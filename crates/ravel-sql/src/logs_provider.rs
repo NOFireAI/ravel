@@ -6,8 +6,9 @@
 //! (resolution is the endpoint's job) and a [`LogSegmentFetcher`], and
 //! never resolves. `scan` extracts widen-only pushdown from the filters
 //! (crate::logs_pushdown), prunes the snapshot's segments by
-//! [`LogSegmentFetcher::ts_range_relevant`] against the extracted ts bounds,
-//! and builds a single [`LogsScanExec`] leaf.
+//! [`LogSegmentFetcher::ts_range_relevant`] against the extracted ts bounds
+//! and then by declared-column statistics (crate::logs_stats_prune, ADR-2121
+//! D1), and builds a single [`LogsScanExec`] leaf.
 //!
 //! `supports_filters_pushdown` returns `Inexact` for every filter except one
 //! that resolves purely to a `ts` bound and/or a `has_word` call, which the
@@ -55,6 +56,7 @@ use crate::distributed_rlog::{
 use crate::logs_pushdown::{LogsPushdown, extract_logs, filter_is_exact};
 use crate::logs_scan::LogsScanExec;
 use crate::logs_schema::{logs_schema, logs_schema_with_declared};
+use crate::logs_stats_prune::prune_segments_by_stats;
 
 /// The `logs` table provider for one tenant over one pinned `Signal::Logs`
 /// snapshot.
@@ -94,6 +96,10 @@ pub struct LogsTableProvider {
     /// per-segment scan timeline (`SqlConfig::segment_timing`). `false` by
     /// default, installed with [`Self::with_segment_timing`].
     segment_timing: bool,
+    /// Whether [`Self::build_scan`] skips segments by declared-column
+    /// statistics (ADR-2121 D1). Always `true` outside tests, which turn it
+    /// off to compare against the unpruned scan.
+    stats_pruning: bool,
 }
 
 impl LogsTableProvider {
@@ -120,6 +126,7 @@ impl LogsTableProvider {
             #[cfg(feature = "flight-sql")]
             distributed: None,
             segment_timing: false,
+            stats_pruning: true,
         }
     }
 
@@ -216,6 +223,14 @@ impl LogsTableProvider {
         self
     }
 
+    /// Turn plan-time statistics pruning off, so a test can compare the rows
+    /// and fetches of the same query with and without it.
+    #[cfg(test)]
+    pub(crate) fn with_stats_pruning(mut self, stats_pruning: bool) -> Self {
+        self.stats_pruning = stats_pruning;
+        self
+    }
+
     /// Build the scan over every segment in the snapshot with no pushdown and
     /// no projection (every column). Exposed (like the metrics provider's
     /// `plan`) so tests can execute the scan without a SQL front-end.
@@ -244,7 +259,8 @@ impl LogsTableProvider {
     /// widen-only ts subset of that already-admitted snapshot, so
     /// re-checking a count against it here would be a second, weaker check
     /// over the wrong set (post-prune, origin-blind); it is not
-    /// reimplemented.
+    /// reimplemented. The same holds for the statistics pruning below
+    /// (ADR-2121 D1): a segment it skips was still admitted.
     fn build_scan(
         &self,
         target_partitions: usize,
@@ -252,6 +268,16 @@ impl LogsTableProvider {
         projection: Option<&Vec<usize>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let segments = self.pruned_segments(pushdown);
+        let (segments, pruned_by_stats) = if self.stats_pruning {
+            prune_segments_by_stats(
+                segments,
+                &pushdown.prune,
+                self.declared.as_ref(),
+                self.column_stats.as_deref(),
+            )
+        } else {
+            (segments, 0)
+        };
         let scan = LogsScanExec::new(
             self.tenant_hash,
             self.fetcher.clone(),
@@ -268,7 +294,8 @@ impl LogsTableProvider {
             Arc::clone(&self.declared),
         )?
         .with_column_stats(self.column_stats.clone())
-        .with_segment_timing(self.segment_timing);
+        .with_segment_timing(self.segment_timing)
+        .with_segments_pruned_by_stats(pruned_by_stats);
         Ok(Arc::new(scan))
     }
 
@@ -416,6 +443,7 @@ mod tests {
 
     use datafusion::arrow::array::{StringArray, TimestampNanosecondArray};
     use datafusion::arrow::record_batch::RecordBatch;
+    use proptest::prelude::*;
     use ravel_catalog::SegmentLevel;
     use ravel_logseg::writer::ObjectIdentity;
     use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
@@ -2454,5 +2482,904 @@ mod tests {
             "the per-key rewrite must carry segment_timing through \
              reproject_attr_keys: got {per_key} points against {declared}"
         );
+    }
+
+    // ---- Plan-time segment skipping by declared-column statistics ----------
+    // ADR-2121 D1: `build_scan` drops a segment whose exact declared-column
+    // min/max proves a prune-only `NumRange` arm excludes all of its rows.
+
+    /// A pass-through backend that counts GETs per object key, so a test can
+    /// state that one specific data object was never fetched.
+    struct KeyCountingStore {
+        inner: Arc<dyn ObjectStoreBackend>,
+        gets: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    }
+
+    impl KeyCountingStore {
+        fn new(inner: Arc<dyn ObjectStoreBackend>) -> Arc<Self> {
+            Arc::new(KeyCountingStore {
+                inner,
+                gets: std::sync::Mutex::new(std::collections::HashMap::new()),
+            })
+        }
+
+        fn gets_of(&self, key: &str) -> u64 {
+            self.gets
+                .lock()
+                .expect("gets lock")
+                .get(key)
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for KeyCountingStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: ravel_object_store::GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+            *self
+                .gets
+                .lock()
+                .expect("gets lock")
+                .entry(key.to_string())
+                .or_insert(0) += 1;
+            self.inner.get(key, range).await
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            ravel_object_store::Capabilities {
+                multipart: false,
+                ..self.inner.capabilities()
+            }
+        }
+    }
+
+    /// The declared I64 column the statistics tests constrain.
+    const CODE: &str = "code";
+    /// A second declared I64 column, carried as `1` on every record and never
+    /// stamped, for the cross-column `OR` shape.
+    const OTHER: &str = "other";
+
+    fn code_declared() -> Vec<DeclaredColumn> {
+        vec![
+            DeclaredColumn::new(CODE, crate::declared::DeclaredType::I64),
+            DeclaredColumn::new(OTHER, crate::declared::DeclaredType::I64),
+        ]
+    }
+
+    /// One record per value at ts `seq * 100 + i`, with `code` set to the value
+    /// (absent, so NULL, for `None`) and `other = 1`.
+    fn code_records(seq: u64, values: &[Option<i64>]) -> Vec<LogRecord> {
+        let resource = vec![("service.name".to_string(), s("api"))];
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let mut attrs = vec![(OTHER.to_string(), AttrValue::I64(1))];
+                if let Some(v) = v {
+                    attrs.push((CODE.to_string(), AttrValue::I64(*v)));
+                }
+                let ts = seq as i64 * 100 + i as i64;
+                record(&resource, &attrs, ts, &format!("seg {seq} row {i}"))
+            })
+            .collect()
+    }
+
+    /// The exact stamp a correct writer produces for `values` on [`CODE`].
+    fn code_stamp(values: &[Option<i64>]) -> ravel_types::declared_stats::DeclaredColumnStat {
+        use ravel_types::declared_stats::{
+            DeclaredColumnStat, DeclaredStatType, DeclaredStatValue,
+        };
+        let present: Vec<i64> = values.iter().flatten().copied().collect();
+        DeclaredColumnStat::new(
+            CODE,
+            DeclaredStatType::I64,
+            present.iter().min().map(|v| DeclaredStatValue::I64(*v)),
+            present.iter().max().map(|v| DeclaredStatValue::I64(*v)),
+            (values.len() - present.len()) as u64,
+        )
+        .expect("valid stamp")
+    }
+
+    /// `seg` carrying `stamps` the way resolution delivers them: through the
+    /// commit-record carrier read, whose row-count clauses bind against the
+    /// segment's own `sample_count`.
+    fn with_stamps(
+        seg: SegmentRef,
+        stamps: &[ravel_types::declared_stats::DeclaredColumnStat],
+    ) -> SegmentRef {
+        let mut rec = ravel_proto::commit::v1::CommitRecord {
+            sample_count: seg.sample_count,
+            ..Default::default()
+        };
+        ravel_commit::declared_stats::stamp_commit_record(&mut rec, stamps);
+        let validated = ravel_commit::declared_stats::read_commit_record(&rec);
+        assert_eq!(
+            validated.covered().len(),
+            stamps.len(),
+            "test setup: every stamp must pass the carrier read"
+        );
+        SegmentRef {
+            declared_column_stats: ravel_catalog::DeclaredColumnStats::from_validated(&validated),
+            ..seg
+        }
+    }
+
+    /// A `.cstat` entry on [`CODE`] claiming `min`/`max` over `non_null` of
+    /// `rows` rows.
+    fn code_cstat(
+        rows: u64,
+        non_null: u64,
+        min: Option<i64>,
+        max: Option<i64>,
+    ) -> ravel_proto::catalog::v1::ColumnStat {
+        use ravel_proto::catalog::v1::column_value::Kind;
+        let value = |v: i64| ravel_proto::catalog::v1::ColumnValue {
+            kind: Some(Kind::I64(v)),
+        };
+        ravel_proto::catalog::v1::ColumnStat {
+            name: CODE.to_string(),
+            declared_type: 2, // ravel.sys.v1.TypedAttrColumnType::I64
+            non_null_count: non_null,
+            null_count: rows - non_null,
+            min: min.map(value),
+            max: max.map(value),
+            dictionary_present: false,
+            dictionary: Vec::new(),
+            sum: None,
+        }
+    }
+
+    /// The exact `.cstat` entry for `values`.
+    fn exact_cstat(values: &[Option<i64>]) -> ravel_proto::catalog::v1::ColumnStat {
+        let present: Vec<i64> = values.iter().flatten().copied().collect();
+        code_cstat(
+            values.len() as u64,
+            present.len() as u64,
+            present.iter().min().copied(),
+            present.iter().max().copied(),
+        )
+    }
+
+    /// Loaded column statistics carrying `entries`, keyed by content hash the
+    /// way a v3 `.cstat` load keys them.
+    fn loaded_cstats(
+        entries: Vec<(&SegmentRef, ravel_proto::catalog::v1::ColumnStat)>,
+    ) -> Arc<LoadedColumnStats> {
+        let by_content_hash = entries
+            .into_iter()
+            .map(|(seg, stat)| {
+                (
+                    seg.content_hash,
+                    ravel_proto::catalog::v1::ColumnStatsSegment {
+                        ingest_hour_bucket: seg.ingest_hour_bucket,
+                        shard: seg.shard,
+                        writer_id: seg.writer_id.as_bytes().to_vec(),
+                        writer_epoch: seg.writer_epoch,
+                        writer_seq: seg.writer_seq,
+                        columns: vec![stat],
+                    },
+                )
+            })
+            .collect();
+        Arc::new(LoadedColumnStats {
+            segments: std::collections::HashMap::new(),
+            by_content_hash,
+            part_blake3: Vec::new(),
+        })
+    }
+
+    /// Write `values` as one real RLOG object at `key` and return its unstamped
+    /// L0 `SegmentRef`, with a content hash and writer sequence of its own so a
+    /// `.cstat` entry joins to exactly this segment.
+    async fn write_code_segment(
+        store: &dyn ObjectStoreBackend,
+        key: &str,
+        seq: u64,
+        values: &[Option<i64>],
+    ) -> SegmentRef {
+        let records = code_records(seq, values);
+        let mut w = RlogWriter::new(RlogConfig::default(), identity());
+        for r in &records {
+            w.push(r.clone()).expect("push");
+        }
+        let bytes = w.finish().expect("finish");
+        let content_hash = *blake3::hash(&bytes).as_bytes();
+        let size = bytes.len() as u64;
+        store
+            .put(key, bytes::Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put object");
+        SegmentRef {
+            data_object_key: key.to_string(),
+            object_size: size,
+            min_event_ts_ns: records.iter().map(|r| r.ts_ns).min().expect("nonempty"),
+            max_event_ts_ns: records.iter().map(|r| r.ts_ns).max().expect("nonempty"),
+            ingest_hour_bucket: 0,
+            sample_count: records.len() as u64,
+            series_count: 0,
+            shard: 0,
+            content_hash,
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: seq,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            declared_column_stats: Default::default(),
+        }
+    }
+
+    /// What one statistics-pruning run returned and fetched.
+    struct PruneRun {
+        rows: BTreeSet<(i64, String)>,
+        /// The scan's `segments_pruned_by_stats`, or `None` when the optimizer
+        /// folded the filter to a constant `false` and planned no scan at all.
+        scan_pruned_by_stats: Option<usize>,
+        store: Arc<KeyCountingStore>,
+    }
+
+    impl PruneRun {
+        fn pruned_by_stats(&self) -> usize {
+            self.scan_pruned_by_stats
+                .expect("the plan carries a LogsScanExec")
+        }
+    }
+
+    /// Run `sql` through the production session over `segments` stored in
+    /// `inner`, with statistics pruning on or off, counting GETs per key.
+    async fn run_pruned(
+        inner: &Arc<dyn ObjectStoreBackend>,
+        segments: Vec<SegmentRef>,
+        column_stats: Option<Arc<LoadedColumnStats>>,
+        stats_pruning: bool,
+        sql: &str,
+    ) -> PruneRun {
+        let store = KeyCountingStore::new(Arc::clone(inner));
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&store) as _;
+        let provider = LogsTableProvider::new(
+            Snapshot {
+                segments,
+                segments_pruned: 0,
+                pending_erasure: Vec::new(),
+            },
+            TenantHash([7u8; 16]),
+            LogSegmentFetcher::new(backend),
+            PhaseAccounting::pooled_over(&QueryAccounting::new()),
+        )
+        .with_declared_columns(code_declared())
+        .with_column_stats(column_stats)
+        .with_stats_pruning(stats_pruning);
+        let ctx = logs_session(provider).expect("session");
+        let plan = ctx
+            .sql(sql)
+            .await
+            .expect("plan")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        let batches = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
+            .await
+            .expect("collect");
+        let scan_pruned_by_stats = find_logs_scan(&plan).map(|scan| {
+            scan.metrics()
+                .expect("the scan publishes metrics")
+                .sum_by_name("segments_pruned_by_stats")
+                .expect("segments_pruned_by_stats is registered")
+                .as_usize()
+        });
+        PruneRun {
+            rows: rows(&batches),
+            scan_pruned_by_stats,
+            store,
+        }
+    }
+
+    /// The row a test expects: `(ts, body)` for row `i` of segment `seq`.
+    fn code_row(seq: u64, i: usize) -> (i64, String) {
+        (seq as i64 * 100 + i as i64, format!("seg {seq} row {i}"))
+    }
+
+    /// Write `values` as a real RLOG object plus its commit record, stamped
+    /// with its exact [`CODE`] statistics when `stamped`, so `SqlExecutor`'s
+    /// own catalog resolve delivers the segment and its stamp.
+    async fn publish_code_segment(
+        store: &dyn ObjectStoreBackend,
+        tenant: &ravel_types::TenantId,
+        seq: u64,
+        values: &[Option<i64>],
+        stamped: bool,
+    ) -> String {
+        use ravel_commit::publish::RetryPolicy;
+        use ravel_commit::record::NewCommitRecord;
+        use ravel_commit::{keys, publish, record};
+        let records = code_records(seq, values);
+        let writer_id = Uuid::from_u128(0x2121);
+        let mut w = RlogWriter::new(
+            RlogConfig::default(),
+            ObjectIdentity {
+                tenant_hash: tenant.hash().0,
+                shard: 0,
+                writer_id: *writer_id.as_bytes(),
+                writer_epoch: 1,
+                writer_seq: seq,
+            },
+        );
+        for r in &records {
+            w.push(r.clone()).expect("push");
+        }
+        let bytes = w.finish().expect("finish");
+        let mut rec = record::build(NewCommitRecord {
+            tenant_hash: tenant.hash(),
+            signal: ravel_types::Signal::Logs,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: seq,
+            object_size: bytes.len() as u64,
+            content_hash: *blake3::hash(&bytes).as_bytes(),
+            sample_count: records.len() as u64,
+            series_count: 1,
+            min_event_ts_ns: records.iter().map(|r| r.ts_ns).min().expect("nonempty"),
+            max_event_ts_ns: records.iter().map(|r| r.ts_ns).max().expect("nonempty"),
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            created_unix_ns: 10,
+            ingest_hour_bucket: 0,
+        })
+        .expect("commit record");
+        if stamped {
+            ravel_commit::declared_stats::stamp_commit_record(&mut rec, &[code_stamp(values)]);
+        }
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, bytes::Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        data_key
+    }
+
+    /// The acceptance test for ADR-2121 D1, through `SqlExecutor::execute`,
+    /// the funnel the SQL endpoint uses (catalog resolve, then this provider's
+    /// `scan`).
+    ///
+    /// Five segments, every one resolved from a real commit record. Three are
+    /// stamped with `code` ranges disjoint from `code = 201` (`[100, 102]`,
+    /// `[300, 302]`, and one whose `code` is NULL in every row, which the stamp
+    /// proves with `null_count == sample_count`). One stamped `[200, 202]`
+    /// holds a match. The fifth also holds a `201` but carries no stamp, so its
+    /// column is declined and it must be read.
+    ///
+    /// Flipped assertions: making `prune_segments_by_stats` return its input
+    /// unchanged (skips nothing) fails the zero-GET assertion on the
+    /// `[100, 102]` object and the count (`0 != 3`). Making `arm_excludes`
+    /// answer `true` for a declined column (`let Some(coverage) = .. else {
+    /// return true }`) skips the unstamped segment and fails the row assertion,
+    /// which loses its `201`, and the count (`4 != 3`).
+    #[tokio::test]
+    async fn a_segment_whose_stats_exclude_the_predicate_is_never_fetched() {
+        const NOW_NS: i64 = 4 * 3_600_000_000_000;
+        let memory: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new("stats-prune-acceptance".to_string());
+        let low = publish_code_segment(
+            memory.as_ref(),
+            &tenant,
+            1,
+            &[Some(100), Some(101), Some(102)],
+            true,
+        )
+        .await;
+        let hit = publish_code_segment(
+            memory.as_ref(),
+            &tenant,
+            2,
+            &[Some(200), Some(201), Some(202)],
+            true,
+        )
+        .await;
+        let high = publish_code_segment(
+            memory.as_ref(),
+            &tenant,
+            3,
+            &[Some(300), Some(301), Some(302)],
+            true,
+        )
+        .await;
+        let all_null =
+            publish_code_segment(memory.as_ref(), &tenant, 4, &[None, None, None], true).await;
+        let unstamped = publish_code_segment(
+            memory.as_ref(),
+            &tenant,
+            5,
+            &[Some(150), Some(201), Some(250)],
+            false,
+        )
+        .await;
+
+        let store = KeyCountingStore::new(Arc::clone(&memory));
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&store) as _;
+        let catalog = Arc::new(
+            ravel_catalog::Catalog::new(
+                Arc::clone(&backend),
+                ravel_catalog::CatalogConfig::default(),
+            )
+            .expect("catalog"),
+        );
+        let executor = crate::executor::SqlExecutor::new(
+            catalog,
+            ravel_query::SegmentFetcher::new(Arc::clone(&backend)),
+            LogSegmentFetcher::new(Arc::clone(&backend)),
+            crate::spans_fetcher::SpanSegmentFetcher::new(Arc::clone(&backend)),
+            SqlConfig::default(),
+            1 << 30,
+        )
+        .with_declared_column_source(Arc::new(
+            crate::declared::StaticDeclaredColumns::new(code_declared()),
+        ));
+        let outcome = executor
+            .execute(
+                tenant.hash(),
+                &crate::executor::SqlRequest {
+                    sql: "SELECT ts, body FROM logs WHERE code = 201".to_string(),
+                    window: ravel_types::TimeRange {
+                        start_ns: 0,
+                        end_ns: NOW_NS,
+                    },
+                    min_tokens: Vec::new(),
+                    now_ns: NOW_NS,
+                    deadline: std::time::Duration::from_secs(30),
+                    row_window: false,
+                    max_rows: None,
+                    budgets: None,
+                },
+            )
+            .await
+            .expect("execute");
+
+        assert_eq!(
+            rows(outcome.output.batches()),
+            BTreeSet::from([code_row(2, 1), code_row(5, 1)]),
+            "exactly the two code = 201 rows, one of them in the unstamped segment"
+        );
+        assert_eq!(outcome.stats.segments, 5, "the resolve sees every segment");
+        for (name, key) in [("low", &low), ("high", &high), ("all-NULL", &all_null)] {
+            assert_eq!(
+                store.gets_of(key),
+                0,
+                "the {name} segment's stats exclude code = 201, so its object is never fetched"
+            );
+        }
+        for (name, key) in [("matching", &hit), ("unstamped", &unstamped)] {
+            assert!(
+                store.gets_of(key) > 0,
+                "the {name} segment must still be read"
+            );
+        }
+        assert_eq!(
+            outcome.stats.segments_pruned_by_stats, 3,
+            "segments_pruned_by_stats counts the three excluded segments"
+        );
+    }
+
+    /// Carriers that disagree about one segment decline its column, and so do
+    /// no carriers at all: neither segment is skipped, although each one's
+    /// stamp alone, or its `.cstat` alone, would exclude `code = 500`. A
+    /// segment covered by an exact `.cstat` entry and no stamp is skipped, which
+    /// shows the `.cstat` side of the union is live in this test.
+    ///
+    /// Flipped assertion: ignoring a disagreement (`if !stamp.agrees_with(&cstat)`
+    /// in `segment_declared_coverage` to `if false`) skips the conflicting
+    /// segment on its stamp and fails the count (`2 != 1`).
+    #[tokio::test]
+    async fn conflicting_or_absent_carriers_never_skip_a_segment() {
+        let memory: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let values = [Some(200), Some(201), Some(202)];
+        let conflict = write_code_segment(memory.as_ref(), "conflict", 1, &values).await;
+        let conflict = with_stamps(conflict, &[code_stamp(&values)]);
+        let uncovered = write_code_segment(memory.as_ref(), "uncovered", 2, &values).await;
+        let cstat_only = write_code_segment(memory.as_ref(), "cstat-only", 3, &values).await;
+        // The `.cstat` claims [100, 102] for an object holding [200, 202]:
+        // valid on its own, and in disagreement with the exact stamp.
+        let stats = loaded_cstats(vec![
+            (&conflict, code_cstat(3, 3, Some(100), Some(102))),
+            (&cstat_only, exact_cstat(&values)),
+        ]);
+
+        let run = run_pruned(
+            &memory,
+            vec![conflict, uncovered, cstat_only],
+            Some(stats),
+            true,
+            "SELECT ts, body FROM logs WHERE code = 500",
+        )
+        .await;
+        assert!(run.rows.is_empty(), "no row holds code = 500");
+        assert_eq!(
+            run.pruned_by_stats(),
+            1,
+            "only the segment with one exact carrier is skipped"
+        );
+        assert!(
+            run.store.gets_of("conflict") > 0,
+            "conflicting carriers decline the column, so the segment is read"
+        );
+        assert!(
+            run.store.gets_of("uncovered") > 0,
+            "a segment with no stamp and no .cstat entry is read"
+        );
+        assert_eq!(run.store.gets_of("cstat-only"), 0);
+    }
+
+    /// Shapes `extract_logs` declines skip nothing, even where a naive reading
+    /// of the literal would exclude the segment: `code != 5` and `NOT (code =
+    /// 5)` over a segment whose every `code` is `5`, and a cross-column `OR`
+    /// (`other = 1 OR code = 3`) whose `code` disjunct is disjoint from the
+    /// segment while its `other` disjunct matches every row. A control statement on the same segment
+    /// (`code = 6`) is skipped, so the stamps are usable here.
+    ///
+    /// Flipped assertion: dropping `declared_i64_or_envelope`'s same-column
+    /// check turns the cross-column `OR` into a `[1, 3]` envelope on `code`,
+    /// which skips the segment and loses all three rows.
+    #[tokio::test]
+    async fn declined_shapes_skip_nothing() {
+        let memory: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let values = [Some(5), Some(5), Some(5)];
+        let seg = write_code_segment(memory.as_ref(), "fives", 1, &values).await;
+        let seg = with_stamps(seg, &[code_stamp(&values)]);
+        let every_row = BTreeSet::from([code_row(1, 0), code_row(1, 1), code_row(1, 2)]);
+
+        for (sql, want) in [
+            ("SELECT ts, body FROM logs WHERE code != 5", BTreeSet::new()),
+            (
+                "SELECT ts, body FROM logs WHERE NOT (code = 5)",
+                BTreeSet::new(),
+            ),
+            (
+                "SELECT ts, body FROM logs WHERE other = 1 OR code = 3",
+                every_row.clone(),
+            ),
+        ] {
+            let run = run_pruned(&memory, vec![seg.clone()], None, true, sql).await;
+            assert_eq!(run.rows, want, "rows of `{sql}`");
+            assert_eq!(run.pruned_by_stats(), 0, "`{sql}` must skip nothing");
+            assert!(run.store.gets_of("fives") > 0, "`{sql}` reads the segment");
+        }
+
+        let control = run_pruned(
+            &memory,
+            vec![seg],
+            None,
+            true,
+            "SELECT ts, body FROM logs WHERE code = 6",
+        )
+        .await;
+        assert!(control.rows.is_empty());
+        assert_eq!(
+            control.pruned_by_stats(),
+            1,
+            "control: the stamp excludes 6"
+        );
+    }
+
+    /// The count is visible where an operator reads it: `EXPLAIN ANALYZE`
+    /// prints `segments_pruned_by_stats` among the logs scan's metrics.
+    ///
+    /// Flipped assertion: removing the `global_counter` registration from
+    /// `with_segments_pruned_by_stats` drops the metric from the output.
+    #[tokio::test]
+    async fn explain_analyze_reports_segments_pruned_by_stats() {
+        let memory: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let mut segments = Vec::new();
+        for (seq, base) in [(1u64, 100i64), (2, 200), (3, 300)] {
+            let values = [Some(base), Some(base + 1)];
+            let seg =
+                write_code_segment(memory.as_ref(), &format!("seg-{seq}"), seq, &values).await;
+            segments.push(with_stamps(seg, &[code_stamp(&values)]));
+        }
+        let backend = Arc::clone(&memory);
+        let provider = LogsTableProvider::new(
+            Snapshot {
+                segments,
+                segments_pruned: 0,
+                pending_erasure: Vec::new(),
+            },
+            TenantHash([7u8; 16]),
+            LogSegmentFetcher::new(backend),
+            PhaseAccounting::pooled_over(&QueryAccounting::new()),
+        )
+        .with_declared_columns(code_declared());
+        let ctx = logs_session(provider).expect("session");
+        let batches = ctx
+            .sql("EXPLAIN ANALYZE SELECT ts, body FROM logs WHERE code = 201")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("explain analyze");
+        let text = datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+            .expect("format")
+            .to_string();
+        let scan_line = text
+            .lines()
+            .find(|l| l.contains("LogsScanExec"))
+            .unwrap_or_else(|| panic!("no LogsScanExec line in:\n{text}"));
+        assert!(
+            scan_line.contains("segments_pruned_by_stats=2"),
+            "the scan's EXPLAIN ANALYZE metrics must report the two skipped \
+             segments: {scan_line}"
+        );
+    }
+
+    /// Which statistics carriers a generated segment has for [`CODE`].
+    #[derive(Clone, Copy, Debug)]
+    enum Carriers {
+        None,
+        Stamp,
+        Cstat,
+        StampAndCstat,
+        /// An exact stamp and a `.cstat` entry that disagrees with it.
+        Conflict,
+    }
+
+    /// One generated conjunct of the statement's `WHERE` clause.
+    #[derive(Clone, Debug)]
+    enum Conjunct {
+        Eq(i64),
+        Lt(i64),
+        LtEq(i64),
+        Gt(i64),
+        GtEq(i64),
+        Between(i64, i64),
+        In(Vec<i64>),
+        NotEq(i64),
+        Not(i64),
+        OrOther(i64, i64),
+    }
+
+    impl Conjunct {
+        fn sql(&self) -> String {
+            match self {
+                Conjunct::Eq(v) => format!("code = {v}"),
+                Conjunct::Lt(v) => format!("code < {v}"),
+                Conjunct::LtEq(v) => format!("code <= {v}"),
+                Conjunct::Gt(v) => format!("code > {v}"),
+                Conjunct::GtEq(v) => format!("code >= {v}"),
+                Conjunct::Between(a, b) => format!("code BETWEEN {a} AND {b}"),
+                Conjunct::In(vs) => format!(
+                    "code IN ({})",
+                    vs.iter().map(i64::to_string).collect::<Vec<_>>().join(", ")
+                ),
+                Conjunct::NotEq(v) => format!("code != {v}"),
+                Conjunct::Not(v) => format!("NOT (code = {v})"),
+                Conjunct::OrOther(a, b) => format!("(code = {a} OR other = {b})"),
+            }
+        }
+
+        /// The inclusive `[lo, hi]` arm the reader's pruning builds for this
+        /// conjunct, or `None` for a shape that builds no arm. Written out from
+        /// the SQL meaning, independently of `extract_logs`.
+        fn arm(&self) -> Option<(Option<i64>, Option<i64>)> {
+            match self {
+                Conjunct::Eq(v) => Some((Some(*v), Some(*v))),
+                Conjunct::Lt(v) => Some((None, Some(v - 1))),
+                Conjunct::LtEq(v) => Some((None, Some(*v))),
+                Conjunct::Gt(v) => Some((Some(v + 1), None)),
+                Conjunct::GtEq(v) => Some((Some(*v), None)),
+                Conjunct::Between(a, b) => Some((Some(*a), Some(*b))),
+                Conjunct::In(vs) => Some((vs.iter().min().copied(), vs.iter().max().copied())),
+                Conjunct::NotEq(_) | Conjunct::Not(_) | Conjunct::OrOther(..) => None,
+            }
+        }
+    }
+
+    /// Whether the D1 rule, applied by hand, skips a segment holding `values`
+    /// with `carriers` under `conjuncts`: some arm is disjoint from an exact
+    /// `[min, max]`, or the column is all NULL with the NULL count proven,
+    /// which only a stamp does.
+    fn rule_skips(values: &[Option<i64>], carriers: Carriers, conjuncts: &[Conjunct]) -> bool {
+        let proven = match carriers {
+            Carriers::None | Carriers::Conflict => return false,
+            Carriers::Stamp | Carriers::StampAndCstat => true,
+            Carriers::Cstat => false,
+        };
+        let present: Vec<i64> = values.iter().flatten().copied().collect();
+        conjuncts.iter().filter_map(Conjunct::arm).any(|(lo, hi)| {
+            match (present.iter().min(), present.iter().max()) {
+                (Some(&min), Some(&max)) => {
+                    hi.is_some_and(|h| h < min) || lo.is_some_and(|l| l > max)
+                }
+                _ => proven,
+            }
+        })
+    }
+
+    fn arb_conjunct() -> impl Strategy<Value = Conjunct> {
+        let v = || 0i64..=8;
+        prop_oneof![
+            v().prop_map(Conjunct::Eq),
+            v().prop_map(Conjunct::Lt),
+            v().prop_map(Conjunct::LtEq),
+            v().prop_map(Conjunct::Gt),
+            v().prop_map(Conjunct::GtEq),
+            (v(), v()).prop_map(|(a, b)| Conjunct::Between(a, b)),
+            proptest::collection::vec(v(), 1..=3).prop_map(Conjunct::In),
+            v().prop_map(Conjunct::NotEq),
+            v().prop_map(Conjunct::Not),
+            (v(), 0i64..=2).prop_map(|(a, b)| Conjunct::OrOther(a, b)),
+        ]
+    }
+
+    fn arb_segment() -> impl Strategy<Value = (Vec<Option<i64>>, Carriers)> {
+        let values = prop_oneof![
+            4 => proptest::collection::vec(proptest::option::weighted(0.8, 0i64..=8), 1..=4),
+            1 => (1usize..=3).prop_map(|n| vec![None; n]),
+        ];
+        let carriers = prop_oneof![
+            Just(Carriers::None),
+            Just(Carriers::Stamp),
+            Just(Carriers::Cstat),
+            Just(Carriers::StampAndCstat),
+            Just(Carriers::Conflict),
+        ];
+        (values, carriers)
+    }
+
+    /// A `.cstat` entry that disagrees with the exact one for `values` while
+    /// staying valid on its own: a widened minimum, or for an all-NULL segment
+    /// a claimed non-null value.
+    fn conflicting_cstat(values: &[Option<i64>]) -> ravel_proto::catalog::v1::ColumnStat {
+        let present: Vec<i64> = values.iter().flatten().copied().collect();
+        let rows = values.len() as u64;
+        match (present.iter().min(), present.iter().max()) {
+            (Some(&min), Some(&max)) => {
+                code_cstat(rows, present.len() as u64, Some(min - 1), Some(max))
+            }
+            _ => code_cstat(rows, 1, Some(0), Some(0)),
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Over generated segments (stamped, `.cstat`-covered, both, neither,
+        /// conflicting; overlapping and disjoint ranges; all-NULL columns) and
+        /// generated statements of the extracted shapes plus declined ones, the
+        /// rows with statistics pruning equal the rows without it, the skipped
+        /// segments are exactly the ones the D1 rule selects (by count, and by
+        /// which objects saw zero GETs), and nothing is skipped with pruning
+        /// off.
+        ///
+        /// Flipped assertions: skipping a segment only when EVERY arm is
+        /// disjoint (`.any(` to `.all(` over the arms in
+        /// `prune_segments_by_stats`) misses skips and fails the count; treating
+        /// an arm that touches the boundary as disjoint (`q < seg_min` to
+        /// `q <= seg_min` in `arm_excludes`) skips a segment holding a match and
+        /// fails the row equality.
+        #[test]
+        fn stats_pruning_changes_no_row_and_skips_exactly_what_the_rule_selects(
+            segs in proptest::collection::vec(arb_segment(), 1..=4),
+            conjuncts in proptest::collection::vec(arb_conjunct(), 1..=3),
+        ) {
+            // At most one IN list: DataFusion's simplifier intersects IN lists
+            // AND-ed on one column, which would change the pushed shape.
+            prop_assume!(conjuncts.iter().filter(|c| matches!(c, Conjunct::In(_))).count() <= 1);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let memory: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+                let mut segments = Vec::new();
+                let mut cstats = Vec::new();
+                let mut expected_skipped = BTreeSet::new();
+                for (i, (values, carriers)) in segs.iter().enumerate() {
+                    let key = format!("seg-{i}");
+                    let seq = i as u64 + 1;
+                    let seg = write_code_segment(memory.as_ref(), &key, seq, values).await;
+                    let seg = match carriers {
+                        Carriers::Stamp | Carriers::StampAndCstat | Carriers::Conflict => {
+                            with_stamps(seg, &[code_stamp(values)])
+                        }
+                        Carriers::None | Carriers::Cstat => seg,
+                    };
+                    match carriers {
+                        Carriers::Cstat | Carriers::StampAndCstat => {
+                            cstats.push((seg.clone(), exact_cstat(values)));
+                        }
+                        Carriers::Conflict => cstats.push((seg.clone(), conflicting_cstat(values))),
+                        Carriers::None | Carriers::Stamp => {}
+                    }
+                    if rule_skips(values, *carriers, &conjuncts) {
+                        expected_skipped.insert(key);
+                    }
+                    segments.push(seg);
+                }
+                let stats = loaded_cstats(cstats.iter().map(|(s, c)| (s, c.clone())).collect());
+                let sql = format!(
+                    "SELECT ts, body FROM logs WHERE {}",
+                    conjuncts.iter().map(Conjunct::sql).collect::<Vec<_>>().join(" AND ")
+                );
+
+                let on = run_pruned(&memory, segments.clone(), Some(Arc::clone(&stats)), true, &sql)
+                    .await;
+                let off = run_pruned(&memory, segments, Some(stats), false, &sql).await;
+
+                prop_assert_eq!(&on.rows, &off.rows, "rows differ with pruning for `{}`", sql);
+                // A contradiction the optimizer folds to `false` (`code IN (0)
+                // AND code = 1`) plans no scan: nothing is fetched and there is
+                // nothing for the rule to decide.
+                let (Some(on_pruned), Some(off_pruned)) =
+                    (on.scan_pruned_by_stats, off.scan_pruned_by_stats)
+                else {
+                    prop_assert!(on.rows.is_empty() && off.rows.is_empty());
+                    for i in 0..segs.len() {
+                        prop_assert_eq!(on.store.gets_of(&format!("seg-{i}")), 0);
+                    }
+                    return Ok(());
+                };
+                prop_assert_eq!(off_pruned, 0);
+                prop_assert_eq!(
+                    on_pruned,
+                    expected_skipped.len(),
+                    "skip count for `{}` over {:?}",
+                    sql,
+                    segs
+                );
+                let unfetched: BTreeSet<String> = (0..segs.len())
+                    .map(|i| format!("seg-{i}"))
+                    .filter(|k| on.store.gets_of(k) == 0)
+                    .collect();
+                prop_assert_eq!(&unfetched, &expected_skipped, "unfetched objects for `{}`", sql);
+                for i in 0..segs.len() {
+                    prop_assert!(
+                        off.store.gets_of(&format!("seg-{i}")) > 0,
+                        "with pruning off every object is read"
+                    );
+                }
+                Ok(())
+            })?;
+        }
     }
 }
