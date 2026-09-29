@@ -1731,8 +1731,9 @@ fn blocked_bucket_report(blocked: &[BlockedBucket]) -> String {
         }
         out.push_str(
             "# A losing_record_parts bucket's authoritative compaction records are at the \
-             target, but compaction records that lost their overlap still carry below_target \
-             parts below it. Re-running migrate does not clear it: neither migrate nor sweep \
+             target, but compaction records that lost their overlap still hold below_target \
+             output parts under the target. Re-running migrate does not clear it: neither \
+             migrate nor sweep \
              reclaims a losing record's parts, and they keep counting in l1_compaction_parts. \
              It clears when retention ages the bucket out (subject to the format-version hold, \
              which keeps an object this build cannot read). That is not a command you run.",
@@ -2828,8 +2829,9 @@ mod tests {
             blocked_bucket_report(std::slice::from_ref(&losing)),
             "blocked_bucket: shard=2 hour=7 reason=losing_record_parts below_target=3\n\
              # A losing_record_parts bucket's authoritative compaction records are at the \
-             target, but compaction records that lost their overlap still carry below_target \
-             parts below it. Re-running migrate does not clear it: neither migrate nor sweep \
+             target, but compaction records that lost their overlap still hold below_target \
+             output parts under the target. Re-running migrate does not clear it: neither \
+             migrate nor sweep \
              reclaims a losing record's parts, and they keep counting in l1_compaction_parts. \
              It clears when retention ages the bucket out (subject to the format-version hold, \
              which keeps an object this build cannot read). That is not a command you run."
