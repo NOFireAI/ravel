@@ -285,16 +285,18 @@ fn signal_name(s: Signal) -> String {
     s.key_prefix().to_string()
 }
 
-/// Canonical `input_set_hash` for `inputs`. Inputs MUST already be in
-/// canonical order (as [`load_inputs`] leaves them).
+/// Canonical version 1 `input_set_hash` for `inputs`. Inputs MUST already be
+/// in canonical order (as [`load_inputs`] leaves them).
 ///
 /// A thin wrapper over
 /// [`ravel_commit::erasure::compute_compaction_input_set_hash`], the single
 /// source of truth for this hash (issue #830): builds the identity list from
 /// the decoded `InputRecord`s and delegates, so this crate carries no
 /// hash-preimage logic of its own to drift from `ravel-catalog`'s
-/// `seal_divergence`, which recomputes the same hash from a stored record's
-/// declared `inputs`.
+/// `seal_divergence`, which recomputes this hash from a version 1 record's
+/// declared `inputs`. A version 2 (superseding) record's hash is
+/// [`ravel_commit::erasure::compute_superseding_compaction_input_set_hash`]
+/// instead.
 pub fn input_set_hash(inputs: &[InputRecord]) -> [u8; 32] {
     let ids: Vec<CompactionInputIdentity> = inputs
         .iter()
