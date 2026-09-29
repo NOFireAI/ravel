@@ -280,6 +280,13 @@ pub struct SqlStats {
     pub blocks_total: u64,
     pub blocks_scanned: u64,
     pub blocks_pruned_by_postings: u64,
+    /// Segments the successful attempt's logs scan skipped before any fetch
+    /// because their declared-column statistics excluded a pushed-down
+    /// predicate (ADR-2121 D1), read off the scan's
+    /// `segments_pruned_by_stats` counter. Counted within [`Self::segments`],
+    /// which is the resolved snapshot. Zero for a metrics query and for a
+    /// logs plan with no scan node.
+    pub segments_pruned_by_stats: u64,
     /// This query's spill totals (ADR-0954), read off the executed plan's own
     /// DataFusion counters after the stream stopped, the same way the block
     /// counters above are. All zero on the default configuration, where the
@@ -463,6 +470,7 @@ struct BlockCounts {
     total: u64,
     scanned: u64,
     pruned_by_postings: u64,
+    segments_pruned_by_stats: u64,
     timing: ScanTiming,
     /// Summed from the counter `RsegScanExec` publishes (crate::scan). Lives
     /// here rather than in a second walk because one traversal already reads
@@ -470,10 +478,10 @@ struct BlockCounts {
     histogram_series_skipped: u64,
 }
 
-/// Sum the `blocks_total` / `blocks_scanned` / `blocks_pruned_by_postings`
-/// DataFusion counters over `plan` and its descendants, plus the metrics
-/// scan's `histogram_series_skipped`. Only `LogsScanExec` publishes the first
-/// three names (crate::logs_scan) and only `RsegScanExec` the last
+/// Sum the `blocks_total` / `blocks_scanned` / `blocks_pruned_by_postings` /
+/// `segments_pruned_by_stats` DataFusion counters over `plan` and its
+/// descendants, plus the metrics scan's `histogram_series_skipped`. Only
+/// `LogsScanExec` publishes the first four names (crate::logs_scan) and only `RsegScanExec` the last
 /// (crate::scan), so each sum is that scan's total however the optimizer
 /// nested it, and a plan carrying neither scan contributes nothing. Reads the
 /// counters the scans already maintain rather than counting a second time.
@@ -487,6 +495,7 @@ fn accumulate_block_counts(plan: &Arc<dyn ExecutionPlan>, counts: &mut BlockCoun
         counts.total += sum("blocks_total");
         counts.scanned += sum("blocks_scanned");
         counts.pruned_by_postings += sum("blocks_pruned_by_postings");
+        counts.segments_pruned_by_stats += sum("segments_pruned_by_stats");
         counts.histogram_series_skipped += sum(crate::scan::HISTOGRAM_SERIES_SKIPPED_METRIC);
         accumulate_scan_timing(&metrics, &mut counts.timing);
     }
@@ -1304,6 +1313,7 @@ impl SqlExecutor {
                     stats.blocks_total = blocks.total;
                     stats.blocks_scanned = blocks.scanned;
                     stats.blocks_pruned_by_postings = blocks.pruned_by_postings;
+                    stats.segments_pruned_by_stats = blocks.segments_pruned_by_stats;
                     stats.scan_timing = blocks.timing;
                     stats.histogram_series_skipped = blocks.histogram_series_skipped;
                     let phase_snapshot = phase_accounting.snapshot();

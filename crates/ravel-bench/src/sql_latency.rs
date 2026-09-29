@@ -557,6 +557,12 @@ pub struct ScanDiagnostics {
     pub blocks_scanned: u64,
     /// Blocks pruned by POSTINGS before any read (ADR-0049).
     pub blocks_pruned_by_postings: u64,
+    /// Segments the logs scan skipped before any fetch because their
+    /// declared-column statistics excluded a pushed-down predicate (ADR-2121
+    /// D1). Counted within [`Self::segments`]. A report written before the
+    /// field existed reads as `0`.
+    #[serde(default)]
+    pub segments_pruned_by_stats: u64,
     /// Object-store GET requests the cold run issued.
     pub object_store_get_requests: u64,
     /// Object-store LIST requests the cold run issued.
@@ -1916,6 +1922,7 @@ pub async fn measure_corpus(
             blocks_total: 0,
             blocks_scanned: 0,
             blocks_pruned_by_postings: 0,
+            segments_pruned_by_stats: 0,
             object_store_get_requests: 0,
             object_store_list_requests: 0,
             object_store_bytes: 0,
@@ -2029,6 +2036,7 @@ pub async fn measure_corpus(
                     blocks_total: outcome.stats.blocks_total,
                     blocks_scanned: outcome.stats.blocks_scanned,
                     blocks_pruned_by_postings: outcome.stats.blocks_pruned_by_postings,
+                    segments_pruned_by_stats: outcome.stats.segments_pruned_by_stats,
                     object_store_get_requests: acc.s3_requests(AccountedOp::Get),
                     object_store_list_requests: acc.s3_requests(AccountedOp::List),
                     object_store_bytes: acc.total_s3_bytes(),
@@ -3054,6 +3062,20 @@ mod tests {
         shard: u32,
         records: &[LogRecord],
     ) -> Vec<Vec<u8>> {
+        write_records_as_objects_with(store, tenant, shard, records, false).await
+    }
+
+    /// [`write_records_as_objects`], with each commit record stamped with its
+    /// object's exact `duration_ms` statistics when `stamp_duration` is set
+    /// (ADR-0873), so a resolve delivers segments the logs scan can skip by
+    /// statistics (ADR-2121 D1).
+    async fn write_records_as_objects_with(
+        store: &Arc<dyn ObjectStoreBackend>,
+        tenant: &TenantId,
+        shard: u32,
+        records: &[LogRecord],
+        stamp_duration: bool,
+    ) -> Vec<Vec<u8>> {
         let mut written = Vec::with_capacity(records.len());
         let writer_id = Uuid::from_u128(0x5100_0100 + u128::from(shard));
         for (obj_idx, rec) in records.iter().enumerate() {
@@ -3093,7 +3115,25 @@ mod tests {
                 created_unix_ns: 10,
                 ingest_hour_bucket: 0,
             };
-            let built = record::build(new_record).expect("build commit record");
+            let mut built = record::build(new_record).expect("build commit record");
+            if stamp_duration {
+                use ravel_types::declared_stats::{
+                    DeclaredColumnStat, DeclaredStatType, DeclaredStatValue,
+                };
+                let duration = rec.attrs.iter().find_map(|(k, v)| match v {
+                    AttrValue::I64(d) if k == "duration_ms" => Some(*d),
+                    _ => None,
+                });
+                let stat = DeclaredColumnStat::new(
+                    "duration_ms",
+                    DeclaredStatType::I64,
+                    duration.map(DeclaredStatValue::I64),
+                    duration.map(DeclaredStatValue::I64),
+                    u64::from(duration.is_none()),
+                )
+                .expect("valid stamp");
+                ravel_commit::declared_stats::stamp_commit_record(&mut built, &[stat]);
+            }
             let data_key = keys::reconstruct_data_key(&built).expect("data key");
             store
                 .put(
@@ -4419,6 +4459,80 @@ mod tests {
             acc[0].object_store_get_requests
         );
         assert_eq!(scan.cache_hits, acc[0].cache_hits);
+    }
+
+    /// The report carries the logs scan's `segments_pruned_by_stats` for each
+    /// statement (ADR-2121 D1). Five one-record objects hold `duration_ms`
+    /// 0, 400, 800, 1200 and 1600, each commit record stamped with its exact
+    /// statistics, so `duration_ms = 1600` skips the other four before any
+    /// fetch and a predicate-free statement skips none. A report written
+    /// before the field existed still parses, with the figure `0`.
+    ///
+    /// Flipped assertion: filling the cold run's `segments_pruned_by_stats`
+    /// with `0` instead of `outcome.stats.segments_pruned_by_stats` fails the
+    /// first entry's `4`.
+    #[tokio::test]
+    async fn scan_diagnostics_report_segments_pruned_by_stats() {
+        let store = empty_store();
+        let tenant = TenantId::new("stats-prune-tenant");
+        let records = build_records(5, 0);
+        write_records_as_objects_with(&store, &tenant, 0, &records, true).await;
+        let (measured, skipped, failed) = measure_corpus(
+            &store,
+            tenant.hash(),
+            &[
+                entry(
+                    "selective",
+                    "SELECT body FROM logs WHERE duration_ms = 1600",
+                ),
+                entry("all", "SELECT body FROM logs"),
+            ],
+            &[DeclaredColumn::new("duration_ms", DeclaredType::I64)],
+            1,
+            TimeRange {
+                start_ns: 0,
+                end_ns: NOW_NS,
+            },
+            NOW_NS,
+            0,
+            Duration::from_secs(30),
+            false,
+            None,
+            ExecutorSettings::default(),
+            false,
+            None,
+        )
+        .await
+        .expect("run");
+        assert!(skipped.is_empty() && failed.is_empty());
+        let scan = |i: usize| {
+            measured[i]
+                .scan
+                .as_ref()
+                .expect("in-process scan diagnostics")
+        };
+        assert_eq!(measured[0].rows_returned, 1, "one record has duration 1600");
+        assert_eq!(scan(0).segments, 5);
+        assert_eq!(
+            scan(0).segments_pruned_by_stats,
+            4,
+            "the four objects whose stamps exclude 1600 are skipped"
+        );
+        assert_eq!(measured[1].rows_returned, 5);
+        assert_eq!(
+            scan(1).segments_pruned_by_stats,
+            0,
+            "a statement with no declared-column predicate skips nothing"
+        );
+
+        let mut legacy = serde_json::to_value(scan(0)).expect("serialize");
+        assert_eq!(legacy["segments_pruned_by_stats"], 4);
+        legacy
+            .as_object_mut()
+            .expect("object")
+            .remove("segments_pruned_by_stats");
+        let old: ScanDiagnostics = serde_json::from_value(legacy).expect("legacy report parses");
+        assert_eq!(old.segments_pruned_by_stats, 0);
     }
 
     // ---- Probe misses in the per-run accounting (#883) ---------------------
