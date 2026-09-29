@@ -554,15 +554,29 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   backend reached only through the `ObjectStoreBackend` contract report every
   condition `Unknown`; `S3Store` also
   gains `ObjectLockProbeSource`/`BucketConfigProbeSource` impls derived from the
-  same report. Two new direct dependencies for the crate: `ring` (SigV4
+  same report, and a `BucketProbesSource` impl that derives both from one
+  report. `LifecycleRuleStatus` gains `NonCompliant(reason)` for a rule that
+  covers `t/` but fails its condition (an `AbortIncompleteMultipartUpload`
+  longer than 7 days, a `NoncurrentDays` other than the expected one), where
+  the probe used to say `present`: `bucket_config_alarms` raises the abort
+  `NOTE` and, on a versioned bucket, the noncurrent-expiration `ALARM` on it,
+  each naming the reason, and `store qualify` prints `non-compliant` and the
+  reason on the rule's own line. `store qualify` asks both informational
+  probes through one `BucketProbesSource` call, so a source backed by the
+  control plane reads the bucket once per run (3 GETs where two separate
+  probes cost 6). Two new direct dependencies for the crate: `ring` (SigV4
   HMAC-SHA256 and SHA-256) and `quick-xml` 0.41 (reading the S3 XML responses),
   both already in the lock and neither pulling in an AWS SDK or a RustCrypto
   crate. `versioning` is `Unknown`, naming the element, when the
   `?versioning` document carries anything besides `Status` and `MfaDelete`
   (MinIO's `ExcludedPrefixes` and `ExcludeFolders` leave keys unversioned).
-  Every control-plane request is counted as an attempt in the store's
-  `StoreMetrics`, a `?versions` page under `list` and every other read under
-  `get`. The lifecycle conditions also accept a union of enabled rules on
+  Every control-plane request is counted in its own block of the store's
+  `StoreMetrics`, read with `StoreMetrics::control_plane()` as a
+  `ControlPlaneMetricsSnapshot` of `requests` (sent), `calls` (answered with
+  any status) and `response_bytes` (response-body wire bytes as received);
+  the block is outside `StoreOp::ALL` and `StoreMetricsSnapshot`, so the
+  data plane's `get` and `list` blocks are unchanged and nothing exports it
+  yet. The lifecycle conditions also accept a union of enabled rules on
   exactly `t/0` through `t/f`, one per lowercase hex digit a tenant hash can
   start with, each member's values checked as a covering rule's are; any other
   set of narrower prefixes stays `Unknown`. `BucketProtectionParams` gains

@@ -1261,19 +1261,11 @@ impl crate::conformance::BucketControlPlane for S3Store {
 #[async_trait::async_trait]
 impl crate::conformance::ObjectLockProbeSource for S3Store {
     async fn object_lock_status(&self) -> crate::conformance::ObjectLockProbe {
-        use crate::conformance::{ConditionState, ObjectLockProbe, ProtectionConditionId};
         let report = self
             .control_plane
             .report(&crate::conformance::BucketProtectionParams::default())
             .await;
-        match report.state(ProtectionConditionId::ObjectLock) {
-            Some(ConditionState::Pass) => {
-                ObjectLockProbe::enabled("Object Lock is enabled on the bucket (?object-lock)")
-            }
-            Some(ConditionState::Fail(detail)) => ObjectLockProbe::disabled(detail.clone()),
-            Some(ConditionState::Unknown(detail)) => ObjectLockProbe::unknown(detail.clone()),
-            None => ObjectLockProbe::unknown("object-lock condition missing from the report"),
-        }
+        object_lock_probe(&report)
     }
 }
 
@@ -1288,11 +1280,42 @@ impl crate::conformance::BucketConfigProbeSource for S3Store {
     }
 }
 
-/// Map the report onto the older three-field [`BucketConfigProbe`]. The probe
-/// has no "present but out of range" status, so a rule that covers `t/` but
-/// fails its condition (an abort rule longer than 7 days, covering noncurrent
-/// rules that disagree) is reported `Present`, with the failure named in
-/// `detail`, rather than `Absent`.
+#[async_trait::async_trait]
+impl crate::conformance::BucketProbesSource for S3Store {
+    /// Both probes from one report, so the bucket is read once.
+    async fn bucket_probes(&self) -> crate::conformance::BucketProbes {
+        let (report, notes) = self
+            .control_plane
+            .report_with_notes(&crate::conformance::BucketProtectionParams::default())
+            .await;
+        crate::conformance::BucketProbes {
+            object_lock: object_lock_probe(&report),
+            bucket_config: bucket_config_probe(&report, notes),
+        }
+    }
+}
+
+/// Map the report's `object-lock` condition onto an [`ObjectLockProbe`].
+///
+/// [`ObjectLockProbe`]: crate::conformance::ObjectLockProbe
+fn object_lock_probe(
+    report: &crate::conformance::BucketProtectionReport,
+) -> crate::conformance::ObjectLockProbe {
+    use crate::conformance::{ConditionState, ObjectLockProbe, ProtectionConditionId};
+    match report.state(ProtectionConditionId::ObjectLock) {
+        Some(ConditionState::Pass) => {
+            ObjectLockProbe::enabled("Object Lock is enabled on the bucket (?object-lock)")
+        }
+        Some(ConditionState::Fail(detail)) => ObjectLockProbe::disabled(detail.clone()),
+        Some(ConditionState::Unknown(detail)) => ObjectLockProbe::unknown(detail.clone()),
+        None => ObjectLockProbe::unknown("object-lock condition missing from the report"),
+    }
+}
+
+/// Map the report onto the older three-field [`BucketConfigProbe`]. A rule that
+/// covers `t/` but fails its condition (an abort rule longer than 7 days,
+/// covering noncurrent rules that disagree) is `NonCompliant` with the failure
+/// as its reason; a failing condition with no covering rule is `Absent`.
 ///
 /// [`BucketConfigProbe`]: crate::conformance::BucketConfigProbe
 fn bucket_config_probe(
@@ -1308,17 +1331,13 @@ fn bucket_config_probe(
         Some(ConditionState::Fail(_)) => VersioningStatus::Off,
         _ => VersioningStatus::Unknown,
     };
-    let mut detail = "derived from the ADR-1727 bucket-protection control plane (?versioning, \
-                      ?lifecycle over signed read-only GETs)"
+    let detail = "derived from the ADR-1727 bucket-protection control plane (?versioning, \
+                  ?lifecycle over signed read-only GETs)"
         .to_string();
-    let mut rule_status = |id: ProtectionConditionId, covers_data: bool| match report.state(id) {
+    let rule_status = |id: ProtectionConditionId, covers_data: bool| match report.state(id) {
         Some(ConditionState::Pass) => LifecycleRuleStatus::Present,
         Some(ConditionState::Fail(failure)) if covers_data => {
-            detail.push_str(&format!(
-                "; {}: rule present but failing: {failure}",
-                id.id()
-            ));
-            LifecycleRuleStatus::Present
+            LifecycleRuleStatus::NonCompliant(failure.clone())
         }
         Some(ConditionState::Fail(_)) => LifecycleRuleStatus::Absent,
         _ => LifecycleRuleStatus::Unknown,
@@ -2566,48 +2585,116 @@ mod tests {
 
     use super::*;
 
-    /// An abort rule that covers `t/` but runs longer than 7 days is present
-    /// and out of range, not absent: the probe says `Present` and names the
-    /// failure in its detail. With no covering rule it stays `Absent`.
-    #[test]
-    fn bucket_config_probe_reports_an_out_of_range_abort_rule_as_present() {
-        use crate::conformance::{LifecycleRuleStatus, ProtectionConditionId};
-        let body = b"<LifecycleConfiguration><Rule><Status>Enabled</Status><Filter/>\
-            <AbortIncompleteMultipartUpload><DaysAfterInitiation>30</DaysAfterInitiation>\
-            </AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>";
-        let lifecycle = bucket_config::FetchOutcome::Present(
-            bucket_config::parse_lifecycle(body).expect("parse"),
-        );
-        use bucket_config::FetchOutcome::Unknown;
+    /// The probe for one lifecycle document, with versioning `Enabled`.
+    fn probe_for_lifecycle(
+        body: &[u8],
+        params: &crate::conformance::BucketProtectionParams,
+    ) -> crate::conformance::BucketConfigProbe {
+        use bucket_config::FetchOutcome::{Present, Unknown};
+        let versioning = bucket_config::parse_versioning(
+            b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
+        )
+        .expect("parse");
+        let lifecycle = bucket_config::parse_lifecycle(body).expect("parse");
         let (report, notes) = bucket_config::assemble_report(
-            &Unknown("not asked".to_string()),
-            &lifecycle,
+            &Present(versioning),
+            &Present(lifecycle),
             &Unknown("not asked".to_string()),
             &Unknown("not asked".to_string()),
             &bucket_config::RetentionSample::NotSampled,
+            params,
+        );
+        bucket_config_probe(&report, notes)
+    }
+
+    /// An abort rule that covers `t/` but runs longer than 7 days is
+    /// `NonCompliant` with the failure as its reason, and raises the abort
+    /// NOTE naming that reason. With no covering noncurrent rule, that rule
+    /// stays `Absent` and raises the versioning ALARM.
+    #[test]
+    fn bucket_config_probe_reports_an_out_of_range_abort_rule_as_non_compliant() {
+        use crate::conformance::{LifecycleRuleStatus, VersioningStatus, bucket_config_alarms};
+        let probe = probe_for_lifecycle(
+            b"<LifecycleConfiguration><Rule><ID>ravel</ID><Status>Enabled</Status><Filter/>\
+            <AbortIncompleteMultipartUpload><DaysAfterInitiation>30</DaysAfterInitiation>\
+            </AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>",
             &crate::conformance::BucketProtectionParams::default(),
         );
-        assert!(
-            report
-                .state(ProtectionConditionId::AbortMultipart)
-                .expect("present")
-                .is_fail()
-        );
-        let probe = bucket_config_probe(&report, notes);
+        let reason = "rule \"ravel\": AbortIncompleteMultipartUpload is 30 days, more than 7";
+        assert_eq!(probe.versioning, VersioningStatus::On);
         assert_eq!(
             probe.abort_incomplete_multipart_upload,
-            LifecycleRuleStatus::Present
-        );
-        assert!(
-            probe
-                .detail
-                .contains("abort-multipart: rule present but failing"),
-            "{}",
-            probe.detail
+            LifecycleRuleStatus::NonCompliant(reason.to_string())
         );
         assert_eq!(
             probe.noncurrent_version_expiration,
             LifecycleRuleStatus::Absent
+        );
+        assert_eq!(
+            probe.detail,
+            "derived from the ADR-1727 bucket-protection control plane (?versioning, ?lifecycle \
+             over signed read-only GETs)"
+        );
+        let alarms = bucket_config_alarms(&probe);
+        assert_eq!(alarms.len(), 2, "{alarms:?}");
+        assert_eq!(
+            alarms[0],
+            "ALARM: object versioning is enabled but no noncurrent-version expiration rule is \
+             configured. This silently converts every Ravel delete (retention, sweep, and \
+             ADR-0064 erasure) into a soft delete, inverting every deletion guarantee, and is an \
+             unsupported configuration (ADR-0064 §7 point 1). Configure noncurrent-version \
+             expiration plus expired-delete-marker cleanup on all t/ prefixes, or disable \
+             versioning."
+        );
+        assert_eq!(
+            alarms[1],
+            format!(
+                "NOTE: the REQUIRED AbortIncompleteMultipartUpload lifecycle rule (7 days or \
+                 less) covers t/ but does not meet the contract: {reason} (ADR-0064 §7 point 3). \
+                 Abandoned multipart uploads stay billable for longer than the contract allows. \
+                 The NOTE prefix reflects the probe's limits, not an optional requirement."
+            )
+        );
+    }
+
+    /// A covering noncurrent rule whose `NoncurrentDays` disagrees with the
+    /// expected value is `NonCompliant`, and on a versioned bucket raises the
+    /// noncurrent ALARM naming the reason. The compliant abort rule beside it
+    /// is `Present` and raises nothing.
+    #[test]
+    fn bucket_config_probe_reports_a_disagreeing_noncurrent_rule_as_non_compliant() {
+        use crate::conformance::{LifecycleRuleStatus, bucket_config_alarms};
+        let params = crate::conformance::BucketProtectionParams {
+            expected_noncurrent_days: Some(30),
+            ..Default::default()
+        };
+        let probe = probe_for_lifecycle(
+            b"<LifecycleConfiguration><Rule><ID>ravel</ID><Status>Enabled</Status><Filter/>\
+            <NoncurrentVersionExpiration><NoncurrentDays>90</NoncurrentDays>\
+            </NoncurrentVersionExpiration>\
+            <AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation>\
+            </AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>",
+            &params,
+        );
+        let reason = "rule \"ravel\": NoncurrentDays is 90, expected 30";
+        assert_eq!(
+            probe.noncurrent_version_expiration,
+            LifecycleRuleStatus::NonCompliant(reason.to_string())
+        );
+        assert_eq!(
+            probe.abort_incomplete_multipart_upload,
+            LifecycleRuleStatus::Present
+        );
+        assert_eq!(
+            bucket_config_alarms(&probe),
+            vec![format!(
+                "ALARM: object versioning is enabled and a noncurrent-version expiration rule \
+                 covers t/, but it does not meet the contract: {reason}. A Ravel delete \
+                 (retention, sweep, and ADR-0064 erasure) then leaves prior versions recoverable \
+                 for a window other than the one the deployment's deletion bounds assume, which \
+                 is an unsupported configuration (ADR-0064 §7 point 1). Configure one \
+                 noncurrent-version expiration rule on all t/ prefixes, or disable versioning."
+            )]
         );
     }
 

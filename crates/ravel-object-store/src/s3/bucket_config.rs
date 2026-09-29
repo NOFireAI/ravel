@@ -38,7 +38,7 @@ use quick_xml::events::Event;
 use crate::conformance::{
     BucketProtectionParams, BucketProtectionReport, ConditionState, ProtectionConditionId,
 };
-use crate::instrument::{StoreMetrics, StoreOp};
+use crate::instrument::StoreMetrics;
 
 const ALGORITHM: &str = "AWS4-HMAC-SHA256";
 const SERVICE: &str = "s3";
@@ -1299,10 +1299,10 @@ const RETENTION_NOT_CONFIGURED: &[&str] = &["NoSuchObjectLockConfiguration"];
 pub(crate) struct BucketControlPlaneClient {
     client: reqwest::Client,
     credentials: AwsCredentialProvider,
-    /// The store's own [`StoreMetrics`]: every request here is billed like a
-    /// data-plane one, so it is counted as an attempt in the same handle the
-    /// data plane's counting connector records into. `reqwest` gives no
-    /// connector seam of its own, so [`Self::send_get`] records it directly.
+    /// The store's own [`StoreMetrics`]. Every request here is recorded in its
+    /// control-plane block ([`StoreMetrics::control_plane`]), never in a
+    /// data-plane per-op block. `reqwest` gives no connector seam of its own,
+    /// so [`Self::send_get`] records directly.
     metrics: Arc<StoreMetrics>,
     clock: Arc<dyn SigningClock>,
     bucket: String,
@@ -1342,12 +1342,10 @@ impl BucketControlPlaneClient {
     /// Sign and send one read-only `GET`, returning the 2xx body or a classified
     /// error. A 404 is [`ControlPlaneError::NotConfigured`] only when the body's
     /// `<Error><Code>` is one of `not_configured`; any other 404 is
-    /// [`ControlPlaneError::NotFound`]. The request is counted as one attempt
-    /// under `op`, the S3 request class it is billed as (`List` for the
-    /// `?versions` listing, `Get` for everything else).
+    /// [`ControlPlaneError::NotFound`]. The request, its response and the
+    /// response body's bytes are counted in the control-plane block.
     async fn send_get(
         &self,
-        op: StoreOp,
         object_key: Option<&str>,
         query_pairs: &[(String, String)],
         not_configured: &[&str],
@@ -1420,13 +1418,14 @@ impl BucketControlPlaneClient {
             builder = builder.header("x-amz-security-token", token);
         }
 
-        // Counted before dispatch, as the data plane's connector counts: the
-        // request is billed whether or not a response arrives.
-        self.metrics.record_attempt(op);
+        // Counted before dispatch: the request is billed whether or not a
+        // response arrives.
+        self.metrics.record_control_plane_request();
         let mut response = builder
             .send()
             .await
             .map_err(|e| ControlPlaneError::Transport(e.to_string()))?;
+        self.metrics.record_control_plane_call();
         let status = response.status();
         if status.is_redirection() {
             return Err(ControlPlaneError::Redirect(status.as_u16()));
@@ -1443,6 +1442,8 @@ impl BucketControlPlaneClient {
             .await
             .map_err(|e| ControlPlaneError::Transport(e.to_string()))?
         {
+            self.metrics
+                .record_control_plane_response_bytes(chunk.len() as u64);
             if body.len() + chunk.len() > MAX_BODY_BYTES {
                 return Err(ControlPlaneError::BodyTooLarge);
             }
@@ -1469,13 +1470,8 @@ impl BucketControlPlaneClient {
 
     async fn fetch_versioning(&self) -> FetchOutcome<VersioningConfig> {
         classify_fetch(
-            self.send_get(
-                StoreOp::Get,
-                None,
-                &[("versioning".to_string(), String::new())],
-                &[],
-            )
-            .await,
+            self.send_get(None, &[("versioning".to_string(), String::new())], &[])
+                .await,
             parse_versioning,
             "",
         )
@@ -1484,7 +1480,6 @@ impl BucketControlPlaneClient {
     async fn fetch_lifecycle(&self) -> FetchOutcome<LifecycleConfig> {
         classify_fetch(
             self.send_get(
-                StoreOp::Get,
                 None,
                 &[("lifecycle".to_string(), String::new())],
                 LIFECYCLE_NOT_CONFIGURED,
@@ -1498,7 +1493,6 @@ impl BucketControlPlaneClient {
     async fn fetch_replication(&self) -> FetchOutcome<ReplicationConfig> {
         classify_fetch(
             self.send_get(
-                StoreOp::Get,
                 None,
                 &[("replication".to_string(), String::new())],
                 REPLICATION_NOT_CONFIGURED,
@@ -1512,7 +1506,6 @@ impl BucketControlPlaneClient {
     async fn fetch_object_lock(&self) -> FetchOutcome<ObjectLockConfig> {
         classify_fetch(
             self.send_get(
-                StoreOp::Get,
                 None,
                 &[("object-lock".to_string(), String::new())],
                 OBJECT_LOCK_NOT_CONFIGURED,
@@ -1541,7 +1534,7 @@ impl BucketControlPlaneClient {
             ));
         }
         classify_fetch(
-            self.send_get(StoreOp::List, None, &pairs, &[]).await,
+            self.send_get(None, &pairs, &[]).await,
             parse_object_versions,
             "",
         )
@@ -1550,7 +1543,6 @@ impl BucketControlPlaneClient {
     async fn fetch_retention(&self, key: &str, version_id: &str) -> FetchOutcome<RetentionConfig> {
         classify_fetch(
             self.send_get(
-                StoreOp::Get,
                 Some(key),
                 &[
                     ("retention".to_string(), String::new()),

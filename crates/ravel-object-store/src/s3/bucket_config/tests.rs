@@ -9,6 +9,8 @@ use axum::response::Response;
 use axum::routing::get;
 use parking_lot::Mutex;
 
+use crate::instrument::{ControlPlaneMetricsSnapshot, StoreMetricsSnapshot};
+
 use super::*;
 
 /// A fixed clock so signatures and retention expiry are reproducible.
@@ -1655,6 +1657,8 @@ struct SeenRequest {
     path: String,
     query: String,
     headers: Vec<(String, String)>,
+    /// Length of the body the fake answered with.
+    response_body_len: u64,
 }
 
 #[derive(Clone)]
@@ -1671,6 +1675,12 @@ async fn fake_handler(
 ) -> Response {
     let query = uri.query().unwrap_or("").to_string();
     let path = uri.path().to_string();
+    let subresource = query
+        .split('&')
+        .next()
+        .and_then(|p| p.split('=').next())
+        .unwrap_or("");
+    let (status, body) = (state.respond)(subresource, &path, &query);
     state.seen.lock().push(SeenRequest {
         method: method.to_string(),
         path: path.clone(),
@@ -1684,13 +1694,8 @@ async fn fake_handler(
                 )
             })
             .collect(),
+        response_body_len: body.len() as u64,
     });
-    let subresource = query
-        .split('&')
-        .next()
-        .and_then(|p| p.split('=').next())
-        .unwrap_or("");
-    let (status, body) = (state.respond)(subresource, &path, &query);
     let mut response = Response::builder().status(status);
     if status.is_redirection() {
         response = response.header("location", "/redirected?versioning=");
@@ -1865,6 +1870,7 @@ fn local_verifier_accepts_the_aws_query_string_examples() {
                     ),
                 ),
             ],
+            ..SeenRequest::default()
         };
         verify_authorization(&request, &UNSIGNED_TOKEN);
     }
@@ -3148,14 +3154,18 @@ fn two_version_bucket() -> Responder {
     )
 }
 
-/// Every control-plane request is billed, so each one the endpoint served
-/// moves the store's attempt counter, under the request class S3 bills it as:
-/// the `?versions` listing page as a LIST, every other read as a GET.
+/// Every control-plane request lands in the store's control-plane block, not
+/// in a data-plane per-op block: `requests` and `calls` per GET served, and
+/// `response_bytes` as the body bytes the endpoint sent. The data plane's
+/// blocks stay exactly zero, so `attempts - calls` there still means retries.
 #[tokio::test]
-async fn report_requests_are_counted_in_the_store_metrics() {
+async fn report_requests_are_counted_in_the_control_plane_block() {
     let (base, seen) = spawn_fake(two_version_bucket()).await;
     let metrics: Arc<StoreMetrics> = Arc::default();
     let client = test_client_with_metrics(&base, None, true, Arc::clone(&metrics));
+    let served_bytes = |seen: &Mutex<Vec<SeenRequest>>| -> u64 {
+        seen.lock().iter().map(|r| r.response_body_len).sum()
+    };
 
     let report = client.report(&full_params()).await;
     assert!(
@@ -3164,27 +3174,55 @@ async fn report_requests_are_counted_in_the_store_metrics() {
             .expect("present")
             .is_pass()
     );
-    let served = u64::try_from(seen.lock().len()).expect("fits");
-    let snapshot = metrics.snapshot();
-    assert_eq!(served, 7);
-    assert_eq!(snapshot.list.attempts, 1, "{snapshot:?}");
-    assert_eq!(snapshot.get.attempts, 6, "{snapshot:?}");
-    let total: u64 = StoreOp::ALL
-        .iter()
-        .map(|op| snapshot.op(*op).attempts)
-        .sum();
-    assert_eq!(total, served);
+    // versioning, lifecycle, replication, object-lock, one `?versions` page,
+    // and the retention of the current and the noncurrent version.
+    assert_eq!(seen.lock().len(), 7);
+    let bytes = served_bytes(&seen);
+    assert_eq!(bytes, 1348);
     assert_eq!(
-        snapshot.get.calls, 0,
-        "attempts only, never completed calls"
+        metrics.control_plane(),
+        ControlPlaneMetricsSnapshot {
+            requests: 7,
+            calls: 7,
+            response_bytes: bytes,
+        }
     );
+    assert_eq!(metrics.snapshot(), StoreMetricsSnapshot::default());
 
     // The server's params fetch versioning, lifecycle and object-lock only.
     client.report(&BucketProtectionParams::default()).await;
-    let served = u64::try_from(seen.lock().len()).expect("fits");
-    let snapshot = metrics.snapshot();
-    assert_eq!(served, 10);
-    assert_eq!(snapshot.get.attempts + snapshot.list.attempts, served);
+    assert_eq!(seen.lock().len(), 10);
+    let bytes = served_bytes(&seen);
+    assert_eq!(bytes, 1348 + 612);
+    assert_eq!(
+        metrics.control_plane(),
+        ControlPlaneMetricsSnapshot {
+            requests: 10,
+            calls: 10,
+            response_bytes: bytes,
+        }
+    );
+    assert_eq!(metrics.snapshot(), StoreMetricsSnapshot::default());
+
+    // A GET that gets no response is a request and not a call.
+    let closed = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind");
+    let closed_base = format!("http://{}", closed.local_addr().expect("addr"));
+    drop(closed);
+    let unreachable: Arc<StoreMetrics> = Arc::default();
+    test_client_with_metrics(&closed_base, None, true, Arc::clone(&unreachable))
+        .report(&BucketProtectionParams::default())
+        .await;
+    assert_eq!(
+        unreachable.control_plane(),
+        ControlPlaneMetricsSnapshot {
+            requests: 3,
+            calls: 0,
+            response_bytes: 0,
+        }
+    );
+    assert_eq!(unreachable.snapshot(), StoreMetricsSnapshot::default());
 }
 
 /// Without a replication expectation (the server, ADR-1727 decision 5)

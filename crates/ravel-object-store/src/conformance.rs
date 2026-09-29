@@ -363,10 +363,15 @@ impl VersioningStatus {
 }
 
 /// Whether one of ADR-0064 §7's sanctioned lifecycle rules appears configured.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LifecycleRuleStatus {
-    /// The backend affirmatively reports the rule present.
+    /// The backend affirmatively reports the rule present and compliant.
     Present,
+    /// The backend affirmatively reports a rule covering every key under `t/`
+    /// that carries the action but fails its condition (an abort rule longer
+    /// than 7 days, covering noncurrent rules that disagree). Carries the
+    /// reason. Alarms exactly as [`Absent`](Self::Absent) does.
+    NonCompliant(String),
     /// The backend affirmatively reports the rule absent.
     Absent,
     /// The backend cannot answer (the honest default through the trait
@@ -379,6 +384,7 @@ impl LifecycleRuleStatus {
     pub fn name(&self) -> &'static str {
         match self {
             LifecycleRuleStatus::Present => "present",
+            LifecycleRuleStatus::NonCompliant(_) => "non-compliant",
             LifecycleRuleStatus::Absent => "absent",
             LifecycleRuleStatus::Unknown => "unknown",
         }
@@ -425,33 +431,49 @@ pub fn bucket_config_alarms(probe: &BucketConfigProbe) -> Vec<String> {
     // expiration rule silently converts every Ravel delete into a soft delete,
     // inverting every deletion guarantee in the system. ADR-0064 §7 point 1
     // calls this an unsupported configuration.
-    if probe.versioning == VersioningStatus::On
-        && probe.noncurrent_version_expiration == LifecycleRuleStatus::Absent
-    {
-        alarms.push(
-            "ALARM: object versioning is enabled but no noncurrent-version expiration rule is \
-             configured. This silently converts every Ravel delete (retention, sweep, and \
-             ADR-0064 erasure) into a soft delete, inverting every deletion guarantee, and is an \
-             unsupported configuration (ADR-0064 §7 point 1). Configure noncurrent-version \
-             expiration plus expired-delete-marker cleanup on all t/ prefixes, or disable \
-             versioning."
-                .to_string(),
-        );
+    if probe.versioning == VersioningStatus::On {
+        match &probe.noncurrent_version_expiration {
+            LifecycleRuleStatus::Absent => alarms.push(
+                "ALARM: object versioning is enabled but no noncurrent-version expiration rule \
+                 is configured. This silently converts every Ravel delete (retention, sweep, and \
+                 ADR-0064 erasure) into a soft delete, inverting every deletion guarantee, and is \
+                 an unsupported configuration (ADR-0064 §7 point 1). Configure noncurrent-version \
+                 expiration plus expired-delete-marker cleanup on all t/ prefixes, or disable \
+                 versioning."
+                    .to_string(),
+            ),
+            LifecycleRuleStatus::NonCompliant(reason) => alarms.push(format!(
+                "ALARM: object versioning is enabled and a noncurrent-version expiration rule \
+                 covers t/, but it does not meet the contract: {reason}. A Ravel delete \
+                 (retention, sweep, and ADR-0064 erasure) then leaves prior versions recoverable \
+                 for a window other than the one the deployment's deletion bounds assume, which \
+                 is an unsupported configuration (ADR-0064 §7 point 1). Configure one \
+                 noncurrent-version expiration rule on all t/ prefixes, or disable versioning."
+            )),
+            LifecycleRuleStatus::Present | LifecycleRuleStatus::Unknown => {}
+        }
     }
     // REQUIRED (#864): the abort-incomplete-multipart rule (ADR-0064 §7 point 3;
     // also converts S5-19's undocumented dependency into a documented one).
     // Emitted under NOTE rather than ALARM only because no vendor API this crate
     // calls can observe the rule, so the probe cannot establish compliance
     // either way. The prefix reflects the probe's limits, not a weaker rule.
-    if probe.abort_incomplete_multipart_upload == LifecycleRuleStatus::Absent {
-        alarms.push(
+    match &probe.abort_incomplete_multipart_upload {
+        LifecycleRuleStatus::Absent => alarms.push(
             "NOTE: the REQUIRED AbortIncompleteMultipartUpload lifecycle rule (7 days or \
              less) is not configured (ADR-0064 §7 point 3). Its absence violates the bucket \
              configuration contract: nothing in Ravel reaps abandoned multipart uploads, so \
              their parts stay billable indefinitely. The NOTE prefix reflects the probe's \
              limits, not an optional requirement."
                 .to_string(),
-        );
+        ),
+        LifecycleRuleStatus::NonCompliant(reason) => alarms.push(format!(
+            "NOTE: the REQUIRED AbortIncompleteMultipartUpload lifecycle rule (7 days or less) \
+             covers t/ but does not meet the contract: {reason} (ADR-0064 §7 point 3). \
+             Abandoned multipart uploads stay billable for longer than the contract allows. \
+             The NOTE prefix reflects the probe's limits, not an optional requirement."
+        )),
+        LifecycleRuleStatus::Present | LifecycleRuleStatus::Unknown => {}
     }
     alarms
 }
@@ -491,6 +513,38 @@ pub async fn probe_bucket_config<S: BucketConfigProbeSource + ?Sized>(
     source: &S,
 ) -> BucketConfigProbe {
     source.bucket_config().await
+}
+
+/// Both informational probes, as `ravel-cli store qualify` prints them.
+#[derive(Debug, Clone)]
+pub struct BucketProbes {
+    pub object_lock: ObjectLockProbe,
+    pub bucket_config: BucketConfigProbe,
+}
+
+/// Source of both informational probes at once, for a caller that reports
+/// both. The provided method asks the two sources in turn; a source whose two
+/// answers come from one read of the bucket (`S3Store`, one control-plane
+/// report) overrides it so the read happens once.
+#[async_trait::async_trait]
+pub trait BucketProbesSource: ObjectLockProbeSource + BucketConfigProbeSource + Sync {
+    async fn bucket_probes(&self) -> BucketProbes {
+        BucketProbes {
+            object_lock: self.object_lock_status().await,
+            bucket_config: self.bucket_config().await,
+        }
+    }
+}
+
+/// The production path: both halves are `Unknown`, as the two impls above.
+impl BucketProbesSource for dyn ObjectStoreBackend {}
+
+/// Run both informational probes against `source`. Never fails, never panics,
+/// never affects qualification.
+pub async fn probe_bucket_lock_and_config<S: BucketProbesSource + ?Sized>(
+    source: &S,
+) -> BucketProbes {
+    source.bucket_probes().await
 }
 
 // --- Noncurrent-version listing for verify-custody (ADR-0064 §7, S4-12) ---
