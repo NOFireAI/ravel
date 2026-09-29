@@ -66,8 +66,11 @@ measurements are on #2121 (Stage 0 and 0b):
     validation, 5.3% sits under that presence search and 4.2% under
     `build_columnar_batches`.
 - The single-column statements (q2-q4, q8, q11-q12, q20, q25-q27, q30) spend
-  6-17 CPU-s each. 90.3% of that is scan decode. DataFusion finishes them in
-  0.05-0.35 s wall.
+  6-17 CPU-s each. 90.3% of that is scan decode, 15.5% is per-cell
+  `AttrValue` work and 6.2% is UTF-8 validation. They total 15.1 s hot,
+  against DataFusion's 0.05-0.35 s each. These figures come from the Stage
+  0b comment on #2121 (issuecomment-5880952601), and the hot totals from the
+  Stage 0 results (issuecomment-5879801791).
 
 **A per-statement floor sits outside the CPU profile.**
 - q1, q7 and q37-q43 run in 0.42-0.48 s on 0.1-2.8 CPU-s.
@@ -96,18 +99,31 @@ by content hash then identity, and conflicting carriers treated as absent.
   - `IN` on a declared `I64` column, as its one envelope range, in both
     forms `extract_logs` recognises: a literal `IN` list, and the
     same-column `col = v1 OR col = v2 OR ...` that DataFusion's simplifier
-    rewrites a small `IN` into before the scan sees it;
-  - the `ts` window.
+    rewrites a small `IN` into before the scan sees it.
+
+  The `ts` window is not one of them. `extract_logs` carries it separately
+  (`ts_lo`/`ts_hi`), and the provider already drops segments outside it by
+  their `SegmentRef` time range. D1 does not count those drops in
+  `segments_pruned_by_stats`.
 
   Everything `extract_logs` declines, D1 declines too, including `!=`, `NOT`
   and a general `OR`. The arms `extract_logs` produces are intersected, so a
   segment is skipped when any one arm's range is disjoint from the segment's
   [min, max].
 - **Conservative by construction.** A segment is skipped only when stats are
-  present and exact for that column in that segment, and the predicate is
-  false over the closed interval [min, max] for every value (NULL rows never
-  satisfy a comparison, so a segment of all NULLs is skippable for any
-  comparison).
+  present and exact for that column in that segment, and the arm is false
+  over the closed interval [min, max] for every value.
+- **Ordering.** The disjointness test runs in the declared type's own
+  ordering: signed `i64`, and `false < true` for `Bool`. The arm's
+  bit-pattern bounds are decoded to that type before any comparison, the
+  way the reader's `stat_disjoint` compares them. An unsigned compare of the
+  bit patterns would order every negative value above every positive one,
+  and would skip a segment that holds matching rows. q41's `TraficSourceID
+  IN (-1, 6)` has exactly that shape.
+- **All-NULL segments.** Coverage present with no extrema proves the column
+  has no non-null row in that segment. NULL satisfies no comparison, so every
+  arm skips that segment. This is its own rule, not a case of the [min, max]
+  test, and it applies only when the NULL count is proven.
 - **Floats.** No declared float type exists yet. When one lands, its arm
   inherits `NumRange`'s float contract before D1 may use it.
 - **Str columns.** They are excluded from this ADR because
@@ -120,10 +136,23 @@ by content hash then identity, and conflicting carriers treated as absent.
   `LogsTableProvider::scan` returns the fan-out plan before it extracts any
   predicate, and filters are re-applied above that plan. D1 prunes nothing
   on that path, and this ADR leaves it that way.
+- **Flight SQL slices.** A Flight SQL `DoGet` serves a slice whose ticket
+  carries `SegmentRef`s without their stamps, and adding them would change
+  the ticket format. D1 therefore skips nothing on that path. The
+  ClickBench driver queries over HTTP, so it is not affected.
+- **Carriers in practice.** A filtered scan does not normally load `.cstat`
+  (the executor's load gate), so production skipping comes from the stamps.
+  On this corpus, `CounterID` is a declared resource attribute. It has no
+  FIELD_DIR column, so `.cstat` never covers it. The stamp, which folds the
+  merged value including resource attributes, is its only carrier.
+  Measuring D1 therefore has a precondition: before the final run, check
+  that the loaded segments carry a `CounterID` stamp. A corpus without
+  stamps would skip nothing and read as a code regression.
 - **Visibility.** The pruned count is reported:
   - as `segments_pruned_by_stats` on the scan's `EXPLAIN ANALYZE` metrics;
-  - in query accounting, next to `segments_pruned` (postings), so a report
-    can say which mechanism skipped what.
+  - in `SqlStats`, beside `blocks_pruned_by_postings`, and in
+    `sql_latency_bench`'s per-statement report. (`Snapshot::segments_pruned`
+    is a resolve-time count, not a postings count.)
 
 A skipped segment is never fetched, so it costs no GET, no bytes and no
 admission. `max_segments` admission still counts the resolved snapshot, not
@@ -136,16 +165,22 @@ The v4 decoded block holds a declared column as one `Vec<Option<i64>>`,
 array is built over the block's surviving rows, so every build is a gather
 through the surviving row indices.
 
-When the block's key has exactly one record-level occurrence of the
-declared type and no resource or scope value can supply or override any
-surviving row, `build_declared_columnar_array` gathers that column's cells
-straight into the Arrow builder for its `Int64`, `Boolean` or `Binary`
-array. It does not call `merged_value` and constructs no `AttrValue`. The
-condition is decided once per block, from the same `DeclaredPlan`
-`merged_value` consults. Every other block keeps today's per-cell path
-unchanged, including the ADR-0090 decision 7 rule that a wrong-variant
-record value reads NULL. This is ADR-0099 decision 2's direct construction,
-applied to the declared arms that still go through the row-path resolver.
+When the block's key has exactly one record-level occurrence, and it is of
+the declared type (`single_matching`, which `DeclaredPlan` already
+computes), `build_declared_columnar_array` reads each surviving row's cell
+from that column. A present cell goes straight into the `Int64`, `Boolean`
+or `Binary` builder, with no `merged_value` call and no `AttrValue`. An
+absent cell takes today's path for that row: the resource or scope
+fallback through `DeclaredResolver`. This is the same order `merged_value`
+already follows, since its fused `single_matching` read returns before the
+fallback whenever the cell is present.
+- No per-stream check is added. Resource and scope values are still decoded
+  only for rows the record does not set.
+- Blocks where the key has several occurrences keep today's per-cell path
+  unchanged, including the ADR-0090 decision 7 rule that a wrong-variant
+  record value reads NULL.
+- This is ADR-0099 decision 2's direct construction, applied to the
+  declared arms that still go through the row-path resolver.
 
 The gather is correct only if it produces the same array as the per-cell
 path. A property test drives both over generated blocks, including:
@@ -162,16 +197,18 @@ A declared `Str` column stays a `Dictionary(Int32, Utf8)` array on every
 path (ADR-0099 decision 5): the fast-path batch and the fallback batch must
 validate against one schema. What changes is how often a cell's bytes are
 validated:
-- **Presence.** Choosing the winning occurrence of a key no longer validates
-  UTF-8 to decide whether a `Str` cursor is present at a row. The decision
-  "a non-UTF-8 cell counts as absent and falls through to the resource or
-  scope value" is kept. It is made once per cell and reused by the build
-  that follows. Presence is not reduced to "bytes present", because that
+- **Presence.** Choosing the winning occurrence of a key (`winning_idx`,
+  called per surviving row on both page kinds) no longer re-validates UTF-8
+  to decide whether a `Str` cursor is present at a row. The rule "a
+  non-UTF-8 cell counts as absent and falls through to the resource or scope
+  value" is kept. Presence is not reduced to "bytes present", because that
   would change which occurrence wins.
-- **Plain pages.** A plain-page cell validated for presence is not validated
-  again when its `&str` is appended.
-- **Dict pages.** These already validate each dictionary entry once per
-  block. They are unchanged.
+- **Dict pages.** The builder already validates each dictionary entry once
+  per block to build the values array. That per-entry validity is recorded
+  once, and a row's presence becomes a lookup of its id in it, not a
+  validation of the entry's bytes per row.
+- **Plain pages.** Each cell is validated once. The result is shared between
+  the presence search and the append of its `&str`.
 
 Results do not change: a cell that reads NULL or falls through today does
 the same afterwards. A property test compares the arrays before and after
@@ -179,15 +216,21 @@ over generated blocks that include invalid UTF-8 cells, dictionary entries
 and multi-occurrence keys. No `unsafe`, and no unchecked UTF-8 conversion;
 the workspace denies both.
 
-### D4. Decode integer pages in batches
+### D4. Decode an integer page straight into its present rows
 
-The per-value varint and bit-unpacking loops that produce the decoded
-columns D2 gathers from decode a page's
-values into a reusable buffer in one pass per page. They stop going through
-per-value iterator calls.
+An integer page is already decoded in one pass (`decode_i64`,
+`decode_bitmap`) into a vector of the present values. `block.rs` then
+scatters that vector against the block's presence bitmap into a second
+vector, `Vec<Option<_>>`. D4 fuses the two steps: the page decodes directly
+into the presence-shaped vector, which removes one allocation and one pass
+per page.
+- The per-value varint decode itself (`get_uvarint`, `get_ivarint`) is not
+  touched. Making it cheaper means a different encoding, which is #2135's
+  (RLOG v5) scope and a format change.
+- So D4 is credited only with the scatter and allocation share. It is not
+  credited with the whole 7.1% leaf share of varint and bit unpacking.
 - This is decoder implementation only. The RLOG v4 page encoding does not
-  change, so nothing here touches a frozen format.
-- The existing codec property tests pin equivalence.
+  change, and the existing codec property tests pin equivalence.
 
 ### D5. Measure the floor before changing anything for it
 
@@ -244,9 +287,9 @@ final measurement runs.
     #2135 instead.
   - The band allows for the part of wall time that does not scale with CPU.
 - **Single-column statements (q2-q4, q8, q11-q12, q20, q25-q27, q30):** hot
-  at most 13.5 s in total, against 15.1 s today. A miss is anything above
-  14.3 s. Their ceiling is the 15.5% `AttrValue` share plus at most the
-  6.2% UTF-8 share, so the floor is about 11.8 s.
+  at most 13.5 s in total, against 15.1 s today (Context). A miss is
+  anything above 14.3 s. Their ceiling is the 15.5% `AttrValue` share plus
+  at most their 6.2% UTF-8 share, so the floor is about 11.8 s.
 - **Cold, total:** at most 1,500 s. A miss is anything above 1,540 s.
   - Each skipped segment saves about 42.7 s / 2,617 of a statement's cold
     time.
@@ -260,7 +303,7 @@ final measurement runs.
   segments. The exact per-statement figures, and the figure for every other
   statement with an extracted arm (q20's `UserID = ...` among them), are
   computed from a dump of the tenant's stamps and posted on #2121 before
-  the final run. The seven statements do not share one predicate set, so
+  the final run. The dump is also the check of D1's stamp precondition. The seven statements do not share one predicate set, so
   they are not expected to share one figure.
 - **No regressions:**
   - every statement returns the same rows as main;
@@ -324,7 +367,7 @@ flowchart LR
   B -->|I64/Bool/Bytes, single occurrence, no overlay| D2[D2: gather cells, no AttrValue]
   B -->|overlay or several occurrences| OLD[per-cell merged_value, unchanged]
   B -->|Str| D3[D3: UTF-8 checked at most once per cell per block]
-  B --> D4[D4: batch varint / bit unpack]
+  B --> D4[D4: decode integer pages straight into present rows]
 ```
 
 - Statements with a selective predicate on a declared `I64`, `Bool` or `ts`
