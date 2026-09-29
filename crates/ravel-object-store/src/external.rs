@@ -192,7 +192,8 @@ pub enum ExternalKind {
     S3 {
         region: String,
         /// `None` uses AWS's regional endpoint; set it for an S3-compatible
-        /// deployment.
+        /// deployment. A scheme, host and port only: [`ExternalStore::open`]
+        /// refuses an endpoint carrying a path.
         #[serde(default)]
         endpoint: Option<String>,
         #[serde(default)]
@@ -260,6 +261,15 @@ pub enum ProfileError {
     CredentialsRejected { kind: &'static str, profile: String },
     #[error("opening the external store failed: {0}")]
     Backend(#[from] StoreError),
+    /// An S3 profile's endpoint carries a path, query or fragment. The client
+    /// sends every request under the endpoint as written, with `/<bucket>`
+    /// appended when path-style, so a path would move the bucket the profile
+    /// names under another one.
+    #[error(
+        "the S3 endpoint of profile {profile} carries a path; an endpoint names a host and \
+         port, and the bucket is named separately"
+    )]
+    EndpointPath { profile: String },
 }
 
 /// Parse a JSON array of profiles.
@@ -327,6 +337,16 @@ impl ExternalStore {
             bucket = %bucket,
             "opening a read-only external store"
         );
+        if let ExternalKind::S3 {
+            endpoint: Some(endpoint),
+            ..
+        } = &profile.kind
+            && endpoint_carries_a_path(endpoint)
+        {
+            return Err(ProfileError::EndpointPath {
+                profile: profile.name.clone(),
+            });
+        }
         let backend = match &profile.kind {
             ExternalKind::S3 {
                 region,
@@ -376,6 +396,16 @@ impl ExternalStore {
             store: format!("external profile {}", self.profile),
         })
     }
+}
+
+/// Whether an S3 endpoint URL has anything after its authority other than
+/// trailing `/`s, which the client trims: a path, a query or a fragment.
+fn endpoint_carries_a_path(endpoint: &str) -> bool {
+    let rest = endpoint
+        .split_once("://")
+        .map_or(endpoint, |(_, rest)| rest);
+    let after = rest.find(['/', '?', '#']).map_or("", |at| &rest[at..]);
+    !after.trim_end_matches('/').is_empty()
 }
 
 fn open_s3(
@@ -892,6 +922,56 @@ mod tests {
             !caps.suffix_range,
             "object_store's Azure client refuses a suffix range"
         );
+    }
+
+    /// An S3 endpoint with a path is refused before any secret is read (the
+    /// secret file here does not exist), whatever the addressing style: a
+    /// path-style `http://ravel-host/ravel-bucket` with bucket `t` would read
+    /// Ravel's keys under `t/`. Trailing slashes, which the client trims, are
+    /// not a path.
+    #[test]
+    fn an_s3_endpoint_with_a_path_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("missing");
+        for endpoint in [
+            "http://ravel-host/ravel-bucket",
+            "http://ravel-host:9000/ravel-bucket/",
+            "https://ravel-host/?x=1",
+            "https://ravel-host#f",
+            "ravel-host/ravel-bucket",
+        ] {
+            for force_path_style in [true, false] {
+                let mut profile = s3_profile(&missing);
+                if let ExternalKind::S3 {
+                    endpoint: e,
+                    force_path_style: style,
+                    ..
+                } = &mut profile.kind
+                {
+                    *e = Some(endpoint.to_string());
+                    *style = force_path_style;
+                }
+                let err = ExternalStore::open(&profile, "t").err().expect("refused");
+                assert!(
+                    matches!(&err, ProfileError::EndpointPath { profile } if profile == "lake"),
+                    "{endpoint} {force_path_style}: {err:?}"
+                );
+                assert!(!err.to_string().contains("ravel-bucket"), "{err}");
+            }
+        }
+        for endpoint in [
+            "http://ravel-host",
+            "http://ravel-host/",
+            "http://ravel-host:9000//",
+        ] {
+            assert!(!endpoint_carries_a_path(endpoint), "{endpoint}");
+        }
+        let path = secret_file(&dir);
+        let mut profile = s3_profile(&path);
+        if let ExternalKind::S3 { endpoint: e, .. } = &mut profile.kind {
+            *e = Some("http://127.0.0.1:1/".to_string());
+        }
+        ExternalStore::open(&profile, "t").expect("a trailing slash opens");
     }
 
     #[test]

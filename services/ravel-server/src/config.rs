@@ -103,12 +103,13 @@ pub struct ParquetProfiles {
     pub ravel_bucket: Option<RavelS3Bucket>,
 }
 
-/// Ravel's own S3 bucket and the endpoint it is reached at (`None` for AWS's
-/// regional endpoint).
+/// Ravel's own S3 bucket, the endpoint it is reached at (`None` for AWS's
+/// regional endpoint) and the region, as `--store s3` reaches it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RavelS3Bucket {
     pub bucket: String,
     pub endpoint: Option<String>,
+    pub region: String,
 }
 
 /// Which credential source `--store s3` uses (ADR-0106). The CLI-facing mirror
@@ -6341,6 +6342,14 @@ impl Cli {
             .map_err(|e| anyhow::anyhow!("invalid --limits-file {}: {e}", path.display()))
     }
 
+    /// `--s3-region`, or `us-east-1` when it is not set: the region
+    /// `--store s3` reaches its bucket in.
+    pub fn s3_region_or_default(&self) -> String {
+        self.s3_region
+            .clone()
+            .unwrap_or_else(|| "us-east-1".to_string())
+    }
+
     /// Load and validate `--parquet-profiles` (ADR-2040 decision D1) through
     /// [`ravel_object_store::external::load_profiles`], with Ravel's own data
     /// bucket beside them. `None` when the flag is absent.
@@ -6357,6 +6366,7 @@ impl Cli {
             StoreKind::S3 => self.s3_bucket.clone().map(|bucket| RavelS3Bucket {
                 bucket,
                 endpoint: self.s3_endpoint.clone(),
+                region: self.s3_region_or_default(),
             }),
         };
         Ok(Some(ParquetProfiles {
@@ -12618,6 +12628,7 @@ mod tests {
             Some(RavelS3Bucket {
                 bucket: "ravel-data".to_string(),
                 endpoint: Some("http://127.0.0.1:9000".to_string()),
+                region: "us-east-1".to_string(),
             })
         );
         let duplicate = tempfile::NamedTempFile::new().expect("temp file");

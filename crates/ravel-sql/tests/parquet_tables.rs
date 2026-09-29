@@ -687,10 +687,11 @@ async fn a_file_changed_or_deleted_after_create_fails_the_query_naming_it() {
 }
 
 /// ADR-2040 D4: a manifest naming a file in Ravel's own data bucket is refused
-/// when the query reads it, whatever wrote the manifest. The production
-/// `ProfileStores` is configured with Ravel's bucket at the profile's own
-/// endpoint; the refusal comes before the store is opened, so the query
-/// fails typed without a network.
+/// when the query reads it. The production `ProfileStores` is configured with
+/// Ravel's bucket at the profile's own endpoint, which the profile addresses
+/// virtual-hosted, so every key it reads is sent under that endpoint as
+/// written; the refusal comes before the store is opened, so the query fails
+/// typed without a network.
 #[tokio::test]
 async fn a_file_in_ravels_own_bucket_is_refused_on_read() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -706,6 +707,7 @@ async fn a_file_in_ravels_own_bucket_is_refused_on_read() {
     let profiles = ravel_object_store::external::load_profiles(&json).expect("profiles");
     let stores = ravel_sql::ProfileStores::new(profiles).refusing(ravel_sql::RavelBucket {
         endpoint: Some("http://127.0.0.1:9".to_string()),
+        region: "us-east-1".to_string(),
         bucket: BUCKET.to_string(),
     });
     let lake = Lake::with_external(

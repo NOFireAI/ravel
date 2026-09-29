@@ -62,73 +62,201 @@ pub enum ExternalStoreError {
         #[source]
         source: ProfileError,
     },
-    /// The profile reaches `bucket` at the endpoint Ravel's own data bucket is
-    /// configured at, and the names match (ADR-2040 D4). No Parquet table reads
-    /// Ravel's bucket, whatever wrote the manifest naming the file.
+    /// The address `profile` reaches `bucket` at overlaps the address of
+    /// Ravel's own data bucket (ADR-2040 D4): see [`RavelBucket`] for what is
+    /// compared. Only configuration is compared; Ravel's bucket reached under
+    /// another name is refused when the grant is written, by the probe of
+    /// ADR-2040 D1.
     #[error("bucket {bucket:?} through profile {profile:?} is Ravel's own data bucket")]
     RavelBucket { profile: String, bucket: String },
 }
 
 /// Ravel's own data bucket as the server is configured to reach it: the S3
-/// endpoint (`None` for AWS's regional endpoint) and the bucket name.
+/// endpoint (`None` for AWS's regional endpoint), the region and the bucket
+/// name. Ravel's store addresses its bucket path-style.
+///
+/// A (profile, bucket) reaches it when their bucket addresses overlap. A
+/// bucket address is where the S3 client sends requests for the bucket: an
+/// explicit endpoint as written when virtual-hosted, the endpoint with
+/// `/<bucket>` appended when path-style, and AWS's regional endpoint for the
+/// region when there is none; a GCS profile's is the bucket on GCS. Two
+/// addresses overlap when they are on the same service (the same AWS
+/// partition, GCS, or the same host and port, a missing port read as the
+/// scheme's default) and one's bucket and path segments begin with the
+/// other's. An AWS or GCS address's bucket is its host's bucket label or, for
+/// the service host itself, its first path segment, so a virtual-hosted and a
+/// path-style address of one bucket compare equal. The prefix rule matters for
+/// an endpoint that names no bucket: a virtual-hosted profile at Ravel's own
+/// host sends every key verbatim, so a key beginning with Ravel's bucket name
+/// reads Ravel's bucket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RavelBucket {
     pub endpoint: Option<String>,
+    pub region: String,
     pub bucket: String,
 }
 
 impl RavelBucket {
-    /// Whether `profile` reaching `bucket` names this bucket by
-    /// configuration: the same bucket name on the same service. Ravel's bucket
-    /// reached under another name is refused when the grant is written, by
-    /// the probe of ADR-2040 D1, not here.
+    /// Whether `profile` reaching `bucket` addresses this bucket, or a
+    /// location containing it, by configuration.
     fn is_reached_by(&self, profile: &ExternalProfile, bucket: &str) -> bool {
-        if self.bucket != bucket {
-            return false;
-        }
-        let ravel = Service::of(self.endpoint.as_deref());
-        match &profile.kind {
-            ExternalKind::S3 { endpoint, .. } => Service::of(endpoint.as_deref()) == ravel,
-            ExternalKind::Gcs { .. } => ravel == Service::Gcs,
-            ExternalKind::Azure { .. } => false,
-        }
+        let ravel = BucketAddress::s3(self.endpoint.as_deref(), &self.region, &self.bucket, true);
+        let theirs = match &profile.kind {
+            ExternalKind::S3 {
+                endpoint,
+                region,
+                force_path_style,
+                ..
+            } => BucketAddress::s3(endpoint.as_deref(), region, bucket, *force_path_style),
+            ExternalKind::Gcs { .. } => BucketAddress {
+                service: Service::Gcs,
+                segments: vec![bucket.to_string()],
+            },
+            ExternalKind::Azure { .. } => return false,
+        };
+        ravel.overlaps(&theirs)
     }
 }
 
-/// The service an S3 endpoint reaches: AWS for no endpoint or any
-/// `amazonaws.com` host, GCS's S3 interoperability host, or any other host
-/// and port, whatever the scheme and path.
+/// Where requests for one bucket go: the service and the leading path
+/// segments every key is appended to.
 #[derive(Debug, PartialEq, Eq)]
-enum Service {
-    Aws,
-    Gcs,
-    Host(String),
+struct BucketAddress {
+    service: Service,
+    segments: Vec<String>,
 }
 
-impl Service {
-    fn of(endpoint: Option<&str>) -> Self {
-        let Some(endpoint) = endpoint else {
-            return Service::Aws;
+/// The namespace a bucket address is resolved in. AWS bucket names are unique
+/// within a partition, and GovCloud and China are partitions of their own.
+#[derive(Debug, PartialEq, Eq)]
+enum Service {
+    Aws(AwsPartition),
+    Gcs,
+    /// Any other host, lowercased, with its port.
+    Host(String, Option<u16>),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AwsPartition {
+    Commercial,
+    GovCloud,
+    China,
+}
+
+impl BucketAddress {
+    /// The address of `bucket` through an S3 client configured with
+    /// `endpoint`, `region` and `path_style`, following `object_store`'s
+    /// `AmazonS3Builder`.
+    fn s3(endpoint: Option<&str>, region: &str, bucket: &str, path_style: bool) -> Self {
+        let url = match (endpoint, path_style) {
+            (Some(endpoint), false) => endpoint.to_string(),
+            (Some(endpoint), true) => format!("{}/{bucket}", endpoint.trim_end_matches('/')),
+            (None, false) => format!("https://{bucket}.s3.{region}.amazonaws.com"),
+            (None, true) => format!("https://s3.{region}.amazonaws.com/{bucket}"),
         };
-        let endpoint = endpoint.trim().to_ascii_lowercase();
-        let authority = endpoint
-            .split_once("://")
-            .map_or(endpoint.as_str(), |(_, rest)| rest);
-        let host = authority
-            .split(['/', '?', '#'])
-            .next()
-            .unwrap_or_default()
+        Self::of_url(&url)
+    }
+
+    fn of_url(url: &str) -> Self {
+        let url = url.trim();
+        let (scheme, rest) = match url.split_once("://") {
+            Some((scheme, rest)) => (scheme.to_ascii_lowercase(), rest),
+            None => (String::new(), url),
+        };
+        let at = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let (authority, path) = rest.split_at(at);
+        let path = path.split(['?', '#']).next().unwrap_or_default();
+        let mut segments: Vec<String> = path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .map(str::to_string)
+            .collect();
+        let host_port = authority
             .rsplit('@')
             .next()
-            .unwrap_or_default();
-        let name = host.split(':').next().unwrap_or_default();
-        if name == "amazonaws.com" || name.ends_with(".amazonaws.com") {
-            Service::Aws
-        } else if name == "storage.googleapis.com" {
-            Service::Gcs
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let (host, port) = split_port(&host_port);
+        let host = host.trim_end_matches('.');
+        let port = port.or(match scheme.as_str() {
+            "https" => Some(443),
+            "http" => Some(80),
+            _ => None,
+        });
+
+        let (labels, partition) = if let Some(labels) = host.strip_suffix(".amazonaws.com.cn") {
+            (labels, Some(AwsPartition::China))
+        } else if let Some(labels) = host.strip_suffix(".amazonaws.com") {
+            (labels, Some(AwsPartition::Commercial))
         } else {
-            Service::Host(host.to_string())
+            (host, None)
+        };
+        if let Some(partition) = partition {
+            let labels: Vec<&str> = labels.split('.').collect();
+            if let Some(service) = labels
+                .iter()
+                .rposition(|label| *label == "s3" || label.starts_with("s3-"))
+            {
+                let partition = if labels[service..]
+                    .iter()
+                    .any(|label| label.contains("us-gov-"))
+                {
+                    AwsPartition::GovCloud
+                } else {
+                    partition
+                };
+                if service > 0 {
+                    segments.insert(0, labels[..service].join("."));
+                }
+                return BucketAddress {
+                    service: Service::Aws(partition),
+                    segments,
+                };
+            }
         }
+        if host == "storage.googleapis.com" {
+            return BucketAddress {
+                service: Service::Gcs,
+                segments,
+            };
+        }
+        if let Some(bucket) = host.strip_suffix(".storage.googleapis.com") {
+            segments.insert(0, bucket.to_string());
+            return BucketAddress {
+                service: Service::Gcs,
+                segments,
+            };
+        }
+        BucketAddress {
+            service: Service::Host(host.to_string(), port),
+            segments,
+        }
+    }
+
+    /// Whether the two addresses are on one service and one's segments begin
+    /// with the other's.
+    fn overlaps(&self, other: &BucketAddress) -> bool {
+        let shorter = self.segments.len().min(other.segments.len());
+        self.service == other.service && self.segments[..shorter] == other.segments[..shorter]
+    }
+}
+
+/// `host_port` split into its host and its port, when it names one that
+/// parses. An IPv6 literal keeps its brackets.
+fn split_port(host_port: &str) -> (&str, Option<u16>) {
+    let colon = if host_port.starts_with('[') {
+        host_port
+            .find(']')
+            .and_then(|close| host_port[close..].find(':').map(|at| close + at))
+    } else {
+        host_port.rfind(':')
+    };
+    match colon {
+        Some(at) => match host_port[at + 1..].parse() {
+            Ok(port) => (&host_port[..at], Some(port)),
+            Err(_) => (&host_port[..at], None),
+        },
+        None => (host_port, None),
     }
 }
 
@@ -710,14 +838,26 @@ mod tests {
         dir: &std::path::Path,
         readable: bool,
     ) -> ExternalProfile {
+        s3_profile_in(name, endpoint, "us-east-1", true, dir, readable)
+    }
+
+    /// [`s3_profile`] in `region`, path-style or virtual-hosted.
+    fn s3_profile_in(
+        name: &str,
+        endpoint: Option<&str>,
+        region: &str,
+        path_style: bool,
+        dir: &std::path::Path,
+        readable: bool,
+    ) -> ExternalProfile {
         let key = dir.join(if readable { "key" } else { "missing" });
         if readable {
             std::fs::write(&key, "test-key\n").expect("write key");
         }
         let endpoint = endpoint.map_or("null".to_string(), |e| format!("{e:?}"));
         let json = format!(
-            r#"[{{"name": {name:?}, "kind": "s3", "region": "us-east-1", "endpoint": {endpoint},
-                 "allow_http": true, "force_path_style": true,
+            r#"[{{"name": {name:?}, "kind": "s3", "region": {region:?}, "endpoint": {endpoint},
+                 "allow_http": true, "force_path_style": {path_style},
                  "credentials": {{"mode": "static",
                    "access_key_id": {{"from": "file", "path": {key:?}}},
                    "secret_access_key": {{"from": "file", "path": {key:?}}}}}}}]"#
@@ -799,6 +939,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let ravel = RavelBucket {
             endpoint: Some("http://127.0.0.1:9".to_string()),
+            region: "us-east-1".to_string(),
             bucket: "ravel".to_string(),
         };
         let stores = ProfileStores::new(vec![
@@ -824,23 +965,25 @@ mod tests {
             table: "t".to_string(),
             source: ExternalStoreError::RavelBucket {
                 profile: "lake".to_string(),
-                bucket: "ravel".to_string(),
+                bucket: "ravel-data".to_string(),
             },
         };
         assert_eq!(err.class(), ErrorClass::Unsupported);
         let message = err.client_message();
         assert!(message.contains("Ravel's own data bucket"), "{message}");
-        assert!(!message.contains("\"ravel\""), "{message}");
+        assert!(!message.contains("ravel-data"), "{message}");
+        assert!(!message.contains("lake"), "{message}");
     }
 
-    /// The service comparison: AWS for no endpoint or any `amazonaws.com`
-    /// host, GCS's interoperability host for a GCS profile, and an Azure
-    /// profile never matches an S3-configured bucket.
+    /// The service comparison: one AWS partition for no endpoint or any
+    /// commercial S3 host, GCS's interoperability host for a GCS profile, and
+    /// an Azure profile never matches an S3-configured bucket.
     #[tokio::test]
     async fn ravels_bucket_is_matched_by_service() {
         let dir = tempfile::tempdir().expect("temp dir");
         let aws = RavelBucket {
             endpoint: None,
+            region: "us-east-1".to_string(),
             bucket: "ravel".to_string(),
         };
         let profile = s3_profile(
@@ -862,11 +1005,156 @@ mod tests {
         .expect("profiles");
         let gcs = RavelBucket {
             endpoint: Some("https://storage.googleapis.com".to_string()),
+            region: "us-east-1".to_string(),
             bucket: "ravel".to_string(),
         };
         assert!(gcs.is_reached_by(&profiles[0], "ravel"));
         assert!(!aws.is_reached_by(&profiles[0], "ravel"));
         assert!(!gcs.is_reached_by(&profiles[1], "ravel"));
         assert!(!aws.is_reached_by(&profiles[1], "ravel"));
+    }
+
+    /// A path-style profile endpoint carrying a path moves the bucket it
+    /// names under the path: `http://ravel-host/ravel-bucket` with bucket `t`
+    /// addresses Ravel's keys `t/...`. It is refused as Ravel's bucket when
+    /// Ravel's is there, and refused at open when no Ravel bucket is
+    /// configured or the host is another one.
+    #[tokio::test]
+    async fn a_profile_endpoint_with_a_path_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ravel = RavelBucket {
+            endpoint: Some("http://ravel-host".to_string()),
+            region: "us-east-1".to_string(),
+            bucket: "ravel-bucket".to_string(),
+        };
+        let profiles = || {
+            vec![
+                s3_profile(
+                    "under",
+                    Some("http://ravel-host/ravel-bucket"),
+                    dir.path(),
+                    true,
+                ),
+                s3_profile("other", Some("http://127.0.0.1:9/prefix"), dir.path(), true),
+            ]
+        };
+        let stores = ProfileStores::new(profiles()).refusing(ravel);
+        assert!(
+            matches!(
+                stores.store("under", "t"),
+                Err(ExternalStoreError::RavelBucket { .. })
+            ),
+            "the path puts bucket t inside Ravel's"
+        );
+        let unconfigured = ProfileStores::new(profiles());
+        for (stores, profile) in [
+            (&stores, "other"),
+            (&unconfigured, "under"),
+            (&unconfigured, "other"),
+        ] {
+            let err = stores.store(profile, "t").err().expect("refused");
+            assert!(
+                matches!(
+                    &err,
+                    ExternalStoreError::Open {
+                        source: ProfileError::EndpointPath { .. },
+                        ..
+                    }
+                ),
+                "{profile}: {err:?}"
+            );
+        }
+    }
+
+    /// A virtual-hosted endpoint is used as written, so its bucket is the one
+    /// its host names, not the bucket the profile is asked for; one that names
+    /// no bucket sends each key verbatim, and a key beginning with Ravel's
+    /// bucket reads Ravel's bucket.
+    #[test]
+    fn a_virtual_hosted_endpoint_is_compared_as_written() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let virtual_hosted = |endpoint: &str| {
+            s3_profile_in("v", Some(endpoint), "us-east-1", false, dir.path(), true)
+        };
+        let local = RavelBucket {
+            endpoint: Some("http://ravel-host".to_string()),
+            region: "us-east-1".to_string(),
+            bucket: "ravel-bucket".to_string(),
+        };
+        assert!(local.is_reached_by(&virtual_hosted("http://ravel-host"), "lake"));
+        assert!(local.is_reached_by(&virtual_hosted("http://RAVEL-HOST:80/"), "lake"));
+        assert!(!local.is_reached_by(&virtual_hosted("http://lake.ravel-host"), "ravel-bucket"));
+
+        let aws = RavelBucket {
+            endpoint: None,
+            region: "us-east-1".to_string(),
+            bucket: "ravel".to_string(),
+        };
+        assert!(aws.is_reached_by(
+            &virtual_hosted("https://s3.us-east-1.amazonaws.com"),
+            "lake"
+        ));
+        assert!(aws.is_reached_by(
+            &virtual_hosted("https://ravel.s3.eu-west-1.amazonaws.com"),
+            "lake"
+        ));
+        assert!(!aws.is_reached_by(
+            &virtual_hosted("https://lake.s3.us-east-1.amazonaws.com"),
+            "ravel"
+        ));
+        let regional = s3_profile_in("r", None, "eu-west-1", false, dir.path(), true);
+        assert!(aws.is_reached_by(&regional, "ravel"));
+        assert!(!aws.is_reached_by(&regional, "lake"));
+    }
+
+    /// A missing port is the scheme's default, so `https://h` and
+    /// `https://h:443` are one endpoint and `https://h:9000` another.
+    #[test]
+    fn default_ports_are_normalised() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ravel = RavelBucket {
+            endpoint: Some("https://minio.example".to_string()),
+            region: "us-east-1".to_string(),
+            bucket: "ravel".to_string(),
+        };
+        let at = |endpoint: &str| s3_profile("p", Some(endpoint), dir.path(), true);
+        assert!(ravel.is_reached_by(&at("https://minio.example:443"), "ravel"));
+        assert!(ravel.is_reached_by(&at("https://Minio.Example./"), "ravel"));
+        assert!(!ravel.is_reached_by(&at("https://minio.example:9000"), "ravel"));
+        assert!(!ravel.is_reached_by(&at("http://minio.example"), "ravel"));
+        let explicit = RavelBucket {
+            endpoint: Some("http://[::1]:80".to_string()),
+            region: "us-east-1".to_string(),
+            bucket: "ravel".to_string(),
+        };
+        assert!(explicit.is_reached_by(&at("http://[::1]"), "ravel"));
+        assert!(!explicit.is_reached_by(&at("http://[::1]:9000"), "ravel"));
+    }
+
+    /// Bucket names are unique within an AWS partition, not across them: a
+    /// GovCloud or China bucket of Ravel's bucket's name is another bucket.
+    #[test]
+    fn aws_partitions_are_compared_apart() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let in_region = |region: &str| s3_profile_in("p", None, region, true, dir.path(), true);
+        let at = |endpoint: &str| s3_profile("p", Some(endpoint), dir.path(), true);
+        let commercial = RavelBucket {
+            endpoint: None,
+            region: "us-east-1".to_string(),
+            bucket: "ravel".to_string(),
+        };
+        assert!(commercial.is_reached_by(&in_region("ap-south-1"), "ravel"));
+        assert!(!commercial.is_reached_by(&in_region("us-gov-west-1"), "ravel"));
+        assert!(
+            !commercial.is_reached_by(&at("https://s3-fips.us-gov-west-1.amazonaws.com"), "ravel")
+        );
+        assert!(!commercial.is_reached_by(&at("https://s3.cn-north-1.amazonaws.com.cn"), "ravel"));
+        let gov = RavelBucket {
+            endpoint: None,
+            region: "us-gov-west-1".to_string(),
+            bucket: "ravel".to_string(),
+        };
+        assert!(gov.is_reached_by(&in_region("us-gov-east-1"), "ravel"));
+        assert!(!gov.is_reached_by(&in_region("us-east-1"), "ravel"));
     }
 }

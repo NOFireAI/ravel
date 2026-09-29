@@ -575,6 +575,7 @@ pub fn build_sql_state_with_parquet(
         let stores = match config.ravel_bucket {
             Some(ravel) => stores.refusing(ravel_sql::RavelBucket {
                 endpoint: ravel.endpoint,
+                region: ravel.region,
                 bucket: ravel.bucket,
             }),
             None => stores,
@@ -1780,6 +1781,7 @@ mod tests {
             ravel_bucket: Some(crate::config::RavelS3Bucket {
                 bucket: "ravel-data".to_string(),
                 endpoint: Some("https://storage.googleapis.com".to_string()),
+                region: "us-east-1".to_string(),
             }),
         }));
         let sources = configured.executor.parquet_sources().expect("sources");

@@ -1057,9 +1057,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and D6, #2053). `ravel-server --parquet-profiles` (`RAVEL_PARQUET_PROFILES`)
   loads the credential profile file `ravel-cli` uses, and each profile's
   read-only store is opened per bucket the first time a query reads it. A
-  profile reaching Ravel's own data bucket (`--s3-bucket` on the service
-  `--s3-endpoint` names) is refused with a typed error before that store is
-  opened, whatever wrote the manifest naming the file. A
+  (profile, bucket) whose bucket address overlaps that of Ravel's own data
+  bucket (`--s3-bucket` at `--s3-endpoint` in `--s3-region`, path-style) is
+  refused with a typed error before that store is opened. A bucket address is
+  where the S3 client sends the bucket's requests: a virtual-hosted endpoint as
+  written, a path-style one with `/<bucket>` appended, AWS's regional endpoint
+  when there is none. Two overlap on the same AWS partition, on GCS, or on the
+  same host and port (a missing port read as the scheme's default) when one's
+  bucket and path segments begin with the other's, so a virtual-hosted profile
+  at Ravel's host that names no bucket is refused too. An S3 profile endpoint
+  carrying a path is refused whenever a store is opened from it, for a query
+  and for `tenant parquet-grant add` alike. A
   statement whose only tables are Parquet tables of the caller's tenant
   resolves each table's newest live manifest and the tenant's current grants
   before its session is built: a file outside every current grant fails the
