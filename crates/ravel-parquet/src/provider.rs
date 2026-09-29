@@ -6,7 +6,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, Fields, Schema, SchemaRef, TimeUnit};
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{Column, ToDFSchema};
 use datafusion::config::TableParquetOptions;
@@ -213,9 +213,15 @@ impl ParquetTableProvider {
         let mut parquet_options = TableParquetOptions::default();
         parquet_options.global.binary_as_string = options.binary_as_string;
         parquet_options.global.pushdown_filters = true;
-        // DataFusion's own schema inference drops file-level metadata and
-        // applies these two rewrites in this order.
-        let mut schema = Schema::new(file_schema.fields().clone());
+        // DataFusion's own schema inference clears the schema's metadata and
+        // each top-level field's, then applies these two rewrites in this
+        // order.
+        let fields: Fields = file_schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone().with_metadata(HashMap::new()))
+            .collect();
+        let mut schema = Schema::new(fields);
         if parquet_options.global.binary_as_string {
             schema = transform_binary_to_string(&schema);
         }
@@ -497,6 +503,7 @@ mod tests {
         Array, Date32Array, Int64Array, TimestampMillisecondArray, TimestampSecondArray,
     };
     use datafusion::physical_plan::ExecutionPlanProperties;
+    use datafusion::prelude::SessionConfig;
     use datafusion_datasource_parquet::ParquetFileReaderFactory;
     use ravel_object_store::memory::MemoryStore;
     use ravel_query::QueryPhase;
@@ -538,11 +545,31 @@ mod tests {
         let scan = snapshot.phase(QueryPhase::Scan);
         assert_eq!(probe.s3_bytes(AccountedOp::Get), footers);
         assert_eq!(probe.s3_requests(AccountedOp::Get), 2);
+        assert_eq!(
+            probe.cache_hits, 1,
+            "the scan finds a's footer decoded when the table was built"
+        );
         assert_eq!(scan.s3_bytes(AccountedOp::Get), chunks);
         assert_eq!(
             scan.s3_requests(AccountedOp::Get),
             4,
             "two columns, two files"
+        );
+
+        let rows = read_all(&ctx, "t", &["a", "b"]).await;
+        assert_eq!(rows.expect("rows"), "1|x,2|y,3|z,4|w,5|v");
+        let second = accounting.snapshot();
+        let probe = second.phase(QueryPhase::Probe);
+        assert_eq!(
+            probe.s3_requests(AccountedOp::Get),
+            2,
+            "a second read issues no Probe GET"
+        );
+        assert_eq!(probe.s3_bytes(AccountedOp::Get), footers);
+        assert_eq!(probe.cache_hits, 3, "one metadata cache hit per file");
+        assert_eq!(
+            second.phase(QueryPhase::Scan).s3_requests(AccountedOp::Get),
+            4
         );
     }
 
@@ -596,6 +623,54 @@ mod tests {
         assert_eq!(rows.expect("rows"), "0,1,2,3,4");
     }
 
+    /// With byte-range repartitioning admitting every file (a 1-byte minimum),
+    /// the serial table keeps its one partition and the parallel table's
+    /// single file is split, so the serial scan's single group survives the
+    /// physical optimizer and is not only what the provider emitted.
+    #[tokio::test]
+    async fn file_scan_repartitioning_splits_a_parallel_scan_and_never_a_serial_one() {
+        let store = Arc::new(MemoryStore::new());
+        let fixture = Fixture::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>);
+        let values: Vec<i64> = (0..2_000).collect();
+        let labels: Vec<String> = values.iter().map(|v| format!("row-{v}")).collect();
+        let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let file = fixture
+            .put_file(
+                &store,
+                "lake/t/big.parquet",
+                parquet_bytes(&values, &labels),
+                true,
+            )
+            .await;
+        let config = SessionConfig::new()
+            .with_target_partitions(4)
+            .with_repartition_file_scans(true)
+            .with_repartition_file_min_size(1);
+
+        let partitions = |parallel: bool| {
+            let fixture = &fixture;
+            let config = config.clone();
+            let file = file.clone();
+            async move {
+                let table = fixture.provider("t", 1, vec![file], parallel).await;
+                let ctx = fixture.session_with(config, &[("t", table)]);
+                let frame = ctx.table("t").await.expect("table");
+                let plan = frame.create_physical_plan().await.expect("plan");
+                let rows = read_all(&ctx, "t", &["a"]).await.expect("rows");
+                (plan.output_partitioning().partition_count(), rows)
+            }
+        };
+        let expected: Vec<String> = values.iter().map(i64::to_string).collect();
+        let expected = expected.join(",");
+
+        let (serial, rows) = partitions(false).await;
+        assert_eq!(serial, 1);
+        assert_eq!(rows, expected);
+        let (parallel, rows) = partitions(true).await;
+        assert_eq!(parallel, 4);
+        assert_eq!(rows, expected);
+    }
+
     #[test]
     fn groups_split_contiguously_and_never_exceed_the_file_count() {
         let files = |n: usize| {
@@ -609,6 +684,60 @@ mod tests {
         assert_eq!(sizes(file_groups(files(2), true, 4)), vec![1, 1]);
         assert_eq!(sizes(file_groups(files(5), false, 4)), vec![5]);
         assert_eq!(sizes(file_groups(files(3), true, 0)), vec![3]);
+    }
+
+    /// A file whose columns carry `PARQUET:field_id` yields a table schema
+    /// with no field metadata, equal to what DataFusion's own inference
+    /// returns for the same bytes.
+    #[tokio::test]
+    async fn the_schema_carries_no_field_metadata_and_equals_datafusions_inference() {
+        use datafusion::arrow::array::{ArrayRef, StringArray};
+        use datafusion::arrow::datatypes::Field;
+        use datafusion::datasource::file_format::FileFormat;
+        use datafusion_datasource_parquet::ParquetFormat;
+        use object_store::memory::InMemory;
+        use object_store::{ObjectStore, ObjectStoreExt};
+
+        let field_id = |id: &str| {
+            HashMap::from([(
+                parquet::arrow::PARQUET_FIELD_ID_META_KEY.to_string(),
+                id.to_string(),
+            )])
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false).with_metadata(field_id("1")),
+            Field::new("b", DataType::Utf8, false).with_metadata(field_id("2")),
+        ]));
+        let bytes = crate::test_support::write(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["x", "y"])),
+            ],
+        );
+
+        let store = Arc::new(MemoryStore::new());
+        let fixture = Fixture::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>);
+        let file = fixture
+            .put_file(&store, "lake/t/ids.parquet", bytes.clone(), true)
+            .await;
+        let table = fixture.provider("t", 1, vec![file], false).await;
+        let ours = table.schema();
+        for field in ours.fields() {
+            assert!(field.metadata().is_empty(), "{field:?}");
+        }
+        assert!(ours.metadata().is_empty());
+
+        let memory: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let location = Path::from("ids.parquet");
+        memory.put(&location, bytes.into()).await.expect("put");
+        let meta = memory.head(&location).await.expect("head");
+        let ctx = fixture.session(&[]);
+        let inferred = ParquetFormat::default()
+            .infer_schema(&ctx.state(), &memory, &[meta])
+            .await
+            .expect("infer");
+        assert_eq!(ours, inferred);
     }
 
     #[tokio::test]
