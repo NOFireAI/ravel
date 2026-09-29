@@ -22,8 +22,9 @@
 //!
 //! What the floor protects is a writer's resolve-to-put window, not a running
 //! query, which reads a table's manifest once, when it resolves.
-//! [`ravel_pqtable::writer::apply`] finishes its put within half of the same
-//! floor after its resolve, and a sweep deletes a version only once the version
+//! [`ravel_pqtable::writer::apply`] finishes its put within half of the
+//! `min_grace_ms` its caller passes, which must be no larger than this stored
+//! floor, and a sweep deletes a version only once the version
 //! after it is older than the grace. Every version committed after a writer's
 //! resolve is younger than that, so no sweep frees the version key the
 //! writer's create-if-absent put targets while the writer is in flight. The

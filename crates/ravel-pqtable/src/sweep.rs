@@ -10,9 +10,10 @@
 //! superseded it (the next one present) is older than the grace plus
 //! [`SKEW_MS`]. What that protects is a writer's resolve-to-put window, not a
 //! query, which reads a manifest once, when it resolves: [`crate::writer`]
-//! finishes a put within half of the minimum grace after its resolve, so every
-//! version committed after that resolve is too young for a sweep to free the
-//! key the put targets. [`plan`] only ever selects a version that has a
+//! finishes a put within half of the `min_grace_ms` its caller passes, so
+//! provided that value is no larger than the grace this sweep runs under,
+//! every version committed after the writer's resolve is too young for a
+//! sweep to free the key the put targets. [`plan`] only ever selects a version that has a
 //! successor in the same listing, so it does not select a table's newest
 //! version, dropped or live, which the next writer numbers from.
 //!
