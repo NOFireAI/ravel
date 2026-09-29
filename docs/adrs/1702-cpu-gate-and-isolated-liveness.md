@@ -552,7 +552,8 @@ reservation sites. Both readings are settled here.
   statistics reservations, `Catalog::reserve_decoded` then evicts
   decoded-cache entries until the budget admits the charge, so the decoder
   still decides; only when the bytes over the limit are held outside those
-  caches does the budget refusal stand. In the query fetcher, the per-frame
+  caches does the budget refusal stand (and then no pass runs: see the
+  eviction-skip amendment below). In the query fetcher, the per-frame
   charges sum into one per-section reservation, which goes to the budget
   directly with no eviction pass, so there a 0-byte charge on an over-limit
   budget is refused outright.
@@ -565,7 +566,8 @@ reservation sites. Both readings are settled here.
   object. Answering memory pressure by taking the more expensive path is the
   wrong direction, and a failed fold is retried by the next one. The
   exception is a previous postings object larger than the budget's whole
-  limit: `Catalog::reserve_decoded` skips the eviction pass for it, so it is
+  limit (widened by the eviction-skip amendment below):
+  `Catalog::reserve_decoded` skips the eviction pass for it, so it is
   refused on every tick and that tenant's fold stays failed where the old code
   rebuilt, and an operator sees the fold's typed budget error logged every
   tick. The shipped server cannot reach it today, since ravel-server never
@@ -582,3 +584,29 @@ runtime heartbeat, which the server builds and beats on the main runtime in
 every mode. `/metrics` reads its age at scrape time, and the health listener,
 when configured, reads the same heartbeat for its `/healthz` and `/readyz`
 verdicts, so the gauge and the probes never disagree about the age.
+
+## Amendment (2026-09-30): the eviction pass is skipped whenever it cannot help
+
+<!-- amendment-supersedes: phrase="caches does the budget refusal stand" pointer="eviction-skip amendment" -->
+<!-- amendment-supersedes: phrase="exception is a previous postings object larger than the budget's whole" pointer="eviction-skip amendment" -->
+
+The decode-refusal amendment has `Catalog::reserve_decoded` skip its eviction
+pass only for an object larger than the budget's whole limit, and otherwise
+evict decoded-cache entries until the charge fits. On a budget shared with
+SQL, the fetchers and the live readers, a decode larger than everything the
+decoded caches hold still ran the pass, evicted every tenant's cached parts
+and postings, and was refused anyway.
+
+`reserve_decoded` now skips the pass, and keeps its first refusal, for any
+object no eviction could admit: one larger than the whole limit, or one that
+would not fit even if the decoded caches gave back every byte they hold
+(the budget's reserved bytes less the bytes the caches' entries carry, plus
+the charge, exceed the limit). The caches track the bytes their entries'
+reservations carry, so the test reads one figure per cache. An entry a live
+resolve still holds counts in that figure, so it overstates what eviction
+frees and the test errs toward running the pass. Otherwise the pass evicts
+only until the charge fits, as before. For a previous postings object on the
+fold path this is the same outcome the decode-refusal amendment describes for
+an oversized object: refused on every tick while it holds, with the fold's
+typed budget error logged. The shipped server still never calls
+`Catalog::with_memory_budget`, so no deployment reaches this path yet.
