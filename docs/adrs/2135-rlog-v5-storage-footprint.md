@@ -131,7 +131,10 @@ What the codebase already guarantees, which bounds the change:
    the bucket width instead of disappearing. The three widths nest (1 h
    divides 6 h divides 1 d), which decision 2 relies on. Every change to a
    tenant's key, including clearing it, increments a clustering generation
-   stored with it. Audit and alert RLOG writers never take a key.
+   stored with it. Clearing a key keeps the field present with the
+   incremented generation and an empty column list, so generation 0 means
+   only "never set", and a clear outranks every earlier key in compaction
+   exactly as a new key would. Audit and alert RLOG writers never take a key.
 
 2. **Every v5 object records its sort order, and compaction merges on it.**
    The v5 footer records the object's sort descriptor (bucket width and key
@@ -175,9 +178,20 @@ What the codebase already guarantees, which bounds the change:
      the cut points are too. Two parts of one stream may then overlap in key
      and time ranges, which costs pruning precision, not correctness.
 
-3. **Two RLOG-only codecs: a GCD wrapper and a column reference.** Both live
-   in `ravel-logseg`, wrapping `ravel-codec`, which is not modified, so RSEG
-   and RSPAN bytes and readers do not change.
+3. **Two RLOG-only codecs: a GCD wrapper and a column reference.** The
+   shared `Enc` registry in `ravel-codec` gains variants for tags 10 to 13
+   (this decision and decision 6), because PAGE_DIR validates every page's
+   tag through it. That is an additive change to the enum only: no existing
+   encoder or decoder in `ravel-codec` changes its output or accepts a new
+   tag, the RSEG and RSPAN decoders refuse tags 10 to 13 with their existing
+   typed error (a test in each pins it), and their bytes do not change. The
+   encode and decode logic for the new tags lives in `ravel-logseg`.
+   RSEG already has a GCD codec for timestamps (`TS_GCD_I64`, ADR-0092
+   decision 6), which divides each value by the page's divisor directly and
+   so only fires when every value is a multiple of it. The RLOG codec takes
+   offsets from the page minimum first, so a page whose values share no
+   divisor but whose gaps do still qualifies; that is also why its overflow
+   rules below had to be stated.
    - Tag 10, GCD i64: `gcd` varint (at least 2), `base` ivarint, the inner
      encoding tag, then the inner encoding of the quotients. The writer
      computes offsets `v.wrapping_sub(base)` as u64 with `base` the page
@@ -228,9 +242,15 @@ What the codebase already guarantees, which bounds the change:
    level-0 crc. Every reader verifies the dictionary page's own PAGE_DIR
    crc32c before decoding any id against it, on every path, including a
    whole-block read, so a corrupt dictionary is a `Corrupted` error for every
-   block of the chunk, never wrong strings. A reader that needs any block of
-   the chunk fetches the dictionary page too; it sits at the start of the
-   chunk extent the ranged fetcher already reads. Both writer paths build
+   block of the chunk, never wrong strings. PAGE_DIR's decoder relaxes three
+   rules for this page only: its block index may equal `block_count`, it
+   may precede block 0 in the chunk although the index otherwise ascends,
+   and it may take a chunk's page count one past two per block. Any other
+   page that breaks those rules, or a second dictionary page in one chunk,
+   is still `Corrupted`. The ranged fetch plans pages by surviving block, and
+   the dictionary page belongs to none, so both the projected page ranges
+   and `read_block_columns` add the dictionary page's extent for every kept
+   chunk that has one, whichever of its blocks survive. Both writer paths build
    the row-group dictionary the same way. Every object of the measured
    corpus is a single row group, so the -5.5% measured for one dictionary
    per object is the row-group figure there, and an upper bound for
@@ -313,7 +333,9 @@ the per-object record it would read.
   saving opt-in and the reader safe.
 - **Changing `encode_i64` and the bloom builder in `ravel-codec`.** They are
   shared with RSEG and RSPAN, so an in-place change would alter those formats
-  without a version bump. The new behaviour lives in RLOG-only wrappers.
+  without a version bump. The new behaviour lives in RLOG-only wrappers; the
+  only `ravel-codec` change is the additive `Enc` variants of decision 3,
+  which no RSEG or RSPAN path accepts.
 - **Sorting by the key with no time bucket.** It maximises compression but
   lets one block span a stream's whole time range, which costs time pruning
   on organic telemetry, and it removes the nested coarse order that lets
