@@ -496,13 +496,12 @@ maintenance tick.
   survive too), and a cold-start fold over it yields
   the same latest record per identity as a fold over the unswept history.
 - **No usable memo means no sweep for that tenant that tick.** The driver
-  counts the skip under `ravel_alert_retention_skipped_total{reason}`:
-  `absent` (no memo while the tenant has alert commit records), `undecodable`,
-  `unsupported_version`, `watermark_below_floor` (the memo's watermark hour,
-  clamped to the driver's own hour, is below the expiry floor's hour), or
-  `store_error` (the memo read, or the one listing that tells an unused alert
-  keyspace from a lost memo, failed against object storage). A tenant with no
-  memo and no alert commit records is neither swept nor counted.
+  clamps the memo's watermark hour to its own clock's hour before using it,
+  which can only lower it. It counts each skip under
+  `ravel_alert_retention_skipped_total{reason}`, whose reasons the
+  [observability guide](guides/observability.md#alert-retention-skips-ravel_alert_retention_skipped_total)
+  enumerates. A tenant with no memo and no alert commit records is neither
+  swept nor counted.
 - **`--alert-retention 0` turns off the retention sweep and its memo read
   only.** A nonzero window shorter than one hour plus the memo's seal margin is
   refused at startup, since the watermark could never reach the floor.
