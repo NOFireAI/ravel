@@ -500,7 +500,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   re-encodes. Decoding accepts `format_version` 1 or 2 and checks that a
   version 2 record names a compaction record in its own tenant, signal, shard
   and hour and carries the version 2 input-set hash over its inputs and that
-  key; a version 1 record that sets the field is refused. Nothing writes a
+  key; a version 1 record that sets the field is refused. The named key must be
+  the canonical rendering of the key it parses to, so a key differing only in
+  hex case is refused. The seal-divergence check behind `catalog verify` and
+  scrub recomputes each compaction record's hash for its own version, so a
+  valid version 2 record no longer reads as corrupt. Nothing writes a
   version 2 record yet, and resolution does not yet honour one. A build
   without this change refuses a version 2 record with its unsupported
   `format_version` error. Version 1 records encode and decode byte for byte
