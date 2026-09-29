@@ -8,6 +8,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A first log or span shard death sheds the whole pod** (issue #1691).
+  The log and span routers condemn a shard on its first actor death, with
+  no respawn budget to absorb a transient, and `/readyz` turns 503 for the
+  process, so the replica stops serving all three signals. A single
+  poison-pill log tenant can therefore shed a replica that is serving
+  metrics fine. The full rule is in docs/ingest.md (Log pipeline and Span
+  pipeline).
 - **SQL fetches now reserve against the process-wide memory budget**
   (ADR-1170 decision 2, issue #2086). The server's SQL path wires the same
   `Arc<MemoryBudget>` the SQL executor already used into its RSEG metrics,
