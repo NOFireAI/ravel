@@ -50,7 +50,7 @@ use ravel_proto::commit::v1::{CommitRecord, CompactionRecord};
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::{Signal, TenantHash};
 
-use crate::charged::{ChargedPart, ChargedPostings};
+use crate::charged::{Charged, ChargedPart, ChargedPostings};
 
 /// Charged cost of one cached commit entry beyond its variable-length
 /// members: the `CommitRecord` struct (about 224 bytes of scalars and
@@ -643,6 +643,9 @@ struct DecodedEntry<V> {
     /// records (see the module docs). Not the decoded size the value's own
     /// [`Reservation`](ravel_memory::Reservation) charges.
     bytes: u64,
+    /// The bytes the value's reservation holds, captured at insert. A
+    /// reservation's size never changes, so this stays equal to it.
+    reserved_bytes: u64,
     use_tick: u64,
 }
 
@@ -652,6 +655,8 @@ struct DecodedTenantCache<V> {
     /// with `entries`, the same shape and for the same reason as
     /// [`TenantCache::by_use`].
     by_use: std::collections::BTreeMap<u64, String>,
+    /// Summed [`DecodedEntry::reserved_bytes`] of everything in `entries`.
+    reserved_bytes: u64,
 }
 
 impl<V> Default for DecodedTenantCache<V> {
@@ -659,6 +664,7 @@ impl<V> Default for DecodedTenantCache<V> {
         Self {
             entries: HashMap::new(),
             by_use: std::collections::BTreeMap::new(),
+            reserved_bytes: 0,
         }
     }
 }
@@ -676,10 +682,20 @@ impl<V> DecodedTenantCache<V> {
         Some(hit)
     }
 
-    /// Admit `value` and evict least-recently-used until the tenant holds at
-    /// most `capacity` entries. A key already held keeps its stored value
-    /// (these objects are immutable) and only refreshes its recency.
-    fn insert(&mut self, key: String, value: Arc<V>, bytes: u64, capacity: usize, tick: u64) {
+    /// Admit `value`, whose reservation holds `reserved_bytes`, and evict
+    /// least-recently-used until the tenant holds at most `capacity` entries.
+    /// A key already held keeps its stored value (these objects are immutable)
+    /// and only refreshes its recency; the offered value is not held, so it
+    /// adds nothing to [`Self::reserved_bytes`].
+    fn insert(
+        &mut self,
+        key: String,
+        value: Arc<V>,
+        bytes: u64,
+        reserved_bytes: u64,
+        capacity: usize,
+        tick: u64,
+    ) {
         if self.touch(&key, tick).is_some() {
             return;
         }
@@ -688,9 +704,11 @@ impl<V> DecodedTenantCache<V> {
             DecodedEntry {
                 value,
                 bytes,
+                reserved_bytes,
                 use_tick: tick,
             },
         );
+        self.reserved_bytes = self.reserved_bytes.saturating_add(reserved_bytes);
         self.by_use.insert(tick, key);
         while self.entries.len() > capacity.max(1) {
             if self.remove_lru().is_none() {
@@ -708,7 +726,9 @@ impl<V> DecodedTenantCache<V> {
     /// caller decides where the value (and so its reservation) is dropped.
     fn remove_lru(&mut self) -> Option<DecodedEntry<V>> {
         let (_, key) = self.by_use.pop_first()?;
-        self.entries.remove(&key)
+        let entry = self.entries.remove(&key)?;
+        self.reserved_bytes = self.reserved_bytes.saturating_sub(entry.reserved_bytes);
+        Some(entry)
     }
 }
 
@@ -729,7 +749,7 @@ impl<V> DecodedTenantCache<V> {
 ///   [`ravel_memory::MemoryBudget`] wired into the catalog could be held
 ///   entirely by other tenants' cached entries, and every later decode would
 ///   be refused with nothing able to give the memory back. A reservation
-///   larger than the whole budget takes no such pass: see
+///   that would not fit even with both caches empty takes no such pass: see
 ///   [`crate::Catalog::reserve_decoded`].
 ///
 /// An entry evicted by either bound releases its reservation only when the
@@ -782,20 +802,16 @@ impl<V> DecodedCache<V> {
         }
     }
 
-    pub(crate) fn insert(
-        &self,
-        tenant: TenantHash,
-        key: String,
-        value: Arc<V>,
-        bytes: u64,
-        capacity: usize,
-    ) {
-        let tick = self.clock.next();
+    /// Bytes the reservations of every entry this cache holds carry, across
+    /// every tenant: the most that dropping all of them could return to a
+    /// budget. An entry a live resolve also holds an `Arc` to is counted in
+    /// full although dropping it frees nothing until that `Arc` goes, so this
+    /// is an upper bound on what eviction frees, never an underestimate.
+    pub(crate) fn reserved_bytes(&self) -> u64 {
         self.tenants
             .lock()
-            .entry(tenant)
-            .or_default()
-            .insert(key, value, bytes, capacity, tick);
+            .values()
+            .fold(0u64, |sum, cache| sum.saturating_add(cache.reserved_bytes))
     }
 
     /// Drop the whole per-tenant outer-map entry for `tenant` (ADR-0069
@@ -863,6 +879,28 @@ impl<V> DecodedCache<V> {
             .values()
             .map(|cache| cache.entries.len())
             .sum()
+    }
+}
+
+impl<T> DecodedCache<Charged<T>> {
+    pub(crate) fn insert(
+        &self,
+        tenant: TenantHash,
+        key: String,
+        value: Arc<Charged<T>>,
+        bytes: u64,
+        capacity: usize,
+    ) {
+        let tick = self.clock.next();
+        let reserved_bytes = value.reserved_bytes();
+        self.tenants.lock().entry(tenant).or_default().insert(
+            key,
+            value,
+            bytes,
+            reserved_bytes,
+            capacity,
+            tick,
+        );
     }
 }
 
@@ -937,11 +975,11 @@ impl DecodedCaches {
     /// concurrent resolve inserting into either cache lengthens the pass, and
     /// under enough concurrent inserts it ends only when `want` fits.
     ///
-    /// A caller whose `want` exceeds the budget's whole limit must not call
-    /// this at all ([`crate::Catalog::reserve_decoded`] returns its first
-    /// refusal instead): the loop condition can never become false, so the
-    /// pass would empty both caches, across every tenant, for a decode no
-    /// eviction could ever admit.
+    /// A caller whose `want` could not fit even with both caches empty must
+    /// not call this at all ([`crate::Catalog::reserve_decoded`] returns its
+    /// first refusal instead, see [`Self::reserved_bytes`]): the loop
+    /// condition would never become false, so the pass would empty both
+    /// caches, across every tenant, for a decode no eviction could admit.
     pub(crate) fn evict_until_fits(&self, budget: &ravel_memory::MemoryBudget, want: u64) -> u64 {
         let mut dropped = 0;
         while budget
@@ -979,6 +1017,16 @@ impl DecodedCaches {
         // The chosen cache was emptied between the peek and the eviction, so
         // try the other rather than reporting both empty.
         self.parts.evict_lru() || self.postings.evict_lru()
+    }
+
+    /// Bytes the reservations of every entry in both caches carry
+    /// ([`DecodedCache::reserved_bytes`]): the most an eviction pass could
+    /// return to the budget. Read without holding either cache still, so a
+    /// concurrent insert or eviction can move it before the caller acts on it.
+    pub(crate) fn reserved_bytes(&self) -> u64 {
+        self.parts
+            .reserved_bytes()
+            .saturating_add(self.postings.reserved_bytes())
     }
 
     /// Entries dropped under memory pressure since this catalog was built.

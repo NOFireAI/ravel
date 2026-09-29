@@ -822,22 +822,31 @@ impl Catalog {
     /// though the cache has dropped it: eviction only ends a cache's claim on
     /// a value, never a reader's.
     ///
-    /// A decode wanting more than the budget's whole limit skips the pass
-    /// entirely and keeps its first refusal: no eviction could ever admit it,
-    /// and evicting anyway flushes every tenant's decoded caches on each such
-    /// query. That refusal is a refusal like any other, counted in neither
+    /// A decode that could not fit even if the caches gave back every byte
+    /// they hold skips the pass entirely and keeps its first refusal: the
+    /// test is `reserved - held + want > limit`, with `held` the caches'
+    /// reservation bytes ([`DecodedCaches::reserved_bytes`]), the subtraction
+    /// saturating at 0 and an overflowing sum refused as
+    /// [`ravel_memory::MemoryBudget::try_reserve`] refuses it. This covers a
+    /// decode wanting more than the budget's whole limit, and one refused
+    /// because other holders of a shared budget (SQL, the fetchers, the live
+    /// readers) own more of it than the caches could make up: evicting anyway
+    /// would flush every tenant's decoded caches on each such query and still
+    /// refuse. Such a refusal is counted in neither
     /// [`Catalog::decoded_cache_memory_evictions`] nor
-    /// [`Catalog::decode_reserve_retries`].
+    /// [`Catalog::decode_reserve_retries`]. `held` counts an entry a live
+    /// resolve also holds, which frees nothing when evicted, so the test never
+    /// skips a pass that could have admitted the decode; a pass it lets
+    /// through can still end in a refused retry.
     ///
     /// A decode charged 0 bytes (its declared length is over the ceiling, see
     /// [`ravel_memory::decoded_charge`]) is refused only on a budget a
-    /// `reserve_unchecked` caller pushed over its limit. It takes the pass and
-    /// the one retry like any other refusal: cached entries hold reservations
-    /// on that same budget, so evicting them can bring it back within its
-    /// limit, and the 0-byte retry then succeeds and leaves the outcome to the
-    /// decoder's own refusal (ADR-1702 decision 6). When the over-limit bytes
-    /// are held outside the caches the pass empties them and the retry is
-    /// refused.
+    /// `reserve_unchecked` caller pushed over its limit. It follows the same
+    /// rule: when cached entries hold enough of the excess, the pass evicts
+    /// until the budget is back within its limit and the 0-byte retry
+    /// succeeds, leaving the outcome to the decoder's own refusal (ADR-1702
+    /// decision 6); when the excess is held outside the caches, no pass runs
+    /// and the first refusal is the answer.
     ///
     /// Eviction and retry are NOT atomic against each other or against other
     /// resolves. Another task can take the freed bytes between the two, so a
@@ -857,7 +866,18 @@ impl Catalog {
             Err(refusal) => refusal,
         };
         let want = ravel_memory::decoded_charge(declared, ceiling);
-        if want > self.memory_budget.limit() {
+        let limit = self.memory_budget.limit();
+        if want > limit {
+            return Err(refusal);
+        }
+        let held_outside_caches = self
+            .memory_budget
+            .reserved()
+            .saturating_sub(self.decoded.reserved_bytes());
+        if held_outside_caches
+            .checked_add(want)
+            .is_none_or(|total| total > limit)
+        {
             return Err(refusal);
         }
         self.decoded.evict_until_fits(&self.memory_budget, want);
@@ -873,11 +893,12 @@ impl Catalog {
 
     /// Decode reservations retried after such an eviction pass, cumulative.
     /// One per refused reservation that ran the pass, whether or not the retry
-    /// succeeded. A decode wanting more than the budget's whole limit skips
-    /// the pass and counts nothing. A decode charged 0 bytes (declared over
-    /// its ceiling) refused by a budget already over its limit does run the
-    /// pass and counts one retry, which succeeds once eviction brings the
-    /// budget within its limit.
+    /// succeeded. A decode that could not fit even with the caches' whole
+    /// held reservation given back (`reserved - held + want > limit`, see
+    /// [`Catalog::reserve_decoded`]) skips the pass and counts nothing; that
+    /// includes one wanting more than the budget's whole limit, and a 0-byte
+    /// charge (declared over its ceiling) on a budget pushed over its limit by
+    /// bytes the caches do not hold.
     pub fn decode_reserve_retries(&self) -> u64 {
         self.decode_reserve_retries.load(Ordering::Relaxed)
     }
