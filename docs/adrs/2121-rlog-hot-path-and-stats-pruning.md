@@ -164,10 +164,20 @@ The 0.2-0.46 s per-statement floor is latency, and its cause is a hypothesis.
 ### Sequencing with the work other issues own
 
 - **D1** touches `ravel-sql` (logs provider and scan) and can start at once.
-- **D2-D4** touch `crates/ravel-logseg/src/reader.rs`, `ravel-codec` and
-  `ravel-sql/src/logs_scan.rs`. The #2066 branch (perf/2066-sparse-assembly)
-  also rewrites `reader.rs`, so D4 waits until that branch lands. D2 and D3
-  sit in `logs_scan.rs` and `ravel-codec` and do not wait.
+- **D2 and D3** sit in `ravel-sql/src/logs_scan.rs` and consume the
+  reader's decoded page view. They wait for D1, which also touches
+  `logs_scan.rs`. Epic #2135 (RLOG v5, ADR-2135) adds object-level string
+  dictionaries and new integer encodings behind that view. So before D2
+  dispatches, it is re-checked against whatever view is on main then. If
+  v5 has landed, D2 builds on v5's view and not on v4's.
+- **D4** touches the integer decode paths in `ravel-codec` and
+  `crates/ravel-logseg`. That is where #2135 adds its decode arms, and where
+  the #2066 branch (perf/2066-sparse-assembly) rewrites `reader.rs`. D4
+  waits until both have landed, and is re-scoped against their decoders.
+  If #2135's own decoders already decode a page in one pass, D4 is closed as
+  done by #2135 rather than duplicated.
+- This ADR changes no RLOG format, so it adds nothing to #2135's version
+  bump.
 - q33's pool exhaustion (23% of its CPU in page faults) is the memory-budget
   work sequenced after #2086. It is outside this ADR.
 
@@ -175,7 +185,12 @@ The 0.2-0.46 s per-statement floor is latency, and its cause is a hypothesis.
 
 Each band is checked by the same Stage 0 procedure on a fresh c6a.4xlarge
 with the same corpus and geometry, using the build that lands the last
-task.
+task. If RLOG v5 (#2135) lands before that measurement, v5 changes the
+bytes and the decode cost, and these v4 bands no longer describe what is
+measured. In that case the baseline is re-run on a v5 build just before
+this epic's first task lands, and the bands are re-derived from it using
+the same rules. The bands move only in a comment on #2121 posted before the
+final measurement runs.
 - **Hot, total of 42 statements:** at most 78 s. A miss is anything above
   82 s. D2+D3+D4 remove at most 24.7% of hot CPU (8.0 + 9.6 + 7.1). That is
   an upper bound on the saving, so it is a lower bound on the time: 91.3 s x
