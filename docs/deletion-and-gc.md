@@ -120,6 +120,7 @@ own parameters, not gaps a correctly declared config leaves open.
 | unreferenced part | `l1/` object referenced by no compaction record in its bucket | a compaction record OR a retention tombstone exists for the bucket (a tombstone makes future compaction impossible, so a record-less part can never be re-referenced); age > grace + max_compaction_lifetime; the branch condition (non-reference, or record-absent-and-tombstoned) re-verified immediately before delete | part last_modified |
 | retention (ADR-0019, HEAD-reachability gate ADR-0020) | everything in a tombstoned bucket, tombstone deleted last | now >= tombstone.retired_at_ns + protection_horizon; the live catalog HEAD snapshot names no object inside the bucket (delete blocker, see below); bucket LIST-verified empty before the tombstone itself is deleted | tombstone retired_at_ns |
 | idempotency marker (ADR-0051 §5; logs and spans only, run once per signal rather than per shard) | `t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm` marker object | marker's `<ingest_hour>` older than `now_hour - idem_dedup_window_hours - IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS`; a key that fails to parse as `<keyhash32>.<ingest_hour>.idm` is skipped, never deleted | marker key's own `<ingest_hour>` |
+| alert retention (ADR-1688; tombstone-free, alerts shard only, see "Alert signal retention" below) | an L0 commit record under the tenant's alerts commit prefix, then the data object it names | `alert_retention_window_ns` nonzero; the tenant's alert state memo readable and its watermark hour (clamped to the sweeper's own hour) at or above the expiry floor's hour; the record's ingest hour strictly below that watermark; max_event_ts older than now - window and now >= created_unix_ns + protection_horizon; its max_event_ts not the `ts_ns` of any record the memo holds; the legal-hold lease check clear | record max_event_ts and created_unix_ns |
 
 ## HEAD-referenced snapshot delete blocker
 
@@ -465,6 +466,54 @@ than deletes, so even a forced pass keeps the recovery window.
 - A store NotFound on a segment pinned by a running query surfaces as
   SnapshotInvalidated; the frontend re-resolves and retries once before
   failing the query.
+
+## Alert signal retention (ADR-1688)
+
+`Signal::Alerts` is outside the maintained signals: nothing compacts it, and
+the ADR-0019 tombstone flow above never runs on it, because the alert
+evaluator's fold refuses any entry under the alerts commit prefix that is not a
+commit or compaction record. Its history is bounded by a separate sweep that
+the worker owning the tenant's `(alerts, 0)` unit runs on the ordinary
+maintenance tick.
+
+- **The sweep is tombstone-free and hard-scoped.** It lists the alerts shard's
+  commit prefix, skips a record whose ingest hour already proves it is not
+  expired, and deletes an expired, past-horizon record's commit record before
+  the data object it names, so no reference ever dangles. The window is
+  `alert_retention_window_ns` (`--alert-retention`, default 90 days), an age on
+  the transition's own timestamp.
+- **Each alert identity's current-state record is kept whatever its age.** The
+  keep set is read from the tenant's alert state memo: its watermark hour and
+  the `ts_ns` of every record it holds, which equals that record's commit
+  `max_event_ts_ns`. An expired record whose `max_event_ts_ns` is in the set is
+  kept, and no record at or above the watermark hour is deleted, since the memo
+  is complete only below it. A shared `ts_ns` can only make the sweep keep
+  more. After a sweep the prefix holds at least every transition inside the
+  window plus one current-state record per identity (records under a legal
+  hold, inside the protection horizon, or at or above the watermark hour can
+  survive too), and a cold-start fold over it yields
+  the same latest record per identity as a fold over the unswept history.
+- **No usable memo means no sweep for that tenant that tick.** The driver
+  counts the skip under `ravel_alert_retention_skipped_total{reason}`:
+  `absent` (no memo while the tenant has alert commit records), `undecodable`,
+  `unsupported_version`, `watermark_below_floor` (the memo's watermark hour,
+  clamped to the driver's own hour, is below the expiry floor's hour), or
+  `store_error` (the memo read, or the one listing that tells an unused alert
+  keyspace from a lost memo, failed against object storage). A tenant with no
+  memo and no alert commit records is neither swept nor counted.
+- **`--alert-retention 0` turns off the retention sweep and its memo read
+  only.** A nonzero window shorter than one hour plus the memo's seal margin is
+  refused at startup, since the watermark could never reach the floor.
+- **The alerts shard gets the orphan sweep whatever the window.** A crash
+  between the retention sweep's record delete and its data delete leaves a data
+  object no commit record names, and the evaluator abandons a transition whose
+  write outlived `max_flush_lifetime`, leaving the same. The same tick runs the
+  shard sweep over the alerts shard, so orphan GC quarantines those under the
+  rules above. A mass-orphan breaker trip there counts under
+  `ravel_maintain_orphan_breaker_tripped_total{signal="alerts"}`.
+- The sweep's outcome (records and data deleted, records kept, and those kept
+  only as current state) is a log line, not part of the per-signal maintenance
+  report or safety metrics.
 
 ## Selective subject erasure (ADR-0064)
 

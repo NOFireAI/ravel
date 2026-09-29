@@ -4307,6 +4307,157 @@ mod tick_tests {
         );
     }
 
+    /// ADR-1688 decision 4: the retention window is the cold-start fold horizon.
+    /// After the maintain tick's alert retention sweep, a cold start (no memo,
+    /// a fresh evaluator, a full fold over the store alone) folds to exactly
+    /// the map the unswept history folded to, full record per identity.
+    ///
+    /// Four identities over ten transitions, against the default 90-day
+    /// window:
+    ///
+    /// - `a`: firing at -100d, resolved at -99d. Its current state is expired.
+    /// - `b`: firing at -98d, resolved at -97d, refired (generation 2) at -96d.
+    ///   Its current state is expired and carries the generation a refire
+    ///   must continue from.
+    /// - `c`: firing at -95d, resolved at -10d, refired at -1d.
+    /// - `d`: firing at -5d, resolved at -2d. Nothing expired.
+    ///
+    /// The sweep deletes exactly the four expired records that are no
+    /// identity's latest (`a` -100d, `b` -98d and -97d, `c` -95d), each with its
+    /// data object, so ten commit records and ten data objects become six of
+    /// each. The count is what stops this passing by deleting nothing.
+    ///
+    /// The memo the sweep keys on is written the way `run_tick` writes it: the
+    /// evaluator's own fold as `records`, its seal bound as `watermark_hour`.
+    ///
+    /// Watch it fail: in `maintain::alert_keep_set`, replace
+    /// `memo.records.values().map(|record| record.ts_ns)` with
+    /// `std::iter::empty::<i64>()`. The sweep then deletes all six expired
+    /// records, `a` and `b` vanish from the cold-start fold, and the count
+    /// assertion reports four commit records left instead of six.
+    #[tokio::test]
+    async fn a_cold_start_fold_after_the_alert_retention_sweep_equals_the_unswept_fold() {
+        const NS_PER_DAY: i64 = 24 * 60 * 60 * NS_PER_SEC;
+        // 2027-01-15T08:00:00Z: every expired hour is a positive ingest hour.
+        const COLD_NOW_NS: i64 = 1_800_000_000 * NS_PER_SEC;
+
+        let memory = MemoryStore::new();
+        memory.set_clock_ms(((COLD_NOW_NS - 100 * NS_PER_DAY) / 1_000_000) as u64);
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(memory);
+        let ev = evaluator(Arc::clone(&store), TestClock::at(COLD_NOW_NS));
+        let tenant = ev.tenant;
+
+        let rule = |id: &str| Rule {
+            rule_id: id.to_string(),
+            ..threshold_rule()
+        };
+        let at = |days: i64| COLD_NOW_NS - days * NS_PER_DAY;
+        let (a, b, c, d) = (rule("a"), rule("b"), rule("c"), rule("d"));
+        let history = [
+            build_transition_record(&a, AlertState::Firing, 1, at(100)),
+            build_transition_record(&a, AlertState::Resolved, 1, at(99)),
+            build_transition_record(&b, AlertState::Firing, 1, at(98)),
+            build_transition_record(&b, AlertState::Resolved, 1, at(97)),
+            build_transition_record(&b, AlertState::Firing, 2, at(96)),
+            build_transition_record(&c, AlertState::Firing, 1, at(95)),
+            build_transition_record(&c, AlertState::Resolved, 1, at(10)),
+            build_transition_record(&c, AlertState::Firing, 2, at(1)),
+            build_transition_record(&d, AlertState::Firing, 1, at(5)),
+            build_transition_record(&d, AlertState::Resolved, 1, at(2)),
+        ];
+        seed_alert_history(&ev, &history).await;
+
+        let commit_prefix =
+            keys::commit_shard_prefix(&tenant, Signal::Alerts, ALERT_SHARD).expect("prefix");
+        let data_prefix = format!("t/{}/a/l0/", tenant.to_hex());
+        let count = |prefix: String| {
+            let store = Arc::clone(&store);
+            async move {
+                ravel_object_store::list_all(store.as_ref(), &prefix)
+                    .await
+                    .expect("list")
+                    .len()
+            }
+        };
+        assert_eq!(count(commit_prefix.clone()).await, 10);
+        assert_eq!(count(data_prefix.clone()).await, 10);
+
+        let unswept = ev.load_latest_records().await.expect("pre-sweep fold");
+        assert_eq!(unswept.len(), 4, "four identities fold");
+        write_alert_state_memo(
+            store.as_ref(),
+            &tenant,
+            &AlertStateMemo {
+                watermark_hour: ev.seal_bound_hour(COLD_NOW_NS),
+                records: unswept.clone(),
+            },
+        )
+        .await
+        .expect("write memo");
+
+        let clock = ravel_maintain::FixedClock::new(COLD_NOW_NS);
+        let worker = ravel_maintain::WorkerSet::with_defaults(COLD_NOW_NS)
+            .with_process_id(Uuid::from_u128(1));
+        let live = worker.solo_live_set();
+        let safety = crate::maintain::MaintenanceSafetyMetrics::default();
+        let ownership = crate::maintain::MaintenanceOwnershipMetrics::new(3);
+        let mut maintain_memo = ravel_maintain::scan::MaintainMemo::with_default_interval();
+        crate::maintain::run_tick_with_clock(
+            &clock,
+            store.as_ref(),
+            &tenant,
+            &ravel_maintain::CompactorConfig::default(),
+            &ravel_maintain::RetentionConfig::default(),
+            1,
+            &mut maintain_memo,
+            &safety,
+            &ownership,
+            &worker,
+            &live,
+        )
+        .await;
+
+        for reason in crate::maintain::AlertRetentionSkipReason::ALL {
+            assert_eq!(safety.alert_retention_skipped(reason), 0, "{reason:?}");
+        }
+        assert_eq!(
+            count(commit_prefix).await,
+            6,
+            "the sweep deletes exactly the four expired records that are no identity's latest"
+        );
+        assert_eq!(
+            count(data_prefix).await,
+            6,
+            "each deleted record's data object goes with it"
+        );
+
+        store
+            .delete(&crate::alert_state_memo::alert_state_memo_key(&tenant))
+            .await
+            .expect("delete memo");
+        assert!(
+            read_alert_state_memo(store.as_ref(), &tenant)
+                .await
+                .expect("read memo")
+                .is_none(),
+            "the cold start has no memo to seed from"
+        );
+        let cold = evaluator(Arc::clone(&store), TestClock::at(COLD_NOW_NS))
+            .fold_latest(None, COLD_NOW_NS)
+            .await
+            .expect("cold-start fold");
+
+        for (id, record) in &unswept {
+            assert_eq!(
+                cold.get(id),
+                Some(record),
+                "identity {} folds to the same record after the sweep",
+                record.rule_id
+            );
+        }
+        assert_eq!(cold, unswept);
+    }
+
     /// The memo path folds only the ingest hours at or after the watermark. With
     /// every seeded record below the watermark, a steady-state fold reads zero
     /// commit/data GETs and issues exactly one tail LIST, yet still returns the
