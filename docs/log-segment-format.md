@@ -1,13 +1,15 @@
 # RLOG: Ravel Log Segment Format
 
 Persistent contract (ADR-0029). Any change bumps the trailer version. The
-current trailer version is 4 (ADR-0699 moved BLOCKS to row groups with
-column-major page placement and added PAGE_DIR). It is the only version any
-reader accepts: ADR-0892 deleted the version-3 reader, and version 2 (which
-added the footer's compaction-identity fields) and version 1 (the format-only
-initial release) were retired the same way before it.
+current trailer version is 5 (ADR-2135 added the footer's sort descriptor and
+clustering generation, put the covered-column list at the head of BLOOM, sized
+bloom filters to a multiple of 512 bits, and registered encoding tags 10 to
+13). It is the only version any reader accepts: the version-4 reader was
+deleted in the same change, as ADR-0892 deleted the version-3 reader, and
+version 2 (which added the footer's compaction-identity fields) and version 1
+(the format-only initial release) were retired the same way before it.
 
-<!-- reader-supported-versions: ravel_logseg = 4 -->
+<!-- reader-supported-versions: ravel_logseg = 5 -->
 <!-- Checked against ravel_logseg::footer::SUPPORTED_VERSIONS by
      scripts/check_format_version_docs.py; keep it in step with the current
      trailer version above when the reader window changes. -->
@@ -35,10 +37,21 @@ unretired predecessor reader rather than an N/N-1 policy in force. The
 irreversible boundary for a v3 store was 0.11.0 to 0.12.0, not 0.10.x to
 0.11.0.
 
+Version 5 changed two byte layouts: the BLOOM section gained its
+covered-column list, and filters are no longer rounded to a power of two, so
+the version-4 BLOOM parser would misread a version-5 section. The footer gained
+two fields (`sort_descriptor`, `clustering_generation`). The writer at version
+5 still produces version 4's content: it records no sort descriptor and
+generation 0, covers every column version 4 indexed, and emits none of tags 10
+to 13. A version-4 object is refused with `UnsupportedVersion` from the
+trailer alone, before the footer or any section is requested. Under the
+pre-v1.0 posture below, a development store holding version-4 objects is wiped
+or re-ingested.
+
 Version 4 changed the BLOCKS layout, deleted the per-block header, and
 redefined the SKIP_IDX level-0 block crc, so it was a versioned change rather
 than the additive kind ADR-0029's carve-out excepts -- whatever PAGE_DIR's own
-kind number would imply on its own. A version-4 object always carries a
+kind number would imply on its own. Since version 4 every object carries a
 PAGE_DIR section, and one that does not is refused.
 
 Version 3 changed no byte layout: it changed which value a `NumStat` bounds
@@ -99,7 +112,7 @@ encodings.
 | trailer (16 bytes):                               |
 |   footer_len:   u32                               |
 |   footer_crc32c:u32                               |
-|   version:      u16   (= 4)                       |
+|   version:      u16   (= 5)                       |
 |   signal:       u8    (2 = logs)                  |
 |   reserved:     u8    (= 0)                       |
 |   magic:        [u8;4] = "RLG1"                   |
@@ -156,6 +169,17 @@ are permitted.
   `base_created_unix_ns`-equivalent: unlike RSEG it has no cross-writer
   record dedup that needs a recovered per-run creation time (retry
   duplicates are structurally impossible at the RLOG write path).
+- row order (ADR-2135 decision 2, field numbers 17-18, added in trailer
+  version 5): `sort_descriptor` (optional `SortDescriptor { bucket_width,
+  key_columns }`) and `clustering_generation` (uint64). An absent descriptor
+  means the default `(stream_ref, ts)` order. A present one orders rows by
+  `(stream_ref, ts.div_euclid(bucket), key_1, ..., key_n, ts)`, with
+  `bucket_width` one of 1 hour, 6 hours, 1 day and one to four key columns,
+  each a name and a type (str, i64, bool, bytes). `clustering_generation` is
+  the tenant clustering generation the object was written under: 0 means the
+  tenant never set a key, and a cleared key leaves the descriptor absent with
+  a nonzero generation. The writer at version 5 records no descriptor and
+  generation 0 on every object.
 - unknown section kinds MUST be skipped by readers (forward
   compatibility).
 
@@ -183,6 +207,9 @@ Validation (all violations `Corrupted`, never panics):
   `[0, total_size - 16 - footer_len)`, with overflow-checked arithmetic.
 - `uncompressed_len` is capped by config (default 1 GiB per section) and
   the decompressed length must equal it exactly.
+- A present `sort_descriptor` with `clustering_generation` 0, an unspecified
+  or unknown `bucket_width`, a key column count outside 1..=4, or a key
+  column with an unspecified or unknown type.
 
 ### Section kinds
 
@@ -327,7 +354,7 @@ than `group_target_blocks` has exactly one row group, and its layout is the
 same, so a small flush object pays nothing for the level (ADR-0699 decision 1).
 
 ```
-BLOCKS (version 4):
+BLOCKS (version 4 and later):
   row group 0 (blocks 0..31):
     chunk column 0:   page(b0) page(b1) ... page(b31)
     chunk column 1:   page(b0) page(b1) ... page(b31)
@@ -446,6 +473,15 @@ SKIP_IDX level-0 entry count.
 | 7 | dictionary | strings, f64 bits, fixed-width |
 | 8 | bitmap | bool columns, presence bitmaps |
 | 9 | fixed-width | trace_id (16B), span_id (8B) |
+| 10 | reserved: GCD i64 (ADR-2135 decision 3) | never written |
+| 11 | reserved: column reference (ADR-2135 decision 3) | never written |
+| 12 | reserved: row-group dictionary page (ADR-2135 decision 6) | never written |
+| 13 | reserved: row-group dictionary ids (ADR-2135 decision 6) | never written |
+
+Tags 10 to 13 are registered in the shared `ravel-codec` registry so the
+codecs of ADR-2135 decisions 3 and 6 can land without another registry
+change. At version 5 no writer emits them, and a PAGE_DIR page carrying one
+is `Corrupted`.
 
 The writer picks per page by measured encoded size, biased toward
 `constant` then `RLE` on ties (they also decode fastest). An unknown
@@ -753,19 +789,29 @@ exactly.
 
 ## BLOOM
 
-One blocked bloom filter per row block. The BLOOM section is a container:
+One blocked bloom filter per row block. The BLOOM section (version 5) is a
+container that starts with the list of column ids its filters cover:
 
 ```
+covered_count: u32
+covered_count column ids: varint each, strictly ascending
 count: u32
 count entries, entry i for block i:
   entry_len: varint
   crc32c:    u32    crc32c over the entry's stored bytes (below)
   entry:     entry_len bytes:
-    m_bits:  varint   (power of two, >= 512)
+    m_bits:  varint   (multiple of 512, >= 512)
     k:       u8       (hash count, > 0)
     seed:    u64 LE
     bits:    m_bits / 8 bytes
 ```
+
+A reader builds a bloom arm only for a covered column. A filter probe for an
+uncovered column proves nothing, so that column is scanned instead of pruned
+and no matching row is dropped (ADR-2135 decision 5). A covered id is either a
+fixed column id (below 10) or a column FIELD_DIR names. The writer at version 5
+covers `severity_text`, `body`, and every string attribute column in FIELD_DIR,
+which is every column version 4 inserted.
 
 Inserted keys are hashed as
 `h = blake3(seed_le(8) || column_id_le(4) || token)`, reading three 64-bit
@@ -779,9 +825,13 @@ the bit at `(block % (m_bits/512)) * 512 + ((g1 + i*g2) % 512)` is set
 within-block offsets read disjoint digest bytes so the first probe is not
 congruent to the block index (which would collapse most set bits onto two
 offsets and wreck the false-positive rate). `k = 7`, chosen for a ~1%
-false-positive rate; `m_bits = next_pow2(max(512, ceil(n * 9.585)))`
-where `n` is the block's distinct `(column_id, token)` count (9.585 bits
-per element for p = 0.01).
+false-positive rate; `m_bits = max(512, ceil(n * 9.585))` rounded up to a
+multiple of 512, where `n` is the block's distinct `(column_id, token)`
+count (9.585 bits per element for p = 0.01). Version 4 rounded up to a power
+of two, which gave up to twice the bits and a lower false-positive rate than
+the design point; version 5 filters run at the designed rate. The probe
+already reduces the block index modulo `m_bits / 512`, so it needs no power
+of two.
 
 Inserted per block, all field-scoped by `column_id`:
 
@@ -797,9 +847,14 @@ collides with an `attr.k` match, so `has_word(body, 'timeout')` and
 The FPR is a pruning-efficiency knob, never a correctness knob. A false
 positive costs one block scan; a false negative is impossible by
 construction, which is what makes bloom-based skipping sound (ADR-0013).
-Readers reject a truncated entry, an `m_bits` that is not a power of two
+Readers reject a truncated entry, an `m_bits` that is not a multiple of 512
 or is below 512, a `k` of 0, a `bits` length that is not `m_bits / 8`,
-and an entry index outside `[0, count)`.
+and an entry index outside `[0, count)`. In the covered list they reject a
+`covered_count` above the object's column count (the fixed ids plus FIELD_DIR's
+entries), an id that is not strictly above the one before it, and an id of 10
+or more that FIELD_DIR does not name. Like any other BLOOM corruption, a
+rejected covered list degrades the scan to no bloom pruning (see "Pruning
+soundness").
 
 ## POSTINGS
 
@@ -1153,8 +1208,10 @@ All violations are `Corrupted`, never panics:
 - codec: id out of dictionary range; delta/double-delta accumulation
   overflow; FOR `bit_width > 64` or packed length mismatch; a codec not
   consuming exactly its bytes.
-- bloom: `m_bits` not a power of two or below 512; `k = 0`; `bits` length
-  wrong; entry crc mismatch; entry index out of range.
+- bloom: `covered_count` over the object's column count; covered ids not
+  strictly ascending, or a dynamic id FIELD_DIR does not name; `m_bits` not a
+  multiple of 512 or below 512; `k = 0`; `bits` length wrong; entry crc
+  mismatch; entry index out of range.
 - postings: whole-section crc mismatch (checked before the header is
   parsed at all); unknown section grammar version; field count or one
   field's term/block count over its cap; non-ascending `column_id`
@@ -1177,9 +1234,13 @@ All violations are `Corrupted`, never panics:
   group's blocks could carry pages for (`block_count * MAX_PAGES`);
   non-ascending `column_id` across a group's chunks; a page count outside
   `1..=2 * block_count`; a page naming a block outside its group or going
-  backwards within a chunk; an unknown `enc` tag; an overflowing chunk length
+  backwards within a chunk; an unknown `enc` tag, or one of the reserved tags
+  10 to 13; an overflowing chunk length
   or extent; a chunk whose extent ends past the BLOCKS section; a total block
   count disagreeing with the SKIP_IDX level-0 entry count; truncation; trailing
   bytes.
-- page crc mismatch (version 4, before the page is decompressed).
+- page crc mismatch (since version 4, before the page is decompressed).
+- footer: a present `sort_descriptor` with `clustering_generation` 0, an
+  unknown bucket width or key column type, or a key column count outside
+  1..=4.
 - block crc mismatch.
