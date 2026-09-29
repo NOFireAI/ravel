@@ -339,7 +339,8 @@ untouched.
   not below, because an object store sees only byte ranges: object_store's
   default `get_ranges` coalesces ranges within 1 MiB (the 0.13 crate
   DataFusion's reader calls, `object_store-0.13.2/src/util.rs:92`), so a
-  store cannot tell a footer read from a column chunk.
+  store cannot tell a footer read from a column chunk. The reader hands
+  DataFusion no Parquet page index (see the page index amendment below).
 - **A decoded-metadata cache.** It is owned by Ravel, bounded in bytes, and
   keyed by tenant hash and the same content key. DataFusion's own
   `FileMetadataCache` lives in the per-query `RuntimeEnv` and dies with the
@@ -524,7 +525,8 @@ cost:
     of partial states is the follow-up if it matters.
 - Parquet filter pushdown (`pushdown_filters`) is on, which evaluates
   predicates inside the reader and decodes the other columns only for
-  surviving rows (K6: 57.5 s to 47.1 s hot, 251.7 s to 203.5 s cold).
+  surviving rows (K6: 57.5 s to 47.1 s hot, 251.7 s to 203.5 s cold). It
+  stays on with page indexes off (see the page index amendment below).
 - `target_partitions` and TopK aggregation keep Ravel's values, since
   neither costs a measurable amount (K1, K3).
 - The spill classifier learns Parquet tables. Spill eligibility comes from
@@ -552,7 +554,8 @@ they split by what they match:
   Parquet-plan test.
 
 DataFusion's row-group, page-index and bloom-filter pruning apply to
-Parquet plans. A query may name several Parquet tables. A Parquet table and a
+Parquet plans, except page-index pruning (see the page index amendment
+below). A query may name several Parquet tables. A Parquet table and a
 signal table in one statement is a `CrossSignalQuery` error, as two signal
 tables are today. `target_signal` gains a Parquet arm, since today a name
 it does not know routes to Metrics.
@@ -812,3 +815,24 @@ read `sys/`) makes the probe inconclusive, and an inconclusive probe
 refuses the grant. Least-privilege credentials that can read only the
 granted prefix are therefore refused, and the operator widens them to
 read `sys/tenancy` or uses another profile.
+
+## Amendment (2026-09-30): the reader does not use Parquet page indexes
+
+<!-- amendment-applies: sections="D3. The reader: DataFusion's Parquet scan through Ravel's fetch path|D6. Session settings for Parquet tables follow the measurement" pointer="page index amendment" -->
+<!-- amendment-supersedes: phrase="page-index and bloom-filter pruning apply" pointer="page index amendment" -->
+
+The reader in D3 hands DataFusion a footer with no column index and no
+offset index, whatever page index policy DataFusion asks for, and the scan
+runs with DataFusion's `enable_page_index` off, so no page index is loaded
+through the reader or through any store. A corrupt offset index makes the
+parquet crate (58.4) return wrong rows without an error, because it reads
+each data page from the byte range the offset index names and never compares
+that with the page's own header; three reviews of issue #2053 found shapes
+(a missing location, a location covering two pages, a wrong first row) that
+no check over the metadata alone can refuse. Without an offset index the
+scan walks each column chunk by page header, which is exact.
+
+Row-group statistics pruning and D6's `pushdown_filters` are unchanged. The
+cost is page-level pruning: on a file that carries a page index, a filter
+that only partly matches a row group reads every page of that row group's
+column chunks instead of only the pages its column index would have kept.
