@@ -440,8 +440,12 @@ impl FlightSqlService for RavelFlightSqlService {
             &self.config,
         )?;
 
-        // Step 2: resolve exactly once. This snapshot, and only this
-        // snapshot, is what DoGet will execute against.
+        // Step 2: resolve exactly once. For the signal tables this snapshot,
+        // and only this snapshot, is what DoGet will execute against. Parquet
+        // tables are the exception: the ticket carries no Parquet state, so
+        // DoGet's plan resolves each table's newest manifest and the tenant's
+        // grants again, and a table replaced or a grant removed between the
+        // two RPCs is what DoGet reads.
         //
         // This accounting handle covers this RPC's resolve and logical plan.
         // DoGet (crate::flight::stream) builds its own handle for the execution

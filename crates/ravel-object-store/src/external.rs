@@ -26,9 +26,10 @@
 //! anything reads through it: that the store evaluates read preconditions, and
 //! that it is not Ravel's own bucket under another name.
 //!
-//! Nothing in a shipping binary constructs an [`ExternalStore`] yet. The
-//! callers are the ravel-parquet reader (#2052) and the grant CLI and
-//! `CREATE EXTERNAL TABLE` paths (#2051, #2054).
+//! `ravel-server` opens one per (profile, bucket) a Parquet table query reads
+//! (through `ravel-sql`'s `ProfileStores`), and `ravel-cli tenant
+//! parquet-grant add` opens one to probe a grant; `CREATE EXTERNAL TABLE`
+//! (#2054) will be the next caller.
 
 use std::path::PathBuf;
 use std::sync::Arc;

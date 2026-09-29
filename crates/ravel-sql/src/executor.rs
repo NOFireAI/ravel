@@ -1176,14 +1176,18 @@ impl SqlExecutor {
     }
 
     /// Answer "what would this statement do?" without reading a single data
-    /// object (ADR-1374 decision 3, prerequisite 3).
+    /// object (ADR-1374 decision 3, prerequisite 3), except for a Parquet
+    /// table's schema.
     ///
     /// Runs the same first half [`Self::execute`] runs -- validate, resolve
     /// the target signal's snapshot, admit it, estimate its cost, build the
     /// session and plan -- and stops before execution. The catalog reads the
     /// resolve issues are real (a plan over an imagined snapshot would answer
     /// a different question than the one asked); no segment is fetched,
-    /// because nothing polls a stream.
+    /// because nothing polls a stream. A Parquet table's provider is built
+    /// from its first file's footer, so explaining a statement over Parquet
+    /// tables reads that footer and its page index (Probe GETs on the external
+    /// store, unless the metadata cache holds them), and no column chunk.
     ///
     /// The returned schema is the effective one, declared typed columns
     /// (ADR-0090) included, because those widen the `logs` table and a caller
@@ -1205,9 +1209,10 @@ impl SqlExecutor {
     /// resolve's own store spend is attributable.
     ///
     /// Bounded by [`SqlRequest::deadline`] exactly as [`Self::execute_accounted`]
-    /// is. Explain issues no data GET, but it does issue the resolve's catalog
-    /// LISTs and GETs, and a store that stops answering would otherwise hang
-    /// this call for as long as the transport allowed.
+    /// is. Explain fetches no segment, but it does issue the resolve's catalog
+    /// LISTs and GETs, and a Parquet table's footer reads, and a store that
+    /// stops answering would otherwise hang this call for as long as the
+    /// transport allowed.
     pub async fn explain_accounted(
         &self,
         tenant_hash: TenantHash,
@@ -1251,7 +1256,7 @@ impl SqlExecutor {
         // `resolve_admitted` itself checks the effective `max_s3_requests`
         // right after resolve returns, so `explain` gets that enforcement
         // for free here without ever reaching the segment-fetch loop in
-        // scan.rs (which it never runs: explain issues no data GET).
+        // scan.rs (which it never runs: explain fetches no segment).
         let Resolved {
             snapshot,
             admission,
