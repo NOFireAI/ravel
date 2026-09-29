@@ -98,7 +98,9 @@ types across that boundary.
    `attrs_map_column` carries the attributes the mapping does not name as
    one map column. Metrics samples are deduplicated per `(series, ts)` by
    bit pattern before writing, the rule the query path applies; logs and
-   spans have no dedup and are exported as stored.
+   spans have no dedup and are exported as stored. (For metrics, which
+   mapping shapes round-trip and how duplicates are resolved are settled by
+   the metrics export amendment below.)
 
 5. **Export is a store read, not a query.** It evaluates no PromQL or SQL,
    applies no staleness rule and no aggregation, and stays on arrow 59
@@ -226,3 +228,36 @@ the OTLP path's identity rules, so both surfaces agree on the `SeriesId`:
   and a missing one name the same series.
 - Two mapped labels that sanitize to one name are refused rather than
   merged.
+
+## Amendment (2026-09-30): what metrics export round-trips
+
+<!-- amendment-applies: sections="Decision" pointer="metrics export amendment" -->
+
+Decision 4 says `load(export(window))` round-trips every mapped field. The
+OTLP series-identity amendment above makes that impossible for some metrics
+mapping shapes, because the load rewrites names the stored series already
+carries in their rewritten form. Metrics export therefore narrows decision
+4 as follows:
+
+- Each series is written under a name that a load with the same mapping
+  turns back into the stored name: the stored name itself when the load
+  leaves it unchanged, otherwise the stored name less a trailing `_total`
+  (a counter whose unit suffix and `_total` the load adds again), less its
+  unit suffix, or less both (a name the suffixes took past the metric-name
+  length cap). Each candidate is checked by running the load's own naming
+  rule over it.
+- A mapping or a series the export cannot invert is refused by name, and
+  no file is written: a `[metrics.histogram]` mapping (a classic histogram
+  round-trips through a scalar mapping with a `le` label instead), a stored
+  name no candidate reproduces, a label the mapping does not name,
+  native-histogram samples in the window, and a timestamp that is not a
+  whole number of the mapping's `ts_unit`. A file that silently loads onto
+  other series is not an export.
+- Duplicates are resolved exactly as the query path resolves them: one
+  sample per `(series, ts)`, the one with the greatest
+  `(created_unix_ns, writer_epoch, writer_seq, in-page index)`, and the
+  greatest value bit pattern only on a tie there. Decision 4's "by bit
+  pattern" names the tie-break, not the whole rule.
+- A reloaded series lands in the target tenant, whose tenant hash enters
+  its `SeriesId`, so the round trip preserves label sets and sample bits
+  rather than the `SeriesId` value itself.

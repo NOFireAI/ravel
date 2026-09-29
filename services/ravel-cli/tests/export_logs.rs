@@ -1761,18 +1761,17 @@ async fn export_refuses_a_directory_output_before_any_store_request() {
     );
 }
 
-/// `--signal metrics` (and, by the same code path, `spans`) is refused by
-/// name rather than attempted: ADR-1751's follow-up order lands metrics load
-/// and spans load first, and export has nothing to round-trip either against
-/// until then.
+/// `--signal spans` is refused by name rather than attempted, and before the
+/// mapping file is opened: spans export is the part of ADR-1751 follow-up
+/// task 3 that has not landed.
 #[tokio::test]
-async fn export_refuses_unsupported_signal_metrics() {
+async fn export_refuses_unsupported_signal_spans() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let err = export::run(
         store,
         StoreSelection::explicit(StoreKind::Memory),
         "acme",
-        SignalArg::Metrics,
+        SignalArg::Spans,
         BASE_NS,
         BASE_NS + ONE_SEC_NS,
         Path::new("/nonexistent/mapping.toml"),
@@ -1782,9 +1781,9 @@ async fn export_refuses_unsupported_signal_metrics() {
         BASE_NS,
     )
     .await
-    .expect_err("metrics export is refused");
+    .expect_err("spans export is refused");
     assert_eq!(
         err.to_string(),
-        export::unsupported_signal_message(SignalArg::Metrics).expect("metrics is unsupported")
+        export::unsupported_signal_message(SignalArg::Spans).expect("spans is unsupported")
     );
 }

@@ -5478,7 +5478,7 @@ impl MetricsColumnIndex {
 /// `Metric::name`), and the suffixes are appended after sanitization, so a
 /// mapped name and the OTLP metric it mirrors reach `SeriesId::compute` as the
 /// same string.
-fn normalized_family_name(
+pub(crate) fn normalized_family_name(
     raw: &str,
     mapping: &MetricsMapping,
     kind: MetricKind,

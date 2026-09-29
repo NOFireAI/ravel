@@ -539,15 +539,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   deployment context falls back to, and a test pins `ravel-query`'s hand copy
   of the fold interval against the server's own default so the two cannot drift
   apart unnoticed.
-- **`ravel-cli export --signal metrics|spans` now names what it actually waits
-  on** (ADR-1751 follow-up task 2 review, issues #1751 and #1712). Both
-  refusals said bulk import for that signal does not exist yet. Both imports
-  have since landed, so each message now names ADR-1751 follow-up task 3, the
-  export work itself, and says the import half of the round trip is already
-  there. Neither message claims that follow-up decides the output columns:
-  ADR-1751 decision 4 already settles them, the same mapping TOML names them.
-  The `export` help text and the ingest guide's bulk-export section say
-  the same.
+- **`ravel-cli export --signal spans` now names what it actually waits on**
+  (ADR-1751 follow-up task 2 review, issues #1751 and #1712). The refusal said
+  bulk import for spans does not exist yet. The import has since landed, so
+  the message now names ADR-1751 follow-up task 3, the export work itself,
+  and says the import half of the round trip is already there. It does not
+  claim that follow-up decides the output columns: ADR-1751 decision 4
+  already settles them, the same mapping TOML names them. The `export` help
+  text and the ingest guide's bulk-export section say the same. (Metrics
+  export itself is added below.)
 
 - **A Parquet load resolves each dictionary-encoded column once per batch
   instead of once per cell** (issues #1751 and #1712). The per-row readers
@@ -647,6 +647,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `S3Store::new` now builds the control-plane client on every construction:
   `ravel-cli store verify-protection` (task 2) and the server startup gate
   (task 3) are the callers.
+- **`ravel-cli export --signal metrics` writes a tenant's stored metric
+  samples to a Parquet file `load --signal metrics` reads back onto the same
+  series** (ADR-1751 decision 4, issue #1712). It resolves the metrics catalog
+  once, fetches the RSEG objects through ravel-query's segment fetcher,
+  applies pending erasure predicates with the functions the query engine
+  calls, and writes the `[metrics]` mapping's columns sorted by event time.
+  Samples are deduplicated per series and timestamp to the one a query
+  serves: the greatest write provenance, then the greatest `f64::to_bits` of
+  the value. A `name_column` export writes each stored name, or the stored
+  name less `_total`, less the unit suffix, or less both, whichever a load
+  with the same mapping turns back into the stored name, and refuses by name
+  a series none reproduces, a series carrying a label the mapping does not
+  name, a native-histogram series, and a sample finer than `ts_unit`; a
+  `name` literal exports only the series it names. A `[metrics.histogram]`
+  mapping is refused with the scalar mapping to use instead. The report adds
+  `series_written`, `series_skipped` and `samples_deduplicated` to the logs
+  export's lines. `--signal spans` is still refused.
 - **`/metrics` renders the three writer clock-lag counters, and a shipped
   alert pages on a refused flush** (ADR-1685 follow-up task 3, issue #1685).
   `ravel_ingest_clock_lag_refused_total`,
