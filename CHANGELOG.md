@@ -570,6 +570,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bytes to the BLOCKS length; an object where either does not hold is refused
   with an error naming it and both figures. `rlog inspect` now prints the
   object's own trailer version rather than the build's constant.
+- **The per-tenant config record reader accepts format version 3, which adds
+  a clustering key and a bloom scope** (ADR-2135, issue #2138). Readers accept
+  record versions 1 to 3 and decode `clustering_key` (field 13: 1 to 4 declared
+  typed attribute columns, a one-hour, six-hour or one-day bucket width, and a
+  clustering generation) and `bloom_scope` (field 14: all, undeclared or text).
+  An absent key reads as no key with generation 0, and an absent scope reads as
+  all. A stored key that names a column that is not a declared typed attribute
+  column, a duplicate column, no columns or more than four, or an unspecified
+  or unknown bucket width fails only its accessor with a typed error; the rest
+  of the record, retention included, still reads. The writer still stamps
+  version 2, and the setters and `set_tenant_config` refuse to write either
+  field until the writer moves to version 3 in a later release. Nothing reads
+  the new fields yet.
 - **The maintenance loop sweeps alert history older than `--alert-retention`,
   default 90 days** (ADR-1688 follow-up task 2, issue #1688). After upgrade
   the first tick deletes every alert transition older than 90 days except each

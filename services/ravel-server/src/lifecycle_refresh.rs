@@ -758,6 +758,8 @@ mod tests {
             created_unix_ns: 1_000,
             updated_unix_ns: 1_000,
             typed_attr_columns: None,
+            clustering_key: None,
+            bloom_scope: ravel_proto::sys::v1::BloomScope::All as i32,
         };
         store
             .put(

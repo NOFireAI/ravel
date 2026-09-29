@@ -534,6 +534,41 @@ message TypedAttrColumnConfig {
   repeated TypedAttrColumn columns = 1;
 }
 
+// The time-bucket width a tenant's clustering key groups rows by (ADR-2135).
+// Exactly three accepted widths. UNSPECIFIED is the proto3 zero default: a
+// present ClusteringKeyConfig carrying it (or an unknown value) is invalid, and
+// the reader's clustering-key accessor refuses it with a typed error rather than
+// guess a width. Record decode itself does not fail on it.
+enum ClusteringBucketWidth {
+  CLUSTERING_BUCKET_WIDTH_UNSPECIFIED = 0;  // refused when the message is present
+  CLUSTERING_BUCKET_WIDTH_ONE_HOUR = 1;
+  CLUSTERING_BUCKET_WIDTH_SIX_HOURS = 2;
+  CLUSTERING_BUCKET_WIDTH_ONE_DAY = 3;
+}
+
+// A tenant's clustering key (ADR-2135): the ordered declared typed attribute
+// columns rows are clustered by, the time-bucket width, and a generation that
+// identifies which key produced a given layout. Valid content is 1 to 4
+// columns, no duplicates, each naming a column declared in the same record's
+// typed_attr_columns, and a width other than UNSPECIFIED. Those rules are
+// enforced by the reader's clustering-key accessor and by the setter (one shared
+// validation), not by record decode, so an invalid stored key never makes the
+// record itself unreadable.
+message ClusteringKeyConfig {
+  repeated string columns = 1;                 // declared typed attribute column names, in key order
+  ClusteringBucketWidth bucket_width = 2;
+  uint64 generation = 3;                       // clustering generation
+}
+
+// Which attribute columns get bloom filters for a tenant (ADR-2135). ALL is the
+// zero value on purpose: an absent field 14 on any record reads as ALL, the
+// behavior every record written before this field existed already had.
+enum BloomScope {
+  BLOOM_SCOPE_ALL = 0;
+  BLOOM_SCOPE_UNDECLARED = 1;
+  BLOOM_SCOPE_TEXT = 2;
+}
+
 // The durable, per-tenant configuration record at `t/<tenant_hash>/config`
 // (ADR-0066 decision 6, epic EM). Moves per-tenant lifecycle state, admission
 // limits, retention, and indexed-field config off process flags and into a
@@ -564,9 +599,19 @@ message TenantConfigRecord {
   // reader that only knows a lower version refuses rather than misreading a
   // future layout, matching every other durable record's version guard.
   //
-  // Version 2 is current: writers stamp 2 and readers accept the SET {1, 2}.
-  // Version 1 remains fully readable, so a record any earlier build wrote is
-  // still read, and nothing has to be migrated.
+  // Writers stamp 2 and readers accept the SET {1, 2, 3}. Versions 1 and 2
+  // remain fully readable, so a record any earlier build wrote is still read,
+  // and nothing has to be migrated.
+  //
+  // Version history:
+  //   1: the original layout, fields 1 to 12.
+  //   2: the same field set; the ADR-0066 R2 writer flip, a floor signal that
+  //      makes a pre-R1 binary refuse the record instead of rewriting it.
+  //   3: adds clustering_key (field 13) and bloom_scope (field 14), ADR-2135.
+  //      Readers accept 3 one release BEFORE any writer stamps it (the R1
+  //      reader-first step, exactly as version 2 was accepted before the R2
+  //      writer flip); writers still stamp 2 and refuse to set either field
+  //      until a later writer flip moves them to 3.
   //
   // This record is CAS-mutable (set_tenant_config rebuilds it whole under
   // CasVersion, naming every field it knows), so per the ADR-0066 R1 amendment
@@ -611,6 +656,19 @@ message TenantConfigRecord {
   // rewrites the record whole and a lagging writer would otherwise strip the new
   // field.
   TypedAttrColumnConfig typed_attr_columns = 12;
+  // Per-tenant clustering key (ADR-2135); absent means no clustering key and
+  // clustering generation 0. Added in format_version 3 under the CAS-mutable
+  // rule: readers accept version 3 fleet-wide first, and no writer emits this
+  // field until the writer flips to 3. A reader that predates it skips the
+  // unknown field and reads every earlier field exactly as before, but refuses a
+  // version-3 record outright, so it can never rewrite the record without it.
+  // See ClusteringKeyConfig for the content rules, which record decode does not
+  // enforce.
+  ClusteringKeyConfig clustering_key = 13;
+  // Per-tenant bloom filter scope (ADR-2135); absent (the zero value) means
+  // ALL. Added in format_version 3 under the same reader-first rollout as
+  // clustering_key.
+  BloomScope bloom_scope = 14;
 }
 
 // One entry of the durable `sys/auth` token map (ADR-0066 decision 6, epic EM):

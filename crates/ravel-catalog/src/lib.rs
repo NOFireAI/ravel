@@ -100,9 +100,11 @@ pub use snapshot_format::{
     encode_column_stats_v3, encode_head, encode_part, encode_postings, validate_min_max_presence,
 };
 pub use tenant_config::{
-    DeclaredColumnType, DeclaredTypedColumn, FIXED_LOGS_SQL_COLUMNS,
-    SetOutcome as TenantConfigSetOutcome, TENANT_CONFIG_FORMAT_VERSION,
-    TENANT_CONFIG_MAX_READ_VERSION, TENANT_CONFIG_MIN_READ_VERSION, TenantConfig,
-    TenantConfigError, TenantLifecycleState, TypedAttrColumnError, config_key, read_config,
-    read_config_values, resolve_retention_window, set_tenant_config, validate_typed_attr_columns,
+    BloomScope, ClusteringBucketWidth, ClusteringKey, DeclaredColumnType, DeclaredTypedColumn,
+    FIXED_LOGS_SQL_COLUMNS, MAX_CLUSTERING_KEY_COLUMNS, SetOutcome as TenantConfigSetOutcome,
+    StorageLayoutConfigError, StoredBloomScope, StoredClusteringKey, TENANT_CONFIG_FORMAT_VERSION,
+    TENANT_CONFIG_MAX_READ_VERSION, TENANT_CONFIG_MIN_READ_VERSION,
+    TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION, TenantConfig, TenantConfigError,
+    TenantLifecycleState, TypedAttrColumnError, config_key, read_config, read_config_values,
+    resolve_retention_window, set_tenant_config, validate_typed_attr_columns,
 };
