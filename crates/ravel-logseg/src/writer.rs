@@ -17,7 +17,6 @@ use crate::block::{
     BlockStrDict, BlockWriteOut, ColumnPlan, ColumnarBlockInput, write_block, write_block_columnar,
 };
 use crate::bloom::BloomBuilder;
-use crate::bloom_section::encode_bloom_section;
 use crate::columnar_batch::ColumnarLogBatch;
 use crate::error::LogSegError;
 use crate::field_dir::{FieldDir, FieldEntry};
@@ -29,6 +28,7 @@ use crate::record::{
     COL_BODY, COL_SEVERITY_TEXT, ColumnValue, FIRST_DYNAMIC_COL, FieldType, LogRecord, ResolvedRow,
     canonical_value_bytes, resolve_value,
 };
+use crate::rlog_bloom::encode_rlog_bloom_section;
 use crate::skip_index::{Level0Entry, SkipIndex};
 use crate::stream_dir::{StreamDir, StreamEntry};
 use crate::tokenizer::tokens;
@@ -99,6 +99,9 @@ pub struct RlogWriter {
     /// `push_columnar` each refuse if the other has already been used.
     batches: Vec<ColumnarLogBatch>,
     indexed_fields: Vec<String>,
+    /// Dynamic string attribute names left out of BLOOM coverage; empty
+    /// outside tests.
+    bloom_uncovered: Vec<String>,
 }
 
 /// Counters describing one write beyond what the object bytes themselves
@@ -187,7 +190,17 @@ impl RlogWriter {
             records: Vec::new(),
             batches: Vec::new(),
             indexed_fields: Vec::new(),
+            bloom_uncovered: Vec::new(),
         }
+    }
+
+    /// Test seam: leaves the named dynamic string columns out of BLOOM, both
+    /// from the covered-column list and from every filter, so a reader test can
+    /// hold an object whose coverage is narrower than the default.
+    #[doc(hidden)]
+    pub fn with_bloom_uncovered_attrs_for_tests(mut self, names: Vec<String>) -> Self {
+        self.bloom_uncovered = names;
+        self
     }
 
     /// Configures which dynamic attribute names get a POSTINGS entry
@@ -474,6 +487,7 @@ impl RlogWriter {
             .filter(|(name, _, _)| indexed_names.contains(name.as_str()))
             .map(|(_, _, cid)| *cid)
             .collect();
+        let (bloom_covered, bloom_skip) = bloom_coverage(&columns, &self.bloom_uncovered);
 
         // Tracked names (indexed union numstat), interned once into a flat table
         // so a record's tracked occurrences key by a small slot index instead of
@@ -655,12 +669,14 @@ impl RlogWriter {
                     row.severity_text.as_bytes(),
                 );
                 for (cid, v) in &row.columns {
-                    if let ColumnValue::Str(bytes) = v {
+                    if let ColumnValue::Str(bytes) = v
+                        && !bloom_skip.contains(cid)
+                    {
                         insert_text(&mut builder, *cid, bytes);
                     }
                 }
             }
-            bloom_entries.push(builder.finish());
+            bloom_entries.push(builder.finish_exact());
             #[cfg(feature = "stage-timing")]
             {
                 bloom_total_ns +=
@@ -798,7 +814,7 @@ impl RlogWriter {
             &mut object,
             &mut sections,
             kind::BLOOM,
-            &Stored::raw(encode_bloom_section(&bloom_entries)),
+            &Stored::raw(encode_rlog_bloom_section(&bloom_covered, &bloom_entries)),
         );
         let mut postings_bytes_len: u64 = 0;
         if !indexed_column_ids.is_empty() {
@@ -985,6 +1001,7 @@ impl RlogWriter {
             .filter(|(name, _, _)| indexed_names.contains(name.as_str()))
             .map(|(_, _, cid)| *cid)
             .collect();
+        let (bloom_covered, bloom_skip) = bloom_coverage(&columns, &self.bloom_uncovered);
 
         // Tracked names (indexed union numstat), interned once into a flat table
         // so a row's tracked occurrences key by a small slot index instead of a
@@ -1493,7 +1510,10 @@ impl RlogWriter {
             // path did. Dict-path Str columns are tokenized per distinct value
             // below instead (their page is empty here).
             for (pos, p) in plans.iter().enumerate() {
-                if plan_uses_dict[plan_of_cid[&p.column_id]] || !matches!(p.ty, FieldType::Str) {
+                if plan_uses_dict[plan_of_cid[&p.column_id]]
+                    || !matches!(p.ty, FieldType::Str)
+                    || bloom_skip.contains(&p.column_id)
+                {
                     continue;
                 }
                 for cell in &values_v[pos] {
@@ -1507,7 +1527,9 @@ impl RlogWriter {
             // the same bits the per-row path would, at per-distinct cost.
             for p in &plans {
                 let plan_idx = plan_of_cid[&p.column_id];
-                if !(plan_uses_dict[plan_idx] && matches!(p.ty, FieldType::Str)) {
+                if !(plan_uses_dict[plan_idx] && matches!(p.ty, FieldType::Str))
+                    || bloom_skip.contains(&p.column_id)
+                {
                     continue;
                 }
                 let mut seen: HashSet<u32> = HashSet::new();
@@ -1523,7 +1545,7 @@ impl RlogWriter {
                     }
                 }
             }
-            bloom_entries.push(builder.finish());
+            bloom_entries.push(builder.finish_exact());
             #[cfg(feature = "stage-timing")]
             {
                 bloom_total_ns +=
@@ -1644,7 +1666,7 @@ impl RlogWriter {
             &mut object,
             &mut sections,
             kind::BLOOM,
-            &Stored::raw(encode_bloom_section(&bloom_entries)),
+            &Stored::raw(encode_rlog_bloom_section(&bloom_covered, &bloom_entries)),
         );
         let mut postings_bytes_len: u64 = 0;
         if !indexed_column_ids.is_empty() {
@@ -2585,6 +2607,28 @@ fn insert_text(builder: &mut BloomBuilder, column_id: u32, bytes: &[u8]) {
     if bytes.len() <= EXACT_BLOOM_MAX {
         builder.insert(column_id, bytes);
     }
+}
+
+/// The BLOOM coverage of one object: `severity_text`, `body`, and every dynamic
+/// Str column whose name is not in `uncovered`, ascending; and the dynamic
+/// Str column ids left out, which no filter may hold a key for.
+fn bloom_coverage(
+    columns: &[(String, FieldType, u32)],
+    uncovered: &[String],
+) -> (Vec<u32>, Vec<u32>) {
+    let mut covered = vec![COL_SEVERITY_TEXT, COL_BODY];
+    let mut skipped = Vec::new();
+    for (name, ty, cid) in columns {
+        if matches!(ty, FieldType::Str) {
+            if uncovered.contains(name) {
+                skipped.push(*cid);
+            } else {
+                covered.push(*cid);
+            }
+        }
+    }
+    covered.sort_unstable();
+    (covered, skipped)
 }
 
 /// The BLOCKS layout a build emits (ADR-0699 decision 1): row groups of
@@ -3679,7 +3723,9 @@ mod tests {
                 "timed region {i} opens on exactly one bloom builder"
             );
             assert_eq!(
-                region.matches(concat!("builder.", "finish()")).count(),
+                region
+                    .matches(concat!("builder.", "finish_exact()"))
+                    .count(),
                 1,
                 "timed region {i} closes on exactly one bloom finish"
             );

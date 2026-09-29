@@ -38,12 +38,12 @@ static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
 const NUM_COLUMNS: usize = 105;
 
 /// BLAKE3 of the synthetic object at each batch size. Regenerated when the
-/// default writer moved from RLOG version 3 to version 4 (ADR-0699): the object
-/// bytes are the version-4 row-group layout now, so these pins moved with the
+/// default writer moved from RLOG version 4 to version 5 (ADR-2135): the BLOOM
+/// section and the trailer version changed, so these pins moved with the
 /// format bump. #682's invariant is unchanged -- the per-block cell
 /// materialization must not alter an output byte within a fixed writer version.
-const HASH_8K: &str = "570d3846e351527186b617b8e84f9127994da7c6e8c8122074a13b360d74e299";
-const HASH_64K: &str = "7cea4d5a46bf7f7c8df6538c77c131f589d0ebdd28d3e9549c0d58a04cf3799a";
+const HASH_8K: &str = "eb55582463d34930b05d72baf57a6814748747741f613a0d539e3bde0aa38d54";
+const HASH_64K: &str = "237b0c79e7cfe0dde9140ffe5c565ad3c344cf187ff1938c365bf6a077ffa06f";
 
 /// Peak-live-bytes bound as a multiple of the total cell payload `P`. Measured
 /// K = peak(65536) / P = 1.865 after the fix; rounded up to the next 0.5. The

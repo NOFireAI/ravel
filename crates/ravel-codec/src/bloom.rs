@@ -206,7 +206,22 @@ impl BloomBuilder {
     /// count (`m_bits` rounded up to a power of two, at least 512 bits) and
     /// returns the serialized entry bytes: `m_bits` uvarint, `k` u8, `seed`
     /// u64 LE, then the bit array (`m_bits / 8` bytes).
-    pub fn finish(mut self) -> Vec<u8> {
+    pub fn finish(self) -> Vec<u8> {
+        self.finish_sized(|target| target.max(BLOCK_BITS).next_power_of_two())
+    }
+
+    /// Like [`BloomBuilder::finish`], but `m_bits` is `max(512, ceil(9.585 *
+    /// n))` rounded up to a multiple of 512 rather than to a power of two, so
+    /// the filter never carries up to twice the bits its key count needs.
+    /// RLOG from version 5 writes this form; parse it with
+    /// [`BloomView::parse_exact`].
+    pub fn finish_exact(self) -> Vec<u8> {
+        self.finish_sized(|target| target.max(BLOCK_BITS).div_ceil(BLOCK_BITS) * BLOCK_BITS)
+    }
+
+    /// The shared body of the two `finish` forms; `size` maps the unrounded
+    /// bit target to `m_bits`, which must be a nonzero multiple of 512.
+    fn finish_sized(mut self, size: impl FnOnce(u64) -> u64) -> Vec<u8> {
         // Hash each distinct raw key once, then dedup by triple exactly as the
         // old insert-time path did (idempotent for bit-setting, but the
         // distinct-triple count is what sizes the filter). Draining (instead
@@ -224,7 +239,7 @@ impl BloomBuilder {
         }
         let n = triples.len() as f64;
         let target = (n * BITS_PER_ELEM).ceil() as u64;
-        let m_bits = target.max(BLOCK_BITS).next_power_of_two();
+        let m_bits = size(target);
         let block_count = m_bits / BLOCK_BITS;
         let mut bits = vec![0u8; (m_bits / 8) as usize];
         for (block, g1, g2) in &triples {
@@ -259,9 +274,24 @@ impl<'a> BloomView<'a> {
     /// power of two or is below 512, a `k` of 0, a bit array whose length is
     /// not `m_bits / 8`, and trailing bytes.
     pub fn parse(bytes: &'a [u8]) -> Result<Self, CodecError> {
+        Self::parse_sized(bytes, |m_bits| {
+            m_bits >= BLOCK_BITS && m_bits.is_power_of_two()
+        })
+    }
+
+    /// Parses an entry written by [`BloomBuilder::finish_exact`]: identical to
+    /// [`BloomView::parse`] except that `m_bits` must be a nonzero multiple
+    /// of 512 rather than a power of two.
+    pub fn parse_exact(bytes: &'a [u8]) -> Result<Self, CodecError> {
+        Self::parse_sized(bytes, |m_bits| {
+            m_bits >= BLOCK_BITS && m_bits % BLOCK_BITS == 0
+        })
+    }
+
+    fn parse_sized(bytes: &'a [u8], accept: impl FnOnce(u64) -> bool) -> Result<Self, CodecError> {
         let mut pos = 0;
         let m_bits = get_uvarint(bytes, &mut pos)?;
-        if m_bits < BLOCK_BITS || !m_bits.is_power_of_two() {
+        if !accept(m_bits) {
             return Err(CodecError::Corrupted(format!("bloom m_bits {m_bits}")));
         }
         let k = *bytes
@@ -418,6 +448,94 @@ mod tests {
             BloomView::parse(&bad),
             Err(CodecError::Corrupted(_))
         ));
+    }
+
+    fn exact_filter(n: u32) -> Vec<u8> {
+        let mut b = BloomBuilder::new(3);
+        for i in 0..n {
+            b.insert(1, format!("tok{i}").as_bytes());
+        }
+        b.finish_exact()
+    }
+
+    fn m_bits_of(entry: &[u8]) -> u64 {
+        let mut pos = 0;
+        get_uvarint(entry, &mut pos).expect("m_bits")
+    }
+
+    /// An entry of `m_bits` with a well-formed rest, for the parse checks.
+    fn entry_with_m_bits(m_bits: u64) -> Vec<u8> {
+        let mut e = Vec::new();
+        put_uvarint(&mut e, m_bits);
+        e.push(K);
+        e.extend_from_slice(&0u64.to_le_bytes());
+        e.extend_from_slice(&vec![0u8; (m_bits / 8) as usize]);
+        e
+    }
+
+    /// `m_bits = max(512, ceil(9.585 n))` rounded up to a multiple of 512:
+    /// 107 keys need 1026 bits and get 1536, where the power-of-two form
+    /// would give 2048.
+    #[test]
+    fn finish_exact_sizes_to_a_multiple_of_512() {
+        for (n, want) in [
+            (0u32, 512u64),
+            (53, 512),
+            (54, 1024),
+            (100, 1024),
+            (107, 1536),
+            (1000, 9728),
+        ] {
+            let entry = exact_filter(n);
+            assert_eq!(m_bits_of(&entry), want, "n = {n}");
+            assert_eq!(entry.len(), entry_with_m_bits(want).len(), "n = {n}");
+        }
+        assert_eq!(m_bits_of(&build_pow2(107)), 2048);
+    }
+
+    fn build_pow2(n: u32) -> Vec<u8> {
+        let mut b = BloomBuilder::new(3);
+        for i in 0..n {
+            b.insert(1, format!("tok{i}").as_bytes());
+        }
+        b.finish()
+    }
+
+    #[test]
+    fn exact_filter_has_no_false_negatives() {
+        let entry = exact_filter(1000);
+        let v = BloomView::parse_exact(&entry).expect("parse_exact");
+        for i in 0..1000 {
+            assert!(v.may_contain(1, format!("tok{i}").as_bytes()), "tok{i}");
+        }
+    }
+
+    #[test]
+    fn parse_exact_refuses_a_length_not_a_multiple_of_512() {
+        for m_bits in [0u64, 256, 513, 1000, 1528] {
+            let e = entry_with_m_bits(m_bits);
+            assert!(
+                matches!(BloomView::parse_exact(&e), Err(CodecError::Corrupted(_))),
+                "m_bits {m_bits}"
+            );
+        }
+        for m_bits in [512u64, 1024, 1536, 9728] {
+            BloomView::parse_exact(&entry_with_m_bits(m_bits)).expect("multiple of 512");
+        }
+    }
+
+    #[test]
+    fn parse_still_refuses_a_non_power_of_two_length() {
+        for m_bits in [1536u64, 9728] {
+            assert!(
+                matches!(
+                    BloomView::parse(&entry_with_m_bits(m_bits)),
+                    Err(CodecError::Corrupted(_))
+                ),
+                "m_bits {m_bits}"
+            );
+        }
+        BloomView::parse(&entry_with_m_bits(2048)).expect("power of two");
     }
 }
 
