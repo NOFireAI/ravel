@@ -132,6 +132,19 @@ pub enum MaintainError {
         "compaction claim lost at the {at} checkpoint; the run cancelled and published nothing (ADR-1029 decision 3)"
     )]
     ClaimLost { at: &'static str },
+    /// A renewal at a cancellation checkpoint failed with a genuine store
+    /// error (ADR-1029 decision 3): distinct from [`MaintainError::ClaimLost`],
+    /// which means the claim was stolen or is gone. Not internal plumbing
+    /// like `ClaimLost` -- it propagates as a hard error and aborts the run,
+    /// exactly as `Store` did before this variant existed.
+    #[error(
+        "compaction claim renewal at the {at} checkpoint failed with a store error (not a lost claim): {source}"
+    )]
+    ClaimRenewFailed {
+        at: &'static str,
+        #[source]
+        source: StoreError,
+    },
     #[error(
         "sealed bucket holds two compaction records with different input_set_hash (fatal invariant breach at {observed_key:?}): ours {ours}, theirs {theirs}"
     )]

@@ -205,7 +205,9 @@ pub struct ClaimSkip {
 /// What [`ClaimGuard::acquire`] did.
 #[derive(Debug)]
 pub enum Acquire {
-    /// This run holds the claim (fresh, or stolen from an expired holder).
+    /// This run holds the claim: fresh, or stolen from an expired holder.
+    /// Which is [`ClaimGuard::stolen`] (ADR-1029 decision 3's contended
+    /// path), read after this returns.
     Acquired,
     /// The claim is not available to this run; see [`ClaimSkip`].
     Skipped(ClaimSkip),
@@ -273,6 +275,9 @@ struct State {
     held: Option<Held>,
     /// The checkpoint that cancelled the run, once one has.
     cancelled_at: Option<Checkpoint>,
+    /// Whether [`ClaimGuard::acquire`] took this claim over from an expired
+    /// holder (the contended path) rather than creating it fresh.
+    stolen: bool,
     /// Successful renewals this run made.
     renewals: u32,
     /// Store requests the claim protocol issued for this run. The ledger
@@ -343,6 +348,13 @@ impl ClaimGuard {
     /// The checkpoint that cancelled this run, if one did.
     pub async fn cancelled_at(&self) -> Option<Checkpoint> {
         self.inner.state.lock().await.cancelled_at
+    }
+
+    /// Whether [`Self::acquire`] took this claim over from an expired holder
+    /// rather than creating it fresh (ADR-1029 decision 3). `false` before
+    /// `acquire` has returned `Ok(Acquire::Acquired)`.
+    pub async fn stolen(&self) -> bool {
+        self.inner.state.lock().await.stolen
     }
 
     /// Successful renewals this run has made.
@@ -530,6 +542,7 @@ impl ClaimGuard {
                     payload,
                     last_write_ns: now_ns,
                 });
+                state.stolen = true;
                 Ok(Acquire::Acquired)
             }
             Steal::Lost => {
@@ -633,7 +646,13 @@ impl ClaimGuard {
                 state.cancelled_at = Some(at);
                 Ok(Verdict::Cancel)
             }
-            Err(err) => Err(MaintainError::Store(err)),
+            // A genuine store error, distinct from a lost claim above: the
+            // claim may still be held, this renewal just could not confirm it
+            // (ADR-1029 decision 3).
+            Err(err) => Err(MaintainError::ClaimRenewFailed {
+                at: at.name(),
+                source: err,
+            }),
         }
     }
 

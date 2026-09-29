@@ -165,6 +165,21 @@ pub struct MaintainReport {
     /// which cancelled at a checkpoint and published nothing (ADR-1029
     /// decision 3). Also never counted as compacted.
     pub claim_cancelled: usize,
+    /// Buckets this pass took the advisory compaction claim for, fresh or
+    /// stolen (ADR-1029 decision 3): the count [`claims_stolen`] is a subset
+    /// of. Never counted for a bucket this process merely evaluated without
+    /// claiming (coordination off, no participant installed, below the cost
+    /// gate, or the `claim_deferred` hold from a previous tick's observation).
+    ///
+    /// [`claims_stolen`]: MaintainReport::claims_stolen
+    pub claims_acquired: usize,
+    /// The subset of [`claims_acquired`] that were taken over from an expired
+    /// holder rather than created fresh. A sustained nonzero rate against
+    /// `claims_acquired` means the configured claim lease is shorter than
+    /// this process's actual merge time (ADR-1029 decision 3).
+    ///
+    /// [`claims_acquired`]: MaintainReport::claims_acquired
+    pub claims_stolen: usize,
     /// The largest retention lag this pass observed, in nanoseconds: for the
     /// oldest bucket that is expired (past `bucket_end + retention_window`) yet
     /// still physically present (tombstoned, swept-partial, or blocked by a
@@ -1368,7 +1383,7 @@ pub async fn scan_and_maintain_with_memo(
         }
 
         let bucket = Bucket::new(tenant_hash, signal, shard, hour);
-        let (retention_outcome, compaction) = if claim_deferred {
+        let (retention_outcome, compaction, acquisition) = if claim_deferred {
             let outcome = retention_sweep_bucket_with_reach(
                 &mut reach,
                 store,
@@ -1379,7 +1394,7 @@ pub async fn scan_and_maintain_with_memo(
                 &bucket,
             )
             .await?;
-            (outcome, None)
+            (outcome, None, None)
         } else {
             maintain_bucket_with_reach(
                 &mut reach,
@@ -1392,6 +1407,16 @@ pub async fn scan_and_maintain_with_memo(
             )
             .await?
         };
+        // Applies whenever a claim was genuinely held, whether the compaction
+        // ran, was cancelled at a checkpoint, or (the `claim_deferred` branch
+        // above) never attempted at all -- in which case `acquisition` is
+        // `None` and nothing increments here (#1035).
+        if let Some(acq) = &acquisition {
+            report.claims_acquired += 1;
+            if acq.stolen {
+                report.claims_stolen += 1;
+            }
+        }
         match retention_outcome {
             // Fully retired: the bucket's data is gone, so it is not a
             // still-present expired bucket and contributes no retention lag.
