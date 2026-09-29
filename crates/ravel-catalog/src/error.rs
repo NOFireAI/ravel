@@ -131,21 +131,23 @@ pub enum CatalogError {
         #[source]
         source: ErasureError,
     },
-    /// A rewrite record's `superseded_record_key` chain exceeded the resolver's
-    /// depth bound (ADR-0064 decision 3, amended: a rewrite may supersede a
-    /// prior rewrite recursively). A chain this long is either corruption or a
-    /// pathological write pattern; the resolver refuses it as a typed error
-    /// rather than looping unboundedly. `bucket` names where it was observed.
+    /// A `superseded_record_key` chain of rewrite records, or of version 2
+    /// compaction records, exceeded the resolver's depth bound (ADR-0064
+    /// decision 3, amended: a rewrite may supersede a prior rewrite
+    /// recursively; ADR-0066's force 2 amendment chains version 2 records the
+    /// same way). A chain this long is either corruption or a pathological
+    /// write pattern; the resolver refuses it as a typed error rather than
+    /// looping unboundedly. `bucket` names where it was observed.
     #[error(
-        "rewrite record supersession chain in bucket {bucket:?} exceeded the max depth of {max}"
+        "compaction or rewrite record supersession chain in bucket {bucket:?} exceeded the max depth of {max}"
     )]
     RewriteSupersessionChainTooDeep { bucket: String, max: usize },
-    /// A rewrite record's `superseded_record_key` chain forms a cycle
-    /// (ADR-0064 decision 3). Two rewrite records naming each other, or a
-    /// longer loop, would otherwise spin forever; the resolver detects the
-    /// revisit and fails with this typed error. `key` is the record key first
-    /// revisited.
-    #[error("rewrite record supersession cycle detected at key {key:?}")]
+    /// A `superseded_record_key` chain of rewrite records, or of version 2
+    /// compaction records, forms a cycle (ADR-0064 decision 3). Two records
+    /// naming each other, or a longer loop, would otherwise spin forever; the
+    /// resolver detects the revisit and fails with this typed error. `key` is
+    /// the record key first revisited.
+    #[error("compaction or rewrite record supersession cycle detected at key {key:?}")]
     RewriteSupersessionCycle { key: String },
     /// A version 2 compaction record at `key` names, in
     /// `superseded_record_key`, a present record at `superseded_key` whose
