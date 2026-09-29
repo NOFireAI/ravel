@@ -1292,6 +1292,7 @@ async fn sweep_superseded_impl(
                             signal,
                             shard,
                             &record.superseded_record_key,
+                            ChainEntry::Rewrite,
                         )
                         .await?,
                         applied,
@@ -1822,9 +1823,10 @@ impl SupersededInputs for SupersededSubset {
 }
 
 /// One generation on a supersession chain: the compaction or rewrite record a
-/// newer rewrite superseded (ADR-0064 amendment: `superseded_record_key` names
-/// either an `l1.<hash>.cmt` compaction record or an `rw.<hash>.cmt` rewrite
-/// record, recursive supersession included).
+/// newer record superseded (ADR-0064 amendment: a rewrite's
+/// `superseded_record_key` names either an `l1.<hash>.cmt` compaction record
+/// or an `rw.<hash>.cmt` rewrite record, recursive supersession included; a
+/// version 2 compaction record's names the compaction record it re-encodes).
 enum ChainLink {
     Compaction(CompactionRecord),
     Rewrite(RewriteRecord),
@@ -1839,10 +1841,11 @@ impl ChainLink {
     }
 
     /// Whether this generation superseded raw L0 inputs (the end of the
-    /// chain), rather than another compaction/rewrite record.
+    /// chain), rather than another compaction/rewrite record. A version 2
+    /// compaction record is a link: it names the record it re-encodes.
     fn names_raw_l0_inputs(&self) -> bool {
         match self {
-            ChainLink::Compaction(_) => true,
+            ChainLink::Compaction(r) => r.superseded_record_key.is_empty(),
             ChainLink::Rewrite(r) => !r.inputs.is_empty(),
         }
     }
@@ -1850,11 +1853,15 @@ impl ChainLink {
     /// The record this generation itself superseded, or `None` at the end of
     /// the chain.
     fn superseded_record_key(&self) -> Option<&str> {
-        match self {
-            ChainLink::Compaction(_) => None,
-            ChainLink::Rewrite(r) if r.superseded_record_key.is_empty() => None,
-            ChainLink::Rewrite(r) => Some(&r.superseded_record_key),
-        }
+        let key = match self {
+            ChainLink::Compaction(r) => &r.superseded_record_key,
+            ChainLink::Rewrite(r) => &r.superseded_record_key,
+        };
+        if key.is_empty() { None } else { Some(key) }
+    }
+
+    fn is_version_2_compaction(&self) -> bool {
+        matches!(self, ChainLink::Compaction(r) if !r.superseded_record_key.is_empty())
     }
 
     /// The erasure request ids this generation applied (empty for a compaction
@@ -1949,6 +1956,32 @@ async fn load_chain_link(store: &dyn ObjectStoreBackend, key: &str) -> Result<Op
     }
 }
 
+/// The most records on one supersession chain, counting the record it is
+/// entered from: the bound the catalog's resolver puts on the same chains, so
+/// a chain the resolver refuses as too deep is refused here too rather than
+/// walked further.
+const MAX_CHAIN_DEPTH: usize = 64;
+
+/// Which record a [`gather_superseded_chain`] walk starts from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainEntry {
+    /// A rewrite record that superseded a whole record. The group runs down to
+    /// the raw L0 inputs at the end of the chain, since the rewrite supersedes
+    /// them too.
+    Rewrite,
+    /// A version 2 compaction record. The group is the records it supersedes
+    /// and their parts, and never a raw L0 input: those are the version 2
+    /// record's own inputs, which rule 2's compaction arm gates as it gates any
+    /// record's.
+    Version2,
+}
+
+impl ChainEntry {
+    fn gathers_raw_l0_inputs(self) -> bool {
+        matches!(self, ChainEntry::Rewrite)
+    }
+}
+
 /// Gather the deletion targets for a rewrite record that superseded a whole
 /// prior compaction/rewrite record: the entire supersession chain behind
 /// `predecessor_key`, walked back generation by generation to the raw L0 inputs
@@ -1976,12 +2009,23 @@ async fn load_chain_link(store: &dyn ObjectStoreBackend, key: &str) -> Result<Op
 /// applied. Those requests' `.dreq`s cannot be retired while the group is
 /// held, because the objects in it are the pre-image the requests erased a
 /// subject out of.
+///
+/// A version 2 compaction record on the chain is a link, not an end: the walk
+/// continues to the record it re-encodes. If that record is already gone, the
+/// version 2 record is the end of the chain, and under
+/// [`ChainEntry::Rewrite`] its own raw L0 inputs (its predecessor's, verbatim)
+/// join the group; the missing generation is a compaction record, which
+/// applied no request, so the chain is not truncated. Under
+/// [`ChainEntry::Version2`] no raw L0 input joins the group at all. The walk is
+/// bounded by [`MAX_CHAIN_DEPTH`] records and checked for a revisit, so a cycle
+/// or an over-deep chain is an error, never a guess.
 async fn gather_superseded_chain(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
     signal: Signal,
     shard: u32,
     predecessor_key: &str,
+    entry: ChainEntry,
 ) -> Result<Vec<SupersededGroup>> {
     let mut chain_record_keys: Vec<String> = Vec::new();
     let mut chain_part_keys: Vec<String> = Vec::new();
@@ -1993,6 +2037,9 @@ async fn gather_superseded_chain(
     let mut truncated = false;
     let mut seen: HashSet<String> = HashSet::new();
     let mut cursor = Some(predecessor_key.to_string());
+    // The version 2 record the walk just stepped past, whose raw L0 inputs
+    // end the chain if the record it names is gone.
+    let mut version_2_above: Option<ChainLink> = None;
 
     while let Some(key) = cursor {
         if !seen.insert(key.clone()) {
@@ -2000,10 +2047,37 @@ async fn gather_superseded_chain(
                 "supersession chain from {predecessor_key} revisits {key}"
             )));
         }
+        // `>=`: the record the chain is entered from counts toward the bound,
+        // as it does in the catalog's walk, but is not itself on this walk.
+        if seen.len() >= MAX_CHAIN_DEPTH {
+            return Err(MaintainError::Invariant(format!(
+                "supersession chain from {predecessor_key} is longer than {MAX_CHAIN_DEPTH} records"
+            )));
+        }
         let Some(link) = load_chain_link(store, &key).await? else {
-            truncated = true;
+            match version_2_above.take() {
+                Some(above) => {
+                    if entry.gathers_raw_l0_inputs() {
+                        for group in above
+                            .raw_l0_input_groups(store, tenant, signal, shard)
+                            .await?
+                        {
+                            input_record_keys.extend(group.record_keys);
+                            input_data_keys.extend(group.data_keys);
+                            objects.extend(group.objects);
+                        }
+                    }
+                }
+                None => truncated = true,
+            }
             break;
         };
+        if entry == ChainEntry::Version2 && !matches!(link, ChainLink::Compaction(_)) {
+            return Err(MaintainError::Invariant(format!(
+                "version 2 compaction supersession chain from {predecessor_key} reaches \
+                 rewrite record {key}"
+            )));
+        }
         // The gate reads one hour's covering snapshot parts, so a chain that
         // spanned two ingest hours could not be gated as one unit. A rewrite
         // record's decode already verifies that its `superseded_record_key`
@@ -2030,17 +2104,20 @@ async fn gather_superseded_chain(
         }
         chain_record_keys.push(key);
         if link.names_raw_l0_inputs() {
-            for group in link
-                .raw_l0_input_groups(store, tenant, signal, shard)
-                .await?
-            {
-                input_record_keys.extend(group.record_keys);
-                input_data_keys.extend(group.data_keys);
-                objects.extend(group.objects);
+            if entry.gathers_raw_l0_inputs() {
+                for group in link
+                    .raw_l0_input_groups(store, tenant, signal, shard)
+                    .await?
+                {
+                    input_record_keys.extend(group.record_keys);
+                    input_data_keys.extend(group.data_keys);
+                    objects.extend(group.objects);
+                }
             }
             break;
         }
         cursor = link.superseded_record_key().map(str::to_string);
+        version_2_above = link.is_version_2_compaction().then_some(link);
     }
 
     let Some(ingest_hour_bucket) = ingest_hour_bucket else {

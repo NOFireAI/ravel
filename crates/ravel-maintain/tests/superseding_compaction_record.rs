@@ -36,6 +36,7 @@ use ravel_proto::commit::v1::{
     CompactionInputIdentity, CompactionPart, CompactionRecord, ErasurePredicateMatcher,
     ErasureRequest, RewriteDrop, RewriteRecord,
 };
+use ravel_types::{Signal, TimeRange};
 use uuid::Uuid;
 
 fn hour_ns() -> i64 {
@@ -429,6 +430,99 @@ async fn sweep_deletes_nothing_for_a_version_2_record_with_other_inputs() {
 
     let deleted = sweep_everything(store.as_ref(), &b).await;
     assert_eq!(deleted, BTreeSet::new());
+}
+
+/// The data-object keys a snapshot resolve over the logs bucket's hour serves.
+async fn served_keys(store: &Arc<MemoryStore>, now_ns: i64) -> BTreeSet<String> {
+    let dyn_store: Arc<dyn ObjectStoreBackend> = store.clone();
+    let catalog = ravel_catalog::Catalog::new(
+        dyn_store,
+        ravel_catalog::CatalogConfig {
+            shard_count: SHARD + 1,
+            ..Default::default()
+        },
+    )
+    .expect("catalog");
+    let base = hour_ns();
+    catalog
+        .resolve(
+            &tenant_hash(),
+            Signal::Logs,
+            TimeRange {
+                start_ns: base,
+                end_ns: base + NS_PER_HOUR,
+            },
+            &[],
+            now_ns,
+        )
+        .await
+        .expect("resolve")
+        .segments
+        .iter()
+        .map(|s| s.data_object_key.clone())
+        .collect()
+}
+
+/// A rewrite R naming a version 2 C2 that names C1, swept past every horizon:
+/// R's chain group runs through C2 to C1, so both records, both parts and the
+/// raw L0 inputs below them go, and a resolve afterwards serves R's part and
+/// nothing else.
+///
+/// Flipped line: `ChainLink::Compaction(r) => r.superseded_record_key
+/// .is_empty()` in `ChainLink::names_raw_l0_inputs` (sweep.rs), restored to
+/// `ChainLink::Compaction(_) => true`. The walk then ends at C2: C1 and its
+/// part survive, and C1, named by no present record once C2 is gone, is served
+/// again with its pre-erasure part beside R's.
+#[tokio::test]
+async fn sweep_follows_a_rewrite_chain_through_a_version_2_link() {
+    let store = Arc::new(MemoryStore::new());
+    let b = logs_bucket();
+    let base = hour_ns();
+    let inputs = seed_inputs(store.as_ref(), &[(0x81, 1), (0x82, 2)]).await;
+    let c1 = version_1(
+        &b,
+        vec![input(0x81, 1), input(0x82, 2)],
+        0x00,
+        part(0xc1, base, base + 10_000),
+    );
+    let c1_key = put_compaction(store.as_ref(), &c1).await;
+    let c2 = version_2(
+        &c1,
+        &c1_key,
+        c1.inputs.clone(),
+        part(0xc2, base, base + 10_000),
+    );
+    let c2_key = put_compaction(store.as_ref(), &c2).await;
+    let r = put_rewrite(
+        store.as_ref(),
+        &b,
+        &c2_key,
+        Uuid::from_u128(0xd2),
+        part(0x0e, base, base + 10_000),
+    )
+    .await;
+
+    let deleted = sweep_everything(store.as_ref(), &b).await;
+    let mut expected: BTreeSet<String> = inputs
+        .iter()
+        .flat_map(|(commit, data)| [commit.clone(), data.clone()])
+        .collect();
+    expected.extend([
+        c1_key,
+        keys::reconstruct_l1_part_key(&c1, &c1.parts[0]).unwrap(),
+        c2_key,
+        keys::reconstruct_l1_part_key(&c2, &c2.parts[0]).unwrap(),
+    ]);
+    assert_eq!(deleted, expected);
+    let r_part = keys::reconstruct_rewrite_part_key(&r, &r.parts[0]).unwrap();
+    assert_eq!(
+        all_keys(store.as_ref()).await,
+        BTreeSet::from([keys::rewrite_record_key_for(&r).unwrap(), r_part.clone()])
+    );
+    assert_eq!(
+        served_keys(&store, past_horizon_ns()).await,
+        BTreeSet::from([r_part])
+    );
 }
 
 fn pending_request(b: &Bucket, request_id: Uuid) -> Vec<PendingErasureRequest> {
