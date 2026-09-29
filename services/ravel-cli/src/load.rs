@@ -11496,7 +11496,7 @@ type = "i64"
         // re-baseline of both sides at once. The value moves only with the
         // writer: this one is the RLOG version 5 layout (ADR-2135).
         const RICH_OBJECT_BLAKE3: &str =
-            "418bbcc3b15d48fd3e513fc5b5e8f8f6981225875ce51d4afb06bb87a3aa3fad";
+            "845645933a0c853183dfd9a6744eadbdf8d009e627e010b8d53d439bb97bbc95";
         assert_eq!(
             blake3::hash(&bytes_off).to_hex().as_str(),
             RICH_OBJECT_BLAKE3,

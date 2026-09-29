@@ -115,8 +115,8 @@ const TOTAL_BLOCKS: usize = SEGMENTS * BLOCKS_PER_SEG;
 /// what makes the byte figures track the surviving fraction.
 const BODY_BYTES: usize = 16 * 1024;
 /// Suffix probe length for the ranged path: over this fixture's largest object
-/// tail, 4,495 bytes (segment 6: footer + SKIP_IDX 160 + PAGE_DIR 237 + BLOOM
-/// 3,888), so one probe per segment carries every plan section and the scan
+/// tail, 4,499 bytes (segment 6: footer + SKIP_IDX 160 + PAGE_DIR 237 + BLOOM
+/// 3,892), so one probe per segment carries every plan section and the scan
 /// needs no second GET for them. That is what `DEFAULT_LOG_SUFFIX_LEN` does at
 /// production object sizes (issue #766); the production value would cover this
 /// whole 79 KB fixture object and leave no byte figure to read.
@@ -911,12 +911,12 @@ async fn selective_numeric_reads_only_surviving_blocks() {
         "full scan decodes every block"
     );
     assert_eq!(full.rows, TOTAL_BLOCKS, "full scan returns every record");
-    // 630,495 = the eight version-5 objects' bytes exactly (their sizes
+    // 630,527 = the eight version-5 objects' bytes exactly (their sizes
     // differ: each block's bloom filter is sized to its own token count). One
     // whole-object GET per segment and nothing else, so this is the object
     // bytes and not a byte more.
     assert_eq!(
-        full.bytes, 630_495,
+        full.bytes, 630_527,
         "full scan reads exactly the object bytes"
     );
     assert_eq!(full.plan_full_reads, 0, "full scan skips the plan phase");
@@ -1101,7 +1101,7 @@ async fn text_predicate_falls_back_to_full_object_read() {
     );
     assert_eq!(text.rows, SEGMENTS, "one matching record per segment");
     // The whole objects are read: bytes ~ a full scan plus the probes, the
-    // amplification #761 cannot remove for a text predicate. 696,031 = 630,495
+    // amplification #761 cannot remove for a text predicate. 696,063 = 630,527
     // object bytes + 65,536 probe bytes (8 x 8 KiB). The 176 FIELD_DIR bytes
     // (8 x 22) this figure carried before #835 were the scan open's, not the
     // plan's: the plan fallback selects every column, while the scan's
@@ -1110,7 +1110,7 @@ async fn text_predicate_falls_back_to_full_object_read() {
     // short-circuits that open, so the read goes with it.
     let full = measure("full_scan", &[], cache).await;
     assert_eq!(
-        text.bytes, 696_031,
+        text.bytes, 696_063,
         "text fallback: the whole objects plus one plan probe each"
     );
     assert!(
@@ -1190,7 +1190,7 @@ async fn selective_third_no_partition_multiplication_under_cache_pressure() {
     //           the second read; each set carries its segment's 8 bridged gap
     //           bytes).
     // Pages are re-read under pressure, so the bound is one full pass, not
-    // the no-eviction figure: both stay under the 630,495 a full pass moves.
+    // the no-eviction figure: both stay under the 630,527 a full pass moves.
     assert_eq!(big.bytes, 264_479, "q20 with no eviction");
     assert_eq!(
         small.bytes, 479_269,
@@ -1268,11 +1268,11 @@ async fn text_predicate_no_second_wire_read_regardless_of_cache() {
              nothing beyond that -- the scan adds no GET of any shape",
             s.label
         );
-        // 696,031: identical to the big-cache figure
+        // 696,063: identical to the big-cache figure
         // (`text_predicate_falls_back_to_full_object_read`), proving the byte
         // cost no longer depends on cache size.
         assert_eq!(
-            s.bytes, 696_031,
+            s.bytes, 696_063,
             "{}: exactly the corpus bytes plus the fixed per-segment plan \
              overhead, moved once, never twice",
             s.label
@@ -1298,11 +1298,11 @@ async fn text_predicate_no_second_wire_read_regardless_of_cache() {
             "{}: one matching record per segment",
             s.label
         );
-        // 630,495: the whole corpus (see `full.bytes` in the sibling test),
+        // 630,527: the whole corpus (see `full.bytes` in the sibling test),
         // charged as reused rather than folded into the GET-bytes figure the
         // plan phase already recorded -- the truthful-accounting deliverable.
         assert_eq!(
-            s.acc_bytes_reused, 630_495,
+            s.acc_bytes_reused, 630_527,
             "{}: the scan's reuse of every carried whole object is charged via \
              bytes_reused, not silently absorbed into acc_bytes",
             s.label
@@ -1373,11 +1373,11 @@ async fn text_predicate_prunes_most_scan_adds_no_gets() {
         "only the one segment carrying the marker survives"
     );
     assert_eq!(s.rows, 1, "exactly one matching record, from segment 0");
-    // 78,721: segment 0's whole-object size (its block 0 carries
+    // 78,725: segment 0's whole-object size (its block 0 carries
     // `MARKER_RARE` in addition to `MARKER_FEW`) -- the only segment whose
     // carry the scan ever reuses.
     assert_eq!(
-        s.acc_bytes_reused, 78_721,
+        s.acc_bytes_reused, 78_725,
         "the one surviving segment's scan reuses its plan-carried bytes \
          rather than issuing a second GET"
     );
