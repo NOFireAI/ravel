@@ -1508,6 +1508,7 @@ async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> Loop
                         ownership.as_ref(),
                         &worker,
                         &live_set,
+                        clock.now_ns(),
                     )
                     .await;
 
@@ -1623,7 +1624,8 @@ pub async fn reap_query_worker_heartbeats(
 /// "storage has no tenants," the exact silent failure this avoids.
 ///
 /// Before discovery the cycle runs the one-per-deployment query-worker reap
-/// ([`reap_query_worker_heartbeats`]), gated on this process owning it.
+/// ([`reap_query_worker_heartbeats`]), gated on this process owning it and
+/// judged at `now_ns`, the caller's injected clock reading.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_discovery_cycle(
     store: &dyn ObjectStoreBackend,
@@ -1637,10 +1639,11 @@ pub async fn run_discovery_cycle(
     ownership: &MaintenanceOwnershipMetrics,
     worker: &WorkerSet,
     live_set: &[Uuid],
+    now_ns: i64,
 ) -> MaintainReport {
     // Before discovery, so a failed tenant listing does not also stall the
     // query-worker prefix.
-    reap_query_worker_heartbeats(store, worker, live_set, WallClock.now_ns()).await;
+    reap_query_worker_heartbeats(store, worker, live_set, now_ns).await;
 
     let outcome = match discover_and_restrict_by_lifecycle(store, fallback_allow).await {
         Ok(outcome) => outcome,
@@ -4577,6 +4580,7 @@ mod tests {
             &ownership,
             &worker,
             &worker.solo_live_set(),
+            WallClock.now_ns(),
         )
         .await;
         assert!(
@@ -6401,6 +6405,7 @@ mod tests {
             &ownership,
             &worker,
             &worker.solo_live_set(),
+            WallClock.now_ns(),
         )
         .await;
 
@@ -6447,6 +6452,7 @@ mod tests {
             &ownership,
             &worker,
             &worker.solo_live_set(),
+            WallClock.now_ns(),
         )
         .await;
 
@@ -6508,6 +6514,7 @@ mod tests {
             &ownership,
             &worker,
             &worker.solo_live_set(),
+            WallClock.now_ns(),
         )
         .await;
 
@@ -7944,6 +7951,7 @@ mod tests {
                 &ownership,
                 &worker,
                 &live_solo,
+                WallClock.now_ns(),
             )
             .await;
         }
@@ -7968,6 +7976,7 @@ mod tests {
             &ownership,
             &worker,
             &live_ab,
+            WallClock.now_ns(),
         )
         .await;
 
@@ -8069,6 +8078,7 @@ mod tests {
                 &ownership,
                 &worker,
                 &live_solo,
+                WallClock.now_ns(),
             )
             .await;
         }
@@ -8104,6 +8114,7 @@ mod tests {
             &ownership,
             &worker,
             &live_solo,
+            WallClock.now_ns(),
         )
         .await;
         assert_eq!(
@@ -8145,6 +8156,7 @@ mod tests {
             &ownership,
             &worker,
             &live_solo,
+            WallClock.now_ns(),
         )
         .await;
         assert!(
@@ -8185,6 +8197,7 @@ mod tests {
             &ownership,
             &worker,
             &live_ab,
+            WallClock.now_ns(),
         )
         .await;
         assert_eq!(
@@ -10231,14 +10244,15 @@ mod query_worker_reap_tests {
 
     /// The maintain tick is the caller: one discovery cycle on a single
     /// maintain process reaps a dead query-worker record, over a store holding
-    /// no tenant at all.
+    /// no tenant at all. The horizon is judged at the `now_ns` the caller
+    /// passes: [`NOW_NS`] is decades before the wall clock, so a cycle that
+    /// read the wall clock instead would reap the live record too.
     #[tokio::test]
     async fn a_discovery_cycle_reaps_dead_query_worker_keys() {
-        let now_ms = u64::try_from(WallClock.now_ns() / 1_000_000).expect("a positive clock");
         let memory = MemoryStore::new();
-        memory.set_clock_ms(now_ms);
-        let live_key = seed(&memory, now_ms, now_ms, WallClock.now_ns()).await;
-        seed(&memory, now_ms - 10 * H_MS, now_ms, 0).await;
+        memory.set_clock_ms(NOW_MS);
+        let live_key = seed(&memory, NOW_MS, NOW_MS, NOW_NS).await;
+        seed(&memory, NOW_MS - 10 * H_MS, NOW_MS, NOW_NS - 10 * H_NS).await;
 
         let worker = WorkerSet::with_defaults(0);
         let mut memo = MaintainMemo::with_default_interval();
@@ -10254,6 +10268,7 @@ mod query_worker_reap_tests {
             &MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS),
             &worker,
             &worker.solo_live_set(),
+            NOW_NS,
         )
         .await;
 
