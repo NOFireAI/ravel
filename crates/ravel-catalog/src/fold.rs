@@ -2760,7 +2760,11 @@ impl Catalog {
     /// authoritative record through
     /// [`crate::catalog::select_authoritative_compaction_records`] (issue
     /// #1070), the loser's parts skipped and its uncovered inputs folded in as
-    /// raw L0. A selective-erasure rewrite record (ADR-0064
+    /// raw L0. The same selector skips a record a present version 2 record
+    /// supersedes, and a version 2 record a live rewrite dominates is dropped
+    /// before it runs
+    /// ([`crate::catalog::erasure_dominated_compaction_records`]). A
+    /// selective-erasure rewrite record (ADR-0064
     /// decision 3, amended) contributes its own output parts as level-1
     /// entries and supersedes either its named L0 inputs directly, or -- when
     /// it names a `superseded_record_key` instead -- whatever that
@@ -2826,28 +2830,6 @@ impl Catalog {
             compaction_records.push(((*ckey).to_string(), record));
         }
 
-        // Overlapping input sets in one bucket (issue #1070): pick one
-        // authoritative record per overlap component through the SAME helper
-        // snapshot resolution uses, so a folded snapshot and a live resolve
-        // never disagree on which record wins. A loser's parts are skipped
-        // below and only WINNING records' inputs join `excluded`, so a loser
-        // input no winner names is folded in as a raw L0. Disjoint records are
-        // not in conflict and both contribute.
-        let losing_compaction_records =
-            crate::catalog::select_authoritative_compaction_records(&compaction_records);
-        for (ckey, record) in &compaction_records {
-            if losing_compaction_records.contains(ckey.as_str()) {
-                continue;
-            }
-            for input in &record.inputs {
-                excluded.insert((
-                    input.writer_id.clone(),
-                    input.writer_epoch,
-                    input.writer_seq,
-                ));
-            }
-        }
-
         // Load rewrite records (ADR-0064 decision 3), verified against their
         // own identity inside `load_and_validate_rewrite`.
         let mut rewrite_records: Vec<(String, Arc<RewriteRecord>)> = Vec::new();
@@ -2867,8 +2849,8 @@ impl Catalog {
         // mechanism to snapshot resolution (`process_bucket`), sharing one
         // chase helper.
         let mut superseded_records: HashSet<String> = HashSet::new();
+        let bucket_label = keys::commit_shard_hour_prefix(tenant, signal, shard, hour)?;
         if !rewrite_records.is_empty() {
-            let bucket_label = keys::commit_shard_hour_prefix(tenant, signal, shard, hour)?;
             let compaction_by_key: HashMap<&str, &CompactionRecord> = compaction_records
                 .iter()
                 .map(|(k, r)| (k.as_str(), r.as_ref()))
@@ -2890,6 +2872,39 @@ impl Catalog {
             }
         }
 
+        // Overlapping input sets in one bucket (issue #1070): pick one
+        // authoritative record per overlap component through the SAME helpers
+        // snapshot resolution uses, so a folded snapshot and a live resolve
+        // never disagree on which record wins: a version 2 record a live
+        // rewrite dominates is dropped first, and the selector excludes every
+        // record a present version 2 record supersedes. An excluded record's
+        // parts are skipped below and only AUTHORITATIVE records' inputs join
+        // `excluded`, so a loser input no winner names is folded in as a raw
+        // L0. Disjoint records are not in conflict and both contribute.
+        let dominated = crate::catalog::erasure_dominated_compaction_records(
+            &compaction_records,
+            &rewrite_records,
+            &bucket_label,
+        )?;
+        let candidates: Vec<(&str, &CompactionRecord)> = compaction_records
+            .iter()
+            .map(|(k, r)| (k.as_str(), r.as_ref()))
+            .filter(|(k, _)| !dominated.contains(k))
+            .collect();
+        let selection = crate::catalog::select_authoritative_compaction_records(&candidates)?;
+        for (ckey, record) in &candidates {
+            if selection.is_excluded(ckey) {
+                continue;
+            }
+            for input in &record.inputs {
+                excluded.insert((
+                    input.writer_id.clone(),
+                    input.writer_epoch,
+                    input.writer_seq,
+                ));
+            }
+        }
+
         // Sibling-rewrite alarm, raised through the same helper snapshot
         // resolution uses. The fold is the path that matters most here: a
         // rewrite always lands in an already-sealed bucket (ADR-0064 §3.1),
@@ -2905,7 +2920,8 @@ impl Catalog {
         // the loser names stays a raw level-0 entry.
         for (ckey, record) in &compaction_records {
             if superseded_records.contains(ckey.as_str())
-                || losing_compaction_records.contains(ckey.as_str())
+                || dominated.contains(ckey.as_str())
+                || selection.is_excluded(ckey)
             {
                 continue;
             }

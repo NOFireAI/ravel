@@ -24,7 +24,10 @@
 //! selection the read path uses) is left out too, with a caveat the first two
 //! shapes do not carry: a node that has not adopted the overlap rule may still
 //! serve the loser's parts, and the loser is not horizon-bounded, so the sweep
-//! never reclaims them. L0 commit records carry no such check (the commit
+//! never reclaims them. The same selection leaves out a compaction record a
+//! present version 2 record supersedes, and a version 2 record a live rewrite
+//! record dominates is left out before it runs
+//! (`ravel_catalog::erasure_dominated_compaction_records`). L0 commit records carry no such check (the commit
 //! record arm below tests neither supersession, overlap, nor a tombstone for
 //! them), so an L0 object a live compaction already folded is
 //! still scrubbed, and a `level="l0"` mismatch on an already-compacted hour
@@ -1766,10 +1769,61 @@ async fn unit_targets(store: &dyn ObjectStoreBackend, unit: &Unit) -> UnitOutcom
                 .or_default()
                 .push((record_key.as_str(), rec));
         }
+        let mut rewrites_by_bucket: std::collections::HashMap<
+            u32,
+            Vec<(&str, &ravel_proto::commit::v1::RewriteRecord)>,
+        > = std::collections::HashMap::new();
+        for (record_key, rec) in &rewrite_records {
+            rewrites_by_bucket
+                .entry(rec.ingest_hour_bucket)
+                .or_default()
+                .push((record_key.as_str(), rec));
+        }
         let mut losing: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for in_bucket in by_bucket.values() {
-            for record_key in ravel_catalog::select_authoritative_compaction_records(in_bucket) {
-                losing.insert(record_key.to_string());
+        for (hour, in_bucket) in &by_bucket {
+            // Every record of one hour shares the bucket prefix its key sits
+            // under, which is all the error below needs to name.
+            let prefix = in_bucket
+                .first()
+                .and_then(|(record_key, _)| record_key.rsplit_once('/'))
+                .map(|(prefix, _)| format!("{prefix}/"))
+                .unwrap_or_default();
+            let rewrites = rewrites_by_bucket
+                .get(hour)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            // A version 2 record a live rewrite dominates is dropped before
+            // the selection, and the selection also excludes every record a
+            // present version 2 record supersedes. A supersession the resolver
+            // refuses (a cycle, a chain past the depth bound, or a version 2
+            // record whose inputs differ from the record it names) is not fatal
+            // here: the hour's records all stay in the slice, since scrubbing
+            // bytes nothing reads costs budget, not correctness.
+            let resolved =
+                ravel_catalog::erasure_dominated_compaction_records(in_bucket, rewrites, &prefix)
+                    .and_then(|dominated| {
+                        let candidates: Vec<(&str, &ravel_proto::commit::v1::CompactionRecord)> =
+                            in_bucket
+                                .iter()
+                                .filter(|(record_key, _)| !dominated.contains(record_key))
+                                .copied()
+                                .collect();
+                        let selection =
+                            ravel_catalog::select_authoritative_compaction_records(&candidates)?;
+                        Ok(dominated
+                            .iter()
+                            .copied()
+                            .chain(selection.excluded())
+                            .map(str::to_string)
+                            .collect::<Vec<String>>())
+                    });
+            match resolved {
+                Ok(excluded) => losing.extend(excluded),
+                Err(err) => tracing::warn!(
+                    bucket = %prefix, error = %err,
+                    "scrub: unresolvable compaction supersession; scrubbing every \
+                     record of this hour this tick"
+                ),
             }
         }
         losing
@@ -3207,6 +3261,172 @@ mod tests {
             metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::Rewrite),
             0,
             "this bucket holds no rewrite record"
+        );
+    }
+
+    /// A version 1 compaction record in hour 500,000 whose `input_set_hash` is
+    /// `hash_byte` repeated, with one part seeded by `seed`.
+    fn lineage_compaction(hash_byte: u8, seed: u8) -> ravel_proto::commit::v1::CompactionRecord {
+        ravel_proto::commit::v1::CompactionRecord {
+            format_version: 1,
+            tenant_hash: tenant().hash().0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            shard: 0,
+            ingest_hour_bucket: 500_000,
+            level: 1,
+            inputs: vec![ravel_proto::commit::v1::CompactionInputIdentity {
+                writer_id: Uuid::from_u128(9).to_string(),
+                writer_epoch: 1,
+                writer_seq: 1,
+            }],
+            input_set_hash: vec![hash_byte; 32],
+            parts: vec![ravel_proto::commit::v1::CompactionPart {
+                part_index: 0,
+                first_series_id: vec![0u8; 16],
+                last_series_id: vec![0xffu8; 16],
+                content_hash: vec![seed; 32],
+                object_size: 64,
+                sample_count: 1,
+                series_count: 1,
+                run_count: 1,
+                min_event_ts_ns: 500_000 * NS_PER_HOUR,
+                max_event_ts_ns: 500_000 * NS_PER_HOUR,
+                segment_format_version: 1,
+                declared_column_stats: Vec::new(),
+            }],
+            created_unix_ns: 500_000 * NS_PER_HOUR,
+            superseded_record_key: String::new(),
+        }
+    }
+
+    /// The version 2 record re-encoding `predecessor` at `predecessor_key`.
+    fn lineage_successor(
+        predecessor: &ravel_proto::commit::v1::CompactionRecord,
+        predecessor_key: &str,
+        seed: u8,
+    ) -> ravel_proto::commit::v1::CompactionRecord {
+        let mut successor = predecessor.clone();
+        successor.format_version = 2;
+        successor.superseded_record_key = predecessor_key.to_string();
+        successor.input_set_hash =
+            ravel_commit::erasure::compute_superseding_compaction_input_set_hash(
+                &successor.inputs,
+                predecessor_key,
+            )
+            .to_vec();
+        successor.parts[0].content_hash = vec![seed; 32];
+        successor
+    }
+
+    async fn put_lineage_compaction(
+        store: &MemoryStore,
+        record: &ravel_proto::commit::v1::CompactionRecord,
+    ) -> String {
+        let key = keys::compaction_record_key_for(record).expect("record key");
+        store
+            .put(
+                &key,
+                ravel_commit::record::encode_compaction(record),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put compaction record");
+        key
+    }
+
+    /// The object keys a unit holding every one of `keys` expands to.
+    async fn lineage_targets(store: &MemoryStore, keys: &[String]) -> Vec<String> {
+        let unit = Unit {
+            advance: keys.to_vec(),
+            context: keys.to_vec(),
+            context_pages: 0,
+        };
+        let mut targets: Vec<String> = unit_targets(store, &unit)
+            .await
+            .targets
+            .into_iter()
+            .map(|entry| entry.target.object_key)
+            .collect();
+        targets.sort();
+        targets
+    }
+
+    /// Scrub's authoritative set for a bucket holding C1 and a version 2 C2
+    /// naming C1 is C2: only C2's part is scrubbed.
+    ///
+    /// Flipped line: `let superseded = superseded_by_version_2_records(records)?;`
+    /// in `ravel_catalog::select_authoritative_compaction_records`, replaced by
+    /// an empty set. C1 and C2 then share their input, and C1's all-zero hash
+    /// wins the tie-break, so C1's part is the one scrubbed.
+    #[tokio::test]
+    async fn a_superseded_predecessor_part_is_left_out_of_the_corpus() {
+        let store = MemoryStore::new();
+        let c1 = lineage_compaction(0x00, 0xc1);
+        let c1_key = put_lineage_compaction(&store, &c1).await;
+        let c2 = lineage_successor(&c1, &c1_key, 0xc2);
+        let c2_key = put_lineage_compaction(&store, &c2).await;
+
+        let targets = lineage_targets(&store, &[c1_key, c2_key]).await;
+        assert_eq!(
+            targets,
+            vec![keys::reconstruct_l1_part_key(&c2, &c2.parts[0]).expect("part key")]
+        );
+    }
+
+    /// A rewrite and a version 2 record both naming C1: the version 2 record
+    /// is dominated, so only the rewrite's part is scrubbed.
+    ///
+    /// Flipped line: `ravel_catalog::erasure_dominated_compaction_records`
+    /// returning an empty set. C2 is then authoritative, and its part is
+    /// scrubbed beside the rewrite's.
+    #[tokio::test]
+    async fn an_erasure_dominated_version_2_part_is_left_out_of_the_corpus() {
+        use ravel_proto::commit::v1::{RewriteDrop, RewriteRecord};
+
+        let store = MemoryStore::new();
+        let c1 = lineage_compaction(0xff, 0xc1);
+        let c1_key = put_lineage_compaction(&store, &c1).await;
+        let c2 = lineage_successor(&c1, &c1_key, 0xc2);
+        let c2_key = put_lineage_compaction(&store, &c2).await;
+        let request_id = Uuid::from_u128(0xd0).to_string();
+        let rewrite = RewriteRecord {
+            format_version: 1,
+            tenant_hash: c1.tenant_hash.clone(),
+            signal: c1.signal,
+            shard: 0,
+            ingest_hour_bucket: 500_000,
+            inputs: Vec::new(),
+            input_set_hash: ravel_commit::erasure::compute_rewrite_input_set_hash(
+                &[],
+                Some(&c1_key),
+                std::slice::from_ref(&request_id),
+            )
+            .to_vec(),
+            parts: vec![ravel_proto::commit::v1::CompactionPart {
+                content_hash: vec![0x0e; 32],
+                ..c1.parts[0].clone()
+            }],
+            drops: vec![RewriteDrop {
+                request_id,
+                dropped_count: 1,
+            }],
+            created_unix_ns: c1.created_unix_ns + 1,
+            superseded_record_key: c1_key.clone(),
+        };
+        let rewrite_key = keys::rewrite_record_key_for(&rewrite).expect("rewrite key");
+        store
+            .put(
+                &rewrite_key,
+                ravel_commit::erasure::encode_rewrite(&rewrite),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put rewrite record");
+
+        let targets = lineage_targets(&store, &[c1_key, c2_key, rewrite_key]).await;
+        assert_eq!(
+            targets,
+            vec![keys::reconstruct_rewrite_part_key(&rewrite, &rewrite.parts[0]).expect("part")]
         );
     }
 

@@ -147,6 +147,17 @@ pub enum CatalogError {
     /// revisited.
     #[error("rewrite record supersession cycle detected at key {key:?}")]
     RewriteSupersessionCycle { key: String },
+    /// A version 2 compaction record at `key` names, in
+    /// `superseded_record_key`, a present record at `superseded_key` whose
+    /// deduplicated input set differs from its own (ADR-0066 force 2
+    /// amendment, item 2). A version 2 record copies its predecessor's inputs
+    /// verbatim; decoding sees one record and cannot check that, so resolution
+    /// refuses the bucket rather than exclude a predecessor that alone names
+    /// some input.
+    #[error(
+        "version 2 compaction record {key:?} supersedes {superseded_key:?} but names a different input set"
+    )]
+    CompactionSupersessionInputMismatch { key: String, superseded_key: String },
     /// A fold-built per-part column-statistics object (ADR-1413, `.cstat` v3,
     /// `SnapshotPartRef.column_stats` field 7) still exceeds the ceiling after
     /// the fold dropped every dictionary it could (largest first): its

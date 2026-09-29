@@ -22,7 +22,10 @@ use ravel_proto::commit::v1::{
 };
 use uuid::Uuid;
 
-use crate::keys::{parse_compaction_record_key, parse_rewrite_record_key};
+use crate::keys::{
+    compaction_record_key, parse_compaction_record_key, parse_rewrite_record_key,
+    rewrite_record_key,
+};
 use crate::signal;
 
 /// The only supported `format_version` for every selective-erasure record.
@@ -69,6 +72,10 @@ pub enum ErasureError {
     InputSetHashMismatch,
     #[error("superseded_record_key {0:?} does not parse as a compaction or rewrite record key")]
     InvalidSupersededRecordKey(String),
+    #[error(
+        "superseded_record_key {0:?} of a rewrite record is not the canonical rendering of the key it parses to"
+    )]
+    NonCanonicalSupersededRecordKey(String),
     #[error(
         "superseded_record_key names a different bucket than this record: key names \
          (tenant={key_tenant_hex}, signal={key_signal:?}, shard={key_shard}, hour={key_hour}), \
@@ -472,13 +479,53 @@ pub fn validate_rewrite(record: &RewriteRecord) -> Result<(), ErasureError> {
     // that should have stayed erased or excluding records that were never
     // actually rewritten.
     if let Some(key) = superseded {
-        let (key_tenant, key_signal, key_shard, key_hour) = parse_compaction_record_key(key)
-            .map(|p| (p.tenant_hash.0, p.signal, p.shard, p.ingest_hour_bucket))
-            .or_else(|_| {
-                parse_rewrite_record_key(key)
-                    .map(|p| (p.tenant_hash.0, p.signal, p.shard, p.ingest_hour_bucket))
-            })
-            .map_err(|_| ErasureError::InvalidSupersededRecordKey(key.to_string()))?;
+        let invalid = || ErasureError::InvalidSupersededRecordKey(key.to_string());
+        // The parsers accept either hex case; only the builder's own rendering
+        // string-equals the key the resolver's supersession sets compare
+        // against, so the key must be that rendering.
+        let (key_tenant, key_signal, key_shard, key_hour, canonical) =
+            match parse_compaction_record_key(key) {
+                Ok(p) => {
+                    let canonical = compaction_record_key(
+                        &p.tenant_hash,
+                        p.signal,
+                        p.shard,
+                        p.ingest_hour_bucket,
+                        &p.input_set_hash16.to_ascii_lowercase(),
+                    )
+                    .map_err(|_| invalid())?;
+                    (
+                        p.tenant_hash.0,
+                        p.signal,
+                        p.shard,
+                        p.ingest_hour_bucket,
+                        canonical,
+                    )
+                }
+                Err(_) => {
+                    let p = parse_rewrite_record_key(key).map_err(|_| invalid())?;
+                    let canonical = rewrite_record_key(
+                        &p.tenant_hash,
+                        p.signal,
+                        p.shard,
+                        p.ingest_hour_bucket,
+                        &p.input_set_hash16.to_ascii_lowercase(),
+                    )
+                    .map_err(|_| invalid())?;
+                    (
+                        p.tenant_hash.0,
+                        p.signal,
+                        p.shard,
+                        p.ingest_hour_bucket,
+                        canonical,
+                    )
+                }
+            };
+        if canonical != key {
+            return Err(ErasureError::NonCanonicalSupersededRecordKey(
+                key.to_string(),
+            ));
+        }
         let record_signal = signal::from_proto(record.signal)
             .map_err(|_| ErasureError::UnknownSignal(record.signal))?;
         if key_tenant.as_slice() != record.tenant_hash.as_slice()
@@ -1198,6 +1245,65 @@ mod tests {
                 "not-a-real-key".to_string()
             ))
         );
+    }
+
+    /// A `superseded_record_key` that parses, names this record's own bucket
+    /// and is bound into a matching hash, but is not the builder's rendering of
+    /// the key it parses to: uppercase hex in the hash16 or the tenant field,
+    /// for both a compaction and a rewrite predecessor. The resolver compares
+    /// keys as strings, so such a key would name no listed record.
+    #[test]
+    fn rewrite_rejects_non_canonical_superseded_record_key() {
+        let tenant = ravel_types::TenantHash([0xab; 16]);
+        let tenant_hex = tenant.to_hex();
+        let compaction = crate::keys::compaction_record_key(
+            &tenant,
+            ravel_types::Signal::Metrics,
+            1,
+            0,
+            "aabbccddeeff0011",
+        )
+        .expect("build a well-formed compaction record key for the fixture");
+        let rewrite = crate::keys::rewrite_record_key(
+            &tenant,
+            ravel_types::Signal::Metrics,
+            1,
+            0,
+            "aabbccddeeff0011",
+        )
+        .expect("build a well-formed rewrite record key for the fixture");
+        let variants = [
+            compaction.replace("aabbccddeeff0011", "AABBCCDDEEFF0011"),
+            compaction.replace(&tenant_hex, &tenant_hex.to_uppercase()),
+            rewrite.replace("aabbccddeeff0011", "AABBCCDDEEFF0011"),
+            rewrite.replace(&tenant_hex, &tenant_hex.to_uppercase()),
+        ];
+        let build = |key: &str| {
+            let mut rw = valid_superseding_rewrite();
+            rw.tenant_hash = tenant.0.to_vec();
+            let mut request_ids: Vec<String> =
+                rw.drops.iter().map(|d| d.request_id.clone()).collect();
+            request_ids.sort();
+            rw.input_set_hash =
+                compute_rewrite_input_set_hash(&[], Some(key), &request_ids).to_vec();
+            rw.superseded_record_key = key.to_string();
+            rw
+        };
+        // The canonical keys pass, so each refusal below is the rendering
+        // check, not the parser, the bucket match or the hash.
+        assert_eq!(validate_rewrite(&build(&compaction)), Ok(()));
+        assert_eq!(validate_rewrite(&build(&rewrite)), Ok(()));
+        for key in variants {
+            assert!(key != compaction && key != rewrite, "{key} differs");
+            assert!(
+                parse_compaction_record_key(&key).is_ok() || parse_rewrite_record_key(&key).is_ok(),
+                "fixture key {key} must parse"
+            );
+            assert_eq!(
+                validate_rewrite(&build(&key)),
+                Err(ErasureError::NonCanonicalSupersededRecordKey(key))
+            );
+        }
     }
 
     #[test]
