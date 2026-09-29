@@ -36,6 +36,12 @@ async fn memory_smoke() {
     let config = small_config(Arc::new(MemoryStore::new()), "memory");
     let report = run(&config).await;
 
+    // The report's flush counters sum to the estimate it reports. That the
+    // printed breakdown carries every counter is pinned by the unit tests.
+    assert_eq!(
+        report.flush_counts().estimated_put_count(),
+        report.estimated_put_count
+    );
     assert!(
         report.accepted_points > 0,
         "memory_smoke must ingest a non-zero point count"

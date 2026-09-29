@@ -43,6 +43,13 @@ async fn depth_and_adaptive_policy_memory_smoke() {
     let config = args.to_config();
     let report = run(&config).await;
 
+    // The report's flush counters sum to the estimate it reports. That the
+    // printed breakdown carries every counter is pinned by the unit tests.
+    assert_eq!(
+        report.flush_counts().estimated_put_count(),
+        report.estimated_put_count
+    );
+
     // Config knobs echoed back so a panel row is self-describing.
     assert_eq!(report.config.max_inflight_flushes, 3);
     assert_eq!(report.config.flush_delay_policy, "adaptive");

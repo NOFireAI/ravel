@@ -332,9 +332,11 @@ Loop over `select!`:
   `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` is derived from. The floor is read
   against `flush_est_bytes`, the same object-bytes estimate `min_flush_bytes`
   uses, and a buffer crosses tiers upward as rows arrive, so a trickle that
-  reaches the floor flushes 40 s after its oldest row rather than an hour
-  after it. The default is 0, which disables the tier and leaves every buffer
-  on the two clocks above. A non-zero floor widens the buffered-mode loss
+  reaches the floor flushes on the idle clock measured from its oldest row
+  rather than on the hold. A buffer that crosses the floor later than
+  `max_flush_delay_idle` after its oldest row is already past that clock, so
+  it flushes on the next tick once it crosses. The default is 0, which
+  disables the tier and leaves every buffer on the two clocks above. A non-zero floor widens the buffered-mode loss
   window for a buffer below it from `max_flush_delay_idle` to
   `max_flush_lifetime` (docs/consistency-model.md), and the floor must be
   below `min_flush_bytes`: `IngestConfig::validate` refuses anything else and

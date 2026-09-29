@@ -4,9 +4,9 @@
 //! floor at or above `min_flush_bytes` leaves no idle tier between them, so
 //! every buffer that is not already worth a PUT would take the hour-long
 //! sub-floor hold, and the buffered-mode loss window an operator thought they
-//! were scoping to near-empty tenants would cover all of them. `start` calls
-//! `IngestConfig::validate` on each pipeline's config before building its
-//! router, so that combination refuses startup instead of running.
+//! were scoping to near-empty tenants would cover all of them. `start` checks
+//! the pair at its top, in every mode, before any pipeline is built, so that
+//! combination refuses startup instead of running.
 //!
 //! Both halves are covered here: the refusal names the flags an operator set,
 //! and the shipped default of 0 (and a legal non-zero floor) still start.
@@ -128,10 +128,9 @@ async fn a_floor_at_min_flush_bytes_refuses_startup() {
     );
 }
 
-/// Above the boundary too, and the refusal reaches the operator even though
-/// the metrics pipeline is the first config built: a check that ran on only
-/// one pipeline would still fail here, so this pins the refusal rather than
-/// which pipeline raised it.
+/// Above the boundary too: this pins that the refusal reaches the operator
+/// with both flags named, not which check raised it (the top-of-`start` check
+/// fires before any pipeline's own validation).
 #[tokio::test]
 async fn a_floor_above_min_flush_bytes_refuses_startup() {
     let err = start_with_floor(MIN_FLUSH_BYTES + 1)

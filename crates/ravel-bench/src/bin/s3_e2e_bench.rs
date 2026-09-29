@@ -80,10 +80,7 @@ fn print_human_table(report: &Report) {
         report.ack_latency_ms.max,
         report.ack_latency_ms.count
     );
-    println!(
-        "  flushes           : size={} age={} manual={}",
-        report.flushes_by_size, report.flushes_by_age, report.flushes_manual
-    );
+    println!("{}", report.flush_counts().breakdown_line());
     println!("  put_retries       : {}", report.put_retries);
     println!(
         "{}",
