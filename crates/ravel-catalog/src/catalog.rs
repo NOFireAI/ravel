@@ -3094,40 +3094,14 @@ impl Catalog {
         // so a part a rewrite superseded is never included.
         let mut excluded: HashSet<(String, u64, u64)> = HashSet::new();
         let mut newest_record_created_ns = i64::MIN;
-        let mut input_set_hashes: HashSet<Vec<u8>> = HashSet::new();
         let mut compaction_records: Vec<(String, Arc<CompactionRecord>)> =
             Vec::with_capacity(compaction_keys.len());
         for ckey in &compaction_keys {
             let record = self
                 .load_and_validate_compaction(tenant, signal, shard, ckey, accounting)
                 .await?;
-            input_set_hashes.insert(record.input_set_hash.clone());
             newest_record_created_ns = newest_record_created_ns.max(record.created_unix_ns);
             compaction_records.push((ckey.clone(), record));
-        }
-
-        // Overlapping input sets in one bucket (issue #1070): query-time dedup
-        // rescues only metrics, so serving both overlapping records' parts
-        // returns logs and spans rows twice. Pick one authoritative record per
-        // overlap component; its losers' parts are skipped below and only the
-        // WINNING records' inputs join `excluded`, so a loser input no winner
-        // names falls through to the raw-L0 pass. Disjoint records are not in
-        // conflict and both stay (see
-        // [`select_authoritative_compaction_records`] for the coverage
-        // argument).
-        let losing_compaction_records =
-            select_authoritative_compaction_records(&compaction_records);
-        for (ckey, record) in &compaction_records {
-            if losing_compaction_records.contains(ckey.as_str()) {
-                continue;
-            }
-            for input in &record.inputs {
-                excluded.insert((
-                    input.writer_id.clone(),
-                    input.writer_epoch,
-                    input.writer_seq,
-                ));
-            }
         }
 
         // Load every rewrite record (ADR-0064 decision 3). Same-bucket, key
@@ -3174,12 +3148,47 @@ impl Catalog {
             }
         }
 
+        // A version 2 record whose predecessor a live rewrite superseded is
+        // dropped before selection: its parts re-encode the pre-erasure data.
+        let dominated =
+            erasure_dominated_compaction_records(&compaction_records, &rewrite_records, &prefix)?;
+        let candidates: Vec<(&str, &CompactionRecord)> = compaction_records
+            .iter()
+            .map(|(k, r)| (k.as_str(), r.as_ref()))
+            .filter(|(k, _)| !dominated.contains(k))
+            .collect();
+
+        // Overlapping input sets in one bucket (issue #1070): query-time dedup
+        // rescues only metrics, so serving both overlapping records' parts
+        // returns logs and spans rows twice. Pick one authoritative record per
+        // overlap component, after excluding every record a present version 2
+        // record supersedes; the excluded records' parts are skipped below and
+        // only the AUTHORITATIVE records' inputs join `excluded`, so a loser
+        // input no winner names falls through to the raw-L0 pass. Disjoint
+        // records are not in conflict and both stay (see
+        // [`select_authoritative_compaction_records`] for the coverage
+        // argument).
+        let selection = select_authoritative_compaction_records(&candidates)?;
+        for (ckey, record) in &candidates {
+            if selection.is_excluded(ckey) {
+                continue;
+            }
+            for input in &record.inputs {
+                excluded.insert((
+                    input.writer_id.clone(),
+                    input.writer_epoch,
+                    input.writer_seq,
+                ));
+            }
+        }
+
         // Compaction parts: include each non-superseded record's parts
         // (event-bound filtered). A record whose whole output a live rewrite
         // superseded is skipped -- its parts would resurrect erased records.
         for (ckey, record) in &compaction_records {
             if superseded_records.contains(ckey)
-                || losing_compaction_records.contains(ckey.as_str())
+                || dominated.contains(ckey.as_str())
+                || selection.is_excluded(ckey)
             {
                 continue;
             }
@@ -3223,7 +3232,14 @@ impl Catalog {
         // disjoint sets both serve above (harmless); overlapping sets resolved
         // to one authoritative record above (issue #1070). Either way this is
         // an interlock anomaly worth alarming on loudly (docs/catalog-and-mvcc.md
-        // step 3, §3.6 row 11).
+        // step 3, §3.6 row 11). A record a present version 2 record supersedes,
+        // and a version 2 record a live rewrite dominates, are expected state
+        // until a sweep removes them, not a second input set.
+        let input_set_hashes: HashSet<&[u8]> = candidates
+            .iter()
+            .filter(|(k, _)| !selection.superseded().contains(k))
+            .map(|(_, r)| r.input_set_hash.as_slice())
+            .collect();
         if input_set_hashes.len() > 1 {
             self.compaction_input_set_conflicts
                 .fetch_add(1, Ordering::Relaxed);
@@ -3840,9 +3856,17 @@ impl Catalog {
         // parts even though `process_bucket` never serves them, so a snapshot
         // can carry parts from both overlapping records. Pick one
         // authoritative record per overlap component here too, and skip a
-        // loser below before testing whether it covers the token.
-        let losing_compaction_records =
-            select_authoritative_compaction_records(&compaction_records);
+        // loser below before testing whether it covers the token. A version 2
+        // record a present one supersedes is excluded the same way, and one a
+        // live rewrite dominates is dropped before the selection runs.
+        let dominated =
+            erasure_dominated_compaction_records(&compaction_records, &rewrite_records, &prefix)?;
+        let candidates: Vec<(&str, &CompactionRecord)> = compaction_records
+            .iter()
+            .map(|(k, r)| (k.as_str(), r.as_ref()))
+            .filter(|(k, _)| !dominated.contains(k))
+            .collect();
+        let selection = select_authoritative_compaction_records(&candidates)?;
 
         // Which records a live rewrite superseded as a whole (their parts must
         // never be served). No rewrites -> empty set -> exactly the pre-ADR-0064
@@ -3883,7 +3907,8 @@ impl Catalog {
         // A live compaction record whose inputs cover the token: serve its parts.
         for (ckey, record) in &compaction_records {
             if superseded_records.contains(ckey)
-                || losing_compaction_records.contains(ckey.as_str())
+                || dominated.contains(ckey.as_str())
+                || selection.is_excluded(ckey)
             {
                 continue;
             }
@@ -4259,8 +4284,11 @@ fn build_l1_segment_ref(
 }
 
 /// Maximum length of a `superseded_record_key` chase before the resolver gives
-/// up with a typed error (ADR-0064 decision 3, amended). Real chains are one
-/// link per erasure batch over a bucket and never approach this; a chain this
+/// up with a typed error (ADR-0064 decision 3, amended), counted in records
+/// walked. The same bound applies to a rewrite chain, which may pass through
+/// version 2 compaction records, and to a chain of version 2 compaction
+/// records alone (ADR-0066 force 2 amendment). Real chains are one
+/// link per erasure batch or re-encode over a bucket and never approach this; a chain this
 /// long is corruption or a pathological write pattern, refused rather than
 /// looped. Cycles are caught independently by a visited set, so this only
 /// bounds acyclic-but-absurd depth.
@@ -4331,11 +4359,200 @@ fn build_rewrite_l1_segment_ref(
     })
 }
 
+/// One bucket's compaction records as
+/// [`select_authoritative_compaction_records`] resolved them: which records a
+/// present version 2 record supersedes, which lost their overlap component,
+/// and how many records the largest component held once the superseded ones
+/// were set aside.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuthoritativeSelection<'a> {
+    superseded: HashSet<&'a str>,
+    losing: HashSet<&'a str>,
+    largest_component: usize,
+}
+
+impl<'a> AuthoritativeSelection<'a> {
+    /// Whether the record at `key` is not authoritative, so its output parts
+    /// must be ignored and its inputs do not count as superseded by it.
+    pub fn is_excluded(&self, key: &str) -> bool {
+        self.superseded.contains(key) || self.losing.contains(key)
+    }
+
+    /// Every record key [`Self::is_excluded`] answers `true` for.
+    pub fn excluded(&self) -> impl Iterator<Item = &'a str> + '_ {
+        self.superseded.iter().chain(self.losing.iter()).copied()
+    }
+
+    /// The records a present version 2 record names, directly or down a chain
+    /// of version 2 records.
+    pub fn superseded(&self) -> &HashSet<&'a str> {
+        &self.superseded
+    }
+
+    /// The records that lost their overlap component to another record.
+    pub fn losing(&self) -> &HashSet<&'a str> {
+        &self.losing
+    }
+
+    /// The number of records in the largest overlap component, counted after
+    /// the superseded records were excluded: a predecessor and the version 2
+    /// record that re-encodes it count as one. Zero for an empty bucket.
+    pub fn largest_component(&self) -> usize {
+        self.largest_component
+    }
+}
+
+/// The bucket prefix a record key sits under, for naming a bucket in an error.
+fn bucket_label(record_key: &str) -> String {
+    match record_key.rsplit_once('/') {
+        Some((prefix, _)) => format!("{prefix}/"),
+        None => record_key.to_string(),
+    }
+}
+
+/// The keys of every record in `records` that a present version 2 compaction
+/// record names in `superseded_record_key`, following chains of version 2
+/// records. A named key that is not present excludes nothing. Each chain is
+/// walked from every version 2 record, bounded by
+/// [`MAX_REWRITE_SUPERSESSION_DEPTH`] records and checked for a revisit, so a
+/// cycle or an over-deep chain is a typed error rather than a guess about
+/// which record is live.
+fn superseded_by_version_2_records<K, R>(records: &[(K, R)]) -> Result<HashSet<&str>, CatalogError>
+where
+    K: AsRef<str>,
+    R: Borrow<CompactionRecord>,
+{
+    let by_key: HashMap<&str, &CompactionRecord> = records
+        .iter()
+        .map(|(key, record)| (key.as_ref(), record.borrow()))
+        .collect();
+    let mut superseded: HashSet<&str> = HashSet::new();
+    for (start_key, start) in records {
+        if start.borrow().superseded_record_key.is_empty() {
+            continue;
+        }
+        let mut visited: HashSet<&str> = HashSet::new();
+        let mut current_key: &str = start_key.as_ref();
+        let mut current: &CompactionRecord = start.borrow();
+        let mut depth = 0usize;
+        loop {
+            if !visited.insert(current_key) {
+                return Err(CatalogError::RewriteSupersessionCycle {
+                    key: current_key.to_string(),
+                });
+            }
+            if depth >= MAX_REWRITE_SUPERSESSION_DEPTH {
+                return Err(CatalogError::RewriteSupersessionChainTooDeep {
+                    bucket: bucket_label(current_key),
+                    max: MAX_REWRITE_SUPERSESSION_DEPTH,
+                });
+            }
+            depth += 1;
+            let Some((&named_key, &named)) =
+                by_key.get_key_value(current.superseded_record_key.as_str())
+            else {
+                break;
+            };
+            superseded.insert(named_key);
+            current_key = named_key;
+            current = named;
+        }
+    }
+    Ok(superseded)
+}
+
+/// The version 2 compaction records a live rewrite record dominates
+/// (docs/catalog-and-mvcc.md step 3): a version 2 record whose predecessor a
+/// rewrite record in the same bucket supersedes, directly or through its
+/// chain, or whose predecessor is itself dominated. Its parts are a re-encode
+/// of the pre-erasure predecessor and may still hold an erased subject, so the
+/// rewrite wins and every caller drops these records before
+/// [`select_authoritative_compaction_records`] runs. The selector sees only
+/// compaction records, which is why this is a separate step every bucket
+/// resolution that has the rewrite records in view calls: snapshot resolution,
+/// the token fallback, the index fold, scrub, the erasure completion gate and
+/// `migrate`.
+///
+/// The predecessor need not be present: once a sweep has removed it, the
+/// rewrite still names it, and the version 2 record stays dominated. The
+/// rewrite chains are resolved with [`resolve_rewrite_supersession`], so a
+/// cyclic or over-deep chain is the same typed error resolution returns;
+/// `bucket_prefix` names the bucket in it.
+pub fn erasure_dominated_compaction_records<'a, K, R, RK, RR>(
+    compaction_records: &'a [(K, R)],
+    rewrite_records: &[(RK, RR)],
+    bucket_prefix: &str,
+) -> Result<HashSet<&'a str>, CatalogError>
+where
+    K: AsRef<str>,
+    R: Borrow<CompactionRecord>,
+    RK: AsRef<str>,
+    RR: Borrow<RewriteRecord>,
+{
+    let mut dominated: HashSet<&'a str> = HashSet::new();
+    let any_version_2 = compaction_records
+        .iter()
+        .any(|(_, record)| !record.borrow().superseded_record_key.is_empty());
+    if rewrite_records.is_empty() || !any_version_2 {
+        return Ok(dominated);
+    }
+    let compaction_by_key: HashMap<&str, &CompactionRecord> = compaction_records
+        .iter()
+        .map(|(key, record)| (key.as_ref(), record.borrow()))
+        .collect();
+    let rewrite_by_key: HashMap<&str, &RewriteRecord> = rewrite_records
+        .iter()
+        .map(|(key, record)| (key.as_ref(), record.borrow()))
+        .collect();
+    let mut rewrite_superseded: HashSet<String> = HashSet::new();
+    let mut discard: HashSet<(String, u64, u64)> = HashSet::new();
+    for (key, record) in rewrite_records {
+        resolve_rewrite_supersession(
+            key.as_ref(),
+            record.borrow(),
+            bucket_prefix,
+            &compaction_by_key,
+            &rewrite_by_key,
+            &mut discard,
+            &mut rewrite_superseded,
+        )?;
+    }
+    // Each round marks at least one more record or ends the loop, so this runs
+    // at most `compaction_records.len()` rounds whatever the chain shape.
+    loop {
+        let before = dominated.len();
+        for (key, record) in compaction_records {
+            let key = key.as_ref();
+            let named = record.borrow().superseded_record_key.as_str();
+            if named.is_empty() || dominated.contains(key) {
+                continue;
+            }
+            if rewrite_superseded.contains(named) || dominated.contains(named) {
+                dominated.insert(key);
+            }
+        }
+        if dominated.len() == before {
+            return Ok(dominated);
+        }
+    }
+}
+
 /// Select one authoritative compaction record per *overlap component* of a
-/// bucket, returning the keys of the records whose output parts must be
-/// IGNORED (the losers). Shared by snapshot resolution (`process_bucket`), the
-/// index fold (`classify_bucket`), the superseded-input sweep, and the erasure
-/// completion gate, so every one of them derives identical bucket state.
+/// bucket, reporting the records whose output parts must be IGNORED. Shared by
+/// snapshot resolution (`process_bucket`), the token fallback, the index fold
+/// (`classify_bucket`), the superseded-input sweep, scrub, `migrate` and the
+/// erasure completion gate, so every one of them derives identical bucket
+/// state.
+///
+/// Supersession is applied first. A version 2 record names, in
+/// `superseded_record_key`, the record it re-encodes; every present record so
+/// named is excluded before any component is formed, following chains of
+/// version 2 records (see [`superseded_by_version_2_records`] for the bound and
+/// the cycle check, whose failures are this function's only errors). Left in, a
+/// predecessor and its successor would share every input, form one component,
+/// and the tie-break below could keep the predecessor. A version 2 record whose
+/// own predecessor a rewrite record supersedes is removed by the caller before
+/// this runs ([`erasure_dominated_compaction_records`]).
 ///
 /// Two compaction records are in conflict when their input sets overlap (share
 /// at least one L0 input identity). Query-time dedup by `(series_id, ts)`
@@ -4371,22 +4588,33 @@ fn build_rewrite_l1_segment_ref(
 /// is why the sweep treats an input as superseded only where an authoritative
 /// record names it, and why the erasure completion gate keeps such an input in
 /// its live view.
-pub fn select_authoritative_compaction_records<K, R>(records: &[(K, R)]) -> HashSet<&str>
+pub fn select_authoritative_compaction_records<K, R>(
+    records: &[(K, R)],
+) -> Result<AuthoritativeSelection<'_>, CatalogError>
 where
     K: AsRef<str>,
     R: Borrow<CompactionRecord>,
 {
-    if records.len() < 2 {
-        return HashSet::new();
+    let superseded = superseded_by_version_2_records(records)?;
+    let live: Vec<(&str, &CompactionRecord)> = records
+        .iter()
+        .map(|(key, record)| (key.as_ref(), record.borrow()))
+        .filter(|(key, _)| !superseded.contains(key))
+        .collect();
+    if live.len() < 2 {
+        return Ok(AuthoritativeSelection {
+            superseded,
+            losing: HashSet::new(),
+            largest_component: live.len(),
+        });
     }
     // Each record's input identities, deduplicated once: the union-find below
     // walks them, and the tie-break counts them. A malformed record naming the
     // same input twice must not thereby claim a larger set.
-    let identities: Vec<HashSet<(&str, u64, u64)>> = records
+    let identities: Vec<HashSet<(&str, u64, u64)>> = live
         .iter()
         .map(|(_key, record)| {
             record
-                .borrow()
                 .inputs
                 .iter()
                 .map(|input| {
@@ -4403,7 +4631,7 @@ where
     // Union-find over record indices: union two records whenever they name the
     // same input identity, so a component is a maximal set of records linked by
     // input-set overlap.
-    let mut parent: Vec<usize> = (0..records.len()).collect();
+    let mut parent: Vec<usize> = (0..live.len()).collect();
     fn find(parent: &mut [usize], mut x: usize) -> usize {
         while parent[x] != x {
             parent[x] = parent[parent[x]];
@@ -4428,7 +4656,7 @@ where
 
     // Group record indices by component root.
     let mut components: HashMap<usize, Vec<usize>> = HashMap::new();
-    for i in 0..records.len() {
+    for i in 0..live.len() {
         let root = find(&mut parent, i);
         components.entry(root).or_default().push(i);
     }
@@ -4436,7 +4664,9 @@ where
     // Within each multi-record component keep the maximal-input-set record;
     // every other record in that component is a loser.
     let mut losing: HashSet<&str> = HashSet::new();
+    let mut largest_component = 0usize;
     for members in components.values() {
+        largest_component = largest_component.max(members.len());
         if members.len() < 2 {
             continue;
         }
@@ -4444,23 +4674,21 @@ where
             identities[b]
                 .len()
                 .cmp(&identities[a].len())
-                .then_with(|| {
-                    records[a]
-                        .1
-                        .borrow()
-                        .input_set_hash
-                        .cmp(&records[b].1.borrow().input_set_hash)
-                })
-                .then_with(|| records[a].0.as_ref().cmp(records[b].0.as_ref()))
+                .then_with(|| live[a].1.input_set_hash.cmp(&live[b].1.input_set_hash))
+                .then_with(|| live[a].0.cmp(live[b].0))
         }) {
             for &m in members {
                 if m != winner {
-                    losing.insert(records[m].0.as_ref());
+                    losing.insert(live[m].0);
                 }
             }
         }
     }
-    losing
+    Ok(AuthoritativeSelection {
+        superseded,
+        losing,
+        largest_component,
+    })
 }
 
 /// Resolve one rewrite record's supersession into the two unified exclusion
@@ -4472,7 +4700,8 @@ where
 ///   `inputs` when set, or -- when `superseded_record_key` is set instead --
 ///   the inputs of the compaction/rewrite record it names, chased through any
 ///   rewrite-of-a-rewrite chain until a record with `inputs` set directly is
-///   reached.
+///   reached. A version 2 compaction record on the chain is a link: the chase
+///   continues to the record it names.
 /// - `superseded_records` gains the key of every compaction/rewrite record a
 ///   rewrite superseded as a whole, so the caller can exclude that record's
 ///   output parts (overlap harmlessness does not hold across a rewrite).
@@ -4513,9 +4742,14 @@ pub fn resolve_rewrite_supersession(
     excluded: &mut HashSet<(String, u64, u64)>,
     superseded_records: &mut HashSet<String>,
 ) -> Result<(), CatalogError> {
+    #[derive(Clone, Copy)]
+    enum Link<'r> {
+        Rewrite(&'r RewriteRecord),
+        Compaction(&'r CompactionRecord),
+    }
     let mut visited: HashSet<String> = HashSet::new();
     let mut current_key = start_key.to_string();
-    let mut current: &RewriteRecord = start_record;
+    let mut current = Link::Rewrite(start_record);
     let mut depth = 0usize;
     loop {
         if !visited.insert(current_key.clone()) {
@@ -4534,26 +4768,36 @@ pub fn resolve_rewrite_supersession(
         }
         depth += 1;
 
-        // Direct-inputs case: terminal. Exclude the raw L0/L1 identities.
-        if !current.inputs.is_empty() {
-            for input in &current.inputs {
-                excluded.insert((
-                    input.writer_id.clone(),
-                    input.writer_epoch,
-                    input.writer_seq,
-                ));
+        let superseded_key = match current {
+            Link::Rewrite(rewrite) => {
+                // Direct-inputs case: terminal. Exclude the raw L0/L1
+                // identities.
+                if !rewrite.inputs.is_empty() {
+                    for input in &rewrite.inputs {
+                        excluded.insert((
+                            input.writer_id.clone(),
+                            input.writer_epoch,
+                            input.writer_seq,
+                        ));
+                    }
+                    return Ok(());
+                }
+                rewrite.superseded_record_key.as_str()
             }
-            return Ok(());
-        }
+            // A version 2 compaction record is a link, not an end: it
+            // re-encodes the record it names, whose parts the rewrite also
+            // superseded.
+            Link::Compaction(compaction) => compaction.superseded_record_key.as_str(),
+        };
 
         // Superseded-record case: the whole named record's output is
         // superseded, so its parts must be excluded.
-        let superseded_key = current.superseded_record_key.as_str();
         superseded_records.insert(superseded_key.to_string());
 
-        // A compaction record is terminal (it always carries `inputs`): exclude
-        // its L0 inputs; its parts are already excluded via `superseded_records`.
         if let Some(comp) = compaction_by_key.get(superseded_key) {
+            // Exclude its L0 inputs; its parts are already excluded via
+            // `superseded_records`. A version 1 record ends the chain; a
+            // version 2 record's predecessor is chased next.
             for input in &comp.inputs {
                 excluded.insert((
                     input.writer_id.clone(),
@@ -4561,19 +4805,19 @@ pub fn resolve_rewrite_supersession(
                     input.writer_seq,
                 ));
             }
+            if comp.superseded_record_key.is_empty() {
+                return Ok(());
+            }
+            current = Link::Compaction(comp);
+        } else if let Some(next) = rewrite_by_key.get(superseded_key) {
+            // A prior rewrite record: chase it (rewrite-of-a-rewrite).
+            current = Link::Rewrite(next);
+        } else {
+            // Named predecessor is not live in this bucket (already swept):
+            // its inputs and parts are gone, so nothing more to exclude.
             return Ok(());
         }
-
-        // A prior rewrite record: chase it (rewrite-of-a-rewrite).
-        if let Some(next) = rewrite_by_key.get(superseded_key) {
-            current_key = superseded_key.to_string();
-            current = next;
-            continue;
-        }
-
-        // Named predecessor is not live in this bucket (already swept): its
-        // inputs and parts are gone, so nothing more to exclude. Stop cleanly.
-        return Ok(());
+        current_key = superseded_key.to_string();
     }
 }
 
@@ -5793,6 +6037,208 @@ mod tests {
             err,
             CatalogError::RewriteSupersessionChainTooDeep { .. }
         ));
+    }
+
+    /// A compaction record at hour 10 whose key follows `hash_byte`, naming
+    /// `superseded_key` when that is non-empty (then stamped version 2). The
+    /// selector and the chase read only keys, inputs and the supersession
+    /// field, so the version 2 hash is not recomputed here.
+    fn bare_compaction(hash_byte: u8, superseded_key: &str) -> (String, CompactionRecord) {
+        let record = CompactionRecord {
+            format_version: if superseded_key.is_empty() { 1 } else { 2 },
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal::to_proto(Signal::Metrics) as i32,
+            shard: 0,
+            ingest_hour_bucket: 10,
+            level: 1,
+            inputs: vec![ravel_proto::commit::v1::CompactionInputIdentity {
+                writer_id: Uuid::from_u128(1).to_string(),
+                writer_epoch: 1,
+                writer_seq: 1,
+            }],
+            input_set_hash: vec![hash_byte; 32],
+            parts: Vec::new(),
+            created_unix_ns: 0,
+            superseded_record_key: superseded_key.to_string(),
+        };
+        let key = keys::compaction_record_key_for(&record).expect("record key");
+        (key, record)
+    }
+
+    /// A chain of `n` compaction records where each names the next and the
+    /// last is version 1: `records[0]` is the head.
+    fn compaction_chain(n: usize) -> Vec<(String, CompactionRecord)> {
+        let mut chain: Vec<(String, CompactionRecord)> = Vec::with_capacity(n);
+        let mut named = String::new();
+        for i in 0..n {
+            let (key, record) = bare_compaction(u8::try_from(i).expect("small chain"), &named);
+            named = key.clone();
+            chain.push((key, record));
+        }
+        chain.reverse();
+        chain
+    }
+
+    /// A two-record cycle of version 2 compaction records is the typed
+    /// `RewriteSupersessionCycle` error on `Catalog::resolve`, never a guess
+    /// about which record is live and never a hang. Honest hashing makes such
+    /// a cycle unconstructable in stored bytes (each key would have to follow
+    /// a hash over the other key), so the two records are placed in the
+    /// decoded-record cache, whose hit path re-checks the fields and the key
+    /// reconstruction but not the version 2 hash; placeholder objects make the
+    /// listing find them.
+    ///
+    /// Flipped line: `let superseded = superseded_by_version_2_records(records)?;`
+    /// in `select_authoritative_compaction_records`, replaced by an empty set.
+    /// The resolve then succeeds and serves one of the two records.
+    #[tokio::test]
+    async fn a_two_record_version_2_cycle_is_a_typed_error_on_resolve() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let (k1, _) = bare_compaction(0x01, "");
+        let (k2, _) = bare_compaction(0x02, "");
+        let (k1_again, c1) = bare_compaction(0x01, &k2);
+        let (k2_again, c2) = bare_compaction(0x02, &k1);
+        assert_eq!(
+            (k1.as_str(), k2.as_str()),
+            (k1_again.as_str(), k2_again.as_str())
+        );
+        for (key, record) in [(&k1, c1), (&k2, c2)] {
+            store
+                .put(
+                    key,
+                    Bytes::from_static(b"cached"),
+                    PutOptions::create_if_absent(),
+                )
+                .await
+                .expect("put placeholder");
+            catalog.compaction_cache.insert(
+                tenant(),
+                key.clone(),
+                Arc::new(record),
+                64,
+                catalog.config.cache_capacity_per_tenant,
+                catalog.config.compaction_cache_max_bytes_per_tenant(),
+            );
+        }
+        let range = TimeRange {
+            start_ns: 10 * NS_PER_HOUR,
+            end_ns: 11 * NS_PER_HOUR,
+        };
+        let err = catalog
+            .resolve(
+                &tenant(),
+                Signal::Metrics,
+                range,
+                &[],
+                10 * NS_PER_HOUR + NS_PER_HOUR / 2,
+            )
+            .await
+            .expect_err("a supersession cycle must be a typed error");
+        assert!(
+            matches!(&err, CatalogError::RewriteSupersessionCycle { key } if *key == k1 || *key == k2),
+            "{err:?}"
+        );
+    }
+
+    /// The selector excludes every link of a chain but its head, and a chain
+    /// longer than the depth bound is the typed error. The bound is exact: a
+    /// chain of `MAX_REWRITE_SUPERSESSION_DEPTH` records is walked, one more
+    /// is refused.
+    #[test]
+    fn selector_chain_walk_is_bounded_exactly() {
+        let chain = compaction_chain(3);
+        let selection =
+            select_authoritative_compaction_records(&chain).expect("a short chain resolves");
+        let excluded: HashSet<&str> = selection.excluded().collect();
+        assert_eq!(
+            excluded,
+            HashSet::from([chain[1].0.as_str(), chain[2].0.as_str()])
+        );
+        assert!(!selection.is_excluded(&chain[0].0));
+        assert_eq!(selection.largest_component(), 1);
+
+        select_authoritative_compaction_records(&compaction_chain(MAX_REWRITE_SUPERSESSION_DEPTH))
+            .expect("a chain of exactly the maximum length must be walked");
+        let err = select_authoritative_compaction_records(&compaction_chain(
+            MAX_REWRITE_SUPERSESSION_DEPTH + 1,
+        ))
+        .expect_err("one record past the maximum must be refused");
+        assert!(matches!(
+            err,
+            CatalogError::RewriteSupersessionChainTooDeep { max, .. }
+                if max == MAX_REWRITE_SUPERSESSION_DEPTH
+        ));
+    }
+
+    /// A version 2 record naming an absent key excludes nothing, and a
+    /// predecessor with its successor count as one record in the largest
+    /// overlap component.
+    #[test]
+    fn selector_supersession_edges() {
+        let (absent_key, _) = bare_compaction(0x70, "");
+        let lone = [bare_compaction(0x71, &absent_key)];
+        let selection = select_authoritative_compaction_records(&lone).expect("resolves");
+        assert_eq!(selection.excluded().count(), 0);
+        assert_eq!(selection.largest_component(), 1);
+
+        let chain = compaction_chain(2);
+        let selection = select_authoritative_compaction_records(&chain).expect("resolves");
+        assert_eq!(selection.largest_component(), 1);
+        assert!(selection.losing().is_empty());
+        assert_eq!(
+            selection.superseded(),
+            &HashSet::from([chain[1].0.as_str()])
+        );
+    }
+
+    /// The rewrite chase treats a version 2 compaction record as a link: a
+    /// rewrite naming C2, which names C1, supersedes both.
+    ///
+    /// Flipped line: the `if comp.superseded_record_key.is_empty()` return in
+    /// `resolve_rewrite_supersession`, made unconditional (a compaction record
+    /// ends the chain, as before). `superseded` is then only `{C2}`.
+    #[test]
+    fn rewrite_chase_passes_through_a_version_2_record() {
+        let chain = compaction_chain(2);
+        let (c2_key, c2) = &chain[0];
+        let (c1_key, c1) = &chain[1];
+        let rewrite = bare_superseding_rewrite(c2_key);
+        let rewrite_key = "t/aa/m/c/0000/19700101T10/rw.1111111111111111.cmt";
+        let compaction_by_key: HashMap<&str, &CompactionRecord> =
+            [(c2_key.as_str(), c2), (c1_key.as_str(), c1)]
+                .into_iter()
+                .collect();
+        let rewrite_by_key: HashMap<&str, &RewriteRecord> =
+            [(rewrite_key, &rewrite)].into_iter().collect();
+        let mut excluded = HashSet::new();
+        let mut superseded = HashSet::new();
+        resolve_rewrite_supersession(
+            rewrite_key,
+            &rewrite,
+            "bucket",
+            &compaction_by_key,
+            &rewrite_by_key,
+            &mut excluded,
+            &mut superseded,
+        )
+        .expect("the chain resolves");
+        assert_eq!(superseded, HashSet::from([c2_key.clone(), c1_key.clone()]));
+        assert_eq!(excluded.len(), 1, "C1 and C2 name the same one input");
+
+        // Dominance reads the same chase: a sibling version 2 record naming C1
+        // is dominated because the rewrite reached C1 through C2.
+        let (sibling_key, mut sibling) = bare_compaction(0x40, c1_key);
+        sibling.inputs[0].writer_seq = 2;
+        let compactions = vec![
+            chain[0].clone(),
+            chain[1].clone(),
+            (sibling_key.clone(), sibling),
+        ];
+        let rewrites = [(rewrite_key, &rewrite)];
+        let dominated = erasure_dominated_compaction_records(&compactions, &rewrites, "bucket")
+            .expect("dominance resolves");
+        assert!(dominated.contains(sibling_key.as_str()), "{dominated:?}");
     }
 
     async fn seed_provisioning_record(store: &MemoryStore, shard_count: u32) {

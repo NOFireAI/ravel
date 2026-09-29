@@ -2387,11 +2387,38 @@ pub async fn bucket_erasure_completion(
     // exclusion set from every record instead would hide a resolvable raw L0
     // from this gate and let a `.done` be written while the subject is still
     // returnable.
-    let losing_records =
-        ravel_catalog::select_authoritative_compaction_records(&compaction_records);
+    //
+    // A record a present version 2 record supersedes is excluded the same way,
+    // and a version 2 record whose predecessor a live rewrite supersedes is
+    // dropped before the selection, as the resolver drops it: its parts are a
+    // re-encode of the pre-erasure data.
+    let prefix = keys::commit_shard_hour_prefix(
+        &bucket.tenant_hash,
+        bucket.signal,
+        bucket.shard,
+        bucket.ingest_hour_bucket,
+    )?;
+    let unresolvable = |e: ravel_catalog::CatalogError| {
+        MaintainError::Invariant(format!(
+            "erasure completion: catalog supersession resolution failed for {prefix}: {e}"
+        ))
+    };
+    let dominated = ravel_catalog::erasure_dominated_compaction_records(
+        &compaction_records,
+        &rewrite_records,
+        &prefix,
+    )
+    .map_err(unresolvable)?;
+    let candidates: Vec<(&str, &CompactionRecord)> = compaction_records
+        .iter()
+        .map(|(k, r)| (k.as_str(), r))
+        .filter(|(k, _)| !dominated.contains(k))
+        .collect();
+    let selection = ravel_catalog::select_authoritative_compaction_records(&candidates)
+        .map_err(unresolvable)?;
     let mut excluded: HashSet<(String, u64, u64)> = HashSet::new();
-    for (key, record) in &compaction_records {
-        if losing_records.contains(key.as_str()) {
+    for (key, record) in &candidates {
+        if selection.is_excluded(key) {
             continue;
         }
         for input in &record.inputs {
@@ -2402,7 +2429,11 @@ pub async fn bucket_erasure_completion(
             ));
         }
     }
-    let losing_records: HashSet<String> = losing_records.into_iter().map(str::to_owned).collect();
+    let losing_records: HashSet<String> = selection
+        .excluded()
+        .chain(dominated.iter().copied())
+        .map(str::to_owned)
+        .collect();
     let mut superseded_records: HashSet<String> = HashSet::new();
     if !rewrite_records.is_empty() {
         let compaction_by_key: HashMap<&str, &CompactionRecord> = compaction_records
@@ -2413,12 +2444,6 @@ pub async fn bucket_erasure_completion(
             .iter()
             .map(|(k, r)| (k.as_str(), r))
             .collect();
-        let prefix = keys::commit_shard_hour_prefix(
-            &bucket.tenant_hash,
-            bucket.signal,
-            bucket.shard,
-            bucket.ingest_hour_bucket,
-        )?;
         for (rkey, record) in &rewrite_records {
             ravel_catalog::resolve_rewrite_supersession(
                 rkey,
