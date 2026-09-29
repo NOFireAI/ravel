@@ -454,9 +454,11 @@ and the CAS read/write helpers.
   the version 2 hash over `(inputs, superseded_record_key)` for a version 2
   record. Resolution honours its supersession (step 3 of "Snapshot
   resolution" below), and refuses a bucket where a version 2 record's inputs
-  differ from those of the present record it names. No writer produces a
-  version 2 record yet, and the sweep reclaims nothing on account of its
-  supersession yet; both are later steps of the amendment's task list.
+  differ from those of the present record it names. The superseded-input
+  sweep reclaims the record it names, with that record's parts, once the
+  version 2 record's protection horizon has passed (docs/deletion-and-gc.md,
+  the superseded-input row). No writer produces a version 2 record yet, so
+  that reclamation has nothing to act on until the writer ships.
 - Selective-erasure request and completion records (ADR-0064 decision 1) live
   under a separate `t/<tenant_hash>/<signal>/del/` prefix, not in `c/`, so the
   bucket-resolution LIST never sees them; the resolver LISTs `del/` once per
@@ -1255,16 +1257,31 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
      overlap selection sees only compaction records, so this rule is applied
      first, wherever rewrite and compaction records are both in view:
      resolution, the token fallback (step 5), the index fold, scrub, the
-     erasure completion gate and `migrate`. The superseded-input sweep
-     reclaims nothing on account of version 2 supersession or dominance yet:
-     a superseded predecessor or a dominated version 2 record is reclaimed
-     only where a rule that predates version 2 records reaches it, such as a
-     rewrite chain that names it. The sweep treats an input as superseded
-     only where an authoritative record names it both with and without
-     version 2 supersession applied, and treats none of a bucket's inputs as
-     superseded when that bucket's supersession does not resolve (a cycle,
-     an over-deep chain, or a version 2 record whose inputs differ from its
-     predecessor's).
+     erasure completion gate and `migrate`. The erasure rewrite pass picks
+     the bucket's live record by the same rules: the one record no rewrite
+     chain, no present version 2 record and no dominance excludes, with a
+     cycle or an over-deep chain a typed error.
+   - **Reclaiming superseded records.** The superseded-input sweep reclaims a
+     record a present version 2 record supersedes, with its parts, as one
+     chain group entered from the version 2 record at the head of the chain
+     and followed to its end (C3 over C2 over C1 reclaims C2 and C1), once
+     that record's protection horizon has passed, only when no reachable
+     HEAD names any part in the group, and never under a legal hold; parts
+     go first and records after, the oldest record first. The group holds
+     no raw L0 input: those are the version 2 record's own inputs, decided
+     by the authoritative-input rule below. A dominated version 2 record
+     joins the chain group of the rewrite whose chain reaches the record it
+     names and is deleted with its parts under that group's horizon,
+     reachability and hold rules, ahead of the chain's own records. A
+     version 2 record naming a key that is not present reclaims nothing.
+     The sweep treats an input as superseded only where an authoritative
+     record names it both with and without version 2 supersession applied:
+     while a predecessor is present, excluding it can hand its overlap
+     component to another record, and the two views then disagree. It
+     treats none of a bucket's inputs as superseded, and reclaims nothing on
+     account of the bucket's version 2 records, when that bucket's
+     supersession does not resolve (a cycle, an over-deep chain, or a
+     version 2 record whose inputs differ from its predecessor's).
    - Include each compaction record's parts and each rewrite record's output
      parts as segment refs, filtered by per-part event bounds, UNLESS that
      record's key is in `superseded_records`. A superseded record's parts are
