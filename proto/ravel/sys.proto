@@ -535,12 +535,14 @@ message TypedAttrColumnConfig {
 }
 
 // The time-bucket width a tenant's clustering key groups rows by (ADR-2135).
-// Exactly three accepted widths. UNSPECIFIED is the proto3 zero default: a
-// present ClusteringKeyConfig carrying it (or an unknown value) is invalid, and
-// the reader's clustering-key accessor refuses it with a typed error rather than
-// guess a width. Record decode itself does not fail on it.
+// Exactly three accepted widths. UNSPECIFIED is the proto3 zero default: a set
+// ClusteringKeyConfig (one or more columns) carrying it (or an unknown value)
+// is invalid, and the reader's clustering-key accessor refuses it with a typed
+// error rather than guess a width. The clear setter stores UNSPECIFIED, and the
+// width of a cleared key (no columns) is not read. Record decode itself does
+// not fail on it.
 enum ClusteringBucketWidth {
-  CLUSTERING_BUCKET_WIDTH_UNSPECIFIED = 0;  // refused when the message is present
+  CLUSTERING_BUCKET_WIDTH_UNSPECIFIED = 0;  // refused on a set key
   CLUSTERING_BUCKET_WIDTH_ONE_HOUR = 1;
   CLUSTERING_BUCKET_WIDTH_SIX_HOURS = 2;
   CLUSTERING_BUCKET_WIDTH_ONE_DAY = 3;
@@ -548,12 +550,20 @@ enum ClusteringBucketWidth {
 
 // A tenant's clustering key (ADR-2135): the ordered declared typed attribute
 // columns rows are clustered by, the time-bucket width, and a generation that
-// identifies which key produced a given layout. Valid content is 1 to 4
-// columns, no duplicates, each naming a column declared in the same record's
-// typed_attr_columns, and a width other than UNSPECIFIED. Those rules are
-// enforced by the reader's clustering-key accessor and by the setter (one shared
-// validation), not by record decode, so an invalid stored key never makes the
-// record itself unreadable.
+// identifies which key produced a given layout. The setters store the previous
+// generation plus one on every set and every clear, and generation 0 means only
+// "never set", which is an absent message: the accessor refuses a present
+// message with generation 0. A message with no columns is a CLEARED key, which
+// ADR-2135 ranks like a new key, above every key with a lower generation. A
+// message with columns is a SET key, whose valid content is 1 to
+// 4 columns, no duplicates, each naming one of the tenant's effective declared
+// typed attribute columns (the record's typed_attr_columns override when
+// present, otherwise the deployment default), and a width other than
+// UNSPECIFIED. Those rules are enforced by the reader's clustering-key accessor
+// and by the setter (one shared validation), not by record decode. This message
+// can fail decode only by making the record invalid protobuf (a column name
+// that is not valid UTF-8 does); a well-formed but invalid key is reported by
+// the accessor, not by decode.
 message ClusteringKeyConfig {
   repeated string columns = 1;                 // declared typed attribute column names, in key order
   ClusteringBucketWidth bucket_width = 2;
@@ -656,8 +666,9 @@ message TenantConfigRecord {
   // rewrites the record whole and a lagging writer would otherwise strip the new
   // field.
   TypedAttrColumnConfig typed_attr_columns = 12;
-  // Per-tenant clustering key (ADR-2135); absent means no clustering key and
-  // clustering generation 0. Added in format_version 3 under the CAS-mutable
+  // Per-tenant clustering key (ADR-2135); absent means a key was never set, at
+  // clustering generation 0, and present with no columns means the key was
+  // cleared. Added in format_version 3 under the CAS-mutable
   // rule: readers accept version 3 fleet-wide first, and no writer emits this
   // field until the writer flips to 3. A reader that predates it skips the
   // unknown field and reads every earlier field exactly as before, but refuses a

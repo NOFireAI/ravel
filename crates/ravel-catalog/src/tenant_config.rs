@@ -339,7 +339,7 @@ pub enum ClusteringKeyState {
     /// Record field 13 is absent: no key was ever set, clustering generation 0.
     NeverSet,
     /// Field 13 is present with no columns: the key was cleared at `generation`
-    /// (at least 1). Rows are written unkeyed, and the clear outranks every key
+    /// (at least 1). ADR-2135 ranks a clear like a new key, above every key
     /// with a lower generation.
     Cleared { generation: u64 },
     /// Field 13 is present with 1 to [`MAX_CLUSTERING_KEY_COLUMNS`] columns.
@@ -391,8 +391,8 @@ pub struct StoredBloomScope(i32);
 /// A clustering-key or bloom-scope value refused by the accessor or setter
 /// (ADR-2135). Record decode does not raise these: a well-formed but invalid
 /// stored value leaves the rest of the record readable and fails only the
-/// accessor for that field. Decode fails only on bytes that are not a valid
-/// protobuf record, which includes a key column name that is not valid UTF-8.
+/// accessor for that field. A stored key can fail decode only by making the
+/// record invalid protobuf, as a key column name that is not valid UTF-8 does.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum StorageLayoutConfigError {
     /// [`TenantConfig::set_clustering_key`] was given no columns.
@@ -583,11 +583,11 @@ impl TenantConfig {
     /// The tenant's clustering-key state, validated.
     ///
     /// `declared` is the tenant's EFFECTIVE declared typed attribute columns,
-    /// resolved by the caller exactly as typed-column resolution does everywhere
-    /// else: this config's `typed_attr_columns` override when it is `Some`,
-    /// otherwise the deployment default (`--typed-attr-column` on the server).
-    /// This crate does not know the deployment default, so it never reads
-    /// `typed_attr_columns` here.
+    /// resolved by the caller as the server's logs SQL declared-column overlay
+    /// resolves them: this config's `typed_attr_columns` override when it is
+    /// `Some`, otherwise the deployment default (`--typed-attr-column` on the
+    /// server). This crate does not know the deployment default, so this
+    /// accessor does not read `typed_attr_columns`.
     ///
     /// An absent field 13 is [`ClusteringKeyState::NeverSet`], and a present one
     /// with no columns is [`ClusteringKeyState::Cleared`] whatever its bucket
@@ -656,8 +656,9 @@ impl TenantConfig {
     }
 
     /// Clear the clustering key: field 13 stays present with no columns, an
-    /// unspecified bucket width and the stored generation plus one, so the clear
-    /// outranks every earlier key (ADR-2135 decision 1). Refuses with
+    /// unspecified bucket width and the stored generation plus one, the higher
+    /// generation that lets ADR-2135 decision 1 rank the clear above every
+    /// earlier key. Refuses with
     /// [`StorageLayoutConfigError::ClusteringGenerationExhausted`] and
     /// [`StorageLayoutConfigError::WriterCannotEmit`] as
     /// [`TenantConfig::set_clustering_key`] does; on either error the config is
@@ -2832,6 +2833,42 @@ mod tests {
         assert_eq!(
             read.bloom_scope(),
             Err(StorageLayoutConfigError::UnknownBloomScope { got: 42 })
+        );
+    }
+
+    /// A key column name that is not valid UTF-8 makes the record invalid
+    /// protobuf, so it fails record decode rather than the accessor.
+    #[tokio::test]
+    async fn a_key_column_that_is_not_utf8_fails_record_decode() {
+        let mut record = build_record(
+            &tenant(),
+            &TenantConfig::new(TenantLifecycleState::Active),
+            0,
+            0,
+        );
+        record.format_version = 3;
+        record.clustering_key = Some(sysproto::ClusteringKeyConfig {
+            columns: vec!["\u{1}KEY\u{1}".into()],
+            bucket_width: SIX_HOURS,
+            generation: 1,
+        });
+        let mut bytes = record.encode_to_vec();
+        let at = bytes
+            .windows(5)
+            .position(|w| w == b"\x01KEY\x01")
+            .expect("the column name is in the encoding");
+        bytes[at] = 0xFF;
+        let store = mem();
+        store
+            .put(&config_key(&tenant()), bytes.into(), PutOptions::default())
+            .await
+            .expect("seed record");
+        let err = read_config(store.as_ref(), &tenant())
+            .await
+            .expect_err("invalid UTF-8 is invalid protobuf");
+        assert!(
+            matches!(err, TenantConfigError::Decode { .. }),
+            "got: {err}"
         );
     }
 }
