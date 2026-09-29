@@ -1594,20 +1594,20 @@ async fn main() -> anyhow::Result<()> {
                 },
         } => {
             let store = store::build_store(&cli.store)?;
-            let targets = match tenant {
+            let report = match tenant {
                 Some(tenant) => {
-                    rlog_footprint::tenant_object_keys(
+                    let keys = rlog_footprint::tenant_object_keys(
                         std::sync::Arc::clone(&store),
                         cli.store.selection(),
                         &tenant,
                         shards,
                         now_ns()?,
                     )
-                    .await?
+                    .await?;
+                    rlog_footprint::footprint_keys(store.as_ref(), &keys).await?
                 }
-                None => objects,
+                None => rlog_footprint::footprint_targets(store.as_ref(), &objects).await?,
             };
-            let report = rlog_footprint::footprint_targets(store.as_ref(), &targets).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {

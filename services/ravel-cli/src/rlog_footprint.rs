@@ -145,6 +145,31 @@ pub struct FootprintReport {
     pub objects: Vec<ObjectFootprint>,
 }
 
+/// An object whose figures do not add up. The report is refused rather than
+/// printed, since a footprint that does not reconcile does not measure the
+/// object it names.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ReconcileError {
+    /// Section, footer and trailer bytes plus the bytes none of them covers
+    /// differ from the object size, which happens when two extents overlap.
+    #[error(
+        "{object}: sections, footer, trailer and uncovered bytes account for \
+         {accounted_bytes} bytes but the object is {object_bytes} bytes"
+    )]
+    Sections {
+        object: String,
+        accounted_bytes: u64,
+        object_bytes: u64,
+    },
+    /// The stored page bytes PAGE_DIR lists differ from the BLOCKS length.
+    #[error("{object}: PAGE_DIR pages store {page_bytes} bytes but BLOCKS is {blocks_bytes} bytes")]
+    Pages {
+        object: String,
+        page_bytes: u64,
+        blocks_bytes: u64,
+    },
+}
+
 /// Where one object's bytes come from.
 pub enum ObjectSource<'a> {
     Local(&'a Path),
@@ -293,16 +318,63 @@ pub async fn object_footprint(src: &ObjectSource<'_>) -> anyhow::Result<ObjectFo
         );
     }
 
+    let footprint = tally(
+        &footer,
+        footer_start,
+        footer_len,
+        total,
+        &field_dir,
+        &page_dir,
+    );
+    let accounted_bytes = footprint
+        .sections
+        .values()
+        .try_fold(footprint.gap_bytes, |acc, s| acc.checked_add(s.bytes))
+        .unwrap_or(u64::MAX);
+    if accounted_bytes != total {
+        return Err(ReconcileError::Sections {
+            object: label,
+            accounted_bytes,
+            object_bytes: total,
+        }
+        .into());
+    }
+    let page_bytes = footprint.page_stored_bytes();
+    if page_bytes != blocks.len {
+        return Err(ReconcileError::Pages {
+            object: label,
+            page_bytes,
+            blocks_bytes: blocks.len,
+        }
+        .into());
+    }
+
     Ok(ObjectFootprint {
-        key: label.clone(),
+        key: label,
         trailer_version,
         level: footer.level,
-        footprint: tally(&footer, footer_len, total, &field_dir, &page_dir),
+        footprint,
     })
+}
+
+/// The bytes of `[0, total)` that no extent covers. Overlapping extents are
+/// counted once here, so their summed lengths exceed `total - uncovered`.
+fn uncovered_bytes(mut extents: Vec<(u64, u64)>, total: u64) -> u64 {
+    extents.sort_unstable();
+    let mut cursor = 0u64;
+    let mut uncovered = 0u64;
+    for (start, end) in extents {
+        if start > cursor {
+            uncovered += start - cursor;
+        }
+        cursor = cursor.max(end);
+    }
+    uncovered + total.saturating_sub(cursor)
 }
 
 fn tally(
     footer: &LogFooter,
+    footer_start: u64,
     footer_len: u32,
     total: u64,
     field_dir: &FieldDir,
@@ -314,7 +386,10 @@ fn tally(
         total_bytes: total,
         ..Footprint::default()
     };
-    let mut covered = 0u64;
+    let mut extents = vec![
+        (footer_start, total - TRAILER_LEN as u64),
+        (total - TRAILER_LEN as u64, total),
+    ];
     for s in &footer.sections {
         let entry = fp.sections.entry(section_name(s.kind)).or_default();
         entry.count += 1;
@@ -324,7 +399,7 @@ fn tally(
         } else {
             s.uncomp_len
         };
-        covered += s.len;
+        extents.push((s.offset, s.offset.saturating_add(s.len)));
     }
     for (name, len) in [
         ("FOOTER", u64::from(footer_len)),
@@ -338,9 +413,8 @@ fn tally(
                 uncompressed_bytes: len,
             },
         );
-        covered += len;
     }
-    fp.gap_bytes = total.saturating_sub(covered);
+    fp.gap_bytes = uncovered_bytes(extents, total);
 
     for group in &page_dir.groups {
         for chunk in &group.chunks {
@@ -483,8 +557,9 @@ pub async fn tenant_object_keys(
     Ok(keys)
 }
 
-/// Measures every object in `targets`: a target naming an existing local file
-/// is read from disk, any other is an object key in `store`.
+/// Measures every object in `targets`, as given on the command line: a target
+/// naming an existing local file is read from disk, any other is an object key
+/// in `store`.
 pub async fn footprint_targets(
     store: &dyn ObjectStoreBackend,
     targets: &[String],
@@ -498,6 +573,20 @@ pub async fn footprint_targets(
             ObjectSource::Store(store, t)
         };
         objects.push(object_footprint(&src).await?);
+    }
+    Ok(report(objects))
+}
+
+/// Measures every object key in `keys` from `store`, whatever the local
+/// filesystem holds at the same path. This is the form for keys the catalog
+/// resolved.
+pub async fn footprint_keys(
+    store: &dyn ObjectStoreBackend,
+    keys: &[String],
+) -> anyhow::Result<FootprintReport> {
+    let mut objects = Vec::with_capacity(keys.len());
+    for k in keys {
+        objects.push(object_footprint(&ObjectSource::Store(store, k)).await?);
     }
     Ok(report(objects))
 }
