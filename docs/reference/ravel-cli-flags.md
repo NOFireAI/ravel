@@ -55,6 +55,17 @@ _No flags._
 | --- | --- | --- | --- |
 | `<PATH>` |  |  | Local file path or object store key |
 
+### rlog footprint
+
+Attribute every stored byte of RLOG objects to section, column and encoding. Reads each object's trailer, footer, FIELD_DIR and PAGE_DIR by range, never its page bodies
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--json` |  |  | Print the report as one JSON document |
+| `--shards` |  | `4` | Shard count for the `--tenant` catalog resolve |
+| `--tenant` |  |  | Measure every logs data object the catalog resolves for this tenant over all time (live L0 flush and L1 compacted segments) |
+| `<OBJECTS>` |  |  | Local file paths or object store keys to measure |
+
 ## rspan
 
 Inspect an RSPAN span segment (footer, sections, skip index)

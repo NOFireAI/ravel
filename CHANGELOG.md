@@ -558,6 +558,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   CAS probes or an emergency. Claims stay advisory either way: the
   compaction record's `CreateIfAbsent` remains the sole correctness
   mechanism.
+- **`ravel-cli rlog footprint` attributes every stored byte of RLOG objects**
+  (ADR-2135 decision 7, issue #2137). Given object keys, local paths, or
+  `--tenant`, it reads each object's trailer, footer, FIELD_DIR and PAGE_DIR
+  and reports bytes per section (footer and trailer included), stored and
+  uncompressed page bytes and page counts per column, and bytes per encoding
+  per column; `--json` prints the same report as one document. Section bytes
+  plus any bytes no section covers sum to the object size and per-column stored page bytes sum to the BLOCKS
+  length. `rlog inspect` now prints the object's own trailer version rather
+  than the build's constant.
 - **The maintenance loop sweeps alert history older than `--alert-retention`,
   default 90 days** (ADR-1688 follow-up task 2, issue #1688). After upgrade
   the first tick deletes every alert transition older than 90 days except each

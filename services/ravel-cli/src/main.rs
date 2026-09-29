@@ -5,8 +5,8 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use ravel_cli::maintain::SignalArg;
 use ravel_cli::{
-    catalog, hold, idem, maintain, now_ns, parse_max_flush_lifetime_ns, store, tenancy,
-    tenant_token,
+    catalog, hold, idem, maintain, now_ns, parse_max_flush_lifetime_ns, rlog_footprint, store,
+    tenancy, tenant_token,
 };
 use ravel_logseg::block::NumStat;
 use ravel_logseg::field_dir::FieldDir;
@@ -123,8 +123,16 @@ fn command_hashes_tenant(command: &Command) -> bool {
         // `--tenant`, so it needs the bucket's scheme resolved first; the
         // other `commit` variants take an explicit key/path and do not.
         Command::Commit { command } => matches!(command, CommitCommand::Reconstruct { .. }),
+        // `rlog footprint --tenant` resolves the tenant's catalog; given
+        // object keys or paths instead, it hashes nothing.
+        Command::Rlog { command } => matches!(
+            command,
+            RlogCommand::Footprint {
+                tenant: Some(_),
+                ..
+            }
+        ),
         Command::Segment { .. }
-        | Command::Rlog { .. }
         | Command::Rspan { .. }
         | Command::Store { .. }
         | Command::Idem { .. }
@@ -1171,6 +1179,23 @@ enum RlogCommand {
         /// Local file path or object store key.
         path: String,
     },
+    /// Attribute every stored byte of RLOG objects to section, column and
+    /// encoding. Reads each object's trailer, footer, FIELD_DIR and PAGE_DIR
+    /// by range, never its page bodies.
+    Footprint {
+        /// Measure every logs data object the catalog resolves for this
+        /// tenant over all time (live L0 flush and L1 compacted segments).
+        #[arg(long, conflicts_with = "objects", required_unless_present = "objects")]
+        tenant: Option<String>,
+        /// Shard count for the `--tenant` catalog resolve.
+        #[arg(long, default_value_t = 4, requires = "tenant")]
+        shards: u32,
+        /// Print the report as one JSON document.
+        #[arg(long)]
+        json: bool,
+        /// Local file paths or object store keys to measure.
+        objects: Vec<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1558,6 +1583,37 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let bytes = store::read_bytes(&cli.store, &path).await?;
             rlog_inspect(&bytes)
+        }
+        Command::Rlog {
+            command:
+                RlogCommand::Footprint {
+                    tenant,
+                    shards,
+                    json,
+                    objects,
+                },
+        } => {
+            let store = store::build_store(&cli.store)?;
+            let targets = match tenant {
+                Some(tenant) => {
+                    rlog_footprint::tenant_object_keys(
+                        std::sync::Arc::clone(&store),
+                        cli.store.selection(),
+                        &tenant,
+                        shards,
+                        now_ns()?,
+                    )
+                    .await?
+                }
+                None => objects,
+            };
+            let report = rlog_footprint::footprint_targets(store.as_ref(), &targets).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", rlog_footprint::render_text(&report));
+            }
+            Ok(())
         }
         Command::Rspan {
             command: RspanCommand::Inspect { path },
@@ -2641,7 +2697,9 @@ fn rlog_inspect(bytes: &[u8]) -> anyhow::Result<()> {
         .map_err(|err| anyhow::anyhow!("failed to parse rlog segment: {err}"))?;
 
     println!("total_size: {}", bytes.len());
-    println!("version: {}", footer::VERSION);
+    let version = footer::trailer_version(bytes)
+        .map_err(|err| anyhow::anyhow!("failed to parse rlog segment: {err}"))?;
+    println!("version: {version}");
     println!("signal: {}", footer::SIGNAL_LOGS);
     println!("tenant_hash: {}", hex::encode(footer.tenant_hash));
     println!("shard: {}", footer.shard);

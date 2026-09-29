@@ -310,6 +310,73 @@ corrupt SKIP_IDX in particular is loud, not a degrade, because its
 level-0 entries are the only source of block byte ranges and per-block
 checksums.
 
+## `rlog footprint`: where a log segment's bytes go
+
+`rlog footprint` attributes every stored byte of one or more RLOG objects to a
+section, a column, and an encoding. It takes either object keys or local paths,
+or `--tenant <id>`, which measures every logs data object the catalog resolves
+for that tenant over all time (live L0 flush and L1 compacted segments). Per object
+it fetches four ranges: the 16-byte trailer, the footer, FIELD_DIR, and
+PAGE_DIR. It never fetches page bodies, so the cost does not grow with the
+BLOCKS section. `--json` prints the same report as one JSON document, with the
+per-object figures under `objects` and the sums under `total`.
+
+```sh
+ravel-cli rlog footprint a.rlog
+```
+
+```
+object_count: 1
+record_count: 12
+total_bytes: 1123
+gap_bytes: 0
+page_stored_bytes: 264
+objects:
+  a.rlog version=4 level=0 records=12 bytes=1123
+sections:
+  BLOCKS count=1 bytes=264 uncompressed_bytes=264
+  BLOOM count=1 bytes=244 uncompressed_bytes=244
+  FIELD_DIR count=1 bytes=30 uncompressed_bytes=21
+  FOOTER count=1 bytes=188 uncompressed_bytes=188
+  PAGE_DIR count=1 bytes=235 uncompressed_bytes=319
+  SKIP_IDX count=1 bytes=94 uncompressed_bytes=141
+  STREAM_DIR count=1 bytes=52 uncompressed_bytes=50
+  TRAILER count=1 bytes=16 uncompressed_bytes=16
+columns:
+  body type=fixed pages=3 stored_bytes=159 uncompressed_bytes=4144
+    enc=plain pages=3 stored_bytes=159 uncompressed_bytes=4144
+  code type=i64 pages=3 stored_bytes=15 uncompressed_bytes=15
+    enc=delta_zigzag pages=3 stored_bytes=15 uncompressed_bytes=15
+  flags type=fixed pages=3 stored_bytes=3 uncompressed_bytes=3
+    enc=constant pages=3 stored_bytes=3 uncompressed_bytes=3
+  observed_ts type=fixed pages=3 stored_bytes=12 uncompressed_bytes=12
+    enc=for_bitpack pages=3 stored_bytes=12 uncompressed_bytes=12
+  severity_num type=fixed pages=3 stored_bytes=3 uncompressed_bytes=3
+    enc=constant pages=3 stored_bytes=3 uncompressed_bytes=3
+  severity_text type=fixed pages=3 stored_bytes=21 uncompressed_bytes=21
+    enc=dictionary pages=3 stored_bytes=21 uncompressed_bytes=21
+  stream_ref type=fixed pages=3 stored_bytes=3 uncompressed_bytes=3
+    enc=constant pages=3 stored_bytes=3 uncompressed_bytes=3
+  svc type=str pages=3 stored_bytes=36 uncompressed_bytes=36
+    enc=dictionary pages=3 stored_bytes=36 uncompressed_bytes=36
+  ts type=fixed pages=3 stored_bytes=12 uncompressed_bytes=12
+    enc=for_bitpack pages=3 stored_bytes=12 uncompressed_bytes=12
+```
+
+The figures reconcile exactly. The `sections` bytes, including the `FOOTER`
+and `TRAILER` rows, plus `gap_bytes` (bytes no section covers) sum to
+`total_bytes`. `page_stored_bytes`, the sum of every column's `stored_bytes`,
+equals the `BLOCKS` section length. A section's `uncompressed_bytes` is its
+length before whole-section zstd, and equals `bytes` for a `comp=none`
+section. A column's `stored_bytes` is its page bytes as stored (a page of at least
+512 bytes is stored zstd-compressed when that is smaller) and
+`uncompressed_bytes` is the same pages before compression, so the `body` column
+above shows 4144 bytes of text stored in 159. Fixed columns appear by name and
+dynamic columns by their FIELD_DIR name and type; a column PAGE_DIR has no
+chunk for is not listed. A column that
+is absent from some rows carries two pages per block, a presence bitmap
+(`enc=bitmap`) and the values, so its `pages` count is twice the block count.
+
 ## `commit decode`: what a commit record says
 
 ```sh
