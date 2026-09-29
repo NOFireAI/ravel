@@ -969,6 +969,16 @@ pub struct IngestPipelineSnapshot {
     /// signal for the same reason `flushes_queued_total` is: all three
     /// pipelines run the same teardown path.
     pub flush_all_residue_tenants: u64,
+    /// Flushes refused because the raw flush-open reading lagged the store's
+    /// observed clock beyond the clock-skew allowance (ADR-1685). Carried for
+    /// every signal: all three shard actors run the lag check.
+    pub clock_lag_refused: u64,
+    /// Flush-open attempts made before any store-clock observation, so the
+    /// ADR-1685 lag check did not run.
+    pub clock_lag_unchecked: u64,
+    /// Flush-open attempts a teardown drain made with the ADR-1685 lag check
+    /// bypassed on a lagging reading.
+    pub clock_lag_bypassed_at_shutdown: u64,
     /// Per-shard ingest-skew figures (issue #865, ADR-1692), one entry per
     /// shard with recorded activity; an idle shard is simply absent here and
     /// the renderer fills it with zeros. Empty for a pipeline whose router is
@@ -1084,6 +1094,9 @@ impl IngestPipelineSnapshot {
             flushes_queued_total: snapshot.flushes_queued_total,
             flush_trigger_deferred_total: snapshot.flush_trigger_deferred_total,
             flush_all_residue_tenants: snapshot.flush_all_residue_tenants,
+            clock_lag_refused: snapshot.clock_lag_refused,
+            clock_lag_unchecked: snapshot.clock_lag_unchecked,
+            clock_lag_bypassed_at_shutdown: snapshot.clock_lag_bypassed_at_shutdown,
             shard_skew: Vec::new(),
             active_shard_count: 0,
         }
@@ -1128,6 +1141,9 @@ impl IngestPipelineSnapshot {
             flushes_queued_total: snapshot.flushes_queued_total,
             flush_trigger_deferred_total: snapshot.flush_trigger_deferred_total,
             flush_all_residue_tenants: snapshot.flush_all_residue_tenants,
+            clock_lag_refused: snapshot.clock_lag_refused,
+            clock_lag_unchecked: snapshot.clock_lag_unchecked,
+            clock_lag_bypassed_at_shutdown: snapshot.clock_lag_bypassed_at_shutdown,
             shard_skew: Vec::new(),
             active_shard_count: 0,
         }
@@ -1163,6 +1179,9 @@ impl IngestPipelineSnapshot {
             flushes_queued_total: snapshot.flushes_queued_total,
             flush_trigger_deferred_total: snapshot.flush_trigger_deferred_total,
             flush_all_residue_tenants: snapshot.flush_all_residue_tenants,
+            clock_lag_refused: snapshot.clock_lag_refused,
+            clock_lag_unchecked: snapshot.clock_lag_unchecked,
+            clock_lag_bypassed_at_shutdown: snapshot.clock_lag_bypassed_at_shutdown,
             shard_skew: Vec::new(),
             active_shard_count: 0,
         }
@@ -1735,6 +1754,64 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
             "ravel_ingest_flush_all_residue_tenants_total",
             &labels(mode, pipeline.signal),
             pipeline.flush_all_residue_tenants,
+        );
+    }
+
+    // ADR-1685: all three shard actors run the store-clock lag check, so the
+    // three families render a sample for every signal.
+    write_header(
+        out,
+        "ravel_ingest_clock_lag_refused_total",
+        "Flushes refused because the writer's flush-open clock reading lagged the object \
+         store's observed clock by more than the clock-skew allowance (ADR-1685), by signal. \
+         The flush fails with a retryable error and its rows re-buffer; a rise means this \
+         host's clock runs behind the store's and would publish into a sealed ingest hour: fix \
+         the host clock.",
+        "counter",
+    );
+    for pipeline in pipelines {
+        write_sample(
+            out,
+            "ravel_ingest_clock_lag_refused_total",
+            &labels(mode, pipeline.signal),
+            pipeline.clock_lag_refused,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_ingest_clock_lag_unchecked_total",
+        "Flush-open attempts that found no store-clock observation yet, so the ADR-1685 lag \
+         check did not run and the flush proceeded unchecked, by signal. Cumulative: attempts \
+         made before the first store response are expected, so the signal is a value still \
+         growing past a process's first minute against a store that reports a clock.",
+        "counter",
+    );
+    for pipeline in pipelines {
+        write_sample(
+            out,
+            "ravel_ingest_clock_lag_unchecked_total",
+            &labels(mode, pipeline.signal),
+            pipeline.clock_lag_unchecked,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_ingest_clock_lag_bypassed_at_shutdown_total",
+        "Flush-open attempts on a Shutdown or channel-close drain that found a lagging clock \
+         reading and went on with the ADR-1685 lag check bypassed rather than strand \
+         acknowledged buffered rows, by signal. Counts the bypass, not the publication. Those \
+         rows may land in a sealed ingest hour, invisible to token-less reads until a catalog \
+         HEAD rebuild.",
+        "counter",
+    );
+    for pipeline in pipelines {
+        write_sample(
+            out,
+            "ravel_ingest_clock_lag_bypassed_at_shutdown_total",
+            &labels(mode, pipeline.signal),
+            pipeline.clock_lag_bypassed_at_shutdown,
         );
     }
 }
@@ -8258,6 +8335,104 @@ mod tests {
             "conversion must carry the span pipeline's own residue count, not another \
              pipeline's or zero:\n{body}"
         );
+    }
+
+    /// ADR-1685 task 3: the three clock-lag counters render in the ingest
+    /// family for all three signals, each sample carrying its own pipeline's
+    /// own field. The nine values are pairwise distinct, so a swapped field
+    /// (refused rendered from unchecked, say) or a pipeline fed from another
+    /// pipeline's snapshot fails on the exact sample line.
+    #[test]
+    fn clock_lag_counters_render_exactly_once_per_signal_with_their_own_value() {
+        let ingest = vec![
+            IngestPipelineSnapshot::from_metrics(IngestMetricsSnapshot {
+                clock_lag_refused: 11,
+                clock_lag_unchecked: 12,
+                clock_lag_bypassed_at_shutdown: 13,
+                ..Default::default()
+            }),
+            IngestPipelineSnapshot::from_log_metrics(LogIngestMetricsSnapshot {
+                clock_lag_refused: 21,
+                clock_lag_unchecked: 22,
+                clock_lag_bypassed_at_shutdown: 23,
+                ..Default::default()
+            }),
+            IngestPipelineSnapshot::from_span_metrics(SpanIngestMetricsSnapshot {
+                clock_lag_refused: 31,
+                clock_lag_unchecked: 32,
+                clock_lag_bypassed_at_shutdown: 33,
+                ..Default::default()
+            }),
+        ];
+        let body = render(
+            Mode::Gateway,
+            &StoreMetricsSnapshot::default(),
+            &ingest,
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
+            true,
+        );
+
+        let families = [
+            ("ravel_ingest_clock_lag_refused_total", [11, 21, 31]),
+            ("ravel_ingest_clock_lag_unchecked_total", [12, 22, 32]),
+            (
+                "ravel_ingest_clock_lag_bypassed_at_shutdown_total",
+                [13, 23, 33],
+            ),
+        ];
+        for (name, values) in families {
+            assert_eq!(
+                body.matches(&format!("# TYPE {name} counter\n")).count(),
+                1,
+                "{name} must declare its TYPE exactly once, as a counter:\n{body}"
+            );
+            assert_eq!(
+                body.lines()
+                    .filter(|line| line.starts_with(&format!("# HELP {name} ")))
+                    .count(),
+                1,
+                "{name} must carry exactly one HELP line:\n{body}"
+            );
+            let samples: Vec<&str> = body
+                .lines()
+                .filter(|line| line.starts_with(&format!("{name}{{")))
+                .collect();
+            let expected: Vec<String> = ["metrics", "logs", "spans"]
+                .iter()
+                .zip(values)
+                .map(|(signal, value)| {
+                    format!("{name}{{mode=\"gateway\",signal=\"{signal}\"}} {value}")
+                })
+                .collect();
+            assert_eq!(
+                samples, expected,
+                "{name} must render one sample per signal, each with its own pipeline's value"
+            );
+        }
     }
 
     /// Issue #1741: `ravel_ingest_in_flight_flushes` must render for a

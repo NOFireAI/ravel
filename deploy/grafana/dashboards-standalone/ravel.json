@@ -457,6 +457,15 @@
           },
           "legendFormat": "shards condemned",
           "expr": "sum(rate(ravel_ingest_shards_condemned_total[$__rate_interval]))"
+        },
+        {
+          "refId": "F",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "legendFormat": "clock-lag refused flushes",
+          "expr": "sum(rate(ravel_ingest_clock_lag_refused_total[$__rate_interval]))"
         }
       ]
     },
