@@ -691,8 +691,11 @@ static CARRIER_CONFLICTS: AtomicU64 = AtomicU64::new(0);
 /// Call multiplicity, stated rather than deduplicated: one increment per
 /// (declared column, conflicting segment, `partition_statistics` call). Within
 /// one call a column increments at most once, because the first conflicting
-/// segment declines the column and the remaining segments skip it. Across
-/// calls nothing is deduplicated, and DataFusion may call
+/// segment declines the column and the remaining segments skip it. The
+/// plan-time statistics prune (ADR-2121 D1, crate::logs_stats_prune) reads the
+/// same per-segment coverage and adds one increment per `NumRange` arm on the
+/// column it evaluates against a conflicting segment, once per scan it plans.
+/// Across calls nothing is deduplicated, and DataFusion may call
 /// `partition_statistics` several times while building one plan, so N
 /// statements over one defective segment observe some multiple of N. A
 /// per-query dedup is deliberately not built: it would need per-plan state
@@ -1161,6 +1164,13 @@ pub struct LogsScanExec {
     /// metric registration) so a production query pays nothing for a
     /// timeline only the bench reporter reads.
     segment_timing: bool,
+    /// Segments the provider skipped by declared-column statistics before
+    /// building this scan (ADR-2121 D1), published as the
+    /// `segments_pruned_by_stats` counter. Installed with
+    /// [`Self::with_segments_pruned_by_stats`] and carried across every
+    /// rebuild, because the skipped segments are not in [`Self::segments`]
+    /// for a rebuild to recount.
+    segments_pruned_by_stats: usize,
     /// The row count DataFusion's `LimitPushdown` optimizer rule pushed into
     /// this scan (issue #362), installed with [`Self::with_fetch`]. `None`
     /// (the default) reproduces the pre-#362 scan exactly: every segment this
@@ -1551,6 +1561,7 @@ impl LogsScanExec {
         .map(|scan| {
             scan.with_column_stats(self.column_stats.clone())
                 .with_segment_timing(self.segment_timing)
+                .with_segments_pruned_by_stats(self.segments_pruned_by_stats)
                 .with_fetch_pushed(self.fetch)
         })
     }
@@ -1592,6 +1603,7 @@ impl LogsScanExec {
         .map(|scan| {
             scan.with_column_stats(self.column_stats.clone())
                 .with_segment_timing(self.segment_timing)
+                .with_segments_pruned_by_stats(self.segments_pruned_by_stats)
                 .with_fetch_pushed(self.fetch)
         })
     }
@@ -1617,6 +1629,20 @@ impl LogsScanExec {
     /// reproduces the pre-gate scan exactly.
     pub(crate) fn with_segment_timing(mut self, segment_timing: bool) -> Self {
         self.segment_timing = segment_timing;
+        self
+    }
+
+    /// Record how many segments the provider skipped by declared-column
+    /// statistics before building this scan (ADR-2121 D1), and publish the
+    /// figure as the `segments_pruned_by_stats` counter on this scan's metric
+    /// set, where `EXPLAIN ANALYZE` and the executor's `SqlStats` read it.
+    /// Registered at plan time, so a scan that skipped nothing reports `0`
+    /// rather than omitting the counter.
+    pub(crate) fn with_segments_pruned_by_stats(mut self, pruned: usize) -> Self {
+        self.segments_pruned_by_stats = pruned;
+        MetricBuilder::new(&self.metrics)
+            .global_counter("segments_pruned_by_stats")
+            .add(pruned);
         self
     }
 
@@ -1761,6 +1787,7 @@ impl LogsScanExec {
             attr_keys: Arc::new(attr_keys),
             column_stats: None,
             segment_timing: false,
+            segments_pruned_by_stats: 0,
             fetch: None,
             full_schema: full,
             schema,
@@ -2540,6 +2567,7 @@ impl ExecutionPlan for LogsScanExec {
             attr_keys: Arc::clone(&self.attr_keys),
             column_stats: self.column_stats.clone(),
             segment_timing: self.segment_timing,
+            segments_pruned_by_stats: self.segments_pruned_by_stats,
             fetch: limit,
             full_schema: Arc::clone(&self.full_schema),
             schema: Arc::clone(&self.schema),

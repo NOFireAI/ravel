@@ -3272,6 +3272,22 @@ never drop a true result):
   across both `0.0`/`-0.0` bit patterns, never build a bound from a NaN literal),
   which the i64/bool code does not need.
 
+Those same `NumRange` arms also skip whole segments before any fetch
+(ADR-2121 D1). `LogsTableProvider::scan` drops a segment when one arm is
+disjoint from the segment's exact `[min, max]` for its column, taken from the
+`SegmentRef` stamp (ADR-0873) or the `.cstat` entry under the carrier rules the
+declared-column MIN/MAX shortcut uses. A segment that neither carrier covers,
+or whose carriers disagree, is never skipped. A segment whose column is NULL in
+every row is skipped for any arm when its NULL count is proven equal to its row
+count, which today only a stamp proves. `str`/`bytes` equality never skips a
+segment, and neither does a shape `extract_logs` declines. A skipped segment
+costs no GET and is counted as `segments_pruned_by_stats` in the scan's
+`EXPLAIN ANALYZE` metrics and in `SqlStats`. `max_segments` admission still
+counts the whole resolved snapshot, and the distributed coordinator fan-out
+does not skip. `SqlExecutor` skips the `.cstat` load when the analyzed plan's
+filters already carry a prune arm (`logs_column_stats_eligible`), so on a
+filtered scan it is normally the stamp that skips.
+
 ### Declared typed attribute columns (ADR-0090)
 
 An operator can declare a per-tenant set of attribute keys as native typed
