@@ -66,24 +66,10 @@ struct GetCost {
     bytes: u64,
 }
 
-/// The bytes a `declared`-byte section or frame may allocate under a decoder
-/// whose ceiling is `ceiling`: the declared length itself, or 0 when it is
-/// over the ceiling, since the decoder refuses an oversized one before it
-/// allocates anything. Charging the ceiling instead turns that refusal into a
-/// budget refusal whenever the budget has less than the ceiling free, which
-/// reports memory pressure where an oversized section was and replaces the
-/// decoder's own typed error with a retryable one. Charging 0 leaves the
-/// outcome to the decoder only while the budget is within its limit: a budget
-/// already over it (a `reserve_unchecked` caller can put it there) refuses
-/// even a 0-byte reservation.
-fn decoded_charge(declared: u64, ceiling: u64) -> u64 {
-    if declared > ceiling { 0 } else { declared }
-}
-
 /// What a catalog decode is charged before it runs (ADR-1702 decision 6): the
 /// footer-declared `uncompressed_len` of every catalog section the object
-/// carries, each through [`decoded_charge`] against the reader's section
-/// ceiling.
+/// carries, each through [`ravel_memory::decoded_charge`] against the reader's
+/// section ceiling.
 ///
 /// SERIES_META_CHUNKS is the exception, and `meta_chunks_inflated` is what
 /// replaces its footer figure when the chunk directory is readable. That
@@ -112,15 +98,19 @@ fn catalog_decode_len(
         })
         .map(|s| match (s.kind, meta_chunks_inflated) {
             (SECTION_SERIES_META_CHUNKS, Some(inflated)) => inflated,
-            _ => decoded_charge(s.uncompressed_len, limits.max_section_uncompressed_bytes),
+            _ => ravel_memory::decoded_charge(
+                s.uncompressed_len,
+                limits.max_section_uncompressed_bytes,
+            ),
         })
         .fold(0, u64::saturating_add)
 }
 
 /// The bytes SERIES_META_CHUNKS inflates to: the sum of its chunk directory's
 /// `frame_uncompressed_len` (docs/segment-format.md "SERIES_IDX"), each
-/// through [`decoded_charge`] against the reader's section ceiling, since
-/// `decode_catalog_v5_chunked` refuses a larger frame before allocating it.
+/// through [`ravel_memory::decoded_charge`] against the reader's section
+/// ceiling, since `decode_catalog_v5_chunked` refuses a larger frame before
+/// allocating it.
 /// The directory lives in SERIES_IDX, which every chunked path has already
 /// fetched into `regions` before the decode.
 ///
@@ -155,7 +145,7 @@ fn meta_chunks_inflated_len(
     Some(
         index
             .chunk_frame_uncompressed_lens()
-            .map(|len| decoded_charge(len, limits.max_section_uncompressed_bytes))
+            .map(|len| ravel_memory::decoded_charge(len, limits.max_section_uncompressed_bytes))
             .fold(0u64, u64::saturating_add),
     )
 }
@@ -5008,9 +4998,10 @@ mod tests {
     /// Both are asserted here, on the charge each reader computes, rather than
     /// end to end through a fetch that cannot reach one of them.
     ///
-    /// FLIP: make `decoded_charge` return `declared.min(ceiling)` and the frame
-    /// assertion fails first, with `left: Some(12288), right: Some(4096)`: the
-    /// oversized frame charges the ceiling instead of nothing.
+    /// FLIP: make `ravel_memory::decoded_charge` return
+    /// `declared.min(ceiling)` and the frame assertion fails first, with
+    /// `left: Some(12288), right: Some(4096)`: the oversized frame charges the
+    /// ceiling instead of nothing.
     #[test]
     fn a_declared_length_over_the_ceiling_is_charged_nothing() {
         const CEILING: u64 = 8_192;

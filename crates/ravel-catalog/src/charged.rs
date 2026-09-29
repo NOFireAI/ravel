@@ -20,24 +20,8 @@ pub(crate) type ChargedPart = Charged<DecodedPart>;
 /// A decoded postings object and the reservation for its body.
 pub(crate) type ChargedPostings = Charged<DecodedPostings>;
 
-/// The bytes a decode of a `declared`-byte body may allocate under a decoder
-/// whose ceiling is `ceiling`: the declared length itself, or 0 when it is
-/// over the ceiling.
-///
-/// A declared length over the ceiling allocates nothing at all: the decoder
-/// refuses it before it allocates. Charging the ceiling for one turns that
-/// refusal into a budget refusal whenever the budget has less than the ceiling
-/// free, which reports memory pressure where an oversized object was, and
-/// takes the caller down a different path (a resolve fails instead of falling
-/// back to listing) than the decoder's own refusal would. Charging 0 leaves
-/// the outcome to the decoder, except on a budget already over its limit (a
-/// `reserve_unchecked` caller can put it there), which refuses even a 0-byte
-/// reservation.
-pub(crate) fn decoded_charge(declared: u64, ceiling: u64) -> u64 {
-    if declared > ceiling { 0 } else { declared }
-}
-
-/// Reserves [`decoded_charge`] for a decode of a `declared`-byte body.
+/// Reserves [`ravel_memory::decoded_charge`] for a decode of a
+/// `declared`-byte body.
 ///
 /// This is the bare reservation. Every resolve-path decode reaches it through
 /// `Catalog::reserve_decoded` instead (parts and postings directly, column
@@ -48,7 +32,7 @@ pub(crate) fn reserve_decoded(
     declared: u64,
     ceiling: u64,
 ) -> Result<Reservation, MemoryExhausted> {
-    budget.reserve(decoded_charge(declared, ceiling))
+    budget.reserve(ravel_memory::decoded_charge(declared, ceiling))
 }
 
 /// What a decode site reserves its declared output bytes through.
