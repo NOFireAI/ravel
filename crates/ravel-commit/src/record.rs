@@ -108,6 +108,10 @@ pub enum RecordError {
     )]
     InvalidSupersededRecordKey(String),
     #[error(
+        "superseded_record_key {0:?} of a format_version 2 compaction record is not the canonical rendering of the key it parses to"
+    )]
+    NonCanonicalSupersededRecordKey(String),
+    #[error(
         "superseded_record_key names a different bucket than this compaction record: key names \
          (tenant={key_tenant_hex}, signal={key_signal}, shard={key_shard}, hour={key_hour}), \
          record is (tenant={record_tenant_hex}, signal={record_signal}, shard={record_shard}, hour={record_hour})"
@@ -285,11 +289,13 @@ pub fn token_for(record: &CommitRecord) -> Result<CommitToken, RecordError> {
 /// (see [`crate::keys::verify_compaction_record_key`]), not repeated here.
 ///
 /// `superseded_record_key` is set exactly when the record is version 2. A
-/// version 2 record's key must name a compaction record (never a rewrite
-/// record) in this record's own bucket, and its `input_set_hash` must be
+/// version 2 record's key must be the canonical rendering of a compaction
+/// record key (never a rewrite record key) in this record's own bucket, and
+/// its `input_set_hash` must be
 /// [`crate::erasure::compute_superseding_compaction_input_set_hash`] over its
-/// own inputs and that key: the selector excludes whatever a present version 2
-/// record names, so an unchecked value would drop a live record.
+/// own inputs and that key. No selector honours the key yet; once one does it
+/// will exclude whatever a present version 2 record names (ADR-0066 force 2
+/// amendment, item 3), so an unchecked value would then drop a live record.
 pub fn validate_compaction(record: &CompactionRecord) -> Result<(), RecordError> {
     check_format_version(
         RecordKind::Compaction,
@@ -318,6 +324,21 @@ fn validate_superseding_compaction(record: &CompactionRecord) -> Result<(), Reco
     }
     let parsed = keys::parse_compaction_record_key(key)
         .map_err(|_| RecordError::InvalidSupersededRecordKey(key.to_string()))?;
+    // The parser accepts either hex case; only the builder's own rendering
+    // string-equals the key a string-based exclusion will compare against.
+    let canonical = keys::compaction_record_key(
+        &parsed.tenant_hash,
+        parsed.signal,
+        parsed.shard,
+        parsed.ingest_hour_bucket,
+        &parsed.input_set_hash16.to_ascii_lowercase(),
+    )
+    .map_err(|_| RecordError::InvalidSupersededRecordKey(key.to_string()))?;
+    if canonical != key {
+        return Err(RecordError::NonCanonicalSupersededRecordKey(
+            key.to_string(),
+        ));
+    }
     let key_signal = signal::to_proto(parsed.signal) as i32;
     if parsed.tenant_hash.0.as_slice() != record.tenant_hash.as_slice()
         || key_signal != record.signal
@@ -835,6 +856,42 @@ mod tests {
         let record = superseding_compaction();
         let key = compaction_key_in(&record, |p| p.ingest_hour_bucket -= 1);
         assert_bucket_mismatch(decode_superseding_with_key(key));
+    }
+
+    /// `superseding_compaction`'s key with the path segment at `segment`
+    /// uppercased; the tenant (segment 1) and the filename (segment 6) are the
+    /// ones whose hex the parser accepts in either case.
+    fn superseding_key_with_uppercased_segment(segment: usize) -> String {
+        let key = superseding_compaction().superseded_record_key;
+        let mut parts: Vec<String> = key.split('/').map(str::to_string).collect();
+        parts[segment] = if segment == 6 {
+            let file: Vec<&str> = parts[6].split('.').collect();
+            format!("{}.{}.{}", file[0], file[1].to_ascii_uppercase(), file[2])
+        } else {
+            parts[segment].to_ascii_uppercase()
+        };
+        let altered = parts.join("/");
+        assert_ne!(altered, key, "the fixture must contain lowercase hex");
+        assert!(keys::parse_compaction_record_key(&altered).is_ok());
+        altered
+    }
+
+    #[test]
+    fn compaction_v2_naming_an_uppercase_tenant_key_rejected() {
+        let key = superseding_key_with_uppercased_segment(1);
+        assert_eq!(
+            decode_superseding_with_key(key.clone()),
+            Err(RecordError::NonCanonicalSupersededRecordKey(key))
+        );
+    }
+
+    #[test]
+    fn compaction_v2_naming_an_uppercase_hash16_key_rejected() {
+        let key = superseding_key_with_uppercased_segment(6);
+        assert_eq!(
+            decode_superseding_with_key(key.clone()),
+            Err(RecordError::NonCanonicalSupersededRecordKey(key))
+        );
     }
 
     #[test]

@@ -439,9 +439,15 @@ and the CAS read/write helpers.
   rewrite hashes, so its key keeps the `l1.<input_set_hash16>.cmt` shape and
   differs from its predecessor's. Decoding refuses a version 2 record whose
   `superseded_record_key` is empty, is not a compaction record key (a rewrite
-  record key included), names a different tenant, signal, shard or hour
-  bucket, or whose `input_set_hash` is not that hash, and refuses a version 1
-  record that sets the field. No writer produces a version 2 record yet, and
+  record key included), is not the canonical rendering of the key it parses
+  to (lowercase hex in the tenant and `hash16` fields, exactly as
+  `keys::compaction_record_key` renders it), names a different tenant,
+  signal, shard or hour bucket, or whose `input_set_hash` is not that hash,
+  and refuses a version 1 record that sets the field. The seal-divergence
+  check (`catalog verify`, scrub) recomputes each compaction record's hash for
+  its own version: the version 1 hash over `inputs` for a version 1 record,
+  the version 2 hash over `(inputs, superseded_record_key)` for a version 2
+  record. No writer produces a version 2 record yet, and
   resolution does not yet honour its supersession; both are later steps of
   the amendment's task list.
 - Selective-erasure request and completion records (ADR-0064 decision 1) live

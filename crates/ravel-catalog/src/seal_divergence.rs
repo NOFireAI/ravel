@@ -27,7 +27,9 @@ use std::collections::{BTreeMap, HashSet};
 
 #[cfg(test)]
 use prost::Message;
-use ravel_commit::erasure::compute_compaction_input_set_hash;
+use ravel_commit::erasure::{
+    compute_compaction_input_set_hash, compute_superseding_compaction_input_set_hash,
+};
 use ravel_commit::keys::{self, KeyError};
 use ravel_commit::record::{self, RecordError};
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
@@ -313,17 +315,24 @@ pub async fn verify_seal_divergence(
                         source,
                     }
                 })?;
-                // The loader above only checks the record's key and that it
-                // protobuf-decodes; neither confirms `inputs` is what the
-                // record's own `input_set_hash` names. Recompute the
-                // canonical hash from `rec.inputs` and compare before
-                // trusting a single one of them to suppress an L0 entry from
-                // the ground truth: a mismatch means the record is corrupt
-                // or forged (never a routine condition, since every writer
-                // of a real compaction record computes this hash the same
-                // way), and failing loud here is what makes `catalog verify`
-                // notice instead of silently under-checking real L0 entries.
-                let computed = compute_compaction_input_set_hash(&rec.inputs);
+                // Recompute the record's hash for its own format_version
+                // before trusting a single input to suppress an L0 entry from
+                // the ground truth: the version 1 hash over `inputs` for a
+                // version 1 record, the version 2 hash over `inputs` and
+                // `superseded_record_key` for a version 2 record. A mismatch
+                // under that per-version rule means the record is corrupt or
+                // forged, and failing loud here is what makes `catalog
+                // verify` notice instead of silently under-checking real L0
+                // entries.
+                let computed =
+                    if rec.format_version == record::COMPACTION_SUPERSEDING_FORMAT_VERSION {
+                        compute_superseding_compaction_input_set_hash(
+                            &rec.inputs,
+                            &rec.superseded_record_key,
+                        )
+                    } else {
+                        compute_compaction_input_set_hash(&rec.inputs)
+                    };
                 if rec.input_set_hash.as_slice() != computed.as_slice() {
                     return Err(SealDivergenceError::CompactionInputSetHashMismatch {
                         key: object.key.clone(),
@@ -516,6 +525,21 @@ mod tests {
         created_unix_ns: i64,
         forged_hash: Option<[u8; 32]>,
     ) -> String {
+        let mut record = compaction_record(tenant, ingest_hour_bucket, inputs, created_unix_ns);
+        if let Some(forged) = forged_hash {
+            record.input_set_hash = forged.to_vec();
+        }
+        put_compaction_record(store, &record).await
+    }
+
+    /// A version 1 compaction record over `inputs` in `(shard 0,
+    /// ingest_hour_bucket)` with one L1 part and the canonical version 1 hash.
+    fn compaction_record(
+        tenant: &str,
+        ingest_hour_bucket: u32,
+        inputs: &[&ravel_proto::commit::v1::CommitRecord],
+        created_unix_ns: i64,
+    ) -> ravel_proto::commit::v1::CompactionRecord {
         use ravel_commit::signal;
         use ravel_proto::commit::v1::{CompactionInputIdentity, CompactionPart, CompactionRecord};
 
@@ -528,8 +552,7 @@ mod tests {
                 writer_seq: r.writer_seq,
             })
             .collect();
-        let input_set_hash =
-            forged_hash.unwrap_or_else(|| compute_compaction_input_set_hash(&input_ids));
+        let input_set_hash = compute_compaction_input_set_hash(&input_ids);
         let part_payload = format!("l1-{ingest_hour_bucket}").into_bytes();
         let part_content_hash = *blake3::hash(&part_payload).as_bytes();
         let part = CompactionPart {
@@ -546,7 +569,7 @@ mod tests {
             segment_format_version: 3,
             declared_column_stats: Vec::new(),
         };
-        let record = CompactionRecord {
+        CompactionRecord {
             format_version: 1,
             tenant_hash: tenant_hash.0.to_vec(),
             signal: signal::to_proto(Signal::Metrics).into(),
@@ -558,8 +581,37 @@ mod tests {
             parts: vec![part],
             created_unix_ns,
             superseded_record_key: String::new(),
-        };
-        let key = keys::compaction_record_key_for(&record).expect("compaction key");
+        }
+    }
+
+    /// A version 2 record re-encoding `predecessor`: same bucket and inputs,
+    /// the predecessor's key in `superseded_record_key`, and the version 2
+    /// hash over both.
+    fn superseding_compaction_record(
+        predecessor: ravel_proto::commit::v1::CompactionRecord,
+    ) -> ravel_proto::commit::v1::CompactionRecord {
+        let superseded_record_key =
+            keys::compaction_record_key_for(&predecessor).expect("predecessor key");
+        let input_set_hash = ravel_commit::erasure::compute_superseding_compaction_input_set_hash(
+            &predecessor.inputs,
+            &superseded_record_key,
+        );
+        ravel_proto::commit::v1::CompactionRecord {
+            format_version: record::COMPACTION_SUPERSEDING_FORMAT_VERSION,
+            input_set_hash: input_set_hash.to_vec(),
+            superseded_record_key,
+            created_unix_ns: predecessor.created_unix_ns + 1,
+            ..predecessor
+        }
+    }
+
+    /// Write `record` at its own key, bypassing encode-side validation so a
+    /// fixture can store a record the decoder refuses.
+    async fn put_compaction_record(
+        store: &MemoryStore,
+        record: &ravel_proto::commit::v1::CompactionRecord,
+    ) -> String {
+        let key = keys::compaction_record_key_for(record).expect("compaction key");
         store
             .put(
                 &key,
@@ -866,6 +918,69 @@ mod tests {
                 );
             }
             other => panic!("expected CompactionInputSetHashMismatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_version_two_compaction_record_passes() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "superseding";
+        let now = 600_000 * NS_PER_HOUR;
+        let created = now - SEALED_AGE_NS;
+        let hour = u32::try_from(created / NS_PER_HOUR).expect("fits u32");
+
+        let l0 = publish_segment(store.as_ref(), tenant, 1, created).await;
+        let v2 = superseding_compaction_record(compaction_record(tenant, hour, &[&l0], created));
+        put_compaction_record(store.as_ref(), &v2).await;
+        fold(store.clone(), tenant, now).await;
+
+        let report = verify_seal_divergence(
+            store.as_ref(),
+            &TenantId::new(tenant).hash(),
+            Signal::Metrics,
+        )
+        .await
+        .expect("a valid version 2 record's stored hash is the version 2 hash")
+        .expect("HEAD present after fold");
+        assert!(!report.has_divergence());
+        assert!(report.missing.is_empty());
+        assert!(report.mismatched.is_empty());
+        assert!(report.orphaned.is_empty());
+        assert_eq!(report.snapshot_entry_count, 1, "the L1 part is counted");
+        assert_eq!(
+            report.sealed_record_count, 0,
+            "the version 2 record's input is excluded from the ground truth"
+        );
+    }
+
+    #[tokio::test]
+    async fn version_two_compaction_record_carrying_the_version_one_hash_is_refused() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "superseding-v1-hash";
+        let now = 600_000 * NS_PER_HOUR;
+        let created = now - SEALED_AGE_NS;
+        let hour = u32::try_from(created / NS_PER_HOUR).expect("fits u32");
+
+        let l0 = publish_segment(store.as_ref(), tenant, 1, created).await;
+        fold(store.clone(), tenant, now).await;
+        let mut v2 =
+            superseding_compaction_record(compaction_record(tenant, hour, &[&l0], created));
+        v2.input_set_hash = compute_compaction_input_set_hash(&v2.inputs).to_vec();
+        let record_key = put_compaction_record(store.as_ref(), &v2).await;
+
+        let err = verify_seal_divergence(
+            store.as_ref(),
+            &TenantId::new(tenant).hash(),
+            Signal::Metrics,
+        )
+        .await
+        .expect_err("a version 2 record carrying the version 1 hash must not pass");
+        match &err {
+            SealDivergenceError::CompactionRecordCorrupt { key, source } => {
+                assert_eq!(key, &record_key);
+                assert_eq!(source, &RecordError::SupersedingInputSetHashMismatch);
+            }
+            other => panic!("expected CompactionRecordCorrupt, got {other:?}"),
         }
     }
 
