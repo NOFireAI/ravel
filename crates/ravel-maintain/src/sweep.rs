@@ -2169,10 +2169,12 @@ async fn load_chain_link(store: &dyn ObjectStoreBackend, key: &str) -> Result<Op
     }
 }
 
-/// The most records on one supersession chain, counting the record it is
-/// entered from: the bound the catalog's resolver puts on the same chains, so
-/// a chain the resolver refuses as too deep is refused here too rather than
-/// walked further.
+/// The most records one supersession chain walk charges, counting the record
+/// it is entered from, which is the bound the catalog puts on the same chains.
+/// The charge follows the catalog's walks exactly (see
+/// [`ChainEntry::charges`]), so a chain is refused here exactly when the
+/// catalog refuses it: a stricter bound would fail the whole shard's pass over
+/// a chain every resolve accepts.
 const MAX_CHAIN_DEPTH: usize = 64;
 
 /// Which record a [`gather_superseded_chain`] walk starts from.
@@ -2192,6 +2194,20 @@ enum ChainEntry {
 impl ChainEntry {
     fn gathers_raw_l0_inputs(self) -> bool {
         matches!(self, ChainEntry::Rewrite)
+    }
+
+    /// Whether a present `link` on this walk counts toward [`MAX_CHAIN_DEPTH`].
+    /// An absent record never does. The rewrite chase gives a version 1
+    /// compaction record no iteration of its own, since it ends the chase in
+    /// the iteration of the record naming it; the version 2 chain walk gives
+    /// every present record one, the version 1 record at its end included.
+    fn charges(self, link: &ChainLink) -> bool {
+        match self {
+            ChainEntry::Rewrite => {
+                !matches!(link, ChainLink::Compaction(r) if r.superseded_record_key.is_empty())
+            }
+            ChainEntry::Version2 => true,
+        }
     }
 }
 
@@ -2230,8 +2246,9 @@ impl ChainEntry {
 /// join the group; the missing generation is a compaction record, which
 /// applied no request, so the chain is not truncated. Under
 /// [`ChainEntry::Version2`] no raw L0 input joins the group at all. The walk is
-/// bounded by [`MAX_CHAIN_DEPTH`] records and checked for a revisit, so a cycle
-/// or an over-deep chain is an error, never a guess.
+/// bounded by [`MAX_CHAIN_DEPTH`], charged as the catalog charges the same
+/// chain ([`ChainEntry::charges`]), and checked for a revisit, so a cycle or an
+/// over-deep chain is an error, never a guess.
 async fn gather_superseded_chain(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
@@ -2249,6 +2266,9 @@ async fn gather_superseded_chain(
     let mut request_ids: BTreeSet<String> = BTreeSet::new();
     let mut truncated = false;
     let mut seen: HashSet<String> = HashSet::new();
+    // The record the chain is entered from is charged, though it is not on
+    // this walk.
+    let mut depth = 1usize;
     let mut cursor = Some(predecessor_key.to_string());
     // The version 2 record the walk just stepped past, whose raw L0 inputs
     // end the chain if the record it names is gone.
@@ -2258,13 +2278,6 @@ async fn gather_superseded_chain(
         if !seen.insert(key.clone()) {
             return Err(MaintainError::Invariant(format!(
                 "supersession chain from {predecessor_key} revisits {key}"
-            )));
-        }
-        // `>=`: the record the chain is entered from counts toward the bound,
-        // as it does in the catalog's walk, but is not itself on this walk.
-        if seen.len() >= MAX_CHAIN_DEPTH {
-            return Err(MaintainError::Invariant(format!(
-                "supersession chain from {predecessor_key} is longer than {MAX_CHAIN_DEPTH} records"
             )));
         }
         let Some(link) = load_chain_link(store, &key).await? else {
@@ -2285,6 +2298,15 @@ async fn gather_superseded_chain(
             }
             break;
         };
+        if entry.charges(&link) {
+            if depth >= MAX_CHAIN_DEPTH {
+                return Err(MaintainError::Invariant(format!(
+                    "supersession chain from {predecessor_key} is longer than {MAX_CHAIN_DEPTH} \
+                     records"
+                )));
+            }
+            depth += 1;
+        }
         if entry == ChainEntry::Version2 && !matches!(link, ChainLink::Compaction(_)) {
             return Err(MaintainError::Invariant(format!(
                 "version 2 compaction supersession chain from {predecessor_key} reaches \
@@ -5868,5 +5890,248 @@ mod tests {
             present(&store, &key).await,
             "a failed superseded pass deletes nothing from the bucket"
         );
+    }
+
+    /// What a depth-boundary chain ends in.
+    #[derive(Debug, Clone, Copy)]
+    enum ChainEnd {
+        PresentVersion1,
+        Absent,
+    }
+
+    const DEPTH_SHARD: u32 = 0;
+
+    /// The version 1 record at the bottom of a depth-boundary chain, put and
+    /// added to `present` unless `end` is [`ChainEnd::Absent`]. Returns its key
+    /// and the record.
+    async fn put_chain_bottom(
+        store: &MemoryStore,
+        end: ChainEnd,
+        present: &mut Vec<(String, CompactionRecord)>,
+    ) -> (String, CompactionRecord) {
+        let record = CompactionRecord {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Logs).into(),
+            shard: DEPTH_SHARD,
+            ingest_hour_bucket: 1,
+            level: 1,
+            inputs: vec![CompactionInputIdentity {
+                writer_id: Uuid::from_u128(1).to_string(),
+                writer_epoch: 1,
+                writer_seq: 1,
+            }],
+            input_set_hash: vec![0x11; 32],
+            ..Default::default()
+        };
+        let key = keys::compaction_record_key_for(&record).expect("key");
+        if matches!(end, ChainEnd::PresentVersion1) {
+            store
+                .put(
+                    &key,
+                    record::encode_compaction(&record),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("seed put");
+            present.push((key.clone(), record.clone()));
+        }
+        (key, record)
+    }
+
+    /// `rewrites` rewrite records, each naming the one below, over a chain
+    /// bottom. Returns the rewrites bottom first and the compaction records
+    /// present.
+    async fn put_rewrite_chain(
+        store: &MemoryStore,
+        rewrites: usize,
+        end: ChainEnd,
+    ) -> (
+        Vec<(String, RewriteRecord)>,
+        Vec<(String, CompactionRecord)>,
+    ) {
+        let mut compactions = Vec::new();
+        let (mut below, _) = put_chain_bottom(store, end, &mut compactions).await;
+        let mut out = Vec::with_capacity(rewrites);
+        for i in 0..rewrites {
+            let request_id = Uuid::from_u128(i as u128 + 1).to_string();
+            let record = RewriteRecord {
+                format_version: 1,
+                tenant_hash: tenant().0.to_vec(),
+                signal: ravel_commit::signal::to_proto(Signal::Logs).into(),
+                shard: DEPTH_SHARD,
+                ingest_hour_bucket: 1,
+                inputs: Vec::new(),
+                input_set_hash: ravel_commit::erasure::compute_rewrite_input_set_hash(
+                    &[],
+                    Some(&below),
+                    std::slice::from_ref(&request_id),
+                )
+                .to_vec(),
+                parts: Vec::new(),
+                drops: vec![ravel_proto::commit::v1::RewriteDrop {
+                    request_id,
+                    dropped_count: 1,
+                }],
+                created_unix_ns: 0,
+                superseded_record_key: below.clone(),
+            };
+            let key = keys::rewrite_record_key_for(&record).expect("key");
+            store
+                .put(
+                    &key,
+                    ravel_commit::erasure::encode_rewrite(&record),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("seed put");
+            below = key.clone();
+            out.push((key, record));
+        }
+        (out, compactions)
+    }
+
+    /// `version_2s` version 2 records, each naming the one below, over a
+    /// chain bottom. Returns every present compaction record, bottom first.
+    async fn put_version_2_chain(
+        store: &MemoryStore,
+        version_2s: usize,
+        end: ChainEnd,
+    ) -> Vec<(String, CompactionRecord)> {
+        let mut out = Vec::new();
+        let (mut below, bottom) = put_chain_bottom(store, end, &mut out).await;
+        for _ in 0..version_2s {
+            let record = CompactionRecord {
+                format_version: 2,
+                input_set_hash:
+                    ravel_commit::erasure::compute_superseding_compaction_input_set_hash(
+                        &bottom.inputs,
+                        &below,
+                    )
+                    .to_vec(),
+                superseded_record_key: below.clone(),
+                ..bottom.clone()
+            };
+            let key = keys::compaction_record_key_for(&record).expect("key");
+            store
+                .put(
+                    &key,
+                    record::encode_compaction(&record),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("seed put");
+            below = key.clone();
+            out.push((key, record));
+        }
+        out
+    }
+
+    fn assert_refused_as_too_deep(result: Result<Vec<SupersededGroup>>, case: &str) {
+        match result {
+            Err(MaintainError::Invariant(msg)) => {
+                assert!(msg.contains("longer than 64 records"), "{case}: {msg}")
+            }
+            Err(other) => panic!("{case}: expected the depth refusal, got {other:?}"),
+            Ok(_) => panic!("{case}: expected the depth refusal, the walk was accepted"),
+        }
+    }
+
+    /// The chain walk's depth bound accepts and refuses exactly the chains the
+    /// catalog's walks do, at the last accepted depth and one past it: a
+    /// rewrite chain as `resolve_rewrite_supersession` charges it (the
+    /// entered-from rewrite and every rewrite below it; neither the version 1
+    /// record ending it nor an absent record), and a version 2 chain as the
+    /// selector charges it (the head and every present record below it, the
+    /// version 1 record included; not an absent one). Each case asks the
+    /// catalog too, so the expectation is the catalog's answer and not only
+    /// this test's reading of it.
+    ///
+    /// Flipped line: the depth check in `gather_superseded_chain` restored to
+    /// `if seen.len() >= MAX_CHAIN_DEPTH` before the record is loaded. The
+    /// rewrite chain ending in a version 1 record is then refused at its last
+    /// accepted depth, as is each chain ending in an absent record.
+    #[tokio::test]
+    async fn chain_walk_depth_bound_matches_the_catalog_exactly() {
+        for end in [ChainEnd::PresentVersion1, ChainEnd::Absent] {
+            // R plus 63 rewrites plus the end: 64 rewrites charged.
+            for (rewrites, accepted) in [(MAX_CHAIN_DEPTH, true), (MAX_CHAIN_DEPTH + 1, false)] {
+                let case = format!("{rewrites} rewrites over {end:?}");
+                let store = MemoryStore::new();
+                let (chain, compactions) = put_rewrite_chain(&store, rewrites, end).await;
+                let (top_key, top) = chain.last().expect("a rewrite");
+                let compaction_by_key: HashMap<&str, &CompactionRecord> =
+                    compactions.iter().map(|(k, r)| (k.as_str(), r)).collect();
+                let rewrite_by_key: HashMap<&str, &RewriteRecord> =
+                    chain.iter().map(|(k, r)| (k.as_str(), r)).collect();
+                let catalog = ravel_catalog::resolve_rewrite_supersession(
+                    top_key,
+                    top,
+                    "bucket",
+                    &compaction_by_key,
+                    &rewrite_by_key,
+                    &mut HashSet::new(),
+                    &mut HashSet::new(),
+                );
+                assert_eq!(catalog.is_ok(), accepted, "catalog, {case}: {catalog:?}");
+                let walked = gather_superseded_chain(
+                    &store,
+                    &tenant(),
+                    Signal::Logs,
+                    DEPTH_SHARD,
+                    &top.superseded_record_key,
+                    ChainEntry::Rewrite,
+                )
+                .await;
+                if accepted {
+                    let groups = walked.expect(&case);
+                    assert_eq!(groups.len(), 1, "{case}");
+                    let expected = rewrites - 1 + compactions.len();
+                    assert_eq!(groups[0].chain_record_keys.len(), expected, "{case}");
+                } else {
+                    assert_refused_as_too_deep(walked, &case);
+                }
+            }
+
+            // The head plus 63 present records below it, with an absent
+            // record past them or not.
+            let last_accepted = match end {
+                ChainEnd::PresentVersion1 => MAX_CHAIN_DEPTH - 1,
+                ChainEnd::Absent => MAX_CHAIN_DEPTH,
+            };
+            for (version_2s, accepted) in [(last_accepted, true), (last_accepted + 1, false)] {
+                let case = format!("{version_2s} version 2 records over {end:?}");
+                let store = MemoryStore::new();
+                let records = put_version_2_chain(&store, version_2s, end).await;
+                let catalog = select_authoritative_compaction_records(&records);
+                assert_eq!(
+                    catalog.is_ok(),
+                    accepted,
+                    "catalog, {case}: {:?}",
+                    catalog.err()
+                );
+                let (_, head) = records.last().expect("a version 2 record");
+                let walked = gather_superseded_chain(
+                    &store,
+                    &tenant(),
+                    Signal::Logs,
+                    DEPTH_SHARD,
+                    &head.superseded_record_key,
+                    ChainEntry::Version2,
+                )
+                .await;
+                if accepted {
+                    let groups = walked.expect(&case);
+                    assert_eq!(groups.len(), 1, "{case}");
+                    assert_eq!(
+                        groups[0].chain_record_keys.len(),
+                        records.len() - 1,
+                        "{case}"
+                    );
+                } else {
+                    assert_refused_as_too_deep(walked, &case);
+                }
+            }
+        }
     }
 }

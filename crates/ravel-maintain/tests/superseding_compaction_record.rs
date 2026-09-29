@@ -1152,3 +1152,218 @@ async fn migrate_reaudit_refuses_a_version_2_record_with_other_inputs() {
         "{message}"
     );
 }
+
+fn rewrite_key(record: &RewriteRecord) -> String {
+    keys::rewrite_record_key_for(record).unwrap()
+}
+
+fn rewrite_part_key(record: &RewriteRecord) -> String {
+    keys::reconstruct_rewrite_part_key(record, &record.parts[0]).unwrap()
+}
+
+/// The state C2's chain group leaves behind while a HEAD still names the raw
+/// inputs (as in [`sweep_holds_a_head_named_raw_input_apart_from_the_predecessor`]):
+/// C1 is gone, and C2, which re-encodes it, and C1's raw inputs are present.
+/// The erasure pass then writes R naming C2. Past every horizon with no HEAD,
+/// R's walk runs to C2, finds C1 absent, and ends in C2's raw inputs: the two
+/// raw commits, their data objects, C2 and its part go, and a resolve serves
+/// R's part alone before the pass and after it.
+///
+/// Flipped line: the `Some(above)` arm of `version_2_above.take()` in
+/// `gather_superseded_chain` (sweep.rs) replaced with `truncated = true`. The
+/// raw inputs then survive C2, R's chase stops at the absent C2 and excludes
+/// nothing, and they are served beside R's part, erased subject included.
+#[tokio::test]
+async fn sweep_ends_a_rewrite_chain_in_the_raw_inputs_under_a_version_2_link() {
+    let store = Arc::new(MemoryStore::new());
+    let b = logs_bucket();
+    let base = hour_ns();
+    let inputs = seed_inputs(store.as_ref(), &[(0x75, 1), (0x76, 2)]).await;
+    let c1 = version_1(
+        &b,
+        vec![input(0x75, 1), input(0x76, 2)],
+        0x00,
+        part(0xc1, base, base + 10_000),
+    );
+    // Never put: C2's chain group already reclaimed it.
+    let c1_key = keys::compaction_record_key_for(&c1).unwrap();
+    let c2 = version_2(
+        &c1,
+        &c1_key,
+        c1.inputs.clone(),
+        part(0xc2, base, base + 10_000),
+    );
+    let c2_key = put_compaction(store.as_ref(), &c2).await;
+    let r = put_rewrite(
+        store.as_ref(),
+        &b,
+        &c2_key,
+        Uuid::from_u128(0xd7),
+        part(0x0e, base, base + 10_000),
+    )
+    .await;
+    let r_part = rewrite_part_key(&r);
+    assert_eq!(
+        served_keys(&store, past_horizon_ns()).await,
+        BTreeSet::from([r_part.clone()])
+    );
+
+    let deleted = sweep_everything(store.as_ref(), &b).await;
+    assert_eq!(
+        served_keys(&store, past_horizon_ns()).await,
+        BTreeSet::from([r_part.clone()])
+    );
+    let mut expected: BTreeSet<String> = inputs
+        .iter()
+        .flat_map(|(commit, data)| [commit.clone(), data.clone()])
+        .collect();
+    expected.extend([c2_key, part_key(&c2)]);
+    assert_eq!(deleted, expected);
+    assert_eq!(
+        all_keys(store.as_ref()).await,
+        BTreeSet::from([rewrite_key(&r), r_part])
+    );
+}
+
+/// A rule 2 pass over `mem` whose deletes of `failing_key` time out: the pass
+/// fails, and the fault fired exactly once.
+async fn sweep_failing_delete_of(mem: &Arc<MemoryStore>, b: &Bucket, failing_key: &str) {
+    let plan = FaultPlan::empty()
+        .with_rule(Rule::new(Op::Delete, ScriptedFault::Timeout).with_key_contains(failing_key));
+    let store = FaultStore::new(mem.clone(), plan);
+    let result = sweep_superseded(
+        &store,
+        &FixedClock::new(past_horizon_ns()),
+        &cfg(),
+        &NoLeases,
+        &b.tenant_hash,
+        b.signal,
+        b.shard,
+    )
+    .await;
+    assert!(result.is_err(), "the failed record delete fails the pass");
+    assert_eq!(store.fault_count(Op::Delete, FaultKind::Timeout), 1);
+}
+
+/// R2 over R1 over C1, with a version 2 C2 naming C1 that the rewrites
+/// dominate. R2's group deletes C2 ahead of the chain's own records, so a
+/// delete of C2 that fails leaves every record in place (only the parts are
+/// gone) and a resolve still serves R2's part alone. A clean pass afterwards
+/// finishes the group.
+///
+/// Flipped line: `joined_keys.append(&mut group.chain_record_keys)` in
+/// `Version2Groups::join_dominated` (sweep.rs) turned around, so the joined
+/// records follow the chain's own. C1 and R1 then go before the failed delete
+/// of C2, R2 names an absent R1, C2 names a key no rewrite chain reaches and
+/// is no longer dominated, and the resolve serves C2's part beside R2's.
+#[tokio::test]
+async fn sweep_deletes_a_dominated_record_before_the_rewrite_chain_it_joins() {
+    let mem = Arc::new(MemoryStore::new());
+    let b = logs_bucket();
+    let base = hour_ns();
+    let c1 = version_1(&b, vec![input(0xE5, 1)], 0xff, part(0xc1, base, base + 10));
+    let c1_key = put_compaction(mem.as_ref(), &c1).await;
+    let c2 = version_2(&c1, &c1_key, c1.inputs.clone(), part(0xc2, base, base + 10));
+    let c2_key = put_compaction(mem.as_ref(), &c2).await;
+    let r1 = put_rewrite(
+        mem.as_ref(),
+        &b,
+        &c1_key,
+        Uuid::from_u128(0xe1),
+        part(0x1e, base, base + 10),
+    )
+    .await;
+    let r2 = put_rewrite(
+        mem.as_ref(),
+        &b,
+        &rewrite_key(&r1),
+        Uuid::from_u128(0xe2),
+        part(0x2e, base, base + 10),
+    )
+    .await;
+    let r2_part = rewrite_part_key(&r2);
+    assert_eq!(
+        served_keys(&mem, past_horizon_ns()).await,
+        BTreeSet::from([r2_part.clone()])
+    );
+
+    sweep_failing_delete_of(&mem, &b, &c2_key).await;
+    assert_eq!(
+        served_keys(&mem, past_horizon_ns()).await,
+        BTreeSet::from([r2_part.clone()])
+    );
+    assert_eq!(
+        bucket_keys(mem.as_ref()).await,
+        BTreeSet::from([
+            c1_key,
+            c2_key,
+            rewrite_key(&r1),
+            rewrite_key(&r2),
+            r2_part.clone(),
+        ])
+    );
+
+    let outcome = sweep_at(mem.as_ref(), &b, past_horizon_ns(), &NoLeases).await;
+    assert_eq!((outcome.records_deleted, outcome.data_deleted), (3, 3));
+    assert_eq!(
+        bucket_keys(mem.as_ref()).await,
+        BTreeSet::from([rewrite_key(&r2), r2_part])
+    );
+}
+
+/// A version 2 C3 over a version 2 C2 over C1, with a rewrite R naming C1, so
+/// both version 2 records are dominated and join R's group. The newer C3 is
+/// deleted first, so a delete of C3 that fails leaves every record in place
+/// and a resolve still serves R's part alone.
+///
+/// Flipped line: `joined.into_iter().rev()` in `Version2Groups::join_dominated`
+/// (sweep.rs) without the `.rev()`. C2 then goes before the failed delete of
+/// C3, which is left naming an absent C2 that no rewrite chain reaches, is no
+/// longer dominated, and outranks C1 in their overlap component, so the
+/// resolve serves C3's part beside R's.
+#[tokio::test]
+async fn sweep_deletes_dominated_records_newest_first() {
+    let mem = Arc::new(MemoryStore::new());
+    let b = logs_bucket();
+    let base = hour_ns();
+    let c1 = version_1(&b, vec![input(0xE6, 1)], 0xff, part(0xc1, base, base + 10));
+    let c1_key = put_compaction(mem.as_ref(), &c1).await;
+    let c2 = version_2(&c1, &c1_key, c1.inputs.clone(), part(0xc2, base, base + 10));
+    let c2_key = put_compaction(mem.as_ref(), &c2).await;
+    let c3 = version_2(&c2, &c2_key, c2.inputs.clone(), part(0xc3, base, base + 10));
+    let c3_key = put_compaction(mem.as_ref(), &c3).await;
+    assert!(
+        c3.input_set_hash < c1.input_set_hash,
+        "C3 must outrank C1 once it is not dominated"
+    );
+    let r = put_rewrite(
+        mem.as_ref(),
+        &b,
+        &c1_key,
+        Uuid::from_u128(0xe3),
+        part(0x3e, base, base + 10),
+    )
+    .await;
+    let r_part = rewrite_part_key(&r);
+    assert_eq!(
+        served_keys(&mem, past_horizon_ns()).await,
+        BTreeSet::from([r_part.clone()])
+    );
+
+    sweep_failing_delete_of(&mem, &b, &c3_key).await;
+    assert_eq!(
+        served_keys(&mem, past_horizon_ns()).await,
+        BTreeSet::from([r_part.clone()])
+    );
+    assert_eq!(
+        bucket_keys(mem.as_ref()).await,
+        BTreeSet::from([c1_key, c2_key, c3_key, rewrite_key(&r), r_part.clone()])
+    );
+
+    let outcome = sweep_at(mem.as_ref(), &b, past_horizon_ns(), &NoLeases).await;
+    assert_eq!((outcome.records_deleted, outcome.data_deleted), (3, 3));
+    assert_eq!(
+        bucket_keys(mem.as_ref()).await,
+        BTreeSet::from([rewrite_key(&r), r_part])
+    );
+}
