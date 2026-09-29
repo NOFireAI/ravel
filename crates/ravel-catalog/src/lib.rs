@@ -106,5 +106,6 @@ pub use tenant_config::{
     StoredClusteringKey, TENANT_CONFIG_FORMAT_VERSION, TENANT_CONFIG_MAX_READ_VERSION,
     TENANT_CONFIG_MIN_READ_VERSION, TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION, TenantConfig,
     TenantConfigError, TenantLifecycleState, TypedAttrColumnError, config_key, read_config,
-    read_config_values, resolve_retention_window, set_tenant_config, validate_typed_attr_columns,
+    read_config_values, resolve_declared_columns, resolve_retention_window, set_tenant_config,
+    validate_typed_attr_columns,
 };

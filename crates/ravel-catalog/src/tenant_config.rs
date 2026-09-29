@@ -587,7 +587,8 @@ impl TenantConfig {
     /// resolves them: this config's `typed_attr_columns` override when it is
     /// `Some`, otherwise the deployment default (`--typed-attr-column` on the
     /// server). This crate does not know the deployment default, so this
-    /// accessor does not read `typed_attr_columns`.
+    /// accessor does not read `typed_attr_columns`; [`resolve_declared_columns`]
+    /// resolves `declared` from it and the deployment default.
     ///
     /// An absent field 13 is [`ClusteringKeyState::NeverSet`], and a present one
     /// with no columns is [`ClusteringKeyState::Cleared`] whatever its bucket
@@ -719,7 +720,16 @@ impl TenantConfig {
     /// stamps a version below [`TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION`]; on
     /// that error the config is unchanged.
     pub fn set_bloom_scope(&mut self, scope: BloomScope) -> Result<(), StorageLayoutConfigError> {
-        check_writer_can_emit("bloom_scope", TENANT_CONFIG_FORMAT_VERSION)?;
+        self.set_bloom_scope_as(scope, TENANT_CONFIG_FORMAT_VERSION)
+    }
+
+    /// [`TenantConfig::set_bloom_scope`] for a writer stamping `writer_version`.
+    fn set_bloom_scope_as(
+        &mut self,
+        scope: BloomScope,
+        writer_version: u32,
+    ) -> Result<(), StorageLayoutConfigError> {
+        check_writer_can_emit("bloom_scope", writer_version)?;
         self.stored_bloom_scope = StoredBloomScope(scope.to_proto() as i32);
         Ok(())
     }
@@ -728,9 +738,15 @@ impl TenantConfig {
     /// config carrying either is refused while the writer cannot emit it, and a
     /// carried value must pass its validation. `set_tenant_config` is not given
     /// the tenant's effective declared columns, so for a clustering key this
-    /// re-checks only the rules that do not depend on them; the declared-column
-    /// rule is applied by [`TenantConfig::set_clustering_key`], the only way a
-    /// config outside this module gets a key other than decoding one.
+    /// re-checks only the rules that do not depend on them.
+    ///
+    /// The declared-column rule is applied by
+    /// [`TenantConfig::set_clustering_key`]. A decoded key also reaches this
+    /// gate through a read-modify-write that replaces another field and carries
+    /// the rest through (`ravel-cli typed-attr-column set` replaces
+    /// `typed_attr_columns` that way), which can leave a key naming a column the
+    /// new declaration dropped; the declared-column rule for that path lands
+    /// with the writer flip.
     fn check_storage_layout_writable(&self) -> Result<(), StorageLayoutConfigError> {
         if let Some(stored) = self.stored_clustering_key.as_ref() {
             check_writer_can_emit("clustering_key", TENANT_CONFIG_FORMAT_VERSION)?;
@@ -761,6 +777,21 @@ pub fn resolve_retention_window(
     tenant_config
         .and_then(|cfg| cfg.retention_ns)
         .or(default_retention_ns)
+}
+
+/// The tenant's effective declared typed attribute columns: the record's
+/// [`TenantConfig::typed_attr_columns`] override when the record is present and
+/// carries `Some` (including `Some(vec![])`, an override to no declared
+/// columns), otherwise `deployment_default`. This is the `declared` argument
+/// every caller of [`TenantConfig::clustering_key`] and
+/// [`TenantConfig::set_clustering_key`] must pass.
+pub fn resolve_declared_columns<'a>(
+    tenant_config: Option<&'a TenantConfig>,
+    deployment_default: &'a [DeclaredTypedColumn],
+) -> &'a [DeclaredTypedColumn] {
+    tenant_config
+        .and_then(|cfg| cfg.typed_attr_columns.as_deref())
+        .unwrap_or(deployment_default)
 }
 
 /// A typed config-record failure. Every variant is fatal to the touch that
@@ -2834,6 +2865,60 @@ mod tests {
             read.bloom_scope(),
             Err(StorageLayoutConfigError::UnknownBloomScope { got: 42 })
         );
+    }
+
+    /// A writer at the storage-layout version stores each bloom scope as its own
+    /// proto value in field 14, and the value reads back as the same scope
+    /// through the record. The sequence starts from the default `ALL` and changes
+    /// the scope on every step, so a setter that stores nothing fails too.
+    #[tokio::test]
+    async fn set_bloom_scope_stores_every_variant_through_the_record() {
+        let v3 = TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION;
+        let mut cfg = TenantConfig::new(TenantLifecycleState::Active);
+        for (scope, proto) in [
+            (BloomScope::Text, sysproto::BloomScope::Text),
+            (BloomScope::Undeclared, sysproto::BloomScope::Undeclared),
+            (BloomScope::All, sysproto::BloomScope::All),
+        ] {
+            cfg.set_bloom_scope_as(scope, v3)
+                .expect("the writer can emit");
+            assert_eq!(cfg.stored_bloom_scope, StoredBloomScope(proto as i32));
+            assert_eq!(cfg.bloom_scope(), Ok(scope));
+
+            let mut record = build_record(&tenant(), &cfg, 0, 0);
+            assert_eq!(record.bloom_scope, proto as i32);
+            record.format_version = v3;
+            let read = store_and_read(&record).await;
+            assert_eq!(read.stored_bloom_scope, StoredBloomScope(proto as i32));
+            assert_eq!(read.bloom_scope(), Ok(scope));
+        }
+    }
+
+    /// The declared-column precedence: a present record's `Some` override wins,
+    /// an empty override included, and an absent record or an unset override
+    /// both fall through to the deployment default.
+    #[test]
+    fn resolve_declared_columns_prefers_the_record_override() {
+        let default = vec![str_col("d")];
+        let with = |columns: Option<Vec<DeclaredTypedColumn>>| TenantConfig {
+            typed_attr_columns: columns,
+            ..TenantConfig::new(TenantLifecycleState::Active)
+        };
+
+        let overridden = with(Some(vec![str_col("a"), str_col("b")]));
+        assert_eq!(
+            resolve_declared_columns(Some(&overridden), &default),
+            &[str_col("a"), str_col("b")][..]
+        );
+        let emptied = with(Some(Vec::new()));
+        assert_eq!(resolve_declared_columns(Some(&emptied), &default), &[][..]);
+
+        let unset = with(None);
+        assert_eq!(
+            resolve_declared_columns(Some(&unset), &default),
+            &default[..]
+        );
+        assert_eq!(resolve_declared_columns(None, &default), &default[..]);
     }
 
     /// A key column name that is not valid UTF-8 makes the record invalid
