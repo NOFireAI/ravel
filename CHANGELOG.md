@@ -333,6 +333,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The bucket-protection control plane reports one misconfiguration once,
+  and signs the `Host` it sends** (issue #2178, issue #2172 item 2). The
+  sanctioned lifecycle rule covering all of `t/` (alone, or as a member of the
+  sixteen-rule `t/0` .. `t/f` union) no longer also fails `no-foreign-rule`
+  when its `NoncurrentDays` is below the expected value:
+  `noncurrent-expiration` reports it, so `conditions_failed` reads 1, not 2.
+  A transition or current-version expiration on that rule is still foreign.
+  The control-plane client used to sign the endpoint's authority as
+  configured while `reqwest` sends the `url` crate's form of it, so an
+  endpoint of `https://s3.example.internal:443` (or `http://...:80`, or an
+  uppercase host) was answered 403 and read as `Unknown` (access denied); the
+  signed `host` now drops the scheme's default port and lowercases the host,
+  matching what is sent. `delete-marker-replication` accepts the same
+  sixteen-rule union the lifecycle conditions do, where it used to report the
+  union "not evaluated". The server's `--require-bucket-protection` gate asks
+  both probes through one `BucketProbesSource` call, so a source backed by the
+  control plane reads the bucket once per startup (3 GETs where two separate
+  probes cost 6).
+
 - **A catalog decode declared over its ceiling now evicts decoded-cache entries
   until the budget admits it or the caches are empty** (issue #2132). Such a
   decode is charged 0 bytes, and a budget pushed over its limit by
@@ -575,9 +594,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   or `sys/` carries a transition, a current-version expiration, or a
   `NoncurrentDays` shorter than the reference (the expected value, else the one
   value the covering rules agree on). A `NoncurrentDays` below the reference
-  fails `no-foreign-rule`, and also `noncurrent-expiration` when the rule
-  reaches part of `t/`; with no reference to compare against, the same rule is
-  `Unknown` there instead. `DeleteMarkerReplication` `Disabled` on a rule over
+  on a rule other than the sanctioned covering one fails `no-foreign-rule`,
+  and also `noncurrent-expiration` when the rule reaches part of `t/`; with no
+  reference to compare against, the same rule is `Unknown` there instead. `DeleteMarkerReplication` `Disabled` on a rule over
   part of `t/` fails `delete-marker-replication`. A 404 is "not configured"
   only when its `<Error><Code>` is that call's own code
   (`NoSuchLifecycleConfiguration`, `ReplicationConfigurationNotFoundError`,

@@ -276,7 +276,7 @@ table's wording alone would allow `Pass`.
    in place of `t/f`), a digit spelled in upper case, or a digit with no
    rule proves nothing, and the narrower rules leave the lifecycle
    conditions `Unknown`. The same union is what the other lifecycle
-   conditions accept as coverage.
+   conditions and `delete-marker-replication` accept as coverage.
 
 2. **`noncurrent-expiration` fails in cases the table does not name.** Besides
    a covering rule whose `NoncurrentDays` differs from the expected `E_v`,

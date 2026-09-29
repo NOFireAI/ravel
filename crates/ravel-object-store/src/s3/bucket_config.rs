@@ -366,7 +366,11 @@ fn request_target(
                 Some(index) => (&rest[..index], &rest[index..]),
                 None => (rest, ""),
             };
-            (scheme, authority.to_string(), base_path.to_string())
+            (
+                scheme,
+                normalize_authority(scheme, authority),
+                base_path.to_string(),
+            )
         }
         None if force_path_style => ("https", format!("s3.{region}.amazonaws.com"), String::new()),
         None => (
@@ -397,6 +401,29 @@ fn request_target(
         url,
         host,
         canonical_uri: path,
+    }
+}
+
+/// The authority as the `url` crate re-serialises it, which is what `reqwest`
+/// sends as `Host`: the host lowercased, and the port dropped when it is empty
+/// or the scheme's default (443 for `https`, 80 for `http`). The signed `host`
+/// value must be these exact bytes, or S3 rejects the signature.
+fn normalize_authority(scheme: &str, authority: &str) -> String {
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((literal, tail)) => (format!("[{literal}]"), tail.strip_prefix(':')),
+            None => (authority.to_string(), None),
+        },
+        None => match authority.rsplit_once(':') {
+            Some((host, port)) => (host.to_string(), Some(port)),
+            None => (authority.to_string(), None),
+        },
+    };
+    let default_port = if scheme == "http" { "80" } else { "443" };
+    let host = host.to_ascii_lowercase();
+    match port {
+        Some(port) if !port.is_empty() && port != default_port => format!("{host}:{port}"),
+        _ => host,
     }
 }
 
@@ -823,17 +850,14 @@ const TENANT_HASH_DIGITS: &str = "0123456789abcdef";
 /// narrower rules `Unknown`. Keys under `t/` that do not start with a
 /// lowercase hex digit (including the key `t/` itself) are not Ravel's and are
 /// not claimed.
-fn complete_union(
-    rules: &[LifecycleRule],
-    member: impl Fn(&LifecycleRule) -> bool,
-) -> BTreeSet<usize> {
+fn complete_union<R: ScopedRule>(rules: &[R], member: impl Fn(&R) -> bool) -> BTreeSet<usize> {
     let mut members: BTreeSet<usize> = BTreeSet::new();
     let mut digits: BTreeSet<char> = BTreeSet::new();
     for (index, rule) in rules.iter().enumerate() {
-        if rule.status != RuleStatus::Enabled || !member(rule) {
+        if *rule.status() != RuleStatus::Enabled || !member(rule) {
             continue;
         }
-        let RuleScope::Prefix(prefix) = &rule.scope else {
+        let RuleScope::Prefix(prefix) = rule.scope() else {
             continue;
         };
         let mut rest = match prefix.strip_prefix(DATA_ROOT) {
@@ -851,6 +875,30 @@ fn complete_union(
         members
     } else {
         BTreeSet::new()
+    }
+}
+
+/// A lifecycle or replication rule, as far as [`complete_union`] reads it.
+trait ScopedRule {
+    fn status(&self) -> &RuleStatus;
+    fn scope(&self) -> &RuleScope;
+}
+
+impl ScopedRule for LifecycleRule {
+    fn status(&self) -> &RuleStatus {
+        &self.status
+    }
+    fn scope(&self) -> &RuleScope {
+        &self.scope
+    }
+}
+
+impl ScopedRule for ReplicationRule {
+    fn status(&self) -> &RuleStatus {
+        &self.status
+    }
+    fn scope(&self) -> &RuleScope {
+        &self.scope
     }
 }
 
@@ -1035,12 +1083,12 @@ pub(crate) struct ReplicationConfig {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ObjectLockConfig {
-    /// `Some(true)` when `ObjectLockEnabled` is exactly `Enabled`, the only
-    /// value S3 defines; `None` when the element is missing, empty, or spelled
-    /// any other way (a document that states nothing this reader can place).
-    /// Object Lock that is off is a 404 with its own not-configured code, not a
-    /// value here.
-    pub enabled: Option<bool>,
+    /// `true` when `ObjectLockEnabled` is exactly `Enabled`, the only value S3
+    /// defines; `false` when the element is missing, empty, or spelled any
+    /// other way (a document that states nothing this reader can place, not a
+    /// disabled lock). Object Lock that is off is a 404 with its own
+    /// not-configured code, not a value here.
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1210,7 +1258,7 @@ pub(crate) fn parse_object_lock(body: &[u8]) -> Result<ObjectLockConfig, Control
     Ok(ObjectLockConfig {
         enabled: root
             .single("ObjectLockEnabled")?
-            .and_then(|value| (value.value() == "Enabled").then_some(true)),
+            .is_some_and(|value| value.value() == "Enabled"),
     })
 }
 
@@ -1915,14 +1963,11 @@ pub(crate) fn assemble_report(
     states.push((
         Id::ObjectLock,
         match object_lock {
-            FetchOutcome::Present(config) => match config.enabled {
-                Some(true) => ConditionState::Pass,
-                Some(false) => ConditionState::Fail("Object Lock is not enabled".to_string()),
-                None => ConditionState::Unknown(
-                    "ObjectLockConfiguration carries no ObjectLockEnabled value of exactly Enabled"
-                        .to_string(),
-                ),
-            },
+            FetchOutcome::Present(config) if config.enabled => ConditionState::Pass,
+            FetchOutcome::Present(_) => ConditionState::Unknown(
+                "ObjectLockConfiguration carries no ObjectLockEnabled value of exactly Enabled"
+                    .to_string(),
+            ),
             FetchOutcome::Absent(detail) => ConditionState::Fail(detail.clone()),
             FetchOutcome::Unknown(detail) => ConditionState::Unknown(detail.clone()),
         },
@@ -2116,7 +2161,7 @@ pub(crate) fn lifecycle_conditions(
         expired_marker: expired_marker.state,
         abort: abort.state,
         rule_scope,
-        no_foreign: no_foreign_rule_state(rules, reference_days),
+        no_foreign: no_foreign_rule_state(rules, reference_days, &noncurrent_union),
         notes,
     }
 }
@@ -2357,10 +2402,15 @@ fn evaluate_action<T: Copy + fmt::Display>(
 /// noncurrent-version expiration sooner than `reference_noncurrent_days`. An
 /// expiration or action the reader cannot classify, a day count that does not
 /// parse, a `NoncurrentDays` with no reference to compare it against, or a rule
-/// whose filter or status is unrecognised makes it `Unknown`.
+/// whose filter or status is unrecognised makes it `Unknown`. The
+/// `NoncurrentDays` of an enabled rule covering all of `t/`, or of a member of
+/// `noncurrent_union`, is `noncurrent-expiration`'s to judge, exactly as
+/// [`early_noncurrent_rules`] leaves it, so one wrong value fails one
+/// condition.
 fn no_foreign_rule_state(
     rules: &[LifecycleRule],
     reference_noncurrent_days: Option<u32>,
+    noncurrent_union: &BTreeSet<usize>,
 ) -> ConditionState {
     let mut fails: Vec<String> = Vec::new();
     let mut unknowns: Vec<String> = Vec::new();
@@ -2386,7 +2436,10 @@ fn no_foreign_rule_state(
         if let Some(date) = &rule.expiration_date {
             definite.push(format!("expiration on date {date}"));
         }
+        let sanctioned = noncurrent_union.contains(&index)
+            || (active == Tri::Yes && rule.scope.coverage_of_data_root() == Coverage::Full);
         match early_noncurrent(rule, reference_noncurrent_days) {
+            _ if sanctioned => {}
             Some(Ok(detail)) => definite.push(detail),
             Some(Err(detail)) => unclassified.push(detail),
             None => {}
@@ -2436,13 +2489,16 @@ fn no_foreign_rule_state(
 /// `Fail`. An enabled rule on part of `t/` (a narrower prefix, or a tag- or
 /// size-narrowed filter) may take priority over the covering rule for the keys
 /// it matches, so one with `DeleteMarkerReplication` `Disabled` is `Fail` and
-/// one with a missing or unrecognised status is `Unknown`.
+/// one with a missing or unrecognised status is `Unknown`. The members of a
+/// [`complete_union`] of enabled rules count as covering rules, exactly as
+/// they do for the lifecycle conditions.
 fn delete_marker_replication_state(config: &ReplicationConfig) -> ConditionState {
     let mut enabled: Vec<String> = Vec::new();
     let mut disabled: Vec<String> = Vec::new();
     let mut partial_disabled: Vec<String> = Vec::new();
     let mut unknowns: Vec<String> = Vec::new();
     let mut union_members: Vec<String> = Vec::new();
+    let union = complete_union(&config.rules, |_| true);
     for (index, rule) in config.rules.iter().enumerate() {
         let label = match &rule.id {
             Some(id) => format!("rule {id:?}"),
@@ -2452,7 +2508,10 @@ fn delete_marker_replication_state(config: &ReplicationConfig) -> ConditionState
         if active == Tri::No {
             continue;
         }
-        let coverage = rule.scope.coverage_of_data_root();
+        let coverage = match rule.scope.coverage_of_data_root() {
+            Coverage::UnionMember if union.contains(&index) => Coverage::Full,
+            coverage => coverage,
+        };
         let partial = match coverage {
             Coverage::UnionMember => true,
             Coverage::None => rule.scope.intersects_data_root(),
@@ -2514,7 +2573,8 @@ fn delete_marker_replication_state(config: &ReplicationConfig) -> ConditionState
     } else if !union_members.is_empty() {
         ConditionState::Unknown(format!(
             "no enabled replication rule covers every key under t/; rules on narrower prefixes \
-             ({}) might as a union, which is not evaluated",
+             ({}) might cover t/ as a union, but only one rule on each of t/0 .. t/f is \
+             provably complete",
             union_members.join(", ")
         ))
     } else {
