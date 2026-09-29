@@ -813,7 +813,7 @@ pub struct ServerConfig {
     /// probe observe 503 over a still-open listener, so Kubernetes stops routing
     /// new connections before the sockets close. It is a settle delay, paid once
     /// per shutdown and NOT counted against [`ServerConfig::shutdown_timeout`];
-    /// the ADR-0071 heartbeat delete runs concurrently with it. In-process tests
+    /// the ADR-0071 heartbeat drain runs concurrently with it. In-process tests
     /// set it to zero so a suite that shuts a server down on every case does not
     /// pay it hundreds of times.
     pub drain_settle_interval: Duration,
@@ -1110,12 +1110,13 @@ impl Drop for AbortOnDrop {
 
 /// Handle to the ADR-0071 query-worker heartbeat loop, held on [`Running`] so
 /// graceful shutdown stops it deterministically rather than leaving it detached.
-/// [`QueryWorkerHeartbeat::shutdown`] signals the loop, which deletes this
-/// process's `sys/query/workers/<uuid>` record before returning, then joins the
-/// task.
+/// [`QueryWorkerHeartbeat::shutdown`] signals the loop, which overwrites this
+/// process's `sys/query/workers/<uuid>` record with a drained stamp no reader
+/// accepts as live before returning, then joins the task.
 ///
-/// That join is unbounded on its own: the loop's final `delete_heartbeat` ends
-/// in [`ObjectStoreBackend::delete`], which takes no deadline. Every caller
+/// That join is unbounded on its own: the loop's final drain
+/// (`QueryWorkers::mark_drained`) ends in an object-store PUT, which takes no
+/// deadline. Every caller
 /// must therefore impose one; [`Running::shutdown`] uses
 /// [`heartbeat_stop_budget`].
 struct QueryWorkerHeartbeat {
@@ -1124,10 +1125,10 @@ struct QueryWorkerHeartbeat {
 }
 
 impl QueryWorkerHeartbeat {
-    /// Stop the heartbeat loop and wait for it to delete its record and exit.
+    /// Stop the heartbeat loop and wait for it to drain its record and exit.
     /// Unbounded by construction (see the type's own docs): call it under a
     /// timeout. Dropping the returned future on that timeout detaches the task
-    /// rather than cancelling the delete, so a store that answers late can
+    /// rather than cancelling the drain write, so a store that answers late can
     /// still complete it before the process exits.
     async fn shutdown(self) {
         // The receiver is dropped only when the loop exits, so a send error
@@ -1168,12 +1169,13 @@ fn listener_join_budget(shutdown_timeout: Duration) -> Duration {
 /// The bound on stopping the ADR-0071 heartbeat, expressed as a slice of
 /// `--shutdown-timeout`.
 ///
-/// The stop cannot move inside the bounded drain block: the delete has to be
-/// ATTEMPTED while the listeners still serve, so a sibling coordinator drops
+/// The stop cannot move inside the bounded drain block: the drained-stamp
+/// write has to be ATTEMPTED while the listeners still serve, so a sibling coordinator drops
 /// this worker from its live set before the fragment socket disappears, and the
 /// drain block runs after the close signal. It therefore carries a bound of its
 /// own. It needs one: [`QueryWorkerHeartbeat::shutdown`] awaits a loop whose
-/// final step is [`ObjectStoreBackend::delete`], which takes no deadline, and
+/// final step is an [`ObjectStoreBackend::put`] of the drained stamp, which
+/// takes no deadline, and
 /// the S3 backend retries a deadline-less operation internally for about
 /// `retry_timeout + request_timeout` (roughly 200s; the numbers are stated in
 /// `ravel_object_store::s3`, whose comment rests on every caller passing a
@@ -1181,17 +1183,17 @@ fn listener_join_budget(shutdown_timeout: Duration) -> Duration {
 /// ingest buffers are still unflushed and the kubelet escalates to SIGKILL,
 /// which is the failure issue #1291 exists to fix.
 ///
-/// A tenth of the budget is ample for one DELETE against a reachable store, and
+/// A tenth of the budget is ample for one PUT against a reachable store, and
 /// it runs concurrently with the pre-close readiness settle, so on the healthy
 /// path it costs nothing at all. It also keeps this bound plus
 /// `--shutdown-timeout` below [`K8S_DEFAULT_GRACE_PERIOD`] at the shipped
 /// defaults, which `default_shutdown_timeout_is_below_the_kubernetes_grace_period`
-/// pins. A delete cut off here self-corrects, but not instantly: the record
+/// pins. A stamp write cut off here self-corrects, but not instantly: the record
 /// ages out of a sibling's live set only once its stamp passes the staleness
 /// window (`liveness_factor * heartbeat_interval`, three heartbeat intervals,
 /// about 180s at the `ravel_fleet` defaults of a 60s interval and a factor of
 /// 3). For that whole window a sibling coordinator can still route a fragment
-/// to this draining worker; the delete-before-close ordering above is what
+/// to this draining worker; the stamp-before-close ordering above is what
 /// keeps the healthy path from paying it.
 fn heartbeat_stop_budget(shutdown_timeout: Duration) -> Duration {
     shutdown_timeout / 10
@@ -1324,7 +1326,7 @@ impl Running {
     }
 
     /// Gracefully stop the server: flip readiness to draining so a probe sees
-    /// 503 before any listener closes, delete the ADR-0071 heartbeat
+    /// 503 before any listener closes, drain the ADR-0071 heartbeat record
     /// concurrently with a short settle wait, then attempt to flush ingest
     /// buffers before joining the listeners, join the listeners under their own
     /// sub-budget, and join the shard actors and background tasks.
@@ -1387,7 +1389,7 @@ impl Running {
         } = self;
 
         // Flip readiness to draining FIRST, before any listener closes, and stop
-        // the ADR-0071 heartbeat CONCURRENTLY with the settle wait. Deleting the
+        // the ADR-0071 heartbeat CONCURRENTLY with the settle wait. Draining the
         // heartbeat record while the fragment listener is still open lets a
         // sibling coordinator drop this worker from its live set before the
         // socket closes, instead of routing a fragment to a listener that is
@@ -1397,7 +1399,7 @@ impl Running {
         //
         // That stop carries `heartbeat_stop_budget` rather than the drain
         // block's `--shutdown-timeout`, because it has to run BEFORE the close
-        // signal below and it awaits a deadline-less object-store DELETE:
+        // signal below and it awaits a deadline-less object-store PUT:
         // unbounded, an unreachable store would hold the process here with
         // every ingest buffer still unflushed.
         readiness.begin_drain();
@@ -3669,7 +3671,8 @@ pub async fn start_with_heartbeat(
     // heartbeat loop then writes `sys/query/workers/<uuid>` and refreshes the
     // live set on its cadence. Its handle and a shutdown sender live on
     // `Running` (not detached) so graceful shutdown can stop the loop, which
-    // deletes this process's worker record before returning; a draining process
+    // overwrites this process's worker record with a drained stamp before
+    // returning; a draining process
     // must stop advertising itself to sibling coordinators, not linger in their
     // live set until its stamp ages past the staleness window.
     let query_worker_heartbeat: Option<QueryWorkerHeartbeat> =

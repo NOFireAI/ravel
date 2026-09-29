@@ -22,7 +22,7 @@ use ravel_commit::keys::{
     erasure_request_key, l1_part_key, maint_cursor_key, retention_tombstone_key,
     rewrite_record_key,
 };
-use ravel_fleet::query_workers::query_worker_key;
+use ravel_fleet::query_workers::{QUERY_WORKERS_PREFIX, query_worker_key};
 use ravel_fleet::worker_set::heartbeat_key;
 use ravel_types::{Signal, TenantHash};
 use uuid::Uuid;
@@ -1857,7 +1857,9 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
         kms_resources: &[("GatewayTenantKms", &[TENANT_KMS_KEY_ARN])],
     },
     // Query: reads every level, writes catalog-fold output, the query-audit
-    // prefix and its worker registration; deletes nothing.
+    // prefix and its worker registration; deletes nothing. A drained query
+    // worker overwrites its own registration rather than deleting it, and the
+    // maintain role reaps dead registrations (issue #1828).
     ExpectedRolePatterns {
         role: "query",
         list_prefixes: &[
@@ -1969,6 +1971,14 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // all, so every reap was refused and the prefix the per-tick LIST walks
     // grew without bound. Asserted call by call by
     // maintain_template_covers_every_worker_heartbeat_call.
+    //
+    // sys/query/workers/* appears on the list and delete axes only. The query
+    // role deletes nothing, so the maintain tick reaps dead query-worker
+    // records (issue #1828): reap_dead_query_workers in
+    // crates/ravel-fleet/src/query_workers.rs LISTs the prefix and DELETEs each
+    // key past the reap horizon, judged from LIST metadata, so it reads no
+    // record and writes none. Asserted call by call by
+    // maintain_template_covers_every_query_worker_reap_call.
     ExpectedRolePatterns {
         role: "maintain",
         list_prefixes: &[
@@ -1981,6 +1991,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/catalog/*/snap/*",
             "t/*/catalog/*/idx/*",
             "sys/maintain/workers/*",
+            "sys/query/workers/*",
             "quarantine/t/*/*/l0/*",
         ],
         list_actions: &["s3:ListBucket"],
@@ -2022,6 +2033,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/catalog/*/snap/*",
             "t/*/catalog/*/idx/*",
             "sys/maintain/workers/*",
+            "sys/query/workers/*",
             "quarantine/t/*/*/l0/*",
         ],
         // Both delete operations, and the same two the Deny names. Maintain is
@@ -3723,6 +3735,100 @@ fn maintain_template_covers_every_worker_heartbeat_call() {
             }
         }
     }
+}
+
+/// Every object-store call the maintain tick's query-worker reap makes,
+/// asserted against the shipped Maintain template (issue #1828).
+///
+/// The query role deletes nothing (ADR-0055 section 1), so the reap of dead
+/// `sys/query/workers/<process_id>` records runs on the maintain tick, owned by
+/// one maintain process per deployment
+/// (`reap_query_worker_heartbeats` in `services/ravel-server/src/maintain.rs`).
+/// It goes through `reap_dead_query_workers` in
+/// `crates/ravel-fleet/src/query_workers.rs`, which makes two calls:
+///
+/// - `list_all(store, QUERY_WORKERS_PREFIX)`, judging each key by the
+///   modification time the LIST result carries;
+/// - `store.delete(key)` in `reap_keys`, for each key past the reap horizon.
+///
+/// It reads and writes no record, so the maintain role gets no GET or PUT on
+/// the prefix. Before issue #1828 the query coordinator made these deletes
+/// under a role with no delete grant, every one was refused, and the prefix
+/// grew with every query worker that ever ran.
+#[test]
+fn maintain_template_covers_every_query_worker_reap_call() {
+    let maintain = load_policy("maintain");
+    let list_prefixes = list_prefix_patterns(&maintain, Some("Allow"));
+    let gets = key_patterns_for(&maintain, &["s3:GetObject"], Some("Allow"));
+    let puts = key_patterns_for(&maintain, &["s3:PutObject"], Some("Allow"));
+    let deletes = delete_key_patterns(&maintain, "Allow");
+
+    let record = query_worker_key(&Uuid::from_u128(WITNESS_PROCESS_ID).to_string());
+
+    // Call 1: the reap LISTs the whole prefix.
+    assert!(
+        list_prefixes
+            .iter()
+            .any(|p| glob_matches(p, QUERY_WORKERS_PREFIX)),
+        "maintain: no ListBucket s3:prefix admits {QUERY_WORKERS_PREFIX:?}, the \
+         prefix reap_dead_query_workers passes to list_all. The reap is refused \
+         before it sees a key. s3:prefix values: {list_prefixes:?}"
+    );
+
+    // Call 2: reap_keys DELETEs each key past the reap horizon.
+    assert!(
+        deletes.iter().any(|p| glob_matches(p, &record)),
+        "maintain: no delete Allow reaches the dead query-worker record \
+         {record:?}, which reap_keys deletes past the reap horizon. Every reap \
+         is refused and {QUERY_WORKERS_PREFIX:?} grows with every query worker \
+         that has ever run (#1828). Grants: {deletes:?}"
+    );
+
+    // The reap reads and writes no record.
+    for (axis, patterns) in [("s3:GetObject Allow", &gets), ("s3:PutObject Allow", &puts)] {
+        assert!(
+            !patterns.iter().any(|p| glob_matches(p, &record)),
+            "maintain: {axis} reaches the query-worker record {record:?}, which \
+             the reap never reads or writes. Patterns: {patterns:?}"
+        );
+    }
+
+    // Tightness: a list or delete pattern reaching the record reaches nothing
+    // outside the query-worker prefix.
+    let outside: Vec<&String> = key_domain()
+        .iter()
+        .filter(|key| !key.starts_with(QUERY_WORKERS_PREFIX))
+        .collect();
+    assert!(
+        !outside.is_empty(),
+        "the key domain models no key outside {QUERY_WORKERS_PREFIX:?}"
+    );
+    for (axis, patterns) in [
+        ("s3:prefix Allow", &list_prefixes),
+        ("delete Allow", &deletes),
+    ] {
+        for pattern in patterns {
+            if !glob_matches(pattern, &record) {
+                continue;
+            }
+            for key in &outside {
+                assert!(
+                    !glob_matches(pattern, key),
+                    "maintain: {axis} pattern {pattern:?} reaches the query-worker \
+                     record {record:?} AND {key:?}, which lies outside \
+                     {QUERY_WORKERS_PREFIX:?} (#1828)"
+                );
+            }
+        }
+    }
+
+    // The query role still deletes nothing, this record included.
+    let query_deletes = delete_key_patterns(&load_policy("query"), "Allow");
+    assert!(
+        query_deletes.is_empty(),
+        "query: the role must grant no delete at all (ADR-0055 section 1); the \
+         maintain role reaps its dead registrations. Grants: {query_deletes:?}"
+    );
 }
 
 /// One statement reduced to what an Allow/Deny overlap check needs: which
