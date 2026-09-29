@@ -203,7 +203,10 @@ record it names), which records a version 2 record supersedes is not known. A
 rewrite's chain group there that reaches a version 2 record reclaims nothing,
 not even the records above the link: the group is one unit, and deleting its
 upper records would leave the rest resolvable with nothing naming them as
-erased.
+erased. The pass reports that chain as held: the rewrite's applied requests,
+and the bucket as a truncated one, since the refused walk collects no request
+a rewrite between it and the link applied. The erasure-request sweep therefore keeps every `.dreq` of the signal
+while the bucket stays unresolved.
 
 A rewrite record landing outside both the fixed reconcile window and the
 frontier band is not left to wait indefinitely for one of those two passes to

@@ -2205,8 +2205,9 @@ pub async fn erasure_rewrite_bucket(
 /// -- the exact supersession chase a snapshot resolve
 /// (`ravel_catalog::Catalog::process_bucket`) and the index fold use -- never
 /// through [`resolve_live_record`], which the rewrite path uses to pick its own
-/// generation and which never computes the raw L0 inputs a query serves. That is the whole point: completion cannot diverge from
-/// what a query serves, because it is computed by the same code the query runs.
+/// generation and which never computes the raw L0 inputs a query serves. That
+/// is the whole point: completion cannot diverge from what a query serves,
+/// because it is computed by the same code the query runs.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BucketErasureCompletion {
     /// `request_id`s that overlap this bucket's live event range AND for which
@@ -2339,10 +2340,11 @@ pub const ERASURE_REWRITE_DEADLINE_NS: i64 = 72 * NS_PER_HOUR;
 /// "through `resolve_rewrite_supersession` and `classify_bucket`, not a bucket
 /// LIST in isolation." The rewrite pass classifies a bucket `AlreadyApplied`
 /// off [`resolve_live_record`], which picks the live compaction/rewrite record
-/// and never computes which raw L0 inputs a query still resolves. So a bucket whose live rewrite names the request but whose
-/// chain fails to exclude an L0 input the query still serves (the
-/// absent-predecessor / partial-input case §4 names, or a live sibling rewrite)
-/// reads "done" to the rewrite pass while a snapshot keeps serving the subject.
+/// and never computes which raw L0 inputs a query still resolves. So a bucket
+/// whose live rewrite names the request but whose chain fails to exclude an L0
+/// input the query still serves (the absent-predecessor / partial-input case
+/// §4 names, or a live sibling rewrite) reads "done" to the rewrite pass while
+/// a snapshot keeps serving the subject.
 /// This function closes that gap by reconstructing the query's exact served set:
 ///
 /// 1. `excluded` (raw L0 identities) and `superseded_records` (whole

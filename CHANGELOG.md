@@ -626,7 +626,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now runs through a version 2 record to the record it names, so a rewrite
   over C2 over C1 reclaims C1 too instead of leaving it to be served again,
   except in a bucket whose version 2 supersession does not resolve, where
-  such a chain reclaims nothing. The chain walk's depth bound counts records
+  such a chain reclaims nothing and is reported as held, its rewrite's
+  requests and its bucket as truncated, so rule 6 keeps the signal's `.dreq`s.
+  The chain walk's depth bound counts records
   as the catalog's walks do. The erasure rewrite pass picks a bucket's live
   record through the catalog's shared supersession rules, so C1
   with a version 2 C2 resolves to C2, a rewrite and a version 2 record over the

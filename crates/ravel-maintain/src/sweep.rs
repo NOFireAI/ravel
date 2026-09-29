@@ -1227,9 +1227,11 @@ async fn sweep_superseded_impl(
     let mut groups: Vec<SupersededGroup> = Vec::new();
     let mut by_identity: HashMap<String, usize> = HashMap::new();
     // Buckets holding a rewrite this deleting pass left for its horizon, and
-    // buckets already logged for a refused version 2 link.
+    // the buckets and applied requests of rewrite chains it refused at a
+    // version 2 link.
     let mut young_rewrite_buckets: HashSet<u32> = HashSet::new();
-    let mut refused_buckets: HashSet<u32> = HashSet::new();
+    let mut refused_buckets: BTreeSet<u32> = BTreeSet::new();
+    let mut refused_request_ids: BTreeSet<String> = BTreeSet::new();
     for (key, entry) in &entries {
         // An observing pass gathers this entry too. The successor's own gather
         // covers the same chain only when the successor superseded a whole
@@ -1341,8 +1343,9 @@ async fn sweep_superseded_impl(
                     //
                     // In a bucket whose version 2 supersession does not
                     // resolve, a deleting pass does not follow a version 2
-                    // link. An observing pass does: gathering more can only
-                    // add holds.
+                    // link, and reports the chain as held in a truncated
+                    // bucket. An observing pass does follow it: gathering more
+                    // can only add holds.
                     let bucket = record.ingest_hour_bucket;
                     let links = if deleting && version_2.unresolved.contains(&bucket) {
                         Version2Links::Refuse
@@ -1360,6 +1363,9 @@ async fn sweep_superseded_impl(
                     )
                     .await?
                     else {
+                        // A chain this pass will not delete and cannot walk to
+                        // the end: held, and truncated, for rule 6.
+                        refused_request_ids.extend(applied);
                         if refused_buckets.insert(bucket) {
                             tracing::warn!(
                                 tenant_hash = %tenant.to_hex(),
@@ -1426,6 +1432,20 @@ async fn sweep_superseded_impl(
         outcome.dominated_records_unattached =
             version_2.count_unattached(&groups, &young_rewrite_buckets, tenant, signal, shard);
     }
+    // A refused chain is not deleted, so it is held. Its walk collected no
+    // request a rewrite between the refusing one and the link applied, so its
+    // bucket is reported as truncated.
+    outcome.held_request_ids.extend(refused_request_ids);
+    outcome
+        .held_truncated_buckets
+        .extend(
+            refused_buckets
+                .into_iter()
+                .map(|ingest_hour_bucket| HeldBucket {
+                    shard,
+                    ingest_hour_bucket,
+                }),
+        );
     let mut cleared: Vec<&SupersededGroup> = Vec::with_capacity(groups.len());
     for group in &groups {
         if let Some(protected) = group.protected_key(lease) {
@@ -1492,8 +1512,16 @@ async fn sweep_superseded_impl(
     // with the record that erased a subject out of it deleted, which would
     // leave the erasure request's filter with nothing durable to discover it
     // by.
+    //
+    // Groups of distinct identity can still share a key: a dominated version
+    // 2 record naming an absent record joins every group that ended there. A
+    // key is deleted and counted once per pass.
+    let mut deleted: HashSet<&str> = HashSet::new();
     for group in &cleared {
         for k in &group.record_keys {
+            if !deleted.insert(k) {
+                continue;
+            }
             if !config.dry_run {
                 store.delete(k).await?;
             }
@@ -1502,6 +1530,9 @@ async fn sweep_superseded_impl(
     }
     for group in &cleared {
         for k in &group.data_keys {
+            if !deleted.insert(k) {
+                continue;
+            }
             if !config.dry_run {
                 store.delete(k).await?;
             }
@@ -1510,6 +1541,9 @@ async fn sweep_superseded_impl(
     }
     for group in &cleared {
         for k in &group.chain_record_keys {
+            if !deleted.insert(k) {
+                continue;
+            }
             if !config.dry_run {
                 store.delete(k).await?;
             }
@@ -1975,6 +2009,11 @@ impl SupersededGroup {
     /// The group of a rewrite whose predecessor, at `absent_key`, is already
     /// gone: nothing of the chain is left, but a dominated version 2 record
     /// naming the same key may still be.
+    ///
+    /// An absent compaction record applied no erasure request, so the group is
+    /// truncated only when the absent key is a rewrite record's. The group
+    /// survives only when a dominated version 2 record joins it, and a version
+    /// 2 record names only a compaction record key.
     fn over_absent_predecessor(ingest_hour_bucket: u32, absent_key: &str) -> Self {
         Self {
             ingest_hour_bucket,
@@ -1983,7 +2022,10 @@ impl SupersededGroup {
             chain_record_keys: Vec::new(),
             objects: Vec::new(),
             request_ids: BTreeSet::new(),
-            truncated: true,
+            truncated: !matches!(
+                keys::partition_bucket_entry(absent_key),
+                Ok(BucketEntry::CompactionRecord(_))
+            ),
             absent_end: Some(absent_key.to_string()),
             identity: absent_key.to_string(),
         }
@@ -2351,8 +2393,9 @@ enum Version2Links {
     Follow,
     /// The bucket's version 2 supersession does not resolve, so which records
     /// a version 2 record on the chain supersedes is not known: a walk that
-    /// meets one gathers nothing. A group is indivisible, so the records above
-    /// the link cannot go without it either.
+    /// meets one gathers nothing, and the caller reports the chain as held in
+    /// a truncated bucket. A group is indivisible, so the records above the
+    /// link cannot go without it either.
     Refuse,
 }
 
@@ -6107,7 +6150,17 @@ mod tests {
         Vec<(String, CompactionRecord)>,
     ) {
         let mut compactions = Vec::new();
-        let (mut below, _) = put_chain_bottom(store, end, &mut compactions).await;
+        let (below, _) = put_chain_bottom(store, end, &mut compactions).await;
+        (put_rewrites_over(store, below, rewrites).await, compactions)
+    }
+
+    /// `rewrites` rewrite records, each naming the one below, the bottom one
+    /// naming `below`. Returns them bottom first.
+    async fn put_rewrites_over(
+        store: &MemoryStore,
+        mut below: String,
+        rewrites: usize,
+    ) -> Vec<(String, RewriteRecord)> {
         let mut out = Vec::with_capacity(rewrites);
         for i in 0..rewrites {
             let request_id = Uuid::from_u128(i as u128 + 1).to_string();
@@ -6144,7 +6197,7 @@ mod tests {
             below = key.clone();
             out.push((key, record));
         }
-        (out, compactions)
+        out
     }
 
     /// `version_2s` version 2 records, each naming the one below, over a
@@ -6223,14 +6276,19 @@ mod tests {
     /// entered-from rewrite and every rewrite below it; neither the version 1
     /// record ending it nor an absent record), and a version 2 chain as the
     /// selector charges it (the head and every present record below it, the
-    /// version 1 record included; not an absent one). Each case asks the
-    /// catalog too, so the expectation is the catalog's answer and not only
-    /// this test's reading of it.
+    /// version 1 record included; not an absent one), and a rewrite chain over
+    /// a version 2 link over a version 1 record as the rewrite chase charges it
+    /// (the version 2 link included). Each case asks the catalog too, so the
+    /// expectation is the catalog's answer and not only this test's reading of
+    /// it.
     ///
     /// Flipped line: the depth check in `gather_superseded_chain` restored to
     /// `if seen.len() >= MAX_CHAIN_DEPTH` before the record is loaded. The
     /// rewrite chain ending in a version 1 record is then refused at its last
-    /// accepted depth, as is each chain ending in an absent record.
+    /// accepted depth, as is each chain ending in an absent record. For the
+    /// mixed chain: the `ChainEntry::Rewrite` arm of `ChainEntry::charges`
+    /// charging no compaction record at all, which accepts 64 rewrites over the
+    /// version 2 record.
     #[tokio::test]
     async fn chain_walk_depth_bound_matches_the_catalog_exactly() {
         for end in [ChainEnd::PresentVersion1, ChainEnd::Absent] {
@@ -6313,6 +6371,49 @@ mod tests {
                 } else {
                     assert_refused_as_too_deep(walked, &case);
                 }
+            }
+        }
+
+        // Rewrites over a version 2 record over a version 1 record: the
+        // rewrite chase charges the entered-from rewrite, every rewrite below
+        // it and the version 2 link, and not the version 1 record.
+        for (rewrites, accepted) in [(MAX_CHAIN_DEPTH - 1, true), (MAX_CHAIN_DEPTH, false)] {
+            let case = format!("{rewrites} rewrites over a version 2 record");
+            let store = MemoryStore::new();
+            let compactions = put_version_2_chain(&store, 1, ChainEnd::PresentVersion1).await;
+            let (version_2_key, _) = compactions.last().expect("the version 2 record");
+            let chain = put_rewrites_over(&store, version_2_key.clone(), rewrites).await;
+            let (top_key, top) = chain.last().expect("a rewrite");
+            let compaction_by_key: HashMap<&str, &CompactionRecord> =
+                compactions.iter().map(|(k, r)| (k.as_str(), r)).collect();
+            let rewrite_by_key: HashMap<&str, &RewriteRecord> =
+                chain.iter().map(|(k, r)| (k.as_str(), r)).collect();
+            let catalog = ravel_catalog::resolve_rewrite_supersession(
+                top_key,
+                top,
+                "bucket",
+                &compaction_by_key,
+                &rewrite_by_key,
+                &mut HashSet::new(),
+                &mut HashSet::new(),
+            );
+            assert_eq!(catalog.is_ok(), accepted, "catalog, {case}: {catalog:?}");
+            let walked = gather_superseded_chain(
+                &store,
+                &tenant(),
+                Signal::Logs,
+                DEPTH_SHARD,
+                &top.superseded_record_key,
+                ChainEntry::Rewrite,
+                Version2Links::Follow,
+            )
+            .await;
+            if accepted {
+                let groups = walked.expect(&case).expect("followed");
+                assert_eq!(groups.len(), 1, "{case}");
+                assert_eq!(groups[0].chain_record_keys.len(), rewrites + 1, "{case}");
+            } else {
+                assert_refused_as_too_deep(walked, &case);
             }
         }
     }
