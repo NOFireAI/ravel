@@ -1170,11 +1170,12 @@ mod tests {
     ) -> Vec<u8> {
         let metadata = metadata_with_page_index(bytes);
         let chunk = metadata.row_group(0).column(0);
-        let at = usize::try_from(chunk.offset_index_offset().expect("an offset index"))
-            .expect("offset");
-        let len = usize::try_from(chunk.offset_index_length().expect("an offset index"))
-            .expect("length");
-        let locations = pages(metadata.offset_index().expect("an offset index")[0][0].page_locations());
+        let at =
+            usize::try_from(chunk.offset_index_offset().expect("an offset index")).expect("offset");
+        let len =
+            usize::try_from(chunk.offset_index_length().expect("an offset index")).expect("length");
+        let locations =
+            pages(metadata.offset_index().expect("an offset index")[0][0].page_locations());
         let count = u8::try_from(locations.len()).expect("few pages");
         assert!(count < 15, "a short list header");
         // OffsetIndex { 1: list<PageLocation> } in the compact protocol.
@@ -1226,7 +1227,8 @@ mod tests {
 
     /// [`three_pages`] whose second location claims the page starts at row 3,
     /// not 2. With the offset index a filtered scan selects rows by those
-    /// first rows and skips pages by them, so `a = 4` skips the wrong rows.
+    /// first rows and skips pages by them, so `a = 3` skips the row it
+    /// selects and returns nothing.
     #[tokio::test]
     async fn a_wrong_first_row_index_leaves_a_filtered_scan_exact() {
         let bytes = with_page_locations(&three_pages(), |pages| {
@@ -1492,7 +1494,9 @@ mod tests {
         let memory = Arc::new(MemoryStore::new());
         let recording = Arc::new(RecordingStore::new(Arc::clone(&memory), false));
         let fixture = Fixture::new(Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>);
-        let file = fixture.put_file(&memory, KEY, Bytes::from(bytes), false).await;
+        let file = fixture
+            .put_file(&memory, KEY, Bytes::from(bytes), false)
+            .await;
         for policy in [
             PageIndexPolicy::Skip,
             PageIndexPolicy::Optional,
@@ -1526,7 +1530,11 @@ mod tests {
             chunks
         );
         let ranges = recording.ranges().split_off(before);
-        assert_eq!(ranges.len(), 3, "the footer and two column chunks: {ranges:?}");
+        assert_eq!(
+            ranges.len(),
+            3,
+            "the footer and two column chunks: {ranges:?}"
+        );
         assert!(
             ranges.iter().all(|range| match *range {
                 GetRange::Range(start, end) =>
