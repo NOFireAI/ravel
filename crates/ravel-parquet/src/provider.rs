@@ -470,13 +470,26 @@ impl TableProvider for RawParquetScan {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let predicate = match conjunction(filters.to_vec()) {
+            Some(filter) => {
+                let df_schema = Arc::clone(&self.schema).to_dfschema()?;
+                Some(state.create_physical_expr(filter, &df_schema)?)
+            }
+            None => None,
+        };
+        // A predicate is what makes DataFusion load the page index for page
+        // pruning, so only a filtered scan's readers load and check it first.
+        let factory = self
+            .factory
+            .as_ref()
+            .clone()
+            .with_page_index(predicate.is_some());
         let mut source = ParquetSource::new(Arc::clone(&self.schema))
             .with_table_parquet_options(self.options.clone())
-            .with_parquet_file_reader_factory(Arc::clone(&self.factory) as _)
+            .with_parquet_file_reader_factory(Arc::new(factory) as _)
             .with_pushdown_filters(self.options.global.pushdown_filters);
-        if let Some(filter) = conjunction(filters.to_vec()) {
-            let df_schema = Arc::clone(&self.schema).to_dfschema()?;
-            source = source.with_predicate(state.create_physical_expr(filter, &df_schema)?);
+        if let Some(predicate) = predicate {
+            source = source.with_predicate(predicate);
         }
         let groups = file_groups(
             self.partitioned_files(),
@@ -533,6 +546,10 @@ mod tests {
             .await;
         let footers: u64 = [&a, &b].iter().map(|f| u64::from(f.footer_len) + 8).sum();
         let chunks = fixture.column_chunk_bytes(&[&a, &b]).await;
+        let (a_entry, b_entry) = (
+            fixture.decoded_footer_bytes(&a).await,
+            fixture.decoded_footer_bytes(&b).await,
+        );
 
         let accounting = PhaseAccounting::new();
         let table = fixture
@@ -550,6 +567,10 @@ mod tests {
         assert_eq!(
             probe.cache_hits, 1,
             "the scan finds a's footer decoded when the table was built"
+        );
+        assert_eq!(
+            probe.cache_bytes, a_entry,
+            "a footer cache hit charges the entry's size"
         );
         assert_eq!(scan.s3_bytes(AccountedOp::Get), chunks);
         assert_eq!(
@@ -569,6 +590,7 @@ mod tests {
         );
         assert_eq!(probe.s3_bytes(AccountedOp::Get), footers);
         assert_eq!(probe.cache_hits, 3, "one metadata cache hit per file");
+        assert_eq!(probe.cache_bytes, 2 * a_entry + b_entry);
         assert_eq!(
             second.phase(QueryPhase::Scan).s3_requests(AccountedOp::Get),
             4
