@@ -335,15 +335,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **A catalog decode declared over its ceiling now evicts decoded-cache entries
   until the budget admits it or the caches are empty** (issue #2132). Such a
-  decode is charged 0 bytes,
-  and a budget pushed over its limit by `reserve_unchecked` refuses even that.
-  The eviction pass `Catalog::reserve_decoded` runs before its one retry used
-  to stop only once the free space covered the charge, which 0 bytes always
-  did, so it evicted nothing and the refusal stood. It now evicts until the
-  budget admits the charge by the same test `try_reserve` applies. When the
-  over-limit bytes are held by cached entries, releasing them lets the retry
-  succeed and the decoder's own refusal decides the outcome; when they are held
-  elsewhere, the pass empties the caches and the retry is refused. The charge rule itself,
+  decode is charged 0 bytes, and a budget pushed over its limit by
+  `reserve_unchecked` refuses even that. The eviction pass
+  `Catalog::reserve_decoded` runs before its one retry used to stop only once
+  the free space covered the charge, which 0 bytes always did, so it evicted
+  nothing and the refusal stood. It now evicts until the budget admits the
+  charge by the same test `try_reserve` applies. When the over-limit bytes are
+  held by cached entries, releasing them lets the retry succeed and the
+  decoder's own refusal decides the outcome; when they are held elsewhere, the
+  pass empties the caches and the retry is refused. The charge rule itself,
   `decoded_charge`, now lives once in `ravel-memory`, and both the query
   fetcher and the catalog call it.
 - **`ravel-cli load --signal logs` loads a dictionary-encoded hex `trace_id` or
