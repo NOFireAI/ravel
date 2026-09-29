@@ -4390,7 +4390,10 @@ mod tests {
              scan nothing to look up"
         );
         assert_eq!(acc[0].cache_misses, 3, "cold run's fetcher-cache misses");
-        assert_eq!(acc[0].object_store_bytes, 836, "cold run's store bytes");
+        // 846 = the 836 of RLOG v4 plus the v5 BLOOM covered-column list for
+        // this object's two string columns: a 4-byte count, two 1-byte ids and
+        // the 4-byte crc32c over them.
+        assert_eq!(acc[0].object_store_bytes, 846, "cold run's store bytes");
 
         // Warm run: served from cache, so it drops to plan reads only.
         assert_eq!(
