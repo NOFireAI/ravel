@@ -70,8 +70,8 @@
 use crate::complexity_guard;
 use datafusion::sql::parser::Statement as DFStatement;
 use datafusion::sql::sqlparser::ast::{
-    Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, Query, SetExpr, Statement,
-    TableFactor, Visit, Visitor,
+    Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectNamePart, Query,
+    SetExpr, Statement, TableFactor, Visit, Visitor,
 };
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
@@ -335,6 +335,66 @@ pub(crate) fn referenced_base_tables(sql: &str) -> Result<BTreeSet<String>, Vali
     // A CTE-declared name is query-local, never a base-table reference.
     tables.retain(|table| !ctes.contains(table));
     Ok(tables)
+}
+
+/// The first table reference in `sql` that can never name a table a session
+/// registers: a table-function call (`read_parquet(...)`, `TABLE(...)`,
+/// `range(0, 10)`), or a table name that is a URL or a path, which is any name
+/// part quoted with `'` or holding a `/` or a `:` (`'s3://bucket/x.parquet'`,
+/// `'ravel-pq://<tenant_hash>/...'`).
+///
+/// A session admits no table function and has no URL table, so such a
+/// statement always fails to plan. The executor refuses it with the same
+/// planning error before resolving anything, so it reads no object from any
+/// store (ADR-2040 decision D4).
+pub(crate) fn unreadable_table_reference(sql: &str) -> Result<Option<String>, ValidationError> {
+    let statements = complexity_guard::parse_guarded(sql)?;
+    let mut found = None;
+    for statement in &statements {
+        if let DFStatement::Statement(inner) = statement
+            && let Statement::Query(query) = inner.as_ref()
+            && let ControlFlow::Break(name) = query.visit(&mut UnreadableTableFinder)
+        {
+            found = Some(name);
+            break;
+        }
+    }
+    Ok(found)
+}
+
+/// Stops at the first table factor [`unreadable_table_reference`] describes.
+struct UnreadableTableFinder;
+
+impl Visitor for UnreadableTableFinder {
+    type Break = String;
+
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<String> {
+        match factor {
+            TableFactor::Table {
+                name,
+                args: Some(_),
+                ..
+            }
+            | TableFactor::Function { name, .. } => ControlFlow::Break(name.to_string()),
+            TableFactor::TableFunction { expr, .. } => ControlFlow::Break(format!("TABLE({expr})")),
+            TableFactor::Table { name, .. } => {
+                let url_like = name.0.iter().any(|part| match part {
+                    ObjectNamePart::Identifier(ident) => {
+                        ident.quote_style == Some('\'')
+                            || ident.value.contains('/')
+                            || ident.value.contains(':')
+                    }
+                    ObjectNamePart::Function(_) => true,
+                });
+                if url_like {
+                    ControlFlow::Break(name.to_string())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            }
+            _ => ControlFlow::Continue(()),
+        }
+    }
 }
 
 /// Collects every table-factor name in a query tree, plus every CTE alias the
@@ -620,6 +680,38 @@ mod tests {
 
     fn reject(sql: &str) -> ValidationError {
         validate(sql).expect_err("must be rejected")
+    }
+
+    /// Table functions and URL-shaped names are found wherever they sit in
+    /// the statement; a plain, qualified or quoted identifier is not one.
+    #[test]
+    fn unreadable_table_references_are_found_and_plain_names_are_not() {
+        for sql in [
+            "SELECT * FROM 's3://b/x.parquet'",
+            "SELECT * FROM \"file:///etc/passwd\"",
+            "SELECT * FROM read_parquet('x')",
+            "SELECT * FROM TABLE(read_parquet('x'))",
+            "SELECT * FROM hits WHERE id IN (SELECT value FROM range(0, 3))",
+            "WITH t AS (SELECT * FROM generate_series(0, 3)) SELECT * FROM t",
+        ] {
+            assert!(
+                unreadable_table_reference(sql).expect("parses").is_some(),
+                "{sql}"
+            );
+        }
+        for sql in [
+            "SELECT * FROM hits",
+            "SELECT * FROM public.hits",
+            "SELECT * FROM \"Hits\" JOIN logs ON true",
+            "WITH t AS (SELECT 1) SELECT * FROM t",
+            "SELECT 1",
+        ] {
+            assert_eq!(
+                unreadable_table_reference(sql).expect("parses"),
+                None,
+                "{sql}"
+            );
+        }
     }
 
     #[test]

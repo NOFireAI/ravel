@@ -1052,8 +1052,28 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that tenant's URL. `ParquetTableProvider` applies the D5 coercions
   (`binary_as_string` and the `ravel.cast.<column>` integer casts) and the D6
   file groups: up to `target_partitions` groups for a parallel scan, and one
-  group in manifest order, never re-split, otherwise. Nothing routes SQL to it
-  yet; issue #2053 does.
+  group in manifest order, never re-split, otherwise.
+- Parquet tables answer `POST /api/v1/sql` and Flight SQL (ADR-2040 D3, D4
+  and D6, #2053). `ravel-server --parquet-profiles` (`RAVEL_PARQUET_PROFILES`)
+  loads the credential profile file `ravel-cli` uses, and each profile's
+  read-only store is opened per bucket the first time a query reads it. A
+  statement whose only tables are Parquet tables of the caller's tenant
+  resolves each table's newest live manifest and the tenant's current grants
+  before its session is built: a file outside every current grant fails the
+  query with `LocationNotGranted`, and without a profile file a statement
+  naming a Parquet table fails with `NotConfigured` (HTTP 422). A Parquet
+  table beside a signal table is `CrossSignalQuery`; another tenant's table, a
+  dropped table and any other unknown name fail to plan as an unknown table
+  always has. Only a Parquet session's registry resolves a store, its own
+  tenant's `ravel-pq://` URL, and a statement naming a table function or a
+  URL-shaped table is refused before any store read. The reader evaluates
+  filters in the scan; an exact-typed statement scans in up to
+  `target_partitions` file groups with file-scan repartitioning on, any other
+  in one group in manifest order. A filtered scan's reader loads and checks the
+  page index first, so a page outside its column chunk is a `Corrupt` error
+  rather than a panic, and a footer refused as `Corrupt` is cached as refused.
+  `tenant parquet-grant add` lists past a zero-byte directory blob, and says so
+  when its search for an object stopped at the listing page bound.
 
 ## [0.19.0] - 2026-09-27
 

@@ -35,6 +35,7 @@ use datafusion::error::DataFusionError;
 use ravel_catalog::{CatalogError, LoadColumnStatsError};
 use ravel_query::{FetchError, FoldLag, LogFetchError};
 
+use crate::parquet::ParquetQueryError;
 use crate::spans_fetcher::SpanFetchError;
 use crate::validate::ValidationError;
 
@@ -140,16 +141,17 @@ pub enum SqlError {
     Validation(#[from] ValidationError),
 
     /// The query references two or more of the registered tables (`samples`,
-    /// `logs`, `spans`, `alerts`, `audit`). ADR-0033 decision C admits exactly
-    /// one signal per query in v1, and ADR-0045 decision 5 and ADR-1101
-    /// decision 1 extend that rule to the third, fourth and fifth tables, so
-    /// this is rejected before any catalog resolve. Its text names only the
-    /// fixed table names -- no server state -- so it is safe to return
-    /// verbatim, like a validation error, and maps to HTTP 400.
+    /// `logs`, `spans`, `alerts`, `audit`), or one of them and a Parquet table
+    /// of the caller's tenant (ADR-2040 decision D6). ADR-0033 decision C
+    /// admits exactly one signal per query in v1, and ADR-0045 decision 5 and
+    /// ADR-1101 decision 1 extend that rule to the third, fourth and fifth
+    /// tables, so this is rejected before any catalog resolve. Its text names
+    /// only the fixed table names -- no server state -- so it is safe to
+    /// return verbatim, like a validation error, and maps to HTTP 400.
     #[error(
         "a SQL query may reference exactly one of the samples, logs, spans, \
-         alerts and audit tables; two signals cannot be scanned or joined \
-         together in v1"
+         alerts and audit tables, or only Parquet tables; two signals, or a \
+         signal and a Parquet table, cannot be scanned or joined together in v1"
     )]
     CrossSignalQuery,
 
@@ -199,6 +201,12 @@ pub enum SqlError {
     /// server-side only.
     #[error("corrupt stream_attrs blob: {0}")]
     CorruptStreamAttrs(String),
+
+    /// A statement over Parquet tables (ADR-2040) was refused, or one of its
+    /// reads failed. [`crate::ParquetQueryError`] decides its own class and
+    /// what of its text a client may see.
+    #[error(transparent)]
+    Parquet(Box<ParquetQueryError>),
 
     /// A pinned segment vanished and the re-resolve-and-retry contract was
     /// exhausted (docs/consistency-model.md).
@@ -330,6 +338,12 @@ pub enum SqlError {
     Shared { class: ErrorClass, message: String },
 }
 
+impl From<ParquetQueryError> for SqlError {
+    fn from(err: ParquetQueryError) -> Self {
+        SqlError::Parquet(Box::new(err))
+    }
+}
+
 impl SqlError {
     /// Re-attribute a disabled-disk-manager spill refusal to the pool that
     /// actually filled, from the pool's `used`/`limit` at the moment of
@@ -398,6 +412,7 @@ impl SqlError {
             | SqlError::SpanFetch(_)
             | SqlError::CorruptStreamAttrs(_)
             | SqlError::SnapshotInvalidated => ErrorClass::Unavailable,
+            SqlError::Parquet(parquet) => parquet.class(),
             SqlError::DeadlineExceeded { .. } => ErrorClass::Timeout,
             SqlError::TooManySamples { .. }
             | SqlError::TooManySegments { .. }
@@ -485,6 +500,7 @@ impl SqlError {
                 | SpanFetchError::FetchMemoryExhausted { .. } => MSG_UNAVAILABLE.to_string(),
             },
             SqlError::CorruptStreamAttrs(_) => MSG_CORRUPT.to_string(),
+            SqlError::Parquet(parquet) => parquet.client_message(),
             SqlError::SnapshotInvalidated => MSG_UNAVAILABLE.to_string(),
             SqlError::DeadlineExceeded { .. }
             | SqlError::TooManySamples { .. }

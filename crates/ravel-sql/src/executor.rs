@@ -22,9 +22,15 @@
 //!    naming one metric prunes by postings exactly as PromQL does; a logs
 //!    query or one with no such predicate resolves unpruned, identical to the
 //!    former plain `resolve`.
+//!
+//!    A statement whose only tables are Parquet tables of the caller's tenant
+//!    (ADR-2040) resolves no catalog: [`SqlExecutor::resolve_parquet_target`]
+//!    reads each table's newest live manifest and the tenant's current grants
+//!    instead, and refuses a file outside every grant. A Parquet table beside
+//!    a signal table is [`SqlError::CrossSignalQuery`].
 //! 3. Build the fresh single-tenant `SessionContext` around the owned
-//!    `Snapshot`, registering the one table the query targets (security
-//!    invariant 2, crate::session).
+//!    `Snapshot`, registering the one table the query targets, or its Parquet
+//!    tables (security invariant 2, crate::session).
 //! 4. Plan, then execute, draining the stream under the wall deadline.
 //!
 //! # Snapshot retry contract
@@ -69,7 +75,7 @@
 //! never returned (docs/query-engine.md "Budgets").
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -78,9 +84,11 @@ use std::time::{Duration, Instant};
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::error::ArrowError;
+use datafusion::catalog::TableProvider;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, DFSchema, ScalarValue, TableReference};
 use datafusion::dataframe::DataFrame;
+use datafusion::datasource::empty::EmptyTable;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::disk_manager::DiskManager;
@@ -117,6 +125,7 @@ use crate::logs_provider::LogsTableProvider;
 use crate::logs_pushdown::extract_logs;
 use crate::memory::{CeilingBreach, TenantMemoryAccountant};
 use crate::output::QueryOutput;
+use crate::parquet::{self, ParquetQueryError, ParquetResolution, ParquetSession, ParquetSources};
 use crate::provider::RavelTableProvider;
 use crate::pushdown::extract;
 use crate::session::{
@@ -126,9 +135,10 @@ use crate::session::{
 use crate::spans_fetcher::SpanSegmentFetcher;
 use crate::spans_provider::SpansTableProvider;
 use crate::spill::{OperatorSpill, SpillCounts, SpillScratch, accumulate_spill_counts};
-use crate::validate::{referenced_base_tables, validate};
+use crate::validate::{referenced_base_tables, unreadable_table_reference, validate};
 
-/// Which of the five v1 tables (and thus which `Signal`) a query targets.
+/// Which of the five v1 tables (and thus which `Signal`) a query targets, or
+/// whether it reads Parquet tables instead (ADR-2040).
 /// A closed enum rather than `Signal` directly: `Signal` carries a `Profiles`
 /// variant the SQL surface has no table for, and the executor must never
 /// resolve or register that.
@@ -146,18 +156,53 @@ pub enum TargetSignal {
     /// The `audit` table, resolved against `Signal::Audit` (ADR-1101
     /// decision 1).
     Audit,
+    /// Only Parquet tables of the caller's tenant (ADR-2040), resolved from
+    /// their manifests rather than from a signal's catalog.
+    Parquet,
 }
 
 impl TargetSignal {
-    fn signal(self) -> Signal {
+    /// The signal whose catalog this target resolves; `None` for Parquet
+    /// tables, which have no catalog.
+    fn signal(self) -> Option<Signal> {
         match self {
-            TargetSignal::Metrics => Signal::Metrics,
-            TargetSignal::Logs => Signal::Logs,
-            TargetSignal::Spans => Signal::Spans,
-            TargetSignal::Alerts => Signal::Alerts,
-            TargetSignal::Audit => Signal::Audit,
+            TargetSignal::Metrics => Some(Signal::Metrics),
+            TargetSignal::Logs => Some(Signal::Logs),
+            TargetSignal::Spans => Some(Signal::Spans),
+            TargetSignal::Alerts => Some(Signal::Alerts),
+            TargetSignal::Audit => Some(Signal::Audit),
+            TargetSignal::Parquet => None,
         }
     }
+}
+
+/// The base tables one statement names, split the way the target is chosen.
+struct StatementTables {
+    /// The one signal table named, if any.
+    signal: Option<TargetSignal>,
+    /// Every other base table name: Parquet tables, or names that are no
+    /// table at all.
+    others: BTreeSet<String>,
+}
+
+/// The Parquet resolve a plan starts from.
+enum ParquetPlan {
+    /// Not resolved yet: the plan resolves it itself. The Flight SQL pinned
+    /// path plans from a ticket that carries no Parquet state.
+    Unresolved,
+    /// Resolved by this request's own resolve; `None` when the statement
+    /// names no live Parquet table.
+    Resolved(Option<ParquetResolution>),
+}
+
+/// What one resolve produced for one statement.
+struct Resolved {
+    snapshot: Snapshot,
+    admission: SegmentAdmission,
+    estimate: CostEstimate,
+    unfolded_segments_resolved: u64,
+    target: TargetSignal,
+    parquet: Option<ParquetResolution>,
 }
 
 /// The coordinator-side distributed samples scan for one query: the minted
@@ -201,6 +246,9 @@ struct PlanExtras {
     /// The injected clock reading paired with `column_stats_window`, same
     /// provenance rule.
     column_stats_now_ns: i64,
+    /// The Parquet tables the statement reads, when its resolve already
+    /// resolved them.
+    parquet: ParquetPlan,
 }
 
 /// One SQL request, fully resolved from its transport.
@@ -501,11 +549,12 @@ fn accumulate_block_counts(plan: &Arc<dyn ExecutionPlan>, counts: &mut BlockCoun
 /// a span's event time is its `start_ts` (`end_ts` is when it finished), and
 /// the two RLOG-backed tables carry `ts_ns`. All five are
 /// `Timestamp(Nanosecond, None)`, so one literal type serves them all.
-fn window_ts_column(target: TargetSignal) -> &'static str {
+fn window_ts_column(target: TargetSignal) -> Option<&'static str> {
     match target {
-        TargetSignal::Metrics | TargetSignal::Logs => "ts",
-        TargetSignal::Spans => "start_ts",
-        TargetSignal::Alerts | TargetSignal::Audit => "ts_ns",
+        TargetSignal::Metrics | TargetSignal::Logs => Some("ts"),
+        TargetSignal::Spans => Some("start_ts"),
+        TargetSignal::Alerts | TargetSignal::Audit => Some("ts_ns"),
+        TargetSignal::Parquet => None,
     }
 }
 
@@ -694,6 +743,13 @@ fn unbounded_estimate_components(target: TargetSignal) -> Vec<&'static str> {
         TargetSignal::Logs | TargetSignal::Spans | TargetSignal::Alerts | TargetSignal::Audit => {
             vec!["estimated_decompressed_bytes"]
         }
+        // No estimator reads a manifest yet, so the zero estimate a Parquet
+        // statement carries bounds nothing.
+        TargetSignal::Parquet => vec![
+            "estimated_requests",
+            "estimated_store_bytes",
+            "estimated_decompressed_bytes",
+        ],
     }
 }
 
@@ -892,6 +948,10 @@ pub struct SqlExecutor {
     /// call site stay source-compatible; a caller installs the real cache-aside
     /// overlay (#302) with [`Self::with_declared_column_source`].
     declared_source: Arc<dyn DeclaredColumnSource>,
+    /// What Parquet tables are read through (ADR-2040). `None` leaves every
+    /// name that is not a signal table resolving exactly as it did before
+    /// Parquet tables existed.
+    parquet: Option<ParquetSources>,
 }
 
 /// One tenant's memory accountant plus the last-touch stamp idle-tenant
@@ -924,7 +984,22 @@ impl SqlExecutor {
             tenants: Mutex::new(HashMap::new()),
             process_memory_budget: Arc::new(MemoryBudget::unlimited()),
             declared_source: default_declared_source(),
+            parquet: None,
         }
+    }
+
+    /// Make Parquet tables queryable (ADR-2040): a statement whose only
+    /// tables are Parquet tables of the caller's tenant resolves their
+    /// manifests through `sources` and reads their files through its external
+    /// stores.
+    pub fn with_parquet_sources(mut self, sources: ParquetSources) -> Self {
+        self.parquet = Some(sources);
+        self
+    }
+
+    /// The Parquet sources [`Self::with_parquet_sources`] installed.
+    pub fn parquet_sources(&self) -> Option<&ParquetSources> {
+        self.parquet.as_ref()
     }
 
     /// Install the process-wide memory budget every tenant accountant this
@@ -1171,13 +1246,20 @@ impl SqlExecutor {
         // caller's own `accounting`, just under the API the shared
         // `resolve_admitted`/`plan_pinned_with` now take.
         let phase_accounting = PhaseAccounting::pooled_over(accounting);
-        let target = Self::target_signal(&req.sql)?;
+        Self::statement_tables(&req.sql)?;
         let declared = self.resolve_declared_columns(tenant_hash, req.now_ns).await;
         // `resolve_admitted` itself checks the effective `max_s3_requests`
         // right after resolve returns, so `explain` gets that enforcement
         // for free here without ever reaching the segment-fetch loop in
         // scan.rs (which it never runs: explain issues no data GET).
-        let (snapshot, admission, estimate, _unfolded_segments_resolved) = self
+        let Resolved {
+            snapshot,
+            admission,
+            estimate,
+            target,
+            parquet,
+            ..
+        } = self
             .resolve_admitted(tenant_hash, req, &phase_accounting)
             .await?;
         let segments_resolved = snapshot.segments.len();
@@ -1196,6 +1278,7 @@ impl SqlExecutor {
                     budgets: req.budgets,
                     column_stats_window: req.window,
                     column_stats_now_ns: req.now_ns,
+                    parquet: ParquetPlan::Resolved(parquet),
                 },
             )
             .await?;
@@ -1242,11 +1325,12 @@ impl SqlExecutor {
         // one instant together.
         let declared = self.resolve_declared_columns(tenant_hash, req.now_ns).await;
 
-        // Resolved from the statement text alone, so it is attempt-independent
-        // and identical to what `explain` reports for the same text. Resolved
-        // before the loop so a cross-signal statement fails here rather than
-        // after a snapshot resolve has already been paid for.
-        let target = Self::target_signal(&req.sql)?;
+        // Checked from the statement text alone, before the loop, so a
+        // statement naming two signal tables fails here rather than after a
+        // snapshot resolve has already been paid for. Which target it reads is
+        // each attempt's resolve's answer: whether a name is a Parquet table
+        // is a fact about the store, not the text.
+        Self::statement_tables(&req.sql)?;
 
         // At most two passes: the original and the one retry the
         // consistency model allows. Each pass gets its own QueryAccounting
@@ -1264,8 +1348,14 @@ impl SqlExecutor {
             // whose snapshot resolves to zero segments cannot slip past this
             // ceiling on the strength that it never reaches the
             // segment-fetch loop in scan.rs.
-            let (snapshot, estimate, unfolded_segments_resolved) =
-                self.resolve(tenant_hash, req, &phase_accounting).await?;
+            let Resolved {
+                snapshot,
+                estimate,
+                unfolded_segments_resolved,
+                target,
+                parquet,
+                ..
+            } = self.resolve(tenant_hash, req, &phase_accounting).await?;
             stats.resolves += 1;
             stats.attempts += 1;
             stats.segments = snapshot.segments.len();
@@ -1285,7 +1375,14 @@ impl SqlExecutor {
             );
 
             let (result, emitted, blocks, spill, spill_by_operator, caps) = self
-                .attempt(tenant_hash, req, snapshot, &phase_accounting, &declared)
+                .attempt(
+                    tenant_hash,
+                    req,
+                    snapshot,
+                    &phase_accounting,
+                    &declared,
+                    parquet,
+                )
                 .await;
             stats.batches_emitted += emitted;
             // Overwritten per attempt, like `spill` below: these describe the
@@ -1362,7 +1459,9 @@ impl SqlExecutor {
         // phase-split handle to hand in): `pooled_over` shares this same
         // handle's counters across all four phases, so the resolve's cost
         // still lands on `accounting` exactly as before.
-        let (snapshot, estimate, _unfolded_segments_resolved) = self
+        let Resolved {
+            snapshot, estimate, ..
+        } = self
             .resolve(tenant_hash, req, &PhaseAccounting::pooled_over(accounting))
             .await?;
         Ok((snapshot, estimate))
@@ -1414,6 +1513,7 @@ impl SqlExecutor {
                 budgets: None,
                 column_stats_window: window,
                 column_stats_now_ns: now_ns,
+                parquet: ParquetPlan::Unresolved,
             },
         )
         .await
@@ -1452,6 +1552,7 @@ impl SqlExecutor {
                 budgets: None,
                 column_stats_window: window,
                 column_stats_now_ns: now_ns,
+                parquet: ParquetPlan::Unresolved,
             },
         )
         .await
@@ -1497,16 +1598,60 @@ impl SqlExecutor {
         // build its own throwaway session and analyze the same SQL, so a logs
         // query with declared columns planned three times before executing
         // once. The build happens only when a consumer will read it.
-        let wants_stats_gate = matches!(Self::target_signal(sql), Ok(TargetSignal::Logs))
-            && !extras.declared.is_empty();
+        //
+        // ADR-2040: a statement over Parquet tables resolves them here unless
+        // its request's resolve already did (the Flight SQL pinned path plans
+        // from a ticket that carries none), and builds each table's provider
+        // before classification, which plans against their schemas.
+        let tables = Self::statement_tables(sql)?;
+        let parquet = match extras.parquet {
+            ParquetPlan::Resolved(resolution) => resolution,
+            ParquetPlan::Unresolved => {
+                self.resolve_parquet_target(tenant_hash, sql, &tables, phase_accounting)
+                    .await?
+            }
+        };
+        let target = if parquet.is_some() {
+            TargetSignal::Parquet
+        } else {
+            tables.signal.unwrap_or(TargetSignal::Metrics)
+        };
+        let parquet_tables = match (parquet, &self.parquet) {
+            (Some(resolution), Some(sources)) => {
+                let tables = parquet::build_tables(
+                    sources,
+                    tenant_hash,
+                    &resolution,
+                    phase_accounting,
+                    false,
+                )
+                .await?;
+                Some((resolution, tables))
+            }
+            (Some(_), None) => {
+                return Err(SqlError::Internal(
+                    "a Parquet resolution reached an executor without Parquet sources".to_string(),
+                ));
+            }
+            (None, _) => None,
+        };
+        let parquet_schemas = parquet_tables
+            .as_ref()
+            .map(|(_, tables)| parquet::schemas(tables));
+        let wants_stats_gate = matches!(target, TargetSignal::Logs) && !extras.declared.is_empty();
         // ADR-0954: the spill eligibility predicate reads the same analyzed
         // plan, so a configured-spill deployment is a third consumer of it
         // rather than a second analyze pass.
         let wants_spill_gate = config.spill.is_some();
         let analyzed = if config.parallel_final_aggregation || wants_stats_gate || wants_spill_gate
         {
-            self.analyzed_classification_plan(tenant_hash, sql, &extras.declared)
-                .await
+            self.analyzed_classification_plan(
+                tenant_hash,
+                sql,
+                &extras.declared,
+                parquet_schemas.as_deref(),
+            )
+            .await
         } else {
             None
         };
@@ -1541,7 +1686,6 @@ impl SqlExecutor {
         // Build the one table the query targets over the snapshot resolved for
         // its signal. `resolve` already resolved `snapshot` against exactly
         // this signal, so the provider and the snapshot always agree.
-        let target = Self::target_signal(sql)?;
         let table = match target {
             TargetSignal::Metrics => {
                 #[cfg_attr(not(feature = "flight-sql"), allow(unused_mut))]
@@ -1651,6 +1795,30 @@ impl SqlExecutor {
                 self.log_fetcher.clone(),
                 phase_accounting.scan().clone(),
             ))),
+            // ADR-2040 D6: an exact-typed statement scans in up to
+            // `target_partitions` file groups; every other one scans one group
+            // in manifest file order, so its aggregates fold in a fixed order.
+            TargetSignal::Parquet => {
+                let Some((resolution, tables)) = parquet_tables else {
+                    return Err(SqlError::Internal(
+                        "the Parquet target was chosen without its tables".to_string(),
+                    ));
+                };
+                let tables = if exact_typed_aggregates {
+                    tables
+                        .into_iter()
+                        .map(|(name, provider)| {
+                            provider
+                                .with_parallel(true)
+                                .map(|provider| (name, provider))
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(ParquetQueryError::from)?
+                } else {
+                    tables
+                };
+                SessionTable::Parquet(parquet::session_tables(tenant_hash, &resolution, tables))
+            }
         };
 
         let decision = match &scratch {
@@ -1670,11 +1838,10 @@ impl SqlExecutor {
         // schema).
         let window_predicate = match extras.row_window {
             Some(window) => {
-                let (plan, predicate) = apply_row_window(
-                    frame.logical_plan().clone(),
-                    window_ts_column(target),
-                    window,
-                )?;
+                let ts_column =
+                    window_ts_column(target).ok_or(ParquetQueryError::RowWindowUnsupported)?;
+                let (plan, predicate) =
+                    apply_row_window(frame.logical_plan().clone(), ts_column, window)?;
                 frame = DataFrame::new(ctx.state(), plan);
                 predicate
             }
@@ -1715,7 +1882,12 @@ impl SqlExecutor {
         config: &crate::distributed::DistributedFlightConfig,
         template: &crate::flight_ticket::FlightTicket,
     ) -> Option<Vec<crate::distributed::WorkerSlice>> {
-        if !matches!(Self::target_signal(sql).ok()?, TargetSignal::Metrics) {
+        let tables = Self::statement_tables(sql).ok()?;
+        if !matches!(
+            tables.signal.unwrap_or(TargetSignal::Metrics),
+            TargetSignal::Metrics
+        ) || !tables.others.is_empty()
+        {
             return None;
         }
         let estimate = estimate_metrics_cost(snapshot, 0);
@@ -1797,11 +1969,9 @@ impl SqlExecutor {
         tenant_hash: TenantHash,
         req: &SqlRequest,
         phase_accounting: &PhaseAccounting,
-    ) -> Result<(Snapshot, CostEstimate, u64), SqlError> {
-        let (snapshot, _admission, estimate, unfolded_segments_resolved) = self
-            .resolve_admitted(tenant_hash, req, phase_accounting)
-            .await?;
-        Ok((snapshot, estimate, unfolded_segments_resolved))
+    ) -> Result<Resolved, SqlError> {
+        self.resolve_admitted(tenant_hash, req, phase_accounting)
+            .await
     }
 
     /// This executor's configuration with `budgets` applied (ADR-1374
@@ -1828,14 +1998,42 @@ impl SqlExecutor {
         tenant_hash: TenantHash,
         req: &SqlRequest,
         phase_accounting: &PhaseAccounting,
-    ) -> Result<(Snapshot, SegmentAdmission, CostEstimate, u64), SqlError> {
+    ) -> Result<Resolved, SqlError> {
         // Idle-tenant eviction last-touch (ADR-0069 decision 2): stamp this
         // tenant's activity with the request's injected clock before resolving.
         // This is the one funnel both the HTTP (`execute`/`run`) and Flight SQL
         // (`resolve_snapshot`) paths pass through, so any tenant running a query
         // is kept out of the idle sweep.
         self.touch_tenant(tenant_hash, req.now_ns);
-        let target = Self::target_signal(&req.sql)?;
+        let tables = Self::statement_tables(&req.sql)?;
+        // ADR-2040: a statement whose only tables are Parquet tables resolves
+        // their manifests here instead of a signal's catalog. A Parquet table
+        // has no segments, so there is nothing to admit against
+        // `max_segments`.
+        if let Some(resolution) = self
+            .resolve_parquet_target(tenant_hash, &req.sql, &tables, phase_accounting)
+            .await?
+        {
+            return Ok(Resolved {
+                snapshot: Snapshot {
+                    segments: Vec::new(),
+                    segments_pruned: 0,
+                    pending_erasure: Vec::new(),
+                },
+                admission: SegmentAdmission {
+                    sealed_count: 0,
+                    exempt_count: 0,
+                },
+                estimate: CostEstimate::new(0, 0, 0, 0, 0),
+                unfolded_segments_resolved: 0,
+                target: TargetSignal::Parquet,
+                parquet: Some(resolution),
+            });
+        }
+        let target = tables.signal.unwrap_or(TargetSignal::Metrics);
+        let signal = target.signal().ok_or_else(|| {
+            SqlError::Internal("a signal-table resolve reached the Parquet target".to_string())
+        })?;
         // Postings pruning by the equality `__name__` predicate pushed down
         // from the query's WHERE clause. Without this the SQL
         // path called plain `Catalog::resolve`, so the measured 5.9-40.9x
@@ -1853,7 +2051,8 @@ impl SqlExecutor {
             TargetSignal::Logs
             | TargetSignal::Spans
             | TargetSignal::Alerts
-            | TargetSignal::Audit => None,
+            | TargetSignal::Audit
+            | TargetSignal::Parquet => None,
         };
         let catalog_requests = self
             .catalog
@@ -1862,7 +2061,7 @@ impl SqlExecutor {
             .catalog
             .resolve_pruned_with_admission(
                 &tenant_hash,
-                target.signal(),
+                signal,
                 req.window,
                 &req.min_tokens,
                 req.now_ns,
@@ -1898,6 +2097,7 @@ impl SqlExecutor {
                 estimate_logs_cost(&snapshot, catalog_requests)
             }
             TargetSignal::Spans => estimate_spans_cost(&snapshot, catalog_requests),
+            TargetSignal::Parquet => CostEstimate::new(0, 0, 0, 0, 0),
         };
         // Checked here, in the one resolve path `execute`, `explain`, and the
         // Flight SQL `resolve_snapshot` all funnel through, right after
@@ -1938,7 +2138,64 @@ impl SqlExecutor {
                 fold_lag,
             });
         }
-        Ok((snapshot, admission, estimate, unfolded_segments_resolved))
+        Ok(Resolved {
+            snapshot,
+            admission,
+            estimate,
+            unfolded_segments_resolved,
+            target,
+            parquet: None,
+        })
+    }
+
+    /// The Parquet tables `sql` reads, when it reads any (ADR-2040 D3, D6).
+    ///
+    /// - A table function or a URL-shaped table name is refused with the
+    ///   planning error it would meet anyway, before anything is read.
+    /// - Without [`ParquetSources`], or when the statement names nothing but
+    ///   signal tables, this is `None` and reads nothing.
+    /// - A signal table beside a name that has Parquet manifest versions is
+    ///   [`SqlError::CrossSignalQuery`].
+    /// - With no credential profiles configured, a name with manifest versions
+    ///   is [`ParquetQueryError::NotConfigured`], from one LIST per name and no
+    ///   GET.
+    /// - Otherwise each name's newest live manifest, checked against the
+    ///   tenant's current grants; `None` when no name is a live Parquet table,
+    ///   so the statement then plans, and fails, as a statement naming an
+    ///   unknown table always has.
+    ///
+    /// Every read here is charged to the Resolve phase.
+    async fn resolve_parquet_target(
+        &self,
+        tenant_hash: TenantHash,
+        sql: &str,
+        tables: &StatementTables,
+        phase_accounting: &PhaseAccounting,
+    ) -> Result<Option<ParquetResolution>, SqlError> {
+        if let Some(name) = unreadable_table_reference(sql)? {
+            return Err(SqlError::Plan(format!(
+                "{name} is not a table this session can read: table functions and URL tables \
+                 are not admitted"
+            )));
+        }
+        let Some(sources) = &self.parquet else {
+            return Ok(None);
+        };
+        if tables.others.is_empty() {
+            return Ok(None);
+        }
+        let accounting = phase_accounting.resolve();
+        if tables.signal.is_some() || !sources.is_configured() {
+            let named =
+                parquet::names_with_versions(sources, &tenant_hash, &tables.others, accounting)
+                    .await?;
+            return match named.into_iter().next() {
+                Some(_) if tables.signal.is_some() => Err(SqlError::CrossSignalQuery),
+                Some(table) => Err(ParquetQueryError::NotConfigured { table }.into()),
+                None => Ok(None),
+            };
+        }
+        Ok(parquet::resolve_tables(sources, &tenant_hash, &tables.others, accounting).await?)
     }
 
     /// This query's [`QueryIoShape`] (issue #1214), mirroring
@@ -1996,6 +2253,9 @@ impl SqlExecutor {
             // should never carry a zero object size, so that case does not
             // arise here in practice.
             TargetSignal::Spans => (u64::MAX, self.span_fetcher.get_limiter_permits() as u64),
+            // A Parquet statement resolves no segments, so neither figure is
+            // read; the scan's own reads go through the same process limiter.
+            TargetSignal::Parquet => (u64::MAX, self.fetcher.get_limiter_permits() as u64),
         };
         let mut counts = IoShapeCounts::default();
         let depth = snapshot
@@ -2053,7 +2313,8 @@ impl SqlExecutor {
             TargetSignal::Logs
             | TargetSignal::Spans
             | TargetSignal::Alerts
-            | TargetSignal::Audit => PlanClass::Unclassified,
+            | TargetSignal::Audit
+            | TargetSignal::Parquet => PlanClass::Unclassified,
         };
         counts.into_shape(
             unfolded_segments_resolved,
@@ -2141,7 +2402,7 @@ impl SqlExecutor {
         declared: &[DeclaredColumn],
     ) -> bool {
         match self
-            .analyzed_classification_plan(tenant_hash, sql, declared)
+            .analyzed_classification_plan(tenant_hash, sql, declared, None)
             .await
         {
             Some(plan) => plan_is_exact_typed(&plan),
@@ -2158,14 +2419,36 @@ impl SqlExecutor {
     /// physical planning applies before optimization; running it here is what
     /// resolves, for example, `avg`'s argument to `Float64` and an integer
     /// `sum`'s argument to `Int64` before the walk inspects their types.
+    ///
+    /// `parquet` carries the resolved Parquet tables' names and schemas for a
+    /// statement over them (ADR-2040 D6): the plan is then built over an empty
+    /// table of each schema, so its aggregates and keys classify by the types
+    /// the real scan produces. `None` builds the empty table of the signal the
+    /// statement names.
     async fn analyzed_classification_plan(
         &self,
         tenant_hash: TenantHash,
         sql: &str,
         declared: &[DeclaredColumn],
+        parquet: Option<&[(String, SchemaRef)]>,
     ) -> Option<LogicalPlan> {
-        let target = Self::target_signal(sql).ok()?;
-        let table = self.empty_snapshot_table(target, tenant_hash, declared);
+        let table = match parquet {
+            Some(schemas) => SessionTable::Parquet(ParquetSession {
+                tables: schemas
+                    .iter()
+                    .map(|(name, schema)| {
+                        let table: Arc<dyn TableProvider> =
+                            Arc::new(EmptyTable::new(Arc::clone(schema)));
+                        (name.clone(), table)
+                    })
+                    .collect(),
+                store: Arc::new(ravel_parquet::TenantParquetStore::new(tenant_hash)),
+            }),
+            None => {
+                let target = Self::target_signal(sql).ok()?;
+                self.empty_snapshot_table(target, tenant_hash, declared)
+            }
+        };
         // A private, unbounded pool: this session never executes, so nothing is
         // ever reserved against it and it never touches the tenant accountant.
         let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
@@ -2317,6 +2600,13 @@ impl SqlExecutor {
                 self.log_fetcher.clone(),
                 QueryAccounting::new(),
             ))),
+            // A Parquet table's schema comes from its resolved footer, which
+            // this schema-only helper does not have; a session with no table
+            // plans nothing, which the classification treats as not exact.
+            TargetSignal::Parquet => SessionTable::Parquet(ParquetSession {
+                tables: Vec::new(),
+                store: Arc::new(ravel_parquet::TenantParquetStore::new(tenant_hash)),
+            }),
         }
     }
 
@@ -2345,13 +2635,27 @@ impl SqlExecutor {
     /// metrics snapshot and never touched it -- and `crate::validate` already
     /// rules out anything that would need a data source it cannot reach. Only
     /// the multiple-table case is genuinely unsupported, so only it is an error.
+    ///
+    /// ADR-2040 D6 adds Parquet tables, which this text-only answer cannot see:
+    /// whether a name is one is a fact about the store. A statement naming
+    /// only Parquet tables returns `Metrics` here, and [`Self::resolve_admitted`]
+    /// and [`Self::plan_pinned_with`] choose [`TargetSignal::Parquet`] once the
+    /// manifests are resolved.
     fn target_signal(sql: &str) -> Result<TargetSignal, SqlError> {
-        let tables = referenced_base_tables(sql)?;
-        let has_samples = tables.contains(SAMPLES_TABLE);
-        let has_logs = tables.contains(LOGS_TABLE);
-        let has_spans = tables.contains(SPANS_TABLE);
-        let has_alerts = tables.contains(ALERTS_TABLE);
-        let has_audit = tables.contains(AUDIT_TABLE);
+        Ok(Self::statement_tables(sql)?
+            .signal
+            .unwrap_or(TargetSignal::Metrics))
+    }
+
+    /// The base tables `sql` names: the one signal table, if any, and every
+    /// other name. Two signal tables are [`SqlError::CrossSignalQuery`].
+    fn statement_tables(sql: &str) -> Result<StatementTables, SqlError> {
+        let mut tables = referenced_base_tables(sql)?;
+        let has_samples = tables.remove(SAMPLES_TABLE);
+        let has_logs = tables.remove(LOGS_TABLE);
+        let has_spans = tables.remove(SPANS_TABLE);
+        let has_alerts = tables.remove(ALERTS_TABLE);
+        let has_audit = tables.remove(AUDIT_TABLE);
         // Naming two of the five real tables crosses signals: v1 resolves one
         // snapshot per query, so this is rejected before any catalog listing.
         let named = u8::from(has_samples)
@@ -2362,18 +2666,23 @@ impl SqlExecutor {
         if named > 1 {
             return Err(SqlError::CrossSignalQuery);
         }
-        if has_logs {
-            Ok(TargetSignal::Logs)
+        let signal = if has_logs {
+            Some(TargetSignal::Logs)
         } else if has_spans {
-            Ok(TargetSignal::Spans)
+            Some(TargetSignal::Spans)
         } else if has_alerts {
-            Ok(TargetSignal::Alerts)
+            Some(TargetSignal::Alerts)
         } else if has_audit {
-            Ok(TargetSignal::Audit)
+            Some(TargetSignal::Audit)
+        } else if has_samples {
+            Some(TargetSignal::Metrics)
         } else {
-            // `samples` only, or no real table at all: metrics by default.
-            Ok(TargetSignal::Metrics)
-        }
+            None
+        };
+        Ok(StatementTables {
+            signal,
+            others: tables,
+        })
     }
 
     /// Build a session over `snapshot`, plan, and drain the stream.
@@ -2387,6 +2696,7 @@ impl SqlExecutor {
         snapshot: Snapshot,
         phase_accounting: &PhaseAccounting,
         declared: &[DeclaredColumn],
+        parquet: Option<ParquetResolution>,
     ) -> (
         Result<QueryOutput, SqlError>,
         usize,
@@ -2409,6 +2719,7 @@ impl SqlExecutor {
                     budgets: req.budgets,
                     column_stats_window: req.window,
                     column_stats_now_ns: req.now_ns,
+                    parquet: ParquetPlan::Resolved(parquet),
                 },
             )
             .await
@@ -3076,7 +3387,10 @@ fn plan_error(err: DataFusionError) -> SqlError {
         Ok(sql) => sql,
         Err(other) => match other {
             DataFusionError::ResourcesExhausted(msg) => SqlError::ResourcesExhausted(msg),
-            other => SqlError::Plan(other.to_string()),
+            other => match parquet::read_error(&other) {
+                Some(read) => ParquetQueryError::Read(read).into(),
+                None => SqlError::Plan(other.to_string()),
+            },
         },
     }
 }
@@ -3104,7 +3418,12 @@ fn execution_error(err: DataFusionError, pool: &Arc<dyn MemoryPool>) -> SqlError
         Ok(sql) => sql,
         Err(other) => match other {
             DataFusionError::ResourcesExhausted(msg) => SqlError::ResourcesExhausted(msg),
-            other => return SqlError::Execution(other.to_string()),
+            // A Parquet read fails inside DataFusion's own scan, which wraps
+            // the reader's typed error rather than a `SqlError`.
+            other => match parquet::read_error(&other) {
+                Some(read) => return ParquetQueryError::Read(read).into(),
+                None => return SqlError::Execution(other.to_string()),
+            },
         },
     };
     match sql {
@@ -4687,6 +5006,7 @@ mod tests {
                 TenantHash([9u8; 16]),
                 "SELECT avg(CAST(value AS BIGINT)) AS a FROM samples",
                 &[],
+                None,
             )
             .await
             .expect("throwaway avg plan analyzes");
@@ -4734,6 +5054,7 @@ mod tests {
                 TenantHash([9u8; 16]),
                 "SELECT avg(value) AS a FROM samples",
                 &[],
+                None,
             )
             .await
             .expect("throwaway avg plan analyzes");
@@ -4839,6 +5160,47 @@ mod tests {
     }
 
     /// An executor over an empty store, for the idle-accountant eviction tests.
+    /// ADR-2040 D6: the spill and exact-typed classifiers see a Parquet
+    /// statement's plan, built over empty tables of the resolved schemas. A
+    /// statement naming no signal table would otherwise plan against the
+    /// metrics table, fail to find its tables, and classify as neither.
+    #[tokio::test]
+    async fn the_classification_plan_has_a_parquet_arm() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+        let executor = eviction_test_executor();
+        let tenant = TenantHash([9u8; 16]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("score", DataType::Float64, false),
+        ]));
+        let schemas = vec![("hits".to_string(), schema)];
+        let grouped = "SELECT name, count(*) FROM hits GROUP BY name";
+        let plan = executor
+            .analyzed_classification_plan(tenant, grouped, &[], Some(&schemas))
+            .await
+            .expect("a plan over the Parquet schema");
+        assert!(plan_is_spill_eligible(&plan));
+        assert!(plan_is_exact_typed(&plan));
+        let float = executor
+            .analyzed_classification_plan(
+                tenant,
+                "SELECT sum(score) FROM hits",
+                &[],
+                Some(&schemas),
+            )
+            .await
+            .expect("a plan over the Parquet schema");
+        assert!(!plan_is_exact_typed(&float));
+        assert!(
+            executor
+                .analyzed_classification_plan(tenant, grouped, &[], None)
+                .await
+                .is_none(),
+            "without the Parquet arm the statement does not plan"
+        );
+    }
+
     fn eviction_test_executor() -> SqlExecutor {
         use ravel_catalog::{Catalog, CatalogConfig};
         use ravel_object_store::memory::MemoryStore;

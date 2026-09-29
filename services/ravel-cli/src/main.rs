@@ -60,9 +60,9 @@ struct Cli {
 
     /// Path to the external credential profile file (ADR-2040 decision D1),
     /// the JSON list of named profiles `tenant parquet-grant add` resolves
-    /// `--profile` against. ravel-server will read the same file for its
-    /// Parquet-table paths once issue #2053 wires them. A top-level flag,
-    /// given before the subcommand, like the tenant-hash flags.
+    /// `--profile` against. ravel-server reads the same file, from its own
+    /// `--parquet-profiles` flag, to read Parquet tables' files. A top-level
+    /// flag, given before the subcommand, like the tenant-hash flags.
     #[arg(long, value_name = "PATH", env = "RAVEL_PARQUET_PROFILES")]
     parquet_profiles: Option<std::path::PathBuf>,
 

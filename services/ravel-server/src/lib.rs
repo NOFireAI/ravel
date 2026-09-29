@@ -652,6 +652,12 @@ pub struct ServerConfig {
     /// the `logs` table's zero-declaration base schema, exactly as before these
     /// flags existed.
     pub typed_attr_columns: crate::typed_attr_config::TypedAttrColumnConfig,
+    /// The credential profiles Parquet tables are read through (ADR-2040
+    /// decision D1), loaded by `main` from `--parquet-profiles`. [`start`]
+    /// installs Parquet sources on the shared `SqlExecutor` either way: `None`
+    /// makes every Parquet table unqueryable, and a query naming one fails
+    /// with a typed error saying no profile file is configured.
+    pub parquet_profiles: Option<Vec<ravel_object_store::external::ExternalProfile>>,
     /// `--disable-cache`: turn off every ADR-0046 read cache in the process,
     /// not just the fetcher cache. `main` sets it from
     /// `Cli::disable_cache`, the same flag `store::build_cache` reads to return
@@ -2801,7 +2807,7 @@ pub async fn start_with_heartbeat(
                 );
             }
             sweep_declared_columns = Some(declared_columns.clone());
-            let state = query::build_sql_state(
+            let state = query::build_sql_state_with_parquet(
                 catalog.clone(),
                 store.clone(),
                 config.tenant_resolver.clone(),
@@ -2827,6 +2833,9 @@ pub async fn start_with_heartbeat(
                 // installed on `metrics_state` above, so a tenant's SQL
                 // reservation and the `/metrics` gauges agree on one counter.
                 process_memory_budget.clone(),
+                // ADR-2040: the `--parquet-profiles` credential profiles, or
+                // `None`, which leaves every Parquet table unqueryable.
+                config.parquet_profiles.clone(),
             )?;
             // `build_sql_state` installs `NoopQueryAuditSink` internally;
             // override with the process-wide pipeline (ADR-0062 decision 2b).
@@ -4993,6 +5002,7 @@ PTREtiuqNQ9HYwDc6S9HnUYgt9z+qtP0A5BTFL4jvybiT6/CRnVuZ0Ds
             scrub_period: Duration::from_secs(7 * 86_400),
             indexed_fields: Default::default(),
             typed_attr_columns: Default::default(),
+            parquet_profiles: None,
             disable_cache: false,
             cache_max_bytes: 256 * 1024 * 1024,
             catalog_cache_max_bytes: 256 * 1024 * 1024,

@@ -89,6 +89,7 @@ async fn start_keyed_server(store: Arc<dyn ObjectStoreBackend>) -> ravel_server:
         scrub_period: Duration::from_secs(7 * 86_400),
         indexed_fields: Default::default(),
         typed_attr_columns: Default::default(),
+        parquet_profiles: None,
         disable_cache: false,
         cache_max_bytes: 256 * 1024 * 1024,
         catalog_cache_max_bytes: 256 * 1024 * 1024,

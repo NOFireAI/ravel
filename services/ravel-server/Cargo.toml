@@ -302,6 +302,12 @@ tempfile = { workspace = true }
 # Test-only: parks every main-runtime worker and bounds a wedged test for the
 # ADR-1702 health listener tests (`src/health_listener.rs`).
 ravel-test-support = { workspace = true }
+# Test-only: tests/sql_endpoint.rs writes a tenant's Parquet location grant and
+# table manifest the way `ravel-cli` and the DDL path do, and the Parquet file
+# the table reads. parquet 59 is the major the `arrow` dev-dependency above
+# pairs with, already in the lockfile through ravel-cli.
+ravel-pqtable = { workspace = true }
+parquet = { version = "59", default-features = false, features = ["arrow"] }
 
 [lints]
 workspace = true

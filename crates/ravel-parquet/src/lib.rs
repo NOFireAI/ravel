@@ -19,8 +19,9 @@
 //!   by `ravel-pqtable` before the session is built, and never lists the
 //!   store while planning.
 //!
-//! Nothing outside this crate's tests constructs these yet: routing SQL to
-//! [`ParquetTableProvider`] is issue #2053.
+//! `ravel-sql`'s executor builds one [`ParquetTableProvider`] per Parquet
+//! table a statement names, after resolving its manifest, and a session over
+//! them whose registry is a [`SingleStoreRegistry`].
 
 mod error;
 mod metadata_cache;

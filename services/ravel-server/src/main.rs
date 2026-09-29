@@ -189,6 +189,15 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to configure per-tenant SSE-KMS routing (--tenant-kms-config)")?;
     }
 
+    let parquet_profiles = cli.parse_parquet_profiles()?;
+    if let Some(profiles) = &parquet_profiles {
+        let names: Vec<&str> = profiles
+            .iter()
+            .map(|profile| profile.name.as_str())
+            .collect();
+        tracing::info!(profiles = ?names, "Parquet table credential profiles loaded");
+    }
+
     let tenant_tokens = cli.parse_tenant_tokens()?;
     // Fold and maintenance derive their tenant set from storage each cycle
     // (ADR-0048 decision 3), not from these flags. This is now
@@ -595,6 +604,7 @@ async fn main() -> anyhow::Result<()> {
             .context("failed to parse --scrub-period")?,
         indexed_fields,
         typed_attr_columns,
+        parquet_profiles,
         disable_cache: cli.disable_cache,
         cache_max_bytes: performance.cache_max_bytes,
         catalog_cache_max_bytes: performance.catalog_cache_max_bytes,
