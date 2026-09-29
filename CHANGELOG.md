@@ -556,7 +556,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   same report. Two new direct dependencies for the crate: `ring` (SigV4
   HMAC-SHA256 and SHA-256) and `quick-xml` 0.41 (reading the S3 XML responses),
   both already in the lock and neither pulling in an AWS SDK or a RustCrypto
-  crate. Nothing in the shipping binaries reads these reports yet, though
+  crate. `versioning` is `Unknown`, naming the element, when the
+  `?versioning` document carries anything besides `Status` and `MfaDelete`
+  (MinIO's `ExcludedPrefixes` and `ExcludeFolders` leave keys unversioned).
+  Every control-plane request is counted as an attempt in the store's
+  `StoreMetrics`, a `?versions` page under `list` and every other read under
+  `get`. The lifecycle conditions also accept a union of enabled rules on
+  exactly `t/0` through `t/f`, one per lowercase hex digit a tenant hash can
+  start with, each member's values checked as a covering rule's are; any other
+  set of narrower prefixes stays `Unknown`. `BucketProtectionParams` gains
+  `expect_replication` (the CLI's `--expect-replication`): when it is off, as
+  on the server, `?replication` is not fetched and `delete-marker-replication`
+  is `Unknown` the way unsampled `object-retention` is, never `Fail`.
+  Nothing in the shipping binaries reads these reports yet, though
   `S3Store::new` now builds the control-plane client on every construction:
   `ravel-cli store verify-protection` (task 2) and the server startup gate
   (task 3) are the callers.

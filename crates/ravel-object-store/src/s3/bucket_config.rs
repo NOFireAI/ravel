@@ -38,6 +38,7 @@ use quick_xml::events::Event;
 use crate::conformance::{
     BucketProtectionParams, BucketProtectionReport, ConditionState, ProtectionConditionId,
 };
+use crate::instrument::{StoreMetrics, StoreOp};
 
 const ALGORITHM: &str = "AWS4-HMAC-SHA256";
 const SERVICE: &str = "s3";
@@ -300,8 +301,14 @@ pub(crate) fn parse_iso8601(value: &str) -> Option<(i64, u32)> {
             if offset.len() != 5 || offset.as_bytes()[2] != b':' {
                 return None;
             }
-            let hours: i64 = offset[..2].parse().ok()?;
-            let minutes: i64 = offset[3..].parse().ok()?;
+            let digits = |field: &str| -> Option<i64> {
+                if !field.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                field.parse().ok()
+            };
+            let hours = digits(offset.get(..2)?)?;
+            let minutes = digits(offset.get(3..)?)?;
             if hours > 23 || minutes > 59 {
                 return None;
             }
@@ -673,6 +680,10 @@ fn error_code_detail(body: &[u8]) -> String {
 pub(crate) struct VersioningConfig {
     /// `Some("Enabled")`, `Some("Suspended")`, or `None` (never enabled).
     pub status: Option<String>,
+    /// Child elements other than `Status` and `MfaDelete`, such as MinIO's
+    /// `ExcludedPrefixes` and `ExcludeFolders`, which leave some keys
+    /// unversioned under `Status` `Enabled`.
+    pub unrecognized: Vec<String>,
 }
 
 /// A rule's `Status`.
@@ -687,9 +698,9 @@ pub(crate) enum RuleStatus {
 impl RuleStatus {
     fn parse(element: Result<Option<&XmlElement>, Repeated>) -> RuleStatus {
         match element.map(|e| e.map(XmlElement::value)) {
-            Ok(Some(value)) if value.eq_ignore_ascii_case("Enabled") => RuleStatus::Enabled,
-            Ok(Some(value)) if value.eq_ignore_ascii_case("Disabled") => RuleStatus::Disabled,
-            Ok(Some(value)) => RuleStatus::Other(value.to_string()),
+            Ok(Some("Enabled")) => RuleStatus::Enabled,
+            Ok(Some("Disabled")) => RuleStatus::Disabled,
+            Ok(Some(value)) => RuleStatus::Other(short_excerpt(value)),
             Ok(None) => RuleStatus::Other("<missing>".to_string()),
             Err(repeated) => RuleStatus::Other(repeated.to_string()),
         }
@@ -716,10 +727,9 @@ pub(crate) enum Days {
 impl Days {
     fn parse(element: Result<Option<&XmlElement>, Repeated>) -> Days {
         match element.map(|e| e.map(XmlElement::value)) {
-            Ok(Some(value)) => value
-                .parse()
+            Ok(Some(value)) => parse_decimal(value)
                 .map(Days::Value)
-                .unwrap_or_else(|_| Days::Invalid(value.to_string())),
+                .unwrap_or_else(|| Days::Invalid(short_excerpt(value))),
             Ok(None) => Days::Invalid("<missing>".to_string()),
             Err(repeated) => Days::Invalid(repeated.to_string()),
         }
@@ -733,6 +743,20 @@ impl Days {
     }
 }
 
+/// A day count as S3 writes one: decimal digits only, no sign, and no leading
+/// zero except a lone `0`. `u32::from_str` alone would also take `+30` and
+/// `030`.
+fn parse_decimal(value: &str) -> Option<u32> {
+    let bytes = value.as_bytes();
+    let plain = !bytes.is_empty()
+        && bytes.iter().all(u8::is_ascii_digit)
+        && (bytes[0] != b'0' || bytes.len() == 1);
+    if !plain {
+        return None;
+    }
+    value.parse().ok()
+}
+
 /// A boolean from a lifecycle rule, with the same absent/invalid split as
 /// [`Days`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -744,9 +768,9 @@ pub(crate) enum Flag {
 impl Flag {
     fn parse(element: &XmlElement) -> Flag {
         match element.value() {
-            value if value.eq_ignore_ascii_case("true") => Flag::Value(true),
-            value if value.eq_ignore_ascii_case("false") => Flag::Value(false),
-            value => Flag::Invalid(value.to_string()),
+            "true" => Flag::Value(true),
+            "false" => Flag::Value(false),
+            value => Flag::Invalid(short_excerpt(value)),
         }
     }
 }
@@ -769,14 +793,65 @@ pub(crate) enum RuleScope {
 enum Coverage {
     /// Every key under `t/`.
     Full,
-    /// A plain prefix strictly under `t/`. Several such rules could cover all
-    /// of `t/` as a union (ADR-1727 decision 3), which this reader does not
-    /// evaluate, so it is neither proof of coverage nor of its absence.
+    /// A plain prefix strictly under `t/`. On its own it is neither proof of
+    /// coverage nor of its absence; [`complete_union`] decides when a set of
+    /// them covers `t/` (ADR-1727 decision 3).
     UnionMember,
     /// No key under `t/`, or only a tag- or size-narrowed subset.
     None,
     /// An unrecognised filter.
     Unknown,
+}
+
+/// The characters a tenant segment under `t/` can start with: every key Ravel
+/// writes under `t/` is `t/<tenant_hash>/...` with the hash in lowercase hex
+/// (docs/catalog-and-mvcc.md).
+const TENANT_HASH_DIGITS: &str = "0123456789abcdef";
+
+/// The rules that together cover every key under `t/` as a union of prefixes
+/// (ADR-1727 decision 3's `rule-scope`), or an empty set when they do not.
+///
+/// "Covers every key under `t/`" means covers every key of the form
+/// `t/<d>...` where `<d>` is a lowercase hex digit, which is every key Ravel
+/// writes there. Over an arbitrary byte alphabet no finite set of narrower
+/// prefixes can be shown complete, so the only union this accepts is an
+/// exhaustive one over the first character after `t/`: for each of the sixteen
+/// hex digits `d`, at least one enabled rule whose whole scope is exactly the
+/// plain prefix `t/<d>` and for which `member` holds. A union split further
+/// down (`t/f0` .. `t/ff` in place of `t/f`), a digit spelled in upper case,
+/// or a digit with no rule leaves the set empty, and the caller keeps the
+/// narrower rules `Unknown`. Keys under `t/` that do not start with a
+/// lowercase hex digit (including the key `t/` itself) are not Ravel's and are
+/// not claimed.
+fn complete_union(
+    rules: &[LifecycleRule],
+    member: impl Fn(&LifecycleRule) -> bool,
+) -> BTreeSet<usize> {
+    let mut members: BTreeSet<usize> = BTreeSet::new();
+    let mut digits: BTreeSet<char> = BTreeSet::new();
+    for (index, rule) in rules.iter().enumerate() {
+        if rule.status != RuleStatus::Enabled || !member(rule) {
+            continue;
+        }
+        let RuleScope::Prefix(prefix) = &rule.scope else {
+            continue;
+        };
+        let mut rest = match prefix.strip_prefix(DATA_ROOT) {
+            Some(rest) => rest.chars(),
+            None => continue,
+        };
+        if let (Some(digit), None) = (rest.next(), rest.next())
+            && TENANT_HASH_DIGITS.contains(digit)
+        {
+            members.insert(index);
+            digits.insert(digit);
+        }
+    }
+    if digits.len() == TENANT_HASH_DIGITS.len() {
+        members
+    } else {
+        BTreeSet::new()
+    }
 }
 
 /// Three-valued answer for a rule property that depends on something the reader
@@ -826,9 +901,15 @@ impl RuleScope {
     fn describe(&self) -> String {
         match self {
             RuleScope::Prefix(prefix) if prefix.is_empty() => "the whole bucket".to_string(),
-            RuleScope::Prefix(prefix) => format!("prefix {prefix:?}"),
-            RuleScope::Narrowed { prefix, by } => format!("prefix {prefix:?} narrowed by {by}"),
-            RuleScope::Unrecognized(detail) => format!("an unrecognised filter ({detail})"),
+            RuleScope::Prefix(prefix) => format!("prefix {:?}", short_excerpt(prefix)),
+            RuleScope::Narrowed { prefix, by } => format!(
+                "prefix {:?} narrowed by {}",
+                short_excerpt(prefix),
+                short_excerpt(by)
+            ),
+            RuleScope::Unrecognized(detail) => {
+                format!("an unrecognised filter ({})", short_excerpt(detail))
+            }
         }
     }
 }
@@ -954,8 +1035,11 @@ pub(crate) struct ReplicationConfig {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ObjectLockConfig {
-    /// `ObjectLockEnabled` read as `Enabled` or not, `None` when the element is
-    /// missing or empty (a document that states nothing either way).
+    /// `Some(true)` when `ObjectLockEnabled` is exactly `Enabled`, the only
+    /// value S3 defines; `None` when the element is missing, empty, or spelled
+    /// any other way (a document that states nothing this reader can place).
+    /// Object Lock that is off is a 404 with its own not-configured code, not a
+    /// value here.
     pub enabled: Option<bool>,
 }
 
@@ -987,8 +1071,16 @@ pub(crate) struct ObjectVersionListing {
 
 pub(crate) fn parse_versioning(body: &[u8]) -> Result<VersioningConfig, ControlPlaneError> {
     let root = parse_document(body, "VersioningConfiguration")?;
+    let mut unrecognized: Vec<String> = root
+        .children
+        .iter()
+        .filter(|child| !matches!(child.name.as_str(), "Status" | "MfaDelete"))
+        .map(|child| short_excerpt(&child.name))
+        .collect();
+    unrecognized.dedup();
     Ok(VersioningConfig {
         status: root.single("Status")?.map(|s| s.value().to_string()),
+        unrecognized,
     })
 }
 
@@ -1032,7 +1124,7 @@ fn lifecycle_rule(rule: &XmlElement) -> LifecycleRule {
         Ok(Some(action)) => {
             out.noncurrent_days = Some(match action.single("NewerNoncurrentVersions") {
                 Ok(newer) => {
-                    out.newer_noncurrent_versions = newer.map(|n| n.value().to_string());
+                    out.newer_noncurrent_versions = newer.map(|n| short_excerpt(n.value()));
                     Days::parse(action.single("NoncurrentDays"))
                 }
                 Err(repeated) => Days::Invalid(repeated.to_string()),
@@ -1062,7 +1154,7 @@ fn lifecycle_rule(rule: &XmlElement) -> LifecycleRule {
 /// position instead; no condition reads the ID.
 fn rule_id(rule: &XmlElement) -> Option<String> {
     match rule.single("ID") {
-        Ok(id) => id.map(|id| id.value().to_string()),
+        Ok(id) => id.map(|id| short_excerpt(id.value())),
         Err(_) => None,
     }
 }
@@ -1083,7 +1175,7 @@ fn read_expiration(expiration: &XmlElement, out: &mut LifecycleRule) {
     }
     match expiration.single("Date") {
         Ok(None) => {}
-        Ok(Some(date)) => out.expiration_date = Some(date.value().to_string()),
+        Ok(Some(date)) => out.expiration_date = Some(short_excerpt(date.value())),
         Err(repeated) => out.expiration_unrecognized = Some(format!("<Expiration> {repeated}")),
     }
     match expiration.single("ExpiredObjectDeleteMarker") {
@@ -1118,9 +1210,7 @@ pub(crate) fn parse_object_lock(body: &[u8]) -> Result<ObjectLockConfig, Control
     Ok(ObjectLockConfig {
         enabled: root
             .single("ObjectLockEnabled")?
-            .map(XmlElement::value)
-            .filter(|value| !value.is_empty())
-            .map(|value| value.eq_ignore_ascii_case("Enabled")),
+            .and_then(|value| (value.value() == "Enabled").then_some(true)),
     })
 }
 
@@ -1165,10 +1255,14 @@ pub(crate) fn parse_object_versions(
     };
     for version in root.children_named("Version") {
         listing.versions.push(ObjectVersion {
-            key: version
-                .single("Key")?
-                .map(|k| k.text.clone())
-                .unwrap_or_default(),
+            key: match version.single("Key")? {
+                Some(key) => key.text.clone(),
+                None => {
+                    return Err(ControlPlaneError::Parse(
+                        "a listed version carries no Key".to_string(),
+                    ));
+                }
+            },
             version_id: match version.single("VersionId")?.map(XmlElement::value) {
                 Some(id) if !id.is_empty() => id.to_string(),
                 _ => {
@@ -1200,10 +1294,16 @@ const RETENTION_NOT_CONFIGURED: &[&str] = &["NoSuchObjectLockConfiguration"];
 
 /// A read-only bucket-configuration client for one S3 bucket (ADR-1727 decision
 /// 1). Holds the `reqwest` client, the credential provider `S3Store` already
-/// owns, and enough of `S3Config` to address and sign requests.
+/// owns, the store's request metrics, and enough of `S3Config` to address and
+/// sign requests.
 pub(crate) struct BucketControlPlaneClient {
     client: reqwest::Client,
     credentials: AwsCredentialProvider,
+    /// The store's own [`StoreMetrics`]: every request here is billed like a
+    /// data-plane one, so it is counted as an attempt in the same handle the
+    /// data plane's counting connector records into. `reqwest` gives no
+    /// connector seam of its own, so [`Self::send_get`] records it directly.
+    metrics: Arc<StoreMetrics>,
     clock: Arc<dyn SigningClock>,
     bucket: String,
     region: String,
@@ -1215,6 +1315,7 @@ impl BucketControlPlaneClient {
     pub(crate) fn new(
         client: reqwest::Client,
         credentials: AwsCredentialProvider,
+        metrics: Arc<StoreMetrics>,
         bucket: String,
         region: String,
         endpoint: Option<String>,
@@ -1223,6 +1324,7 @@ impl BucketControlPlaneClient {
         BucketControlPlaneClient {
             client,
             credentials,
+            metrics,
             clock: Arc::new(SystemSigningClock),
             bucket,
             region,
@@ -1240,9 +1342,12 @@ impl BucketControlPlaneClient {
     /// Sign and send one read-only `GET`, returning the 2xx body or a classified
     /// error. A 404 is [`ControlPlaneError::NotConfigured`] only when the body's
     /// `<Error><Code>` is one of `not_configured`; any other 404 is
-    /// [`ControlPlaneError::NotFound`].
+    /// [`ControlPlaneError::NotFound`]. The request is counted as one attempt
+    /// under `op`, the S3 request class it is billed as (`List` for the
+    /// `?versions` listing, `Get` for everything else).
     async fn send_get(
         &self,
+        op: StoreOp,
         object_key: Option<&str>,
         query_pairs: &[(String, String)],
         not_configured: &[&str],
@@ -1315,6 +1420,9 @@ impl BucketControlPlaneClient {
             builder = builder.header("x-amz-security-token", token);
         }
 
+        // Counted before dispatch, as the data plane's connector counts: the
+        // request is billed whether or not a response arrives.
+        self.metrics.record_attempt(op);
         let mut response = builder
             .send()
             .await
@@ -1361,8 +1469,13 @@ impl BucketControlPlaneClient {
 
     async fn fetch_versioning(&self) -> FetchOutcome<VersioningConfig> {
         classify_fetch(
-            self.send_get(None, &[("versioning".to_string(), String::new())], &[])
-                .await,
+            self.send_get(
+                StoreOp::Get,
+                None,
+                &[("versioning".to_string(), String::new())],
+                &[],
+            )
+            .await,
             parse_versioning,
             "",
         )
@@ -1371,6 +1484,7 @@ impl BucketControlPlaneClient {
     async fn fetch_lifecycle(&self) -> FetchOutcome<LifecycleConfig> {
         classify_fetch(
             self.send_get(
+                StoreOp::Get,
                 None,
                 &[("lifecycle".to_string(), String::new())],
                 LIFECYCLE_NOT_CONFIGURED,
@@ -1384,6 +1498,7 @@ impl BucketControlPlaneClient {
     async fn fetch_replication(&self) -> FetchOutcome<ReplicationConfig> {
         classify_fetch(
             self.send_get(
+                StoreOp::Get,
                 None,
                 &[("replication".to_string(), String::new())],
                 REPLICATION_NOT_CONFIGURED,
@@ -1397,6 +1512,7 @@ impl BucketControlPlaneClient {
     async fn fetch_object_lock(&self) -> FetchOutcome<ObjectLockConfig> {
         classify_fetch(
             self.send_get(
+                StoreOp::Get,
                 None,
                 &[("object-lock".to_string(), String::new())],
                 OBJECT_LOCK_NOT_CONFIGURED,
@@ -1425,7 +1541,7 @@ impl BucketControlPlaneClient {
             ));
         }
         classify_fetch(
-            self.send_get(None, &pairs, &[]).await,
+            self.send_get(StoreOp::List, None, &pairs, &[]).await,
             parse_object_versions,
             "",
         )
@@ -1434,6 +1550,7 @@ impl BucketControlPlaneClient {
     async fn fetch_retention(&self, key: &str, version_id: &str) -> FetchOutcome<RetentionConfig> {
         classify_fetch(
             self.send_get(
+                StoreOp::Get,
                 Some(key),
                 &[
                     ("retention".to_string(), String::new()),
@@ -1460,7 +1577,11 @@ impl BucketControlPlaneClient {
     ) -> (BucketProtectionReport, ReportNotes) {
         let versioning = self.fetch_versioning().await;
         let lifecycle = self.fetch_lifecycle().await;
-        let replication = self.fetch_replication().await;
+        let replication = if params.expect_replication {
+            self.fetch_replication().await
+        } else {
+            FetchOutcome::Unknown(REPLICATION_NOT_EXPECTED.to_string())
+        };
         let object_lock = self.fetch_object_lock().await;
         let retention = if params.sample_object_retention {
             self.sample_retention(&params.protected_retention_prefixes)
@@ -1654,21 +1775,29 @@ fn retention_verdict(
         FetchOutcome::Absent(detail) => return not_protecting(detail.clone()),
         FetchOutcome::Unknown(detail) => return SampleVerdict::Unknown(detail.clone()),
     };
-    if !config
-        .mode
-        .as_deref()
-        .is_some_and(|mode| mode.eq_ignore_ascii_case("COMPLIANCE"))
-    {
-        return not_protecting(format!(
-            "retention mode {:?} is not COMPLIANCE",
-            config.mode
-        ));
+    match config.mode.as_deref() {
+        Some("COMPLIANCE") => {}
+        Some("GOVERNANCE") | None => {
+            return not_protecting(format!(
+                "retention mode {:?} is not COMPLIANCE",
+                config.mode
+            ));
+        }
+        Some(other) => {
+            return SampleVerdict::Unknown(format!(
+                "retention mode {:?} is neither COMPLIANCE nor GOVERNANCE",
+                short_excerpt(other)
+            ));
+        }
     }
     let Some(raw) = config.retain_until.as_deref() else {
         return SampleVerdict::Unknown("retention carries no RetainUntilDate".to_string());
     };
     let Some((until, _)) = parse_iso8601(raw) else {
-        return SampleVerdict::Unknown(format!("RetainUntilDate {raw:?} does not parse"));
+        return SampleVerdict::Unknown(format!(
+            "RetainUntilDate {:?} does not parse",
+            short_excerpt(raw)
+        ));
     };
     if until > now_unix_secs {
         if listing_truncated {
@@ -1712,6 +1841,12 @@ pub(crate) enum RetentionSample {
     /// Sampling could not determine the state.
     Unknown(String),
 }
+
+/// The `delete-marker-replication` detail when the caller expects no
+/// replication (ADR-1727 decision 5: the condition is CLI-only), mirroring
+/// [`RetentionSample::NotSampled`].
+const REPLICATION_NOT_EXPECTED: &str =
+    "delete-marker replication not evaluated: no replication expected";
 
 /// At most the first 200 bytes of `text`, for an error detail.
 fn short_excerpt(text: &str) -> String {
@@ -1757,20 +1892,7 @@ pub(crate) fn assemble_report(
     states.push((
         Id::Versioning,
         match versioning {
-            FetchOutcome::Present(config) => {
-                if config
-                    .status
-                    .as_deref()
-                    .is_some_and(|s| s.eq_ignore_ascii_case("Enabled"))
-                {
-                    ConditionState::Pass
-                } else {
-                    ConditionState::Fail(format!(
-                        "object versioning is not Enabled (status: {})",
-                        config.status.as_deref().unwrap_or("none")
-                    ))
-                }
-            }
+            FetchOutcome::Present(config) => versioning_state(config),
             // `?versioning` has no not-configured code, so this cannot occur;
             // a not-configured answer is still not proof of anything.
             FetchOutcome::Absent(detail) | FetchOutcome::Unknown(detail) => {
@@ -1789,6 +1911,9 @@ pub(crate) fn assemble_report(
     states.push((
         Id::DeleteMarkerReplication,
         match replication {
+            _ if !params.expect_replication => {
+                ConditionState::Unknown(REPLICATION_NOT_EXPECTED.to_string())
+            }
             FetchOutcome::Present(config) => delete_marker_replication_state(config),
             FetchOutcome::Absent(detail) => ConditionState::Fail(detail.clone()),
             FetchOutcome::Unknown(detail) => ConditionState::Unknown(detail.clone()),
@@ -1802,7 +1927,8 @@ pub(crate) fn assemble_report(
                 Some(true) => ConditionState::Pass,
                 Some(false) => ConditionState::Fail("Object Lock is not enabled".to_string()),
                 None => ConditionState::Unknown(
-                    "ObjectLockConfiguration carries no ObjectLockEnabled value".to_string(),
+                    "ObjectLockConfiguration carries no ObjectLockEnabled value of exactly Enabled"
+                        .to_string(),
                 ),
             },
             FetchOutcome::Absent(detail) => ConditionState::Fail(detail.clone()),
@@ -1823,6 +1949,30 @@ pub(crate) fn assemble_report(
     ));
 
     (BucketProtectionReport::from_states(states), verdicts.notes)
+}
+
+/// `versioning`: `Status` exactly `Enabled` with no element beside it that
+/// could exclude keys passes. `Suspended` or no `Status` fails whatever else
+/// the document carries, since no key is then versioned by it. Any other
+/// `Status` spelling, or `Enabled` beside an element this reader does not
+/// evaluate, is `Unknown`.
+fn versioning_state(config: &VersioningConfig) -> ConditionState {
+    match config.status.as_deref() {
+        Some("Enabled") if config.unrecognized.is_empty() => ConditionState::Pass,
+        Some("Enabled") => ConditionState::Unknown(format!(
+            "versioning Status is Enabled, but the configuration also carries <{}>, which can \
+             leave keys unversioned and is not evaluated",
+            config.unrecognized.join(">, <")
+        )),
+        Some("Suspended") => {
+            ConditionState::Fail("object versioning is not Enabled (status: Suspended)".to_string())
+        }
+        None => ConditionState::Fail("object versioning is not Enabled (status: none)".to_string()),
+        Some(other) => ConditionState::Unknown(format!(
+            "versioning Status {:?} is neither Enabled nor Suspended",
+            short_excerpt(other)
+        )),
+    }
 }
 
 /// The five lifecycle-derived condition states plus their [`ReportNotes`].
@@ -1893,10 +2043,12 @@ pub(crate) fn lifecycle_conditions(
         },
         true,
     );
-    let reference_days = expected_noncurrent_days.or_else(|| covering_noncurrent_days(rules));
+    let noncurrent_union = complete_union(rules, |rule| rule.noncurrent_days.is_some());
+    let reference_days =
+        expected_noncurrent_days.or_else(|| covering_noncurrent_days(rules, &noncurrent_union));
     let noncurrent_state = fold_early_expiry(
         noncurrent.state.clone(),
-        early_noncurrent_rules(rules, reference_days),
+        early_noncurrent_rules(rules, reference_days, &noncurrent_union),
     );
     let expired_marker = evaluate_action(
         rules,
@@ -1977,16 +2129,19 @@ pub(crate) fn lifecycle_conditions(
     }
 }
 
-/// The `NoncurrentDays` every enabled rule covering all of `t/` agrees on, the
-/// reference an early expiry is measured against when no `E_v` was given.
-fn covering_noncurrent_days(rules: &[LifecycleRule]) -> Option<u32> {
+/// The `NoncurrentDays` every enabled rule covering all of `t/` (alone, or as a
+/// member of `union`) agrees on, the reference an early expiry is measured
+/// against when no `E_v` was given.
+fn covering_noncurrent_days(rules: &[LifecycleRule], union: &BTreeSet<usize>) -> Option<u32> {
     let values: BTreeSet<u32> = rules
         .iter()
-        .filter(|rule| {
-            rule.status == RuleStatus::Enabled
-                && rule.scope.coverage_of_data_root() == Coverage::Full
+        .enumerate()
+        .filter(|(index, rule)| {
+            union.contains(index)
+                || (rule.status == RuleStatus::Enabled
+                    && rule.scope.coverage_of_data_root() == Coverage::Full)
         })
-        .filter_map(|rule| match rule.noncurrent_days {
+        .filter_map(|(_, rule)| match rule.noncurrent_days {
             Some(Days::Value(days)) => Some(days),
             _ => None,
         })
@@ -2026,11 +2181,13 @@ fn early_noncurrent(
 /// Rules that can delete noncurrent versions under `t/` early and that
 /// [`evaluate_action`] does not already judge by value: every rule not
 /// `Disabled` whose scope can reach `t/`, except an enabled rule covering all
-/// of `t/`. A rule on `sys/` alone is `no-foreign-rule`'s to judge. Returns the
-/// definite findings and the uncertain ones.
+/// of `t/` and a member of `union`, the complete union of noncurrent rules. A
+/// rule on `sys/` alone is `no-foreign-rule`'s to judge. Returns the definite
+/// findings and the uncertain ones.
 fn early_noncurrent_rules(
     rules: &[LifecycleRule],
     reference: Option<u32>,
+    union: &BTreeSet<usize>,
 ) -> (Vec<String>, Vec<String>) {
     let mut fails: Vec<String> = Vec::new();
     let mut unknowns: Vec<String> = Vec::new();
@@ -2040,7 +2197,9 @@ fn early_noncurrent_rules(
         if active == Tri::No || targets == Tri::No {
             continue;
         }
-        if active == Tri::Yes && rule.scope.coverage_of_data_root() == Coverage::Full {
+        if union.contains(&index)
+            || (active == Tri::Yes && rule.scope.coverage_of_data_root() == Coverage::Full)
+        {
             continue;
         }
         let Some(found) = early_noncurrent(rule, reference) else {
@@ -2085,10 +2244,11 @@ fn fold_early_expiry(
 /// One sanctioned lifecycle action evaluated over every rule.
 struct ActionEval {
     state: ConditionState,
-    /// An enabled rule covering every key under `t/` carries the action.
+    /// An enabled rule covering every key under `t/`, or every member of a
+    /// complete union, carries the action.
     carried: bool,
     /// Rules that might carry it over `t/`: an unrecognised filter or status,
-    /// or a plain prefix strictly under `t/` (a possible union member).
+    /// or a plain prefix strictly under `t/` outside any complete union.
     possibly_carried: Vec<String>,
 }
 
@@ -2097,9 +2257,11 @@ struct ActionEval {
 /// `check` rejects, or (with `require_agreement`) such rules that carry
 /// different values, is `Fail`. A value that does not parse, or a rule whose
 /// filter or status is unrecognised, is `Unknown`. `Pass` needs at least one
-/// covering rule and nothing uncertain. With no covering rule, rules on
-/// narrower `t/` prefixes make it `Unknown` (they may form a union) and
-/// otherwise it is `Fail`.
+/// covering rule and nothing uncertain. The members of a [`complete_union`] of
+/// rules carrying the action count as covering rules, each value checked and
+/// compared the same way. With no covering rule, rules on narrower `t/`
+/// prefixes that form no complete union make it `Unknown` and otherwise it is
+/// `Fail`.
 fn evaluate_action<T: Copy + fmt::Display>(
     rules: &[LifecycleRule],
     action: &str,
@@ -2113,6 +2275,7 @@ fn evaluate_action<T: Copy + fmt::Display>(
     let mut possibly_carried: Vec<String> = Vec::new();
     let mut accepted: Vec<(String, T)> = Vec::new();
     let mut carried = false;
+    let union = complete_union(rules, |rule| value_of(rule).is_some());
 
     for (index, rule) in rules.iter().enumerate() {
         let Some(value) = value_of(rule) else {
@@ -2123,7 +2286,11 @@ fn evaluate_action<T: Copy + fmt::Display>(
         if active == Tri::No {
             continue;
         }
-        match (active, rule.scope.coverage_of_data_root()) {
+        let coverage = match rule.scope.coverage_of_data_root() {
+            Coverage::UnionMember if union.contains(&index) => Coverage::Full,
+            coverage => coverage,
+        };
+        match (active, coverage) {
             (_, Coverage::None) => {}
             (Tri::Yes, Coverage::Full) => {
                 carried = true;
@@ -2177,7 +2344,8 @@ fn evaluate_action<T: Copy + fmt::Display>(
     } else if !union_members.is_empty() {
         ConditionState::Unknown(format!(
             "no enabled rule covering every key under t/ carries {action}; rules on narrower \
-             prefixes ({}) might cover t/ as a union, which is not evaluated",
+             prefixes ({}) might cover t/ as a union, but only one rule on each of t/0 .. t/f \
+             is provably complete",
             union_members.join(", ")
         ))
     } else {

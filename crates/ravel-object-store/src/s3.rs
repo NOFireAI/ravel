@@ -994,6 +994,7 @@ impl S3Store {
         let control_plane = Arc::new(BucketControlPlaneClient::new(
             control_plane_client,
             control_plane_credentials,
+            Arc::clone(&metrics),
             config.bucket.clone(),
             config.region.clone(),
             config.endpoint.clone(),

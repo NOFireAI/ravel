@@ -1470,6 +1470,7 @@ fn versioning_passes_only_when_enabled() {
         assembled(
             FetchOutcome::Present(VersioningConfig {
                 status: status.map(str::to_string),
+                unrecognized: Vec::new(),
             }),
             FetchOutcome::Unknown("not under test".to_string()),
         )
@@ -1482,8 +1483,9 @@ fn versioning_passes_only_when_enabled() {
     assert!(state_for(None).is_fail());
 }
 
-/// `ObjectLockEnabled` `Enabled` passes and any other value fails; a document
-/// without the element states nothing, so it is Unknown.
+/// `ObjectLockEnabled` `Enabled` passes. S3 defines no other value (Object
+/// Lock that is off is a not-configured 404), so any other value, like a
+/// document without the element, states nothing and is Unknown.
 #[test]
 fn object_lock_reads_the_enabled_element_three_ways() {
     let state_for = |body: &str| {
@@ -1502,7 +1504,7 @@ fn object_lock_reads_the_enabled_element_three_ways() {
     let other = state_for(
         "<ObjectLockConfiguration><ObjectLockEnabled>Disabled</ObjectLockEnabled></ObjectLockConfiguration>",
     );
-    assert!(other.is_fail(), "{other:?}");
+    assert!(other.is_unknown(), "{other:?}");
     let silent = state_for(
         "<ObjectLockConfiguration><Rule><DefaultRetention><Mode>COMPLIANCE</Mode></DefaultRetention>\
          </Rule></ObjectLockConfiguration>",
@@ -1541,8 +1543,8 @@ fn repeated_object_lock_enabled_is_unknown() {
     }
 }
 
-/// An empty ObjectLockEnabled states nothing: Unknown, not Fail. A non-empty
-/// value other than Enabled still fails.
+/// An empty ObjectLockEnabled states nothing: Unknown, not Fail. So does a
+/// non-empty value other than exactly Enabled.
 #[test]
 fn empty_object_lock_enabled_is_unknown() {
     for element in [
@@ -1559,7 +1561,7 @@ fn empty_object_lock_enabled_is_unknown() {
         "<ObjectLockConfiguration><ObjectLockEnabled>Suspended</ObjectLockEnabled>\
          </ObjectLockConfiguration>",
     );
-    assert!(state.is_fail(), "{state:?}");
+    assert!(state.is_unknown(), "{state:?}");
 }
 
 /// Document-level single values that are repeated make the whole response
@@ -1734,9 +1736,19 @@ fn test_client_with(
     token: Option<&str>,
     allow_http: bool,
 ) -> BucketControlPlaneClient {
+    test_client_with_metrics(endpoint, token, allow_http, Arc::default())
+}
+
+fn test_client_with_metrics(
+    endpoint: &str,
+    token: Option<&str>,
+    allow_http: bool,
+    metrics: Arc<StoreMetrics>,
+) -> BucketControlPlaneClient {
     BucketControlPlaneClient::new(
         http_client(allow_http),
         static_credential_provider(KAT_ACCESS_KEY, KAT_SECRET_KEY, token),
+        metrics,
         "ravel-test-bucket".to_string(),
         KAT_REGION.to_string(),
         Some(endpoint.to_string()),
@@ -2380,11 +2392,13 @@ async fn streamed_body_over_the_cap_without_content_length_is_unknown() {
 
 // --- Whole-report tests over HTTP ---
 
-/// Params that put every condition in play, including the retention sampling
-/// the server path leaves off (ADR-1727 decision 5).
+/// Params that put every condition in play, including the replication
+/// expectation and retention sampling the server path leaves off (ADR-1727
+/// decision 5).
 fn full_params() -> BucketProtectionParams {
     BucketProtectionParams {
         expected_noncurrent_days: Some(30),
+        expect_replication: true,
         sample_object_retention: true,
         protected_retention_prefixes: vec!["t/".to_string()],
     }
@@ -2858,4 +2872,376 @@ async fn malformed_bodies_report_every_condition_unknown_over_http() {
         assert!(state.is_unknown(), "{} is {state:?}", id.id());
     }
     assert_eq!(report.failed_count(), 0);
+}
+
+// --- Versioning extensions ---
+
+fn versioning_state(body: &str) -> ConditionState {
+    assembled(
+        classify_fetch(Ok(body.as_bytes().to_vec()), parse_versioning, ""),
+        FetchOutcome::Unknown("not under test".to_string()),
+    )
+    .state(ProtectionConditionId::Versioning)
+    .expect("present")
+    .clone()
+}
+
+/// MinIO answers `?versioning` with extensions that leave keys unversioned
+/// (an excluded prefix, or every folder object), so `Status` `Enabled` beside
+/// one does not show that every key under t/ is versioned: Unknown, naming the
+/// element.
+#[test]
+fn minio_versioning_exclusions_are_unknown_not_pass() {
+    let excluded_prefix = r#"<?xml version="1.0" encoding="UTF-8"?>
+<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status><ExcludedPrefixes><Prefix>t/</Prefix></ExcludedPrefixes></VersioningConfiguration>"#;
+    let state = versioning_state(excluded_prefix);
+    assert!(state.is_unknown(), "{state:?}");
+    assert!(state.detail().contains("ExcludedPrefixes"), "{state:?}");
+
+    let exclude_folders = r#"<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status><ExcludeFolders>true</ExcludeFolders></VersioningConfiguration>"#;
+    let state = versioning_state(exclude_folders);
+    assert!(state.is_unknown(), "{state:?}");
+    assert!(state.detail().contains("ExcludeFolders"), "{state:?}");
+
+    let with_mfa = "<VersioningConfiguration><Status>Enabled</Status><MfaDelete>Disabled</MfaDelete>\
+                    </VersioningConfiguration>";
+    assert!(versioning_state(with_mfa).is_pass());
+}
+
+// --- Lifecycle rule-scope as a union of prefixes ---
+
+const HEX_DIGITS: &str = "0123456789abcdef";
+
+/// One enabled rule on `{base}{c}` for each character `c` of `chars`, each
+/// carrying `actions(c)`.
+fn union_rules(base: &str, chars: &str, actions: impl Fn(char) -> String) -> String {
+    chars
+        .chars()
+        .map(|c| {
+            rule(
+                &format!("tenant-{base}{c}"),
+                &format!("<Filter><Prefix>{base}{c}</Prefix></Filter>"),
+                &actions(c),
+            )
+        })
+        .collect()
+}
+
+fn all_actions(_: char) -> String {
+    format!("{}{MARKER}{ABORT_7}", noncurrent("30"))
+}
+
+/// Sixteen rules on `t/0` .. `t/f` cover every key Ravel writes under t/
+/// (the tenant segment is lowercase hex), so each action they all carry is
+/// judged as a covering rule's would be, and rule-scope passes.
+#[test]
+fn exhaustive_hex_union_covers_t() {
+    let rules = union_rules("t/", HEX_DIGITS, all_actions);
+    for v in [evaluate(&rules), evaluate_without_e_v(&rules)] {
+        for (name, state) in [
+            ("noncurrent", &v.noncurrent),
+            ("marker", &v.expired_marker),
+            ("abort", &v.abort),
+            ("rule-scope", &v.rule_scope),
+            ("no-foreign", &v.no_foreign),
+        ] {
+            assert!(state.is_pass(), "{name}: {state:?}");
+        }
+        assert!(v.notes.abort_rule_covers_data && v.notes.noncurrent_rule_covers_data);
+    }
+}
+
+/// A union that misses one first character, that splits the missing
+/// character one level further down, or that spells it in upper case does not
+/// provably cover t/: the reader invents no coverage, so these stay Unknown.
+#[test]
+fn incomplete_hex_union_stays_unknown() {
+    let missing_f = union_rules("t/", "0123456789abcde", all_actions);
+    let deeper_f = format!("{missing_f}{}", union_rules("t/f", HEX_DIGITS, all_actions));
+    let upper_f = format!("{missing_f}{}", union_rules("t/", "F", all_actions));
+    for rules in [missing_f, deeper_f, upper_f] {
+        let v = evaluate(&rules);
+        assert!(v.noncurrent.is_unknown(), "{:?}", v.noncurrent);
+        assert!(v.abort.is_unknown(), "{:?}", v.abort);
+        assert!(v.rule_scope.is_unknown(), "{:?}", v.rule_scope);
+    }
+}
+
+/// Union members are checked as covering rules are: one member keeping
+/// noncurrent versions longer than the others fails noncurrent-expiration,
+/// with or without an expected E_v.
+#[test]
+fn union_members_that_disagree_on_noncurrent_days_fail() {
+    let rules = union_rules("t/", HEX_DIGITS, |c| {
+        let days = if c == '7' { "45" } else { "30" };
+        format!("{}{MARKER}{ABORT_7}", noncurrent(days))
+    });
+    let v = evaluate(&rules);
+    assert!(v.noncurrent.is_fail(), "{:?}", v.noncurrent);
+    assert!(
+        v.noncurrent
+            .detail()
+            .contains("rule \"tenant-t/7\": NoncurrentDays is 45, expected 30"),
+        "{:?}",
+        v.noncurrent
+    );
+    let v = evaluate_without_e_v(&rules);
+    assert!(
+        v.noncurrent.is_fail() && v.noncurrent.detail().contains("disagree"),
+        "{:?}",
+        v.noncurrent
+    );
+}
+
+// --- Exact value parsing ---
+
+/// The offset of an ISO 8601 time is two digits, a colon and two digits: a
+/// sign inside either field is refused, not read as a negative offset.
+#[test]
+fn iso8601_offset_fields_are_digits_only() {
+    for bad in [
+        "2030-01-01T00:00:00+-5:00",
+        "2030-01-01T00:00:00-+5:00",
+        "2030-01-01T00:00:00+05:+3",
+    ] {
+        assert_eq!(parse_iso8601(bad), None, "{bad:?} must not parse");
+    }
+    assert!(parse_iso8601("2030-01-01T00:00:00-05:00").is_some());
+}
+
+/// A day count is plain decimal digits: a sign or a leading zero is not a
+/// value S3 sends, so it reads as Unknown. A lone 0 stays a value.
+#[test]
+fn day_counts_with_a_sign_or_leading_zero_are_unknown() {
+    for days in ["+30", "030"] {
+        let v = evaluate(&rule(
+            "ravel",
+            "<Filter/>",
+            &format!("{}{MARKER}{ABORT_7}", noncurrent(days)),
+        ));
+        assert!(v.noncurrent.is_unknown(), "{days}: {:?}", v.noncurrent);
+    }
+    let zero_abort = "<AbortIncompleteMultipartUpload><DaysAfterInitiation>0</DaysAfterInitiation>\
+                      </AbortIncompleteMultipartUpload>";
+    let v = evaluate(&rule(
+        "ravel",
+        "<Filter/>",
+        &format!("{}{MARKER}{zero_abort}", noncurrent("30")),
+    ));
+    assert!(v.abort.is_pass(), "{:?}", v.abort);
+}
+
+/// S3's enumerated values are case-sensitive: another spelling is not the
+/// value, so it is Unknown rather than read as the value it resembles.
+#[test]
+fn enumerated_values_compare_exactly() {
+    let all = all_actions('-');
+    let v = evaluate(&format!(
+        "<Rule><Status>enabled</Status><Filter/>{all}</Rule>"
+    ));
+    assert!(v.noncurrent.is_unknown(), "{:?}", v.noncurrent);
+
+    let upper_marker =
+        "<Expiration><ExpiredObjectDeleteMarker>TRUE</ExpiredObjectDeleteMarker></Expiration>";
+    let v = evaluate(&rule(
+        "ravel",
+        "<Filter/>",
+        &format!("{}{upper_marker}{ABORT_7}", noncurrent("30")),
+    ));
+    assert!(v.expired_marker.is_unknown(), "{:?}", v.expired_marker);
+
+    let state = dmr_state(&replication_rule("Enabled", "<Filter/>", "enabled"));
+    assert!(state.is_unknown(), "{state:?}");
+
+    let state = versioning_state(
+        "<VersioningConfiguration><Status>enabled</Status></VersioningConfiguration>",
+    );
+    assert!(state.is_unknown(), "{state:?}");
+
+    let state = object_lock_state(
+        "<ObjectLockConfiguration><ObjectLockEnabled>enabled</ObjectLockEnabled>\
+         </ObjectLockConfiguration>",
+    );
+    assert!(state.is_unknown(), "{state:?}");
+
+    let verdict = retention_verdict(
+        &retention("compliance", "2030-01-01T00:00:00Z"),
+        KAT_UNIX_SECS,
+        false,
+    );
+    assert!(matches!(verdict, SampleVerdict::Unknown(_)), "{verdict:?}");
+}
+
+/// A listed version with no Key cannot address its retention, as one with no
+/// VersionId cannot.
+#[test]
+fn listed_version_without_a_key_is_a_parse_error() {
+    let no_key = "<ListVersionsResult><IsTruncated>false</IsTruncated>\
+                  <Version><VersionId>v1</VersionId><IsLatest>true</IsLatest>\
+                  <LastModified>2013-05-01T00:00:00.000Z</LastModified></Version>\
+                  </ListVersionsResult>";
+    assert!(parse_object_versions(no_key.as_bytes()).is_err());
+}
+
+/// Text copied from a successful response into a condition detail is cut to
+/// an excerpt, so a broken endpoint cannot grow a detail without bound.
+#[test]
+fn response_text_in_details_is_bounded() {
+    let long = "x".repeat(5000);
+    let bounded = |state: &ConditionState| {
+        assert!(
+            state.detail().len() < 1000,
+            "{} bytes",
+            state.detail().len()
+        );
+        assert!(state.detail().contains("..."), "{state:?}");
+    };
+    let all = all_actions('-');
+
+    let v = evaluate(&format!(
+        "<Rule><Status>{long}</Status><Filter/>{all}</Rule>"
+    ));
+    bounded(&v.noncurrent);
+
+    let v = evaluate(&rule(
+        "ravel",
+        "<Filter/>",
+        &format!("{}{MARKER}{ABORT_7}", noncurrent(&long)),
+    ));
+    bounded(&v.noncurrent);
+
+    let v = evaluate(&format!(
+        "{}{}",
+        rule("ravel", "<Filter/>", &all),
+        rule(
+            "early",
+            &format!("<Filter><Prefix>t/{long}</Prefix></Filter>"),
+            &noncurrent("10"),
+        ),
+    ));
+    bounded(&v.no_foreign);
+
+    let listing =
+        format!("<ListVersionsResult><IsTruncated>{long}</IsTruncated></ListVersionsResult>");
+    let detail = match parse_object_versions(listing.as_bytes()) {
+        Ok(listing) => panic!("an IsTruncated that is not a boolean parsed: {listing:?}"),
+        Err(e) => e.into_unknown_detail(),
+    };
+    assert!(
+        detail.len() < 1000 && detail.contains("..."),
+        "{} bytes",
+        detail.len()
+    );
+}
+
+// --- Request accounting and the replication expectation ---
+
+fn two_version_bucket() -> Responder {
+    bucket(
+        |_query| {
+            listing_body(&[
+                version("t/a/1.rseg", "v1", true, "2013-05-01T00:00:00.000Z"),
+                version("t/a/1.rseg", "v0", false, "2013-04-01T00:00:00.000Z"),
+            ])
+        },
+        |_path| (StatusCode::OK, COMPLIANT_RETENTION.to_string()),
+    )
+}
+
+/// Every control-plane request is billed, so each one the endpoint served
+/// moves the store's attempt counter, under the request class S3 bills it as:
+/// the `?versions` listing page as a LIST, every other read as a GET.
+#[tokio::test]
+async fn report_requests_are_counted_in_the_store_metrics() {
+    let (base, seen) = spawn_fake(two_version_bucket()).await;
+    let metrics: Arc<StoreMetrics> = Arc::default();
+    let client = test_client_with_metrics(&base, None, true, Arc::clone(&metrics));
+
+    let report = client.report(&full_params()).await;
+    assert!(
+        report
+            .state(ProtectionConditionId::ObjectRetention)
+            .expect("present")
+            .is_pass()
+    );
+    let served = u64::try_from(seen.lock().len()).expect("fits");
+    let snapshot = metrics.snapshot();
+    assert_eq!(served, 7);
+    assert_eq!(snapshot.list.attempts, 1, "{snapshot:?}");
+    assert_eq!(snapshot.get.attempts, 6, "{snapshot:?}");
+    let total: u64 = StoreOp::ALL
+        .iter()
+        .map(|op| snapshot.op(*op).attempts)
+        .sum();
+    assert_eq!(total, served);
+    assert_eq!(
+        snapshot.get.calls, 0,
+        "attempts only, never completed calls"
+    );
+
+    // The server's params fetch versioning, lifecycle and object-lock only.
+    client.report(&BucketProtectionParams::default()).await;
+    let served = u64::try_from(seen.lock().len()).expect("fits");
+    let snapshot = metrics.snapshot();
+    assert_eq!(served, 10);
+    assert_eq!(snapshot.get.attempts + snapshot.list.attempts, served);
+}
+
+/// Without a replication expectation (the server, ADR-1727 decision 5)
+/// delete-marker-replication is not evaluated: `?replication` is not fetched,
+/// and a bucket with no replication reports the condition Unknown, the way an
+/// unsampled object-retention reports, so it never counts as a failure. With
+/// the expectation, the same bucket fails it.
+#[tokio::test]
+async fn delete_marker_replication_needs_a_replication_expectation() {
+    let absent = FetchOutcome::Absent("no replication configuration on the bucket".to_string());
+    let state_with = |expect_replication: bool| {
+        let params = BucketProtectionParams {
+            expect_replication,
+            ..full_params()
+        };
+        let (report, _) = assemble_report(
+            &FetchOutcome::Unknown("not under test".to_string()),
+            &FetchOutcome::Unknown("not under test".to_string()),
+            &absent,
+            &FetchOutcome::Unknown("not under test".to_string()),
+            &RetentionSample::NotSampled,
+            &params,
+        );
+        (
+            report
+                .state(ProtectionConditionId::DeleteMarkerReplication)
+                .expect("present")
+                .clone(),
+            report.failed_count(),
+        )
+    };
+    let (state, failed) = state_with(false);
+    assert_eq!(
+        state,
+        ConditionState::Unknown(REPLICATION_NOT_EXPECTED.to_string())
+    );
+    assert_eq!(failed, 0);
+    let (state, failed) = state_with(true);
+    assert!(state.is_fail(), "{state:?}");
+    assert_eq!(failed, 1);
+
+    let (base, seen) = spawn_fake(two_version_bucket()).await;
+    let params = BucketProtectionParams {
+        expect_replication: false,
+        ..full_params()
+    };
+    let report = test_client(&base).report(&params).await;
+    assert!(
+        report
+            .state(ProtectionConditionId::DeleteMarkerReplication)
+            .expect("present")
+            .is_unknown()
+    );
+    assert!(
+        seen.lock()
+            .iter()
+            .all(|request| !request.query.starts_with("replication=")),
+        "?replication must not be fetched"
+    );
 }
