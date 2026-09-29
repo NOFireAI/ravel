@@ -3938,8 +3938,9 @@ Schemas (`crates/ravel-sql/src/alerts_schema.rs`,
 Row contract. `alerts` exposes raw history: one row per state transition, never
 a folded current-state row. Retention bounds that history: transitions older
 than the `--alert-retention` window are deleted, except each identity's
-current-state record, so current-state queries keep working. The three write-identity columns exist because
-`ts_ns` alone is not a total order over that history. Two evaluators can overlap
+current-state record, so current-state queries keep working. The three
+write-identity columns exist because `ts_ns` alone is not a total order over
+that history. Two evaluators can overlap
 briefly at a lease handover and write the same `alert_id` at the same `ts_ns`;
 the evaluator's own fold breaks that tie with the record's epoch and sequence,
 and the table exposes the same keys plus `writer_id` so a SQL fold has a total

@@ -36,8 +36,8 @@
 //! key: `RejectReason`, `ScrubReason`, `ScrubUnreadableReason` and
 //! `AlertRetentionSkipReason` all render `reason`, `Level` (log/tracing
 //! severity) and `ScrubLevel` (issue #1686, which part of the commit lineage
-//! -- `l0`/`l1`/`rewrite` -- a scrub target came from) both render `level`, `MergeMemoryKind` and `DeletedObjectKind`
-//! both render `kind`, and `ReadGateSite` and `WriteGateSite` both render
+//! -- `l0`/`l1`/`rewrite` -- a scrub target came from) both render `level`,
+//! `MergeMemoryKind` and `DeletedObjectKind` both render `kind`, and `ReadGateSite` and `WriteGateSite` both render
 //! `site`. `Label::RuntimeWorker(u32)` is bounded like `Label::Shard`, by its
 //! only constructor.
 //! Every variant's payload is a closed enum
