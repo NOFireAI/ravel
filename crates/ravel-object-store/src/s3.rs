@@ -991,9 +991,12 @@ impl S3Store {
         .map_err(|e| {
             StoreError::Permanent(format!("failed to build bucket control-plane client: {e}"))
         })?;
+        // The control plane counts its billed requests into the same handle the
+        // data-plane connector below counts into.
         let control_plane = Arc::new(BucketControlPlaneClient::new(
             control_plane_client,
             control_plane_credentials,
+            Arc::clone(&metrics),
             config.bucket.clone(),
             config.region.clone(),
             config.endpoint.clone(),

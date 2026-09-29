@@ -770,8 +770,9 @@ impl BucketProtectionReport {
 }
 
 /// Inputs that change what some conditions mean (ADR-1727 decisions 4 and 5).
-/// A deployment's choice, not a constant: the server has no expected `E_v` and
-/// does not sample retention, while `store verify-protection` supplies both.
+/// A deployment's choice, not a constant: the server has no expected `E_v`, no
+/// replication expectation, and does not sample retention, while `store
+/// verify-protection` supplies all three.
 #[derive(Debug, Clone, Default)]
 pub struct BucketProtectionParams {
     /// Expected noncurrent-version expiration days (`E_v`). `Some` requires the
@@ -786,6 +787,13 @@ pub struct BucketProtectionParams {
     /// `no-foreign-rule` `Unknown`; a `sys/` rule carrying one makes only
     /// `no-foreign-rule` `Unknown`.
     pub expected_noncurrent_days: Option<u32>,
+    /// Whether the deployment expects replication, so `delete-marker-replication`
+    /// is evaluated. Off for the server (the condition is CLI-only, decision 5);
+    /// the CLI turns it on with `--expect-replication`. When off, `?replication`
+    /// is not read and `delete-marker-replication` reports `Unknown` ("not
+    /// evaluated"), never `Fail`, the way `object-retention` reports when
+    /// retention is not sampled.
+    pub expect_replication: bool,
     /// Whether to sample objects for the `object-retention` condition. Off for
     /// the server (retention is CLI-only, decision 5); the CLI turns it on with
     /// `--expect-object-retention`. When off, `object-retention` reports

@@ -1470,6 +1470,7 @@ fn versioning_passes_only_when_enabled() {
         assembled(
             FetchOutcome::Present(VersioningConfig {
                 status: status.map(str::to_string),
+                unrecognized: Vec::new(),
             }),
             FetchOutcome::Unknown("not under test".to_string()),
         )
@@ -1737,6 +1738,7 @@ fn test_client_with(
     BucketControlPlaneClient::new(
         http_client(allow_http),
         static_credential_provider(KAT_ACCESS_KEY, KAT_SECRET_KEY, token),
+        Arc::default(),
         "ravel-test-bucket".to_string(),
         KAT_REGION.to_string(),
         Some(endpoint.to_string()),
@@ -2385,6 +2387,7 @@ async fn streamed_body_over_the_cap_without_content_length_is_unknown() {
 fn full_params() -> BucketProtectionParams {
     BucketProtectionParams {
         expected_noncurrent_days: Some(30),
+        expect_replication: true,
         sample_object_retention: true,
         protected_retention_prefixes: vec!["t/".to_string()],
     }
@@ -2858,4 +2861,373 @@ async fn malformed_bodies_report_every_condition_unknown_over_http() {
         assert!(state.is_unknown(), "{} is {state:?}", id.id());
     }
     assert_eq!(report.failed_count(), 0);
+}
+
+// --- Review fixes: versioning extensions, request accounting, union scope ---
+
+fn versioning_state(body: &str) -> ConditionState {
+    assembled(
+        classify_fetch(Ok(body.as_bytes().to_vec()), parse_versioning, ""),
+        FetchOutcome::Unknown("not under test".to_string()),
+    )
+    .state(ProtectionConditionId::Versioning)
+    .expect("present")
+    .clone()
+}
+
+/// MinIO answers `?versioning` with `ExcludedPrefixes` and does not version the
+/// keys under an excluded prefix, so `Status` `Enabled` alone proves nothing.
+#[test]
+fn minio_excluded_prefixes_make_versioning_unknown() {
+    let state = versioning_state(
+        r#"<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status><ExcludedPrefixes><Prefix>t/</Prefix></ExcludedPrefixes></VersioningConfiguration>"#,
+    );
+    assert!(state.is_unknown(), "{state:?}");
+    assert!(state.detail().contains("ExcludedPrefixes"), "{state:?}");
+}
+
+#[test]
+fn minio_exclude_folders_makes_versioning_unknown() {
+    let state = versioning_state(
+        "<VersioningConfiguration><Status>Enabled</Status><ExcludeFolders>true</ExcludeFolders>\
+         </VersioningConfiguration>",
+    );
+    assert!(state.is_unknown(), "{state:?}");
+    assert!(state.detail().contains("ExcludeFolders"), "{state:?}");
+}
+
+/// `MfaDelete` is part of the S3 document and changes nothing about which keys
+/// are versioned.
+#[test]
+fn mfa_delete_beside_enabled_versioning_still_passes() {
+    let state = versioning_state(
+        "<VersioningConfiguration><Status>Enabled</Status><MfaDelete>Disabled</MfaDelete>\
+         </VersioningConfiguration>",
+    );
+    assert!(state.is_pass(), "{state:?}");
+}
+
+/// Every request a report sends is billed, so each one moves the store's
+/// request counters: configuration and retention reads under `get`, versions
+/// listing pages under `list`.
+#[tokio::test]
+async fn a_report_moves_the_store_request_counters_by_every_request_served() {
+    use crate::conformance::BucketControlPlane;
+    use crate::instrument::StoreMetrics;
+    use crate::s3::{S3AuthMode, S3Config, S3Store};
+
+    let respond = bucket(
+        |_query| {
+            listing_body(&[
+                version("t/a/1.rseg", "v1", true, "2013-05-01T00:00:00.000Z"),
+                version("t/a/1.rseg", "v0", false, "2013-04-01T00:00:00.000Z"),
+            ])
+        },
+        |_path| (StatusCode::OK, COMPLIANT_RETENTION.to_string()),
+    );
+    let (base, seen) = spawn_fake(respond).await;
+    let metrics = Arc::new(StoreMetrics::default());
+    let store = S3Store::with_metrics(
+        S3Config {
+            bucket: "ravel-test-bucket".to_string(),
+            region: KAT_REGION.to_string(),
+            endpoint: Some(base),
+            access_key_id: KAT_ACCESS_KEY.to_string(),
+            secret_access_key: KAT_SECRET_KEY.to_string(),
+            allow_http: true,
+            force_path_style: true,
+            kms_key_id: None,
+            session_token: None,
+            credentials_file: None,
+            auth: S3AuthMode::Static,
+            instance_metadata_endpoint: None,
+        },
+        Arc::clone(&metrics),
+    )
+    .expect("store");
+    let before = metrics.snapshot();
+    let report = store.bucket_protection_report(&full_params()).await;
+    assert!(
+        report
+            .state(ProtectionConditionId::Versioning)
+            .expect("present")
+            .is_pass(),
+        "{report:?}"
+    );
+    let after = metrics.snapshot();
+
+    let requests = seen.lock();
+    let listings = requests
+        .iter()
+        .filter(|r| r.query.starts_with("max-keys=") || r.query.starts_with("key-marker="))
+        .count();
+    let reads = requests.len() - listings;
+    assert_eq!(
+        (reads, listings),
+        (6, 1),
+        "the endpoint served 6 GETs and 1 LIST page"
+    );
+    assert_eq!(after.get.attempts - before.get.attempts, reads as u64);
+    assert_eq!(after.list.attempts - before.list.attempts, listings as u64);
+    for op in [after.put, after.head, after.list_delimited, after.delete] {
+        assert_eq!(op.attempts, 0, "{op:?}");
+    }
+}
+
+fn hex_union(skip: Option<char>, actions_for: impl Fn(char) -> String) -> String {
+    "0123456789abcdef"
+        .chars()
+        .filter(|digit| Some(*digit) != skip)
+        .map(|digit| {
+            rule(
+                &format!("part-{digit}"),
+                &format!("<Filter><Prefix>t/{digit}</Prefix></Filter>"),
+                &actions_for(digit),
+            )
+        })
+        .collect()
+}
+
+/// Sixteen rules on `t/0` .. `t/f` cover every key Ravel writes under `t/`,
+/// since a tenant hash is lowercase hex: the union is a covering rule set.
+#[test]
+fn exhaustive_first_character_union_covers_t() {
+    let all = format!("{}{MARKER}{ABORT_7}", noncurrent("30"));
+    for v in [
+        evaluate(&hex_union(None, |_| all.clone())),
+        evaluate_without_e_v(&hex_union(None, |_| all.clone())),
+    ] {
+        for state in [
+            &v.noncurrent,
+            &v.expired_marker,
+            &v.abort,
+            &v.rule_scope,
+            &v.no_foreign,
+        ] {
+            assert!(state.is_pass(), "{state:?}");
+        }
+        assert!(v.notes.noncurrent_rule_covers_data && v.notes.abort_rule_covers_data);
+    }
+}
+
+/// One first character missing leaves a tenant range unproven, and deeper or
+/// uppercase members prove nothing about the missing range.
+#[test]
+fn union_missing_one_first_character_stays_unknown() {
+    let all = format!("{}{MARKER}{ABORT_7}", noncurrent("30"));
+    let v = evaluate(&hex_union(Some('f'), |_| all.clone()));
+    for state in [&v.noncurrent, &v.expired_marker, &v.abort, &v.rule_scope] {
+        assert!(state.is_unknown(), "{state:?}");
+    }
+    let v = evaluate(&format!(
+        "{}{}{}",
+        hex_union(Some('f'), |_| all.clone()),
+        rule("upper", "<Filter><Prefix>t/F</Prefix></Filter>", &all),
+        rule("deeper", "<Filter><Prefix>t/f0</Prefix></Filter>", &all),
+    ));
+    assert!(v.rule_scope.is_unknown(), "{:?}", v.rule_scope);
+    assert!(v.noncurrent.is_unknown(), "{:?}", v.noncurrent);
+}
+
+/// Union members are checked as covering rules are, so members that disagree
+/// on `NoncurrentDays` fail, and a member out of range fails its condition.
+#[test]
+fn union_members_that_disagree_on_noncurrent_days_fail() {
+    let v = evaluate_without_e_v(&hex_union(None, |digit| {
+        let days = if digit == '7' { "40" } else { "30" };
+        format!("{}{MARKER}{ABORT_7}", noncurrent(days))
+    }));
+    assert!(v.noncurrent.is_fail(), "{:?}", v.noncurrent);
+    assert!(
+        v.noncurrent
+            .detail()
+            .contains("disagree on NoncurrentVersionExpiration"),
+        "{:?}",
+        v.noncurrent
+    );
+    let v = evaluate(&hex_union(None, |digit| {
+        let abort = if digit == '3' {
+            "<AbortIncompleteMultipartUpload><DaysAfterInitiation>30</DaysAfterInitiation></AbortIncompleteMultipartUpload>"
+        } else {
+            ABORT_7
+        };
+        format!("{}{MARKER}{abort}", noncurrent("30"))
+    }));
+    assert!(v.abort.is_fail(), "{:?}", v.abort);
+}
+
+/// With no replication expectation (the server, and the CLI without
+/// `--expect-replication`), `delete-marker-replication` is not evaluated: a
+/// bucket without replication is not a `Fail`.
+#[test]
+fn delete_marker_replication_is_not_evaluated_without_an_expectation() {
+    let (report, _) = assemble_report(
+        &FetchOutcome::Unknown("not under test".to_string()),
+        &FetchOutcome::Unknown("not under test".to_string()),
+        &FetchOutcome::Absent("no replication configuration on the bucket".to_string()),
+        &FetchOutcome::Unknown("not under test".to_string()),
+        &RetentionSample::NotSampled,
+        &BucketProtectionParams::default(),
+    );
+    let state = report
+        .state(ProtectionConditionId::DeleteMarkerReplication)
+        .expect("present");
+    assert!(!state.is_fail(), "{state:?}");
+    assert!(state.detail().contains("not evaluated"), "{state:?}");
+}
+
+/// Not evaluated means not asked: no `?replication` request is sent.
+#[tokio::test]
+async fn no_replication_request_without_an_expectation() {
+    let respond = bucket(
+        |_query| listing_body(&[]),
+        |_path| (StatusCode::OK, COMPLIANT_RETENTION.to_string()),
+    );
+    let (base, seen) = spawn_fake(respond).await;
+    let params = BucketProtectionParams {
+        expected_noncurrent_days: Some(30),
+        ..BucketProtectionParams::default()
+    };
+    let report = test_client(&base).report(&params).await;
+    assert!(
+        !report
+            .state(ProtectionConditionId::DeleteMarkerReplication)
+            .expect("present")
+            .is_fail()
+    );
+    let queries: Vec<String> = seen.lock().iter().map(|r| r.query.clone()).collect();
+    assert_eq!(
+        queries,
+        ["versioning=", "lifecycle=", "object-lock="],
+        "no ?replication and no retention sampling"
+    );
+}
+
+/// The offset of an ISO 8601 time is four digits: a sign inside it is refused,
+/// not read as an offset the other way.
+#[test]
+fn iso8601_offset_with_an_inner_sign_is_refused() {
+    for bad in [
+        "2030-01-01T00:00:00+-5:00",
+        "2030-01-01T00:00:00-+5:00",
+        "2030-01-01T00:00:00+05:+1",
+    ] {
+        assert_eq!(parse_iso8601(bad), None, "{bad:?} must not parse");
+    }
+    assert!(parse_iso8601("2030-01-01T00:00:00-05:00").is_some());
+}
+
+fn element(name: &str, text: &str) -> XmlElement {
+    XmlElement {
+        name: name.to_string(),
+        text: text.to_string(),
+        children: Vec::new(),
+    }
+}
+
+/// A day count is plain decimal digits: no sign, no leading zero. A lone `0`
+/// stays a value.
+#[test]
+fn day_counts_with_a_sign_or_leading_zero_are_invalid() {
+    for bad in ["+30", "030", "-1", "00", "3 0"] {
+        let days = Days::parse(Ok(Some(&element("NoncurrentDays", bad))));
+        assert!(matches!(days, Days::Invalid(_)), "{bad:?} read as {days:?}");
+    }
+    assert_eq!(
+        Days::parse(Ok(Some(&element("NoncurrentDays", "0")))),
+        Days::Value(0)
+    );
+    assert_eq!(
+        Days::parse(Ok(Some(&element("NoncurrentDays", "30")))),
+        Days::Value(30)
+    );
+    let v = evaluate(&rule(
+        "signed",
+        "<Filter/>",
+        &format!("{}{MARKER}{ABORT_7}", noncurrent("+30")),
+    ));
+    assert!(v.noncurrent.is_unknown(), "{:?}", v.noncurrent);
+}
+
+/// S3 values are case-sensitive: another spelling of `Enabled`, `true`, or
+/// `COMPLIANCE` is unrecognised, so it is `Unknown`, never `Pass`.
+#[test]
+fn other_spellings_of_s3_values_are_unrecognised() {
+    assert_eq!(
+        RuleStatus::parse(Ok(Some(&element("Status", "enabled")))),
+        RuleStatus::Other("enabled".to_string())
+    );
+    assert_eq!(
+        RuleStatus::parse(Ok(Some(&element("Status", "DISABLED")))),
+        RuleStatus::Other("DISABLED".to_string())
+    );
+    assert_eq!(
+        Flag::parse(&element("ExpiredObjectDeleteMarker", "TRUE")),
+        Flag::Invalid("TRUE".to_string())
+    );
+    assert!(parse_bool(&element("IsTruncated", "False")).is_err());
+
+    let v = evaluate(
+        "<Rule><Status>enabled</Status><Filter/><NoncurrentVersionExpiration><NoncurrentDays>30\
+         </NoncurrentDays></NoncurrentVersionExpiration></Rule>",
+    );
+    assert!(v.noncurrent.is_unknown(), "{:?}", v.noncurrent);
+
+    let state = versioning_state(
+        "<VersioningConfiguration><Status>enabled</Status></VersioningConfiguration>",
+    );
+    assert!(state.is_unknown(), "{state:?}");
+    let state = object_lock_state(
+        "<ObjectLockConfiguration><ObjectLockEnabled>enabled</ObjectLockEnabled>\
+         </ObjectLockConfiguration>",
+    );
+    assert!(state.is_unknown(), "{state:?}");
+    assert!(matches!(
+        retention_verdict(
+            &retention("compliance", "2030-01-01T00:00:00Z"),
+            KAT_UNIX_SECS,
+            false
+        ),
+        SampleVerdict::Unknown(_)
+    ));
+}
+
+/// A listed version without a `Key` cannot address its retention, the same as
+/// one without a `VersionId`.
+#[test]
+fn listed_version_without_a_key_is_a_parse_error() {
+    let body = "<ListVersionsResult><IsTruncated>false</IsTruncated>\
+                <Version><VersionId>v1</VersionId><IsLatest>true</IsLatest>\
+                <LastModified>2013-05-01T00:00:00.000Z</LastModified></Version>\
+                </ListVersionsResult>";
+    assert!(parse_object_versions(body.as_bytes()).is_err());
+}
+
+/// Text from a successful response reaches a condition detail only through
+/// `short_excerpt`, so a detail stays bounded however long the value is.
+#[test]
+fn response_text_in_details_is_bounded() {
+    let long = "x".repeat(5000);
+    let RuleStatus::Other(status) = RuleStatus::parse(Ok(Some(&element("Status", &long)))) else {
+        panic!("a long status is not Enabled");
+    };
+    assert!(status.len() <= 203, "{}", status.len());
+    let Days::Invalid(days) = Days::parse(Ok(Some(&element("Days", &long)))) else {
+        panic!("a long day count is not a value");
+    };
+    assert!(days.len() <= 203, "{}", days.len());
+    let detail = parse_bool(&element("IsLatest", &long))
+        .expect_err("not a bool")
+        .into_unknown_detail();
+    assert!(detail.len() < 300, "{}", detail.len());
+    for scope in [
+        RuleScope::Prefix(long.clone()),
+        RuleScope::Narrowed {
+            prefix: long.clone(),
+            by: "a tag".to_string(),
+        },
+        RuleScope::Unrecognized(long.clone()),
+    ] {
+        assert!(scope.describe().len() < 300, "{}", scope.describe().len());
+    }
 }
