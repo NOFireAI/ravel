@@ -344,6 +344,26 @@ impl fmt::Display for MemoryExhausted {
 
 impl Error for MemoryExhausted {}
 
+/// The bytes a decode of a `declared`-byte body (a section, frame, part,
+/// postings or column-statistics object) may allocate under a decoder whose
+/// ceiling is `ceiling`: the declared length itself, or 0 when it is over the
+/// ceiling, since the decoder refuses an oversized one before it allocates
+/// anything (ADR-1702 decision 6).
+///
+/// Charging the ceiling instead turns that refusal into a budget refusal
+/// whenever the budget has less than the ceiling free, which reports memory
+/// pressure where an oversized object was, replaces the decoder's own typed
+/// error with a retryable one, and takes the caller down a different path (a
+/// catalog resolve fails instead of falling back to listing) than the
+/// decoder's refusal would. Charging 0 leaves the outcome to the decoder only
+/// while the budget is within its limit: a budget already over it (a
+/// `reserve_unchecked` caller can put it there) refuses even a 0-byte
+/// reservation.
+#[must_use]
+pub fn decoded_charge(declared: u64, ceiling: u64) -> u64 {
+    if declared > ceiling { 0 } else { declared }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -556,5 +576,15 @@ mod tests {
         assert_eq!(budget.handoff_overlap(), 0);
         drop(guard);
         assert_eq!(budget.handoff_overlap(), 0);
+    }
+
+    #[test]
+    fn decoded_charge_is_the_declared_length_up_to_the_ceiling_and_zero_over_it() {
+        assert_eq!(decoded_charge(4_095, 4_096), 4_095, "under the ceiling");
+        assert_eq!(decoded_charge(4_096, 4_096), 4_096, "equal to the ceiling");
+        assert_eq!(decoded_charge(4_097, 4_096), 0, "over the ceiling");
+        assert_eq!(decoded_charge(u64::MAX, 4_096), 0, "far over the ceiling");
+        assert_eq!(decoded_charge(0, 0), 0, "ceiling 0, nothing declared");
+        assert_eq!(decoded_charge(1, 0), 0, "ceiling 0, one byte declared");
     }
 }
