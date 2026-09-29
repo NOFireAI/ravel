@@ -1054,6 +1054,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   file groups: up to `target_partitions` groups for a parallel scan, and one
   group in manifest order, never re-split, otherwise. Nothing routes SQL to it
   yet; issue #2053 does.
+- **The logs SQL scan skips segments whose declared-column statistics exclude
+  the predicate** (ADR-2121 D1, issue #2151). A declared `i64`/`bool`
+  comparison or `BETWEEN`, or a declared `i64` `IN`, now also drops every
+  segment whose exact min/max for that column (the `SegmentRef` stamp or the
+  `.cstat` entry) proves no row can match, before any fetch, so the segment
+  costs no GET. A segment neither carrier covers, or whose carriers disagree,
+  is never skipped. A Flight SQL `DoGet` rebuilds segments from its ticket,
+  which carries no stamps, so it skips only by a loaded `.cstat` entry. The
+  count is reported as `segments_pruned_by_stats` on the logs scan's `EXPLAIN
+  ANALYZE` metrics, in `SqlStats`, and in `sql_latency_bench`'s per-statement
+  scan diagnostics. `max_segments` admission and the distributed coordinator
+  fan-out are unchanged.
 
 ## [0.19.0] - 2026-09-27
 
