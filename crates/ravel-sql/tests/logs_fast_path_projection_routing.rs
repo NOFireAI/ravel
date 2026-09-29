@@ -187,14 +187,15 @@ fn record(seg: usize, blk: usize) -> LogRecord {
 }
 
 /// Which RLOG trailer version the fixture stamps on its objects. The
-/// column-chunk ranged read needs a PAGE_DIR (ADR-0699 decision 5), and only
-/// version 4 has one; ADR-0892 deleted the version-3 reader, so a v3 object is
-/// not readable at all and the routing question does not arise for it. What is
-/// pinned instead is what it COSTS to find that out: nothing (decision 4).
+/// column-chunk ranged read needs a PAGE_DIR (ADR-0699 decision 5), which
+/// version 4 introduced and the current version keeps; ADR-0892 deleted the
+/// version-3 reader, so a v3 object is not readable at all and the routing
+/// question does not arise for it. What is pinned instead is what it COSTS to
+/// find that out: nothing (decision 4).
 #[derive(Clone, Copy)]
 enum RlogVersion {
     V3,
-    V4,
+    Current,
 }
 
 /// Restamp `object`'s trailer at `version`, recomputing the footer crc over it
@@ -227,7 +228,7 @@ async fn write_segment(
     }
     let written = w.finish().expect("finish");
     let (bytes, format_version) = match version {
-        RlogVersion::V4 => (written, ravel_logseg::footer::VERSION),
+        RlogVersion::Current => (written, ravel_logseg::footer::VERSION),
         RlogVersion::V3 => {
             let v = ravel_logseg::footer::VERSION - 1;
             (restamp_version(&written, v), v)
@@ -439,12 +440,12 @@ struct Shape {
 /// Plan and run one projection against a fresh fixture at `threshold`, and
 /// report its exact wire cost.
 async fn measure(projection: Option<Vec<usize>>, threshold_divisor: Option<u64>) -> Shape {
-    measure_versioned(projection, threshold_divisor, RlogVersion::V4).await
+    measure_versioned(projection, threshold_divisor, RlogVersion::Current).await
 }
 
 /// [`measure`] over a fixture written at an explicit RLOG version, so the
 /// version gate on the ranged route (issue #862) can be exercised on both v3
-/// and v4 objects.
+/// and current-version objects.
 async fn measure_versioned(
     projection: Option<Vec<usize>>,
     threshold_divisor: Option<u64>,
@@ -531,7 +532,7 @@ const TOTAL_ROWS: usize = SEGMENTS * BLOCKS_PER_SEG;
 #[tokio::test]
 async fn narrow_projection_reads_column_chunks_not_whole_objects() {
     let base = Arc::new(MemoryStore::new());
-    let snapshot = build_snapshot(base.as_ref(), RlogVersion::V4).await;
+    let snapshot = build_snapshot(base.as_ref(), RlogVersion::Current).await;
     let stored = snapshot_bytes(&snapshot);
     drop(snapshot);
 
@@ -550,7 +551,7 @@ async fn narrow_projection_reads_column_chunks_not_whole_objects() {
     // wire cost is a fraction of the stored bytes rather than all of them.
     assert_eq!(
         (shape.bytes, stored),
-        (71_554, 411_444),
+        (71_554, 406_004),
         "exact wire bytes for the narrow shape, against the fixture's stored bytes"
     );
 
@@ -575,7 +576,7 @@ async fn narrow_projection_reads_column_chunks_not_whole_objects() {
 #[tokio::test]
 async fn wide_projection_keeps_the_whole_object_read() {
     let base = Arc::new(MemoryStore::new());
-    let snapshot = build_snapshot(base.as_ref(), RlogVersion::V4).await;
+    let snapshot = build_snapshot(base.as_ref(), RlogVersion::Current).await;
     let stored = snapshot_bytes(&snapshot);
     drop(snapshot);
 
@@ -588,7 +589,7 @@ async fn wide_projection_keeps_the_whole_object_read() {
     );
     assert_eq!(
         (shape.bytes, stored),
-        (411_444, 411_444),
+        (406_004, 406_004),
         "a whole-object read moves exactly the stored bytes"
     );
     assert_eq!(
@@ -604,7 +605,7 @@ async fn wide_projection_keeps_the_whole_object_read() {
 #[tokio::test]
 async fn select_star_is_unchanged() {
     let base = Arc::new(MemoryStore::new());
-    let snapshot = build_snapshot(base.as_ref(), RlogVersion::V4).await;
+    let snapshot = build_snapshot(base.as_ref(), RlogVersion::Current).await;
     let stored = snapshot_bytes(&snapshot);
     drop(snapshot);
 
@@ -617,7 +618,7 @@ async fn select_star_is_unchanged() {
     );
     assert_eq!(
         (shape.bytes, stored),
-        (411_444, 411_444),
+        (406_004, 406_004),
         "SELECT * moves exactly the stored bytes"
     );
     assert_eq!(
@@ -670,9 +671,9 @@ async fn both_paths_return_identical_rows() {
 }
 
 /// ADR-0892 decisions 4 and 5: the SAME narrow projection over the SAME
-/// above-threshold segments, stamped at RLOG v3 instead of v4, is REFUSED with
-/// the typed `UnsupportedVersion` error having issued ZERO requests of every
-/// counted kind.
+/// above-threshold segments, stamped at RLOG v3 instead of the current
+/// version, is REFUSED with the typed `UnsupportedVersion` error having issued
+/// ZERO requests of every counted kind.
 ///
 /// This arm used to pin the opposite law -- `(SEGMENTS full, 0 suffix, 0
 /// ranges)`, the whole-object read a v3 segment kept however narrow the

@@ -119,7 +119,7 @@ fn rlog_inspect_output_matches_golden_fixture() {
     assert_eq!(
         stdout, expected,
         "`rlog inspect` output regressed; the RLOG format is frozen \
-         (docs/log-segment-format.md, currently trailer v4) -- this must not \
+         (docs/log-segment-format.md, currently trailer v5) -- this must not \
          change without a version bump and ADR"
     );
     assert!(
@@ -195,9 +195,8 @@ fn truncated_object_prints_typed_error_not_panic() {
 /// what `rlog inspect` prints.
 ///
 /// The end-to-end half cannot tell the trailer from the build's format
-/// constant yet: the reader accepts one version and every object carries it.
-/// It becomes discriminating at the v5 bump, if that build still reads v4
-/// objects. Until then the byte-offset half below is the
+/// constant: the reader accepts one version (version 5 refuses version 4
+/// objects) and every object carries it. The byte-offset half below is the
 /// part that can fail: it patches the trailer's version bytes and calls the
 /// byte reader directly, without asking the reader to open a version it would
 /// refuse.

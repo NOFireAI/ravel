@@ -4796,16 +4796,17 @@ mod tests {
     /// probes, the floor tail is 7.1, and with the crossing probe that is 16.2
     /// per part. 11 of the 12 parts close on the target (178 probes) and the
     /// trailing part runs its own partial ladder without ever closing (its proxy
-    /// passes the target, its records run out), which accounts for the remaining
-    /// 13 of the 191 pinned below. The model treats `r` as constant along a part
-    /// and ignores that a floored step overshoots, so a few percent is the
+    /// passes the target, its records run out), which with the per-part spread
+    /// around the model accounts for the remaining 18 of the 196 pinned below.
+    /// The model treats `r` as constant along a part and ignores that a
+    /// floored step overshoots, so a few percent is the
     /// expected agreement; a change that made probing linear in the deficit, or
     /// per-record, would miss it by an order of magnitude. Demonstrated red by
     /// the rate-model scheduler named in
     /// [`stored_target_overshoot_is_bounded_when_compressibility_collapses`]
     /// (an uncapped cumulative-rate step in place of
     /// `let step = deficit.max(PROBE_MIN_STEP_BYTES);`), under which this fixture
-    /// runs 34 probes, not 191.
+    /// ran 34 probes when measured at RLOG version 4 (191 pinned then).
     ///
     /// Demonstrated red against the old proxy-as-close design: replace the probe
     /// block in `PartSink::push` with `over_stored = part.stored_estimate >=
@@ -4903,10 +4904,11 @@ mod tests {
         // r = 7.08, d0 = STORED_TARGET * (1 - 1/r) = 14_069, ladder
         // ln(14069/4096) / ln(7.08/6.08) = 8.1, floor tail r = 7.1, crossing
         // probe 1, so 16.2 per part; 11 closing parts = 178, plus the trailing
-        // part's partial ladder = 191 pinned.
+        // part's partial ladder and the per-part spread around the model = 196
+        // pinned.
         assert_eq!(
             tracker.probes_run(),
-            191,
+            196,
             "the exact-encode probe count for this fixture is deterministic; the \
              geometric model predicts about 16.2 probes per part for r={ratio:.2} \
              over {} parts",
@@ -5257,11 +5259,12 @@ mod tests {
         // Deterministic corpus, so the probe count is pinned here too: r = 7.08
         // as in `stored_target_closes_parts_on_actual_encoded_object_bytes`
         // (same `ratio_record` fixture), 16.2 probes per part by the geometric
-        // model, 5 closing parts = 81 plus the trailing part's partial ladder =
-        // 89. Under the rate-model scheduler that test names it runs 16.
+        // model, 5 closing parts = 81 plus the trailing part's partial ladder and
+        // the per-part spread around the model = 91. Under the rate-model
+        // scheduler that test names it runs 16.
         assert_eq!(
             tracker.probes_run(),
-            89,
+            91,
             "the probe count is deterministic for this corpus: 16.2 per part by \
              the geometric model over the {} closing parts",
             parts.len() - 1
@@ -6293,9 +6296,10 @@ mod tests {
     /// the pre-D1 path's real bytes, now over the memory-target boundaries: the
     /// memory-target close, the trailing-part close, and every part in between,
     /// which is what the #872 change moved onto records plus a fresh writer at
-    /// close. The comparison is meaningful because `ravel-logseg` (the frozen
-    /// writer that turns a record set into bytes) has no commits between 76c90a3
-    /// and here, so a diff can only come from this crate.
+    /// close. The RLOG version 5 bump (ADR-2135) changed the writer's BLOOM and
+    /// footer bytes, which the memory-target split does not read, so the six
+    /// constants were re-captured under version 5 and the part count stayed
+    /// six; between that bump and here a diff can only come from this crate.
     ///
     /// The stored-target geometry #872 introduced is pinned separately, by
     /// [`stored_target_closes_parts_on_actual_encoded_object_bytes`] (band plus
@@ -6306,16 +6310,16 @@ mod tests {
         /// Total records seeded across the three inputs: 4 streams x
         /// (30 + 1) + 4 x (30 + 1) + 4 x (40 + 1).
         const EXPECTED_ROWS: usize = 4 * 31 + 4 * 31 + 4 * 41;
-        /// Part `content_hash` values, in `part_index` order, as printed by this
-        /// fixture ported onto commit 76c90a3 under
-        /// `l1_part_memory_target_bytes: 32 * 1024` (see the note above).
+        /// Part `content_hash` values, in `part_index` order, under
+        /// `l1_part_memory_target_bytes: 32 * 1024`, re-captured at the RLOG
+        /// version 5 bump (see the note above).
         const EXPECTED_PART_HASHES: &[&str] = &[
-            "853fb59210a344a2e656f6e1a29aa2feeeab0ec486373f3d37fd8975f74cb7ac",
-            "dca4d7e8b9729de6c64f132fa1eb52028ab85de629d17e1f8b85d7b916c883a4",
-            "6669e7d418d5e42b1bcd46e664c9b00503e3cbdbf6ed35e9ddd49d493e386459",
-            "29d933b58b29a40ee80a1587ecf91021bdc747376131f86fcef8dfdca9b1679a",
-            "f6c414a7fc62039e3000817c8ab65e36060bd20cee30fab61d1cb2eb4f166dd1",
-            "5641cc650be9829ca9bfb88d203ca98872ddf4fd1149815d25ed8bb4ddd44e46",
+            "1074e045c85223cb37cecce30c4753d0cd489864bb57007a8c086108f677fdbf",
+            "b766886237691a80fa401e5ccee1f6bffb5cea18985c68d0cf6515003398bb20",
+            "d7d1a8326c227dcecf55889bd27f786984441abbb1eacf3acb5a8827fb40ea7c",
+            "624c75945043e4db964566c430ce11e6709ee975b0dd71ac4c44a2f058079676",
+            "8a32c1e5f48e3da9a2b97156f3521971c10d9924514b491399ad550a506a6240",
+            "e3f20f9e46d1b2d19d030f043db4b646cd326047aa598309d82a3aacc05cf343",
         ];
 
         let (hashes, rows) = differential_hash_run().await;
@@ -6658,7 +6662,7 @@ mod tests {
         // The exact bytes, not only the order: the part hashes under overlap-gated
         // and eager all-open admission, pinned as literals.
         const EXPECTED_HASHES: [&str; 1] =
-            ["bcb041dad935c2e867f943330601f9bf04da1e171faa3ebdf67cadd14eefef39"];
+            ["b951173782cdb26d4c6f544c3bba7d50bf5b2bc5ca9752ada08c8ce555d27556"];
         let overlap = compact_part_hashes(&inputs, &CompactorConfig::default()).await;
         let eager = compact_part_hashes(
             &inputs,

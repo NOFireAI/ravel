@@ -33,12 +33,12 @@
 //!
 //! # Version 4 (ADR-0699 decision 5)
 //!
-//! The writer emits version-4 objects, so the surviving blocks these figures
-//! are proportional to are no longer contiguous byte ranges: a block's pages sit
-//! one per column chunk inside its row group, and the fetch is one coalesced
-//! range per surviving `(row group, projected column)`. Every assertion below
-//! keeps its meaning; the literals are measured on version-4 objects and each
-//! says what it counts.
+//! The writer emits version-5 objects, which keep version 4's row groups, so
+//! the surviving blocks these figures are proportional to are no longer
+//! contiguous byte ranges: a block's pages sit one per column chunk inside its
+//! row group, and the fetch is one coalesced range per surviving `(row group,
+//! projected column)`. Every assertion below keeps its meaning; the literals
+//! are measured on version-5 objects and each says what it counts.
 //!
 //! Two fetcher settings this fixture pins deliberately, because the figures are
 //! meaningless without them:
@@ -46,7 +46,7 @@
 //! - `SUFFIX_LEN` is sized to cover the object tail (footer, SKIP_IDX, PAGE_DIR,
 //!   BLOOM), which is what `DEFAULT_LOG_SUFFIX_LEN` does at production object
 //!   sizes and what issue #766 raised it for. At the default 256 KiB a probe
-//!   would swallow this fixture's whole 81 KB object and there would be no byte
+//!   would swallow this fixture's whole 79 KB object and there would be no byte
 //!   figure left to read.
 //! - `with_coalesce_gap(0)`. Under version 4 the hole between two wanted pages
 //!   of one column is the OTHER blocks' pages of that column, so the gap
@@ -114,12 +114,12 @@ const TOTAL_BLOCKS: usize = SEGMENTS * BLOCKS_PER_SEG;
 /// selective read still has to fetch a page of per surviving block, so it is
 /// what makes the byte figures track the surviving fraction.
 const BODY_BYTES: usize = 16 * 1024;
-/// Suffix probe length for the ranged path: just over this fixture's 6,780-byte
-/// object tail (footer + SKIP_IDX 139 + PAGE_DIR 199 + BLOOM 6,250), so one
-/// probe per segment carries every plan section and the scan needs no second GET
-/// for them. That is what `DEFAULT_LOG_SUFFIX_LEN` does at production object
-/// sizes (issue #766); the production value would cover this whole 81 KB fixture
-/// object and leave no byte figure to read.
+/// Suffix probe length for the ranged path: over this fixture's largest object
+/// tail, 4,495 bytes (segment 6: footer + SKIP_IDX 160 + PAGE_DIR 237 + BLOOM
+/// 3,888), so one probe per segment carries every plan section and the scan
+/// needs no second GET for them. That is what `DEFAULT_LOG_SUFFIX_LEN` does at
+/// production object sizes (issue #766); the production value would cover this
+/// whole 79 KB fixture object and leave no byte figure to read.
 const SUFFIX_LEN: u64 = 8192;
 
 /// A marker word present in exactly the first block of every segment. A
@@ -134,8 +134,10 @@ const MARKER_FEW: &str = "MARKERFEW";
 /// undecidable at the skip index, so every segment's plan phase still reads
 /// the whole object to count survivors (issue #835 fixture below) -- but only
 /// one segment actually survives, so the scan opens exactly one object and the
-/// other `SEGMENTS - 1` are never opened at all.
-const MARKER_RARE: &str = "MARKERRARE";
+/// other `SEGMENTS - 1` are never opened at all. Bloom is probabilistic, so
+/// the word is one no other block of this deterministic corpus false-matches;
+/// the `blocks_scanned == 1` pin below is what checks it.
+const MARKER_RARE: &str = "MARKERSOLE";
 
 /// The declared numeric column every record carries: `code = <block index>`
 /// (0..BLOCKS_PER_SEG). A `NumRange` prune arm on it (ClickBench q20/q37 shape)
@@ -909,13 +911,12 @@ async fn selective_numeric_reads_only_surviving_blocks() {
         "full scan decodes every block"
     );
     assert_eq!(full.rows, TOTAL_BLOCKS, "full scan returns every record");
-    // 649,903 = the eight version-4 objects' bytes exactly (segment 0 carries
-    // `MARKER_RARE` in addition to `MARKER_FEW`, so its object is a few bytes
-    // larger than the other seven after compression). One whole-object GET
-    // per segment and nothing else, so this is the object bytes and not a
-    // byte more.
+    // 630,495 = the eight version-5 objects' bytes exactly (their sizes
+    // differ: each block's bloom filter is sized to its own token count). One
+    // whole-object GET per segment and nothing else, so this is the object
+    // bytes and not a byte more.
     assert_eq!(
-        full.bytes, 649_903,
+        full.bytes, 630_495,
         "full scan reads exactly the object bytes"
     );
     assert_eq!(full.plan_full_reads, 0, "full scan skips the plan phase");
@@ -1100,7 +1101,7 @@ async fn text_predicate_falls_back_to_full_object_read() {
     );
     assert_eq!(text.rows, SEGMENTS, "one matching record per segment");
     // The whole objects are read: bytes ~ a full scan plus the probes, the
-    // amplification #761 cannot remove for a text predicate. 715,439 = 649,903
+    // amplification #761 cannot remove for a text predicate. 696,031 = 630,495
     // object bytes + 65,536 probe bytes (8 x 8 KiB). The 176 FIELD_DIR bytes
     // (8 x 22) this figure carried before #835 were the scan open's, not the
     // plan's: the plan fallback selects every column, while the scan's
@@ -1109,7 +1110,7 @@ async fn text_predicate_falls_back_to_full_object_read() {
     // short-circuits that open, so the read goes with it.
     let full = measure("full_scan", &[], cache).await;
     assert_eq!(
-        text.bytes, 715_439,
+        text.bytes, 696_031,
         "text fallback: the whole objects plus one plan probe each"
     );
     assert!(
@@ -1189,7 +1190,7 @@ async fn selective_third_no_partition_multiplication_under_cache_pressure() {
     //           the second read; each set carries its segment's 8 bridged gap
     //           bytes).
     // Pages are re-read under pressure, so the bound is one full pass, not
-    // the no-eviction figure: both stay under the 649,903 a full pass moves.
+    // the no-eviction figure: both stay under the 630,495 a full pass moves.
     assert_eq!(big.bytes, 264_479, "q20 with no eviction");
     assert_eq!(
         small.bytes, 479_269,
@@ -1267,11 +1268,11 @@ async fn text_predicate_no_second_wire_read_regardless_of_cache() {
              nothing beyond that -- the scan adds no GET of any shape",
             s.label
         );
-        // 715,439: identical to the big-cache figure
+        // 696,031: identical to the big-cache figure
         // (`text_predicate_falls_back_to_full_object_read`), proving the byte
         // cost no longer depends on cache size.
         assert_eq!(
-            s.bytes, 715_439,
+            s.bytes, 696_031,
             "{}: exactly the corpus bytes plus the fixed per-segment plan \
              overhead, moved once, never twice",
             s.label
@@ -1297,11 +1298,11 @@ async fn text_predicate_no_second_wire_read_regardless_of_cache() {
             "{}: one matching record per segment",
             s.label
         );
-        // 649,903: the whole corpus (see `full.bytes` in the sibling test),
+        // 630,495: the whole corpus (see `full.bytes` in the sibling test),
         // charged as reused rather than folded into the GET-bytes figure the
         // plan phase already recorded -- the truthful-accounting deliverable.
         assert_eq!(
-            s.acc_bytes_reused, 649_903,
+            s.acc_bytes_reused, 630_495,
             "{}: the scan's reuse of every carried whole object is charged via \
              bytes_reused, not silently absorbed into acc_bytes",
             s.label
@@ -1372,11 +1373,11 @@ async fn text_predicate_prunes_most_scan_adds_no_gets() {
         "only the one segment carrying the marker survives"
     );
     assert_eq!(s.rows, 1, "exactly one matching record, from segment 0");
-    // 81,147: segment 0's whole-object size, a few bytes larger than the
-    // other seven (its block 0 carries `MARKER_RARE` in addition to
-    // `MARKER_FEW`) -- the only segment whose carry the scan ever reuses.
+    // 78,721: segment 0's whole-object size (its block 0 carries
+    // `MARKER_RARE` in addition to `MARKER_FEW`) -- the only segment whose
+    // carry the scan ever reuses.
     assert_eq!(
-        s.acc_bytes_reused, 81_147,
+        s.acc_bytes_reused, 78_721,
         "the one surviving segment's scan reuses its plan-carried bytes \
          rather than issuing a second GET"
     );

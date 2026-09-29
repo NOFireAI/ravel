@@ -683,19 +683,19 @@ async fn without_a_cache_phase_two_costs_exactly_one_get_per_fetched_block() {
     // its byte fetch is the query's normal fetch for that object: these fixture
     // objects are below the block-range threshold, so each block read is a
     // whole-object GET, exactly as the baseline's segment reads are. So the
-    // cost is one object's bytes per winner, not one block's. 29,645 is the
-    // four objects a single pass moves (the baseline); 103,606 is that plus
-    // 73,961 for the ten whole-object block reads, and 36,818 is that plus
-    // 7,173 for one. See ADR-0774's consequences: narrowing that fetch to the
+    // cost is one object's bytes per winner, not one block's. 27,749 is the
+    // four objects a single pass moves (the baseline); 96,970 is that plus
+    // 69,221 for the ten whole-object block reads, and 34,448 is that plus
+    // 6,699 for one. See ADR-0774's consequences: narrowing that fetch to the
     // named block indices is a ravel-query follow-up, and it is what would make
     // the byte cost per-block rather than per-object.
-    assert_eq!(baseline.bytes, 29_645, "the four objects, once");
+    assert_eq!(baseline.bytes, 27_749, "the four objects, once");
     assert_eq!(
-        one.bytes, 36_818,
+        one.bytes, 34_448,
         "one winner adds one whole-object block read"
     );
     assert_eq!(
-        all.bytes, 103_606,
+        all.bytes, 96_970,
         "ten winners add ten whole-object block reads"
     );
     // And the rows are still identical, so the extra reads bought nothing but
