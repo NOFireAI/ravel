@@ -33,6 +33,7 @@
 
 use datafusion::error::DataFusionError;
 use ravel_catalog::{CatalogError, LoadColumnStatsError};
+use ravel_object_store::StoreError;
 use ravel_query::{FetchError, FoldLag, LogFetchError};
 
 use crate::spans_fetcher::SpanFetchError;
@@ -125,10 +126,15 @@ pub enum ErrorClass {
     /// The request is well-formed but cannot be served: budget exceeded,
     /// memory pool exhausted, planning or execution failure. 422.
     Unsupported,
-    /// A storage-layer fault. 503.
+    /// A transient storage-layer fault. 503.
     Unavailable,
     /// The wall deadline expired. 504.
     Timeout,
+    /// A permanent data-integrity fault: a corrupt stored object, a decode
+    /// that failed or panicked on it, or a fetched object that does not match
+    /// the request. A retry re-reads the same bytes and fails the same way,
+    /// so it is kept apart from [`ErrorClass::Unavailable`]. 500.
+    Internal,
 }
 
 /// A ravel-sql execution error.
@@ -193,7 +199,7 @@ pub enum SqlError {
     /// (crate::logs_scan). This is the same data-integrity fault as the
     /// fetcher's own [`LogFetchError::Corrupt`] path -- a stored blob that
     /// failed integrity -- just detected one layer up, so it surfaces with the
-    /// identical client class ([`ErrorClass::Unavailable`]) and message
+    /// identical client class ([`ErrorClass::Internal`]) and message
     /// ([`MSG_CORRUPT`]) rather than collapsing into a generic internal error.
     /// The detail string carries no object key or tenant data and is logged
     /// server-side only.
@@ -382,6 +388,9 @@ impl SqlError {
 
     /// The client-visible class, for HTTP status selection.
     pub fn class(&self) -> ErrorClass {
+        if self.is_integrity_fault() {
+            return ErrorClass::Internal;
+        }
         match self {
             SqlError::Validation(_) | SqlError::CrossSignalQuery => ErrorClass::BadRequest,
             // An over-wide window refused before any LIST is a
@@ -453,7 +462,13 @@ impl SqlError {
             ) => MSG_UNAVAILABLE.to_string(),
             SqlError::ColumnStats(_) => MSG_CORRUPT.to_string(),
             SqlError::Fetch(fetch) => match fetch {
-                FetchError::Corrupt { .. } => MSG_CORRUPT.to_string(),
+                // A store-side checksum mismatch is the same permanent data
+                // fault as a failed decode, as on the PromQL path.
+                FetchError::Corrupt { .. }
+                | FetchError::Store {
+                    source: StoreError::Corrupted(_),
+                    ..
+                } => MSG_CORRUPT.to_string(),
                 // A memory-budget refusal carries only byte counts (no object
                 // key or tenant identity); redacted to the transient message
                 // like a storage fault, since retrying under less pressure can
@@ -467,9 +482,12 @@ impl SqlError {
                 // violation of the read relative to the request, redacted like
                 // corruption: its `Display` names both object keys and both
                 // tenant hashes, none of which reaches the client.
-                LogFetchError::Corrupt { .. } | LogFetchError::CarryMismatch { .. } => {
-                    MSG_CORRUPT.to_string()
-                }
+                LogFetchError::Corrupt { .. }
+                | LogFetchError::CarryMismatch { .. }
+                | LogFetchError::Store {
+                    source: StoreError::Corrupted(_),
+                    ..
+                } => MSG_CORRUPT.to_string(),
                 LogFetchError::Store { .. }
                 | LogFetchError::EtagChanged { .. }
                 | LogFetchError::FetchMemoryExhausted { .. } => MSG_UNAVAILABLE.to_string(),
@@ -478,9 +496,12 @@ impl SqlError {
                 // A cross-tenant object is an integrity violation of the fetched
                 // segment relative to the request, redacted like corruption
                 // (the mismatching tenant identity never reaches the client).
-                SpanFetchError::Corrupt { .. } | SpanFetchError::TenantMismatch { .. } => {
-                    MSG_CORRUPT.to_string()
-                }
+                SpanFetchError::Corrupt { .. }
+                | SpanFetchError::TenantMismatch { .. }
+                | SpanFetchError::Store {
+                    source: StoreError::Corrupted(_),
+                    ..
+                } => MSG_CORRUPT.to_string(),
                 SpanFetchError::Store { .. }
                 | SpanFetchError::FetchMemoryExhausted { .. } => MSG_UNAVAILABLE.to_string(),
             },
@@ -505,6 +526,46 @@ impl SqlError {
             SqlError::Internal(_) | SqlError::OperatorPanic(_) => MSG_INTERNAL.to_string(),
             SqlError::Shared { message, .. } => message.clone(),
         }
+    }
+
+    /// True for a permanent data-integrity fault: every error
+    /// [`SqlError::client_message`] redacts to [`MSG_CORRUPT`]. The fetchers
+    /// report a panicked read-gate decode job as their `Corrupt` variant, so
+    /// it lands here too. Same rule as the PromQL HTTP surface, which answers
+    /// 500 for exactly the faults it redacts to that message.
+    fn is_integrity_fault(&self) -> bool {
+        matches!(
+            self,
+            SqlError::Catalog(
+                CatalogError::Reconstruction { .. }
+                    | CatalogError::FieldMismatch { .. }
+                    | CatalogError::Record(_)
+                    | CatalogError::Key(_)
+            ) | SqlError::ColumnStats(
+                LoadColumnStatsError::HeadCorrupt { .. }
+                    | LoadColumnStatsError::TenantHashMismatch { .. }
+            ) | SqlError::Fetch(
+                FetchError::Corrupt { .. }
+                    | FetchError::Store {
+                        source: StoreError::Corrupted(_),
+                        ..
+                    }
+            ) | SqlError::LogFetch(
+                LogFetchError::Corrupt { .. }
+                    | LogFetchError::CarryMismatch { .. }
+                    | LogFetchError::Store {
+                        source: StoreError::Corrupted(_),
+                        ..
+                    }
+            ) | SqlError::SpanFetch(
+                SpanFetchError::Corrupt { .. }
+                    | SpanFetchError::TenantMismatch { .. }
+                    | SpanFetchError::Store {
+                        source: StoreError::Corrupted(_),
+                        ..
+                    }
+            ) | SqlError::CorruptStreamAttrs(_)
+        )
     }
 
     /// True when this error is a store `NotFound` on a pinned segment: the
@@ -704,7 +765,7 @@ mod tests {
         // LogFetchError::Corrupt path -- one corruption class, not two.
         let reverify = SqlError::CorruptStreamAttrs("stream_attrs truncated".to_string());
         assert_eq!(reverify.client_message(), MSG_CORRUPT);
-        assert_eq!(reverify.class(), ErrorClass::Unavailable);
+        assert_eq!(reverify.class(), ErrorClass::Internal);
 
         let fetcher = SqlError::LogFetch(LogFetchError::Corrupt {
             key: LEAKY_KEY.to_string(),
@@ -715,6 +776,74 @@ mod tests {
         // The detail string stays available server-side and leaks nothing.
         assert!(reverify.to_string().contains("stream_attrs truncated"));
         assert_redacted(&reverify.client_message());
+    }
+
+    /// Every fault the redaction calls corrupt takes the internal class, and
+    /// nothing else does: the PromQL surface's rule. The panicked-decode cases
+    /// are built the way each fetcher reports a `CpuGateError::Panicked` job.
+    #[test]
+    fn exactly_the_corrupt_faults_take_the_internal_class() {
+        let key = || LEAKY_KEY.to_string();
+        let panicked = "read CPU gate: the gated job panicked".to_string();
+        let corrupt = [
+            SqlError::Fetch(FetchError::Corrupt {
+                key: key(),
+                source: ravel_segment::SegmentError::Decompress(panicked.clone()),
+            }),
+            SqlError::Fetch(FetchError::Store {
+                key: key(),
+                source: StoreError::Corrupted("checksum mismatch".into()),
+            }),
+            SqlError::LogFetch(LogFetchError::Corrupt {
+                key: key(),
+                source: ravel_logseg::LogSegError::Corrupted(panicked.clone()),
+            }),
+            SqlError::LogFetch(LogFetchError::Store {
+                key: key(),
+                source: StoreError::Corrupted("checksum mismatch".into()),
+            }),
+            SqlError::SpanFetch(SpanFetchError::Corrupt {
+                key: key(),
+                source: ravel_rspan::SpanSegError::Corrupted(panicked),
+            }),
+            SqlError::SpanFetch(SpanFetchError::Store {
+                key: key(),
+                source: StoreError::Corrupted("checksum mismatch".into()),
+            }),
+            SqlError::CorruptStreamAttrs("truncated".into()),
+        ];
+        for err in &corrupt {
+            assert_eq!(err.client_message(), MSG_CORRUPT, "{err}");
+            assert_eq!(err.class(), ErrorClass::Internal, "{err}");
+        }
+
+        let transient = [
+            SqlError::Fetch(FetchError::Store {
+                key: key(),
+                source: StoreError::Transient(RAW_STORE_TEXT.into()),
+            }),
+            SqlError::Fetch(FetchError::EtagChanged { key: key() }),
+            SqlError::LogFetch(LogFetchError::Store {
+                key: key(),
+                source: StoreError::Transient("read CPU gate: cancelled".into()),
+            }),
+            SqlError::SpanFetch(SpanFetchError::Store {
+                key: key(),
+                source: StoreError::Permanent(RAW_STORE_TEXT.into()),
+            }),
+            SqlError::Catalog(CatalogError::Store(StoreError::Transient(
+                RAW_STORE_TEXT.into(),
+            ))),
+            SqlError::SnapshotInvalidated,
+        ];
+        for err in &transient {
+            assert_ne!(err.client_message(), MSG_CORRUPT, "{err}");
+            assert_eq!(err.class(), ErrorClass::Unavailable, "{err}");
+        }
+        assert_eq!(
+            SqlError::DeadlineExceeded { millis: 5 }.class(),
+            ErrorClass::Timeout
+        );
     }
 
     #[test]
@@ -730,7 +859,7 @@ mod tests {
             carried_tenant: ravel_types::TenantHash([2u8; 16]),
         });
         assert_eq!(err.client_message(), MSG_CORRUPT);
-        assert_eq!(err.class(), ErrorClass::Unavailable);
+        assert_eq!(err.class(), ErrorClass::Internal);
         // The detail survives server-side, where it is the whole point.
         assert!(err.to_string().contains(LEAKY_KEY));
         assert_redacted(&err.client_message());
