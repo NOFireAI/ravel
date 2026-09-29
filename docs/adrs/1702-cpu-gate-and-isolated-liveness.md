@@ -546,7 +546,12 @@ reservation sites. Both readings are settled here.
   would: a snapshot part that should fall back to listing fails the query
   instead. Charging 0 leaves the outcome to the decoder. This covers the
   snapshot part, postings and column statistics reservations, the per-frame
-  `SERIES_META_CHUNKS` charge, and the per-section catalog charge.
+  `SERIES_META_CHUNKS` charge, and the per-section catalog charge. One budget
+  state still refuses a 0-byte charge: one a `reserve_unchecked` caller has
+  pushed over its limit. `Catalog::reserve_decoded` then evicts decoded-cache
+  entries until the budget admits the charge, so the decoder still decides;
+  only when the bytes over the limit are held outside those caches does the
+  budget refusal stand.
 - **A refused reservation fails the operation, on the resolve path and on the
   fold path alike.** Both paths could instead degrade: the resolve by
   disabling pruning, the fold by rebuilding its postings from scratch. Both
