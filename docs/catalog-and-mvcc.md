@@ -1259,8 +1259,9 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
      resolution, the token fallback (step 5), the index fold, scrub, the
      erasure completion gate and `migrate`. The erasure rewrite pass picks
      the bucket's live record by the same rules: the one record no rewrite
-     chain, no present version 2 record and no dominance excludes, with a
-     cycle or an over-deep chain a typed error.
+     chain, no present version 2 record and no dominance excludes. A cycle
+     or an over-deep chain fails the pass with an invariant error carrying
+     the catalog's error as text, not with an error type of its own.
    - **Reclaiming superseded records.** The superseded-input sweep reclaims a
      record a present version 2 record supersedes, with its parts, as one
      chain group entered from the version 2 record at the head of the chain

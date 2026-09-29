@@ -184,17 +184,18 @@ record. A version 2 record naming a record that is not present reclaims
 nothing.
 
 A version 2 record whose predecessor a present rewrite record also supersedes
-is dominated: its parts re-encode the pre-erasure data. No record names it, so
-no chain walk reaches it; instead it joins the chain group of the rewrite whose
-chain reaches the record it names, and is deleted with its parts under that
-group's horizon, HEAD gate and hold. A HEAD that still names its parts holds
-the whole group, and with it every erasure request the group's records
-applied. Dominated records are deleted ahead of the chain's own records and
-newest first, so a crash between two deletes never leaves one undominated. A
-dominated record whose predecessor is already gone joins the group of the
-rewrite whose chain ends at that same absent key, even when that group holds
-nothing else; one that no group takes is logged and counted in the pass's
-`dominated_records_unattached`, not skipped silently.
+is dominated: its parts re-encode the pre-erasure data. A rewrite that names
+it directly reaches it on its own chain walk; otherwise no record on the chain
+names it, so it joins the chain group of the rewrite whose chain reaches the
+record it names, and is deleted with its parts under that group's horizon,
+HEAD gate and hold. A HEAD that still names its parts holds the whole group,
+and with it every erasure request the live rewrite applied and every one the
+group's records applied. Dominated records are deleted ahead of the chain's
+own records and newest first, so a crash between two deletes never leaves one
+undominated. A dominated record whose predecessor is already gone joins the
+group of the rewrite whose chain ends at that same absent key, even when that
+group holds nothing else; one that no group takes is logged and counted in the
+pass's `dominated_records_unattached`, not skipped silently.
 
 In a bucket whose version 2 supersession does not resolve (a cycle, a chain
 past the depth bound, or a version 2 record whose inputs differ from the

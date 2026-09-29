@@ -611,12 +611,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   group holds no raw L0 input; those stay under the authoritative-input rule,
   whose two-view guard is kept. A version 2 record a rewrite dominates joins
   that rewrite's chain group and is deleted with its parts under the same
-  rules. A rewrite's chain now runs through a version 2 record to the record it
-  names, so a rewrite over C2 over C1 reclaims C1 too instead of leaving it to
-  be served again. The erasure rewrite pass picks a bucket's live record
-  through the catalog's shared supersession rules, so C1
+  rules, and one whose predecessor is already gone joins the group of the
+  rewrite whose chain ends at the key it names; one no group takes is counted
+  in `SupersededSweepOutcome::dominated_records_unattached`. A rewrite's chain
+  now runs through a version 2 record to the record it names, so a rewrite
+  over C2 over C1 reclaims C1 too instead of leaving it to be served again,
+  except in a bucket whose version 2 supersession does not resolve, where
+  such a chain reclaims nothing. The chain walk's depth bound counts records
+  as the catalog's walks do. The erasure rewrite pass picks a bucket's live
+  record through the catalog's shared supersession rules, so C1
   with a version 2 C2 resolves to C2, a rewrite and a version 2 record over the
-  same C1 resolve to the rewrite, and a cycle is a typed error instead of
+  same C1 resolve to the rewrite, and a cycle fails the pass with
+  `MaintainError::Invariant` carrying the catalog's error as text instead of
   `MultipleLiveRecords` or `NoLiveRecord`. No production path writes a version
   2 record yet, so this is dormant until the writer ships.
 - **`validate_rewrite` refuses a non-canonical `superseded_record_key`** (issue
