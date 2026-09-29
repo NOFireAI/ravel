@@ -228,8 +228,8 @@ impl PinnedParquetReader {
                 ParquetReadError::Corrupt { key, message }
             }
             SingleFlightError::Upstream(CacheFetchError::Store(source)) => match *source {
-                StoreError::PreconditionFailed { .. } => ParquetReadError::FileChanged { key },
-                StoreError::NotFound { .. } => ParquetReadError::FileMissing { key },
+                StoreError::PreconditionFailed => ParquetReadError::FileChanged { key },
+                StoreError::NotFound => ParquetReadError::FileMissing { key },
                 _ => ParquetReadError::Store { key, source },
             },
         }
