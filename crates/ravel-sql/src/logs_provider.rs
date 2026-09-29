@@ -3052,8 +3052,8 @@ mod tests {
     ///
     /// Flipped assertion: dropping the stamp check from `arm_excludes` (the
     /// `if stamp_coverage(..).is_none() { return false; }`) skips the segment
-    /// on its `.cstat` entry and fails the count (`0 != 3`) and the skip count
-    /// (`1 != 0`).
+    /// on its `.cstat` entry and fails the result assertion (a count of `0`
+    /// where `3` is expected).
     #[tokio::test]
     async fn a_cstat_entry_alone_never_skips_a_segment_with_resource_level_matches() {
         const NOW_NS: i64 = 4 * 3_600_000_000_000;
@@ -3234,6 +3234,67 @@ mod tests {
             "a .cstat entry alone never skips a segment"
         );
         assert_eq!(run.store.gets_of("stamped"), 0);
+    }
+
+    /// Fixed stamped segments and arms, each with the verdict and rows the D1
+    /// rule gives, so the mutations below fail deterministically instead of
+    /// when the property test happens to draw the right case.
+    ///
+    /// Flipped assertions:
+    /// - an unsigned compare of the arm and segment bounds' bit patterns
+    ///   (`q < seg_min` as `(q as u64) < (seg_min as u64)`, the same on the
+    ///   other side) orders every negative value above every positive one, and
+    ///   skips `IN (-1, 6)` over `[-3, 10]`, `code < 5` over `[-10, -7]` and
+    ///   `code > -5` over `[3, 10]`, each of which holds a match;
+    /// - skipping only when EVERY arm is disjoint (`.any(` to `.all(` over the
+    ///   arms in `prune_segments_by_stats`) keeps `code >= 0 AND code = 50`
+    ///   and `other = 1 AND code = 50` over `[0, 3]` (`other` is unstamped);
+    /// - treating an arm that touches an inclusive bound as disjoint (`q <
+    ///   seg_min` to `q <= seg_min`, or `q > seg_max` to `q >= seg_max`, in
+    ///   `arm_excludes`) skips `code = 5` or `code = 9` over `[5, 9]` and loses
+    ///   the matching row.
+    #[tokio::test]
+    async fn fixed_arm_cases_skip_exactly_the_disjoint_segments() {
+        let memory: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let cases: [(&[i64], &str, bool, &[usize]); 12] = [
+            (&[-5, -4, -3], "code IN (-1, 6)", true, &[]),
+            (&[-3, -1, 10], "code IN (-1, 6)", false, &[1]),
+            (&[-5, 0, 3], "code < -5", true, &[]),
+            (&[-10, -8, -7], "code < -5", false, &[0, 1, 2]),
+            (&[-10, -8, -7], "code < 5", false, &[0, 1, 2]),
+            (&[3, 5, 10], "code > -5", false, &[0, 1, 2]),
+            (&[0, 1, 3], "code >= 0 AND code = 50", true, &[]),
+            (&[0, 1, 3], "other = 1 AND code = 50", true, &[]),
+            (&[5, 7, 9], "code = 5", false, &[0]),
+            (&[5, 7, 9], "code = 9", false, &[2]),
+            (&[5, 7, 9], "code = 4", true, &[]),
+            (&[5, 7, 9], "code = 10", true, &[]),
+        ];
+        let mut mismatches = Vec::new();
+        for (i, (values, predicate, skipped, matching)) in cases.into_iter().enumerate() {
+            let key = format!("case-{i}");
+            let values: Vec<Option<i64>> = values.iter().copied().map(Some).collect();
+            let seq = i as u64 + 1;
+            let seg = write_code_segment(memory.as_ref(), &key, seq, &values).await;
+            let seg = with_stamps(seg, &[code_stamp(&values)]);
+            let sql = format!("SELECT ts, body FROM logs WHERE {predicate}");
+            let run = run_pruned(&memory, vec![seg], None, true, &sql).await;
+            let want: BTreeSet<_> = matching.iter().map(|&r| code_row(seq, r)).collect();
+            let got = (
+                run.rows.len(),
+                run.pruned_by_stats(),
+                run.store.gets_of(&key) == 0,
+            );
+            if run.rows != want || got.1 != usize::from(skipped) || got.2 != skipped {
+                mismatches.push(format!(
+                    "`{predicate}` over {values:?}: (rows, skipped, unfetched) = {got:?}, \
+                     want ({}, {}, {skipped})",
+                    want.len(),
+                    usize::from(skipped)
+                ));
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
     }
 
     /// Shapes `extract_logs` declines skip nothing, even where a naive reading
@@ -3420,7 +3481,7 @@ mod tests {
     }
 
     fn arb_conjunct() -> impl Strategy<Value = Conjunct> {
-        let v = || 0i64..=8;
+        let v = || -8i64..=8;
         prop_oneof![
             v().prop_map(Conjunct::Eq),
             v().prop_map(Conjunct::Lt),
@@ -3437,7 +3498,7 @@ mod tests {
 
     fn arb_segment() -> impl Strategy<Value = (Vec<Option<i64>>, Carriers)> {
         let values = prop_oneof![
-            4 => proptest::collection::vec(proptest::option::weighted(0.8, 0i64..=8), 1..=4),
+            4 => proptest::collection::vec(proptest::option::weighted(0.8, -8i64..=8), 1..=4),
             1 => (1usize..=3).prop_map(|n| vec![None; n]),
         ];
         let carriers = prop_oneof![
@@ -3473,14 +3534,9 @@ mod tests {
         /// rows with statistics pruning equal the rows without it, the skipped
         /// segments are exactly the ones the D1 rule selects (by count, and by
         /// which objects saw zero GETs), and nothing is skipped with pruning
-        /// off.
-        ///
-        /// Flipped assertions: skipping a segment only when EVERY arm is
-        /// disjoint (`.any(` to `.all(` over the arms in
-        /// `prune_segments_by_stats`) misses skips and fails the count; treating
-        /// an arm that touches the boundary as disjoint (`q < seg_min` to
-        /// `q <= seg_min` in `arm_excludes`) skips a segment holding a match and
-        /// fails the row equality.
+        /// off. `code` values and `code` literals range over `-8..=8`, so arms
+        /// and bounds of mixed sign are drawn. The mutations this suite catches are pinned
+        /// deterministically in `fixed_arm_cases_skip_exactly_the_disjoint_segments`.
         #[test]
         fn stats_pruning_changes_no_row_and_skips_exactly_what_the_rule_selects(
             segs in proptest::collection::vec(arb_segment(), 1..=4),
