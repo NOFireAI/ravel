@@ -2,10 +2,11 @@
 
 Persistent contract (ADR-0029). Any change bumps the trailer version. The
 current trailer version is 5 (ADR-2135 added the footer's sort descriptor and
-clustering generation, put the covered-column list at the head of BLOOM, sized
-bloom filters to a multiple of 512 bits, and registered encoding tags 10 to
-13). It is the only version any reader accepts: the version-4 reader was
-deleted in the same change, as ADR-0892 deleted the version-3 reader, and
+clustering generation, put the covered-column list, under its own crc32c, at
+the head of BLOOM, sized bloom filters to a multiple of 512 bits, and
+registered encoding tags 10 to 13). It is the only version any reader
+accepts: the version-4 reader was deleted in the same change, as ADR-0892
+deleted the version-3 reader, and
 version 2 (which added the footer's compaction-identity fields) and version 1
 (the format-only initial release) were retired the same way before it.
 
@@ -208,8 +209,9 @@ Validation (all violations `Corrupted`, never panics):
 - `uncompressed_len` is capped by config (default 1 GiB per section) and
   the decompressed length must equal it exactly.
 - A present `sort_descriptor` with `clustering_generation` 0, an unspecified
-  or unknown `bucket_width`, a key column count outside 1..=4, or a key
-  column with an unspecified or unknown type.
+  or unknown `bucket_width`, a key column count outside 1..=4, a key column
+  with an unspecified or unknown type, a key column with an empty name, or
+  two key columns with the same name (whatever their types).
 
 ### Section kinds
 
@@ -335,7 +337,11 @@ exact scan and to no stat, always legal.
 
 ## BLOCKS
 
-Records are sorted `(stream_ref ascending, ts_ns ascending)`. Target 8192
+When the footer carries no `sort_descriptor`, records are sorted
+`(stream_ref ascending, ts_ns ascending)`. When it carries one, records are
+sorted `(stream_ref, time bucket, key columns, ts_ns)` as the descriptor
+defines (see "LogFooter", row order). The writer at version 5 records no
+descriptor, so every object it writes has the first order. Target 8192
 records per block, cap 8 MiB uncompressed. Per block, one page per column
 that has at least one value in the block.
 
@@ -795,6 +801,8 @@ container that starts with the list of column ids its filters cover:
 ```
 covered_count: u32
 covered_count column ids: varint each, strictly ascending
+covered_crc32c: u32   crc32c over the list bytes above (covered_count and
+                      the id varints)
 count: u32
 count entries, entry i for block i:
   entry_len: varint
@@ -851,10 +859,14 @@ Readers reject a truncated entry, an `m_bits` that is not a multiple of 512
 or is below 512, a `k` of 0, a `bits` length that is not `m_bits / 8`,
 and an entry index outside `[0, count)`. In the covered list they reject a
 `covered_count` above the object's column count (the fixed ids plus FIELD_DIR's
-entries), an id that is not strictly above the one before it, and an id of 10
-or more that FIELD_DIR does not name. Like any other BLOOM corruption, a
-rejected covered list degrades the scan to no bloom pruning (see "Pruning
-soundness").
+entries) and a `covered_crc32c` that does not match the list bytes, and only
+then, on a list whose crc matched, an id that is not strictly above the one
+before it and an id of 10 or more that FIELD_DIR does not name. The crc is what
+catches a flipped id that still leaves an ascending list of real columns: the
+structural checks accept that list, and probing the substituted column in
+filters that hold no key for it would drop matching rows. Like any other BLOOM
+corruption, a rejected covered list is `Corrupted` and degrades the scan to no
+bloom pruning (see "Pruning soundness").
 
 ## POSTINGS
 
@@ -1042,8 +1054,12 @@ The merge is defined entirely in terms of this format:
   collision and is a hard, typed error (the cross-object form of the
   single-writer `InconsistentStreamAttrs` check), never a silent pick.
 - **Re-sort, re-block, and re-group.** The merged records are re-sorted by
-  `(stream_ref ascending, ts ascending)` and re-chunked at the same 8192
-  record block target, then placed into row groups of `group_target_blocks`
+  the output object's sort descriptor: `(stream_ref ascending, ts
+  ascending)` when the output carries none, and `(stream_ref, time bucket,
+  key columns, ts)` when it carries one (ADR-2135 decision 2 picks the
+  output descriptor). The writer at version 5 records no descriptor, so a
+  compacted part today is sorted `(stream_ref, ts)`. The records are then
+  re-chunked at the same 8192 record block target, then placed into row groups of `group_target_blocks`
   consecutive blocks with their pages column-major (ADR-0699 decision 1).
   Compaction is where full row groups arise: an L0 flush object is usually one
   short group, an L1 segment is many full ones, which is what makes a narrow
@@ -1114,7 +1130,8 @@ requires containment.
 ## Checksum coverage map
 
 Every byte a reader interprets is covered by a checksum it can verify on
-its access path (ADR-0010 §4):
+its access path (ADR-0010 §4), except BLOOM's `count` and `entry_len`
+framing, which is checked structurally (see below):
 
 | bytes | checksum | where it lives | when verified |
 |---|---|---|---|
@@ -1125,15 +1142,22 @@ its access path (ADR-0010 §4):
 | PAGE_DIR stored bytes | `Section.crc32c` | footer section entry | before decoding the section |
 | one page's stored bytes | that page's `crc32c` | PAGE_DIR | before decompressing the page |
 | one block's pages concatenated in `column_id` order | `block_crc32c` | that block's SKIP_IDX level-0 entry | before decoding the block, by a reader that took every page of it |
+| BLOOM covered-column list (`covered_count` and the id varints) | `covered_crc32c` | BLOOM, right after the ids | before any id is validated or used, in `RlogBloomSection::parse` |
 | one BLOOM entry's stored bytes | per-entry `crc32c` | BLOOM container framing | before probing the entry |
 | POSTINGS header (`column_id`, `capped`, `stride`, counts, `first_term`s, offsets, for every field) | whole-section `Section.crc32c` | footer section entry | before `PostingsSection::parse`, in `RlogReader::scan` |
 | one POSTINGS term block's stored bytes | per-block `crc32c` | POSTINGS sparse-index entry | before decompressing the block a probe lands on |
 
-BLOCKS and BLOOM have no whole-section crc because they are never read
-whole: a selective scan touches a handful of blocks or blooms, and a
-whole-section crc could not be verified without fetching the whole
-section, defeating the point. Their per-page, per-block, and per-entry
-crc32c are the access-path-verifiable equivalents.
+The writer stores a `Section.crc32c` for BLOCKS and BLOOM as for every
+section, but `RlogReader::scan` does not verify either. BLOCKS is read by
+page and by block, and verifying a whole-section crc would mean fetching
+the whole section, defeating the projection; its per-page and per-block
+crc32c are the access-path-verifiable equivalents. BLOOM is read whole by
+`scan` (one fetch of its stored bytes), and its checksums are the
+covered-list crc and the per-entry crc above: the list crc covers every
+byte of the header that decides which columns may prune, and each entry's
+crc covers the filter it frames. The remaining bytes, `count` and each
+`entry_len`, are checked structurally: the entries must tile the section
+exactly, with no trailing bytes.
 
 Version 4's per-page crc32c exists for the same reason one level down. A
 reader that fetched two of a hundred columns holds no more than those two
@@ -1175,8 +1199,9 @@ proves absent.
   of, and prunes nothing. `RlogReader::scan` applies it between skip-index
   and bloom pruning, so bloom only has to consider whatever POSTINGS
   could not already rule out.
-- Bloom negative is proof of absence: skip the block. Bloom positive is
-  no information: scan the block and evaluate the predicate exactly on
+- Bloom negative on a covered column is proof of absence: skip the block.
+  Bloom positive, or any probe of a column the covered list omits, is no
+  information: scan the block and evaluate the predicate exactly on
   decoded values.
 - Regex/substring predicates consult blooms only when the planner can
   extract word literals that any match must contain; otherwise only
