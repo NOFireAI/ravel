@@ -683,10 +683,11 @@ pub struct ServerConfig {
     /// (`ResolvedPerformanceDefaults::memory_remainder_bytes`), which `main`
     /// fills from the resolved struct. [`start`] wraps this in ONE
     /// `Arc<ravel_memory::MemoryBudget>` shared by the `sql`-featured
-    /// `SqlExecutor` (via `SqlExecutor::with_process_memory_budget`) and the
-    /// `/metrics` gauges on `MetricsState`, so a tenant's SQL reservation and
-    /// the exposed gauges read the SAME counter rather than two
-    /// independently drifting instances.
+    /// `SqlExecutor` and its three fetchers (`build_sql_state`), the PromQL
+    /// engine, the distributed fragment service, the startup cache warm pass
+    /// and the `/metrics` gauges on `MetricsState`, so every reservation and
+    /// the exposed gauges read the SAME counter rather than independently
+    /// drifting instances.
     pub process_memory_budget_bytes: u64,
     /// Whether [`Self::process_memory_budget_bytes`] was sized from
     /// [`config::PERF_SOURCE_FALLBACK`] (host memory unknown), rather than

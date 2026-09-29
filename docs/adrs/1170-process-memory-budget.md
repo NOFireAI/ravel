@@ -321,7 +321,9 @@ marked):
   `MemoryBudget::unlimited()`: `QueryEngine::with_memory_budget` reaches only its
   `fetcher` and `log_fetcher`, and no server task installs a finite budget yet.
   (See the decision 2 server amendment below: `ravel-server` now installs the
-  process budget on its PromQL, fragment and cache-warm fetchers.)
+  process budget on its PromQL, fragment and cache-warm fetchers.
+  The SQL fetcher amendment below records that `build_sql_state`'s fetchers,
+  the server's only RSPAN fetcher among them, now reserve against it too.)
 - The SQL cross-boundary overlap is untracked by `handoff_overlap`. The
   cache-hit overlap was too, and is now marked at every cache-hit call site,
   and `covering_read`'s own cache-insert branch and RSEG's `ensure_ranges`
@@ -726,7 +728,8 @@ logged, not a startup failure.
 
 Still unreserved against this budget: the RSPAN fetcher and every fetcher
 `build_sql_state` constructs, which keep their private
-`MemoryBudget::unlimited()`. The M5 reserve calibration (#1256) remains open.
+`MemoryBudget::unlimited()` (no longer true: see the SQL fetcher amendment
+below). The M5 reserve calibration (#1256) remains open.
 
 ## Amendment (2026-09-26, ADR-2023): a loopback fetch-cache share and a catalog cache sized on its own
 
@@ -796,3 +799,28 @@ is the residual that remains.
 meaning: `live_bytes` is the placed bytes assembled reads hold, and
 `peak_live_bytes` its high-water mark. The pool counters (`allocated`,
 `reused`, `zeroed_bytes`) are retired.
+
+## Amendment (2026-09-29, issue #2086): the SQL path's fetchers reserve against the budget
+
+<!-- amendment-applies: sections="Amendment (2026-09-06, Refs: #1254)|Amendment 2026-09-26 (issue #1255): decision 2 reaches the server" pointer="SQL fetcher amendment" -->
+
+`build_sql_state` (`services/ravel-server/src/query.rs`) now installs the
+process `MemoryBudget` on the three fetchers it builds, the RSEG metrics, RLOG
+logs and RSPAN spans fetchers, the same `Arc` the SQL executor already held.
+That RSPAN fetcher is the only one `ravel-server` builds, so no server fetcher
+outside tests still reserves against a private unlimited budget. A SQL fetch
+the budget cannot admit fails with `FetchMemoryExhausted` and answers 503
+(`unavailable`) over HTTP, distinct from the SQL memory pool's own refusal,
+which answers 422. The tests
+`a_sql_{metrics,logs,spans}_fetch_over_the_process_budget_is_refused_and_the_process_keeps_serving`
+and `sql_logs_query_reserves_a_nonzero_fetch_gauge_while_the_get_is_held` in
+`services/ravel-server/src/tests.rs` pin each fetcher's wiring through the
+real HTTP router.
+
+The SQL cross-boundary overlap named under decision 2 is now charged in
+production. A SQL scan charges the batches it decodes to the SQL pool, which
+draws on this same budget, while the fetch guard for the bytes they were
+decoded from may still be live, so the two ledgers can count overlapping
+bytes and `handoff_overlap` does not see it. `unique` overcounts by that
+overlap; the M5 reserve calibration (#1256) has to account for it as the
+decision 2 text above already requires.
