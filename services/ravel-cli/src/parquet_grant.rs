@@ -59,8 +59,9 @@ use ravel_types::{TenantHash, TenantId};
 
 /// How many listing pages `add` reads while looking for one object under the
 /// granted prefix. A prefix whose first objects are this far into a listing is
-/// reported as empty rather than probed, so the search is bounded on a bucket
-/// whose listing is dominated by keys outside the grant.
+/// refused rather than probed, with a refusal that says the search stopped at
+/// this bound, so the search is bounded on a bucket whose listing is dominated
+/// by keys outside the grant.
 const MAX_PROBE_LIST_PAGES: usize = 8;
 
 /// Opens the store a profile names for one bucket. [`ExternalStore::open`] in
@@ -107,14 +108,28 @@ fn kind_admits_scheme(kind: &ExternalKind, scheme: &str) -> bool {
     )
 }
 
-/// The key of one object the candidate grant admits, or `None` when the
-/// prefix holds none within [`MAX_PROBE_LIST_PAGES`] listing pages.
+/// What [`one_object_under`] found under a candidate grant.
+#[derive(Debug, PartialEq, Eq)]
+enum ProbeObject {
+    /// The key of one object the grant admits.
+    Found(String),
+    /// The listing ran to its end without one.
+    Empty,
+    /// [`MAX_PROBE_LIST_PAGES`] pages were read without one, and the listing
+    /// had more.
+    PageCapReached,
+}
+
+/// One object the candidate grant admits, looked for within
+/// [`MAX_PROBE_LIST_PAGES`] listing pages.
 ///
 /// A location that did not end in `/` (`directory` false) may name one object,
 /// so its key is probed with a HEAD first: `object_store` appends `/` to every
 /// non-empty list prefix, so a listing of `data/x.parquet` never returns
 /// `data/x.parquet` itself. Without an object at that key the location is
-/// listed as a prefix.
+/// listed as a prefix. A zero-byte object at that key is listed through too:
+/// on an Azure account with a hierarchical namespace a directory is a
+/// zero-byte blob, so its HEAD succeeds, and it is not a file to probe.
 ///
 /// Admission is decided by [`grants::contains_key`], the same segment-wise
 /// rule the read path applies, so a listing prefix of `data` cannot offer
@@ -123,11 +138,11 @@ async fn one_object_under(
     store: &dyn ObjectStoreBackend,
     candidate: &Grant,
     directory: bool,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<ProbeObject> {
     if !directory && !candidate.prefix.is_empty() {
         match store.head(&candidate.prefix).await {
-            Ok(_) => return Ok(Some(candidate.prefix.clone())),
-            Err(StoreError::NotFound) => {}
+            Ok(meta) if meta.size > 0 => return Ok(ProbeObject::Found(candidate.prefix.clone())),
+            Ok(_) | Err(StoreError::NotFound) => {}
             Err(err) => {
                 return Err(err).with_context(|| format!("reading {}", candidate.url()));
             }
@@ -146,15 +161,15 @@ async fn one_object_under(
                 &candidate.bucket,
                 meta.key.as_bytes(),
             ) {
-                return Ok(Some(meta.key.clone()));
+                return Ok(ProbeObject::Found(meta.key.clone()));
             }
         }
         match listed.next {
             Some(next) => page = Some(next),
-            None => return Ok(None),
+            None => return Ok(ProbeObject::Empty),
         }
     }
-    Ok(None)
+    Ok(ProbeObject::PageCapReached)
 }
 
 /// Grant `url` to `profile` for `tenant`, after the checks this module's
@@ -194,14 +209,19 @@ pub async fn add_grant(
         created_by: created_by.to_string(),
     };
 
-    let Some(probe_key) =
-        one_object_under(external.as_ref(), &candidate, parsed.key.directory).await?
-    else {
-        anyhow::bail!(
-            "the location {url:?} holds no object, so the store's preconditions could not be \
+    let probe_key =
+        match one_object_under(external.as_ref(), &candidate, parsed.key.directory).await? {
+            ProbeObject::Found(key) => key,
+            ProbeObject::Empty => anyhow::bail!(
+                "the location {url:?} holds no object, so the store's preconditions could not be \
              probed on it: grant a location that already holds at least one object"
-        );
-    };
+            ),
+            ProbeObject::PageCapReached => anyhow::bail!(
+                "no object under the location {url:?} was found within the first \
+             {MAX_PROBE_LIST_PAGES} listing pages, so the store's preconditions could not be \
+             probed on it: grant a narrower location, one whose first objects are listed sooner"
+            ),
+        };
     probe_preconditions(external.as_ref(), &probe_key)
         .await
         .with_context(|| {
@@ -769,6 +789,87 @@ mod tests {
         assert!(text.contains("holds no object"), "{text}");
     }
 
+    /// A location without a trailing `/` whose HEAD finds a zero-byte object,
+    /// as an Azure account with a hierarchical namespace reports a directory,
+    /// is listed as a prefix, and the object probed is the file under it.
+    #[tokio::test]
+    async fn a_zero_byte_directory_blob_is_listed_through() {
+        let store = external_bucket().await;
+        store
+            .put("data", Bytes::new(), PutOptions::default())
+            .await
+            .expect("put directory blob");
+        let external = ListsUnderSlash(store);
+        assert_eq!(external.head("data").await.expect("head").size, 0);
+        let candidate = Grant {
+            profile: "prod".to_string(),
+            scheme: "az".to_string(),
+            bucket: "customer".to_string(),
+            prefix: "data".to_string(),
+            created_unix_ns: NOW,
+            created_by: "ravel-cli".to_string(),
+        };
+        assert_eq!(
+            one_object_under(&external, &candidate, false)
+                .await
+                .expect("probe"),
+            ProbeObject::Found("data/part-0.parquet".to_string())
+        );
+    }
+
+    /// A listing that stops at the page bound is not reported as an empty
+    /// location: the refusal says no object was found within that many pages
+    /// and asks for a narrower location, while a listing that ran to its end
+    /// still says the location holds no object.
+    #[tokio::test]
+    async fn a_listing_stopped_at_the_page_bound_is_refused_as_such() {
+        let store = MemoryStore::with_page_size(1);
+        for index in 0..=MAX_PROBE_LIST_PAGES {
+            store
+                .put(
+                    &format!("data2/{index}.parquet"),
+                    Bytes::from_static(b"x"),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("put");
+        }
+        let external: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let err = add_grant(
+            &MemoryStore::new(),
+            &TenantId::new("acme").hash(),
+            &s3_profile("prod"),
+            "s3://customer/data",
+            "ravel-cli",
+            &AtNs(NOW),
+            &opener(Arc::clone(&external)),
+        )
+        .await
+        .expect_err("must refuse");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains(&format!(
+                "was found within the first {MAX_PROBE_LIST_PAGES} listing pages"
+            )),
+            "{text}"
+        );
+        assert!(text.contains("grant a narrower location"), "{text}");
+        assert!(!text.contains("holds no object"), "{text}");
+
+        let err = add_grant(
+            &MemoryStore::new(),
+            &TenantId::new("acme").hash(),
+            &s3_profile("prod"),
+            "s3://customer/elsewhere/",
+            "ravel-cli",
+            &AtNs(NOW),
+            &opener(external),
+        )
+        .await
+        .expect_err("must refuse");
+        assert!(format!("{err:#}").contains("holds no object"), "{err:#}");
+    }
+
     /// The object probed is one the grant admits: a sibling prefix sharing the
     /// grant's first characters is not offered to the probe, so an empty grant
     /// beside a populated `data2/` is still refused as empty.
@@ -795,7 +896,7 @@ mod tests {
             one_object_under(&store, &candidate, true)
                 .await
                 .expect("list"),
-            None
+            ProbeObject::Empty
         );
     }
 

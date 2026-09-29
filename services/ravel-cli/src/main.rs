@@ -3440,6 +3440,45 @@ mod tests {
                 ],
                 false,
             ),
+            (
+                &[
+                    "ravel", "parquet", "sweep", "--tenant", "t", "--grace", "1h",
+                ],
+                true,
+            ),
+            (&["ravel", "parquet", "ls", "--tenant", "t"], false),
+            (
+                &[
+                    "ravel",
+                    "tenant",
+                    "parquet-grant",
+                    "add",
+                    "--tenant",
+                    "t",
+                    "--location",
+                    "s3://lake/data/",
+                    "--profile",
+                    "lake",
+                ],
+                true,
+            ),
+            (
+                &[
+                    "ravel",
+                    "tenant",
+                    "parquet-grant",
+                    "remove",
+                    "--tenant",
+                    "t",
+                    "--location",
+                    "s3://lake/data/",
+                ],
+                true,
+            ),
+            (
+                &["ravel", "tenant", "parquet-grant", "ls", "--tenant", "t"],
+                false,
+            ),
         ];
         for (args, expect_write) in cases {
             let cli =
