@@ -85,7 +85,8 @@ use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsSe
 use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsServiceServer;
 use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceServiceServer;
 use ravel_ingest::{
-    AdmissionController, IngestConfig, IngestRouter, LogIngestRouter, SpanIngestRouter, SystemClock,
+    AdmissionController, IngestConfig, IngestConfigError, IngestRouter, LogIngestRouter,
+    SpanIngestRouter, SystemClock,
 };
 use ravel_object_store::{ObjectStoreBackend, StoreMetrics};
 #[cfg(feature = "otap")]
@@ -490,9 +491,9 @@ pub struct ServerConfig {
     /// [`ravel_ingest::IngestConfig::idle_flush_byte_floor`] on all three
     /// ingest pipelines (ADR-1737 decision 1). `0` disables it, which is the
     /// shipped default and leaves every buffer on today's two clocks. A
-    /// non-zero value must be below `min_flush_bytes`;
-    /// [`ravel_ingest::IngestConfig::validate`] is called on each pipeline's
-    /// config in [`start`] and refuses startup otherwise. See
+    /// non-zero value must be below `min_flush_bytes`; [`start`] refuses
+    /// startup otherwise, in every [`Mode`], including the ones that build no
+    /// ingest router. See
     /// `--idle-flush-byte-floor`, whose help states the buffered-mode loss
     /// window a non-zero floor accepts.
     pub idle_flush_byte_floor: usize,
@@ -1812,13 +1813,46 @@ fn mcp_settings(
 fn validated_ingest_config(config: IngestConfig, signal: Signal) -> anyhow::Result<IngestConfig> {
     config.validate().map_err(|e| {
         anyhow::anyhow!(
-            "invalid ingest configuration for the {} pipeline: {e}. \
-             --idle-flush-byte-floor must be below --min-flush-bytes, or 0 to disable the \
-             sub-floor hold",
-            crate::metrics::signal_name(signal)
+            "invalid ingest configuration for the {} pipeline: {}",
+            crate::metrics::signal_name(signal),
+            ingest_config_refusal(&e)
         )
     })?;
     Ok(config)
+}
+
+/// Refuses a `--idle-flush-byte-floor` at or above `--min-flush-bytes` in
+/// every [`Mode`], so a process that builds no ingest router (`--mode query`,
+/// `--mode maintain`) cannot start on a flag combination its help says is
+/// refused. [`validated_ingest_config`] still runs per pipeline for the modes
+/// that build one. Only the floor rule is checked here: every field other
+/// than the two flags is taken from `IngestConfig::default()`, so a
+/// `validate` rule on another field would be judged against defaults, not the
+/// operator's values.
+fn validate_idle_flush_byte_floor(config: &ServerConfig) -> anyhow::Result<()> {
+    IngestConfig {
+        min_flush_bytes: config.min_flush_bytes,
+        idle_flush_byte_floor: config.idle_flush_byte_floor,
+        ..IngestConfig::default()
+    }
+    .validate()
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "invalid ingest configuration: {}",
+            ingest_config_refusal(&e)
+        )
+    })
+}
+
+/// The refusal text for one [`IngestConfigError`], with the advice naming the
+/// flags that variant's fields come from.
+fn ingest_config_refusal(e: &IngestConfigError) -> String {
+    match e {
+        IngestConfigError::IdleFlushByteFloorNotBelowMinFlushBytes { .. } => format!(
+            "{e}. --idle-flush-byte-floor must be below --min-flush-bytes, or 0 to disable \
+             the sub-floor hold"
+        ),
+    }
 }
 
 /// Set once the ADR-1689 release A warnings have been logged, so a process that
@@ -1971,6 +2005,8 @@ pub async fn start_with_heartbeat(
     cache: Option<ravel_query::ReadCache>,
     heartbeat: health_listener::Heartbeat,
 ) -> anyhow::Result<Running> {
+    validate_idle_flush_byte_floor(&config)?;
+
     // Install the rustls process-level crypto provider before any TLS endpoint
     // is built (ADR-0071 amendment decision 1: the dedicated fragment listener
     // terminates TLS in-process). This binary links both the `ring` and
@@ -4880,7 +4916,10 @@ mod release_b_warning_tests {
         }
     }
 
-    fn settings(fragment_listener: bool, sql_ticket_key_file: bool) -> config::DistribSettings {
+    pub(super) fn settings(
+        fragment_listener: bool,
+        sql_ticket_key_file: bool,
+    ) -> config::DistribSettings {
         config::DistribSettings {
             fragment_keys: vec![[0x11; 32]],
             sql_ticket_keys: sql_ticket_key_file.then(|| vec![[0x22; 32]]),
@@ -4956,7 +4995,7 @@ PTREtiuqNQ9HYwDc6S9HnUYgt9z+qtP0A5BTFL4jvybiT6/CRnVuZ0Ds
 
     /// A `ServerConfig` for a `mode` process carrying `distrib`, bound to
     /// ephemeral loopback ports.
-    fn server_config(mode: Mode, distrib: config::DistribSettings) -> ServerConfig {
+    pub(super) fn server_config(mode: Mode, distrib: config::DistribSettings) -> ServerConfig {
         ServerConfig {
             mode,
             listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
@@ -5212,5 +5251,56 @@ PTREtiuqNQ9HYwDc6S9HnUYgt9z+qtP0A5BTFL4jvybiT6/CRnVuZ0Ds
                 assert!(lines.is_empty(), "{mode:?}: {lines:?}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod idle_flush_byte_floor_mode_tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    /// A `--mode query` process builds no ingest router, so the per-pipeline
+    /// check never sees its config; the floor is still refused, with the same
+    /// flags and byte figures a `--mode all` refusal carries. `distrib` is
+    /// cleared as a precaution: the floor check already returns before any
+    /// release B logging, so the once-flag another test asserts on is not
+    /// reached either way.
+    #[tokio::test]
+    async fn a_query_mode_floor_above_min_flush_bytes_refuses_startup() {
+        let mut config = release_b_warning_tests::server_config(
+            Mode::Query,
+            release_b_warning_tests::settings(true, true),
+        );
+        config.distrib = None;
+        config.idle_flush_byte_floor = config.min_flush_bytes + 1;
+        let min_flush_bytes = config.min_flush_bytes;
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::new(ravel_object_store::memory::MemoryStore::new());
+        let err = start(
+            config,
+            store.clone(),
+            store,
+            Arc::new(StoreMetrics::default()),
+            None,
+        )
+        .await
+        .err()
+        .expect("a query-mode floor above min_flush_bytes must refuse startup");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("--idle-flush-byte-floor"),
+            "the refusal must name the flag the operator set, got: {message}"
+        );
+        assert!(
+            message.contains("--min-flush-bytes"),
+            "the refusal must name the flag the floor is validated against, got: {message}"
+        );
+        assert!(
+            message.contains(&format!("({} bytes)", min_flush_bytes + 1))
+                && message.contains(&format!("({min_flush_bytes} bytes)")),
+            "the refusal must carry the byte figures that conflict, got: {message}"
+        );
     }
 }

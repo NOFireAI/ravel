@@ -211,6 +211,56 @@ fn depth_report(samples: Vec<u64>) -> DepthReport {
     }
 }
 
+/// A run's flush count by trigger: the five counters `estimated_put_count`
+/// sums, and [`FlushCounts::breakdown_line`] prints every one of them, so the
+/// printed breakdown sums to the estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlushCounts {
+    pub by_size: u64,
+    pub by_age: u64,
+    pub by_age_adaptive: u64,
+    pub by_age_floor: u64,
+    pub manual: u64,
+}
+
+impl FlushCounts {
+    pub fn from_snapshot(metrics: &ravel_ingest::IngestMetricsSnapshot) -> Self {
+        Self {
+            by_size: metrics.flushes_by_size,
+            by_age: metrics.flushes_by_age,
+            by_age_adaptive: metrics.flushes_by_age_adaptive,
+            by_age_floor: metrics.flushes_by_age_floor,
+            manual: metrics.flushes_manual,
+        }
+    }
+
+    /// One data-object PUT and one commit-record PUT per flush, excluding
+    /// retries.
+    pub fn estimated_put_count(&self) -> u64 {
+        2 * (self.by_size + self.by_age + self.by_age_adaptive + self.by_age_floor + self.manual)
+    }
+
+    /// The human-table flush-cause line `ingest_bench` prints.
+    pub fn breakdown_line(&self) -> String {
+        format!(
+            "  flushes           : size={} age={} age_adaptive={} age_floor={} manual={}",
+            self.by_size, self.by_age, self.by_age_adaptive, self.by_age_floor, self.manual
+        )
+    }
+}
+
+impl Report {
+    pub fn flush_counts(&self) -> FlushCounts {
+        FlushCounts {
+            by_size: self.flushes_by_size,
+            by_age: self.flushes_by_age,
+            by_age_adaptive: self.flushes_by_age_adaptive,
+            by_age_floor: self.flushes_by_age_floor,
+            manual: self.flushes_manual,
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub struct Report {
     pub config: ReportConfig,
@@ -223,6 +273,9 @@ pub struct Report {
     /// zero when `--flush-delay-policy fixed`. Reported alongside the fixed
     /// counters so the A/B panel can attribute the flush-cause shift.
     pub flushes_by_age_adaptive: u64,
+    /// Flushes the sub-floor hold opened (ADR-1737). Zero unless the router's
+    /// `idle_flush_byte_floor` is non-zero, and disjoint from `flushes_by_age`.
+    pub flushes_by_age_floor: u64,
     pub flushes_manual: u64,
     /// In-flight flush-depth occupancy, sampled over the run.
     pub in_flight_depth: DepthReport,
@@ -236,7 +289,11 @@ pub struct Report {
     /// (`ravel_commit::publish::publish`), excluding retries. Includes the
     /// adaptive-age flushes so the estimate stays correct with the adaptive
     /// policy on; unchanged from before at the default policy where
-    /// `flushes_by_age_adaptive` is always zero.
+    /// `flushes_by_age_adaptive` is always zero. Includes
+    /// `flushes_by_age_floor` too, so it stays correct with a floor set.
+    /// Computed by [`FlushCounts::estimated_put_count`] over the same five
+    /// counters this report carries, so twice the printed breakdown
+    /// ([`FlushCounts::breakdown_line`]) is exactly this figure.
     pub estimated_put_count: u64,
     pub bytes_written: u64,
     pub logical_bytes: u64,
@@ -702,12 +759,7 @@ pub async fn run(config: &IngestBenchConfig) -> Report {
     } else {
         bytes_written as f64 / logical_bytes as f64
     };
-    let estimated_put_count = 2
-        * (metrics.flushes_by_size
-            + metrics.flushes_by_age
-            + metrics.flushes_by_age_adaptive
-            + metrics.flushes_by_age_floor
-            + metrics.flushes_manual);
+    let estimated_put_count = FlushCounts::from_snapshot(&metrics).estimated_put_count();
 
     Report {
         config: ReportConfig {
@@ -727,6 +779,7 @@ pub async fn run(config: &IngestBenchConfig) -> Report {
         flushes_by_size: metrics.flushes_by_size,
         flushes_by_age: metrics.flushes_by_age,
         flushes_by_age_adaptive: metrics.flushes_by_age_adaptive,
+        flushes_by_age_floor: metrics.flushes_by_age_floor,
         flushes_manual: metrics.flushes_manual,
         in_flight_depth: depth,
         put_retries: metrics.put_retries,
@@ -760,6 +813,35 @@ mod tests {
             .map(|b| (b.depth, b.samples))
             .collect();
         assert_eq!(buckets, vec![(0, 2), (1, 1), (2, 2), (3, 1)]);
+    }
+
+    /// A floor-set run's counters, each trigger non-zero and a distinct power
+    /// of two, so a counter the printed line drops changes the sum. The bench
+    /// itself writes in strict mode and so never takes the sub-floor hold,
+    /// which is why the snapshot is built here rather than read off a run.
+    #[test]
+    fn printed_flush_breakdown_sums_to_the_estimate_with_a_floor_set() {
+        let snapshot = ravel_ingest::IngestMetricsSnapshot {
+            flushes_by_size: 1,
+            flushes_by_age: 2,
+            flushes_by_age_adaptive: 4,
+            flushes_by_age_floor: 8,
+            flushes_manual: 16,
+            ..Default::default()
+        };
+        let counts = FlushCounts::from_snapshot(&snapshot);
+        let line = counts.breakdown_line();
+        let printed: u64 = line
+            .split_whitespace()
+            .filter_map(|field| field.split_once('='))
+            .map(|(_, value)| value.parse::<u64>().expect("numeric flush count"))
+            .sum();
+        assert_eq!(counts.estimated_put_count(), 62);
+        assert_eq!(
+            2 * printed,
+            counts.estimated_put_count(),
+            "the printed breakdown must sum to the estimate: {line}"
+        );
     }
 
     #[test]

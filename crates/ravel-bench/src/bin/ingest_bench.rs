@@ -53,13 +53,7 @@ fn print_human_table(report: &Report) {
         report.ack_latency_ms.max,
         report.ack_latency_ms.count
     );
-    println!(
-        "  flushes           : size={} age={} age_adaptive={} manual={}",
-        report.flushes_by_size,
-        report.flushes_by_age,
-        report.flushes_by_age_adaptive,
-        report.flushes_manual
-    );
+    println!("{}", report.flush_counts().breakdown_line());
     print!(
         "  in-flight depth   : max_observed={} (n={}, {}) histogram=[",
         report.in_flight_depth.max_observed,
