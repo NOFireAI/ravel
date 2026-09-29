@@ -642,6 +642,31 @@ async fn footprint_refuses_a_section_grown_into_its_neighbour() {
         "{text}"
     );
     assert!(text.contains("o.rlog"), "{text}");
+
+    // The binary prints no report and exits non-zero with the same error.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("grown.rlog");
+    std::fs::write(&path, &edited).expect("write");
+    let out = Command::new(env!("CARGO_BIN_EXE_ravel-cli"))
+        .args(["--store", "memory", "rlog", "footprint", "--json"])
+        .arg(&path)
+        .output()
+        .expect("ravel-cli runs");
+    assert!(!out.status.success());
+    assert!(
+        out.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("grown.rlog"), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "account for {} bytes but the object is {total} bytes",
+            total + 1
+        )),
+        "{stderr}"
+    );
 }
 
 /// A section shifted one byte back overlaps its predecessor and leaves a
