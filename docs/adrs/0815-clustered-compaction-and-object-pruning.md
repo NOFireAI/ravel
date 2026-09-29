@@ -140,7 +140,8 @@ The per-tenant override lives in the existing durable config record
 `t/<tenant_hash>/config` (docs/catalog-and-mvcc.md; ADR-0066 §6), which already
 carries the indexed-field set and the declared typed-attribute-column set. A
 new optional `clustering_key` field (a declared column name, or the sentinel
-for EventTime) is an additive field on `TenantConfigRecord`, resolved
+for EventTime) is an additive field on `TenantConfigRecord` (shape and
+versioning replaced: see the ADR-2135 clustering-key amendment), resolved
 override-over-default exactly as retention and admission limits already are. A
 tenant whose queries filter on a different low-cardinality dimension (say a
 `Region` column) sets the key to that column and gets object exclusion on it
@@ -305,7 +306,8 @@ which total-order sorting has already pushed to the tail.
 #### Identity: pinning the clustering configuration that produced a record
 
 The clustering key is read from `t/<tenant_hash>/config`
-(`TenantConfigRecord.clustering_key`, decision 2), a mutable, whole-record
+(`TenantConfigRecord.clustering_key`, decision 2, whose shape is now the
+ADR-2135 clustering-key amendment's), a mutable, whole-record
 CAS-replaced object. `input_set_hash` (docs/catalog-and-mvcc.md) is defined
 today as the blake3 digest over the compaction record's sorted `inputs` list
 alone. If the clustering key changes between a compaction attempt and its
@@ -1048,7 +1050,8 @@ exclusion is an index problem, and it solves only the former.
     `covered_hour_min`/`covered_hour_max` (additive only on an L1 record,
     where both equal its single bucket -- a cross-hour record is
     deliberately NOT in this class, next bullet); on `TenantConfigRecord`,
-    `clustering_key`. All are the same class as the `enc`/`config` histories
+    `clustering_key` (no longer additive: see the ADR-2135 clustering-key
+    amendment). All are the same class as the `enc`/`config` histories
     (docs/catalog-and-mvcc.md) and as this ADR's own EventTime precedent
     (`CompactionPart.min_event_ts_ns`/`max_event_ts_ns` are already additive
     fields on the same message, added without a bump when ADR-0018 shipped
@@ -1721,3 +1724,26 @@ absent or duplicated figure fails the same as one outside the band.
   record published" into a one-object existence check every consumer
   answers identically, at the cost of one GET per discovered cross-hour
   record.
+
+## Amendment (2026-09-29): the ADR-2135 clustering-key amendment
+
+<!-- amendment-supersedes: phrase="is an additive field on `TenantConfigRecord`" pointer="ADR-2135 clustering-key amendment" -->
+<!-- amendment-supersedes: phrase="on `TenantConfigRecord`, `clustering_key`" pointer="ADR-2135 clustering-key amendment" -->
+<!-- amendment-supersedes: phrase="`TenantConfigRecord.clustering_key`" pointer="ADR-2135 clustering-key amendment" -->
+
+ADR-2135 took the field name this ADR's decision 2 reserved.
+`TenantConfigRecord.clustering_key` is field 13 of the record and carries
+ADR-2135's `ClusteringKeyConfig`: a repeated list of declared typed attribute
+column names in key order, a bucket width, and a clustering generation. It
+was added at record `format_version` 3 under ADR-0066's readers-before-writers
+rule, not as an additive field without a version bump. Field names and
+numbers on a persistent format are frozen, so decision 2's shape (one
+declared column name, or a sentinel for EventTime) can no longer be added
+under that name.
+
+If decision 2 is ever implemented, it reads the per-tenant override from
+ADR-2135's `ClusteringKeyConfig` rather than adding a field of its own, and
+any change to that message's shape follows ADR-0066 with its own version
+bump. Every other decision in this ADR is unchanged and still unimplemented.
+The `clustering_key` descriptors on `CompactionPart` and `CompactionRecord`
+are different fields on different messages and are not affected.
