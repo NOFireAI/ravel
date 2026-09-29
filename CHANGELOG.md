@@ -476,6 +476,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`/metrics` renders the three writer clock-lag counters, and a shipped
+  alert pages on a refused flush** (ADR-1685 follow-up task 3, issue #1685).
+  `ravel_ingest_clock_lag_refused_total`,
+  `ravel_ingest_clock_lag_unchecked_total` and
+  `ravel_ingest_clock_lag_bypassed_at_shutdown_total` render in the ingest
+  family for the metrics, logs and spans signals. The new
+  `RavelWriterClockLagRefused` rule in `deploy/prometheus/ravel.rules.yaml`
+  fires on `increase(ravel_ingest_clock_lag_refused_total[10m]) > 0` held for
+  5m: a writer whose clock runs behind the object store's clock by more than
+  the clock-skew allowance. The other two counters do not page; the
+  observability guide says why.
 - **The maintenance loop sweeps alert history older than `--alert-retention`,
   default 90 days** (ADR-1688 follow-up task 2, issue #1688). After upgrade
   the first tick deletes every alert transition older than 90 days except each
