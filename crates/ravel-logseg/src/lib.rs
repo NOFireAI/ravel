@@ -32,10 +32,12 @@ pub mod stream_dir;
 pub mod varint;
 pub mod writer;
 
-// encoding, bloom, bloom_section, and tokenizer live in `ravel-codec`
-// (ADR-0045 decision 1). Re-exported here so no other crate's imports or
-// Cargo.toml need to change.
-pub use ravel_codec::{bloom, bloom_section, encoding, tokenizer};
+// encoding, bloom, and tokenizer live in `ravel-codec` (ADR-0045 decision 1).
+// Re-exported here so no other crate's imports or Cargo.toml need to change.
+pub use ravel_codec::{bloom, encoding, tokenizer};
+
+#[cfg(test)]
+mod bloom_coverage_tests;
 
 // The columnar block view (ADR-0099 decision 1). `block::DecodedBlock` is
 // deliberately NOT re-exported: the view is the whole public surface over a

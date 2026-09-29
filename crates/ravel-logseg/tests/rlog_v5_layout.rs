@@ -1,6 +1,8 @@
 //! RLOG trailer version 5 (ADR-2135, docs/log-segment-format.md): the footer
 //! sort descriptor and clustering generation, the BLOOM covered-column list, and
-//! the single-version window that refuses version 4.
+//! the single-version window that refuses version 4. The reader's handling of an
+//! uncovered column is tested in the crate (`src/bloom_coverage_tests.rs`),
+//! where the writer's coverage seam is visible.
 #![allow(clippy::expect_used)]
 
 use std::borrow::Cow;
@@ -15,9 +17,8 @@ use ravel_logseg::footer::{
 use ravel_logseg::record::{COL_BODY, COL_SEVERITY_TEXT};
 use ravel_logseg::rlog_bloom::{RlogBloomSection, encode_rlog_bloom_section};
 use ravel_logseg::{
-    AttrValue, ByteSource, FieldSel, FieldType, LogRecord, LogSegError, LogStreamId,
-    ObjectIdentity, Predicate, RlogConfig, RlogReader, RlogWriter, read_section,
-    stream_attrs_bytes,
+    AttrValue, ByteSource, FieldType, LogRecord, LogSegError, LogStreamId, ObjectIdentity,
+    Predicate, RlogConfig, RlogReader, RlogWriter, read_section, stream_attrs_bytes,
 };
 
 fn identity() -> ObjectIdentity {
@@ -78,85 +79,6 @@ fn bloom_raw_of(object: &[u8]) -> Vec<u8> {
     let cfg = RlogConfig::default();
     let ftr = open(object).expect("open");
     read_section(object, ftr.section(kind::BLOOM).expect("BLOOM"), &cfg).expect("read BLOOM")
-}
-
-fn has_word(field: FieldSel, word: &str) -> Predicate {
-    Predicate::HasWord {
-        field,
-        word: word.to_string(),
-    }
-}
-
-fn notes(rows: &[LogRecord]) -> Vec<String> {
-    rows.iter()
-        .map(|r| {
-            r.attrs
-                .iter()
-                .find_map(|(k, v)| match (k.as_str(), v) {
-                    ("note", AttrValue::Str(s)) => Some(s.clone()),
-                    _ => None,
-                })
-                .expect("note attr")
-        })
-        .collect()
-}
-
-/// A word predicate on a column BLOOM does not cover builds no bloom arm: the
-/// block survives bloom pruning untouched and the exact scan decides row by
-/// row. The block holds a matching and a non-matching row, so pruning on the
-/// uncovered column (its filter holds no token for it) loses the match, and
-/// treating an uncovered column as matching without the exact scan returns the
-/// other row too.
-#[test]
-fn bloom_arm_skips_uncovered_column() {
-    let records = vec![
-        record(0, "request alpha", "needle in here"),
-        record(1, "request beta", "only hay here"),
-    ];
-    let writer = RlogWriter::new(RlogConfig::default(), identity())
-        .with_bloom_uncovered_attrs_for_tests(vec!["note".to_string()]);
-    let object = write(writer, &records);
-
-    // The object's coverage is what the test relies on: body, severity_text and
-    // `region` are covered, `note` is not.
-    let dir = field_dir_of(&object);
-    let note_cid = dir.column("note", FieldType::Str).expect("note").column_id;
-    let region_cid = dir
-        .column("region", FieldType::Str)
-        .expect("region")
-        .column_id;
-    let bloom_raw = bloom_raw_of(&object);
-    let section = RlogBloomSection::parse(&bloom_raw, &dir).expect("parse BLOOM");
-    assert_eq!(
-        section.covered(),
-        [COL_SEVERITY_TEXT, COL_BODY, region_cid].as_slice()
-    );
-    assert!(!section.covers(note_cid));
-
-    let cfg = RlogConfig::default();
-    let reader = RlogReader::new(&object, &cfg).expect("reader");
-
-    let (rows, stats) = reader
-        .scan(&has_word(FieldSel::Attr("note".into()), "needle"))
-        .expect("scan");
-    assert_eq!(notes(&rows), vec!["needle in here".to_string()]);
-    assert_eq!(stats.blocks_total, 1);
-    assert!(!stats.bloom_degraded);
-    assert_eq!(
-        stats.blocks_after_bloom, stats.blocks_after_postings,
-        "an uncovered column must not prune a block"
-    );
-    assert_eq!(stats.blocks_after_bloom, 1);
-    assert_eq!(stats.blocks_scanned, 1);
-
-    // The same object's bloom is live for a covered column: a word absent from
-    // `region` prunes the block, so the survival above is about coverage.
-    let (rows, stats) = reader
-        .scan(&has_word(FieldSel::Attr("region".into()), "east"))
-        .expect("scan");
-    assert!(rows.is_empty());
-    assert_eq!(stats.blocks_after_postings, 1);
-    assert_eq!(stats.blocks_after_bloom, 0);
 }
 
 /// The RLOG golden object as the version-4 writer produced it, trailer version
