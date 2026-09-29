@@ -4508,8 +4508,9 @@ mod tick_tests {
         let floor_hour = hour_bucket(expiry_floor);
         let floor_hour_start = i64::from(floor_hour) * NS_PER_HOUR;
         assert!(
-            floor_hour_start < expiry_floor,
-            "the floor's hour must hold time before the floor"
+            floor_hour_start + 10 * 60 * NS_PER_SEC < expiry_floor,
+            "e's records, placed 5 and 10 minutes into the floor's hour, must be \
+             expired, or they survive for a reason unrelated to the watermark"
         );
 
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
