@@ -462,5 +462,8 @@ ADR-2135 decision 6 lets a string column chunk start with one dictionary
 page shared by the chunk's blocks. It is the one page that belongs to a chunk
 rather than a block: PAGE_DIR lists it first in the chunk under a block index
 one past the group's last block, it sits outside every block's level-0 crc,
-and every reader verifies its own crc32c before using it.
+and every reader verifies its own crc32c before using it. For that page only,
+PAGE_DIR's decoder accepts a block index equal to the group's block count, an
+entry ahead of block 0 in an otherwise ascending chunk, and one page beyond
+two per block; the ranged fetch adds its extent to every kept chunk.
 
