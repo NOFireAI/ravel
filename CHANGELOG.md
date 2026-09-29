@@ -333,6 +333,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`ravel-server` refuses a bad `--idle-flush-byte-floor` before it writes
+  anything to the bucket** (ADR-1737, issue #2181). A floor at or above
+  `--min-flush-bytes` was refused only at the top of `start`, after `main` had
+  already pinned `sys/tenancy`, bootstrapped `sys/gc`, validated provisioning
+  and bound `--listen-health`, so on a fresh bucket a refused start still
+  left those durable objects behind. The pair is now checked during CLI
+  validation, beside the flush-cadence flags, before the store is built.
+  `start` keeps its own check for a library caller that does not go through
+  the CLI.
 - **A catalog decode declared over its ceiling now evicts decoded-cache entries
   until the budget admits it or the caches are empty** (issue #2132). Such a
   decode is charged 0 bytes, and a budget pushed over its limit by
@@ -553,6 +562,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`--audit-retention` sets the query-audit retention window** (ADR-0062
+  decision 2c, ADR-1688, issue #2126). The server built its compactor with
+  the compiled-in 90-day audit window and no way to change it. The flag takes
+  a humantime duration and defaults to `90d`, so a deployment that does not
+  set it sweeps exactly as before. `0` keeps every query-audit record. A
+  nonzero window below one hour plus the compactor's seal margin
+  (`--gc-max-flush-lifetime` plus the clock-skew allowance, `2h 5m` on the
+  defaults) is refused at startup, in the same shape as `--alert-retention`.
 - **A read-only bucket-protection control plane in `ravel-object-store`**
   (ADR-1727 follow-up task 1, issue #1727). `S3Store` can now report, per
   condition, whether the bucket's protection configuration is Pass, Fail, or

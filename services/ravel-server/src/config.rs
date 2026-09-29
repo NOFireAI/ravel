@@ -720,6 +720,21 @@ pub struct Cli {
     #[arg(long, value_name = "DURATION")]
     pub alert_retention: Option<String>,
 
+    /// Age past which the maintenance loop deletes query-audit records, as a
+    /// humantime duration (e.g. `400d`), ADR-0062 decision 2c. A record is
+    /// deleted once its newest event is older than this window and it is past
+    /// the protection horizon; a legal hold covering the query-audit shard
+    /// blocks the delete. Set it to the deployment's audit retention
+    /// obligation. `0` keeps every query-audit record forever. A nonzero
+    /// window shorter than one hour plus the compactor's seal margin
+    /// (`--gc-max-flush-lifetime` plus the clock-skew allowance) is refused at
+    /// startup: it would expire records from hours that are not yet sealed and
+    /// can still gain records from an in-flight flush. Omitted defaults to
+    /// `ravel_maintain::config::DEFAULT_AUDIT_RETENTION_NS` (90 days).
+    /// (default: 90d)
+    #[arg(long, value_name = "DURATION")]
+    pub audit_retention: Option<String>,
+
     /// Default age-based retention window applied to every tenant with no
     /// explicit `--retention-tenant` override, as a humantime duration
     /// (e.g. `30d`, `720h`). Omitted means no default retention: nothing is
@@ -4773,6 +4788,28 @@ impl Cli {
         })
     }
 
+    /// Resolve `--idle-flush-byte-floor` against the resolved
+    /// `--min-flush-bytes` (ADR-1737 decision 1), refusing a floor at or above
+    /// it. [`Self::validate`] calls this, so `main` refuses a bad floor before
+    /// it touches the store or binds a listener; [`crate::start`] repeats the
+    /// same check for a library caller that never went through the CLI.
+    pub fn resolve_idle_flush_byte_floor(&self) -> anyhow::Result<usize> {
+        let floor = usize::try_from(self.idle_flush_byte_floor).unwrap_or(usize::MAX);
+        ravel_ingest::IngestConfig {
+            min_flush_bytes: self.resolve_flush_cadence()?.min_flush_bytes,
+            idle_flush_byte_floor: floor,
+            ..ravel_ingest::IngestConfig::default()
+        }
+        .validate()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "invalid ingest configuration: {e}. --idle-flush-byte-floor must be below \
+                 --min-flush-bytes, or 0 to disable the sub-floor hold"
+            )
+        })?;
+        Ok(floor)
+    }
+
     /// Resolve the per-shard flush concurrency pair. Effective concurrency is
     /// the lower of the two knobs, because the queued-flush cap refuses a
     /// trigger before any task is spawned to take a permit. When
@@ -5457,6 +5494,91 @@ impl Cli {
             .saturating_add(Duration::from_secs(3600))
     }
 
+    /// Parse `--audit-retention` into the
+    /// `CompactorConfig::audit_retention_window_ns` the maintenance loop
+    /// sweeps with (ADR-0062 decision 2c), defaulting to
+    /// [`ravel_maintain::config::DEFAULT_AUDIT_RETENTION_NS`].
+    ///
+    /// `0` returns `i64::MAX`: the audit sweep has no disabled value of its
+    /// own, and the largest window puts its expiry floor before every event,
+    /// so no record ever expires.
+    ///
+    /// A nonzero window below one hour plus the seal margin
+    /// (`max_flush_lifetime_ns`, the resolved `--gc-max-flush-lifetime` the
+    /// compactor runs with, plus the default clock-skew allowance) fails
+    /// startup rather than being clamped. The hour covers the expiry floor and
+    /// a record's hour falling on opposite sides of an hour boundary, as in
+    /// [`Self::alert_retention_floor`].
+    pub fn parse_audit_retention(&self, max_flush_lifetime_ns: i64) -> anyhow::Result<i64> {
+        let Some(s) = self.audit_retention.as_deref() else {
+            return Ok(ravel_maintain::config::DEFAULT_AUDIT_RETENTION_NS);
+        };
+        let dur = humantime::parse_duration(s)
+            .map_err(|e| anyhow::anyhow!("invalid --audit-retention '{s}': {e}"))?;
+        if dur.is_zero() {
+            return Ok(i64::MAX);
+        }
+        let max_flush_lifetime = Duration::from_nanos(max_flush_lifetime_ns.max(0).unsigned_abs());
+        let clock_skew = Duration::from_nanos(
+            ravel_maintain::config::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS.unsigned_abs(),
+        );
+        let floor = max_flush_lifetime
+            .saturating_add(clock_skew)
+            .saturating_add(Duration::from_secs(3600));
+        if dur < floor {
+            anyhow::bail!(
+                "invalid --audit-retention '{s}': a nonzero window must be at least {}, one hour \
+                 plus the compactor's seal margin at --gc-max-flush-lifetime {} and a {} clock-skew \
+                 allowance; a shorter window expires query-audit records from hours that are not \
+                 yet sealed and can still gain records from an in-flight flush. Use 0 to keep \
+                 every query-audit record instead.",
+                humantime::format_duration(floor),
+                humantime::format_duration(max_flush_lifetime),
+                humantime::format_duration(clock_skew),
+            );
+        }
+        Ok(i64::try_from(dur.as_nanos()).unwrap_or(i64::MAX))
+    }
+
+    /// Resolve the [`ravel_maintain::CompactorConfig`] the maintenance loop
+    /// runs with: the GC durations from `gc_runtime` (the same values the
+    /// `sys/gc` validation checks) plus every `--maintain-*` and retention
+    /// window flag, with the compiled-in defaults for the rest.
+    pub fn resolve_compactor_config(
+        &self,
+        gc_runtime: &GcRuntimeConfig,
+    ) -> anyhow::Result<ravel_maintain::CompactorConfig> {
+        use anyhow::Context;
+
+        let interior_reverify_ns = self
+            .parse_maintain_interior_reverify()
+            .context("failed to parse --maintain-interior-reverify")?;
+        let alert_retention_window_ns = self
+            .parse_alert_retention()
+            .context("failed to parse --alert-retention")?;
+        let audit_retention_window_ns = self
+            .parse_audit_retention(gc_runtime.max_flush_lifetime_ns)
+            .context("failed to parse --audit-retention")?;
+        let claim_lease_duration = self
+            .parse_maintain_claim_lease()
+            .context("failed to parse --maintain-claim-lease")?;
+        let claim_min_input_bytes = self
+            .parse_maintain_claim_min_input_bytes()
+            .context("failed to parse --maintain-claim-min-input-bytes")?;
+        Ok(ravel_maintain::CompactorConfig {
+            protection_horizon_ns: gc_runtime.protection_horizon_ns,
+            grace_ns: gc_runtime.grace_ns,
+            max_flush_lifetime_ns: gc_runtime.max_flush_lifetime_ns,
+            interior_reverify_ns,
+            audit_retention_window_ns,
+            alert_retention_window_ns,
+            coordination: self.maintain_claims.mode(),
+            claim_lease_duration,
+            claim_min_input_bytes,
+            ..ravel_maintain::CompactorConfig::default()
+        })
+    }
+
     /// Parse `--idle-tenant-state-ttl` into a duration (ADR-0069 decision 2),
     /// defaulting to [`crate::idle_tenant_state::DEFAULT_IDLE_TENANT_STATE_TTL`]
     /// when unset. Unlike the sibling interval knobs, a zero duration is
@@ -5623,6 +5745,7 @@ impl Cli {
         // or partially-overridden flush cadence fails startup, not the first
         // flush.
         let flush_cadence = self.resolve_flush_cadence()?;
+        self.resolve_idle_flush_byte_floor()?;
 
         // ADR-0076 decision 4: the idle tier (no strict waiter, below
         // min_flush_bytes) must never flush faster than the fast tier (a
@@ -11537,6 +11660,146 @@ mod tests {
             .parse_alert_retention()
             .expect("zero is the opt-out at any interval"),
             0
+        );
+    }
+
+    /// The `CompactorConfig` the server builds from `args`, with the GC
+    /// durations resolved exactly as `main` resolves them.
+    fn compactor(args: &[&str]) -> anyhow::Result<ravel_maintain::CompactorConfig> {
+        let cli = cli(args);
+        let gc_runtime = cli.resolve_gc_runtime(Duration::from_secs(30))?;
+        cli.resolve_compactor_config(&gc_runtime)
+    }
+
+    /// `--audit-retention` unset leaves the compactor on the compiled-in
+    /// 90-day audit window, so a deployment that never sets it sweeps exactly
+    /// as before the flag existed; a set window reaches the compactor in
+    /// nanoseconds; `0` reaches it as the largest window, which no event is
+    /// ever older than.
+    #[test]
+    fn audit_retention_default_zero_and_window_reach_the_compactor() {
+        let default = compactor(&[]).expect("default");
+        assert_eq!(
+            default.audit_retention_window_ns,
+            ravel_maintain::config::DEFAULT_AUDIT_RETENTION_NS
+        );
+        assert_eq!(
+            default.audit_retention_window_ns,
+            90 * 24 * 3_600_000_000_000
+        );
+        assert_eq!(
+            compactor(&["--audit-retention", "400d"])
+                .expect("400d")
+                .audit_retention_window_ns,
+            400 * 24 * 3_600_000_000_000
+        );
+        assert_eq!(
+            compactor(&["--audit-retention", "0"])
+                .expect("zero")
+                .audit_retention_window_ns,
+            i64::MAX
+        );
+        // The audit window moves on its own: the alert window is untouched.
+        assert_eq!(
+            compactor(&["--audit-retention", "400d"])
+                .expect("400d")
+                .alert_retention_window_ns,
+            ravel_maintain::config::DEFAULT_ALERT_RETENTION_NS
+        );
+        let err = compactor(&["--audit-retention", "soon"]).expect_err("unparseable");
+        assert!(
+            format!("{err:#}").contains("invalid --audit-retention 'soon'"),
+            "{err:#}"
+        );
+    }
+
+    /// A nonzero window below one hour plus the compactor's seal margin is
+    /// refused, with the exact message. On the defaults the margin is the 1 h
+    /// max flush lifetime plus the 5 m clock-skew allowance, so the minimum
+    /// is 2 h 5 m: `2h` is refused and `2h 5m` is not. A longer
+    /// `--gc-max-flush-lifetime` raises the minimum, and `0` stays the
+    /// keep-forever value at any lifetime.
+    #[test]
+    fn audit_retention_refuses_a_window_below_the_seal_margin_floor() {
+        let err = compactor(&["--audit-retention", "2h"])
+            .expect_err("2h is below the floor at the default flush lifetime");
+        assert_eq!(
+            format!("{err:#}"),
+            "failed to parse --audit-retention: invalid --audit-retention '2h': a nonzero window \
+             must be at least 2h 5m, one hour plus the compactor's seal margin at \
+             --gc-max-flush-lifetime 1h and a 5m clock-skew allowance; a shorter window expires \
+             query-audit records from hours that are not yet sealed and can still gain records \
+             from an in-flight flush. Use 0 to keep every query-audit record instead."
+        );
+
+        assert_eq!(
+            compactor(&["--audit-retention", "2h 5m"])
+                .expect("2h 5m is exactly the floor")
+                .audit_retention_window_ns,
+            (2 * 3_600 + 300) * 1_000_000_000
+        );
+
+        let err = compactor(&["--audit-retention", "3h", "--gc-max-flush-lifetime", "2h"])
+            .expect_err("a 2 h flush lifetime raises the floor past 3 h");
+        assert!(format!("{err:#}").contains("at least 3h 5m"), "{err:#}");
+
+        assert_eq!(
+            compactor(&["--audit-retention", "0", "--gc-max-flush-lifetime", "2h"])
+                .expect("zero keeps every record at any flush lifetime")
+                .audit_retention_window_ns,
+            i64::MAX
+        );
+    }
+
+    /// A floor at or above the resolved `--min-flush-bytes` is refused by
+    /// `Cli::validate`, which `main` runs before it builds the store, with the
+    /// same message `start` gives. Both the shipped `min_flush_bytes` and an
+    /// explicitly set cadence are checked, and a floor just below either
+    /// resolves to the byte count the operator typed.
+    #[test]
+    fn idle_flush_byte_floor_at_or_above_min_flush_bytes_is_refused_by_validate() {
+        let err = cli(&["--idle-flush-byte-floor", "262144"])
+            .validate()
+            .expect_err("a floor at the shipped min_flush_bytes must be refused");
+        assert_eq!(
+            err.to_string(),
+            "invalid ingest configuration: idle_flush_byte_floor (262144 bytes) must be below \
+             min_flush_bytes (262144 bytes), or 0 to disable it. --idle-flush-byte-floor must be \
+             below --min-flush-bytes, or 0 to disable the sub-floor hold"
+        );
+        assert_eq!(
+            cli(&["--idle-flush-byte-floor", "262143"])
+                .resolve_idle_flush_byte_floor()
+                .expect("a floor below min_flush_bytes resolves"),
+            262_143
+        );
+
+        let cadence = [
+            "--max-flush-delay",
+            "2s",
+            "--max-flush-delay-idle",
+            "40s",
+            "--min-flush-bytes",
+            "65536",
+        ];
+        let mut above = cadence.to_vec();
+        above.extend(["--idle-flush-byte-floor", "65537"]);
+        let err = cli(&above)
+            .validate()
+            .expect_err("a floor above an explicit min_flush_bytes must be refused");
+        assert!(
+            err.to_string().contains(
+                "idle_flush_byte_floor (65537 bytes) must be below min_flush_bytes (65536 bytes)"
+            ),
+            "{err}"
+        );
+        let mut below = cadence.to_vec();
+        below.extend(["--idle-flush-byte-floor", "65535"]);
+        assert_eq!(
+            cli(&below)
+                .resolve_idle_flush_byte_floor()
+                .expect("a floor below an explicit min_flush_bytes resolves"),
+            65_535
         );
     }
 
