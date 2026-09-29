@@ -190,13 +190,29 @@ fn truncated_object_prints_typed_error_not_panic() {
     );
 }
 
-/// The printed `version:` is the one the object's own trailer carries (bytes
-/// 8..10 of the 16-byte trailer, little-endian), read off the unpatched object.
+/// Pins where the printed `version:` line comes from: bytes 8..10 of the
+/// 16-byte trailer, little-endian, read by `footer::trailer_version`, which is
+/// what `rlog inspect` prints.
+///
+/// The end-to-end half cannot tell the trailer from the build's format
+/// constant yet: the reader accepts one version and every object carries it.
+/// It becomes discriminating at the v5 bump, if that build still reads v4
+/// objects. Until then the byte-offset half below is the
+/// part that can fail: it patches the trailer's version bytes and calls the
+/// byte reader directly, without asking the reader to open a version it would
+/// refuse.
 #[test]
-fn rlog_inspect_prints_the_trailer_version() {
+fn rlog_inspect_version_line_reads_the_trailer_bytes() {
     let bytes = build_object();
     let at = bytes.len() - 16 + 8;
     let trailer_version = u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+
+    let mut patched = bytes.clone();
+    patched[at..at + 2].copy_from_slice(&0xBEEFu16.to_le_bytes());
+    assert_eq!(
+        ravel_logseg::footer::trailer_version(&patched).expect("trailer present"),
+        0xBEEF
+    );
 
     let path = temp_path("trailer-version");
     std::fs::write(&path, &bytes).expect("writes object");
