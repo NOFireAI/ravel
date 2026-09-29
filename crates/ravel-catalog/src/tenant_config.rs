@@ -75,7 +75,8 @@ pub const TENANT_CONFIG_MAX_READ_VERSION: u32 = 3;
 
 /// The lowest writer version that may emit `clustering_key` (field 13) and
 /// `bloom_scope` (field 14). While [`TENANT_CONFIG_FORMAT_VERSION`] is below
-/// this, [`TenantConfig::set_clustering_key`], [`TenantConfig::set_bloom_scope`]
+/// this, [`TenantConfig::set_clustering_key`],
+/// [`TenantConfig::clear_clustering_key`], [`TenantConfig::set_bloom_scope`]
 /// and [`set_tenant_config`] refuse to set either field with
 /// [`StorageLayoutConfigError::WriterCannotEmit`].
 pub const TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION: u32 = 3;
@@ -283,7 +284,7 @@ pub const MAX_CLUSTERING_KEY_COLUMNS: usize = 4;
 
 /// The time-bucket width a clustering key groups rows by (ADR-2135): exactly the
 /// three accepted widths. The proto `UNSPECIFIED` value and unknown values have
-/// no variant; [`TenantConfig::clustering_key`] refuses them.
+/// no variant; [`TenantConfig::clustering_key`] refuses them on a set key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClusteringBucketWidth {
     /// One-hour buckets.
@@ -319,22 +320,37 @@ impl ClusteringBucketWidth {
     }
 }
 
-/// A validated clustering key (ADR-2135), as returned by
-/// [`TenantConfig::clustering_key`].
+/// A validated set clustering key (ADR-2135), carried by
+/// [`ClusteringKeyState::Set`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusteringKey {
     /// Declared typed attribute column names, in key order.
     pub columns: Vec<String>,
     /// The time-bucket width.
     pub bucket_width: ClusteringBucketWidth,
-    /// The clustering generation.
+    /// The clustering generation, at least 1.
     pub generation: u64,
+}
+
+/// A tenant's validated clustering-key state (ADR-2135 decision 1), as returned
+/// by [`TenantConfig::clustering_key`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClusteringKeyState {
+    /// Record field 13 is absent: no key was ever set, clustering generation 0.
+    NeverSet,
+    /// Field 13 is present with no columns: the key was cleared at `generation`
+    /// (at least 1). Rows are written unkeyed, and the clear outranks every key
+    /// with a lower generation.
+    Cleared { generation: u64 },
+    /// Field 13 is present with 1 to [`MAX_CLUSTERING_KEY_COLUMNS`] columns.
+    Set(ClusteringKey),
 }
 
 /// A clustering key exactly as the record stores it, unvalidated. Opaque so that
 /// its content is only read through the validating
 /// [`TenantConfig::clustering_key`], and only set through
-/// [`TenantConfig::set_clustering_key`] or record decode.
+/// [`TenantConfig::set_clustering_key`], [`TenantConfig::clear_clustering_key`]
+/// or record decode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredClusteringKey {
     columns: Vec<String>,
@@ -373,21 +389,37 @@ impl BloomScope {
 pub struct StoredBloomScope(i32);
 
 /// A clustering-key or bloom-scope value refused by the accessor or setter
-/// (ADR-2135). Record decode never raises these: an invalid stored value leaves
-/// the rest of the record readable and fails only the accessor for that field.
+/// (ADR-2135). Record decode does not raise these: a well-formed but invalid
+/// stored value leaves the rest of the record readable and fails only the
+/// accessor for that field. Decode fails only on bytes that are not a valid
+/// protobuf record, which includes a key column name that is not valid UTF-8.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum StorageLayoutConfigError {
-    /// A clustering key names no columns.
-    #[error("the clustering key names no columns: a key needs 1 to 4 columns")]
+    /// [`TenantConfig::set_clustering_key`] was given no columns.
+    #[error(
+        "cannot set a clustering key with no columns: a key needs 1 to 4 columns, and removing \
+         a key is a clear"
+    )]
     EmptyClusteringKey,
+    /// A stored clustering key is present with generation 0, which only an
+    /// absent (never set) key may carry.
+    #[error(
+        "the stored clustering key is present with generation 0: every set or clear stores a \
+         generation of at least 1"
+    )]
+    ZeroClusteringGeneration,
+    /// The stored clustering generation is `u64::MAX`, so no later change can
+    /// carry a higher one.
+    #[error("the clustering generation {generation} cannot be incremented")]
+    ClusteringGenerationExhausted { generation: u64 },
     /// A clustering key names more columns than the maximum.
     #[error("the clustering key names {count} columns, more than the maximum of {max}")]
     TooManyClusteringKeyColumns { count: usize, max: usize },
     /// A clustering key names the same column twice.
     #[error("the clustering key names column {column:?} more than once")]
     DuplicateClusteringKeyColumn { column: String },
-    /// A clustering key column is not a declared typed attribute column of the
-    /// tenant (the record's `typed_attr_columns`).
+    /// A clustering key column is not in the tenant's effective declared typed
+    /// attribute columns, the list the caller passed.
     #[error(
         "clustering key column {column:?} is not a declared typed attribute column of this tenant"
     )]
@@ -418,16 +450,21 @@ pub enum StorageLayoutConfigError {
     },
 }
 
-/// The one clustering-key validation, shared by [`TenantConfig::clustering_key`]
-/// and [`TenantConfig::set_clustering_key`]. `declared` is the tenant's declared
-/// typed attribute columns; any other attribute name is refused.
-fn validate_clustering_key(
-    columns: &[String],
-    bucket_width: i32,
-    declared: &[DeclaredTypedColumn],
-) -> Result<ClusteringBucketWidth, StorageLayoutConfigError> {
+/// The clustering-key rules that do not depend on the tenant's declared columns:
+/// a present key needs generation at least 1; no columns is a clear, whose
+/// bucket width is not read; otherwise 1 to [`MAX_CLUSTERING_KEY_COLUMNS`]
+/// distinct columns and a known, specified width.
+fn validate_clustering_key_shape(
+    stored: &StoredClusteringKey,
+) -> Result<ClusteringKeyState, StorageLayoutConfigError> {
+    if stored.generation == 0 {
+        return Err(StorageLayoutConfigError::ZeroClusteringGeneration);
+    }
+    let columns = &stored.columns;
     if columns.is_empty() {
-        return Err(StorageLayoutConfigError::EmptyClusteringKey);
+        return Ok(ClusteringKeyState::Cleared {
+            generation: stored.generation,
+        });
     }
     if columns.len() > MAX_CLUSTERING_KEY_COLUMNS {
         return Err(StorageLayoutConfigError::TooManyClusteringKeyColumns {
@@ -441,21 +478,46 @@ fn validate_clustering_key(
                 column: column.clone(),
             });
         }
-        if !declared.iter().any(|d| &d.key == column) {
-            return Err(StorageLayoutConfigError::UndeclaredClusteringKeyColumn {
-                column: column.clone(),
-            });
-        }
     }
-    ClusteringBucketWidth::from_proto_i32(bucket_width)
+    let bucket_width = ClusteringBucketWidth::from_proto_i32(stored.bucket_width)?;
+    Ok(ClusteringKeyState::Set(ClusteringKey {
+        columns: columns.clone(),
+        bucket_width,
+        generation: stored.generation,
+    }))
 }
 
-/// Refuse a write of a field this build's writer version cannot carry.
-fn check_writer_can_emit(field: &'static str) -> Result<(), StorageLayoutConfigError> {
-    if TENANT_CONFIG_FORMAT_VERSION < TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION {
+/// The full clustering-key validation, shared by [`TenantConfig::clustering_key`]
+/// and [`TenantConfig::set_clustering_key`]: the shape rules, then every column
+/// of a set key must be in `declared`, the tenant's effective declared typed
+/// attribute columns.
+fn validate_clustering_key(
+    stored: &StoredClusteringKey,
+    declared: &[DeclaredTypedColumn],
+) -> Result<ClusteringKeyState, StorageLayoutConfigError> {
+    let state = validate_clustering_key_shape(stored)?;
+    if let ClusteringKeyState::Set(key) = &state
+        && let Some(column) = key
+            .columns
+            .iter()
+            .find(|column| !declared.iter().any(|d| &d.key == *column))
+    {
+        return Err(StorageLayoutConfigError::UndeclaredClusteringKeyColumn {
+            column: column.clone(),
+        });
+    }
+    Ok(state)
+}
+
+/// Refuse a write of a field a writer stamping `writer_version` cannot carry.
+fn check_writer_can_emit(
+    field: &'static str,
+    writer_version: u32,
+) -> Result<(), StorageLayoutConfigError> {
+    if writer_version < TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION {
         return Err(StorageLayoutConfigError::WriterCannotEmit {
             field,
-            writer_version: TENANT_CONFIG_FORMAT_VERSION,
+            writer_version,
             required: TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION,
         });
     }
@@ -518,25 +580,29 @@ impl TenantConfig {
         }
     }
 
-    /// The tenant's clustering key, validated: `Ok(None)` when the record carries
-    /// none. A stored key naming no columns, more than
-    /// [`MAX_CLUSTERING_KEY_COLUMNS`], a duplicate column, a column that is not in
-    /// this config's `typed_attr_columns`, or an unspecified or unknown bucket
-    /// width is refused with the matching [`StorageLayoutConfigError`].
-    pub fn clustering_key(&self) -> Result<Option<ClusteringKey>, StorageLayoutConfigError> {
-        let Some(stored) = self.stored_clustering_key.as_ref() else {
-            return Ok(None);
-        };
-        let bucket_width = validate_clustering_key(
-            &stored.columns,
-            stored.bucket_width,
-            self.typed_attr_columns.as_deref().unwrap_or(&[]),
-        )?;
-        Ok(Some(ClusteringKey {
-            columns: stored.columns.clone(),
-            bucket_width,
-            generation: stored.generation,
-        }))
+    /// The tenant's clustering-key state, validated.
+    ///
+    /// `declared` is the tenant's EFFECTIVE declared typed attribute columns,
+    /// resolved by the caller exactly as typed-column resolution does everywhere
+    /// else: this config's `typed_attr_columns` override when it is `Some`,
+    /// otherwise the deployment default (`--typed-attr-column` on the server).
+    /// This crate does not know the deployment default, so it never reads
+    /// `typed_attr_columns` here.
+    ///
+    /// An absent field 13 is [`ClusteringKeyState::NeverSet`], and a present one
+    /// with no columns is [`ClusteringKeyState::Cleared`] whatever its bucket
+    /// width. A present key with generation 0 is refused, and so is a set key with
+    /// more than [`MAX_CLUSTERING_KEY_COLUMNS`] columns, a duplicate column, a
+    /// column not in `declared`, or an unspecified or unknown bucket width, each
+    /// with the matching [`StorageLayoutConfigError`].
+    pub fn clustering_key(
+        &self,
+        declared: &[DeclaredTypedColumn],
+    ) -> Result<ClusteringKeyState, StorageLayoutConfigError> {
+        match self.stored_clustering_key.as_ref() {
+            None => Ok(ClusteringKeyState::NeverSet),
+            Some(stored) => validate_clustering_key(stored, declared),
+        }
     }
 
     /// The stored clustering generation, 0 when the record carries no clustering
@@ -560,31 +626,91 @@ impl TenantConfig {
         }
     }
 
-    /// Set the clustering key. Runs the same validation as
-    /// [`TenantConfig::clustering_key`] against this config's
-    /// `typed_attr_columns`, then refuses with
-    /// [`StorageLayoutConfigError::WriterCannotEmit`] while this build's writer
-    /// stamps a version below [`TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION`].
-    /// On any error the config is unchanged.
+    /// Set the clustering key to `columns` (1 to [`MAX_CLUSTERING_KEY_COLUMNS`])
+    /// and `bucket_width`, at the stored generation plus one.
+    ///
+    /// `declared` is the tenant's EFFECTIVE declared typed attribute columns,
+    /// resolved by the caller as for [`TenantConfig::clustering_key`] (this
+    /// config's `typed_attr_columns` override when `Some`, otherwise the
+    /// deployment default). No columns is refused with
+    /// [`StorageLayoutConfigError::EmptyClusteringKey`], since removing a key is
+    /// [`TenantConfig::clear_clustering_key`]; otherwise the key runs the same
+    /// validation as the accessor. A stored generation of `u64::MAX` is refused
+    /// with [`StorageLayoutConfigError::ClusteringGenerationExhausted`]. Then the
+    /// call refuses with [`StorageLayoutConfigError::WriterCannotEmit`] while this
+    /// build's writer stamps a version below
+    /// [`TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION`]. On any error the config is
+    /// unchanged.
     pub fn set_clustering_key(
         &mut self,
         columns: Vec<String>,
         bucket_width: ClusteringBucketWidth,
-        generation: u64,
+        declared: &[DeclaredTypedColumn],
     ) -> Result<(), StorageLayoutConfigError> {
-        let bucket_width = bucket_width.to_proto() as i32;
-        validate_clustering_key(
-            &columns,
-            bucket_width,
-            self.typed_attr_columns.as_deref().unwrap_or(&[]),
-        )?;
-        check_writer_can_emit("clustering_key")?;
-        self.stored_clustering_key = Some(StoredClusteringKey {
+        self.set_clustering_key_as(
             columns,
             bucket_width,
-            generation,
-        });
+            declared,
+            TENANT_CONFIG_FORMAT_VERSION,
+        )
+    }
+
+    /// Clear the clustering key: field 13 stays present with no columns, an
+    /// unspecified bucket width and the stored generation plus one, so the clear
+    /// outranks every earlier key (ADR-2135 decision 1). Refuses with
+    /// [`StorageLayoutConfigError::ClusteringGenerationExhausted`] and
+    /// [`StorageLayoutConfigError::WriterCannotEmit`] as
+    /// [`TenantConfig::set_clustering_key`] does; on either error the config is
+    /// unchanged.
+    pub fn clear_clustering_key(&mut self) -> Result<(), StorageLayoutConfigError> {
+        self.clear_clustering_key_as(TENANT_CONFIG_FORMAT_VERSION)
+    }
+
+    /// [`TenantConfig::set_clustering_key`] for a writer stamping
+    /// `writer_version`.
+    fn set_clustering_key_as(
+        &mut self,
+        columns: Vec<String>,
+        bucket_width: ClusteringBucketWidth,
+        declared: &[DeclaredTypedColumn],
+        writer_version: u32,
+    ) -> Result<(), StorageLayoutConfigError> {
+        if columns.is_empty() {
+            return Err(StorageLayoutConfigError::EmptyClusteringKey);
+        }
+        let key = StoredClusteringKey {
+            columns,
+            bucket_width: bucket_width.to_proto() as i32,
+            generation: self.next_clustering_generation()?,
+        };
+        validate_clustering_key(&key, declared)?;
+        check_writer_can_emit("clustering_key", writer_version)?;
+        self.stored_clustering_key = Some(key);
         Ok(())
+    }
+
+    /// [`TenantConfig::clear_clustering_key`] for a writer stamping
+    /// `writer_version`.
+    fn clear_clustering_key_as(
+        &mut self,
+        writer_version: u32,
+    ) -> Result<(), StorageLayoutConfigError> {
+        let key = StoredClusteringKey {
+            columns: Vec::new(),
+            bucket_width: sysproto::ClusteringBucketWidth::Unspecified as i32,
+            generation: self.next_clustering_generation()?,
+        };
+        check_writer_can_emit("clustering_key", writer_version)?;
+        self.stored_clustering_key = Some(key);
+        Ok(())
+    }
+
+    /// The generation the next set or clear stores: the stored one plus one.
+    fn next_clustering_generation(&self) -> Result<u64, StorageLayoutConfigError> {
+        let generation = self.clustering_generation();
+        generation
+            .checked_add(1)
+            .ok_or(StorageLayoutConfigError::ClusteringGenerationExhausted { generation })
     }
 
     /// Set the bloom scope. Refuses with
@@ -592,21 +718,25 @@ impl TenantConfig {
     /// stamps a version below [`TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION`]; on
     /// that error the config is unchanged.
     pub fn set_bloom_scope(&mut self, scope: BloomScope) -> Result<(), StorageLayoutConfigError> {
-        check_writer_can_emit("bloom_scope")?;
+        check_writer_can_emit("bloom_scope", TENANT_CONFIG_FORMAT_VERSION)?;
         self.stored_bloom_scope = StoredBloomScope(scope.to_proto() as i32);
         Ok(())
     }
 
     /// The write-time gate [`set_tenant_config`] applies to fields 13 and 14: a
     /// config carrying either is refused while the writer cannot emit it, and a
-    /// carried value must pass its accessor's validation.
+    /// carried value must pass its validation. `set_tenant_config` is not given
+    /// the tenant's effective declared columns, so for a clustering key this
+    /// re-checks only the rules that do not depend on them; the declared-column
+    /// rule is applied by [`TenantConfig::set_clustering_key`], the only way a
+    /// config outside this module gets a key other than decoding one.
     fn check_storage_layout_writable(&self) -> Result<(), StorageLayoutConfigError> {
-        if self.stored_clustering_key.is_some() {
-            check_writer_can_emit("clustering_key")?;
-            self.clustering_key()?;
+        if let Some(stored) = self.stored_clustering_key.as_ref() {
+            check_writer_can_emit("clustering_key", TENANT_CONFIG_FORMAT_VERSION)?;
+            validate_clustering_key_shape(stored)?;
         }
         if self.stored_bloom_scope != StoredBloomScope::default() {
-            check_writer_can_emit("bloom_scope")?;
+            check_writer_can_emit("bloom_scope", TENANT_CONFIG_FORMAT_VERSION)?;
             self.bloom_scope()?;
         }
         Ok(())
@@ -2055,10 +2185,22 @@ mod tests {
         columns: &[&str],
         bucket_width: i32,
     ) -> TenantConfig {
+        decoded_v3_with_stored_key(Some(declared), columns, bucket_width, 9).await
+    }
+
+    /// As [`decoded_v3_with_key`], with the record's own `typed_attr_columns`
+    /// override (`None` = the tenant relies on the deployment default) and the
+    /// stored generation chosen by the caller.
+    async fn decoded_v3_with_stored_key(
+        record_declared: Option<Vec<DeclaredTypedColumn>>,
+        columns: &[&str],
+        bucket_width: i32,
+        generation: u64,
+    ) -> TenantConfig {
         let cfg = TenantConfig {
             retention_ns: Some(48 * 3_600_000_000_000),
             indexed_fields: Some(vec!["service.name".into()]),
-            typed_attr_columns: Some(declared),
+            typed_attr_columns: record_declared,
             ..TenantConfig::new(TenantLifecycleState::Active)
         };
         let mut record = build_record(&tenant(), &cfg, 0, 0);
@@ -2066,12 +2208,28 @@ mod tests {
         record.clustering_key = Some(sysproto::ClusteringKeyConfig {
             columns: names(columns),
             bucket_width,
-            generation: 9,
+            generation,
         });
         store_and_read(&record).await
     }
 
+    /// The effective declared columns a caller resolves when the record's own
+    /// override is the only source, as in the tests that do not exercise the
+    /// deployment default.
+    fn own_declared(cfg: &TenantConfig) -> Vec<DeclaredTypedColumn> {
+        cfg.typed_attr_columns.clone().unwrap_or_default()
+    }
+
+    /// The `Set` key of a validated state, failing the test on any other state.
+    fn set_key(state: ClusteringKeyState) -> ClusteringKey {
+        match state {
+            ClusteringKeyState::Set(key) => key,
+            other => panic!("expected a set key, got {other:?}"),
+        }
+    }
+
     const SIX_HOURS: i32 = sysproto::ClusteringBucketWidth::SixHours as i32;
+    const UNSPECIFIED: i32 = sysproto::ClusteringBucketWidth::Unspecified as i32;
 
     /// A version-3 record encoded here decodes with its clustering key and bloom
     /// scope at their exact values, and every earlier field is preserved.
@@ -2089,8 +2247,9 @@ mod tests {
         let read = store_and_read(&record).await;
 
         assert_eq!(
-            read.clustering_key().expect("a valid stored key"),
-            Some(ClusteringKey {
+            read.clustering_key(&own_declared(&read))
+                .expect("a valid stored key"),
+            ClusteringKeyState::Set(ClusteringKey {
                 columns: names(&["k8s.namespace.name", "http.status_code"]),
                 bucket_width: ClusteringBucketWidth::SixHours,
                 generation: 7,
@@ -2127,7 +2286,7 @@ mod tests {
             ),
         ] {
             let read = decoded_v3_with_key(vec![str_col("a")], &["a"], proto as i32).await;
-            let key = read.clustering_key().expect("valid").expect("present");
+            let key = set_key(read.clustering_key(&own_declared(&read)).expect("valid"));
             assert_eq!(key.bucket_width, domain, "proto {proto:?}");
         }
         for (proto, domain) in [
@@ -2176,7 +2335,11 @@ mod tests {
             .await
             .expect("read")
             .expect("present");
-        assert_eq!(read.clustering_key().expect("absent is valid"), None);
+        assert_eq!(
+            read.clustering_key(&own_declared(&read))
+                .expect("absent is valid"),
+            ClusteringKeyState::NeverSet
+        );
         assert_eq!(read.clustering_generation(), 0);
         assert_eq!(read.bloom_scope().expect("absent is ALL"), BloomScope::All);
     }
@@ -2210,9 +2373,22 @@ mod tests {
             ..TenantConfig::new(TenantLifecycleState::Active)
         };
         let before = cfg.clone();
+        let declared = own_declared(&cfg);
 
         assert_eq!(
-            cfg.set_clustering_key(names(&["a", "b"]), ClusteringBucketWidth::OneHour, 1),
+            cfg.set_clustering_key(
+                names(&["a", "b"]),
+                ClusteringBucketWidth::OneHour,
+                &declared
+            ),
+            Err(StorageLayoutConfigError::WriterCannotEmit {
+                field: "clustering_key",
+                writer_version: 2,
+                required: 3,
+            })
+        );
+        assert_eq!(
+            cfg.clear_clustering_key(),
             Err(StorageLayoutConfigError::WriterCannotEmit {
                 field: "clustering_key",
                 writer_version: 2,
@@ -2237,11 +2413,23 @@ mod tests {
             }),
             ..before.clone()
         };
+        let with_cleared_key = TenantConfig {
+            stored_clustering_key: Some(StoredClusteringKey {
+                columns: Vec::new(),
+                bucket_width: UNSPECIFIED,
+                generation: 2,
+            }),
+            ..before.clone()
+        };
         let with_scope = TenantConfig {
             stored_bloom_scope: StoredBloomScope(sysproto::BloomScope::Text as i32),
             ..before.clone()
         };
-        for (cfg, field) in [(with_key, "clustering_key"), (with_scope, "bloom_scope")] {
+        for (cfg, field) in [
+            (with_key, "clustering_key"),
+            (with_cleared_key, "clustering_key"),
+            (with_scope, "bloom_scope"),
+        ] {
             let store = mem();
             let err = set_tenant_config(store.as_ref(), &tenant(), &cfg, 1)
                 .await
@@ -2285,16 +2473,30 @@ mod tests {
             Some(48 * 3_600_000_000_000),
             "retention still resolves from a record whose stored key is invalid"
         );
-        assert_eq!(read.clustering_key(), Err(expected.clone()), "accessor");
+        let declared = own_declared(&read);
+        assert_eq!(
+            read.clustering_key(&declared),
+            Err(expected.clone()),
+            "accessor"
+        );
 
         let mut cfg = TenantConfig {
             stored_clustering_key: None,
             ..read
         };
         assert_eq!(
-            cfg.set_clustering_key(names(columns), ClusteringBucketWidth::SixHours, 9),
+            cfg.set_clustering_key_as(
+                names(columns),
+                ClusteringBucketWidth::SixHours,
+                &declared,
+                TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION,
+            ),
             Err(expected),
-            "setter"
+            "setter, even for a writer that can emit the field"
+        );
+        assert_eq!(
+            cfg.stored_clustering_key, None,
+            "a refused set changes nothing"
         );
     }
 
@@ -2335,10 +2537,11 @@ mod tests {
         // Four is the maximum and accepted.
         let read = decoded_v3_with_key(declared, &["c4", "c3", "c2", "c1"], SIX_HOURS).await;
         assert_eq!(
-            read.clustering_key()
-                .expect("four columns are valid")
-                .expect("present")
-                .columns,
+            set_key(
+                read.clustering_key(&own_declared(&read))
+                    .expect("four columns are valid")
+            )
+            .columns,
             names(&["c4", "c3", "c2", "c1"])
         );
     }
@@ -2353,35 +2556,264 @@ mod tests {
         .await;
     }
 
+    /// Setting a key with no columns is refused, even for a writer that can emit
+    /// the field: removing a key is a clear, not an empty set.
+    #[test]
+    fn set_clustering_key_refuses_an_empty_column_list() {
+        let mut cfg = TenantConfig {
+            typed_attr_columns: Some(vec![str_col("a")]),
+            ..TenantConfig::new(TenantLifecycleState::Active)
+        };
+        let declared = own_declared(&cfg);
+        assert_eq!(
+            cfg.set_clustering_key_as(
+                Vec::new(),
+                ClusteringBucketWidth::OneHour,
+                &declared,
+                TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION,
+            ),
+            Err(StorageLayoutConfigError::EmptyClusteringKey)
+        );
+        assert_eq!(cfg.stored_clustering_key, None);
+    }
+
+    /// A cleared key (field 13 present, no columns, generation at least 1)
+    /// decodes as cleared at its generation, not as an error and not as never
+    /// set, and its bucket width is not read.
     #[tokio::test]
-    async fn clustering_key_refuses_an_empty_column_list() {
-        assert_key_refused(
-            vec![str_col("a")],
-            &[],
-            StorageLayoutConfigError::EmptyClusteringKey,
+    async fn a_cleared_key_decodes_as_cleared_at_its_generation() {
+        for width in [UNSPECIFIED, SIX_HOURS, 99] {
+            let read = decoded_v3_with_stored_key(Some(vec![str_col("a")]), &[], width, 1).await;
+            assert_eq!(
+                read.clustering_key(&own_declared(&read)),
+                Ok(ClusteringKeyState::Cleared { generation: 1 }),
+                "width {width}"
+            );
+            assert_eq!(read.clustering_generation(), 1);
+            assert_eq!(read.retention_ns, Some(48 * 3_600_000_000_000));
+        }
+        // No declared columns at all: a clear names none, so nothing is undeclared.
+        let read = decoded_v3_with_stored_key(None, &[], UNSPECIFIED, 5).await;
+        assert_eq!(
+            read.clustering_key(&[]),
+            Ok(ClusteringKeyState::Cleared { generation: 5 })
+        );
+    }
+
+    /// Generation 0 means only "never set", so a present key carrying it is
+    /// refused, whether it is a set key or a cleared one.
+    #[tokio::test]
+    async fn a_present_key_with_generation_zero_is_refused() {
+        for columns in [&["a"][..], &[]] {
+            let read =
+                decoded_v3_with_stored_key(Some(vec![str_col("a")]), columns, SIX_HOURS, 0).await;
+            assert_eq!(
+                read.clustering_key(&own_declared(&read)),
+                Err(StorageLayoutConfigError::ZeroClusteringGeneration),
+                "columns {columns:?}"
+            );
+            assert_eq!(read.retention_ns, Some(48 * 3_600_000_000_000));
+        }
+    }
+
+    /// Every set and every clear stores the previous generation plus one, never a
+    /// caller's value, starting from 0 for a key that was never set. A clear keeps
+    /// field 13 present with no columns through the record round trip.
+    #[tokio::test]
+    async fn set_and_clear_increment_the_stored_generation() {
+        let v3 = TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION;
+        let declared = vec![str_col("a"), str_col("b")];
+
+        let mut cfg =
+            decoded_v3_with_stored_key(Some(declared.clone()), &["a"], SIX_HOURS, 7).await;
+        let mut seen = Vec::new();
+        cfg.set_clustering_key_as(names(&["b"]), ClusteringBucketWidth::OneDay, &declared, v3)
+            .expect("set");
+        seen.push(cfg.clustering_key(&declared).expect("valid"));
+        cfg.set_clustering_key_as(names(&["b"]), ClusteringBucketWidth::OneDay, &declared, v3)
+            .expect("set the same key again");
+        seen.push(cfg.clustering_key(&declared).expect("valid"));
+        cfg.clear_clustering_key_as(v3).expect("clear");
+        seen.push(cfg.clustering_key(&declared).expect("valid"));
+        cfg.clear_clustering_key_as(v3).expect("clear again");
+        seen.push(cfg.clustering_key(&declared).expect("valid"));
+        cfg.set_clustering_key_as(
+            names(&["a", "b"]),
+            ClusteringBucketWidth::OneHour,
+            &declared,
+            v3,
         )
-        .await;
+        .expect("set after a clear");
+        seen.push(cfg.clustering_key(&declared).expect("valid"));
+
+        let b_one_day = |generation| {
+            ClusteringKeyState::Set(ClusteringKey {
+                columns: names(&["b"]),
+                bucket_width: ClusteringBucketWidth::OneDay,
+                generation,
+            })
+        };
+        assert_eq!(
+            seen,
+            vec![
+                b_one_day(8),
+                b_one_day(9),
+                ClusteringKeyState::Cleared { generation: 10 },
+                ClusteringKeyState::Cleared { generation: 11 },
+                ClusteringKeyState::Set(ClusteringKey {
+                    columns: names(&["a", "b"]),
+                    bucket_width: ClusteringBucketWidth::OneHour,
+                    generation: 12,
+                }),
+            ]
+        );
+
+        // From never set, the first change stores generation 1.
+        let fresh = TenantConfig {
+            typed_attr_columns: Some(declared.clone()),
+            ..TenantConfig::new(TenantLifecycleState::Active)
+        };
+        let mut set = fresh.clone();
+        set.set_clustering_key_as(
+            names(&["a"]),
+            ClusteringBucketWidth::SixHours,
+            &declared,
+            v3,
+        )
+        .expect("set");
+        assert_eq!(set.clustering_generation(), 1);
+        let mut cleared = fresh;
+        cleared.clear_clustering_key_as(v3).expect("clear");
+
+        // A clear round-trips through the record as a present field 13.
+        let mut record = build_record(&tenant(), &cleared, 0, 0);
+        record.format_version = 3;
+        assert_eq!(
+            record.clustering_key,
+            Some(sysproto::ClusteringKeyConfig {
+                columns: Vec::new(),
+                bucket_width: UNSPECIFIED,
+                generation: 1,
+            })
+        );
+        let read = store_and_read(&record).await;
+        assert_eq!(
+            read.clustering_key(&declared),
+            Ok(ClusteringKeyState::Cleared { generation: 1 })
+        );
+
+        // The last generation cannot be incremented; both changes refuse and
+        // leave the config as it was.
+        let mut exhausted =
+            decoded_v3_with_stored_key(Some(declared.clone()), &["a"], SIX_HOURS, u64::MAX).await;
+        let before = exhausted.clone();
+        let err = StorageLayoutConfigError::ClusteringGenerationExhausted {
+            generation: u64::MAX,
+        };
+        assert_eq!(
+            exhausted.set_clustering_key_as(
+                names(&["b"]),
+                ClusteringBucketWidth::OneDay,
+                &declared,
+                v3
+            ),
+            Err(err.clone())
+        );
+        assert_eq!(exhausted.clear_clustering_key_as(v3), Err(err));
+        assert_eq!(exhausted, before);
+    }
+
+    /// Key columns are checked against the effective declared list the caller
+    /// passes, never against the record's own `typed_attr_columns`: a tenant with
+    /// no override relies on the deployment default, which only the caller knows.
+    #[tokio::test]
+    async fn key_columns_validate_against_the_effective_declared_list() {
+        let v3 = TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION;
+        let deployment_default = vec![str_col("a")];
+
+        // No record override: the record itself declares nothing.
+        let read = decoded_v3_with_stored_key(None, &["a"], SIX_HOURS, 3).await;
+        assert_eq!(
+            read.clustering_key(&deployment_default),
+            Ok(ClusteringKeyState::Set(ClusteringKey {
+                columns: names(&["a"]),
+                bucket_width: ClusteringBucketWidth::SixHours,
+                generation: 3,
+            }))
+        );
+        let mut cfg = read.clone();
+        cfg.set_clustering_key_as(
+            names(&["a"]),
+            ClusteringBucketWidth::OneHour,
+            &deployment_default,
+            v3,
+        )
+        .expect("a column in the effective list is declared");
+        assert_eq!(cfg.clustering_generation(), 4);
+
+        let read = decoded_v3_with_stored_key(None, &["z"], SIX_HOURS, 3).await;
+        let undeclared_z =
+            StorageLayoutConfigError::UndeclaredClusteringKeyColumn { column: "z".into() };
+        assert_eq!(
+            read.clustering_key(&deployment_default),
+            Err(undeclared_z.clone())
+        );
+        let mut cfg = read;
+        let before = cfg.clone();
+        assert_eq!(
+            cfg.set_clustering_key_as(
+                names(&["z"]),
+                ClusteringBucketWidth::OneHour,
+                &deployment_default,
+                v3
+            ),
+            Err(undeclared_z)
+        );
+        assert_eq!(cfg, before);
+
+        // A list passed by the caller is the whole list: a column the record's
+        // own override names but the passed list does not is refused, and a column
+        // only the passed list names is accepted.
+        let read = decoded_v3_with_stored_key(Some(vec![str_col("b")]), &["b"], SIX_HOURS, 3).await;
+        let undeclared_b =
+            StorageLayoutConfigError::UndeclaredClusteringKeyColumn { column: "b".into() };
+        assert_eq!(
+            read.clustering_key(&deployment_default),
+            Err(undeclared_b.clone())
+        );
+        let mut cfg = read;
+        assert_eq!(
+            cfg.set_clustering_key_as(
+                names(&["b"]),
+                ClusteringBucketWidth::OneHour,
+                &deployment_default,
+                v3
+            ),
+            Err(undeclared_b)
+        );
+        cfg.set_clustering_key_as(
+            names(&["a"]),
+            ClusteringBucketWidth::OneHour,
+            &deployment_default,
+            v3,
+        )
+        .expect("a column only the passed list declares");
     }
 
     /// The setter's width type has no unspecified or unknown value, so these two
     /// cases reach the shared validation only through the stored record.
     #[tokio::test]
     async fn clustering_key_refuses_an_unspecified_or_unknown_bucket_width() {
-        let read = decoded_v3_with_key(
-            vec![str_col("a")],
-            &["a"],
-            sysproto::ClusteringBucketWidth::Unspecified as i32,
-        )
-        .await;
+        let read = decoded_v3_with_key(vec![str_col("a")], &["a"], UNSPECIFIED).await;
         assert_eq!(
-            read.clustering_key(),
+            read.clustering_key(&own_declared(&read)),
             Err(StorageLayoutConfigError::UnspecifiedBucketWidth)
         );
         assert_eq!(read.clustering_generation(), 9);
 
         let read = decoded_v3_with_key(vec![str_col("a")], &["a"], 99).await;
         assert_eq!(
-            read.clustering_key(),
+            read.clustering_key(&own_declared(&read)),
             Err(StorageLayoutConfigError::UnknownBucketWidth { got: 99 })
         );
     }
