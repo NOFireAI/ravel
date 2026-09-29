@@ -126,7 +126,7 @@ mod tests {
 
     use super::*;
     use crate::manifest::encode_manifest;
-    use crate::test_util::{TENANT_A, TENANT_B, live_manifest};
+    use crate::test_util::{CountingStore, TENANT_A, TENANT_B, live_manifest};
 
     async fn put_version(store: &MemoryStore, tenant: &TenantHash, version: u64) {
         let m = live_manifest("hits", version, &[version as u8]);
@@ -155,6 +155,46 @@ mod tests {
         );
         let got = newest(&store, &TENANT_A, "hits").await.expect("resolve");
         assert_eq!(got, Some(live_manifest("hits", 12, &[12])));
+    }
+
+    #[tokio::test]
+    async fn a_newest_version_deleted_before_every_read_is_reported_as_vanished() {
+        // A sweep deleting the version this resolve just listed, on every
+        // attempt. Three versions and three deletions exhaust the bound, so
+        // the resolve reports Vanished rather than an empty table.
+        let inner = MemoryStore::new();
+        for v in [1, 2, 3] {
+            put_version(&inner, &TENANT_A, v).await;
+        }
+        let store = CountingStore::new(inner);
+        store.delete_after_each_list((1..=MAX_RESOLVE_ATTEMPTS as u64).rev().map(|v| {
+            manifest_key(&TENANT_A, "hits", v).expect("key")
+        }));
+        let got = newest(&store, &TENANT_A, "hits").await;
+        assert!(
+            matches!(
+                got,
+                Err(ResolveError::Vanished { ref table, attempts })
+                    if table == "hits" && attempts == MAX_RESOLVE_ATTEMPTS
+            ),
+            "{got:?}"
+        );
+        assert_eq!(store.list_count(), MAX_RESOLVE_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn a_newest_version_that_reappears_within_the_bound_resolves() {
+        // Only the first listed newest is deleted, so the second attempt
+        // reads version 2 and the resolve succeeds inside the bound.
+        let inner = MemoryStore::new();
+        for v in [1, 2, 3] {
+            put_version(&inner, &TENANT_A, v).await;
+        }
+        let store = CountingStore::new(inner);
+        store.delete_after_each_list([manifest_key(&TENANT_A, "hits", 3).expect("key")]);
+        let got = newest(&store, &TENANT_A, "hits").await.expect("resolve");
+        assert_eq!(got, Some(live_manifest("hits", 2, &[2])));
+        assert_eq!(store.list_count(), 2);
     }
 
     #[tokio::test]
