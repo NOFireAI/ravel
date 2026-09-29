@@ -313,6 +313,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A catalog decode declared over its ceiling no longer runs a vacuous
+  eviction pass** (issue #2132). Such a decode is charged 0 bytes, and a budget
+  pushed over its limit by `reserve_unchecked` refuses even that;
+  `Catalog::reserve_decoded` now returns that first refusal directly instead of
+  running an eviction pass that could free nothing and counting it in
+  `decode_reserve_retries`. The charge rule itself, `decoded_charge`, now lives
+  once in `ravel-memory`, and both the query fetcher and the catalog call it.
 - **`ravel-cli load --signal logs` loads a dictionary-encoded hex `trace_id` or
   `span_id` column** (issue #2116). A default Parquet writer dictionary-encodes
   string columns, and the columnar logs path refused such an id column with
