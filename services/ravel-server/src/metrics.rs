@@ -12539,13 +12539,14 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
     /// them would keep passing if the shard actor stopped counting floor
     /// flushes: they pin the renderer, not the path. This one drives a live
     /// `IngestRouter` at the shipped cadence with only the floor set, writes
-    /// one buffered row far below it, and advances an injected clock past the
-    /// idle clock first and then past the hold.
+    /// one buffered row far below it, and advances an injected clock in one
+    /// step to `max_flush_lifetime`, past both the idle clock and the hold.
     ///
     /// The pair of final figures is what discriminates: `flushes_by_age` must
     /// still be 0. Had the buffer taken `max_flush_delay_idle` instead of the
-    /// hold, it would have flushed at 41 s and this body would carry
-    /// `flushes_by_age` 1 with the floor counter at 0. An operator sizes the
+    /// hold, the same advance would have flushed it under `FlushTrigger::Age`
+    /// and this body would carry `flushes_by_age` 1 with the floor counter
+    /// at 0. An operator sizes the
     /// buffered-mode loss window they accepted from this counter, so a flush
     /// counted under the wrong trigger is the defect, not merely a missing
     /// sample.
@@ -12617,7 +12618,6 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
         config
             .validate()
             .expect("a floor below min_flush_bytes is a legal configuration");
-        let idle_ns = config.max_flush_delay_idle.as_nanos() as i64;
         // The shipped hold is `max_flush_lifetime` less one `flush_tick`, and
         // the age check itself runs on a tick, so the worst buffer age at
         // flush open is exactly `max_flush_lifetime`. Advancing that far is
@@ -12699,10 +12699,11 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             "the floor counter must render at 0 before any flush opens:\n{before}"
         );
 
-        // Past the idle clock, which this buffer must NOT be using.
-        advance(idle_ns + 1_000_000_000);
-        // Past the hold itself, which is what must open the flush.
-        advance(worst_age_ns - idle_ns - 1_000_000_000);
+        // One step to the worst age at flush open, past both the idle clock
+        // and the hold. The trigger the actor records depends on the buffer's
+        // bytes, not on the path the clock took, so a buffer on the idle clock
+        // would flush here too and be counted under `flushes_by_age`.
+        advance(worst_age_ns);
         until(|| {
             let snapshot = router.metrics().snapshot();
             snapshot.flushes_by_age_floor + snapshot.flushes_by_age + snapshot.flushes_by_size >= 1

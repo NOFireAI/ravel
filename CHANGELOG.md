@@ -313,6 +313,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`ravel-server` refuses an `--idle-flush-byte-floor` at or above
+  `--min-flush-bytes` in every mode** (issue #2080, ADR-1737). The check ran
+  only where an ingest router is built, so `--mode query` and `--mode
+  maintain` started on a combination the flag help says is refused.
+- **`ingest_bench` and `s3_e2e_bench` report `flushes_by_age_floor`** (issue
+  #2080). `estimated_put_count` already counted sub-floor hold flushes, but
+  neither report nor its printed flush breakdown carried them, so the
+  breakdown did not sum to the estimate once a floor was set.
 - **`ravel-cli load --signal logs` loads a dictionary-encoded hex `trace_id` or
   `span_id` column** (issue #2116). A default Parquet writer dictionary-encodes
   string columns, and the columnar logs path refused such an id column with
