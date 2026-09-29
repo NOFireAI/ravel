@@ -123,14 +123,15 @@ the pod, which is why liveness is a separate route and why a condemned shard
 needs an operator to roll the process
 ([guides/operations/troubleshooting.md](guides/operations/troubleshooting.md)).
 On SIGTERM this same
-`/readyz` is the drain signal: the process flips it to 503 first and deletes
-its distributed query heartbeat record while it waits a short settle interval,
-so a probe observes the 503 and a sibling coordinator drops this worker from
-its live set while the listeners are still open. It then signals the listeners
+`/readyz` is the drain signal: the process flips it to 503 first and
+overwrites its distributed query heartbeat record with a drained stamp no
+reader accepts as live while it waits a short settle interval, so a probe
+observes the 503 and a sibling coordinator drops this worker from its live set
+while the listeners are still open. It then signals the listeners
 closed, attempts to flush every ingest shard actor (metrics, logs, and spans)
 before waiting on those sockets, and stops the background tasks. The drain
 from that close signal onwards is bounded by `--shutdown-timeout` (default
-25s), and the heartbeat delete, which runs ahead of it, carries a tenth of
+25s), and the heartbeat drain write, which runs ahead of it, carries a tenth of
 that as its own bound (2.5s), so neither a wedged flush nor an unreachable
 object store can hold the *drain* past 27.5s at the defaults. That is not the
 whole SIGTERM-to-exit budget: after the drain returns, `main` flushes the OTLP

@@ -375,26 +375,42 @@ identity. That check does not keep a new identity out: the shipped query role
 and records carry no MAC, so any principal holding that role can write a
 self-consistent record at a fresh UUID key and join the live set.
 
-That listing is also what keeps the prefix bounded. A node that drains
-gracefully deletes its own record on the way out, but one lost to a crash, a
-kill or a node failure cannot, so two rules apply to every key the listing
-returns. A key whose modification time is already older than the liveness
-window is not fetched at all: its stamp can only be older still, so the read
-cost of a coordinator tracks the live fleet rather than every node that ever
-ran. A key older than twice that window is deleted, from the same listing, so
-the delete needs no listing of its own. The doubled width is the clock-skew margin
-between the object store's clock and the reader's; a live node reaped by a
-skewed clock reappears on its next beat, at most one interval later. A store
-that reports no modification time, or one in the future, gets neither rule:
-such a key is read normally and is never deleted.
+A query node never deletes a record: the query role (`deploy/iam/query.json`)
+holds no `s3:DeleteObject` at all. A node that drains gracefully overwrites its
+own record on the way out with a stamp no reader accepts as live, so every
+sibling drops it from its live set on its next listing, at most one heartbeat
+interval later, and stops dialing it. The record itself stays behind, like the
+record of a node lost to a crash, a kill or a node failure.
 
-The delete needs a permission the shipped `deploy/iam/query.json` does not
-grant. That template allows no `s3:DeleteObject` anywhere, so on a deployment
-using it the reap is denied per key and logged as a warning the process
-continues past: the GET is still skipped, but the prefix does not shrink. Grant
-`s3:DeleteObject` on `sys/query/workers/*` to the query role for the reap to
-take effect. The maintain and admission families carry the same gap on their
-own worker prefixes.
+A key whose modification time is already older than the liveness window is not
+fetched at all: its stamp can only be older still, so the read cost of a
+coordinator tracks the live fleet rather than every node that ever ran.
+
+**Maintain-mode processes** keep the prefix bounded. On each maintain cycle,
+the maintain process that owns a fixed unit under the same rendezvous rule that
+spreads the other maintain work lists `sys/query/workers/` and deletes every
+key whose modification time is older than twice the liveness window. That is
+one process per view of the maintain membership: while two processes briefly
+disagree about membership both may reap, which is harmless because a delete of
+an absent key is a no-op. The doubled width is the clock-skew margin between
+the object store's clock and the maintain process's; a live node reaped by a
+skewed clock reappears on its next beat, at most one interval later. A store
+that reports no modification time keeps such a key forever; a key whose
+modification time is in the future stays until that time is more than twice
+the window in the past. The shipped `deploy/iam/maintain.json` grants the list
+and the delete on `sys/query/workers/*`; no maintain process needs to read a
+record. A deployment that runs no maintain-mode process reaps nothing, and the
+prefix grows by one key for every query node that ever ran. That includes a
+deployment that runs every role in one `--mode all` process with distributed
+query on: `--mode all` runs no maintenance loop.
+
+The admission family still carries the gap this reap closes for query workers:
+its reconciler deletes stale snapshots under a role the shipped templates give
+no delete, so its prefix is not reaped either.
+
+If the reaping credential lacks the delete, the pass logs one error naming the
+prefix and the number of keys left, and stops deleting until the next cycle,
+instead of one warning per key.
 
 To place a slice, the coordinator rendezvous-hashes the slice's
 `(tenant_hash, signal, shard)` unit over the live set and takes the top owner,
