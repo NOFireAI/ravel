@@ -640,8 +640,11 @@ migrates the other two:
   below-target part as compaction-eligible, but no build does it yet: both
   compaction and the migration rewrite refuse a bucket that already carries a
   compaction record, and the walk never reaches such a bucket's parts.
-  Re-running `migrate` reports the same `l1_compaction_parts` figure, and no
-  `blocked_bucket` line is printed for one. The figure is over listed records,
+  Re-running `migrate` reports the same `l1_compaction_parts` figure. No
+  `blocked_bucket` line is printed for one, except when the bucket's
+  authoritative compaction records are all at the target and the below-target
+  parts belong to records that lost their overlap (see `losing_record_parts`
+  below). The figure is over listed records,
   so it can still fall without a `migrate` run: a compaction record that a later
   rewrite record superseded stays listed until a `sweep` deletes it and its
   parts, the same way a superseded predecessor rewrite does;
@@ -650,14 +653,20 @@ migrates the other two:
 - a **below-target L0 input only a losing compaction record names** is served
   raw and the walk cannot migrate it (see `loser_only_inputs` below).
 
-`migrate` names each bucket in the last two categories on its own line:
+`migrate` names each bucket in the last two categories on its own line, and
+each bucket held below the target only by a losing compaction record's parts.
+A bucket that qualifies both as `loser_only_inputs` and as
+`losing_record_parts` gets the `losing_record_parts` line only; the two clear
+the same way:
 
 ```
-buckets_blocked: 2
+buckets_blocked: 3
 blocked_bucket: shard=0 hour=100 reason=rewrite_parts below_target=2
 blocked_bucket: shard=3 hour=47 reason=loser_only_inputs
+blocked_bucket: shard=3 hour=52 reason=losing_record_parts below_target=1
 # Re-running migrate does not clear any blocked bucket above; it reports the same list again. ...
 # A loser_only_inputs bucket clears only when retention ages those inputs out: ...
+# A losing_record_parts bucket's authoritative compaction records are at the target, ...
 ```
 
 Every other line of the report is `key: value`; the explanatory prose is
@@ -665,13 +674,14 @@ prefixed with `# ` so a parser reading those lines does not take a sentence
 fragment for a key.
 
 `buckets_blocked` is how many `blocked_bucket` lines there are, and it covers
-the buckets THIS INVOCATION EXAMINED. The rewrite-record half comes from the
-re-audit, which reads every shard, so it is complete; the loser-only half comes
-from the walk, so an invocation that resumed from a cursor does not re-report
-the loser-only buckets an earlier invocation found. When `buckets_blocked` is
-non-zero, re-running is not the remedy. A `loser_only_inputs` block is not
-something a command clears; a `rewrite_parts` block can be, when it lists a
-superseded predecessor a `sweep` removes (see below).
+the buckets THIS INVOCATION EXAMINED. The `rewrite_parts` and
+`losing_record_parts` lines come from the re-audit, which reads every shard, so
+they are complete; the loser-only half comes from the walk, so an invocation
+that resumed from a cursor does not re-report the loser-only buckets an earlier
+invocation found. When `buckets_blocked` is non-zero, re-running is not the
+remedy. A `loser_only_inputs` or `losing_record_parts` block is not something a
+command clears; a `rewrite_parts` block can be, when it lists a superseded
+predecessor a `sweep` removes (see below).
 
 **`loser_only_inputs`.** An L0 input that only a losing compaction record names
 is served raw and the walk cannot migrate it: a new record over that subset
@@ -680,6 +690,22 @@ aging those inputs out is the only thing that clears it in this build. A later
 authoritative compaction covering them would, but none is ever published:
 compaction refuses a bucket that already carries a compaction record, so the
 bucket's record set is closed.
+
+**`losing_record_parts`.** The bucket's authoritative compaction records all
+have their parts at or above the target, but compaction records that lost
+their overlap to them carry `below_target` output parts below it, summed over
+those losing records. Where `loser_only_inputs` is about the raw L0 inputs only
+a losing record names, this is about the losing record's own output parts.
+Nothing serves them, but they still count in `l1_compaction_parts`, and the
+floor is still refused over them: a build older than the rule that picks one
+authoritative record per overlap may still serve them. Re-running `migrate`
+does not clear it, and neither does `sweep`: neither reclaims a losing record's
+parts. Retention does, when it ages the bucket out, subject to the
+format-version hold that keeps an object this build cannot read. That is not a
+command you run. A bucket whose authoritative records are themselves below the
+target is not named this way. Nor is a bucket that lists a rewrite record: it
+gets a `rewrite_parts` line when its rewrite parts are below the target, and
+no line otherwise.
 
 **`rewrite_parts`.** The bucket holds a live selective-erasure rewrite record
 (the durable steady state of a bucket an erasure request touched), and
@@ -717,7 +743,7 @@ format floor over objects that still exist below the target, some of which queri
 still read (a superseded predecessor is not one of them, but the current output
 version's own below-target parts are).
 
-Blocked buckets are narrowed to those two cases deliberately. The rewrite
+Blocked buckets are narrowed to those cases deliberately. The rewrite
 primitive also refuses a bucket when a concurrent compaction or erasure lands
 between the walk's listing and its own, which is harmless and converges on a
 later run. Because the refusal alone cannot tell the two apart, the walk
