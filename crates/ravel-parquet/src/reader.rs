@@ -16,12 +16,10 @@ use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_datasource_parquet::ParquetFileReaderFactory;
 use futures::future::{BoxFuture, FutureExt, try_join_all};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
-use parquet::arrow::async_reader::{AsyncFileReader, MetadataFetch};
-use parquet::errors::ParquetError;
+use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::file::metadata::{
-    FooterTail, PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader,
+    FooterTail, ParquetMetaData, ParquetMetaDataBuilder, ParquetMetaDataReader,
 };
-use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use ravel_cache::{CacheKey, PinnedIdentity, SingleFlightError, Source};
 use ravel_object_store::{GetRange, ObjectStoreBackend, Pin, StoreError};
 use ravel_pqtable::manifest::ParquetFile;
@@ -111,14 +109,9 @@ impl fmt::Debug for ReadServices {
 /// the manifest recorded, charged to [`QueryPhase::Probe`]; every other read
 /// is charged to [`QueryPhase::Scan`].
 ///
-/// The reader always loads the page index with the footer (charged to Probe)
-/// and checks it before handing the footer out, whatever the scan's
-/// predicate. DataFusion prunes pages whenever the scan has a predicate when
-/// it opens a file, and that includes dynamic filters (hash join, TopK)
-/// pushed into the scan after planning; the parquet crate panics on some
-/// malformed page locations rather than returning an error. DataFusion loads
-/// a page index itself only when the footer it is handed lacks one, so the
-/// index it prunes with is always one this reader checked.
+/// The reader does not use the file's page index. The footer it hands out
+/// carries no column index or offset index, whatever options the caller
+/// passes, so the scan decodes every column chunk it reads by page header.
 #[derive(Debug, Clone)]
 pub struct PinnedParquetReader {
     tenant: TenantHash,
@@ -255,8 +248,8 @@ impl PinnedParquetReader {
         }
     }
 
-    /// The decoded footer with its checked page index, from the metadata
-    /// cache or from Probe reads.
+    /// The decoded footer, without its page index, from the metadata cache
+    /// or from a Probe read.
     ///
     /// A metadata cache hit counts as a Probe cache hit of the entry's charged
     /// size, the convention the catalog caches use. The key is the pinned
@@ -264,9 +257,7 @@ impl PinnedParquetReader {
     /// the footer is decoded or refused from. A footer refused as `Corrupt` is
     /// cached as refused under that key, so a later read fails the same way
     /// without reading it again. A read that failed is not cached, whatever
-    /// it failed on: a store error, a read that came back short, or a page
-    /// index range past the recorded size, which [`Self::read_range`] fails
-    /// as `Corrupt` before any GET.
+    /// it failed on: a store error or a read that came back short.
     pub async fn metadata(&self) -> Result<Arc<ParquetMetaData>, ParquetReadError> {
         let cache_key = MetadataKey::of(&self.cache_key(0, 0), self.file.file.footer_len);
         if let Some((footer, bytes)) = self.services.metadata.get(&cache_key) {
@@ -293,7 +284,8 @@ impl PinnedParquetReader {
         }
     }
 
-    /// Read, decode and check the footer, then load and check its page index.
+    /// Read, decode and check the footer. The metadata it returns carries no
+    /// page index.
     async fn read_footer(&self) -> Result<Arc<ParquetMetaData>, FooterError> {
         let size = self.file.file.size;
         let footer_len = u64::from(self.file.file.footer_len);
@@ -324,29 +316,9 @@ impl PinnedParquetReader {
         let metadata = ParquetMetaDataReader::decode_metadata(&tail[..split])
             .map_err(|err| FooterError::Refused(format!("footer: {err}")))?;
         check_chunks(&metadata, size - tail_len).map_err(FooterError::Refused)?;
-        let metadata = Arc::new(metadata);
+        let metadata = Arc::new(without_page_index(metadata));
         check_arrow_schema(&metadata).map_err(FooterError::Refused)?;
-        self.with_checked_page_index(metadata).await
-    }
-
-    /// `metadata` with its page index loaded through Probe reads and checked.
-    /// A file that carries no page index, or whose offset index does not
-    /// decode (dropped under the `Optional` policy), comes back without one;
-    /// DataFusion's own load of the same pinned bytes would find none either.
-    async fn with_checked_page_index(
-        &self,
-        metadata: Arc<ParquetMetaData>,
-    ) -> Result<Arc<ParquetMetaData>, FooterError> {
-        let owned = Arc::try_unwrap(metadata).unwrap_or_else(|shared| shared.as_ref().clone());
-        let mut loader = ParquetMetaDataReader::new_with_metadata(owned)
-            .with_page_index_policy(PageIndexPolicy::Optional);
-        loader
-            .load_page_index(ProbeFetch(self))
-            .await
-            .map_err(page_index_error)?;
-        let metadata = loader.finish().map_err(page_index_error)?;
-        check_page_index(&metadata).map_err(FooterError::Refused)?;
-        Ok(Arc::new(metadata))
+        Ok(metadata)
     }
 }
 
@@ -359,113 +331,19 @@ enum FooterError {
     Refused(String),
 }
 
-/// A page index load failure: the reader's own error when one of its reads
-/// failed, a refusal when the bytes it read did not decode.
-fn page_index_error(err: ParquetError) -> FooterError {
-    if let ParquetError::External(source) = &err
-        && let Some(read) = source.downcast_ref::<ParquetReadError>()
-    {
-        return FooterError::Read(read.clone());
+/// `metadata` with no column index and no offset index. The parquet crate
+/// reads each data page from the byte range its offset index location names
+/// and never compares that with the page's own header, so a corrupt location
+/// decodes the wrong rows without an error; without an offset index it walks
+/// the column chunk by page header.
+fn without_page_index(metadata: ParquetMetaData) -> ParquetMetaData {
+    if metadata.column_index().is_none() && metadata.offset_index().is_none() {
+        return metadata;
     }
-    FooterError::Refused(format!("page index: {err}"))
-}
-
-/// Refuse a page index whose page locations the scan could not use
-/// safely: every data page must lie inside its column chunk's byte range,
-/// the first at the chunk's `data_page_offset` and each later one at or past
-/// the end of the one before; the first page must start at row 0, each page
-/// must start at a later row than the one before and inside the row group;
-/// and a column index, where there is one, must describe as many pages as
-/// the offset index lists. The scan reads every data page from its location
-/// and every byte before the first one as a dictionary page, so a location
-/// naming another page's bytes, or a gap before the first, decodes the wrong
-/// values without an error.
-fn check_page_index(metadata: &ParquetMetaData) -> Result<(), String> {
-    let Some(offset_index) = metadata.offset_index() else {
-        return Ok(());
-    };
-    if offset_index.len() != metadata.num_row_groups() {
-        return Err(format!(
-            "the offset index covers {} row groups, the footer {}",
-            offset_index.len(),
-            metadata.num_row_groups()
-        ));
-    }
-    for (row_group, (group, columns)) in metadata.row_groups().iter().zip(offset_index).enumerate()
-    {
-        if columns.len() != group.num_columns() {
-            return Err(format!(
-                "row group {row_group}: the offset index covers {} columns, the footer {}",
-                columns.len(),
-                group.num_columns()
-            ));
-        }
-        let rows = group.num_rows();
-        for (column, (chunk, index)) in group.columns().iter().zip(columns).enumerate() {
-            let start = chunk
-                .dictionary_page_offset()
-                .unwrap_or_else(|| chunk.data_page_offset());
-            let end = start.saturating_add(chunk.compressed_size());
-            let mut previous_row: Option<i64> = None;
-            let mut previous_end: Option<i64> = None;
-            for (page, location) in index.page_locations().iter().enumerate() {
-                let page_end = location
-                    .offset
-                    .checked_add(i64::from(location.compressed_page_size));
-                let inside = location.offset >= start
-                    && location.compressed_page_size > 0
-                    && page_end.is_some_and(|page_end| page_end <= end);
-                let row = location.first_row_index;
-                let row_ok = match previous_row {
-                    None => row == 0,
-                    Some(previous) => row > previous,
-                } && row < rows.max(1);
-                if !inside || !row_ok {
-                    return Err(format!(
-                        "row group {row_group} column {column} page {page}: {} bytes at \
-                         offset {} from row {row}, outside the chunk's bytes {start}..{end} \
-                         or its {rows} rows",
-                        location.compressed_page_size, location.offset
-                    ));
-                }
-                match previous_end {
-                    None if location.offset != chunk.data_page_offset() => {
-                        return Err(format!(
-                            "row group {row_group} column {column}: the first page is at offset \
-                             {}, the chunk's first data page at {}",
-                            location.offset,
-                            chunk.data_page_offset()
-                        ));
-                    }
-                    Some(previous_end) if location.offset < previous_end => {
-                        return Err(format!(
-                            "row group {row_group} column {column} page {page}: offset {} is \
-                             before the previous page's end {previous_end}",
-                            location.offset
-                        ));
-                    }
-                    _ => {}
-                }
-                previous_row = Some(row);
-                previous_end = page_end;
-            }
-            if let Some(column_index) = metadata
-                .column_index()
-                .and_then(|index| index.get(row_group))
-                .and_then(|columns| columns.get(column))
-                && !matches!(column_index, ColumnIndexMetaData::NONE)
-                && column_index.num_pages() != index.page_locations().len() as u64
-            {
-                return Err(format!(
-                    "row group {row_group} column {column}: the column index describes {} \
-                     pages, the offset index {}",
-                    column_index.num_pages(),
-                    index.page_locations().len()
-                ));
-            }
-        }
-    }
-    Ok(())
+    ParquetMetaDataBuilder::new_from_metadata(metadata)
+        .set_column_index(None)
+        .set_offset_index(None)
+        .build()
 }
 
 /// Refuse a footer placing any column chunk outside the `data_end` bytes
@@ -536,29 +414,14 @@ impl AsyncFileReader for PinnedParquetReader {
         .boxed()
     }
 
+    /// The footer without its page index, whatever page index policy
+    /// `_options` asks for.
     fn get_metadata<'a>(
         &'a mut self,
         _options: Option<&'a ArrowReaderOptions>,
     ) -> BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
         async move {
             self.metadata()
-                .await
-                .map_err(ParquetReadError::into_parquet)
-        }
-        .boxed()
-    }
-}
-
-/// Page index reads for [`PinnedParquetReader::with_checked_page_index`],
-/// charged to Probe like the footer they belong with.
-struct ProbeFetch<'a>(&'a PinnedParquetReader);
-
-impl MetadataFetch for ProbeFetch<'_> {
-    fn fetch(&mut self, range: Range<u64>) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
-        let reader = self.0;
-        async move {
-            reader
-                .read_range(range, QueryPhase::Probe)
                 .await
                 .map_err(ParquetReadError::into_parquet)
         }
@@ -647,6 +510,8 @@ mod tests {
         read_error, read_where, render_rows,
     };
     use datafusion::logical_expr::{Expr, JoinType, col, ident, lit};
+    use parquet::file::metadata::PageIndexPolicy;
+    use parquet::file::page_index::offset_index::PageLocation;
     use proptest::prelude::*;
     use proptest::sample::Index;
     use ravel_object_store::memory::MemoryStore;
@@ -974,8 +839,8 @@ mod tests {
     }
 
     /// `a > 4`: the intact file's row group (`a` in 1..=3) is pruned by its
-    /// statistics, and the mutated file's (4..=6) is only partly matched, so
-    /// DataFusion loads its page index to prune pages.
+    /// statistics, and the mutated file's (4..=6) is only partly matched, the
+    /// case in which DataFusion would prune its pages with a page index.
     fn page_pruning_filter() -> Expr {
         ident("a").gt(lit(4_i64))
     }
@@ -1090,23 +955,15 @@ mod tests {
             .expect("a one-bit flip that moves a page out of its chunk")
     }
 
-    /// The parquet crate panics on a page location outside its chunk when it
-    /// prunes pages. The reader refuses such an index with the footer,
-    /// whatever the scan's predicate, and the outcome does not depend on what
-    /// ran before: an unfiltered, a filtered and another unfiltered scan over
-    /// one metadata cache each fail with the same `Corrupt` error.
+    /// The parquet crate panics on some page locations outside their chunk
+    /// when it prunes pages. The reader never hands the scan a page index, so
+    /// an unfiltered, a filtered and another unfiltered scan over one metadata
+    /// cache each return the file's exact rows, decoded by page header.
     #[tokio::test]
-    async fn a_page_index_out_of_its_chunk_is_corrupt_whatever_ran_before() {
+    async fn a_page_index_out_of_its_chunk_is_never_read_whatever_ran_before() {
         let flipped = page_index_out_of_its_chunk();
         let size = flipped.len() as u64;
         let footer_len = footer_len_of(&flipped);
-
-        let store = Arc::new(MemoryStore::new());
-        let fixture = Fixture::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>);
-        let file = fixture
-            .put_raw(&store, KEY, Bytes::from(flipped.clone()), size, footer_len)
-            .await;
-        assert_corrupt(fixture.reader(file).metadata().await, "outside the chunk");
 
         let store = Arc::new(MemoryStore::new());
         let fixture = Fixture::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>);
@@ -1128,21 +985,17 @@ mod tests {
             async move {
                 match read_where(ctx, "t", &["a", "b"], filter).await {
                     Ok(rows) => format!("rows {rows}"),
-                    Err(err) => format!("{:?}", read_error(&err)),
+                    Err(err) => format!("{err}"),
                 }
             }
         };
-        let first = outcome(None).await;
-        let filtered = outcome(Some(page_pruning_filter())).await;
-        let again = outcome(None).await;
-        assert!(
-            first.starts_with("Some(Corrupt")
-                && first.contains(KEY)
-                && first.contains("outside the chunk"),
-            "{first}"
+        let all = "rows 1|one,2|two,3|six,4|four,5|five,6|sixx";
+        assert_eq!(outcome(None).await, all);
+        assert_eq!(
+            outcome(Some(page_pruning_filter())).await,
+            "rows 5|five,6|sixx"
         );
-        assert_eq!(filtered, first);
-        assert_eq!(again, first);
+        assert_eq!(outcome(None).await, all);
     }
 
     /// One `a: Int64` column holding 1..=4, plain and uncompressed, in two
@@ -1220,51 +1073,53 @@ mod tests {
         bytes
     }
 
-    /// Two page locations naming the same bytes pass every per-page check:
-    /// each lies inside the chunk and starts at a later row. The scan reads
-    /// every page from its location, so it would decode the first page twice
-    /// and return 1, 2, 1, 2 with the right row count; the reader refuses the
-    /// index instead, and a scan of it beside an intact file fails typed with
-    /// no rows.
+    /// Two page locations naming the same bytes: the parquet crate reads every
+    /// data page from its location, so with the offset index it would decode
+    /// the first page twice and return 1, 2, 1, 2. The scan decodes by page
+    /// header instead, and a scan beside an intact copy returns both files'
+    /// real rows.
     #[tokio::test]
-    async fn a_page_location_overlapping_the_one_before_is_corrupt() {
+    async fn a_page_location_overlapping_the_one_before_changes_no_row() {
         let bytes = second_page_on_the_first();
-        let (size, footer_len) = (bytes.len() as u64, footer_len_of(&bytes));
+        let got = scan_beside_intact(two_equal_pages(), bytes, None).await;
+        assert_eq!(got.expect("rows"), "1,1,2,2,3,3,4,4");
+    }
+
+    /// Scan `a` over a table of two files, `intact` and `corrupt` at [`KEY`],
+    /// the second described by its own length and trailer, with `filter`.
+    async fn scan_beside_intact(
+        intact: Vec<u8>,
+        corrupt: Vec<u8>,
+        filter: Option<Expr>,
+    ) -> datafusion::error::Result<String> {
+        let (size, footer_len) = (corrupt.len() as u64, footer_len_of(&corrupt));
         let store = Arc::new(MemoryStore::new());
         let fixture = Fixture::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>);
         let intact = fixture
-            .put_file(
-                &store,
-                "lake/t/intact.parquet",
-                Bytes::from(two_equal_pages()),
-                false,
-            )
+            .put_file(&store, "lake/t/intact.parquet", Bytes::from(intact), false)
             .await;
-        let table = fixture.provider("t", 1, vec![intact.clone()], false).await;
-        let rows = read_all(&fixture.session(&[("t", table)]), "t", &["a"]).await;
-        assert_eq!(rows.expect("the intact file reads"), "1,2,3,4");
+        let file = fixture
+            .put_raw(&store, KEY, Bytes::from(corrupt), size, footer_len)
+            .await;
+        let table = fixture.provider("t", 1, vec![intact, file], false).await;
+        read_where(&fixture.session(&[("t", table)]), "t", &["a"], filter).await
+    }
 
+    /// Scan `a` over a table whose one file is `bytes` at [`KEY`], described
+    /// by its own length and trailer, with `filter`.
+    async fn scan_alone(bytes: Vec<u8>, filter: Option<Expr>) -> datafusion::error::Result<String> {
+        let (size, footer_len) = (bytes.len() as u64, footer_len_of(&bytes));
+        let store = Arc::new(MemoryStore::new());
+        let fixture = Fixture::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>);
         let file = fixture
             .put_raw(&store, KEY, Bytes::from(bytes), size, footer_len)
             .await;
-        let table = fixture.provider("t", 1, vec![intact, file], false).await;
-        let got = read_all(&fixture.session(&[("t", table)]), "t", &["a"]).await;
-        match got {
-            Err(err) => match read_error(&err) {
-                Some(ParquetReadError::Corrupt { key, message }) => {
-                    assert_eq!(key, KEY);
-                    assert!(
-                        message.contains("before the previous page's end"),
-                        "{message}"
-                    );
-                }
-                other => panic!("expected Corrupt, got {other:?} from {err}"),
-            },
-            Ok(rows) => panic!("expected Corrupt, got rows {rows}"),
-        }
+        let table = fixture.provider("t", 1, vec![file], false).await;
+        read_where(&fixture.session(&[("t", table)]), "t", &["a"], filter).await
     }
 
-    /// The metadata of `bytes` with its page index, as the reader loads it.
+    /// The metadata of `bytes` with its page index, as the parquet crate loads
+    /// it.
     fn metadata_with_page_index(bytes: &[u8]) -> ParquetMetaData {
         ParquetMetaDataReader::new()
             .with_page_index_policy(PageIndexPolicy::Required)
@@ -1272,33 +1127,125 @@ mod tests {
             .expect("metadata with a page index")
     }
 
-    /// An offset index whose one location is the second data page: it lies
-    /// inside the chunk and starts at row 0, but the scan would read the first
-    /// data page's bytes, before it, as a dictionary page.
-    #[test]
-    fn a_first_page_location_past_the_first_data_page_is_refused() {
-        let metadata = metadata_with_page_index(&two_equal_pages());
-        let chunk = metadata.row_group(0).column(0);
-        assert_eq!(chunk.dictionary_page_offset(), None);
-        let second =
-            metadata.offset_index().expect("an offset index")[0][0].page_locations()[1].clone();
-        assert!(second.offset > chunk.data_page_offset());
-        let mut index = parquet::file::metadata::OffsetIndexBuilder::new();
-        index.append_offset_and_size(second.offset, second.compressed_page_size);
-        index.append_row_count(4);
-        let moved = parquet::file::metadata::ParquetMetaDataBuilder::new_from_metadata(metadata)
-            .set_offset_index(Some(vec![vec![index.build()]]))
+    /// One `a: Int64` column holding 1..=6, plain and uncompressed, in three
+    /// data pages of two values each, with no dictionary page and with page
+    /// statistics, so the file carries a column index and an offset index.
+    fn three_pages() -> Vec<u8> {
+        use datafusion::arrow::array::{ArrayRef, Int64Array};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use parquet::file::properties::WriterProperties;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let batch = datafusion::arrow::array::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4, 5, 6])) as ArrayRef],
+        )
+        .expect("batch");
+        let properties = WriterProperties::builder()
+            .set_dictionary_enabled(false)
+            .set_data_page_row_count_limit(2)
+            .set_write_batch_size(2)
             .build();
-        let err = check_page_index(&moved).expect_err("refused");
-        assert!(err.contains("the chunk's first data page at"), "{err}");
+        let mut bytes = Vec::new();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(&mut bytes, schema, Some(properties))
+            .expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+        let metadata = metadata_with_page_index(&bytes);
+        let pages = metadata.offset_index().expect("an offset index")[0][0].page_locations();
+        let rows: Vec<i64> = pages.iter().map(|page| page.first_row_index).collect();
+        assert_eq!(rows, [0, 2, 4]);
+        assert!(metadata.column_index().is_some());
+        bytes
     }
 
-    /// ArrowWriter's own layout passes the page order checks: with a
-    /// dictionary page, the first location is the chunk's `data_page_offset`
-    /// and the dictionary page lies before it; without one, the first location
-    /// is where the chunk starts. Both files scan to their rows.
+    /// `bytes`, a one-column file, with the offset index of its one column
+    /// chunk replaced by `pages(&its locations)`. The new index is written in
+    /// place and zero-padded to the old one's length, which the parquet crate
+    /// ignores after the struct's end; every other byte, the footer included,
+    /// is untouched.
+    fn with_page_locations(
+        bytes: &[u8],
+        pages: impl Fn(&[PageLocation]) -> Vec<PageLocation>,
+    ) -> Vec<u8> {
+        let metadata = metadata_with_page_index(bytes);
+        let chunk = metadata.row_group(0).column(0);
+        let at = usize::try_from(chunk.offset_index_offset().expect("an offset index"))
+            .expect("offset");
+        let len = usize::try_from(chunk.offset_index_length().expect("an offset index"))
+            .expect("length");
+        let locations = pages(metadata.offset_index().expect("an offset index")[0][0].page_locations());
+        let count = u8::try_from(locations.len()).expect("few pages");
+        assert!(count < 15, "a short list header");
+        // OffsetIndex { 1: list<PageLocation> } in the compact protocol.
+        let mut index = vec![0x19, (count << 4) | 0x0c];
+        for page in &locations {
+            index.push(0x16);
+            zigzag_varint(page.offset, &mut index);
+            index.push(0x15);
+            zigzag_varint(i64::from(page.compressed_page_size), &mut index);
+            index.push(0x16);
+            zigzag_varint(page.first_row_index, &mut index);
+            index.push(0);
+        }
+        index.push(0);
+        assert!(index.len() <= len, "{} bytes over {len}", index.len());
+        index.resize(len, 0);
+        let mut out = bytes.to_vec();
+        out[at..at + len].copy_from_slice(&index);
+        let decoded = page_locations_of(&out).expect("the new index decodes");
+        assert_eq!(decoded[0].2, locations);
+        out
+    }
+
+    /// [`three_pages`] whose offset index locates only the first and the last
+    /// page. The parquet crate reads the pages the offset index names, so with
+    /// it an unfiltered scan returns 1, 2, 5, 6 without an error.
     #[tokio::test]
-    async fn arrow_writer_files_pass_the_page_order_checks() {
+    async fn a_missing_page_location_drops_no_row() {
+        let bytes = with_page_locations(&three_pages(), |pages| {
+            vec![pages[0].clone(), pages[2].clone()]
+        });
+        let got = scan_alone(bytes, None).await;
+        assert_eq!(got.expect("rows"), "1,2,3,4,5,6");
+    }
+
+    /// [`three_pages`] whose offset index sizes its first location to cover
+    /// the first two pages and has no location for the second. With it the
+    /// second page's rows vanish without an error.
+    #[tokio::test]
+    async fn a_location_covering_two_pages_drops_no_row() {
+        let bytes = with_page_locations(&three_pages(), |pages| {
+            let mut first = pages[0].clone();
+            first.compressed_page_size += pages[1].compressed_page_size;
+            vec![first, pages[2].clone()]
+        });
+        let got = scan_alone(bytes, None).await;
+        assert_eq!(got.expect("rows"), "1,2,3,4,5,6");
+    }
+
+    /// [`three_pages`] whose second location claims the page starts at row 3,
+    /// not 2. With the offset index a filtered scan selects rows by those
+    /// first rows and skips pages by them, so `a = 4` skips the wrong rows.
+    #[tokio::test]
+    async fn a_wrong_first_row_index_leaves_a_filtered_scan_exact() {
+        let bytes = with_page_locations(&three_pages(), |pages| {
+            let mut pages = pages.to_vec();
+            pages[1].first_row_index = 3;
+            pages
+        });
+        for (value, want) in [(2, "2"), (3, "3"), (4, "4"), (5, "5")] {
+            let got = scan_alone(bytes.clone(), Some(ident("a").eq(lit(value as i64)))).await;
+            assert_eq!(got.expect("rows"), want, "a = {value}");
+        }
+        let got = scan_alone(bytes, Some(ident("a").gt(lit(2_i64)))).await;
+        assert_eq!(got.expect("rows"), "3,4,5,6");
+    }
+
+    /// A dictionary-encoded file with several data pages per column scans to
+    /// its rows.
+    #[tokio::test]
+    async fn a_dictionary_encoded_file_with_several_pages_scans_to_its_rows() {
         use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
         use parquet::file::properties::WriterProperties;
@@ -1329,14 +1276,9 @@ mod tests {
         let metadata = metadata_with_page_index(&dictionary);
         let offset_index = metadata.offset_index().expect("an offset index");
         for (chunk, index) in metadata.row_group(0).columns().iter().zip(&offset_index[0]) {
-            let pages = index.page_locations();
-            assert_eq!(pages.len(), 3, "{pages:?}");
-            assert!(chunk.dictionary_page_offset().expect("a dictionary") < pages[0].offset);
-            assert_eq!(pages[0].offset, chunk.data_page_offset());
+            assert_eq!(index.page_locations().len(), 3);
+            assert!(chunk.dictionary_page_offset().is_some());
         }
-        check_page_index(&metadata).expect("the dictionary-encoded file passes");
-        let plain = metadata_with_page_index(&two_equal_pages());
-        check_page_index(&plain).expect("the plain file passes");
 
         let store = Arc::new(MemoryStore::new());
         let fixture = Fixture::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>);
@@ -1404,26 +1346,22 @@ mod tests {
     /// dynamic filter into `t`'s scan after planning: that scan gets a
     /// predicate although the statement has no WHERE clause and the
     /// provider's `scan()` received no filter. The corrupt file's row group
-    /// (`a` in 4..=6) is only partly matched by it, so DataFusion prunes that
-    /// file's pages with whatever page index the reader handed out. The reader
-    /// always loads and checks the page index with the footer, so the join
-    /// fails typed rather than reaching the parquet crate's panic.
+    /// (`a` in 4..=6) is only partly matched by it, the case in which
+    /// DataFusion would prune that file's pages with a page index. The reader
+    /// hands out none, so the join returns the corrupt file's real row rather
+    /// than reaching the parquet crate's panic.
     #[tokio::test]
-    async fn a_join_over_a_page_index_out_of_its_chunk_is_corrupt() {
+    async fn a_join_over_a_page_index_out_of_its_chunk_returns_exact_rows() {
         let intact = tokio::task::spawn_blocking(|| join_with_second_file(valid()))
             .await
             .expect("the join does not panic");
         assert_eq!(intact.expect("the intact join reads"), "5|five");
 
         let flipped = page_index_out_of_its_chunk();
-        let err = tokio::task::spawn_blocking(move || join_with_second_file(flipped))
+        let got = tokio::task::spawn_blocking(move || join_with_second_file(flipped))
             .await
-            .expect("the join does not panic")
-            .expect_err("the join fails");
-        assert!(
-            matches!(read_error(&err), Some(ParquetReadError::Corrupt { key, .. }) if key == KEY),
-            "{err}"
-        );
+            .expect("the join does not panic");
+        assert_eq!(got.expect("the join reads"), "5|five");
     }
 
     /// A footer refused as corrupt is cached as refused: the second read of the
@@ -1520,81 +1458,57 @@ mod tests {
 
     /// The TopK over `t` pushes a dynamic filter into the scan once the first
     /// file has given it `a = 5`: `a < 5` only partly matches the corrupt
-    /// file's row group, so DataFusion prunes that file's pages. The statement
-    /// has no WHERE clause; it still fails typed.
+    /// file's row group, the case in which DataFusion would prune that file's
+    /// pages with a page index. The statement has no WHERE clause; it returns
+    /// the corrupt file's real smallest row.
     #[tokio::test]
-    async fn a_top_k_over_a_page_index_out_of_its_chunk_is_corrupt() {
+    async fn a_top_k_over_a_page_index_out_of_its_chunk_returns_exact_rows() {
         let intact = tokio::task::spawn_blocking(|| top_one_with_second_file(valid()))
             .await
             .expect("the TopK does not panic");
         assert_eq!(intact.expect("the intact TopK reads"), "4|four");
 
         let flipped = page_index_out_of_its_chunk();
-        let err = tokio::task::spawn_blocking(move || top_one_with_second_file(flipped))
+        let got = tokio::task::spawn_blocking(move || top_one_with_second_file(flipped))
             .await
-            .expect("the TopK does not panic")
-            .expect_err("the TopK fails");
-        assert!(
-            matches!(read_error(&err), Some(ParquetReadError::Corrupt { key, .. }) if key == KEY),
-            "{err}"
-        );
+            .expect("the TopK does not panic");
+        assert_eq!(got.expect("the TopK reads"), "4|four");
     }
 
-    /// A file written with chunk statistics only carries an offset index and
-    /// no column index. The loaded metadata records an explicit "no column
-    /// index" for each chunk, which is what keeps DataFusion from loading the
-    /// page index again, unchecked, through the Scan reads: a scan that prunes
-    /// pages reads exactly the column chunks.
+    /// The footer the reader hands out carries no column index and no offset
+    /// index, whatever page index policy the caller asks for, although the
+    /// file carries both; and a scan whose filter only partly matches the
+    /// file's row group reads the footer and the column chunks, never a byte
+    /// of the page index.
     #[tokio::test]
-    async fn an_offset_index_without_a_column_index_is_not_loaded_again_by_the_scan() {
-        use datafusion::arrow::array::{ArrayRef, StringArray};
-        use datafusion::arrow::datatypes::{DataType, Field, Schema};
-        use parquet::file::properties::{EnabledStatistics, WriterProperties};
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("a", DataType::Int64, false),
-            Field::new("b", DataType::Utf8, false),
-        ]));
-        let batch = datafusion::arrow::array::RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(datafusion::arrow::array::Int64Array::from(vec![4, 5, 6])) as ArrayRef,
-                Arc::new(StringArray::from(vec!["four", "five", "sixx"])),
-            ],
-        )
-        .expect("batch");
-        let properties = WriterProperties::builder()
-            .set_dictionary_enabled(false)
-            .set_statistics_enabled(EnabledStatistics::Chunk)
-            .build();
-        let mut bytes = Vec::new();
-        let mut writer = parquet::arrow::ArrowWriter::try_new(&mut bytes, schema, Some(properties))
-            .expect("writer");
-        writer.write(&batch).expect("write");
-        writer.close().expect("close");
+    async fn the_footer_carries_no_page_index_and_the_scan_never_reads_one() {
+        let bytes = valid();
+        let stored = metadata_with_page_index(&bytes);
+        assert!(stored.column_index().is_some() && stored.offset_index().is_some());
+        let stripped = without_page_index(stored);
+        assert!(stripped.column_index().is_none() && stripped.offset_index().is_none());
+        let page_index = page_index_region(&bytes);
 
         let memory = Arc::new(MemoryStore::new());
-        let fixture = Fixture::new(Arc::clone(&memory) as Arc<dyn ObjectStoreBackend>);
-        let file = fixture
-            .put_file(&memory, KEY, Bytes::from(bytes), false)
-            .await;
-        let metadata = fixture
-            .reader(file.clone())
-            .metadata()
-            .await
-            .expect("footer");
-        assert!(metadata.offset_index().is_some());
-        let column_index = metadata.column_index().expect("an explicit column index");
-        assert!(
-            column_index
-                .iter()
-                .flatten()
-                .all(|index| matches!(index, ColumnIndexMetaData::NONE)),
-            "{column_index:?}"
-        );
+        let recording = Arc::new(RecordingStore::new(Arc::clone(&memory), false));
+        let fixture = Fixture::new(Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>);
+        let file = fixture.put_file(&memory, KEY, Bytes::from(bytes), false).await;
+        for policy in [
+            PageIndexPolicy::Skip,
+            PageIndexPolicy::Optional,
+            PageIndexPolicy::Required,
+        ] {
+            let options = ArrowReaderOptions::new().with_page_index_policy(policy);
+            let mut reader = fixture.reader(file.clone());
+            let metadata = reader.get_metadata(Some(&options)).await.expect("footer");
+            assert!(metadata.column_index().is_none(), "{policy:?}");
+            assert!(metadata.offset_index().is_none(), "{policy:?}");
+        }
 
         let chunks = fixture.column_chunk_bytes(&[&file]).await;
-        let fixture = Fixture::new(Arc::clone(&memory) as Arc<dyn ObjectStoreBackend>);
+        let footer = u64::from(file.footer_len) + TRAILER_LEN;
+        let before = recording.ranges().len();
+        let fixture = Fixture::new(Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>);
         let accounting = PhaseAccounting::new();
         let table = fixture
             .provider_with("t", 1, vec![file], false, accounting.clone())
@@ -1602,17 +1516,30 @@ mod tests {
         let ctx = fixture.session(&[("t", table)]);
         let rows = read_where(&ctx, "t", &["a", "b"], Some(page_pruning_filter())).await;
         assert_eq!(rows.expect("rows"), "5|five,6|sixx");
-        let scan = accounting.snapshot();
+        let snapshot = accounting.snapshot();
         assert_eq!(
-            scan.phase(QueryPhase::Scan).s3_bytes(AccountedOp::Get),
+            snapshot.phase(QueryPhase::Probe).s3_bytes(AccountedOp::Get),
+            footer
+        );
+        assert_eq!(
+            snapshot.phase(QueryPhase::Scan).s3_bytes(AccountedOp::Get),
             chunks
+        );
+        let ranges = recording.ranges().split_off(before);
+        assert_eq!(ranges.len(), 3, "the footer and two column chunks: {ranges:?}");
+        assert!(
+            ranges.iter().all(|range| match *range {
+                GetRange::Range(start, end) =>
+                    end <= page_index.start as u64 || start >= page_index.end as u64,
+                _ => false,
+            }),
+            "{ranges:?} against the page index at {page_index:?}"
         );
     }
 
     /// A footer read that comes back short fails as `Corrupt` but is not
     /// cached as refused: it says nothing about the pinned bytes, and the next
-    /// read of the same file succeeds. The same holds for the page index read
-    /// that follows a footer read.
+    /// read of the same file succeeds.
     #[tokio::test]
     async fn a_short_read_is_not_cached_as_refused() {
         let memory = Arc::new(MemoryStore::new());
@@ -1634,33 +1561,7 @@ mod tests {
             .await
             .expect("the next read is not refused from the cache");
         assert_eq!(metadata.file_metadata().num_rows(), 3);
-        assert_eq!(recording.ranges().len(), 3, "footer twice, page index once");
-
-        let memory = Arc::new(MemoryStore::new());
-        let recording = Arc::new(RecordingStore::new(Arc::clone(&memory), false));
-        let fixture = Fixture::new(Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>);
-        let page_index = page_index_region(&valid()).len();
-        let file = fixture
-            .put_file(&memory, KEY, Bytes::from(valid()), false)
-            .await;
-
-        recording.shorten_read(2);
-        assert_corrupt(
-            fixture.reader(file.clone()).metadata().await,
-            &format!("returned {} bytes", page_index - 1),
-        );
-        assert_eq!(recording.ranges().len(), 2, "footer, then the page index");
-        let metadata = fixture
-            .reader(file)
-            .metadata()
-            .await
-            .expect("the next read is not refused from the cache");
-        assert!(metadata.offset_index().is_some());
-        assert_eq!(
-            recording.ranges().len(),
-            3,
-            "the page index again, the footer from the byte cache"
-        );
+        assert_eq!(recording.ranges().len(), 2, "the footer twice");
     }
 
     /// Two tables of one tenant over the same pinned file, one recording its
@@ -1715,13 +1616,15 @@ mod tests {
         assert_eq!(outcomes(true).await, right_first);
     }
 
-    /// [`any_mutation`] with half the weight on the page index, which a
-    /// filtered scan prunes pages with and which is a small part of the file.
+    /// A one-byte change inside the page index, which is a small part of the
+    /// file.
+    fn page_index_mutation() -> impl Strategy<Value = Mutation> {
+        (any::<Index>(), 1..=u8::MAX).prop_map(|(at, mask)| Mutation::FlipPageIndex(at, mask))
+    }
+
+    /// [`any_mutation`] with half the weight on the page index.
     fn filtered_scan_mutation() -> impl Strategy<Value = Mutation> {
-        prop_oneof![
-            any_mutation(),
-            (any::<Index>(), 1..=u8::MAX).prop_map(|(at, mask)| Mutation::FlipPageIndex(at, mask)),
-        ]
+        prop_oneof![any_mutation(), page_index_mutation()]
     }
 
     proptest! {
@@ -1740,9 +1643,19 @@ mod tests {
             );
         }
 
+        /// A byte change inside the page index leaves a filtered scan's rows
+        /// exactly the intact file's: the reader never reads those bytes.
+        #[test]
+        fn a_page_index_byte_change_leaves_a_filtered_scan_exact(
+            mutation in page_index_mutation(),
+        ) {
+            let got = scan_second_file_where(mutation.apply(&valid()), Some(page_pruning_filter()));
+            prop_assert_eq!(got.expect("rows"), "5|five,6|sixx");
+        }
+
         /// [`any_byte_change_is_an_error_or_rows_never_a_panic`] for a
-        /// filtered scan, which prunes pages with the page index, with half
-        /// the cases changing a byte of that index.
+        /// filtered scan, with half the cases changing a byte of the page
+        /// index.
         #[test]
         fn any_byte_change_under_a_filtered_scan_is_an_error_or_rows_never_a_panic(
             mutation in filtered_scan_mutation(),

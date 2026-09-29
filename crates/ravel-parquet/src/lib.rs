@@ -6,7 +6,8 @@
 //! - [`PinnedParquetReader`], an `AsyncFileReader` for one manifest file that
 //!   reads through the process-wide `GetLimiter` and `ReadCache`, pins every
 //!   read to the manifest's ETag and version, and charges the footer read to
-//!   the Probe phase and every other read to the Scan phase;
+//!   the Probe phase and every other read to the Scan phase; it does not use
+//!   the file's page index;
 //!   [`PinnedReaderFactory`] builds one per file DataFusion opens;
 //! - [`MetadataCache`], a decoded-footer cache owned by Ravel, bounded in
 //!   bytes, keyed by tenant hash and pinned identity, held outside any

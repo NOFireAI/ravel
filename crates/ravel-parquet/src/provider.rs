@@ -214,6 +214,9 @@ impl ParquetTableProvider {
         let mut parquet_options = TableParquetOptions::default();
         parquet_options.global.binary_as_string = options.binary_as_string;
         parquet_options.global.pushdown_filters = true;
+        // Without it the opener never builds a page pruning predicate, so it
+        // never asks the reader for a page index to prune with.
+        parquet_options.global.enable_page_index = false;
         // DataFusion's own schema inference clears the schema's metadata and
         // each top-level field's, then applies these two rewrites in this
         // order.
@@ -507,10 +510,6 @@ impl TableProvider for RawParquetScan {
             }
             None => None,
         };
-        // Every reader hands DataFusion a footer whose page index it has
-        // already loaded and checked, so page pruning, whether from this
-        // predicate or from a dynamic filter pushed in after planning, never
-        // loads an unchecked one.
         let mut source = ParquetSource::new(Arc::clone(&self.schema))
             .with_table_parquet_options(self.options.clone())
             .with_parquet_file_reader_factory(Arc::clone(&self.factory) as _)
@@ -551,8 +550,8 @@ mod tests {
     use ravel_query::QueryPhase;
     use ravel_types::accounting::AccountedOp;
 
-    /// Each file's footer and page index are one Probe read each; the column
-    /// chunks are Scan reads.
+    /// Each file's footer is one Probe read and its page index is never read;
+    /// the column chunks are Scan reads.
     #[tokio::test]
     async fn reads_exact_rows_with_footer_charged_to_probe_and_chunks_to_scan() {
         let store = Arc::new(MemoryStore::new());
@@ -574,7 +573,6 @@ mod tests {
             )
             .await;
         let footers: u64 = [&a, &b].iter().map(|f| u64::from(f.footer_len) + 8).sum();
-        let page_indexes = fixture.page_index_bytes(&a).await + fixture.page_index_bytes(&b).await;
         let chunks = fixture.column_chunk_bytes(&[&a, &b]).await;
         let (a_entry, b_entry) = (
             fixture.decoded_footer_bytes(&a).await,
@@ -592,11 +590,11 @@ mod tests {
         let snapshot = accounting.snapshot();
         let probe = snapshot.phase(QueryPhase::Probe);
         let scan = snapshot.phase(QueryPhase::Scan);
-        assert_eq!(probe.s3_bytes(AccountedOp::Get), footers + page_indexes);
+        assert_eq!(probe.s3_bytes(AccountedOp::Get), footers);
         assert_eq!(
             probe.s3_requests(AccountedOp::Get),
-            4,
-            "a footer and a page index per file"
+            2,
+            "one footer read per file"
         );
         assert_eq!(
             probe.cache_hits, 1,
@@ -619,10 +617,10 @@ mod tests {
         let probe = second.phase(QueryPhase::Probe);
         assert_eq!(
             probe.s3_requests(AccountedOp::Get),
-            4,
+            2,
             "a second read issues no Probe GET"
         );
-        assert_eq!(probe.s3_bytes(AccountedOp::Get), footers + page_indexes);
+        assert_eq!(probe.s3_bytes(AccountedOp::Get), footers);
         assert_eq!(probe.cache_hits, 3, "one metadata cache hit per file");
         assert_eq!(probe.cache_bytes, 2 * a_entry + b_entry);
         assert_eq!(
@@ -736,9 +734,10 @@ mod tests {
         assert_eq!(rows, expected);
     }
 
-    /// ADR-2040 D6: the scan evaluates pushed-down filters inside the reader.
+    /// ADR-2040 D6: the scan evaluates pushed-down filters inside the reader,
+    /// and does not prune pages with a page index.
     #[tokio::test]
-    async fn the_scan_evaluates_filters_inside_the_reader() {
+    async fn the_scan_evaluates_filters_inside_the_reader_without_a_page_index() {
         let store = Arc::new(MemoryStore::new());
         let fixture = Fixture::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>);
         let file = fixture
@@ -763,6 +762,7 @@ mod tests {
             .downcast_to_file_source::<ParquetSource>()
             .expect("a Parquet file source");
         assert!(source.table_parquet_options().global.pushdown_filters);
+        assert!(!source.table_parquet_options().global.enable_page_index);
         assert!(datafusion::datasource::physical_plan::FileSource::filter(source).is_some());
     }
 

@@ -1186,8 +1186,8 @@ impl SqlExecutor {
     /// a different question than the one asked); no segment is fetched,
     /// because nothing polls a stream. A Parquet table's provider is built
     /// from its first file's footer, so explaining a statement over Parquet
-    /// tables reads that footer and its page index (Probe GETs on the external
-    /// store, unless the metadata cache holds them), and no column chunk.
+    /// tables reads that footer (a Probe GET on the external store, unless the
+    /// metadata cache holds it), and no column chunk.
     ///
     /// The returned schema is the effective one, declared typed columns
     /// (ADR-0090) included, because those widen the `logs` table and a caller

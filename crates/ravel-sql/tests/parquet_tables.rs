@@ -264,7 +264,7 @@ fn rows(outcome: &SqlOutcome) -> Vec<String> {
 
 /// The reachability test at the executor: a filtered SELECT over a
 /// three-file table returns the exact rows, reads the manifest and grants in
-/// the Resolve phase, footers and page indexes in Probe, and data in Scan.
+/// the Resolve phase, footers in Probe, and data in Scan.
 #[tokio::test]
 async fn a_parquet_table_answers_a_filtered_select_with_its_reads_split_by_phase() {
     let lake = Lake::configured();
@@ -290,8 +290,8 @@ async fn a_parquet_table_answers_a_filtered_select_with_its_reads_split_by_phase
     let probe = phases.phase(QueryPhase::Probe);
     assert_eq!(
         probe.s3_requests(AccountedOp::Get),
-        6,
-        "a footer and a page index for each of three files"
+        3,
+        "a footer for each of three files and no page index"
     );
     assert_eq!(
         probe.cache_hits, 1,

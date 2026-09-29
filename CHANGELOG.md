@@ -1080,20 +1080,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   URL-shaped table is refused before any store read. The reader evaluates
   filters in the scan; an exact-typed statement scans in up to
   `target_partitions` file groups with file-scan repartitioning on, any other
-  in one group in manifest order. Every reader loads and checks a file's page
-  index with its footer, whatever the statement filters, so a page outside its
-  column chunk is a `Corrupt` error rather than a panic, including when a join
-  or TopK pushes a dynamic filter into the scan. A page location that starts
-  before the previous page's end, or a first location other than the chunk's
-  first data page, is `Corrupt` too: the scan reads every page from its
-  location, so either would otherwise decode the wrong bytes without an
-  error. Decoded footers and refusals are cached per pinned file and footer
-  length the manifest recorded. A refusal is cached: a footer length the file
-  cannot hold, a trailer or footer that does not decode or disagrees with the
-  manifest, and a page index the parquet crate's loader or the checks above
-  refuse. A read that failed is not cached, whatever it failed on: a store
-  error, a read that came back short, and a page index range past the recorded
-  size, which fails as `Corrupt` without being cached.
+  in one group in manifest order. The reader does not use a file's page
+  index: it hands the scan a footer with no column index or offset index, and
+  the scan runs with DataFusion's `enable_page_index` off, so every column
+  chunk is decoded by page header and a corrupt offset index changes no row,
+  including when a join or TopK pushes a dynamic filter into the scan.
+  Row-group statistics pruning and `pushdown_filters` are unchanged; there is
+  no page-level pruning. Decoded footers and refusals are cached per pinned
+  file and footer length the manifest recorded. A refusal is cached: a footer
+  length the file cannot hold, and a trailer or footer that does not decode or
+  disagrees with the manifest. A read that failed is not cached, whatever it
+  failed on: a store error or a read that came back short.
   `tenant parquet-grant add` lists past a zero-byte directory blob, and says so
   when its search for an object stopped at the listing page bound.
 

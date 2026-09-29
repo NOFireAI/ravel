@@ -21,7 +21,7 @@ use datafusion::logical_expr::{Expr, ident};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_datasource_parquet::source::ParquetSource;
 use parquet::arrow::ArrowWriter;
-use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
+use parquet::file::metadata::ParquetMetaDataReader;
 use parquet::file::properties::WriterProperties;
 use ravel_cache::{Cache, CacheLimits};
 use ravel_object_store::memory::MemoryStore;
@@ -348,9 +348,9 @@ impl Fixture {
         total
     }
 
-    /// [`ParquetMetaData::memory_size`] of `file`'s footer and page index
-    /// decoded from the stored bytes, the size its metadata cache entry is
-    /// charged.
+    /// [`ParquetMetaData::memory_size`] of `file`'s footer, without its page
+    /// index, decoded from the stored bytes: the size its metadata cache entry
+    /// is charged.
     ///
     /// [`ParquetMetaData::memory_size`]: parquet::file::metadata::ParquetMetaData::memory_size
     pub(crate) async fn decoded_footer_bytes(&self, file: &ParquetFile) -> u64 {
@@ -361,44 +361,10 @@ impl Fixture {
             .await
             .expect("get")
             .data;
-        ParquetMetaDataReader::new()
-            .with_page_index_policy(PageIndexPolicy::Optional)
-            .parse_and_finish(&bytes)
-            .expect("footer and page index")
-            .memory_size() as u64
-    }
-
-    /// Length of `file`'s page index, from its first column index to the end
-    /// of its last offset index: the one read the reader loads it with.
-    pub(crate) async fn page_index_bytes(&self, file: &ParquetFile) -> u64 {
-        let key = String::from_utf8(file.key.clone()).expect("ascii key");
-        let bytes = self
-            .store
-            .get(&key, GetRange::Full)
-            .await
-            .expect("get")
-            .data;
         let end = bytes.len() - 8;
-        let footer = &bytes[end - file.footer_len as usize..end];
-        let metadata = ParquetMetaDataReader::decode_metadata(footer).expect("footer");
-        let chunks: Vec<_> = metadata
-            .row_groups()
-            .iter()
-            .flat_map(|group| group.columns())
-            .collect();
-        let start = chunks
-            .iter()
-            .filter_map(|chunk| chunk.column_index_offset())
-            .min()
-            .expect("ArrowWriter writes a column index");
-        let end = chunks
-            .iter()
-            .filter_map(|chunk| {
-                Some(chunk.offset_index_offset()? + i64::from(chunk.offset_index_length()?))
-            })
-            .max()
-            .expect("ArrowWriter writes an offset index");
-        (end - start) as u64
+        ParquetMetaDataReader::decode_metadata(&bytes[end - file.footer_len as usize..end])
+            .expect("footer")
+            .memory_size() as u64
     }
 
     pub(crate) fn session(&self, tables: &[(&str, Arc<ParquetTableProvider>)]) -> SessionContext {
