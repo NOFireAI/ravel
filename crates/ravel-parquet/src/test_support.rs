@@ -4,6 +4,7 @@
 #![allow(clippy::expect_used)]
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
@@ -20,7 +21,7 @@ use datafusion::logical_expr::{Expr, ident};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_datasource_parquet::source::ParquetSource;
 use parquet::arrow::ArrowWriter;
-use parquet::file::metadata::ParquetMetaDataReader;
+use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
 use parquet::file::properties::WriterProperties;
 use ravel_cache::{Cache, CacheLimits};
 use ravel_object_store::memory::MemoryStore;
@@ -347,8 +348,9 @@ impl Fixture {
         total
     }
 
-    /// [`ParquetMetaData::memory_size`] of `file`'s footer decoded from the
-    /// stored bytes, the size its metadata cache entry is charged.
+    /// [`ParquetMetaData::memory_size`] of `file`'s footer and page index
+    /// decoded from the stored bytes, the size its metadata cache entry is
+    /// charged.
     ///
     /// [`ParquetMetaData::memory_size`]: parquet::file::metadata::ParquetMetaData::memory_size
     pub(crate) async fn decoded_footer_bytes(&self, file: &ParquetFile) -> u64 {
@@ -359,11 +361,44 @@ impl Fixture {
             .await
             .expect("get")
             .data;
+        ParquetMetaDataReader::new()
+            .with_page_index_policy(PageIndexPolicy::Optional)
+            .parse_and_finish(&bytes)
+            .expect("footer and page index")
+            .memory_size() as u64
+    }
+
+    /// Length of `file`'s page index, from its first column index to the end
+    /// of its last offset index: the one read the reader loads it with.
+    pub(crate) async fn page_index_bytes(&self, file: &ParquetFile) -> u64 {
+        let key = String::from_utf8(file.key.clone()).expect("ascii key");
+        let bytes = self
+            .store
+            .get(&key, GetRange::Full)
+            .await
+            .expect("get")
+            .data;
         let end = bytes.len() - 8;
         let footer = &bytes[end - file.footer_len as usize..end];
-        ParquetMetaDataReader::decode_metadata(footer)
-            .expect("footer")
-            .memory_size() as u64
+        let metadata = ParquetMetaDataReader::decode_metadata(footer).expect("footer");
+        let chunks: Vec<_> = metadata
+            .row_groups()
+            .iter()
+            .flat_map(|group| group.columns())
+            .collect();
+        let start = chunks
+            .iter()
+            .filter_map(|chunk| chunk.column_index_offset())
+            .min()
+            .expect("ArrowWriter writes a column index");
+        let end = chunks
+            .iter()
+            .filter_map(|chunk| {
+                Some(chunk.offset_index_offset()? + i64::from(chunk.offset_index_length()?))
+            })
+            .max()
+            .expect("ArrowWriter writes an offset index");
+        (end - start) as u64
     }
 
     pub(crate) fn session(&self, tables: &[(&str, Arc<ParquetTableProvider>)]) -> SessionContext {
@@ -438,8 +473,13 @@ pub(crate) async fn read_where(
         .sort(vec![ident(columns[0]).sort(true, false)])?
         .collect()
         .await?;
+    render_rows(&batches)
+}
+
+/// `batches` rendered as `v|v,v|v`, in their order.
+pub(crate) fn render_rows(batches: &[RecordBatch]) -> DfResult<String> {
     let mut rows = Vec::new();
-    for batch in &batches {
+    for batch in batches {
         for row in 0..batch.num_rows() {
             let cells = (0..batch.num_columns())
                 .map(|c| array_value_to_string(batch.column(c), row))
@@ -507,6 +547,7 @@ pub(crate) struct RecordingStore {
     inner: Arc<MemoryStore>,
     suffix_range: bool,
     ranges: Mutex<Vec<GetRange>>,
+    short_next: AtomicBool,
 }
 
 impl RecordingStore {
@@ -515,7 +556,14 @@ impl RecordingStore {
             inner,
             suffix_range,
             ranges: Mutex::new(Vec::new()),
+            short_next: AtomicBool::new(false),
         }
+    }
+
+    /// Return the next pinned read one byte short, as a store dropping the
+    /// end of a body would.
+    pub(crate) fn shorten_next_read(&self) {
+        self.short_next.store(true, Ordering::SeqCst);
     }
 
     pub(crate) fn ranges(&self) -> Vec<GetRange> {
@@ -556,7 +604,12 @@ impl ObjectStoreBackend for RecordingStore {
         pin: &Pin,
     ) -> Result<PinnedRead, StoreError> {
         self.record(&range);
-        self.inner.get_pinned(key, range, pin).await
+        let mut read = self.inner.get_pinned(key, range, pin).await?;
+        if self.short_next.swap(false, Ordering::SeqCst) {
+            let data = &mut read.outcome.data;
+            *data = data.slice(..data.len().saturating_sub(1));
+        }
+        Ok(read)
     }
 
     async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {

@@ -507,16 +507,13 @@ impl TableProvider for RawParquetScan {
             }
             None => None,
         };
-        // A predicate is what makes DataFusion load the page index for page
-        // pruning, so only a filtered scan's readers load and check it first.
-        let factory = self
-            .factory
-            .as_ref()
-            .clone()
-            .with_page_index(predicate.is_some());
+        // Every reader hands DataFusion a footer whose page index it has
+        // already loaded and checked, so page pruning, whether from this
+        // predicate or from a dynamic filter pushed in after planning, never
+        // loads an unchecked one.
         let mut source = ParquetSource::new(Arc::clone(&self.schema))
             .with_table_parquet_options(self.options.clone())
-            .with_parquet_file_reader_factory(Arc::new(factory) as _)
+            .with_parquet_file_reader_factory(Arc::clone(&self.factory) as _)
             .with_pushdown_filters(self.options.global.pushdown_filters);
         if let Some(predicate) = predicate {
             source = source.with_predicate(predicate);
@@ -554,6 +551,8 @@ mod tests {
     use ravel_query::QueryPhase;
     use ravel_types::accounting::AccountedOp;
 
+    /// Each file's footer and page index are one Probe read each; the column
+    /// chunks are Scan reads.
     #[tokio::test]
     async fn reads_exact_rows_with_footer_charged_to_probe_and_chunks_to_scan() {
         let store = Arc::new(MemoryStore::new());
@@ -575,6 +574,7 @@ mod tests {
             )
             .await;
         let footers: u64 = [&a, &b].iter().map(|f| u64::from(f.footer_len) + 8).sum();
+        let page_indexes = fixture.page_index_bytes(&a).await + fixture.page_index_bytes(&b).await;
         let chunks = fixture.column_chunk_bytes(&[&a, &b]).await;
         let (a_entry, b_entry) = (
             fixture.decoded_footer_bytes(&a).await,
@@ -592,8 +592,12 @@ mod tests {
         let snapshot = accounting.snapshot();
         let probe = snapshot.phase(QueryPhase::Probe);
         let scan = snapshot.phase(QueryPhase::Scan);
-        assert_eq!(probe.s3_bytes(AccountedOp::Get), footers);
-        assert_eq!(probe.s3_requests(AccountedOp::Get), 2);
+        assert_eq!(probe.s3_bytes(AccountedOp::Get), footers + page_indexes);
+        assert_eq!(
+            probe.s3_requests(AccountedOp::Get),
+            4,
+            "a footer and a page index per file"
+        );
         assert_eq!(
             probe.cache_hits, 1,
             "the scan finds a's footer decoded when the table was built"
@@ -615,10 +619,10 @@ mod tests {
         let probe = second.phase(QueryPhase::Probe);
         assert_eq!(
             probe.s3_requests(AccountedOp::Get),
-            2,
+            4,
             "a second read issues no Probe GET"
         );
-        assert_eq!(probe.s3_bytes(AccountedOp::Get), footers);
+        assert_eq!(probe.s3_bytes(AccountedOp::Get), footers + page_indexes);
         assert_eq!(probe.cache_hits, 3, "one metadata cache hit per file");
         assert_eq!(probe.cache_bytes, 2 * a_entry + b_entry);
         assert_eq!(

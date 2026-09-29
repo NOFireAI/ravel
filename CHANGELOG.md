@@ -1069,9 +1069,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   URL-shaped table is refused before any store read. The reader evaluates
   filters in the scan; an exact-typed statement scans in up to
   `target_partitions` file groups with file-scan repartitioning on, any other
-  in one group in manifest order. A filtered scan's reader loads and checks the
-  page index first, so a page outside its column chunk is a `Corrupt` error
-  rather than a panic, and a footer refused as `Corrupt` is cached as refused.
+  in one group in manifest order. Every reader loads and checks a file's page
+  index with its footer, whatever the statement filters, so a page outside its
+  column chunk is a `Corrupt` error rather than a panic, including when a join
+  or TopK pushes a dynamic filter into the scan. A footer or page index refused
+  as `Corrupt` is cached as refused; a read that failed, or came back short, is
+  not.
   `tenant parquet-grant add` lists past a zero-byte directory blob, and says so
   when its search for an object stopped at the listing page bound.
 
