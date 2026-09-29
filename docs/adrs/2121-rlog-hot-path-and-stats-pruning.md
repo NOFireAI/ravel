@@ -2,7 +2,7 @@
 
 - Status: Accepted (2026-09-29); implementation tracked on epic #2121
 - Date: 2026-09-29
-- Refs: #2121, #2066, #2086, #2130, #2135, ADR-0087, ADR-0090, ADR-0093, ADR-0094, ADR-0099, ADR-0850, ADR-0873, ADR-1413, ADR-2023, ADR-2066
+- Refs: #2121, #2066, #2086, #2130, #2135, #2159, ADR-0087, ADR-0090, ADR-0093, ADR-0094, ADR-0099, ADR-0850, ADR-0873, ADR-1413, ADR-2023, ADR-2066, ADR-2135
 
 ## Context
 
@@ -257,7 +257,7 @@ The 0.2-0.46 s per-statement floor is latency, and its cause is a hypothesis.
 - **D1** touches `ravel-sql` (logs provider and scan) and can start at once.
 - **D2 and D3** sit in `ravel-sql/src/logs_scan.rs` and consume the
   reader's decoded page view. They wait for D1, which also touches
-  `logs_scan.rs`. Epic #2135 (RLOG v5; its ADR is not yet on main) adds
+  `logs_scan.rs`. Epic #2135 (RLOG v5, ADR-2135, Proposed) adds
   object-level string dictionaries and new integer encodings behind that
   view. So before D2
   dispatches, it is re-checked against whatever view is on main then. If
