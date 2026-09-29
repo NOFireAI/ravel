@@ -190,6 +190,28 @@ fn truncated_object_prints_typed_error_not_panic() {
     );
 }
 
+/// The printed `version:` is the one the object's own trailer carries (bytes
+/// 8..10 of the 16-byte trailer, little-endian), read off the unpatched object.
+#[test]
+fn rlog_inspect_prints_the_trailer_version() {
+    let bytes = build_object();
+    let at = bytes.len() - 16 + 8;
+    let trailer_version = u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+
+    let path = temp_path("trailer-version");
+    std::fs::write(&path, &bytes).expect("writes object");
+    let output = run_inspect(&path);
+    let _ = std::fs::remove_file(&path);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+    let printed: Vec<&str> = stdout
+        .lines()
+        .filter_map(|l| l.strip_prefix("version: "))
+        .collect();
+    assert_eq!(printed, vec![trailer_version.to_string().as_str()]);
+}
+
 /// Regenerates `tests/fixtures/rlog_inspect.txt` after a deliberate, versioned
 /// format change (never for an internal refactor). Run explicitly:
 ///   cargo test -p ravel-cli --test rlog_inspect -- --ignored capture

@@ -19,6 +19,7 @@ pub mod parquet_grant;
 pub mod provision;
 pub mod qualify;
 pub mod reconstruct;
+pub mod rlog_footprint;
 pub mod store;
 pub mod tenancy;
 pub mod tenant_token;
