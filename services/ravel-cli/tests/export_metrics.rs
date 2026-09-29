@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
@@ -28,13 +28,16 @@ use ravel_cli::export::{self, MetricsExportReport};
 use ravel_cli::load::{self, MetricsMapping};
 use ravel_cli::maintain::SignalArg;
 use ravel_cli::store::{StoreKind, StoreSelection};
-use ravel_ingest::{Clock, SystemClock};
+use ravel_ingest::{
+    Clock, IngestConfig, IngestPoint, IngestRouter, IngestValue, SystemClock, WriteMode,
+};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::instrument::{InstrumentedStore, StoreMetricsSnapshot};
 use ravel_object_store::memory::MemoryStore;
 use ravel_query::SegmentFetcher;
 use ravel_query::http::{AppState, StaticBearerTokenResolver, router};
 use ravel_query::{EngineConfig, QueryEngine};
+use ravel_segment::{HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, ResetHint};
 use ravel_types::{LabelSet, METRIC_NAME_LABEL, SeriesId, Signal, TenantId, TimeRange};
 use serde_json::Value;
 use tower::ServiceExt;
@@ -650,6 +653,8 @@ async fn served_value(app: &Router, query: &str, at_ns: i64) -> f64 {
 /// Two loads of the same `(series, ts)` export as one row, whether the two
 /// samples carry the same bits or different ones, and the row carries the
 /// bits the query path serves: the later write, under the provenance order.
+/// The later write carries the smaller value, so a winner chosen by value
+/// bits rather than provenance exports the earlier one.
 #[tokio::test]
 async fn duplicate_samples_export_as_the_one_the_query_path_serves() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -666,7 +671,7 @@ async fn duplicate_samples_export_as_the_one_the_query_path_serves() {
         &mapping,
         &[
             ("cpu", same_ts, 1.5, "api", "h1"),
-            ("cpu", differing_ts, 2.5, "api", "h1"),
+            ("cpu", differing_ts, 3.5, "api", "h1"),
         ],
         now,
         Arc::new(SystemClock),
@@ -679,7 +684,7 @@ async fn duplicate_samples_export_as_the_one_the_query_path_serves() {
         &mapping,
         &[
             ("cpu", same_ts, 1.5, "api", "h1"),
-            ("cpu", differing_ts, 3.5, "api", "h1"),
+            ("cpu", differing_ts, 2.5, "api", "h1"),
         ],
         now + 1,
         Arc::new(SystemClock),
@@ -708,12 +713,12 @@ async fn duplicate_samples_export_as_the_one_the_query_path_serves() {
     assert_eq!(i64_values(&batch, "ts"), vec![same_ts, differing_ts]);
     assert_eq!(
         f64_bits(&batch, "value"),
-        vec![1.5f64.to_bits(), 3.5f64.to_bits()],
-        "identical duplicates collapse, and the later write wins a differing pair"
+        vec![1.5f64.to_bits(), 2.5f64.to_bits()],
+        "identical duplicates collapse, and the later, smaller write wins a differing pair"
     );
 
     let app = query_app(Arc::clone(&store), &TenantId::new("alpha"));
-    for (ts, exported) in [(same_ts, 1.5f64), (differing_ts, 3.5f64)] {
+    for (ts, exported) in [(same_ts, 1.5f64), (differing_ts, 2.5f64)] {
         assert_eq!(
             served_value(&app, "cpu_seconds", ts).await.to_bits(),
             exported.to_bits(),
@@ -990,4 +995,224 @@ column = "host_col"
             T0 + 1
         )
     );
+}
+
+/// Under `ts_unit = "millis"` the export writes each timestamp in
+/// milliseconds, and the re-load lands every sample on its stored ns time.
+#[tokio::test]
+async fn a_millis_mapping_writes_millisecond_timestamps_and_round_trips() {
+    const MILLIS_MAPPING: &str = r#"
+[metrics]
+name_column = "name"
+value_column = "value"
+ts_column = "ts"
+ts_unit = "millis"
+
+[[metrics.label]]
+name = "job"
+column = "job_col"
+
+[[metrics.label]]
+name = "host"
+column = "host_col"
+"#;
+    const MS: i64 = 1_000_000;
+    let rows: [SourceRow<'_>; 3] = [
+        ("cpu", T2 / MS, 3.0, "api", "h1"),
+        ("cpu", T0 / MS, 1.0, "api", "h1"),
+        ("cpu", (T1 + 7 * MS) / MS, 2.0, "api", "h1"),
+    ];
+    let (report, batch) = round_trip(MILLIS_MAPPING, &rows).await;
+
+    assert_eq!(report.rows_written, 3);
+    assert_eq!(
+        i64_values(&batch, "ts"),
+        vec![T0 / MS, (T1 + 7 * MS) / MS, T2 / MS],
+        "each ts is the stored ns time in milliseconds"
+    );
+    assert_eq!(
+        f64_bits(&batch, "value"),
+        vec![1.0f64.to_bits(), 2.0f64.to_bits(), 3.0f64.to_bits()]
+    );
+}
+
+/// A raw name that fits the 512-byte metric-name cap but whose stored name,
+/// with the unit suffix and `_total` a load appended, does not: the export
+/// writes the name less both suffixes, which a load with the same mapping
+/// accepts and suffixes back onto the stored name.
+#[tokio::test]
+async fn a_counter_name_suffixed_past_the_length_cap_round_trips() {
+    const COUNTER_MAPPING: &str = r#"
+[metrics]
+name_column = "name"
+value_column = "value"
+ts_column = "ts"
+ts_unit = "nanos"
+unit = "s"
+kind = "counter"
+
+[[metrics.label]]
+name = "job"
+column = "job_col"
+
+[[metrics.label]]
+name = "host"
+column = "host_col"
+"#;
+    let raw = "n".repeat(510);
+    let rows: [SourceRow<'_>; 2] = [
+        (raw.as_str(), T0, 1.0, "api", "h1"),
+        (raw.as_str(), T1, 2.0, "api", "h1"),
+    ];
+    let (report, batch) = round_trip(COUNTER_MAPPING, &rows).await;
+
+    assert_eq!(report.series_written, 1);
+    assert_eq!(
+        str_values(&batch, "name"),
+        some(&[raw.as_str(), raw.as_str()]),
+        "the stored {raw}_seconds_total is 524 bytes, so the name is written less both suffixes"
+    );
+}
+
+/// The gauge form of the case above: the stored name carries only the unit
+/// suffix, and the export writes it less that suffix.
+#[tokio::test]
+async fn a_gauge_name_suffixed_past_the_length_cap_round_trips() {
+    let raw = "g".repeat(510);
+    let rows: [SourceRow<'_>; 1] = [(raw.as_str(), T0, 1.0, "api", "h1")];
+    let (report, batch) = round_trip(GAUGE_MAPPING, &rows).await;
+
+    assert_eq!(report.series_written, 1);
+    assert_eq!(
+        str_values(&batch, "name"),
+        some(&[raw.as_str()]),
+        "the stored {raw}_seconds is 518 bytes, so the name is written less the unit suffix"
+    );
+}
+
+/// A mapping that writes two fields to one output column is refused before
+/// any object-store request.
+#[tokio::test]
+async fn a_shared_output_column_is_refused_before_any_store_request() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let instrumented = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+    let metrics = instrumented.metrics();
+    let store: Arc<dyn ObjectStoreBackend> = instrumented;
+    let mapping = metrics_mapping(
+        r#"
+[metrics]
+name_column = "name"
+value_column = "value"
+ts_column = "ts"
+ts_unit = "nanos"
+
+[[metrics.label]]
+name = "job"
+column = "value"
+"#,
+    );
+    let out = dir.path().join("out.parquet");
+    let err = export_window(&store, "alpha", T0, T1, &mapping, &out, LOAD_NS)
+        .await
+        .expect_err("a shared output column is refused");
+    assert_eq!(
+        err.to_string(),
+        "the mapping writes two different fields to the output column \"value\"; give each one \
+         its own column name"
+    );
+    assert_eq!(metrics.snapshot(), StoreMetricsSnapshot::default());
+    assert!(!out.exists(), "a refused export writes no file");
+}
+
+/// A native-histogram series with samples in the window refuses the whole
+/// export by name. Native histograms are refused at wire admission, so the
+/// sample is written through `IngestRouter::write_values` directly, as
+/// ravel-ingest's own histogram read-back test does.
+#[tokio::test]
+async fn a_native_histogram_series_in_the_window_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("alpha");
+    let labels = LabelSet::new(vec![
+        ravel_types::Label {
+            name: METRIC_NAME_LABEL.to_string(),
+            value: "req_latency".to_string(),
+        },
+        ravel_types::Label {
+            name: "job".to_string(),
+            value: "api".to_string(),
+        },
+    ])
+    .expect("label set");
+    let series_id = SeriesId::compute(&tenant, "req_latency", &labels).expect("series id");
+    let router = IngestRouter::new(
+        IngestConfig {
+            shard_count: 1,
+            target_bytes: 8,
+            max_flush_delay: Duration::from_secs(3600),
+            flush_tick: Duration::from_millis(20),
+            ..IngestConfig::default()
+        },
+        Arc::clone(&store),
+        Signal::Metrics,
+        Arc::new(FixedClock(LOAD_NS)),
+    );
+    router
+        .write_values(
+            tenant.clone(),
+            vec![IngestPoint {
+                series_id,
+                labels: Arc::new(labels),
+                value: IngestValue::Histogram(HistogramSample {
+                    ts_ns: T1,
+                    value: HistogramValue {
+                        scale: 2,
+                        zero_threshold: 1e-9,
+                        sum: Some(42.5),
+                        custom_values: None,
+                        positive_spans: vec![HistogramSpan {
+                            offset: 0,
+                            length: 3,
+                        }],
+                        negative_spans: vec![],
+                        counts: HistogramCounts::Int {
+                            zero_count: 1,
+                            count: 7,
+                            positive: vec![2, 3, 1],
+                            negative: vec![],
+                        },
+                        reset_hint: ResetHint::Yes,
+                    },
+                }),
+            }],
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("the histogram sample is written");
+    router.shutdown().await;
+
+    let out = dir.path().join("out.parquet");
+    let err = export_window(
+        &store,
+        "alpha",
+        T0,
+        T2,
+        &metrics_mapping(GAUGE_MAPPING),
+        &out,
+        LOAD_NS,
+    )
+    .await
+    .expect_err("a native-histogram series is refused");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "series req_latency{{job=\"api\"}} holds native (exponential) histogram samples in \
+             [{T0}, {T2}), which a [metrics] mapping cannot carry: native histograms are not \
+             mappable in this version, and an export that left them out would not round-trip \
+             the window. Export a window that holds none, or name one metric with a name \
+             literal."
+        )
+    );
+    assert!(!out.exists(), "a refused export writes no file");
 }

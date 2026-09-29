@@ -83,7 +83,9 @@
 //! load maps back onto the stored one: the stored name itself when the load
 //! leaves it unchanged (every suffix the load would add is already there),
 //! otherwise the stored name less its trailing `_total` (a counter with a
-//! unit, where the unit suffix sits before `_total`). The candidate is checked
+//! unit, where the unit suffix sits before `_total`), less its unit suffix, or
+//! less both (a name the suffixes took past the metric-name length cap, which
+//! the load applies to the name as written). Each candidate is checked
 //! by running the load's own naming rule over it, so an export never writes a
 //! name that re-loads onto a different series; a series no candidate
 //! reproduces is refused by name. A `name` literal mapping writes no name
@@ -110,7 +112,7 @@ use ravel_logseg::record::{attr_value_to_string, decode_stream_attrs};
 use ravel_logseg::{AttrValue, LogRecord, LogStreamId};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::IngestLimits;
-use ravel_otlp::normalize::{prometheus_family_name, sanitize_metric_name};
+use ravel_otlp::normalize::prometheus_family_name;
 use ravel_query::erasure::{
     retain_histogram_series, retain_series_soa, retain_unerased_log_records,
     snapshot_pending_erasure_predicates,
@@ -119,7 +121,7 @@ use ravel_query::{FetchedSeriesSoa, LogQuery, LogSegmentFetcher, SegmentFetcher}
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::{LabelSet, METRIC_NAME_LABEL, SeriesId, Signal, TenantHash, TenantId, TimeRange};
 
-use crate::load::{ColType, Mapping, MetricsMapping};
+use crate::load::{ColType, Mapping, MetricsMapping, normalized_family_name};
 use crate::maintain::SignalArg;
 use crate::store::{StoreSelection, require_tenant_data_present};
 
@@ -441,8 +443,10 @@ async fn resolve_snapshot(
 /// event time, carrying the columns the `[metrics]` section names.
 ///
 /// `shards`, `max_ingest_lag_ns` and `out` mean what they mean for
-/// [`export_logs`]. A mapping shape the export refuses, and an unusable
-/// `out`, are both refused before any object-store request.
+/// [`export_logs`]. A mapping shape the export refuses (a
+/// `[metrics.histogram]`, an unusable `name` literal, two fields sharing one
+/// output column), and an unusable `out`, are all refused before any
+/// object-store request.
 ///
 /// The whole export is refused, and nothing is written, when a series in the
 /// window cannot be written so that `load` with the same mapping lands it on
@@ -467,6 +471,7 @@ pub async fn export_metrics(
     if mapping.is_histogram() {
         anyhow::bail!(HISTOGRAM_MAPPING_REFUSAL);
     }
+    check_metrics_output_columns(mapping)?;
     let limits = IngestLimits::default();
     let literal_family_name = match &mapping.name {
         Some(literal) => Some(reloaded_family_name(literal, mapping, &limits).ok_or_else(
@@ -761,39 +766,37 @@ fn resolve_duplicates(mut samples: Vec<SampleCandidate>) -> (Vec<(i64, f64)>, u6
 }
 
 /// The family name `load` gives a row whose name cell is `raw` under
-/// `mapping`, or `None` where the load refuses the name: the same length cap,
-/// sanitizer and suffix pass the loader and the OTLP path apply.
+/// `mapping`, or `None` where the load refuses the name.
 fn reloaded_family_name(
     raw: &str,
     mapping: &MetricsMapping,
     limits: &IngestLimits,
 ) -> Option<String> {
-    if raw.len() > limits.max_metric_name_len {
-        return None;
-    }
-    let sanitized = sanitize_metric_name(raw);
-    if sanitized.is_empty() {
-        return None;
-    }
     let (kind, is_monotonic_sum) = mapping.metric_kind();
-    Some(prometheus_family_name(
-        &sanitized,
-        mapping.unit(),
-        kind,
-        is_monotonic_sum,
-    ))
+    normalized_family_name(raw, mapping, kind, is_monotonic_sum, limits).ok()
 }
 
 /// The `name_column` value that loads back as `stored` under `mapping`: the
-/// stored name itself, else the stored name less a trailing `_total`. Each
-/// candidate is checked against [`reloaded_family_name`], so `None` means no
-/// candidate reproduces the series.
+/// stored name itself, else the stored name less a trailing `_total`, less
+/// the mapping's unit suffix, or less both. The last two reach a name the
+/// suffixes took past the metric-name length cap. Each candidate is checked
+/// against [`reloaded_family_name`], so `None` means no candidate reproduces
+/// the series.
 fn written_metric_name(
     stored: &str,
     mapping: &MetricsMapping,
     limits: &IngestLimits,
 ) -> Option<String> {
-    [Some(stored), stored.strip_suffix("_total")]
+    let (kind, _) = mapping.metric_kind();
+    // The unit suffix as a load spells it after a name, `_seconds` for `s`.
+    let with_unit = prometheus_family_name("a", mapping.unit(), kind, false);
+    let unit_suffix = with_unit.strip_prefix('a').filter(|s| !s.is_empty());
+    let less_total = stored.strip_suffix("_total");
+    let less_unit = unit_suffix.and_then(|suffix| stored.strip_suffix(suffix));
+    let less_both = less_total
+        .zip(unit_suffix)
+        .and_then(|(name, suffix)| name.strip_suffix(suffix));
+    [Some(stored), less_total, less_unit, less_both]
         .into_iter()
         .flatten()
         .find(|candidate| {
@@ -879,6 +882,25 @@ fn describe_series(labels: &LabelSet) -> String {
     format!("{name}{{{}}}", rest.join(", "))
 }
 
+/// Refuses a mapping that writes two fields to one output column, the columns
+/// [`build_metrics_batch`] writes, before the export reads anything.
+fn check_metrics_output_columns(mapping: &MetricsMapping) -> anyhow::Result<()> {
+    let columns = std::iter::once(&mapping.ts_column)
+        .chain(&mapping.name_column)
+        .chain(std::iter::once(&mapping.value_column))
+        .chain(mapping.labels.iter().map(|label| &label.column));
+    let mut seen: HashSet<&str> = HashSet::new();
+    for name in columns {
+        if !seen.insert(name.as_str()) {
+            anyhow::bail!(
+                "the mapping writes two different fields to the output column {name:?}; give \
+                 each one its own column name"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Builds the output batch for `rows`: the `ts` column in the mapping's
 /// `ts_unit`, the `name_column` when the mapping has one, the `value` column,
 /// and one `Utf8` column per `[[metrics.label]]`, null where the series lacks
@@ -928,16 +950,6 @@ fn build_metrics_batch(
             );
         }
         columns.push((label.column.clone(), Arc::new(values.finish())));
-    }
-
-    let mut seen: HashSet<&str> = HashSet::new();
-    for (name, _) in &columns {
-        if !seen.insert(name.as_str()) {
-            anyhow::bail!(
-                "the mapping writes two different fields to the output column {name:?}; give \
-                 each one its own column name"
-            );
-        }
     }
 
     // Declared nullable explicitly, for the reason `build_batch` gives.

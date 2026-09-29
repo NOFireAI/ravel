@@ -553,6 +553,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`ravel-cli export --signal metrics` writes a tenant's stored metric
+  samples to a Parquet file `load --signal metrics` reads back onto the same
+  series** (ADR-1751 decision 4, issue #1712). It resolves the metrics catalog
+  once, fetches the RSEG objects through ravel-query's segment fetcher,
+  applies pending erasure predicates with the functions the query engine
+  calls, and writes the `[metrics]` mapping's columns sorted by event time.
+  Samples are deduplicated per series and timestamp to the one a query
+  serves: the greatest write provenance, then the greatest `f64::to_bits` of
+  the value. A `name_column` export writes each stored name, or the stored
+  name less `_total`, less the unit suffix, or less both, whichever a load
+  with the same mapping turns back into the stored name, and refuses by name
+  a series none reproduces, a series carrying a label the mapping does not
+  name, a native-histogram series, and a sample finer than `ts_unit`; a
+  `name` literal exports only the series it names. A `[metrics.histogram]`
+  mapping is refused with the scalar mapping to use instead. The report adds
+  `series_written`, `series_skipped` and `samples_deduplicated` to the logs
+  export's lines. `--signal spans` is still refused.
 - **`/metrics` renders the three writer clock-lag counters, and a shipped
   alert pages on a refused flush** (ADR-1685 follow-up task 3, issue #1685).
   `ravel_ingest_clock_lag_refused_total`,
@@ -1352,23 +1369,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dependency on `ravel-query`, which is what sharing the query path's
   exclusion rules rather than copying them is worth (ADR-1751 amendment,
   2026-09-26).
-- **`ravel-cli export --signal metrics` writes a tenant's stored metric
-  samples to a Parquet file `load --signal metrics` reads back onto the same
-  series** (ADR-1751 decision 4, issue #1712). It resolves the metrics catalog
-  once, fetches the RSEG objects through ravel-query's segment fetcher,
-  applies pending erasure predicates with the functions the query engine
-  calls, and writes the `[metrics]` mapping's columns sorted by event time.
-  Samples are deduplicated per series and timestamp to the one a query
-  serves: the greatest write provenance, then the greatest `f64::to_bits` of
-  the value. A `name_column` export writes each stored name, or the stored
-  name less `_total` for a counter with a unit, whichever a load with the same
-  mapping turns back into the stored name, and refuses by name a series
-  neither reproduces, a series carrying a label the mapping does not name, a
-  native-histogram series, and a sample finer than `ts_unit`; a `name`
-  literal exports only the series it names. A `[metrics.histogram]` mapping
-  is refused with the scalar mapping to use instead. The report adds
-  `series_written`, `series_skipped` and `samples_deduplicated` to the logs
-  export's lines. `--signal spans` is still refused.
 
 - **`ravel-server --listen-health <addr>` serves liveness and readiness from
   its own thread** (ADR-1702). The listener runs on a dedicated
