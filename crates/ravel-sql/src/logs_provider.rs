@@ -2828,10 +2828,26 @@ mod tests {
         values: &[Option<i64>],
         stamped: bool,
     ) -> String {
+        let stamps = if stamped {
+            vec![code_stamp(values)]
+        } else {
+            Vec::new()
+        };
+        publish_records(store, tenant, seq, &code_records(seq, values), &stamps).await
+    }
+
+    /// Write `records` as a real RLOG object plus its commit record carrying
+    /// `stamps`, and return the object's data key.
+    async fn publish_records(
+        store: &dyn ObjectStoreBackend,
+        tenant: &ravel_types::TenantId,
+        seq: u64,
+        records: &[LogRecord],
+        stamps: &[ravel_types::declared_stats::DeclaredColumnStat],
+    ) -> String {
         use ravel_commit::publish::RetryPolicy;
         use ravel_commit::record::NewCommitRecord;
         use ravel_commit::{keys, publish, record};
-        let records = code_records(seq, values);
         let writer_id = Uuid::from_u128(0x2121);
         let mut w = RlogWriter::new(
             RlogConfig::default(),
@@ -2843,7 +2859,7 @@ mod tests {
                 writer_seq: seq,
             },
         );
-        for r in &records {
+        for r in records {
             w.push(r.clone()).expect("push");
         }
         let bytes = w.finish().expect("finish");
@@ -2867,8 +2883,8 @@ mod tests {
             ingest_hour_bucket: 0,
         })
         .expect("commit record");
-        if stamped {
-            ravel_commit::declared_stats::stamp_commit_record(&mut rec, &[code_stamp(values)]);
+        if !stamps.is_empty() {
+            ravel_commit::declared_stats::stamp_commit_record(&mut rec, stamps);
         }
         let data_key = keys::reconstruct_data_key(&rec).expect("data key");
         store
@@ -2879,6 +2895,54 @@ mod tests {
             .await
             .expect("publish");
         data_key
+    }
+
+    /// Run `sql` through `SqlExecutor::execute`, the funnel the SQL endpoint
+    /// uses (catalog resolve, the `.cstat` load decision, then this provider's
+    /// `scan`), with [`code_declared`] as the declared columns.
+    async fn execute_code_sql(
+        backend: &Arc<dyn ObjectStoreBackend>,
+        tenant: &ravel_types::TenantId,
+        sql: &str,
+        now_ns: i64,
+    ) -> crate::executor::SqlOutcome {
+        let catalog = Arc::new(
+            ravel_catalog::Catalog::new(
+                Arc::clone(backend),
+                ravel_catalog::CatalogConfig::default(),
+            )
+            .expect("catalog"),
+        );
+        let executor = crate::executor::SqlExecutor::new(
+            catalog,
+            ravel_query::SegmentFetcher::new(Arc::clone(backend)),
+            LogSegmentFetcher::new(Arc::clone(backend)),
+            crate::spans_fetcher::SpanSegmentFetcher::new(Arc::clone(backend)),
+            SqlConfig::default(),
+            1 << 30,
+        )
+        .with_declared_column_source(Arc::new(
+            crate::declared::StaticDeclaredColumns::new(code_declared()),
+        ));
+        executor
+            .execute(
+                tenant.hash(),
+                &crate::executor::SqlRequest {
+                    sql: sql.to_string(),
+                    window: ravel_types::TimeRange {
+                        start_ns: 0,
+                        end_ns: now_ns,
+                    },
+                    min_tokens: Vec::new(),
+                    now_ns,
+                    deadline: std::time::Duration::from_secs(30),
+                    row_window: false,
+                    max_rows: None,
+                    budgets: None,
+                },
+            )
+            .await
+            .expect("execute")
     }
 
     /// The acceptance test for ADR-2121 D1, through `SqlExecutor::execute`,
@@ -2940,43 +3004,13 @@ mod tests {
 
         let store = KeyCountingStore::new(Arc::clone(&memory));
         let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&store) as _;
-        let catalog = Arc::new(
-            ravel_catalog::Catalog::new(
-                Arc::clone(&backend),
-                ravel_catalog::CatalogConfig::default(),
-            )
-            .expect("catalog"),
-        );
-        let executor = crate::executor::SqlExecutor::new(
-            catalog,
-            ravel_query::SegmentFetcher::new(Arc::clone(&backend)),
-            LogSegmentFetcher::new(Arc::clone(&backend)),
-            crate::spans_fetcher::SpanSegmentFetcher::new(Arc::clone(&backend)),
-            SqlConfig::default(),
-            1 << 30,
+        let outcome = execute_code_sql(
+            &backend,
+            &tenant,
+            "SELECT ts, body FROM logs WHERE code = 201",
+            NOW_NS,
         )
-        .with_declared_column_source(Arc::new(
-            crate::declared::StaticDeclaredColumns::new(code_declared()),
-        ));
-        let outcome = executor
-            .execute(
-                tenant.hash(),
-                &crate::executor::SqlRequest {
-                    sql: "SELECT ts, body FROM logs WHERE code = 201".to_string(),
-                    window: ravel_types::TimeRange {
-                        start_ns: 0,
-                        end_ns: NOW_NS,
-                    },
-                    min_tokens: Vec::new(),
-                    now_ns: NOW_NS,
-                    deadline: std::time::Duration::from_secs(30),
-                    row_window: false,
-                    max_rows: None,
-                    budgets: None,
-                },
-            )
-            .await
-            .expect("execute");
+        .await;
 
         assert_eq!(
             rows(outcome.output.batches()),
@@ -3003,23 +3037,169 @@ mod tests {
         );
     }
 
-    /// Carriers that disagree about one segment decline its column, and so do
-    /// no carriers at all: neither segment is skipped, although each one's
-    /// stamp alone, or its `.cstat` alone, would exclude `code = 500`. A
-    /// segment covered by an exact `.cstat` entry and no stamp is skipped, which
-    /// shows the `.cstat` side of the union is live in this test.
+    /// A `.cstat` entry alone never skips a segment (ADR-2121 D1). The fold
+    /// builds `.cstat` from the record-level cells only, while SQL returns the
+    /// merged value, so a row whose `code` lives only in its resource
+    /// attributes is outside the entry's `[min, max]`.
     ///
-    /// Flipped assertion: ignoring a disagreement (`if !stamp.agrees_with(&cstat)`
-    /// in `segment_declared_coverage` to `if false`) skips the conflicting
-    /// segment on its stamp and fails the count (`2 != 1`).
+    /// One unstamped segment: five rows carry `code` 1..=5 on the record, three
+    /// carry `code = 100` only in the resource attributes. A real fold builds
+    /// its `.cstat` entry, asserted to claim `[1, 5]` with the three resource
+    /// rows counted NULL. `NOT (code <> 100)` declines a prune arm in the
+    /// analyzed plan, so `SqlExecutor` loads the `.cstat`; the optimizer then
+    /// simplifies it to `code = 100`, which reaches the scan as a `[100, 100]`
+    /// arm disjoint from the entry.
+    ///
+    /// Flipped assertion: dropping the stamp check from `arm_excludes` (the
+    /// `if stamp_coverage(..).is_none() { return false; }`) skips the segment
+    /// on its `.cstat` entry and fails the count (`0 != 3`) and the skip count
+    /// (`1 != 0`).
     #[tokio::test]
-    async fn conflicting_or_absent_carriers_never_skip_a_segment() {
+    async fn a_cstat_entry_alone_never_skips_a_segment_with_resource_level_matches() {
+        const NOW_NS: i64 = 4 * 3_600_000_000_000;
+        let memory: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new("stats-prune-cstat-only".to_string());
+        let config = ravel_catalog::TenantConfig {
+            typed_attr_columns: Some(
+                code_declared()
+                    .iter()
+                    .map(|d| ravel_catalog::DeclaredTypedColumn {
+                        key: d.key.clone(),
+                        ty: ravel_catalog::DeclaredColumnType::I64,
+                    })
+                    .collect(),
+            ),
+            ..ravel_catalog::TenantConfig::new(ravel_catalog::TenantLifecycleState::Active)
+        };
+        ravel_catalog::set_tenant_config(memory.as_ref(), &tenant.hash(), &config, 1)
+            .await
+            .expect("tenant config");
+
+        let plain = vec![("service.name".to_string(), s("api"))];
+        let with_code = vec![
+            ("service.name".to_string(), s("api")),
+            (CODE.to_string(), AttrValue::I64(100)),
+        ];
+        let records: Vec<LogRecord> = (0..8usize)
+            .map(|i| {
+                let mut attrs = vec![(OTHER.to_string(), AttrValue::I64(1))];
+                let resource = if i < 5 {
+                    attrs.push((CODE.to_string(), AttrValue::I64(i as i64 + 1)));
+                    &plain
+                } else {
+                    &with_code
+                };
+                let (ts, body) = code_row(1, i);
+                record(resource, &attrs, ts, &body)
+            })
+            .collect();
+        let key = publish_records(memory.as_ref(), &tenant, 1, &records, &[]).await;
+
+        let catalog = ravel_catalog::Catalog::new(
+            Arc::clone(&memory),
+            ravel_catalog::CatalogConfig::default(),
+        )
+        .expect("catalog");
+        let report = catalog
+            .fold(
+                &tenant.hash(),
+                ravel_types::Signal::Logs,
+                Uuid::from_u128(0x2151),
+                NOW_NS,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold");
+        assert_eq!(
+            report.column_stats_part_objects_built, 1,
+            "the fold builds one .cstat object"
+        );
+        let loaded = catalog
+            .load_column_stats(
+                &tenant.hash(),
+                ravel_types::Signal::Logs,
+                ravel_types::TimeRange {
+                    start_ns: 0,
+                    end_ns: NOW_NS,
+                },
+                NOW_NS,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("load .cstat")
+            .expect("a .cstat object is present");
+        let entries: Vec<_> = loaded
+            .by_content_hash
+            .values()
+            .flat_map(|seg| seg.columns.iter().filter(|c| c.name == CODE))
+            .collect();
+        assert_eq!(entries.len(), 1, "one .cstat entry for code");
+        let code_value = |v: i64| ravel_proto::catalog::v1::ColumnValue {
+            kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(v)),
+        };
+        assert_eq!(
+            (
+                entries[0].min.clone(),
+                entries[0].max.clone(),
+                entries[0].null_count
+            ),
+            (Some(code_value(1)), Some(code_value(5)), 3),
+            "the .cstat entry tallies the record cells only"
+        );
+
+        let store = KeyCountingStore::new(Arc::clone(&memory));
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&store) as _;
+        let outcome = execute_code_sql(
+            &backend,
+            &tenant,
+            "SELECT COUNT(*) AS n, MIN(code) AS lo, MAX(code) AS hi \
+             FROM logs WHERE NOT (code <> 100)",
+            NOW_NS,
+        )
+        .await;
+        let batches = outcome.output.batches();
+        let text = datafusion::arrow::util::pretty::pretty_format_batches(batches)
+            .expect("format")
+            .to_string();
+        let want = "\
++---+-----+-----+
+| n | lo  | hi  |
++---+-----+-----+
+| 3 | 100 | 100 |
++---+-----+-----+";
+        assert_eq!(
+            text, want,
+            "the three resource-level code = 100 rows are returned"
+        );
+        assert_eq!(
+            outcome.stats.segments_pruned_by_stats, 0,
+            "the .cstat entry alone must not skip the segment"
+        );
+        assert!(store.gets_of(&key) > 0, "the segment is read");
+    }
+
+    /// Only a stamp that no `.cstat` entry contradicts skips a segment by
+    /// `code`'s arm. A stamp with a disagreeing `.cstat` entry, no carrier at
+    /// all, and an exact `.cstat` entry with no stamp each leave the segment
+    /// read, although the stamp alone, or the `.cstat` alone, would exclude
+    /// `code = 500`. A segment with only an exact stamp is skipped, which shows
+    /// the arm excludes in this test.
+    ///
+    /// Flipped assertions: ignoring a disagreement (`if !stamp.agrees_with(&cstat)`
+    /// in `segment_declared_coverage` to `if false`) skips the conflicting
+    /// segment on its stamp, and dropping the stamp check from `arm_excludes`
+    /// skips the `.cstat`-only segment; each fails the count (`2 != 1`).
+    #[tokio::test]
+    async fn only_an_uncontradicted_stamp_skips_a_segment() {
         let memory: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let values = [Some(200), Some(201), Some(202)];
         let conflict = write_code_segment(memory.as_ref(), "conflict", 1, &values).await;
         let conflict = with_stamps(conflict, &[code_stamp(&values)]);
         let uncovered = write_code_segment(memory.as_ref(), "uncovered", 2, &values).await;
         let cstat_only = write_code_segment(memory.as_ref(), "cstat-only", 3, &values).await;
+        let stamped = write_code_segment(memory.as_ref(), "stamped", 4, &values).await;
+        let stamped = with_stamps(stamped, &[code_stamp(&values)]);
         // The `.cstat` claims [100, 102] for an object holding [200, 202]:
         // valid on its own, and in disagreement with the exact stamp.
         let stats = loaded_cstats(vec![
@@ -3029,7 +3209,7 @@ mod tests {
 
         let run = run_pruned(
             &memory,
-            vec![conflict, uncovered, cstat_only],
+            vec![conflict, uncovered, cstat_only, stamped],
             Some(stats),
             true,
             "SELECT ts, body FROM logs WHERE code = 500",
@@ -3039,17 +3219,21 @@ mod tests {
         assert_eq!(
             run.pruned_by_stats(),
             1,
-            "only the segment with one exact carrier is skipped"
+            "only the segment with an uncontradicted stamp is skipped"
         );
         assert!(
             run.store.gets_of("conflict") > 0,
-            "conflicting carriers decline the column, so the segment is read"
+            "a .cstat entry that disagrees with the stamp declines the column"
         );
         assert!(
             run.store.gets_of("uncovered") > 0,
             "a segment with no stamp and no .cstat entry is read"
         );
-        assert_eq!(run.store.gets_of("cstat-only"), 0);
+        assert!(
+            run.store.gets_of("cstat-only") > 0,
+            "a .cstat entry alone never skips a segment"
+        );
+        assert_eq!(run.store.gets_of("stamped"), 0);
     }
 
     /// Shapes `extract_logs` declines skip nothing, even where a naive reading
@@ -3215,22 +3399,22 @@ mod tests {
     }
 
     /// Whether the D1 rule, applied by hand, skips a segment holding `values`
-    /// with `carriers` under `conjuncts`: some arm is disjoint from an exact
-    /// `[min, max]`, or the column is all NULL with the NULL count proven,
-    /// which only a stamp does.
+    /// with `carriers` under `conjuncts`: the segment carries a stamp no
+    /// `.cstat` entry contradicts, and some arm is disjoint from its exact
+    /// `[min, max]` or the column is all NULL. A `.cstat` entry alone never
+    /// skips.
     fn rule_skips(values: &[Option<i64>], carriers: Carriers, conjuncts: &[Conjunct]) -> bool {
-        let proven = match carriers {
-            Carriers::None | Carriers::Conflict => return false,
-            Carriers::Stamp | Carriers::StampAndCstat => true,
-            Carriers::Cstat => false,
-        };
+        match carriers {
+            Carriers::None | Carriers::Cstat | Carriers::Conflict => return false,
+            Carriers::Stamp | Carriers::StampAndCstat => {}
+        }
         let present: Vec<i64> = values.iter().flatten().copied().collect();
         conjuncts.iter().filter_map(Conjunct::arm).any(|(lo, hi)| {
             match (present.iter().min(), present.iter().max()) {
                 (Some(&min), Some(&max)) => {
                     hi.is_some_and(|h| h < min) || lo.is_some_and(|l| l > max)
                 }
-                _ => proven,
+                _ => true,
             }
         })
     }

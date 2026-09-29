@@ -3281,20 +3281,24 @@ never drop a true result):
 Those same `NumRange` arms also skip whole segments before any fetch
 (ADR-2121 D1). `LogsTableProvider::scan` drops a segment when one arm is
 disjoint from the segment's exact `[min, max]` for its column, taken from the
-`SegmentRef` stamp (ADR-0873) or the `.cstat` entry under the carrier rules the
-declared-column MIN/MAX shortcut uses. A segment that neither carrier covers,
-or whose carriers disagree, is never skipped. A segment whose column is NULL in
-every row is skipped for any arm when its NULL count is proven equal to its row
-count, which today only a stamp proves. `str`/`bytes` equality never skips a
-segment, and neither does a shape `extract_logs` declines. A skipped segment
-costs no GET and is counted as `segments_pruned_by_stats` in the scan's
-`EXPLAIN ANALYZE` metrics and in `SqlStats`. `max_segments` admission still
-counts the whole resolved snapshot, and the distributed coordinator fan-out
-does not skip. `SqlExecutor` skips the `.cstat` load when the analyzed plan's
-filters already carry a prune arm (`logs_column_stats_eligible`), so on a
-filtered scan it is normally the stamp that skips. A Flight SQL `DoGet`
-rebuilds its segments from the ticket, whose pin carries no stamps, so there a
-segment is skipped only by a loaded `.cstat` entry.
+`SegmentRef` stamp (ADR-0873). The stamp is folded from the merged value SQL
+returns (the record cell, or the resource or scope value a row falls back to).
+A `.cstat` entry alone never skips a segment, because it tallies only the
+record-level cells and a row whose value lives only in the resource or scope
+attributes can match outside its `[min, max]`. A segment with no stamp for the
+column, or whose `.cstat` entry disagrees with its stamp (the conflict rule
+the declared-column MIN/MAX shortcut uses), is never skipped by that column's
+arm; another column's arm or the ts window can still drop it. A segment whose
+column is NULL in every row is skipped for any arm, since its stamp proves the
+NULL count equal to the row count. The comparison runs in signed `i64` order
+(`false < true` for `bool`), never on the arms' unsigned bit patterns.
+`str`/`bytes` equality never skips a segment, and neither does a shape
+`extract_logs` declines. A skipped segment costs no GET and is counted as
+`segments_pruned_by_stats` in the scan's `EXPLAIN ANALYZE` metrics and in
+`SqlStats`. `max_segments` admission still counts the whole resolved snapshot,
+and the distributed coordinator fan-out does not skip. A Flight SQL `DoGet`
+rebuilds its segments from the ticket, whose pin carries no stamps, so it
+skips nothing by statistics.
 
 ### Declared typed attribute columns (ADR-0090)
 
