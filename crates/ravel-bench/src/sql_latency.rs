@@ -4390,9 +4390,11 @@ mod tests {
              scan nothing to look up"
         );
         assert_eq!(acc[0].cache_misses, 3, "cold run's fetcher-cache misses");
-        // 846 = the 836 of RLOG v4 plus the v5 BLOOM covered-column list for
-        // this object's two string columns: a 4-byte count, two 1-byte ids and
-        // the 4-byte crc32c over them.
+        // 846 = the 836 of RLOG v4 plus the v5 BLOOM covered-column list: a
+        // 4-byte count, one 1-byte id per covered column and the 4-byte crc32c
+        // over them. This object covers exactly the two fixed string columns
+        // (severity_text and body, which the writer always lists); a fixture
+        // with dynamic string columns carries one more id per such column.
         assert_eq!(acc[0].object_store_bytes, 846, "cold run's store bytes");
 
         // Warm run: served from cache, so it drops to plan reads only.

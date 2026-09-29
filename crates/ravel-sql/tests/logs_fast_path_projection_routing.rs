@@ -194,7 +194,9 @@ fn record(seg: usize, blk: usize) -> LogRecord {
 /// find that out: nothing (decision 4).
 #[derive(Clone, Copy)]
 enum RlogVersion {
-    V3,
+    /// The version just below the reader's (`footer::VERSION - 1`), which no
+    /// build reads: it is named for what it stamps, not for a fixed number.
+    Previous,
     Current,
 }
 
@@ -202,7 +204,8 @@ enum RlogVersion {
 /// exactly as the writer does, so the only thing wrong with the result is its
 /// declared version.
 ///
-/// This is how the v3 fixture is built now that no v3 producer exists. Patching
+/// This is how the previous-version fixture is built now that no producer of
+/// that version exists (the reader accepts exactly one version). Patching
 /// the two version bytes in place would break the footer crc, and the object
 /// would be refused as corruption rather than as an unsupported version --
 /// which would pass this file's rejection test for the wrong reason.
@@ -229,7 +232,7 @@ async fn write_segment(
     let written = w.finish().expect("finish");
     let (bytes, format_version) = match version {
         RlogVersion::Current => (written, ravel_logseg::footer::VERSION),
-        RlogVersion::V3 => {
+        RlogVersion::Previous => {
             let v = ravel_logseg::footer::VERSION - 1;
             (restamp_version(&written, v), v)
         }
@@ -671,7 +674,8 @@ async fn both_paths_return_identical_rows() {
 }
 
 /// ADR-0892 decisions 4 and 5: the SAME narrow projection over the SAME
-/// above-threshold segments, stamped at RLOG v3 instead of the current
+/// above-threshold segments, stamped at the version just below the reader's
+/// (`footer::VERSION - 1`, today 4) instead of the current
 /// version, is REFUSED with the typed `UnsupportedVersion` error having issued
 /// ZERO requests of every counted kind.
 ///
@@ -694,7 +698,7 @@ async fn both_paths_return_identical_rows() {
 #[tokio::test]
 async fn narrow_projection_over_v3_segment_is_refused_before_any_request() {
     let base = Arc::new(MemoryStore::new());
-    let snapshot = build_snapshot(base.as_ref(), RlogVersion::V3).await;
+    let snapshot = build_snapshot(base.as_ref(), RlogVersion::Previous).await;
     let counting = CountingStore::new(base);
     let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>;
     let threshold = smallest_object(&snapshot) / THRESHOLD_DIVISOR;
@@ -762,7 +766,7 @@ async fn narrow_projection_over_v3_segment_is_refused_before_any_request() {
 #[tokio::test]
 async fn plan_path_over_v3_segment_is_refused_before_any_request() {
     let base = Arc::new(MemoryStore::new());
-    let snapshot = build_snapshot(base.as_ref(), RlogVersion::V3).await;
+    let snapshot = build_snapshot(base.as_ref(), RlogVersion::Previous).await;
     let counting = CountingStore::new(base);
     let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>;
     let threshold = smallest_object(&snapshot) / THRESHOLD_DIVISOR;

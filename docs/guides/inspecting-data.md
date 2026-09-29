@@ -180,7 +180,7 @@ Field by field:
 ## `rlog inspect`: what's inside one log segment
 
 Log data lives in RLOG objects (`.rlog`), the columnar log segment format
-([docs/log-segment-format.md](../log-segment-format.md), trailer version 4).
+([docs/log-segment-format.md](../log-segment-format.md), trailer version 5).
 RLOG is a sibling of RSEG: it shares the 16-byte trailer, the protobuf footer,
 and the crc32c discipline, and has its own sections. The ingest path writes
 RLOG objects, the `logs` SQL table on `POST /api/v1/sql` reads them back, and
@@ -193,8 +193,8 @@ ravel-cli rlog inspect "t/abab.../l/l0/0000/....rlog"
 ```
 
 ```
-total_size: 902
-version: 4
+total_size: 913
+version: 5
 signal: 2
 tenant_hash: abababababababababababababababab
 shard: 3
@@ -217,8 +217,8 @@ sections:
   kind=3 name=BLOCKS offset=94 len=120 comp=none uncompressed_len=120
   kind=4 name=SKIP_IDX offset=214 len=75 comp=zstd uncompressed_len=104
   kind=8 name=PAGE_DIR offset=289 len=164 comp=zstd uncompressed_len=193
-  kind=5 name=BLOOM offset=453 len=164 comp=none uncompressed_len=164
-  kind=6 name=POSTINGS offset=617 len=66 comp=none uncompressed_len=66
+  kind=5 name=BLOOM offset=453 len=175 comp=none uncompressed_len=175
+  kind=6 name=POSTINGS offset=628 len=66 comp=none uncompressed_len=66
 skip_index level 0 (2 block(s)):
   block[0] offset=0 len=113 crc32c=941f3f49 record_count=2 ts_range=[100, 200] stream_ref_range=[0, 0]
     stat column_id=10 type=i64 min_bits=200 max_bits=504 null_count=0 has_nan=false resolved_min=200 resolved_max=504
@@ -319,7 +319,9 @@ for that tenant over all time (live L0 flush and L1 compacted segments). Per obj
 it fetches four ranges: the 16-byte trailer, the footer, FIELD_DIR, and
 PAGE_DIR. It never fetches page bodies, so the cost does not grow with the
 BLOCKS section. `--json` prints the same report as one JSON document, with the
-per-object figures under `objects` and the sums under `total`.
+per-object figures under `objects` and the sums under `total`. The figures
+below come from one small example object; yours differ, and under version 5
+the BLOOM figure includes the covered-column list and its crc32c.
 
 ```sh
 ravel-cli rlog footprint a.rlog
@@ -328,14 +330,14 @@ ravel-cli rlog footprint a.rlog
 ```
 object_count: 1
 record_count: 12
-total_bytes: 1123
+total_bytes: 1134
 gap_bytes: 0
 page_stored_bytes: 264
 objects:
-  a.rlog version=4 level=0 records=12 bytes=1123
+  a.rlog version=5 level=0 records=12 bytes=1134
 sections:
   BLOCKS count=1 bytes=264 uncompressed_bytes=264
-  BLOOM count=1 bytes=244 uncompressed_bytes=244
+  BLOOM count=1 bytes=255 uncompressed_bytes=255
   FIELD_DIR count=1 bytes=30 uncompressed_bytes=21
   FOOTER count=1 bytes=188 uncompressed_bytes=188
   PAGE_DIR count=1 bytes=235 uncompressed_bytes=319
