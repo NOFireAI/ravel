@@ -1831,7 +1831,7 @@ pub fn prometheus_family_name(
 /// `unitMapper` table (ADR-0085 Decision 2), returning the Prometheus word or
 /// `None` for an empty or unrecognized unit. The dimensionless `1` is not in
 /// this table: its `_ratio` mapping is gauge-specific and lives in
-/// [`unit_suffix`], since this mapper has no metric kind.
+/// `unit_suffix`, since this mapper has no metric kind.
 pub fn map_unit(unit: &str) -> Option<String> {
     let mapped = match unit {
         // time
