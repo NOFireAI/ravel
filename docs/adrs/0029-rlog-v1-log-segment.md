@@ -73,9 +73,12 @@ RLOG v1 exists as specified in `docs/log-segment-format.md`:
   addressable so one block is readable alone.
 - **Records sort by `(stream_ref ascending, ts_ns ascending)`.**
   Clustering by stream makes the stream column near-free, timestamps
-  near-monotonic within a run, and per-stream dictionaries tight.
+  near-monotonic within a run, and per-stream dictionaries tight. RLOG v5
+  adds an optional declared order inside a stream (see the ADR-2135
+  amendment below).
 - **Per-page tagged encodings.** A nine-entry encoding registry; the
-  writer measures and picks the smallest per page; the tag makes the
+  writer measures and picks the smallest per page (by stored size from
+  RLOG v5, see the ADR-2135 amendment below); the tag makes the
   choice self-describing. Unknown tags are a typed decode error, never a
   guess.
 - **Multi-level skip index** (levels 0 and 1 in SKIP_IDX, level 2 in the
@@ -170,3 +173,16 @@ dispatch does.
 - Precedent: ADR-0004 (RSEG v1), ADR-0005 (series identity),
   ADR-0010 §4/§7 (checksum coverage, identity binding), ADR-0013
   (pruning soundness). docs/catalog-and-mvcc.md (`l` keyspace).
+
+## Amendment (2026-09-29, ADR-2135): RLOG v5 order, codecs and bloom coverage
+
+<!-- amendment-applies: sections="Decision" pointer="ADR-2135 amendment" -->
+
+ADR-2135 moves RLOG to trailer version 5. A tenant may declare a clustering
+key, and its objects then sort by `(stream_ref, time bucket, key, ts)`
+instead of `(stream_ref, ts)`; objects record their order in the footer.
+The writer chooses each page's encoding by its stored size after the page
+envelope, not by its encoded size. The registry gains tags 10 to 13, and
+BLOOM records which columns it covers. The per-page tags, the proof-only
+pruning rule and the other constants stand.
+

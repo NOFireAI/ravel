@@ -453,3 +453,11 @@ the probe extent itself (as a `Range` GET of the same bytes, so it keys
 identically), which places the footer, the trailer and every tail section at
 once for no GET; that is done only when a read cache is wired, because without
 one it would re-read the tail on the wire instead of the individual sections.
+
+## Amendment (2026-09-29, ADR-2135): row-group string dictionaries
+
+<!-- amendment-applies: none reason="adds a dictionary page at the head of a string column chunk in RLOG v5 and retires no wording here; the row group, column chunk and PAGE_DIR decisions stand as written" -->
+
+ADR-2135 decision 6 lets a string column chunk start with one dictionary
+page shared by the chunk's blocks, listed first in PAGE_DIR for that chunk.
+
