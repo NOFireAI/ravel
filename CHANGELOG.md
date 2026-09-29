@@ -68,6 +68,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `Verification::Stragglers` carries the three counts and the list, and
   `FamilyMigrateReport::buckets_blocked` is a method over `blocked_buckets`
   rather than a separate counter.
+- **`ravel-cli maintain migrate` names a bucket held below the target only by
+  a losing compaction record's parts** (ADR-0066, force 2 amendment item 9,
+  issue #2093). When every authoritative compaction record of a bucket has its
+  parts at the target and records that lost their overlap still carry parts
+  below it, the report prints
+  `blocked_bucket: ... reason=losing_record_parts below_target=<n>`, where
+  `<n>` sums the losing records' below-target parts, with a comment line saying
+  re-running `migrate` does not clear it and retention ageing the bucket out,
+  under the format-version hold, does. Those parts still count in
+  `l1_compaction_parts`, so the floor is still refused over them; only the
+  naming is new. A bucket whose authoritative records are below the target is
+  not named this way, a bucket that lists a rewrite record stays
+  `rewrite_parts` only, and a record a version 2 record supersedes is not a
+  loser. `BlockedReason` gains `LosingRecordParts { below_target }`.
 - **The background supervisor now takes an advisory claim before compacting a
   large bucket, so two processes whose ownership overlaps no longer both pay
   for the same merge** (ADR-1029 decisions 3 to 5, issue #1033). The claim is

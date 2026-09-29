@@ -138,9 +138,9 @@ impl MigrateBudget {
 }
 
 /// Why a bucket cannot be migrated by this job, whatever the operator runs next
-/// (ADR-1331 decision 2). Both variants are permanent in the sense the
+/// (ADR-1331 decision 2). Every variant is permanent in the sense the
 /// maintenance guide gives the word: re-running `migrate` reports the same
-/// bucket again, and no command clears it.
+/// bucket again. What clears each one is on the variant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockedReason {
     /// A live rewrite record (selective erasure, ADR-0064) carries
@@ -162,10 +162,12 @@ pub enum BlockedReason {
     /// current output version AND a sweep removes the superseded predecessor
     /// (ADR-1331 decision 3).
     RewriteParts { below_target: usize },
-    /// Overlapping compaction records resolve to a winner and a loser, and an
-    /// input only the loser names is still served raw and below the target. A
-    /// new record over that subset joins the same overlap component and loses
-    /// to the existing winner, so no rewrite migrates it.
+    /// Overlapping compaction records resolve to a winner and a loser, and a
+    /// raw L0 input only the loser names is still served raw and below the
+    /// target. A new record over that subset joins the same overlap component
+    /// and loses to the existing winner, so no rewrite migrates it. This is
+    /// about the loser's INPUTS; the loser's own output parts are
+    /// [`Self::LosingRecordParts`].
     ///
     /// Nothing in this build clears it except retention aging those inputs out,
     /// subject to the ADR-0066 #530 version hold. A "later authoritative
@@ -175,6 +177,24 @@ pub enum BlockedReason {
     /// already carries a compaction record, so the bucket's record set is
     /// closed.
     LoserOnlyInputs,
+    /// Every authoritative compaction record of the bucket has all of its parts
+    /// at or above the target, and the records that lost their overlap
+    /// component carry `below_target` output parts below it, summed over those
+    /// losers (ADR-0066 force 2 amendment, item 9). Nothing serves a loser's
+    /// parts, but they still count in [`BelowTargetReport::l1`]: a build that
+    /// predates the authoritative-selection rule may still serve them, so they
+    /// are no safe basis for raising the floor.
+    ///
+    /// Not this reason: a bucket whose authoritative records are themselves
+    /// below the target (its winner has not converged either), a bucket that
+    /// lists a rewrite record ([`Self::RewriteParts`] alone), and a record a
+    /// present version 2 record supersedes or a version 2 record a live
+    /// rewrite dominates, which the sweep reclaims.
+    ///
+    /// Nothing in this build reclaims a losing record's parts, so re-running
+    /// `migrate` or `sweep` does not clear it. It clears when retention ages
+    /// the bucket out, subject to the ADR-0066 #530 version hold.
+    LosingRecordParts { below_target: usize },
 }
 
 /// One bucket the migration job cannot migrate, named with its reason
@@ -205,11 +225,14 @@ pub struct BelowTargetReport {
     /// records, once an authoritative compaction record or a rewrite record
     /// names them as inputs, are excluded rather than counted here.
     pub l0: usize,
-    /// Below-target parts of compaction records only. They refuse the floor
-    /// raise, and no code path migrates them (issue #2093), so re-running
-    /// `migrate` reports the same figure. Their buckets are not named in
-    /// [`Self::blocked`]; whether they should be is #2093's decision, not this
-    /// type's.
+    /// Below-target parts of compaction records only, authoritative or not.
+    /// They refuse the floor raise, and no code path migrates them (issue
+    /// #2093), so re-running `migrate` reports the same figure. A bucket whose
+    /// authoritative records are all at the target and whose overlap losers
+    /// carry below-target parts is named in [`Self::blocked`] as
+    /// [`BlockedReason::LosingRecordParts`], with the losers' share of this
+    /// figure; a bucket whose authoritative records are themselves below the
+    /// target is not named.
     ///
     /// Like [`Self::rewrite_parts`], this is a count over LISTED records: a
     /// compaction record that a later rewrite record superseded stays listed
@@ -223,9 +246,13 @@ pub struct BelowTargetReport {
     pub rewrite_parts: usize,
     /// The buckets whose `rewrite_parts` block the floor, one entry per bucket
     /// with its exact count, summed over every rewrite record that bucket
-    /// lists. The walk contributes the [`BlockedReason::LoserOnlyInputs`]
-    /// entries separately, so this pass reports only what it can see for
-    /// itself.
+    /// lists, and the buckets held below the target only by overlap losers'
+    /// parts ([`BlockedReason::LosingRecordParts`]), whose count is also in
+    /// `l1`. A bucket that lists a rewrite record is only ever named with
+    /// `RewriteParts`. The walk contributes the
+    /// [`BlockedReason::LoserOnlyInputs`] entries separately, so this pass
+    /// reports only what it can see for itself. Sorted by
+    /// `(shard, ingest_hour)`.
     pub blocked: Vec<BlockedBucket>,
 }
 
@@ -291,7 +318,7 @@ pub struct FamilyMigrateReport {
     /// its `(shard, ingest_hour)` and the reason no re-run clears it
     /// (ADR-1331 decision 2).
     ///
-    /// Two conditions land here and neither is a transient refusal. A bucket
+    /// Three conditions land here and none is a transient refusal. A bucket
     /// whose overlapping compaction records resolve to a winner and a loser
     /// leaves every input only the loser names served as a raw L0 segment: it
     /// is live, and rewriting that subset cannot migrate it, because a new
@@ -299,21 +326,26 @@ pub struct FamilyMigrateReport {
     /// existing winner ([`BlockedReason::LoserOnlyInputs`], found by the walk).
     /// A bucket whose live rewrite record carries parts below the target is one
     /// this job never rewrites at all ([`BlockedReason::RewriteParts`], found by
-    /// the re-audit). Either makes [`count_below_target`] report stragglers on
-    /// every invocation, so the family's floor stays unraised until the
-    /// condition itself resolves; naming the bucket and the reason is what
-    /// keeps an operator from re-running a job that cannot converge.
+    /// the re-audit). A bucket whose authoritative compaction records are at
+    /// the target while an overlap loser's own parts are below it is held down
+    /// by parts nothing in this build reclaims
+    /// ([`BlockedReason::LosingRecordParts`], found by the re-audit). Each
+    /// makes [`count_below_target`] report stragglers on every invocation, so
+    /// the family's floor stays unraised until the condition itself resolves;
+    /// naming the bucket and the reason is what keeps an operator from
+    /// re-running a job that cannot converge.
     ///
-    /// The two halves have different scopes and the list is their union, so it
+    /// The two passes have different scopes and the list is their union, so it
     /// is not a census of the family. The re-audit covers every shard, so its
-    /// [`BlockedReason::RewriteParts`] entries are complete. The walk covers
+    /// [`BlockedReason::RewriteParts`] and
+    /// [`BlockedReason::LosingRecordParts`] entries are complete. The walk covers
     /// only the buckets PAST THE CURSOR that this invocation examined, so a
     /// walk resumed mid-family omits the [`BlockedReason::LoserOnlyInputs`]
     /// buckets an earlier invocation found and does not re-report them.
     ///
     /// Sorted by `(shard, ingest_hour)`, one entry per bucket. Where both
     /// passes name the same bucket the re-audit's entry is the one kept, since
-    /// it is the only one of the two that carries a count.
+    /// the re-audit's reasons carry a count and the walk's does not.
     pub blocked_buckets: Vec<BlockedBucket>,
     /// The `(shard, ingest_hour)` the cursor was persisted at, when this
     /// invocation stopped on its budget. `None` once the walk completes: a
@@ -536,6 +568,16 @@ async fn list_shard_hours(
 /// rewrite superseded stays listed until `sweep` deletes it, so its parts are
 /// summed into its bucket's figure alongside the successor's for as long as it
 /// is there.
+///
+/// A losing compaction record's parts count in `l1` like any other compaction
+/// part (ADR-0066 force 2 amendment, item 9): an older build may still serve
+/// them, so the floor is refused over them. When every authoritative record of
+/// the bucket is at the target, the losers are all that holds it below, and the
+/// bucket is named [`BlockedReason::LosingRecordParts`] with the losers'
+/// below-target part count, from the same [`authoritative_compaction_records`]
+/// selection that decides which inputs are superseded. Nothing in this build
+/// reclaims a loser's parts, so only retention clears that entry, subject to
+/// the format-version hold.
 pub async fn count_below_target(
     store: &dyn ObjectStoreBackend,
     tenant_hash: &TenantHash,
@@ -577,11 +619,32 @@ pub async fn count_below_target(
                 }
             }
         }
-        for (ingest_hour, below_target) in rewrite_below_by_hour {
+        let mut blocked_by_hour: BTreeMap<u32, BlockedReason> = rewrite_below_by_hour
+            .into_iter()
+            .map(|(hour, below_target)| (hour, BlockedReason::RewriteParts { below_target }))
+            .collect();
+        // A losing compaction record's below-target parts are already in `l1`
+        // above. The bucket is named for them only when its authoritative
+        // records are all at the target, so the losers are what holds it
+        // below; a bucket listing a rewrite record keeps its `RewriteParts`
+        // treatment alone.
+        for (hour, parts) in &family.compaction_authority {
+            if family.rewrite_hours.contains(hour) {
+                continue;
+            }
+            if parts.authoritative.iter().any(|v| *v < target_version) {
+                continue;
+            }
+            let below_target = parts.losing.iter().filter(|v| **v < target_version).count();
+            if below_target > 0 {
+                blocked_by_hour.insert(*hour, BlockedReason::LosingRecordParts { below_target });
+            }
+        }
+        for (ingest_hour, reason) in blocked_by_hour {
             report.blocked.push(BlockedBucket {
                 shard,
                 ingest_hour,
-                reason: BlockedReason::RewriteParts { below_target },
+                reason,
             });
         }
         for key in family.commit_keys {
@@ -750,6 +813,18 @@ struct ShardFamily {
     /// authoritative compaction record or a rewrite record names as an input.
     superseded_commits: HashSet<String>,
     records: Vec<RecordParts>,
+    /// Per ingest hour holding compaction records, the part versions of its
+    /// authoritative records and of its overlap losers.
+    compaction_authority: BTreeMap<u32, BucketPartVersions>,
+    /// Every ingest hour that lists at least one rewrite record.
+    rewrite_hours: HashSet<u32>,
+}
+
+/// The part versions of one bucket's compaction records, split by
+/// [`BucketAuthority`].
+struct BucketPartVersions {
+    authoritative: Vec<u32>,
+    losing: Vec<u32>,
 }
 
 async fn read_shard_family(
@@ -857,13 +932,15 @@ async fn read_shard_family(
     // -- the loser's parts are ignored -- so it is still served raw and still
     // counts as live. The same holds for a record a present version 2 record
     // supersedes and for a version 2 record a live rewrite dominates.
+    let mut compaction_authority = BTreeMap::new();
     for (hour, bucket_records) in &compaction_by_bucket {
         let bucket = Bucket::new(*tenant_hash, signal, shard, *hour);
         let rewrites = rewrite_by_bucket
             .get(hour)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        for (_, rec) in authoritative_compaction_records(&bucket, bucket_records, rewrites)? {
+        let authority = authoritative_compaction_records(&bucket, bucket_records, rewrites)?;
+        for (_, rec) in &authority.authoritative {
             superseded_commits.extend(superseded_input_commit_keys(
                 tenant_hash,
                 signal,
@@ -871,26 +948,56 @@ async fn read_shard_family(
                 rec,
             )?);
         }
+        let part_versions = |records: &[&(String, CompactionRecord)]| -> Vec<u32> {
+            records
+                .iter()
+                .flat_map(|(_, rec)| rec.parts.iter().map(|p| p.segment_format_version))
+                .collect()
+        };
+        compaction_authority.insert(
+            *hour,
+            BucketPartVersions {
+                authoritative: part_versions(&authority.authoritative),
+                losing: part_versions(&authority.losing),
+            },
+        );
     }
 
     Ok(ShardFamily {
         commit_keys,
         superseded_commits,
         records,
+        compaction_authority,
+        rewrite_hours: rewrite_by_bucket.into_keys().collect(),
     })
+}
+
+/// One bucket's compaction records as [`authoritative_compaction_records`]
+/// resolved them. A record in neither list is one a present version 2 record
+/// supersedes, or a version 2 record a live rewrite dominates: the sweep
+/// reclaims those, so neither list names them.
+struct BucketAuthority<'a> {
+    /// The records whose parts are served and whose inputs are superseded.
+    authoritative: Vec<&'a (String, CompactionRecord)>,
+    /// The records that lost their overlap component to another record
+    /// ([`ravel_catalog::AuthoritativeSelection::losing`]). Nothing serves
+    /// their parts and nothing in this build reclaims them.
+    losing: Vec<&'a (String, CompactionRecord)>,
 }
 
 /// The compaction records of one bucket whose inputs the resolver treats as
 /// superseded: a version 2 record a live rewrite dominates is dropped
 /// ([`ravel_catalog::erasure_dominated_compaction_records`]), and the selector
 /// then excludes every record a present version 2 record supersedes and every
-/// overlap loser. Both halves of this module ask the question here, so the walk
-/// and the re-audit agree with `Catalog::resolve` and with each other.
+/// overlap loser. The overlap losers are returned apart, so the re-audit can
+/// name a bucket held below the target by a loser's parts alone. Both halves of
+/// this module ask the question here, so the walk and the re-audit agree with
+/// `Catalog::resolve` and with each other.
 fn authoritative_compaction_records<'a>(
     bucket: &Bucket,
     compaction_records: &'a [(String, CompactionRecord)],
     rewrite_records: &[(String, RewriteRecord)],
-) -> Result<Vec<&'a (String, CompactionRecord)>> {
+) -> Result<BucketAuthority<'a>> {
     let prefix = keys::commit_shard_hour_prefix(
         &bucket.tenant_hash,
         bucket.signal,
@@ -915,10 +1022,19 @@ fn authoritative_compaction_records<'a>(
         .collect();
     let selection =
         select_authoritative_compaction_records(&candidate_pairs).map_err(unresolvable)?;
-    Ok(candidates
-        .into_iter()
-        .filter(|(key, _)| !selection.is_excluded(key))
-        .collect())
+    let mut authority = BucketAuthority {
+        authoritative: Vec::new(),
+        losing: Vec::new(),
+    };
+    for candidate in candidates {
+        let key = candidate.0.as_str();
+        if selection.losing().contains(key) {
+            authority.losing.push(candidate);
+        } else if !selection.is_excluded(key) {
+            authority.authoritative.push(candidate);
+        }
+    }
+    Ok(authority)
 }
 
 /// The most compaction records any one overlap component of a bucket holds,
@@ -1074,6 +1190,7 @@ async fn raw_served_commit_keys(
 
     let mut superseded: HashSet<String> = HashSet::new();
     for (_, rec) in authoritative_compaction_records(bucket, &compaction_records, &rewrite_records)?
+        .authoritative
     {
         superseded.extend(superseded_input_commit_keys(
             &bucket.tenant_hash,
@@ -1298,18 +1415,19 @@ pub async fn migrate_family(
     let mut audit =
         count_below_target(store, &tenant_hash, signal, verify_shards, target_version).await?;
 
-    // The two permanent cases are found by different passes -- the walk sees a
-    // surviving overlap, the re-audit sees a rewrite record's parts -- so the
-    // one list an operator reads is their union. A bucket both passes name
-    // (partial coverage under a rewrite record) is one blocked bucket, not two:
-    // `buckets_blocked` counts buckets.
+    // The permanent cases are found by different passes -- the walk sees a
+    // surviving overlap's raw inputs, the re-audit sees a rewrite record's or a
+    // losing compaction record's parts -- so the one list an operator reads is
+    // their union. A bucket both passes name (partial coverage under a rewrite
+    // record, or a loser whose inputs and parts are both below the target) is
+    // one blocked bucket, not two: `buckets_blocked` counts buckets.
     //
     // On that collision the re-audit's entry REPLACES the walk's rather than
     // being dropped. Both reasons are true of the bucket and neither is cleared
     // by a re-run, so the line says the same thing about what to do next
-    // either way; but only `RewriteParts` carries a count, and dropping it left
-    // the operator with no figure at all for the parts holding that bucket's
-    // floor down.
+    // either way; but only the re-audit's reasons carry a count, and dropping
+    // one left the operator with no figure at all for the parts holding that
+    // bucket's floor down.
     for blocked in std::mem::take(&mut audit.blocked) {
         match report
             .blocked_buckets
@@ -2535,44 +2653,105 @@ mod tests {
         hash_seed: u8,
         part_version: u32,
     ) -> String {
+        put_compaction_fixture(
+            store,
+            CompactionFixture {
+                shard,
+                hour,
+                input_seqs,
+                hash_seed,
+                part_versions: &[part_version],
+                supersedes: "",
+            },
+        )
+        .await
+    }
+
+    /// One compaction record for [`put_compaction_fixture`] to build.
+    struct CompactionFixture<'a> {
+        shard: u32,
+        hour: u32,
+        /// The L0 inputs this record names, by the same `seq` [`seed_at`]
+        /// takes.
+        input_seqs: &'a [u64],
+        /// Fills a version 1 record's `input_set_hash`, which the record key
+        /// embeds. A version 2 record's hash is the version 2 hash over its
+        /// inputs and `supersedes`, so it ignores this.
+        hash_seed: u8,
+        /// One part per entry, stamped at that version.
+        part_versions: &'a [u32],
+        /// The compaction record key this one supersedes. Non-empty makes it a
+        /// version 2 record.
+        supersedes: &'a str,
+    }
+
+    /// Build and PUT one compaction record, version 1 or version 2 as
+    /// `spec.supersedes` decides. No part data objects are written.
+    async fn put_compaction_fixture(
+        store: &dyn ObjectStoreBackend,
+        spec: CompactionFixture<'_>,
+    ) -> String {
         use prost::Message;
         use ravel_proto::commit::v1::{CompactionInputIdentity, CompactionPart};
 
+        let CompactionFixture {
+            shard,
+            hour,
+            input_seqs,
+            hash_seed,
+            part_versions,
+            supersedes,
+        } = spec;
         let th = tenant_hash();
         let created = i64::from(hour) * NS_PER_HOUR;
-        let input_set_hash = vec![hash_seed; 32];
+        let inputs: Vec<CompactionInputIdentity> = input_seqs
+            .iter()
+            .map(|seq| CompactionInputIdentity {
+                writer_id: Uuid::from_u128(u128::from(*seq)).to_string(),
+                writer_epoch: EPOCH,
+                writer_seq: *seq,
+            })
+            .collect();
+        let (format_version, input_set_hash) = if supersedes.is_empty() {
+            (1, vec![hash_seed; 32])
+        } else {
+            (
+                2,
+                ravel_commit::erasure::compute_superseding_compaction_input_set_hash(
+                    &inputs, supersedes,
+                )
+                .to_vec(),
+            )
+        };
         let record = CompactionRecord {
-            format_version: 1,
+            format_version,
             tenant_hash: th.0.to_vec(),
             signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
             shard,
             ingest_hour_bucket: hour,
             level: 1,
-            inputs: input_seqs
+            inputs,
+            input_set_hash: input_set_hash.clone(),
+            parts: part_versions
                 .iter()
-                .map(|seq| CompactionInputIdentity {
-                    writer_id: Uuid::from_u128(u128::from(*seq)).to_string(),
-                    writer_epoch: EPOCH,
-                    writer_seq: *seq,
+                .zip(0u32..)
+                .map(|(version, part_index)| CompactionPart {
+                    part_index,
+                    first_series_id: vec![0u8; 16],
+                    last_series_id: vec![0xff; 16],
+                    content_hash: vec![hash_seed.wrapping_add(part_index as u8); 32],
+                    object_size: 4096,
+                    sample_count: 1,
+                    series_count: 1,
+                    run_count: 1,
+                    min_event_ts_ns: created,
+                    max_event_ts_ns: created + 100,
+                    segment_format_version: *version,
+                    declared_column_stats: Vec::new(),
                 })
                 .collect(),
-            input_set_hash: input_set_hash.clone(),
-            parts: vec![CompactionPart {
-                part_index: 0,
-                first_series_id: vec![0u8; 16],
-                last_series_id: vec![0xff; 16],
-                content_hash: vec![hash_seed; 32],
-                object_size: 4096,
-                sample_count: 1,
-                series_count: 1,
-                run_count: 1,
-                min_event_ts_ns: created,
-                max_event_ts_ns: created + 100,
-                segment_format_version: part_version,
-                declared_column_stats: Vec::new(),
-            }],
             created_unix_ns: created,
-            superseded_record_key: String::new(),
+            superseded_record_key: supersedes.to_string(),
         };
         let hash16: String = input_set_hash[..8]
             .iter()
@@ -3024,9 +3203,10 @@ mod tests {
     /// `migrate_bucket_format` both refuse a bucket that already carries a
     /// compaction record, and the walk never reaches such a bucket's parts
     /// (issue #2093 -- ADR-0066 decision 4 force 2 is unimplemented). What this
-    /// test pins is only that the two SOURCES are counted apart, and that this
-    /// round does not name a compaction-part bucket in `blocked_buckets`:
-    /// whether to add a reason for it is #2093's decision.
+    /// test pins is only that the two SOURCES are counted apart, and that a
+    /// bucket whose AUTHORITATIVE record is below the target is not named in
+    /// `blocked_buckets`: only a bucket held below by overlap losers' parts is
+    /// ([`BlockedReason::LosingRecordParts`]).
     ///
     /// Prove-the-test: make `count_below_target` treat every record's parts as
     /// rewrite parts (delete the `match rec.kind`) and this fails with
@@ -3069,9 +3249,8 @@ mod tests {
         );
         assert!(
             report.blocked_buckets.is_empty(),
-            "this round names only rewrite-parts and loser-only buckets; the below-target \
-             compaction part blocks the floor too but is reported as an l1 count alone \
-             (issue #2093): {:?}",
+            "the below-target part belongs to the bucket's authoritative record, so it blocks \
+             the floor as an l1 count alone and names no bucket (issue #2093): {:?}",
             report.blocked_buckets
         );
         assert_eq!(report.buckets_blocked(), 0);
@@ -3383,6 +3562,238 @@ mod tests {
              FUTURE_VERSION target exactly as in the other tests here (l1 == 1). No rewrite \
              record exists here, so rewrite_parts is 0 and the one blocked bucket carries \
              the overlap reason"
+        );
+    }
+
+    /// Run [`migrate_family`] once to [`FUTURE_VERSION`] over one shard with
+    /// every bucket up to `sealed_hour` sealed.
+    async fn migrate_to_future(
+        store: &dyn ObjectStoreBackend,
+        sealed_hour: u32,
+    ) -> FamilyMigrateReport {
+        let clock = FixedClock::new(sealed_now_ns_for(sealed_hour));
+        migrate_family(
+            store,
+            &clock,
+            &CompactorConfig::default(),
+            tenant_hash(),
+            Signal::Metrics,
+            FAMILY,
+            FUTURE_VERSION,
+            1,
+            MigrateBudget::unlimited(),
+            "test",
+        )
+        .await
+        .expect("migrate")
+    }
+
+    /// Seed four below-target L0 inputs at `(0, 100)` and two overlapping
+    /// compaction records over them: the winner names all four with its one
+    /// part at `winner_part_version`, the loser names `{2, 3}` with three parts,
+    /// two below [`FUTURE_VERSION`] and one at it. The winner names every
+    /// input, so nothing is served raw and the walk has nothing to migrate.
+    /// Returns the winner's key.
+    async fn seed_losing_parts_bucket(
+        store: &dyn ObjectStoreBackend,
+        winner_part_version: u32,
+    ) -> String {
+        for (seq, metric) in [(1u64, "alpha"), (2, "beta"), (3, "gamma"), (4, "delta")] {
+            seed_at(store, 0, 100, seq, metric, VERSION_V7 as u32).await;
+        }
+        let winner =
+            put_compaction_record(store, 0, 100, &[1, 2, 3, 4], 0x11, winner_part_version).await;
+        put_compaction_fixture(
+            store,
+            CompactionFixture {
+                shard: 0,
+                hour: 100,
+                input_seqs: &[2, 3],
+                hash_seed: 0x22,
+                part_versions: &[VERSION_V7 as u32, VERSION_V7 as u32, FUTURE_VERSION],
+                supersedes: "",
+            },
+        )
+        .await;
+        winner
+    }
+
+    /// ADR-0066 force 2 amendment, item 9: a bucket whose authoritative record
+    /// is at the target and whose overlap loser carries below-target parts is
+    /// named `LosingRecordParts` with the loser's below-target part count, and
+    /// those parts still count in `l1`, so the floor is still refused.
+    ///
+    /// The loser has three parts and two are below the target, so
+    /// `below_target == 2` pins a count of below-target PARTS, not of losing
+    /// records (1) or of the loser's parts (3). `l1 == 2` pins that the losing
+    /// parts still count: the winner's part is at the target and adds nothing.
+    ///
+    /// Prove-the-test: delete the `blocked_by_hour.insert(*hour,
+    /// BlockedReason::LosingRecordParts { below_target })` line in
+    /// `count_below_target` and this fails with `blocked_buckets` empty
+    /// (`left: []`): the floor refused over parts no line names, which is the
+    /// pre-change report.
+    #[tokio::test]
+    async fn a_bucket_held_below_only_by_losing_parts_is_named_with_their_count() {
+        let store = MemoryStore::new();
+        provision(&store, 1).await;
+        seed_losing_parts_bucket(&store, FUTURE_VERSION).await;
+
+        let report = migrate_to_future(&store, 100).await;
+
+        let expected = vec![BlockedBucket {
+            shard: 0,
+            ingest_hour: 100,
+            reason: BlockedReason::LosingRecordParts { below_target: 2 },
+        }];
+        assert_eq!(report.blocked_buckets, expected);
+        assert_eq!(report.buckets_migrated, 0, "nothing is served raw");
+        assert_eq!(
+            report.verification,
+            Some(Verification::Stragglers {
+                l0: 0,
+                l1: 2,
+                rewrite_parts: 0,
+                blocked: expected,
+            }),
+            "the loser's two below-target parts count in l1 and name the bucket"
+        );
+    }
+
+    /// The same bucket with the winner's part below the target too: its
+    /// authoritative record has not converged, so the losers are not what
+    /// holds it below and the bucket is not named for them. Every part still
+    /// counts in `l1`.
+    ///
+    /// Prove-the-test: delete the `if parts.authoritative.iter().any(|v| *v <
+    /// target_version) { continue; }` check in `count_below_target` and this
+    /// fails with `blocked: [BlockedBucket { shard: 0, ingest_hour: 100,
+    /// reason: LosingRecordParts { below_target: 2 } }]`.
+    #[tokio::test]
+    async fn a_bucket_whose_winner_is_below_target_is_not_named_for_its_losers() {
+        let store = MemoryStore::new();
+        provision(&store, 1).await;
+        seed_losing_parts_bucket(&store, VERSION_V7 as u32).await;
+
+        let report = migrate_to_future(&store, 100).await;
+
+        assert_eq!(report.blocked_buckets, Vec::new());
+        assert_eq!(
+            report.verification,
+            Some(Verification::Stragglers {
+                l0: 0,
+                l1: 3,
+                rewrite_parts: 0,
+                blocked: Vec::new(),
+            }),
+            "the winner's part and the loser's two below-target parts all count in l1"
+        );
+    }
+
+    /// A record a present version 2 record supersedes is not an overlap loser,
+    /// so its below-target parts do not name the bucket: the sweep reclaims
+    /// it. C1 is a version 1 record with a below-target part, C2 a version 2
+    /// record naming C1 with its part at the target. C1's part still counts
+    /// in `l1`.
+    ///
+    /// Prove-the-test: in `authoritative_compaction_records`, test
+    /// `selection.is_excluded(key)` instead of `selection.losing().contains(key)`
+    /// for the losing branch and this fails with `blocked: [BlockedBucket {
+    /// shard: 0, ingest_hour: 100, reason: LosingRecordParts { below_target: 1
+    /// } }]`.
+    #[tokio::test]
+    async fn a_record_a_version_2_record_supersedes_is_not_named_as_a_loser() {
+        let store = MemoryStore::new();
+        provision(&store, 1).await;
+        for (seq, metric) in [(1u64, "alpha"), (2, "beta")] {
+            seed_at(&store, 0, 100, seq, metric, VERSION_V7 as u32).await;
+        }
+        let c1 = put_compaction_record(&store, 0, 100, &[1, 2], 0x11, VERSION_V7 as u32).await;
+        let c2 = put_compaction_fixture(
+            &store,
+            CompactionFixture {
+                shard: 0,
+                hour: 100,
+                input_seqs: &[1, 2],
+                hash_seed: 0,
+                part_versions: &[FUTURE_VERSION],
+                supersedes: &c1,
+            },
+        )
+        .await;
+
+        // The fixture is what the test says it is: the selector reads C1 as
+        // superseded, not as a loser.
+        let mut records = Vec::new();
+        for key in [&c1, &c2] {
+            let got = store.get(key, GetRange::Full).await.expect("get record");
+            let rec = record::decode_compaction(got.data.as_ref()).expect("decode record");
+            records.push((key.clone(), rec));
+        }
+        let selection = select_authoritative_compaction_records(&records).expect("select");
+        assert!(selection.superseded().contains(c1.as_str()));
+        assert!(selection.losing().is_empty());
+
+        let report = migrate_to_future(&store, 100).await;
+
+        assert_eq!(report.blocked_buckets, Vec::new());
+        assert_eq!(
+            report.verification,
+            Some(Verification::Stragglers {
+                l0: 0,
+                l1: 1,
+                rewrite_parts: 0,
+                blocked: Vec::new(),
+            }),
+            "C1's below-target part counts in l1 until the sweep reclaims it, and names \
+             nothing"
+        );
+    }
+
+    /// A bucket that lists a rewrite record keeps its `RewriteParts` entry and
+    /// is not also named for its overlap loser's parts. The rewrite record
+    /// supersedes the winner and carries one below-target part.
+    ///
+    /// Prove-the-test: delete the `if family.rewrite_hours.contains(hour) {
+    /// continue; }` check in `count_below_target` and this fails with the
+    /// bucket named `LosingRecordParts { below_target: 2 }` in place of
+    /// `RewriteParts { below_target: 1 }`.
+    #[tokio::test]
+    async fn a_bucket_listing_a_rewrite_record_is_named_rewrite_parts_only() {
+        let store = MemoryStore::new();
+        provision(&store, 1).await;
+        let winner = seed_losing_parts_bucket(&store, FUTURE_VERSION).await;
+        put_rewrite_record(
+            &store,
+            RewriteFixture {
+                shard: 0,
+                hour: 100,
+                input_seqs: &[],
+                hash_seed: 0x33,
+                part_version: VERSION_V7 as u32,
+                part_count: 1,
+                supersedes: &winner,
+            },
+        )
+        .await;
+
+        let report = migrate_to_future(&store, 100).await;
+
+        let expected = vec![BlockedBucket {
+            shard: 0,
+            ingest_hour: 100,
+            reason: BlockedReason::RewriteParts { below_target: 1 },
+        }];
+        assert_eq!(report.blocked_buckets, expected);
+        assert_eq!(
+            report.verification,
+            Some(Verification::Stragglers {
+                l0: 0,
+                l1: 2,
+                rewrite_parts: 1,
+                blocked: expected,
+            }),
+            "the loser's parts still count in l1; the bucket is named for its rewrite part"
         );
     }
 }
