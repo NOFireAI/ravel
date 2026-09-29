@@ -2,8 +2,9 @@
 
 Status: Proposed. Issue #2135.
 Migration class A for the RLOG object (trailer version 4 to 5); class C for the
-three additive `TenantConfigRecord` fields (record `format_version` 2 to 3,
-under ADR-0066's R1 readers-before-writers rule).
+two `TenantConfigRecord` fields, 13 and 14, added at record `format_version`
+3 under ADR-0066's R1 readers-before-writers rule (the clustering generation
+is a field of the key message, not of the record).
 Amends ADR-0029 (sort order, encoding choice, BLOOM layout) and ADR-0699
 (row-group dictionaries); both carry an amendment section pointing here.
 Amends ADR-0815 decision 2's field shape (`TenantConfigRecord.clustering_key`)
