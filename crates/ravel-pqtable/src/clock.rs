@@ -31,14 +31,8 @@ impl FixedClock {
         }
     }
 
-    /// Move the clock, so one test can advance time between a writer's
-    /// resolve and its put.
-    pub fn set(&self, now_ns: i64) {
-        self.now_ns
-            .store(now_ns, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// Move the clock forward by `delta_ns`, returning the new value.
+    /// Move the clock forward by `delta_ns`, returning the new value, so one
+    /// test can age time between a writer's resolve and its put.
     pub fn advance(&self, delta_ns: i64) -> i64 {
         self.now_ns
             .fetch_add(delta_ns, std::sync::atomic::Ordering::SeqCst)
