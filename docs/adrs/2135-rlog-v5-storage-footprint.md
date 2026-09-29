@@ -149,18 +149,26 @@ What the codebase already guarantees, which bounds the change:
      order). Every input, whatever its own key, is sorted on the coarse prefix
      because the widths nest, and both admission modes follow the same rule,
      so they emit the same sequence and stay byte-identical.
-   - **Open-cursor set.** With keyed inputs, every input whose slice of a
-     stream reaches the current coarse bucket must be open at once. For
-     unkeyed inputs the set is ADR-0979's `D`, unchanged. For keyed inputs it
-     is at most the number of inputs whose slice of a stream touches one
-     bucket, which for a 1-day bucket can be every input of a sealed hour.
-     The compactor therefore derives a fan-in cap `F` from
-     `merge_cursor_budget_bytes`, and when a bucket's inputs exceed `F` it
-     partitions them, in input order, into batches of at most `F` that are
-     merged independently. The partition is computed before admission, so
-     both modes see the same batches. A keyed bucket is split into more
-     parts, never aborted on the key's account; clustering across batches is
-     lost, and each part is still sorted by the output descriptor.
+   - **Open-cursor set.** When `W` is wider than 1 ns, every input whose
+     slice of a stream reaches the current coarse bucket must be open at
+     once, keyed or not. In a merge where no input is keyed the set is
+     ADR-0979's `D`, unchanged. Otherwise it is every input whose slice of the
+     stream touches one bucket, which for a 1-day bucket can be every input of
+     a sealed hour.
+   - **Batches sized by reservation.** Before admission, for each stream, the
+     compactor sums the `cursor_reservation_bytes` of the inputs touching each
+     coarse bucket, using the SKIP_IDX bounds admission already reads. If no
+     bucket's sum exceeds `merge_cursor_budget_bytes`, the stream merges in
+     one pass as above. If one does, the stream's inputs are partitioned in
+     input order, greedily on the running sum of their reservations, into
+     batches whose sum stays within the budget, and each batch is merged on
+     its own. Reservations differ widely between inputs, which is why the cap
+     is on bytes, not on a count of inputs. The partition depends only on the
+     input set, so both admission modes see the same batches. A single input
+     whose own reservation exceeds the budget aborts exactly as it does today
+     in an unkeyed merge; batching adds no abort of its own. A batched stream
+     yields more parts, clustering across batches is lost, and each part is
+     still sorted by the output descriptor.
    - **Part cuts.** Parts close on the same memory and stored-size targets as
      today, including in the middle of a coarse bucket (issue #711 stands).
      The merge's emission order is deterministic for a fixed input set, so
@@ -213,10 +221,20 @@ What the codebase already guarantees, which bounds the change:
    whose distinct values in a row group are at most half its values, the
    column chunk starts with one dictionary page, and each block's page holds
    only bit-packed ids into it (new tags 12, dictionary page, and 13,
-   dictionary ids). PAGE_DIR lists the dictionary page first in the chunk. A
-   reader that needs any block of the chunk fetches the dictionary page too;
-   it sits at the start of the chunk extent the ranged fetcher already reads.
-   Both writer paths build the row-group dictionary the same way.
+   dictionary ids). The dictionary page belongs to the chunk, not to a
+   block. PAGE_DIR lists it first in the chunk with a block index equal to
+   the group's `block_count`, one past its last block, which no v4 entry can
+   carry; every other page keeps its block. It is outside every block's
+   level-0 crc. Every reader verifies the dictionary page's own PAGE_DIR
+   crc32c before decoding any id against it, on every path, including a
+   whole-block read, so a corrupt dictionary is a `Corrupted` error for every
+   block of the chunk, never wrong strings. A reader that needs any block of
+   the chunk fetches the dictionary page too; it sits at the start of the
+   chunk extent the ranged fetcher already reads. Both writer paths build
+   the row-group dictionary the same way. Every object of the measured
+   corpus is a single row group, so the -5.5% measured for one dictionary
+   per object is the row-group figure there, and an upper bound for
+   compacted objects that hold several row groups.
 
 7. **Version and rollout.**
    - **RLOG object.** All of the above is RLOG trailer version 5. Under
@@ -244,7 +262,7 @@ flowchart TD
     TC["TenantConfigRecord v3<br/>clustering_key + generation, bloom_scope"] --> ING["Ingest flush<br/>RlogWriter"]
     LD["Bulk loader<br/>--zstd-level"] --> ING
     ING -->|"sort (stream, bucket, key, ts)<br/>GCD, column ref, stored-size choice<br/>row-group dictionaries"| L0["L0 RLOG v5<br/>footer: sort descriptor, generation<br/>BLOOM: covered columns"]
-    L0 --> CMP["Compaction merge<br/>heads by (stream_id, ts / W, input)<br/>fan-in capped by the cursor budget"]
+    L0 --> CMP["Compaction merge<br/>heads by (stream_id, ts / W, input)<br/>reservation-sized batches when a bucket exceeds the cursor budget"]
     CMP -->|"descriptor of the highest generation<br/>compaction zstd level"| L1["L1 RLOG v5"]
     L0 --> RD["Readers<br/>bloom arms only on covered columns"]
     L1 --> RD
@@ -316,14 +334,19 @@ the per-object record it would read.
 - Time pruning inside one stream coarsens to the bucket width for a tenant
   that declares a key. Pruning on the key's columns improves, because blocks
   become narrow in them.
-- Compaction of a keyed tenant opens more cursors per bucket than today and
-  is split into fan-in batches when they exceed the cursor budget, producing
-  more parts for that bucket than an unkeyed tenant would.
+- Compaction of a keyed tenant opens more cursors per bucket than today, and
+  a merge holding any keyed input admits its unkeyed inputs per bucket too.
 - Write CPU rises: every candidate encoding is compressed, and higher levels
   compress more slowly. Decompression cost does not depend on the level. Each
   stage reports its serialize and compaction CPU next to its bytes.
 - The clustering key and bloom scope cannot be set until the release after
-  the one carrying the record-version-3 reader has rolled out.
+  the one carrying the record-version-3 reader has rolled out. While the
+  writer release is rolling out, a node still on the reader-only build reads
+  a version-3 record but refuses to rewrite it, so a tenant config change
+  routed to that node fails with a refusal to rewrite a newer record until
+  the rollout finishes.
+- Keyed compaction may split a stream into reservation-sized batches, which
+  yields more parts for that stream than an unbatched merge.
 - Every RLOG object written before this change becomes unreadable by a build
   that includes it, per ADR-0531. Development stores are wiped or re-ingested.
 - Golden fixtures, `ravel-cli` inspector fixtures, version assertions in
