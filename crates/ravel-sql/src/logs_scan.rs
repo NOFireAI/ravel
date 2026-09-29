@@ -861,7 +861,7 @@ fn stamp_scalar(ty: DeclaredType, value: DeclaredStatValue) -> Option<ScalarValu
 /// column (ADR-0873 clause 6 drops every occurrence of a duplicated name, so a
 /// duplicate arrives here as no entry at all) and the lookup is a lookup rather
 /// than a pick between claims.
-fn stamp_coverage(
+pub(crate) fn stamp_coverage(
     declared: &DeclaredColumn,
     stamps: &DeclaredColumnStats,
 ) -> Option<SegmentCoverage> {
