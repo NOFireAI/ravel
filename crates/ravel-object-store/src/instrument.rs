@@ -67,6 +67,18 @@
 //!   [`StoreMetrics::record_get_unverified`]. Zero for a backend that is not the
 //!   S3 adapter. A non-zero and *growing* value against an endpoint that is
 //!   supposed to store checksums is the signal that it is dropping them.
+//! - The bucket-protection control plane (ADR-1727 decision 1) has its own
+//!   block, [`ControlPlaneMetricsSnapshot`], read with
+//!   [`StoreMetrics::control_plane`] and never through [`StoreOp`] or
+//!   [`StoreMetrics::snapshot`]. Its read-only GETs are not data-plane calls,
+//!   so counting them under `get` or `list` would add attempts with no
+//!   matching `calls` and break `attempts - calls` as the retry overhead.
+//!   `requests` counts every GET it sends, before dispatch; `calls` counts
+//!   those that got an HTTP response back, whatever its status, so
+//!   `requests - calls` is the GETs that got no response at all.
+//!   `response_bytes` counts the wire bytes of each response body as received,
+//!   error bodies included, before any size check refuses the body; a response
+//!   refused on its `Content-Length` reads no body and adds nothing.
 //! - `errors[class]` is indexed by [`StoreErrorClass`], one slot per
 //!   [`StoreError`] variant. `AlreadyExists` under `CreateIfAbsent` is a
 //!   protocol signal rather than a failure (ADR-0002), so a healthy commit
@@ -432,6 +444,32 @@ pub struct StoreMetrics {
     /// checksum check (ADR-1696 decision 3). Store-wide rather than per-op:
     /// only `get` can move it, so a per-op block would be five permanent zeros.
     get_unverified: AtomicU64,
+    /// The bucket-protection control plane's own block; see the
+    /// [module docs](self).
+    control_plane: ControlPlaneMetrics,
+}
+
+/// Counters for the bucket-protection control plane's read-only GETs
+/// (ADR-1727 decision 1). See the [module docs](self) for what each counts.
+#[derive(Debug, Default)]
+struct ControlPlaneMetrics {
+    requests: AtomicU64,
+    calls: AtomicU64,
+    response_bytes: AtomicU64,
+}
+
+/// Point-in-time copy of the control plane's block, read with
+/// [`StoreMetrics::control_plane`]. Not part of [`StoreMetricsSnapshot`]: the
+/// block is no [`StoreOp`], so an exporter iterating [`StoreOp::ALL`] never
+/// sees it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ControlPlaneMetricsSnapshot {
+    /// GETs sent, counted before dispatch.
+    pub requests: u64,
+    /// GETs that got an HTTP response back, whatever its status.
+    pub calls: u64,
+    /// Wire bytes of the response bodies, as received.
+    pub response_bytes: u64,
 }
 
 impl StoreMetrics {
@@ -470,6 +508,33 @@ impl StoreMetrics {
     /// wants the one counter without taking a whole [`snapshot`](Self::snapshot).
     pub fn get_unverified(&self) -> u64 {
         self.get_unverified.load(Ordering::Relaxed)
+    }
+
+    /// One control-plane GET about to be sent. Touches no per-op block.
+    pub(crate) fn record_control_plane_request(&self) {
+        self.control_plane.requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One control-plane GET that got an HTTP response back.
+    pub(crate) fn record_control_plane_call(&self) {
+        self.control_plane.calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Response-body bytes of a control-plane GET, as received.
+    pub(crate) fn record_control_plane_response_bytes(&self, bytes: u64) {
+        self.control_plane
+            .response_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Point-in-time copy of the control plane's block. Separate from
+    /// [`snapshot`](Self::snapshot), which covers the data plane only.
+    pub fn control_plane(&self) -> ControlPlaneMetricsSnapshot {
+        ControlPlaneMetricsSnapshot {
+            requests: self.control_plane.requests.load(Ordering::Relaxed),
+            calls: self.control_plane.calls.load(Ordering::Relaxed),
+            response_bytes: self.control_plane.response_bytes.load(Ordering::Relaxed),
+        }
     }
 
     /// Record one completed call from outside this module, using the same
