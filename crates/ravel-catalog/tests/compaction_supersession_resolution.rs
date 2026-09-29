@@ -1,12 +1,13 @@
 //! Resolution honours a version 2 compaction record (ADR-0066 force 2
-//! amendment, items 3 and 5).
+//! amendment, items 2, 3 and 5).
 //!
 //! A version 2 record names, in `superseded_record_key`, the compaction record
 //! it re-encodes. Its inputs are the predecessor's, so left to the overlap
 //! rule alone the two would form one component and the tie-break could keep
 //! the predecessor. The selector excludes every record a present version 2
-//! record names, following chains of them, before any component is formed.
-//! And when a live rewrite record and a version 2 record both supersede the
+//! record names, following chains of them, before any component is formed,
+//! and refuses a version 2 record whose inputs differ from its present
+//! predecessor's as a typed error. And when a live rewrite record and a version 2 record both supersede the
 //! same predecessor, the rewrite wins: the version 2 record's parts re-encode
 //! the pre-erasure data.
 //!
@@ -23,8 +24,8 @@
 use std::sync::Arc;
 
 use ravel_catalog::{
-    Catalog, CatalogConfig, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, DEFAULT_FOLD_SAFETY_MARGIN_NS,
-    DEFAULT_MAX_FLUSH_LIFETIME_NS, SegmentLevel,
+    Catalog, CatalogConfig, CatalogError, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
+    DEFAULT_FOLD_SAFETY_MARGIN_NS, DEFAULT_MAX_FLUSH_LIFETIME_NS, SegmentLevel,
 };
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_commit::{erasure, keys, signal};
@@ -396,6 +397,78 @@ async fn a_version_2_record_naming_an_absent_key_excludes_nothing() {
     let mut expected = vec![part_key(&c2), part_key(&other)];
     expected.sort();
     assert_eq!(l1_keys(&snapshot), expected);
+}
+
+/// C1 over `[a, b]` and a version 2 C2 naming C1 but carrying `[a, b, c]`: a
+/// record a writer copying its predecessor's inputs would never produce, and
+/// one decoding cannot refuse, since the version 2 hash is over C2's own
+/// inputs. Returns C1's key and C2's key.
+async fn mismatched_successor(store: &dyn ObjectStoreBackend) -> (String, String) {
+    let (a, b, c) = (l0_record(1), l0_record(2), l0_record(3));
+    let c1 = version_1(&[&a, &b], 0x00, 0xc1);
+    let c1_key = put_compaction(store, &c1).await;
+    let mut c2 = version_2(&c1, &c1_key, 0xc2);
+    c2.inputs.push(identity(&c));
+    c2.input_set_hash =
+        erasure::compute_superseding_compaction_input_set_hash(&c2.inputs, &c1_key).to_vec();
+    let c2_key = put_compaction(store, &c2).await;
+    (c1_key, c2_key)
+}
+
+fn is_input_mismatch(err: &CatalogError, c1_key: &str, c2_key: &str) -> bool {
+    matches!(
+        err,
+        CatalogError::CompactionSupersessionInputMismatch { key, superseded_key }
+            if key == c2_key && superseded_key == c1_key
+    )
+}
+
+/// A version 2 record whose inputs differ from its present predecessor's is a
+/// typed error on resolve and on the fold, never an exclusion of the
+/// predecessor.
+///
+/// Flipped line: `check_version_2_inputs(records)?;` in
+/// `superseded_by_version_2_records` (catalog.rs). Without it C1 is excluded,
+/// the resolve serves C2's part, and the fold seals the hour.
+#[tokio::test]
+async fn a_version_2_record_with_other_inputs_is_a_typed_error() {
+    let store = Arc::new(MemoryStore::new());
+    let (c1_key, c2_key) = mismatched_successor(store.as_ref()).await;
+
+    let (range, now) = live_window();
+    let err = catalog(&store)
+        .resolve(&tenant(), Signal::Metrics, range, &[], now)
+        .await
+        .expect_err("resolve must refuse the bucket");
+    assert!(is_input_mismatch(&err, &c1_key, &c2_key), "{err:?}");
+
+    let (_, now) = sealed_window();
+    let err = catalog(&store)
+        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
+        .await
+        .expect_err("the fold must refuse the bucket");
+    assert!(is_input_mismatch(&err, &c1_key, &c2_key), "{err:?}");
+}
+
+/// The same mismatch with a live rewrite naming C1 is the same error, although
+/// dominance drops C2 before the selector sees it.
+///
+/// Flipped line: `check_version_2_inputs(compaction_records)?;` in
+/// `erasure_dominated_compaction_records` (catalog.rs). Without it C2 is
+/// dominated and dropped, C1 is rewrite-superseded, and the resolve succeeds
+/// serving the rewrite's part.
+#[tokio::test]
+async fn a_dominated_version_2_record_with_other_inputs_is_a_typed_error() {
+    let store = Arc::new(MemoryStore::new());
+    let (c1_key, c2_key) = mismatched_successor(store.as_ref()).await;
+    put_rewrite(store.as_ref(), &c1_key, 0x0e).await;
+    let (range, now) = live_window();
+
+    let err = catalog(&store)
+        .resolve(&tenant(), Signal::Metrics, range, &[], now)
+        .await
+        .expect_err("resolve must refuse the bucket");
+    assert!(is_input_mismatch(&err, &c1_key, &c2_key), "{err:?}");
 }
 
 /// C1 over `[a, b]` with the all-`0xff` hash, a version 2 C2 naming C1, and a

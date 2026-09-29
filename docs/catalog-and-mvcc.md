@@ -448,9 +448,10 @@ and the CAS read/write helpers.
   its own version: the version 1 hash over `inputs` for a version 1 record,
   the version 2 hash over `(inputs, superseded_record_key)` for a version 2
   record. Resolution honours its supersession (step 3 of "Snapshot
-  resolution" below). No writer produces a version 2 record yet, and the
-  sweep does not yet reclaim the record it supersedes; both are later steps
-  of the amendment's task list.
+  resolution" below), and refuses a bucket where a version 2 record's inputs
+  differ from those of the present record it names. No writer produces a
+  version 2 record yet, and the sweep reclaims nothing on account of its
+  supersession yet; both are later steps of the amendment's task list.
 - Selective-erasure request and completion records (ADR-0064 decision 1) live
   under a separate `t/<tenant_hash>/<signal>/del/` prefix, not in `c/`, so the
   bucket-resolution LIST never sees them; the resolver LISTs `del/` once per
@@ -1224,7 +1225,16 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
      amendment). Every compaction record a present version 2 record names is
      excluded before the overlap components below are formed: its parts are
      not included and its inputs do not join `excluded` on its account (the
-     version 2 record names the same inputs). Chains are followed (C3
+     version 2 record names the same inputs). Decoding sees one record and
+     cannot check that equality, so resolution does: a version 2 record
+     whose deduplicated input set differs from that of the present record it
+     names is a typed error naming both keys, never an exclusion, since
+     excluding the predecessor would stop covering an input only it names.
+     The check runs before erasure dominance as well as in the overlap
+     selection, so a dominated version 2 record cannot bypass it, and every
+     resolution of the bucket (the token fallback, the index fold, scrub,
+     the erasure completion gate and `migrate` included) fails with it.
+     Chains are followed (C3
      supersedes C2 supersedes C1 leaves only C3), with the same bounded,
      cycle-checked walk the rewrite chase uses: a cycle or a chain longer
      than the bound is a typed error, never a guess about which record is
@@ -1239,11 +1249,16 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
      overlap selection sees only compaction records, so this rule is applied
      first, wherever rewrite and compaction records are both in view:
      resolution, the token fallback (step 5), the index fold, scrub, the
-     erasure completion gate and `migrate`. The superseded-input sweep does
-     not reclaim a superseded predecessor, its parts, or a dominated version
-     2 record yet, and treats an input as superseded only where an
-     authoritative record names it both with and without version 2
-     supersession applied.
+     erasure completion gate and `migrate`. The superseded-input sweep
+     reclaims nothing on account of version 2 supersession or dominance yet:
+     a superseded predecessor or a dominated version 2 record is reclaimed
+     only where a rule that predates version 2 records reaches it, such as a
+     rewrite chain that names it. The sweep treats an input as superseded
+     only where an authoritative record names it both with and without
+     version 2 supersession applied, and treats none of a bucket's inputs as
+     superseded when that bucket's supersession does not resolve (a cycle,
+     an over-deep chain, or a version 2 record whose inputs differ from its
+     predecessor's).
    - Include each compaction record's parts and each rewrite record's output
      parts as segment refs, filtered by per-part event bounds, UNLESS that
      record's key is in `superseded_records`. A superseded record's parts are

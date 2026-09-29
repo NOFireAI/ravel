@@ -1,13 +1,15 @@
 //! Maintenance over a bucket holding a version 2 compaction record (ADR-0066
-//! force 2 amendment, items 3 to 5).
+//! force 2 amendment, items 2 to 5).
 //!
 //! A version 2 record names, in `superseded_record_key`, the compaction record
 //! it re-encodes. The shared selector excludes that predecessor, and a version
 //! 2 record whose predecessor a live rewrite record supersedes is dropped
 //! before the selector runs. The erasure completion gate and `migrate` follow
-//! both rules, as the resolver does. The sweep does not reclaim a superseded
-//! predecessor yet: that needs horizon, reachability and hold rules of its
-//! own, so until then it deletes nothing it did not delete before.
+//! both rules, as the resolver does. A version 2 record whose inputs differ
+//! from its present predecessor's is a typed error for all of them. The sweep
+//! does not reclaim a superseded predecessor yet: that needs horizon,
+//! reachability and hold rules of its own, so until then it deletes nothing it
+//! did not delete before.
 //!
 //! Every fixture writes records directly to a `MemoryStore` and drives the
 //! production entries (`sweep_superseded`, `sweep_unreferenced_parts`,
@@ -322,17 +324,41 @@ async fn sweep_keeps_an_erasure_dominated_version_2_record() {
     );
 }
 
+/// Seed one raw L0 input per `(writer, seq)` in the logs bucket, returning
+/// each one's commit key and data key.
+async fn seed_inputs(
+    store: &dyn ObjectStoreBackend,
+    inputs: &[(u128, u64)],
+) -> Vec<(String, String)> {
+    let base = hour_ns();
+    let mut commits = Vec::new();
+    for &(writer, seq) in inputs {
+        let commit = seed_rlog_input(
+            store,
+            Uuid::from_u128(writer),
+            1,
+            seq,
+            &[log_record(1, base + 1_000 * seq as i64, "row")],
+        )
+        .await;
+        let data = data_key_of(store, &commit).await;
+        commits.push((commit, data));
+    }
+    commits
+}
+
 /// The sweep's guard: an input is superseded only where an authoritative
 /// record names it both with version 2 supersession honoured and with it
-/// ignored. C1 names `[a, b]` and wins the tie-break once supersession is
-/// ignored; C2 (version 2, naming C1) names `[a, c]`, which a writer that
-/// copies its predecessor's inputs would never produce but decoding cannot
-/// refuse. Honoured, C2 is authoritative and names `a` and `c`; ignored, C1
-/// is and names `a` and `b`. Only `a` is in both, so only `a` goes.
+/// ignored. C1 names `[a, b]` with the all-zero hash, C2 (version 2, naming
+/// C1) re-encodes the same `[a, b]`, and a version 1 D names `[b, c]` with a
+/// hash between C1's and C2's. All three sets are the same size, so the hash
+/// decides. Ignored, the three form one component, C1 wins, and the
+/// authoritative inputs are `a` and `b`; honoured, C1 is excluded, D beats C2,
+/// and they are `b` and `c`. Only `b` is in both, so only `b` goes.
 ///
 /// Flipped lines, in `AuthoritativeInputs::from_records` (sweep.rs): keeping
 /// only the ignored view (the sweep before resolution honoured version 2
-/// records) deletes `b`, which the resolver now serves as a raw L0 because no
+/// records) deletes `a`, which the resolver now serves as a raw L0 because no
 /// authoritative record names it; keeping only the honoured view deletes `c`,
 /// which a node that predates the rule still serves as a raw L0.
 #[tokio::test]
@@ -340,19 +366,7 @@ async fn sweep_supersedes_only_inputs_both_views_name() {
     let store = Arc::new(MemoryStore::new());
     let b = logs_bucket();
     let base = hour_ns();
-    let mut commits = Vec::new();
-    for (writer, seq) in [(0xC1u128, 1u64), (0xC2, 2), (0xC3, 3)] {
-        let commit = seed_rlog_input(
-            store.as_ref(),
-            Uuid::from_u128(writer),
-            1,
-            seq,
-            &[log_record(1, base + 1_000 * seq as i64, "row")],
-        )
-        .await;
-        let data = data_key_of(store.as_ref(), &commit).await;
-        commits.push((commit, data));
-    }
+    let commits = seed_inputs(store.as_ref(), &[(0xC1, 1), (0xC2, 2), (0xC3, 3)]).await;
     let c1 = version_1(
         &b,
         vec![input(0xC1, 1), input(0xC2, 2)],
@@ -363,14 +377,58 @@ async fn sweep_supersedes_only_inputs_both_views_name() {
     let c2 = version_2(
         &c1,
         &c1_key,
-        vec![input(0xC1, 1), input(0xC3, 3)],
+        c1.inputs.clone(),
+        part(0xc2, base, base + 10_000),
+    );
+    put_compaction(store.as_ref(), &c2).await;
+    let d = version_1(
+        &b,
+        vec![input(0xC2, 2), input(0xC3, 3)],
+        0x01,
+        part(0xd1, base, base + 10_000),
+    );
+    assert!(
+        d.input_set_hash < c2.input_set_hash,
+        "D must beat C2 in the honoured view"
+    );
+    put_compaction(store.as_ref(), &d).await;
+
+    let deleted = sweep_everything(store.as_ref(), &b).await;
+    let (b_commit, b_data) = commits[1].clone();
+    assert_eq!(deleted, BTreeSet::from([b_commit, b_data]));
+}
+
+/// A version 2 C2 naming C1 but carrying `[a, b, c]` where C1 carries
+/// `[a, b]` is a typed error for every resolution of the bucket, so the sweep
+/// treats none of its inputs as superseded and deletes nothing.
+///
+/// Flipped line: `check_version_2_inputs(records)?;` in
+/// `superseded_by_version_2_records` (catalog.rs). Without it C2 is
+/// authoritative in both views (honoured, C1 is excluded; ignored, C2's larger
+/// set wins), and the sweep deletes all three inputs.
+#[tokio::test]
+async fn sweep_deletes_nothing_for_a_version_2_record_with_other_inputs() {
+    let store = Arc::new(MemoryStore::new());
+    let b = logs_bucket();
+    let base = hour_ns();
+    seed_inputs(store.as_ref(), &[(0x61, 1), (0x62, 2), (0x63, 3)]).await;
+    let c1 = version_1(
+        &b,
+        vec![input(0x61, 1), input(0x62, 2)],
+        0x00,
+        part(0xc1, base, base + 10_000),
+    );
+    let c1_key = put_compaction(store.as_ref(), &c1).await;
+    let c2 = version_2(
+        &c1,
+        &c1_key,
+        vec![input(0x61, 1), input(0x62, 2), input(0x63, 3)],
         part(0xc2, base, base + 10_000),
     );
     put_compaction(store.as_ref(), &c2).await;
 
     let deleted = sweep_everything(store.as_ref(), &b).await;
-    let (a_commit, a_data) = commits[0].clone();
-    assert_eq!(deleted, BTreeSet::from([a_commit, a_data]));
+    assert_eq!(deleted, BTreeSet::new());
 }
 
 fn pending_request(b: &Bucket, request_id: Uuid) -> Vec<PendingErasureRequest> {
@@ -472,30 +530,20 @@ async fn migrate_counts_a_predecessor_and_its_successor_as_one_record() {
     assert_eq!(largest_overlap_component(&contested).expect("count"), 2);
 }
 
-/// `migrate`'s re-audit treats as superseded only the inputs the resolver's
-/// authoritative records name, dominance included. R supersedes C1 over
-/// `[a, b]`; the version 2 C2 names C1 but carries `[a, b, c]`. The resolver
-/// drops the dominated C2, so no authoritative record names `c` and it is
-/// served as a raw L0 below the target: the re-audit must count it.
+/// `migrate`'s re-audit refuses a bucket the resolver refuses. R supersedes C1
+/// over `[a, b]`; the version 2 C2 names C1 but carries `[a, b, c]`. The
+/// re-audit fails with the typed error rather than counting `c` either way.
 ///
-/// Flipped line: `erasure_dominated_compaction_records` (catalog.rs) returning
-/// an empty set. C2 is then authoritative, `c` counts as superseded, and the
-/// re-audit reports no live below-target L0.
+/// Flipped line: `check_version_2_inputs(compaction_records)?;` in
+/// `erasure_dominated_compaction_records` (catalog.rs). The re-audit drops the
+/// dominated C2 before the selector runs, so without it the selector never
+/// sees C2 and the re-audit reports `c` as a live below-target L0.
 #[tokio::test]
-async fn migrate_reaudit_follows_erasure_dominance() {
+async fn migrate_reaudit_refuses_a_version_2_record_with_other_inputs() {
     let store = Arc::new(MemoryStore::new());
     let b = logs_bucket();
     let base = hour_ns();
-    for (writer, seq) in [(0x71u128, 1u64), (0x72, 2), (0x73, 3)] {
-        seed_rlog_input(
-            store.as_ref(),
-            Uuid::from_u128(writer),
-            1,
-            seq,
-            &[log_record(1, base + 1_000 * seq as i64, "row")],
-        )
-        .await;
-    }
+    seed_inputs(store.as_ref(), &[(0x71, 1), (0x72, 2), (0x73, 3)]).await;
     let c1 = version_1(
         &b,
         vec![input(0x71, 1), input(0x72, 2)],
@@ -509,7 +557,7 @@ async fn migrate_reaudit_follows_erasure_dominance() {
         vec![input(0x71, 1), input(0x72, 2), input(0x73, 3)],
         part(0xc2, base, base + 10_000),
     );
-    put_compaction(store.as_ref(), &c2).await;
+    let c2_key = put_compaction(store.as_ref(), &c2).await;
     put_rewrite(
         store.as_ref(),
         &b,
@@ -520,8 +568,14 @@ async fn migrate_reaudit_follows_erasure_dominance() {
     .await;
 
     let target = u32::from(ravel_logseg::footer::VERSION) + 1;
-    let report = count_below_target(store.as_ref(), &b.tenant_hash, b.signal, SHARD + 1, target)
+    let err = count_below_target(store.as_ref(), &b.tenant_hash, b.signal, SHARD + 1, target)
         .await
-        .expect("re-audit");
-    assert_eq!(report.l0, 1, "only c is served raw: {report:?}");
+        .expect_err("the re-audit must refuse the bucket");
+    let message = err.to_string();
+    assert!(
+        message.contains("names a different input set")
+            && message.contains(&c2_key)
+            && message.contains(&c1_key),
+        "{message}"
+    );
 }

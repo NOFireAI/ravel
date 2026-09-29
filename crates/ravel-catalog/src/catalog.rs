@@ -4410,18 +4410,69 @@ fn bucket_label(record_key: &str) -> String {
     }
 }
 
+/// A record's input identities, deduplicated.
+fn input_identity_set(record: &CompactionRecord) -> HashSet<(&str, u64, u64)> {
+    record
+        .inputs
+        .iter()
+        .map(|input| {
+            (
+                input.writer_id.as_str(),
+                input.writer_epoch,
+                input.writer_seq,
+            )
+        })
+        .collect()
+}
+
+/// Refuse a version 2 record whose present predecessor names a different
+/// deduplicated input set, as
+/// [`CatalogError::CompactionSupersessionInputMismatch`]. Excluding such a
+/// predecessor would stop covering an input only it names, and the sweep,
+/// which does not see rewrite records, could then disagree with the resolver
+/// about which inputs are served raw. A predecessor that is not present is
+/// not checked.
+fn check_version_2_inputs<K, R>(records: &[(K, R)]) -> Result<(), CatalogError>
+where
+    K: AsRef<str>,
+    R: Borrow<CompactionRecord>,
+{
+    let by_key: HashMap<&str, &CompactionRecord> = records
+        .iter()
+        .map(|(key, record)| (key.as_ref(), record.borrow()))
+        .collect();
+    for (key, record) in records {
+        let record = record.borrow();
+        if record.superseded_record_key.is_empty() {
+            continue;
+        }
+        let Some(predecessor) = by_key.get(record.superseded_record_key.as_str()) else {
+            continue;
+        };
+        if input_identity_set(record) != input_identity_set(predecessor) {
+            return Err(CatalogError::CompactionSupersessionInputMismatch {
+                key: key.as_ref().to_string(),
+                superseded_key: record.superseded_record_key.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The keys of every record in `records` that a present version 2 compaction
 /// record names in `superseded_record_key`, following chains of version 2
-/// records. A named key that is not present excludes nothing. Each chain is
-/// walked from every version 2 record, bounded by
-/// [`MAX_REWRITE_SUPERSESSION_DEPTH`] records and checked for a revisit, so a
-/// cycle or an over-deep chain is a typed error rather than a guess about
-/// which record is live.
+/// records. A named key that is not present excludes nothing. A present one
+/// whose input set differs from the version 2 record's is a typed error
+/// ([`check_version_2_inputs`]), never an exclusion. Each chain is walked from
+/// every version 2 record, bounded by [`MAX_REWRITE_SUPERSESSION_DEPTH`]
+/// records and checked for a revisit, so a cycle or an over-deep chain is a
+/// typed error rather than a guess about which record is live.
 fn superseded_by_version_2_records<K, R>(records: &[(K, R)]) -> Result<HashSet<&str>, CatalogError>
 where
     K: AsRef<str>,
     R: Borrow<CompactionRecord>,
 {
+    check_version_2_inputs(records)?;
     let by_key: HashMap<&str, &CompactionRecord> = records
         .iter()
         .map(|(key, record)| (key.as_ref(), record.borrow()))
@@ -4477,7 +4528,11 @@ where
 /// rewrite still names it, and the version 2 record stays dominated. The
 /// rewrite chains are resolved with [`resolve_rewrite_supersession`], so a
 /// cyclic or over-deep chain is the same typed error resolution returns;
-/// `bucket_prefix` names the bucket in it.
+/// `bucket_prefix` names the bucket in it. A version 2 record whose present
+/// predecessor names a different input set is refused here too
+/// ([`check_version_2_inputs`]): the selector never sees a dominated record,
+/// so without this check a mismatch would pass whenever a rewrite names the
+/// predecessor.
 pub fn erasure_dominated_compaction_records<'a, K, R, RK, RR>(
     compaction_records: &'a [(K, R)],
     rewrite_records: &[(RK, RR)],
@@ -4496,6 +4551,7 @@ where
     if rewrite_records.is_empty() || !any_version_2 {
         return Ok(dominated);
     }
+    check_version_2_inputs(compaction_records)?;
     let compaction_by_key: HashMap<&str, &CompactionRecord> = compaction_records
         .iter()
         .map(|(key, record)| (key.as_ref(), record.borrow()))
@@ -4547,8 +4603,9 @@ where
 /// Supersession is applied first. A version 2 record names, in
 /// `superseded_record_key`, the record it re-encodes; every present record so
 /// named is excluded before any component is formed, following chains of
-/// version 2 records (see [`superseded_by_version_2_records`] for the bound and
-/// the cycle check, whose failures are this function's only errors). Left in, a
+/// version 2 records (see [`superseded_by_version_2_records`] for the bound,
+/// the cycle check and the input-equality check, whose failures are this
+/// function's only errors). Left in, a
 /// predecessor and its successor would share every input, form one component,
 /// and the tie-break below could keep the predecessor. A version 2 record whose
 /// own predecessor a rewrite record supersedes is removed by the caller before
@@ -4613,19 +4670,7 @@ where
     // same input twice must not thereby claim a larger set.
     let identities: Vec<HashSet<(&str, u64, u64)>> = live
         .iter()
-        .map(|(_key, record)| {
-            record
-                .inputs
-                .iter()
-                .map(|input| {
-                    (
-                        input.writer_id.as_str(),
-                        input.writer_epoch,
-                        input.writer_seq,
-                    )
-                })
-                .collect()
-        })
+        .map(|(_key, record)| input_identity_set(record))
         .collect();
 
     // Union-find over record indices: union two records whenever they name the
@@ -6228,8 +6273,7 @@ mod tests {
 
         // Dominance reads the same chase: a sibling version 2 record naming C1
         // is dominated because the rewrite reached C1 through C2.
-        let (sibling_key, mut sibling) = bare_compaction(0x40, c1_key);
-        sibling.inputs[0].writer_seq = 2;
+        let (sibling_key, sibling) = bare_compaction(0x40, c1_key);
         let compactions = vec![
             chain[0].clone(),
             chain[1].clone(),
