@@ -1177,10 +1177,10 @@ MINUS the two cache ceilings, not the pre-carve `memory_budget_bytes` figure
 logged beside it; `u64::MAX` means unlimited, which is what any host with
 unreadable memory reports regardless of the caps set on it),
 `ravel_memory_reserved_bytes` split by a
-`component` label (`fetch` is the bytes held by PromQL-path fetch
-reservations, including distributed fragment slices and the startup cache
-warm pass; `sql` is the rest of the reserved total; the SQL path's own
-fetchers do not reserve against this budget yet), and
+`component` label (`fetch` is the bytes held by fetch reservations on the
+PromQL and SQL paths, including distributed fragment slices and the startup
+cache warm pass; `sql` is the rest of the reserved total, what the SQL
+executor's per-tenant accountants hold), and
 `ravel_memory_handoff_overlap_bytes` (the part of the `fetch` share whose
 bytes went through the read cache, hit or miss, whether or not the cache
 kept them; `0` when no read cache is configured).

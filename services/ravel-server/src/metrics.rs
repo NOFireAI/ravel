@@ -473,9 +473,9 @@ impl AllocatorStat {
 /// `MemoryBudget` through its raw `try_reserve`/`reserve_unchecked`/`release`
 /// counter API; `Fetch` is the fetch layer's own reservation against that
 /// same budget (the PromQL, fragment and cache-warm `SegmentFetcher` and
-/// `LogSegmentFetcher` instances, through the RAII `reserve`/`Reservation`
-/// API). The fetchers `build_sql_state` constructs and `SpanSegmentFetcher`
-/// use the same API but are not wired to this budget.
+/// `LogSegmentFetcher` instances, and the three fetchers `build_sql_state`
+/// constructs, RSPAN included, through the RAII `reserve`/`Reservation`
+/// API).
 /// `ravel_memory::MemoryBudget` tracks the fetch share in its own counter, so
 /// the two never double-count (see [`Label::MemoryComponent`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

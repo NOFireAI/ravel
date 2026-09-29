@@ -493,11 +493,13 @@ pub const DEFAULT_MAX_QUERY_BYTES: usize = ravel_sql::DEFAULT_MAX_QUERY_BYTES;
 ///
 /// `process_memory_budget` is the ADR-1170 decisions 1/3 process-wide
 /// accountant: the shared remainder left after both hard cache carves
-/// (`ResolvedPerformanceDefaults::memory_remainder_bytes`), installed on the
-/// executor via `SqlExecutor::with_process_memory_budget` so every tenant's
-/// SQL memory reservation counts against the SAME instance
-/// [`crate::lib`]'s `/metrics` gauges read, rather than an executor-private
-/// budget the exposition cannot see.
+/// (`ResolvedPerformanceDefaults::memory_remainder_bytes`). It is installed
+/// on the executor via `SqlExecutor::with_process_memory_budget` so every
+/// tenant's SQL memory reservation counts against the SAME instance
+/// [`crate::lib`]'s `/metrics` gauges read, AND on the metrics, logs, and
+/// spans fetchers via their own `with_memory_budget` so a SQL fetch
+/// reservation counts against, and can be refused by, that same instance
+/// (issue #2086) rather than each fetcher's private unlimited default.
 #[cfg(feature = "sql")]
 #[allow(clippy::too_many_arguments)]
 pub fn build_sql_state(
@@ -557,8 +559,9 @@ pub fn build_sql_state(
     }
     .with_spill_from_env()?;
     let max_deadline = config.engine.deadline;
-    let mut metrics_fetcher =
-        SegmentFetcher::new(store.clone()).with_get_limiter(get_limiter.clone());
+    let mut metrics_fetcher = SegmentFetcher::new(store.clone())
+        .with_get_limiter(get_limiter.clone())
+        .with_memory_budget(process_memory_budget.clone());
     // ADR-0107's read-shape crossover, from `--logs-block-range-threshold` via
     // `QueryBudgets::apply_to_engine`. This is the single wiring point for it, so
     // an operator who sets the flag to `u64::MAX` gets whole-object logs reads
@@ -587,15 +590,18 @@ pub fn build_sql_state(
         .with_get_limiter(get_limiter.clone())
         .with_request_cost_bytes(config.engine.logs_request_cost_bytes)
         .with_max_fetch_run_bytes(config.engine.logs_max_fetch_run_bytes)
-        .map_err(|err| anyhow::anyhow!("invalid logs fetch bound: {err}"))?;
+        .map_err(|err| anyhow::anyhow!("invalid logs fetch bound: {err}"))?
+        .with_memory_budget(process_memory_budget.clone());
     // The spans fetcher (RSPAN) reads the same object store, with the default
-    // RspanConfig (ADR-0045 decision 5). It attaches no fetcher cache: unlike
-    // the RSEG/RLOG fetchers it has no `with_cache` seam, and none is wired
+    // RspanConfig (ADR-0045 decision 5). It attaches no fetcher cache:
+    // `SpanSegmentFetcher::with_cache` exists, but no cache is wired to it
     // here. Its `fetch_accounted` path is tenant-checked and accounted (ADR-0045
     // via #1080), so a `spans` query is isolated and metered like any other.
     // ADR-1195: shares the same process-wide `GetLimiter` as the metrics and
     // logs fetchers above, not a private pool.
-    let span_fetcher = SpanSegmentFetcher::new(store.clone()).with_get_limiter(get_limiter);
+    let span_fetcher = SpanSegmentFetcher::new(store.clone())
+        .with_get_limiter(get_limiter)
+        .with_memory_budget(process_memory_budget.clone());
     if let Some(cache) = cache {
         metrics_fetcher = metrics_fetcher.with_cache(cache.clone());
         logs_fetcher = logs_fetcher.with_cache(cache);

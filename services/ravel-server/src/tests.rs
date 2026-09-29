@@ -25,16 +25,18 @@ use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
 use ravel_ingest::{AdmissionController, AdmissionLimits, Clock, SystemClock};
+use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreMetrics};
 use ravel_query::http::{StaticBearerTokenResolver, TenantResolver};
 use ravel_query::{
-    FetchError, GetLimiter, LogSegmentFetcher, QueryAdmissionController, QueryConcurrencyLimit,
-    QueryError, ReadCache, SegmentFetcher,
+    EngineConfig, FetchError, GetLimiter, LogFetchError, LogSegmentFetcher,
+    QueryAdmissionController, QueryConcurrencyLimit, QueryError, ReadCache, SegmentFetcher,
 };
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
-use ravel_sql::{SqlConfig, SqlExecutor, SqlRequest};
+use ravel_sql::{SpanFetchError, SqlConfig, SqlError, SqlExecutor, SqlRequest};
+use ravel_types::logstream::log_stream_id;
 use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId, TimeRange};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -1155,5 +1157,724 @@ async fn memory_handoff_overlap_equals_the_fetch_reservation_while_a_cached_fetc
     assert!(
         scrape.contains("ravel_memory_handoff_overlap_bytes{mode=\"all\"} 0\n"),
         "the overlap gauge must read back to 0 after completion:\n{scrape}"
+    );
+}
+
+/// Builds the real SQL `SqlState` via `crate::query::build_sql_state` (the
+/// same constructor `crate::start` calls), plus a `/metrics` router sharing
+/// one `Catalog` and the SAME `process_memory_budget` instance, so an
+/// issue #2086 SQL memory-budget acceptance test exercises the actual server
+/// wiring rather than a hand-assembled `SqlExecutor` (unlike `harness` above,
+/// whose fetchers get no `.with_memory_budget` call at all).
+fn sql_budget_harness(
+    store: Arc<dyn ObjectStoreBackend>,
+    process_memory_budget: Arc<ravel_memory::MemoryBudget>,
+) -> (Arc<SqlExecutor>, Router, Router) {
+    let catalog =
+        Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+    let catalog_for_metrics = Arc::clone(&catalog);
+    let catalog_cache_metrics = catalog.byte_cache_metrics();
+    let query_accounting = Arc::new(QueryAccountingMetrics::new(HashSet::new()));
+    let tokens: HashMap<String, TenantId> =
+        HashMap::from([("acme-token".to_string(), TenantId::new("acme".to_string()))]);
+    let tenant_resolver: Arc<dyn TenantResolver> = Arc::new(StaticBearerTokenResolver::new(tokens));
+
+    let state = crate::query::build_sql_state(
+        catalog,
+        Arc::clone(&store),
+        tenant_resolver,
+        None,
+        EngineConfig::default(),
+        Arc::new(GetLimiter::new(8).expect("nonzero permits")),
+        ravel_sql::DEFAULT_MAX_QUERY_BYTES,
+        crate::query::DEFAULT_MAX_TENANT_BYTES,
+        false,
+        Arc::clone(&query_accounting),
+        QueryAdmissionController::shared(QueryConcurrencyLimit::Unlimited),
+        None,
+        Arc::clone(&process_memory_budget),
+    )
+    .expect("sql state builds");
+
+    let executor = Arc::clone(&state.executor);
+    let sql = sql_router(state);
+
+    let metrics = crate::metrics::router(MetricsState {
+        mode: Mode::All,
+        store_metrics: Arc::new(StoreMetrics::default()),
+        ingest_router: None,
+        log_ingest_router: None,
+        span_ingest_router: None,
+        catalog: catalog_for_metrics,
+        tenant_discovery: None,
+        maintenance_safety: None,
+        maintenance_ownership: None,
+        merge_memory: None,
+        scrub: None,
+        cache_metrics: None,
+        cache_disk_metrics: None,
+        catalog_cache_metrics,
+        catalog_cache_disk_metrics: None,
+        admission: Arc::new(AdmissionController::new(
+            Arc::new(SystemClock),
+            AdmissionLimits::default(),
+        )),
+        reconcile_cycle: Arc::new(crate::admission_reconcile::ReconcileCycleMetrics::default()),
+        metrics_tenant_labels: false,
+        metrics_tenant_allowlist: Arc::new(HashSet::new()),
+        query_accounting,
+        ingest_concurrency: crate::ingest_concurrency::IngestConcurrencyController::shared(
+            crate::ingest_concurrency::IngestConcurrencyLimit::Bounded(1024),
+        ),
+        ingest_buffer_budget: ravel_ingest::IngestByteBudget::shared(
+            ravel_ingest::IngestByteBudgetLimit::Unlimited,
+        ),
+        distrib: None,
+        durable_auth: None,
+        ingest_byte_metrics: std::sync::Arc::new(
+            crate::ingest_byte_metrics::IngestByteMetrics::new(),
+        ),
+        normalize_reject_metrics: std::sync::Arc::new(
+            crate::normalize_reject_metrics::NormalizeRejectMetrics::new(),
+        ),
+        metadata_cache: None,
+        cache: None,
+        cache_max_bytes: 0,
+        catalog_cache_max_bytes: 0,
+        audit_pipeline: None,
+        process_memory_budget,
+        process_memory_budget_is_fallback: false,
+        cpu_gates: crate::cpu_gates::CpuGates::new(Default::default()),
+        can_fold: true,
+        fold_loop: Default::default(),
+        heartbeat: crate::health_listener::Heartbeat::new(Arc::new(SystemClock)),
+    });
+
+    (executor, sql, metrics)
+}
+
+/// Publishes one real RSEG segment for `tenant`/`metric`, anchored inside the
+/// fixed `[0, NOW_NS]` window the SQL tests' `post_sql`/`sql_body` already
+/// query, with high-entropy sample values so its data object exceeds the
+/// 512 KiB whole-object-read threshold: only past that threshold does
+/// `ensure_ranges` reserve against the process memory budget at all, rather
+/// than reading the whole object in one unbudgeted GET. Asserts the threshold
+/// was really crossed rather than assuming it from the sample count.
+///
+/// Unlike `publish_large_segment` above (anchored to real wall-clock time,
+/// needed there because the raw PromQL HTTP handler's `now_ns()` is not
+/// injectable), this fixture stays inside the small fixed SQL window, so
+/// `Catalog::resolve`'s per-(shard, ingest-hour) LIST fan-out stays at a
+/// handful of hours rather than one per real wall-clock hour since the epoch.
+async fn publish_large_sql_segment(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    metric: &str,
+) {
+    let tenant_hash = tenant.hash();
+    let label_set = LabelSet::new(vec![Label {
+        name: "__name__".to_string(),
+        value: metric.to_string(),
+    }])
+    .expect("valid labels");
+    let series_id = SeriesId::compute(tenant, metric, &label_set).expect("series id");
+
+    let base_ts_ns = NOW_NS - 300 * NS_PER_SEC;
+    let samples: Vec<Sample> = (0..LARGE_SEGMENT_SAMPLES)
+        .map(|i| Sample {
+            ts_ns: base_ts_ns + i as i64 * 1_000_000,
+            value: high_entropy_value(i),
+        })
+        .collect();
+
+    let series = vec![SeriesInput {
+        series_id,
+        labels: label_set,
+        samples,
+    }];
+
+    let writer_id = Uuid::from_u128(4_000);
+    let identity = SegmentIdentity {
+        tenant_hash: tenant_hash.0,
+        shard: 0,
+        writer_id: writer_id.to_string(),
+        writer_epoch: 1,
+        writer_seq: 1,
+    };
+    let written = SegmentWriter::write(
+        series,
+        identity,
+        IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        },
+    )
+    .expect("write segment");
+
+    let object_size = written.bytes.len() as u64;
+    assert!(
+        object_size > 512 * 1024,
+        "fixture must exceed the 512 KiB whole-object threshold to force a \
+         budgeted range read, got {object_size} bytes"
+    );
+
+    let hour_bucket = u32::try_from(base_ts_ns / NS_PER_HOUR).expect("hour bucket");
+    let rec = record::build(NewCommitRecord {
+        tenant_hash,
+        signal: Signal::Metrics,
+        shard: 0,
+        writer_id,
+        writer_epoch: 1,
+        writer_seq: 1,
+        object_size,
+        content_hash: written.summary.blake3,
+        sample_count: written.summary.sample_count,
+        series_count: written.summary.series_count,
+        min_event_ts_ns: written.summary.min_event_ts_ns,
+        max_event_ts_ns: written.summary.max_event_ts_ns,
+        min_ingest_ts_ns: written.summary.min_event_ts_ns,
+        max_ingest_ts_ns: written.summary.max_event_ts_ns,
+        segment_format_version: 1,
+        created_unix_ns: NOW_NS,
+        ingest_hour_bucket: hour_bucket,
+    })
+    .expect("valid commit record");
+
+    let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+    store
+        .put(&data_key, written.bytes, PutOptions::default())
+        .await
+        .expect("put data object");
+    publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish");
+}
+
+/// One log record on stream `service.name = "budget-svc"`, mirroring
+/// `tests/sql_endpoint.rs`'s `log_record` fixture builder.
+fn sql_log_record(ts: i64, body: &str) -> LogRecord {
+    let resource = vec![(
+        "service.name".to_string(),
+        AttrValue::Str("budget-svc".to_string()),
+    )];
+    LogRecord {
+        stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+        stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 9,
+        severity_text: "INFO".into(),
+        body: body.into(),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: Vec::new(),
+    }
+}
+
+/// Publishes one real RLOG object plus its `Signal::Logs` commit record.
+/// `LogSegmentFetcher::whole_object_bytes` reserves against the process
+/// memory budget for any object at or below the ADR-0996 fetch bound (64 MiB
+/// by default; see `EngineConfig::logs_max_fetch_run_bytes`), so a single
+/// small record is enough to force a budgeted reservation, unlike RSEG's
+/// small-object path which needs a >512 KiB fixture.
+async fn publish_small_log_segment(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    records: &[LogRecord],
+) {
+    let tenant_hash = tenant.hash();
+
+    let mut min_event_ts_ns = i64::MAX;
+    let mut max_event_ts_ns = i64::MIN;
+    let mut streams = std::collections::HashSet::new();
+    for rec in records {
+        min_event_ts_ns = min_event_ts_ns.min(rec.ts_ns);
+        max_event_ts_ns = max_event_ts_ns.max(rec.ts_ns);
+        streams.insert(rec.stream_id);
+    }
+
+    let writer_id = Uuid::from_u128(9_500);
+    let identity = ravel_logseg::writer::ObjectIdentity {
+        tenant_hash: tenant_hash.0,
+        shard: 0,
+        writer_id: writer_id.into_bytes(),
+        writer_epoch: 1,
+        writer_seq: 1,
+    };
+    let mut writer = RlogWriter::new(RlogConfig::default(), identity);
+    for rec in records {
+        writer.push(rec.clone()).expect("push log record");
+    }
+    let bytes = writer.finish().expect("finish rlog object");
+    let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+
+    let rec = record::build(NewCommitRecord {
+        tenant_hash,
+        signal: Signal::Logs,
+        shard: 0,
+        writer_id,
+        writer_epoch: 1,
+        writer_seq: 1,
+        object_size: bytes.len() as u64,
+        content_hash,
+        sample_count: records.len() as u64,
+        series_count: streams.len() as u64,
+        min_event_ts_ns,
+        max_event_ts_ns,
+        min_ingest_ts_ns: min_event_ts_ns,
+        max_ingest_ts_ns: max_event_ts_ns,
+        segment_format_version: u32::from(ravel_ingest::LOG_SEGMENT_FORMAT_VERSION),
+        created_unix_ns: 10,
+        ingest_hour_bucket: 0,
+    })
+    .expect("valid log commit record");
+
+    let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+    store
+        .put(&data_key, bytes::Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put log data object");
+    publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish log commit");
+}
+
+/// One span on `service.name = "budget-svc"`, mirroring `tests/sql_endpoint.rs`'s
+/// `span_record` fixture builder.
+fn sql_span_record(trace: [u8; 16], start: i64) -> ravel_rspan::SpanRecord {
+    ravel_rspan::SpanRecord {
+        trace_id: trace,
+        span_id: [1; 8],
+        parent_span_id: None,
+        name: "budget-span".to_string(),
+        start_ts_ns: start,
+        end_ts_ns: start + 1_000_000,
+        status_code: ravel_rspan::StatusCode::Ok,
+        status_message: None,
+        attrs: vec![("service.name".to_string(), "budget-svc".to_string())],
+    }
+}
+
+/// Publishes one real RSPAN object plus its `Signal::Spans` commit record.
+/// Unlike RSEG and RLOG, `SpanSegmentFetcher::whole_object_bytes` reserves
+/// unconditionally for every read regardless of object size, so a single
+/// small span is enough to force a budgeted reservation.
+async fn publish_small_span_segment(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    records: &[ravel_rspan::SpanRecord],
+) {
+    let tenant_hash = tenant.hash();
+
+    let mut min_event_ts_ns = i64::MAX;
+    let mut max_event_ts_ns = i64::MIN;
+    let mut traces = std::collections::HashSet::new();
+    for rec in records {
+        min_event_ts_ns = min_event_ts_ns.min(rec.start_ts_ns);
+        max_event_ts_ns = max_event_ts_ns.max(rec.end_ts_ns);
+        traces.insert(rec.trace_id);
+    }
+
+    let writer_id = Uuid::from_u128(5_500);
+    let identity = ravel_rspan::ObjectIdentity {
+        tenant_hash: tenant_hash.0,
+        shard: 0,
+        writer_id: writer_id.into_bytes(),
+        writer_epoch: 1,
+        writer_seq: 1,
+    };
+    let mut writer = ravel_rspan::RspanWriter::new(ravel_rspan::RspanConfig::default(), identity);
+    for rec in records {
+        writer.push(rec.clone());
+    }
+    let bytes = writer.finish().expect("finish rspan object");
+    let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+
+    let rec = record::build(NewCommitRecord {
+        tenant_hash,
+        signal: Signal::Spans,
+        shard: 0,
+        writer_id,
+        writer_epoch: 1,
+        writer_seq: 1,
+        object_size: bytes.len() as u64,
+        content_hash,
+        sample_count: records.len() as u64,
+        series_count: traces.len() as u64,
+        min_event_ts_ns,
+        max_event_ts_ns,
+        min_ingest_ts_ns: min_event_ts_ns,
+        max_ingest_ts_ns: max_event_ts_ns,
+        segment_format_version: 1,
+        created_unix_ns: 10,
+        ingest_hour_bucket: 0,
+    })
+    .expect("valid span commit record");
+
+    let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+    store
+        .put(&data_key, bytes::Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put span data object");
+    publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish span commit");
+}
+
+/// ACCEPTANCE TEST (issue #2086): a SQL `samples` (RSEG) fetch whose real
+/// execution outgrows the ADR-1170 process-wide memory budget is refused
+/// typed (`SqlError::Fetch(FetchError::FetchMemoryExhausted)`) and, through
+/// the real HTTP router, as `StatusCode::SERVICE_UNAVAILABLE` /
+/// `errorType: "unavailable"`. This exercises `crate::query::build_sql_state`'s
+/// `.with_memory_budget(process_memory_budget)` wiring on the metrics
+/// fetcher, not a hand-built `SegmentFetcher` (`harness` above never calls
+/// `.with_memory_budget` at all).
+///
+/// The fixture crosses the 512 KiB whole-object-read threshold
+/// (`publish_large_sql_segment`) so the refused reservation is the ranged
+/// read's (`ensure_ranges`) column fetch, the charge this test is about.
+///
+/// Prove-the-test: remove `.with_memory_budget(process_memory_budget.clone())`
+/// from the metrics fetcher in `build_sql_state`
+/// (services/ravel-server/src/query.rs). The fetch then reserves nothing and
+/// the same tiny budget refuses the query in the SQL pool instead, as
+/// `ResourcesExhausted` (422), so both the typed check and the 503 assertion
+/// fail.
+#[tokio::test]
+async fn a_sql_metrics_fetch_over_the_process_budget_is_refused_and_the_process_keeps_serving() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    publish_large_sql_segment(store.as_ref(), &tenant, "sql_budget_metric").await;
+
+    let budget = Arc::new(ravel_memory::MemoryBudget::new(4 * 1024));
+    let (executor, sql, _metrics) = sql_budget_harness(Arc::clone(&store), Arc::clone(&budget));
+
+    let request = SqlRequest {
+        sql: "SELECT ts, value FROM samples ORDER BY ts".to_string(),
+        window: TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        },
+        min_tokens: Vec::new(),
+        now_ns: NOW_NS,
+        deadline: Duration::from_secs(30),
+        row_window: false,
+        max_rows: None,
+        budgets: None,
+    };
+    let err = executor
+        .execute(tenant.hash(), &request)
+        .await
+        .expect_err("a 4 KiB budget must refuse a >512 KiB range read");
+    match err {
+        SqlError::Fetch(FetchError::FetchMemoryExhausted {
+            requested,
+            reserved,
+            limit,
+        }) => {
+            assert_eq!(
+                limit,
+                4 * 1024,
+                "the refusal must name the configured limit"
+            );
+            assert!(
+                requested > limit.saturating_sub(reserved),
+                "the refused reservation must need more than the budget remainder: \
+                 requested {requested}, reserved {reserved}"
+            );
+        }
+        other => panic!("expected SqlError::Fetch(FetchMemoryExhausted), got {other:?}"),
+    }
+    assert_eq!(
+        budget.reserved(),
+        0,
+        "the refused query must leave no charge on the shared process counter"
+    );
+
+    let (status, body) = post_sql(&sql, "SELECT ts, value FROM samples ORDER BY ts").await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a refused fetch must answer 503 unavailable: {body}"
+    );
+    assert_eq!(body["errorType"], "unavailable", "body: {body}");
+
+    assert_eq!(budget.reserved(), 0);
+    let (status, body) = post_sql(&sql, "SELECT 1").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the process must keep answering after a refusal: {body}"
+    );
+}
+
+/// ACCEPTANCE TEST (issue #2086): a SQL `logs` (RLOG) fetch whose real
+/// execution outgrows the ADR-1170 process-wide memory budget is refused
+/// typed (`SqlError::LogFetch(LogFetchError::FetchMemoryExhausted)`) and,
+/// through the real HTTP router, as `StatusCode::SERVICE_UNAVAILABLE` /
+/// `errorType: "unavailable"`. Sibling of the metrics test above, for the
+/// logs fetcher's own `.with_memory_budget` wiring in `build_sql_state`.
+///
+/// A single tiny log record is enough to force the reservation: unlike RSEG,
+/// RLOG's whole-object read path reserves for any object at or below the
+/// 64 MiB ADR-0996 fetch bound, so no large fixture is needed.
+///
+/// Prove-the-test: remove `.with_memory_budget(process_memory_budget.clone())`
+/// from the logs fetcher in `build_sql_state`. The typed check then fails the
+/// same way as the metrics test above.
+#[tokio::test]
+async fn a_sql_logs_fetch_over_the_process_budget_is_refused_and_the_process_keeps_serving() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    let ts = NOW_NS - 300 * NS_PER_SEC;
+    publish_small_log_segment(
+        store.as_ref(),
+        &tenant,
+        &[sql_log_record(ts, "budget probe")],
+    )
+    .await;
+
+    let budget = Arc::new(ravel_memory::MemoryBudget::new(1));
+    let (executor, sql, _metrics) = sql_budget_harness(Arc::clone(&store), Arc::clone(&budget));
+
+    let request = SqlRequest {
+        sql: "SELECT ts, body FROM logs".to_string(),
+        window: TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        },
+        min_tokens: Vec::new(),
+        now_ns: NOW_NS,
+        deadline: Duration::from_secs(30),
+        row_window: false,
+        max_rows: None,
+        budgets: None,
+    };
+    let err = executor
+        .execute(tenant.hash(), &request)
+        .await
+        .expect_err("a 1-byte budget must refuse any whole-object logs read");
+    match err {
+        SqlError::LogFetch(LogFetchError::FetchMemoryExhausted {
+            requested,
+            reserved,
+            limit,
+        }) => {
+            assert_eq!(limit, 1, "the refusal must name the configured limit");
+            assert!(
+                requested > limit.saturating_sub(reserved),
+                "the refused reservation must need more than the budget remainder: \
+                 requested {requested}, reserved {reserved}"
+            );
+        }
+        other => panic!("expected SqlError::LogFetch(FetchMemoryExhausted), got {other:?}"),
+    }
+    assert_eq!(
+        budget.reserved(),
+        0,
+        "the refused query must leave no charge on the shared process counter"
+    );
+
+    let (status, body) = post_sql(&sql, "SELECT ts, body FROM logs").await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a refused fetch must answer 503 unavailable: {body}"
+    );
+    assert_eq!(body["errorType"], "unavailable", "body: {body}");
+
+    assert_eq!(budget.reserved(), 0);
+    let (status, body) = post_sql(&sql, "SELECT 1").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the process must keep answering after a refusal: {body}"
+    );
+}
+
+/// ACCEPTANCE TEST (issue #2086): a SQL `spans` (RSPAN) fetch whose real
+/// execution outgrows the ADR-1170 process-wide memory budget is refused
+/// typed (`SqlError::SpanFetch(SpanFetchError::FetchMemoryExhausted)`) and,
+/// through the real HTTP router, as `StatusCode::SERVICE_UNAVAILABLE` /
+/// `errorType: "unavailable"`. Sibling of the two tests above, for the spans
+/// fetcher's own `.with_memory_budget` wiring in `build_sql_state`.
+///
+/// A single tiny span is enough to force the reservation:
+/// `SpanSegmentFetcher::whole_object_bytes` reserves unconditionally for
+/// every read, with no size threshold at all.
+///
+/// Prove-the-test: remove `.with_memory_budget(process_memory_budget)` from
+/// the spans fetcher in `build_sql_state`. The typed check then fails the
+/// same way as the two tests above.
+#[tokio::test]
+async fn a_sql_spans_fetch_over_the_process_budget_is_refused_and_the_process_keeps_serving() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    let ts = NOW_NS - 300 * NS_PER_SEC;
+    publish_small_span_segment(store.as_ref(), &tenant, &[sql_span_record([7; 16], ts)]).await;
+
+    let budget = Arc::new(ravel_memory::MemoryBudget::new(1));
+    let (executor, sql, _metrics) = sql_budget_harness(Arc::clone(&store), Arc::clone(&budget));
+
+    let request = SqlRequest {
+        sql: "SELECT name, service_name FROM spans ORDER BY start_ts".to_string(),
+        window: TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        },
+        min_tokens: Vec::new(),
+        now_ns: NOW_NS,
+        deadline: Duration::from_secs(30),
+        row_window: false,
+        max_rows: None,
+        budgets: None,
+    };
+    let err = executor
+        .execute(tenant.hash(), &request)
+        .await
+        .expect_err("a 1-byte budget must refuse any whole-object spans read");
+    match err {
+        SqlError::SpanFetch(SpanFetchError::FetchMemoryExhausted {
+            requested,
+            reserved,
+            limit,
+        }) => {
+            assert_eq!(limit, 1, "the refusal must name the configured limit");
+            assert!(
+                requested > limit.saturating_sub(reserved),
+                "the refused reservation must need more than the budget remainder: \
+                 requested {requested}, reserved {reserved}"
+            );
+        }
+        other => panic!("expected SqlError::SpanFetch(FetchMemoryExhausted), got {other:?}"),
+    }
+    assert_eq!(
+        budget.reserved(),
+        0,
+        "the refused query must leave no charge on the shared process counter"
+    );
+
+    let (status, body) = post_sql(
+        &sql,
+        "SELECT name, service_name FROM spans ORDER BY start_ts",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a refused fetch must answer 503 unavailable: {body}"
+    );
+    assert_eq!(body["errorType"], "unavailable", "body: {body}");
+
+    assert_eq!(budget.reserved(), 0);
+    let (status, body) = post_sql(&sql, "SELECT 1").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the process must keep answering after a refusal: {body}"
+    );
+}
+
+/// ACCEPTANCE TEST (issue #2086's observability requirement): while a SQL
+/// `logs` fetch's budgeted whole-object GET is in flight,
+/// `ravel_memory_reserved_bytes{mode="all",component="fetch"}` reads exactly
+/// the fetcher's own live reservation, both through the direct counter and
+/// through a real `/metrics` scrape, and returns to exactly 0 once the query
+/// completes.
+///
+/// The gauge itself reads back to 0 after the query answers -- there is no
+/// persisted counter or peak figure for a fetch reservation on `/metrics`
+/// today, and adding a new metric family is out of this task's scope -- so
+/// the reservation is observed HELD, mirroring the existing PromQL gauge test
+/// (`memory_gauges_report_a_nonzero_fetch_reservation_during_a_query` above)
+/// rather than read back after completion. The figure asserted on is
+/// `ravel_memory_reserved_bytes{component="fetch"}`, the same gauge that test
+/// uses, proved nonzero while a real `FaultStore`-held GET keeps a live
+/// `Reservation` open on the SQL logs path specifically.
+///
+/// Prove-the-test: remove `.with_memory_budget(process_memory_budget.clone())`
+/// from the logs fetcher in `build_sql_state`. `budget.fetch_reserved()` then
+/// reads 0 throughout (nothing is ever reserved), so
+/// `observed_nonzero` stays `false` and the query's own branch of the
+/// `select!` panics: "the fetch gauge must be observed nonzero at least once
+/// while the GET was held".
+#[tokio::test]
+async fn sql_logs_query_reserves_a_nonzero_fetch_gauge_while_the_get_is_held() {
+    let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+    let tenant = TenantId::new("acme".to_string());
+    let ts = NOW_NS - 300 * NS_PER_SEC;
+    publish_small_log_segment(
+        store.as_ref(),
+        &tenant,
+        &[sql_log_record(ts, "gauge probe")],
+    )
+    .await;
+
+    let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
+    let (executor, _sql, metrics) = sql_budget_harness(Arc::clone(&store), Arc::clone(&budget));
+
+    let request = SqlRequest {
+        sql: "SELECT ts, body FROM logs".to_string(),
+        window: TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        },
+        min_tokens: Vec::new(),
+        now_ns: NOW_NS,
+        deadline: Duration::from_secs(30),
+        row_window: false,
+        max_rows: None,
+        budgets: None,
+    };
+
+    let gate = fault_store.hold(Op::Get, Some("/l0/".to_string()), Occurrence::Always);
+    let mut query = Box::pin(executor.execute(tenant.hash(), &request));
+
+    let mut observed_nonzero = false;
+    loop {
+        tokio::select! {
+            result = &mut query => {
+                assert!(
+                    observed_nonzero,
+                    "the fetch gauge must be observed nonzero at least once while the GET was held"
+                );
+                result.expect("query must succeed under an unlimited budget");
+                break;
+            }
+            () = gate.wait_until_held(1) => {
+                let held = gate.held_details();
+                let (id, _, _) = held[0];
+                let reserved = budget.fetch_reserved();
+                if reserved > 0 {
+                    observed_nonzero = true;
+                    assert!(
+                        budget.reserved() >= reserved,
+                        "the total reserved must include the fetch share: total {}, fetch {reserved}",
+                        budget.reserved()
+                    );
+                    let scrape = scrape_metrics(&metrics).await;
+                    assert!(
+                        scrape.contains(&format!(
+                            "ravel_memory_reserved_bytes{{mode=\"all\",component=\"fetch\"}} {reserved}\n"
+                        )),
+                        "the fetch gauge must equal the fetcher's reservation ({reserved}):\n{scrape}"
+                    );
+                }
+                gate.release(id);
+            }
+        }
+    }
+
+    assert_eq!(
+        budget.fetch_reserved(),
+        0,
+        "the reservation must release once the query completes"
+    );
+    let scrape = scrape_metrics(&metrics).await;
+    assert!(
+        scrape.contains("ravel_memory_reserved_bytes{mode=\"all\",component=\"fetch\"} 0\n"),
+        "the fetch gauge must read back to 0 after completion:\n{scrape}"
     );
 }
