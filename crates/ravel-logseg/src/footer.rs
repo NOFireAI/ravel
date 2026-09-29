@@ -812,7 +812,8 @@ mod tests {
     }
 
     /// Today's RLOG window is a single version: ADR-0892 deleted the version-3
-    /// reader, so nothing but [`VERSION`] is accepted.
+    /// reader and ADR-2135 the version-4 one, so nothing but [`VERSION`] is
+    /// accepted.
     #[test]
     fn todays_window_accepts_only_the_current_version() {
         assert_eq!(SUPPORTED_VERSIONS.newest(), VERSION);
@@ -827,10 +828,16 @@ mod tests {
     /// decision 6: deleting a reader without pinning its absence lets the
     /// window silently reopen, and `SupportedVersions::n_and_prev` is one token
     /// away in the same file. Swapping `single(VERSION)` back to
-    /// `n_and_prev(VERSION)` fails here.
+    /// `n_and_prev(VERSION)` fails here. The versions are spelled out so a bump
+    /// that forgets to revisit this window fails too: 5 is the only version,
+    /// and 4 (ADR-2135) and 3 (ADR-0892) are both outside it.
     #[test]
     fn the_previous_version_is_excluded_from_the_window() {
+        assert_eq!(VERSION, 5);
+        assert!(SUPPORTED_VERSIONS.contains(5));
         assert!(!SUPPORTED_VERSIONS.contains(VERSION - 1));
+        assert!(!SUPPORTED_VERSIONS.contains(4));
+        assert!(!SUPPORTED_VERSIONS.contains(3));
     }
 
     /// The exclusion is the reader's behaviour, not just the constant's: a

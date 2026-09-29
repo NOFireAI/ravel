@@ -195,5 +195,9 @@ fn row_group_buffer_is_one_row_group_and_does_not_grow_with_the_object() {
         "the row group size changes where pages sit, never how many bytes they are"
     );
     assert_eq!(ungrouped_groups, 4 * GROUP);
-    assert_eq!(footer::VERSION, 4, "these are version-4 objects");
+    assert_eq!(
+        footer::VERSION,
+        5,
+        "these are version-5 objects, which keep version 4's row groups"
+    );
 }

@@ -49,12 +49,12 @@ fn writer(cfg: RlogConfig) -> RlogWriter {
     RlogWriter::new(cfg, identity())
 }
 
-fn write_v4(cfg: RlogConfig, recs: &[LogRecord]) -> Vec<u8> {
+fn write_rlog(cfg: RlogConfig, recs: &[LogRecord]) -> Vec<u8> {
     let mut w = writer(cfg);
     for r in recs {
         w.push(r.clone()).expect("push");
     }
-    w.finish().expect("finish v4")
+    w.finish().expect("finish")
 }
 
 /// The same records written as ONE row group, whatever `cfg` asks for: the
@@ -62,7 +62,7 @@ fn write_v4(cfg: RlogConfig, recs: &[LogRecord]) -> Vec<u8> {
 /// possible number of column chunks and the most different placement there is
 /// from a many-group one.
 fn write_single_group(cfg: RlogConfig, recs: &[LogRecord]) -> Vec<u8> {
-    write_v4(
+    write_rlog(
         RlogConfig {
             group_target_blocks: usize::MAX,
             ..cfg
@@ -219,7 +219,7 @@ fn is_corrupted(r: Result<impl Sized, LogSegError>) -> bool {
 /// Asserts the error is `Corrupted` and that its message names `needle`.
 ///
 /// Used where a weaker "some error happened" would pass on a different check
-/// entirely: a version-4 object with its PAGE_DIR removed is *also* rejected
+/// entirely: a current-version object with its PAGE_DIR removed is *also* rejected
 /// downstream, because its BLOCKS bytes fail the block crc when read as
 /// version-3 blocks. Only the message proves the version/section agreement
 /// check is what refused it.
@@ -325,7 +325,7 @@ proptest! {
             group_target_blocks: group,
             ..RlogConfig::default()
         };
-        let many = write_v4(cfg, &records);
+        let many = write_rlog(cfg, &records);
         let one = write_single_group(cfg, &records);
         prop_assert_eq!(page_dir_of(&one).groups.len(), 1, "the oracle is one group");
         // The two placements really differ whenever the corpus spans more than
@@ -356,16 +356,16 @@ fn row_group_boundary_cases_decode_identically_to_a_single_group() {
         };
         let records = linear_corpus(blocks * PER_BLOCK);
         let one = write_single_group(cfg, &records);
-        let v4 = write_v4(cfg, &records);
+        let grouped = write_rlog(cfg, &records);
 
         let from_one: Vec<String> = scan_all(&one).iter().map(key).collect();
-        let from_v4: Vec<String> = scan_all(&v4).iter().map(key).collect();
+        let from_grouped: Vec<String> = scan_all(&grouped).iter().map(key).collect();
         assert_eq!(
-            from_v4, from_one,
+            from_grouped, from_one,
             "{blocks} blocks at a {GROUP}-block group"
         );
 
-        let dir = page_dir_of(&v4);
+        let dir = page_dir_of(&grouped);
         assert_eq!(dir.block_count(), blocks as u64, "{blocks} blocks");
         assert_eq!(
             dir.groups.len(),
@@ -433,7 +433,7 @@ fn two_column_projection_skips_the_other_103_columns_pages() {
         ..RlogConfig::default()
     };
     let records = wide_corpus(BLOCKS * PER_BLOCK);
-    let object = write_v4(cfg, &records);
+    let object = write_rlog(cfg, &records);
 
     // The fixture really is 105 pages per block, with no presence pages.
     let dir = page_dir_of(&object);
@@ -496,7 +496,7 @@ fn chunk_ranges_cover_exactly_their_pages_contiguously() {
         group_target_blocks: 4,
         ..RlogConfig::default()
     };
-    let object = write_v4(cfg, &wide_corpus(9 * 8));
+    let object = write_rlog(cfg, &wide_corpus(9 * 8));
     let dir = page_dir_of(&object);
     let reader = RlogReader::new(&object, &cfg).expect("open");
     let blocks_offset = open(&object)
@@ -570,7 +570,7 @@ fn flipped_byte_inside_a_page_is_a_typed_error() {
         group_target_blocks: 4,
         ..RlogConfig::default()
     };
-    let object = write_v4(cfg, &linear_corpus(9 * 8));
+    let object = write_rlog(cfg, &linear_corpus(9 * 8));
     let blocks_offset = open(&object)
         .expect("footer")
         .section(kind::BLOCKS)
@@ -608,7 +608,7 @@ fn flipped_byte_in_page_dir_fails_the_section_crc() {
         group_target_blocks: 4,
         ..RlogConfig::default()
     };
-    let object = write_v4(cfg, &linear_corpus(9 * 8));
+    let object = write_rlog(cfg, &linear_corpus(9 * 8));
     let desc = *open(&object)
         .expect("footer")
         .section(kind::PAGE_DIR)
@@ -637,7 +637,7 @@ fn truncated_last_row_group_is_a_typed_error() {
         group_target_blocks: 4,
         ..RlogConfig::default()
     };
-    let object = write_v4(cfg, &linear_corpus(9 * 8));
+    let object = write_rlog(cfg, &linear_corpus(9 * 8));
     // The reassembled but untruncated object still reads, so the failures below
     // are about the truncation and not about the reassembly.
     let intact = truncate_blocks(&object, 0);
@@ -661,7 +661,7 @@ fn page_dir_offsets_past_blocks_are_refused() {
         group_target_blocks: 4,
         ..RlogConfig::default()
     };
-    let object = write_v4(cfg, &linear_corpus(9 * 8));
+    let object = write_rlog(cfg, &linear_corpus(9 * 8));
     let mut dir = page_dir_of(&object);
     let blocks_len = open(&object)
         .expect("footer")
@@ -692,7 +692,7 @@ fn page_dir_page_count_over_the_cap_is_refused() {
         group_target_blocks: 4,
         ..RlogConfig::default()
     };
-    let object = write_v4(cfg, &linear_corpus(9 * 8));
+    let object = write_rlog(cfg, &linear_corpus(9 * 8));
 
     // A hand-built directory: one group of one block whose single column claims
     // a page count far above the cap.
@@ -726,36 +726,36 @@ fn page_dir_page_count_over_the_cap_is_refused() {
 
 // --- version gate -----------------------------------------------------------
 
-/// The version gate accepts version 4 and nothing else: a trailer stamped 3 or
-/// 5 is refused with the typed unsupported-version error (ADR-0892 decision 1,
-/// ADR-0066 decision 2). PAGE_DIR is mandatory at that one version, so an
-/// object missing it is refused rather than read under a guessed layout.
+/// The version gate accepts version 5 and nothing else: a trailer stamped 4 or
+/// 6 is refused with the typed unsupported-version error (ADR-0892 decision 1,
+/// ADR-0066 decision 2, ADR-2135). PAGE_DIR is mandatory at that one version,
+/// so an object missing it is refused rather than read under a guessed layout.
 #[test]
-fn version_gate_accepts_only_4() {
+fn version_gate_accepts_only_5() {
     let cfg = RlogConfig {
         block_target_records: 5,
         group_target_blocks: 4,
         ..RlogConfig::default()
     };
     let records = linear_corpus(20);
-    let v4 = write_v4(cfg, &records);
+    let v5 = write_rlog(cfg, &records);
 
-    let n4 = v4.len();
+    let n5 = v5.len();
     assert_eq!(
-        u16::from_le_bytes([v4[n4 - 8], v4[n4 - 7]]),
+        u16::from_le_bytes([v5[n5 - 8], v5[n5 - 7]]),
         footer::VERSION
     );
-    assert_eq!(footer::VERSION, 4);
+    assert_eq!(footer::VERSION, 5);
 
     assert_eq!(
-        scan_all(&v4).len(),
+        scan_all(&v5).len(),
         records.len(),
-        "a version-4 object reads"
+        "a version-5 object reads"
     );
 
-    // A version-4 object whose PAGE_DIR was dropped is refused rather than read
+    // A version-5 object whose PAGE_DIR was dropped is refused rather than read
     // under a guessed layout.
-    let (footer, sections) = explode(&v4);
+    let (footer, sections) = explode(&v5);
     let without: Vec<Section> = sections
         .into_iter()
         .filter(|s| s.kind != kind::PAGE_DIR)
@@ -769,26 +769,26 @@ fn version_gate_accepts_only_4() {
     // not mistaken for corruption. The object is the current one restamped, so
     // every other byte is structurally valid and the trailer version is the
     // only thing that can be failing.
-    let (footer, sections) = explode(&v4);
-    let stamped_v3 = assemble_versioned(footer, &sections, footer::VERSION - 1);
-    match open_and_drain(&stamped_v3) {
-        Err(LogSegError::UnsupportedVersion(3)) => {}
+    let (footer, sections) = explode(&v5);
+    let stamped_v4 = assemble_versioned(footer, &sections, footer::VERSION - 1);
+    match open_and_drain(&stamped_v4) {
+        Err(LogSegError::UnsupportedVersion(4)) => {}
         other => panic!(
-            "expected UnsupportedVersion(3), got {:?}",
+            "expected UnsupportedVersion(4), got {:?}",
             other.map(|_| ())
         ),
     }
     // The same rewrite at the current version still reads, so the refusal above
     // is about the version byte and not about the rewrite.
-    let (footer, sections) = explode(&v4);
+    let (footer, sections) = explode(&v5);
     assert!(open_and_drain(&assemble_versioned(footer, &sections, footer::VERSION)).is_ok());
 
-    let mut future = v4.clone();
-    future[n4 - 8..n4 - 6].copy_from_slice(&5u16.to_le_bytes());
+    let mut future = v5.clone();
+    future[n5 - 8..n5 - 6].copy_from_slice(&6u16.to_le_bytes());
     match RlogReader::new(&future, &cfg) {
-        Err(LogSegError::UnsupportedVersion(5)) => {}
+        Err(LogSegError::UnsupportedVersion(6)) => {}
         other => panic!(
-            "expected UnsupportedVersion(5), got {:?}",
+            "expected UnsupportedVersion(6), got {:?}",
             other.map(|_| ())
         ),
     }

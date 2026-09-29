@@ -189,7 +189,7 @@ fn measure_peak<R, F: FnOnce() -> R>(f: F) -> (R, usize) {
     (r, peak.load(Ordering::Relaxed))
 }
 
-/// Builds one version-4 object of `blocks` blocks through the columnar writer,
+/// Builds one object of `blocks` blocks through the columnar writer,
 /// returning `(object bytes, P, P per block, finish-time peak, PAGE_DIR group
 /// count)`.
 fn build(blocks: usize) -> (Vec<u8>, u64, u64, usize, usize) {
@@ -200,7 +200,7 @@ fn build(blocks: usize) -> (Vec<u8>, u64, u64, usize, usize) {
         w.finish().expect("finish")
     });
 
-    // A present PAGE_DIR section is the version-4 discriminant (absent in v3).
+    // PAGE_DIR is mandatory from version 4 on (absent in v3).
     let ftr = open(&bytes).expect("open");
     let raw = read_section(
         &bytes,

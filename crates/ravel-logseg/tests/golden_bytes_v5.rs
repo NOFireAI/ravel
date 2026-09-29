@@ -1,12 +1,12 @@
-//! Golden-bytes regression for the RLOG v4 writer (ADR-0699,
+//! Golden-bytes regression for the RLOG v5 writer (ADR-2135,
 //! docs/log-segment-format.md): the writer's output for a fixed representative
-//! input must stay byte-for-byte identical across internal refactors of the v4
-//! encode path. RLOG v4 is a frozen persistent contract; this test is the
+//! input must stay byte-for-byte identical across internal refactors of the v5
+//! encode path. RLOG v5 is a frozen persistent contract; this test is the
 //! tripwire for an accidental format change.
 //!
-//! To regenerate `golden_rlog_v4.bin` after a deliberate, versioned format
+//! To regenerate `golden_rlog_v5.bin` after a deliberate, versioned format
 //! change (never for an internal refactor), run:
-//!   cargo test -p ravel-logseg --test golden_bytes_v4 -- --ignored --nocapture
+//!   cargo test -p ravel-logseg --test golden_bytes_v5 -- --ignored --nocapture
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use ravel_logseg::footer::{self, kind, open};
@@ -85,18 +85,18 @@ fn write_golden() -> Vec<u8> {
     for rec in golden_records() {
         w.push(rec).expect("push record");
     }
-    w.finish().expect("finish v4 golden")
+    w.finish().expect("finish v5 golden")
 }
 
 #[test]
 fn matches_golden_fixture() {
     let written = write_golden();
-    let fixture: &[u8] = include_bytes!("fixtures/golden_rlog_v4.bin");
+    let fixture: &[u8] = include_bytes!("fixtures/golden_rlog_v5.bin");
     assert_eq!(
         written.as_slice(),
         fixture,
-        "RLOG v4 writer output diverged from the captured golden fixture; \
-         RLOG v4 is frozen (docs/log-segment-format.md) -- this must never change \
+        "RLOG v5 writer output diverged from the captured golden fixture; \
+         RLOG v5 is frozen (docs/log-segment-format.md) -- this must never change \
          without a version bump and ADR"
     );
 
@@ -164,17 +164,17 @@ fn write_is_deterministic_across_repeated_calls() {
     assert_eq!(
         write_golden(),
         write_golden(),
-        "v4 output must be deterministic"
+        "v5 output must be deterministic"
     );
 }
 
 #[test]
 #[ignore = "regenerates a golden fixture; run explicitly, never in CI"]
-fn capture_golden_rlog_v4() {
+fn capture_golden_rlog_v5() {
     std::fs::write(
         concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/golden_rlog_v4.bin"
+            "/tests/fixtures/golden_rlog_v5.bin"
         ),
         write_golden(),
     )
