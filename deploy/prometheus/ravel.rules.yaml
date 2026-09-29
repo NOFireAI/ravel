@@ -358,7 +358,9 @@ groups:
     # Only the refusal pages. ravel_ingest_clock_lag_unchecked_total counts
     # flushes made before any store time was observed, a wiring defect rather
     # than an incident; ravel_ingest_clock_lag_bypassed_at_shutdown_total is
-    # teardown residue on a process that is already exiting.
+    # teardown residue on a process that is already exiting. The refusal is a
+    # warning, not critical: no row is lost and the blast radius is one
+    # process, though that process sheds new writes once its buffer fills.
     rules:
       - alert: RavelWriterClockLagRefused
         expr: |
