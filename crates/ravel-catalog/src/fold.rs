@@ -2511,9 +2511,10 @@ impl Catalog {
         // A refusal fails the fold rather than rebuilding: the rebuild fetches
         // and decodes every segment's names, holding more memory than the one
         // postings decode just refused. The resolve path answers the same
-        // refusal the same way (ADR-1702, the decode-refusal amendment). An
-        // object larger than the budget's whole limit skips the eviction pass
-        // and is refused on every fold, so that tenant's fold stays failed.
+        // refusal the same way (ADR-1702, the decode-refusal amendment). A
+        // refusal the eviction pass cannot clear (see
+        // `Catalog::reserve_decoded`) recurs on every fold while it holds, so
+        // that tenant's fold stays failed.
         let reservation =
             self.reserve_decoded(header.body_uncompressed_len, limits.max_postings_bytes)?;
         let decoded =

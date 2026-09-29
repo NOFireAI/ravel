@@ -884,6 +884,16 @@ pub async fn read_metrics_meta_for_serve(
 /// moves into the job with the body (decision 6). `None` decodes inline, which
 /// is [`read_metrics_meta_for_serve`]. A job the gate cannot complete is
 /// [`MetricsMetaError::DecodeJob`].
+///
+/// The reservation is made against the bare `budget`, with no eviction pass,
+/// unlike a catalog decode ([`crate::Catalog::reserve_decoded`]). This reader
+/// is a free function that takes only a store and a budget (the query
+/// metadata cache reaches it through [`read_metrics_meta_for_serve`]), so it
+/// has no catalog whose decoded caches it could evict. Passing it one would
+/// give a caller outside the catalog a way to evict every tenant's decoded
+/// parts and postings to admit one tenant's metadata snapshot, which the
+/// catalog's own decodes already compete for. A refusal is therefore final
+/// here and evicts nothing held by anyone else.
 pub async fn read_metrics_meta_for_serve_on_gate(
     store: &dyn ObjectStoreBackend,
     tenant_hash: &TenantHash,

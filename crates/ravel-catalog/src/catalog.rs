@@ -837,22 +837,38 @@ impl Catalog {
     /// though the cache has dropped it: eviction only ends a cache's claim on
     /// a value, never a reader's.
     ///
-    /// A decode wanting more than the budget's whole limit skips the pass
-    /// entirely and keeps its first refusal: no eviction could ever admit it,
-    /// and evicting anyway flushes every tenant's decoded caches on each such
-    /// query. That refusal is a refusal like any other, counted in neither
+    /// A decode that could not fit even if the caches gave back every byte
+    /// they hold skips the pass entirely and keeps its first refusal: the
+    /// test is `reserved - held + want > limit`, with `held` the caches'
+    /// reservation bytes ([`DecodedCaches::reserved_bytes`]), the subtraction
+    /// saturating at 0 and an overflowing sum refused as
+    /// [`ravel_memory::MemoryBudget::try_reserve`] refuses it. This covers a
+    /// decode wanting more than the budget's whole limit, and one refused
+    /// because other holders of a shared budget (SQL, the fetchers, the live
+    /// readers) own more of it than the caches could make up: evicting anyway
+    /// would flush every tenant's decoded caches on each such query and still
+    /// refuse. Such a refusal is counted in neither
     /// [`Catalog::decoded_cache_memory_evictions`] nor
-    /// [`Catalog::decode_reserve_retries`].
+    /// [`Catalog::decode_reserve_retries`]. `held` counts an entry a live
+    /// resolve also holds, which frees nothing when evicted, so the figure
+    /// overstates what eviction can free and the test errs toward running the
+    /// pass; a pass it lets through can still end in a refused retry. The two
+    /// figures are read without a common lock, `held` first, so they can skew
+    /// in either direction by a concurrent entry's bytes: an eviction that has
+    /// already subtracted an entry from `held` but not yet released its
+    /// reservation, or a decode that reserved after `held` was read and
+    /// inserts before `reserved` is, both raise `reserved - held` by that
+    /// entry and can make the test skip a pass that entry's bytes would have
+    /// let through. Either refusal is the ordinary typed one.
     ///
     /// A decode charged 0 bytes (its declared length is over the ceiling, see
     /// [`ravel_memory::decoded_charge`]) is refused only on a budget a
-    /// `reserve_unchecked` caller pushed over its limit. It takes the pass and
-    /// the one retry like any other refusal: cached entries hold reservations
-    /// on that same budget, so evicting them can bring it back within its
-    /// limit, and the 0-byte retry then succeeds and leaves the outcome to the
-    /// decoder's own refusal (ADR-1702 decision 6). When the over-limit bytes
-    /// are held outside the caches the pass empties them and the retry is
-    /// refused.
+    /// `reserve_unchecked` caller pushed over its limit. It follows the same
+    /// rule: when cached entries hold enough of the excess, the pass evicts
+    /// until the budget is back within its limit and the 0-byte retry
+    /// succeeds, leaving the outcome to the decoder's own refusal (ADR-1702
+    /// decision 6); when the excess is held outside the caches, no pass runs
+    /// and the first refusal is the answer.
     ///
     /// Eviction and retry are NOT atomic against each other or against other
     /// resolves. Another task can take the freed bytes between the two, so a
@@ -872,7 +888,21 @@ impl Catalog {
             Err(refusal) => refusal,
         };
         let want = ravel_memory::decoded_charge(declared, ceiling);
-        if want > self.memory_budget.limit() {
+        let limit = self.memory_budget.limit();
+        // The test below also refuses this; checking it first skips the two
+        // cache locks `reserved_bytes` takes.
+        if want > limit {
+            return Err(refusal);
+        }
+        // `held` is read before `reserved`: an entry leaving the caches
+        // between the two reads then lowers `reserved` against a `held` that
+        // still counts it, which errs toward running the pass.
+        let held = self.decoded.reserved_bytes();
+        let held_outside_caches = self.memory_budget.reserved().saturating_sub(held);
+        if held_outside_caches
+            .checked_add(want)
+            .is_none_or(|total| total > limit)
+        {
             return Err(refusal);
         }
         self.decoded.evict_until_fits(&self.memory_budget, want);
@@ -888,11 +918,12 @@ impl Catalog {
 
     /// Decode reservations retried after such an eviction pass, cumulative.
     /// One per refused reservation that ran the pass, whether or not the retry
-    /// succeeded. A decode wanting more than the budget's whole limit skips
-    /// the pass and counts nothing. A decode charged 0 bytes (declared over
-    /// its ceiling) refused by a budget already over its limit does run the
-    /// pass and counts one retry, which succeeds once eviction brings the
-    /// budget within its limit.
+    /// succeeded. A decode that could not fit even with the caches' whole
+    /// held reservation given back (`reserved - held + want > limit`, see
+    /// [`Catalog::reserve_decoded`]) skips the pass and counts nothing; that
+    /// includes one wanting more than the budget's whole limit, and a 0-byte
+    /// charge (declared over its ceiling) on a budget whose bytes held outside
+    /// the caches alone exceed its limit.
     pub fn decode_reserve_retries(&self) -> u64 {
         self.decode_reserve_retries.load(Ordering::Relaxed)
     }
@@ -12084,8 +12115,9 @@ mod tests {
     /// make a part larger than the whole limit fit, so a pass would flush
     /// every tenant's decoded entries on each such query and still refuse.
     ///
-    /// FLIP: drop the `want > self.memory_budget.limit()` early return from
-    /// `Catalog::reserve_decoded` (catalog.rs) and the pass runs anyway: the
+    /// FLIP: drop both early returns from `Catalog::reserve_decoded`
+    /// (catalog.rs), `want > limit` and the `reserved - held + want > limit`
+    /// one that also covers this case, and the pass runs anyway: the
     /// small tenant's cached part is evicted, so
     /// `decoded_cache_memory_evictions()` and `decode_reserve_retries()` below
     /// read 1 instead of 0, `part_cache().total_entries()` reads 0 instead of
@@ -12226,16 +12258,14 @@ mod tests {
 
     /// When the over-limit bytes are held by a `reserve_unchecked` the caches
     /// do not own, larger than everything cached, eviction cannot bring the
-    /// budget within its limit: the pass empties both caches, the one retry
-    /// is refused, and that refusal is the answer.
+    /// budget within its limit: no pass runs, no retry is counted, both cached
+    /// parts survive, and the first refusal is the answer.
     ///
-    /// FLIP: return early from `Catalog::reserve_decoded` when `want == 0`
-    /// and no pass runs: `decode_reserve_retries()` below reads 0 instead of
-    /// 1, `decoded_cache_memory_evictions()` 0 instead of 2, and the refusal
-    /// reports the cached parts still reserved. Reverting the loop condition
-    /// in `DecodedCaches::evict_until_fits` (cache.rs) to
-    /// `budget.limit().saturating_sub(budget.reserved()) < want` fails the
-    /// same refusal assertion: the pass evicts nothing.
+    /// FLIP: drop the `reserved - held + want > limit` early return from
+    /// `Catalog::reserve_decoded` (catalog.rs) and the pass empties both
+    /// caches for a retry that is refused anyway: the refusal below reports
+    /// `reserved` equal to `foreign` alone, `decode_reserve_retries()` reads 1
+    /// and `decoded_cache_memory_evictions()` 2.
     #[tokio::test]
     async fn a_zero_charge_over_the_limit_is_refused_when_eviction_cannot_help() {
         let store = Arc::new(MemoryStore::new());
@@ -12272,16 +12302,205 @@ mod tests {
             err,
             ravel_memory::MemoryExhausted {
                 requested: 0,
-                reserved: foreign,
+                reserved: cached_len + foreign,
                 limit: cached_len,
             },
-            "the retry's refusal, with every cached part released"
+            "the first refusal, reported with both cached parts still reserved"
         );
-        assert_eq!(catalog.decode_reserve_retries(), 1);
-        assert_eq!(catalog.decoded_cache_memory_evictions(), 2);
-        assert_eq!(catalog.part_cache().total_entries(), 0);
+        assert_eq!(catalog.decode_reserve_retries(), 0);
+        assert_eq!(catalog.decoded_cache_memory_evictions(), 0);
+        assert_eq!(catalog.part_cache().entry_count(&first), 1);
+        assert_eq!(catalog.part_cache().entry_count(&second), 1);
         budget.release(foreign);
-        assert_eq!(budget.reserved(), 0);
+        assert_eq!(budget.reserved(), cached_len);
+    }
+
+    /// Issue #2108: on a finite budget shared with other holders, a decode
+    /// larger than what the decoded caches hold but within the limit is
+    /// refused without an eviction pass when the other holders own the rest:
+    /// evicting every cached entry could not admit it.
+    ///
+    /// FLIP: drop the `reserved - held + want > limit` early return from
+    /// `Catalog::reserve_decoded` (catalog.rs) and the pass evicts the small
+    /// tenant's part before the retry is refused: the refusal below reports
+    /// `reserved` equal to `foreign` alone, `decoded_cache_memory_evictions()`
+    /// reads 1, `decode_reserve_retries()` 1, and the small tenant's entry
+    /// count 0.
+    #[tokio::test]
+    async fn a_decode_the_caches_cannot_make_room_for_evicts_nothing() {
+        let store = Arc::new(MemoryStore::new());
+        let sealed_hour = 500_000u32;
+        let now_ns = fold_now_ns(sealed_hour);
+        let range = sealed_hour_range(sealed_hour);
+        let small = TenantHash([0x67; 16]);
+        let large = TenantHash([0x68; 16]);
+        let small_len = fold_one_part_for(&store, small, sealed_hour, 1).await;
+        let large_len = fold_one_part_for(&store, large, sealed_hour, 8).await;
+        assert!(
+            large_len > small_len + 1,
+            "the large part must exceed what the caches will hold: {large_len} vs {small_len}"
+        );
+
+        // The large part fits the limit, so the whole-limit shortcut does not
+        // decide this; what decides it is the other holder's share.
+        let limit = small_len + large_len;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+        let catalog = Catalog::new(store.clone(), config(1))
+            .expect("catalog")
+            .with_memory_budget(budget.clone());
+        catalog
+            .resolve(&small, Signal::Metrics, range, &[], now_ns)
+            .await
+            .expect("the small tenant resolves within the budget");
+        assert_eq!(catalog.part_cache().total_entries(), 1);
+        assert_eq!(catalog.decoded.reserved_bytes(), small_len);
+
+        // Another holder of the shared budget (SQL, a fetcher, a live reader).
+        let foreign = small_len + 1;
+        let other_holder = budget.reserve(foreign).expect("the other holder fits");
+        assert_eq!(budget.reserved(), small_len + foreign);
+
+        let err = catalog
+            .resolve(&large, Signal::Metrics, range, &[], now_ns)
+            .await
+            .expect_err("the other holder's share leaves no room the caches could make");
+        match err {
+            CatalogError::MemoryExhausted(exhausted) => {
+                assert_eq!(
+                    exhausted,
+                    ravel_memory::MemoryExhausted {
+                        requested: large_len,
+                        reserved: small_len + foreign,
+                        limit,
+                    },
+                    "the first refusal, with the small tenant's part still cached"
+                );
+            }
+            other => panic!("expected CatalogError::MemoryExhausted, got {other:?}"),
+        }
+        assert_eq!(catalog.decoded_cache_memory_evictions(), 0);
+        assert_eq!(catalog.decode_reserve_retries(), 0);
+        assert_eq!(catalog.part_cache().entry_count(&small), 1);
+        assert_eq!(catalog.part_cache().total_entries(), 1);
+        drop(other_holder);
+        assert_eq!(budget.reserved(), small_len);
+    }
+
+    /// When the caches do hold enough, the pass still runs and evicts only
+    /// what the charge needs: of two cached parts, the least-recently-used one
+    /// goes, the retry admits the new decode, and the other part survives.
+    ///
+    /// FLIP: make the new early return in `Catalog::reserve_decoded`
+    /// (catalog.rs) ignore the caches' share, testing
+    /// `self.memory_budget.reserved()` instead of `held_outside_caches`, and
+    /// the pass never runs: the third tenant's resolve fails its `expect`
+    /// with `MemoryExhausted`. Make `DecodedCaches::evict_until_fits`
+    /// (cache.rs) evict until both caches are empty and the eviction count
+    /// reads 2 and the second tenant's entry count 0.
+    #[tokio::test]
+    async fn a_decode_the_caches_can_make_room_for_evicts_only_what_it_needs() {
+        let store = Arc::new(MemoryStore::new());
+        let sealed_hour = 500_000u32;
+        let now_ns = fold_now_ns(sealed_hour);
+        let range = sealed_hour_range(sealed_hour);
+        let first = TenantHash([0x69; 16]);
+        let second = TenantHash([0x6a; 16]);
+        let third = TenantHash([0x6b; 16]);
+        let lens = [
+            fold_one_part_for(&store, first, sealed_hour, 1).await,
+            fold_one_part_for(&store, second, sealed_hour, 1).await,
+            fold_one_part_for(&store, third, sealed_hour, 1).await,
+        ];
+        let part_len = lens[0];
+        assert!(
+            lens.iter().all(|len| *len == part_len),
+            "the fixture charges every tenant the same, so the arithmetic is exact: {lens:?}"
+        );
+
+        // Two cached parts plus another holder's share fill the budget.
+        let foreign = 5;
+        let limit = 2 * part_len + foreign;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+        let catalog = Catalog::new(store.clone(), config(1))
+            .expect("catalog")
+            .with_memory_budget(budget.clone());
+        for tenant in [&first, &second] {
+            catalog
+                .resolve(tenant, Signal::Metrics, range, &[], now_ns)
+                .await
+                .expect("each tenant resolves within the budget");
+        }
+        let other_holder = budget.reserve(foreign).expect("the other holder fits");
+        assert_eq!(budget.reserved(), limit);
+        assert_eq!(catalog.decoded.reserved_bytes(), 2 * part_len);
+
+        let snapshot = catalog
+            .resolve(&third, Signal::Metrics, range, &[], now_ns)
+            .await
+            .expect("evicting one cached part admits the third tenant's decode");
+        assert_eq!(snapshot.segments.len(), 1);
+        assert_eq!(catalog.decoded_cache_memory_evictions(), 1);
+        assert_eq!(catalog.decode_reserve_retries(), 1);
+        assert_eq!(catalog.part_cache().entry_count(&first), 0);
+        assert_eq!(catalog.part_cache().entry_count(&second), 1);
+        assert_eq!(catalog.part_cache().entry_count(&third), 1);
+        assert_eq!(catalog.decoded.reserved_bytes(), 2 * part_len);
+        assert_eq!(budget.reserved(), limit);
+        drop(other_holder);
+    }
+
+    /// The skip test admits exactly what `try_reserve` admits: when the bytes
+    /// held outside the caches plus the charge equal the limit, the pass
+    /// runs, evicts the one cached part, and the retry admits the decode.
+    ///
+    /// FLIP: change `total > limit` in `Catalog::reserve_decoded` to
+    /// `total >= limit` and the pass is skipped: the second tenant's resolve
+    /// fails its `expect` with `MemoryExhausted`.
+    #[tokio::test]
+    async fn a_decode_that_fits_exactly_once_the_caches_empty_runs_the_pass() {
+        let store = Arc::new(MemoryStore::new());
+        let sealed_hour = 500_000u32;
+        let now_ns = fold_now_ns(sealed_hour);
+        let range = sealed_hour_range(sealed_hour);
+        let first = TenantHash([0x6c; 16]);
+        let second = TenantHash([0x6d; 16]);
+        let lens = [
+            fold_one_part_for(&store, first, sealed_hour, 1).await,
+            fold_one_part_for(&store, second, sealed_hour, 1).await,
+        ];
+        let part_len = lens[0];
+        assert!(
+            lens.iter().all(|len| *len == part_len),
+            "the fixture charges every tenant the same, so the arithmetic is exact: {lens:?}"
+        );
+
+        // One cached part plus another holder's share fill the budget, and
+        // the other holder's share plus one part is exactly the limit.
+        let foreign = 5;
+        let limit = part_len + foreign;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+        let catalog = Catalog::new(store.clone(), config(1))
+            .expect("catalog")
+            .with_memory_budget(budget.clone());
+        catalog
+            .resolve(&first, Signal::Metrics, range, &[], now_ns)
+            .await
+            .expect("the first tenant resolves within the budget");
+        let other_holder = budget.reserve(foreign).expect("the other holder fits");
+        assert_eq!(budget.reserved(), limit);
+        assert_eq!(catalog.decoded.reserved_bytes(), part_len);
+
+        let snapshot = catalog
+            .resolve(&second, Signal::Metrics, range, &[], now_ns)
+            .await
+            .expect("evicting the one cached part admits a charge that fits exactly");
+        assert_eq!(snapshot.segments.len(), 1);
+        assert_eq!(catalog.decoded_cache_memory_evictions(), 1);
+        assert_eq!(catalog.decode_reserve_retries(), 1);
+        assert_eq!(catalog.part_cache().entry_count(&first), 0);
+        assert_eq!(catalog.part_cache().entry_count(&second), 1);
+        assert_eq!(budget.reserved(), limit);
+        drop(other_holder);
     }
 
     /// The declared `body_uncompressed_len` of the one-segment, one-column v3
