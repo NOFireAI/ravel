@@ -82,7 +82,9 @@ use ravel_types::{Signal, TenantHash};
 
 use crate::bucket::Bucket;
 use crate::clock::Clock;
-use crate::compact::{ClaimedCompaction, compact_bucket_claimed};
+use crate::compact::{
+    ClaimAcquisition, ClaimedCompaction, compact_bucket_claimed_with_acquisition,
+};
 use crate::config::{CompactorConfig, RetentionConfig};
 use crate::error::{MaintainError, Result};
 use crate::reachability::SnapshotGate;
@@ -344,7 +346,10 @@ pub async fn maintain_bucket(
 ) -> Result<(RetentionOutcome, Option<ClaimedCompaction>)> {
     let window_ns = resolve_retention_window_ns(store, retention, &bucket.tenant_hash).await?;
     let mut reach = SnapshotReachability::new();
-    maintain_bucket_with_reach(&mut reach, store, clock, config, window_ns, lease, bucket).await
+    let (outcome, compaction, _acquisition) =
+        maintain_bucket_with_reach(&mut reach, store, clock, config, window_ns, lease, bucket)
+            .await?;
+    Ok((outcome, compaction))
 }
 
 /// [`maintain_bucket`] with a caller-owned [`SnapshotReachability`] cache
@@ -361,22 +366,28 @@ pub async fn maintain_bucket_with_reach(
     window_ns: Option<i64>,
     lease: &dyn LeaseCheck,
     bucket: &Bucket,
-) -> Result<(RetentionOutcome, Option<ClaimedCompaction>)> {
+) -> Result<(
+    RetentionOutcome,
+    Option<ClaimedCompaction>,
+    Option<ClaimAcquisition>,
+)> {
     let outcome =
         retention_sweep_bucket_with_reach(reach, store, clock, config, window_ns, lease, bucket)
             .await?;
-    let compaction = match outcome {
+    let (compaction, acquisition) = match outcome {
         // The bucket is (or is being) retired, or its delete is blocked by a
         // still-reaching snapshot: never compact it.
         RetentionOutcome::Tombstoned
         | RetentionOutcome::Swept
         | RetentionOutcome::SweptPartial
-        | RetentionOutcome::BlockedBySnapshot(_) => None,
+        | RetentionOutcome::BlockedBySnapshot(_) => (None, None),
         RetentionOutcome::NoPolicy | RetentionOutcome::NotSealed | RetentionOutcome::NotExpired => {
-            Some(compact_bucket_claimed(store, clock, config, bucket).await?)
+            let (compaction, acquisition) =
+                compact_bucket_claimed_with_acquisition(store, clock, config, bucket).await?;
+            (Some(compaction), acquisition)
         }
     };
-    Ok((outcome, compaction))
+    Ok((outcome, compaction, acquisition))
 }
 
 /// The maximum `max_event_ts_ns` across a bucket's L0 commit records,

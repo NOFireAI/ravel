@@ -325,14 +325,41 @@ async fn main() -> anyhow::Result<()> {
     let alert_retention_window_ns = cli
         .parse_alert_retention()
         .context("failed to parse --alert-retention")?;
+    let claim_lease_duration = cli
+        .parse_maintain_claim_lease()
+        .context("failed to parse --maintain-claim-lease")?;
+    let claim_min_input_bytes = cli
+        .parse_maintain_claim_min_input_bytes()
+        .context("failed to parse --maintain-claim-min-input-bytes")?;
     let compactor = CompactorConfig {
         protection_horizon_ns: gc_runtime.protection_horizon_ns,
         grace_ns: gc_runtime.grace_ns,
         max_flush_lifetime_ns: gc_runtime.max_flush_lifetime_ns,
         interior_reverify_ns,
         alert_retention_window_ns,
+        coordination: cli.maintain_claims.mode(),
+        claim_lease_duration,
+        claim_min_input_bytes,
         ..CompactorConfig::default()
     };
+    // ADR-1029 decision 3: a lease shorter than twice the time to encode and
+    // PUT the largest L1 part at a conservative rate can expire, and be
+    // stolen, before a run still encoding its largest part reaches its own
+    // next renewal checkpoint. Logged, not refused: a deployment with
+    // deliberately small parts and a short lease is a valid shape.
+    if ravel_maintain::config::claim_lease_below_warn_threshold(
+        claim_lease_duration,
+        compactor.max_l1_part_bytes,
+    ) {
+        tracing::warn!(
+            claim_lease_secs = claim_lease_duration.as_secs(),
+            max_l1_part_bytes = compactor.max_l1_part_bytes,
+            "maintenance: --maintain-claim-lease is below ADR-1029 decision 3's startup \
+             threshold (2x the estimated encode+PUT time for the largest L1 part); a claim \
+             can expire while its run is still encoding its largest part, raise the lease if \
+             ravel_maintain_claims_lost_total climbs"
+        );
+    }
     // The catalog listing window and the OTLP admission bound are one
     // coordinated value (ADR-0051 section 4), from `--max-ingest-lag`. Resolve
     // the pair here so the retention floor below is validated against the SAME

@@ -3498,6 +3498,27 @@ pub struct MaintenanceSafetySignalSnapshot {
     /// and a per-cycle maximum over this process's units, rendered in seconds as
     /// `ravel_maintain_retention_lag_seconds`.
     pub retention_lag_ns: i64,
+    /// Claim acquisitions for this signal since process start, fresh or
+    /// stolen (ADR-1029 decision 3, issue #1035). A counter, backing
+    /// `ravel_maintain_claims_acquired_total`.
+    pub claims_acquired: u64,
+    /// Subset of `claims_acquired` above taken over from an expired holder
+    /// rather than created fresh. Backs `ravel_maintain_claims_stolen_total`.
+    pub claims_stolen: u64,
+    /// Claims this process held and then lost before publishing (taken over
+    /// after its lease expired; the run cancelled), since process start. Backs
+    /// `ravel_maintain_claims_lost_total`.
+    pub claims_lost: u64,
+    /// Claim renewals that failed with a genuine object-store error rather
+    /// than losing the claim, since process start. Backs
+    /// `ravel_maintain_claim_renew_failures_total`.
+    pub claim_renew_failures: u64,
+    /// Bucket evaluations that did not compact because an unexpired claim held
+    /// the bucket, one per pass while the hold lasts, since process start (the
+    /// Consequences list's
+    /// `claimed_buckets_skipped`). Backs
+    /// `ravel_maintain_claims_skipped_total`.
+    pub claims_skipped: u64,
 }
 
 /// One scrape's maintenance-safety counters (ADR-0048 decisions 1, 4, 6): the three safety controls that, before this issue, reached
@@ -3575,6 +3596,11 @@ impl MaintenanceSafetySnapshot {
                     l0_records_pending: metrics.l0_records_pending(signal),
                     bytes_reclaimed: metrics.bytes_reclaimed(signal),
                     retention_lag_ns: metrics.retention_lag_ns(signal),
+                    claims_acquired: metrics.claims_acquired(signal),
+                    claims_stolen: metrics.claims_stolen(signal),
+                    claims_lost: metrics.claims_lost(signal),
+                    claim_renew_failures: metrics.claim_renew_failures(signal),
+                    claims_skipped: metrics.claims_skipped(signal),
                 })
                 .collect(),
         }
@@ -3824,6 +3850,99 @@ fn render_maintain_safety_family(
             "ravel_maintain_retention_lag_seconds",
             &labels(mode, signal.signal),
             signal.retention_lag_ns as f64 / 1e9,
+        );
+    }
+
+    // Advisory compaction claim counters (ADR-1029 decision 3, issue #1035):
+    // claims are advisory only, correctness rests on content-addressed parts
+    // and CreateIfAbsent record publication, so these exist to size the lease
+    // and diagnose contention, not to prove correctness.
+    write_header(
+        out,
+        "ravel_maintain_claims_acquired_total",
+        "Compaction claims this process acquired, by signal, since process start, fresh or \
+         taken over from an expired claim. Counted from shard passes that complete: a pass \
+         that ends in an error drops the claim counts it had gathered.",
+        "counter",
+    );
+    for signal in &snapshot.signals {
+        write_sample(
+            out,
+            "ravel_maintain_claims_acquired_total",
+            &labels(mode, signal.signal),
+            signal.claims_acquired,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_maintain_claims_stolen_total",
+        "Subset of ravel_maintain_claims_acquired_total taken over from an expired claim \
+         rather than created fresh, by signal, since process start. An expired claim is also \
+         what a crash, a restart or a failed run leaves behind, so a steal alone does not mean \
+         the lease is too short.",
+        "counter",
+    );
+    for signal in &snapshot.signals {
+        write_sample(
+            out,
+            "ravel_maintain_claims_stolen_total",
+            &labels(mode, signal.signal),
+            signal.claims_stolen,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_maintain_claims_lost_total",
+        "Claims this process held and then lost before publishing, by signal, since process \
+         start: another process took the claim over after its lease expired, or the claim \
+         object was deleted, and this run cancelled at its next checkpoint. A sustained rate \
+         means the lease is shorter than this deployment's merges; see the operations guide. \
+         Counted from shard passes that complete.",
+        "counter",
+    );
+    for signal in &snapshot.signals {
+        write_sample(
+            out,
+            "ravel_maintain_claims_lost_total",
+            &labels(mode, signal.signal),
+            signal.claims_lost,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_maintain_claim_renew_failures_total",
+        "Compaction claim renewals that failed with a genuine object-store error rather than \
+         losing the claim, by signal, since process start.",
+        "counter",
+    );
+    for signal in &snapshot.signals {
+        write_sample(
+            out,
+            "ravel_maintain_claim_renew_failures_total",
+            &labels(mode, signal.signal),
+            signal.claim_renew_failures,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_maintain_claims_skipped_total",
+        "Bucket evaluations in which this process did not compact because of a claim, by \
+         signal, since process start: an unexpired claim held the bucket, another contender \
+         won the steal, the claim could not be read, or it vanished twice. A held bucket adds \
+         one per maintenance pass until its claim expires. Counted from shard passes that \
+         complete.",
+        "counter",
+    );
+    for signal in &snapshot.signals {
+        write_sample(
+            out,
+            "ravel_maintain_claims_skipped_total",
+            &labels(mode, signal.signal),
+            signal.claims_skipped,
         );
     }
 
@@ -9635,6 +9754,11 @@ mod tests {
                     l0_records_pending: 8,
                     bytes_reclaimed: 4096,
                     retention_lag_ns: 90_000_000_000,
+                    claims_acquired: 15,
+                    claims_stolen: 14,
+                    claims_lost: 17,
+                    claim_renew_failures: 18,
+                    claims_skipped: 19,
                 },
                 MaintenanceSafetySignalSnapshot {
                     signal: Signal::Logs,
@@ -9648,6 +9772,11 @@ mod tests {
                     l0_records_pending: 0,
                     bytes_reclaimed: 0,
                     retention_lag_ns: 0,
+                    claims_acquired: 0,
+                    claims_stolen: 0,
+                    claims_lost: 0,
+                    claim_renew_failures: 0,
+                    claims_skipped: 0,
                 },
             ],
         };
@@ -9796,6 +9925,53 @@ mod tests {
                 "ravel_maintain_retention_lag_seconds{mode=\"maintain\",signal=\"logs\"} 0"
             ),
             "a zero-valued signal must still render:\n{body}"
+        );
+        // Advisory compaction claim counters (ADR-1029 decision 3, #1035): all
+        // five families, each a counter, each rendering the zero-valued signal.
+        for (family, kind, ty) in [
+            (
+                "ravel_maintain_claims_acquired_total",
+                ("metrics", 15),
+                "counter",
+            ),
+            (
+                "ravel_maintain_claims_stolen_total",
+                ("metrics", 14),
+                "counter",
+            ),
+            (
+                "ravel_maintain_claims_lost_total",
+                ("metrics", 17),
+                "counter",
+            ),
+            (
+                "ravel_maintain_claim_renew_failures_total",
+                ("metrics", 18),
+                "counter",
+            ),
+            (
+                "ravel_maintain_claims_skipped_total",
+                ("metrics", 19),
+                "counter",
+            ),
+        ] {
+            let (signal, value) = kind;
+            assert!(
+                body.contains(&format!("# TYPE {family} {ty}")),
+                "{family} must carry a {ty} TYPE header:\n{body}"
+            );
+            assert!(
+                body.contains(&format!(
+                    "{family}{{mode=\"maintain\",signal=\"{signal}\"}} {value}"
+                )),
+                "missing {family} sample:\n{body}"
+            );
+        }
+        assert!(
+            body.contains(
+                "ravel_maintain_claims_acquired_total{mode=\"maintain\",signal=\"logs\"} 0"
+            ),
+            "a zero-valued signal must still render for claims_acquired:\n{body}"
         );
     }
 
@@ -10474,6 +10650,11 @@ mod tests {
                 l0_records_pending: 1,
                 bytes_reclaimed: 1,
                 retention_lag_ns: 1,
+                claims_acquired: 1,
+                claims_stolen: 1,
+                claims_lost: 1,
+                claim_renew_failures: 1,
+                claims_skipped: 1,
             }],
         };
         let body = render(
@@ -10706,6 +10887,127 @@ mod tests {
             &[
                 (Signal::Metrics, "84600"),
                 (Signal::Logs, "1.5"),
+                (Signal::Spans, "0"),
+            ],
+        );
+    }
+
+    /// `ravel_maintain_claims_acquired_total` (ADR-1029 decision 3, #1035): a
+    /// counter, one header in every mode, one `{mode, signal}` sample per
+    /// maintained signal, fresh acquisitions and steals both counted.
+    #[test]
+    fn claims_acquired_family_pins_name_type_and_labels() {
+        let snapshot = safety_snapshot_with(|s| {
+            s.claims_acquired = match s.signal {
+                Signal::Metrics => 5,
+                Signal::Logs => 2,
+                _ => 0,
+            };
+        });
+        assert_safety_family_renders(
+            &snapshot,
+            "ravel_maintain_claims_acquired_total",
+            "counter",
+            &[
+                (Signal::Metrics, "5"),
+                (Signal::Logs, "2"),
+                (Signal::Spans, "0"),
+            ],
+        );
+    }
+
+    /// `ravel_maintain_claims_stolen_total` (ADR-1029 decision 3, #1035): a
+    /// counter, always a subset of `ravel_maintain_claims_acquired_total`, one
+    /// header in every mode, one `{mode, signal}` sample per maintained signal.
+    #[test]
+    fn claims_stolen_family_pins_name_type_and_labels() {
+        let snapshot = safety_snapshot_with(|s| {
+            s.claims_stolen = match s.signal {
+                Signal::Metrics => 3,
+                Signal::Logs => 0,
+                _ => 0,
+            };
+        });
+        assert_safety_family_renders(
+            &snapshot,
+            "ravel_maintain_claims_stolen_total",
+            "counter",
+            &[
+                (Signal::Metrics, "3"),
+                (Signal::Logs, "0"),
+                (Signal::Spans, "0"),
+            ],
+        );
+    }
+
+    /// `ravel_maintain_claims_lost_total` (ADR-1029 decision 3, #1035): a
+    /// counter, one header in every mode, one `{mode, signal}` sample per
+    /// maintained signal.
+    #[test]
+    fn claims_lost_family_pins_name_type_and_labels() {
+        let snapshot = safety_snapshot_with(|s| {
+            s.claims_lost = match s.signal {
+                Signal::Metrics => 4,
+                Signal::Logs => 1,
+                _ => 0,
+            };
+        });
+        assert_safety_family_renders(
+            &snapshot,
+            "ravel_maintain_claims_lost_total",
+            "counter",
+            &[
+                (Signal::Metrics, "4"),
+                (Signal::Logs, "1"),
+                (Signal::Spans, "0"),
+            ],
+        );
+    }
+
+    /// `ravel_maintain_claim_renew_failures_total` (ADR-1029 decision 3,
+    /// #1035): a counter, distinct from `ravel_maintain_claims_lost_total`
+    /// (a store-error renewal is not a lost claim), one header in every mode,
+    /// one `{mode, signal}` sample per maintained signal.
+    #[test]
+    fn claim_renew_failures_family_pins_name_type_and_labels() {
+        let snapshot = safety_snapshot_with(|s| {
+            s.claim_renew_failures = match s.signal {
+                Signal::Metrics => 6,
+                Signal::Logs => 0,
+                _ => 0,
+            };
+        });
+        assert_safety_family_renders(
+            &snapshot,
+            "ravel_maintain_claim_renew_failures_total",
+            "counter",
+            &[
+                (Signal::Metrics, "6"),
+                (Signal::Logs, "0"),
+                (Signal::Spans, "0"),
+            ],
+        );
+    }
+
+    /// `ravel_maintain_claims_skipped_total` (ADR-1029 decision 3, #1035): a
+    /// counter, one header in every mode, one `{mode, signal}` sample per
+    /// maintained signal.
+    #[test]
+    fn claims_skipped_family_pins_name_type_and_labels() {
+        let snapshot = safety_snapshot_with(|s| {
+            s.claims_skipped = match s.signal {
+                Signal::Metrics => 9,
+                Signal::Logs => 0,
+                _ => 0,
+            };
+        });
+        assert_safety_family_renders(
+            &snapshot,
+            "ravel_maintain_claims_skipped_total",
+            "counter",
+            &[
+                (Signal::Metrics, "9"),
+                (Signal::Logs, "0"),
                 (Signal::Spans, "0"),
             ],
         );

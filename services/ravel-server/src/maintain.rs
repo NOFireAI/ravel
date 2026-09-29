@@ -212,6 +212,33 @@ pub struct MaintenanceSafetyMetrics {
     /// this process observed, so a later unit with a smaller lag must not lower
     /// it and units must not add together.
     retention_lag_ns_accum: [AtomicI64; MAINTAINED_SIGNALS.len()],
+    /// Claim acquisitions per signal since process start, from every unit's
+    /// `MaintainReport::claims_acquired` (ADR-1029 decision 3, issue #1035):
+    /// this run took the claim, fresh or stolen. Backs
+    /// `ravel_maintain_claims_acquired_total`.
+    claims_acquired: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    /// Subset of `claims_acquired` above taken over from an expired holder
+    /// rather than created fresh (`MaintainReport::claims_stolen`, ADR-1029
+    /// decision 3). Backs `ravel_maintain_claims_stolen_total`.
+    claims_stolen: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    /// Claims this process held and then lost before publishing: another
+    /// process took the claim over after its lease expired and this run
+    /// cancelled at its next checkpoint, per signal since process start
+    /// (`MaintainReport::claim_cancelled`, ADR-1029 decision 3). Backs
+    /// `ravel_maintain_claims_lost_total`.
+    claims_lost: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    /// Claim renewals that failed with a genuine object-store error rather
+    /// than losing the claim (`MaintainError::ClaimRenewFailed`, ADR-1029
+    /// decision 3), per signal since process start. Backs
+    /// `ravel_maintain_claim_renew_failures_total`.
+    claim_renew_failures: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    /// Bucket evaluations that did not compact because an unexpired claim
+    /// held the bucket (one per pass while the hold lasts), per signal since
+    /// process start
+    /// (`MaintainReport::claim_skipped`, ADR-1029 decision 3; this is the
+    /// Consequences list's `claimed_buckets_skipped`). Backs
+    /// `ravel_maintain_claims_skipped_total`.
+    claims_skipped: [AtomicU64; MAINTAINED_SIGNALS.len()],
     /// Tenant ticks whose alert retention sweep was skipped for want of a
     /// usable alert state memo (ADR-1688 decision 3 and its store-error
     /// amendment), indexed by [`AlertRetentionSkipReason::index`].
@@ -516,6 +543,38 @@ impl MaintenanceSafetyMetrics {
         self.retention_lag_ns[signal_index(signal)].load(Ordering::Relaxed)
     }
 
+    /// Claim acquisitions for `signal` since process start, fresh or stolen
+    /// (ADR-1029 decision 3). Backs `ravel_maintain_claims_acquired_total`.
+    pub fn claims_acquired(&self, signal: Signal) -> u64 {
+        self.claims_acquired[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Subset of [`claims_acquired`](Self::claims_acquired) taken over from
+    /// an expired holder rather than created fresh. Backs
+    /// `ravel_maintain_claims_stolen_total`.
+    pub fn claims_stolen(&self, signal: Signal) -> u64 {
+        self.claims_stolen[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Claims this process held and then lost for `signal` since process
+    /// start. Backs `ravel_maintain_claims_lost_total`.
+    pub fn claims_lost(&self, signal: Signal) -> u64 {
+        self.claims_lost[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Claim renewals for `signal` that failed with a genuine store error
+    /// since process start. Backs `ravel_maintain_claim_renew_failures_total`.
+    pub fn claim_renew_failures(&self, signal: Signal) -> u64 {
+        self.claim_renew_failures[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Buckets skipped for `signal` because another run already held the
+    /// claim, since process start. Backs
+    /// `ravel_maintain_claims_skipped_total`.
+    pub fn claims_skipped(&self, signal: Signal) -> u64 {
+        self.claims_skipped[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
     pub fn record_legal_hold_refresh_failure(&self) {
         self.legal_hold_refresh_failures
             .fetch_add(1, Ordering::Relaxed);
@@ -523,6 +582,14 @@ impl MaintenanceSafetyMetrics {
 
     pub fn record_conservation_abort(&self, signal: Signal) {
         self.conservation_aborts[signal_index(signal)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One [`MaintainError::ClaimRenewFailed`] for `signal` (ADR-1029
+    /// decision 3): a renewal at a cancellation checkpoint failed with a
+    /// genuine store error rather than losing the claim. Backs
+    /// `ravel_maintain_claim_renew_failures_total`.
+    pub fn record_claim_renew_failure(&self, signal: Signal) {
+        self.claim_renew_failures[signal_index(signal)].fetch_add(1, Ordering::Relaxed);
     }
 
     /// One `sweep_shard` result for `signal`, taken whole so no figure the
@@ -617,6 +684,13 @@ impl MaintenanceSafetyMetrics {
         // single oldest still-present expired bucket, so a later unit with a
         // smaller lag must not lower it and two units must not add together.
         self.retention_lag_ns_accum[index].fetch_max(report.retention_lag_ns, Ordering::Relaxed);
+        // Claim counters (ADR-1029 decision 3, issue #1035): plain running
+        // totals, unlike the two accumulators above, so they need no
+        // begin/publish pairing and are visible on the next scrape.
+        self.claims_acquired[index].fetch_add(report.claims_acquired as u64, Ordering::Relaxed);
+        self.claims_stolen[index].fetch_add(report.claims_stolen as u64, Ordering::Relaxed);
+        self.claims_lost[index].fetch_add(report.claim_cancelled as u64, Ordering::Relaxed);
+        self.claims_skipped[index].fetch_add(report.claim_skipped as u64, Ordering::Relaxed);
     }
 
     /// Clear the L0-pending accumulator at the top of a maintenance cycle.
@@ -1569,6 +1643,8 @@ pub async fn run_discovery_cycle(
         total.skipped_terminal += report.skipped_terminal;
         total.claim_skipped += report.claim_skipped;
         total.claim_cancelled += report.claim_cancelled;
+        total.claims_acquired += report.claims_acquired;
+        total.claims_stolen += report.claims_stolen;
         total.l0_records_pending += report.l0_records_pending;
         total.retention_lag_ns = total.retention_lag_ns.max(report.retention_lag_ns);
     }
@@ -2013,6 +2089,8 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
                         // process actually ran.
                         claim_skipped = report.claim_skipped,
                         claim_cancelled = report.claim_cancelled,
+                        claims_acquired = report.claims_acquired,
+                        claims_stolen = report.claims_stolen,
                         "maintenance: retention + compaction pass complete"
                     );
                     safety.record_scan(signal, &report);
@@ -2023,6 +2101,8 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
                     total.skipped_terminal += report.skipped_terminal;
                     total.claim_skipped += report.claim_skipped;
                     total.claim_cancelled += report.claim_cancelled;
+                    total.claims_acquired += report.claims_acquired;
+                    total.claims_stolen += report.claims_stolen;
                     total.l0_records_pending += report.l0_records_pending;
                     total.retention_lag_ns = total.retention_lag_ns.max(report.retention_lag_ns);
                 }
@@ -2044,6 +2124,18 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
                          retried next tick"
                     );
                     safety.record_conservation_abort(signal);
+                }
+                Err(MaintainError::ClaimRenewFailed { at, source }) => {
+                    tracing::warn!(
+                        tenant = %tenant.to_hex(),
+                        signal = ?signal,
+                        shard,
+                        checkpoint = at,
+                        error = %source,
+                        "maintenance: compaction claim renewal failed with a store error \
+                         (not a lost claim); retried next tick"
+                    );
+                    safety.record_claim_renew_failure(signal);
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -3448,6 +3540,17 @@ mod tests {
             0,
             "and the claim protocol issues no request at all"
         );
+        assert_eq!(
+            (
+                off.safety.claims_acquired(Signal::Metrics),
+                off.safety.claims_stolen(Signal::Metrics),
+                off.safety.claims_lost(Signal::Metrics),
+                off.safety.claim_renew_failures(Signal::Metrics),
+                off.safety.claims_skipped(Signal::Metrics),
+            ),
+            (0, 0, 0, 0, 0),
+            "with coordination off none of the five claim counters move"
+        );
 
         // Phase 2, coordination on: exactly one merge runs.
         let on = overlapping_supervisor_tick(Coordination::On, Interleave::Pause).await;
@@ -3479,6 +3582,18 @@ mod tests {
         assert_eq!(
             on.b_ledger.publish.requests, 0,
             "and B never reached the publish protocol"
+        );
+        assert_eq!(
+            (
+                on.safety.claims_acquired(Signal::Metrics),
+                on.safety.claims_stolen(Signal::Metrics),
+                on.safety.claims_lost(Signal::Metrics),
+                on.safety.claim_renew_failures(Signal::Metrics),
+                on.safety.claims_skipped(Signal::Metrics),
+            ),
+            (1, 0, 0, 0, 1),
+            "A's fresh acquisition and B's skip, with no steal, loss, or \
+             renewal failure"
         );
 
         // Phase 3, coordination on with A's lease expiring under it: B steals
@@ -3518,6 +3633,76 @@ mod tests {
             "B's: the rejected CreateIfAbsent, the GET and HEAD that observed \
              the expired claim, the steal, and the completion"
         );
+        assert_eq!(
+            (
+                stolen.safety.claims_acquired(Signal::Metrics),
+                stolen.safety.claims_stolen(Signal::Metrics),
+                stolen.safety.claims_lost(Signal::Metrics),
+                stolen.safety.claim_renew_failures(Signal::Metrics),
+                stolen.safety.claims_skipped(Signal::Metrics),
+            ),
+            (2, 1, 1, 0, 0),
+            "acquired counts A's fresh acquisition AND B's steal (stolen is a \
+             subset of acquired, not separate from it); lost counts A's claim \
+             taken from it; no renewal failure, because A's renewal at the \
+             checkpoint succeeded and simply reported the steal"
+        );
+    }
+
+    /// OBSERVABILITY: a real supervisor pass's claim counters reach the
+    /// actual `/metrics` body, not just the in-process accessors. Runs the
+    /// steal phase of the ADR-1029 acceptance fixture above (the one
+    /// scenario that touches all five counters at once: A's fresh
+    /// acquisition, B's steal, A's loss) and asserts every one of the five
+    /// families this issue adds is present with its accumulated sample.
+    #[tokio::test]
+    async fn claim_counters_render_on_metrics_after_a_real_supervisor_pass() {
+        let stolen = overlapping_supervisor_tick(Coordination::On, Interleave::Steal).await;
+        let body = rendered_metrics(&stolen.safety);
+
+        assert!(
+            body.contains(
+                "ravel_maintain_claims_acquired_total{mode=\"maintain\",signal=\"metrics\"} 2"
+            ),
+            "claims_acquired_total must render A's fresh acquisition plus B's \
+             steal:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_claims_stolen_total{mode=\"maintain\",signal=\"metrics\"} 1"
+            ),
+            "claims_stolen_total must render B's steal:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_claims_lost_total{mode=\"maintain\",signal=\"metrics\"} 1"
+            ),
+            "claims_lost_total must render A's cancelled claim:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_claim_renew_failures_total{mode=\"maintain\",signal=\"metrics\"} 0"
+            ),
+            "claim_renew_failures_total must render, even at zero:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_claims_skipped_total{mode=\"maintain\",signal=\"metrics\"} 0"
+            ),
+            "claims_skipped_total must render, even at zero:\n{body}"
+        );
+        for name in [
+            "ravel_maintain_claims_acquired_total",
+            "ravel_maintain_claims_stolen_total",
+            "ravel_maintain_claims_lost_total",
+            "ravel_maintain_claim_renew_failures_total",
+            "ravel_maintain_claims_skipped_total",
+        ] {
+            assert!(
+                body.contains(&format!("# TYPE {name} counter")),
+                "{name} must render as a counter:\n{body}"
+            );
+        }
     }
 
     /// The claim participant a tick installs for itself reads the tick's own
@@ -3603,6 +3788,157 @@ mod tests {
         );
     }
 
+    /// A store that advances a shared [`FixedClock`] past the claim's
+    /// renewal threshold the instant the first L1 part is written, so the
+    /// [`crate::claim_guard::Checkpoint::PartBoundary`] check right after
+    /// that part (which runs after the PUT) renews rather than finding the
+    /// lease fresh.
+    struct AdvanceClockPastRenewalOnFirstPartPut<S> {
+        inner: S,
+        clock: FixedClock,
+        advance_to_ns: i64,
+        fired: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl<S: ObjectStoreBackend> ObjectStoreBackend for AdvanceClockPastRenewalOnFirstPartPut<S> {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            let outcome = self.inner.put(key, data, opts).await;
+            if key.contains("/l1/")
+                && self
+                    .fired
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                self.clock.set(self.advance_to_ns);
+            }
+            outcome
+        }
+        async fn get(
+            &self,
+            key: &str,
+            range: ravel_object_store::GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// A claim renewal that fails with a genuine object-store error is
+    /// reported as `ravel_maintain_claim_renew_failures_total`, not as
+    /// `ravel_maintain_claims_lost_total`. `ClaimGuard::checkpoint` maps a
+    /// scripted `PreconditionFailed` to `Renewal::ClaimLost` (an ordinary
+    /// steal, [`scripted_precondition_failure_on_renew_is_claim_lost`] in
+    /// ravel-fleet), but any OTHER store error propagates as
+    /// [`MaintainError::ClaimRenewFailed`], which `maintain.rs`'s dedicated
+    /// match arm records as a renewal failure and nothing else.
+    ///
+    /// Shown failing against a supervisor whose `ClaimRenewFailed` error arm
+    /// recorded a lost claim instead of a renewal failure: the renew-failure
+    /// count reads 0 instead of 1.
+    #[tokio::test]
+    async fn claim_renewal_store_error_counts_as_a_renew_failure_not_a_loss() {
+        const LEASE: std::time::Duration = std::time::Duration::from_secs(3);
+        let now_ns: i64 = 1_700_000_000 * 1_000_000_000;
+        let inner = MemoryStore::new();
+        inner.set_clock_ms((now_ns / 1_000_000) as u64);
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        for seq in 1..=2 {
+            publish_compactable_input(&inner, &tenant_id, 0, seq).await;
+        }
+
+        // Fault the SECOND PUT to the claim key: the first is the acquire's
+        // CreateIfAbsent, which must succeed for the run to reach a renewal
+        // at all.
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Put,
+                ScriptedFault::Transient("renewal store error".into()),
+            )
+            .with_key_contains(ravel_fleet::claim::COMPACTION_CLAIMS_PREFIX)
+            .with_occurrence(ravel_object_store::fault::Occurrence::Nth(2)),
+        );
+        let faulted = FaultStore::new(inner, plan);
+        let clock = FixedClock::new(now_ns);
+        let store = AdvanceClockPastRenewalOnFirstPartPut {
+            inner: faulted,
+            clock: clock.clone(),
+            advance_to_ns: now_ns + (LEASE.as_nanos() / 3) as i64 + 1_000_000_000,
+            fired: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        let worker = pinned_worker();
+        let live = worker.solo_live_set();
+        let config = CompactorConfig {
+            coordination: Coordination::On,
+            claim_min_input_bytes: 1,
+            claim_lease_duration: LEASE,
+            claim_participant: Some(ClaimParticipant::new(
+                worker.process_id(),
+                Arc::new(clock.clone()) as Arc<dyn Clock>,
+            )),
+            // One part per series, so the first part's PUT is exactly the
+            // PartBoundary checkpoint this test needs to trip.
+            max_l1_part_bytes: 1,
+            ..CompactorConfig::default()
+        };
+        let retention = RetentionConfig::default();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let mut memo = MaintainMemo::with_default_interval();
+
+        run_tick_with_clock(
+            &clock, &store, &tenant, &config, &retention, 1, &mut memo, &safety, &ownership,
+            &worker, &live,
+        )
+        .await;
+
+        assert_eq!(
+            store
+                .inner
+                .fault_count(Op::Put, ravel_object_store::fault::FaultKind::Transient),
+            1,
+            "the scripted renewal fault fired exactly once"
+        );
+        assert_eq!(
+            safety.claim_renew_failures(Signal::Metrics),
+            1,
+            "a genuine store error on renewal counts as a renew failure"
+        );
+        assert_eq!(
+            safety.claims_lost(Signal::Metrics),
+            0,
+            "and not as a lost claim: nothing stole or cancelled this one"
+        );
+    }
+
     /// Parts a full merge of the acceptance fixture writes: one per input
     /// series, under a part target of one byte.
     const PARTS: u64 = 4;
@@ -3622,6 +3958,11 @@ mod tests {
         b: MaintainReport,
         a_ledger: ravel_maintain::RunRequestReport,
         b_ledger: ravel_maintain::RunRequestReport,
+        /// Both replicas' claim counters, accumulated into the one recorder
+        /// the fixture shares across A and B: a real deployment gives each
+        /// process its own, so these are the SUM of what A and B each
+        /// reported, not either replica's contribution alone.
+        safety: MaintenanceSafetyMetrics,
     }
 
     /// Drive two supervisors over one compactable bucket with overlapping
@@ -3747,6 +4088,7 @@ mod tests {
             b: b_report,
             a_ledger: a_ledger.report(),
             b_ledger: b_ledger.report(),
+            safety,
         }
     }
 

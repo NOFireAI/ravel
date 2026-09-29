@@ -342,6 +342,72 @@ when a claim is in the way. It is safe for correctness, because the compaction
 record's create-if-absent still decides which output is published, but the
 merge may duplicate one another maintainer is running.
 
+### Compaction claim metrics
+
+Claims are advisory only: correctness rests entirely on content-addressed
+parts and the compaction record's `CreateIfAbsent`, and a claim bug can only
+waste work, never corrupt data. Both the background
+supervisor's per-unit tick and `ravel-cli maintain compact-bucket` /
+`compact-tenant` take claims; `--no-claim` on the CLI and
+`--maintain-claims off` on the server (below) are the two ways to opt a run
+out.
+
+The server's `/metrics` endpoint renders five claim counters, one family per
+signal. They count this server's own maintenance supervisor only: a
+`ravel-cli maintain compact-*` run is a separate process, reports its outcomes
+in its walk summary, and never moves these counters.
+
+- `ravel_maintain_claims_acquired_total` -- claims taken, fresh or taken over
+  from an expired claim.
+- `ravel_maintain_claims_stolen_total` -- the subset of the above taken over
+  from an expired claim. A crash, a restart or a failed run leaves an expired
+  claim behind too, so steals on their own are expected after any of those.
+- `ravel_maintain_claims_lost_total` -- claims this process held and lost
+  before publishing: another process took the claim over after its lease
+  expired, or the claim object was deleted, and this run cancelled at its
+  next checkpoint. A lifecycle rule or a manual delete on the claim prefix
+  also moves it, so rule that out before raising the lease.
+- `ravel_maintain_claim_renew_failures_total` -- renewals that failed with a
+  store error, distinct from a lost claim. The run stops with an error and its
+  claim is left to expire, so the bucket is skipped (by this process too)
+  until then.
+- `ravel_maintain_claims_skipped_total` -- bucket evaluations that did not
+  compact because of a claim: most often an unexpired claim held the bucket,
+  but also a lost steal race, a claim that could not be read, or one that
+  vanished twice (something outside the protocol is deleting claims). A held
+  bucket adds one per maintenance pass until the claim expires. The pass
+  that observed the claim logs a skip line with the reason; the later passes
+  of the same hold count without logging.
+
+The acquired, stolen, lost and skipped counts are gathered per shard pass and
+added when the pass completes; a pass that ends in an error drops what it had
+counted, so read them as lower bounds. A renewal store error is counted where
+it surfaces, so `ravel_maintain_claim_renew_failures_total` is not affected.
+
+Alert on lost claims, not on steals:
+`rate(ravel_maintain_claims_lost_total[15m]) > 0` held for 30 minutes (`for:
+30m`). A lost claim means a run was still working when its lease expired and
+another process took the bucket over, so the lease is shorter than that
+deployment's merges: raise `--maintain-claim-lease`. A steal is the other
+side of that event, but it also follows every crash and restart, so a steal
+rate alone over-alerts.
+
+Three flags configure claiming:
+
+- `--maintain-claim-lease <DURATION>` (default `300s`): how long a claim stays
+  live without a renewal. A lease below twice the time to encode and PUT the
+  largest L1 segment at a conservative rate logs a startup warning, not a
+  refusal; zero is refused outright.
+- `--maintain-claim-min-input-bytes <BYTES>` (default 64 MiB): the cost gate.
+  A bucket below this many listed L0 input bytes runs unclaimed, because a
+  duplicated small merge costs less than the claim traffic that would prevent
+  it. Zero is refused: it would claim every bucket regardless of size.
+- `--maintain-claims on|off` (default `on`): the fleet-wide escape hatch.
+  `off` disables claiming everywhere on that process, for a store whose
+  qualification record predates the CAS probes, or for an emergency; claims
+  stay advisory either way, so racing runs still converge at the compaction
+  record and the loser just pays its merge first.
+
 ## Garbage collection and retention
 
 Ravel deletes data through two independent triggers, both driven by the
