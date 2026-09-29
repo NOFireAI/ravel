@@ -16,7 +16,7 @@ use datafusion::catalog::TableProvider;
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::logical_expr::ident;
+use datafusion::logical_expr::{Expr, ident};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_datasource_parquet::source::ParquetSource;
 use parquet::arrow::ArrowWriter;
@@ -155,7 +155,7 @@ impl Fixture {
             store,
             services: ReadServices {
                 limiter: Arc::new(GetLimiter::new(4).expect("limiter")),
-                cache: ReadCache::Ram(Arc::new(cache)),
+                cache: Some(ReadCache::Ram(Arc::new(cache))),
                 metadata: Arc::new(MetadataCache::new(8 << 20)),
             },
             registered: Arc::new(TenantParquetStore::new(TENANT)),
@@ -223,6 +223,11 @@ impl Fixture {
             row_count: 0,
             footer_len,
         }
+    }
+
+    /// The services this fixture's readers share, caches included.
+    pub(crate) fn services(&self) -> ReadServices {
+        self.services.clone()
     }
 
     fn pinned(&self, file: ParquetFile) -> Arc<PinnedFile> {
@@ -342,6 +347,25 @@ impl Fixture {
         total
     }
 
+    /// [`ParquetMetaData::memory_size`] of `file`'s footer decoded from the
+    /// stored bytes, the size its metadata cache entry is charged.
+    ///
+    /// [`ParquetMetaData::memory_size`]: parquet::file::metadata::ParquetMetaData::memory_size
+    pub(crate) async fn decoded_footer_bytes(&self, file: &ParquetFile) -> u64 {
+        let key = String::from_utf8(file.key.clone()).expect("ascii key");
+        let bytes = self
+            .store
+            .get(&key, GetRange::Full)
+            .await
+            .expect("get")
+            .data;
+        let end = bytes.len() - 8;
+        let footer = &bytes[end - file.footer_len as usize..end];
+        ParquetMetaDataReader::decode_metadata(footer)
+            .expect("footer")
+            .memory_size() as u64
+    }
+
     pub(crate) fn session(&self, tables: &[(&str, Arc<ParquetTableProvider>)]) -> SessionContext {
         self.session_with(SessionConfig::new().with_target_partitions(4), tables)
     }
@@ -394,9 +418,22 @@ pub(crate) async fn read_all(
     table: &str,
     columns: &[&str],
 ) -> DfResult<String> {
-    let batches = ctx
-        .table(table)
-        .await?
+    read_where(ctx, table, columns, None).await
+}
+
+/// [`read_all`] of the rows `filter` keeps. The filter reaches the scan as its
+/// predicate, so DataFusion prunes with it and evaluates it in the reader.
+pub(crate) async fn read_where(
+    ctx: &SessionContext,
+    table: &str,
+    columns: &[&str],
+    filter: Option<Expr>,
+) -> DfResult<String> {
+    let mut frame = ctx.table(table).await?;
+    if let Some(filter) = filter {
+        frame = frame.filter(filter)?;
+    }
+    let batches = frame
         .select(columns.iter().map(|c| ident(*c)).collect::<Vec<_>>())?
         .sort(vec![ident(columns[0]).sort(true, false)])?
         .collect()
