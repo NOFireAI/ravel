@@ -573,6 +573,29 @@ fn build_router_with_sink(
     tokens: HashMap<String, TenantId>,
     audit_sink: Arc<dyn ravel_maintain::QueryAuditSink>,
 ) -> Router {
+    build_router_full(store, tokens, audit_sink, None)
+}
+
+/// [`build_router`] with Parquet tables queryable through `parquet`.
+fn build_router_with_parquet(
+    store: Arc<dyn ObjectStoreBackend>,
+    tokens: HashMap<String, TenantId>,
+    parquet: ravel_sql::ParquetSources,
+) -> Router {
+    build_router_full(
+        store,
+        tokens,
+        Arc::new(ravel_maintain::NoopQueryAuditSink),
+        Some(parquet),
+    )
+}
+
+fn build_router_full(
+    store: Arc<dyn ObjectStoreBackend>,
+    tokens: HashMap<String, TenantId>,
+    audit_sink: Arc<dyn ravel_maintain::QueryAuditSink>,
+    parquet: Option<ravel_sql::ParquetSources>,
+) -> Router {
     let catalog =
         Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
     let executor = SqlExecutor::new(
@@ -583,6 +606,10 @@ fn build_router_with_sink(
         SqlConfig::default(),
         1 << 30,
     );
+    let executor = match parquet {
+        Some(sources) => executor.with_parquet_sources(sources),
+        None => executor,
+    };
     router(SqlState {
         executor: Arc::new(executor),
         tenant_resolver: Arc::new(StaticBearerTokenResolver::new(tokens)),
@@ -682,6 +709,185 @@ async fn one_tenant_app(metric: &str, samples: &[(i64, f64)]) -> Router {
     let tenant = TenantId::new("acme".to_string());
     publish_segment(store.as_ref(), &tenant, 0, metric, samples).await;
     build_router(store, tokens(&[("acme-token", "acme")]))
+}
+
+/// The external lake store behind credential profile `lake`, and a router
+/// whose executor reads Parquet tables through it, or reads none of them when
+/// `profiles` is false because no profile file is configured.
+fn parquet_app(
+    store: Arc<dyn ObjectStoreBackend>,
+    lake: Arc<dyn ObjectStoreBackend>,
+    profiles: bool,
+) -> Router {
+    let external = profiles.then(|| {
+        Arc::new(ravel_sql::ExternalStoreMap::new(HashMap::from([(
+            "lake".to_string(),
+            lake,
+        )]))) as Arc<dyn ravel_sql::ExternalStores>
+    });
+    let sources = ravel_sql::ParquetSources::new(
+        Arc::clone(&store),
+        external,
+        Arc::new(ravel_query::GetLimiter::new(8).expect("limiter")),
+        None,
+        ravel_sql::DEFAULT_PARQUET_METADATA_CACHE_BYTES,
+    );
+    build_router_with_parquet(store, tokens(&[("acme-token", "acme")]), sources)
+}
+
+/// Write one Parquet file of `id: Int64`, `name: Utf8` into `lake` at `key`,
+/// grant `s3://lake/clicks` to tenant `acme` under profile `lake`, and create
+/// table `clicks` over the file, as `ravel-cli tenant parquet-grant add` and a
+/// `CREATE EXTERNAL TABLE` would.
+async fn create_clicks_table(store: &dyn ObjectStoreBackend, lake: &dyn ObjectStoreBackend) {
+    use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use ravel_pqtable::clock::FixedClock;
+    use ravel_pqtable::manifest::ParquetFile;
+    use ravel_pqtable::writer::{Intent, apply};
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["alpha", "beta", "gamma"])),
+        ],
+    )
+    .expect("batch");
+    let mut bytes = Vec::new();
+    let mut writer =
+        parquet::arrow::ArrowWriter::try_new(&mut bytes, schema, None).expect("writer");
+    writer.write(&batch).expect("write");
+    writer.close().expect("close");
+    let size = bytes.len() as u64;
+    let mut word = [0u8; 4];
+    word.copy_from_slice(&bytes[bytes.len() - 8..bytes.len() - 4]);
+    let footer_len = u32::from_le_bytes(word);
+    let key = "clicks/part-0.parquet";
+    let put = lake
+        .put(key, bytes::Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put the Parquet file");
+
+    let tenant = TenantId::new("acme".to_string()).hash();
+    let clock = FixedClock::new(NOW_NS);
+    ravel_pqtable::grants::add(store, &tenant, "lake", "s3://lake/clicks", "test", &clock)
+        .await
+        .expect("grant");
+    apply(
+        store,
+        &tenant,
+        "clicks",
+        Intent::Create {
+            if_not_exists: false,
+            location: "s3://lake/clicks/".to_string(),
+            grant: "s3://lake/clicks".to_string(),
+            files: vec![ParquetFile {
+                profile: "lake".to_string(),
+                bucket: "lake".to_string(),
+                key: key.as_bytes().to_vec(),
+                size,
+                etag: put.etag.0,
+                version: String::new(),
+                row_count: 3,
+                footer_len,
+            }],
+            options: std::collections::BTreeMap::new(),
+            created_by: "test".to_string(),
+            statement: "CREATE EXTERNAL TABLE clicks STORED AS PARQUET LOCATION \
+                        's3://lake/clicks/'"
+                .to_string(),
+        },
+        &clock,
+        60_000,
+    )
+    .await
+    .expect("create the table");
+}
+
+/// The phase entry named `name` of a response's `stats.phases`.
+fn phase<'a>(value: &'a Value, name: &str) -> &'a Value {
+    value["stats"]["phases"]
+        .as_array()
+        .expect("phases")
+        .iter()
+        .find(|phase| phase["phase"] == name)
+        .unwrap_or_else(|| panic!("no {name} phase in {value}"))
+}
+
+/// ADR-2040 reachability, issue #2053: a tenant's Parquet table, granted and
+/// created the way the operator and DDL paths write them, answers a filtered
+/// SELECT on `POST /api/v1/sql` with its exact rows, and the response's
+/// accounting puts the manifest and grants reads in Resolve, the footer and
+/// page index in Probe, and the data in Scan.
+#[tokio::test]
+async fn a_parquet_table_is_queryable_over_http() {
+    use ravel_object_store::instrument::{InstrumentedStore, StoreOp};
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let lake = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+    create_clicks_table(store.as_ref(), lake.as_ref()).await;
+    let app = parquet_app(
+        Arc::clone(&store),
+        Arc::clone(&lake) as Arc<dyn ObjectStoreBackend>,
+        true,
+    );
+
+    let (status, value) = post_json(
+        &app,
+        "acme-token",
+        "SELECT id, name FROM clicks WHERE id >= 2 ORDER BY id",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(
+        value["data"]["rows"],
+        serde_json::json!([[2, "beta"], [3, "gamma"]]),
+        "{value}"
+    );
+    let resolve = phase(&value, "resolve");
+    assert_eq!(resolve["s3ListRequests"], 1, "{value}");
+    assert_eq!(resolve["s3GetRequests"], 2, "{value}");
+    assert_eq!(
+        phase(&value, "probe")["s3GetRequests"],
+        2,
+        "the footer and the page index: {value}"
+    );
+    let scan = phase(&value, "scan")["s3GetRequests"]
+        .as_u64()
+        .expect("scan GETs");
+    assert!(scan > 0, "{value}");
+    assert_eq!(
+        lake.metrics().snapshot().op(StoreOp::Get).calls,
+        2 + scan,
+        "every lake GET is in Probe or Scan"
+    );
+}
+
+/// With no credential profile file the same table is refused with the typed
+/// error that says so, and the lake is never read.
+#[tokio::test]
+async fn a_parquet_table_without_a_profile_file_is_refused_over_http() {
+    use ravel_object_store::instrument::{InstrumentedStore, StoreOp};
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let lake = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+    create_clicks_table(store.as_ref(), lake.as_ref()).await;
+    let app = parquet_app(
+        Arc::clone(&store),
+        Arc::clone(&lake) as Arc<dyn ObjectStoreBackend>,
+        false,
+    );
+    let (status, value) = post_json(&app, "acme-token", "SELECT id FROM clicks").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
+    let message = value["error"].as_str().expect("error text");
+    assert!(message.contains("Parquet table clicks"), "{value}");
+    assert!(message.contains("--parquet-profiles"), "{value}");
+    assert_eq!(lake.metrics().snapshot().op(StoreOp::Get).calls, 0);
 }
 
 // ---------------------------------------------------------------------------

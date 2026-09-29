@@ -596,6 +596,22 @@ pub struct Cli {
     )]
     pub tenant_kms_config: Option<PathBuf>,
 
+    /// Path to the JSON file of credential profiles Parquet tables are read
+    /// through (ADR-2040 decision D1): the same file, and the same loader,
+    /// `ravel-cli --parquet-profiles` validates grants against. Each profile
+    /// names a store kind, its endpoint or account, and where its secret is
+    /// kept (an environment variable or a file), never the secret itself.
+    /// Absent (the default): no Parquet table is queryable, and a SQL query
+    /// naming one fails with a typed error that says so. Read at startup; a
+    /// malformed file stops the server. Used only by the `sql` feature's
+    /// endpoints.
+    #[arg(
+        long = "parquet-profiles",
+        env = "RAVEL_PARQUET_PROFILES",
+        value_name = "PATH"
+    )]
+    pub parquet_profiles: Option<PathBuf>,
+
     /// Disables the per-(tenant, signal) background catalog fold task, which
     /// runs in `--mode maintain` and `--mode all` and nowhere else. The other
     /// two modes refuse this flag at startup rather than ignore it.
@@ -6207,6 +6223,22 @@ impl Cli {
             .map_err(|e| anyhow::anyhow!("could not read --limits-file {path:?}: {e}"))?;
         limits::parse_limits_file(&text)
             .map_err(|e| anyhow::anyhow!("invalid --limits-file {}: {e}", path.display()))
+    }
+
+    /// Load and validate `--parquet-profiles` (ADR-2040 decision D1) through
+    /// [`ravel_object_store::external::load_profiles`]. `None` when the flag
+    /// is absent.
+    pub fn parse_parquet_profiles(
+        &self,
+    ) -> anyhow::Result<Option<Vec<ravel_object_store::external::ExternalProfile>>> {
+        let Some(path) = self.parquet_profiles.as_deref() else {
+            return Ok(None);
+        };
+        let json = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("could not read --parquet-profiles {path:?}: {e}"))?;
+        ravel_object_store::external::load_profiles(&json)
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("invalid --parquet-profiles {}: {e}", path.display()))
     }
 
     /// Load and validate `--tenant-kms-config` (ADR-0062 decision 1,
@@ -12301,6 +12333,44 @@ mod tests {
             err.to_string().contains("--mtls-listener"),
             "the error names the flag it would apply to: {err}"
         );
+    }
+
+    /// `--parquet-profiles` is read through the loader ravel-cli uses: an
+    /// absent flag is no profiles, a valid file names its profiles, and a
+    /// malformed one or a duplicate name stops startup naming the flag.
+    #[test]
+    fn parquet_profiles_are_loaded_through_the_shared_loader() {
+        assert!(cli(&[]).parse_parquet_profiles().expect("absent").is_none());
+        let good = tempfile::NamedTempFile::new().expect("temp file");
+        std::fs::write(
+            good.path(),
+            r#"[{"name": "lake", "kind": "gcs", "credentials": {"mode": "application_default"}}]"#,
+        )
+        .expect("write");
+        let path = good.path().to_str().expect("utf-8 path");
+        let profiles = cli(&["--parquet-profiles", path])
+            .parse_parquet_profiles()
+            .expect("valid file")
+            .expect("profiles");
+        assert_eq!(
+            profiles.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            vec!["lake"]
+        );
+        let duplicate = tempfile::NamedTempFile::new().expect("temp file");
+        std::fs::write(
+            duplicate.path(),
+            r#"[{"name": "lake", "kind": "gcs", "credentials": {"mode": "application_default"}},
+                {"name": "lake", "kind": "gcs", "credentials": {"mode": "application_default"}}]"#,
+        )
+        .expect("write");
+        let err = cli(&[
+            "--parquet-profiles",
+            duplicate.path().to_str().expect("utf-8 path"),
+        ])
+        .parse_parquet_profiles()
+        .expect_err("a duplicate name is refused");
+        assert!(err.to_string().contains("--parquet-profiles"), "{err}");
+        assert!(err.to_string().contains("duplicate"), "{err}");
     }
 
     #[test]

@@ -213,6 +213,7 @@ async fn start_server(
         scrub_period: std::time::Duration::from_secs(7 * 86_400),
         indexed_fields: Default::default(),
         typed_attr_columns: Default::default(),
+        parquet_profiles: None,
         // No read cache: the only fetch reservation is the fetcher's own.
         disable_cache: true,
         cache_max_bytes: 256 * 1024 * 1024,

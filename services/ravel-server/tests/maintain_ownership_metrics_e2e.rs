@@ -115,6 +115,7 @@ fn maintain_config(tenant: &TenantId) -> ServerConfig {
         scrub_period: Duration::from_secs(60),
         indexed_fields: Default::default(),
         typed_attr_columns: Default::default(),
+        parquet_profiles: None,
         disable_cache: false,
         cache_max_bytes: 256 * 1024 * 1024,
         catalog_cache_max_bytes: 256 * 1024 * 1024,

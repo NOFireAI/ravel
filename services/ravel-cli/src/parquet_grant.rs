@@ -31,8 +31,8 @@
 //!
 //! Profiles are read from the JSON file named by the global
 //! `--parquet-profiles` flag (or `RAVEL_PARQUET_PROFILES`), through
-//! [`load_profiles`], the loader ravel-server will use for the same file once
-//! issue #2053 wires its Parquet-table paths. A profile
+//! [`load_profiles`], the loader ravel-server uses for the same file, given to
+//! it by its own `--parquet-profiles` flag. A profile
 //! names its secrets through [`ravel_object_store::external::SecretSource`],
 //! whose two forms are an environment variable name and a file path, so the
 //! profile file carries a reference to secret material rather than the
@@ -330,8 +330,8 @@ fn require_profiles_path(path: Option<&Path>) -> anyhow::Result<&Path> {
     path.ok_or_else(|| {
         anyhow::anyhow!(
             "no credential profile file: pass --parquet-profiles <PATH> (or set \
-             RAVEL_PARQUET_PROFILES), the same file ravel-server will read once issue #2053 \
-             wires its Parquet-table paths"
+             RAVEL_PARQUET_PROFILES), the same file ravel-server reads from its own \
+             --parquet-profiles flag"
         )
     })
 }

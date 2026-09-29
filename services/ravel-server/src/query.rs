@@ -498,6 +498,11 @@ pub const DEFAULT_MAX_QUERY_BYTES: usize = ravel_sql::DEFAULT_MAX_QUERY_BYTES;
 /// SQL memory reservation counts against the SAME instance
 /// [`crate::lib`]'s `/metrics` gauges read, rather than an executor-private
 /// budget the exposition cannot see.
+///
+/// The executor this builds reads no Parquet table: a name that is not a
+/// signal table resolves as it did before Parquet tables existed.
+/// [`build_sql_state_with_parquet`] is the same state with Parquet sources
+/// installed, which is what [`crate::start`] builds.
 #[cfg(feature = "sql")]
 #[allow(clippy::too_many_arguments)]
 pub fn build_sql_state(
@@ -514,6 +519,98 @@ pub fn build_sql_state(
     query_admission: Arc<QueryAdmissionController>,
     declared_columns: Option<Arc<dyn ravel_sql::DeclaredColumnSource>>,
     process_memory_budget: Arc<ravel_memory::MemoryBudget>,
+) -> anyhow::Result<crate::sql::SqlState> {
+    build_sql_state_inner(
+        catalog,
+        store,
+        tenant_resolver,
+        cache,
+        engine_config,
+        get_limiter,
+        max_query_bytes,
+        max_tenant_bytes,
+        parallel_final_aggregation,
+        query_accounting,
+        query_admission,
+        declared_columns,
+        process_memory_budget,
+        None,
+    )
+}
+
+/// [`build_sql_state`] with Parquet tables queryable (ADR-2040): the executor
+/// resolves a tenant's Parquet manifests and grants from `store`, and reads
+/// their files through one read-only external store per (credential profile,
+/// bucket), opened from `parquet_profiles` the first time a query reads that
+/// bucket and kept for the process. The reads share `get_limiter` and `cache`
+/// with the signal-table fetchers.
+///
+/// `parquet_profiles` is `None` when no `--parquet-profiles` file is
+/// configured: no Parquet table is then queryable, and a query naming one
+/// fails with `ParquetQueryError::NotConfigured`.
+#[cfg(feature = "sql")]
+#[allow(clippy::too_many_arguments)]
+pub fn build_sql_state_with_parquet(
+    catalog: Arc<Catalog>,
+    store: Arc<dyn ObjectStoreBackend>,
+    tenant_resolver: Arc<dyn TenantResolver>,
+    cache: Option<ReadCache>,
+    engine_config: EngineConfig,
+    get_limiter: Arc<GetLimiter>,
+    max_query_bytes: usize,
+    max_tenant_bytes: usize,
+    parallel_final_aggregation: bool,
+    query_accounting: Arc<crate::metrics::QueryAccountingMetrics>,
+    query_admission: Arc<QueryAdmissionController>,
+    declared_columns: Option<Arc<dyn ravel_sql::DeclaredColumnSource>>,
+    process_memory_budget: Arc<ravel_memory::MemoryBudget>,
+    parquet_profiles: Option<Vec<ravel_object_store::external::ExternalProfile>>,
+) -> anyhow::Result<crate::sql::SqlState> {
+    let external = parquet_profiles.map(|profiles| {
+        Arc::new(ravel_sql::ProfileStores::new(profiles)) as Arc<dyn ravel_sql::ExternalStores>
+    });
+    let sources = ravel_sql::ParquetSources::new(
+        store.clone(),
+        external,
+        get_limiter.clone(),
+        cache.clone(),
+        ravel_sql::DEFAULT_PARQUET_METADATA_CACHE_BYTES,
+    );
+    build_sql_state_inner(
+        catalog,
+        store,
+        tenant_resolver,
+        cache,
+        engine_config,
+        get_limiter,
+        max_query_bytes,
+        max_tenant_bytes,
+        parallel_final_aggregation,
+        query_accounting,
+        query_admission,
+        declared_columns,
+        process_memory_budget,
+        Some(sources),
+    )
+}
+
+#[cfg(feature = "sql")]
+#[allow(clippy::too_many_arguments)]
+fn build_sql_state_inner(
+    catalog: Arc<Catalog>,
+    store: Arc<dyn ObjectStoreBackend>,
+    tenant_resolver: Arc<dyn TenantResolver>,
+    cache: Option<ReadCache>,
+    engine_config: EngineConfig,
+    get_limiter: Arc<GetLimiter>,
+    max_query_bytes: usize,
+    max_tenant_bytes: usize,
+    parallel_final_aggregation: bool,
+    query_accounting: Arc<crate::metrics::QueryAccountingMetrics>,
+    query_admission: Arc<QueryAdmissionController>,
+    declared_columns: Option<Arc<dyn ravel_sql::DeclaredColumnSource>>,
+    process_memory_budget: Arc<ravel_memory::MemoryBudget>,
+    parquet: Option<ravel_sql::ParquetSources>,
 ) -> anyhow::Result<crate::sql::SqlState> {
     use ravel_query::{LogSegmentFetcher, SegmentFetcher};
     use ravel_sql::{SpanSegmentFetcher, SqlConfig, SqlExecutor};
@@ -625,6 +722,10 @@ pub fn build_sql_state(
         None => executor,
     };
     let executor = executor.with_process_memory_budget(process_memory_budget);
+    let executor = match parquet {
+        Some(sources) => executor.with_parquet_sources(sources),
+        None => executor,
+    };
     Ok(crate::sql::SqlState {
         executor: Arc::new(executor),
         tenant_resolver,
@@ -1072,6 +1173,7 @@ mod catalog_cache_tests {
             scrub_period: Duration::from_secs(7 * 86_400),
             indexed_fields: crate::postings_config::IndexedFieldConfig::default(),
             typed_attr_columns: crate::typed_attr_config::TypedAttrColumnConfig::default(),
+            parquet_profiles: None,
             disable_cache: false,
             cache_max_bytes: 256 * 1024 * 1024,
             catalog_cache_max_bytes: 256 * 1024 * 1024,
@@ -1609,6 +1711,67 @@ mod tests {
             state.executor.config().engine.max_bytes_scanned,
             ByteLimit::Bounded(4096),
             "the SQL executor must enforce the configured byte budget, not the default Unlimited"
+        );
+    }
+
+    /// ADR-2040: `start`'s state builder always installs Parquet sources on the
+    /// executor, configured exactly when a profile file was loaded, while the
+    /// plain builder installs none.
+    #[cfg(feature = "sql")]
+    #[test]
+    fn build_sql_state_with_parquet_installs_the_profiles_it_is_given() {
+        let build = |profiles: Option<Vec<ravel_object_store::external::ExternalProfile>>| {
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let catalog = build_catalog(
+                store.clone(),
+                1,
+                false,
+                ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+                None,
+                None,
+                None,
+                Duration::from_secs(2),
+            )
+            .expect("catalog");
+            build_sql_state_with_parquet(
+                catalog,
+                store,
+                Arc::new(StaticBearerTokenResolver::new(HashMap::new())),
+                None,
+                EngineConfig::default(),
+                Arc::new(GetLimiter::new(1).expect("nonzero permits")),
+                ravel_sql::DEFAULT_MAX_QUERY_BYTES,
+                DEFAULT_MAX_TENANT_BYTES,
+                false,
+                Arc::new(crate::metrics::QueryAccountingMetrics::new(
+                    std::collections::HashSet::new(),
+                )),
+                QueryAdmissionController::shared(ravel_query::QueryConcurrencyLimit::Unlimited),
+                None,
+                Arc::new(ravel_memory::MemoryBudget::unlimited()),
+                profiles,
+            )
+            .expect("sql state builds")
+        };
+        let profiles = ravel_object_store::external::load_profiles(
+            r#"[{"name": "lake", "kind": "gcs", "credentials": {"mode": "application_default"}}]"#,
+        )
+        .expect("profiles");
+        let configured = build(Some(profiles));
+        assert!(
+            configured
+                .executor
+                .parquet_sources()
+                .expect("sources")
+                .is_configured()
+        );
+        let unconfigured = build(None);
+        assert!(
+            !unconfigured
+                .executor
+                .parquet_sources()
+                .expect("sources are installed without profiles too")
+                .is_configured()
         );
     }
 

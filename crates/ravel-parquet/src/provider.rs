@@ -140,6 +140,7 @@ impl TableOptions {
 #[derive(Debug)]
 pub struct ParquetTableProvider {
     raw: Arc<RawParquetScan>,
+    casts: BTreeMap<String, Cast>,
     /// The projection applying the table's casts; `None` without casts.
     cast_plan: Option<LogicalPlan>,
     schema: SchemaRef,
@@ -280,18 +281,46 @@ impl ParquetTableProvider {
             parallel,
         });
 
-        if options.casts.is_empty() {
+        Self::over(raw, options.casts)
+    }
+
+    /// The same table with its file grouping chosen by `parallel`, reading
+    /// nothing: the footer read when the table was built is reused.
+    pub fn with_parallel(&self, parallel: bool) -> Result<Self, ParquetTableError> {
+        let raw = Arc::new(RawParquetScan {
+            parallel,
+            ..self.raw.as_ref().clone()
+        });
+        Self::over(raw, self.casts.clone())
+    }
+
+    /// Whether the scan is split into up to `target_partitions` file groups.
+    pub fn parallel(&self) -> bool {
+        self.raw.parallel
+    }
+
+    fn over(
+        raw: Arc<RawParquetScan>,
+        casts: BTreeMap<String, Cast>,
+    ) -> Result<Self, ParquetTableError> {
+        if casts.is_empty() {
+            let schema = Arc::clone(&raw.schema);
             return Ok(ParquetTableProvider {
                 raw,
+                casts,
                 cast_plan: None,
-                schema: raw_schema,
+                schema,
             });
         }
-        let plan = cast_plan(&table, &raw, &options.casts)
-            .map_err(|source| ParquetTableError::Plan { table, source })?;
+        let plan =
+            cast_plan(&raw.table, &raw, &casts).map_err(|source| ParquetTableError::Plan {
+                table: raw.table.clone(),
+                source,
+            })?;
         let schema = Arc::new(plan.schema().as_arrow().clone());
         Ok(ParquetTableProvider {
             raw,
+            casts,
             cast_plan: Some(plan),
             schema,
         })
@@ -382,6 +411,7 @@ impl TableProvider for ParquetTableProvider {
 type ScanFile = (String, u64, Option<String>, Option<String>, u32);
 
 /// The Parquet scan itself, before any cast.
+#[derive(Clone)]
 struct RawParquetScan {
     table: String,
     schema: SchemaRef,
@@ -634,6 +664,13 @@ mod tests {
         let groups = file_groups_of(serial.as_ref(), &ctx).await;
         assert_eq!(groups, vec![(0..5).map(path).collect::<Vec<_>>()]);
 
+        let regrouped = serial.with_parallel(true).expect("regroup");
+        assert!(regrouped.parallel());
+        assert_eq!(
+            file_groups_of(&regrouped, &ctx).await,
+            file_groups_of(parallel.as_ref(), &ctx).await
+        );
+
         let ctx = fixture.session(&[("t", serial)]);
         let plan = ctx
             .table("t")
@@ -693,6 +730,36 @@ mod tests {
         let (parallel, rows) = partitions(true).await;
         assert_eq!(parallel, 4);
         assert_eq!(rows, expected);
+    }
+
+    /// ADR-2040 D6: the scan evaluates pushed-down filters inside the reader.
+    #[tokio::test]
+    async fn the_scan_evaluates_filters_inside_the_reader() {
+        let store = Arc::new(MemoryStore::new());
+        let fixture = Fixture::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>);
+        let file = fixture
+            .put_file(
+                &store,
+                "lake/t/a.parquet",
+                parquet_bytes(&[1], &["x"]),
+                true,
+            )
+            .await;
+        let table = fixture.provider("t", 1, vec![file], false).await;
+        let ctx = fixture.session(&[]);
+        let filter = datafusion::logical_expr::ident("a").gt(datafusion::logical_expr::lit(0_i64));
+        let plan = table
+            .scan(&ctx.state(), None, &[filter], None)
+            .await
+            .expect("scan");
+        let exec = plan
+            .downcast_ref::<DataSourceExec>()
+            .expect("a Parquet scan");
+        let (_, source) = exec
+            .downcast_to_file_source::<ParquetSource>()
+            .expect("a Parquet file source");
+        assert!(source.table_parquet_options().global.pushdown_filters);
+        assert!(datafusion::datasource::physical_plan::FileSource::filter(source).is_some());
     }
 
     #[test]
