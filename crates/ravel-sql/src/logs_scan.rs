@@ -760,11 +760,11 @@ fn record_carrier_conflict(
 /// `sample_count` before any grant but whose NULL count is deliberately not
 /// promoted to proven here.
 #[derive(Clone)]
-struct SegmentCoverage {
-    min: Option<ScalarValue>,
-    max: Option<ScalarValue>,
-    null_count: u64,
-    null_count_proven: bool,
+pub(crate) struct SegmentCoverage {
+    pub(crate) min: Option<ScalarValue>,
+    pub(crate) max: Option<ScalarValue>,
+    pub(crate) null_count: u64,
+    pub(crate) null_count_proven: bool,
 }
 
 impl SegmentCoverage {
@@ -989,6 +989,55 @@ fn cstat_coverage(
         null_count: stat.null_count,
         null_count_proven: false,
     })
+}
+
+/// The loaded `.cstat` entry for `seg`, joined by content hash and then by
+/// segment identity, or `None` when no statistics are loaded or none name it.
+pub(crate) fn segment_column_stats<'a>(
+    column_stats: Option<&'a LoadedColumnStats>,
+    seg: &SegmentRef,
+) -> Option<&'a ColumnStatsSegment> {
+    column_stats.and_then(|stats| stats.stat_for(&seg.content_hash, &segment_identity(seg)))
+}
+
+/// This segment's exact coverage of one declared column: the union of the
+/// `SegmentRef` stamp and the `.cstat` entry (ADR-0873 decision 4), where
+/// `seg_stats` is [`segment_column_stats`] for `seg`.
+///
+/// `None` declines the column for this segment: a `Str` column (no scalar form
+/// on the statistics paths), a segment neither carrier covers, or carriers
+/// that disagree. A disagreement is a writer, fold or build defect and is
+/// recorded with [`record_carrier_conflict`] before declining. When both
+/// carriers agree the stamp's triple is returned, with the NULL count proven if
+/// either carrier proved it.
+pub(crate) fn segment_declared_coverage(
+    declared: &DeclaredColumn,
+    seg: &SegmentRef,
+    seg_stats: Option<&ColumnStatsSegment>,
+) -> Option<SegmentCoverage> {
+    if matches!(declared.ty, DeclaredType::Str) {
+        return None;
+    }
+    match (
+        stamp_coverage(declared, &seg.declared_column_stats),
+        cstat_coverage(declared, seg, seg_stats),
+    ) {
+        (None, None) => None,
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (Some(stamp), Some(cstat)) => {
+            // Nothing is combined across carriers: both claim to describe the
+            // same rows of the same immutable object exactly, so they agree
+            // (use either) or one of them is wrong and no answer is safe.
+            if !stamp.agrees_with(&cstat) {
+                record_carrier_conflict(seg, &declared.key, &stamp, &cstat);
+                return None;
+            }
+            Some(SegmentCoverage {
+                null_count_proven: stamp.null_count_proven || cstat.null_count_proven,
+                ..stamp
+            })
+        }
+    }
 }
 
 /// The `None`-valued Arrow scalar `ty` projects to, for a declared column
@@ -1856,44 +1905,17 @@ impl LogsScanExec {
             // Either carrier may be absent for this segment, and neither
             // absence short-circuits the other: a live-tail segment has a
             // stamp and no `.cstat`, a pre-stamp sealed segment the reverse.
-            let seg_stats = self
-                .column_stats
-                .as_ref()
-                .and_then(|stats| stats.stat_for(&seg.content_hash, &segment_identity(seg)));
-            let stamps = &seg.declared_column_stats;
+            let seg_stats = segment_column_stats(self.column_stats.as_deref(), seg);
             for (k, a) in acc.iter_mut().enumerate() {
                 if a.declined {
                     continue;
                 }
-                let declared = &self.declared[k];
-                let coverage = match (
-                    stamp_coverage(declared, stamps),
-                    cstat_coverage(declared, seg, seg_stats),
-                ) {
-                    // Covered by neither: the ordinary uncovered state,
-                    // never an error, and the column falls back to a scan.
-                    (None, None) => {
-                        a.declined = true;
-                        continue;
-                    }
-                    (Some(only), None) | (None, Some(only)) => only,
-                    (Some(stamp), Some(cstat)) => {
-                        // Nothing is combined across carriers: both claim
-                        // to describe the same rows of the same immutable
-                        // object exactly, so they agree (use either) or
-                        // one of them is wrong and no answer is safe. A
-                        // conflict is a writer/fold/build defect, so it is
-                        // counted rather than only degraded.
-                        if !stamp.agrees_with(&cstat) {
-                            record_carrier_conflict(seg, &declared.key, &stamp, &cstat);
-                            a.declined = true;
-                            continue;
-                        }
-                        SegmentCoverage {
-                            null_count_proven: stamp.null_count_proven || cstat.null_count_proven,
-                            ..stamp
-                        }
-                    }
+                // Uncovered (the ordinary state, never an error) or
+                // conflicting carriers: the column falls back to a scan.
+                let Some(coverage) = segment_declared_coverage(&self.declared[k], seg, seg_stats)
+                else {
+                    a.declined = true;
+                    continue;
                 };
 
                 if let Some(min) = coverage.min {
