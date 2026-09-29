@@ -120,6 +120,9 @@ use crate::{
     StoreError, UploadChecksum, Version, multipart_finished, multipart_poisoned,
 };
 
+mod bucket_config;
+use bucket_config::{BucketControlPlaneClient, ReportNotes};
+
 mod credentials;
 use credentials::FileCredentialProvider;
 
@@ -891,6 +894,12 @@ pub struct S3Store {
     /// per process: two stores pointed at different endpoints observe
     /// different clocks.
     store_time: Arc<ObservedStoreTime>,
+    /// The read-only bucket-protection control plane (ADR-1727 decision 1). Signs
+    /// its own SigV4 GETs with the same credential provider this store holds, so
+    /// there is no second credential path. Nothing in the shipping binaries calls
+    /// it yet: `ravel-cli store verify-protection` (task 2) and the server startup
+    /// gate (task 3) are what reach it.
+    control_plane: Arc<BucketControlPlaneClient>,
 }
 
 impl S3Store {
@@ -953,6 +962,44 @@ impl S3Store {
         // runs; `retry`/`RetryConfig` stay at `object_store`'s defaults.
         let metrics = attempt_metrics.unwrap_or_default();
         let store_time: Arc<ObservedStoreTime> = Arc::default();
+        // The credential provider the bucket-protection control plane signs with:
+        // the very one this store already uses (file, instance-role, or an inline
+        // static provider built from the same S3Config fields), never a second
+        // credential path (ADR-1727 decision 1, S3Config's "no credential-chain
+        // magic" rule).
+        let control_plane_credentials = if let Some(provider) = &instance_role_provider {
+            Arc::clone(provider) as AwsCredentialProvider
+        } else if let Some(provider) = &credential_provider {
+            Arc::clone(provider) as AwsCredentialProvider
+        } else {
+            bucket_config::static_credential_provider(
+                &config.access_key_id,
+                &config.secret_access_key,
+                config.session_token.as_deref(),
+            )
+        };
+        // Same timeouts the data plane runs under: an unbounded control-plane GET
+        // would hang the startup gate and the CLI on an endpoint that accepts the
+        // connection and never answers. `Client::new` would also panic on a TLS
+        // backend that fails to initialize; the builder reports it.
+        let control_plane_client = bucket_config::control_plane_http_client(
+            http.connect_timeout,
+            http.request_timeout,
+            http.pool_idle_timeout,
+            config.allow_http,
+        )
+        .map_err(|e| {
+            StoreError::Permanent(format!("failed to build bucket control-plane client: {e}"))
+        })?;
+        let control_plane = Arc::new(BucketControlPlaneClient::new(
+            control_plane_client,
+            control_plane_credentials,
+            Arc::clone(&metrics),
+            config.bucket.clone(),
+            config.region.clone(),
+            config.endpoint.clone(),
+            config.force_path_style,
+        ));
         let store = builder
             .with_http_connector(S3HttpConnector::new(
                 Arc::clone(&metrics),
@@ -971,6 +1018,7 @@ impl S3Store {
             upload_integrity,
             metrics,
             store_time,
+            control_plane,
         })
     }
 
@@ -1189,6 +1237,124 @@ impl S3Store {
         let mut store = Self::new(config)?;
         store.page_size = page_size.max(1);
         Ok(store)
+    }
+}
+
+// --- Bucket-protection control plane impls (ADR-1727 decision 2) ---
+//
+// `S3Store` answers all three probe seams affirmatively from its own read-only
+// SigV4 GETs, while the `dyn ObjectStoreBackend` impls in `conformance.rs` stay
+// as they are (every field `Unknown`). `ObjectStoreBackend` itself is unchanged.
+// Nothing in the shipping binaries calls these yet (`ravel-cli store
+// verify-protection` and the server startup gate are tasks 2 and 3).
+
+#[async_trait::async_trait]
+impl crate::conformance::BucketControlPlane for S3Store {
+    async fn bucket_protection_report(
+        &self,
+        params: &crate::conformance::BucketProtectionParams,
+    ) -> crate::conformance::BucketProtectionReport {
+        self.control_plane.report(params).await
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::conformance::ObjectLockProbeSource for S3Store {
+    async fn object_lock_status(&self) -> crate::conformance::ObjectLockProbe {
+        let report = self
+            .control_plane
+            .report(&crate::conformance::BucketProtectionParams::default())
+            .await;
+        object_lock_probe(&report)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::conformance::BucketConfigProbeSource for S3Store {
+    async fn bucket_config(&self) -> crate::conformance::BucketConfigProbe {
+        let (report, notes) = self
+            .control_plane
+            .report_with_notes(&crate::conformance::BucketProtectionParams::default())
+            .await;
+        bucket_config_probe(&report, notes)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::conformance::BucketProbesSource for S3Store {
+    /// Both probes from one report, so the bucket is read once.
+    async fn bucket_probes(&self) -> crate::conformance::BucketProbes {
+        let (report, notes) = self
+            .control_plane
+            .report_with_notes(&crate::conformance::BucketProtectionParams::default())
+            .await;
+        crate::conformance::BucketProbes {
+            object_lock: object_lock_probe(&report),
+            bucket_config: bucket_config_probe(&report, notes),
+        }
+    }
+}
+
+/// Map the report's `object-lock` condition onto an [`ObjectLockProbe`].
+///
+/// [`ObjectLockProbe`]: crate::conformance::ObjectLockProbe
+fn object_lock_probe(
+    report: &crate::conformance::BucketProtectionReport,
+) -> crate::conformance::ObjectLockProbe {
+    use crate::conformance::{ConditionState, ObjectLockProbe, ProtectionConditionId};
+    match report.state(ProtectionConditionId::ObjectLock) {
+        Some(ConditionState::Pass) => {
+            ObjectLockProbe::enabled("Object Lock is enabled on the bucket (?object-lock)")
+        }
+        Some(ConditionState::Fail(detail)) => ObjectLockProbe::disabled(detail.clone()),
+        Some(ConditionState::Unknown(detail)) => ObjectLockProbe::unknown(detail.clone()),
+        None => ObjectLockProbe::unknown("object-lock condition missing from the report"),
+    }
+}
+
+/// Map the report onto the older three-field [`BucketConfigProbe`]. A rule that
+/// covers `t/` but fails its condition (an abort rule longer than 7 days,
+/// covering noncurrent rules that disagree) is `NonCompliant` with the failure
+/// as its reason; a failing condition with no covering rule is `Absent`.
+///
+/// [`BucketConfigProbe`]: crate::conformance::BucketConfigProbe
+fn bucket_config_probe(
+    report: &crate::conformance::BucketProtectionReport,
+    notes: ReportNotes,
+) -> crate::conformance::BucketConfigProbe {
+    use crate::conformance::{
+        BucketConfigProbe, ConditionState, LifecycleRuleStatus, ProtectionConditionId,
+        VersioningStatus,
+    };
+    let versioning = match report.state(ProtectionConditionId::Versioning) {
+        Some(ConditionState::Pass) => VersioningStatus::On,
+        Some(ConditionState::Fail(_)) => VersioningStatus::Off,
+        _ => VersioningStatus::Unknown,
+    };
+    let detail = "derived from the ADR-1727 bucket-protection control plane (?versioning, \
+                  ?lifecycle over signed read-only GETs)"
+        .to_string();
+    let rule_status = |id: ProtectionConditionId, covers_data: bool| match report.state(id) {
+        Some(ConditionState::Pass) => LifecycleRuleStatus::Present,
+        Some(ConditionState::Fail(failure)) if covers_data => {
+            LifecycleRuleStatus::NonCompliant(failure.clone())
+        }
+        Some(ConditionState::Fail(_)) => LifecycleRuleStatus::Absent,
+        _ => LifecycleRuleStatus::Unknown,
+    };
+    let abort_incomplete_multipart_upload = rule_status(
+        ProtectionConditionId::AbortMultipart,
+        notes.abort_rule_covers_data,
+    );
+    let noncurrent_version_expiration = rule_status(
+        ProtectionConditionId::NoncurrentExpiration,
+        notes.noncurrent_rule_covers_data,
+    );
+    BucketConfigProbe {
+        versioning,
+        abort_incomplete_multipart_upload,
+        noncurrent_version_expiration,
+        detail,
     }
 }
 
@@ -2418,6 +2584,119 @@ mod tests {
     use object_store::{PutResult, UploadPart};
 
     use super::*;
+
+    /// The probe for one lifecycle document, with versioning `Enabled`.
+    fn probe_for_lifecycle(
+        body: &[u8],
+        params: &crate::conformance::BucketProtectionParams,
+    ) -> crate::conformance::BucketConfigProbe {
+        use bucket_config::FetchOutcome::{Present, Unknown};
+        let versioning = bucket_config::parse_versioning(
+            b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
+        )
+        .expect("parse");
+        let lifecycle = bucket_config::parse_lifecycle(body).expect("parse");
+        let (report, notes) = bucket_config::assemble_report(
+            &Present(versioning),
+            &Present(lifecycle),
+            &Unknown("not asked".to_string()),
+            &Unknown("not asked".to_string()),
+            &bucket_config::RetentionSample::NotSampled,
+            params,
+        );
+        bucket_config_probe(&report, notes)
+    }
+
+    /// An abort rule that covers `t/` but runs longer than 7 days is
+    /// `NonCompliant` with the failure as its reason, and raises the abort
+    /// NOTE naming that reason. With no covering noncurrent rule, that rule
+    /// stays `Absent` and raises the versioning ALARM.
+    #[test]
+    fn bucket_config_probe_reports_an_out_of_range_abort_rule_as_non_compliant() {
+        use crate::conformance::{LifecycleRuleStatus, VersioningStatus, bucket_config_alarms};
+        let probe = probe_for_lifecycle(
+            b"<LifecycleConfiguration><Rule><ID>ravel</ID><Status>Enabled</Status><Filter/>\
+            <AbortIncompleteMultipartUpload><DaysAfterInitiation>30</DaysAfterInitiation>\
+            </AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>",
+            &crate::conformance::BucketProtectionParams::default(),
+        );
+        let reason = "rule \"ravel\": AbortIncompleteMultipartUpload is 30 days, more than 7";
+        assert_eq!(probe.versioning, VersioningStatus::On);
+        assert_eq!(
+            probe.abort_incomplete_multipart_upload,
+            LifecycleRuleStatus::NonCompliant(reason.to_string())
+        );
+        assert_eq!(
+            probe.noncurrent_version_expiration,
+            LifecycleRuleStatus::Absent
+        );
+        assert_eq!(
+            probe.detail,
+            "derived from the ADR-1727 bucket-protection control plane (?versioning, ?lifecycle \
+             over signed read-only GETs)"
+        );
+        let alarms = bucket_config_alarms(&probe);
+        assert_eq!(alarms.len(), 2, "{alarms:?}");
+        assert_eq!(
+            alarms[0],
+            "ALARM: object versioning is enabled but no noncurrent-version expiration rule is \
+             configured. This silently converts every Ravel delete (retention, sweep, and \
+             ADR-0064 erasure) into a soft delete, inverting every deletion guarantee, and is an \
+             unsupported configuration (ADR-0064 §7 point 1). Configure noncurrent-version \
+             expiration plus expired-delete-marker cleanup on all t/ prefixes, or disable \
+             versioning."
+        );
+        assert_eq!(
+            alarms[1],
+            format!(
+                "NOTE: the REQUIRED AbortIncompleteMultipartUpload lifecycle rule (7 days or \
+                 less) covers t/ but does not meet the contract: {reason} (ADR-0064 §7 point 3). \
+                 Abandoned multipart uploads stay billable for longer than the contract allows. \
+                 The NOTE prefix reflects the probe's limits, not an optional requirement."
+            )
+        );
+    }
+
+    /// A covering noncurrent rule whose `NoncurrentDays` disagrees with the
+    /// expected value is `NonCompliant`, and on a versioned bucket raises the
+    /// noncurrent ALARM naming the reason. The compliant abort rule beside it
+    /// is `Present` and raises nothing.
+    #[test]
+    fn bucket_config_probe_reports_a_disagreeing_noncurrent_rule_as_non_compliant() {
+        use crate::conformance::{LifecycleRuleStatus, bucket_config_alarms};
+        let params = crate::conformance::BucketProtectionParams {
+            expected_noncurrent_days: Some(30),
+            ..Default::default()
+        };
+        let probe = probe_for_lifecycle(
+            b"<LifecycleConfiguration><Rule><ID>ravel</ID><Status>Enabled</Status><Filter/>\
+            <NoncurrentVersionExpiration><NoncurrentDays>90</NoncurrentDays>\
+            </NoncurrentVersionExpiration>\
+            <AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation>\
+            </AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>",
+            &params,
+        );
+        let reason = "rule \"ravel\": NoncurrentDays is 90, expected 30";
+        assert_eq!(
+            probe.noncurrent_version_expiration,
+            LifecycleRuleStatus::NonCompliant(reason.to_string())
+        );
+        assert_eq!(
+            probe.abort_incomplete_multipart_upload,
+            LifecycleRuleStatus::Present
+        );
+        assert_eq!(
+            bucket_config_alarms(&probe),
+            vec![format!(
+                "ALARM: object versioning is enabled and a noncurrent-version expiration rule \
+                 covers t/, but it does not meet the contract: {reason}. A Ravel delete \
+                 (retention, sweep, and ADR-0064 erasure) then leaves prior versions recoverable \
+                 for a window other than the one the deployment's deletion bounds assume, which \
+                 is an unsupported configuration (ADR-0064 §7 point 1). Configure one \
+                 noncurrent-version expiration rule on all t/ prefixes, or disable versioning."
+            )]
+        );
+    }
 
     /// A fake `object_store` multipart upload whose every `put_part` fails,
     /// modeling a backend part upload that already exhausted `object_store`'s

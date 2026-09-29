@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use ravel_object_store::conformance::{
-    BucketConfigProbe, CONFORMANCE_SUITE_VERSION, bucket_config_alarms, probe_bucket_config,
-    probe_object_lock, run_conformance_suite,
+    BucketConfigProbe, BucketProbesSource, CONFORMANCE_SUITE_VERSION, LifecycleRuleStatus,
+    bucket_config_alarms, probe_bucket_lock_and_config, run_conformance_suite,
 };
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError};
 
@@ -60,24 +60,16 @@ pub async fn qualify(
     // `sys/qualification`, or whether the server starts (ADR-0050 section 6 is
     // unaffected). Today it always reports "unknown" through the
     // `ObjectStoreBackend` contract, which exposes no such query.
-    let object_lock = probe_object_lock(store.as_ref()).await;
-    println!(
-        "{:<40} {} (informational, non-blocking) {}",
-        "object_lock/versioning",
-        object_lock.status.name(),
-        object_lock.detail
-    );
-
+    //
     // Informational required-bucket-configuration report (ADR-0064 §7, S2-16,
-    // S4-12): bucket versioning state and the presence/absence of the two
-    // sanctioned lifecycle rules, plus any contract-violation alarms. Like the
-    // Object Lock probe above, it is informational-plus-alarming and never
-    // affects whether qualification passes, what `sys/qualification` records, or
-    // whether the server starts; `object_store` cannot enforce bucket policy, so
-    // Ravel reports what it can observe (unknown through the trait contract) and
+    // S4-12): bucket versioning state and the status of the two sanctioned
+    // lifecycle rules, plus any contract-violation alarms. Like the Object Lock
+    // probe, it is informational-plus-alarming and never affects whether
+    // qualification passes, what `sys/qualification` records, or whether the
+    // server starts; `object_store` cannot enforce bucket policy, so Ravel
+    // reports what it can observe (unknown through the trait contract) and
     // documents what it requires.
-    let bucket_config = probe_bucket_config(store.as_ref()).await;
-    for line in bucket_config_report_lines(&bucket_config) {
+    for line in bucket_probe_lines(store.as_ref()).await {
         println!("{line}");
     }
 
@@ -215,13 +207,44 @@ async fn re_record_if_stale(
     ))
 }
 
+/// Probe `source` once for both informational reports and render them: the
+/// Object Lock / versioning line, then [`bucket_config_report_lines`]. One
+/// probe call, so a source that reads the bucket for its answers (`S3Store`)
+/// reads it once per qualify run rather than once per report.
+pub async fn bucket_probe_lines<S: BucketProbesSource + ?Sized>(source: &S) -> Vec<String> {
+    let probes = probe_bucket_lock_and_config(source).await;
+    let mut lines = vec![format!(
+        "{:<40} {} (informational, non-blocking) {}",
+        "object_lock/versioning",
+        probes.object_lock.status.name(),
+        probes.object_lock.detail
+    )];
+    lines.extend(bucket_config_report_lines(&probes.bucket_config));
+    lines
+}
+
 /// Render the informational required-bucket-configuration report for a
 /// [`BucketConfigProbe`] (ADR-0064 §7): one line per observed setting (all
 /// clearly labeled informational and non-blocking), followed by one line per
-/// contract-violation alarm from [`bucket_config_alarms`]. Factored out of
-/// [`qualify`] so the compliant/non-compliant reporting can be tested without a
-/// live versioned bucket (the trait contract only ever reports `unknown`).
+/// contract-violation alarm from [`bucket_config_alarms`]. A non-compliant rule
+/// names its reason on its own line. Factored out of [`qualify`] so the
+/// compliant/non-compliant reporting can be tested without a live versioned
+/// bucket.
 pub fn bucket_config_report_lines(probe: &BucketConfigProbe) -> Vec<String> {
+    let rule_line = |label: &str, status: &LifecycleRuleStatus| match status {
+        LifecycleRuleStatus::NonCompliant(reason) => format!(
+            "{label:<40} {} (informational, non-blocking) {reason}",
+            status.name()
+        ),
+        LifecycleRuleStatus::Present
+        | LifecycleRuleStatus::Absent
+        | LifecycleRuleStatus::Unknown => {
+            format!(
+                "{label:<40} {} (informational, non-blocking)",
+                status.name()
+            )
+        }
+    };
     let mut lines = vec![
         format!(
             "{:<40} {} (informational, non-blocking) {}",
@@ -229,15 +252,13 @@ pub fn bucket_config_report_lines(probe: &BucketConfigProbe) -> Vec<String> {
             probe.versioning.name(),
             probe.detail
         ),
-        format!(
-            "{:<40} {} (informational, non-blocking)",
+        rule_line(
             "lifecycle/abort_incomplete_multipart",
-            probe.abort_incomplete_multipart_upload.name(),
+            &probe.abort_incomplete_multipart_upload,
         ),
-        format!(
-            "{:<40} {} (informational, non-blocking)",
+        rule_line(
             "lifecycle/noncurrent_version_expiration",
-            probe.noncurrent_version_expiration.name(),
+            &probe.noncurrent_version_expiration,
         ),
     ];
     for alarm in bucket_config_alarms(probe) {
@@ -291,6 +312,153 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("ALARM") && l.contains("unsupported configuration")),
             "a versioned bucket without a noncurrent-version rule must alarm: {lines:?}"
+        );
+    }
+
+    /// Bodies a versioned, locked bucket answers with, whose one covering
+    /// lifecycle rule carries an abort window of 30 days.
+    fn fake_bucket_body(subresource: &str) -> &'static str {
+        match subresource {
+            "versioning" => {
+                "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"
+            }
+            "lifecycle" => {
+                "<LifecycleConfiguration><Rule><ID>ravel</ID><Status>Enabled</Status><Filter/>\
+                 <NoncurrentVersionExpiration><NoncurrentDays>30</NoncurrentDays>\
+                 </NoncurrentVersionExpiration>\
+                 <Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration>\
+                 <AbortIncompleteMultipartUpload><DaysAfterInitiation>30</DaysAfterInitiation>\
+                 </AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>"
+            }
+            "object-lock" => {
+                "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+                 </ObjectLockConfiguration>"
+            }
+            other => panic!("unexpected subresource {other:?}"),
+        }
+    }
+
+    /// Stand up a fake S3 endpoint over [`fake_bucket_body`], returning its
+    /// base URL and the count of requests and body bytes it served.
+    async fn spawn_fake_bucket() -> (
+        String,
+        Arc<std::sync::atomic::AtomicU64>,
+        Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let served = Arc::new(AtomicU64::new(0));
+        let served_bytes = Arc::new(AtomicU64::new(0));
+        let (requests, bytes) = (Arc::clone(&served), Arc::clone(&served_bytes));
+        let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let (requests, bytes) = (Arc::clone(&requests), Arc::clone(&bytes));
+            async move {
+                let query = uri.query().unwrap_or("");
+                let subresource = query.split(['=', '&']).next().unwrap_or("");
+                let body = fake_bucket_body(subresource);
+                requests.fetch_add(1, Ordering::Relaxed);
+                bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
+                body
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), served, served_bytes)
+    }
+
+    /// One qualify run reads the bucket once for both informational reports:
+    /// three control-plane GETs (versioning, lifecycle, object-lock), where
+    /// probing the two reports separately costs six. The abort rule that
+    /// covers t/ with a 30-day window prints `non-compliant` with its reason on
+    /// its own line, and the NOTE names the same reason.
+    #[tokio::test]
+    async fn bucket_probe_lines_read_the_bucket_once_and_name_a_non_compliant_rule() {
+        use std::sync::atomic::Ordering;
+
+        use ravel_object_store::StoreMetrics;
+        use ravel_object_store::conformance::{probe_bucket_config, probe_object_lock};
+        use ravel_object_store::instrument::ControlPlaneMetricsSnapshot;
+        use ravel_object_store::s3::{S3Config, S3Store};
+
+        let (endpoint, served, served_bytes) = spawn_fake_bucket().await;
+        let metrics: Arc<StoreMetrics> = Arc::default();
+        let store = S3Store::with_metrics(
+            S3Config {
+                bucket: "ravel-test".to_string(),
+                region: "us-east-1".to_string(),
+                endpoint: Some(endpoint),
+                access_key_id: "test".to_string(),
+                secret_access_key: "test".to_string(),
+                allow_http: true,
+                force_path_style: true,
+                kms_key_id: None,
+                session_token: None,
+                credentials_file: None,
+                auth: Default::default(),
+                instance_metadata_endpoint: None,
+            },
+            Arc::clone(&metrics),
+        )
+        .expect("store");
+
+        let lines = bucket_probe_lines(&store).await;
+        let reason = "rule \"ravel\": AbortIncompleteMultipartUpload is 30 days, more than 7";
+        assert_eq!(
+            lines,
+            vec![
+                format!(
+                    "{:<40} enabled (informational, non-blocking) Object Lock is enabled on the \
+                     bucket (?object-lock)",
+                    "object_lock/versioning"
+                ),
+                format!(
+                    "{:<40} on (informational, non-blocking) derived from the ADR-1727 \
+                     bucket-protection control plane (?versioning, ?lifecycle over signed \
+                     read-only GETs)",
+                    "bucket/versioning"
+                ),
+                format!(
+                    "{:<40} non-compliant (informational, non-blocking) {reason}",
+                    "lifecycle/abort_incomplete_multipart"
+                ),
+                format!(
+                    "{:<40} present (informational, non-blocking)",
+                    "lifecycle/noncurrent_version_expiration"
+                ),
+                format!(
+                    "{:<40} NOTE: the REQUIRED AbortIncompleteMultipartUpload lifecycle rule (7 \
+                     days or less) covers t/ but does not meet the contract: {reason} (ADR-0064 \
+                     §7 point 3). Abandoned multipart uploads stay billable for longer than the \
+                     contract allows. The NOTE prefix reflects the probe's limits, not an \
+                     optional requirement.",
+                    "bucket/config"
+                ),
+            ]
+        );
+        let bytes = served_bytes.load(Ordering::Relaxed);
+        assert_eq!(served.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            metrics.control_plane(),
+            ControlPlaneMetricsSnapshot {
+                requests: 3,
+                calls: 3,
+                response_bytes: bytes,
+            }
+        );
+        assert_eq!(bytes, 569);
+
+        // The two probes asked one at a time each run a whole report.
+        probe_object_lock(&store).await;
+        probe_bucket_config(&store).await;
+        assert_eq!(served.load(Ordering::Relaxed), 3 + 6);
+        assert_eq!(metrics.control_plane().requests, 3 + 6);
+        assert_eq!(
+            metrics.snapshot(),
+            ravel_object_store::StoreMetricsSnapshot::default()
         );
     }
 }

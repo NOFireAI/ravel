@@ -273,9 +273,10 @@ mod tests {
         );
     }
 
-    /// Flipped line: the `if probe.versioning == VersioningStatus::On &&
-    /// probe.noncurrent_version_expiration == LifecycleRuleStatus::Absent`
-    /// check inside `conformance::bucket_config_alarms`, surfaced here
+    /// Flipped line: the `LifecycleRuleStatus::Absent` arm of the
+    /// `probe.noncurrent_version_expiration` match under
+    /// `probe.versioning == VersioningStatus::On` inside
+    /// `conformance::bucket_config_alarms`, surfaced here
     /// through the `"ALARM: "` branch of `enforce`'s alarm loop. Given a
     /// probe with versioning on and the expiration rule absent, that ALARM
     /// string is produced and `enforce` must turn it into a refusal; without

@@ -113,7 +113,9 @@ data; verification is reads of configuration.
    covers a backend with no API for the call, an access denial, and a
    response the reader cannot parse. The noncurrent sample reuses the
    listing `verify-custody` already has
-   (`crates/ravel-object-store/src/conformance.rs:545-558`).
+   (`crates/ravel-object-store/src/conformance.rs:545-558`). `rule-scope`
+   and `noncurrent-expiration` are evaluated more narrowly than the table
+   states; see the rule-scope and noncurrent-expiration amendment below.
 
 4. **`ravel-cli store verify-protection`.** The subcommand takes
    `--expected-noncurrent-days <E_v>`, `--expect-replication`, and
@@ -252,3 +254,43 @@ flowchart LR
   5. CI: the contract-job cases of decision 6.
   6. Follow-up: a `--bucket-protection-recheck-interval` that reruns the
      report in-process and moves the gauges without a restart.
+
+## Amendment (2026-09-29): rule-scope and noncurrent-expiration are narrower than the decision 3 table
+
+<!-- amendment-applies: sections="Decision" pointer="rule-scope and noncurrent-expiration amendment" -->
+
+The control plane as built evaluates two decision 3 conditions more
+narrowly than the table states. Neither narrowing can turn a non-compliant
+bucket into `Pass`: each leaves a condition `Unknown` or `Fail` where the
+table's wording alone would allow `Pass`.
+
+1. **`rule-scope`: the only union of prefixes accepted is sixteen rules.**
+   The table accepts "a union of prefixes that does" cover every `t/`
+   prefix. The code accepts exactly one union: enabled rules whose whole
+   scope is the plain prefix `t/<d>`, at least one for each of the sixteen
+   lowercase hex digits `t/0` through `t/f`, each carrying the action with
+   the value a covering rule needs. Every key Ravel writes under `t/`
+   starts with a lowercase hex digit (the tenant hash), and over an
+   arbitrary key alphabet no other finite set of narrower prefixes can be
+   shown to cover `t/`. A union split further down (`t/f0` through `t/ff`
+   in place of `t/f`), a digit spelled in upper case, or a digit with no
+   rule proves nothing, and the narrower rules leave the lifecycle
+   conditions `Unknown`. The same union is what the other lifecycle
+   conditions accept as coverage.
+
+2. **`noncurrent-expiration` fails in cases the table does not name.** Besides
+   a covering rule whose `NoncurrentDays` differs from the expected `E_v`,
+   the condition fails when a covering rule also keeps
+   `NewerNoncurrentVersions` (a version can then outlive `NoncurrentDays`),
+   when covering rules disagree on `NoncurrentDays`, and when a rule over
+   part of `t/` expires noncurrent versions earlier than the reference: the
+   expected `E_v` when one is supplied, else the one value the covering
+   rules agree on. With no reference to compare against, that narrower rule
+   leaves the condition `Unknown`. Without an expected `E_v`, as on the
+   server, a covering rule's value is not checked, as decision 5 states.
+
+Under decision 4, an expected condition these readings leave `Unknown`
+makes `store verify-protection` exit `2`, never `0`. A bucket whose rules
+cover `t/` in a form the code does not prove reads as "could not verify":
+the operator restates the rules as one rule over `t/` (or the whole
+bucket) or as the sixteen-rule union, or confirms coverage out of band.
