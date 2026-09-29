@@ -43,7 +43,7 @@ fail, the test is vacuous. Rewrite it.
 - "The fixture is smaller but the logic is the same."
 - Reusing one constant everywhere because it is convenient.
 
-When a spec asks for this proof (fleet-task-spec's "Soundness claims need
-a failing test"), the report must name the flipped line. When you review
+When a spec asks for this proof (fleet-task-spec's "Filling the
+template", Tests), the report must name the flipped line. When you review
 someone else's test, ask the same question: which line flips to make this
 fail?

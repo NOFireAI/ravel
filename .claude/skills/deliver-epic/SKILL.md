@@ -11,20 +11,18 @@ The ledger in the epic issue is the source of truth for resume: write it
 before acting, not after, so a dropped session loses nothing.
 
 This skill orchestrates; it does not restate. Specs come from the
-fleet-task-spec skill, merges from the merge-fleet-result skill, frozen
-formats from the format-change skill. Read those when you reach their
-stage.
-
-## Quick reference
+fleet-task-spec skill, merges from merge-fleet-result, frozen formats from
+format-change. `reference.md` beside this file holds the incidents behind
+the rules below.
 
 | Stage | Output | Gate |
 |---|---|---|
 | 0 Measure | Profiled baseline on the real workload | a number, not a hypothesis |
-| 1 Design | ADR + epic issue | HUMAN APPROVAL (only one) |
+| 1 Design | ADR + epic issue | HUMAN APPROVAL (the only one) |
 | 2 Decompose | Task table, DAG, waves, sub-issues | waves have zero file overlap |
 | 3 Execute | Fleet dispatch per wave, ledger entries | all tasks terminal |
-| 4 Checkpoint | Opus adversarial review of wave diff | review passes |
-| 5 Land | Merged main, closed sub-issues, ledger | gates green in worktree |
+| 4 Checkpoint | Adversarial review of the wave diff | review passes |
+| 5 Land | Merged main, closed sub-issues, ledger | required checks green |
 
 Stages 3-5 loop per wave. Wave N+1 is not dispatched until wave N has
 landed on main.
@@ -32,50 +30,33 @@ landed on main.
 ## Stage 0 - Measure
 
 A performance epic aimed by a report instead of a profile spends its
-whole budget on the wrong half of the system. Before Stage 1:
-
-1. Run the real target workload end to end and record where the time
-   goes, per phase. Use the profile-hotspot skill; the CLI and bench
-   crates already carry stage-timing and flamegraph lanes.
-2. Write the numbers into the epic issue body: total, the phase that
-   dominates, and the measurement command so anyone can re-run it.
-3. The epic's Decision must name the measured bottleneck it attacks and
-   the number it moves. "The audit suggests X is slow" is not a
-   bottleneck; a stage timing is.
-
-Skip Stage 0 only for an epic with no performance claim at all. If you
-skip it, say so in the epic body and say why.
+budget on the wrong half of the system. Run the real workload end to end
+with the profile-hotspot skill (the CLI and bench crates carry
+stage-timing and flamegraph lanes), and write the total, the dominant
+phase and the measurement command into the epic body. The Decision must
+name the measured bottleneck and the number it moves. Skip this stage
+only for an epic with no performance claim, and say so in the epic body.
 
 ## Stage 1 - Design
 
-1. Research against the actual codebase: Explore subagents over the
-   crates the intent touches, plus their normative docs from the
-   CLAUDE.md doc map. Never read vendored dependency sources.
-2. Open the epic issue FIRST:
-   `gh issue create --title "Epic: <feature>" --body-file <body>`
-   Body: intent paragraph, Stage 0 numbers, empty `## Tasks` checklist,
-   empty `## Ledger` section. Then assign it to yourself
-   (`gh issue edit <n> --add-assignee @me`). The assignee is the claim:
-   ownership that lives only in a session's head collides the moment a
-   second session picks "the next obvious thing". Then open the state
-   index for it, once, so every later stage has somewhere to write:
+1. Research the crates the intent touches and their normative docs (the
+   CLAUDE.md doc map) with Explore subagents. Never read vendored
+   dependency sources.
+2. Open the epic issue first:
+   `gh issue create --title "Epic: <feature>" --body-file <body>`, with the
+   intent, the Stage 0 numbers, an empty `## Tasks` checklist and an empty
+   `## Ledger`. Assign it to yourself (`gh issue edit <n> --add-assignee
+   @me`): the assignee is the claim another session sees. Then
    `scripts/epic-orchestrator.sh init <epic> --title "<feature>"`.
-3. **The ADR number is the epic issue number.** GitHub allocates issue
-   numbers atomically, so two parallel epics cannot collide, and no
-   reservation step is needed. Write the full ADR at
-   `docs/adrs/NNNN-<slug>.md` where NNNN is the zero-padded issue
-   number. Sections: Context, Decision, Rejected alternatives (each with
-   the concrete reason it lost), Consequences. Include at least one
-   diagram (Mermaid: component or data-flow; trust-boundary for anything
-   security-shaped) - a prose-only ADR has cost an extra approval round
-   trip. If any frozen format is touched, follow the format-change skill
-   before writing the full ADR.
-4. STOP. Present ADR summary, rejected alternatives, and issue number.
-   Nothing is committed yet: there is no stub to land, because the issue
-   number already reserves the ADR number. This is the only mandatory
-   human gate; on approval, commit the ADR
-   (`docs: add ADR-NNNN <title>`, trailer `Refs: #<epic>`), push, and
-   proceed without further confirmation.
+3. The ADR number is the epic issue number, zero-padded:
+   `docs/adrs/NNNN-<slug>.md`. Sections: Context, Decision, Rejected
+   alternatives (each with the concrete reason it lost), Consequences, and
+   at least one Mermaid diagram (component or data flow; trust boundary
+   for anything security-shaped). If a frozen format is touched, follow
+   format-change first.
+4. STOP. Present the ADR summary, rejected alternatives and issue number.
+   On approval, commit the ADR (`docs: add ADR-NNNN <title>`, trailer
+   `Refs: #<epic>`), push, and proceed without further confirmation.
 
 ## Stage 2 - Decompose
 
@@ -86,75 +67,58 @@ ID | title | crates | predicted files | deps | acceptance test | risk
 ```
 
 - Acceptance test: a named test (`crate::module::test_name`) that must
-  exist and pass in the task's result. It goes verbatim into the spec's
-  Tests section and is re-run at checkpoint.
-- Risk tier: low / medium / high. High = touches durability, commit
-  protocol, or a persistent format boundary.
-- End-to-end reachability: at least one task in the table must carry an
-  acceptance test that proves the epic's delivered capability is actually
-  constructed and reachable from a real caller in the shipping binary,
-  not merely unit- or crate-tested in isolation. Crate-level tests pass
-  against code no production path ever builds: a merged, crate-tested
-  cache has shipped that no caller constructed. The reachability
-  test drives the capability through a real entry point (a service
-  handler, a query path, a startup wire-up), so a green result means the
-  feature is truly usable, not just present. Point the executor at an
-  existing reachability test in the tree (one that attaches the feature
-  through a real entry point) as the pattern to follow, without
-  repeating its diff.
+  exist and pass in the result. It goes verbatim into the spec's Tests
+  section and is re-run at checkpoint.
+- Risk: low / medium / high. High touches durability, the commit protocol,
+  or a persistent format boundary.
+- At least one task's acceptance test drives the delivered capability
+  through a real entry point in the shipping binary (a service handler, a
+  query path, a startup wire-up), so a green result means it is usable,
+  not just present. Point the executor at an existing reachability test
+  as the pattern.
 
-Build the DAG from deps, then cut into waves:
+Build the DAG from deps, then cut waves:
 
-- A wave is a set of ready tasks (all deps landed) with **zero overlap
-  in predicted files, and no two tasks in the same crate** - same-crate
-  tasks collide on lib.rs mod declarations and Cargo.toml even when
-  their file lists look disjoint.
-- Two tasks predicted to touch the same file are not "serialized", they
-  are ONE fleet task with combined deliverables. Splitting same-file
-  work across dispatches produces two divergent rewrites of the same
-  code that then need manual reconciliation.
-- High-risk tasks ride solo in their wave (isolates the checkpoint
-  review) and get `effort: high` on dispatch.
-- Prediction is conservative: unsure whether a task touches a file,
-  assume it does.
+- A wave is a set of ready tasks with zero overlap in predicted files and
+  no two tasks in the same crate (same-crate tasks collide on `lib.rs`,
+  `Cargo.toml` and signatures even when their file lists look disjoint).
+  When one task changes a public signature, grep the other tasks'
+  predicted files for that name.
+- Two tasks predicted to touch the same file are one fleet task with
+  combined deliverables, not two serialized ones.
+- High-risk tasks ride solo in their wave and get `effort: high`.
+- Predict conservatively: unsure whether a task touches a file, assume it
+  does.
 
-Create one sub-issue per task (body: scope, acceptance test, risk),
-tick-list them in the epic's `## Tasks`, and write the full wave plan as
-the first ledger entry.
+Create one sub-issue per task (scope, acceptance test, risk), tick-list
+them in `## Tasks`, and write the wave plan as the first ledger entry.
 
 ## Stage 3 - Execute (per wave)
 
-1. Confirm local main == origin/main and clean; the wave dispatches from
-   this HEAD.
-2. Write each spec with the fleet-task-spec skill. The harness-override
-   and UNATTENDED paragraphs are not optional. Spec's Tests section
-   names the acceptance test.
-3. Dispatch each task in the wave through the intent script, never by
-   calling `fleet_dispatch` straight. That script is the chokepoint where
-   the pre-dispatch guards actually run: a stale ref, a dangling intent
-   from a previous attempt, and a ticket some open pull request is already
-   working all refuse there. Calling the MCP tool directly skips all
-   three, and "remember to check first" is not a check.
+1. Write each spec with the fleet-task-spec skill; its Tests section names
+   the acceptance test.
+2. Dispatch through the intent script, never by calling `fleet_dispatch`
+   directly: it is where the stale-ref, dangling-intent and duplicate-work
+   guards run.
 
    ```sh
    sha=$(git fetch origin main -q && git rev-parse origin/main)
-   # Predicted files for this task, from the Stage 2 table. Optional, but
-   # it is what turns an overlapping open pull request into a refusal
-   # instead of two divergent rewrites of one file.
+   # Predicted files from the Stage 2 table: an open PR on them refuses.
    export DISPATCH_PATHS="crates/x/src/a.rs,crates/x/src/b.rs"
    nonce=$(scripts/fleet-dispatch-intent.sh intent <epic> <sub-issue> "$sha")
    ```
 
-   Refusals here are terminal for that task this tick: 65 means a pull
-   request already addresses the ticket, 66 that one is already touching
-   those files, 69 that GitHub could not be asked, which is not the same
-   as a clean answer. Resolve the named pull request rather than reaching
-   for `DISPATCH_SKIP_DUPLICATE_CHECK=1`; that flag is for a deliberate
-   second task on one ticket (a fix round, a continuation after a ceiling
-   kill), and a habit of using it to get past a refusal retires the guard.
+   A refusal ends that task for this tick. 65: a pull request already
+   addresses the ticket, or a previous intent has no recorded outcome
+   (reconcile it with `record` or `failed`). 66: an open pull request
+   touches those files. 69: GitHub could not be asked, which is not a
+   clean answer. Any other non-zero exit, including the fresh-ref
+   guard's, is a refusal too. Resolve what it names;
+   `DISPATCH_SKIP_DUPLICATE_CHECK=1` is only for a deliberate second task
+   on one ticket (a fix round, a continuation after a ceiling kill).
 
-   Then `fleet_dispatch` with `ref=$sha`, and close out the intent with
-   the task id (or `failed` and the reason, if the dispatch errored):
+3. `fleet_dispatch` with `ref=$sha`, then record immediately, before
+   watching anything:
 
    ```sh
    scripts/fleet-dispatch-intent.sh record <epic> "$nonce" <task_id>
@@ -162,172 +126,119 @@ the first ledger entry.
      ticket=<sub-issue> task=<task_id> ref="$sha"
    ```
 
-   Both, not either. The intent script writes COMMENTS, which close out
-   the dangling-intent check; `epic-orchestrator.sh record` writes the
-   `- #<ticket> task=<uuid> dispatched` line into the issue BODY and reads
-   it back to prove it arrived (exit 70 if not: `gh` exits 0 on an edit
-   another session overwrote), and indexes it locally. `epic-status.sh`
-   reads the body and nothing else, so a task recorded only in comments is
-   invisible to the reconciliation that exists to catch a silently dead
-   one. Record every task id IMMEDIATELY, before watching anything: a
-   dropped session with unrecorded task ids orphans running work, and
-   hand-editing the body instead leaves the index empty, so the resume
-   procedure's first command fails with exit 66.
-4. Watch with `scripts/fleet-watch.sh <watch-url> <interval>` in
-   background, one per task. Pass the bare command straight to the
-   background-execution tool with its own backgrounding flag (e.g. the
-   Bash tool's `run_in_background: true`) - do not wrap it in `nohup
-   ... &` yourself first. Backgrounding it manually returns control to
-   the shell the instant the `&` is issued, so the tool marks that call
-   "complete" right then, before the watch loop has run at all; every
-   later terminal-event notification is then silently lost, and nothing
-   tells you the wave finished. Watchers launched with
-   `nohup fleet-watch.sh ... & echo $!` show "completed" within a
-   second while `fleet_status` still reports
-   `running` for every task. Interval: 120s for tasks expected under an
-   hour, 300s otherwise. Never poll `fleet_status` in a foreground loop
-   and never rely on a single SSE connection - it drops within seconds
-   in this environment.
+   If the dispatch errored, close the intent instead with
+   `scripts/fleet-dispatch-intent.sh failed <epic> "$nonce" <reason>`.
 
-Failure playbook (in order of check):
+   Both, not either. The intent script writes comments, which close the
+   dangling-intent check; `epic-orchestrator.sh record` writes the task
+   line into the issue body, reads it back (exit 70 if another session's
+   edit overwrote it) and indexes it locally. `epic-status.sh` reads only
+   the body. Hand-editing the body instead leaves the index empty, and
+   resume then fails with exit 66.
+4. Watch each task with `scripts/fleet-watch-loop.sh <watch-url>` as the
+   whole command of a Monitor, one per task (CLAUDE.md, "Waiting on fleet
+   tasks and PRs"). Never run a watcher with `run_in_background` or
+   `nohup ... &` (the harness kills it after about 10 minutes), never poll
+   `fleet_status` in a foreground loop, and never rely on one SSE
+   connection.
+
+Failure playbook, in order of check:
 
 | Signal | Action |
 |---|---|
-| done, but `git ls-remote origin refs/heads/task/<id>/result` empty | Work lost. Re-dispatch same spec once. |
+| done, but `git ls-remote origin refs/heads/task/<id>/result` empty | Work lost. Re-dispatch the same spec once. |
 | rate limit / auth / transient executor error | Retry once as-is. Second failure: re-dispatch with `label_selector` naming a different executor. |
-| runtime ceiling (~4h kill) | Fleet recovers committed work. Fetch the recovered ref, re-dispatch as a CONTINUATION from that ref (`ref:` param, spec says what remains). Never restart from scratch. |
-| second re-dispatch also fails | Stop the wave, ledger `blocked`, report to user. Do not silently drop the task from the epic. |
+| runtime ceiling (~4h kill) | Fetch the recovered ref and re-dispatch a continuation from it (`ref:`, spec says what remains). Never restart from scratch. |
+| second re-dispatch also fails | Stop the wave, ledger `blocked`, report to the user. Never drop the task silently. |
 
-Every dispatch, retry, and terminal event gets a ledger line when it
+Every dispatch, retry and terminal event gets a ledger line when it
 happens.
 
 ## Stage 4 - Checkpoint (per wave)
 
-Runs after every wave task is terminal with a verified result ref, and
-BEFORE any merge.
+After every wave task is terminal with a verified result ref, and before
+any PR is opened:
 
-1. Fetch all result branches. Build the combined diff against **current
-   origin/main**, not the dispatch-time HEAD - main moves under you.
-2. Spawn one adversarial review subagent: Agent tool, general-purpose,
-   `model: opus`, `isolation: "worktree"`. The reviewer runs real git
-   commands (checkouts, scratch clones, rebase drills against edge
-   cases) in the course of verifying scripts; without worktree isolation
-   it operates on the dispatching session's own shared checkout and can
-   silently discard uncommitted local edits as collateral: a reviewer
-   dispatched without isolation has reverted a hand-authored,
-   uncommitted fix to its committed state,
-   with no stash and no reflog entry, the exact corruption CLAUDE.md's
-   workspace-isolation section warns about. Prompt it to hunt ONLY
-   correctness bugs and invariant violations - not style, not naming,
-   not structure:
+1. Fetch the result branches and build the combined diff against current
+   `origin/main`, not the dispatch-time HEAD.
+2. Spawn one adversarial reviewer: Agent tool, general-purpose,
+   `model: opus`, `isolation: "worktree"` (it runs real git commands, and
+   without isolation it can revert uncommitted edits in your checkout).
+   It hunts only correctness bugs and invariant violations, not style:
    - durability depending on local disk; recovery reading another
      process's local state
    - mutation of data objects, commit records, manifests, index objects
    - in-place edits to frozen formats (RSEG, proto/, series identity,
-     commit tokens, key layout) without ADR + version bump
+     commit tokens, key layout) without ADR and version bump
    - unwrap/expect on production paths; `unsafe`
    - silent approximation; placeholder implementations on critical paths
-   - acceptance tests that don't genuinely assert the claimed behavior
-   - a sentence in a doc, HELP string, doc comment or ADR that asserts a
-     property the code does not have, especially one using "never" or
-     "always" that holds on one path and not another, and any number
-     stated in prose that no longer matches the tree
-   - a pattern fixed at one site and left at another: grep the instance
-     the change fixes and check every other occurrence
-   - a metric family, label, flag or report field that a doc names and
-     nothing renders or produces
-   Require findings as `file:line - claim - why it's wrong`, and a
-   verdict: pass or block.
+   - acceptance tests that do not assert the claimed behavior
+   - a sentence in a doc, HELP string, doc comment or ADR asserting a
+     property the code lacks ("never"/"always" true on one path only, a
+     number that no longer matches the tree)
+   - a pattern fixed at one site and left at another: grep for the
+     instance the change fixes and check every other occurrence
+   - a metric family, label, flag or report field a doc names and nothing
+     renders
 
-   Run this BEFORE opening the pull request, not after. Skipping it on a
-   wave moves round one of the review into public, where each finding
-   costs a CI cycle and a re-review instead of a local fix: one epic ran
-   10 review rounds on a single pull request this way, and about half of
-   every finding across it was an unpaired prose claim the checkpoint
-   would have caught.
-3. Block verdict: fix before merging anything. Small and mechanical fix
-   locally (in a worktree); otherwise a fix task to the fleet. Re-review
-   the changed area. Wave N+1 does not dispatch until pass.
-4. Ledger the verdict, findings count, and fix commits.
-5. Remove the reviewer's worktree. `isolation: "worktree"` only
-   auto-removes it when the agent made no changes; a reviewer that ran
-   scratch clones, rebase drills, or a block-verdict fix leaves it behind
-   and returns its path in the result instead. Once its verdict and any
-   fix commits are captured in the ledger (step 4), nothing reads that
-   worktree again: `git worktree remove <path>` from outside it. Same
-   failure shape as Stage 5's: an instruction living only in the tool
-   description, not a numbered step here, is an instruction that gets
-   skipped, and each skipped removal leaves a worktree carrying up to
-   tens of gigabytes of build cache.
+   Findings as `file:line - claim - why it's wrong`, and a verdict: pass
+   or block.
+3. Block: fix before merging anything, locally in a worktree if small and
+   mechanical, otherwise as a fleet fix task. Re-review the changed area.
+   Wave N+1 does not dispatch until the verdict is pass.
+4. Ledger the verdict, finding count and fix commits.
+5. Remove the reviewer's worktree (`git worktree remove <path>`, from
+   outside it). `isolation: "worktree"` removes it only when the agent
+   changed nothing, and each one left behind can hold tens of gigabytes
+   of build cache.
 
 ## Stage 5 - Land (per wave)
 
-Work in a dedicated worktree of main (`git worktree add`), per CLAUDE.md.
+Work in a fresh worktree of `origin/main`, per CLAUDE.md.
 
 1. Per task, in DAG order: `scripts/fleet-result-inspect.sh <task-id>`,
-   write the PR message file (first line = PR title, body after the blank
-   line carries `Fixes: #<sub-issue>`), then
-   `scripts/fleet-result-merge.sh <task-id> <message-file> -p <crates>`.
-   `main` is protected, so the script never pushes it: it cleans the
-   result branch's history, runs local pre-flight gates, and opens a PR.
-   It does NOT enable auto-merge (standing rule, 2026-08-26): the fleet
-   review posts as a comment rather than a required check, so `--auto`
-   used to land before the review arrived. It posts `@claude-fleet
-   review` instead; wait for that review, address every finding, then
-   merge by hand. `FLEET_MERGE_AUTO=1` restores the old behaviour for the
-   rare case that genuinely does not need the wait.
-
-   Before merging each PR, confirm CI is green on the head you reviewed:
+   write the PR message file (line 1 is the title; the body carries
+   `Fixes: #<sub-issue>`), then `scripts/fleet-result-merge.sh <task-id>
+   <message-file> -p <crates>`. It opens a PR without auto-merge and
+   posts `@claude-fleet review`; follow the merge-fleet-result skill to
+   answer the review and merge. Before merging, confirm CI on the
+   reviewed head:
 
    ```sh
    scripts/guards/assert-green-head.sh <pr> --epic <epic>
    ```
 
-   Exit 0 merges. 2 means wait; 3 means rerun once; 1 is the same failure
-   twice, which is real and escalates; 4 is a flake with the budget
-   spent; 5 is no verdict, which is never a green; 6 hands a cancelled or
-   timed-out check to `ci-sweep-cancelled.sh`. Passing `--epic` keeps the
-   failure signatures in this epic's state file rather than a per-PR one.
-   Then record it:
-
-   ```sh
-   scripts/epic-orchestrator.sh record <epic> merged pr=<pr> sha=<merge-sha>
-   ```
-
-   The merge-fleet-result skill covers gate failures, scope creep, and
-   confirming the PR actually merged.
-2. Real merge conflict: STOP and read the conflicting main commits first
+   0 merges; 2 wait; 3 rerun once; 1 is the same failure twice (real,
+   escalate); 4 a flake with the rerun budget spent; 5 no verdict, never
+   a green; 6 a cancelled or timed-out check for `ci-sweep-cancelled.sh`.
+   Then `scripts/epic-orchestrator.sh record <epic> merged pr=<pr>
+   sha=<merge-sha>`.
+2. Real merge conflict: stop and read the conflicting main commits
    (`git log <merge-base>..origin/main -- <paths>`, full bodies). If a
    structural decision killed the task's premise (an ADR, a format
-   version change, a rewrite), do not force it through: preserve the
-   branch, comment on the sub-issue with the pointer, ledger it, move
-   on. Only overlapping-edit conflicts get resolved textually.
-3. Verify each sub-issue actually closed (`Fixes:` closes, `Refs:` does
-   not); close stragglers with a comment linking the merge.
+   version change, a rewrite), preserve the branch, point to it from the
+   sub-issue, ledger it and move on. Resolve only overlapping edits
+   textually.
+3. Verify each sub-issue closed (`Fixes:` closes, `Refs:` does not);
+   close stragglers with a comment linking the merge.
 4. Ledger the wave: merge SHAs, new main SHA, closed issues. Tick the
-   epic checklist.
-5. Remove this wave's worktree now (`git worktree remove <path>`), from
-   outside it: every task's PR is open (or landed) and wave N+1 lands
-   against a moved main anyway, so it creates its own fresh worktree in
-   step 1 rather than reusing this one. Do this before starting wave N+1,
-   not batched at epic end: a multi-wave epic that waits lets these
-   pile up (each wave's worktree carrying its own build-cache
-   target dir) instead of shedding them wave by wave.
-6. Last wave only: update README and docs per CLAUDE.md's
-   doc-currency rule, final ledger entry, close the epic.
+   checklist.
+5. Remove this wave's worktree before starting wave N+1; the next wave
+   lands against a moved main in its own fresh worktree.
+6. Last wave only: update README and docs per CLAUDE.md, write the final
+   ledger entry, close the epic.
 
 ## Ledger format
 
-One `### Wave N` block in the epic issue's `## Ledger` section, edited
-in place (`gh issue edit --body-file`, or a comment per wave if body
-edits race):
+One `### Wave N` block in the epic's `## Ledger`, edited in place
+(`gh issue edit --body-file`, or a comment per wave if body edits race):
 
 ```
 ### Wave N - <planned|dispatched|review|blocked|landed>
 plan: T4 #103, T7 #106 (from main <sha>)
 T4 #103 task=<task_id> done result=<sha>
 T7 #106 task=<task_id> ceiling-killed; continued as task=<task_id2> from <recovered-sha>
-review: pass (opus, 2 findings fixed in <sha>)
+review: pass (2 findings fixed in <sha>)
 landed: <merge-sha> <merge-sha2>; main=<sha>; closed #103 #106
 ```
 
@@ -335,7 +246,7 @@ landed: <merge-sha> <merge-sha2>; main=<sha>; closed #103 #106
 
 0. `scripts/epic-orchestrator.sh reconcile <epic>` first. It rewrites
    `.claude/epic-state/<epic>.json` from live GitHub state and exits 65 on
-   any drift that must be fixed before the next dispatch, including a task
+   drift that must be fixed before the next dispatch, including a task
    the local index knows about that never reached the issue body. A task
    with a start ref and no result ref is settled by asking the fleet control
    plane (`GET /v1/tasks/<id>`). RUNNING does not block. DEAD blocks until
@@ -349,44 +260,27 @@ landed: <merge-sha> <merge-sha2>; main=<sha>; closed #103 #106
    the backoff has to run; a rate limit, a 5xx or a session limit is parked
    with `resume-set --reason`, which exits 69 with the delay to pass to
    ScheduleWakeup, or 75 when the error is fatal or the budget is spent.
-1. Read the epic issue ledger; find the last wave block and its status.
-2. Any task_id without a terminal ledger line: `fleet_status` it, verify
-   its result ref with `git ls-remote`, resume that stage's procedure.
-3. `planned` -> dispatch it; `dispatched` -> re-arm watches;
-   `review` -> rerun checkpoint (results are fetched, diff is cheap);
-   `blocked` -> the block reason is in the ledger, resolve it;
-   `landed` -> next wave.
+1. Read the ledger's last wave block and its status.
+2. Any task without a terminal ledger line: `fleet_status` it, verify its
+   result ref with `git ls-remote`, and resume that stage.
+3. `planned`: dispatch. `dispatched`: re-arm the watches. `review`: rerun
+   the checkpoint. `blocked`: resolve the reason in the ledger. `landed`:
+   next wave.
+
 Never re-dispatch a task whose result ref exists; merge it.
 
-## Red flags - stop and reread the relevant stage
+## Red flags
 
-- "Executor reported gates green" - not the gate; local gates on the
-  merged tree are.
-- "Conflict, I'll just resolve it" - premise check first (stage 5.2).
-- "These two tasks touch the same file but different functions" - one
-  task or different waves. No exceptions.
-- "Same crate, but their file lists are disjoint" - still one wave apart.
-  Two tasks dispatched concurrently into one crate on this reasoning
-  have collided: one added a parameter to a function the other grew a new
-  call site for, the merge was textually clean, and the build broke on
-  `E0061`. When one task changes a public signature, grep the other
-  task's predicted files for that name before calling the waves disjoint.
-- "Diff is small, skip the checkpoint" - checkpoint runs every wave.
-- "I'll ask the user before wave 2" - the only gate is ADR approval.
-  Asking mid-flight strands the epic (unattended rule).
-- "I'll record the task_ids after they finish" - ledger before watch,
-  always.
-- "I'll just call `fleet_dispatch` directly, I already checked" - the
-  intent script is where the stale-ref, dangling-intent and duplicate-work
-  guards run. A dispatch that skips it has skipped all three, and the
-  check you did in your head is not on the ticket for the next session.
-- "The duplicate guard refused, I'll set DISPATCH_SKIP_DUPLICATE_CHECK=1"
-  - read what it named first. That flag is for a deliberate second task on
-  one ticket, and using it to get past a refusal once makes using it the
-  next time easier; a guard routinely worked around has stopped being one.
-- "I'll clean up all the wave worktrees at the end" - remove each one at
-  the end of its own wave (Stage 5 step 5); waiting compounds disk use
-  across every wave still to come.
-- "The reviewer's worktree is the harness's problem" - it's only
-  auto-removed when the agent made no changes; a review that ran scratch
-  git commands or applied a fix leaves it behind (Stage 4 step 5).
+- "Executor reported gates green": the cold verify-dispatch run and the
+  PR's required checks are the gate.
+- "Conflict, I'll just resolve it": premise check first (Stage 5.2).
+- "Same file but different functions" or "same crate, disjoint files":
+  one task, or different waves.
+- "Diff is small, skip the checkpoint": it runs every wave.
+- "I'll ask the user before wave 2": the only gate is ADR approval.
+- "I'll record the task ids after they finish": record before watching.
+- "I'll call `fleet_dispatch` directly, I already checked", or "the
+  duplicate guard refused, I'll set the skip flag": the intent script's
+  guards are the check; read what a refusal names.
+- "I'll clean up worktrees at the end": remove each at the end of its own
+  wave, reviewer worktrees included.

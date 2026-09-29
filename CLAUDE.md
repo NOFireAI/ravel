@@ -94,7 +94,9 @@ cargo clippy -p ravel-server -p ravel-sql --features flight-sql --all-targets --
 cargo test   -p ravel-server -p ravel-sql --features flight-sql
 ```
 
-`scripts/gates.sh` runs these when the crates are in scope. It also runs a
+`scripts/gates.sh` runs these when `ravel-server` or `ravel-sql` is in
+scope; a scoped run that names only `ravel-query` skips them, so add
+`-p ravel-server` for a query-only change. It also runs a
 ravel-bench lane (`--features sql-latency,profiling,flight-lane` clippy and
 tests, plus `--features stage-timing`) whenever ravel-bench, ravel-sql,
 ravel-query, or ravel-ingest is in scope, and a `-p ravel-logseg -p
@@ -168,10 +170,8 @@ the fallback becomes no-op status polls that burn turns and tokens.
   status to the epic ledger at each state transition so the user can
   self-serve.
 - Both of the above are standing behavior, not something to do only when
-  asked (issue #613: over four days, `epic-status.sh` ran 15 times
-  against 440 hand-rolled `gh issue view` calls, and every fleet task
-  death in that window was found by someone remembering to reconcile,
-  never by an error surfacing on its own). Concretely: run
+  asked: a fleet task death never surfaces as an error on its own, only
+  through reconciliation. Concretely: run
   `scripts/epic-status.sh <epic>` for every epic you are actively
   driving before dispatching new work on it, and again at each idle
   wakeup while a wave is in flight -- not only in response to a status
@@ -280,11 +280,10 @@ connection, a pushed-but-broken main).
 - `scripts/fleet-result-merge.sh <task-id> <message-file> [-p CRATE ...]`:
   cleans `wip:`/fixup commits out of the reviewed result branch, runs
   `gates.sh`, and opens a PR against `main` (`main` is protected; the
-  script never pushes or merges it directly). The PR opens WITHOUT
-  auto-merge by default (standing rule, 2026-08-26): a bot review posts as
-  a comment, not a required status check, so `--auto` used to merge before
-  that review landed (#749/#750 shipped with 6 real findings unaddressed
-  this way). After opening the PR it posts `@claude-fleet review` on it,
+  script never pushes or merges it directly). The PR opens without
+  auto-merge: the bot review posts as a comment, not a required status
+  check, so `--auto` would merge before that review landed. After opening
+  the PR it posts `@claude-fleet review` on it,
   which is the trigger for the fleet review (ADR-1586). Wait for the
   `claude-fleet[bot]` review and fix or answer every finding not marked
   `nit`. A review whose findings are all nits is clean: do not push for
@@ -294,8 +293,8 @@ connection, a pushed-but-broken main).
   `scripts/pr-review-status.sh <pr-number>`, then run the exact merge
   command it prints once clean (it pins `--match-head-commit` to the SHA
   it just checked, so a stale check can't land unreviewed code).
-  `FLEET_MERGE_AUTO=1` restores the old auto-merge behavior for the rare
-  case that genuinely does not need the wait. Task refs are left on
+  `FLEET_MERGE_AUTO=1` enables auto-merge for the rare case that
+  genuinely does not need the wait. Task refs are left on
   origin until the PR is confirmed
   merged; see the merge-fleet-result skill for that step. Write the PR
   message to `<message-file>` first (trailers included; line 1 is the
@@ -379,7 +378,7 @@ inside the primary checkout, a bare 40-character hex literal in a Bash
 command, and three destructive git operations: `reset --hard/--soft` onto
 a remote ref, `filter-branch`, and a force-push naming `main`. The gate
 patterns match cargo's global flags
-too (`cargo --locked test | tail -1` was allowed until they did). It
+too (`cargo --locked test | tail -1`). It
 fails open on any internal error, and it exempts a dispatched fleet clone
 (which is itself the isolated workspace).
 `RAVEL_GUARD_ALLOW_PRIMARY=1` is the escape hatch for the worktree rule;
@@ -442,9 +441,9 @@ than passing for "no pull request open".
   The two halves of the test tree fail differently: `make test-python` uses
   `unittest discover -p 'test_*.py'`, so a Python suite cannot be orphaned and
   grepping a workflow for its filename proves nothing, while shell suites are
-  enumerated by hand and a new one runs nowhere until somebody remembers.
-  That has bitten three times, each a green suite that had never executed
-  sitting beside a real defect. Runs in `gates.sh` as well as CI, because the
+  enumerated by hand and a new one runs nowhere until somebody remembers,
+  which leaves a green suite that never executed beside a real defect.
+  Runs in `gates.sh` as well as CI, because the
   person it exists for is the one who just added a suite. It does not see
   suites named by another convention. `deploy/metricsbench/tests/` holds one
   of each: its `.test.sh` file is scanned and its `.sh` sibling is not, though
@@ -472,9 +471,8 @@ than passing for "no pull request open".
   apart: it measured the current directory and passed about a volume the
   caller was never going to write to.
   The check proves headroom at one instant, not for the duration of the
-  build. A session that read 82 GB free, started a cold gate, and took
-  the volume to 886 MiB still passed this guard: another session was
-  building at the same time. For anything longer than a few minutes,
+  build, and another session can be building on the same volume at the
+  same time. For anything longer than a few minutes,
   also arm `scripts/guards/disk-watchdog.sh <your-worktree>` alongside it.
   Killing your build costs a retry; letting the volume reach zero stops
   every Bash command in every session on the host, including the ones
@@ -485,9 +483,7 @@ than passing for "no pull request open".
   (default 9 GB, warning at 15). The scope is REQUIRED and it is what
   makes the thing safe here: a watchdog that matches by command name
   kills every session's build on this box and reports it as killing
-  yours. Two sessions wrote that version independently within one hour on
-  2026-09-09 and one killed the other's compile with it, which is why
-  this exists as a script rather than as the paragraph above.
+  yours, so use this script rather than a hand-written watchdog.
   The matched set is `cargo` and `rustc` plus the linker children they
   spawn (`cc`, `ld`, `collect2`, `rust-lld`, `clang`, `clang++`): SIGKILL
   to rustc leaves its linker running, and linking is the phase writing
@@ -539,62 +535,49 @@ than passing for "no pull request open".
   or in what order two should land, depends on facts a script cannot see.
   Several Claude sessions work this repo through one shared `gh` account, so
   a PR's author never says which session owns it and idle time says nothing
-  about whether that session is alive. Both assumptions failed on
-  2026-09-14: #1786 and #1788 bumped rustls for the same advisory twenty
-  minutes apart under titles too different to match by eye, and sat in the
-  merge queue together, where the second would have rebased to an empty diff;
-  and five fix rounds went out against PRs whose session was awake and
-  already fixing the same findings, on heads that moved minutes later, so
-  landing one would have reverted the other session's work while looking
-  like an ordinary landing. Run this before the first action on any PR that
+  about whether that session is alive. Two PRs can make the same change
+  under titles too different to match by eye, and a fix round pushed
+  against a PR whose session is still working can revert that session's
+  work while looking like an ordinary landing. Run this before the first
+  action on any PR that
   is not demonstrably yours, and re-resolve the head immediately before a
   `fleet_dispatch` against it: findings extracted against a head that has
   since moved are already stale. Claim a PR by commenting on it BEFORE
   reading its findings, not after dispatching a round; a claim posted at the
   end of the pipeline documents an intention events have already overtaken.
   Cases in `scripts/guards/check-duplicate-work.test.sh`; the IDENTICAL path
-  is tested synthetically because its only real instance was closed within
-  the hour.
+  is tested synthetically.
 - `scripts/guards/assert-fresh-merge-base.sh <pr-number>`: exits non-zero
   when a PR's merge base is behind `origin/main`, printing how far and what
-  it has not seen. **Since 2026-09-13 a merge queue on `protect-main` is what
-  actually enforces freshness**: it rebases each entry onto current main and
-  runs full CI on the combined result before landing, so do NOT hand-rebase a
-  PR merely because main moved, and do not treat a behind-ness count as a
-  reason to pay a CI cycle. The queue is `REBASE`/`ALLGREEN`, batches up to 5,
-  and `ci.yml` already carried the `merge_group:` trigger. This guard remains
-  the check for a merge that BYPASSES the queue, and for diagnosing a branch
-  that will not enter it. Green CI on a stale base is not evidence about the merge: a
-  PR green against an older base can still break `main` (8a534f43 left main
-  uncompilable exactly this way, a five-argument call site landing minutes
-  before another PR made the function take six, both PRs green), and a gate
-  added to `main` after a PR went green has never run against that PR at
-  all. Four PRs were CI-green and behind simultaneously on 2026-09-06.
-  `main` DOES run its own CI (`ci.yml` has `on: push: branches: [main]`;
-  the coverage lane and the publish gate both need it), so a break of the
-  8a534f43 kind is detected, but only once the merge has landed and anyone
-  pulling in between has a broken tree. Detection after the damage is not
-  prevention. One class survives main's push CI entirely and this guard is
-  its only detector: a landing loop that copies files against a list
-  derived from current main can DELETE a change another session landed
-  minutes earlier, and that revert is textually clean and green, because
-  removing lines compiles as well as never adding them and the tests for
-  the reverted work went in the same commit. Two were caught on 2026-09-09,
-  both only because the guard printed a merge-base the author did not
-  recognise. `ALLOW_STALE_MERGE_BASE=1` to
-  proceed anyway. It exits 1 for a base that is behind and 2 when it could
-  not tell (bad argument, no such pull request, git failed), so a caller
-  reporting to a human can say which it got; a caller that only needs "may
-  I merge" treats any non-zero as no, and MUST, because 126 and 127 come
-  from the shell rather than the guard and mean it never ran. That is not
-  hypothetical: the guard is newer than most checkouts, a primary checkout
-  here is routinely dozens of commits behind, and one lacking the file
-  exits 127, which a caller switching on 1 versus 2 falls straight
-  through. Run it from a worktree that is on current main; asking a stale
-  tree whether a branch is stale is the same mistake one level up. Note it fetches with an explicit destination refspec: a
-  hand-rolled version using `git fetch origin main <other-ref>` and then
-  `rev-parse FETCH_HEAD` reads back MAIN, so it compares main with itself
-  and reports every branch fresh.
+  it has not seen. The merge queue on `protect-main` is what enforces
+  freshness: it rebases each entry onto current main and runs full CI on
+  the combined result before landing, so do NOT hand-rebase a PR merely
+  because main moved, and do not treat a behind-ness count as a reason to
+  pay a CI cycle. The queue is `REBASE`/`ALLGREEN`, batches up to 5, and
+  `ci.yml` carries the `merge_group:` trigger. This guard is the check for
+  a merge that BYPASSES the queue, and for diagnosing a branch that will
+  not enter it. Green CI on a stale base is not evidence about the merge:
+  a PR green against an older base can still break `main` (a call site
+  landing just before another PR changes the function's arity, both PRs
+  green), and a gate added to `main` after a PR went green has never run
+  against that PR. `main`'s own push CI detects a break of that kind only
+  after it has landed. One class survives main's push CI entirely and this
+  guard is its only detector: a landing loop that copies files against a
+  list derived from current main can DELETE a change another session
+  landed minutes earlier, and that revert is textually clean and green,
+  because removing lines compiles as well as never adding them and the
+  tests for the reverted work went in the same commit.
+  `ALLOW_STALE_MERGE_BASE=1` to proceed anyway. It exits 1 for a base that
+  is behind and 2 when it could not tell (bad argument, no such pull
+  request, git failed), so a caller reporting to a human can say which it
+  got; a caller that only needs "may I merge" treats any non-zero as no,
+  and MUST, because 126 and 127 come from the shell rather than the guard
+  and mean it never ran (a checkout older than the guard exits 127). Run
+  it from a worktree that is on current main; asking a stale tree whether
+  a branch is stale is the same mistake one level up. It fetches with an
+  explicit destination refspec: a hand-rolled version using `git fetch
+  origin main <other-ref>` and then `rev-parse FETCH_HEAD` reads back MAIN,
+  so it compares main with itself and reports every branch fresh.
 - `scripts/guards/assert-gh-auth.sh [hostname]`: exits non-zero when gh
   cannot complete an authenticated API call. Run it before any landing
   sequence: tokens die mid-session, and a failure found at push time
@@ -761,30 +744,22 @@ than passing for "no pull request open".
   the predicate would silently narrow it from 26 helpers to 5).
   Scope: the default target is the single file
   `services/ravel-cli/src/load.rs`; the rule is NOT yet enforced
-  workspace-wide. Pointing it at every other `.rs` that mentions an
-  injected-clock type surfaces 9 findings across 5 files (in ravel-cache,
-  ravel-maintain, and ravel-server; a mix of idle-eviction sleeps that poll
-  a clock-controlled state and `tokio::time::timeout` deadlock guards that
-  would each need a real allow-wall-clock reason), and it finds no helper at
-  all in 78 more clock-mentioning files, 70 of them integration tests: 60
-  under `crates/*/tests/` and 10 under `services/*/tests/`. Issue #1278 is
-  the follow-up that widens the scan and resolves those.
+  workspace-wide: the other files that mention an injected-clock type,
+  most of them integration tests under `crates/*/tests/` and
+  `services/*/tests/`, are not scanned. Issue #1278 is the follow-up that
+  widens the scan and resolves what it finds.
 
 ### Writing gate and poll shell
 
-Three shell bugs have each silently turned a failing gate or watch loop
-into a false green. When you write or edit any such script:
+Each rule below closes a way a failing gate or watch loop has silently
+read as green. When you write or edit any such script:
 
 - Capture an exit code as `cmd || code=$?` on the same line. `$?` read
-  after an `if`/`fi` block reports the `if` construct, not the command
-  (this exact bug made a draft of `verify-dispatch-gates.sh` report PASS
-  on everything).
+  after an `if`/`fi` block reports the `if` construct, not the command.
 - `set -e` at the top of a Bash tool call does NOTHING. The block is
   `eval`'d (zsh's own `(eval):N:` error prefix gives it away), and
   ERREXIT does not apply to the enclosing eval'd context, so it is inert
-  at every depth: top level, inside `( ... )`, and inside a function. A
-  partial rebase was pushed under one, and the fix that re-pushed under
-  another was equally ungated and merely had nothing left to catch.
+  at every depth: top level, inside `( ... )`, and inside a function.
   SCRIPT FILES ARE UNAFFECTED: everything under `scripts/` runs as its
   own shell and its `set -e` behaves normally. This is about inline shell
   only. What works inline is one explicit refusal per dangerous step,
@@ -792,8 +767,7 @@ into a false green. When you write or edit any such script:
   `if ! cmd; then ... exit 1; fi`. `echo "EXIT=$?"` reports and
   continues; printing a number beside a dangerous action is not a gate,
   and it relies on your attention at the moment you are most hurried.
-  Verifying this rule is itself the trap, and four attempts across two
-  sessions all failed the same way, by measuring a neighbouring shell:
+  To verify this rule, do not measure a neighbouring shell:
   `bash -c 'set -e; ...'` and `zsh -c '...'` spawn a clean shell where it
   works, running the probe from inside a `.sh` file does the same, and
   appending `|| echo aborted` to see whether something aborts puts it in
@@ -804,7 +778,7 @@ into a false green. When you write or edit any such script:
   when the text contains backticks. The shell command-substitutes them,
   the identifier runs as a command, its empty output is substituted, and
   `gh` exits 0 and returns a URL: the published text is missing exactly
-  the names the argument rested on. Two sessions hit this within an hour.
+  the names the argument rested on.
   Use `--body-file` or `-F body=@file` with text written by the Write
   tool or a quoted heredoc, then verify the artifact rather than the exit
   code. Save the body to a file first and refuse on a failed fetch,
@@ -825,39 +799,36 @@ into a false green. When you write or edit any such script:
 - Never name a variable `status`, `path`, `argv`, or `PWD`: zsh reserves
   them, and assignment kills the loop with `read-only variable`.
 - Never pipe a gate OR A GUARD through `grep`, `head`, or `tail`, and never
-  append `&& echo MARKER`: the pipeline's exit code masks the real one. The
-  rule reads as being about gates and is not. On 2026-09-09 two sessions
-  broke it on `assert-fresh-merge-base.sh` within the same hour, both while
-  shortening its output: `guard 1556 | head -3` reported exit 0 on a branch
-  three commits behind, and `out=$(guard N 2>&1 | tail -1)` reported 0 for a
-  guard that was not in that checkout and had really exited 127. A guard
-  that reports fresh on a stale branch is worse than no guard, because it
-  retires the suspicion that would have caught it. The PreToolUse hook now refuses both forms rather than
-  leaving this to memory. When you genuinely want short output and the
-  truth, redirect to a file and read it separately; if you must pipe, bash
+  append `&& echo MARKER`: the pipeline's exit code masks the real one, so
+  `guard N | head -3` reports 0 for a guard that failed or never ran
+  (127). A guard that reports fresh on a stale branch is worse than no
+  guard, because it retires the suspicion that would have caught it. The
+  PreToolUse hook refuses both forms. When you genuinely want short output
+  and the truth, redirect to a file and read it separately; if you must pipe, bash
   keeps every stage in `${PIPESTATUS[0]}` (zsh spells it `${pipestatus[1]}`,
   and every script under scripts/ is bash).
 - A plain `out=$(cmd)` DOES propagate cmd's status, including when `$?` is
   read on the next line; measured, not recalled. The two forms that lose it
   are `local o=$(cmd)`, where `local`'s own success becomes the status, and
-  any pipe. Do not restructure a working assignment believing otherwise: a
-  session diagnosed its pipe bug as an assignment bug and wrote the wrong
-  mechanism into its notes.
+  any pipe. Do not restructure a working assignment believing otherwise.
 
 ## Fleet executor environment
 
 Facts about the dispatched clone that executors have re-derived by trial
 and error, one wasted turn (or one lost result) at a time:
 
-- Two executor classes exist; tell them apart with `uname -m` and
-  `nproc`. The amd64 class (label `arch=amd64`, x86_64, 16 vCPU, 30 GB
-  RAM, about 350 GB free on the root volume) has a 1 GB tmpfs as HOME:
-  never write logs or `cargo install` output under HOME there; install
-  tools with `--root "$PWD/.dd-tools"`. The arm64 Pi class (aarch64, 4
-  cores, 8 GB RAM) needs `CARGO_BUILD_JOBS=2` on every cargo command and
-  on every script that runs cargo (`scripts/affected-tests.sh` takes no
-  jobs flag); use `CARGO_BUILD_JOBS=4` on amd64. See "Long commands and
-  the Bash tool" above for the `timeout` consequences.
+- Executor hardware varies: at least a 16 vCPU x86_64, an 8-core x86_64
+  with about 15 GB of RAM, and a 4-core aarch64 Pi with 8 GB. Read
+  `uname -m`, `nproc` and total memory instead of assuming a class. The
+  amd64 class (label `arch=amd64`, x86_64, 16 vCPU, 30 GB RAM, about
+  350 GB free on the root volume) has a 1 GB tmpfs as HOME: never write
+  logs or `cargo install` output under HOME there; install tools with
+  `--root "$PWD/.dd-tools"`. Set `CARGO_BUILD_JOBS` on every cargo command
+  and on every script that runs cargo (`scripts/affected-tests.sh` takes
+  no jobs flag) to `min(4, max(2, nproc / 4))`, or to 2 when memory is
+  11 GB or less: a higher value gets `ld` killed with signal 9 during a
+  cold link, which reads as a compiler error. See "Long commands and the
+  Bash tool" above for the `timeout` consequences.
 - Gate logs go to `.gate-logs/` inside the checkout. The tracked
   `.gitignore` covers `.gate-logs/` and `.dd-tools/` so the harness's
   commit-on-death cannot sweep them into a wip commit; the fleet-task-spec
@@ -1020,11 +991,8 @@ mechanical.
   that output quoted in the filing. Quoting is the mechanism, not the
   running: an omitted quote is visible on the page, an omitted mental
   step is not. The same applies to a mechanism claim, which carries its
-  count-check inline beside it. A published headline was once disputed
-  as unreconstructable while the epic body stated the rule outright and
-  a single-statement drop reproduced the total to the cent; the
-  correction moved a planning target twice. An overcorrection is a claim
-  too, and needs the same evidence as the claim it replaces.
+  count-check inline beside it. An overcorrection is a claim too, and
+  needs the same evidence as the claim it replaces.
 - A measurement has preconditions on state, not only on code: the
   catalog folded to the last write (a fold seals an ingest hour only
   `max_flush_lifetime + clock_skew_allowance + fold_safety_margin` after
