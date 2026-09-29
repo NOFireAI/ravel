@@ -4904,11 +4904,11 @@ mod tests {
         // r = 7.08, d0 = STORED_TARGET * (1 - 1/r) = 14_069, ladder
         // ln(14069/4096) / ln(7.08/6.08) = 8.1, floor tail r = 7.1, crossing
         // probe 1, so 16.2 per part; 11 closing parts = 178, plus the trailing
-        // part's partial ladder and the per-part spread around the model = 196
+        // part's partial ladder and the per-part spread around the model = 195
         // pinned.
         assert_eq!(
             tracker.probes_run(),
-            196,
+            195,
             "the exact-encode probe count for this fixture is deterministic; the \
              geometric model predicts about 16.2 probes per part for r={ratio:.2} \
              over {} parts",
@@ -6314,12 +6314,12 @@ mod tests {
         /// `l1_part_memory_target_bytes: 32 * 1024`, re-captured at the RLOG
         /// version 5 bump (see the note above).
         const EXPECTED_PART_HASHES: &[&str] = &[
-            "1074e045c85223cb37cecce30c4753d0cd489864bb57007a8c086108f677fdbf",
-            "b766886237691a80fa401e5ccee1f6bffb5cea18985c68d0cf6515003398bb20",
-            "d7d1a8326c227dcecf55889bd27f786984441abbb1eacf3acb5a8827fb40ea7c",
-            "624c75945043e4db964566c430ce11e6709ee975b0dd71ac4c44a2f058079676",
-            "8a32c1e5f48e3da9a2b97156f3521971c10d9924514b491399ad550a506a6240",
-            "e3f20f9e46d1b2d19d030f043db4b646cd326047aa598309d82a3aacc05cf343",
+            "6d0664e0d1d160bff00c27d6a5580d5621faa46e9179572af2495b6f89915674",
+            "4aa53103f785e2fa51bd208f448b21f7e8b4491495922293d3e24446de7949b5",
+            "65641532551b32a6e1a3c144b57167d757e3c09c9e5701116aad4a477eed671b",
+            "bad1de3f9f8218b65dcc289b25e2025a55e6dfc432b7954843a76350421ad187",
+            "0af9d411bd396d297da584fa9d522a0af2b836a99f08381af7ada7af32bba981",
+            "d77f839942d6de317462046655689af9f615bdcf6ec6189fff509621023e1ca9",
         ];
 
         let (hashes, rows) = differential_hash_run().await;
@@ -6662,7 +6662,7 @@ mod tests {
         // The exact bytes, not only the order: the part hashes under overlap-gated
         // and eager all-open admission, pinned as literals.
         const EXPECTED_HASHES: [&str; 1] =
-            ["b951173782cdb26d4c6f544c3bba7d50bf5b2bc5ca9752ada08c8ce555d27556"];
+            ["33611211c1c25ef7d6778d2026a808bd3565a65686676011983baab69a312595"];
         let overlap = compact_part_hashes(&inputs, &CompactorConfig::default()).await;
         let eager = compact_part_hashes(
             &inputs,

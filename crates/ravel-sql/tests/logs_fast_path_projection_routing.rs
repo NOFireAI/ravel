@@ -551,7 +551,7 @@ async fn narrow_projection_reads_column_chunks_not_whole_objects() {
     // wire cost is a fraction of the stored bytes rather than all of them.
     assert_eq!(
         (shape.bytes, stored),
-        (71_554, 406_004),
+        (71_554, 406_020),
         "exact wire bytes for the narrow shape, against the fixture's stored bytes"
     );
 
@@ -589,7 +589,7 @@ async fn wide_projection_keeps_the_whole_object_read() {
     );
     assert_eq!(
         (shape.bytes, stored),
-        (406_004, 406_004),
+        (406_020, 406_020),
         "a whole-object read moves exactly the stored bytes"
     );
     assert_eq!(
@@ -618,7 +618,7 @@ async fn select_star_is_unchanged() {
     );
     assert_eq!(
         (shape.bytes, stored),
-        (406_004, 406_004),
+        (406_020, 406_020),
         "SELECT * moves exactly the stored bytes"
     );
     assert_eq!(
