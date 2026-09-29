@@ -552,9 +552,10 @@ reservation sites. Both readings are settled here.
   statistics reservations, `Catalog::reserve_decoded` then evicts
   decoded-cache entries until the budget admits the charge, so the decoder
   still decides; only when the bytes over the limit are held outside those
-  caches does the budget refusal stand. The query fetcher's per-frame and
-  per-section charges reserve on the budget directly, with no eviction pass,
-  so there a 0-byte charge on an over-limit budget is refused outright.
+  caches does the budget refusal stand. In the query fetcher, the per-frame
+  charges sum into one per-section reservation, which goes to the budget
+  directly with no eviction pass, so there a 0-byte charge on an over-limit
+  budget is refused outright.
 - **A refused reservation fails the operation, on the resolve path and on the
   fold path alike.** Both paths could instead degrade: the resolve by
   disabling pruning, the fold by rebuilding its postings from scratch. Both
