@@ -37,14 +37,64 @@ fn run(args: &[&str]) -> std::process::Output {
         .expect("ravel-cli runs")
 }
 
-/// `--signal metrics` is refused by the binary, with the message that names the
-/// bulk-import follow-up metrics export waits on. This is the dispatch arm's
-/// only observable behavior that depends on the parsed `--signal`, so a
-/// `Command::Export` variant wired to the wrong argument fails here.
+/// `--signal spans` is refused by the binary, with the message that names the
+/// follow-up spans export waits on. A `Command::Export` variant wired to the
+/// wrong argument fails here or in the metrics test below.
 #[test]
-fn export_signal_metrics_is_refused_through_the_binary() {
+fn export_signal_spans_is_refused_through_the_binary() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mapping = write_mapping(&dir);
+    let out = dir.path().join("out.parquet");
+    let output = run(&[
+        "--store",
+        "memory",
+        "export",
+        "--signal",
+        "spans",
+        "--tenant",
+        "acme",
+        "--start",
+        BASE_RFC3339,
+        "--end",
+        "2023-11-14T22:13:21Z",
+        "--parquet",
+        &out.display().to_string(),
+        "--mapping",
+        &mapping.display().to_string(),
+    ]);
+
+    assert!(
+        !output.status.success(),
+        "export --signal spans must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let expected = unsupported_signal_message(SignalArg::Spans)
+        .expect("spans is an unsupported export signal");
+    assert_eq!(
+        stderr.trim_end(),
+        format!("Error: {expected}"),
+        "the binary must print exactly the unsupported-signal refusal"
+    );
+    assert!(
+        !out.exists(),
+        "a refused export must not create the --parquet file"
+    );
+}
+
+/// `--signal metrics` reaches the metrics export through the binary: the
+/// `[metrics]` section is parsed and a `[metrics.histogram]` mapping gets the
+/// metrics export's own refusal, which no other arm produces.
+#[test]
+fn export_signal_metrics_reaches_the_metrics_export_through_the_binary() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mapping = dir.path().join("mapping.toml");
+    std::fs::write(
+        &mapping,
+        "[metrics]\nname = \"rpc_duration\"\nvalue_column = \"value\"\nts_column = \"ts\"\n\
+         ts_unit = \"nanos\"\n\n[metrics.histogram]\nle_column = \"le\"\nsum_column = \"sum\"\n\
+         count_column = \"count\"\n",
+    )
+    .expect("write mapping");
     let out = dir.path().join("out.parquet");
     let output = run(&[
         "--store",
@@ -66,15 +116,13 @@ fn export_signal_metrics_is_refused_through_the_binary() {
 
     assert!(
         !output.status.success(),
-        "export --signal metrics must exit non-zero"
+        "a histogram mapping must exit non-zero"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let expected = unsupported_signal_message(SignalArg::Metrics)
-        .expect("metrics is an unsupported export signal");
     assert_eq!(
         stderr.trim_end(),
-        format!("Error: {expected}"),
-        "the binary must print exactly the unsupported-signal refusal"
+        format!("Error: {}", ravel_cli::export::HISTOGRAM_MAPPING_REFUSAL),
+        "the binary must print exactly the metrics export's histogram refusal"
     );
     assert!(
         !out.exists(),
