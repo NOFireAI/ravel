@@ -69,6 +69,11 @@ impl<T> Charged<T> {
         }
     }
 
+    /// The bytes this value's reservation holds against its budget.
+    pub(crate) fn reserved_bytes(&self) -> u64 {
+        self._reservation.size()
+    }
+
     /// A value charged 0 bytes against a private unlimited budget, for tests
     /// that build decoded values by hand.
     #[cfg(test)]

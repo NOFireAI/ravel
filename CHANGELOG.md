@@ -342,10 +342,27 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   nothing and the refusal stood. It now evicts until the budget admits the
   charge by the same test `try_reserve` applies. When the over-limit bytes are
   held by cached entries, releasing them lets the retry succeed and the
-  decoder's own refusal decides the outcome; when they are held elsewhere, the
-  pass empties the caches and the retry is refused. The charge rule itself,
+  decoder's own refusal decides the outcome; when they are held elsewhere, no
+  pass runs, the cached entries survive, and the first refusal stands (issue
+  #2108). The charge rule itself,
   `decoded_charge`, now lives once in `ravel-memory`, and both the query
   fetcher and the catalog call it.
+- **A catalog decode the decoded caches cannot make room for is refused
+  without evicting them** (issue #2108). `Catalog::reserve_decoded` skipped
+  its eviction pass only for a charge over the budget's whole limit. On a
+  budget shared with SQL, the fetchers and the live readers, a decode larger
+  than everything the part and postings caches hold could still run the pass,
+  evict every tenant's cached parts and postings, and be refused anyway. The
+  caches now track the bytes their entries' reservations hold, and the pass
+  is skipped, with no retry counted, when
+  `reserved - held + want > limit`; otherwise it evicts only until the charge
+  fits, as before. The metadata cache's serve read
+  (`read_metrics_meta_for_serve_on_gate`) stays on the bare budget, since it
+  has no catalog caches to evict; its doc comment says so. Neither path sees
+  a finite shared budget in the shipped server yet: the server builds its
+  `Catalog` without `with_memory_budget` and its metadata cache without the
+  process budget, and the ADR-1702 read-gate wiring is the follow-up that
+  will.
 - **`ravel-cli load --signal logs` loads a dictionary-encoded hex `trace_id` or
   `span_id` column** (issue #2116). A default Parquet writer dictionary-encodes
   string columns, and the columnar logs path refused such an id column with
