@@ -23,7 +23,7 @@
 //! Nothing here panics for malformed or oversized input: every problem
 //! becomes a [`LogRejection`] so the caller can build an OTLP partial-success
 //! response. This includes deeply nested array/kvlist attribute values:
-//! [`convert_value`] recurses, so it enforces its own
+//! `convert_value` recurses, so it enforces its own
 //! [`MAX_ATTRIBUTE_NESTING_DEPTH`] bound and rejects anything past it. That
 //! bound is what makes the no-overflow guarantee hold on its own terms; it
 //! does not depend on prost's decode-time recursion limit (an upstream
@@ -379,7 +379,7 @@ struct NormalizedBody {
     converted: bool,
 }
 
-/// The key [`convert_value`] is given for a structured body. It never reaches
+/// The key `convert_value` is given for a structured body. It never reaches
 /// a stored attribute name; it appears only in the rejection message for a
 /// body that could not be converted, which this function replaces with
 /// [`LogRejection::UnsupportedBodyKind`] anyway.
@@ -399,7 +399,7 @@ const BODY_KEY: &str = "body";
 /// `ExportLogsServiceRequest`: the value it names is not reachable here, so
 /// storing anything at all would fabricate content the sender never sent.
 ///
-/// A structured body that [`convert_value`] refuses (nested past
+/// A structured body that `convert_value` refuses (nested past
 /// [`MAX_ATTRIBUTE_NESTING_DEPTH`], carrying an unset value, or carrying a
 /// nested string-table reference) is reported as
 /// [`LogRejection::UnsupportedBodyKind`] rather than as the attribute-shaped
@@ -595,7 +595,7 @@ fn zigzag(value: i64) -> u64 {
 /// kept rather than merged.
 ///
 /// Recursion is bounded by [`MAX_ATTRIBUTE_NESTING_DEPTH`]: every value
-/// reaching here came through [`convert_value`], which rejects anything
+/// reaching here came through `convert_value`, which rejects anything
 /// nested deeper.
 fn build_canonical(
     value: &AttrValue,
@@ -715,7 +715,7 @@ fn convert_attr(
     Ok((kv.key.clone(), value))
 }
 
-/// Maximum nesting depth [`convert_value`] will follow through array and
+/// Maximum nesting depth `convert_value` will follow through array and
 /// kvlist attribute values before rejecting, counting the top-level attribute
 /// value as level 1 and each enclosing array or kvlist as one more level.
 ///
@@ -1617,7 +1617,7 @@ mod tests {
     }
 
     /// Wrap `leaf` in `layers` nested single-element `ArrayValue`s. The leaf
-    /// then sits at [`convert_value`] nesting level `layers + 1` (the
+    /// then sits at `convert_value` nesting level `layers + 1` (the
     /// outermost array is level 1).
     fn nested_array(layers: usize, leaf: AnyValueVariant) -> AnyValue {
         let mut value = any(leaf);
