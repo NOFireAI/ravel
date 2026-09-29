@@ -8,6 +8,22 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **RLOG log objects are now written and read at trailer version 5**
+  (ADR-2135, issue #2139). The footer gains a sort descriptor and a clustering
+  generation, the BLOOM section starts with the list of columns its filters
+  cover, bloom filters are sized to a multiple of 512 bits instead of a power
+  of two, and encoding tags 10 to 13 are registered but never written. The
+  writer still produces version 4's content: no sort descriptor, generation
+  0, and bloom coverage of body, severity text and every string attribute.
+  Exact filter sizing made the test fixtures' objects 1 to 3 percent
+  smaller and brings the bloom false-positive rate up to its designed ~1
+  percent from the lower rate power-of-two rounding gave, so a text
+  predicate may scan a few more blocks than before. The reader accepts only
+  version 5: a version-4 object is refused with `UnsupportedVersion` before
+  any section is read, and becomes unreadable once a build with this change
+  is deployed. Under the pre-v1.0 format posture there is no migration path;
+  development stores holding version-4 log objects must be wiped or
+  re-ingested.
 - **SQL fetches now reserve against the process-wide memory budget**
   (ADR-1170 decision 2, issue #2086). The server's SQL path wires the same
   `Arc<MemoryBudget>` the SQL executor already used into its RSEG metrics,
