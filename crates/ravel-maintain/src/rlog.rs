@@ -4797,7 +4797,7 @@ mod tests {
     /// per part. 11 of the 12 parts close on the target (178 probes) and the
     /// trailing part runs its own partial ladder without ever closing (its proxy
     /// passes the target, its records run out), which with the per-part spread
-    /// around the model accounts for the remaining 18 of the 196 pinned below.
+    /// around the model accounts for the remaining 17 of the 195 pinned below.
     /// The model treats `r` as constant along a part and ignores that a
     /// floored step overshoots, so a few percent is the
     /// expected agreement; a change that made probing linear in the deficit, or
