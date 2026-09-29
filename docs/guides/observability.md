@@ -1360,7 +1360,7 @@ runs.
 | `absent` | The tenant has alert records but no memo. A tenant that has never written an alert transition has no memo either and is not counted: it has nothing to sweep. |
 | `undecodable` | The memo object does not decode. |
 | `unsupported_version` | The memo decodes but carries a format version this build does not read. |
-| `watermark_below_floor` | The memo is complete only up to an hour older than the window's expiry floor, so it does not name every identity's current state across the range the sweep would delete from. |
+| `watermark_below_floor` | The memo's watermark hour, clamped to the maintaining process's own clock hour, is below the hour of the window's expiry floor: the memo is complete only up to an hour older than that floor, so it does not name every identity's current state across the range the sweep would delete from. |
 | `store_error` | Reading the memo, or the one listing that tells an unused alert keyspace from a lost one, failed against object storage. |
 
 Each is a skip for one tenant on one tick, and the next tick retries. A rate

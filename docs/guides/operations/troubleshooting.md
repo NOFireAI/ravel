@@ -33,7 +33,7 @@ record you removed as garbage to reclaim.
 
 | Symptom | Likely cause | How to confirm | Corrective action |
 |---|---|---|---|
-| `increase(ravel_maintain_orphan_breaker_tripped_total[5m]) > 0` | A sweep pass found a large set of data objects whose commit records are gone, which usually means records were deleted out of band rather than that a lot of flushes were abandoned. | The counter increment itself is the confirmation: it only increments on a real trip. A trip can only happen on a tick that ran candidate selection, which is the full-sweep cadence (`interior_reverify_ns`, 6 hours by default), not every tick. `ravel_maintain_orphans_withheld` on `/metrics` gives the size of the set withheld by the last such pass, and a tick that skipped selection leaves it unchanged. Re-run the same evaluation without deleting anything with `ravel-cli maintain sweep --tenant <t> --signal <s> --shard <n> --dry-run`. | Restore the missing commit records before the next pass runs. Do not wait for the trip to persist; see below. |
+| `increase(ravel_maintain_orphan_breaker_tripped_total[5m]) > 0` | A sweep pass found a large set of data objects whose commit records are gone, which usually means records were deleted out of band rather than that a lot of flushes were abandoned. | The counter increment itself is the confirmation: it only increments on a real trip. A trip can only happen on a tick that ran candidate selection, which is the full-sweep cadence (`interior_reverify_ns`, 6 hours by default), not every tick. `ravel_maintain_orphans_withheld` on `/metrics` gives the size of the set withheld by the last such pass, and a tick that skipped selection leaves it unchanged. Re-run the same evaluation without deleting anything with `ravel-cli maintain sweep --tenant <t> --signal <s> --shard <n> --dry-run`. Its `--signal` accepts `metrics`, `logs` and `spans` only, so a trip under `signal="alerts"` or `signal="audit"` has no CLI dry run: the alerts and query-audit shards are swept on every maintain tick of the process that owns the unit, not only on the full-sweep cadence, and the next such tick re-evaluates the breaker from live counts. | Restore the missing commit records before the next pass runs. Do not wait for the trip to persist; see below. |
 
 Alert on the **first trip**, with `increase(...) > 0`, not on a sustained
 condition. The counter only increments, so any increase is a trip that really
@@ -79,7 +79,11 @@ and the breaker has no memory across invocations, so an un-overridden pass
 afterward evaluates fresh. Use it only after confirming that deletion is safe,
 either by restoring records or by independently verifying that the candidates
 really are abandoned data. The record-absence signal the orphan rule re-verifies
-against is exactly what out-of-band record loss forges.
+against is exactly what out-of-band record loss forges. There is no override for
+the alerts or query-audit shard: the command does not accept those signals, and
+the maintain tick that next sweeps the shard deletes the candidates as soon as
+the live counts fall below the thresholds, so restoring the records first is
+the only way to keep them.
 
 **What the breaker does not catch.** Four gaps, so you do not read a quiet
 breaker as an all-clear:

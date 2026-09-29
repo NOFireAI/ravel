@@ -4325,7 +4325,9 @@ mod tick_tests {
     /// The sweep deletes exactly the four expired records that are no
     /// identity's latest (`a` -100d, `b` -98d and -97d, `c` -95d), each with its
     /// data object, so ten commit records and ten data objects become six of
-    /// each. The count is what stops this passing by deleting nothing.
+    /// each. The count is what stops this passing by deleting nothing, and the
+    /// empty quarantine prefix is what stops it passing by deleting only the
+    /// commit records and leaving the data to the orphan sweep.
     ///
     /// The memo the sweep keys on is written the way `run_tick` writes it: the
     /// evaluator's own fold as `records`, its seal bound as `watermark_hour`.
@@ -4341,9 +4343,7 @@ mod tick_tests {
         // 2027-01-15T08:00:00Z: every expired hour is a positive ingest hour.
         const COLD_NOW_NS: i64 = 1_800_000_000 * NS_PER_SEC;
 
-        let memory = MemoryStore::new();
-        memory.set_clock_ms(((COLD_NOW_NS - 100 * NS_PER_DAY) / 1_000_000) as u64);
-        let store: Arc<dyn ObjectStoreBackend> = Arc::new(memory);
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let ev = evaluator(Arc::clone(&store), TestClock::at(COLD_NOW_NS));
         let tenant = ev.tenant;
 
@@ -4395,27 +4395,7 @@ mod tick_tests {
         .await
         .expect("write memo");
 
-        let clock = ravel_maintain::FixedClock::new(COLD_NOW_NS);
-        let worker = ravel_maintain::WorkerSet::with_defaults(COLD_NOW_NS)
-            .with_process_id(Uuid::from_u128(1));
-        let live = worker.solo_live_set();
-        let safety = crate::maintain::MaintenanceSafetyMetrics::default();
-        let ownership = crate::maintain::MaintenanceOwnershipMetrics::new(3);
-        let mut maintain_memo = ravel_maintain::scan::MaintainMemo::with_default_interval();
-        crate::maintain::run_tick_with_clock(
-            &clock,
-            store.as_ref(),
-            &tenant,
-            &ravel_maintain::CompactorConfig::default(),
-            &ravel_maintain::RetentionConfig::default(),
-            1,
-            &mut maintain_memo,
-            &safety,
-            &ownership,
-            &worker,
-            &live,
-        )
-        .await;
+        let safety = run_maintain_tick(store.as_ref(), &tenant, COLD_NOW_NS).await;
 
         for reason in crate::maintain::AlertRetentionSkipReason::ALL {
             assert_eq!(safety.alert_retention_skipped(reason), 0, "{reason:?}");
@@ -4426,9 +4406,14 @@ mod tick_tests {
             "the sweep deletes exactly the four expired records that are no identity's latest"
         );
         assert_eq!(
-            count(data_prefix).await,
+            count(data_prefix.clone()).await,
             6,
             "each deleted record's data object goes with it"
+        );
+        assert_eq!(
+            count(format!("quarantine/{data_prefix}")).await,
+            0,
+            "the retention sweep deletes the data objects itself, not the orphan sweep"
         );
 
         store
@@ -4455,6 +4440,206 @@ mod tick_tests {
                 record.rule_id
             );
         }
+        assert_eq!(cold, unswept);
+    }
+
+    /// One maintain tick for `tenant` at `now_ns` under the default configs,
+    /// returning the safety metrics it counted into.
+    async fn run_maintain_tick(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        now_ns: i64,
+    ) -> crate::maintain::MaintenanceSafetyMetrics {
+        let clock = ravel_maintain::FixedClock::new(now_ns);
+        let worker =
+            ravel_maintain::WorkerSet::with_defaults(now_ns).with_process_id(Uuid::from_u128(1));
+        let live = worker.solo_live_set();
+        let safety = crate::maintain::MaintenanceSafetyMetrics::default();
+        let ownership = crate::maintain::MaintenanceOwnershipMetrics::new(3);
+        let mut maintain_memo = ravel_maintain::scan::MaintainMemo::with_default_interval();
+        crate::maintain::run_tick_with_clock(
+            &clock,
+            store,
+            tenant,
+            &ravel_maintain::CompactorConfig::default(),
+            &ravel_maintain::RetentionConfig::default(),
+            1,
+            &mut maintain_memo,
+            &safety,
+            &ownership,
+            &worker,
+            &live,
+        )
+        .await;
+        safety
+    }
+
+    /// The keep set's watermark end to end, through a stale memo written before
+    /// the newest records landed.
+    ///
+    /// The tick runs at half past an hour, so the expiry floor falls inside
+    /// its hour and that hour holds expired records. Three identities:
+    ///
+    /// - `a`: firing at -100d, resolved at -99d. In the memo.
+    /// - `e`: firing and resolved in the expiry floor's hour, both before the
+    ///   floor, so both expired. Absent from the memo, which predates them.
+    /// - `d`: firing at -2d. Absent from the memo.
+    ///
+    /// A memo whose watermark is one hour below the floor makes the tick skip
+    /// with `watermark_below_floor` and delete nothing. Rewritten with its
+    /// watermark at the floor's hour, the sweep deletes `a`'s firing record
+    /// (below the watermark, expired, not in the keep set) and keeps both of
+    /// `e`'s records, which sit at the watermark hour, so the cold-start fold
+    /// still equals the unswept fold.
+    ///
+    /// Watch it fail: in `ravel_maintain::alert_retention::sweep_alert_retention`,
+    /// change `parsed.ingest_hour_bucket >= keep.watermark_hour()` to `>`, and
+    /// both of `e`'s records are deleted (two commit records left, not four).
+    /// Or remove the `WatermarkBelowFloor` early return in
+    /// `maintain::alert_keep_set`, and the first tick counts no skip and
+    /// deletes `a`'s firing record.
+    #[tokio::test]
+    async fn a_stale_memo_keeps_expired_records_at_its_watermark_and_below_the_floor_skips() {
+        const NS_PER_DAY: i64 = 24 * 60 * 60 * NS_PER_SEC;
+        const STALE_NOW_NS: i64 = 1_800_000_000 * NS_PER_SEC + 30 * 60 * NS_PER_SEC;
+
+        let expiry_floor =
+            STALE_NOW_NS - ravel_maintain::CompactorConfig::default().alert_retention_window_ns;
+        let floor_hour = hour_bucket(expiry_floor);
+        let floor_hour_start = i64::from(floor_hour) * NS_PER_HOUR;
+        assert!(
+            floor_hour_start < expiry_floor,
+            "the floor's hour must hold time before the floor"
+        );
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let ev = evaluator(Arc::clone(&store), TestClock::at(STALE_NOW_NS));
+        let tenant = ev.tenant;
+
+        let rule = |id: &str| Rule {
+            rule_id: id.to_string(),
+            ..threshold_rule()
+        };
+        let at = |days: i64| STALE_NOW_NS - days * NS_PER_DAY;
+        let (a, e, d) = (rule("a"), rule("e"), rule("d"));
+        let a_id = compute_alert_id(&a.rule_id, &a.labels);
+        let e_id = compute_alert_id(&e.rule_id, &e.labels);
+        seed_alert_history(
+            &ev,
+            &[
+                build_transition_record(&a, AlertState::Firing, 1, at(100)),
+                build_transition_record(&a, AlertState::Resolved, 1, at(99)),
+            ],
+        )
+        .await;
+        let stale_records = ev.load_latest_records().await.expect("stale fold");
+        seed_alert_history_from(
+            &ev,
+            &[
+                build_transition_record(
+                    &e,
+                    AlertState::Firing,
+                    1,
+                    floor_hour_start + 5 * 60 * NS_PER_SEC,
+                ),
+                build_transition_record(
+                    &e,
+                    AlertState::Resolved,
+                    1,
+                    floor_hour_start + 10 * 60 * NS_PER_SEC,
+                ),
+                build_transition_record(&d, AlertState::Firing, 1, at(2)),
+            ],
+            20_000,
+        )
+        .await;
+
+        let commit_prefix =
+            keys::commit_shard_prefix(&tenant, Signal::Alerts, ALERT_SHARD).expect("prefix");
+        let data_prefix = format!("t/{}/a/l0/", tenant.to_hex());
+        let count = |prefix: String| {
+            let store = Arc::clone(&store);
+            async move {
+                ravel_object_store::list_all(store.as_ref(), &prefix)
+                    .await
+                    .expect("list")
+                    .len()
+            }
+        };
+        assert_eq!(count(commit_prefix.clone()).await, 5);
+        assert_eq!(count(data_prefix.clone()).await, 5);
+
+        let unswept = ev.load_latest_records().await.expect("pre-sweep fold");
+        assert_eq!(unswept.len(), 3, "three identities fold");
+        assert!(
+            stale_records.contains_key(&a_id) && !stale_records.contains_key(&e_id),
+            "the stale memo holds a and not e"
+        );
+        let write_memo = |watermark_hour: u32| {
+            let store = Arc::clone(&store);
+            let records = stale_records.clone();
+            async move {
+                write_alert_state_memo(
+                    store.as_ref(),
+                    &tenant,
+                    &AlertStateMemo {
+                        watermark_hour,
+                        records,
+                    },
+                )
+                .await
+                .expect("write memo");
+            }
+        };
+
+        write_memo(floor_hour - 1).await;
+        let safety = run_maintain_tick(store.as_ref(), &tenant, STALE_NOW_NS).await;
+        for reason in crate::maintain::AlertRetentionSkipReason::ALL {
+            let expected =
+                u64::from(reason == crate::maintain::AlertRetentionSkipReason::WatermarkBelowFloor);
+            assert_eq!(
+                safety.alert_retention_skipped(reason),
+                expected,
+                "{reason:?}"
+            );
+        }
+        assert_eq!(
+            count(commit_prefix.clone()).await,
+            5,
+            "a watermark below the floor deletes nothing"
+        );
+        assert_eq!(count(data_prefix.clone()).await, 5);
+
+        write_memo(floor_hour).await;
+        let safety = run_maintain_tick(store.as_ref(), &tenant, STALE_NOW_NS).await;
+        for reason in crate::maintain::AlertRetentionSkipReason::ALL {
+            assert_eq!(safety.alert_retention_skipped(reason), 0, "{reason:?}");
+        }
+        assert_eq!(
+            count(commit_prefix).await,
+            4,
+            "only a's firing record is deleted: e's expired records sit at the watermark hour"
+        );
+        assert_eq!(count(data_prefix.clone()).await, 4);
+        assert_eq!(
+            count(format!("quarantine/{data_prefix}")).await,
+            0,
+            "the retention sweep deletes the data object itself"
+        );
+
+        store
+            .delete(&crate::alert_state_memo::alert_state_memo_key(&tenant))
+            .await
+            .expect("delete memo");
+        let cold = evaluator(Arc::clone(&store), TestClock::at(STALE_NOW_NS))
+            .fold_latest(None, STALE_NOW_NS)
+            .await
+            .expect("cold-start fold");
+        assert_eq!(
+            cold.get(&e_id).map(|r| r.state),
+            Some(AlertState::Resolved),
+            "e's newest record survives the sweep"
+        );
         assert_eq!(cold, unswept);
     }
 
