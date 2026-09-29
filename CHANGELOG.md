@@ -542,7 +542,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `ObjectLockConfigurationNotFoundError`, or `NoSuchObjectLockConfiguration`
   for retention); any other 404, redirect, body over 1 MiB (with or without a
   `Content-Length`), `ObjectLockConfiguration` whose `ObjectLockEnabled` is
-  missing, empty, or repeated, or `?versions` page without `IsTruncated` or
+  missing, empty, repeated, or anything but exactly `Enabled`, or `?versions`
+  page without `IsTruncated` or
   with a version lacking
   a `VersionId` is `Unknown`. `object-retention` samples the
   newest (by `LastModified`) current and noncurrent version under each
