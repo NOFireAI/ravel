@@ -136,7 +136,11 @@ const MARKER_FEW: &str = "MARKERFEW";
 /// one segment actually survives, so the scan opens exactly one object and the
 /// other `SEGMENTS - 1` are never opened at all. Bloom is probabilistic, so
 /// the word is one no other block of this deterministic corpus false-matches;
-/// the `blocks_scanned == 1` pin below is what checks it.
+/// the `blocks_scanned == 1` pin below is what checks it. The token was chosen
+/// to avoid a bloom collision at the current filter sizing (RLOG v5's exact
+/// sizing raised the false-positive rate enough that the earlier token
+/// collided), so when that pin fails after a sizing change, read it as a
+/// sizing signal first and only then pick another token.
 const MARKER_RARE: &str = "MARKERSOLE";
 
 /// The declared numeric column every record carries: `code = <block index>`
