@@ -313,6 +313,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The maintain role reaps dead query-worker records under
+  `sys/query/workers/`** (issue #1828). The query coordinator used to delete
+  them under a role with no delete grant, so every delete was refused, logged
+  as one warning per key per tick, and the prefix grew without bound. One
+  maintain process per deployment now lists the prefix on its cycle and
+  deletes the keys past the reap horizon; `deploy/iam/maintain.json` gains
+  list and delete on `sys/query/workers/*`, and `deploy/iam/query.json` is
+  unchanged. A draining coordinator overwrites its own record with a stamp no
+  reader accepts as live instead of deleting it. A reap delete refused as
+  access denied is logged once per pass at error and ends that pass.
 - **`ravel-cli load --signal logs` loads a dictionary-encoded hex `trace_id` or
   `span_id` column** (issue #2116). A default Parquet writer dictionary-encodes
   string columns, and the columnar logs path refused such an id column with

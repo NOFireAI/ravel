@@ -57,19 +57,22 @@ grants below are what remains deletable after that deny applies.
 
 - **Gateway** (`gateway.json`): no delete grant at all. The ingest path writes
   and reads objects; it deletes nothing.
-- **Query** (`query.json`): no delete grant at all. The read path deletes
-  nothing, but the query worker heartbeat does: it deletes its own and dead
-  workers' keys under `sys/query/workers/`, and every such delete is refused
-  under this template (issue #1995).
+- **Query** (`query.json`): no delete grant at all, and nothing on the query
+  path deletes. A draining query worker overwrites its own
+  `sys/query/workers/` record with a stamp no reader accepts as live, and the
+  maintain role reaps dead records (issue #1828).
 - **Admin** (`admin.json`): `AdminQualifyDelete` grants delete on
   `sys/qualify/*` only.
 - **Maintain** (`maintain.json`): `MaintainDelete` grants delete on
   `t/*/*/l0/*`, `t/*/*/c/*`, `t/*/*/l1/*`, `t/*/*/idem/*`, `t/*/u/*/0001/*`,
   `t/*/*/del/*.dreq`, `t/*/catalog/*/snap/*`, `t/*/catalog/*/idx/*`,
-  `sys/maintain/workers/*`, and `quarantine/t/*/*/l0/*`. These are the objects
-  the compaction, supersession, retention, erasure-request,
-  unreferenced-catalog, dead-worker reap, and quarantine-reaper sweeps
-  physically remove.
+  `sys/maintain/workers/*`, `sys/query/workers/*`, and
+  `quarantine/t/*/*/l0/*`. These are the objects the compaction,
+  supersession, retention, erasure-request, unreferenced-catalog, dead-worker
+  reap, and quarantine-reaper sweeps physically remove. The query-worker reap
+  runs on one maintain process per deployment and judges each key by its LIST
+  metadata, so `MaintainList` also carries `sys/query/workers/*` and
+  `MaintainRead` does not.
   The catalog half of that list also needs reads, which are easy to miss
   because two of the three fail silently rather than refusing the pass:
   `MaintainRead` carries `t/*/catalog/*/HEAD` (the sweep resolves what is
