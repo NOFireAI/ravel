@@ -363,19 +363,24 @@ columns:
     enc=for_bitpack pages=3 stored_bytes=12 uncompressed_bytes=12
 ```
 
-The figures reconcile exactly. The `sections` bytes, including the `FOOTER`
-and `TRAILER` rows, plus `gap_bytes` (bytes no section covers) sum to
-`total_bytes`. `page_stored_bytes`, the sum of every column's `stored_bytes`,
-equals the `BLOCKS` section length. A section's `uncompressed_bytes` is its
+The figures reconcile exactly, per object, or the command prints no report.
+The `sections` bytes, including the `FOOTER` and `TRAILER` rows, plus
+`gap_bytes` (bytes no section covers) sum to `total_bytes`, and
+`page_stored_bytes`, the sum of every column's `stored_bytes`, equals the
+`BLOCKS` section length. An object that breaks either, for example two
+sections whose byte ranges overlap, is refused with an error naming the object
+and the two figures that differ, and the command exits non-zero. A section's `uncompressed_bytes` is its
 length before whole-section zstd, and equals `bytes` for a `comp=none`
 section. A column's `stored_bytes` is its page bytes as stored (a page of at least
 512 bytes is stored zstd-compressed when that is smaller) and
 `uncompressed_bytes` is the same pages before compression, so the `body` column
 above shows 4144 bytes of text stored in 159. Fixed columns appear by name and
 dynamic columns by their FIELD_DIR name and type; a column PAGE_DIR has no
-chunk for is not listed. A column that
-is absent from some rows carries two pages per block, a presence bitmap
-(`enc=bitmap`) and the values, so its `pages` count is twice the block count.
+chunk for is not listed. A column stores one value page per block that
+carries it, and no page for a block where it is absent from every row. A
+block where it is present on only some rows adds a presence bitmap page
+(`enc=bitmap`) before that value page, so its `pages` count is the number of
+blocks carrying it plus the number of those where it is only partly present.
 
 ## `commit decode`: what a commit record says
 

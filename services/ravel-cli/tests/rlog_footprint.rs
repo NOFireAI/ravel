@@ -16,6 +16,7 @@ use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use ravel_cli::load;
+use ravel_cli::maintain::{ClaimOptions, SignalArg, compact_tenant};
 use ravel_cli::rlog_footprint;
 use ravel_cli::store::{StoreKind, StoreSelection};
 use ravel_ingest::Clock;
@@ -361,27 +362,22 @@ impl Clock for FixedClock {
 
 const BASE_NS: i64 = 1_700_000_000_000_000_000;
 
-/// `--tenant` resolves every object the loader wrote, and each object costs
-/// exactly four GETs whose bytes are the trailer, the footer, FIELD_DIR and
-/// PAGE_DIR: no page body is fetched.
-#[tokio::test]
-async fn tenant_footprint_reads_only_directories() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let instrumented = Arc::new(InstrumentedStore::new(MemoryStore::new()));
-    let metrics = instrumented.metrics();
-    let store: Arc<dyn ObjectStoreBackend> = instrumented;
+const NS_PER_HOUR: i64 = 3_600_000_000_000;
 
-    let src = dir.path().join("src.parquet");
-    let ts: ArrayRef = Arc::new(Int64Array::from(vec![BASE_NS, BASE_NS + 1, BASE_NS + 2]));
-    let body: ArrayRef = Arc::new(StringArray::from(vec!["x", "y", "z"]));
+/// Loads one parquet row per timestamp in `ts`, each its own flush and its own
+/// L0 object, with the loader's clock at `now_ns`.
+async fn load_rows(store: &Arc<dyn ObjectStoreBackend>, dir: &Path, ts: &[i64], now_ns: i64) {
+    let src = dir.join(format!("src-{now_ns}.parquet"));
+    let bodies: Vec<String> = ts.iter().map(|t| format!("row {t}")).collect();
+    let ts: ArrayRef = Arc::new(Int64Array::from(ts.to_vec()));
+    let body: ArrayRef = Arc::new(StringArray::from(bodies));
     let batch = RecordBatch::try_from_iter(vec![("ts", ts), ("body", body)]).expect("batch");
     write_parquet(&src, &batch);
     let mapping =
         load::parse_mapping("ts_column = \"ts\"\nts_unit = \"nanos\"\nbody_column = \"body\"\n")
             .expect("mapping");
-    // One row per batch: every row is its own flush and its own object.
     load::load(
-        Arc::clone(&store),
+        Arc::clone(store),
         &src,
         "acme",
         &mapping,
@@ -389,36 +385,98 @@ async fn tenant_footprint_reads_only_directories() {
         1,
         None,
         1,
-        BASE_NS,
-        Arc::new(FixedClock(BASE_NS)),
+        now_ns,
+        Arc::new(FixedClock(now_ns)),
     )
     .await
     .expect("load");
+}
 
+/// Sorted data object keys under one level directory of the tenant's logs.
+async fn level_keys(store: &dyn ObjectStoreBackend, level_dir: &str) -> Vec<String> {
     let prefix = format!(
-        "t/{}/{}/l0/",
+        "t/{}/{}/{level_dir}/",
         TenantId::new("acme").hash().to_hex(),
         Signal::Logs.key_prefix()
     );
-    let listed = list_all(store.as_ref(), &prefix).await.expect("list");
-    let mut data_keys: Vec<String> = listed
+    let listed = list_all(store, &prefix).await.expect("list");
+    let mut keys: Vec<String> = listed
         .iter()
         .map(|m| m.key.clone())
-        .filter(|k| ravel_commit::keys::parse_data_key(k).is_ok())
+        .filter(|k| {
+            ravel_commit::keys::parse_data_key(k).is_ok()
+                || ravel_commit::keys::parse_l1_part_key(k).is_ok()
+        })
         .collect();
-    data_keys.sort();
-    assert_eq!(data_keys.len(), 3);
+    keys.sort();
+    keys
+}
+
+/// `--tenant` resolves every live object: the L1 segment a compaction wrote
+/// in place of its L0 inputs, and the L0 object written after it. Each object
+/// costs exactly four GETs whose bytes are the trailer, the footer, FIELD_DIR
+/// and PAGE_DIR: no page body is fetched.
+#[tokio::test]
+async fn tenant_footprint_reads_only_directories() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let instrumented = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+    let metrics = instrumented.metrics();
+    let store: Arc<dyn ObjectStoreBackend> = instrumented;
+
+    // Three L0 objects in one hour, compacted into one L1 segment once sealed.
+    load_rows(
+        &store,
+        dir.path(),
+        &[BASE_NS, BASE_NS + 1, BASE_NS + 2],
+        BASE_NS,
+    )
+    .await;
+    let compacted = compact_tenant(
+        Arc::clone(&store),
+        StoreSelection::explicit(StoreKind::Memory),
+        "acme",
+        SignalArg::Logs,
+        Some(1),
+        None,
+        None,
+        false,
+        Some(0),
+        None,
+        None,
+        None,
+        1,
+        BASE_NS + 2 * NS_PER_HOUR,
+        &ClaimOptions::fresh(),
+    )
+    .await
+    .expect("compact");
+    assert_eq!(compacted.parts_written, 1);
+    let l1 = level_keys(store.as_ref(), "l1").await;
+    assert_eq!(l1.len(), 1);
+
+    // One more L0 object, three hours later, which nothing compacts.
+    let later = BASE_NS + 3 * NS_PER_HOUR;
+    load_rows(&store, dir.path(), &[later], later).await;
+    let l0 = level_keys(store.as_ref(), "l0").await;
+    assert_eq!(
+        l0.len(),
+        4,
+        "the three compacted inputs stay listed until GC"
+    );
 
     let keys = rlog_footprint::tenant_object_keys(
         Arc::clone(&store),
         StoreSelection::explicit(StoreKind::Memory),
         "acme",
         1,
-        BASE_NS,
+        later,
     )
     .await
     .expect("resolve");
-    assert_eq!(keys, data_keys);
+    assert_eq!(keys.len(), 2, "{keys:?}");
+    assert!(keys.contains(&l1[0]), "{keys:?}");
+    let live_l0: Vec<&String> = keys.iter().filter(|k| l0.contains(k)).collect();
+    assert_eq!(live_l0.len(), 1, "{keys:?}");
 
     let mut expected_bytes = 0u64;
     let mut sizes = 0u64;
@@ -442,15 +500,267 @@ async fn tenant_footprint_reads_only_directories() {
     }
 
     let before = metrics.snapshot().get;
-    let report = rlog_footprint::footprint_targets(store.as_ref(), &keys)
+    let report = rlog_footprint::footprint_keys(store.as_ref(), &keys)
         .await
         .expect("footprint");
     let after = metrics.snapshot().get;
     assert_eq!(after.calls - before.calls, 4 * keys.len() as u64);
     assert_eq!(after.bytes - before.bytes, expected_bytes);
-    assert_eq!(report.total.object_count, 3);
-    assert_eq!(report.total.record_count, 3);
+    assert_eq!(report.total.object_count, 2);
+    assert_eq!(report.total.record_count, 4);
     assert_eq!(report.total.total_bytes, sizes);
+    let levels: BTreeMap<&str, (u32, u64)> = report
+        .objects
+        .iter()
+        .map(|o| (o.key.as_str(), (o.level, o.footprint.record_count)))
+        .collect();
+    assert_eq!(
+        levels[l1[0].as_str()],
+        (1, 3),
+        "the L1 segment holds all three inputs"
+    );
+    assert_eq!(levels[live_l0[0].as_str()], (0, 1));
+}
+
+/// A key resolved from the catalog is fetched from the store even when a local
+/// file sits at the same path; only an explicit target reads local disk.
+#[tokio::test]
+async fn catalog_keys_are_read_from_the_store_not_local_disk() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let a = object_a();
+    let b = object_b();
+    let path = dir.path().join("same.rlog");
+    std::fs::write(&path, &b).expect("write b");
+    let key = path.to_str().expect("utf-8 path").to_string();
+    let store = MemoryStore::new();
+    store
+        .put(
+            &key,
+            bytes::Bytes::from(a.clone()),
+            ravel_object_store::PutOptions::default(),
+        )
+        .await
+        .expect("put a");
+
+    let from_store = rlog_footprint::footprint_keys(&store, std::slice::from_ref(&key))
+        .await
+        .expect("keys");
+    assert_eq!(from_store.total.total_bytes, a.len() as u64);
+    assert_eq!(from_store.total.record_count, 12);
+
+    let from_disk = rlog_footprint::footprint_targets(&store, std::slice::from_ref(&key))
+        .await
+        .expect("targets");
+    assert_eq!(from_disk.total.total_bytes, b.len() as u64);
+    assert_eq!(from_disk.total.record_count, 6);
+}
+
+/// The object's footer length, from its trailer.
+fn footer_len(bytes: &[u8]) -> usize {
+    u32::from_le_bytes(
+        bytes[bytes.len() - 16..bytes.len() - 12]
+            .try_into()
+            .expect("4 bytes"),
+    ) as usize
+}
+
+/// `bytes` with its section area kept, `appended` written after it, and a
+/// footer rewritten by `edit`, which receives the offset `appended` starts at.
+fn rewrite_footer(
+    bytes: &[u8],
+    appended: &[u8],
+    edit: impl FnOnce(&mut footer::LogFooter, u64),
+) -> Vec<u8> {
+    let mut f = footer::open(bytes).expect("open");
+    let footer_start = bytes.len() - 16 - footer_len(bytes);
+    let mut out = bytes[..footer_start].to_vec();
+    out.extend_from_slice(appended);
+    edit(&mut f, footer_start as u64);
+    footer::write_footer_and_trailer(&mut out, &f);
+    footer::open(&out).expect("the rewritten object still opens");
+    out
+}
+
+/// Index into `f.sections` of a section the footprint does not decode
+/// (STREAM_DIR, SKIP_IDX or BLOOM) that starts past 0 and is directly followed
+/// by another section, so growing or shifting it by one byte overlaps a
+/// neighbour while staying inside the section area.
+fn unread_inner_section(f: &footer::LogFooter) -> usize {
+    f.sections
+        .iter()
+        .position(|s| {
+            [kind::STREAM_DIR, kind::SKIP_IDX, kind::BLOOM].contains(&s.kind)
+                && s.offset > 0
+                && s.len > 0
+                && f.sections.iter().any(|n| n.offset == s.offset + s.len)
+        })
+        .expect("an unread section with a successor")
+}
+
+async fn footprint_of(bytes: &[u8]) -> anyhow::Result<rlog_footprint::FootprintReport> {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("o.rlog");
+    std::fs::write(&path, bytes).expect("write");
+    let target = path.to_str().expect("utf-8 path").to_string();
+    rlog_footprint::footprint_targets(&MemoryStore::new(), &[target]).await
+}
+
+fn reconcile_error(err: &anyhow::Error) -> &rlog_footprint::ReconcileError {
+    err.downcast_ref::<rlog_footprint::ReconcileError>()
+        .unwrap_or_else(|| panic!("not a ReconcileError: {err:#}"))
+}
+
+/// A section grown one byte into its neighbour makes the section bytes sum to
+/// one more than the object size, and is refused naming both figures.
+#[tokio::test]
+async fn footprint_refuses_a_section_grown_into_its_neighbour() {
+    let a = object_a();
+    let edited = rewrite_footer(&a, &[], |f, _| {
+        let i = unread_inner_section(f);
+        f.sections[i].len += 1;
+    });
+    let err = footprint_of(&edited).await.expect_err("must refuse");
+    let total = edited.len() as u64;
+    match reconcile_error(&err) {
+        rlog_footprint::ReconcileError::Sections {
+            accounted_bytes,
+            object_bytes,
+            ..
+        } => {
+            assert_eq!(*accounted_bytes, total + 1);
+            assert_eq!(*object_bytes, total);
+        }
+        other => panic!("wrong variant: {other:?}"),
+    }
+    let text = err.to_string();
+    assert!(
+        text.contains(&format!("account for {} bytes", total + 1)),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("the object is {total} bytes")),
+        "{text}"
+    );
+    assert!(text.contains("o.rlog"), "{text}");
+}
+
+/// A section shifted one byte back overlaps its predecessor and leaves a
+/// one-byte hole, so the section lengths alone still sum to the object size;
+/// the overlap is counted once in the uncovered bytes and the object is
+/// refused.
+#[tokio::test]
+async fn footprint_refuses_sections_that_overlap_at_equal_lengths() {
+    let a = object_a();
+    let edited = rewrite_footer(&a, &[], |f, _| {
+        let i = unread_inner_section(f);
+        f.sections[i].offset -= 1;
+    });
+    let f = footer::open(&edited).expect("open");
+    let total = edited.len() as u64;
+    let lens: u64 = f.sections.iter().map(|s| s.len).sum::<u64>() + footer_len(&edited) as u64 + 16;
+    assert_eq!(lens, total, "the lengths alone reconcile");
+    let err = footprint_of(&edited).await.expect_err("must refuse");
+    match reconcile_error(&err) {
+        rlog_footprint::ReconcileError::Sections {
+            accounted_bytes,
+            object_bytes,
+            ..
+        } => {
+            assert_eq!(*accounted_bytes, total + 1);
+            assert_eq!(*object_bytes, total);
+        }
+        other => panic!("wrong variant: {other:?}"),
+    }
+}
+
+/// A PAGE_DIR whose page lengths sum to one byte less than BLOCKS is refused
+/// naming both figures. The replacement PAGE_DIR is appended after the section
+/// area, so the section reconciliation still holds (the old copy counts as
+/// uncovered bytes) and only the page check can fire.
+#[tokio::test]
+async fn footprint_refuses_pages_that_do_not_sum_to_blocks() {
+    let a = object_a();
+    let f = footer::open(&a).expect("open");
+    let blocks_len = f.section(kind::BLOCKS).expect("BLOCKS").len;
+    let raw = read_section(
+        &a,
+        f.section(kind::PAGE_DIR).expect("PAGE_DIR"),
+        &RlogConfig::default(),
+    )
+    .expect("read PAGE_DIR");
+    let mut dir = PageDir::decode(&raw).expect("decode");
+    let page = dir
+        .groups
+        .iter_mut()
+        .flat_map(|g| g.chunks.iter_mut())
+        .flat_map(|c| c.pages.iter_mut())
+        .find(|p| p.comp == footer::COMP_NONE && p.len > 1)
+        .expect("an uncompressed page");
+    page.len -= 1;
+    page.uncomp_len -= 1;
+    let encoded = dir.encode();
+    let edited = rewrite_footer(&a, &encoded, |f, at| {
+        let desc = f
+            .sections
+            .iter_mut()
+            .find(|s| s.kind == kind::PAGE_DIR)
+            .expect("PAGE_DIR");
+        desc.offset = at;
+        desc.len = encoded.len() as u64;
+        desc.uncomp_len = encoded.len() as u64;
+        desc.comp = footer::COMP_NONE;
+        desc.crc32c = crc32c::crc32c(&encoded);
+    });
+    let err = footprint_of(&edited).await.expect_err("must refuse");
+    match reconcile_error(&err) {
+        rlog_footprint::ReconcileError::Pages {
+            page_bytes,
+            blocks_bytes,
+            ..
+        } => {
+            assert_eq!(*page_bytes, blocks_len - 1);
+            assert_eq!(*blocks_bytes, blocks_len);
+        }
+        other => panic!("wrong variant: {other:?}"),
+    }
+    let text = err.to_string();
+    assert!(
+        text.contains(&format!(
+            "store {} bytes but BLOCKS is {blocks_len} bytes",
+            blocks_len - 1
+        )),
+        "{text}"
+    );
+}
+
+/// Page counts for a column absent from one block, fully present in one and
+/// partly present in two: one value page per block carrying it, plus one
+/// presence page per block where it is only partly present.
+#[tokio::test]
+async fn partially_present_column_pages_count_value_and_presence_pages() {
+    let cfg = RlogConfig {
+        block_target_records: 3,
+        ..RlogConfig::default()
+    };
+    let mut w = RlogWriter::new(cfg, identity(3));
+    // Blocks of three rows: none, rows 3 and 4, all of 6..=8, row 9.
+    let present = [3i64, 4, 6, 7, 8, 9];
+    for i in 0..12i64 {
+        let mut attrs = vec![("n".into(), AttrValue::I64(i))];
+        if present.contains(&i) {
+            attrs.push(("zone".into(), AttrValue::Str("z1".into())));
+        }
+        w.push(rec(3, 9_000 + i, format!("c{i}"), attrs))
+            .expect("push");
+    }
+    let bytes = w.finish().expect("finish");
+    assert_eq!(footer::open(&bytes).expect("open").block_count, 4);
+    let report = footprint_of(&bytes).await.expect("footprint");
+    let zone = &report.total.columns["zone:str"];
+    // Three blocks carry it, two of those partly: 3 + 2.
+    assert_eq!(zone.total.pages, 5);
+    assert_eq!(zone.encodings["bitmap"].pages, 2);
+    assert_eq!(report.total.columns["n:i64"].total.pages, 4);
 }
 
 fn write_parquet(path: &Path, batch: &RecordBatch) {
