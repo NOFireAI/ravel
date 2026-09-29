@@ -198,6 +198,33 @@ impl Fixture {
         }
     }
 
+    /// Write `bytes` at `key` and describe them with the `size` and
+    /// `footer_len` given, whatever the bytes hold. The manifest pins the
+    /// ETag alone.
+    pub(crate) async fn put_raw(
+        &self,
+        memory: &MemoryStore,
+        key: &str,
+        bytes: Bytes,
+        size: u64,
+        footer_len: u32,
+    ) -> ParquetFile {
+        let put = memory
+            .put(key, bytes, PutOptions::default())
+            .await
+            .expect("put");
+        ParquetFile {
+            profile: PROFILE.to_string(),
+            bucket: BUCKET.to_string(),
+            key: key.as_bytes().to_vec(),
+            size,
+            etag: put.etag.0,
+            version: String::new(),
+            row_count: 0,
+            footer_len,
+        }
+    }
+
     fn pinned(&self, file: ParquetFile) -> Arc<PinnedFile> {
         Arc::new(PinnedFile {
             file,
