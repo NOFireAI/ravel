@@ -420,7 +420,7 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
         stats.blocks_after_postings = candidates.len() as u32;
 
         // Bloom pruning. A parse failure, including a covered-column list that
-        // fails validation, degrades to no bloom pruning.
+        // fails its crc or its validation, degrades to no bloom pruning.
         let bloom_bytes = self.section_stored(&self.bloom)?;
         let bloom_section = match RlogBloomSection::parse(&bloom_bytes, &self.field_dir) {
             Ok(s) => Some(s),
@@ -720,12 +720,13 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
     }
 
     /// Slices and crc-verifies the POSTINGS section's stored bytes before
-    /// [`PostingsSection::parse`] sees them. Unlike BLOOM and BLOCKS, whose
-    /// per-entry/per-block crc is the only checksum ever consulted (a
-    /// selective scan never reads them whole), the POSTINGS sparse-index
-    /// header sits in front of every probe and is otherwise unchecksummed on
-    /// this access path: `desc.crc32c` is computed and stored by the writer
-    /// over the whole section (same as STREAM_DIR/FIELD_DIR/SKIP_IDX) but was
+    /// [`PostingsSection::parse`] sees them. Unlike BLOCKS, whose per-page and
+    /// per-block crcs are the checksums consulted, and BLOOM, whose
+    /// covered-column list and entries each carry their own crc, the POSTINGS
+    /// sparse-index header sits in front of every probe and is otherwise
+    /// unchecksummed on this access path: `desc.crc32c` is computed and stored
+    /// by the writer over the whole section (same as STREAM_DIR/FIELD_DIR/
+    /// SKIP_IDX) but was
     /// never consulted here, so a single corrupted header byte that
     /// redirects a probe to a different, still crc-valid term block passed
     /// silently. Checking it costs no fetch: the whole section is

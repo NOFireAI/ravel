@@ -194,11 +194,12 @@ impl RlogWriter {
         }
     }
 
-    /// Test seam: leaves the named dynamic string columns out of BLOOM, both
-    /// from the covered-column list and from every filter, so a reader test can
-    /// hold an object whose coverage is narrower than the default.
-    #[doc(hidden)]
-    pub fn with_bloom_uncovered_attrs_for_tests(mut self, names: Vec<String>) -> Self {
+    /// Test seam, compiled only for this crate's unit tests: leaves the named
+    /// dynamic string columns out of BLOOM, both from the covered-column list
+    /// and from every filter, so a reader test can hold an object whose
+    /// coverage is narrower than the default.
+    #[cfg(test)]
+    pub(crate) fn with_bloom_uncovered_attrs_for_tests(mut self, names: Vec<String>) -> Self {
         self.bloom_uncovered = names;
         self
     }

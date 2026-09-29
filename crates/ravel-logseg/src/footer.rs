@@ -264,8 +264,19 @@ impl SortDescriptor {
                 p.key_columns.len()
             )));
         }
-        let mut key_columns = Vec::with_capacity(p.key_columns.len());
+        let mut key_columns: Vec<SortKeyColumn> = Vec::with_capacity(p.key_columns.len());
         for c in p.key_columns {
+            if c.name.is_empty() {
+                return Err(LogSegError::Corrupted(
+                    "footer sort key column name empty".into(),
+                ));
+            }
+            if key_columns.iter().any(|k| k.name == c.name) {
+                return Err(LogSegError::Corrupted(format!(
+                    "footer sort key column {:?} named twice",
+                    c.name
+                )));
+            }
             let ty = match pb::SortKeyColumnType::try_from(c.r#type) {
                 Ok(pb::SortKeyColumnType::Str) => SortKeyType::Str,
                 Ok(pb::SortKeyColumnType::I64) => SortKeyType::I64,
@@ -1133,6 +1144,63 @@ mod tests {
             obj[i] ^= xor | 1;
 
             prop_assert!(matches!(open(&obj), Err(LogSegError::Corrupted(_))));
+        }
+    }
+
+    fn key(name: &str, ty: SortKeyType) -> SortKeyColumn {
+        SortKeyColumn {
+            name: name.into(),
+            ty,
+        }
+    }
+
+    fn descriptor(key_columns: Vec<SortKeyColumn>) -> pb::SortDescriptor {
+        SortDescriptor {
+            bucket_width: SortBucketWidth::OneHour,
+            key_columns,
+        }
+        .to_proto()
+    }
+
+    /// A sort key names each column once and names it with a nonempty string.
+    /// A repeat is refused whether or not its type differs, and an empty name
+    /// is refused in any position; distinct names of one type still decode.
+    #[test]
+    fn sort_descriptor_refuses_duplicate_and_empty_key_names() {
+        let ok = descriptor(vec![
+            key("region", SortKeyType::Str),
+            key("zone", SortKeyType::Str),
+        ]);
+        let decoded = SortDescriptor::from_proto(ok).expect("distinct names decode");
+        assert_eq!(decoded.key_columns.len(), 2);
+
+        let refused = [
+            (
+                vec![
+                    key("region", SortKeyType::Str),
+                    key("region", SortKeyType::Str),
+                ],
+                "named twice",
+            ),
+            (
+                vec![
+                    key("region", SortKeyType::Str),
+                    key("status", SortKeyType::I64),
+                    key("region", SortKeyType::I64),
+                ],
+                "named twice",
+            ),
+            (vec![key("", SortKeyType::Str)], "name empty"),
+            (
+                vec![key("region", SortKeyType::Str), key("", SortKeyType::Bool)],
+                "name empty",
+            ),
+        ];
+        for (columns, needle) in refused {
+            match SortDescriptor::from_proto(descriptor(columns.clone())) {
+                Err(LogSegError::Corrupted(m)) => assert!(m.contains(needle), "{m}"),
+                other => panic!("{columns:?}: expected Corrupted({needle}), got {other:?}"),
+            }
         }
     }
 }
