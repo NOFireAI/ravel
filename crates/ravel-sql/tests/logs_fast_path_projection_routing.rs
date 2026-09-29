@@ -10,8 +10,9 @@
 //!   about BLOCKS; none is about COLUMNS.
 //! - Before #862 that assignment implied the read: each segment went to
 //!   `LogSegmentFetcher::scan_whole_accounted_with_tenant`, one whole-object GET,
-//!   however narrow the projection. That was right under RLOG v3, where reading
-//!   every block meant needing every byte. Under v4 a block's pages sit one per
+//!   however narrow the projection. That was right before RLOG v4 (the version
+//!   that introduced PAGE_DIR), when reading every block meant needing every
+//!   byte. Since v4 a block's pages sit one per
 //!   column chunk inside its row group, and the ranged entry already fetches one
 //!   coalesced range per surviving `(row group, projected column)` from the same
 //!   `ColumnSelection` (ADR-0699 decision 5), so reading every block no longer
@@ -188,10 +189,11 @@ fn record(seg: usize, blk: usize) -> LogRecord {
 
 /// Which RLOG trailer version the fixture stamps on its objects. The
 /// column-chunk ranged read needs a PAGE_DIR (ADR-0699 decision 5), which
-/// version 4 introduced and the current version keeps; ADR-0892 deleted the
-/// version-3 reader, so a v3 object is not readable at all and the routing
-/// question does not arise for it. What is pinned instead is what it COSTS to
-/// find that out: nothing (decision 4).
+/// version 4 introduced and the current version keeps. The reader accepts
+/// exactly one trailer version (ADR-0531's pre-v1.0 window; ADR-2135 moved it
+/// to 5), so an object stamped at the version just below it is not readable at
+/// all and the routing question does not arise for it. What is pinned instead
+/// is what it COSTS to find that out: nothing (ADR-0892 decision 4).
 #[derive(Clone, Copy)]
 enum RlogVersion {
     /// The version just below the reader's (`footer::VERSION - 1`), which no
@@ -447,8 +449,8 @@ async fn measure(projection: Option<Vec<usize>>, threshold_divisor: Option<u64>)
 }
 
 /// [`measure`] over a fixture written at an explicit RLOG version, so the
-/// version gate on the ranged route (issue #862) can be exercised on both v3
-/// and current-version objects.
+/// version gate on the ranged route (issue #862) can be exercised on both
+/// previous-version and current-version objects.
 async fn measure_versioned(
     projection: Option<Vec<usize>>,
     threshold_divisor: Option<u64>,
@@ -680,14 +682,15 @@ async fn both_paths_return_identical_rows() {
 /// ZERO requests of every counted kind.
 ///
 /// This arm used to pin the opposite law -- `(SEGMENTS full, 0 suffix, 0
-/// ranges)`, the whole-object read a v3 segment kept however narrow the
-/// projection (issue #862) -- and it is rewritten rather than deleted because
-/// it is the only coverage of what a v3 object costs, and this change is
-/// exactly what alters that cost.
+/// ranges)`, the whole-object read a pre-PAGE_DIR segment kept however narrow
+/// the projection (issue #862) -- and it is rewritten rather than deleted
+/// because it is the only coverage of what an unreadable-version object costs,
+/// and this change is exactly what alters that cost.
 ///
 /// The ordering is the point, and it is not free. Removing the version gate
 /// from `PartitionCtx::open_by_column_chunk` (decision 3) removes what used to
-/// route a v3 object away from the ranged path, so without decision 4's
+/// route an unreadable-version object away from the ranged path, so without
+/// decision 4's
 /// pre-filter the object reaches `open_from_suffix` only after a suffix probe
 /// has been paid for -- and, when the probe misses the footer, a footer-range
 /// GET on top. The error is the same either way; the request count is not.
@@ -696,7 +699,7 @@ async fn both_paths_return_identical_rows() {
 ///
 /// Zero is asserted exactly, per counted kind, never as "fewer than before".
 #[tokio::test]
-async fn narrow_projection_over_v3_segment_is_refused_before_any_request() {
+async fn narrow_projection_over_previous_version_segment_is_refused_before_any_request() {
     let base = Arc::new(MemoryStore::new());
     let snapshot = build_snapshot(base.as_ref(), RlogVersion::Previous).await;
     let counting = CountingStore::new(base);
@@ -716,7 +719,7 @@ async fn narrow_projection_over_v3_segment_is_refused_before_any_request() {
     .expect("scan");
     let err = collect(Arc::clone(&plan), Arc::new(TaskContext::default()))
         .await
-        .expect_err("a v3 segment is unreadable and must not produce rows");
+        .expect_err("a previous-version segment is unreadable and must not produce rows");
 
     // The typed error, not a string match and not a generic internal error.
     assert_unsupported_version(&err, ravel_logseg::footer::VERSION - 1);
@@ -741,7 +744,7 @@ async fn narrow_projection_over_v3_segment_is_refused_before_any_request() {
 /// ADR-0892 decision 4, the PLAN path: `compute_plan_counts` must refuse an
 /// unreadable version BEFORE its plan probe, with the SAME exact-zero request
 /// law the scan-path sibling above
-/// (`narrow_projection_over_v3_segment_is_refused_before_any_request`) pins.
+/// (`narrow_projection_over_previous_version_segment_is_refused_before_any_request`) pins.
 ///
 /// The scan-path test cannot reach this guard. The predicate-free full-window
 /// whole-segment fast path skips `compute_plan_counts` entirely
@@ -755,7 +758,8 @@ async fn narrow_projection_over_v3_segment_is_refused_before_any_request() {
 /// `plan_segment` probe.
 ///
 /// Removing the `refuse_unreadable_version(seg)?` line from
-/// `compute_plan_counts` fails this test: each v3 segment's `plan_segment` then
+/// `compute_plan_counts` fails this test: each previous-version segment's
+/// `plan_segment` then
 /// issues its suffix probe (and, when the probe misses the footer, a
 /// footer-range GET) before `open_from_suffix` rejects the version, so the
 /// counters are no longer all zero. The guard-removed run was observed issuing
@@ -764,7 +768,7 @@ async fn narrow_projection_over_v3_segment_is_refused_before_any_request() {
 ///
 /// Zero is asserted exactly, per counted kind, never as "fewer than before".
 #[tokio::test]
-async fn plan_path_over_v3_segment_is_refused_before_any_request() {
+async fn plan_path_over_previous_version_segment_is_refused_before_any_request() {
     let base = Arc::new(MemoryStore::new());
     let snapshot = build_snapshot(base.as_ref(), RlogVersion::Previous).await;
     let counting = CountingStore::new(base);
@@ -789,7 +793,7 @@ async fn plan_path_over_v3_segment_is_refused_before_any_request() {
     .expect("scan");
     let err = collect(Arc::clone(&plan), Arc::new(TaskContext::default()))
         .await
-        .expect_err("a v3 segment is unreadable and must not produce rows");
+        .expect_err("a previous-version segment is unreadable and must not produce rows");
 
     // Same typed error the scan path produces, refused on the plan path here.
     assert_unsupported_version(&err, ravel_logseg::footer::VERSION - 1);
