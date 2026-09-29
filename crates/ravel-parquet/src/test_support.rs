@@ -4,7 +4,7 @@
 #![allow(clippy::expect_used)]
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
@@ -547,7 +547,8 @@ pub(crate) struct RecordingStore {
     inner: Arc<MemoryStore>,
     suffix_range: bool,
     ranges: Mutex<Vec<GetRange>>,
-    short_next: AtomicBool,
+    /// Pinned reads left until the one returned short; 0 when none is.
+    short_in: AtomicUsize,
 }
 
 impl RecordingStore {
@@ -556,14 +557,19 @@ impl RecordingStore {
             inner,
             suffix_range,
             ranges: Mutex::new(Vec::new()),
-            short_next: AtomicBool::new(false),
+            short_in: AtomicUsize::new(0),
         }
     }
 
     /// Return the next pinned read one byte short, as a store dropping the
     /// end of a body would.
     pub(crate) fn shorten_next_read(&self) {
-        self.short_next.store(true, Ordering::SeqCst);
+        self.shorten_read(1);
+    }
+
+    /// Return the `nth` pinned read from now (1 for the next) one byte short.
+    pub(crate) fn shorten_read(&self, nth: usize) {
+        self.short_in.store(nth, Ordering::SeqCst);
     }
 
     pub(crate) fn ranges(&self) -> Vec<GetRange> {
@@ -605,7 +611,12 @@ impl ObjectStoreBackend for RecordingStore {
     ) -> Result<PinnedRead, StoreError> {
         self.record(&range);
         let mut read = self.inner.get_pinned(key, range, pin).await?;
-        if self.short_next.swap(false, Ordering::SeqCst) {
+        let left = self
+            .short_in
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            });
+        if left == Ok(1) {
             let data = &mut read.outcome.data;
             *data = data.slice(..data.len().saturating_sub(1));
         }

@@ -5,20 +5,25 @@ use parquet::file::metadata::ParquetMetaData;
 use ravel_cache::CacheKey;
 
 /// Identity of one decoded footer: the tenant and the pinned identity's
-/// content hash, the same two halves a pinned [`CacheKey`] carries.
+/// content hash, the same two halves a pinned [`CacheKey`] carries, and the
+/// footer length the manifest recorded. The reader decodes or refuses a
+/// footer from the pinned bytes and that length together, so two manifests
+/// recording different lengths for one file get separate entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MetadataKey {
     tenant_hash: [u8; 16],
     content_hash: [u8; 32],
+    footer_len: u32,
 }
 
 impl MetadataKey {
-    /// The metadata key of the file a pinned byte-cache key belongs to; the
-    /// key's range is not part of it.
-    pub fn of(key: &CacheKey) -> Self {
+    /// The metadata key of the file a pinned byte-cache key belongs to, read
+    /// with a `footer_len`-byte footer; the key's range is not part of it.
+    pub fn of(key: &CacheKey, footer_len: u32) -> Self {
         MetadataKey {
             tenant_hash: key.tenant_hash,
             content_hash: key.content_hash,
+            footer_len,
         }
     }
 }
@@ -169,6 +174,7 @@ mod tests {
         MetadataKey {
             tenant_hash: [1; 16],
             content_hash: [byte; 32],
+            footer_len: 8,
         }
     }
 

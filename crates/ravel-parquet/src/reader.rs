@@ -259,13 +259,16 @@ impl PinnedParquetReader {
     /// cache or from Probe reads.
     ///
     /// A metadata cache hit counts as a Probe cache hit of the entry's charged
-    /// size, the convention the catalog caches use. Pinned bytes the reader
-    /// refused as `Corrupt` are cached as refused under the same key, so a
-    /// later read fails the same way without reading them again. A failed
-    /// read, including one that came back short, is not cached: the store may
-    /// answer the next one.
+    /// size, the convention the catalog caches use. The key is the pinned
+    /// identity and the footer length the manifest recorded, the two inputs
+    /// the footer is decoded or refused from. A footer refused as `Corrupt` is
+    /// cached as refused under that key, so a later read fails the same way
+    /// without reading it again. A read that failed is not cached, whatever
+    /// it failed on: a store error, a read that came back short, or a page
+    /// index range past the recorded size, which [`Self::read_range`] fails
+    /// as `Corrupt` before any GET.
     pub async fn metadata(&self) -> Result<Arc<ParquetMetaData>, ParquetReadError> {
-        let cache_key = MetadataKey::of(&self.cache_key(0, 0));
+        let cache_key = MetadataKey::of(&self.cache_key(0, 0), self.file.file.footer_len);
         if let Some((footer, bytes)) = self.services.metadata.get(&cache_key) {
             let probe = self.accounting.phase(QueryPhase::Probe);
             probe.record_cache_hit();
@@ -1608,7 +1611,8 @@ mod tests {
 
     /// A footer read that comes back short fails as `Corrupt` but is not
     /// cached as refused: it says nothing about the pinned bytes, and the next
-    /// read of the same file succeeds.
+    /// read of the same file succeeds. The same holds for the page index read
+    /// that follows a footer read.
     #[tokio::test]
     async fn a_short_read_is_not_cached_as_refused() {
         let memory = Arc::new(MemoryStore::new());
@@ -1631,6 +1635,84 @@ mod tests {
             .expect("the next read is not refused from the cache");
         assert_eq!(metadata.file_metadata().num_rows(), 3);
         assert_eq!(recording.ranges().len(), 3, "footer twice, page index once");
+
+        let memory = Arc::new(MemoryStore::new());
+        let recording = Arc::new(RecordingStore::new(Arc::clone(&memory), false));
+        let fixture = Fixture::new(Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>);
+        let page_index = page_index_region(&valid()).len();
+        let file = fixture
+            .put_file(&memory, KEY, Bytes::from(valid()), false)
+            .await;
+
+        recording.shorten_read(2);
+        assert_corrupt(
+            fixture.reader(file.clone()).metadata().await,
+            &format!("returned {} bytes", page_index - 1),
+        );
+        assert_eq!(recording.ranges().len(), 2, "footer, then the page index");
+        let metadata = fixture
+            .reader(file)
+            .metadata()
+            .await
+            .expect("the next read is not refused from the cache");
+        assert!(metadata.offset_index().is_some());
+        assert_eq!(
+            recording.ranges().len(),
+            3,
+            "the page index again, the footer from the byte cache"
+        );
+    }
+
+    /// Two tables of one tenant over the same pinned file, one recording its
+    /// footer length and one recording a length the trailer disagrees with,
+    /// each get the outcome they get alone, in either query order: the
+    /// refusal describes the manifest, so it is not served to the table whose
+    /// manifest is right, and the decoded footer is not served to the table
+    /// whose manifest is wrong.
+    #[tokio::test]
+    async fn a_wrong_footer_length_is_cached_apart_from_the_right_one() {
+        async fn outcomes(wrong_first: bool) -> Vec<String> {
+            let memory = Arc::new(MemoryStore::new());
+            let fixture = Fixture::new(Arc::clone(&memory) as Arc<dyn ObjectStoreBackend>);
+            let right = fixture
+                .put_file(&memory, KEY, Bytes::from(valid()), false)
+                .await;
+            let wrong = ParquetFile {
+                footer_len: right.footer_len + 1,
+                ..right.clone()
+            };
+            let mut files = [("right", right), ("wrong", wrong)];
+            if wrong_first {
+                files.reverse();
+            }
+            let mut out = Vec::new();
+            for (name, file) in files {
+                let outcome = match fixture
+                    .provider_with_options(name, 1, vec![file], Default::default())
+                    .await
+                {
+                    Ok(table) => {
+                        let ctx = fixture.session(&[(name, Arc::new(table))]);
+                        match read_all(&ctx, name, &["a", "b"]).await {
+                            Ok(rows) => format!("{name}: rows {rows}"),
+                            Err(err) => format!("{name}: {:?}", read_error(&err)),
+                        }
+                    }
+                    Err(err) => format!("{name}: {err}"),
+                };
+                out.push(outcome);
+            }
+            out.sort();
+            out
+        }
+
+        let right_first = outcomes(false).await;
+        assert_eq!(right_first[0], "right: rows 4|four,5|five,6|sixx");
+        assert!(
+            right_first[1].starts_with("wrong: ") && right_first[1].contains("the trailer records"),
+            "{right_first:?}"
+        );
+        assert_eq!(outcomes(true).await, right_first);
     }
 
     /// [`any_mutation`] with half the weight on the page index, which a

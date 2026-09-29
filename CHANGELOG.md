@@ -1079,9 +1079,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before the previous page's end, or a first location other than the chunk's
   first data page, is `Corrupt` too: the scan reads every page from its
   location, so either would otherwise decode the wrong bytes without an
-  error. A footer or page index refused
-  as `Corrupt` is cached as refused; a read that failed, or came back short, is
-  not.
+  error. Decoded footers and refusals are cached per pinned file and footer
+  length the manifest recorded. A refusal is cached: a footer length the file
+  cannot hold, a trailer or footer that does not decode or disagrees with the
+  manifest, and a page index the parquet crate's loader or the checks above
+  refuse. A read that failed is not cached, whatever it failed on: a store
+  error, a read that came back short, and a page index range past the recorded
+  size, which fails as `Corrupt` without being cached.
   `tenant parquet-grant add` lists past a zero-byte directory blob, and says so
   when its search for an object stopped at the listing page bound.
 
