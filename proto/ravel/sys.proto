@@ -558,7 +558,9 @@ enum ClusteringBucketWidth {
 // message with columns is a SET key, whose valid content is 1 to
 // 4 columns, no duplicates, each naming one of the tenant's effective declared
 // typed attribute columns (the record's typed_attr_columns override when
-// present, otherwise the deployment default), and a width other than
+// present, otherwise the tenant's base columns as the server resolves them:
+// its --typed-attr-column-tenant override when one is set, else the
+// process-wide --typed-attr-column default), and a width other than
 // UNSPECIFIED. Those rules are enforced by the reader's clustering-key accessor
 // and by the setter (one shared validation), not by record decode. This message
 // can fail decode only by making the record invalid protobuf (a column name

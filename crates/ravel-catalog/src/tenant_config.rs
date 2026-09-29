@@ -585,10 +585,13 @@ impl TenantConfig {
     /// `declared` is the tenant's EFFECTIVE declared typed attribute columns,
     /// resolved by the caller as the server's logs SQL declared-column overlay
     /// resolves them: this config's `typed_attr_columns` override when it is
-    /// `Some`, otherwise the deployment default (`--typed-attr-column` on the
-    /// server). This crate does not know the deployment default, so this
-    /// accessor does not read `typed_attr_columns`; [`resolve_declared_columns`]
-    /// resolves `declared` from it and the deployment default.
+    /// `Some`, otherwise the tenant's base columns as the server resolves them
+    /// (`TypedAttrColumnConfig::columns_for`: the tenant's
+    /// `--typed-attr-column-tenant` override when one is set, else the
+    /// process-wide `--typed-attr-column` default; an override is total, not
+    /// additive). This crate does not know those base columns, so this accessor
+    /// does not read `typed_attr_columns`; [`resolve_declared_columns`] resolves
+    /// `declared` from it and the base columns the caller passes.
     ///
     /// An absent field 13 is [`ClusteringKeyState::NeverSet`], and a present one
     /// with no columns is [`ClusteringKeyState::Cleared`] whatever its bucket
@@ -782,9 +785,13 @@ pub fn resolve_retention_window(
 /// The tenant's effective declared typed attribute columns: the record's
 /// [`TenantConfig::typed_attr_columns`] override when the record is present and
 /// carries `Some` (including `Some(vec![])`, an override to no declared
-/// columns), otherwise `deployment_default`. This is the `declared` argument
-/// every caller of [`TenantConfig::clustering_key`] and
-/// [`TenantConfig::set_clustering_key`] must pass.
+/// columns), otherwise `deployment_default`, which is the tenant's base columns
+/// as the server resolves them (`TypedAttrColumnConfig::columns_for`: the
+/// tenant's `--typed-attr-column-tenant` override when one is set, else the
+/// process-wide `--typed-attr-column` default), not the process-wide default
+/// alone. This is the `declared` argument every caller of
+/// [`TenantConfig::clustering_key`] and [`TenantConfig::set_clustering_key`]
+/// must pass.
 pub fn resolve_declared_columns<'a>(
     tenant_config: Option<&'a TenantConfig>,
     deployment_default: &'a [DeclaredTypedColumn],
