@@ -6,6 +6,7 @@
 
 use std::fmt;
 use std::ops::Range;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -14,7 +15,7 @@ use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_datasource_parquet::ParquetFileReaderFactory;
 use futures::future::{BoxFuture, FutureExt, try_join_all};
-use parquet::arrow::arrow_reader::ArrowReaderOptions;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::file::metadata::{FooterTail, ParquetMetaData, ParquetMetaDataReader};
 use ravel_cache::{CacheKey, PinnedIdentity, SingleFlightError, Source};
@@ -271,11 +272,62 @@ impl PinnedParquetReader {
         }
         let metadata = ParquetMetaDataReader::decode_metadata(&tail[..split])
             .map_err(|err| self.corrupt(format!("footer: {err}")))?;
+        self.check_chunks(&metadata, size - tail_len)?;
         let metadata = Arc::new(metadata);
+        self.check_arrow_schema(&metadata)?;
         self.services
             .metadata
             .insert(cache_key, Arc::clone(&metadata));
         Ok(metadata)
+    }
+
+    /// Refuse a footer placing any column chunk outside the `data_end` bytes
+    /// before it. The footer decoder accepts a negative offset or length, and
+    /// `ColumnChunkMetaData::byte_range`, which the scan calls, panics on one.
+    fn check_chunks(
+        &self,
+        metadata: &ParquetMetaData,
+        data_end: u64,
+    ) -> Result<(), ParquetReadError> {
+        for (row_group, group) in metadata.row_groups().iter().enumerate() {
+            for (column, chunk) in group.columns().iter().enumerate() {
+                let start = chunk
+                    .dictionary_page_offset()
+                    .unwrap_or_else(|| chunk.data_page_offset());
+                let len = chunk.compressed_size();
+                let end = u64::try_from(start)
+                    .ok()
+                    .zip(u64::try_from(len).ok())
+                    .and_then(|(start, len)| start.checked_add(len));
+                if !end.is_some_and(|end| end <= data_end) {
+                    return Err(self.corrupt(format!(
+                        "row group {row_group} column {column} is {len} bytes at offset {start}, \
+                         outside the {data_end} bytes before the footer"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse a footer whose schema the Arrow reader cannot convert. Arrow's
+    /// IPC decoder panics on some malformed embedded `ARROW:schema` values
+    /// rather than returning an error, so the conversion the Arrow reader
+    /// makes from this metadata runs here first, under `catch_unwind`. The
+    /// decode depends only on the metadata, so a footer that passes here does
+    /// not panic when the scan converts it again.
+    fn check_arrow_schema(&self, metadata: &Arc<ParquetMetaData>) -> Result<(), ParquetReadError> {
+        let converted = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            ArrowReaderMetadata::try_new(Arc::clone(metadata), ArrowReaderOptions::new())
+                .map(|_| ())
+        }));
+        match converted {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(self.corrupt(format!("footer schema: {err}"))),
+            Err(_) => {
+                Err(self.corrupt("the footer's embedded Arrow schema is malformed".to_string()))
+            }
+        }
     }
 }
 
@@ -395,9 +447,365 @@ impl ParquetFileReaderFactory for PinnedReaderFactory {
 mod tests {
     use super::*;
     use crate::test_support::{
-        Fixture, RecordingStore, assert_file_changed, parquet_bytes, read_all,
+        Fixture, RecordingStore, assert_file_changed, footer_len_of, parquet_bytes, read_all,
+        read_error,
     };
+    use proptest::prelude::*;
+    use proptest::sample::Index;
     use ravel_object_store::memory::MemoryStore;
+
+    const KEY: &str = "lake/t/bad.parquet";
+
+    /// Store `bytes` at [`KEY`] described by `size` and `footer_len`, and read
+    /// its footer through a reader over it.
+    async fn footer_of(
+        bytes: Vec<u8>,
+        size: u64,
+        footer_len: u32,
+    ) -> Result<Arc<ParquetMetaData>, ParquetReadError> {
+        let store = Arc::new(MemoryStore::new());
+        let fixture = Fixture::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>);
+        let file = fixture
+            .put_raw(&store, KEY, Bytes::from(bytes), size, footer_len)
+            .await;
+        fixture.reader(file).metadata().await
+    }
+
+    /// The error must be `Corrupt` for [`KEY`] with `needle` in its message.
+    fn assert_corrupt<T: fmt::Debug>(got: Result<T, ParquetReadError>, needle: &str) {
+        match got {
+            Err(ParquetReadError::Corrupt { key, message }) => {
+                assert_eq!(key, KEY);
+                assert!(message.contains(needle), "{needle:?} not in {message:?}");
+            }
+            other => panic!("expected Corrupt with {needle:?}, got {other:?}"),
+        }
+    }
+
+    fn valid() -> Vec<u8> {
+        parquet_bytes(&[4, 5, 6], &["four", "five", "sixx"]).to_vec()
+    }
+
+    #[tokio::test]
+    async fn a_read_outside_the_recorded_size_is_refused() {
+        let bytes = valid();
+        let size = bytes.len() as u64;
+        let store = Arc::new(MemoryStore::new());
+        let fixture = Fixture::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>);
+        let file = fixture
+            .put_raw(&store, KEY, Bytes::from(bytes), size, 0)
+            .await;
+        let reader = fixture.reader(file);
+        assert_corrupt(
+            reader
+                .read_range(size - 4..size + 1, QueryPhase::Scan)
+                .await,
+            "outside the",
+        );
+        #[allow(clippy::reversed_empty_ranges)]
+        let backwards = 5..4;
+        assert_corrupt(
+            reader.read_range(backwards, QueryPhase::Scan).await,
+            "outside the",
+        );
+    }
+
+    /// The manifest records three bytes more than the store holds, so the
+    /// footer read comes back three bytes short.
+    #[tokio::test]
+    async fn a_short_read_is_corrupt() {
+        let bytes = valid();
+        let (size, footer_len) = (bytes.len() as u64, footer_len_of(&bytes));
+        assert_corrupt(
+            footer_of(bytes, size + 3, footer_len).await,
+            &format!("returned {} bytes", u64::from(footer_len) + TRAILER_LEN - 3),
+        );
+    }
+
+    #[tokio::test]
+    async fn a_footer_longer_than_the_file_is_corrupt() {
+        let bytes = valid();
+        let size = bytes.len() as u64;
+        let footer_len = u32::try_from(size).expect("small file");
+        assert_corrupt(
+            footer_of(bytes, size, footer_len).await,
+            &format!("records a {footer_len}-byte footer in a {size}-byte file"),
+        );
+    }
+
+    #[tokio::test]
+    async fn a_trailer_without_the_magic_is_corrupt() {
+        let mut bytes = valid();
+        let (size, footer_len) = (bytes.len() as u64, footer_len_of(&bytes));
+        let end = bytes.len();
+        bytes[end - 4..].copy_from_slice(b"RAV1");
+        assert_corrupt(footer_of(bytes, size, footer_len).await, "footer trailer: ");
+    }
+
+    #[tokio::test]
+    async fn an_encrypted_footer_is_refused() {
+        let mut bytes = valid();
+        let (size, footer_len) = (bytes.len() as u64, footer_len_of(&bytes));
+        let end = bytes.len();
+        bytes[end - 4..].copy_from_slice(b"PARE");
+        assert_corrupt(
+            footer_of(bytes, size, footer_len).await,
+            "the footer is encrypted",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_footer_length_the_trailer_disagrees_with_is_corrupt() {
+        let bytes = valid();
+        let (size, footer_len) = (bytes.len() as u64, footer_len_of(&bytes));
+        assert_corrupt(
+            footer_of(bytes, size, footer_len - 1).await,
+            &format!(
+                "the trailer records a {footer_len}-byte footer, the manifest {}",
+                footer_len - 1
+            ),
+        );
+    }
+
+    /// The trailer is intact and agrees with the manifest; the metadata it
+    /// frames is not Thrift.
+    #[tokio::test]
+    async fn a_footer_that_does_not_decode_is_corrupt() {
+        let mut bytes = valid();
+        let (size, footer_len) = (bytes.len() as u64, footer_len_of(&bytes));
+        let end = bytes.len() - TRAILER_LEN as usize;
+        bytes[end - footer_len as usize..end].fill(0xff);
+        assert_corrupt(footer_of(bytes, size, footer_len).await, "footer: ");
+    }
+
+    /// A one-bit flip in the footer that still decodes but gives a column
+    /// chunk a negative length: the reader refuses it rather than handing it
+    /// to the scan, which panics on it, and the scan fails typed.
+    #[tokio::test]
+    async fn a_footer_placing_a_chunk_outside_the_file_is_corrupt() {
+        let original = valid();
+        let (size, footer_len) = (original.len() as u64, footer_len_of(&original));
+        let end = original.len() - TRAILER_LEN as usize;
+        let start = end - footer_len as usize;
+        let negative = |bytes: &[u8]| {
+            ParquetMetaDataReader::decode_metadata(&bytes[start..end])
+                .ok()
+                .is_some_and(|metadata| {
+                    metadata
+                        .row_groups()
+                        .iter()
+                        .flat_map(|group| group.columns())
+                        .any(|chunk| chunk.compressed_size() < 0)
+                })
+        };
+        let flipped = (start..end)
+            .flat_map(|at| (0..8).map(move |bit| (at, 1u8 << bit)))
+            .map(|(at, mask)| {
+                let mut bytes = original.clone();
+                bytes[at] ^= mask;
+                bytes
+            })
+            .find(|bytes| negative(bytes))
+            .expect("a one-bit flip that makes a chunk length negative");
+
+        assert_corrupt(
+            footer_of(flipped.clone(), size, footer_len).await,
+            "outside the",
+        );
+        let err = tokio::task::spawn_blocking(move || scan_with_second_file(flipped))
+            .await
+            .expect("the scan does not panic")
+            .expect_err("the scan fails");
+        assert!(
+            matches!(read_error(&err), Some(ParquetReadError::Corrupt { key, .. }) if key == KEY),
+            "{err}"
+        );
+    }
+
+    /// One base64 character of the embedded `ARROW:schema` replaced so that
+    /// Arrow's IPC decoder panics on it: the reader refuses the footer, and the
+    /// scan fails typed instead of panicking.
+    #[tokio::test]
+    async fn a_footer_whose_arrow_schema_panics_arrow_is_corrupt() {
+        const BASE64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let original = valid();
+        let (size, footer_len) = (original.len() as u64, footer_len_of(&original));
+        let end = original.len() - TRAILER_LEN as usize;
+        let start = end - footer_len as usize;
+        let decode = |bytes: &[u8]| ParquetMetaDataReader::decode_metadata(&bytes[start..end]);
+        let schema = decode(&original)
+            .expect("footer")
+            .file_metadata()
+            .key_value_metadata()
+            .and_then(|kv| kv.iter().find(|kv| kv.key == "ARROW:schema"))
+            .and_then(|kv| kv.value.clone())
+            .expect("ArrowWriter embeds its schema");
+        let at = original[start..end]
+            .windows(schema.len())
+            .position(|window| window == schema.as_bytes())
+            .expect("the schema's bytes are in the footer")
+            + start;
+        let panics = |bytes: &[u8]| {
+            let Ok(metadata) = decode(bytes) else {
+                return false;
+            };
+            let metadata = Arc::new(metadata);
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                ArrowReaderMetadata::try_new(metadata, ArrowReaderOptions::new()).map(|_| ())
+            }))
+            .is_err()
+        };
+        let broken = (at..at + schema.len())
+            .flat_map(|at| BASE64.iter().map(move |&c| (at, c)))
+            .filter(|&(at, c)| original[at] != c)
+            .map(|(at, c)| {
+                let mut bytes = original.clone();
+                bytes[at] = c;
+                bytes
+            })
+            .find(|bytes| panics(bytes))
+            .expect("a one-character change that panics Arrow's schema decoder");
+
+        assert_corrupt(
+            footer_of(broken.clone(), size, footer_len).await,
+            "embedded Arrow schema is malformed",
+        );
+        let err = tokio::task::spawn_blocking(move || scan_with_second_file(broken))
+            .await
+            .expect("the scan does not panic")
+            .expect_err("the scan fails");
+        assert!(
+            matches!(read_error(&err), Some(ParquetReadError::Corrupt { key, .. }) if key == KEY),
+            "{err}"
+        );
+    }
+
+    /// A byte-level change to a stored file.
+    #[derive(Debug, Clone)]
+    enum Mutation {
+        /// Keep the first `len` bytes, `len` below the original length.
+        Truncate(Index),
+        /// XOR one byte of the 8-byte trailer with a nonzero mask.
+        FlipTrailer(Index, u8),
+        /// XOR any byte with a nonzero mask.
+        Flip(Index, u8),
+        /// Remove `remove` bytes at the offset and insert `insert` there.
+        Splice(Index, usize, Vec<u8>),
+    }
+
+    impl Mutation {
+        fn apply(&self, original: &[u8]) -> Vec<u8> {
+            let mut bytes = original.to_vec();
+            match self {
+                Mutation::Truncate(len) => bytes.truncate(len.index(original.len())),
+                Mutation::FlipTrailer(at, mask) => {
+                    let at = original.len() - TRAILER_LEN as usize + at.index(8);
+                    bytes[at] ^= mask;
+                }
+                Mutation::Flip(at, mask) => bytes[at.index(original.len())] ^= mask,
+                Mutation::Splice(at, remove, insert) => {
+                    let at = at.index(original.len());
+                    let end = (at + remove).min(original.len());
+                    bytes.splice(at..end, insert.iter().copied());
+                }
+            }
+            bytes
+        }
+    }
+
+    fn detected_mutation() -> impl Strategy<Value = Mutation> {
+        prop_oneof![
+            any::<Index>().prop_map(Mutation::Truncate),
+            (any::<Index>(), 1..=u8::MAX).prop_map(|(at, mask)| Mutation::FlipTrailer(at, mask)),
+        ]
+    }
+
+    fn any_mutation() -> impl Strategy<Value = Mutation> {
+        prop_oneof![
+            detected_mutation(),
+            (any::<Index>(), 1..=u8::MAX).prop_map(|(at, mask)| Mutation::Flip(at, mask)),
+            (
+                any::<Index>(),
+                0..16_usize,
+                proptest::collection::vec(any::<u8>(), 0..16)
+            )
+                .prop_map(|(at, remove, insert)| Mutation::Splice(at, remove, insert)),
+        ]
+    }
+
+    /// Scan a two-file table whose second file is `mutated`, stored as is and
+    /// described by its own length and by the footer length its trailer
+    /// holds, so the reader gets past the manifest checks to the parser. The
+    /// first file is intact and supplies the schema.
+    fn scan_with_second_file(mutated: Vec<u8>) -> datafusion::error::Result<String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async move {
+            let store = Arc::new(MemoryStore::new());
+            let fixture = Fixture::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>);
+            let good = fixture
+                .put_file(
+                    &store,
+                    "lake/t/good.parquet",
+                    parquet_bytes(&[1, 2, 3], &["one", "two", "six"]),
+                    false,
+                )
+                .await;
+            let size = mutated.len() as u64;
+            let footer_len = if mutated.len() >= TRAILER_LEN as usize {
+                footer_len_of(&mutated)
+            } else {
+                0
+            };
+            let bad = fixture
+                .put_raw(&store, KEY, Bytes::from(mutated), size, footer_len)
+                .await;
+            let table = fixture.provider("t", 1, vec![good, bad], false).await;
+            let ctx = fixture.session(&[("t", table)]);
+            read_all(&ctx, "t", &["a", "b"]).await
+        })
+    }
+
+    proptest! {
+        /// A truncated file, or one whose trailer changed, fails the scan
+        /// with a typed `Corrupt` error naming it, and returns no rows.
+        #[test]
+        fn a_truncated_file_or_a_changed_trailer_fails_the_scan_typed(
+            mutation in detected_mutation(),
+        ) {
+            let got = scan_with_second_file(mutation.apply(&valid()));
+            let err = got.expect_err("a corrupt file must fail the scan");
+            let found = read_error(&err);
+            prop_assert!(
+                matches!(&found, Some(ParquetReadError::Corrupt { key, .. }) if key == KEY),
+                "{err}"
+            );
+        }
+
+        /// Any byte change, anywhere in the file, ends the scan with an error
+        /// or with rows, never a panic. The reader cannot refuse every change:
+        /// nothing it checks covers the page values, so a flipped value byte
+        /// decodes as a different value. When the error carries a
+        /// `ParquetReadError`, it is `Corrupt` and names the changed file.
+        #[test]
+        fn any_byte_change_is_an_error_or_rows_never_a_panic(
+            mutation in any_mutation(),
+        ) {
+            let original = valid();
+            let mutated = mutation.apply(&original);
+            prop_assume!(mutated != original);
+            if let Err(err) = scan_with_second_file(mutated)
+                && let Some(found) = read_error(&err)
+            {
+                prop_assert!(
+                    matches!(&found, ParquetReadError::Corrupt { key, .. } if key == KEY),
+                    "{err}"
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn a_file_overwritten_after_create_fails_the_scan_and_is_never_mixed_with_cached_pages() {
