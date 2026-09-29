@@ -342,6 +342,52 @@ when a claim is in the way. It is safe for correctness, because the compaction
 record's create-if-absent still decides which output is published, but the
 merge may duplicate one another maintainer is running.
 
+### Compaction claim metrics
+
+Claims are advisory only: correctness rests entirely on content-addressed
+parts and the compaction record's `CreateIfAbsent`, and a claim bug can only
+waste work, never corrupt data. Both the background
+supervisor's per-unit tick and `ravel-cli maintain compact-bucket` /
+`compact-tenant` take claims; `--no-claim` on the CLI and
+`--maintain-claims off` on the server (below) are the two ways to opt a run
+out.
+
+The server's `/metrics` endpoint renders five claim counters, one family per
+signal:
+
+- `ravel_maintain_claims_acquired_total` -- claims taken, fresh or stolen.
+- `ravel_maintain_claims_stolen_total` -- subset of the above taken over from
+  an expired holder.
+- `ravel_maintain_claims_lost_total` -- held claims lost to a renewal that lost
+  its compare-and-swap (someone else stole first) or was cancelled.
+- `ravel_maintain_claim_renew_failures_total` -- renewals that failed with a
+  genuine store error, distinct from a lost claim.
+- `ravel_maintain_claims_skipped_total` -- buckets skipped because another
+  process held the claim; the same figure the CLI walk summary reports as
+  `claim-skipped`.
+
+Alert on a sustained steal rate:
+`rate(ravel_maintain_claims_stolen_total[15m]) > 0`. A steal only happens once
+a claim's lease has expired while its holder was still working, so a
+sustained rate means the configured lease is shorter than a real merge's
+longest non-cancellable stage. Raise `--maintain-claim-lease`.
+
+Three flags configure claiming:
+
+- `--maintain-claim-lease <DURATION>` (default `300s`): how long a claim stays
+  live without a renewal. A lease below twice the time to encode and PUT the
+  largest L1 segment at a conservative rate logs a startup warning, not a
+  refusal; zero is refused outright.
+- `--maintain-claim-min-input-bytes <BYTES>` (default 64 MiB): the cost gate.
+  A bucket below this many listed L0 input bytes runs unclaimed, because a
+  duplicated small merge costs less than the claim traffic that would prevent
+  it. Zero is refused: it would claim every bucket regardless of size.
+- `--maintain-claims on|off` (default `on`): the fleet-wide escape hatch.
+  `off` disables claiming everywhere on that process, for a store whose
+  qualification record predates the CAS probes, or for an emergency; claims
+  stay advisory either way, so racing runs still converge at the compaction
+  record and the loser just pays its merge first.
+
 ## Garbage collection and retention
 
 Ravel deletes data through two independent triggers, both driven by the

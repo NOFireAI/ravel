@@ -489,14 +489,20 @@ Three further facts about the landed implementation:
    where the claim is acquired (moved after the input record reads by the
    amendment on where the claim is taken), and the guard is consulted at the
    other four. The `Checkpoint` enum names only those four.
-2. **The Consequences metrics are not shipped yet.**
-   `ravel_maintain_claims_acquired_total`, `claims_lost_total`,
-   `claims_stolen_total`, `claim_renew_failures_total` and
-   `claimed_buckets_skipped` land with #1035. Until then claim outcomes
-   surface as tracing fields (the skip and completion-failure events in
-   `crates/ravel-maintain/src/compact.rs`, the lost-claim warning in
+2. **The Consequences metrics shipped with #1035 (dated note, 2026-09-29).**
+   `ravel_maintain_claims_acquired_total`, `ravel_maintain_claims_stolen_total`,
+   `ravel_maintain_claims_lost_total`, `ravel_maintain_claim_renew_failures_total`
+   and `ravel_maintain_claims_skipped_total` render on `/metrics`, one family
+   per signal, accumulated by the supervisor from each pass's `MaintainReport`
+   (`services/ravel-server/src/maintain.rs`, `crates/ravel-maintain/src/scan.rs`).
+   `ravel_maintain_claims_skipped_total` is this Consequences list's
+   `claimed_buckets_skipped`, under its shipped name. Before #1035 claim
+   outcomes surfaced only as tracing fields (the skip and completion-failure
+   events in `crates/ravel-maintain/src/compact.rs`, the lost-claim warning in
    `claim_guard.rs`, and the supervisor's per-shard pass summary) and as the
-   `MaintainReport` counters `claim_skipped` and `claim_cancelled`.
+   `MaintainReport` counters `claim_skipped` and `claim_cancelled`; those
+   fields and counters still exist and now feed the metrics above rather
+   than being the only surface.
 3. **A held bucket is still retention-evaluated.** The supervisor's claim
    hold (`MaintainMemo::claim_deferred`) skips only the held bucket's
    compaction call. Retention and zone classification run for it as for any

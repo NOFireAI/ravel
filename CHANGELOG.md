@@ -476,6 +476,24 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Advisory compaction claims report five `/metrics` counters and gain three
+  server flags** (ADR-1029, issue #1035). The supervisor accumulates each
+  maintenance pass's claim outcomes, per signal, into
+  `ravel_maintain_claims_acquired_total`,
+  `ravel_maintain_claims_stolen_total` (a subset of acquired, taken over from
+  an expired holder), `ravel_maintain_claims_lost_total`,
+  `ravel_maintain_claim_renew_failures_total` (a genuine store error on
+  renewal, distinct from a lost claim) and
+  `ravel_maintain_claims_skipped_total` (the same figure the CLI walk summary
+  reports as `claim-skipped`). Three new flags configure claiming:
+  `--maintain-claim-lease` (default `300s`, refused at zero, warns at startup
+  below twice the time to encode and PUT the largest L1 segment at a
+  conservative rate), `--maintain-claim-min-input-bytes` (default 64 MiB,
+  refused at zero) and `--maintain-claims on|off` (default `on`), the
+  fleet-wide escape hatch for a store whose qualification record predates the
+  CAS probes or an emergency. Claims stay advisory either way: the
+  compaction record's `CreateIfAbsent` remains the sole correctness
+  mechanism.
 - **The maintenance loop sweeps alert history older than `--alert-retention`,
   default 90 days** (ADR-1688 follow-up task 2, issue #1688). After upgrade
   the first tick deletes every alert transition older than 90 days except each
