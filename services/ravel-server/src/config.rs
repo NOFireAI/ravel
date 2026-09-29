@@ -118,6 +118,29 @@ impl S3Auth {
     }
 }
 
+/// The `--maintain-claims` values (ADR-1029 decision 5). The CLI-facing
+/// mirror of [`ravel_maintain::config::Coordination`], which lives in a crate
+/// that does not depend on clap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum MaintainClaimsArg {
+    /// Claim buckets at or above the cost gate. The default.
+    #[default]
+    On,
+    /// Never claim; racing runs still converge at the compaction record's
+    /// `CreateIfAbsent`.
+    Off,
+}
+
+impl MaintainClaimsArg {
+    /// The library-level mode this flag value selects.
+    pub fn mode(self) -> ravel_maintain::config::Coordination {
+        match self {
+            MaintainClaimsArg::On => ravel_maintain::config::Coordination::On,
+            MaintainClaimsArg::Off => ravel_maintain::config::Coordination::Off,
+        }
+    }
+}
+
 /// The `--logs-fetch-policy` values (ADR-0996 decision 2). The CLI-facing
 /// mirror of [`ravel_query::LogsFetchPolicy`], which lives in a crate that does
 /// not depend on clap. The spellings clap derives from these variant names are
@@ -645,6 +668,40 @@ pub struct Cli {
     /// due, the pre-ADR-0065 behavior for that zone).
     #[arg(long = "maintain-interior-reverify", value_name = "DURATION")]
     pub maintain_interior_reverify: Option<String>,
+
+    /// How long an advisory compaction claim (ADR-1029) stays live without a
+    /// renewal, as a humantime duration (e.g. `300s`, `5m`). Passed straight
+    /// to `ravel_maintain::config::CompactorConfig::claim_lease_duration`.
+    /// Omitted defaults to
+    /// [`ravel_maintain::config::DEFAULT_CLAIM_LEASE_DURATION`] (300 s). Zero
+    /// is refused at startup: a lease that never covers a moment of work
+    /// makes every claim theft-prone by construction. A lease below ADR-1029
+    /// decision 3's threshold (twice the time to encode and PUT the largest
+    /// L1 part at a conservative rate) is accepted but logged as a startup
+    /// warning, not refused: it is a real deployment shape (small parts, a
+    /// deliberately short lease) rather than a config error.
+    #[arg(long = "maintain-claim-lease", value_name = "DURATION")]
+    pub maintain_claim_lease: Option<String>,
+
+    /// The advisory-claim cost gate (ADR-1029 decision 4), in bytes: a
+    /// bucket is claimed only when its listed L0 input bytes reach this.
+    /// Below it, the bucket runs unclaimed through the same pipeline -- a
+    /// duplicated merge costs less than the PUT-class claim traffic that
+    /// would prevent it. Omitted defaults to
+    /// [`ravel_maintain::config::DEFAULT_CLAIM_MIN_INPUT_BYTES`] (64 MiB).
+    /// Zero is refused at startup: it would claim every bucket regardless of
+    /// size, defeating the cost gate this flag configures.
+    #[arg(long = "maintain-claim-min-input-bytes", value_name = "BYTES")]
+    pub maintain_claim_min_input_bytes: Option<u64>,
+
+    /// Whether this process takes advisory compaction claims at all
+    /// (ADR-1029 decision 5's escape hatch). `off` is the fleet-wide
+    /// fallback for a store whose qualification record predates the CAS
+    /// probes, or an emergency: claims are advisory either way, so racing
+    /// runs still converge at the compaction record's `CreateIfAbsent` and
+    /// the loser just pays its merge first.
+    #[arg(long = "maintain-claims", value_enum, default_value_t = MaintainClaimsArg::On)]
+    pub maintain_claims: MaintainClaimsArg,
 
     /// Age past which the maintenance loop deletes alert transition records,
     /// as a humantime duration (e.g. `90d`), ADR-1688 decision 5. Each alert
@@ -5308,6 +5365,47 @@ impl Cli {
                 })?;
                 Ok(i64::try_from(dur.as_nanos()).unwrap_or(i64::MAX))
             }
+        }
+    }
+
+    /// Parse `--maintain-claim-lease` (ADR-1029 decision 3), defaulting to
+    /// [`ravel_maintain::config::DEFAULT_CLAIM_LEASE_DURATION`] when unset.
+    /// Unlike `--maintain-interior-reverify`, a zero duration is refused
+    /// rather than accepted as a documented disable value: a claim lease of
+    /// zero expires before it can cover even a moment of work, making every
+    /// claim theft-prone by construction, and `--maintain-claims off` is the
+    /// actual way to disable claiming.
+    pub fn parse_maintain_claim_lease(&self) -> anyhow::Result<std::time::Duration> {
+        match self.maintain_claim_lease.as_deref() {
+            None => Ok(ravel_maintain::config::DEFAULT_CLAIM_LEASE_DURATION),
+            Some(s) => {
+                let dur = humantime::parse_duration(s)
+                    .map_err(|e| anyhow::anyhow!("invalid --maintain-claim-lease '{s}': {e}"))?;
+                if dur.is_zero() {
+                    anyhow::bail!(
+                        "--maintain-claim-lease '{s}' must be a positive duration: a zero \
+                         lease expires before it can cover any work, making every claim \
+                         theft-prone; use --maintain-claims off to disable claiming instead"
+                    );
+                }
+                Ok(dur)
+            }
+        }
+    }
+
+    /// Parse `--maintain-claim-min-input-bytes` (ADR-1029 decision 4),
+    /// defaulting to
+    /// [`ravel_maintain::config::DEFAULT_CLAIM_MIN_INPUT_BYTES`] when unset.
+    /// Zero is refused: it would claim every bucket regardless of size,
+    /// defeating the cost gate this flag configures.
+    pub fn parse_maintain_claim_min_input_bytes(&self) -> anyhow::Result<u64> {
+        match self.maintain_claim_min_input_bytes {
+            None => Ok(ravel_maintain::config::DEFAULT_CLAIM_MIN_INPUT_BYTES),
+            Some(0) => anyhow::bail!(
+                "--maintain-claim-min-input-bytes must be nonzero: a zero cost gate claims \
+                 every bucket regardless of size"
+            ),
+            Some(bytes) => Ok(bytes),
         }
     }
 
@@ -11439,6 +11537,119 @@ mod tests {
             .parse_alert_retention()
             .expect("zero is the opt-out at any interval"),
             0
+        );
+    }
+
+    /// `--maintain-claim-lease` defaults to
+    /// [`ravel_maintain::config::DEFAULT_CLAIM_LEASE_DURATION`] (300 s),
+    /// parses a humantime duration, and refuses both an unparseable value and
+    /// a zero duration (ADR-1029 decision 3): a zero lease expires before it
+    /// can cover any work.
+    #[test]
+    fn maintain_claim_lease_parses_default_and_duration_refuses_zero() {
+        assert_eq!(
+            cli(&[]).parse_maintain_claim_lease().expect("default"),
+            ravel_maintain::config::DEFAULT_CLAIM_LEASE_DURATION
+        );
+        assert_eq!(
+            cli(&["--maintain-claim-lease", "90s"])
+                .parse_maintain_claim_lease()
+                .expect("90s"),
+            Duration::from_secs(90)
+        );
+        let err = cli(&["--maintain-claim-lease", "soon"])
+            .parse_maintain_claim_lease()
+            .expect_err("unparseable");
+        assert!(err.to_string().contains("--maintain-claim-lease"), "{err}");
+
+        let err = cli(&["--maintain-claim-lease", "0s"])
+            .parse_maintain_claim_lease()
+            .expect_err("a zero lease is refused");
+        let text = err.to_string();
+        assert!(text.contains("--maintain-claim-lease"), "{text}");
+        assert!(text.contains("theft-prone"), "{text}");
+        assert!(text.contains("--maintain-claims off"), "{text}");
+    }
+
+    /// `--maintain-claim-min-input-bytes` defaults to
+    /// [`ravel_maintain::config::DEFAULT_CLAIM_MIN_INPUT_BYTES`] (64 MiB) and
+    /// refuses zero: a zero cost gate would claim every bucket regardless of
+    /// size (ADR-1029 decision 4).
+    #[test]
+    fn maintain_claim_min_input_bytes_parses_default_and_refuses_zero() {
+        assert_eq!(
+            cli(&[])
+                .parse_maintain_claim_min_input_bytes()
+                .expect("default"),
+            ravel_maintain::config::DEFAULT_CLAIM_MIN_INPUT_BYTES
+        );
+        assert_eq!(
+            cli(&["--maintain-claim-min-input-bytes", "1024"])
+                .parse_maintain_claim_min_input_bytes()
+                .expect("1024"),
+            1024
+        );
+        let err = cli(&["--maintain-claim-min-input-bytes", "0"])
+            .parse_maintain_claim_min_input_bytes()
+            .expect_err("zero is refused");
+        assert!(err.to_string().contains("must be nonzero"), "{err}");
+    }
+
+    /// `--maintain-claims` defaults to on and its `.mode()` maps each variant
+    /// to the matching [`ravel_maintain::config::Coordination`] the compactor
+    /// reads.
+    #[test]
+    fn maintain_claims_flag_defaults_on_and_maps_to_coordination() {
+        assert_eq!(
+            cli(&[]).maintain_claims.mode(),
+            ravel_maintain::config::Coordination::On
+        );
+        assert_eq!(
+            cli(&["--maintain-claims", "off"]).maintain_claims.mode(),
+            ravel_maintain::config::Coordination::Off
+        );
+        assert_eq!(
+            cli(&["--maintain-claims", "on"]).maintain_claims.mode(),
+            ravel_maintain::config::Coordination::On
+        );
+    }
+
+    /// ADR-1029 decision 3's startup warning: a lease below 2x the time to
+    /// encode and PUT one `max_l1_part_bytes` part at the conservative 10
+    /// MiB/s rate fires the warning; a lease at or above it does not. At the
+    /// default 256 MiB `max_l1_part_bytes`, the threshold is 2 * (256 MiB /
+    /// 10 MiB/s) = 2 * 25.6 s = 51.2 s. A part under 10 MiB still gets a
+    /// nonzero threshold: 8 MiB gives 1.6 s.
+    #[test]
+    fn claim_lease_warn_threshold_fires_below_and_not_above() {
+        let max_l1_part_bytes: u64 = 256 * 1024 * 1024;
+        assert!(
+            ravel_maintain::config::claim_lease_below_warn_threshold(
+                Duration::from_millis(51_199),
+                max_l1_part_bytes,
+            ),
+            "51.199s is below the 51.2s threshold"
+        );
+        assert!(
+            !ravel_maintain::config::claim_lease_below_warn_threshold(
+                Duration::from_millis(51_200),
+                max_l1_part_bytes,
+            ),
+            "51.2s meets the threshold exactly"
+        );
+        assert!(
+            ravel_maintain::config::claim_lease_below_warn_threshold(
+                Duration::from_secs(1),
+                8 * 1024 * 1024,
+            ),
+            "a 1s lease is below the 1.6s threshold of an 8 MiB part"
+        );
+        assert!(
+            !ravel_maintain::config::claim_lease_below_warn_threshold(
+                ravel_maintain::config::DEFAULT_CLAIM_LEASE_DURATION,
+                max_l1_part_bytes,
+            ),
+            "the shipped 300s default clears the threshold for the default part size"
         );
     }
 

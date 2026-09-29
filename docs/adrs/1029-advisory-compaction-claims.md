@@ -333,9 +333,11 @@ sequenceDiagram
   `claims_lost_total`, `claims_stolen_total`,
   `claim_renew_failures_total`, `claimed_buckets_skipped` on the walk
   report. Alert rule: sustained steal rate above zero (a steal storm
-  means lease duration is below a non-cancellable stage). These land with
-  #1035; until then see the amendment on jitter on the contended path for
-  where claim outcomes surface.
+  means lease duration is below a non-cancellable stage). These shipped
+  with #1035; see item 2 of the implementation facts at the end for the
+  shipped names and why the operations guide alerts on lost claims rather
+  than steals, and the amendment on jitter on the contended path for the
+  tracing fields claim outcomes also surface as.
 - **Interaction with #1028 bucket concurrency**: claims are per bucket;
   a concurrent walk holds N claims with independent renewal state.
   Jitter is per work id, so N parallel acquisitions do not stampede.
@@ -489,14 +491,31 @@ Three further facts about the landed implementation:
    where the claim is acquired (moved after the input record reads by the
    amendment on where the claim is taken), and the guard is consulted at the
    other four. The `Checkpoint` enum names only those four.
-2. **The Consequences metrics are not shipped yet.**
-   `ravel_maintain_claims_acquired_total`, `claims_lost_total`,
-   `claims_stolen_total`, `claim_renew_failures_total` and
-   `claimed_buckets_skipped` land with #1035. Until then claim outcomes
-   surface as tracing fields (the skip and completion-failure events in
-   `crates/ravel-maintain/src/compact.rs`, the lost-claim warning in
+2. **The Consequences metrics shipped with #1035 (dated note, 2026-09-29).**
+   `ravel_maintain_claims_acquired_total`, `ravel_maintain_claims_stolen_total`,
+   `ravel_maintain_claims_lost_total`, `ravel_maintain_claim_renew_failures_total`
+   and `ravel_maintain_claims_skipped_total` render on `/metrics`, one family
+   per signal, accumulated by the supervisor from each pass's `MaintainReport`
+   (`services/ravel-server/src/maintain.rs`, `crates/ravel-maintain/src/scan.rs`).
+   `ravel_maintain_claims_skipped_total` is this Consequences list's
+   `claimed_buckets_skipped`, under its shipped name. Before #1035 claim
+   outcomes surfaced only as tracing fields (the skip and completion-failure
+   events in `crates/ravel-maintain/src/compact.rs`, the lost-claim warning in
    `claim_guard.rs`, and the supervisor's per-shard pass summary) and as the
-   `MaintainReport` counters `claim_skipped` and `claim_cancelled`.
+   `MaintainReport` counters `claim_skipped` and `claim_cancelled`; those
+   fields and counters still exist and now feed the metrics above rather
+   than being the only surface. Renewal store errors are the exception: the
+   supervisor counts them where the error surfaces, because a pass that ends
+   in an error returns no report, and so drops the other counts it had
+   gathered. The operations guide alerts on
+   `ravel_maintain_claims_lost_total` rather than on the steal rate the
+   Consequences name: an expired claim is left by any crash, restart or
+   failed run, so steals follow those too, while a lost claim is a run that
+   was still working when another process took the bucket, which is the
+   too-short lease that rule was after. `contend` does not tell this
+   process's own expired claim from another's, so after a renewal store
+   error the process skips its own bucket until the lease expires and then
+   steals it back; that is reported on #1029 rather than changed here.
 3. **A held bucket is still retention-evaluated.** The supervisor's claim
    hold (`MaintainMemo::claim_deferred`) skips only the held bucket's
    compaction call. Retention and zone classification run for it as for any

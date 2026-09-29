@@ -111,7 +111,7 @@ pub async fn compact_bucket(
     config: &CompactorConfig,
     bucket: &Bucket,
 ) -> Result<CompactionOutcome> {
-    match drive(store, clock, config, bucket, Coordinate::No).await? {
+    match drive(store, clock, config, bucket, Coordinate::No).await?.0 {
         ClaimedCompaction::Ran(outcome) => Ok(outcome),
         // Unreachable by construction: `Coordinate::No` never acquires a claim,
         // so no claim can be held against this run or lost under it. Typed
@@ -142,6 +142,23 @@ pub async fn compact_bucket_claimed(
     config: &CompactorConfig,
     bucket: &Bucket,
 ) -> Result<ClaimedCompaction> {
+    Ok(drive(store, clock, config, bucket, Coordinate::Yes)
+        .await?
+        .0)
+}
+
+/// [`compact_bucket_claimed`], additionally reporting whether checkpoint 1
+/// acquired a claim and whether that acquisition was a steal (ADR-1029
+/// decision 3). Used only by [`crate::retention::maintain_bucket_with_reach`],
+/// which folds the acquisition into the run's [`crate::scan::MaintainReport`]
+/// counters (#1035); `compact_bucket_claimed`'s own signature and every
+/// existing caller are unchanged.
+pub(crate) async fn compact_bucket_claimed_with_acquisition(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    bucket: &Bucket,
+) -> Result<(ClaimedCompaction, Option<ClaimAcquisition>)> {
     drive(store, clock, config, bucket, Coordinate::Yes).await
 }
 
@@ -161,7 +178,7 @@ async fn drive(
     config: &CompactorConfig,
     bucket: &Bucket,
     coordinate: Coordinate,
-) -> Result<ClaimedCompaction> {
+) -> Result<(ClaimedCompaction, Option<ClaimAcquisition>)> {
     // This is the run's outermost driver, so it opens the request ledger's
     // scope here, BEFORE the bucket LIST below: that LIST is the run's first
     // store request and belongs in the run's own report, and the rewrite
@@ -193,18 +210,21 @@ async fn compact_bucket_scoped(
     config: &CompactorConfig,
     bucket: &Bucket,
     coordinate: Coordinate,
-) -> Result<ClaimedCompaction> {
+) -> Result<(ClaimedCompaction, Option<ClaimAcquisition>)> {
     let start_ns = clock.now_ns();
     if !bucket.is_sealed(start_ns, config) {
-        return Ok(ClaimedCompaction::Ran(CompactionOutcome::NotSealed));
+        return Ok((ClaimedCompaction::Ran(CompactionOutcome::NotSealed), None));
     }
 
     let listing = list_bucket_with_ledger(store, bucket, config.request_ledger.as_ref()).await?;
     if listing.tombstone_key.is_some() {
-        return Ok(ClaimedCompaction::Ran(CompactionOutcome::Tombstoned));
+        return Ok((ClaimedCompaction::Ran(CompactionOutcome::Tombstoned), None));
     }
     if !listing.compaction_record_keys.is_empty() {
-        return Ok(ClaimedCompaction::Ran(CompactionOutcome::AlreadyCompacted));
+        return Ok((
+            ClaimedCompaction::Ran(CompactionOutcome::AlreadyCompacted),
+            None,
+        ));
     }
     // One bucket serves one record set. A live rewrite record already covers
     // these inputs with records deliberately removed from its outputs, and a
@@ -212,12 +232,18 @@ async fn compact_bucket_scoped(
     // it: a snapshot including both resurrects the erased records
     // (ADR-0064 decision 3 point 5). Refuse rather than publish the second set.
     if !listing.rewrite_record_keys.is_empty() {
-        return Ok(ClaimedCompaction::Ran(CompactionOutcome::RewritePresent));
+        return Ok((
+            ClaimedCompaction::Ran(CompactionOutcome::RewritePresent),
+            None,
+        ));
     }
     if listing.commit_keys.len() < config.min_compaction_inputs {
-        return Ok(ClaimedCompaction::Ran(CompactionOutcome::BelowMinInputs {
-            count: listing.commit_keys.len(),
-        }));
+        return Ok((
+            ClaimedCompaction::Ran(CompactionOutcome::BelowMinInputs {
+                count: listing.commit_keys.len(),
+            }),
+            None,
+        ));
     }
 
     // The input set, read once for the whole run: the merge needs it, and so
@@ -239,11 +265,12 @@ async fn compact_bucket_scoped(
     // Cancellation checkpoint 1 (ADR-1029 decision 3), which is also where the
     // claim is acquired: a bucket that is not worth claiming runs on through
     // the identical pipeline with no guard installed.
-    let guard = match acquire_claim(store, config, bucket, &inputs, coordinate).await? {
-        Claimed::Skipped(skip) => return Ok(ClaimedCompaction::SkippedClaimed(skip)),
-        Claimed::Unclaimed => None,
-        Claimed::Held(guard) => Some(guard),
-    };
+    let (guard, acquisition) =
+        match acquire_claim(store, config, bucket, &inputs, coordinate).await? {
+            Claimed::Skipped(skip) => return Ok((ClaimedCompaction::SkippedClaimed(skip), None)),
+            Claimed::Unclaimed => (None, None),
+            Claimed::Held { guard, stolen } => (Some(guard), Some(ClaimAcquisition { stolen })),
+        };
     // The guard rides on this run's OWN config clone, never on the caller's:
     // two buckets compacted concurrently under one base config each get their
     // own, so a checkpoint can only ever renew its own bucket's claim.
@@ -301,7 +328,7 @@ async fn compact_bucket_scoped(
     // stands. The claim then ages out under its lease.
     if let Some(guard) = guard {
         if let Some(at) = guard.cancelled_at().await {
-            return Ok(ClaimedCompaction::Cancelled { at, outcome });
+            return Ok((ClaimedCompaction::Cancelled { at, outcome }, acquisition));
         }
         if let Err(err) = guard.complete(store).await {
             tracing::warn!(
@@ -315,13 +342,29 @@ async fn compact_bucket_scoped(
             );
         }
     }
-    Ok(ClaimedCompaction::Ran(outcome))
+    Ok((ClaimedCompaction::Ran(outcome), acquisition))
+}
+
+/// Whether checkpoint 1's claim acquisition was a fresh claim or a steal
+/// from an expired holder (ADR-1029 decision 3). Reported out of
+/// [`compact_bucket_claimed_with_acquisition`] for the caller's metrics;
+/// [`ClaimedCompaction`]'s own shape carries no acquisition detail. `pub`,
+/// not `pub(crate)`, because [`crate::retention::maintain_bucket_with_reach`]
+/// is itself re-exported and returns it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimAcquisition {
+    pub stolen: bool,
 }
 
 /// What the claim decision at checkpoint 1 produced.
 enum Claimed {
     /// This run holds the bucket's claim for its duration.
-    Held(ClaimGuard),
+    Held {
+        guard: ClaimGuard,
+        /// Whether this claim was taken over from an expired holder rather
+        /// than created fresh.
+        stolen: bool,
+    },
     /// No claim was taken: coordination is off, no participant is installed,
     /// the caller is the unclaimed [`compact_bucket`] entry point, the bucket
     /// is below the cost gate, or the bucket's claim object is unreadable and
@@ -376,7 +419,10 @@ async fn acquire_claim(
         config.request_ledger.clone(),
     );
     match guard.acquire(store).await? {
-        Acquire::Acquired => Ok(Claimed::Held(guard)),
+        Acquire::Acquired => {
+            let stolen = guard.stolen().await;
+            Ok(Claimed::Held { guard, stolen })
+        }
         // A stale unreadable claim: the guard already warned with its key.
         Acquire::Unclaimed { .. } => Ok(Claimed::Unclaimed),
         Acquire::Skipped(skip) => {

@@ -76,7 +76,9 @@ pub use bucket::Bucket;
 pub use claim_guard::{Acquire, Checkpoint, ClaimGuard, ClaimSkip, ClaimSkipReason, Verdict};
 pub use clock::{Clock, FixedClock};
 pub use codec::{RsegCodec, SegmentCodec};
-pub use compact::{ClaimedCompaction, CompactionOutcome, compact_bucket, compact_bucket_claimed};
+pub use compact::{
+    ClaimAcquisition, ClaimedCompaction, CompactionOutcome, compact_bucket, compact_bucket_claimed,
+};
 pub use config::{
     AdmissionMode, AuditMode, AuditPipelineConfig, ClaimParticipant, CompactorConfig, Coordination,
     MergeMemoryTracker, MergePhasePeaks, RetentionConfig, RetentionConfigError, RetentionPolicy,
