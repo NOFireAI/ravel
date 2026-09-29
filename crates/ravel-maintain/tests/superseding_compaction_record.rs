@@ -1,5 +1,5 @@
 //! Maintenance over a bucket holding a version 2 compaction record (ADR-0066
-//! force 2 amendment, items 2 to 5).
+//! force 2 amendment, items 2 to 6).
 //!
 //! A version 2 record names, in `superseded_record_key`, the compaction record
 //! it re-encodes. The shared selector excludes that predecessor, and a version
@@ -7,15 +7,16 @@
 //! before the selector runs. The erasure completion gate and `migrate` follow
 //! both rules, as the resolver does. A version 2 record whose inputs differ
 //! from its present predecessor's is a typed error for all of them. The sweep
-//! does not reclaim a superseded predecessor yet: that needs horizon,
-//! reachability and hold rules of its own, so until then it deletes nothing it
-//! did not delete before.
+//! reclaims a superseded predecessor and its parts as a chain group entered
+//! from the version 2 record, under that record's horizon, the HEAD
+//! reachability gate and legal hold, and reclaims an erasure-dominated version
+//! 2 record with its rewrite's chain group.
 //!
-//! Every fixture writes records directly to a `MemoryStore` and drives the
-//! production entries (`sweep_superseded`, `sweep_unreferenced_parts`,
-//! `bucket_erasure_completion`, `count_below_target`,
-//! `migrate::largest_overlap_component`). Each test's doc comment names the
-//! line whose change it catches.
+//! Every fixture writes records directly to a `MemoryStore` (or a `FaultStore`
+//! over one) and drives the production entries (`sweep_superseded`,
+//! `sweep_unreferenced_parts`, `bucket_erasure_completion`,
+//! `count_below_target`, `migrate::largest_overlap_component`, a catalog
+//! resolve). Each test's doc comment names the line whose change it catches.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 mod common;
@@ -27,15 +28,19 @@ use common::*;
 use ravel_commit::{erasure, keys, record, signal};
 use ravel_maintain::migrate::largest_overlap_component;
 use ravel_maintain::{
-    Bucket, CompactorConfig, FixedClock, NoLeases, PendingErasureRequest,
-    bucket_erasure_completion, count_below_target, sweep_superseded, sweep_unreferenced_parts,
+    Bucket, CompactorConfig, FixedClock, LeaseCheck, NoLeases, PendingErasureRequest,
+    SupersededSweepOutcome, bucket_erasure_completion, count_below_target, sweep_superseded,
+    sweep_unreferenced_parts,
 };
+use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions, list_all};
+use ravel_proto::catalog::v1::{SnapshotEntry, SnapshotHead, SnapshotPartRef};
 use ravel_proto::commit::v1::{
     CompactionInputIdentity, CompactionPart, CompactionRecord, ErasurePredicateMatcher,
     ErasureRequest, RewriteDrop, RewriteRecord,
 };
+use ravel_types::{Signal, TimeRange};
 use uuid::Uuid;
 
 fn hour_ns() -> i64 {
@@ -250,17 +255,44 @@ async fn sweep_everything(store: &dyn ObjectStoreBackend, bucket: &Bucket) -> BT
     before.difference(&after).cloned().collect()
 }
 
-/// A bucket holding C1 and a version 2 C2 naming C1, swept past every horizon,
-/// loses no record and no part: neither the superseded predecessor nor either
-/// record's parts are reclaimed yet. The inputs were swept long ago, as they
-/// are by the time a version 2 record is written, so nothing else is in play.
-///
-/// This pins the sweep's behaviour as it was before resolution honoured the
-/// record, and passes on that code too; the guard it relies on is pinned by
-/// `sweep_supersedes_only_inputs_both_views_name` below.
-#[tokio::test]
-async fn sweep_reclaims_nothing_of_a_superseded_predecessor() {
-    let store = Arc::new(MemoryStore::new());
+fn part_key(record: &CompactionRecord) -> String {
+    keys::reconstruct_l1_part_key(record, &record.parts[0]).unwrap()
+}
+
+/// Rule 2 alone at `now_ns` under `lease`.
+async fn sweep_at(
+    store: &dyn ObjectStoreBackend,
+    b: &Bucket,
+    now_ns: i64,
+    lease: &dyn LeaseCheck,
+) -> SupersededSweepOutcome {
+    sweep_superseded(
+        store,
+        &FixedClock::new(now_ns),
+        &cfg(),
+        lease,
+        &b.tenant_hash,
+        b.signal,
+        b.shard,
+    )
+    .await
+    .expect("rule 2")
+}
+
+/// Every key present, less the catalog objects a test put there itself.
+async fn bucket_keys(store: &dyn ObjectStoreBackend) -> BTreeSet<String> {
+    all_keys(store)
+        .await
+        .into_iter()
+        .filter(|k| !k.contains("/catalog/"))
+        .collect()
+}
+
+/// C1 and a version 2 C2 naming it, in the logs bucket, with no raw L0 input
+/// left: they were swept long before a version 2 record is written.
+async fn seed_predecessor_pair(
+    store: &dyn ObjectStoreBackend,
+) -> (CompactionRecord, String, CompactionRecord, String) {
     let b = logs_bucket();
     let base = hour_ns();
     let c1 = version_1(
@@ -269,59 +301,490 @@ async fn sweep_reclaims_nothing_of_a_superseded_predecessor() {
         0x00,
         part(0xc1, base, base + 10),
     );
-    let c1_key = put_compaction(store.as_ref(), &c1).await;
+    let c1_key = put_compaction(store, &c1).await;
     let c2 = version_2(&c1, &c1_key, c1.inputs.clone(), part(0xc2, base, base + 10));
-    put_compaction(store.as_ref(), &c2).await;
-
-    let deleted = sweep_everything(store.as_ref(), &b).await;
-    assert_eq!(deleted, BTreeSet::new());
-    let after = all_keys(store.as_ref()).await;
-    assert_eq!(after.len(), 4, "two records and two parts survive");
+    let c2_key = put_compaction(store, &c2).await;
+    (c1, c1_key, c2, c2_key)
 }
 
-/// A live rewrite R and a version 2 C2 both naming C1, swept past every
-/// horizon. The sweep deletes exactly what it deleted before resolution
-/// honoured version 2 records: R's chain group, which is C1 and C1's part.
-/// The erasure-dominated C2 and its part survive, and so do R and its part.
+/// The level-1 snapshot entry a fold writes for `record`'s first part.
+fn l1_entry(record: &CompactionRecord) -> SnapshotEntry {
+    let p = &record.parts[0];
+    SnapshotEntry {
+        level: 1,
+        shard: record.shard,
+        ingest_hour_bucket: record.ingest_hour_bucket,
+        writer_id: record.input_set_hash.clone(),
+        writer_epoch: u64::from(p.part_index),
+        writer_seq: 0,
+        content_hash: p.content_hash.clone(),
+        object_size: p.object_size,
+        min_event_ts_ns: p.min_event_ts_ns,
+        max_event_ts_ns: p.max_event_ts_ns,
+        sample_count: p.sample_count,
+        series_count: p.series_count,
+        segment_format_version: p.segment_format_version,
+        created_unix_ns: record.created_unix_ns,
+        declared_column_stats: Vec::new(),
+    }
+}
+
+/// The level-0 snapshot entry a fold writes for the raw input at `commit_key`.
+async fn l0_entry(store: &dyn ObjectStoreBackend, commit_key: &str) -> SnapshotEntry {
+    let rec = record::decode(&get_full(store, commit_key).await).expect("decode commit record");
+    SnapshotEntry {
+        level: 0,
+        shard: rec.shard,
+        ingest_hour_bucket: rec.ingest_hour_bucket,
+        writer_id: Uuid::parse_str(&rec.writer_id).unwrap().as_bytes().to_vec(),
+        writer_epoch: rec.writer_epoch,
+        writer_seq: rec.writer_seq,
+        content_hash: rec.content_hash.clone(),
+        object_size: 1,
+        min_event_ts_ns: rec.min_event_ts_ns,
+        max_event_ts_ns: rec.max_event_ts_ns,
+        sample_count: 1,
+        series_count: 1,
+        segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+        created_unix_ns: 0,
+        declared_column_stats: Vec::new(),
+    }
+}
+
+/// PUT a catalog HEAD whose one snapshot part holds `entries`, the way a fold
+/// that ran before a successor record was written names what it served.
+async fn put_head_with(store: &dyn ObjectStoreBackend, entries: Vec<SnapshotEntry>) {
+    let signal_id = signal::to_proto(Signal::Logs) as u32;
+    let entry_count = entries.len() as u64;
+    let bytes = ravel_catalog::encode_part(tenant_hash().0, signal_id, SHARD + 1, HOUR, &entries)
+        .expect("snapshot part encodes");
+    let prefix = format!(
+        "t/{}/catalog/{}",
+        tenant_hash().to_hex(),
+        Signal::Logs.key_prefix()
+    );
+    let part_key = format!("{prefix}/snap/test-part.csnap");
+    store
+        .put(
+            &part_key,
+            bytes::Bytes::from(bytes.clone()),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put snapshot part");
+    let head = SnapshotHead {
+        format_version: 1,
+        tenant_hash: tenant_hash().0.to_vec(),
+        signal: signal_id,
+        shard_count: SHARD + 1,
+        watermark_hour: HOUR,
+        parts: vec![SnapshotPartRef {
+            key: part_key,
+            blake3: blake3::hash(&bytes).as_bytes().to_vec(),
+            size: bytes.len() as u64,
+            entry_count,
+            watermark_hour: HOUR,
+            min_hour: 0,
+            column_stats: None,
+        }],
+        folder_id: vec![0u8; 16],
+        created_unix_ns: 0,
+        postings: None,
+        shard_generation_count: 1,
+    };
+    store
+        .put(
+            &format!("{prefix}/HEAD"),
+            bytes::Bytes::from(ravel_catalog::encode_head(&head).expect("HEAD encodes")),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put HEAD");
+}
+
+/// A [`LeaseCheck`] protecting one exact key, standing in for a legal hold.
+struct HoldKey(String);
+
+impl LeaseCheck for HoldKey {
+    fn is_protected(&self, key: &str) -> bool {
+        key == self.0
+    }
+}
+
+/// C1 and a version 2 C2 naming it, swept one nanosecond before C2's
+/// protection horizon passes: nothing is deleted, although C1's own horizon
+/// passed long before. The chain group is gated on the record that superseded
+/// C1, since a query pinned before C2 was written may still read C1's part.
 ///
-/// This passes on the code before resolution honoured the record as well:
-/// the sweep gives C2 no rule of its own yet.
+/// This passes on the code before the change too, which never reclaimed C1.
+/// Flipped line: the `now < record.created_unix_ns.saturating_add(config
+/// .protection_horizon_ns)` gate in rule 2's compaction arm (sweep.rs), which
+/// the version 2 chain group sits behind. Without it C1 and its part go.
 #[tokio::test]
-async fn sweep_keeps_an_erasure_dominated_version_2_record() {
+async fn sweep_keeps_a_superseded_predecessor_inside_the_version_2_horizon() {
+    let store = MemoryStore::new();
+    let b = logs_bucket();
+    let (c1, _, c2, _) = seed_predecessor_pair(&store).await;
+    let before = bucket_keys(&store).await;
+    let now = c2.created_unix_ns + cfg().protection_horizon_ns - 1;
+    assert!(now >= c1.created_unix_ns + cfg().protection_horizon_ns);
+
+    let outcome = sweep_at(&store, &b, now, &NoLeases).await;
+    assert_eq!(outcome, SupersededSweepOutcome::default());
+    assert_eq!(bucket_keys(&store).await, before);
+}
+
+/// C1 and a version 2 C2 naming it, swept past C2's horizon with no HEAD:
+/// C1's part and then C1 are deleted, one record and one data object, and C2
+/// with its part stays. A second pass finds nothing more.
+///
+/// Fails on the code before the change, which deleted nothing here. Flipped
+/// line: `if deleting && version_2.heads.contains(key)` in rule 2's compaction
+/// arm (sweep.rs); without the version 2 chain group C1 and its part survive.
+#[tokio::test]
+async fn sweep_reclaims_a_superseded_predecessor_past_the_horizon() {
+    let store = MemoryStore::new();
+    let b = logs_bucket();
+    let (c1, c1_key, c2, c2_key) = seed_predecessor_pair(&store).await;
+
+    let outcome = sweep_at(&store, &b, past_horizon_ns(), &NoLeases).await;
+    assert_eq!((outcome.records_deleted, outcome.data_deleted), (1, 1));
+    assert_eq!(outcome.held(), 0);
+    assert_eq!(
+        bucket_keys(&store).await,
+        BTreeSet::from([c2_key.clone(), part_key(&c2)])
+    );
+    let again = sweep_at(&store, &b, past_horizon_ns(), &NoLeases).await;
+    assert_eq!((again.records_deleted, again.data_deleted), (0, 0));
+    assert!(!bucket_keys(&store).await.contains(&c1_key));
+    assert!(!bucket_keys(&store).await.contains(&part_key(&c1)));
+}
+
+/// The chain group deletes parts first and records after: a delete of C1's
+/// record that fails leaves C1's part already gone and C1 still present, never
+/// the reverse.
+///
+/// Fails on the code before the change, where no delete is issued and the
+/// part survives. Flipped line: the phase C loop over `group.data_keys`
+/// running before the loop over `group.chain_record_keys` (sweep.rs).
+#[tokio::test]
+async fn sweep_deletes_a_predecessors_parts_before_its_record() {
+    let mem = Arc::new(MemoryStore::new());
+    let b = logs_bucket();
+    let (c1, c1_key, _, _) = seed_predecessor_pair(mem.as_ref()).await;
+    let plan = FaultPlan::empty()
+        .with_rule(Rule::new(Op::Delete, ScriptedFault::Timeout).with_key_contains(&c1_key));
+    let store = FaultStore::new(mem.clone(), plan);
+
+    let err = sweep_superseded(
+        &store,
+        &FixedClock::new(past_horizon_ns()),
+        &cfg(),
+        &NoLeases,
+        &b.tenant_hash,
+        b.signal,
+        b.shard,
+    )
+    .await;
+    assert!(err.is_err(), "the failed record delete fails the pass");
+    assert_eq!(store.fault_count(Op::Delete, FaultKind::Timeout), 1);
+    let left = bucket_keys(mem.as_ref()).await;
+    assert!(!left.contains(&part_key(&c1)), "the part went first");
+    assert!(left.contains(&c1_key), "the record outlives its part");
+}
+
+/// C1 and a version 2 C2 naming it, past C2's horizon, with a HEAD that still
+/// names C1's part: nothing of C1 is deleted, and the pass counts C1's record
+/// and part as held by the snapshot.
+///
+/// Fails on the code before the change, which counted nothing held (it
+/// gathered no group). Flipped line: the `reach.object_gate(...)` match in
+/// phase B (sweep.rs) answering `Clear`; C1 and its part are then deleted.
+#[tokio::test]
+async fn sweep_holds_a_predecessor_a_head_still_names() {
+    let store = MemoryStore::new();
+    let b = logs_bucket();
+    let (c1, _, _, _) = seed_predecessor_pair(&store).await;
+    put_head_with(&store, vec![l1_entry(&c1)]).await;
+    let before = bucket_keys(&store).await;
+
+    let outcome = sweep_at(&store, &b, past_horizon_ns(), &NoLeases).await;
+    assert_eq!((outcome.records_deleted, outcome.data_deleted), (0, 0));
+    assert_eq!(outcome.held_by_snapshot, 2, "C1's record and its part");
+    assert_eq!(outcome.held_by_unreadable_head, 0);
+    assert_eq!(bucket_keys(&store).await, before);
+}
+
+/// C1 and a version 2 C2 naming it, past C2's horizon, with a legal hold on
+/// C1's part: the whole group is held, so C1's record stays too.
+///
+/// Fails on the code before the change, which held no group. Flipped line:
+/// `if let Some(protected) = group.protected_key(lease)` in phase B
+/// (sweep.rs); without it C1 and its part are deleted.
+#[tokio::test]
+async fn sweep_holds_a_predecessor_under_a_legal_hold() {
+    let store = MemoryStore::new();
+    let b = logs_bucket();
+    let (c1, _, _, _) = seed_predecessor_pair(&store).await;
+    let before = bucket_keys(&store).await;
+
+    let hold = HoldKey(part_key(&c1));
+    let outcome = sweep_at(&store, &b, past_horizon_ns(), &hold).await;
+    assert_eq!((outcome.records_deleted, outcome.data_deleted), (0, 0));
+    assert_eq!(outcome.chain_groups_held_by_legal_hold, 1);
+    assert_eq!(bucket_keys(&store).await, before);
+}
+
+/// A version 2 record naming a key that is not present reclaims nothing: C2
+/// alone, past its horizon.
+#[tokio::test]
+async fn sweep_reclaims_nothing_for_an_absent_predecessor() {
+    let store = MemoryStore::new();
+    let b = logs_bucket();
+    let (_, c1_key, _, _) = seed_predecessor_pair(&store).await;
+    store.delete(&c1_key).await.expect("drop C1");
+    let before = bucket_keys(&store).await;
+
+    let outcome = sweep_at(&store, &b, past_horizon_ns(), &NoLeases).await;
+    assert_eq!(outcome, SupersededSweepOutcome::default());
+    assert_eq!(bucket_keys(&store).await, before);
+}
+
+/// C3 over C2 over C1, all version 2 above C1, past every horizon: one chain
+/// group entered from C3 reclaims C2 and C1 with their parts, two records and
+/// two data objects, and C3 stays.
+///
+/// Fails on the code before the change, which deleted nothing. Flipped line:
+/// `cursor = link.superseded_record_key()` in `gather_superseded_chain`
+/// (sweep.rs) returning `None` for a compaction link; the walk then stops at
+/// C2 and C1 is left, superseded by C2, with its part.
+#[tokio::test]
+async fn sweep_reclaims_a_three_link_version_2_chain() {
+    let store = MemoryStore::new();
+    let b = logs_bucket();
+    let base = hour_ns();
+    let (_, _, c2, c2_key) = seed_predecessor_pair(&store).await;
+    let c3 = version_2(&c2, &c2_key, c2.inputs.clone(), part(0xc3, base, base + 10));
+    let c3_key = put_compaction(&store, &c3).await;
+
+    let outcome = sweep_at(&store, &b, past_horizon_ns(), &NoLeases).await;
+    assert_eq!((outcome.records_deleted, outcome.data_deleted), (2, 2));
+    assert_eq!(
+        bucket_keys(&store).await,
+        BTreeSet::from([c3_key, part_key(&c3)])
+    );
+}
+
+/// The superseded raw L0 inputs of a bucket holding C1 and C2 are deleted
+/// exactly as for a bucket holding C2 alone (its predecessor already gone):
+/// neither loses an input before any horizon, and past every horizon both lose
+/// the same two inputs, each once. The C1 bucket also loses C1 and its part,
+/// and nothing else: the chain group entered from C2 holds no raw input.
+///
+/// Fails on the code before the change on the C1 bucket's key set, which kept
+/// C1. Flipped line: `matches!(self, ChainEntry::Rewrite)` in
+/// `ChainEntry::gathers_raw_l0_inputs` (sweep.rs) answering `true` for a
+/// version 2 entry; the chain group then gathers C1's inputs a second time and
+/// the C1 bucket's pass counts five records and five data objects.
+#[tokio::test]
+async fn sweep_deletes_the_same_raw_inputs_with_or_without_the_predecessor() {
+    let base = hour_ns();
+    let b = logs_bucket();
+    let mut deleted_inputs: Vec<BTreeSet<String>> = Vec::new();
+    for keep_predecessor in [true, false] {
+        let store = MemoryStore::new();
+        let inputs = seed_inputs(&store, &[(0x91, 1), (0x92, 2)]).await;
+        let c1 = version_1(
+            &b,
+            vec![input(0x91, 1), input(0x92, 2)],
+            0x00,
+            part(0xc1, base, base + 10_000),
+        );
+        let c1_key = put_compaction(&store, &c1).await;
+        let c2 = version_2(
+            &c1,
+            &c1_key,
+            c1.inputs.clone(),
+            part(0xc2, base, base + 10_000),
+        );
+        let c2_key = put_compaction(&store, &c2).await;
+        if !keep_predecessor {
+            store.delete(&c1_key).await.expect("drop C1");
+            store.delete(&part_key(&c1)).await.expect("drop C1's part");
+        }
+        let input_keys: BTreeSet<String> = inputs
+            .iter()
+            .flat_map(|(commit, data)| [commit.clone(), data.clone()])
+            .collect();
+
+        let young = c1.created_unix_ns + cfg().protection_horizon_ns - 1;
+        let before = bucket_keys(&store).await;
+        assert_eq!(
+            sweep_at(&store, &b, young, &NoLeases).await,
+            SupersededSweepOutcome::default()
+        );
+        assert_eq!(bucket_keys(&store).await, before);
+
+        let outcome = sweep_at(&store, &b, past_horizon_ns(), &NoLeases).await;
+        let deleted: BTreeSet<String> = before
+            .difference(&bucket_keys(&store).await)
+            .cloned()
+            .collect();
+        let mut expected = input_keys.clone();
+        if keep_predecessor {
+            expected.extend([c1_key.clone(), part_key(&c1)]);
+            assert_eq!((outcome.records_deleted, outcome.data_deleted), (3, 3));
+        } else {
+            assert_eq!((outcome.records_deleted, outcome.data_deleted), (2, 2));
+        }
+        assert_eq!(deleted, expected);
+        assert_eq!(
+            bucket_keys(&store).await,
+            BTreeSet::from([c2_key, part_key(&c2)])
+        );
+        deleted_inputs.push(deleted.intersection(&input_keys).cloned().collect());
+    }
+    assert_eq!(deleted_inputs[0], deleted_inputs[1]);
+}
+
+/// A HEAD naming a raw L0 input holds that input whether or not the
+/// predecessor is present, and the predecessor's chain group, which holds no
+/// raw input, is not held by it.
+///
+/// Fails on the code before the change, which left C1 and its part. Flipped
+/// line: as for
+/// [`sweep_deletes_the_same_raw_inputs_with_or_without_the_predecessor`]; a
+/// chain group holding the raw inputs is held with them and C1 survives.
+#[tokio::test]
+async fn sweep_holds_a_head_named_raw_input_apart_from_the_predecessor() {
     let store = Arc::new(MemoryStore::new());
     let b = logs_bucket();
     let base = hour_ns();
+    let inputs = seed_inputs(store.as_ref(), &[(0x95, 1)]).await;
+    let c1 = version_1(
+        &b,
+        vec![input(0x95, 1)],
+        0x00,
+        part(0xc1, base, base + 10_000),
+    );
+    let c1_key = put_compaction(store.as_ref(), &c1).await;
+    let c2 = version_2(
+        &c1,
+        &c1_key,
+        c1.inputs.clone(),
+        part(0xc2, base, base + 10_000),
+    );
+    put_compaction(store.as_ref(), &c2).await;
+    // A HEAD folded before either record names the raw input.
+    let entry = l0_entry(store.as_ref(), &inputs[0].0).await;
+    put_head_with(store.as_ref(), vec![entry]).await;
+
+    let outcome = sweep_at(store.as_ref(), &b, past_horizon_ns(), &NoLeases).await;
+    let left = bucket_keys(store.as_ref()).await;
+    assert!(left.contains(&inputs[0].0) && left.contains(&inputs[0].1));
+    assert_eq!(outcome.held_by_snapshot, 2, "the input's commit and data");
+    assert!(!left.contains(&c1_key) && !left.contains(&part_key(&c1)));
+    assert_eq!((outcome.records_deleted, outcome.data_deleted), (1, 1));
+}
+
+/// A live rewrite R and a version 2 C2 both naming C1, with C1's raw inputs
+/// still present, swept past every horizon. The erasure-dominated C2 joins R's
+/// chain group: C2 and its part go with C1, its part and the raw inputs, each
+/// once, and R with its part stays.
+///
+/// Fails on the code before the change, which left C2 and its part (and
+/// gathered the raw inputs from C2's own entry a second time). Flipped line:
+/// `version_2.join_dominated(group, &compactions)?` in rule 2's rewrite arm
+/// (sweep.rs); without it C2 and its part survive, named by no record, with
+/// parts that re-encode the pre-erasure C1.
+#[tokio::test]
+async fn sweep_reclaims_an_erasure_dominated_version_2_record_with_its_rewrite() {
+    let store = Arc::new(MemoryStore::new());
+    let b = logs_bucket();
+    let base = hour_ns();
+    let inputs = seed_inputs(store.as_ref(), &[(0xB1, 1), (0xB2, 2)]).await;
     let c1 = version_1(
         &b,
         vec![input(0xB1, 1), input(0xB2, 2)],
         0xff,
-        part(0xc1, base, base + 10),
+        part(0xc1, base, base + 10_000),
     );
     let c1_key = put_compaction(store.as_ref(), &c1).await;
-    let c2 = version_2(&c1, &c1_key, c1.inputs.clone(), part(0xc2, base, base + 10));
+    let c2 = version_2(
+        &c1,
+        &c1_key,
+        c1.inputs.clone(),
+        part(0xc2, base, base + 10_000),
+    );
     let c2_key = put_compaction(store.as_ref(), &c2).await;
     let r = put_rewrite(
         store.as_ref(),
         &b,
         &c1_key,
         Uuid::from_u128(0xd0),
-        part(0x0e, base, base + 10),
+        part(0x0e, base, base + 10_000),
     )
     .await;
+    let before = bucket_keys(store.as_ref()).await;
 
-    let deleted = sweep_everything(store.as_ref(), &b).await;
-    let c1_part = keys::reconstruct_l1_part_key(&c1, &c1.parts[0]).unwrap();
-    assert_eq!(deleted, BTreeSet::from([c1_key, c1_part]));
-    let after = all_keys(store.as_ref()).await;
+    let outcome = sweep_at(store.as_ref(), &b, past_horizon_ns(), &NoLeases).await;
+    // Two raw commits and C1, C2; two raw data objects and two parts.
+    assert_eq!((outcome.records_deleted, outcome.data_deleted), (4, 4));
+    let after = bucket_keys(store.as_ref()).await;
+    let deleted: BTreeSet<String> = before.difference(&after).cloned().collect();
+    let mut expected: BTreeSet<String> = inputs
+        .iter()
+        .flat_map(|(commit, data)| [commit.clone(), data.clone()])
+        .collect();
+    expected.extend([c1_key, part_key(&c1), c2_key, part_key(&c2)]);
+    assert_eq!(deleted, expected);
     assert_eq!(
         after,
         BTreeSet::from([
-            c2_key,
-            keys::reconstruct_l1_part_key(&c2, &c2.parts[0]).unwrap(),
             keys::rewrite_record_key_for(&r).unwrap(),
             keys::reconstruct_rewrite_part_key(&r, &r.parts[0]).unwrap(),
         ])
     );
+}
+
+/// The dominated C2 is under R's reachability gate as a member of R's group: a
+/// HEAD still naming C2's part (folded while C2 was authoritative, before R
+/// was written) holds C1 and R's whole group with it, and every request R
+/// applied stays held.
+///
+/// Fails on the code before the change, which deleted C1 and its part and held
+/// nothing. Flipped line: as for
+/// [`sweep_reclaims_an_erasure_dominated_version_2_record_with_its_rewrite`];
+/// without the join C2's part is outside the group and the gate clears it.
+#[tokio::test]
+async fn sweep_holds_a_rewrite_group_while_a_head_names_a_dominated_part() {
+    let store = Arc::new(MemoryStore::new());
+    let b = logs_bucket();
+    let base = hour_ns();
+    let c1 = version_1(&b, vec![input(0xB5, 1)], 0xff, part(0xc1, base, base + 10));
+    let c1_key = put_compaction(store.as_ref(), &c1).await;
+    let c2 = version_2(&c1, &c1_key, c1.inputs.clone(), part(0xc2, base, base + 10));
+    put_compaction(store.as_ref(), &c2).await;
+    let request = Uuid::from_u128(0xd5);
+    put_rewrite(
+        store.as_ref(),
+        &b,
+        &c1_key,
+        request,
+        part(0x0e, base, base + 10),
+    )
+    .await;
+    put_head_with(store.as_ref(), vec![l1_entry(&c2)]).await;
+    let before = bucket_keys(store.as_ref()).await;
+
+    let outcome = sweep_at(store.as_ref(), &b, past_horizon_ns(), &NoLeases).await;
+    assert_eq!((outcome.records_deleted, outcome.data_deleted), (0, 0));
+    assert_eq!(outcome.held_by_snapshot, 4, "C1, C2 and their parts");
+    assert_eq!(
+        outcome.held_request_ids,
+        BTreeSet::from([request.to_string()])
+    );
+    assert_eq!(bucket_keys(store.as_ref()).await, before);
 }
 
 /// Seed one raw L0 input per `(writer, seq)` in the logs bucket, returning
@@ -354,13 +817,17 @@ async fn seed_inputs(
 /// hash between C1's and C2's. All three sets are the same size, so the hash
 /// decides. Ignored, the three form one component, C1 wins, and the
 /// authoritative inputs are `a` and `b`; honoured, C1 is excluded, D beats C2,
-/// and they are `b` and `c`. Only `b` is in both, so only `b` goes.
+/// and they are `b` and `c`. Only `b` is in both, so only `b` goes, together
+/// with C1 and its part, which C2's chain group reclaims without touching a
+/// raw input.
 ///
 /// Flipped lines, in `AuthoritativeInputs::from_records` (sweep.rs): keeping
 /// only the ignored view (the sweep before resolution honoured version 2
 /// records) deletes `a`, which the resolver now serves as a raw L0 because no
-/// authoritative record names it; keeping only the honoured view deletes `c`,
-/// which a node that predates the rule still serves as a raw L0.
+/// authoritative record names it; keeping only the honoured view deletes `c`
+/// while C1 is still present, which a node that ignores version 2
+/// supersession still serves as a raw L0. `ChainEntry::gathers_raw_l0_inputs`
+/// answering `true` for a version 2 entry deletes `a` with C1's group.
 #[tokio::test]
 async fn sweep_supersedes_only_inputs_both_views_name() {
     let store = Arc::new(MemoryStore::new());
@@ -395,7 +862,20 @@ async fn sweep_supersedes_only_inputs_both_views_name() {
 
     let deleted = sweep_everything(store.as_ref(), &b).await;
     let (b_commit, b_data) = commits[1].clone();
-    assert_eq!(deleted, BTreeSet::from([b_commit, b_data]));
+    assert_eq!(
+        deleted,
+        BTreeSet::from([b_commit, b_data, c1_key, part_key(&c1)])
+    );
+
+    // With C1 gone the two views agree: D beats C2 in both, so `c`, which D's
+    // part serves, goes on the next pass, and `a`, which only the losing C2
+    // names, is still served raw and stays.
+    let deleted = sweep_everything(store.as_ref(), &b).await;
+    let (c_commit, c_data) = commits[2].clone();
+    assert_eq!(deleted, BTreeSet::from([c_commit, c_data]));
+    let (a_commit, a_data) = commits[0].clone();
+    let left = all_keys(store.as_ref()).await;
+    assert!(left.contains(&a_commit) && left.contains(&a_data));
 }
 
 /// A version 2 C2 naming C1 but carrying `[a, b, c]` where C1 carries
@@ -429,6 +909,99 @@ async fn sweep_deletes_nothing_for_a_version_2_record_with_other_inputs() {
 
     let deleted = sweep_everything(store.as_ref(), &b).await;
     assert_eq!(deleted, BTreeSet::new());
+}
+
+/// The data-object keys a snapshot resolve over the logs bucket's hour serves.
+async fn served_keys(store: &Arc<MemoryStore>, now_ns: i64) -> BTreeSet<String> {
+    let dyn_store: Arc<dyn ObjectStoreBackend> = store.clone();
+    let catalog = ravel_catalog::Catalog::new(
+        dyn_store,
+        ravel_catalog::CatalogConfig {
+            shard_count: SHARD + 1,
+            ..Default::default()
+        },
+    )
+    .expect("catalog");
+    let base = hour_ns();
+    catalog
+        .resolve(
+            &tenant_hash(),
+            Signal::Logs,
+            TimeRange {
+                start_ns: base,
+                end_ns: base + NS_PER_HOUR,
+            },
+            &[],
+            now_ns,
+        )
+        .await
+        .expect("resolve")
+        .segments
+        .iter()
+        .map(|s| s.data_object_key.clone())
+        .collect()
+}
+
+/// A rewrite R naming a version 2 C2 that names C1, swept past every horizon:
+/// R's chain group runs through C2 to C1, so both records, both parts and the
+/// raw L0 inputs below them go, and a resolve afterwards serves R's part and
+/// nothing else.
+///
+/// Flipped line: `ChainLink::Compaction(r) => r.superseded_record_key
+/// .is_empty()` in `ChainLink::names_raw_l0_inputs` (sweep.rs), restored to
+/// `ChainLink::Compaction(_) => true`. The walk then ends at C2: C1 and its
+/// part survive, and C1, named by no present record once C2 is gone, is served
+/// again with its pre-erasure part beside R's.
+#[tokio::test]
+async fn sweep_follows_a_rewrite_chain_through_a_version_2_link() {
+    let store = Arc::new(MemoryStore::new());
+    let b = logs_bucket();
+    let base = hour_ns();
+    let inputs = seed_inputs(store.as_ref(), &[(0x81, 1), (0x82, 2)]).await;
+    let c1 = version_1(
+        &b,
+        vec![input(0x81, 1), input(0x82, 2)],
+        0x00,
+        part(0xc1, base, base + 10_000),
+    );
+    let c1_key = put_compaction(store.as_ref(), &c1).await;
+    let c2 = version_2(
+        &c1,
+        &c1_key,
+        c1.inputs.clone(),
+        part(0xc2, base, base + 10_000),
+    );
+    let c2_key = put_compaction(store.as_ref(), &c2).await;
+    let r = put_rewrite(
+        store.as_ref(),
+        &b,
+        &c2_key,
+        Uuid::from_u128(0xd2),
+        part(0x0e, base, base + 10_000),
+    )
+    .await;
+
+    let deleted = sweep_everything(store.as_ref(), &b).await;
+    let mut expected: BTreeSet<String> = inputs
+        .iter()
+        .flat_map(|(commit, data)| [commit.clone(), data.clone()])
+        .collect();
+    expected.extend([
+        c1_key,
+        keys::reconstruct_l1_part_key(&c1, &c1.parts[0]).unwrap(),
+        c2_key,
+        keys::reconstruct_l1_part_key(&c2, &c2.parts[0]).unwrap(),
+    ]);
+    assert_eq!(deleted, expected);
+    let r_part = keys::reconstruct_rewrite_part_key(&r, &r.parts[0]).unwrap();
+    assert_eq!(
+        all_keys(store.as_ref()).await,
+        BTreeSet::from([keys::rewrite_record_key_for(&r).unwrap(), r_part.clone()])
+    );
+    assert_eq!(
+        served_keys(&store, past_horizon_ns()).await,
+        BTreeSet::from([r_part])
+    );
 }
 
 fn pending_request(b: &Bucket, request_id: Uuid) -> Vec<PendingErasureRequest> {
@@ -577,5 +1150,324 @@ async fn migrate_reaudit_refuses_a_version_2_record_with_other_inputs() {
             && message.contains(&c2_key)
             && message.contains(&c1_key),
         "{message}"
+    );
+}
+
+fn rewrite_key(record: &RewriteRecord) -> String {
+    keys::rewrite_record_key_for(record).unwrap()
+}
+
+fn rewrite_part_key(record: &RewriteRecord) -> String {
+    keys::reconstruct_rewrite_part_key(record, &record.parts[0]).unwrap()
+}
+
+/// The state C2's chain group leaves behind while a HEAD still names the raw
+/// inputs (as in [`sweep_holds_a_head_named_raw_input_apart_from_the_predecessor`]):
+/// C1 is gone, and C2, which re-encodes it, and C1's raw inputs are present.
+/// The erasure pass then writes R naming C2. Past every horizon with no HEAD,
+/// R's walk runs to C2, finds C1 absent, and ends in C2's raw inputs: the two
+/// raw commits, their data objects, C2 and its part go, and a resolve serves
+/// R's part alone before the pass and after it.
+///
+/// Flipped line: the `Some(above)` arm of `version_2_above.take()` in
+/// `gather_superseded_chain` (sweep.rs) replaced with `truncated = true`. The
+/// raw inputs then survive C2, R's chase stops at the absent C2 and excludes
+/// nothing, and they are served beside R's part, erased subject included.
+#[tokio::test]
+async fn sweep_ends_a_rewrite_chain_in_the_raw_inputs_under_a_version_2_link() {
+    let store = Arc::new(MemoryStore::new());
+    let b = logs_bucket();
+    let base = hour_ns();
+    let inputs = seed_inputs(store.as_ref(), &[(0x75, 1), (0x76, 2)]).await;
+    let c1 = version_1(
+        &b,
+        vec![input(0x75, 1), input(0x76, 2)],
+        0x00,
+        part(0xc1, base, base + 10_000),
+    );
+    // Never put: C2's chain group already reclaimed it.
+    let c1_key = keys::compaction_record_key_for(&c1).unwrap();
+    let c2 = version_2(
+        &c1,
+        &c1_key,
+        c1.inputs.clone(),
+        part(0xc2, base, base + 10_000),
+    );
+    let c2_key = put_compaction(store.as_ref(), &c2).await;
+    let r = put_rewrite(
+        store.as_ref(),
+        &b,
+        &c2_key,
+        Uuid::from_u128(0xd7),
+        part(0x0e, base, base + 10_000),
+    )
+    .await;
+    let r_part = rewrite_part_key(&r);
+    assert_eq!(
+        served_keys(&store, past_horizon_ns()).await,
+        BTreeSet::from([r_part.clone()])
+    );
+
+    let deleted = sweep_everything(store.as_ref(), &b).await;
+    assert_eq!(
+        served_keys(&store, past_horizon_ns()).await,
+        BTreeSet::from([r_part.clone()])
+    );
+    let mut expected: BTreeSet<String> = inputs
+        .iter()
+        .flat_map(|(commit, data)| [commit.clone(), data.clone()])
+        .collect();
+    expected.extend([c2_key, part_key(&c2)]);
+    assert_eq!(deleted, expected);
+    assert_eq!(
+        all_keys(store.as_ref()).await,
+        BTreeSet::from([rewrite_key(&r), r_part])
+    );
+}
+
+/// A rule 2 pass over `mem` whose deletes of `failing_key` time out: the pass
+/// fails, and the fault fired exactly once.
+async fn sweep_failing_delete_of(mem: &Arc<MemoryStore>, b: &Bucket, failing_key: &str) {
+    let plan = FaultPlan::empty()
+        .with_rule(Rule::new(Op::Delete, ScriptedFault::Timeout).with_key_contains(failing_key));
+    let store = FaultStore::new(mem.clone(), plan);
+    let result = sweep_superseded(
+        &store,
+        &FixedClock::new(past_horizon_ns()),
+        &cfg(),
+        &NoLeases,
+        &b.tenant_hash,
+        b.signal,
+        b.shard,
+    )
+    .await;
+    assert!(result.is_err(), "the failed record delete fails the pass");
+    assert_eq!(store.fault_count(Op::Delete, FaultKind::Timeout), 1);
+}
+
+/// R2 over R1 over C1, with a version 2 C2 naming C1 that the rewrites
+/// dominate. R2's group deletes C2 ahead of the chain's own records, so a
+/// delete of C2 that fails leaves every record in place (only the parts are
+/// gone) and a resolve still serves R2's part alone. A clean pass afterwards
+/// finishes the group.
+///
+/// Flipped line: `joined_keys.append(&mut group.chain_record_keys)` in
+/// `Version2Groups::join_dominated` (sweep.rs) turned around, so the joined
+/// records follow the chain's own. C1 and R1 then go before the failed delete
+/// of C2, R2 names an absent R1, C2 names a key no rewrite chain reaches and
+/// is no longer dominated, and the resolve serves C2's part beside R2's.
+#[tokio::test]
+async fn sweep_deletes_a_dominated_record_before_the_rewrite_chain_it_joins() {
+    let mem = Arc::new(MemoryStore::new());
+    let b = logs_bucket();
+    let base = hour_ns();
+    let c1 = version_1(&b, vec![input(0xE5, 1)], 0xff, part(0xc1, base, base + 10));
+    let c1_key = put_compaction(mem.as_ref(), &c1).await;
+    let c2 = version_2(&c1, &c1_key, c1.inputs.clone(), part(0xc2, base, base + 10));
+    let c2_key = put_compaction(mem.as_ref(), &c2).await;
+    let r1 = put_rewrite(
+        mem.as_ref(),
+        &b,
+        &c1_key,
+        Uuid::from_u128(0xe1),
+        part(0x1e, base, base + 10),
+    )
+    .await;
+    let r2 = put_rewrite(
+        mem.as_ref(),
+        &b,
+        &rewrite_key(&r1),
+        Uuid::from_u128(0xe2),
+        part(0x2e, base, base + 10),
+    )
+    .await;
+    let r2_part = rewrite_part_key(&r2);
+    assert_eq!(
+        served_keys(&mem, past_horizon_ns()).await,
+        BTreeSet::from([r2_part.clone()])
+    );
+
+    sweep_failing_delete_of(&mem, &b, &c2_key).await;
+    assert_eq!(
+        served_keys(&mem, past_horizon_ns()).await,
+        BTreeSet::from([r2_part.clone()])
+    );
+    assert_eq!(
+        bucket_keys(mem.as_ref()).await,
+        BTreeSet::from([
+            c1_key,
+            c2_key,
+            rewrite_key(&r1),
+            rewrite_key(&r2),
+            r2_part.clone(),
+        ])
+    );
+
+    let outcome = sweep_at(mem.as_ref(), &b, past_horizon_ns(), &NoLeases).await;
+    assert_eq!((outcome.records_deleted, outcome.data_deleted), (3, 3));
+    assert_eq!(
+        bucket_keys(mem.as_ref()).await,
+        BTreeSet::from([rewrite_key(&r2), r2_part])
+    );
+}
+
+/// A version 2 C3 over a version 2 C2 over C1, with a rewrite R naming C1, so
+/// both version 2 records are dominated and join R's group. The newer C3 is
+/// deleted first, so a delete of C3 that fails leaves every record in place
+/// and a resolve still serves R's part alone.
+///
+/// Flipped line: `joined.into_iter().rev()` in `Version2Groups::join_dominated`
+/// (sweep.rs) without the `.rev()`. C2 then goes before the failed delete of
+/// C3, which is left naming an absent C2 that no rewrite chain reaches, is no
+/// longer dominated, and outranks C1 in their overlap component, so the
+/// resolve serves C3's part beside R's.
+#[tokio::test]
+async fn sweep_deletes_dominated_records_newest_first() {
+    let mem = Arc::new(MemoryStore::new());
+    let b = logs_bucket();
+    let base = hour_ns();
+    let c1 = version_1(&b, vec![input(0xE6, 1)], 0xff, part(0xc1, base, base + 10));
+    let c1_key = put_compaction(mem.as_ref(), &c1).await;
+    let c2 = version_2(&c1, &c1_key, c1.inputs.clone(), part(0xc2, base, base + 10));
+    let c2_key = put_compaction(mem.as_ref(), &c2).await;
+    let c3 = version_2(&c2, &c2_key, c2.inputs.clone(), part(0xc3, base, base + 10));
+    let c3_key = put_compaction(mem.as_ref(), &c3).await;
+    assert!(
+        c3.input_set_hash < c1.input_set_hash,
+        "C3 must outrank C1 once it is not dominated"
+    );
+    let r = put_rewrite(
+        mem.as_ref(),
+        &b,
+        &c1_key,
+        Uuid::from_u128(0xe3),
+        part(0x3e, base, base + 10),
+    )
+    .await;
+    let r_part = rewrite_part_key(&r);
+    assert_eq!(
+        served_keys(&mem, past_horizon_ns()).await,
+        BTreeSet::from([r_part.clone()])
+    );
+
+    sweep_failing_delete_of(&mem, &b, &c3_key).await;
+    assert_eq!(
+        served_keys(&mem, past_horizon_ns()).await,
+        BTreeSet::from([r_part.clone()])
+    );
+    assert_eq!(
+        bucket_keys(mem.as_ref()).await,
+        BTreeSet::from([c1_key, c2_key, c3_key, rewrite_key(&r), r_part.clone()])
+    );
+
+    let outcome = sweep_at(mem.as_ref(), &b, past_horizon_ns(), &NoLeases).await;
+    assert_eq!((outcome.records_deleted, outcome.data_deleted), (3, 3));
+    assert_eq!(
+        bucket_keys(mem.as_ref()).await,
+        BTreeSet::from([rewrite_key(&r), r_part])
+    );
+}
+
+/// R names a version 2 C2 that carries `[a, b, c]` while the C1 it names
+/// carries `[a, b]`, so the bucket's version 2 supersession does not resolve.
+/// Past every horizon a deleting pass does not follow R's chain past C2 and
+/// reclaims nothing of it, and C2's extra input `c` is never deleted.
+///
+/// Flipped line: the `Version2Links::Refuse` choice in rule 2's rewrite arm
+/// (sweep.rs) replaced with `Version2Links::Follow`. R's walk then runs
+/// through C2 to C1 and deletes `a`, `b`, C1, C2 and both parts.
+#[tokio::test]
+async fn sweep_does_not_follow_a_version_2_link_in_an_unresolved_bucket() {
+    let store = Arc::new(MemoryStore::new());
+    let b = logs_bucket();
+    let base = hour_ns();
+    let inputs = seed_inputs(store.as_ref(), &[(0x65, 1), (0x66, 2), (0x67, 3)]).await;
+    let c1 = version_1(
+        &b,
+        vec![input(0x65, 1), input(0x66, 2)],
+        0x00,
+        part(0xc1, base, base + 10_000),
+    );
+    let c1_key = put_compaction(store.as_ref(), &c1).await;
+    let c2 = version_2(
+        &c1,
+        &c1_key,
+        vec![input(0x65, 1), input(0x66, 2), input(0x67, 3)],
+        part(0xc2, base, base + 10_000),
+    );
+    let c2_key = put_compaction(store.as_ref(), &c2).await;
+    put_rewrite(
+        store.as_ref(),
+        &b,
+        &c2_key,
+        Uuid::from_u128(0xd8),
+        part(0x0e, base, base + 10_000),
+    )
+    .await;
+    let before = bucket_keys(store.as_ref()).await;
+
+    let outcome = sweep_at(store.as_ref(), &b, past_horizon_ns(), &NoLeases).await;
+    assert_eq!(outcome, SupersededSweepOutcome::default());
+    assert_eq!(sweep_everything(store.as_ref(), &b).await, BTreeSet::new());
+    assert_eq!(bucket_keys(store.as_ref()).await, before);
+    let (c_commit, c_data) = inputs[2].clone();
+    assert!(before.contains(&c_commit) && before.contains(&c_data));
+}
+
+/// A version 2 C2 naming a C1 that is already gone, with a rewrite R naming
+/// the same C1: C2 is dominated, so it is skipped from its own entry, and R's
+/// walk finds C1 absent and gathers nothing. C2 is attached to R's group by
+/// the key both name and reclaimed with it past the horizon, its part before
+/// its record: a delete of C2's record that fails leaves the part gone and
+/// the record present, and a clean pass then removes the record. A resolve
+/// serves R's part alone throughout.
+///
+/// Flipped line: `.chain(group.absent_end.iter())` in
+/// `Version2Groups::join_dominated` (sweep.rs) removed. C2 then joins no
+/// group, no delete of it is issued, and it is kept with its pre-erasure part.
+#[tokio::test]
+async fn sweep_reclaims_a_dominated_record_whose_predecessor_is_gone() {
+    let mem = Arc::new(MemoryStore::new());
+    let b = logs_bucket();
+    let base = hour_ns();
+    let c1 = version_1(&b, vec![input(0xE7, 1)], 0xff, part(0xc1, base, base + 10));
+    // Never put: R's group already reclaimed it.
+    let c1_key = keys::compaction_record_key_for(&c1).unwrap();
+    let c2 = version_2(&c1, &c1_key, c1.inputs.clone(), part(0xc2, base, base + 10));
+    let c2_key = put_compaction(mem.as_ref(), &c2).await;
+    let r = put_rewrite(
+        mem.as_ref(),
+        &b,
+        &c1_key,
+        Uuid::from_u128(0xe4),
+        part(0x4e, base, base + 10),
+    )
+    .await;
+    let r_part = rewrite_part_key(&r);
+    assert_eq!(
+        served_keys(&mem, past_horizon_ns()).await,
+        BTreeSet::from([r_part.clone()])
+    );
+
+    sweep_failing_delete_of(&mem, &b, &c2_key).await;
+    assert_eq!(
+        bucket_keys(mem.as_ref()).await,
+        BTreeSet::from([c2_key.clone(), rewrite_key(&r), r_part.clone()])
+    );
+    assert_eq!(
+        served_keys(&mem, past_horizon_ns()).await,
+        BTreeSet::from([r_part.clone()])
+    );
+
+    let outcome = sweep_at(mem.as_ref(), &b, past_horizon_ns(), &NoLeases).await;
+    assert_eq!((outcome.records_deleted, outcome.data_deleted), (1, 1));
+    assert_eq!(outcome.dominated_records_unattached, 0);
+    assert_eq!(
+        bucket_keys(mem.as_ref()).await,
+        BTreeSet::from([rewrite_key(&r), r_part.clone()])
+    );
+    assert_eq!(
+        served_keys(&mem, past_horizon_ns()).await,
+        BTreeSet::from([r_part])
     );
 }

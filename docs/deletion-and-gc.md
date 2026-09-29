@@ -116,7 +116,7 @@ own parameters, not gaps a correctly declared config leaves open.
 |---|---|---|---|
 | orphan (first implementation, ADR-0010 §11; batched re-verify and breaker, ADR-0048 decisions 4-5; quarantine, ADR-0058 amendment) | data object with no commit record | age > grace + max_flush_lifetime (default 1 h); record absence re-verified by one fresh LIST shared by every candidate in the pass; the mass-orphan circuit breaker not tripped (or deliberately overridden). A candidate that clears these is moved to `quarantine/`, not deleted | object last_modified |
 | quarantine reaper (ADR-0058 amendment) | a `quarantine/<original key>/q<ns>` object an orphan pass moved out of the live keyspace | age since the quarantine timestamp embedded in the key > quarantine_horizon (default 7 days); a key whose `/q<ns>` segment does not parse is skipped, never deleted | quarantine key's own `/q<ns>` timestamp |
-| superseded input (ADR-0018, HEAD-reachability gate ADR-0020) | L0 commit records + data objects named in a compaction or rewrite record's input list, or a whole superseded predecessor record together with the parts it names | now >= record.created_unix_ns + protection_horizon; the live catalog HEAD snapshot names none of the objects the delete would remove (delete blocker, see below) | compaction or rewrite record created_unix_ns |
+| superseded input (ADR-0018, HEAD-reachability gate ADR-0020) | L0 commit records + data objects named in a compaction or rewrite record's input list; a whole superseded predecessor record together with the parts it names, whether a rewrite record or a version 2 compaction record supersedes it; an erasure-dominated version 2 compaction record with its parts, in the chain group of the rewrite that dominates it | now >= record.created_unix_ns + protection_horizon, for the rewrite or version 2 record the chain group is entered from; the live catalog HEAD snapshot names none of the objects the delete would remove (delete blocker, see below); no legal hold on any key of the chain group | compaction, rewrite or version 2 record created_unix_ns |
 | unreferenced part | `l1/` object referenced by no compaction record in its bucket | a compaction record OR a retention tombstone exists for the bucket (a tombstone makes future compaction impossible, so a record-less part can never be re-referenced); age > grace + max_compaction_lifetime; the branch condition (non-reference, or record-absent-and-tombstoned) re-verified immediately before delete | part last_modified |
 | retention (ADR-0019, HEAD-reachability gate ADR-0020) | everything in a tombstoned bucket, tombstone deleted last | now >= tombstone.retired_at_ns + protection_horizon; the live catalog HEAD snapshot names no object inside the bucket (delete blocker, see below); bucket LIST-verified empty before the tombstone itself is deleted | tombstone retired_at_ns |
 | idempotency marker (ADR-0051 §5; logs and spans only, run once per signal rather than per shard) | `t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm` marker object | marker's `<ingest_hour>` older than `now_hour - idem_dedup_window_hours - IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS`; a key that fails to parse as `<keyhash32>.<ingest_hour>.idm` is skipped, never deleted | marker key's own `<ingest_hour>` |
@@ -167,7 +167,43 @@ the entire chain at once, down to the raw inputs the oldest generation
 superseded: a HEAD naming anything in the chain holds all of it. Asking per
 generation would clear on a stale HEAD, which names the raw inputs rather than
 any generation's outputs, and would delete a record while the inputs it erased
-a subject out of were still resolvable.
+a subject out of were still resolvable. A version 2 compaction record on a
+rewrite's chain is a link, not an end: the chain continues to the record it
+re-encodes, so a rewrite over a version 2 record reclaims that record's
+predecessor too.
+
+A version 2 compaction record supersedes the compaction record it re-encodes,
+and the sweep reclaims that predecessor, with its parts, as a chain group of
+the same kind, entered from the version 2 record at the head of the chain and
+followed to its end: over C3, C2 and C1, the group entered from C3 holds C2
+and C1. It is gathered only once the version 2 record's protection horizon has
+passed, the HEAD gate decides it whole, and a legal hold on any key in it holds
+all of it. It holds no raw input: those are the version 2 record's own inputs,
+copied verbatim, and the input rule decides them exactly as for any compaction
+record. A version 2 record naming a record that is not present reclaims
+nothing.
+
+A version 2 record whose predecessor a present rewrite record also supersedes
+is dominated: its parts re-encode the pre-erasure data. A rewrite that names
+it directly reaches it on its own chain walk; otherwise no record on the chain
+names it, so it joins the chain group of the rewrite whose chain reaches the
+record it names, and is deleted with its parts under that group's horizon,
+HEAD gate and hold. A HEAD that still names its parts holds the whole group,
+and with it every erasure request the live rewrite applied and every one the
+group's records applied. Dominated records are deleted ahead of the chain's
+own records and newest first, so a crash between two deletes never leaves one
+undominated. A dominated record whose predecessor is already gone joins the
+group of the rewrite whose chain ends at that same absent key, even when that
+group holds nothing else; one that no group takes is logged and counted in the
+pass's `dominated_records_unattached`, not skipped silently.
+
+In a bucket whose version 2 supersession does not resolve (a cycle, a chain
+past the depth bound, or a version 2 record whose inputs differ from the
+record it names), which records a version 2 record supersedes is not known. A
+rewrite's chain group there that reaches a version 2 record reclaims nothing,
+not even the records above the link: the group is one unit, and deleting its
+upper records would leave the rest resolvable with nothing naming them as
+erased.
 
 A rewrite record landing outside both the fixed reconcile window and the
 frontier band is not left to wait indefinitely for one of those two passes to
@@ -410,7 +446,12 @@ than deletes, so even a forced pass keeps the recovery window.
   missing rows. The losing record's own parts are served from nowhere, but
   they stay referenced for as long as the losing record exists, and no rule
   removes a losing record today: the sweep reclaims neither, so an overlap
-  leaves the loser's parts in place as a bounded storage cost.
+  leaves the loser's parts in place as a bounded storage cost. A record a
+  present version 2 record supersedes is excluded like a loser but is
+  reclaimed (above). While it is present, an input counts as superseded only
+  where an authoritative record names it both with and without that
+  supersession applied, since excluding the predecessor can hand its overlap
+  group to another record.
 - **A rewrite record outlives every input it superseded.** A whole
   supersession chain, from the live record back to the raw inputs its oldest
   generation superseded, is one indivisible delete unit: the HEAD gate decides
