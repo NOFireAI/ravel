@@ -369,9 +369,14 @@ fn page_index_error(err: ParquetError) -> FooterError {
 
 /// Refuse a page index whose page locations the scan could not use
 /// safely: every data page must lie inside its column chunk's byte range,
-/// the first page must start at row 0, each page must start at a later row
-/// than the one before and inside the row group, and a column index, where
-/// there is one, must describe as many pages as the offset index lists.
+/// the first at the chunk's `data_page_offset` and each later one at or past
+/// the end of the one before; the first page must start at row 0, each page
+/// must start at a later row than the one before and inside the row group;
+/// and a column index, where there is one, must describe as many pages as
+/// the offset index lists. The scan reads every data page from its location
+/// and every byte before the first one as a dictionary page, so a location
+/// naming another page's bytes, or a gap before the first, decodes the wrong
+/// values without an error.
 fn check_page_index(metadata: &ParquetMetaData) -> Result<(), String> {
     let Some(offset_index) = metadata.offset_index() else {
         return Ok(());
@@ -399,6 +404,7 @@ fn check_page_index(metadata: &ParquetMetaData) -> Result<(), String> {
                 .unwrap_or_else(|| chunk.data_page_offset());
             let end = start.saturating_add(chunk.compressed_size());
             let mut previous_row: Option<i64> = None;
+            let mut previous_end: Option<i64> = None;
             for (page, location) in index.page_locations().iter().enumerate() {
                 let page_end = location
                     .offset
@@ -419,7 +425,26 @@ fn check_page_index(metadata: &ParquetMetaData) -> Result<(), String> {
                         location.compressed_page_size, location.offset
                     ));
                 }
+                match previous_end {
+                    None if location.offset != chunk.data_page_offset() => {
+                        return Err(format!(
+                            "row group {row_group} column {column}: the first page is at offset \
+                             {}, the chunk's first data page at {}",
+                            location.offset,
+                            chunk.data_page_offset()
+                        ));
+                    }
+                    Some(previous_end) if location.offset < previous_end => {
+                        return Err(format!(
+                            "row group {row_group} column {column} page {page}: offset {} is \
+                             before the previous page's end {previous_end}",
+                            location.offset
+                        ));
+                    }
+                    _ => {}
+                }
                 previous_row = Some(row);
+                previous_end = page_end;
             }
             if let Some(column_index) = metadata
                 .column_index()
@@ -1115,6 +1140,209 @@ mod tests {
         );
         assert_eq!(filtered, first);
         assert_eq!(again, first);
+    }
+
+    /// One `a: Int64` column holding 1..=4, plain and uncompressed, in two
+    /// data pages of two values each, with no dictionary page and no
+    /// statistics, so the two pages are the same size.
+    fn two_equal_pages() -> Vec<u8> {
+        use datafusion::arrow::array::{ArrayRef, Int64Array};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use parquet::file::properties::{EnabledStatistics, WriterProperties};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let batch = datafusion::arrow::array::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4])) as ArrayRef],
+        )
+        .expect("batch");
+        let properties = WriterProperties::builder()
+            .set_dictionary_enabled(false)
+            .set_statistics_enabled(EnabledStatistics::None)
+            .set_data_page_row_count_limit(2)
+            .set_write_batch_size(2)
+            .build();
+        let mut bytes = Vec::new();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(&mut bytes, schema, Some(properties))
+            .expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+        bytes
+    }
+
+    /// Append `value` to `out` as a compact-protocol zigzag varint.
+    fn zigzag_varint(value: i64, out: &mut Vec<u8>) {
+        let mut rest = ((value << 1) ^ (value >> 63)) as u64;
+        while rest >= 0x80 {
+            out.push((rest as u8 & 0x7f) | 0x80);
+            rest >>= 7;
+        }
+        out.push(rest as u8);
+    }
+
+    /// [`two_equal_pages`] with the offset index's second page location
+    /// moved onto the first page's offset, its size and first row unchanged.
+    /// Every other byte, the footer included, is untouched.
+    fn second_page_on_the_first() -> Vec<u8> {
+        let mut bytes = two_equal_pages();
+        let chunks = page_locations_of(&bytes).expect("an offset index");
+        let [(_, _, pages)] = chunks.as_slice() else {
+            panic!("one column chunk, got {}", chunks.len());
+        };
+        let [first, second] = pages.as_slice() else {
+            panic!("two pages, got {pages:?}");
+        };
+        assert_eq!(first.compressed_page_size, second.compressed_page_size);
+        assert_eq!(second.first_row_index, 2);
+        // PageLocation's first two fields, as the offset index encodes them.
+        let encode = |offset: i64| {
+            let mut out = vec![0x16];
+            zigzag_varint(offset, &mut out);
+            out.push(0x15);
+            zigzag_varint(i64::from(second.compressed_page_size), &mut out);
+            out
+        };
+        let (was, now) = (encode(second.offset), encode(first.offset));
+        assert_eq!(was.len(), now.len());
+        let at: Vec<usize> = (0..bytes.len() - was.len())
+            .filter(|&at| bytes[at..at + was.len()] == was[..])
+            .collect();
+        let [at] = at.as_slice() else {
+            panic!("one encoding of the second location, found {at:?}");
+        };
+        bytes[*at..*at + now.len()].copy_from_slice(&now);
+        let moved = page_locations_of(&bytes).expect("still decodes");
+        assert_eq!(moved[0].2[1].offset, first.offset);
+        assert_eq!(moved[0].2[1].first_row_index, 2);
+        bytes
+    }
+
+    /// Two page locations naming the same bytes pass every per-page check:
+    /// each lies inside the chunk and starts at a later row. The scan reads
+    /// every page from its location, so it would decode the first page twice
+    /// and return 1, 2, 1, 2 with the right row count; the reader refuses the
+    /// index instead, and a scan of it beside an intact file fails typed with
+    /// no rows.
+    #[tokio::test]
+    async fn a_page_location_overlapping_the_one_before_is_corrupt() {
+        let bytes = second_page_on_the_first();
+        let (size, footer_len) = (bytes.len() as u64, footer_len_of(&bytes));
+        let store = Arc::new(MemoryStore::new());
+        let fixture = Fixture::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>);
+        let intact = fixture
+            .put_file(
+                &store,
+                "lake/t/intact.parquet",
+                Bytes::from(two_equal_pages()),
+                false,
+            )
+            .await;
+        let table = fixture.provider("t", 1, vec![intact.clone()], false).await;
+        let rows = read_all(&fixture.session(&[("t", table)]), "t", &["a"]).await;
+        assert_eq!(rows.expect("the intact file reads"), "1,2,3,4");
+
+        let file = fixture
+            .put_raw(&store, KEY, Bytes::from(bytes), size, footer_len)
+            .await;
+        let table = fixture.provider("t", 1, vec![intact, file], false).await;
+        let got = read_all(&fixture.session(&[("t", table)]), "t", &["a"]).await;
+        match got {
+            Err(err) => match read_error(&err) {
+                Some(ParquetReadError::Corrupt { key, message }) => {
+                    assert_eq!(key, KEY);
+                    assert!(
+                        message.contains("before the previous page's end"),
+                        "{message}"
+                    );
+                }
+                other => panic!("expected Corrupt, got {other:?} from {err}"),
+            },
+            Ok(rows) => panic!("expected Corrupt, got rows {rows}"),
+        }
+    }
+
+    /// The metadata of `bytes` with its page index, as the reader loads it.
+    fn metadata_with_page_index(bytes: &[u8]) -> ParquetMetaData {
+        ParquetMetaDataReader::new()
+            .with_page_index_policy(PageIndexPolicy::Required)
+            .parse_and_finish(&Bytes::copy_from_slice(bytes))
+            .expect("metadata with a page index")
+    }
+
+    /// An offset index whose one location is the second data page: it lies
+    /// inside the chunk and starts at row 0, but the scan would read the first
+    /// data page's bytes, before it, as a dictionary page.
+    #[test]
+    fn a_first_page_location_past_the_first_data_page_is_refused() {
+        let metadata = metadata_with_page_index(&two_equal_pages());
+        let chunk = metadata.row_group(0).column(0);
+        assert_eq!(chunk.dictionary_page_offset(), None);
+        let second =
+            metadata.offset_index().expect("an offset index")[0][0].page_locations()[1].clone();
+        assert!(second.offset > chunk.data_page_offset());
+        let mut index = parquet::file::metadata::OffsetIndexBuilder::new();
+        index.append_offset_and_size(second.offset, second.compressed_page_size);
+        index.append_row_count(4);
+        let moved = parquet::file::metadata::ParquetMetaDataBuilder::new_from_metadata(metadata)
+            .set_offset_index(Some(vec![vec![index.build()]]))
+            .build();
+        let err = check_page_index(&moved).expect_err("refused");
+        assert!(err.contains("the chunk's first data page at"), "{err}");
+    }
+
+    /// ArrowWriter's own layout passes the page order checks: with a
+    /// dictionary page, the first location is the chunk's `data_page_offset`
+    /// and the dictionary page lies before it; without one, the first location
+    /// is where the chunk starts. Both files scan to their rows.
+    #[tokio::test]
+    async fn arrow_writer_files_pass_the_page_order_checks() {
+        use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use parquet::file::properties::WriterProperties;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Utf8, false),
+        ]));
+        let batch = datafusion::arrow::array::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4, 5, 6])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["x", "y", "x", "y", "x", "y"])),
+            ],
+        )
+        .expect("batch");
+        let properties = WriterProperties::builder()
+            .set_data_page_row_count_limit(2)
+            .set_write_batch_size(2)
+            .build();
+        let mut dictionary = Vec::new();
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(&mut dictionary, schema, Some(properties))
+                .expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+
+        let metadata = metadata_with_page_index(&dictionary);
+        let offset_index = metadata.offset_index().expect("an offset index");
+        for (chunk, index) in metadata.row_group(0).columns().iter().zip(&offset_index[0]) {
+            let pages = index.page_locations();
+            assert_eq!(pages.len(), 3, "{pages:?}");
+            assert!(chunk.dictionary_page_offset().expect("a dictionary") < pages[0].offset);
+            assert_eq!(pages[0].offset, chunk.data_page_offset());
+        }
+        check_page_index(&metadata).expect("the dictionary-encoded file passes");
+        let plain = metadata_with_page_index(&two_equal_pages());
+        check_page_index(&plain).expect("the plain file passes");
+
+        let store = Arc::new(MemoryStore::new());
+        let fixture = Fixture::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>);
+        let file = fixture
+            .put_file(&store, KEY, Bytes::from(dictionary), false)
+            .await;
+        let table = fixture.provider("t", 1, vec![file], false).await;
+        let rows = read_all(&fixture.session(&[("t", table)]), "t", &["a", "b"]).await;
+        assert_eq!(rows.expect("rows"), "1|x,2|y,3|x,4|y,5|x,6|y");
     }
 
     /// `SELECT t.a, t.b FROM u JOIN t ON u.a = t.a`, where table `t`'s files

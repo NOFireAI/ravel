@@ -1075,7 +1075,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   in one group in manifest order. Every reader loads and checks a file's page
   index with its footer, whatever the statement filters, so a page outside its
   column chunk is a `Corrupt` error rather than a panic, including when a join
-  or TopK pushes a dynamic filter into the scan. A footer or page index refused
+  or TopK pushes a dynamic filter into the scan. A page location that starts
+  before the previous page's end, or a first location other than the chunk's
+  first data page, is `Corrupt` too: the scan reads every page from its
+  location, so either would otherwise decode the wrong bytes without an
+  error. A footer or page index refused
   as `Corrupt` is cached as refused; a read that failed, or came back short, is
   not.
   `tenant parquet-grant add` lists past a zero-byte directory blob, and says so
