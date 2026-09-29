@@ -829,6 +829,13 @@ impl Catalog {
     /// [`Catalog::decoded_cache_memory_evictions`] nor
     /// [`Catalog::decode_reserve_retries`].
     ///
+    /// A decode charged 0 bytes (its declared length is over the ceiling, see
+    /// [`ravel_memory::decoded_charge`]) skips the pass the same way. It is
+    /// refused only on a budget a `reserve_unchecked` caller pushed over its
+    /// limit, where eviction can never make room for 0 bytes: the pass loops
+    /// only while the free space is below `want`, so it would evict nothing
+    /// and the retry would return the same refusal.
+    ///
     /// Eviction and retry are NOT atomic against each other or against other
     /// resolves. Another task can take the freed bytes between the two, so a
     /// retry can be refused against a budget this pass did make room in; and
@@ -846,8 +853,8 @@ impl Catalog {
             Ok(reservation) => return Ok(reservation),
             Err(refusal) => refusal,
         };
-        let want = crate::charged::decoded_charge(declared, ceiling);
-        if want > self.memory_budget.limit() {
+        let want = ravel_memory::decoded_charge(declared, ceiling);
+        if want == 0 || want > self.memory_budget.limit() {
             return Err(refusal);
         }
         self.decoded.evict_until_fits(&self.memory_budget, want);
@@ -863,8 +870,10 @@ impl Catalog {
 
     /// Decode reservations retried after such an eviction pass, cumulative.
     /// One per refused reservation that ran the pass, whether or not the retry
-    /// succeeded; a refusal over the budget's whole limit skips the pass and
-    /// counts nothing.
+    /// succeeded. Two refusals skip the pass and count nothing: a decode
+    /// wanting more than the budget's whole limit, and a decode charged 0
+    /// bytes (declared over its ceiling) refused by a budget already over its
+    /// limit.
     pub fn decode_reserve_retries(&self) -> u64 {
         self.decode_reserve_retries.load(Ordering::Relaxed)
     }
@@ -11487,8 +11496,8 @@ mod tests {
     /// an oversized part into a retryable memory error on every budget with
     /// less than the ceiling free.
     ///
-    /// FLIP: make `charged::decoded_charge` return `declared.min(ceiling)` and
-    /// this resolve fails with
+    /// FLIP: make `ravel_memory::decoded_charge` return
+    /// `declared.min(ceiling)` and this resolve fails with
     /// `CatalogError::MemoryExhausted(MemoryExhausted { requested: 1,
     /// reserved: 0, limit: 0 })`, so `expect` panics on it.
     #[tokio::test]
@@ -12104,6 +12113,69 @@ mod tests {
             "the unrelated tenant's cached part survives the refusal"
         );
         assert_eq!(budget.reserved(), small_len);
+    }
+
+    /// A decode declaring more than its ceiling is charged 0, and on a budget
+    /// a `reserve_unchecked` caller pushed over its limit even 0 bytes are
+    /// refused. No eviction can make 0 bytes fit any better than they already
+    /// do, so that refusal is final: no eviction pass, no retry counted.
+    ///
+    /// FLIP: drop the `want == 0` early return from `Catalog::reserve_decoded`
+    /// (catalog.rs) and the pass runs for nothing: `decode_reserve_retries()`
+    /// below reads 1 instead of 0, while `decoded_cache_memory_evictions()`
+    /// still reads 0.
+    #[tokio::test]
+    async fn a_zero_charge_refused_over_the_limit_skips_the_eviction_pass() {
+        let store = Arc::new(MemoryStore::new());
+        let sealed_hour = 500_000u32;
+        let now_ns = fold_now_ns(sealed_hour);
+        let range = sealed_hour_range(sealed_hour);
+        let cached = TenantHash([0x63; 16]);
+        let cached_len = fold_one_part_for(&store, cached, sealed_hour, 1).await;
+
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(cached_len));
+        let catalog = Catalog::new(store.clone(), config(1))
+            .expect("catalog")
+            .with_memory_budget(budget.clone());
+        catalog
+            .resolve(&cached, Signal::Metrics, range, &[], now_ns)
+            .await
+            .expect("the tenant resolves within the budget");
+        assert_eq!(catalog.part_cache().total_entries(), 1);
+        assert_eq!(budget.reserved(), cached_len);
+
+        budget.reserve_unchecked(1);
+        assert_eq!(
+            budget.reserved(),
+            cached_len + 1,
+            "the budget is over its limit"
+        );
+
+        const CEILING: u64 = 4_096;
+        let err = catalog
+            .reserve_decoded(CEILING + 1, CEILING)
+            .expect_err("a budget over its limit refuses even a 0-byte reservation");
+        assert_eq!(
+            err,
+            ravel_memory::MemoryExhausted {
+                requested: 0,
+                reserved: cached_len + 1,
+                limit: cached_len,
+            }
+        );
+        assert_eq!(
+            catalog.decode_reserve_retries(),
+            0,
+            "a 0-byte charge is refused once, with no retry"
+        );
+        assert_eq!(
+            catalog.decoded_cache_memory_evictions(),
+            0,
+            "and no eviction pass"
+        );
+        assert_eq!(catalog.part_cache().total_entries(), 1);
+        budget.release(1);
+        assert_eq!(budget.reserved(), cached_len);
     }
 
     /// The declared `body_uncompressed_len` of the one-segment, one-column v3
