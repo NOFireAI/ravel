@@ -11,14 +11,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **RLOG log objects are now written and read at trailer version 5**
   (ADR-2135, issue #2139). The footer gains a sort descriptor and a clustering
   generation, the BLOOM section starts with the list of columns its filters
-  cover, bloom filters are sized to a multiple of 512 bits instead of a power
-  of two, and encoding tags 10 to 13 are registered but never written. The
-  writer still produces version 4's content: no sort descriptor, generation
-  0, and bloom coverage of body, severity text and every string attribute.
-  Exact filter sizing made the test fixtures' objects 1 to 3 percent
-  smaller and brings the bloom false-positive rate up to its designed ~1
-  percent from the lower rate power-of-two rounding gave, so a text
-  predicate may scan a few more blocks than before. The reader accepts only
+  cover under its own crc32c, bloom filters are sized to a multiple of 512
+  bits instead of a power of two, and encoding tags 10 to 13 are registered
+  but never written. A covered list that fails its crc is refused as
+  corrupt and the scan falls back to no bloom pruning. The writer still
+  produces version 4's content: no sort descriptor, generation 0, and bloom
+  coverage of body, severity text and every string attribute. Each filter
+  is now no larger than version 4 made it for the same keys, and it runs at
+  the false-positive rate its sizing rule targets rather than the lower rate
+  power-of-two rounding could give, so a text predicate may scan more blocks
+  than before. The reader accepts only
   version 5: a version-4 object is refused with `UnsupportedVersion` before
   any section is read, and becomes unreadable once a build with this change
   is deployed. Under the pre-v1.0 format posture there is no migration path;
