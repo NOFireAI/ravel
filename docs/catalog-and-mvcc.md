@@ -293,8 +293,13 @@ holding `tenant_hash`, a `format_version` floor, a `lifecycle_state`
 (`active` / `suspended` / `offboarding`), optional admission-limit and
 retention overrides, an optional indexed-field set, an optional declared
 typed-attribute-column set (ADR-0090; `str`/`i64`/`bool`/`bytes` only in v1),
-and `created`/`updated` timestamps (proto/ravel/sys.proto
-`TenantConfigRecord`). Defaults still come
+an optional clustering key (ADR-2135; its columns, bucket width and
+generation, where a cleared key keeps the field with an empty column list),
+a bloom scope (ADR-2135; an absent one reads as `ALL`), and
+`created`/`updated` timestamps (proto/ravel/sys.proto `TenantConfigRecord`;
+readers accept record version 3, which can carry the clustering key and bloom
+scope, while the writer still stamps version 2 until the writer flip, so
+neither is written yet). Defaults still come
 from flags/limits-file at startup; a field present here overrides the default
 for this tenant, an absent one leaves the default in place. Unlike the
 append-only `prov`/`enc` histories, it is mutated by **whole-record

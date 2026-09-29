@@ -218,18 +218,22 @@ which fails if a new versioned message lands unclassified):
 | `AdmissionUsageSnapshot` | never rewritten (sole-writer Overwrite, fresh dump) | ADR-0057 snapshot, `PutMode::Overwrite` | {1} |
 | `WorkerHeartbeat` | never rewritten (sole-writer Overwrite, fresh dump) | ADR-0065 heartbeat, `PutMode::Overwrite` | {1} |
 | `ProvisioningRecord` | **CAS-mutable** | `provisioning::append_generation`, `raise_format_floor` | **{1, 2, 3}** (3 read, not written: ADR-1746 Release A) |
-| `TenantConfigRecord` | **CAS-mutable** | `tenant_config::set_tenant_config` | **{1, 2}** |
+| `TenantConfigRecord` | **CAS-mutable** | `tenant_config::set_tenant_config` | **{1, 2, 3}** (3 read, not written: ADR-2135) |
 | `MetricMetadataRecord` | **CAS-mutable** | ingest metadata sink read→`merge_entries`→write | **{1, 2}** |
 | `AuthTokenMap` | **CAS-mutable** | `sys/auth` CAS-replace | {1, 2} (managed_by; floor added in R2) |
 | `GcConfig` | **CAS-mutable** | `ravel-maintain::gc_config::set_gc_config` | {1}, ceiling-only gate |
 | `CompactionClaim` | **CAS-mutable** | ADR-1029 claim renew/steal/complete | {1}, ceiling-only gate |
 | `KeyEpochRecord` | **CAS-mutable** | `ravel-catalog::key_epoch` append-epoch CAS | {1} (floor added in R2) |
 
-Every read set in this table that belongs to a reader in `ravel-catalog` is
-asserted against that reader's own `MIN_READ_VERSION..=MAX_READ_VERSION`
-constants by the enumeration test, so a widened gate that does not update this
-table fails. The four rows whose readers live in other crates are maintained by
-hand.
+The enumeration test does not read this markdown table. It keeps its own
+copy of the classification (`classification_table()`), fails when a versioned
+message in `proto/ravel/sys.proto` is missing from that copy or the copy
+names one the proto lacks, and asserts the copy's read sets for
+`ProvisioningRecord`, `TenantConfigRecord`, `MetricMetadataRecord`,
+`AuthTokenMap` and `KeyEpochRecord` against each reader's own
+`MIN_READ_VERSION..=MAX_READ_VERSION` constants, so a widened gate that does
+not update the test's copy fails. This table, and the test's entries for the
+other six messages, are maintained by hand.
 
 "Never rewritten" covers the write-once markers AND the sole-writer
 `PutMode::Overwrite` snapshots (`AdmissionUsageSnapshot`, `WorkerHeartbeat`): each

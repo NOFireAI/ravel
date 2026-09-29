@@ -6,7 +6,9 @@ three additive `TenantConfigRecord` fields (record `format_version` 2 to 3,
 under ADR-0066's R1 readers-before-writers rule).
 Amends ADR-0029 (sort order, encoding choice, BLOOM layout) and ADR-0699
 (row-group dictionaries); both carry an amendment section pointing here.
-Leaves ADR-0815 unimplemented and unchanged; see "Relationship to ADR-0815".
+Amends ADR-0815 decision 2's field shape (`TenantConfigRecord.clustering_key`)
+and leaves its other decisions unimplemented and unchanged; ADR-0815 carries an
+amendment section pointing here. See "Relationship to ADR-0815".
 
 ## Context
 
@@ -293,7 +295,15 @@ flowchart TD
 ADR-0815 (Proposed, unimplemented) clusters data across objects at compaction,
 leading with event time, to exclude whole objects. This ADR orders rows inside
 each stream of an object, at ingest and at compaction, to compress them. It
-does not implement or change any ADR-0815 decision. ADR-0815 rejects ingest-time
+implements no ADR-0815 decision and changes one: ADR-0815 decision 2 reserved
+`TenantConfigRecord.clustering_key` for a single declared column name or an
+EventTime sentinel, added without a version bump, and this ADR gives that
+field (field 13) decision 1's key instead, as the `ClusteringKeyConfig`
+message (one to four columns, a bucket width, a generation) at record
+version 3 (decision 7). ADR-0815's amendment section records that its
+decision 2, if implemented, reads this message rather than adding a field of
+its own.
+Every other ADR-0815 decision is unchanged. ADR-0815 rejects ingest-time
 clustering because it would buffer rows across arrivals and break the pinned
 flush identity; decision 1 here buffers nothing, since it only changes the
 order in which the writer sorts the rows of one flush that it already sorts
