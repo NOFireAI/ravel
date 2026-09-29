@@ -542,9 +542,10 @@ is not swept at all that tick rather than swept without that protection, and
 `unsupported_version`, `watermark_below_floor` (the memo is complete only for
 hours older than the retention floor), or `store_error` (object storage failed
 the memo read, or the listing that tells an unused alert keyspace from a lost
-memo). A tenant that has never written an alert transition is not counted. The family carries no tenant label, so a sustained nonzero
-rate says some tenant is not being swept, not which one: look at the evaluator
-for every reason but `store_error`, and at object-storage access for that one.
+memo). A tenant that has never written an alert transition is not counted.
+The family carries no tenant label, so a sustained nonzero rate says some
+tenant is not being swept, not which one: look at the evaluator for every
+reason but `store_error`, and at object-storage access for that one.
 
 Set `--alert-retention` to a longer window before upgrading if you need more
 history, or `--alert-retention 0` to keep every transition forever, which is

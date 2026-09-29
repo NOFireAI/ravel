@@ -469,10 +469,12 @@ than deletes, so even a forced pass keeps the recovery window.
 
 ## Alert signal retention (ADR-1688)
 
-`Signal::Alerts` is outside the maintained signals: nothing compacts it, and
-the ADR-0019 tombstone flow above never runs on it, because the alert
-evaluator's fold refuses any entry under the alerts commit prefix that is not a
-commit or compaction record. Its history is bounded by a separate sweep that
+`Signal::Alerts` is outside the maintained signals the maintenance tick loops
+over, so nothing compacts it and the ADR-0019 tombstone flow above never runs
+on it. That flow must also stay off it: the alert evaluator's fold refuses any
+entry under the alerts commit prefix that is not a commit or compaction
+record, so a tombstone there would break the fold. Its history is bounded by a
+separate sweep that
 the worker owning the tenant's `(alerts, 0)` unit runs on the ordinary
 maintenance tick.
 
