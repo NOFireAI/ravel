@@ -1057,11 +1057,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **The logs SQL scan skips segments whose declared-column statistics exclude
   the predicate** (ADR-2121 D1, issue #2151). A declared `i64`/`bool`
   comparison or `BETWEEN`, or a declared `i64` `IN`, now also drops every
-  segment whose exact min/max for that column (the `SegmentRef` stamp or the
-  `.cstat` entry) proves no row can match, before any fetch, so the segment
-  costs no GET. A segment neither carrier covers, or whose carriers disagree,
-  is never skipped. A Flight SQL `DoGet` rebuilds segments from its ticket,
-  which carries no stamps, so it skips only by a loaded `.cstat` entry. The
+  segment whose `SegmentRef` stamp for that column proves no row can match,
+  before any fetch, so the segment costs no GET. A `.cstat` entry alone never
+  skips a segment: it tallies only the record-level cells, and a row whose
+  value lives only in the resource or scope attributes can match outside its
+  min/max. A segment with no stamp for the column, or whose `.cstat` entry
+  disagrees with its stamp, is never skipped by that column's arm; another
+  column's arm or the ts window can still drop it. A Flight SQL `DoGet`
+  rebuilds segments from its ticket, which carries no stamps, so it skips
+  nothing by statistics. The
   count is reported as `segments_pruned_by_stats` on the logs scan's `EXPLAIN
   ANALYZE` metrics, in `SqlStats`, and in `sql_latency_bench`'s per-statement
   scan diagnostics. `max_segments` admission and the distributed coordinator
