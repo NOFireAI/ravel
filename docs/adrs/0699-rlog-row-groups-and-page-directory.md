@@ -456,8 +456,11 @@ one it would re-read the tail on the wire instead of the individual sections.
 
 ## Amendment (2026-09-29, ADR-2135): row-group string dictionaries
 
-<!-- amendment-applies: none reason="adds a dictionary page at the head of a string column chunk in RLOG v5 and retires no wording here; the row group, column chunk and PAGE_DIR decisions stand as written" -->
+<!-- amendment-applies: none reason="adds a v5 chunk-level dictionary page that ADR-2135 decision 6 defines, including its PAGE_DIR entry and checksum; the row group and column chunk decisions here stand, and every page other than that one keeps the per-block PAGE_DIR entry described here" -->
 
 ADR-2135 decision 6 lets a string column chunk start with one dictionary
-page shared by the chunk's blocks, listed first in PAGE_DIR for that chunk.
+page shared by the chunk's blocks. It is the one page that belongs to a chunk
+rather than a block: PAGE_DIR lists it first in the chunk under a block index
+one past the group's last block, it sits outside every block's level-0 crc,
+and every reader verifies its own crc32c before using it.
 
