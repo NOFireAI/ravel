@@ -6506,9 +6506,10 @@ mod tests {
     /// every RLOG object carries one, so its absence would silently turn the
     /// bloom half of this check into a vacuous pass.
     fn rlog_index_resolves(bytes: &[u8], value: &str) -> (bool, bool) {
-        use ravel_logseg::bloom_section::BloomSection;
+        use ravel_logseg::field_dir::FieldDir;
         use ravel_logseg::footer::kind;
         use ravel_logseg::postings::PostingsSection;
+        use ravel_logseg::rlog_bloom::RlogBloomSection;
 
         let cfg = RlogConfig::default();
         let footer = ravel_logseg::footer::open(bytes).expect("open RLOG footer");
@@ -6531,8 +6532,15 @@ mod tests {
         let bloom_desc = footer
             .section(kind::BLOOM)
             .expect("every RLOG object carries a BLOOM section");
+        let field_dir_desc = footer
+            .section(kind::FIELD_DIR)
+            .expect("every RLOG object carries a FIELD_DIR section");
+        let field_dir_raw = ravel_logseg::read_section(bytes, field_dir_desc, &cfg)
+            .expect("read FIELD_DIR section");
+        let field_dir =
+            FieldDir::decode(&field_dir_raw, u64::MAX).expect("decode FIELD_DIR section");
         let raw = ravel_logseg::read_section(bytes, bloom_desc, &cfg).expect("read BLOOM section");
-        let section = BloomSection::parse(&raw).expect("parse BLOOM section");
+        let section = RlogBloomSection::parse(&raw, &field_dir).expect("parse BLOOM section");
         let bloom_hit = (0..section.len()).any(|i| {
             let view = section.entry(i).expect("bloom entry");
             PROBE_COLUMN_IDS

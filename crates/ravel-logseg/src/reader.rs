@@ -14,7 +14,6 @@ use std::sync::Arc;
 use ravel_types::logstream::AttrValue;
 
 use crate::block::{ColumnIdSet, ColumnPlan, DecodedBlock, PageCounters, read_block_pages};
-use crate::bloom_section::BloomSection;
 use crate::columnar::ColumnarBlockView;
 use crate::columns::ColumnSelection;
 use crate::error::LogSegError;
@@ -27,6 +26,7 @@ use crate::record::{
     COL_BODY, COL_FLAGS, COL_OBSERVED_TS, COL_SEVERITY_NUM, COL_SEVERITY_TEXT, COL_SPAN_ID,
     COL_STREAM_REF, COL_TRACE_ID, COL_TS, FieldSel, FieldType, LogRecord, Predicate, resolve_value,
 };
+use crate::rlog_bloom::RlogBloomSection;
 use crate::skip_index::{NumRangeArm, SkipIndex};
 use crate::source::ByteSource;
 use crate::stream_dir::StreamDir;
@@ -419,16 +419,20 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
         }
         stats.blocks_after_postings = candidates.len() as u32;
 
-        // Bloom pruning. A parse failure degrades to no bloom pruning.
+        // Bloom pruning. A parse failure, including a covered-column list that
+        // fails validation, degrades to no bloom pruning.
         let bloom_bytes = self.section_stored(&self.bloom)?;
-        let bloom_section = match BloomSection::parse(&bloom_bytes) {
+        let bloom_section = match RlogBloomSection::parse(&bloom_bytes, &self.field_dir) {
             Ok(s) => Some(s),
             Err(_) => {
                 stats.bloom_degraded = true;
                 None
             }
         };
-        let bloom_arms = self.bloom_arms(&arms);
+        let bloom_arms = match &bloom_section {
+            Some(section) => self.bloom_arms(&arms, section),
+            None => Vec::new(),
+        };
 
         let mut survivors: Vec<usize> = Vec::new();
         for &b in &candidates {
@@ -557,14 +561,20 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
     /// The bloom-eligible arms: HasWord on any field, and Equals on a short
     /// string field. Each yields `(column_id, key tokens)` where all tokens must
     /// probe positive for a block to survive. An arm that cannot map to a bloom
-    /// column (e.g. HasWord over a name that is not a string column) is omitted
-    /// so it never prunes.
-    fn bloom_arms(&self, arms: &[&Predicate]) -> Vec<(u32, Vec<Vec<u8>>)> {
+    /// column (e.g. HasWord over a name that is not a string column), or whose
+    /// column `section` does not cover, is omitted so it never prunes.
+    fn bloom_arms(
+        &self,
+        arms: &[&Predicate],
+        section: &RlogBloomSection<'_>,
+    ) -> Vec<(u32, Vec<Vec<u8>>)> {
+        let covered_column =
+            |field: &FieldSel| self.word_column(field).filter(|&cid| section.covers(cid));
         let mut out = Vec::new();
         for a in arms {
             match a {
                 Predicate::HasWord { field, word } => {
-                    if let Some(cid) = self.word_column(field) {
+                    if let Some(cid) = covered_column(field) {
                         let toks = tokens(word);
                         if !toks.is_empty() {
                             out.push((cid, toks));
@@ -575,7 +585,7 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
                     field,
                     value: AttrValue::Str(s),
                 } if s.len() <= 64 => {
-                    if let Some(cid) = self.word_column(field) {
+                    if let Some(cid) = covered_column(field) {
                         out.push((cid, vec![s.clone().into_bytes()]));
                     }
                 }
@@ -689,7 +699,7 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
     /// True if `block`'s bloom proves some required arm's key absent.
     fn block_pruned_by_bloom(
         &self,
-        section: &BloomSection<'_>,
+        section: &RlogBloomSection<'_>,
         block: usize,
         arms: &[(u32, Vec<Vec<u8>>)],
     ) -> bool {
