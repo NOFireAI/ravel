@@ -3914,7 +3914,11 @@ fn build_record(
     let raw_ts = read_ts(ts_col, row, mapping.ts_unit)?
         .ok_or_else(|| format!("ts column {:?} is null", mapping.ts_column))?;
     if raw_ts < 0 {
-        return Err(negative_ts_rejection(raw_ts, mapping.ts_unit));
+        return Err(negative_ts_rejection(
+            raw_ts,
+            ts_col.data_type(),
+            mapping.ts_unit,
+        ));
     }
 
     // Kept: future-skew bound, same `max_future_skew_ns` as ravel-otlp. The
@@ -4336,12 +4340,26 @@ fn read_bytes(arr: &ArrayRef, row: usize) -> Result<Option<Vec<u8>>, String> {
 /// counterpart of the spans load's refusal: OTLP's timestamps are `u64`.
 /// Every unit conversion multiplies by a positive factor and refuses overflow,
 /// so a negative result always comes from a negative cell, never from the
-/// declared unit.
-fn negative_ts_rejection(ts_ns: i64, declared: TsUnit) -> String {
+/// unit.
+///
+/// The rejection names the unit [`read_ts`] and [`ts_src`] actually applied to
+/// `ts_type`: a native Arrow `Timestamp` column's own unit, the declared
+/// `ts_unit` for any other column.
+fn negative_ts_rejection(ts_ns: i64, ts_type: &DataType, declared: TsUnit) -> String {
+    let unit = match ts_type {
+        DataType::Timestamp(unit, _) => format!(
+            "read in the column's own Timestamp unit, {}",
+            match unit {
+                TimeUnit::Second => "seconds",
+                TimeUnit::Millisecond => "millis",
+                TimeUnit::Microsecond => "micros",
+                TimeUnit::Nanosecond => "nanos",
+            }
+        ),
+        _ => format!("read as ts_unit = {}", declared.as_str()),
+    };
     format!(
-        "timestamp is before the Unix epoch ({ts_ns} ns, read as ts_unit = {}); the column \
-         holds a negative value",
-        declared.as_str()
+        "timestamp is before the Unix epoch ({ts_ns} ns, {unit}); the column holds a negative value"
     )
 }
 
@@ -5110,7 +5128,11 @@ fn build_columnar_batch(
                 }
             };
             if raw_ts < 0 {
-                return Err(row_err(negative_ts_rejection(raw_ts, mapping.ts_unit)));
+                return Err(row_err(negative_ts_rejection(
+                    raw_ts,
+                    span.column(cols.ts).data_type(),
+                    mapping.ts_unit,
+                )));
             }
             let skew_ns = raw_ts.saturating_sub(now_ns);
             if skew_ns > limits.max_future_skew_ns {
@@ -5602,10 +5624,15 @@ fn build_metric_row(
     now_ns: i64,
     row: usize,
 ) -> Result<MetricRow, String> {
-    let raw_ts = read_ts(cols.col(batch, cols.ts), row, mapping.ts_unit)?
+    let ts_col = cols.col(batch, cols.ts);
+    let raw_ts = read_ts(ts_col, row, mapping.ts_unit)?
         .ok_or_else(|| format!("ts column {:?} is null", mapping.ts_column))?;
     if raw_ts < 0 {
-        return Err(negative_ts_rejection(raw_ts, mapping.ts_unit));
+        return Err(negative_ts_rejection(
+            raw_ts,
+            ts_col.data_type(),
+            mapping.ts_unit,
+        ));
     }
 
     // Kept: the future-skew bound, at the metrics OTLP limit. The past-lag
@@ -11751,16 +11778,18 @@ type = "i64"
         }
     }
 
-    /// The columnar path reads its mapped dictionary columns in place: none is
-    /// flattened ahead of it, and a dictionary attribute still reaches the
-    /// `StrColumnDict` fast path. The row path resolves the same batch's
-    /// dictionary columns once each, and the two build the same batch.
+    /// With no id column mapped, the columnar path reads its mapped dictionary
+    /// columns in place: none is flattened ahead of it (only a mapped id column
+    /// is, which `the_columnar_path_resolves_each_mapped_id_column_once` pins),
+    /// and a dictionary attribute still reaches the `StrColumnDict` fast path.
+    /// The row path resolves the same batch's dictionary columns once each, and
+    /// the two build the same batch.
     ///
     /// An all-null chunk over an empty dictionary is part of the batch, so the
     /// columnar path's per-cell answer for it (`str_src`'s all-null path) is
     /// what this load exercises too.
     #[test]
-    fn the_columnar_path_resolves_no_dictionary_column() {
+    fn the_columnar_path_resolves_no_dictionary_column_when_no_id_column_is_mapped() {
         const ROWS: usize = 64;
         let dict = |vals: Vec<&str>| -> ArrayRef {
             Arc::new(
@@ -11794,7 +11823,8 @@ type = "i64"
         assert_eq!(
             counters.columns(),
             0,
-            "the columnar path flattens none of the four mapped dictionary columns"
+            "with no id column mapped, the columnar path flattens none of the four mapped \
+             dictionary columns"
         );
         assert_eq!(
             counters.cell_keys(),
@@ -11822,6 +11852,54 @@ type = "i64"
             counters.columns(),
             4,
             "the row reference resolves each mapped dictionary column once"
+        );
+    }
+
+    /// The columnar path flattens a mapped dictionary id column once per
+    /// batch, ahead of the row loop, and no other mapped dictionary column:
+    /// two id columns beside a dictionary body resolve exactly two columns,
+    /// whatever the row count is.
+    #[test]
+    fn the_columnar_path_resolves_each_mapped_id_column_once() {
+        const ROWS: usize = 64;
+        let trace_hex = hex::encode([1u8; 16]);
+        let span_hex = hex::encode([2u8; 8]);
+        let dict = |vals: Vec<&str>| -> ArrayRef {
+            Arc::new(
+                vals.into_iter()
+                    .map(Some)
+                    .collect::<DictionaryArray<Int32Type>>(),
+            )
+        };
+        let ts: Vec<i64> = (0..ROWS as i64).map(|i| NOW_NS + i).collect();
+        let b = batch(vec![
+            ("ts", i64_col(ts)),
+            ("body", dict(vec!["hello"; ROWS])),
+            ("trace_id", dict(vec![trace_hex.as_str(); ROWS])),
+            ("span_id", dict(vec![span_hex.as_str(); ROWS])),
+        ]);
+        let mut m = base_mapping();
+        m.body_column = Some("body".to_string());
+        m.trace_id_column = Some("trace_id".to_string());
+        m.span_id_column = Some("span_id".to_string());
+
+        let counters = dict_counters();
+        let col = build_columnar_or_panic(&b, &m);
+        assert_eq!(
+            counters.columns(),
+            2,
+            "the two id columns are resolved once each, over {ROWS} rows, and the body is not"
+        );
+        assert_eq!(
+            counters.cell_keys(),
+            0,
+            "no dictionary key is resolved per cell"
+        );
+        assert_eq!(col.num_rows, ROWS, "every row is built");
+        assert_eq!(
+            assert_paths_match(&b, &m),
+            col,
+            "the row path builds the same batch"
         );
     }
 
@@ -12742,8 +12820,8 @@ type = "i64"
                     reason,
                 };
 
-                // 1. ts (required) and 2. future-skew bound, in build_record
-                // order.
+                // 1. ts (required), not negative, and 2. future-skew bound, in
+                // build_record order.
                 let raw_ts = match ts.get(local).map_err(row_err)? {
                     Some(t) => t,
                     None => {
@@ -12753,6 +12831,13 @@ type = "i64"
                         )));
                     }
                 };
+                if raw_ts < 0 {
+                    return Err(row_err(negative_ts_rejection(
+                        raw_ts,
+                        span.column(cols.ts).data_type(),
+                        mapping.ts_unit,
+                    )));
+                }
                 let skew_ns = raw_ts.saturating_sub(now_ns);
                 if skew_ns > limits.max_future_skew_ns {
                     return Err(row_err(format!(
@@ -13110,6 +13195,34 @@ type = "i64"
             })
             .collect();
         (spans, mapping)
+    }
+
+    /// The reference build refuses a negative timestamp at the same row, with
+    /// the same reason, as the production build.
+    #[test]
+    fn the_reference_build_refuses_a_negative_timestamp_like_production() {
+        let spans = vec![(batch(vec![("ts", i64_col(vec![NOW_NS, -5, NOW_NS]))]), 10)];
+        let mapping = base_mapping();
+        let limits = LogIngestLimits::default();
+        let refusal = |result: Result<ColumnarLogBatch, ColBuildError>| match result {
+            Err(ColBuildError::Row { row, reason }) => (row, reason),
+            Err(ColBuildError::Batch(r)) => panic!("expected a row rejection, got batch: {r}"),
+            Ok(_) => panic!("expected a row rejection, got a batch"),
+        };
+        let got = refusal(build_columnar_batch(&spans, &mapping, &limits, NOW_NS));
+        let want = refusal(build_columnar_batch_reference(
+            &spans, &mapping, &limits, NOW_NS,
+        ));
+        assert_eq!(
+            got,
+            (
+                11,
+                "timestamp is before the Unix epoch (-5 ns, read as ts_unit = nanos); the column \
+                 holds a negative value"
+                    .to_string()
+            )
+        );
+        assert_eq!(want, got, "the reference refuses the same row the same way");
     }
 
     /// Assert the slot-table build and the pre-#689 map build produce the same
@@ -15889,6 +16002,181 @@ type = "str"
             assert_eq!(*row, 1);
             assert_eq!(reason, NEGATIVE_MILLIS);
             assert!(list_data_objects(store.as_ref()).await.is_empty());
+        }
+
+        async fn load_logs_row(
+            pq: &Path,
+            mapping: &Mapping,
+        ) -> (Result<LoadReport, LoadError>, Arc<dyn ObjectStoreBackend>) {
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let result = load_row(
+                Arc::clone(&store),
+                pq,
+                "acme",
+                mapping,
+                1,
+                1_000,
+                None,
+                NOW_NS,
+                Arc::new(FixedClock(NOW_NS)),
+            )
+            .await;
+            (result, store)
+        }
+
+        /// A gauge mapping over `ts` and `value`, declaring `ts_unit`.
+        fn metrics_mapping(ts_unit: &str) -> MetricsMapping {
+            parse_metrics_mapping(&format!(
+                "[metrics]\nname = \"probe\"\nvalue_column = \"value\"\nts_column = \
+                 \"ts\"\nts_unit = \"{ts_unit}\"\nkind = \"gauge\"\n"
+            ))
+            .expect("valid mapping")
+        }
+
+        async fn load_metrics_on(
+            pq: &Path,
+            mapping: &MetricsMapping,
+        ) -> (
+            Result<MetricsLoadReport, LoadError>,
+            Arc<dyn ObjectStoreBackend>,
+        ) {
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let result = load_metrics(
+                Arc::clone(&store),
+                pq,
+                "acme",
+                mapping,
+                1,
+                1_000,
+                0,
+                1,
+                DEFAULT_MAX_INFLIGHT_FLUSHES,
+                1,
+                None,
+                NOW_NS,
+                Arc::new(FixedClock(NOW_NS)),
+            )
+            .await;
+            (result, store)
+        }
+
+        /// A file whose `ts` is `ts` beside a `value` column, one row per cell.
+        fn ts_file(ts: ArrayRef) -> (tempfile::TempDir, PathBuf) {
+            let values: Vec<f64> = (0..ts.len()).map(|i| i as f64).collect();
+            write_with(
+                &batch(vec![
+                    ("ts", ts),
+                    ("value", Arc::new(Float64Array::from(values)) as ArrayRef),
+                ]),
+                false,
+            )
+        }
+
+        /// A native `Timestamp(Second)` column scales by its own unit, not by
+        /// the declared `ts_unit`, so the refusal names the unit that was
+        /// applied: `-5` seconds is `-5000000000` ns, and `nanos` is not what
+        /// produced it.
+        const NEGATIVE_NATIVE_SECONDS: &str = "timestamp is before the Unix epoch (-5000000000 \
+                                               ns, read in the column's own Timestamp unit, \
+                                               seconds); the column holds a negative value";
+
+        fn native_seconds_negative_file() -> (tempfile::TempDir, PathBuf) {
+            let now_s = NOW_NS / 1_000_000_000;
+            ts_file(Arc::new(TimestampSecondArray::from(vec![now_s, -5, now_s])) as ArrayRef)
+        }
+
+        fn assert_native_seconds_refusal(err: &LoadError) {
+            let LoadError::RowRejected { row, reason, .. } = err else {
+                panic!("expected RowRejected, got {err:?}");
+            };
+            assert_eq!(*row, 1);
+            assert_eq!(reason, NEGATIVE_NATIVE_SECONDS);
+        }
+
+        #[tokio::test]
+        async fn a_native_timestamp_refusal_names_the_column_unit_on_every_path() {
+            let (_dir, pq) = native_seconds_negative_file();
+            let schema = reader_schema_for(&pq);
+            let ts_type = schema.as_ref().map_or_else(
+                || {
+                    let file = std::fs::File::open(&pq).expect("open parquet");
+                    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                        .expect("reader")
+                        .schema()
+                        .field_with_name("ts")
+                        .expect("ts field")
+                        .data_type()
+                        .clone()
+                },
+                |s| {
+                    s.field_with_name("ts")
+                        .expect("ts field")
+                        .data_type()
+                        .clone()
+                },
+            );
+            assert_eq!(
+                ts_type,
+                DataType::Timestamp(TimeUnit::Second, None),
+                "the loader reads a native seconds column"
+            );
+            let mut logs = base_mapping();
+            logs.ts_unit = TsUnit::Nanos;
+
+            let (result, store) = load_logs_row(&pq, &logs).await;
+            assert_native_seconds_refusal(&result.expect_err("row path refuses"));
+            assert!(list_data_objects(store.as_ref()).await.is_empty());
+
+            let (result, store) = load_columnar(&pq, &logs).await;
+            assert_native_seconds_refusal(&result.expect_err("columnar path refuses"));
+            assert!(list_data_objects(store.as_ref()).await.is_empty());
+
+            let (result, store) = load_metrics_on(&pq, &metrics_mapping("nanos")).await;
+            assert_native_seconds_refusal(&result.expect_err("metrics path refuses"));
+            assert!(list_data_objects(store.as_ref()).await.is_empty());
+        }
+
+        /// A timestamp of exactly 0 is the epoch, not before it: every path
+        /// loads it.
+        fn zero_ts_file() -> (tempfile::TempDir, PathBuf) {
+            ts_file(i64_col(vec![NOW_NS, 0, NOW_NS]))
+        }
+
+        #[tokio::test]
+        async fn the_logs_row_path_accepts_a_zero_timestamp() {
+            let (_dir, pq) = zero_ts_file();
+            let (result, store) = load_logs_row(&pq, &base_mapping()).await;
+            let report = result.expect("a zero timestamp loads");
+            assert_eq!(report.rows_processed, 3);
+            let ts: Vec<i64> = stored_ids(store.as_ref())
+                .await
+                .into_iter()
+                .map(|(ts, _, _)| ts)
+                .collect();
+            assert_eq!(ts, vec![0, NOW_NS, NOW_NS], "the zero row is stored at 0");
+        }
+
+        #[tokio::test]
+        async fn the_logs_columnar_path_accepts_a_zero_timestamp() {
+            let (_dir, pq) = zero_ts_file();
+            let (result, store) = load_columnar(&pq, &base_mapping()).await;
+            let report = result.expect("a zero timestamp loads");
+            assert_eq!(report.rows_processed, 3);
+            assert!(report.columnar_batches_built > 0, "the columnar path ran");
+            let ts: Vec<i64> = stored_ids(store.as_ref())
+                .await
+                .into_iter()
+                .map(|(ts, _, _)| ts)
+                .collect();
+            assert_eq!(ts, vec![0, NOW_NS, NOW_NS], "the zero row is stored at 0");
+        }
+
+        #[tokio::test]
+        async fn the_metrics_path_accepts_a_zero_timestamp() {
+            let (_dir, pq) = zero_ts_file();
+            let (result, _store) = load_metrics_on(&pq, &metrics_mapping("nanos")).await;
+            let report = result.expect("a zero timestamp loads");
+            assert_eq!(report.rows_processed, 3, "every row, the zero one included");
         }
     }
 
