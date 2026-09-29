@@ -189,7 +189,20 @@ no chain walk reaches it; instead it joins the chain group of the rewrite whose
 chain reaches the record it names, and is deleted with its parts under that
 group's horizon, HEAD gate and hold. A HEAD that still names its parts holds
 the whole group, and with it every erasure request the group's records
-applied.
+applied. Dominated records are deleted ahead of the chain's own records and
+newest first, so a crash between two deletes never leaves one undominated. A
+dominated record whose predecessor is already gone joins the group of the
+rewrite whose chain ends at that same absent key, even when that group holds
+nothing else; one that no group takes is logged and counted in the pass's
+`dominated_records_unattached`, not skipped silently.
+
+In a bucket whose version 2 supersession does not resolve (a cycle, a chain
+past the depth bound, or a version 2 record whose inputs differ from the
+record it names), which records a version 2 record supersedes is not known. A
+rewrite's chain group there that reaches a version 2 record reclaims nothing,
+not even the records above the link: the group is one unit, and deleting its
+upper records would leave the rest resolvable with nothing naming them as
+erased.
 
 A rewrite record landing outside both the fixed reconcile window and the
 frontier band is not left to wait indefinitely for one of those two passes to

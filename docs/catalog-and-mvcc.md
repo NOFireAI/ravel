@@ -1272,8 +1272,12 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
      by the authoritative-input rule below. A dominated version 2 record
      joins the chain group of the rewrite whose chain reaches the record it
      names and is deleted with its parts under that group's horizon,
-     reachability and hold rules, ahead of the chain's own records. A
-     version 2 record naming a key that is not present reclaims nothing.
+     reachability and hold rules, ahead of the chain's own records and
+     newest first. When the record it names is already gone, it joins the
+     group of the rewrite whose chain ends at that same absent key, even
+     when nothing else of that chain is left; a dominated record no group
+     takes is logged and counted, never skipped silently. A version 2
+     record naming a key that is not present reclaims nothing.
      The sweep treats an input as superseded only where an authoritative
      record names it both with and without version 2 supersession applied:
      while a predecessor is present, excluding it can hand its overlap
@@ -1281,7 +1285,10 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
      treats none of a bucket's inputs as superseded, and reclaims nothing on
      account of the bucket's version 2 records, when that bucket's
      supersession does not resolve (a cycle, an over-deep chain, or a
-     version 2 record whose inputs differ from its predecessor's).
+     version 2 record whose inputs differ from its predecessor's): in such
+     a bucket a rewrite's chain group that reaches a version 2 record
+     reclaims nothing at all, since the group is one unit and what the
+     version 2 record supersedes is not known.
    - Include each compaction record's parts and each rewrite record's output
      parts as segment refs, filtered by per-part event bounds, UNLESS that
      record's key is in `superseded_records`. A superseded record's parts are

@@ -556,7 +556,10 @@ fn log_superseded_holds(
     shard: u32,
     outcome: &SupersededSweepOutcome,
 ) {
-    if outcome.held() == 0 && outcome.chain_groups_held_by_legal_hold == 0 {
+    if outcome.held() == 0
+        && outcome.chain_groups_held_by_legal_hold == 0
+        && outcome.dominated_records_unattached == 0
+    {
         return;
     }
     tracing::warn!(
@@ -568,6 +571,7 @@ fn log_superseded_holds(
         chain_groups_held_by_legal_hold = outcome.chain_groups_held_by_legal_hold,
         held_requests = outcome.held_request_ids.len(),
         held_truncated_buckets = outcome.held_truncated_buckets.len(),
+        dominated_records_unattached = outcome.dominated_records_unattached,
         "superseded-input sweep: held inputs the live catalog HEAD snapshot still names \
          (or could not be read, or a legal hold protects); they are collected once the fold \
          reconciles their hour, HEAD is rebuilt, or the hold is released"
@@ -1028,6 +1032,12 @@ pub struct SupersededSweepOutcome {
     /// are not in `held_request_ids`, because no surviving record names them,
     /// so rule 6 falls back to the bucket.
     pub held_truncated_buckets: BTreeSet<HeldBucket>,
+    /// Erasure-dominated version 2 compaction records kept this pass because
+    /// no rewrite's chain group took them, in buckets with no rewrite still
+    /// inside its protection horizon. Each one holds parts that re-encode a
+    /// pre-erasure record, so a nonzero value is an operator signal. Counted
+    /// by a deleting pass only.
+    pub dominated_records_unattached: usize,
 }
 
 impl SupersededSweepOutcome {
@@ -1216,6 +1226,10 @@ async fn sweep_superseded_impl(
     // the pass removed.
     let mut groups: Vec<SupersededGroup> = Vec::new();
     let mut by_identity: HashMap<String, usize> = HashMap::new();
+    // Buckets holding a rewrite this deleting pass left for its horizon, and
+    // buckets already logged for a refused version 2 link.
+    let mut young_rewrite_buckets: HashSet<u32> = HashSet::new();
+    let mut refused_buckets: HashSet<u32> = HashSet::new();
     for (key, entry) in &entries {
         // An observing pass gathers this entry too. The successor's own gather
         // covers the same chain only when the successor superseded a whole
@@ -1272,8 +1286,10 @@ async fn sweep_superseded_impl(
                             shard,
                             &record.superseded_record_key,
                             ChainEntry::Version2,
+                            Version2Links::Follow,
                         )
-                        .await?,
+                        .await?
+                        .unwrap_or_default(),
                     );
                 }
                 (gathered, Vec::new())
@@ -1296,6 +1312,7 @@ async fn sweep_superseded_impl(
                             .created_unix_ns
                             .saturating_add(config.protection_horizon_ns)
                 {
+                    young_rewrite_buckets.insert(record.ingest_hour_bucket);
                     continue;
                 }
                 let applied: Vec<String> = record
@@ -1319,19 +1336,54 @@ async fn sweep_superseded_impl(
                     // them, so this rule removes records and parts together.
                     // An erasure-dominated version 2 record re-encodes a
                     // record on this chain and may hold the erased subject, so
-                    // it joins the group.
-                    let mut gathered = gather_superseded_chain(
+                    // it joins the group, the group of a predecessor already
+                    // gone included.
+                    //
+                    // In a bucket whose version 2 supersession does not
+                    // resolve, a deleting pass does not follow a version 2
+                    // link. An observing pass does: gathering more can only
+                    // add holds.
+                    let bucket = record.ingest_hour_bucket;
+                    let links = if deleting && version_2.unresolved.contains(&bucket) {
+                        Version2Links::Refuse
+                    } else {
+                        Version2Links::Follow
+                    };
+                    let Some(mut gathered) = gather_superseded_chain(
                         store,
                         tenant,
                         signal,
                         shard,
                         &record.superseded_record_key,
                         ChainEntry::Rewrite,
+                        links,
                     )
-                    .await?;
+                    .await?
+                    else {
+                        if refused_buckets.insert(bucket) {
+                            tracing::warn!(
+                                tenant_hash = %tenant.to_hex(),
+                                signal = signal.key_prefix(),
+                                shard,
+                                ingest_hour_bucket = bucket,
+                                rewrite_key = %key,
+                                "superseded-input sweep: a rewrite chain reaches a version 2 \
+                                 record in a bucket whose version 2 supersession does not \
+                                 resolve; nothing of the chain is reclaimed"
+                            );
+                        }
+                        continue;
+                    };
+                    if gathered.is_empty() {
+                        gathered.push(SupersededGroup::over_absent_predecessor(
+                            bucket,
+                            &record.superseded_record_key,
+                        ));
+                    }
                     for group in &mut gathered {
                         version_2.join_dominated(group, &compactions)?;
                     }
+                    gathered.retain(|group| group.object_count() > 0);
                     (gathered, applied)
                 }
             }
@@ -1370,6 +1422,10 @@ async fn sweep_superseded_impl(
     // so a HEAD that still names the oldest generation's raw inputs holds
     // every record above them too.
     let mut outcome = SupersededSweepOutcome::default();
+    if deleting {
+        outcome.dominated_records_unattached =
+            version_2.count_unattached(&groups, &young_rewrite_buckets, tenant, signal, shard);
+    }
     let mut cleared: Vec<&SupersededGroup> = Vec::with_capacity(groups.len());
     for group in &groups {
         if let Some(protected) = group.protected_key(lease) {
@@ -1647,26 +1703,34 @@ impl AuthoritativeInputs {
 /// rewrite dominates enters a chain group of its own ([`ChainEntry::Version2`])
 /// that holds the records below it and their parts. A dominated version 2
 /// record joins the chain group of the rewrite whose chain reaches the record
-/// it names ([`Self::join_dominated`]): no record's `superseded_record_key`
-/// names it, so the rewrite's own walk never reaches it.
+/// it names ([`Self::join_dominated`]): a walk down a rewrite's chain follows
+/// what each record supersedes, so it reaches a dominated record only when a
+/// record on the chain names it.
 ///
 /// A bucket whose supersession does not resolve (a cycle, a chain past the
 /// depth bound, a version 2 record whose inputs differ from the record it
 /// names) fails every resolve over it. It gets no version 2 chain group and no
-/// dominated record, so this pass reclaims nothing on account of its version 2
-/// records, as [`AuthoritativeInputs`] treats none of its inputs as superseded.
+/// dominated record, and a deleting pass's rewrite chain walk does not step
+/// past a version 2 record in it ([`Version2Links::Refuse`]), so this pass
+/// reclaims nothing on account of its version 2 records, as
+/// [`AuthoritativeInputs`] treats none of its inputs as superseded.
 #[derive(Default)]
 struct Version2Groups {
     /// The version 2 records that enter a chain group of their own.
     heads: HashSet<String>,
     /// Records that belong to a present rewrite's chain group although the
-    /// rewrite does not name them: every dominated version 2 record, and every
+    /// rewrite may not name them: every dominated version 2 record, and every
     /// record one of those names down its chain. A deleting pass does not
     /// process them from their own listing entry, for the reason it skips a
-    /// record a rewrite names.
+    /// record a rewrite names. The `(4, 4)` counts in
+    /// `sweep_reclaims_an_erasure_dominated_version_2_record_with_its_rewrite`
+    /// fail without the skip: the dominated record's own entry gathers the raw
+    /// inputs a second time.
     rewrite_members: HashSet<String>,
     /// Each bucket's dominated version 2 records.
     dominated: HashMap<u32, Vec<String>>,
+    /// The buckets whose version 2 supersession does not resolve.
+    unresolved: HashSet<u32>,
 }
 
 impl Version2Groups {
@@ -1716,6 +1780,7 @@ impl Version2Groups {
                     Ok(dominated) => dominated,
                     Err(error) => {
                         unresolvable(error);
+                        out.unresolved.insert(bucket);
                         continue;
                     }
                 };
@@ -1728,6 +1793,7 @@ impl Version2Groups {
                 Ok(selection) => selection,
                 Err(error) => {
                     unresolvable(error);
+                    out.unresolved.insert(bucket);
                     continue;
                 }
             };
@@ -1761,11 +1827,13 @@ impl Version2Groups {
     }
 
     /// Add to a rewrite's chain group every dominated version 2 record whose
-    /// chain reaches one of the group's records, with its parts. The records
-    /// go ahead of the chain's own, newest first: a dominated record is only
-    /// dominated while the record it names is present or a rewrite names it,
-    /// so deleting one that names another dominated record before that record
-    /// keeps every survivor of a crash dominated.
+    /// chain reaches one of the group's records, or the absent record the
+    /// rewrite's walk ended at, with its parts. The records go ahead of the
+    /// chain's own, newest first: a record is dominated only while the key it
+    /// names is on a present rewrite's chain (present or not) or names a
+    /// dominated record, so deleting the chain's records, or a dominated
+    /// record before the one naming it, could leave a survivor of a crash
+    /// undominated and served.
     fn join_dominated(
         &self,
         group: &mut SupersededGroup,
@@ -1774,8 +1842,12 @@ impl Version2Groups {
         let Some(dominated) = self.dominated.get(&group.ingest_hour_bucket) else {
             return Ok(());
         };
-        let mut in_group: HashSet<&str> =
-            group.chain_record_keys.iter().map(String::as_str).collect();
+        let mut in_group: HashSet<&str> = group
+            .chain_record_keys
+            .iter()
+            .chain(group.absent_end.iter())
+            .map(String::as_str)
+            .collect();
         let mut joined: Vec<&str> = Vec::new();
         loop {
             let before = joined.len();
@@ -1809,6 +1881,45 @@ impl Version2Groups {
         joined_keys.append(&mut group.chain_record_keys);
         group.chain_record_keys = joined_keys;
         Ok(())
+    }
+
+    /// Log and count every dominated record no gathered group holds, in a
+    /// bucket where no rewrite was left for its horizon: it would otherwise be
+    /// kept silently, with parts that re-encode a pre-erasure record.
+    fn count_unattached(
+        &self,
+        groups: &[SupersededGroup],
+        young_rewrite_buckets: &HashSet<u32>,
+        tenant: &TenantHash,
+        signal: Signal,
+        shard: u32,
+    ) -> usize {
+        let attached: HashSet<&str> = groups
+            .iter()
+            .flat_map(|group| group.chain_record_keys.iter().map(String::as_str))
+            .collect();
+        let mut unattached = 0;
+        for (bucket, dominated) in &self.dominated {
+            if young_rewrite_buckets.contains(bucket) {
+                continue;
+            }
+            for key in dominated {
+                if attached.contains(key.as_str()) {
+                    continue;
+                }
+                tracing::warn!(
+                    tenant_hash = %tenant.to_hex(),
+                    signal = signal.key_prefix(),
+                    shard,
+                    ingest_hour_bucket = *bucket,
+                    record_key = %key,
+                    "superseded-input sweep: an erasure-dominated version 2 record is in no \
+                     rewrite's chain group, so it is kept this pass"
+                );
+                unattached += 1;
+            }
+        }
+        unattached
     }
 }
 
@@ -1851,12 +1962,33 @@ struct SupersededGroup {
     /// so whatever requests that generation applied are named by no surviving
     /// record and cannot appear in `request_ids`.
     truncated: bool,
+    /// The absent record the chain walk ended at, if it ended at one. A
+    /// dominated version 2 record naming it belongs to this group
+    /// ([`Version2Groups::join_dominated`]).
+    absent_end: Option<String>,
     /// Dedup key: the oldest record this group deletes, which is the one thing
     /// two live rewrites over the same predecessor gather identically.
     identity: String,
 }
 
 impl SupersededGroup {
+    /// The group of a rewrite whose predecessor, at `absent_key`, is already
+    /// gone: nothing of the chain is left, but a dominated version 2 record
+    /// naming the same key may still be.
+    fn over_absent_predecessor(ingest_hour_bucket: u32, absent_key: &str) -> Self {
+        Self {
+            ingest_hour_bucket,
+            record_keys: Vec::new(),
+            data_keys: Vec::new(),
+            chain_record_keys: Vec::new(),
+            objects: Vec::new(),
+            request_ids: BTreeSet::new(),
+            truncated: true,
+            absent_end: Some(absent_key.to_string()),
+            identity: absent_key.to_string(),
+        }
+    }
+
     /// Objects this group would delete, for the held counters.
     fn object_count(&self) -> usize {
         self.record_keys.len() + self.data_keys.len() + self.chain_record_keys.len()
@@ -1946,6 +2078,7 @@ async fn gather_l0_inputs(
                     }],
                     request_ids: BTreeSet::new(),
                     truncated: false,
+                    absent_end: None,
                 });
             }
             Err(StoreError::NotFound) => {}
@@ -2211,6 +2344,18 @@ impl ChainEntry {
     }
 }
 
+/// Whether a [`gather_superseded_chain`] walk may step past a version 2
+/// compaction record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Version2Links {
+    Follow,
+    /// The bucket's version 2 supersession does not resolve, so which records
+    /// a version 2 record on the chain supersedes is not known: a walk that
+    /// meets one gathers nothing. A group is indivisible, so the records above
+    /// the link cannot go without it either.
+    Refuse,
+}
+
 /// Gather the deletion targets for a rewrite record that superseded a whole
 /// prior compaction/rewrite record: the entire supersession chain behind
 /// `predecessor_key`, walked back generation by generation to the raw L0 inputs
@@ -2232,7 +2377,11 @@ impl ChainEntry {
 /// gap, flagged [`SupersededGroup::truncated`] so a hold on it can be reported
 /// per bucket rather than per request; an absent `predecessor_key` yields no
 /// group at all, and any surviving parts below it are unreferenced under the
-/// live record and collected by rule 3.
+/// live record and collected by rule 3. The absent record's key is kept as
+/// [`SupersededGroup::absent_end`].
+///
+/// `Ok(None)` means the walk met a version 2 record under
+/// [`Version2Links::Refuse`] and gathered nothing.
 ///
 /// The group also carries every erasure request the generations it covers
 /// applied. Those requests' `.dreq`s cannot be retired while the group is
@@ -2256,7 +2405,8 @@ async fn gather_superseded_chain(
     shard: u32,
     predecessor_key: &str,
     entry: ChainEntry,
-) -> Result<Vec<SupersededGroup>> {
+    links: Version2Links,
+) -> Result<Option<Vec<SupersededGroup>>> {
     let mut chain_record_keys: Vec<String> = Vec::new();
     let mut chain_part_keys: Vec<String> = Vec::new();
     let mut input_record_keys: Vec<String> = Vec::new();
@@ -2265,6 +2415,7 @@ async fn gather_superseded_chain(
     let mut ingest_hour_bucket: Option<u32> = None;
     let mut request_ids: BTreeSet<String> = BTreeSet::new();
     let mut truncated = false;
+    let mut absent_end: Option<String> = None;
     let mut seen: HashSet<String> = HashSet::new();
     // The record the chain is entered from is charged, though it is not on
     // this walk.
@@ -2296,8 +2447,12 @@ async fn gather_superseded_chain(
                 }
                 None => truncated = true,
             }
+            absent_end = Some(key);
             break;
         };
+        if links == Version2Links::Refuse && link.is_version_2_compaction() {
+            return Ok(None);
+        }
         if entry.charges(&link) {
             if depth >= MAX_CHAIN_DEPTH {
                 return Err(MaintainError::Invariant(format!(
@@ -2356,7 +2511,7 @@ async fn gather_superseded_chain(
     }
 
     let Some(ingest_hour_bucket) = ingest_hour_bucket else {
-        return Ok(Vec::new());
+        return Ok(Some(Vec::new()));
     };
     // Oldest generation first: a record is deleted only after every object the
     // generations below it superseded, and after the generation it superseded.
@@ -2368,7 +2523,7 @@ async fn gather_superseded_chain(
         .first()
         .cloned()
         .unwrap_or_else(|| predecessor_key.to_string());
-    Ok(vec![SupersededGroup {
+    Ok(Some(vec![SupersededGroup {
         ingest_hour_bucket,
         record_keys: input_record_keys,
         data_keys: input_data_keys,
@@ -2376,8 +2531,9 @@ async fn gather_superseded_chain(
         objects,
         request_ids,
         truncated,
+        absent_end,
         identity,
-    }])
+    }]))
 }
 
 /// A record's `input_set_hash` as the 32-byte array a level-1 snapshot entry
@@ -6027,7 +6183,31 @@ mod tests {
         out
     }
 
-    fn assert_refused_as_too_deep(result: Result<Vec<SupersededGroup>>, case: &str) {
+    /// A dominated record no gathered group holds is counted, once, unless a
+    /// rewrite in its bucket was left for its horizon; one a group holds is
+    /// not. Flipped line: the `attached.contains(key.as_str())` skip in
+    /// `Version2Groups::count_unattached`; without it the held record counts.
+    #[test]
+    fn unattached_dominated_records_are_counted() {
+        let groups = Version2Groups {
+            dominated: HashMap::from([
+                (1, vec!["held".to_string(), "orphan".to_string()]),
+                (2, vec!["waiting".to_string()]),
+            ]),
+            ..Default::default()
+        };
+        let group = SupersededGroup {
+            chain_record_keys: vec!["held".to_string()],
+            ..SupersededGroup::over_absent_predecessor(1, "absent")
+        };
+        let young = HashSet::from([2]);
+        let count = groups.count_unattached(&[group], &young, &tenant(), Signal::Logs, DEPTH_SHARD);
+        assert_eq!(count, 1);
+        let count = groups.count_unattached(&[], &HashSet::new(), &tenant(), Signal::Logs, 0);
+        assert_eq!(count, 3);
+    }
+
+    fn assert_refused_as_too_deep(result: Result<Option<Vec<SupersededGroup>>>, case: &str) {
         match result {
             Err(MaintainError::Invariant(msg)) => {
                 assert!(msg.contains("longer than 64 records"), "{case}: {msg}")
@@ -6081,10 +6261,11 @@ mod tests {
                     DEPTH_SHARD,
                     &top.superseded_record_key,
                     ChainEntry::Rewrite,
+                    Version2Links::Follow,
                 )
                 .await;
                 if accepted {
-                    let groups = walked.expect(&case);
+                    let groups = walked.expect(&case).expect("followed");
                     assert_eq!(groups.len(), 1, "{case}");
                     let expected = rewrites - 1 + compactions.len();
                     assert_eq!(groups[0].chain_record_keys.len(), expected, "{case}");
@@ -6118,10 +6299,11 @@ mod tests {
                     DEPTH_SHARD,
                     &head.superseded_record_key,
                     ChainEntry::Version2,
+                    Version2Links::Follow,
                 )
                 .await;
                 if accepted {
-                    let groups = walked.expect(&case);
+                    let groups = walked.expect(&case).expect("followed");
                     assert_eq!(groups.len(), 1, "{case}");
                     assert_eq!(
                         groups[0].chain_record_keys.len(),

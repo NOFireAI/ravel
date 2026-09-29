@@ -1367,3 +1367,107 @@ async fn sweep_deletes_dominated_records_newest_first() {
         BTreeSet::from([rewrite_key(&r), r_part])
     );
 }
+
+/// R names a version 2 C2 that carries `[a, b, c]` while the C1 it names
+/// carries `[a, b]`, so the bucket's version 2 supersession does not resolve.
+/// Past every horizon a deleting pass does not follow R's chain past C2 and
+/// reclaims nothing of it, and C2's extra input `c` is never deleted.
+///
+/// Flipped line: the `Version2Links::Refuse` choice in rule 2's rewrite arm
+/// (sweep.rs) replaced with `Version2Links::Follow`. R's walk then runs
+/// through C2 to C1 and deletes `a`, `b`, C1, C2 and both parts.
+#[tokio::test]
+async fn sweep_does_not_follow_a_version_2_link_in_an_unresolved_bucket() {
+    let store = Arc::new(MemoryStore::new());
+    let b = logs_bucket();
+    let base = hour_ns();
+    let inputs = seed_inputs(store.as_ref(), &[(0x65, 1), (0x66, 2), (0x67, 3)]).await;
+    let c1 = version_1(
+        &b,
+        vec![input(0x65, 1), input(0x66, 2)],
+        0x00,
+        part(0xc1, base, base + 10_000),
+    );
+    let c1_key = put_compaction(store.as_ref(), &c1).await;
+    let c2 = version_2(
+        &c1,
+        &c1_key,
+        vec![input(0x65, 1), input(0x66, 2), input(0x67, 3)],
+        part(0xc2, base, base + 10_000),
+    );
+    let c2_key = put_compaction(store.as_ref(), &c2).await;
+    put_rewrite(
+        store.as_ref(),
+        &b,
+        &c2_key,
+        Uuid::from_u128(0xd8),
+        part(0x0e, base, base + 10_000),
+    )
+    .await;
+    let before = bucket_keys(store.as_ref()).await;
+
+    let outcome = sweep_at(store.as_ref(), &b, past_horizon_ns(), &NoLeases).await;
+    assert_eq!(outcome, SupersededSweepOutcome::default());
+    assert_eq!(sweep_everything(store.as_ref(), &b).await, BTreeSet::new());
+    assert_eq!(bucket_keys(store.as_ref()).await, before);
+    let (c_commit, c_data) = inputs[2].clone();
+    assert!(before.contains(&c_commit) && before.contains(&c_data));
+}
+
+/// A version 2 C2 naming a C1 that is already gone, with a rewrite R naming
+/// the same C1: C2 is dominated, so it is skipped from its own entry, and R's
+/// walk finds C1 absent and gathers nothing. C2 is attached to R's group by
+/// the key both name and reclaimed with it past the horizon, its part before
+/// its record: a delete of C2's record that fails leaves the part gone and
+/// the record present, and a clean pass then removes the record. A resolve
+/// serves R's part alone throughout.
+///
+/// Flipped line: `.chain(group.absent_end.iter())` in
+/// `Version2Groups::join_dominated` (sweep.rs) removed. C2 then joins no
+/// group, no delete of it is issued, and it is kept with its pre-erasure part.
+#[tokio::test]
+async fn sweep_reclaims_a_dominated_record_whose_predecessor_is_gone() {
+    let mem = Arc::new(MemoryStore::new());
+    let b = logs_bucket();
+    let base = hour_ns();
+    let c1 = version_1(&b, vec![input(0xE7, 1)], 0xff, part(0xc1, base, base + 10));
+    // Never put: R's group already reclaimed it.
+    let c1_key = keys::compaction_record_key_for(&c1).unwrap();
+    let c2 = version_2(&c1, &c1_key, c1.inputs.clone(), part(0xc2, base, base + 10));
+    let c2_key = put_compaction(mem.as_ref(), &c2).await;
+    let r = put_rewrite(
+        mem.as_ref(),
+        &b,
+        &c1_key,
+        Uuid::from_u128(0xe4),
+        part(0x4e, base, base + 10),
+    )
+    .await;
+    let r_part = rewrite_part_key(&r);
+    assert_eq!(
+        served_keys(&mem, past_horizon_ns()).await,
+        BTreeSet::from([r_part.clone()])
+    );
+
+    sweep_failing_delete_of(&mem, &b, &c2_key).await;
+    assert_eq!(
+        bucket_keys(mem.as_ref()).await,
+        BTreeSet::from([c2_key.clone(), rewrite_key(&r), r_part.clone()])
+    );
+    assert_eq!(
+        served_keys(&mem, past_horizon_ns()).await,
+        BTreeSet::from([r_part.clone()])
+    );
+
+    let outcome = sweep_at(mem.as_ref(), &b, past_horizon_ns(), &NoLeases).await;
+    assert_eq!((outcome.records_deleted, outcome.data_deleted), (1, 1));
+    assert_eq!(outcome.dominated_records_unattached, 0);
+    assert_eq!(
+        bucket_keys(mem.as_ref()).await,
+        BTreeSet::from([rewrite_key(&r), r_part.clone()])
+    );
+    assert_eq!(
+        served_keys(&mem, past_horizon_ns()).await,
+        BTreeSet::from([r_part])
+    );
+}
