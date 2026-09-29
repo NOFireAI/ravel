@@ -82,12 +82,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   under the format-version hold, does. Those parts still count in
   `l1_compaction_parts`, so the floor is still refused over them; only the
   naming is new. A bucket whose authoritative records are below the target is
-  not named this way, a bucket that lists a rewrite record is never named this
-  way (it gets a `rewrite_parts` line only when its rewrite parts are below the
-  target), and a record a version 2 record supersedes is not a loser. A bucket
+  not named this way, a bucket whose rewrite record parts are below the target
+  gets its `rewrite_parts` line only, and a record a version 2 record
+  supersedes is not a loser. A bucket
   the walk names `loser_only_inputs` that also qualifies here gets this line
   only, since the two clear the same way. `BlockedReason` gains
   `LosingRecordParts { below_target }`.
+- **`ravel-cli maintain migrate` names a rewrite-record bucket held below the
+  target only by losing compaction record parts** (ADR-0066, force 2
+  amendment item 9, issue #2169). A bucket listing a rewrite record whose
+  parts are all at the target, with losing compaction records carrying parts
+  below it, printed no `blocked_bucket` line while `l1_compaction_parts`
+  counted those parts. It now gets
+  `blocked_bucket: ... reason=losing_record_parts below_target=<n>`. A bucket
+  whose rewrite record parts are below the target keeps its `rewrite_parts`
+  line only, and the counts are unchanged.
 - **The background supervisor now takes an advisory claim before compacting a
   large bucket, so two processes whose ownership overlaps no longer both pay
   for the same merge** (ADR-1029 decisions 3 to 5, issue #1033). The claim is

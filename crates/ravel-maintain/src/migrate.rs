@@ -186,9 +186,10 @@ pub enum BlockedReason {
     /// are no safe basis for raising the floor.
     ///
     /// Not this reason: a bucket whose authoritative records are themselves
-    /// below the target (its winner has not converged either); a bucket that
-    /// lists a rewrite record, which is named [`Self::RewriteParts`] when its
-    /// rewrite parts are below the target and not named at all otherwise; and
+    /// below the target (its winner has not converged either); a bucket whose
+    /// rewrite record parts are below the target, which is named
+    /// [`Self::RewriteParts`] alone (a bucket whose rewrite record parts are
+    /// all at the target is named this way when its losers qualify); and
     /// a record a present version 2 record supersedes or a version 2 record a
     /// live rewrite dominates, which nothing in this build reclaims either.
     ///
@@ -582,9 +583,12 @@ async fn list_shard_hours(
 /// parts below (a loser's raw L0 inputs, if any, count in `l0`), and the
 /// bucket is named [`BlockedReason::LosingRecordParts`] with the losers'
 /// below-target part count, from the same [`authoritative_compaction_records`]
-/// selection that decides which inputs are superseded. Nothing in this build
-/// reclaims a loser's parts, so only retention clears that entry, subject to
-/// the format-version hold.
+/// selection that decides which inputs are superseded. A bucket that lists a
+/// rewrite record is named this way too when the rewrite record's parts are all
+/// at the target; one whose rewrite parts are below the target keeps its
+/// [`BlockedReason::RewriteParts`] entry alone. Nothing in this build reclaims
+/// a loser's parts, so only retention clears that entry, subject to the
+/// format-version hold.
 pub async fn count_below_target(
     store: &dyn ObjectStoreBackend,
     tenant_hash: &TenantHash,
@@ -633,10 +637,9 @@ pub async fn count_below_target(
         // A losing compaction record's below-target parts are already in `l1`
         // above. The bucket is named for them only when its authoritative
         // records are all at the target, so the losers are what holds it
-        // below; a bucket listing a rewrite record keeps its `RewriteParts`
-        // treatment alone.
+        // below; a bucket already named `RewriteParts` keeps that entry alone.
         for (hour, parts) in &family.compaction_authority {
-            if family.rewrite_hours.contains(hour) {
+            if blocked_by_hour.contains_key(hour) {
                 continue;
             }
             if parts.authoritative.iter().any(|v| *v < target_version) {
@@ -823,8 +826,6 @@ struct ShardFamily {
     /// Per ingest hour holding compaction records, the part versions of its
     /// authoritative records and of its overlap losers.
     compaction_authority: BTreeMap<u32, BucketPartVersions>,
-    /// Every ingest hour that lists at least one rewrite record.
-    rewrite_hours: HashSet<u32>,
 }
 
 /// The part versions of one bucket's compaction records, split by
@@ -975,7 +976,6 @@ async fn read_shard_family(
         superseded_commits,
         records,
         compaction_authority,
-        rewrite_hours: rewrite_by_bucket.into_keys().collect(),
     })
 }
 
@@ -3768,11 +3768,12 @@ mod tests {
         );
     }
 
-    /// A bucket that lists a rewrite record keeps its `RewriteParts` entry and
-    /// is not also named for its overlap loser's parts. The rewrite record
-    /// supersedes the winner and carries one below-target part.
+    /// A bucket whose rewrite record parts are below the target keeps its
+    /// `RewriteParts` entry and is not also named for its overlap loser's
+    /// parts. The rewrite record supersedes the winner and carries one
+    /// below-target part.
     ///
-    /// Prove-the-test: delete the `if family.rewrite_hours.contains(hour) {
+    /// Prove-the-test: delete the `if blocked_by_hour.contains_key(hour) {
     /// continue; }` check in `count_below_target` and this fails with the
     /// bucket named `LosingRecordParts { below_target: 2 }` in place of
     /// `RewriteParts { below_target: 1 }`.
@@ -3812,6 +3813,57 @@ mod tests {
                 blocked: expected,
             }),
             "the loser's parts still count in l1; the bucket is named for its rewrite part"
+        );
+    }
+
+    /// A bucket that lists a rewrite record whose parts are all at the target
+    /// is named `LosingRecordParts` for its overlap loser's below-target parts
+    /// (issue #2169): the rewrite record's presence alone does not suppress
+    /// the line. The rewrite record supersedes the winner and its two parts are
+    /// at the target, so `rewrite_parts == 0` and the loser's two below-target
+    /// parts are the whole `l1`.
+    ///
+    /// Prove-the-test: make the `if blocked_by_hour.contains_key(hour)` check
+    /// in `count_below_target` skip every hour that lists a rewrite record (the
+    /// code before issue #2169) and this fails with `blocked_buckets` empty
+    /// (`left: []`).
+    #[tokio::test]
+    async fn a_bucket_whose_rewrite_parts_are_at_target_is_named_for_its_losers() {
+        let store = MemoryStore::new();
+        provision(&store, 1).await;
+        let winner = seed_losing_parts_bucket(&store, &[FUTURE_VERSION]).await;
+        put_rewrite_record(
+            &store,
+            RewriteFixture {
+                shard: 0,
+                hour: 100,
+                input_seqs: &[],
+                hash_seed: 0x33,
+                part_version: FUTURE_VERSION,
+                part_count: 2,
+                supersedes: &winner,
+            },
+        )
+        .await;
+
+        let report = migrate_to_future(&store, 100).await;
+
+        let expected = vec![BlockedBucket {
+            shard: 0,
+            ingest_hour: 100,
+            reason: BlockedReason::LosingRecordParts { below_target: 2 },
+        }];
+        assert_eq!(report.blocked_buckets, expected);
+        assert_eq!(
+            report.verification,
+            Some(Verification::Stragglers {
+                l0: 0,
+                l1: 2,
+                rewrite_parts: 0,
+                blocked: expected,
+            }),
+            "the loser's two below-target parts count in l1 and name the bucket; the \
+             rewrite record's parts are at the target and count nowhere"
         );
     }
 }
