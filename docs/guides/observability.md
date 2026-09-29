@@ -173,6 +173,9 @@ Labels: `mode` and `signal`. The `signal` label carries `metrics`, `logs`, or
 | `ravel_ingest_queued_flushes` | Flush tasks spawned and not yet reaped, summed across shards (a gauge): the per-shard queue `--max-queued-flushes` caps. It can exceed the shard count times that cap, because a tenant buffer over its memory backstop spawns whatever the queue depth; this gauge rising while `ravel_ingest_flush_trigger_deferred_total` stays flat is that exemption, not a queue that lost its bound. |
 | `ravel_ingest_flush_trigger_deferred_total` | Size and age flush triggers refused because their shard was already holding `--max-queued-flushes` spawned flush tasks, summed across shards. A refusal is a deferral, not a shed: the buffer rides back untouched and the next tick re-fires once a flush has been reaped, so a rising figure means flush latency slipped past `--max-flush-delay` while nothing was dropped. |
 | `ravel_ingest_flush_all_residue_tenants_total` | Tenants a teardown drain left with buffered rows still unflushed, summed across shards. In buffered mode those rows were already acknowledged ([Consistency model](../consistency-model.md)), so a nonzero increase is data loss, not backpressure. It counts TENANTS, and a residual buffer can also hold strict-mode rows whose waiters were answered 503 and will retry, so the count is an upper bound on tenants that lost acknowledged data; the same drain also logs an ERROR per residual shard, carrying that shard's tenant count. See [Reachability during shutdown](#reachability-during-shutdown) below for when a scrape can actually see this change. |
+| `ravel_ingest_clock_lag_refused_total` | Flushes refused because the writer's flush-open clock reading lagged the object store's observed clock (the latest response `Date` the store adapter saw) by more than the five-minute clock-skew allowance. Strict waiters get the retryable 503 and the buffer goes back for the next trigger; nothing is written. A rising figure means this host's clock runs behind the store's and would otherwise publish into an ingest hour the fold may already have sealed: fix the host clock. See [the writer clock-lag alert](#the-writer-clock-lag-alert). |
+| `ravel_ingest_clock_lag_unchecked_total` | Flush-open attempts that found no store-clock observation yet, so the lag check did not run and the flush proceeded unchecked. Cumulative and never reset: the attempts a process makes before its first store response stay in the total, so the signal is a figure still growing past the process's first minute, which is a wiring defect against a store that reports a clock. A `MemoryStore`-backed process reports none, so there it grows by design. |
+| `ravel_ingest_clock_lag_bypassed_at_shutdown_total` | Flush-open attempts on a `Shutdown` or channel-close drain that found a lagging reading and went on with the lag check bypassed, rather than strand rows buffered mode had already acknowledged. It counts the bypass, not the publication: the monotonic floor still applies on those passes. Those rows may land in an ingest hour the fold has sealed, invisible to token-less reads until a catalog HEAD rebuild. Each bypass also logs at WARN naming the measured lag. A nonzero figure means a writer was shut down with a lagging clock: fix the host clock, and rebuild the HEAD if a token-less read is missing the rows. |
 
 The collisions family carries no `signal="spans"` series. Spans derive no
 identity that can collide, so that sample is structurally absent, not zero.
@@ -200,7 +203,45 @@ snapshots already expose the stale-provisioning counter it pairs with. A logs-
 or spans-only process therefore still renders a real (possibly zero) sample
 for all six. `ravel_ingest_flush_all_residue_tenants_total` is carried for
 all three signals too, for the same reason: `DrainIntent::Teardown` runs
-identically in every shard actor.
+identically in every shard actor. The three `ravel_ingest_clock_lag_*`
+families are carried for all three signals as well, because every shard
+actor runs the store-clock lag check at flush open.
+
+#### The writer clock-lag alert
+
+A refused flush means a writer's clock runs behind the object store's by more
+than the clock-skew allowance. The refusal does not clear on its own: nothing
+the flush does moves either clock, so every retry refuses again until the host
+clock converges, and in buffered mode the rows wait in the buffer and shed at
+the byte-budget ceiling if it never does. The rule ships as the
+`ravel-ingest-clock` group in
+[`deploy/prometheus/ravel.rules.yaml`](../../deploy/prometheus/ravel.rules.yaml).
+
+```yaml
+groups:
+  - name: ravel-ingest-clock
+    rules:
+      - alert: RavelWriterClockLagRefused
+        expr: |
+          increase(ravel_ingest_clock_lag_refused_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            A Ravel writer's clock runs behind the object store's clock, so its
+            {{ $labels.signal }} flushes are refused
+```
+
+Neither of the other two clock-lag counters pages.
+`ravel_ingest_clock_lag_unchecked_total` counts flushes made before any store
+time was observed, which every process does at startup, so a nonzero value is
+expected; only one still growing well after startup says something, and what
+it says is a wiring defect to file, not an incident.
+`ravel_ingest_clock_lag_bypassed_at_shutdown_total` is teardown residue: it
+moves on a process that is already exiting, so an alert on it would fire after
+the process that could act on it is gone. Read it after a rollout, beside the
+refusal counter's history.
 
 #### Per-tenant PUT attribution (`ravel_ingest_attribution_puts_total`)
 

@@ -31,7 +31,7 @@
 //! parse as structure and are each caught by one of those two checks, the
 //! same way Prometheus itself refuses them on load.
 //!
-//! `docs/guides/observability.md` reprints 14 of these rules in fenced `yaml`
+//! `docs/guides/observability.md` reprints 16 of these rules in fenced `yaml`
 //! blocks, to explain them in place. Those blocks are parsed the same way and
 //! compared field by field against the shipped file, which is what keeps a
 //! rename from updating one copy and leaving the other handing readers a dead
@@ -84,14 +84,14 @@ const GUIDE_FILE: &str = concat!(
 /// no longer resolves) would otherwise leave every assertion below passing
 /// vacuously over an empty set. Adding a rule that names a new metric fails
 /// here until this number is updated.
-const EXPECTED_METRIC_NAMES: usize = 40;
+const EXPECTED_METRIC_NAMES: usize = 41;
 
 /// Groups and alert rules in the shipped file, counted off the parsed
 /// structure. Pinned for the same reason as the name count: a file that lost
 /// a group, or a group that lost a rule, must fail rather than shrink the
 /// scan. `deploy/README.md` states both figures.
-const EXPECTED_GROUPS: usize = 8;
-const EXPECTED_ALERTS: usize = 34;
+const EXPECTED_GROUPS: usize = 9;
+const EXPECTED_ALERTS: usize = 35;
 
 /// Rules transcribed from a troubleshooting-table row that states no
 /// duration, so they carry no `for:` and say so in an `as_documented`
@@ -132,8 +132,8 @@ const DASHBOARD_FILE: &str = concat!(
 /// nothing. `deploy/README.md` states the row and name figures.
 const EXPECTED_DASHBOARD_ROWS: usize = 6;
 const EXPECTED_DASHBOARD_PANELS: usize = 36;
-const EXPECTED_DASHBOARD_TARGETS: usize = 108;
-const EXPECTED_DASHBOARD_METRIC_NAMES: usize = 111;
+const EXPECTED_DASHBOARD_TARGETS: usize = 109;
+const EXPECTED_DASHBOARD_METRIC_NAMES: usize = 112;
 
 /// Families the dashboard graphs that no shipped rule alerts on.
 ///
@@ -149,8 +149,8 @@ const EXPECTED_DASHBOARD_ONLY_NAMES: usize = 71;
 /// them. Pinned so that an extractor that matches no block, or a block that
 /// stops holding rules, fails here rather than leaving the per-alert
 /// comparison below iterating an empty set.
-const EXPECTED_GUIDE_BLOCKS: usize = 6;
-const EXPECTED_GUIDE_ALERTS: usize = 15;
+const EXPECTED_GUIDE_BLOCKS: usize = 7;
+const EXPECTED_GUIDE_ALERTS: usize = 16;
 
 /// One tenant, one trivially valid PromQL rule. Enough for `alerting::spawn`
 /// to build an evaluator, which is what puts the whole `ravel_alert_*` family

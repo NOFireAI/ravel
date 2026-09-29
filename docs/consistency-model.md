@@ -399,9 +399,11 @@ query sees. Guarantees:
   the drain makes up to `MAX_FLUSH_ALL_PASSES` further passes with the check
   bypassed, publishing rather than dropping rows buffered mode had already
   acknowledged, counting `clock_lag_bypassed_at_shutdown` (see docs/ingest.md
-  and the ADR-1685 teardown amendment). All three counters live on the
-  `ravel-ingest` metrics snapshots and none of them is rendered by `/metrics`
-  yet, which is ADR-1685 follow-up task 3. So this direction still needs its
+  and the ADR-1685 teardown amendment). `/metrics` renders all three as
+  `ravel_ingest_clock_lag_refused_total`,
+  `ravel_ingest_clock_lag_unchecked_total`, and
+  `ravel_ingest_clock_lag_bypassed_at_shutdown_total`. Those three paths
+  still publish, so this direction still needs its
   after-the-fact detector, the scheduled
   seal-divergence scrubber (`services/ravel-server/src/scrub.rs`,
   `run_seal_divergence_tick`). That tick re-lists sealed commit records and
