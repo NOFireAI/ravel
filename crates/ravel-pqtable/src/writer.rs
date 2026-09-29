@@ -970,10 +970,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_45_s_grace_floor_leaves_a_usable_put_budget() {
-        // A 45 s floor leaves a 22.5 s resolve-to-put budget, and a put on a
-        // clock that does not move commits inside it. The budget is measured
-        // end to end on this call's own clock, so nothing is taken off it for
-        // the difference between that clock and the store's.
+        // A 45 s floor halves to a 22.5 s resolve-to-put budget, which the
+        // removed 30 s skew allowance used to consume entirely (every write
+        // was refused with NoPutBudget). The budget is now measured end to end
+        // on this call's own clock, so a put under such a floor commits.
         let store = MemoryStore::new();
         assert_eq!(
             apply(
