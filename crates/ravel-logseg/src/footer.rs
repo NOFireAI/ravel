@@ -31,10 +31,16 @@ pub const MAGIC: [u8; 4] = *b"RLG1";
 /// range and has no header, so nothing but this version byte tells a reader
 /// which of the two layouts BLOCKS holds.
 ///
-/// Version 3 is not readable: ADR-0892 deleted its reader, so the window below
-/// is a single version, matching RSPAN and RSEG. A stored version-3 object is
-/// rejected with [`LogSegError::UnsupportedVersion`].
-pub const VERSION: u16 = 4;
+/// Bumped 4 -> 5 by ADR-2135, which added the footer sort descriptor and
+/// clustering generation, put the covered-column list at the head of BLOOM,
+/// sized each bloom filter to a multiple of 512 bits instead of a power of
+/// two, and reserved encoding tags 10-13.
+///
+/// Versions 3 and 4 are not readable: ADR-0892 and ADR-2135 deleted their
+/// readers, so the window below is a single version, matching RSPAN and RSEG.
+/// A stored object of any other version is rejected with
+/// [`LogSegError::UnsupportedVersion`].
+pub const VERSION: u16 = 5;
 
 /// The set of RLOG trailer versions this build's reader accepts. Writers always
 /// emit the current version [`VERSION`]; readers accept that version and
@@ -89,8 +95,9 @@ impl SupportedVersions {
     }
 }
 
-/// RLOG's supported-version window: `{4}` since ADR-0892, which deleted the
-/// version-3 reader and brought RLOG back in line with RSPAN and RSEG. The
+/// RLOG's supported-version window: `{5}` since ADR-2135, which deleted the
+/// version-4 reader under the same pre-release posture ADR-0892 applied to
+/// version 3, keeping RLOG in line with RSPAN and RSEG. The
 /// writer emits `SUPPORTED_VERSIONS.newest()`; the reader accepts that and
 /// nothing else. This is the single source the writer, the reader gate,
 /// `audit-versions`, `migrate`, and the compactor's `OUTPUT_FORMAT_VERSION` all
@@ -127,8 +134,8 @@ pub mod kind {
     // Kind 7 is reserved for GRAM_IDX (ADR-0105), which has no implementation
     // yet; PAGE_DIR takes the next free number rather than that one.
     /// Per-row-group, per-column-chunk, per-page directory
-    /// (ADR-0699 decision 2). Mandatory in trailer version 4, the only version
-    /// this build reads.
+    /// (ADR-0699 decision 2). Mandatory since trailer version 4, and in
+    /// version 5, the only version this build reads.
     pub const PAGE_DIR: u32 = 8;
 }
 
@@ -166,6 +173,118 @@ pub struct LogFooter {
     pub input_set_hash: Vec<u8>,
     /// Part ordinal within one compaction output (0 on an L0 object).
     pub part_index: u32,
+    /// The object's row order (ADR-2135 decision 2). `None` is the default
+    /// `(stream_ref, ts)` order.
+    pub sort_descriptor: Option<SortDescriptor>,
+    /// The tenant clustering generation the object was written under: 0 when
+    /// the tenant never set a key. A cleared key leaves `sort_descriptor`
+    /// `None` with a nonzero generation; a descriptor with generation 0 is
+    /// refused as corrupt.
+    pub clustering_generation: u64,
+}
+
+/// Width of the time bucket leading a clustered sort key.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SortBucketWidth {
+    OneHour,
+    SixHours,
+    OneDay,
+}
+
+/// Value type of one sort key column.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SortKeyType {
+    Str,
+    I64,
+    Bool,
+    Bytes,
+}
+
+/// One sort key column: a declared typed attribute name and its type.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SortKeyColumn {
+    pub name: String,
+    pub ty: SortKeyType,
+}
+
+/// Most key columns a sort descriptor may name (ADR-2135 decision 1).
+pub const MAX_SORT_KEY_COLUMNS: usize = 4;
+
+/// A clustered row order: `(stream_ref, ts.div_euclid(bucket), key_columns in
+/// order, ts)`. `key_columns` holds 1 to [`MAX_SORT_KEY_COLUMNS`] entries.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SortDescriptor {
+    pub bucket_width: SortBucketWidth,
+    pub key_columns: Vec<SortKeyColumn>,
+}
+
+impl SortDescriptor {
+    fn to_proto(&self) -> pb::SortDescriptor {
+        let bucket_width = match self.bucket_width {
+            SortBucketWidth::OneHour => pb::SortBucketWidth::OneHour,
+            SortBucketWidth::SixHours => pb::SortBucketWidth::SixHours,
+            SortBucketWidth::OneDay => pb::SortBucketWidth::OneDay,
+        };
+        pb::SortDescriptor {
+            bucket_width: bucket_width as i32,
+            key_columns: self
+                .key_columns
+                .iter()
+                .map(|c| {
+                    let ty = match c.ty {
+                        SortKeyType::Str => pb::SortKeyColumnType::Str,
+                        SortKeyType::I64 => pb::SortKeyColumnType::I64,
+                        SortKeyType::Bool => pb::SortKeyColumnType::Bool,
+                        SortKeyType::Bytes => pb::SortKeyColumnType::Bytes,
+                    };
+                    pb::SortKeyColumn {
+                        name: c.name.clone(),
+                        r#type: ty as i32,
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    fn from_proto(p: pb::SortDescriptor) -> Result<Self, LogSegError> {
+        let bucket_width = match pb::SortBucketWidth::try_from(p.bucket_width) {
+            Ok(pb::SortBucketWidth::OneHour) => SortBucketWidth::OneHour,
+            Ok(pb::SortBucketWidth::SixHours) => SortBucketWidth::SixHours,
+            Ok(pb::SortBucketWidth::OneDay) => SortBucketWidth::OneDay,
+            Ok(pb::SortBucketWidth::Unspecified) | Err(_) => {
+                return Err(LogSegError::Corrupted(format!(
+                    "footer sort descriptor bucket width {} unknown",
+                    p.bucket_width
+                )));
+            }
+        };
+        if p.key_columns.is_empty() || p.key_columns.len() > MAX_SORT_KEY_COLUMNS {
+            return Err(LogSegError::Corrupted(format!(
+                "footer sort descriptor has {} key columns, not 1..={MAX_SORT_KEY_COLUMNS}",
+                p.key_columns.len()
+            )));
+        }
+        let mut key_columns = Vec::with_capacity(p.key_columns.len());
+        for c in p.key_columns {
+            let ty = match pb::SortKeyColumnType::try_from(c.r#type) {
+                Ok(pb::SortKeyColumnType::Str) => SortKeyType::Str,
+                Ok(pb::SortKeyColumnType::I64) => SortKeyType::I64,
+                Ok(pb::SortKeyColumnType::Bool) => SortKeyType::Bool,
+                Ok(pb::SortKeyColumnType::Bytes) => SortKeyType::Bytes,
+                Ok(pb::SortKeyColumnType::Unspecified) | Err(_) => {
+                    return Err(LogSegError::Corrupted(format!(
+                        "footer sort key column {:?} type {} unknown",
+                        c.name, c.r#type
+                    )));
+                }
+            };
+            key_columns.push(SortKeyColumn { name: c.name, ty });
+        }
+        Ok(SortDescriptor {
+            bucket_width,
+            key_columns,
+        })
+    }
 }
 
 impl LogFooter {
@@ -203,6 +322,8 @@ impl LogFooter {
             level: self.level,
             input_set_hash: self.input_set_hash.clone(),
             part_index: self.part_index,
+            sort_descriptor: self.sort_descriptor.as_ref().map(SortDescriptor::to_proto),
+            clustering_generation: self.clustering_generation,
         }
     }
 
@@ -224,6 +345,15 @@ impl LogFooter {
                 uncomp_len: s.uncompressed_len,
             });
         }
+        let sort_descriptor = p
+            .sort_descriptor
+            .map(SortDescriptor::from_proto)
+            .transpose()?;
+        if sort_descriptor.is_some() && p.clustering_generation == 0 {
+            return Err(LogSegError::Corrupted(
+                "footer sort descriptor present with clustering generation 0".into(),
+            ));
+        }
         Ok(LogFooter {
             tenant_hash,
             shard: p.shard,
@@ -241,6 +371,8 @@ impl LogFooter {
             level: p.level,
             input_set_hash: p.input_set_hash,
             part_index: p.part_index,
+            sort_descriptor,
+            clustering_generation: p.clustering_generation,
         })
     }
 }
@@ -512,6 +644,8 @@ mod tests {
             level: 0,
             input_set_hash: Vec::new(),
             part_index: 0,
+            sort_descriptor: None,
+            clustering_generation: 0,
         }
     }
 
