@@ -25,7 +25,7 @@ use bytes::Bytes;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::TableProvider;
 use datafusion::error::DataFusionError;
-use ravel_object_store::external::{ExternalProfile, ExternalStore, ProfileError};
+use ravel_object_store::external::{ExternalKind, ExternalProfile, ExternalStore, ProfileError};
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, PutOptions, PutOutcome, StoreError,
@@ -62,6 +62,74 @@ pub enum ExternalStoreError {
         #[source]
         source: ProfileError,
     },
+    /// The profile reaches `bucket` at the endpoint Ravel's own data bucket is
+    /// configured at, and the names match (ADR-2040 D4). No Parquet table reads
+    /// Ravel's bucket, whatever wrote the manifest naming the file.
+    #[error("bucket {bucket:?} through profile {profile:?} is Ravel's own data bucket")]
+    RavelBucket { profile: String, bucket: String },
+}
+
+/// Ravel's own data bucket as the server is configured to reach it: the S3
+/// endpoint (`None` for AWS's regional endpoint) and the bucket name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RavelBucket {
+    pub endpoint: Option<String>,
+    pub bucket: String,
+}
+
+impl RavelBucket {
+    /// Whether `profile` reaching `bucket` names this bucket by
+    /// configuration: the same bucket name on the same service. Ravel's bucket
+    /// reached under another name is refused when the grant is written, by
+    /// the probe of ADR-2040 D1, not here.
+    fn is_reached_by(&self, profile: &ExternalProfile, bucket: &str) -> bool {
+        if self.bucket != bucket {
+            return false;
+        }
+        let ravel = Service::of(self.endpoint.as_deref());
+        match &profile.kind {
+            ExternalKind::S3 { endpoint, .. } => Service::of(endpoint.as_deref()) == ravel,
+            ExternalKind::Gcs { .. } => ravel == Service::Gcs,
+            ExternalKind::Azure { .. } => false,
+        }
+    }
+}
+
+/// The service an S3 endpoint reaches: AWS for no endpoint or any
+/// `amazonaws.com` host, GCS's S3 interoperability host, or any other host
+/// and port, whatever the scheme and path.
+#[derive(Debug, PartialEq, Eq)]
+enum Service {
+    Aws,
+    Gcs,
+    Host(String),
+}
+
+impl Service {
+    fn of(endpoint: Option<&str>) -> Self {
+        let Some(endpoint) = endpoint else {
+            return Service::Aws;
+        };
+        let endpoint = endpoint.trim().to_ascii_lowercase();
+        let authority = endpoint
+            .split_once("://")
+            .map_or(endpoint.as_str(), |(_, rest)| rest);
+        let host = authority
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or_default()
+            .rsplit('@')
+            .next()
+            .unwrap_or_default();
+        let name = host.split(':').next().unwrap_or_default();
+        if name == "amazonaws.com" || name.ends_with(".amazonaws.com") {
+            Service::Aws
+        } else if name == "storage.googleapis.com" {
+            Service::Gcs
+        } else {
+            Service::Host(host.to_string())
+        }
+    }
 }
 
 /// The read-only stores Parquet files are read through, one per (credential
@@ -76,9 +144,12 @@ pub trait ExternalStores: Send + Sync {
 
 /// [`ExternalStores`] over the profiles of a credential profile file: each
 /// (profile, bucket) is opened with [`ExternalStore::open`] the first time a
-/// query reads it, and the open store is kept for the process.
+/// query reads it, and the open store is kept for the process. A (profile,
+/// bucket) that is Ravel's own data bucket ([`Self::refusing`]) is refused
+/// before anything is opened.
 pub struct ProfileStores {
     profiles: HashMap<String, ExternalProfile>,
+    ravel: Option<RavelBucket>,
     opened: Mutex<HashMap<(String, String), Arc<dyn ObjectStoreBackend>>>,
 }
 
@@ -89,8 +160,16 @@ impl ProfileStores {
                 .into_iter()
                 .map(|profile| (profile.name.clone(), profile))
                 .collect(),
+            ravel: None,
             opened: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Refuse, with [`ExternalStoreError::RavelBucket`], every (profile,
+    /// bucket) that reaches `ravel`.
+    pub fn refusing(mut self, ravel: RavelBucket) -> Self {
+        self.ravel = Some(ravel);
+        self
     }
 
     /// The configured profile names, sorted.
@@ -126,6 +205,16 @@ impl ExternalStores for ProfileStores {
                 .ok_or_else(|| ExternalStoreError::UnknownProfile {
                     profile: profile.to_string(),
                 })?;
+        if self
+            .ravel
+            .as_ref()
+            .is_some_and(|ravel| ravel.is_reached_by(config, bucket))
+        {
+            return Err(ExternalStoreError::RavelBucket {
+                profile: profile.to_string(),
+                bucket: bucket.to_string(),
+            });
+        }
         let store =
             ExternalStore::open(config, bucket).map_err(|source| ExternalStoreError::Open {
                 profile: profile.to_string(),
@@ -203,6 +292,12 @@ impl ParquetSources {
     /// read at all.
     pub fn is_configured(&self) -> bool {
         self.external.is_some()
+    }
+
+    /// The stores Parquet files are read through; `None` when no credential
+    /// profiles are configured.
+    pub fn external_stores(&self) -> Option<&Arc<dyn ExternalStores>> {
+        self.external.as_ref()
     }
 
     /// The decoded-footer cache, shared by every query this executor runs.
@@ -347,6 +442,13 @@ impl ParquetQueryError {
                 | ParquetTableError::Schema { .. }),
             ) => err.to_string(),
             ParquetQueryError::Table(ParquetTableError::Plan { .. }) => MSG_PLAN.to_string(),
+            ParquetQueryError::Store {
+                table,
+                source: ExternalStoreError::RavelBucket { .. },
+            } => format!(
+                "Parquet table {table} names a file in Ravel's own data bucket, which no Parquet \
+                 table may read"
+            ),
             ParquetQueryError::Store { table, .. }
             | ParquetQueryError::Table(ParquetTableError::NoStore { table, .. }) => format!(
                 "Parquet table {table} is read through a credential profile this server cannot \
@@ -592,5 +694,179 @@ impl ObjectStoreBackend for ResolveStore {
 
     fn capabilities(&self) -> Capabilities {
         self.inner.capabilities()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// A static-key S3 profile reaching `endpoint`, its keys read from files
+    /// under `dir` when `readable`, from a missing file otherwise.
+    fn s3_profile(
+        name: &str,
+        endpoint: Option<&str>,
+        dir: &std::path::Path,
+        readable: bool,
+    ) -> ExternalProfile {
+        let key = dir.join(if readable { "key" } else { "missing" });
+        if readable {
+            std::fs::write(&key, "test-key\n").expect("write key");
+        }
+        let endpoint = endpoint.map_or("null".to_string(), |e| format!("{e:?}"));
+        let json = format!(
+            r#"[{{"name": {name:?}, "kind": "s3", "region": "us-east-1", "endpoint": {endpoint},
+                 "allow_http": true, "force_path_style": true,
+                 "credentials": {{"mode": "static",
+                   "access_key_id": {{"from": "file", "path": {key:?}}},
+                   "secret_access_key": {{"from": "file", "path": {key:?}}}}}}}]"#
+        );
+        ravel_object_store::external::load_profiles(&json)
+            .expect("profile")
+            .remove(0)
+    }
+
+    /// `ProfileStores` opens one store per (profile, bucket), the first time
+    /// it is asked, and hands the same store back on every later request.
+    #[tokio::test]
+    async fn one_store_per_profile_and_bucket_reused_on_the_next_read() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let stores = ProfileStores::new(vec![
+            s3_profile("lake", Some("http://127.0.0.1:9"), dir.path(), true),
+            s3_profile("other", Some("http://127.0.0.1:9"), dir.path(), true),
+        ]);
+        let first = stores.store("lake", "a").expect("opens");
+        let again = stores.store("lake", "a").expect("reused");
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "the second read reuses the store"
+        );
+        let bucket = stores.store("lake", "b").expect("opens");
+        assert!(
+            !Arc::ptr_eq(&first, &bucket),
+            "another bucket, another store"
+        );
+        let profile = stores.store("other", "a").expect("opens");
+        assert!(
+            !Arc::ptr_eq(&first, &profile),
+            "another profile, another store"
+        );
+        assert!(matches!(
+            stores.store("nobody", "a"),
+            Err(ExternalStoreError::UnknownProfile { profile }) if profile == "nobody"
+        ));
+    }
+
+    /// A profile whose secret cannot be read fails with a typed error that
+    /// names the kind of source and not its path. The failure is not kept:
+    /// once the secret file exists, the next request opens the store.
+    #[tokio::test]
+    async fn a_profile_whose_secret_cannot_be_read_fails_typed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let stores = ProfileStores::new(vec![s3_profile(
+            "lake",
+            Some("http://127.0.0.1:9"),
+            dir.path(),
+            false,
+        )]);
+        let err = stores.store("lake", "a").err().expect("refused");
+        assert!(
+            matches!(
+                &err,
+                ExternalStoreError::Open {
+                    profile,
+                    bucket,
+                    source: ProfileError::SecretUnavailable { kind: "file" },
+                } if profile == "lake" && bucket == "a"
+            ),
+            "{err:?}"
+        );
+        assert!(!err.to_string().contains("missing"), "{err}");
+        std::fs::write(dir.path().join("missing"), "test-key\n").expect("write key");
+        stores
+            .store("lake", "a")
+            .expect("the next request opens the store");
+    }
+
+    /// ADR-2040 D4: a (profile, bucket) naming Ravel's own data bucket, the
+    /// same bucket name on the same service, is refused before the store is
+    /// opened, so even a profile whose secret is unreadable fails this way.
+    /// The same profile's other buckets, and the same name on another
+    /// endpoint, still open.
+    #[tokio::test]
+    async fn ravels_own_bucket_is_refused_before_anything_is_opened() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ravel = RavelBucket {
+            endpoint: Some("http://127.0.0.1:9".to_string()),
+            bucket: "ravel".to_string(),
+        };
+        let stores = ProfileStores::new(vec![
+            s3_profile("lake", Some("HTTP://127.0.0.1:9/"), dir.path(), true),
+            s3_profile("locked", Some("http://127.0.0.1:9"), dir.path(), false),
+            s3_profile("elsewhere", Some("http://127.0.0.1:10"), dir.path(), true),
+        ])
+        .refusing(ravel);
+        for profile in ["lake", "locked"] {
+            let err = stores.store(profile, "ravel").err().expect("refused");
+            assert!(
+                matches!(&err, ExternalStoreError::RavelBucket { profile: p, bucket }
+                    if p == profile && bucket == "ravel"),
+                "{profile}: {err:?}"
+            );
+        }
+        stores.store("lake", "lake").expect("another bucket opens");
+        stores
+            .store("elsewhere", "ravel")
+            .expect("the same name on another endpoint opens");
+
+        let err = ParquetQueryError::Store {
+            table: "t".to_string(),
+            source: ExternalStoreError::RavelBucket {
+                profile: "lake".to_string(),
+                bucket: "ravel".to_string(),
+            },
+        };
+        assert_eq!(err.class(), ErrorClass::Unsupported);
+        let message = err.client_message();
+        assert!(message.contains("Ravel's own data bucket"), "{message}");
+        assert!(!message.contains("\"ravel\""), "{message}");
+    }
+
+    /// The service comparison: AWS for no endpoint or any `amazonaws.com`
+    /// host, GCS's interoperability host for a GCS profile, and an Azure
+    /// profile never matches an S3-configured bucket.
+    #[tokio::test]
+    async fn ravels_bucket_is_matched_by_service() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let aws = RavelBucket {
+            endpoint: None,
+            bucket: "ravel".to_string(),
+        };
+        let profile = s3_profile(
+            "lake",
+            Some("https://s3.eu-west-1.amazonaws.com"),
+            dir.path(),
+            true,
+        );
+        assert!(aws.is_reached_by(&profile, "ravel"));
+        assert!(!aws.is_reached_by(&profile, "lake"));
+        let local = s3_profile("local", Some("http://127.0.0.1:9"), dir.path(), true);
+        assert!(!aws.is_reached_by(&local, "ravel"));
+
+        let profiles = ravel_object_store::external::load_profiles(
+            r#"[{"name": "g", "kind": "gcs", "credentials": {"mode": "application_default"}},
+                {"name": "z", "kind": "azure", "account": "acct",
+                 "credentials": {"mode": "sas_token", "token": {"from": "env", "name": "T"}}}]"#,
+        )
+        .expect("profiles");
+        let gcs = RavelBucket {
+            endpoint: Some("https://storage.googleapis.com".to_string()),
+            bucket: "ravel".to_string(),
+        };
+        assert!(gcs.is_reached_by(&profiles[0], "ravel"));
+        assert!(!aws.is_reached_by(&profiles[0], "ravel"));
+        assert!(!gcs.is_reached_by(&profiles[1], "ravel"));
+        assert!(!aws.is_reached_by(&profiles[1], "ravel"));
     }
 }

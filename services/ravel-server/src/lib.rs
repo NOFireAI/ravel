@@ -653,11 +653,12 @@ pub struct ServerConfig {
     /// flags existed.
     pub typed_attr_columns: crate::typed_attr_config::TypedAttrColumnConfig,
     /// The credential profiles Parquet tables are read through (ADR-2040
-    /// decision D1), loaded by `main` from `--parquet-profiles`. [`start`]
-    /// installs Parquet sources on the shared `SqlExecutor` either way: `None`
-    /// makes every Parquet table unqueryable, and a query naming one fails
-    /// with a typed error saying no profile file is configured.
-    pub parquet_profiles: Option<Vec<ravel_object_store::external::ExternalProfile>>,
+    /// decision D1), loaded by `main` from `--parquet-profiles`, with Ravel's
+    /// own data bucket, which they are refused from (D4). [`start`] installs
+    /// Parquet sources on the shared `SqlExecutor` either way: `None` makes
+    /// every Parquet table unqueryable, and a query naming one fails with a
+    /// typed error saying no profile file is configured.
+    pub parquet_profiles: Option<crate::config::ParquetProfiles>,
     /// `--disable-cache`: turn off every ADR-0046 read cache in the process,
     /// not just the fetcher cache. `main` sets it from
     /// `Cli::disable_cache`, the same flag `store::build_cache` reads to return

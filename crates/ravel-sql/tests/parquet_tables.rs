@@ -25,14 +25,16 @@ use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_object_store::instrument::{InstrumentedStore, StoreOp};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
+use ravel_parquet::ParquetReadError;
 use ravel_pqtable::clock::FixedClock;
 use ravel_pqtable::grants;
 use ravel_pqtable::manifest::ParquetFile;
 use ravel_pqtable::writer::{self, Intent};
 use ravel_query::{GetLimiter, LogSegmentFetcher, QueryPhase, SegmentFetcher};
 use ravel_sql::{
-    DEFAULT_PARQUET_METADATA_CACHE_BYTES, ExternalStoreMap, MSG_PLAN, ParquetQueryError,
-    ParquetSources, SpanSegmentFetcher, SqlConfig, SqlError, SqlExecutor, SqlOutcome, TargetSignal,
+    DEFAULT_PARQUET_METADATA_CACHE_BYTES, ErrorClass, ExternalStoreMap, MSG_PLAN,
+    ParquetQueryError, ParquetSources, SpanSegmentFetcher, SqlConfig, SqlError, SqlExecutor,
+    SqlOutcome, TargetSignal,
 };
 use ravel_types::accounting::AccountedOp;
 use ravel_types::{TenantHash, TenantId};
@@ -103,17 +105,27 @@ impl Lake {
     /// An executor whose Parquet sources reach [`PROFILE`] through the lake
     /// store, or reach no profile at all when `configured` is false.
     fn new(configured: bool, config: SqlConfig) -> Self {
-        let ravel = Arc::new(InstrumentedStore::new(MemoryStore::new()));
         let lake = Arc::new(InstrumentedStore::new(MemoryStore::new()));
-        let store: Arc<dyn ObjectStoreBackend> = ravel.clone();
-        let catalog =
-            Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
         let external = configured.then(|| {
             Arc::new(ExternalStoreMap::new(HashMap::from([(
                 PROFILE.to_string(),
                 Arc::clone(&lake) as Arc<dyn ObjectStoreBackend>,
             )]))) as Arc<dyn ravel_sql::ExternalStores>
         });
+        Lake::with_external(lake, external, config)
+    }
+
+    /// An executor whose Parquet sources read through `external`; `lake` is
+    /// where [`Self::put_file`] writes.
+    fn with_external(
+        lake: Arc<InstrumentedStore<MemoryStore>>,
+        external: Option<Arc<dyn ravel_sql::ExternalStores>>,
+        config: SqlConfig,
+    ) -> Self {
+        let ravel = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+        let store: Arc<dyn ObjectStoreBackend> = ravel.clone();
+        let catalog =
+            Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
         let sources = ParquetSources::new(
             Arc::clone(&store),
             external,
@@ -420,6 +432,14 @@ async fn a_grant_sharing_only_a_string_prefix_does_not_admit_a_file() {
 
 /// A URL table, another tenant's `ravel-pq://` path and every table-function
 /// spelling fail to plan before any store is read.
+///
+/// Every statement here fails to plan with or without the executor's early
+/// refusal, so the error alone cannot tell the two apart. The store counters
+/// can: without the refusal, each statement is resolved first (as a signal
+/// query, whose catalog resolve reads Ravel's store with one GET and two
+/// LISTs, or as a Parquet table, whose manifest resolve LISTs and GETs it)
+/// and only then fails. The Ravel-store GET and LIST counts are therefore
+/// checked unchanged after each statement, not only after all of them.
 #[tokio::test]
 async fn url_tables_and_table_functions_read_nothing() {
     let lake = Lake::configured();
@@ -439,9 +459,15 @@ async fn url_tables_and_table_functions_read_nothing() {
         "SELECT * FROM TABLE(read_parquet('s3://lake/t/hits/0.parquet'))".to_string(),
         "SELECT * FROM hits WHERE id IN (SELECT value FROM range(0, 10))".to_string(),
     ] {
+        let before = (lake.all_gets(), Lake::lists(&lake.ravel));
         let err = lake.execute(&acme, &sql).await.expect_err(&sql);
         assert!(matches!(err, SqlError::Plan(_)), "{sql}: {err}");
         assert_eq!(err.client_message(), MSG_PLAN, "{sql}");
+        assert_eq!(
+            (lake.all_gets(), Lake::lists(&lake.ravel)),
+            before,
+            "{sql}: the refusal reads nothing from either store"
+        );
     }
     assert_eq!(lake.all_gets(), (ravel_before, lake_before));
     assert_eq!(Lake::lists(&lake.ravel), lists_before);
@@ -559,6 +585,11 @@ async fn bounded_topk_fires_on_a_parquet_plan_with_the_exact_answer() {
 
 /// With no credential profile file a Parquet table is not queryable: the
 /// statement fails typed, after one LIST and no GET on either store.
+///
+/// The Ravel-store GET count is what tells this early refusal from resolving
+/// the table anyway and refusing afterwards: a resolve LISTs the table's
+/// versions and then GETs its newest manifest, while the refusal stops after
+/// the LIST that says the name has versions at all.
 #[tokio::test]
 async fn no_profile_file_is_a_typed_error_that_reads_nothing() {
     let lake = Lake::new(false, SqlConfig::default());
@@ -583,10 +614,125 @@ async fn no_profile_file_is_a_typed_error_that_reads_nothing() {
         "{}",
         err.client_message()
     );
-    assert_eq!(lake.all_gets(), (ravel_before, lake_before));
-    assert_eq!(Lake::lists(&lake.ravel) - lists_before, 1);
+    assert_eq!(
+        Lake::gets(&lake.ravel),
+        ravel_before,
+        "no manifest GET, which resolving the table would issue"
+    );
+    assert_eq!(Lake::gets(&lake.lake), lake_before, "no file is read");
+    assert_eq!(
+        Lake::lists(&lake.ravel) - lists_before,
+        1,
+        "one LIST of the table's versions"
+    );
 
     unknown_table_error(&lake, &acme, "SELECT * FROM nosuch").await;
+}
+
+/// A file overwritten after CREATE, and one deleted after it, fail the query
+/// with `FileChanged` and `FileMissing` (ADR-2040 D3): class `Unsupported`,
+/// which HTTP answers with 422, and a client message that names the file and
+/// tells the caller to run `CREATE OR REPLACE`. Neither is the table's first
+/// file, so the table still builds and the failure comes from the scan.
+#[tokio::test]
+async fn a_file_changed_or_deleted_after_create_fails_the_query_naming_it() {
+    let sql = "SELECT id, name FROM hits ORDER BY id";
+    for changed in [true, false] {
+        let lake = Lake::configured();
+        let acme = tenant("acme");
+        lake.hits_for(&acme).await;
+        let before = lake.execute(&acme, sql).await.expect("reads before");
+        assert_eq!(rows(&before).len(), 6);
+
+        let key = if changed {
+            "t/hits/1.parquet"
+        } else {
+            "t/hits/2.parquet"
+        };
+        if changed {
+            lake.lake
+                .inner()
+                .put(
+                    key,
+                    parquet_bytes(&[7, 8], &["x", "y"], &[0.0, 0.0]),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("overwrite");
+        } else {
+            lake.lake.inner().delete(key).await.expect("delete");
+        }
+
+        let err = lake.execute(&acme, sql).await.expect_err(key);
+        let read = match parquet_error(&err) {
+            Some(ParquetQueryError::Read(read)) => read,
+            _ => panic!("{key}: expected a Parquet read error, got {err:?}"),
+        };
+        if changed {
+            assert!(
+                matches!(read, ParquetReadError::FileChanged { key: k } if k == key),
+                "{read:?}"
+            );
+        } else {
+            assert!(
+                matches!(read, ParquetReadError::FileMissing { key: k } if k == key),
+                "{read:?}"
+            );
+        }
+        assert_eq!(err.class(), ErrorClass::Unsupported, "{key}");
+        let message = err.client_message();
+        assert!(message.contains(key), "{message}");
+        assert!(message.contains("CREATE OR REPLACE"), "{message}");
+    }
+}
+
+/// ADR-2040 D4: a manifest naming a file in Ravel's own data bucket is refused
+/// when the query reads it, whatever wrote the manifest. The production
+/// `ProfileStores` is configured with Ravel's bucket at the profile's own
+/// endpoint; the refusal comes before the store is opened, so the query
+/// fails typed without a network.
+#[tokio::test]
+async fn a_file_in_ravels_own_bucket_is_refused_on_read() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let key = dir.path().join("key");
+    std::fs::write(&key, "test-key").expect("write key");
+    let json = format!(
+        r#"[{{"name": {PROFILE:?}, "kind": "s3", "region": "us-east-1",
+             "endpoint": "http://127.0.0.1:9", "allow_http": true,
+             "credentials": {{"mode": "static",
+               "access_key_id": {{"from": "file", "path": {key:?}}},
+               "secret_access_key": {{"from": "file", "path": {key:?}}}}}}}]"#
+    );
+    let profiles = ravel_object_store::external::load_profiles(&json).expect("profiles");
+    let stores = ravel_sql::ProfileStores::new(profiles).refusing(ravel_sql::RavelBucket {
+        endpoint: Some("http://127.0.0.1:9".to_string()),
+        bucket: BUCKET.to_string(),
+    });
+    let lake = Lake::with_external(
+        Arc::new(InstrumentedStore::new(MemoryStore::new())),
+        Some(Arc::new(stores) as Arc<dyn ravel_sql::ExternalStores>),
+        SqlConfig::default(),
+    );
+    let acme = tenant("acme");
+    lake.hits_for(&acme).await;
+
+    let err = lake
+        .execute(&acme, "SELECT count(*) FROM hits")
+        .await
+        .expect_err("Ravel's bucket");
+    assert!(
+        matches!(
+            parquet_error(&err),
+            Some(ParquetQueryError::Store {
+                table,
+                source: ravel_sql::ExternalStoreError::RavelBucket { .. },
+            }) if table == "hits"
+        ),
+        "{err:?}"
+    );
+    assert_eq!(err.class(), ErrorClass::Unsupported);
+    let message = err.client_message();
+    assert!(message.contains("Ravel's own data bucket"), "{message}");
 }
 
 /// A dropped table is no table: the same planning failure as a name nobody

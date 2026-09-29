@@ -192,6 +192,7 @@ async fn main() -> anyhow::Result<()> {
     let parquet_profiles = cli.parse_parquet_profiles()?;
     if let Some(profiles) = &parquet_profiles {
         let names: Vec<&str> = profiles
+            .profiles
             .iter()
             .map(|profile| profile.name.as_str())
             .collect();

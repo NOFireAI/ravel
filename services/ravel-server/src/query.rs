@@ -545,7 +545,9 @@ pub fn build_sql_state(
 /// their files through one read-only external store per (credential profile,
 /// bucket), opened from `parquet_profiles` the first time a query reads that
 /// bucket and kept for the process. The reads share `get_limiter` and `cache`
-/// with the signal-table fetchers.
+/// with the signal-table fetchers. A (profile, bucket) that is Ravel's own
+/// data bucket, by `parquet_profiles.ravel_bucket`, is refused before it is
+/// opened (ADR-2040 D4).
 ///
 /// `parquet_profiles` is `None` when no `--parquet-profiles` file is
 /// configured: no Parquet table is then queryable, and a query naming one
@@ -566,10 +568,18 @@ pub fn build_sql_state_with_parquet(
     query_admission: Arc<QueryAdmissionController>,
     declared_columns: Option<Arc<dyn ravel_sql::DeclaredColumnSource>>,
     process_memory_budget: Arc<ravel_memory::MemoryBudget>,
-    parquet_profiles: Option<Vec<ravel_object_store::external::ExternalProfile>>,
+    parquet_profiles: Option<crate::config::ParquetProfiles>,
 ) -> anyhow::Result<crate::sql::SqlState> {
-    let external = parquet_profiles.map(|profiles| {
-        Arc::new(ravel_sql::ProfileStores::new(profiles)) as Arc<dyn ravel_sql::ExternalStores>
+    let external = parquet_profiles.map(|config| {
+        let stores = ravel_sql::ProfileStores::new(config.profiles);
+        let stores = match config.ravel_bucket {
+            Some(ravel) => stores.refusing(ravel_sql::RavelBucket {
+                endpoint: ravel.endpoint,
+                bucket: ravel.bucket,
+            }),
+            None => stores,
+        };
+        Arc::new(stores) as Arc<dyn ravel_sql::ExternalStores>
     });
     let sources = ravel_sql::ParquetSources::new(
         store.clone(),
@@ -1722,11 +1732,13 @@ mod tests {
 
     /// ADR-2040: `start`'s state builder always installs Parquet sources on the
     /// executor, configured exactly when a profile file was loaded, while the
-    /// plain builder installs none.
+    /// plain builder installs none. The profiles' stores refuse Ravel's own
+    /// bucket (D4): here a GCS profile and a Ravel bucket at GCS's
+    /// interoperability endpoint, refused before any credential is looked up.
     #[cfg(feature = "sql")]
-    #[test]
-    fn build_sql_state_with_parquet_installs_the_profiles_it_is_given() {
-        let build = |profiles: Option<Vec<ravel_object_store::external::ExternalProfile>>| {
+    #[tokio::test]
+    async fn build_sql_state_with_parquet_installs_the_profiles_it_is_given() {
+        let build = |profiles: Option<crate::config::ParquetProfiles>| {
             let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
             let catalog = build_catalog(
                 store.clone(),
@@ -1763,13 +1775,24 @@ mod tests {
             r#"[{"name": "lake", "kind": "gcs", "credentials": {"mode": "application_default"}}]"#,
         )
         .expect("profiles");
-        let configured = build(Some(profiles));
+        let configured = build(Some(crate::config::ParquetProfiles {
+            profiles,
+            ravel_bucket: Some(crate::config::RavelS3Bucket {
+                bucket: "ravel-data".to_string(),
+                endpoint: Some("https://storage.googleapis.com".to_string()),
+            }),
+        }));
+        let sources = configured.executor.parquet_sources().expect("sources");
+        assert!(sources.is_configured());
+        let refused = sources
+            .external_stores()
+            .expect("profile stores")
+            .store("lake", "ravel-data")
+            .err()
+            .expect("Ravel's bucket is refused");
         assert!(
-            configured
-                .executor
-                .parquet_sources()
-                .expect("sources")
-                .is_configured()
+            matches!(refused, ravel_sql::ExternalStoreError::RavelBucket { .. }),
+            "{refused:?}"
         );
         let unconfigured = build(None);
         assert!(

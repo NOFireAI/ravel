@@ -1057,6 +1057,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and D6, #2053). `ravel-server --parquet-profiles` (`RAVEL_PARQUET_PROFILES`)
   loads the credential profile file `ravel-cli` uses, and each profile's
   read-only store is opened per bucket the first time a query reads it. A
+  profile reaching Ravel's own data bucket (`--s3-bucket` on the service
+  `--s3-endpoint` names) is refused with a typed error before that store is
+  opened, whatever wrote the manifest naming the file. A
   statement whose only tables are Parquet tables of the caller's tenant
   resolves each table's newest live manifest and the tenant's current grants
   before its session is built: a file outside every current grant fails the

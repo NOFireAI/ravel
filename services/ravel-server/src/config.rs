@@ -93,6 +93,24 @@ pub enum StoreKind {
     S3,
 }
 
+/// `--parquet-profiles`, loaded, and Ravel's own data bucket, which no Parquet
+/// table may read a file from (ADR-2040 decision D4).
+#[derive(Debug, Clone)]
+pub struct ParquetProfiles {
+    pub profiles: Vec<ravel_object_store::external::ExternalProfile>,
+    /// `--s3-bucket` at `--s3-endpoint` under `--store s3`; `None` under
+    /// `--store memory`, whose objects no profile can reach.
+    pub ravel_bucket: Option<RavelS3Bucket>,
+}
+
+/// Ravel's own S3 bucket and the endpoint it is reached at (`None` for AWS's
+/// regional endpoint).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RavelS3Bucket {
+    pub bucket: String,
+    pub endpoint: Option<String>,
+}
+
 /// Which credential source `--store s3` uses (ADR-0106). The CLI-facing mirror
 /// of [`ravel_object_store::s3::S3AuthMode`], which lives in a crate that does
 /// not depend on clap.
@@ -6324,19 +6342,27 @@ impl Cli {
     }
 
     /// Load and validate `--parquet-profiles` (ADR-2040 decision D1) through
-    /// [`ravel_object_store::external::load_profiles`]. `None` when the flag
-    /// is absent.
-    pub fn parse_parquet_profiles(
-        &self,
-    ) -> anyhow::Result<Option<Vec<ravel_object_store::external::ExternalProfile>>> {
+    /// [`ravel_object_store::external::load_profiles`], with Ravel's own data
+    /// bucket beside them. `None` when the flag is absent.
+    pub fn parse_parquet_profiles(&self) -> anyhow::Result<Option<ParquetProfiles>> {
         let Some(path) = self.parquet_profiles.as_deref() else {
             return Ok(None);
         };
         let json = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("could not read --parquet-profiles {path:?}: {e}"))?;
-        ravel_object_store::external::load_profiles(&json)
-            .map(Some)
-            .map_err(|e| anyhow::anyhow!("invalid --parquet-profiles {}: {e}", path.display()))
+        let profiles = ravel_object_store::external::load_profiles(&json)
+            .map_err(|e| anyhow::anyhow!("invalid --parquet-profiles {}: {e}", path.display()))?;
+        let ravel_bucket = match self.store {
+            StoreKind::Memory => None,
+            StoreKind::S3 => self.s3_bucket.clone().map(|bucket| RavelS3Bucket {
+                bucket,
+                endpoint: self.s3_endpoint.clone(),
+            }),
+        };
+        Ok(Some(ParquetProfiles {
+            profiles,
+            ravel_bucket,
+        }))
     }
 
     /// Load and validate `--tenant-kms-config` (ADR-0062 decision 1,
@@ -12548,7 +12574,9 @@ mod tests {
 
     /// `--parquet-profiles` is read through the loader ravel-cli uses: an
     /// absent flag is no profiles, a valid file names its profiles, and a
-    /// malformed one or a duplicate name stops startup naming the flag.
+    /// malformed one or a duplicate name stops startup naming the flag. Ravel's
+    /// own bucket rides along: `--s3-bucket` at `--s3-endpoint` under
+    /// `--store s3`, and none under `--store memory`.
     #[test]
     fn parquet_profiles_are_loaded_through_the_shared_loader() {
         assert!(cli(&[]).parse_parquet_profiles().expect("absent").is_none());
@@ -12564,8 +12592,33 @@ mod tests {
             .expect("valid file")
             .expect("profiles");
         assert_eq!(
-            profiles.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            profiles
+                .profiles
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["lake"]
+        );
+        assert_eq!(profiles.ravel_bucket, None, "--store memory has no bucket");
+        let s3 = cli(&[
+            "--parquet-profiles",
+            path,
+            "--store",
+            "s3",
+            "--s3-bucket",
+            "ravel-data",
+            "--s3-endpoint",
+            "http://127.0.0.1:9000",
+        ])
+        .parse_parquet_profiles()
+        .expect("valid file")
+        .expect("profiles");
+        assert_eq!(
+            s3.ravel_bucket,
+            Some(RavelS3Bucket {
+                bucket: "ravel-data".to_string(),
+                endpoint: Some("http://127.0.0.1:9000".to_string()),
+            })
         );
         let duplicate = tempfile::NamedTempFile::new().expect("temp file");
         std::fs::write(

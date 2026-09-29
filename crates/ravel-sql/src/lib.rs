@@ -175,7 +175,7 @@ pub use page_plan::{
 };
 pub use parquet::{
     DEFAULT_PARQUET_METADATA_CACHE_BYTES, ExternalStoreError, ExternalStoreMap, ExternalStores,
-    ParquetQueryError, ParquetSession, ParquetSources, ProfileStores,
+    ParquetQueryError, ParquetSession, ParquetSources, ProfileStores, RavelBucket,
 };
 pub use provider::RavelTableProvider;
 pub use pushdown::Pushdown;
