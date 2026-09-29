@@ -237,10 +237,11 @@ groups:
 
 Neither of the other two clock-lag counters pages.
 `ravel_ingest_clock_lag_unchecked_total` counts flushes made before any store
-time was observed. The server makes object-storage requests before ingest
-starts, and the S3 connector records every response's `Date`, so on S3 it
-should stay at 0; a nonzero value is itself the signal, and what it says is a
-wiring defect to file, not an incident.
+time was observed. The observation is kept per store instance, and the
+server's startup requests and its ingest writes share the default store, whose
+S3 connector records every response's `Date`, so on S3 it should stay at 0; a
+nonzero value is itself the signal, and what it says is a wiring defect to
+file, not an incident.
 `ravel_ingest_clock_lag_bypassed_at_shutdown_total` is teardown residue: it
 moves on a process that is already exiting, so an alert on it would fire after
 the process that could act on it is gone. Read it after a rollout, beside the
