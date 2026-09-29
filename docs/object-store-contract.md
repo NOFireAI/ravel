@@ -1527,9 +1527,13 @@ a misconfigured grant cannot become a request against someone else's bucket.
 `capabilities()` reports `create_if_absent: false`, `cas_version: false`,
 `upload_checksum: false` and `multipart: false`: a caller that selects a
 path by capability must never select a write path here. Those flags describe
-this store, not the bucket behind it. An external store is consequently
-never a candidate for the mandatory-capability check above, which governs
-the bucket Ravel writes.
+this store, not the bucket behind it. On the read side it reports
+`consistent_read`, `consistent_list` and `prefix_list` true for every kind,
+and `suffix_range` true for S3 and GCS but false for Azure, whose
+`object_store` client refuses a suffix range before sending it. The
+`ravel-parquet` footer read asks for an explicit range ending at the size the
+manifest pinned, so it issues no suffix range on any kind. An external store is consequently never a candidate for
+the mandatory-capability check above, which governs the bucket Ravel writes.
 
 Two probes qualify a grant before anything reads through it, both in
 `external::probe`, both fail-closed, and both run at grant creation rather
