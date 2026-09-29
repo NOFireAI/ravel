@@ -346,6 +346,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   pass empties the caches and the retry is refused. The charge rule itself,
   `decoded_charge`, now lives once in `ravel-memory`, and both the query
   fetcher and the catalog call it.
+- **`ravel-cli load --signal logs`, `--signal metrics` and `--signal spans`
+  name the unit a negative timestamp was read in** (issue #2133). For a
+  native Arrow `Timestamp` ts column the loader scales by the column's own
+  unit, but the refusal named the declared `ts_unit` instead; a
+  `Timestamp(Second)` cell of -5 under `ts_unit = "nanos"` reported "read as
+  ts_unit = nanos". It now reports "read in the column's own Timestamp unit,
+  seconds". An integer column still names `ts_unit`. The spans refusal, which
+  named both declared units whatever the columns were, now names the start and
+  the end each by the same rule, against `start_ts_unit` and `end_ts_unit`.
 - **`ravel-cli load --signal logs` loads a dictionary-encoded hex `trace_id` or
   `span_id` column** (issue #2116). A default Parquet writer dictionary-encodes
   string columns, and the columnar logs path refused such an id column with
@@ -353,10 +362,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now resolves the two id columns once per batch and stores the same ids as a
   plain column; a null cell stores no id in either form.
 - **`ravel-cli load --signal logs` and `--signal metrics` refuse a negative
-  timestamp** (issue #2118), as the spans load already did. A row whose `ts`,
-  read in the declared `ts_unit`, falls before the Unix epoch is a row rejection
-  naming `ts_unit` on the logs and metrics load paths, where before only the
-  future-skew bound was checked. A negative result always means a negative
+  timestamp** (issue #2118), as the spans load already did. A row whose `ts`
+  falls before the Unix epoch is a row rejection on the logs and metrics load
+  paths, naming the unit the value was read in (see the #2133 entry above),
+  where before only the future-skew bound was checked. A negative result always means a negative
   cell: unit conversion never flips a sign.
 - **The spans load's reserved attribute keys come from ravel-otlp** (issue
   #2123). `ravel_otlp::traces_normalize` now exports `RESERVED_ATTR_KEYS` and

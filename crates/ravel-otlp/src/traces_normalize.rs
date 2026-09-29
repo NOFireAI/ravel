@@ -71,8 +71,8 @@ pub const ATTR_EVENTS_RAW: &str = "_events_raw";
 pub const ATTR_LINKS_RAW: &str = "_links_raw";
 
 /// Every reserved `attrs` key, in one place so stripping a sender's own
-/// attribute of the same name (see [`normalize_span`]) cannot drift from the
-/// set [`reserved_attrs`] actually populates. Public so a caller refusing
+/// attribute of the same name (see `normalize_span`) cannot drift from the
+/// set `reserved_attrs` actually populates. Public so a caller refusing
 /// these keys (the bulk loader's spans mapping) reads the same set.
 pub const RESERVED_ATTR_KEYS: [&str; 5] = [
     ATTR_SPAN_KIND,

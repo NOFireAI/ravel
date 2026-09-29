@@ -3914,7 +3914,11 @@ fn build_record(
     let raw_ts = read_ts(ts_col, row, mapping.ts_unit)?
         .ok_or_else(|| format!("ts column {:?} is null", mapping.ts_column))?;
     if raw_ts < 0 {
-        return Err(negative_ts_rejection(raw_ts, mapping.ts_unit));
+        return Err(negative_ts_rejection(
+            raw_ts,
+            ts_col.data_type(),
+            mapping.ts_unit,
+        ));
     }
 
     // Kept: future-skew bound, same `max_future_skew_ns` as ravel-otlp. The
@@ -4336,13 +4340,33 @@ fn read_bytes(arr: &ArrayRef, row: usize) -> Result<Option<Vec<u8>>, String> {
 /// counterpart of the spans load's refusal: OTLP's timestamps are `u64`.
 /// Every unit conversion multiplies by a positive factor and refuses overflow,
 /// so a negative result always comes from a negative cell, never from the
-/// declared unit.
-fn negative_ts_rejection(ts_ns: i64, declared: TsUnit) -> String {
+/// unit.
+///
+/// The rejection names the unit [`read_ts`] and [`ts_src`] actually applied to
+/// `ts_type`, as [`ts_read_unit`] phrases it.
+fn negative_ts_rejection(ts_ns: i64, ts_type: &DataType, declared: TsUnit) -> String {
+    let unit = ts_read_unit(ts_type, declared, "ts_unit");
     format!(
-        "timestamp is before the Unix epoch ({ts_ns} ns, read as ts_unit = {}); the column \
-         holds a negative value",
-        declared.as_str()
+        "timestamp is before the Unix epoch ({ts_ns} ns, {unit}); the column holds a negative value"
     )
+}
+
+/// The unit [`read_ts`] applied to a timestamp column of type `ts_type`, as a
+/// refusal names it: a native Arrow `Timestamp` column's own unit, the
+/// declared unit (under its mapping key `unit_key`) for any other column.
+fn ts_read_unit(ts_type: &DataType, declared: TsUnit, unit_key: &str) -> String {
+    match ts_type {
+        DataType::Timestamp(unit, _) => format!(
+            "read in the column's own Timestamp unit, {}",
+            match unit {
+                TimeUnit::Second => "seconds",
+                TimeUnit::Millisecond => "millis",
+                TimeUnit::Microsecond => "micros",
+                TimeUnit::Nanosecond => "nanos",
+            }
+        ),
+        _ => format!("read as {unit_key} = {}", declared.as_str()),
+    }
 }
 
 /// Read the `ts` column to nanoseconds. An integer column uses the mapping's
@@ -5110,7 +5134,11 @@ fn build_columnar_batch(
                 }
             };
             if raw_ts < 0 {
-                return Err(row_err(negative_ts_rejection(raw_ts, mapping.ts_unit)));
+                return Err(row_err(negative_ts_rejection(
+                    raw_ts,
+                    span.column(cols.ts).data_type(),
+                    mapping.ts_unit,
+                )));
             }
             let skew_ns = raw_ts.saturating_sub(now_ns);
             if skew_ns > limits.max_future_skew_ns {
@@ -5602,10 +5630,15 @@ fn build_metric_row(
     now_ns: i64,
     row: usize,
 ) -> Result<MetricRow, String> {
-    let raw_ts = read_ts(cols.col(batch, cols.ts), row, mapping.ts_unit)?
+    let ts_col = cols.col(batch, cols.ts);
+    let raw_ts = read_ts(ts_col, row, mapping.ts_unit)?
         .ok_or_else(|| format!("ts column {:?} is null", mapping.ts_column))?;
     if raw_ts < 0 {
-        return Err(negative_ts_rejection(raw_ts, mapping.ts_unit));
+        return Err(negative_ts_rejection(
+            raw_ts,
+            ts_col.data_type(),
+            mapping.ts_unit,
+        ));
     }
 
     // Kept: the future-skew bound, at the metrics OTLP limit. The past-lag
@@ -7053,12 +7086,19 @@ fn build_span(
     // overlaps nearly every query window. Unit conversion cannot flip a sign,
     // so a negative value always comes from a negative cell.
     if start_ts_ns < 0 || end_ts_ns < 0 {
+        let start_unit = ts_read_unit(
+            cols.col(batch, cols.start_ts).data_type(),
+            mapping.start_ts_unit,
+            "start_ts_unit",
+        );
+        let end_unit = ts_read_unit(
+            cols.col(batch, cols.end_ts).data_type(),
+            mapping.end_ts_unit,
+            "end_ts_unit",
+        );
         return Err(format!(
-            "span timestamps are before the Unix epoch (start {start_ts_ns} ns, end {end_ts_ns} \
-             ns, read as start_ts_unit = {}, end_ts_unit = {}); a timestamp column holds a \
-             negative value",
-            mapping.start_ts_unit.as_str(),
-            mapping.end_ts_unit.as_str()
+            "span timestamps are before the Unix epoch (start {start_ts_ns} ns, {start_unit}; \
+             end {end_ts_ns} ns, {end_unit}); a timestamp column holds a negative value"
         ));
     }
     if end_ts_ns < start_ts_ns {
@@ -11751,16 +11791,18 @@ type = "i64"
         }
     }
 
-    /// The columnar path reads its mapped dictionary columns in place: none is
-    /// flattened ahead of it, and a dictionary attribute still reaches the
-    /// `StrColumnDict` fast path. The row path resolves the same batch's
-    /// dictionary columns once each, and the two build the same batch.
+    /// With no id column mapped, the columnar path reads its mapped dictionary
+    /// columns in place: none is flattened ahead of it (only a mapped id column
+    /// is, which `the_columnar_path_resolves_each_mapped_id_column_once` pins),
+    /// and a dictionary attribute still reaches the `StrColumnDict` fast path.
+    /// The row path resolves the same batch's dictionary columns once each, and
+    /// the two build the same batch.
     ///
     /// An all-null chunk over an empty dictionary is part of the batch, so the
     /// columnar path's per-cell answer for it (`str_src`'s all-null path) is
     /// what this load exercises too.
     #[test]
-    fn the_columnar_path_resolves_no_dictionary_column() {
+    fn the_columnar_path_resolves_no_dictionary_column_when_no_id_column_is_mapped() {
         const ROWS: usize = 64;
         let dict = |vals: Vec<&str>| -> ArrayRef {
             Arc::new(
@@ -11794,7 +11836,8 @@ type = "i64"
         assert_eq!(
             counters.columns(),
             0,
-            "the columnar path flattens none of the four mapped dictionary columns"
+            "with no id column mapped, the columnar path flattens none of the four mapped \
+             dictionary columns"
         );
         assert_eq!(
             counters.cell_keys(),
@@ -11822,6 +11865,54 @@ type = "i64"
             counters.columns(),
             4,
             "the row reference resolves each mapped dictionary column once"
+        );
+    }
+
+    /// The columnar path flattens a mapped dictionary id column once per
+    /// batch, ahead of the row loop, and no other mapped dictionary column:
+    /// two id columns beside a dictionary body resolve exactly two columns,
+    /// whatever the row count is.
+    #[test]
+    fn the_columnar_path_resolves_each_mapped_id_column_once() {
+        const ROWS: usize = 64;
+        let trace_hex = hex::encode([1u8; 16]);
+        let span_hex = hex::encode([2u8; 8]);
+        let dict = |vals: Vec<&str>| -> ArrayRef {
+            Arc::new(
+                vals.into_iter()
+                    .map(Some)
+                    .collect::<DictionaryArray<Int32Type>>(),
+            )
+        };
+        let ts: Vec<i64> = (0..ROWS as i64).map(|i| NOW_NS + i).collect();
+        let b = batch(vec![
+            ("ts", i64_col(ts)),
+            ("body", dict(vec!["hello"; ROWS])),
+            ("trace_id", dict(vec![trace_hex.as_str(); ROWS])),
+            ("span_id", dict(vec![span_hex.as_str(); ROWS])),
+        ]);
+        let mut m = base_mapping();
+        m.body_column = Some("body".to_string());
+        m.trace_id_column = Some("trace_id".to_string());
+        m.span_id_column = Some("span_id".to_string());
+
+        let counters = dict_counters();
+        let col = build_columnar_or_panic(&b, &m);
+        assert_eq!(
+            counters.columns(),
+            2,
+            "the two id columns are resolved once each, over {ROWS} rows, and the body is not"
+        );
+        assert_eq!(
+            counters.cell_keys(),
+            0,
+            "no dictionary key is resolved per cell"
+        );
+        assert_eq!(col.num_rows, ROWS, "every row is built");
+        assert_eq!(
+            assert_paths_match(&b, &m),
+            col,
+            "the row path builds the same batch"
         );
     }
 
@@ -12742,8 +12833,8 @@ type = "i64"
                     reason,
                 };
 
-                // 1. ts (required) and 2. future-skew bound, in build_record
-                // order.
+                // 1. ts (required), not negative, and 2. future-skew bound, in
+                // build_record order.
                 let raw_ts = match ts.get(local).map_err(row_err)? {
                     Some(t) => t,
                     None => {
@@ -12753,6 +12844,13 @@ type = "i64"
                         )));
                     }
                 };
+                if raw_ts < 0 {
+                    return Err(row_err(negative_ts_rejection(
+                        raw_ts,
+                        span.column(cols.ts).data_type(),
+                        mapping.ts_unit,
+                    )));
+                }
                 let skew_ns = raw_ts.saturating_sub(now_ns);
                 if skew_ns > limits.max_future_skew_ns {
                     return Err(row_err(format!(
@@ -13110,6 +13208,34 @@ type = "i64"
             })
             .collect();
         (spans, mapping)
+    }
+
+    /// The reference build refuses a negative timestamp at the same row, with
+    /// the same reason, as the production build.
+    #[test]
+    fn the_reference_build_refuses_a_negative_timestamp_like_production() {
+        let spans = vec![(batch(vec![("ts", i64_col(vec![NOW_NS, -5, NOW_NS]))]), 10)];
+        let mapping = base_mapping();
+        let limits = LogIngestLimits::default();
+        let refusal = |result: Result<ColumnarLogBatch, ColBuildError>| match result {
+            Err(ColBuildError::Row { row, reason }) => (row, reason),
+            Err(ColBuildError::Batch(r)) => panic!("expected a row rejection, got batch: {r}"),
+            Ok(_) => panic!("expected a row rejection, got a batch"),
+        };
+        let got = refusal(build_columnar_batch(&spans, &mapping, &limits, NOW_NS));
+        let want = refusal(build_columnar_batch_reference(
+            &spans, &mapping, &limits, NOW_NS,
+        ));
+        assert_eq!(
+            got,
+            (
+                11,
+                "timestamp is before the Unix epoch (-5 ns, read as ts_unit = nanos); the column \
+                 holds a negative value"
+                    .to_string()
+            )
+        );
+        assert_eq!(want, got, "the reference refuses the same row the same way");
     }
 
     /// Assert the slot-table build and the pre-#689 map build produce the same
@@ -15042,8 +15168,8 @@ type = "str"
             assert_eq!(dropped, 0, "nothing was dropped");
         }
 
-        /// A negative start or end is refused, naming both declared units:
-        /// OTLP's two `u64` timestamps have no negative to match against.
+        /// A negative start or end is refused, naming the unit each was read
+        /// in: OTLP's two `u64` timestamps have no negative to match against.
         #[test]
         fn a_negative_timestamp_is_refused() {
             let err = build_one(Row {
@@ -15054,9 +15180,9 @@ type = "str"
             assert_eq!(
                 err,
                 format!(
-                    "span timestamps are before the Unix epoch (start -1 ns, end {NOW_NS} ns, \
-                     read as start_ts_unit = nanos, end_ts_unit = nanos); a timestamp column \
-                     holds a negative value"
+                    "span timestamps are before the Unix epoch (start -1 ns, read as \
+                     start_ts_unit = nanos; end {NOW_NS} ns, read as end_ts_unit = nanos); a \
+                     timestamp column holds a negative value"
                 )
             );
 
@@ -15076,6 +15202,26 @@ type = "str"
                 ..Row::default()
             })
             .expect("zero is the fallback case, not a negative one");
+        }
+
+        /// A native `Timestamp(Second)` start scales by its own unit, not by
+        /// the declared `start_ts_unit`, so the refusal names seconds for the
+        /// start, while the integer end still names `end_ts_unit`.
+        #[test]
+        fn a_negative_native_start_names_its_own_unit() {
+            let err = build_one(Row {
+                start: Arc::new(TimestampSecondArray::from(vec![-5])) as ArrayRef,
+                ..Row::default()
+            })
+            .expect_err("a negative native start is refused");
+            assert_eq!(
+                err,
+                format!(
+                    "span timestamps are before the Unix epoch (start -5000000000 ns, read in \
+                     the column's own Timestamp unit, seconds; end {NOW_NS} ns, read as \
+                     end_ts_unit = nanos); a timestamp column holds a negative value"
+                )
+            );
         }
 
         /// Both attribute-count caps are properties of the mapping, so both
@@ -15889,6 +16035,384 @@ type = "str"
             assert_eq!(*row, 1);
             assert_eq!(reason, NEGATIVE_MILLIS);
             assert!(list_data_objects(store.as_ref()).await.is_empty());
+        }
+
+        async fn load_logs_row(
+            pq: &Path,
+            mapping: &Mapping,
+        ) -> (Result<LoadReport, LoadError>, Arc<dyn ObjectStoreBackend>) {
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let result = load_row(
+                Arc::clone(&store),
+                pq,
+                "acme",
+                mapping,
+                1,
+                1_000,
+                None,
+                NOW_NS,
+                Arc::new(FixedClock(NOW_NS)),
+            )
+            .await;
+            (result, store)
+        }
+
+        /// A gauge mapping over `ts` and `value`, declaring `ts_unit`.
+        fn metrics_mapping(ts_unit: &str) -> MetricsMapping {
+            parse_metrics_mapping(&format!(
+                "[metrics]\nname = \"probe\"\nvalue_column = \"value\"\nts_column = \
+                 \"ts\"\nts_unit = \"{ts_unit}\"\nkind = \"gauge\"\n"
+            ))
+            .expect("valid mapping")
+        }
+
+        async fn load_metrics_on(
+            pq: &Path,
+            mapping: &MetricsMapping,
+        ) -> (
+            Result<MetricsLoadReport, LoadError>,
+            Arc<dyn ObjectStoreBackend>,
+        ) {
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let result = load_metrics(
+                Arc::clone(&store),
+                pq,
+                "acme",
+                mapping,
+                1,
+                1_000,
+                0,
+                1,
+                DEFAULT_MAX_INFLIGHT_FLUSHES,
+                1,
+                None,
+                NOW_NS,
+                Arc::new(FixedClock(NOW_NS)),
+            )
+            .await;
+            (result, store)
+        }
+
+        /// A file whose `ts` is `ts` beside a `value` column, one row per cell.
+        fn ts_file(ts: ArrayRef) -> (tempfile::TempDir, PathBuf) {
+            let values: Vec<f64> = (0..ts.len()).map(|i| i as f64).collect();
+            write_with(
+                &batch(vec![
+                    ("ts", ts),
+                    ("value", Arc::new(Float64Array::from(values)) as ArrayRef),
+                ]),
+                false,
+            )
+        }
+
+        /// A native `Timestamp(Second)` column scales by its own unit, not by
+        /// the declared `ts_unit`, so the refusal names the unit that was
+        /// applied: `-5` seconds is `-5000000000` ns, and `nanos` is not what
+        /// produced it.
+        const NEGATIVE_NATIVE_SECONDS: &str = "timestamp is before the Unix epoch (-5000000000 \
+                                               ns, read in the column's own Timestamp unit, \
+                                               seconds); the column holds a negative value";
+
+        fn native_seconds_negative_file() -> (tempfile::TempDir, PathBuf) {
+            let now_s = NOW_NS / 1_000_000_000;
+            ts_file(Arc::new(TimestampSecondArray::from(vec![now_s, -5, now_s])) as ArrayRef)
+        }
+
+        fn assert_native_seconds_refusal(err: &LoadError) {
+            let LoadError::RowRejected { row, reason, .. } = err else {
+                panic!("expected RowRejected, got {err:?}");
+            };
+            assert_eq!(*row, 1);
+            assert_eq!(reason, NEGATIVE_NATIVE_SECONDS);
+        }
+
+        #[tokio::test]
+        async fn a_native_timestamp_refusal_names_the_column_unit_on_every_path() {
+            let (_dir, pq) = native_seconds_negative_file();
+            let schema = reader_schema_for(&pq);
+            let ts_type = schema.as_ref().map_or_else(
+                || {
+                    let file = std::fs::File::open(&pq).expect("open parquet");
+                    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                        .expect("reader")
+                        .schema()
+                        .field_with_name("ts")
+                        .expect("ts field")
+                        .data_type()
+                        .clone()
+                },
+                |s| {
+                    s.field_with_name("ts")
+                        .expect("ts field")
+                        .data_type()
+                        .clone()
+                },
+            );
+            assert_eq!(
+                ts_type,
+                DataType::Timestamp(TimeUnit::Second, None),
+                "the loader reads a native seconds column"
+            );
+            let mut logs = base_mapping();
+            logs.ts_unit = TsUnit::Nanos;
+
+            let (result, store) = load_logs_row(&pq, &logs).await;
+            assert_native_seconds_refusal(&result.expect_err("row path refuses"));
+            assert!(list_data_objects(store.as_ref()).await.is_empty());
+
+            let (result, store) = load_columnar(&pq, &logs).await;
+            assert_native_seconds_refusal(&result.expect_err("columnar path refuses"));
+            assert!(list_data_objects(store.as_ref()).await.is_empty());
+
+            let (result, store) = load_metrics_on(&pq, &metrics_mapping("nanos")).await;
+            assert_native_seconds_refusal(&result.expect_err("metrics path refuses"));
+            assert!(list_data_objects(store.as_ref()).await.is_empty());
+        }
+
+        /// A timestamp of exactly 0 is the epoch, not before it: every path
+        /// loads it.
+        fn zero_ts_file() -> (tempfile::TempDir, PathBuf) {
+            ts_file(i64_col(vec![NOW_NS, 0, NOW_NS]))
+        }
+
+        #[tokio::test]
+        async fn the_logs_row_path_accepts_a_zero_timestamp() {
+            let (_dir, pq) = zero_ts_file();
+            let (result, store) = load_logs_row(&pq, &base_mapping()).await;
+            let report = result.expect("a zero timestamp loads");
+            assert_eq!(report.rows_processed, 3);
+            let ts: Vec<i64> = stored_ids(store.as_ref())
+                .await
+                .into_iter()
+                .map(|(ts, _, _)| ts)
+                .collect();
+            assert_eq!(ts, vec![0, NOW_NS, NOW_NS], "the zero row is stored at 0");
+        }
+
+        #[tokio::test]
+        async fn the_logs_columnar_path_accepts_a_zero_timestamp() {
+            let (_dir, pq) = zero_ts_file();
+            let (result, store) = load_columnar(&pq, &base_mapping()).await;
+            let report = result.expect("a zero timestamp loads");
+            assert_eq!(report.rows_processed, 3);
+            assert!(report.columnar_batches_built > 0, "the columnar path ran");
+            let ts: Vec<i64> = stored_ids(store.as_ref())
+                .await
+                .into_iter()
+                .map(|(ts, _, _)| ts)
+                .collect();
+            assert_eq!(ts, vec![0, NOW_NS, NOW_NS], "the zero row is stored at 0");
+        }
+
+        #[tokio::test]
+        async fn the_metrics_path_accepts_a_zero_timestamp() {
+            let (_dir, pq) = zero_ts_file();
+            let (result, _store) = load_metrics_on(&pq, &metrics_mapping("nanos")).await;
+            let report = result.expect("a zero timestamp loads");
+            assert_eq!(report.rows_processed, 3, "every row, the zero one included");
+        }
+    }
+
+    mod empty_dictionary_chunk_file {
+        use std::path::PathBuf;
+
+        use parquet::column::page::{CompressedPage, Page, PageWriteSpec, PageWriter};
+        use parquet::column::writer::{get_column_writer, get_typed_column_writer};
+        use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
+        use parquet::file::properties::WriterProperties;
+        use parquet::file::writer::{SerializedFileWriter, SerializedPageWriter, TrackedWrite};
+        use parquet::schema::parser::parse_message_type;
+        use ravel_object_store::memory::MemoryStore;
+
+        use super::*;
+
+        /// Passes every page through except the dictionary page, which it
+        /// replaces with one holding no values. The data pages still carry the
+        /// keys the real dictionary answered, so a non-null key names a value
+        /// the written dictionary does not have.
+        struct EmptyDictionaryPage<P> {
+            inner: P,
+            empty: bool,
+        }
+
+        impl<P: PageWriter> PageWriter for EmptyDictionaryPage<P> {
+            fn write_page(
+                &mut self,
+                page: CompressedPage,
+            ) -> parquet::errors::Result<PageWriteSpec> {
+                let Page::DictionaryPage {
+                    encoding,
+                    is_sorted,
+                    ..
+                } = page.compressed_page()
+                else {
+                    return self.inner.write_page(page);
+                };
+                if !self.empty {
+                    return self.inner.write_page(page);
+                }
+                let empty = Page::DictionaryPage {
+                    buf: bytes::Bytes::new(),
+                    num_values: 0,
+                    encoding: *encoding,
+                    is_sorted: *is_sorted,
+                };
+                self.inner.write_page(CompressedPage::new(empty, 0))
+            }
+
+            fn close(&mut self) -> parquet::errors::Result<()> {
+                self.inner.close()
+            }
+        }
+
+        /// A three-row file: `ts` plain, and `svc` dictionary-encoded with keys
+        /// `[0, null, 0]`, under an empty dictionary page when `empty_dictionary`
+        /// is set and under its real one-value dictionary otherwise. The `svc`
+        /// chunk is written by a column writer over [`EmptyDictionaryPage`] and
+        /// spliced into the row group whole.
+        fn write_file(empty_dictionary: bool) -> (tempfile::TempDir, PathBuf) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let pq = dir.path().join("in.parquet");
+            let schema = Arc::new(
+                parse_message_type(
+                    "message log { required int64 ts; optional binary svc (UTF8); }",
+                )
+                .expect("schema"),
+            );
+            let props = Arc::new(
+                WriterProperties::builder()
+                    .set_dictionary_enabled(true)
+                    .build(),
+            );
+            let file = std::fs::File::create(&pq).expect("create parquet");
+            let mut writer =
+                SerializedFileWriter::new(file, schema, Arc::clone(&props)).expect("file writer");
+            let svc_descr = writer.schema_descr().column(1);
+            let mut rg = writer.next_row_group().expect("row group");
+
+            let mut ts = rg.next_column().expect("ts column").expect("ts writer");
+            ts.typed::<Int64Type>()
+                .write_batch(&[NOW_NS, NOW_NS + 1, NOW_NS + 2], None, None)
+                .expect("write ts");
+            ts.close().expect("close ts");
+
+            let mut chunk = TrackedWrite::new(Vec::new());
+            let close = {
+                let pages = EmptyDictionaryPage {
+                    inner: SerializedPageWriter::new(&mut chunk),
+                    empty: empty_dictionary,
+                };
+                let mut svc = get_typed_column_writer::<ByteArrayType>(get_column_writer(
+                    svc_descr,
+                    props,
+                    Box::new(pages),
+                ));
+                svc.write_batch(
+                    &[ByteArray::from("api"), ByteArray::from("api")],
+                    Some(&[1, 0, 1]),
+                    None,
+                )
+                .expect("write svc");
+                svc.close().expect("close svc")
+            };
+            let chunk = bytes::Bytes::from(chunk.into_inner().expect("chunk bytes"));
+            rg.append_column(&chunk, close).expect("splice svc");
+            rg.close().expect("close row group");
+            writer.close().expect("close file");
+            (dir, pq)
+        }
+
+        fn svc_mapping() -> Mapping {
+            let mut m = base_mapping();
+            m.resource_attributes = vec![attr("service.name", "svc", ColType::Str)];
+            m
+        }
+
+        async fn load_on(
+            path: LoadPath,
+            pq: &Path,
+        ) -> (Result<LoadReport, LoadError>, Arc<dyn ObjectStoreBackend>) {
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let result = load_instrumented(
+                Arc::clone(&store),
+                pq,
+                "acme",
+                &svc_mapping(),
+                1,
+                1_000,
+                0,
+                None,
+                1,
+                DEFAULT_MAX_INFLIGHT_FLUSHES,
+                DEFAULT_DECODE_QUEUE_BATCHES,
+                DEFAULT_TARGET_BYTES,
+                None,
+                NOW_NS,
+                Arc::new(FixedClock(NOW_NS)),
+                path,
+                None,
+                None,
+            )
+            .await;
+            (result, store)
+        }
+
+        /// The loader reads `svc` as a dictionary column, so the batch this
+        /// file would decode to is the shape `str_src` and
+        /// `resolve_dictionary_column` answer differently.
+        fn assert_read_as_dictionary(pq: &Path) {
+            let schema = reader_schema_for(pq).expect("a dictionary-preserving schema");
+            assert_eq!(
+                schema
+                    .field_with_name("svc")
+                    .expect("svc field")
+                    .data_type(),
+                &DataType::Dictionary(Box::new(DICT_KEY_TYPE), Box::new(DataType::Utf8)),
+            );
+        }
+
+        /// An empty dictionary page under a non-null key never reaches either
+        /// load path as a batch: the Parquet reader itself fails the decode,
+        /// with the same batch refusal on the row path and the columnar path,
+        /// and nothing is stored by either.
+        #[tokio::test]
+        async fn both_paths_refuse_an_empty_dictionary_page_under_a_key() {
+            let (_dir, pq) = write_file(true);
+            assert_read_as_dictionary(&pq);
+
+            let mut reasons = Vec::new();
+            for path in [LoadPath::Row, LoadPath::Columnar] {
+                let (result, store) = load_on(path, &pq).await;
+                let err = result.expect_err("the corrupt file is refused");
+                let LoadError::BatchFailed { reason, .. } = &err else {
+                    panic!("expected BatchFailed on {path:?}, got {err:?}");
+                };
+                assert!(
+                    reason.starts_with("failed to read Parquet batch: "),
+                    "the reader refuses the chunk on {path:?}: {reason}"
+                );
+                assert!(list_data_objects(store.as_ref()).await.is_empty());
+                reasons.push(reason.clone());
+            }
+            assert_eq!(reasons[0], reasons[1], "both paths refuse identically");
+        }
+
+        /// The control: the same writer with the dictionary page left intact
+        /// loads all three rows on both paths, so the refusal above comes from
+        /// the emptied dictionary and not from the spliced chunk.
+        #[tokio::test]
+        async fn the_same_file_with_its_dictionary_loads_on_both_paths() {
+            let (_dir, pq) = write_file(false);
+            assert_read_as_dictionary(&pq);
+
+            let mut stored = Vec::new();
+            for path in [LoadPath::Row, LoadPath::Columnar] {
+                let (result, store) = load_on(path, &pq).await;
+                let report = result.expect("the intact file loads");
+                assert_eq!(report.rows_processed, 3, "every row loads on {path:?}");
+                stored.push(decoded_records(store.as_ref()).await);
+            }
+            assert_eq!(stored[0], stored[1], "both paths store the same records");
         }
     }
 }
