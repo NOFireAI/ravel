@@ -505,10 +505,40 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   hex case is refused. The seal-divergence check behind `catalog verify` and
   scrub recomputes each compaction record's hash for its own version, so a
   valid version 2 record no longer reads as corrupt. Nothing writes a
-  version 2 record yet, and resolution does not yet honour one. A build
+  version 2 record yet. A build
   without this change refuses a version 2 record with its unsupported
   `format_version` error. Version 1 records encode and decode byte for byte
   as before.
+- **Resolution honours a version 2 compaction record** (ADR-0066, force 2
+  amendment items 3 to 5, issue #2093). The shared selector
+  `ravel_catalog::select_authoritative_compaction_records` now excludes every
+  compaction record a present version 2 record names before it forms overlap
+  components, following chains of version 2 records with the rewrite chase's
+  bound of 64 records; a cycle or an over-deep chain is the typed
+  `RewriteSupersessionCycle` or `RewriteSupersessionChainTooDeep` error. It
+  returns an `AuthoritativeSelection` rather than the set of losing keys. The
+  rewrite chase continues through a version 2 record to the record it names.
+  A new `ravel_catalog::erasure_dominated_compaction_records` drops a version
+  2 record whose predecessor a live rewrite supersedes, so the rewrite wins;
+  resolve, the token fallback, the fold, scrub, the erasure completion gate and
+  `migrate` call it before the selector. `migrate` gains
+  `largest_overlap_component`, which counts a predecessor and its version 2
+  successor as one record. The superseded-input sweep reclaims nothing new: an
+  input counts as superseded only where an authoritative record names it both
+  with and without version 2 supersession, and neither a superseded
+  predecessor nor a dominated version 2 record is deleted. The interlock
+  alarm no longer counts a superseded predecessor as a second input set. No
+  production path writes a version 2 record yet, so on a real bucket this is
+  dormant.
+- **`validate_rewrite` refuses a non-canonical `superseded_record_key`** (issue
+  #2124). A rewrite record naming its predecessor with uppercase hex in the
+  tenant or hash16 field parsed and was accepted, though no listed key matches
+  it as a string. It is now refused with
+  `ErasureError::NonCanonicalSupersededRecordKey`, as a version 2 compaction
+  record already was.
+- **`ravel-cli maintain inspect` prints a compaction record's
+  `superseded_record_key`** (issue #2124), after `input_set_hash`, when the
+  record sets it.
 - **The maintenance loop sweeps alert history older than `--alert-retention`,
   default 90 days** (ADR-1688 follow-up task 2, issue #1688). After upgrade
   the first tick deletes every alert transition older than 90 days except each
