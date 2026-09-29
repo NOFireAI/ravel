@@ -78,6 +78,29 @@ your turn waiting for one. Nothing will wake you -- your turn ending ends
 the task, and anything uncommitted is lost with no result ref. A slow cold
 build here is expected; wait for it in the foreground.
 
+LONG COMMANDS: give every Bash call that runs cargo, a script or the poll
+below the longest timeout the tool accepts (600000 ms). The tool still
+moves a command that outruns it into the background by itself, and you
+have no tool that blocks on a background command, nor any wakeup that
+reaches you. Before the first long command, run the log-directory check
+under Gates below; it creates `.gate-logs/` and proves it is ignored and has
+room. Then run every long command with its output in a log that ends with
+an exit marker on its own line:
+
+    <command> > .gate-logs/<step>.log 2>&1; printf '\nEXIT=%d\n' "$?" >> .gate-logs/<step>.log
+
+The call itself always reports success, because the `printf` runs last:
+the command's result is only in the log. So after every long command, read
+the log's `EXIT=` line, whether the call returned or the tool backgrounded
+it. If it was backgrounded, wait with this bounded poll, at the same
+600000 ms timeout, and repeat the call until the log shows `EXIT=`:
+
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18; do grep -q '^EXIT=' .gate-logs/<step>.log && break; sleep 30; done; tail -n 40 .gate-logs/<step>.log
+
+If the call returned, run only its `tail`. The tail shows the marker; for a
+non-zero code, grep the log for the failure itself, since it can sit above
+the last 40 lines.
+
 Implement <issue ref> for the Ravel project: <one sentence>. Work ONLY
 inside <crates/dirs>.
 
@@ -150,13 +173,14 @@ radius of your own change, and affected-tests.sh computes it (the
 named crates plus every crate that depends on them). The commit that
 gets gated must already be formatted; never append a formatting-only
 fixup commit after a failed --check. Run every gate command UNPIPED and
-read its own real exit code (`cmd; code=$?`), never `| tail` / `| head` /
-`| grep` to keep the output small -- the pipeline's exit code is the last
-stage's, not the gate's, so a real failure buried in a `tail`-truncated
-tool-result can report a false "affected-tests passed" while a test
-actually failed. If the output is long, redirect it to a file and grep or
-read the file separately; the exit code check and the output-size problem
-are independent, solve them independently.
+read its own real exit code (the `EXIT=` marker from LONG COMMANDS, which
+survives into a later tool call where a `code` variable would not), never
+`| tail` / `| head` / `| grep` to keep the output small -- the pipeline's
+exit code is the last stage's, not the gate's, so a real failure buried in
+a `tail`-truncated tool-result can report a false "affected-tests passed"
+while a test actually failed. The LONG COMMANDS form solves both at once:
+the redirect keeps the output out of the tool result, and the marker at the
+end of the same log carries the gate's own exit code.
 Where that file goes is itself a rule, because both wrong answers have
 already cost a task. Run this first, as ONE command, substituting
 nothing:
@@ -173,7 +197,8 @@ in the next.
 If the guard exits non-zero, say so in your report and stop rather than
 picking another directory: a host without 5 GB for a log has no room for
 the gate either, and the run would die mid-link with a fake compiler
-error. Then redirect every long gate to `.gate-logs/<step>.log`.
+error. Then run every long gate in the LONG COMMANDS form, into
+`.gate-logs/<step>.log` with its `EXIT=` marker.
 
 HOME on the amd64 executor class is a 1 GB tmpfs: pointing the log
 directory there makes the disk-headroom guard report 0 GB free and fail
@@ -307,6 +332,22 @@ committed immediately, before any further deliverable. On a host where a
 single cold `cargo check` can run for hours, "commit after step 1" and
 "commit the moment anything works" are different instructions, and only
 the second survives a kill mid-build.
+
+The absolute is not enough on its own, because the executor does not
+always choose to background. The Bash tool moves any command past its time
+limit into the background itself, and the executor's toolset has no
+blocking wait: task 5f2d232f's transcript lists Bash, ScheduleWakeup, Task
+and TaskStop, and no task-output tool, and a wakeup it arms fires into a
+session that has already ended. Three executors on 2026-09-29 ended their
+turn this way on an auto-backgrounded `cargo test` or workspace clippy. The
+third did so even though its spec told it to "call the task-output tool in
+blocking mode", which names a tool it does not have. The LONG COMMANDS
+paragraph in the template gives the executor a wait it can actually run: an
+exit marker appended to the log, and a foreground poll bounded under the
+tool's limit, repeated until the marker appears. The loop is spelled out
+without command substitution because fleet-cp refuses a spec containing
+one. Numbered commit points saved all three tasks' code; only the gates
+were lost.
 
 ## Executor test scope
 
