@@ -718,17 +718,18 @@ same instance to two more fetch paths:
   like any other warm failure.
 
 So a PromQL query's RSEG and RLOG fetches, on the local or the distributed
-path, the warm pass, and the SQL executor's per-tenant accountants draw down one
-limit, and a PromQL fetch that needs more than what the SQL side and other
-fetches leave free is refused.
+path, the warm pass, the SQL query path's RSEG/RLOG/RSPAN fetches, and the SQL
+executor's per-tenant accountants draw down one limit, and any of these that
+needs more than what the others leave free is refused.
 
-One set of fetchers still draws on its own default budget, not this shared one,
-and so is not yet bounded by a finite process budget: the SQL query path's.
-`build_sql_state` (`services/ravel-server/src/query.rs`) constructs its RSEG
-metrics, RLOG logs, and RSPAN span fetchers with `with_get_limiter` but not
-`with_memory_budget`, so each reserves against its own
-`MemoryBudget::unlimited()`. It is the only RSPAN fetcher `ravel-server`
-builds.
+The SQL query path's fetchers share this same budget too. `build_sql_state`
+(`services/ravel-server/src/query.rs`) constructs its RSEG metrics, RLOG logs,
+and RSPAN span fetchers with both `with_get_limiter` and `with_memory_budget`,
+passing the identical `Arc<MemoryBudget>` instance the SQL executor itself
+uses. A SQL fetch that would exceed the shared budget is refused with the same
+typed `FetchMemoryExhausted` (`SqlError::Fetch`/`LogFetch`/`SpanFetch`), which
+the HTTP layer maps to 503 `unavailable`, same as every other class of
+`ErrorClass::Unavailable`. It is the only RSPAN fetcher `ravel-server` builds.
 
 Reservation sites, each taken **before** its GET, with the guard's lifetime
 tied to the buffer it accounts for:
@@ -811,10 +812,10 @@ budget: PromQL evaluation (`QueryEngine::with_memory_budget`, wired in
 `ravel-server`), cache warming (`ravel-server`'s `cache_warm.rs`) and
 distributed query fragments (`ravel-server`'s `distrib.rs`). A read whose
 decode does not fit is refused with the 503 `FetchMemoryExhausted` maps to.
-The SQL samples scan reaches the same `decode_selected`, but its fetchers
-reserve against their own unlimited budget (see the SQL-path paragraph
-above), so its decodes are charged and never refused until that fetcher is
-wired to the process budget. The catalog resolve charges its own decodes the same way
+The SQL samples scan reaches the same `decode_selected`, and its fetcher now
+reserves against the same process budget (see the SQL-path paragraph above),
+so its decodes are charged and refused exactly like the PromQL path's. The
+catalog resolve charges its own decodes the same way
 (`Catalog::with_memory_budget`, docs/catalog-and-mvcc.md), as does the
 `/api/v1/metadata` cache (`MetadataCache::with_memory_budget`), but both still
 default to an unlimited budget and the server does not yet pass them the real

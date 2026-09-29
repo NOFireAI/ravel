@@ -8,6 +8,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **SQL fetches now reserve against the process-wide memory budget**
+  (ADR-1170 decision 2, issue #2086). `build_sql_state`
+  (`services/ravel-server/src/query.rs`) wires the same `Arc<MemoryBudget>`
+  the SQL executor already used into its RSEG metrics, RLOG logs, and RSPAN
+  span fetchers, matching the PromQL path. A SQL fetch that would exceed the
+  shared budget is now refused typed (`FetchMemoryExhausted`) and, over HTTP,
+  as 503 `unavailable`, instead of reserving against an unlimited private
+  budget and never refusing. This changes no default: the process budget's
+  size and carve are unchanged, and a deployment that never approached the
+  limit sees no behavior change.
+
 - **`ravel-cli maintain migrate` names every bucket whose refusal no re-run
   clears** (ADR-1331, issue #1331). A bucket that selective erasure has
   touched keeps a live rewrite record whose surviving parts carry the
