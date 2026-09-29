@@ -21,6 +21,18 @@ pub enum Enc {
     Dict = 7,
     Bitmap = 8,
     FixedWidth = 9,
+    /// Reserved for the GCD-scaled integer codec (ADR-2135 decision 3). No
+    /// encoder in this crate emits it and every decoder refuses it.
+    GcdI64 = 10,
+    /// Reserved for the column-reference codec (ADR-2135 decision 3). No
+    /// encoder in this crate emits it and every decoder refuses it.
+    ColumnRef = 11,
+    /// Reserved for the paged-dictionary page (ADR-2135 decision 6). No
+    /// encoder in this crate emits it and every decoder refuses it.
+    DictPage = 12,
+    /// Reserved for the ids page of a paged dictionary (ADR-2135 decision 6).
+    /// No encoder in this crate emits it and every decoder refuses it.
+    DictIds = 13,
 }
 
 impl Enc {
@@ -36,6 +48,10 @@ impl Enc {
             7 => Enc::Dict,
             8 => Enc::Bitmap,
             9 => Enc::FixedWidth,
+            10 => Enc::GcdI64,
+            11 => Enc::ColumnRef,
+            12 => Enc::DictPage,
+            13 => Enc::DictIds,
             other => return Err(CodecError::Corrupted(format!("unknown enc tag {other}"))),
         })
     }
@@ -836,11 +852,45 @@ mod tests {
 
     #[test]
     fn enc_tag_roundtrip() {
-        for tag in 1u8..=9 {
+        for tag in 1u8..=13 {
             assert_eq!(Enc::from_u8(tag).expect("known").to_u8(), tag);
         }
         assert!(matches!(Enc::from_u8(0), Err(CodecError::Corrupted(_))));
-        assert!(matches!(Enc::from_u8(10), Err(CodecError::Corrupted(_))));
+        assert!(matches!(Enc::from_u8(14), Err(CodecError::Corrupted(_))));
+    }
+
+    /// Tags 10-13 are registered but no codec here reads them: every decoder
+    /// refuses each one with its own not-this-codec error, whatever the bytes.
+    #[test]
+    fn reserved_enc_tags_are_refused_by_every_decoder() {
+        for tag in 10u8..=13 {
+            let enc = Enc::from_u8(tag).expect("registered");
+            for bytes in [&[][..], &[0u8, 0, 0, 0][..]] {
+                let is_refusal = |r: Result<(), CodecError>, what: &str| match r {
+                    Err(CodecError::Corrupted(msg)) => {
+                        assert!(msg.contains(what), "tag {tag}: {msg}")
+                    }
+                    Ok(()) => panic!("tag {tag} decoded as {what}"),
+                };
+                is_refusal(
+                    decode_i64(enc, bytes, 0).map(|_| ()),
+                    "not an integer codec",
+                );
+                is_refusal(
+                    decode_strings(enc, bytes, 0).map(|_| ()),
+                    "not a string codec",
+                );
+                is_refusal(
+                    decode_strings_columnar(enc, bytes, 0).map(|_| ()),
+                    "not a string codec",
+                );
+                is_refusal(decode_f64(enc, bytes, 0).map(|_| ()), "not an f64 codec");
+                is_refusal(
+                    decode_fixed(enc, bytes, 0, 8).map(|_| ()),
+                    "not a fixed-width codec",
+                );
+            }
+        }
     }
 
     #[test]
@@ -984,7 +1034,7 @@ mod proptests {
 
         #[test]
         fn i64_decode_never_panics(
-            tag in 1u8..=9,
+            tag in 1u8..=13,
             bytes in proptest::collection::vec(any::<u8>(), 0..256),
             count in 0usize..1000,
         ) {
@@ -1286,7 +1336,7 @@ mod string_dict_proptests {
 
         #[test]
         fn string_decode_never_panics(
-            tag in 1u8..=9,
+            tag in 1u8..=13,
             bytes in proptest::collection::vec(any::<u8>(), 0..256),
             count in 0usize..500,
         ) {
@@ -1322,7 +1372,7 @@ mod string_dict_proptests {
         /// The non-fusing entry point never panics on arbitrary bytes.
         #[test]
         fn columnar_string_decode_never_panics(
-            tag in 1u8..=9,
+            tag in 1u8..=13,
             bytes in proptest::collection::vec(any::<u8>(), 0..256),
             count in 0usize..500,
         ) {

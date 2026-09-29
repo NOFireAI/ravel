@@ -503,6 +503,10 @@ pub fn enc_name(enc: Enc) -> &'static str {
         Enc::Dict => "dictionary",
         Enc::Bitmap => "bitmap",
         Enc::FixedWidth => "fixed_width",
+        Enc::GcdI64 => "gcd_i64",
+        Enc::ColumnRef => "column_ref",
+        Enc::DictPage => "dict_page",
+        Enc::DictIds => "dict_ids",
     }
 }
 

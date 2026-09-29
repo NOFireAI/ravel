@@ -514,6 +514,8 @@ mod tests {
             level: 0,
             input_set_hash: Vec::new(),
             part_index: 0,
+            sort_descriptor: None,
+            clustering_generation: 0,
         }
     }
 

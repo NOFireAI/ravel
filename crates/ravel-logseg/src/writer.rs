@@ -837,6 +837,8 @@ impl RlogWriter {
             level,
             input_set_hash,
             part_index,
+            sort_descriptor: None,
+            clustering_generation: 0,
         };
         write_footer_and_trailer(&mut object, &footer);
         Ok((
@@ -1677,6 +1679,8 @@ impl RlogWriter {
             level,
             input_set_hash,
             part_index,
+            sort_descriptor: None,
+            clustering_generation: 0,
         };
         write_footer_and_trailer(&mut object, &footer);
         Ok((
