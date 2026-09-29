@@ -933,9 +933,13 @@ Owner decision (2026-09-28, on #1828): the reap moves to the maintain role,
 which already holds `s3:DeleteObject`, and the Query role keeps deleting
 nothing. Concretely:
 
-- One maintain process per deployment, the owner of a fixed rendezvous unit
-  over the maintain live set, lists `sys/query/workers/` on its tick and
-  deletes the keys past the reap horizon, judged from LIST metadata alone.
+- The maintain process that owns a fixed rendezvous unit over the maintain
+  live set lists `sys/query/workers/` on its tick and deletes the keys past
+  the reap horizon, judged from LIST metadata alone. That is one process per
+  view of the maintain membership, briefly two while views disagree, which is
+  harmless because the delete is idempotent. A deployment with no
+  `Mode::Maintain` process, including one that runs a single `Mode::All`
+  process, reaps nothing.
   `MaintainList` and `MaintainDelete` gain `sys/query/workers/*`, and
   nothing wider. The reap reads and writes no record, so `MaintainRead` and
   `MaintainWrite` are unchanged.

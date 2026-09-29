@@ -3532,8 +3532,8 @@ mod tests {
 
     /// The query coordinator's heartbeat loop issues no delete under
     /// `sys/query/workers/`, neither on its ticks with dead records present nor
-    /// on its drain: the query role holds no delete grant, and the maintain
-    /// tier reaps. The drain still takes the coordinator out of another
+    /// on its drain: the query role holds no delete grant, and a maintain-mode
+    /// process reaps. The drain still takes the coordinator out of another
     /// reader's live set at once, at the same reader clock.
     ///
     /// Every delete under the prefix is scripted to fail, so any delete the

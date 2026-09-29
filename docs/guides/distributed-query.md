@@ -386,18 +386,27 @@ A key whose modification time is already older than the liveness window is not
 fetched at all: its stamp can only be older still, so the read cost of a
 coordinator tracks the live fleet rather than every node that ever ran.
 
-**Maintain-mode processes** keep the prefix bounded. On each maintain cycle, one
-maintain process per deployment (the owner of a fixed unit under the same
-rendezvous rule that spreads the other maintain work) lists
-`sys/query/workers/` and deletes every key whose modification time is older
-than twice the liveness window. The doubled width is the clock-skew margin
-between the object store's clock and the maintain process's; a live node
-reaped by a skewed clock reappears on its next beat, at most one interval
-later. A store that reports no modification time, or one in the future, keeps
-such a key forever. The shipped `deploy/iam/maintain.json` grants the list
+**Maintain-mode processes** keep the prefix bounded. On each maintain cycle,
+the maintain process that owns a fixed unit under the same rendezvous rule that
+spreads the other maintain work lists `sys/query/workers/` and deletes every
+key whose modification time is older than twice the liveness window. That is
+one process per view of the maintain membership: while two processes briefly
+disagree about membership both may reap, which is harmless because a delete of
+an absent key is a no-op. The doubled width is the clock-skew margin between
+the object store's clock and the maintain process's; a live node reaped by a
+skewed clock reappears on its next beat, at most one interval later. A store
+that reports no modification time keeps such a key forever; a key whose
+modification time is in the future stays until that time is more than twice
+the window in the past. The shipped `deploy/iam/maintain.json` grants the list
 and the delete on `sys/query/workers/*`; no maintain process needs to read a
 record. A deployment that runs no maintain-mode process reaps nothing, and the
-prefix grows with every query node that ever ran.
+prefix grows by one key for every query node that ever ran. That includes a
+deployment that runs every role in one `--mode all` process with distributed
+query on: `--mode all` runs no maintenance.
+
+The admission family still carries the gap this reap closes for query workers:
+its reconciler deletes stale snapshots under a role the shipped templates give
+no delete, so its prefix is not reaped either.
 
 If the reaping credential lacks the delete, the pass logs one error naming the
 prefix and the number of keys left, and stops deleting until the next cycle,

@@ -812,7 +812,7 @@ pub struct ServerConfig {
     /// probe observe 503 over a still-open listener, so Kubernetes stops routing
     /// new connections before the sockets close. It is a settle delay, paid once
     /// per shutdown and NOT counted against [`ServerConfig::shutdown_timeout`];
-    /// the ADR-0071 heartbeat delete runs concurrently with it. In-process tests
+    /// the ADR-0071 heartbeat drain runs concurrently with it. In-process tests
     /// set it to zero so a suite that shuts a server down on every case does not
     /// pay it hundreds of times.
     pub drain_settle_interval: Duration,
@@ -1109,12 +1109,13 @@ impl Drop for AbortOnDrop {
 
 /// Handle to the ADR-0071 query-worker heartbeat loop, held on [`Running`] so
 /// graceful shutdown stops it deterministically rather than leaving it detached.
-/// [`QueryWorkerHeartbeat::shutdown`] signals the loop, which deletes this
-/// process's `sys/query/workers/<uuid>` record before returning, then joins the
-/// task.
+/// [`QueryWorkerHeartbeat::shutdown`] signals the loop, which overwrites this
+/// process's `sys/query/workers/<uuid>` record with a drained stamp no reader
+/// accepts as live before returning, then joins the task.
 ///
-/// That join is unbounded on its own: the loop's final `delete_heartbeat` ends
-/// in [`ObjectStoreBackend::delete`], which takes no deadline. Every caller
+/// That join is unbounded on its own: the loop's final drain
+/// (`QueryWorkers::mark_drained`) ends in an object-store PUT, which takes no
+/// deadline. Every caller
 /// must therefore impose one; [`Running::shutdown`] uses
 /// [`heartbeat_stop_budget`].
 struct QueryWorkerHeartbeat {
@@ -1123,10 +1124,10 @@ struct QueryWorkerHeartbeat {
 }
 
 impl QueryWorkerHeartbeat {
-    /// Stop the heartbeat loop and wait for it to delete its record and exit.
+    /// Stop the heartbeat loop and wait for it to drain its record and exit.
     /// Unbounded by construction (see the type's own docs): call it under a
     /// timeout. Dropping the returned future on that timeout detaches the task
-    /// rather than cancelling the delete, so a store that answers late can
+    /// rather than cancelling the drain write, so a store that answers late can
     /// still complete it before the process exits.
     async fn shutdown(self) {
         // The receiver is dropped only when the loop exits, so a send error
@@ -1323,7 +1324,7 @@ impl Running {
     }
 
     /// Gracefully stop the server: flip readiness to draining so a probe sees
-    /// 503 before any listener closes, delete the ADR-0071 heartbeat
+    /// 503 before any listener closes, drain the ADR-0071 heartbeat record
     /// concurrently with a short settle wait, then attempt to flush ingest
     /// buffers before joining the listeners, join the listeners under their own
     /// sub-budget, and join the shard actors and background tasks.
@@ -1386,7 +1387,7 @@ impl Running {
         } = self;
 
         // Flip readiness to draining FIRST, before any listener closes, and stop
-        // the ADR-0071 heartbeat CONCURRENTLY with the settle wait. Deleting the
+        // the ADR-0071 heartbeat CONCURRENTLY with the settle wait. Draining the
         // heartbeat record while the fragment listener is still open lets a
         // sibling coordinator drop this worker from its live set before the
         // socket closes, instead of routing a fragment to a listener that is
@@ -1396,7 +1397,7 @@ impl Running {
         //
         // That stop carries `heartbeat_stop_budget` rather than the drain
         // block's `--shutdown-timeout`, because it has to run BEFORE the close
-        // signal below and it awaits a deadline-less object-store DELETE:
+        // signal below and it awaits a deadline-less object-store PUT:
         // unbounded, an unreachable store would hold the process here with
         // every ingest buffer still unflushed.
         readiness.begin_drain();

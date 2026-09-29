@@ -55,7 +55,8 @@
 //!   bounds the LIST itself. The extra width is the clock-skew margin between
 //!   the object store's clock (which sets the modification time) and the
 //!   reader's. The deleter is the maintain role, which holds the delete grant
-//!   on this prefix: one maintain process per deployment calls
+//!   on this prefix: the maintain process that owns a fixed rendezvous unit
+//!   (one per view of the maintain membership) calls
 //!   [`reap_dead_query_workers`] on its tick. The reap judges only the LIST
 //!   metadata, so it reads no record. Reaping is idempotent and costs a
 //!   live-but-skewed worker at most one heartbeat interval of invisibility,
@@ -85,7 +86,8 @@ pub const QUERY_WORKERS_PREFIX: &str = "sys/query/workers/";
 
 /// The heartbeat stamp a draining worker writes over its own record
 /// ([`QueryWorkers::mark_drained`]). `worker_set::is_stale` saturates, so this
-/// stamp is past the liveness window for every reader clock and every window.
+/// stamp is past the liveness window for every reader clock and every window
+/// short of `i64::MAX` nanoseconds.
 pub const DRAINED_STAMP_NS: i64 = i64::MIN;
 
 /// The liveness window, in nanoseconds, for a heartbeat interval and liveness

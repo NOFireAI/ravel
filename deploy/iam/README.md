@@ -70,7 +70,8 @@ grants below are what remains deletable after that deny applies.
   `quarantine/t/*/*/l0/*`. These are the objects the compaction,
   supersession, retention, erasure-request, unreferenced-catalog, dead-worker
   reap, and quarantine-reaper sweeps physically remove. The query-worker reap
-  runs on one maintain process per deployment and judges each key by its LIST
+  runs on the maintain process that owns a fixed rendezvous unit (one per view
+  of the maintain membership) and judges each key by its LIST
   metadata, so `MaintainList` also carries `sys/query/workers/*` and
   `MaintainRead` does not.
   The catalog half of that list also needs reads, which are easy to miss
