@@ -1204,7 +1204,8 @@ ravel-cli export --signal logs --tenant acme \
 ```
 
 Run with the same mapping a load of that data used, it produces a file
-`ravel-cli load` reads back:
+`ravel-cli load` reads back (a metrics export can refuse instead; see
+[Metrics export](#metrics-export)):
 
 ```sh
 ravel-cli load --parquet acme-day.parquet --tenant acme-copy --mapping map.toml
@@ -1213,8 +1214,11 @@ ravel-cli load --parquet acme-day.parquet --tenant acme-copy --mapping map.toml
 **Logs and metrics.** `--signal` has no default and accepts `logs` and
 `metrics`. The `--mapping` file must carry the section that signal names, under
 the same section rules `load` applies. `--signal metrics` has its own rules for
-duplicates and names, in [Metrics export](#metrics-export) below; everything
-else in this section applies to both signals. `--signal spans` is refused by
+duplicates, names and what round-trips, in [Metrics export](#metrics-export)
+below. The window, memory, listing-window, sort-order and deletion subsections
+and the `--shards` and `--parquet` notes apply to both signals; "What
+round-trips and what does not" is about logs, except where a bullet says
+otherwise. `--signal spans` is refused by
 name: bulk import for spans has landed (`load --signal spans` above), and the
 refusal says the export half of that round trip is the remaining work and that
 only `--signal logs` and `--signal metrics` are supported.
@@ -1306,7 +1310,8 @@ attribute key gets a null in that column, which a later load reads back as the
 same absent attribute. An attribute stored under a type the mapping does not
 declare for that key is refused by name rather than written as a null.
 
-Four things to know before treating a round trip as lossless:
+Four things to know before treating a logs round trip as lossless (only the
+last applies to metrics as well):
 
 - **Only what the mapping names.** A resource or record attribute the mapping
   does not declare is not in the output. Setting `attrs_map_column = "attrs"`
@@ -1324,9 +1329,10 @@ Four things to know before treating a round trip as lossless:
   mapping declares. A mapping with `ts_unit = "millis"` writes millisecond
   values, and a reload of that file gets timestamps truncated to the
   millisecond. Use `ts_unit = "nanos"` when the round trip has to be exact.
+  A metrics export refuses such a sample instead (see below).
 - **Retention restarts on reload.** Loading an exported file is an ordinary
   bulk load, so the reloaded records bucket by the new load's time, not by
-  their event time or their original ingest hour.
+  their event time or their original ingest hour. This holds for metrics too.
 
 `--shards` is the tenant's configured shard count, the same value a load of
 that tenant uses, and the tenant's durable provisioning record supplies the
@@ -1396,9 +1402,15 @@ load with the same mapping turns back into the stored one:
   is stored as, say, `net_rx_bytes_total`; a load would append `_bytes` to
   that again, because it does not end in `_bytes`, so the export writes
   `net_rx_bytes` and the load adds `_total` back.
+- Otherwise the stored name less its unit suffix, or less both the unit
+  suffix and `_total`. This reaches a name the suffixes took past the 512-byte
+  metric-name limit: a raw name of 510 bytes loaded under `unit = "s"` and
+  `kind = "counter"` is stored 524 bytes long, over the limit a load applies
+  to the name cell, so the export writes the 510-byte name and the load appends
+  `_seconds_total` again.
 
 Each name is checked against the load's own naming rule before anything is
-written, and a series that neither name reproduces is refused by name, with
+written, and a series that no candidate reproduces is refused by name, with
 what a load would call it: a series stored as `cpu` cannot be exported under a
 mapping with `unit = "s"`, because a load would name it `cpu_seconds`. Export
 with the `unit` and `kind` the data was loaded with, or with neither, which
@@ -1429,4 +1441,11 @@ that re-loads onto different series:
 
 A refused export writes no file. With those refusals, loading an exported file
 with the same mapping, into any tenant, reproduces the same label sets, the
-same timestamps and the same value bit patterns for every exported sample.
+same timestamps and the same value bit patterns for every exported sample the
+reload admits. The reload applies the row checks every load applies, and the
+export does not repeat them: a label value longer than the label value length
+limit, a series with more labels than the loader's per-record cap, or a
+timestamp before the Unix epoch, any of which a series written through another
+ingest path can hold, stops the reload at that row with a `row N:` error
+naming the reason. Batches before that row stay loaded, and the error lists
+their commit tokens.

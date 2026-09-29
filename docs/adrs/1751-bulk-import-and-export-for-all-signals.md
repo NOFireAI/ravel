@@ -242,12 +242,14 @@ carries in their rewritten form. Metrics export therefore narrows decision
 - Each series is written under a name that a load with the same mapping
   turns back into the stored name: the stored name itself when the load
   leaves it unchanged, otherwise the stored name less a trailing `_total`
-  (a counter whose unit suffix and `_total` the load adds again). Each
-  candidate is checked by running the load's own naming rule over it.
+  (a counter whose unit suffix and `_total` the load adds again), less its
+  unit suffix, or less both (a name the suffixes took past the metric-name
+  length cap). Each candidate is checked by running the load's own naming
+  rule over it.
 - A mapping or a series the export cannot invert is refused by name, and
   no file is written: a `[metrics.histogram]` mapping (a classic histogram
   round-trips through a scalar mapping with a `le` label instead), a stored
-  name neither candidate reproduces, a label the mapping does not name,
+  name no candidate reproduces, a label the mapping does not name,
   native-histogram samples in the window, and a timestamp that is not a
   whole number of the mapping's `ts_unit`. A file that silently loads onto
   other series is not an export.

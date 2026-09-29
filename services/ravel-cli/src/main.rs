@@ -703,7 +703,8 @@ enum Command {
         parquet: std::path::PathBuf,
         /// Path to the `--mapping` TOML naming the output columns. The same
         /// file a `load` of this data used produces a file that load reads
-        /// back.
+        /// back, or, for metrics, refuses by name a series no file under it
+        /// re-loads onto the same series.
         #[arg(long, value_name = "TOML")]
         mapping: std::path::PathBuf,
         /// Configured shard count, used to resolve the catalog. The tenant's
