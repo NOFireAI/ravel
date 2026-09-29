@@ -85,11 +85,17 @@ measurements are on #2121 (Stage 0 and 0b):
 ### D1. Skip segments by declared-column statistics when the logs scan is planned
 
 `LogsTableProvider::scan` drops a segment before `LogsScanExec` is built when
-a pushed-down predicate provably excludes every row of that segment. It uses
-the segment's own min/max from the stamp its `SegmentRef` carries or from the
-`.cstat` entry, under the same carrier rules `declared_min_max_all` already
-applies: the stamp read off the `SegmentRef` itself, a `.cstat` entry joined
-by content hash then identity, and conflicting carriers treated as absent.
+a pushed-down predicate provably excludes every row of that segment. The
+min/max it trusts is the one on the stamp its `SegmentRef` carries. The
+stamp is folded from the merged value SQL returns for a declared column,
+the record's own cell or the resource or scope value it falls back to.
+
+A `.cstat` entry is never enough to skip a segment, because it records only
+the record-level cells. A row whose value lives only in the resource or
+scope attributes is outside its [min, max], so skipping on `.cstat` would
+drop that row. When a segment has both carriers and they disagree, the
+segment is not skipped, the same conflict rule `declared_min_max_all`
+applies.
 
 - **Predicates.** The predicates are exactly the ones `extract_logs` (in
   `logs_pushdown.rs`, under ADR-0093) already turns into prune-only
@@ -110,9 +116,9 @@ by content hash then identity, and conflicting carriers treated as absent.
   and a general `OR`. The arms `extract_logs` produces are intersected, so a
   segment is skipped when any one arm's range is disjoint from the segment's
   [min, max].
-- **Conservative by construction.** A segment is skipped only when stats are
-  present and exact for that column in that segment, and the arm is false
-  over the closed interval [min, max] for every value.
+- **Conservative by construction.** A segment is skipped only when its
+  stamp covers that column, no `.cstat` entry conflicts with the stamp, and
+  the arm is false over the closed interval [min, max] for every value.
 - **Ordering.** The disjointness test runs in the declared type's own
   ordering: signed `i64`, and `false < true` for `Bool`. The arm's
   bit-pattern bounds are decoded to that type before any comparison, the
@@ -138,16 +144,16 @@ by content hash then identity, and conflicting carriers treated as absent.
   on that path, and this ADR leaves it that way.
 - **Flight SQL slices.** A Flight SQL `DoGet` serves a slice whose ticket
   carries `SegmentRef`s without their stamps, and adding them would change
-  the ticket format. D1 therefore skips nothing on that path. The
-  ClickBench driver queries over HTTP, so it is not affected.
-- **Carriers in practice.** A filtered scan does not normally load `.cstat`
-  (the executor's load gate), so production skipping comes from the stamps.
-  On this corpus, `CounterID` is a declared resource attribute. It has no
-  FIELD_DIR column, so `.cstat` never covers it. The stamp, which folds the
-  merged value including resource attributes, is its only carrier.
-  Measuring D1 therefore has a precondition: before the final run, check
-  that the loaded segments carry a `CounterID` stamp. A corpus without
-  stamps would skip nothing and read as a code regression.
+  the ticket format. Since D1 skips only on a stamp, it skips nothing on
+  that path. The ClickBench driver queries over HTTP, so it is not
+  affected.
+- **Stamps as a precondition.** On this corpus `CounterID` is a declared
+  resource attribute. The writer gives it an all-NULL record-level column,
+  so its `.cstat` entry describes nothing SQL returns. The stamp is the one
+  carrier that can skip on it. Measuring D1 therefore has a precondition:
+  before the final run, check that the loaded segments carry a `CounterID`
+  stamp. A corpus without stamps would skip nothing, and that would read as
+  a code regression.
 - **Visibility.** The pruned count is reported:
   - as `segments_pruned_by_stats` on the scan's `EXPLAIN ANALYZE` metrics;
   - in `SqlStats`, beside `blocks_pruned_by_postings`, and in
@@ -374,8 +380,10 @@ flowchart LR
   column fetch only the objects whose stats admit a match. The saving grows
   with how tightly data is clustered by that column inside objects. On
   ClickBench's load order, `CounterID` clusters into 145 of 2,617 objects.
-- A segment without stats, which is a pre-stamp segment with no `.cstat`, is
-  never skipped. The cost of that is a fetch, never a wrong answer.
+- A segment without a stamp for the arm's column is never skipped by that
+  arm, even when it has a `.cstat` entry (a pre-stamp segment, for
+  instance). Another column's arm or the ts window can still drop it. The
+  cost of a missed skip is a fetch, never a wrong answer.
 - D2's fast path and the per-cell path must stay equal. The property test is
   the contract, and a change to the merge rules has to extend it.
 - No persistent format, key layout or proto changes. No admission or
