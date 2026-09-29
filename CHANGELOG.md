@@ -384,7 +384,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   proceeds and counts `clock_lag_unchecked`. All three counters here
   (`clock_lag_refused`, `clock_lag_unchecked`, and
   `clock_lag_bypassed_at_shutdown` below) are on the `ravel-ingest` metrics
-  snapshots; `/metrics` renders none of them yet. A
+  snapshots, and `/metrics` renders all three (see the clock-lag entry
+  under Added). A
   graceful shutdown is the one exception, because a lag refusal re-anchors
   nothing and so refuses every enforced pass of a drain: on the `Shutdown` and
   channel-close drains the drain then makes bypass passes, under the same pass
@@ -494,6 +495,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`/metrics` renders the three writer clock-lag counters, and a shipped
+  alert pages on a refused flush** (ADR-1685 follow-up task 3, issue #1685).
+  `ravel_ingest_clock_lag_refused_total`,
+  `ravel_ingest_clock_lag_unchecked_total` and
+  `ravel_ingest_clock_lag_bypassed_at_shutdown_total` render in the ingest
+  family for the metrics, logs and spans signals. The new
+  `RavelWriterClockLagRefused` rule in `deploy/prometheus/ravel.rules.yaml`
+  fires on `increase(ravel_ingest_clock_lag_refused_total[10m]) > 0` held for
+  5m: a writer whose clock runs behind the object store's clock by more than
+  the clock-skew allowance. The other two counters do not page; the
+  observability guide says why.
 - **Readers accept and validate a version 2 compaction record** (ADR-0066,
   force 2 amendment, issue #2093). `CompactionRecord` gains
   `superseded_record_key`, naming the compaction record a version 2 record

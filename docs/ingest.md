@@ -473,8 +473,10 @@ recoverable outcome the writer had before this check existed, rather than a
 drop. `FlushNow` and every size or age trigger keep refusing, since their
 actor keeps running to retry. All three counters here (`clock_lag_refused`,
 `clock_lag_unchecked`, and `clock_lag_bypassed_at_shutdown`) live on the
-`ravel-ingest` metrics snapshots, and `/metrics` renders none of them yet:
-ADR-1685 follow-up task 3 renders all three.
+`ravel-ingest` metrics snapshots, and `/metrics` renders them as
+`ravel_ingest_clock_lag_refused_total`,
+`ravel_ingest_clock_lag_unchecked_total`, and
+`ravel_ingest_clock_lag_bypassed_at_shutdown_total` for every signal.
 
 The bypass passes are a bounded loop rather than one pass because the ADR-1307
 floor still applies on them, which is also what decides how many over-bound

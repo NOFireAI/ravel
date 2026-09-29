@@ -354,6 +354,31 @@ groups:
             steady expected backfill.
           runbook: docs/guides/observability.md#reading-the-reason-label
 
+  - name: ravel-ingest-clock
+    # Only the refusal pages. ravel_ingest_clock_lag_unchecked_total counts
+    # flushes made before any store time was observed, a wiring defect rather
+    # than an incident; ravel_ingest_clock_lag_bypassed_at_shutdown_total is
+    # teardown residue on a process that is already exiting.
+    rules:
+      - alert: RavelWriterClockLagRefused
+        expr: |
+          increase(ravel_ingest_clock_lag_refused_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            A Ravel writer's clock runs behind the object store's clock, so its
+            {{ $labels.signal }} flushes are refused
+          description: >-
+            The writer's flush-open clock reading lagged the store's observed
+            clock by more than the clock-skew allowance. Refused flushes return
+            a retryable error and their rows stay buffered until the clock
+            converges; once the process-wide byte budget is full, new writes
+            to this process are shed with HTTP 429. Fix NTP on the host of
+            this process.
+          runbook: docs/guides/observability.md#the-writer-clock-lag-alert
+
   # --- Transcribed from docs/guides/operations/troubleshooting.md ---
   #
   # Each rule below carries the threshold the symptom-table row states. A row
