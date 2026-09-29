@@ -920,6 +920,12 @@ impl DecodedCaches {
     /// cached entries least-recently-used first across every tenant of both
     /// caches. Returns how many entries were dropped.
     ///
+    /// The loop runs while `budget.reserved() + want` overflows a `u64` or
+    /// exceeds `budget.limit()`, the same test
+    /// [`ravel_memory::MemoryBudget::try_reserve`] refuses on. A `want` of 0
+    /// therefore still evicts on a budget a `reserve_unchecked` caller pushed
+    /// over its limit, until eviction brings it back within the limit.
+    ///
     /// The loop is bounded by the number of cached entries, not by the bytes
     /// it frees: an entry a live resolve still holds an `Arc` to stays charged
     /// to the budget after this drops it, so a pass can remove every entry and
@@ -933,12 +939,16 @@ impl DecodedCaches {
     ///
     /// A caller whose `want` exceeds the budget's whole limit must not call
     /// this at all ([`crate::Catalog::reserve_decoded`] returns its first
-    /// refusal instead): the condition below can never become false, so the
+    /// refusal instead): the loop condition can never become false, so the
     /// pass would empty both caches, across every tenant, for a decode no
     /// eviction could ever admit.
     pub(crate) fn evict_until_fits(&self, budget: &ravel_memory::MemoryBudget, want: u64) -> u64 {
         let mut dropped = 0;
-        while budget.limit().saturating_sub(budget.reserved()) < want {
+        while budget
+            .reserved()
+            .checked_add(want)
+            .is_none_or(|total| total > budget.limit())
+        {
             if !self.evict_one_lru() {
                 break;
             }

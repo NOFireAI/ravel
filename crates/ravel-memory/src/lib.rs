@@ -344,8 +344,8 @@ impl fmt::Display for MemoryExhausted {
 
 impl Error for MemoryExhausted {}
 
-/// The bytes a decode of a `declared`-byte body (a section, frame, part or
-/// postings object) may allocate under a decoder whose ceiling is `ceiling`:
+/// The bytes a decode of a `declared`-byte body (a section, frame, part,
+/// postings or column-statistics object) may allocate under a decoder whose ceiling is `ceiling`:
 /// the declared length itself, or 0 when it is over the ceiling, since the
 /// decoder refuses an oversized one before it allocates anything (ADR-1702
 /// decision 6).

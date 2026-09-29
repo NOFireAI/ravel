@@ -830,11 +830,14 @@ impl Catalog {
     /// [`Catalog::decode_reserve_retries`].
     ///
     /// A decode charged 0 bytes (its declared length is over the ceiling, see
-    /// [`ravel_memory::decoded_charge`]) skips the pass the same way. It is
-    /// refused only on a budget a `reserve_unchecked` caller pushed over its
-    /// limit, where eviction can never make room for 0 bytes: the pass loops
-    /// only while the free space is below `want`, so it would evict nothing
-    /// and the retry would return the same refusal.
+    /// [`ravel_memory::decoded_charge`]) is refused only on a budget a
+    /// `reserve_unchecked` caller pushed over its limit. It takes the pass and
+    /// the one retry like any other refusal: cached entries hold reservations
+    /// on that same budget, so evicting them can bring it back within its
+    /// limit, and the 0-byte retry then succeeds and leaves the outcome to the
+    /// decoder's own refusal (ADR-1702 decision 6). When the over-limit bytes
+    /// are held outside the caches the pass empties them and the retry is
+    /// refused.
     ///
     /// Eviction and retry are NOT atomic against each other or against other
     /// resolves. Another task can take the freed bytes between the two, so a
@@ -854,7 +857,7 @@ impl Catalog {
             Err(refusal) => refusal,
         };
         let want = ravel_memory::decoded_charge(declared, ceiling);
-        if want == 0 || want > self.memory_budget.limit() {
+        if want > self.memory_budget.limit() {
             return Err(refusal);
         }
         self.decoded.evict_until_fits(&self.memory_budget, want);
@@ -870,10 +873,11 @@ impl Catalog {
 
     /// Decode reservations retried after such an eviction pass, cumulative.
     /// One per refused reservation that ran the pass, whether or not the retry
-    /// succeeded. Two refusals skip the pass and count nothing: a decode
-    /// wanting more than the budget's whole limit, and a decode charged 0
-    /// bytes (declared over its ceiling) refused by a budget already over its
-    /// limit.
+    /// succeeded. A decode wanting more than the budget's whole limit skips
+    /// the pass and counts nothing. A decode charged 0 bytes (declared over
+    /// its ceiling) refused by a budget already over its limit does run the
+    /// pass and counts one retry, which succeeds once eviction brings the
+    /// budget within its limit.
     pub fn decode_reserve_retries(&self) -> u64 {
         self.decode_reserve_retries.load(Ordering::Relaxed)
     }
@@ -12117,15 +12121,17 @@ mod tests {
 
     /// A decode declaring more than its ceiling is charged 0, and on a budget
     /// a `reserve_unchecked` caller pushed over its limit even 0 bytes are
-    /// refused. No eviction can make 0 bytes fit any better than they already
-    /// do, so that refusal is final: no eviction pass, no retry counted.
+    /// refused. Cached entries hold reservations on that same budget, so
+    /// evicting them can bring it back within its limit, after which the
+    /// 0-byte retry succeeds and the decoder's own refusal decides the
+    /// outcome (ADR-1702 decision 6).
     ///
-    /// FLIP: drop the `want == 0` early return from `Catalog::reserve_decoded`
-    /// (catalog.rs) and the pass runs for nothing: `decode_reserve_retries()`
-    /// below reads 1 instead of 0, while `decoded_cache_memory_evictions()`
-    /// still reads 0.
+    /// FLIP: make `DecodedCaches::evict_until_fits` (cache.rs) loop while
+    /// `budget.limit().saturating_sub(budget.reserved()) < want` again, or
+    /// return early from `Catalog::reserve_decoded` when `want == 0`, and the
+    /// 0-byte reservation below is refused instead of admitted.
     #[tokio::test]
-    async fn a_zero_charge_refused_over_the_limit_skips_the_eviction_pass() {
+    async fn a_zero_charge_over_the_limit_evicts_until_the_budget_admits_it() {
         let store = Arc::new(MemoryStore::new());
         let sealed_hour = 500_000u32;
         let now_ns = fold_now_ns(sealed_hour);
@@ -12152,30 +12158,85 @@ mod tests {
         );
 
         const CEILING: u64 = 4_096;
+        let reservation = catalog
+            .reserve_decoded(CEILING + 1, CEILING)
+            .expect("evicting the cached part brings the budget within its limit");
+        assert_eq!(reservation.size(), 0, "an over-ceiling decode is charged 0");
+        assert_eq!(
+            catalog.decode_reserve_retries(),
+            1,
+            "one refusal, one eviction pass, one retry"
+        );
+        assert_eq!(
+            catalog.decoded_cache_memory_evictions(),
+            1,
+            "the pass evicted the one cached part"
+        );
+        assert_eq!(catalog.part_cache().total_entries(), 0);
+        assert_eq!(budget.reserved(), 1);
+        drop(reservation);
+        budget.release(1);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// When the over-limit bytes are held by a `reserve_unchecked` the caches
+    /// do not own, larger than everything cached, eviction cannot bring the
+    /// budget within its limit: the pass empties both caches, the one retry
+    /// is refused, and that refusal is the answer.
+    ///
+    /// FLIP: return early from `Catalog::reserve_decoded` when `want == 0`
+    /// and no pass runs: `decode_reserve_retries()` below reads 0 instead of
+    /// 1, `decoded_cache_memory_evictions()` 0 instead of 2, and the refusal
+    /// reports the cached parts still reserved. Reverting the loop condition
+    /// in `DecodedCaches::evict_until_fits` (cache.rs) to
+    /// `budget.limit().saturating_sub(budget.reserved()) < want` fails the
+    /// same refusal assertion: the pass evicts nothing.
+    #[tokio::test]
+    async fn a_zero_charge_over_the_limit_is_refused_when_eviction_cannot_help() {
+        let store = Arc::new(MemoryStore::new());
+        let sealed_hour = 500_000u32;
+        let now_ns = fold_now_ns(sealed_hour);
+        let range = sealed_hour_range(sealed_hour);
+        let first = TenantHash([0x64; 16]);
+        let second = TenantHash([0x65; 16]);
+        let first_len = fold_one_part_for(&store, first, sealed_hour, 1).await;
+        let second_len = fold_one_part_for(&store, second, sealed_hour, 1).await;
+        let cached_len = first_len + second_len;
+
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(cached_len));
+        let catalog = Catalog::new(store.clone(), config(1))
+            .expect("catalog")
+            .with_memory_budget(budget.clone());
+        for tenant in [&first, &second] {
+            catalog
+                .resolve(tenant, Signal::Metrics, range, &[], now_ns)
+                .await
+                .expect("each tenant resolves within the budget");
+        }
+        assert_eq!(catalog.part_cache().total_entries(), 2);
+        assert_eq!(budget.reserved(), cached_len);
+
+        let foreign = cached_len + 1;
+        budget.reserve_unchecked(foreign);
+
+        const CEILING: u64 = 4_096;
         let err = catalog
             .reserve_decoded(CEILING + 1, CEILING)
-            .expect_err("a budget over its limit refuses even a 0-byte reservation");
+            .expect_err("the foreign reservation alone keeps the budget over its limit");
         assert_eq!(
             err,
             ravel_memory::MemoryExhausted {
                 requested: 0,
-                reserved: cached_len + 1,
+                reserved: foreign,
                 limit: cached_len,
-            }
+            },
+            "the retry's refusal, with every cached part released"
         );
-        assert_eq!(
-            catalog.decode_reserve_retries(),
-            0,
-            "a 0-byte charge is refused once, with no retry"
-        );
-        assert_eq!(
-            catalog.decoded_cache_memory_evictions(),
-            0,
-            "and no eviction pass"
-        );
-        assert_eq!(catalog.part_cache().total_entries(), 1);
-        budget.release(1);
-        assert_eq!(budget.reserved(), cached_len);
+        assert_eq!(catalog.decode_reserve_retries(), 1);
+        assert_eq!(catalog.decoded_cache_memory_evictions(), 2);
+        assert_eq!(catalog.part_cache().total_entries(), 0);
+        budget.release(foreign);
+        assert_eq!(budget.reserved(), 0);
     }
 
     /// The declared `body_uncompressed_len` of the one-segment, one-column v3
