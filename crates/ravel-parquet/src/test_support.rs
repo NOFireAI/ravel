@@ -42,7 +42,7 @@ pub(crate) const PROFILE: &str = "default";
 pub(crate) const BUCKET: &str = "lake";
 pub(crate) const TENANT: TenantHash = TenantHash([0x5a; 16]);
 
-fn write(schema: Arc<Schema>, columns: Vec<ArrayRef>) -> Bytes {
+pub(crate) fn write(schema: Arc<Schema>, columns: Vec<ArrayRef>) -> Bytes {
     let batch = RecordBatch::try_new(Arc::clone(&schema), columns).expect("batch");
     let properties = WriterProperties::builder()
         .set_dictionary_enabled(false)
@@ -316,12 +316,19 @@ impl Fixture {
     }
 
     pub(crate) fn session(&self, tables: &[(&str, Arc<ParquetTableProvider>)]) -> SessionContext {
+        self.session_with(SessionConfig::new().with_target_partitions(4), tables)
+    }
+
+    pub(crate) fn session_with(
+        &self,
+        config: SessionConfig,
+        tables: &[(&str, Arc<ParquetTableProvider>)],
+    ) -> SessionContext {
         let registry = Arc::new(SingleStoreRegistry::new(Arc::clone(&self.registered)));
         let runtime = RuntimeEnvBuilder::new()
             .with_object_store_registry(registry)
             .build_arc()
             .expect("runtime");
-        let config = SessionConfig::new().with_target_partitions(4);
         let ctx = SessionContext::new_with_config_rt(config, runtime);
         for (name, table) in tables {
             ctx.register_table(*name, Arc::clone(table) as Arc<dyn TableProvider>)
