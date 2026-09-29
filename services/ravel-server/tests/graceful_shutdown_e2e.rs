@@ -1,6 +1,7 @@
 //! Graceful shutdown drains buffered ingest, marks the process not-ready before
-//! listeners close, and deletes the distributed-query heartbeat record on the
-//! way out (issue #1291, server half).
+//! listeners close, and overwrites the distributed-query heartbeat record with
+//! the drained stamp on the way out (issue #1291, server half; issue #1828).
+//! The query role never deletes that record: the maintain role reaps it.
 //!
 //! These drive a real in-process server over real sockets. Automatic
 //! time-based flushes are disabled (a very long `max_flush_delay`) so the only
@@ -25,10 +26,12 @@ use opentelemetry_proto::tonic::metrics::v1::{
 };
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use prost::Message;
-use ravel_fleet::query_workers::QUERY_WORKERS_PREFIX;
+use ravel_fleet::query_workers::{
+    DRAINED_STAMP_NS, QUERY_WORKERS_PREFIX, QueryWorkerRecord, QueryWorkers,
+};
 use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{ObjectStoreBackend, list_all};
+use ravel_object_store::{GetRange, ObjectStoreBackend, list_all};
 use ravel_query::distrib::partition::DistribThresholds;
 use ravel_server::config::DistribSettings;
 use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
@@ -224,7 +227,7 @@ fn metrics_l0_prefix() -> String {
 /// Park until the heartbeat loop's first `sys/query/workers/<uuid>` write has
 /// landed. It writes before its first sleep, so this converges in well under a
 /// second; a shutdown assertion is only meaningful once the record it must
-/// delete exists.
+/// overwrite with the drained stamp exists.
 async fn await_heartbeat_record(store: &dyn ObjectStoreBackend) {
     for _ in 0..200 {
         if !list_all(store, QUERY_WORKERS_PREFIX)
@@ -237,6 +240,27 @@ async fn await_heartbeat_record(store: &dyn ObjectStoreBackend) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("a distributed-query process must publish a heartbeat record before shutdown");
+}
+
+/// Decode every record under `sys/query/workers/`, in key order.
+async fn worker_records(store: &dyn ObjectStoreBackend) -> Vec<QueryWorkerRecord> {
+    let mut records = Vec::new();
+    for meta in list_all(store, QUERY_WORKERS_PREFIX)
+        .await
+        .expect("list worker records")
+    {
+        let got = store
+            .get(&meta.key, GetRange::Full)
+            .await
+            .expect("get worker record");
+        records.push(QueryWorkerRecord::decode(got.data.as_ref()).expect("decode worker record"));
+    }
+    records
+}
+
+/// A reader that is not the server under test, as a sibling coordinator is.
+fn sibling_reader() -> QueryWorkers {
+    QueryWorkers::with_defaults("127.0.0.1:1", "127.0.0.1:2", 1)
 }
 
 /// A buffered-mode ingest ack is written to the shard buffer and acked before
@@ -542,11 +566,13 @@ async fn readyz_is_503_before_the_first_listener_closes() {
 }
 
 /// A distributed-query process writes its `sys/query/workers/<uuid>` heartbeat
-/// record; graceful shutdown must delete it so sibling coordinators drop it from
-/// their live set immediately rather than dialing a stopped worker until its
-/// stamp ages out.
+/// record; graceful shutdown must overwrite it with [`DRAINED_STAMP_NS`] so
+/// sibling coordinators drop it from their live set immediately rather than
+/// dialing a stopped worker until its stamp ages out. The record itself stays:
+/// the query role holds no delete grant (ADR-0055 section 1), and the maintain
+/// role reaps it later.
 #[tokio::test]
-async fn heartbeat_worker_record_is_deleted_on_shutdown() {
+async fn heartbeat_worker_record_is_stamped_drained_on_shutdown() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let running = start_server(store.clone(), Mode::All, Some(always_distribute_settings())).await;
 
@@ -554,12 +580,30 @@ async fn heartbeat_worker_record_is_deleted_on_shutdown() {
 
     running.shutdown().await.expect("graceful shutdown");
 
-    let after = list_all(store.as_ref(), QUERY_WORKERS_PREFIX)
+    let after = worker_records(store.as_ref()).await;
+    assert_eq!(
+        after.len(),
+        1,
+        "shutdown must leave exactly this process's record in place, found: {after:?}"
+    );
+    assert_eq!(
+        after[0].started_unix_ns, DRAINED_STAMP_NS,
+        "shutdown must overwrite the record with the drained stamp, found: {after:?}"
+    );
+
+    let reader = sibling_reader();
+    let live = reader
+        .live_set(store.as_ref(), now_ns())
         .await
-        .expect("list worker records after shutdown");
+        .expect("sibling live_set");
     assert!(
-        after.is_empty(),
-        "shutdown must delete this process's heartbeat record, found: {after:?}"
+        live.iter().all(|r| r.process_id != after[0].process_id),
+        "a sibling's live set must leave the drained record out, got: {live:?}"
+    );
+    assert_eq!(
+        live.len(),
+        1,
+        "a sibling's live set must hold only the sibling itself, got: {live:?}"
     );
 }
 
@@ -762,15 +806,15 @@ async fn ingest_flush_is_attempted_before_the_listener_join() {
     shutdown.abort();
 }
 
-/// The ADR-0071 heartbeat record must be deleted BEFORE the listeners close, so
-/// a sibling coordinator drops this worker from its live set while the fragment
-/// listener is still up, instead of routing a fragment to a socket about to
-/// disappear mid-join. With a non-zero settle interval the delete (run
-/// concurrently with the settle wait) lands while the listeners are still open:
-/// a probe issued mid-shutdown observes the record already gone AND a listener
+/// The ADR-0071 heartbeat record must be stamped drained BEFORE the listeners
+/// close, so a sibling coordinator drops this worker from its live set while the
+/// fragment listener is still up, instead of routing a fragment to a socket
+/// about to disappear mid-join. With a non-zero settle interval the drain write
+/// (run concurrently with the settle wait) lands while the listeners are still
+/// open: a probe issued mid-shutdown observes the drained stamp AND a listener
 /// still serving.
 #[tokio::test]
-async fn heartbeat_record_is_deleted_while_a_listener_still_serves() {
+async fn heartbeat_record_is_stamped_drained_while_a_listener_still_serves() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let running = start_server_configured(
         store.clone(),
@@ -786,16 +830,23 @@ async fn heartbeat_record_is_deleted_while_a_listener_still_serves() {
     // Drive shutdown from a background task so the assertion can run mid-drain.
     let shutdown = tokio::spawn(async move { running.shutdown().await });
 
-    // During the settle window observe the record already gone while a listener
-    // (`/healthz` liveness, independent of drain) still accepts. Empty implies
-    // deleted: the record was present above, and only shutdown removes it.
+    // During the settle window observe the drained stamp while a listener
+    // (`/healthz` liveness, independent of drain) still accepts. Only shutdown
+    // writes that stamp; every heartbeat tick writes a clock reading.
     let probe = reqwest::Client::new();
+    let reader = sibling_reader();
     let mut observed = false;
     for _ in 0..200 {
-        let records = list_all(store.as_ref(), QUERY_WORKERS_PREFIX)
-            .await
-            .expect("list worker records mid-shutdown");
-        if records.is_empty()
+        let records = worker_records(store.as_ref()).await;
+        let drained = records.len() == 1 && records[0].started_unix_ns == DRAINED_STAMP_NS;
+        let left_live_set = drained
+            && reader
+                .live_set(store.as_ref(), now_ns())
+                .await
+                .expect("sibling live_set mid-shutdown")
+                .iter()
+                .all(|r| r.process_id != records[0].process_id);
+        if left_live_set
             && let Ok(resp) = probe.get(format!("{base}/healthz")).send().await
             && resp.status().as_u16() == 200
         {
@@ -812,35 +863,38 @@ async fn heartbeat_record_is_deleted_while_a_listener_still_serves() {
 
     assert!(
         observed,
-        "the heartbeat record must be deleted while a listener is still serving"
+        "the heartbeat record must be stamped drained, and out of a sibling's live set, while \
+         a listener is still serving"
     );
 }
 
 /// The heartbeat stop is BOUNDED, so an object store that never answers the
-/// worker-record DELETE cannot hold the process past its grace period with the
-/// ingest buffers still unflushed.
+/// worker-record drain PUT cannot hold the process past its grace period with
+/// the ingest buffers still unflushed.
 ///
 /// That stop sits ahead of the `--shutdown-timeout`-bounded drain block by
-/// necessity: the delete has to be attempted while the listeners still serve.
+/// necessity: the drain write has to land while the listeners still serve.
 /// Unbounded there, it awaits a loop whose last step is
-/// `ObjectStoreBackend::delete`, which takes no deadline at all, so an
-/// unreachable store parks the whole shutdown in it -- the exact issue #1291
-/// failure, reintroduced in the distributed-query mode.
+/// `QueryWorkers::mark_drained`, an `ObjectStoreBackend::put` that takes no
+/// deadline at all, so an unreachable store parks the whole shutdown in it --
+/// the exact issue #1291 failure, reintroduced in the distributed-query mode.
 ///
-/// A `FaultStore` hold gate on the worker-record DELETE is what makes the
-/// difference observable. `MemoryStore` cannot: its DELETE always answers
+/// A `FaultStore` hold gate on the worker-record PUT is what makes the
+/// difference observable. `MemoryStore` cannot: its PUT always answers
 /// immediately, so
-/// [`heartbeat_worker_record_is_deleted_on_shutdown`] passes either way and is
-/// not coverage for this. With the bound in place `shutdown` returns; without
-/// it, it never returns and the outer `timeout` below is what reports it.
+/// [`heartbeat_worker_record_is_stamped_drained_on_shutdown`] passes either way
+/// and is not coverage for this. With the bound in place `shutdown` returns;
+/// without it, it never returns and the outer `timeout` below is what reports
+/// it.
 #[tokio::test]
-async fn shutdown_returns_when_the_heartbeat_delete_never_answers() {
+async fn shutdown_returns_when_the_heartbeat_drain_write_never_answers() {
     /// Small, so the heartbeat stop's tenth-of-budget slice is short; large
-    /// enough that the slice still comfortably covers entering the DELETE.
+    /// enough that the slice still comfortably covers entering the drain PUT.
     const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-    /// Above `SHUTDOWN_TIMEOUT` plus that slice with wide margin, and far below
-    /// the ~200s a deadline-less S3 DELETE retries for, so which bound ended
-    /// the shutdown is unambiguous.
+    /// Above `SHUTDOWN_TIMEOUT` plus that slice with wide margin, far below the
+    /// ~200s a deadline-less S3 PUT retries for, so which bound ended the
+    /// shutdown is unambiguous, and well inside the 60s heartbeat interval
+    /// (`QueryWorkers::with_defaults`), so no tick PUT lands in the gate.
     const OUTER_BOUND: Duration = Duration::from_secs(30);
 
     let faults = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
@@ -855,49 +909,61 @@ async fn shutdown_returns_when_the_heartbeat_delete_never_answers() {
 
     await_heartbeat_record(store.as_ref()).await;
 
-    // Armed only now: no worker-record DELETE happens before shutdown, so this
-    // gate can hold exactly one call, the one the heartbeat stop makes.
+    let before = worker_records(store.as_ref()).await;
+    assert_eq!(
+        before.len(),
+        1,
+        "one live record before shutdown: {before:?}"
+    );
+    assert_ne!(
+        before[0].started_unix_ns, DRAINED_STAMP_NS,
+        "the record must be a live tick before shutdown"
+    );
+    let own_key = format!("{QUERY_WORKERS_PREFIX}{}", before[0].process_id);
+
+    // Armed only after the first tick's PUT has landed, and the next tick is a
+    // full heartbeat interval away, so this gate can hold exactly one call: the
+    // drain PUT the heartbeat stop makes.
     let gate = faults.hold(
-        Op::Delete,
+        Op::Put,
         Some(QUERY_WORKERS_PREFIX.to_string()),
         Occurrence::Always,
     );
 
     let shutdown = tokio::spawn(async move { running.shutdown().await });
 
-    // Park until the DELETE is genuinely held, so the bound below is measured
+    // Park until the PUT is genuinely held, so the bound below is measured
     // against a stuck store rather than against a race with the heartbeat loop.
     tokio::time::timeout(OUTER_BOUND, gate.wait_until_held(1))
         .await
-        .expect("the heartbeat stop must reach its worker-record DELETE");
+        .expect("the heartbeat stop must reach its worker-record drain PUT");
     let held = gate.held_details();
     assert_eq!(
         held.len(),
         1,
-        "exactly one call may be held: the worker-record DELETE, got: {held:?}"
+        "exactly one call may be held: the worker-record drain PUT, got: {held:?}"
     );
-    assert_eq!(held[0].1, Op::Delete, "the held call must be the DELETE");
-    assert!(
-        held[0].2.starts_with(QUERY_WORKERS_PREFIX),
-        "the held DELETE must be this process's worker record, got: {}",
-        held[0].2
+    assert_eq!(held[0].1, Op::Put, "the held call must be the PUT");
+    assert_eq!(
+        held[0].2, own_key,
+        "the held PUT must be this process's worker record"
     );
 
     tokio::time::timeout(OUTER_BOUND, shutdown)
         .await
         .expect(
             "shutdown must return on the heartbeat stop's own bound; waiting past this means the \
-             stop is unbounded and a deadline-less store DELETE holds the drain",
+             stop is unbounded and a deadline-less store PUT holds the drain",
         )
         .expect("the shutdown task joins")
         .expect("a heartbeat stop cut off by its bound is a warning, not a shutdown error");
 
-    // The DELETE is still held: the bound detached the heartbeat task rather
-    // than cancelling the call. Release it so the task can finish.
+    // The PUT is still held: the bound detached the heartbeat task rather than
+    // cancelling the call. Release it so the task can finish.
     assert_eq!(
         gate.held_count(),
         1,
-        "the abandoned DELETE must still be in flight, not cancelled"
+        "the abandoned drain PUT must still be in flight, not cancelled"
     );
     for id in gate.held() {
         assert!(gate.release(id), "releasing a held call must succeed");
