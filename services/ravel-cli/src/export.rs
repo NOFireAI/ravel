@@ -114,12 +114,32 @@
 //! load produced by coercing the typed cell; each mapped attribute is written
 //! as the value of its declared type that coerces back to the stored string,
 //! and a stored string no such value produces (`"007"` under `i64`) is
-//! refused by name. A `[spans]` mapping has no `attrs_map_column`, so only
-//! the mapped fields are written: the reserved attributes holding a span's
-//! kind, trace state, flags, events and links, any stored attribute the
-//! mapping does not name, and a parent id, status code or status message the
-//! mapping has no column for, are not, and the report counts the spans that
-//! carried one ([`SpansExportReport::spans_with_unwritten_data`]).
+//! refused by name. The check runs the load's own coercion,
+//! `crate::load::span_attr_string`, over each candidate, so the two cannot
+//! disagree. With `attrs_map_column` set, every stored attribute the mapping
+//! does not name, reserved keys aside, is written as stored into that one
+//! `Map<Utf8, Utf8>` column, which a load reads back into the span's
+//! attributes, up to the load's per-span cap below.
+//!
+//! What a spans export does not write, the one list every other description
+//! of it points to:
+//!
+//! - the reserved attributes holding a span's kind, trace state, flags,
+//!   events and links, which no mapping key can name;
+//! - any stored attribute the mapping does not name, when `attrs_map_column`
+//!   is unset;
+//! - with `attrs_map_column` set, the map entries past the load's per-span
+//!   cap: a load refuses a row whose `[[spans.attribute]]` values and map
+//!   entries together exceed
+//!   [`LOADER_MAX_ATTRIBUTES_PER_RECORD`](crate::load::LOADER_MAX_ATTRIBUTES_PER_RECORD),
+//!   so the map holds at most that cap less the row's written
+//!   `[[spans.attribute]]` values, the entries kept being the first in
+//!   ascending byte order of key;
+//! - a parent id, a status code other than Unset, or a status message, when
+//!   the mapping omits that optional column.
+//!
+//! A span carrying one is written without it rather than refused, and
+//! [`SpansExportReport::spans_with_unwritten_data`] counts those spans.
 
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -139,7 +159,7 @@ use ravel_logseg::{AttrValue, LogRecord, LogStreamId};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::IngestLimits;
 use ravel_otlp::normalize::prometheus_family_name;
-use ravel_otlp::promcompat::format_float;
+use ravel_otlp::traces_normalize::is_reserved_key;
 use ravel_query::erasure::{
     is_erased_span, retain_histogram_series, retain_series_soa, retain_unerased_log_records,
     snapshot_pending_erasure_predicates,
@@ -152,7 +172,8 @@ use ravel_types::accounting::QueryAccounting;
 use ravel_types::{LabelSet, METRIC_NAME_LABEL, SeriesId, Signal, TenantHash, TenantId, TimeRange};
 
 use crate::load::{
-    AttrMap, ColType, Mapping, MetricsMapping, SpansMapping, TsUnit, normalized_family_name,
+    AttrMap, ColType, LOADER_MAX_ATTRIBUTES_PER_RECORD, Mapping, MetricsMapping, SpansMapping,
+    TsUnit, normalized_family_name, span_attr_string,
 };
 use crate::maintain::SignalArg;
 use crate::store::{StoreSelection, require_tenant_data_present};
@@ -219,13 +240,8 @@ pub struct SpansExportReport {
     /// Pending selective-erasure predicates applied to this read.
     pub erasure_predicates: usize,
     /// Written spans that carried at least one stored value the file does not
-    /// carry: an attribute under a reserved key holding a span field the
-    /// `[spans]` mapping cannot name (kind, trace state, flags, events,
-    /// links) or under a key the mapping does not name, a parent id when the
-    /// mapping has no `parent_span_id_column`, a status code other than Unset
-    /// when it has no `status_code_column`, or a status message when it has
-    /// no `status_message_column`. A load of the file gives those spans
-    /// without them.
+    /// carry, from the list in the [module documentation](crate::export); a
+    /// load of the file gives those spans without it.
     pub spans_with_unwritten_data: u64,
 }
 
@@ -1176,10 +1192,9 @@ fn build_metrics_batch(
 /// a span in the window would not re-load as stored under `mapping` (see the
 /// module documentation): a timestamp that is not a whole number of its
 /// declared unit, a start a load would re-time or refuse, or a mapped
-/// attribute whose stored string the declared type does not read back. The
-/// attributes the mapping cannot or does not name, and a parent id, status
-/// code or status message the mapping has no column for, are not written and
-/// are counted, not refused.
+/// attribute whose stored string the declared type does not read back. What
+/// the file cannot carry is written without, not refused, and counted in
+/// [`SpansExportReport::spans_with_unwritten_data`].
 #[allow(clippy::too_many_arguments)]
 pub async fn export_spans(
     store: Arc<dyn ObjectStoreBackend>,
@@ -1244,7 +1259,7 @@ pub async fn export_spans(
     spans.sort_by_key(|span| (span.start_ts_ns, span.trace_id, span.span_id));
 
     let rows = span_output_rows(mapping, &spans)?;
-    let spans_with_unwritten_data = spans_with_unwritten_data(mapping, &spans);
+    let spans_with_unwritten_data = spans_with_unwritten_data(mapping, &rows);
     let empty = build_spans_batch(mapping, &[])?;
     let rows_written = write_output(out, empty.schema(), |writer| {
         let mut rows_written = 0u64;
@@ -1267,16 +1282,13 @@ pub async fn export_spans(
     })
 }
 
-/// How many of `spans` carry a stored value [`build_spans_batch`] does not
-/// write under `mapping`: an attribute no mapped attribute names, or a
-/// parent id, non-Unset status code or status message whose column the
-/// mapping omits.
-fn spans_with_unwritten_data(mapping: &SpansMapping, spans: &[SpanRecord]) -> u64 {
-    let mapped: BTreeSet<&str> = span_mapped_attributes(mapping)
-        .map(|spec| spec.key.as_str())
-        .collect();
+/// How many of `rows` carry a stored value [`build_spans_batch`] does not
+/// write under `mapping`, from the list in this module's doc.
+fn spans_with_unwritten_data(mapping: &SpansMapping, rows: &[SpanOutRow<'_>]) -> u64 {
+    let mapped = span_mapped_keys(mapping);
     let mut unwritten = 0u64;
-    for span in spans {
+    for row in rows {
+        let span = row.span;
         let lost_parent = mapping.parent_span_id_column.is_none() && span.parent_span_id.is_some();
         let lost_status =
             mapping.status_code_column.is_none() && span.status_code != StatusCode::Unset;
@@ -1285,11 +1297,11 @@ fn spans_with_unwritten_data(mapping: &SpansMapping, spans: &[SpanRecord]) -> u6
                 .status_message
                 .as_deref()
                 .is_some_and(|message| !message.is_empty());
-        let lost_attribute = span
-            .attrs
-            .iter()
-            .any(|(key, _)| !mapped.contains(key.as_str()));
-        if lost_parent || lost_status || lost_message || lost_attribute {
+        let lost_attribute = span.attrs.iter().any(|(key, _)| {
+            !mapped.contains(key.as_str())
+                && (mapping.attrs_map_column.is_none() || is_reserved_key(key))
+        });
+        if lost_parent || lost_status || lost_message || lost_attribute || row.map_truncated {
             unwritten += 1;
         }
     }
@@ -1322,6 +1334,11 @@ impl SpanRefusals {
 struct SpanOutRow<'a> {
     span: &'a SpanRecord,
     attrs: Vec<Option<AttrValue>>,
+    /// The `attrs_map_column` entries, from [`span_map_entries`]; empty when
+    /// the mapping sets no map column.
+    map: Vec<(&'a str, &'a str)>,
+    /// Whether the load's per-span attribute cap left map entries out.
+    map_truncated: bool,
 }
 
 /// Every mapped attribute, in the order [`SpanOutRow::attrs`] holds them.
@@ -1332,12 +1349,20 @@ fn span_mapped_attributes(mapping: &SpansMapping) -> impl Iterator<Item = &AttrM
         .chain(&mapping.attributes)
 }
 
+/// The attribute keys the mapping gives a column of their own.
+fn span_mapped_keys(mapping: &SpansMapping) -> BTreeSet<&str> {
+    span_mapped_attributes(mapping)
+        .map(|spec| spec.key.as_str())
+        .collect()
+}
+
 /// Checks every span in output order against what a load reads back, and
 /// returns the rows to write, or the refusal for the first kind any span hit.
 fn span_output_rows<'a>(
     mapping: &SpansMapping,
     spans: &'a [SpanRecord],
 ) -> anyhow::Result<Vec<SpanOutRow<'a>>> {
+    let mapped = span_mapped_keys(mapping);
     let mut refusals = SpanRefusals::default();
     let mut rows = Vec::with_capacity(spans.len());
     for (position, span) in spans.iter().enumerate() {
@@ -1376,7 +1401,7 @@ fn span_output_rows<'a>(
             let value = match stored {
                 None => None,
                 Some(stored) => {
-                    let typed = typed_span_attr(stored, spec.value_type);
+                    let typed = typed_span_attr(&spec.key, stored, spec.value_type);
                     if typed.is_none() {
                         refusals.add(
                             SpanRefusal::UnwritableAttribute,
@@ -1398,10 +1423,52 @@ fn span_output_rows<'a>(
             };
             attrs.push(value);
         }
-        rows.push(SpanOutRow { span, attrs });
+        let (map, map_truncated) = match mapping.attrs_map_column {
+            None => (Vec::new(), false),
+            Some(_) => {
+                let written_span_attributes = attrs[mapping.resource_attributes.len()..]
+                    .iter()
+                    .filter(|value| value.is_some())
+                    .count();
+                span_map_entries(&mapped, span, written_span_attributes)
+            }
+        };
+        rows.push(SpanOutRow {
+            span,
+            attrs,
+            map,
+            map_truncated,
+        });
     }
     refusals.into_result()?;
     Ok(rows)
+}
+
+/// The `attrs_map_column` entries a load of the file reads back into `span`,
+/// and whether any stored attribute that belongs in the map was left out.
+///
+/// The candidates are the stored attributes no mapped column names, reserved
+/// keys aside. A spans load refuses a row whose `[[spans.attribute]]` values
+/// and map entries together exceed [`LOADER_MAX_ATTRIBUTES_PER_RECORD`]
+/// (`resource_attribute` values do not count), so the map holds at most that
+/// cap less `written_span_attributes`: the candidates sorted by key in
+/// ascending byte order, and the first that many of them.
+fn span_map_entries<'a>(
+    mapped: &BTreeSet<&str>,
+    span: &'a SpanRecord,
+    written_span_attributes: usize,
+) -> (Vec<(&'a str, &'a str)>, bool) {
+    let mut entries: Vec<(&str, &str)> = span
+        .attrs
+        .iter()
+        .filter(|(key, _)| !mapped.contains(key.as_str()) && !is_reserved_key(key))
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    entries.sort_unstable();
+    let room = LOADER_MAX_ATTRIBUTES_PER_RECORD.saturating_sub(written_span_attributes);
+    let truncated = entries.len() > room;
+    entries.truncate(room);
+    (entries, truncated)
 }
 
 fn sub_unit_span_message(span: &SpanRecord, field: &str, ts_ns: i64, unit: TsUnit) -> String {
@@ -1427,34 +1494,21 @@ fn describe_span(span: &SpanRecord) -> String {
 /// The value of declared type `ty` whose load-side string coercion is exactly
 /// `stored`, or `None` when there is none.
 ///
-/// RSPAN stores every attribute as a string, and a spans load coerces a typed
-/// cell to one by `ravel_otlp`'s own mapping: a bool and an integer take their
-/// canonical string form, a float goes through `format_float`, and bytes
-/// become lowercase hex. The candidate is parsed from `stored` and kept only
-/// when that coercion gives `stored` back, so `"007"` is not an `i64` and
-/// `"ABCD"` is not `bytes`.
-fn typed_span_attr(stored: &str, ty: ColType) -> Option<AttrValue> {
-    let (value, reloaded) = match ty {
-        ColType::Str => return Some(AttrValue::Str(stored.to_string())),
-        ColType::I64 => {
-            let v: i64 = stored.parse().ok()?;
-            (AttrValue::I64(v), v.to_string())
-        }
-        ColType::F64 => {
-            let v: f64 = stored.parse().ok()?;
-            (AttrValue::F64(v), format_float(v))
-        }
-        ColType::Bool => {
-            let v: bool = stored.parse().ok()?;
-            (AttrValue::Bool(v), v.to_string())
-        }
-        ColType::Bytes => {
-            let v = hex::decode(stored).ok()?;
-            let reloaded = hex::encode(&v);
-            (AttrValue::Bytes(v), reloaded)
-        }
+/// RSPAN stores every attribute as a string, which a spans load produced with
+/// [`span_attr_string`]. The candidate is only parsed from `stored` here, and
+/// kept when that same function turns it back into `stored`, so `"007"` is not
+/// an `i64` and `"ABCD"` is not `bytes`, and the export cannot write a value
+/// the load would store differently.
+fn typed_span_attr(key: &str, stored: &str, ty: ColType) -> Option<AttrValue> {
+    let candidate = match ty {
+        ColType::Str => AttrValue::Str(stored.to_string()),
+        ColType::I64 => AttrValue::I64(stored.parse().ok()?),
+        ColType::F64 => AttrValue::F64(stored.parse().ok()?),
+        ColType::Bool => AttrValue::Bool(stored.parse().ok()?),
+        ColType::Bytes => AttrValue::Bytes(hex::decode(stored).ok()?),
     };
-    (reloaded == stored).then_some(value)
+    let reloaded = span_attr_string(key, &candidate).ok()?;
+    (reloaded == stored).then_some(candidate)
 }
 
 /// The mapping's spelling of a declared attribute type.
@@ -1482,7 +1536,8 @@ fn check_spans_output_columns(mapping: &SpansMapping) -> anyhow::Result<()> {
             ])
             .chain(&mapping.status_code_column)
             .chain(&mapping.status_message_column)
-            .chain(span_mapped_attributes(mapping).map(|spec| &spec.column)),
+            .chain(span_mapped_attributes(mapping).map(|spec| &spec.column))
+            .chain(&mapping.attrs_map_column),
     )
 }
 
@@ -1566,6 +1621,19 @@ fn build_spans_batch(
             column.push(&spec.key, row.attrs.get(i).and_then(Option::as_ref))?;
         }
         columns.push((spec.column.clone(), column.finish()));
+    }
+
+    if let Some(name) = &mapping.attrs_map_column {
+        let mut map = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        for row in rows {
+            for (key, value) in &row.map {
+                map.keys().append_value(key);
+                map.values().append_value(value);
+            }
+            map.append(true)
+                .context("failed to build the attrs map column")?;
+        }
+        columns.push((name.clone(), Arc::new(map.finish())));
     }
 
     // Declared nullable explicitly, for the reason `build_batch` gives.
@@ -2448,5 +2516,107 @@ mod tests {
              writing it in millis would move it onto a different timestamp. Export with a finer \
              start_ts_unit."
         );
+    }
+
+    /// For every declared attribute type, the value a spans export writes for
+    /// a stored string coerces back through the load's own helper to exactly
+    /// that string, and a string no value of the type reproduces is not
+    /// written. The cases sit where two copies of the coercion could disagree:
+    /// signed zero, float extremes and exponent forms, the i64 bounds,
+    /// uppercase hex the load would lowercase, and the empty string.
+    #[test]
+    fn a_written_span_attribute_coerces_back_to_its_stored_string_or_is_not_written() {
+        let f64_max = f64::MAX.to_string();
+        let f64_lowest = f64::MIN.to_string();
+        let f64_min_positive = f64::MIN_POSITIVE.to_string();
+        let f64_subnormal = f64::from_bits(1).to_string();
+        let cases: Vec<(ColType, &str, bool)> = vec![
+            (ColType::Str, "", true),
+            (ColType::Str, "007", true),
+            (ColType::Str, "DEADBEEF", true),
+            (ColType::Str, "-0", true),
+            (ColType::I64, "0", true),
+            (ColType::I64, "-1", true),
+            (ColType::I64, "9223372036854775807", true),
+            (ColType::I64, "-9223372036854775808", true),
+            (ColType::I64, "9223372036854775808", false),
+            (ColType::I64, "-9223372036854775809", false),
+            (ColType::I64, "007", false),
+            (ColType::I64, "+1", false),
+            (ColType::I64, "-0", false),
+            (ColType::I64, "1.0", false),
+            (ColType::I64, " 1", false),
+            (ColType::I64, "", false),
+            (ColType::F64, "0", true),
+            (ColType::F64, "-0", true),
+            (ColType::F64, "0.1", true),
+            (ColType::F64, "-2.5", true),
+            (ColType::F64, "+Inf", true),
+            (ColType::F64, "-Inf", true),
+            (ColType::F64, "NaN", true),
+            (ColType::F64, "1000000000000000000000", true),
+            (ColType::F64, "0.000000000000000000001", true),
+            (ColType::F64, &f64_max, true),
+            (ColType::F64, &f64_lowest, true),
+            (ColType::F64, &f64_min_positive, true),
+            (ColType::F64, &f64_subnormal, true),
+            (ColType::F64, "1e21", false),
+            (ColType::F64, "1E5", false),
+            (ColType::F64, "1.0", false),
+            (ColType::F64, "-0.0", false),
+            (ColType::F64, "+0", false),
+            (ColType::F64, "0.10", false),
+            (ColType::F64, "inf", false),
+            (ColType::F64, "Infinity", false),
+            (ColType::F64, "nan", false),
+            (ColType::F64, "", false),
+            (ColType::Bool, "true", true),
+            (ColType::Bool, "false", true),
+            (ColType::Bool, "True", false),
+            (ColType::Bool, "TRUE", false),
+            (ColType::Bool, "1", false),
+            (ColType::Bool, "", false),
+            (ColType::Bytes, "", true),
+            (ColType::Bytes, "00", true),
+            (ColType::Bytes, "deadbeef", true),
+            (ColType::Bytes, "0123456789abcdef", true),
+            (ColType::Bytes, "DEADBEEF", false),
+            (ColType::Bytes, "DeadBeef", false),
+            (ColType::Bytes, "abc", false),
+            (ColType::Bytes, "0x00", false),
+            (ColType::Bytes, "zz", false),
+        ];
+        for (ty, stored, written) in cases {
+            match typed_span_attr("k", stored, ty) {
+                Some(value) => {
+                    assert!(
+                        written,
+                        "{ty:?} {stored:?} has no value that reloads as it, but the export \
+                         would write {value:?}"
+                    );
+                    assert!(
+                        matches!(
+                            (&value, ty),
+                            (AttrValue::Str(_), ColType::Str)
+                                | (AttrValue::I64(_), ColType::I64)
+                                | (AttrValue::F64(_), ColType::F64)
+                                | (AttrValue::Bool(_), ColType::Bool)
+                                | (AttrValue::Bytes(_), ColType::Bytes)
+                        ),
+                        "{ty:?} {stored:?} is written as {value:?}"
+                    );
+                    assert_eq!(
+                        span_attr_string("k", &value).as_deref(),
+                        Ok(stored),
+                        "{ty:?}: the export writes {value:?} for {stored:?}, which the load \
+                         stores as a different string"
+                    );
+                }
+                None => assert!(
+                    !written,
+                    "{ty:?} {stored:?} reloads from a {ty:?} value, but the export writes none"
+                ),
+            }
+        }
     }
 }
