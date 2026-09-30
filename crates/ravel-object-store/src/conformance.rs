@@ -455,9 +455,10 @@ pub fn bucket_config_alarms(probe: &BucketConfigProbe) -> Vec<String> {
     }
     // REQUIRED (#864): the abort-incomplete-multipart rule (ADR-0064 §7 point 3;
     // also converts S5-19's undocumented dependency into a documented one).
-    // Emitted under NOTE rather than ALARM only because no vendor API this crate
-    // calls can observe the rule, so the probe cannot establish compliance
-    // either way. The prefix reflects the probe's limits, not a weaker rule.
+    // Emitted under NOTE rather than ALARM because only the concrete S3Store's
+    // control plane can observe the rule; through the dyn path the probe cannot
+    // establish compliance either way. The prefix reflects the probe's limits,
+    // not a weaker rule.
     match &probe.abort_incomplete_multipart_upload {
         LifecycleRuleStatus::Absent => alarms.push(
             "NOTE: the REQUIRED AbortIncompleteMultipartUpload lifecycle rule (7 days or \
@@ -483,7 +484,8 @@ pub fn bucket_config_alarms(probe: &BucketConfigProbe) -> Vec<String> {
 /// [`ObjectLockProbeSource`] is: a real bucket-policy capability belongs to its
 /// own trait-extending ADR (ADR-0042 decision 3), and `object_store` 0.14 has
 /// no query for it. Every production backend reports `Unknown` through the dyn
-/// impl below; test fixtures implement it to represent compliant and
+/// impl below; `S3Store` implements it directly from its own control-plane
+/// reads, and test fixtures implement it to represent compliant and
 /// non-compliant buckets.
 #[async_trait::async_trait]
 pub trait BucketConfigProbeSource {
@@ -848,10 +850,11 @@ pub struct BucketProtectionParams {
     /// `delete-marker-replication` reports `Unknown`, never `Fail`, the same way
     /// `object-retention` does when retention is not sampled.
     pub expect_replication: bool,
-    /// Whether to sample objects for the `object-retention` condition. Off for
-    /// the server (retention is CLI-only, decision 5); the CLI turns it on with
-    /// `--expect-object-retention`. When off, `object-retention` reports
-    /// `Unknown`.
+    /// Whether to sample objects for the `object-retention` condition. No
+    /// shipping caller sets it: neither the server nor `ravel-cli store
+    /// verify-protection` checks object retention yet, since no sampling rule
+    /// tried so far reads a correctly configured bucket as passing. When off,
+    /// `object-retention` reports `Unknown`.
     pub sample_object_retention: bool,
     /// Protected-prefix families to sample one current and one noncurrent object
     /// from for the `object-retention` condition. Empty leaves the condition

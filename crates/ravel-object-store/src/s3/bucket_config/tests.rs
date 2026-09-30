@@ -1853,17 +1853,34 @@ fn retention(mode: &str, until: &str) -> FetchOutcome<RetentionConfig> {
     })
 }
 
+/// A locked recent object protects, an object carrying no retention at all
+/// does not, and a lapsed compliance lock is `Unknown`: its object is not a
+/// recent one, so it proves nothing either way about new writes.
 #[test]
-fn lapsed_retention_does_not_protect() {
+fn lapsed_retention_reads_unknown_and_missing_retention_reads_fail() {
     let now = KAT_UNIX_SECS;
     assert_eq!(
         retention_verdict(&retention("COMPLIANCE", "2030-01-01T00:00:00Z"), now, false),
         SampleVerdict::Protects
     );
-    assert!(matches!(
+    assert_eq!(
         retention_verdict(&retention("COMPLIANCE", "2012-01-01T00:00:00Z"), now, false),
-        SampleVerdict::NotProtecting(_)
-    ));
+        SampleVerdict::Unknown(
+            "compliance retention lapsed at 2012-01-01T00:00:00Z: the sampled object's retention \
+             has lapsed, so it is not a recent object and says nothing about the retention on \
+             new writes"
+                .to_string()
+        )
+    );
+    let unlocked = FetchOutcome::Absent(
+        "the object version carries no retention (NoSuchObjectLockConfiguration)".to_string(),
+    );
+    assert_eq!(
+        retention_verdict(&unlocked, now, false),
+        SampleVerdict::NotProtecting(
+            "the object version carries no retention (NoSuchObjectLockConfiguration)".to_string()
+        )
+    );
     assert!(matches!(
         retention_verdict(&retention("GOVERNANCE", "2030-01-01T00:00:00Z"), now, false),
         SampleVerdict::NotProtecting(_)
@@ -2996,9 +3013,10 @@ async fn retention_state(
     (state, seen)
 }
 
-/// A compliance lock whose RetainUntilDate has passed no longer protects.
+/// A compliance lock whose RetainUntilDate has passed leaves the condition
+/// `Unknown`, never `Fail`: the sampled object is not a recent one.
 #[tokio::test]
-async fn lapsed_retention_fails_object_retention_over_http() {
+async fn lapsed_retention_leaves_object_retention_unknown_over_http() {
     let respond = bucket(
         |_query| {
             listing_body(&[
@@ -3015,8 +3033,13 @@ async fn lapsed_retention_fails_object_retention_over_http() {
         },
     );
     let (state, _seen) = retention_state(respond, &["t/"]).await;
-    assert!(state.is_fail(), "{state:?}");
-    assert!(state.detail().contains("lapsed"), "{state:?}");
+    assert!(state.is_unknown(), "{state:?}");
+    assert!(
+        state
+            .detail()
+            .contains("the sampled object's retention has lapsed, so it is not a recent object"),
+        "{state:?}"
+    );
 }
 
 /// A family with no current version, or whose listing fails, is Unknown for

@@ -45,8 +45,9 @@ neither on the wire by default:
   `AmazonS3Builder::with_checksum_algorithm` (`s3.rs:805-812`), in which case
   S3 verifies-or-rejects the PUT and stores the checksum with the object. It
   defaults to `Off` (`s3.rs:280-284`, `:536`), no server flag sets it, and
-  production always builds the store with `S3HttpConfig::default()`
-  (`services/ravel-server/src/store.rs:409` via `with_metrics`, `s3.rs:638-639`).
+  production always builds the store with `S3HttpConfig::default()` (see the
+  2026-09-30 CLI amendment; `services/ravel-server/src/store.rs:409` via
+  `with_metrics`, `s3.rs:638-639`).
   With integrity on, multipart is excluded and a payload above the single-PUT
   ceiling is refused loudly (`s3.rs:1628-1646`).
 - The GET path passes `range` and `if_match` only (`get_one`,
@@ -346,3 +347,35 @@ floci backend rather than run an untested default; it is the only launcher
 that sets `off`. The store qualification Job the operator runs does not
 exercise the upload checksum, so a passing qualification says nothing about
 whether the endpoint accepts the header.
+(It now does: see the 2026-09-30 CLI amendment below.)
+
+## Amendment (2026-09-30): the CLI flags and the qualification Job carry the checksum settings
+
+<!-- amendment-applies: sections="Context|Amendment (2026-09-30): the server flags for upload integrity and the checksum request" pointer="2026-09-30 CLI amendment" -->
+<!-- amendment-supersedes: phrase="production always builds the store with" pointer="2026-09-30 CLI amendment" -->
+<!-- amendment-supersedes: phrase="whether the endpoint accepts the header" pointer="2026-09-30 CLI amendment" -->
+
+`ravel-cli` now takes the same two options as `ravel-server`, with the same
+names, environment variables and defaults: `--s3-upload-integrity`
+(`RAVEL_S3_UPLOAD_INTEGRITY`, default `crc64nvme`) and
+`--s3-request-stored-checksum` (`RAVEL_S3_REQUEST_STORED_CHECKSUM`, default
+`true`). Neither binary builds its primary production store with
+`S3HttpConfig::default()` any more. Two kinds of S3 store still do: the
+per-tenant stores `--tenant-kms-config` routes to
+(`crates/ravel-object-store/src/kms_routing.rs`, through
+`S3Store::with_metrics`; issue #2224), and the read-only external Parquet
+profile stores (`crates/ravel-object-store/src/external.rs`, through
+`S3Store::new`), which `ravel-cli` reaches from `parquet_grant.rs` and
+`ravel-sql` from its Parquet reads. The `request_stored_checksum` flag the
+2026-09-27 amendment assigned to follow-up task 2 now exists on both.
+
+`ravel-cli store qualify` builds its store with those options, so every
+conformance-suite PUT carries the selected checksum, and under `crc64nvme`
+with the stored checksum requested it runs decision 3's echo check: a probe
+PUT under `sys/qualify/`, read back whole, then deleted. A rejected PUT fails
+qualification. The operator's qualification Job always
+sets both environment variables from `spec.storage.s3.uploadIntegrity` and
+`spec.storage.s3.requestStoredChecksum`, unlike the server flags, which are
+rendered only away from the default, and both fields are inputs to the
+qualification hash, so editing either re-runs the Job. A passing
+qualification now shows the endpoint accepted the configured upload checksum.

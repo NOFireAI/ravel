@@ -631,8 +631,12 @@ with no transport checksum. The per-tenant stores `--tenant-kms-config`
 routes to are still built with the library default and apply neither flag.
 The
 library default stays `Off` for any other caller that builds an `S3Store`
-directly. `ravel-cli` still builds its store with the library default; its
-store selection flag is pending.
+directly. `ravel-cli` takes the same `--s3-upload-integrity` flag, default and
+environment variable, so `ravel-cli store qualify` PUTs with the checksum the
+servers will use and an endpoint that rejects the header fails qualification.
+The operator's store qualification Job always sets `RAVEL_S3_UPLOAD_INTEGRITY`
+from `spec.storage.s3.uploadIntegrity`, and a change to that field re-runs
+qualification.
 
 Two limits of `object_store` 0.14's `AmazonS3` client shape this. First, it
 exposes no per-request checksum hook and no way to attach a caller-supplied
@@ -720,8 +724,10 @@ endpoint returns no stored checksum, and every full-object read is served and
 counted unverified. It exists for an endpoint that rejects the header outright.
 `ravel-server` sets it with `--s3-request-stored-checksum` (default `true`;
 `--s3-request-stored-checksum=false` turns it off, environment variable
-`RAVEL_S3_REQUEST_STORED_CHECKSUM`), and the operator with
-`spec.storage.s3.requestStoredChecksum`. No `ravel-cli` flag sets it yet.
+`RAVEL_S3_REQUEST_STORED_CHECKSUM`), `ravel-cli` with the same flag, default
+and environment variable, and the operator with
+`spec.storage.s3.requestStoredChecksum`, which also reaches the store
+qualification Job.
 
 **A read with no verifiable checksum is served and counted, never refused**
 (decision 3). The count is `StoreMetricsSnapshot::get_unverified` (also
@@ -787,8 +793,8 @@ choice (AWS S3 and RustFS), CRC64-NVME needs a recent endpoint. RustFS accepts
 a CRC64-NVME PUT and returns the stored checksum on an unranged read (the
 contract lane above asserts both). The library default is `Off`, so an
 `S3Store` built directly reports `upload_checksum: false` unless a mode is
-configured; `ravel-server` configures `Crc64Nvme` unless told otherwise (see
-"Upload checksums").
+configured; `ravel-server` and `ravel-cli` configure `Crc64Nvme` unless told
+otherwise (see "Upload checksums").
 
 ### Credentials
 
@@ -1018,6 +1024,14 @@ JSON record to `sys/qualification` via `CreateIfAbsent`:
 }
 ```
 
+Against an S3 store it also runs the stored-checksum echo check before the
+record is written: under `--s3-upload-integrity crc64nvme` with the stored
+checksum requested, it PUTs a probe object under the run's scratch prefix,
+reads it back whole, and deletes it. A refused PUT or GET, or a returned
+checksum that does not match the body read, fails qualification and writes no
+record; an endpoint that returns no stored checksum is reported and does not
+fail it.
+
 `CreateIfAbsent` makes qualification once-per-bucket at a given suite version:
 a second `store qualify` run against a bucket already qualified under the
 current version leaves the existing record untouched and reports it instead of
@@ -1049,8 +1063,11 @@ small objects, so a run leaves `2 x max(page_size + 2, 5)` of them plus the
 14 the other probes leave (two conditional-write keys, five read-after-write,
 five list-after-write, one concurrent-create, and the delete probe's
 surviving key): 2018 objects at the default page size of 1000, against 24
-before the page size became a parameter. None are deleted
-afterward and each run's prefix is unique, so this is unbounded untracked
+before the page size became a parameter. The delete probe's second key and
+the stored-checksum echo probe's object are the only scratch objects a run
+deletes; the echo object stays too when its delete is refused, and the run
+prints a note naming it. Nothing else is deleted afterward and each run's
+prefix is unique, so this is unbounded untracked
 storage a runbook should sweep periodically (delete `sys/qualify/` between
 runs), not a correctness issue. A bucket qualified with a small
 `--list-page-size` writes proportionally fewer, but proves proportionally
@@ -1278,10 +1295,13 @@ adapter contract:
    period ends.
 
 Enforcement stays at the bucket/IAM layer (ADR-0042 decision 3): nothing
-in this crate can configure or verify Object Lock or lifecycle policy
-in-process, because `object_store` 0.14 exposes no such API and this crate
-never opens a second, direct-SDK side channel. What this crate *can* do is
-report what a backend affirmatively discloses, via
+in this crate can configure Object Lock or lifecycle policy, and
+`object_store` 0.14 exposes no API to read either. `S3Store` reads them
+itself, with read-only signed GETs of the bucket's `?versioning`,
+`?lifecycle` and `?object-lock` configuration (and `?replication` and
+per-object `?retention` when asked), using the store's own credentials and
+no second SDK. What this crate *can* do is report what a backend
+affirmatively discloses, via
 [`ObjectLockProbeSource`]/`probe_object_lock` and
 [`BucketConfigProbeSource`]/`probe_bucket_config` (see "Runtime
 qualification" above) plus `bucket_config_alarms`, which turns an observed
@@ -1289,15 +1309,21 @@ qualification" above) plus `bucket_config_alarms`, which turns an observed
 contract violation (point 1's versioning/expiration pairing) and
 `"NOTE:"`-prefixed strings where the probe cannot establish compliance. The
 multipart-abort rule is REQUIRED (point 3), so its absence is a contract
-violation and not an advisory gap; it is reported under `"NOTE:"` only because
-this crate calls no vendor API that can observe the rule, so the probe cannot
-determine compliance either way. The prefix reflects the limits of the probe,
-never a weaker requirement. Every production backend reports
-[`ObjectLockStatus::Unknown`] and every `BucketConfigProbe` field
-`Unknown` through these traits today, since there is no vendor API this crate
-calls to populate anything else, so today these probes are informational
-only, exactly as ADR-0055 §3 designed them, and their reporting stays
-that way regardless of the flag below.
+violation and not an advisory gap; it is reported under `"NOTE:"` because a
+backend reached through `ObjectStoreBackend` alone cannot observe the rule, and
+the same prefix is kept when `S3Store` does observe it. The prefix reflects
+the limits of the probe, never a weaker requirement.
+
+Which answer a caller gets depends on the type it probes. The
+`dyn ObjectStoreBackend` impls of these traits report
+[`ObjectLockStatus::Unknown`] and every `BucketConfigProbe` field `Unknown`,
+since the trait exposes no such query. `S3Store` implements them from the
+bucket reads above, so a caller holding the concrete store gets the bucket's
+real answers: `ravel-cli store qualify` and `ravel-cli store
+verify-protection` do. In `store qualify` the lines stay informational and
+never change whether qualification passes, exactly as ADR-0055 §3 designed
+them. `ravel-server` still probes through `dyn ObjectStoreBackend`, so its
+reporting and the startup gate below see `Unknown` for every backend.
 
 `ravel-server --require-bucket-protection` (ADR-0072 decision 3, default
 OFF, env `RAVEL_REQUIRE_BUCKET_PROTECTION`) turns the same probes into a
@@ -1307,9 +1333,10 @@ production silently unprotected:
 - `ObjectLockStatus::Disabled`, or a `bucket_config_alarms` `"ALARM:"`
   entry (the versioning-without-expiration misconfiguration), is fatal:
   the server refuses to start with a typed error.
-- `ObjectLockStatus::Unknown`, the case every backend reachable only
-  through `ObjectStoreBackend` reports today, since no adapter can
-  actually answer this query, logs one warning and sets the
+- `ObjectLockStatus::Unknown`, which is what the server sees today for
+  every backend, S3 included, because it probes through
+  `dyn ObjectStoreBackend` rather than the concrete `S3Store`, logs one
+  warning and sets the
   `ravel_bucket_protection_unknown` gauge to `1`, so a fleet can alarm on
   it without being blocked by it.
 - `ObjectLockStatus::Enabled` with no alarms starts clean, gauge at `0`.

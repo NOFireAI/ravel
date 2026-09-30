@@ -53,12 +53,43 @@ guarantees Ravel's durability depends on. `--store memory` is exempt and never
 needs qualification.
 
 `store qualify` writes transient scratch objects under `sys/qualify/<run-id>/`
-while it runs its suite, not only the final record. The Admin policy grants no
-delete anywhere, so that scratch is never cleaned up by the credential itself.
-It is bounded per run, but not small: the two listing probes write two keys
+while it runs its suite, not only the final record. The Admin policy's one
+delete grant, `AdminQualifyDelete`, covers `sys/qualify/*` only, so the
+checksum echo probe below can remove its own object; the suite itself leaves
+its scratch in place. It is bounded per run, but not small: the two listing probes write two keys
 more than the declared page size each, so a run at the default page size
 leaves about two thousand small objects, and repeated runs against the same
 bucket accumulate them. Sweep the prefix from a runbook when it matters.
+
+Against `--store s3`, `store qualify` also prints the bucket's Object Lock,
+versioning and lifecycle state read from the bucket itself, as informational
+lines that never fail the run, and one stored-checksum line. That check PUTs a
+probe object with the `--s3-upload-integrity` checksum, reads it back whole
+with the stored checksum requested, and says what the endpoint did:
+
+- `verified`: the endpoint returned a stored checksum (CRC-64/NVME or
+  CRC-32C), and the same algorithm computed over the body read matched it.
+  The returned value is not compared with the one the PUT sent, so a CRC-32C
+  the endpoint computed itself also reads as `verified`.
+- `not returned`: the endpoint returned none, so every whole-object read in
+  production is served and counted unverified.
+- `not checked (...)`: the check did not run, with the reason: upload
+  integrity `off`, `sha256` (whose stored checksum is not recomputed on read),
+  `--s3-request-stored-checksum=false`, or a store other than S3.
+- `FAIL`: the endpoint returned a stored checksum that does not match the
+  same algorithm computed over the body read, or the probe PUT or GET failed.
+  Qualification fails and nothing is recorded.
+
+The probe object sits under `sys/qualify/<run-id>/` and is deleted afterwards.
+On a versioned bucket that delete only adds a delete marker: the probe's
+object version stays under `sys/qualify/` as a noncurrent version. If the
+credential cannot delete it, a `note:` line
+names the object left in place and the outcome stands.
+
+`store qualify --list-page-size` builds the S3 store with the page size and
+the selected checksum settings together, so a small page size (the weekly
+disaster recovery rehearsal runs `--list-page-size 2`) still checksums every
+PUT.
 
 ## The bucket protection contract
 
@@ -128,6 +159,13 @@ starts without the gate. The Kubernetes operator sets it unconditionally for
 every cluster it reconciles: the custom resource carries no development or
 staging profile field to gate on.
 
+`ravel-cli store verify-protection --expected-noncurrent-days <E_v>` checks
+the whole bucket half of the contract against an S3 bucket's own
+configuration and exits `0` only when every expected condition passes, `1`
+when any fails, and `2` when any could not be verified. Schedule it;
+[running the checklist with ravel-cli](../disaster-recovery.md#running-the-checklist-with-ravel-cli)
+describes its flags, output, and the read-only permissions it needs.
+
 ## The first deployment against a fresh bucket
 
 Two control objects are created on the first authorized contact with an
@@ -178,10 +216,10 @@ operator credential rather than a service credential:
 - It is used only by out-of-band operator and CI invocations: `store qualify`,
   `gc-config set`, `provision adopt`, legal holds, and the read-only inspection
   subcommands. No continuously running process should hold it.
-- Even Admin cannot delete any of the protected prefixes, and it cannot delete
-  anything else either, because it has no delete grant at all. A leaked Admin
-  key can forge or overwrite control objects within its write grant, but it
-  cannot make existing data disappear.
+- Even Admin cannot delete any of the protected prefixes, and its one delete
+  grant, `AdminQualifyDelete`, covers only the `sys/qualify/*` scratch that
+  `store qualify` writes. A leaked Admin key can forge or overwrite control
+  objects within its write grant, but it cannot make existing data disappear.
 
 ## Readiness and the store reachability probe
 

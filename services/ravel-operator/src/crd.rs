@@ -196,11 +196,12 @@ pub struct S3Spec {
     /// `off`. The endpoint verifies each upload against it and stores it so
     /// a full-object read can be verified. Set `off` only for an endpoint that
     /// rejects the checksum header, which fails every PUT from the first flush.
-    /// Applies to the rendered server containers and to the operator's own S3
-    /// client. The flag is rendered only when it differs from the default,
-    /// which the server applies on its own. The store qualification Job does
-    /// not exercise it, so a passing qualification does not show that the
-    /// endpoint accepts the checksum header.
+    /// Applies to the rendered server containers, the store qualification
+    /// Job, and the operator's own S3 client. The server flag is rendered only
+    /// when it differs from the default, which the server applies on its own.
+    /// The qualification Job PUTs with the same checksum, so an endpoint that
+    /// rejects the header fails qualification, and changing this field
+    /// re-runs it.
     #[serde(default)]
     pub upload_integrity: S3UploadIntegrity,
 
@@ -208,8 +209,10 @@ pub struct S3Spec {
     /// full-object read is verified before it is served
     /// (`--s3-request-stored-checksum`). Defaults to true. Set false only for
     /// an endpoint that rejects the request header: every full-object read is
-    /// then counted in `ravel_store_get_unverified_total`. Rendered only when
-    /// false.
+    /// then counted in `ravel_store_get_unverified_total`. The server flag is
+    /// rendered only when false. The store qualification Job requests the
+    /// stored checksum under the same setting, and changing this field
+    /// re-runs it.
     #[serde(default = "default_true")]
     pub request_stored_checksum: bool,
 
@@ -914,8 +917,10 @@ pub struct RavelClusterStatus {
     #[serde(default)]
     pub gc_bootstrap_waiting_since: Option<String>,
 
-    /// The qualify-Job input hash (bucket, region, endpoint, image, credentials
-    /// Secret name) that store qualification last succeeded against (issue #36).
+    /// The qualify-Job input hash (bucket, region, endpoint, `allowHttp`,
+    /// `uploadIntegrity`, `requestStoredChecksum`, image, credentials Secret
+    /// name and that Secret's `resourceVersion`) that store qualification last
+    /// succeeded against (issue #36).
     /// The operator gates serving on `ravel-cli store qualify` before it creates any
     /// Deployment; recording the qualified inputs here makes that gate durable:
     /// a later pass whose inputs still hash to this value proceeds without

@@ -129,7 +129,11 @@ data; verification is reads of configuration.
    `GetLifecycleConfiguration`, `GetReplicationConfiguration`,
    `GetBucketObjectLockConfiguration`, `GetObjectRetention`,
    `ListBucketVersions`) ship as a separate statement in the IAM templates,
-   so the ingest and query roles gain nothing.
+   so the ingest and query roles gain nothing. (Narrowed by the
+   verify-protection retention amendment below: the command does not check
+   `object-retention` yet, takes no option for it, and prints it as not
+   checked without letting it affect the exit code, so of the actions above
+   it needs only the four bucket-configuration ones.)
 
 5. **In-process gate and gauges.** Under `--require-bucket-protection` the
    startup check runs the same report. Fatal: `versioning` on without
@@ -140,7 +144,9 @@ data; verification is reads of configuration.
    `E_v` and no replication or retention expectation, so
    `noncurrent-expiration` checks presence in-process and the exact value
    only in the CLI; `delete-marker-replication` and `object-retention` are
-   CLI-only. `Unknown` stays a warning plus gauge, as ADR-0072 decided.
+   CLI-only (and `object-retention` is not checked by the CLI either yet: see
+   the verify-protection retention amendment below). `Unknown` stays a
+   warning plus gauge, as ADR-0072 decided.
 
    Two gauges carry the result: `ravel_bucket_protection_conditions_failed`
    is the count of conditions observed `Fail` at the last startup check,
@@ -294,3 +300,29 @@ makes `store verify-protection` exit `2`, never `0`. A bucket whose rules
 cover `t/` in a form the code does not prove reads as "could not verify":
 the operator restates the rules as one rule over `t/` (or the whole
 bucket) or as the sixteen-rule union, or confirms coverage out of band.
+
+## Amendment (2026-09-30): verify-protection does not check object-retention yet
+
+<!-- amendment-applies: sections="Decision" pointer="verify-protection retention amendment" -->
+
+`store verify-protection` as built (follow-up task 2) does not check
+`object-retention`. It takes no option for it, samples no object, and
+prints the condition as not checked by this command; the condition never
+affects the exit code, so exit `0` says nothing about per-object retention.
+
+Every sampling rule tried misreported a correctly configured bucket. The
+newest object in a family is not locked yet under a mechanism that applies
+retention after the write, and the newest object older than a fixed window
+still reads wrong under clock skew, under a retention period shorter than
+the window, for catalog snapshot and index objects the sanctioned HEAD-only
+posture never locks, and for create-if-absent keys that never have the
+noncurrent version the control plane samples. Which objects a sample should
+read is open, and is issue #2228's to decide. Until then an operator checks
+object retention by hand, as the disaster recovery guide describes.
+
+The control plane's reading of a sample is unchanged for any caller that
+supplies one: a sampled object whose `RetainUntilDate` has passed reads
+`Unknown`, not `Fail`, since a lapsed lock on an object older than the
+retention period says nothing about the retention on new writes. A sampled
+object with no retention at all, or with governance-mode retention, still
+reads `Fail`.

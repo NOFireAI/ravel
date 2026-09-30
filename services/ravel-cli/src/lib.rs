@@ -9,6 +9,9 @@ pub mod catalog;
 pub mod cli_profiling;
 pub mod erase;
 pub mod export;
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod fake_s3;
 pub mod gc_config;
 pub mod hold;
 pub mod idem;
