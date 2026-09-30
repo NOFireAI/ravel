@@ -508,7 +508,9 @@ The candidates, in priority order:
 - i64 pages (`ts`, `observed_ts`, `stream_ref`, `severity_num`, `flags`,
   i64 attributes): constant (only when every value is equal), RLE, plain,
   delta-zigzag and double-delta (each only when no intermediate overflows),
-  FOR bit-pack, then GCD i64 (only when it applies). At most seven.
+  FOR bit-pack, then GCD i64 (only when it applies). At most six at once:
+  a page whose values are all equal has all-zero offsets, so constant and
+  GCD i64 never both apply.
 - string pages (`severity_text`, `body`, `attrs_raw`, string and bytes
   attributes): dictionary and plain. The one the `distinct / total <= 0.5`
   heuristic would pick comes first. Two.

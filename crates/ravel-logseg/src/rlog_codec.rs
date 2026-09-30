@@ -209,7 +209,9 @@ pub fn decode_gcd_i64(bytes: &[u8], count: usize) -> Result<Vec<i64>, LogSegErro
 /// Every integer candidate for one page, in tie-break priority order:
 /// constant (when every value is equal), RLE, plain, delta-zigzag and
 /// double-delta (each when no intermediate overflows), FOR bit-pack, then GCD
-/// i64 (when [`encode_gcd_i64`] applies). At most seven candidates.
+/// i64 (when [`encode_gcd_i64`] applies). At most six candidates at once:
+/// constant needs every value equal, which makes every offset zero, so it
+/// and GCD i64 never both apply.
 ///
 /// The first six are exactly `ravel-codec`'s `encode_i64` candidates, in its
 /// order, so the smallest of them by encoded length with ties to the earlier
