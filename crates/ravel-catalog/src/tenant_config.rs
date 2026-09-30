@@ -38,11 +38,11 @@ use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions, Stor
 use ravel_proto::sys::v1 as sysproto;
 use ravel_types::TenantHash;
 
-/// Format version written into every config record this build emits: the writer,
-/// including the CAS-replace rewrite in [`set_tenant_config`], stamps exactly
-/// this. It is also the highest version a rewrite can reproduce byte-for-byte, so
-/// a rewrite refuses any record declaring a version above it rather than strip a
-/// field it does not model (ADR-0066 decision 5).
+/// Format version [`set_tenant_config`], create and CAS-replace rewrite alike,
+/// stamps on a record that carries neither `clustering_key` (field 13) nor a
+/// non-default `bloom_scope` (field 14). A record carrying either is stamped
+/// [`TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION`] instead, and only the
+/// opted-in storage-layout setters can put either field on a config.
 ///
 /// ADR-0066 R2 raised this from 1 to 2, the writer half of the
 /// readers-before-writers sequence R1 opened. Version 2 carries the same field
@@ -68,18 +68,40 @@ pub const TENANT_CONFIG_FORMAT_VERSION: u32 = 2;
 ///
 /// Version 3 (ADR-2135, `clustering_key` field 13 and `bloom_scope` field 14)
 /// repeats the sequence: this ceiling is raised to 3 while
-/// [`TENANT_CONFIG_FORMAT_VERSION`] stays 2, so the reader ships and rolls out
-/// before any writer stamps 3. The two constants are separate so the writer flip
-/// changes only the writer's.
+/// [`TENANT_CONFIG_FORMAT_VERSION`] stays 2, so the reader ships before a
+/// writer stamps 3 by default. Until then a version-3 record is written only on
+/// demand, behind the operator opt-in [`StorageLayoutWrite::ReadersRolledOut`].
+/// The two constants are separate so the writer flip changes only the writer's.
 pub const TENANT_CONFIG_MAX_READ_VERSION: u32 = 3;
 
-/// The lowest writer version that may emit `clustering_key` (field 13) and
-/// `bloom_scope` (field 14). While [`TENANT_CONFIG_FORMAT_VERSION`] is below
-/// this, [`TenantConfig::set_clustering_key`],
-/// [`TenantConfig::clear_clustering_key`], [`TenantConfig::set_bloom_scope`]
-/// and [`set_tenant_config`] refuse to set either field with
-/// [`StorageLayoutConfigError::WriterCannotEmit`].
+/// The record version that carries `clustering_key` (field 13) and
+/// `bloom_scope` (field 14). [`set_tenant_config`] stamps it on a record that
+/// carries either field. [`TenantConfig::set_clustering_key`],
+/// [`TenantConfig::clear_clustering_key`] and [`TenantConfig::set_bloom_scope`]
+/// refuse with [`StorageLayoutConfigError::WriterCannotEmit`] unless given
+/// [`StorageLayoutWrite::ReadersRolledOut`].
+///
+/// It is also the highest version a whole-record rewrite reproduces, since this
+/// build models every field of it, so [`set_tenant_config`] refuses to rewrite a
+/// record declaring a version above it rather than strip a field it does not
+/// model (ADR-0066 decision 5).
 pub const TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION: u32 = 3;
+
+/// The operator's opt-in to write a version-3 record (ADR-2135 decision 7,
+/// ADR-0066 R1). The version-3 reader has not shipped in a release, so a
+/// version-3 record written today is refused by any process still running an
+/// older release. The storage-layout setters take this token so that writing one
+/// is a named decision, never a default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StorageLayoutWrite {
+    /// No opt-in: the storage-layout setters refuse with
+    /// [`StorageLayoutConfigError::WriterCannotEmit`].
+    #[default]
+    Disabled,
+    /// The operator states that every process reading this bucket's tenant
+    /// config records runs a release whose reader accepts version 3.
+    ReadersRolledOut,
+}
 
 /// Lowest record version a reader accepts: the supported read set is a closed
 /// interval `TENANT_CONFIG_MIN_READ_VERSION..=TENANT_CONFIG_MAX_READ_VERSION`, a
@@ -348,7 +370,7 @@ pub enum ClusteringKeyState {
 
 /// A clustering key exactly as the record stores it, unvalidated. Opaque so that
 /// its content is only read through the validating
-/// [`TenantConfig::clustering_key`], and only set through
+/// [`TenantConfig::clustering_key`], and only produced by
 /// [`TenantConfig::set_clustering_key`], [`TenantConfig::clear_clustering_key`]
 /// or record decode.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,6 +378,9 @@ pub struct StoredClusteringKey {
     columns: Vec<String>,
     bucket_width: i32,
     generation: u64,
+    /// The opt-in the value was produced under: the setter's argument, or
+    /// `ReadersRolledOut` for a key decoded from a version-3 record.
+    write: StorageLayoutWrite,
 }
 
 /// Which attribute columns get bloom filters for a tenant (ADR-2135). This
@@ -386,10 +411,41 @@ impl BloomScope {
 /// Opaque for the same reason as [`StoredClusteringKey`]; read it through
 /// [`TenantConfig::bloom_scope`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct StoredBloomScope(i32);
+pub struct StoredBloomScope {
+    value: i32,
+    /// As [`StoredClusteringKey`]'s, and always `Disabled` for the zero value,
+    /// which is not written to the record.
+    write: StorageLayoutWrite,
+}
 
-/// A clustering-key or bloom-scope value refused by the accessor or setter
-/// (ADR-2135). Record decode does not raise these: a well-formed but invalid
+impl StoredBloomScope {
+    fn new(value: i32, write: StorageLayoutWrite) -> Self {
+        let write = if value == 0 {
+            StorageLayoutWrite::Disabled
+        } else {
+            write
+        };
+        StoredBloomScope { value, write }
+    }
+
+    /// Whether the record carries field 14: a zero value is not written.
+    fn is_set(self) -> bool {
+        self.value != 0
+    }
+}
+
+/// The opt-in a value decoded from a record of `format_version` carries.
+fn decoded_write(format_version: u32) -> StorageLayoutWrite {
+    if format_version >= TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION {
+        StorageLayoutWrite::ReadersRolledOut
+    } else {
+        StorageLayoutWrite::Disabled
+    }
+}
+
+/// A clustering-key or bloom-scope value refused by the accessor, a setter, or
+/// the write gate in [`set_tenant_config`] (ADR-2135). Record decode does not
+/// raise these: a well-formed but invalid
 /// stored value leaves the rest of the record readable and fails only the
 /// accessor for that field. A stored key can fail decode only by making the
 /// record invalid protobuf, as a key column name that is not valid UTF-8 does.
@@ -418,12 +474,50 @@ pub enum StorageLayoutConfigError {
     /// A clustering key names the same column twice.
     #[error("the clustering key names column {column:?} more than once")]
     DuplicateClusteringKeyColumn { column: String },
-    /// A clustering key column is not in the tenant's effective declared typed
-    /// attribute columns, the list the caller passed.
+    /// A clustering key column is not in the config record's own
+    /// `typed_attr_columns`, the list ingest resolves the key against.
     #[error(
-        "clustering key column {column:?} is not a declared typed attribute column of this tenant"
+        "clustering key column {column:?} is not a declared typed attribute column in this \
+         tenant's config record: declare it in the record's typed_attr_columns first"
     )]
     UndeclaredClusteringKeyColumn { column: String },
+    /// [`TenantConfig::clear_clustering_key`] on a config whose key was never
+    /// set.
+    #[error("there is no clustering key to clear: this tenant never set one")]
+    ClusteringKeyNeverSet,
+    /// A write carries a lower clustering generation than the stored record,
+    /// which would let an older generation name a second key.
+    #[error(
+        "the config carries clustering generation {proposed}, below the stored record's \
+         {stored}: change the key with set_clustering_key or clear_clustering_key on the config \
+         read from the record"
+    )]
+    ClusteringGenerationRegressed { stored: u64, proposed: u64 },
+    /// A write carries a clustering key that differs from the stored record's
+    /// at the same generation, so one generation would name two keys.
+    #[error(
+        "the config carries a clustering key different from the stored record's at the same \
+         generation {generation}: every key change must go through set_clustering_key or \
+         clear_clustering_key, which increment the generation"
+    )]
+    ClusteringKeyChangedWithoutGeneration { generation: u64 },
+    /// A write drops a typed attribute column the current clustering key names.
+    #[error(
+        "typed attribute column {column:?} is named by the current clustering key and cannot be \
+         removed: clear the clustering key first"
+    )]
+    ClusteringKeyColumnRemoved { column: String },
+    /// A write changes the type of a typed attribute column the current
+    /// clustering key names.
+    #[error(
+        "typed attribute column {column:?} is named by the current clustering key and cannot be \
+         retyped from {from:?} to {to:?}: clear the clustering key first"
+    )]
+    ClusteringKeyColumnRetyped {
+        column: String,
+        from: DeclaredColumnType,
+        to: DeclaredColumnType,
+    },
     /// A clustering key carries the proto `UNSPECIFIED` bucket width.
     #[error("the clustering key has no bucket width: it must be one hour, six hours, or one day")]
     UnspecifiedBucketWidth,
@@ -436,12 +530,14 @@ pub enum StorageLayoutConfigError {
     /// The record carries a bloom scope value this build does not know.
     #[error("the bloom scope has an unknown value {got}: it must be all, undeclared, or text")]
     UnknownBloomScope { got: i32 },
-    /// This build's writer stamps a record version that cannot carry the field.
+    /// A storage-layout field was set, or reached [`set_tenant_config`],
+    /// without [`StorageLayoutWrite::ReadersRolledOut`].
     #[error(
-        "cannot set {field}: this build's config record writer stamps format_version \
-         {writer_version}, and {field} can only be written by a version-{required} writer. That \
-         writer flip ships only after every reader accepts version {required}, so a reader \
-         that predates the field refuses the record instead of rewriting it without the field"
+        "cannot set {field} without the storage-layout write opt-in: this build's config record \
+         writer stamps format_version {writer_version} by default, and {field} needs a \
+         version-{required} record, which a reader from a release that predates version \
+         {required} refuses. Opt in only once every process reading this bucket runs a release \
+         whose reader accepts version {required} (ADR-0066 R1)"
     )]
     WriterCannotEmit {
         field: &'static str,
@@ -487,10 +583,10 @@ fn validate_clustering_key_shape(
     }))
 }
 
-/// The full clustering-key validation, shared by [`TenantConfig::clustering_key`]
-/// and [`TenantConfig::set_clustering_key`]: the shape rules, then every column
-/// of a set key must be in `declared`, the tenant's effective declared typed
-/// attribute columns.
+/// The full clustering-key validation, shared by [`TenantConfig::clustering_key`],
+/// [`TenantConfig::set_clustering_key`] and the write gate in
+/// [`set_tenant_config`]: the shape rules, then every column of a set key must be
+/// in `declared`, the config record's own `typed_attr_columns`.
 fn validate_clustering_key(
     stored: &StoredClusteringKey,
     declared: &[DeclaredTypedColumn],
@@ -509,19 +605,24 @@ fn validate_clustering_key(
     Ok(state)
 }
 
-/// Refuse a write of a field a writer stamping `writer_version` cannot carry.
-fn check_writer_can_emit(
+/// Refuse a write of `field` that was not given the storage-layout opt-in.
+fn check_opted_in(
     field: &'static str,
-    writer_version: u32,
+    write: StorageLayoutWrite,
 ) -> Result<(), StorageLayoutConfigError> {
-    if writer_version < TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION {
-        return Err(StorageLayoutConfigError::WriterCannotEmit {
+    match write {
+        StorageLayoutWrite::ReadersRolledOut => Ok(()),
+        StorageLayoutWrite::Disabled => Err(StorageLayoutConfigError::WriterCannotEmit {
             field,
-            writer_version,
+            writer_version: TENANT_CONFIG_FORMAT_VERSION,
             required: TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION,
-        });
+        }),
     }
-    Ok(())
+}
+
+/// The declared type of `column` in `columns`, if it is declared.
+fn declared_type(columns: &[DeclaredTypedColumn], column: &str) -> Option<DeclaredColumnType> {
+    columns.iter().find(|d| d.key == column).map(|d| d.ty)
 }
 
 /// A tenant's durable config, decoded into a plain struct so consumers (the
@@ -554,10 +655,15 @@ pub struct TenantConfig {
     pub typed_attr_columns: Option<Vec<DeclaredTypedColumn>>,
     /// The stored clustering key (ADR-2135, record field 13), unvalidated: `None`
     /// when the record carries none. Read it through
-    /// [`TenantConfig::clustering_key`].
+    /// [`TenantConfig::clustering_key`]; change it only through
+    /// [`TenantConfig::set_clustering_key`] and
+    /// [`TenantConfig::clear_clustering_key`]. The value type has no public
+    /// constructor, and [`set_tenant_config`] re-applies the setter's validation
+    /// to whatever this field carries.
     pub stored_clustering_key: Option<StoredClusteringKey>,
     /// The stored bloom scope (ADR-2135, record field 14), unvalidated. Read it
-    /// through [`TenantConfig::bloom_scope`].
+    /// through [`TenantConfig::bloom_scope`]; change it only through
+    /// [`TenantConfig::set_bloom_scope`].
     pub stored_bloom_scope: StoredBloomScope,
 }
 
@@ -580,33 +686,28 @@ impl TenantConfig {
         }
     }
 
-    /// The tenant's clustering-key state, validated.
-    ///
-    /// `declared` is the tenant's EFFECTIVE declared typed attribute columns,
-    /// resolved by the caller as the server's logs SQL declared-column overlay
-    /// resolves them: this config's `typed_attr_columns` override when it is
-    /// `Some`, otherwise the tenant's base columns as the server resolves them
-    /// (`TypedAttrColumnConfig::columns_for`: the tenant's
-    /// `--typed-attr-column-tenant` override when one is set, else the
-    /// process-wide `--typed-attr-column` default; an override is total, not
-    /// additive). This crate does not know those base columns, so this accessor
-    /// does not read `typed_attr_columns`; [`resolve_declared_columns`] resolves
-    /// `declared` from it and the base columns the caller passes.
+    /// The tenant's clustering-key state, validated against this config's own
+    /// `typed_attr_columns` (no columns when it is `None`), the list ingest
+    /// resolves the key against. The base columns a server falls back to when
+    /// the record declares none never satisfy a key column.
     ///
     /// An absent field 13 is [`ClusteringKeyState::NeverSet`], and a present one
     /// with no columns is [`ClusteringKeyState::Cleared`] whatever its bucket
     /// width. A present key with generation 0 is refused, and so is a set key with
     /// more than [`MAX_CLUSTERING_KEY_COLUMNS`] columns, a duplicate column, a
-    /// column not in `declared`, or an unspecified or unknown bucket width, each
-    /// with the matching [`StorageLayoutConfigError`].
-    pub fn clustering_key(
-        &self,
-        declared: &[DeclaredTypedColumn],
-    ) -> Result<ClusteringKeyState, StorageLayoutConfigError> {
+    /// column this config does not declare, or an unspecified or unknown bucket
+    /// width, each with the matching [`StorageLayoutConfigError`].
+    pub fn clustering_key(&self) -> Result<ClusteringKeyState, StorageLayoutConfigError> {
         match self.stored_clustering_key.as_ref() {
             None => Ok(ClusteringKeyState::NeverSet),
-            Some(stored) => validate_clustering_key(stored, declared),
+            Some(stored) => validate_clustering_key(stored, self.own_typed_columns()),
         }
+    }
+
+    /// This config's own declared typed attribute columns, empty when it
+    /// declares none.
+    fn own_typed_columns(&self) -> &[DeclaredTypedColumn] {
+        self.typed_attr_columns.as_deref().unwrap_or(&[])
     }
 
     /// The stored clustering generation, 0 when the record carries no clustering
@@ -621,7 +722,7 @@ impl TenantConfig {
     /// none. An unknown stored value is refused with
     /// [`StorageLayoutConfigError::UnknownBloomScope`].
     pub fn bloom_scope(&self) -> Result<BloomScope, StorageLayoutConfigError> {
-        let got = self.stored_bloom_scope.0;
+        let got = self.stored_bloom_scope.value;
         match sysproto::BloomScope::try_from(got) {
             Ok(sysproto::BloomScope::All) => Ok(BloomScope::All),
             Ok(sysproto::BloomScope::Undeclared) => Ok(BloomScope::Undeclared),
@@ -631,54 +732,25 @@ impl TenantConfig {
     }
 
     /// Set the clustering key to `columns` (1 to [`MAX_CLUSTERING_KEY_COLUMNS`])
-    /// and `bucket_width`, at the stored generation plus one.
+    /// and `bucket_width`, at the stored generation plus one: 1 when no key was
+    /// ever set, `g + 1` when the key was last set or cleared at `g`.
     ///
-    /// `declared` is the tenant's EFFECTIVE declared typed attribute columns,
-    /// resolved by the caller as for [`TenantConfig::clustering_key`] (this
-    /// config's `typed_attr_columns` override when `Some`, otherwise the
-    /// deployment default). No columns is refused with
-    /// [`StorageLayoutConfigError::EmptyClusteringKey`], since removing a key is
-    /// [`TenantConfig::clear_clustering_key`]; otherwise the key runs the same
-    /// validation as the accessor. A stored generation of `u64::MAX` is refused
-    /// with [`StorageLayoutConfigError::ClusteringGenerationExhausted`]. Then the
-    /// call refuses with [`StorageLayoutConfigError::WriterCannotEmit`] while this
-    /// build's writer stamps a version below
-    /// [`TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION`]. On any error the config is
+    /// Every column must be in this config's own `typed_attr_columns`, not the
+    /// tenant's base columns a server falls back to when the record declares
+    /// none, since ingest resolves the key against the record's own list. No
+    /// columns is refused with [`StorageLayoutConfigError::EmptyClusteringKey`],
+    /// since removing a key is [`TenantConfig::clear_clustering_key`]; otherwise
+    /// the key runs the same validation as the accessor. A stored generation of
+    /// `u64::MAX` is refused with
+    /// [`StorageLayoutConfigError::ClusteringGenerationExhausted`]. Then the call
+    /// refuses with [`StorageLayoutConfigError::WriterCannotEmit`] unless `write`
+    /// is [`StorageLayoutWrite::ReadersRolledOut`]. On any error the config is
     /// unchanged.
     pub fn set_clustering_key(
         &mut self,
         columns: Vec<String>,
         bucket_width: ClusteringBucketWidth,
-        declared: &[DeclaredTypedColumn],
-    ) -> Result<(), StorageLayoutConfigError> {
-        self.set_clustering_key_as(
-            columns,
-            bucket_width,
-            declared,
-            TENANT_CONFIG_FORMAT_VERSION,
-        )
-    }
-
-    /// Clear the clustering key: field 13 stays present with no columns, an
-    /// unspecified bucket width and the stored generation plus one, the higher
-    /// generation that lets ADR-2135 decision 1 rank the clear above every
-    /// earlier key. Refuses with
-    /// [`StorageLayoutConfigError::ClusteringGenerationExhausted`] and
-    /// [`StorageLayoutConfigError::WriterCannotEmit`] as
-    /// [`TenantConfig::set_clustering_key`] does; on either error the config is
-    /// unchanged.
-    pub fn clear_clustering_key(&mut self) -> Result<(), StorageLayoutConfigError> {
-        self.clear_clustering_key_as(TENANT_CONFIG_FORMAT_VERSION)
-    }
-
-    /// [`TenantConfig::set_clustering_key`] for a writer stamping
-    /// `writer_version`.
-    fn set_clustering_key_as(
-        &mut self,
-        columns: Vec<String>,
-        bucket_width: ClusteringBucketWidth,
-        declared: &[DeclaredTypedColumn],
-        writer_version: u32,
+        write: StorageLayoutWrite,
     ) -> Result<(), StorageLayoutConfigError> {
         if columns.is_empty() {
             return Err(StorageLayoutConfigError::EmptyClusteringKey);
@@ -687,25 +759,37 @@ impl TenantConfig {
             columns,
             bucket_width: bucket_width.to_proto() as i32,
             generation: self.next_clustering_generation()?,
+            write,
         };
-        validate_clustering_key(&key, declared)?;
-        check_writer_can_emit("clustering_key", writer_version)?;
+        validate_clustering_key(&key, self.own_typed_columns())?;
+        check_opted_in("clustering_key", write)?;
         self.stored_clustering_key = Some(key);
         Ok(())
     }
 
-    /// [`TenantConfig::clear_clustering_key`] for a writer stamping
-    /// `writer_version`.
-    fn clear_clustering_key_as(
+    /// Clear the clustering key: field 13 stays present with no columns, an
+    /// unspecified bucket width and the stored generation plus one, the higher
+    /// generation that lets ADR-2135 decision 1 rank the clear above every
+    /// earlier key. Refuses with
+    /// [`StorageLayoutConfigError::ClusteringKeyNeverSet`] when no key was ever
+    /// set, and with [`StorageLayoutConfigError::ClusteringGenerationExhausted`]
+    /// and [`StorageLayoutConfigError::WriterCannotEmit`] as
+    /// [`TenantConfig::set_clustering_key`] does; on any error the config is
+    /// unchanged.
+    pub fn clear_clustering_key(
         &mut self,
-        writer_version: u32,
+        write: StorageLayoutWrite,
     ) -> Result<(), StorageLayoutConfigError> {
+        if self.stored_clustering_key.is_none() {
+            return Err(StorageLayoutConfigError::ClusteringKeyNeverSet);
+        }
         let key = StoredClusteringKey {
             columns: Vec::new(),
             bucket_width: sysproto::ClusteringBucketWidth::Unspecified as i32,
             generation: self.next_clustering_generation()?,
+            write,
         };
-        check_writer_can_emit("clustering_key", writer_version)?;
+        check_opted_in("clustering_key", write)?;
         self.stored_clustering_key = Some(key);
         Ok(())
     }
@@ -719,44 +803,106 @@ impl TenantConfig {
     }
 
     /// Set the bloom scope. Refuses with
-    /// [`StorageLayoutConfigError::WriterCannotEmit`] while this build's writer
-    /// stamps a version below [`TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION`]; on
-    /// that error the config is unchanged.
-    pub fn set_bloom_scope(&mut self, scope: BloomScope) -> Result<(), StorageLayoutConfigError> {
-        self.set_bloom_scope_as(scope, TENANT_CONFIG_FORMAT_VERSION)
-    }
-
-    /// [`TenantConfig::set_bloom_scope`] for a writer stamping `writer_version`.
-    fn set_bloom_scope_as(
+    /// [`StorageLayoutConfigError::WriterCannotEmit`] unless `write` is
+    /// [`StorageLayoutWrite::ReadersRolledOut`]; on that error the config is
+    /// unchanged. [`BloomScope::All`] is the proto zero value, which the record
+    /// does not carry, so setting it removes field 14.
+    pub fn set_bloom_scope(
         &mut self,
         scope: BloomScope,
-        writer_version: u32,
+        write: StorageLayoutWrite,
     ) -> Result<(), StorageLayoutConfigError> {
-        check_writer_can_emit("bloom_scope", writer_version)?;
-        self.stored_bloom_scope = StoredBloomScope(scope.to_proto() as i32);
+        check_opted_in("bloom_scope", write)?;
+        self.stored_bloom_scope = StoredBloomScope::new(scope.to_proto() as i32, write);
         Ok(())
     }
 
-    /// The write-time gate [`set_tenant_config`] applies to fields 13 and 14: a
-    /// config carrying either is refused while the writer cannot emit it, and a
-    /// carried value must pass its validation. `set_tenant_config` is not given
-    /// the tenant's effective declared columns, so for a clustering key this
-    /// re-checks only the rules that do not depend on them.
-    ///
-    /// The declared-column rule is applied by
-    /// [`TenantConfig::set_clustering_key`]. A decoded key also reaches this
-    /// gate through a read-modify-write that replaces another field and carries
-    /// the rest through (`ravel-cli typed-attr-column set` replaces
-    /// `typed_attr_columns` that way), which can leave a key naming a column the
-    /// new declaration dropped; the declared-column rule for that path lands
-    /// with the writer flip.
-    fn check_storage_layout_writable(&self) -> Result<(), StorageLayoutConfigError> {
-        if let Some(stored) = self.stored_clustering_key.as_ref() {
-            check_writer_can_emit("clustering_key", TENANT_CONFIG_FORMAT_VERSION)?;
-            validate_clustering_key_shape(stored)?;
+    /// The format version [`build_record`] stamps for this config:
+    /// [`TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION`] when it carries field 13
+    /// or a nonzero field 14, else [`TENANT_CONFIG_FORMAT_VERSION`].
+    fn record_format_version(&self) -> u32 {
+        if self.stored_clustering_key.is_some() || self.stored_bloom_scope.is_set() {
+            TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION
+        } else {
+            TENANT_CONFIG_FORMAT_VERSION
         }
-        if self.stored_bloom_scope != StoredBloomScope::default() {
-            check_writer_can_emit("bloom_scope", TENANT_CONFIG_FORMAT_VERSION)?;
+    }
+
+    /// The part of the [`set_tenant_config`] gate on fields 13 and 14 that
+    /// needs no stored record, checked before any I/O: a carried value must have
+    /// been produced under the opt-in.
+    fn check_storage_layout_opted_in(&self) -> Result<(), StorageLayoutConfigError> {
+        if let Some(stored) = self.stored_clustering_key.as_ref() {
+            check_opted_in("clustering_key", stored.write)?;
+        }
+        if self.stored_bloom_scope.is_set() {
+            check_opted_in("bloom_scope", self.stored_bloom_scope.write)?;
+        }
+        Ok(())
+    }
+
+    /// The rest of the [`set_tenant_config`] gate, checked against `stored`, the
+    /// config decoded from the record being replaced (`None` when there is none).
+    ///
+    /// The clustering generation may not fall below the stored one, and at the
+    /// stored generation the key must be the stored key. When the key is the
+    /// stored set key, the write may neither drop nor retype a typed attribute
+    /// column it names: that changes the key's descriptor without a new
+    /// generation (ADR-2135 decision 2). Then a carried key runs the setter's
+    /// validation, shape and membership in this config's own
+    /// `typed_attr_columns`, and a carried bloom scope must be known.
+    fn check_storage_layout_writable(
+        &self,
+        stored: Option<&TenantConfig>,
+    ) -> Result<(), StorageLayoutConfigError> {
+        if let Some(stored_cfg) = stored {
+            let stored_generation = stored_cfg.clustering_generation();
+            let proposed = self.clustering_generation();
+            if proposed < stored_generation {
+                return Err(StorageLayoutConfigError::ClusteringGenerationRegressed {
+                    stored: stored_generation,
+                    proposed,
+                });
+            }
+            if proposed == stored_generation
+                && let (Some(new), Some(old)) = (
+                    self.stored_clustering_key.as_ref(),
+                    stored_cfg.stored_clustering_key.as_ref(),
+                )
+            {
+                if new.columns != old.columns
+                    || (!new.columns.is_empty() && new.bucket_width != old.bucket_width)
+                {
+                    return Err(
+                        StorageLayoutConfigError::ClusteringKeyChangedWithoutGeneration {
+                            generation: proposed,
+                        },
+                    );
+                }
+                for column in &old.columns {
+                    let from = declared_type(stored_cfg.own_typed_columns(), column);
+                    match (from, declared_type(self.own_typed_columns(), column)) {
+                        (_, None) => {
+                            return Err(StorageLayoutConfigError::ClusteringKeyColumnRemoved {
+                                column: column.clone(),
+                            });
+                        }
+                        (Some(from), Some(to)) if from != to => {
+                            return Err(StorageLayoutConfigError::ClusteringKeyColumnRetyped {
+                                column: column.clone(),
+                                from,
+                                to,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if let Some(key) = self.stored_clustering_key.as_ref() {
+            validate_clustering_key(key, self.own_typed_columns())?;
+        }
+        if self.stored_bloom_scope.is_set() {
             self.bloom_scope()?;
         }
         Ok(())
@@ -784,21 +930,26 @@ pub fn resolve_retention_window(
 
 /// The tenant's effective declared typed attribute columns: the record's
 /// [`TenantConfig::typed_attr_columns`] override when the record is present and
-/// carries `Some` (including `Some(vec![])`, an override to no declared
-/// columns), otherwise `deployment_default`, which is the tenant's base columns
-/// as the server resolves them (`TypedAttrColumnConfig::columns_for`: the
-/// tenant's `--typed-attr-column-tenant` override when one is set, else the
+/// carries a `Some` list that passes [`validate_typed_attr_columns`] (including
+/// `Some(vec![])`, an override to no declared columns), otherwise
+/// `base_columns`, which is the tenant's base columns as the server resolves
+/// them (`TypedAttrColumnConfig::columns_for`: the tenant's
+/// `--typed-attr-column-tenant` override when one is set, else the
 /// process-wide `--typed-attr-column` default), not the process-wide default
-/// alone. This is the `declared` argument every caller of
-/// [`TenantConfig::clustering_key`] and [`TenantConfig::set_clustering_key`]
-/// must pass.
+/// alone.
+///
+/// A decodable list that fails validation falls back to `base_columns`, as the
+/// server's declared-column overlay treats it like a failed read. The overlay
+/// serves its last-good cached list when it has one; this stateless form has
+/// none, so it serves the base columns.
 pub fn resolve_declared_columns<'a>(
     tenant_config: Option<&'a TenantConfig>,
-    deployment_default: &'a [DeclaredTypedColumn],
+    base_columns: &'a [DeclaredTypedColumn],
 ) -> &'a [DeclaredTypedColumn] {
-    tenant_config
-        .and_then(|cfg| cfg.typed_attr_columns.as_deref())
-        .unwrap_or(deployment_default)
+    match tenant_config.and_then(|cfg| cfg.typed_attr_columns.as_deref()) {
+        Some(list) if validate_typed_attr_columns(list).is_ok() => list,
+        _ => base_columns,
+    }
 }
 
 /// A typed config-record failure. Every variant is fatal to the touch that
@@ -842,7 +993,7 @@ pub enum TenantConfigError {
     )]
     VersionBelowFloor { key: String, got: u32, floor: u32 },
     /// [`set_tenant_config`] read a record declaring a version this build's writer
-    /// cannot reproduce (> [`TENANT_CONFIG_FORMAT_VERSION`]). The whole-record
+    /// cannot reproduce (> [`TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION`]). The whole-record
     /// CAS-replace rebuilds the body from this build's field set, so a field a
     /// newer writer added would be silently dropped; the write is refused and
     /// nothing is persisted (ADR-0066 decision 5). Checked before the decode
@@ -850,7 +1001,8 @@ pub enum TenantConfigError {
     /// than the read ceiling.
     #[error(
         "config record {key:?} declares format_version {got}, newer than this build's writer \
-         version {TENANT_CONFIG_FORMAT_VERSION}: refusing to rewrite it whole and strip fields this \
+         version {TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION}: refusing to rewrite it whole and \
+         strip fields this \
          build does not model (ADR-0066 decision 5)"
     )]
     RefusingToRewriteNewerRecord { key: String, got: u32 },
@@ -1021,8 +1173,12 @@ fn decode_record(
             columns: k.columns.clone(),
             bucket_width: k.bucket_width,
             generation: k.generation,
+            write: decoded_write(record.format_version),
         }),
-        stored_bloom_scope: StoredBloomScope(record.bloom_scope),
+        stored_bloom_scope: StoredBloomScope::new(
+            record.bloom_scope,
+            decoded_write(record.format_version),
+        ),
     })
 }
 
@@ -1034,7 +1190,7 @@ fn build_record(
     updated_unix_ns: i64,
 ) -> sysproto::TenantConfigRecord {
     sysproto::TenantConfigRecord {
-        format_version: TENANT_CONFIG_FORMAT_VERSION,
+        format_version: config.record_format_version(),
         tenant_hash: tenant_hash.0.to_vec(),
         lifecycle_state: config.lifecycle_state.to_proto() as i32,
         max_active_series: config.max_active_series,
@@ -1068,7 +1224,7 @@ fn build_record(
                 generation: k.generation,
             }
         }),
-        bloom_scope: config.stored_bloom_scope.0,
+        bloom_scope: config.stored_bloom_scope.value,
     }
 }
 
@@ -1132,6 +1288,18 @@ pub enum SetOutcome {
 /// `now_ns` is stamped as `updated_unix_ns`, and as `created_unix_ns` too when
 /// the record is first created; on an update the existing `created_unix_ns` is
 /// carried through verbatim.
+///
+/// The record is stamped [`TENANT_CONFIG_FORMAT_VERSION`] unless `config`
+/// carries a clustering key or a non-default bloom scope, which stamps
+/// [`TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION`]. Either field is refused with
+/// [`StorageLayoutConfigError::WriterCannotEmit`], before any I/O, unless it was
+/// produced under [`StorageLayoutWrite::ReadersRolledOut`] (by a setter, or by
+/// decoding a version-3 record). Against the record being replaced, the
+/// clustering generation may not regress, a key may not change without a new
+/// generation, and a typed attribute column the current key names may be
+/// neither removed nor retyped; a carried key must also pass the setter's
+/// validation against `config`'s own `typed_attr_columns`. Each refusal is a
+/// [`TenantConfigError::InvalidStorageLayoutConfig`] and writes nothing.
 pub async fn set_tenant_config(
     store: &dyn ObjectStoreBackend,
     tenant_hash: &TenantHash,
@@ -1152,6 +1320,13 @@ pub async fn set_tenant_config(
             }
         })?;
     }
+    let storage_layout_error = |source| TenantConfigError::InvalidStorageLayoutConfig {
+        key: key.clone(),
+        source,
+    };
+    config
+        .check_storage_layout_opted_in()
+        .map_err(storage_layout_error)?;
 
     match store.get(&key, GetRange::Full).await {
         Ok(outcome) => {
@@ -1168,31 +1343,26 @@ pub async fn set_tenant_config(
                 })?;
             // Rewrite refusal (ADR-0066 decision 5): the CAS-replace below rebuilds
             // the body from this build's field set. A record a newer writer wrote
-            // (version above what this build stamps) may carry a field this build
-            // does not model, which the rebuild would strip. Nothing is written.
+            // (version above the highest this build writes) may carry a field this
+            // build does not model, which the rebuild would strip. Nothing is
+            // written.
             //
             // Checked BEFORE decode_record, whose ceiling is the read ceiling: on
             // a write path the operator needs to hear that nothing was persisted
-            // and why, not that the record could not be read. The read ceiling is
-            // above the writer's while version 3 is read but not written, so the
-            // read gate alone would admit a version-3 record here and the rebuild
-            // would drop its fields 13 and 14.
-            if existing.format_version > TENANT_CONFIG_FORMAT_VERSION {
+            // and why, not that the record could not be read.
+            if existing.format_version > TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION {
                 return Err(TenantConfigError::RefusingToRewriteNewerRecord {
                     key,
                     got: existing.format_version,
                 });
             }
-            config.check_storage_layout_writable().map_err(|source| {
-                TenantConfigError::InvalidStorageLayoutConfig {
-                    key: key.clone(),
-                    source,
-                }
-            })?;
             // Guard version and misfile before writing back: set_tenant_config
             // persists the record, so trusting a misfiled or below-floor read
             // would durably corrupt it.
-            decode_record(&existing, &key, tenant_hash)?;
+            let existing_config = decode_record(&existing, &key, tenant_hash)?;
+            config
+                .check_storage_layout_writable(Some(&existing_config))
+                .map_err(storage_layout_error)?;
             let created_unix_ns = existing.created_unix_ns;
             let record = build_record(tenant_hash, config, created_unix_ns, now_ns);
             match store
@@ -1212,12 +1382,9 @@ pub async fn set_tenant_config(
             }
         }
         Err(StoreError::NotFound) => {
-            config.check_storage_layout_writable().map_err(|source| {
-                TenantConfigError::InvalidStorageLayoutConfig {
-                    key: key.clone(),
-                    source,
-                }
-            })?;
+            config
+                .check_storage_layout_writable(None)
+                .map_err(storage_layout_error)?;
             let record = build_record(tenant_hash, config, now_ns, now_ns);
             match store
                 .put(
