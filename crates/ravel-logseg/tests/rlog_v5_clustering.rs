@@ -760,6 +760,308 @@ fn descriptor_naming_an_absent_or_stream_level_column_is_refused() {
     assert_eq!((ftr.sort_descriptor, ftr.clustering_generation), (None, 4));
 }
 
+/// The `seq` attribute of every row the object stores, in stored order.
+fn seqs(object: &[u8]) -> Vec<i64> {
+    scan(object)
+        .into_iter()
+        .map(|r| {
+            r.attrs
+                .iter()
+                .find_map(|(k, v)| match (k.as_str(), v) {
+                    ("seq", AttrValue::I64(n)) => Some(*n),
+                    _ => None,
+                })
+                .expect("seq attribute")
+        })
+        .collect()
+}
+
+#[test]
+fn ties_keep_push_order_past_the_small_sort_cutoff() {
+    // 192 rows at one ts on one stream, keyed 1, 2, 0, 1, 2, 0, ...: 64 rows
+    // per key value, each group tied on the whole sort tuple. Push order is
+    // not a sorted run, so the sort has to move rows, and at this length a
+    // non-stable sort reorders rows it considers equal.
+    let key_of = [1, 2, 0];
+    let records: Vec<LogRecord> = (0..192i64)
+        .map(|i| {
+            rec(
+                STREAM_A,
+                T0 + 7,
+                &format!("t{i}"),
+                vec![
+                    ("k", AttrValue::I64(key_of[i as usize % 3])),
+                    ("seq", AttrValue::I64(i)),
+                ],
+            )
+        })
+        .collect();
+    let d = descriptor(&[("k", SortKeyType::I64)]);
+    let expected_seq: Vec<i64> = [2i64, 0, 1]
+        .iter()
+        .flat_map(|first| (0..64).map(move |j| first + 3 * j))
+        .collect();
+    assert_eq!(expected_seq.len(), 192);
+    let expected_bodies: Vec<String> = expected_seq.iter().map(|i| format!("t{i}")).collect();
+
+    assert_eq!(
+        order_both_paths(&d, &records),
+        expected_bodies,
+        "each key group in push order"
+    );
+    let cfg = RlogConfig::default();
+    let rows = write_rows(&cfg, Some(&d), 1, &records).expect("row path");
+    let cols = write_columnar(&cfg, Some(&d), 1, &records, 96).expect("columnar path");
+    assert_eq!(seqs(&rows), expected_seq, "row path");
+    assert_eq!(seqs(&cols), expected_seq, "columnar path");
+}
+
+#[test]
+fn equal_keys_order_by_ts_whatever_the_push_order() {
+    // Inside one (stream, bucket, key) group the rows arrive in descending ts
+    // and are stored ascending. Key "a" rows interleave with key "b" rows in
+    // ts, so ordering by ts ahead of the key would interleave the groups.
+    let k = |v: &str| vec![("tenant", s(v))];
+    let records = vec![
+        rec(STREAM_A, T0 + 50, "a50", k("a")),
+        rec(STREAM_A, T0 + 45, "b45", k("b")),
+        rec(STREAM_A, T0 + 40, "a40", k("a")),
+        rec(STREAM_A, T0 + 35, "b35", k("b")),
+        rec(STREAM_A, T0 + 30, "a30", k("a")),
+        // The next bucket, also pushed descending.
+        rec(STREAM_A, T0 + HOUR + 2, "c2", k("a")),
+        rec(STREAM_A, T0 + HOUR + 1, "c1", k("a")),
+    ];
+    let d = descriptor(&[("tenant", SortKeyType::Str)]);
+    let expected = ["a30", "a40", "a50", "b35", "b45", "c1", "c2"];
+    assert_eq!(order_both_paths(&d, &records), expected, "row path");
+    let cols =
+        write_columnar(&RlogConfig::default(), Some(&d), 1, &records, 3).expect("columnar path");
+    assert_eq!(bodies(&cols), expected, "columnar path");
+    let ts: Vec<i64> = scan(&cols).iter().map(|r| r.ts_ns - T0).collect();
+    assert_eq!(ts, [30, 40, 50, 35, 45, HOUR + 1, HOUR + 2]);
+}
+
+#[test]
+fn compacted_objects_carry_and_validate_the_descriptor() {
+    let k = |v: &str| vec![("tenant", s(v))];
+    let records = vec![
+        rec(STREAM_A, T0 + 3, "r0", k("b")),
+        rec(STREAM_A, T0 + 1, "r1", k("c")),
+        rec(STREAM_A, T0 + 2, "r2", k("a")),
+        rec(STREAM_B, T0, "r3", k("a")),
+    ];
+    let hash = vec![0xAA, 0xBB, 0xCC];
+    let cfg = RlogConfig::default();
+    let row_writer = |d: &SortDescriptor| {
+        let mut w = writer(&cfg, Some(d), 9);
+        for r in &records {
+            w.push(r.clone()).expect("push");
+        }
+        w
+    };
+    let columnar_writer = |d: &SortDescriptor| {
+        let mut w = writer(&cfg, Some(d), 9);
+        w.push_columnar(batch(&records[..2], false)).expect("push");
+        w.push_columnar(batch(&records[2..], true)).expect("push");
+        w
+    };
+
+    let d = descriptor(&[("tenant", SortKeyType::Str)]);
+    let rows = row_writer(&d)
+        .finish_compacted(1, hash.clone(), 2)
+        .expect("row path");
+    let (rows_stats, _) = row_writer(&d)
+        .finish_compacted_with_stats(1, hash.clone(), 2)
+        .expect("row path, with stats");
+    let cols = columnar_writer(&d)
+        .finish_compacted(1, hash.clone(), 2)
+        .expect("columnar path");
+    let (cols_stats, _) = columnar_writer(&d)
+        .finish_compacted_with_stats(1, hash.clone(), 2)
+        .expect("columnar path, with stats");
+    assert!(rows == rows_stats, "finish_compacted_with_stats bytes");
+    assert!(rows == cols, "row and columnar compacted objects differ");
+    assert!(
+        rows == cols_stats,
+        "columnar finish_compacted_with_stats bytes"
+    );
+    assert_eq!(bodies(&rows), ["r2", "r0", "r1", "r3"]);
+    let ftr = open(&rows).expect("open");
+    assert_eq!(ftr.sort_descriptor.as_ref(), Some(&d));
+    assert_eq!(ftr.clustering_generation, 9);
+    assert_eq!(
+        (ftr.level, ftr.input_set_hash.as_slice(), ftr.part_index),
+        (1, hash.as_slice(), 2)
+    );
+
+    let missing = descriptor(&[("missing", SortKeyType::Str)]);
+    let refusals = [
+        row_writer(&missing).finish_compacted(1, hash.clone(), 2),
+        row_writer(&missing)
+            .finish_compacted_with_stats(1, hash.clone(), 2)
+            .map(|(o, _)| o),
+        columnar_writer(&missing).finish_compacted(1, hash.clone(), 2),
+        columnar_writer(&missing)
+            .finish_compacted_with_stats(1, hash.clone(), 2)
+            .map(|(o, _)| o),
+    ];
+    for (i, r) in refusals.into_iter().enumerate() {
+        match r {
+            Err(LogSegError::InvalidSortDescriptor(why)) => assert_eq!(
+                why,
+                "key column \"missing\" of type Str is not a per-record attribute of any record",
+                "refusal {i}"
+            ),
+            other => panic!(
+                "refusal {i}: expected InvalidSortDescriptor, got {:?}",
+                other.map(|object| format!("an object of {} bytes", object.len()))
+            ),
+        }
+    }
+}
+
+#[test]
+fn cleared_key_on_the_columnar_path_records_only_the_generation() {
+    // Pushed out of ts order within a stream, so the (stream_ref, ts) order a
+    // cleared key keeps is visible.
+    let records = vec![
+        rec(STREAM_B, T0 + 1, "b1", vec![("tenant", s("a"))]),
+        rec(STREAM_A, T0 + 5, "a5", vec![("tenant", s("a"))]),
+        rec(STREAM_A, T0 + 2, "a2", vec![("tenant", s("z"))]),
+    ];
+    let cfg = RlogConfig::default();
+    let rows = write_rows(&cfg, None, 6, &records).expect("row path");
+    for split in [0, 1, 2] {
+        let cols = write_columnar(&cfg, None, 6, &records, split).expect("columnar path");
+        let ftr = open(&cols).expect("open");
+        assert_eq!(
+            (ftr.sort_descriptor, ftr.clustering_generation),
+            (None, 6),
+            "split {split}"
+        );
+        assert!(cols == rows, "split {split}: columnar object differs");
+        assert_eq!(bodies(&cols), ["a2", "a5", "b1"], "split {split}");
+    }
+}
+
+#[test]
+fn list_and_map_values_under_a_bytes_key_sort_by_their_encoding() {
+    use ravel_logseg::record::canonical_value_bytes;
+    let values = [
+        AttrValue::Map(vec![("k".to_string(), AttrValue::Bool(true))]),
+        AttrValue::List(vec![AttrValue::I64(2)]),
+        AttrValue::Bytes(vec![0xFF]),
+        AttrValue::List(vec![AttrValue::Str("a".to_string())]),
+        AttrValue::List(vec![AttrValue::I64(1), AttrValue::I64(0)]),
+        AttrValue::Bytes(vec![]),
+        AttrValue::Map(vec![]),
+    ];
+    let records: Vec<LogRecord> = values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            rec(
+                STREAM_A,
+                T0 + i as i64,
+                &format!("r{i}"),
+                vec![("k", v.clone())],
+            )
+        })
+        .collect();
+
+    // The order bytewise comparison of each value's stored bytes gives.
+    let stored = |v: &AttrValue| match v {
+        AttrValue::Bytes(b) => b.clone(),
+        other => canonical_value_bytes(other),
+    };
+    let mut by_encoding: Vec<usize> = (0..values.len()).collect();
+    by_encoding.sort_by(|&a, &b| stored(&values[a]).cmp(&stored(&values[b])));
+    let by_encoding: Vec<String> = by_encoding.iter().map(|i| format!("r{i}")).collect();
+
+    let d = descriptor(&[("k", SortKeyType::Bytes)]);
+    let order = order_both_paths(&d, &records);
+    assert_eq!(order, by_encoding, "bytewise over the stored encoding");
+    assert_eq!(order, ["r5", "r3", "r1", "r4", "r6", "r0", "r2"]);
+}
+
+#[test]
+fn bloom_scope_undeclared_with_nothing_declared_equals_all() {
+    let all = write_scoped(&BloomScope::All);
+    let none_declared = write_scoped(&BloomScope::Undeclared { declared: vec![] });
+    assert!(all == none_declared, "object bytes differ");
+    let (dir, _) = dir_and_bloom(&none_declared);
+    let mut covered = vec![
+        COL_SEVERITY_TEXT,
+        COL_BODY,
+        str_col(&dir, "note"),
+        str_col(&dir, "region"),
+    ];
+    covered.sort_unstable();
+    let mut present = text_values();
+    present.push((str_col(&dir, "note"), notes()));
+    present.push((str_col(&dir, "region"), vec!["westcoast".to_string()]));
+    assert_bloom(&none_declared, &covered, &[], &present);
+}
+
+#[test]
+fn bloom_scope_undeclared_matches_declared_names_across_types() {
+    // `dual` is both an I64 column and a Str column. Declaring the name (for
+    // its I64 column) uncovers the Str column too; a scan for its word still
+    // returns every row carrying it.
+    let records: Vec<LogRecord> = (0..4)
+        .map(|i| {
+            rec(
+                STREAM_A,
+                T0 + i,
+                &format!("request alpha{i}"),
+                vec![("dual", AttrValue::I64(i)), ("dual", s("dualword"))],
+            )
+        })
+        .collect();
+    let write = |scope: BloomScope| {
+        let mut w = RlogWriter::new(RlogConfig::default(), identity()).with_bloom_scope(scope);
+        for r in &records {
+            w.push(r.clone()).expect("push");
+        }
+        w.finish().expect("finish")
+    };
+    let declared = write(BloomScope::Undeclared {
+        declared: vec!["dual".to_string()],
+    });
+    let all = write(BloomScope::All);
+
+    let (dir, _) = dir_and_bloom(&declared);
+    let dual = str_col(&dir, "dual");
+    assert!(dir.column("dual", FieldType::I64).is_some(), "I64 column");
+    let mut text_only = vec![COL_SEVERITY_TEXT, COL_BODY];
+    text_only.sort_unstable();
+    let probed = assert_bloom(
+        &declared,
+        &text_only,
+        &[(dual, vec!["dualword".to_string()])],
+        &text_values(),
+    );
+    // 1 value of 2 keys over one entry.
+    assert_eq!(probed, 2);
+
+    let mut with_dual = vec![COL_SEVERITY_TEXT, COL_BODY, dual];
+    with_dual.sort_unstable();
+    let mut present = text_values();
+    present.push((dual, vec!["dualword".to_string()]));
+    assert_bloom(&all, &with_dual, &[], &present);
+
+    let word = Predicate::HasWord {
+        field: ravel_logseg::FieldSel::Attr("dual".to_string()),
+        word: "dualword".to_string(),
+    };
+    for (scope, object) in [("undeclared", &declared), ("all", &all)] {
+        let reader = RlogReader::new(object, &RlogConfig::default()).expect("reader");
+        let (hits, _) = reader.scan(&word).expect("scan");
+        assert_eq!(hits.len(), 4, "{scope}: every row carrying the word");
+    }
+}
+
 fn golden_identity() -> ObjectIdentity {
     ObjectIdentity {
         tenant_hash: [0xB2; 16],
