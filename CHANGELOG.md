@@ -8,6 +8,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`ravel-server` sends a CRC64-NVME upload checksum on every S3 PUT by
+  default** (issue #1696). The endpoint verifies each PUT against
+  `x-amz-checksum-crc64nvme` and stores it, so a full-object read, commit
+  records included, is verified against it. The new
+  `--s3-upload-integrity {off,crc64nvme,sha256}` flag
+  (`RAVEL_S3_UPLOAD_INTEGRITY`) selects the algorithm; an endpoint that
+  rejects the header fails the first write at startup, and
+  `--s3-upload-integrity off` is the remedy. The new
+  `--s3-request-stored-checksum` switch (`RAVEL_S3_REQUEST_STORED_CHECKSUM`,
+  default `true`) controls the `x-amz-checksum-mode` request header;
+  `--s3-request-stored-checksum=false` counts every full-object read as
+  unverified. The operator exposes both as `spec.storage.s3.uploadIntegrity`
+  and `spec.storage.s3.requestStoredChecksum` and applies them to its own S3
+  client too.
 - **The RLOG writer now chooses each i64 and string page's encoding by its stored size, and writes encoding tags 10 (GCD i64) and 11 (an `observed_ts` equal to `ts`, stored as a reference to it)** (ADR-2135 decisions 3 and 4, issue #2140); no i64 or string page stores more bytes than the encoding chosen before (a very small object can still grow by a few bytes, because a PAGE_DIR whose `ts` and `observed_ts` entries used to be identical compresses worse), each candidate encoding of a page is compressed at most once (up to six candidates for an i64 page, two for a string page), and the reader decodes both tags.
 - **`s3_e2e_bench` counts adaptive-age flushes** (issue #2186). Its printed
   flush breakdown gains an `age_adaptive=` field between `age=` and

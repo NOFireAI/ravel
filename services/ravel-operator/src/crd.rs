@@ -154,8 +154,8 @@ pub struct StorageSpec {
     pub s3: S3Spec,
 }
 
-/// S3 backend configuration. `bucket`/`region`/`endpoint`/`allowHttp` render
-/// as CLI flags; credentials are injected as env vars from a Secret via
+/// S3 backend configuration. `bucket`/`region`/`endpoint`/`allowHttp`/
+/// `uploadIntegrity`/`requestStoredChecksum` render as CLI flags; credentials are injected as env vars from a Secret via
 /// `valueFrom`, never as literal flag values (ADR-0034 decision 2).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -190,9 +190,64 @@ pub struct S3Spec {
     #[serde(default)]
     pub allow_http: bool,
 
+    /// Server-verified checksum attached to every PUT
+    /// (`--s3-upload-integrity`): `crc64nvme` (the default), `sha256`, or
+    /// `off`. The endpoint verifies each upload against it and stores it so
+    /// a full-object read can be verified. Set `off` only for an endpoint that
+    /// rejects the checksum header, which fails the first write at startup.
+    /// Applies to the rendered server containers and to the operator's own S3
+    /// client. The flag is rendered only when it differs from the default,
+    /// which the server applies on its own.
+    #[serde(default)]
+    pub upload_integrity: S3UploadIntegrity,
+
+    /// Ask the endpoint to return the checksum it stored at upload so a
+    /// full-object read is verified before it is served
+    /// (`--s3-request-stored-checksum`). Defaults to true. Set false only for
+    /// an endpoint that rejects the request header: every full-object read is
+    /// then counted in `ravel_store_get_unverified_total`. Rendered only when
+    /// false.
+    #[serde(default = "default_true")]
+    pub request_stored_checksum: bool,
+
     /// Secret with keys `accessKeyId` and `secretAccessKey`, injected as the
     /// `RAVEL_S3_ACCESS_KEY` / `RAVEL_S3_SECRET_KEY` env vars.
     pub credentials_secret_ref: LocalSecretRef,
+}
+
+/// The `uploadIntegrity` values, spelled exactly as `ravel-server`'s
+/// `--s3-upload-integrity` values.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum S3UploadIntegrity {
+    /// Attach no checksum.
+    Off,
+    /// Attach `x-amz-checksum-crc64nvme`. The default.
+    #[default]
+    Crc64Nvme,
+    /// Attach `x-amz-checksum-sha256`; verified on upload, and a read of an
+    /// object stored with it is counted unverified.
+    Sha256,
+}
+
+impl S3UploadIntegrity {
+    /// The `--s3-upload-integrity` value this selects.
+    pub fn flag_value(self) -> &'static str {
+        match self {
+            S3UploadIntegrity::Off => "off",
+            S3UploadIntegrity::Crc64Nvme => "crc64nvme",
+            S3UploadIntegrity::Sha256 => "sha256",
+        }
+    }
+
+    /// The library-level mode the operator's own S3 client is built with.
+    pub fn mode(self) -> ravel_object_store::s3::UploadIntegrity {
+        match self {
+            S3UploadIntegrity::Off => ravel_object_store::s3::UploadIntegrity::Off,
+            S3UploadIntegrity::Crc64Nvme => ravel_object_store::s3::UploadIntegrity::Crc64Nvme,
+            S3UploadIntegrity::Sha256 => ravel_object_store::s3::UploadIntegrity::Sha256,
+        }
+    }
 }
 
 /// Gateway tier: replicas, resources, and optional fold tuning.

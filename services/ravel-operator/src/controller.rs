@@ -28,7 +28,7 @@ use kube::{Api, Client, Resource, ResourceExt};
 use kube_runtime::controller::{Action, Controller};
 use kube_runtime::{WatchStreamExt, predicates, reflector, watcher};
 use ravel_object_store::ObjectStoreBackend;
-use ravel_object_store::s3::{S3Config, S3Store};
+use ravel_object_store::s3::{S3Config, S3HttpConfig, S3Store};
 use ravel_types::{Signal, TenantHash, TenantHashScheme, TenantId};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -670,13 +670,24 @@ async fn build_auth_store(
     let (access_key_id, secret_access_key) =
         resolve_s3_credentials(client, namespace, &spec.storage.s3.credentials_secret_ref).await?;
     let config = auth_store_config(spec, access_key_id, secret_access_key)?;
-    S3Store::new(config).map_err(Error::Store)
+    S3Store::with_http_config(config, auth_store_http_config(spec)).map_err(Error::Store)
+}
+
+/// The HTTP client config [`build_auth_store`] connects with: the default
+/// tuning plus `spec.storage.s3.uploadIntegrity` and `requestStoredChecksum`,
+/// so the operator's own writes carry the checksum the server's do.
+fn auth_store_http_config(spec: &RavelClusterSpec) -> S3HttpConfig {
+    S3HttpConfig {
+        upload_integrity: spec.storage.s3.upload_integrity.mode(),
+        request_stored_checksum: spec.storage.s3.request_stored_checksum,
+        ..Default::default()
+    }
 }
 
 /// The [`S3Config`] [`build_auth_store`] connects with, split out from the
 /// Secret read so the plaintext-endpoint decision is testable without a
 /// `kube::Client`: the refusal is entirely here and `build_auth_store` is a
-/// credential read plus [`S3Store::new`] around it.
+/// credential read plus [`S3Store::with_http_config`] around it.
 fn auth_store_config(
     spec: &RavelClusterSpec,
     access_key_id: String,
@@ -3215,6 +3226,33 @@ mod tests {
         );
     }
 
+    /// The operator's own S3 client attaches the checksum the server pods do:
+    /// CRC64-NVME and the checksum-mode header by default (the library
+    /// default is `Off`, so a build that ignored the spec fails the first
+    /// assertion), and each spec field passed through.
+    #[test]
+    fn auth_store_http_config_follows_the_spec_checksum_fields() {
+        use crate::crd::S3UploadIntegrity;
+        use ravel_object_store::s3::UploadIntegrity;
+
+        let mut spec = spec_with_affinity(None);
+        let http = auth_store_http_config(&spec);
+        assert_eq!(http.upload_integrity, UploadIntegrity::Crc64Nvme);
+        assert!(http.request_stored_checksum);
+
+        spec.storage.s3.upload_integrity = S3UploadIntegrity::Off;
+        spec.storage.s3.request_stored_checksum = false;
+        let http = auth_store_http_config(&spec);
+        assert_eq!(http.upload_integrity, UploadIntegrity::Off);
+        assert!(!http.request_stored_checksum);
+
+        spec.storage.s3.upload_integrity = S3UploadIntegrity::Sha256;
+        assert_eq!(
+            auth_store_http_config(&spec).upload_integrity,
+            UploadIntegrity::Sha256
+        );
+    }
+
     /// A minimal spec whose only interesting field is `gateway.ingestAffinity`.
     fn spec_with_affinity(affinity: Option<IngestAffinitySpec>) -> RavelClusterSpec {
         RavelClusterSpec {
@@ -3227,6 +3265,8 @@ mod tests {
                     region: "eu-west-1".to_string(),
                     endpoint: None,
                     allow_http: false,
+                    upload_integrity: Default::default(),
+                    request_stored_checksum: true,
                     credentials_secret_ref: LocalSecretRef {
                         name: "ravel-s3".to_string(),
                     },
@@ -5069,6 +5109,8 @@ mod tests {
                         region: "us-east-1".to_string(),
                         endpoint: None,
                         allow_http: false,
+                        upload_integrity: Default::default(),
+                        request_stored_checksum: true,
                         credentials_secret_ref: LocalSecretRef {
                             name: "creds".to_string(),
                         },

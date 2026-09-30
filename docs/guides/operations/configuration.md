@@ -121,6 +121,47 @@ S3):
 A `--store s3` process with no bucket or no credentials fails at startup with an
 error naming the missing one. It never starts in a half-configured state.
 
+### Upload and read checksums
+
+Every PUT carries a CRC64-NVME checksum (`x-amz-checksum-crc64nvme`) by
+default. The endpoint verifies the body against it and rejects a PUT whose
+bytes changed on the way, so a corrupted object never becomes visible, and it
+stores the checksum with the object. Every request also asks the endpoint to
+return that stored checksum (`x-amz-checksum-mode: ENABLED`), and a full-object
+read is verified against it before the bytes are used. A mismatch is an error,
+not a wrong answer. This is the only check a commit record gets: it is a bare
+protobuf with no checksum of its own.
+
+- `--s3-upload-integrity` (`RAVEL_S3_UPLOAD_INTEGRITY`): `crc64nvme` (the
+  default), `sha256`, or `off`. `sha256` is verified by the endpoint on upload
+  only: Ravel cannot recompute it on read, so a read of an object stored with
+  it counts as unverified.
+- `--s3-request-stored-checksum` (`RAVEL_S3_REQUEST_STORED_CHECKSUM`): `true`
+  (the default) or `false`, written `--s3-request-stored-checksum=false`.
+  Turned off, no request asks for the stored checksum, and every full-object
+  read is served unverified and counted.
+
+AWS S3 and RustFS accept both headers. An endpoint that does not accept the
+upload checksum header fails the first write at startup with the endpoint's
+error. The remedy is `--s3-upload-integrity off`, and its cost is that every
+object the process writes, commit records included, has no transport checksum
+to verify against. An endpoint that rejects the checksum-mode request header
+needs `--s3-request-stored-checksum=false`. Both flags are ignored under
+`--store memory`.
+
+A read that finds no stored checksum it can check is served, never refused, and
+counted in `ravel_store_get_unverified_total` (see
+[Observability](../observability.md)). Objects written before upload checksums
+were on carry none, so the counter moves on an upgraded bucket until retention
+or a rewrite replaces them. A count that keeps growing on a bucket where every
+object was written with `crc64nvme` means the endpoint is not returning the
+checksums it stored.
+
+Under the Kubernetes operator the same two settings are
+`spec.storage.s3.uploadIntegrity` and `spec.storage.s3.requestStoredChecksum`
+on the `RavelCluster`. They also govern the operator's own S3 client.
+`ravel-cli` does not attach an upload checksum yet.
+
 ### Choosing a credential source
 
 `--s3-auth` picks where the credentials come from.

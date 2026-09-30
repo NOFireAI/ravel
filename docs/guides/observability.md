@@ -153,7 +153,12 @@ Four more store counters carry `mode` and no `op` label:
 
 `ravel_store_get_unverified_total` stays at zero on a backend other than S3.
 On S3 it moves when a full-object read comes back without a stored checksum
-the store can check the body against. The control-plane counters cover only
+the store can check the body against: an object written with
+`--s3-upload-integrity off` (or before upload checksums were on) or with
+`sha256`, an endpoint that does not return stored checksums, and every
+full-object read of a process started with
+`--s3-request-stored-checksum=false`. See
+[Upload and read checksums](operations/configuration.md#upload-and-read-checksums). The control-plane counters cover only
 the read-only bucket-configuration GETs behind the bucket-protection check.
 Those GETs are not object-store operations, so they never appear in the
 per-operation families above, and those families keep meaning data-plane

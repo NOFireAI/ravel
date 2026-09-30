@@ -137,6 +137,34 @@ impl S3Auth {
     }
 }
 
+/// Which server-verified checksum `--store s3` attaches to every PUT. The
+/// CLI-facing mirror of [`ravel_object_store::s3::UploadIntegrity`], whose
+/// library default is `Off`; the server's default is `crc64nvme`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum S3UploadIntegrity {
+    /// Attach no checksum.
+    Off,
+    /// Attach `x-amz-checksum-crc64nvme`, verified by the endpoint on receipt
+    /// and returned on a full-object read for the adapter to verify.
+    #[default]
+    #[value(name = "crc64nvme")]
+    Crc64Nvme,
+    /// Attach `x-amz-checksum-sha256`, verified by the endpoint on receipt.
+    /// A read of an object stored this way is counted unverified.
+    Sha256,
+}
+
+impl S3UploadIntegrity {
+    /// The library-level mode this flag value selects.
+    pub fn mode(self) -> ravel_object_store::s3::UploadIntegrity {
+        match self {
+            S3UploadIntegrity::Off => ravel_object_store::s3::UploadIntegrity::Off,
+            S3UploadIntegrity::Crc64Nvme => ravel_object_store::s3::UploadIntegrity::Crc64Nvme,
+            S3UploadIntegrity::Sha256 => ravel_object_store::s3::UploadIntegrity::Sha256,
+        }
+    }
+}
+
 /// The `--maintain-claims` values (ADR-1029 decision 5). The CLI-facing
 /// mirror of [`ravel_maintain::config::Coordination`], which lives in a crate
 /// that does not depend on clap.
@@ -607,6 +635,42 @@ pub struct Cli {
     /// address; a value redirects IMDS for tests and unusual deployments.
     #[arg(long, env = "RAVEL_S3_INSTANCE_METADATA_ENDPOINT", value_name = "URL")]
     pub s3_instance_metadata_endpoint: Option<String>,
+
+    /// Server-verified checksum attached to every PUT under `--store s3`:
+    /// `crc64nvme` (the default), `sha256`, or `off`. The endpoint verifies
+    /// the body against it and rejects a PUT whose bytes changed in transit,
+    /// and stores it so a full-object read can be verified against it. An
+    /// endpoint that does not accept the checksum header fails the first
+    /// startup write; `off` is the remedy, and leaves stored objects,
+    /// commit records included, with no transport checksum. `sha256` is
+    /// verified on upload only: a read of an object stored with it is
+    /// counted in `ravel_store_get_unverified_total`. Ignored under
+    /// `--store memory`.
+    #[arg(
+        long,
+        value_enum,
+        default_value = "crc64nvme",
+        env = "RAVEL_S3_UPLOAD_INTEGRITY",
+        value_name = "ALGORITHM"
+    )]
+    pub s3_upload_integrity: S3UploadIntegrity,
+
+    /// Ask the endpoint to return the checksum it stored at upload
+    /// (`x-amz-checksum-mode: ENABLED`) so a full-object read is verified
+    /// against it before the bytes are served. On by default. Pass
+    /// `--s3-request-stored-checksum=false` only for an endpoint that rejects
+    /// the header: every full-object read is then served unverified and
+    /// counted in `ravel_store_get_unverified_total`. The bare flag means
+    /// `true`. Ignored under `--store memory`.
+    #[arg(
+        long = "s3-request-stored-checksum",
+        env = "RAVEL_S3_REQUEST_STORED_CHECKSUM",
+        num_args = 0..=1,
+        default_value_t = true,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set,
+    )]
+    pub s3_request_stored_checksum: bool,
 
     /// Single-key SSE-KMS (ADR-0062 decision 1c): every PUT this process
     /// makes through the default store is encrypted with this KMS key ARN,
@@ -6457,6 +6521,17 @@ impl Cli {
         self.s3_region
             .clone()
             .unwrap_or_else(|| "us-east-1".to_string())
+    }
+
+    /// The HTTP client config `--store s3` builds its store with:
+    /// [`ravel_object_store::s3::S3HttpConfig::default`] plus
+    /// `--s3-upload-integrity` and `--s3-request-stored-checksum`.
+    pub fn s3_http_config(&self) -> ravel_object_store::s3::S3HttpConfig {
+        ravel_object_store::s3::S3HttpConfig {
+            upload_integrity: self.s3_upload_integrity.mode(),
+            request_stored_checksum: self.s3_request_stored_checksum,
+            ..Default::default()
+        }
     }
 
     /// Load and validate `--parquet-profiles` (ADR-2040 decision D1) through
@@ -14145,5 +14220,82 @@ mod tests {
             from_lf, from_crlf,
             "a CRLF tenant token file must parse to the same map as its LF equivalent"
         );
+    }
+
+    /// `--s3-upload-integrity` and `--s3-request-stored-checksum` reach the
+    /// `S3HttpConfig` `build_store` hands to `S3Store`: CRC64-NVME and the
+    /// checksum-mode header by default, and each flag value passed through.
+    /// The library default is `Off`, so a flag parsed but not copied into
+    /// the config fails the first `upload_integrity` assertion.
+    #[test]
+    fn s3_checksum_flags_reach_the_http_config() {
+        use ravel_object_store::s3::UploadIntegrity;
+
+        let default = cli(&["--store", "s3"]).s3_http_config();
+        assert_eq!(
+            default.upload_integrity,
+            UploadIntegrity::Crc64Nvme,
+            "the server attaches CRC64-NVME to every PUT by default"
+        );
+        assert!(
+            default.request_stored_checksum,
+            "the server asks for the stored checksum by default"
+        );
+
+        for (value, expected) in [
+            ("off", UploadIntegrity::Off),
+            ("crc64nvme", UploadIntegrity::Crc64Nvme),
+            ("sha256", UploadIntegrity::Sha256),
+        ] {
+            let http = cli(&["--store", "s3", "--s3-upload-integrity", value]).s3_http_config();
+            assert_eq!(
+                http.upload_integrity, expected,
+                "--s3-upload-integrity {value}"
+            );
+            assert!(
+                http.request_stored_checksum,
+                "--s3-upload-integrity {value} leaves the checksum-mode header on"
+            );
+        }
+
+        let off = cli(&["--store", "s3", "--s3-request-stored-checksum=false"]).s3_http_config();
+        assert!(
+            !off.request_stored_checksum,
+            "--s3-request-stored-checksum=false stops asking for the stored checksum"
+        );
+        assert_eq!(
+            off.upload_integrity,
+            UploadIntegrity::Crc64Nvme,
+            "the header switch leaves the upload checksum alone"
+        );
+        for on in [
+            &["--store", "s3", "--s3-request-stored-checksum=true"][..],
+            &["--store", "s3", "--s3-request-stored-checksum"][..],
+        ] {
+            assert!(
+                cli(on).s3_http_config().request_stored_checksum,
+                "{on:?} asks for the stored checksum"
+            );
+        }
+
+        assert!(
+            Cli::try_parse_from(["ravel-server", "--s3-upload-integrity", "md5"]).is_err(),
+            "an unknown algorithm is refused at parse time"
+        );
+    }
+
+    /// Both checksum flags are ignored under `--store memory`, like every
+    /// other `--s3-*` flag: a stray exported value cannot refuse the start.
+    #[test]
+    fn s3_checksum_flags_are_ignored_under_store_memory() {
+        cli(&[
+            "--store",
+            "memory",
+            "--s3-upload-integrity",
+            "off",
+            "--s3-request-stored-checksum=false",
+        ])
+        .validate()
+        .expect("--store memory ignores the S3 checksum flags");
     }
 }

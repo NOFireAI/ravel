@@ -419,8 +419,12 @@ pub fn build_store(cli: &Cli, cache_max_bytes: u64) -> anyhow::Result<BuiltStore
             // `ravel_store_calls_total` come from one snapshot (issue #928). Built
             // before the store so the connector and the decorator share it.
             let metrics = Arc::new(StoreMetrics::default());
-            let store = S3Store::with_metrics(config.clone(), Arc::clone(&metrics))
-                .map_err(|err| anyhow::anyhow!("failed to build S3 store: {err}"))?;
+            let store = S3Store::with_http_config_and_metrics(
+                config.clone(),
+                cli.s3_http_config(),
+                Arc::clone(&metrics),
+            )
+            .map_err(|err| anyhow::anyhow!("failed to build S3 store: {err}"))?;
 
             // Per-tenant SSE-KMS routing (ADR-0062 decision 1, ADR-0072
             // decision 2): off by default. Without --tenant-kms-config this builds exactly
@@ -1299,6 +1303,9 @@ mod tests {
         /// pin `attempts` to the exact number of billed requests on the wire
         /// rather than to `> 0` (issue #928).
         put_count: std::sync::atomic::AtomicUsize,
+        /// Every `x-amz-checksum-*` header of the most recent PUT, sorted by
+        /// name, so a test can see which checksum the built store attached.
+        put_checksum_headers: std::sync::Mutex<Vec<(String, String)>>,
     }
 
     async fn spawn_mock_s3() -> (String, Arc<MockS3>) {
@@ -1325,6 +1332,21 @@ mod tests {
                 header_text("authorization"),
                 header_text("x-amz-security-token"),
             ));
+            let mut checksum_headers: Vec<(String, String)> = headers
+                .iter()
+                .filter(|(name, _)| name.as_str().starts_with("x-amz-checksum-"))
+                .map(|(name, value)| {
+                    (
+                        name.as_str().to_string(),
+                        value.to_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect();
+            checksum_headers.sort();
+            *state
+                .put_checksum_headers
+                .lock()
+                .expect("put_checksum_headers lock") = checksum_headers;
             state
                 .put_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1502,6 +1524,99 @@ mod tests {
         assert_eq!(
             token, "imds-token",
             "the request must carry the IMDS session token"
+        );
+    }
+
+    /// The checksum headers a PUT through `build_store`'s store carries for
+    /// the given extra flags, from the mock S3's record of that PUT.
+    async fn put_checksum_headers_for(extra: &[&str]) -> Vec<(String, String)> {
+        use clap::Parser;
+
+        let (s3_endpoint, mock) = spawn_mock_s3().await;
+        let mut argv = vec![
+            "ravel-server",
+            "--store",
+            "s3",
+            "--s3-bucket",
+            "ravel-test",
+            "--s3-endpoint",
+            &s3_endpoint,
+            "--s3-access-key",
+            "test",
+            "--s3-secret-key",
+            "test",
+        ];
+        argv.extend_from_slice(extra);
+        let cli = Cli::try_parse_from(argv).expect("flags parse");
+        let built = build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES)
+            .expect("static-key S3 config must build without network access");
+        built
+            .foreground
+            .put("t/k", Bytes::from_static(b"hello"), PutOptions::default())
+            .await
+            .expect("put through the built store");
+        assert_eq!(
+            mock.put_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "precondition: the mock served exactly one PUT"
+        );
+        mock.put_checksum_headers
+            .lock()
+            .expect("put_checksum_headers lock")
+            .clone()
+    }
+
+    fn header_names(headers: &[(String, String)]) -> Vec<&str> {
+        headers.iter().map(|(name, _)| name.as_str()).collect()
+    }
+
+    /// `--s3-upload-integrity` and `--s3-request-stored-checksum` reach the
+    /// wire through `build_store`, not only the parsed `Cli`: with no flag the
+    /// PUT carries `x-amz-checksum-crc64nvme` and `x-amz-checksum-mode`,
+    /// `sha256` swaps the algorithm, `off` sends no upload checksum, and
+    /// `--s3-request-stored-checksum=false` drops the mode header. A
+    /// `build_store` that ignored `Cli::s3_http_config` would send no upload
+    /// checksum at all and fail the default case.
+    #[tokio::test]
+    async fn s3_checksum_flags_reach_the_put_on_the_wire() {
+        let default = put_checksum_headers_for(&[]).await;
+        assert_eq!(
+            header_names(&default),
+            vec!["x-amz-checksum-crc64nvme", "x-amz-checksum-mode"],
+            "the default PUT carries CRC64-NVME and asks for stored checksums"
+        );
+        assert!(
+            default
+                .iter()
+                .any(|(name, value)| name == "x-amz-checksum-crc64nvme" && !value.is_empty()),
+            "the CRC64-NVME header carries a digest: {default:?}"
+        );
+        assert!(
+            default
+                .iter()
+                .any(|(name, value)| name == "x-amz-checksum-mode" && value == "ENABLED"),
+            "the checksum-mode header is ENABLED: {default:?}"
+        );
+
+        let sha256 = put_checksum_headers_for(&["--s3-upload-integrity", "sha256"]).await;
+        assert_eq!(
+            header_names(&sha256),
+            vec!["x-amz-checksum-mode", "x-amz-checksum-sha256"],
+            "--s3-upload-integrity sha256 attaches SHA-256 instead"
+        );
+
+        let off = put_checksum_headers_for(&["--s3-upload-integrity", "off"]).await;
+        assert_eq!(
+            header_names(&off),
+            vec!["x-amz-checksum-mode"],
+            "--s3-upload-integrity off attaches no upload checksum"
+        );
+
+        let no_mode = put_checksum_headers_for(&["--s3-request-stored-checksum=false"]).await;
+        assert_eq!(
+            header_names(&no_mode),
+            vec!["x-amz-checksum-crc64nvme"],
+            "--s3-request-stored-checksum=false sends no checksum-mode header"
         );
     }
 
