@@ -806,8 +806,9 @@ impl BucketProtectionReport {
             .map(|entry| &entry.state)
     }
 
-    /// Count of conditions observed [`ConditionState::Fail`] (ADR-1727 decision
-    /// 5: the `ravel_bucket_protection_conditions_failed` gauge).
+    /// Count of conditions observed [`ConditionState::Fail`] across the whole
+    /// report. The server's `ravel_bucket_protection_conditions_failed` gauge
+    /// counts only the conditions it checks, not this.
     pub fn failed_count(&self) -> usize {
         self.conditions
             .iter()
@@ -815,8 +816,9 @@ impl BucketProtectionReport {
             .count()
     }
 
-    /// Count of conditions observed [`ConditionState::Unknown`] (ADR-1727
-    /// decision 5: the `ravel_bucket_protection_conditions_unknown` gauge).
+    /// Count of conditions observed [`ConditionState::Unknown`] across the
+    /// whole report. The server's `ravel_bucket_protection_conditions_unknown`
+    /// gauge counts only the conditions it checks, not this.
     pub fn unknown_count(&self) -> usize {
         self.conditions
             .iter()

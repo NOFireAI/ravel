@@ -142,8 +142,12 @@ data; verification is reads of configuration.
    was unobservable), `no-foreign-rule` failed, and `object-lock` disabled
    (already fatal under ADR-0072 decision 3). The server has no expected
    `E_v` and no replication or retention expectation, so
-   `noncurrent-expiration` checks presence in-process and the exact value
-   only in the CLI; `delete-marker-replication` and `object-retention` are
+   `noncurrent-expiration` checks presence in-process (narrowed by the
+   server gate amendment below: the gate also fails the condition on rules
+   that keep noncurrent versions longer, covering rules that disagree on
+   `NoncurrentDays`, or rules that expire noncurrent versions sooner) and
+   the exact value only in the CLI; `delete-marker-replication` and
+   `object-retention` are
    CLI-only (and `object-retention` is not checked by the CLI either yet: see
    the verify-protection retention amendment below). `Unknown` stays a
    warning plus gauge, as ADR-0072 decided.
@@ -326,3 +330,42 @@ supplies one: a sampled object whose `RetainUntilDate` has passed reads
 retention period says nothing about the retention on new writes. A sampled
 object with no retention at all, or with governance-mode retention, still
 reads `Fail`.
+
+## Amendment (2026-09-30): the server gate's noncurrent-expiration reading and its read deadline
+
+<!-- amendment-applies: sections="Decision" pointer="server gate amendment" -->
+<!-- amendment-supersedes: phrase="checks presence in-process" pointer="server gate amendment" -->
+
+The startup gate as built (follow-up task 3) differs from decision 5 in two
+ways.
+
+1. **`noncurrent-expiration` is more than a presence check in-process.**
+   Decision 5 says the condition checks presence in-process and the exact
+   value only in the CLI. The server still supplies no expected `E_v`, so it
+   never compares a covering rule's `NoncurrentDays` with one. The condition
+   reads the rules as the rule-scope and noncurrent-expiration amendment
+   above describes, though, so on a versioned bucket the gate also refuses
+   to start when a covering rule keeps `NewerNoncurrentVersions`, when
+   covering rules disagree on `NoncurrentDays`, and when a rule over part of
+   `t/` expires noncurrent versions sooner than the value the covering rules
+   agree on.
+
+2. **The bucket-configuration read has a deadline.** The server bounds its
+   whole read of the report (the three GETs `?versioning`, `?lifecycle` and
+   `?object-lock`) with one 10 s deadline. A read that has not finished by
+   then counts every checked condition `Unknown`, which logs a warning,
+   sets the gauges and starts, as decision 5 and ADR-0072 decided for
+   `Unknown`; it never refuses. The value comes from the operator's liveness
+   probe (5 s initial delay, 10 s period, failure threshold 3), which
+   restarts a pod on its third consecutive failure, between about 25 s and
+   35 s after the pod starts depending on the probe's tick phase. The
+   read-cache warm-up also runs before the main HTTP listener binds, which
+   the probe targets unless `dedicated_health_port` is set, and is bounded
+   by its own 10 s, so the two bounds together leave at least 5 s of the
+   earliest restart for the rest of startup.
+   The deadline covers the bucket-configuration read only. The
+   `sys/qualification` read that runs before it (ADR-0050 section 6) goes
+   through the retrying data-plane store and is bounded only by the store's
+   own request timeout and retries, so an endpoint that stalls every request
+   holds startup at that read first; the deadline helps when only the
+   control-plane GETs stall.

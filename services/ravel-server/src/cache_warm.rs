@@ -56,7 +56,7 @@ const MAX_PARTS_PER_TENANT_PER_SIGNAL: usize = 4;
 /// signal. A single deadline over the whole loop, not a per-fetch one: a
 /// store with many tenants must not warm zero of them just because the
 /// first several were slow.
-const WARM_DEADLINE: Duration = Duration::from_secs(10);
+pub(crate) const WARM_DEADLINE: Duration = Duration::from_secs(10);
 
 /// How far back "most recent" looks when resolving parts to warm, measured
 /// from the tenant's own latest ingest hour rather than wall-clock `now`

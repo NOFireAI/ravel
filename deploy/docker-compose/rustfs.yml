@@ -37,14 +37,38 @@ services:
     # readiness wait; the service exits 0 only once the bucket exists. The
     # image's entrypoint is the `aws` binary itself, so running more than one
     # command needs an explicit shell.
-    entrypoint: >
-      /bin/sh -c "
-      i=0;
-      until aws --endpoint-url http://rustfs:9000 s3api list-buckets >/dev/null 2>&1; do
-        i=$$((i + 1));
-        if [ $$i -ge 120 ]; then echo 'rustfs did not answer a signed call in 120 s'; exit 1; fi;
-        echo 'waiting for rustfs'; sleep 1;
-      done &&
-      { aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket ravel-dev ||
-        aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket ravel-dev; } &&
-      aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket ravel-dev"
+    #
+    # The bucket is created the way a --require-bucket-protection deployment
+    # needs it (docs/object-store-contract.md "Required bucket configuration"):
+    # Object Lock enabled at creation, versioning on, and one whole-bucket
+    # lifecycle rule carrying the sanctioned actions, the same script as
+    # deploy/docker-compose/ravel.yml. NoncurrentDays 1 keeps a dev bucket's
+    # noncurrent versions briefly. A `rustfs-data/` created before this bucket
+    # carried Object Lock fails the read-back below; remove it to start over.
+    # crates/ravel-object-store's
+    # `launcher_lifecycle_documents_pass_every_in_process_condition` test reads
+    # the lifecycle document from this file.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        LIFECYCLE='{"Rules":[{"ID":"ravel","Filter":{"Prefix":""},"Status":"Enabled","Expiration":{"ExpiredObjectDeleteMarker":true},"NoncurrentVersionExpiration":{"NoncurrentDays":1},"AbortIncompleteMultipartUpload":{"DaysAfterInitiation":7}}]}'
+        s3() { aws --endpoint-url http://rustfs:9000 s3api "$$@"; }
+        i=0
+        until s3 list-buckets >/dev/null 2>&1; do
+          i=$$((i + 1))
+          if [ $$i -ge 120 ]; then echo 'rustfs did not answer a signed call in 120 s'; exit 1; fi
+          echo 'waiting for rustfs'; sleep 1
+        done
+        s3 head-bucket --bucket ravel-dev 2>/dev/null ||
+          s3 create-bucket --bucket ravel-dev --object-lock-enabled-for-bucket
+        s3 head-bucket --bucket ravel-dev
+        s3 put-bucket-versioning --bucket ravel-dev --versioning-configuration Status=Enabled
+        s3 put-bucket-lifecycle-configuration --bucket ravel-dev --lifecycle-configuration "$$LIFECYCLE"
+        test "$$(s3 get-object-lock-configuration --bucket ravel-dev --query ObjectLockConfiguration.ObjectLockEnabled --output text)" = Enabled
+        test "$$(s3 get-bucket-versioning --bucket ravel-dev --query Status --output text)" = Enabled
+        test "$$(s3 get-bucket-lifecycle-configuration --bucket ravel-dev --query 'Rules[0].AbortIncompleteMultipartUpload.DaysAfterInitiation' --output text)" = 7
+        test "$$(s3 get-bucket-lifecycle-configuration --bucket ravel-dev --query 'Rules[0].NoncurrentVersionExpiration.NoncurrentDays' --output text)" = 1
+        test "$$(s3 get-bucket-lifecycle-configuration --bucket ravel-dev --query 'to_string(Rules[0].Expiration.ExpiredObjectDeleteMarker)' --output text)" = true
+        echo 'bucket ravel-dev ready: Object Lock, versioning and lifecycle rules set'
