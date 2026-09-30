@@ -1403,7 +1403,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   index: it hands the scan a footer with no column index or offset index, and
   the scan runs with DataFusion's `enable_page_index` off, so every column
   chunk is decoded by page header and a corrupt offset index changes no row,
-  including when a join or TopK pushes a dynamic filter into the scan.
+  including when a join or TopK pushes a dynamic filter into the scan. A
+  panic in the Parquet decoder while it decodes a corrupt file is reported as
+  `Corrupt`, naming the table and the file, not as an operator panic.
   Row-group statistics pruning and `pushdown_filters` are unchanged; there is
   no page-level pruning. Decoded footers and refusals are cached per pinned
   file and footer length the manifest recorded. A refusal is cached: a footer

@@ -54,8 +54,10 @@ pub(crate) fn record_opened(key: String) {
 /// It is transparent to the optimizer: its properties are the inner plan's,
 /// and every rewrite DataFusion would apply to the inner plan (projection,
 /// limit and filter pushdown, file-scan repartitioning) is applied to it
-/// below this node. EXPLAIN shows one extra node,
-/// `ParquetPanicBoundaryExec: table=<table>`, above the scan.
+/// below this node. File-scan repartitioning needs no forwarding: DataFusion
+/// repartitions a scan from the node directly above it, which is this one.
+/// EXPLAIN shows one extra node, `ParquetPanicBoundaryExec: table=<table>`,
+/// above the scan.
 #[derive(Debug)]
 pub(crate) struct ParquetPanicBoundaryExec {
     table: String,
@@ -67,6 +69,7 @@ impl ParquetPanicBoundaryExec {
         ParquetPanicBoundaryExec { table, inner }
     }
 
+    #[cfg(test)]
     pub(crate) fn inner(&self) -> &Arc<dyn ExecutionPlan> {
         &self.inner
     }
@@ -118,17 +121,6 @@ impl ExecutionPlan for ParquetPanicBoundaryExec {
             DataFusionError::Internal("ParquetPanicBoundaryExec takes one child".to_string())
         })?;
         Ok(self.over(inner))
-    }
-
-    fn repartitioned(
-        &self,
-        target_partitions: usize,
-        config: &ConfigOptions,
-    ) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
-        Ok(self
-            .inner
-            .repartitioned(target_partitions, config)?
-            .map(|inner| self.over(inner)))
     }
 
     fn execute(
