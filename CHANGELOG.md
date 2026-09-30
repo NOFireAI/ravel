@@ -616,6 +616,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   nonzero window is accepted, since the sweep deletes a whole immutable record
   only once its newest event is older than the window; an unparseable value
   is refused at startup, before the server writes to the bucket.
+- **`ravel-server` exports the unverified-read and control-plane store
+  counters at `/metrics`** (issues #2172, #1727, #1696).
+  `ravel_store_get_unverified_total` counts full-object reads served without
+  verifying the body against a stored checksum;
+  `ravel_store_control_plane_requests_total`,
+  `ravel_store_control_plane_calls_total` and
+  `ravel_store_control_plane_response_bytes_total` count the bucket-protection
+  control plane's read-only GETs sent, answered, and their response body bytes.
+  All four carry `mode` and no `op` label, and the control-plane GETs stay out
+  of the per-operation `ravel_store_*` families. `ravel-server` itself sends
+  no control-plane GET yet (its startup check probes through the generic
+  store, issue #2197), so the three control-plane counters read 0.
 - **A read-only bucket-protection control plane in `ravel-object-store`**
   (ADR-1727 follow-up task 1, issue #1727). `S3Store` can now report, per
   condition, whether the bucket's protection configuration is Pass, Fail, or

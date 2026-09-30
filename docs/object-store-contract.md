@@ -706,10 +706,9 @@ No server or CLI flag sets it yet; that is ADR-1696 follow-up task 2.
 
 **A read with no verifiable checksum is served and counted, never refused**
 (decision 3). The count is `StoreMetricsSnapshot::get_unverified` (also
-`S3Store::get_unverified`); it is meant to be exported as
-`ravel_store_get_unverified_total`, but `ravel-server` does not render it at
-`/metrics` yet (ADR-1696 follow-up task 2), so today it is readable only
-through those two accessors. Three things land there: a response with no
+`S3Store::get_unverified`); `ravel-server` exports it at `/metrics` as
+`ravel_store_get_unverified_total`, a counter labelled `mode` only. Three
+things land there: a response with no
 `x-amz-checksum-*` header (an endpoint that stores no checksum, one that ignored
 checksum mode, or a store with `request_stored_checksum` off), a response
 carrying a digest this adapter cannot recompute (SHA-256, which has no

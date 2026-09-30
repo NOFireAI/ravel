@@ -294,7 +294,19 @@ checksum header, and the adapter recomputes the digest over the body it read
 before returning it. And the count decision 3 names
 `ravel_store_get_unverified_total` is on `StoreMetricsSnapshot::get_unverified`
 and `S3Store::get_unverified`; `ravel-server` does not export it at `/metrics`
-until follow-up task 2.
+until follow-up task 2 (it now does; see the 2026-09-30 export amendment).
 
 The RustFS contract lane now asserts the premise directly: a `Crc64Nvme` PUT
 read back whole moves the unverified count by exactly 0.
+
+## Amendment (2026-09-30): the unverified-read counter is exported
+
+<!-- amendment-applies: sections="Amendment (2026-09-27, #1696): checksums come only from unranged responses" pointer="2026-09-30 export amendment" -->
+<!-- amendment-supersedes: phrase="does not export it at `/metrics`" pointer="2026-09-30 export amendment" -->
+
+`ravel-server` now renders `ravel_store_get_unverified_total` at `/metrics`, a
+counter labelled `mode` and nothing else, read from the same
+`StoreMetricsSnapshot` as the per-operation `ravel_store_*` families. The
+`/metrics` export the 2026-09-27 amendment assigned to follow-up task 2 is
+done; the `S3HttpConfig::request_stored_checksum` flag it also assigned there
+is not.

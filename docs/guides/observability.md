@@ -123,7 +123,8 @@ with rules, whether or not that process currently holds a tenant's alert lease.
 
 ### Object store (`ravel_store_*`)
 
-Labels: `mode`, `op`, and `error_kind` on the error counter only.
+Labels on the per-operation families below: `mode`, `op`, and `error_kind` on
+the error counter only.
 
 | Metric | Meaning |
 |---|---|
@@ -140,6 +141,26 @@ histogram renders one `_bucket` series per bound with an `le` label, plus a
 These counters are process-global. They sum every caller, so an ingest get and
 a query get land in the same series. Per-query attribution lives in the
 per-query cost family below.
+
+Four more store counters carry `mode` and no `op` label:
+
+| Metric | Meaning |
+|---|---|
+| `ravel_store_get_unverified_total` | Full-object reads served without verifying the body against a stored checksum. |
+| `ravel_store_control_plane_requests_total` | Bucket-protection control-plane GETs sent, counted before dispatch. |
+| `ravel_store_control_plane_calls_total` | Bucket-protection control-plane GETs that got an HTTP response back, whatever its status. |
+| `ravel_store_control_plane_response_bytes_total` | Wire bytes of the control-plane response bodies, as received. |
+
+`ravel_store_get_unverified_total` stays at zero on a backend other than S3.
+On S3 it moves when a full-object read comes back without a stored checksum
+the store can check the body against. The control-plane counters cover only
+the read-only bucket-configuration GETs behind the bucket-protection check.
+Those GETs are not object-store operations, so they never appear in the
+per-operation families above, and those families keep meaning data-plane
+traffic only. The server sends none of these GETs yet: its startup
+bucket-protection check runs through the generic store and reports unknown,
+so the three control-plane counters read 0 until that check uses the S3
+control plane.
 
 ### Ingest pipelines (`ravel_ingest_*`)
 
