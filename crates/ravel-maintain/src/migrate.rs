@@ -2021,6 +2021,112 @@ mod tests {
         assert_eq!(audit, BelowTargetReport::default());
     }
 
+    /// The floor a migrate run raised, and how `audit-versions` classifies it
+    /// against a fresh census: the same enumeration and the same observation
+    /// its floor-evidence step builds, over the two-shard range.
+    async fn classify_raised_floor(
+        store: &dyn ObjectStoreBackend,
+    ) -> (
+        ravel_catalog::FormatFloor,
+        FamilyCensus,
+        ravel_catalog::FloorEvidence,
+    ) {
+        let floors = ravel_catalog::read_floors_from_store(store, &tenant_hash(), Signal::Metrics)
+            .await
+            .expect("read floors")
+            .expect("provisioned");
+        assert_eq!(floors.len(), 1, "one raised floor: {floors:?}");
+        let floor = floors[0].clone();
+        let census = census_family(store, &tenant_hash(), Signal::Metrics, 2)
+            .await
+            .expect("census");
+        let observed = ravel_catalog::FloorObservation {
+            live_below_floor: census.live_below(floor.floor_version) as u64,
+            newest_created_unix_ns: census.newest_live_created_unix_ns,
+            scan_shards: 2,
+        };
+        let evidence = ravel_catalog::classify_floor(&floor, &observed);
+        (floor, census, evidence)
+    }
+
+    /// A floor migrate raises records the re-audit that verified it (ADR-1746
+    /// decision 1), and that basis is exactly what `audit-versions` counts:
+    /// the entries, newest creation time and shard range equal a census taken
+    /// right after the raise, so the floor classifies `Current` rather than
+    /// `Unknown`. One more commit record at the floor, created later, then
+    /// makes it `Stale`.
+    ///
+    /// The tenant mixes every population the basis has to agree with the
+    /// census on: a bucket the walk rewrites (its L0 record superseded and
+    /// excluded, its compaction record's part counted and, created at the
+    /// migrate clock, the newest record), and a live L0 record already at the
+    /// target on the other shard.
+    #[tokio::test]
+    async fn raised_floor_records_the_verifying_census_as_its_basis() {
+        let store = MemoryStore::new();
+        provision(&store, 2).await;
+        let target = VERSION_V7 as u32;
+        seed_at(&store, 0, 100, 1, "alpha", target - 1).await;
+        seed_at(&store, 1, 100, 2, "beta", target).await;
+
+        let now = sealed_now_ns_for(100);
+        let clock = FixedClock::new(now);
+        let report = migrate_family(
+            &store,
+            &clock,
+            &CompactorConfig::default(),
+            tenant_hash(),
+            Signal::Metrics,
+            FAMILY,
+            target,
+            2,
+            MigrateBudget::unlimited(),
+            "test",
+        )
+        .await
+        .expect("migrate");
+        assert_eq!(report.buckets_migrated, 1);
+        assert_eq!(
+            report.verification,
+            Some(Verification::FloorRaised {
+                floor_version: target
+            })
+        );
+
+        let (floor, census, evidence) = classify_raised_floor(&store).await;
+        let live_entries: usize = census.live_l0.values().chain(census.parts.values()).sum();
+        let newest = census
+            .newest_live_created_unix_ns
+            .expect("the census saw live records");
+        assert_eq!(
+            floor.basis,
+            Some(ravel_catalog::FloorBasis {
+                observed_entries: live_entries as u64,
+                observed_newest_created_unix_ns: newest,
+                observed_shards: 2,
+            }),
+            "the basis is the census the raise was verified against"
+        );
+        // The same figures as literals: the live L0 record on shard 1 plus the
+        // rewrite's one part, the newest being the compaction record created
+        // at the migrate clock.
+        assert_eq!(live_entries, 2);
+        assert_eq!(newest, now);
+        assert_eq!(
+            evidence,
+            ravel_catalog::FloorEvidence::Current,
+            "right after the raise nothing is newer than the basis"
+        );
+
+        seed_at(&store, 0, 110, 3, "gamma", target).await;
+        let (_, _, evidence) = classify_raised_floor(&store).await;
+        assert_eq!(
+            evidence,
+            ravel_catalog::FloorEvidence::Stale,
+            "a record at the floor created after the basis leaves it stale"
+        );
+    }
+
     /// The L1 part keys the migration published for one `(shard, hour)` bucket,
     /// read out of its compaction record, so the test can open the rewrite's own
     /// output through the production RSEG reader rather than a copy of it.

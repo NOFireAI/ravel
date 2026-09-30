@@ -621,7 +621,10 @@ target on-object format version. One invocation:
 2. stops early and persists the cursor once `--budget-records` is spent (`0`,
    the default, is unlimited; re-run to resume), or, once the walk drains,
    re-audits fresh and raises the floor only if that re-audit finds zero records
-   below the target.
+   below the target. The raised floor records that re-audit as its basis: the
+   live entries it counted (live L0 commit records plus every compaction and
+   rewrite part), the newest creation time among its records, and the shard
+   range it scanned.
 
 A refused raise, reported as "FOUND STRAGGLERS", means the fresh re-audit found
 objects that still exist below the target, some of which queries still read. It
@@ -785,8 +788,10 @@ Beside each signal's histogram it prints every recorded format floor with its
 basis and a classification against the records it just read: `current`,
 `stale` (records newer than the basis, or a wider shard range), `contradicted`
 (a live record below the floor), or `unknown` (the floor records no basis,
-which is true of every floor raised so far). It also exits nonzero when any
-floor is `contradicted`.
+which is true of every floor raised before `migrate` began recording one). A
+floor `migrate` just raised is `current` until a record newer than its basis
+lands or the shard range grows. It also exits nonzero when any floor is
+`contradicted`.
 
 Each format supports exactly one version and carries no reader for the
 previous one, so any live object at another version is an anomaly to re-ingest,
