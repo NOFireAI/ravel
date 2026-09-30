@@ -370,7 +370,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   or a permanent error) now stops only the chain it belongs to: that chain
   deletes none of its later keys that pass, its requests are reported held,
   and the other chains are collected. The pass counts each refusal in
-  `SupersededSweepOutcome::deletes_refused` and logs it. A pass in which
+  `SupersededSweepOutcome::deletes_refused` and
+  `SweepReport::superseded_deletes_refused` and logs it, and the server
+  sums the count per signal in the new
+  `ravel_maintain_superseded_deletes_refused_total` counter on `/metrics`,
+  since the unit's tick no longer records a refusal as failed. A pass in which
   every delete it attempted was refused still fails, with the first
   refusal's error, so a credential without delete permission fails the pass
   as it did before. A retryable error, a read-only

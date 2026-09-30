@@ -809,7 +809,8 @@ into them. An operator with erasure obligations must budget them deliberately.
   chain's tail when the two share it, and that is safe: a chain moves past a
   key only once that key is deleted, and every object a record supersedes
   sits earlier in that record's own chain. The pass reports the chain's
-  requests as held, counts the refusal in its `deletes_refused`, and still
+  requests as held, counts the refusal in its `deletes_refused` (summed on
+  `/metrics` as `ravel_maintain_superseded_deletes_refused_total`), and still
   collects every other chain, provided at least one delete in the pass
   succeeds. A pass in which every delete it attempted was refused fails with
   the first refusal's error, which is what a credential without delete

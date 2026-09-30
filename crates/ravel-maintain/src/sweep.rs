@@ -203,6 +203,13 @@ pub struct SweepReport {
     pub superseded_records_deleted: usize,
     /// Rule 2: superseded L0 data objects deleted.
     pub superseded_data_deleted: usize,
+    /// Rule 2: deletes the store refused this pass
+    /// ([`SupersededSweepOutcome::deletes_refused`]). The refusing chain keeps
+    /// its remaining keys for a later pass and the pass still succeeds, so this
+    /// field is the only per-pass record of the refusal; it feeds
+    /// `ravel_maintain_superseded_deletes_refused_total`. The steady state is
+    /// `0`.
+    pub superseded_deletes_refused: usize,
     /// Rule 3: unreferenced `l1/` part objects deleted.
     pub unreferenced_parts_deleted: usize,
     /// Bytes of the objects [`Self::quarantine_reaped`] deleted this pass, from
@@ -276,8 +283,10 @@ pub async fn sweep_shard(
 /// [`sweep_shard`], also returning what rule 2 held this pass, unioned with
 /// [`SupersededHolds::absorb`] across shards. These are a deleting pass's
 /// holds, which miss every chain under a rewrite still inside its protection
-/// horizon, so they are an operator signal and not an input to rule 6:
-/// [`sweep_erasure_requests`] observes its own.
+/// horizon, so they are not an input to rule 6: [`sweep_erasure_requests`]
+/// observes its own. The operator signal for a hold is the WARN line this pass
+/// logs; the returned value is for a caller that wants to aggregate the holds
+/// across shards.
 pub async fn sweep_shard_with_holds(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -334,6 +343,7 @@ pub async fn sweep_shard_with_holds(
             quarantine_reaped: quarantine.reaped,
             superseded_records_deleted: superseded.records_deleted,
             superseded_data_deleted: superseded.data_deleted,
+            superseded_deletes_refused: superseded.deletes_refused,
             unreferenced_parts_deleted,
             quarantine_reaped_bytes: quarantine.reaped_bytes,
             unreferenced_parts_bytes,
@@ -531,6 +541,7 @@ pub async fn sweep_shard_zoned_with_holds(
             quarantine_reaped: quarantine.reaped,
             superseded_records_deleted: superseded.records_deleted,
             superseded_data_deleted: superseded.data_deleted,
+            superseded_deletes_refused: superseded.deletes_refused,
             unreferenced_parts_deleted,
             quarantine_reaped_bytes: quarantine.reaped_bytes,
             unreferenced_parts_bytes,
@@ -1050,9 +1061,11 @@ pub struct SupersededSweepOutcome {
     /// succeeds: the refusing group keeps every key it had not yet deleted and
     /// is reported held, the next pass whose scope includes that hour retries
     /// it, and the other groups are collected. A pass in which every delete it
-    /// attempted was refused fails with the first refusal's error instead. The
-    /// count is on this outcome and each refusal is logged at WARN; a
-    /// persistent nonzero value is an operator signal.
+    /// attempted was refused fails with the first refusal's error instead. Each
+    /// refusal is logged at WARN, and the combined pass copies the count into
+    /// [`SweepReport::superseded_deletes_refused`], which feeds
+    /// `ravel_maintain_superseded_deletes_refused_total`; a persistent nonzero
+    /// value is an operator signal.
     pub deletes_refused: usize,
 }
 

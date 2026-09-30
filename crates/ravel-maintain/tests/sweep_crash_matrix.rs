@@ -14,9 +14,11 @@
 
 mod common;
 
+use std::collections::BTreeSet;
+
 use common::*;
 use prost::Message;
-use ravel_commit::{keys, signal};
+use ravel_commit::{erasure, keys, signal};
 use ravel_maintain::{
     Bucket, Clock, CompactionOutcome, CompactorConfig, ErasureRewriteOutcome, FixedClock,
     MaintainMemo, NoLeases, PendingErasureRequest, PublishOutcome, compact_bucket,
@@ -27,7 +29,9 @@ use ravel_object_store::fault::{
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, StoreError, list_all};
-use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest, RetentionTombstone};
+use ravel_proto::commit::v1::{
+    ErasurePredicateMatcher, ErasureRequest, RetentionTombstone, RewriteRecord,
+};
 use ravel_types::Signal;
 use uuid::Uuid;
 
@@ -809,6 +813,416 @@ async fn row8e_refused_commit_record_delete_stops_only_its_own_group() {
     run(Sig::Metrics).await;
     run(Sig::Logs).await;
     run(Sig::Spans).await;
+}
+
+/// Row 8e through the combined passes: the refusal a pass tolerates reaches
+/// [`ravel_maintain::SweepReport::superseded_deletes_refused`], the field the
+/// server's `ravel_maintain_superseded_deletes_refused_total` counter sums.
+/// Both entries that build a report are covered, `sweep_shard` and
+/// `sweep_shard_zoned`, each on its own fixture.
+///
+/// Discrimination: building either report with `superseded_deletes_refused:
+/// 0` in place of `superseded.deletes_refused` fails that entry's
+/// `assert_eq!(.., 1)`.
+#[tokio::test]
+async fn row8e_refusal_reaches_the_sweep_report() {
+    for zoned in [false, true] {
+        let inner = MemoryStore::new();
+        let created = sealed_now_ns();
+        let clock = FixedClock::new(created);
+        let bucket = seed_and_compact(&inner, &clock, Sig::Metrics).await;
+        let commits = l0_commit_keys(&inner, &bucket).await;
+        assert_eq!(commits.len(), 2, "the fixture holds two superseded inputs");
+        let denied = commits[0].clone();
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Delete, ScriptedFault::Permanent("delete denied".into()))
+                .with_key_contains(&denied),
+        );
+        let store = FaultStore::new(inner, plan);
+
+        clock.set(past_horizon(created, &cfg()));
+        let report = if zoned {
+            sweep_shard_zoned(
+                &store,
+                &clock,
+                &cfg(),
+                &NoLeases,
+                &bucket.tenant_hash,
+                bucket.signal,
+                bucket.shard,
+                &[bucket.ingest_hour_bucket],
+            )
+            .await
+        } else {
+            sweep_shard(
+                &store,
+                &clock,
+                &cfg(),
+                &NoLeases,
+                &bucket.tenant_hash,
+                bucket.signal,
+                bucket.shard,
+            )
+            .await
+        }
+        .expect("a refused delete does not fail the pass");
+        assert_eq!(
+            store.fault_count(Op::Delete, FaultKind::Permanent),
+            1,
+            "the refusal must have fired exactly once (zoned: {zoned})"
+        );
+        assert_eq!(
+            report.superseded_deletes_refused, 1,
+            "the report carries the refusal (zoned: {zoned}): {report:?}"
+        );
+        assert_eq!(
+            (
+                report.superseded_records_deleted,
+                report.superseded_data_deleted
+            ),
+            (1, 1),
+            "the other input is collected (zoned: {zoned})"
+        );
+        assert_eq!(l0_commit_keys(&store, &bucket).await, vec![denied]);
+    }
+}
+
+// --- Rows 8f and 8g: a refusal in the data loop and the chain-record loop ---
+
+/// Every key currently under the test tenant, across every signal and prefix.
+async fn tenant_keys(store: &dyn ObjectStoreBackend) -> BTreeSet<String> {
+    list_all(store, &format!("t/{}/", tenant_hash().to_hex()))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.key)
+        .collect()
+}
+
+/// The data-object key the commit record at `key` names.
+async fn data_key_of(store: &dyn ObjectStoreBackend, key: &str) -> String {
+    let bytes = get_full(store, key).await;
+    let record = ravel_commit::record::decode(&bytes).unwrap();
+    keys::reconstruct_data_key(&record).unwrap()
+}
+
+/// The rewrite record at `key`.
+async fn rewrite_record(store: &dyn ObjectStoreBackend, key: &str) -> RewriteRecord {
+    erasure::decode_rewrite(&get_full(store, key).await).unwrap()
+}
+
+/// Keys of a supersession chain with two rewrite generations over one
+/// compaction in [`HOUR`], plus a plain compaction in the hour before it.
+///
+/// The chain is one deletion group, entered from the live rewrite R2. Its
+/// input-record loop deletes the compaction's two input commit records, its
+/// data loop deletes their data objects (in the compaction record's input
+/// order) and then the parts of R1 and of the compaction, and its chain-record
+/// loop deletes the compaction record and then R1. R2 is live and never
+/// deleted. The other hour's two raw inputs are two more groups, each a commit
+/// record and a data object and nothing else.
+struct RefusalFixture {
+    input_commits: Vec<String>,
+    input_data: Vec<String>,
+    parts: Vec<String>,
+    compaction: String,
+    r1: String,
+    r2: String,
+    other_commits: Vec<String>,
+    other_data: Vec<String>,
+}
+
+impl RefusalFixture {
+    /// Every key of the chain group, in its delete order within each loop.
+    fn chain_group(&self) -> Vec<String> {
+        self.input_commits
+            .iter()
+            .chain(&self.input_data)
+            .chain(&self.parts)
+            .chain([&self.compaction, &self.r1])
+            .cloned()
+            .collect()
+    }
+
+    /// Every key of the other hour's groups.
+    fn other_groups(&self) -> Vec<String> {
+        self.other_commits
+            .iter()
+            .chain(&self.other_data)
+            .cloned()
+            .collect()
+    }
+}
+
+async fn seed_refusal_fixture(
+    store: &dyn ObjectStoreBackend,
+    clock: &FixedClock,
+) -> RefusalFixture {
+    let chain_bucket = bucket();
+    for spec in erasure_metrics_specs() {
+        seed_input(store, &spec).await;
+    }
+    let outcome = compact_bucket(store, clock, &cfg(), &chain_bucket)
+        .await
+        .expect("compact");
+    assert!(
+        matches!(outcome, CompactionOutcome::Compacted { .. }),
+        "expected Compacted, got {outcome:?}"
+    );
+    let compaction = compaction_record_key(store, &chain_bucket).await;
+    let record = fetch_compaction_record(store, &chain_bucket).await;
+    let mut input_commits = Vec::new();
+    let mut input_data = Vec::new();
+    for input in &record.inputs {
+        let key = keys::commit_key(
+            &chain_bucket.tenant_hash,
+            chain_bucket.signal,
+            chain_bucket.shard,
+            chain_bucket.ingest_hour_bucket,
+            Uuid::parse_str(&input.writer_id).unwrap(),
+            input.writer_epoch,
+            input.writer_seq,
+        )
+        .unwrap();
+        input_data.push(data_key_of(store, &key).await);
+        input_commits.push(key);
+    }
+    assert_eq!(input_commits.len(), 2);
+
+    for (seed, metric) in [(42, "victim"), (43, "absent")] {
+        let mut memo = MaintainMemo::with_default_interval();
+        let rewrite = erasure_rewrite_bucket(
+            store,
+            clock,
+            &cfg(),
+            &NoLeases,
+            &chain_bucket,
+            &[pending_erasure(seed, metric)],
+            &mut memo,
+        )
+        .await
+        .expect("rewrite");
+        assert!(
+            matches!(rewrite, ErasureRewriteOutcome::Rewritten { .. }),
+            "each request publishes one generation, got {rewrite:?}"
+        );
+    }
+    let prefix = keys::commit_shard_hour_prefix(
+        &chain_bucket.tenant_hash,
+        chain_bucket.signal,
+        chain_bucket.shard,
+        chain_bucket.ingest_hour_bucket,
+    )
+    .unwrap();
+    let mut rewrites: Vec<(String, RewriteRecord)> = Vec::new();
+    for meta in list_all(store, &prefix).await.unwrap() {
+        if matches!(
+            keys::partition_bucket_entry(&meta.key),
+            Ok(keys::BucketEntry::RewriteRecord(_))
+        ) {
+            let record = rewrite_record(store, &meta.key).await;
+            rewrites.push((meta.key, record));
+        }
+    }
+    assert_eq!(rewrites.len(), 2, "two rewrite generations");
+    let find = |superseded: &str| {
+        rewrites
+            .iter()
+            .find(|(_, r)| r.superseded_record_key == superseded)
+            .unwrap_or_else(|| panic!("no rewrite supersedes {superseded}"))
+            .clone()
+    };
+    let (r1, r1_record) = find(&compaction);
+    let (r2, _) = find(&r1);
+    let mut parts: Vec<String> = r1_record
+        .parts
+        .iter()
+        .map(|p| keys::reconstruct_rewrite_part_key(&r1_record, p).unwrap())
+        .collect();
+    parts.extend(
+        record
+            .parts
+            .iter()
+            .map(|p| keys::reconstruct_l1_part_key(&record, p).unwrap()),
+    );
+    assert!(!parts.is_empty(), "the chain's generations published parts");
+
+    let other_bucket = bucket_at(HOUR - 1);
+    for (writer, seq) in [(11, 1), (12, 2)] {
+        seed_input(
+            store,
+            &InputSpec::new_at(
+                HOUR - 1,
+                Uuid::from_u128(writer),
+                10,
+                seq,
+                vec![raw_series("m", &[("k", "o")], &[(1_000, 1.0)])],
+            ),
+        )
+        .await;
+    }
+    let outcome = compact_bucket(store, clock, &cfg(), &other_bucket)
+        .await
+        .expect("compact the other hour");
+    assert!(
+        matches!(outcome, CompactionOutcome::Compacted { .. }),
+        "expected Compacted, got {outcome:?}"
+    );
+    let other_commits = l0_commit_keys(store, &other_bucket).await;
+    assert_eq!(other_commits.len(), 2);
+    let mut other_data = Vec::new();
+    for key in &other_commits {
+        other_data.push(data_key_of(store, key).await);
+    }
+
+    RefusalFixture {
+        input_commits,
+        input_data,
+        parts,
+        compaction,
+        r1,
+        r2,
+        other_commits,
+        other_data,
+    }
+}
+
+/// Run the superseded sweep over [`seed_refusal_fixture`] past the horizon
+/// with every delete of `denied(fixture)` refused, and assert the refusal
+/// stopped the chain group exactly at that key: the group's keys before it
+/// are gone, it and every later key of the group survive (`kept`, in delete
+/// order), the other hour's groups are fully collected, and nothing else
+/// under the tenant moved.
+async fn assert_chain_stops_at(
+    denied: fn(&RefusalFixture) -> String,
+    kept: fn(&RefusalFixture) -> Vec<String>,
+) {
+    let inner = MemoryStore::new();
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let fixture = seed_refusal_fixture(&inner, &clock).await;
+    let denied = denied(&fixture);
+    let kept = kept(&fixture);
+    assert_eq!(kept.first(), Some(&denied), "the refused key is kept first");
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Delete, ScriptedFault::Permanent("delete denied".into()))
+            .with_key_contains(&denied),
+    );
+    let store = FaultStore::new(inner, plan);
+    let before = tenant_keys(&store).await;
+
+    clock.set(past_horizon(created, &cfg()));
+    let outcome = sweep_superseded(
+        &store,
+        &clock,
+        &cfg(),
+        &NoLeases,
+        &tenant_hash(),
+        Signal::Metrics,
+        SHARD,
+    )
+    .await
+    .expect("a refused delete does not fail the pass");
+    assert_eq!(
+        store.fault_count(Op::Delete, FaultKind::Permanent),
+        1,
+        "the refusal must have fired exactly once"
+    );
+    assert_eq!(outcome.deletes_refused, 1);
+
+    let after = tenant_keys(&store).await;
+    let surviving: Vec<String> = kept
+        .iter()
+        .filter(|k| after.contains(k.as_str()))
+        .cloned()
+        .collect();
+    assert_eq!(
+        surviving, kept,
+        "the stopped group keeps the refused key and every key after it"
+    );
+    let chain = fixture.chain_group();
+    let earlier: Vec<String> = chain
+        .iter()
+        .filter(|k| !kept.contains(k))
+        .cloned()
+        .collect();
+    assert!(
+        earlier.iter().all(|k| !after.contains(k.as_str())),
+        "the stopped group's keys before the refusal are gone: {earlier:?}"
+    );
+    let other = fixture.other_groups();
+    assert!(
+        other.iter().all(|k| !after.contains(k.as_str())),
+        "the other hour's groups are fully collected: {other:?}"
+    );
+    assert!(
+        after.contains(fixture.r2.as_str()),
+        "the live rewrite stays"
+    );
+    let gone: BTreeSet<String> = before.difference(&after).cloned().collect();
+    let expected: BTreeSet<String> = earlier.into_iter().chain(other).collect();
+    assert_eq!(gone, expected, "the pass deleted exactly those keys");
+    assert_eq!(
+        (outcome.records_deleted, outcome.data_deleted),
+        (
+            fixture.input_commits.len()
+                + fixture.other_commits.len()
+                + [&fixture.compaction, &fixture.r1]
+                    .iter()
+                    .filter(|k| !kept.contains(k))
+                    .count(),
+            fixture.other_data.len()
+                + fixture
+                    .input_data
+                    .iter()
+                    .chain(&fixture.parts)
+                    .filter(|k| !kept.contains(k))
+                    .count(),
+        )
+    );
+}
+
+/// Row 8f: the store refuses the delete of the chain group's first data
+/// object, in the data loop, after the input-record loop deleted both of the
+/// group's input commit records. The group keeps both data objects, every
+/// part, the compaction record and R1; the other hour's groups are collected.
+///
+/// Discrimination: with the refusal arm in `sweep_superseded_impl` continuing
+/// past the refused key in the data loop instead of stopping the group, the
+/// group deletes its second data object and every part, then both chain
+/// records, and the `surviving == kept` assertion fails.
+#[tokio::test]
+async fn row8f_refused_data_delete_stops_only_its_own_group() {
+    assert_chain_stops_at(
+        |f| f.input_data[0].clone(),
+        |f| {
+            f.input_data
+                .iter()
+                .chain(&f.parts)
+                .chain([&f.compaction, &f.r1])
+                .cloned()
+                .collect()
+        },
+    )
+    .await;
+}
+
+/// Row 8g: the store refuses the delete of the chain's oldest own record, the
+/// compaction record R1 superseded, in the chain-record loop, after the
+/// group's input records, data objects and parts are gone. The group keeps the
+/// compaction record and R1; the other hour's groups are collected.
+///
+/// Discrimination: with the refusal arm continuing past the refused key in
+/// the chain-record loop instead of stopping the group, R1 is deleted while
+/// the compaction record it superseded survives, and the `surviving == kept`
+/// assertion fails.
+#[tokio::test]
+async fn row8g_refused_chain_record_delete_stops_only_its_own_group() {
+    assert_chain_stops_at(
+        |f| f.compaction.clone(),
+        |f| vec![f.compaction.clone(), f.r1.clone()],
+    )
+    .await;
 }
 
 // --- Row 9: pinned query outlives horizon, input deleted under it ----------
