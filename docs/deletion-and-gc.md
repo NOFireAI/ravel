@@ -158,7 +158,10 @@ record can land in any sealed hour, including one both the fold's fixed
 reconcile window and its retention-frontier band miss, and the snapshot part
 covering that hour then keeps naming the pre-rewrite inputs. An input the live
 HEAD still names is held for a later pass instead of deleted, and the pass
-reports how many objects it held under each of the two reasons below.
+reports how many objects it held under each of the two reasons below, summed on
+`/metrics` as `ravel_maintain_superseded_inputs_held_total` with
+`reason="named"` for an object HEAD still names and `reason="unreadable_head"`
+for a HEAD or covering part that cannot be read.
 
 A rewrite record can itself be superseded by a later rewrite applying a
 different erasure request, so the objects one delete unit covers are a whole
@@ -479,7 +482,9 @@ than deletes, so even a forced pass keeps the recovery window.
   is skipped for this pass and nothing in it is deleted. Hold scopes are per
   prefix, so a hold covering a shard's data prefixes but not its commit
   prefix would otherwise let one pass delete a chain's records while the
-  input bytes those records account for survive.
+  input bytes those records account for survive. The pass counts each
+  skipped group, summed on `/metrics` as
+  `ravel_maintain_superseded_groups_held_by_legal_hold_total`.
 - A held input costs storage until the fold reconciles its hour or an
   operator rebuilds HEAD; nothing else about the hour changes, and every
   query over it keeps resolving normally. That is the deliberate trade
@@ -701,7 +706,9 @@ every bound is measured.
   pass, for either reason the gate holds them, and the buckets in which it
   held the inputs of a chain it could not walk back to a raw input. The
   erasure rule holds a `.dreq` past its horizon when its request id is in the
-  first set, or when the second set is non-empty at all.
+  first set, or when the second set is non-empty at all, and counts each one
+  it holds, summed on `/metrics` as
+  `ravel_maintain_dreq_held_by_superseded_inputs_total`.
 
   **The hold is computed over every supersession chain a HEAD-named part
   still resolves, whether or not the chain is old enough to delete.** Two

@@ -1157,8 +1157,10 @@ pub async fn sweep(
         quarantine_reaped,
         superseded_records_deleted,
         superseded_data_deleted,
-        // Each refusal is logged at WARN by the sweep itself.
-        superseded_deletes_refused: _,
+        superseded_deletes_refused,
+        superseded_held_by_snapshot,
+        superseded_held_by_unreadable_head,
+        superseded_groups_held_by_legal_hold,
         unreferenced_parts_deleted,
         // Byte totals for the reclaimed-bytes metric (issue #1729); this CLI
         // reports counts, not bytes, so they are not printed here.
@@ -1206,6 +1208,10 @@ pub async fn sweep(
     println!("quarantine ({r_verb}): {quarantine_reaped}");
     println!("superseded_records ({verb}): {superseded_records_deleted}");
     println!("superseded_data ({verb}): {superseded_data_deleted}");
+    println!("superseded deletes refused (kept for a later pass): {superseded_deletes_refused}");
+    println!("superseded held (HEAD still names them): {superseded_held_by_snapshot}");
+    println!("superseded held (HEAD unreadable): {superseded_held_by_unreadable_head}");
+    println!("superseded groups held (legal hold): {superseded_groups_held_by_legal_hold}");
     println!("unreferenced_parts ({verb}): {unreferenced_parts_deleted}");
     println!("full_pass: {full_pass}");
     if orphan_breaker_tripped {
