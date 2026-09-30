@@ -667,8 +667,7 @@ pub struct Cli {
     /// endpoint that does not accept the checksum header fails every PUT,
     /// starting with the first flush, which can come after the process
     /// reports ready; `off` is the remedy, and leaves stored objects,
-    /// commit records included, with no transport checksum. Stores routed
-    /// by `--tenant-kms-config` do not apply it yet. `sha256` is
+    /// commit records included, with no transport checksum. `sha256` is
     /// verified on upload only: a read of an object stored with it is
     /// counted in `ravel_store_get_unverified_total`. Ignored under
     /// `--store memory`.
@@ -687,8 +686,7 @@ pub struct Cli {
     /// `--s3-request-stored-checksum=false` only for an endpoint that rejects
     /// the header: every full-object read is then served unverified and
     /// counted in `ravel_store_get_unverified_total`. The bare flag means
-    /// `true`. Stores routed by `--tenant-kms-config` do not apply it yet and
-    /// always send the header. Ignored under `--store memory`.
+    /// `true`. Ignored under `--store memory`.
     #[arg(
         long = "s3-request-stored-checksum",
         env = "RAVEL_S3_REQUEST_STORED_CHECKSUM",
@@ -1772,7 +1770,7 @@ pub struct Cli {
     /// of the data objects a query scans. This flag bounds the fetcher cache
     /// ONLY (ADR-2023): the catalog's separate byte cache
     /// (`query::build_catalog`) derives on its own, or is set independently
-    /// with `--catalog-cache-max-bytes`.
+    /// with `--catalog-cache-max-bytes`. A value of `0` builds no fetcher cache.
     /// Read at startup only; there is no live resize. Ignored when
     /// `--disable-cache` is set. Unset, it derives at 25% of the memory budget,
     /// or 40% on a `--store s3` deployment against a loopback `--s3-endpoint`,

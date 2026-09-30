@@ -640,10 +640,9 @@ header fails every PUT; startup writes nothing to an existing bucket, so that
 shows at the first flush, possibly after the process reports ready.
 `--s3-upload-integrity off` is the remedy, and leaves every object it writes
 with no transport checksum. The per-tenant stores `--tenant-kms-config`
-routes to are still built with the library default and apply neither flag.
-The
-library default stays `Off` for any other caller that builds an `S3Store`
-directly. `ravel-cli` takes the same `--s3-upload-integrity` flag, default and
+routes to are built with the same HTTP config as the default store, so they
+apply both flags. The library default stays `Off` for any other caller that
+builds an `S3Store` directly. `ravel-cli` takes the same `--s3-upload-integrity` flag, default and
 environment variable, so `ravel-cli store qualify` PUTs with the checksum the
 servers will use and an endpoint that rejects the header fails qualification.
 The operator's store qualification Job always sets `RAVEL_S3_UPLOAD_INTEGRITY`

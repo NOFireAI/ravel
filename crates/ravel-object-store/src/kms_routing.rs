@@ -50,7 +50,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use parking_lot::Mutex;
 
-use crate::s3::{S3Config, S3Store};
+use crate::s3::{S3Config, S3HttpConfig, S3Store};
 use crate::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
     ObjectStoreBackend, PageToken, PutOptions, PutOutcome, StoreError, StoreMetrics,
@@ -142,8 +142,15 @@ pub fn routes_through_tenant_key(key: &str) -> bool {
 impl KmsRoutingStore {
     /// Wrap `default` (the deployment-default store) and build per-tenant stores
     /// by cloning `default_config`, overriding only `kms_key_id`, and calling
-    /// [`S3Store::with_metrics`] against `metrics` --- the same construction path
-    /// the default store used, against the same metrics handle.
+    /// [`S3Store::with_http_config_and_metrics`] with `http` against `metrics`
+    /// --- the same construction path the default store used, with the same
+    /// HTTP config and metrics handle.
+    ///
+    /// `http` must be the config the default store was built with, so a routed
+    /// tenant write attaches the same upload checksum and sends the same
+    /// stored-checksum request as every other write (ADR-1696).
+    /// [`S3HttpConfig::default`] would build each tenant store with no upload
+    /// checksum whatever the default store was configured with.
     ///
     /// `metrics` must be the very handle the base [`S3Store`] and the outer
     /// [`InstrumentedStore`](crate::InstrumentedStore) already share, so every store the decorator counts a
@@ -155,16 +162,18 @@ impl KmsRoutingStore {
     pub fn new(
         default: Arc<dyn ObjectStoreBackend>,
         default_config: S3Config,
+        http: S3HttpConfig,
         metrics: Arc<StoreMetrics>,
     ) -> Self {
         Self::with_builder(
             default,
             default_config,
             Box::new(move |config: &S3Config| {
-                Ok(
-                    Box::new(S3Store::with_metrics(config.clone(), Arc::clone(&metrics))?)
-                        as Box<dyn ObjectStoreBackend>,
-                )
+                Ok(Box::new(S3Store::with_http_config_and_metrics(
+                    config.clone(),
+                    http.clone(),
+                    Arc::clone(&metrics),
+                )?) as Box<dyn ObjectStoreBackend>)
             }),
         )
     }
