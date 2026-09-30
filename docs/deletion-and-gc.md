@@ -210,8 +210,11 @@ bound the catalog's resolve applies, or that revisits a record, is refused and
 reported the same way in any bucket. A refused chain is contained to its own
 bucket: the pass returns normally and still reclaims, or observes, the shard's
 other buckets. Every pass refuses these chains when it walks them, but only
-the observing pass walks every chain: a deleting pass skips a rewrite still
-inside its horizon and every record below it. So only an erasure-request
+the observing pass walks every rewrite's chain: a deleting pass skips a
+rewrite still inside its horizon and every record below it. No observing pass
+walks a version 2 head's chain, and it needs none: that chain holds only
+compaction records, and a compaction record applies no erasure request, so a
+refusal there cannot hide a request a `.dreq` waits on. So only an erasure-request
 sweep that runs its own observing pass, as the maintain loop's does, is
 certain to see every refused chain and keep the signal's `.dreq`s that are
 past their horizon.

@@ -1366,8 +1366,10 @@ async fn sweep_superseded_impl(
                     // resolve, no pass follows a version 2 link. A walk
                     // refused for that, or for a chain past the depth bound
                     // or a revisit, is held in a truncated bucket in every
-                    // pass kind, so the two rule-6 entry points see the same
-                    // holds and the shard's other buckets are still swept.
+                    // pass kind, so both rule-6 entry points refuse the same
+                    // chains when they walk them, though only the observing
+                    // pass walks every rewrite's chain, and the shard's other buckets
+                    // are still swept.
                     let bucket = record.ingest_hour_bucket;
                     let links = if version_2.unresolved.contains(&bucket) {
                         Version2Links::Refuse
@@ -2510,6 +2512,34 @@ async fn gather_superseded_chain(
     entry: ChainEntry,
     links: Version2Links,
 ) -> Result<ChainWalk> {
+    walk_superseded_chain(
+        store,
+        tenant,
+        signal,
+        shard,
+        predecessor_key,
+        entry,
+        links,
+        async |key: &str| load_chain_link(store, key).await,
+    )
+    .await
+}
+
+/// [`gather_superseded_chain`] with the chain's records read through `load`.
+/// Content-addressed record keys make a stored chain that revisits a record
+/// unconstructible, so only a loader that skips key verification can feed
+/// the walk one.
+#[allow(clippy::too_many_arguments)]
+async fn walk_superseded_chain(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    predecessor_key: &str,
+    entry: ChainEntry,
+    links: Version2Links,
+    load: impl AsyncFn(&str) -> Result<Option<ChainLink>>,
+) -> Result<ChainWalk> {
     let mut chain_record_keys: Vec<String> = Vec::new();
     let mut chain_part_keys: Vec<String> = Vec::new();
     let mut input_record_keys: Vec<String> = Vec::new();
@@ -2532,7 +2562,7 @@ async fn gather_superseded_chain(
         if !seen.insert(key.clone()) {
             return Ok(ChainWalk::Refused(ChainRefusal::Cycle));
         }
-        let Some(link) = load_chain_link(store, &key).await? else {
+        let Some(link) = load(&key).await? else {
             match version_2_above.take() {
                 Some(above) => {
                     if entry.gathers_raw_l0_inputs() {
@@ -6481,6 +6511,82 @@ mod tests {
                 assert_eq!(groups[0].chain_record_keys.len(), rewrites + 1, "{case}");
             } else {
                 assert_refused_as_too_deep(walked, &case);
+            }
+        }
+    }
+
+    /// A chain that revisits a record is refused as a cycle and gathers
+    /// nothing, whether it loops back through another record or names itself,
+    /// while the same loader over the same records without the loop gathers
+    /// the chain. The records are served unverified, since content-addressed
+    /// keys make a stored cycle unconstructible.
+    ///
+    /// Flipped line: the `ChainRefusal::Cycle` return in
+    /// `walk_superseded_chain` turned into an `Err(MaintainError::Invariant)`;
+    /// both cyclic cases then fail.
+    #[tokio::test]
+    async fn chain_walk_refuses_a_chain_that_revisits_a_record() {
+        fn rewrite(request: u128, superseded: &str) -> RewriteRecord {
+            RewriteRecord {
+                format_version: 1,
+                tenant_hash: tenant().0.to_vec(),
+                signal: ravel_commit::signal::to_proto(Signal::Logs).into(),
+                shard: DEPTH_SHARD,
+                ingest_hour_bucket: 1,
+                input_set_hash: vec![request as u8; 32],
+                drops: vec![ravel_proto::commit::v1::RewriteDrop {
+                    request_id: Uuid::from_u128(request).to_string(),
+                    dropped_count: 1,
+                }],
+                superseded_record_key: superseded.to_string(),
+                ..Default::default()
+            }
+        }
+        let cases = [
+            (
+                "a loop through another record",
+                vec![("a", rewrite(1, "b")), ("b", rewrite(2, "a"))],
+                Some(ChainRefusal::Cycle),
+            ),
+            (
+                "a record naming itself",
+                vec![("a", rewrite(1, "a"))],
+                Some(ChainRefusal::Cycle),
+            ),
+            (
+                "the same records without the loop",
+                vec![("a", rewrite(1, "b")), ("b", rewrite(2, ""))],
+                None,
+            ),
+        ];
+        let store = MemoryStore::new();
+        for (case, chain, refusal) in cases {
+            let records: HashMap<&str, RewriteRecord> = chain.into_iter().collect();
+            let walked = walk_superseded_chain(
+                &store,
+                &tenant(),
+                Signal::Logs,
+                DEPTH_SHARD,
+                "a",
+                ChainEntry::Rewrite,
+                Version2Links::Follow,
+                async |key: &str| Ok(records.get(key).cloned().map(ChainLink::Rewrite)),
+            )
+            .await;
+            match (walked, refusal) {
+                (Ok(ChainWalk::Refused(reason)), Some(expected)) => {
+                    assert_eq!(reason, expected, "{case}")
+                }
+                (Ok(ChainWalk::Gathered(groups)), None) => {
+                    assert_eq!(groups.len(), 1, "{case}");
+                    assert_eq!(groups[0].chain_record_keys, ["b", "a"], "{case}");
+                    assert_eq!(groups[0].request_ids.len(), 2, "{case}");
+                }
+                (Ok(ChainWalk::Refused(reason)), None) => panic!("{case}: refused as {reason:?}"),
+                (Ok(ChainWalk::Gathered(_)), Some(_)) => {
+                    panic!("{case}: expected the cycle refusal, the walk was accepted")
+                }
+                (Err(error), _) => panic!("{case}: {error:?}"),
             }
         }
     }
