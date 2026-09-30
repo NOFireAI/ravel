@@ -173,6 +173,26 @@ async fn put_rewrite(
     request_id: Uuid,
     part: CompactionPart,
 ) -> RewriteRecord {
+    put_rewrite_created_at(
+        store,
+        bucket,
+        superseded_key,
+        request_id,
+        part,
+        hour_ns() + 5_000,
+    )
+    .await
+}
+
+/// [`put_rewrite`] with the record's `created_unix_ns` set to `created_ns`.
+async fn put_rewrite_created_at(
+    store: &dyn ObjectStoreBackend,
+    bucket: &Bucket,
+    superseded_key: &str,
+    request_id: Uuid,
+    part: CompactionPart,
+    created_ns: i64,
+) -> RewriteRecord {
     let request_id = request_id.to_string();
     let record = RewriteRecord {
         format_version: 1,
@@ -192,7 +212,7 @@ async fn put_rewrite(
             request_id,
             dropped_count: 1,
         }],
-        created_unix_ns: hour_ns() + 5_000,
+        created_unix_ns: created_ns,
         superseded_record_key: superseded_key.to_string(),
     };
     let part_key = keys::reconstruct_rewrite_part_key(&record, &record.parts[0]).expect("part");
@@ -1913,4 +1933,209 @@ async fn a_rewrite_chain_over_an_absent_compaction_record_is_not_truncated() {
     let mut expected = before;
     expected.remove(&unrelated_dreq);
     assert_eq!(bucket_keys(store.as_ref()).await, expected);
+}
+
+/// The level-1 snapshot entry a fold writes for `record`'s first part.
+fn rewrite_l1_entry(record: &RewriteRecord) -> SnapshotEntry {
+    let p = &record.parts[0];
+    SnapshotEntry {
+        level: 1,
+        shard: record.shard,
+        ingest_hour_bucket: record.ingest_hour_bucket,
+        writer_id: record.input_set_hash.clone(),
+        writer_epoch: u64::from(p.part_index),
+        writer_seq: 0,
+        content_hash: p.content_hash.clone(),
+        object_size: p.object_size,
+        min_event_ts_ns: p.min_event_ts_ns,
+        max_event_ts_ns: p.max_event_ts_ns,
+        sample_count: p.sample_count,
+        series_count: p.series_count,
+        segment_format_version: p.segment_format_version,
+        created_unix_ns: record.created_unix_ns,
+        declared_column_stats: Vec::new(),
+    }
+}
+
+/// R2 over R1 over C1, with a HEAD naming R1's part and nothing else, and a
+/// completed `.dreq` for each rewrite's request past its horizon. The
+/// observing pass gathers a group with C1 as its identity twice: from R1's own
+/// entry (C1 and its part) and from R2's walk (C1, R1 and both parts). Only
+/// the second holds R1's part, so the HEAD gate must see the union whichever
+/// entry is listed first. Listing order follows the rewrite hashes, so the
+/// fixture is rebuilt over request ids until both orders have run. Rule 6 on
+/// the production path keeps both `.dreq`s in both orders.
+///
+/// Flipped lines: everything in `SupersededGroup::absorb_duplicate` (sweep.rs)
+/// after the request and truncation merge removed, so the first gather's keys
+/// and objects stand, as before the fix. With R1's entry
+/// listed first the kept group holds only C1's part, the gate clears, and
+/// rule 6 retires both `.dreq`s: `(2, 0, 0)`.
+#[tokio::test]
+async fn rule_6_holds_a_request_whichever_duplicate_gather_comes_first() {
+    let b = logs_bucket();
+    let base = hour_ns();
+    let mut orders_seen: BTreeSet<bool> = BTreeSet::new();
+    for seed in 0u128..64 {
+        let store = MemoryStore::new();
+        let c1 = version_1(&b, vec![input(0x1A, 1)], 0xff, part(0xc1, base, base + 10));
+        let c1_key = put_compaction(&store, &c1).await;
+        let chain = put_rewrites_over(&store, &b, &c1_key, 2, 0x4_0000 + 2 * seed).await;
+        let (r1, r2) = (&chain[0], &chain[1]);
+        let r1_first = rewrite_key(r1) < rewrite_key(r2);
+        if !orders_seen.insert(r1_first) {
+            continue;
+        }
+        put_head_with(&store, vec![rewrite_l1_entry(r1)]).await;
+        for r in [r1, r2] {
+            put_completed_request(&store, &b, Uuid::parse_str(&r.drops[0].request_id).unwrap())
+                .await;
+        }
+        let before = bucket_keys(&store).await;
+
+        assert_eq!(
+            rule_6(&store, &b, &NoLeases).await,
+            (0, 2, 2),
+            "R1's own entry listed first: {r1_first}"
+        );
+        assert_eq!(bucket_keys(&store).await, before);
+        if orders_seen.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(orders_seen.len(), 2, "both listing orders must have run");
+}
+
+/// Two chains in one bucket, each a rewrite R over a compaction C over two
+/// raw inputs, and a store that refuses (a permanent error, as an Object Lock
+/// retention reads) every delete of chain A's first input commit record. Past
+/// every horizon with no HEAD, the pass returns `Ok`: chain B's two input
+/// records, their data, C_B and its part go, nothing of chain A is deleted,
+/// the refusal is counted once, and R_A's request is reported held. A clean
+/// pass afterwards collects chain A.
+///
+/// Flipped line: the `Err(e) if delete_refused(&e)` arm in phase C of
+/// `sweep_superseded_impl` (sweep.rs) removed, so the refusal takes the
+/// `return Err(e.into())` arm. The pass then fails, and chain B is kept too
+/// whenever chain A's group comes first.
+#[tokio::test]
+async fn a_refused_record_delete_stops_only_its_own_chain() {
+    let mem = Arc::new(MemoryStore::new());
+    let b = logs_bucket();
+    let base = hour_ns();
+    let inputs = seed_inputs(mem.as_ref(), &[(0xB1, 1), (0xB2, 2), (0xB3, 3), (0xB4, 4)]).await;
+    let c_a = version_1(
+        &b,
+        vec![input(0xB1, 1), input(0xB2, 2)],
+        0x01,
+        part(0xa1, base, base + 10_000),
+    );
+    let c_a_key = put_compaction(mem.as_ref(), &c_a).await;
+    let c_b = version_1(
+        &b,
+        vec![input(0xB3, 3), input(0xB4, 4)],
+        0x02,
+        part(0xb1, base, base + 10_000),
+    );
+    let c_b_key = put_compaction(mem.as_ref(), &c_b).await;
+    let request_a = Uuid::from_u128(0xa0);
+    let r_a = put_rewrite(
+        mem.as_ref(),
+        &b,
+        &c_a_key,
+        request_a,
+        part(0xa2, base, base + 10_000),
+    )
+    .await;
+    let r_b = put_rewrite(
+        mem.as_ref(),
+        &b,
+        &c_b_key,
+        Uuid::from_u128(0xb0),
+        part(0xb2, base, base + 10_000),
+    )
+    .await;
+    let before = bucket_keys(mem.as_ref()).await;
+
+    let locked = inputs[0].0.clone();
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Delete, ScriptedFault::Permanent("object locked".into()))
+            .with_key_contains(&locked),
+    );
+    let store = FaultStore::new(mem.clone(), plan);
+    let outcome = sweep_at(&store, &b, past_horizon_ns(), &NoLeases).await;
+    assert_eq!(store.fault_count(Op::Delete, FaultKind::Permanent), 1);
+    assert_eq!(
+        outcome,
+        SupersededSweepOutcome {
+            records_deleted: 3,
+            data_deleted: 3,
+            deletes_refused: 1,
+            held_request_ids: BTreeSet::from([request_a.to_string()]),
+            ..SupersededSweepOutcome::default()
+        }
+    );
+    let mut chain_b: BTreeSet<String> = inputs[2..]
+        .iter()
+        .flat_map(|(commit, data)| [commit.clone(), data.clone()])
+        .collect();
+    chain_b.extend([c_b_key, part_key(&c_b)]);
+    let after = bucket_keys(mem.as_ref()).await;
+    assert_eq!(
+        before.difference(&after).cloned().collect::<BTreeSet<_>>(),
+        chain_b
+    );
+
+    let outcome = sweep_at(mem.as_ref(), &b, past_horizon_ns(), &NoLeases).await;
+    assert_eq!((outcome.records_deleted, outcome.data_deleted), (3, 3));
+    assert_eq!(
+        bucket_keys(mem.as_ref()).await,
+        BTreeSet::from([
+            rewrite_key(&r_a),
+            rewrite_part_key(&r_a),
+            rewrite_key(&r_b),
+            rewrite_part_key(&r_b),
+        ])
+    );
+}
+
+/// R2 over R1 over C1, R1 past its horizon and R2 still inside it, with a
+/// HEAD naming C1's part: R1's pre-erasure input, still resolvable. A
+/// deleting pass collects nothing, since C1 and R1 belong to R2's chain and
+/// R2 is young. Rule 6, whose only entry observes every chain whatever its
+/// age, keeps R1's `.dreq` past its horizon.
+///
+/// Flipped line: `SweepMode::GateOnly` in `observe_superseded_holds`
+/// (sweep.rs) changed to `SweepMode::Delete`, which is what deciding from a
+/// deleting pass's holds amounts to. That pass walks neither R2 nor R1, holds
+/// nothing, and rule 6 retires R1's `.dreq`: `(1, 0, 0)`.
+#[tokio::test]
+async fn rule_6_keeps_a_request_under_a_young_rewrite() {
+    let store = MemoryStore::new();
+    let b = logs_bucket();
+    let base = hour_ns();
+    let c1 = version_1(&b, vec![input(0x2A, 1)], 0xff, part(0xc1, base, base + 10));
+    let c1_key = put_compaction(&store, &c1).await;
+    let r1_request = Uuid::from_u128(0x2b);
+    let r1 = put_rewrite(&store, &b, &c1_key, r1_request, part(0x2c, base, base + 10)).await;
+    let young_ns = past_horizon_ns() - cfg().protection_horizon_ns + NS_PER_HOUR;
+    put_rewrite_created_at(
+        &store,
+        &b,
+        &rewrite_key(&r1),
+        Uuid::from_u128(0x2d),
+        part(0x2e, base, base + 10),
+        young_ns,
+    )
+    .await;
+    put_head_with(&store, vec![l1_entry(&c1)]).await;
+    put_completed_request(&store, &b, r1_request).await;
+    let before = bucket_keys(&store).await;
+
+    let outcome = sweep_at(&store, &b, past_horizon_ns(), &NoLeases).await;
+    assert_eq!((outcome.records_deleted, outcome.data_deleted), (0, 0));
+    assert_eq!(bucket_keys(&store).await, before);
+
+    assert_eq!(rule_6(&store, &b, &NoLeases).await, (0, 1, 1));
+    assert_eq!(bucket_keys(&store).await, before);
 }
