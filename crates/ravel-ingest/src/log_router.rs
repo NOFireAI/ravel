@@ -1216,6 +1216,162 @@ mod tests {
         );
     }
 
+    /// The row/columnar byte-identity anchor above, for a keyed tenant: a
+    /// format-version-3 record with a two-column clustering key and the
+    /// `undeclared` bloom scope. Records share streams, so the key reorders
+    /// rows inside each stream, and every data object is checked to carry the
+    /// descriptor, so identity is not met by both paths dropping the layout.
+    #[tokio::test]
+    async fn columnar_write_matches_row_write_for_a_keyed_tenant() {
+        use prost::Message;
+        use ravel_catalog::config_key;
+        use ravel_logseg::footer::{
+            SortBucketWidth, SortDescriptor, SortKeyColumn, SortKeyType, open,
+        };
+        use ravel_logseg::{Predicate, RlogConfig, RlogReader};
+        use ravel_object_store::PutOptions;
+        use ravel_proto::sys::v1 as proto;
+
+        let seed = 0x00C0_FFEE_u64;
+        let clock: Arc<dyn Clock> = Arc::new(FixedClock(1_700_000_000_000_000_000));
+        let tenant = TenantId::new("acme");
+        let typed = |key: &str, ty: proto::TypedAttrColumnType| proto::TypedAttrColumn {
+            key: key.to_string(),
+            r#type: ty as i32,
+        };
+        let record = proto::TenantConfigRecord {
+            format_version: 3,
+            tenant_hash: tenant.hash().0.to_vec(),
+            lifecycle_state: proto::TenantLifecycleState::Active as i32,
+            typed_attr_columns: Some(proto::TypedAttrColumnConfig {
+                columns: vec![
+                    typed("k_str", proto::TypedAttrColumnType::Str),
+                    typed("k_int", proto::TypedAttrColumnType::I64),
+                ],
+            }),
+            clustering_key: Some(proto::ClusteringKeyConfig {
+                columns: vec!["k_str".to_string(), "k_int".to_string()],
+                bucket_width: proto::ClusteringBucketWidth::OneDay as i32,
+                generation: 3,
+            }),
+            bloom_scope: proto::BloomScope::Undeclared as i32,
+            created_unix_ns: 1,
+            updated_unix_ns: 1,
+            ..Default::default()
+        };
+        let config = config_key(&tenant.hash());
+
+        // `diverse_records` on six streams instead of 48, eight records each.
+        let records: Vec<NormalizedLogRecord> = diverse_records()
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut r)| {
+                let res: Vec<(String, AttrValue)> = vec![
+                    (
+                        "service.name".to_string(),
+                        AttrValue::Str("api".to_string()),
+                    ),
+                    ("host".to_string(), AttrValue::Str(format!("h{}", i % 6))),
+                ];
+                r.stream_id = log_stream_id(&res, "scope", "", &[]);
+                r.stream_attrs = stream_attrs_bytes(&res, "scope", "", &[]);
+                r
+            })
+            .collect();
+
+        let store_row: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let store_col: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        for store in [&store_row, &store_col] {
+            store
+                .put(
+                    &config,
+                    record.encode_to_vec().into(),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("put config record");
+        }
+        let router = |store: &Arc<dyn ObjectStoreBackend>| {
+            LogIngestRouter::with_rng(
+                buffer_all(),
+                Arc::clone(store),
+                Arc::clone(&clock),
+                overlay(),
+                Arc::new(SeededRng::new(seed)),
+            )
+        };
+
+        let router_row = router(&store_row);
+        router_row
+            .write(
+                tenant.clone(),
+                records.clone(),
+                WriteMode::Buffered,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("row buffered write enqueues");
+        router_row.flush_all().await;
+
+        let router_col = router(&store_col);
+        let batch =
+            ColumnarLogBatch::from_records(&records.iter().map(to_logrecord).collect::<Vec<_>>());
+        router_col
+            .write_columnar(
+                tenant.clone(),
+                batch,
+                WriteMode::Buffered,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("columnar buffered write enqueues");
+        router_col.flush_all().await;
+
+        let objs_row = collect_objects(store_row.as_ref()).await;
+        let objs_col = collect_objects(store_col.as_ref()).await;
+        assert_eq!(
+            objs_row, objs_col,
+            "row and columnar paths must produce byte-identical stored objects for a keyed tenant"
+        );
+
+        let want = SortDescriptor {
+            bucket_width: SortBucketWidth::OneDay,
+            key_columns: vec![
+                SortKeyColumn {
+                    name: "k_str".to_string(),
+                    ty: SortKeyType::Str,
+                },
+                SortKeyColumn {
+                    name: "k_int".to_string(),
+                    ty: SortKeyType::I64,
+                },
+            ],
+        };
+        let shards: std::collections::HashSet<u32> = records
+            .iter()
+            .map(|r| shard_for_log(&r.stream_id, 4))
+            .collect();
+        let mut data_objects = 0;
+        let mut reordered_streams = 0;
+        for (_, bytes) in objs_row.iter().filter(|(key, _)| key != &config) {
+            let Ok(ftr) = open(bytes) else { continue };
+            data_objects += 1;
+            assert_eq!(ftr.sort_descriptor.as_ref(), Some(&want));
+            assert_eq!(ftr.clustering_generation, 3);
+            let reader = RlogReader::new(bytes, &RlogConfig::default()).expect("reader");
+            let (rows, _) = reader.scan(&Predicate::And(vec![])).expect("scan");
+            let mut by_stream: HashMap<_, Vec<i64>> = HashMap::new();
+            for row in &rows {
+                by_stream.entry(row.stream_id).or_default().push(row.ts_ns);
+            }
+            reordered_streams += by_stream.values().filter(|ts| !ts.is_sorted()).count();
+        }
+        assert_eq!(data_objects, shards.len(), "one data object per shard");
+        // Within each stream `k_str` = "v{i}" sorts "v42" before "v6" and "v43"
+        // before "v7", so the key moves all six streams away from ts order.
+        assert_eq!(reordered_streams, 6);
+    }
+
     /// ADR-2135: a format-version-3 config record carrying neither the
     /// clustering key (field 13) nor the bloom scope (field 14) writes the
     /// same objects as a tenant with no config record at all. Same seed and

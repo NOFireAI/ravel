@@ -37,7 +37,9 @@ pub use admission::{
     AdmissionController, AdmissionLimits, CountLimit, IdentityAdmission, RateLimit,
     RequestRejection, RequestRejectionReason, TenantUsage,
 };
-pub use attribution::{MAX_TRACKED_TENANTS, PUTS_PER_FLUSH, TenantPutAttribution, TenantPutCount};
+pub use attribution::{
+    MAX_TRACKED_TENANTS, PUTS_PER_FLUSH, TenantCount, TenantPutAttribution, TenantPutCount,
+};
 pub use budget::{IngestByteBudget, IngestByteBudgetLimit, IngestByteCharge, IngestByteShed};
 pub use clock::{Clock, SystemClock};
 pub use config::{

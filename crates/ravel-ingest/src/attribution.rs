@@ -80,34 +80,45 @@ pub struct TenantPutCount {
     pub error: u64,
 }
 
+/// One tenant's count in a [`TenantTopK`]. `error` is the Space-Saving
+/// overestimate bound, as on [`TenantPutCount`]: the true count lies in
+/// `[count - error, count]`, and `error` is 0 for a tenant never admitted by
+/// eviction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TenantCount {
+    pub tenant: TenantHash,
+    pub count: u64,
+    pub error: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct Entry {
     count: u64,
     error: u64,
 }
 
-/// Bounded-cardinality top-K per-tenant PUT attribution. Shared across all
-/// shard actors of one signal through an `Arc`, exactly like the counters in
-/// [`crate::IngestMetrics`], so recorded PUTs for one tenant sum across every
-/// shard that flushed for it. See the [module docs](self) for the counting
-/// convention and the admission/eviction policy.
+/// The Space-Saving per-tenant table behind [`TenantPutAttribution`], shared
+/// by every other per-tenant counter that must stay bounded by ADR-0076
+/// decision 2. See the [module docs](self) for the admission and eviction
+/// policy. Admission by eviction adds the evicted count to the newcomer, so
+/// the sum of the tracked counts always equals the sum of everything recorded.
 #[derive(Debug)]
-pub struct TenantPutAttribution {
+pub(crate) struct TenantTopK {
     cap: usize,
     entries: Mutex<HashMap<TenantHash, Entry>>,
 }
 
-impl Default for TenantPutAttribution {
+impl Default for TenantTopK {
     fn default() -> Self {
         Self::with_capacity(MAX_TRACKED_TENANTS)
     }
 }
 
-impl TenantPutAttribution {
-    /// A structure tracking at most `cap` distinct tenants. Production code
-    /// uses [`Default`] ([`MAX_TRACKED_TENANTS`]); `cap` is a knob for tests
-    /// that need to drive eviction without pushing thousands of tenants.
-    /// `cap` must be at least 1.
+impl TenantTopK {
+    /// A table tracking at most `cap` distinct tenants. Production code uses
+    /// [`Default`] ([`MAX_TRACKED_TENANTS`]); `cap` is a knob for tests that
+    /// need to drive eviction without pushing thousands of tenants. `cap` must
+    /// be at least 1.
     pub(crate) fn with_capacity(cap: usize) -> Self {
         debug_assert!(cap >= 1, "attribution capacity must be at least 1");
         Self {
@@ -116,29 +127,17 @@ impl TenantPutAttribution {
         }
     }
 
-    /// Attribute one completed flush's [`PUTS_PER_FLUSH`] PUTs to `tenant`.
-    /// Called from each shard actor's `run_flush` terminal success path.
-    pub(crate) fn record_flush(&self, tenant: TenantHash) {
-        self.record_puts(tenant, PUTS_PER_FLUSH);
-    }
-
-    /// Add `puts` to `tenant`'s attributed count, applying the Space-Saving
+    /// Add `n` to `tenant`'s count, applying the Space-Saving
     /// admission/eviction policy documented on the module when the tenant is
     /// new and the table is full.
-    fn record_puts(&self, tenant: TenantHash, puts: u64) {
+    pub(crate) fn record(&self, tenant: TenantHash, n: u64) {
         let mut map = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(entry) = map.get_mut(&tenant) {
-            entry.count = entry.count.saturating_add(puts);
+            entry.count = entry.count.saturating_add(n);
             return;
         }
         if map.len() < self.cap {
-            map.insert(
-                tenant,
-                Entry {
-                    count: puts,
-                    error: 0,
-                },
-            );
+            map.insert(tenant, Entry { count: n, error: 0 });
             return;
         }
         // Table full and `tenant` is new: evict the smallest-count entry (ties
@@ -154,11 +153,64 @@ impl TenantPutAttribution {
             map.insert(
                 tenant,
                 Entry {
-                    count: victim_count.saturating_add(puts),
+                    count: victim_count.saturating_add(n),
                     error: victim_count,
                 },
             );
         }
+    }
+
+    /// Every tracked tenant's count, in no particular order.
+    pub(crate) fn counts(&self) -> Vec<TenantCount> {
+        let map = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        map.iter()
+            .map(|(&tenant, e)| TenantCount {
+                tenant,
+                count: e.count,
+                error: e.error,
+            })
+            .collect()
+    }
+
+    /// Number of tenants currently tracked. Never exceeds the cap.
+    pub(crate) fn len(&self) -> usize {
+        self.entries.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+}
+
+/// Bounded-cardinality top-K per-tenant PUT attribution. Shared across all
+/// shard actors of one signal through an `Arc`, exactly like the counters in
+/// [`crate::IngestMetrics`], so recorded PUTs for one tenant sum across every
+/// shard that flushed for it. See the [module docs](self) for the counting
+/// convention and the admission/eviction policy.
+#[derive(Debug, Default)]
+pub struct TenantPutAttribution {
+    table: TenantTopK,
+}
+
+impl TenantPutAttribution {
+    /// A structure tracking at most `cap` distinct tenants. Production code
+    /// uses [`Default`] ([`MAX_TRACKED_TENANTS`]); `cap` is a knob for tests
+    /// that need to drive eviction without pushing thousands of tenants.
+    /// `cap` must be at least 1.
+    #[cfg(test)]
+    pub(crate) fn with_capacity(cap: usize) -> Self {
+        Self {
+            table: TenantTopK::with_capacity(cap),
+        }
+    }
+
+    /// Attribute one completed flush's [`PUTS_PER_FLUSH`] PUTs to `tenant`.
+    /// Called from each shard actor's `run_flush` terminal success path.
+    pub(crate) fn record_flush(&self, tenant: TenantHash) {
+        self.record_puts(tenant, PUTS_PER_FLUSH);
+    }
+
+    /// Add `puts` to `tenant`'s attributed count, applying the Space-Saving
+    /// admission/eviction policy documented on the module when the tenant is
+    /// new and the table is full.
+    fn record_puts(&self, tenant: TenantHash, puts: u64) {
+        self.table.record(tenant, puts);
     }
 
     /// The `n` tenants with the most attributed PUTs, descending (ties broken
@@ -166,13 +218,14 @@ impl TenantPutAttribution {
     /// are tracked, and an empty vector when none are. This is the read API a
     /// later operator-facing endpoint (ADR-0076 T4) consumes.
     pub fn top_n(&self, n: usize) -> Vec<TenantPutCount> {
-        let map = self.entries.lock().unwrap_or_else(|p| p.into_inner());
-        let mut all: Vec<TenantPutCount> = map
-            .iter()
-            .map(|(&tenant, e)| TenantPutCount {
-                tenant,
-                puts: e.count,
-                error: e.error,
+        let mut all: Vec<TenantPutCount> = self
+            .table
+            .counts()
+            .into_iter()
+            .map(|c| TenantPutCount {
+                tenant: c.tenant,
+                puts: c.count,
+                error: c.error,
             })
             .collect();
         all.sort_unstable_by(|a, b| b.puts.cmp(&a.puts).then_with(|| a.tenant.cmp(&b.tenant)));
@@ -183,7 +236,7 @@ impl TenantPutAttribution {
     /// Number of tenants currently tracked. Never exceeds
     /// [`MAX_TRACKED_TENANTS`] (or the `with_capacity` cap in tests).
     pub fn tracked_len(&self) -> usize {
-        self.entries.lock().unwrap_or_else(|p| p.into_inner()).len()
+        self.table.len()
     }
 }
 

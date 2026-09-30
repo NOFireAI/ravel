@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use prost::Message;
 use ravel_catalog::config_key;
-use ravel_ingest::{IngestConfig, LogIngestRouter, WriteMode};
+use ravel_ingest::{IngestConfig, LogIngestRouter, TenantCount, WriteMode};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_otlp::logs_normalize::NormalizedLogRecord;
@@ -165,7 +165,11 @@ async fn an_unresolved_key_warns_once_per_refresh() {
     );
     assert_eq!(
         router.metrics().clustering_key_unresolved_by_tenant(),
-        vec![(tenant.hash(), 3)]
+        vec![TenantCount {
+            tenant: tenant.hash(),
+            count: 3,
+            error: 0,
+        }]
     );
     router.shutdown().await;
 }

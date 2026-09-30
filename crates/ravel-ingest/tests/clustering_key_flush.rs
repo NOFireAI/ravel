@@ -16,7 +16,7 @@ use prost::Message;
 use ravel_catalog::config_key;
 use ravel_commit::keys;
 use ravel_commit::record;
-use ravel_ingest::{IngestConfig, LogIngestRouter, WriteMode};
+use ravel_ingest::{IngestConfig, LogIngestRouter, TenantCount, WriteMode};
 use ravel_logseg::field_dir::FieldDir;
 use ravel_logseg::footer::{
     LogFooter, SortBucketWidth, SortDescriptor, SortKeyColumn, SortKeyType, kind, open,
@@ -28,6 +28,7 @@ use ravel_logseg::{
     FieldType, LogRecord, ObjectIdentity, Predicate, RlogConfig, RlogReader, RlogWriter,
     read_section,
 };
+use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Sequence, SequenceStep};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions};
 use ravel_otlp::logs_normalize::NormalizedLogRecord;
@@ -225,11 +226,10 @@ fn keys_of(text: &str) -> Vec<Vec<u8>> {
     keys
 }
 
-/// Six records on one stream, pushed as a, d, c, e, f, b. Under a
-/// `[region: str, user: i64]` key with six-hour buckets they store as
-/// f, b, e, c, a, d. One-hour buckets put every record in its own hour and
-/// store the unkeyed ts order b, a, c, f, e, d, and a `user` key typed `str`
-/// reads every `user` as absent and stores f, b, c, e, a, d.
+/// Six records on one stream, pushed as a, d, c, e, f, b. Unkeyed they store
+/// in ts order b, a, c, f, e, d. Under a `[region: str, user: i64]` key with
+/// six-hour buckets they store as f, b, e, c, a, d, and under a `[user: i64]`
+/// key with one-day buckets as f, b, e, a, c, d.
 fn clustering_records() -> Vec<NormalizedLogRecord> {
     let r = |ts, body, region: Option<&str>, user| {
         let mut attrs = vec![("user", AttrValue::I64(user))];
@@ -483,33 +483,158 @@ async fn unresolved_key_column_writes_without_a_descriptor_and_counts() {
     let first = write(&router, bloom_records()).await;
     assert_eq!(
         router.metrics().clustering_key_unresolved_by_tenant(),
-        vec![(tenant_hash(), 1)]
+        exact_count(1)
     );
     // A second flush inside the refresh horizon counts again.
     let second = write(&router, bloom_records()).await;
     assert_eq!(
         router.metrics().clustering_key_unresolved_by_tenant(),
-        vec![(tenant_hash(), 2)]
+        exact_count(2)
     );
     router.shutdown().await;
 
     for token in [first, second] {
-        let object = object_for(store.as_ref(), &token).await;
-        let ftr = footer(&object);
-        assert_eq!(ftr.sort_descriptor, None);
-        assert_eq!(ftr.clustering_generation, 0);
-        // Full coverage, not the stored Text scope.
-        let (dir, raw) = dir_and_bloom(&object);
-        let section = RlogBloomSection::parse(&raw, &dir).expect("parse BLOOM");
-        let mut covered = vec![
-            COL_SEVERITY_TEXT,
-            COL_BODY,
-            str_col(&dir, "note"),
-            str_col(&dir, "region"),
-        ];
-        covered.sort_unstable();
-        assert_eq!(section.covered(), covered.as_slice());
+        assert_unkeyed_full_coverage(&object_for(store.as_ref(), &token).await);
     }
+}
+
+/// This tenant's unresolved-layout count as the metrics report it, `n` flushes
+/// with no overestimate.
+fn exact_count(n: u64) -> Vec<TenantCount> {
+    vec![TenantCount {
+        tenant: tenant_hash(),
+        count: n,
+        error: 0,
+    }]
+}
+
+/// No descriptor, generation 0, and every string column of
+/// [`bloom_records`] covered.
+fn assert_unkeyed_full_coverage(object: &[u8]) {
+    let ftr = footer(object);
+    assert_eq!(ftr.sort_descriptor, None);
+    assert_eq!(ftr.clustering_generation, 0);
+    let (dir, raw) = dir_and_bloom(object);
+    let section = RlogBloomSection::parse(&raw, &dir).expect("parse BLOOM");
+    let mut covered = vec![
+        COL_SEVERITY_TEXT,
+        COL_BODY,
+        str_col(&dir, "note"),
+        str_col(&dir, "region"),
+    ];
+    covered.sort_unstable();
+    assert_eq!(section.covered(), covered.as_slice());
+}
+
+#[tokio::test]
+async fn a_key_the_writer_refuses_writes_without_a_descriptor_and_counts() {
+    // A raw record can declare a typed column named "" and key on it. The
+    // config accessor accepts that key; the writer refuses an empty key column
+    // name, so handing it over would abandon every flush for the tenant.
+    let config = layout_record(
+        &[
+            ("", TypedAttrColumnType::Str),
+            ("region", TypedAttrColumnType::Str),
+        ],
+        Some(key(&[""], ClusteringBucketWidth::OneHour, 6)),
+        BloomScope::Text,
+    );
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    put_record(store.as_ref(), &config).await;
+    let router = LogIngestRouter::new(
+        flush_on_first(),
+        Arc::clone(&store),
+        TestClock::new(BASE_NS),
+    );
+
+    let token = write(&router, bloom_records()).await;
+    assert_eq!(
+        router.metrics().clustering_key_unresolved_by_tenant(),
+        exact_count(1)
+    );
+    assert_eq!(router.metrics().snapshot().abandoned_input_rejected, 0);
+    router.shutdown().await;
+    assert_unkeyed_full_coverage(&object_for(store.as_ref(), &token).await);
+}
+
+#[tokio::test]
+async fn deleting_a_keyed_record_resets_the_flush_after_a_refresh() {
+    let config = layout_record(
+        REGION_USER,
+        Some(key(&["region"], ClusteringBucketWidth::OneHour, 8)),
+        BloomScope::All,
+    );
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    put_record(store.as_ref(), &config).await;
+    let clock = TestClock::new(BASE_NS);
+    let router = LogIngestRouter::new(flush_on_first(), Arc::clone(&store), clock.clone());
+
+    let keyed = write(&router, clustering_records()).await;
+    store
+        .delete(&config_key(&tenant_hash()))
+        .await
+        .expect("delete config record");
+    // Inside the horizon the cached key still applies.
+    let cached = write(&router, clustering_records()).await;
+    clock.advance_ns(PAST_HORIZON_NS);
+    let reset = write(&router, clustering_records()).await;
+    router.shutdown().await;
+
+    for (token, generation) in [(keyed, 8), (cached, 8)] {
+        let ftr = footer(&object_for(store.as_ref(), &token).await);
+        assert!(ftr.sort_descriptor.is_some());
+        assert_eq!(ftr.clustering_generation, generation);
+    }
+    let reset_object = object_for(store.as_ref(), &reset).await;
+    let reset = footer(&reset_object);
+    assert_eq!(reset.sort_descriptor, None);
+    assert_eq!(reset.clustering_generation, 0);
+    assert_eq!(bodies(&reset_object), ["b", "a", "c", "f", "e", "d"]);
+    assert_eq!(
+        reset_object,
+        direct_object(&reset, clustering_records()),
+        "no record after the refresh: the object differs from a writer with no builder calls"
+    );
+}
+
+#[tokio::test]
+async fn one_config_get_serves_the_fields_and_the_layout() {
+    let config = layout_record(
+        REGION_USER,
+        Some(key(&["region", "user"], ClusteringBucketWidth::SixHours, 5)),
+        BloomScope::All,
+    );
+    // Every GET of the config key passes through one counted sequence step;
+    // more steps than any correct run takes, so an extra GET is counted too.
+    let steps = 8;
+    let plan = FaultPlan::empty().with_sequence(
+        Sequence::new(Op::Get)
+            .with_key_contains(config_key(&tenant_hash()))
+            .with_steps(vec![SequenceStep::Passthrough; steps]),
+    );
+    let fault = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+    let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+    put_record(store.as_ref(), &config).await;
+    let router = LogIngestRouter::new(
+        flush_on_first(),
+        Arc::clone(&store),
+        TestClock::new(BASE_NS),
+    );
+
+    // One flush on a cold cache: one refresh, then the flush itself.
+    let token = write(&router, clustering_records()).await;
+    router.shutdown().await;
+    assert_eq!(
+        fault.sequence_progress(0),
+        1,
+        "one refresh and one flush read the config key once"
+    );
+    let ftr = footer(&object_for(store.as_ref(), &token).await);
+    assert_eq!(
+        ftr.clustering_generation, 5,
+        "the layout came from that read"
+    );
+    assert!(ftr.sort_descriptor.is_some());
 }
 
 #[tokio::test]
