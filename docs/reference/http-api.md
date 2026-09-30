@@ -149,11 +149,20 @@ For the query routes, the status codes come from one shared error mapping:
 - 422 `execution`: a resource-budget refusal (too many segments, series,
   samples, or scanned bytes; an over-wide window), or an unsupported construct.
 - 500 `internal`: a permanent data-integrity fault in already-stored objects (a
-  corrupt segment, an unreconstructable commit record, a non-monotonic run). It
+  corrupt segment, an unreconstructable or mismatched commit record, a
+  compaction record or erasure request whose stored bytes fail to decode at a
+  format version this build covers, a non-monotonic run). It
   is not retryable, and its message is fixed so no object key or tenant hash
   leaks.
-- 503 `unavailable`: a transient storage fault, an invalidated snapshot, or an
-  unsatisfiable `min_commit_token`. Retryable.
+- 503 `unavailable`: a transient storage fault, an invalidated snapshot, a
+  catalog object (HEAD, snapshot part, postings, compaction record or erasure
+  request) written in a newer format version this build cannot yet read (a
+  peer on a newer build can, during a rolling upgrade), a catalog decode job
+  the read CPU gate cancelled at shutdown, or an unsatisfiable
+  `min_commit_token`. Retryable. One exception on `/api/v1/sql`: a
+  newer-version HEAD read by the column-statistics loader still answers 500
+  `internal`. A column-statistics object this build cannot decode answers no
+  error: the query reads the data instead.
 - 504 `timeout`: the query passed its deadline.
 - 401 `unauthorized`: no resolvable credential.
 
