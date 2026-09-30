@@ -826,11 +826,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   objects through ravel-query's span fetcher, drops the spans a pending
   erasure matches with the check the SQL spans scan makes, and writes every
   `[spans]` mapping field as stored, with no deduplication, sorted by start
-  time, then trace id, then span id. Span kind, trace state, flags, events,
-  links, any attribute the mapping does not name, and a parent id, status code
-  or status message whose optional column the mapping omits are not written,
-  and the report counts the spans that lost them as
-  `spans_with_unwritten_data`. Each timestamp is written in its
+  time, then trace id, then span id. With the optional `attrs_map_column`, every
+  stored attribute the mapping does not name, the reserved ones aside, is
+  written as stored into one `Map<Utf8, Utf8>` column that the spans load reads
+  back; what the file cannot carry is written without and counted as
+  `spans_with_unwritten_data`. Each mapped attribute is chosen by checking that
+  the load's own coercion of the candidate reproduces the stored string, so the
+  export and the load share one coercion (issue #2216). Each timestamp is
+  written in its
   declared unit, and the export refuses, in the metrics export's gathered
   form ("refused on N spans for this reason; first: ..."), a span whose start
   the load would re-time or refuse, a timestamp finer than its unit, and a
@@ -1051,7 +1054,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `end_ts_column` with their units, an optional `status_code_column` (OTLP's
   0/1/2 integer enum) and `status_message_column`, and
   `[[spans.resource_attribute]]` and `[[spans.attribute]]` columns coerced to
-  strings. One input row is one span.
+  strings, and an optional `attrs_map_column`: a map column of strings whose
+  entries are merged into the span's attributes as written, a row being refused
+  when its map holds a key a mapped attribute also names, one key twice, or a
+  reserved key (issue #2216). One input row is one span.
 
   **A span loaded from Parquet is stored as the same record the same span sent
   over OTLP produces**, field for field. The loader reuses `ravel-otlp`'s own

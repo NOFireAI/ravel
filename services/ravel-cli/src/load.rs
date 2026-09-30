@@ -927,8 +927,8 @@ fn span_shape_rejected(what: &str) -> LoadError {
         "--mapping [spans] names {what}, which this version does not map (ADR-1751 decision 2: \
          native histograms, span events and span links are not mappable, and a mapping that names \
          them is rejected). The mappable span fields are trace_id, span_id, parent_span_id, name, \
-         start_ts, end_ts, status_code, status_message, and the resource_attribute and attribute \
-         column lists."
+         start_ts, end_ts, status_code, status_message, the resource_attribute and attribute \
+         column lists, and attrs_map_column."
     ))
 }
 
@@ -946,6 +946,7 @@ fn span_shape_rejected(what: &str) -> LoadError {
 /// end_ts_unit           = "nanos"
 /// status_code_column    = "status"     # optional, OTLP's 0/1/2 integer enum
 /// status_message_column = "status_msg" # optional
+/// attrs_map_column      = "attrs"      # optional, Map<Utf8, Utf8>
 ///
 /// # Resource attributes: merged into every span's one attrs map. A key may
 /// # not appear in both attribute lists (such a mapping is refused), so this
@@ -1011,6 +1012,14 @@ pub struct SpansMapping {
     /// Columns merged into the span's `attrs` map at span precedence.
     #[serde(default, rename = "attribute")]
     pub attributes: Vec<AttrMap>,
+    /// One `Map<Utf8, Utf8>` column for the attributes neither list names
+    /// (ADR-1751 decision 4). `ravel-cli export` writes every stored attribute
+    /// the mapping does not name, reserved keys aside, into it, and
+    /// `ravel-cli load` merges its entries into the span's `attrs` at span
+    /// precedence; see [`read_span_attrs_map`] for what a load refuses. A
+    /// mapping that never sets it is unaffected.
+    #[serde(default)]
+    pub attrs_map_column: Option<String>,
 }
 
 impl SpansMapping {
@@ -6820,6 +6829,8 @@ struct SpansColumnIndex {
     resource_attributes: Vec<usize>,
     /// One column index per `[[spans.attribute]]`, in mapping order.
     attributes: Vec<usize>,
+    /// The `attrs_map_column`, already checked to be a map of strings.
+    attrs_map: Option<usize>,
     /// The batch's columns with every mapped dictionary column resolved once.
     columns: ResolvedColumns,
 }
@@ -6873,6 +6884,14 @@ impl SpansColumnIndex {
             .iter()
             .map(|a| idx(&a.column))
             .collect::<Result<Vec<_>, String>>()?;
+        let attrs_map = match &mapping.attrs_map_column {
+            Some(c) => {
+                let i = idx(c)?;
+                check_attrs_map_column(schema.field(i).data_type(), c)?;
+                Some(i)
+            }
+            None => None,
+        };
         // Every column a row reader may read a string, a byte string or an id
         // out of. The timestamp and status columns are numeric and carry no
         // dictionary a reader resolves.
@@ -6894,6 +6913,7 @@ impl SpansColumnIndex {
             status_message,
             resource_attributes,
             attributes,
+            attrs_map,
             columns,
         })
     }
@@ -7162,7 +7182,7 @@ fn build_span(
         row,
         dropped,
     )?;
-    let span_attrs = read_span_attrs(
+    let mut span_attrs = read_span_attrs(
         batch,
         cols,
         &cols.attributes,
@@ -7171,11 +7191,28 @@ fn build_span(
         row,
         dropped,
     )?;
+    if let Some(i) = cols.attrs_map {
+        span_attrs.extend(read_span_attrs_map(
+            cols.col(batch, i),
+            row,
+            mapping,
+            limits,
+            dropped,
+        )?);
+        if span_attrs.len() > LOADER_MAX_ATTRIBUTES_PER_RECORD {
+            return Err(format!(
+                "span carries {} attributes with its attrs_map_column entries, more than the \
+                 loader per-record cap of {LOADER_MAX_ATTRIBUTES_PER_RECORD}",
+                span_attrs.len()
+            ));
+        }
+    }
     // The same merge the OTLP path runs, with an empty scope set: this loader
     // maps no instrumentation scope, so there is nothing between resource and
     // span precedence. The reserved-key strip `normalize_span` applies is not
     // repeated here because `SpansMapping::validate` refuses a mapping naming
-    // any reserved key outright, so no merged map can hold one.
+    // any reserved key outright and `read_span_attrs_map` refuses a row whose
+    // map holds one, so no merged map can hold one.
     let attrs = merge_attrs(&resource_attrs, &[], &span_attrs);
 
     Ok(NormalizedSpan {
@@ -7236,7 +7273,7 @@ fn read_span_attrs(
 /// [`format_float`], and bytes become lowercase hex. A list or map has no
 /// Parquet scalar column source and no RSPAN representation, and is refused
 /// rather than given a stringification this code would be inventing.
-fn span_attr_string(key: &str, value: &AttrValue) -> Result<String, String> {
+pub(crate) fn span_attr_string(key: &str, value: &AttrValue) -> Result<String, String> {
     Ok(match value {
         AttrValue::Str(s) => s.clone(),
         AttrValue::Bool(b) => b.to_string(),
@@ -7250,6 +7287,95 @@ fn span_attr_string(key: &str, value: &AttrValue) -> Result<String, String> {
             ));
         }
     })
+}
+
+/// Check that the `attrs_map_column` is a map from strings to strings, the
+/// shape `ravel-cli export` writes, when the batch's columns are resolved.
+fn check_attrs_map_column(data_type: &DataType, column: &str) -> Result<(), String> {
+    let is_string = |ty: &DataType| matches!(ty, DataType::Utf8 | DataType::LargeUtf8);
+    if let DataType::Map(entries, _) = data_type
+        && let DataType::Struct(fields) = entries.data_type()
+        && fields.len() == 2
+        && is_string(fields[0].data_type())
+        && is_string(fields[1].data_type())
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "attrs_map_column {column:?} has type {data_type:?}; expected a map of string keys to \
+         string values"
+    ))
+}
+
+/// Read one row's `attrs_map_column` entries, the attributes the mapping does
+/// not name, as the `(key, value)` strings RSPAN stores.
+///
+/// A null cell and a null value are attributes the row does not carry. Each
+/// entry goes through the OTLP path's own attribute rule: a key or value over
+/// its length cap drops that attribute, counted in `dropped`, and keeps the
+/// span. A row is refused when its map holds a key a mapped attribute also
+/// names, a key twice, or a reserved key: one span carries one attrs map with
+/// unique keys, so which value reached the record would otherwise be decided
+/// silently, and a reserved key would fabricate a span field this version does
+/// not map.
+fn read_span_attrs_map(
+    arr: &ArrayRef,
+    row: usize,
+    mapping: &SpansMapping,
+    limits: &SpanIngestLimits,
+    dropped: &mut u64,
+) -> Result<Vec<(String, String)>, String> {
+    if arr.is_null(row) {
+        return Ok(Vec::new());
+    }
+    let column = mapping.attrs_map_column.as_deref().unwrap_or_default();
+    let entries = arr
+        .as_map_opt()
+        .ok_or_else(|| format!("attrs_map_column {column:?} is not a map column"))?
+        .value(row);
+    let keys = entries.column(0);
+    let values = entries.column(1);
+    let mut out: Vec<(String, String)> = Vec::with_capacity(entries.len());
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for i in 0..entries.len() {
+        let key = read_string(keys, i)?
+            .ok_or_else(|| format!("attrs_map_column {column:?} holds a null key"))?;
+        if let Some((spec, _)) = mapping
+            .mapped_attributes()
+            .find(|(spec, _)| spec.key == key)
+        {
+            return Err(format!(
+                "attrs_map_column {column:?} holds the key {key:?}, which the mapping also reads \
+                 from the column {:?}. A span carries one merged attrs map with unique keys, so \
+                 one of the two would never reach the record; drop the key from the map or the \
+                 entry from the mapping.",
+                spec.column
+            ));
+        }
+        if is_reserved_key(&key) {
+            return Err(format!(
+                "attrs_map_column {column:?} holds the reserved attribute key {key:?}, which \
+                 holds a span field this version does not map"
+            ));
+        }
+        if !seen.insert(key.clone()) {
+            return Err(format!(
+                "attrs_map_column {column:?} holds the key {key:?} twice. A span carries one \
+                 merged attrs map with unique keys, so one of the two would never reach the \
+                 record."
+            ));
+        }
+        let Some(value) = read_string(values, i)? else {
+            continue;
+        };
+        if key.len() > limits.max_attribute_key_len || value.len() > limits.max_attribute_value_len
+        {
+            *dropped += 1;
+            continue;
+        }
+        out.push((key, value));
+    }
+    Ok(out)
 }
 
 /// The decode state the spans loader shuttles into and back out of each
@@ -14399,6 +14525,31 @@ type = "str"
             };
             assert!(
                 message.contains("declares the attribute key \"http.method\" twice"),
+                "the refusal names the key: {message}"
+            );
+        }
+
+        /// `attrs_map_column` is a `[spans]` key, as it is a logs one, and
+        /// `deny_unknown_fields` still refuses a key that is not.
+        #[test]
+        fn attrs_map_column_is_accepted_and_an_unknown_key_is_still_refused() {
+            let text = MAPPING_TOML.replace("[spans]\n", "[spans]\nattrs_map_column = \"rest\"\n");
+            let mapping = parse_spans_mapping(&text).expect("attrs_map_column is a [spans] key");
+            assert_eq!(mapping.attrs_map_column.as_deref(), Some("rest"));
+            assert_eq!(
+                parse_spans_mapping(MAPPING_TOML)
+                    .expect("valid mapping")
+                    .attrs_map_column,
+                None
+            );
+            let typo = MAPPING_TOML.replace("[spans]\n", "[spans]\nattrs_map_colum = \"rest\"\n");
+            let LoadError::Setup(message) =
+                parse_spans_mapping(&typo).expect_err("deny_unknown_fields rejects a typo")
+            else {
+                panic!("expected a setup error");
+            };
+            assert!(
+                message.contains("unknown field `attrs_map_colum`"),
                 "the refusal names the key: {message}"
             );
         }
