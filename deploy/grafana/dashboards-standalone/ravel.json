@@ -1607,7 +1607,7 @@
             "uid": "${ds}"
           },
           "legendFormat": "budget bytes",
-          "expr": "max(ravel_memory_budget_bytes)"
+          "expr": "max(ravel_memory_budget_bytes{mode!=\"gateway\"})"
         },
         {
           "refId": "D",

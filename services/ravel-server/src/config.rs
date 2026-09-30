@@ -84,6 +84,21 @@ impl Mode {
     pub fn renders_fold_counters(self) -> bool {
         self.runs_scheduled_fold() || self.mounts_on_demand_fold()
     }
+
+    /// Whether this mode uses the ADR-1170 process memory budget: the fetcher
+    /// cache, the catalog byte cache, and the shared SQL/fetch `MemoryBudget`
+    /// carved from `memory_budget_bytes`. False only for [`Mode::Gateway`]:
+    /// it serves no query surface, so no fetcher, SQL executor or cache warm
+    /// reads through the fetcher cache or reserves against the accountant, and
+    /// it runs no fold, so nothing reads through the catalog byte cache.
+    /// [`Mode::Maintain`] folds through the catalog, so its byte cache holds
+    /// memory there.
+    ///
+    /// Read by [`Cli::performance_flags`], which is where a gateway's budget
+    /// resolves to not applicable instead of being carved and checked.
+    pub fn uses_memory_budget(self) -> bool {
+        !matches!(self, Mode::Gateway)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -3036,6 +3051,10 @@ pub const PERF_SOURCE_BUDGET_CARVE: &str = "budget-carve";
 /// [`LOOPBACK_CACHE_MEMORY_PERCENT`] of `memory_budget_bytes` rather than at
 /// [`CACHE_MEMORY_PERCENT`] (ADR-2023).
 pub const PERF_SOURCE_BUDGET_CARVE_LOOPBACK: &str = "budget-carve-loopback";
+/// [`ResolvedPerformanceDefaults`] source: this process's mode uses no part
+/// of the ADR-1170 memory budget ([`Mode::uses_memory_budget`]), so no budget
+/// was derived and no cache ceiling was carved from one.
+pub const PERF_SOURCE_NOT_APPLICABLE: &str = "not-applicable";
 
 /// The operator's explicit performance flags: `None` per field means "derive".
 /// One field is not a flag: `store_is_loopback`, a fact about the store the
@@ -3094,6 +3113,13 @@ pub struct PerformanceFlags {
     /// fictitious and the whole budget is really available to the shared
     /// SQL/fetch accountant.
     pub disable_cache: bool,
+    /// Whether this process's mode uses no part of the memory budget
+    /// (`!Mode::uses_memory_budget`, [`Mode::Gateway`] today). Not a flag: a
+    /// fact about `--mode`, like `store_is_loopback` is about the store. Set,
+    /// no budget is derived, no cache ceiling is carved, and
+    /// [`ResolvedPerformanceDefaults::check_memory_budget`] has nothing to
+    /// refuse.
+    pub memory_budget_not_applicable: bool,
 }
 
 /// The six performance settings this process runs with, each with the source it
@@ -3204,6 +3230,14 @@ pub struct ResolvedPerformanceDefaults {
     /// no memory and [`Self::memory_hard_caps_bytes`] is `0` regardless of
     /// them.
     pub cache_disabled: bool,
+    /// The mode uses no part of the memory budget
+    /// ([`PerformanceFlags::memory_budget_not_applicable`]). Then
+    /// [`Self::memory_budget_bytes`] and [`Self::memory_remainder_bytes`] are
+    /// `u64::MAX` (an accountant nothing reserves against, which refuses
+    /// nothing), [`Self::memory_hard_caps_bytes`] is `0`, each cache ceiling
+    /// is its explicit flag or else `0`, and every budget-derived source is
+    /// [`PERF_SOURCE_NOT_APPLICABLE`].
+    pub memory_budget_not_applicable: bool,
     /// Where each of the six above came from: [`PERF_SOURCE_FLAG`],
     /// [`PERF_SOURCE_DERIVED`], or [`PERF_SOURCE_FALLBACK`].
     pub sources: PerformanceSources,
@@ -3316,6 +3350,11 @@ fn resolve_knob(
 ///   `--disable-cache` builds neither cache, so `memory_hard_caps_bytes` is
 ///   `0`, the remainder is the whole budget, and there is nothing for that
 ///   refusal to fire on.
+/// - `flags.memory_budget_not_applicable` (`--mode gateway`) replaces the
+///   three rules above: `memory_budget_bytes` and `memory_remainder_bytes`
+///   are `u64::MAX`, `memory_hard_caps_bytes` is `0`, and each cache
+///   ceiling is its explicit flag (sourced as a flag) or else `0`, sourced
+///   [`PERF_SOURCE_NOT_APPLICABLE`].
 /// - `sql_max_query_bytes`: [`SQL_QUERY_MEMORY_PERCENT`] of `MemTotal`, else
 ///   [`DEFAULT_SQL_MAX_QUERY_BYTES`].
 /// - `sql_tenant_max_bytes`: [`SQL_TENANT_MEMORY_PERCENT`] of `MemTotal`, else
@@ -3413,7 +3452,12 @@ pub fn resolve_performance_defaults(
     // shared SQL/fetch `MemoryBudget` accountant (`memory_remainder_bytes`)
     // down to `0`, refusing every real reservation on a process that
     // otherwise looks healthy.
+    //
+    // A mode that uses no part of the budget derives none: subtracting the
+    // reserve there would refuse a small gateway pod over memory it never
+    // claims.
     let (memory_budget_bytes, memory_budget_source) = match host.mem_total_bytes {
+        _ if flags.memory_budget_not_applicable => (u64::MAX, PERF_SOURCE_NOT_APPLICABLE),
         Some(total) => (
             total.saturating_sub(MEMORY_OVERHEAD_RESERVE_BYTES),
             PERF_SOURCE_DERIVED,
@@ -3428,6 +3472,7 @@ pub fn resolve_performance_defaults(
     // known-memory) arm, and only when `flags.store_is_loopback` is true.
     let (cache_max_bytes, cache_source) = match (flags.cache_max_bytes, host.mem_total_bytes) {
         (Some(n), _) => (n, PERF_SOURCE_FLAG),
+        (None, _) if flags.memory_budget_not_applicable => (0, PERF_SOURCE_NOT_APPLICABLE),
         (None, Some(_)) if flags.store_is_loopback => (
             percent_of(memory_budget_bytes, LOOPBACK_CACHE_MEMORY_PERCENT),
             PERF_SOURCE_BUDGET_CARVE_LOOPBACK,
@@ -3446,6 +3491,7 @@ pub fn resolve_performance_defaults(
     let (catalog_cache_max_bytes, catalog_cache_source) =
         match (flags.catalog_cache_max_bytes, host.mem_total_bytes) {
             (Some(n), _) => (n, PERF_SOURCE_FLAG),
+            (None, _) if flags.memory_budget_not_applicable => (0, PERF_SOURCE_NOT_APPLICABLE),
             (None, Some(_)) => (
                 percent_of(memory_budget_bytes, CATALOG_CACHE_MEMORY_PERCENT),
                 PERF_SOURCE_BUDGET_CARVE,
@@ -3459,7 +3505,9 @@ pub fn resolve_performance_defaults(
     // charging them against the budget would carve memory no cache holds and
     // shrink the shared SQL/fetch remainder by up to 45% of the budget (the
     // loopback fetch share plus the catalog share).
-    let memory_hard_caps_bytes = if flags.disable_cache {
+    // A mode outside the budget is charged nothing either: its caches are
+    // never read through, so an explicit ceiling there bounds no memory.
+    let memory_hard_caps_bytes = if flags.disable_cache || flags.memory_budget_not_applicable {
         0
     } else {
         cache_max_bytes.saturating_add(catalog_cache_max_bytes)
@@ -3530,6 +3578,7 @@ pub fn resolve_performance_defaults(
         memory_hard_caps_bytes,
         memory_remainder_bytes,
         cache_disabled: flags.disable_cache,
+        memory_budget_not_applicable: flags.memory_budget_not_applicable,
         sources: PerformanceSources {
             fetch_concurrency: fetch_source,
             store_get_concurrency: store_get_concurrency_source,
@@ -3645,8 +3694,18 @@ impl ResolvedPerformanceDefaults {
     /// budget against `0` caps, which the `>=` comparison below would refuse
     /// with no flag left that could satisfy it. `emit` WARNs about a `0`
     /// remainder instead.
+    ///
+    /// Also a no-op in a mode that uses no part of the budget
+    /// ([`Self::memory_budget_not_applicable`], `--mode gateway`): it builds
+    /// no query surface and runs no fold, so no fetcher, SQL executor or fold
+    /// reads through either cache or reserves against the shared accountant,
+    /// and there is no remainder this check could be protecting. Every other
+    /// mode keeps the check and its message unchanged.
     pub fn check_memory_budget(&self) -> Result<(), MemoryBudgetExceeded> {
-        if self.sources.memory_budget_bytes == PERF_SOURCE_FALLBACK || self.cache_disabled {
+        if self.sources.memory_budget_bytes == PERF_SOURCE_FALLBACK
+            || self.cache_disabled
+            || self.memory_budget_not_applicable
+        {
             return Ok(());
         }
         if self.memory_hard_caps_bytes >= self.memory_budget_bytes {
@@ -3748,35 +3807,50 @@ impl ResolvedPerformanceDefaults {
         // both sums are taken against a `u64::MAX` budget, so a `derived`
         // label there invites the reader to check
         // `budget = effective - reserve` against arithmetic that never ran.
-        tracing::info!(
-            setting = "memory_budget_bytes",
-            value = self.memory_budget_bytes,
-            source = self.sources.memory_budget_bytes,
-            "performance default resolved"
-        );
-        tracing::info!(
-            setting = "memory_overhead_reserve_bytes",
-            value = self.memory_overhead_reserve_bytes,
-            source = self.sources.memory_budget_bytes,
-            "performance default resolved"
-        );
-        // `cache_disabled` rides on the hard-caps line for the reason
-        // `clamped` rides on `sql_max_query_bytes` below: when it is true this
-        // value is `0` rather than the sum of the two cache lines above it,
-        // and a reader adding those two up would not get this number.
-        tracing::info!(
-            setting = "memory_hard_caps_bytes",
-            value = self.memory_hard_caps_bytes,
-            source = self.sources.memory_budget_bytes,
-            cache_disabled = self.cache_disabled,
-            "performance default resolved"
-        );
-        tracing::info!(
-            setting = "memory_remainder_bytes",
-            value = self.memory_remainder_bytes,
-            source = self.sources.memory_budget_bytes,
-            "performance default resolved"
-        );
+        //
+        // A gateway derives no budget, so it prints one line saying so in
+        // place of all four: a `u64::MAX` budget and a reserve that was never
+        // subtracted would read as figures this process runs under.
+        if self.memory_budget_not_applicable {
+            tracing::info!(
+                setting = "memory_budget_bytes",
+                source = self.sources.memory_budget_bytes,
+                "performance default not applicable in gateway mode: it builds no query \
+                 surface and runs no fold, so no memory budget is derived, no overhead reserve \
+                 is subtracted, and no cache ceiling is carved"
+            );
+        } else {
+            tracing::info!(
+                setting = "memory_budget_bytes",
+                value = self.memory_budget_bytes,
+                source = self.sources.memory_budget_bytes,
+                "performance default resolved"
+            );
+            tracing::info!(
+                setting = "memory_overhead_reserve_bytes",
+                value = self.memory_overhead_reserve_bytes,
+                source = self.sources.memory_budget_bytes,
+                "performance default resolved"
+            );
+            // `cache_disabled` rides on the hard-caps line for the reason
+            // `clamped` rides on `sql_max_query_bytes` below: when it is true
+            // this value is `0` rather than the sum of the two cache lines
+            // above it, and a reader adding those two up would not get this
+            // number.
+            tracing::info!(
+                setting = "memory_hard_caps_bytes",
+                value = self.memory_hard_caps_bytes,
+                source = self.sources.memory_budget_bytes,
+                cache_disabled = self.cache_disabled,
+                "performance default resolved"
+            );
+            tracing::info!(
+                setting = "memory_remainder_bytes",
+                value = self.memory_remainder_bytes,
+                source = self.sources.memory_budget_bytes,
+                "performance default resolved"
+            );
+        }
         // Startup refuses a `0` remainder on every other path (see
         // `check_memory_budget`), so this WARN is the only signal on the one
         // path that is allowed to start with one: `--disable-cache` on a host
@@ -6428,6 +6502,7 @@ impl Cli {
             sql_tenant_max_bytes: self.sql_tenant_max_bytes,
             query_deadline,
             disable_cache: self.disable_cache,
+            memory_budget_not_applicable: !self.mode.uses_memory_budget(),
         })
     }
 
@@ -6435,6 +6510,14 @@ impl Cli {
     /// against `host` (issue #1141). `main` calls this once, with
     /// [`HostProfile::detect`], and threads the result into every consumer;
     /// a test calls it with an injected profile.
+    ///
+    /// Mode-aware for the memory budget only. In every mode that uses it
+    /// ([`Mode::uses_memory_budget`]: `all`, `query`, `maintain`) the budget
+    /// is carved and [`ResolvedPerformanceDefaults::check_memory_budget`]
+    /// refuses startup as before. `--mode gateway` builds no query surface and
+    /// runs no fold, so it derives no budget, subtracts no overhead reserve,
+    /// and skips that check: a gateway starts under a cgroup memory limit of
+    /// 2 GiB or less. The other settings resolve the same way in every mode.
     ///
     /// `--logs-fetch-policy` carries no concurrency default (ADR-1196):
     /// `latency-first` resolves `store_get_concurrency` exactly as every
@@ -10271,6 +10354,188 @@ mod tests {
         let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
         cli.resolve_performance(tiny)
             .expect_err("the refusal still fires for a process that does build caches");
+    }
+
+    /// A 512 MiB container: the kind lane's gateway pod limit.
+    const SMALL_POD_MEM_BYTES: u64 = 512 * 1024 * 1024;
+
+    /// Only `--mode gateway` sits outside the memory budget: `all` and
+    /// `query` build the query surface (fetcher cache, SQL executor, shared
+    /// accountant) and `maintain` folds through the catalog byte cache.
+    #[test]
+    fn only_the_gateway_mode_uses_no_memory_budget() {
+        assert!(Mode::All.uses_memory_budget());
+        assert!(Mode::Query.uses_memory_budget());
+        assert!(Mode::Maintain.uses_memory_budget());
+        assert!(!Mode::Gateway.uses_memory_budget());
+    }
+
+    /// A gateway builds no query surface and runs no fold, so it neither
+    /// derives a memory budget nor refuses to start for lack of one: under a
+    /// 512 MiB effective memory it resolves, and every memory figure is pinned
+    /// to the not-applicable value. The settings outside the budget resolve
+    /// exactly as they do in query mode on the same host.
+    ///
+    /// Prove-the-test: set `memory_budget_not_applicable: false` in
+    /// `Cli::performance_flags` (the pre-fix behavior) and the first `expect`
+    /// panics on the `MemoryBudgetExceeded` refusal of a `0`-byte budget.
+    #[test]
+    fn a_gateway_starts_under_a_512_mib_memory_limit() {
+        let host = HostProfile::new(2, Some(SMALL_POD_MEM_BYTES));
+        let cli = Cli::try_parse_from(["ravel-server", "--mode", "gateway"]).expect("flags parse");
+        let resolved = cli
+            .resolve_performance(host)
+            .expect("a gateway uses no memory budget, so a 512 MiB pod must start");
+
+        assert!(resolved.memory_budget_not_applicable);
+        assert_eq!(resolved.memory_budget_bytes, u64::MAX);
+        assert_eq!(resolved.memory_hard_caps_bytes, 0);
+        assert_eq!(resolved.memory_remainder_bytes, u64::MAX);
+        assert_eq!(resolved.cache_max_bytes, 0);
+        assert_eq!(resolved.catalog_cache_max_bytes, 0);
+        assert_eq!(
+            resolved.memory_overhead_reserve_bytes,
+            MEMORY_OVERHEAD_RESERVE_BYTES
+        );
+        assert_eq!(
+            resolved.sources.memory_budget_bytes,
+            PERF_SOURCE_NOT_APPLICABLE
+        );
+        assert_eq!(resolved.sources.cache_max_bytes, PERF_SOURCE_NOT_APPLICABLE);
+        assert_eq!(
+            resolved.sources.catalog_cache_max_bytes,
+            PERF_SOURCE_NOT_APPLICABLE
+        );
+        assert!(!resolved.cache_disabled);
+        assert_eq!(resolved.check_memory_budget(), Ok(()));
+
+        // Everything outside the budget is mode-independent: the gateway's
+        // values equal a query process's on the same host, field by field.
+        let query = resolve_performance_defaults(host, PerformanceFlags::default());
+        assert_eq!(resolved.fetch_concurrency, query.fetch_concurrency);
+        assert_eq!(resolved.store_get_concurrency, query.store_get_concurrency);
+        assert_eq!(resolved.sql_partition_count, query.sql_partition_count);
+        assert_eq!(resolved.promql_fetch_fanout, query.promql_fetch_fanout);
+        assert_eq!(
+            resolved.catalog_resolve_concurrency,
+            query.catalog_resolve_concurrency
+        );
+        assert_eq!(resolved.max_segments, query.max_segments);
+        assert_eq!(resolved.sql_max_query_bytes, query.sql_max_query_bytes);
+        assert_eq!(resolved.sql_tenant_max_bytes, query.sql_tenant_max_bytes);
+        assert_eq!(resolved.query_deadline, query.query_deadline);
+
+        // An explicit cache flag is kept verbatim, not replaced, and charges
+        // no budget: the gateway never reads through either cache.
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--mode",
+            "gateway",
+            "--cache-max-bytes",
+            "20000000000",
+            "--catalog-cache-max-bytes",
+            "20000000000",
+        ])
+        .expect("flags parse");
+        let resolved = cli
+            .resolve_performance(host)
+            .expect("explicit cache ceilings in a gateway bound no memory");
+        assert_eq!(resolved.cache_max_bytes, 20_000_000_000);
+        assert_eq!(resolved.sources.cache_max_bytes, PERF_SOURCE_FLAG);
+        assert_eq!(resolved.catalog_cache_max_bytes, 20_000_000_000);
+        assert_eq!(resolved.sources.catalog_cache_max_bytes, PERF_SOURCE_FLAG);
+        assert_eq!(resolved.memory_hard_caps_bytes, 0);
+        assert_eq!(resolved.memory_remainder_bytes, u64::MAX);
+    }
+
+    /// The modes that build a cache or the shared SQL/fetch budget keep the
+    /// refusal and its message unchanged on the same 512 MiB host the
+    /// gateway starts on. Maintain is included: it folds through the catalog
+    /// byte cache.
+    #[test]
+    fn query_all_and_maintain_still_refuse_under_a_512_mib_memory_limit() {
+        let host = HostProfile::new(2, Some(SMALL_POD_MEM_BYTES));
+        for mode in ["query", "all", "maintain"] {
+            let cli = Cli::try_parse_from(["ravel-server", "--mode", mode]).expect("flags parse");
+            let err = cli
+                .resolve_performance(host)
+                .expect_err("a 512 MiB host derives a 0-byte budget, which must still refuse");
+            let exceeded = err
+                .downcast_ref::<MemoryBudgetExceeded>()
+                .expect("typed MemoryBudgetExceeded error");
+            assert_eq!(
+                *exceeded,
+                MemoryBudgetExceeded {
+                    cache_max_bytes: 0,
+                    catalog_cache_max_bytes: 0,
+                    hard_caps_total: 0,
+                    memory_budget_bytes: 0,
+                },
+                "--mode {mode}"
+            );
+            let message = exceeded.to_string();
+            assert!(
+                message.starts_with(
+                    "cache_max_bytes (0) + catalog_cache_max_bytes (0) = 0 bytes leaves no \
+                     strictly positive remainder of memory_budget_bytes (0 bytes) for the \
+                     shared SQL/fetch memory budget; no --cache-max-bytes value can satisfy \
+                     this check against a 0-byte budget"
+                ),
+                "--mode {mode}: {message}"
+            );
+        }
+    }
+
+    /// A gateway's startup log says the memory budget is not applicable, on
+    /// one line, rather than printing a `u64::MAX` budget and a reserve that
+    /// was never subtracted.
+    ///
+    /// Prove-the-test: drop the `if self.memory_budget_not_applicable` branch
+    /// in `emit` (keep only the four resolved lines) and the "must say it
+    /// does not apply" assertion fails on a line reading
+    /// `value=18446744073709551615 source="not-applicable"`.
+    #[test]
+    fn a_gateway_logs_its_memory_budget_as_not_applicable() {
+        let host = HostProfile::new(2, Some(SMALL_POD_MEM_BYTES));
+        let cli = Cli::try_parse_from(["ravel-server", "--mode", "gateway"]).expect("flags parse");
+        let resolved = cli.resolve_performance(host).expect("gateway resolves");
+        let (captured, _guard) = capture_events(tracing::Level::INFO);
+
+        resolved.emit(host);
+
+        let lines = captured.lock();
+        let joined = lines.join("\n");
+        let budget_lines: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("setting=\"memory_budget_bytes\""))
+            .collect();
+        assert_eq!(budget_lines.len(), 1, "lines: {lines:?}");
+        assert!(
+            budget_lines[0].contains("not applicable in gateway mode"),
+            "the budget line must say it does not apply: {}",
+            budget_lines[0]
+        );
+        assert!(
+            budget_lines[0].contains("source=\"not-applicable\""),
+            "{}",
+            budget_lines[0]
+        );
+        for setting in [
+            "memory_overhead_reserve_bytes",
+            "memory_hard_caps_bytes",
+            "memory_remainder_bytes",
+        ] {
+            let needle = format!("setting=\"{setting}\"");
+            assert_eq!(
+                joined.matches(&needle).count(),
+                0,
+                "a gateway must not print {setting}, lines: {lines:?}"
+            );
+        }
+        assert!(
+            !joined.contains(&u64::MAX.to_string()),
+            "no unlimited sentinel may reach the log as a figure: {lines:?}"
+        );
     }
 
     /// The four ADR-1170 decision 3/4 emit lines -- `memory_budget_bytes`,

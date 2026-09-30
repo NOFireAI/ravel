@@ -951,8 +951,13 @@ naming a cap that may not be the one that was hit.
 
 ### Process-wide memory budget (ADR-1170)
 
-`ravel-server` derives one process-wide ceiling, `memory_budget_bytes`, at
-startup: cgroup-capped effective memory (`/proc/meminfo`'s `MemTotal`, capped
+`ravel-server` in `all`, `query` and `maintain` mode derives one process-wide
+ceiling, `memory_budget_bytes`, at startup. A `--mode gateway` process serves
+no query and runs no fold, so it derives none: its budget and remainder read
+`u64::MAX` with source `not-applicable`, no overhead reserve is subtracted,
+each cache ceiling is its explicit flag or else `0`, and the startup refusal
+below does not apply. The derived budget is cgroup-capped effective memory
+(`/proc/meminfo`'s `MemTotal`, capped
 by the cgroup v2 `memory.max` or v1 `memory.limit_in_bytes` when the process
 runs under a finite one) minus a fixed 2 GiB overhead reserve for the
 allocator, thread stacks, and everything outside this accounting. It is
@@ -1045,7 +1050,9 @@ The gauge reads `u64::MAX` (unlimited) on the fallback path, which is any host
 where memory could not be read, whatever `--cache-max-bytes` was set to: that
 clamp keys off the budget's source alone, so an explicit cap on an unmeasured
 host still renders unlimited here while the real ceiling behind it is
-`u64::MAX` minus the two caps.
+`u64::MAX` minus the two caps. It also reads `u64::MAX` on every
+`--mode gateway` process, which derives no budget, so a panel that takes the
+maximum across pods filters on `mode!="gateway"`.
 
 The PromQL engine's fetchers, the SQL path's fetchers and the SQL executor
 share this one budget (see
