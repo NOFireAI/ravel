@@ -199,8 +199,7 @@ impl PinnedParquetReader {
 
         let hit = match &self.services.cache {
             Some(ReadCache::Ram(cache)) => cache.get(&key),
-            Some(ReadCache::Tiered(cache)) => cache.get_off_worker(key).await,
-            None => None,
+            Some(ReadCache::Tiered(_)) | None => None,
         };
         if let Some(bytes) = hit {
             accounting.record_cache_hit();
