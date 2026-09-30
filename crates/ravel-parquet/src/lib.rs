@@ -18,7 +18,10 @@
 //!   only that store's URL;
 //! - [`ParquetTableProvider`], which builds its scan from a manifest resolved
 //!   by `ravel-pqtable` before the session is built, and never lists the
-//!   store while planning.
+//!   store while planning;
+//! - [`snapshot::snapshot_location`], which turns a granted location into
+//!   the files a manifest pins and the schema they share, reading each
+//!   footer with the reader's checks.
 //!
 //! `ravel-sql`'s executor builds one [`ParquetTableProvider`] per Parquet
 //! table a statement names, after resolving its manifest, and a session over
