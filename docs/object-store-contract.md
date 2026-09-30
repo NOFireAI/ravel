@@ -564,16 +564,20 @@ has on the same backend: a real check on `MemoryStore`, a local pre-flight
 against the caller's buffer on `S3Store` (see "Upload checksums": the
 caller's CRC32C value itself cannot be put on the wire through `object_store`
 0.14). That is separate from the server-verified checksum `upload_integrity`
-selects, which the multipart path could carry: with the algorithm set,
-`object_store` 0.14.1's `create_multipart` sends `x-amz-checksum-algorithm`,
-and each `put_part` goes through `PutRequest::with_payload`, which attaches
-that part's `x-amz-checksum-crc64nvme` or `x-amz-checksum-sha256`. `put()`
-does not route large overwrites here under integrity yet (see "Upload
-checksums"), pending a real-endpoint check that the endpoint verifies them.
+selects, which this path already sends whenever integrity is on, because the
+algorithm is set for the whole client: `object_store` 0.14.1's
+`create_multipart` sends `x-amz-checksum-algorithm`, and each `put_part` goes
+through `PutRequest::with_payload`, which attaches that part's
+`x-amz-checksum-crc64nvme` or `x-amz-checksum-sha256`. It sends no
+`x-amz-checksum-type`, so what the endpoint records for the completed object
+is its default type for the algorithm (on AWS, a full-object checksum for
+CRC64-NVME and a composite one for SHA-256). `put()` does not route large
+overwrites here under integrity yet (see "Upload checksums"), pending a
+real-endpoint check that the endpoint verifies the part checksums.
 A mismatch fails that
 `put_part` with `Corrupted`, does not count as a part, and leaves the upload
 open, so the caller may re-send the same bytes with a correct checksum. There
-is **no whole-object checksum** for a multipart upload: `complete` takes no
+is **no caller-supplied whole-object checksum** for a multipart upload: `complete` takes no
 checksum argument, and the object never exists as one buffer to digest. Ravel's
 integrity guarantee for these objects is therefore read-time only, from the
 footer/section/page crc32c hierarchy (docs/segment-format.md), same as for any
@@ -782,10 +786,12 @@ path: every object up to S3's 5 GiB single-request limit goes out as one
 checksummed PUT, and a larger payload is refused rather than sent as
 multipart. The reason is cost and shape, not a missing mechanism: one PUT is
 one billed request where multipart costs parts + 2, and the whole object gets
-one checksum where multipart gets one per part. Multipart parts could carry
-per-part checksums (see "Checksum coverage" under "Multipart upload"), so a
-later change can switch large overwrites to multipart under integrity once a
-real endpoint is shown to verify them. Only the explicit `put_multipart` API uploads parts, and no production writer
+one checksum over its bytes as sent, where multipart sends one with each part
+and leaves the completed object's checksum type to the endpoint's default for
+the algorithm. The explicit `put_multipart` path already sends those part
+checksums under integrity (see "Checksum coverage" under "Multipart upload"),
+so a later change can switch large overwrites to multipart under integrity
+once a real endpoint is shown to verify them. Only the explicit `put_multipart` API uploads parts, and no production writer
 calls it; for what a caller-supplied part checksum covers there, see "Checksum
 coverage" under "Multipart upload".
 
@@ -1134,16 +1140,20 @@ adapter contract:
    objects, commit records, manifests, and index objects are immutable";
    this section is that invariant's bucket-level enforcement point). Object
    Lock protects object *versions*: compliance mode refuses any request that
-   would destroy or alter a locked version (a DELETE naming its version id,
+   would destroy or alter a locked version (a delete naming its version id,
    a lifecycle expiration) for the configured retention period, with no
    principal (including the bucket owner) able to shorten or remove it. It
    does not protect the key's current-version pointer. Object Lock requires
-   a versioned bucket, and there a DELETE with no version id succeeds and
+   a versioned bucket, and there a delete with no version id succeeds and
    inserts a delete marker, and a PUT adds a new current version; neither
    is refused. Against a compromised or misconfigured credential, then, the
    guarantee is that every locked version stays recoverable, not that the
-   key keeps reading it. Every Ravel delete is such a DELETE: `S3Store::delete`
-   calls `object_store`'s delete, which sends no version id. Subject identifiers that must remain erasable under ADR-0064 live in
+   key keeps reading it. Every Ravel delete is such a delete:
+   `S3Store::delete` calls `object_store` 0.14.1's `ObjectStoreExt::delete`,
+   which for S3 goes through `delete_stream` and sends a `DeleteObjects`
+   request (`POST /?delete`) whose body names only the key, with no
+   `VersionId`. Ravel never sets `disable_bulk_delete`, the one switch that
+   would send a path `DELETE` instead. Subject identifiers that must remain erasable under ADR-0064 live in
    *values*, never in *object keys or names*, so naming a prefix in the lock
    never exposes a subject value through the pattern itself. What a locked
    object *contains* is a separate question, and for one member of the
@@ -1161,8 +1171,8 @@ adapter contract:
    rewrite pass supersedes its inputs, and the superseded sweep then
    removes those inputs' commit records like any other superseded chain).
    A per-object compliance-mode retention `R` on a still-locked commit
-   record does not refuse that delete. The sweep's DELETE carries no
-   version id, so it succeeds and inserts a delete marker: the key reads as
+   record does not refuse that delete. The sweep's `DeleteObjects` entry
+   carries no version id, so it succeeds and inserts a delete marker: the key reads as
    absent to Ravel from then on, and the sweep moves on exactly as it would
    on an unlocked record. The locked version stays in storage as a
    noncurrent version. The noncurrent-version expiration rule point 1
@@ -1177,7 +1187,20 @@ adapter contract:
 
    The superseded sweep does tolerate refused deletes, but what refuses
    them is a deny policy or a credential without `s3:DeleteObject`, not
-   Object Lock. It runs three delete loops in order over every cleared
+   Object Lock. S3 reports that refusal per key inside the `DeleteObjects`
+   200 response, as an `<Error>` whose code is `AccessDenied`, and
+   `S3Store::delete` returns it as `AccessDenied`, the class the sweep
+   tolerates per chain. Every per-key code maps by the HTTP status S3
+   documents for it, the way a single request's status maps: the 403 codes
+   (`AccessDenied`, `AllAccessDisabled`, `AccountProblem`,
+   `InvalidAccessKeyId`, `InvalidObjectState`, `SignatureDoesNotMatch`) to
+   `AccessDenied`, `NoSuchKey` to the idempotent missing-key success,
+   `PreconditionFailed` to `PreconditionFailed`, and `ServiceUnavailable`
+   to `Throttled`. `object_store` retries the whole request on a per-key
+   `SlowDown` or `InternalError`, and any other code takes the generic
+   classification (`Transient` unless its text reads as a throttle or a
+   timeout), which is retryable and fails the pass. A whole-request 403 is
+   `AccessDenied` too. It runs three delete loops in order over every cleared
    chain in the pass: every chain's input commit records first, then every
    chain's input data objects (its L0 data and pre-rewrite L1 segments),
    then every chain's own compaction or rewrite records last, so a rewrite

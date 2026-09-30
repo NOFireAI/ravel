@@ -51,8 +51,8 @@ records are not exempt even that far: they are deleted, once superseded, by
 the same sweeps. Object Lock does not refuse that delete. Ravel's delete names
 no version, so on the versioned bucket Object Lock requires it succeeds and
 inserts a delete marker: the record reads as absent to Ravel and the sweep
-carries on, while the locked version stays in storage until its retention
-period has passed and the noncurrent-version expiration rule removes it. The
+carries on, while the locked version stays in storage until its retain-until
+has passed and the noncurrent-version expiration rule removes it. The
 retention period therefore extends how long the record's bytes physically
 exist, not how long the sweep waits; see the object store contract's
 "Required bucket configuration" for the bound.
@@ -65,7 +65,7 @@ a typed string or bytes attribute column a per-part column-statistics object
 among them holds that subject's own column value. A lock over the keyspace
 does not delay that delete, which succeeds as a delete marker, but the locked
 version keeps the value in storage: it persists until the fold reconciles that
-hour and then until the retention period and the noncurrent-version expiration
+hour and then until its retain-until and the noncurrent-version expiration
 have both passed. The maintenance IAM policy Ravel ships
 permits that delete: its catalog delete-deny is scoped to
 `catalog/<signal>/HEAD`, and the maintenance role holds delete on
@@ -78,7 +78,7 @@ store contract's "Required bucket
 configuration" section, "A lock on the catalog family". The scoped posture is
 therefore still not a disaster-recovery choice; it is the baseline the commit
 and catalog layers already assume, with the commit-record family carrying the
-sweep-delay cost above and the catalog family the sweep delay and, for those
+physical-removal cost above and the catalog family that cost and, for those
 tenants, the erasure bound.
 
 Scoping the lock takes an operator-run mechanism, and it is a requirement of
@@ -107,12 +107,15 @@ inserts a delete marker; Object Lock protects object versions, not the
 current-version pointer, and refuses none of those deletes. The sweep carries
 on as if the object were unlocked, and the key reads as absent to Ravel. What
 the period extends is how long the locked version physically stays in
-storage: it is removed only once its retention period has passed and the
+storage: it is removed only once its retain-until has passed and the
 noncurrent-version expiration rule has fired, so a commit record's
 physical-removal bound becomes the later of the sweep's bound plus `E_v` and
 its retain-until. The sweeps do stop on a delete the store refuses, one chain
 at a time, but what refuses is a deny policy or a credential without
-`s3:DeleteObject`, not the lock. The catalog keyspace extends the erasure
+`s3:DeleteObject`, not the lock. S3 reports that refusal per key inside the
+200 response to the `DeleteObjects` request Ravel sends, and Ravel reads a
+per-key `AccessDenied` as access denied, so it holds back that one chain
+rather than failing the whole pass. The catalog keyspace extends the erasure
 bound too, for a tenant with a typed string or bytes attribute column and
 only for such a tenant; that cost, its exact bound and the shipped-IAM ceiling
 are in the object store contract's "Required bucket configuration" section,
@@ -241,8 +244,9 @@ level 2 as a deliberate choice, with the erasure consequence disclosed.
 
 ## `DeleteMarkerReplication` is mandatory for erasure-obligated deployments
 
-Every Ravel delete issues a **simple DELETE**; nothing in Ravel ever deletes
-by version id. On a versioned bucket a simple DELETE becomes a **delete
+Every Ravel delete is a **simple delete**, a `DeleteObjects` request whose
+body names only the key; nothing in Ravel ever deletes by version id. On a
+versioned bucket a simple delete becomes a **delete
 marker**, and a delete marker replicates to the replica **only when
 `DeleteMarkerReplication` is enabled**.
 
@@ -620,7 +624,7 @@ record: a real end-to-end run against RustFS is what fills a row.
 
 | Level | Controls | Erasure-bound consequence | RPO/RTO |
 |---|---|---|---|
-| **Every level** | Object Lock enabled on the bucket and versioning ON; at levels 0 and 1, no bucket default retention and an operator-run mechanism applying per-object retention in compliance mode to `sys/`, provisioning records, commit records and the catalog keyspace `t/*/catalog/*/*` (level 2 replaces the mechanism with its bucket default retention); `--require-bucket-protection` gates startup on the bucket half (Object Lock, versioning and the lifecycle rules), and the mechanism or the default retention is verified out of band | None for `sys/` and the provisioning records (no erasable subject value, and no sweep deletes them). For the commit records, `max(bound + E_v, R)` where `R` is the chosen retention period: the sweep's delete succeeds as a delete marker, and the locked version is removed once `R` and noncurrent-version expiry have both passed. For the catalog keyspace, the unreferenced-catalog sweep does delete its snapshot and index objects, and for any tenant with a typed string or bytes attribute column a stale per-part column-statistics object stores an erased value verbatim. That bound is not `max(bound + E_v, R)`: the object stays referenced until the fold reconciles that hour or HEAD is rebuilt, so it is "until the fold reconciles, then plus the later of `R` and `E_v`". The maintenance IAM policy Ravel ships permits that delete (its catalog deny is scoped to `catalog/<signal>/HEAD`); a copy of that template predating the narrowing denies it outright and leaves the bound open-ended until it is re-applied. Scope the mechanism to `catalog/<signal>/HEAD` alone to drop the retention half of it | Not a recovery control |
+| **Every level** | Object Lock enabled on the bucket and versioning ON; at levels 0 and 1, no bucket default retention and an operator-run mechanism applying per-object retention in compliance mode to `sys/`, provisioning records, commit records and the catalog keyspace `t/*/catalog/*/*` (level 2 replaces the mechanism with its bucket default retention); `--require-bucket-protection` gates startup on the bucket half (Object Lock, versioning and the lifecycle rules), and the mechanism or the default retention is verified out of band | None for `sys/` and the provisioning records (no erasable subject value, and no sweep deletes them). For the commit records, `max(bound + E_v, R)` where `R` is the locked version's retain-until: the sweep's delete succeeds as a delete marker, and the locked version is removed once `R` and noncurrent-version expiry have both passed. For the catalog keyspace, the unreferenced-catalog sweep does delete its snapshot and index objects, and for any tenant with a typed string or bytes attribute column a stale per-part column-statistics object stores an erased value verbatim. That bound is not `max(bound + E_v, R)`: the object stays referenced until the fold reconciles that hour or HEAD is rebuilt, so it is "until the fold reconciles, then plus the later of `R` and `E_v`". The maintenance IAM policy Ravel ships permits that delete (its catalog deny is scoped to `catalog/<signal>/HEAD`); a copy of that template predating the narrowing denies it outright and leaves the bound open-ended until it is re-applied. Scope the mechanism to `catalog/<signal>/HEAD` alone to drop the retention half of it | Not a recovery control |
 | **level 0** (default) | Versioning + `NoncurrentDays = E_v` + expired-delete-marker cleanup; no replica | Primary `+E_v` | None; bucket loss is total loss |
 | **level 1** (recommended) | Level 0 plus a replica: different region/account/KMS key, replication v2 with `DeleteMarkerReplication`, RTC recommended; the replica versioned with `NoncurrentDays = E_v_r` and expired-delete-marker cleanup | Primary `+E_v`; replica residue is replication lag + `E_v_r` (requires `DeleteMarkerReplication`) | Defined here; **unmeasured** until a rehearsal record exists. RTC gives RPO a 15-minute ceiling; without RTC, unbounded |
 | **level 2** (optional) | level 1 plus a bucket default retention `D`, which S3 applies to every object including the data objects | `max(bound + E_v, D)`; query-time exclusion still immediate | As level 1 |

@@ -827,14 +827,19 @@ and PII-free) get permanent audit evidence without permanent PII.
 
 Decision 6's "Bucket-level Object Lock" bullet says S3 refuses the sweep's
 deletes under a compliance-mode default retention `D`. It does not. Object
-Lock requires a versioned bucket, and every Ravel delete is a DELETE with no
-version id: `S3Store::delete` calls `object_store`'s delete, whose
-`delete_request` in 0.14.1 sends DELETE on the path and adds `versionId` only
-on GET. On a versioned bucket that request succeeds and inserts a delete
+Lock requires a versioned bucket, and every Ravel delete names no version
+id: `S3Store::delete` calls `object_store` 0.14.1's `ObjectStoreExt::delete`,
+which for S3 goes through `delete_stream` to `bulk_delete_request` and sends
+a `DeleteObjects` request (`POST /?delete`) whose body carries only the
+`Key`, never a `VersionId`. Only `disable_bulk_delete`, which Ravel never
+sets, would send a path DELETE instead, and that carries no version id
+either. On a versioned bucket that request succeeds and inserts a delete
 marker. Object Lock protects object versions, not the current-version
-pointer, so it refuses a DELETE naming a locked version's id and a lifecycle
-expiration of that version, and nothing Ravel sends. This is AWS S3
-semantics, not something the repository can test.
+pointer, so it refuses a delete naming a locked version's id and a lifecycle
+expiration of that version, and nothing Ravel sends. The request Ravel sends
+is pinned by `a_delete_is_one_delete_objects_request_with_no_version_id` in
+`crates/ravel-object-store/tests/s3_http_faults.rs`; what S3 does with it is
+AWS S3 semantics, not something the repository can test.
 
 So under `D` the sweep's deletes succeed, the key reads as absent to Ravel,
 and the sweep carries on as on an unlocked bucket. The locked version stays
@@ -845,7 +850,10 @@ not remove a version while it is locked. The physical bound is therefore
 not from the sweep waiting. The advice to prefer scoped legal holds over
 blanket default retention, or to keep `D` inside the erasure SLA, stands. The
 refusals the sweep does tolerate as per-object residue come from a deny
-policy or a credential without `s3:DeleteObject`.
+policy or a credential without `s3:DeleteObject`. S3 reports such a refusal
+per key inside the `DeleteObjects` 200 response, and `S3Store::delete` maps a
+per-key `AccessDenied` to `StoreError::AccessDenied`, the class the sweep
+tolerates per chain.
 
 docs/object-store-contract.md "Required bucket configuration" and
 docs/deletion-and-gc.md "Modifiers to the bound" carry the corrected

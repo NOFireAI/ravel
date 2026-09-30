@@ -793,9 +793,10 @@ into them. An operator with erasure obligations must budget them deliberately.
   compliance-mode default retention `D` (the out-of-band step ADR-0042
   documents; Ravel cannot set or enforce per-object retention through
   `object_store`), S3 does not refuse the sweep's deletes. Object Lock needs
-  a versioned bucket, every Ravel delete is a DELETE with no version id
-  (`S3Store::delete` calls `object_store`'s delete, which sends none), and
-  on a versioned bucket that request succeeds and inserts a delete marker:
+  a versioned bucket, every Ravel delete names no version id
+  (`S3Store::delete` calls `object_store`'s delete, which sends a
+  `DeleteObjects` request, `POST /?delete`, whose body carries only the
+  key), and on a versioned bucket that request succeeds and inserts a delete marker:
   Object Lock protects object versions, not the current-version pointer.
   The key reads as absent to Ravel at once, and the locked version stays in
   storage as a noncurrent version until its retain-until passes and the
@@ -820,7 +821,13 @@ into them. An operator with erasure obligations must budget them deliberately.
 
   The refusal path `sweep_superseded` tolerates per chain is reached by a
   deny policy or a credential without `s3:DeleteObject`, not by Object
-  Lock. It runs three delete loops in order over every cleared chain: every
+  Lock. S3 reports that refusal per key inside the `DeleteObjects` 200
+  response, and `S3Store::delete` maps a per-key `AccessDenied` (and every
+  other 403 code) to `StoreError::AccessDenied` and a per-key
+  `PreconditionFailed` to `StoreError::PreconditionFailed`, so it reaches
+  this path per chain rather than failing the pass as a retryable error;
+  docs/object-store-contract.md "Required bucket configuration" lists every
+  mapped code. It runs three delete loops in order over every cleared chain: every
   chain's input commit records first, then every chain's input data
   objects, then every chain's own compaction or rewrite records last. A
   refused delete (access denied, a failed precondition, or a permanent
@@ -893,7 +900,7 @@ into them. An operator with erasure obligations must budget them deliberately.
   decision 1; see [guides/disaster-recovery.md](guides/disaster-recovery.md)),
   a subject erased on the primary survives on the replica until the replica's
   own noncurrent-version expiration reaps it. With `DeleteMarkerReplication`
-  enabled, the primary's simple DELETE replicates as a delete marker and the
+  enabled, the delete marker the primary's delete inserts replicates and the
   replica's copy is physically gone within **replication lag + `E_v_r`** after
   the primary sweep (`E_v_r` is the replica's `NoncurrentDays` rule). This is
   additive to the primary's own `+E_v`: the primary carries erased-subject
@@ -906,7 +913,8 @@ into them. An operator with erasure obligations must budget them deliberately.
   Consequences).
 
   > **Unsupported configuration: a replica without `DeleteMarkerReplication`.**
-  > Every Ravel delete is a simple DELETE, which becomes a delete marker on a
+  > Every Ravel delete names no version id (a `DeleteObjects` entry carrying
+  > only the key), which becomes a delete marker on a
   > versioned bucket and replicates **only** when `DeleteMarkerReplication` is
   > enabled. A replica configured without it never receives the delete markers
   > that reap erased (or retention-, orphan-, supersession-deleted) bytes, so
