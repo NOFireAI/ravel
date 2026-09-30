@@ -558,6 +558,91 @@ async fn hand_built_layout_cannot_bypass_the_setter() {
     );
 }
 
+/// At the stored generation, a key with the stored columns and a different
+/// bucket width is a changed key and is refused, and the stored record is left
+/// as it was. The stored key rewritten unchanged at that generation is written.
+#[tokio::test]
+async fn a_bucket_width_change_needs_a_new_generation() {
+    let store = MemoryStore::new();
+    let mut hourly = base_config();
+    hourly
+        .set_clustering_key(names(&["a", "b"]), ClusteringBucketWidth::OneHour, OPTED_IN)
+        .expect("set");
+    write(&store, &hourly, 1).await;
+    let before = raw_bytes(&store).await;
+
+    let donor = MemoryStore::new();
+    let mut six_hours = raw_record(3, &declared());
+    six_hours.clustering_key = Some(sysproto::ClusteringKeyConfig {
+        columns: names(&["a", "b"]),
+        bucket_width: SIX_HOURS,
+        generation: 1,
+    });
+    put_raw(&donor, &six_hours).await;
+    let rewidened = read(&donor).await;
+    assert_eq!(rewidened.clustering_generation(), 1);
+
+    let err = layout_error(
+        set_tenant_config(&store, &tenant(), &rewidened, 2)
+            .await
+            .expect_err("a new bucket width at generation 1"),
+    );
+    assert_eq!(
+        err,
+        StorageLayoutConfigError::ClusteringKeyChangedWithoutGeneration { generation: 1 }
+    );
+    assert_eq!(
+        raw_bytes(&store).await,
+        before,
+        "the refusal writes nothing"
+    );
+
+    let mut unchanged = read(&store).await;
+    unchanged.retention_ns = Some(7);
+    write(&store, &unchanged, 3).await;
+    let stored = wire(&store).await;
+    assert_eq!(stored.retention_ns, Some(7));
+    assert_eq!(
+        stored.clustering_key,
+        Some(sysproto::ClusteringKeyConfig {
+            columns: names(&["a", "b"]),
+            bucket_width: sysproto::ClusteringBucketWidth::OneHour as i32,
+            generation: 1,
+        })
+    );
+}
+
+/// A version-3 record carrying a bloom scope value outside the enum decodes,
+/// and writing that config back is refused with the value it carries and
+/// writes nothing. Both a value above the highest known scope and a negative
+/// one are checked.
+#[tokio::test]
+async fn an_unknown_bloom_scope_is_not_written_back() {
+    for got in [42, -1] {
+        let store = MemoryStore::new();
+        let mut record = raw_record(3, &declared());
+        record.bloom_scope = got;
+        put_raw(&store, &record).await;
+        let decoded = read(&store).await;
+        assert_eq!(
+            decoded.bloom_scope(),
+            Err(StorageLayoutConfigError::UnknownBloomScope { got })
+        );
+
+        let err = layout_error(
+            set_tenant_config(&store, &tenant(), &decoded, 2)
+                .await
+                .expect_err("an unknown bloom scope"),
+        );
+        assert_eq!(err, StorageLayoutConfigError::UnknownBloomScope { got });
+        assert_eq!(
+            raw_bytes(&store).await,
+            record.encode_to_vec(),
+            "the refusal writes nothing"
+        );
+    }
+}
+
 /// A decodable `typed_attr_columns` list that fails validation resolves to the
 /// base columns, as the server's declared-column overlay treats it; a valid
 /// list on the same path resolves to itself.
