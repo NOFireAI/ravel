@@ -199,7 +199,8 @@ impl PinnedParquetReader {
 
         let hit = match &self.services.cache {
             Some(ReadCache::Ram(cache)) => cache.get(&key),
-            Some(ReadCache::Tiered(_)) | None => None,
+            Some(ReadCache::Tiered(cache)) => cache.get_off_worker(key).await,
+            None => None,
         };
         if let Some(bytes) = hit {
             accounting.record_cache_hit();
@@ -2182,5 +2183,60 @@ mod tests {
             .await
             .expect("lands exactly on the budget");
         assert_eq!(recording.ranges().len(), 2);
+    }
+
+    /// A `Tiered` cache (production's `--cache-dir` configuration) serves a
+    /// hit from either tier with zero new requests, even at the request
+    /// budget: both tiers are consulted before `precheck`, not after.
+    ///
+    /// FLIP: consulting only the RAM tier before `precheck`, as
+    /// `Some(ReadCache::Tiered(_)) | None => None` used to, runs `precheck`
+    /// first for a Tiered cache and refuses both reads here.
+    #[tokio::test]
+    async fn a_tiered_cache_hit_is_admitted_at_the_request_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let memory = Arc::new(ravel_memory::MemoryBudget::unlimited());
+        let store = Arc::new(MemoryStore::new());
+        let recording = Arc::new(RecordingStore::new(Arc::clone(&store), false));
+        let fixture = Fixture::new_tiered(
+            Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>,
+            dir.path(),
+        )
+        .with_limits(limits_of(
+            &memory,
+            ByteLimit::Unlimited,
+            RequestLimit::Bounded(0),
+        ));
+        let file = fixture
+            .put_file(
+                &store,
+                "lake/t/a.parquet",
+                parquet_bytes(&[4, 5, 6], &["four", "five", "sixx"]),
+                false,
+            )
+            .await;
+        let reader = fixture.reader(file);
+        let Some(ReadCache::Tiered(tiered)) = &fixture.services().cache else {
+            panic!("fixture built with a Tiered cache");
+        };
+
+        // RAM-tier hit.
+        let ram_key = reader.cache_key(0, 4);
+        tiered.insert(ram_key, Bytes::from_static(b"abcd"));
+        reader
+            .read_range(0..4, QueryPhase::Scan)
+            .await
+            .expect("a RAM-tier hit needs no request, even at a zero-request budget");
+        assert!(recording.ranges().is_empty(), "{:?}", recording.ranges());
+
+        // Disk-tier hit: the RAM tier misses, the disk tier alone holds the
+        // bytes.
+        let disk_key = reader.cache_key(4, 4);
+        tiered.disk_for_test().insert(disk_key, b"efgh");
+        reader
+            .read_range(4..8, QueryPhase::Scan)
+            .await
+            .expect("a disk-tier hit needs no request, even at a zero-request budget");
+        assert!(recording.ranges().is_empty(), "{:?}", recording.ranges());
     }
 }
