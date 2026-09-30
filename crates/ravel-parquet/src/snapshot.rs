@@ -8,7 +8,6 @@
 //! each file's identity from the footer read's response, never from the
 //! listing.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,7 +15,10 @@ use bytes::Bytes;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use futures::StreamExt;
 use futures::stream;
-use ravel_object_store::{GetRange, ObjectStoreBackend, Pin, PinnedRead, StoreError};
+use ravel_object_store::{
+    DrainStep, GetRange, MAX_LIST_PAGES, ObjectStoreBackend, Pin, PinnedRead, StoreError,
+    drain_pages,
+};
 use ravel_pqtable::grants::{Grant, KeyPrefix, contains_key};
 use ravel_pqtable::manifest::{ParquetFile, key_is_addressable};
 use ravel_query::{GetLimiter, PhaseAccounting, QueryPhase};
@@ -231,6 +233,22 @@ fn check_file_key(location: &GrantedLocation, key: &str) -> Result<(), SnapshotE
     Ok(())
 }
 
+/// Error out of the [`drain_pages`] hooks in [`list_files`], converted to a
+/// [`SnapshotError`] once the drain finishes. `drain_pages` requires an
+/// `E: From<StoreError>`; a blanket `From<StoreError> for SnapshotError`
+/// would lose the location `SnapshotError::List` carries, so this carries it
+/// through instead.
+enum ListDrainError {
+    Store(StoreError),
+    Snapshot(SnapshotError),
+}
+
+impl From<StoreError> for ListDrainError {
+    fn from(source: StoreError) -> Self {
+        ListDrainError::Store(source)
+    }
+}
+
 async fn list_files(
     store: &dyn ObjectStoreBackend,
     location: &GrantedLocation,
@@ -244,48 +262,47 @@ async fn list_files(
         directory_markers: 0,
         other_suffixes: 0,
     };
-    // A key may appear on more than one page; each is counted once.
-    let mut seen = HashSet::new();
-    let mut page = None;
-    loop {
-        resolve.record_s3_request(AccountedOp::List);
-        let result = store
-            .list(&prefix, page)
-            .await
-            .map_err(|source| SnapshotError::List {
-                location: location.url(),
-                source,
-            })?;
-        for object in result.objects {
-            if !seen.insert(object.key.clone()) {
-                continue;
-            }
+    drain_pages(
+        &prefix,
+        None,
+        MAX_LIST_PAGES,
+        |_start_after, page| async {
+            resolve.record_s3_request(AccountedOp::List);
+            Ok(store.list(&prefix, page).await?)
+        },
+        |object| {
             if object.key.ends_with('/') {
                 listed.directory_markers += 1;
-                continue;
+                return Ok(DrainStep::Continue);
             }
             if !object.key.ends_with(PARQUET_SUFFIX) {
                 listed.other_suffixes += 1;
-                continue;
+                return Ok(DrainStep::Continue);
             }
-            check_file_key(location, &object.key)?;
+            check_file_key(location, &object.key).map_err(ListDrainError::Snapshot)?;
             if listed.candidates.len() == limit {
-                return Err(SnapshotError::TooManyFiles {
+                return Err(ListDrainError::Snapshot(SnapshotError::TooManyFiles {
                     location: location.url(),
                     limit,
-                });
+                }));
             }
             listed.candidates.push(Candidate {
                 key: object.key,
                 etag: object.etag.0,
                 size: object.size,
             });
-        }
-        page = result.next;
-        if page.is_none() {
-            return Ok(listed);
-        }
-    }
+            Ok(DrainStep::Continue)
+        },
+    )
+    .await
+    .map_err(|err| match err {
+        ListDrainError::Store(source) => SnapshotError::List {
+            location: location.url(),
+            source,
+        },
+        ListDrainError::Snapshot(err) => err,
+    })?;
+    Ok(listed)
 }
 
 async fn head_file(
@@ -358,10 +375,11 @@ fn key_of(file: &ParquetFile) -> String {
     String::from_utf8_lossy(&file.key).into_owned()
 }
 
-/// `NotFound` means `FileMissing` here because every call site but one is a
-/// read that has not yet proved the object exists. The one exception, the
-/// second GET of a long footer, has already read this same object once and
-/// remaps `FileMissing` to `FileChanged` at its own call site below.
+/// `NotFound` means `FileMissing` here because every call site but two is a
+/// read that has not yet proved the object exists. The two exceptions -- the
+/// tail read retried after the listing misreported the size, and the second
+/// GET of a long footer -- have each already read this same object once and
+/// remap `FileMissing` to `FileChanged` at their own call site below.
 fn read_error(key: &str, source: StoreError) -> SnapshotError {
     let key = key.to_string();
     match source {
@@ -443,7 +461,14 @@ async fn read_file(
             tail_range(size),
             &listed_pin,
         )
-        .await?;
+        .await
+        .map_err(|err| match err {
+            // The first read already proved this object exists at this
+            // pin; a NotFound here means it changed since that read, not
+            // that it was never there.
+            SnapshotError::FileMissing { key } => SnapshotError::FileChanged { key },
+            other => other,
+        })?;
         if tail.outcome.total_size != size {
             return Err(SnapshotError::FileChanged { key: key.clone() });
         }
@@ -514,8 +539,9 @@ async fn read_file(
     let metadata = decode_footer(&footer, size - footer_and_trailer).map_err(&corrupt)?;
     let row_count = u64::try_from(metadata.file_metadata().num_rows())
         .map_err(|_| corrupt("the footer records a negative row count".to_string()))?;
-    let footer_len =
-        u32::try_from(footer_len).map_err(|_| corrupt(format!("a {footer_len}-byte footer")))?;
+    // `trailer_footer_len` widens the trailer's own 4-byte field (a u32) to
+    // build `footer_len`, so this cannot truncate.
+    let footer_len = footer_len as u32;
     let schema = file_schema(&metadata).map_err(|message| corrupt(format!("schema: {message}")))?;
     let file = ParquetFile {
         profile: grant.profile.clone(),
@@ -621,6 +647,19 @@ mod tests {
         /// call numbered here, to synthesize a long-footer second read that
         /// disagrees with the first without racing a real overwrite.
         lie_pin_version_on_call: Option<(usize, String)>,
+        /// Fail the 1-based `get_pinned` call numbered here with `NotFound`,
+        /// to synthesize a deletion racing a retry without touching the real
+        /// object (so a later assertion can still read it back).
+        not_found_on_call: Option<usize>,
+        /// Serve `.csv` keys instead of `.parquet` ones from `synthetic`, so
+        /// a synthetic listing can exercise the skip-and-count path instead
+        /// of the candidate path.
+        synthetic_non_parquet: bool,
+        /// Serve these pages verbatim, in call order, ignoring the requested
+        /// page token and the underlying store. The only way to script a raw
+        /// delivery sequence a real backend would refuse to produce (a
+        /// decrease): no listing built on a real store can reach one.
+        scripted_pages: Mutex<Vec<ListPage>>,
         lists: Mutex<Vec<String>>,
         heads: Mutex<Vec<String>>,
         gets: Mutex<Vec<(String, GetRange, Pin)>>,
@@ -648,12 +687,12 @@ mod tests {
                 .clone()
         }
 
-        fn synthetic_page(count: usize, page: Option<PageToken>) -> ListPage {
+        fn synthetic_page(count: usize, page: Option<PageToken>, suffix: &str) -> ListPage {
             let start = page.map_or(0, |PageToken(at)| at.parse().expect("token"));
             let end = count.min(start + 1000);
             let objects = (start..end)
                 .map(|i| ObjectMeta {
-                    key: format!("data/{i:06}.parquet"),
+                    key: format!("data/{i:06}{suffix}"),
                     size: 100,
                     etag: Etag(format!("e{i}")),
                     version: Version(format!("v{i}")),
@@ -691,6 +730,9 @@ mod tests {
                 gets.push((key.to_string(), range, pin.clone()));
                 gets.len()
             };
+            if self.not_found_on_call == Some(call) {
+                return Err(StoreError::NotFound);
+            }
             let mut sent_pin = pin.clone();
             if self.misreport_listing {
                 sent_pin.etag = sent_pin.etag.trim_start_matches("listed:").to_string();
@@ -726,8 +768,22 @@ mod tests {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(prefix.to_string());
+            {
+                let mut scripted = self
+                    .scripted_pages
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if !scripted.is_empty() {
+                    return Ok(scripted.remove(0));
+                }
+            }
             if let Some(count) = self.synthetic {
-                return Ok(Self::synthetic_page(count, page));
+                let suffix = if self.synthetic_non_parquet {
+                    ".csv"
+                } else {
+                    PARQUET_SUFFIX
+                };
+                return Ok(Self::synthetic_page(count, page, suffix));
             }
             let repeated = match (&page, self.repeat_page_boundary) {
                 (Some(PageToken(after)), true) => Some(self.inner.head(after).await?),
@@ -958,9 +1014,9 @@ mod tests {
     /// A store may list a key again at the start of the next page; here the
     /// repeated boundary key is a `.parquet` file on two different page
     /// boundaries (`data/a.parquet`, then `data/c.parquet`). Mutation that
-    /// fails it: dropping the `seen` check lists each repeated file twice.
-    /// `skipped_keys_repeated_across_a_page_boundary_are_counted_once` below
-    /// covers a marker and a non-`.parquet` key repeating this way.
+    /// fails it: dropping the drain's last-key dedup lists each repeated
+    /// file twice. `skipped_keys_repeated_across_a_page_boundary_are_counted_once`
+    /// below covers a marker and a non-`.parquet` key repeating this way.
     #[tokio::test]
     async fn a_key_listed_on_two_pages_is_counted_once() {
         let store = Scripted {
@@ -982,10 +1038,10 @@ mod tests {
     }
 
     /// A directory marker and a non-`.parquet` key can repeat across a page
-    /// boundary too; the `seen` dedup applies to every listed key before the
-    /// suffix is even looked at, not only to `.parquet` files. With
-    /// `page_size(1)` every key but the last repeats once. Mutation that
-    /// fails it: applying `seen` only to `.parquet` keys, which counts the
+    /// boundary too; the drain's last-key dedup applies to every listed key
+    /// before the suffix is even looked at, not only to `.parquet` files.
+    /// With `page_size(1)` every key but the last repeats once. Mutation
+    /// that fails it: deduping only `.parquet` keys, which counts the
     /// marker and the skipped key twice.
     #[tokio::test]
     async fn skipped_keys_repeated_across_a_page_boundary_are_counted_once() {
@@ -1003,6 +1059,89 @@ mod tests {
         assert_eq!(keys(&got), ["data/b.parquet", "data/c.parquet"]);
         assert_eq!(got.skipped_directory_markers, 1);
         assert_eq!(got.skipped_other_suffixes, 1);
+    }
+
+    /// A raw delivery sequence a real backend would refuse to produce: the
+    /// second page's only key sorts below the first page's, which is not the
+    /// "repeat of the last delivered key" the contract allows across a page
+    /// boundary. `list_files` now runs on `drain_pages`
+    /// (`crates/ravel-object-store/src/lib.rs`), which refuses this as a
+    /// typed `StoreError::ListOrderViolation` rather than reordering or
+    /// silently admitting both keys (docs/object-store-contract.md,
+    /// "Listing"). Confirmed against the code before this fix: the old
+    /// hand-rolled loop deduped by a `HashSet` and had no ordering check at
+    /// all, so it read both keys as two distinct files instead of refusing.
+    #[tokio::test]
+    async fn a_listing_that_decreases_across_pages_refuses_with_a_typed_error() {
+        let store = Scripted::default();
+        *store
+            .scripted_pages
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = vec![
+            ListPage {
+                objects: vec![ObjectMeta {
+                    key: "data/b.parquet".to_string(),
+                    size: 1,
+                    etag: Etag("eb".to_string()),
+                    version: Version("vb".to_string()),
+                    last_modified_unix_ms: 0,
+                }],
+                next: Some(PageToken("b".to_string())),
+            },
+            ListPage {
+                objects: vec![ObjectMeta {
+                    key: "data/a.parquet".to_string(),
+                    size: 1,
+                    etag: Etag("ea".to_string()),
+                    version: Version("va".to_string()),
+                    last_modified_unix_ms: 0,
+                }],
+                next: None,
+            },
+        ];
+        match snapshot(&store, "s3://lake/data/").await {
+            Err(SnapshotError::List {
+                source:
+                    StoreError::ListOrderViolation {
+                        previous,
+                        offending,
+                        ..
+                    },
+                ..
+            }) => {
+                assert_eq!(previous, "data/b.parquet");
+                assert_eq!(offending, "data/a.parquet");
+            }
+            other => panic!("expected List(ListOrderViolation), got {other:?}"),
+        }
+    }
+
+    /// `MAX_TABLE_FILES` never bounds a listing's skipped keys, only its
+    /// `.parquet` candidates, so a directory of skip-only keys far past that
+    /// limit must still drain to completion. This does not observe memory
+    /// directly; that is pinned instead by this module holding no `HashSet`
+    /// (or other per-key set) and by the order-violation test above, which
+    /// only a constant-memory last-key dedup can pass.
+    #[tokio::test]
+    async fn a_listing_of_many_skipped_keys_completes_with_the_right_counts() {
+        let count = 2 * MAX_TABLE_FILES;
+        let store = Scripted {
+            synthetic: Some(count),
+            synthetic_non_parquet: true,
+            ..Scripted::default()
+        };
+        let listed = list_files(
+            &store,
+            &location("s3://lake/data/"),
+            &PhaseAccounting::new(),
+            MAX_TABLE_FILES,
+        )
+        .await
+        .expect("listing");
+        assert_eq!(listed.candidates.len(), 0);
+        assert_eq!(listed.other_suffixes, count as u64);
+        assert_eq!(listed.directory_markers, 0);
+        assert_eq!(store.lists().len(), count / 1000);
     }
 
     /// Mutation that fails it: dropping the `key_is_addressable` check
@@ -1333,6 +1472,27 @@ mod tests {
         let store = Scripted {
             misreport_listing: true,
             lie_total_size_on_call: Some((2, lie)),
+            ..Scripted::default()
+        };
+        put(&store, "data/a.parquet", bytes).await;
+        match snapshot(&store, "s3://lake/data/").await {
+            Err(SnapshotError::FileChanged { key }) => assert_eq!(key, "data/a.parquet"),
+            other => panic!("expected FileChanged, got {other:?}"),
+        }
+    }
+
+    /// The size-mismatch retry has already read this object once, at the
+    /// first (mismatched) tail read above; a `NotFound` on the retry means
+    /// the object changed since, not that it was never there. Mutation that
+    /// fails it: reporting `FileMissing` for this GET instead of remapping
+    /// it to `FileChanged` (confirmed against the code before this fix: the
+    /// same scenario reported `FileMissing`).
+    #[tokio::test]
+    async fn a_notfound_on_the_size_mismatch_retry_reports_the_file_changed() {
+        let bytes = parquet_bytes(&[1, 2, 3], &["x", "y", "z"]);
+        let store = Scripted {
+            misreport_listing: true,
+            not_found_on_call: Some(2),
             ..Scripted::default()
         };
         put(&store, "data/a.parquet", bytes).await;
