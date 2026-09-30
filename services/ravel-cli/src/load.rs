@@ -29,7 +29,7 @@ use arrow::array::{
     TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
     TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
-use arrow::array::{BinaryArray, FixedSizeBinaryArray, new_null_array};
+use arrow::array::{BinaryArray, FixedSizeBinaryArray, MapArray, new_null_array};
 use arrow::compute::take;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -4270,8 +4270,9 @@ fn dictionary_key(arr: &ArrayRef, row: usize) -> Result<usize, String> {
 
 #[cfg(test)]
 thread_local! {
-    /// Columns [`resolve_dictionary_column`] has resolved on this thread, for
-    /// the test that pins one resolution per dictionary column per batch. A
+    /// Columns [`resolve_dictionary_column`] has resolved, and attrs map
+    /// children [`MapChild::new`] has normalized the keys of, on this thread,
+    /// for the tests that pin one resolution per dictionary column per batch. A
     /// thread local rather than a global: tests share a process.
     static DICT_COLUMNS_RESOLVED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// The same for [`dictionary_key`], which is the per-cell cost.
@@ -6833,7 +6834,7 @@ struct SpansColumnIndex {
     /// One column index per `[[spans.attribute]]`, in mapping order.
     attributes: Vec<usize>,
     /// The `attrs_map_column`, already checked to be a map of strings.
-    attrs_map: Option<usize>,
+    attrs_map: Option<SpansAttrsMap>,
     /// The batch's columns with every mapped dictionary column resolved once.
     columns: ResolvedColumns,
 }
@@ -6847,7 +6848,9 @@ impl SpansColumnIndex {
     ///
     /// Each mapped dictionary column is resolved to its value type here too,
     /// once for the whole batch rather than once per cell
-    /// ([`resolve_dictionary_column`]).
+    /// ([`resolve_dictionary_column`]). The `attrs_map_column`'s key and value
+    /// dictionaries have their keys normalized once and are read in place
+    /// ([`SpansAttrsMap::resolve`]).
     fn resolve(batch: &RecordBatch, mapping: &SpansMapping) -> Result<SpansColumnIndex, String> {
         let schema = batch.schema();
         let idx = |name: &str| -> Result<usize, String> {
@@ -6891,7 +6894,7 @@ impl SpansColumnIndex {
             Some(c) => {
                 let i = idx(c)?;
                 check_attrs_map_column(schema.field(i).data_type(), c)?;
-                Some(i)
+                Some(SpansAttrsMap::resolve(batch.column(i), c, mapping)?)
             }
             None => None,
         };
@@ -7194,21 +7197,9 @@ fn build_span(
         row,
         dropped,
     )?;
-    if let Some(i) = cols.attrs_map {
-        span_attrs.extend(read_span_attrs_map(
-            cols.col(batch, i),
-            row,
-            mapping,
-            limits,
-            dropped,
-        )?);
-        if span_attrs.len() > LOADER_MAX_ATTRIBUTES_PER_RECORD {
-            return Err(format!(
-                "span carries {} attributes with its attrs_map_column entries, more than the \
-                 loader per-record cap of {LOADER_MAX_ATTRIBUTES_PER_RECORD}",
-                span_attrs.len()
-            ));
-        }
+    if let Some(map) = &cols.attrs_map {
+        let entries = read_span_attrs_map(map, row, span_attrs.len(), limits, dropped)?;
+        span_attrs.extend(entries);
     }
     // The same merge the OTLP path runs, with an empty scope set: this loader
     // maps no instrumentation scope, so there is nothing between resource and
@@ -7318,6 +7309,127 @@ fn check_attrs_map_column(data_type: &DataType, column: &str) -> Result<(), Stri
     ))
 }
 
+/// One batch's `attrs_map_column`, resolved once by [`SpansAttrsMap::resolve`]
+/// for every row [`read_span_attrs_map`] reads out of it.
+struct SpansAttrsMap {
+    /// The mapping's name for the column, as a refusal quotes it.
+    column: String,
+    /// The batch's map column; its offsets and nulls index `keys` and `values`.
+    map: MapArray,
+    /// The map's key and value children.
+    keys: MapChild,
+    values: MapChild,
+    /// Every key a mapped attribute names, with the column it reads.
+    mapped_keys: std::collections::HashMap<String, String>,
+}
+
+/// One string child of a spans attrs map, read per entry by [`MapChild::get`].
+enum MapChild {
+    /// A plain string child, or a dictionary child whose dictionary is empty,
+    /// read by [`read_str`].
+    Plain(ArrayRef),
+    /// A dictionary child, its keys normalized once for the batch. Entries are
+    /// read out of `values` in place: copying the values an entry references
+    /// would overflow a `Utf8` child's i32 offsets once the referenced bytes
+    /// pass 2 GiB, even when every one of them is over the value cap.
+    Dictionary {
+        child: ArrayRef,
+        values: ArrayRef,
+        keys: Vec<usize>,
+    },
+}
+
+impl MapChild {
+    /// Reading a dictionary child per entry calls `normalized_keys`, which
+    /// builds a key vector the size of the whole child, so a row's entries
+    /// would cost O(entries^2); it is called once here instead. A child whose
+    /// dictionary is empty is left plain, so arrow's assertion in
+    /// `normalized_keys` is never reached: every key of such a child is null,
+    /// and its row is refused as holding a null key.
+    fn new(child: &ArrayRef) -> Self {
+        if matches!(child.data_type(), DataType::Dictionary(_, _)) {
+            let dict = child.as_any_dictionary();
+            if !dict.values().is_empty() {
+                #[cfg(test)]
+                DICT_COLUMNS_RESOLVED.with(|n| n.set(n.get() + 1));
+                return MapChild::Dictionary {
+                    child: Arc::clone(child),
+                    values: Arc::clone(dict.values()),
+                    keys: dict.normalized_keys(),
+                };
+            }
+        }
+        MapChild::Plain(Arc::clone(child))
+    }
+
+    /// Entry `i`'s string, borrowed out of the child, by the rule
+    /// [`read_str`] reads a cell by.
+    fn get(&self, i: usize) -> Result<Option<&str>, String> {
+        match self {
+            MapChild::Plain(arr) => read_str(arr, i),
+            MapChild::Dictionary {
+                child,
+                values,
+                keys,
+            } => {
+                if child.is_null(i) {
+                    return Ok(None);
+                }
+                let key = keys
+                    .get(i)
+                    .copied()
+                    .ok_or_else(|| format!("dictionary column has no key at row {i}"))?;
+                read_str(values, key)
+            }
+        }
+    }
+}
+
+impl SpansAttrsMap {
+    /// Resolve the map column `arr` of one batch, already checked by
+    /// [`check_attrs_map_column`]: each child's dictionary keys once, as
+    /// [`MapChild::new`] describes, and the mapped keys a map entry may not
+    /// repeat.
+    fn resolve(arr: &ArrayRef, column: &str, mapping: &SpansMapping) -> Result<Self, String> {
+        let map = arr
+            .as_map_opt()
+            .ok_or_else(|| format!("attrs_map_column {column:?} is not a map column"))?
+            .clone();
+        let keys = MapChild::new(map.keys());
+        let values = MapChild::new(map.values());
+        let mut mapped_keys = std::collections::HashMap::new();
+        for (spec, _) in mapping.mapped_attributes() {
+            mapped_keys
+                .entry(spec.key.clone())
+                .or_insert_with(|| spec.column.clone());
+        }
+        Ok(SpansAttrsMap {
+            column: column.to_string(),
+            map,
+            keys,
+            values,
+            mapped_keys,
+        })
+    }
+}
+
+/// A string cell borrowed out of `arr`, read by the rule [`read_string`]
+/// reads an owned one by.
+fn read_str(arr: &ArrayRef, row: usize) -> Result<Option<&str>, String> {
+    if arr.is_null(row) {
+        return Ok(None);
+    }
+    match arr.data_type() {
+        DataType::Utf8 => Ok(Some(downcast::<StringArray>(arr)?.value(row))),
+        DataType::LargeUtf8 => Ok(Some(downcast::<LargeStringArray>(arr)?.value(row))),
+        DataType::Dictionary(_, _) => {
+            let dict = arr.as_any_dictionary();
+            read_str(dict.values(), dictionary_key(arr, row)?)
+        }
+        other => Err(format!("expected a string column, found {other:?}")),
+    }
+}
+
 /// Read one row's `attrs_map_column` entries, the attributes the mapping does
 /// not name, as the `(key, value)` strings RSPAN stores.
 ///
@@ -7330,50 +7442,54 @@ fn check_attrs_map_column(data_type: &DataType, column: &str) -> Result<(), Stri
 /// unique keys, so which value reached the record would otherwise be decided
 /// silently, and a reserved key would fabricate a span field this version does
 /// not map.
+///
+/// A row is also refused when its `span_attributes` `[[spans.attribute]]`
+/// values and its kept entries together pass
+/// [`LOADER_MAX_ATTRIBUTES_PER_RECORD`]. That refusal comes after every entry
+/// is checked, since any refusal above takes precedence over it and the
+/// message states the full count, but no entry past the cap is copied out.
 fn read_span_attrs_map(
-    arr: &ArrayRef,
+    map: &SpansAttrsMap,
     row: usize,
-    mapping: &SpansMapping,
+    span_attributes: usize,
     limits: &SpanIngestLimits,
     dropped: &mut u64,
 ) -> Result<Vec<(String, String)>, String> {
-    if arr.is_null(row) {
+    if map.map.is_null(row) {
         return Ok(Vec::new());
     }
-    let column = mapping.attrs_map_column.as_deref().unwrap_or_default();
-    let entries = arr
-        .as_map_opt()
-        .ok_or_else(|| format!("attrs_map_column {column:?} is not a map column"))?
-        .value(row);
-    let keys = entries.column(0);
-    let values = entries.column(1);
-    let mut out: Vec<(String, String)> = Vec::with_capacity(entries.len());
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for i in 0..entries.len() {
-        let key = read_string(keys, i)?
+    let column = map.column.as_str();
+    let offsets = map.map.value_offsets();
+    let (start, end) = (offsets[row] as usize, offsets[row + 1] as usize);
+    let room = LOADER_MAX_ATTRIBUTES_PER_RECORD.saturating_sub(span_attributes);
+    let mut out: Vec<(String, String)> = Vec::with_capacity((end - start).min(room));
+    let mut kept = 0usize;
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for i in start..end {
+        // Before the null-value skip, so an entry with both null is refused:
+        // Arrow declares a map's key field non-nullable.
+        let key = map
+            .keys
+            .get(i)?
             .ok_or_else(|| format!("attrs_map_column {column:?} holds a null key"))?;
-        let Some(value) = read_string(values, i)? else {
+        let Some(value) = map.values.get(i)? else {
             continue;
         };
-        if let Some((spec, _)) = mapping
-            .mapped_attributes()
-            .find(|(spec, _)| spec.key == key)
-        {
+        if let Some(mapped_column) = map.mapped_keys.get(key) {
             return Err(format!(
                 "attrs_map_column {column:?} holds the key {key:?}, which the mapping also reads \
-                 from the column {:?}. A span carries one merged attrs map with unique keys, so \
-                 one of the two would never reach the record; drop the key from the map or the \
-                 entry from the mapping.",
-                spec.column
+                 from the column {mapped_column:?}. A span carries one merged attrs map with \
+                 unique keys, so one of the two would never reach the record; drop the key from \
+                 the map or the entry from the mapping."
             ));
         }
-        if is_reserved_key(&key) {
+        if is_reserved_key(key) {
             return Err(format!(
                 "attrs_map_column {column:?} holds the reserved attribute key {key:?}, which \
                  holds a span field this version does not map"
             ));
         }
-        if !seen.insert(key.clone()) {
+        if !seen.insert(key) {
             return Err(format!(
                 "attrs_map_column {column:?} holds the key {key:?} twice. A span carries one \
                  merged attrs map with unique keys, so one of the two would never reach the \
@@ -7385,7 +7501,17 @@ fn read_span_attrs_map(
             *dropped += 1;
             continue;
         }
-        out.push((key, value));
+        kept += 1;
+        if kept <= room {
+            out.push((key.to_string(), value.to_string()));
+        }
+    }
+    if kept > room {
+        return Err(format!(
+            "span carries {} attributes with its attrs_map_column entries, more than the loader \
+             per-record cap of {LOADER_MAX_ATTRIBUTES_PER_RECORD}",
+            span_attributes + kept
+        ));
     }
     Ok(out)
 }
@@ -14605,10 +14731,11 @@ type = "str"
             let text = MAPPING_TOML.replace("[spans]\n", "[spans]\nattrs_map_column = \"attrs\"\n");
             let mapping = parse_spans_mapping(&text).expect("valid mapping");
             let limits = SpanIngestLimits::default();
+            let resolved = SpansAttrsMap::resolve(&map, "attrs", &mapping).expect("map resolves");
             let mut dropped = 0;
             let rows: Vec<Vec<(String, String)>> = (0..2)
                 .map(|row| {
-                    read_span_attrs_map(&map, row, &mapping, &limits, &mut dropped)
+                    read_span_attrs_map(&resolved, row, 0, &limits, &mut dropped)
                         .expect("entries read")
                 })
                 .collect();
@@ -14795,6 +14922,543 @@ type = "str"
                 counters.columns(),
                 4,
                 "the row loop resolves no further columns"
+            );
+        }
+
+        /// One `attrs` map cell: `None` is a null cell, a `None` key or value
+        /// a null one.
+        type DictMapCell = Option<Vec<(Option<String>, Option<String>)>>;
+
+        /// A map column whose keys and values are both dictionary-encoded
+        /// `Utf8`, one cell per row.
+        fn dict_attrs_map(cells: &[DictMapCell]) -> ArrayRef {
+            use arrow::array::StructArray;
+            use arrow::buffer::{NullBuffer, OffsetBuffer};
+            use arrow::datatypes::Fields;
+
+            let entries: Vec<&(Option<String>, Option<String>)> =
+                cells.iter().flatten().flatten().collect();
+            let keys: DictionaryArray<Int32Type> =
+                entries.iter().map(|(key, _)| key.as_deref()).collect();
+            let values: DictionaryArray<Int32Type> =
+                entries.iter().map(|(_, value)| value.as_deref()).collect();
+            let mut offsets = vec![0i32];
+            for cell in cells {
+                let len = cell.as_ref().map_or(0, Vec::len);
+                offsets.push(offsets[offsets.len() - 1] + len as i32);
+            }
+            // Arrow declares a map's key field non-nullable, and a struct
+            // refuses a null in a non-nullable child, so a fixture with a null
+            // key has to declare the field nullable to be built at all.
+            let null_keys = keys.null_count() > 0;
+            let fields = Fields::from(vec![
+                Field::new("keys", keys.data_type().clone(), null_keys),
+                Field::new("values", values.data_type().clone(), true),
+            ]);
+            let entries = StructArray::new(
+                fields.clone(),
+                vec![Arc::new(keys) as ArrayRef, Arc::new(values) as ArrayRef],
+                None,
+            );
+            Arc::new(
+                MapArray::try_new(
+                    Arc::new(Field::new("entries", DataType::Struct(fields), false)),
+                    OffsetBuffer::new(offsets.into()),
+                    entries,
+                    Some(NullBuffer::from(
+                        cells.iter().map(Option::is_some).collect::<Vec<_>>(),
+                    )),
+                    false,
+                )
+                .expect("map array"),
+            )
+        }
+
+        fn some_entries(entries: &[(&str, Option<&str>)]) -> DictMapCell {
+            Some(
+                entries
+                    .iter()
+                    .map(|(key, value)| (Some(key.to_string()), value.map(str::to_string)))
+                    .collect(),
+            )
+        }
+
+        /// One row per `attrs_map_column` outcome, over a map whose keys and
+        /// values are dictionary-encoded: plain entries, a null cell, a null
+        /// value, an over-cap value, each per-entry refusal (a null key among
+        /// them, alone and with a null value), the per-record cap,
+        /// and a refusal that sits after the cap is passed, which the row
+        /// still reports rather than the cap.
+        fn dict_attrs_map_fixture() -> (SpansMapping, RecordBatch) {
+            let cap = LOADER_MAX_ATTRIBUTES_PER_RECORD;
+            let long = "v".repeat(SpanIngestLimits::default().max_attribute_value_len + 1);
+            let numbered = |count: usize| -> Vec<(Option<String>, Option<String>)> {
+                (0..count)
+                    .map(|i| (Some(format!("k{i:04}")), Some("v".to_string())))
+                    .collect()
+            };
+            let mut reserved_after_cap = numbered(cap);
+            reserved_after_cap.push((Some("_kind".to_string()), Some("server".to_string())));
+            let mut duplicate_after_cap = numbered(cap);
+            duplicate_after_cap.push((Some("k0000".to_string()), Some("w".to_string())));
+            let cells: Vec<DictMapCell> = vec![
+                some_entries(&[("zone", Some("eu")), ("peer", Some("db"))]),
+                None,
+                some_entries(&[
+                    ("zone", None),
+                    ("peer", Some("db")),
+                    ("blob", Some(long.as_str())),
+                    ("zone", Some("us")),
+                ]),
+                some_entries(&[("peer", Some("db")), ("http.method", Some("POST"))]),
+                some_entries(&[("_kind", Some("server"))]),
+                some_entries(&[("zone", Some("eu")), ("zone", Some("us"))]),
+                Some(vec![
+                    (Some("peer".to_string()), Some("db".to_string())),
+                    (None, Some("x".to_string())),
+                ]),
+                Some(vec![(None, None)]),
+                some_entries(&[]),
+                Some(numbered(cap - 1)),
+                Some(numbered(cap)),
+                Some(numbered(cap + 5)),
+                Some(reserved_after_cap),
+                Some(duplicate_after_cap),
+                some_entries(&[("zone", Some("eu"))]),
+            ];
+            let rows = cells.len();
+            let text = MAPPING_TOML.replace("[spans]\n", "[spans]\nattrs_map_column = \"attrs\"\n");
+            let mapping = parse_spans_mapping(&text).expect("valid mapping");
+            let batch = batch(vec![
+                ("trace_id", bin_col(vec![vec![1u8; 16]; rows])),
+                ("span_id", bin_col(vec![vec![2u8; 8]; rows])),
+                ("name", str_col(vec!["op"; rows])),
+                ("start_ns", i64_col(vec![NOW_NS; rows])),
+                ("end_ns", i64_col(vec![NOW_NS; rows])),
+                ("method", str_col(vec!["GET"; rows])),
+                ("attrs", dict_attrs_map(&cells)),
+            ]);
+            (mapping, batch)
+        }
+
+        /// The map's key and value dictionaries are resolved once, when the
+        /// batch's columns are, and no entry resolves a dictionary key of its
+        /// own: a per-entry resolution costs O(entries) each.
+        #[test]
+        fn attrs_map_dictionaries_are_resolved_once_per_batch() {
+            let limits = SpanIngestLimits::default();
+            let (mapping, batch) = dict_attrs_map_fixture();
+            let counters = dict_counters();
+            let cols = SpansColumnIndex::resolve(&batch, &mapping).expect("columns resolve");
+            assert_eq!(
+                counters.columns(),
+                2,
+                "the map's key and value dictionaries, each once"
+            );
+            for row in 0..batch.num_rows() {
+                let _ = build_span(&batch, &cols, &mapping, &limits, NOW_NS, row, &mut 0);
+            }
+            assert_eq!(
+                counters.cell_keys(),
+                0,
+                "no entry resolves a dictionary key of its own"
+            );
+            assert_eq!(counters.columns(), 2, "the row loop resolves no column");
+        }
+
+        /// A map type with the given key and value types.
+        fn map_type(key: DataType, value: DataType) -> DataType {
+            let fields = arrow::datatypes::Fields::from(vec![
+                Field::new("keys", key, false),
+                Field::new("values", value, true),
+            ]);
+            DataType::Map(
+                Arc::new(Field::new("entries", DataType::Struct(fields), false)),
+                false,
+            )
+        }
+
+        fn assert_not_a_string_map(data_type: DataType) {
+            let err = check_attrs_map_column(&data_type, "attrs")
+                .expect_err("a map that is not of strings is refused");
+            assert_eq!(
+                err,
+                format!(
+                    "attrs_map_column \"attrs\" has type {data_type:?}; expected a map of string \
+                     keys to string values"
+                )
+            );
+        }
+
+        /// A map whose values are not strings is refused by name.
+        #[test]
+        fn an_attrs_map_of_non_string_values_is_refused() {
+            check_attrs_map_column(&map_type(DataType::Utf8, DataType::Utf8), "attrs")
+                .expect("a map of strings passes");
+            assert_not_a_string_map(map_type(DataType::Utf8, DataType::Int64));
+        }
+
+        /// A map whose keys are not strings is refused by name.
+        #[test]
+        fn an_attrs_map_of_non_string_keys_is_refused() {
+            check_attrs_map_column(&map_type(DataType::LargeUtf8, DataType::Utf8), "attrs")
+                .expect("a map of strings passes");
+            assert_not_a_string_map(map_type(DataType::Int64, DataType::Utf8));
+        }
+
+        /// Every row's stored attributes and dropped count, or its refusal,
+        /// exactly as the spans load builds them.
+        #[test]
+        fn a_dictionary_encoded_attrs_map_reads_every_outcome_exactly() {
+            let cap = LOADER_MAX_ATTRIBUTES_PER_RECORD;
+            let limits = SpanIngestLimits::default();
+            let (mapping, batch) = dict_attrs_map_fixture();
+            let cols = SpansColumnIndex::resolve(&batch, &mapping).expect("columns resolve");
+            /// A row's stored attributes and dropped count, or its refusal.
+            type Outcome = Result<(Vec<(String, String)>, u64), String>;
+            let got: Vec<Outcome> = (0..batch.num_rows())
+                .map(|row| {
+                    let mut dropped = 0;
+                    build_span(&batch, &cols, &mapping, &limits, NOW_NS, row, &mut dropped)
+                        .map(|span| (span.attrs, dropped))
+                })
+                .collect();
+
+            let pair = |key: &str, value: &str| (key.to_string(), value.to_string());
+            let method = pair("http.method", "GET");
+            let mut at_cap = vec![method.clone()];
+            at_cap.extend((0..cap - 1).map(|i| pair(&format!("k{i:04}"), "v")));
+            let over_cap = |count: usize| {
+                format!(
+                    "span carries {count} attributes with its attrs_map_column entries, more \
+                     than the loader per-record cap of {cap}"
+                )
+            };
+            let collision = "attrs_map_column \"attrs\" holds the key \"http.method\", which the \
+                             mapping also reads from the column \"method\". A span carries one \
+                             merged attrs map with unique keys, so one of the two would never \
+                             reach the record; drop the key from the map or the entry from the \
+                             mapping.";
+            let reserved = "attrs_map_column \"attrs\" holds the reserved attribute key \
+                            \"_kind\", which holds a span field this version does not map";
+            let null_key = "attrs_map_column \"attrs\" holds a null key";
+            let twice = |key: &str| {
+                format!(
+                    "attrs_map_column \"attrs\" holds the key {key:?} twice. A span carries one \
+                     merged attrs map with unique keys, so one of the two would never reach the \
+                     record."
+                )
+            };
+            let want: Vec<Outcome> = vec![
+                Ok((
+                    vec![method.clone(), pair("peer", "db"), pair("zone", "eu")],
+                    0,
+                )),
+                Ok((vec![method.clone()], 0)),
+                Ok((
+                    vec![method.clone(), pair("peer", "db"), pair("zone", "us")],
+                    1,
+                )),
+                Err(collision.to_string()),
+                Err(reserved.to_string()),
+                Err(twice("zone")),
+                Err(null_key.to_string()),
+                Err(null_key.to_string()),
+                Ok((vec![method.clone()], 0)),
+                Ok((at_cap, 0)),
+                Err(over_cap(cap + 1)),
+                Err(over_cap(cap + 6)),
+                Err(reserved.to_string()),
+                Err(twice("k0000")),
+                Ok((vec![method, pair("zone", "eu")], 0)),
+            ];
+            assert_eq!(got.len(), want.len());
+            for (row, (got, want)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(got, want, "row {row}");
+            }
+        }
+
+        /// The rows `--skip-rows` keeps read the outcomes they read in the whole
+        /// batch. The batch slice it takes starts the map's offsets past 0 while
+        /// the key and value children stay the whole batch's, so an entry is
+        /// found by the offset itself, not by its distance from the first.
+        #[test]
+        fn a_sliced_attrs_map_reads_the_rows_it_kept() {
+            let limits = SpanIngestLimits::default();
+            let (mapping, batch) = dict_attrs_map_fixture();
+            type Outcome = Result<(Vec<(String, String)>, u64), String>;
+            let outcomes = |batch: &RecordBatch| -> Vec<Outcome> {
+                let cols = SpansColumnIndex::resolve(batch, &mapping).expect("columns resolve");
+                (0..batch.num_rows())
+                    .map(|row| {
+                        let mut dropped = 0;
+                        build_span(batch, &cols, &mapping, &limits, NOW_NS, row, &mut dropped)
+                            .map(|span| (span.attrs, dropped))
+                    })
+                    .collect()
+            };
+            let whole = outcomes(&batch);
+            for cut in 1..batch.num_rows() {
+                let sliced = batch.slice(cut, batch.num_rows() - cut);
+                let first = sliced
+                    .column_by_name("attrs")
+                    .expect("the map column")
+                    .as_map()
+                    .value_offsets()[0];
+                assert_ne!(first, 0, "the slice at {cut} starts the offsets past 0");
+                assert_eq!(outcomes(&sliced), whole[cut..], "the slice at {cut}");
+            }
+        }
+
+        /// A map key a `[[spans.resource_attribute]]` names is refused as one a
+        /// `[[spans.attribute]]` names is: both lists feed the one merged map.
+        #[test]
+        fn an_attrs_map_key_a_resource_attribute_names_is_refused() {
+            let limits = SpanIngestLimits::default();
+            let text = format!(
+                "{}\n[[spans.resource_attribute]]\nkey = \"service.name\"\ncolumn = \"svc\"\ntype \
+                 = \"str\"\n",
+                MAPPING_TOML.replace("[spans]\n", "[spans]\nattrs_map_column = \"attrs\"\n")
+            );
+            let mapping = parse_spans_mapping(&text).expect("valid mapping");
+            let cells = vec![
+                some_entries(&[("zone", Some("eu"))]),
+                some_entries(&[("service.name", Some("other"))]),
+            ];
+            let batch = batch(vec![
+                ("trace_id", bin_col(vec![vec![1u8; 16]; 2])),
+                ("span_id", bin_col(vec![vec![2u8; 8]; 2])),
+                ("name", str_col(vec!["op"; 2])),
+                ("start_ns", i64_col(vec![NOW_NS; 2])),
+                ("end_ns", i64_col(vec![NOW_NS; 2])),
+                ("method", str_col(vec!["GET"; 2])),
+                ("svc", str_col(vec!["cart"; 2])),
+                ("attrs", dict_attrs_map(&cells)),
+            ]);
+            let cols = SpansColumnIndex::resolve(&batch, &mapping).expect("columns resolve");
+            let got: Vec<Result<Vec<(String, String)>, String>> = (0..2)
+                .map(|row| {
+                    build_span(&batch, &cols, &mapping, &limits, NOW_NS, row, &mut 0)
+                        .map(|span| span.attrs)
+                })
+                .collect();
+            let pair = |key: &str, value: &str| (key.to_string(), value.to_string());
+            assert_eq!(
+                got,
+                vec![
+                    Ok(vec![
+                        pair("http.method", "GET"),
+                        pair("service.name", "cart"),
+                        pair("zone", "eu"),
+                    ]),
+                    Err(
+                        "attrs_map_column \"attrs\" holds the key \"service.name\", which the \
+                         mapping also reads from the column \"svc\". A span carries one merged \
+                         attrs map with unique keys, so one of the two would never reach the \
+                         record; drop the key from the map or the entry from the mapping."
+                            .to_string()
+                    ),
+                ]
+            );
+        }
+
+        /// A map child whose dictionary is empty is answered row by row rather
+        /// than taking the batch down in arrow's `normalized_keys`, which
+        /// asserts the dictionary is non-empty. Every entry of such a child is
+        /// null: a null value skips its entry, a null key refuses its own row,
+        /// and the rows around it load.
+        #[test]
+        fn an_attrs_map_child_with_an_empty_dictionary_is_answered_per_row() {
+            use arrow::array::StructArray;
+            use arrow::buffer::OffsetBuffer;
+            use arrow::datatypes::Fields;
+
+            const ROWS: usize = 3;
+            let limits = SpanIngestLimits::default();
+            let text = MAPPING_TOML.replace("[spans]\n", "[spans]\nattrs_map_column = \"attrs\"\n");
+            let mapping = parse_spans_mapping(&text).expect("valid mapping");
+            let empty_dictionary = || -> ArrayRef {
+                Arc::new(DictionaryArray::<Int32Type>::new(
+                    Int32Array::from(vec![None]),
+                    Arc::new(StringArray::from(Vec::<&str>::new())),
+                ))
+            };
+            let plain = |value: &str| -> ArrayRef { Arc::new(StringArray::from(vec![value])) };
+            // Row 1 holds the map's one entry; rows 0 and 2 hold none.
+            let batch_of = |keys: ArrayRef, values: ArrayRef| -> RecordBatch {
+                let fields = Fields::from(vec![
+                    Field::new("keys", keys.data_type().clone(), keys.null_count() > 0),
+                    Field::new("values", values.data_type().clone(), true),
+                ]);
+                let entries = StructArray::new(fields.clone(), vec![keys, values], None);
+                let map = MapArray::try_new(
+                    Arc::new(Field::new("entries", DataType::Struct(fields), false)),
+                    OffsetBuffer::new(vec![0, 0, 1, 1].into()),
+                    entries,
+                    None,
+                    false,
+                )
+                .expect("map array");
+                batch(vec![
+                    ("trace_id", bin_col(vec![vec![1u8; 16]; ROWS])),
+                    ("span_id", bin_col(vec![vec![2u8; 8]; ROWS])),
+                    ("name", str_col(vec!["op"; ROWS])),
+                    ("start_ns", i64_col(vec![NOW_NS; ROWS])),
+                    ("end_ns", i64_col(vec![NOW_NS; ROWS])),
+                    ("method", str_col(vec!["GET"; ROWS])),
+                    ("attrs", Arc::new(map) as ArrayRef),
+                ])
+            };
+            let outcomes = |batch: &RecordBatch| -> Vec<Result<Vec<(String, String)>, String>> {
+                let cols = SpansColumnIndex::resolve(batch, &mapping).expect("columns resolve");
+                (0..ROWS)
+                    .map(|row| {
+                        build_span(batch, &cols, &mapping, &limits, NOW_NS, row, &mut 0)
+                            .map(|span| span.attrs)
+                    })
+                    .collect()
+            };
+            let method = || Ok(vec![("http.method".to_string(), "GET".to_string())]);
+
+            assert_eq!(
+                outcomes(&batch_of(plain("zone"), empty_dictionary())),
+                vec![method(), method(), method()],
+                "an empty value dictionary skips its null entry"
+            );
+            assert_eq!(
+                outcomes(&batch_of(empty_dictionary(), plain("eu"))),
+                vec![
+                    method(),
+                    Err("attrs_map_column \"attrs\" holds a null key".to_string()),
+                    method(),
+                ],
+                "an empty key dictionary refuses only the row holding its entry"
+            );
+        }
+
+        /// The map's dictionary children are read in place: the resolved child
+        /// holds the batch's own dictionary values, not a copy of the values its
+        /// entries reference. A copy of a `Utf8` child overflows its i32 offsets
+        /// once the referenced bytes pass 2 GiB, failing the whole batch where
+        /// each over-cap entry is dropped and counted.
+        #[test]
+        fn attrs_map_dictionaries_are_read_in_place() {
+            let (mapping, batch) = dict_attrs_map_fixture();
+            let cols = SpansColumnIndex::resolve(&batch, &mapping).expect("columns resolve");
+            let resolved = cols.attrs_map.as_ref().expect("the mapping names a map");
+            let source = batch
+                .column_by_name("attrs")
+                .expect("the map column")
+                .as_map();
+            for (name, child, own) in [
+                ("key", &resolved.keys, source.keys()),
+                ("value", &resolved.values, source.values()),
+            ] {
+                let MapChild::Dictionary { values, .. } = child else {
+                    panic!("the {name} child is read as a dictionary");
+                };
+                assert!(
+                    Arc::ptr_eq(values, own.as_any_dictionary().values()),
+                    "the {name} child reads the batch's own dictionary values"
+                );
+            }
+        }
+
+        /// A Parquet round trip over a dictionary-encoded map whose 2049
+        /// entries all reference one over-cap value: every entry is dropped
+        /// and counted, and the load succeeds. The referenced bytes stay far
+        /// below the i32 offset range, so this does not exercise the offset
+        /// overflow; the in-place read is pinned by
+        /// `attrs_map_dictionaries_are_read_in_place`.
+        #[tokio::test]
+        async fn an_over_cap_dictionary_value_many_entries_reference_is_dropped() {
+            use ravel_object_store::memory::MemoryStore;
+
+            const ROWS: usize = 2049;
+            let long = "v".repeat(SpanIngestLimits::default().max_attribute_value_len + 1);
+            let cells: Vec<DictMapCell> = (0..ROWS)
+                .map(|_| some_entries(&[("blob", Some(long.as_str()))]))
+                .collect();
+            let text = MAPPING_TOML.replace("[spans]\n", "[spans]\nattrs_map_column = \"attrs\"\n");
+            let mapping = parse_spans_mapping(&text).expect("valid mapping");
+            let batch = batch(vec![
+                ("trace_id", bin_col(vec![vec![1u8; 16]; ROWS])),
+                (
+                    "span_id",
+                    bin_col(
+                        (0..ROWS as u64)
+                            .map(|i| (i + 1).to_be_bytes().to_vec())
+                            .collect(),
+                    ),
+                ),
+                ("name", str_col(vec!["op"; ROWS])),
+                ("start_ns", i64_col(vec![NOW_NS; ROWS])),
+                ("end_ns", i64_col(vec![NOW_NS; ROWS])),
+                ("method", str_col(vec!["GET"; ROWS])),
+                ("attrs", dict_attrs_map(&cells)),
+            ]);
+            let dir = tempfile::tempdir().expect("tempdir");
+            let pq = dir.path().join("spans.parquet");
+            let file = std::fs::File::create(&pq).expect("create parquet");
+            let mut writer = parquet::arrow::ArrowWriter::try_new(file, batch.schema(), None)
+                .expect("arrow writer");
+            writer.write(&batch).expect("write batch");
+            writer.close().expect("close writer");
+
+            // The load reads the map's children as dictionaries, so the entries
+            // go through the in-place read this test is about.
+            let schema = match reader_schema_for_path(&pq).expect("the footer parses") {
+                Some(schema) => schema,
+                None => ParquetRecordBatchReaderBuilder::try_new(
+                    std::fs::File::open(&pq).expect("open parquet"),
+                )
+                .expect("reader")
+                .schema()
+                .clone(),
+            };
+            let map_type = schema
+                .field_with_name("attrs")
+                .expect("the map column")
+                .data_type();
+            let DataType::Map(entries, _) = map_type else {
+                panic!("the attrs column reads as a map, not {map_type:?}");
+            };
+            let DataType::Struct(children) = entries.data_type() else {
+                panic!("a map's entries are a struct");
+            };
+            for child in children {
+                assert!(
+                    matches!(child.data_type(), DataType::Dictionary(_, _)),
+                    "the map's {} child reads as a dictionary, not {:?}",
+                    child.name(),
+                    child.data_type()
+                );
+            }
+
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let mut report = SpansLoadReport::default();
+            load_spans_into(
+                &mut report,
+                store,
+                &pq,
+                "acme",
+                &mapping,
+                1,
+                10_000,
+                0,
+                1,
+                1,
+                1,
+                None,
+                NOW_NS,
+                Arc::new(SystemClock),
+            )
+            .await
+            .expect("the load succeeds");
+            assert_eq!(report.rows_processed, ROWS as u64, "every span is kept");
+            assert_eq!(
+                report.attributes_dropped, ROWS as u64,
+                "every entry's over-cap value is dropped and counted"
             );
         }
 
