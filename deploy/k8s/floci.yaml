@@ -82,8 +82,12 @@ spec:
           #
           # /_floci/health answers before every service handler is running, so
           # a plain 200 here is a liveness signal, not a readiness one. The
-          # readiness probe greps for the S3 handler specifically. `sh -c` is
-          # available: the floci image ships a shell (it is not distroless).
+          # readiness probe checks for the S3 handler specifically. The pinned
+          # image (RHEL 9) ships bash as /bin/sh but no curl, wget, nc or grep,
+          # so the probe uses bash builtins only: it sends the request over
+          # /dev/tcp, reads the response with read (which returns non-zero at
+          # EOF but fills the variable, hence the ;), and requires a 200
+          # status line and the S3 handler reported running.
           livenessProbe:
             httpGet:
               path: /_floci/health
@@ -97,7 +101,7 @@ spec:
               command:
                 - /bin/sh
                 - -c
-                - 'curl -fsS http://127.0.0.1:4566/_floci/health | grep -q ''"s3":"running"'''
+                - 'exec 3<>/dev/tcp/127.0.0.1/4566 && printf "GET /_floci/health HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n" >&3 && { IFS= read -r -d "" r <&3; [[ $r == "HTTP/1."?" 200 "* && $r == *"\"s3\":\"running\""* ]]; }'
             initialDelaySeconds: 3
             periodSeconds: 3
             timeoutSeconds: 3
