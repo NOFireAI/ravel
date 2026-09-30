@@ -191,6 +191,18 @@ pub enum SortBucketWidth {
     OneDay,
 }
 
+impl SortBucketWidth {
+    /// The bucket width in nanoseconds, the divisor of `ts.div_euclid`.
+    pub fn width_ns(self) -> i64 {
+        const NS_PER_HOUR: i64 = 3_600_000_000_000;
+        match self {
+            SortBucketWidth::OneHour => NS_PER_HOUR,
+            SortBucketWidth::SixHours => 6 * NS_PER_HOUR,
+            SortBucketWidth::OneDay => 24 * NS_PER_HOUR,
+        }
+    }
+}
+
 /// Value type of one sort key column.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SortKeyType {

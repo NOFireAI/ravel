@@ -141,6 +141,7 @@ fn variant(e: &LogSegError) -> &'static str {
         LogSegError::LimitExceeded(_) => "LimitExceeded",
         LogSegError::Unplaced { .. } => "Unplaced",
         LogSegError::InconsistentStreamAttrs(_) => "InconsistentStreamAttrs",
+        LogSegError::InvalidSortDescriptor(_) => "InvalidSortDescriptor",
         LogSegError::Io(_) => "Io",
     }
 }

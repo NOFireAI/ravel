@@ -13,7 +13,8 @@
 /// bytes. `LimitExceeded` is a caller/config bound (too many columns, an
 /// empty object). `InconsistentStreamAttrs` is writer-side input validation:
 /// two records claiming one stream id but disagreeing on the resource+scope
-/// bytes behind it. `Io` wraps compression backend failures.
+/// bytes behind it. `InvalidSortDescriptor` is writer-side validation of a
+/// caller's sort descriptor. `Io` wraps compression backend failures.
 #[derive(Debug, thiserror::Error)]
 pub enum LogSegError {
     #[error("corrupted segment: {0}")]
@@ -42,6 +43,13 @@ pub enum LogSegError {
     /// nothing has been decoded yet, so it is never `Corrupted`.
     #[error("inconsistent stream attrs: {0}")]
     InconsistentStreamAttrs(String),
+    /// The sort descriptor handed to the writer cannot be recorded or applied
+    /// for this object: its shape would not decode (no key or more than four,
+    /// an empty or repeated name, generation 0), or a key column is not a
+    /// per-record attribute of its declared type on any record of the object.
+    /// Writer-side input validation, never `Corrupted`.
+    #[error("invalid sort descriptor: {0}")]
+    InvalidSortDescriptor(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
