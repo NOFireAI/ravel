@@ -11,7 +11,8 @@
 #   3. `kind load docker-image` both, so the cluster needs no registry and the
 #      operator's IfNotPresent pull policy resolves locally
 #   4. deploy the fake S3 backend selected by RAVEL_FAKE_S3_BACKEND and wait
-#      for it to serve S3, then create the bucket
+#      for it to serve S3, then create a bucket that passes the operator's
+#      bucket-protection startup gate
 #   5. install the CRD, RBAC, and operator Deployment from deploy/k8s/operator/
 #   6. apply a RavelCluster pointed at that backend and those image tags
 #   7. wait for the operator to report `Available`, which by construction means
@@ -243,6 +244,9 @@ kubectl create secret generic "$AUDIT_TOKEN_KEY_SECRET" \
 
 # ---- 4. fake S3 backend ------------------------------------------------------
 log "deploying fake S3 backend '${BACKEND}' from ${BACKEND_MANIFEST}"
+# A Job's pod template is immutable, so on a reused cluster applying a changed
+# manifest over the completed Job fails. The Job is idempotent; rerun it.
+kubectl delete --namespace "$NAMESPACE" --ignore-not-found --wait=true "job/${BACKEND_JOB}" >/dev/null
 kubectl apply -f "$BACKEND_MANIFEST"
 
 log "waiting for ${BACKEND_DEPLOYMENT} to have a ready replica"
@@ -250,7 +254,9 @@ kubectl wait --namespace "$NAMESPACE" --for=condition=Available --timeout=300s \
   "deployment/${BACKEND_DEPLOYMENT}"
 
 # The Job is the real proof the backend serves S3: it retries until the S3
-# handler answers, creates the bucket, then HEADs it to confirm.
+# handler answers, creates the bucket with Object Lock, versioning and the
+# lifecycle rules the operator's --require-bucket-protection gate checks, then
+# reads each back to confirm.
 log "waiting for bucket-create job ${BACKEND_JOB}"
 if ! kubectl wait --namespace "$NAMESPACE" --for=condition=Complete --timeout=300s \
   "job/${BACKEND_JOB}"; then

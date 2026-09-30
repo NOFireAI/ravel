@@ -3256,26 +3256,36 @@ fn render_shutdown_family(out: &mut String, mode: Mode, drain_overrun_total: u64
     );
 }
 
-/// The `ravel_bucket_protection_unknown` gauge (ADR-0072 decision 3): 1 when
-/// the last `--require-bucket-protection` startup check observed
-/// [`crate::bucket_protection::BucketProtectionOutcome::Unknown`] (every
-/// backend reachable only through `ObjectStoreBackend` today), 0 otherwise,
-/// including when the flag is off. Single source, no labels, the same shape
-/// as [`render_store_probe_family`]; exported unconditionally so a fleet can
-/// alarm on it from a metrics-only monitoring setup.
-fn render_bucket_protection_family(out: &mut String, mode: Mode, unknown: u64) {
-    write_header(
-        out,
-        "ravel_bucket_protection_unknown",
-        "Whether the --require-bucket-protection startup check (ADR-0072 decision 3) could not confirm Object Lock / versioning status for this backend (1), or was off or confirmed Enabled (0).",
-        "gauge",
-    );
-    write_sample(
-        out,
-        "ravel_bucket_protection_unknown",
-        &[Label::Mode(mode)],
-        unknown,
-    );
+/// The three bucket-protection gauges (ADR-0072 decision 3, ADR-1727 decision
+/// 5), from the last `--require-bucket-protection` startup check, all 0 when
+/// the flag is off. Single source, no labels, the same shape as
+/// [`render_store_probe_family`]; exported unconditionally so a fleet can
+/// alarm on them from a metrics-only monitoring setup.
+fn render_bucket_protection_family(
+    out: &mut String,
+    mode: Mode,
+    gauges: crate::bucket_protection::BucketProtectionGauges,
+) {
+    for (name, help, value) in [
+        (
+            "ravel_bucket_protection_unknown",
+            "Whether the --require-bucket-protection startup check could not determine at least one bucket-protection condition (1), or was off or determined every checked condition (0).",
+            gauges.unknown,
+        ),
+        (
+            "ravel_bucket_protection_conditions_failed",
+            "Bucket-protection conditions the --require-bucket-protection startup check observed failed, 0 when the flag is off. A zero is evidence that the bucket passes the seven conditions the server checks only while ravel_bucket_protection_conditions_unknown is also 0.",
+            gauges.conditions_failed,
+        ),
+        (
+            "ravel_bucket_protection_conditions_unknown",
+            "Bucket-protection conditions the --require-bucket-protection startup check could not determine, 0 when the flag is off.",
+            gauges.conditions_unknown,
+        ),
+    ] {
+        write_header(out, name, help, "gauge");
+        write_sample(out, name, &[Label::Mode(mode)], value);
+    }
 }
 
 /// The query-audit pipeline's write-failure and PUT-retry counters (ADR-0062
@@ -6364,7 +6374,7 @@ pub fn render(
     render_bucket_protection_family(
         &mut out,
         mode,
-        crate::bucket_protection::bucket_protection_unknown(),
+        crate::bucket_protection::bucket_protection_gauges(),
     );
     if let Some(snapshot) = durable_auth {
         render_durable_auth_family(&mut out, mode, snapshot);
@@ -7052,6 +7062,44 @@ mod tests {
                     .is_some_and(|rest| rest.starts_with('{') || rest.starts_with(' '))
             })
             .collect()
+    }
+
+    /// The three bucket-protection gauges each render their own field once,
+    /// typed gauge, with `mode` and no other label. Distinct values, so a
+    /// gauge rendering another's field fails.
+    #[test]
+    fn bucket_protection_family_renders_each_gauge_exactly() {
+        let mut body = String::new();
+        render_bucket_protection_family(
+            &mut body,
+            Mode::Query,
+            crate::bucket_protection::BucketProtectionGauges {
+                unknown: 1,
+                conditions_failed: 2,
+                conditions_unknown: 5,
+            },
+        );
+        for (name, value) in [
+            ("ravel_bucket_protection_unknown", 1),
+            ("ravel_bucket_protection_conditions_failed", 2),
+            ("ravel_bucket_protection_conditions_unknown", 5),
+        ] {
+            assert_eq!(
+                body.matches(&format!("# TYPE {name} gauge\n")).count(),
+                1,
+                "{body}"
+            );
+            assert_eq!(
+                body.matches(&format!("# HELP {name} ")).count(),
+                1,
+                "{body}"
+            );
+            assert_eq!(
+                family_samples(&body, name),
+                vec![format!("{name}{{mode=\"query\"}} {value}")],
+                "{body}"
+            );
+        }
     }
 
     /// `ravel_store_get_unverified_total` renders the recorded count exactly

@@ -241,6 +241,15 @@ pub struct BuiltStore {
     /// scheme is installed. `None` when no `KmsRoutingStore` was inserted at all
     /// (either `--store memory`, or `--store s3` with no `--tenant-kms-config`).
     pub kms: Option<Arc<KmsRoutingStore>>,
+    /// The concrete base [`S3Store`] every other handle wraps, `Some` only on
+    /// `--store s3`. The bucket-protection startup gate reads the bucket's
+    /// control plane through it: every wrapper above it is an
+    /// `ObjectStoreBackend`, and a store reached only through that contract
+    /// reports every bucket-protection condition unknown. Under
+    /// `--tenant-kms-config` this is the store the [`KmsRoutingStore`] wraps as
+    /// its default; each per-tenant store it builds clones the same config with
+    /// only the SSE-KMS key changed, so this one bucket is every tenant's.
+    pub s3: Option<Arc<S3Store>>,
     /// The [`ClassedStore`] both handles were drawn from. Held so the per-class
     /// [`ClassedStore::metrics`] blocks (the `{class}` metric dimension) stay
     /// reachable; wiring them onto the `/metrics` scrape is later work.
@@ -355,19 +364,24 @@ fn instance_role_credential_conflict(cli: &Cli) -> Option<anyhow::Error> {
     ))
 }
 
+/// The instrumented backend and the handles [`BuiltStore`] carries beside it:
+/// the metrics block, the KMS router, and the base [`S3Store`].
+type BackendChain = (
+    Arc<dyn ObjectStoreBackend>,
+    Arc<StoreMetrics>,
+    Option<Arc<KmsRoutingStore>>,
+    Option<Arc<S3Store>>,
+);
+
 /// `cache_max_bytes` is the RESOLVED `--cache-max-bytes` (issue #1141), handed
 /// straight to [`build_cache`]; see that function for why it is a parameter
 /// rather than a field read.
 pub fn build_store(cli: &Cli, cache_max_bytes: u64) -> anyhow::Result<BuiltStore> {
-    let (store, metrics, kms): (
-        Arc<dyn ObjectStoreBackend>,
-        Arc<StoreMetrics>,
-        Option<Arc<KmsRoutingStore>>,
-    ) = match cli.store {
+    let (store, metrics, kms, s3): BackendChain = match cli.store {
         StoreKind::Memory => {
             let instrumented = InstrumentedStore::new(MemoryStore::new());
             let metrics = instrumented.metrics();
-            (Arc::new(instrumented), metrics, None)
+            (Arc::new(instrumented), metrics, None, None)
         }
         StoreKind::S3 => {
             let bucket = cli
@@ -419,12 +433,18 @@ pub fn build_store(cli: &Cli, cache_max_bytes: u64) -> anyhow::Result<BuiltStore
             // `ravel_store_calls_total` come from one snapshot (issue #928). Built
             // before the store so the connector and the decorator share it.
             let metrics = Arc::new(StoreMetrics::default());
-            let store = S3Store::with_http_config_and_metrics(
-                config.clone(),
-                cli.s3_http_config(),
-                Arc::clone(&metrics),
-            )
-            .map_err(|err| anyhow::anyhow!("failed to build S3 store: {err}"))?;
+            // Shared rather than owned by the chain so the bucket-protection gate
+            // can reach the concrete store; `Arc<S3Store>` forwards every backend
+            // method to it.
+            let store = Arc::new(
+                S3Store::with_http_config_and_metrics(
+                    config.clone(),
+                    cli.s3_http_config(),
+                    Arc::clone(&metrics),
+                )
+                .map_err(|err| anyhow::anyhow!("failed to build S3 store: {err}"))?,
+            );
+            let s3 = Some(Arc::clone(&store));
 
             // Per-tenant SSE-KMS routing (ADR-0062 decision 1, ADR-0072
             // decision 2): off by default. Without --tenant-kms-config this builds exactly
@@ -436,7 +456,7 @@ pub fn build_store(cli: &Cli, cache_max_bytes: u64) -> anyhow::Result<BuiltStore
                 // InstrumentedStore below already share, so a routed write's
                 // attempts are counted, not dropped (issue #928).
                 let kms = Arc::new(KmsRoutingStore::new(
-                    Arc::new(store) as Arc<dyn ObjectStoreBackend>,
+                    store as Arc<dyn ObjectStoreBackend>,
                     config,
                     Arc::clone(&metrics),
                 ));
@@ -444,10 +464,10 @@ pub fn build_store(cli: &Cli, cache_max_bytes: u64) -> anyhow::Result<BuiltStore
                     SharedKmsStore(kms.clone()),
                     Arc::clone(&metrics),
                 );
-                (Arc::new(instrumented), metrics, Some(kms))
+                (Arc::new(instrumented), metrics, Some(kms), s3)
             } else {
                 let instrumented = InstrumentedStore::with_metrics(store, Arc::clone(&metrics));
-                (Arc::new(instrumented), metrics, None)
+                (Arc::new(instrumented), metrics, None, s3)
             }
         }
     };
@@ -489,6 +509,7 @@ pub fn build_store(cli: &Cli, cache_max_bytes: u64) -> anyhow::Result<BuiltStore
         metrics,
         cache,
         kms,
+        s3,
         classed,
     })
 }
@@ -1136,6 +1157,72 @@ mod tests {
             (observed - now_ns).abs() < DAY_NS,
             "observed {observed} ns is not within a day of now {now_ns} ns"
         );
+    }
+
+    /// `BuiltStore::s3` is the base store the data path writes through, not a
+    /// second store built from the same config. The observed store clock is
+    /// kept per `S3Store` instance, so a write through `foreground` leaves an
+    /// observation on `s3` only when the two share that instance. Covers the
+    /// plain chain and the `--tenant-kms-config` chain, whose unrouted writes
+    /// go to its default store. Flipped line: `let s3 = Some(Arc::clone(&store))`
+    /// in `build_store`, replaced by a fresh `S3Store` from the same config.
+    #[tokio::test]
+    async fn built_s3_handle_is_the_store_the_data_path_writes_through() {
+        use clap::Parser;
+        use std::io::Write;
+
+        let (endpoint, _mock) = spawn_mock_s3().await;
+        let mut kms_file = tempfile::NamedTempFile::new().expect("create temp tenant-kms-config");
+        kms_file
+            .write_all(
+                br#"
+                    [tenants]
+                    acme = "arn:aws:kms:us-east-1:111122223333:key/acme"
+                "#,
+            )
+            .expect("write temp file");
+        let kms_path = kms_file.path().to_str().expect("temp path is valid utf-8");
+
+        for kms_args in [vec![], vec!["--tenant-kms-config", kms_path]] {
+            let mut args = vec![
+                "ravel-server",
+                "--store",
+                "s3",
+                "--s3-bucket",
+                "ravel-test",
+                "--s3-endpoint",
+                &endpoint,
+                "--s3-access-key",
+                "test",
+                "--s3-secret-key",
+                "test",
+            ];
+            args.extend(kms_args.iter().copied());
+            let cli = Cli::try_parse_from(args).expect("flags parse");
+            let built = build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES)
+                .expect("dummy S3 config must build without network access");
+            let s3 = built.s3.expect("--store s3 must return the base S3Store");
+            assert_eq!(
+                ObjectStoreBackend::observed_store_time_ns(s3.as_ref()),
+                None,
+                "precondition: no response observed before any request ({kms_args:?})"
+            );
+
+            built
+                .foreground
+                .put(
+                    "unrouted/seg/0001",
+                    Bytes::from_static(b"payload"),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("put through the data path");
+
+            assert!(
+                ObjectStoreBackend::observed_store_time_ns(s3.as_ref()).is_some(),
+                "a write through the data path must land on BuiltStore::s3 ({kms_args:?})"
+            );
+        }
     }
 
     /// A KMS-routed write's billed HTTP requests are counted into the SAME

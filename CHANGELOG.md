@@ -8,6 +8,36 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`--require-bucket-protection` reads the S3 bucket's protection
+  configuration at startup and refuses on more conditions** (ADR-1727
+  decision 5, issues #1727 and #2197). On `--store s3` the gate now reads the
+  bucket through the concrete S3 store, with three read-only GETs
+  (`?versioning`, `?lifecycle`, `?object-lock`), where before every backend
+  reported unknown and the gate only warned. Under `--tenant-kms-config` it
+  reads the base store's bucket, the one every tenant writes to. The process
+  refuses to start when `object-lock`, `abort-multipart` or `no-foreign-rule`
+  fails, or `noncurrent-expiration` fails on a versioned bucket; any other
+  failed condition and any unknown one warns and starts. Before this change
+  every S3 bucket read unknown and started with a warning, so every bucket
+  that fails a refusing condition now refuses where it started before: Object
+  Lock disabled, no multipart-abort rule, a foreign lifecycle rule, or
+  versioning on without a passing noncurrent-expiration rule. The Kubernetes
+  operator passes the flag to every `RavelCluster`, so this reaches every
+  operator-managed deployment on S3. The dev bucket launchers (the floci and
+  RustFS create-bucket Jobs in `deploy/k8s/` and the compose `createbucket`
+  one-shots) now create the bucket with Object Lock, versioning on and one
+  whole-bucket lifecycle rule carrying the sanctioned actions, and a bucket
+  left from an older launcher fails their read-back. The whole read is
+  bounded to 20 s, under the operator's liveness probe; a read that has not
+  finished by then leaves every condition unknown and starts. No IAM template
+  under `deploy/iam/` grants a server role the three read permissions, so on
+  AWS under a shipped template every condition reads unknown. Two new gauges,
+  `ravel_bucket_protection_conditions_failed` and
+  `ravel_bucket_protection_conditions_unknown`, count the conditions the
+  startup check observed failed and unknown, both 0 with the flag off;
+  `ravel_bucket_protection_unknown` is 1 whenever the unknown count is
+  nonzero. A zero failed count is evidence that the bucket passes the seven
+  conditions the server checks only while the unknown count is also zero.
 - **`ravel-server` sends a CRC64-NVME upload checksum on every S3 PUT by
   default** (issue #1696). The endpoint verifies each PUT against
   `x-amz-checksum-crc64nvme` and stores it, so a full-object read, commit

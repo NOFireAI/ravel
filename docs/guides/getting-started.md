@@ -247,7 +247,10 @@ This runs `docker compose -f deploy/docker-compose/rustfs.yml up -d`
 ([deploy/docker-compose/rustfs.yml](../../deploy/docker-compose/rustfs.yml)). It
 starts RustFS on `127.0.0.1:9000` (S3 API) and `127.0.0.1:9001` (web console),
 with credentials `ravel` / `ravel-dev-secret`, and a one-shot `createbucket`
-service that creates the `ravel-dev` bucket. Data lives in `./rustfs-data` on
+service that creates the `ravel-dev` bucket with Object Lock, versioning and
+the lifecycle rules `--require-bucket-protection` checks. A `./rustfs-data`
+left from before that service set Object Lock fails its read-back; remove the
+directory to start over. Data lives in `./rustfs-data` on
 your machine. `make rustfs-down` stops the stack without deleting it.
 
 ### Run the demo

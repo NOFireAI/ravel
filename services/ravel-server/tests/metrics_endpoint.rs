@@ -1406,6 +1406,33 @@ async fn attribution_family_folds_unconfigured_tenant_to_other() {
     );
 }
 
+/// The three bucket-protection gauges reach a live scrape, each declared once
+/// with one sample. No test in this binary turns on
+/// `--require-bucket-protection`, so each reads the flag-off value 0.
+#[tokio::test]
+async fn bucket_protection_gauges_render_zero_with_the_flag_off() {
+    let running = start_test_server(Mode::All, u64::MAX, false).await;
+    let body = scrape(&running).await;
+    running.shutdown().await.expect("graceful shutdown");
+
+    for name in [
+        "ravel_bucket_protection_unknown",
+        "ravel_bucket_protection_conditions_failed",
+        "ravel_bucket_protection_conditions_unknown",
+    ] {
+        assert_eq!(
+            body.matches(&format!("# TYPE {name} gauge\n")).count(),
+            1,
+            "{name} must be declared exactly once:\n{body}"
+        );
+        assert_eq!(
+            mode_only_samples(&body, name),
+            vec![format!("{name}{{mode=\"all\"}} 0")],
+            "{name} must render one sample at 0:\n{body}"
+        );
+    }
+}
+
 /// Issue #1742: both new families must actually reach a live `GET /metrics`
 /// scrape, not just the in-process `render()` unit tests in
 /// `services/ravel-server/src/metrics.rs`. `ravel_ingest_flush_all_residue_tenants_total`
