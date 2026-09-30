@@ -97,7 +97,11 @@ pub async fn qualify_built(
     }
 
     let echo = checksum_echo(&built, &format!("{scratch_prefix}checksum-echo")).await;
+    let (echo, echo_cleanup) = echo;
     println!("{}", echo.line());
+    if let Some(note) = echo_cleanup {
+        println!("{CHECKSUM_ECHO_LABEL:<40} {note}");
+    }
 
     if !report.passed() {
         let failed_names: Vec<&str> = report.failures().map(|r| r.property.name()).collect();
@@ -301,7 +305,9 @@ impl ChecksumEcho {
 
 /// PUT a probe object at `key` with the store's upload checksum, GET it whole
 /// with checksum mode, and report whether the endpoint returned the checksum
-/// it stored. The probe object is deleted whatever the outcome.
+/// it stored. The probe object is deleted whatever the outcome; a delete the
+/// credential is not granted is returned beside the outcome rather than
+/// failing it, since the Admin role has no delete grant.
 ///
 /// The S3 adapter verifies a returned CRC-64/NVME checksum against the body it
 /// received and fails the read as corrupted on a mismatch, and counts a read
@@ -311,12 +317,33 @@ impl ChecksumEcho {
 /// returned one and the check does not run.
 ///
 /// [`S3Store::get_unverified`]: ravel_object_store::s3::S3Store::get_unverified
-pub async fn checksum_echo(built: &BuiltStore, key: &str) -> ChecksumEcho {
+pub async fn checksum_echo(built: &BuiltStore, key: &str) -> (ChecksumEcho, Option<String>) {
     let BuiltStore::S3 { store, http } = built else {
-        return ChecksumEcho::NotChecked(
-            "not an S3 store: no upload checksum is stored or returned".to_string(),
+        return (
+            ChecksumEcho::NotChecked(
+                "not an S3 store: no upload checksum is stored or returned".to_string(),
+            ),
+            None,
         );
     };
+    let outcome = checksum_echo_probe(store, http, key).await;
+    if matches!(outcome, ChecksumEcho::NotChecked(_)) {
+        return (outcome, None);
+    }
+    let cleanup_error = match store.delete(key).await {
+        Ok(()) => None,
+        Err(err) => Some(format!(
+            "note: the probe object {key} was left in place: {err}"
+        )),
+    };
+    (outcome, cleanup_error)
+}
+
+async fn checksum_echo_probe(
+    store: &ravel_object_store::s3::S3Store,
+    http: &ravel_object_store::s3::S3HttpConfig,
+    key: &str,
+) -> ChecksumEcho {
     match http.upload_integrity {
         UploadIntegrity::Off => {
             return ChecksumEcho::NotChecked("upload integrity off".to_string());
@@ -343,7 +370,7 @@ pub async fn checksum_echo(built: &BuiltStore, key: &str) -> ChecksumEcho {
     let unverified_before = store.get_unverified();
     let read = store.get(key, GetRange::Full).await;
     let unverified_after = store.get_unverified();
-    let outcome = match read {
+    match read {
         Err(StoreError::Corrupted(detail)) => ChecksumEcho::Failed(format!(
             "the endpoint returned a checksum for {key} that does not match the crc64nvme \
              checksum sent with it: {detail}"
@@ -356,13 +383,6 @@ pub async fn checksum_echo(built: &BuiltStore, key: &str) -> ChecksumEcho {
         )),
         Ok(_) if unverified_after == unverified_before => ChecksumEcho::Verified,
         Ok(_) => ChecksumEcho::NotReturned,
-    };
-    match store.delete(key).await {
-        Ok(()) => outcome,
-        Err(err) if outcome.failure().is_none() => {
-            ChecksumEcho::Failed(format!("the probe object {key} was not deleted: {err}"))
-        }
-        Err(_) => outcome,
     }
 }
 
@@ -708,9 +728,10 @@ mod tests {
             (Echo::Nothing, ChecksumEcho::NotReturned),
         ] {
             let (endpoint, fake) = spawn(echo, &[]).await;
-            let outcome = checksum_echo(&s3_store(&endpoint, &[]), key).await;
+            let (outcome, cleanup) = checksum_echo(&s3_store(&endpoint, &[]), key).await;
             assert_eq!(outcome, expected, "{echo:?}");
             assert_eq!(outcome.failure(), None);
+            assert_eq!(cleanup, None);
             let puts = fake.puts();
             assert_eq!(puts.len(), 1, "{puts:?}");
             assert!(
@@ -742,7 +763,7 @@ mod tests {
         );
 
         let (endpoint, fake) = spawn(Echo::Wrong, &[]).await;
-        let outcome = checksum_echo(&s3_store(&endpoint, &[]), key).await;
+        let (outcome, _) = checksum_echo(&s3_store(&endpoint, &[]), key).await;
         let failure = outcome
             .failure()
             .expect("a mismatched checksum fails qualify");
@@ -754,6 +775,26 @@ mod tests {
         assert_eq!(fake.deletes(), vec![key.to_string()]);
     }
 
+    /// A credential with no delete grant, such as the Admin role, leaves the
+    /// probe object in place: the outcome stands, and the note names the key.
+    #[tokio::test]
+    async fn checksum_echo_keeps_its_outcome_when_the_probe_cannot_be_deleted() {
+        use crate::fake_s3::{Echo, spawn};
+
+        let key = "sys/qualify/run/checksum-echo";
+        let (endpoint, fake) = spawn(Echo::Stored, &[]).await;
+        fake.refuse_deletes
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let (outcome, cleanup) = checksum_echo(&s3_store(&endpoint, &[]), key).await;
+        assert_eq!(outcome, ChecksumEcho::Verified);
+        let note = cleanup.expect("a refused delete is reported");
+        assert!(
+            note.starts_with(&format!("note: the probe object {key} was left in place: ")),
+            "{note}"
+        );
+        assert_eq!(fake.object_count(), 1);
+    }
+
     /// With upload integrity off, with the stored checksum not requested, or
     /// on a non-S3 backend, the check says why it did not run and sends
     /// nothing.
@@ -763,7 +804,8 @@ mod tests {
 
         let key = "sys/qualify/run/checksum-echo";
         let (endpoint, fake) = spawn(Echo::Stored, &[]).await;
-        let off = checksum_echo(&s3_store(&endpoint, &["--s3-upload-integrity", "off"]), key).await;
+        let (off, _) =
+            checksum_echo(&s3_store(&endpoint, &["--s3-upload-integrity", "off"]), key).await;
         assert_eq!(
             off.line(),
             format!(
@@ -771,7 +813,7 @@ mod tests {
                 "checksum/stored_echo"
             )
         );
-        let not_requested = checksum_echo(
+        let (not_requested, _) = checksum_echo(
             &s3_store(&endpoint, &["--s3-request-stored-checksum=false"]),
             key,
         )
@@ -781,7 +823,7 @@ mod tests {
                 if reason.starts_with("--s3-request-stored-checksum=false")),
             "{not_requested:?}"
         );
-        let memory = checksum_echo(
+        let (memory, _) = checksum_echo(
             &BuiltStore::Other(Arc::new(ravel_object_store::memory::MemoryStore::new())),
             key,
         )

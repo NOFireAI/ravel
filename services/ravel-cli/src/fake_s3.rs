@@ -4,6 +4,7 @@
 //! which subresources were asked for, so a test can pin both.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
@@ -41,6 +42,8 @@ pub(crate) struct FakeS3 {
     pub deletes: Mutex<Vec<String>>,
     /// The subresource of every control-plane GET, in arrival order.
     pub control_plane: Mutex<Vec<String>>,
+    /// Answer every delete 403, as for a credential with no delete grant.
+    pub refuse_deletes: AtomicBool,
 }
 
 impl FakeS3 {
@@ -81,6 +84,7 @@ pub(crate) async fn spawn(
         puts: Mutex::default(),
         deletes: Mutex::default(),
         control_plane: Mutex::default(),
+        refuse_deletes: AtomicBool::new(false),
     });
     let shared = Arc::clone(&state);
     let app = axum::Router::new().fallback(
@@ -121,6 +125,15 @@ fn handle(
             Some((status, body)) => (*status, body.clone()).into_response(),
             None => StatusCode::NOT_IMPLEMENTED.into_response(),
         };
+    }
+
+    let delete = *method == Method::DELETE || (*method == Method::POST && subresource == "delete");
+    if delete && state.refuse_deletes.load(Ordering::Relaxed) {
+        return (
+            StatusCode::FORBIDDEN,
+            "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>",
+        )
+            .into_response();
     }
 
     match *method {
