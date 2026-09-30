@@ -591,11 +591,14 @@ groups:
           severity: warning
         annotations:
           summary: >-
-            Ravel cannot see whether its bucket has Object Lock and versioning
-            on, while --require-bucket-protection is set
+            Ravel could not determine at least one bucket-protection condition
+            at startup, while --require-bucket-protection is set
           description: >-
             Not necessarily a misconfiguration, but the platform cannot see the
             protection it depends on. Confirm the bucket settings out of band.
+            While this fires, a zero count of failed bucket-protection
+            conditions is not evidence the bucket is compliant: only a zero
+            count of unknown conditions makes it one.
           as_documented: >-
             The guide states this condition with no duration, so no for: is
             set.

@@ -63,8 +63,10 @@ bucket accumulate them. Sweep the prefix from a runbook when it matters.
 ## The bucket protection contract
 
 Some of what protects a Ravel bucket is configured at the bucket and policy
-layer, not by any Ravel process. Nothing in `ravel-server` configures or
-verifies it, because the object-store client exposes no such API. The normative
+layer, not by any Ravel process. Nothing in `ravel-server` configures it,
+because the object-store client exposes no such API; on S3,
+`--require-bucket-protection` reads it back at startup with read-only
+requests, as [described below](#bucket-protection-at-startup). The normative
 statement is
 [the object store contract](../../object-store-contract.md)'s required bucket
 configuration section; this is the operational summary.
@@ -112,19 +114,45 @@ uploads that ended without a confirmed successful abort for any reason. A
 sustained rise in either means the lifecycle rule is the only thing bounding
 orphaned-part cost on that bucket.
 
-`--require-bucket-protection` turns the conformance probes, which are otherwise
-informational, into a startup gate, so a deployment cannot go into production
-silently unprotected:
+### Bucket protection at startup
 
-- **Disabled**, or a versioning-without-expiration alarm, refuses to start.
-- **Unknown**, which is what every backend reachable only through the
-  object-store contract reports, because no adapter can answer the query,
-  logs one warning and sets `ravel_bucket_protection_unknown` to `1` at
-  `/metrics` rather than blocking startup.
-- **Enabled** with no alarms starts clean, with the gauge at `0`.
+`--require-bucket-protection` turns the bucket's protection configuration
+into a startup gate, so a deployment cannot go into production silently
+unprotected. On `--store s3` the check reads the bucket's configuration once,
+with three read-only GETs (`?versioning`, `?lifecycle`, `?object-lock`) signed
+with the store's own credentials, so that identity needs
+`s3:GetBucketVersioning`, `s3:GetLifecycleConfiguration` and
+`s3:GetBucketObjectLockConfiguration`; a denied call reads as unknown, not
+as a failure. Under `--tenant-kms-config` it reads the same bucket: every
+tenant's objects live in the one bucket, and only the encryption key differs
+per tenant. Each condition comes back passed, failed or unknown:
+
+- These failures refuse to start, naming each failed condition:
+  `object-lock` (Object Lock disabled on the bucket), `abort-multipart` (no
+  enabled `AbortIncompleteMultipartUpload` rule of seven days or less
+  covering the data), `no-foreign-rule` (another expiration or transition
+  rule targets `t/` or `sys/`), and `noncurrent-expiration` on a versioned
+  bucket (no enabled rule expiring noncurrent versions over `t/`). The server
+  checks only that such a rule exists, not its `NoncurrentDays`; `ravel-cli
+  store verify-protection --expected-noncurrent-days` checks the value.
+- Any other failed condition (`versioning`, `expired-delete-marker`,
+  `rule-scope`, or `noncurrent-expiration` on an unversioned bucket) logs one
+  warning and starts.
+- An unknown condition logs one warning and starts. On every backend other
+  than S3 the check cannot read the configuration, so every condition is
+  unknown.
+- `delete-marker-replication` and `object-retention` are not checked at
+  startup; run `ravel-cli store verify-protection` for them.
+
+The check sets `ravel_bucket_protection_conditions_failed`,
+`ravel_bucket_protection_conditions_unknown` and
+`ravel_bucket_protection_unknown` at `/metrics`; see
+[Observability](../observability.md#bucket-protection-ravel_bucket_protection_)
+for what a zero means. The check runs once per start: a bucket changed under
+a running process is seen at the next restart.
 
 The flag is off by default, so a development process that does not pass it
-starts without the gate. The Kubernetes operator sets it unconditionally for
+starts without the gate and sends none of those GETs. The Kubernetes operator sets it unconditionally for
 every cluster it reconciles: the custom resource carries no development or
 staging profile field to gate on.
 

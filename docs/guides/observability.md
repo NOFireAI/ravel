@@ -163,10 +163,10 @@ and every full-object read of a process started with
 the read-only bucket-configuration GETs behind the bucket-protection check.
 Those GETs are not object-store operations, so they never appear in the
 per-operation families above, and those families keep meaning data-plane
-traffic only. The server sends none of these GETs yet: its startup
-bucket-protection check runs through the generic store and reports unknown,
-so the three control-plane counters read 0 until that check uses the S3
-control plane.
+traffic only. The server sends these GETs only from its
+`--require-bucket-protection` startup check on `--store s3`: three per start
+(`?versioning`, `?lifecycle`, `?object-lock`). With the flag off, or on any
+other backend, the three control-plane counters read 0.
 
 ### Ingest pipelines (`ravel_ingest_*`)
 
@@ -1232,6 +1232,38 @@ listener-close signal until after the drain's outcome is known, which
 trades away the current, deliberate "stop new traffic immediately so
 Kubernetes drains before anything closes" ordering; that is a shutdown-
 sequencing decision outside this change's scope, not a rendering fix.
+
+### Bucket protection (`ravel_bucket_protection_*`)
+
+Labels: `mode`. Rendered by every process, and set once, by the
+`--require-bucket-protection` startup check. All three read `0` when the flag
+is off.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_bucket_protection_conditions_failed` | Gauge. Bucket-protection conditions the startup check observed failed. A failure outside the refusing set (see [Deployment](operations/deployment.md#bucket-protection-at-startup)) starts the process with a warning and counts here. |
+| `ravel_bucket_protection_conditions_unknown` | Gauge. Bucket-protection conditions the startup check could not determine: no API for the call, an access denial, or a response it could not parse. |
+| `ravel_bucket_protection_unknown` | Gauge. `1` whenever `ravel_bucket_protection_conditions_unknown` is nonzero, else `0`. |
+
+The startup check counts the seven conditions it evaluates: `versioning`,
+`noncurrent-expiration`, `expired-delete-marker`, `abort-multipart`,
+`rule-scope`, `no-foreign-rule` and `object-lock`. It never asks for
+`delete-marker-replication` or `object-retention`, which `ravel-cli store
+verify-protection` checks, so neither ever counts here. On `--store s3` the
+check reads the bucket's configuration with three read-only GETs, counted in
+the control-plane counters above. On every other backend it cannot read the
+configuration at all, so all seven conditions count as unknown and
+`ravel_bucket_protection_unknown` reads `1`.
+
+Alert on `ravel_bucket_protection_unknown == 1`: the shipped
+`RavelBucketProtectionUnknown` rule does. A zero on
+`ravel_bucket_protection_conditions_failed` is evidence that the bucket is
+compliant only when `ravel_bucket_protection_conditions_unknown` is also zero:
+a condition the check could not determine is not a condition that passed. A
+rule or dashboard that reads `conditions_failed == 0` as healthy must also
+require `conditions_unknown == 0`. The values are those of the last startup,
+so they do not move when the bucket's configuration changes under a running
+process.
 
 ### Durable auth refresh (`ravel_durable_auth_*`)
 
