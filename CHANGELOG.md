@@ -1310,6 +1310,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ANALYZE` metrics, in `SqlStats`, and in `sql_latency_bench`'s per-statement
   scan diagnostics. `max_segments` admission and the distributed coordinator
   fan-out are unchanged.
+- **The logs SQL scan does less work per cell when it builds typed attribute
+  columns** (ADR-2121 D2 and D3, issue #2152). When a block stores a typed
+  `i64`, `bool` or `bytes` key in exactly one record-level column, of the
+  declared type, each row's cell is appended straight to its Arrow array with
+  no intermediate attribute value; a row the record does not set still reads
+  the resource or scope value. Building a typed `str` column validates each
+  cell's UTF-8 at most once per block: a dictionary page validates each entry
+  once and looks a row's id up, and a plain page validates a cell once for both
+  the presence check and the value. Query results do not change: a non-UTF-8
+  `str` cell still reads as absent and falls through to the resource or scope
+  value, and a typed `str` column is still `Dictionary(Int32, Utf8)`.
 
 ## [0.19.0] - 2026-09-27
 
