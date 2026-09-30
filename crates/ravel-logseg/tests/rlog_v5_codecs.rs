@@ -63,7 +63,7 @@ fn record(ts: i64, observed_ts: i64, attrs: Vec<(String, AttrValue)>) -> LogReco
 }
 
 fn write_rows(cfg: &RlogConfig, records: &[LogRecord]) -> Vec<u8> {
-    let mut w = RlogWriter::new(cfg.clone(), identity());
+    let mut w = RlogWriter::new(*cfg, identity());
     for r in records {
         w.push(r.clone()).expect("push");
     }
@@ -71,7 +71,7 @@ fn write_rows(cfg: &RlogConfig, records: &[LogRecord]) -> Vec<u8> {
 }
 
 fn write_columnar(cfg: &RlogConfig, batch: ColumnarLogBatch) -> Vec<u8> {
-    let mut w = RlogWriter::new(cfg.clone(), identity());
+    let mut w = RlogWriter::new(*cfg, identity());
     w.push_columnar(batch).expect("push columnar");
     w.finish().expect("finish")
 }
@@ -187,6 +187,9 @@ fn raw_page(column_id: u32, enc: Enc, bytes: Vec<u8>) -> (PageDesc, Vec<u8>) {
         bytes,
     )
 }
+
+/// A named hand-built block: its pages and the plans its dynamic columns need.
+type Case<'a> = (&'a str, Vec<(PageDesc, Vec<u8>)>, &'a [ColumnPlan]);
 
 fn decode_pages(
     record_count: usize,
@@ -381,7 +384,6 @@ fn observed_ts_equal_to_ts_is_stored_as_reference() {
             "row {i}"
         );
     }
-    drop(view);
 
     let mut differ = equal.clone();
     differ[n / 2].observed_ts_ns += 1;
@@ -508,7 +510,7 @@ fn column_ref_refuses_other_targets() {
         &[Some(10), Some(20), Some(30)]
     );
 
-    let cases: Vec<(&str, Vec<(PageDesc, Vec<u8>)>, &[ColumnPlan])> = vec![
+    let cases: Vec<Case<'_>> = vec![
         (
             // stream_ref is placed ahead of observed_ts so it is already
             // decoded: only the target rule can refuse this page.
