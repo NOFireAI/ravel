@@ -19,7 +19,12 @@
 //!   toward the same budgets. Bytes are wire bytes of GET response bodies as
 //!   the accounting records them: a cache hit issues no request and adds none,
 //!   and a retry the store performs inside one `get_pinned` call is neither
-//!   requested nor recorded a second time.
+//!   requested nor recorded a second time. A cache hit is not free of cost,
+//!   only of request/byte accounting: each reader pays one RAM lookup and,
+//!   on a RAM miss against a `Tiered` cache, one disk lookup, before this
+//!   budget is even consulted. Concurrent readers of a disk-only range each
+//!   pay that one disk probe independently -- only the resulting upstream
+//!   GET, not the probe, is collapsed by the single flight.
 
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
