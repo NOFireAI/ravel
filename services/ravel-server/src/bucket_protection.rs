@@ -20,17 +20,18 @@
 //!
 //! # Generic over the probe source, not `dyn ObjectStoreBackend`
 //!
-//! `ObjectLockProbeSource` and `BucketConfigProbeSource` are implemented
-//! directly on the `dyn ObjectStoreBackend` trait object type (not via a
-//! blanket generic impl), so that impl is the only one a value erased to
-//! `Arc<dyn ObjectStoreBackend>` can ever reach, and it unconditionally
-//! reports `Unknown`. [`enforce`] is therefore generic over `S:
-//! ObjectLockProbeSource + BucketConfigProbeSource + ?Sized` rather than
-//! taking `&dyn ObjectStoreBackend`: production monomorphizes it over `dyn
+//! `ObjectLockProbeSource`, `BucketConfigProbeSource` and
+//! `BucketProbesSource` are implemented directly on the `dyn
+//! ObjectStoreBackend` trait object type (not via a blanket generic impl), so
+//! that impl is the only one a value erased to `Arc<dyn ObjectStoreBackend>`
+//! can ever reach, and it unconditionally reports `Unknown`. [`enforce`] is
+//! therefore generic over `S: BucketProbesSource + ?Sized` rather than taking
+//! `&dyn ObjectStoreBackend`: production monomorphizes it over `dyn
 //! ObjectStoreBackend` (today, always `Unknown`, by design per ADR-0042
 //! decision 3), while tests monomorphize it over small fixture structs that
-//! implement both traits directly, bypassing `ObjectStoreBackend` entirely,
-//! to exercise `Enabled`/`Disabled` as well. This is the same fixture
+//! implement the traits directly, bypassing `ObjectStoreBackend` entirely, to
+//! exercise `Enabled`/`Disabled` as well, and over an `S3Store`, which answers
+//! both probes from one control-plane report. This is the same fixture
 //! pattern conformance.rs's own tests use (`FixedLockSource`,
 //! `FixedBucketConfig`).
 //!
@@ -46,8 +47,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context;
 use ravel_object_store::conformance::{
-    BucketConfigProbeSource, ObjectLockProbeSource, ObjectLockStatus, bucket_config_alarms,
-    probe_bucket_config, probe_object_lock,
+    BucketProbesSource, ObjectLockStatus, bucket_config_alarms, probe_bucket_lock_and_config,
 };
 
 /// Whether the most recent [`enforce`] call observed
@@ -114,20 +114,22 @@ pub enum BucketProtectionOutcome {
 ///
 /// Read-only: both probes are GETs (or affirm nothing at all, in the
 /// production `dyn ObjectStoreBackend` case), so this is safe to run before
-/// any listener binds, mirroring [`crate::qualification::enforce`].
+/// any listener binds, mirroring [`crate::qualification::enforce`]. Both
+/// probes come from one [`probe_bucket_lock_and_config`] call, so a source
+/// that reads the bucket for its answers reads it once per startup.
 pub async fn enforce<S>(source: &S) -> Result<BucketProtectionOutcome, BucketProtectionError>
 where
-    S: ObjectLockProbeSource + BucketConfigProbeSource + ?Sized,
+    S: BucketProbesSource + ?Sized,
 {
-    let lock_probe = probe_object_lock(source).await;
+    let probes = probe_bucket_lock_and_config(source).await;
+    let lock_probe = probes.object_lock;
     if lock_probe.status == ObjectLockStatus::Disabled {
         return Err(BucketProtectionError::ObjectLockDisabled {
             detail: lock_probe.detail,
         });
     }
 
-    let config_probe = probe_bucket_config(source).await;
-    for alarm in bucket_config_alarms(&config_probe) {
+    for alarm in bucket_config_alarms(&probes.bucket_config) {
         if let Some(alarm) = alarm.strip_prefix("ALARM: ") {
             return Err(BucketProtectionError::BucketConfigAlarm {
                 alarm: alarm.to_string(),
@@ -162,7 +164,7 @@ pub async fn enforce_if_required<S>(
     source: &S,
 ) -> Result<Option<BucketProtectionOutcome>, BucketProtectionError>
 where
-    S: ObjectLockProbeSource + BucketConfigProbeSource + ?Sized,
+    S: BucketProbesSource + ?Sized,
 {
     if !required {
         return Ok(None);
@@ -179,7 +181,7 @@ where
 ///
 /// Before this extraction, the binary's `main()` inlined
 /// `enforce_if_required(...).context(...)?` directly, monomorphized only
-/// over `&dyn ObjectStoreBackend` (which `probe_object_lock` always reports
+/// over `&dyn ObjectStoreBackend` (which the lock probe always reports
 /// `Unknown` for, by design -- see the module doc). That left the
 /// `Disabled`/alarm refusal branch of this gate completely untested: no
 /// test file could reach `main()`'s `?` at all, and the only type production
@@ -189,7 +191,7 @@ pub async fn enforce_at_startup<S>(
     source: &S,
 ) -> anyhow::Result<Option<BucketProtectionOutcome>>
 where
-    S: ObjectLockProbeSource + BucketConfigProbeSource + ?Sized,
+    S: BucketProbesSource + ?Sized,
 {
     enforce_if_required(required, source)
         .await
@@ -202,7 +204,8 @@ mod tests {
     use std::sync::LazyLock;
 
     use ravel_object_store::conformance::{
-        BucketConfigProbe, LifecycleRuleStatus, ObjectLockProbe, VersioningStatus,
+        BucketConfigProbe, BucketConfigProbeSource, LifecycleRuleStatus, ObjectLockProbe,
+        ObjectLockProbeSource, VersioningStatus,
     };
     use tokio::sync::Mutex;
 
@@ -243,6 +246,8 @@ mod tests {
             self.config.clone()
         }
     }
+
+    impl BucketProbesSource for Fixture {}
 
     fn clean_config() -> BucketConfigProbe {
         BucketConfigProbe {
@@ -366,6 +371,105 @@ mod tests {
         assert_eq!(
             outcome, None,
             "the flag being off must skip the gate entirely, not just avoid refusing"
+        );
+    }
+
+    /// Bodies a versioned, locked bucket with one compliant lifecycle rule
+    /// over the whole bucket answers with.
+    fn fake_bucket_body(subresource: &str) -> &'static str {
+        match subresource {
+            "versioning" => {
+                "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"
+            }
+            "lifecycle" => {
+                "<LifecycleConfiguration><Rule><ID>ravel</ID><Status>Enabled</Status><Filter/>\
+                 <NoncurrentVersionExpiration><NoncurrentDays>30</NoncurrentDays>\
+                 </NoncurrentVersionExpiration>\
+                 <Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration>\
+                 <AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation>\
+                 </AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>"
+            }
+            "object-lock" => {
+                "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+                 </ObjectLockConfiguration>"
+            }
+            other => panic!("unexpected subresource {other:?}"),
+        }
+    }
+
+    /// Flipped line: `enforce`'s `probe_bucket_lock_and_config(source)` call.
+    /// Asking `probe_object_lock` and `probe_bucket_config` in turn, as
+    /// `enforce` did before, runs one whole control-plane report for each:
+    /// six GETs where one report is three (versioning, lifecycle,
+    /// object-lock).
+    #[tokio::test]
+    async fn one_startup_check_reads_the_bucket_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use ravel_object_store::StoreMetrics;
+        use ravel_object_store::instrument::ControlPlaneMetricsSnapshot;
+        use ravel_object_store::s3::{S3Config, S3Store};
+
+        let served = Arc::new(AtomicU64::new(0));
+        let served_bytes = Arc::new(AtomicU64::new(0));
+        let (requests, bytes) = (Arc::clone(&served), Arc::clone(&served_bytes));
+        let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let (requests, bytes) = (Arc::clone(&requests), Arc::clone(&bytes));
+            async move {
+                let query = uri.query().unwrap_or("");
+                let subresource = query.split(['=', '&']).next().unwrap_or("");
+                let body = fake_bucket_body(subresource);
+                requests.fetch_add(1, Ordering::Relaxed);
+                bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
+                body
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let metrics: Arc<StoreMetrics> = Arc::default();
+        let store = S3Store::with_metrics(
+            S3Config {
+                bucket: "ravel-test".to_string(),
+                region: "us-east-1".to_string(),
+                endpoint: Some(format!("http://{addr}")),
+                access_key_id: "test".to_string(),
+                secret_access_key: "test".to_string(),
+                allow_http: true,
+                force_path_style: true,
+                kms_key_id: None,
+                session_token: None,
+                credentials_file: None,
+                auth: Default::default(),
+                instance_metadata_endpoint: None,
+            },
+            Arc::clone(&metrics),
+        )
+        .expect("store");
+
+        let _guard = GAUGE_TEST_LOCK.lock().await;
+        let outcome = enforce(&store)
+            .await
+            .expect("a compliant bucket must start cleanly");
+        assert_eq!(outcome, BucketProtectionOutcome::Enabled);
+        assert_eq!(served.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            metrics.control_plane(),
+            ControlPlaneMetricsSnapshot {
+                requests: 3,
+                calls: 3,
+                response_bytes: served_bytes.load(Ordering::Relaxed),
+            }
+        );
+        assert_eq!(
+            metrics.snapshot(),
+            ravel_object_store::StoreMetricsSnapshot::default()
         );
     }
 }
