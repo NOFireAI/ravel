@@ -80,15 +80,14 @@ fn latency_stats(mut samples_ns: Vec<u64>) -> LatencyStats {
     }
 }
 
-/// A run's flush count by trigger: the four counters `estimated_put_count`
+/// A run's flush count by trigger: the five counters `estimated_put_count`
 /// sums, and [`FlushCounts::breakdown_line`] prints every one of them, so the
-/// printed breakdown sums to the estimate. This run leaves
-/// `adaptive_flush_delay` at its default of off, so it has no adaptive-age
-/// counter to carry.
+/// printed breakdown sums to the estimate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlushCounts {
     pub by_size: u64,
     pub by_age: u64,
+    pub by_age_adaptive: u64,
     pub by_age_floor: u64,
     pub manual: u64,
 }
@@ -98,6 +97,7 @@ impl FlushCounts {
         Self {
             by_size: metrics.flushes_by_size,
             by_age: metrics.flushes_by_age,
+            by_age_adaptive: metrics.flushes_by_age_adaptive,
             by_age_floor: metrics.flushes_by_age_floor,
             manual: metrics.flushes_manual,
         }
@@ -106,14 +106,14 @@ impl FlushCounts {
     /// One data-object PUT and one commit-record PUT per flush, excluding
     /// retries.
     pub fn estimated_put_count(&self) -> u64 {
-        2 * (self.by_size + self.by_age + self.by_age_floor + self.manual)
+        2 * (self.by_size + self.by_age + self.by_age_adaptive + self.by_age_floor + self.manual)
     }
 
     /// The human-table flush-cause line `s3_e2e_bench` prints.
     pub fn breakdown_line(&self) -> String {
         format!(
-            "  flushes           : size={} age={} age_floor={} manual={}",
-            self.by_size, self.by_age, self.by_age_floor, self.manual
+            "  flushes           : size={} age={} age_adaptive={} age_floor={} manual={}",
+            self.by_size, self.by_age, self.by_age_adaptive, self.by_age_floor, self.manual
         )
     }
 }
@@ -123,6 +123,7 @@ impl Report {
         FlushCounts {
             by_size: self.flushes_by_size,
             by_age: self.flushes_by_age,
+            by_age_adaptive: self.flushes_by_age_adaptive,
             by_age_floor: self.flushes_by_age_floor,
             manual: self.flushes_manual,
         }
@@ -137,6 +138,10 @@ pub struct Report {
     pub ack_latency_ms: LatencyReport,
     pub flushes_by_size: u64,
     pub flushes_by_age: u64,
+    /// Flushes opened by the adaptive age corridor (ADR-0067 decision 3).
+    /// Zero while this run leaves `adaptive_flush_delay` at its default of
+    /// off, and carried so the estimate stays correct if it is turned on.
+    pub flushes_by_age_adaptive: u64,
     /// Flushes the sub-floor hold opened (ADR-1737). Zero unless the router's
     /// `idle_flush_byte_floor` is non-zero, and disjoint from `flushes_by_age`.
     pub flushes_by_age_floor: u64,
@@ -150,8 +155,9 @@ pub struct Report {
     /// Derived: one data-object PUT and one commit-record PUT per flush
     /// (`ravel_commit::publish::publish`), excluding retries. Computed by
     /// [`FlushCounts::estimated_put_count`] over the same counters this report
-    /// carries, `flushes_by_age_floor` included, so twice the printed
-    /// breakdown ([`FlushCounts::breakdown_line`]) is exactly this figure.
+    /// carries, `flushes_by_age_adaptive` and `flushes_by_age_floor` included,
+    /// so twice the printed breakdown ([`FlushCounts::breakdown_line`]) is
+    /// exactly this figure.
     pub estimated_put_count: u64,
     pub bytes_written: u64,
     pub logical_bytes: u64,
@@ -501,6 +507,7 @@ pub async fn run(config: &E2eConfig) -> Report {
         ack_latency_ms: latency_stats(latencies_ns).into(),
         flushes_by_size: metrics.flushes_by_size,
         flushes_by_age: metrics.flushes_by_age,
+        flushes_by_age_adaptive: metrics.flushes_by_age_adaptive,
         flushes_by_age_floor: metrics.flushes_by_age_floor,
         flushes_manual: metrics.flushes_manual,
         put_retries: metrics.put_retries,
@@ -527,7 +534,7 @@ mod tests {
     use super::*;
 
     /// Same check as `ravel_bench::ingest`'s test of the same name, over the
-    /// four counters this report carries.
+    /// five counters this report carries.
     #[test]
     fn printed_flush_breakdown_sums_to_the_estimate_with_a_floor_set() {
         let snapshot = ravel_ingest::IngestMetricsSnapshot {
@@ -535,6 +542,7 @@ mod tests {
             flushes_by_age: 2,
             flushes_by_age_floor: 4,
             flushes_manual: 8,
+            flushes_by_age_adaptive: 16,
             ..Default::default()
         };
         let counts = FlushCounts::from_snapshot(&snapshot);
@@ -544,7 +552,11 @@ mod tests {
             .filter_map(|field| field.split_once('='))
             .map(|(_, value)| value.parse::<u64>().expect("numeric flush count"))
             .sum();
-        assert_eq!(counts.estimated_put_count(), 30);
+        assert_eq!(counts.estimated_put_count(), 62);
+        assert!(
+            line.contains("age_adaptive=16"),
+            "the printed breakdown must carry the adaptive-age count: {line}"
+        );
         assert_eq!(
             2 * printed,
             counts.estimated_put_count(),
