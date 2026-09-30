@@ -172,7 +172,9 @@ data; verification is reads of configuration.
    asserts exit `1` and the named condition, and a control case asserts
    exit `0` on the compliant bucket. Replication and retention are
    exercised through the fixture source only: the job's MinIO has no
-   replication target, and its bucket is created without lock.
+   replication target, and its bucket is created without lock. (See the
+   launcher substitution amendment below: the job runs RustFS, not MinIO,
+   and these cases are not in any workflow yet.)
 
 ```mermaid
 flowchart LR
@@ -234,7 +236,9 @@ flowchart LR
   every operator-managed MinIO bucket must be created with lock and carry
   the two sanctioned rules. The kind lane, the compose files, and
   `deploy/k8s/minio.yaml` create compliant buckets in the same commit as
-  the gate change, and the kubernetes guide states the `mc` commands. This
+  the gate change (see the launcher substitution amendment below), and the
+  kubernetes guide states the `mc` commands (the guide states `aws s3api`
+  commands instead; see the same amendment). This
   is the change a fail-closed default sweeps into every launcher, and it is
   listed rather than discovered.
 - For an operator: a new subcommand to schedule (the guide states at least
@@ -369,3 +373,42 @@ ways.
    own request timeout and retries, so an endpoint that stalls every request
    holds startup at that read first; the deadline helps when only the
    control-plane GETs stall.
+
+## Amendment (2026-09-30): the launcher substitution, floci and RustFS in place of MinIO
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="launcher substitution amendment" -->
+<!-- amendment-supersedes: phrase="deploy/k8s/minio.yaml" pointer="launcher substitution amendment" -->
+<!-- amendment-supersedes: phrase="states the `mc` commands" pointer="launcher substitution amendment" -->
+
+The Consequences name a `deploy/k8s/minio.yaml` manifest and say the
+kubernetes guide states `mc` commands. Neither is in the tree. The kind
+environment runs floci as its default fake-S3 backend and RustFS as its
+fallback (ADR-0034 decision 8), and every launcher that creates a bucket
+for a `--require-bucket-protection` server does so with the AWS CLI or
+with plain S3 requests:
+
+- `deploy/k8s/floci.yaml`, whose create Job sends S3's own XML over curl.
+- `deploy/k8s/rustfs.yaml`, and the `createbucket` step of
+  `deploy/docker-compose/ravel.yml` and `deploy/docker-compose/rustfs.yml`,
+  which use the AWS CLI.
+- `scripts/ci-create-bucket.sh`, the helper CI jobs run against their
+  RustFS endpoint, which uses the AWS CLI (issue #2257).
+
+Each creates the bucket with Object Lock enabled, turns versioning on, puts
+the one whole-bucket lifecycle rule (expired delete markers,
+`NoncurrentDays` 1, multipart abort after 7 days), and reads all three
+back. The `launcher_lifecycle_documents_pass_every_in_process_condition`
+test in `ravel-object-store` reads the lifecycle document from each of them
+and checks it against the startup gate's in-process conditions. The
+kubernetes guide states the commands for a real bucket as `aws s3api`
+calls. The consequence itself stands: every launcher creates a compliant
+bucket.
+
+Decision 6 has the same substitution. The `object-store-contract` job runs
+RustFS and creates its bucket with `scripts/ci-create-bucket.sh`, so its
+bucket is now versioned and Object Lock enabled. The negative cases the
+decision describes (one per breakable condition, plus the compliant
+control) are not in any workflow yet. When they are added, they break a
+condition with the AWS CLI (`put-bucket-versioning` with
+`Status=Suspended`, `delete-bucket-lifecycle` or a narrowed rule) instead
+of `mc`.
