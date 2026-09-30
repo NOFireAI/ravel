@@ -347,7 +347,7 @@ fn request_target(
     force_path_style: bool,
     object_key: Option<&str>,
     query_pairs: &[(String, String)],
-) -> RequestTarget {
+) -> Result<RequestTarget, ControlPlaneError> {
     let key_path: String = object_key
         .map(|key| {
             let encoded = key
@@ -359,18 +359,14 @@ fn request_target(
         })
         .unwrap_or_default();
 
-    let (scheme, host, base_path) = match endpoint {
+    let (scheme, authority, base_path) = match endpoint {
         Some(endpoint) => {
             let (scheme, rest) = split_scheme(endpoint.trim_end_matches('/'));
             let (authority, base_path) = match rest.find('/') {
                 Some(index) => (&rest[..index], &rest[index..]),
                 None => (rest, ""),
             };
-            (
-                scheme,
-                normalize_authority(scheme, authority),
-                base_path.to_string(),
-            )
+            (scheme, authority.to_string(), base_path.to_string())
         }
         None if force_path_style => ("https", format!("s3.{region}.amazonaws.com"), String::new()),
         None => (
@@ -393,38 +389,33 @@ fn request_target(
     };
     let query = canonical_query(query_pairs);
     let url = if query.is_empty() {
-        format!("{scheme}://{host}{path}")
+        format!("{scheme}://{authority}{path}")
     } else {
-        format!("{scheme}://{host}{path}?{query}")
+        format!("{scheme}://{authority}{path}?{query}")
     };
-    RequestTarget {
+    let host = wire_host(&url)?;
+    Ok(RequestTarget {
         url,
         host,
         canonical_uri: path,
-    }
+    })
 }
 
-/// The authority as the `url` crate re-serialises it, which is what `reqwest`
-/// sends as `Host`: the host lowercased, and the port dropped when it is empty
-/// or the scheme's default (443 for `https`, 80 for `http`). The signed `host`
+/// The authority `reqwest` sends as `Host` for `url`, taken from the `url`
+/// crate's parse of it: the host as that crate serialises it (lowercased,
+/// IDNA to punycode, IPv4 shorthand expanded, IPv6 compressed and bracketed),
+/// and the port only when it is not the scheme's default. The signed `host`
 /// value must be these exact bytes, or S3 rejects the signature.
-fn normalize_authority(scheme: &str, authority: &str) -> String {
-    let (host, port) = match authority.strip_prefix('[') {
-        Some(rest) => match rest.split_once(']') {
-            Some((literal, tail)) => (format!("[{literal}]"), tail.strip_prefix(':')),
-            None => (authority.to_string(), None),
-        },
-        None => match authority.rsplit_once(':') {
-            Some((host, port)) => (host.to_string(), Some(port)),
-            None => (authority.to_string(), None),
-        },
-    };
-    let default_port = if scheme == "http" { "80" } else { "443" };
-    let host = host.to_ascii_lowercase();
-    match port {
-        Some(port) if !port.is_empty() && port != default_port => format!("{host}:{port}"),
-        _ => host,
-    }
+fn wire_host(url: &str) -> Result<String, ControlPlaneError> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| ControlPlaneError::Transport(format!("invalid request URL: {e}")))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| ControlPlaneError::Transport("request URL has no host".to_string()))?;
+    Ok(match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    })
 }
 
 /// Split `scheme://authority...` into (`"http"`/`"https"`, authority-and-rest).
@@ -1410,7 +1401,7 @@ impl BucketControlPlaneClient {
             self.force_path_style,
             object_key,
             query_pairs,
-        );
+        )?;
         let (amz_date, date_stamp) = format_amz_time(self.clock.now_unix_secs());
 
         let mut headers = vec![
@@ -2399,7 +2390,9 @@ fn evaluate_action<T: Copy + fmt::Display>(
 
 /// `no-foreign-rule`: no enabled rule that targets `t/` or `sys/` carries a
 /// transition, a current-version expiration (by days or by date), or a
-/// noncurrent-version expiration sooner than `reference_noncurrent_days`. An
+/// noncurrent-version expiration sooner than `reference_noncurrent_days`
+/// other than a sanctioned covering rule or a member of the complete
+/// `t/0` .. `t/f` union. An
 /// expiration or action the reader cannot classify, a day count that does not
 /// parse, a `NoncurrentDays` with no reference to compare it against, or a rule
 /// whose filter or status is unrecognised makes it `Unknown`. The

@@ -592,12 +592,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rule that can reach `t/`
   or `sys/` carries a transition, a current-version expiration, or a
   `NoncurrentDays` shorter than the reference (the expected value, else the one
-  value the covering rules agree on). A `NoncurrentDays` below the reference
-  on a rule other than the sanctioned covering one fails `no-foreign-rule`,
+  value the covering rules agree on) other than a sanctioned covering rule or
+  a member of the complete `t/0` .. `t/f` union. A `NoncurrentDays` below the
+  reference on a rule other than a sanctioned covering rule or union member
+  fails `no-foreign-rule`,
   and also `noncurrent-expiration` when the rule reaches part of `t/`; with no
   reference to compare against, the same rule is `Unknown` there instead. On
-  the covering rule itself it fails `noncurrent-expiration` only, so one
-  misconfiguration counts once. `DeleteMarkerReplication` `Disabled` on a rule
+  a sanctioned covering rule or union member it fails `noncurrent-expiration`
+  only, so one misconfiguration counts once. `DeleteMarkerReplication` `Disabled` on a rule
   over part of `t/` fails `delete-marker-replication`. A 404 is "not configured"
   only when its `<Error><Code>` is that call's own code
   (`NoSuchLifecycleConfiguration`, `ReplicationConfigurationNotFoundError`,
@@ -642,9 +644,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   union of enabled rules on exactly `t/0` through `t/f`, one per lowercase hex
   digit a tenant hash can start with, each member's values checked as a
   covering rule's are; any other set of narrower prefixes stays `Unknown`. The
-  signed `host` is the authority `reqwest` sends, with the scheme's default
-  port dropped and the host lowercased, so an endpoint configured as
-  `https://host:443` or with an uppercase host is not answered 403. The
+  signed `host` is the authority the request carries, derived from the parsed
+  URL as `reqwest` derives its `Host` (host lowercased, IDNA hosts in punycode,
+  IP literals normalised, the scheme's default port dropped), so an endpoint
+  configured as `https://host:443`, with an uppercase or non-ASCII host, or
+  with a leading-zero port is not answered 403. The
   server's `--require-bucket-protection` gate asks both probes through one
   `BucketProbesSource` call too. Neither `store qualify` nor the server gate
   is handed an `S3Store` yet: both probe through the `ObjectStoreBackend`

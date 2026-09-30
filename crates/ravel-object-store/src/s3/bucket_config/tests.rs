@@ -231,7 +231,7 @@ fn target(endpoint: Option<&str>, path_style: bool, key: Option<&str>) -> Reques
         ],
         None => vec![("versioning".to_string(), String::new())],
     };
-    request_target("bkt", "eu-west-1", endpoint, path_style, key, &query)
+    request_target("bkt", "eu-west-1", endpoint, path_style, key, &query).expect("target")
 }
 
 /// Each addressing style produces the URL `object_store` would use for the
@@ -311,6 +311,45 @@ fn signed_host_is_the_authority_sent() {
         let t = target(Some(endpoint), true, None);
         assert_eq!(t.host, host, "{endpoint}");
         assert_eq!(wire_authority(&t.url), t.host, "{endpoint}");
+    }
+}
+
+/// Endpoints whose written authority the `url` crate rewrites before `reqwest`
+/// sends it: the signed `host` is the rewritten form, not the text as given.
+#[test]
+fn signed_host_follows_the_url_crate_rewrite() {
+    let mut mismatches = Vec::new();
+    for endpoint in [
+        "https://Bücket.example.com",
+        "http://[0:0:0:0:0:0:0:1]:9000",
+        "https://[0:0:0:0:0:0:0:1]",
+        "https://host:0443",
+        "http://host:09000",
+        "http://127.1:9000",
+        "https://HOST.Example.COM:9000",
+        "https://user:secret@host.example:9000",
+    ] {
+        let t = target(Some(endpoint), true, None);
+        let wire = wire_authority(&t.url);
+        if t.host != wire {
+            mismatches.push(format!("{endpoint}: signed {} wire {wire}", t.host));
+        }
+    }
+    assert_eq!(mismatches, Vec::<String>::new());
+}
+
+/// An endpoint the `url` crate cannot parse is a transport error (so the
+/// condition reads `Unknown`), not a panic.
+#[test]
+fn unparseable_endpoint_is_a_transport_error() {
+    let query = vec![("versioning".to_string(), String::new())];
+    for endpoint in ["http://[::1", "https://host:99999", "http://ho st:9000"] {
+        let err = request_target("bkt", "eu-west-1", Some(endpoint), true, None, &query)
+            .expect_err(endpoint);
+        assert!(
+            matches!(err, ControlPlaneError::Transport(_)),
+            "{endpoint}: {err:?}"
+        );
     }
 }
 
@@ -3162,7 +3201,7 @@ fn union_members_that_disagree_on_noncurrent_days_fail() {
 /// The sanctioned rule covering all of t/ with a NoncurrentDays below E_v is
 /// one misconfiguration: noncurrent-expiration fails on it and no-foreign-rule
 /// does not, since there is no foreign rule. The report carries one Fail, so
-/// the conditions_failed gauge reads 1.
+/// failed_count() reads 1.
 #[test]
 fn short_noncurrent_days_on_the_covering_rule_fail_one_condition() {
     let short = rule(
