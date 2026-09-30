@@ -282,6 +282,13 @@ pub struct LogIngestMetrics {
     /// [`LogIngestMetrics::tenant_put_attribution`] rather than folded into the
     /// `Copy` snapshot. See [`crate::attribution`] for the policy.
     put_attribution: TenantPutAttribution,
+    /// Per-tenant count of flushed objects written with no sort descriptor and
+    /// full bloom coverage because the tenant's stored clustering key or bloom
+    /// scope did not resolve against its declared typed columns (ADR-2135),
+    /// intended for export as `ingest_clustering_key_unresolved_total`
+    /// labelled by tenant. Only a tenant that hit that state has an entry.
+    /// Read via [`LogIngestMetrics::clustering_key_unresolved_by_tenant`].
+    clustering_key_unresolved: Mutex<HashMap<TenantHash, u64>>,
 }
 
 /// Point-in-time copy of [`LogIngestMetrics`] for scraping. See the
@@ -717,6 +724,29 @@ impl LogIngestMetrics {
     pub(crate) fn record_indexed_fields_stale_fallback(&self) {
         self.indexed_fields_stale_fallbacks
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One flush for `tenant` wrote its object with no sort descriptor and
+    /// full bloom coverage because the tenant's storage layout did not resolve
+    /// (ADR-2135). Called from `run_flush` before the object is encoded.
+    pub(crate) fn record_clustering_key_unresolved(&self, tenant: TenantHash) {
+        let mut map = self
+            .clustering_key_unresolved
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *map.entry(tenant).or_default() += 1;
+    }
+
+    /// Point-in-time per-tenant unresolved-layout flush counts, sorted by
+    /// tenant hash. A tenant with no unresolved flush is absent.
+    pub fn clustering_key_unresolved_by_tenant(&self) -> Vec<(TenantHash, u64)> {
+        let map = self
+            .clustering_key_unresolved
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut counts: Vec<(TenantHash, u64)> = map.iter().map(|(&t, &n)| (t, n)).collect();
+        counts.sort_unstable_by_key(|&(tenant, _)| tenant);
+        counts
     }
 
     /// Fold one flushed object's write-side POSTINGS counters

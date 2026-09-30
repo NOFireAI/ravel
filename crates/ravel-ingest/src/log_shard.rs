@@ -73,6 +73,7 @@ use crate::log_metrics::LogIngestMetrics;
 use crate::metrics::FlushTrigger;
 #[cfg(feature = "stage-timing")]
 use crate::stage_timing::{LogStage, LogStageTimings};
+use crate::storage_layout::{WriterLayout, writer_layout};
 
 pub(crate) type LogAck = oneshot::Sender<Result<CommitToken, LogWriteError>>;
 
@@ -632,18 +633,34 @@ impl LogFlushCtx {
         // durable read the indexed-field resolution above just performed (fast
         // path hit, or the `refresh` that ran on a miss). An empty list leaves
         // every column of this object uncovered, the permanent legal default.
-        let declared_columns: Vec<(String, u32)> = self
+        let (typed_columns, layout) = self
             .indexed_fields
-            .typed_columns_cached(&tenant_hash, flush_open_ns)
+            .declared_layout_cached(&tenant_hash, flush_open_ns);
+        // ADR-2135 decisions 1 and 5: the tenant's clustering key and bloom
+        // scope from that same entry, key column types and `undeclared` names
+        // taken from the typed columns stamped below. A layout that does not
+        // resolve writes the unkeyed default and is counted rather than
+        // failing the flush.
+        let writer_layout = match writer_layout(&layout, &typed_columns) {
+            Some(resolved) => resolved,
+            None => {
+                self.metrics.record_clustering_key_unresolved(tenant_hash);
+                WriterLayout::unkeyed()
+            }
+        };
+        let declared_columns: Vec<(String, u32)> = typed_columns
             .into_iter()
             .map(|col| (col.key, declared_type_tag(col.ty)))
             .collect();
         // Encode: RLOG serialization only (RlogWriter push + finish), excluding
-        // the indexed-field resolution above and the object-store PUT below.
+        // the indexed-field and layout resolution above and the object-store
+        // PUT below.
         #[cfg(feature = "stage-timing")]
         let encode_start = std::time::Instant::now();
-        let mut writer =
-            RlogWriter::new(RlogConfig::default(), identity).with_indexed_fields(indexed_fields);
+        let mut writer = RlogWriter::new(RlogConfig::default(), identity)
+            .with_indexed_fields(indexed_fields)
+            .with_sort_descriptor(writer_layout.descriptor, writer_layout.generation)
+            .with_bloom_scope(writer_layout.bloom_scope);
         let push_result = match payload {
             FlushPayload::Rows(records) => records
                 .into_iter()

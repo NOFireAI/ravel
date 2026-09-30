@@ -724,6 +724,28 @@ since `finish()` does not report it back), and `segment_format_version` is
 `LOG_SEGMENT_FORMAT_VERSION`, RLOG's own trailer version, not
 `SEGMENT_FORMAT_VERSION`.
 
+The log flush writes each object with the tenant's clustering key and bloom
+scope (ADR-2135 decisions 1 and 5). Both come from config record fields 13
+and 14, read by the same single GET that supplies the tenant's indexed fields
+and declared typed columns, and are cached beside them: they refresh when that
+entry passes its 60 s horizon, a failed re-read keeps serving the last values
+read, and idle eviction drops them with the entry. The flush resolves them at
+its pinned `flush_open_ns`, before the `Encode` timing window opens. A tenant
+with no record, or a record without either field, gets no sort descriptor,
+clustering generation 0 and full bloom coverage, which leaves the object's
+bytes as they were before this change. A set key writes a sort descriptor with
+the key's bucket width, key column types taken from the declared typed columns
+the flush stamps statistics from, and the key's generation; a cleared key
+writes no descriptor and the generation it was cleared at. The `undeclared`
+scope leaves exactly those declared typed columns out of bloom coverage. When
+the stored key or scope does not resolve against the record's declared typed
+columns (a key column that is not declared, for example), the flush still
+writes, with no descriptor, generation 0 and full bloom coverage; the overlay
+logs one warning each time it refreshes that tenant's entry, and each such
+flush adds one to the tenant's `ingest_clustering_key_unresolved_total` count,
+read through `LogIngestMetrics::clustering_key_unresolved_by_tenant`.
+`ravel-server` does not export that counter at `/metrics` yet.
+
 `LogIngestMetrics` mirrors `IngestMetrics` counter for counter under two
 renames that follow the unit change: `buffered_records_total` for
 `buffered_points_total`, `stream_id_collisions` for `series_id_collisions`.

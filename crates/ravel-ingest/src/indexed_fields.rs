@@ -41,6 +41,7 @@ use ravel_types::TenantHash;
 
 use crate::lifecycle::DEFAULT_LIFECYCLE_REFRESH_INTERVAL_NS;
 use crate::log_router::LogIndexedFields;
+use crate::storage_layout::StorageLayout;
 
 /// Backoff after a failed durable re-read before the overlay will attempt that
 /// tenant's `TenantConfig` GET again (ADR-0079 deliverable 5). Mirrors the shape
@@ -83,6 +84,10 @@ struct CacheEntry {
     /// empty list only costs a segment its stamp coverage (it scans), never a
     /// wrong answer, so it follows the identical failure discipline.
     typed_columns: Vec<DeclaredTypedColumn>,
+    /// The tenant's clustering key and bloom scope (ADR-2135), resolved from
+    /// the same read against `typed_columns`. The default layout (never set,
+    /// scope `all`) on a base-only entry.
+    layout: StorageLayout,
     refreshed_at_ns: i64,
     attempted_at_ns: i64,
     last_touched_ns: i64,
@@ -207,25 +212,26 @@ impl IndexedFieldsOverlay {
         }
     }
 
-    /// The tenant's declared typed columns as last resolved into the cache
-    /// (ADR-0873 wave 5a). Read after the flush has already resolved this
-    /// tenant's indexed fields for the same tick (fast path or `refresh`), so
-    /// the entry exists and its `typed_columns` came from the same durable read;
-    /// returns an empty list when no entry exists yet or the config declares
-    /// none. Stamps `last_touched_ns` so reading declared columns keeps an entry
-    /// live exactly as a field read does. `now_ns` is the flush's pinned clock.
-    pub(crate) fn typed_columns_cached(
+    /// The tenant's declared typed columns (ADR-0873 wave 5a) and storage
+    /// layout (ADR-2135) as last resolved into the cache, both from one entry.
+    /// Read after the flush has already resolved this tenant's indexed fields
+    /// for the same tick (fast path or `refresh`), so the entry exists and both
+    /// came from the same durable read; returns an empty list and the default
+    /// layout when no entry exists yet. Stamps `last_touched_ns` so this read
+    /// keeps an entry live exactly as a field read does. `now_ns` is the
+    /// flush's pinned clock.
+    pub(crate) fn declared_layout_cached(
         &self,
         tenant: &TenantHash,
         now_ns: i64,
-    ) -> Vec<DeclaredTypedColumn> {
+    ) -> (Vec<DeclaredTypedColumn>, StorageLayout) {
         let mut inner = self.lock();
         match inner.cache.get_mut(tenant) {
             Some(entry) => {
                 entry.last_touched_ns = now_ns;
-                entry.typed_columns.clone()
+                (entry.typed_columns.clone(), entry.layout.clone())
             }
-            None => Vec::new(),
+            None => (Vec::new(), StorageLayout::default()),
         }
     }
 
@@ -275,6 +281,12 @@ impl IndexedFieldsOverlay {
                     .as_ref()
                     .and_then(|c| c.typed_attr_columns.clone())
                     .unwrap_or_default();
+                // The clustering key and bloom scope ride it too (ADR-2135),
+                // the key validated against those same typed columns.
+                let layout = config
+                    .as_ref()
+                    .map(|c| StorageLayout::resolve(c, &typed_columns))
+                    .unwrap_or_default();
                 let durable = config.and_then(|c| c.indexed_fields);
                 match durable {
                     // A present durable override: validate before it can replace
@@ -283,12 +295,12 @@ impl IndexedFieldsOverlay {
                     Some(list) if validate_indexed_list(&list).is_err() => {
                         self.serve_on_failure(tenant, now_ns)
                     }
-                    Some(list) => self.install_fresh(tenant, list, typed_columns, now_ns),
+                    Some(list) => self.install_fresh(tenant, list, typed_columns, layout, now_ns),
                     // No override: the base's own tenant-override-or-default
                     // resolution stands unchanged.
                     None => {
                         let base_fields = self.base.fields_for(tenant);
-                        self.install_fresh(tenant, base_fields, typed_columns, now_ns)
+                        self.install_fresh(tenant, base_fields, typed_columns, layout, now_ns)
                     }
                 }
             }
@@ -297,20 +309,33 @@ impl IndexedFieldsOverlay {
     }
 
     /// Install a freshly-resolved list for `tenant`, stamping the refresh time and
-    /// clearing any pending failed-read backoff.
+    /// clearing any pending failed-read backoff. An unresolved layout logs one
+    /// warning here, once per refresh; every flush it serves is counted by the
+    /// caller.
     fn install_fresh(
         &self,
         tenant: &TenantHash,
         fields: Vec<String>,
         typed_columns: Vec<DeclaredTypedColumn>,
+        layout: StorageLayout,
         now_ns: i64,
     ) -> RefreshOutcome {
+        if let StorageLayout::Unresolved(error) = &layout {
+            tracing::warn!(
+                tenant_hash = %tenant.to_hex(),
+                %error,
+                "tenant clustering key or bloom scope does not resolve against its declared \
+                 typed columns; log objects are written with no sort descriptor and full bloom \
+                 coverage"
+            );
+        }
         let mut inner = self.lock();
         inner.cache.insert(
             *tenant,
             CacheEntry {
                 fields: fields.clone(),
                 typed_columns,
+                layout,
                 refreshed_at_ns: now_ns,
                 attempted_at_ns: NEVER,
                 last_touched_ns: now_ns,
@@ -348,6 +373,7 @@ impl IndexedFieldsOverlay {
                 // known, so no segment it flushes is stamped until a read
                 // succeeds. Fail-closed to uncovered, never to a wrong stamp.
                 typed_columns: Vec::new(),
+                layout: StorageLayout::default(),
                 refreshed_at_ns: NEVER,
                 attempted_at_ns: now_ns,
                 last_touched_ns: now_ns,
@@ -638,6 +664,79 @@ mod tests {
         assert!(
             overlay.fields_for_cached(&active, sweep_ns).is_some(),
             "the active tenant's entry survives the sweep"
+        );
+    }
+
+    /// ADR-2135: the storage layout rides the indexed-field entry. A failed
+    /// re-read keeps serving the last layout read, and idle eviction drops it
+    /// with the entry, leaving the no-record default.
+    #[tokio::test]
+    async fn layout_serves_last_known_good_and_is_evicted_with_its_entry() {
+        use prost::Message;
+        use ravel_catalog::{
+            BloomScope, ClusteringBucketWidth, ClusteringKey, ClusteringKeyState, config_key,
+        };
+        use ravel_object_store::PutOptions;
+        use ravel_proto::sys::v1 as proto;
+
+        let t = tenant(9);
+        let record = proto::TenantConfigRecord {
+            format_version: 3,
+            tenant_hash: t.0.to_vec(),
+            lifecycle_state: proto::TenantLifecycleState::Active as i32,
+            typed_attr_columns: Some(proto::TypedAttrColumnConfig {
+                columns: vec![proto::TypedAttrColumn {
+                    key: "region".to_string(),
+                    r#type: proto::TypedAttrColumnType::Str as i32,
+                }],
+            }),
+            clustering_key: Some(proto::ClusteringKeyConfig {
+                columns: vec!["region".to_string()],
+                bucket_width: proto::ClusteringBucketWidth::OneHour as i32,
+                generation: 7,
+            }),
+            bloom_scope: proto::BloomScope::Text as i32,
+            created_unix_ns: 1,
+            updated_unix_ns: 1,
+            ..Default::default()
+        };
+        let good: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        good.put(
+            &config_key(&t),
+            record.encode_to_vec().into(),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put config record");
+        let failing: Arc<dyn ObjectStoreBackend> = Arc::new(FaultStore::new(
+            MemoryStore::new(),
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::Get, ScriptedFault::Transient("store down".into()))
+                    .with_occurrence(Occurrence::Always),
+            ),
+        ));
+        let want = StorageLayout::Resolved {
+            clustering: ClusteringKeyState::Set(ClusteringKey {
+                columns: vec!["region".to_string()],
+                bucket_width: ClusteringBucketWidth::OneHour,
+                generation: 7,
+            }),
+            bloom_scope: BloomScope::Text,
+        };
+        let overlay = overlay_over(Arc::new(crate::NoIndexedFields));
+
+        let out = overlay.refresh(good.as_ref(), &t, 10_000).await;
+        assert!(matches!(out, RefreshOutcome::Fresh(_)));
+        assert_eq!(overlay.declared_layout_cached(&t, 10_000).1, want);
+
+        let out = overlay.refresh(failing.as_ref(), &t, 20_000).await;
+        assert!(matches!(out, RefreshOutcome::Fallback(_)));
+        assert_eq!(overlay.declared_layout_cached(&t, 20_000).1, want);
+
+        assert_eq!(overlay.evict_idle(40_000, 1_000), 1);
+        assert_eq!(
+            overlay.declared_layout_cached(&t, 40_000).1,
+            StorageLayout::default()
         );
     }
 }

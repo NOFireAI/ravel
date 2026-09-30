@@ -1216,6 +1216,74 @@ mod tests {
         );
     }
 
+    /// ADR-2135: a format-version-3 config record carrying neither the
+    /// clustering key (field 13) nor the bloom scope (field 14) writes the
+    /// same objects as a tenant with no config record at all. Same seed and
+    /// clock as above, so every stored byte other than the config record
+    /// itself is compared.
+    #[tokio::test]
+    async fn a_record_without_layout_fields_writes_the_same_objects_as_no_record() {
+        use prost::Message;
+        use ravel_catalog::config_key;
+        use ravel_object_store::PutOptions;
+        use ravel_proto::sys::v1::{TenantConfigRecord, TenantLifecycleState};
+
+        let seed = 0x00C0_FFEE_u64;
+        let clock: Arc<dyn Clock> = Arc::new(FixedClock(1_700_000_000_000_000_000));
+        let tenant = TenantId::new("acme");
+
+        let store_none: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let store_v3: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let record = TenantConfigRecord {
+            format_version: 3,
+            tenant_hash: tenant.hash().0.to_vec(),
+            lifecycle_state: TenantLifecycleState::Active as i32,
+            created_unix_ns: 1,
+            updated_unix_ns: 1,
+            ..Default::default()
+        };
+        let config = config_key(&tenant.hash());
+        store_v3
+            .put(
+                &config,
+                record.encode_to_vec().into(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put config record");
+
+        for store in [&store_none, &store_v3] {
+            let router = LogIngestRouter::with_rng(
+                buffer_all(),
+                Arc::clone(store),
+                Arc::clone(&clock),
+                overlay(),
+                Arc::new(SeededRng::new(seed)),
+            );
+            router
+                .write(
+                    tenant.clone(),
+                    diverse_records(),
+                    WriteMode::Buffered,
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("buffered write enqueues");
+            router.flush_all().await;
+        }
+
+        let objs_none = collect_objects(store_none.as_ref()).await;
+        let mut objs_v3 = collect_objects(store_v3.as_ref()).await;
+        let before = objs_v3.len();
+        objs_v3.retain(|(key, _)| key != &config);
+        assert_eq!(objs_v3.len(), before - 1, "the config record is set aside");
+        assert!(!objs_none.is_empty());
+        assert_eq!(
+            objs_none, objs_v3,
+            "a record without fields 13 and 14 must not change a stored byte"
+        );
+    }
+
     /// Each per-shard sub-batch `partition_columnar` builds is exactly what
     /// `ColumnarLogBatch::from_records` would build from that shard's rows in row
     /// order (dynamic-column order and drop, stream-directory rebuild, dense
