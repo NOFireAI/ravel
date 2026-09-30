@@ -327,7 +327,6 @@ fn signed_host_follows_the_url_crate_rewrite() {
         "http://host:09000",
         "http://127.1:9000",
         "https://HOST.Example.COM:9000",
-        "https://user:secret@host.example:9000",
     ] {
         let t = target(Some(endpoint), true, None);
         let wire = wire_authority(&t.url);
@@ -353,9 +352,34 @@ fn unparseable_endpoint_is_a_transport_error() {
     }
 }
 
+/// An endpoint carrying userinfo is refused as a transport error: `reqwest`
+/// would send it as a second `Authorization` header beside the signature.
+#[test]
+fn endpoint_with_credentials_is_a_transport_error() {
+    let query = vec![("versioning".to_string(), String::new())];
+    for endpoint in [
+        "https://user:secret@minio.example:9000",
+        "http://user@minio.example:9000",
+        "https://:secret@minio.example",
+    ] {
+        let err = request_target("bkt", "eu-west-1", Some(endpoint), true, None, &query)
+            .expect_err(endpoint);
+        match err {
+            ControlPlaneError::Transport(message) => assert_eq!(
+                message,
+                "credentials in the endpoint URL are not supported for the control plane; its \
+                 requests are signed with the store's configured credentials",
+                "{endpoint}"
+            ),
+            other => panic!("{endpoint}: {other:?}"),
+        }
+    }
+}
+
 /// On the wire: a request through a forward proxy (so the endpoint's name and
 /// port need not be reachable) carries the `Host` the signature covers, for a
-/// scheme-default port, a non-default one, and an uppercase host.
+/// scheme-default port, a non-default one, and an uppercase host, and exactly
+/// one `Authorization` header.
 #[tokio::test]
 async fn host_header_on_the_wire_matches_the_signature() {
     let respond: Responder = Arc::new(|_sub, _path, _query| {
@@ -404,6 +428,12 @@ async fn host_header_on_the_wire_matches_the_signature() {
             .find(|(name, _)| name == "host")
             .map(|(_, value)| value.clone());
         assert_eq!(sent_host.as_deref(), Some(host), "{endpoint}");
+        let authorizations = request
+            .headers
+            .iter()
+            .filter(|(name, _)| name == "authorization")
+            .count();
+        assert_eq!(authorizations, 1, "{endpoint}");
         verify_authorization(&request, &UNSIGNED_TOKEN);
     }
 }
@@ -1609,9 +1639,19 @@ fn complete_replication_union_covers_t() {
         if c == 'a' { "Disabled" } else { "Enabled" }
     }));
     assert!(state.is_fail(), "{state:?}");
-    assert!(
-        state.detail().contains("rule #11") && state.detail().contains("disagree"),
-        "{state:?}"
+    let enabled = HEX_DIGITS
+        .chars()
+        .enumerate()
+        .filter(|(_, c)| *c != 'a')
+        .map(|(index, c)| format!("rule #{} on prefix \"t/{c}\"", index + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    assert_eq!(
+        state.detail(),
+        format!(
+            "enabled replication rules covering t/ disagree on DeleteMarkerReplication: Enabled \
+             on {enabled}, Disabled on rule #11 on prefix \"t/a\""
+        )
     );
 }
 
@@ -3186,7 +3226,7 @@ fn union_members_that_disagree_on_noncurrent_days_fail() {
     assert!(
         v.noncurrent
             .detail()
-            .contains("rule \"tenant-t/7\": NoncurrentDays is 45, expected 30"),
+            .contains("rule \"tenant-t/7\" on prefix \"t/7\": NoncurrentDays is 45, expected 30"),
         "{:?}",
         v.noncurrent
     );
@@ -3241,7 +3281,9 @@ fn short_noncurrent_days_on_the_covering_rule_fail_one_condition() {
     let v = evaluate(&union);
     assert_eq!(
         v.noncurrent,
-        ConditionState::Fail("rule \"tenant-t/7\": NoncurrentDays is 14, expected 30".to_string())
+        ConditionState::Fail(
+            "rule \"tenant-t/7\" on prefix \"t/7\": NoncurrentDays is 14, expected 30".to_string()
+        )
     );
     assert_eq!(v.no_foreign, ConditionState::Pass);
 

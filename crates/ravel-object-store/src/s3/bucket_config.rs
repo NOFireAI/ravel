@@ -405,10 +405,19 @@ fn request_target(
 /// crate's parse of it: the host as that crate serialises it (lowercased,
 /// IDNA to punycode, IPv4 shorthand expanded, IPv6 compressed and bracketed),
 /// and the port only when it is not the scheme's default. The signed `host`
-/// value must be these exact bytes, or S3 rejects the signature.
+/// value must be these exact bytes, or S3 rejects the signature. A URL with
+/// userinfo is refused: `reqwest` turns it into a second `Authorization`
+/// header beside the SigV4 one.
 fn wire_host(url: &str) -> Result<String, ControlPlaneError> {
     let parsed = reqwest::Url::parse(url)
         .map_err(|e| ControlPlaneError::Transport(format!("invalid request URL: {e}")))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(ControlPlaneError::Transport(
+            "credentials in the endpoint URL are not supported for the control plane; its \
+             requests are signed with the store's configured credentials"
+                .to_string(),
+        ));
+    }
     let host = parsed
         .host_str()
         .ok_or_else(|| ControlPlaneError::Transport("request URL has no host".to_string()))?;
@@ -2309,13 +2318,16 @@ fn evaluate_action<T: Copy + fmt::Display>(
         let Some(value) = value_of(rule) else {
             continue;
         };
-        let label = rule.label(index);
+        let mut label = rule.label(index);
         let active = rule.status.active();
         if active == Tri::No {
             continue;
         }
         let coverage = match rule.scope.coverage_of_data_root() {
-            Coverage::UnionMember if union.contains(&index) => Coverage::Full,
+            Coverage::UnionMember if union.contains(&index) => {
+                label = format!("{label} on {}", rule.scope.describe());
+                Coverage::Full
+            }
             coverage => coverage,
         };
         match (active, coverage) {
@@ -2493,7 +2505,7 @@ fn delete_marker_replication_state(config: &ReplicationConfig) -> ConditionState
     let mut union_members: Vec<String> = Vec::new();
     let union = complete_union(&config.rules, |_| true);
     for (index, rule) in config.rules.iter().enumerate() {
-        let label = match &rule.id {
+        let mut label = match &rule.id {
             Some(id) => format!("rule {id:?}"),
             None => format!("rule #{}", index + 1),
         };
@@ -2502,7 +2514,10 @@ fn delete_marker_replication_state(config: &ReplicationConfig) -> ConditionState
             continue;
         }
         let coverage = match rule.scope.coverage_of_data_root() {
-            Coverage::UnionMember if union.contains(&index) => Coverage::Full,
+            Coverage::UnionMember if union.contains(&index) => {
+                label = format!("{label} on {}", rule.scope.describe());
+                Coverage::Full
+            }
             coverage => coverage,
         };
         let partial = match coverage {

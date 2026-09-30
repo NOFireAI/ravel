@@ -648,8 +648,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   URL as `reqwest` derives its `Host` (host lowercased, IDNA hosts in punycode,
   IP literals normalised, the scheme's default port dropped), so an endpoint
   configured as `https://host:443`, with an uppercase or non-ASCII host, or
-  with a leading-zero port is not answered 403. The
-  server's `--require-bucket-protection` gate asks both probes through one
+  with a leading-zero port is not answered 403. An endpoint carrying userinfo
+  (`https://user:secret@host`) is refused as `Unknown` rather than sent with
+  a second `Authorization` header. The server's `--require-bucket-protection` gate asks both probes through one
   `BucketProbesSource` call too. Neither `store qualify` nor the server gate
   is handed an `S3Store` yet: both probe through the `ObjectStoreBackend`
   contract, so against a real bucket they report every condition `Unknown`
