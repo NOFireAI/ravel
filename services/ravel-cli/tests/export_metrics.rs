@@ -928,7 +928,8 @@ column = "host_col"
     .await;
     assert_eq!(
         err,
-        "series cpu{host=\"h1\", job=\"api\"} cannot be exported under this mapping: no \
+        "export --signal metrics refused on 1 series; first: series cpu{host=\"h1\", \
+         job=\"api\"} cannot be exported under this mapping: no \
          name_column value loads back as \"cpu\" with unit = \"s\" and kind = \"gauge\" (written \
          as \"cpu\", a load names it \"cpu_seconds\"), so the exported file would re-load onto a \
          different series. Export it with the unit and kind it was loaded with; a mapping with \
@@ -957,10 +958,60 @@ column = "job_col"
     .await;
     assert_eq!(
         err,
-        "series cpu{host=\"h1\", job=\"api\"} carries the label \"host\", which no \
-         [[metrics.label]] in the mapping names; a load of the exported file would drop it and \
-         land the samples on a different series. Add a [[metrics.label]] for it."
+        "export --signal metrics refused on 1 series; first: series cpu{host=\"h1\", \
+         job=\"api\"} carries the label \"host\", which no [[metrics.label]] in the mapping \
+         names; a load of the exported file would drop it and land the samples on a different \
+         series. Add a [[metrics.label]] for it."
     );
+}
+
+/// Several series refused for the same reason are refused once, naming the
+/// count and the first offender in the output file's series order, whatever
+/// order the export's hash map visits them in. The series are loaded in the
+/// reverse of that order, and the export runs repeatedly over one store.
+#[tokio::test]
+async fn several_refused_series_name_the_count_and_the_first_in_output_order() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    load_rows(
+        &store,
+        dir.path(),
+        "alpha",
+        &metrics_mapping(GAUGE_MAPPING),
+        &[("cpu", T0, 1.0, "api", "h2"), ("cpu", T0, 2.0, "api", "h1")],
+        LOAD_NS,
+        Arc::new(FixedClock(LOAD_NS)),
+    )
+    .await;
+    let job_only = metrics_mapping(
+        r#"
+[metrics]
+name_column = "name"
+value_column = "value"
+ts_column = "ts"
+ts_unit = "nanos"
+unit = "s"
+
+[[metrics.label]]
+name = "job"
+column = "job_col"
+"#,
+    );
+    for run in 0..16 {
+        let out = dir.path().join(format!("out-{run}.parquet"));
+        let err = export_window(&store, "alpha", T0, T2, &job_only, &out, LOAD_NS)
+            .await
+            .expect_err("the export is refused");
+        assert_eq!(
+            err.to_string(),
+            "export --signal metrics refused on 2 series; first: series \
+             cpu_seconds{host_name=\"h1\", job=\"api\"} carries the label \"host_name\", which no [[metrics.label]] in the mapping \
+             names; a load of the exported file would drop it and land the samples on a \
+             different series. Add a [[metrics.label]] for it.",
+            "run {run}"
+        );
+        assert!(!out.exists(), "a refused export writes no file");
+    }
 }
 
 /// A sample whose timestamp is not a whole number of the mapping's `ts_unit`
@@ -989,8 +1040,8 @@ column = "host_col"
     assert_eq!(
         err,
         format!(
-            "a sample of series cpu{{host=\"h1\", job=\"api\"}} is at {} ns, which is not a whole \
-             number of millis (the mapping's ts_unit); writing it in millis would move it onto a \
+            "export --signal metrics refused on 1 series; first: a sample of series \
+             cpu{{host=\"h1\", job=\"api\"}} is at {} ns, which is not a whole number of millis (the mapping's ts_unit); writing it in millis would move it onto a \
              different timestamp. Export with a finer ts_unit.",
             T0 + 1
         )

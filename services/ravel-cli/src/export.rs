@@ -71,10 +71,10 @@
 //!
 //! # Metrics: duplicates and series identity
 //!
-//! The query path serves one sample per `(series, ts)`: the candidate with the
-//! greatest `(created_unix_ns, writer_epoch, writer_seq, in_page_index)`
-//! provenance, ties broken by the greatest `f64::to_bits` of the value
-//! (docs/catalog-and-mvcc.md). The export writes exactly that sample and
+//! The query path serves one sample per `(series, ts)`, chosen by
+//! [`ravel_query::serves_over`]; the export orders its candidates with
+//! [`ravel_query::DedupKey::serve_cmp`], the comparison that function is built
+//! on, so it cannot pick a different one. The export writes exactly that sample and
 //! counts every other candidate as `samples_deduplicated`, so two loads of one
 //! sample export as one row whatever their bit patterns.
 //!
@@ -98,7 +98,7 @@
 //! ([`HISTOGRAM_MAPPING_REFUSAL`]): export the exploded series with a scalar
 //! mapping instead.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -119,7 +119,7 @@ use ravel_query::erasure::{
     retain_histogram_series, retain_series_soa, retain_unerased_log_records,
     snapshot_pending_erasure_predicates,
 };
-use ravel_query::{FetchedSeriesSoa, LogQuery, LogSegmentFetcher, SegmentFetcher};
+use ravel_query::{DedupKey, FetchedSeriesSoa, LogQuery, LogSegmentFetcher, SegmentFetcher};
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::{LabelSet, METRIC_NAME_LABEL, SeriesId, Signal, TenantHash, TenantId, TimeRange};
 
@@ -566,6 +566,7 @@ pub async fn export_metrics(
     let factor = mapping.ts_unit.factor();
     let mut samples_deduplicated = 0u64;
     let mut series_out: Vec<OutputSeries> = Vec::new();
+    let mut refusals = SeriesRefusals::default();
     for (series_id, candidates) in by_series {
         if candidates.samples.is_empty() {
             continue;
@@ -574,43 +575,62 @@ pub async fn export_metrics(
             skipped.insert(series_id);
             continue;
         }
-        let stored_name = candidates.labels.get(METRIC_NAME_LABEL).ok_or_else(|| {
-            anyhow::anyhow!(
-                "series {} carries no {METRIC_NAME_LABEL} label, so no mapping can name it",
-                describe_series(&candidates.labels)
-            )
-        })?;
-        let written_name = match literal_family_name {
-            Some(_) => None,
-            None => Some(
-                written_metric_name(stored_name, mapping, &limits)
-                    .ok_or_else(|| unwritable_name(&candidates.labels, mapping, &limits))?,
-            ),
+        let labels = &candidates.labels;
+        let sort_key: SeriesSortKey = labels
+            .iter()
+            .map(|l| (l.name.clone(), l.value.clone()))
+            .collect();
+        let written_name = match (labels.get(METRIC_NAME_LABEL), &literal_family_name) {
+            (None, _) => {
+                refusals.add(
+                    Refusal::NoMetricName,
+                    &sort_key,
+                    format!(
+                        "series {} carries no {METRIC_NAME_LABEL} label, so no mapping can name it",
+                        describe_series(labels)
+                    ),
+                );
+                None
+            }
+            (Some(_), Some(_)) => None,
+            (Some(stored_name), None) => {
+                let written = written_metric_name(stored_name, mapping, &limits);
+                if written.is_none() {
+                    refusals.add(
+                        Refusal::UnwritableName,
+                        &sort_key,
+                        unwritable_name(labels, mapping, &limits),
+                    );
+                }
+                written
+            }
         };
-        let label_values = mapped_label_values(&candidates.labels, mapping, &label_index)?;
+        let label_values =
+            mapped_label_values(labels, mapping, &label_index, &sort_key, &mut refusals);
         let (samples, dropped) = resolve_duplicates(candidates.samples);
         samples_deduplicated += dropped;
         if let Some((ts_ns, _)) = samples.iter().find(|(ts_ns, _)| ts_ns % factor != 0) {
-            anyhow::bail!(
-                "a sample of series {} is at {ts_ns} ns, which is not a whole number of {} (the \
-                 mapping's ts_unit); writing it in {} would move it onto a different timestamp. \
-                 Export with a finer ts_unit.",
-                describe_series(&candidates.labels),
-                mapping.ts_unit.as_str(),
-                mapping.ts_unit.as_str()
+            refusals.add(
+                Refusal::SubUnitTimestamp,
+                &sort_key,
+                format!(
+                    "a sample of series {} is at {ts_ns} ns, which is not a whole number of {} \
+                     (the mapping's ts_unit); writing it in {} would move it onto a different \
+                     timestamp. Export with a finer ts_unit.",
+                    describe_series(labels),
+                    mapping.ts_unit.as_str(),
+                    mapping.ts_unit.as_str()
+                ),
             );
         }
         series_out.push(OutputSeries {
-            sort_key: candidates
-                .labels
-                .iter()
-                .map(|l| (l.name.clone(), l.value.clone()))
-                .collect(),
+            sort_key,
             written_name,
             label_values,
             samples,
         });
     }
+    refusals.into_result()?;
     // Rows sort by event time, then by label set, so the file is the same for
     // the same store contents whatever order the segments were fetched in.
     series_out.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
@@ -655,11 +675,10 @@ pub async fn export_metrics(
 }
 
 /// One in-window sample of a series before duplicate resolution, with the
-/// provenance key the query path's merge orders duplicates by.
+/// key the query path's merge orders duplicates by.
 struct SampleCandidate {
     ts_ns: i64,
-    priority: (i64, u64, u64, u32),
-    value: f64,
+    key: DedupKey,
 }
 
 /// Every in-window candidate sample of one series, across all the runs and
@@ -669,12 +688,16 @@ struct SeriesCandidates {
     samples: Vec<SampleCandidate>,
 }
 
+/// A series' full label set as `(name, value)` pairs, `__name__` included, in
+/// label-name order: the order the output file lists series in.
+type SeriesSortKey = Vec<(String, String)>;
+
 /// One series as it is written: the name for the `name_column` (`None` under a
 /// `name` literal), one value per `[[metrics.label]]` in mapping order (`None`
 /// writes a null, which the load reads as an absent label), and the
 /// deduplicated `(ts_ns, value)` samples in ascending `ts_ns`.
 struct OutputSeries {
-    sort_key: Vec<(String, String)>,
+    sort_key: SeriesSortKey,
     written_name: Option<String>,
     label_values: Vec<Option<String>>,
     samples: Vec<(i64, f64)>,
@@ -726,41 +749,45 @@ fn collect_run(
         if !in_export_window(ts_ns, start_ns, end_ns) {
             continue;
         }
-        let priority = match run
+        let key = match run
             .per_sample_priorities
             .as_ref()
             .and_then(|column| column.get(pos))
         {
-            Some(priority) => priority.as_tuple(),
-            None => (
+            Some(priority) => DedupKey::from_parts(
+                priority.created_unix_ns,
+                priority.writer_epoch,
+                priority.writer_seq,
+                priority.in_page_index,
+                value,
+            ),
+            None => DedupKey::from_parts(
                 run.created_unix_ns,
                 run.writer_epoch,
                 run.writer_seq,
                 u32::try_from(pos).unwrap_or(u32::MAX),
+                value,
             ),
         };
-        entry.samples.push(SampleCandidate {
-            ts_ns,
-            priority,
-            value,
-        });
+        entry.samples.push(SampleCandidate { ts_ns, key });
     }
     Ok(())
 }
 
 /// Resolves duplicate timestamps the way the query path's merge does: at each
-/// `ts`, the candidate with the greatest `(priority, value.to_bits())` wins.
-/// Returns the winners in ascending `ts` and the number of candidates dropped.
+/// `ts`, the candidate [`DedupKey::serve_cmp`] orders greatest wins. Returns
+/// the winners in ascending `ts` and the number of candidates dropped.
 fn resolve_duplicates(mut samples: Vec<SampleCandidate>) -> (Vec<(i64, f64)>, u64) {
-    samples.sort_by_key(|c| (c.ts_ns, c.priority, c.value.to_bits()));
+    samples.sort_by(|a, b| a.ts_ns.cmp(&b.ts_ns).then(a.key.serve_cmp(&b.key)));
     let total = samples.len();
     let mut winners: Vec<(i64, f64)> = Vec::with_capacity(total);
     for candidate in samples {
-        // Ascending order puts the greatest candidate of a timestamp last, so
+        // Ascending order puts the served candidate of a timestamp last, so
         // the last one seen replaces every earlier one.
+        let sample = (candidate.ts_ns, f64::from_bits(candidate.key.value_bits));
         match winners.last_mut() {
-            Some(last) if last.0 == candidate.ts_ns => *last = (candidate.ts_ns, candidate.value),
-            _ => winners.push((candidate.ts_ns, candidate.value)),
+            Some(last) if last.0 == candidate.ts_ns => *last = sample,
+            _ => winners.push(sample),
         }
     }
     let dropped = (total - winners.len()) as u64;
@@ -809,11 +836,7 @@ fn written_metric_name(
 
 /// The refusal for a series whose stored name no `name_column` value loads
 /// back as.
-fn unwritable_name(
-    labels: &LabelSet,
-    mapping: &MetricsMapping,
-    limits: &IngestLimits,
-) -> anyhow::Error {
+fn unwritable_name(labels: &LabelSet, mapping: &MetricsMapping, limits: &IngestLimits) -> String {
     let stored = labels.get(METRIC_NAME_LABEL).unwrap_or_default();
     let kind = if mapping.metric_kind().1 {
         "counter"
@@ -824,7 +847,7 @@ fn unwritable_name(
         Some(name) => format!("names it {name:?}"),
         None => "refuses it".to_string(),
     };
-    anyhow::anyhow!(
+    format!(
         "series {} cannot be exported under this mapping: no name_column value loads back as \
          {stored:?} with unit = {:?} and kind = {kind:?} (written as {stored:?}, a load \
          {as_written}), so the exported file would re-load onto a different series. Export it \
@@ -836,41 +859,106 @@ fn unwritable_name(
 }
 
 /// One output value per `[[metrics.label]]`, in mapping order, for a series'
-/// stored labels. Refuses a stored label the mapping does not name, and a
-/// stored empty value, since the load drops both and would land the samples on
-/// a different series.
+/// stored labels. Records a refusal for the first stored label the mapping
+/// does not name and the first stored empty value, since the load drops both
+/// and would land the samples on a different series.
 fn mapped_label_values(
     labels: &LabelSet,
     mapping: &MetricsMapping,
     label_index: &HashMap<String, usize>,
-) -> anyhow::Result<Vec<Option<String>>> {
+    sort_key: &[(String, String)],
+    refusals: &mut SeriesRefusals,
+) -> Vec<Option<String>> {
     let mut values: Vec<Option<String>> = vec![None; mapping.labels.len()];
+    let mut unmapped = false;
+    let mut empty = false;
     for label in labels.iter() {
         if label.name == METRIC_NAME_LABEL {
             continue;
         }
         let Some(&i) = label_index.get(label.name.as_str()) else {
-            anyhow::bail!(
-                "series {} carries the label {:?}, which no [[metrics.label]] in the mapping \
-                 names; a load of the exported file would drop it and land the samples on a \
-                 different series. Add a [[metrics.label]] for it.",
-                describe_series(labels),
-                label.name
-            );
+            if !unmapped {
+                unmapped = true;
+                refusals.add(
+                    Refusal::UnmappedLabel,
+                    sort_key,
+                    format!(
+                        "series {} carries the label {:?}, which no [[metrics.label]] in the \
+                         mapping names; a load of the exported file would drop it and land the \
+                         samples on a different series. Add a [[metrics.label]] for it.",
+                        describe_series(labels),
+                        label.name
+                    ),
+                );
+            }
+            continue;
         };
         if label.value.is_empty() {
-            anyhow::bail!(
-                "series {} carries the label {:?} with an empty value, which a load drops, so the \
-                 exported file would re-load onto a different series",
-                describe_series(labels),
-                label.name
-            );
+            if !empty {
+                empty = true;
+                refusals.add(
+                    Refusal::EmptyLabelValue,
+                    sort_key,
+                    format!(
+                        "series {} carries the label {:?} with an empty value, which a load \
+                         drops, so the exported file would re-load onto a different series",
+                        describe_series(labels),
+                        label.name
+                    ),
+                );
+            }
+            continue;
         }
         if let Some(slot) = values.get_mut(i) {
             *slot = Some(label.value.clone());
         }
     }
-    Ok(values)
+    values
+}
+
+/// Why a series cannot be written. The declaration order is the order the
+/// kinds are reported in when several apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Refusal {
+    NoMetricName,
+    UnwritableName,
+    UnmappedLabel,
+    EmptyLabelValue,
+    SubUnitTimestamp,
+}
+
+/// Every per-series refusal of one export, gathered so the one reported does
+/// not depend on the order the series were visited in.
+#[derive(Default)]
+struct SeriesRefusals {
+    /// Per kind, each offending series' output sort key and its message.
+    by_kind: BTreeMap<Refusal, Vec<(SeriesSortKey, String)>>,
+}
+
+impl SeriesRefusals {
+    /// Records one series under `kind`; a caller adds a series at most once
+    /// per kind.
+    fn add(&mut self, kind: Refusal, sort_key: &[(String, String)], message: String) {
+        self.by_kind
+            .entry(kind)
+            .or_default()
+            .push((sort_key.to_vec(), message));
+    }
+
+    /// Refuses on the first kind any series hit, naming the first offender in
+    /// the output file's series order and how many series that kind covers.
+    fn into_result(self) -> anyhow::Result<()> {
+        let Some((_, offenders)) = self.by_kind.into_iter().next() else {
+            return Ok(());
+        };
+        let count = offenders.len();
+        match offenders.into_iter().min_by(|a, b| a.0.cmp(&b.0)) {
+            Some((_, message)) => {
+                anyhow::bail!("export --signal metrics refused on {count} series; first: {message}")
+            }
+            None => Ok(()),
+        }
+    }
 }
 
 /// `name{label="value", ...}` for a refusal message.
@@ -1706,5 +1794,58 @@ mod tests {
             .expect("span_id is FixedSizeBinary");
         assert_eq!(span.value(0), [0xCD; 8]);
         assert!(span.is_null(1));
+    }
+
+    /// One scalar run of series `cpu` holding a single sample.
+    fn one_sample_run(
+        ts_ns: i64,
+        value: f64,
+        writer_epoch: u64,
+        writer_seq: u64,
+    ) -> FetchedSeriesSoa {
+        FetchedSeriesSoa {
+            series_id: SeriesId([7; 16]),
+            labels: LabelSet::new(vec![ravel_types::Label {
+                name: METRIC_NAME_LABEL.to_string(),
+                value: "cpu".to_string(),
+            }])
+            .expect("label set"),
+            timestamps: vec![ts_ns],
+            values: vec![value],
+            created_unix_ns: 5,
+            writer_epoch,
+            writer_seq,
+            per_sample_priorities: None,
+        }
+    }
+
+    /// Two duplicates at one ts that differ only in writer_epoch and
+    /// writer_seq: the higher epoch wins although its seq is lower, so a key
+    /// that transposed the two fields would keep the other value.
+    #[test]
+    fn a_higher_writer_epoch_wins_over_a_higher_writer_seq() {
+        for runs in [[(1, 9, 1.0), (2, 3, 2.0)], [(2, 3, 2.0), (1, 9, 1.0)]] {
+            let mut by_series = HashMap::new();
+            for (epoch, seq, value) in runs {
+                collect_run(
+                    &mut by_series,
+                    one_sample_run(100, value, epoch, seq),
+                    0,
+                    200,
+                )
+                .expect("run collects");
+            }
+            let candidates = by_series.remove(&SeriesId([7; 16])).expect("one series");
+            let (samples, dropped) = resolve_duplicates(candidates.samples);
+            assert_eq!(dropped, 1);
+            assert_eq!(
+                samples
+                    .iter()
+                    .map(|(ts, v)| (*ts, v.to_bits()))
+                    .collect::<Vec<_>>(),
+                vec![(100, 2.0f64.to_bits())],
+                "the epoch-2 write is served"
+            );
+        }
     }
 }
