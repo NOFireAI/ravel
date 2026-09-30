@@ -491,7 +491,10 @@ impl ParquetFileReaderFactory for PinnedReaderFactory {
         let location = partitioned_file.object_meta.location.as_ref();
         self.index_of(location)
             .and_then(|index| self.reader(index))
-            .map(|reader| Box::new(reader) as Box<dyn AsyncFileReader + Send>)
+            .map(|reader| {
+                crate::boundary::record_opened(reader.file.key_str());
+                Box::new(reader) as Box<dyn AsyncFileReader + Send>
+            })
             .ok_or_else(|| {
                 DataFusionError::Execution(format!(
                     "{location} is not a file of Parquet table {} version {}",
