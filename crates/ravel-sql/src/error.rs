@@ -32,7 +32,7 @@
 //! errors (which carry only counts and limits an operator needs).
 
 use datafusion::error::DataFusionError;
-use ravel_catalog::{CatalogError, LoadColumnStatsError, SnapshotFormatError};
+use ravel_catalog::{CatalogError, HEAD_FORMAT_VERSION, LoadColumnStatsError, SnapshotFormatError};
 use ravel_commit::erasure::ErasureError;
 use ravel_commit::record::RecordError;
 use ravel_cpu_gate::CpuGateError;
@@ -646,15 +646,17 @@ impl SqlError {
 ///   same on every build), `RewriteSupersessionCycle`, and
 ///   `CompactionSupersessionInputMismatch`. `ColumnStatsPartOverBound` is here
 ///   too: the ceiling is a fixed format constant, so every node refuses the same
-///   part. A version below the supported minimum (a writer that left proto3's
-///   default 0) is corrupt as well: no build reads it.
-/// - A version above the highest this build reads is retryable
+///   part. A version or enum value below the supported minimum (a writer that
+///   left proto3's default 0) is corrupt as well: no build reads it.
+/// - A version or enum value above the highest this build reads is retryable
 ///   ([`MSG_UNAVAILABLE`], `ErrorClass::Unavailable`, 503): during a rolling
-///   upgrade a peer on a newer build can read it. That is `UnsupportedHeadVersion`,
-///   every case [`SnapshotFormatError::is_newer_format_version`] reports, and
-///   the above-maximum unsupported-version case of the record inside `Record` and
-///   `CompactionRecordDecode` and of the erasure object inside
-///   `ErasureRequestDecode` and `RewriteRecordDecode`.
+///   upgrade a peer on a newer build can read it. That is an
+///   `UnsupportedHeadVersion` above [`HEAD_FORMAT_VERSION`], every case
+///   [`SnapshotFormatError::is_newer_format_version`] reports, the
+///   above-maximum unsupported-version case of the record inside `Record` and
+///   `CompactionRecordDecode`, and every case
+///   [`ErasureError::is_newer_format_version`] reports for the erasure object
+///   inside `ErasureRequestDecode` and `RewriteRecordDecode`.
 /// - Transient storage faults and fold-progress/liveness failures stay
 ///   retryable, as does a `SnapshotFormat` decode job the read CPU gate
 ///   cancelled or refused while closed; a panicked decode job is corrupt.
@@ -686,7 +688,14 @@ fn redact_catalog(err: &CatalogError) -> &'static str {
 
         // A newer on-object format version this build cannot read: a peer on a
         // newer build can during a rolling upgrade, so it is retryable. 503.
-        CatalogError::UnsupportedHeadVersion { .. } => MSG_UNAVAILABLE,
+        // A HEAD below the floor is corrupt. 500.
+        CatalogError::UnsupportedHeadVersion { format_version } => {
+            if *format_version > HEAD_FORMAT_VERSION {
+                MSG_UNAVAILABLE
+            } else {
+                MSG_CORRUPT
+            }
+        }
 
         // Echoed verbatim by `client_message` before it reaches here; matched
         // only for exhaustiveness.
@@ -718,14 +727,13 @@ fn redact_record(err: &RecordError) -> &'static str {
     }
 }
 
-/// An erasure request or rewrite record: retryable only for a format version
-/// above the highest this build reads.
+/// An erasure request or rewrite record: retryable only for a format version,
+/// signal or deferral cause above the highest this build reads.
 fn redact_erasure(err: &ErasureError) -> &'static str {
-    match err {
-        ErasureError::UnsupportedFormatVersion { expected, actual } if actual > expected => {
-            MSG_UNAVAILABLE
-        }
-        _ => MSG_CORRUPT,
+    if err.is_newer_format_version() {
+        MSG_UNAVAILABLE
+    } else {
+        MSG_CORRUPT
     }
 }
 
@@ -1002,13 +1010,15 @@ mod tests {
     /// version a peer can read: 500 for every version kind, record, erasure
     /// object and snapshot format alike.
     ///
-    /// FLIP: drop the `if actual > expected` guard in `redact_record` and the
-    /// first case answers `left: "upstream storage temporarily unavailable"`,
+    /// FLIP: answer every `UnsupportedHeadVersion` with `MSG_UNAVAILABLE` in
+    /// `redact_catalog` and the first case fails with
+    /// `left: "upstream storage temporarily unavailable"`,
     /// `right: "stored data failed integrity validation"`.
     #[test]
     fn below_floor_versions_are_corrupt_not_retryable() {
         let key = || LEAKY_KEY.to_string();
         let below_floor = [
+            SqlError::Catalog(CatalogError::UnsupportedHeadVersion { format_version: 0 }),
             SqlError::Catalog(CatalogError::CompactionRecordDecode {
                 key: key(),
                 source: RecordError::UnsupportedFormatVersion {
@@ -1063,6 +1073,66 @@ mod tests {
             }),
         ];
         for err in &below_floor {
+            assert_eq!(err.client_message(), MSG_CORRUPT, "{err}");
+            assert_eq!(err.class(), ErrorClass::Internal, "{err}");
+            assert_redacted(&err.client_message());
+        }
+    }
+
+    /// An enum value above the highest this build reads is retryable, because
+    /// a new value can ship without a format version bump and a peer on a
+    /// newer build can read it; 0, proto3's default and an unstamped field, is
+    /// corrupt. One case each for the entry level, the column declared type,
+    /// the erasure signal and the deferral cause, under both erasure wrappers.
+    /// The PromQL boundary pins the same split.
+    ///
+    /// FLIP: classify `ColumnStatsUnknownDeclaredType` as never newer and the
+    /// declared-type case fails with
+    /// `left: "stored data failed integrity validation"`,
+    /// `right: "upstream storage temporarily unavailable"`.
+    #[test]
+    fn unknown_enum_values_above_the_maximum_are_unavailable_zero_is_corrupt() {
+        let key = || LEAKY_KEY.to_string();
+        let snapshot =
+            |err: SnapshotFormatError| SqlError::Catalog(CatalogError::SnapshotFormat(err));
+        let declared = |declared_type: u32| {
+            snapshot(SnapshotFormatError::ColumnStatsUnknownDeclaredType {
+                name: "c".to_string(),
+                declared_type,
+            })
+        };
+        let erasure = |source: fn() -> ErasureError| {
+            [
+                SqlError::Catalog(CatalogError::ErasureRequestDecode {
+                    key: key(),
+                    source: source(),
+                }),
+                SqlError::Catalog(CatalogError::RewriteRecordDecode {
+                    key: key(),
+                    source: source(),
+                }),
+            ]
+        };
+
+        let mut unavailable = vec![
+            snapshot(SnapshotFormatError::UnsupportedLevel(2)),
+            declared(5),
+        ];
+        unavailable.extend(erasure(|| ErasureError::UnknownSignal(7)));
+        unavailable.extend(erasure(|| ErasureError::UnknownDeferralCause(2)));
+        for err in &unavailable {
+            assert_eq!(err.client_message(), MSG_UNAVAILABLE, "{err}");
+            assert_eq!(err.class(), ErrorClass::Unavailable, "{err}");
+            assert_redacted(&err.client_message());
+        }
+
+        let mut corrupt = vec![
+            snapshot(SnapshotFormatError::UnsupportedLevel(0)),
+            declared(0),
+        ];
+        corrupt.extend(erasure(|| ErasureError::UnknownSignal(0)));
+        corrupt.extend(erasure(|| ErasureError::UnknownDeferralCause(0)));
+        for err in &corrupt {
             assert_eq!(err.client_message(), MSG_CORRUPT, "{err}");
             assert_eq!(err.class(), ErrorClass::Internal, "{err}");
             assert_redacted(&err.client_message());

@@ -107,6 +107,54 @@ pub enum ErasureError {
     Decode(#[from] prost::DecodeError),
 }
 
+/// The highest `ravel.commit.v1.Signal` value this build reads.
+const MAX_SIGNAL: i32 = ravel_proto::commit::v1::Signal::Audit as i32;
+
+/// The highest `ErasureDeferralCause` value this build reads.
+const MAX_DEFERRAL_CAUSE: i32 = ErasureDeferralCause::LegalHold as i32;
+
+impl ErasureError {
+    /// True when the record carries a format version, or a signal or deferral
+    /// cause enum value, above the highest this build reads: a peer on a newer
+    /// build can read it during a rolling upgrade, so a query surface answers
+    /// it as retryable. A new enum value can ship without a format version
+    /// bump, so it counts the same as a newer version. A version or value at
+    /// or below the supported minimum (proto3's default 0, an unstamped field,
+    /// or a negative value) is false, like every other variant: it is a fault
+    /// in immutable stored bytes that no build reads.
+    ///
+    /// Every variant is named, so a new one fails to compile until it is
+    /// classified here.
+    pub fn is_newer_format_version(&self) -> bool {
+        match self {
+            ErasureError::UnsupportedFormatVersion { expected, actual } => actual > expected,
+            ErasureError::UnknownSignal(value) => *value > MAX_SIGNAL,
+            ErasureError::UnknownDeferralCause(value) => *value > MAX_DEFERRAL_CAUSE,
+
+            ErasureError::InvalidTenantHashLen(_)
+            | ErasureError::InvalidRequestId(_)
+            | ErasureError::EmptyPredicate
+            | ErasureError::EmptyPredicateMatcherKey
+            | ErasureError::WindowOutOfOrder { .. }
+            | ErasureError::InvalidPredicateHashLen(_)
+            | ErasureError::TimestampsOutOfOrder { .. }
+            | ErasureError::InvalidInputSetHashLen(_)
+            | ErasureError::BothInputsAndSuperseded
+            | ErasureError::NeitherInputsNorSuperseded
+            | ErasureError::InputSetHashMismatch
+            | ErasureError::InvalidSupersededRecordKey(_)
+            | ErasureError::NonCanonicalSupersededRecordKey(_)
+            | ErasureError::SupersededRecordKeyBucketMismatch { .. }
+            | ErasureError::DuplicateAppliedRequestId(_)
+            | ErasureError::InputsNotSorted { .. }
+            | ErasureError::BucketDropSignalMismatch { .. }
+            | ErasureError::EmptyDrops
+            | ErasureError::InvalidPartContentHashLen(_)
+            | ErasureError::Decode(_) => false,
+        }
+    }
+}
+
 fn check_tenant_hash(bytes: &[u8]) -> Result<(), ErasureError> {
     if bytes.len() == 16 {
         Ok(())
@@ -1565,5 +1613,57 @@ mod tests {
 
     fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// `MAX_SIGNAL` and `MAX_DEFERRAL_CAUSE` are the highest values the
+    /// validators accept: the value itself passes and the next one is refused.
+    #[test]
+    fn enum_maxima_match_the_validators() {
+        assert_eq!(check_signal(MAX_SIGNAL), Ok(()));
+        assert_eq!(
+            check_signal(MAX_SIGNAL + 1),
+            Err(ErasureError::UnknownSignal(MAX_SIGNAL + 1))
+        );
+        let completion = |deferral_cause| ErasureCompletion {
+            deferral_cause,
+            ..valid_completion()
+        };
+        assert_eq!(validate_completion(&completion(MAX_DEFERRAL_CAUSE)), Ok(()));
+        assert_eq!(
+            validate_completion(&completion(MAX_DEFERRAL_CAUSE + 1)),
+            Err(ErasureError::UnknownDeferralCause(MAX_DEFERRAL_CAUSE + 1))
+        );
+    }
+
+    /// A version or enum value above the highest this build reads is newer; 0
+    /// (an unstamped field) and a negative value are not.
+    #[test]
+    fn only_values_above_the_supported_maximum_are_newer() {
+        let newer = [
+            ErasureError::UnsupportedFormatVersion {
+                expected: FORMAT_VERSION,
+                actual: FORMAT_VERSION + 1,
+            },
+            ErasureError::UnknownSignal(MAX_SIGNAL + 1),
+            ErasureError::UnknownDeferralCause(MAX_DEFERRAL_CAUSE + 1),
+        ];
+        for err in &newer {
+            assert!(err.is_newer_format_version(), "{err:?}");
+        }
+
+        let not_newer = [
+            ErasureError::UnsupportedFormatVersion {
+                expected: FORMAT_VERSION,
+                actual: 0,
+            },
+            ErasureError::UnknownSignal(0),
+            ErasureError::UnknownSignal(-1),
+            ErasureError::UnknownDeferralCause(0),
+            ErasureError::UnknownDeferralCause(-1),
+            ErasureError::InvalidTenantHashLen(3),
+        ];
+        for err in &not_newer {
+            assert!(!err.is_newer_format_version(), "{err:?}");
+        }
     }
 }

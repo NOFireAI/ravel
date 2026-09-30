@@ -13,7 +13,7 @@
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use ravel_catalog::{CatalogError, SnapshotFormatError};
+use ravel_catalog::{CatalogError, HEAD_FORMAT_VERSION, SnapshotFormatError};
 use ravel_commit::erasure::ErasureError;
 use ravel_commit::record::RecordError;
 use ravel_cpu_gate::CpuGateError;
@@ -193,12 +193,12 @@ impl From<QueryError> for ApiError {
 ///
 /// The catalog arm follows the same rule the SQL boundary's `redact_catalog`
 /// does, so both surfaces answer the same fault the same way: a fault in stored
-/// bytes whose format version this build covers, a version below the supported
-/// minimum included, is corrupt (500, non-retryable), while a catalog object
-/// written in a format version above the highest this build reads stays
-/// unavailable (503, retryable), because a peer on a newer build can read it
-/// during a rolling upgrade. Every catalog variant is named (no wildcard) so a
-/// new one fails to compile until it is classified.
+/// bytes whose format version this build covers, a version or enum value below
+/// the supported minimum included, is corrupt (500, non-retryable), while a
+/// catalog object carrying a format version or enum value above the highest
+/// this build reads stays unavailable (503, retryable), because a peer on a
+/// newer build can read it during a rolling upgrade. Every catalog variant is
+/// named (no wildcard) so a new one fails to compile until it is classified.
 fn redacted_storage_message(err: &QueryError) -> Option<&'static str> {
     match err {
         QueryError::Fetch(fetch) => Some(match fetch {
@@ -251,8 +251,14 @@ fn redacted_storage_message(err: &QueryError) -> Option<&'static str> {
 
             // A newer on-object format version this build cannot read is
             // retryable: a peer on a newer build can read it during a rolling
-            // upgrade. 503.
-            CatalogError::UnsupportedHeadVersion { .. } => MSG_UNAVAILABLE,
+            // upgrade. 503. A HEAD below the floor is corrupt. 500.
+            CatalogError::UnsupportedHeadVersion { format_version } => {
+                if *format_version > HEAD_FORMAT_VERSION {
+                    MSG_UNAVAILABLE
+                } else {
+                    MSG_CORRUPT
+                }
+            }
 
             // Never reached: the outer arm returns None for WindowTooWide.
             // Matched only for exhaustiveness.
@@ -287,14 +293,13 @@ fn redacted_record_message(err: &RecordError) -> &'static str {
     }
 }
 
-/// An erasure request or rewrite record: retryable only for a format version
-/// above the highest this build reads.
+/// An erasure request or rewrite record: retryable only for a format version,
+/// signal or deferral cause above the highest this build reads.
 fn redacted_erasure_message(err: &ErasureError) -> &'static str {
-    match err {
-        ErasureError::UnsupportedFormatVersion { expected, actual } if actual > expected => {
-            MSG_UNAVAILABLE
-        }
-        _ => MSG_CORRUPT,
+    if err.is_newer_format_version() {
+        MSG_UNAVAILABLE
+    } else {
+        MSG_CORRUPT
     }
 }
 
@@ -695,12 +700,13 @@ mod tests {
     /// version a peer can read: 500 for every version kind, record, erasure
     /// object and snapshot format alike. The SQL boundary pins the same cases.
     ///
-    /// FLIP: drop the `if actual > expected` guard in `redacted_erasure_message`
-    /// and the erasure-request case fails with `left: 503`, `right: 500`.
+    /// FLIP: answer every `UnsupportedHeadVersion` with `MSG_UNAVAILABLE` and
+    /// the first case fails with `left: 503`, `right: 500`.
     #[test]
     fn below_floor_versions_are_500_not_503() {
         assert_catalog_status(
             &[
+                || CatalogError::UnsupportedHeadVersion { format_version: 0 },
                 || CatalogError::CompactionRecordDecode {
                     key: LEAKY_KEY.to_string(),
                     source: RecordError::UnsupportedFormatVersion {
@@ -744,6 +750,79 @@ mod tests {
                     CatalogError::SnapshotFormat(
                         SnapshotFormatError::ColumnStatsUnsupportedVersion(0),
                     )
+                },
+            ],
+            500,
+        );
+    }
+
+    /// An enum value above the highest this build reads is the retryable 503,
+    /// because a new value can ship without a format version bump and a peer
+    /// on a newer build can read it; 0, proto3's default and an unstamped
+    /// field, is the non-retryable 500. One case each for the entry level, the
+    /// column declared type, the erasure signal and the deferral cause, under
+    /// both erasure wrappers. The SQL boundary pins the same cases.
+    ///
+    /// FLIP: classify `ErasureError::UnknownSignal` as never newer and the
+    /// first erasure-request case fails with `left: 500`, `right: 503`.
+    #[test]
+    fn unknown_enum_values_above_the_maximum_are_503_zero_is_500() {
+        assert_catalog_status(
+            &[
+                || CatalogError::SnapshotFormat(SnapshotFormatError::UnsupportedLevel(2)),
+                || {
+                    CatalogError::SnapshotFormat(
+                        SnapshotFormatError::ColumnStatsUnknownDeclaredType {
+                            name: "c".to_string(),
+                            declared_type: 5,
+                        },
+                    )
+                },
+                || CatalogError::ErasureRequestDecode {
+                    key: LEAKY_KEY.to_string(),
+                    source: ErasureError::UnknownSignal(7),
+                },
+                || CatalogError::RewriteRecordDecode {
+                    key: LEAKY_KEY.to_string(),
+                    source: ErasureError::UnknownSignal(7),
+                },
+                || CatalogError::ErasureRequestDecode {
+                    key: LEAKY_KEY.to_string(),
+                    source: ErasureError::UnknownDeferralCause(2),
+                },
+                || CatalogError::RewriteRecordDecode {
+                    key: LEAKY_KEY.to_string(),
+                    source: ErasureError::UnknownDeferralCause(2),
+                },
+            ],
+            503,
+        );
+        assert_catalog_status(
+            &[
+                || CatalogError::SnapshotFormat(SnapshotFormatError::UnsupportedLevel(0)),
+                || {
+                    CatalogError::SnapshotFormat(
+                        SnapshotFormatError::ColumnStatsUnknownDeclaredType {
+                            name: "c".to_string(),
+                            declared_type: 0,
+                        },
+                    )
+                },
+                || CatalogError::ErasureRequestDecode {
+                    key: LEAKY_KEY.to_string(),
+                    source: ErasureError::UnknownSignal(0),
+                },
+                || CatalogError::RewriteRecordDecode {
+                    key: LEAKY_KEY.to_string(),
+                    source: ErasureError::UnknownSignal(0),
+                },
+                || CatalogError::ErasureRequestDecode {
+                    key: LEAKY_KEY.to_string(),
+                    source: ErasureError::UnknownDeferralCause(0),
+                },
+                || CatalogError::RewriteRecordDecode {
+                    key: LEAKY_KEY.to_string(),
+                    source: ErasureError::UnknownDeferralCause(0),
                 },
             ],
             500,

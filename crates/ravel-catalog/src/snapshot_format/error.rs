@@ -296,20 +296,24 @@ pub enum SnapshotFormatError {
 
 /// The highest `SnapshotEntry.level` `part.rs`'s entry validation accepts
 /// (0 is an L0 commit, 1 a compaction part).
-const MAX_ENTRY_LEVEL: u32 = 1;
+pub(super) const MAX_ENTRY_LEVEL: u32 = 1;
+
+/// The highest `ColumnStat.declared_type` tag `column_stats.rs`'s column
+/// validation accepts (1=Str, 2=I64, 3=Bool, 4=Bytes).
+const MAX_DECLARED_TYPE: u32 = 4;
 
 impl SnapshotFormatError {
-    /// True when the object carries a format version, or an entry level, above
-    /// the highest this build reads: a peer on a newer build can read it during
-    /// a rolling upgrade, so a query surface answers it as retryable. A version
-    /// below the supported minimum is false, like every other variant: it is a
-    /// fault in immutable stored bytes (a writer that left proto3's default 0),
-    /// and no build reads it.
+    /// True when the object carries a format version, an entry level, or a
+    /// column declared type above the highest this build reads: a peer on a
+    /// newer build can read it during a rolling upgrade, so a query surface
+    /// answers it as retryable. A version or value below the supported minimum
+    /// is false, like every other variant: it is a fault in immutable stored
+    /// bytes (a writer that left proto3's default 0), and no build reads it.
     ///
-    /// `UnsupportedLevel` counts as a newer version because a new entry field
-    /// has shipped without a part envelope or header version bump
-    /// (docs/catalog-and-mvcc.md, `declared_column_stats`), so a new level
-    /// cannot be assumed to bump the part version first. A header whose
+    /// `UnsupportedLevel` and `ColumnStatsUnknownDeclaredType` count as a newer
+    /// version because a new value can ship without an envelope or header
+    /// version bump (docs/catalog-and-mvcc.md, `declared_column_stats`), so it
+    /// cannot be assumed to bump the object version first. A header whose
     /// version disagrees with an envelope version this build accepts is a
     /// self-inconsistent object, not a newer one.
     ///
@@ -328,6 +332,9 @@ impl SnapshotFormatError {
                 COLUMN_STATS_ACCEPTED_READ_VERSIONS
                     .iter()
                     .all(|accepted| version > accepted)
+            }
+            SnapshotFormatError::ColumnStatsUnknownDeclaredType { declared_type, .. } => {
+                *declared_type > MAX_DECLARED_TYPE
             }
 
             SnapshotFormatError::TooSmall { .. }
@@ -401,7 +408,6 @@ impl SnapshotFormatError {
             | SnapshotFormatError::ColumnStatsV3PartBlake3CountMismatch(_)
             | SnapshotFormatError::ColumnStatsPartOverBound { .. }
             | SnapshotFormatError::ColumnStatsDuplicateColumnName { .. }
-            | SnapshotFormatError::ColumnStatsUnknownDeclaredType { .. }
             | SnapshotFormatError::ColumnStatsValueTypeMismatch { .. }
             | SnapshotFormatError::ColumnStatsDictEntryMissingValue { .. }
             | SnapshotFormatError::ColumnStatsDuplicateDictValue { .. }
@@ -441,6 +447,10 @@ mod tests {
             SnapshotFormatError::UnsupportedHeadVersion(HEAD_FORMAT_VERSION + 1),
             SnapshotFormatError::PostingsUnsupportedVersion(POSTINGS_VERSION + 1),
             SnapshotFormatError::ColumnStatsUnsupportedVersion(column_stats_max + 1),
+            SnapshotFormatError::ColumnStatsUnknownDeclaredType {
+                name: "c".to_string(),
+                declared_type: MAX_DECLARED_TYPE + 1,
+            },
         ];
         for err in &newer {
             assert!(err.is_newer_format_version(), "{err:?}");
@@ -453,6 +463,11 @@ mod tests {
             SnapshotFormatError::ColumnStatsUnsupportedVersion(0),
             // A retired whole-object version below the only accepted one.
             SnapshotFormatError::ColumnStatsUnsupportedVersion(column_stats_max - 1),
+            // An unstamped declared type (proto3's default 0).
+            SnapshotFormatError::ColumnStatsUnknownDeclaredType {
+                name: "c".to_string(),
+                declared_type: 0,
+            },
             SnapshotFormatError::HeaderVersionMismatch {
                 header: u32::from(VERSION) + 1,
                 envelope: VERSION,
@@ -463,5 +478,46 @@ mod tests {
         for err in &not_newer {
             assert!(!err.is_newer_format_version(), "{err:?}");
         }
+    }
+
+    /// `MAX_DECLARED_TYPE` is the highest tag the column validator accepts:
+    /// every tag from 1 up to it encodes, and the next one is refused as
+    /// unknown.
+    #[test]
+    fn max_declared_type_matches_the_column_validator() {
+        use ravel_proto::catalog::v1::{ColumnStat, ColumnStatsSegment};
+
+        let encode = |declared_type: u32| {
+            let segment = ColumnStatsSegment {
+                ingest_hour_bucket: 1,
+                shard: 0,
+                writer_id: vec![0xAA; 32],
+                writer_epoch: 1,
+                writer_seq: 1,
+                columns: vec![ColumnStat {
+                    name: "c".to_string(),
+                    declared_type,
+                    null_count: 1,
+                    ..ColumnStat::default()
+                }],
+            };
+            crate::snapshot_format::encode_column_stats_v3(
+                [0x11; 16],
+                1,
+                [0x22; 32],
+                &[segment],
+                crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES,
+            )
+        };
+        for declared_type in 1..=MAX_DECLARED_TYPE {
+            encode(declared_type).expect("a known declared type encodes");
+        }
+        assert_eq!(
+            encode(MAX_DECLARED_TYPE + 1),
+            Err(SnapshotFormatError::ColumnStatsUnknownDeclaredType {
+                name: "c".to_string(),
+                declared_type: MAX_DECLARED_TYPE + 1,
+            })
+        );
     }
 }

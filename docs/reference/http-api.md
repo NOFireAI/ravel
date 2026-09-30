@@ -152,22 +152,22 @@ For the query routes, the status codes come from one shared error mapping:
   corrupt segment, an unreconstructable or mismatched commit record, a catalog
   object (commit, compaction or rewrite record, erasure request, HEAD, snapshot
   part or postings) whose stored bytes fail to decode at a format version this
-  build covers or carry a format version below the lowest it supports, a
+  build covers, carry a format version below the lowest it supports, or leave
+  an enum field unset (proto3's default 0) where a value is required, a
   supersession chain of compaction or rewrite records that is cyclic, deeper
   than the resolver's fixed bound, or names a predecessor with a different
-  input set, a per-part column-statistics object the fold cannot fit under its
-  fixed ceiling, a catalog decode job that panicked, a non-monotonic run). It
-  is not retryable, and its message is fixed so no object key or tenant hash
+  input set, a catalog decode job that panicked, a non-monotonic run). It is
+  not retryable, and its message is fixed so no object key or tenant hash
   leaks.
 - 503 `unavailable`: a transient storage fault, an invalidated snapshot, a
   catalog object (commit, compaction or rewrite record, erasure request, HEAD,
-  snapshot part or postings) written in a format
-  version above the highest this build reads, or a snapshot part entry at a
-  level above the highest it reads (a peer on a newer build can read either,
-  during a rolling upgrade), a catalog
-  decode job the read CPU gate cancelled at shutdown, or an unsatisfiable
-  `min_commit_token`. Retryable. A column-statistics object this build cannot
-  decode answers no error: the query reads the data instead.
+  snapshot part or postings) written in a format version above the highest
+  this build reads, or carrying an enum value above the highest it reads (a
+  snapshot part entry level, or the signal of an erasure request or rewrite
+  record), which a peer on a newer build can read during a rolling upgrade, a
+  catalog decode job the read CPU gate cancelled at shutdown, or an
+  unsatisfiable `min_commit_token`. Retryable. A column-statistics object this
+  build cannot decode answers no error: the query reads the data instead.
 - 504 `timeout`: the query passed its deadline.
 - 401 `unauthorized`: no resolvable credential.
 

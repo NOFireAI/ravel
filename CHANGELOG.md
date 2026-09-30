@@ -505,20 +505,26 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   surfaces used to answer the retryable 503. So do a supersession chain that
   is cyclic, deeper than the resolver's fixed bound, or names a predecessor
   with a different input set (`RewriteSupersessionCycle`,
-  `RewriteSupersessionChainTooDeep`, `CompactionSupersessionInputMismatch`),
-  and a per-part column-statistics object the fold cannot fit under its fixed
-  ceiling (`ColumnStatsPartOverBound`): each is a property of stored records
-  or of a fixed constant, so no retry clears it. A catalog object written in
-  a format version above the highest this build reads
-  (`UnsupportedHeadVersion`, every case
-  `SnapshotFormatError::is_newer_format_version` reports, including a snapshot
-  part entry at a newer level, and the newer-version case of those record
-  decodes) stays a retryable 503 on both, because a peer on a newer build can
-  read it during a rolling upgrade. That includes a commit record
-  (`CatalogError::Record`), classified by its inner `RecordError` the way
-  `CompactionRecordDecode` is, and a HEAD read by the SQL column-statistics
-  loader. A version below the lowest this build supports, such as a record
-  stamped 0 by a writer that failed to set it, is corrupt: 500 on both. A
+  `RewriteSupersessionChainTooDeep`, `CompactionSupersessionInputMismatch`):
+  each is a property of stored records or of a fixed constant, so no retry
+  clears it. `ColumnStatsPartOverBound` is a fold-time refusal no query route
+  produces; both mappings class it corrupt too. A catalog object written in a
+  format version above the highest this build reads (an
+  `UnsupportedHeadVersion` above `HEAD_FORMAT_VERSION`, every case
+  `SnapshotFormatError::is_newer_format_version` reports, and the
+  newer-version case of those record decodes) stays a retryable 503 on both,
+  because a peer on a newer build can read it during a rolling upgrade. That
+  includes a commit record (`CatalogError::Record`), classified by its inner
+  `RecordError` the way `CompactionRecordDecode` is, and a HEAD read by the
+  SQL column-statistics loader. An enum value above the highest this build
+  knows answers the same 503, because a new value can ship without a format
+  version bump: a snapshot part entry level, a column-statistics declared
+  type, and an erasure signal or deferral cause, decided by
+  `SnapshotFormatError::is_newer_format_version` and
+  `ErasureError::is_newer_format_version`. A version below the lowest this
+  build supports, such as a record or HEAD stamped 0 by a writer that failed
+  to set it, is corrupt, as is an enum field left unset (proto3's default 0)
+  where a value is required: 500 on both. A
   catalog decode job the read CPU gate cancelled or closed before it ran stays
   503; one that panicked answers 500. Other store errors, timeouts,
   cancellation and admission refusals keep their classes.
