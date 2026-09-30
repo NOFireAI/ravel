@@ -1538,6 +1538,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   differs from the first file's; it also refuses a prefix with no file or
   more than 100,000 (`MAX_TABLE_FILES`), a listing whose raw delivery
   decreases, and a snapshot that outlives its deadline.
+- **Tenant resolution carries an optional `ddl` capability** (ADR-2040
+  decision 4, "Who may run DDL", issue #2238). Absent by default. A
+  `--tenant-token`/`--tenant-token-file` tenant ending in `;ddl` (the tenant
+  is the text before the last `;`) grants it for that token; any other
+  suffix, or an empty tenant before it, refuses startup. `--oidc-ddl-claim
+  <CLAIM>` grants it from a verified OIDC token when that claim is present
+  as the JSON boolean `true`. Nothing yet consumes the capability; it is
+  plumbing for `CREATE EXTERNAL TABLE` (#2054).
 
 ## [0.19.0] - 2026-09-27
 
