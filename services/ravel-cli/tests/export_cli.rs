@@ -12,9 +12,6 @@
 
 use std::process::Command;
 
-use ravel_cli::export::unsupported_signal_message;
-use ravel_cli::maintain::SignalArg;
-
 /// 2023-11-14T22:13:20Z, the instant `tests/export_logs.rs` builds its window
 /// around, in whole seconds so the nanosecond figure below is checkable by eye.
 const BASE_RFC3339: &str = "2023-11-14T22:13:20Z";
@@ -37,13 +34,22 @@ fn run(args: &[&str]) -> std::process::Output {
         .expect("ravel-cli runs")
 }
 
-/// `--signal spans` is refused by the binary, with the message that names the
-/// follow-up spans export waits on. A `Command::Export` variant wired to the
+/// `--signal spans` reaches the spans export through the binary: the
+/// `[spans]` section is parsed and a mapping writing two fields to one
+/// column gets the spans export's column refusal, which a logs parse of the
+/// same document never reaches. A `Command::Export` variant wired to the
 /// wrong argument fails here or in the metrics test below.
 #[test]
-fn export_signal_spans_is_refused_through_the_binary() {
+fn export_signal_spans_reaches_the_spans_export_through_the_binary() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let mapping = write_mapping(&dir);
+    let mapping = dir.path().join("mapping.toml");
+    std::fs::write(
+        &mapping,
+        "[spans]\ntrace_id_column = \"trace_id\"\nspan_id_column = \"span_id\"\n\
+         name_column = \"name\"\nstart_ts_column = \"start\"\nstart_ts_unit = \"nanos\"\n\
+         end_ts_column = \"end\"\nend_ts_unit = \"nanos\"\nstatus_message_column = \"name\"\n",
+    )
+    .expect("write mapping");
     let out = dir.path().join("out.parquet");
     let output = run(&[
         "--store",
@@ -65,15 +71,14 @@ fn export_signal_spans_is_refused_through_the_binary() {
 
     assert!(
         !output.status.success(),
-        "export --signal spans must exit non-zero"
+        "a duplicate output column must exit non-zero"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let expected = unsupported_signal_message(SignalArg::Spans)
-        .expect("spans is an unsupported export signal");
     assert_eq!(
         stderr.trim_end(),
-        format!("Error: {expected}"),
-        "the binary must print exactly the unsupported-signal refusal"
+        "Error: the mapping writes two different fields to the output column \"name\"; give \
+         each one its own column name",
+        "the binary must print exactly the spans export's column refusal"
     );
     assert!(
         !out.exists(),

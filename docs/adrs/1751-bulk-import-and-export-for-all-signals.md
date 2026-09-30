@@ -96,7 +96,8 @@ types across that boundary.
    exactly the mapped columns, sorted by event time, so
    `load(export(window))` round-trips every mapped field. An opt-in
    `attrs_map_column` carries the attributes the mapping does not name as
-   one map column. Metrics samples are deduplicated per `(series, ts)` by
+   one map column (not yet for spans; see the spans export amendment
+   below). Metrics samples are deduplicated per `(series, ts)` by
    bit pattern before writing, the rule the query path applies; logs and
    spans have no dedup and are exported as stored. (For metrics, which
    mapping shapes round-trip and how duplicates are resolved are settled by
@@ -261,3 +262,25 @@ carries in their rewritten form. Metrics export therefore narrows decision
 - A reloaded series lands in the target tenant, whose tenant hash enters
   its `SeriesId`, so the round trip preserves label sets and sample bits
   rather than the `SeriesId` value itself.
+
+## Amendment (2026-09-30): spans export carries mapped fields only
+
+<!-- amendment-applies: sections="Decision" pointer="spans export amendment" -->
+
+Decision 4's opt-in `attrs_map_column` is not available for spans yet: the
+`[spans]` mapping has no such key, on load or on export. Spans export
+therefore carries the mapped fields only, and narrows decision 4 as follows:
+
+- Every mapped field round-trips: the ids, the name, both timestamps in
+  their declared units, the status, and each mapped attribute. A span whose
+  mapped fields a load would not read back as stored is refused by name, and
+  no file is written.
+- The span fields RSPAN keeps under reserved attribute keys (span kind,
+  trace state, flags, events and links, which a span ingested over OTLP
+  carries and for none of which decision 2 gives the mapping a field, and
+  whose reserved keys a mapping may not name), any attribute the mapping
+  does not name, and a parent id, a status code other than Unset or a
+  status message when the mapping omits that optional column are not
+  written. A span carrying one is exported without it rather than refused,
+  and the report counts those spans as `spans_with_unwritten_data`, so a
+  lossy export says how lossy it was.

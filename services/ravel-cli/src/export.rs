@@ -1,15 +1,13 @@
 //! `ravel-cli export`: bulk read-out of a tenant's stored records into a
 //! Parquet file, the inverse of `ravel-cli load` (ADR-1751 decision 4).
 //!
-//! `--signal logs` and `--signal metrics` are implemented. Spans export is the
-//! remaining part of ADR-1751 follow-up task 3, and
-//! [`unsupported_signal_message`] refuses it by name rather than producing an
-//! empty file.
+//! `--signal logs`, `--signal metrics` and `--signal spans` are implemented.
 //!
 //! # What makes this a store read rather than a query
 //!
 //! The export resolves the catalog once, at a single snapshot, and reads the
-//! RLOG (logs) or RSEG (metrics) objects that snapshot names. It plans no SQL and contacts no
+//! RLOG (logs), RSEG (metrics) or RSPAN (spans) objects that snapshot names.
+//! It plans no SQL and contacts no
 //! `ravel-server`; it does read object storage directly, one LIST wave per
 //! resolve and a GET per surviving segment, so against S3 it is as remote as
 //! any other read. What it shares with a query is the visibility layer: the
@@ -31,7 +29,10 @@
 //!   same predicates over the fetched series with
 //!   [`ravel_query::erasure::retain_series_soa`] and
 //!   [`ravel_query::erasure::retain_histogram_series`], the functions the
-//!   query engine calls on its own fetch.
+//!   query engine calls on its own fetch. A spans export fetches through
+//!   [`ravel_query::SpanSegmentFetcher`] and drops every span
+//!   [`ravel_query::erasure::is_erased_span`] matches on its merged attributes
+//!   and start time, the call the SQL spans scan makes on each fetched row.
 //!
 //! # Memory and mid-export store changes
 //!
@@ -55,7 +56,10 @@
 //! over the decoded rows ([`in_export_window`]) so the two spellings of the
 //! same bound cannot drift apart unnoticed. For metrics, the segment fetch
 //! takes no range, so [`in_export_window`] over the decoded samples is the
-//! only place the window is applied.
+//! only place the window is applied. A span's event time is its start: the
+//! span fetch returns every span whose `[start, end]` interval overlaps the
+//! window, and [`in_export_window`] over each span's start keeps exactly the
+//! ones that start inside it.
 //!
 //! # Round-tripping through `ravel-cli load`
 //!
@@ -98,8 +102,27 @@
 //! `[metrics.histogram]` mapping is refused outright
 //! ([`HISTOGRAM_MAPPING_REFUSAL`]): export the exploded series with a scalar
 //! mapping instead.
+//!
+//! # Spans: stored as they are
+//!
+//! Spans have no deduplication: every stored span in the window is one row,
+//! so a span loaded twice exports twice. Rows sort by `(start_ts, trace_id,
+//! span_id)`; spans equal on all three keep the snapshot's fetch order. Each
+//! timestamp is written in its own declared unit, and a span whose start or
+//! end is not a whole number of that unit is refused rather than truncated,
+//! as a metrics sample is. RSPAN stores every attribute as a string, which a
+//! load produced by coercing the typed cell; each mapped attribute is written
+//! as the value of its declared type that coerces back to the stored string,
+//! and a stored string no such value produces (`"007"` under `i64`) is
+//! refused by name. A `[spans]` mapping has no `attrs_map_column`, so only
+//! the mapped fields are written: the reserved attributes holding a span's
+//! kind, trace state, flags, events and links, any stored attribute the
+//! mapping does not name, and a parent id, status code or status message the
+//! mapping has no column for, are not, and the report counts the spans that
+//! carried one ([`SpansExportReport::spans_with_unwritten_data`]).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::borrow::Borrow;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -116,15 +139,21 @@ use ravel_logseg::{AttrValue, LogRecord, LogStreamId};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::IngestLimits;
 use ravel_otlp::normalize::prometheus_family_name;
+use ravel_otlp::promcompat::format_float;
 use ravel_query::erasure::{
-    retain_histogram_series, retain_series_soa, retain_unerased_log_records,
+    is_erased_span, retain_histogram_series, retain_series_soa, retain_unerased_log_records,
     snapshot_pending_erasure_predicates,
 };
-use ravel_query::{DedupKey, FetchedSeriesSoa, LogQuery, LogSegmentFetcher, SegmentFetcher};
+use ravel_query::{
+    DedupKey, FetchedSeriesSoa, LogQuery, LogSegmentFetcher, SegmentFetcher, SpanSegmentFetcher,
+};
+use ravel_rspan::{SpanQuery, SpanRecord, StatusCode};
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::{LabelSet, METRIC_NAME_LABEL, SeriesId, Signal, TenantHash, TenantId, TimeRange};
 
-use crate::load::{ColType, Mapping, MetricsMapping, normalized_family_name};
+use crate::load::{
+    AttrMap, ColType, Mapping, MetricsMapping, SpansMapping, TsUnit, normalized_family_name,
+};
 use crate::maintain::SignalArg;
 use crate::store::{StoreSelection, require_tenant_data_present};
 
@@ -176,6 +205,30 @@ pub struct MetricsExportReport {
     pub samples_deduplicated: u64,
 }
 
+/// What one `export --signal spans` run did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpansExportReport {
+    /// Rows written to the output file: one per stored span whose start is in
+    /// `[start_ns, end_ns)` and that survived erasure exclusion.
+    pub rows_written: u64,
+    /// Segments the resolved snapshot named and the fetcher read.
+    pub segments_read: u64,
+    /// Segments `Catalog::resolve` pruned by event-time range before any
+    /// object was fetched.
+    pub segments_pruned: u64,
+    /// Pending selective-erasure predicates applied to this read.
+    pub erasure_predicates: usize,
+    /// Written spans that carried at least one stored value the file does not
+    /// carry: an attribute under a reserved key holding a span field the
+    /// `[spans]` mapping cannot name (kind, trace state, flags, events,
+    /// links) or under a key the mapping does not name, a parent id when the
+    /// mapping has no `parent_span_id_column`, a status code other than Unset
+    /// when it has no `status_code_column`, or a status message when it has
+    /// no `status_message_column`. A load of the file gives those spans
+    /// without them.
+    pub spans_with_unwritten_data: u64,
+}
+
 /// The refusal a `[metrics.histogram]` mapping gets from `export --signal
 /// metrics`.
 pub const HISTOGRAM_MAPPING_REFUSAL: &str = "export --signal metrics cannot write a mapping with \
@@ -186,23 +239,14 @@ pub const HISTOGRAM_MAPPING_REFUSAL: &str = "export --signal metrics cannot writ
      for the metric name and a [[metrics.label]] for le); loading that file with the same scalar \
      mapping reproduces the same series and samples.";
 
-/// Why `signal` cannot be exported yet, or `None` when it can.
+/// Why `signal` cannot be exported, or `None` when it can.
 ///
-/// `logs` and `metrics` are supported. Bulk import for spans has landed, so
-/// the missing piece spans export waits on is export itself, the rest of
-/// ADR-1751 follow-up task 3. The message names that and stops there:
-/// ADR-1751 decision 4 already settles the output columns (the same mapping
-/// TOML names them), so a refusal saying the follow-up decides them
-/// contradicts the decision record.
+/// Every signal `load` imports is exported, so this is `None` for all of
+/// them. The match is exhaustive so a new signal has to be classified here
+/// before `run` accepts it.
 pub fn unsupported_signal_message(signal: SignalArg) -> Option<String> {
     match signal {
-        SignalArg::Logs | SignalArg::Metrics => None,
-        SignalArg::Spans => Some(
-            "export --signal spans is not available: it is ADR-1751 follow-up task 3. Bulk \
-             import for spans has landed (`load --signal spans`), so this is the remaining half \
-             of that round trip. Only --signal logs and --signal metrics are supported."
-                .to_string(),
-        ),
+        SignalArg::Logs | SignalArg::Metrics | SignalArg::Spans => None,
     }
 }
 
@@ -255,6 +299,33 @@ pub async fn run(
         println!("segments_pruned: {}", report.segments_pruned);
         println!("erasure_predicates: {}", report.erasure_predicates);
         println!("samples_deduplicated: {}", report.samples_deduplicated);
+        return Ok(());
+    }
+    if signal == SignalArg::Spans {
+        let mapping = crate::load::parse_spans_mapping(&text)?;
+        selection.print_header();
+        let report = export_spans(
+            store,
+            selection,
+            tenant,
+            start_ns,
+            end_ns,
+            &mapping,
+            out,
+            shards,
+            max_ingest_lag_ns,
+            now_ns,
+        )
+        .await?;
+        println!("output: {}", out.display());
+        println!("rows_written: {}", report.rows_written);
+        println!("segments_read: {}", report.segments_read);
+        println!("segments_pruned: {}", report.segments_pruned);
+        println!("erasure_predicates: {}", report.erasure_predicates);
+        println!(
+            "spans_with_unwritten_data: {}",
+            report.spans_with_unwritten_data
+        );
         return Ok(());
     }
     let mapping = crate::load::parse_mapping(&text)?;
@@ -928,61 +999,73 @@ enum Refusal {
     SubUnitTimestamp,
 }
 
-/// Every per-series refusal of one export, gathered so the one reported does
-/// not depend on the order the series were visited in.
-#[derive(Default)]
-struct SeriesRefusals {
-    by_kind: BTreeMap<Refusal, KindOffenders>,
+/// Every per-offender refusal of one export, gathered so the one reported does
+/// not depend on the order the offenders were visited in. `K` is the refusal
+/// kind, whose declaration order is the report order; `S` is an offender's
+/// output sort key, which identifies it.
+struct Refusals<K, S> {
+    by_kind: BTreeMap<K, KindOffenders<S>>,
 }
 
-/// The series one refusal kind covers: how many, and the first in the output
-/// file's series order with its message.
-struct KindOffenders {
-    count: usize,
-    first_key: SeriesSortKey,
+impl<K, S> Default for Refusals<K, S> {
+    fn default() -> Self {
+        Refusals {
+            by_kind: BTreeMap::new(),
+        }
+    }
+}
+
+/// The offenders one refusal kind covers, by output sort key, and the message
+/// of the first of them in output order.
+struct KindOffenders<S> {
+    offenders: BTreeSet<S>,
     first_message: String,
 }
 
-impl SeriesRefusals {
-    /// Records one series under `kind`; a caller adds a series at most once
-    /// per kind.
-    fn add(&mut self, kind: Refusal, sort_key: &[(String, String)], message: String) {
-        match self.by_kind.get_mut(&kind) {
-            Some(offenders) => {
-                offenders.count += 1;
-                if sort_key < offenders.first_key.as_slice() {
-                    offenders.first_key = sort_key.to_vec();
-                    offenders.first_message = message;
-                }
-            }
-            None => {
-                self.by_kind.insert(
-                    kind,
-                    KindOffenders {
-                        count: 1,
-                        first_key: sort_key.to_vec(),
-                        first_message: message,
-                    },
-                );
-            }
+impl<K: Ord, S: Ord> Refusals<K, S> {
+    /// Records the offender `sort_key` under `kind`. Adding one offender twice
+    /// under one kind counts it once.
+    fn add<Q>(&mut self, kind: K, sort_key: &Q, message: String)
+    where
+        Q: ?Sized + Ord + ToOwned<Owned = S>,
+        S: Borrow<Q>,
+    {
+        let offenders = self.by_kind.entry(kind).or_insert_with(|| KindOffenders {
+            offenders: BTreeSet::new(),
+            first_message: String::new(),
+        });
+        if !offenders.offenders.insert(sort_key.to_owned()) {
+            return;
+        }
+        if offenders.offenders.first().map(Borrow::borrow) == Some(sort_key) {
+            offenders.first_message = message;
         }
     }
 
-    /// Refuses on the first kind any series hit, naming the first offender in
-    /// the output file's series order and how many series that kind covers;
-    /// series refused only for a later kind are not counted.
-    fn into_result(self) -> anyhow::Result<()> {
+    /// Refuses on the first kind any offender hit, naming the first offender
+    /// in output order and how many offenders that kind covers; offenders
+    /// refused only for a later kind are not counted.
+    fn into_result_for(self, signal: &str, noun: &str) -> anyhow::Result<()> {
         match self.by_kind.into_values().next() {
             Some(KindOffenders {
-                count,
+                offenders,
                 first_message,
-                ..
             }) => anyhow::bail!(
-                "export --signal metrics refused on {count} series for this reason; first: \
-                 {first_message}"
+                "export --signal {signal} refused on {} {noun} for this reason; first: \
+                 {first_message}",
+                offenders.len()
             ),
             None => Ok(()),
         }
+    }
+}
+
+/// The per-series refusals of one metrics export.
+type SeriesRefusals = Refusals<Refusal, SeriesSortKey>;
+
+impl SeriesRefusals {
+    fn into_result(self) -> anyhow::Result<()> {
+        self.into_result_for("metrics", "series")
     }
 }
 
@@ -1000,10 +1083,16 @@ fn describe_series(labels: &LabelSet) -> String {
 /// Refuses a mapping that writes two fields to one output column, the columns
 /// [`build_metrics_batch`] writes, before the export reads anything.
 fn check_metrics_output_columns(mapping: &MetricsMapping) -> anyhow::Result<()> {
-    let columns = std::iter::once(&mapping.ts_column)
-        .chain(&mapping.name_column)
-        .chain(std::iter::once(&mapping.value_column))
-        .chain(mapping.labels.iter().map(|label| &label.column));
+    check_distinct_columns(
+        std::iter::once(&mapping.ts_column)
+            .chain(&mapping.name_column)
+            .chain(std::iter::once(&mapping.value_column))
+            .chain(mapping.labels.iter().map(|label| &label.column)),
+    )
+}
+
+/// Refuses a list of output column names that names one column twice.
+fn check_distinct_columns<'a>(columns: impl Iterator<Item = &'a String>) -> anyhow::Result<()> {
     let mut seen: HashSet<&str> = HashSet::new();
     for name in columns {
         if !seen.insert(name.as_str()) {
@@ -1065,6 +1154,418 @@ fn build_metrics_batch(
             );
         }
         columns.push((label.column.clone(), Arc::new(values.finish())));
+    }
+
+    // Declared nullable explicitly, for the reason `build_batch` gives.
+    RecordBatch::try_from_iter_with_nullable(
+        columns.into_iter().map(|(name, array)| (name, array, true)),
+    )
+    .context("failed to build the export record batch")
+}
+
+/// Export the spans a tenant holds whose start is in `[start_ns, end_ns)` to
+/// a Parquet file laid out by `mapping`: one row per stored span, sorted by
+/// `(start_ts, trace_id, span_id)`, carrying the columns the `[spans]` section
+/// names.
+///
+/// `shards`, `max_ingest_lag_ns` and `out` mean what they mean for
+/// [`export_logs`]. Two fields sharing one output column, and an unusable
+/// `out`, are refused before any object-store request.
+///
+/// The whole export is refused, and nothing is written, when a mapped field of
+/// a span in the window would not re-load as stored under `mapping` (see the
+/// module documentation): a timestamp that is not a whole number of its
+/// declared unit, a start a load would re-time or refuse, or a mapped
+/// attribute whose stored string the declared type does not read back. The
+/// attributes the mapping cannot or does not name, and a parent id, status
+/// code or status message the mapping has no column for, are not written and
+/// are counted, not refused.
+#[allow(clippy::too_many_arguments)]
+pub async fn export_spans(
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    start_ns: i64,
+    end_ns: i64,
+    mapping: &SpansMapping,
+    out: &Path,
+    shards: u32,
+    max_ingest_lag_ns: Option<i64>,
+    now_ns: i64,
+) -> anyhow::Result<SpansExportReport> {
+    check_window(start_ns, end_ns)?;
+    check_spans_output_columns(mapping)?;
+    check_output_path(out)?;
+    let tenant_hash = TenantId::new(tenant).hash();
+    require_tenant_data_present(selection, store.as_ref(), "export", tenant, &tenant_hash).await?;
+
+    let snapshot = resolve_snapshot(
+        &store,
+        &tenant_hash,
+        Signal::Spans,
+        start_ns,
+        end_ns,
+        shards,
+        max_ingest_lag_ns,
+        now_ns,
+    )
+    .await?;
+    let predicates = snapshot_pending_erasure_predicates(&snapshot);
+    let erasure_predicates = predicates.len();
+    // The fetch window is an interval-overlap test on `[start_ts, end_ts]`, so
+    // it returns every span starting in the export window (a stored span never
+    // ends before it starts) plus spans that started earlier and are still
+    // open; `in_export_window` below keeps only the former.
+    let query = SpanQuery::ts_range(start_ns, fetch_range_end_ns(end_ns));
+    let fetcher = SpanSegmentFetcher::new(Arc::clone(&store));
+    let accounting = QueryAccounting::new();
+
+    let mut spans: Vec<SpanRecord> = Vec::new();
+    let mut segments_read = 0u64;
+    for seg_ref in &snapshot.segments {
+        let fetched = fetcher
+            .fetch_accounted(seg_ref, tenant_hash, &query, None, None, &[], &accounting)
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "failed to read span segment {}: {err}",
+                    seg_ref.data_object_key
+                )
+            })?;
+        if let Some(output) = fetched {
+            segments_read += 1;
+            spans.extend(output.records.into_iter().map(|row| row.record));
+        }
+    }
+    spans.retain(|span| in_export_window(span.start_ts_ns, start_ns, end_ns));
+    if !predicates.is_empty() {
+        spans.retain(|span| !is_erased_span(&span.attrs, span.start_ts_ns, &predicates));
+    }
+    spans.sort_by_key(|span| (span.start_ts_ns, span.trace_id, span.span_id));
+
+    let rows = span_output_rows(mapping, &spans)?;
+    let spans_with_unwritten_data = spans_with_unwritten_data(mapping, &spans);
+    let empty = build_spans_batch(mapping, &[])?;
+    let rows_written = write_output(out, empty.schema(), |writer| {
+        let mut rows_written = 0u64;
+        for chunk in rows.chunks(EXPORT_BATCH_ROWS) {
+            let batch = build_spans_batch(mapping, chunk)?;
+            writer
+                .write(&batch)
+                .with_context(|| format!("failed to write a batch to {}", out.display()))?;
+            rows_written += batch.num_rows() as u64;
+        }
+        Ok(rows_written)
+    })?;
+
+    Ok(SpansExportReport {
+        rows_written,
+        segments_read,
+        segments_pruned: snapshot.segments_pruned,
+        erasure_predicates,
+        spans_with_unwritten_data,
+    })
+}
+
+/// How many of `spans` carry a stored value [`build_spans_batch`] does not
+/// write under `mapping`: an attribute no mapped attribute names, or a
+/// parent id, non-Unset status code or status message whose column the
+/// mapping omits.
+fn spans_with_unwritten_data(mapping: &SpansMapping, spans: &[SpanRecord]) -> u64 {
+    let mapped: BTreeSet<&str> = span_mapped_attributes(mapping)
+        .map(|spec| spec.key.as_str())
+        .collect();
+    let mut unwritten = 0u64;
+    for span in spans {
+        let lost_parent = mapping.parent_span_id_column.is_none() && span.parent_span_id.is_some();
+        let lost_status =
+            mapping.status_code_column.is_none() && span.status_code != StatusCode::Unset;
+        let lost_message = mapping.status_message_column.is_none()
+            && span
+                .status_message
+                .as_deref()
+                .is_some_and(|message| !message.is_empty());
+        let lost_attribute = span
+            .attrs
+            .iter()
+            .any(|(key, _)| !mapped.contains(key.as_str()));
+        if lost_parent || lost_status || lost_message || lost_attribute {
+            unwritten += 1;
+        }
+    }
+    unwritten
+}
+
+/// Why a span cannot be written. The declaration order is the order the
+/// kinds are reported in when several apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SpanRefusal {
+    UnloadableInterval,
+    SubUnitTimestamp,
+    UnwritableAttribute,
+}
+
+/// The per-span refusals of one spans export, keyed by each span's position
+/// in the sorted output. Two stored copies of one span are two rows and two
+/// offenders.
+type SpanRefusals = Refusals<SpanRefusal, usize>;
+
+impl SpanRefusals {
+    fn into_result(self) -> anyhow::Result<()> {
+        self.into_result_for("spans", "spans")
+    }
+}
+
+/// One output row: a stored span plus one value per mapped attribute,
+/// `resource_attribute` entries first and then `attribute` entries, each
+/// already in the declared type, `None` where the span lacks the key.
+struct SpanOutRow<'a> {
+    span: &'a SpanRecord,
+    attrs: Vec<Option<AttrValue>>,
+}
+
+/// Every mapped attribute, in the order [`SpanOutRow::attrs`] holds them.
+fn span_mapped_attributes(mapping: &SpansMapping) -> impl Iterator<Item = &AttrMap> {
+    mapping
+        .resource_attributes
+        .iter()
+        .chain(&mapping.attributes)
+}
+
+/// Checks every span in output order against what a load reads back, and
+/// returns the rows to write, or the refusal for the first kind any span hit.
+fn span_output_rows<'a>(
+    mapping: &SpansMapping,
+    spans: &'a [SpanRecord],
+) -> anyhow::Result<Vec<SpanOutRow<'a>>> {
+    let mut refusals = SpanRefusals::default();
+    let mut rows = Vec::with_capacity(spans.len());
+    for (position, span) in spans.iter().enumerate() {
+        if span.start_ts_ns <= 0 || span.end_ts_ns < span.start_ts_ns {
+            refusals.add(
+                SpanRefusal::UnloadableInterval,
+                &position,
+                format!(
+                    "{} starts at {} ns and ends at {} ns; a load reads a zero start as load \
+                     time and refuses a negative start or an end before the start, so the \
+                     exported file would not re-load as the same span",
+                    describe_span(span),
+                    span.start_ts_ns,
+                    span.end_ts_ns
+                ),
+            );
+        }
+        for (field, ts_ns, unit) in [
+            ("start_ts", span.start_ts_ns, mapping.start_ts_unit),
+            ("end_ts", span.end_ts_ns, mapping.end_ts_unit),
+        ] {
+            if ts_ns % unit.factor() != 0 {
+                refusals.add(
+                    SpanRefusal::SubUnitTimestamp,
+                    &position,
+                    sub_unit_span_message(span, field, ts_ns, unit),
+                );
+            }
+        }
+        let mut attrs = Vec::new();
+        for spec in span_mapped_attributes(mapping) {
+            let stored = span
+                .attrs
+                .iter()
+                .find_map(|(key, value)| (key == &spec.key).then_some(value.as_str()));
+            let value = match stored {
+                None => None,
+                Some(stored) => {
+                    let typed = typed_span_attr(stored, spec.value_type);
+                    if typed.is_none() {
+                        refusals.add(
+                            SpanRefusal::UnwritableAttribute,
+                            &position,
+                            format!(
+                                "{} carries the attribute {:?} with the stored value {stored:?}, \
+                                 which the mapping declares {}; no {} cell loads back as that \
+                                 string, so the exported file would not re-load as the same \
+                                 span. Declare the attribute as str.",
+                                describe_span(span),
+                                spec.key,
+                                col_type_name(spec.value_type),
+                                col_type_name(spec.value_type)
+                            ),
+                        );
+                    }
+                    typed
+                }
+            };
+            attrs.push(value);
+        }
+        rows.push(SpanOutRow { span, attrs });
+    }
+    refusals.into_result()?;
+    Ok(rows)
+}
+
+fn sub_unit_span_message(span: &SpanRecord, field: &str, ts_ns: i64, unit: TsUnit) -> String {
+    let unit = unit.as_str();
+    format!(
+        "{} has {field} {ts_ns} ns, which is not a whole number of {unit} (the mapping's \
+         {field}_unit); writing it in {unit} would move it onto a different timestamp. Export \
+         with a finer {field}_unit.",
+        describe_span(span)
+    )
+}
+
+/// `span "name" (trace_id <hex>, span_id <hex>)` for a refusal message.
+fn describe_span(span: &SpanRecord) -> String {
+    format!(
+        "span {:?} (trace_id {}, span_id {})",
+        span.name,
+        hex::encode(span.trace_id),
+        hex::encode(span.span_id)
+    )
+}
+
+/// The value of declared type `ty` whose load-side string coercion is exactly
+/// `stored`, or `None` when there is none.
+///
+/// RSPAN stores every attribute as a string, and a spans load coerces a typed
+/// cell to one by `ravel_otlp`'s own mapping: a bool and an integer take their
+/// canonical string form, a float goes through `format_float`, and bytes
+/// become lowercase hex. The candidate is parsed from `stored` and kept only
+/// when that coercion gives `stored` back, so `"007"` is not an `i64` and
+/// `"ABCD"` is not `bytes`.
+fn typed_span_attr(stored: &str, ty: ColType) -> Option<AttrValue> {
+    let (value, reloaded) = match ty {
+        ColType::Str => return Some(AttrValue::Str(stored.to_string())),
+        ColType::I64 => {
+            let v: i64 = stored.parse().ok()?;
+            (AttrValue::I64(v), v.to_string())
+        }
+        ColType::F64 => {
+            let v: f64 = stored.parse().ok()?;
+            (AttrValue::F64(v), format_float(v))
+        }
+        ColType::Bool => {
+            let v: bool = stored.parse().ok()?;
+            (AttrValue::Bool(v), v.to_string())
+        }
+        ColType::Bytes => {
+            let v = hex::decode(stored).ok()?;
+            let reloaded = hex::encode(&v);
+            (AttrValue::Bytes(v), reloaded)
+        }
+    };
+    (reloaded == stored).then_some(value)
+}
+
+/// The mapping's spelling of a declared attribute type.
+fn col_type_name(ty: ColType) -> &'static str {
+    match ty {
+        ColType::Str => "str",
+        ColType::I64 => "i64",
+        ColType::F64 => "f64",
+        ColType::Bool => "bool",
+        ColType::Bytes => "bytes",
+    }
+}
+
+/// Refuses a spans mapping that writes two fields to one output column, the
+/// columns [`build_spans_batch`] writes, before the export reads anything.
+fn check_spans_output_columns(mapping: &SpansMapping) -> anyhow::Result<()> {
+    check_distinct_columns(
+        [&mapping.trace_id_column, &mapping.span_id_column]
+            .into_iter()
+            .chain(&mapping.parent_span_id_column)
+            .chain([
+                &mapping.name_column,
+                &mapping.start_ts_column,
+                &mapping.end_ts_column,
+            ])
+            .chain(&mapping.status_code_column)
+            .chain(&mapping.status_message_column)
+            .chain(span_mapped_attributes(mapping).map(|spec| &spec.column)),
+    )
+}
+
+/// Builds the output batch for `rows`, one column per field the `[spans]`
+/// section names, in the Arrow types the spans `--mapping` reader accepts:
+/// `FixedSizeBinary` of the id width for the ids (a null parent is a root
+/// span), `Utf8` for the name and status message, `Int64` for the two
+/// timestamps (each in its own declared unit) and for the status code as
+/// OTLP's integer enum, and each mapped attribute in its declared type.
+fn build_spans_batch(
+    mapping: &SpansMapping,
+    rows: &[SpanOutRow<'_>],
+) -> anyhow::Result<RecordBatch> {
+    let mut columns: Vec<(String, ArrayRef)> = Vec::new();
+
+    let mut trace_ids = FixedSizeBinaryBuilder::new(16);
+    let mut span_ids = FixedSizeBinaryBuilder::new(8);
+    for row in rows {
+        append_id(&mut trace_ids, Some(&row.span.trace_id[..]))?;
+        append_id(&mut span_ids, Some(&row.span.span_id[..]))?;
+    }
+    columns.push((
+        mapping.trace_id_column.clone(),
+        Arc::new(trace_ids.finish()),
+    ));
+    columns.push((mapping.span_id_column.clone(), Arc::new(span_ids.finish())));
+
+    if let Some(name) = &mapping.parent_span_id_column {
+        let mut parents = FixedSizeBinaryBuilder::new(8);
+        for row in rows {
+            append_id(
+                &mut parents,
+                row.span.parent_span_id.as_ref().map(|id| &id[..]),
+            )?;
+        }
+        columns.push((name.clone(), Arc::new(parents.finish())));
+    }
+
+    let mut names = StringBuilder::new();
+    for row in rows {
+        names.append_value(&row.span.name);
+    }
+    columns.push((mapping.name_column.clone(), Arc::new(names.finish())));
+
+    let ts_column = |unit: TsUnit, ts_of: fn(&SpanRecord) -> i64| -> ArrayRef {
+        let factor = unit.factor();
+        let mut ts = Int64Builder::with_capacity(rows.len());
+        for row in rows {
+            ts.append_value(ts_of(row.span) / factor);
+        }
+        Arc::new(ts.finish())
+    };
+    columns.push((
+        mapping.start_ts_column.clone(),
+        ts_column(mapping.start_ts_unit, |span| span.start_ts_ns),
+    ));
+    columns.push((
+        mapping.end_ts_column.clone(),
+        ts_column(mapping.end_ts_unit, |span| span.end_ts_ns),
+    ));
+
+    if let Some(name) = &mapping.status_code_column {
+        let mut codes = Int64Builder::with_capacity(rows.len());
+        for row in rows {
+            codes.append_value(row.span.status_code as i64);
+        }
+        columns.push((name.clone(), Arc::new(codes.finish())));
+    }
+
+    if let Some(name) = &mapping.status_message_column {
+        let mut messages = StringBuilder::new();
+        for row in rows {
+            messages.append_option(row.span.status_message.as_deref());
+        }
+        columns.push((name.clone(), Arc::new(messages.finish())));
+    }
+
+    for (i, spec) in span_mapped_attributes(mapping).enumerate() {
+        let mut column = AttrColumn::new(spec.value_type);
+        for row in rows {
+            column.push(&spec.key, row.attrs.get(i).and_then(Option::as_ref))?;
+        }
+        columns.push((spec.column.clone(), column.finish()));
     }
 
     // Declared nullable explicitly, for the reason `build_batch` gives.
@@ -1574,26 +2075,11 @@ mod tests {
         build_batch(mapping, &rows).expect("batch builds")
     }
 
-    /// Logs and metrics export; spans is refused with the follow-up it waits
-    /// on, and the refusal lists both supported signals.
     #[test]
-    fn unsupported_signal_message_refuses_only_spans() {
-        assert_eq!(unsupported_signal_message(SignalArg::Logs), None);
-        assert_eq!(unsupported_signal_message(SignalArg::Metrics), None);
-        let spans = unsupported_signal_message(SignalArg::Spans).expect("spans is unsupported");
-        assert_eq!(
-            spans,
-            "export --signal spans is not available: it is ADR-1751 follow-up task 3. Bulk import \
-             for spans has landed (`load --signal spans`), so this is the remaining half of that \
-             round trip. Only --signal logs and --signal metrics are supported."
-        );
-        // ADR-1751 decision 4 already settles the output columns: the same
-        // mapping TOML names them. A refusal claiming the follow-up decides
-        // them contradicts the decision record.
-        assert!(
-            !spans.contains("column layout"),
-            "the follow-up does not decide the column layout: {spans}"
-        );
+    fn every_signal_is_exported() {
+        for signal in [SignalArg::Logs, SignalArg::Metrics, SignalArg::Spans] {
+            assert_eq!(unsupported_signal_message(signal), None, "{signal:?}");
+        }
     }
 
     /// The window is half-open at both spellings of its end: the last
@@ -1821,6 +2307,21 @@ mod tests {
         assert!(span.is_null(1));
     }
 
+    /// A series added twice under one kind is one offender: the count is
+    /// keyed by the series' output sort key, not by the number of calls.
+    #[test]
+    fn one_series_added_twice_under_one_kind_counts_once() {
+        let key: SeriesSortKey = vec![(METRIC_NAME_LABEL.to_string(), "cpu".to_string())];
+        let mut refusals = SeriesRefusals::default();
+        refusals.add(Refusal::UnmappedLabel, &key, "series cpu{}".to_string());
+        refusals.add(Refusal::UnmappedLabel, &key, "series cpu{}".to_string());
+        let err = refusals.into_result().expect_err("the series is refused");
+        assert_eq!(
+            err.to_string(),
+            "export --signal metrics refused on 1 series for this reason; first: series cpu{}"
+        );
+    }
+
     /// One scalar run of series `cpu` holding a single sample.
     fn one_sample_run(
         ts_ns: i64,
@@ -1872,5 +2373,80 @@ mod tests {
                 "the epoch-2 write is served"
             );
         }
+    }
+
+    /// A `[spans]` mapping with `start_ts` in `start_unit`, `end_ts` in nanos,
+    /// and `http.status_code` declared i64.
+    fn spans_mapping(start_unit: &str) -> SpansMapping {
+        crate::load::parse_spans_mapping(&format!(
+            "[spans]\ntrace_id_column = \"trace_id\"\nspan_id_column = \"span_id\"\n\
+             name_column = \"name\"\nstart_ts_column = \"start\"\n\
+             start_ts_unit = \"{start_unit}\"\nend_ts_column = \"end\"\n\
+             end_ts_unit = \"nanos\"\n\n\
+             [[spans.attribute]]\nkey = \"http.status_code\"\ncolumn = \"http_status\"\n\
+             type = \"i64\"\n"
+        ))
+        .expect("valid spans mapping")
+    }
+
+    fn span(name: &str, start_ts_ns: i64, end_ts_ns: i64) -> SpanRecord {
+        SpanRecord {
+            trace_id: [1; 16],
+            span_id: [0x11; 8],
+            parent_span_id: None,
+            name: name.to_string(),
+            start_ts_ns,
+            end_ts_ns,
+            status_code: ravel_rspan::StatusCode::Unset,
+            status_message: None,
+            attrs: Vec::new(),
+        }
+    }
+
+    fn span_refusal(mapping: &SpansMapping, span: SpanRecord) -> String {
+        match span_output_rows(mapping, &[span]) {
+            Ok(_) => panic!("the span is refused"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_span_starting_at_zero_is_refused_as_unloadable() {
+        assert_eq!(
+            span_refusal(&spans_mapping("nanos"), span("zero start", 0, 5)),
+            "export --signal spans refused on 1 spans for this reason; first: span \"zero \
+             start\" (trace_id 01010101010101010101010101010101, span_id 1111111111111111) \
+             starts at 0 ns and ends at 5 ns; a load reads a zero start as load time and refuses \
+             a negative start or an end before the start, so the exported file would not re-load \
+             as the same span"
+        );
+    }
+
+    #[test]
+    fn a_span_ending_before_its_start_is_refused_as_unloadable() {
+        assert_eq!(
+            span_refusal(&spans_mapping("nanos"), span("backwards", 10, 9)),
+            "export --signal spans refused on 1 spans for this reason; first: span \
+             \"backwards\" (trace_id 01010101010101010101010101010101, span_id \
+             1111111111111111) starts at 10 ns and ends at 9 ns; a load reads a zero start as \
+             load time and refuses a negative start or an end before the start, so the exported \
+             file would not re-load as the same span"
+        );
+    }
+
+    /// One span both finer than its `start_ts_unit` and carrying an attribute
+    /// its declared type does not read back is refused for the timestamp.
+    #[test]
+    fn a_sub_unit_timestamp_is_reported_before_an_unwritable_attribute() {
+        let mut both = span("both", 1_000_000_001, 2_000_000_000);
+        both.attrs = vec![("http.status_code".to_string(), "007".to_string())];
+        assert_eq!(
+            span_refusal(&spans_mapping("millis"), both),
+            "export --signal spans refused on 1 spans for this reason; first: span \"both\" \
+             (trace_id 01010101010101010101010101010101, span_id 1111111111111111) has start_ts \
+             1000000001 ns, which is not a whole number of millis (the mapping's start_ts_unit); \
+             writing it in millis would move it onto a different timestamp. Export with a finer \
+             start_ts_unit."
+        );
     }
 }

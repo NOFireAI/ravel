@@ -580,15 +580,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   deployment context falls back to, and a test pins `ravel-query`'s hand copy
   of the fold interval against the server's own default so the two cannot drift
   apart unnoticed.
-- **`ravel-cli export --signal spans` now names what it actually waits on**
-  (ADR-1751 follow-up task 2 review, issues #1751 and #1712). The refusal said
-  bulk import for spans does not exist yet. The import has since landed, so
-  the message now names ADR-1751 follow-up task 3, the export work itself,
-  and says the import half of the round trip is already there. It does not
-  claim that follow-up decides the output columns: ADR-1751 decision 4
-  already settles them, the same mapping TOML names them. The `export` help
-  text and the ingest guide's bulk-export section say the same. (Metrics
-  export itself is added below.)
 
 - **A Parquet load resolves each dictionary-encoded column once per batch
   instead of once per cell** (issues #1751 and #1712). The per-row readers
@@ -743,7 +734,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   A `[metrics.histogram]` mapping is refused with the scalar mapping to use
   instead. The report adds
   `series_written`, `series_skipped` and `samples_deduplicated` to the logs
-  export's lines. `--signal spans` is still refused.
+  export's lines. `--signal spans` writes a tenant's
+  stored spans that start in the window to a file from which
+  `load --signal spans` reads back every mapped field: it fetches the RSPAN
+  objects through ravel-query's span fetcher, drops the spans a pending
+  erasure matches with the check the SQL spans scan makes, and writes every
+  `[spans]` mapping field as stored, with no deduplication, sorted by start
+  time, then trace id, then span id. Span kind, trace state, flags, events,
+  links, any attribute the mapping does not name, and a parent id, status code
+  or status message whose optional column the mapping omits are not written,
+  and the report counts the spans that lost them as
+  `spans_with_unwritten_data`. Each timestamp is written in its
+  declared unit, and the export refuses, in the metrics export's gathered
+  form ("refused on N spans for this reason; first: ..."), a span whose start
+  the load would re-time or refuse, a timestamp finer than its unit, and a
+  mapped attribute whose stored string its declared type does not read back.
+  N counts distinct spans, so a span whose start and end are both finer than
+  their unit counts once (issue #2213).
 - **`/metrics` renders the three writer clock-lag counters, and a shipped
   alert pages on a refused flush** (ADR-1685 follow-up task 3, issue #1685).
   `ravel_ingest_clock_lag_refused_total`,
