@@ -4791,13 +4791,13 @@ mod tests {
     /// `PROBE_MIN_STEP_BYTES / r`), plus the crossing probe itself -- which is
     /// `r * ln(d0 / PROBE_MIN_STEP_BYTES) + r` for large `r`.
     ///
-    /// This fixture measures `r` = 7.08 (`ratio` below, printed by the run), so
-    /// `d0` = 14_069, the ladder is `ln(14069 / 4096) / ln(7.08 / 6.08)` = 8.1
-    /// probes, the floor tail is 7.1, and with the crossing probe that is 16.2
-    /// per part. 11 of the 12 parts close on the target (178 probes) and the
+    /// This fixture measures `r` = 7.26 (`ratio` below, printed by the run), so
+    /// `d0` = 14_127, the ladder is `ln(14127 / 4096) / ln(7.26 / 6.26)` = 8.4
+    /// probes, the floor tail is 7.3, and with the crossing probe that is 16.6
+    /// per part. 10 of the 11 parts close on the target (166 probes) and the
     /// trailing part runs its own partial ladder without ever closing (its proxy
     /// passes the target, its records run out), which with the per-part spread
-    /// around the model accounts for the remaining 17 of the 195 pinned below.
+    /// around the model accounts for the remaining 29 of the 195 pinned below.
     /// The model treats `r` as constant along a part and ignores that a
     /// floored step overshoots, so a few percent is the
     /// expected agreement; a change that made probing linear in the deficit, or
@@ -4901,16 +4901,16 @@ mod tests {
         );
         // The probe cost, pinned exactly (the corpus is deterministic) and cross
         // checked against the geometric model in the doc comment above:
-        // r = 7.08, d0 = STORED_TARGET * (1 - 1/r) = 14_069, ladder
-        // ln(14069/4096) / ln(7.08/6.08) = 8.1, floor tail r = 7.1, crossing
-        // probe 1, so 16.2 per part; 11 closing parts = 178, plus the trailing
+        // r = 7.26, d0 = STORED_TARGET * (1 - 1/r) = 14_127, ladder
+        // ln(14127/4096) / ln(7.26/6.26) = 8.4, floor tail r = 7.3, crossing
+        // probe 1, so 16.6 per part; 10 closing parts = 166, plus the trailing
         // part's partial ladder and the per-part spread around the model = 195
         // pinned.
         assert_eq!(
             tracker.probes_run(),
             195,
             "the exact-encode probe count for this fixture is deterministic; the \
-             geometric model predicts about 16.2 probes per part for r={ratio:.2} \
+             geometric model predicts about 16.6 probes per part for r={ratio:.2} \
              over {} parts",
             parts.len()
         );
@@ -5018,11 +5018,12 @@ mod tests {
     /// .max(f64::MIN_POSITIVE); let step = (((deficit as f64) / rate).ceil() as
     /// u64).max(PROBE_MIN_STEP_BYTES);` in place of
     /// `let step = deficit.max(PROBE_MIN_STEP_BYTES);` -- and the probe pin below
-    /// fails first at 85 against 124, then, with the pin relaxed to 85, this
-    /// fixture emits 29 parts whose first object is 150_646 bytes, 9.2x the
+    /// fails first at 71 against 123, then, with the pin relaxed to 71, this
+    /// fixture emits 25 parts whose first object is 228_222 bytes, 13.9x the
     /// 16 KiB target, failing the band assertion at part 0. The remaining parts
-    /// land between 16_853 and 18_893 bytes, inside the band, which is why the
-    /// assertion covers every part and not just the largest. The uniformly
+    /// land between 9_914 (the trailing part) and 18_731 bytes, inside the
+    /// band, which is why the assertion covers every part and not just the
+    /// largest. The uniformly
     /// compressible corpus of
     /// [`stored_target_closes_parts_on_actual_encoded_object_bytes`] passes the
     /// band under both schedulers, which is exactly why this fixture exists.
@@ -5033,7 +5034,7 @@ mod tests {
         /// Ordinal where the corpus stops compressing. Enough compressible
         /// payload ahead of it that the first part's early probes all land inside
         /// it and fit a low rate (its 200 records charge the proxy 56_061 bytes,
-        /// 3.4 targets' worth, and encode to 1_220), and thousands of incompressible
+        /// 3.4 targets' worth, and encode to 800), and thousands of incompressible
         /// records after it for that rate to be wrong about.
         const PREFIX: i64 = 200;
         const STORED_TARGET: u64 = 16 * 1024;
@@ -5106,14 +5107,14 @@ mod tests {
         // The probe cost, pinned exactly rather than as `> 0`: the corpus is
         // deterministic, so the geometric model is checkable against it. Almost
         // every part of this fixture lies past the collapse, where
-        // r = 1 / post_rate = 1.59, so d0 = STORED_TARGET * (1 - 1/r) = 6_072,
-        // the ladder to the floor is ln(6072/4096) / ln(1.59/0.59) = 0.4 probes,
+        // r = 1 / post_rate = 1.60, so d0 = STORED_TARGET * (1 - 1/r) = 6_131,
+        // the ladder to the floor is ln(6131/4096) / ln(1.60/0.60) = 0.4 probes,
         // the floor tail is r = 1.6, and the crossing probe makes 3.0 per part:
-        // 40 closing parts = 120, plus the first part's longer ladder across the
-        // compressible prefix (r = 1/pre_rate = 46 there) = 124 pinned.
+        // 39 closing parts = 117, plus the first part's longer ladder across the
+        // compressible prefix (r = 1/pre_rate = 70 there) = 123 pinned.
         assert_eq!(
             tracker.probes_run(),
-            124,
+            123,
             "the exact-encode probe count for this fixture is deterministic; the \
              geometric model predicts about 3.0 probes per part for \
              r={:.2} past the collapse, over {} parts",
@@ -6299,7 +6300,10 @@ mod tests {
     /// close. The RLOG version 5 bump (ADR-2135) changed the writer's BLOOM and
     /// footer bytes, which the memory-target split does not read, so the six
     /// constants were re-captured under version 5 and the part count stayed
-    /// six; between that bump and here a diff can only come from this crate.
+    /// six. They were re-captured once more when the writer began choosing each
+    /// page's encoding by stored size, with the GCD and column-reference codecs
+    /// among the candidates (#2140), and the part count again stayed six;
+    /// between that change and here a diff can only come from this crate.
     ///
     /// The stored-target geometry #872 introduced is pinned separately, by
     /// [`stored_target_closes_parts_on_actual_encoded_object_bytes`] (band plus
@@ -6311,15 +6315,15 @@ mod tests {
         /// (30 + 1) + 4 x (30 + 1) + 4 x (40 + 1).
         const EXPECTED_ROWS: usize = 4 * 31 + 4 * 31 + 4 * 41;
         /// Part `content_hash` values, in `part_index` order, under
-        /// `l1_part_memory_target_bytes: 32 * 1024`, re-captured at the RLOG
-        /// version 5 bump (see the note above).
+        /// `l1_part_memory_target_bytes: 32 * 1024`, re-captured at the
+        /// stored-size encoding choice (see the note above).
         const EXPECTED_PART_HASHES: &[&str] = &[
-            "6d0664e0d1d160bff00c27d6a5580d5621faa46e9179572af2495b6f89915674",
-            "4aa53103f785e2fa51bd208f448b21f7e8b4491495922293d3e24446de7949b5",
-            "65641532551b32a6e1a3c144b57167d757e3c09c9e5701116aad4a477eed671b",
-            "bad1de3f9f8218b65dcc289b25e2025a55e6dfc432b7954843a76350421ad187",
-            "0af9d411bd396d297da584fa9d522a0af2b836a99f08381af7ada7af32bba981",
-            "d77f839942d6de317462046655689af9f615bdcf6ec6189fff509621023e1ca9",
+            "59bc1b97b30c22fefd37082ca13fcea3f9ca413d184d4dad958c425918116463",
+            "79911944901ebc86cabe2f98a3638524e381cb454b292f161b7222c2b2e211a9",
+            "65c1b3b869e6ff4f5511b0860722faee7a9f8e7b418715f1a9f80a2edacb8e16",
+            "fff6977ad871a741019d199d2e08993db2201acfce64b14f9b5fdd1f74f3176e",
+            "d90295bbc856d208095d72acc9da9ff4e1ffd3865148efd87f80783c7ae0d3b5",
+            "71bd01a6239b6173a9bec9780947073323b3fdc799fc4604a1c00996413932d1",
         ];
 
         let (hashes, rows) = differential_hash_run().await;
@@ -6662,7 +6666,7 @@ mod tests {
         // The exact bytes, not only the order: the part hashes under overlap-gated
         // and eager all-open admission, pinned as literals.
         const EXPECTED_HASHES: [&str; 1] =
-            ["33611211c1c25ef7d6778d2026a808bd3565a65686676011983baab69a312595"];
+            ["6dad4dabf2d0cddd34b0969b97cfe933985533b7dc5578fa0cc19d620b696338"];
         let overlap = compact_part_hashes(&inputs, &CompactorConfig::default()).await;
         let eager = compact_part_hashes(
             &inputs,
