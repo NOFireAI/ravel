@@ -205,11 +205,19 @@ not even the records above the link: the group is one unit, and deleting its
 upper records would leave the rest resolvable with nothing naming them as
 erased. The pass reports that chain as held: the rewrite's applied requests,
 and the bucket as a truncated one, since the refused walk collects no request
-a rewrite between it and the link applied. An erasure-request sweep given
-that pass's holds keeps the signal's `.dreq`s that are past their horizon.
-The maintain loop's erasure-request sweep does not take them: it runs an
-observing pass, which follows the link and holds the chain only when the
-HEAD gate or a legal hold does.
+a rewrite between it and the link applied. A chain walk that passes the depth
+bound the catalog's resolve applies, or that revisits a record, is refused and
+reported the same way in any bucket. A refused chain is contained to its own
+bucket: the pass returns normally and still reclaims, or observes, the shard's
+other buckets. Every pass refuses these chains when it walks them, but only
+the observing pass walks every rewrite's chain: a deleting pass skips a
+rewrite still inside its horizon and every record below it. No observing pass
+walks a version 2 head's chain, and it needs none: that chain holds only
+compaction records, and a compaction record applies no erasure request, so a
+refusal there cannot hide a request a `.dreq` waits on. So only an erasure-request
+sweep that runs its own observing pass, as the maintain loop's does, is
+certain to see every refused chain and keep the signal's `.dreq`s that are
+past their horizon.
 
 A rewrite record landing outside both the fixed reconcile window and the
 frontier band is not left to wait indefinitely for one of those two passes to
@@ -733,18 +741,20 @@ every bound is measured.
   collecting the requests every generation applied, and reports every request
   on a chain whose objects it held. A superseded generation's own parts count:
   they still carry whatever the generation above them erased. When the walk
-  cannot reach a raw input because a generation's record is already gone, the
-  requests that generation applied are no longer named anywhere; the sweep
-  reports that bucket as one where a chain was cut, and any candidate `.dreq`
-  is held while such a bucket exists, since no surviving record can say which
-  requests the missing generation applied. A chain group
+  cannot reach a raw input because a rewrite generation's record is already
+  gone, or because the walk was refused, the requests the unwalked
+  generations applied are not collected by the walk; the sweep reports that
+  bucket as one where a chain was cut, and any candidate `.dreq` is held
+  while such a bucket exists, since the walk cannot say which requests those
+  generations applied. A missing compaction record
+  applied no request, so a walk that ends at one cuts nothing. A chain group
   the legal-hold gate skipped holds its requests' `.dreq`s the same way a
   HEAD-held one does, which is what keeps a data-prefix-only hold from
   retiring a filter over data it is preserving.
 
-- **Why the hold terminates.** The cut-chain hold counts only objects the
-  superseded-input sweep actually held on this pass, never the bare presence
-  of a commit record in the bucket: a bucket with a cut chain and no held
+- **Why the hold terminates.** Apart from a refused chain, the cut-chain hold
+  counts only objects the superseded-input sweep actually held on this pass,
+  never the bare presence of a commit record in the bucket: a bucket with a cut chain and no held
   object releases the `.dreq`. Two properties make that reachable. First, the
   delete order within a chain (inputs and each generation's parts before the
   records that superseded them, oldest generation first) means a missing
@@ -757,7 +767,11 @@ every bound is measured.
   and cannot pin any request's filter, however long it sits there. So each
   hold is discharged by the event that released the objects behind it, the
   fold reconciling the hour, an operator rebuilding HEAD, or a human clearing
-  the legal hold, and no state pins a request forever.
+  the legal hold, and no state pins a request forever. A refused chain is the
+  one hold the HEAD gate does not decide: it lasts while its bucket's
+  supersession does not resolve, which is also every resolve over that bucket
+  failing, so it ends when an operator repairs the bucket, and each pass logs
+  the refusal until then.
 
 ### Modifiers to the bound
 
