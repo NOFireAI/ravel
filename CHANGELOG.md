@@ -1531,10 +1531,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the same trailer, column chunk and embedded Arrow schema checks the reader
   applies. A typed `SnapshotError` naming the key refuses the whole snapshot
   for a file changed or deleted after the listing, an empty or truncated
-  file, a footer the reader would refuse, a key the object-store client
-  cannot address exactly, and a file whose schema differs from the first
-  file's; it also refuses a prefix with no file or more than 100,000
-  (`MAX_TABLE_FILES`), and a snapshot that outlives its deadline.
+  file, a footer the reader would refuse, a listed `.parquet` key the
+  object-store client cannot address exactly, and a file whose schema
+  differs from the first file's; it also refuses a prefix with no file or
+  more than 100,000 (`MAX_TABLE_FILES`), and a snapshot that outlives its
+  deadline.
 
 ## [0.19.0] - 2026-09-27
 

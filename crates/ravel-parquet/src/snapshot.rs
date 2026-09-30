@@ -358,6 +358,10 @@ fn key_of(file: &ParquetFile) -> String {
     String::from_utf8_lossy(&file.key).into_owned()
 }
 
+/// `NotFound` means `FileMissing` here because every call site but one is a
+/// read that has not yet proved the object exists. The one exception, the
+/// second GET of a long footer, has already read this same object once and
+/// remaps `FileMissing` to `FileChanged` at its own call site below.
 fn read_error(key: &str, source: StoreError) -> SnapshotError {
     let key = key.to_string();
     match source {
@@ -484,7 +488,14 @@ async fn read_file(
             (footer_start, tail_start),
             &pin,
         )
-        .await?;
+        .await
+        .map_err(|err| match err {
+            // The first read already proved this object exists at this
+            // pin; a NotFound here means it changed since that read, not
+            // that it was never there.
+            SnapshotError::FileMissing { key } => SnapshotError::FileChanged { key },
+            other => other,
+        })?;
         if before.outcome.total_size != size || before.pin != recorded {
             return Err(SnapshotError::FileChanged { key: key.clone() });
         }
@@ -529,7 +540,7 @@ mod tests {
     use async_trait::async_trait;
     use datafusion::arrow::array::{ArrayRef, Int64Array};
     use datafusion::arrow::datatypes::{DataType, Field};
-    use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
+    use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{
         Capabilities, DelimitedList, Etag, GetOutcome, ListPage, ObjectMeta, PageToken, PutOptions,
@@ -602,9 +613,17 @@ mod tests {
         /// from a pin's ETag before reading.
         misreport_listing: bool,
         repeat_page_boundary: bool,
+        /// Replace the reported `total_size` on the 1-based `get_pinned` call
+        /// numbered here, to synthesize a retry or a long-footer second read
+        /// that disagrees on size without racing a real overwrite.
+        lie_total_size_on_call: Option<(usize, u64)>,
+        /// Replace the reported pin's version on the 1-based `get_pinned`
+        /// call numbered here, to synthesize a long-footer second read that
+        /// disagrees with the first without racing a real overwrite.
+        lie_pin_version_on_call: Option<(usize, String)>,
         lists: Mutex<Vec<String>>,
         heads: Mutex<Vec<String>>,
-        gets: Mutex<Vec<(String, GetRange)>>,
+        gets: Mutex<Vec<(String, GetRange, Pin)>>,
     }
 
     impl Scripted {
@@ -622,7 +641,7 @@ mod tests {
                 .clone()
         }
 
-        fn gets(&self) -> Vec<(String, GetRange)> {
+        fn gets(&self) -> Vec<(String, GetRange, Pin)> {
             self.gets
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -667,15 +686,27 @@ mod tests {
             range: GetRange,
             pin: &Pin,
         ) -> Result<PinnedRead, StoreError> {
-            self.gets
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push((key.to_string(), range));
-            let mut pin = pin.clone();
+            let call = {
+                let mut gets = self.gets.lock().unwrap_or_else(PoisonError::into_inner);
+                gets.push((key.to_string(), range, pin.clone()));
+                gets.len()
+            };
+            let mut sent_pin = pin.clone();
             if self.misreport_listing {
-                pin.etag = pin.etag.trim_start_matches("listed:").to_string();
+                sent_pin.etag = sent_pin.etag.trim_start_matches("listed:").to_string();
             }
-            self.inner.get_pinned(key, range, &pin).await
+            let mut read = self.inner.get_pinned(key, range, &sent_pin).await?;
+            if let Some((n, size)) = self.lie_total_size_on_call
+                && n == call
+            {
+                read.outcome.total_size = size;
+            }
+            if let Some((n, ref version)) = self.lie_pin_version_on_call
+                && n == call
+            {
+                read.pin.version = Some(version.clone());
+            }
+            Ok(read)
         }
 
         async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
@@ -924,9 +955,12 @@ mod tests {
         assert_eq!(names, ["a", "b"], "a Hive directory adds no column");
     }
 
-    /// A store may list a key again at the start of the next page. Mutation
-    /// that fails it: dropping the `seen` check lists the repeated file twice
-    /// and counts the repeated marker twice.
+    /// A store may list a key again at the start of the next page; here the
+    /// repeated boundary key is a `.parquet` file on two different page
+    /// boundaries (`data/a.parquet`, then `data/c.parquet`). Mutation that
+    /// fails it: dropping the `seen` check lists each repeated file twice.
+    /// `skipped_keys_repeated_across_a_page_boundary_are_counted_once` below
+    /// covers a marker and a non-`.parquet` key repeating this way.
     #[tokio::test]
     async fn a_key_listed_on_two_pages_is_counted_once() {
         let store = Scripted {
@@ -944,6 +978,30 @@ mod tests {
         assert_eq!(store.lists().len(), 3, "three pages were listed");
         assert_eq!(keys(&got), ["data/a.parquet", "data/c.parquet"]);
         assert_eq!(got.skipped_directory_markers, 2);
+        assert_eq!(got.skipped_other_suffixes, 1);
+    }
+
+    /// A directory marker and a non-`.parquet` key can repeat across a page
+    /// boundary too; the `seen` dedup applies to every listed key before the
+    /// suffix is even looked at, not only to `.parquet` files. With
+    /// `page_size(1)` every key but the last repeats once. Mutation that
+    /// fails it: applying `seen` only to `.parquet` keys, which counts the
+    /// marker and the skipped key twice.
+    #[tokio::test]
+    async fn skipped_keys_repeated_across_a_page_boundary_are_counted_once() {
+        let store = Scripted {
+            inner: MemoryStore::with_page_size(1),
+            repeat_page_boundary: true,
+            ..Scripted::default()
+        };
+        let valid = parquet_bytes(&[1], &["x"]);
+        put(&store, "data/", Bytes::new()).await;
+        put(&store, "data/a.csv", Bytes::from_static(b"csv")).await;
+        put(&store, "data/b.parquet", valid.clone()).await;
+        put(&store, "data/c.parquet", valid).await;
+        let got = snapshot(&store, "s3://lake/data/").await.expect("snapshot");
+        assert_eq!(keys(&got), ["data/b.parquet", "data/c.parquet"]);
+        assert_eq!(got.skipped_directory_markers, 1);
         assert_eq!(got.skipped_other_suffixes, 1);
     }
 
@@ -1010,9 +1068,12 @@ mod tests {
         ));
     }
 
-    /// Mutation that fails it: `MAX_TABLE_FILES` raised by one, or the limit
-    /// check moved after the push (`len > limit`), admits 100,001 files and
-    /// goes on to read their footers.
+    /// Mutation that fails it: `MAX_TABLE_FILES` raised by one, or the check
+    /// kept before the push but written `len > limit` instead of `== limit`
+    /// (an off-by-one that lets exactly one extra file through silently;
+    /// with only `MAX_TABLE_FILES + 1` synthetic files here it never fires
+    /// in this loop at all, so the snapshot admits 100,001 files and goes on
+    /// to read their footers).
     #[tokio::test]
     async fn more_than_the_file_limit_refuses_before_any_footer_read() {
         let store = Scripted {
@@ -1129,13 +1190,23 @@ mod tests {
         );
         assert_ne!(version, "listed-version");
         let size = bytes.len() as u64;
+        let listed_pin = Pin::etag(format!("listed:{}", meta.etag.0));
         assert_eq!(
             store.gets(),
             [
-                ("data/a.parquet".to_string(), GetRange::Range(0, size - 1)),
-                ("data/a.parquet".to_string(), GetRange::Range(0, size)),
+                (
+                    "data/a.parquet".to_string(),
+                    GetRange::Range(0, size - 1),
+                    listed_pin.clone()
+                ),
+                (
+                    "data/a.parquet".to_string(),
+                    GetRange::Range(0, size),
+                    listed_pin
+                ),
             ],
-            "the misplaced first read is redone at the size the response reported"
+            "the misplaced first read is redone at the size the response reported, \
+             both reads pinned on the listed (misreported) ETag"
         );
     }
 
@@ -1160,6 +1231,8 @@ mod tests {
         let footer_len = footer_len_of(&bytes);
         assert!(u64::from(footer_len) + TRAILER_LEN > FOOTER_PREFETCH);
         put(&store, "data/wide.parquet", bytes.clone()).await;
+        let (meta, pin) = store.inner.pin_of("data/wide.parquet").await.expect("pin");
+        let version = pin.version.clone().expect("MemoryStore reports a version");
         let accounting = PhaseAccounting::new();
         let limiter = GetLimiter::new(4).expect("permits");
         let got = snapshot_location(
@@ -1183,13 +1256,20 @@ mod tests {
             [
                 (
                     "data/wide.parquet".to_string(),
-                    GetRange::Range(tail_start, size)
+                    GetRange::Range(tail_start, size),
+                    Pin::etag(meta.etag.0.clone())
                 ),
                 (
                     "data/wide.parquet".to_string(),
-                    GetRange::Range(footer_start, tail_start)
+                    GetRange::Range(footer_start, tail_start),
+                    Pin {
+                        etag: meta.etag.0,
+                        version: Some(version),
+                    }
                 ),
-            ]
+            ],
+            "the second GET selects the version the first read saw and keeps \
+             If-Match on the listed ETag"
         );
         let spent = accounting.snapshot();
         let get = AccountedOp::Get.index();
@@ -1199,6 +1279,67 @@ mod tests {
         assert_eq!(spent.resolve.s3_requests[list], 1);
         assert_eq!(spent.resolve.s3_requests[get], 0);
         assert_eq!(spent.scan, Default::default());
+    }
+
+    /// The long footer's second GET has already read this object once, at
+    /// the tail read above; a `NotFound` there means the object changed
+    /// since, not that it was never there. Mutation that fails it: reporting
+    /// `FileMissing` for this GET instead of remapping it to `FileChanged`
+    /// (confirmed against the code before this fix: the same scenario
+    /// reported `FileMissing`).
+    #[tokio::test]
+    async fn a_notfound_on_the_long_footers_second_get_reports_the_file_changed() {
+        let inner = MemoryStore::new();
+        let bytes = wide_parquet_bytes(1500);
+        put(&inner, "data/wide.parquet", bytes).await;
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::NotFoundBlip)
+                .with_key_contains("wide.parquet".to_string())
+                .with_occurrence(Occurrence::Nth(2)),
+        );
+        let store = FaultStore::new(inner, plan);
+        match snapshot(&store, "s3://lake/data/").await {
+            Err(SnapshotError::FileChanged { key }) => assert_eq!(key, "data/wide.parquet"),
+            other => panic!("expected FileChanged, got {other:?}"),
+        }
+    }
+
+    /// The long footer's second GET reports a pin whose version disagrees
+    /// with the one the first read saw: the object changed between the two
+    /// reads. Mutation that fails it: comparing only `total_size`, not
+    /// `pin`, between the two reads.
+    #[tokio::test]
+    async fn a_second_footer_read_whose_reported_pin_disagrees_with_the_first_refuses_as_changed() {
+        let store = Scripted {
+            lie_pin_version_on_call: Some((2, "lied-version".to_string())),
+            ..Scripted::default()
+        };
+        let bytes = wide_parquet_bytes(1500);
+        put(&store, "data/wide.parquet", bytes).await;
+        match snapshot(&store, "s3://lake/data/").await {
+            Err(SnapshotError::FileChanged { key }) => assert_eq!(key, "data/wide.parquet"),
+            other => panic!("expected FileChanged, got {other:?}"),
+        }
+    }
+
+    /// A retry (forced here by a misreported listed size) whose second read
+    /// again disagrees on `total_size` refuses instead of looping or reading
+    /// past the file. Mutation that fails it: dropping the second
+    /// `total_size` check and trusting the first mismatch was the only one.
+    #[tokio::test]
+    async fn a_size_that_disagrees_again_on_retry_refuses_as_changed() {
+        let bytes = parquet_bytes(&[1, 2, 3], &["x", "y", "z"]);
+        let lie = bytes.len() as u64 + 1;
+        let store = Scripted {
+            misreport_listing: true,
+            lie_total_size_on_call: Some((2, lie)),
+            ..Scripted::default()
+        };
+        put(&store, "data/a.parquet", bytes).await;
+        match snapshot(&store, "s3://lake/data/").await {
+            Err(SnapshotError::FileChanged { key }) => assert_eq!(key, "data/a.parquet"),
+            other => panic!("expected FileChanged, got {other:?}"),
+        }
     }
 
     /// Mutation that fails it: reporting the expiry as any other error.
@@ -1238,6 +1379,7 @@ mod tests {
             let bytes = parquet_bytes(&[1], &["x"]);
             put(&store, key, bytes.clone()).await;
             put(&store, "data/two.parquet", parquet_bytes(&[2], &["y"])).await;
+            let etag = store.inner.head(key).await.expect("head").etag.0;
             let accounting = PhaseAccounting::new();
             let limiter = GetLimiter::new(4).expect("permits");
             let got = snapshot_location(
@@ -1253,7 +1395,10 @@ mod tests {
             assert!(store.lists().is_empty());
             assert_eq!(store.heads(), [key]);
             let size = bytes.len() as u64;
-            assert_eq!(store.gets(), [(key.to_string(), GetRange::Range(0, size))]);
+            assert_eq!(
+                store.gets(),
+                [(key.to_string(), GetRange::Range(0, size), Pin::etag(etag))]
+            );
             assert_eq!(
                 (got.skipped_directory_markers, got.skipped_other_suffixes),
                 (0, 0)
