@@ -442,6 +442,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The operator CRD refuses a zero maintain or fold interval at admission**
+  (issue #2266). `spec.maintain.intervalSecs` and
+  `spec.maintain.fold.intervalSecs` render into `--maintain-interval-secs` and
+  `--fold-interval-secs`, which `ravel-server` refuses to start with at `0`,
+  since either loop would run without pause. The CRD schema accepted `0`, so
+  such a `RavelCluster` passed admission and its maintain pods crash-looped.
+  Both fields now carry `minimum: 1` and the API server rejects `0`.
+  Reapply `deploy/k8s/operator/crd.yaml` to pick up the bound.
+
 - **A gateway starts under a small memory limit** (issue #2234).
   `ravel-server` refused to start in every mode under a cgroup memory limit of
   2 GiB or less, because the process memory budget (effective memory minus a
