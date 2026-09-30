@@ -1130,8 +1130,8 @@ sections describe.
    computed and verified locally before upload as a pre-flight guard; that
    CRC32C is not itself sent to the store. On S3, `ravel-server` attaches a
    separate CRC64-NVME checksum to every PUT by default
-   (`--s3-upload-integrity`; stores routed by `--tenant-kms-config` do not
-   apply it yet), which the endpoint verifies on receipt and
+   (`--s3-upload-integrity`, which also reaches the stores
+   `--tenant-kms-config` routes to), which the endpoint verifies on receipt and
    stores, and a full-object GET verifies the body against it
    (docs/object-store-contract.md, "Upload checksums" and "Read-side checksum
    verification"). `AlreadyExists` is

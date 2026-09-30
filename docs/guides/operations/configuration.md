@@ -124,8 +124,8 @@ error naming the missing one. It never starts in a half-configured state.
 ### Upload and read checksums
 
 Every PUT carries a CRC64-NVME checksum (`x-amz-checksum-crc64nvme`) by
-default, except from the per-tenant stores `--tenant-kms-config` routes to
-(see below). An object of any size up to S3's 5 GiB single-request limit is
+default, including those from the per-tenant stores `--tenant-kms-config`
+routes to. An object of any size up to S3's 5 GiB single-request limit is
 sent as one checksummed PUT rather than in parts. The endpoint verifies the body against it and rejects a PUT whose
 bytes changed on the way, so a corrupted object never becomes visible, and it
 stores the checksum with the object. Every request except a LIST also asks the
@@ -151,8 +151,8 @@ its cost is that every object the process writes, commit records included,
 has no transport checksum to verify against. An endpoint that rejects the
 checksum-mode request header needs `--s3-request-stored-checksum=false`. Both
 flags are ignored under `--store memory`. The per-tenant stores that
-`--tenant-kms-config` routes to do not apply either flag yet: their PUTs carry
-no upload checksum and their reads always ask for the stored one.
+`--tenant-kms-config` routes to apply both flags exactly as the default store
+does.
 
 A read that finds no stored checksum it can check is served, never refused, and
 counted in `ravel_store_get_unverified_total` (see
@@ -602,8 +602,10 @@ applies with a 16 MiB factor.
 
 ## Read cache tiers
 
-The read cache has a RAM tier, always on unless `--disable-cache`, and an
-opt-in local-disk tier. `--cache-dir <path>` attaches the disk tier at that
+The read cache has a RAM tier, on unless `--disable-cache` is set or its
+ceiling resolves to `0` (what a gateway resolves when no ceiling flag is
+set), and an opt-in
+local-disk tier. `--cache-dir <path>` attaches the disk tier at that
 directory to both the query fetcher cache and the catalog byte cache, so a RAM
 eviction is served from local disk instead of paying the object-store round trip
 again:
@@ -1296,7 +1298,12 @@ not applicable in gateway mode, and its `ravel_memory_budget_bytes` reads
 catalog byte cache, so its `/metrics` carries no `cache="catalog"` series
 for `ravel_cache_hits_total`, `ravel_cache_misses_total`,
 `ravel_cache_resident_entries`, `ravel_cache_resident_bytes` or
-`ravel_cache_max_bytes`. Every other mode (`all`, `query`, `maintain`) still needs
+`ravel_cache_max_bytes`. Likewise, unless `--cache-max-bytes` is set, a
+gateway builds no fetcher cache, and under `--cache-dir` no disk tier for it,
+so its `/metrics` carries no `cache="fetch"` series for any of those
+families. With neither flag set, no `ravel_cache_*` family renders at all.
+In any mode, a `--cache-max-bytes` of `0` builds no fetcher cache.
+Every other mode (`all`, `query`, `maintain`) still needs
 effective memory above the 2 GiB reserve plus whatever its two cache
 ceilings claim. The current state is visible
 live at `/metrics`: `ravel_memory_budget_bytes` (the ceiling of that shared

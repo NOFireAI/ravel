@@ -25,8 +25,8 @@ const CACHE_MAX_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
 const CACHE_MAX_ENTRIES: usize = 1_000_000;
 
 /// Build the ADR-0046 read cache from CLI config as a [`ravel_query::ReadCache`]
-/// (RAM-only or RAM-over-disk), or `None` when `--disable-cache` is set. `None`
-/// must leave query behavior byte-for-byte identical to a build with no cache
+/// (RAM-only or RAM-over-disk), or `None` when `--disable-cache` is set or
+/// `cache_max_bytes` is `0`. `None` must leave query behavior byte-for-byte identical to a build with no cache
 /// wiring at all: callers pass it to
 /// `SegmentFetcher`/`LogSegmentFetcher`/`QueryEngine`'s `with_cache` only when
 /// `Some`.
@@ -36,6 +36,12 @@ const CACHE_MAX_ENTRIES: usize = 1_000_000;
 /// rather than read off `cli`: an unset flag is a share of the host's memory,
 /// and reading the raw `Option` here would silently cache 256 MiB on a host
 /// whose startup log announced 24 GiB.
+///
+/// `0` is the disabled sentinel, as `byte_cache_max_bytes` is for the catalog
+/// byte cache (`query::build_catalog`): a gateway resolves both ceilings to `0`
+/// when neither flag is set, and a zero-capacity cache would still count
+/// misses on `/metrics` and, under `--cache-dir`, run the disk tier's age
+/// sweep over a directory it can never fill.
 ///
 /// With no `--cache-dir`, this returns [`ravel_query::ReadCache::Ram`], byte-for-byte
 /// the pre-#97 RAM-only cache (same `--cache-max-bytes` budget and the same
@@ -53,7 +59,7 @@ const CACHE_MAX_ENTRIES: usize = 1_000_000;
 /// inside a Tokio runtime; `build_store`'s caller (`main`) is `#[tokio::main]`,
 /// so this holds on every `--cache-dir` startup.
 pub fn build_cache(cli: &Cli, cache_max_bytes: u64) -> Option<ravel_query::ReadCache> {
-    if cli.disable_cache {
+    if cli.disable_cache || cache_max_bytes == 0 {
         return None;
     }
     let ram_limits = CacheLimits::new(cache_max_bytes, CACHE_MAX_ENTRIES, CACHE_MAX_ENTRY_BYTES);
@@ -226,7 +232,8 @@ pub struct BuiltStore {
     /// traffic alike). Distinct from the per-class metrics on [`Self::classed`].
     pub metrics: Arc<StoreMetrics>,
     /// The ADR-0046 read cache (RAM-only, or RAM-over-disk when `--cache-dir` is
-    /// set), `None` when `--disable-cache` is set. The caller attaches it to the
+    /// set), `None` when `--disable-cache` is set or the ceiling resolves to
+    /// `0`. The caller attaches it to the
     /// query fetchers via their existing `with_cache` builders.
     pub cache: Option<ravel_query::ReadCache>,
     /// A handle onto the live [`KmsRoutingStore`] embedded in the backend chain,
@@ -433,13 +440,14 @@ pub fn build_store(cli: &Cli, cache_max_bytes: u64) -> anyhow::Result<BuiltStore
             // `ravel_store_calls_total` come from one snapshot (issue #928). Built
             // before the store so the connector and the decorator share it.
             let metrics = Arc::new(StoreMetrics::default());
+            let http = cli.s3_http_config();
             // Shared rather than owned by the chain so the bucket-protection gate
             // can reach the concrete store; `Arc<S3Store>` forwards every backend
             // method to it.
             let store = Arc::new(
                 S3Store::with_http_config_and_metrics(
                     config.clone(),
-                    cli.s3_http_config(),
+                    http.clone(),
                     Arc::clone(&metrics),
                 )
                 .map_err(|err| anyhow::anyhow!("failed to build S3 store: {err}"))?,
@@ -454,10 +462,13 @@ pub fn build_store(cli: &Cli, cache_max_bytes: u64) -> anyhow::Result<BuiltStore
                 // factory: each KMS-routed S3Store records its billed HTTP
                 // requests (attempts) into the one block the base store and the
                 // InstrumentedStore below already share, so a routed write's
-                // attempts are counted, not dropped (issue #928).
+                // attempts are counted, not dropped (issue #928). The same HTTP
+                // config goes with it, so a routed write carries the upload
+                // checksum and stored-checksum request the flags select.
                 let kms = Arc::new(KmsRoutingStore::new(
                     store as Arc<dyn ObjectStoreBackend>,
                     config,
+                    http,
                     Arc::clone(&metrics),
                 ));
                 let instrumented = InstrumentedStore::with_metrics(
@@ -1064,6 +1075,14 @@ mod tests {
     async fn kms_routed_build(
         tenant_hash: &str,
     ) -> (Arc<dyn ObjectStoreBackend>, Arc<StoreMetrics>, Arc<MockS3>) {
+        kms_routed_build_with(tenant_hash, &[]).await
+    }
+
+    /// [`kms_routed_build`] with `extra` flags appended to the command line.
+    async fn kms_routed_build_with(
+        tenant_hash: &str,
+        extra: &[&str],
+    ) -> (Arc<dyn ObjectStoreBackend>, Arc<StoreMetrics>, Arc<MockS3>) {
         use clap::Parser;
         use std::io::Write;
 
@@ -1078,7 +1097,7 @@ mod tests {
         )
         .expect("write temp file");
 
-        let cli = Cli::try_parse_from([
+        let mut argv = vec![
             "ravel-server",
             "--store",
             "s3",
@@ -1092,8 +1111,9 @@ mod tests {
             "test",
             "--tenant-kms-config",
             file.path().to_str().expect("temp path is valid utf-8"),
-        ])
-        .expect("flags parse");
+        ];
+        argv.extend_from_slice(extra);
+        let cli = Cli::try_parse_from(argv).expect("flags parse");
 
         let BuiltStore {
             foreground: store,
@@ -1236,8 +1256,8 @@ mod tests {
     /// The count is pinned EXACTLY to what the mock endpoint served, not `> 0`:
     /// a fraction of the truth passes a `> 0` assertion, which is the very
     /// failure being fixed. Reverting the per-tenant factory in
-    /// `KmsRoutingStore::new` from `S3Store::with_metrics` back to
-    /// `S3Store::new` turns this red: the routed put's store then records no
+    /// `KmsRoutingStore::new` from `S3Store::with_http_config_and_metrics`
+    /// back to `S3Store::new` turns this red: the routed put's store then records no
     /// attempt, so `put.attempts` reads 0 while the mock still served a PUT.
     #[tokio::test]
     async fn kms_routed_write_counts_attempts_into_shared_metrics() {
@@ -1393,6 +1413,10 @@ mod tests {
         /// Every `x-amz-checksum-*` header of the most recent PUT, sorted by
         /// name, so a test can see which checksum the built store attached.
         put_checksum_headers: std::sync::Mutex<Vec<(String, String)>>,
+        /// The `x-amz-server-side-encryption-aws-kms-key-id` of the most
+        /// recent PUT, empty when it carried none, so a test can tell a
+        /// write through a per-tenant KMS store from one through the default.
+        put_kms_key_id: std::sync::Mutex<String>,
     }
 
     async fn spawn_mock_s3() -> (String, Arc<MockS3>) {
@@ -1434,6 +1458,8 @@ mod tests {
                 .put_checksum_headers
                 .lock()
                 .expect("put_checksum_headers lock") = checksum_headers;
+            *state.put_kms_key_id.lock().expect("put_kms_key_id lock") =
+                header_text("x-amz-server-side-encryption-aws-kms-key-id");
             state
                 .put_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1704,6 +1730,113 @@ mod tests {
             header_names(&no_mode),
             vec!["x-amz-checksum-crc64nvme"],
             "--s3-request-stored-checksum=false sends no checksum-mode header"
+        );
+    }
+
+    /// The checksum headers of one routed tenant write under
+    /// `--tenant-kms-config` plus `extra`, after checking the PUT went through
+    /// the per-tenant store (it carries the tenant's SSE-KMS key id).
+    async fn routed_put_checksum_headers_for(extra: &[&str]) -> Vec<(String, String)> {
+        let tenant_hash = "00112233445566778899aabbccddeeff";
+        let (store, _metrics, mock) = kms_routed_build_with(tenant_hash, extra).await;
+        store
+            .put(
+                &format!("t/{tenant_hash}/seg/0001"),
+                Bytes::from_static(b"payload"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("routed put through the per-tenant KMS store");
+        assert_eq!(
+            mock.put_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "precondition: the mock served exactly one PUT"
+        );
+        assert_eq!(
+            *mock.put_kms_key_id.lock().expect("put_kms_key_id lock"),
+            "arn:aws:kms:us-east-1:111122223333:key/acme",
+            "precondition: the PUT went through the per-tenant KMS store"
+        );
+        mock.put_checksum_headers
+            .lock()
+            .expect("put_checksum_headers lock")
+            .clone()
+    }
+
+    /// `--s3-upload-integrity` and `--s3-request-stored-checksum` reach a
+    /// tenant write `--tenant-kms-config` routes to a per-tenant store, not
+    /// only the default store (issue #2224): with no flag the routed PUT
+    /// carries `x-amz-checksum-crc64nvme` and `x-amz-checksum-mode`, `off`
+    /// drops the upload checksum, and `--s3-request-stored-checksum=false`
+    /// drops the mode header. A per-tenant store built from
+    /// `S3HttpConfig::default()` sends no upload checksum and fails the
+    /// default case.
+    #[tokio::test]
+    async fn s3_checksum_flags_reach_the_kms_routed_put_on_the_wire() {
+        let default = routed_put_checksum_headers_for(&[]).await;
+        assert_eq!(
+            header_names(&default),
+            vec!["x-amz-checksum-crc64nvme", "x-amz-checksum-mode"],
+            "the default routed PUT carries CRC64-NVME and asks for stored checksums"
+        );
+
+        let off = routed_put_checksum_headers_for(&["--s3-upload-integrity", "off"]).await;
+        assert_eq!(
+            header_names(&off),
+            vec!["x-amz-checksum-mode"],
+            "--s3-upload-integrity off attaches no upload checksum to a routed PUT"
+        );
+
+        let no_mode =
+            routed_put_checksum_headers_for(&["--s3-request-stored-checksum=false"]).await;
+        assert_eq!(
+            header_names(&no_mode),
+            vec!["x-amz-checksum-crc64nvme"],
+            "--s3-request-stored-checksum=false sends no checksum-mode header on a routed PUT"
+        );
+    }
+
+    /// A `0` fetcher-cache ceiling builds no cache, with or without
+    /// `--cache-dir`, so a gateway (which resolves the ceiling to `0` when no
+    /// flag is set) holds neither a zero-capacity RAM tier nor a disk tier
+    /// running its age sweep (issue #2241). The nonzero builds are the
+    /// control: the same command lines build a cache, and `--cache-dir`
+    /// builds the tiered one.
+    #[tokio::test]
+    async fn zero_cache_ceiling_builds_no_fetcher_cache_and_no_disk_tier() {
+        use clap::Parser;
+
+        let dir = tempfile::tempdir().expect("create temp cache dir");
+        let ram_only = Cli::try_parse_from(["ravel-server"]).expect("flags parse");
+        let with_dir = Cli::try_parse_from([
+            "ravel-server",
+            "--cache-dir",
+            dir.path().to_str().expect("temp path is valid utf-8"),
+        ])
+        .expect("flags parse");
+
+        assert!(
+            matches!(
+                build_cache(&ram_only, crate::config::DEFAULT_CACHE_MAX_BYTES),
+                Some(ravel_query::ReadCache::Ram(_))
+            ),
+            "control: a nonzero ceiling builds the RAM cache"
+        );
+        assert!(
+            matches!(
+                build_cache(&with_dir, crate::config::DEFAULT_CACHE_MAX_BYTES),
+                Some(ravel_query::ReadCache::Tiered(_))
+            ),
+            "control: a nonzero ceiling under --cache-dir builds the disk tier"
+        );
+
+        assert!(
+            build_cache(&ram_only, 0).is_none(),
+            "a 0 ceiling builds no fetcher cache"
+        );
+        assert!(
+            build_cache(&with_dir, 0).is_none(),
+            "a 0 ceiling under --cache-dir builds no fetcher cache and no disk tier"
         );
     }
 

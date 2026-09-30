@@ -364,7 +364,8 @@ names, environment variables and defaults: `--s3-upload-integrity`
 `S3HttpConfig::default()` any more. Two kinds of S3 store still do: the
 per-tenant stores `--tenant-kms-config` routes to
 (`crates/ravel-object-store/src/kms_routing.rs`, through
-`S3Store::with_metrics`; issue #2224), and the read-only external Parquet
+`S3Store::with_metrics`; issue #2224; see the KMS-routed stores amendment
+below, which changes this), and the read-only external Parquet
 profile stores (`crates/ravel-object-store/src/external.rs`, through
 `S3Store::new`), which `ravel-cli` reaches from `parquet_grant.rs` and
 `ravel-sql` from its Parquet reads. The `request_stored_checksum` flag the
@@ -407,3 +408,15 @@ claims multipart carries no checksum. The Context's `s3.rs:1628-1646` cite
 for the exclusion and the refusal is stale: the exclusion is now at
 `s3.rs:2363-2368` and the refusal at `s3.rs:2377-2384`.
 
+## Amendment (2026-10-01): KMS-routed stores carry the checksum settings
+
+<!-- amendment-applies: sections="Amendment (2026-09-30): the CLI flags and the qualification Job carry the checksum settings" pointer="KMS-routed stores amendment" -->
+
+The previous amendment listed the per-tenant stores `--tenant-kms-config`
+routes to as still built with `S3HttpConfig::default()`. They no longer are:
+`KmsRoutingStore::new` takes the `S3HttpConfig` the default store was built
+with and builds each tenant store through
+`S3Store::with_http_config_and_metrics`, so a routed tenant write attaches
+the same upload checksum and sends the same stored-checksum request as every
+other write. The read-only external Parquet profile stores are the one kind
+of S3 store still built with the default config.

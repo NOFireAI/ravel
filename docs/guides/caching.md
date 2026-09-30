@@ -52,9 +52,9 @@ prefixes, and the `alerts` and `audit` tables read them through that same log
 fetcher, so their bytes are cached on the same terms as any other log object:
 whole object or block ranges by the same size threshold and fetch policy, keyed
 the same way, accounted through the same funnel, and held by whichever tiers
-the process built: the RAM tier always, plus the local-disk tier when
-`--cache-dir` is set, exactly as for `logs`. Nothing about the cache is
-specific to those two signals.
+the process built: the RAM tier whenever the fetcher cache is built, plus the
+local-disk tier when `--cache-dir` is set, exactly as for `logs`. Nothing about
+the cache is specific to those two signals.
 
 One thing is not cached:
 
@@ -72,8 +72,10 @@ or not present at all.
 
 ## Two tiers
 
-The cache has a RAM tier and a local-disk tier. The RAM tier is always on
-(unless `--disable-cache`). The disk tier is opt-in: `--cache-dir <path>`
+The cache has a RAM tier and a local-disk tier. The RAM tier is on unless
+`--disable-cache` is set or the fetcher cache's ceiling is `0`: a
+`--cache-max-bytes` of `0` builds no fetcher cache, and a gateway with neither
+cache flag set resolves both ceilings to `0`. The disk tier is opt-in: `--cache-dir <path>`
 attaches a local-disk tier at that directory to both the fetcher cache and the
 catalog byte cache, so a RAM eviction is served from local disk instead of
 re-paying the object-store round trip. With no `--cache-dir`, the process has
@@ -275,7 +277,9 @@ below can be computed per cache or summed across both:
   than its access pattern would suggest and nothing else.
 
 With both caches off (`--disable-cache`), none of these samples appear on
-`/metrics` at all: neither `cache="fetch"` nor `cache="catalog"`.
+`/metrics` at all: neither `cache="fetch"` nor `cache="catalog"`. A fetcher
+cache whose ceiling is `0` is not built either, so `cache="fetch"` is absent
+in that case too.
 
 Request hit rate is
 `hits / (hits + misses)`; byte hit rate is `bytes_served / (bytes_served +
