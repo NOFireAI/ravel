@@ -822,8 +822,8 @@ fn phase<'a>(value: &'a Value, name: &str) -> &'a Value {
 /// ADR-2040 reachability, issue #2053: a tenant's Parquet table, granted and
 /// created the way the operator and DDL paths write them, answers a filtered
 /// SELECT on `POST /api/v1/sql` with its exact rows, and the response's
-/// accounting puts the manifest and grants reads in Resolve, the footer and
-/// page index in Probe, and the data in Scan.
+/// accounting puts the manifest and grants reads in Resolve, the footer in
+/// Probe (no page index), and the data in Scan.
 #[tokio::test]
 async fn a_parquet_table_is_queryable_over_http() {
     use ravel_object_store::instrument::{InstrumentedStore, StoreOp};
@@ -854,8 +854,8 @@ async fn a_parquet_table_is_queryable_over_http() {
     assert_eq!(resolve["s3GetRequests"], 2, "{value}");
     assert_eq!(
         phase(&value, "probe")["s3GetRequests"],
-        2,
-        "the footer and the page index: {value}"
+        1,
+        "the footer and no page index: {value}"
     );
     let scan = phase(&value, "scan")["s3GetRequests"]
         .as_u64()
@@ -863,7 +863,7 @@ async fn a_parquet_table_is_queryable_over_http() {
     assert!(scan > 0, "{value}");
     assert_eq!(
         lake.metrics().snapshot().op(StoreOp::Get).calls,
-        2 + scan,
+        1 + scan,
         "every lake GET is in Probe or Scan"
     );
 }
