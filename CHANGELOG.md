@@ -459,6 +459,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   heartbeat under `--distributed-query` also refuses a zero period rather than
   writing heartbeats without pause; no flag sets that period today.
 
+- **The operator CRD refuses a zero maintain or fold interval at admission**
+  (issue #2266). `spec.maintain.intervalSecs` and
+  `spec.maintain.fold.intervalSecs` render into `--maintain-interval-secs` and
+  `--fold-interval-secs`, which `ravel-server` now refuses to start with at
+  `0` (see the entry above). The CRD schema accepted `0`, so such a
+  `RavelCluster` passed admission and its maintain pods would crash-loop.
+  Both fields now carry `minimum: 1` and the API server rejects `0`.
+  Reapply `deploy/k8s/operator/crd.yaml` to pick up the bound. A
+  `RavelCluster` already stored with `0` keeps it after the reapply, and its
+  maintain pods keep crash-looping until the field is edited to `1` or more.
+
 - **An S3 delete refused for one key now reads as access denied, so the
   superseded sweep holds back that one chain instead of failing the pass**
   (issues #2227 and #2220). `S3Store::delete` goes out as a `DeleteObjects`
