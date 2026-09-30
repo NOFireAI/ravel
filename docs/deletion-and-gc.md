@@ -569,6 +569,19 @@ maintenance tick.
   shard sweep over the alerts shard, so orphan GC quarantines those under the
   rules above. A mass-orphan breaker trip there counts under
   `ravel_maintain_orphan_breaker_tripped_total{signal="alerts"}`.
+- **The alerts shard sweep is skipped for a tenant with no alert objects.**
+  Unless that tick's memo read or the absent-memo listing of the alert commit
+  prefix already found an object, the driver first lists the tenant's whole
+  alert keyspace (`t/<tenant_hash>/a/`) and the quarantine mirror of it
+  (`quarantine/t/<tenant_hash>/a/`), one bounded listing each, and skips the
+  sweep only when both come back empty. The commit prefix alone is not enough:
+  an orphan data object sits under `l0/` beside an empty `c/`, and the
+  quarantine reaper still has copies after orphan GC moved the last live
+  object. Every rule the sweep runs lists under one of those two prefixes, so
+  both empty means every rule would find nothing, and an object written after
+  either listing is younger than every age gate the sweep applies, so skipping
+  that tick defers no work the sweep could have done. A gate listing that fails
+  has not shown the keyspace empty, so the sweep runs.
 - The sweep's outcome (records and data deleted, records kept, and those kept
   only as current state) is a log line, not part of the per-signal maintenance
   report or safety metrics.

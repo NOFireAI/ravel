@@ -236,12 +236,16 @@ pub struct SweepReport {
     /// extra request because rule 3 already listed the `l1/` prefix; feeds
     /// `ravel_maintain_bytes_reclaimed_total`.
     pub unreferenced_parts_bytes: u64,
-    /// Bytes of the objects [`Self::superseded_data_deleted`] deleted this
-    /// pass: each L0 data object at its commit record's `object_size`, and each
-    /// superseded L1 part at the `object_size` its compaction or rewrite record
-    /// carries. Rule 2 already read those records to find the keys, so this
-    /// costs no request; it is the size the writer recorded, not a listed size
-    /// or wire bytes. Feeds `ravel_maintain_bytes_reclaimed_total`.
+    /// Bytes of the objects [`Self::superseded_data_deleted`] deleted: each L0
+    /// data object at its commit record's `object_size`, charged on the pass
+    /// that deletes it, and each superseded L1 part at the `object_size` its
+    /// compaction or rewrite record carries, charged on the pass that deletes
+    /// that record. A part delete that finds nothing still succeeds, so a part
+    /// charged on its own delete would be charged again by the next pass
+    /// whenever the record naming it was refused. Rule 2 already read those
+    /// records to find the keys, so this costs no request; it is the size the
+    /// writer recorded, not a listed size or wire bytes. Feeds
+    /// `ravel_maintain_bytes_reclaimed_total`.
     pub superseded_data_bytes: u64,
     /// Rule 1's mass-orphan circuit breaker tripped this pass (ADR-0048
     /// decision 4): `orphans_deleted` is `0` and `orphans_withheld` carries
@@ -1255,7 +1259,8 @@ impl SweepMode {
 /// Also returns the bytes of the data objects and parts
 /// [`SupersededSweepOutcome::data_deleted`] counts, each charged at the
 /// `object_size` the record naming it carries, so sizing them costs no
-/// request ([`SweepReport::superseded_data_bytes`]).
+/// request ([`SweepReport::superseded_data_bytes`]). A part is charged when the
+/// chain record naming it is deleted, not when the part is.
 #[allow(clippy::too_many_arguments)]
 async fn sweep_superseded_impl(
     reach: &mut SnapshotReachability,
@@ -1685,6 +1690,8 @@ async fn sweep_superseded_impl(
                         data_bytes.saturating_add(group.data_sizes.get(k).copied().unwrap_or(0));
                 } else {
                     outcome.records_deleted += 1;
+                    data_bytes =
+                        data_bytes.saturating_add(group.part_bytes.get(k).copied().unwrap_or(0));
                 }
             }
         }
@@ -2070,11 +2077,13 @@ impl Version2Groups {
             let Some(record) = compactions.get(key) else {
                 continue;
             };
+            let mut record_part_bytes = 0u64;
             for (part_key, object, size) in ChainLink::Compaction(record.clone()).part_targets()? {
-                group.data_sizes.insert(part_key.clone(), size);
+                record_part_bytes = record_part_bytes.saturating_add(size);
                 group.data_keys.push(part_key);
                 group.objects.push(object);
             }
+            group.part_bytes.insert(key.to_string(), record_part_bytes);
             joined_keys.push(key.to_string());
         }
         joined_keys.append(&mut group.chain_record_keys);
@@ -2159,10 +2168,13 @@ struct SupersededGroup {
     ingest_hour_bucket: u32,
     record_keys: Vec<String>,
     data_keys: Vec<String>,
-    /// The size of each of `data_keys` as recorded in the record that names
-    /// it: the L0 commit record's `object_size`, or the part's own
-    /// `object_size` in its compaction or rewrite record.
+    /// The size of each L0 data object in `data_keys`, as its commit record's
+    /// `object_size` records it. A part has no entry here: see `part_bytes`.
     data_sizes: HashMap<String, u64>,
+    /// For each of `chain_record_keys`, the summed `object_size` of the parts
+    /// it names, charged when that record's delete succeeds. A part delete that finds nothing still succeeds, so
+    /// the next pass after a refused record delete deletes the same parts again.
+    part_bytes: HashMap<String, u64>,
     /// The supersession chain's own compaction/rewrite records, oldest
     /// generation first, deleted after every object they superseded.
     chain_record_keys: Vec<String>,
@@ -2200,6 +2212,7 @@ impl SupersededGroup {
             record_keys: Vec::new(),
             data_keys: Vec::new(),
             data_sizes: HashMap::new(),
+            part_bytes: HashMap::new(),
             chain_record_keys: Vec::new(),
             objects: Vec::new(),
             request_ids: BTreeSet::new(),
@@ -2259,6 +2272,12 @@ impl SupersededGroup {
         self.data_sizes.extend(
             other
                 .data_sizes
+                .iter()
+                .map(|(key, size)| (key.clone(), *size)),
+        );
+        self.part_bytes.extend(
+            other
+                .part_bytes
                 .iter()
                 .map(|(key, size)| (key.clone(), *size)),
         );
@@ -2347,6 +2366,7 @@ async fn gather_l0_inputs(
                     identity: commit_key.clone(),
                     record_keys: vec![commit_key],
                     data_sizes: HashMap::from([(data_key.clone(), rec.object_size)]),
+                    part_bytes: HashMap::new(),
                     data_keys: vec![data_key],
                     chain_record_keys: Vec::new(),
                     objects: vec![SnapshotObject::L0 {
@@ -2796,6 +2816,7 @@ async fn walk_superseded_chain(
     let mut input_record_keys: Vec<String> = Vec::new();
     let mut input_data_keys: Vec<String> = Vec::new();
     let mut data_sizes: HashMap<String, u64> = HashMap::new();
+    let mut part_bytes: HashMap<String, u64> = HashMap::new();
     let mut objects: Vec<SnapshotObject> = Vec::new();
     let mut ingest_hour_bucket: Option<u32> = None;
     let mut request_ids: BTreeSet<String> = BTreeSet::new();
@@ -2869,11 +2890,13 @@ async fn walk_superseded_chain(
                 request_ids.insert(canonical_request_id(id));
             }
         }
+        let mut record_part_bytes = 0u64;
         for (part_key, object, size) in link.part_targets()? {
-            data_sizes.insert(part_key.clone(), size);
+            record_part_bytes = record_part_bytes.saturating_add(size);
             chain_part_keys.push(part_key);
             objects.push(object);
         }
+        part_bytes.insert(key.clone(), record_part_bytes);
         chain_record_keys.push(key);
         if link.names_raw_l0_inputs() {
             if entry.gathers_raw_l0_inputs() {
@@ -2911,6 +2934,7 @@ async fn walk_superseded_chain(
         record_keys: input_record_keys,
         data_keys: input_data_keys,
         data_sizes,
+        part_bytes,
         chain_record_keys,
         objects,
         request_ids,
@@ -4038,6 +4062,7 @@ mod tests {
     use ravel_proto::catalog::v1::{
         SnapshotColumnStatsPartRef, SnapshotHead, SnapshotPartRef, SnapshotPostingsRef,
     };
+    use ravel_proto::commit::v1::CompactionPart;
     use ravel_types::TenantId;
 
     use super::*;
@@ -6573,6 +6598,158 @@ mod tests {
         assert_eq!(count, 1);
         let count = groups.count_unattached(&[], &HashSet::new(), &tenant(), Signal::Logs, 0);
         assert_eq!(count, 3);
+    }
+
+    /// Recorded sizes of the two L1 parts [`put_sized_part_chain`] writes.
+    /// Distinct, so charging one part's size for both cannot pass.
+    const PART_SIZES: [u64; 2] = [1_111, 20_202];
+
+    /// A version 1 compaction record whose two L1 parts carry [`PART_SIZES`],
+    /// an object at each part key, and one rewrite over the record. Returns
+    /// the compaction record's key and the part keys.
+    async fn put_sized_part_chain(store: &MemoryStore) -> (String, Vec<String>) {
+        let record = CompactionRecord {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Logs).into(),
+            shard: DEPTH_SHARD,
+            ingest_hour_bucket: 1,
+            level: 1,
+            inputs: vec![CompactionInputIdentity {
+                writer_id: Uuid::from_u128(1).to_string(),
+                writer_epoch: 1,
+                writer_seq: 1,
+            }],
+            input_set_hash: vec![0x11; 32],
+            parts: PART_SIZES
+                .iter()
+                .zip(0u8..)
+                .map(|(&object_size, index)| CompactionPart {
+                    part_index: u32::from(index),
+                    content_hash: vec![0x40 + index; 32],
+                    object_size,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let key = keys::compaction_record_key_for(&record).expect("key");
+        store
+            .put(
+                &key,
+                record::encode_compaction(&record),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed put");
+        let mut part_keys = Vec::new();
+        for part in &record.parts {
+            let part_key = keys::reconstruct_l1_part_key(&record, part).expect("part key");
+            store
+                .put(
+                    &part_key,
+                    Bytes::from_static(b"part"),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("seed part");
+            part_keys.push(part_key);
+        }
+        put_rewrites_over(store, key.clone(), 1).await;
+        (key, part_keys)
+    }
+
+    /// One deleting rule 2 pass over [`put_sized_part_chain`]'s shard, past the
+    /// rewrite's protection horizon, returning the outcome and the bytes it
+    /// charged.
+    async fn sized_chain_pass(
+        store: &dyn ObjectStoreBackend,
+    ) -> Result<(SupersededSweepOutcome, u64)> {
+        let config = CompactorConfig::default();
+        let clock = FixedClock::new(config.protection_horizon_ns + 1);
+        sweep_superseded_impl(
+            &mut SnapshotReachability::new(),
+            store,
+            &clock,
+            &config,
+            &NoLeases,
+            &tenant(),
+            Signal::Logs,
+            DEPTH_SHARD,
+            None,
+            SweepMode::Delete,
+        )
+        .await
+    }
+
+    /// Issue #2073: a superseded L1 part is charged at the `object_size` its
+    /// record carries, part by part. Flipped line: `part.object_size` in
+    /// `ChainLink::part_targets` replaced with `0`; "each part at its recorded
+    /// size" reads left 0, right 21313.
+    #[tokio::test]
+    async fn superseded_parts_are_charged_at_their_recorded_sizes() {
+        let store = MemoryStore::new();
+        let (record_key, part_keys) = put_sized_part_chain(&store).await;
+
+        let (outcome, bytes) = sized_chain_pass(&store).await.expect("pass");
+
+        assert_eq!(outcome.data_deleted, 2);
+        assert_eq!(outcome.records_deleted, 1);
+        assert_eq!(bytes, 21_313, "each part at its recorded size");
+        for key in part_keys.iter().chain([&record_key]) {
+            assert!(!present(&store, key).await, "{key} deleted");
+        }
+    }
+
+    /// Issue #2073: a pass that deletes a chain's parts but is refused the
+    /// record naming them charges nothing for those parts; the next pass
+    /// rebuilds the part keys from the surviving record, deletes them again
+    /// (a missing key is a successful delete) and deletes the record, and it
+    /// is the one that charges them. Across both passes each part is charged
+    /// exactly once. Flipped lines: the part charge moved back to each part's
+    /// own delete (each part's size inserted into `data_sizes` in
+    /// `walk_superseded_chain`, and the `part_bytes` charge on the chain-record
+    /// delete removed); "a refused record charges none of its parts" reads
+    /// left 21313, right 0.
+    #[tokio::test]
+    async fn a_refused_chain_record_delete_charges_its_parts_once() {
+        let inner = MemoryStore::new();
+        let (record_key, part_keys) = put_sized_part_chain(&inner).await;
+        let store = FaultStore::new(
+            inner,
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::Delete, ScriptedFault::Permanent("denied".into()))
+                    .with_key_contains(record_key.clone())
+                    .with_occurrence(Occurrence::Nth(1)),
+            ),
+        );
+
+        let (first, first_bytes) = sized_chain_pass(&store).await.expect("pass 1");
+        assert_eq!(
+            store.fault_count(Op::Delete, FaultKind::Permanent),
+            1,
+            "the record's delete was refused"
+        );
+        assert_eq!(first.deletes_refused, 1);
+        assert_eq!(first.data_deleted, 2, "pass 1 deleted both parts");
+        assert_eq!(first.records_deleted, 0);
+        assert_eq!(first_bytes, 0, "a refused record charges none of its parts");
+        assert!(present(&store, &record_key).await);
+        for key in &part_keys {
+            assert!(!present(&store, key).await, "{key} deleted by pass 1");
+        }
+
+        let (second, second_bytes) = sized_chain_pass(&store).await.expect("pass 2");
+        assert_eq!(store.fault_count(Op::Delete, FaultKind::Permanent), 1);
+        assert_eq!(second.deletes_refused, 0);
+        assert_eq!(second.data_deleted, 2, "pass 2 deleted the parts again");
+        assert_eq!(second.records_deleted, 1);
+        assert_eq!(
+            second_bytes, 21_313,
+            "the record's delete charges its parts"
+        );
+        assert!(!present(&store, &record_key).await);
+        assert_eq!(first_bytes + second_bytes, PART_SIZES.iter().sum::<u64>());
     }
 
     fn assert_refused_as_too_deep(result: Result<ChainWalk>, case: &str) {

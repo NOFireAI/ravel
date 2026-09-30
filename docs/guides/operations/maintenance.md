@@ -476,7 +476,8 @@ nothing in it, so a tenant with nothing to sweep pays two bounded listings
 instead: one of its whole alert keyspace (`t/<tenant_hash>/a/`, which holds
 every commit record, L0 data object and L1 segment the rules look at) and one
 of the quarantine copies taken from it. When both come back empty the sweep is
-skipped for that tick. A tenant that runs alert rules has an alert state memo
+skipped for that tick; when either listing fails, the sweep runs, since a failed
+listing has not shown the keyspace empty. A tenant that runs alert rules has an alert state memo
 under that keyspace, so with a nonzero `--alert-retention` the memo read already
 shows the keyspace is in use and the sweep runs without the extra listings. With
 the default 90-day window a tenant with no alert rules pays one memo GET and
