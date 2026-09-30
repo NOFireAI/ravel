@@ -1048,6 +1048,47 @@ impl ProvisioningError {
             source,
         }
     }
+
+    /// True when a retry, here or on a peer, can succeed, so a query surface
+    /// answers the failure as retryable (503) rather than as corrupt (500).
+    ///
+    /// A record declaring a version above this build's read ceiling, or above
+    /// its writer version on a rewrite path, is retryable: a peer on a newer
+    /// build handles it during a rolling upgrade. A lost CAS race is retryable
+    /// by definition. A store fault takes the class the query surfaces give a
+    /// store fault elsewhere: a checksum mismatch (`StoreError::Corrupted`) is
+    /// permanent, every other store fault is retryable. A fault in the stored
+    /// record's own bytes (an undecodable, misfiled or structurally corrupt
+    /// record, or a version below the floor) is permanent, and so is a
+    /// refusal of the caller's own arguments or of the record's current
+    /// state, which every build and every retry refuses alike.
+    ///
+    /// Every variant is named, so a new one fails to compile until it is
+    /// classified here.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            ProvisioningError::Store { source, .. } => !matches!(source, StoreError::Corrupted(_)),
+            ProvisioningError::UnsupportedVersion { got, ceiling, .. } => got > ceiling,
+            ProvisioningError::RefusingToRewriteNewerRecord { .. }
+            | ProvisioningError::ReshardCasConflict { .. }
+            | ProvisioningError::FloorCasConflict { .. } => true,
+
+            ProvisioningError::Decode { .. }
+            | ProvisioningError::VersionBelowFloor { .. }
+            | ProvisioningError::CorruptRecord { .. }
+            | ProvisioningError::CorruptGenerations { .. }
+            | ProvisioningError::CorruptFloors { .. }
+            | ProvisioningError::AdoptionWouldHideData { .. }
+            | ProvisioningError::NoRecordToReshard { .. }
+            | ProvisioningError::ActivationInPast { .. }
+            | ProvisioningError::ReshardSameCount { .. }
+            | ProvisioningError::ReshardCountOutOfRange { .. }
+            | ProvisioningError::FloorFamilyEmpty
+            | ProvisioningError::FloorFamilyNotLowercase(_)
+            | ProvisioningError::FloorNotAboveCurrent { .. }
+            | ProvisioningError::NoRecordForFloor { .. } => false,
+        }
+    }
 }
 
 /// Count of provisioning validations that observed a present, decodable record
@@ -4990,5 +5031,98 @@ pub(crate) mod tests {
             2,
             "the floor-raise rewrite stamps 2"
         );
+    }
+
+    /// A version above the read ceiling, a newer record on a rewrite path, a
+    /// lost CAS race and a non-checksum store fault are retryable; a stored-byte
+    /// fault, a below-floor version, a checksum mismatch and a refusal of the
+    /// caller's arguments or of the record's state are not.
+    #[test]
+    fn only_newer_versions_cas_races_and_transient_store_faults_are_retryable() {
+        let key = || "t/k/m/prov".to_string();
+        let above_ceiling = check_supported_version(PROVISIONING_MAX_READ_VERSION + 1, "k")
+            .expect_err("above the ceiling is refused");
+        let below_floor = check_supported_version(0, "k").expect_err("0 is below the floor");
+        assert!(matches!(
+            above_ceiling,
+            ProvisioningError::UnsupportedVersion { .. }
+        ));
+        assert!(matches!(
+            below_floor,
+            ProvisioningError::VersionBelowFloor { .. }
+        ));
+
+        let retryable = [
+            above_ceiling,
+            ProvisioningError::store("k", StoreError::Timeout),
+            ProvisioningError::store("k", StoreError::NotFound),
+            ProvisioningError::store("k", StoreError::AccessDenied("denied".into())),
+            ProvisioningError::RefusingToRewriteNewerRecord {
+                key: key(),
+                got: PROVISIONING_FORMAT_VERSION + 1,
+            },
+            ProvisioningError::ReshardCasConflict { key: key() },
+            ProvisioningError::FloorCasConflict { key: key() },
+        ];
+        for err in &retryable {
+            assert!(err.is_retryable(), "{err:?}");
+        }
+
+        let permanent = [
+            below_floor,
+            ProvisioningError::store("k", StoreError::Corrupted("checksum".into())),
+            ProvisioningError::Decode {
+                key: key(),
+                source: sysproto::ProvisioningRecord::decode(&[0xff][..])
+                    .expect_err("a lone 0xff is not a valid record"),
+            },
+            ProvisioningError::CorruptRecord {
+                key: key(),
+                field: "signal",
+                expected: "Metrics".into(),
+                actual: "Logs".into(),
+            },
+            ProvisioningError::CorruptGenerations {
+                key: key(),
+                defect: GenerationDefect::NotDense,
+            },
+            ProvisioningError::CorruptFloors {
+                key: key(),
+                defect: FloorDefect::ZeroFloor,
+            },
+            ProvisioningError::AdoptionWouldHideData {
+                tenant_hash: "th".into(),
+                signal: "metrics",
+                configured: 4,
+                observed_shard: 7,
+            },
+            ProvisioningError::NoRecordToReshard {
+                key: key(),
+                tenant_hash: "th".into(),
+                signal: "metrics",
+            },
+            ProvisioningError::ActivationInPast {
+                activation_hour: 1,
+                now_hour: 2,
+            },
+            ProvisioningError::ReshardSameCount { shard_count: 4 },
+            ProvisioningError::ReshardCountOutOfRange { shard_count: 0 },
+            ProvisioningError::FloorFamilyEmpty,
+            ProvisioningError::FloorFamilyNotLowercase("RSEG".into()),
+            ProvisioningError::FloorNotAboveCurrent {
+                key: key(),
+                family: "rseg".into(),
+                requested: 3,
+                current: 3,
+            },
+            ProvisioningError::NoRecordForFloor {
+                key: key(),
+                tenant_hash: "th".into(),
+                signal: "metrics",
+            },
+        ];
+        for err in &permanent {
+            assert!(!err.is_retryable(), "{err:?}");
+        }
     }
 }

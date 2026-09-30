@@ -197,8 +197,12 @@ impl From<QueryError> for ApiError {
 /// the supported minimum included, is corrupt (500, non-retryable), while a
 /// catalog object carrying a format version or enum value above the highest
 /// this build reads stays unavailable (503, retryable), because a peer on a
-/// newer build can read it during a rolling upgrade. Every catalog variant is
-/// named (no wildcard) so a new one fails to compile until it is classified.
+/// newer build can read it during a rolling upgrade. An erasure request's or
+/// rewrite record's unknown signal is corrupt at every value, since it is read
+/// only under its own signal's key prefix, and a provisioning fault takes the
+/// class [`ravel_catalog::ProvisioningError::is_retryable`] gives it. Every
+/// catalog variant is named (no wildcard) so a new one fails to compile until
+/// it is classified.
 fn redacted_storage_message(err: &QueryError) -> Option<&'static str> {
     match err {
         QueryError::Fetch(fetch) => Some(match fetch {
@@ -264,12 +268,22 @@ fn redacted_storage_message(err: &QueryError) -> Option<&'static str> {
             // Matched only for exhaustiveness.
             CatalogError::WindowTooWide { .. } => MSG_UNAVAILABLE,
 
+            // A provisioning record's version above the read ceiling, a lost
+            // CAS race or a transient store fault is retryable (503); a corrupt
+            // or below-floor record is not (500).
+            CatalogError::Provisioning(source) => {
+                if source.is_retryable() {
+                    MSG_UNAVAILABLE
+                } else {
+                    MSG_CORRUPT
+                }
+            }
+
             // Transient storage faults, fold progress/liveness failures, and
             // resource backpressure stay retryable.
             CatalogError::InvalidConfig(_)
             | CatalogError::Store(_)
             | CatalogError::FoldCasRetriesExhausted { .. }
-            | CatalogError::Provisioning(_)
             | CatalogError::MemoryExhausted(_) => MSG_UNAVAILABLE,
         }),
         QueryError::NonMonotonicSamples { .. } => Some(MSG_CORRUPT),
@@ -280,21 +294,43 @@ fn redacted_storage_message(err: &QueryError) -> Option<&'static str> {
 
 /// A commit or compaction record: retryable only for a format version above the
 /// highest this build reads. A version below the floor (a writer that left
-/// proto3's default 0) is corrupt, since no build reads it.
+/// proto3's default 0) is corrupt, since no build reads it. Every variant is
+/// named, so a new one fails to compile until it is classified here.
 fn redacted_record_message(err: &RecordError) -> &'static str {
     match err {
-        RecordError::UnsupportedFormatVersion { expected, actual } if actual > expected => {
-            MSG_UNAVAILABLE
+        RecordError::UnsupportedFormatVersion { expected, actual } => {
+            if actual > expected {
+                MSG_UNAVAILABLE
+            } else {
+                MSG_CORRUPT
+            }
         }
-        RecordError::UnsupportedRecordFormatVersion { max, actual, .. } if actual > max => {
-            MSG_UNAVAILABLE
+        RecordError::UnsupportedRecordFormatVersion { max, actual, .. } => {
+            if actual > max {
+                MSG_UNAVAILABLE
+            } else {
+                MSG_CORRUPT
+            }
         }
-        _ => MSG_CORRUPT,
+        RecordError::InvalidTenantHashLen(_)
+        | RecordError::InvalidContentHashLen(_)
+        | RecordError::EventTsOutOfOrder { .. }
+        | RecordError::IngestTsOutOfOrder { .. }
+        | RecordError::IngestHourInconsistent { .. }
+        | RecordError::InvalidWriterId(_)
+        | RecordError::SupersededRecordKeyOnVersionOne(_)
+        | RecordError::MissingSupersededRecordKey
+        | RecordError::InvalidSupersededRecordKey(_)
+        | RecordError::NonCanonicalSupersededRecordKey(_)
+        | RecordError::SupersededRecordKeyBucketMismatch { .. }
+        | RecordError::SupersedingInputSetHashMismatch
+        | RecordError::Key(_)
+        | RecordError::Decode(_) => MSG_CORRUPT,
     }
 }
 
-/// An erasure request or rewrite record: retryable only for a format version,
-/// signal or deferral cause above the highest this build reads.
+/// An erasure request or rewrite record: retryable only for a format version
+/// above the highest this build reads.
 fn redacted_erasure_message(err: &ErasureError) -> &'static str {
     if err.is_newer_format_version() {
         MSG_UNAVAILABLE
@@ -756,17 +792,20 @@ mod tests {
         );
     }
 
-    /// An enum value above the highest this build reads is the retryable 503,
-    /// because a new value can ship without a format version bump and a peer
-    /// on a newer build can read it; 0, proto3's default and an unstamped
-    /// field, is the non-retryable 500. One case each for the entry level, the
-    /// column declared type, the erasure signal and the deferral cause, under
-    /// both erasure wrappers. The SQL boundary pins the same cases.
+    /// An entry level or column declared type above the highest this build
+    /// reads is the retryable 503, because a new value can ship without a
+    /// format version bump and a peer on a newer build can read it; a declared
+    /// type of 0, proto3's default and an unstamped field, is the
+    /// non-retryable 500. An erasure signal or deferral cause is 500 at every
+    /// value, under both erasure wrappers: a newer build writes a new signal
+    /// under a key prefix this build never lists, so an unknown one read here
+    /// disagrees with its own key. The SQL boundary pins the same cases.
     ///
-    /// FLIP: classify `ErasureError::UnknownSignal` as never newer and the
-    /// first erasure-request case fails with `left: 500`, `right: 503`.
+    /// FLIP: classify `ErasureError::UnknownSignal` above `Signal::Audit` as
+    /// newer and the first erasure-request case fails with `left: 503`,
+    /// `right: 500`.
     #[test]
-    fn unknown_enum_values_above_the_maximum_are_503_zero_is_500() {
+    fn unknown_level_and_type_above_the_maximum_are_503_erasure_enums_500() {
         assert_catalog_status(
             &[
                 || CatalogError::SnapshotFormat(SnapshotFormatError::UnsupportedLevel(2)),
@@ -778,28 +817,35 @@ mod tests {
                         },
                     )
                 },
-                || CatalogError::ErasureRequestDecode {
-                    key: LEAKY_KEY.to_string(),
-                    source: ErasureError::UnknownSignal(7),
-                },
-                || CatalogError::RewriteRecordDecode {
-                    key: LEAKY_KEY.to_string(),
-                    source: ErasureError::UnknownSignal(7),
-                },
-                || CatalogError::ErasureRequestDecode {
-                    key: LEAKY_KEY.to_string(),
-                    source: ErasureError::UnknownDeferralCause(2),
-                },
-                || CatalogError::RewriteRecordDecode {
-                    key: LEAKY_KEY.to_string(),
-                    source: ErasureError::UnknownDeferralCause(2),
-                },
             ],
             503,
         );
         assert_catalog_status(
             &[
-                || CatalogError::SnapshotFormat(SnapshotFormatError::UnsupportedLevel(0)),
+                || CatalogError::ErasureRequestDecode {
+                    key: LEAKY_KEY.to_string(),
+                    source: ErasureError::UnknownSignal(7),
+                },
+                || CatalogError::RewriteRecordDecode {
+                    key: LEAKY_KEY.to_string(),
+                    source: ErasureError::UnknownSignal(7),
+                },
+                || CatalogError::ErasureRequestDecode {
+                    key: LEAKY_KEY.to_string(),
+                    source: ErasureError::UnknownSignal(0),
+                },
+                || CatalogError::RewriteRecordDecode {
+                    key: LEAKY_KEY.to_string(),
+                    source: ErasureError::UnknownSignal(0),
+                },
+                || CatalogError::ErasureRequestDecode {
+                    key: LEAKY_KEY.to_string(),
+                    source: ErasureError::UnknownDeferralCause(2),
+                },
+                || CatalogError::RewriteRecordDecode {
+                    key: LEAKY_KEY.to_string(),
+                    source: ErasureError::UnknownDeferralCause(2),
+                },
                 || {
                     CatalogError::SnapshotFormat(
                         SnapshotFormatError::ColumnStatsUnknownDeclaredType {
@@ -808,21 +854,89 @@ mod tests {
                         },
                     )
                 },
-                || CatalogError::ErasureRequestDecode {
-                    key: LEAKY_KEY.to_string(),
-                    source: ErasureError::UnknownSignal(0),
+            ],
+            500,
+        );
+    }
+
+    /// A provisioning record above the read ceiling, a lost CAS race and a
+    /// transient store fault are the retryable 503; an undecodable, misfiled
+    /// or structurally corrupt record, a version below the floor, a checksum
+    /// mismatch and a refused reshard argument are the non-retryable 500. The
+    /// SQL boundary pins the same split.
+    ///
+    /// FLIP: put `CatalogError::Provisioning(_)` back in the `MSG_UNAVAILABLE`
+    /// arm and the first 500 case fails with `left: 503`, `right: 500`.
+    #[test]
+    fn provisioning_faults_take_the_class_of_the_record_fault() {
+        use ravel_catalog::{
+            GenerationDefect, PROVISIONING_MAX_READ_VERSION, PROVISIONING_MIN_READ_VERSION,
+            ProvisioningError,
+        };
+
+        assert_catalog_status(
+            &[
+                || {
+                    CatalogError::Provisioning(ProvisioningError::UnsupportedVersion {
+                        key: LEAKY_KEY.to_string(),
+                        got: PROVISIONING_MAX_READ_VERSION + 1,
+                        ceiling: PROVISIONING_MAX_READ_VERSION,
+                    })
                 },
-                || CatalogError::RewriteRecordDecode {
-                    key: LEAKY_KEY.to_string(),
-                    source: ErasureError::UnknownSignal(0),
+                || {
+                    CatalogError::Provisioning(ProvisioningError::Store {
+                        key: LEAKY_KEY.to_string(),
+                        source: StoreError::Timeout,
+                    })
                 },
-                || CatalogError::ErasureRequestDecode {
-                    key: LEAKY_KEY.to_string(),
-                    source: ErasureError::UnknownDeferralCause(0),
+                || {
+                    CatalogError::Provisioning(ProvisioningError::ReshardCasConflict {
+                        key: LEAKY_KEY.to_string(),
+                    })
                 },
-                || CatalogError::RewriteRecordDecode {
-                    key: LEAKY_KEY.to_string(),
-                    source: ErasureError::UnknownDeferralCause(0),
+            ],
+            503,
+        );
+        assert_catalog_status(
+            &[
+                || {
+                    CatalogError::Provisioning(ProvisioningError::Decode {
+                        key: LEAKY_KEY.to_string(),
+                        source: <() as prost::Message>::decode(&[0xff][..])
+                            .expect_err("a lone 0xff is not a valid message"),
+                    })
+                },
+                || {
+                    CatalogError::Provisioning(ProvisioningError::VersionBelowFloor {
+                        key: LEAKY_KEY.to_string(),
+                        got: 0,
+                        floor: PROVISIONING_MIN_READ_VERSION,
+                    })
+                },
+                || {
+                    CatalogError::Provisioning(ProvisioningError::CorruptRecord {
+                        key: LEAKY_KEY.to_string(),
+                        field: "signal",
+                        expected: "Metrics".to_string(),
+                        actual: "Logs".to_string(),
+                    })
+                },
+                || {
+                    CatalogError::Provisioning(ProvisioningError::CorruptGenerations {
+                        key: LEAKY_KEY.to_string(),
+                        defect: GenerationDefect::NotDense,
+                    })
+                },
+                || {
+                    CatalogError::Provisioning(ProvisioningError::Store {
+                        key: LEAKY_KEY.to_string(),
+                        source: StoreError::Corrupted(RAW_STORE_TEXT.to_string()),
+                    })
+                },
+                || {
+                    CatalogError::Provisioning(ProvisioningError::ReshardSameCount {
+                        shard_count: 4,
+                    })
                 },
             ],
             500,

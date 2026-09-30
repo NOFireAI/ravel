@@ -647,16 +647,25 @@ impl SqlError {
 ///   `CompactionSupersessionInputMismatch`. `ColumnStatsPartOverBound` is here
 ///   too: the ceiling is a fixed format constant, so every node refuses the same
 ///   part. A version or enum value below the supported minimum (a writer that
-///   left proto3's default 0) is corrupt as well: no build reads it.
+///   left proto3's default 0) is corrupt as well: no build reads it. So is an
+///   erasure request or rewrite record with an unknown signal, whatever its
+///   value: it is read only under its own signal's key prefix, so it disagrees
+///   with its own key.
 /// - A version or enum value above the highest this build reads is retryable
 ///   ([`MSG_UNAVAILABLE`], `ErrorClass::Unavailable`, 503): during a rolling
 ///   upgrade a peer on a newer build can read it. That is an
 ///   `UnsupportedHeadVersion` above [`HEAD_FORMAT_VERSION`], every case
 ///   [`SnapshotFormatError::is_newer_format_version`] reports, the
 ///   above-maximum unsupported-version case of the record inside `Record` and
-///   `CompactionRecordDecode`, and every case
+///   `CompactionRecordDecode`, and the above-maximum format version
 ///   [`ErasureError::is_newer_format_version`] reports for the erasure object
 ///   inside `ErasureRequestDecode` and `RewriteRecordDecode`.
+/// - `Provisioning` takes the class
+///   [`ravel_catalog::ProvisioningError::is_retryable`] gives
+///   it: a record version above the read ceiling, a lost CAS race and a store
+///   fault other than a checksum mismatch are retryable; an undecodable,
+///   misfiled or structurally corrupt record, a version below the floor, and a
+///   checksum mismatch are corrupt.
 /// - Transient storage faults and fold-progress/liveness failures stay
 ///   retryable, as does a `SnapshotFormat` decode job the read CPU gate
 ///   cancelled or refused while closed; a panicked decode job is corrupt.
@@ -701,34 +710,66 @@ fn redact_catalog(err: &CatalogError) -> &'static str {
         // only for exhaustiveness.
         CatalogError::WindowTooWide { .. } => MSG_UNAVAILABLE,
 
+        // A provisioning record's version above the read ceiling, a lost CAS
+        // race or a transient store fault is retryable (503); a corrupt or
+        // below-floor record is not (500).
+        CatalogError::Provisioning(source) => {
+            if source.is_retryable() {
+                MSG_UNAVAILABLE
+            } else {
+                MSG_CORRUPT
+            }
+        }
+
         // Transient storage faults, fold progress/liveness failures, and
         // resource backpressure: a retry (here or elsewhere) can succeed, so
         // they keep the retryable message.
         CatalogError::InvalidConfig(_)
         | CatalogError::Store(_)
         | CatalogError::FoldCasRetriesExhausted { .. }
-        | CatalogError::Provisioning(_)
         | CatalogError::MemoryExhausted(_) => MSG_UNAVAILABLE,
     }
 }
 
 /// A commit or compaction record: retryable only for a format version above the
 /// highest this build reads. The same `RecordError` answers the same way under
-/// `CatalogError::Record` and `CatalogError::CompactionRecordDecode`.
+/// `CatalogError::Record` and `CatalogError::CompactionRecordDecode`. Every
+/// variant is named, so a new one fails to compile until it is classified here.
 fn redact_record(err: &RecordError) -> &'static str {
     match err {
-        RecordError::UnsupportedFormatVersion { expected, actual } if actual > expected => {
-            MSG_UNAVAILABLE
+        RecordError::UnsupportedFormatVersion { expected, actual } => {
+            if actual > expected {
+                MSG_UNAVAILABLE
+            } else {
+                MSG_CORRUPT
+            }
         }
-        RecordError::UnsupportedRecordFormatVersion { max, actual, .. } if actual > max => {
-            MSG_UNAVAILABLE
+        RecordError::UnsupportedRecordFormatVersion { max, actual, .. } => {
+            if actual > max {
+                MSG_UNAVAILABLE
+            } else {
+                MSG_CORRUPT
+            }
         }
-        _ => MSG_CORRUPT,
+        RecordError::InvalidTenantHashLen(_)
+        | RecordError::InvalidContentHashLen(_)
+        | RecordError::EventTsOutOfOrder { .. }
+        | RecordError::IngestTsOutOfOrder { .. }
+        | RecordError::IngestHourInconsistent { .. }
+        | RecordError::InvalidWriterId(_)
+        | RecordError::SupersededRecordKeyOnVersionOne(_)
+        | RecordError::MissingSupersededRecordKey
+        | RecordError::InvalidSupersededRecordKey(_)
+        | RecordError::NonCanonicalSupersededRecordKey(_)
+        | RecordError::SupersededRecordKeyBucketMismatch { .. }
+        | RecordError::SupersedingInputSetHashMismatch
+        | RecordError::Key(_)
+        | RecordError::Decode(_) => MSG_CORRUPT,
     }
 }
 
-/// An erasure request or rewrite record: retryable only for a format version,
-/// signal or deferral cause above the highest this build reads.
+/// An erasure request or rewrite record: retryable only for a format version
+/// above the highest this build reads.
 fn redact_erasure(err: &ErasureError) -> &'static str {
     if err.is_newer_format_version() {
         MSG_UNAVAILABLE
@@ -875,6 +916,78 @@ mod tests {
         assert_eq!(err.client_message(), MSG_UNAVAILABLE);
         assert_redacted(&err.client_message());
         assert_eq!(err.class(), ErrorClass::Unavailable);
+    }
+
+    /// A provisioning record above the read ceiling, a lost CAS race and a
+    /// transient store fault are retryable; an undecodable, misfiled or
+    /// structurally corrupt record, a version below the floor, a checksum
+    /// mismatch and a refused reshard argument are corrupt. The PromQL
+    /// boundary pins the same split.
+    ///
+    /// FLIP: put `CatalogError::Provisioning(_)` back in the `MSG_UNAVAILABLE`
+    /// arm of `redact_catalog` and the first corrupt case fails with
+    /// `left: "upstream storage temporarily unavailable"`,
+    /// `right: "stored data failed integrity validation"`.
+    #[test]
+    fn provisioning_faults_take_the_class_of_the_record_fault() {
+        use ravel_catalog::{
+            GenerationDefect, PROVISIONING_MAX_READ_VERSION, PROVISIONING_MIN_READ_VERSION,
+            ProvisioningError,
+        };
+
+        let key = || LEAKY_KEY.to_string();
+        let provisioning = |err: ProvisioningError| SqlError::Catalog(CatalogError::from(err));
+
+        let unavailable = [
+            provisioning(ProvisioningError::UnsupportedVersion {
+                key: key(),
+                got: PROVISIONING_MAX_READ_VERSION + 1,
+                ceiling: PROVISIONING_MAX_READ_VERSION,
+            }),
+            provisioning(ProvisioningError::Store {
+                key: key(),
+                source: StoreError::Timeout,
+            }),
+            provisioning(ProvisioningError::ReshardCasConflict { key: key() }),
+        ];
+        for err in &unavailable {
+            assert_eq!(err.client_message(), MSG_UNAVAILABLE, "{err}");
+            assert_eq!(err.class(), ErrorClass::Unavailable, "{err}");
+            assert_redacted(&err.client_message());
+        }
+
+        let corrupt = [
+            provisioning(ProvisioningError::Decode {
+                key: key(),
+                source: <() as prost::Message>::decode(&[0xff][..])
+                    .expect_err("a lone 0xff is not a valid message"),
+            }),
+            provisioning(ProvisioningError::VersionBelowFloor {
+                key: key(),
+                got: 0,
+                floor: PROVISIONING_MIN_READ_VERSION,
+            }),
+            provisioning(ProvisioningError::CorruptRecord {
+                key: key(),
+                field: "signal",
+                expected: "Metrics".to_string(),
+                actual: "Logs".to_string(),
+            }),
+            provisioning(ProvisioningError::CorruptGenerations {
+                key: key(),
+                defect: GenerationDefect::NotDense,
+            }),
+            provisioning(ProvisioningError::Store {
+                key: key(),
+                source: StoreError::Corrupted(RAW_STORE_TEXT.to_string()),
+            }),
+            provisioning(ProvisioningError::ReshardSameCount { shard_count: 4 }),
+        ];
+        for err in &corrupt {
+            assert_eq!(err.client_message(), MSG_CORRUPT, "{err}");
+            assert_eq!(err.class(), ErrorClass::Internal, "{err}");
+            assert_redacted(&err.client_message());
+        }
     }
 
     /// Catalog errors are classified by whether a retry, possibly routed to
@@ -1079,19 +1192,25 @@ mod tests {
         }
     }
 
-    /// An enum value above the highest this build reads is retryable, because
-    /// a new value can ship without a format version bump and a peer on a
-    /// newer build can read it; 0, proto3's default and an unstamped field, is
-    /// corrupt. One case each for the entry level, the column declared type,
-    /// the erasure signal and the deferral cause, under both erasure wrappers.
-    /// The PromQL boundary pins the same split.
+    /// An entry level or column declared type above the highest this build
+    /// reads is retryable, because a new value can ship without a format
+    /// version bump and a peer on a newer build can read it; a declared type
+    /// of 0, proto3's default and an unstamped field, is corrupt. An erasure
+    /// signal or deferral cause is corrupt at every value, under both erasure
+    /// wrappers: a newer build writes a new signal under a key prefix this
+    /// build never lists, so an unknown one read here disagrees with its own
+    /// key. The PromQL boundary pins the same split.
     ///
     /// FLIP: classify `ColumnStatsUnknownDeclaredType` as never newer and the
     /// declared-type case fails with
     /// `left: "stored data failed integrity validation"`,
-    /// `right: "upstream storage temporarily unavailable"`.
+    /// `right: "upstream storage temporarily unavailable"`. Classify
+    /// `ErasureError::UnknownSignal` above `Signal::Audit` as newer and the
+    /// first erasure case fails with
+    /// `left: "upstream storage temporarily unavailable"`,
+    /// `right: "stored data failed integrity validation"`.
     #[test]
-    fn unknown_enum_values_above_the_maximum_are_unavailable_zero_is_corrupt() {
+    fn unknown_level_and_type_above_the_maximum_are_unavailable_erasure_enums_corrupt() {
         let key = || LEAKY_KEY.to_string();
         let snapshot =
             |err: SnapshotFormatError| SqlError::Catalog(CatalogError::SnapshotFormat(err));
@@ -1114,24 +1233,20 @@ mod tests {
             ]
         };
 
-        let mut unavailable = vec![
+        let unavailable = [
             snapshot(SnapshotFormatError::UnsupportedLevel(2)),
             declared(5),
         ];
-        unavailable.extend(erasure(|| ErasureError::UnknownSignal(7)));
-        unavailable.extend(erasure(|| ErasureError::UnknownDeferralCause(2)));
         for err in &unavailable {
             assert_eq!(err.client_message(), MSG_UNAVAILABLE, "{err}");
             assert_eq!(err.class(), ErrorClass::Unavailable, "{err}");
             assert_redacted(&err.client_message());
         }
 
-        let mut corrupt = vec![
-            snapshot(SnapshotFormatError::UnsupportedLevel(0)),
-            declared(0),
-        ];
+        let mut corrupt = Vec::from(erasure(|| ErasureError::UnknownSignal(7)));
         corrupt.extend(erasure(|| ErasureError::UnknownSignal(0)));
-        corrupt.extend(erasure(|| ErasureError::UnknownDeferralCause(0)));
+        corrupt.extend(erasure(|| ErasureError::UnknownDeferralCause(2)));
+        corrupt.push(declared(0));
         for err in &corrupt {
             assert_eq!(err.client_message(), MSG_CORRUPT, "{err}");
             assert_eq!(err.class(), ErrorClass::Internal, "{err}");

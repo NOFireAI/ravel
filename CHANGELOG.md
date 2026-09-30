@@ -490,8 +490,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `SqlError::class()` put every metrics, logs and spans fetcher error,
   `Corrupt` included, in the `Unavailable` class, so HTTP SQL answered 503 and
   Flight SQL `UNAVAILABLE` for a fault that fails the same way on every retry.
-  A new
-  `ErrorClass::Internal` now holds every error the redaction reports as
+  A new `ErrorClass::Internal` now holds every error the redaction reports as
   "stored data failed integrity validation": a fetcher `Corrupt` error (which
   is also how a panicked read-gate decode job is reported), a store-side
   checksum mismatch, a carry or tenant mismatch, a corrupt `stream_attrs`
@@ -516,17 +515,24 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   because a peer on a newer build can read it during a rolling upgrade. That
   includes a commit record (`CatalogError::Record`), classified by its inner
   `RecordError` the way `CompactionRecordDecode` is, and a HEAD read by the
-  SQL column-statistics loader. An enum value above the highest this build
-  knows answers the same 503, because a new value can ship without a format
-  version bump: a snapshot part entry level, a column-statistics declared
-  type, and an erasure signal or deferral cause, decided by
-  `SnapshotFormatError::is_newer_format_version` and
-  `ErasureError::is_newer_format_version`. A version below the lowest this
-  build supports, such as a record or HEAD stamped 0 by a writer that failed
-  to set it, is corrupt, as is an enum field left unset (proto3's default 0)
-  where a value is required: 500 on both. A
-  catalog decode job the read CPU gate cancelled or closed before it ran stays
-  503; one that panicked answers 500. Other store errors, timeouts,
+  SQL column-statistics loader. A snapshot part entry level or a
+  column-statistics declared type above the highest this build knows answers
+  the same 503, because a new value can ship without a format version bump,
+  as decided by `SnapshotFormatError::is_newer_format_version`. An erasure
+  request or rewrite record naming a signal this build does not know answers
+  500 at every value: each is read only under its own signal's key prefix,
+  and a newer build writes a new signal under a prefix this build never
+  lists, so such a record disagrees with its own key. A version below the
+  lowest this build supports, such as a record or HEAD stamped 0 by a writer
+  that failed to set it, is corrupt, as is a column-statistics declared type
+  or an erasure signal left unset (proto3's default 0): 500 on both. A
+  provisioning record fault (`CatalogError::Provisioning`) takes the class
+  `ProvisioningError::is_retryable` gives it: a version above the read
+  ceiling, a lost CAS race, or a store fault other than a checksum mismatch
+  stays 503, while an undecodable, misfiled or structurally corrupt record, a
+  version below the floor, or a checksum mismatch answers 500. A catalog
+  decode job the read CPU gate cancelled or closed before it ran stays 503;
+  one that panicked answers 500. Other store errors, timeouts,
   cancellation and admission refusals keep their classes.
 - **A catalog decode declared over its ceiling now evicts decoded-cache entries
   until the budget admits it or the caches are empty** (issue #2132). Such a
