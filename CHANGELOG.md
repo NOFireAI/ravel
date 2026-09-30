@@ -374,6 +374,22 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   answers it with 500 `internal` and Flight SQL with `INTERNAL`, the PromQL
   surface's rule for the same fault. Other store errors, timeouts,
   cancellation and admission refusals keep their classes.
+- **A catalog object that fails to decode now answers 500, not a retryable
+  503, on both SQL and PromQL** (issue #2194). A compaction record, erasure
+  request, or snapshot part/HEAD whose stored bytes fail to decode at a format
+  version this build covers used to reach a wildcard arm in both error
+  boundaries and redact to the retryable "upstream storage temporarily
+  unavailable" (503 `unavailable`, Flight `UNAVAILABLE`), so a Prometheus or
+  SQL client retried forever against data that cannot change. These
+  (`CatalogError::CompactionRecordDecode`, `ErasureRequestDecode`, and
+  `SnapshotFormat`) now answer the permanent 500 `internal` / `INTERNAL` class,
+  the same as the existing corrupt commit-record faults. A catalog object
+  written in a newer format version this build cannot read stays retryable
+  (503), because a peer on a newer build can read it during a rolling upgrade:
+  `UnsupportedHeadVersion`, `SnapshotFormat`'s unsupported-version case, and the
+  unsupported-version case each of `CompactionRecordDecode` and
+  `ErasureRequestDecode` carries in its source. Both boundaries now name every
+  `CatalogError` variant, so a new one must be classified before it compiles.
 - **A catalog decode declared over its ceiling now evicts decoded-cache entries
   until the budget admits it or the caches are empty** (issue #2132). Such a
   decode is charged 0 bytes, and a budget pushed over its limit by

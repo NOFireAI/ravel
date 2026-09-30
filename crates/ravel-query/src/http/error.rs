@@ -494,6 +494,101 @@ mod tests {
         assert_redacted(&message);
     }
 
+    /// Issue #2194: four catalog errors a wildcard arm previously redacted to
+    /// the retryable 503 are now classified by whether a retry can succeed. A
+    /// decode failure of stored bytes whose format version this build covers is
+    /// the non-retryable 500 `internal`; a newer format version this build
+    /// cannot read stays the retryable 503 `unavailable`, because a peer on a
+    /// newer build can read it during a rolling upgrade. This is the PromQL half
+    /// of the same fix the SQL boundary carries, so both surfaces answer alike.
+    ///
+    /// FLIP: restoring `redacted_storage_message`'s old `_ => MSG_UNAVAILABLE`
+    /// arm (which drops the corrupt arms for `CompactionRecordDecode`/
+    /// `ErasureRequestDecode`/`SnapshotFormat`) makes each 500/`internal`
+    /// assertion in the first loop read `left: 503, right: 500`. The second
+    /// loop's version-case assertions do not flip: the old wildcard already
+    /// answered them 503, and they pin the rolling-upgrade carve-out.
+    #[test]
+    fn undecodable_catalog_objects_are_500_newer_versions_stay_503() {
+        let parts = |err: QueryError| ApiError::from(err).into_parts();
+
+        // Decode faults of a covered format version: non-retryable 500 internal.
+        let corrupt: Vec<fn() -> QueryError> = vec![
+            || {
+                QueryError::Catalog(CatalogError::CompactionRecordDecode {
+                    key: LEAKY_KEY.to_string(),
+                    source: RecordError::InvalidTenantHashLen(3),
+                })
+            },
+            || {
+                QueryError::Catalog(CatalogError::ErasureRequestDecode {
+                    key: LEAKY_KEY.to_string(),
+                    source: ErasureError::InvalidTenantHashLen(3),
+                })
+            },
+            || QueryError::Catalog(CatalogError::SnapshotFormat(SnapshotFormatError::BadMagic)),
+        ];
+        for make in &corrupt {
+            let p = parts(make());
+            assert_eq!(p.status.as_u16(), 500, "{:?}", make());
+            assert_eq!(p.error_type, "internal", "{:?}", make());
+            assert_eq!(p.message, MSG_CORRUPT, "{:?}", make());
+            assert_redacted(&p.message);
+        }
+
+        // Newer-format-version cases, including the unsupported-version case each
+        // decode fault carries in its source: retryable 503 unavailable.
+        let unavailable: Vec<fn() -> QueryError> = vec![
+            || QueryError::Catalog(CatalogError::UnsupportedHeadVersion { format_version: 2 }),
+            || {
+                QueryError::Catalog(CatalogError::SnapshotFormat(
+                    SnapshotFormatError::UnsupportedVersion(2),
+                ))
+            },
+            || {
+                QueryError::Catalog(CatalogError::CompactionRecordDecode {
+                    key: LEAKY_KEY.to_string(),
+                    source: RecordError::UnsupportedFormatVersion {
+                        expected: 1,
+                        actual: 2,
+                    },
+                })
+            },
+            || {
+                QueryError::Catalog(CatalogError::ErasureRequestDecode {
+                    key: LEAKY_KEY.to_string(),
+                    source: ErasureError::UnsupportedFormatVersion {
+                        expected: 1,
+                        actual: 2,
+                    },
+                })
+            },
+        ];
+        for make in &unavailable {
+            let p = parts(make());
+            assert_eq!(p.status.as_u16(), 503, "{:?}", make());
+            assert_eq!(p.error_type, "unavailable", "{:?}", make());
+            assert_eq!(p.message, MSG_UNAVAILABLE, "{:?}", make());
+            assert_redacted(&p.message);
+        }
+
+        // Control: an existing corrupt catalog variant stays 500, a transient
+        // store fault stays 503.
+        let field = parts(QueryError::Catalog(CatalogError::FieldMismatch {
+            key: LEAKY_KEY.to_string(),
+            field: "tenant_hash",
+            expected: "aaaa".to_string(),
+            actual: TENANT_HASH.to_string(),
+        }));
+        assert_eq!(field.status.as_u16(), 500);
+        assert_eq!(field.error_type, "internal");
+        let store = parts(QueryError::Catalog(CatalogError::Store(StoreError::Permanent(
+            RAW_STORE_TEXT.to_string(),
+        ))));
+        assert_eq!(store.status.as_u16(), 503);
+        assert_eq!(store.error_type, "unavailable");
+    }
+
     #[test]
     fn unsatisfiable_token_is_a_distinct_stable_class() {
         let message = client_message(QueryError::Catalog(CatalogError::UnsatisfiableToken {

@@ -790,6 +790,89 @@ mod tests {
         assert_eq!(err.class(), ErrorClass::Unavailable);
     }
 
+    /// Issue #2194: four catalog errors that a wildcard arm previously sent to
+    /// the retryable unavailable message are now classified by whether a retry,
+    /// possibly routed to another node, can succeed. A decode failure of stored
+    /// bytes whose format version this build covers is corrupt (500); a newer
+    /// format version this build cannot read stays unavailable (503), because a
+    /// peer on a newer build can read it during a rolling upgrade.
+    ///
+    /// FLIP: restoring `redact_catalog`'s old `_ => MSG_UNAVAILABLE` arm (which
+    /// drops the `CompactionRecordDecode`/`ErasureRequestDecode`/`SnapshotFormat`
+    /// corrupt arms) makes each `MSG_CORRUPT`/`Internal` assertion in the first
+    /// loop read `left: "upstream storage temporarily unavailable"`,
+    /// `right: "stored data failed integrity validation"`. The second loop's
+    /// version-case assertions do not flip: the old wildcard already answered
+    /// them unavailable, and they pin that the corrupt reclassification does not
+    /// swallow the rolling-upgrade carve-out.
+    #[test]
+    fn undecodable_catalog_objects_are_corrupt_newer_versions_stay_unavailable() {
+        let key = || LEAKY_KEY.to_string();
+
+        // Decode faults of a covered format version: corrupt, 500.
+        let corrupt = [
+            SqlError::Catalog(CatalogError::CompactionRecordDecode {
+                key: key(),
+                source: RecordError::InvalidTenantHashLen(3),
+            }),
+            SqlError::Catalog(CatalogError::ErasureRequestDecode {
+                key: key(),
+                source: ErasureError::InvalidTenantHashLen(3),
+            }),
+            SqlError::Catalog(CatalogError::SnapshotFormat(SnapshotFormatError::BadMagic)),
+        ];
+        for err in &corrupt {
+            assert_eq!(err.client_message(), MSG_CORRUPT, "{err}");
+            assert_eq!(err.class(), ErrorClass::Internal, "{err}");
+            assert_redacted(&err.client_message());
+        }
+
+        // Newer-format-version cases, including the unsupported-version case each
+        // decode fault carries in its source: retryable, 503.
+        let unavailable = [
+            SqlError::Catalog(CatalogError::UnsupportedHeadVersion { format_version: 2 }),
+            SqlError::Catalog(CatalogError::SnapshotFormat(
+                SnapshotFormatError::UnsupportedVersion(2),
+            )),
+            SqlError::Catalog(CatalogError::CompactionRecordDecode {
+                key: key(),
+                source: RecordError::UnsupportedFormatVersion {
+                    expected: 1,
+                    actual: 2,
+                },
+            }),
+            SqlError::Catalog(CatalogError::ErasureRequestDecode {
+                key: key(),
+                source: ErasureError::UnsupportedFormatVersion {
+                    expected: 1,
+                    actual: 2,
+                },
+            }),
+        ];
+        for err in &unavailable {
+            assert_eq!(err.client_message(), MSG_UNAVAILABLE, "{err}");
+            assert_eq!(err.class(), ErrorClass::Unavailable, "{err}");
+            assert_ne!(err.client_message(), MSG_CORRUPT, "{err}");
+            assert_redacted(&err.client_message());
+        }
+
+        // Control: an existing corrupt variant stays 500 and a transient store
+        // fault stays 503, so the loops above are not a blanket flip.
+        let existing_corrupt = SqlError::Catalog(CatalogError::FieldMismatch {
+            key: key(),
+            field: "tenant_hash",
+            expected: "aaaa".to_string(),
+            actual: TENANT_HASH.to_string(),
+        });
+        assert_eq!(existing_corrupt.client_message(), MSG_CORRUPT);
+        assert_eq!(existing_corrupt.class(), ErrorClass::Internal);
+        let transient = SqlError::Catalog(CatalogError::Store(StoreError::Transient(
+            RAW_STORE_TEXT.to_string(),
+        )));
+        assert_eq!(transient.client_message(), MSG_UNAVAILABLE);
+        assert_eq!(transient.class(), ErrorClass::Unavailable);
+    }
+
     #[test]
     fn unsatisfiable_token_is_a_distinct_stable_class() {
         let err = SqlError::Catalog(CatalogError::UnsatisfiableToken {
