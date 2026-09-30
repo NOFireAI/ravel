@@ -12,6 +12,10 @@ workspace = true
 ravel-types = { workspace = true }
 ravel-segment = { workspace = true }
 ravel-catalog = { workspace = true }
+# `redact_catalog` classifies `SnapshotFormatError::DecodeJob` by its
+# `CpuGateError` cause, the same way the PromQL surface does. ravel-catalog and
+# ravel-query already depend on it, so this adds no crate to the build graph.
+ravel-cpu-gate = { workspace = true }
 # Was dev-only (the endpoint tests publish real commit records rather than
 # hand-building `Snapshot`s) and is now also a library dependency: the
 # ADR-0873 decision 2 defect metric lives in

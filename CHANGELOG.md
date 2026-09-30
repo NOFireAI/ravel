@@ -449,8 +449,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   as it did before. A retryable error, a read-only
   store, or a backend with no delete support still fails the pass.
 - **SQL answers corrupt stored data and a panicked decode as an internal error,
-  not a retryable unavailable** (issue #2097). `SqlError::class()` put every
-  metrics, logs and spans fetcher error, `Corrupt` included, in the
+  not a retryable unavailable** (issues #2097, #2194). `SqlError::class()` put
+  every metrics, logs and spans fetcher error, `Corrupt` included, in the
   `Unavailable` class, so HTTP SQL answered 503 and Flight SQL `UNAVAILABLE`
   for a fault that fails the same way on every retry. A new
   `ErrorClass::Internal` now holds every error the redaction reports as
@@ -459,8 +459,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   checksum mismatch, a carry or tenant mismatch, a corrupt `stream_attrs`
   blob, and a corrupt catalog record or column-statistics HEAD. HTTP SQL
   answers it with 500 `internal` and Flight SQL with `INTERNAL`, the PromQL
-  surface's rule for the same fault. Other store errors, timeouts,
-  cancellation and admission refusals keep their classes.
+  surface's rule for the same fault. A compaction record, erasure request, or
+  snapshot object whose stored bytes fail to decode at a format version this
+  build covers (`CatalogError::CompactionRecordDecode`, `ErasureRequestDecode`,
+  `SnapshotFormat`) joins that class on SQL, and PromQL now answers it with 500
+  `internal` too, where both surfaces used to answer the retryable 503. A
+  catalog object written in a newer format version this build cannot read
+  (`UnsupportedHeadVersion`, and every unsupported-version case of those three,
+  including a snapshot part, HEAD or postings object) stays a retryable 503
+  on both, because a peer on a newer build can read it during a rolling
+  upgrade; on SQL, a HEAD read by the column-statistics loader still answers
+  500. So does a catalog decode job the read CPU gate cancelled or
+  closed before it ran; one that panicked answers 500. Other store errors,
+  timeouts, cancellation and admission refusals keep their classes.
 - **A catalog decode declared over its ceiling now evicts decoded-cache entries
   until the budget admits it or the caches are empty** (issue #2132). Such a
   decode is charged 0 bytes, and a budget pushed over its limit by
