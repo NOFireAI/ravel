@@ -80,7 +80,7 @@ pub struct TenantPutCount {
     pub error: u64,
 }
 
-/// One tenant's count in a [`TenantTopK`]. `error` is the Space-Saving
+/// One tenant's count in a bounded per-tenant table. `error` is the Space-Saving
 /// overestimate bound, as on [`TenantPutCount`]: the true count lies in
 /// `[count - error, count]`, and `error` is 0 for a tenant never admitted by
 /// eviction.
