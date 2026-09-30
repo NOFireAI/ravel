@@ -31,7 +31,10 @@ use ravel_pqtable::clock::FixedClock;
 use ravel_pqtable::grants;
 use ravel_pqtable::manifest::ParquetFile;
 use ravel_pqtable::writer::{self, Intent};
-use ravel_query::{GetLimiter, LogSegmentFetcher, QueryPhase, SegmentFetcher};
+use ravel_query::{
+    ByteLimit, EngineConfig, GetLimiter, LogSegmentFetcher, QueryPhase, RequestBudgets,
+    RequestLimit, SegmentFetcher,
+};
 use ravel_sql::{
     DEFAULT_PARQUET_METADATA_CACHE_BYTES, ErrorClass, ExternalStoreMap, MAX_STATEMENT_TABLE_NAMES,
     MSG_PLAN, ParquetQueryError, ParquetSources, SpanSegmentFetcher, SqlConfig, SqlError,
@@ -1236,4 +1239,278 @@ async fn a_parquet_read_past_the_memory_budget_is_refused() {
         "{err:?}"
     );
     assert_eq!(Lake::gets(&tiny.lake), 0, "no GET for the refused footer");
+}
+
+/// `SqlConfig::default()` with the byte and request budgets replaced.
+fn budgeted_config(max_bytes_scanned: ByteLimit, max_s3_requests: RequestLimit) -> SqlConfig {
+    SqlConfig {
+        engine: EngineConfig {
+            max_bytes_scanned,
+            max_s3_requests,
+            ..EngineConfig::default()
+        },
+        ..SqlConfig::default()
+    }
+}
+
+/// Every LIST and GET that has reached Ravel's store or the lake.
+fn store_requests(lake: &Lake) -> u64 {
+    let (ravel_gets, ravel_lists, lake_gets) = reads(lake);
+    ravel_gets + ravel_lists + lake_gets
+}
+
+/// What `sql` costs over `hits` with no budget: the resolve phase's
+/// requests, every phase's requests, and every phase's wire bytes.
+async fn unbudgeted_cost(sql: &str) -> (u64, u64, u64) {
+    let lake = Lake::configured();
+    let acme = tenant("acme");
+    lake.hits_for(&acme).await;
+    let outcome = lake.execute(&acme, sql).await.expect("unbudgeted");
+    let phases = &outcome.phase_accounting;
+    let resolve = phases.phase(QueryPhase::Resolve).total_s3_requests();
+    let pooled = phases.pooled();
+    (resolve, pooled.total_s3_requests(), pooled.total_s3_bytes())
+}
+
+/// A Parquet query is held to `max_s3_requests` at resolve and again as each
+/// request is issued: the request that would be one past the budget is never
+/// sent, whatever phase it belongs to.
+///
+/// FLIP: counting only the requests the resolve made (the wrong
+/// implementation) admits the budget of 6 here and the query runs to its end,
+/// so the execution-time `expect_err` fails; dropping the resolve check
+/// leaves the first case running three data GETs.
+#[tokio::test]
+async fn a_parquet_query_over_its_request_budget_is_refused() {
+    let sql = "SELECT sum(id) FROM hits";
+    let (resolve, total, _) = unbudgeted_cost(sql).await;
+    let files = hits_files().len() as u64;
+    let floor = resolve + files;
+    assert!(
+        total > floor,
+        "the scan issues requests beyond one per file: {total} against a floor of {floor}"
+    );
+
+    // Below the floor: refused at resolve, having read only the manifest and
+    // the grants record.
+    let lake = Lake::new(
+        true,
+        budgeted_config(ByteLimit::Unlimited, RequestLimit::Bounded(floor - 1)),
+    );
+    let acme = tenant("acme");
+    lake.hits_for(&acme).await;
+    let before = store_requests(&lake);
+    let err = lake.execute(&acme, sql).await.expect_err("over at resolve");
+    assert!(
+        matches!(
+            err,
+            SqlError::RequestBudgetExceeded { requests, max, .. }
+                if requests == floor && max == floor - 1
+        ),
+        "{err:?}"
+    );
+    assert_eq!(err.class(), ErrorClass::Unsupported);
+    assert_eq!(Lake::gets(&lake.lake), 0, "no data GET before the refusal");
+    assert_eq!(
+        store_requests(&lake) - before,
+        resolve,
+        "the refusal came from the resolve's own reads"
+    );
+
+    // At the floor: the resolve admits it, and the first request past the
+    // budget is refused before it is issued.
+    let lake = Lake::new(
+        true,
+        budgeted_config(ByteLimit::Unlimited, RequestLimit::Bounded(floor)),
+    );
+    lake.hits_for(&acme).await;
+    let before = store_requests(&lake);
+    let err = lake.execute(&acme, sql).await.expect_err("over at scan");
+    assert!(
+        matches!(
+            err,
+            SqlError::RequestBudgetExceeded { requests, max, .. }
+                if requests == floor + 1 && max == floor
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        store_requests(&lake) - before,
+        floor,
+        "exactly the budget's requests reached a store, none past it"
+    );
+    assert!(Lake::gets(&lake.lake) > 0, "it got as far as reading data");
+
+    // A budget of exactly the query's cost runs it; one less stops it one
+    // request short.
+    let lake = Lake::new(
+        true,
+        budgeted_config(ByteLimit::Unlimited, RequestLimit::Bounded(total)),
+    );
+    lake.hits_for(&acme).await;
+    let outcome = lake.execute(&acme, sql).await.expect("exactly affordable");
+    assert_eq!(rows(&outcome), vec!["21"]);
+    let lake = Lake::new(
+        true,
+        budgeted_config(ByteLimit::Unlimited, RequestLimit::Bounded(total - 1)),
+    );
+    lake.hits_for(&acme).await;
+    let before = store_requests(&lake);
+    lake.execute(&acme, sql).await.expect_err("one short");
+    assert_eq!(store_requests(&lake) - before, total - 1);
+}
+
+/// `max_bytes_scanned` counts the wire bytes of each GET body, the resolve
+/// phase's manifest and grants reads included, and refuses the request whose
+/// body would cross it before that request is issued.
+///
+/// FLIP: checking the recorded bytes after the GET (as the signal scan does
+/// per segment) leaves the refused chunk's GET in the lake's count; comparing
+/// the recorded bytes without the range about to be read admits the chunk and
+/// the query runs to its end.
+#[tokio::test]
+async fn a_parquet_query_over_its_byte_budget_is_refused() {
+    let acme = tenant("acme");
+    let sql = "SELECT sum(id) FROM big";
+    let unbudgeted = Lake::configured();
+    let bytes = big_for(&unbudgeted, &acme).await;
+    let (chunk, _) = chunk_and_footer_len(&bytes, 0);
+    let outcome = unbudgeted.execute(&acme, sql).await.expect("unbudgeted");
+    let total = outcome.phase_accounting.pooled().total_s3_bytes();
+    let lake_gets = Lake::gets(&unbudgeted.lake);
+    assert!(total > 2 * chunk, "two chunks, a footer and the manifests");
+
+    // Below one chunk: the footer is read, the chunk is not.
+    let lake = Lake::new(
+        true,
+        budgeted_config(ByteLimit::Bounded(chunk - 1), RequestLimit::Unlimited),
+    );
+    big_for(&lake, &acme).await;
+    let err = lake.execute(&acme, sql).await.expect_err("under one chunk");
+    match err {
+        SqlError::TooManyBytesScanned { scanned, max } => {
+            assert_eq!(max, chunk - 1);
+            assert!(
+                scanned > chunk && scanned - chunk < 4096,
+                "the chunk on top of what the resolve and the footer read: {scanned}"
+            );
+        }
+        other => panic!("expected TooManyBytesScanned, got {other:?}"),
+    }
+    assert_eq!(
+        Lake::gets(&lake.lake),
+        1,
+        "the footer, and no GET for the chunk that was refused"
+    );
+
+    // Exactly the bytes the query reads: admitted. One fewer: the last chunk
+    // is refused before its GET.
+    let lake = Lake::new(
+        true,
+        budgeted_config(ByteLimit::Bounded(total), RequestLimit::Unlimited),
+    );
+    big_for(&lake, &acme).await;
+    lake.execute(&acme, sql).await.expect("exactly affordable");
+    let lake = Lake::new(
+        true,
+        budgeted_config(ByteLimit::Bounded(total - 1), RequestLimit::Unlimited),
+    );
+    big_for(&lake, &acme).await;
+    let err = lake.execute(&acme, sql).await.expect_err("one byte short");
+    assert!(
+        matches!(err, SqlError::TooManyBytesScanned { scanned, max }
+            if scanned == total && max == total - 1),
+        "{err:?}"
+    );
+    assert_eq!(
+        Lake::gets(&lake.lake),
+        lake_gets - 1,
+        "the read that would cross the budget was not issued"
+    );
+}
+
+/// A request's own budgets, clamped to the engine's by `effective_config`,
+/// govern a Parquet query: a request budget lower than the engine's refuses,
+/// and one higher than the engine's does not raise it.
+///
+/// FLIP: building the limits from `self.config` instead of the effective
+/// config runs the lowered-budget statements to their ends.
+#[tokio::test]
+async fn a_clamped_request_budget_governs_a_parquet_query() {
+    let acme = tenant("acme");
+    let sql = "SELECT sum(id) FROM hits";
+    let (resolve, total, _) = unbudgeted_cost(sql).await;
+    let floor = resolve + hits_files().len() as u64;
+
+    // The engine's own budget is far above this query; the request lowers it.
+    let lake = Lake::configured();
+    lake.hits_for(&acme).await;
+    let mut req = request(sql);
+    req.budgets = Some(RequestBudgets {
+        max_store_requests: Some(RequestLimit::Bounded(floor - 1)),
+        ..RequestBudgets::default()
+    });
+    let err = lake
+        .executor
+        .execute(acme, &req)
+        .await
+        .expect_err("lowered request budget, at resolve");
+    assert!(
+        matches!(err, SqlError::RequestBudgetExceeded { max, .. } if max == floor - 1),
+        "{err:?}"
+    );
+    assert_eq!(Lake::gets(&lake.lake), 0);
+
+    let mut req = request(sql);
+    req.budgets = Some(RequestBudgets {
+        max_store_requests: Some(RequestLimit::Bounded(floor)),
+        ..RequestBudgets::default()
+    });
+    let before = store_requests(&lake);
+    let err = lake
+        .executor
+        .execute(acme, &req)
+        .await
+        .expect_err("lowered request budget, at scan");
+    assert!(
+        matches!(err, SqlError::RequestBudgetExceeded { max, .. } if max == floor),
+        "{err:?}"
+    );
+    assert_eq!(store_requests(&lake) - before, floor);
+
+    let mut req = request(sql);
+    req.budgets = Some(RequestBudgets {
+        max_bytes_scanned: Some(ByteLimit::Bounded(1)),
+        ..RequestBudgets::default()
+    });
+    let err = lake
+        .executor
+        .execute(acme, &req)
+        .await
+        .expect_err("lowered byte budget");
+    assert!(
+        matches!(err, SqlError::TooManyBytesScanned { max: 1, .. }),
+        "{err:?}"
+    );
+
+    // A request cannot raise the engine's budget.
+    let lake = Lake::new(
+        true,
+        budgeted_config(ByteLimit::Unlimited, RequestLimit::Bounded(total - 1)),
+    );
+    lake.hits_for(&acme).await;
+    let mut req = request(sql);
+    req.budgets = Some(RequestBudgets {
+        max_store_requests: Some(RequestLimit::Bounded(u64::MAX)),
+        ..RequestBudgets::default()
+    });
+    let err = lake
+        .executor
+        .execute(acme, &req)
+        .await
+        .expect_err("the engine's budget stands");
+    assert!(
+        matches!(err, SqlError::RequestBudgetExceeded { max, .. } if max == total - 1),
+        "{err:?}"
+    );
 }
