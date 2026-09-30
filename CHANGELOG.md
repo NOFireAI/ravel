@@ -638,6 +638,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The RLOG writer can sort an object by a clustering key and limit which columns BLOOM covers** (ADR-2135 decisions 1 and 5, issue #2141): `RlogWriter::with_sort_descriptor` orders rows by `(stream_ref, ts.div_euclid(bucket), key_1, ..., key_n, ts)` on resolved per-record values, identically on the row and columnar paths, and records the descriptor and clustering generation in the footer, refusing with `InvalidSortDescriptor` a descriptor the footer decoder would refuse or one naming a key no record carries as a per-record attribute of its type; `RlogWriter::with_bloom_scope` covers every string column (`All`, the default), `body`, `severity_text` and the string columns not in a declared-column list (`Undeclared`), or only `body` and `severity_text` (`Text`), and an uncovered column gets no bloom keys. With neither set the writer's output is byte-identical to before; no ingest or compaction caller sets either yet.
+
 - **`--audit-retention` sets the query-audit retention window** (ADR-0062
   decision 2c, ADR-1688, issue #2126). The server built its compactor with
   the compiled-in 90-day audit window and no way to change it. The flag takes
