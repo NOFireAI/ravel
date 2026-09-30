@@ -4356,15 +4356,15 @@ fn negative_ts_rejection(ts_ns: i64, ts_type: &DataType, declared: TsUnit) -> St
 /// declared unit (under its mapping key `unit_key`) for any other column.
 fn ts_read_unit(ts_type: &DataType, declared: TsUnit, unit_key: &str) -> String {
     match ts_type {
-        DataType::Timestamp(unit, _) => format!(
-            "read in the column's own Timestamp unit, {}",
-            match unit {
-                TimeUnit::Second => "seconds",
-                TimeUnit::Millisecond => "millis",
-                TimeUnit::Microsecond => "micros",
-                TimeUnit::Nanosecond => "nanos",
-            }
-        ),
+        DataType::Timestamp(unit, _) => {
+            let unit = match unit {
+                TimeUnit::Second => TsUnit::Seconds,
+                TimeUnit::Millisecond => TsUnit::Millis,
+                TimeUnit::Microsecond => TsUnit::Micros,
+                TimeUnit::Nanosecond => TsUnit::Nanos,
+            };
+            format!("read in the column's own Timestamp unit, {}", unit.as_str())
+        }
         _ => format!("read as {unit_key} = {}", declared.as_str()),
     }
 }
@@ -7069,15 +7069,15 @@ fn build_span(
     // emits. A NULL cell has no OTLP counterpart and is refused instead: in a
     // file the operator controls it is a mapping or export mistake, and
     // placing a span at load time because a column was empty would hide it.
-    let start_ts_ns = match read_ts(cols.col(batch, cols.start_ts), row, mapping.start_ts_unit)?
-        .ok_or_else(|| format!("start_ts column {:?} is null", mapping.start_ts_column))?
-    {
+    let start_cell_ns = read_ts(cols.col(batch, cols.start_ts), row, mapping.start_ts_unit)?
+        .ok_or_else(|| format!("start_ts column {:?} is null", mapping.start_ts_column))?;
+    let start_ts_ns = match start_cell_ns {
         0 => now_ns,
         v => v,
     };
-    let end_ts_ns = match read_ts(cols.col(batch, cols.end_ts), row, mapping.end_ts_unit)?
-        .ok_or_else(|| format!("end_ts column {:?} is null", mapping.end_ts_column))?
-    {
+    let end_cell_ns = read_ts(cols.col(batch, cols.end_ts), row, mapping.end_ts_unit)?
+        .ok_or_else(|| format!("end_ts column {:?} is null", mapping.end_ts_column))?;
+    let end_ts_ns = match end_cell_ns {
         0 => start_ts_ns,
         v => v,
     };
@@ -7086,16 +7086,27 @@ fn build_span(
     // overlaps nearly every query window. Unit conversion cannot flip a sign,
     // so a negative value always comes from a negative cell.
     if start_ts_ns < 0 || end_ts_ns < 0 {
-        let start_unit = ts_read_unit(
-            cols.col(batch, cols.start_ts).data_type(),
-            mapping.start_ts_unit,
-            "start_ts_unit",
-        );
-        let end_unit = ts_read_unit(
-            cols.col(batch, cols.end_ts).data_type(),
-            mapping.end_ts_unit,
-            "end_ts_unit",
-        );
+        // A substituted value was never read from its own column, so naming
+        // that column's unit would send the operator looking for a value it
+        // does not hold.
+        let start_unit = if start_cell_ns == 0 {
+            "taken from load time because start_ts is 0".to_string()
+        } else {
+            ts_read_unit(
+                cols.col(batch, cols.start_ts).data_type(),
+                mapping.start_ts_unit,
+                "start_ts_unit",
+            )
+        };
+        let end_unit = if end_cell_ns == 0 {
+            "taken from start_ts because end_ts is 0".to_string()
+        } else {
+            ts_read_unit(
+                cols.col(batch, cols.end_ts).data_type(),
+                mapping.end_ts_unit,
+                "end_ts_unit",
+            )
+        };
         return Err(format!(
             "span timestamps are before the Unix epoch (start {start_ts_ns} ns, {start_unit}; \
              end {end_ts_ns} ns, {end_unit}); a timestamp column holds a negative value"
@@ -15225,6 +15236,47 @@ type = "str"
             );
         }
 
+        /// A zero end cell takes the start, so a negative start makes the end
+        /// negative too. The end was never read from the end column, and the
+        /// refusal says it came from the start rather than naming
+        /// `end_ts_unit`, under which the end column holds a 0.
+        #[test]
+        fn a_substituted_end_names_the_start_as_its_source() {
+            let err = build_one(Row {
+                start: Arc::new(TimestampSecondArray::from(vec![-5])) as ArrayRef,
+                end: i64_col(vec![0]),
+                ..Row::default()
+            })
+            .expect_err("a negative start with a zero end is refused");
+            assert_eq!(
+                err,
+                "span timestamps are before the Unix epoch (start -5000000000 ns, read in the \
+                 column's own Timestamp unit, seconds; end -5000000000 ns, taken from start_ts \
+                 because end_ts is 0); a timestamp column holds a negative value"
+            );
+        }
+
+        /// A zero start cell takes load time, so a negative end is refused
+        /// beside a start the start column does not hold. The refusal says the
+        /// start came from load time rather than naming `start_ts_unit`.
+        #[test]
+        fn a_substituted_start_names_load_time_as_its_source() {
+            let err = build_one(Row {
+                start: i64_col(vec![0]),
+                end: i64_col(vec![-5]),
+                ..Row::default()
+            })
+            .expect_err("a zero start with a negative end is refused");
+            assert_eq!(
+                err,
+                format!(
+                    "span timestamps are before the Unix epoch (start {NOW_NS} ns, taken from \
+                     load time because start_ts is 0; end -5 ns, read as end_ts_unit = nanos); \
+                     a timestamp column holds a negative value"
+                )
+            );
+        }
+
         /// Both attribute-count caps are properties of the mapping, so both
         /// are refused at mapping parse rather than per row.
         #[test]
@@ -16125,6 +16177,33 @@ type = "str"
             };
             assert_eq!(*row, 1);
             assert_eq!(reason, NEGATIVE_NATIVE_SECONDS);
+        }
+
+        /// The logs and metrics refusal spells every native Arrow unit, and an
+        /// integer column's declared unit, exactly as the mapping writes it.
+        #[test]
+        fn the_logs_and_metrics_refusal_spells_every_unit() {
+            let native = |unit: TimeUnit| {
+                negative_ts_rejection(-5, &DataType::Timestamp(unit, None), TsUnit::Nanos)
+            };
+            for (unit, name) in [
+                (TimeUnit::Second, "seconds"),
+                (TimeUnit::Millisecond, "millis"),
+                (TimeUnit::Microsecond, "micros"),
+                (TimeUnit::Nanosecond, "nanos"),
+            ] {
+                assert_eq!(
+                    native(unit),
+                    format!(
+                        "timestamp is before the Unix epoch (-5 ns, read in the column's own \
+                         Timestamp unit, {name}); the column holds a negative value"
+                    )
+                );
+            }
+            assert_eq!(
+                negative_ts_rejection(-5_000_000, &DataType::Int64, TsUnit::Millis),
+                NEGATIVE_MILLIS
+            );
         }
 
         #[tokio::test]
