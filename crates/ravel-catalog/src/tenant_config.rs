@@ -92,6 +92,14 @@ pub const TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION: u32 = 3;
 /// version-3 record written today is refused by any process still running an
 /// older release. The storage-layout setters take this token so that writing one
 /// is a named decision, never a default.
+///
+/// The token records a decision its caller makes, the operator's CLI once one
+/// sets these fields; it does not enforce one. Nothing here checks which
+/// releases the bucket's readers run. [`ReadersRolledOut`] is public, and a key
+/// or scope decoded from any version-3 record carries it, so copying a stored
+/// key or scope from such a config into another carries the opt-in with it.
+///
+/// [`ReadersRolledOut`]: StorageLayoutWrite::ReadersRolledOut
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StorageLayoutWrite {
     /// No opt-in: the storage-layout setters refuse with
@@ -658,8 +666,8 @@ pub struct TenantConfig {
     /// [`TenantConfig::clustering_key`]; change it only through
     /// [`TenantConfig::set_clustering_key`] and
     /// [`TenantConfig::clear_clustering_key`]. The value type has no public
-    /// constructor, and [`set_tenant_config`] re-applies the setter's validation
-    /// to whatever this field carries.
+    /// constructor, and [`set_tenant_config`] runs the accessor's validation on
+    /// whatever this field carries.
     pub stored_clustering_key: Option<StoredClusteringKey>,
     /// The stored bloom scope (ADR-2135, record field 14), unvalidated. Read it
     /// through [`TenantConfig::bloom_scope`]; change it only through

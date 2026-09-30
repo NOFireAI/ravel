@@ -1,8 +1,8 @@
 //! The storage-layout setters on the tenant config record (ADR-2135 decision 7,
 //! issue #2146): the clustering key and bloom scope are written through
 //! `set_tenant_config` as a version-3 record only behind the operator opt-in,
-//! and the write gate re-applies the setters' rules to whatever a config
-//! carries. Every test goes through the public write and read path on a
+//! and the write gate validates whatever a config carries, on its own and
+//! against the record it replaces. Every test goes through the public write and read path on a
 //! `MemoryStore`, and asserts the record on the wire where the claim is about
 //! the record.
 
@@ -554,6 +554,36 @@ async fn hand_built_layout_cannot_bypass_the_setter() {
             columns: names(&["b"]),
             bucket_width: ONE_DAY,
             generation: 2,
+        })
+    );
+}
+
+/// The gate does not require the stored generation plus one: two setter calls
+/// on one config read at generation 1 are written at generation 3, with the
+/// second call's key.
+#[tokio::test]
+async fn chained_setters_write_the_stored_generation_plus_two() {
+    let store = MemoryStore::new();
+    let mut first = base_config();
+    first
+        .set_clustering_key(names(&["a"]), ClusteringBucketWidth::OneHour, OPTED_IN)
+        .expect("set");
+    write(&store, &first, 1).await;
+
+    let mut chained = read(&store).await;
+    chained
+        .set_clustering_key(names(&["b"]), ClusteringBucketWidth::OneHour, OPTED_IN)
+        .expect("second set");
+    chained
+        .set_clustering_key(names(&["c", "a"]), ClusteringBucketWidth::OneDay, OPTED_IN)
+        .expect("third set");
+    write(&store, &chained, 2).await;
+    assert_eq!(
+        wire(&store).await.clustering_key,
+        Some(sysproto::ClusteringKeyConfig {
+            columns: names(&["c", "a"]),
+            bucket_width: ONE_DAY,
+            generation: 3,
         })
     );
 }
