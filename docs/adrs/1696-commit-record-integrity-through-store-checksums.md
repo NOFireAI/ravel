@@ -49,7 +49,8 @@ neither on the wire by default:
   2026-09-30 CLI amendment; `services/ravel-server/src/store.rs:409` via
   `with_metrics`, `s3.rs:638-639`).
   With integrity on, multipart is excluded and a payload above the single-PUT
-  ceiling is refused loudly (`s3.rs:1628-1646`).
+  ceiling is refused loudly (`s3.rs:1628-1646`); for why, and what the
+  multipart path could carry, see the 2026-09-30 multipart amendment below.
 - The GET path passes `range` and `if_match` only (`get_one`,
   `s3.rs:1453-1470`), asks for no checksum and verifies none. `GetOutcome`
   carries `data`, `etag`, `version`, `total_size` and no checksum
@@ -379,3 +380,24 @@ sets both environment variables from `spec.storage.s3.uploadIntegrity` and
 rendered only away from the default, and both fields are inputs to the
 qualification hash, so editing either re-runs the Job. A passing
 qualification now shows the endpoint accepted the configured upload checksum.
+
+## Amendment (2026-09-30, #2227): why multipart stays excluded under upload integrity
+
+<!-- amendment-applies: sections="Context" pointer="2026-09-30 multipart amendment" -->
+
+The adapter's own comments gave the exclusion a reason that is false: that
+multipart parts cannot carry a server-verified checksum. With a checksum
+algorithm set on the client, `object_store` 0.14.1's `create_multipart`
+sends `x-amz-checksum-algorithm`, and `put_part` sends each part through
+`PutRequest::with_payload`, which attaches `x-amz-checksum-crc64nvme` or
+`x-amz-checksum-sha256` whenever `config.checksum` is set. So the multipart
+path could carry per-part checksums today.
+
+The exclusion stands, with a true reason: a single PUT is one billed request
+where multipart costs parts + 2, and the whole object gets one checksum where
+multipart gets one per part. No real endpoint has been checked to verify the
+per-part checksums, so switching large overwrites to multipart under
+integrity is a later change that needs that real-endpoint check first. The
+refusal of a payload above the single-PUT ceiling is unchanged; its error
+text no longer claims multipart carries no checksum.
+
