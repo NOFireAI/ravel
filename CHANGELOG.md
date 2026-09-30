@@ -1517,6 +1517,24 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   failed on: a store error or a read that came back short.
   `tenant parquet-grant add` lists past a zero-byte directory blob, and says so
   when its search for an object stopped at the listing page bound.
+- **`ravel-parquet`: `snapshot::snapshot_location`, the file list `CREATE
+  EXTERNAL TABLE` will pin** (ADR-2040 decision D2, issue #2052). Not reachable
+  from SQL yet; #2054 wires it into the DDL. A location naming one object is
+  read with one HEAD and no LIST; a prefix ending in `/` is listed once,
+  recursively, and every key ending in exactly `.parquet` becomes a file,
+  Hive-style subdirectories included with no partition columns. Directory
+  markers and other suffixes are skipped and counted separately. Each footer
+  is read with `If-Match` on the ETag the listing reported, under a
+  `GetLimiter` permit and charged to the Probe phase, with up to the
+  limiter's permits in flight, and the file's ETag, version and size are
+  recorded from that read's response, not from the listing. The footer passes
+  the same trailer, column chunk and embedded Arrow schema checks the reader
+  applies. A typed `SnapshotError` naming the key refuses the whole snapshot
+  for a file changed or deleted after the listing, an empty or truncated
+  file, a footer the reader would refuse, a key the object-store client
+  cannot address exactly, and a file whose schema differs from the first
+  file's; it also refuses a prefix with no file or more than 100,000
+  (`MAX_TABLE_FILES`), and a snapshot that outlives its deadline.
 
 ## [0.19.0] - 2026-09-27
 

@@ -3,9 +3,10 @@
 //!
 //! [`snapshot_location`] turns a `LOCATION` that already lies inside one of
 //! the caller's grants into the [`ParquetFile`]s a manifest records and the
-//! one schema they share. It reads every footer the way the scan will, so a
-//! file the scan would refuse is refused here, and it records each file's
-//! identity from the footer read's response, never from the listing.
+//! one schema they share. It runs the reader's footer checks on every
+//! footer, so a footer the scan would refuse is refused here, and it records
+//! each file's identity from the footer read's response, never from the
+//! listing.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -72,7 +73,7 @@ impl GrantedLocation {
 /// What a location holds, ready for a manifest.
 #[derive(Debug, Clone)]
 pub struct LocationSnapshot {
-    /// One entry per `.parquet` object, in listing order.
+    /// One entry per file, in listing order.
     pub files: Vec<ParquetFile>,
     /// The Arrow schema every file shares, with the schema's and each
     /// top-level field's metadata cleared.
@@ -84,7 +85,9 @@ pub struct LocationSnapshot {
 }
 
 /// Why a location could not be snapshotted. Each names the location or the
-/// object key it refused; none carries a credential.
+/// object key it refused. The text built here names locations, keys and
+/// grants, none of which carries a credential; `List` and `Store` append the
+/// store error's own text.
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {
     #[error("LOCATION {location} holds no {PARQUET_SUFFIX} file")]
@@ -141,8 +144,9 @@ pub enum SnapshotError {
 /// directory location is listed once, recursively; every key ending in
 /// exactly [`PARQUET_SUFFIX`] becomes a file, Hive-style subdirectories
 /// included as plain files, and the other keys are counted and skipped. A
-/// file key [`key_is_addressable`] refuses, more than [`MAX_TABLE_FILES`]
-/// files, or none at all, refuses the snapshot.
+/// file key [`key_is_addressable`] refuses or the grant does not contain,
+/// more than [`MAX_TABLE_FILES`] files, or none at all, refuses the
+/// snapshot.
 ///
 /// Each file's footer read carries `If-Match` on the ETag the listing (or
 /// the HEAD) reported, takes a `limiter` permit, and is charged to
@@ -471,28 +475,28 @@ async fn read_file(
             etag: listed_pin.etag.clone(),
             version: recorded.version.clone(),
         };
-        let head = pinned_get(
+        let footer_start = size - footer_and_trailer;
+        let before = pinned_get(
             store,
             limiter,
             accounting,
             &key,
-            (size - footer_and_trailer, tail_start),
+            (footer_start, tail_start),
             &pin,
         )
         .await?;
-        if head.outcome.total_size != size || head.pin != recorded {
+        if before.outcome.total_size != size || before.pin != recorded {
             return Err(SnapshotError::FileChanged { key: key.clone() });
         }
-        let head = head.outcome.data;
-        if head.len() as u64 != tail_start - (size - footer_and_trailer) {
+        let before = before.outcome.data;
+        if before.len() as u64 != tail_start - footer_start {
             return Err(corrupt(format!(
-                "read of bytes {}..{tail_start} returned {} bytes",
-                size - footer_and_trailer,
-                head.len()
+                "read of bytes {footer_start}..{tail_start} returned {} bytes",
+                before.len()
             )));
         }
         let mut footer = Vec::with_capacity(footer_len as usize);
-        footer.extend_from_slice(&head);
+        footer.extend_from_slice(&before);
         footer.extend_from_slice(&data[..split]);
         Bytes::from(footer)
     };
@@ -1050,9 +1054,8 @@ mod tests {
         ));
     }
 
-    /// Mutation that fails it: comparing each file with the one before it
-    /// rather than with the first names `data/d.parquet` against
-    /// `data/c.parquet`; skipping the comparison admits both.
+    /// Mutation that fails it: skipping the comparison admits both differing
+    /// files.
     #[tokio::test]
     async fn a_schema_mismatch_refuses_naming_the_first_file_that_differs() {
         let store = two_files().await;
@@ -1097,8 +1100,8 @@ mod tests {
     /// The listing reports an ETag spelled differently, a size one byte
     /// short and a CAS version that is not the store's selector; the
     /// recorded file carries what the footer read's response reported.
-    /// Mutations that fail it: taking the ETag, the version or the size from
-    /// the listing's `ObjectMeta`.
+    /// Mutations that fail it: taking the ETag or the size from the listing's
+    /// `ObjectMeta`, and recording no version.
     #[tokio::test]
     async fn the_recorded_identity_comes_from_the_footer_read_not_the_listing() {
         let store = Scripted {
@@ -1198,8 +1201,7 @@ mod tests {
         assert_eq!(spent.scan, Default::default());
     }
 
-    /// Mutation that fails it: dropping the `tokio::time::timeout` around the
-    /// snapshot leaves it waiting on the held read forever.
+    /// Mutation that fails it: reporting the expiry as any other error.
     #[tokio::test]
     async fn a_snapshot_past_its_deadline_refuses_with_the_deadline_error() {
         let store = two_files().await;
@@ -1226,30 +1228,42 @@ mod tests {
         }
     }
 
-    /// Mutation that fails it: listing a single-object location as a prefix.
+    /// One HEAD charged to Resolve and one footer GET charged to Probe, for a
+    /// key with or without the `.parquet` suffix. Mutation that fails it:
+    /// listing a single-object location as a prefix.
     #[tokio::test]
     async fn a_single_object_location_reads_that_object_and_lists_nothing() {
-        let store = Scripted::default();
-        put(&store, "data/one.parquet", parquet_bytes(&[1], &["x"])).await;
-        put(&store, "data/two.parquet", parquet_bytes(&[2], &["y"])).await;
-        let got = snapshot(&store, "s3://lake/data/one.parquet")
+        for key in ["data/one.parquet", "data/export"] {
+            let store = Scripted::default();
+            let bytes = parquet_bytes(&[1], &["x"]);
+            put(&store, key, bytes.clone()).await;
+            put(&store, "data/two.parquet", parquet_bytes(&[2], &["y"])).await;
+            let accounting = PhaseAccounting::new();
+            let limiter = GetLimiter::new(4).expect("permits");
+            let got = snapshot_location(
+                &store,
+                &location(&format!("s3://lake/{key}")),
+                &limiter,
+                DEADLINE,
+                &accounting,
+            )
             .await
             .expect("snapshot");
-        assert_eq!(keys(&got), ["data/one.parquet"]);
-        assert!(store.lists().is_empty());
-        assert_eq!(store.heads(), ["data/one.parquet"]);
-        assert!(
-            store
-                .gets()
-                .iter()
-                .all(|(key, _)| key == "data/one.parquet"),
-            "{:?}",
-            store.gets()
-        );
-        assert_eq!(
-            (got.skipped_directory_markers, got.skipped_other_suffixes),
-            (0, 0)
-        );
+            assert_eq!(keys(&got), [key]);
+            assert!(store.lists().is_empty());
+            assert_eq!(store.heads(), [key]);
+            let size = bytes.len() as u64;
+            assert_eq!(store.gets(), [(key.to_string(), GetRange::Range(0, size))]);
+            assert_eq!(
+                (got.skipped_directory_markers, got.skipped_other_suffixes),
+                (0, 0)
+            );
+            let spent = accounting.snapshot();
+            assert_eq!(spent.resolve.s3_requests[AccountedOp::Head.index()], 1);
+            assert_eq!(spent.resolve.s3_requests[AccountedOp::List.index()], 0);
+            assert_eq!(spent.probe.s3_requests[AccountedOp::Get.index()], 1);
+            assert_eq!(spent.probe.s3_bytes[AccountedOp::Get.index()], size);
+        }
     }
 
     /// Drive a snapshot of four files whose every GET is held, releasing the
