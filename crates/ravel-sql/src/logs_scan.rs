@@ -321,7 +321,7 @@ use ravel_commit::declared_stats::{StatCarrier, observe_declared_stat_drops};
 use ravel_logseg::footer::LogFooter;
 use ravel_logseg::{
     AttrColumn, BoolCursor, BytesCursor, ColumnSelection, ColumnarBlockView, F64BitsCursor,
-    FieldSel, FieldType, I64Cursor, LogRecord, LogSegError, Predicate, ScanStats,
+    FieldSel, FieldType, I64Cursor, LogRecord, LogSegError, Predicate, ScanStats, StrDictColumn,
 };
 use ravel_proto::catalog::v1::column_value::Kind as ColumnValueKind;
 use ravel_proto::catalog::v1::{ColumnStat, ColumnStatsSegment, ColumnValue};
@@ -4659,17 +4659,103 @@ fn attr_key_column_array(key: &str, merged: &[Vec<(String, AttrValue)>]) -> Arra
 /// `HashMap<u32, _>` lookup per cell; the cursor resolves the column's storage
 /// once and then indexes the resolved slice per row with no lookup.
 enum DeclaredCursor<'a> {
-    Str(BytesCursor<'a>),
+    Str(StrCursor<'a>),
     Bytes(BytesCursor<'a>),
     I64(I64Cursor<'a>),
     F64(F64BitsCursor<'a>),
     Bool(BoolCursor<'a>),
 }
 
+#[cfg(test)]
+thread_local! {
+    /// UTF-8 validations [`cell_text`] ran on this thread, so a test can pin how
+    /// often a declared `Str` cell's bytes are validated.
+    static CELL_TEXT_VALIDATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A `Str` cell's bytes as text, or `None` when they are not UTF-8. Every UTF-8
+/// validation of a declared `Str` cell or dictionary entry goes through here.
+fn cell_text(bytes: &[u8]) -> Option<&str> {
+    #[cfg(test)]
+    CELL_TEXT_VALIDATIONS.with(|n| n.set(n.get() + 1));
+    std::str::from_utf8(bytes).ok()
+}
+
+/// A `Str` FIELD_DIR column resolved once per block, whose cells' UTF-8 is
+/// validated at most once per block (ADR-2121 D3).
+///
+/// On a dictionary page each entry is validated the first time any row or the
+/// dictionary build asks for it, and every later read of that entry, from the
+/// presence search or from the build, is a lookup of the row's id. A plain page
+/// validates the cell on each [`text_at`](Self::text_at) call, so a caller that
+/// needs both presence and text reads it once and keeps the result
+/// ([`winner_at`]).
+struct StrCursor<'a> {
+    cells: BytesCursor<'a>,
+    /// The page's ids and per-entry text, `Some` only for a dictionary page.
+    dict: Option<StrDictText<'a>>,
+}
+
+/// A dictionary page's ids plus each entry's text, validated on first use.
+struct StrDictText<'a> {
+    col: StrDictColumn<'a>,
+    /// Parallel to `col.dict()`: `Some(Some(text))` for a validated UTF-8
+    /// entry, `Some(None)` for a validated non-UTF-8 entry, unset until first
+    /// read.
+    text: Vec<std::cell::OnceCell<Option<&'a str>>>,
+}
+
+impl<'a> StrDictText<'a> {
+    /// The text of dictionary entry `id`, or `None` when it is not UTF-8.
+    fn entry(&self, id: usize) -> Option<&'a str> {
+        let slot = self.text.get(id)?;
+        let dict = self.col.dict();
+        *slot.get_or_init(|| dict.get(id).and_then(|b| cell_text(b)))
+    }
+
+    /// The number of dictionary entries.
+    fn len(&self) -> usize {
+        self.text.len()
+    }
+}
+
+impl<'a> StrCursor<'a> {
+    fn resolve(view: &ColumnarBlockView<'a>, column_id: u32) -> Self {
+        let dict = view.str_dict(column_id).map(|col| StrDictText {
+            text: (0..col.dict().len())
+                .map(|_| std::cell::OnceCell::new())
+                .collect(),
+            col,
+        });
+        StrCursor {
+            cells: view.bytes_cursor(column_id),
+            dict,
+        }
+    }
+
+    /// The cell at surviving row `i` as text, or `None` when absent or not
+    /// UTF-8. Treating invalid UTF-8 as no value matches the row path
+    /// ([`read_str_cell`]), which lets a resource/scope fallback show through.
+    fn text_at(&self, i: usize) -> Option<&'a str> {
+        match &self.dict {
+            Some(d) => d.entry(d.col.id_at(i)? as usize),
+            None => cell_text(self.cells.at(i)?),
+        }
+    }
+}
+
+/// Whether a cursor sets the key at a row, and for a `Str` cursor the text its
+/// presence test already validated.
+enum Presence<'a> {
+    Absent,
+    Present,
+    Text(&'a str),
+}
+
 impl<'a> DeclaredCursor<'a> {
     fn resolve(view: &ColumnarBlockView<'a>, col: AttrColumn) -> Self {
         match col.ty {
-            FieldType::Str => DeclaredCursor::Str(view.bytes_cursor(col.column_id)),
+            FieldType::Str => DeclaredCursor::Str(StrCursor::resolve(view, col.column_id)),
             FieldType::Bytes => DeclaredCursor::Bytes(view.bytes_cursor(col.column_id)),
             FieldType::I64 => DeclaredCursor::I64(view.i64_cursor(col.column_id)),
             FieldType::F64 => DeclaredCursor::F64(view.f64_bits_cursor(col.column_id)),
@@ -4680,24 +4766,30 @@ impl<'a> DeclaredCursor<'a> {
     /// Whether the record sets the key in this column at surviving row `i`, with
     /// the same "readable" rule the row path uses: an invalid-UTF-8 `Str` cell is
     /// not a value (matches [`read_str_cell`]), so it must not suppress the
-    /// resource/scope fallback.
-    fn present_at(&self, i: usize) -> bool {
-        match self {
-            DeclaredCursor::Str(c) => c.str_at(i).is_some(),
+    /// resource/scope fallback. A `Str` cell's validated text is returned with
+    /// the answer so the caller does not validate it again.
+    fn presence_at(&self, i: usize) -> Presence<'a> {
+        let present = match self {
+            DeclaredCursor::Str(c) => return c.text_at(i).map_or(Presence::Absent, Presence::Text),
             DeclaredCursor::Bytes(c) => c.at(i).is_some(),
             DeclaredCursor::I64(c) => c.at(i).is_some(),
             DeclaredCursor::F64(c) => c.at(i).is_some(),
             DeclaredCursor::Bool(c) => c.at(i).is_some(),
+        };
+        if present {
+            Presence::Present
+        } else {
+            Presence::Absent
         }
     }
 
     /// The cell at surviving row `i` as an [`AttrValue`], or `None` when NULL (or,
-    /// for `Str`, not UTF-8). Used for the non-`Str` builders and to compare a
-    /// record value's variant against the declared type; the `Str` builder reads
-    /// `&str` directly so it never allocates a throwaway `String` (#875).
+    /// for `Str`, not UTF-8). Used for the multi-occurrence non-`Str` builders and
+    /// the synthetic per-key columns; the `Str` builder reads `&str` directly so
+    /// it never allocates a throwaway `String` (#875).
     fn value_at(&self, i: usize) -> Option<AttrValue> {
         match self {
-            DeclaredCursor::Str(c) => c.str_at(i).map(|s| AttrValue::Str(s.to_string())),
+            DeclaredCursor::Str(c) => c.text_at(i).map(|s| AttrValue::Str(s.to_string())),
             DeclaredCursor::Bytes(c) => c.at(i).map(|b| AttrValue::Bytes(b.to_vec())),
             DeclaredCursor::I64(c) => c.at(i).map(AttrValue::I64),
             DeclaredCursor::F64(c) => c.at(i).map(|bits| AttrValue::F64(f64::from_bits(bits))),
@@ -4706,14 +4798,42 @@ impl<'a> DeclaredCursor<'a> {
     }
 }
 
+/// The index into `cols`/`cursors` of the record's WINNING occurrence of a key
+/// at surviving row `i`, or `None` when the record does not set the key, plus
+/// the winner's text when it is a `Str` cursor (validated once, by the presence
+/// test).
+///
+/// The highest FIELD_DIR type byte wins, and among equal type bytes the last
+/// one, the tie-break `max_by_key` gives; see [`DeclaredPlan::winning_idx`] for
+/// the rule this implements.
+fn winner_at<'a>(
+    cols: &[AttrColumn],
+    cursors: &[DeclaredCursor<'a>],
+    i: usize,
+) -> Option<(usize, Option<&'a str>)> {
+    let mut best: Option<(usize, u8, Option<&'a str>)> = None;
+    for (k, (col, cursor)) in cols.iter().zip(cursors).enumerate() {
+        let text = match cursor.presence_at(i) {
+            Presence::Absent => continue,
+            Presence::Present => None,
+            Presence::Text(s) => Some(s),
+        };
+        let ty = col.ty.to_u8();
+        if best.is_none_or(|(_, b, _)| ty >= b) {
+            best = Some((k, ty, text));
+        }
+    }
+    best.map(|(k, _, text)| (k, text))
+}
+
 /// One declared column's FIELD_DIR resolution for a block, done once rather than
 /// per row (ADR-0099 decision 2). Every FIELD_DIR column of the key is resolved
 /// to a cursor once when the plan is built; the row loop then reads through the
 /// cursors with no per-cell column lookup (#875).
 struct DeclaredPlan<'d, 'a> {
     dc: &'d DeclaredColumn,
-    /// The raw FIELD_DIR columns of this key, across all stored types. Kept
-    /// because [`ColumnarBlockView::str_dict`] resolves by column id.
+    /// The raw FIELD_DIR columns of this key, across all stored types. Kept for
+    /// their type bytes, which order the occurrences ([`winner_at`]).
     cols: Vec<AttrColumn>,
     /// Cursors parallel to [`Self::cols`], resolved once for the block.
     cursors: Vec<DeclaredCursor<'a>>,
@@ -4739,11 +4859,6 @@ impl<'d, 'a> DeclaredPlan<'d, 'a> {
             cursors,
             matching_idx,
         }
-    }
-
-    /// The declared-type FIELD_DIR column, if the key has one.
-    fn matching_col(&self) -> Option<AttrColumn> {
-        self.matching_idx.map(|k| self.cols[k])
     }
 
     /// The cursor over the declared-type column, if any.
@@ -4778,15 +4893,16 @@ impl<'d, 'a> DeclaredPlan<'d, 'a> {
     /// from FIELD_DIR position, so the answer does not depend on the directory's
     /// sort order.
     ///
-    /// Only consulted in the multi-column case; the fused case gets the same
-    /// answer from the single matching read.
+    /// The fused `single_matching` reads get the same answer from the single
+    /// matching read.
     fn winning_idx(&self, i: usize) -> Option<usize> {
-        self.cursors
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| c.present_at(i))
-            .max_by_key(|(k, _)| self.cols[*k].ty.to_u8())
-            .map(|(k, _)| k)
+        self.winner(i).map(|(k, _)| k)
+    }
+
+    /// [`winning_idx`](Self::winning_idx) plus the winner's text when it is the
+    /// `Str` cursor, as its presence test validated it ([`winner_at`]).
+    fn winner(&self, i: usize) -> Option<(usize, Option<&'a str>)> {
+        winner_at(&self.cols, &self.cursors, i)
     }
 }
 
@@ -4891,6 +5007,26 @@ impl<'p, 'd, 'a> DeclaredResolver<'p, 'd, 'a> {
         }
     }
 
+    /// The cursor over the key's one FIELD_DIR column when
+    /// [`DeclaredPlan::single_matching`] holds for the block, else `None`.
+    fn single_cursor(&self) -> Option<&'p DeclaredCursor<'a>> {
+        self.matching_cursor.filter(|_| self.single_matching)
+    }
+
+    /// The resource/scope value for surviving row `i`'s stream, for a row the
+    /// record does not set the key at; `None` when the stream has none.
+    fn fallback_at(
+        &mut self,
+        view: &ColumnarBlockView<'_>,
+        i: usize,
+        cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
+    ) -> DFResult<Option<&AttrValue>> {
+        let Some(stream_ref) = view.stream_ref(i) else {
+            return Ok(None);
+        };
+        Ok(self.fallback_value(view, cache, stream_ref)?.as_ref())
+    }
+
     /// The merged value of the declared key at surviving row `i`. Returns the
     /// record-column value when the record's WINNING occurrence of the key
     /// ([`DeclaredPlan::winning_idx`]) is at the declared type; `None` when that
@@ -4926,10 +5062,40 @@ impl<'p, 'd, 'a> DeclaredResolver<'p, 'd, 'a> {
                 None
             });
         }
-        let Some(stream_ref) = view.stream_ref(i) else {
-            return Ok(None);
-        };
-        Ok(self.fallback_value(view, cache, stream_ref)?.clone())
+        Ok(self.fallback_at(view, i, cache)?.cloned())
+    }
+}
+
+/// Append a merged `I64` value, or NULL for an absent value or another variant.
+fn append_i64(b: &mut Int64Builder, v: Option<&AttrValue>) {
+    match v {
+        Some(AttrValue::I64(v)) => b.append_value(*v),
+        _ => b.append_null(),
+    }
+}
+
+/// Append a merged `Bool` value, or NULL for an absent value or another variant.
+fn append_bool(b: &mut BooleanBuilder, v: Option<&AttrValue>) {
+    match v {
+        Some(AttrValue::Bool(v)) => b.append_value(*v),
+        _ => b.append_null(),
+    }
+}
+
+/// Append a merged `Bytes` value, or NULL for an absent value or another
+/// variant.
+fn append_bytes(b: &mut BinaryBuilder, v: Option<&AttrValue>) {
+    match v {
+        Some(AttrValue::Bytes(bytes)) => b.append_value(bytes),
+        // Parity with the row path: a resource/scope `List`/`Map` value is
+        // canonicalized. In the eligible (no `attrs_raw`) case a record's
+        // `List`/`Map` is already stored as a canonicalized `Bytes` column, and
+        // `decode_stream_attrs` omits nested resource values, so this arm is
+        // effectively dead here; it is kept identical to `declared_column_array`.
+        Some(v @ (AttrValue::List(_) | AttrValue::Map(_))) => {
+            b.append_value(canonical_value_bytes(v))
+        }
+        _ => b.append_null(),
     }
 }
 
@@ -4942,6 +5108,13 @@ impl<'p, 'd, 'a> DeclaredResolver<'p, 'd, 'a> {
 ///
 /// The `match` on the declared type mirrors [`declared_column_array`], so a
 /// future declared `f64` slots in as one arm on both paths.
+///
+/// When [`DeclaredPlan::single_matching`] holds, the `I64`, `Bool` and `Bytes`
+/// arms read each row's cell straight from the one cursor (ADR-2121 D2): a
+/// present cell is appended with no [`AttrValue`], and only an absent cell
+/// takes the resource/scope fallback, the order
+/// [`DeclaredResolver::merged_value`] follows. Every other block goes through
+/// `merged_value` per cell.
 fn build_declared_columnar_array(
     view: &ColumnarBlockView<'_>,
     resolver: &mut DeclaredResolver<'_, '_, '_>,
@@ -4950,43 +5123,53 @@ fn build_declared_columnar_array(
     cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
 ) -> DFResult<ArrayRef> {
     let plan = resolver.plan;
+    let single = resolver.single_cursor();
     Ok(match plan.dc.ty {
         DeclaredType::Str => build_declared_str_columnar(view, resolver, start, end, cache)?,
         DeclaredType::I64 => {
-            let mut b = Int64Builder::new();
-            for i in start..end {
-                match resolver.merged_value(view, i, cache)? {
-                    Some(AttrValue::I64(v)) => b.append_value(v),
-                    _ => b.append_null(),
+            let mut b = Int64Builder::with_capacity(end - start);
+            if let Some(DeclaredCursor::I64(c)) = single {
+                for i in start..end {
+                    match c.at(i) {
+                        Some(v) => b.append_value(v),
+                        None => append_i64(&mut b, resolver.fallback_at(view, i, cache)?),
+                    }
+                }
+            } else {
+                for i in start..end {
+                    append_i64(&mut b, resolver.merged_value(view, i, cache)?.as_ref());
                 }
             }
             Arc::new(b.finish())
         }
         DeclaredType::Bool => {
-            let mut b = BooleanBuilder::new();
-            for i in start..end {
-                match resolver.merged_value(view, i, cache)? {
-                    Some(AttrValue::Bool(v)) => b.append_value(v),
-                    _ => b.append_null(),
+            let mut b = BooleanBuilder::with_capacity(end - start);
+            if let Some(DeclaredCursor::Bool(c)) = single {
+                for i in start..end {
+                    match c.at(i) {
+                        Some(v) => b.append_value(v),
+                        None => append_bool(&mut b, resolver.fallback_at(view, i, cache)?),
+                    }
+                }
+            } else {
+                for i in start..end {
+                    append_bool(&mut b, resolver.merged_value(view, i, cache)?.as_ref());
                 }
             }
             Arc::new(b.finish())
         }
         DeclaredType::Bytes => {
             let mut b = BinaryBuilder::new();
-            for i in start..end {
-                match resolver.merged_value(view, i, cache)? {
-                    Some(AttrValue::Bytes(bytes)) => b.append_value(bytes),
-                    // Parity with the row path: a resource/scope `List`/`Map`
-                    // value is canonicalized. In the eligible (no `attrs_raw`)
-                    // case a record's `List`/`Map` is already stored as a
-                    // canonicalized `Bytes` column, and `decode_stream_attrs`
-                    // omits nested resource values, so this arm is effectively
-                    // dead here; it is kept identical to `declared_column_array`.
-                    Some(v @ (AttrValue::List(_) | AttrValue::Map(_))) => {
-                        b.append_value(canonical_value_bytes(&v))
+            if let Some(DeclaredCursor::Bytes(c)) = single {
+                for i in start..end {
+                    match c.at(i) {
+                        Some(bytes) => b.append_value(bytes),
+                        None => append_bytes(&mut b, resolver.fallback_at(view, i, cache)?),
                     }
-                    _ => b.append_null(),
+                }
+            } else {
+                for i in start..end {
+                    append_bytes(&mut b, resolver.merged_value(view, i, cache)?.as_ref());
                 }
             }
             Arc::new(b.finish())
@@ -5010,12 +5193,14 @@ fn build_declared_columnar_array(
 ///   NULL by ADR-0090 decision 7). A row the record does not set at all reads
 ///   through to the resource/scope fallback, whose value is appended to the
 ///   dictionary (the one per-row copy, unavoidable because that value is not in
-///   the page).
+///   the page). Each entry is validated once per block ([`StrCursor`]), and a
+///   row's presence is a lookup of its id.
 /// - **Plain page** (`str_dict` returns `None`, or the key has no `Str`
 ///   FIELD_DIR column at all): a degenerate identity dictionary, one entry per
 ///   non-null surviving row with keys `0..`. The record's own `Str` value is read
-///   as `&str` straight from the [`BytesCursor`] into the builder, so no
-///   throwaway `String` is allocated per cell (deliverable 3, #875). No hashing
+///   as `&str` straight from the [`StrCursor`] into the builder, so no
+///   throwaway `String` is allocated per cell (deliverable 3, #875), and the
+///   text the presence search validated is the text appended. No hashing
 ///   and no dedup pass, so this case stays exactly as expensive as it was.
 fn build_declared_str_columnar(
     view: &ColumnarBlockView<'_>,
@@ -5026,137 +5211,129 @@ fn build_declared_str_columnar(
 ) -> DFResult<ArrayRef> {
     let n = end - start;
     let plan = resolver.plan;
-    Ok(
-        match plan
-            .matching_col()
-            .and_then(|mc| view.str_dict(mc.column_id))
-        {
-            Some(col) => {
-                // Dictionary values start as the page's distinct byte values,
-                // decoded to UTF-8; a non-UTF-8 entry becomes a NULL value. Ids
-                // address these in the page's order, so a record row's page id maps
-                // straight to a dictionary index. Resource/scope fallback values are
-                // appended past the page dict.
-                let mut values = StringBuilder::new();
-                for v in col.dict() {
-                    match std::str::from_utf8(v) {
-                        Ok(s) => values.append_value(s),
-                        Err(_) => values.append_null(),
-                    }
+    // The declared-type (`Str`) column's cursor; `None` when the key has no
+    // `Str` column at all (then only the resource/scope fallback yields a value).
+    let matching_str = match plan.matching_cursor() {
+        Some(DeclaredCursor::Str(c)) => Some(c),
+        _ => None,
+    };
+    Ok(match matching_str.and_then(|c| c.dict.as_ref()) {
+        Some(dict) => {
+            // Dictionary values start as the page's distinct values as text;
+            // a non-UTF-8 entry becomes a NULL value. Ids address these in the
+            // page's order, so a record row's page id maps straight to a
+            // dictionary index. Resource/scope fallback values are appended
+            // past the page dict.
+            let mut values = StringBuilder::new();
+            for id in 0..dict.len() {
+                match dict.entry(id) {
+                    Some(s) => values.append_value(s),
+                    None => values.append_null(),
                 }
-                let mut next_extra = i32::try_from(col.dict().len()).map_err(|_| {
-                    DataFusionError::Internal("declared Str dictionary exceeds i32 keys".into())
-                })?;
-                let mut keys: Vec<Option<i32>> = Vec::with_capacity(n);
-                for i in start..end {
-                    if let Some(win) = plan.winning_idx(i) {
-                        // Record wins. Its value is the winning occurrence's cell
-                        // ([`DeclaredPlan::winning_idx`]); a winner in another-typed
-                        // column of the same key is a NULL cell, even when this row
-                        // also has a `Str` cell the winner shadows. An `id` pointing
-                        // at a non-UTF-8 (NULL) dictionary value also reads NULL,
-                        // matching the UTF-8 rule on the `Str` cursor.
-                        match (Some(win) == plan.matching_idx)
-                            .then(|| col.id_at(i))
-                            .flatten()
-                        {
-                            Some(id) => keys.push(Some(i32::try_from(id).map_err(|_| {
-                                DataFusionError::Internal(
-                                    "declared Str dictionary id exceeds i32".into(),
-                                )
-                            })?)),
-                            None => keys.push(None),
-                        }
-                    } else if let Some(stream_ref) = view.stream_ref(i) {
-                        match resolver.fallback_value(view, cache, stream_ref)? {
-                            Some(AttrValue::Str(s)) => {
-                                values.append_value(s);
-                                keys.push(Some(next_extra));
-                                next_extra += 1;
-                            }
-                            _ => keys.push(None),
-                        }
-                    } else {
-                        keys.push(None);
-                    }
-                }
-                let dict = DictionaryArray::<Int32Type>::try_new(
-                    Int32Array::from(keys),
-                    Arc::new(values.finish()),
-                )
-                .map_err(DataFusionError::from)?;
-                Arc::new(dict)
             }
-            None => {
-                // Identity dictionary: one entry per non-null row, no dedup. The
-                // record's own value is appended as `&str` straight from the
-                // cursor -- no per-cell `String` (deliverable 3, #875).
-                let mut values = StringBuilder::new();
-                let mut keys: Vec<Option<i32>> = Vec::with_capacity(n);
-                let mut next = 0i32;
-                // The declared-type (`Str`) column's cursor, when the key has a
-                // plain-page `Str` column; `None` when it has no `Str` column at
-                // all (then only the resource/scope fallback yields a value).
-                let matching_str = match plan.matching_cursor() {
-                    Some(DeclaredCursor::Str(c)) => Some(c),
-                    _ => None,
-                };
-                for i in start..end {
-                    // `appended` == "this row is decided, do not consult the
-                    // resource/scope fallback" (record wins over resource).
-                    let mut appended = false;
-                    if resolver.single_matching {
-                        // Fused: one cursor read is both presence and value.
-                        if let Some(s) = matching_str.and_then(|c| c.str_at(i)) {
+            let mut next_extra = i32::try_from(dict.len()).map_err(|_| {
+                DataFusionError::Internal("declared Str dictionary exceeds i32 keys".into())
+            })?;
+            let mut keys: Vec<Option<i32>> = Vec::with_capacity(n);
+            for i in start..end {
+                if let Some(win) = plan.winning_idx(i) {
+                    // Record wins. Its value is the winning occurrence's cell
+                    // ([`DeclaredPlan::winning_idx`]); a winner in another-typed
+                    // column of the same key is a NULL cell, even when this row
+                    // also has a `Str` cell the winner shadows. An `id` pointing
+                    // at a non-UTF-8 (NULL) dictionary value also reads NULL,
+                    // matching the UTF-8 rule on the `Str` cursor.
+                    match (Some(win) == plan.matching_idx)
+                        .then(|| dict.col.id_at(i))
+                        .flatten()
+                    {
+                        Some(id) => keys.push(Some(i32::try_from(id).map_err(|_| {
+                            DataFusionError::Internal(
+                                "declared Str dictionary id exceeds i32".into(),
+                            )
+                        })?)),
+                        None => keys.push(None),
+                    }
+                } else if let Some(stream_ref) = view.stream_ref(i) {
+                    match resolver.fallback_value(view, cache, stream_ref)? {
+                        Some(AttrValue::Str(s)) => {
+                            values.append_value(s);
+                            keys.push(Some(next_extra));
+                            next_extra += 1;
+                        }
+                        _ => keys.push(None),
+                    }
+                } else {
+                    keys.push(None);
+                }
+            }
+            let dict = DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(keys),
+                Arc::new(values.finish()),
+            )
+            .map_err(DataFusionError::from)?;
+            Arc::new(dict)
+        }
+        None => {
+            // Identity dictionary: one entry per non-null row, no dedup. The
+            // record's own value is appended as `&str` straight from the
+            // cursor -- no per-cell `String` (deliverable 3, #875).
+            let mut values = StringBuilder::new();
+            let mut keys: Vec<Option<i32>> = Vec::with_capacity(n);
+            let mut next = 0i32;
+            for i in start..end {
+                // `appended` == "this row is decided, do not consult the
+                // resource/scope fallback" (record wins over resource).
+                let mut appended = false;
+                if resolver.single_matching {
+                    // Fused: one cursor read is both presence and value.
+                    if let Some(s) = matching_str.and_then(|c| c.text_at(i)) {
+                        values.append_value(s);
+                        keys.push(Some(next));
+                        next += 1;
+                        appended = true;
+                    }
+                    // A `None` here (absent, or not UTF-8) falls through to
+                    // the fallback, matching the row path.
+                } else if let Some((win, text)) = plan.winner(i) {
+                    // Record wins: the winning occurrence's `Str` cell, as the
+                    // presence search validated it, or NULL when that winner
+                    // sits in a different-typed column of the same key
+                    // ([`DeclaredPlan::winning_idx`]).
+                    match (Some(win) == plan.matching_idx).then_some(text).flatten() {
+                        Some(s) => {
                             values.append_value(s);
                             keys.push(Some(next));
                             next += 1;
-                            appended = true;
                         }
-                        // A `None` here (absent, or not UTF-8) falls through to
-                        // the fallback, matching the row path.
-                    } else if let Some(win) = plan.winning_idx(i) {
-                        // Record wins: the winning occurrence's `Str` cell, or NULL
-                        // when that winner sits in a different-typed column of the
-                        // same key ([`DeclaredPlan::winning_idx`]).
-                        match (Some(win) == plan.matching_idx)
-                            .then(|| matching_str.and_then(|c| c.str_at(i)))
-                            .flatten()
-                        {
-                            Some(s) => {
-                                values.append_value(s);
-                                keys.push(Some(next));
-                                next += 1;
-                            }
-                            None => keys.push(None),
-                        }
-                        appended = true;
+                        None => keys.push(None),
                     }
-                    if appended {
-                        continue;
-                    }
-                    if let Some(stream_ref) = view.stream_ref(i) {
-                        match resolver.fallback_value(view, cache, stream_ref)? {
-                            Some(AttrValue::Str(s)) => {
-                                values.append_value(s);
-                                keys.push(Some(next));
-                                next += 1;
-                            }
-                            _ => keys.push(None),
-                        }
-                    } else {
-                        keys.push(None);
-                    }
+                    appended = true;
                 }
-                let dict = DictionaryArray::<Int32Type>::try_new(
-                    Int32Array::from(keys),
-                    Arc::new(values.finish()),
-                )
-                .map_err(DataFusionError::from)?;
-                Arc::new(dict)
+                if appended {
+                    continue;
+                }
+                if let Some(stream_ref) = view.stream_ref(i) {
+                    match resolver.fallback_value(view, cache, stream_ref)? {
+                        Some(AttrValue::Str(s)) => {
+                            values.append_value(s);
+                            keys.push(Some(next));
+                            next += 1;
+                        }
+                        _ => keys.push(None),
+                    }
+                } else {
+                    keys.push(None);
+                }
             }
-        },
-    )
+            let dict = DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(keys),
+                Arc::new(values.finish()),
+            )
+            .map_err(DataFusionError::from)?;
+            Arc::new(dict)
+        }
+    })
 }
 
 /// One synthetic per-key attribute column's FIELD_DIR resolution for a block
@@ -5195,12 +5372,7 @@ impl<'a> AttrKeyPlan<'a> {
     /// `attrs_raw` page falls the whole segment back to the row path before this
     /// builds a column.
     fn winning_idx(&self, i: usize) -> Option<usize> {
-        self.cursors
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| c.present_at(i))
-            .max_by_key(|(k, _)| self.cols[*k].ty.to_u8())
-            .map(|(k, _)| k)
+        winner_at(&self.cols, &self.cursors, i).map(|(k, _)| k)
     }
 }
 
