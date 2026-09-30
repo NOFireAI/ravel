@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use ravel_maintain::{CompactorConfig, RetentionConfig};
+use ravel_maintain::RetentionConfig;
 use ravel_server::alert_sink::DEFAULT_SINK_TIMEOUT;
 use ravel_server::alerting::{DEFAULT_QUERY_DEADLINE, load_rules_file};
 use ravel_server::{
@@ -319,29 +319,8 @@ async fn main() -> anyhow::Result<()> {
     let gc_runtime = cli
         .resolve_gc_runtime(performance.query_deadline)
         .context("failed to parse the --gc-* GC-config flags")?;
-    let interior_reverify_ns = cli
-        .parse_maintain_interior_reverify()
-        .context("failed to parse --maintain-interior-reverify")?;
-    let alert_retention_window_ns = cli
-        .parse_alert_retention()
-        .context("failed to parse --alert-retention")?;
-    let claim_lease_duration = cli
-        .parse_maintain_claim_lease()
-        .context("failed to parse --maintain-claim-lease")?;
-    let claim_min_input_bytes = cli
-        .parse_maintain_claim_min_input_bytes()
-        .context("failed to parse --maintain-claim-min-input-bytes")?;
-    let compactor = CompactorConfig {
-        protection_horizon_ns: gc_runtime.protection_horizon_ns,
-        grace_ns: gc_runtime.grace_ns,
-        max_flush_lifetime_ns: gc_runtime.max_flush_lifetime_ns,
-        interior_reverify_ns,
-        alert_retention_window_ns,
-        coordination: cli.maintain_claims.mode(),
-        claim_lease_duration,
-        claim_min_input_bytes,
-        ..CompactorConfig::default()
-    };
+    let compactor = cli.resolve_compactor_config(&gc_runtime)?;
+    let claim_lease_duration = compactor.claim_lease_duration;
     // ADR-1029 decision 3: a lease shorter than twice the time to encode and
     // PUT the largest L1 part at a conservative rate can expire, and be
     // stolen, before a run still encoding its largest part reaches its own
@@ -540,10 +519,12 @@ async fn main() -> anyhow::Result<()> {
         max_flush_delay_idle: flush_cadence.max_flush_delay_idle,
         min_flush_bytes: flush_cadence.min_flush_bytes,
         // Not part of the ADR-0076 cadence trio `resolve_flush_cadence`
-        // reconciles: the floor moves on its own, and its one cross-field
-        // constraint is checked against the resolved `min_flush_bytes` by
-        // `IngestConfig::validate` in `start`.
-        idle_flush_byte_floor: cli.idle_flush_byte_floor as usize,
+        // reconciles: the floor moves on its own. `cli.validate()` already
+        // refused a floor at or above the resolved `min_flush_bytes`, before
+        // the store was built.
+        idle_flush_byte_floor: cli
+            .resolve_idle_flush_byte_floor()
+            .context("failed to resolve --idle-flush-byte-floor")?,
         tenant_resolver: resolver_bundle.resolver,
         mtls_listener,
         fold_tenants,
