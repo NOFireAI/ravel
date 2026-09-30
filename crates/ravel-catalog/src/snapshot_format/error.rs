@@ -293,3 +293,175 @@ pub enum SnapshotFormatError {
     #[error("decode job on the read CPU gate failed: {0}")]
     DecodeJob(ravel_cpu_gate::CpuGateError),
 }
+
+/// The highest `SnapshotEntry.level` `part.rs`'s entry validation accepts
+/// (0 is an L0 commit, 1 a compaction part).
+const MAX_ENTRY_LEVEL: u32 = 1;
+
+impl SnapshotFormatError {
+    /// True when the object carries a format version, or an entry level, above
+    /// the highest this build reads: a peer on a newer build can read it during
+    /// a rolling upgrade, so a query surface answers it as retryable. A version
+    /// below the supported minimum is false, like every other variant: it is a
+    /// fault in immutable stored bytes (a writer that left proto3's default 0),
+    /// and no build reads it.
+    ///
+    /// `UnsupportedLevel` counts as a newer version because a new entry field
+    /// has shipped without a part envelope or header version bump
+    /// (docs/catalog-and-mvcc.md, `declared_column_stats`), so a new level
+    /// cannot be assumed to bump the part version first. A header whose
+    /// version disagrees with an envelope version this build accepts is a
+    /// self-inconsistent object, not a newer one.
+    ///
+    /// Every variant is named, so a new one fails to compile until it is
+    /// classified here.
+    pub fn is_newer_format_version(&self) -> bool {
+        use super::{
+            COLUMN_STATS_ACCEPTED_READ_VERSIONS, HEAD_FORMAT_VERSION, POSTINGS_VERSION, VERSION,
+        };
+        match self {
+            SnapshotFormatError::UnsupportedVersion(version) => *version > VERSION,
+            SnapshotFormatError::UnsupportedLevel(level) => *level > MAX_ENTRY_LEVEL,
+            SnapshotFormatError::UnsupportedHeadVersion(version) => *version > HEAD_FORMAT_VERSION,
+            SnapshotFormatError::PostingsUnsupportedVersion(version) => *version > POSTINGS_VERSION,
+            SnapshotFormatError::ColumnStatsUnsupportedVersion(version) => {
+                COLUMN_STATS_ACCEPTED_READ_VERSIONS
+                    .iter()
+                    .all(|accepted| version > accepted)
+            }
+
+            SnapshotFormatError::TooSmall { .. }
+            | SnapshotFormatError::BadMagic
+            | SnapshotFormatError::ReservedNonZero
+            | SnapshotFormatError::Truncated
+            | SnapshotFormatError::TrailingBytes
+            | SnapshotFormatError::HeaderCrcMismatch
+            | SnapshotFormatError::HeaderDecode(_)
+            | SnapshotFormatError::HeaderTooLarge
+            | SnapshotFormatError::HeaderVersionMismatch { .. }
+            | SnapshotFormatError::BadTenantHashLen(_)
+            | SnapshotFormatError::BodyCrcMismatch
+            | SnapshotFormatError::Compress(_)
+            | SnapshotFormatError::Decompress(_)
+            | SnapshotFormatError::DecompressedTooLarge { .. }
+            | SnapshotFormatError::DecompressedLenMismatch { .. }
+            | SnapshotFormatError::EntryDecode(_)
+            | SnapshotFormatError::EntryCountMismatch { .. }
+            | SnapshotFormatError::EntriesUnsorted
+            | SnapshotFormatError::DuplicateEntry
+            | SnapshotFormatError::WatermarkExceeded { .. }
+            | SnapshotFormatError::BelowMinHour { .. }
+            | SnapshotFormatError::MinHourExceedsWatermark { .. }
+            | SnapshotFormatError::BadFieldLen { .. }
+            | SnapshotFormatError::HeadDecode(_)
+            | SnapshotFormatError::BadHeadTenantHashLen(_)
+            | SnapshotFormatError::BadFolderIdLen(_)
+            | SnapshotFormatError::HeadNoParts
+            | SnapshotFormatError::HeadWatermarkMismatch { .. }
+            | SnapshotFormatError::BadPartRefFieldLen { .. }
+            | SnapshotFormatError::EmptyPartKey { .. }
+            | SnapshotFormatError::PartRefRangeInverted { .. }
+            | SnapshotFormatError::PartsNotSortedByMinHour { .. }
+            | SnapshotFormatError::PartRangesOverlap { .. }
+            | SnapshotFormatError::BadPostingsRefBlake3Len(_)
+            | SnapshotFormatError::EmptyPostingsKey
+            | SnapshotFormatError::BadPostingsRefPartBlake3Len { .. }
+            | SnapshotFormatError::PostingsRefPartCountMismatch { .. }
+            | SnapshotFormatError::PostingsRefPartBlake3Mismatch { .. }
+            | SnapshotFormatError::PostingsTooSmall { .. }
+            | SnapshotFormatError::PostingsHeaderDecode(_)
+            | SnapshotFormatError::PostingsHeaderTooLarge
+            | SnapshotFormatError::PostingsTooManyNames(_)
+            | SnapshotFormatError::PostingsNameNotUtf8
+            | SnapshotFormatError::PostingsNamesUnsorted
+            | SnapshotFormatError::PostingsDuplicateName
+            | SnapshotFormatError::PostingsNameCountMismatch { .. }
+            | SnapshotFormatError::PostingsOrdinalOutOfBounds { .. }
+            | SnapshotFormatError::PostingsOrdinalsNotStrictlyIncreasing { .. }
+            | SnapshotFormatError::PostingsPartBlake3Len { .. }
+            | SnapshotFormatError::PostingsPartBindingMismatch
+            | SnapshotFormatError::PostingsBadVarint
+            | SnapshotFormatError::ColumnStatsTooSmall { .. }
+            | SnapshotFormatError::ColumnStatsBadMagic
+            | SnapshotFormatError::ColumnStatsReservedNonZero
+            | SnapshotFormatError::ColumnStatsTrailingBytes
+            | SnapshotFormatError::ColumnStatsHeaderCrcMismatch
+            | SnapshotFormatError::ColumnStatsHeaderDecode(_)
+            | SnapshotFormatError::ColumnStatsHeaderVersionMismatch { .. }
+            | SnapshotFormatError::ColumnStatsBadTenantHashLen(_)
+            | SnapshotFormatError::ColumnStatsBodyCrcMismatch
+            | SnapshotFormatError::ColumnStatsDecompressedTooLarge { .. }
+            | SnapshotFormatError::ColumnStatsDecompressedLenMismatch { .. }
+            | SnapshotFormatError::ColumnStatsSegmentDecode(_)
+            | SnapshotFormatError::ColumnStatsSegmentCountMismatch { .. }
+            | SnapshotFormatError::ColumnStatsSegmentsUnsorted
+            | SnapshotFormatError::ColumnStatsDuplicateSegment
+            | SnapshotFormatError::ColumnStatsBadFieldLen { .. }
+            | SnapshotFormatError::ColumnStatsPartBindingMismatch
+            | SnapshotFormatError::ColumnStatsV3PartBlake3CountMismatch(_)
+            | SnapshotFormatError::ColumnStatsPartOverBound { .. }
+            | SnapshotFormatError::ColumnStatsDuplicateColumnName { .. }
+            | SnapshotFormatError::ColumnStatsUnknownDeclaredType { .. }
+            | SnapshotFormatError::ColumnStatsValueTypeMismatch { .. }
+            | SnapshotFormatError::ColumnStatsDictEntryMissingValue { .. }
+            | SnapshotFormatError::ColumnStatsDuplicateDictValue { .. }
+            | SnapshotFormatError::ColumnStatsDictCountMismatch { .. }
+            | SnapshotFormatError::ColumnStatsDictPresentMismatch { .. }
+            | SnapshotFormatError::ColumnStatsUnexpectedMinMax { .. }
+            | SnapshotFormatError::ColumnStatsMissingMinMax { .. }
+            | SnapshotFormatError::ColumnStatsMinMaxInverted { .. }
+            | SnapshotFormatError::ColumnStatsSumOnNonInteger { .. }
+            | SnapshotFormatError::ColumnStatsSumMismatch { .. }
+            | SnapshotFormatError::ColumnStatsSumWithoutValues { .. }
+            | SnapshotFormatError::DecodeJob(_) => false,
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::snapshot_format::{
+        COLUMN_STATS_ACCEPTED_READ_VERSIONS, HEAD_FORMAT_VERSION, POSTINGS_VERSION, VERSION,
+    };
+
+    /// Each version kind is newer exactly above the highest version this build
+    /// reads; one below the floor (a record stamped 0) is not.
+    #[test]
+    fn only_versions_above_the_supported_maximum_are_newer() {
+        let column_stats_max = COLUMN_STATS_ACCEPTED_READ_VERSIONS
+            .iter()
+            .copied()
+            .max()
+            .expect("the accepted read set is non-empty");
+        let newer = [
+            SnapshotFormatError::UnsupportedVersion(VERSION + 1),
+            SnapshotFormatError::UnsupportedLevel(MAX_ENTRY_LEVEL + 1),
+            SnapshotFormatError::UnsupportedHeadVersion(HEAD_FORMAT_VERSION + 1),
+            SnapshotFormatError::PostingsUnsupportedVersion(POSTINGS_VERSION + 1),
+            SnapshotFormatError::ColumnStatsUnsupportedVersion(column_stats_max + 1),
+        ];
+        for err in &newer {
+            assert!(err.is_newer_format_version(), "{err:?}");
+        }
+
+        let not_newer = [
+            SnapshotFormatError::UnsupportedVersion(0),
+            SnapshotFormatError::UnsupportedHeadVersion(0),
+            SnapshotFormatError::PostingsUnsupportedVersion(0),
+            SnapshotFormatError::ColumnStatsUnsupportedVersion(0),
+            // A retired whole-object version below the only accepted one.
+            SnapshotFormatError::ColumnStatsUnsupportedVersion(column_stats_max - 1),
+            SnapshotFormatError::HeaderVersionMismatch {
+                header: u32::from(VERSION) + 1,
+                envelope: VERSION,
+            },
+            SnapshotFormatError::BadMagic,
+            SnapshotFormatError::DecodeJob(ravel_cpu_gate::CpuGateError::Cancelled),
+        ];
+        for err in &not_newer {
+            assert!(!err.is_newer_format_version(), "{err:?}");
+        }
+    }
+}
