@@ -571,6 +571,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`--audit-retention` sets the query-audit retention window** (ADR-0062
+  decision 2c, ADR-1688, issue #2126). The server built its compactor with
+  the compiled-in 90-day audit window and no way to change it. The flag takes
+  a humantime duration and defaults to `90d`, so a deployment that does not
+  set it sweeps exactly as before. `0` keeps every query-audit record. A
+  nonzero window below one hour plus the compactor's seal margin
+  (`--gc-max-flush-lifetime` plus the clock-skew allowance, `2h 5m` on the
+  defaults) is refused at startup, in the same shape as `--alert-retention`.
 - **A read-only bucket-protection control plane in `ravel-object-store`**
   (ADR-1727 follow-up task 1, issue #1727). `S3Store` can now report, per
   condition, whether the bucket's protection configuration is Pass, Fail, or
@@ -1179,8 +1187,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   byte count, defaults to 0 (the sub-floor hold disabled), and reaches the
   `IngestConfig` of all three ingest pipelines, so a deployment that does not
   set it keeps today's flush cadence and buffered-mode loss window exactly.
-  A floor at or above `--min-flush-bytes` refuses startup in every mode, checked
-  at the top of `start`, with a message naming both flags rather than silently
+  A floor at or above `--min-flush-bytes` refuses startup in every mode,
+  checked during CLI validation before anything is written to the bucket (and
+  again at the top of `start` for a library caller that does not go through
+  the CLI), with a message naming both flags rather than silently
   putting every sub-`min_flush_bytes` buffer on the hour-long hold. The new
   `ravel_ingest_flushes_by_age_floor_total` family renders for every signal
   beside `ravel_ingest_flushes_by_age_total`, which is how an operator sees
