@@ -348,7 +348,7 @@
                           "intervalSecs": {
                             "description": "How often each tenant's fold task wakes, in seconds\n(`--fold-interval-secs`).",
                             "format": "uint64",
-                            "minimum": 0.0,
+                            "minimum": 1.0,
                             "nullable": true,
                             "type": "integer"
                           }
@@ -358,7 +358,7 @@
                       "intervalSecs": {
                         "description": "How often the maintenance task wakes, in seconds\n(`--maintain-interval-secs`).",
                         "format": "uint64",
-                        "minimum": 0.0,
+                        "minimum": 1.0,
                         "nullable": true,
                         "type": "integer"
                       },

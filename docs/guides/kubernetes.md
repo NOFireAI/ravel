@@ -286,9 +286,9 @@ A minimal example is in
 | `spec.query.resources` | object | `requests: {cpu: 200m, memory: 512Mi}`, no limits | An explicit block replaces the default entirely rather than merging with it. |
 | `spec.maintain.enabled` | boolean | `true` | `false` deletes the maintain Deployment. |
 | `spec.maintain.replicas` | integer | `1` | |
-| `spec.maintain.intervalSecs` | integer | none | `--maintain-interval-secs`. `0` fails the maintain pods at startup. |
+| `spec.maintain.intervalSecs` | integer | none | `--maintain-interval-secs`. Minimum `1`: `0` is refused at admission, since the server refuses a zero interval at startup. |
 | `spec.maintain.fold.disabled` | boolean | `false` | `--disable-fold` on the maintain pods, the only Deployment the operator renders that runs the scheduled fold. Fold is a query-cost optimization only; disabling it never changes results. |
-| `spec.maintain.fold.intervalSecs` | integer | none | `--fold-interval-secs` on the maintain pods. `0` fails the maintain pods at startup. |
+| `spec.maintain.fold.intervalSecs` | integer | none | `--fold-interval-secs` on the maintain pods. Minimum `1`: `0` is refused at admission, since the server refuses a zero interval at startup. |
 | `spec.maintain.resources` | object | `requests: {cpu: 100m, memory: 256Mi}`, no limits | An explicit block replaces the default entirely rather than merging with it. |
 | `spec.gc.protectionHorizon` | string | none | `--gc-protection-horizon` on the maintain pods, a duration such as `25h5m`. It must equal the protection horizon stored in the bucket's `sys/gc`, read with `ravel-cli gc-config show`, or the maintain pods refuse to start. Unset renders no flag and the server's default applies. |
 | `spec.gc.grace` | string | none | `--gc-grace` on the maintain pods, a duration such as `24h`. It must equal the grace stored in the bucket's `sys/gc`, read with `ravel-cli gc-config show`, or the maintain pods refuse to start. Unset renders no flag and the server's default applies. |
