@@ -510,15 +510,17 @@ fn column_ref_refuses_other_targets() {
 
     let cases: Vec<(&str, Vec<(PageDesc, Vec<u8>)>, &[ColumnPlan])> = vec![
         (
+            // stream_ref is placed ahead of observed_ts so it is already
+            // decoded: only the target rule can refuse this page.
             "observed_ts naming stream_ref",
             vec![
                 ts_page(),
+                sref_page(),
                 raw_page(
                     COL_OBSERVED_TS,
                     Enc::ColumnRef,
                     encode_column_ref(COL_STREAM_REF),
                 ),
-                sref_page(),
             ],
             &[],
         ),
