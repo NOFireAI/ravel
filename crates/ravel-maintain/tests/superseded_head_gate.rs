@@ -27,8 +27,8 @@ use ravel_commit::{erasure, signal};
 use ravel_maintain::{
     Bucket, CompactorConfig, ErasureRequestSweepOutcome, ErasureRewriteOutcome, FixedClock,
     LeaseCheck, LegalHoldCheck, MaintainMemo, NoLeases, PendingErasureRequest,
-    SupersededSweepOutcome, erasure_rewrite_bucket, shard_hold_scopes, sweep_erasure_requests,
-    sweep_superseded, write_hold_set,
+    SupersededSweepOutcome, SweepReport, erasure_rewrite_bucket, shard_hold_scopes,
+    sweep_erasure_requests, sweep_shard, sweep_shard_zoned, sweep_superseded, write_hold_set,
 };
 use ravel_object_store::fault::{
     FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
@@ -2853,4 +2853,153 @@ async fn the_observing_pass_deletes_nothing_and_reads_the_catalog_twice() {
         fixture.input_data_keys,
         "and nothing it observed was removed"
     );
+}
+
+// --- The combined passes carry rule 2's hold counts -------------------------
+
+/// One combined pass over the old bucket's shard: [`sweep_shard`], or
+/// [`sweep_shard_zoned`] scoped to [`OLD_HOUR`].
+async fn combined_pass(
+    store: &dyn ObjectStoreBackend,
+    clock: &FixedClock,
+    lease: &dyn LeaseCheck,
+    zoned: bool,
+) -> SweepReport {
+    let b = old_bucket();
+    if zoned {
+        sweep_shard_zoned(
+            store,
+            clock,
+            &cfg(),
+            lease,
+            &b.tenant_hash,
+            b.signal,
+            b.shard,
+            &[OLD_HOUR],
+        )
+        .await
+    } else {
+        sweep_shard(
+            store,
+            clock,
+            &cfg(),
+            lease,
+            &b.tenant_hash,
+            b.signal,
+            b.shard,
+        )
+        .await
+    }
+    .expect("a held pass does not fail")
+}
+
+/// The three hold counts rule 2 reports reach [`SweepReport`], the report the
+/// server's maintain loop records into
+/// `ravel_maintain_superseded_inputs_held_total` and
+/// `ravel_maintain_superseded_groups_held_by_legal_hold_total`, with the exact
+/// counts [`sweep_superseded`] reports on the same fixtures above: four
+/// objects held for a HEAD that still names them, four for an unreadable
+/// HEAD, and one chain group for a legal hold. Both entries that build a
+/// report are covered, each on each fixture, and each count is asserted with
+/// the other two so a field copied from the wrong outcome field fails too.
+///
+/// Flip-line proof: in either `SweepReport { .. }` literal in `sweep.rs`,
+/// replace `superseded.held_by_snapshot`, `superseded.held_by_unreadable_head`
+/// or `superseded.chain_groups_held_by_legal_hold` with `0`; that entry's
+/// assertion on the matching fixture fails.
+#[tokio::test]
+async fn the_combined_pass_reports_every_superseded_hold() {
+    for zoned in [false, true] {
+        // A HEAD that still names the pre-rewrite inputs.
+        let mem = Arc::new(MemoryStore::new());
+        let created = sealed_now_ns();
+        let clock = FixedClock::new(created);
+        seed_two_hours(mem.as_ref()).await;
+        fold_head(&mem, created, 1, None).await;
+        run_rewrite(mem.as_ref(), &clock).await;
+        fold_head(&mem, created + 3 * NS_PER_HOUR, 2, None).await;
+        clock.set(past_horizon(created));
+        let report = combined_pass(mem.as_ref(), &clock, &NoLeases, zoned).await;
+        assert_eq!(
+            (
+                report.superseded_held_by_snapshot,
+                report.superseded_held_by_unreadable_head,
+                report.superseded_groups_held_by_legal_hold,
+            ),
+            (4, 0, 0),
+            "two records and two data objects held as Named (zoned: {zoned}): {report:?}"
+        );
+        assert_eq!(
+            (
+                report.superseded_records_deleted,
+                report.superseded_data_deleted
+            ),
+            (0, 0)
+        );
+
+        // A HEAD that is present and cannot be read.
+        let mem = Arc::new(MemoryStore::new());
+        let clock = FixedClock::new(created);
+        seed_two_hours(mem.as_ref()).await;
+        fold_head(&mem, created, 1, None).await;
+        run_rewrite(mem.as_ref(), &clock).await;
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::CorruptRange).with_key_contains(head_key()),
+        );
+        let store = FaultStore::new(mem.clone(), plan);
+        clock.set(past_horizon(created));
+        let report = combined_pass(&store, &clock, &NoLeases, zoned).await;
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::CorruptRange),
+            1,
+            "the HEAD read was corrupted (zoned: {zoned})"
+        );
+        assert_eq!(
+            (
+                report.superseded_held_by_snapshot,
+                report.superseded_held_by_unreadable_head,
+                report.superseded_groups_held_by_legal_hold,
+            ),
+            (0, 4, 0),
+            "all four objects held as Unreadable (zoned: {zoned}): {report:?}"
+        );
+
+        // A legal hold on the data prefix of a chain the HEAD no longer names.
+        let mem = Arc::new(MemoryStore::new());
+        let clock = FixedClock::new(created);
+        seed_chain(&mem, &clock, created, 2, Some(200)).await;
+        let b = old_bucket();
+        let scopes = shard_hold_scopes(&b.tenant_hash, b.signal, b.shard).expect("hold scopes");
+        write_hold_set(
+            mem.as_ref(),
+            &b.tenant_hash,
+            Uuid::from_u128(0x4001),
+            created,
+            &scopes[0],
+            "litigation hold",
+        )
+        .await
+        .expect("hold set");
+        let lease = LegalHoldCheck::refresh(mem.as_ref(), &b.tenant_hash)
+            .await
+            .expect("hold snapshot");
+        clock.set(past_horizon(created));
+        let report = combined_pass(mem.as_ref(), &clock, &lease, zoned).await;
+        assert_eq!(
+            (
+                report.superseded_held_by_snapshot,
+                report.superseded_held_by_unreadable_head,
+                report.superseded_groups_held_by_legal_hold,
+            ),
+            (0, 0, 1),
+            "exactly one chain group skipped for the hold (zoned: {zoned}): {report:?}"
+        );
+        assert_eq!(
+            (
+                report.superseded_records_deleted,
+                report.superseded_data_deleted
+            ),
+            (0, 0)
+        );
+    }
 }

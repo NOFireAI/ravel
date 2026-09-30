@@ -32,9 +32,10 @@
 //! ADR-0873 decision 2 to split the declared-statistics drop tally across
 //! its four carriers, and `gate`, `site` and `worker` added by ADR-1702
 //! decision 11 for the CPU gate and tokio runtime families). The twenty-one
-//! keys come from twenty-seven `Label` variants, because some variants share a
-//! key: `RejectReason`, `ScrubReason`, `ScrubUnreadableReason` and
-//! `AlertRetentionSkipReason` all render `reason`, `Level` (log/tracing
+//! keys come from twenty-eight `Label` variants, because some variants share a
+//! key: `RejectReason`, `ScrubReason`, `ScrubUnreadableReason`,
+//! `AlertRetentionSkipReason` and `SupersededHeldReason` all render `reason`,
+//! `Level` (log/tracing
 //! severity) and `ScrubLevel` (issue #1686, which part of the commit lineage
 //! -- `l0`/`l1`/`rewrite` -- a scrub target came from) both render `level`,
 //! `MergeMemoryKind` and `DeletedObjectKind` both render `kind`, and `ReadGateSite` and `WriteGateSite` both render
@@ -291,8 +292,11 @@ pub enum Label {
     /// Why the alert retention driver skipped a tenant (ADR-1688 decision 3):
     /// `absent`, `undecodable`, `unsupported_version`, `watermark_below_floor`,
     /// or `store_error`. Shares the `reason` key with `RejectReason`,
-    /// `ScrubReason` and `ScrubUnreadableReason`.
+    /// `ScrubReason`, `ScrubUnreadableReason` and `SupersededHeldReason`.
     AlertRetentionSkipReason(crate::maintain::AlertRetentionSkipReason),
+    /// Why rule 2 held a superseded input: `named` or `unreadable_head`.
+    /// Shares the `reason` key with the other reason variants.
+    SupersededHeldReason(crate::maintain::SupersededHeldReason),
     Cache(CacheFamily),
     CacheTier(CacheTier),
     MergeMemoryKind(MergeMemoryKind),
@@ -512,6 +516,7 @@ impl Label {
             Label::ScrubLevel(_) => "level",
             Label::ScrubUnreadableReason(_) => "reason",
             Label::AlertRetentionSkipReason(_) => "reason",
+            Label::SupersededHeldReason(_) => "reason",
             Label::Cache(_) => "cache",
             Label::CacheTier(_) => "tier",
             Label::MergeMemoryKind(_) => "kind",
@@ -544,6 +549,7 @@ impl Label {
             Label::ScrubLevel(level) => level.as_str().to_string(),
             Label::ScrubUnreadableReason(reason) => reason.as_str().to_string(),
             Label::AlertRetentionSkipReason(reason) => reason.name().to_string(),
+            Label::SupersededHeldReason(reason) => reason.name().to_string(),
             Label::Cache(family) => family.name().to_string(),
             Label::CacheTier(tier) => tier.name().to_string(),
             Label::MergeMemoryKind(kind) => kind.name().to_string(),
@@ -3522,6 +3528,25 @@ pub struct MaintenanceSafetySignalSnapshot {
     /// refusal stops only its own supersession chain and the pass succeeds,
     /// so this counter is where it shows; the steady state is a flat line.
     pub superseded_deletes_refused: u64,
+    /// Superseded objects rule 2 held because the live HEAD snapshot still
+    /// names them, summed per pass since process start: a held object counts
+    /// once for every pass that holds it. Backs
+    /// `ravel_maintain_superseded_inputs_held_total{reason="named"}`.
+    pub superseded_inputs_held_named: u64,
+    /// Superseded objects rule 2 held because HEAD or a covering snapshot part
+    /// could not be read, summed per pass since process start. Backs
+    /// `ravel_maintain_superseded_inputs_held_total{reason="unreadable_head"}`.
+    pub superseded_inputs_held_unreadable_head: u64,
+    /// Supersession chain groups rule 2 skipped whole because a legal hold
+    /// protects a key in them, summed per pass since process start. Backs
+    /// `ravel_maintain_superseded_groups_held_by_legal_hold_total`.
+    pub superseded_groups_held_by_legal_hold: u64,
+    /// `.dreq`s the erasure-request sweep kept past their horizon because its
+    /// own observing pass held a chain group naming the request, or held a
+    /// chain it could not walk to the end anywhere in the signal, summed per
+    /// tick since process start. Backs
+    /// `ravel_maintain_dreq_held_by_superseded_inputs_total`.
+    pub dreq_held_by_superseded_inputs: u64,
     /// Objects physically deleted from `quarantine/` past the quarantine
     /// horizon since process start. Read against `orphans_quarantined`: that
     /// one climbing while this one stays flat is a quarantine prefix filling
@@ -3607,6 +3632,10 @@ pub struct MaintenanceSafetySnapshot {
     /// member, in that order. Rendered as further `signal` samples of
     /// `ravel_maintain_orphan_breaker_tripped_total`, after `signals`' own.
     pub unmaintained_orphan_breaker_trips: Vec<(Signal, u64)>,
+    /// Rule 2's refusal and hold totals on those same shards, in the same
+    /// order. Rendered as further `signal` samples of the superseded refusal
+    /// and hold families, after `signals`' own.
+    pub unmaintained_superseded: Vec<(Signal, crate::maintain::UnmaintainedSupersededCounts)>,
     pub signals: Vec<MaintenanceSafetySignalSnapshot>,
 }
 
@@ -3635,6 +3664,10 @@ impl MaintenanceSafetySnapshot {
                 .iter()
                 .map(|&signal| (signal, metrics.unmaintained_orphan_breaker_trips(signal)))
                 .collect(),
+            unmaintained_superseded: crate::maintain::UNMAINTAINED_SWEPT_SIGNALS
+                .iter()
+                .map(|&signal| (signal, metrics.unmaintained_superseded(signal)))
+                .collect(),
             signals: crate::maintain::MAINTAINED_SIGNALS
                 .iter()
                 .map(|&signal| MaintenanceSafetySignalSnapshot {
@@ -3646,6 +3679,17 @@ impl MaintenanceSafetySnapshot {
                     orphans_quarantined: metrics.orphans_quarantined(signal),
                     orphans_quarantine_refused: metrics.orphans_quarantine_refused(signal),
                     superseded_deletes_refused: metrics.superseded_deletes_refused(signal),
+                    superseded_inputs_held_named: metrics.superseded_inputs_held(
+                        signal,
+                        crate::maintain::SupersededHeldReason::Named,
+                    ),
+                    superseded_inputs_held_unreadable_head: metrics.superseded_inputs_held(
+                        signal,
+                        crate::maintain::SupersededHeldReason::UnreadableHead,
+                    ),
+                    superseded_groups_held_by_legal_hold: metrics
+                        .superseded_groups_held_by_legal_hold(signal),
+                    dreq_held_by_superseded_inputs: metrics.dreq_held_by_superseded_inputs(signal),
                     quarantine_reaped: metrics.quarantine_reaped(signal),
                     l0_records_pending: metrics.l0_records_pending(signal),
                     bytes_reclaimed: metrics.bytes_reclaimed(signal),
@@ -3830,9 +3874,13 @@ fn render_maintain_safety_family(
         out,
         "ravel_maintain_superseded_deletes_refused_total",
         "Superseded-input deletes the store refused (access denied, a failed precondition, or a \
-         permanent error), by signal. A refusal keeps the rest of its supersession chain for a \
+         permanent error), by signal, including the alerts and query-audit shards (signal alerts \
+         and audit; the alerts sample reads zero today, since nothing compacts or rewrites that \
+         shard). A refusal keeps the rest of its supersession chain for a \
          later pass and the pass still succeeds, so this is where a deny policy on part of the \
-         keyspace shows. The steady state is a flat line, so alert on increase() > 0.",
+         keyspace shows. The steady state is a flat line, so alert on increase() > 0 over at \
+         least the full-sweep interval (interior_reverify_ns, 6h by default), the only cadence \
+         on which an interior hour is retried.",
         "counter",
     );
     for signal in &snapshot.signals {
@@ -3841,6 +3889,129 @@ fn render_maintain_safety_family(
             "ravel_maintain_superseded_deletes_refused_total",
             &labels(mode, signal.signal),
             signal.superseded_deletes_refused,
+        );
+    }
+    for (signal, counts) in &snapshot.unmaintained_superseded {
+        write_sample(
+            out,
+            "ravel_maintain_superseded_deletes_refused_total",
+            &labels(mode, *signal),
+            counts.deletes_refused,
+        );
+    }
+
+    // Rule 2's holds. Each pass counts what it held again, so these are
+    // counters of per-pass holds. An interior hour is swept only on the
+    // full-sweep cadence, so the question is whether they grow over at least
+    // that interval, not their rate or the running total.
+    write_header(
+        out,
+        "ravel_maintain_superseded_inputs_held_total",
+        "Superseded objects the superseded-input sweep held rather than deleted, by signal and \
+         reason, including the alerts and query-audit shards (the alerts sample reads zero \
+         today, since nothing compacts or rewrites that shard), counted once per pass that \
+         holds them. Objects a legal hold protects are not counted here: \
+         ravel_maintain_superseded_groups_held_by_legal_hold_total counts them, in chain \
+         groups. Tail hours and the query-audit shard count on every tick; interior hours \
+         count only on the full sweep (interior_reverify_ns, 6h by default), so read \
+         increase() over at least that interval, not rate(). reason=named: the live catalog \
+         HEAD snapshot still names the object, which clears once the fold reconciles its hour \
+         or HEAD is rebuilt. reason=unreadable_head: HEAD or a covering snapshot part is \
+         present and cannot be read, so the sweep holds fail-closed; any sustained growth there \
+         needs an operator.",
+        "counter",
+    );
+    for signal in &snapshot.signals {
+        for (reason, value) in [
+            (
+                crate::maintain::SupersededHeldReason::Named,
+                signal.superseded_inputs_held_named,
+            ),
+            (
+                crate::maintain::SupersededHeldReason::UnreadableHead,
+                signal.superseded_inputs_held_unreadable_head,
+            ),
+        ] {
+            write_sample(
+                out,
+                "ravel_maintain_superseded_inputs_held_total",
+                &[
+                    Label::Mode(mode),
+                    Label::Signal(signal.signal),
+                    Label::SupersededHeldReason(reason),
+                ],
+                value,
+            );
+        }
+    }
+    for (signal, counts) in &snapshot.unmaintained_superseded {
+        for (reason, value) in [
+            (
+                crate::maintain::SupersededHeldReason::Named,
+                counts.held_named,
+            ),
+            (
+                crate::maintain::SupersededHeldReason::UnreadableHead,
+                counts.held_unreadable_head,
+            ),
+        ] {
+            write_sample(
+                out,
+                "ravel_maintain_superseded_inputs_held_total",
+                &[
+                    Label::Mode(mode),
+                    Label::Signal(*signal),
+                    Label::SupersededHeldReason(reason),
+                ],
+                value,
+            );
+        }
+    }
+
+    write_header(
+        out,
+        "ravel_maintain_superseded_groups_held_by_legal_hold_total",
+        "Supersession chain groups the superseded-input sweep skipped whole because a legal hold \
+         protects at least one key in them, by signal, including the alerts and query-audit \
+         shards (the alerts sample reads zero today), counted once per pass that skips them, \
+         on the same cadence as ravel_maintain_superseded_inputs_held_total. \
+         Expected while a hold is in force; it stops growing when the hold is lifted.",
+        "counter",
+    );
+    for signal in &snapshot.signals {
+        write_sample(
+            out,
+            "ravel_maintain_superseded_groups_held_by_legal_hold_total",
+            &labels(mode, signal.signal),
+            signal.superseded_groups_held_by_legal_hold,
+        );
+    }
+    for (signal, counts) in &snapshot.unmaintained_superseded {
+        write_sample(
+            out,
+            "ravel_maintain_superseded_groups_held_by_legal_hold_total",
+            &labels(mode, *signal),
+            counts.groups_held_by_legal_hold,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_maintain_dreq_held_by_superseded_inputs_total",
+        "Erasure requests (.dreq) kept past their protection horizon, by signal, counted once \
+         per tick that keeps them. The erasure-request sweep's own observing pass of the \
+         superseded-input sweep, over every hour and chains of any age, held a chain group \
+         naming the request, or held a chain it could not walk to the end anywhere in the \
+         signal, which keeps every such .dreq. The query-time exclusion filter stays in force \
+         meanwhile. This can grow while the superseded hold counters stay flat.",
+        "counter",
+    );
+    for signal in &snapshot.signals {
+        write_sample(
+            out,
+            "ravel_maintain_dreq_held_by_superseded_inputs_total",
+            &labels(mode, signal.signal),
+            signal.dreq_held_by_superseded_inputs,
         );
     }
 
@@ -7221,6 +7392,7 @@ mod tests {
             Label::ScrubLevel(ScrubLevel::L0),
             Label::ScrubUnreadableReason(UnreadableReason::AccessDenied),
             Label::AlertRetentionSkipReason(crate::maintain::AlertRetentionSkipReason::Absent),
+            Label::SupersededHeldReason(crate::maintain::SupersededHeldReason::Named),
             Label::Cache(CacheFamily::Fetch),
             Label::CacheTier(CacheTier::Ram),
             Label::MergeMemoryKind(MergeMemoryKind::Transient),
@@ -7252,6 +7424,7 @@ mod tests {
                 Label::ScrubLevel(_) => "level",
                 Label::ScrubUnreadableReason(_) => "reason",
                 Label::AlertRetentionSkipReason(_) => "reason",
+                Label::SupersededHeldReason(_) => "reason",
                 Label::Cache(_) => "cache",
                 Label::CacheTier(_) => "tier",
                 Label::MergeMemoryKind(_) => "kind",
@@ -7297,6 +7470,8 @@ mod tests {
                 // AlertRetentionSkipReason (ADR-1688 decision 3) reuses the
                 // `reason` key too.
                 "reason",
+                // SupersededHeldReason (issue #2221) reuses the `reason` key.
+                "reason",
                 "cache",
                 "tier",
                 "kind",
@@ -7328,8 +7503,8 @@ mod tests {
         );
         assert_eq!(
             one_of_each.len(),
-            27,
-            "exactly 27 label variants, 21 distinct keys"
+            28,
+            "exactly 28 label variants, 21 distinct keys"
         );
         assert_eq!(
             keys.iter().collect::<HashSet<_>>().len(),
@@ -9882,6 +10057,7 @@ mod tests {
             objects_deleted_unreferenced_parts_deleted: 13,
             alert_retention_skipped: Vec::new(),
             unmaintained_orphan_breaker_trips: vec![(Signal::Alerts, 14), (Signal::Audit, 0)],
+            unmaintained_superseded: Vec::new(),
             signals: vec![
                 MaintenanceSafetySignalSnapshot {
                     signal: Signal::Metrics,
@@ -9892,6 +10068,10 @@ mod tests {
                     orphans_quarantined: 4,
                     orphans_quarantine_refused: 5,
                     superseded_deletes_refused: 20,
+                    superseded_inputs_held_named: 21,
+                    superseded_inputs_held_unreadable_head: 22,
+                    superseded_groups_held_by_legal_hold: 23,
+                    dreq_held_by_superseded_inputs: 24,
                     quarantine_reaped: 6,
                     l0_records_pending: 8,
                     bytes_reclaimed: 4096,
@@ -9911,6 +10091,10 @@ mod tests {
                     orphans_quarantined: 0,
                     orphans_quarantine_refused: 0,
                     superseded_deletes_refused: 0,
+                    superseded_inputs_held_named: 0,
+                    superseded_inputs_held_unreadable_head: 0,
+                    superseded_groups_held_by_legal_hold: 0,
+                    dreq_held_by_superseded_inputs: 0,
                     quarantine_reaped: 0,
                     l0_records_pending: 0,
                     bytes_reclaimed: 0,
@@ -10683,10 +10867,14 @@ mod tests {
     /// already feeds every `SweepReport` into. The report is what a sweep pass
     /// returns, so this covers the whole chain the figures were stopping one
     /// step short of: `SweepReport` to counter to rendered sample. Rule 2's
-    /// superseded-delete refusal counter rides the same chain.
+    /// superseded-delete refusal and hold counters ride the same chain, and
+    /// so does the erasure-request sweep's `.dreq` hold, through
+    /// `record_erasure_sweep`. The query-audit shard's report goes through
+    /// `record_unmaintained_superseded` and renders under `signal="audit"`.
     ///
-    /// Four distinct values, all asserted: a renderer reading the wrong field
-    /// of the snapshot renders a plausible number and fails here.
+    /// Every value distinct and every sample matched as a whole line: a
+    /// renderer reading the wrong field of the snapshot renders a plausible
+    /// number and fails here.
     #[test]
     fn render_includes_orphan_quarantine_series() {
         let safety = crate::maintain::MaintenanceSafetyMetrics::default();
@@ -10698,6 +10886,27 @@ mod tests {
                 orphans_quarantine_refused: 2,
                 quarantine_reaped: 3,
                 superseded_deletes_refused: 4,
+                superseded_held_by_snapshot: 7,
+                superseded_held_by_unreadable_head: 8,
+                superseded_groups_held_by_legal_hold: 9,
+                ..Default::default()
+            },
+        );
+        safety.record_erasure_sweep(
+            Signal::Metrics,
+            &ravel_maintain::ErasureRequestSweepOutcome {
+                deleted: 1,
+                kept: 12,
+                held_by_superseded_inputs: 11,
+            },
+        );
+        safety.record_unmaintained_superseded(
+            Signal::Audit,
+            &ravel_maintain::SweepReport {
+                superseded_deletes_refused: 13,
+                superseded_held_by_snapshot: 14,
+                superseded_held_by_unreadable_head: 15,
+                superseded_groups_held_by_legal_hold: 16,
                 ..Default::default()
             },
         );
@@ -10752,10 +10961,62 @@ mod tests {
                 "ravel_maintain_superseded_deletes_refused_total{mode=\"maintain\",\
                  signal=\"metrics\"} 4",
             ),
+            (
+                "# TYPE ravel_maintain_superseded_inputs_held_total counter",
+                "ravel_maintain_superseded_inputs_held_total{mode=\"maintain\",\
+                 signal=\"metrics\",reason=\"named\"} 7",
+            ),
+            (
+                "# TYPE ravel_maintain_superseded_inputs_held_total counter",
+                "ravel_maintain_superseded_inputs_held_total{mode=\"maintain\",\
+                 signal=\"metrics\",reason=\"unreadable_head\"} 8",
+            ),
+            (
+                "# TYPE ravel_maintain_superseded_groups_held_by_legal_hold_total counter",
+                "ravel_maintain_superseded_groups_held_by_legal_hold_total{mode=\"maintain\",\
+                 signal=\"metrics\"} 9",
+            ),
+            (
+                "# TYPE ravel_maintain_dreq_held_by_superseded_inputs_total counter",
+                "ravel_maintain_dreq_held_by_superseded_inputs_total{mode=\"maintain\",\
+                 signal=\"metrics\"} 11",
+            ),
+            (
+                "# TYPE ravel_maintain_superseded_deletes_refused_total counter",
+                "ravel_maintain_superseded_deletes_refused_total{mode=\"maintain\",\
+                 signal=\"audit\"} 13",
+            ),
+            (
+                "# TYPE ravel_maintain_superseded_inputs_held_total counter",
+                "ravel_maintain_superseded_inputs_held_total{mode=\"maintain\",\
+                 signal=\"audit\",reason=\"named\"} 14",
+            ),
+            (
+                "# TYPE ravel_maintain_superseded_inputs_held_total counter",
+                "ravel_maintain_superseded_inputs_held_total{mode=\"maintain\",\
+                 signal=\"audit\",reason=\"unreadable_head\"} 15",
+            ),
+            (
+                "# TYPE ravel_maintain_superseded_groups_held_by_legal_hold_total counter",
+                "ravel_maintain_superseded_groups_held_by_legal_hold_total{mode=\"maintain\",\
+                 signal=\"audit\"} 16",
+            ),
         ] {
             assert!(body.contains(header), "missing TYPE line {header}:\n{body}");
-            assert!(body.contains(sample), "missing sample {sample}:\n{body}");
+            assert!(
+                body.lines().any(|line| line == sample),
+                "missing sample {sample}:\n{body}"
+            );
         }
+
+        // The alerts shard shares the families and nothing was recorded for
+        // it, so it renders at zero rather than borrowing the audit counts.
+        assert!(
+            body.lines().any(|line| line
+                == "ravel_maintain_superseded_deletes_refused_total{mode=\"maintain\",\
+                    signal=\"alerts\"} 0"),
+            "the alerts shard's refusal sample must render at zero:\n{body}"
+        );
 
         // A signal the pass never touched still renders, at zero, like every
         // other series in this family.
@@ -10788,6 +11049,20 @@ mod tests {
             objects_deleted_unreferenced_parts_deleted: 1,
             alert_retention_skipped: Vec::new(),
             unmaintained_orphan_breaker_trips: vec![(Signal::Alerts, 1), (Signal::Audit, 1)],
+            unmaintained_superseded: [Signal::Alerts, Signal::Audit]
+                .into_iter()
+                .map(|signal| {
+                    (
+                        signal,
+                        crate::maintain::UnmaintainedSupersededCounts {
+                            deletes_refused: 1,
+                            held_named: 1,
+                            held_unreadable_head: 1,
+                            groups_held_by_legal_hold: 1,
+                        },
+                    )
+                })
+                .collect(),
             signals: vec![MaintenanceSafetySignalSnapshot {
                 signal: Signal::Metrics,
                 conservation_aborts: 1,
@@ -10797,6 +11072,10 @@ mod tests {
                 orphans_quarantined: 1,
                 orphans_quarantine_refused: 1,
                 superseded_deletes_refused: 1,
+                superseded_inputs_held_named: 1,
+                superseded_inputs_held_unreadable_head: 1,
+                superseded_groups_held_by_legal_hold: 1,
+                dreq_held_by_superseded_inputs: 1,
                 quarantine_reaped: 1,
                 l0_records_pending: 1,
                 bytes_reclaimed: 1,
@@ -10851,12 +11130,16 @@ mod tests {
                     || line.starts_with("ravel_maintain_orphans_quarantined_total")
                     || line.starts_with("ravel_maintain_orphans_quarantine_refused_total")
                     || line.starts_with("ravel_maintain_superseded_deletes_refused_total")
+                    || line.starts_with("ravel_maintain_superseded_groups_held_by_legal_hold_total")
+                    || line.starts_with("ravel_maintain_dreq_held_by_superseded_inputs_total")
                     || line.starts_with("ravel_maintain_quarantine_reaped_total")
                     || line.starts_with("ravel_maintain_l0_records_pending")
                     || line.starts_with("ravel_maintain_bytes_reclaimed_total")
                     || line.starts_with("ravel_maintain_retention_lag_seconds")
                 {
                     vec!["mode", "signal"]
+                } else if line.starts_with("ravel_maintain_superseded_inputs_held_total") {
+                    vec!["mode", "signal", "reason"]
                 } else if line.starts_with("ravel_maintain_objects_deleted_total") {
                     vec!["mode", "kind"]
                 } else {
