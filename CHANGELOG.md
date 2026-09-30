@@ -1534,8 +1534,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   file, a footer the reader would refuse, a listed `.parquet` key the
   object-store client cannot address exactly, and a file whose schema
   differs from the first file's; it also refuses a prefix with no file or
-  more than 100,000 (`MAX_TABLE_FILES`), and a snapshot that outlives its
-  deadline.
+  more than 100,000 (`MAX_TABLE_FILES`), a listing whose raw delivery
+  decreases, and a snapshot that outlives its deadline.
 
 ## [0.19.0] - 2026-09-27
 
