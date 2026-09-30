@@ -451,15 +451,13 @@ impl LiveRecordBody {
     }
 }
 
-/// Which live generation currently owns a bucket's record set, resolved by
-/// the one-hop `superseded_record_key` rule: the live key is whichever
-/// compaction/rewrite record present in the bucket's listing is not named by
-/// any other present record's `superseded_record_key`. This is deliberately
-/// NOT `ravel_catalog::catalog::resolve_rewrite_supersession`'s job (the full
-/// predecessor-chain chase a query snapshot needs to build its L0-input
-/// exclusion set): a rewrite pass only ever needs the immediate live
-/// generation's own parts to decode, which is one hop, never a chase, because
-/// each generation's rewrite record fully supersedes everything before it.
+/// Which live generation currently owns a bucket's record set: the one
+/// compaction/rewrite record present in the bucket's listing that no other
+/// present record supersedes. A rewrite pass only ever needs that generation's
+/// own parts to decode. Supersession is the resolver's: a record a rewrite
+/// supersedes, directly or down its chain, a record a present version 2
+/// compaction record supersedes, and a version 2 record a rewrite dominates are
+/// all out ([`select_live_record`]).
 #[derive(Debug, Clone)]
 enum LiveRecord {
     /// The bucket has never been compacted or rewritten: the live set is the
@@ -492,16 +490,75 @@ async fn resolve_live_record(
         let record = get_rewrite_record(store, key).await?;
         decoded.push((key.clone(), LiveRecordBody::Rewrite(record)));
     }
+    select_live_record(decoded, &bucket_prefix_for_error(bucket))
+}
 
-    let superseded: HashSet<String> = decoded
+/// The live record among a bucket's decoded compaction and rewrite records,
+/// by the same supersession rules a snapshot resolve applies, through the
+/// catalog's shared functions: every record a rewrite supersedes, following
+/// its chain through rewrite records and version 2 compaction records
+/// ([`ravel_catalog::resolve_rewrite_supersession`]); every version 2 record a
+/// rewrite dominates ([`ravel_catalog::erasure_dominated_compaction_records`]);
+/// and every record a present version 2 record supersedes
+/// ([`ravel_catalog::select_authoritative_compaction_records`]). A cycle, an
+/// over-deep chain, or a version 2 record whose inputs differ from its
+/// predecessor's is the catalog's typed error, reported as
+/// [`MaintainError::Invariant`]. Overlap losers are not set aside: two
+/// compaction records the selector would choose between are still
+/// [`MaintainError::MultipleLiveRecords`], since a rewrite of one would leave
+/// the other's inputs unerased.
+fn select_live_record(
+    decoded: Vec<(String, LiveRecordBody)>,
+    bucket_prefix: &str,
+) -> Result<LiveRecord> {
+    let unresolvable = |e: ravel_catalog::CatalogError| {
+        MaintainError::Invariant(format!(
+            "erasure rewrite: catalog supersession resolution failed for {bucket_prefix}: {e}"
+        ))
+    };
+    let compactions: Vec<(&str, &CompactionRecord)> = decoded
         .iter()
-        .filter_map(|(_, body)| match body {
-            LiveRecordBody::Rewrite(r) if !r.superseded_record_key.is_empty() => {
-                Some(r.superseded_record_key.clone())
-            }
-            _ => None,
+        .filter_map(|(key, body)| match body {
+            LiveRecordBody::Compaction(r) => Some((key.as_str(), r)),
+            LiveRecordBody::Rewrite(_) => None,
         })
         .collect();
+    let rewrites: Vec<(&str, &RewriteRecord)> = decoded
+        .iter()
+        .filter_map(|(key, body)| match body {
+            LiveRecordBody::Rewrite(r) => Some((key.as_str(), r)),
+            LiveRecordBody::Compaction(_) => None,
+        })
+        .collect();
+
+    let mut superseded: HashSet<String> = HashSet::new();
+    let compaction_by_key: HashMap<&str, &CompactionRecord> = compactions.iter().copied().collect();
+    let rewrite_by_key: HashMap<&str, &RewriteRecord> = rewrites.iter().copied().collect();
+    let mut discard: HashSet<(String, u64, u64)> = HashSet::new();
+    for (key, record) in &rewrites {
+        ravel_catalog::resolve_rewrite_supersession(
+            key,
+            record,
+            bucket_prefix,
+            &compaction_by_key,
+            &rewrite_by_key,
+            &mut discard,
+            &mut superseded,
+        )
+        .map_err(unresolvable)?;
+    }
+    let dominated =
+        ravel_catalog::erasure_dominated_compaction_records(&compactions, &rewrites, bucket_prefix)
+            .map_err(unresolvable)?;
+    let candidates: Vec<(&str, &CompactionRecord)> = compactions
+        .iter()
+        .copied()
+        .filter(|(key, _)| !dominated.contains(key))
+        .collect();
+    let selection = ravel_catalog::select_authoritative_compaction_records(&candidates)
+        .map_err(unresolvable)?;
+    superseded.extend(dominated.iter().map(|k| (*k).to_string()));
+    superseded.extend(selection.superseded().iter().map(|k| (*k).to_string()));
 
     let mut live: Vec<(String, LiveRecordBody)> = decoded
         .into_iter()
@@ -514,11 +571,11 @@ async fn resolve_live_record(
             Ok(LiveRecord::Existing { key, body })
         }
         0 => Err(MaintainError::NoLiveRecord {
-            bucket_prefix: bucket_prefix_for_error(bucket),
+            bucket_prefix: bucket_prefix.to_string(),
             live_count: 0,
         }),
         _ => Err(MaintainError::MultipleLiveRecords {
-            bucket_prefix: bucket_prefix_for_error(bucket),
+            bucket_prefix: bucket_prefix.to_string(),
             live_keys: live.into_iter().map(|(k, _)| k).collect(),
         }),
     }
@@ -2147,9 +2204,10 @@ pub async fn erasure_rewrite_bucket(
 /// Every field is derived through [`ravel_catalog::resolve_rewrite_supersession`]
 /// -- the exact supersession chase a snapshot resolve
 /// (`ravel_catalog::Catalog::process_bucket`) and the index fold use -- never
-/// through the one-hop [`resolve_live_record`] the rewrite path uses to decode
-/// its own generation. That is the whole point: completion cannot diverge from
-/// what a query serves, because it is computed by the same code the query runs.
+/// through [`resolve_live_record`], which the rewrite path uses to pick its own
+/// generation and which never computes the raw L0 inputs a query serves. That
+/// is the whole point: completion cannot diverge from what a query serves,
+/// because it is computed by the same code the query runs.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BucketErasureCompletion {
     /// `request_id`s that overlap this bucket's live event range AND for which
@@ -2281,12 +2339,12 @@ pub const ERASURE_REWRITE_DEADLINE_NS: i64 = 72 * NS_PER_HOUR;
 /// This is the completion gate the ADR requires the rewrite pass to derive
 /// "through `resolve_rewrite_supersession` and `classify_bucket`, not a bucket
 /// LIST in isolation." The rewrite pass classifies a bucket `AlreadyApplied`
-/// off [`resolve_live_record`], which is one hop: it picks the live
-/// compaction/rewrite record and never computes which raw L0 inputs a query
-/// still resolves. So a bucket whose live rewrite names the request but whose
-/// chain fails to exclude an L0 input the query still serves (the
-/// absent-predecessor / partial-input case §4 names, or a live sibling rewrite)
-/// reads "done" to the rewrite pass while a snapshot keeps serving the subject.
+/// off [`resolve_live_record`], which picks the live compaction/rewrite record
+/// and never computes which raw L0 inputs a query still resolves. So a bucket
+/// whose live rewrite names the request but whose chain fails to exclude an L0
+/// input the query still serves (the absent-predecessor / partial-input case
+/// §4 names, or a live sibling rewrite) reads "done" to the rewrite pass while
+/// a snapshot keeps serving the subject.
 /// This function closes that gap by reconstructing the query's exact served set:
 ///
 /// 1. `excluded` (raw L0 identities) and `superseded_records` (whole
@@ -2513,8 +2571,8 @@ fn bucket_serves_subject(
     live_rewrites: &[&RewriteRecord],
 ) -> bool {
     // A live raw L0 record overlapping the window: un-rewritten input a
-    // snapshot still resolves (the F1 blindness -- the one-hop resolver never
-    // saw this, because it only inspects compaction/rewrite records).
+    // snapshot still resolves (the F1 blindness -- `resolve_live_record` never
+    // sees this, because it only inspects compaction/rewrite records).
     if live_l0.iter().any(|ir| {
         bucket_may_overlap(
             ir.record.min_event_ts_ns,
@@ -7305,5 +7363,239 @@ mod tests {
              the second catalog's out-of-window exemplar (ts 100) must survive, \
              even though both name the same series_id across two catalogs"
         );
+    }
+
+    // --- resolve_live_record over version 2 compaction records -------------
+
+    fn live_input(seq: u64) -> CompactionInputIdentity {
+        CompactionInputIdentity {
+            writer_id: Uuid::from_u128(0x5eed).to_string(),
+            writer_epoch: EPOCH,
+            writer_seq: seq,
+        }
+    }
+
+    fn live_part(seed: u8) -> CompactionPart {
+        CompactionPart {
+            part_index: 0,
+            first_series_id: vec![0u8; 16],
+            last_series_id: vec![0xff; 16],
+            content_hash: vec![seed; 32],
+            object_size: 1,
+            sample_count: 1,
+            series_count: 1,
+            run_count: 1,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: 1,
+            segment_format_version: OUTPUT_FORMAT_VERSION,
+            declared_column_stats: Vec::new(),
+        }
+    }
+
+    fn version_1_record(inputs: Vec<CompactionInputIdentity>) -> CompactionRecord {
+        let b = bucket();
+        CompactionRecord {
+            format_version: 1,
+            tenant_hash: b.tenant_hash.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(b.signal) as i32,
+            shard: b.shard,
+            ingest_hour_bucket: b.ingest_hour_bucket,
+            level: 1,
+            // A version 1 hash is not re-derived on decode; the first input's
+            // seq keeps two fixtures' keys apart.
+            input_set_hash: vec![inputs.first().map_or(0, |i| i.writer_seq as u8); 32],
+            inputs,
+            parts: vec![live_part(0xc1)],
+            created_unix_ns: 1,
+            superseded_record_key: String::new(),
+        }
+    }
+
+    fn version_2_record(predecessor: &CompactionRecord, predecessor_key: &str) -> CompactionRecord {
+        CompactionRecord {
+            format_version: 2,
+            input_set_hash: erasure::compute_superseding_compaction_input_set_hash(
+                &predecessor.inputs,
+                predecessor_key,
+            )
+            .to_vec(),
+            parts: vec![live_part(0xc2)],
+            created_unix_ns: predecessor.created_unix_ns + 1,
+            superseded_record_key: predecessor_key.to_string(),
+            ..predecessor.clone()
+        }
+    }
+
+    fn rewrite_over(superseded_key: &str) -> RewriteRecord {
+        let b = bucket();
+        let request_id = Uuid::from_u128(0xe1).to_string();
+        RewriteRecord {
+            format_version: 1,
+            tenant_hash: b.tenant_hash.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(b.signal) as i32,
+            shard: b.shard,
+            ingest_hour_bucket: b.ingest_hour_bucket,
+            inputs: Vec::new(),
+            input_set_hash: erasure::compute_rewrite_input_set_hash(
+                &[],
+                Some(superseded_key),
+                std::slice::from_ref(&request_id),
+            )
+            .to_vec(),
+            parts: vec![live_part(0x0e)],
+            drops: vec![RewriteDrop {
+                request_id,
+                dropped_count: 1,
+            }],
+            created_unix_ns: 10,
+            superseded_record_key: superseded_key.to_string(),
+        }
+    }
+
+    async fn put_live_compaction(
+        store: &dyn ObjectStoreBackend,
+        record: &CompactionRecord,
+    ) -> String {
+        let key = keys::compaction_record_key_for(record).expect("key");
+        store
+            .put(
+                &key,
+                ravel_commit::record::encode_compaction(record),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put compaction record");
+        key
+    }
+
+    async fn put_live_rewrite(store: &dyn ObjectStoreBackend, record: &RewriteRecord) -> String {
+        let key = keys::rewrite_record_key_for(record).expect("key");
+        store
+            .put(
+                &key,
+                erasure::encode_rewrite(record),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put rewrite record");
+        key
+    }
+
+    async fn live_key(store: &dyn ObjectStoreBackend) -> Result<String> {
+        let b = bucket();
+        let listing = crate::read::list_bucket(store, &b).await?;
+        match resolve_live_record(store, &b, &listing).await? {
+            LiveRecord::Existing { key, .. } => Ok(key),
+            LiveRecord::RawL0 => panic!("the bucket holds records"),
+        }
+    }
+
+    /// C1 and a version 2 C2 naming C1: the live record is C2, the record a
+    /// snapshot resolve serves. Flipped line: `superseded.extend(selection
+    /// .superseded()...)` in `select_live_record`. Without it both records are
+    /// live and the pass fails with `MultipleLiveRecords`, which is what the
+    /// one-hop rule this replaced returned.
+    #[tokio::test]
+    async fn live_record_is_the_version_2_successor() {
+        let store = MemoryStore::new();
+        let c1 = version_1_record(vec![live_input(1), live_input(2)]);
+        let c1_key = put_live_compaction(&store, &c1).await;
+        let c2 = version_2_record(&c1, &c1_key);
+        let c2_key = put_live_compaction(&store, &c2).await;
+        assert_eq!(live_key(&store).await.expect("one live record"), c2_key);
+    }
+
+    /// A rewrite R and a version 2 C2 both naming C1: R wins, since C2's parts
+    /// re-encode the pre-erasure C1. Flipped line: `superseded.extend(dominated
+    /// ...)` in `select_live_record`. Without it C2 is live beside R and the
+    /// pass fails with `MultipleLiveRecords`.
+    #[tokio::test]
+    async fn live_record_is_the_rewrite_over_a_dominated_version_2_record() {
+        let store = MemoryStore::new();
+        let c1 = version_1_record(vec![live_input(1)]);
+        let c1_key = put_live_compaction(&store, &c1).await;
+        put_live_compaction(&store, &version_2_record(&c1, &c1_key)).await;
+        let r_key = put_live_rewrite(&store, &rewrite_over(&c1_key)).await;
+        assert_eq!(live_key(&store).await.expect("one live record"), r_key);
+    }
+
+    /// A rewrite R naming a version 2 C2 that names C1: R is live. The rewrite
+    /// chain runs through C2 to C1. Flipped line: the
+    /// `resolve_rewrite_supersession` loop in `select_live_record`, replaced by
+    /// R's one-hop `superseded_record_key` (the rule before this change). C1 is
+    /// then live beside R and the pass fails with `MultipleLiveRecords`.
+    #[tokio::test]
+    async fn live_record_is_a_rewrite_over_a_version_2_link() {
+        let store = MemoryStore::new();
+        let c1 = version_1_record(vec![live_input(1)]);
+        let c1_key = put_live_compaction(&store, &c1).await;
+        let c2_key = put_live_compaction(&store, &version_2_record(&c1, &c1_key)).await;
+        let r_key = put_live_rewrite(&store, &rewrite_over(&c2_key)).await;
+        assert_eq!(live_key(&store).await.expect("one live record"), r_key);
+    }
+
+    /// Two version 2 records naming each other are the catalog's typed cycle
+    /// error, never a pick. A cycle cannot be written through the store (each
+    /// key is a hash over the other's), so the decoded set is built directly.
+    /// Flipped line: `select_authoritative_compaction_records(&candidates)
+    /// .map_err(unresolvable)?` in `select_live_record`. Without the selector
+    /// neither record is superseded and the answer is `MultipleLiveRecords`.
+    #[test]
+    fn a_version_2_cycle_is_a_typed_error() {
+        let c1 = version_1_record(vec![live_input(1)]);
+        let a = CompactionRecord {
+            superseded_record_key: "b".to_string(),
+            ..version_2_record(&c1, "b")
+        };
+        let b = CompactionRecord {
+            superseded_record_key: "a".to_string(),
+            ..version_2_record(&c1, "a")
+        };
+        let decoded = vec![
+            ("a".to_string(), LiveRecordBody::Compaction(a)),
+            ("b".to_string(), LiveRecordBody::Compaction(b)),
+        ];
+        match select_live_record(decoded, "prefix/") {
+            Err(MaintainError::Invariant(message)) => {
+                assert!(message.contains("cycle"), "{message}");
+            }
+            other => panic!("expected the typed cycle error, got {other:?}"),
+        }
+    }
+
+    /// Two rewrite records naming each other are the same typed error. Before
+    /// this change each was named by the other's `superseded_record_key` and
+    /// the answer was `NoLiveRecord`. Flipped line: as for
+    /// [`live_record_is_a_rewrite_over_a_version_2_link`].
+    #[test]
+    fn a_rewrite_cycle_is_a_typed_error() {
+        let decoded = vec![
+            ("a".to_string(), LiveRecordBody::Rewrite(rewrite_over("b"))),
+            ("b".to_string(), LiveRecordBody::Rewrite(rewrite_over("a"))),
+        ];
+        match select_live_record(decoded, "prefix/") {
+            Err(MaintainError::Invariant(message)) => {
+                assert!(message.contains("cycle"), "{message}");
+            }
+            other => panic!("expected the typed cycle error, got {other:?}"),
+        }
+    }
+
+    /// Two overlapping version 1 records are still `MultipleLiveRecords`: the
+    /// resolver's overlap tie-break is not the rewrite pass's to apply.
+    #[test]
+    fn overlapping_version_1_records_are_still_multiple_live_records() {
+        let c1 = version_1_record(vec![live_input(1), live_input(2)]);
+        let c3 = version_1_record(vec![live_input(2), live_input(3)]);
+        let decoded = vec![
+            ("c1".to_string(), LiveRecordBody::Compaction(c1)),
+            ("c3".to_string(), LiveRecordBody::Compaction(c3)),
+        ];
+        match select_live_record(decoded, "prefix/") {
+            Err(MaintainError::MultipleLiveRecords { live_keys, .. }) => {
+                assert_eq!(live_keys.len(), 2, "{live_keys:?}");
+            }
+            other => panic!("expected MultipleLiveRecords, got {other:?}"),
+        }
     }
 }
