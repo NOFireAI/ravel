@@ -541,8 +541,15 @@ impl ParquetQueryError {
                     }
                     ParquetReadError::Store { .. }
                     | ParquetReadError::Corrupt { .. }
-                    | ParquetReadError::LeaderLost { .. }
-                    | ParquetReadError::MemoryExhausted { .. } => ErrorClass::Unavailable,
+                    | ParquetReadError::LeaderLost { .. } => ErrorClass::Unavailable,
+                    // Unreachable in practice: `From<ParquetQueryError> for
+                    // SqlError` (ravel-sql/src/error.rs) converts this to
+                    // `SqlError::Fetch` before a boxed `SqlError::Parquet`
+                    // ever reaches this `class()` call.
+                    ParquetReadError::MemoryExhausted { .. } => ErrorClass::Unavailable,
+                    // Unreachable in practice: the same `From` impl converts
+                    // these to `SqlError::RequestBudgetExceeded` /
+                    // `SqlError::TooManyBytesScanned` first.
                     ParquetReadError::RequestBudgetExceeded { .. }
                     | ParquetReadError::BytesBudgetExceeded { .. } => ErrorClass::Unsupported,
                 }
@@ -569,14 +576,20 @@ impl ParquetQueryError {
             ParquetQueryError::Read(read)
             | ParquetQueryError::Table(ParquetTableError::Read { source: read, .. }) => {
                 match read {
-                    ParquetReadError::FileChanged { .. }
-                    | ParquetReadError::FileMissing { .. }
-                    | ParquetReadError::RequestBudgetExceeded { .. }
+                    ParquetReadError::FileChanged { .. } | ParquetReadError::FileMissing { .. } => {
+                        read.to_string()
+                    }
+                    // Unreachable in practice: see the note on the matching
+                    // arm in `class()` above -- `From<ParquetQueryError> for
+                    // SqlError` converts these before `client_message()` runs.
+                    ParquetReadError::RequestBudgetExceeded { .. }
                     | ParquetReadError::BytesBudgetExceeded { .. } => read.to_string(),
                     ParquetReadError::Corrupt { .. } => MSG_CORRUPT.to_string(),
-                    ParquetReadError::Store { .. }
-                    | ParquetReadError::LeaderLost { .. }
-                    | ParquetReadError::MemoryExhausted { .. } => MSG_UNAVAILABLE.to_string(),
+                    ParquetReadError::Store { .. } | ParquetReadError::LeaderLost { .. } => {
+                        MSG_UNAVAILABLE.to_string()
+                    }
+                    // Unreachable in practice: same note as above.
+                    ParquetReadError::MemoryExhausted { .. } => MSG_UNAVAILABLE.to_string(),
                 }
             }
             ParquetQueryError::Table(
