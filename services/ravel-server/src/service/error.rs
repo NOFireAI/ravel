@@ -196,6 +196,11 @@ impl ServiceError {
                 StatusCode::GATEWAY_TIMEOUT,
                 "timeout",
             ),
+            ErrorClass::Internal => (
+                ServiceErrorKind::Internal,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+            ),
         };
 
         if status == StatusCode::BAD_REQUEST {

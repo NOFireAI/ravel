@@ -117,9 +117,9 @@ fn corrupt(what: &str) -> DataFusionError {
     // A malformed blob here means a record we decoded carried corrupt canonical
     // stream_attrs bytes: the same data-integrity fault the fetcher reports as
     // `LogFetchError::Corrupt`, just detected one layer up. Surface it with the
-    // identical client class/message (`MSG_CORRUPT`, `ErrorClass::Unavailable`)
-    // via `SqlError::CorruptStreamAttrs`, not a distinct internal-error class,
-    // so one underlying fault never maps to two client-visible classes. Never a
+    // identical client class/message (`MSG_CORRUPT`, `ErrorClass::Internal`)
+    // via `SqlError::CorruptStreamAttrs`, not a class of its own, so one
+    // underlying fault never maps to two client-visible classes. Never a
     // panic or a silently-wrong filter result.
     SqlError::CorruptStreamAttrs(what.to_string()).into()
 }
@@ -219,7 +219,7 @@ mod tests {
             DataFusionError::External(b) => b.downcast::<SqlError>().expect("SqlError"),
             other => panic!("expected External, got {other:?}"),
         };
-        assert_eq!(sql.class(), crate::error::ErrorClass::Unavailable);
+        assert_eq!(sql.class(), crate::error::ErrorClass::Internal);
         assert_eq!(sql.client_message(), crate::error::MSG_CORRUPT);
     }
 

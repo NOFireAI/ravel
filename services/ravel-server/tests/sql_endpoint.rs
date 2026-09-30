@@ -30,7 +30,9 @@ use ravel_logseg::{
     AttrValue, LogRecord, Predicate, RlogConfig, RlogReader, RlogWriter, stream_attrs_bytes,
 };
 use ravel_maintain::QUERY_AUDIT_SHARD;
-use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
+use ravel_object_store::fault::{
+    FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, list_all};
 use ravel_query::http::StaticBearerTokenResolver;
@@ -992,6 +994,82 @@ async fn a_storage_fault_body_carries_no_object_key_or_tenant_hash() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_body_redacted(&bytes, &tenant);
 
+    let value: Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(value["errorType"], "unavailable");
+    assert_eq!(value["error"], ravel_sql::MSG_UNAVAILABLE);
+}
+
+/// A corrupt RSEG object fails the same way on every read, so the endpoint
+/// answers 500 `internal`, as the PromQL surface does for the same fault,
+/// never the retryable 503 a client would retry forever.
+#[tokio::test]
+async fn a_corrupt_segment_answers_500_not_503() {
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Get, ScriptedFault::CorruptRange)
+            .with_key_contains(".rseg")
+            .with_occurrence(Occurrence::Always),
+    );
+    let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+    let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&store) as Arc<dyn ObjectStoreBackend>;
+    let tenant = TenantId::new("acme".to_string());
+    publish_segment(backend.as_ref(), &tenant, 0, "m", &[(1, 1.0), (2, 2.0)]).await;
+
+    let app = build_router(backend, tokens(&[("acme-token", "acme")]));
+    let (status, bytes) = post(
+        &app,
+        Some("acme-token"),
+        None,
+        body("SELECT ts, value FROM samples"),
+    )
+    .await;
+
+    assert!(
+        store.fault_count(Op::Get, FaultKind::CorruptRange) >= 1,
+        "the corruption fault never fired"
+    );
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert_body_redacted(&bytes, &tenant);
+    let value: Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(value["errorType"], "internal");
+    assert_eq!(value["error"], ravel_sql::MSG_CORRUPT);
+}
+
+/// A transient store fault on the same read keeps the retryable 503.
+#[tokio::test]
+async fn a_transient_segment_fault_answers_503() {
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(
+            Op::Get,
+            ScriptedFault::Transient(RAW_STORE_TEXT.to_string()),
+        )
+        .with_key_contains(".rseg")
+        .with_occurrence(Occurrence::Always),
+    );
+    let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+    let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&store) as Arc<dyn ObjectStoreBackend>;
+    let tenant = TenantId::new("acme".to_string());
+    publish_segment(backend.as_ref(), &tenant, 0, "m", &[(1, 1.0), (2, 2.0)]).await;
+
+    let app = build_router(backend, tokens(&[("acme-token", "acme")]));
+    let (status, bytes) = post(
+        &app,
+        Some("acme-token"),
+        None,
+        body("SELECT ts, value FROM samples"),
+    )
+    .await;
+
+    assert!(
+        store.fault_count(Op::Get, FaultKind::Transient) >= 1,
+        "the transient fault never fired"
+    );
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_body_redacted(&bytes, &tenant);
     let value: Value = serde_json::from_slice(&bytes).expect("json");
     assert_eq!(value["errorType"], "unavailable");
     assert_eq!(value["error"], ravel_sql::MSG_UNAVAILABLE);
