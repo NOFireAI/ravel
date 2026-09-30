@@ -31,8 +31,8 @@ use ravel_object_store::{
     PageToken, PutOptions, PutOutcome, StoreError,
 };
 use ravel_parquet::{
-    MetadataCache, ParquetReadError, ParquetTableError, ParquetTableProvider, ReadServices,
-    TenantParquetStore,
+    MetadataCache, ParquetReadError, ParquetTableError, ParquetTableProvider, ReadLimits,
+    ReadServices, TenantParquetStore,
 };
 use ravel_pqtable::grants::{self, GrantsError};
 use ravel_pqtable::manifest::Manifest;
@@ -539,7 +539,10 @@ impl ParquetQueryError {
                     }
                     ParquetReadError::Store { .. }
                     | ParquetReadError::Corrupt { .. }
-                    | ParquetReadError::LeaderLost { .. } => ErrorClass::Unavailable,
+                    | ParquetReadError::LeaderLost { .. }
+                    | ParquetReadError::MemoryExhausted { .. } => ErrorClass::Unavailable,
+                    ParquetReadError::RequestBudgetExceeded { .. }
+                    | ParquetReadError::BytesBudgetExceeded { .. } => ErrorClass::Unsupported,
                 }
             }
             ParquetQueryError::Resolve { .. } | ParquetQueryError::Grants(_) => {
@@ -564,13 +567,14 @@ impl ParquetQueryError {
             ParquetQueryError::Read(read)
             | ParquetQueryError::Table(ParquetTableError::Read { source: read, .. }) => {
                 match read {
-                    ParquetReadError::FileChanged { .. } | ParquetReadError::FileMissing { .. } => {
-                        read.to_string()
-                    }
+                    ParquetReadError::FileChanged { .. }
+                    | ParquetReadError::FileMissing { .. }
+                    | ParquetReadError::RequestBudgetExceeded { .. }
+                    | ParquetReadError::BytesBudgetExceeded { .. } => read.to_string(),
                     ParquetReadError::Corrupt { .. } => MSG_CORRUPT.to_string(),
-                    ParquetReadError::Store { .. } | ParquetReadError::LeaderLost { .. } => {
-                        MSG_UNAVAILABLE.to_string()
-                    }
+                    ParquetReadError::Store { .. }
+                    | ParquetReadError::LeaderLost { .. }
+                    | ParquetReadError::MemoryExhausted { .. } => MSG_UNAVAILABLE.to_string(),
                 }
             }
             ParquetQueryError::Table(
@@ -687,12 +691,15 @@ pub(crate) async fn resolve_tables(
 
 /// Build one provider per resolved table, reading each table's first footer
 /// through the reader (charged to Probe), and the store the session's
-/// registry answers with. `parallel` is ADR-2040 D6's file grouping.
+/// registry answers with. `parallel` is ADR-2040 D6's file grouping. Every
+/// read the tables make, this footer read included, is admitted against
+/// `limits`.
 pub(crate) async fn build_tables(
     sources: &ParquetSources,
     tenant: TenantHash,
     resolution: &ParquetResolution,
     accounting: &PhaseAccounting,
+    limits: &ReadLimits,
     parallel: bool,
 ) -> Result<Vec<(String, ParquetTableProvider)>, ParquetQueryError> {
     let Some(external) = &sources.external else {
@@ -726,6 +733,7 @@ pub(crate) async fn build_tables(
             &stores,
             sources.services.clone(),
             accounting.clone(),
+            limits.clone(),
             parallel,
         )
         .await?;

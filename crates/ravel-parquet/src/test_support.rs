@@ -38,6 +38,7 @@ use ravel_types::TenantHash;
 
 use crate::boundary::ParquetPanicBoundaryExec;
 use crate::error::{ParquetReadError, ParquetTableError};
+use crate::limits::ReadLimits;
 use crate::metadata_cache::MetadataCache;
 use crate::provider::ParquetTableProvider;
 use crate::reader::{PinnedFile, PinnedParquetReader, PinnedReaderFactory, ReadServices};
@@ -191,6 +192,7 @@ pub(crate) struct Fixture {
     store: Arc<dyn ObjectStoreBackend>,
     services: ReadServices,
     registered: Arc<TenantParquetStore>,
+    limits: ReadLimits,
 }
 
 impl Fixture {
@@ -205,7 +207,14 @@ impl Fixture {
                 metadata: Arc::new(MetadataCache::new(8 << 20)),
             },
             registered: Arc::new(TenantParquetStore::new(TENANT)),
+            limits: ReadLimits::unlimited(),
         }
+    }
+
+    /// This fixture's readers and providers admit their reads against `limits`.
+    pub(crate) fn with_limits(mut self, limits: ReadLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     /// Write `bytes` at `key` and describe it as a manifest would. With
@@ -289,6 +298,7 @@ impl Fixture {
             self.pinned(file),
             self.services.clone(),
             PhaseAccounting::new(),
+            self.limits.clone(),
         )
     }
 
@@ -306,6 +316,7 @@ impl Fixture {
             files.into(),
             self.services.clone(),
             PhaseAccounting::new(),
+            self.limits.clone(),
         )
     }
 
@@ -326,6 +337,7 @@ impl Fixture {
             &stores,
             self.services.clone(),
             accounting,
+            self.limits.clone(),
             parallel,
         )
         .await

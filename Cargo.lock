@@ -5086,6 +5086,7 @@ dependencies = [
  "parquet 58.4.0",
  "proptest",
  "ravel-cache",
+ "ravel-memory",
  "ravel-object-store",
  "ravel-pqtable",
  "ravel-query",
