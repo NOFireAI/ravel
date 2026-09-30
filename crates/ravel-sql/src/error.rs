@@ -32,7 +32,9 @@
 //! errors (which carry only counts and limits an operator needs).
 
 use datafusion::error::DataFusionError;
-use ravel_catalog::{CatalogError, LoadColumnStatsError};
+use ravel_catalog::{CatalogError, LoadColumnStatsError, SnapshotFormatError};
+use ravel_commit::erasure::ErasureError;
+use ravel_commit::record::RecordError;
 use ravel_object_store::StoreError;
 use ravel_query::{FetchError, FoldLag, LogFetchError};
 
@@ -591,16 +593,78 @@ impl SqlError {
 /// Class-specific redaction for catalog errors, mirroring
 /// `redacted_storage_message` on the PromQL path so both endpoints answer
 /// the same way for the same fault.
+///
+/// The rule is whether a retry, possibly routed to another node, can succeed:
+///
+/// - A decode failure of stored bytes whose format version this build covers is
+///   a permanent data fault ([`MSG_CORRUPT`], `ErrorClass::Internal`, 500):
+///   re-reading the same object on any node fails the same way. That is
+///   `CompactionRecordDecode`, `ErasureRequestDecode`, and `SnapshotFormat`,
+///   alongside the existing corrupt group (`Reconstruction`, `FieldMismatch`,
+///   `Record`, `Key`).
+/// - "This build cannot read a newer format version" is retryable
+///   ([`MSG_UNAVAILABLE`], `ErrorClass::Unavailable`, 503): during a rolling
+///   upgrade a peer on a newer build can read it. That is `UnsupportedHeadVersion`,
+///   `SnapshotFormat`'s `UnsupportedVersion` case, and the unsupported-version
+///   case each of `CompactionRecordDecode` and `ErasureRequestDecode` carries in
+///   its source.
+/// - Transient storage faults and fold-progress/liveness failures stay
+///   retryable; `UnsatisfiableToken` keeps its own stable message.
+///
+/// Every variant is named (no wildcard) so a new `CatalogError` fails to
+/// compile here until it is classified. `WindowTooWide` never reaches this
+/// function -- [`SqlError::client_message`] echoes it verbatim before calling
+/// in -- but is matched for exhaustiveness.
 fn redact_catalog(err: &CatalogError) -> &'static str {
     match err {
         CatalogError::UnsatisfiableToken { .. } => MSG_UNSATISFIABLE,
+
+        // Corrupt stored data whose format version this build covers: a retry on
+        // any node re-reads the same bytes and fails the same way. 500.
         CatalogError::Reconstruction { .. }
         | CatalogError::FieldMismatch { .. }
         | CatalogError::Record(_)
         | CatalogError::Key(_) => MSG_CORRUPT,
-        // Store errors and any future variant redact to the transient
-        // message rather than risk leaking backend text.
-        _ => MSG_UNAVAILABLE,
+        CatalogError::CompactionRecordDecode {
+            source:
+                RecordError::UnsupportedFormatVersion { .. }
+                | RecordError::UnsupportedRecordFormatVersion { .. },
+            ..
+        } => MSG_UNAVAILABLE,
+        CatalogError::CompactionRecordDecode { .. } => MSG_CORRUPT,
+        CatalogError::ErasureRequestDecode {
+            source: ErasureError::UnsupportedFormatVersion { .. },
+            ..
+        } => MSG_UNAVAILABLE,
+        CatalogError::ErasureRequestDecode { .. } => MSG_CORRUPT,
+        CatalogError::SnapshotFormat(SnapshotFormatError::UnsupportedVersion(_)) => MSG_UNAVAILABLE,
+        CatalogError::SnapshotFormat(_) => MSG_CORRUPT,
+
+        // A newer on-object format version this build cannot read: a peer on a
+        // newer build can during a rolling upgrade, so it is retryable. 503.
+        CatalogError::UnsupportedHeadVersion { .. } => MSG_UNAVAILABLE,
+
+        // Echoed verbatim by `client_message` before it reaches here; matched
+        // only for exhaustiveness.
+        CatalogError::WindowTooWide { .. } => MSG_UNAVAILABLE,
+
+        // Transient storage faults, fold progress/liveness failures, and
+        // resource backpressure: a retry (here or elsewhere) can succeed, so
+        // they keep the retryable message. The rewrite/compaction structural
+        // faults listed here are decode/consistency failures of stored records
+        // the same rule would call corrupt; issue #2194 scoped only the four
+        // decode/version faults above, so they keep their prior mapping until a
+        // follow-up classifies them.
+        CatalogError::InvalidConfig(_)
+        | CatalogError::Store(_)
+        | CatalogError::FoldCasRetriesExhausted { .. }
+        | CatalogError::Provisioning(_)
+        | CatalogError::RewriteRecordDecode { .. }
+        | CatalogError::RewriteSupersessionChainTooDeep { .. }
+        | CatalogError::RewriteSupersessionCycle { .. }
+        | CatalogError::CompactionSupersessionInputMismatch { .. }
+        | CatalogError::ColumnStatsPartOverBound { .. }
+        | CatalogError::MemoryExhausted(_) => MSG_UNAVAILABLE,
     }
 }
 

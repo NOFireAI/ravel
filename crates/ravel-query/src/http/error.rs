@@ -13,7 +13,9 @@
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use ravel_catalog::CatalogError;
+use ravel_catalog::{CatalogError, SnapshotFormatError};
+use ravel_commit::erasure::ErasureError;
+use ravel_commit::record::RecordError;
 use ravel_cpu_gate::CpuGateError;
 use ravel_object_store::StoreError;
 
@@ -188,6 +190,14 @@ impl From<QueryError> for ApiError {
 /// unsatisfiable-token map to the retryable HTTP 503; each carries its own
 /// stable message so diagnosability survives redaction; the budget class
 /// keeps its own 422 mapping and unredacted counts.
+///
+/// The catalog arm follows the same rule the SQL boundary's `redact_catalog`
+/// does, so both surfaces answer the same fault the same way: a decode failure
+/// of stored bytes whose format version this build covers is corrupt (500,
+/// non-retryable), while a catalog object written in a newer format version
+/// this build cannot read stays unavailable (503, retryable), because a peer on
+/// a newer build can read it during a rolling upgrade. Every catalog variant is
+/// named (no wildcard) so a new one fails to compile until it is classified.
 fn redacted_storage_message(err: &QueryError) -> Option<&'static str> {
     match err {
         QueryError::Fetch(fetch) => Some(match fetch {
@@ -216,13 +226,56 @@ fn redacted_storage_message(err: &QueryError) -> Option<&'static str> {
         QueryError::Catalog(CatalogError::WindowTooWide { .. }) => None,
         QueryError::Catalog(catalog) => Some(match catalog {
             CatalogError::UnsatisfiableToken { .. } => MSG_UNSATISFIABLE,
+
+            // Corrupt stored data whose format version this build covers: a
+            // retry re-reads the same bytes and fails the same way, so it is
+            // the non-retryable 500, not the retryable 503.
             CatalogError::Reconstruction { .. }
             | CatalogError::FieldMismatch { .. }
             | CatalogError::Record(_)
             | CatalogError::Key(_) => MSG_CORRUPT,
-            // Store errors and any future catalog variant redact to the
-            // transient-unavailable message rather than risk leaking text.
-            _ => MSG_UNAVAILABLE,
+            CatalogError::CompactionRecordDecode {
+                source:
+                    RecordError::UnsupportedFormatVersion { .. }
+                    | RecordError::UnsupportedRecordFormatVersion { .. },
+                ..
+            } => MSG_UNAVAILABLE,
+            CatalogError::CompactionRecordDecode { .. } => MSG_CORRUPT,
+            CatalogError::ErasureRequestDecode {
+                source: ErasureError::UnsupportedFormatVersion { .. },
+                ..
+            } => MSG_UNAVAILABLE,
+            CatalogError::ErasureRequestDecode { .. } => MSG_CORRUPT,
+            CatalogError::SnapshotFormat(SnapshotFormatError::UnsupportedVersion(_)) => {
+                MSG_UNAVAILABLE
+            }
+            CatalogError::SnapshotFormat(_) => MSG_CORRUPT,
+
+            // A newer on-object format version this build cannot read is
+            // retryable: a peer on a newer build can read it during a rolling
+            // upgrade. 503.
+            CatalogError::UnsupportedHeadVersion { .. } => MSG_UNAVAILABLE,
+
+            // Never reached: the outer arm returns None for WindowTooWide.
+            // Matched only for exhaustiveness.
+            CatalogError::WindowTooWide { .. } => MSG_UNAVAILABLE,
+
+            // Transient storage faults, fold progress/liveness failures, and
+            // resource backpressure stay retryable. The rewrite/compaction
+            // structural faults are decode/consistency failures the same rule
+            // would call corrupt; issue #2194 scoped only the four
+            // decode/version faults above, so they keep their prior mapping
+            // until a follow-up classifies them.
+            CatalogError::InvalidConfig(_)
+            | CatalogError::Store(_)
+            | CatalogError::FoldCasRetriesExhausted { .. }
+            | CatalogError::Provisioning(_)
+            | CatalogError::RewriteRecordDecode { .. }
+            | CatalogError::RewriteSupersessionChainTooDeep { .. }
+            | CatalogError::RewriteSupersessionCycle { .. }
+            | CatalogError::CompactionSupersessionInputMismatch { .. }
+            | CatalogError::ColumnStatsPartOverBound { .. }
+            | CatalogError::MemoryExhausted(_) => MSG_UNAVAILABLE,
         }),
         QueryError::NonMonotonicSamples { .. } => Some(MSG_CORRUPT),
         QueryError::SnapshotInvalidated => Some(MSG_UNAVAILABLE),
