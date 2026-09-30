@@ -58,7 +58,7 @@ pub use reader::{
 };
 pub use record::{FieldSel, FieldType, LogRecord, Predicate, stream_attrs_bytes};
 pub use source::{ByteSource, SparseObject};
-pub use writer::{ObjectIdentity, RlogConfig, RlogWriter};
+pub use writer::{BloomScope, ObjectIdentity, RlogConfig, RlogWriter};
 
 // Re-exported for callers building records; these are the ravel-types identity
 // primitives that appear in the public [`LogRecord`] and [`Predicate`] surface.

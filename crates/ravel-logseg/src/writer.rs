@@ -2,7 +2,8 @@
 //! (docs/log-segment-format.md).
 //!
 //! [`RlogWriter::finish`] runs the full pipeline: collect and sort the stream
-//! directory, assign dense stream refs, sort records by `(stream_ref, ts)`,
+//! directory, assign dense stream refs, sort records by `(stream_ref, ts)` or
+//! by the clustered order of [`RlogWriter::with_sort_descriptor`],
 //! split dynamic attributes into per-type columns under the 1000-column budget
 //! (overflow keys fold into `attrs_raw`), chunk into blocks, build per-block
 //! token blooms and the skip index, compress the whole-read sections, and emit
@@ -20,7 +21,10 @@ use crate::bloom::BloomBuilder;
 use crate::columnar_batch::ColumnarLogBatch;
 use crate::error::LogSegError;
 use crate::field_dir::{FieldDir, FieldEntry};
-use crate::footer::{COMP_NONE, COMP_ZSTD, LogFooter, SectionDesc, kind, write_footer_and_trailer};
+use crate::footer::{
+    COMP_NONE, COMP_ZSTD, LogFooter, MAX_SORT_KEY_COLUMNS, SectionDesc, SortDescriptor,
+    SortKeyType, kind, write_footer_and_trailer,
+};
 use crate::page_dir::{ChunkEntry, GroupEntry, PageDir, PageEntry};
 use crate::postings::{DEFAULT_STRIDE, FieldTerms, encode_postings_section, term_key};
 use crate::reader::stream_attr_pairs;
@@ -99,9 +103,26 @@ pub struct RlogWriter {
     /// `push_columnar` each refuse if the other has already been used.
     batches: Vec<ColumnarLogBatch>,
     indexed_fields: Vec<String>,
-    /// Dynamic string attribute names left out of BLOOM coverage; empty
-    /// outside tests.
-    bloom_uncovered: Vec<String>,
+    /// The clustered row order and the generation recorded with it
+    /// ([`RlogWriter::with_sort_descriptor`]); `None` and 0 by default.
+    sort_descriptor: Option<SortDescriptor>,
+    clustering_generation: u64,
+    bloom_scope: BloomScope,
+}
+
+/// Which string columns BLOOM covers (ADR-2135 decision 5). A column outside
+/// the scope is left off the section's covered-column list and no filter holds
+/// a key for it, so a reader scans it instead of pruning on it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum BloomScope {
+    /// `body`, `severity_text`, and every string attribute column.
+    #[default]
+    All,
+    /// `body`, `severity_text`, and every string attribute column whose name
+    /// is not in `declared`, the tenant's declared typed columns.
+    Undeclared { declared: Vec<String> },
+    /// `body` and `severity_text` only.
+    Text,
 }
 
 /// Counters describing one write beyond what the object bytes themselves
@@ -190,17 +211,37 @@ impl RlogWriter {
             records: Vec::new(),
             batches: Vec::new(),
             indexed_fields: Vec::new(),
-            bloom_uncovered: Vec::new(),
+            sort_descriptor: None,
+            clustering_generation: 0,
+            bloom_scope: BloomScope::All,
         }
     }
 
-    /// Test seam, compiled only for this crate's unit tests: leaves the named
-    /// dynamic string columns out of BLOOM, both from the covered-column list
-    /// and from every filter, so a reader test can hold an object whose
-    /// coverage is narrower than the default.
-    #[cfg(test)]
-    pub(crate) fn with_bloom_uncovered_attrs_for_tests(mut self, names: Vec<String>) -> Self {
-        self.bloom_uncovered = names;
+    /// Orders the object's records by `descriptor` and records it in the
+    /// footer with `generation` (ADR-2135 decisions 1 and 2). With a
+    /// descriptor, records sort by `(stream_ref, ts.div_euclid(bucket),
+    /// key_1, ..., key_n, ts)`, each key read from the record's first
+    /// per-record attribute of that name and declared type; a record without
+    /// one sorts before every record with one. `None` keeps the
+    /// `(stream_ref, ts)` order and still records `generation`, which is how
+    /// a cleared key is written. The build refuses, with
+    /// [`LogSegError::InvalidSortDescriptor`], a descriptor with generation 0,
+    /// with no key or more than four, with an empty or repeated key name, or
+    /// naming a key no record carries as a per-record attribute of its type.
+    pub fn with_sort_descriptor(
+        mut self,
+        descriptor: Option<SortDescriptor>,
+        generation: u64,
+    ) -> Self {
+        self.sort_descriptor = descriptor;
+        self.clustering_generation = generation;
+        self
+    }
+
+    /// Limits BLOOM to `scope` (ADR-2135 decision 5). The default,
+    /// [`BloomScope::All`], covers every string column.
+    pub fn with_bloom_scope(mut self, scope: BloomScope) -> Self {
+        self.bloom_scope = scope;
         self
     }
 
@@ -288,10 +329,11 @@ impl RlogWriter {
                 self.cfg.max_dynamic_columns
             )));
         }
+        let cluster = cluster_order(self.sort_descriptor.as_ref(), self.clustering_generation)?;
         if !self.batches.is_empty() {
-            return self.build_object_columnar(level, input_set_hash, part_index, layout);
+            return self.build_object_columnar(level, input_set_hash, part_index, layout, cluster);
         }
-        self.build_object(level, input_set_hash, part_index, layout)
+        self.build_object(level, input_set_hash, part_index, layout, cluster)
     }
 
     /// Produces the whole object as an L1 compacted part, stamping the caller's
@@ -341,6 +383,7 @@ impl RlogWriter {
         input_set_hash: Vec<u8>,
         part_index: u32,
         layout: Layout,
+        cluster: Option<ClusterOrder>,
     ) -> Result<(Vec<u8>, WriteStats), LogSegError> {
         if self.records.is_empty() {
             return Err(LogSegError::LimitExceeded("empty object".into()));
@@ -374,6 +417,26 @@ impl RlogWriter {
         for (i, id) in sorted_ids.iter().enumerate() {
             ref_of.insert(*id, i as u32);
         }
+
+        // Each clustering key's value per record, in push order, read off the
+        // per-record layer only (ADR-2135 decision 1).
+        let key_values: Vec<Vec<Option<KeyValue>>> = match &cluster {
+            None => Vec::new(),
+            Some(order) => {
+                let values: Vec<Vec<Option<KeyValue>>> = order
+                    .keys
+                    .iter()
+                    .map(|(name, ty)| {
+                        self.records
+                            .iter()
+                            .map(|r| record_key_value(&r.attrs, name, *ty))
+                            .collect()
+                    })
+                    .collect();
+                check_keys_carried(order, &values, &streams)?;
+                values
+            }
+        };
 
         // The caller's indexed-field list (docs/adrs/0049-rlog-postings.md
         // decision 3: opt-in per field). Resolved before column assignment
@@ -488,7 +551,7 @@ impl RlogWriter {
             .filter(|(name, _, _)| indexed_names.contains(name.as_str()))
             .map(|(_, _, cid)| *cid)
             .collect();
-        let (bloom_covered, bloom_skip) = bloom_coverage(&columns, &self.bloom_uncovered);
+        let (bloom_covered, bloom_skip) = bloom_coverage(&columns, &self.bloom_scope);
 
         // Tracked names (indexed union numstat), interned once into a flat table
         // so a record's tracked occurrences key by a small slot index instead of
@@ -519,7 +582,7 @@ impl RlogWriter {
             }
         }
 
-        // Resolve every record into storage form, then sort by (stream_ref, ts).
+        // Resolve every record into storage form, then sort into the object's row order.
         // `resolve_row` also computes each row's merged-view POSTINGS terms and
         // its per-name NumStat winners, both read off the one resolved merged
         // view seeded from `stream_seeds`. One scratch serves every record: it is
@@ -538,11 +601,20 @@ impl RlogWriter {
                 &mut stamp,
             ));
         }
-        rows.sort_by(|a, b| {
-            a.stream_ref
-                .cmp(&b.stream_ref)
-                .then_with(|| a.ts_ns.cmp(&b.ts_ns))
-        });
+        match &cluster {
+            None => rows.sort_by(|a, b| {
+                a.stream_ref
+                    .cmp(&b.stream_ref)
+                    .then_with(|| a.ts_ns.cmp(&b.ts_ns))
+            }),
+            Some(order) => {
+                let stream_refs: Vec<u32> = rows.iter().map(|r| r.stream_ref).collect();
+                let ts: Vec<i64> = rows.iter().map(|r| r.ts_ns).collect();
+                let perm = clustered_permutation(order, &stream_refs, &ts, &key_values);
+                let mut slots: Vec<Option<ResolvedRow>> = rows.into_iter().map(Some).collect();
+                rows = perm.iter().filter_map(|&i| slots[i].take()).collect();
+            }
+        }
 
         // Chunk into blocks by record target and an estimated byte cap.
         let block_spans = chunk_blocks(&rows, &self.cfg);
@@ -671,7 +743,7 @@ impl RlogWriter {
                 );
                 for (cid, v) in &row.columns {
                     if let ColumnValue::Str(bytes) = v
-                        && !bloom_skip.contains(cid)
+                        && bloom_skip.binary_search(cid).is_err()
                     {
                         insert_text(&mut builder, *cid, bytes);
                     }
@@ -854,8 +926,8 @@ impl RlogWriter {
             level,
             input_set_hash,
             part_index,
-            sort_descriptor: None,
-            clustering_generation: 0,
+            sort_descriptor: self.sort_descriptor.clone(),
+            clustering_generation: self.clustering_generation,
         };
         write_footer_and_trailer(&mut object, &footer);
         Ok((
@@ -901,6 +973,7 @@ impl RlogWriter {
         input_set_hash: Vec<u8>,
         part_index: u32,
         layout: Layout,
+        cluster: Option<ClusterOrder>,
     ) -> Result<(Vec<u8>, WriteStats), LogSegError> {
         let batches = &self.batches;
         let total_rows: usize = batches.iter().map(|b| b.num_rows).sum();
@@ -944,6 +1017,17 @@ impl RlogWriter {
         for (i, id) in sorted_ids.iter().enumerate() {
             ref_of.insert(*id, i as u32);
         }
+
+        // Each clustering key's value per global row, read from the same
+        // first per-record occurrence the row path reads.
+        let key_values: Vec<Vec<Option<KeyValue>>> = match &cluster {
+            None => Vec::new(),
+            Some(order) => {
+                let values = columnar_key_values(order, batches, &bases, total_rows);
+                check_keys_carried(order, &values, &streams)?;
+                values
+            }
+        };
 
         let indexed_names: std::collections::HashSet<&str> =
             self.indexed_fields.iter().map(String::as_str).collect();
@@ -1002,7 +1086,7 @@ impl RlogWriter {
             .filter(|(name, _, _)| indexed_names.contains(name.as_str()))
             .map(|(_, _, cid)| *cid)
             .collect();
-        let (bloom_covered, bloom_skip) = bloom_coverage(&columns, &self.bloom_uncovered);
+        let (bloom_covered, bloom_skip) = bloom_coverage(&columns, &self.bloom_scope);
 
         // Tracked names (indexed union numstat), interned once into a flat table
         // so a row's tracked occurrences key by a small slot index instead of a
@@ -1198,14 +1282,22 @@ impl RlogWriter {
                 }
             }
         }
-        // Sort rows by (stream_ref, ts) exactly as the row path sorts
-        // ResolvedRows; `sort_by` is stable, so ties keep the appended order.
-        let mut perm: Vec<usize> = (0..total_rows).collect();
-        perm.sort_by(|&a, &b| {
-            g_stream_ref[a]
-                .cmp(&g_stream_ref[b])
-                .then_with(|| g_ts[a].cmp(&g_ts[b]))
-        });
+        // Sort rows exactly as the row path sorts ResolvedRows; `sort_by` is
+        // stable, so ties keep the appended order. A clustered order compares
+        // resolved key values, never the dictionary ids above, which follow
+        // first-seen order.
+        let perm: Vec<usize> = match &cluster {
+            None => {
+                let mut perm: Vec<usize> = (0..total_rows).collect();
+                perm.sort_by(|&a, &b| {
+                    g_stream_ref[a]
+                        .cmp(&g_stream_ref[b])
+                        .then_with(|| g_ts[a].cmp(&g_ts[b]))
+                });
+                perm
+            }
+            Some(order) => clustered_permutation(order, &g_stream_ref, &g_ts, &key_values),
+        };
 
         // Chunk into blocks, reproducing chunk_blocks/row_estimate. The dynamic
         // part is precomputed in `g_est_dyn`; the rest is byte-identical.
@@ -1513,7 +1605,7 @@ impl RlogWriter {
             for (pos, p) in plans.iter().enumerate() {
                 if plan_uses_dict[plan_of_cid[&p.column_id]]
                     || !matches!(p.ty, FieldType::Str)
-                    || bloom_skip.contains(&p.column_id)
+                    || bloom_skip.binary_search(&p.column_id).is_ok()
                 {
                     continue;
                 }
@@ -1529,7 +1621,7 @@ impl RlogWriter {
             for p in &plans {
                 let plan_idx = plan_of_cid[&p.column_id];
                 if !(plan_uses_dict[plan_idx] && matches!(p.ty, FieldType::Str))
-                    || bloom_skip.contains(&p.column_id)
+                    || bloom_skip.binary_search(&p.column_id).is_ok()
                 {
                     continue;
                 }
@@ -1702,8 +1794,8 @@ impl RlogWriter {
             level,
             input_set_hash,
             part_index,
-            sort_descriptor: None,
-            clustering_generation: 0,
+            sort_descriptor: self.sort_descriptor.clone(),
+            clustering_generation: self.clustering_generation,
         };
         write_footer_and_trailer(&mut object, &footer);
         Ok((
@@ -2610,26 +2702,216 @@ fn insert_text(builder: &mut BloomBuilder, column_id: u32, bytes: &[u8]) {
     }
 }
 
-/// The BLOOM coverage of one object: `severity_text`, `body`, and every dynamic
-/// Str column whose name is not in `uncovered`, ascending; and the dynamic
-/// Str column ids left out, which no filter may hold a key for.
+/// The BLOOM coverage of one object under `scope`: `severity_text`, `body`, and
+/// the dynamic Str columns the scope keeps, ascending; and the dynamic Str
+/// column ids left out, ascending, which no filter may hold a key for.
 fn bloom_coverage(
     columns: &[(String, FieldType, u32)],
-    uncovered: &[String],
+    scope: &BloomScope,
 ) -> (Vec<u32>, Vec<u32>) {
     let mut covered = vec![COL_SEVERITY_TEXT, COL_BODY];
     let mut skipped = Vec::new();
     for (name, ty, cid) in columns {
         if matches!(ty, FieldType::Str) {
-            if uncovered.contains(name) {
-                skipped.push(*cid);
-            } else {
+            let keep = match scope {
+                BloomScope::All => true,
+                BloomScope::Undeclared { declared } => !declared.contains(name),
+                BloomScope::Text => false,
+            };
+            if keep {
                 covered.push(*cid);
+            } else {
+                skipped.push(*cid);
             }
         }
     }
     covered.sort_unstable();
+    skipped.sort_unstable();
     (covered, skipped)
+}
+
+/// A sort descriptor resolved for one build: the bucket width in nanoseconds
+/// and each key column's name and storage type, in key order.
+struct ClusterOrder {
+    bucket_ns: i64,
+    keys: Vec<(String, FieldType)>,
+}
+
+/// One resolved clustering key value. Str and Bytes values both land in
+/// `Bytes` and compare bytewise, I64 numerically, and false before true. An
+/// absent value is `None`, which `Option`'s order puts before every value. All
+/// values of one key share its declared type, so two variants never meet.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum KeyValue {
+    I64(i64),
+    Bool(bool),
+    Bytes(Vec<u8>),
+}
+
+/// Validates the caller's descriptor against the rules the footer decoder
+/// enforces, so a descriptor the writer records passes its own decoder.
+fn cluster_order(
+    descriptor: Option<&SortDescriptor>,
+    generation: u64,
+) -> Result<Option<ClusterOrder>, LogSegError> {
+    let Some(d) = descriptor else {
+        return Ok(None);
+    };
+    let invalid = |why: String| Err(LogSegError::InvalidSortDescriptor(why));
+    if generation == 0 {
+        return invalid("a descriptor needs a nonzero clustering generation".into());
+    }
+    if d.key_columns.is_empty() || d.key_columns.len() > MAX_SORT_KEY_COLUMNS {
+        return invalid(format!(
+            "{} key columns, not 1..={MAX_SORT_KEY_COLUMNS}",
+            d.key_columns.len()
+        ));
+    }
+    let mut keys: Vec<(String, FieldType)> = Vec::with_capacity(d.key_columns.len());
+    for c in &d.key_columns {
+        if c.name.is_empty() {
+            return invalid("key column name empty".into());
+        }
+        if keys.iter().any(|(name, _)| *name == c.name) {
+            return invalid(format!("key column {:?} named twice", c.name));
+        }
+        let ty = match c.ty {
+            SortKeyType::Str => FieldType::Str,
+            SortKeyType::I64 => FieldType::I64,
+            SortKeyType::Bool => FieldType::Bool,
+            SortKeyType::Bytes => FieldType::Bytes,
+        };
+        keys.push((c.name.clone(), ty));
+    }
+    Ok(Some(ClusterOrder {
+        bucket_ns: d.bucket_width.width_ns(),
+        keys,
+    }))
+}
+
+/// The key value `value` gives a key of type `ty`: `None` when it resolves to
+/// another storage type.
+fn key_value(value: &AttrValue, ty: FieldType) -> Option<KeyValue> {
+    let (resolved_ty, cv) = resolve_value(value);
+    if resolved_ty != ty {
+        return None;
+    }
+    match cv {
+        ColumnValue::I64(v) => Some(KeyValue::I64(v)),
+        ColumnValue::Bool(b) => Some(KeyValue::Bool(b)),
+        ColumnValue::Str(b) | ColumnValue::Bytes(b) => Some(KeyValue::Bytes(b)),
+        ColumnValue::F64(_) => None,
+    }
+}
+
+/// A record's value for key `(name, ty)`: its first per-record attribute of
+/// that name resolving to that type, the occurrence that takes the column.
+fn record_key_value(attrs: &[(String, AttrValue)], name: &str, ty: FieldType) -> Option<KeyValue> {
+    attrs
+        .iter()
+        .filter(|(k, _)| k == name)
+        .find_map(|(_, v)| key_value(v, ty))
+}
+
+/// The columnar counterpart of [`record_key_value`] over every global row: a
+/// row's first `(name, type)` occurrence is its batch column cell, and its
+/// residual attributes hold only later ones.
+fn columnar_key_values(
+    order: &ClusterOrder,
+    batches: &[ColumnarLogBatch],
+    bases: &[usize],
+    total_rows: usize,
+) -> Vec<Vec<Option<KeyValue>>> {
+    order
+        .keys
+        .iter()
+        .map(|(name, ty)| {
+            let mut values: Vec<Option<KeyValue>> = vec![None; total_rows];
+            for (b, &base) in batches.iter().zip(bases) {
+                for c in b
+                    .dyn_columns
+                    .iter()
+                    .filter(|c| c.name == *name && c.field_type == *ty)
+                {
+                    let mut slot = 0usize;
+                    for row in 0..b.num_rows {
+                        if !c.validity.get(row) {
+                            continue;
+                        }
+                        let cell = &c.cells[slot];
+                        slot += 1;
+                        if values[base + row].is_none() {
+                            values[base + row] = key_value(cell, *ty);
+                        }
+                    }
+                }
+                for (row, extras) in b.residual_attrs.iter().enumerate() {
+                    if values[base + row].is_none() {
+                        values[base + row] = record_key_value(extras, name, *ty);
+                    }
+                }
+            }
+            values
+        })
+        .collect()
+}
+
+/// Refuses an order with a key no record carries as a per-record attribute of
+/// its declared type: such a key orders nothing, and a value on the stream
+/// layer is not a per-record value.
+fn check_keys_carried(
+    order: &ClusterOrder,
+    key_values: &[Vec<Option<KeyValue>>],
+    streams: &BTreeMap<LogStreamId, &[u8]>,
+) -> Result<(), LogSegError> {
+    for ((name, ty), values) in order.keys.iter().zip(key_values) {
+        if values.iter().any(Option::is_some) {
+            continue;
+        }
+        let mut stream_level = false;
+        for blob in streams.values() {
+            if stream_attr_pairs(blob)?.iter().any(|(k, _)| k == name) {
+                stream_level = true;
+                break;
+            }
+        }
+        return Err(LogSegError::InvalidSortDescriptor(format!(
+            "key column {name:?} of type {ty:?} is not a per-record attribute of any record{}",
+            if stream_level {
+                " (it is a stream-level attribute only)"
+            } else {
+                ""
+            }
+        )));
+    }
+    Ok(())
+}
+
+/// The clustered row order (ADR-2135 decision 1) as a permutation of row
+/// indices: `(stream_ref, ts.div_euclid(bucket), key_1, ..., key_n, ts)`,
+/// stable, so equal rows keep their push order.
+fn clustered_permutation(
+    order: &ClusterOrder,
+    stream_refs: &[u32],
+    ts: &[i64],
+    key_values: &[Vec<Option<KeyValue>>],
+) -> Vec<usize> {
+    let buckets: Vec<i64> = ts.iter().map(|t| t.div_euclid(order.bucket_ns)).collect();
+    let mut perm: Vec<usize> = (0..ts.len()).collect();
+    perm.sort_by(|&a, &b| {
+        stream_refs[a]
+            .cmp(&stream_refs[b])
+            .then_with(|| buckets[a].cmp(&buckets[b]))
+            .then_with(|| {
+                key_values
+                    .iter()
+                    .map(|k| k[a].cmp(&k[b]))
+                    .find(|o| o.is_ne())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| ts[a].cmp(&ts[b]))
+    });
+    perm
 }
 
 /// The BLOCKS layout a build emits (ADR-0699 decision 1): row groups of

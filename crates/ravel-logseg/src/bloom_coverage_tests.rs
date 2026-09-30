@@ -1,7 +1,6 @@
 //! Reader behaviour over BLOOM coverage (docs/log-segment-format.md "BLOOM"):
 //! a column the covered-column list omits never prunes, whichever predicate
-//! arm names it, and a covered list that fails its crc prunes nothing. These
-//! live in the crate because they need the writer's test-only coverage seam.
+//! arm names it, and a covered list that fails its crc prunes nothing.
 #![allow(clippy::expect_used)]
 
 use crate::bloom::BloomBuilder;
@@ -57,8 +56,11 @@ fn records() -> Vec<LogRecord> {
 
 /// One block holding `records()`, with `note` left out of BLOOM entirely.
 fn object_without_note_coverage() -> Vec<u8> {
-    let mut w = RlogWriter::new(RlogConfig::default(), identity())
-        .with_bloom_uncovered_attrs_for_tests(vec!["note".to_string()]);
+    let mut w = RlogWriter::new(RlogConfig::default(), identity()).with_bloom_scope(
+        crate::writer::BloomScope::Undeclared {
+            declared: vec!["note".to_string()],
+        },
+    );
     for r in records() {
         w.push(r).expect("push");
     }
