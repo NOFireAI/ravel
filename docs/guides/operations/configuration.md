@@ -170,7 +170,8 @@ the endpoint.
 Under the Kubernetes operator the same two settings are
 `spec.storage.s3.uploadIntegrity` and `spec.storage.s3.requestStoredChecksum`
 on the `RavelCluster`. They also govern the operator's own S3 client.
-`ravel-cli` does not attach an upload checksum yet.
+`ravel-cli` takes the same two options with the same defaults; see
+[Upload checksums](#upload-checksums) under its store options.
 
 ### Choosing a credential source
 
@@ -233,6 +234,32 @@ credentials) to run against the real bucket, or load data first.
 
 An explicit `--store memory` keeps the zero-count report: that store was
 chosen, so an empty result is an answer.
+
+### Upload checksums
+
+`ravel-cli --store s3` attaches a server-verified checksum to every PUT and
+asks for the stored one back on every read:
+
+- `--s3-upload-integrity` (`RAVEL_S3_UPLOAD_INTEGRITY`): `crc64nvme`, the
+  default, attaches `x-amz-checksum-crc64nvme`; `sha256` attaches
+  `x-amz-checksum-sha256`; `off` attaches none. The endpoint verifies the body
+  against the checksum, rejects a PUT whose bytes do not match, and stores the
+  checksum with the object. An endpoint that does not support the header fails
+  the first write loudly; `off` is the remedy there, and commit records written
+  under it are unverified. With a checksum on, every object goes out as one
+  PUT rather than in parts, so an overwrite above S3's 5 GiB single-request
+  limit is refused (with `off` named as the remedy); no `ravel-cli` write
+  comes near that size.
+- `--s3-request-stored-checksum` (`RAVEL_S3_REQUEST_STORED_CHECKSUM`): on by
+  default, it sends `x-amz-checksum-mode: ENABLED`, so a whole-object read is
+  checked against a returned CRC-64/NVME or CRC-32C checksum before its bytes
+  are used, and a mismatch is an error. A read that comes back with no
+  checksum, or with a SHA-256 one, is served unverified.
+  `--s3-request-stored-checksum=false` stops sending the header, for an
+  endpoint that rejects it.
+
+`ravel-cli store qualify` reports whether the endpoint returns the stored
+checksum; see [qualify the store](deployment.md#qualify-the-store).
 
 ## Storage credential roles
 

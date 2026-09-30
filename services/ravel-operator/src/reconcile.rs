@@ -2310,8 +2310,8 @@ pub const QUALIFY_COMPONENT: &str = "qualify";
 
 /// Annotation on the qualify Job carrying [`qualify_job_input_hash`], so a
 /// change to the inputs qualification proves against (bucket, region, endpoint,
-/// image, credentials Secret name and its resourceVersion) re-runs it and a
-/// no-op reconcile does not.
+/// `allowHttp`, the two checksum settings, image, credentials Secret name and
+/// its resourceVersion) re-runs it and a no-op reconcile does not.
 pub const QUALIFY_SPEC_HASH_ANNOTATION: &str = "ravel.nofire.ai/qualify-spec-hash";
 
 /// `backoffLimit` for the qualify Job: one retry absorbs a transient S3 error
@@ -2353,27 +2353,44 @@ pub const QUALIFY_JOB_TTL_SECONDS: i32 = 3600;
 /// `DeadlineExceeded` before the retry budget ([`QUALIFY_JOB_BACKOFF_LIMIT`])
 /// was ever spent.
 ///
-/// Arithmetic. `ravel-cli store qualify` runs 28 sequential object operations
-/// against the bucket: probe create-if-absent (put, put, get = 3), probe CAS
-/// version (put, put, put, get = 4), probe read-after-write ([`super`]'s
-/// `CONSISTENCY_CYCLES` = 5 put+get = 10), probe list-after-write (5 put+list
-/// = 10), and the final `sys/qualification` create-if-absent write (1); the two
-/// informational probes issue no request through the `ObjectStoreBackend`
-/// contract. Each operation's per-request ceiling is the S3 client's 20 s
-/// `request_timeout` (ravel-object-store `S3HttpConfig::default`), so one
-/// slow-but-healthy attempt whose every operation approaches that ceiling
-/// without retrying is bounded by 28 * 20 s = 560 s. Adding ~140 s per attempt
-/// for pod scheduling and image pull gives a 700 s per-attempt budget. With
-/// `QUALIFY_JOB_BACKOFF_LIMIT` = 1 the Job runs at most two attempts, so the
-/// Job-wide deadline is 2 * 700 s = 1400 s: a slow-but-healthy initial attempt
-/// AND a full retry both complete before it fires. A single hung attempt still
-/// terminates, at the 1400 s Job-wide bound rather than running forever
-/// (a hung endpoint stalls each operation at ~200 s = `retry_timeout` 180 s +
-/// `request_timeout` 20 s).
+/// Arithmetic. The Job runs `ravel-cli store qualify` at its default
+/// `--list-page-size` of 1000, so each listing probe writes 1000 + 2 = 1002
+/// keys and a listing drain costs one request per 1000 keys, plus one more
+/// when the last page is exactly full: a full page carries a continuation
+/// token, and following it returns an empty page. One healthy attempt runs
+/// 2083 sequential operations against the bucket. The conformance suite runs
+/// 2074: create-if-absent (put, put, get = 3), CAS version (put, put, put,
+/// get = 4), read-after-write (5 put+get = 10), list-after-write (5 put+list
+/// = 10), concurrent create-if-absent (8 concurrent puts as 1 round trip, up
+/// to 3 sequential retries for each of the 8 writers = 24, and a get: 26),
+/// listing order (1002 puts, a 2-page `list`, a 2-page `list_after`, and a
+/// `list_after` from the second key whose 1000-key tail fills one page and is
+/// followed by an empty one, 2 pages: 1008), cross-page listing (1002 puts and
+/// a 2-page `list`: 1004), and delete visibility (put, put, delete, get, list,
+/// list_after, delete, list, list_after = 9). After it come the three bucket
+/// control-plane GETs (`?versioning`, `?lifecycle`, `?object-lock` = 3), the
+/// stored-checksum echo probe (put, get, delete = 3), and the
+/// `sys/qualification` record (create-if-absent put, then a get and a CAS put
+/// when an older record is there = 3): 2074 + 3 + 3 + 3 = 2083. Budgeting each
+/// at the S3 client's 20 s `request_timeout` would put one attempt at 41660 s,
+/// a bound that no longer stops a hung Job in useful time, so a
+/// slow-but-healthy operation is budgeted at 500 ms instead, several times a
+/// healthy endpoint's latency: 2083 * 0.5 s = 1041.5 s, rounded up to whole
+/// seconds as 1042 s. Adding 140 s per attempt for pod scheduling and image
+/// pull gives an 1182 s per-attempt budget. With `QUALIFY_JOB_BACKOFF_LIMIT` =
+/// 1 the Job runs at most two attempts, so the Job-wide deadline is 2 * 1182 s
+/// = 2364 s: a slow-but-healthy initial attempt AND a full retry both complete
+/// before it fires as long as each operation stays near the 500 ms budget (at
+/// 1 s per operation one attempt takes about 2223 s and the retry cannot
+/// finish in time). The eight HEADs the store sends after losing
+/// create-if-absent PUTs are not counted; they cost about 4 s of the 140 s
+/// allowance. A hung attempt still terminates, at the 2364 s Job-wide
+/// bound at the latest (a hung endpoint stalls each operation at ~200 s =
+/// `retry_timeout` 180 s + `request_timeout` 20 s).
 ///
 /// Not part of [`qualify_job_input_hash`]: tuning this deadline (or the backoff
 /// limit) must not re-run a qualification that already passed.
-pub const QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS: i64 = 1400;
+pub const QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS: i64 = 2364;
 
 /// `StoreQualified` reason while the qualify Job is being created or is still
 /// running: serving is held until it reports success.
@@ -2398,12 +2415,13 @@ pub const STORE_QUALIFIED_MESSAGE: &str =
 
 /// A deterministic change-detection hash over the inputs store qualification
 /// proves against (issue #36): the bucket, region, endpoint, `allowHttp`,
-/// server image, the credentials Secret NAME, and that credentials Secret's
-/// `resourceVersion`. When any of these changes the store the cluster would
-/// serve on, the credentials it would serve with, or (for `allowHttp`) whether
-/// the qualification can reach that store at all, is different, so
-/// qualification is re-run; an unrelated spec edit (a replica count, a fold
-/// interval) leaves this stable and does not re-qualify.
+/// `uploadIntegrity`, `requestStoredChecksum`, server image, the credentials
+/// Secret NAME, and that credentials Secret's `resourceVersion`. When any of
+/// these changes the store the cluster would serve on, the credentials it
+/// would serve with, or (for `allowHttp` and the two checksum settings)
+/// whether the qualification can reach or write that store at all, is
+/// different, so qualification is re-run; an unrelated spec edit (a replica
+/// count, a fold interval) leaves this stable and does not re-qualify.
 ///
 /// The `resourceVersion` is what makes a fixed-name credential ROTATION
 /// re-qualify (finding, issue #36): rotating the Secret in place keeps its name
@@ -2470,11 +2488,25 @@ pub fn qualify_job_input_hash(
     } else {
         "false"
     };
+    // The two checksum settings are hashed for the same reason as `allowHttp`:
+    // `store qualify` PUTs with the upload checksum and requests the stored
+    // one, so an endpoint that rejects either header fails qualification, and
+    // setting the field to `off`/`false` is the remediation. Excluding them
+    // would leave that edit unqualified and the cluster held. Adding them
+    // re-qualifies every existing cluster once on the upgrade that adds them,
+    // the same cost `allowHttp` accepted.
+    let request_stored_checksum = if spec.storage.s3.request_stored_checksum {
+        "true"
+    } else {
+        "false"
+    };
     blake3_hex(&[
         spec.storage.s3.bucket.as_str(),
         spec.storage.s3.region.as_str(),
         endpoint.as_str(),
         allow_http,
+        spec.storage.s3.upload_integrity.flag_value(),
+        request_stored_checksum,
         spec.image.as_str(),
         spec.storage.s3.credentials_secret_ref.name.as_str(),
         credentials_rv.as_str(),
@@ -2488,9 +2520,10 @@ pub fn qualify_job_input_hash(
 /// so a backend that fails the object-store contract is caught at deploy time
 /// rather than crash-looping every server pod on a fresh bucket. Image and
 /// credentials mirror the server Deployment's shared
-/// `storage.s3.credentialsSecretRef`; the bucket, region, endpoint, and
-/// `allowHttp` reach `ravel-cli` through the same `RAVEL_S3_*` env vars it
-/// reads (clap `env`), the exact shape the kind lane's hand-run Job used.
+/// `storage.s3.credentialsSecretRef`; the bucket, region, endpoint,
+/// `allowHttp`, `uploadIntegrity`, and `requestStoredChecksum` reach
+/// `ravel-cli` through the same `RAVEL_S3_*` env vars it reads (clap `env`),
+/// the exact shape the kind lane's hand-run Job used.
 ///
 /// `allowHttp` IS part of [`qualify_job_input_hash`] (finding 3, issue #1707).
 /// It does not change which store was qualified, but the hash also gates
@@ -2549,6 +2582,22 @@ pub fn desired_qualify_job(
             ..Default::default()
         });
     }
+    // `store qualify` PUTs with the upload checksum and reads back the stored
+    // one, so the Job must carry the servers' settings or it proves a
+    // different client. Always rendered, unlike the server flags: an image
+    // whose `ravel-cli` predates them ignores an unknown env var, and the
+    // explicit value keeps the Job and the servers in agreement even if the
+    // CLI's default were to change.
+    env.push(EnvVar {
+        name: "RAVEL_S3_UPLOAD_INTEGRITY".to_string(),
+        value: Some(spec.storage.s3.upload_integrity.flag_value().to_string()),
+        ..Default::default()
+    });
+    env.push(EnvVar {
+        name: "RAVEL_S3_REQUEST_STORED_CHECKSUM".to_string(),
+        value: Some(spec.storage.s3.request_stored_checksum.to_string()),
+        ..Default::default()
+    });
     // Credentials mirror the server Deployment exactly: sourced from the shared
     // credentials Secret via secretKeyRef, never literal values.
     env.extend(s3_credential_env(spec, None));
@@ -7526,8 +7575,8 @@ mod tests {
         }
     }
 
-    /// The input hash is stable for one spec and changes for each of the six
-    /// inputs it covers, and only those. Pins the exact set of fields that
+    /// The input hash is stable for one spec and changes for each of the
+    /// spec inputs it covers, and only those. Pins the exact set of fields that
     /// re-trigger qualification (issue #36): a change to any of them is a
     /// different store to prove, or (for `allowHttp`, issue #1707) a change to
     /// whether the qualification can run at all; an unrelated change is not.
@@ -7561,6 +7610,11 @@ mod tests {
         // before the Deployments are allowed up.
         let mut allow_http = spec.clone();
         allow_http.storage.s3.allow_http = !spec.storage.s3.allow_http;
+        let mut upload_integrity = spec.clone();
+        upload_integrity.storage.s3.upload_integrity = S3UploadIntegrity::Off;
+        let mut stored_checksum = spec.clone();
+        stored_checksum.storage.s3.request_stored_checksum =
+            !spec.storage.s3.request_stored_checksum;
         for (label, changed) in [
             ("bucket", &bucket),
             ("region", &region),
@@ -7568,6 +7622,8 @@ mod tests {
             ("image", &image),
             ("credentials secret", &creds),
             ("allowHttp", &allow_http),
+            ("uploadIntegrity", &upload_integrity),
+            ("requestStoredChecksum", &stored_checksum),
         ] {
             assert_ne!(
                 base,
@@ -7769,6 +7825,71 @@ mod tests {
         );
     }
 
+    /// `store qualify` PUTs with the upload checksum and requests the stored
+    /// one, so the qualify Job must carry the cluster's `uploadIntegrity` and
+    /// `requestStoredChecksum`, and editing either must re-run it: a cluster
+    /// that sets `uploadIntegrity: off` for an endpoint rejecting the header
+    /// would otherwise stay held on a Job that still sends it. Two CRs that
+    /// differ only in one field hash differently and render Jobs whose env
+    /// carries each CR's value.
+    #[test]
+    fn qualify_job_carries_and_hashes_the_checksum_settings() {
+        let env_of = |spec: &RavelClusterSpec, name: &str| -> Option<String> {
+            desired_qualify_job(spec, "prod", Some("rv-1"))
+                .spec
+                .and_then(|s| s.template.spec)
+                .and_then(|pod| pod.containers[0].env.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .find(|e| e.name == name)
+                .and_then(|e| e.value)
+        };
+
+        let crc = base_spec();
+        assert_eq!(
+            crc.storage.s3.upload_integrity,
+            S3UploadIntegrity::Crc64Nvme
+        );
+        assert!(crc.storage.s3.request_stored_checksum);
+        for (mode, value) in [
+            (S3UploadIntegrity::Off, "off"),
+            (S3UploadIntegrity::Sha256, "sha256"),
+        ] {
+            let mut other = crc.clone();
+            other.storage.s3.upload_integrity = mode;
+            assert_ne!(
+                qualify_job_input_hash(&crc, Some("rv-1")),
+                qualify_job_input_hash(&other, Some("rv-1")),
+                "uploadIntegrity crc64nvme and {value} must hash differently"
+            );
+            assert_eq!(
+                env_of(&crc, "RAVEL_S3_UPLOAD_INTEGRITY").as_deref(),
+                Some("crc64nvme")
+            );
+            assert_eq!(
+                env_of(&other, "RAVEL_S3_UPLOAD_INTEGRITY").as_deref(),
+                Some(value)
+            );
+        }
+
+        let mut unrequested = crc.clone();
+        unrequested.storage.s3.request_stored_checksum = false;
+        assert_ne!(
+            qualify_job_input_hash(&crc, Some("rv-1")),
+            qualify_job_input_hash(&unrequested, Some("rv-1")),
+            "requestStoredChecksum true and false must hash differently"
+        );
+        // "true" and "false" are the only spellings clap's bool parser takes.
+        assert_eq!(
+            env_of(&crc, "RAVEL_S3_REQUEST_STORED_CHECKSUM").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            env_of(&unrequested, "RAVEL_S3_REQUEST_STORED_CHECKSUM").as_deref(),
+            Some("false")
+        );
+    }
+
     /// `qualify_job_phase` reads the Job's terminal condition: `Complete=True`
     /// is success, `Failed=True` carries its message, nothing terminal is still
     /// running.
@@ -7820,20 +7941,28 @@ mod tests {
         );
         // activeDeadlineSeconds is Job-wide (summed across every retry) and takes
         // precedence over backoffLimit, so the deadline must fit the intended
-        // attempts end to end: 700 s per attempt (560 s of ops + ~140 s pod
-        // scheduling/pull) * (backoffLimit + 1) attempts.
+        // attempts end to end: 1182 s per attempt (2083 operations at 500 ms =
+        // 1041.5 s, rounded up to 1042 s, + 140 s pod scheduling/pull) *
+        // (backoffLimit + 1) attempts. The 2083 is derived from, and matches,
+        // the request counts ravel-cli's
+        // `one_attempt_at_the_default_page_size_issues_the_budgeted_requests`
+        // (services/ravel-cli/src/qualify.rs) pins on a fake S3 endpoint; the
+        // two figures are separate literals, so a change to one does not fail
+        // the other's test.
         assert_eq!(
             QUALIFY_JOB_BACKOFF_LIMIT, 1,
             "one retry (two attempts total)"
         );
+        let per_attempt_seconds = (2083 * 500_u64).div_ceil(1000) as i64 + 140;
+        assert_eq!(per_attempt_seconds, 1182);
         assert_eq!(
-            QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS, 1400,
-            "the Job-wide deadline is 1400 s = 700 s per attempt * 2 attempts, so a \
+            QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS, 2364,
+            "the Job-wide deadline is 2364 s = 1182 s per attempt * 2 attempts, so a \
              slow-but-healthy first attempt plus one full retry both fit before it fires"
         );
         assert_eq!(
             QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS,
-            700 * i64::from(QUALIFY_JOB_BACKOFF_LIMIT + 1),
+            per_attempt_seconds * i64::from(QUALIFY_JOB_BACKOFF_LIMIT + 1),
             "the deadline and the backoff limit are sized together"
         );
     }
@@ -7875,15 +8004,15 @@ mod tests {
 
     /// The `activeDeadlineSeconds` and `backoffLimit` are tuning knobs, not
     /// qualified inputs: [`qualify_job_input_hash`] covers exactly the
-    /// bucket, region, endpoint, `allowHttp`, image, credentials Secret name,
-    /// and credentials `resourceVersion`, and never either knob, so tuning them
-    /// leaves the hash equal and does not re-run a qualification that already
-    /// passed.
+    /// bucket, region, endpoint, `allowHttp`, `uploadIntegrity`,
+    /// `requestStoredChecksum`, image, credentials Secret name, and credentials
+    /// `resourceVersion`, and never either knob, so tuning them leaves the hash
+    /// equal and does not re-run a qualification that already passed.
     #[test]
     fn the_deadline_is_not_part_of_the_qualified_input_hash() {
         let spec = base_spec();
 
-        // Recompute the hash over exactly the seven qualified inputs,
+        // Recompute the hash over exactly the nine qualified inputs,
         // deliberately excluding both knobs, through the same `blake3_hex`
         // composition the production hasher uses. If it folded either knob in,
         // this reference would diverge and the assertion would fail.
@@ -7896,12 +8025,19 @@ mod tests {
         } else {
             "false"
         };
+        let request_stored_checksum = if spec.storage.s3.request_stored_checksum {
+            "true"
+        } else {
+            "false"
+        };
         let credentials_rv = format!("\u{1}{}", "rv-1");
         let expected = blake3_hex(&[
             spec.storage.s3.bucket.as_str(),
             spec.storage.s3.region.as_str(),
             endpoint.as_str(),
             allow_http,
+            spec.storage.s3.upload_integrity.flag_value(),
+            request_stored_checksum,
             spec.image.as_str(),
             spec.storage.s3.credentials_secret_ref.name.as_str(),
             credentials_rv.as_str(),
@@ -7910,7 +8046,7 @@ mod tests {
         assert_eq!(
             qualify_job_input_hash(&spec, Some("rv-1")),
             expected,
-            "the qualified-input hash covers exactly the seven qualified inputs, never the \
+            "the qualified-input hash covers exactly the nine qualified inputs, never the \
              deadline or the backoff limit"
         );
     }
@@ -7952,8 +8088,8 @@ mod tests {
         );
     }
 
-    /// Golden value for [`qualify_job_input_hash`] (finding 3): the seven
-    /// qualified inputs of [`base_spec`] plus a fixed credentials
+    /// Golden value for [`qualify_job_input_hash`] (finding 3): the eight
+    /// qualified spec inputs of [`base_spec`] plus a fixed credentials
     /// `resourceVersion` hash to a fixed literal, stable by construction across
     /// Rust releases. The literal changed when the endpoint slot gained a
     /// presence byte (0x01 before a Some value) so endpoint: null and
@@ -7963,12 +8099,16 @@ mod tests {
     /// and again when `allowHttp` joined the hashed set (issue #1707), which
     /// re-qualifies every existing cluster once on that upgrade, and again
     /// when `base_spec`'s endpoint fixture hostname changed (issue #2008),
-    /// which changes the hashed bytes with no change in behavior.
+    /// which changes the hashed bytes with no change in behavior, and again
+    /// when `uploadIntegrity` and `requestStoredChecksum` joined the hashed set
+    /// because `store qualify` now PUTs with the upload checksum and requests
+    /// the stored one. Like the `allowHttp` change, that re-qualifies every
+    /// existing cluster once after the operator upgrade that adds them.
     #[test]
     fn qualify_job_input_hash_golden_is_stable_by_construction() {
         assert_eq!(
             qualify_job_input_hash(&base_spec(), Some("rv-golden")),
-            "fcce62c70486f6f3a53de345da901f44f3b5c5dac0799aa197c80ec1c43423f7",
+            "24d69826f4e13844ba25471e9d505437d20d498de5bfa5de0dc60e08162010d2",
         );
     }
 
@@ -8242,12 +8382,19 @@ mod tests {
         } else {
             "false"
         };
+        let request_stored_checksum = if spec.storage.s3.request_stored_checksum {
+            "true"
+        } else {
+            "false"
+        };
         let credentials_rv = format!("\u{1}{}", "rv");
         let expected = blake3_hex(&[
             spec.storage.s3.bucket.as_str(),
             spec.storage.s3.region.as_str(),
             endpoint.as_str(),
             allow_http,
+            spec.storage.s3.upload_integrity.flag_value(),
+            request_stored_checksum,
             spec.image.as_str(),
             spec.storage.s3.credentials_secret_ref.name.as_str(),
             credentials_rv.as_str(),

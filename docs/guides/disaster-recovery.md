@@ -140,8 +140,10 @@ refuses to start; a backend that cannot disclose its state warns once and
 raises the `ravel_bucket_protection_unknown` gauge; a bucket reporting it
 enabled starts clean. The flag cannot see whether the retention mechanism is
 running, whether every protected object version carries retention, or whether
-a bucket default retention is set; those are verified out of band with the
-commands under "Verification" below. The flag is off by default, so an
+a bucket default retention is set; those are verified out of band, with the
+commands in the "Platform-CLI verification checklist" below (`ravel-cli store
+verify-protection` does not check object retention). The flag is off by
+default, so an
 existing deployment is unchanged until an operator turns it on. Enforcement
 itself stays at the bucket and IAM layer either way: nothing in a Ravel
 process can configure Object Lock.
@@ -273,15 +275,18 @@ service level agreement. This runbook refuses to pick a number for you.
 ## Platform-CLI verification checklist
 
 Ravel cannot enforce most of this and does not pretend to. `ravel-cli store
-qualify` probes whether Object Lock and versioning appear enabled and reports
-whether a lifecycle rule is present, not what the rule says, and
-**replication configuration is invisible to the object-store layer**, so
-verification of the lifecycle values and the replication controls is an
-explicit platform-CLI step and not something Ravel checked. The versioning
+verify-protection` runs the primary-bucket half of this checklist from the
+bucket's own configuration (see "Running the checklist with ravel-cli" below):
+versioning, the lifecycle values including `NoncurrentDays = E_v`, Object Lock
+and delete-marker replication. It does not check per-object retention, the
+replica bucket, the replication destination's account, region and KMS key, or
+RTC; those stay platform-CLI steps. `ravel-cli store qualify` prints the same
+bucket probes as informational lines and never fails on them. The versioning
 and `NoncurrentDays = E_v` lifecycle checks apply at level 0 and level 1
-alike; the replication and replica checks are level 1 only. Run these against
-the actual buckets, and treat a missing row or a differing value as a failed
-check:
+alike; the replication and replica checks are level 1 only. The commands below
+are the manual form of every check, and the only form for the replica. Run
+them against the actual buckets, and treat a missing row or a differing value
+as a failed check:
 
 ```sh
 # Primary: versioning ON
@@ -314,14 +319,23 @@ aws s3api get-bucket-lifecycle-configuration --bucket <replica> \
 # expects none here)
 aws s3api get-object-lock-configuration --bucket <primary>
 
-# The scoped posture, at every level: a recent object under a protected
-# prefix carries per-object retention in compliance mode. Repeat for one
-# object per protected prefix family, and for one noncurrent version (a
-# superseded catalog HEAD is a good candidate): a mechanism fed by a
-# current-version-only inventory leaves noncurrent versions unlocked.
-aws s3api get-object-retention --bucket <primary> --key <recent-protected-key>
-aws s3api list-object-versions --bucket <primary> --prefix <protected-prefix> --max-keys 5
-aws s3api get-object-retention --bucket <primary> --key <protected-key> --version-id <noncurrent-version-id>
+# The scoped posture, at every level: an object your retention mechanism
+# covers carries per-object retention in compliance mode. Pick the object
+# yourself rather than from a listing (a listing returns keys in key order,
+# oldest shards and hours first): one written after the mechanism's last
+# full run but no earlier than its coverage lag (for a scheduled job, its
+# interval plus its inventory delay and run time; for an event-driven
+# function, its reconciliation interval), under each prefix family the
+# mechanism covers and nothing else (under the HEAD-only posture that is
+# t/<tenant-hash>/catalog/<signal>/HEAD, not the snapshot and index objects
+# beside it). Read the version list of that key, then the retention of its
+# current version and of one noncurrent version: a mechanism fed by a
+# current-version-only inventory leaves noncurrent versions unlocked. A
+# lapsed RetainUntilDate means the object was locked and has aged out, not
+# that the mechanism is off.
+aws s3api list-object-versions --bucket <primary> --prefix <exact-key>
+aws s3api get-object-retention --bucket <primary> --key <exact-key> --version-id <current-version-id>
+aws s3api get-object-retention --bucket <primary> --key <exact-key> --version-id <noncurrent-version-id>
 ```
 
 Confirm in the replication output that `DeleteMarkerReplication` is `Enabled`
@@ -330,6 +344,89 @@ region under a different `ReplicaKmsKeyID`, and, if you need a stated RPO,
 that RTC (`ReplicationTime`) is enabled. On an S3-compatible store that
 implements bucket replication, use that store's own replication
 configuration; the mandates above are what it has to satisfy.
+
+### Running the checklist with ravel-cli
+
+`ravel-cli store verify-protection` reads the primary bucket's versioning,
+lifecycle, replication and Object Lock configuration over read-only requests
+signed with the same `--store s3` credentials every other `ravel-cli` command
+uses. Run it at least daily and after any change to the bucket's policy or
+lifecycle rules:
+
+```sh
+ravel-cli --store s3 --s3-bucket <primary> ... store verify-protection \
+  --expected-noncurrent-days <E_v> --expect-replication
+```
+
+- `--expected-noncurrent-days` is required: the `E_v` the noncurrent-version
+  expiration rule covering `t/` must carry.
+- `--expect-replication` makes `delete-marker-replication` count. Pass it at
+  level 1.
+
+`object-retention` is not checked by this command: it is always printed as
+not checked and never moves the exit code, so exit `0` says nothing about
+per-object retention. Check it by hand against the bucket's own retention
+configuration: the retention mechanism you run, or the bucket default
+retention at level 2, and the `get-object-lock-configuration`,
+`list-object-versions` and `get-object-retention` commands in the checklist
+above, with the permissions listed at the end of this section.
+
+It prints one line per condition, the condition's identifier, then `pass`,
+`fail` or `unknown`, then the reason, and a summary line last:
+
+```
+versioning                 pass
+noncurrent-expiration      fail    rule "ravel": NoncurrentDays is 10, expected 30
+expired-delete-marker      pass
+abort-multipart            pass
+rule-scope                 pass
+no-foreign-rule            pass
+delete-marker-replication  unknown not expected, does not affect the exit code: ...
+object-lock                pass
+object-retention           unknown not checked by this command, does not affect the exit code
+verify-protection: FAIL: failed: noncurrent-expiration
+```
+
+| Condition | Passes when |
+|---|---|
+| `versioning` | versioning is `Enabled` |
+| `noncurrent-expiration` | an enabled rule covering `t/` expires noncurrent versions after exactly `E_v` days |
+| `expired-delete-marker` | an enabled rule covering `t/` removes expired delete markers |
+| `abort-multipart` | an enabled rule covering `t/` aborts incomplete multipart uploads within 7 days |
+| `rule-scope` | the rules above cover every `t/` prefix |
+| `no-foreign-rule` | no other expiration or transition rule targets `t/` or `sys/` |
+| `delete-marker-replication` | replication carries `DeleteMarkerReplication` `Enabled` |
+| `object-lock` | Object Lock is enabled on the bucket |
+| `object-retention` | never: not checked by this command, and never moves the exit code |
+
+The exit code is the verdict: `0` only when every expected condition passes,
+`1` when any expected condition fails (the summary names each), and `2` when
+none fails but at least one could not be verified, or the bucket's control
+plane could not be reached at all (the summary names each). `unknown` is never
+`pass`: an access denial, an endpoint with no such API, a response that does
+not parse, and a condition missing from the report all exit `2`, and so does a
+store other than `--store s3`. A condition that is not expected is still
+printed, marked as such, and does not move the exit code. A usage error, such
+as a missing `--expected-noncurrent-days`, also exits `2`, before anything is
+read and without the per-condition lines, and so does a report that could
+not be written to stdout, so a script that treats `2` as "could not verify"
+should also check that a summary line was printed.
+
+A lifecycle rule counts as covering `t/` when its scope is the whole bucket,
+exactly `t/`, or when enabled rules scoped to `t/0` through `t/f`, one per
+lowercase hex digit, each carry the value. Any other split of `t/` cannot be
+proven to cover it and reads `unknown`; restate the rules in one of those
+shapes, or confirm the coverage by hand. A covering rule that also keeps
+`NewerNoncurrentVersions`, covering rules that disagree on `NoncurrentDays`,
+and a rule over part of `t/` that expires noncurrent versions sooner than
+`E_v` each fail `noncurrent-expiration`.
+
+The identity that runs it needs read-only access: `s3:GetBucketVersioning`,
+`s3:GetLifecycleConfiguration`, `s3:GetReplicationConfiguration` and
+`s3:GetBucketObjectLockConfiguration`. It writes nothing. Checking object
+retention by hand with the `get-object-retention` and `list-object-versions`
+commands in the checklist above also needs `s3:GetObjectRetention` and
+`s3:ListBucketVersions`.
 
 ## Restore procedure: the replica is a restore source, never a live failover target
 
@@ -419,7 +516,7 @@ verified operation.
    restored objects: objects restored before the mechanism runs carry no
    retention, so run the backfill and confirm one current and one noncurrent
    version per protected prefix family carries retention, with the commands
-   under "Verification". At level 2 it means the bucket default retention `D`
+   in the platform-CLI verification checklist. At level 2 it means the bucket default retention `D`
    set on the restore bucket before the restore copy, so every restored
    object is locked as it lands. The startup flag checks only the bucket half
    of this; the mechanism, or the default retention, is verified by hand.

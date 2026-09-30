@@ -1791,7 +1791,9 @@ enum SampleVerdict {
 /// Whether one sampled version's retention protects it at `now`: compliance
 /// mode with a `RetainUntilDate` still in the future. A sample drawn from a
 /// listing cut off at the page cap is `Unknown` whichever way its lock reads,
-/// since that sample may not be the family's newest object.
+/// since that sample may not be the family's newest object. A compliance lock
+/// that has lapsed is `Unknown` too: the condition is about a recent object,
+/// and an object whose finite retention has run out is not one.
 fn retention_verdict(
     outcome: &FetchOutcome<RetentionConfig>,
     now_unix_secs: i64,
@@ -1846,7 +1848,10 @@ fn retention_verdict(
             SampleVerdict::Protects
         }
     } else {
-        not_protecting(format!("compliance retention lapsed at {raw}"))
+        SampleVerdict::Unknown(format!(
+            "compliance retention lapsed at {raw}: the sampled object's retention has lapsed, so \
+             it is not a recent object and says nothing about the retention on new writes"
+        ))
     }
 }
 
@@ -1872,7 +1877,7 @@ fn classify_fetch<T>(
 /// The object-retention sampling outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RetentionSample {
-    /// Retention was not sampled (server path, ADR-1727 decision 5).
+    /// Retention was not sampled (every shipping caller today).
     NotSampled,
     /// Every sampled object carried unexpired compliance-mode retention.
     Pass,

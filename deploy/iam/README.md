@@ -268,3 +268,16 @@ Two known gaps are recorded here and are NOT closed by the grants above.
   than in this template, but this template's write grant is what lets the
   write happen on a shipped deployment, so it is recorded here. Tracked in
   issue #1979.
+
+## Bucket-configuration reads: granted by no template
+
+No template here grants the read-only bucket-configuration actions
+`s3:GetBucketVersioning`, `s3:GetLifecycleConfiguration`,
+`s3:GetReplicationConfiguration` and `s3:GetBucketObjectLockConfiguration`,
+which `ravel-cli store verify-protection` and the bucket lines of
+`ravel-cli store qualify` read (and which `ravel-server
+--require-bucket-protection` reads at startup). Under these templates those
+reads are refused, the commands report every bucket condition as unknown, and
+`verify-protection` exits 2. Run them with an identity outside these templates
+that holds those four actions. Whether a shipped role should carry them is
+issue #2230.
