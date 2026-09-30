@@ -1170,8 +1170,8 @@ adapter contract:
    erasure sweep itself deletes only the `.dreq` request objects; the
    rewrite pass supersedes its inputs, and the superseded sweep then
    removes those inputs' commit records like any other superseded chain).
-   A per-object compliance-mode retention `R` on a still-locked commit
-   record does not refuse that delete. The sweep's `DeleteObjects` entry
+   A per-object compliance-mode retention on a still-locked commit record,
+   retained until `R`, does not refuse that delete. The sweep's `DeleteObjects` entry
    carries no version id, so it succeeds and inserts a delete marker: the key reads as
    absent to Ravel from then on, and the sweep moves on exactly as it would
    on an unlocked record. The locked version stays in storage as a
@@ -1180,14 +1180,18 @@ adapter contract:
    it while it is locked, so it is physically removed by a lifecycle run
    once both its retain-until has passed and `E_v` has elapsed since the
    delete: the physical-removal bound for the record is the later of
-   `bound + E_v` and its retain-until (the moment the mechanism locked the
-   version, plus `R`), written `max(bound + E_v, R)` below. That bound
+   `bound + E_v` and its retain-until `R` (a time: the moment the mechanism
+   locked the version plus the retention period it chose), written
+   `max(bound + E_v, R)` below. That bound
    comes from lifecycle expiry and `R`, not from the sweep waiting, and the
    sweep's progress does not depend on `R` at all.
 
    The superseded sweep does tolerate refused deletes, but what refuses
    them is a deny policy or a credential without `s3:DeleteObject`, not
-   Object Lock. S3 reports that refusal per key inside the `DeleteObjects`
+   Object Lock. It is the only maintenance pass that tolerates one per
+   chain: every other pass that deletes, ADR-0019 retention deletion and
+   the unreferenced-catalog sweep among them, fails as a whole on the
+   first refused delete (see "A lock on the catalog family" below). S3 reports that refusal per key inside the `DeleteObjects`
    200 response, as an `<Error>` whose code is `AccessDenied`, and
    `S3Store::delete` returns it as `AccessDenied`, the class the sweep
    tolerates per chain. Every per-key code maps by the HTTP status S3
@@ -1271,23 +1275,31 @@ adapter contract:
    (`crates/ravel-maintain/src/sweep.rs`), and the erased value persists
    with no retention involved at all. Only after the reconcile or the
    rebuild is the stale `.cstat` unreferenced, and only then does a
-   retention `R` on `t/*/catalog/*/*` start to matter. The sweep's delete
-   of it then succeeds as a delete marker, as for a commit record above,
-   so Ravel stops reading it, but the locked version holding the value
-   stays in storage until its retain-until has passed and the
-   noncurrent-version expiration has removed it. The erasure bound for
-   such a tenant is therefore "until the fold reconciles that hour, then
-   the later of `+R` and `+E_v`", not `max(bound + E_v, R)` alone.
+   retention on `t/*/catalog/*/*` start to matter. Even then the sweep does
+   not delete it at once: rule 5 deletes an unreferenced catalog object
+   only once its `last_modified` age exceeds `protection_horizon` (25 h
+   5 min with defaults), so the delete lands at the first sweep after the
+   later of the reconcile and that age, which can be about a day after the
+   reconcile. That delete succeeds as a delete marker, as for a commit
+   record above, so Ravel stops reading it, but the locked version holding
+   the value stays in storage until its retain-until `R` has passed and
+   the noncurrent-version expiration, `E_v` after the delete, has removed
+   it. The erasure bound for such a tenant is therefore
+   `max(max(T_f, T_w + protection_horizon) + S + E_v, R)`, where `T_f` is
+   when the fold reconciles that hour (or HEAD is rebuilt), `T_w` is the
+   stale object's `last_modified`, `S` is one sweep interval (default
+   5 min), and `R` is the locked version's retain-until; it is not
+   `max(bound + E_v, R)`.
 
    An older shipped template made this worse than that bound.
    `deploy/iam/maintain.json`'s `DenyDeleteProtected` statement used to deny
    the Maintain role every delete under `t/*/catalog/*/*`, so the
    unreferenced `.cstat` was not deletable at all, whatever the retention
-   posture was: the bound was open-ended rather than `+R`. The current
-   template's `DenyDeleteProtected` denies only `catalog/<signal>/HEAD`, and
+   posture was: the bound was open-ended rather than the one above. The
+   current template's `DenyDeleteProtected` denies only `catalog/<signal>/HEAD`, and
    `MaintainDelete` grants delete on `catalog/<signal>/snap/*` and
    `catalog/<signal>/idx/*`, matching what
-   `sweep_unreferenced_catalog_objects` actually removes, so the `+R` bound
+   `sweep_unreferenced_catalog_objects` actually removes, so the bound
    above is the one that applies under the current templates. An operator
    running a copy of `maintain.json` shipped before this narrowing must
    re-apply it: until then the sweep still refuses its first catalog delete

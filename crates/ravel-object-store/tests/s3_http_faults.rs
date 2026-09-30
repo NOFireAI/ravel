@@ -239,6 +239,9 @@ struct Seen {
     /// on the wire. Ravel's own reads never send it; an external pinned read
     /// does when the grant recorded a version.
     version_id: Option<String>,
+    /// The raw request body of a `DeleteObjects` request, which is where its
+    /// keys and any `VersionId` go. `None` for every other operation.
+    delete_body: Option<String>,
 }
 
 impl Seen {
@@ -289,6 +292,7 @@ impl FakeState {
         fault: Option<Fault>,
         headers: &HeaderMap,
         query: &HashMap<String, String>,
+        body: &[u8],
     ) {
         self.log.lock().push(Seen {
             op,
@@ -307,6 +311,8 @@ impl FakeState {
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string),
             version_id: query.get("versionId").cloned(),
+            delete_body: (op == Op::DeleteObjects)
+                .then(|| String::from_utf8_lossy(body).into_owned()),
         });
     }
 }
@@ -575,6 +581,15 @@ fn delete_objects_keys(body: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// The inner text of every `<Object>` element a `DeleteObjects` body carries,
+/// in request order.
+fn delete_objects_entries(body: &str) -> Vec<&str> {
+    body.split("<Object>")
+        .skip(1)
+        .filter_map(|rest| rest.split_once("</Object>").map(|(entry, _)| entry))
+        .collect()
+}
+
 /// A 200 `DeleteResult` carrying `entries` (`<Deleted>` and `<Error>`
 /// elements), the shape S3 answers every `DeleteObjects` request with.
 fn delete_result(entries: &str) -> Response {
@@ -720,7 +735,7 @@ async fn handle(
     };
 
     let fault = state.take_fault(op);
-    state.record(op, &key, fault, &headers, &query);
+    state.record(op, &key, fault, &headers, &query, &data);
     if has_unsigned_amz_header(&headers) {
         return error_response(
             StatusCode::FORBIDDEN,
@@ -1607,11 +1622,23 @@ async fn a_delete_is_one_delete_objects_request_with_no_version_id() {
         1,
         "one delete must be one DeleteObjects request"
     );
+    let body = bulk[0]
+        .delete_body
+        .as_deref()
+        .expect("a DeleteObjects request records its body");
     assert_eq!(
-        bulk[0].key, "fault/deleted",
-        "the body must name only the key"
+        delete_objects_entries(body),
+        ["<Key>fault/deleted</Key>"],
+        "the body must carry exactly one Object element naming only the key: {body}"
     );
-    assert_eq!(bulk[0].version_id, None, "a delete must carry no versionId");
+    assert!(
+        !body.contains("<VersionId>"),
+        "a delete must carry no VersionId element: {body}"
+    );
+    assert_eq!(
+        bulk[0].version_id, None,
+        "a delete must carry no versionId query parameter"
+    );
     assert_eq!(fake.count(Op::Delete), 0, "no path DELETE may be sent");
     assert_eq!(fake.object("fault/deleted"), None);
 }

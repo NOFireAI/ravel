@@ -808,20 +808,23 @@ into them. An operator with erasure obligations must budget them deliberately.
   operators with erasure obligations to prefer scoped legal holds over
   blanket default retention, or to keep `D` inside their erasure SLA.
 
-- **`+R`, scoped per-object compliance retention on commit records
+- **`R`, scoped per-object compliance retention on commit records
   (`t/*/*/c/*`).** Under the scoped posture (bucket default retention OFF,
   an operator-run mechanism applying per-object retention instead;
   docs/object-store-contract.md "Required bucket configuration", ADR-0072
-  decision 3), a superseded commit record still under its retention period
-  `R` behaves as `+D` describes: the sweep's delete succeeds as a delete
-  marker, the chain's collection carries on as if the record were unlocked,
-  and the locked version is physically removed at `max(bound + E_v, R)`,
-  the later of `bound + E_v` and the version's retain-until (lock time plus
-  `R`).
+  decision 3), a superseded commit record still locked, with retain-until
+  `R` (a time: the moment the mechanism locked it plus the retention period
+  it chose), behaves as `+D` describes: the sweep's delete succeeds as a
+  delete marker, the chain's collection carries on as if the record were
+  unlocked, and the locked version is physically removed at
+  `max(bound + E_v, R)`, the later of `bound + E_v` and `R`.
 
   The refusal path `sweep_superseded` tolerates per chain is reached by a
   deny policy or a credential without `s3:DeleteObject`, not by Object
-  Lock. S3 reports that refusal per key inside the `DeleteObjects` 200
+  Lock. It is the only maintenance pass that tolerates a refusal per chain:
+  every other pass that deletes, ADR-0019 retention deletion and the
+  unreferenced-catalog sweep among them, fails as a whole on the first
+  refused delete. S3 reports that refusal per key inside the `DeleteObjects` 200
   response, and `S3Store::delete` maps a per-key `AccessDenied` (and every
   other 403 code) to `StoreError::AccessDenied` and a per-key
   `PreconditionFailed` to `StoreError::PreconditionFailed`, so it reaches
@@ -855,11 +858,11 @@ into them. An operator with erasure obligations must budget them deliberately.
   of supersession GC, ADR-0019 retention deletion, or ADR-0064 erasure.
   That is a statement about those three mechanisms and nothing wider: the
   catalog family is swept by a fourth one, the unreferenced-catalog sweep,
-  which carries its own `+R` erasure bound for some tenants (below). The
+  which carries its own erasure bound under `R` for some tenants (below). The
   sweep's progress on superseded chains does not depend on `R`, since
   Object Lock refuses none of its deletes.
 
-- **`+R` again, scoped per-object compliance retention on the catalog
+- **`R` again, scoped per-object compliance retention on the catalog
   keyspace (`t/*/catalog/*/*`).** A compliance lock on this keyspace
   costs an erasure obligation, not only reclamation. The unreferenced-catalog
   sweep deletes the snapshot and index objects the current HEAD no longer
@@ -867,11 +870,20 @@ into them. An operator with erasure obligations must budget them deliberately.
   per-part `.cstat` index object among them holds that subject's own column
   value. A lock over the keyspace does not delay that delete, which
   succeeds as a delete marker as under `+D`, but the locked version holding
-  the value stays in storage: the erased value persists until the fold
-  reconciles the hour and then the later of a further `R` and `E_v`. The
+  the value stays in storage. The sweep deletes the stale `.cstat` only
+  once the fold has reconciled the hour (or HEAD is rebuilt) and the
+  object's `last_modified` age exceeds `protection_horizon` (25 h 5 min
+  with defaults), and the locked version then stays until its retain-until
+  `R` has passed and noncurrent-version expiry has fired `E_v` after the
+  delete: the erased value persists until
+  `max(max(T_f, T_w + protection_horizon) + S + E_v, R)`, where `T_f` is
+  when the fold reconciles that hour (or HEAD is rebuilt), `T_w` is the
+  stale object's `last_modified`, `S` is one sweep interval (default
+  5 min), and `R` is the locked version's retain-until. The
   shipped Maintain IAM policy permits that delete, with its catalog deny
   scoped to `catalog/<signal>/HEAD`; a copy of that template predating the
-  narrowing denies it outright and leaves the bound open-ended until it is
+  narrowing denies it outright, which fails the whole `(tenant, signal)`
+  pass of that sweep every tick and leaves the bound open-ended until it is
   re-applied. The four-step mechanism,
   the exact bound, the IAM ceiling, and the HEAD-scoping advice are in
   docs/object-store-contract.md's "Required bucket configuration" section,
@@ -938,7 +950,7 @@ into them. An operator with erasure obligations must budget them deliberately.
     `I64` and `BOOL` extrema (proto/ravel/commit.proto,
     `DeclaredColumnStatValue`), which cannot represent a `STR` or `BYTES`
     value either. The per-part `.cstat` column-statistics objects are the
-    exception the `+R` modifier above sets out: for a tenant with a `STR` or
+    exception the catalog-keyspace `R` modifier above sets out: for a tenant with a `STR` or
     `BYTES` typed attribute column they hold that column's exact min, max,
     and distinct-value dictionary (the dictionary only up to a fixed entry
     cap; the min and max always), so an erased subject's own value can sit

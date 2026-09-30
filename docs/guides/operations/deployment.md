@@ -115,7 +115,7 @@ three. Commit records are not exempt even that far: a maintenance sweep
 deletes a superseded commit record. Object Lock does not refuse that delete:
 Ravel's delete names no version, so on the versioned bucket Object Lock
 requires it succeeds and inserts a delete marker, and the sweep carries on.
-The locked version stays in storage until its retention period has passed and
+The locked version stays in storage until its retain-until has passed and
 the noncurrent-version expiration rule removes it, so the retention period
 chosen for commit records bounds how long their bytes physically remain, not
 how long the sweep waits; the contract page's "Required bucket configuration"
@@ -128,9 +128,10 @@ deletes the snapshot and index objects the current HEAD no longer names, and
 for a tenant that declares a typed string or bytes attribute column a per-part
 column-statistics object among them holds that subject's own column value. A
 lock over the keyspace does not delay that delete, which succeeds as a delete
-marker, but the locked version keeps the value in storage: it persists until
-the fold reconciles that hour and then until the retention period and the
-noncurrent-version expiration have both passed. The maintenance
+marker, but the locked version keeps the value in storage: the sweep deletes
+the object only once the fold has reconciled that hour and the object is older
+than `protection_horizon`, and the value then persists until its retain-until
+has passed and the noncurrent-version expiration has fired. The maintenance
 IAM policy Ravel ships permits that delete, with its catalog deny scoped to
 `catalog/<signal>/HEAD`; a copy of that template predating the narrowing
 denies it outright and leaves the bound open-ended until it is re-applied.
