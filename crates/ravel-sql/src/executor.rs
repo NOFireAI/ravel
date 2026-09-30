@@ -125,7 +125,10 @@ use crate::logs_provider::LogsTableProvider;
 use crate::logs_pushdown::extract_logs;
 use crate::memory::{CeilingBreach, TenantMemoryAccountant};
 use crate::output::QueryOutput;
-use crate::parquet::{self, ParquetQueryError, ParquetResolution, ParquetSession, ParquetSources};
+use crate::parquet::{
+    self, MAX_STATEMENT_TABLE_NAMES, ParquetQueryError, ParquetResolution, ParquetSession,
+    ParquetSources,
+};
 use crate::provider::RavelTableProvider;
 use crate::pushdown::extract;
 use crate::session::{
@@ -2172,8 +2175,9 @@ impl SqlExecutor {
     /// - A signal table beside a name that has Parquet manifest versions is
     ///   [`SqlError::CrossSignalQuery`].
     /// - With no credential profiles configured, a name with manifest versions
-    ///   is [`ParquetQueryError::NotConfigured`], from one LIST per name and no
-    ///   GET.
+    ///   is [`ParquetQueryError::NotConfigured`].
+    /// - In both cases above the names are listed in order and the first one
+    ///   with versions decides: one LIST per name up to it and no GET.
     /// - Otherwise each name's newest live manifest, checked against the
     ///   tenant's current grants; `None` when no name is a live Parquet table,
     ///   so the statement then plans, and fails, as a statement naming an
@@ -2201,10 +2205,16 @@ impl SqlExecutor {
         }
         let accounting = phase_accounting.resolve();
         if tables.signal.is_some() || !sources.is_configured() {
-            let named =
-                parquet::names_with_versions(sources, &tenant_hash, &tables.others, accounting)
-                    .await?;
-            return match named.into_iter().next() {
+            // The first name with versions decides the outcome, so the
+            // resolve stops there rather than listing every name.
+            let named = parquet::first_name_with_versions(
+                sources,
+                &tenant_hash,
+                &tables.others,
+                accounting,
+            )
+            .await?;
+            return match named {
                 Some(_) if tables.signal.is_some() => Err(SqlError::CrossSignalQuery),
                 Some(table) => Err(ParquetQueryError::NotConfigured { table }.into()),
                 None => Ok(None),
@@ -2663,7 +2673,10 @@ impl SqlExecutor {
     }
 
     /// The base tables `sql` names: the one signal table, if any, and every
-    /// other name. Two signal tables are [`SqlError::CrossSignalQuery`].
+    /// other name. Two signal tables are [`SqlError::CrossSignalQuery`], and
+    /// more than [`MAX_STATEMENT_TABLE_NAMES`] other names are
+    /// [`SqlError::TooManyTables`], so the Parquet resolve's one LIST per
+    /// name is bounded before it starts.
     fn statement_tables(sql: &str) -> Result<StatementTables, SqlError> {
         let mut tables = referenced_base_tables(sql)?;
         let has_samples = tables.remove(SAMPLES_TABLE);
@@ -2680,6 +2693,12 @@ impl SqlExecutor {
             + u8::from(has_audit);
         if named > 1 {
             return Err(SqlError::CrossSignalQuery);
+        }
+        if tables.len() > MAX_STATEMENT_TABLE_NAMES {
+            return Err(SqlError::TooManyTables {
+                count: tables.len(),
+                max: MAX_STATEMENT_TABLE_NAMES,
+            });
         }
         let signal = if has_logs {
             Some(TargetSignal::Logs)

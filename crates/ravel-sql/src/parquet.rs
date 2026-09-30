@@ -48,6 +48,16 @@ use crate::error::{ErrorClass, MSG_CORRUPT, MSG_PLAN, MSG_UNAVAILABLE};
 /// not choose a bound.
 pub const DEFAULT_PARQUET_METADATA_CACHE_BYTES: u64 = 64 << 20;
 
+/// The most distinct base tables other than the five signal tables one
+/// statement may name ([`crate::SqlError::TooManyTables`] past it).
+///
+/// Whether such a name is a Parquet table is a fact about the store, so each
+/// one can cost a LIST of its manifest prefix, issued one after another before
+/// the statement plans. This bound caps those LISTs per statement. Sixteen
+/// clears every join a dashboard or report realistically writes, while the
+/// statement complexity guard alone would admit several hundred names.
+pub const MAX_STATEMENT_TABLE_NAMES: usize = 16;
+
 /// Why opening the store behind one (profile, bucket) failed.
 #[derive(Debug, thiserror::Error)]
 pub enum ExternalStoreError {
@@ -594,16 +604,16 @@ impl ParquetQueryError {
     }
 }
 
-/// Every name in `names` that has at least one manifest version for `tenant`,
-/// from one LIST per valid table name and no GET.
-pub(crate) async fn names_with_versions(
+/// The first name in `names` that has at least one manifest version for
+/// `tenant`, from one LIST per valid table name up to and including it and no
+/// GET.
+pub(crate) async fn first_name_with_versions(
     sources: &ParquetSources,
     tenant: &TenantHash,
     names: &BTreeSet<String>,
     accounting: &QueryAccounting,
-) -> Result<Vec<String>, ParquetQueryError> {
+) -> Result<Option<String>, ParquetQueryError> {
     let store = sources.resolve_store(accounting);
-    let mut found = Vec::new();
     for name in names {
         if validate_table(name).is_err() {
             continue;
@@ -615,10 +625,10 @@ pub(crate) async fn names_with_versions(
                 source,
             })?;
         if !versions.is_empty() {
-            found.push(name.clone());
+            return Ok(Some(name.clone()));
         }
     }
-    Ok(found)
+    Ok(None)
 }
 
 /// Resolve the Parquet tables among `names`: the newest live manifest of each,
