@@ -517,9 +517,14 @@ verified operation.
    installed (a promoted replica still carries `E_v_r`; replace it), the
    `AbortIncompleteMultipartUpload` rule of seven days or less, and Object
    Lock enabled. Without the lifecycle rules the erasure bound does not hold
-   for anything written from this point, and a server started with
+   for anything written from this point. A server started with
    `--require-bucket-protection` refuses a bucket without Object Lock or the
-   multipart-abort rule. At levels 0 and 1 that
+   multipart-abort rule only when its identity can read the bucket's
+   versioning, lifecycle and Object Lock configuration. No template under
+   `deploy/iam/` grants those reads, so under a shipped template the check
+   reads every condition unknown, warns and starts: grant the three reads to
+   the restore bucket's server role, or verify the bucket with `ravel-cli
+   store verify-protection` before the first start. At levels 0 and 1 that
    also means no default retention and the
    retention mechanism pointed at the restore bucket and backfilled over the
    restored objects: objects restored before the mechanism runs carry no

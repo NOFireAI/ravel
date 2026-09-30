@@ -1242,7 +1242,7 @@ is off.
 | Metric | Meaning |
 |---|---|
 | `ravel_bucket_protection_conditions_failed` | Gauge. Bucket-protection conditions the startup check observed failed. A failure outside the refusing set (see [Deployment](operations/deployment.md#bucket-protection-at-startup)) starts the process with a warning and counts here. |
-| `ravel_bucket_protection_conditions_unknown` | Gauge. Bucket-protection conditions the startup check could not determine: no API for the call, an access denial, a response it could not parse, or a read that did not finish within 20 seconds. |
+| `ravel_bucket_protection_conditions_unknown` | Gauge. Bucket-protection conditions the startup check could not determine: no API for the call, an access denial, a response it could not parse, or a bucket-configuration read that did not finish within 15 seconds. |
 | `ravel_bucket_protection_unknown` | Gauge. `1` whenever `ravel_bucket_protection_conditions_unknown` is nonzero, else `0`. |
 
 The startup check counts the seven conditions it evaluates: `versioning`,
@@ -1254,7 +1254,7 @@ check reads the bucket's configuration with three read-only GETs, counted in
 the control-plane counters above. On every other backend it cannot read the
 configuration at all, so all seven conditions count as unknown and
 `ravel_bucket_protection_unknown` reads `1`. The same happens on S3 when the
-read has not finished within 20 seconds, or when the process's identity lacks
+bucket-configuration read has not finished within 15 seconds, or when the process's identity lacks
 the three read permissions, which no shipped IAM template grants (see
 [Deployment](operations/deployment.md#bucket-protection-at-startup)).
 

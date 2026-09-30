@@ -1350,10 +1350,14 @@ and `object-lock`. It never asks for `delete-marker-replication` or
 - Every other failed condition (`versioning`, `expired-delete-marker`,
   `rule-scope`, or `noncurrent-expiration` on an unversioned bucket) logs one
   warning and starts.
-- Every `Unknown` condition logs one warning and starts. The whole read is
-  bounded to 20 seconds, shorter than the Kubernetes operator's liveness
-  probe; a read that has not finished by then leaves every condition
-  `Unknown`.
+- Every `Unknown` condition logs one warning and starts. The
+  bucket-configuration read is bounded to 15 seconds, which leaves at least 10
+  seconds before the Kubernetes operator's liveness probe can first restart
+  the pod (about 25 seconds after it starts); a read that has not finished by
+  then leaves every condition `Unknown`. The bound covers that read only: the
+  `sys/qualification` read that runs before it is bounded by the store's own
+  request timeout and retries, so an endpoint that stalls every request holds
+  startup there first.
 - Three gauges carry the result: `ravel_bucket_protection_conditions_failed`
   and `ravel_bucket_protection_conditions_unknown` count the seven checked
   conditions observed `Fail` and `Unknown`, and

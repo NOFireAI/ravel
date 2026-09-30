@@ -538,9 +538,11 @@ pub struct Cli {
     /// a failing noncurrent expiration (no covering rule, a covering rule that
     /// keeps NewerNoncurrentVersions, covering rules that disagree on
     /// NoncurrentDays, or a narrower rule that expires sooner) refuses to
-    /// start; any other failed or undetermined condition, and a read that has
-    /// not finished within 20 s, warns and sets the
-    /// `ravel_bucket_protection_*` gauges.
+    /// start; any other failed or undetermined condition, and a
+    /// bucket-configuration read that has not finished within 15 s, warns and
+    /// sets the `ravel_bucket_protection_*` gauges. The 15 s bound covers that
+    /// read only: the `sys/qualification` read before it is bounded by the
+    /// store's own request timeout and retries.
     /// Default off: with the flag unset, startup is byte-identical to before
     /// this gate existed. Enforcement itself stays at the bucket/IAM layer
     /// (ADR-0042 decision 3); this only makes a silently-unprotected

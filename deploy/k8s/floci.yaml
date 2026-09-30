@@ -233,9 +233,19 @@ spec:
                 echo "bucket ${BUCKET} does not have versioning enabled" >&2
                 exit 1
               fi
-              if ! curl -fsS "${ENDPOINT}/${BUCKET}?lifecycle" |
+              lifecycle="$(curl -fsS "${ENDPOINT}/${BUCKET}?lifecycle")"
+              if ! printf '%s\n' "$lifecycle" |
                 grep -q '<DaysAfterInitiation>7</DaysAfterInitiation>'; then
                 echo "bucket ${BUCKET} does not carry the multipart-abort rule" >&2
+                exit 1
+              fi
+              if ! printf '%s\n' "$lifecycle" | grep -q '<NoncurrentDays>1</NoncurrentDays>'; then
+                echo "bucket ${BUCKET} does not carry the noncurrent-expiration rule" >&2
+                exit 1
+              fi
+              if ! printf '%s\n' "$lifecycle" |
+                grep -q '<ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker>'; then
+                echo "bucket ${BUCKET} does not carry the expired-delete-marker rule" >&2
                 exit 1
               fi
               echo "bucket ${BUCKET} ready: Object Lock, versioning and lifecycle rules set"

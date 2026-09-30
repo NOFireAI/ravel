@@ -181,10 +181,17 @@ per tenant. Each condition comes back passed, failed or unknown:
 - An unknown condition logs one warning and starts. On every backend other
   than S3 the check cannot read the configuration, so every condition is
   unknown.
-- The whole read is bounded to 20 seconds, so a stalled endpoint cannot hold
-  startup past the Kubernetes operator's liveness probe (about 35 seconds).
-  A read that has not finished by then leaves every condition unknown, which
-  warns and starts.
+- The bucket-configuration read is bounded to 15 seconds. The Kubernetes
+  operator's liveness probe restarts a pod on its third consecutive failure,
+  between about 25 and 35 seconds after the pod starts, so the bound leaves at
+  least 10 seconds for the rest of startup. A read that has not finished by
+  then leaves every condition unknown, which warns and starts.
+- The bound covers the bucket-configuration read only. The
+  `sys/qualification` read runs before it, on the store's ordinary retrying
+  path, and is bounded only by the store's own request timeout and retries. An
+  endpoint that stalls every request holds startup at that read, where the
+  liveness probe can restart the pod; the bound helps when only the three
+  configuration GETs stall.
 - `delete-marker-replication` and `object-retention` are not checked at
   startup. `ravel-cli store verify-protection` checks the first; no Ravel
   command checks object retention yet, so verify it by hand as the disaster
