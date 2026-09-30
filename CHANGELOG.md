@@ -1299,9 +1299,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   naming a Parquet table fails with `NotConfigured` (HTTP 422). A Parquet
   table beside a signal table is `CrossSignalQuery`; another tenant's table, a
   dropped table and any other unknown name fail to plan as an unknown table
-  always has. Only a Parquet session's registry resolves a store, its own
-  tenant's `ravel-pq://` URL, and a statement naming a table function or a
-  URL-shaped table is refused before any store read. The reader evaluates
+  always has. Each such name costs one LIST of its manifest prefix, so a
+  statement naming more than 16 distinct tables besides the five signal tables
+  (`MAX_STATEMENT_TABLE_NAMES`) fails with `TooManyTables` (HTTP 400) before
+  any manifest is listed. Only a Parquet session's registry resolves a store,
+  its own tenant's `ravel-pq://` URL, and a statement naming a table function
+  or a URL-shaped table is refused before any store read. The reader evaluates
   filters in the scan; an exact-typed statement scans in up to
   `target_partitions` file groups with file-scan repartitioning on, any other
   in one group in manifest order. The reader does not use a file's page

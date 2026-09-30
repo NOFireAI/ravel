@@ -32,9 +32,9 @@ use ravel_pqtable::manifest::ParquetFile;
 use ravel_pqtable::writer::{self, Intent};
 use ravel_query::{GetLimiter, LogSegmentFetcher, QueryPhase, SegmentFetcher};
 use ravel_sql::{
-    DEFAULT_PARQUET_METADATA_CACHE_BYTES, ErrorClass, ExternalStoreMap, MSG_PLAN,
-    ParquetQueryError, ParquetSources, SpanSegmentFetcher, SqlConfig, SqlError, SqlExecutor,
-    SqlOutcome, TargetSignal,
+    DEFAULT_PARQUET_METADATA_CACHE_BYTES, ErrorClass, ExternalStoreMap, MAX_STATEMENT_TABLE_NAMES,
+    MSG_PLAN, ParquetQueryError, ParquetSources, SpanSegmentFetcher, SqlConfig, SqlError,
+    SqlExecutor, SqlOutcome, TargetSignal,
 };
 use ravel_types::accounting::AccountedOp;
 use ravel_types::{TenantHash, TenantId};
@@ -782,6 +782,114 @@ async fn two_parquet_tables_join() {
         .await
         .expect("join");
     assert_eq!(rows(&outcome), vec!["1|first", "5|fifth"]);
+}
+
+/// `count` distinct table names that sort after `hits` and are no table.
+fn unknown_names(count: usize) -> Vec<String> {
+    (0..count).map(|i| format!("u{i:02}")).collect()
+}
+
+/// The (Ravel GET, Ravel LIST, lake GET) counts.
+fn reads(lake: &Lake) -> (u64, u64, u64) {
+    (
+        Lake::gets(&lake.ravel),
+        Lake::lists(&lake.ravel),
+        Lake::gets(&lake.lake),
+    )
+}
+
+/// One name past the cap fails from the statement text with its own 400,
+/// before a single LIST or GET reaches either store.
+#[tokio::test]
+async fn a_statement_naming_one_table_too_many_reads_nothing() {
+    let lake = Lake::configured();
+    let acme = tenant("acme");
+    lake.hits_for(&acme).await;
+    let before = reads(&lake);
+
+    let names = unknown_names(MAX_STATEMENT_TABLE_NAMES + 1);
+    let sql = format!("SELECT 1 FROM {}", names.join(", "));
+    let err = lake
+        .execute(&acme, &sql)
+        .await
+        .expect_err("too many tables");
+    assert!(
+        matches!(
+            err,
+            SqlError::TooManyTables { count, max }
+                if count == MAX_STATEMENT_TABLE_NAMES + 1 && max == MAX_STATEMENT_TABLE_NAMES
+        ),
+        "{err}"
+    );
+    assert_eq!(err.class(), ErrorClass::BadRequest);
+    assert_eq!(reads(&lake), before, "no LIST or GET on either store");
+}
+
+/// Exactly the cap still resolves: each name costs one manifest LIST and the
+/// statement then fails as an unknown table. The catalog resolve an unknown
+/// name falls through to is measured on its own, from a statement naming no
+/// table, and subtracted.
+#[tokio::test]
+async fn a_statement_naming_the_cap_is_an_unknown_table_after_one_list_each() {
+    let lake = Lake::configured();
+    let acme = tenant("acme");
+    lake.hits_for(&acme).await;
+
+    let before = Lake::lists(&lake.ravel);
+    lake.execute(&acme, "SELECT 1").await.expect("no table");
+    let catalog_lists = Lake::lists(&lake.ravel) - before;
+
+    let names = unknown_names(MAX_STATEMENT_TABLE_NAMES);
+    let sql = format!("SELECT 1 FROM {}", names.join(", "));
+    let before = Lake::lists(&lake.ravel);
+    unknown_table_error(&lake, &acme, &sql).await;
+    assert_eq!(
+        Lake::lists(&lake.ravel) - before - catalog_lists,
+        MAX_STATEMENT_TABLE_NAMES as u64,
+        "one manifest LIST per name"
+    );
+}
+
+/// With a signal table present, the first name with manifest versions decides
+/// `CrossSignalQuery`: the unknown names after it are never listed.
+#[tokio::test]
+async fn samples_beside_a_parquet_table_stops_at_the_first_found_name() {
+    let lake = Lake::configured();
+    let acme = tenant("acme");
+    lake.hits_for(&acme).await;
+    let before = reads(&lake);
+
+    let names = unknown_names(MAX_STATEMENT_TABLE_NAMES - 1);
+    let sql = format!("SELECT 1 FROM samples, hits, {}", names.join(", "));
+    let err = lake.execute(&acme, &sql).await.expect_err("cross signal");
+    assert!(matches!(err, SqlError::CrossSignalQuery), "{err}");
+    let (ravel_gets, ravel_lists, lake_gets) = reads(&lake);
+    assert_eq!(ravel_lists - before.1, 1, "one LIST, of hits's versions");
+    assert_eq!((ravel_gets, lake_gets), (before.0, before.2), "no GET");
+}
+
+/// Without a profile file, the first name with manifest versions decides
+/// `NotConfigured`: the unknown names after it are never listed.
+#[tokio::test]
+async fn not_configured_stops_at_the_first_found_name() {
+    let lake = Lake::new(false, SqlConfig::default());
+    let acme = tenant("acme");
+    lake.hits_for(&acme).await;
+    let before = reads(&lake);
+
+    let names = unknown_names(MAX_STATEMENT_TABLE_NAMES - 1);
+    let sql = format!("SELECT 1 FROM hits, {}", names.join(", "));
+    let err = lake.execute(&acme, &sql).await.expect_err("no profiles");
+    assert!(
+        matches!(
+            parquet_error(&err),
+            Some(ParquetQueryError::NotConfigured { table }) if table == "hits"
+        ),
+        "{err}"
+    );
+    let (ravel_gets, ravel_lists, lake_gets) = reads(&lake);
+    assert_eq!(ravel_lists - before.1, 1, "one LIST, of hits's versions");
+    assert_eq!((ravel_gets, lake_gets), (before.0, before.2), "no GET");
 }
 
 /// A row window names an event-time column, which a Parquet table has none
