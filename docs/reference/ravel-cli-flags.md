@@ -25,8 +25,10 @@ RAVEL_UPDATE_CLI_REFERENCE=1 cargo test -p ravel-cli
 | `--s3-endpoint` | `RAVEL_S3_ENDPOINT` |  |  |
 | `--s3-instance-metadata-endpoint` | `RAVEL_S3_INSTANCE_METADATA_ENDPOINT` |  | Base URL of the EC2 instance metadata service, used only under `--s3-auth instance-role` (ADR-0106). Unset uses the AWS link-local address; a value redirects IMDS for tests and unusual deployments |
 | `--s3-region` | `RAVEL_S3_REGION` |  |  |
+| `--s3-request-stored-checksum` | `RAVEL_S3_REQUEST_STORED_CHECKSUM` | `true` | Ask the endpoint to return the checksum it stored at upload (`x-amz-checksum-mode: ENABLED`), so a whole-object read is verified against it before the bytes are used. On by default; pass `--s3-request-stored-checksum=false` for an endpoint that rejects the header, and every whole-object read is then served unverified. Same flag, default, and env var as ravel-server's |
 | `--s3-secret-key` | `RAVEL_S3_SECRET_KEY` |  |  |
 | `--s3-session-token` | `RAVEL_S3_SESSION_TOKEN` |  | Temporary AWS session token paired with `--s3-access-key` / `--s3-secret-key` for STS-issued credentials (ADR-0072 decision 1). Ignored when `--s3-credentials-file` is set: the file wins. Only meaningful under `--s3-auth static` |
+| `--s3-upload-integrity` | `RAVEL_S3_UPLOAD_INTEGRITY` | `crc64nvme` | Server-verified checksum every `--store s3` PUT carries. `crc64nvme` (the default) attaches `x-amz-checksum-crc64nvme` and `sha256` attaches `x-amz-checksum-sha256`: the endpoint verifies the body against it, rejects a PUT whose bytes do not match, and stores the checksum with the object. `off` attaches none. An endpoint that does not support the header fails the first write; `off` is the remedy there, at the cost of unverified commit records. Same flag, values, default, and env var as ravel-server's |
 | `--store` |  |  | Which object store to run against. Unset means `memory`, the empty in-process store: a walk-shaped command over tenant data then reports `store: memory (default)` in its header, and refuses a walk that reaches no data at all rather than reporting zero counters at exit 0. An explicit `--store memory` keeps that zero-count report |
 | `--tenant-hash-key-file` |  |  | Path to the bucket's 32-byte deployment key (64 hex characters or 32 raw bytes), needed to address a v2-keyed bucket's tenant prefixes |
 | `--tenant-hash-unkeyed` |  |  | Assert the bucket is v1-unkeyed. An unkeyed or absent marker resolves to v1 without this, but it makes the expectation explicit; mutually exclusive with --tenant-hash-key-file |
@@ -281,6 +283,16 @@ Run the conformance suite against the configured backend and, on a pass, record 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
 | `--list-page-size` |  | `1000` | List page size to build the store with and declare to the conformance suite's listing probes. Defaults to the production S3 page size, so a default run proves a real continuation-token boundary is crossed; must match the store this command builds, so the cross-page probe judges a real pagination boundary rather than a mismatched, meaningless one. The upper bound is the number of objects a run would write: each listing probe puts the page size plus two scratch objects into the bucket, so a page size beyond a million is a typo that would fill a bucket, not a page size any backend serves |
+
+### store verify-protection
+
+Read the bucket's protection configuration and check it against the deployment's expectations: one line per condition, then a summary. Exits 0 only when every expected condition passes, 1 when any fails, and 2 when any could not be verified or the bucket's control plane could not be reached. A usage error (a missing or malformed flag) also exits 2, before anything is read. Read-only
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--expect-object-retention` |  |  | Expect per-object compliance-mode retention: the most recently modified current object found in each protected prefix family, and one noncurrent version, must carry unexpired compliance-mode retention. A sampled object whose lock has lapsed is not a recent object, so it reads unknown rather than fail. Without this flag the condition is printed and does not affect the exit code |
+| `--expect-replication` |  |  | Expect replication: `delete-marker-replication` must pass. Without it the condition is printed and does not affect the exit code |
+| `--expected-noncurrent-days` |  |  | The noncurrent-version expiration, in days, the lifecycle rule covering `t/` must carry (`E_v`) |
 
 ## hold
 
