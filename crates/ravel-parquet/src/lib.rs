@@ -29,6 +29,7 @@ mod error;
 mod metadata_cache;
 mod provider;
 mod reader;
+pub mod snapshot;
 mod store;
 
 #[cfg(test)]
