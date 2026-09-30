@@ -84,8 +84,8 @@ use ravel_maintain::ScrubLevel;
 use ravel_maintain::UnreadableReason;
 use ravel_object_store::StoreMetrics;
 use ravel_object_store::instrument::{
-    LATENCY_BUCKET_BOUNDS_MICROS, LATENCY_BUCKET_COUNT, StoreErrorClass, StoreMetricsSnapshot,
-    StoreOp,
+    ControlPlaneMetricsSnapshot, LATENCY_BUCKET_BOUNDS_MICROS, LATENCY_BUCKET_COUNT,
+    StoreErrorClass, StoreMetricsSnapshot, StoreOp,
 };
 use ravel_query::http::MetadataCacheCounters;
 use ravel_types::accounting::{
@@ -859,6 +859,52 @@ fn render_store_family(out: &mut String, mode: Mode, snapshot: &StoreMetricsSnap
             &[Label::Mode(mode), Label::Op(op)],
             cumulative[LATENCY_BUCKET_COUNT - 1],
         );
+    }
+
+    // Store-wide, not per-op: only a full-object get can move it, so it carries
+    // no `op` label.
+    write_header(
+        out,
+        "ravel_store_get_unverified_total",
+        "Full-object reads served without verifying the body against a stored checksum.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_store_get_unverified_total",
+        &[Label::Mode(mode)],
+        snapshot.get_unverified,
+    );
+}
+
+/// The bucket-protection control plane's read-only GETs, from
+/// [`StoreMetrics::control_plane`]. Its own families with no `op` label: the
+/// control plane is no [`StoreOp`], so none of its requests appear in the
+/// per-op `ravel_store_*` families above.
+fn render_store_control_plane_family(
+    out: &mut String,
+    mode: Mode,
+    snapshot: &ControlPlaneMetricsSnapshot,
+) {
+    for (name, help, value) in [
+        (
+            "ravel_store_control_plane_requests_total",
+            "Bucket-protection control-plane GETs sent, counted before dispatch.",
+            snapshot.requests,
+        ),
+        (
+            "ravel_store_control_plane_calls_total",
+            "Bucket-protection control-plane GETs that got an HTTP response back, whatever its status.",
+            snapshot.calls,
+        ),
+        (
+            "ravel_store_control_plane_response_bytes_total",
+            "Wire bytes of bucket-protection control-plane response bodies, as received.",
+            snapshot.response_bytes,
+        ),
+    ] {
+        write_header(out, name, help, "counter");
+        write_sample(out, name, &[Label::Mode(mode)], value);
     }
 }
 
@@ -6899,6 +6945,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         render_runtime_family(&mut body, state.mode, &runtime);
     }
     render_heartbeat_age_family(&mut body, state.mode, state.heartbeat.age());
+    render_store_control_plane_family(&mut body, state.mode, &state.store_metrics.control_plane());
     (
         StatusCode::OK,
         [(CONTENT_TYPE, "text/plain; version=0.0.4")],
@@ -6967,6 +7014,72 @@ mod tests {
             exposed_memory_budget_limit(21_045_339_751, false),
             21_045_339_751
         );
+    }
+
+    /// Every sample line of `name` (the bare family name, no suffix) in `body`.
+    fn family_samples<'a>(body: &'a str, name: &str) -> Vec<&'a str> {
+        body.lines()
+            .filter(|line| {
+                line.strip_prefix(name)
+                    .is_some_and(|rest| rest.starts_with('{') || rest.starts_with(' '))
+            })
+            .collect()
+    }
+
+    /// `ravel_store_get_unverified_total` renders the recorded count exactly
+    /// once, with `mode` and no `op` label.
+    #[test]
+    fn store_family_renders_get_unverified_as_one_store_wide_sample() {
+        let metrics = StoreMetrics::default();
+        for _ in 0..3 {
+            metrics.record_get_unverified();
+        }
+        let mut body = String::new();
+        render_store_family(&mut body, Mode::All, &metrics.snapshot());
+        assert_eq!(
+            body.matches("# TYPE ravel_store_get_unverified_total counter\n")
+                .count(),
+            1
+        );
+        assert_eq!(
+            family_samples(&body, "ravel_store_get_unverified_total"),
+            vec!["ravel_store_get_unverified_total{mode=\"all\"} 3"]
+        );
+    }
+
+    /// The three control-plane counters each render their own snapshot field,
+    /// with `mode` and no `op` label, and the per-op `ravel_store_*` families
+    /// carry no control-plane series.
+    #[test]
+    fn control_plane_family_renders_each_field_under_its_own_name() {
+        let snapshot = ControlPlaneMetricsSnapshot {
+            requests: 7,
+            calls: 5,
+            response_bytes: 1348,
+        };
+        let mut body = String::new();
+        render_store_control_plane_family(&mut body, Mode::Query, &snapshot);
+        for (name, value) in [
+            ("ravel_store_control_plane_requests_total", 7),
+            ("ravel_store_control_plane_calls_total", 5),
+            ("ravel_store_control_plane_response_bytes_total", 1348),
+        ] {
+            assert_eq!(
+                body.matches(&format!("# TYPE {name} counter\n")).count(),
+                1,
+                "{name} TYPE line:\n{body}"
+            );
+            assert_eq!(
+                family_samples(&body, name),
+                vec![format!("{name}{{mode=\"query\"}} {value}")],
+                "{name} sample:\n{body}"
+            );
+        }
+        assert!(!body.contains("op=\""), "no op label:\n{body}");
+
+        let mut store = String::new();
+        render_store_family(&mut store, Mode::Query, &StoreMetricsSnapshot::default());
+        assert!(!store.contains("control_plane"), "{store}");
     }
 
     /// The acceptance test for the exposition renderer. Proves both halves: a populated
