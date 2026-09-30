@@ -832,10 +832,9 @@ fn descriptor_naming_a_key_no_record_has_a_value_for_is_accepted() {
         order_both_paths(&partial, &records),
         ["r2", "r5", "r4", "r1", "r0", "r3"]
     );
-    // A name the stream layer also carries is accepted once one record
-    // carries it per-record, and the stream-level value is no value for the
-    // key: m1 has none and sorts first, although its stream's "svc" sorts
-    // after m0's "aaa" and m1 is the later row.
+    // For a name the stream layer also carries, the stream-level value is no
+    // value for the key: m1 has none and sorts first, although its stream's
+    // "svc" sorts after m0's "aaa" and m1 is the later row.
     let mixed = vec![
         rec(STREAM_A, T0, "m0", vec![("service.name", s("aaa"))]),
         rec(STREAM_A, T0 + 1, "m1", vec![]),
