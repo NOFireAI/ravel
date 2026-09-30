@@ -4735,7 +4735,8 @@ impl<'a> StrCursor<'a> {
 
     /// The cell at surviving row `i` as text, or `None` when absent or not
     /// UTF-8. Treating invalid UTF-8 as no value matches the row path
-    /// ([`read_str_cell`]), which lets a resource/scope fallback show through.
+    /// (`String::from_utf8(..).ok()`), which lets a resource/scope fallback show
+    /// through.
     fn text_at(&self, i: usize) -> Option<&'a str> {
         match &self.dict {
             Some(d) => d.entry(d.col.id_at(i)? as usize),
@@ -5964,7 +5965,7 @@ mod columnar_lookup_tests {
     };
     use ravel_types::logstream::LogStreamId;
 
-    fn sid(n: u8) -> LogStreamId {
+    pub(super) fn sid(n: u8) -> LogStreamId {
         let mut a = [0u8; 16];
         a[0] = n;
         LogStreamId(a)
@@ -6445,7 +6446,7 @@ mod columnar_lookup_tests {
     /// keys are resolved through the dictionary values here rather than
     /// compared as ids: the two paths build different dictionaries for the same
     /// logical column and only the logical values must match.
-    fn declared_cells(arr: &ArrayRef, ty: DeclaredType) -> Vec<Option<String>> {
+    pub(super) fn declared_cells(arr: &ArrayRef, ty: DeclaredType) -> Vec<Option<String>> {
         match ty {
             DeclaredType::Str => {
                 let d = arr
@@ -6814,5 +6815,821 @@ mod projection_width_tests {
         let r = resolve_columns(&[LOG_COL_TS], &[], &[], &[], &[], FIRST_DECLARED_COL);
         assert_eq!(r.width, Some(2));
         assert_eq!(r.fraction_of(0), 2.0 / 10.0);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    //! ADR-2121 D2 and D3: the declared-column builds read a single-column
+    //! block's cells with no per-cell `AttrValue` and validate a `Str` cell's
+    //! UTF-8 at most once per block, and still build the arrays the per-cell
+    //! path built.
+    //!
+    //! `RlogWriter` only writes valid UTF-8 `Str` cells, so every fixture here
+    //! is a writer-produced object whose one block is rewritten with the cells
+    //! a test names, through the writer's own `write_block` and block layout.
+
+    use super::columnar_lookup_tests::{declared_cells, sid};
+    use super::*;
+    use datafusion::arrow::array::{BinaryArray, BooleanArray, Int64Array};
+    use proptest::prelude::*;
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    use ravel_logseg::block::{ColumnPlan, write_block};
+    use ravel_logseg::field_dir::FieldDir;
+    use ravel_logseg::footer::{
+        COMP_NONE, LogFooter, SectionDesc, kind, open as open_footer, write_footer_and_trailer,
+    };
+    use ravel_logseg::reader::read_section;
+    use ravel_logseg::record::{ColumnValue, ResolvedRow, stream_attrs_bytes};
+    use ravel_logseg::skip_index::SkipIndex;
+    use ravel_logseg::writer::BlocksBuilder;
+    use ravel_logseg::{ObjectIdentity, RlogConfig, RlogReader, RlogWriter};
+
+    const KEY: &str = "k";
+    const STREAMS: usize = 3;
+    /// Every occurrence type a key can be stored under; a generated block's key
+    /// has a FIELD_DIR column for a subset of them.
+    const TYPES: [FieldType; 5] = [
+        FieldType::Str,
+        FieldType::I64,
+        FieldType::F64,
+        FieldType::Bool,
+        FieldType::Bytes,
+    ];
+    const DECLARED: [DeclaredType; 4] = [
+        DeclaredType::Str,
+        DeclaredType::I64,
+        DeclaredType::Bool,
+        DeclaredType::Bytes,
+    ];
+    /// `Str` cells of a dictionary-heavy block: two valid values and two that
+    /// are not UTF-8, so a page dictionary carries non-UTF-8 entries.
+    const STR_POOL: [&[u8]; 4] = [b"a", b"bc", &[b'b', 0xff], &[0xc3]];
+
+    fn cfg() -> RlogConfig {
+        RlogConfig {
+            block_target_records: 256,
+            max_dynamic_columns: 16,
+            ..RlogConfig::default()
+        }
+    }
+
+    /// One block row: its stream and its record cell per entry of [`TYPES`]. A
+    /// cell of a type the block's key has no column for is not written.
+    #[derive(Clone, Debug)]
+    struct Row {
+        stream: usize,
+        cells: Vec<Option<ColumnValue>>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct Block {
+        /// The types the key has a FIELD_DIR column for.
+        types: Vec<FieldType>,
+        rows: Vec<Row>,
+        /// Per stream: the key's resource value and its scope value.
+        overlays: Vec<(Option<AttrValue>, Option<AttrValue>)>,
+        /// Rows `lo..=hi` survive the scan's content predicate.
+        lo: usize,
+        hi: usize,
+        /// Where the surviving rows split into two builds, in percent.
+        split_pct: usize,
+    }
+
+    /// A valid seed value of each type, so the writer's FIELD_DIR carries a
+    /// column for it.
+    fn seed_value(ty: FieldType) -> AttrValue {
+        match ty {
+            FieldType::Str => AttrValue::Str("seed".into()),
+            FieldType::I64 => AttrValue::I64(0),
+            FieldType::F64 => AttrValue::F64(0.5),
+            FieldType::Bool => AttrValue::Bool(false),
+            FieldType::Bytes => AttrValue::Bytes(vec![9]),
+        }
+    }
+
+    /// Write `block` as one RLOG object: the writer lays out STREAM_DIR,
+    /// FIELD_DIR and the footer from seed records (row `r` on stream `r % 3`,
+    /// setting the key at every type in `block.types`), then the block itself is
+    /// replaced with `block.rows` verbatim, non-UTF-8 `Str` cells included.
+    fn encode(block: &Block, cfg: &RlogConfig) -> Vec<u8> {
+        assert!(
+            block.rows.len() >= STREAMS,
+            "every stream has a seed record"
+        );
+        let stream_attrs = |s: usize| {
+            let (resource, scope) = &block.overlays[s];
+            let mut res = vec![("svc".to_string(), AttrValue::Str("s".into()))];
+            res.extend(resource.iter().map(|v| (KEY.to_string(), v.clone())));
+            let scope: Vec<(String, AttrValue)> =
+                scope.iter().map(|v| (KEY.to_string(), v.clone())).collect();
+            stream_attrs_bytes(&res, "scope", "1", &scope)
+        };
+        let mut w = RlogWriter::new(
+            *cfg,
+            ObjectIdentity {
+                tenant_hash: [0; 16],
+                shard: 0,
+                writer_id: [0; 16],
+                writer_epoch: 0,
+                writer_seq: 0,
+            },
+        );
+        for r in 0..block.rows.len() {
+            let s = r % STREAMS;
+            w.push(LogRecord {
+                stream_id: sid(s as u8),
+                stream_attrs: stream_attrs(s),
+                ts_ns: r as i64 * 10,
+                observed_ts_ns: r as i64 * 10,
+                severity_num: 9,
+                severity_text: "INFO".into(),
+                body: "b".into(),
+                trace_id: None,
+                span_id: None,
+                flags: 0,
+                attrs: block
+                    .types
+                    .iter()
+                    .map(|&ty| (KEY.to_string(), seed_value(ty)))
+                    .collect(),
+            })
+            .expect("push");
+        }
+        let obj = w.finish().expect("finish");
+
+        let footer = open_footer(&obj).expect("open the writer's footer");
+        let desc = *footer.section(kind::FIELD_DIR).expect("FIELD_DIR");
+        let dir = FieldDir::decode(&read_section(&obj, &desc, cfg).expect("read"), u64::MAX)
+            .expect("decode FIELD_DIR");
+        let mut plans: Vec<(usize, ColumnPlan)> = block
+            .types
+            .iter()
+            .map(|&ty| {
+                let t = TYPES.iter().position(|&x| x == ty).expect("a known type");
+                let column_id = dir.column(KEY, ty).expect("a column per type").column_id;
+                (t, ColumnPlan { column_id, ty })
+            })
+            .collect();
+        plans.sort_by_key(|(_, p)| p.column_id);
+        let rows: Vec<ResolvedRow> = block
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(r, row)| ResolvedRow {
+                stream_ref: row.stream as u32,
+                ts_ns: r as i64 * 10,
+                observed_ts_ns: r as i64 * 10,
+                severity_num: 9,
+                severity_text: "INFO".into(),
+                body: "b".into(),
+                trace_id: None,
+                span_id: None,
+                flags: 0,
+                attrs_raw: None,
+                columns: plans
+                    .iter()
+                    .filter_map(|(t, p)| row.cells[*t].clone().map(|v| (p.column_id, v)))
+                    .collect(),
+                indexed_terms: Vec::new(),
+                stat_winners: Vec::new(),
+            })
+            .collect();
+        let plans: Vec<ColumnPlan> = plans.into_iter().map(|(_, p)| p).collect();
+        let written = write_block(&rows, &plans, cfg.zstd_level).expect("write one block");
+        let mut layout = BlocksBuilder::version_4(cfg.group_target_blocks);
+        layout.push(written);
+        let (blocks_bytes, l0, page_dir) = layout.finish();
+        let skip = SkipIndex::build(l0).encode();
+        let page_dir_bytes = page_dir.encode();
+
+        let mut out: Vec<u8> = Vec::new();
+        let mut sections: Vec<SectionDesc> = Vec::new();
+        for d in &footer.sections {
+            let (bytes, comp, uncomp_len) = match d.kind {
+                kind::BLOCKS => (blocks_bytes.clone(), COMP_NONE, blocks_bytes.len() as u64),
+                kind::SKIP_IDX => (skip.clone(), COMP_NONE, skip.len() as u64),
+                kind::PAGE_DIR => (
+                    page_dir_bytes.clone(),
+                    COMP_NONE,
+                    page_dir_bytes.len() as u64,
+                ),
+                _ => {
+                    let start = usize::try_from(d.offset).expect("offset fits");
+                    let end = start + usize::try_from(d.len).expect("len fits");
+                    (obj[start..end].to_vec(), d.comp, d.uncomp_len)
+                }
+            };
+            sections.push(SectionDesc {
+                kind: d.kind,
+                offset: out.len() as u64,
+                len: bytes.len() as u64,
+                crc32c: crc32c::crc32c(&bytes),
+                comp,
+                uncomp_len,
+            });
+            out.extend_from_slice(&bytes);
+        }
+        let patched = LogFooter { sections, ..footer };
+        write_footer_and_trailer(&mut out, &patched);
+        out
+    }
+
+    /// The content predicate that keeps rows `lo..=hi`.
+    fn window(block: &Block) -> Predicate {
+        Predicate::TsRange {
+            min_ns: block.lo as i64 * 10,
+            max_ns: block.hi as i64 * 10,
+        }
+    }
+
+    // --- the pre-change per-cell path, rebuilt from the view's own accessors --
+
+    /// Whether the record sets the key in `col` at row `i`: a `Str` cell counts
+    /// only when it is UTF-8.
+    fn ref_present(view: &ColumnarBlockView<'_>, col: AttrColumn, i: usize) -> bool {
+        match col.ty {
+            FieldType::Str => view.bytes_cursor(col.column_id).str_at(i).is_some(),
+            FieldType::Bytes => view.bytes_cursor(col.column_id).at(i).is_some(),
+            FieldType::I64 => view.i64_cursor(col.column_id).at(i).is_some(),
+            FieldType::F64 => view.f64_bits_cursor(col.column_id).at(i).is_some(),
+            FieldType::Bool => view.bool_cursor(col.column_id).at(i).is_some(),
+        }
+    }
+
+    /// The record's winning occurrence at row `i`: the highest type byte, the
+    /// last one on a tie.
+    fn ref_winner(view: &ColumnarBlockView<'_>, cols: &[AttrColumn], i: usize) -> Option<usize> {
+        cols.iter()
+            .enumerate()
+            .filter(|(_, c)| ref_present(view, **c, i))
+            .max_by_key(|(_, c)| c.ty.to_u8())
+            .map(|(k, _)| k)
+    }
+
+    /// The row's stream's resource/scope value of the key.
+    fn ref_fallback(view: &ColumnarBlockView<'_>, i: usize) -> Option<AttrValue> {
+        let blob = view.stream_attrs(i)?;
+        let attrs = decode_stream_attrs(blob).expect("stream attrs");
+        find_attr(&attrs, KEY).cloned()
+    }
+
+    /// The merged value at row `i` with its variant not yet checked: the record's
+    /// winning cell when it is of the declared type, NULL when the winner is of
+    /// another type, and the fallback only when the record does not set the key.
+    fn ref_merged(
+        view: &ColumnarBlockView<'_>,
+        dc: &DeclaredColumn,
+        i: usize,
+    ) -> Option<AttrValue> {
+        let cols: Vec<AttrColumn> = view.attr_columns_for(&dc.key).collect();
+        let Some(win) = ref_winner(view, &cols, i) else {
+            return ref_fallback(view, i);
+        };
+        let col = cols[win];
+        if col.ty != declared_field_type(dc.ty) {
+            return None;
+        }
+        match col.ty {
+            FieldType::Str => view
+                .bytes_cursor(col.column_id)
+                .str_at(i)
+                .map(|s| AttrValue::Str(s.to_string())),
+            FieldType::I64 => view.i64_cursor(col.column_id).at(i).map(AttrValue::I64),
+            FieldType::Bool => view.bool_cursor(col.column_id).at(i).map(AttrValue::Bool),
+            FieldType::Bytes => view
+                .bytes_cursor(col.column_id)
+                .at(i)
+                .map(|b| AttrValue::Bytes(b.to_vec())),
+            FieldType::F64 => None,
+        }
+    }
+
+    /// The array the pre-change build produced for rows `start..end`, down to
+    /// the `Str` dictionary's layout: a dictionary page's entries in page order
+    /// (NULL for a non-UTF-8 entry) with fallback values appended past them, or
+    /// an identity dictionary over a plain page.
+    fn per_cell_reference(
+        view: &ColumnarBlockView<'_>,
+        dc: &DeclaredColumn,
+        start: usize,
+        end: usize,
+    ) -> ArrayRef {
+        match dc.ty {
+            DeclaredType::I64 => Arc::new(Int64Array::from(
+                (start..end)
+                    .map(|i| match ref_merged(view, dc, i) {
+                        Some(AttrValue::I64(v)) => Some(v),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            DeclaredType::Bool => Arc::new(BooleanArray::from(
+                (start..end)
+                    .map(|i| match ref_merged(view, dc, i) {
+                        Some(AttrValue::Bool(v)) => Some(v),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            DeclaredType::Bytes => {
+                let cells: Vec<Option<Vec<u8>>> = (start..end)
+                    .map(|i| match ref_merged(view, dc, i) {
+                        Some(AttrValue::Bytes(b)) => Some(b),
+                        _ => None,
+                    })
+                    .collect();
+                Arc::new(BinaryArray::from(
+                    cells.iter().map(|c| c.as_deref()).collect::<Vec<_>>(),
+                ))
+            }
+            DeclaredType::Str => {
+                let cols: Vec<AttrColumn> = view.attr_columns_for(&dc.key).collect();
+                let str_col = cols.iter().find(|c| c.ty == FieldType::Str);
+                let mut values: Vec<Option<String>> = Vec::new();
+                let mut keys: Vec<Option<i32>> = Vec::new();
+                match str_col.and_then(|c| view.str_dict(c.column_id)) {
+                    Some(page) => {
+                        values.extend(
+                            page.dict()
+                                .iter()
+                                .map(|v| std::str::from_utf8(v).ok().map(str::to_string)),
+                        );
+                        for i in start..end {
+                            let key = match ref_winner(view, &cols, i) {
+                                Some(win) if cols[win].ty == FieldType::Str => {
+                                    page.id_at(i).map(|id| id as i32)
+                                }
+                                Some(_) => None,
+                                None => match ref_fallback(view, i) {
+                                    Some(AttrValue::Str(s)) => {
+                                        values.push(Some(s));
+                                        Some(values.len() as i32 - 1)
+                                    }
+                                    _ => None,
+                                },
+                            };
+                            keys.push(key);
+                        }
+                    }
+                    None => {
+                        for i in start..end {
+                            keys.push(match ref_merged(view, dc, i) {
+                                Some(AttrValue::Str(s)) => {
+                                    values.push(Some(s));
+                                    Some(values.len() as i32 - 1)
+                                }
+                                _ => None,
+                            });
+                        }
+                    }
+                }
+                Arc::new(
+                    DictionaryArray::<Int32Type>::try_new(
+                        Int32Array::from(keys),
+                        Arc::new(StringArray::from(values)),
+                    )
+                    .expect("reference dictionary"),
+                )
+            }
+        }
+    }
+
+    // --- generated blocks ---------------------------------------------------
+
+    fn str_cell(pooled: bool) -> BoxedStrategy<Option<ColumnValue>> {
+        if pooled {
+            prop_oneof![
+                Just(None),
+                prop::sample::select(STR_POOL.to_vec())
+                    .prop_map(|b| Some(ColumnValue::Str(b.to_vec()))),
+            ]
+            .boxed()
+        } else {
+            prop_oneof![
+                Just(None),
+                "[a-d]{0,3}".prop_map(|s| Some(ColumnValue::Str(s.into_bytes()))),
+                prop::collection::vec(any::<u8>(), 1..4).prop_map(|b| Some(ColumnValue::Str(b))),
+            ]
+            .boxed()
+        }
+    }
+
+    fn row(pooled: bool) -> impl Strategy<Value = Row> {
+        (
+            0..STREAMS,
+            str_cell(pooled),
+            prop::option::of((-3i64..3).prop_map(ColumnValue::I64)),
+            prop::option::of(any::<u64>().prop_map(ColumnValue::F64)),
+            prop::option::of(any::<bool>().prop_map(ColumnValue::Bool)),
+            prop::option::of(prop::collection::vec(any::<u8>(), 0..3).prop_map(ColumnValue::Bytes)),
+        )
+            .prop_map(|(stream, s, i, f, b, y)| Row {
+                stream,
+                cells: vec![s, i, f, b, y],
+            })
+    }
+
+    fn overlay_value(ty: FieldType) -> BoxedStrategy<AttrValue> {
+        match ty {
+            FieldType::Str => prop::sample::select(vec!["r", "a"])
+                .prop_map(|s| AttrValue::Str(s.into()))
+                .boxed(),
+            FieldType::I64 => (-2i64..2).prop_map(AttrValue::I64).boxed(),
+            FieldType::F64 => Just(AttrValue::F64(1.5)).boxed(),
+            FieldType::Bool => any::<bool>().prop_map(AttrValue::Bool).boxed(),
+            FieldType::Bytes => Just(AttrValue::Bytes(vec![7, 7])).boxed(),
+        }
+    }
+
+    /// A resource or scope value of one of `types`, or none. The writer gives
+    /// the key a FIELD_DIR column for each type a stream carries it at, so a
+    /// block whose overlays stay inside the record's types keeps a
+    /// single-column key single.
+    fn overlay(types: Vec<FieldType>) -> BoxedStrategy<Option<AttrValue>> {
+        if types.is_empty() {
+            return Just(None).boxed();
+        }
+        prop_oneof![
+            Just(None),
+            prop::sample::select(types).prop_flat_map(|ty| overlay_value(ty).prop_map(Some)),
+        ]
+        .boxed()
+    }
+
+    fn block() -> impl Strategy<Value = Block> {
+        (
+            prop::collection::vec(any::<bool>(), TYPES.len()),
+            any::<bool>(),
+            any::<bool>(),
+            STREAMS..40usize,
+        )
+            .prop_flat_map(|(mask, pooled, narrow, n)| {
+                let types: Vec<FieldType> = TYPES
+                    .iter()
+                    .zip(&mask)
+                    .filter(|(_, m)| **m)
+                    .map(|(t, _)| *t)
+                    .collect();
+                let overlay_types = if narrow {
+                    types.clone()
+                } else {
+                    TYPES.to_vec()
+                };
+                (
+                    Just(types),
+                    prop::collection::vec(row(pooled), n),
+                    prop::collection::vec(
+                        (overlay(overlay_types.clone()), overlay(overlay_types)),
+                        STREAMS,
+                    ),
+                    0..n,
+                    0..n,
+                    0usize..=100,
+                )
+            })
+            .prop_map(|(types, rows, overlays, a, b, split_pct)| Block {
+                types,
+                rows,
+                overlays,
+                lo: a.min(b),
+                hi: a.max(b),
+                split_pct,
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// ADR-2121 D2 and D3's contract: for every declarable type, the
+        /// declared-column build over a generated block equals the pre-change
+        /// per-cell build ([`per_cell_reference`]) array for array, chunk by
+        /// chunk with one resolver across the chunks as the scan uses it, and
+        /// equals the row path's `declared_column_array` cell for cell.
+        ///
+        /// The generated blocks carry resource and scope values of every type,
+        /// NULL cells, one key under up to five types, a surviving-row window,
+        /// non-UTF-8 `Str` cells on plain pages and non-UTF-8 entries in page
+        /// dictionaries ([`the_block_generator_reaches_every_case_the_property_names`]).
+        ///
+        /// Flipped assertions, each seen failing:
+        /// - the single-cursor gather taken without `single_matching`
+        ///   (`single_cursor` returning `matching_cursor` alone): a row whose
+        ///   winning occurrence is of another type reads the declared cell;
+        /// - an absent cell appended as NULL instead of reading the
+        ///   resource/scope value in the gather arms;
+        /// - `Str` presence reduced to "bytes present" (`Presence::Text` only
+        ///   when the cell's bytes validate, `Presence::Present` otherwise): a
+        ///   non-UTF-8 cell stops falling through to the resource/scope value.
+        #[test]
+        fn the_page_fast_path_builds_the_same_array_as_the_per_cell_path(block in block()) {
+            let cfg = cfg();
+            let obj = encode(&block, &cfg);
+            let reader = RlogReader::new(&obj, &cfg).expect("open");
+            let pred = window(&block);
+
+            let mut rows = reader
+                .scan_blocks(&pred, &[], &ColumnSelection::all())
+                .expect("scan");
+            let records = rows.next_block(&obj).expect("row exit").expect("one block");
+            let merged: Vec<Vec<(String, AttrValue)>> = records
+                .iter()
+                .map(|r| merged_attrs(r).expect("merge"))
+                .collect();
+
+            let mut scan = reader
+                .scan_blocks(&pred, &[], &ColumnSelection::all())
+                .expect("scan");
+            let view = scan
+                .next_block_columnar(&obj)
+                .expect("columnar exit")
+                .expect("one block");
+            let n = view.surviving_count();
+            prop_assert_eq!(n, block.hi - block.lo + 1);
+            prop_assert_eq!(records.len(), n);
+            let split = n * block.split_pct / 100;
+
+            for ty in DECLARED {
+                let dc = DeclaredColumn::new(KEY, ty);
+                let plan = DeclaredPlan::build(&view, &dc);
+                let mut resolver = DeclaredResolver::new(&plan);
+                let mut cache = HashMap::new();
+                let mut cells = Vec::with_capacity(n);
+                for (start, end) in [(0, split), (split, n)] {
+                    let built =
+                        build_declared_columnar_array(&view, &mut resolver, start, end, &mut cache)
+                            .expect("declared array");
+                    let reference = per_cell_reference(&view, &dc, start, end);
+                    prop_assert_eq!(
+                        built.to_data(),
+                        reference.to_data(),
+                        "{:?} rows {}..{}",
+                        ty,
+                        start,
+                        end
+                    );
+                    cells.extend(declared_cells(&built, ty));
+                }
+                let row_path = declared_cells(&declared_column_array(&dc, &merged), ty);
+                prop_assert_eq!(cells, row_path, "{:?} against the row path", ty);
+            }
+        }
+    }
+
+    /// The generator is not vacuous: over the deterministic runner's first 256
+    /// blocks it produces every case the property names.
+    #[test]
+    fn the_block_generator_reaches_every_case_the_property_names() {
+        let cfg = cfg();
+        let mut runner = TestRunner::deterministic();
+        let strategy = block();
+        let mut seen: BTreeSet<&'static str> = BTreeSet::new();
+        for _ in 0..256 {
+            let block = strategy.new_tree(&mut runner).expect("a block").current();
+            let obj = encode(&block, &cfg);
+            let reader = RlogReader::new(&obj, &cfg).expect("open");
+            let mut scan = reader
+                .scan_blocks(&window(&block), &[], &ColumnSelection::all())
+                .expect("scan");
+            let view = scan
+                .next_block_columnar(&obj)
+                .expect("columnar exit")
+                .expect("one block");
+            if view.surviving_count() < block.rows.len() {
+                seen.insert("a surviving-row subset");
+            }
+            let cols: Vec<AttrColumn> = view.attr_columns_for(KEY).collect();
+            if cols.len() == 1 {
+                seen.insert("a single-column key");
+            }
+            if let Some(c) = cols.iter().find(|c| c.ty == FieldType::Str) {
+                match view.str_dict(c.column_id) {
+                    Some(page) if page.dict().iter().any(|v| std::str::from_utf8(v).is_err()) => {
+                        seen.insert("a non-UTF-8 dictionary entry");
+                    }
+                    Some(_) => {}
+                    None => {
+                        let cells = view.bytes_cursor(c.column_id);
+                        if (0..view.surviving_count())
+                            .any(|i| cells.at(i).is_some() && cells.str_at(i).is_none())
+                        {
+                            seen.insert("a non-UTF-8 plain-page cell");
+                        }
+                    }
+                }
+            }
+            for i in 0..view.surviving_count() {
+                let present = cols.iter().filter(|c| ref_present(&view, **c, i)).count();
+                if present > 1 {
+                    seen.insert("one key under several types in one row");
+                }
+                if present == 0 && ref_fallback(&view, i).is_some() {
+                    seen.insert("a resource or scope value shown through");
+                }
+                if present == 0 && ref_fallback(&view, i).is_none() {
+                    seen.insert("a NULL row");
+                }
+            }
+            if block
+                .overlays
+                .iter()
+                .any(|(res, scope)| res.is_none() && scope.is_some())
+            {
+                seen.insert("a scope-only value");
+            }
+        }
+        let want: BTreeSet<&'static str> = [
+            "a surviving-row subset",
+            "a single-column key",
+            "a non-UTF-8 dictionary entry",
+            "a non-UTF-8 plain-page cell",
+            "one key under several types in one row",
+            "a resource or scope value shown through",
+            "a NULL row",
+            "a scope-only value",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(seen, want);
+    }
+
+    // --- UTF-8 validation count -------------------------------------------
+
+    fn validations() -> u64 {
+        CELL_TEXT_VALIDATIONS.with(|n| n.get())
+    }
+
+    /// A block with the key under `types`, one stream with no overlay, `cells`
+    /// per row parallel to `types`, and rows `lo..=hi` surviving.
+    fn fixed_block(
+        types: &[FieldType],
+        cells: Vec<Vec<Option<ColumnValue>>>,
+        lo: usize,
+        hi: usize,
+    ) -> Block {
+        Block {
+            types: types.to_vec(),
+            rows: cells
+                .into_iter()
+                .map(|by_type| {
+                    let mut all = vec![None; TYPES.len()];
+                    for (ty, cell) in types.iter().zip(by_type) {
+                        let t = TYPES.iter().position(|x| x == ty).expect("a known type");
+                        all[t] = cell;
+                    }
+                    Row {
+                        stream: 0,
+                        cells: all,
+                    }
+                })
+                .collect(),
+            overlays: vec![(None, None); STREAMS],
+            lo,
+            hi,
+            split_pct: 50,
+        }
+    }
+
+    fn str_value(s: &[u8]) -> Option<ColumnValue> {
+        Some(ColumnValue::Str(s.to_vec()))
+    }
+
+    /// Build the declared `Str` column over `block` in two chunks and return
+    /// the UTF-8 validations the build ran, whether the page was a dictionary
+    /// page, and the cells.
+    fn count_str_build(block: &Block) -> (u64, bool, Vec<Option<String>>) {
+        let cfg = cfg();
+        let obj = encode(block, &cfg);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let mut scan = reader
+            .scan_blocks(&window(block), &[], &ColumnSelection::all())
+            .expect("scan");
+        let view = scan
+            .next_block_columnar(&obj)
+            .expect("columnar exit")
+            .expect("one block");
+        let dc = DeclaredColumn::new(KEY, DeclaredType::Str);
+        let n = view.surviving_count();
+        let before = validations();
+        let plan = DeclaredPlan::build(&view, &dc);
+        let dict_page = matches!(
+            plan.matching_cursor(),
+            Some(DeclaredCursor::Str(c)) if c.dict.is_some()
+        );
+        let mut resolver = DeclaredResolver::new(&plan);
+        let mut cache = HashMap::new();
+        let mut cells = Vec::new();
+        for (start, end) in [(0, n / 2), (n / 2, n)] {
+            let built = build_declared_columnar_array(&view, &mut resolver, start, end, &mut cache)
+                .expect("declared array");
+            cells.extend(declared_cells(&built, DeclaredType::Str));
+        }
+        (validations() - before, dict_page, cells)
+    }
+
+    /// ADR-2121 D3: a declared `Str` cell's UTF-8 is validated at most once per
+    /// block. On a plain page each surviving cell is validated once, whether
+    /// the key has one occurrence (the fused read) or also an `I64` one (the
+    /// presence search's validation is the text appended). On a dictionary page
+    /// each entry is validated once for the block, however many rows and
+    /// chunks read it, and a row costs no validation.
+    ///
+    /// Flipped assertions, each seen failing:
+    /// - the plain-page multi-occurrence build re-reading the winner's text
+    ///   (`matching_str.and_then(|c| c.text_at(i))` in place of the presence
+    ///   search's `text`) counts 9 where 6 is expected;
+    /// - a dictionary-page presence test that validates the row's entry bytes
+    ///   (`cell_text(self.cells.at(i)?)` in `StrCursor::text_at`'s dictionary
+    ///   arm) counts one per present row on top of the entries;
+    /// - validating the dictionary per chunk (`OnceCell` dropped for a plain
+    ///   `cell_text` in `StrDictText::entry`) counts each entry twice.
+    #[test]
+    fn a_declared_str_cell_is_validated_at_most_once_per_block() {
+        // Plain page, one occurrence: rows 1..=6 survive, and 1, 3, 4 and 6 of
+        // them carry a cell (4 of them), one of which is not UTF-8.
+        let plain = fixed_block(
+            &[FieldType::Str],
+            vec![
+                vec![str_value(b"r0")],
+                vec![str_value(b"r1")],
+                vec![None],
+                vec![str_value(&[b'r', 0xff])],
+                vec![str_value(b"r4")],
+                vec![None],
+                vec![str_value(b"r6")],
+                vec![str_value(b"r7")],
+            ],
+            1,
+            6,
+        );
+        let (count, dict_page, cells) = count_str_build(&plain);
+        assert!(!dict_page, "unique values encode as a plain page");
+        assert_eq!(count, 4, "one validation per surviving present cell");
+        assert_eq!(
+            cells,
+            vec![
+                Some("r1".into()),
+                None,
+                None,
+                Some("r4".into()),
+                None,
+                Some("r6".into())
+            ]
+        );
+
+        // Plain page, `Str` and `I64` occurrences: every row has a `Str` cell,
+        // rows 0..=3 an `I64` one that wins over it. Rows 1..=6 survive.
+        let multi = fixed_block(
+            &[FieldType::Str, FieldType::I64],
+            (0..8)
+                .map(|r| {
+                    vec![
+                        str_value(format!("m{r}").as_bytes()),
+                        (r < 4).then_some(ColumnValue::I64(r)),
+                    ]
+                })
+                .collect(),
+            1,
+            6,
+        );
+        let (count, dict_page, cells) = count_str_build(&multi);
+        assert!(!dict_page, "unique values encode as a plain page");
+        assert_eq!(count, 6, "one validation per surviving present cell");
+        assert_eq!(
+            cells,
+            vec![
+                None,
+                None,
+                None,
+                Some("m4".into()),
+                Some("m5".into()),
+                Some("m6".into())
+            ]
+        );
+
+        // Dictionary page: 12 rows over three entries, one not UTF-8, all rows
+        // surviving, built in two chunks.
+        let entries: [&[u8]; 3] = [b"a", b"bc", &[b'b', 0xff]];
+        let dict = fixed_block(
+            &[FieldType::Str],
+            (0..12).map(|r| vec![str_value(entries[r % 3])]).collect(),
+            0,
+            11,
+        );
+        let (count, dict_page, cells) = count_str_build(&dict);
+        assert!(
+            dict_page,
+            "three distinct of twelve encode as a dictionary page"
+        );
+        assert_eq!(
+            count, 3,
+            "one validation per dictionary entry, none per row"
+        );
+        let want: Vec<Option<String>> = (0..12)
+            .map(|r| ["a", "bc"].get(r % 3).map(|s| s.to_string()))
+            .collect();
+        assert_eq!(cells, want);
     }
 }
