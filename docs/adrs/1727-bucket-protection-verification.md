@@ -306,7 +306,17 @@ bucket) or as the sixteen-rule union, or confirms coverage out of band.
 `object-retention` sample more narrowly than decision 3's table states, and
 needs one permission decision 4 does not list.
 
-1. **The sample is the newest object a bounded listing finds per family.**
+1. **The sample is the newest object older than the retention coverage
+   window that a bounded listing finds per family.** A mechanism that applies
+   retention after the write lags it: the scheduled batch job the disaster
+   recovery guide sanctions covers an object up to its schedule interval plus
+   the inventory delay after the write, and even the event-driven mechanism
+   lags by seconds. The newest object in a family is the one most likely
+   inside that lag, so on a compliant bucket it can carry no retention yet.
+   `--expect-object-retention` therefore requires
+   `--retention-coverage-window DURATION` (a humantime duration, such as
+   `25h`) and is refused without it, and every family's sample is the newest
+   current object whose `LastModified` is more than that window before now.
    Three of the four protected prefix families (provisioning records, commit
    records, the catalog keyspace) sit under a tenant hash, and a versions
    listing takes a literal prefix, so the CLI locates one concrete object per
@@ -315,20 +325,31 @@ needs one permission decision 4 does not list.
    object's exact key to the control plane:
    - `sys/`: the most recently modified object under `sys/`, skipping the
      `sys/qualify/` and `sys/pq-probe/` scratch and the per-process
-     `sys/maintain/` state, whose continuous rewrites would otherwise make it
-     the newest object every time;
+     `sys/maintain/` and `sys/query/workers/` state, whose continuous
+     rewrites would otherwise make it the newest object every time;
    - provisioning records: the newest `t/<h>/<signal>/prov` across tenants;
-   - catalog keyspace: the newest object directly under a
-     `t/<h>/catalog/<signal>/` (the head pointer) across tenants;
-   - commit records: the newest object in each shard's newest ingest hour,
-     in the tenant whose catalog head was written most recently, as a cheap
-     stand-in for the tenant with the newest commit.
+   - catalog keyspace: the newest object under a `t/<h>/catalog/<signal>/`
+     across tenants: the head pointer, snapshot parts and index objects,
+     since a head rewritten on every fold is never older than the window on
+     an active tenant;
+   - commit records: the newest object in each shard's newest ingest hour
+     that holds one older than the window, in the tenant whose catalog was
+     written most recently, as a cheap stand-in for the tenant with the
+     newest commit. An hour that opens after the window's start is not
+     listed, since a record is never created before its ingest hour opens.
 
    The control plane then samples that object's current version and its
-   newest noncurrent version. Because the listing prefix is an exact key, a
-   busy prefix no longer fills the versions listing's page cap. A family with
-   no object to sample leaves `object-retention` `Unknown`, never `Pass`, so
-   a bucket with no tenant yet exits `2` under `--expect-object-retention`.
+   newest noncurrent version. Because the listing prefix is an exact key, the
+   versions listing holds that one object's versions and no other key's, so
+   other objects written under the same family cannot fill its page cap; an
+   object rewritten often, such as a catalog head, can still keep enough
+   noncurrent versions within the noncurrent retention period to fill it. A
+   family with no object to sample, or whose objects found are all inside the
+   window, leaves `object-retention` `Unknown`, never `Pass` and never
+   `Fail`, and the detail names the window; so a bucket with no tenant yet,
+   or one younger than the window, exits `2` under
+   `--expect-object-retention`. An object older than the window with no
+   retention still reads `Fail`.
    When a listing budget runs out, the sample is the newest object found
    rather than provably the newest, and an `Unknown` or `Fail` detail says
    so; a locked sample still passes, since it is locked whether or not it is
@@ -350,6 +371,10 @@ needs one permission decision 4 does not list.
    listing is denied and `object-retention` reads `Unknown`, exit `2`. The
    other conditions need nothing beyond decision 4's list.
 
-None of the three can turn a non-compliant bucket into exit `0`: each leaves a
-condition `Unknown` or `Fail` where a wider sample might have read `Pass`, and
-the lapsed-lock reading moves a `Fail` to `Unknown`, which still exits `2`.
+Apart from the window, none of the three can turn a non-compliant bucket into
+exit `0`: each leaves a condition `Unknown` or `Fail` where a wider sample
+might have read `Pass`, and the lapsed-lock reading moves a `Fail` to
+`Unknown`, which still exits `2`. The window delays detection by design: a
+retention mechanism that stops covering writes is reported once the first
+uncovered object is older than the window, not before, so the window should
+be the mechanism's real lag and no longer.
