@@ -1653,18 +1653,46 @@ async fn an_attrs_map_column_sharing_a_mapped_column_is_refused() {
 /// `r1`, and one `[[spans.attribute]]` per key `a0000` .. `a1023`, the most a
 /// mapping may declare, each read from the column of its own name.
 fn full_width_mapping() -> SpansMapping {
+    spans_mapping(&full_width_text(
+        &["r0", "r1"],
+        0..load::LOADER_MAX_ATTRIBUTES_PER_RECORD,
+    ))
+}
+
+/// [`REQUIRED_ONLY_MAPPING`] with `attrs_map_column = "attrs"`.
+fn required_only_with_attrs_map() -> String {
+    REQUIRED_ONLY_MAPPING.replace(
+        "end_ts_unit     = \"micros\"\n",
+        "end_ts_unit     = \"micros\"\nattrs_map_column = \"attrs\"\n",
+    )
+}
+
+/// [`REQUIRED_ONLY_MAPPING`] plus one `[[spans.resource_attribute]]` per key
+/// in `resource_keys` and one `[[spans.attribute]]` `a{i:04}` per `i` in
+/// `attributes`, each read from the column of its own name.
+fn full_width_text(resource_keys: &[&str], attributes: std::ops::Range<usize>) -> String {
     let mut text = String::from(REQUIRED_ONLY_MAPPING);
-    for key in ["r0", "r1"] {
+    for key in resource_keys {
         text.push_str(&format!(
             "\n[[spans.resource_attribute]]\nkey = \"{key}\"\ncolumn = \"{key}\"\ntype = \"str\"\n"
         ));
     }
-    for i in 0..load::LOADER_MAX_ATTRIBUTES_PER_RECORD {
+    for i in attributes {
         text.push_str(&format!(
             "\n[[spans.attribute]]\nkey = \"a{i:04}\"\ncolumn = \"a{i:04}\"\ntype = \"str\"\n"
         ));
     }
-    spans_mapping(&text)
+    text
+}
+
+/// The export mapping of the cap tests: `r0` and `a0000` mapped to columns
+/// and every other attribute in the `attrs` map.
+fn one_attribute_map_mapping() -> SpansMapping {
+    spans_mapping(&full_width_text(&["r0"], 0..1).replacen(
+        REQUIRED_ONLY_MAPPING,
+        &required_only_with_attrs_map(),
+        1,
+    ))
 }
 
 /// One source row under [`full_width_mapping`]: every `a` attribute set to
@@ -1769,14 +1797,7 @@ async fn a_spans_export_writes_no_more_map_entries_than_its_load_reads() {
         vec![1025, 1026]
     );
 
-    let mapping = spans_mapping(&format!(
-        "{}\n[[spans.resource_attribute]]\nkey = \"r0\"\ncolumn = \"r0\"\ntype = \"str\"\n\n\
-         [[spans.attribute]]\nkey = \"a0000\"\ncolumn = \"a0000\"\ntype = \"str\"\n",
-        REQUIRED_ONLY_MAPPING.replace(
-            "end_ts_unit     = \"micros\"\n",
-            "end_ts_unit     = \"micros\"\nattrs_map_column = \"attrs\"\n",
-        )
-    ));
+    let mapping = one_attribute_map_mapping();
     let export_pq = dir.path().join("export.parquet");
     let report = export_window(&store, "alpha", T0, T1, &mapping, &export_pq)
         .await
@@ -1805,4 +1826,137 @@ async fn a_spans_export_writes_no_more_map_entries_than_its_load_reads() {
         beta, expected,
         "the at-cap span re-loads with every attribute, the over-cap span without r1"
     );
+}
+
+/// A span whose `[[spans.attribute]]` values alone fill the loader per-record
+/// cap leaves no room in the map: both spans store 1024 `a` attributes, all
+/// mapped to columns, and the second also stores the unmapped `r1`. The export
+/// writes an empty map for each, counts only the second, and the file re-loads
+/// every span as stored less `r1`.
+#[tokio::test]
+async fn span_attributes_alone_at_the_cap_leave_no_map_room() {
+    let cap = load::LOADER_MAX_ATTRIBUTES_PER_RECORD;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let source = dir.path().join("wide.parquet");
+    write_parquet(
+        &source,
+        &full_width_batch(&[
+            WideRow {
+                span: 0x11,
+                start_ns: T0,
+                with_r1: false,
+            },
+            WideRow {
+                span: 0x22,
+                start_ns: T0 + 2 * ONE_MS_NS,
+                with_r1: true,
+            },
+        ]),
+    );
+    load_file(&store, &source, "alpha", &full_width_mapping(), LOAD_NS).await;
+    let alpha = stored(&store, "alpha", T0, T1, LOAD_NS).await;
+    assert_eq!(
+        alpha
+            .iter()
+            .map(|span| span.attrs.len())
+            .collect::<Vec<_>>(),
+        vec![1025, 1026]
+    );
+
+    let mapping = spans_mapping(&full_width_text(&["r0"], 0..cap).replacen(
+        REQUIRED_ONLY_MAPPING,
+        &required_only_with_attrs_map(),
+        1,
+    ));
+    let export_pq = dir.path().join("export.parquet");
+    let report = export_window(&store, "alpha", T0, T1, &mapping, &export_pq)
+        .await
+        .expect("export succeeds");
+    assert_eq!(report.rows_written, 2);
+    assert_eq!(
+        report.spans_with_unwritten_data, 1,
+        "only the span storing r1, which has no room in the map"
+    );
+    assert_eq!(
+        map_values(&read_parquet(&export_pq), "attrs"),
+        vec![Vec::new(), Vec::new()],
+        "the mapped attributes alone reach the cap, so neither map holds an entry"
+    );
+
+    load_file(&store, &export_pq, "beta", &mapping, LOAD_NS + ONE_SEC_NS).await;
+    let beta = stored(&store, "beta", T0, T1, LOAD_NS + ONE_SEC_NS).await;
+    let expected: Vec<SpanRecord> = alpha
+        .into_iter()
+        .map(|mut span| {
+            span.attrs.retain(|(key, _)| key != "r1");
+            span
+        })
+        .collect();
+    assert_eq!(beta, expected, "every span re-loads as stored, less r1");
+}
+
+/// A mapped `[[spans.attribute]]` the span does not store writes a null cell,
+/// which a load does not count toward the cap, so the map gets that slot back.
+/// The span stores `r1` and `a0001` .. `a1023` but no `a0000`: under the
+/// export mapping that maps `a0000` those are 1024 map candidates, exactly the
+/// cap, so every one is written, nothing is counted, and the file re-loads the
+/// span as stored.
+#[tokio::test]
+async fn a_null_mapped_attribute_gives_its_slot_back_to_the_map() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let source = dir.path().join("wide.parquet");
+    let wide = full_width_batch(&[WideRow {
+        span: 0x11,
+        start_ns: T0,
+        with_r1: true,
+    }]);
+    let rows = wide.num_rows();
+    let columns: Vec<(String, ArrayRef)> = wide
+        .schema()
+        .fields()
+        .iter()
+        .zip(wide.columns())
+        .map(|(field, column)| {
+            let column = if field.name() == "a0000" {
+                Arc::new(StringArray::from(vec![None::<&str>; rows])) as ArrayRef
+            } else {
+                Arc::clone(column)
+            };
+            (field.name().clone(), column)
+        })
+        .collect();
+    write_parquet(
+        &source,
+        &RecordBatch::try_from_iter(columns).expect("batch without a0000"),
+    );
+    load_file(&store, &source, "alpha", &full_width_mapping(), LOAD_NS).await;
+    let alpha = stored(&store, "alpha", T0, T1, LOAD_NS).await;
+    assert_eq!(alpha.len(), 1);
+    assert_eq!(alpha[0].attrs.len(), 1025, "r0, r1 and a0001 .. a1023");
+    assert!(!alpha[0].attrs.iter().any(|(key, _)| key == "a0000"));
+
+    let mapping = one_attribute_map_mapping();
+    let export_pq = dir.path().join("export.parquet");
+    let report = export_window(&store, "alpha", T0, T1, &mapping, &export_pq)
+        .await
+        .expect("export succeeds");
+    assert_eq!(report.rows_written, 1);
+    assert_eq!(
+        report.spans_with_unwritten_data, 0,
+        "the null a0000 cell takes no map room, so r1 fits"
+    );
+    let mut expected_map: Vec<(String, String)> = (1..load::LOADER_MAX_ATTRIBUTES_PER_RECORD)
+        .map(|i| (format!("a{i:04}"), "v".to_string()))
+        .collect();
+    expected_map.push(("r1".to_string(), "y".to_string()));
+    assert_eq!(
+        map_values(&read_parquet(&export_pq), "attrs"),
+        vec![expected_map]
+    );
+
+    load_file(&store, &export_pq, "beta", &mapping, LOAD_NS + ONE_SEC_NS).await;
+    let beta = stored(&store, "beta", T0, T1, LOAD_NS + ONE_SEC_NS).await;
+    assert_eq!(beta, alpha, "the span re-loads with every attribute");
 }
