@@ -130,6 +130,15 @@ diagnostics() {
   kubectl describe -n "$NAMESPACE" pods 2>&1 | sed 's/^/[pods] /' >&2 || true
   kubectl logs -n "$NAMESPACE" deploy/ravel-operator --tail=80 2>&1 |
     sed 's/^/[operator] /' >&2 || true
+  # A crashlooping server exits before /metrics or a readiness probe says why;
+  # its last container's output is the only place the refusal is written.
+  local pod
+  for pod in $(kubectl get -n "$NAMESPACE" pods -l app.kubernetes.io/managed-by=ravel-operator \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null); do
+    kubectl logs -n "$NAMESPACE" "$pod" --tail=60 2>&1 | sed "s/^/[${pod}] /" >&2 || true
+    kubectl logs -n "$NAMESPACE" "$pod" --previous --tail=60 2>&1 |
+      sed "s/^/[${pod} previous] /" >&2 || true
+  done
   log "cluster ${CLUSTER_NAME} left running for inspection; scripts/kind-down.sh removes it"
   return "$status"
 }
@@ -298,7 +307,8 @@ spec:
       # Both backends speak plaintext http:// on a Service name, which no pod
       # reaches over loopback; without this the server refuses to start.
       allowHttp: true
-      uploadIntegrity: ${UPLOAD_INTEGRITY}
+      # Quoted: YAML reads a bare off as the boolean false.
+      uploadIntegrity: "${UPLOAD_INTEGRITY}"
       credentialsSecretRef:
         name: ${S3_CREDENTIALS_SECRET}
   tenantTokensSecretRef:
@@ -308,14 +318,15 @@ spec:
   gateway:
     replicas: 1
     # Kept identical to the example: an explicit block replaces the rendered
-    # default request rather than merging with it.
+    # default request rather than merging with it. No memory limit: the
+    # server subtracts a fixed 2 GiB overhead reserve from its cgroup limit
+    # to size its memory budget and refuses to start on a 0-byte budget.
     resources:
       requests:
         cpu: 100m
         memory: 256Mi
       limits:
         cpu: 500m
-        memory: 512Mi
   query:
     replicas: 1
   maintain:
