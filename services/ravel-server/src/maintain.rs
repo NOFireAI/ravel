@@ -241,8 +241,9 @@ pub struct MaintenanceSafetyMetrics {
     /// this process observed, so a later unit with a smaller lag must not lower
     /// it and units must not add together.
     retention_lag_ns_accum: [AtomicI64; MAINTAINED_SIGNALS.len()],
-    /// The published count of units whose retention/compaction scan failed in
-    /// the most recent completed cycle (issue #2073), paired with
+    /// The published count of units whose retention/compaction scan failed, or
+    /// that a failed provisioning or shard-generation read skipped, in the most
+    /// recent completed cycle (issue #2073), paired with
     /// `units_scan_failed_accum` the same way as the two gauges above. A failed
     /// scan reports no retention lag, so this is what an operator reads beside
     /// `ravel_maintain_retention_lag_seconds` to know the lag did not cover
@@ -723,7 +724,9 @@ impl MaintenanceSafetyMetrics {
     }
 
     /// Units of `signal` whose retention/compaction scan returned an error in
-    /// this process's most recent completed maintenance cycle. A gauge, backing
+    /// this process's most recent completed maintenance cycle, or that were
+    /// skipped unscanned because their `(tenant, signal)`'s provisioning check
+    /// or shard-generation read failed. A gauge, backing
     /// `ravel_maintain_units_scan_failed` (issue #2073): each such unit is
     /// missing from [`retention_lag_ns`](Self::retention_lag_ns).
     pub fn units_scan_failed(&self, signal: Signal) -> u64 {
@@ -2102,6 +2105,26 @@ fn note_owned_units(
     }
 }
 
+/// Count each unit of `signal` this process owns below `shard_count` as a
+/// failed scan, for a `(tenant, signal)` whose provisioning check or
+/// shard-generation read failed. Those units are skipped before any is scanned,
+/// so they report no retention lag, and a transient store error there
+/// increments no other counter.
+fn record_skipped_units_scan_failed(
+    safety: &MaintenanceSafetyMetrics,
+    worker: &WorkerSet,
+    live_set: &[Uuid],
+    tenant: &TenantHash,
+    signal: Signal,
+    shard_count: u32,
+) {
+    for shard in 0..shard_count {
+        if worker.owns_unit(live_set, tenant, signal, shard) {
+            safety.record_scan_failed(signal);
+        }
+    }
+}
+
 /// Every orphan candidate the pass left present in the live set (ADR-0058
 /// decision 1), which is what the `orphans_present` gauge reports.
 ///
@@ -2227,6 +2250,7 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
             // `ravel_provisioning_shard_count_mismatch_total` fires for a
             // maintain-only mismatch, not just an ingest-path one.
             crate::provisioning::note_provisioning_failure(&err);
+            record_skipped_units_scan_failed(safety, worker, live_set, tenant, signal, shard_count);
             tracing::error!(
                 tenant = %tenant.to_hex(),
                 signal = ?signal,
@@ -2258,6 +2282,14 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
                 Ok(None) => shard_count,
                 Err(err) => {
                     crate::provisioning::note_provisioning_failure(&err);
+                    record_skipped_units_scan_failed(
+                        safety,
+                        worker,
+                        live_set,
+                        tenant,
+                        signal,
+                        shard_count,
+                    );
                     tracing::error!(
                         tenant = %tenant.to_hex(),
                         signal = ?signal,
@@ -8017,6 +8049,9 @@ mod tests {
         )
         .await;
         safety.publish_scan_cycle();
+        let faults_after_first =
+            store.fault_count(Op::List, ravel_object_store::fault::FaultKind::Transient);
+        assert!(faults_after_first > 0, "shard 0's listing really faulted");
         assert_eq!(first.retired, 1, "shard 1's expired bucket was tombstoned");
         assert_eq!(
             safety.units_scan_failed(Signal::Metrics),
@@ -8038,6 +8073,11 @@ mod tests {
         )
         .await;
         safety.publish_scan_cycle();
+        assert!(
+            store.fault_count(Op::List, ravel_object_store::fault::FaultKind::Transient)
+                > faults_after_first,
+            "shard 0's listing faulted again on tick 2"
+        );
         assert_eq!(
             safety.units_scan_failed(Signal::Metrics),
             1,
@@ -8065,6 +8105,79 @@ mod tests {
         );
     }
 
+    /// Issue #2073: a `(tenant, signal)` whose provisioning check or
+    /// shard-generation read fails with a store error skips every unit it owns
+    /// before scanning any, and each of those units counts on
+    /// `units_scan_failed`. A store error is not a hard provisioning failure,
+    /// so nothing else counts it. Both reads GET the provisioning record: on an
+    /// empty store the check issues the first GET and, finding no record and no
+    /// data, passes; the generation read issues the second.
+    ///
+    /// Watch it fail: delete the `record_skipped_units_scan_failed` call on
+    /// the failing read's `continue` path in `run_tick_with_clock`; the
+    /// matching assertion reads left 0, right 2.
+    #[tokio::test]
+    async fn a_failed_provisioning_read_counts_its_skipped_units_as_scan_failed() {
+        use ravel_object_store::fault::{FaultKind, Occurrence};
+
+        let tenant = TenantId::new("acme").hash();
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let worker = solo_worker();
+        let live = worker.solo_live_set();
+        let prov_key = ravel_catalog::provisioning_key(&tenant, Signal::Metrics);
+
+        for (occurrence, read) in [
+            (Occurrence::Nth(1), "the provisioning check"),
+            (Occurrence::Nth(2), "the shard-generation read"),
+        ] {
+            let store = FaultStore::new(
+                MemoryStore::new(),
+                FaultPlan::empty().with_rule(
+                    Rule::new(
+                        Op::Get,
+                        ScriptedFault::Transient("provisioning record unavailable".into()),
+                    )
+                    .with_key_contains(prov_key.clone())
+                    .with_occurrence(occurrence),
+                ),
+            );
+            let safety = MaintenanceSafetyMetrics::default();
+            let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+            let mut memo = MaintainMemo::with_default_interval();
+
+            safety.begin_scan_cycle();
+            run_tick_with_clock(
+                &FixedClock::new(1_700_000_000 * 1_000_000_000),
+                &store,
+                &tenant,
+                &compactor,
+                &retention,
+                2,
+                &mut memo,
+                &safety,
+                &ownership,
+                &worker,
+                &live,
+            )
+            .await;
+            safety.publish_scan_cycle();
+
+            assert_eq!(
+                store.fault_count(Op::Get, FaultKind::Transient),
+                1,
+                "{read} really faulted"
+            );
+            assert_eq!(
+                safety.units_scan_failed(Signal::Metrics),
+                2,
+                "both owned units {read} skipped are counted"
+            );
+            assert_eq!(safety.units_scan_failed(Signal::Logs), 0);
+            assert_eq!(safety.units_scan_failed(Signal::Spans), 0);
+        }
+    }
+
     /// Issue #2073 item 3: a superseded-input sweep adds the exact recorded
     /// size of every L0 data object it deletes to `bytes_reclaimed`. Tick 1
     /// compacts two inputs; tick 2, past the compaction record's protection
@@ -8079,10 +8192,14 @@ mod tests {
         let written_ns: i64 = 1_700_000_000 * 1_000_000_000;
         let store = MemoryStore::new();
         store.set_clock_ms((written_ns / 1_000_000) as u64);
-        let mut sizes = 0u64;
-        for seq in 1..=2 {
-            sizes += publish_compactable_input(&store, &tenant_id, 0, seq).await;
+        // A longer metric name at seq 1000 gives the two inputs distinct
+        // recorded sizes, so charging one input's size for both cannot pass.
+        let mut input_sizes = Vec::new();
+        for seq in [1, 1_000] {
+            input_sizes.push(publish_compactable_input(&store, &tenant_id, 0, seq).await);
         }
+        assert_ne!(input_sizes[0], input_sizes[1], "the inputs' sizes differ");
+        let sizes: u64 = input_sizes.iter().sum();
         let compactor = CompactorConfig::default();
         let retention = RetentionConfig::default();
         let worker = solo_worker();
@@ -10701,6 +10818,53 @@ mod alert_retention_tests {
 
         tick(&store, &tenant, &disabled, &safety, &worker, &live).await;
         let mut expected = vec![keyspace.clone(), format!("quarantine/{keyspace}")];
+        expected.extend(sweep_listings(&tenant, false));
+        assert_eq!(store.take_alert_listings(&tenant), expected);
+    }
+
+    /// The gate's soundness rests on its error path: a gate listing that fails
+    /// has not shown the keyspace empty, so the sweep still runs and its own
+    /// listings report the store fault. Only the gate's first listing faults
+    /// here (the first listing under the alert keyspace on a tick with the
+    /// memo read disabled); the sweep's listings after it succeed.
+    ///
+    /// Watch it fail: make the `Err(err)` arm of the gate match in
+    /// `run_alert_retention` return early. The tick then issues the failed
+    /// gate listing alone, a list of 1 against 7.
+    #[tokio::test]
+    async fn a_failed_gate_listing_still_runs_the_sweep() {
+        use ravel_object_store::fault::{FaultKind, Occurrence};
+
+        let memory = MemoryStore::new();
+        memory.set_clock_ms(((NOW_NS - 100 * NS_PER_DAY) / 1_000_000) as u64);
+        let tenant = TenantId::new("quiet").hash();
+        let keyspace = alert_keyspace(&tenant);
+        let store = ListLog::new(FaultStore::new(
+            memory,
+            FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::List,
+                    ScriptedFault::Transient("alert keyspace unavailable".into()),
+                )
+                .with_key_contains(keyspace.clone())
+                .with_occurrence(Occurrence::Nth(1)),
+            ),
+        ));
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        let disabled = CompactorConfig {
+            alert_retention_window_ns: 0,
+            ..CompactorConfig::default()
+        };
+
+        tick(&store, &tenant, &disabled, &safety, &worker, &live).await;
+
+        assert_eq!(
+            store.inner.fault_count(Op::List, FaultKind::Transient),
+            1,
+            "the gate's listing really faulted"
+        );
+        let mut expected = vec![keyspace];
         expected.extend(sweep_listings(&tenant, false));
         assert_eq!(store.take_alert_listings(&tenant), expected);
     }

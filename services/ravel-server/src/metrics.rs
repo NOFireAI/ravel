@@ -3577,9 +3577,10 @@ pub struct MaintenanceSafetySignalSnapshot {
     /// deletions whose object size is known without an extra request: the
     /// quarantine reaper and rule 3's unreferenced-part delete at their listed
     /// size (issue #1729), and rule 2's superseded data at the `object_size`
-    /// its commit, compaction or rewrite record carries (issue #2073). A
-    /// counter. Retention deletions are excluded; they delete by key without a
-    /// known size, so counting them would need an extra request.
+    /// its commit, compaction or rewrite record carries (issue #2073), a part
+    /// on the pass that deletes the record naming it. A counter. Retention
+    /// deletions are excluded; they delete by key without a known size, so
+    /// counting them would need an extra request.
     pub bytes_reclaimed: u64,
     /// Retention lag for this signal, in nanoseconds, from the most recent
     /// completed maintenance cycle (issue #1729): for the oldest bucket that is
@@ -3588,7 +3589,8 @@ pub struct MaintenanceSafetySignalSnapshot {
     /// and a per-cycle maximum over this process's units, rendered in seconds as
     /// `ravel_maintain_retention_lag_seconds`.
     pub retention_lag_ns: i64,
-    /// Units of this signal whose retention/compaction scan failed in the most
+    /// Units of this signal whose retention/compaction scan failed, or that a
+    /// failed provisioning or shard-generation read skipped, in the most
     /// recent completed maintenance cycle (issue #2073). A gauge, rendered as
     /// `ravel_maintain_units_scan_failed`: a failed unit reports no retention
     /// lag, so a nonzero value means `retention_lag_ns` did not cover every
@@ -4083,9 +4085,11 @@ fn render_maintain_safety_family(
          start. Object sizes, not wire bytes: the quarantine reaper and rule 3's unreferenced-part \
          delete count each object at the size their listing returned, and the superseded-input \
          sweep counts each superseded data object and part at the object_size its commit, \
-         compaction or rewrite record carries. Retention deletions are excluded because they \
-         delete by key without a known size, so this is a lower bound on total bytes reclaimed, \
-         not the whole of it. Per process: sum across maintain replicas for the fleet.",
+         compaction or rewrite record carries, a part on the pass that deletes the record naming \
+         it, so each is counted once. Retention deletions are excluded because they \
+         delete by key without a known size, so this undercounts the bytes reclaimed, except \
+         that two replicas sweeping one unit during an ownership handoff can each count the \
+         same object. Per process: sum across maintain replicas for the fleet.",
         "counter",
     );
     for signal in &snapshot.signals {
@@ -4106,9 +4110,13 @@ fn render_maintain_safety_family(
          units: it names the single worst bucket, not a sum. The deadline is the bucket's newest \
          event plus the retention window when this process tombstoned the bucket itself; \
          otherwise the earlier of its ingest hour's end plus the window and its tombstone time, \
-         which under-reads by up to one hour. A unit whose scan failed contributes nothing, so \
-         read this beside ravel_maintain_units_scan_failed. A value that keeps climbing means \
-         retention's physical sweep is not keeping pace; see the troubleshooting guide.",
+         which under-reads by up to one hour plus max_ingest_lag (three hours at the defaults) \
+         and over-reads by at most the allowed future clock skew. A tombstoned bucket holding a \
+         rewrite record is measured from its tombstone time alone, which never over-reads. A \
+         unit whose scan failed, or that a failed provisioning read skipped, contributes \
+         nothing, so read this beside ravel_maintain_units_scan_failed. A value that keeps \
+         climbing means retention's physical sweep is not keeping pace; see the troubleshooting \
+         guide.",
         "gauge",
     );
     for signal in &snapshot.signals {
@@ -4124,8 +4132,9 @@ fn render_maintain_safety_family(
         out,
         "ravel_maintain_units_scan_failed",
         "Units (tenant, shard) of this signal whose retention and compaction scan returned an \
-         error in this process's most recent completed maintenance cycle, by signal. A gauge. A \
-         failed unit reports no retention lag, so while this is nonzero \
+         error in this process's most recent completed maintenance cycle, or that were skipped \
+         unscanned because their provisioning check or shard-generation read failed, by signal. \
+         A gauge. A failed unit reports no retention lag, so while this is nonzero \
          ravel_maintain_retention_lag_seconds does not cover every unit and can read 0 for a \
          signal whose sweep is stuck. Per process: sum across maintain replicas for the fleet.",
         "gauge",

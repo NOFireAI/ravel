@@ -428,6 +428,19 @@ async fn publish_l0_segment(
     hour: u32,
     writer_seq: u64,
 ) -> u64 {
+    publish_l0_segment_with_samples(store, tenant, shard, hour, writer_seq, 1).await
+}
+
+/// [`publish_l0_segment`] with `sample_count` samples, one nanosecond apart,
+/// so two segments can carry distinct recorded sizes.
+async fn publish_l0_segment_with_samples(
+    store: &MemoryStore,
+    tenant: &TenantId,
+    shard: u32,
+    hour: u32,
+    writer_seq: u64,
+    sample_count: i64,
+) -> u64 {
     let tenant_hash = tenant.hash();
     let writer_id = Uuid::from_u128(7);
     let created_unix_ns = i64::from(hour) * NS_PER_HOUR + 1_000_000_000;
@@ -440,10 +453,12 @@ async fn publish_l0_segment(
     let series = vec![SeriesInput {
         series_id,
         labels,
-        samples: vec![Sample {
-            ts_ns: created_unix_ns,
-            value: writer_seq as f64,
-        }],
+        samples: (0..sample_count)
+            .map(|offset| Sample {
+                ts_ns: created_unix_ns + offset,
+                value: writer_seq as f64,
+            })
+            .collect(),
     }];
     let identity = SegmentIdentity {
         tenant_hash: tenant_hash.0,
@@ -1015,21 +1030,37 @@ async fn one_clocked_tick_moves_every_backlog_and_throughput_figure_by_the_exact
     let hour_r = tick_1_hour - 31 * 24;
 
     let mut writer_seq = 0u64;
-    let mut bucket_b_input_bytes = 0u64;
+    let mut bucket_b_input_sizes = Vec::new();
     for (hour, depth) in [
         (hour_a, COMPACTING_DEPTH),
         (hour_c, RESIDENT_DEPTH),
         (hour_b, 2),
         (hour_r, 1),
     ] {
-        for _ in 0..depth {
+        for index in 0..depth {
             writer_seq += 1;
-            let size = publish_l0_segment(store.as_ref(), &tenant, 0, hour, writer_seq).await;
+            // Bucket B's inputs carry one and two samples, so their recorded
+            // sizes differ and one size charged for both cannot pass.
+            let samples = if hour == hour_b { index as i64 + 1 } else { 1 };
+            let size = publish_l0_segment_with_samples(
+                store.as_ref(),
+                &tenant,
+                0,
+                hour,
+                writer_seq,
+                samples,
+            )
+            .await;
             if hour == hour_b {
-                bucket_b_input_bytes += size;
+                bucket_b_input_sizes.push(size);
             }
         }
     }
+    assert_ne!(
+        bucket_b_input_sizes[0], bucket_b_input_sizes[1],
+        "bucket B's inputs have distinct recorded sizes"
+    );
+    let bucket_b_input_bytes: u64 = bucket_b_input_sizes.iter().sum();
 
     let bucket_b = ravel_maintain::Bucket::new(tenant_hash, Signal::Metrics, 0, hour_b);
     let offline = ravel_maintain::compact_bucket(

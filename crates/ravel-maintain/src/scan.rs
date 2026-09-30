@@ -195,12 +195,17 @@ pub struct MaintainReport {
     /// timestamp, so a pass over a bucket another process (or an earlier run of
     /// this one) tombstoned measures from the earlier of the hour's nominal
     /// expiry (`(hour + 1) * NS_PER_HOUR + retention_window_ns`) and the
-    /// tombstone's `retired_at_ns`. The
-    /// true expiry is at or before both, so that fallback under-reads the lag
-    /// by up to one hour, except that an event running past its ingest hour by
-    /// the allowed future clock skew can make the nominal figure over-read by
-    /// up to that skew. It is the figure `ravel_maintain_retention_lag_seconds`
-    /// renders (issue #1729).
+    /// tombstone's `retired_at_ns`. An event can sit up to `max_ingest_lag`
+    /// before its ingest hour, so that fallback under-reads the lag by up to
+    /// one hour plus `max_ingest_lag` (three hours at the defaults), and an
+    /// event running past its ingest hour by the allowed future clock skew can
+    /// make the nominal figure over-read by up to that skew. A tombstoned
+    /// bucket that lists a rewrite record measures from `retired_at_ns` alone,
+    /// because a rewrite with no parts stands its `created_unix_ns` in for an
+    /// event time and can move the expiry to any instant before the tombstone:
+    /// that figure never over-reads, and under-reads by how long after its
+    /// expiry the tombstone was written. It is the figure
+    /// `ravel_maintain_retention_lag_seconds` renders (issue #1729).
     pub retention_lag_ns: i64,
 }
 
@@ -224,8 +229,11 @@ fn reschedule_ns(skip: &ClaimSkip) -> i64 {
 /// ([`ObservedExpiry::NoLaterThan`]). The true expiry is at or before both
 /// instants, except that an event running past its ingest hour by the allowed
 /// clock skew can put it after the nominal one, so the fallback under-reads by
-/// how far the earlier of the two sits past the true expiry: at most an hour,
-/// since a bucket's events fall inside its hour. Uses saturating arithmetic
+/// how far the earlier of the two sits past the true expiry: at most one hour
+/// plus `max_ingest_lag`, since an event can sit that far before its ingest
+/// hour. For a bucket that lists a rewrite record
+/// ([`ObservedExpiry::NoLaterThanOnly`]) the nominal deadline bounds nothing,
+/// so the lag is `now` past `retired_at_ns` alone. Uses saturating arithmetic
 /// throughout, matching [`classify_zone`].
 fn expired_bucket_retention_lag_ns(
     hour: u32,
@@ -239,6 +247,7 @@ fn expired_bucket_retention_lag_ns(
     let since = |instant_ns: i64| now_ns.saturating_sub(instant_ns).max(0);
     match expiry {
         Some(ObservedExpiry::Exact(expiry_ns)) => since(expiry_ns),
+        Some(ObservedExpiry::NoLaterThanOnly(retired_at_ns)) => since(retired_at_ns),
         fallback => {
             let bucket_end_ns = i64::from(hour)
                 .saturating_add(1)
@@ -2546,6 +2555,20 @@ mod invalidate_tests {
         assert_eq!(
             expired_bucket_retention_lag_ns(HOUR, now, Some(window), late),
             5 * NS_PER_HOUR
+        );
+        // A bucket listing a rewrite record: an erasure's parts-less rewrite
+        // can push the expiry past the nominal deadline, so only the tombstone
+        // bounds it and the lag is `now` past `retired_at_ns`. Flipped line:
+        // delete the `NoLaterThanOnly` arm in `expired_bucket_retention_lag_ns`;
+        // "only the tombstone bounds a rewritten bucket" reads left 18000000000000,
+        // right 14400000000000.
+        let rewritten = Some(ObservedExpiry::NoLaterThanOnly(
+            bucket_end + window + NS_PER_HOUR,
+        ));
+        assert_eq!(
+            expired_bucket_retention_lag_ns(HOUR, now, Some(window), rewritten),
+            4 * NS_PER_HOUR,
+            "only the tombstone bounds a rewritten bucket"
         );
     }
 
