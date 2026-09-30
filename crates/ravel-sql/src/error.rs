@@ -132,8 +132,9 @@ pub enum ErrorClass {
     Timeout,
     /// A permanent data-integrity fault: a corrupt stored object, a decode
     /// that failed or panicked on it, or a fetched object that does not match
-    /// the request. A retry re-reads the same bytes and fails the same way,
-    /// so it is kept apart from [`ErrorClass::Unavailable`]. 500.
+    /// the request. The fault is in the stored data or in this build's
+    /// ability to read it, so the same request to the same build fails the
+    /// same way; it is kept apart from [`ErrorClass::Unavailable`]. 500.
     Internal,
 }
 
@@ -528,44 +529,11 @@ impl SqlError {
         }
     }
 
-    /// True for a permanent data-integrity fault: every error
-    /// [`SqlError::client_message`] redacts to [`MSG_CORRUPT`]. The fetchers
-    /// report a panicked read-gate decode job as their `Corrupt` variant, so
-    /// it lands here too. Same rule as the PromQL HTTP surface, which answers
-    /// 500 for exactly the faults it redacts to that message.
+    /// True exactly when [`SqlError::client_message`] redacts to
+    /// [`MSG_CORRUPT`], except for [`SqlError::Shared`], which keeps the
+    /// class captured with it.
     fn is_integrity_fault(&self) -> bool {
-        matches!(
-            self,
-            SqlError::Catalog(
-                CatalogError::Reconstruction { .. }
-                    | CatalogError::FieldMismatch { .. }
-                    | CatalogError::Record(_)
-                    | CatalogError::Key(_)
-            ) | SqlError::ColumnStats(
-                LoadColumnStatsError::HeadCorrupt { .. }
-                    | LoadColumnStatsError::TenantHashMismatch { .. }
-            ) | SqlError::Fetch(
-                FetchError::Corrupt { .. }
-                    | FetchError::Store {
-                        source: StoreError::Corrupted(_),
-                        ..
-                    }
-            ) | SqlError::LogFetch(
-                LogFetchError::Corrupt { .. }
-                    | LogFetchError::CarryMismatch { .. }
-                    | LogFetchError::Store {
-                        source: StoreError::Corrupted(_),
-                        ..
-                    }
-            ) | SqlError::SpanFetch(
-                SpanFetchError::Corrupt { .. }
-                    | SpanFetchError::TenantMismatch { .. }
-                    | SpanFetchError::Store {
-                        source: StoreError::Corrupted(_),
-                        ..
-                    }
-            ) | SqlError::CorruptStreamAttrs(_)
-        )
+        !matches!(self, SqlError::Shared { .. }) && self.client_message() == MSG_CORRUPT
     }
 
     /// True when this error is a store `NotFound` on a pinned segment: the
@@ -712,6 +680,7 @@ mod tests {
         assert!(err.to_string().contains(LEAKY_KEY));
         assert_eq!(err.client_message(), MSG_CORRUPT);
         assert_redacted(&err.client_message());
+        assert_eq!(err.class(), ErrorClass::Internal);
     }
 
     #[test]
@@ -722,6 +691,7 @@ mod tests {
         assert!(err.to_string().contains(RAW_STORE_TEXT));
         assert_eq!(err.client_message(), MSG_UNAVAILABLE);
         assert_redacted(&err.client_message());
+        assert_eq!(err.class(), ErrorClass::Unavailable);
     }
 
     #[test]
@@ -778,14 +748,51 @@ mod tests {
         assert_redacted(&reverify.client_message());
     }
 
-    /// Every fault the redaction calls corrupt takes the internal class, and
-    /// nothing else does: the PromQL surface's rule. The panicked-decode cases
-    /// are built the way each fetcher reports a `CpuGateError::Panicked` job.
+    /// One value of every variant the redaction calls corrupt takes the
+    /// internal class, and a sample of transient faults does not: the PromQL
+    /// surface's rule. The panicked-decode cases are built the way each
+    /// fetcher reports a `CpuGateError::Panicked` job.
     #[test]
     fn exactly_the_corrupt_faults_take_the_internal_class() {
         let key = || LEAKY_KEY.to_string();
         let panicked = "read CPU gate: the gated job panicked".to_string();
         let corrupt = [
+            SqlError::Catalog(CatalogError::Reconstruction {
+                key: key(),
+                source: ravel_commit::keys::ReconstructionError::ObjectKeyMismatch {
+                    expected: key(),
+                    actual: format!("{LEAKY_KEY}.other"),
+                },
+            }),
+            SqlError::Catalog(CatalogError::FieldMismatch {
+                key: key(),
+                field: "tenant_hash",
+                expected: "aaaa".to_string(),
+                actual: TENANT_HASH.to_string(),
+            }),
+            SqlError::Catalog(CatalogError::Record(
+                ravel_commit::record::RecordError::InvalidTenantHashLen(3),
+            )),
+            SqlError::Catalog(CatalogError::Key(ravel_commit::keys::KeyError::Malformed {
+                key: key(),
+                reason: "truncated".to_string(),
+            })),
+            SqlError::ColumnStats(LoadColumnStatsError::HeadCorrupt {
+                key: key(),
+                source: ravel_catalog::SnapshotFormatError::BadMagic,
+            }),
+            SqlError::ColumnStats(LoadColumnStatsError::TenantHashMismatch {
+                key: key(),
+                expected: "aaaa".to_string(),
+                actual: TENANT_HASH.to_string(),
+            }),
+            SqlError::LogFetch(LogFetchError::CarryMismatch {
+                key: key(),
+                carried_key: format!("{LEAKY_KEY}.other"),
+                tenant: ravel_types::TenantHash([1u8; 16]),
+                carried_tenant: ravel_types::TenantHash([2u8; 16]),
+            }),
+            SqlError::SpanFetch(SpanFetchError::TenantMismatch { key: key() }),
             SqlError::Fetch(FetchError::Corrupt {
                 key: key(),
                 source: ravel_segment::SegmentError::Decompress(panicked.clone()),
@@ -834,6 +841,17 @@ mod tests {
             SqlError::Catalog(CatalogError::Store(StoreError::Transient(
                 RAW_STORE_TEXT.into(),
             ))),
+            SqlError::ColumnStats(LoadColumnStatsError::Store {
+                key: key(),
+                source: StoreError::AccessDenied(RAW_STORE_TEXT.into()),
+            }),
+            SqlError::ColumnStats(LoadColumnStatsError::MemoryExhausted(
+                ravel_memory::MemoryExhausted {
+                    requested: 4096,
+                    reserved: 1024,
+                    limit: 2048,
+                },
+            )),
             SqlError::SnapshotInvalidated,
         ];
         for err in &transient {
