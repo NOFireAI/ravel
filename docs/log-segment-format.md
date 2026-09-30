@@ -41,11 +41,11 @@ irreversible boundary for a v3 store was 0.11.0 to 0.12.0, not 0.10.x to
 Version 5 changed two byte layouts: the BLOOM section gained its
 covered-column list, and filters are no longer rounded to a power of two, so
 the version-4 BLOOM parser would misread a version-5 section. The footer gained
-two fields (`sort_descriptor`, `clustering_generation`). The writer at version
-5 records no sort descriptor and generation 0, covers every column version 4
-indexed, and emits neither tag 12 nor tag 13. It does emit tags 10 and 11, and
-it chooses each page's encoding by stored size (see "Encodings (tag
-registry)"). A version-4 object is refused with `UnsupportedVersion` from the
+two fields (`sort_descriptor`, `clustering_generation`). By default the writer
+at version 5 records no sort descriptor and generation 0, covers every column
+version 4 indexed, and emits neither tag 12 nor tag 13. It does emit tags 10
+and 11, and it chooses each page's encoding by stored size (see "Encodings
+(tag registry)"). A version-4 object is refused with `UnsupportedVersion` from the
 trailer alone, before the footer or any section is requested. Under the
 pre-v1.0 posture below, a development store holding version-4 objects is wiped
 or re-ingested.
@@ -180,8 +180,10 @@ are permitted.
   each a name and a type (str, i64, bool, bytes). `clustering_generation` is
   the tenant clustering generation the object was written under: 0 means the
   tenant never set a key, and a cleared key leaves the descriptor absent with
-  a nonzero generation. The writer at version 5 records no descriptor and
-  generation 0 on every object.
+  a nonzero generation. The writer records the descriptor and generation its
+  caller passes to `RlogWriter::with_sort_descriptor`, and no descriptor and
+  generation 0 when the caller passes none; see "BLOCKS" for the order it
+  writes and the descriptors it refuses.
 - unknown section kinds MUST be skipped by readers (forward
   compatibility).
 
@@ -341,10 +343,43 @@ exact scan and to no stat, always legal.
 When the footer carries no `sort_descriptor`, records are sorted
 `(stream_ref ascending, ts_ns ascending)`. When it carries one, records are
 sorted `(stream_ref, time bucket, key columns, ts_ns)` as the descriptor
-defines (see "LogFooter", row order). The writer at version 5 records no
-descriptor, so every object it writes has the first order. Target 8192
-records per block, cap 8 MiB uncompressed. Per block, one page per column
-that has at least one value in the block.
+defines (see "LogFooter", row order). Target 8192 records per block, cap 8 MiB
+uncompressed. Per block, one page per column that has at least one value in
+the block.
+
+The writer uses the descriptor order when its caller sets one with
+`RlogWriter::with_sort_descriptor`, and the rules below hold on the row-major
+and the columnar write paths alike, which produce byte-identical objects:
+
+- A record's value for a key column is its first per-record attribute with the
+  key's name whose value stores as the key's type (see FIELD_DIR's per-type
+  splitting; a list or map value stores as bytes), whether or not that
+  attribute took a dynamic column. Stream-level (resource and scope)
+  attributes are not per-record values. A record with no such attribute has no
+  value for the key.
+- Key values compare as values, never as dictionary ids: a record with no
+  value sorts before every record with one, i64 values compare as signed
+  integers, str and bytes values compare bytewise (a prefix before its
+  extensions, so the empty value before every other), and false sorts before
+  true.
+- The time bucket is `ts_ns.div_euclid(bucket_width)` in nanoseconds (1 hour
+  is 3,600,000,000,000). Rows equal on the whole
+  `(stream_ref, bucket, key_1, ..., key_n, ts_ns)` tuple keep the order the
+  writer received them in.
+- Block and object min/max `ts_ns` stay folds over their rows: under a
+  descriptor a block's first and last rows need not hold its extremes.
+
+The writer refuses the whole object with `InvalidSortDescriptor` when it
+builds it (`finish` or `finish_compacted`), before encoding any block, for a
+descriptor with `clustering_generation` 0, with no key column or more than
+four, with an empty key column name or a name used twice, or with a key column
+that no record of the object carries as a per-record attribute of the declared
+type. The last covers a key carried only as a stream-level attribute and a key
+carried only with another type. The first four are the footer decoder's own
+descriptor checks, so a descriptor the writer records passes them. A key
+present on only some records is accepted, and so is a key some streams also
+carry at stream level: records whose value sits only on the stream layer have
+no value for it.
 
 A **block** is a logical unit, not a byte range. It is what SKIP_IDX level 0,
 BLOOM, and POSTINGS are keyed by, and nothing about its size or its pruning
@@ -878,9 +913,18 @@ count entries, entry i for block i:
 A reader builds a bloom arm only for a covered column. A filter probe for an
 uncovered column proves nothing, so that column is scanned instead of pruned
 and no matching row is dropped (ADR-2135 decision 5). A covered id is either a
-fixed column id (below 10) or a column FIELD_DIR names. The writer at version 5
-covers `severity_text`, `body`, and every string attribute column in FIELD_DIR,
-which is every column version 4 inserted.
+fixed column id (below 10) or a column FIELD_DIR names. The writer's covered set
+is its BLOOM scope, which its caller sets with `RlogWriter::with_bloom_scope`:
+
+- `All`, the default: `severity_text`, `body`, and every string attribute
+  column in FIELD_DIR, which is every column version 4 inserted.
+- `Undeclared`, given the tenant's declared-column names: `severity_text`,
+  `body`, and every string attribute column in FIELD_DIR whose name is not
+  declared. A declared name that is not a string column changes nothing.
+- `Text`: `severity_text` and `body` only.
+
+The covered list is exactly that set, ascending, and no filter holds a key of
+a column outside it.
 
 Inserted keys are hashed as
 `h = blake3(seed_le(8) || column_id_le(4) || token)`, reading three 64-bit
@@ -904,9 +948,8 @@ of two.
 
 Inserted per block, all field-scoped by `column_id`:
 
-- every word token (see Tokenizer) of `body` and of every string column
-  value;
-- the exact value, for string values of at most 64 bytes, to accelerate
+- every word token (see Tokenizer) of every covered column's value;
+- the exact value, for covered values of at most 64 bytes, to accelerate
   equality where the page was not dictionary-encoded.
 
 Field-scoping (the `column_id` in the hash) means a `body` match never
@@ -1118,8 +1161,8 @@ The merge is defined entirely in terms of this format:
   the output object's sort descriptor: `(stream_ref ascending, ts
   ascending)` when the output carries none, and `(stream_ref, time bucket,
   key columns, ts)` when it carries one (ADR-2135 decision 2 picks the
-  output descriptor). The writer at version 5 records no descriptor, so a
-  compacted part today is sorted `(stream_ref, ts)`. The records are then
+  output descriptor). The compactor sets no descriptor on its writer yet, so
+  a compacted part today is sorted `(stream_ref, ts)`. The records are then
   re-chunked at the same 8192 record block target, then placed into row groups of `group_target_blocks`
   consecutive blocks with their pages column-major (ADR-0699 decision 1).
   Compaction is where full row groups arise: an L0 flush object is usually one
