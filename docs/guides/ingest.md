@@ -1235,10 +1235,11 @@ would re-time or refuse, or a mapped attribute whose stored string its declared
 type cannot reproduce (`"007"` declared `i64`). Refusals are counted per kind
 and name the first offending span in output order. A `[spans]` mapping has no
 `attrs_map_column`, so the span kind, trace state, flags, events and links a
-span ingested over OTLP carries, and any attribute the mapping does not name,
-are not written. Those are not refused: the report line
-`spans_with_unwritten_attributes` counts the written spans that lost at least
-one of them, and a load of the file gives those spans without them.
+span ingested over OTLP carries, any attribute the mapping does not name, and
+a parent id, status code or status message whose optional column the mapping
+omits, are not written. Those are not refused: the report line
+`spans_with_unwritten_data` counts the written spans that lost at least one of
+them, and a load of the file gives those spans without them.
 
 ### What the window means
 

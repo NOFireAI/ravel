@@ -505,7 +505,7 @@ async fn load_then_export_then_load_round_trips_every_mapped_span_field() {
     assert_eq!(report.rows_written, 4);
     assert_eq!(report.erasure_predicates, 0);
     assert_eq!(
-        report.spans_with_unwritten_attributes, 2,
+        report.spans_with_unwritten_data, 2,
         "the root and the later trace carry the unmapped tenant.tier"
     );
 
@@ -829,7 +829,12 @@ async fn attributes_the_file_does_not_carry_are_counted_per_span() {
         .expect("export succeeds");
     assert_eq!(report.rows_written, 3);
     assert_eq!(
-        report.spans_with_unwritten_attributes, 2,
+        report.segments_read, 2,
+        "one object from the file load, one from the OTLP ingest"
+    );
+    assert_eq!(report.segments_pruned, 0);
+    assert_eq!(
+        report.spans_with_unwritten_data, 2,
         "the _kind span and the tenant.tier span; the mapped-only span lost nothing"
     );
 
@@ -849,6 +854,91 @@ async fn attributes_the_file_does_not_carry_are_counted_per_span() {
     );
     assert!(attrs_of(&beta, [0x22; 8]).is_empty());
     assert!(attrs_of(&beta, [0x33; 8]).is_empty());
+}
+
+/// A `[spans]` mapping naming only the required fields: no parent, status
+/// code or status message column, and no attributes.
+const REQUIRED_ONLY_MAPPING: &str = r#"
+[spans]
+trace_id_column = "trace_id"
+span_id_column  = "span_id"
+name_column     = "name"
+start_ts_column = "start_ns"
+start_ts_unit   = "nanos"
+end_ts_column   = "end_us"
+end_ts_unit     = "micros"
+"#;
+
+/// A parent id, a non-Unset status code and a status message the mapping has
+/// no column for are not written, and each span that stored one is counted:
+/// three of the four spans lost one field each, the bare span lost nothing.
+#[tokio::test]
+async fn span_fields_the_mapping_has_no_column_for_are_counted_per_span() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    load_rows(
+        &store,
+        dir.path(),
+        "alpha",
+        &spans_mapping(SPANS_MAPPING),
+        &[
+            Src {
+                parent: Some([0x10; 8]),
+                ..bare(1, 0x11, "child", T0, T0 + ONE_MS_NS)
+            },
+            Src {
+                status_code: Some(2),
+                ..bare(2, 0x22, "failed", T0 + 2 * ONE_MS_NS, T0 + 3 * ONE_MS_NS)
+            },
+            Src {
+                status_message: Some("deadlock"),
+                ..bare(3, 0x33, "explained", T0 + 4 * ONE_MS_NS, T0 + 5 * ONE_MS_NS)
+            },
+            bare(4, 0x44, "bare", T0 + 6 * ONE_MS_NS, T0 + 7 * ONE_MS_NS),
+        ],
+    )
+    .await;
+    let alpha = stored(&store, "alpha", T0, T1, LOAD_NS).await;
+    let span = |spans: &[SpanRecord], span_id: [u8; 8]| -> SpanRecord {
+        spans
+            .iter()
+            .find(|span| span.span_id == span_id)
+            .expect("span stored")
+            .clone()
+    };
+    assert_eq!(span(&alpha, [0x11; 8]).parent_span_id, Some([0x10; 8]));
+    assert_eq!(span(&alpha, [0x22; 8]).status_code, StatusCode::Error);
+    assert_eq!(
+        span(&alpha, [0x33; 8]).status_message.as_deref(),
+        Some("deadlock")
+    );
+
+    let mapping = spans_mapping(REQUIRED_ONLY_MAPPING);
+    let export_pq = dir.path().join("export.parquet");
+    let report = export_window(&store, "alpha", T0, T1, &mapping, &export_pq)
+        .await
+        .expect("export succeeds");
+    assert_eq!(report.rows_written, 4);
+    assert_eq!(
+        report.spans_with_unwritten_data, 3,
+        "the child's parent, the failed span's status and the explained span's message"
+    );
+
+    load_file(&store, &export_pq, "beta", &mapping, LOAD_NS + ONE_SEC_NS).await;
+    let beta = stored(&store, "beta", T0, T1, LOAD_NS + ONE_SEC_NS).await;
+    let expected: Vec<SpanRecord> = alpha
+        .into_iter()
+        .map(|mut span| {
+            span.parent_span_id = None;
+            span.status_code = StatusCode::Unset;
+            span.status_message = None;
+            span
+        })
+        .collect();
+    assert_eq!(
+        beta, expected,
+        "the re-loaded spans lack exactly the fields the file does not carry"
+    );
 }
 
 /// Loads `rows` into tenant `alpha` under [`SPANS_MAPPING`], exports

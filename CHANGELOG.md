@@ -738,9 +738,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   erasure matches with the check the SQL spans scan makes, and writes every
   `[spans]` mapping field as stored, with no deduplication, sorted by start
   time, then trace id, then span id. Span kind, trace state, flags, events,
-  links and any attribute the mapping does not name are not written, and the
-  report counts the spans that lost them as
-  `spans_with_unwritten_attributes`. Each timestamp is written in its
+  links, any attribute the mapping does not name, and a parent id, status code
+  or status message whose optional column the mapping omits are not written,
+  and the report counts the spans that lost them as
+  `spans_with_unwritten_data`. Each timestamp is written in its
   declared unit, and the export refuses, in the metrics export's gathered
   form ("refused on N spans for this reason; first: ..."), a span whose start
   the load would re-time or refuse, a timestamp finer than its unit, and a

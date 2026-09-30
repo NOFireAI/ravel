@@ -278,8 +278,9 @@ therefore carries the mapped fields only, and narrows decision 4 as follows:
 - The span fields RSPAN keeps under reserved attribute keys (span kind,
   trace state, flags, events and links, which a span ingested over OTLP
   carries and for none of which decision 2 gives the mapping a field, and
-  whose reserved keys a mapping may not name) and any attribute the
-  mapping does not name are not written. A span carrying one is exported
-  without it rather than refused, and the report counts those spans as
-  `spans_with_unwritten_attributes`, so a lossy export says how lossy it
-  was.
+  whose reserved keys a mapping may not name), any attribute the mapping
+  does not name, and a parent id, a status code other than Unset or a
+  status message when the mapping omits that optional column are not
+  written. A span carrying one is exported without it rather than refused,
+  and the report counts those spans as `spans_with_unwritten_data`, so a
+  lossy export says how lossy it was.

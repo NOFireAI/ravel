@@ -116,9 +116,10 @@
 //! and a stored string no such value produces (`"007"` under `i64`) is
 //! refused by name. A `[spans]` mapping has no `attrs_map_column`, so only
 //! the mapped fields are written: the reserved attributes holding a span's
-//! kind, trace state, flags, events and links, and any stored attribute the
-//! mapping does not name, are not, and the report counts the spans that
-//! carried one ([`SpansExportReport::spans_with_unwritten_attributes`]).
+//! kind, trace state, flags, events and links, any stored attribute the
+//! mapping does not name, and a parent id, status code or status message the
+//! mapping has no column for, are not, and the report counts the spans that
+//! carried one ([`SpansExportReport::spans_with_unwritten_data`]).
 
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -146,7 +147,7 @@ use ravel_query::erasure::{
 use ravel_query::{
     DedupKey, FetchedSeriesSoa, LogQuery, LogSegmentFetcher, SegmentFetcher, SpanSegmentFetcher,
 };
-use ravel_rspan::{SpanQuery, SpanRecord};
+use ravel_rspan::{SpanQuery, SpanRecord, StatusCode};
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::{LabelSet, METRIC_NAME_LABEL, SeriesId, Signal, TenantHash, TenantId, TimeRange};
 
@@ -217,12 +218,15 @@ pub struct SpansExportReport {
     pub segments_pruned: u64,
     /// Pending selective-erasure predicates applied to this read.
     pub erasure_predicates: usize,
-    /// Written spans that carried at least one stored attribute the file does
-    /// not carry: a reserved key holding a span field the `[spans]` mapping
-    /// cannot name (kind, trace state, flags, events, links), or a key the
-    /// mapping does not name. A load of the file gives those spans without
-    /// them.
-    pub spans_with_unwritten_attributes: u64,
+    /// Written spans that carried at least one stored value the file does not
+    /// carry: an attribute under a reserved key holding a span field the
+    /// `[spans]` mapping cannot name (kind, trace state, flags, events,
+    /// links) or under a key the mapping does not name, a parent id when the
+    /// mapping has no `parent_span_id_column`, a status code other than Unset
+    /// when it has no `status_code_column`, or a status message when it has
+    /// no `status_message_column`. A load of the file gives those spans
+    /// without them.
+    pub spans_with_unwritten_data: u64,
 }
 
 /// The refusal a `[metrics.histogram]` mapping gets from `export --signal
@@ -319,8 +323,8 @@ pub async fn run(
         println!("segments_pruned: {}", report.segments_pruned);
         println!("erasure_predicates: {}", report.erasure_predicates);
         println!(
-            "spans_with_unwritten_attributes: {}",
-            report.spans_with_unwritten_attributes
+            "spans_with_unwritten_data: {}",
+            report.spans_with_unwritten_data
         );
         return Ok(());
     }
@@ -1173,8 +1177,9 @@ fn build_metrics_batch(
 /// module documentation): a timestamp that is not a whole number of its
 /// declared unit, a start a load would re-time or refuse, or a mapped
 /// attribute whose stored string the declared type does not read back. The
-/// attributes the mapping cannot or does not name are not written and are
-/// counted, not refused.
+/// attributes the mapping cannot or does not name, and a parent id, status
+/// code or status message the mapping has no column for, are not written and
+/// are counted, not refused.
 #[allow(clippy::too_many_arguments)]
 pub async fn export_spans(
     store: Arc<dyn ObjectStoreBackend>,
@@ -1239,7 +1244,7 @@ pub async fn export_spans(
     spans.sort_by_key(|span| (span.start_ts_ns, span.trace_id, span.span_id));
 
     let rows = span_output_rows(mapping, &spans)?;
-    let spans_with_unwritten_attributes = spans_with_unwritten_attributes(mapping, &spans);
+    let spans_with_unwritten_data = spans_with_unwritten_data(mapping, &spans);
     let empty = build_spans_batch(mapping, &[])?;
     let rows_written = write_output(out, empty.schema(), |writer| {
         let mut rows_written = 0u64;
@@ -1258,22 +1263,33 @@ pub async fn export_spans(
         segments_read,
         segments_pruned: snapshot.segments_pruned,
         erasure_predicates,
-        spans_with_unwritten_attributes,
+        spans_with_unwritten_data,
     })
 }
 
-/// How many of `spans` carry a stored attribute no mapped attribute names.
-fn spans_with_unwritten_attributes(mapping: &SpansMapping, spans: &[SpanRecord]) -> u64 {
+/// How many of `spans` carry a stored value [`build_spans_batch`] does not
+/// write under `mapping`: an attribute no mapped attribute names, or a
+/// parent id, non-Unset status code or status message whose column the
+/// mapping omits.
+fn spans_with_unwritten_data(mapping: &SpansMapping, spans: &[SpanRecord]) -> u64 {
     let mapped: BTreeSet<&str> = span_mapped_attributes(mapping)
         .map(|spec| spec.key.as_str())
         .collect();
     let mut unwritten = 0u64;
     for span in spans {
-        if span
+        let lost_parent = mapping.parent_span_id_column.is_none() && span.parent_span_id.is_some();
+        let lost_status =
+            mapping.status_code_column.is_none() && span.status_code != StatusCode::Unset;
+        let lost_message = mapping.status_message_column.is_none()
+            && span
+                .status_message
+                .as_deref()
+                .is_some_and(|message| !message.is_empty());
+        let lost_attribute = span
             .attrs
             .iter()
-            .any(|(key, _)| !mapped.contains(key.as_str()))
-        {
+            .any(|(key, _)| !mapped.contains(key.as_str()));
+        if lost_parent || lost_status || lost_message || lost_attribute {
             unwritten += 1;
         }
     }

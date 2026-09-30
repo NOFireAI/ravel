@@ -673,9 +673,10 @@ enum Command {
     /// is refused rather than written as a file that loads onto other series.
     /// A spans export writes the mapped fields only, and refuses by name a
     /// span whose mapped fields a load would not read back as stored; span
-    /// kind, trace state, flags, events, links and any attribute the mapping
-    /// does not name are not written, and the report counts the spans that
-    /// lost them.
+    /// kind, trace state, flags, events, links, any attribute the mapping
+    /// does not name, and a parent id, status code or status message the
+    /// mapping has no column for are not written, and the report counts the
+    /// spans that lost them.
     Export {
         /// Signal to export: `logs`, `metrics` or `spans`. No default: a
         /// command that chooses for you which data it touches is a silent
@@ -709,9 +710,10 @@ enum Command {
         /// back, or, for metrics, refuses by name a series no file under it
         /// re-loads as the same one. For spans, every mapped field round-trips
         /// and a span whose mapped fields would not is refused by name; span
-        /// kind, trace state, flags, events, links and any attribute the
-        /// mapping does not name are not written, and the report counts the
-        /// spans that lost them.
+        /// kind, trace state, flags, events, links, any attribute the mapping
+        /// does not name, and a parent id, status code or status message the
+        /// mapping has no column for are not written, and the report counts
+        /// the spans that lost them.
         #[arg(long, value_name = "TOML")]
         mapping: std::path::PathBuf,
         /// Configured shard count, used to resolve the catalog. The tenant's
