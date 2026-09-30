@@ -1536,6 +1536,35 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   differs from the first file's; it also refuses a prefix with no file or
   more than 100,000 (`MAX_TABLE_FILES`), a listing whose raw delivery
   decreases, and a snapshot that outlives its deadline.
+- **Parquet queries reserve the bytes they fetch against the process memory
+  budget and obey the request and byte budgets every other SQL query obeys**
+  (issue #2239, ADR-1170 decision 2). Every range the Parquet reader returns
+  to the scan (column chunks, footer reads, page ranges) reserves its byte
+  length against the executor's process memory budget before the read cache
+  is consulted or a GET is issued, and the reservation is released when
+  parquet drops the bytes, not when the GET returns. A batch of ranges is
+  reserved whole before any of it is read. A refused reservation fails the
+  query with the error the signal fetchers raise for theirs
+  (`FetchMemoryExhausted`, the same class, HTTP status and client message)
+  and issues no GET for the refused range. With the default unlimited memory
+  budget nothing is refused. The decoded-footer cache (`metadata_cache_bytes`)
+  is a separate, separately bounded cache and is not charged to that budget:
+  only a footer's raw bytes are, while the reader holds them to decode them.
+  A Parquet statement is also held to `max_s3_requests` and
+  `max_bytes_scanned` from the effective config, so a request's clamped
+  budgets apply. At resolve, the requests the resolve made plus one GET per
+  file the statement opens (a floor: an uncached footer and each column chunk
+  cost more) are checked against the request budget, and the estimate is no
+  longer zero. At execution each GET is refused before it is issued if it
+  would take the query's request count or scanned bytes past a budget
+  (`RequestBudgetExceeded`, `TooManyBytesScanned`). The bytes counted are the
+  wire bytes of GET response bodies, the resolve phase's manifest and grant
+  reads included; a read served from the cache issues and counts no request.
+  A row window on a statement that names only non-signal tables is refused
+  before anything is read. A dropped table is an unknown table on every
+  resolve path, including a signal table beside a Parquet name and a server
+  with no credential profile file, at one extra GET of the newest manifest per
+  name that has versions.
 
 ## [0.19.0] - 2026-09-27
 
