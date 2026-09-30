@@ -62,9 +62,18 @@
 //!   so a non-`Off` mode is a deployment assertion that the endpoint honors it.
 //!   `upload_checksum` is not in [`Capabilities::mandatory`] and gates no mode,
 //!   so either setting starts. See [`UploadIntegrity`] and `capabilities()`
-//!   below. The multipart per-part path keeps only the local pre-flight: a
-//!   multipart `UploadPart` takes no `with_checksum_algorithm` value in this
-//!   client, and there is no whole-object digest to attach at `complete`.
+//!   below. When on, `put()` keeps every size on the single-PUT path: one
+//!   billed request where multipart costs parts + 2, and one checksum over
+//!   the whole object's bytes as sent. The algorithm is set for the whole
+//!   client, so the explicit `put_multipart` path already sends checksums
+//!   under integrity: `object_store`'s `create_multipart` sends
+//!   `x-amz-checksum-algorithm` and each `put_part` goes through
+//!   `PutRequest::with_payload`, which attaches the part's digest. It sends
+//!   no `x-amz-checksum-type`, so what the endpoint records for the completed
+//!   object is its default type for the algorithm (on AWS, a full-object
+//!   checksum for CRC64-NVME and a composite one for SHA-256). Routing large
+//!   overwrites through it under integrity waits on a real-endpoint check
+//!   that the endpoint verifies those part checksums.
 //! - **Read-side checksum verification is header-driven, and a whole-object
 //!   read is only verifiable when one response carried the whole object**
 //!   (ADR-1696 decisions 2 to 4). `object_store` 0.14's `GetResult` exposes no
@@ -167,9 +176,10 @@ pub const MULTIPART_PART_SIZE: usize = 8 * 1024 * 1024;
 /// failure mode is re-sending the entire object.
 pub const MULTIPART_THRESHOLD: usize = 2 * MULTIPART_PART_SIZE;
 /// S3's single-request PUT ceiling. With upload integrity enabled, `put`
-/// stays on the single-PUT path (server-verified checksum, one billed
-/// request) up to this size and refuses above it rather than silently
-/// taking the unverified multipart path.
+/// stays on the single-PUT path (one billed request, one server-verified
+/// checksum over the whole object) up to this size and refuses above it
+/// rather than switching to multipart, whose per-part checksums have not
+/// been checked against a real endpoint.
 pub const SINGLE_PUT_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 // The chunking constants satisfy S3's part rules by construction, checked at
@@ -1488,6 +1498,55 @@ pub(crate) fn map_get_error(e: object_store::Error) -> StoreError {
     map_error_common(e)
 }
 
+/// `delete`-specific mapping. `object_store` sends every delete as a
+/// `DeleteObjects` request, and S3 refuses a single key inside that request's
+/// 200 response. `object_store` surfaces the refusal as `Error::Generic` over a
+/// crate-private `DeleteFailed`, so its S3 error code is recoverable only from
+/// the `Display` text. Each named code maps the way the single-request path
+/// maps the HTTP status S3 documents for it: 403 to
+/// [`StoreError::AccessDenied`], 404 to [`StoreError::NotFound`], 412 to
+/// [`StoreError::PreconditionFailed`], 503 to [`StoreError::Throttled`]. Any
+/// other code falls through to [`classify_generic`]. A response naming
+/// `SlowDown` or `InternalError` never gets here: `object_store` retries the
+/// whole request on either, and an exhausted retry is an ordinary `Generic`.
+fn map_delete_error(e: object_store::Error) -> StoreError {
+    if let object_store::Error::Generic { store, source } = &e
+        && let Some(code) = delete_objects_key_code(source.as_ref())
+    {
+        match code.as_str() {
+            "AccessDenied"
+            | "AllAccessDisabled"
+            | "AccountProblem"
+            | "InvalidAccessKeyId"
+            | "InvalidObjectState"
+            | "SignatureDoesNotMatch" => {
+                return StoreError::AccessDenied(format!("{store}: {source}"));
+            }
+            "NoSuchKey" => return StoreError::NotFound,
+            "PreconditionFailed" => return StoreError::PreconditionFailed,
+            "ServiceUnavailable" => {
+                return StoreError::Throttled {
+                    retry_after_ms: 1000,
+                };
+            }
+            _ => {}
+        }
+    }
+    map_error_common(e)
+}
+
+/// The S3 error code of a per-key `DeleteObjects` refusal, parsed from
+/// `object_store`'s `"DeleteObjects request failed for key {path}: {message}
+/// (code: {code})"`. `None` for any other error.
+fn delete_objects_key_code(
+    source: &(dyn std::error::Error + Send + Sync + 'static),
+) -> Option<String> {
+    let msg = source.to_string();
+    let rest = msg.strip_prefix("DeleteObjects request failed for key ")?;
+    let (_, code) = rest.rsplit_once(" (code: ")?;
+    code.strip_suffix(')').map(str::to_string)
+}
+
 /// Walk an error's [`std::error::Error::source`] chain looking for
 /// `object_store`'s publicly nameable [`object_store::client::HttpError`],
 /// returning its [`object_store::client::HttpErrorKind`] if present.
@@ -2307,16 +2366,19 @@ impl ObjectStoreBackend for S3Store {
             {
                 return self.put_via_multipart(key, data).await;
             }
-            // With upload integrity enabled the multipart path is excluded:
-            // its parts carry no server-verified checksum, and advertising
-            // `upload_checksum` while a large overwrite bypasses verification
-            // would be a lie. The single-PUT path covers every size up to
-            // S3's 5 GiB per-request ceiling -- which also costs ONE billed
-            // PUT where multipart costs parts + 2 -- and a payload above the
-            // ceiling is refused loudly rather than silently downgraded.
+            // With upload integrity enabled the multipart path is excluded.
+            // Its part requests carry checksums (`object_store` attaches one
+            // to each `put_part` when the client has an algorithm), but no real
+            // endpoint has been checked to verify them, so `upload_checksum`
+            // rests on the single-PUT path alone: ONE billed PUT where
+            // multipart costs parts + 2, and one checksum over the whole
+            // object. That path covers every size up to S3's 5 GiB
+            // per-request ceiling, and a payload above it is refused loudly.
             if self.upload_integrity.is_enabled() && data.len() as u64 > SINGLE_PUT_MAX_BYTES {
                 return Err(StoreError::Permanent(format!(
-                    "put of {key}: {} bytes exceeds the {SINGLE_PUT_MAX_BYTES}-byte single-PUT                      ceiling, and multipart uploads carry no server-verified checksum; disable                      upload integrity (UploadIntegrity::Off) to write objects this large",
+                    "put of {key}: {} bytes exceeds the {SINGLE_PUT_MAX_BYTES}-byte single-PUT \
+                     ceiling, and with upload integrity on every put is a single PUT; disable \
+                     upload integrity (UploadIntegrity::Off) to write objects this large",
                     data.len(),
                 )));
             }
@@ -2534,11 +2596,11 @@ impl ObjectStoreBackend for S3Store {
     async fn delete(&self, key: &str) -> Result<(), StoreError> {
         connector::scope(StoreOp::Delete, async move {
             let path = path_of(key);
-            match self.store.delete(&path).await {
+            match self.store.delete(&path).await.map_err(map_delete_error) {
                 Ok(()) => Ok(()),
                 // Idempotent per the contract: deleting a missing key succeeds.
-                Err(object_store::Error::NotFound { .. }) => Ok(()),
-                Err(e) => Err(map_error_common(e)),
+                Err(StoreError::NotFound) => Ok(()),
+                Err(e) => Err(e),
             }
         })
         .await

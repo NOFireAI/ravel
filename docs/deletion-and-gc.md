@@ -792,22 +792,49 @@ into them. An operator with erasure obligations must budget them deliberately.
 - **`+D`, bucket-default Object Lock retention.** If the operator enabled
   compliance-mode default retention `D` (the out-of-band step ADR-0042
   documents; Ravel cannot set or enforce per-object retention through
-  `object_store`), S3 itself refuses the sweep's deletes until each object's
-  retain-until passes, so the physical-removal bound becomes `max(bound, D)`.
+  `object_store`), S3 does not refuse the sweep's deletes. Object Lock needs
+  a versioned bucket, every Ravel delete names no version id
+  (`S3Store::delete` calls `object_store`'s delete, which sends a
+  `DeleteObjects` request, `POST /?delete`, whose body carries only the
+  key), and on a versioned bucket that request succeeds and inserts a delete marker:
+  Object Lock protects object versions, not the current-version pointer.
+  The key reads as absent to Ravel at once, and the locked version stays in
+  storage as a noncurrent version until its retain-until passes and the
+  `NoncurrentDays = E_v` expiration rule (below) removes it, which lifecycle
+  does not do while the version is locked. The physical-removal bound
+  becomes `max(bound + E_v, D)`, the later of the two: it comes from
+  noncurrent-version expiry and `D`, not from the sweep waiting.
   docs/object-store-contract.md "Required bucket configuration" advises
   operators with erasure obligations to prefer scoped legal holds over
   blanket default retention, or to keep `D` inside their erasure SLA.
 
-- **`+R`, scoped per-object compliance retention on commit records
+- **`R`, scoped per-object compliance retention on commit records
   (`t/*/*/c/*`).** Under the scoped posture (bucket default retention OFF,
   an operator-run mechanism applying per-object retention instead;
   docs/object-store-contract.md "Required bucket configuration", ADR-0072
-  decision 3), a superseded commit record still under its retention period
-  `R` refuses the same sweep delete `+D` describes. `sweep_superseded` runs
-  three delete loops in order over every cleared chain: every chain's input
-  commit records first, then every chain's input data objects, then every
-  chain's own compaction or rewrite records last. A refused delete (access
-  denied, a failed precondition, or a permanent error) stops only the chain
+  decision 3), a superseded commit record still locked, with retain-until
+  `R` (a time: the moment the mechanism locked it plus the retention period
+  it chose), behaves as `+D` describes: the sweep's delete succeeds as a
+  delete marker, the chain's collection carries on as if the record were
+  unlocked, and the locked version is physically removed at
+  `max(bound + E_v, R)`, the later of `bound + E_v` and `R`.
+
+  The refusal path `sweep_superseded` tolerates per chain is reached by a
+  deny policy or a credential without `s3:DeleteObject`, not by Object
+  Lock. It is the only maintenance pass that tolerates a refusal per chain:
+  every other pass that deletes, ADR-0019 retention deletion and the
+  unreferenced-catalog sweep among them, fails as a whole on the first
+  refused delete. S3 reports that refusal per key inside the `DeleteObjects` 200
+  response, and `S3Store::delete` maps a per-key `AccessDenied` (and every
+  other 403 code) to `StoreError::AccessDenied` and a per-key
+  `PreconditionFailed` to `StoreError::PreconditionFailed`, so it reaches
+  this path per chain rather than failing the pass as a retryable error;
+  docs/object-store-contract.md "Required bucket configuration" lists every
+  mapped code. It runs three delete loops in order over every cleared chain: every
+  chain's input commit records first, then every chain's input data
+  objects, then every chain's own compaction or rewrite records last. A
+  refused delete (access denied, a failed precondition, or a permanent
+  error) stops only the chain
   it belongs to: that chain deletes none of its later keys in that pass, in
   any of the three loops, so its own deletes stop where a crash at that key
   would stop them. Another chain can still delete a key in the stopped
@@ -819,11 +846,11 @@ into them. An operator with erasure obligations must budget them deliberately.
   collects every other chain, provided at least one delete in the pass
   succeeds. A pass in which every delete it attempted was refused fails with
   the first refusal's error, which is what a credential without delete
-  permission produces. A lock on a chain's input commit record therefore holds that
-  chain's data at `max(bound, R)` until `R` elapses. A lock on a chain's own
-  compaction or rewrite record is met only after that chain's input records
-  and their data are already gone: it holds only that record, and the ones
-  above it, at `max(bound, R)`, for the next pass to retry. A delete that
+  permission produces. A refusal on a chain's input commit record therefore
+  holds that chain's data until the refusal is lifted. A refusal on a
+  chain's own compaction or rewrite record is met only after that chain's
+  input records and their data are already gone: it holds only that record,
+  and the ones above it, for the next pass to retry. A delete that
   fails with a retryable error (a timeout, throttling, a transient fault), a
   read-only store, or a backend with no delete support still fails the whole
   pass. `sys/*`, `t/*/*/prov`, and
@@ -831,21 +858,32 @@ into them. An operator with erasure obligations must budget them deliberately.
   of supersession GC, ADR-0019 retention deletion, or ADR-0064 erasure.
   That is a statement about those three mechanisms and nothing wider: the
   catalog family is swept by a fourth one, the unreferenced-catalog sweep,
-  which carries its own `+R` erasure bound for some tenants (below). Keep
-  `R` inside `protection_horizon` (about 25 h with defaults) so the sweep
-  keeps making progress on superseded chains.
+  which carries its own erasure bound under `R` for some tenants (below). The
+  sweep's progress on superseded chains does not depend on `R`, since
+  Object Lock refuses none of its deletes.
 
-- **`+R` again, scoped per-object compliance retention on the catalog
+- **`R` again, scoped per-object compliance retention on the catalog
   keyspace (`t/*/catalog/*/*`).** A compliance lock on this keyspace
   costs an erasure obligation, not only reclamation. The unreferenced-catalog
   sweep deletes the snapshot and index objects the current HEAD no longer
   names, and for a tenant with a `STR` or `BYTES` typed attribute column a
   per-part `.cstat` index object among them holds that subject's own column
-  value; a lock over the keyspace delays that delete, and the erased value
-  persists until the fold reconciles the hour and then a further `R`. The
+  value. A lock over the keyspace does not delay that delete, which
+  succeeds as a delete marker as under `+D`, but the locked version holding
+  the value stays in storage. The sweep deletes the stale `.cstat` only
+  once the fold has reconciled the hour (or HEAD is rebuilt) and the
+  object's `last_modified` age exceeds `protection_horizon` (25 h 5 min
+  with defaults), and the locked version then stays until its retain-until
+  `R` has passed and noncurrent-version expiry has fired `E_v` after the
+  delete: the erased value persists until
+  `max(max(T_f, T_w + protection_horizon) + S + E_v, R)`, where `T_f` is
+  when the fold reconciles that hour (or HEAD is rebuilt), `T_w` is the
+  stale object's `last_modified`, `S` is one sweep interval (default
+  5 min), and `R` is the locked version's retain-until. The
   shipped Maintain IAM policy permits that delete, with its catalog deny
   scoped to `catalog/<signal>/HEAD`; a copy of that template predating the
-  narrowing denies it outright and leaves the bound open-ended until it is
+  narrowing denies it outright, which fails the whole `(tenant, signal)`
+  pass of that sweep every tick and leaves the bound open-ended until it is
   re-applied. The four-step mechanism,
   the exact bound, the IAM ceiling, and the HEAD-scoping advice are in
   docs/object-store-contract.md's "Required bucket configuration" section,
@@ -874,7 +912,7 @@ into them. An operator with erasure obligations must budget them deliberately.
   decision 1; see [guides/disaster-recovery.md](guides/disaster-recovery.md)),
   a subject erased on the primary survives on the replica until the replica's
   own noncurrent-version expiration reaps it. With `DeleteMarkerReplication`
-  enabled, the primary's simple DELETE replicates as a delete marker and the
+  enabled, the delete marker the primary's delete inserts replicates and the
   replica's copy is physically gone within **replication lag + `E_v_r`** after
   the primary sweep (`E_v_r` is the replica's `NoncurrentDays` rule). This is
   additive to the primary's own `+E_v`: the primary carries erased-subject
@@ -887,7 +925,8 @@ into them. An operator with erasure obligations must budget them deliberately.
   Consequences).
 
   > **Unsupported configuration: a replica without `DeleteMarkerReplication`.**
-  > Every Ravel delete is a simple DELETE, which becomes a delete marker on a
+  > Every Ravel delete names no version id (a `DeleteObjects` entry carrying
+  > only the key), which becomes a delete marker on a
   > versioned bucket and replicates **only** when `DeleteMarkerReplication` is
   > enabled. A replica configured without it never receives the delete markers
   > that reap erased (or retention-, orphan-, supersession-deleted) bytes, so
@@ -911,7 +950,7 @@ into them. An operator with erasure obligations must budget them deliberately.
     `I64` and `BOOL` extrema (proto/ravel/commit.proto,
     `DeclaredColumnStatValue`), which cannot represent a `STR` or `BYTES`
     value either. The per-part `.cstat` column-statistics objects are the
-    exception the `+R` modifier above sets out: for a tenant with a `STR` or
+    exception the catalog-keyspace `R` modifier above sets out: for a tenant with a `STR` or
     `BYTES` typed attribute column they hold that column's exact min, max,
     and distinct-value dictionary (the dictionary only up to a fixed entry
     cap; the min and max always), so an erased subject's own value can sit

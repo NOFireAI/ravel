@@ -442,6 +442,30 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **An S3 delete refused for one key now reads as access denied, so the
+  superseded sweep holds back that one chain instead of failing the pass**
+  (issues #2227 and #2220). `S3Store::delete` goes out as a `DeleteObjects`
+  request, and S3 reports a per-key refusal (a deny policy, a credential
+  without `s3:DeleteObject`) inside that request's 200 response.
+  `object_store` surfaces it as an untyped error, which Ravel classified as
+  `Transient`, so a refusal the sweep is built to tolerate per chain failed
+  the whole pass and was retried as if the store were unavailable. The per-key
+  code now maps by the HTTP status S3 documents for it: the 403 codes
+  (`AccessDenied`, `AllAccessDisabled`, `AccountProblem`,
+  `InvalidAccessKeyId`, `InvalidObjectState`, `SignatureDoesNotMatch`) to
+  `AccessDenied`, `NoSuchKey` to a successful idempotent delete,
+  `PreconditionFailed` to `PreconditionFailed`, and `ServiceUnavailable` to
+  `Throttled`. Any other code keeps its previous classification. Only the
+  superseded sweep tolerates a refusal per chain; every other maintenance
+  pass that deletes, the unreferenced-catalog sweep among them, still fails
+  its pass on the first refused delete. The documentation no longer says a
+  compliance-mode Object Lock retention refuses the sweep's delete: a delete
+  naming no version id lands as a delete marker on the versioned bucket, and
+  the locked version is removed once its retain-until and noncurrent-version
+  expiry have both passed. The advice to keep a commit-record retention
+  inside `protection_horizon` so the sweep keeps making progress is
+  withdrawn, since the lock never pauses the sweep.
+
 - **A gateway starts under a small memory limit** (issue #2234).
   `ravel-server` refused to start in every mode under a cgroup memory limit of
   2 GiB or less, because the process memory budget (effective memory minus a

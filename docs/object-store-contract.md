@@ -561,11 +561,23 @@ same bytes back. It applies to `Overwrite` only; a `CreateIfAbsent` or
 **Checksum coverage.** `put_part`'s optional `UploadChecksum` is verified
 per part, before the part is sent, with exactly the reach `PutOptions::checksum`
 has on the same backend: a real check on `MemoryStore`, a local pre-flight
-against the caller's buffer on `S3Store` (see "Upload checksums": nothing can
-be put on the wire through `object_store` 0.14). A mismatch fails that
+against the caller's buffer on `S3Store` (see "Upload checksums": the
+caller's CRC32C value itself cannot be put on the wire through `object_store`
+0.14). That is separate from the server-verified checksum `upload_integrity`
+selects, which this path already sends whenever integrity is on, because the
+algorithm is set for the whole client: `object_store` 0.14.1's
+`create_multipart` sends `x-amz-checksum-algorithm`, and each `put_part` goes
+through `PutRequest::with_payload`, which attaches that part's
+`x-amz-checksum-crc64nvme` or `x-amz-checksum-sha256`. It sends no
+`x-amz-checksum-type`, so what the endpoint records for the completed object
+is its default type for the algorithm (on AWS, a full-object checksum for
+CRC64-NVME and a composite one for SHA-256). `put()` does not route large
+overwrites here under integrity yet (see "Upload checksums"), pending a
+real-endpoint check that the endpoint verifies the part checksums.
+A mismatch fails that
 `put_part` with `Corrupted`, does not count as a part, and leaves the upload
 open, so the caller may re-send the same bytes with a correct checksum. There
-is **no whole-object checksum** for a multipart upload: `complete` takes no
+is **no caller-supplied whole-object checksum** for a multipart upload: `complete` takes no
 checksum argument, and the object never exists as one buffer to digest. Ravel's
 integrity guarantee for these objects is therefore read-time only, from the
 footer/section/page crc32c hierarchy (docs/segment-format.md), same as for any
@@ -771,8 +783,15 @@ ranged read of the same object is served.
 
 With `upload_integrity` on, `put()` never takes its above-threshold multipart
 path: every object up to S3's 5 GiB single-request limit goes out as one
-checksummed PUT, and a larger payload is refused rather than sent unchecked.
-Only the explicit `put_multipart` API uploads parts, and no production writer
+checksummed PUT, and a larger payload is refused rather than sent as
+multipart. The reason is cost and shape, not a missing mechanism: one PUT is
+one billed request where multipart costs parts + 2, and the whole object gets
+one checksum over its bytes as sent, where multipart sends one with each part
+and leaves the completed object's checksum type to the endpoint's default for
+the algorithm. The explicit `put_multipart` path already sends those part
+checksums under integrity (see "Checksum coverage" under "Multipart upload"),
+so a later change can switch large overwrites to multipart under integrity
+once a real endpoint is shown to verify them. Only the explicit `put_multipart` API uploads parts, and no production writer
 calls it; for what a caller-supplied part checksum covers there, see "Checksum
 coverage" under "Multipart upload".
 
@@ -1120,11 +1139,21 @@ adapter contract:
    immutability the commit and catalog layers assume as a given (see "Data
    objects, commit records, manifests, and index objects are immutable";
    this section is that invariant's bucket-level enforcement point). Object
-   Lock is what makes that assumption hold even against a compromised or
-   misconfigured credential that can otherwise issue deletes: compliance
-   mode refuses deletion or overwrite for the configured retention period,
-   with no principal (including the bucket owner) able to shorten or remove
-   it. Subject identifiers that must remain erasable under ADR-0064 live in
+   Lock protects object *versions*: compliance mode refuses any request that
+   would destroy or alter a locked version (a delete naming its version id,
+   a lifecycle expiration) for the configured retention period, with no
+   principal (including the bucket owner) able to shorten or remove it. It
+   does not protect the key's current-version pointer. Object Lock requires
+   a versioned bucket, and there a delete with no version id succeeds and
+   inserts a delete marker, and a PUT adds a new current version; neither
+   is refused. Against a compromised or misconfigured credential, then, the
+   guarantee is that every locked version stays recoverable, not that the
+   key keeps reading it. Every Ravel delete is such a delete:
+   `S3Store::delete` calls `object_store` 0.14.1's `ObjectStoreExt::delete`,
+   which for S3 goes through `delete_stream` and sends a `DeleteObjects`
+   request (`POST /?delete`) whose body names only the key, with no
+   `VersionId`. Ravel never sets `disable_bulk_delete`, the one switch that
+   would send a path `DELETE` instead. Subject identifiers that must remain erasable under ADR-0064 live in
    *values*, never in *object keys or names*, so naming a prefix in the lock
    never exposes a subject value through the pattern itself. What a locked
    object *contains* is a separate question, and for one member of the
@@ -1141,32 +1170,56 @@ adapter contract:
    erasure sweep itself deletes only the `.dreq` request objects; the
    rewrite pass supersedes its inputs, and the superseded sweep then
    removes those inputs' commit records like any other superseded chain).
-   A per-object compliance-mode retention `R` on a still-locked commit
-   record refuses that delete until `R` elapses, so the physical-removal
-   bound for the record (and for the sweep pass holding it) becomes
-   `max(bound, R)`. The superseded sweep runs three delete loops in order
-   over every cleared chain in the pass: every chain's input commit
-   records first, then every chain's input data objects (its L0 data and
-   pre-rewrite L1 segments), then every chain's own compaction or rewrite
-   records last, so a rewrite record outlives every input it superseded.
-   A refused delete stops only the chain it belongs to: that chain's later
-   keys are left for a later pass, in every loop, and every other chain in
-   the pass is still collected. A pass in which every delete it attempted
-   was refused still fails with the first refusal, so a credential without
-   delete permission stalls the unit rather than passing quietly. A lock
-   on a chain's input commit record
-   therefore leaves that chain's L0 data in place, undeleted, until the
-   record's retention expires and a later pass completes the delete. A
-   lock on a chain's own compaction or rewrite record is met only after
-   the pass has deleted that chain's input records and their data, so the
-   refusal holds only the chain's own record, and any above it, through
-   the retention period for the next pass to retry once `R` elapses; the
+   A per-object compliance-mode retention on a still-locked commit record,
+   retained until `R`, does not refuse that delete. The sweep's `DeleteObjects` entry
+   carries no version id, so it succeeds and inserts a delete marker: the key reads as
+   absent to Ravel from then on, and the sweep moves on exactly as it would
+   on an unlocked record. The locked version stays in storage as a
+   noncurrent version. The noncurrent-version expiration rule point 1
+   requires (`NoncurrentDays = E_v`, counted from the delete) cannot remove
+   it while it is locked, so it is physically removed by a lifecycle run
+   once both its retain-until has passed and `E_v` has elapsed since the
+   delete: the physical-removal bound for the record is the later of
+   `bound + E_v` and its retain-until `R` (a time: the moment the mechanism
+   locked the version plus the retention period it chose), written
+   `max(bound + E_v, R)` below. That bound
+   comes from lifecycle expiry and `R`, not from the sweep waiting, and the
+   sweep's progress does not depend on `R` at all.
+
+   The superseded sweep does tolerate refused deletes, but what refuses
+   them is a deny policy or a credential without `s3:DeleteObject`, not
+   Object Lock. It is the only maintenance pass that tolerates one per
+   chain: every other pass that deletes, ADR-0019 retention deletion and
+   the unreferenced-catalog sweep among them, fails as a whole on the
+   first refused delete (see "A lock on the catalog family" below). S3 reports that refusal per key inside the `DeleteObjects`
+   200 response, as an `<Error>` whose code is `AccessDenied`, and
+   `S3Store::delete` returns it as `AccessDenied`, the class the sweep
+   tolerates per chain. Every per-key code maps by the HTTP status S3
+   documents for it, the way a single request's status maps: the 403 codes
+   (`AccessDenied`, `AllAccessDisabled`, `AccountProblem`,
+   `InvalidAccessKeyId`, `InvalidObjectState`, `SignatureDoesNotMatch`) to
+   `AccessDenied`, `NoSuchKey` to the idempotent missing-key success,
+   `PreconditionFailed` to `PreconditionFailed`, and `ServiceUnavailable`
+   to `Throttled`. `object_store` retries the whole request on a per-key
+   `SlowDown` or `InternalError`, and any other code takes the generic
+   classification (`Transient` unless its text reads as a throttle or a
+   timeout), which is retryable and fails the pass. A whole-request 403 is
+   `AccessDenied` too. It runs three delete loops in order over every cleared
+   chain in the pass: every chain's input commit records first, then every
+   chain's input data objects (its L0 data and pre-rewrite L1 segments),
+   then every chain's own compaction or rewrite records last, so a rewrite
+   record outlives every input it superseded. A refused delete stops only
+   the chain it belongs to: that chain's later keys are left for a later
+   pass, in every loop, and every other chain in the pass is still
+   collected. A pass in which every delete it attempted was refused still
+   fails with the first refusal, so a credential without delete permission
+   stalls the unit rather than passing quietly. A refusal on a chain's
+   input commit record therefore leaves that chain's L0 data in place until
+   the refusal is lifted; a refusal on a chain's own compaction or rewrite
+   record is met only after the pass has deleted that chain's input records
+   and their data, so it holds only that record, and any above it. The
    crash ordering the sweep is built around, a record outliving the
-   objects it superseded, is preserved either way. An
-   operator who needs these sweeps to keep making progress keeps `R` at
-   or under `protection_horizon` (about 25 hours with `CompactorConfig`
-   defaults); an `R` longer than that pauses collection on that record
-   for the difference.
+   objects it superseded, is preserved either way.
 
    **A lock on the catalog family.** `t/*/catalog/*/*` reaches more than
    the HEAD pointer and its versions: the same pattern covers the
@@ -1222,19 +1275,31 @@ adapter contract:
    (`crates/ravel-maintain/src/sweep.rs`), and the erased value persists
    with no retention involved at all. Only after the reconcile or the
    rebuild is the stale `.cstat` unreferenced, and only then does a
-   retention `R` on `t/*/catalog/*/*` start to matter. The erasure bound
-   for such a tenant is therefore "until the fold reconciles that hour,
-   then `+R`", not `max(bound, R)` alone.
+   retention on `t/*/catalog/*/*` start to matter. Even then the sweep does
+   not delete it at once: rule 5 deletes an unreferenced catalog object
+   only once its `last_modified` age exceeds `protection_horizon` (25 h
+   5 min with defaults), so the delete lands at the first sweep after the
+   later of the reconcile and that age, which can be about a day after the
+   reconcile. That delete succeeds as a delete marker, as for a commit
+   record above, so Ravel stops reading it, but the locked version holding
+   the value stays in storage until its retain-until `R` has passed and
+   the noncurrent-version expiration, `E_v` after the delete, has removed
+   it. The erasure bound for such a tenant is therefore
+   `max(max(T_f, T_w + protection_horizon) + S + E_v, R)`, where `T_f` is
+   when the fold reconciles that hour (or HEAD is rebuilt), `T_w` is the
+   stale object's `last_modified`, `S` is one sweep interval (default
+   5 min), and `R` is the locked version's retain-until; it is not
+   `max(bound + E_v, R)`.
 
    An older shipped template made this worse than that bound.
    `deploy/iam/maintain.json`'s `DenyDeleteProtected` statement used to deny
    the Maintain role every delete under `t/*/catalog/*/*`, so the
    unreferenced `.cstat` was not deletable at all, whatever the retention
-   posture was: the bound was open-ended rather than `+R`. The current
-   template's `DenyDeleteProtected` denies only `catalog/<signal>/HEAD`, and
+   posture was: the bound was open-ended rather than the one above. The
+   current template's `DenyDeleteProtected` denies only `catalog/<signal>/HEAD`, and
    `MaintainDelete` grants delete on `catalog/<signal>/snap/*` and
    `catalog/<signal>/idx/*`, matching what
-   `sweep_unreferenced_catalog_objects` actually removes, so the `+R` bound
+   `sweep_unreferenced_catalog_objects` actually removes, so the bound
    above is the one that applies under the current templates. An operator
    running a copy of `maintain.json` shipped before this narrowing must
    re-apply it: until then the sweep still refuses its first catalog delete
@@ -1246,18 +1311,17 @@ adapter contract:
    was always independent of the IAM deny and remains sufficient now that
    the deny is narrowed to match.
 
-   The refusal is not confined to the locked object either, for an
-   operator who locks the whole catalog family rather than HEAD alone. The
-   sweep's
-   delete loop propagates the first refusal, so one locked object aborts
-   that `(tenant, signal)` pass and the unreferenced objects behind it in
-   the same pass are left in place too. The production driver logs the
-   failed pass and retries on the next maintenance tick, where the same
-   object refuses again, so collection of that `(tenant, signal)`'s
-   catalog garbage resumes only once `R` elapses. An operator who applies
-   the scoped posture to the whole catalog keyspace should therefore keep
-   `R` inside `protection_horizon` here for the same reason as for commit
-   records.
+   A lock on the whole catalog family rather than HEAD alone does not
+   stall this sweep: Object Lock refuses none of its deletes, for the
+   delete-marker reason above. What does stall it is a refusal from a deny
+   policy or a missing `s3:DeleteObject`, such as the older template's
+   deny. The sweep's delete loop propagates the first refusal, so one
+   refused object aborts that `(tenant, signal)` pass and the unreferenced
+   objects behind it in the same pass are left in place too. The
+   production driver logs the failed pass and retries on the next
+   maintenance tick, where the same object is refused again, so
+   collection of that `(tenant, signal)`'s catalog garbage resumes only
+   once the policy is fixed.
 
    **How the prefix scoping is achieved.** Object Lock has no prefix
    scope of its own. It is enabled once per bucket, at bucket creation,
@@ -1281,8 +1345,8 @@ adapter contract:
    | Scheduled batch job | An S3 Batch Operations job, run on a schedule and driven by an S3 Inventory manifest that lists all object versions (`IncludedObjectVersions=All`) filtered to the same prefixes, sets the same retention on every listed version, current and noncurrent. An entry with no version id is rejected before the job is submitted; a current-version-only manifest leaves noncurrent versions unlocked. | Up to the schedule interval plus the inventory delay plus the job's own execution and retry time. |
 
    Between an object's creation and the moment the mechanism acts on it,
-   the object carries no retention, and any credential that can delete
-   can delete it. That window is the residual exposure of the scoped
+   the object carries no retention, and any credential that can delete a
+   version (`s3:DeleteObjectVersion`) can remove it permanently. That window is the residual exposure of the scoped
    posture. Pick the mechanism whose window your compliance regime
    accepts. The AWS reference for both is
    [S3 Object Lock](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html).
@@ -1290,9 +1354,10 @@ adapter contract:
    The alternative posture is **whole-bucket**: set a bucket default
    retention and run no mechanism at all. S3 then applies retention at
    write time, so there is no window. The cost is that every data object
-   is locked for the retention period, which means selective subject
-   erasure and retention deletion cannot remove an object before that
-   period ends.
+   is locked for the retention period. Selective subject erasure and
+   retention deletion still succeed as delete markers, so Ravel stops
+   reading the object, but they cannot physically remove its locked
+   version before that period ends.
 
 Enforcement stays at the bucket/IAM layer (ADR-0042 decision 3): nothing
 in this crate can configure Object Lock or lifecycle policy, and

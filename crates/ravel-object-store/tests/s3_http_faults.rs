@@ -100,6 +100,10 @@ enum Op {
     Put,
     Head,
     Delete,
+    /// `DeleteObjects` (`POST /?delete`), which is what `S3Store::delete`
+    /// sends: `object_store` routes a single-key delete through its bulk
+    /// path unless bulk delete is disabled, and Ravel never disables it.
+    DeleteObjects,
     CreateMultipart,
     UploadPart,
     CompleteMultipart,
@@ -132,6 +136,14 @@ enum Fault {
     OkWithSlowDownBody,
     /// 403 `AccessDenied`: permanent, must not be retried at all.
     AccessDenied,
+    /// `DeleteObjects` only: a 200 whose `DeleteResult` carries an `<Error>`
+    /// with this code and message for every requested key. S3 reports a
+    /// per-key refusal (a deny policy, a missing `s3:DeleteObject`) this way,
+    /// not with an error status, so no retry layer sees it.
+    DeleteKeyError {
+        code: &'static str,
+        message: &'static str,
+    },
     /// A 200 whose body starts, then the connection dies before the declared
     /// `Content-Length` is delivered. The response headers already succeeded,
     /// so no retry layer covers this: it surfaces to the caller, and the
@@ -227,6 +239,9 @@ struct Seen {
     /// on the wire. Ravel's own reads never send it; an external pinned read
     /// does when the grant recorded a version.
     version_id: Option<String>,
+    /// The raw request body of a `DeleteObjects` request, which is where its
+    /// keys and any `VersionId` go. `None` for every other operation.
+    delete_body: Option<String>,
 }
 
 impl Seen {
@@ -277,6 +292,7 @@ impl FakeState {
         fault: Option<Fault>,
         headers: &HeaderMap,
         query: &HashMap<String, String>,
+        body: &[u8],
     ) {
         self.log.lock().push(Seen {
             op,
@@ -295,6 +311,8 @@ impl FakeState {
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string),
             version_id: query.get("versionId").cloned(),
+            delete_body: (op == Op::DeleteObjects)
+                .then(|| String::from_utf8_lossy(body).into_owned()),
         });
     }
 }
@@ -474,6 +492,7 @@ fn query_pairs(query: &str) -> HashMap<String, String> {
 fn classify(method: &Method, query: &HashMap<String, String>) -> Option<Op> {
     let has_upload_id = query.contains_key("uploadId");
     match *method {
+        Method::POST if query.contains_key("delete") => Some(Op::DeleteObjects),
         Method::POST if query.contains_key("uploads") => Some(Op::CreateMultipart),
         Method::POST if has_upload_id => Some(Op::CompleteMultipart),
         Method::PUT if has_upload_id => Some(Op::UploadPart),
@@ -549,6 +568,39 @@ fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
         status,
         vec![(header::CONTENT_TYPE, "application/xml".to_string())],
         Body::from(s3_error_body(code, message)),
+    )
+}
+
+/// The keys a `DeleteObjects` body names, in request order. Ravel's keys are
+/// plain ASCII with no XML metacharacters, so no unescaping is needed.
+fn delete_objects_keys(body: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(body);
+    text.split("<Key>")
+        .skip(1)
+        .filter_map(|rest| rest.split_once("</Key>").map(|(key, _)| key.to_string()))
+        .collect()
+}
+
+/// The inner text of every `<Object>` element a `DeleteObjects` body carries,
+/// in request order.
+fn delete_objects_entries(body: &str) -> Vec<&str> {
+    body.split("<Object>")
+        .skip(1)
+        .filter_map(|rest| rest.split_once("</Object>").map(|(entry, _)| entry))
+        .collect()
+}
+
+/// A 200 `DeleteResult` carrying `entries` (`<Deleted>` and `<Error>`
+/// elements), the shape S3 answers every `DeleteObjects` request with.
+fn delete_result(entries: &str) -> Response {
+    build(
+        StatusCode::OK,
+        vec![(header::CONTENT_TYPE, "application/xml".to_string())],
+        Body::from(format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             {entries}</DeleteResult>"
+        )),
     )
 }
 
@@ -675,9 +727,15 @@ async fn handle(
     let data = axum::body::to_bytes(body, MAX_REQUEST_BODY)
         .await
         .unwrap_or_default();
+    // A DeleteObjects request names its keys in the body, not the path.
+    let key = if op == Op::DeleteObjects {
+        delete_objects_keys(&data).join(",")
+    } else {
+        key
+    };
 
     let fault = state.take_fault(op);
-    state.record(op, &key, fault, &headers, &query);
+    state.record(op, &key, fault, &headers, &query, &data);
     if has_unsigned_amz_header(&headers) {
         return error_response(
             StatusCode::FORBIDDEN,
@@ -715,6 +773,18 @@ async fn handle(
             "AccessDenied",
             "Access Denied by the fake endpoint.",
         ),
+        Some(Fault::DeleteKeyError { code, message }) => {
+            let errors: String = delete_objects_keys(&data)
+                .iter()
+                .map(|key| {
+                    format!(
+                        "<Error><Key>{key}</Key><Code>{code}</Code>\
+                         <Message>{message}</Message></Error>"
+                    )
+                })
+                .collect();
+            delete_result(&errors)
+        }
         Some(Fault::DropMidResponse) => drop_mid_response(&headers),
         Some(Fault::ConditionalConflict) => error_response(
             StatusCode::CONFLICT,
@@ -913,6 +983,15 @@ fn serve(
         Op::Delete => {
             state.objects.lock().remove(key);
             build(StatusCode::NO_CONTENT, vec![], Body::empty())
+        }
+        Op::DeleteObjects => {
+            let mut deleted = String::new();
+            let mut objects = state.objects.lock();
+            for key in delete_objects_keys(&data) {
+                objects.remove(&key);
+                deleted.push_str(&format!("<Deleted><Key>{key}</Key></Deleted>"));
+            }
+            delete_result(&deleted)
         }
         Op::CreateMultipart => {
             let upload_id = {
@@ -1521,6 +1600,162 @@ async fn access_denied_is_never_retried() {
         1,
         "a permanent error must not be retried at all"
     );
+}
+
+/// `S3Store::delete` is one `DeleteObjects` POST naming only the key: never a
+/// path `DELETE`, and never a `versionId`, which is why a versioned bucket
+/// answers it with a delete marker rather than removing a version.
+#[tokio::test]
+async fn a_delete_is_one_delete_objects_request_with_no_version_id() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+    fake.seed("fault/deleted", b"present");
+
+    store
+        .delete("fault/deleted")
+        .await
+        .expect("a delete the endpoint accepts must succeed");
+
+    let bulk = fake.requests(Op::DeleteObjects);
+    assert_eq!(
+        bulk.len(),
+        1,
+        "one delete must be one DeleteObjects request"
+    );
+    let body = bulk[0]
+        .delete_body
+        .as_deref()
+        .expect("a DeleteObjects request records its body");
+    assert_eq!(
+        delete_objects_entries(body),
+        ["<Key>fault/deleted</Key>"],
+        "the body must carry exactly one Object element naming only the key: {body}"
+    );
+    assert!(
+        !body.contains("<VersionId>"),
+        "a delete must carry no VersionId element: {body}"
+    );
+    assert_eq!(
+        bulk[0].version_id, None,
+        "a delete must carry no versionId query parameter"
+    );
+    assert_eq!(fake.count(Op::Delete), 0, "no path DELETE may be sent");
+    assert_eq!(fake.object("fault/deleted"), None);
+}
+
+/// S3 refuses one key of a `DeleteObjects` request inside a 200 response, and
+/// `object_store` surfaces that as an untyped `Generic` error. A per-key
+/// `AccessDenied` (a deny policy, a missing `s3:DeleteObject`) must still reach
+/// the caller as `AccessDenied`, the class the sweep tolerates per chain,
+/// rather than as a retryable error that fails the whole pass.
+#[tokio::test]
+async fn a_per_key_access_denied_in_delete_objects_is_access_denied() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+    fake.seed("fault/denied", b"kept");
+    fake.always(
+        Op::DeleteObjects,
+        Fault::DeleteKeyError {
+            code: "AccessDenied",
+            message: "Access Denied",
+        },
+    );
+
+    let error = store
+        .delete("fault/denied")
+        .await
+        .expect_err("a per-key AccessDenied must fail the delete");
+    assert!(
+        matches!(error, StoreError::AccessDenied(_)),
+        "a per-key AccessDenied must map to AccessDenied, got {error:?}"
+    );
+    assert!(!error.is_retryable(), "{error:?} must not be retryable");
+    assert_eq!(fake.count(Op::DeleteObjects), 1, "a refusal is not retried");
+    assert!(fake.object("fault/denied").is_some());
+}
+
+/// Every per-key code with a mapping, by the HTTP status S3 documents for it,
+/// classified the way the single-request path classifies that status: 403 is
+/// `AccessDenied`, 404 is the idempotent missing-key success, 412 is
+/// `PreconditionFailed`, 503 is `Throttled`. A code with no mapping (here the
+/// 400 `InvalidArgument`) keeps the `Generic` classification, `Transient`. A
+/// per-key `SlowDown` never reaches the mapping: `object_store` retries the
+/// request, so one scripted `SlowDown` costs a second request and succeeds.
+#[tokio::test]
+async fn per_key_delete_objects_codes_map_by_their_http_status() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+
+    fake.script(
+        Op::DeleteObjects,
+        [Fault::DeleteKeyError {
+            code: "SlowDown",
+            message: "Please reduce your request rate.",
+        }],
+    );
+    store
+        .delete("fault/codes")
+        .await
+        .expect("object_store retries a per-key SlowDown");
+    assert_eq!(fake.count(Op::DeleteObjects), 2, "SlowDown then success");
+
+    let denied = [
+        "AccessDenied",
+        "AllAccessDisabled",
+        "AccountProblem",
+        "InvalidAccessKeyId",
+        "InvalidObjectState",
+        "SignatureDoesNotMatch",
+    ];
+    for code in denied {
+        fake.script(
+            Op::DeleteObjects,
+            [Fault::DeleteKeyError {
+                code,
+                message: "refused",
+            }],
+        );
+        let error = store.delete("fault/codes").await.expect_err(code);
+        assert!(
+            matches!(error, StoreError::AccessDenied(_)),
+            "{code} must map to AccessDenied, got {error:?}"
+        );
+    }
+
+    fake.script(
+        Op::DeleteObjects,
+        [Fault::DeleteKeyError {
+            code: "NoSuchKey",
+            message: "The specified key does not exist.",
+        }],
+    );
+    store
+        .delete("fault/codes")
+        .await
+        .expect("a per-key NoSuchKey is an idempotent delete");
+
+    let cases = [
+        ("PreconditionFailed", "precondition"),
+        ("ServiceUnavailable", "throttled"),
+        ("InvalidArgument", "transient"),
+    ];
+    for (code, want) in cases {
+        fake.script(
+            Op::DeleteObjects,
+            [Fault::DeleteKeyError {
+                code,
+                message: "refused",
+            }],
+        );
+        let error = store.delete("fault/codes").await.expect_err(code);
+        let got = match error {
+            StoreError::PreconditionFailed => "precondition",
+            StoreError::Throttled { .. } => "throttled",
+            StoreError::Transient(_) => "transient",
+            ref other => panic!("{code} mapped to {other:?}"),
+        };
+        assert_eq!(got, want, "{code} classified as {error:?}");
+    }
 }
 
 /// An endpoint that throttles forever eventually gives up, and the error that
@@ -2500,10 +2735,10 @@ async fn multipart_part_failure_yields_permanent_and_no_visible_object() {
 /// endpoint must abort the upload and surface the error with no object at the
 /// key.
 /// #993 review finding: with upload integrity enabled, an Overwrite put above
-/// [`MULTIPART_THRESHOLD`] must NOT take the multipart path -- multipart parts
-/// carry no server-verified checksum, so the capability would overstate; the
-/// single-PUT path covers every size to the 5 GiB ceiling and costs one billed
-/// request where multipart costs parts + 2. The op counters are the proof.
+/// [`MULTIPART_THRESHOLD`] must NOT take the multipart path: the single-PUT
+/// path covers every size to the 5 GiB ceiling, carries one whole-object
+/// checksum, and costs one billed request where multipart costs parts + 2.
+/// The op counters are the proof.
 ///
 /// Demonstrated failing against the unguarded routing (dropping the
 /// `!upload_integrity.is_enabled()` term from `put`): CreateMultipart then
