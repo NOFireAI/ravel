@@ -690,14 +690,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   applies pending erasure predicates with the functions the query engine
   calls, and writes the `[metrics]` mapping's columns sorted by event time.
   Samples are deduplicated per series and timestamp to the one a query
-  serves: the greatest write provenance, then the greatest `f64::to_bits` of
-  the value. A `name_column` export writes each stored name, or the stored
-  name less `_total`, less the unit suffix, or less both, whichever a load
-  with the same mapping turns back into the stored name, and refuses by name
-  a series none reproduces, a series carrying a label the mapping does not
-  name, a native-histogram series, and a sample finer than `ts_unit`; a
-  `name` literal exports only the series it names. A `[metrics.histogram]`
-  mapping is refused with the scalar mapping to use instead. The report adds
+  serves, through the same `ravel_query` comparison the PromQL engine and the
+  SQL operator use. A `name_column` export writes each stored name, or the
+  stored name less `_total`, less the unit suffix, or less both, whichever a
+  load with the same mapping turns back into the stored name, and refuses by
+  name a series none reproduces, a series carrying a label the mapping does
+  not name, a native-histogram series, and a sample finer than `ts_unit`. A
+  native-histogram series is refused first, on its own, as the fetch reads
+  it. The other refusals are gathered over every series and reported once,
+  on the first kind in a fixed order, counting the series that kind covers
+  and naming the first in the output file's series order ("refused on N
+  series for this reason; first: ..."), so the message is the same on every
+  run over the same store; a `name` literal exports only the series it names.
+  A `[metrics.histogram]` mapping is refused with the scalar mapping to use
+  instead. The report adds
   `series_written`, `series_skipped` and `samples_deduplicated` to the logs
   export's lines. `--signal spans` is still refused.
 - **`/metrics` renders the three writer clock-lag counters, and a shipped

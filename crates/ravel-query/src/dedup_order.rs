@@ -52,6 +52,19 @@ impl DedupKey {
             value_bits: value.to_bits(),
         }
     }
+
+    /// Compares two candidates under the order [`serves_over`] states:
+    /// `Greater` means `self` is served over `other`. For a caller that sorts
+    /// candidates rather than testing one pair.
+    #[inline]
+    pub fn serve_cmp(&self, other: &Self) -> Ordering {
+        self.created_unix_ns
+            .cmp(&other.created_unix_ns)
+            .then(self.writer_epoch.cmp(&other.writer_epoch))
+            .then(self.writer_seq.cmp(&other.writer_seq))
+            .then(self.in_page_index.cmp(&other.in_page_index))
+            .then(self.value_bits.cmp(&other.value_bits))
+    }
 }
 
 /// Whether a query serves candidate `a` over candidate `b` at one
@@ -66,13 +79,7 @@ impl DedupKey {
 /// docs/query-engine.md "Cross-cluster duplicate tie-break limitation").
 #[inline]
 pub fn serves_over(a: &DedupKey, b: &DedupKey) -> bool {
-    a.created_unix_ns
-        .cmp(&b.created_unix_ns)
-        .then(a.writer_epoch.cmp(&b.writer_epoch))
-        .then(a.writer_seq.cmp(&b.writer_seq))
-        .then(a.in_page_index.cmp(&b.in_page_index))
-        .then(a.value_bits.cmp(&b.value_bits))
-        == Ordering::Greater
+    a.serve_cmp(b) == Ordering::Greater
 }
 
 #[cfg(test)]
@@ -94,6 +101,8 @@ mod tests {
             !serves_over(&lo, &hi),
             "{lo:?} must not be served over {hi:?}"
         );
+        assert_eq!(hi.serve_cmp(&lo), Ordering::Greater);
+        assert_eq!(lo.serve_cmp(&hi), Ordering::Less);
     }
 
     #[test]
@@ -184,5 +193,6 @@ mod tests {
         // Identical keys: neither is served over the other.
         assert!(!serves_over(&nan_a, &nan_a));
         assert!(!serves_over(&BASE, &BASE));
+        assert_eq!(nan_a.serve_cmp(&nan_a), Ordering::Equal);
     }
 }
