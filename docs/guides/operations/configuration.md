@@ -597,7 +597,8 @@ below): the fetcher cache at 25% of it, or a larger 40% against a loopback
 `--s3-endpoint`, and the catalog byte cache always at a smaller 5%
 (`7516192768` and `1503238553` on the 30 GiB reference host at the 25% share).
 Startup refuses to start, rather than silently clamping, if the two resolved
-hard caps together reach or exceed the process memory budget. Both ceilings are LRU
+hard caps together reach or exceed the process memory budget (never in
+`--mode gateway`, which derives no budget). Both ceilings are LRU
 caps, not reservations: neither pre-allocates, each holds only the bytes it
 has admitted, and the sum of the two cache ceilings and the SQL memory pools
 (which derive from raw host memory, not the process memory budget) may
@@ -1234,7 +1235,23 @@ changes while the process runs, and a container whose cgroup limit changes
 later is not noticed until the next restart. Startup refuses outright when
 the two cache ceilings leave no strictly positive remainder, naming both
 figures; `--disable-cache` is exempt, because a process that builds neither
-cache claims nothing against the budget and the remainder is all of it. The current state is visible
+cache claims nothing against the budget and the remainder is all of it.
+`--mode gateway` derives no budget at all: it builds no query surface and
+runs no fold, so nothing in it reads through either cache or reserves
+against the accountant. No overhead reserve is subtracted for it, so it
+starts under any cgroup memory limit, including one of 2 GiB or less. It
+still needs memory for its ingest buffers (bounded by
+`--max-ingest-buffer-bytes`, 512 MiB by default) plus allocator and runtime
+overhead, so size its limit above that bound; its startup log prints one
+line saying the memory budget is
+not applicable in gateway mode, and its `ravel_memory_budget_bytes` reads
+`u64::MAX`. Unless `--catalog-cache-max-bytes` is set, a gateway builds no
+catalog byte cache, so its `/metrics` carries no `cache="catalog"` series
+for `ravel_cache_hits_total`, `ravel_cache_misses_total`,
+`ravel_cache_resident_entries`, `ravel_cache_resident_bytes` or
+`ravel_cache_max_bytes`. Every other mode (`all`, `query`, `maintain`) still needs
+effective memory above the 2 GiB reserve plus whatever its two cache
+ceilings claim. The current state is visible
 live at `/metrics`: `ravel_memory_budget_bytes` (the ceiling of that shared
 accountant, which is the startup log's `memory_remainder_bytes`, the budget
 MINUS the two cache ceilings, not the pre-carve `memory_budget_bytes` figure
