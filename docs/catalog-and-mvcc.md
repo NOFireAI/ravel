@@ -228,8 +228,18 @@ guarantee beyond the run that created them.
 append-only `format_floors` history (ADR-0066 §3): per-format-family floors
 below which no live object exists for this (tenant, signal), raised only,
 never lowered, CAS-appended by `ravel_catalog::raise_format_floor`
-(proto/ravel/sys.proto `ProvisioningRecord`). It is
-written with `CreateIfAbsent` at the tenant's first write for that signal
+(proto/ravel/sys.proto `ProvisioningRecord`). Each floor entry holds its
+family, `floor_version`, `raised_unix_ns`, `raised_by`, and the observation
+basis of the audit that verified the raise: `observed_entries` (live L0 commit
+records plus every compaction and rewrite part), the newest `created_unix_ns`
+among those commit records and every compaction and rewrite record, and
+`observed_shards` (the shard range scanned, never 0 on a written basis). A
+floor whose three basis fields are all zero has no basis; a raise carries
+every earlier entry through unchanged, so such a floor stays basis-less.
+Every writer stamps `format_version` 3; readers accept 1, 2 and 3, and the
+two CAS rewrite paths (`append_generation`, `raise_format_floor`) refuse a
+record above 3 rather than re-encode it without fields they do not model. The
+record is written with `CreateIfAbsent` at the tenant's first write for that signal
 (`ravel_catalog::validate_or_adopt`), so a racing loser re-reads and
 validates against the winner rather than erroring. It lives under the
 tenant's own prefix, alongside that signal's `l0/` and `c/` shard data, not

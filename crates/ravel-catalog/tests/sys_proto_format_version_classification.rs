@@ -57,8 +57,8 @@ fn classification_table() -> BTreeMap<&'static str, Class> {
         ("AdmissionUsageSnapshot", Immutable(&[1])),
         ("WorkerHeartbeat", Immutable(&[1])),
         // Read-modify-write under CAS. ProvisioningRecord accepts {1, 2, 3}
-        // after ADR-1746 Release A (the FormatFloor basis fields; the writer
-        // still stamps 2). TenantConfigRecord accepts {1, 2, 3} after ADR-2135's
+        // after ADR-1746 Release A (the FormatFloor basis fields), and its
+        // writer stamps 3 since Release B. TenantConfigRecord accepts {1, 2, 3} after ADR-2135's
         // reader-first step (clustering_key and bloom_scope; the writer still
         // stamps 2). MetricMetadataRecord accepts {1, 2} after ADR-0066 R1;
         // AuthTokenMap accepts {1, 2} (managed_by, ADR-0072 #897) and
