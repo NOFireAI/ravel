@@ -1088,13 +1088,15 @@ fn inject_shards_immutability(crd: &mut CustomResourceDefinition) {
     }
 }
 
-/// Attach OpenAPI `minimum: 1` bounds to the count fields that must be positive:
-/// `spec.shards`, `spec.gateway.replicas`, `spec.query.replicas`,
-/// `spec.maintain.replicas`, and `spec.gateway.maxInflightFlushes`.
+/// Attach OpenAPI `minimum: 1` bounds to the count and interval fields that
+/// must be positive: `spec.shards`, `spec.gateway.replicas`,
+/// `spec.query.replicas`, `spec.maintain.replicas`,
+/// `spec.gateway.maxInflightFlushes`, `spec.maintain.intervalSecs`, and
+/// `spec.maintain.fold.intervalSecs`.
 ///
 /// Without this, `shards: 0` or a negative replica count passes CRD validation
 /// and only fails much later as a confusing Deployment-apply error or a
-/// catalog-config panic. schemars 1.2.2 renders these fields as plain
+/// catalog-config panic, and a zero interval crash-loops the maintain pods. schemars 1.2.2 renders these fields as plain
 /// integers (a `u32`'s implicit `minimum: 0` is not a positive floor, and
 /// `i32` replicas get none), so the `minimum` keyword is injected here for the
 /// same reason the CEL rule is: post-hoc injection keeps it directly
@@ -1139,6 +1141,24 @@ fn inject_minimum_bounds(crd: &mut CustomResourceDefinition) {
             .and_then(|p| p.get_mut("maxInflightFlushes"))
         {
             max_inflight.minimum = Some(1.0);
+        }
+        // ravel-server refuses a zero `--maintain-interval-secs` and a zero
+        // `--fold-interval-secs` at startup, since either would run its loop
+        // without pause.
+        let maintain_props = spec_props
+            .get_mut("maintain")
+            .and_then(|m| m.properties.as_mut());
+        if let Some(maintain_props) = maintain_props {
+            if let Some(interval) = maintain_props.get_mut("intervalSecs") {
+                interval.minimum = Some(1.0);
+            }
+            if let Some(fold_interval) = maintain_props
+                .get_mut("fold")
+                .and_then(|f| f.properties.as_mut())
+                .and_then(|p| p.get_mut("intervalSecs"))
+            {
+                fold_interval.minimum = Some(1.0);
+            }
         }
     }
 }
@@ -1459,6 +1479,56 @@ mod tests {
                 "{tier}.replicas must reject negative/zero"
             );
         }
+    }
+
+    #[test]
+    fn maintain_and_fold_intervals_carry_minimum_one_bound() {
+        // ravel-server refuses a zero --maintain-interval-secs and a zero
+        // --fold-interval-secs at startup, so admission must refuse 0 for the
+        // fields rendered into them. schemars alone emits `minimum: 0.0`.
+        let crd = ravel_cluster_crd();
+        let maintain_props = crd.spec.versions[0]
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema")
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop")
+            .properties
+            .as_ref()
+            .expect("spec props")
+            .get("maintain")
+            .expect("maintain prop")
+            .properties
+            .as_ref()
+            .expect("maintain props");
+
+        assert_eq!(
+            maintain_props
+                .get("intervalSecs")
+                .expect("maintain.intervalSecs prop")
+                .minimum,
+            Some(1.0),
+            "maintain.intervalSecs must reject 0"
+        );
+        assert_eq!(
+            maintain_props
+                .get("fold")
+                .expect("maintain.fold prop")
+                .properties
+                .as_ref()
+                .expect("maintain.fold props")
+                .get("intervalSecs")
+                .expect("maintain.fold.intervalSecs prop")
+                .minimum,
+            Some(1.0),
+            "maintain.fold.intervalSecs must reject 0"
+        );
     }
 
     #[test]
