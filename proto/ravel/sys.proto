@@ -556,13 +556,13 @@ enum ClusteringBucketWidth {
 // message with generation 0. A message with no columns is a CLEARED key, which
 // ADR-2135 ranks like a new key, above every key with a lower generation. A
 // message with columns is a SET key, whose valid content is 1 to
-// 4 columns, no duplicates, each naming one of the tenant's effective declared
-// typed attribute columns (the record's typed_attr_columns override when
-// present, otherwise the tenant's base columns as the server resolves them:
-// its --typed-attr-column-tenant override when one is set, else the
-// process-wide --typed-attr-column default), and a width other than
-// UNSPECIFIED. Those rules are enforced by the reader's clustering-key accessor
-// and by the setter (one shared validation), not by record decode. This message
+// 4 columns, no duplicates, each naming a column declared in this record's own
+// typed_attr_columns (not the tenant's base columns a server falls back to when
+// the record declares none), and a width other than UNSPECIFIED. Those rules are
+// enforced by the reader's clustering-key accessor, by the setter and by
+// set_tenant_config's write gate (one shared validation), not by record decode.
+// While a set key is current, a record write may not drop or retype a
+// typed_attr_columns entry the key names; the key must be cleared first. This message
 // can fail decode only by making the record invalid protobuf (a column name
 // that is not valid UTF-8 does); a well-formed but invalid key is reported by
 // the accessor, not by decode.
@@ -611,27 +611,30 @@ message TenantConfigRecord {
   // reader that only knows a lower version refuses rather than misreading a
   // future layout, matching every other durable record's version guard.
   //
-  // Writers stamp 2 and readers accept the SET {1, 2, 3}. Versions 1 and 2
-  // remain fully readable, so a record any earlier build wrote is still read,
-  // and nothing has to be migrated.
+  // Writers stamp 2 by default and readers accept the SET {1, 2, 3}. Versions 1
+  // and 2 remain fully readable, so a record any earlier build wrote is still
+  // read, and nothing has to be migrated.
   //
   // Version history:
   //   1: the original layout, fields 1 to 12.
   //   2: the same field set; the ADR-0066 R2 writer flip, a floor signal that
   //      makes a pre-R1 binary refuse the record instead of rewriting it.
   //   3: adds clustering_key (field 13) and bloom_scope (field 14), ADR-2135.
-  //      Readers accept 3 one release BEFORE any writer stamps it (the R1
+  //      Readers accepted 3 one release before any writer stamped it (the R1
   //      reader-first step, exactly as version 2 was accepted before the R2
-  //      writer flip); writers still stamp 2 and refuse to set either field
-  //      until a later writer flip moves them to 3.
+  //      writer flip). Written on demand only: the storage-layout setters emit
+  //      either field, and stamp 3, only behind an explicit operator opt-in
+  //      stating every reader already runs a release with the version-3
+  //      reader.
+  //      A record carrying neither field is still stamped 2.
   //
   // This record is CAS-mutable (set_tenant_config rebuilds it whole under
   // CasVersion, naming every field it knows), so per the ADR-0066 R1 amendment
   // its reader accepted version 2 fleet-wide one release BEFORE any writer
   // emitted it; the R2 amendment then flipped the writer into that
-  // already-accepted ceiling. set_tenant_config REFUSES to rewrite a record newer
-  // than this build's writer stamps rather than rebuild it at the older field set
-  // and strip a field a newer writer added.
+  // already-accepted ceiling. set_tenant_config REFUSES to rewrite a record above
+  // version 3, the highest this build writes, rather than rebuild it at the older
+  // field set and strip a field a newer writer added.
   //
   // A version-1 writer never emits `typed_attr_columns` (field 12): it was added
   // after that writer, which is exactly why a binary predating the R1 readers now
@@ -670,17 +673,20 @@ message TenantConfigRecord {
   TypedAttrColumnConfig typed_attr_columns = 12;
   // Per-tenant clustering key (ADR-2135); absent means a key was never set, at
   // clustering generation 0, and present with no columns means the key was
-  // cleared. Added in format_version 3 under the CAS-mutable
-  // rule: readers accept version 3 fleet-wide first, and no writer emits this
-  // field until the writer flips to 3. A reader that predates it skips the
-  // unknown field and reads every earlier field exactly as before, but refuses a
-  // version-3 record outright, so it can never rewrite the record without it.
-  // See ClusteringKeyConfig for the content rules, which record decode does not
-  // enforce.
+  // cleared. Added in format_version 3 under the CAS-mutable rule: readers
+  // accept version 3 fleet-wide first, and this field is emitted on demand, only
+  // by the clustering-key setters behind the operator opt-in, in a record
+  // stamped 3. A record below version 3 that carries it is refused on rewrite.
+  // A reader that predates it skips the unknown field and reads every earlier
+  // field exactly as before, but refuses a version-3 record outright, so it can
+  // never rewrite the record without it. See ClusteringKeyConfig for the
+  // content rules, which record decode does not enforce.
   ClusteringKeyConfig clustering_key = 13;
   // Per-tenant bloom filter scope (ADR-2135); absent (the zero value) means
   // ALL. Added in format_version 3 under the same reader-first rollout as
-  // clustering_key.
+  // clustering_key, and emitted on demand the same way: only the bloom-scope
+  // setter writes a nonzero value, behind the operator opt-in, in a record
+  // stamped 3. Setting ALL removes the field.
   BloomScope bloom_scope = 14;
 }
 
