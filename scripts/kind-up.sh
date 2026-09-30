@@ -144,6 +144,11 @@ case "$BACKEND" in
     # what the floci_contract test uses.
     S3_ACCESS_KEY="test"
     S3_SECRET_KEY="test"
+    # Nothing in this repository has shown floci accepting or storing an
+    # upload checksum, so the lane runs without one rather than on an
+    # untested default. RustFS below keeps the default: its contract lane
+    # proves a CRC64-NVME PUT is stored and verified on read.
+    UPLOAD_INTEGRITY="off"
     ;;
   rustfs)
     BACKEND_MANIFEST="deploy/k8s/rustfs.yaml"
@@ -154,6 +159,7 @@ case "$BACKEND" in
     # deploy/k8s/rustfs.yaml.
     S3_ACCESS_KEY="ravel"
     S3_SECRET_KEY="ravel-dev-secret"
+    UPLOAD_INTEGRITY="crc64nvme"
     ;;
   *)
     die "RAVEL_FAKE_S3_BACKEND must be floci or rustfs, got '${BACKEND}'"
@@ -292,6 +298,7 @@ spec:
       # Both backends speak plaintext http:// on a Service name, which no pod
       # reaches over loopback; without this the server refuses to start.
       allowHttp: true
+      uploadIntegrity: ${UPLOAD_INTEGRITY}
       credentialsSecretRef:
         name: ${S3_CREDENTIALS_SECRET}
   tenantTokensSecretRef:

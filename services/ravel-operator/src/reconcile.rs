@@ -38,7 +38,7 @@ use crate::crd::{
     AffinityBackend, AffinityKeySource, GATEWAY_DEFAULT_CPU_REQUEST,
     GATEWAY_DEFAULT_MEMORY_REQUEST, GatewayReference, IngestAffinitySpec, LocalSecretRef,
     MAINTAIN_DEFAULT_CPU_REQUEST, MAINTAIN_DEFAULT_MEMORY_REQUEST, QUERY_DEFAULT_CPU_REQUEST,
-    QUERY_DEFAULT_MEMORY_REQUEST, RavelClusterSpec, ResourceRequirementsSpec,
+    QUERY_DEFAULT_MEMORY_REQUEST, RavelClusterSpec, ResourceRequirementsSpec, S3UploadIntegrity,
 };
 
 /// A spec that cannot be rendered into a valid object set.
@@ -662,6 +662,16 @@ fn common_store_args(spec: &RavelClusterSpec) -> Vec<String> {
     // plaintext in-cluster endpoint refuses startup without this flag.
     if spec.storage.s3.allow_http {
         args.push("--s3-allow-http".to_string());
+    }
+    // Rendered only away from the server's own defaults, so a cluster that
+    // sets neither field keeps the command line it had and still runs an
+    // image that predates both flags.
+    if spec.storage.s3.upload_integrity != S3UploadIntegrity::default() {
+        args.push("--s3-upload-integrity".to_string());
+        args.push(spec.storage.s3.upload_integrity.flag_value().to_string());
+    }
+    if !spec.storage.s3.request_stored_checksum {
+        args.push("--s3-request-stored-checksum=false".to_string());
     }
     args
 }
@@ -3222,6 +3232,8 @@ mod tests {
                     // `allowHttp` set: the baseline is a spec that renders, so
                     // the two travel together here.
                     allow_http: true,
+                    upload_integrity: Default::default(),
+                    request_stored_checksum: true,
                     credentials_secret_ref: LocalSecretRef {
                         name: "ravel-s3".to_string(),
                     },
@@ -4414,6 +4426,91 @@ mod tests {
                 args.iter().any(|a| a == "--s3-allow-http"),
                 "allowHttp true must render the flag, got: {args:?}"
             );
+        }
+    }
+
+    /// Every server Deployment's args for `spec`: gateway, query, maintain.
+    fn server_args(spec: &RavelClusterSpec) -> Vec<Vec<String>> {
+        let maintain = desired_maintain_deployment(spec, "prod", &ctx())
+            .expect("no gc render error")
+            .expect("maintain enabled");
+        vec![
+            args_of(&desired_gateway_deployment(spec, "prod", &ctx())),
+            args_of(&desired_query_deployment(spec, "prod", &ctx())),
+            args_of(&maintain),
+        ]
+    }
+
+    /// `uploadIntegrity` and `requestStoredChecksum` render as
+    /// `--s3-upload-integrity` and `--s3-request-stored-checksum=false` on
+    /// every server Deployment, and only away from the server's defaults, so
+    /// a cluster that sets neither keeps its command line (and can still run
+    /// an image that predates the flags).
+    #[test]
+    fn s3_checksum_fields_render_only_away_from_the_server_default() {
+        let spec = base_spec();
+        assert_eq!(
+            spec.storage.s3.upload_integrity,
+            S3UploadIntegrity::Crc64Nvme,
+            "precondition: the baseline carries the default"
+        );
+        for args in server_args(&spec) {
+            assert!(
+                !args.iter().any(|a| a.starts_with("--s3-upload-integrity")
+                    || a.starts_with("--s3-request-stored-checksum")),
+                "the defaults render no checksum flag, got: {args:?}"
+            );
+        }
+
+        for (mode, value) in [
+            (S3UploadIntegrity::Off, "off"),
+            (S3UploadIntegrity::Sha256, "sha256"),
+        ] {
+            let mut spec = base_spec();
+            spec.storage.s3.upload_integrity = mode;
+            for args in server_args(&spec) {
+                assert_eq!(
+                    arg_value(&args, "--s3-upload-integrity").as_deref(),
+                    Some(value),
+                    "uploadIntegrity {value} renders its flag, got: {args:?}"
+                );
+            }
+        }
+
+        let mut spec = base_spec();
+        spec.storage.s3.request_stored_checksum = false;
+        for args in server_args(&spec) {
+            assert!(
+                args.iter()
+                    .any(|a| a == "--s3-request-stored-checksum=false"),
+                "requestStoredChecksum false renders the switch, got: {args:?}"
+            );
+        }
+    }
+
+    /// The CRD spells `uploadIntegrity` exactly as the server spells
+    /// `--s3-upload-integrity`, and a spec that omits both fields
+    /// deserializes to the server's defaults.
+    #[test]
+    fn s3_checksum_fields_default_to_the_server_defaults() {
+        let s3: S3Spec = serde_json::from_value(serde_json::json!({
+            "bucket": "b",
+            "credentialsSecretRef": {"name": "creds"},
+        }))
+        .expect("a spec without the checksum fields parses");
+        assert_eq!(s3.upload_integrity, S3UploadIntegrity::Crc64Nvme);
+        assert!(s3.request_stored_checksum);
+
+        for (mode, text) in [
+            (S3UploadIntegrity::Off, "off"),
+            (S3UploadIntegrity::Crc64Nvme, "crc64nvme"),
+            (S3UploadIntegrity::Sha256, "sha256"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(mode).expect("serialize"),
+                serde_json::Value::String(text.to_string())
+            );
+            assert_eq!(mode.flag_value(), text);
         }
     }
 

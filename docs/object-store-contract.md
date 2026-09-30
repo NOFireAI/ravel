@@ -583,7 +583,7 @@ assembled object stays byte-correct. The scripted-fault gap is an
 observability/testing gap, not a correctness one, and no production path
 depends on part completion order.
 
-### Upload checksums (opt-in, never startup-gating)
+### Upload checksums (on by default in the server, never startup-gating)
 
 `upload_checksum` is a `Capabilities` flag, but it is NOT mandatory and no
 mode may require it. When a backend reports `upload_checksum: true`, it
@@ -607,16 +607,32 @@ fault flips the payload between caller and store, and a store claiming the
 capability must reject it (asserting the fault counter proves the corruption
 fired).
 
-**`S3Store`** is opt-in via `S3HttpConfig::upload_integrity` (`UploadIntegrity`):
+**`S3Store`** selects it through `S3HttpConfig::upload_integrity`
+(`UploadIntegrity`):
 
-- `Off` (default) attaches no checksum and reports `upload_checksum: false`.
-  This is the historical behavior, kept as the default because a checksum
-  header an endpoint does not support turns every write into an error.
+- `Off` (the library default) attaches no checksum and reports
+  `upload_checksum: false`. This is the historical behavior.
 - `Crc64Nvme` / `Sha256` configure `object_store`'s whole-client
   `AmazonS3Builder::with_checksum_algorithm`, so it computes that digest over
   the exact payload and sends it as `x-amz-checksum-crc64nvme` /
   `x-amz-checksum-sha256`; S3 verifies-or-rejects on receipt. The capability
   then reports `true`.
+
+`ravel-server` builds its store with `Crc64Nvme` by default, selectable with
+`--s3-upload-integrity {off,crc64nvme,sha256}` (`RAVEL_S3_UPLOAD_INTEGRITY`),
+and the Kubernetes operator does the same for its own S3 client and exposes the
+setting as `spec.storage.s3.uploadIntegrity`. So every PUT the server makes,
+commit records included, carries a checksum the endpoint verifies on receipt
+and stores for the read-side check below. An endpoint that does not accept the
+header fails every PUT; startup writes nothing to an existing bucket, so that
+shows at the first flush, possibly after the process reports ready.
+`--s3-upload-integrity off` is the remedy, and leaves every object it writes
+with no transport checksum. The per-tenant stores `--tenant-kms-config`
+routes to are still built with the library default and apply neither flag.
+The
+library default stays `Off` for any other caller that builds an `S3Store`
+directly. `ravel-cli` still builds its store with the library default; its
+store selection flag is pending.
 
 Two limits of `object_store` 0.14's `AmazonS3` client shape this. First, it
 exposes no per-request checksum hook and no way to attach a caller-supplied
@@ -702,7 +718,10 @@ counterpart below.
 the request header. Set to `false`, no request carries `x-amz-checksum-mode`, the
 endpoint returns no stored checksum, and every full-object read is served and
 counted unverified. It exists for an endpoint that rejects the header outright.
-No server or CLI flag sets it yet; that is ADR-1696 follow-up task 2.
+`ravel-server` sets it with `--s3-request-stored-checksum` (default `true`;
+`--s3-request-stored-checksum=false` turns it off, environment variable
+`RAVEL_S3_REQUEST_STORED_CHECKSUM`), and the operator with
+`spec.storage.s3.requestStoredChecksum`. No `ravel-cli` flag sets it yet.
 
 **A read with no verifiable checksum is served and counted, never refused**
 (decision 3). The count is `StoreMetricsSnapshot::get_unverified` (also
@@ -744,11 +763,12 @@ The RustFS contract lane (`rustfs_contract` in
 read back with `GetRange::Full` moves the unverified count by exactly 0, and a
 ranged read of the same object is served.
 
-There is no per-part or whole-object upload checksum for a multipart upload:
-`object_store`'s `UploadPart` takes no checksum-algorithm value and `complete`
-takes no digest, so a multipart part keeps only the local CRC32C pre-flight (see
-"Checksum coverage" under "Multipart upload"). `put()`'s own above-threshold
-multipart path is therefore not covered by `upload_integrity`.
+With `upload_integrity` on, `put()` never takes its above-threshold multipart
+path: every object up to S3's 5 GiB single-request limit goes out as one
+checksummed PUT, and a larger payload is refused rather than sent unchecked.
+Only the explicit `put_multipart` API uploads parts, and no production writer
+calls it; for what a caller-supplied part checksum covers there, see "Checksum
+coverage" under "Multipart upload".
 
 Upload checksums are CRC32C-class integrity checks against transport
 corruption; they do not verify blake3. blake3 in commit records is an
@@ -762,10 +782,13 @@ CreateIfAbsent and CAS. GCS: generation preconditions. Azure: etags +
 leases. RustFS supports the full mandatory set. Server-side upload checksums
 are reachable through `object_store`'s whole-client
 `with_checksum_algorithm` (SHA-256 / CRC64-NVME), which
-`S3HttpConfig::upload_integrity` opts into; SHA-256 is the broadly supported
-choice (AWS S3 and RustFS), CRC64-NVME needs a recent endpoint. The default is
-`Off`, so `S3Store` reports `upload_checksum: false` unless a mode is
-configured (see "Upload checksums").
+`S3HttpConfig::upload_integrity` selects; SHA-256 is the broadly supported
+choice (AWS S3 and RustFS), CRC64-NVME needs a recent endpoint. RustFS accepts
+a CRC64-NVME PUT and returns the stored checksum on an unranged read (the
+contract lane above asserts both). The library default is `Off`, so an
+`S3Store` built directly reports `upload_checksum: false` unless a mode is
+configured; `ravel-server` configures `Crc64Nvme` unless told otherwise (see
+"Upload checksums").
 
 ### Credentials
 

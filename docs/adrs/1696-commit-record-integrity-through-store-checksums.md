@@ -310,3 +310,39 @@ counter labelled `mode` and nothing else, read from the same
 `/metrics` export the 2026-09-27 amendment assigned to follow-up task 2 is
 done; the `S3HttpConfig::request_stored_checksum` flag it also assigned there
 is not.
+(It now is: see the 2026-09-30 flag amendment below.)
+
+## Amendment (2026-09-30): the server flags for upload integrity and the checksum request
+
+<!-- amendment-applies: sections="Amendment (2026-09-30): the unverified-read counter is exported" pointer="2026-09-30 flag amendment" -->
+<!-- amendment-supersedes: phrase="flag it also assigned there is not" pointer="2026-09-30 flag amendment" -->
+
+`ravel-server` now builds its S3 store from two flags instead of
+`S3HttpConfig::default()`:
+
+- `--s3-upload-integrity {off,crc64nvme,sha256}` (`RAVEL_S3_UPLOAD_INTEGRITY`),
+  default `crc64nvme`, sets `S3HttpConfig::upload_integrity`. The library
+  default stays `Off`; the server's flag carries the default decision 1 asks
+  for.
+- `--s3-request-stored-checksum` (`RAVEL_S3_REQUEST_STORED_CHECKSUM`), default
+  `true`, written `--s3-request-stored-checksum=false` to turn it off, sets
+  `S3HttpConfig::request_stored_checksum`. This is the flag the 2026-09-27
+  amendment assigned to follow-up task 2.
+
+Both are ignored under `--store memory`, as every other `--s3-*` flag is. The
+operator exposes them as `spec.storage.s3.uploadIntegrity` and
+`spec.storage.s3.requestStoredChecksum`, renders each only when it differs
+from the server default, and builds its own S3 client from them. The
+`ravel-cli` half of follow-up task 2 (its store selection and the
+`store qualify` echo check) is not part of this change.
+
+The compose, Kubernetes and demo launchers run RustFS or floci; the disaster
+recovery scripts and the ClickBench runbook can target AWS S3, which accepts
+CRC64-NVME. The RustFS contract
+lane PUTs with `Crc64Nvme` and reads the stored checksum back, so the RustFS
+launchers keep the default. No test in this repository PUTs to floci with an
+upload checksum, so `scripts/kind-up.sh` sets `uploadIntegrity: off` for its
+floci backend rather than run an untested default; it is the only launcher
+that sets `off`. The store qualification Job the operator runs does not
+exercise the upload checksum, so a passing qualification says nothing about
+whether the endpoint accepts the header.

@@ -1070,10 +1070,14 @@ sections describe.
 
 1. Pin the flush identity (above).
 2. PUT data object with `PutMode::CreateIfAbsent`. A CRC32C checksum is
-   computed and verified locally before upload as a pre-flight guard; it is
-   not sent to the store, because no shipped backend accepts a wire-level
-   upload checksum (`capabilities().upload_checksum == false` on S3;
-   wire-level verification is pending). `AlreadyExists` is
+   computed and verified locally before upload as a pre-flight guard; that
+   CRC32C is not itself sent to the store. On S3, `ravel-server` attaches a
+   separate CRC64-NVME checksum to every PUT by default
+   (`--s3-upload-integrity`; stores routed by `--tenant-kms-config` do not
+   apply it yet), which the endpoint verifies on receipt and
+   stores, and a full-object GET verifies the body against it
+   (docs/object-store-contract.md, "Upload checksums" and "Read-side checksum
+   verification"). `AlreadyExists` is
    success: the key embeds the content hash, so the stored bytes are
    identical by construction.
 3. PUT commit record with `PutMode::CreateIfAbsent`.

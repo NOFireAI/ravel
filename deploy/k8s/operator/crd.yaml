@@ -553,6 +553,21 @@
                             "default": "us-east-1",
                             "description": "AWS region (`--s3-region`). Defaults to `us-east-1`.",
                             "type": "string"
+                          },
+                          "requestStoredChecksum": {
+                            "default": true,
+                            "description": "Ask the endpoint to return the checksum it stored at upload so a\nfull-object read is verified before it is served\n(`--s3-request-stored-checksum`). Defaults to true. Set false only for\nan endpoint that rejects the request header: every full-object read is\nthen counted in `ravel_store_get_unverified_total`. Rendered only when\nfalse.",
+                            "type": "boolean"
+                          },
+                          "uploadIntegrity": {
+                            "default": "crc64nvme",
+                            "description": "Server-verified checksum attached to every PUT\n(`--s3-upload-integrity`): `crc64nvme` (the default), `sha256`, or\n`off`. The endpoint verifies each upload against it and stores it so\na full-object read can be verified. Set `off` only for an endpoint that\nrejects the checksum header, which fails every PUT from the first flush.\nApplies to the rendered server containers and to the operator's own S3\nclient. The flag is rendered only when it differs from the default,\nwhich the server applies on its own. The store qualification Job does\nnot exercise it, so a passing qualification does not show that the\nendpoint accepts the checksum header.",
+                            "enum": [
+                              "off",
+                              "crc64nvme",
+                              "sha256"
+                            ],
+                            "type": "string"
                           }
                         },
                         "required": [
