@@ -32,7 +32,7 @@ use crate::metadata_cache::{CachedFooter, MetadataCache, MetadataKey};
 use crate::store::file_path;
 
 /// Length of the Parquet trailer: a 4-byte footer length and the `PAR1` magic.
-const TRAILER_LEN: u64 = 8;
+pub(crate) const TRAILER_LEN: u64 = 8;
 
 /// One manifest file and the store it is read through.
 pub struct PinnedFile {
@@ -300,26 +300,39 @@ impl PinnedParquetReader {
             .await
             .map_err(FooterError::Read)?;
         let split = tail.len() - TRAILER_LEN as usize;
-        let mut trailer = [0u8; TRAILER_LEN as usize];
-        trailer.copy_from_slice(&tail[split..]);
-        let footer = FooterTail::try_from(trailer)
-            .map_err(|err| FooterError::Refused(format!("footer trailer: {err}")))?;
-        if footer.is_encrypted_footer() {
-            return Err(FooterError::Refused("the footer is encrypted".to_string()));
-        }
-        if footer.metadata_length() as u64 != footer_len {
+        let recorded = trailer_footer_len(&tail[split..]).map_err(FooterError::Refused)?;
+        if recorded != footer_len {
             return Err(FooterError::Refused(format!(
-                "the trailer records a {}-byte footer, the manifest {footer_len}",
-                footer.metadata_length()
+                "the trailer records a {recorded}-byte footer, the manifest {footer_len}"
             )));
         }
-        let metadata = ParquetMetaDataReader::decode_metadata(&tail[..split])
-            .map_err(|err| FooterError::Refused(format!("footer: {err}")))?;
-        check_chunks(&metadata, size - tail_len).map_err(FooterError::Refused)?;
-        let metadata = Arc::new(without_page_index(metadata));
-        check_arrow_schema(&metadata).map_err(FooterError::Refused)?;
-        Ok(metadata)
+        decode_footer(&tail[..split], size - tail_len).map_err(FooterError::Refused)
     }
+}
+
+/// The footer length an 8-byte Parquet trailer records, refusing a trailer
+/// without the magic and an encrypted footer.
+pub(crate) fn trailer_footer_len(trailer: &[u8]) -> Result<u64, String> {
+    let trailer: [u8; TRAILER_LEN as usize] = trailer
+        .try_into()
+        .map_err(|_| format!("footer trailer: {} bytes, not {TRAILER_LEN}", trailer.len()))?;
+    let footer = FooterTail::try_from(trailer).map_err(|err| format!("footer trailer: {err}"))?;
+    if footer.is_encrypted_footer() {
+        return Err("the footer is encrypted".to_string());
+    }
+    Ok(footer.metadata_length() as u64)
+}
+
+/// Decode `footer`, the thrift footer of a file whose column chunks lie in
+/// its first `data_end` bytes, and run every check the scan relies on:
+/// [`check_chunks`], the page index removal, and [`check_arrow_schema`].
+pub(crate) fn decode_footer(footer: &[u8], data_end: u64) -> Result<Arc<ParquetMetaData>, String> {
+    let metadata =
+        ParquetMetaDataReader::decode_metadata(footer).map_err(|err| format!("footer: {err}"))?;
+    check_chunks(&metadata, data_end)?;
+    let metadata = Arc::new(without_page_index(metadata));
+    check_arrow_schema(&metadata)?;
+    Ok(metadata)
 }
 
 /// Why [`PinnedParquetReader::read_footer`] could not hand a footer out.

@@ -26,6 +26,7 @@ use datafusion_datasource_parquet::{transform_binary_to_string, transform_schema
 use object_store::ObjectMeta;
 use object_store::path::Path;
 use parquet::arrow::parquet_to_arrow_schema;
+use parquet::file::metadata::ParquetMetaData;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_pqtable::manifest::Manifest;
 use ravel_query::PhaseAccounting;
@@ -203,14 +204,9 @@ impl ParquetTableProvider {
                 table: table.clone(),
                 source,
             })?;
-        let file_metadata = metadata.file_metadata();
-        let file_schema = parquet_to_arrow_schema(
-            file_metadata.schema_descr(),
-            file_metadata.key_value_metadata(),
-        )
-        .map_err(|err| ParquetTableError::Schema {
+        let mut schema = file_schema(&metadata).map_err(|message| ParquetTableError::Schema {
             table: table.clone(),
-            message: err.to_string(),
+            message,
         })?;
         let mut parquet_options = TableParquetOptions::default();
         parquet_options.global.binary_as_string = options.binary_as_string;
@@ -218,15 +214,8 @@ impl ParquetTableProvider {
         // Without it the opener never builds a page pruning predicate, so it
         // never asks the reader for a page index to prune with.
         parquet_options.global.enable_page_index = false;
-        // DataFusion's own schema inference clears the schema's metadata and
-        // each top-level field's, then applies these two rewrites in this
-        // order.
-        let fields: Fields = file_schema
-            .fields()
-            .iter()
-            .map(|field| field.as_ref().clone().with_metadata(HashMap::new()))
-            .collect();
-        let mut schema = Schema::new(fields);
+        // DataFusion's own schema inference applies these two rewrites in this
+        // order, after clearing the metadata `file_schema` clears.
         if parquet_options.global.binary_as_string {
             schema = transform_binary_to_string(&schema);
         }
@@ -452,6 +441,24 @@ impl RawParquetScan {
             })
             .collect()
     }
+}
+
+/// The Arrow schema of a file's footer with the schema's metadata and each
+/// top-level field's cleared, as DataFusion's own schema inference clears
+/// them.
+pub(crate) fn file_schema(metadata: &ParquetMetaData) -> Result<Schema, String> {
+    let file_metadata = metadata.file_metadata();
+    let schema = parquet_to_arrow_schema(
+        file_metadata.schema_descr(),
+        file_metadata.key_value_metadata(),
+    )
+    .map_err(|err| err.to_string())?;
+    let fields: Fields = schema
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone().with_metadata(HashMap::new()))
+        .collect();
+    Ok(Schema::new(fields))
 }
 
 /// Split `files` into at most `target_partitions` contiguous groups, the
