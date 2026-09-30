@@ -34,6 +34,7 @@ use ravel_types::TenantHash;
 
 use crate::boundary::ParquetPanicBoundaryExec;
 use crate::error::ParquetTableError;
+use crate::limits::ReadLimits;
 use crate::reader::{PinnedFile, PinnedReaderFactory, ReadServices};
 use crate::store::{file_path, store_url};
 
@@ -158,6 +159,7 @@ impl ParquetTableProvider {
         stores: &HashMap<(String, String), Arc<dyn ObjectStoreBackend>>,
         services: ReadServices,
         accounting: PhaseAccounting,
+        limits: ReadLimits,
         parallel: bool,
     ) -> Result<Self, ParquetTableError> {
         let table = manifest.table.clone();
@@ -190,6 +192,7 @@ impl ParquetTableProvider {
             files.into(),
             services,
             accounting,
+            limits,
         ));
 
         let first = factory
