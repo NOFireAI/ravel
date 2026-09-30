@@ -85,6 +85,8 @@ services:
         test "$$(s3 get-object-lock-configuration --bucket ravel-dev --query ObjectLockConfiguration.ObjectLockEnabled --output text)" = Enabled
         test "$$(s3 get-bucket-versioning --bucket ravel-dev --query Status --output text)" = Enabled
         test "$$(s3 get-bucket-lifecycle-configuration --bucket ravel-dev --query 'Rules[0].AbortIncompleteMultipartUpload.DaysAfterInitiation' --output text)" = 7
+        test "$$(s3 get-bucket-lifecycle-configuration --bucket ravel-dev --query 'Rules[0].NoncurrentVersionExpiration.NoncurrentDays' --output text)" = 1
+        test "$$(s3 get-bucket-lifecycle-configuration --bucket ravel-dev --query 'to_string(Rules[0].Expiration.ExpiredObjectDeleteMarker)' --output text)" = true
         echo 'bucket ravel-dev ready: Object Lock, versioning and lifecycle rules set'
 
   # Store qualification (ADR-0050 section 6): ravel-server refuses to start on a

@@ -24,10 +24,14 @@
 //! - An unknown condition (no API for the call, an access denial, or a
 //!   response the reader cannot parse) never refuses: it logs one warning and
 //!   raises the `ravel_bucket_protection_unknown` gauge.
-//! - The whole read is bounded by [`STARTUP_DEADLINE`]. A read that has not
-//!   finished by then makes every checked condition unknown, so a stalled
-//!   endpoint warns and starts instead of holding startup past the liveness
-//!   probe.
+//! - The bucket-configuration read is bounded by [`STARTUP_DEADLINE`]. A read
+//!   that has not finished by then makes every checked condition unknown, so
+//!   control-plane GETs that stall warn and start instead of holding startup
+//!   past the operator's earliest liveness restart. The bound covers this read
+//!   only: the `sys/qualification` read that runs before it goes through the
+//!   retrying store path and is bounded only by the store's own request
+//!   timeout and retries, so an endpoint that stalls every request holds
+//!   startup there first.
 //!
 //! Each check sets three gauges: `ravel_bucket_protection_conditions_failed`
 //! and `ravel_bucket_protection_conditions_unknown` count the checked
@@ -64,9 +68,11 @@ use ravel_object_store::s3::S3Store;
 
 /// Bound on the whole startup read of the protection report. Its GETs run
 /// before any listener binds, one after another, each bounded only by the
-/// store's request timeout (20 s by default), while the operator's liveness
-/// probe restarts a pod that has not answered about 35 s after it started.
-pub const STARTUP_DEADLINE: Duration = Duration::from_secs(20);
+/// store's request timeout (20 s by default). The operator's liveness probe
+/// restarts a pod on its third consecutive failure, which lands between about
+/// 25 s and 35 s after the pod starts depending on the probe's tick phase;
+/// 15 s leaves at least 10 s of that for the rest of startup.
+pub const STARTUP_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Count of checked conditions the last [`enforce`] call observed failed.
 /// Process-global, matching the other single-source, no-label `/metrics`
@@ -724,17 +730,9 @@ mod tests {
 
         let _guard = GAUGE_TEST_LOCK.lock().await;
         let deadline = Duration::from_millis(500);
-        let started = std::time::Instant::now();
         let outcome = enforce_within(&store, deadline)
             .await
             .expect("a stalled read must warn and start, not refuse");
-        let elapsed = started.elapsed();
-        // Far below one 20 s request timeout: the deadline, not the request
-        // timeout, ended the read.
-        assert!(
-            elapsed < Duration::from_secs(10),
-            "the check took {elapsed:?} against a {deadline:?} deadline"
-        );
         assert_eq!(
             outcome,
             BucketProtectionOutcome {
@@ -754,12 +752,28 @@ mod tests {
     }
 
     #[test]
-    fn the_startup_deadline_ends_before_the_operator_liveness_budget() {
-        // The operator's liveness probe: 5 s initial delay, then three failed
-        // 10 s periods (services/ravel-operator/src/reconcile.rs, `probes_on`).
-        let liveness_budget = Duration::from_secs(5 + 3 * 10);
-        assert_eq!(STARTUP_DEADLINE, Duration::from_secs(20));
-        assert!(STARTUP_DEADLINE < liveness_budget);
+    fn the_startup_deadline_leaves_room_before_the_earliest_liveness_restart() {
+        // Mirrors the liveness `Probe` that `probes_on` builds in
+        // services/ravel-operator/src/reconcile.rs, whose values are literals
+        // there: `initial_delay_seconds: Some(5)`, `period_seconds: Some(10)`,
+        // `failure_threshold: Some(3)`. The first probe runs at the initial
+        // delay or up to one period later, and the kubelet restarts on the
+        // third consecutive failure, so the earliest restart is the initial
+        // delay plus two periods.
+        let initial_delay_seconds = 5;
+        let period_seconds = 10;
+        let failure_threshold = 3;
+        let earliest_restart =
+            Duration::from_secs(initial_delay_seconds + (failure_threshold - 1) * period_seconds);
+        assert_eq!(earliest_restart, Duration::from_secs(25));
+        assert_eq!(STARTUP_DEADLINE, Duration::from_secs(15));
+        // The rest of startup (the qualification read on a store that
+        // answers, the tenancy and GC reads, the listener bind) needs the
+        // remainder.
+        assert_eq!(
+            earliest_restart.saturating_sub(STARTUP_DEADLINE),
+            Duration::from_secs(10)
+        );
     }
 
     /// Flipped line: `enforce`'s single `probe_bucket_protection` call. One

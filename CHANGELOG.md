@@ -26,10 +26,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   operator-managed deployment on S3. The dev bucket launchers (the floci and
   RustFS create-bucket Jobs in `deploy/k8s/` and the compose `createbucket`
   one-shots) now create the bucket with Object Lock, versioning on and one
-  whole-bucket lifecycle rule carrying the sanctioned actions, and a bucket
-  left from an older launcher fails their read-back. The whole read is
-  bounded to 20 s, under the operator's liveness probe; a read that has not
-  finished by then leaves every condition unknown and starts. No IAM template
+  whole-bucket lifecycle rule carrying the sanctioned actions, and their
+  read-back checks all three actions, so a bucket left from an older launcher,
+  or a backend that dropped one of the actions, fails it. The
+  bucket-configuration read is bounded to 15 s, which leaves at least 10 s
+  before the operator's liveness probe can first restart the pod (about 25 s
+  after it starts); a read that has not finished by then leaves every
+  condition unknown and starts. The bound covers that read only: the
+  `sys/qualification` read that runs before it is bounded by the store's own
+  request timeout and retries, so an endpoint that stalls every request still
+  holds startup there. No IAM template
   under `deploy/iam/` grants a server role the three read permissions, so on
   AWS under a shipped template every condition reads unknown. Two new gauges,
   `ravel_bucket_protection_conditions_failed` and
