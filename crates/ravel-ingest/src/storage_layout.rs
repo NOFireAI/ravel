@@ -56,13 +56,14 @@ impl Default for StorageLayout {
 }
 
 impl StorageLayout {
-    /// Resolve `config`'s stored key and scope. The key is validated against
-    /// `typed_columns`, the declared typed columns the flush stamps statistics
-    /// from, so every column of a resolved key has a type in that list, and
-    /// then against the writer's sort descriptor rules, so a resolved key never
-    /// makes the writer refuse the object.
+    /// Resolve `config`'s stored key and scope. The accessor validates the key
+    /// against `config`'s own typed attribute columns, the list the caller
+    /// passes as `typed_columns`, the declared typed columns the flush stamps
+    /// statistics from. The key's column types then come from `typed_columns`
+    /// under the writer's sort descriptor rules, so a resolved key never makes
+    /// the writer refuse the object.
     pub(crate) fn resolve(config: &TenantConfig, typed_columns: &[DeclaredTypedColumn]) -> Self {
-        let clustering = match config.clustering_key(typed_columns) {
+        let clustering = match config.clustering_key() {
             Ok(state) => state,
             Err(e) => return StorageLayout::Unresolved(e.into()),
         };
