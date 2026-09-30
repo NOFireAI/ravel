@@ -522,8 +522,8 @@ impl ParquetFileReaderFactory for PinnedReaderFactory {
 mod tests {
     use super::*;
     use crate::test_support::{
-        Fixture, RecordingStore, assert_file_changed, footer_len_of, parquet_bytes, read_all,
-        read_error, read_where, render_rows,
+        Fixture, RecordingStore, arrow_schema_panicking, assert_file_changed, footer_len_of,
+        parquet_bytes, read_all, read_error, read_where, render_rows,
     };
     use datafusion::logical_expr::{Expr, JoinType, col, ident, lit};
     use parquet::file::metadata::PageIndexPolicy;
@@ -705,44 +705,9 @@ mod tests {
     /// scan fails typed instead of panicking.
     #[tokio::test]
     async fn a_footer_whose_arrow_schema_panics_arrow_is_corrupt() {
-        const BASE64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let original = valid();
         let (size, footer_len) = (original.len() as u64, footer_len_of(&original));
-        let end = original.len() - TRAILER_LEN as usize;
-        let start = end - footer_len as usize;
-        let decode = |bytes: &[u8]| ParquetMetaDataReader::decode_metadata(&bytes[start..end]);
-        let schema = decode(&original)
-            .expect("footer")
-            .file_metadata()
-            .key_value_metadata()
-            .and_then(|kv| kv.iter().find(|kv| kv.key == "ARROW:schema"))
-            .and_then(|kv| kv.value.clone())
-            .expect("ArrowWriter embeds its schema");
-        let at = original[start..end]
-            .windows(schema.len())
-            .position(|window| window == schema.as_bytes())
-            .expect("the schema's bytes are in the footer")
-            + start;
-        let panics = |bytes: &[u8]| {
-            let Ok(metadata) = decode(bytes) else {
-                return false;
-            };
-            let metadata = Arc::new(metadata);
-            std::panic::catch_unwind(AssertUnwindSafe(|| {
-                ArrowReaderMetadata::try_new(metadata, ArrowReaderOptions::new()).map(|_| ())
-            }))
-            .is_err()
-        };
-        let broken = (at..at + schema.len())
-            .flat_map(|at| BASE64.iter().map(move |&c| (at, c)))
-            .filter(|&(at, c)| original[at] != c)
-            .map(|(at, c)| {
-                let mut bytes = original.clone();
-                bytes[at] = c;
-                bytes
-            })
-            .find(|bytes| panics(bytes))
-            .expect("a one-character change that panics Arrow's schema decoder");
+        let broken = arrow_schema_panicking(&original);
 
         assert_corrupt(
             footer_of(broken.clone(), size, footer_len).await,
