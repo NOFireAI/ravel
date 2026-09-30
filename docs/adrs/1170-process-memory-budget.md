@@ -454,7 +454,8 @@ the shared remainder equals the budget by construction, and startup refuses a
 flag combination whose hard caps alone exceed it (the 2026-09-07 amendment
 below exempts `--disable-cache` from this refusal). On a loopback store the
 fetch cache takes a larger share, and `--cache-max-bytes` no longer sizes the
-catalog cache: see the loopback amendment below.
+catalog cache: see the loopback amendment below. A gateway derives no budget
+and is not refused: see the gateway amendment below.
 
 The overhead reserve is a measured number, not a guess, and it is measured in
 a calibration run that is separate from, and frozen before, the acceptance
@@ -824,3 +825,27 @@ decoded from may still be live, so the two ledgers can count overlapping
 bytes and `handoff_overlap` does not see it. `unique` overcounts by that
 overlap; the M5 reserve calibration (#1256) has to account for it as the
 decision 2 text above already requires.
+
+## Amendment (2026-09-30): a gateway uses no memory budget
+
+<!-- amendment-applies: sections="3. A static carve under one number" pointer="gateway amendment" -->
+
+Decision 3 derived the budget, and refused startup against it, in every mode.
+Only three modes use it. `all` and `query` build the query surface: the fetcher
+cache, the SQL executor and the fetchers that reserve against the shared
+accountant. `maintain` folds through the catalog, so its catalog byte cache
+holds memory. `gateway` builds no query surface and runs no fold, so nothing in
+it reads through either cache or reserves against the accountant, and it was
+refused anyway: under a cgroup memory limit of 2 GiB or less the budget
+derives to `0`, the two carves to `0`, and the `>=` comparison refused a
+process that claimed none of that memory.
+
+`--mode gateway` now derives no budget. `memory_budget_bytes` and the shared
+remainder resolve to `u64::MAX`, the hard caps to `0`, and each cache ceiling
+to its explicit flag or else `0`, all with source `not-applicable`. No
+overhead reserve is subtracted, `check_memory_budget` does not refuse, and the
+startup log prints one line saying the budget is not applicable in gateway mode
+in place of the four budget figures. `ravel_memory_budget_bytes` on a gateway's
+`/metrics` reads `u64::MAX`, the unlimited value, since nothing reserves there.
+Every other mode derives, carves and refuses exactly as decision 3 and the
+amendments above describe, with the same message.

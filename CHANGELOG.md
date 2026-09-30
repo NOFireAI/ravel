@@ -378,6 +378,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A gateway starts under a small memory limit** (issue #2234).
+  `ravel-server` refused to start in every mode under a cgroup memory limit of
+  2 GiB or less, because the process memory budget (effective memory minus a
+  2 GiB overhead reserve) derived to `0` and the startup check refused a `0`
+  remainder, including in `--mode gateway`, which builds no query surface, no
+  fetcher and no cache it reads through. A gateway now derives no budget,
+  subtracts no reserve and skips that check; its startup log says the memory
+  budget is not applicable in gateway mode. `all`, `query` and `maintain` keep
+  the check and its message unchanged.
+
 - **One refused delete no longer stops the superseded-input sweep for every
   chain** (issue #1846). Rule 2 deletes every cleared chain's input commit
   records, then their data objects, then the chains' own records, and a
