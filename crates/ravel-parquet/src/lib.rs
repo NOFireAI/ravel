@@ -29,6 +29,7 @@
 
 mod boundary;
 mod error;
+mod limits;
 mod metadata_cache;
 mod provider;
 mod reader;
@@ -39,6 +40,7 @@ mod store;
 mod test_support;
 
 pub use error::{ParquetReadError, ParquetTableError};
+pub use limits::ReadLimits;
 pub use metadata_cache::{MetadataCache, MetadataKey};
 pub use provider::{Cast, ParquetTableProvider, TableOptions};
 pub use reader::{PinnedFile, PinnedParquetReader, PinnedReaderFactory, ReadServices};

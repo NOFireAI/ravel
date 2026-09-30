@@ -22,6 +22,7 @@ use datafusion::arrow::util::display::array_value_to_string;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use ravel_catalog::{Catalog, CatalogConfig};
+use ravel_memory::MemoryBudget;
 use ravel_object_store::instrument::{InstrumentedStore, StoreOp};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
@@ -122,6 +123,27 @@ impl Lake {
         external: Option<Arc<dyn ravel_sql::ExternalStores>>,
         config: SqlConfig,
     ) -> Self {
+        Lake::with_budget(lake, external, config, Arc::new(MemoryBudget::unlimited()))
+    }
+
+    /// A configured executor over `config` drawing on `budget`.
+    fn budgeted(config: SqlConfig, budget: Arc<MemoryBudget>) -> Self {
+        let lake = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+        let external = Arc::new(ExternalStoreMap::new(HashMap::from([(
+            PROFILE.to_string(),
+            Arc::clone(&lake) as Arc<dyn ObjectStoreBackend>,
+        )]))) as Arc<dyn ravel_sql::ExternalStores>;
+        Lake::with_budget(lake, Some(external), config, budget)
+    }
+
+    /// An executor drawing on `budget`, the process memory budget a server
+    /// shares between its fetchers and its SQL pool.
+    fn with_budget(
+        lake: Arc<InstrumentedStore<MemoryStore>>,
+        external: Option<Arc<dyn ravel_sql::ExternalStores>>,
+        config: SqlConfig,
+        budget: Arc<MemoryBudget>,
+    ) -> Self {
         let ravel = Arc::new(InstrumentedStore::new(MemoryStore::new()));
         let store: Arc<dyn ObjectStoreBackend> = ravel.clone();
         let catalog =
@@ -142,7 +164,8 @@ impl Lake {
                 config,
                 1 << 30,
             )
-            .with_parquet_sources(sources),
+            .with_parquet_sources(sources)
+            .with_process_memory_budget(budget),
         );
         Lake {
             ravel,
@@ -993,4 +1016,224 @@ async fn flight_sql_reads_a_parquet_table() {
     let http = lake.execute(&acme.hash(), sql).await.expect("execute");
     assert_eq!(rows(&http), vec!["4|a", "5|b", "6|c"]);
     assert_eq!(merged(&flight), merged(http.output.batches()));
+}
+
+/// `groups` row groups of `rows` rows each, so every column chunk is about
+/// `8 * rows` bytes: `id: Int64` counting up from 0, `name: Utf8` and
+/// `score: Float64` (`id / 2`). Dictionary encoding and compression are off,
+/// which keeps a chunk's size a function of its row count alone.
+fn big_parquet_bytes(rows: usize, groups: usize) -> Bytes {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("score", DataType::Float64, false),
+    ]));
+    let properties = WriterProperties::builder()
+        .set_dictionary_enabled(false)
+        .set_max_row_group_row_count(Some(rows))
+        .build();
+    let mut out = Vec::new();
+    let mut writer =
+        ArrowWriter::try_new(&mut out, Arc::clone(&schema), Some(properties)).expect("writer");
+    for group in 0..groups {
+        let ids: Vec<i64> = (0..rows).map(|row| (group * rows + row) as i64).collect();
+        let scores: Vec<f64> = ids.iter().map(|id| *id as f64 / 2.0).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids)) as ArrayRef,
+                Arc::new(StringArray::from(vec!["n"; rows])),
+                Arc::new(Float64Array::from(scores)),
+            ],
+        )
+        .expect("batch");
+        writer.write(&batch).expect("write");
+        writer.flush().expect("one row group per batch");
+    }
+    writer.close().expect("close");
+    Bytes::from(out)
+}
+
+/// The bytes of column `column` in the first row group of `file`, and the
+/// footer's own length, from the bytes themselves.
+fn chunk_and_footer_len(file: &Bytes, column: usize) -> (u64, u64) {
+    let end = file.len() - 8;
+    let mut word = [0u8; 4];
+    word.copy_from_slice(&file[end..end + 4]);
+    let footer_len = u64::from(u32::from_le_bytes(word));
+    let metadata = parquet::file::metadata::ParquetMetaDataReader::decode_metadata(
+        &file[end - footer_len as usize..end],
+    )
+    .expect("footer");
+    let chunk = metadata.row_group(0).column(column).byte_range().1;
+    (chunk, footer_len)
+}
+
+/// One table `big` over one two-row-group file whose `id` and `score` chunks
+/// are each 8 * `ROWS` bytes; the file's bytes are returned with it.
+const ROWS: usize = 1 << 19;
+
+async fn big_for(lake: &Lake, tenant: &TenantHash) -> Bytes {
+    let bytes = big_parquet_bytes(ROWS, 2);
+    let file = lake.put_file("t/big/0.parquet", bytes.clone()).await;
+    lake.grant(tenant).await;
+    lake.create(tenant, "big", vec![file]).await;
+    bytes
+}
+
+/// The memory error a signal fetcher's refused reservation is, built for the
+/// comparison of class, status and client message.
+fn signal_memory_error() -> SqlError {
+    SqlError::Fetch(ravel_query::FetchError::FetchMemoryExhausted {
+        requested: 1,
+        reserved: 0,
+        limit: 0,
+    })
+}
+
+/// A column chunk larger than the process memory budget is refused with the
+/// signal fetchers' `FetchMemoryExhausted` (same class and client message)
+/// and its GET is never issued; a budget that fits one chunk at a time admits
+/// a query that reads two chunks one after the other, because the first
+/// chunk's reservation is released when parquet drops its buffer; and a query
+/// that needs two chunks at once is refused by that same budget.
+///
+/// FLIP: reserving after the GET leaves a second lake GET in the first case;
+/// never releasing (or releasing only at the end of the query) fails the
+/// sequential case with `FetchMemoryExhausted` for the second chunk; and a
+/// release at the moment the GET returns leaves `reserved()` at zero in the
+/// mid-stream check.
+#[tokio::test]
+async fn a_parquet_read_past_the_memory_budget_is_refused() {
+    let acme = tenant("acme");
+    let sum_id = "SELECT sum(id) FROM big";
+    let expected_sum = (0..(2 * ROWS) as i64).sum::<i64>().to_string();
+
+    // A budget under one chunk: the footer read fits, the chunk's does not.
+    let probe = Lake::configured();
+    let bytes = big_for(&probe, &acme).await;
+    let (chunk, footer_len) = chunk_and_footer_len(&bytes, 0);
+    assert!(
+        chunk > 100_000,
+        "a chunk of {chunk} bytes dwarfs the footer"
+    );
+    assert!(footer_len + 8 < chunk / 10);
+
+    let budget = Arc::new(MemoryBudget::new(chunk - 1));
+    let refused = Lake::budgeted(SqlConfig::default(), Arc::clone(&budget));
+    big_for(&refused, &acme).await;
+    let before = Lake::gets(&refused.lake);
+    let err = refused
+        .execute(&acme, sum_id)
+        .await
+        .expect_err("a chunk over the budget");
+    match &err {
+        SqlError::Fetch(ravel_query::FetchError::FetchMemoryExhausted {
+            requested, limit, ..
+        }) => {
+            assert_eq!(*requested, chunk);
+            assert_eq!(*limit, chunk - 1);
+        }
+        other => panic!("expected FetchMemoryExhausted, got {other:?}"),
+    }
+    assert_eq!(err.class(), signal_memory_error().class());
+    assert_eq!(err.client_message(), signal_memory_error().client_message());
+    assert_eq!(
+        Lake::gets(&refused.lake) - before,
+        1,
+        "the footer, and no GET for the chunk that was refused"
+    );
+    assert_eq!(
+        budget.reserved(),
+        0,
+        "nothing stays reserved after a refusal"
+    );
+
+    // A budget of one and a half chunks (the half is the SQL pool's own
+    // draw on the same budget): two chunks, one at a time.
+    let budget = Arc::new(MemoryBudget::new(chunk + chunk / 2));
+    let fits = Lake::budgeted(SqlConfig::default(), Arc::clone(&budget));
+    big_for(&fits, &acme).await;
+    let outcome = fits
+        .execute(&acme, sum_id)
+        .await
+        .expect("the first chunk's reservation was released before the second");
+    assert_eq!(rows(&outcome), vec![expected_sum.clone()]);
+    assert_eq!(budget.reserved(), 0);
+
+    // While the stream is inside the first row group its chunk is reserved:
+    // the reservation follows the buffer, not the GET.
+    let accounting = ravel_types::accounting::QueryAccounting::new();
+    let (snapshot, _) = fits
+        .executor
+        .resolve_snapshot(acme, &request("SELECT id FROM big"), &accounting)
+        .await
+        .expect("resolve");
+    let planned = fits
+        .executor
+        .plan_pinned(acme, snapshot, "SELECT id FROM big", &accounting, &[])
+        .await
+        .expect("plan");
+    let mut stream = planned.execute().await.expect("execute");
+    let first = futures::StreamExt::next(&mut stream)
+        .await
+        .expect("a batch")
+        .expect("batch");
+    assert!(
+        first.num_rows() < ROWS,
+        "the row group is not yet exhausted"
+    );
+    assert!(
+        budget.reserved() >= chunk,
+        "the chunk is reserved while parquet holds it: {}",
+        budget.reserved()
+    );
+    drop(stream);
+    // The stream's partition tasks are aborted, not joined, by the drop.
+    for _ in 0..1_000 {
+        if budget.reserved() == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(budget.reserved(), 0, "released when the data is dropped");
+
+    // Two chunks at once (`id` and `score` of one row group) do not fit the
+    // same budget, and neither is requested.
+    let before = Lake::gets(&fits.lake);
+    let err = fits
+        .execute(&acme, "SELECT sum(id), sum(score) FROM big")
+        .await
+        .expect_err("two chunks over a one-chunk budget");
+    assert!(
+        matches!(
+            err,
+            SqlError::Fetch(ravel_query::FetchError::FetchMemoryExhausted { .. })
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        Lake::gets(&fits.lake),
+        before,
+        "the batch is refused before either chunk is requested"
+    );
+
+    // A footer read that does not fit is refused when the table is built.
+    let tiny = Lake::budgeted(
+        SqlConfig::default(),
+        Arc::new(MemoryBudget::new(footer_len)),
+    );
+    big_for(&tiny, &acme).await;
+    let err = tiny
+        .execute(&acme, sum_id)
+        .await
+        .expect_err("a footer over the budget");
+    assert!(
+        matches!(
+            err,
+            SqlError::Fetch(ravel_query::FetchError::FetchMemoryExhausted { .. })
+        ),
+        "{err:?}"
+    );
+    assert_eq!(Lake::gets(&tiny.lake), 0, "no GET for the refused footer");
 }

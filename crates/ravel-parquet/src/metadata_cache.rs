@@ -56,6 +56,13 @@ impl CachedFooter {
 ///
 /// One instance lives for the process, beside the byte cache, so a footer is
 /// decoded, or refused, once per pinned file rather than once per statement.
+///
+/// It is a separately bounded cache, sized by `metadata_cache_bytes`, and
+/// nothing in it is charged to the process memory budget: the decoded footers
+/// are bounded by this cache's own byte limit, which the server sizes apart
+/// from the budget. What is charged is the footer's raw bytes while the reader
+/// holds them for decoding ([`crate::ReadLimits::reserve`]); the decoded form
+/// that stays here is not.
 #[derive(Debug)]
 pub struct MetadataCache {
     max_bytes: u64,
