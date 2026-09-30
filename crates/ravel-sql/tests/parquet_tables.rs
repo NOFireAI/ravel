@@ -32,9 +32,9 @@ use ravel_pqtable::manifest::ParquetFile;
 use ravel_pqtable::writer::{self, Intent};
 use ravel_query::{GetLimiter, LogSegmentFetcher, QueryPhase, SegmentFetcher};
 use ravel_sql::{
-    DEFAULT_PARQUET_METADATA_CACHE_BYTES, ErrorClass, ExternalStoreMap, MSG_PLAN,
-    ParquetQueryError, ParquetSources, SpanSegmentFetcher, SqlConfig, SqlError, SqlExecutor,
-    SqlOutcome, TargetSignal,
+    DEFAULT_PARQUET_METADATA_CACHE_BYTES, ErrorClass, ExternalStoreMap, MAX_NON_SIGNAL_TABLES,
+    MSG_PLAN, ParquetQueryError, ParquetSources, SpanSegmentFetcher, SqlConfig, SqlError,
+    SqlExecutor, SqlOutcome, TargetSignal,
 };
 use ravel_types::accounting::AccountedOp;
 use ravel_types::{TenantHash, TenantId};
@@ -885,4 +885,126 @@ async fn flight_sql_reads_a_parquet_table() {
     let http = lake.execute(&acme.hash(), sql).await.expect("execute");
     assert_eq!(rows(&http), vec!["4|a", "5|b", "6|c"]);
     assert_eq!(merged(&flight), merged(http.output.batches()));
+}
+
+/// `count` distinct table names that are no table of any tenant, in name order
+/// after `hits`.
+fn unknown_names(count: usize) -> Vec<String> {
+    (0..count).map(|i| format!("u{i:02}")).collect()
+}
+
+/// A cross join of `names`.
+fn select_from(names: &[String]) -> String {
+    format!("SELECT 1 FROM {}", names.join(", "))
+}
+
+/// The result of `sql` for `tenant`, with the LISTs and GETs it issued on
+/// Ravel's store.
+async fn ravel_reads(
+    lake: &Lake,
+    tenant: &TenantHash,
+    sql: &str,
+) -> (Result<SqlOutcome, SqlError>, u64, u64) {
+    let (lists, gets) = (Lake::lists(&lake.ravel), Lake::gets(&lake.ravel));
+    let result = lake.execute(tenant, sql).await;
+    (
+        result,
+        Lake::lists(&lake.ravel) - lists,
+        Lake::gets(&lake.ravel) - gets,
+    )
+}
+
+/// Each name that is no signal table costs one LIST to tell whether it is a
+/// Parquet table, so a statement naming more than `MAX_NON_SIGNAL_TABLES` of
+/// them is refused typed before any read of Ravel's store, and one naming
+/// exactly that many still plans, and fails, as an unknown table, after one
+/// LIST per name on top of the metrics catalog's own reads.
+#[tokio::test]
+async fn a_statement_naming_more_tables_than_the_cap_reads_nothing() {
+    let lake = Lake::configured();
+    let acme = tenant("acme");
+    lake.grant(&acme).await;
+
+    let (over, lists, gets) = ravel_reads(
+        &lake,
+        &acme,
+        &select_from(&unknown_names(MAX_NON_SIGNAL_TABLES + 1)),
+    )
+    .await;
+    let err = over.expect_err("over the cap");
+    assert!(
+        matches!(
+            err,
+            SqlError::TooManyTables { count, max }
+                if count == MAX_NON_SIGNAL_TABLES + 1 && max == MAX_NON_SIGNAL_TABLES
+        ),
+        "{err}"
+    );
+    assert_eq!(err.class(), ErrorClass::BadRequest);
+    assert_eq!((lists, gets), (0, 0), "no LIST and no GET of Ravel's store");
+
+    let (baseline, catalog_lists, catalog_gets) =
+        ravel_reads(&lake, &acme, "SELECT count(*) FROM samples").await;
+    baseline.expect("the metrics catalog alone");
+    let (at_cap, lists, gets) = ravel_reads(
+        &lake,
+        &acme,
+        &select_from(&unknown_names(MAX_NON_SIGNAL_TABLES)),
+    )
+    .await;
+    let err = at_cap.expect_err("unknown tables");
+    assert!(matches!(err, SqlError::Plan(_)), "{err}");
+    assert_eq!(err.client_message(), MSG_PLAN);
+    assert_eq!(
+        lists - catalog_lists,
+        MAX_NON_SIGNAL_TABLES as u64,
+        "one LIST per name besides the catalog's {catalog_lists}"
+    );
+    assert_eq!(gets, catalog_gets, "no GET besides the catalog's");
+}
+
+/// Beside a signal table, the first name with manifest versions already makes
+/// the statement `CrossSignalQuery`, so the names after it are never listed.
+#[tokio::test]
+async fn cross_signal_stops_at_the_first_parquet_table() {
+    let lake = Lake::configured();
+    let acme = tenant("acme");
+    lake.hits_for(&acme).await;
+    let mut names = vec!["samples".to_string(), "hits".to_string()];
+    names.extend(unknown_names(5));
+
+    let (result, lists, gets) = ravel_reads(&lake, &acme, &select_from(&names)).await;
+    let err = result.expect_err("cross signal");
+    assert!(matches!(err, SqlError::CrossSignalQuery), "{err}");
+    assert_eq!(
+        lists, 1,
+        "the LIST of hits and none of the five names after it"
+    );
+    assert_eq!(gets, 0);
+}
+
+/// With no profile file, the first name with manifest versions already makes
+/// the statement `NotConfigured`, so the names after it are never listed.
+#[tokio::test]
+async fn not_configured_stops_at_the_first_parquet_table() {
+    let lake = Lake::new(false, SqlConfig::default());
+    let acme = tenant("acme");
+    lake.hits_for(&acme).await;
+    let mut names = vec!["hits".to_string()];
+    names.extend(unknown_names(5));
+
+    let (result, lists, gets) = ravel_reads(&lake, &acme, &select_from(&names)).await;
+    let err = result.expect_err("no profiles");
+    assert!(
+        matches!(
+            parquet_error(&err),
+            Some(ParquetQueryError::NotConfigured { table }) if table == "hits"
+        ),
+        "{err}"
+    );
+    assert_eq!(
+        lists, 1,
+        "the LIST of hits and none of the five names after it"
+    );
+    assert_eq!(gets, 0);
 }
