@@ -18,6 +18,7 @@ use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::logical_expr::{Expr, ident};
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_datasource_parquet::source::ParquetSource;
 use parquet::arrow::ArrowWriter;
@@ -33,6 +34,7 @@ use ravel_pqtable::manifest::{Manifest, ParquetFile};
 use ravel_query::{GetLimiter, PhaseAccounting, ReadCache};
 use ravel_types::TenantHash;
 
+use crate::boundary::ParquetPanicBoundaryExec;
 use crate::error::{ParquetReadError, ParquetTableError};
 use crate::metadata_cache::MetadataCache;
 use crate::provider::ParquetTableProvider;
@@ -466,9 +468,7 @@ pub(crate) async fn file_groups_of(
         .scan(&ctx.state(), None, &[], None)
         .await
         .expect("scan");
-    let exec = plan
-        .downcast_ref::<DataSourceExec>()
-        .expect("a Parquet scan");
+    let exec = scan_of(plan.as_ref());
     let (config, _) = exec
         .downcast_to_file_source::<ParquetSource>()
         .expect("a Parquet file source");
@@ -482,6 +482,15 @@ pub(crate) async fn file_groups_of(
                 .collect()
         })
         .collect()
+}
+
+/// The `DataSourceExec` under the panic boundary a table's scan returns.
+pub(crate) fn scan_of(plan: &dyn ExecutionPlan) -> &DataSourceExec {
+    plan.downcast_ref::<ParquetPanicBoundaryExec>()
+        .expect("a panic boundary")
+        .inner()
+        .downcast_ref::<DataSourceExec>()
+        .expect("a Parquet scan")
 }
 
 /// The [`ParquetReadError`] somewhere in `err`'s source chain.

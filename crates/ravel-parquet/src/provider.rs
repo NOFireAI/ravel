@@ -31,6 +31,7 @@ use ravel_pqtable::manifest::Manifest;
 use ravel_query::PhaseAccounting;
 use ravel_types::TenantHash;
 
+use crate::boundary::ParquetPanicBoundaryExec;
 use crate::error::ParquetTableError;
 use crate::reader::{PinnedFile, PinnedReaderFactory, ReadServices};
 use crate::store::{file_path, store_url};
@@ -528,7 +529,10 @@ impl TableProvider for RawParquetScan {
             .with_limit(limit)
             .with_partitioned_by_file_group(!self.parallel)
             .build();
-        Ok(DataSourceExec::from_data_source(config))
+        Ok(Arc::new(ParquetPanicBoundaryExec::new(
+            self.table.clone(),
+            DataSourceExec::from_data_source(config),
+        )))
     }
 }
 
@@ -538,7 +542,7 @@ mod tests {
     use super::*;
     use crate::test_support::{
         Fixture, binary_parquet_bytes, file_groups_of, int_parquet_bytes, parquet_bytes, read_all,
-        read_columns,
+        read_columns, scan_of,
     };
     use datafusion::arrow::array::{
         Array, Date32Array, Int64Array, TimestampMillisecondArray, TimestampSecondArray,
@@ -755,9 +759,7 @@ mod tests {
             .scan(&ctx.state(), None, &[filter], None)
             .await
             .expect("scan");
-        let exec = plan
-            .downcast_ref::<DataSourceExec>()
-            .expect("a Parquet scan");
+        let exec = scan_of(plan.as_ref());
         let (_, source) = exec
             .downcast_to_file_source::<ParquetSource>()
             .expect("a Parquet file source");
