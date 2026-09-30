@@ -155,10 +155,11 @@ For the query routes, the status codes come from one shared error mapping:
   is not retryable, and its message is fixed so no object key or tenant hash
   leaks.
 - 503 `unavailable`: a transient storage fault, an invalidated snapshot, a
-  catalog HEAD, compaction record or erasure request written in a newer format
-  version this build cannot yet read (a peer on a newer build can, during a
-  rolling upgrade), or an unsatisfiable
-  `min_commit_token`. Retryable.
+  catalog object (HEAD, snapshot part, postings, column statistics, compaction
+  record or erasure request) written in a newer format version this build
+  cannot yet read (a peer on a newer build can, during a rolling upgrade), a
+  catalog decode job the read CPU gate cancelled at shutdown, or an
+  unsatisfiable `min_commit_token`. Retryable.
 - 504 `timeout`: the query passed its deadline.
 - 401 `unauthorized`: no resolvable credential.
 

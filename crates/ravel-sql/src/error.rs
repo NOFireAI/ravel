@@ -35,6 +35,7 @@ use datafusion::error::DataFusionError;
 use ravel_catalog::{CatalogError, LoadColumnStatsError, SnapshotFormatError};
 use ravel_commit::erasure::ErasureError;
 use ravel_commit::record::RecordError;
+use ravel_cpu_gate::CpuGateError;
 use ravel_object_store::StoreError;
 use ravel_query::{FetchError, FoldLag, LogFetchError};
 
@@ -605,11 +606,13 @@ impl SqlError {
 /// - "This build cannot read a newer format version" is retryable
 ///   ([`MSG_UNAVAILABLE`], `ErrorClass::Unavailable`, 503): during a rolling
 ///   upgrade a peer on a newer build can read it. That is `UnsupportedHeadVersion`,
-///   `SnapshotFormat`'s `UnsupportedVersion` case, and the unsupported-version
-///   case each of `CompactionRecordDecode` and `ErasureRequestDecode` carries in
-///   its source.
+///   every unsupported-version case of `SnapshotFormat` (part, HEAD, postings,
+///   column-stats), and the unsupported-version case each of
+///   `CompactionRecordDecode` and `ErasureRequestDecode` carries in its source.
 /// - Transient storage faults and fold-progress/liveness failures stay
-///   retryable; `UnsatisfiableToken` keeps its own stable message.
+///   retryable, as does a `SnapshotFormat` decode job the read CPU gate
+///   cancelled or refused while closed; a panicked decode job is corrupt.
+///   `UnsatisfiableToken` keeps its own stable message.
 ///
 /// Every variant is named (no wildcard) so a new `CatalogError` fails to
 /// compile here until it is classified. `WindowTooWide` never reaches this
@@ -637,7 +640,19 @@ fn redact_catalog(err: &CatalogError) -> &'static str {
             ..
         } => MSG_UNAVAILABLE,
         CatalogError::ErasureRequestDecode { .. } => MSG_CORRUPT,
-        CatalogError::SnapshotFormat(SnapshotFormatError::UnsupportedVersion(_)) => MSG_UNAVAILABLE,
+        // A decode job the read CPU gate dropped at shutdown, or a closed gate,
+        // never ran, so a retry on a healthy node can succeed; one that
+        // panicked panics again on the same bytes.
+        CatalogError::SnapshotFormat(
+            SnapshotFormatError::UnsupportedVersion(_)
+            | SnapshotFormatError::UnsupportedHeadVersion(_)
+            | SnapshotFormatError::PostingsUnsupportedVersion(_)
+            | SnapshotFormatError::ColumnStatsUnsupportedVersion(_)
+            | SnapshotFormatError::DecodeJob(CpuGateError::Cancelled | CpuGateError::Closed),
+        ) => MSG_UNAVAILABLE,
+        // Of SnapshotFormatError's dozens of variants only the ones above are
+        // retryable; every other one is a fault in bytes of a covered format
+        // version, or a panicked decode.
         CatalogError::SnapshotFormat(_) => MSG_CORRUPT,
 
         // A newer on-object format version this build cannot read: a peer on a
@@ -870,6 +885,50 @@ mod tests {
         )));
         assert_eq!(transient.client_message(), MSG_UNAVAILABLE);
         assert_eq!(transient.class(), ErrorClass::Unavailable);
+    }
+
+    /// Every snapshot-format object's newer-version case (part, HEAD, postings,
+    /// column-stats) is unavailable, as is a decode job the read CPU gate
+    /// cancelled or refused while closed. A panicked decode job, an entry level
+    /// outside the covered version, and a declared body over the decode cap
+    /// (a `CatalogConfig` default every node on this build shares) are corrupt.
+    /// The PromQL boundary pins the same split.
+    #[test]
+    fn snapshot_format_newer_versions_and_gate_aborts_are_unavailable() {
+        let catalog =
+            |err: SnapshotFormatError| SqlError::Catalog(CatalogError::SnapshotFormat(err));
+
+        let unavailable = [
+            SnapshotFormatError::UnsupportedVersion(2),
+            SnapshotFormatError::UnsupportedHeadVersion(2),
+            SnapshotFormatError::PostingsUnsupportedVersion(2),
+            SnapshotFormatError::ColumnStatsUnsupportedVersion(4),
+            SnapshotFormatError::DecodeJob(CpuGateError::Cancelled),
+            SnapshotFormatError::DecodeJob(CpuGateError::Closed),
+        ];
+        for source in unavailable {
+            let err = catalog(source);
+            assert_eq!(err.client_message(), MSG_UNAVAILABLE, "{err}");
+            assert_eq!(err.class(), ErrorClass::Unavailable, "{err}");
+        }
+
+        let corrupt = [
+            SnapshotFormatError::DecodeJob(CpuGateError::Panicked),
+            SnapshotFormatError::UnsupportedLevel(2),
+            SnapshotFormatError::DecompressedTooLarge {
+                declared: 2,
+                cap: 1,
+            },
+            SnapshotFormatError::HeaderVersionMismatch {
+                header: 2,
+                envelope: 1,
+            },
+        ];
+        for source in corrupt {
+            let err = catalog(source);
+            assert_eq!(err.client_message(), MSG_CORRUPT, "{err}");
+            assert_eq!(err.class(), ErrorClass::Internal, "{err}");
+        }
     }
 
     #[test]

@@ -246,9 +246,19 @@ fn redacted_storage_message(err: &QueryError) -> Option<&'static str> {
                 ..
             } => MSG_UNAVAILABLE,
             CatalogError::ErasureRequestDecode { .. } => MSG_CORRUPT,
-            CatalogError::SnapshotFormat(SnapshotFormatError::UnsupportedVersion(_)) => {
-                MSG_UNAVAILABLE
-            }
+            // A decode job the read CPU gate dropped at shutdown, or a closed
+            // gate, never ran, so a retry on a healthy node can succeed; one
+            // that panicked panics again on the same bytes.
+            CatalogError::SnapshotFormat(
+                SnapshotFormatError::UnsupportedVersion(_)
+                | SnapshotFormatError::UnsupportedHeadVersion(_)
+                | SnapshotFormatError::PostingsUnsupportedVersion(_)
+                | SnapshotFormatError::ColumnStatsUnsupportedVersion(_)
+                | SnapshotFormatError::DecodeJob(CpuGateError::Cancelled | CpuGateError::Closed),
+            ) => MSG_UNAVAILABLE,
+            // Of SnapshotFormatError's dozens of variants only the ones above
+            // are retryable; every other one is a fault in bytes of a covered
+            // format version, or a panicked decode.
             CatalogError::SnapshotFormat(_) => MSG_CORRUPT,
 
             // A newer on-object format version this build cannot read is
@@ -590,6 +600,53 @@ mod tests {
         )));
         assert_eq!(store.status.as_u16(), 503);
         assert_eq!(store.error_type, "unavailable");
+    }
+
+    /// Every snapshot-format object's newer-version case (part, HEAD, postings,
+    /// column-stats) is the retryable 503, as is a decode job the read CPU gate
+    /// cancelled or refused while closed. A panicked decode job, an entry level
+    /// outside the covered version, and a declared body over the decode cap
+    /// (a `CatalogConfig` default every node on this build shares) are the
+    /// non-retryable 500. The SQL boundary pins the same split.
+    #[test]
+    fn snapshot_format_newer_versions_and_gate_aborts_are_503() {
+        let parts = |err: SnapshotFormatError| {
+            ApiError::from(QueryError::Catalog(CatalogError::SnapshotFormat(err))).into_parts()
+        };
+
+        let unavailable: Vec<fn() -> SnapshotFormatError> = vec![
+            || SnapshotFormatError::UnsupportedVersion(2),
+            || SnapshotFormatError::UnsupportedHeadVersion(2),
+            || SnapshotFormatError::PostingsUnsupportedVersion(2),
+            || SnapshotFormatError::ColumnStatsUnsupportedVersion(4),
+            || SnapshotFormatError::DecodeJob(CpuGateError::Cancelled),
+            || SnapshotFormatError::DecodeJob(CpuGateError::Closed),
+        ];
+        for make in &unavailable {
+            let p = parts(make());
+            assert_eq!(p.status.as_u16(), 503, "{:?}", make());
+            assert_eq!(p.error_type, "unavailable", "{:?}", make());
+            assert_eq!(p.message, MSG_UNAVAILABLE, "{:?}", make());
+        }
+
+        let corrupt: Vec<fn() -> SnapshotFormatError> = vec![
+            || SnapshotFormatError::DecodeJob(CpuGateError::Panicked),
+            || SnapshotFormatError::UnsupportedLevel(2),
+            || SnapshotFormatError::DecompressedTooLarge {
+                declared: 2,
+                cap: 1,
+            },
+            || SnapshotFormatError::HeaderVersionMismatch {
+                header: 2,
+                envelope: 1,
+            },
+        ];
+        for make in &corrupt {
+            let p = parts(make());
+            assert_eq!(p.status.as_u16(), 500, "{:?}", make());
+            assert_eq!(p.error_type, "internal", "{:?}", make());
+            assert_eq!(p.message, MSG_CORRUPT, "{:?}", make());
+        }
     }
 
     #[test]
