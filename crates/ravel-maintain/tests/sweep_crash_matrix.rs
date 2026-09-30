@@ -299,11 +299,12 @@ async fn row8_records_deleted_data_not_orphan_gc_converges() {
     run(Sig::Spans).await;
 }
 
-// --- Row 8b: locked commit record blocks the record-delete loop -----------
+// --- Row 8b: a failing commit-record delete blocks the record loop ---------
 
-/// Row 8b: a compliance-mode Object Lock retention on a commit record
-/// refuses every delete attempt against it, not just the first. The
-/// superseded sweep's record-delete loop runs before its data-delete loop
+/// Row 8b: every delete of a commit record fails with a retryable error (a
+/// timeout), not just the first. A retryable error fails the pass rather than
+/// being tolerated per chain as a refusal is (row 8e). The superseded sweep's
+/// record-delete loop runs before its data-delete loop
 /// (docs/deletion-and-gc.md, docs/object-store-contract.md "Required bucket
 /// configuration"), and the record loop covers every cleared group in the
 /// pass before the data loop runs at all, so a record that never stops
@@ -320,8 +321,8 @@ async fn row8_records_deleted_data_not_orphan_gc_converges() {
 async fn row8b_locked_commit_record_delete_blocks_before_data_loop() {
     async fn run(sig: Sig) {
         let inner = MemoryStore::new();
-        // Always-on: every commit-record delete faults, modeling a retention
-        // period that has not elapsed rather than a one-shot transient error.
+        // Always-on: every commit-record delete faults, rather than a one-shot
+        // transient error.
         let plan = FaultPlan::empty()
             .with_rule(Rule::new(Op::Delete, ScriptedFault::Timeout).with_key_contains("/c/"));
         let store = FaultStore::new(inner, plan);
@@ -417,8 +418,8 @@ async fn seed_three(store: &dyn ObjectStoreBackend, sig: Sig) -> Bucket {
     }
 }
 
-/// Row 8c: the record-delete loop must propagate the first refusal, not
-/// accumulate errors and keep deleting. The fixture has three superseded L0
+/// Row 8c: the record-delete loop must propagate the first retryable delete
+/// failure, not accumulate errors and keep deleting. The fixture has three superseded L0
 /// commit records and the fault fires on the *second* `/c/` delete, so the
 /// first delete really lands in the store and a third record sits behind the
 /// refusal. A correct pass deletes exactly one record and then returns the
@@ -435,8 +436,8 @@ async fn seed_three(store: &dyn ObjectStoreBackend, sig: Sig) -> Bucket {
 async fn row8c_record_loop_stops_at_the_first_refused_delete() {
     async fn run(sig: Sig) {
         let inner = MemoryStore::new();
-        // Nth(2): the first commit-record delete succeeds, the second refuses,
-        // modeling one locked record among several in the same pass.
+        // Nth(2): the first commit-record delete succeeds, the second times
+        // out.
         let plan = FaultPlan::empty().with_rule(
             Rule::new(Op::Delete, ScriptedFault::Timeout)
                 .with_key_contains("/c/")
@@ -478,8 +479,8 @@ async fn row8c_record_loop_stops_at_the_first_refused_delete() {
         .await;
         assert!(
             err.is_err(),
-            "a refused record delete must abort the pass, not be collected and \
-             skipped"
+            "a retryable record-delete failure must abort the pass, not be \
+             collected and skipped"
         );
         assert_eq!(
             store.fault_count(Op::Delete, FaultKind::Timeout),
@@ -506,7 +507,7 @@ async fn row8c_record_loop_stops_at_the_first_refused_delete() {
     run(Sig::Spans).await;
 }
 
-// --- Row 8d: a lock on the chain's own record aborts the third loop --------
+// --- Row 8d: a failure on the chain's own record aborts the third loop -----
 
 /// Two metrics L0 inputs carrying a "victim" series an erasure request can
 /// match, so a rewrite over the compacted bucket supersedes the compaction
@@ -601,15 +602,16 @@ async fn chain_record_count(store: &dyn ObjectStoreBackend, bucket: &Bucket) -> 
         .count()
 }
 
-/// Row 8d: a compliance lock on a chain's OWN compaction or rewrite record does
-/// not hold the superseded data. `sweep_superseded` runs three delete loops in
-/// order (`sweep_superseded_impl`, `crates/ravel-maintain/src/sweep.rs`): every
-/// cleared group's input commit records, then every cleared group's data
-/// objects, then every cleared group's own chain records, so a rewrite record
-/// outlives every input it superseded. By the time a lock on a chain record
-/// refuses, the pass has already deleted the input records, the L0 data, and
-/// the pre-rewrite L1 parts; the refusal aborts the pass at the third loop, and
-/// the chain's own record survives for the next pass to retry.
+/// Row 8d: a retryable failure (a timeout) deleting a chain's OWN compaction
+/// or rewrite record does not hold the superseded data. `sweep_superseded`
+/// runs three delete loops in order (`sweep_superseded_impl`,
+/// `crates/ravel-maintain/src/sweep.rs`): every cleared group's input commit
+/// records, then every cleared group's data objects, then every cleared
+/// group's own chain records, so a rewrite record outlives every input it
+/// superseded. By the time the chain record's delete fails, the pass has
+/// already deleted the input records, the L0 data, and the pre-rewrite L1
+/// parts; the failure aborts the pass at the third loop, and the chain's own
+/// record survives for the next pass to retry.
 ///
 /// The fixture compacts two L0 inputs, then rewrites the compacted bucket so
 /// the rewrite record supersedes the compaction record (the
@@ -706,7 +708,7 @@ async fn row8d_locked_chain_record_aborts_after_inputs_and_data_gone() {
     .await;
     assert!(
         err.is_err(),
-        "a refused chain-record delete must abort the pass"
+        "a retryable chain-record delete failure must abort the pass"
     );
     assert_eq!(
         store.fault_count(Op::Delete, FaultKind::Timeout),
@@ -714,8 +716,8 @@ async fn row8d_locked_chain_record_aborts_after_inputs_and_data_gone() {
         "the Nth(3) chain-record-delete fault must have fired"
     );
 
-    // Loops one and two ran to completion before the third loop refused, so a
-    // lock on the chain's own record did not hold the data behind it.
+    // Loops one and two ran to completion before the third loop failed, so a
+    // failure on the chain's own record did not hold the data behind it.
     assert_eq!(
         l0_commit_count(&store, &bucket).await,
         0,
@@ -733,13 +735,77 @@ async fn row8d_locked_chain_record_aborts_after_inputs_and_data_gone() {
     assert_eq!(
         chain_record_count(&store, &bucket).await,
         before_chain,
-        "the chain's own record count is unchanged: the refused compaction \
-         record survives the retention period for the next pass to retry"
+        "the chain's own record count is unchanged: the compaction record \
+         survives for the next pass to retry"
     );
     assert!(
         store.head(&comp_key).await.is_ok(),
-        "the superseded compaction record survives the refused delete"
+        "the superseded compaction record survives the failed delete"
     );
+}
+
+// --- Row 8e: a refused commit-record delete stops only its own group -------
+
+/// Row 8e: the store refuses (a permanent error, as an Object Lock retention
+/// reads) every delete of one of the two superseded L0 commit records. A
+/// refusal is not a retryable error: the pass returns `Ok`, counts it once in
+/// `deletes_refused`, keeps that input's commit record and data object, and
+/// still deletes the other input's commit record and data object, since each
+/// raw input is its own deletion group. The compaction record and its L1
+/// parts are untouched.
+///
+/// Discrimination: with the refusal taking the pass's error arm instead
+/// (the row 8b behaviour), the sweep returns `Err` and the `expect` below
+/// panics; with the refusing group not stopped, its data object is deleted
+/// under a surviving commit record and `data_deleted` reads 2.
+#[tokio::test]
+async fn row8e_refused_commit_record_delete_stops_only_its_own_group() {
+    async fn run(sig: Sig) {
+        let inner = MemoryStore::new();
+        let created = sealed_now_ns();
+        let clock = FixedClock::new(created);
+        let bucket = seed_and_compact(&inner, &clock, sig).await;
+        let commits = l0_commit_keys(&inner, &bucket).await;
+        assert_eq!(commits.len(), 2, "the fixture holds two superseded inputs");
+        assert_eq!(l0_data_count(&inner, &bucket).await, 2);
+        let locked = commits[0].clone();
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Delete, ScriptedFault::Permanent("object locked".into()))
+                .with_key_contains(&locked),
+        );
+        let store = FaultStore::new(inner, plan);
+
+        clock.set(past_horizon(created, &cfg()));
+        let outcome = sweep_superseded(
+            &store,
+            &clock,
+            &cfg(),
+            &NoLeases,
+            &bucket.tenant_hash,
+            bucket.signal,
+            bucket.shard,
+        )
+        .await
+        .expect("a refused delete does not fail the pass");
+        assert_eq!(
+            store.fault_count(Op::Delete, FaultKind::Permanent),
+            1,
+            "the refusal must have fired exactly once"
+        );
+        assert_eq!(outcome.deletes_refused, 1);
+        assert_eq!((outcome.records_deleted, outcome.data_deleted), (1, 1));
+        assert_eq!(l0_commit_keys(&store, &bucket).await, vec![locked]);
+        assert_eq!(
+            l0_data_count(&store, &bucket).await,
+            1,
+            "the refused input's data object outlives its commit record's \
+             refused delete; the other input's is gone"
+        );
+        assert_l1_intact(&store, &bucket).await;
+    }
+    run(Sig::Metrics).await;
+    run(Sig::Logs).await;
+    run(Sig::Spans).await;
 }
 
 // --- Row 9: pinned query outlives horizon, input deleted under it ----------

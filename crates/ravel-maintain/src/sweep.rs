@@ -273,11 +273,11 @@ pub async fn sweep_shard(
     Ok(report)
 }
 
-/// [`sweep_shard`], also returning what rule 2 held this pass in the form
-/// [`sweep_erasure_requests_with_holds`] consumes. A caller that sweeps several
-/// shards of one signal per tick unions these with [`SupersededHolds::absorb`]
-/// and passes the union to that function, so rule 6 decides from what rule 2
-/// actually held instead of walking the chains a second time.
+/// [`sweep_shard`], also returning what rule 2 held this pass, unioned with
+/// [`SupersededHolds::absorb`] across shards. These are a deleting pass's
+/// holds, which miss every chain under a rewrite still inside its protection
+/// horizon, so they are an operator signal and not an input to rule 6:
+/// [`sweep_erasure_requests`] observes its own.
 pub async fn sweep_shard_with_holds(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -561,6 +561,7 @@ fn log_superseded_holds(
         && outcome.dominated_records_unattached == 0
         && outcome.held_request_ids.is_empty()
         && outcome.held_truncated_buckets.is_empty()
+        && outcome.deletes_refused == 0
     {
         return;
     }
@@ -574,9 +575,11 @@ fn log_superseded_holds(
         held_requests = outcome.held_request_ids.len(),
         held_truncated_buckets = outcome.held_truncated_buckets.len(),
         dominated_records_unattached = outcome.dominated_records_unattached,
+        deletes_refused = outcome.deletes_refused,
         "superseded-input sweep: held inputs the live catalog HEAD snapshot still names \
-         (or could not be read, or a legal hold protects); they are collected once the fold \
-         reconciles their hour, HEAD is rebuilt, or the hold is released"
+         (or could not be read, or a legal hold protects, or the store refused a delete); \
+         they are collected once the fold reconciles their hour, HEAD is rebuilt, or the \
+         hold or refusal is lifted"
     );
 }
 
@@ -993,11 +996,12 @@ pub struct HeldBucket {
 /// unreadable HEAD or snapshot part ([`SnapshotBlock::Unreadable`]).
 ///
 /// `held_request_ids` and `held_truncated_buckets` are what the
-/// erasure-request sweep consumes: this pass is the only component that
-/// already knows, per chain group, both which erasure requests the group's
+/// erasure-request sweep consumes, from an observing pass
+/// ([`SweepMode::GateOnly`]): this pass is the only component that already
+/// knows, per chain group, both which erasure requests the group's
 /// generations applied and whether the group was held. Publishing that here
-/// is what lets rule 6 decide without a walk of its own, and without depending
-/// on a completion record's optional per-bucket drop list.
+/// is what lets rule 6 decide without depending on a completion record's
+/// optional per-bucket drop list.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SupersededSweepOutcome {
     /// Superseded commit, compaction, and rewrite records deleted (or, under
@@ -1040,6 +1044,13 @@ pub struct SupersededSweepOutcome {
     /// pre-erasure record, so a nonzero value is an operator signal. Counted
     /// by a deleting pass only.
     pub dominated_records_unattached: usize,
+    /// Deletes the store refused this pass (access denied, a failed
+    /// precondition, or a permanent error, such as an Object Lock retention
+    /// on one record). Not fatal: the refusing group keeps every key it had
+    /// not yet deleted, is reported held, and is retried next pass, while the
+    /// other groups are collected. A persistent nonzero value is an operator
+    /// signal. Counter seam for `ravel_maintain_superseded_deletes_refused_total`.
+    pub deletes_refused: usize,
 }
 
 impl SupersededSweepOutcome {
@@ -1065,7 +1076,8 @@ impl SupersededSweepOutcome {
 }
 
 /// What a superseded-input sweep held, in the form rule 6 consumes: the union
-/// over however many shards the caller swept.
+/// over however many shards the pass swept. Rule 6 takes it only from its own
+/// observing pass, which walks every chain in the signal whatever its age.
 ///
 /// This is the whole input to the erasure-request guard. Rule 6 asks no
 /// question of its own about supersession chains: rule 2 already walked them,
@@ -1102,6 +1114,11 @@ impl SupersededHolds {
 /// Delete the L0 commit records and data objects named in each horizon-passed
 /// compaction record's input list, records before data objects, skipping any
 /// the live catalog HEAD snapshot still names (the ADR-0020 delete blocker).
+///
+/// A delete the store refuses (access denied, a failed precondition, or a
+/// permanent error) keeps the rest of its own supersession chain for the next
+/// pass and is counted in [`SupersededSweepOutcome::deletes_refused`]; the
+/// other chains are still collected. Any other store error fails the pass.
 pub async fn sweep_superseded(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -1130,8 +1147,8 @@ pub async fn sweep_superseded(
 /// Whether a [`sweep_superseded_impl`] pass deletes what it cleared, or only
 /// computes the gate and the holds.
 ///
-/// [`SweepMode::GateOnly`] is what makes the erasure-request guard reachable
-/// from a caller that has no rule-2 outcome to hand. It is not `dry_run`,
+/// [`SweepMode::GateOnly`] is the pass the erasure-request guard decides from.
+/// It is not `dry_run`,
 /// which reports what a deleting pass would have removed: `records_deleted`
 /// and `data_deleted` are always zero here, and the only outputs a caller
 /// reads are [`SupersededSweepOutcome::held_request_ids`] and
@@ -1366,10 +1383,10 @@ async fn sweep_superseded_impl(
                     // resolve, no pass follows a version 2 link. A walk
                     // refused for that, or for a chain past the depth bound
                     // or a revisit, is held in a truncated bucket in every
-                    // pass kind, so both rule-6 entry points refuse the same
-                    // chains when they walk them, though only the observing
-                    // pass walks every rewrite's chain, and the shard's other buckets
-                    // are still swept.
+                    // pass kind, so a deleting pass and the observing pass
+                    // refuse the same chains when they walk them, though only
+                    // the observing pass walks every rewrite's chain, and the
+                    // shard's other buckets are still swept.
                     let bucket = record.ingest_hour_bucket;
                     let links = if version_2.unresolved.contains(&bucket) {
                         Version2Links::Refuse
@@ -1529,41 +1546,79 @@ async fn sweep_superseded_impl(
     // Groups of distinct identity can still share a key: a dominated version
     // 2 record naming an absent record joins every group that ended there. A
     // key is deleted and counted once per pass.
+    //
+    // A delete the store refuses ([`delete_refused`]) stops only the group it
+    // belongs to: none of that group's later keys is deleted this pass, in
+    // any of the three loops, so what survives of it is a suffix of its own
+    // delete order, the same state a crash at that point leaves. A group that
+    // meets a key another group's delete was refused on stops there too. Every
+    // stopped group is reported held, since objects it superseded may still
+    // be present. Any other store error fails the pass.
     let mut deleted: HashSet<&str> = HashSet::new();
-    for group in &cleared {
-        for k in &group.record_keys {
-            if !deleted.insert(k) {
-                continue;
+    let mut refused: HashSet<&str> = HashSet::new();
+    let mut stopped: Vec<bool> = vec![false; cleared.len()];
+    for delete_loop in [
+        DeleteLoop::InputRecords,
+        DeleteLoop::Data,
+        DeleteLoop::ChainRecords,
+    ] {
+        for (index, group) in cleared.iter().enumerate() {
+            for k in group.loop_keys(delete_loop) {
+                if stopped[index] || refused.contains(k.as_str()) {
+                    stopped[index] = true;
+                    break;
+                }
+                if deleted.contains(k.as_str()) {
+                    continue;
+                }
+                if !config.dry_run {
+                    match store.delete(k).await {
+                        Ok(()) => {}
+                        Err(e) if delete_refused(&e) => {
+                            tracing::warn!(
+                                tenant_hash = %tenant.to_hex(),
+                                signal = signal.key_prefix(),
+                                shard,
+                                ingest_hour_bucket = group.ingest_hour_bucket,
+                                key = %k,
+                                error = %e,
+                                "superseded-input sweep: the store refused a delete; the rest of \
+                                 this supersession chain is kept and retried next pass, and the \
+                                 other chains are still collected"
+                            );
+                            refused.insert(k);
+                            outcome.deletes_refused += 1;
+                            stopped[index] = true;
+                            break;
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                deleted.insert(k);
+                if delete_loop == DeleteLoop::Data {
+                    outcome.data_deleted += 1;
+                } else {
+                    outcome.records_deleted += 1;
+                }
             }
-            if !config.dry_run {
-                store.delete(k).await?;
-            }
-            outcome.records_deleted += 1;
         }
     }
-    for group in &cleared {
-        for k in &group.data_keys {
-            if !deleted.insert(k) {
-                continue;
-            }
-            if !config.dry_run {
-                store.delete(k).await?;
-            }
-            outcome.data_deleted += 1;
-        }
-    }
-    for group in &cleared {
-        for k in &group.chain_record_keys {
-            if !deleted.insert(k) {
-                continue;
-            }
-            if !config.dry_run {
-                store.delete(k).await?;
-            }
-            outcome.records_deleted += 1;
-        }
+    for (group, _) in cleared.iter().zip(&stopped).filter(|(_, s)| **s) {
+        outcome.note_hold(group, shard);
     }
     Ok(outcome)
+}
+
+/// Whether a failed delete is a refusal of that one object, which rule 2's
+/// phase C tolerates per supersession chain: access denied (an S3 Object Lock
+/// retention or a deny policy on the key), a failed precondition, and a
+/// permanent error. A retryable error, and a store that cannot delete at all
+/// (read-only, or no delete support), still fail the pass.
+fn delete_refused(e: &StoreError) -> bool {
+    matches!(
+        e,
+        StoreError::AccessDenied(_) | StoreError::PreconditionFailed | StoreError::Permanent(_)
+    )
 }
 
 /// GET every rewrite record among `entries`, keyed by its commit key, tolerant
@@ -1980,6 +2035,17 @@ struct SupersededSubset {
     ingest_hour_bucket: u32,
 }
 
+/// One of rule 2's phase C delete loops, in the order they run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteLoop {
+    /// Every raw L0 input's commit record.
+    InputRecords,
+    /// The input data objects and every generation's parts.
+    Data,
+    /// The chain's own compaction and rewrite records, oldest first.
+    ChainRecords,
+}
+
 /// One indivisible deletion unit for rule 2: the records to delete first, the
 /// data objects to delete after them, and the snapshot identities those
 /// objects carry so the HEAD-reachability gate can decide the whole unit at
@@ -2048,6 +2114,15 @@ impl SupersededGroup {
         self.record_keys.len() + self.data_keys.len() + self.chain_record_keys.len()
     }
 
+    /// The keys one of rule 2's phase C loops deletes from this group.
+    fn loop_keys(&self, delete_loop: DeleteLoop) -> &[String] {
+        match delete_loop {
+            DeleteLoop::InputRecords => &self.record_keys,
+            DeleteLoop::Data => &self.data_keys,
+            DeleteLoop::ChainRecords => &self.chain_record_keys,
+        }
+    }
+
     /// Every key this group deletes, in delete order.
     fn keys(&self) -> impl Iterator<Item = &String> {
         self.record_keys
@@ -2065,16 +2140,52 @@ impl SupersededGroup {
 
     /// Fold in a second gather of the same group (a sibling live rewrite over
     /// the same predecessor, or, in an observing pass, a predecessor gathered
-    /// from its own entry and again through a successor's walk). Only the two
-    /// facts a duplicate can add are taken: the sibling's own applied requests,
-    /// and a truncation either gather saw. The two gathers may differ in the
-    /// parts they collected when they started from different links, and that
-    /// difference is not merged: the first gather's keys and objects stand,
-    /// which is all a deleting pass acts on, and the observation consumes only
-    /// the request ids and the truncation flag.
+    /// from its own entry and again through a successor's walk). The merged
+    /// group carries both gathers' requests, a truncation either saw, and the
+    /// union of their keys and objects: two walks entered from different links
+    /// share the oldest record but not the generations above it, and a HEAD
+    /// naming only a part the second walk reached must still hold the group,
+    /// whichever gather the listing order put first.
+    ///
+    /// When one gather's keys contain the other's, which is every case of one
+    /// walk entered below the other, its vectors are taken whole, so the
+    /// merged group keeps a delete order a single walk produced. Otherwise the
+    /// keys the first gather lacks are appended after its own, each vector in
+    /// the second gather's order.
     fn absorb_duplicate(&mut self, other: SupersededGroup) {
-        self.request_ids.extend(other.request_ids);
+        self.request_ids.extend(other.request_ids.iter().cloned());
         self.truncated |= other.truncated;
+        let (covers, covered) = {
+            let mine: HashSet<&String> = self.keys().collect();
+            let theirs: HashSet<&String> = other.keys().collect();
+            (theirs.is_subset(&mine), mine.is_subset(&theirs))
+        };
+        if covers {
+            return;
+        }
+        if covered {
+            self.record_keys = other.record_keys;
+            self.data_keys = other.data_keys;
+            self.chain_record_keys = other.chain_record_keys;
+            self.objects = other.objects;
+            if other.absent_end.is_some() {
+                self.absent_end = other.absent_end;
+            }
+            return;
+        }
+        let union = |mine: &mut Vec<String>, theirs: Vec<String>| {
+            let present: HashSet<String> = mine.iter().cloned().collect();
+            mine.extend(theirs.into_iter().filter(|k| !present.contains(k)));
+        };
+        union(&mut self.record_keys, other.record_keys);
+        union(&mut self.data_keys, other.data_keys);
+        union(&mut self.chain_record_keys, other.chain_record_keys);
+        let objects: HashSet<SnapshotObject> = self.objects.iter().copied().collect();
+        self.objects
+            .extend(other.objects.into_iter().filter(|o| !objects.contains(o)));
+        if self.absent_end.is_none() {
+            self.absent_end = other.absent_end;
+        }
     }
 }
 
@@ -3338,22 +3449,24 @@ pub struct ErasureRequestSweepOutcome {
 ///   (such a hold does not cover `del/`, so it does not pin the `.dreq`
 ///   itself). In every one of those cases a snapshot can still resolve the
 ///   pre-rewrite object, so retiring the filter would serve the erased subject
-///   again. The decision is read straight off [`SupersededHolds`], which rule
-///   2 fills while it gates: `request_ids` when a held group names the request,
-///   and `truncated_buckets` when a held group's chain could not be walked to
-///   the end, in which case the requests the missing generation applied are
-///   named by no surviving record and the bucket stands in for them. This
-///   costs no LIST and no GET of its own beyond rule 2's own pass. The holds
-///   cover every supersession chain in the signal, not only the ones old
-///   enough to delete: an object's age says nothing about whether a snapshot
-///   still resolves it, and a chain still inside its own protection horizon is
-///   the likeliest one a stale HEAD names.
+///   again. The decision is read off the [`SupersededHolds`] of an observing
+///   rule-2 pass this function runs itself ([`SweepMode::GateOnly`], over
+///   every shard of the signal): `request_ids` when a held group names the
+///   request, and `truncated_buckets` when a held group's chain could not be
+///   walked to the end, in which case the requests the missing generation
+///   applied are named by no surviving record and the bucket stands in for
+///   them. The holds cover every supersession chain in the signal, not only
+///   the ones old enough to delete: an object's age says nothing about whether
+///   a snapshot still resolves it, and a chain still inside its own protection
+///   horizon is the likeliest one a stale HEAD names. That is why no entry
+///   takes a deleting pass's holds instead: a deleting pass walks no rewrite
+///   still inside its horizon, nor any record below one.
 /// - the [`LeaseCheck`] passes: a legal hold over the `del/` keyspace pins the
 ///   request exactly as it pins any other object.
 ///
 /// A completion's `bucket_drops` is informational only. No part of this rule
-/// reads it: not the hold decision, and not the scope of the observation the
-/// six-argument entry runs. The field is optional on the wire, is written
+/// reads it: not the hold decision, and not the scope of the observation. The
+/// field is optional on the wire, is written
 /// empty by the production writer, and a writer that does populate it is not
 /// obliged to enumerate every bucket it touched, so a present list can be
 /// partial. Any truncated bucket in the signal therefore holds any candidate.
@@ -3374,23 +3487,12 @@ pub struct ErasureRequestSweepOutcome {
 /// `del/` that is neither a `.dreq` nor a `.done` is layout drift and fails
 /// the pass loud, matching the resolver's and the rewrite pass's fail-loud
 /// discipline for this keyspace.
-/// Run rule 6 for a caller that has no rule-2 outcome to hand, observing the
-/// holds itself.
 ///
-/// This is the production entry (`ravel-server`'s maintenance tick), and it is
-/// what makes the guard reachable there: it runs rule 2 in
-/// [`SweepMode::GateOnly`] over every shard of the signal and decides from the
-/// holds that pass reports, instead of from a completion field a production
-/// writer may leave empty. The observation costs one rule-2-shaped pass and
-/// nothing more; a caller that already swept the signal's shards this tick
-/// should sweep with [`sweep_shard_with_holds`], union the holds it returns,
-/// and call [`sweep_erasure_requests_with_holds`] instead, which costs nothing
-/// at all.
-///
-/// The observation runs only when there is a `.dreq` past its horizon to
-/// decide about. An ordinary pass, where every request is either incomplete or
-/// still inside its horizon, reads nothing but the `del/` listing and the
-/// completions.
+/// This is rule 6's only entry, and `ravel-server`'s maintenance tick calls
+/// it. The observation costs one rule-2-shaped pass and nothing more, and runs
+/// only when there is a `.dreq` past its horizon to decide about. An ordinary
+/// pass, where every request is either incomplete or still inside its
+/// horizon, reads nothing but the `del/` listing and the completions.
 pub async fn sweep_erasure_requests(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -3398,48 +3500,6 @@ pub async fn sweep_erasure_requests(
     lease: &dyn LeaseCheck,
     tenant: &TenantHash,
     signal: Signal,
-) -> Result<ErasureRequestSweepOutcome> {
-    sweep_erasure_requests_inner(store, clock, config, lease, tenant, signal, None).await
-}
-
-/// Run rule 6 against the holds a caller's own rule-2 passes already reported
-/// (`holds`), adding no request of its own.
-///
-/// This is the shape the per-tick maintenance loop wants: sweep the signal's
-/// shards with [`sweep_shard_with_holds`], union each returned
-/// [`SupersededHolds`], and pass the union here. A deleting rule-2 pass does
-/// not walk a rewrite still inside its protection horizon or the records below
-/// it, so its holds can miss a chain (refused or HEAD-held) under such a
-/// rewrite; [`sweep_erasure_requests`], which runs its own observing pass over
-/// every rewrite's chain, is the entry point that sees them all.
-///
-/// `holds` must cover every shard of `signal` the caller swept, and the caller
-/// must have swept them with the same `config` horizon. A `holds` that omits a
-/// shard rule 2 held in is the one unsafe input to this function: it would let
-/// a `.dreq` retire while a pre-rewrite object in that shard is still
-/// resolvable. [`sweep_erasure_requests`] exists for callers that cannot make
-/// that guarantee.
-pub async fn sweep_erasure_requests_with_holds(
-    store: &dyn ObjectStoreBackend,
-    clock: &dyn Clock,
-    config: &CompactorConfig,
-    lease: &dyn LeaseCheck,
-    tenant: &TenantHash,
-    signal: Signal,
-    holds: &SupersededHolds,
-) -> Result<ErasureRequestSweepOutcome> {
-    sweep_erasure_requests_inner(store, clock, config, lease, tenant, signal, Some(holds)).await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn sweep_erasure_requests_inner(
-    store: &dyn ObjectStoreBackend,
-    clock: &dyn Clock,
-    config: &CompactorConfig,
-    lease: &dyn LeaseCheck,
-    tenant: &TenantHash,
-    signal: Signal,
-    holds: Option<&SupersededHolds>,
 ) -> Result<ErasureRequestSweepOutcome> {
     let now = clock.now_ns();
     let prefix = keys::del_prefix(tenant, signal);
@@ -3501,15 +3561,7 @@ async fn sweep_erasure_requests_inner(
         });
     }
 
-    let observed;
-    let holds = match holds {
-        Some(holds) => holds,
-        None => {
-            observed =
-                observe_superseded_holds(store, clock, config, lease, tenant, signal).await?;
-            &observed
-        }
-    };
+    let holds = observe_superseded_holds(store, clock, config, lease, tenant, signal).await?;
 
     let mut deleted = 0usize;
     let mut held_by_superseded_inputs = 0usize;
@@ -3556,8 +3608,7 @@ async fn sweep_erasure_requests_inner(
     })
 }
 
-/// Observe what rule 2 holds, without deleting anything, for a rule-6 caller
-/// that has no [`SupersededHolds`] of its own.
+/// Observe what rule 2 holds, without deleting anything, for rule 6.
 ///
 /// The observation always covers the whole signal: the commit keyspace is
 /// listed once to enumerate its shards, and every shard is observed across
@@ -3819,6 +3870,36 @@ mod tests {
             "case is normalised too"
         );
         assert_eq!(super::canonical_request_id("not-a-uuid"), "not-a-uuid");
+    }
+
+    /// Rule 2's phase C tolerates a refusal of one object and fails the pass
+    /// on anything else: a retryable error, and a store that cannot delete at
+    /// all.
+    #[test]
+    fn only_a_per_object_refusal_is_tolerated() {
+        use ravel_object_store::StoreError;
+        for refused in [
+            StoreError::AccessDenied("locked".into()),
+            StoreError::PreconditionFailed,
+            StoreError::Permanent("locked".into()),
+        ] {
+            assert!(super::delete_refused(&refused), "{refused:?}");
+        }
+        for fatal in [
+            StoreError::Timeout,
+            StoreError::Throttled { retry_after_ms: 1 },
+            StoreError::Transient("reset".into()),
+            StoreError::NotFound,
+            StoreError::ReadOnly {
+                operation: "delete".into(),
+                store: "external".into(),
+            },
+            StoreError::Unsupported {
+                operation: "delete".into(),
+            },
+        ] {
+            assert!(!super::delete_refused(&fatal), "{fatal:?}");
+        }
     }
 
     use bytes::Bytes;
