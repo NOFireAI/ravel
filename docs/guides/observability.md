@@ -141,6 +141,22 @@ These counters are process-global. They sum every caller, so an ingest get and
 a query get land in the same series. Per-query attribution lives in the
 per-query cost family below.
 
+Four more store counters carry `mode` and no `op` label:
+
+| Metric | Meaning |
+|---|---|
+| `ravel_store_get_unverified_total` | Full-object reads served without verifying the body against a stored checksum. |
+| `ravel_store_control_plane_requests_total` | Bucket-protection control-plane GETs sent, counted before dispatch. |
+| `ravel_store_control_plane_calls_total` | Bucket-protection control-plane GETs that got an HTTP response back, whatever its status. |
+| `ravel_store_control_plane_response_bytes_total` | Wire bytes of the control-plane response bodies, as received. |
+
+`ravel_store_get_unverified_total` stays at zero on a backend other than S3.
+On S3 it moves when a full-object read comes back without a stored checksum
+the store can check the body against. The control-plane counters cover only the read-only
+bucket-configuration GETs behind the bucket-protection check. Those GETs are
+not object-store operations, so they never appear in the per-operation
+families above, and those families keep meaning data-plane traffic only.
+
 ### Ingest pipelines (`ravel_ingest_*`)
 
 Labels: `mode` and `signal`. The `signal` label carries `metrics`, `logs`, or
