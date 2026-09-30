@@ -390,7 +390,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   named both declared units whatever the columns were, now names the start and
   the end each by the same rule, against `start_ts_unit` and `end_ts_unit`,
   and an end substituted from the start for a zero end cell as "taken from
-  start_ts because end_ts is 0" rather than in the end column's unit.
+  start_ts because end_ts is 0" rather than in the end column's unit, and a
+  start substituted from the load time for a zero start cell as "taken from
+  load time because start_ts is 0" rather than in the start column's unit.
 - **The maintain role reaps dead query-worker records under
   `sys/query/workers/`** (issue #1828). The query coordinator used to delete
   them under a role with no delete grant, so every delete was refused, logged
