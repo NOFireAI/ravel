@@ -3041,6 +3041,14 @@ mod tests {
             .expect("seed version-3 record");
     }
 
+    /// The basis a raise over the empty one-shard tenant these tests provision
+    /// records.
+    const EMPTY_ONE_SHARD_BASIS: ravel_catalog::FloorBasis = ravel_catalog::FloorBasis {
+        observed_entries: 0,
+        observed_newest_created_unix_ns: 0,
+        observed_shards: 1,
+    };
+
     fn rseg_newest() -> u32 {
         u32::from(ravel_segment::SUPPORTED_VERSIONS.newest())
     }
@@ -3074,6 +3082,7 @@ mod tests {
             Signal::Metrics,
             "rseg",
             floor,
+            EMPTY_ONE_SHARD_BASIS,
             "migrate",
             50 * NS_PER_HOUR,
         )
@@ -3309,6 +3318,7 @@ mod tests {
                 Signal::Metrics,
                 "rseg",
                 *version,
+                EMPTY_ONE_SHARD_BASIS,
                 "migrate",
                 (50 + i) * NS_PER_HOUR,
             )

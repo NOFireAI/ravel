@@ -44,7 +44,9 @@
 //!    one straggler is found -- data that landed below the target between the
 //!    walk finishing and the floor being raised -- the floor is left untouched
 //!    and the driver reports the stragglers, so a floor is never CAS-appended
-//!    over a stale audit.
+//!    over a stale audit. A raised floor records that same re-audit as its
+//!    basis ([`ravel_catalog::FloorBasis`]): the live entries it enumerated,
+//!    the newest `created_unix_ns` among them, and the shard range it scanned.
 //!
 //! The floor is a claim about *every* live object of the family, so the
 //! re-audit deliberately counts every live commit and compaction record
@@ -74,8 +76,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use ravel_catalog::{
-    current_floor_from_store, erasure_dominated_compaction_records, resolve_rewrite_supersession,
-    select_authoritative_compaction_records,
+    FloorBasis, current_floor_from_store, erasure_dominated_compaction_records,
+    resolve_rewrite_supersession, select_authoritative_compaction_records,
 };
 use ravel_commit::{keys, record};
 use ravel_object_store::{
@@ -609,7 +611,31 @@ pub async fn count_below_target(
     scan_shards: u32,
     target_version: u32,
 ) -> Result<BelowTargetReport> {
+    let (report, _) =
+        audit_below_target(store, tenant_hash, signal, scan_shards, target_version).await?;
+    Ok(report)
+}
+
+/// [`count_below_target`], plus the [`FloorBasis`] of the same enumeration: the
+/// live entries it saw (L0 commit records it did not exclude as superseded,
+/// plus every compaction and rewrite part), the newest `created_unix_ns` among
+/// those L0 records and every compaction and rewrite record (0 when there are
+/// none), and `scan_shards`. That is the population [`census_family`] reports
+/// as live, so `audit-versions` classifies a floor raised on this basis against
+/// the same definition it was recorded under.
+async fn audit_below_target(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    scan_shards: u32,
+    target_version: u32,
+) -> Result<(BelowTargetReport, FloorBasis)> {
     let mut report = BelowTargetReport::default();
+    let mut entries: u64 = 0;
+    let mut newest: Option<i64> = None;
+    let mut saw_created = |created: i64| {
+        newest = Some(newest.map_or(created, |n| n.max(created)));
+    };
     for shard in 0..scan_shards {
         let family = read_shard_family(
             store,
@@ -626,6 +652,8 @@ pub async fn count_below_target(
         // whole count, not one line per record.
         let mut rewrite_below_by_hour: BTreeMap<u32, usize> = BTreeMap::new();
         for rec in &family.records {
+            entries += rec.part_versions.len() as u64;
+            saw_created(rec.created_unix_ns);
             let below = rec
                 .part_versions
                 .iter()
@@ -676,12 +704,19 @@ pub async fn count_below_target(
             }
             let got = store.get(&key, GetRange::Full).await?;
             let rec = record::decode(&got.data)?;
+            entries += 1;
+            saw_created(rec.created_unix_ns);
             if rec.segment_format_version < target_version {
                 report.l0 += 1;
             }
         }
     }
-    Ok(report)
+    let basis = FloorBasis {
+        observed_entries: entries,
+        observed_newest_created_unix_ns: newest.unwrap_or(0),
+        observed_shards: scan_shards,
+    };
+    Ok((report, basis))
 }
 
 /// The live commit-family population of one `(tenant, signal)` by
@@ -1301,7 +1336,8 @@ async fn raw_served_commit_keys(
 ///    verify-and-raise step once the walk reaches its end within budget;
 /// 4. in the verify step, re-audits fresh via [`count_below_target`] and raises
 ///    the floor to `target_version` (via [`ravel_catalog::raise_format_floor`],
-///    `raised_by` recorded on the entry) only if zero records remain below the
+///    `raised_by` and the re-audit's [`FloorBasis`] recorded on the entry)
+///    only if zero records remain below the
 ///    target; otherwise leaves the floor untouched and reports the stragglers.
 ///
 /// `raise_format_floor` refuses a raise that is not strictly above the current
@@ -1473,8 +1509,8 @@ pub async fn migrate_family(
     // raised over an under-scanned audit. The range is a max over an
     // append-only generation list, so re-resolving can only widen it.
     let verify_shards = scan_shard_count(store, &tenant_hash, signal, configured_shards).await?;
-    let mut audit =
-        count_below_target(store, &tenant_hash, signal, verify_shards, target_version).await?;
+    let (mut audit, basis) =
+        audit_below_target(store, &tenant_hash, signal, verify_shards, target_version).await?;
 
     // The permanent cases are found by different passes -- the walk sees a
     // surviving overlap's raw inputs, the re-audit sees a rewrite record's or a
@@ -1513,9 +1549,10 @@ pub async fn migrate_family(
         return Ok(report);
     }
 
-    // Zero stragglers: raise the floor. If a concurrent run (or a prior one)
-    // already raised it to or past the target, `raise_format_floor` would refuse
-    // the non-strict raise; treat that as success, since the invariant the floor
+    // Zero stragglers: raise the floor, recording as its basis the re-audit
+    // that just found none. If a concurrent run (or a prior one) already raised
+    // it to or past the target, `raise_format_floor` would refuse the
+    // non-strict raise; treat that as success, since the invariant the floor
     // asserts already holds.
     let current = current_floor_from_store(store, &tenant_hash, signal, family)
         .await
@@ -1531,6 +1568,7 @@ pub async fn migrate_family(
                 signal,
                 family,
                 target_version,
+                basis,
                 raised_by,
                 now,
             )
