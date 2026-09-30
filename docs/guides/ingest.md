@@ -669,20 +669,23 @@ type = "str"                         # str | i64 | f64 | bool | bytes
 ```
 
 `attrs_map_column` names one map column of string keys and string values
-whose entries are merged into the span's attributes at span precedence,
-stored exactly as written. It holds the attributes the two lists do not name,
-and it is the column `ravel-cli export --signal spans` writes them into, so a
-spans export under this mapping re-loads them. A null cell or a null value is
-an attribute the row does not carry, and an entry whose key or value is over
-its length cap drops that attribute, counted in `attrs_dropped`, as OTLP drops
-it. A row is refused when its map holds a key that a
+(plain or dictionary-encoded) whose entries are merged into the span's
+attributes at span precedence, stored exactly as written. It holds the
+attributes the two lists do not name, and it is the column `ravel-cli export
+--signal spans` writes them into, so a spans export under this mapping
+re-loads every one it writes; an export leaves out the entries past the cap
+below and counts the spans that lost one. A null cell or a null value is an
+attribute the row does not carry, so an entry with a null value is skipped
+before any of the checks below, and an entry whose key or value is over its
+length cap drops that attribute, counted in `attrs_dropped`, as OTLP drops it.
+A row is refused when its map holds a key that a
 `[[spans.resource_attribute]]` or `[[spans.attribute]]` entry also names,
 whether or not that entry's cell holds a value, when it holds one key twice,
 or when it holds a reserved key: one span carries one attrs map with unique
 keys, and which of two values reached the record must not be decided
 silently. The entries count toward the loader per-record cap of 1024 together
-with the span attributes, and a column that is not a map of strings is
-refused when the batch's columns are resolved.
+with the `[[spans.attribute]]` values, and a column that is not a map of
+strings is refused when the batch's columns are resolved.
 
 **A span loaded here is stored as the same record the same span sent over OTLP
 produces.** Attribute values are coerced to the strings RSPAN's
@@ -748,7 +751,8 @@ in one row (a list or struct column per trace) has to be flattened to one row
 per span; attributes held in a `Struct` column, or in a `Map` column whose
 keys or values are not strings, have to be pivoted to one scalar column per
 attribute key, since `[[spans.attribute]]` names a column and a value type (a
-map of strings to strings is read whole as `attrs_map_column`); a duration column has to be turned into an absolute
+map of strings to strings, plain or dictionary-encoded, is read whole as
+`attrs_map_column`); a duration column has to be turned into an absolute
 `end_ts` in a unit `end_ts_unit` names; and a status written as a string
 (`"OK"`, `"ERROR"`) has to become OTLP's 0/1/2 integer, since
 `status_code_column` reads that enum and nothing else. Pointing a mapping at
@@ -1261,8 +1265,13 @@ would re-time or refuse, or a mapped attribute whose stored string its declared
 type cannot reproduce (`"007"` declared `i64`). Refusals are counted per kind
 and name the first offending span in output order. With `attrs_map_column`
 set, every stored attribute the mapping does not name, the reserved ones
-aside, is written as stored into that one map column, and a load under the
-same mapping reads each back at its exact stored string. What the file cannot
+aside, is written as stored into that one map column, up to the load's
+per-span cap: a load refuses a row whose `[[spans.attribute]]` values and map
+entries together exceed 1024, so the map holds at most 1024 less the span's
+written `[[spans.attribute]]` values, keeping the entries first in ascending
+byte order of key. A load under the same mapping reads each written entry back
+at its exact stored string, and a span that lost entries to the cap is
+counted like any other loss. What the file cannot
 carry is written without rather than refused, and the report line
 `spans_with_unwritten_data` counts the spans that lost some of it (the full
 list is in the `ravel-cli` export module documentation).

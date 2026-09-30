@@ -1793,8 +1793,8 @@ fn print_spans_summary(report: &SpansLoadReport) {
     println!("  elapsed          : {secs:.3}s");
 }
 
-/// Print the attribute values a spans load dropped for being over the OTLP
-/// value-length cap.
+/// Print the attributes a spans load dropped for a value over the OTLP
+/// value-length cap or an `attrs_map_column` key over the key-length cap.
 ///
 /// Printed on the success path and beside the durable-token banner on the
 /// failure path, because a nonzero count means the records that landed are an
@@ -1833,7 +1833,8 @@ fn spans_attrs_dropped_line(report: &SpansLoadReport, scope: AttrsDroppedScope) 
         }
     };
     format!(
-        "  attrs_dropped    : {} (attribute values over the OTLP value-length cap; {tail})",
+        "  attrs_dropped    : {} (attribute values over the OTLP value-length cap and \
+         attrs_map_column keys over the key-length cap; {tail})",
         report.attributes_dropped
     )
 }
@@ -6790,9 +6791,10 @@ pub struct SpansLoadReport {
     pub file_total_rows: u64,
     /// One token per shard acked, across every batch, in submission order.
     pub tokens: Vec<CommitToken>,
-    /// Attribute values dropped for being over the OTLP value-length cap. The
-    /// span itself is kept, so a nonzero count means the stored record is an
-    /// approximation of the source row and nothing else in the load says so.
+    /// Attributes dropped for a value over the OTLP value-length cap, or for an
+    /// `attrs_map_column` key over the OTLP key-length cap. The span itself is
+    /// kept, so a nonzero count means the stored record is an approximation of
+    /// the source row and nothing else in the load says so.
     ///
     /// Counted where the row is BUILT, not where it acks: an attribute dropped
     /// from a span whose batch later failed to flush is counted here and its
@@ -7290,9 +7292,17 @@ pub(crate) fn span_attr_string(key: &str, value: &AttrValue) -> Result<String, S
 }
 
 /// Check that the `attrs_map_column` is a map from strings to strings, the
-/// shape `ravel-cli export` writes, when the batch's columns are resolved.
+/// shape `ravel-cli export` writes, when the batch's columns are resolved. A
+/// dictionary-encoded key or value is a string too: [`read_string`] resolves
+/// it.
 fn check_attrs_map_column(data_type: &DataType, column: &str) -> Result<(), String> {
-    let is_string = |ty: &DataType| matches!(ty, DataType::Utf8 | DataType::LargeUtf8);
+    fn is_string(ty: &DataType) -> bool {
+        match ty {
+            DataType::Utf8 | DataType::LargeUtf8 => true,
+            DataType::Dictionary(_, values) => is_string(values),
+            _ => false,
+        }
+    }
     if let DataType::Map(entries, _) = data_type
         && let DataType::Struct(fields) = entries.data_type()
         && fields.len() == 2
@@ -7310,7 +7320,8 @@ fn check_attrs_map_column(data_type: &DataType, column: &str) -> Result<(), Stri
 /// Read one row's `attrs_map_column` entries, the attributes the mapping does
 /// not name, as the `(key, value)` strings RSPAN stores.
 ///
-/// A null cell and a null value are attributes the row does not carry. Each
+/// A null cell and a null value are attributes the row does not carry, so an
+/// entry with a null value is skipped before any check below. Each other
 /// entry goes through the OTLP path's own attribute rule: a key or value over
 /// its length cap drops that attribute, counted in `dropped`, and keeps the
 /// span. A row is refused when its map holds a key a mapped attribute also
@@ -7340,6 +7351,9 @@ fn read_span_attrs_map(
     for i in 0..entries.len() {
         let key = read_string(keys, i)?
             .ok_or_else(|| format!("attrs_map_column {column:?} holds a null key"))?;
+        let Some(value) = read_string(values, i)? else {
+            continue;
+        };
         if let Some((spec, _)) = mapping
             .mapped_attributes()
             .find(|(spec, _)| spec.key == key)
@@ -7365,9 +7379,6 @@ fn read_span_attrs_map(
                  record."
             ));
         }
-        let Some(value) = read_string(values, i)? else {
-            continue;
-        };
         if key.len() > limits.max_attribute_key_len || value.len() > limits.max_attribute_value_len
         {
             *dropped += 1;
@@ -14554,6 +14565,63 @@ type = "str"
             );
         }
 
+        /// A map whose keys and values are dictionary-encoded strings passes
+        /// the column check and reads each row's entries through the same
+        /// dictionary resolution a plain string column gets.
+        #[test]
+        fn a_dictionary_encoded_attrs_map_is_read_as_strings() {
+            use arrow::array::{DictionaryArray, MapArray, StructArray};
+            use arrow::buffer::OffsetBuffer;
+            use arrow::datatypes::{Fields, Int32Type};
+
+            let keys: DictionaryArray<Int32Type> =
+                vec!["zone", "peer", "zone"].into_iter().collect();
+            let values: DictionaryArray<Int32Type> = vec![Some("eu"), Some("db"), Some("eu")]
+                .into_iter()
+                .collect();
+            let fields = Fields::from(vec![
+                Field::new("keys", keys.data_type().clone(), false),
+                Field::new("values", values.data_type().clone(), true),
+            ]);
+            let entries = StructArray::new(
+                fields.clone(),
+                vec![Arc::new(keys) as ArrayRef, Arc::new(values) as ArrayRef],
+                None,
+            );
+            let map: ArrayRef = Arc::new(
+                MapArray::try_new(
+                    Arc::new(Field::new("entries", DataType::Struct(fields), false)),
+                    OffsetBuffer::new(vec![0, 2, 3].into()),
+                    entries,
+                    None,
+                    false,
+                )
+                .expect("map array"),
+            );
+
+            check_attrs_map_column(map.data_type(), "attrs")
+                .expect("dictionary-encoded strings are strings");
+            let text = MAPPING_TOML.replace("[spans]\n", "[spans]\nattrs_map_column = \"attrs\"\n");
+            let mapping = parse_spans_mapping(&text).expect("valid mapping");
+            let limits = SpanIngestLimits::default();
+            let mut dropped = 0;
+            let rows: Vec<Vec<(String, String)>> = (0..2)
+                .map(|row| {
+                    read_span_attrs_map(&map, row, &mapping, &limits, &mut dropped)
+                        .expect("entries read")
+                })
+                .collect();
+            let pair = |key: &str, value: &str| (key.to_string(), value.to_string());
+            assert_eq!(
+                rows,
+                vec![
+                    vec![pair("zone", "eu"), pair("peer", "db")],
+                    vec![pair("zone", "eu")]
+                ]
+            );
+            assert_eq!(dropped, 0);
+        }
+
         /// A mapped attribute key over the OTLP key-length cap is refused
         /// before any row is read, since the mapping alone decides it.
         #[test]
@@ -15188,14 +15256,16 @@ type = "str"
             );
             assert_eq!(
                 spans_attrs_dropped_line(&report, AttrsDroppedScope::Failed),
-                "  attrs_dropped    : 2 (attribute values over the OTLP value-length cap; counted \
-                 where each span was built, so this includes batches the failure abandoned, whose \
-                 spans are in no object)"
+                "  attrs_dropped    : 2 (attribute values over the OTLP value-length cap and \
+                 attrs_map_column keys over the key-length cap; counted where each span was \
+                 built, so this includes batches the failure abandoned, whose spans are in no \
+                 object)"
             );
             assert_eq!(
                 spans_attrs_dropped_line(&report, AttrsDroppedScope::Complete),
-                "  attrs_dropped    : 2 (attribute values over the OTLP value-length cap; each \
-                 span was stored without them)",
+                "  attrs_dropped    : 2 (attribute values over the OTLP value-length cap and \
+                 attrs_map_column keys over the key-length cap; each span was stored without \
+                 them)",
                 "a load that completed still says the spans were stored without them"
             );
         }

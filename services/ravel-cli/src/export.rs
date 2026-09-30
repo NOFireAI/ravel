@@ -119,7 +119,7 @@
 //! disagree. With `attrs_map_column` set, every stored attribute the mapping
 //! does not name, reserved keys aside, is written as stored into that one
 //! `Map<Utf8, Utf8>` column, which a load reads back into the span's
-//! attributes.
+//! attributes, up to the load's per-span cap below.
 //!
 //! What a spans export does not write, the one list every other description
 //! of it points to:
@@ -128,6 +128,13 @@
 //!   events and links, which no mapping key can name;
 //! - any stored attribute the mapping does not name, when `attrs_map_column`
 //!   is unset;
+//! - with `attrs_map_column` set, the map entries past the load's per-span
+//!   cap: a load refuses a row whose `[[spans.attribute]]` values and map
+//!   entries together exceed
+//!   [`LOADER_MAX_ATTRIBUTES_PER_RECORD`](crate::load::LOADER_MAX_ATTRIBUTES_PER_RECORD),
+//!   so the map holds at most that cap less the row's written
+//!   `[[spans.attribute]]` values, the entries kept being the first in
+//!   ascending byte order of key;
 //! - a parent id, a status code other than Unset, or a status message, when
 //!   the mapping omits that optional column.
 //!
@@ -165,8 +172,8 @@ use ravel_types::accounting::QueryAccounting;
 use ravel_types::{LabelSet, METRIC_NAME_LABEL, SeriesId, Signal, TenantHash, TenantId, TimeRange};
 
 use crate::load::{
-    AttrMap, ColType, Mapping, MetricsMapping, SpansMapping, TsUnit, normalized_family_name,
-    span_attr_string,
+    AttrMap, ColType, LOADER_MAX_ATTRIBUTES_PER_RECORD, Mapping, MetricsMapping, SpansMapping,
+    TsUnit, normalized_family_name, span_attr_string,
 };
 use crate::maintain::SignalArg;
 use crate::store::{StoreSelection, require_tenant_data_present};
@@ -1252,7 +1259,7 @@ pub async fn export_spans(
     spans.sort_by_key(|span| (span.start_ts_ns, span.trace_id, span.span_id));
 
     let rows = span_output_rows(mapping, &spans)?;
-    let spans_with_unwritten_data = spans_with_unwritten_data(mapping, &spans);
+    let spans_with_unwritten_data = spans_with_unwritten_data(mapping, &rows);
     let empty = build_spans_batch(mapping, &[])?;
     let rows_written = write_output(out, empty.schema(), |writer| {
         let mut rows_written = 0u64;
@@ -1275,12 +1282,13 @@ pub async fn export_spans(
     })
 }
 
-/// How many of `spans` carry a stored value [`build_spans_batch`] does not
+/// How many of `rows` carry a stored value [`build_spans_batch`] does not
 /// write under `mapping`, from the list in this module's doc.
-fn spans_with_unwritten_data(mapping: &SpansMapping, spans: &[SpanRecord]) -> u64 {
+fn spans_with_unwritten_data(mapping: &SpansMapping, rows: &[SpanOutRow<'_>]) -> u64 {
     let mapped = span_mapped_keys(mapping);
     let mut unwritten = 0u64;
-    for span in spans {
+    for row in rows {
+        let span = row.span;
         let lost_parent = mapping.parent_span_id_column.is_none() && span.parent_span_id.is_some();
         let lost_status =
             mapping.status_code_column.is_none() && span.status_code != StatusCode::Unset;
@@ -1293,7 +1301,7 @@ fn spans_with_unwritten_data(mapping: &SpansMapping, spans: &[SpanRecord]) -> u6
             !mapped.contains(key.as_str())
                 && (mapping.attrs_map_column.is_none() || is_reserved_key(key))
         });
-        if lost_parent || lost_status || lost_message || lost_attribute {
+        if lost_parent || lost_status || lost_message || lost_attribute || row.map_truncated {
             unwritten += 1;
         }
     }
@@ -1326,6 +1334,11 @@ impl SpanRefusals {
 struct SpanOutRow<'a> {
     span: &'a SpanRecord,
     attrs: Vec<Option<AttrValue>>,
+    /// The `attrs_map_column` entries, from [`span_map_entries`]; empty when
+    /// the mapping sets no map column.
+    map: Vec<(&'a str, &'a str)>,
+    /// Whether the load's per-span attribute cap left map entries out.
+    map_truncated: bool,
 }
 
 /// Every mapped attribute, in the order [`SpanOutRow::attrs`] holds them.
@@ -1349,6 +1362,7 @@ fn span_output_rows<'a>(
     mapping: &SpansMapping,
     spans: &'a [SpanRecord],
 ) -> anyhow::Result<Vec<SpanOutRow<'a>>> {
+    let mapped = span_mapped_keys(mapping);
     let mut refusals = SpanRefusals::default();
     let mut rows = Vec::with_capacity(spans.len());
     for (position, span) in spans.iter().enumerate() {
@@ -1409,10 +1423,52 @@ fn span_output_rows<'a>(
             };
             attrs.push(value);
         }
-        rows.push(SpanOutRow { span, attrs });
+        let (map, map_truncated) = match mapping.attrs_map_column {
+            None => (Vec::new(), false),
+            Some(_) => {
+                let written_span_attributes = attrs[mapping.resource_attributes.len()..]
+                    .iter()
+                    .filter(|value| value.is_some())
+                    .count();
+                span_map_entries(&mapped, span, written_span_attributes)
+            }
+        };
+        rows.push(SpanOutRow {
+            span,
+            attrs,
+            map,
+            map_truncated,
+        });
     }
     refusals.into_result()?;
     Ok(rows)
+}
+
+/// The `attrs_map_column` entries a load of the file reads back into `span`,
+/// and whether any stored attribute that belongs in the map was left out.
+///
+/// The candidates are the stored attributes no mapped column names, reserved
+/// keys aside. A spans load refuses a row whose `[[spans.attribute]]` values
+/// and map entries together exceed [`LOADER_MAX_ATTRIBUTES_PER_RECORD`]
+/// (`resource_attribute` values do not count), so the map holds at most that
+/// cap less `written_span_attributes`: the candidates sorted by key in
+/// ascending byte order, and the first that many of them.
+fn span_map_entries<'a>(
+    mapped: &BTreeSet<&str>,
+    span: &'a SpanRecord,
+    written_span_attributes: usize,
+) -> (Vec<(&'a str, &'a str)>, bool) {
+    let mut entries: Vec<(&str, &str)> = span
+        .attrs
+        .iter()
+        .filter(|(key, _)| !mapped.contains(key.as_str()) && !is_reserved_key(key))
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    entries.sort_unstable();
+    let room = LOADER_MAX_ATTRIBUTES_PER_RECORD.saturating_sub(written_span_attributes);
+    let truncated = entries.len() > room;
+    entries.truncate(room);
+    (entries, truncated)
 }
 
 fn sub_unit_span_message(span: &SpanRecord, field: &str, ts_ns: i64, unit: TsUnit) -> String {
@@ -1568,13 +1624,9 @@ fn build_spans_batch(
     }
 
     if let Some(name) = &mapping.attrs_map_column {
-        let mapped = span_mapped_keys(mapping);
         let mut map = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         for row in rows {
-            for (key, value) in &row.span.attrs {
-                if mapped.contains(key.as_str()) || is_reserved_key(key) {
-                    continue;
-                }
+            for (key, value) in &row.map {
                 map.keys().append_value(key);
                 map.values().append_value(value);
             }

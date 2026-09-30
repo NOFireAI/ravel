@@ -671,10 +671,11 @@ enum Command {
     /// `--signal logs`, `--signal metrics` and `--signal spans` are supported.
     /// A metrics mapping the export cannot invert, such as `[metrics.histogram]`,
     /// is refused rather than written as a file that loads onto other series.
-    /// A spans export writes the mapped fields, and every other stored
-    /// attribute into `attrs_map_column` when the mapping sets one, and
-    /// refuses by name a span whose mapped fields a load would not read back
-    /// as stored; a span losing what the file cannot carry is counted as
+    /// A spans export writes the mapped fields, and, when the mapping sets
+    /// `attrs_map_column`, the other stored attributes except the reserved
+    /// ones into it, as many as the load's per-span attribute cap reads back.
+    /// It refuses by name a span whose mapped fields a load would not read
+    /// back as stored; a span losing what the file cannot carry is counted as
     /// `spans_with_unwritten_data`.
     Export {
         /// Signal to export: `logs`, `metrics` or `spans`. No default: a
@@ -709,8 +710,9 @@ enum Command {
         /// back, or, for metrics, refuses by name a series no file under it
         /// re-loads as the same one. For spans, every mapped field round-trips,
         /// a span whose mapped fields would not is refused by name,
-        /// `attrs_map_column` carries the attributes the mapping does not
-        /// name, and a span losing what the file cannot carry is counted as
+        /// `attrs_map_column` carries the unreserved attributes the mapping
+        /// does not name up to the load's per-span attribute cap, and a span
+        /// losing what the file cannot carry is counted as
         /// `spans_with_unwritten_data`.
         #[arg(long, value_name = "TOML")]
         mapping: std::path::PathBuf,

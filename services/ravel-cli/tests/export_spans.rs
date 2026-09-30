@@ -1505,3 +1505,304 @@ async fn attrs_map_column_cells_are_read_by_the_span_attribute_rules() {
          values"
     );
 }
+
+/// A null map value is an attribute the row does not carry, so it is skipped
+/// before the collision, reserved-key and duplicate checks: none of them
+/// refuses a key whose value is null.
+#[tokio::test]
+async fn a_null_attrs_map_value_is_skipped_before_the_key_checks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let batch = with_attrs_map(
+        source_batch(&[Src {
+            method: Some("GET"),
+            ..bare(1, 0x11, "null values", T0, T0 + ONE_MS_NS)
+        }]),
+        vec![Some(vec![
+            ("http.method", None),
+            ("_kind", None),
+            ("zone", Some("eu")),
+            ("zone", None),
+        ])],
+    );
+    try_load_batch(&store, dir.path(), &attrs_map_mapping(), &batch)
+        .await
+        .expect("null values under a mapped, reserved or repeated key load");
+    let spans = stored(&store, "alpha", T0, T1, LOAD_NS).await;
+    assert_eq!(spans.len(), 1);
+    assert_eq!(
+        spans[0].attrs,
+        pairs(&[("http.method", "GET"), ("zone", "eu")])
+    );
+}
+
+/// `count` distinct map keys `k0000`, `k0001`, ... in ascending order.
+fn numbered_keys(count: usize) -> Vec<String> {
+    (0..count).map(|i| format!("k{i:04}")).collect()
+}
+
+/// A row whose `[[spans.attribute]]` values and map entries together reach
+/// the loader per-record cap loads; one more is refused by name and stores
+/// nothing.
+#[tokio::test]
+async fn attrs_map_entries_count_toward_the_loader_per_record_cap() {
+    let cap = load::LOADER_MAX_ATTRIBUTES_PER_RECORD;
+    let keys = numbered_keys(cap);
+    let entries: Vec<(&str, Option<&str>)> =
+        keys.iter().map(|key| (key.as_str(), Some("v"))).collect();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let at_cap = with_attrs_map(
+        source_batch(&[bare(1, 0x11, "at the cap", T0, T0 + ONE_MS_NS)]),
+        vec![Some(entries.clone())],
+    );
+    try_load_batch(&store, dir.path(), &attrs_map_mapping(), &at_cap)
+        .await
+        .expect("a row at the cap loads");
+    let spans = stored(&store, "alpha", T0, T1, LOAD_NS).await;
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].attrs.len(), cap);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let over_cap = with_attrs_map(
+        source_batch(&[Src {
+            method: Some("GET"),
+            ..bare(1, 0x11, "one over", T0, T0 + ONE_MS_NS)
+        }]),
+        vec![Some(entries)],
+    );
+    let err = try_load_batch(&store, dir.path(), &attrs_map_mapping(), &over_cap)
+        .await
+        .expect_err("a row one over the cap is refused");
+    assert_eq!(
+        err.to_string(),
+        "row 0: span carries 1025 attributes with its attrs_map_column entries, more than the \
+         loader per-record cap of 1024"
+    );
+    assert!(stored(&store, "alpha", T0, T1, LOAD_NS).await.is_empty());
+}
+
+/// A map key over the OTLP key-length cap and a map value over the
+/// value-length cap each drop that one entry and are counted in
+/// `attributes_dropped`; a key and a value exactly at their caps are stored.
+#[tokio::test]
+async fn an_over_cap_attrs_map_key_or_value_is_dropped_and_counted() {
+    let limits = SpanIngestLimits::default();
+    let key_at_cap = "k".repeat(limits.max_attribute_key_len);
+    let key_over_cap = "k".repeat(limits.max_attribute_key_len + 1);
+    let value_at_cap = "v".repeat(limits.max_attribute_value_len);
+    let value_over_cap = "v".repeat(limits.max_attribute_value_len + 1);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let batch = with_attrs_map(
+        source_batch(&[bare(1, 0x11, "long entries", T0, T0 + ONE_MS_NS)]),
+        vec![Some(vec![
+            (key_at_cap.as_str(), Some("short")),
+            (key_over_cap.as_str(), Some("short")),
+            ("value.at.cap", Some(value_at_cap.as_str())),
+            ("value.over.cap", Some(value_over_cap.as_str())),
+            ("zone", Some("eu")),
+        ])],
+    );
+    let report = try_load_batch(&store, dir.path(), &attrs_map_mapping(), &batch)
+        .await
+        .expect("over-cap entries drop, the span loads");
+    assert_eq!(
+        report.attributes_dropped, 2,
+        "the over-cap key and the over-cap value"
+    );
+    let spans = stored(&store, "alpha", T0, T1, LOAD_NS).await;
+    assert_eq!(spans.len(), 1);
+    assert_eq!(
+        spans[0].attrs,
+        pairs(&[
+            (key_at_cap.as_str(), "short"),
+            ("value.at.cap", value_at_cap.as_str()),
+            ("zone", "eu"),
+        ])
+    );
+}
+
+/// An `attrs_map_column` naming another mapped field's output column is
+/// refused as any two fields on one column are, before any store request.
+#[tokio::test]
+async fn an_attrs_map_column_sharing_a_mapped_column_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let instrumented = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+    let metrics = instrumented.metrics();
+    let store: Arc<dyn ObjectStoreBackend> = instrumented;
+    let mut mapping = attrs_map_mapping();
+    mapping.attrs_map_column = Some("method".to_string());
+    let out = dir.path().join("out.parquet");
+    let err = export_window(&store, "alpha", T0, T1, &mapping, &out)
+        .await
+        .expect_err("the shared output column is refused");
+    assert_eq!(
+        err.to_string(),
+        "the mapping writes two different fields to the output column \"method\"; give each one \
+         its own column name"
+    );
+    assert_eq!(metrics.snapshot(), StoreMetricsSnapshot::default());
+    assert!(!out.exists(), "a refused export writes no file");
+}
+
+/// The load mapping of the cap tests below: two resource attributes `r0` and
+/// `r1`, and one `[[spans.attribute]]` per key `a0000` .. `a1023`, the most a
+/// mapping may declare, each read from the column of its own name.
+fn full_width_mapping() -> SpansMapping {
+    let mut text = String::from(REQUIRED_ONLY_MAPPING);
+    for key in ["r0", "r1"] {
+        text.push_str(&format!(
+            "\n[[spans.resource_attribute]]\nkey = \"{key}\"\ncolumn = \"{key}\"\ntype = \"str\"\n"
+        ));
+    }
+    for i in 0..load::LOADER_MAX_ATTRIBUTES_PER_RECORD {
+        text.push_str(&format!(
+            "\n[[spans.attribute]]\nkey = \"a{i:04}\"\ncolumn = \"a{i:04}\"\ntype = \"str\"\n"
+        ));
+    }
+    spans_mapping(&text)
+}
+
+/// One source row under [`full_width_mapping`]: every `a` attribute set to
+/// `"v"`, `r0` set, and `r1` set when `with_r1`.
+struct WideRow {
+    span: u8,
+    start_ns: i64,
+    with_r1: bool,
+}
+
+fn full_width_batch(rows: &[WideRow]) -> RecordBatch {
+    let bin = |values: Vec<Vec<u8>>| -> ArrayRef {
+        let refs: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
+        Arc::new(BinaryArray::from(refs))
+    };
+    let mut columns: Vec<(String, ArrayRef)> = vec![
+        (
+            "trace_id".to_string(),
+            bin(rows.iter().map(|_| vec![7u8; 16]).collect()),
+        ),
+        (
+            "span_id".to_string(),
+            bin(rows.iter().map(|r| vec![r.span; 8]).collect()),
+        ),
+        (
+            "name".to_string(),
+            Arc::new(StringArray::from(vec!["wide"; rows.len()])),
+        ),
+        (
+            "start_ns".to_string(),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| r.start_ns).collect::<Vec<_>>(),
+            )),
+        ),
+        (
+            "end_us".to_string(),
+            Arc::new(Int64Array::from(
+                rows.iter()
+                    .map(|r| (r.start_ns + ONE_MS_NS) / 1_000)
+                    .collect::<Vec<_>>(),
+            )),
+        ),
+        (
+            "r0".to_string(),
+            Arc::new(StringArray::from(vec![Some("x"); rows.len()])),
+        ),
+        (
+            "r1".to_string(),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.with_r1.then_some("y"))
+                    .collect::<Vec<_>>(),
+            )),
+        ),
+    ];
+    for i in 0..load::LOADER_MAX_ATTRIBUTES_PER_RECORD {
+        columns.push((
+            format!("a{i:04}"),
+            Arc::new(StringArray::from(vec!["v"; rows.len()])),
+        ));
+    }
+    RecordBatch::try_from_iter(columns).expect("full-width batch")
+}
+
+/// The map column holds at most the loader per-record cap less the row's
+/// written `[[spans.attribute]]` values, so the file always re-loads. Both
+/// spans store 1024 `a` attributes and `r0`; the second also stores `r1`.
+/// The export maps `a0000` and `r0` to columns, which leaves 1023 map entries
+/// for each span. The first span's candidates are `a0001` .. `a1023`, exactly
+/// 1023, so it re-loads at the cap with every attribute. The second's are
+/// those plus `r1`, one too many: the entries are kept in ascending key
+/// order, so `r1` is the one not written, the span is counted, and the rest
+/// re-loads as stored. `r0` has its own column and takes no map room, as
+/// resource attributes do not count toward the load's cap.
+#[tokio::test]
+async fn a_spans_export_writes_no_more_map_entries_than_its_load_reads() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let source = dir.path().join("wide.parquet");
+    write_parquet(
+        &source,
+        &full_width_batch(&[
+            WideRow {
+                span: 0x11,
+                start_ns: T0,
+                with_r1: false,
+            },
+            WideRow {
+                span: 0x22,
+                start_ns: T0 + 2 * ONE_MS_NS,
+                with_r1: true,
+            },
+        ]),
+    );
+    load_file(&store, &source, "alpha", &full_width_mapping(), LOAD_NS).await;
+    let alpha = stored(&store, "alpha", T0, T1, LOAD_NS).await;
+    assert_eq!(
+        alpha
+            .iter()
+            .map(|span| span.attrs.len())
+            .collect::<Vec<_>>(),
+        vec![1025, 1026]
+    );
+
+    let mapping = spans_mapping(&format!(
+        "{}\n[[spans.resource_attribute]]\nkey = \"r0\"\ncolumn = \"r0\"\ntype = \"str\"\n\n\
+         [[spans.attribute]]\nkey = \"a0000\"\ncolumn = \"a0000\"\ntype = \"str\"\n",
+        REQUIRED_ONLY_MAPPING.replace(
+            "end_ts_unit     = \"micros\"\n",
+            "end_ts_unit     = \"micros\"\nattrs_map_column = \"attrs\"\n",
+        )
+    ));
+    let export_pq = dir.path().join("export.parquet");
+    let report = export_window(&store, "alpha", T0, T1, &mapping, &export_pq)
+        .await
+        .expect("export succeeds");
+    assert_eq!(report.rows_written, 2);
+    assert_eq!(
+        report.spans_with_unwritten_data, 1,
+        "only the span whose map entries passed the cap"
+    );
+    let maps = map_values(&read_parquet(&export_pq), "attrs");
+    let expected_map: Vec<(String, String)> = (1..load::LOADER_MAX_ATTRIBUTES_PER_RECORD)
+        .map(|i| (format!("a{i:04}"), "v".to_string()))
+        .collect();
+    assert_eq!(maps, vec![expected_map.clone(), expected_map]);
+
+    load_file(&store, &export_pq, "beta", &mapping, LOAD_NS + ONE_SEC_NS).await;
+    let beta = stored(&store, "beta", T0, T1, LOAD_NS + ONE_SEC_NS).await;
+    let expected: Vec<SpanRecord> = alpha
+        .into_iter()
+        .map(|mut span| {
+            span.attrs.retain(|(key, _)| key != "r1");
+            span
+        })
+        .collect();
+    assert_eq!(
+        beta, expected,
+        "the at-cap span re-loads with every attribute, the over-cap span without r1"
+    );
+}
