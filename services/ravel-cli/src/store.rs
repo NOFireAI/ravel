@@ -4,9 +4,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{Parser, ValueEnum};
+use ravel_object_store::conformance::{
+    BucketControlPlane, BucketProtectionParams, BucketProtectionReport, ConditionState,
+    ProtectionConditionId, probe_bucket_protection,
+};
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::s3::{S3AuthMode, S3Config, S3Store, resolve_s3_allow_http};
-use ravel_object_store::{GetRange, ObjectStoreBackend};
+use ravel_object_store::s3::{
+    LIST_PAGE_SIZE, S3AuthMode, S3Config, S3HttpConfig, S3Store, UploadIntegrity,
+    resolve_s3_allow_http,
+};
+use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_types::TenantHash;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -194,6 +201,44 @@ impl S3Auth {
     }
 }
 
+/// Which server-verified checksum `--store s3` attaches to every PUT. The
+/// CLI-facing mirror of [`UploadIntegrity`], with the same flag name, values
+/// and default as ravel-server's `--s3-upload-integrity`. The library default
+/// is `Off`; the CLI carries the `crc64nvme` default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum S3UploadIntegrity {
+    /// Attach no checksum.
+    #[value(name = "off")]
+    Off,
+    /// Attach `x-amz-checksum-crc64nvme`.
+    #[default]
+    #[value(name = "crc64nvme")]
+    Crc64Nvme,
+    /// Attach `x-amz-checksum-sha256`.
+    #[value(name = "sha256")]
+    Sha256,
+}
+
+impl S3UploadIntegrity {
+    /// The library-level mode this flag value selects.
+    pub fn mode(self) -> UploadIntegrity {
+        match self {
+            S3UploadIntegrity::Off => UploadIntegrity::Off,
+            S3UploadIntegrity::Crc64Nvme => UploadIntegrity::Crc64Nvme,
+            S3UploadIntegrity::Sha256 => UploadIntegrity::Sha256,
+        }
+    }
+
+    /// The `--s3-upload-integrity` spelling of this value.
+    pub const fn flag_value(self) -> &'static str {
+        match self {
+            S3UploadIntegrity::Off => "off",
+            S3UploadIntegrity::Crc64Nvme => "crc64nvme",
+            S3UploadIntegrity::Sha256 => "sha256",
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 pub struct StoreArgs {
     /// Which object store to run against. Unset means `memory`, the empty
@@ -269,6 +314,38 @@ pub struct StoreArgs {
     /// address; a value redirects IMDS for tests and unusual deployments.
     #[arg(long, env = "RAVEL_S3_INSTANCE_METADATA_ENDPOINT", value_name = "URL")]
     pub s3_instance_metadata_endpoint: Option<String>,
+
+    /// Server-verified checksum every `--store s3` PUT carries. `crc64nvme`
+    /// (the default) attaches `x-amz-checksum-crc64nvme` and `sha256` attaches
+    /// `x-amz-checksum-sha256`: the endpoint verifies the body against it,
+    /// rejects a PUT whose bytes do not match, and stores the checksum with
+    /// the object. `off` attaches none. An endpoint that does not support the
+    /// header fails the first write; `off` is the remedy there, at the cost of
+    /// unverified commit records. Same flag, values, default, and env var as
+    /// ravel-server's.
+    #[arg(
+        long,
+        value_enum,
+        default_value = "crc64nvme",
+        env = "RAVEL_S3_UPLOAD_INTEGRITY"
+    )]
+    pub s3_upload_integrity: S3UploadIntegrity,
+
+    /// Ask the endpoint to return the checksum it stored at upload
+    /// (`x-amz-checksum-mode: ENABLED`), so a whole-object read is verified
+    /// against it before the bytes are used. On by default; pass
+    /// `--s3-request-stored-checksum=false` for an endpoint that rejects the
+    /// header, and every whole-object read is then served unverified. Same
+    /// flag, default, and env var as ravel-server's.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_value_t = true,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set,
+        env = "RAVEL_S3_REQUEST_STORED_CHECKSUM"
+    )]
+    pub s3_request_stored_checksum: bool,
 }
 
 impl StoreArgs {
@@ -298,6 +375,16 @@ impl StoreArgs {
                 self.s3_bucket.as_deref(),
                 self.s3_endpoint.as_deref(),
             ),
+        }
+    }
+
+    /// The HTTP client configuration `--store s3` builds its store with: the
+    /// library's tuning, with the two checksum switches taken from the flags.
+    pub fn s3_http_config(&self) -> S3HttpConfig {
+        S3HttpConfig {
+            upload_integrity: self.s3_upload_integrity.mode(),
+            request_stored_checksum: self.s3_request_stored_checksum,
+            ..S3HttpConfig::default()
         }
     }
 }
@@ -356,11 +443,48 @@ pub fn build_store_with_list_page_size(
     args: &StoreArgs,
     page_size: Option<usize>,
 ) -> anyhow::Result<Arc<dyn ObjectStoreBackend>> {
+    Ok(build_store_handle(args, page_size)?.backend())
+}
+
+/// A built store that keeps the concrete [`S3Store`] when the backend is S3.
+///
+/// The bucket-protection probes answer from the concrete type: `S3Store`
+/// reads the bucket's configuration, while the same store held as
+/// `dyn ObjectStoreBackend` reports every condition unknown. `store qualify`
+/// and `store verify-protection` take this so they reach the real answers;
+/// every other command uses [`BuiltStore::backend`].
+#[derive(Clone)]
+pub enum BuiltStore {
+    S3 {
+        store: Arc<S3Store>,
+        /// The checksum settings the store was built with, which the store
+        /// itself does not expose.
+        http: S3HttpConfig,
+    },
+    Other(Arc<dyn ObjectStoreBackend>),
+}
+
+impl BuiltStore {
+    /// The data-plane handle every command uses.
+    pub fn backend(&self) -> Arc<dyn ObjectStoreBackend> {
+        match self {
+            BuiltStore::S3 { store, .. } => Arc::clone(store) as Arc<dyn ObjectStoreBackend>,
+            BuiltStore::Other(store) => Arc::clone(store),
+        }
+    }
+}
+
+/// [`build_store_with_list_page_size`], keeping the concrete S3 store
+/// ([`BuiltStore`]).
+pub fn build_store_handle(
+    args: &StoreArgs,
+    page_size: Option<usize>,
+) -> anyhow::Result<BuiltStore> {
     match args.store_kind() {
-        StoreKind::Memory => Ok(Arc::new(match page_size {
+        StoreKind::Memory => Ok(BuiltStore::Other(Arc::new(match page_size {
             Some(n) => MemoryStore::with_page_size(n),
             None => MemoryStore::new(),
-        })),
+        }))),
         StoreKind::S3 => {
             let bucket = args
                 .s3_bucket
@@ -405,14 +529,41 @@ pub fn build_store_with_list_page_size(
                 auth,
                 instance_metadata_endpoint: args.s3_instance_metadata_endpoint.clone(),
             };
+            let http = args.s3_http_config();
             let store = match page_size {
-                Some(n) => S3Store::with_page_size(config, n),
-                None => S3Store::new(config),
+                None => S3Store::with_http_config(config, http.clone()),
+                Some(n) if n == LIST_PAGE_SIZE => S3Store::with_http_config(config, http.clone()),
+                // `S3Store::with_page_size` builds with the library's default
+                // HTTP configuration, and no constructor takes both.
+                Some(n) if checksum_settings_are_library_default(&http) => {
+                    S3Store::with_page_size(config, n)
+                }
+                Some(n) => {
+                    return Err(anyhow::anyhow!(
+                        "--list-page-size {n} with --store s3 needs --s3-upload-integrity off and \
+                         --s3-request-stored-checksum left on: the S3 store can be built with a \
+                         list page size other than {LIST_PAGE_SIZE} only under its default \
+                         checksum settings, and this invocation selected \
+                         --s3-upload-integrity {} --s3-request-stored-checksum={}. Drop \
+                         --list-page-size to keep them",
+                        args.s3_upload_integrity.flag_value(),
+                        args.s3_request_stored_checksum,
+                    ));
+                }
             }
             .map_err(|err| anyhow::anyhow!("failed to build S3 store: {err}"))?;
-            Ok(Arc::new(store))
+            Ok(BuiltStore::S3 {
+                store: Arc::new(store),
+                http,
+            })
         }
     }
+}
+
+fn checksum_settings_are_library_default(http: &S3HttpConfig) -> bool {
+    let default = S3HttpConfig::default();
+    http.upload_integrity == default.upload_integrity
+        && http.request_stored_checksum == default.request_stored_checksum
 }
 
 /// Reads `key_or_path` from the local filesystem if it names an existing
@@ -429,6 +580,281 @@ pub async fn read_bytes(args: &StoreArgs, key_or_path: &str) -> anyhow::Result<V
         .await
         .map_err(|err| anyhow::anyhow!("failed to fetch {key_or_path}: {err}"))?;
     Ok(outcome.data.to_vec())
+}
+
+/// `store verify-protection` exit code when every expected condition passed.
+pub const VERIFY_PROTECTION_PASS: i32 = 0;
+/// Exit code when any expected condition failed.
+pub const VERIFY_PROTECTION_FAIL: i32 = 1;
+/// Exit code when no expected condition failed but at least one could not be
+/// verified, including a control plane that could not be reached.
+pub const VERIFY_PROTECTION_UNKNOWN: i32 = 2;
+
+/// What `store verify-protection` expects of the bucket: the deployment's own
+/// choices, as its three flags state them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtectionExpectations {
+    /// `--expected-noncurrent-days`: the `E_v` the covering noncurrent-version
+    /// expiration rule must carry.
+    pub expected_noncurrent_days: u32,
+    /// `--expect-replication`: `delete-marker-replication` is expected.
+    pub expect_replication: bool,
+    /// `--expect-object-retention`: `object-retention` is expected.
+    pub expect_object_retention: bool,
+}
+
+impl ProtectionExpectations {
+    /// Whether condition `id` counts toward the exit code. Every condition is
+    /// expected except the two a deployment opts into.
+    pub fn expects(&self, id: ProtectionConditionId) -> bool {
+        match id {
+            ProtectionConditionId::DeleteMarkerReplication => self.expect_replication,
+            ProtectionConditionId::ObjectRetention => self.expect_object_retention,
+            ProtectionConditionId::Versioning
+            | ProtectionConditionId::NoncurrentExpiration
+            | ProtectionConditionId::ExpiredDeleteMarker
+            | ProtectionConditionId::AbortMultipart
+            | ProtectionConditionId::RuleScope
+            | ProtectionConditionId::NoForeignRule
+            | ProtectionConditionId::ObjectLock => true,
+        }
+    }
+
+    /// The control-plane parameters these expectations ask for.
+    pub fn params(&self, retention_prefixes: Vec<String>) -> BucketProtectionParams {
+        BucketProtectionParams {
+            expected_noncurrent_days: Some(self.expected_noncurrent_days),
+            expect_replication: self.expect_replication,
+            sample_object_retention: self.expect_object_retention,
+            protected_retention_prefixes: retention_prefixes,
+        }
+    }
+}
+
+/// What `store verify-protection` prints, and the code it exits with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyProtectionOutcome {
+    /// One line per condition, then one summary line.
+    pub lines: Vec<String>,
+    pub exit_code: i32,
+}
+
+/// The listing prefixes the `object-retention` sample reads, one per protected
+/// prefix family that could be located, plus the families that could not.
+///
+/// The families are the deployment records under `sys/`, the provisioning
+/// records, the commit records and the catalog keyspace. The last three sit
+/// under a tenant, so they are located under the first tenant prefix in key
+/// order, in the first signal directory that holds each.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionSamplePlan {
+    pub prefixes: Vec<String>,
+    /// Families with no object to sample, by name.
+    pub unsampled: Vec<&'static str>,
+}
+
+const RETENTION_FAMILY_SYS: &str = "deployment records (sys/)";
+const RETENTION_FAMILY_PROV: &str = "provisioning records (t/*/*/prov)";
+const RETENTION_FAMILY_COMMIT: &str = "commit records (t/*/*/c/)";
+const RETENTION_FAMILY_CATALOG: &str = "catalog keyspace (t/*/catalog/)";
+
+/// Locate one sample prefix per protected prefix family (see
+/// [`RetentionSamplePlan`]) with delimited listings over the data plane.
+pub async fn retention_sample_plan(
+    store: &dyn ObjectStoreBackend,
+) -> Result<RetentionSamplePlan, StoreError> {
+    let mut sys = None;
+    let mut prov = None;
+    let mut commit = None;
+    let mut catalog = None;
+
+    let root = store.list_delimited("sys/").await?;
+    if !root.objects.is_empty() || !root.common_prefixes.is_empty() {
+        sys = Some("sys/".to_string());
+    }
+
+    let mut tenants = store.list_delimited("t/").await?.common_prefixes;
+    tenants.sort();
+    if let Some(tenant) = tenants.first() {
+        let mut dirs = store.list_delimited(tenant).await?.common_prefixes;
+        dirs.sort();
+        let catalog_prefix = format!("{tenant}catalog/");
+        if dirs.contains(&catalog_prefix) {
+            catalog = Some(catalog_prefix.clone());
+        }
+        for dir in dirs.iter().filter(|dir| **dir != catalog_prefix) {
+            if prov.is_some() && commit.is_some() {
+                break;
+            }
+            let listed = store.list_delimited(dir).await?;
+            let prov_key = format!("{dir}prov");
+            if prov.is_none() && listed.objects.iter().any(|object| object.key == prov_key) {
+                prov = Some(prov_key);
+            }
+            let commit_prefix = format!("{dir}c/");
+            if commit.is_none() && listed.common_prefixes.contains(&commit_prefix) {
+                commit = Some(commit_prefix);
+            }
+        }
+    }
+
+    let mut plan = RetentionSamplePlan {
+        prefixes: Vec::new(),
+        unsampled: Vec::new(),
+    };
+    for (found, family) in [
+        (sys, RETENTION_FAMILY_SYS),
+        (prov, RETENTION_FAMILY_PROV),
+        (commit, RETENTION_FAMILY_COMMIT),
+        (catalog, RETENTION_FAMILY_CATALOG),
+    ] {
+        match found {
+            Some(prefix) => plan.prefixes.push(prefix),
+            None => plan.unsampled.push(family),
+        }
+    }
+    Ok(plan)
+}
+
+/// Run `store verify-protection` against `store`: locate the retention
+/// sample when retention is expected, read the bucket-protection report, and
+/// render it.
+pub async fn verify_protection(
+    store: &BuiltStore,
+    expectations: ProtectionExpectations,
+) -> VerifyProtectionOutcome {
+    let plan = if expectations.expect_object_retention {
+        Some(
+            retention_sample_plan(store.backend().as_ref())
+                .await
+                .map_err(|err| err.to_string()),
+        )
+    } else {
+        None
+    };
+    match store {
+        BuiltStore::S3 { store, .. } => {
+            verify_protection_with(store.as_ref(), expectations, plan.as_ref()).await
+        }
+        BuiltStore::Other(store) => {
+            verify_protection_with(store.as_ref(), expectations, plan.as_ref()).await
+        }
+    }
+}
+
+/// [`verify_protection`] over any [`BucketControlPlane`], with the retention
+/// sample plan supplied by the caller.
+pub async fn verify_protection_with<S: BucketControlPlane + ?Sized>(
+    source: &S,
+    expectations: ProtectionExpectations,
+    plan: Option<&Result<RetentionSamplePlan, String>>,
+) -> VerifyProtectionOutcome {
+    let prefixes = match plan {
+        Some(Ok(plan)) => plan.prefixes.clone(),
+        Some(Err(_)) | None => Vec::new(),
+    };
+    let report = probe_bucket_protection(source, &expectations.params(prefixes)).await;
+    render_verify_protection(&report, expectations, plan)
+}
+
+/// The outcome for a store that could not be built, so its control plane was
+/// never reached: every expected condition is unknown, and the exit code is
+/// [`VERIFY_PROTECTION_UNKNOWN`].
+pub fn verify_protection_unreachable(
+    err: &anyhow::Error,
+    expectations: ProtectionExpectations,
+) -> VerifyProtectionOutcome {
+    let report = BucketProtectionReport::all_unknown(format!(
+        "could not reach the bucket control plane: {err}"
+    ));
+    render_verify_protection(&report, expectations, None)
+}
+
+/// Render `report` as one line per condition plus a summary line, and pick the
+/// exit code: [`VERIFY_PROTECTION_FAIL`] when any expected condition failed,
+/// else [`VERIFY_PROTECTION_UNKNOWN`] when any expected condition is unknown,
+/// else [`VERIFY_PROTECTION_PASS`]. A condition that is not expected is printed
+/// and marked as such, and never moves the exit code.
+///
+/// `plan` is the retention sample plan when retention is expected: a family
+/// that could not be sampled, or a plan that could not be built, keeps
+/// `object-retention` from reading as a pass.
+pub fn render_verify_protection(
+    report: &BucketProtectionReport,
+    expectations: ProtectionExpectations,
+    plan: Option<&Result<RetentionSamplePlan, String>>,
+) -> VerifyProtectionOutcome {
+    let mut lines = Vec::with_capacity(report.conditions.len() + 1);
+    let mut failed: Vec<&'static str> = Vec::new();
+    let mut unknown: Vec<&'static str> = Vec::new();
+    for entry in &report.conditions {
+        let state = if entry.id == ProtectionConditionId::ObjectRetention {
+            retention_state_with_coverage(&entry.state, plan)
+        } else {
+            entry.state.clone()
+        };
+        let expected = expectations.expects(entry.id);
+        if expected {
+            match state {
+                ConditionState::Pass => {}
+                ConditionState::Fail(_) => failed.push(entry.id.id()),
+                ConditionState::Unknown(_) => unknown.push(entry.id.id()),
+            }
+        }
+        let detail = match (expected, state.detail()) {
+            (true, detail) => detail.to_string(),
+            (false, "") => "not expected, does not affect the exit code".to_string(),
+            (false, detail) => format!("not expected, does not affect the exit code: {detail}"),
+        };
+        lines.push(if detail.is_empty() {
+            format!("{:<26} {}", entry.id.id(), state.verdict())
+        } else {
+            format!("{:<26} {:<7} {detail}", entry.id.id(), state.verdict())
+        });
+    }
+    let (summary, exit_code) = if !failed.is_empty() {
+        let mut summary = format!("verify-protection: FAIL: failed: {}", failed.join(", "));
+        if !unknown.is_empty() {
+            summary.push_str(&format!("; could not verify: {}", unknown.join(", ")));
+        }
+        (summary, VERIFY_PROTECTION_FAIL)
+    } else if !unknown.is_empty() {
+        (
+            format!(
+                "verify-protection: UNKNOWN: could not verify: {}",
+                unknown.join(", ")
+            ),
+            VERIFY_PROTECTION_UNKNOWN,
+        )
+    } else {
+        (
+            "verify-protection: PASS: every expected condition passed".to_string(),
+            VERIFY_PROTECTION_PASS,
+        )
+    };
+    lines.push(summary);
+    VerifyProtectionOutcome { lines, exit_code }
+}
+
+/// `object-retention` as the report states it, narrowed by what the sample
+/// covered: a pass over fewer than every protected prefix family is unknown.
+fn retention_state_with_coverage(
+    state: &ConditionState,
+    plan: Option<&Result<RetentionSamplePlan, String>>,
+) -> ConditionState {
+    let gap = match plan {
+        None => return state.clone(),
+        Some(Err(err)) => {
+            format!("could not locate the protected prefix families to sample: {err}")
+        }
+        Some(Ok(plan)) if plan.unsampled.is_empty() => return state.clone(),
+        Some(Ok(plan)) => format!("no object to sample for {}", plan.unsampled.join(", ")),
+    };
+    match state {
+        ConditionState::Pass => ConditionState::Unknown(gap),
+        ConditionState::Unknown(detail) => ConditionState::Unknown(format!("{detail}; {gap}")),
+        ConditionState::Fail(detail) => ConditionState::Fail(format!("{detail}; {gap}")),
+    }
 }
 
 #[cfg(test)]
@@ -1081,5 +1507,562 @@ mod tests {
         with_file.extend(["--s3-credentials-file", file_path]);
         let args = StoreArgs::try_parse_from(with_file).expect("flags parse");
         build_store(&args).expect("a readable --s3-credentials-file must build");
+    }
+
+    // --- store verify-protection ---
+
+    /// A control plane that serves a fixed report, every condition `Pass`
+    /// except the ones a test overrides.
+    struct FixtureSource(BucketProtectionReport);
+
+    #[async_trait::async_trait]
+    impl BucketControlPlane for FixtureSource {
+        async fn bucket_protection_report(
+            &self,
+            _params: &BucketProtectionParams,
+        ) -> BucketProtectionReport {
+            self.0.clone()
+        }
+    }
+
+    fn fixture(overrides: &[(ProtectionConditionId, ConditionState)]) -> FixtureSource {
+        let mut states: std::collections::HashMap<_, _> = ProtectionConditionId::ALL
+            .iter()
+            .map(|id| (*id, ConditionState::Pass))
+            .collect();
+        states.extend(overrides.iter().cloned());
+        FixtureSource(BucketProtectionReport::from_states(states))
+    }
+
+    fn fail(detail: &str) -> ConditionState {
+        ConditionState::Fail(detail.to_string())
+    }
+
+    fn unknown(detail: &str) -> ConditionState {
+        ConditionState::Unknown(detail.to_string())
+    }
+
+    const EXPECT_CORE: ProtectionExpectations = ProtectionExpectations {
+        expected_noncurrent_days: 30,
+        expect_replication: false,
+        expect_object_retention: false,
+    };
+
+    const EXPECT_ALL: ProtectionExpectations = ProtectionExpectations {
+        expected_noncurrent_days: 30,
+        expect_replication: true,
+        expect_object_retention: true,
+    };
+
+    fn full_plan() -> Result<RetentionSamplePlan, String> {
+        Ok(RetentionSamplePlan {
+            prefixes: vec!["sys/".to_string()],
+            unsampled: Vec::new(),
+        })
+    }
+
+    /// ADR-1727 follow-up task 2's acceptance test: two expected conditions
+    /// fail, and the command prints each on its own line with its detail,
+    /// names both in the summary, and exits 1.
+    #[tokio::test]
+    async fn verify_protection_names_each_failed_condition() {
+        let source = fixture(&[
+            (
+                ProtectionConditionId::NoncurrentExpiration,
+                fail("rule \"ravel\": NoncurrentDays is 10, expected 30"),
+            ),
+            (
+                ProtectionConditionId::ObjectLock,
+                fail("Object Lock is not enabled on the bucket"),
+            ),
+            (
+                ProtectionConditionId::DeleteMarkerReplication,
+                unknown("replication is not expected"),
+            ),
+        ]);
+        let outcome = verify_protection_with(&source, EXPECT_CORE, None).await;
+        assert_eq!(
+            outcome.lines,
+            vec![
+                "versioning                 pass",
+                "noncurrent-expiration      fail    rule \"ravel\": NoncurrentDays is 10, expected 30",
+                "expired-delete-marker      pass",
+                "abort-multipart            pass",
+                "rule-scope                 pass",
+                "no-foreign-rule            pass",
+                "delete-marker-replication  unknown not expected, does not affect the exit code: \
+                 replication is not expected",
+                "object-lock                fail    Object Lock is not enabled on the bucket",
+                "object-retention           pass    not expected, does not affect the exit code",
+                "verify-protection: FAIL: failed: noncurrent-expiration, object-lock",
+            ]
+        );
+        assert_eq!(outcome.exit_code, VERIFY_PROTECTION_FAIL);
+    }
+
+    /// Exit 0 needs every expected condition `Pass`. An unknown the
+    /// deployment did not opt into does not move it; the same unknown under
+    /// its flag does.
+    #[tokio::test]
+    async fn verify_protection_exits_0_only_when_every_expected_condition_passes() {
+        let source = fixture(&[
+            (
+                ProtectionConditionId::DeleteMarkerReplication,
+                unknown("replication is not expected"),
+            ),
+            (
+                ProtectionConditionId::ObjectRetention,
+                unknown("object retention is not sampled"),
+            ),
+        ]);
+        let outcome = verify_protection_with(&source, EXPECT_CORE, None).await;
+        assert_eq!(
+            outcome.lines,
+            vec![
+                "versioning                 pass",
+                "noncurrent-expiration      pass",
+                "expired-delete-marker      pass",
+                "abort-multipart            pass",
+                "rule-scope                 pass",
+                "no-foreign-rule            pass",
+                "delete-marker-replication  unknown not expected, does not affect the exit code: \
+                 replication is not expected",
+                "object-lock                pass",
+                "object-retention           unknown not expected, does not affect the exit code: \
+                 object retention is not sampled",
+                "verify-protection: PASS: every expected condition passed",
+            ]
+        );
+        assert_eq!(outcome.exit_code, VERIFY_PROTECTION_PASS);
+
+        let expecting_replication = ProtectionExpectations {
+            expect_replication: true,
+            ..EXPECT_CORE
+        };
+        let outcome = verify_protection_with(&source, expecting_replication, None).await;
+        assert_eq!(
+            outcome.lines[6],
+            "delete-marker-replication  unknown replication is not expected"
+        );
+        assert_eq!(
+            outcome.lines.last().map(String::as_str),
+            Some("verify-protection: UNKNOWN: could not verify: delete-marker-replication")
+        );
+        assert_eq!(outcome.exit_code, VERIFY_PROTECTION_UNKNOWN);
+
+        let all = fixture(&[]);
+        let outcome = verify_protection_with(&all, EXPECT_ALL, Some(&full_plan())).await;
+        assert_eq!(
+            outcome.exit_code, VERIFY_PROTECTION_PASS,
+            "{:?}",
+            outcome.lines
+        );
+    }
+
+    /// Exit 1 wins over exit 2: a failure alongside an unknown exits 1, and
+    /// the summary names both.
+    #[tokio::test]
+    async fn verify_protection_exits_1_when_any_expected_condition_fails() {
+        let source = fixture(&[
+            (
+                ProtectionConditionId::NoForeignRule,
+                fail("rule \"archive\" transitions t/ to GLACIER"),
+            ),
+            (
+                ProtectionConditionId::RuleScope,
+                unknown("rules cover t/ in a form that cannot be proven"),
+            ),
+        ]);
+        let outcome = verify_protection_with(&source, EXPECT_CORE, None).await;
+        assert_eq!(
+            outcome.lines[4],
+            "rule-scope                 unknown rules cover t/ in a form that cannot be proven"
+        );
+        assert_eq!(
+            outcome.lines[5],
+            "no-foreign-rule            fail    rule \"archive\" transitions t/ to GLACIER"
+        );
+        assert_eq!(
+            outcome.lines.last().map(String::as_str),
+            Some("verify-protection: FAIL: failed: no-foreign-rule; could not verify: rule-scope")
+        );
+        assert_eq!(outcome.exit_code, VERIFY_PROTECTION_FAIL);
+    }
+
+    /// Exit 2 for an expected unknown, for a control plane that could not be
+    /// reached, for a backend with no control plane, and for a retention
+    /// sample that missed a protected prefix family: never exit 0 for "could
+    /// not verify".
+    #[tokio::test]
+    async fn verify_protection_exits_2_when_an_expected_condition_is_unknown() {
+        let source = fixture(&[(
+            ProtectionConditionId::Versioning,
+            unknown("GET ?versioning: 403 AccessDenied"),
+        )]);
+        let outcome = verify_protection_with(&source, EXPECT_CORE, None).await;
+        assert_eq!(
+            outcome.lines[0],
+            "versioning                 unknown GET ?versioning: 403 AccessDenied"
+        );
+        assert_eq!(
+            outcome.lines.last().map(String::as_str),
+            Some("verify-protection: UNKNOWN: could not verify: versioning")
+        );
+        assert_eq!(outcome.exit_code, VERIFY_PROTECTION_UNKNOWN);
+
+        let unreachable = verify_protection_unreachable(
+            &anyhow::anyhow!("--store s3 requires RAVEL_S3_BUCKET"),
+            EXPECT_CORE,
+        );
+        assert_eq!(
+            unreachable.lines[0],
+            "versioning                 unknown could not reach the bucket control plane: \
+             --store s3 requires RAVEL_S3_BUCKET"
+        );
+        assert_eq!(
+            unreachable.lines.last().map(String::as_str),
+            Some(
+                "verify-protection: UNKNOWN: could not verify: versioning, \
+                 noncurrent-expiration, expired-delete-marker, abort-multipart, rule-scope, \
+                 no-foreign-rule, object-lock"
+            )
+        );
+        assert_eq!(unreachable.exit_code, VERIFY_PROTECTION_UNKNOWN);
+
+        let memory = BuiltStore::Other(Arc::new(MemoryStore::new()));
+        let outcome = verify_protection(&memory, EXPECT_ALL).await;
+        assert_eq!(outcome.exit_code, VERIFY_PROTECTION_UNKNOWN);
+        assert_eq!(
+            outcome.lines.last().map(String::as_str),
+            Some(
+                "verify-protection: UNKNOWN: could not verify: versioning, \
+                 noncurrent-expiration, expired-delete-marker, abort-multipart, rule-scope, \
+                 no-foreign-rule, delete-marker-replication, object-lock, object-retention"
+            )
+        );
+
+        // Every sampled object carries retention, but the commit-record family
+        // had nothing to sample: the pass does not stand.
+        let partial = Ok(RetentionSamplePlan {
+            prefixes: vec!["sys/".to_string()],
+            unsampled: vec![RETENTION_FAMILY_COMMIT],
+        });
+        let outcome = verify_protection_with(&fixture(&[]), EXPECT_ALL, Some(&partial)).await;
+        assert_eq!(
+            outcome.lines[8],
+            "object-retention           unknown no object to sample for commit records (t/*/*/c/)"
+        );
+        assert_eq!(outcome.exit_code, VERIFY_PROTECTION_UNKNOWN);
+    }
+
+    /// The retention sample reads one prefix per protected family: `sys/`,
+    /// and under the first tenant in key order its catalog keyspace and the
+    /// first signal directory holding a provisioning record and commit
+    /// records. A family with nothing under it is named, not sampled.
+    #[tokio::test]
+    async fn retention_sample_plan_locates_one_prefix_per_family() {
+        let store = MemoryStore::new();
+        let empty = retention_sample_plan(&store)
+            .await
+            .expect("an empty store lists");
+        assert_eq!(
+            empty,
+            RetentionSamplePlan {
+                prefixes: Vec::new(),
+                unsampled: vec![
+                    RETENTION_FAMILY_SYS,
+                    RETENTION_FAMILY_PROV,
+                    RETENTION_FAMILY_COMMIT,
+                    RETENTION_FAMILY_CATALOG,
+                ],
+            }
+        );
+
+        for key in [
+            "sys/tenancy",
+            "t/bb/catalog/l/HEAD",
+            "t/aa/l/prov",
+            "t/aa/m/c/0/100/w.1.1.cmt",
+            "t/aa/m/prov",
+            "t/aa/catalog/m/HEAD",
+            "t/aa/config",
+        ] {
+            store
+                .put(key, Bytes::from_static(b"x"), PutOptions::default())
+                .await
+                .expect("seed");
+        }
+        let plan = retention_sample_plan(&store).await.expect("lists");
+        assert_eq!(
+            plan,
+            RetentionSamplePlan {
+                prefixes: vec![
+                    "sys/".to_string(),
+                    "t/aa/l/prov".to_string(),
+                    "t/aa/m/c/".to_string(),
+                    "t/aa/catalog/".to_string(),
+                ],
+                unsampled: Vec::new(),
+            }
+        );
+    }
+
+    const COMPLIANT_LIFECYCLE: &str = "<LifecycleConfiguration><Rule><Status>Enabled</Status>\
+         <Filter><Prefix></Prefix></Filter>\
+         <NoncurrentVersionExpiration><NoncurrentDays>30</NoncurrentDays>\
+         </NoncurrentVersionExpiration>\
+         <Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration>\
+         <AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation>\
+         </AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>";
+
+    fn compliant_bucket() -> [(&'static str, axum::http::StatusCode, &'static str); 4] {
+        use axum::http::StatusCode;
+        [
+            (
+                "versioning",
+                StatusCode::OK,
+                "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
+            ),
+            ("lifecycle", StatusCode::OK, COMPLIANT_LIFECYCLE),
+            (
+                "replication",
+                StatusCode::OK,
+                "<ReplicationConfiguration><Rule><Status>Enabled</Status><Filter/>\
+                 <DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>\
+                 </Rule></ReplicationConfiguration>",
+            ),
+            (
+                "object-lock",
+                StatusCode::OK,
+                "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+                 </ObjectLockConfiguration>",
+            ),
+        ]
+    }
+
+    /// `--store s3` reaches the concrete `S3Store`, so verify-protection reads
+    /// the bucket: four signed control-plane GETs, every expected condition
+    /// `Pass`, exit 0. The same store handed over as `dyn ObjectStoreBackend`
+    /// reads nothing and reports every condition unknown, exit 2.
+    #[tokio::test]
+    async fn verify_protection_against_s3_reads_the_bucket_through_the_concrete_store() {
+        let (endpoint, fake) =
+            crate::fake_s3::spawn(crate::fake_s3::Echo::Stored, &compliant_bucket()).await;
+        let built = build_store_handle(&s3_args(&endpoint, false), None).expect("s3 builds");
+        assert!(matches!(built, BuiltStore::S3 { .. }));
+
+        let expectations = ProtectionExpectations {
+            expect_replication: true,
+            ..EXPECT_CORE
+        };
+        let outcome = verify_protection(&built, expectations).await;
+        assert_eq!(
+            fake.control_plane(),
+            vec!["versioning", "lifecycle", "replication", "object-lock"]
+        );
+        assert_eq!(
+            outcome.lines[..8],
+            [
+                "versioning                 pass",
+                "noncurrent-expiration      pass",
+                "expired-delete-marker      pass",
+                "abort-multipart            pass",
+                "rule-scope                 pass",
+                "no-foreign-rule            pass",
+                "delete-marker-replication  pass",
+                "object-lock                pass",
+            ]
+        );
+        assert!(
+            outcome.lines[8].starts_with(
+                "object-retention           unknown not expected, does not affect the exit code: "
+            ),
+            "{:?}",
+            outcome.lines[8]
+        );
+        assert_eq!(
+            outcome.lines[9],
+            "verify-protection: PASS: every expected condition passed"
+        );
+        assert_eq!(outcome.exit_code, VERIFY_PROTECTION_PASS);
+
+        let through_dyn = BuiltStore::Other(built.backend());
+        let outcome = verify_protection(&through_dyn, expectations).await;
+        assert!(
+            outcome.lines[..9]
+                .iter()
+                .all(|line| line.contains(" unknown ")),
+            "{:?}",
+            outcome.lines
+        );
+        assert_eq!(outcome.exit_code, VERIFY_PROTECTION_UNKNOWN);
+        assert_eq!(fake.control_plane().len(), 4, "the dyn path reads nothing");
+    }
+
+    // --- S3 checksum options ---
+
+    /// Both checksum options parse with the server's names, values, defaults
+    /// and environment variables, and reach the `S3HttpConfig` the store is
+    /// built with.
+    #[test]
+    fn s3_checksum_options_parse_and_reach_the_http_config() {
+        use clap::CommandFactory;
+
+        let base = ["ravel-cli", "--store", "s3"];
+        let parse = |extra: &[&str]| {
+            let mut argv = base.to_vec();
+            argv.extend_from_slice(extra);
+            StoreArgs::try_parse_from(argv).expect("flags parse")
+        };
+
+        let defaults = parse(&[]);
+        assert_eq!(defaults.s3_upload_integrity, S3UploadIntegrity::Crc64Nvme);
+        assert!(defaults.s3_request_stored_checksum);
+        let http = defaults.s3_http_config();
+        assert_eq!(http.upload_integrity, UploadIntegrity::Crc64Nvme);
+        assert!(http.request_stored_checksum);
+
+        for (value, mode) in [
+            ("off", UploadIntegrity::Off),
+            ("crc64nvme", UploadIntegrity::Crc64Nvme),
+            ("sha256", UploadIntegrity::Sha256),
+        ] {
+            let args = parse(&["--s3-upload-integrity", value]);
+            assert_eq!(args.s3_upload_integrity.flag_value(), value);
+            assert_eq!(args.s3_http_config().upload_integrity, mode, "{value}");
+        }
+        assert!(
+            StoreArgs::try_parse_from(["ravel-cli", "--s3-upload-integrity", "crc32c"]).is_err(),
+            "an unsupported algorithm is refused at parse time"
+        );
+
+        for (argv, expected) in [
+            (&["--s3-request-stored-checksum=false"][..], false),
+            (&["--s3-request-stored-checksum=true"][..], true),
+            (&["--s3-request-stored-checksum"][..], true),
+            (&["--s3-request-stored-checksum", "false"][..], false),
+        ] {
+            let args = parse(argv);
+            assert_eq!(args.s3_request_stored_checksum, expected, "{argv:?}");
+            assert_eq!(
+                args.s3_http_config().request_stored_checksum,
+                expected,
+                "{argv:?}"
+            );
+        }
+
+        let command = StoreArgs::command();
+        let env_of = |id: &str| {
+            command
+                .get_arguments()
+                .find(|arg| arg.get_id() == id)
+                .and_then(|arg| arg.get_env())
+                .and_then(|env| env.to_str())
+                .map(str::to_string)
+        };
+        assert_eq!(
+            env_of("s3_upload_integrity").as_deref(),
+            Some("RAVEL_S3_UPLOAD_INTEGRITY")
+        );
+        assert_eq!(
+            env_of("s3_request_stored_checksum").as_deref(),
+            Some("RAVEL_S3_REQUEST_STORED_CHECKSUM")
+        );
+    }
+
+    /// A PUT through `--store s3` carries `x-amz-checksum-crc64nvme` by
+    /// default and no checksum under `--s3-upload-integrity off`.
+    #[tokio::test]
+    async fn s3_put_carries_the_selected_upload_checksum() {
+        let (endpoint, fake) = crate::fake_s3::spawn(crate::fake_s3::Echo::Stored, &[]).await;
+        let mut argv = vec![
+            "ravel-cli",
+            "--store",
+            "s3",
+            "--s3-bucket",
+            "ravel-test",
+            "--s3-endpoint",
+            &endpoint,
+            "--s3-access-key",
+            "test",
+            "--s3-secret-key",
+            "test",
+        ];
+        let default_store =
+            build_store(&StoreArgs::try_parse_from(argv.clone()).expect("parse")).expect("build");
+        default_store
+            .put(
+                "t/default",
+                Bytes::from_static(b"hello"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put");
+
+        argv.extend(["--s3-upload-integrity", "off"]);
+        let off_store =
+            build_store(&StoreArgs::try_parse_from(argv).expect("parse")).expect("build");
+        off_store
+            .put("t/off", Bytes::from_static(b"hello"), PutOptions::default())
+            .await
+            .expect("put");
+
+        let puts = fake.puts();
+        assert_eq!(puts.len(), 2, "{puts:?}");
+        assert_eq!(puts[0].key, "t/default");
+        let digest: Vec<&str> = puts[0]
+            .checksum_headers
+            .iter()
+            .filter(|(name, _)| name == "x-amz-checksum-crc64nvme")
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(digest.len(), 1, "{puts:?}");
+        assert_eq!(puts[1].key, "t/off");
+        assert!(
+            puts[1]
+                .checksum_headers
+                .iter()
+                .all(|(name, _)| name == "x-amz-checksum-mode"),
+            "no checksum under off: {puts:?}"
+        );
+    }
+
+    /// A list page size other than the production one can only be built
+    /// under the library's default checksum settings, so the combination with
+    /// the CLI's default is refused by name rather than built without the
+    /// checksum.
+    #[test]
+    fn a_custom_list_page_size_on_s3_refuses_non_default_checksum_settings() {
+        let err = match build_store_handle(&s3_args("http://127.0.0.1:9000", false), Some(10)) {
+            Ok(_) => panic!("crc64nvme with --list-page-size 10 must be refused"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains("--list-page-size 10") && err.contains("--s3-upload-integrity crc64nvme"),
+            "{err}"
+        );
+        build_store_handle(
+            &s3_args("http://127.0.0.1:9000", false),
+            Some(LIST_PAGE_SIZE),
+        )
+        .expect("the production page size keeps the selected settings");
+
+        let off = StoreArgs::try_parse_from([
+            "ravel-cli",
+            "--store",
+            "s3",
+            "--s3-bucket",
+            "ravel-test",
+            "--s3-endpoint",
+            "http://127.0.0.1:9000",
+            "--s3-access-key",
+            "test",
+            "--s3-secret-key",
+            "test",
+            "--s3-upload-integrity",
+            "off",
+        ])
+        .expect("parse");
+        build_store_handle(&off, Some(10)).expect("off with a custom page size builds");
     }
 }

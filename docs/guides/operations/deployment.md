@@ -60,6 +60,29 @@ more than the declared page size each, so a run at the default page size
 leaves about two thousand small objects, and repeated runs against the same
 bucket accumulate them. Sweep the prefix from a runbook when it matters.
 
+Against `--store s3`, `store qualify` also prints the bucket's Object Lock,
+versioning and lifecycle state read from the bucket itself, as informational
+lines that never fail the run, and one stored-checksum line. That check PUTs a
+probe object with the `--s3-upload-integrity` checksum, reads it back whole
+with the stored checksum requested, and says what the endpoint did:
+
+- `verified`: the endpoint returned a stored checksum and it matched the body.
+- `not returned`: the endpoint returned none, so every whole-object read in
+  production is served and counted unverified.
+- `not checked (...)`: the check did not run, with the reason: upload
+  integrity `off`, `sha256` (whose stored checksum is not recomputed on read),
+  `--s3-request-stored-checksum=false`, or a store other than S3.
+- `FAIL`: the endpoint returned a checksum that does not match the one sent,
+  or the probe PUT or GET failed. Qualification fails and nothing is recorded.
+
+The probe object sits under `sys/qualify/<run-id>/` and is deleted afterwards.
+If the credential cannot delete it, a `note:` line names the object left in
+place and the outcome stands.
+
+`store qualify --list-page-size` with a value other than the default builds
+the S3 store only under `--s3-upload-integrity off` and the stored checksum
+requested, and refuses any other combination by name.
+
 ## The bucket protection contract
 
 Some of what protects a Ravel bucket is configured at the bucket and policy
@@ -127,6 +150,13 @@ The flag is off by default, so a development process that does not pass it
 starts without the gate. The Kubernetes operator sets it unconditionally for
 every cluster it reconciles: the custom resource carries no development or
 staging profile field to gate on.
+
+`ravel-cli store verify-protection --expected-noncurrent-days <E_v>` checks
+the whole bucket half of the contract against an S3 bucket's own
+configuration and exits `0` only when every expected condition passes, `1`
+when any fails, and `2` when any could not be verified. Schedule it;
+[running the checklist with ravel-cli](../disaster-recovery.md#running-the-checklist-with-ravel-cli)
+describes its flags, output, and the read-only permissions it needs.
 
 ## The first deployment against a fresh bucket
 

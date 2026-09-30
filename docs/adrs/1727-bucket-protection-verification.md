@@ -129,7 +129,9 @@ data; verification is reads of configuration.
    `GetLifecycleConfiguration`, `GetReplicationConfiguration`,
    `GetBucketObjectLockConfiguration`, `GetObjectRetention`,
    `ListBucketVersions`) ship as a separate statement in the IAM templates,
-   so the ingest and query roles gain nothing.
+   so the ingest and query roles gain nothing. (Narrowed by the
+   verify-protection sample amendment below: the retention sample is taken
+   from one tenant, and locating it also needs `ListBucket`.)
 
 5. **In-process gate and gauges.** Under `--require-bucket-protection` the
    startup check runs the same report. Fatal: `versioning` on without
@@ -294,3 +296,34 @@ makes `store verify-protection` exit `2`, never `0`. A bucket whose rules
 cover `t/` in a form the code does not prove reads as "could not verify":
 the operator restates the rules as one rule over `t/` (or the whole
 bucket) or as the sixteen-rule union, or confirms coverage out of band.
+
+## Amendment (2026-09-30): the verify-protection retention sample and its permissions
+
+<!-- amendment-applies: sections="Decision" pointer="verify-protection sample amendment" -->
+
+`store verify-protection` as built (follow-up task 2) takes the
+`object-retention` sample more narrowly than decision 3's table states, and
+needs one permission decision 4 does not list.
+
+1. **The sample is one tenant's, not the newest across tenants.** Three of the
+   four protected prefix families (provisioning records, commit records, the
+   catalog keyspace) sit under a tenant hash, and a versions listing takes a
+   literal prefix, so the CLI locates concrete prefixes first: `sys/`, and,
+   under the first tenant prefix in key order, `t/<h>/catalog/` and the
+   `prov` record and `c/` prefix of the first signal directory holding each.
+   The control plane then samples the newest current version and the newest
+   noncurrent version under each. A family with no object to sample leaves
+   `object-retention` `Unknown`, never `Pass`, so a bucket with no tenant yet
+   exits `2` under `--expect-object-retention`. A first tenant whose newest
+   commit record has outlived its retention reads `Fail` for that family,
+   though a busier tenant's newer records may be locked.
+2. **Locating the sample needs `ListBucket`.** The prefixes are found with
+   delimited `ListObjectsV2` calls over the data-plane client, which
+   `ListBucketVersions` does not grant. Under
+   `--expect-object-retention` the identity running the command needs
+   `ListBucket` beside the six actions decision 4 names; without it the
+   listing is denied and `object-retention` reads `Unknown`, exit `2`. The
+   other conditions need nothing beyond decision 4's list.
+
+Neither narrowing can turn a non-compliant bucket into exit `0`: each leaves a
+condition `Unknown` or `Fail` where a wider sample might have read `Pass`.

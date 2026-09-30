@@ -1161,6 +1161,27 @@ enum StoreCommand {
         )]
         list_page_size: usize,
     },
+    /// Read the bucket's protection configuration and check it against the
+    /// deployment's expectations: one line per condition, then a summary. Exits
+    /// 0 only when every expected condition passes, 1 when any fails, and 2
+    /// when any could not be verified or the bucket's control plane could not
+    /// be reached. Read-only.
+    VerifyProtection {
+        /// The noncurrent-version expiration, in days, the lifecycle rule
+        /// covering `t/` must carry (`E_v`).
+        #[arg(long, value_name = "DAYS")]
+        expected_noncurrent_days: u32,
+        /// Expect replication: `delete-marker-replication` must pass. Without
+        /// it the condition is printed and does not affect the exit code.
+        #[arg(long)]
+        expect_replication: bool,
+        /// Expect per-object compliance-mode retention: the newest current
+        /// object of each protected prefix family, and one noncurrent version,
+        /// must carry it. Without it the condition is printed and does not
+        /// affect the exit code.
+        #[arg(long)]
+        expect_object_retention: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1878,13 +1899,40 @@ async fn main() -> anyhow::Result<()> {
             command: StoreCommand::Qualify { list_page_size },
         } => {
             let run_id = uuid::Uuid::new_v4();
-            ravel_cli::qualify::qualify(
-                store::build_store_with_list_page_size(&cli.store, Some(list_page_size))?,
+            ravel_cli::qualify::qualify_built(
+                store::build_store_handle(&cli.store, Some(list_page_size))?,
                 cli.store.backend_identity(),
                 &run_id.to_string(),
                 list_page_size,
             )
             .await
+        }
+        Command::Store {
+            command:
+                StoreCommand::VerifyProtection {
+                    expected_noncurrent_days,
+                    expect_replication,
+                    expect_object_retention,
+                },
+        } => {
+            let expectations = store::ProtectionExpectations {
+                expected_noncurrent_days,
+                expect_replication,
+                expect_object_retention,
+            };
+            let outcome = match store::build_store_handle(&cli.store, None) {
+                Ok(built) => store::verify_protection(&built, expectations).await,
+                Err(err) => store::verify_protection_unreachable(&err, expectations),
+            };
+            for line in &outcome.lines {
+                println!("{line}");
+            }
+            if outcome.exit_code != store::VERIFY_PROTECTION_PASS {
+                use std::io::Write as _;
+                std::io::stdout().flush()?;
+                std::process::exit(outcome.exit_code);
+            }
+            Ok(())
         }
         Command::Hold {
             command:
