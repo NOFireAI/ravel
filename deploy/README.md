@@ -54,7 +54,7 @@ ships.
 `grafana/dashboards-standalone/ravel.json` is the shipped dashboard over Ravel's own
 `ravel_` families: 36 panels in 6 rows, named Ingest, Query, Catalog fold,
 Maintenance, Object store and probe, and Alerting. Between them the panels
-reference 112 distinct `ravel_` metric names. Import it into Grafana and pick
+reference 116 distinct `ravel_` metric names. Import it into Grafana and pick
 the Prometheus data source that scrapes your Ravel processes; the dashboard
 carries a single `ds` data-source variable and no hardcoded data-source uid.
 
@@ -82,7 +82,7 @@ asserts each one appears on a `# TYPE` line of a `/metrics` body rendered by a
 running server, through the same scanner and the same rendered bodies the rule
 file goes through. It also asserts that every one of the 41 metric names the
 shipped rules alert on is graphed by some panel here, so a page always has a
-panel to land on. The 6 rows, 36 panels, 109 targets and 112 names are pinned
+panel to land on. The 6 rows, 36 panels, 113 targets and 116 names are pinned
 as literals, so a walk that stops finding panels fails rather than checking an
 empty set.
 

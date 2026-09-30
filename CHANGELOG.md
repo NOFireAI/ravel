@@ -638,6 +638,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`/metrics` exports the superseded-input sweep's hold counters** (issue
+  #2221). `ravel_maintain_superseded_inputs_held_total{reason="named"|"unreadable_head"}`
+  counts superseded objects the sweep held because HEAD still names them or
+  cannot be read, `ravel_maintain_superseded_groups_held_by_legal_hold_total`
+  counts chain groups a legal hold skipped, and
+  `ravel_maintain_dreq_held_by_superseded_inputs_total` counts erasure
+  requests kept past their horizon for a superseded input still present, all
+  by `mode` and `signal`. `SweepReport` carries the three rule-2 counts. The
+  alerts and query-audit shards' superseded refusals and holds now reach
+  `ravel_maintain_superseded_deletes_refused_total` and the hold families
+  under `signal="alerts"` and `signal="audit"`. `ravel-cli maintain sweep`
+  prints the refusal and hold counts, and the standalone Grafana dashboard's
+  reclaim and safety brakes panel graphs all four families.
 - **`--audit-retention` sets the query-audit retention window** (ADR-0062
   decision 2c, ADR-1688, issue #2126). The server built its compactor with
   the compiled-in 90-day audit window and no way to change it. The flag takes

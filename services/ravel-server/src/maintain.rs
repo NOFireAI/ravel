@@ -179,6 +179,17 @@ pub struct MaintenanceSafetyMetrics {
     orphans_quarantined: [AtomicU64; MAINTAINED_SIGNALS.len()],
     orphans_quarantine_refused: [AtomicU64; MAINTAINED_SIGNALS.len()],
     superseded_deletes_refused: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    /// Rule 2's held objects per signal, indexed by
+    /// [`SupersededHeldReason::index`]. Backs
+    /// `ravel_maintain_superseded_inputs_held_total`.
+    superseded_inputs_held:
+        [[AtomicU64; SupersededHeldReason::ALL.len()]; MAINTAINED_SIGNALS.len()],
+    superseded_groups_held_by_legal_hold: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    /// `.dreq`s the erasure-request sweep kept past their horizon because an
+    /// input a rewrite applying them superseded is still present
+    /// ([`ravel_maintain::ErasureRequestSweepOutcome::held_by_superseded_inputs`]).
+    /// Backs `ravel_maintain_dreq_held_by_superseded_inputs_total`.
+    dreq_held_by_superseded_inputs: [AtomicU64; MAINTAINED_SIGNALS.len()],
     quarantine_reaped: [AtomicU64; MAINTAINED_SIGNALS.len()],
     l0_records_pending: [AtomicU64; MAINTAINED_SIGNALS.len()],
     /// The in-progress cycle's L0-pending accumulator, paired with
@@ -253,6 +264,65 @@ pub struct MaintenanceSafetyMetrics {
     /// the same breaker-trip family, so the one alert on that family covers
     /// these shards too.
     unmaintained_orphan_breaker_trips: [AtomicU64; UNMAINTAINED_SWEPT_SIGNALS.len()],
+    /// Rule 2's refusal and hold counts on those same shards, indexed like
+    /// `unmaintained_orphan_breaker_trips` and rendered the same way, as
+    /// further `signal` samples of the maintained signals' families.
+    unmaintained_superseded_deletes_refused: [AtomicU64; UNMAINTAINED_SWEPT_SIGNALS.len()],
+    unmaintained_superseded_inputs_held:
+        [[AtomicU64; SupersededHeldReason::ALL.len()]; UNMAINTAINED_SWEPT_SIGNALS.len()],
+    unmaintained_superseded_groups_held_by_legal_hold:
+        [AtomicU64; UNMAINTAINED_SWEPT_SIGNALS.len()],
+}
+
+/// Why rule 2 held a superseded input this pass: the `reason` label of
+/// `ravel_maintain_superseded_inputs_held_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupersededHeldReason {
+    /// The live catalog HEAD snapshot still names the object
+    /// ([`ravel_maintain::SweepReport::superseded_held_by_snapshot`]).
+    Named,
+    /// HEAD or a covering snapshot part was present and could not be read
+    /// ([`ravel_maintain::SweepReport::superseded_held_by_unreadable_head`]).
+    UnreadableHead,
+}
+
+impl SupersededHeldReason {
+    pub const ALL: [SupersededHeldReason; 2] = [
+        SupersededHeldReason::Named,
+        SupersededHeldReason::UnreadableHead,
+    ];
+
+    fn index(self) -> usize {
+        match self {
+            SupersededHeldReason::Named => 0,
+            SupersededHeldReason::UnreadableHead => 1,
+        }
+    }
+
+    /// The `reason` label value.
+    pub fn name(self) -> &'static str {
+        match self {
+            SupersededHeldReason::Named => "named",
+            SupersededHeldReason::UnreadableHead => "unreadable_head",
+        }
+    }
+
+    fn count(self, report: &ravel_maintain::SweepReport) -> usize {
+        match self {
+            SupersededHeldReason::Named => report.superseded_held_by_snapshot,
+            SupersededHeldReason::UnreadableHead => report.superseded_held_by_unreadable_head,
+        }
+    }
+}
+
+/// Rule 2's refusal and hold totals for one member of
+/// [`UNMAINTAINED_SWEPT_SIGNALS`], read in one call for the snapshot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UnmaintainedSupersededCounts {
+    pub deletes_refused: u64,
+    pub held_named: u64,
+    pub held_unreadable_head: u64,
+    pub groups_held_by_legal_hold: u64,
 }
 
 /// The signals whose one shard the maintain tick runs `sweep_shard` over
@@ -351,6 +421,48 @@ impl MaintenanceSafetyMetrics {
         if let Some(index) = unmaintained_swept_index(signal) {
             self.unmaintained_orphan_breaker_trips[index].fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Rule 2's refusal and hold totals on `signal`'s one swept shard, for a
+    /// member of [`UNMAINTAINED_SWEPT_SIGNALS`]; all zero for any other
+    /// signal, whose counts [`record_sweep`](Self::record_sweep) keeps.
+    pub fn unmaintained_superseded(&self, signal: Signal) -> UnmaintainedSupersededCounts {
+        unmaintained_swept_index(signal).map_or_else(UnmaintainedSupersededCounts::default, |i| {
+            let held = &self.unmaintained_superseded_inputs_held[i];
+            UnmaintainedSupersededCounts {
+                deletes_refused: self.unmaintained_superseded_deletes_refused[i]
+                    .load(Ordering::Relaxed),
+                held_named: held[SupersededHeldReason::Named.index()].load(Ordering::Relaxed),
+                held_unreadable_head: held[SupersededHeldReason::UnreadableHead.index()]
+                    .load(Ordering::Relaxed),
+                groups_held_by_legal_hold: self.unmaintained_superseded_groups_held_by_legal_hold
+                    [i]
+                    .load(Ordering::Relaxed),
+            }
+        })
+    }
+
+    /// Add one `sweep_shard` pass's rule 2 refusal and hold counts for a member
+    /// of [`UNMAINTAINED_SWEPT_SIGNALS`]. Any other signal is a no-op: its
+    /// counts go through [`record_sweep`](Self::record_sweep).
+    pub fn record_unmaintained_superseded(
+        &self,
+        signal: Signal,
+        report: &ravel_maintain::SweepReport,
+    ) {
+        let Some(index) = unmaintained_swept_index(signal) else {
+            return;
+        };
+        self.unmaintained_superseded_deletes_refused[index]
+            .fetch_add(report.superseded_deletes_refused as u64, Ordering::Relaxed);
+        for reason in SupersededHeldReason::ALL {
+            self.unmaintained_superseded_inputs_held[index][reason.index()]
+                .fetch_add(reason.count(report) as u64, Ordering::Relaxed);
+        }
+        self.unmaintained_superseded_groups_held_by_legal_hold[index].fetch_add(
+            report.superseded_groups_held_by_legal_hold as u64,
+            Ordering::Relaxed,
+        );
     }
 
     pub fn legal_hold_refresh_failures(&self) -> u64 {
@@ -455,6 +567,39 @@ impl MaintenanceSafetyMetrics {
     /// [`orphans_quarantine_refused`]: Self::orphans_quarantine_refused
     pub fn superseded_deletes_refused(&self, signal: Signal) -> u64 {
         self.superseded_deletes_refused[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Objects rule 2 held for `reason`, summed over every sweep pass for
+    /// `signal`. A held object is counted again on every pass that holds it,
+    /// so this is held objects times passes: the operator question is whether
+    /// the rate stays above zero, not the total.
+    pub fn superseded_inputs_held(&self, signal: Signal, reason: SupersededHeldReason) -> u64 {
+        self.superseded_inputs_held[signal_index(signal)][reason.index()].load(Ordering::Relaxed)
+    }
+
+    /// Chain groups rule 2 skipped whole because a legal hold protects a key in
+    /// them, summed over every sweep pass for `signal`. Counted per pass, like
+    /// [`superseded_inputs_held`](Self::superseded_inputs_held).
+    pub fn superseded_groups_held_by_legal_hold(&self, signal: Signal) -> u64 {
+        self.superseded_groups_held_by_legal_hold[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// `.dreq`s the erasure-request sweep kept past their horizon because a
+    /// superseded input of one of their rewrites is still present, summed over
+    /// every pass for `signal`. Counted per pass, like
+    /// [`superseded_inputs_held`](Self::superseded_inputs_held).
+    pub fn dreq_held_by_superseded_inputs(&self, signal: Signal) -> u64 {
+        self.dreq_held_by_superseded_inputs[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// One `sweep_erasure_requests` result for `signal`.
+    pub fn record_erasure_sweep(
+        &self,
+        signal: Signal,
+        outcome: &ravel_maintain::ErasureRequestSweepOutcome,
+    ) {
+        self.dreq_held_by_superseded_inputs[signal_index(signal)]
+            .fetch_add(outcome.held_by_superseded_inputs as u64, Ordering::Relaxed);
     }
 
     /// Objects physically deleted from `quarantine/` past the quarantine
@@ -618,8 +763,8 @@ impl MaintenanceSafetyMetrics {
     /// this pass's counts (`store`, never `fetch_add`), matching
     /// [`orphans_withheld`]'s and [`orphans_present`]'s docs on why neither
     /// gauge alone can be read as "resolved". The trip counter, the three
-    /// quarantine counters and the superseded-delete refusal counter
-    /// accumulate (`fetch_add`): each counts events the
+    /// quarantine counters, the superseded-delete refusal counter and the two
+    /// superseded hold counters accumulate (`fetch_add`): each counts events the
     /// pass performed, which a later quiet pass does not undo, and
     /// [`SweepReport`] reports them per pass rather than as running totals, so
     /// the running total has to be kept here.
@@ -657,6 +802,14 @@ impl MaintenanceSafetyMetrics {
             .fetch_add(report.orphans_quarantine_refused as u64, Ordering::Relaxed);
         self.superseded_deletes_refused[index]
             .fetch_add(report.superseded_deletes_refused as u64, Ordering::Relaxed);
+        for reason in SupersededHeldReason::ALL {
+            self.superseded_inputs_held[index][reason.index()]
+                .fetch_add(reason.count(report) as u64, Ordering::Relaxed);
+        }
+        self.superseded_groups_held_by_legal_hold[index].fetch_add(
+            report.superseded_groups_held_by_legal_hold as u64,
+            Ordering::Relaxed,
+        );
         self.quarantine_reaped[index].fetch_add(report.quarantine_reaped as u64, Ordering::Relaxed);
 
         // The `kind`-labeled deleted-objects family (issue #1729): the four
@@ -2365,6 +2518,7 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
                 signal,
                 scan_shards,
                 memo,
+                safety,
             )
             .await;
         }
@@ -2389,7 +2543,8 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
     // shard blocks it. Logged, not folded into `MaintainReport` (whose fields
     // describe the data-signal passes), and kept out of
     // `MaintenanceSafetyMetrics`' per-signal arrays, which cover only
-    // MAINTAINED_SIGNALS; a breaker trip here is counted apart from them.
+    // MAINTAINED_SIGNALS; a breaker trip and rule 2's refusals and holds here
+    // are counted apart from them, under `signal="audit"`.
     if worker.owns_unit(live_set, tenant, Signal::Audit, QUERY_AUDIT_SHARD) {
         match sweep_audit_retention(store, clock, compactor, &hold, tenant).await {
             Ok(outcome) => tracing::info!(
@@ -2447,6 +2602,7 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
                     superseded_records = report.superseded_records_deleted,
                     superseded_data = report.superseded_data_deleted,
                     unreferenced_parts = report.unreferenced_parts_deleted,
+                    superseded_deletes_refused = report.superseded_deletes_refused,
                     "maintenance: query-audit input-cleanup sweep complete"
                 );
                 report_unmaintained_breaker_trip(
@@ -2456,6 +2612,7 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
                     QUERY_AUDIT_SHARD,
                     &report,
                 );
+                safety.record_unmaintained_superseded(Signal::Audit, &report);
             }
             Err(err) => tracing::warn!(
                 tenant = %tenant.to_hex(),
@@ -2534,6 +2691,7 @@ async fn run_alert_retention(
                 "maintenance: alerts shard orphan sweep complete"
             );
             report_unmaintained_breaker_trip(safety, tenant, Signal::Alerts, ALERT_SHARD, &report);
+            safety.record_unmaintained_superseded(Signal::Alerts, &report);
         }
         Err(err) => tracing::warn!(
             tenant = %tenant.to_hex(),
@@ -3107,6 +3265,7 @@ async fn run_erasure_pass(
     signal: Signal,
     scan_shards: u32,
     memo: &mut MaintainMemo,
+    safety: &MaintenanceSafetyMetrics,
 ) {
     match pending_erasure_requests(store, tenant, signal).await {
         Ok(pending) if !pending.is_empty() => {
@@ -3226,13 +3385,17 @@ async fn run_erasure_pass(
     // pending: a request completed by an earlier tick no longer appears in
     // `pending_erasure_requests`, and its `.dreq` still needs sweeping.
     match sweep_erasure_requests(store, clock, compactor, hold, tenant, signal).await {
-        Ok(outcome) => tracing::info!(
-            tenant = %tenant.to_hex(),
-            signal = ?signal,
-            deleted = outcome.deleted,
-            kept = outcome.kept,
-            "maintenance: erasure request sweep pass complete"
-        ),
+        Ok(outcome) => {
+            tracing::info!(
+                tenant = %tenant.to_hex(),
+                signal = ?signal,
+                deleted = outcome.deleted,
+                kept = outcome.kept,
+                held_by_superseded_inputs = outcome.held_by_superseded_inputs,
+                "maintenance: erasure request sweep pass complete"
+            );
+            safety.record_erasure_sweep(signal, &outcome);
+        }
         Err(err) => tracing::warn!(
             tenant = %tenant.to_hex(),
             signal = ?signal,
@@ -5203,6 +5366,7 @@ mod tests {
             Signal::Metrics,
             1,
             &mut memo,
+            &MaintenanceSafetyMetrics::default(),
         )
         .await;
 
@@ -5278,6 +5442,7 @@ mod tests {
             Signal::Metrics,
             1,
             &mut memo,
+            &MaintenanceSafetyMetrics::default(),
         )
         .await;
 
@@ -5315,6 +5480,7 @@ mod tests {
             Signal::Metrics,
             1,
             &mut memo,
+            &MaintenanceSafetyMetrics::default(),
         )
         .await;
 

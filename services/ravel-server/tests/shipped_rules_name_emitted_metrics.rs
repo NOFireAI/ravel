@@ -132,8 +132,8 @@ const DASHBOARD_FILE: &str = concat!(
 /// nothing. `deploy/README.md` states the row and name figures.
 const EXPECTED_DASHBOARD_ROWS: usize = 6;
 const EXPECTED_DASHBOARD_PANELS: usize = 36;
-const EXPECTED_DASHBOARD_TARGETS: usize = 109;
-const EXPECTED_DASHBOARD_METRIC_NAMES: usize = 112;
+const EXPECTED_DASHBOARD_TARGETS: usize = 113;
+const EXPECTED_DASHBOARD_METRIC_NAMES: usize = 116;
 
 /// Families the dashboard graphs that no shipped rule alerts on.
 ///
@@ -143,7 +143,7 @@ const EXPECTED_DASHBOARD_METRIC_NAMES: usize = 112;
 /// threshold should page on. The complement is asserted in the other
 /// direction: every name the rule file alerts on is graphed somewhere here,
 /// so a page always has a panel to land on.
-const EXPECTED_DASHBOARD_ONLY_NAMES: usize = 71;
+const EXPECTED_DASHBOARD_ONLY_NAMES: usize = 75;
 
 /// Fenced `yaml` blocks in the guide, and the alert rules they hold between
 /// them. Pinned so that an extractor that matches no block, or a block that
