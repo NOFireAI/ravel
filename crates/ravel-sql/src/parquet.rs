@@ -643,10 +643,16 @@ pub(crate) async fn first_live_table(
 
 /// The cost of a resolved Parquet statement that is known before any file is
 /// read: the `resolve_requests` its resolve made, plus one GET for each file
-/// its manifests name, since a scan opens every file. The request figure is a
-/// floor, not a ceiling: a file whose footer is not cached costs another GET,
-/// and so does each column chunk. `estimated_store_bytes` is the total size of
-/// the files, which bounds the bytes a scan can read.
+/// its manifests name, since a scan opens every file. Like the segment cost
+/// estimators in `cost.rs`, the request figure assumes a cold cache and a
+/// full scan of every named file: a cached footer or column chunk costs no
+/// GET, and a `LIMIT` that stops the scan before every file opens costs
+/// fewer, so the actual count can land under this figure as well as over it
+/// (an uncached footer and each column chunk still cost more).
+/// `estimated_store_bytes` is the total size of the files, which bounds a
+/// cold-cache full scan's bytes: a range read again after eviction, or a
+/// footer re-read when the metadata cache is too small, reads bytes this
+/// figure already counted once.
 pub(crate) fn estimate_cost(resolution: &ParquetResolution, resolve_requests: u64) -> CostEstimate {
     let mut files = 0u64;
     let mut bytes = 0u64;
