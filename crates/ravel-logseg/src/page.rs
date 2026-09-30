@@ -26,6 +26,84 @@ pub struct PageDesc {
     pub uncomp_len: u64,
 }
 
+/// The zstd frame the envelope stores for `encoded`, or `None` when it stays
+/// raw: below [`COMPRESSION_FLOOR`], when zstd is not strictly smaller, or on a
+/// compression backend error.
+fn compress_if_smaller(encoded: &[u8], zstd_level: i32) -> Option<Vec<u8>> {
+    if encoded.len() < COMPRESSION_FLOOR {
+        return None;
+    }
+    match zstd::bulk::compress(encoded, zstd_level) {
+        Ok(z) if z.len() < encoded.len() => Some(z),
+        _ => None,
+    }
+}
+
+/// One candidate encoding of a page after the compression envelope: exactly
+/// the bytes [`write_page`] would store for it, held so the writer can compare
+/// candidates by stored size and then place the winner without compressing it
+/// a second time (ADR-2135 decision 4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealedPage {
+    pub enc: Enc,
+    pub comp: u8,
+    pub stored: Vec<u8>,
+    pub uncomp_len: u64,
+}
+
+impl SealedPage {
+    /// Appends the stored bytes to `out` and returns the page's descriptor.
+    pub fn append(&self, out: &mut Vec<u8>, column_id: u32) -> PageDesc {
+        out.extend_from_slice(&self.stored);
+        PageDesc {
+            column_id,
+            enc: self.enc,
+            comp: self.comp,
+            len: self.stored.len() as u64,
+            uncomp_len: self.uncomp_len,
+        }
+    }
+}
+
+/// Passes one encoded page through the envelope, with the same floor and
+/// strictly-smaller rule as [`write_page`].
+pub fn seal_page(enc: Enc, encoded: Vec<u8>, zstd_level: i32) -> SealedPage {
+    let uncomp_len = encoded.len() as u64;
+    match compress_if_smaller(&encoded, zstd_level) {
+        Some(z) => SealedPage {
+            enc,
+            comp: COMP_ZSTD,
+            stored: z,
+            uncomp_len,
+        },
+        None => SealedPage {
+            enc,
+            comp: COMP_NONE,
+            stored: encoded,
+            uncomp_len,
+        },
+    }
+}
+
+/// Seals every candidate and keeps the one with the fewest stored bytes. The
+/// candidates come in priority order and a later one replaces the current best
+/// only when strictly smaller, so a tie goes to the earlier candidate. `None`
+/// only for an empty candidate list.
+pub fn smallest_stored(
+    candidates: impl IntoIterator<Item = (Enc, Vec<u8>)>,
+    zstd_level: i32,
+) -> Option<SealedPage> {
+    let mut best: Option<SealedPage> = None;
+    for (enc, encoded) in candidates {
+        let sealed = seal_page(enc, encoded, zstd_level);
+        match &best {
+            Some(b) if sealed.stored.len() >= b.stored.len() => {}
+            _ => best = Some(sealed),
+        }
+    }
+    best
+}
+
 /// Appends one page's stored bytes to `out` and returns its descriptor.
 ///
 /// Compresses with zstd only when `encoded.len() >= COMPRESSION_FLOOR` and the
@@ -40,14 +118,11 @@ pub fn write_page(
     zstd_level: i32,
 ) -> PageDesc {
     let uncomp_len = encoded.len() as u64;
-    let (comp, stored): (u8, std::borrow::Cow<'_, [u8]>) = if encoded.len() >= COMPRESSION_FLOOR {
-        match zstd::bulk::compress(encoded, zstd_level) {
-            Ok(z) if z.len() < encoded.len() => (COMP_ZSTD, std::borrow::Cow::Owned(z)),
-            _ => (COMP_NONE, std::borrow::Cow::Borrowed(encoded)),
-        }
-    } else {
-        (COMP_NONE, std::borrow::Cow::Borrowed(encoded))
-    };
+    let (comp, stored): (u8, std::borrow::Cow<'_, [u8]>) =
+        match compress_if_smaller(encoded, zstd_level) {
+            Some(z) => (COMP_ZSTD, std::borrow::Cow::Owned(z)),
+            None => (COMP_NONE, std::borrow::Cow::Borrowed(encoded)),
+        };
     let len = stored.len() as u64;
     out.extend_from_slice(&stored);
     PageDesc {

@@ -26,6 +26,7 @@ pub mod ranged;
 pub mod reader;
 pub mod record;
 pub mod rlog_bloom;
+pub mod rlog_codec;
 pub mod skip_index;
 pub mod source;
 pub mod stream_dir;
