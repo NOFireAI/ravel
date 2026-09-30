@@ -1529,7 +1529,7 @@ async fn put_completed_request(store: &dyn ObjectStoreBackend, b: &Bucket, id: U
 /// hold names R's request and no truncated bucket, and rule 6 on the
 /// production path retires an unrelated request past its horizon.
 ///
-/// Flipped line: `truncated: !matches!(...)` in
+/// Flipped line: `truncated: absent_link_cuts_chain(absent_key)` in
 /// `SupersededGroup::over_absent_predecessor` (sweep.rs) set back to
 /// `truncated: true`. The held group then reports its bucket as truncated,
 /// and rule 6 keeps the unrelated `.dreq`.
@@ -1652,4 +1652,265 @@ async fn sweep_deletes_a_key_two_groups_share_once() {
             rewrite_part_key(&r3),
         ])
     );
+}
+
+/// `count` rewrites in `b`, the first naming `below` and each later one the
+/// one before it, applying requests `first_request`, `first_request + 1`, and
+/// so on. Returns them bottom first.
+async fn put_rewrites_over(
+    store: &dyn ObjectStoreBackend,
+    b: &Bucket,
+    below: &str,
+    count: usize,
+    first_request: u128,
+) -> Vec<RewriteRecord> {
+    let base = hour_ns();
+    let mut below = below.to_string();
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let r = put_rewrite(
+            store,
+            b,
+            &below,
+            Uuid::from_u128(first_request + i as u128),
+            part(i as u8, base, base + 10),
+        )
+        .await;
+        below = rewrite_key(&r);
+        out.push(r);
+    }
+    out
+}
+
+/// One shard, two buckets: raw inputs `a` and `b` under a version 1 C1 in
+/// the logs hour, and 65 rewrites over a version 1 C0 in the next hour, a
+/// chain the catalog's rewrite chase refuses as past its depth bound. Past
+/// every horizon the pass returns `Ok`, reclaims `a` and `b` (two commit
+/// records, two data objects), and reports the over-deep chain as held: the
+/// top rewrite's request, which is the only rewrite a deleting pass enters,
+/// and its bucket as truncated. Nothing in the over-deep bucket is deleted.
+///
+/// Flipped line: `return Ok(ChainWalk::Refused(ChainRefusal::TooDeep))` in
+/// `gather_superseded_chain` (sweep.rs) turned back into an
+/// `Err(MaintainError::Invariant(..))`. The pass then fails with "supersession
+/// chain from ... is longer than 64 records" and reclaims nothing, `a` and
+/// `b` included.
+#[tokio::test]
+async fn sweep_holds_an_over_deep_rewrite_chain_and_reclaims_the_other_buckets() {
+    let store = Arc::new(MemoryStore::new());
+    let ordinary = logs_bucket();
+    let deep = Bucket {
+        ingest_hour_bucket: HOUR + 1,
+        ..logs_bucket()
+    };
+    let base = hour_ns();
+    let inputs = seed_inputs(store.as_ref(), &[(0xF1, 1), (0xF2, 2)]).await;
+    let c1 = version_1(
+        &ordinary,
+        vec![input(0xF1, 1), input(0xF2, 2)],
+        0x00,
+        part(0xc1, base, base + 10_000),
+    );
+    let c1_key = put_compaction(store.as_ref(), &c1).await;
+    let c0 = version_1(
+        &deep,
+        vec![input(0xF3, 1)],
+        0x00,
+        part(0xc0, base, base + 10),
+    );
+    let c0_key = put_compaction(store.as_ref(), &c0).await;
+    let chain = put_rewrites_over(store.as_ref(), &deep, &c0_key, 65, 0x1_0000).await;
+    let top_request = chain.last().expect("a rewrite").drops[0].request_id.clone();
+    let before = bucket_keys(store.as_ref()).await;
+
+    let outcome = sweep_at(store.as_ref(), &ordinary, past_horizon_ns(), &NoLeases).await;
+    assert_eq!(
+        outcome,
+        SupersededSweepOutcome {
+            records_deleted: 2,
+            data_deleted: 2,
+            held_request_ids: BTreeSet::from([top_request]),
+            held_truncated_buckets: BTreeSet::from([HeldBucket {
+                shard: deep.shard,
+                ingest_hour_bucket: deep.ingest_hour_bucket,
+            }]),
+            ..SupersededSweepOutcome::default()
+        }
+    );
+    let mut expected = before;
+    for (commit, data) in &inputs {
+        assert!(expected.remove(commit) && expected.remove(data));
+    }
+    assert_eq!(bucket_keys(store.as_ref()).await, expected);
+    assert!(expected.contains(&c1_key) && expected.contains(&c0_key));
+}
+
+/// Rule 6 on the production path (`sweep_erasure_requests`) for `b`'s
+/// signal, past every horizon under `lease`: `(deleted, kept,
+/// held_by_superseded_inputs)`.
+async fn rule_6(
+    store: &dyn ObjectStoreBackend,
+    b: &Bucket,
+    lease: &dyn LeaseCheck,
+) -> (usize, usize, usize) {
+    let outcome = sweep_erasure_requests(
+        store,
+        &FixedClock::new(past_horizon_ns()),
+        &cfg(),
+        lease,
+        &b.tenant_hash,
+        b.signal,
+    )
+    .await
+    .expect("rule 6");
+    (
+        outcome.deleted,
+        outcome.kept,
+        outcome.held_by_superseded_inputs,
+    )
+}
+
+/// The unresolved bucket of
+/// [`sweep_does_not_follow_a_version_2_link_in_an_unresolved_bucket`], with a
+/// completed `.dreq` for R's request past its horizon, and a completed `.dreq`
+/// in the metrics signal, which holds no chain. With no HEAD, rule 6 on the
+/// production path keeps R's `.dreq`, exactly as a caller handing it the
+/// deleting pass's holds would, and retires the metrics one.
+///
+/// Flipped line: the `Version2Links::Refuse` choice in rule 2's rewrite arm
+/// (sweep.rs) narrowed back to `deleting && version_2.unresolved.contains(..)`.
+/// The observing pass then follows R's chain through C2 to C1, the HEAD gate
+/// clears it, nothing is held, and R's `.dreq` is retired: `(1, 0, 0)`.
+#[tokio::test]
+async fn rule_6_keeps_a_request_whose_chain_the_observing_pass_refuses() {
+    let store = Arc::new(MemoryStore::new());
+    let b = logs_bucket();
+    let base = hour_ns();
+    seed_inputs(store.as_ref(), &[(0x65, 1), (0x66, 2), (0x67, 3)]).await;
+    let c1 = version_1(
+        &b,
+        vec![input(0x65, 1), input(0x66, 2)],
+        0x00,
+        part(0xc1, base, base + 10_000),
+    );
+    let c1_key = put_compaction(store.as_ref(), &c1).await;
+    let c2 = version_2(
+        &c1,
+        &c1_key,
+        vec![input(0x65, 1), input(0x66, 2), input(0x67, 3)],
+        part(0xc2, base, base + 10_000),
+    );
+    let c2_key = put_compaction(store.as_ref(), &c2).await;
+    let request = Uuid::from_u128(0xf8);
+    put_rewrite(
+        store.as_ref(),
+        &b,
+        &c2_key,
+        request,
+        part(0x0e, base, base + 10_000),
+    )
+    .await;
+    put_completed_request(store.as_ref(), &b, request).await;
+    let metrics = Bucket {
+        signal: Signal::Metrics,
+        ..logs_bucket()
+    };
+    let metrics_dreq = put_completed_request(store.as_ref(), &metrics, Uuid::from_u128(0xf9)).await;
+    let before = bucket_keys(store.as_ref()).await;
+
+    assert_eq!(rule_6(store.as_ref(), &b, &NoLeases).await, (0, 1, 1));
+    assert_eq!(rule_6(store.as_ref(), &metrics, &NoLeases).await, (1, 0, 0));
+    let mut expected = before;
+    expected.remove(&metrics_dreq);
+    assert_eq!(bucket_keys(store.as_ref()).await, expected);
+}
+
+/// 65 rewrites over a version 2 C2 over C1: the catalog refuses the rewrite
+/// chase as past its depth bound, so the bucket's erasure dominance, and with
+/// it its version 2 supersession, does not resolve. Past every horizon, with
+/// no HEAD, rule 6 on the production path returns `Ok`, keeps an unrelated
+/// `.dreq` of the logs signal past its horizon (the chain is held in a
+/// truncated bucket), and retires one in the metrics signal, which holds no
+/// chain. The observation deletes nothing.
+///
+/// Flipped line: `return Ok(ChainWalk::Refused(ChainRefusal::TooDeep))` in
+/// `gather_superseded_chain` (sweep.rs) turned back into an
+/// `Err(MaintainError::Invariant(..))`. The top rewrite's walk meets the bound
+/// before it reaches C2, the observing pass fails, and so does rule 6 for the
+/// logs signal.
+#[tokio::test]
+async fn rule_6_survives_an_over_deep_chain_in_an_unresolved_bucket() {
+    let store = Arc::new(MemoryStore::new());
+    let b = logs_bucket();
+    let base = hour_ns();
+    let c1 = version_1(&b, vec![input(0xFA, 1)], 0xff, part(0xc1, base, base + 10));
+    let c1_key = put_compaction(store.as_ref(), &c1).await;
+    let c2 = version_2(&c1, &c1_key, c1.inputs.clone(), part(0xc2, base, base + 10));
+    let c2_key = put_compaction(store.as_ref(), &c2).await;
+    let chain = put_rewrites_over(store.as_ref(), &b, &c2_key, 65, 0x2_0000).await;
+    let compactions = vec![(c1_key, c1), (c2_key, c2)];
+    let rewrites: Vec<(String, RewriteRecord)> =
+        chain.into_iter().map(|r| (rewrite_key(&r), r)).collect();
+    assert!(
+        ravel_catalog::erasure_dominated_compaction_records(&compactions, &rewrites, "bucket")
+            .is_err(),
+        "the bucket's erasure dominance must not resolve"
+    );
+    put_completed_request(store.as_ref(), &b, Uuid::from_u128(0xfb)).await;
+    let metrics = Bucket {
+        signal: Signal::Metrics,
+        ..logs_bucket()
+    };
+    let metrics_dreq = put_completed_request(store.as_ref(), &metrics, Uuid::from_u128(0xfc)).await;
+    let before = bucket_keys(store.as_ref()).await;
+
+    assert_eq!(rule_6(store.as_ref(), &b, &NoLeases).await, (0, 1, 1));
+    assert_eq!(rule_6(store.as_ref(), &metrics, &NoLeases).await, (1, 0, 0));
+    let mut expected = before;
+    expected.remove(&metrics_dreq);
+    assert_eq!(bucket_keys(store.as_ref()).await, expected);
+}
+
+/// R2 over R1 over a C that is already gone, with a legal hold on R1's record
+/// holding R2's chain group. C is a compaction record, which applied no
+/// erasure request, so the group is held but not truncated: the hold names
+/// R1's and R2's requests and no bucket. Rule 6 on the production path keeps
+/// R1's `.dreq` and retires an unrelated one, both past their horizon.
+///
+/// Flipped line: `None => truncated = absent_link_cuts_chain(&key)` in
+/// `gather_superseded_chain` (sweep.rs) set back to `truncated = true`. The
+/// deleting pass's outcome then names the bucket in `held_truncated_buckets`,
+/// and rule 6 would keep the unrelated `.dreq` too.
+#[tokio::test]
+async fn a_rewrite_chain_over_an_absent_compaction_record_is_not_truncated() {
+    let store = Arc::new(MemoryStore::new());
+    let b = logs_bucket();
+    let base = hour_ns();
+    let c = version_1(&b, vec![input(0xFD, 1)], 0xff, part(0xc1, base, base + 10));
+    // Never put: an earlier pass reclaimed it.
+    let c_key = keys::compaction_record_key_for(&c).unwrap();
+    let chain = put_rewrites_over(store.as_ref(), &b, &c_key, 2, 0x3_0000).await;
+    let (r1, r2) = (&chain[0], &chain[1]);
+    let r1_request = Uuid::parse_str(&r1.drops[0].request_id).unwrap();
+    let r2_request = Uuid::parse_str(&r2.drops[0].request_id).unwrap();
+    let hold = HoldKey(rewrite_key(r1));
+    put_completed_request(store.as_ref(), &b, r1_request).await;
+    let unrelated_dreq = put_completed_request(store.as_ref(), &b, Uuid::from_u128(0xfe)).await;
+    let before = bucket_keys(store.as_ref()).await;
+
+    let outcome = sweep_at(store.as_ref(), &b, past_horizon_ns(), &hold).await;
+    assert_eq!(
+        outcome,
+        SupersededSweepOutcome {
+            chain_groups_held_by_legal_hold: 1,
+            held_request_ids: BTreeSet::from([r1_request.to_string(), r2_request.to_string()]),
+            ..SupersededSweepOutcome::default()
+        }
+    );
+    assert_eq!(bucket_keys(store.as_ref()).await, before);
+
+    assert_eq!(rule_6(store.as_ref(), &b, &hold).await, (1, 1, 1));
+    let mut expected = before;
+    expected.remove(&unrelated_dreq);
+    assert_eq!(bucket_keys(store.as_ref()).await, expected);
 }
