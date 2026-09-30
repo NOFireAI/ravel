@@ -216,6 +216,14 @@ pub fn build(input: NewCommitRecord) -> Result<CommitRecord, RecordError> {
 /// a flush that spans into a later hour (bounded elsewhere by
 /// `max_flush_lifetime`) still validates.
 pub fn validate(record: &CommitRecord) -> Result<(), RecordError> {
+    // First: a newer version may change any field's shape, so a record it
+    // wrote must fail as a newer version, not as a corrupt field.
+    if record.format_version != FORMAT_VERSION {
+        return Err(RecordError::UnsupportedFormatVersion {
+            expected: FORMAT_VERSION,
+            actual: record.format_version,
+        });
+    }
     if record.tenant_hash.len() != 16 {
         return Err(RecordError::InvalidTenantHashLen(record.tenant_hash.len()));
     }
@@ -223,12 +231,6 @@ pub fn validate(record: &CommitRecord) -> Result<(), RecordError> {
         return Err(RecordError::InvalidContentHashLen(
             record.content_hash.len(),
         ));
-    }
-    if record.format_version != FORMAT_VERSION {
-        return Err(RecordError::UnsupportedFormatVersion {
-            expected: FORMAT_VERSION,
-            actual: record.format_version,
-        });
     }
     if record.min_event_ts_ns > record.max_event_ts_ns {
         return Err(RecordError::EventTsOutOfOrder {
@@ -494,6 +496,38 @@ mod tests {
     }
 
     #[test]
+    fn validate_checks_format_version_before_hash_lengths() {
+        let mut record = build(base_input()).expect("valid record");
+        record.format_version = 2;
+        record.tenant_hash = vec![0; 15];
+        record.content_hash = vec![0; 31];
+        assert_eq!(
+            validate(&record),
+            Err(RecordError::UnsupportedFormatVersion {
+                expected: 1,
+                actual: 2
+            })
+        );
+        let bytes = record.encode_to_vec();
+        assert_eq!(
+            decode(&bytes),
+            Err(RecordError::UnsupportedFormatVersion {
+                expected: 1,
+                actual: 2
+            })
+        );
+
+        record.tenant_hash = vec![0; 16];
+        assert_eq!(
+            validate(&record),
+            Err(RecordError::UnsupportedFormatVersion {
+                expected: 1,
+                actual: 2
+            })
+        );
+    }
+
+    #[test]
     fn validate_rejects_event_ts_out_of_order() {
         let mut record = build(base_input()).expect("valid record");
         record.min_event_ts_ns = 5_000;
@@ -615,6 +649,22 @@ mod tests {
                 min: 1,
                 max: 2,
                 actual: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn compaction_checks_format_version_before_tenant_hash_len() {
+        let mut record = sample_compaction();
+        record.format_version = 3;
+        record.tenant_hash = vec![0; 15];
+        assert_eq!(
+            validate_compaction(&record),
+            Err(RecordError::UnsupportedRecordFormatVersion {
+                kind: RecordKind::Compaction,
+                min: 1,
+                max: 2,
+                actual: 3,
             })
         );
     }
@@ -1065,6 +1115,22 @@ mod tests {
                 min: 1,
                 max: 1,
                 actual: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn tombstone_checks_format_version_before_tenant_hash_len() {
+        let mut record = sample_tombstone();
+        record.format_version = 2;
+        record.tenant_hash = vec![0; 15];
+        assert_eq!(
+            validate_tombstone(&record),
+            Err(RecordError::UnsupportedRecordFormatVersion {
+                kind: RecordKind::RetentionTombstone,
+                min: 1,
+                max: 1,
+                actual: 2,
             })
         );
     }
