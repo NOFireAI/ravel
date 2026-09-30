@@ -265,12 +265,45 @@ pub async fn retention_sweep_bucket_with_reach(
     lease: &dyn LeaseCheck,
     bucket: &Bucket,
 ) -> Result<RetentionOutcome> {
+    let (outcome, _expiry) =
+        retention_sweep_bucket_observed(reach, store, clock, config, window_ns, lease, bucket)
+            .await?;
+    Ok(outcome)
+}
+
+/// When an expired bucket expired, as far as one retention evaluation knows
+/// it without a request beyond the ones the evaluation already made. Feeds the
+/// scan's retention lag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObservedExpiry {
+    /// `max_event_ts + window` from the bucket's own records, which the pass
+    /// that writes the tombstone reads to decide expiry.
+    Exact(i64),
+    /// The tombstone's `retired_at_ns`. The tombstone records no event
+    /// timestamp, but it is written only once the bucket has expired, so the
+    /// expiry is at or before this instant.
+    NoLaterThan(i64),
+}
+
+/// [`retention_sweep_bucket_with_reach`], also returning the bucket's
+/// [`ObservedExpiry`] on every outcome that leaves an expired bucket present
+/// or retires it, and `None` on the rest.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn retention_sweep_bucket_observed(
+    reach: &mut SnapshotReachability,
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    window_ns: Option<i64>,
+    lease: &dyn LeaseCheck,
+    bucket: &Bucket,
+) -> Result<(RetentionOutcome, Option<ObservedExpiry>)> {
     let Some(window_ns) = window_ns else {
-        return Ok(RetentionOutcome::NoPolicy);
+        return Ok((RetentionOutcome::NoPolicy, None));
     };
     let now = clock.now_ns();
     if !bucket.is_sealed(now, config) {
-        return Ok(RetentionOutcome::NotSealed);
+        return Ok((RetentionOutcome::NotSealed, None));
     }
 
     let listing = list_bucket(store, bucket).await?;
@@ -280,12 +313,13 @@ pub async fn retention_sweep_bucket_with_reach(
     // anchors on the compaction record's created_unix_ns.
     if let Some(tombstone_key) = &listing.tombstone_key {
         let tombstone = get_tombstone(store, tombstone_key).await?;
+        let expiry = Some(ObservedExpiry::NoLaterThan(tombstone.retired_at_ns));
         if now
             >= tombstone
                 .retired_at_ns
                 .saturating_add(config.protection_horizon_ns)
         {
-            return physical_sweep(
+            let outcome = physical_sweep(
                 reach,
                 store,
                 lease,
@@ -294,9 +328,10 @@ pub async fn retention_sweep_bucket_with_reach(
                 tombstone_key,
                 config.dry_run,
             )
-            .await;
+            .await?;
+            return Ok((outcome, expiry));
         }
-        return Ok(RetentionOutcome::Tombstoned);
+        return Ok((RetentionOutcome::Tombstoned, expiry));
     }
 
     // Not tombstoned: evaluate expiry from the bucket's records (no footer
@@ -315,11 +350,12 @@ pub async fn retention_sweep_bucket_with_reach(
     }
     let max_event = max_event_ts(&commit_records, &compaction_records, &rewrite_records);
     if !is_expired(max_event, now, window_ns) {
-        return Ok(RetentionOutcome::NotExpired);
+        return Ok((RetentionOutcome::NotExpired, None));
     }
 
     write_tombstone(store, bucket, now, window_ns, &listing, config.dry_run).await?;
-    Ok(RetentionOutcome::Tombstoned)
+    let expiry = max_event.map(|max| ObservedExpiry::Exact(max.saturating_add(window_ns)));
+    Ok((RetentionOutcome::Tombstoned, expiry))
 }
 
 /// Run retention before compaction over one bucket (ADR-0019 decision 6): the
@@ -371,8 +407,30 @@ pub async fn maintain_bucket_with_reach(
     Option<ClaimedCompaction>,
     Option<ClaimAcquisition>,
 )> {
-    let outcome =
-        retention_sweep_bucket_with_reach(reach, store, clock, config, window_ns, lease, bucket)
+    let (outcome, _expiry, compaction, acquisition) =
+        maintain_bucket_observed(reach, store, clock, config, window_ns, lease, bucket).await?;
+    Ok((outcome, compaction, acquisition))
+}
+
+/// [`maintain_bucket_with_reach`], also returning the retention evaluation's
+/// [`ObservedExpiry`] (see [`retention_sweep_bucket_observed`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn maintain_bucket_observed(
+    reach: &mut SnapshotReachability,
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    window_ns: Option<i64>,
+    lease: &dyn LeaseCheck,
+    bucket: &Bucket,
+) -> Result<(
+    RetentionOutcome,
+    Option<ObservedExpiry>,
+    Option<ClaimedCompaction>,
+    Option<ClaimAcquisition>,
+)> {
+    let (outcome, expiry) =
+        retention_sweep_bucket_observed(reach, store, clock, config, window_ns, lease, bucket)
             .await?;
     let (compaction, acquisition) = match outcome {
         // The bucket is (or is being) retired, or its delete is blocked by a
@@ -387,7 +445,7 @@ pub async fn maintain_bucket_with_reach(
             (Some(compaction), acquisition)
         }
     };
-    Ok((outcome, compaction, acquisition))
+    Ok((outcome, expiry, compaction, acquisition))
 }
 
 /// The maximum `max_event_ts_ns` across a bucket's L0 commit records,
