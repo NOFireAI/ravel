@@ -756,12 +756,13 @@ pub struct Cli {
 
     /// How often each tenant's fold task wakes up to check for newly sealed
     /// hours, in seconds. Read only in the modes that run that task, and
-    /// refused at startup in the two that do not.
+    /// refused at startup in the two that do not. Zero is refused at startup.
     #[arg(long, default_value_t = 300)]
     pub fold_interval_secs: u64,
 
     /// How often each tenant's maintenance task (`--mode maintain`) wakes up to
     /// run retention, compaction, and the sweeper over every shard, in seconds.
+    /// Zero is refused at startup.
     #[arg(long, default_value_t = 300)]
     pub maintain_interval_secs: u64,
 
@@ -932,7 +933,8 @@ pub struct Cli {
     pub alert_rules_file: Option<PathBuf>,
 
     /// How often each tenant's alert evaluator wakes up to evaluate every rule
-    /// configured for that tenant, in seconds (ADR-0043 decision 3).
+    /// configured for that tenant, in seconds (ADR-0043 decision 3). Zero is
+    /// refused at startup.
     #[arg(long, default_value_t = 60)]
     pub alert_eval_interval_secs: u64,
 
@@ -1006,7 +1008,8 @@ pub struct Cli {
     pub oidc_ddl_claim: Option<String>,
 
     /// How often the JWKS document is refetched, in seconds (ADR-0042
-    /// decision 6). Only used when OIDC is enabled.
+    /// decision 6). Only used when OIDC is enabled. Zero is refused at
+    /// startup.
     #[arg(long, default_value_t = 300)]
     pub oidc_jwks_refresh_interval_secs: u64,
 
@@ -5952,6 +5955,38 @@ impl Cli {
                  could never spawn a flush outside a drain. Set a positive count (8 is the \
                  default)."
             );
+        }
+
+        // Each of these loops sleeps a jittered copy of its interval between
+        // passes, and the jitter of a zero interval is zero too.
+        for (flag, secs, what) in [
+            (
+                "--fold-interval-secs",
+                self.fold_interval_secs,
+                "every tenant's fold task",
+            ),
+            (
+                "--maintain-interval-secs",
+                self.maintain_interval_secs,
+                "tenant discovery and maintenance against object storage",
+            ),
+            (
+                "--alert-eval-interval-secs",
+                self.alert_eval_interval_secs,
+                "every tenant's alert evaluator",
+            ),
+            (
+                "--oidc-jwks-refresh-interval-secs",
+                self.oidc_jwks_refresh_interval_secs,
+                "the JWKS refetch against the issuer",
+            ),
+        ] {
+            if secs == 0 {
+                anyhow::bail!(
+                    "{flag} '0' would run {what} back to back with no pause between passes \
+                     for the life of the process. Set a positive number of seconds."
+                );
+            }
         }
 
         // A --max-inflight-flushes above --max-queued-flushes is NOT refused
@@ -14218,6 +14253,54 @@ mod tests {
             err.to_string().contains("--max-queued-flushes"),
             "error names the flag: {err}"
         );
+    }
+
+    /// Asserts `flag 0` fails validate with a message naming the flag, and
+    /// that the flag's own default, passed explicitly, still validates.
+    fn assert_zero_interval_refused(flag: &str, default: &str) {
+        let err = cli(&[flag, "0"])
+            .validate()
+            .expect_err("a zero loop interval runs the loop without pause");
+        let text = err.to_string();
+        assert!(
+            text.starts_with(&format!("{flag} '0' would run ")),
+            "error names the flag: {text}"
+        );
+        cli(&[flag, default])
+            .validate()
+            .expect("the default interval still starts");
+    }
+
+    #[test]
+    fn zero_fold_interval_secs_fails_validate() {
+        assert_zero_interval_refused("--fold-interval-secs", "300");
+    }
+
+    #[test]
+    fn zero_maintain_interval_secs_fails_validate() {
+        assert_zero_interval_refused("--maintain-interval-secs", "300");
+    }
+
+    #[test]
+    fn zero_alert_eval_interval_secs_fails_validate() {
+        assert_zero_interval_refused("--alert-eval-interval-secs", "60");
+    }
+
+    #[test]
+    fn zero_oidc_jwks_refresh_interval_secs_fails_validate() {
+        assert_zero_interval_refused("--oidc-jwks-refresh-interval-secs", "300");
+    }
+
+    /// No interval flag passed at all: every generated default is positive, so
+    /// the zero-interval refusal never fires on a stock start.
+    #[test]
+    fn default_loop_intervals_validate() {
+        let parsed = cli(&[]);
+        assert_eq!(parsed.fold_interval_secs, 300);
+        assert_eq!(parsed.maintain_interval_secs, 300);
+        assert_eq!(parsed.alert_eval_interval_secs, 60);
+        assert_eq!(parsed.oidc_jwks_refresh_interval_secs, 300);
+        parsed.validate().expect("the default intervals start");
     }
 
     /// `spec.gateway.maxInflightFlushes: 16` is admissible on the shipped CRD
