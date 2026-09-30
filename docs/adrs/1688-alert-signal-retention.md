@@ -207,7 +207,8 @@ flowchart LR
 - The audit window still has no flag (ADR-0062 promised one; the server
   builds `CompactorConfig` with `..Default::default()` at
   `services/ravel-server/src/main.rs:314-320`). This ADR adds the alert flag
-  only and reports the audit gap rather than fixing it here.
+  only and reports the audit gap rather than fixing it here. The audit flag
+  amendment below records that the gap is now closed.
 - Follow-up tasks:
   1. `sweep_alert_retention` in `crates/ravel-maintain` taking a keep set,
      with `alert_retention_window_ns` on `CompactorConfig`; the acceptance
@@ -346,3 +347,19 @@ and too wide in another, and decision 6 at odds with where the counter decision
   only. The alerts shard's orphan sweep runs whatever the window, because the
   evaluator's interlock abandons late writes under `0` too and nothing else
   reclaims them.
+
+## Amendment (2026-09-30): the audit window has a flag
+
+<!-- amendment-applies: sections="Consequences" pointer="audit flag amendment" -->
+
+The Consequences section reported that the query-audit window had no flag.
+`ravel-server --audit-retention` now sets it, in the same shape as
+`--alert-retention`: unset keeps the 90-day default, `0` keeps every
+query-audit record, and an unparseable value is refused before the server
+writes anything to the bucket. Unlike `--alert-retention`, any nonzero window
+is accepted: the audit sweep deletes a whole immutable record only once its
+newest event is older than the window and the record is past the protection
+horizon, and each flush writes a new record, so no hour-seal hazard bounds the
+window from below. The
+audit sweep has no disabled value of its own, so `0` reaches the compactor as
+the largest window, whose expiry floor no record is older than.
