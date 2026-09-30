@@ -4673,16 +4673,17 @@ thread_local! {
     static CELL_TEXT_VALIDATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// A `Str` cell's bytes as text, or `None` when they are not UTF-8. Every UTF-8
-/// validation of a declared `Str` cell or dictionary entry goes through here.
+/// A `Str` cell's bytes as text, or `None` when they are not UTF-8. The
+/// columnar path validates every attribute `Str` cell and dictionary entry
+/// through here.
 fn cell_text(bytes: &[u8]) -> Option<&str> {
     #[cfg(test)]
     CELL_TEXT_VALIDATIONS.with(|n| n.set(n.get() + 1));
     std::str::from_utf8(bytes).ok()
 }
 
-/// A `Str` FIELD_DIR column resolved once per block, whose cells' UTF-8 is
-/// validated at most once per block (ADR-2121 D3).
+/// A `Str` FIELD_DIR column resolved once per block, read so that a declared
+/// `Str` build validates each cell's UTF-8 at most once per block (ADR-2121 D3).
 ///
 /// On a dictionary page each entry is validated the first time any row or the
 /// dictionary build asks for it, and every later read of that entry, from the
@@ -7314,15 +7315,17 @@ mod tests {
         /// non-UTF-8 `Str` cells on plain pages and non-UTF-8 entries in page
         /// dictionaries ([`the_block_generator_reaches_every_case_the_property_names`]).
         ///
-        /// Flipped assertions, each seen failing:
+        /// Flipped assertions: each mutation below fails the chunk comparison
+        /// against the reference, first on an `I64` column:
         /// - the single-cursor gather taken without `single_matching`
         ///   (`single_cursor` returning `matching_cursor` alone): a row whose
-        ///   winning occurrence is of another type reads the declared cell;
+        ///   winning occurrence is of another type reads the declared cell or
+        ///   the fallback instead of NULL;
         /// - an absent cell appended as NULL instead of reading the
         ///   resource/scope value in the gather arms;
-        /// - `Str` presence reduced to "bytes present" (`Presence::Text` only
-        ///   when the cell's bytes validate, `Presence::Present` otherwise): a
-        ///   non-UTF-8 cell stops falling through to the resource/scope value.
+        /// - `Str` presence reduced to "bytes present" (a `Str` cell with bytes
+        ///   is `Presence::Present` even when they are not UTF-8): a non-UTF-8
+        ///   cell stops falling through to the resource/scope value.
         #[test]
         fn the_page_fast_path_builds_the_same_array_as_the_per_cell_path(block in block()) {
             let cfg = cfg();
@@ -7542,9 +7545,10 @@ mod tests {
     ///   search's `text`) counts 9 where 6 is expected;
     /// - a dictionary-page presence test that validates the row's entry bytes
     ///   (`cell_text(self.cells.at(i)?)` in `StrCursor::text_at`'s dictionary
-    ///   arm) counts one per present row on top of the entries;
-    /// - validating the dictionary per chunk (`OnceCell` dropped for a plain
-    ///   `cell_text` in `StrDictText::entry`) counts each entry twice.
+    ///   arm) counts one per row on top of the entries, 15 where 3 is expected;
+    /// - dropping the `OnceCell` from `StrDictText::entry` (a plain
+    ///   `cell_text` per call) validates each entry per chunk and per row, 18
+    ///   where 3 is expected.
     #[test]
     fn a_declared_str_cell_is_validated_at_most_once_per_block() {
         // Plain page, one occurrence: rows 1..=6 survive, and 1, 3, 4 and 6 of

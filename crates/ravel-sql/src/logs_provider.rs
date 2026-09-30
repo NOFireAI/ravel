@@ -2511,6 +2511,17 @@ mod tests {
                 .copied()
                 .unwrap_or(0)
         }
+
+        /// GETs on every key ending in `suffix`.
+        fn gets_with_suffix(&self, suffix: &str) -> u64 {
+            self.gets
+                .lock()
+                .expect("gets lock")
+                .iter()
+                .filter(|(k, _)| k.ends_with(suffix))
+                .map(|(_, n)| n)
+                .sum()
+        }
     }
 
     #[async_trait::async_trait]
@@ -2716,9 +2727,18 @@ mod tests {
         seq: u64,
         values: &[Option<i64>],
     ) -> SegmentRef {
-        let records = code_records(seq, values);
+        write_records_segment(store, key, seq, &code_records(seq, values)).await
+    }
+
+    /// [`write_code_segment`] for any `records`.
+    async fn write_records_segment(
+        store: &dyn ObjectStoreBackend,
+        key: &str,
+        seq: u64,
+        records: &[LogRecord],
+    ) -> SegmentRef {
         let mut w = RlogWriter::new(RlogConfig::default(), identity());
-        for r in &records {
+        for r in records {
             w.push(r.clone()).expect("push");
         }
         let bytes = w.finish().expect("finish");
@@ -2773,6 +2793,26 @@ mod tests {
         stats_pruning: bool,
         sql: &str,
     ) -> PruneRun {
+        run_pruned_with(
+            code_declared(),
+            inner,
+            segments,
+            column_stats,
+            stats_pruning,
+            sql,
+        )
+        .await
+    }
+
+    /// [`run_pruned`] with `declared` as the declared columns.
+    async fn run_pruned_with(
+        declared: Vec<DeclaredColumn>,
+        inner: &Arc<dyn ObjectStoreBackend>,
+        segments: Vec<SegmentRef>,
+        column_stats: Option<Arc<LoadedColumnStats>>,
+        stats_pruning: bool,
+        sql: &str,
+    ) -> PruneRun {
         let store = KeyCountingStore::new(Arc::clone(inner));
         let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&store) as _;
         let provider = LogsTableProvider::new(
@@ -2785,7 +2825,7 @@ mod tests {
             LogSegmentFetcher::new(backend),
             PhaseAccounting::pooled_over(&QueryAccounting::new()),
         )
-        .with_declared_columns(code_declared())
+        .with_declared_columns(declared)
         .with_column_stats(column_stats)
         .with_stats_pruning(stats_pruning);
         let ctx = logs_session(provider).expect("session");
@@ -3050,10 +3090,13 @@ mod tests {
     /// simplifies it to `code = 100`, which reaches the scan as a `[100, 100]`
     /// arm disjoint from the entry.
     ///
-    /// Flipped assertion: dropping the stamp check from `arm_excludes` (the
+    /// Flipped assertions: dropping the stamp check from `arm_excludes` (the
     /// `if stamp_coverage(..).is_none() { return false; }`) skips the segment
     /// on its `.cstat` entry and fails the result assertion (a count of `0`
-    /// where `3` is expected).
+    /// where `3` is expected). The last assertion pins that `execute` fetched
+    /// the `.cstat` object, so the test cannot pass because no entry was
+    /// loaded: forcing `SqlExecutor` to skip the load (`true ||` before
+    /// `!self.logs_column_stats_eligible(..)`) fails it.
     #[tokio::test]
     async fn a_cstat_entry_alone_never_skips_a_segment_with_resource_level_matches() {
         const NOW_NS: i64 = 4 * 3_600_000_000_000;
@@ -3177,6 +3220,10 @@ mod tests {
             "the .cstat entry alone must not skip the segment"
         );
         assert!(store.gets_of(&key) > 0, "the segment is read");
+        assert!(
+            store.gets_with_suffix(".cstat") > 0,
+            "execute loads the .cstat object, so the entry was there to skip on"
+        );
     }
 
     /// Only a stamp that no `.cstat` entry contradicts skips a segment by
@@ -3292,6 +3339,108 @@ mod tests {
                     want.len(),
                     usize::from(skipped)
                 ));
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
+    /// A declared Bool column the `Bool` arm cases constrain.
+    const FLAG: &str = "flag";
+
+    /// One record per value at ts `seq * 100 + i`, with `flag` set to it.
+    fn flag_records(seq: u64, values: &[bool]) -> Vec<LogRecord> {
+        let resource = vec![("service.name".to_string(), s("api"))];
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let (ts, body) = code_row(seq, i);
+                record(
+                    &resource,
+                    &[(FLAG.to_string(), AttrValue::Bool(*v))],
+                    ts,
+                    &body,
+                )
+            })
+            .collect()
+    }
+
+    /// The exact stamp a correct writer produces for `values` on [`FLAG`].
+    fn flag_stamp(values: &[bool]) -> ravel_types::declared_stats::DeclaredColumnStat {
+        use ravel_types::declared_stats::{
+            DeclaredColumnStat, DeclaredStatType, DeclaredStatValue,
+        };
+        DeclaredColumnStat::new(
+            FLAG,
+            DeclaredStatType::Bool,
+            values.iter().min().map(|v| DeclaredStatValue::Bool(*v)),
+            values.iter().max().map(|v| DeclaredStatValue::Bool(*v)),
+            0,
+        )
+        .expect("valid stamp")
+    }
+
+    /// The stats prune's `Bool` arm over fixed stamped segments, in the
+    /// `false < true` order: `flag > false` (the `[1, ..]` arm) skips only the
+    /// all-`false` segment, and `flag > true` (the `[2, ..]` arm) skips every
+    /// segment, none of which can hold a match. `flag = true` skips nothing:
+    /// DataFusion's simplifier rewrites it to the bare column `flag` before
+    /// the scan, and `extract_logs` extracts no arm from a bare column, so the
+    /// scan carries no prune arm for it (`prune=0` in the plan). Every case
+    /// still returns exactly the matching rows.
+    ///
+    /// Flipped assertions: reading a stamped Bool extremum as no value
+    /// (`ScalarValue::Boolean(Some(b)) => None` in `scalar_i64`) keeps every
+    /// segment the arms exclude, and treating an arm that touches an inclusive
+    /// bound as disjoint (`q > seg_max` to `q >= seg_max` in `arm_excludes`)
+    /// skips `flag > false` over `[false, true]` and loses its matching row.
+    #[tokio::test]
+    async fn fixed_bool_arm_cases_skip_exactly_the_disjoint_segments() {
+        let memory: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let declared = vec![DeclaredColumn::new(
+            FLAG,
+            crate::declared::DeclaredType::Bool,
+        )];
+        let segments: [&[bool]; 3] = [&[false, true], &[false, false], &[true, true]];
+        // (predicate, the value a row must hold, or none can match, and which
+        // of `segments` are skipped).
+        let cases: [(&str, Option<bool>, [bool; 3]); 3] = [
+            ("flag = true", Some(true), [false, false, false]),
+            ("flag > false", Some(true), [false, true, false]),
+            ("flag > true", None, [true, true, true]),
+        ];
+        let mut mismatches = Vec::new();
+        let mut seq = 0u64;
+        for (predicate, matching, skipped) in cases {
+            for (values, skipped) in segments.iter().zip(skipped) {
+                seq += 1;
+                let key = format!("flag-{seq}");
+                let seg =
+                    write_records_segment(memory.as_ref(), &key, seq, &flag_records(seq, values))
+                        .await;
+                let seg = with_stamps(seg, &[flag_stamp(values)]);
+                let sql = format!("SELECT ts, body FROM logs WHERE {predicate}");
+                let run =
+                    run_pruned_with(declared.clone(), &memory, vec![seg], None, true, &sql).await;
+                let want: BTreeSet<_> = values
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, v)| Some(**v) == matching)
+                    .map(|(i, _)| code_row(seq, i))
+                    .collect();
+                let got = (
+                    run.rows.len(),
+                    run.scan_pruned_by_stats,
+                    run.store.gets_of(&key) == 0,
+                );
+                if run.rows != want || got.1 != Some(usize::from(skipped)) || got.2 != skipped {
+                    mismatches.push(format!(
+                        "`{predicate}` over {values:?}: (rows, skipped, unfetched) = {got:?}, \
+                         want ({}, Some({}), {skipped})",
+                        want.len(),
+                        usize::from(skipped)
+                    ));
+                }
             }
         }
         assert!(mismatches.is_empty(), "{mismatches:#?}");
