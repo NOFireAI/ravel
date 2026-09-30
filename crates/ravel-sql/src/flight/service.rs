@@ -51,7 +51,7 @@ use arrow_flight::sql::Any;
 use tonic::transport::ClientTlsConfig;
 
 use crate::distributed::{DistributedFlightConfig, FlightWorkerSliceClient, WorkerSliceClient};
-use crate::executor::SqlExecutor;
+use crate::executor::{ParquetPlan, PinnedPlanInputs, PinnedResolve, SqlExecutor};
 use crate::flight::request::{sql_request, status_from_sql};
 use crate::flight::slice::{
     FlightListenerRole, SliceReject, SliceRejectCounters, check_slice_claims, verify_slice,
@@ -459,9 +459,13 @@ impl FlightSqlService for RavelFlightSqlService {
         // DoGet records its actual with a zero estimate so the two folds sum to
         // one whole-query estimate beside the summed whole-query actual.
         let accounting = QueryAccounting::new();
-        let (snapshot, estimate) = self
+        let PinnedResolve {
+            snapshot,
+            estimate,
+            parquet,
+        } = self
             .executor
-            .resolve_snapshot(tenant, &req, &accounting)
+            .resolve_pinned(tenant, &req, &accounting)
             .await
             .map_err(|err| status_from_sql(&err, tenant))?;
         let segments: Vec<SegmentPin> = snapshot
@@ -489,7 +493,17 @@ impl FlightSqlService for RavelFlightSqlService {
         // segments.
         let planned = self
             .executor
-            .plan_pinned(tenant, snapshot, &query.query, &accounting, &declared)
+            .plan_pinned_with_inputs(
+                tenant,
+                snapshot,
+                &query.query,
+                &accounting,
+                PinnedPlanInputs {
+                    declared: declared.clone(),
+                    parquet: ParquetPlan::Resolved(parquet),
+                    budgets: req.budgets,
+                },
+            )
             .await
             .map_err(|err| status_from_sql(&err, tenant))?;
         let schema = planned.schema();

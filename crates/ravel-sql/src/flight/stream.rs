@@ -71,7 +71,10 @@ use std::sync::Arc;
 use tonic::Status;
 
 use crate::error::SqlError;
-use crate::executor::{DistributedScan, PinnedStream, RetryDecision, SqlExecutor, retry_decision};
+use crate::executor::{
+    DistributedScan, ParquetPlan, PinnedPlanInputs, PinnedStream, RetryDecision, SqlExecutor,
+    retry_decision,
+};
 use crate::flight::ClockRef;
 use crate::flight::FlightSqlConfig;
 use crate::flight::request::status_from_sql;
@@ -725,7 +728,11 @@ async fn first_batch(
             sql,
             &accounting,
             distributed,
-            declared,
+            PinnedPlanInputs {
+                declared: declared.to_vec(),
+                parquet: ParquetPlan::Unresolved,
+                budgets: None,
+            },
         )
         .await?;
     let mut stream = planned.execute().await?;
