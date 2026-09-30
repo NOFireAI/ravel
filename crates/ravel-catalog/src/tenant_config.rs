@@ -879,22 +879,26 @@ impl TenantConfig {
                         },
                     );
                 }
+                // A column the stored record never declared is left to the
+                // membership check below.
                 for column in &old.columns {
-                    let from = declared_type(stored_cfg.own_typed_columns(), column);
-                    match (from, declared_type(self.own_typed_columns(), column)) {
-                        (_, None) => {
+                    let Some(from) = declared_type(stored_cfg.own_typed_columns(), column) else {
+                        continue;
+                    };
+                    match declared_type(self.own_typed_columns(), column) {
+                        None => {
                             return Err(StorageLayoutConfigError::ClusteringKeyColumnRemoved {
                                 column: column.clone(),
                             });
                         }
-                        (Some(from), Some(to)) if from != to => {
+                        Some(to) if to != from => {
                             return Err(StorageLayoutConfigError::ClusteringKeyColumnRetyped {
                                 column: column.clone(),
                                 from,
                                 to,
                             });
                         }
-                        _ => {}
+                        Some(_) => {}
                     }
                 }
             }
