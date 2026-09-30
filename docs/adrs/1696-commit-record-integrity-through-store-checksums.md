@@ -359,8 +359,14 @@ whether the endpoint accepts the header.
 names, environment variables and defaults: `--s3-upload-integrity`
 (`RAVEL_S3_UPLOAD_INTEGRITY`, default `crc64nvme`) and
 `--s3-request-stored-checksum` (`RAVEL_S3_REQUEST_STORED_CHECKSUM`, default
-`true`). Neither binary builds its production store with
-`S3HttpConfig::default()` any more, and the `request_stored_checksum` flag the
+`true`). Neither binary builds its primary production store with
+`S3HttpConfig::default()` any more. Two kinds of S3 store still do: the
+per-tenant stores `--tenant-kms-config` routes to
+(`crates/ravel-object-store/src/kms_routing.rs`, through
+`S3Store::with_metrics`; issue #2224), and the read-only external Parquet
+profile stores (`crates/ravel-object-store/src/external.rs`, through
+`S3Store::new`), which `ravel-cli` reaches from `parquet_grant.rs` and
+`ravel-sql` from its Parquet reads. The `request_stored_checksum` flag the
 2026-09-27 amendment assigned to follow-up task 2 now exists on both.
 
 `ravel-cli store qualify` builds its store with those options, so every

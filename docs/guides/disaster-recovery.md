@@ -345,7 +345,8 @@ after any change to the bucket's policy or lifecycle rules:
 
 ```sh
 ravel-cli --store s3 --s3-bucket <primary> ... store verify-protection \
-  --expected-noncurrent-days <E_v> --expect-replication --expect-object-retention
+  --expected-noncurrent-days <E_v> --expect-replication \
+  --expect-object-retention --retention-coverage-window 25h
 ```
 
 - `--expected-noncurrent-days` is required: the `E_v` the noncurrent-version
@@ -353,7 +354,22 @@ ravel-cli --store s3 --s3-bucket <primary> ... store verify-protection \
 - `--expect-replication` makes `delete-marker-replication` count. Pass it at
   level 1.
 - `--expect-object-retention` makes `object-retention` count. Pass it when a
-  retention mechanism or a bucket default retention is in place.
+  retention mechanism or a bucket default retention is in place. It requires
+  `--retention-coverage-window`.
+- `--retention-coverage-window` is the mechanism's coverage window from the
+  table above, as a humantime duration: for a scheduled batch job, the
+  schedule interval plus the inventory delay plus the job's execution and
+  retry time (`25h` for a daily job on a daily inventory is an example, not a
+  default); for the event-driven function, a few minutes. The sample skips
+  objects newer than the window, which may carry no retention yet on a
+  compliant bucket.
+
+A daily run with `--expect-object-retention` exits `0` only when every
+family's sample carries a lock that has not lapsed. The `sys/` records and
+the provisioning records are rarely rewritten, so their newest object older
+than the window can be months old. Their retention period must be longer than
+the age of that object; a shorter one leaves the lock lapsed, the sample
+reads `unknown`, and the run exits `2` although the bucket is compliant.
 
 It prints one line per condition, the condition's identifier, then `pass`,
 `fail` or `unknown`, then the reason, and a summary line last:
@@ -381,7 +397,7 @@ verify-protection: FAIL: failed: noncurrent-expiration
 | `no-foreign-rule` | no other expiration or transition rule targets `t/` or `sys/` |
 | `delete-marker-replication` | replication carries `DeleteMarkerReplication` `Enabled` |
 | `object-lock` | Object Lock is enabled on the bucket |
-| `object-retention` | the most recently modified current object found in each protected prefix family, and one noncurrent version, carry compliance-mode retention that has not lapsed |
+| `object-retention` | the most recently modified current object found in each protected prefix family that is older than `--retention-coverage-window`, and one noncurrent version, carry compliance-mode retention that has not lapsed |
 
 The exit code is the verdict: `0` only when every expected condition passes,
 `1` when any expected condition fails (the summary names each), and `2` when
@@ -391,9 +407,11 @@ plane could not be reached at all (the summary names each). `unknown` is never
 not parse, and a condition missing from the report all exit `2`, and so does a
 store other than `--store s3`. A condition that is not expected is still
 printed, marked as such, and does not move the exit code. A usage error, such
-as a missing `--expected-noncurrent-days`, also exits `2`, before anything is
-read and without the per-condition lines, so a script that treats `2` as
-"could not verify" should also check that a summary line was printed.
+as a missing `--expected-noncurrent-days` or `--expect-object-retention`
+without `--retention-coverage-window`, also exits `2`, before anything is
+read and without the per-condition lines, and so does a report that could
+not be written to stdout, so a script that treats `2` as "could not verify"
+should also check that a summary line was printed.
 
 A lifecycle rule counts as covering `t/` when its scope is the whole bucket,
 exactly `t/`, or when enabled rules scoped to `t/0` through `t/f`, one per
@@ -404,23 +422,33 @@ shapes, or confirm the coverage by hand. A covering rule that also keeps
 and a rule over part of `t/` that expires noncurrent versions sooner than
 `E_v` each fail `noncurrent-expiration`.
 
-The retention sample reads one object per protected family, the most recently
+The retention sample reads one object per protected family: the most recently
 modified current object the command finds within a fixed listing budget (400
-listing calls for `sys/` and the tenant scan, 200 for commit records):
+listing calls for `sys/` and the tenant scan, 200 for commit records) whose
+`LastModified` is more than `--retention-coverage-window` before now. An
+object inside the window is never sampled, however new, because the mechanism
+may not have reached it yet:
 
 - deployment records: the newest object under `sys/`, skipping the
   `store qualify` scratch under `sys/qualify/`, the probe objects under
-  `sys/pq-probe/` and the per-process worker state under `sys/maintain/`;
+  `sys/pq-probe/` and the per-process worker state under `sys/maintain/`
+  and `sys/query/workers/`;
 - provisioning records: the newest `t/<h>/<signal>/prov` across tenants;
-- catalog keyspace: the newest catalog head (`t/<h>/catalog/<signal>/HEAD`)
-  across tenants;
-- commit records: the newest record in each shard's newest ingest hour, in
-  the tenant whose catalog head was written most recently.
+- catalog keyspace: the newest object under a `t/<h>/catalog/<signal>/`
+  across tenants: the head pointer, snapshot parts and index objects (a head
+  rewritten on every fold is never older than the window on an active
+  tenant, so the sample is usually a snapshot part or an index object);
+- commit records: the newest record in each shard's newest ingest hour that
+  holds one older than the window, in the tenant whose catalog was written
+  most recently.
 
 The control plane then reads the retention of that object's current version
 and of its newest noncurrent version, if it has one. A family with nothing to
 sample reads `unknown`, so a bucket with no tenant data yet cannot pass
-`object-retention`. A sampled object with no retention at all reads `fail`. A
+`object-retention`. So does a family whose objects are all inside the window,
+with a detail naming the window: a bucket younger than the window cannot pass
+it either. A sampled object older than the window with no retention at all
+reads `fail`. A
 sampled object whose compliance lock has lapsed reads `unknown`, not `fail`:
 retention is finite, so a lapsed lock only says the object is older than the
 retention period, not that new writes go unprotected. That is the usual

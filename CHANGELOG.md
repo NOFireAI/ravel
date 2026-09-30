@@ -50,7 +50,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `spec.storage.s3.uploadIntegrity` and `requestStoredChecksum`, and both
   fields join the qualification input hash, so editing either re-runs
   qualification and every existing cluster re-qualifies once after the
-  operator upgrade. The Job's `activeDeadlineSeconds` rises from 1400 to 2362
+  operator upgrade. The Job's `activeDeadlineSeconds` rises from 1400 to 2364
   to fit a slow but healthy run and its retry.
 - **The RLOG writer now chooses each i64 and string page's encoding by its stored size, and writes encoding tags 10 (GCD i64) and 11 (an `observed_ts` equal to `ts`, stored as a reference to it)** (ADR-2135 decisions 3 and 4, issue #2140); no i64 or string page stores more bytes than the encoding chosen before (a very small object can still grow by a few bytes, because a PAGE_DIR whose `ts` and `observed_ts` entries used to be identical compresses worse), each candidate encoding of a page is compressed at most once (up to six candidates for an i64 page, two for a string page), and the reader decodes both tags.
 - **`s3_e2e_bench` counts adaptive-age flushes** (issue #2186). Its printed
@@ -670,18 +670,24 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bucket's versioning, lifecycle, replication and Object Lock configuration,
   and with `--expect-object-retention` samples the retention of the most
   recently modified current object a bounded listing finds in each protected
-  prefix family (skipping the `sys/qualify/`, `sys/pq-probe/` and
-  `sys/maintain/` scratch), then prints one line per condition (`pass`, `fail`
-  or `unknown`, with the reason) and a summary. A sampled object whose
-  compliance lock has lapsed reads `unknown`, since it is not a recent object;
-  one with no retention at all reads `fail`. `--expected-noncurrent-days` is
-  required, and `--expect-replication` and `--expect-object-retention` add
-  the two conditions a deployment opts into. It exits `0` only when every
-  expected condition passes, `1` when any fails, and `2` when any could not be
+  prefix family that is older than `--retention-coverage-window` (skipping
+  the `sys/qualify/`, `sys/pq-probe/`, `sys/maintain/` and
+  `sys/query/workers/` scratch), then prints one line per condition (`pass`,
+  `fail` or `unknown`, with the reason) and a summary.
+  `--expect-object-retention` requires `--retention-coverage-window` (a
+  humantime duration such as `25h`): the retention mechanism can lag a write
+  by up to that window, so an object inside it may carry no retention yet on
+  a compliant bucket and is not sampled, and a family with no object older
+  than the window reads `unknown`. A sampled object whose compliance lock has
+  lapsed reads `unknown`, since it is not a recent object; one with no
+  retention at all reads `fail`. `--expected-noncurrent-days` is required,
+  and `--expect-replication` and `--expect-object-retention` add the two
+  conditions a deployment opts into. It exits `0` only when every expected
+  condition passes, `1` when any fails, and `2` when any could not be
   verified, is missing from the report, or the control plane could not be
   reached, so "could not verify" never exits `0`. A usage error also exits
-  `2`. A reader that closes the pipe early does not change the exit code. It
-  is read-only.
+  `2`, and so does a report that could not be written to stdout. A reader
+  that closes the pipe early does not change the exit code. It is read-only.
 - **`--audit-retention` sets the query-audit retention window** (ADR-0062
   decision 2c, ADR-1688, issue #2126). The server built its compactor with
   the compiled-in 90-day audit window and no way to change it. The flag takes
