@@ -630,7 +630,8 @@ Stated explicitly, per ADR-0055's own consequence:
   mechanical answer: the hold wins until an authorized human clears it.
 - **Bucket-level Object Lock**: if the operator enabled compliance-mode
   default retention D (the out-of-band step ADR-0042 documents), S3 itself
-  refuses the sweep's deletes until each object's retain-until passes; the
+  refuses the sweep's deletes until each object's retain-until passes
+  (corrected by the 2026-09-30 Object Lock amendment below: it does not); the
   physical bound becomes `max(bound, D)` and §7's required-configuration
   section instructs operators with erasure obligations to prefer scoped
   legal holds over blanket default retention, or keep D inside their
@@ -818,4 +819,44 @@ and PII-free) get permanent audit evidence without permanent PII.
   zone is inert" scheduling assumption and needs its `invalidate` hook.
   This ADR's rewrite pass should call that hook once leased maintenance
   lands; if this work starts first, it must not assume the hook exists.
+
+## Amendment (2026-09-30, #2220): Object Lock does not refuse the sweep's delete
+
+<!-- amendment-applies: sections="6. Interaction with ADR-0055 (WORM / credential scoping / legal hold) — the landed-second obligation" pointer="2026-09-30 Object Lock amendment" -->
+<!-- amendment-supersedes: phrase="refuses the sweep's deletes until each object's retain-until passes" pointer="2026-09-30 Object Lock amendment" -->
+
+Decision 6's "Bucket-level Object Lock" bullet says S3 refuses the sweep's
+deletes under a compliance-mode default retention `D`. It does not. Object
+Lock requires a versioned bucket, and every Ravel delete names no version
+id: `S3Store::delete` calls `object_store` 0.14.1's `ObjectStoreExt::delete`,
+which for S3 goes through `delete_stream` to `bulk_delete_request` and sends
+a `DeleteObjects` request (`POST /?delete`) whose body carries only the
+`Key`, never a `VersionId`. Only `disable_bulk_delete`, which Ravel never
+sets, would send a path DELETE instead, and that carries no version id
+either. On a versioned bucket that request succeeds and inserts a delete
+marker. Object Lock protects object versions, not the current-version
+pointer, so it refuses a delete naming a locked version's id and a lifecycle
+expiration of that version, and nothing Ravel sends. The request Ravel sends
+is pinned by `a_delete_is_one_delete_objects_request_with_no_version_id` in
+`crates/ravel-object-store/tests/s3_http_faults.rs`; what S3 does with it is
+AWS S3 semantics, not something the repository can test.
+
+So under `D` the sweep's deletes succeed, the key reads as absent to Ravel,
+and the sweep carries on as on an unlocked bucket. The locked version stays
+in storage as a noncurrent version until its retain-until has passed and the
+`NoncurrentDays = E_v` expiration rule §7 requires removes it; lifecycle does
+not remove a version while it is locked. The physical bound is therefore
+`max(bound + E_v, D)`, and it comes from noncurrent-version expiry and `D`,
+not from the sweep waiting. The advice to prefer scoped legal holds over
+blanket default retention, or to keep `D` inside the erasure SLA, stands. The
+refusals the sweep does tolerate as per-object residue come from a deny
+policy or a credential without `s3:DeleteObject`. S3 reports such a refusal
+per key inside the `DeleteObjects` 200 response, and `S3Store::delete` maps a
+per-key `AccessDenied` to `StoreError::AccessDenied`, the class the sweep
+tolerates per chain.
+
+docs/object-store-contract.md "Required bucket configuration" and
+docs/deletion-and-gc.md "Modifiers to the bound" carry the corrected
+behaviour, including the same correction for a scoped per-object retention
+`R` on commit records and the catalog keyspace.
 

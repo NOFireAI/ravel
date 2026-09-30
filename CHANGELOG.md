@@ -442,6 +442,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **An S3 delete refused for one key now reads as access denied, so the
+  superseded sweep holds back that one chain instead of failing the pass**
+  (issues #2227 and #2220). `S3Store::delete` goes out as a `DeleteObjects`
+  request, and S3 reports a per-key refusal (a deny policy, a credential
+  without `s3:DeleteObject`) inside that request's 200 response.
+  `object_store` surfaces it as an untyped error, which Ravel classified as
+  `Transient`, so a refusal the sweep is built to tolerate per chain failed
+  the whole pass and was retried as if the store were unavailable. The per-key
+  code now maps by the HTTP status S3 documents for it: the 403 codes
+  (`AccessDenied`, `AllAccessDisabled`, `AccountProblem`,
+  `InvalidAccessKeyId`, `InvalidObjectState`, `SignatureDoesNotMatch`) to
+  `AccessDenied`, `NoSuchKey` to a successful idempotent delete,
+  `PreconditionFailed` to `PreconditionFailed`, and `ServiceUnavailable` to
+  `Throttled`. Any other code keeps its previous classification.
+
 - **A gateway starts under a small memory limit** (issue #2234).
   `ravel-server` refused to start in every mode under a cgroup memory limit of
   2 GiB or less, because the process memory budget (effective memory minus a
