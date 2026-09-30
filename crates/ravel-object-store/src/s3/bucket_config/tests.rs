@@ -231,7 +231,7 @@ fn target(endpoint: Option<&str>, path_style: bool, key: Option<&str>) -> Reques
         ],
         None => vec![("versioning".to_string(), String::new())],
     };
-    request_target("bkt", "eu-west-1", endpoint, path_style, key, &query)
+    request_target("bkt", "eu-west-1", endpoint, path_style, key, &query).expect("target")
 }
 
 /// Each addressing style produces the URL `object_store` would use for the
@@ -275,6 +275,137 @@ fn request_target_matches_object_store_addressing() {
         "https://s3.eu-west-1.amazonaws.com/bkt/t/a?retention=&versionId=v1"
     );
     assert_eq!(t.host, "s3.eu-west-1.amazonaws.com");
+}
+
+/// The authority `reqwest` sends as `Host` for `url`: the `url` crate's
+/// parse, which lowercases the host and drops the scheme's default port.
+fn wire_authority(url: &str) -> String {
+    let url = reqwest::Url::parse(url).expect("url");
+    let host = url.host_str().expect("host");
+    match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    }
+}
+
+/// The signed `host` is the authority the request carries: a scheme-default
+/// port is dropped and the host lowercased, as the `url` crate does before
+/// `reqwest` writes `Host`; any other port stays.
+#[test]
+fn signed_host_is_the_authority_sent() {
+    for (endpoint, host) in [
+        ("https://s3.example.internal:443", "s3.example.internal"),
+        ("http://s3.example.internal:80", "s3.example.internal"),
+        (
+            "https://s3.example.internal:9000",
+            "s3.example.internal:9000",
+        ),
+        ("http://s3.example.internal:443", "s3.example.internal:443"),
+        ("https://s3.example.internal:80", "s3.example.internal:80"),
+        ("https://S3.Example.Internal", "s3.example.internal"),
+        ("https://S3.Example.Internal:443/", "s3.example.internal"),
+        ("http://MinIO:9000", "minio:9000"),
+        ("https://[::1]:443", "[::1]"),
+        ("http://[::1]:9000", "[::1]:9000"),
+    ] {
+        let t = target(Some(endpoint), true, None);
+        assert_eq!(t.host, host, "{endpoint}");
+        assert_eq!(wire_authority(&t.url), t.host, "{endpoint}");
+    }
+}
+
+/// Endpoints whose written authority the `url` crate rewrites before `reqwest`
+/// sends it: the signed `host` is the rewritten form, not the text as given.
+#[test]
+fn signed_host_follows_the_url_crate_rewrite() {
+    let mut mismatches = Vec::new();
+    for endpoint in [
+        "https://Bücket.example.com",
+        "http://[0:0:0:0:0:0:0:1]:9000",
+        "https://[0:0:0:0:0:0:0:1]",
+        "https://host:0443",
+        "http://host:09000",
+        "http://127.1:9000",
+        "https://HOST.Example.COM:9000",
+        "https://user:secret@host.example:9000",
+    ] {
+        let t = target(Some(endpoint), true, None);
+        let wire = wire_authority(&t.url);
+        if t.host != wire {
+            mismatches.push(format!("{endpoint}: signed {} wire {wire}", t.host));
+        }
+    }
+    assert_eq!(mismatches, Vec::<String>::new());
+}
+
+/// An endpoint the `url` crate cannot parse is a transport error (so the
+/// condition reads `Unknown`), not a panic.
+#[test]
+fn unparseable_endpoint_is_a_transport_error() {
+    let query = vec![("versioning".to_string(), String::new())];
+    for endpoint in ["http://[::1", "https://host:99999", "http://ho st:9000"] {
+        let err = request_target("bkt", "eu-west-1", Some(endpoint), true, None, &query)
+            .expect_err(endpoint);
+        assert!(
+            matches!(err, ControlPlaneError::Transport(_)),
+            "{endpoint}: {err:?}"
+        );
+    }
+}
+
+/// On the wire: a request through a forward proxy (so the endpoint's name and
+/// port need not be reachable) carries the `Host` the signature covers, for a
+/// scheme-default port, a non-default one, and an uppercase host.
+#[tokio::test]
+async fn host_header_on_the_wire_matches_the_signature() {
+    let respond: Responder = Arc::new(|_sub, _path, _query| {
+        (
+            StatusCode::OK,
+            "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"
+                .to_string(),
+        )
+    });
+    let (base, seen) = spawn_fake(respond).await;
+    for (endpoint, host) in [
+        ("http://s3.example.internal:80", "s3.example.internal"),
+        ("http://S3.Example.Internal:80", "s3.example.internal"),
+        (
+            "http://s3.example.internal:9000",
+            "s3.example.internal:9000",
+        ),
+        (
+            "http://S3.Example.Internal:9000",
+            "s3.example.internal:9000",
+        ),
+    ] {
+        let proxied = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::http(&base).expect("proxy"))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("client");
+        let client = BucketControlPlaneClient::new(
+            proxied,
+            static_credential_provider(KAT_ACCESS_KEY, KAT_SECRET_KEY, None),
+            Arc::default(),
+            "ravel-test-bucket".to_string(),
+            KAT_REGION.to_string(),
+            Some(endpoint.to_string()),
+            true,
+        )
+        .with_clock(Arc::new(FixedClock(KAT_UNIX_SECS)));
+        assert!(
+            matches!(client.fetch_versioning().await, FetchOutcome::Present(_)),
+            "{endpoint}"
+        );
+        let request = seen.lock().pop().expect("one request");
+        let sent_host = request
+            .headers
+            .iter()
+            .find(|(name, _)| name == "host")
+            .map(|(_, value)| value.clone());
+        assert_eq!(sent_host.as_deref(), Some(host), "{endpoint}");
+        verify_authorization(&request, &UNSIGNED_TOKEN);
+    }
 }
 
 // --- XML reader tests (each response shape -> parsed value) ---
@@ -435,7 +566,7 @@ fn parses_replication_rules() {
 #[test]
 fn parses_object_lock_enabled() {
     let body = br#"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>"#;
-    assert_eq!(parse_object_lock(body).expect("parse").enabled, Some(true));
+    assert!(parse_object_lock(body).expect("parse").enabled);
 }
 
 #[test]
@@ -1023,7 +1154,8 @@ fn deleting_the_covering_rule_never_turns_no_foreign_into_pass() {
 }
 
 /// A rule repeating NoncurrentVersionExpiration has no single day count: it is
-/// Unknown rather than whichever element came last.
+/// Unknown rather than whichever element came last. On the covering rule that
+/// is noncurrent-expiration's to report, not no-foreign-rule's.
 #[test]
 fn repeated_noncurrent_expiration_is_unknown() {
     for (first, second) in [("1", "30"), ("30", "1")] {
@@ -1041,11 +1173,7 @@ fn repeated_noncurrent_expiration_is_unknown() {
             "{first},{second}: {:?}",
             v.noncurrent
         );
-        assert!(
-            v.no_foreign.is_unknown(),
-            "{first},{second}: {:?}",
-            v.no_foreign
-        );
+        assert_eq!(v.no_foreign, ConditionState::Pass, "{first},{second}");
     }
 }
 
@@ -1078,7 +1206,8 @@ fn repeated_rule_status_is_unknown() {
 }
 
 /// A NoncurrentVersionExpiration whose NoncurrentDays is repeated has no single
-/// day count, so both conditions that read it are Unknown in either order.
+/// day count, so noncurrent-expiration is Unknown in either order. The rule
+/// covers t/, so no-foreign-rule leaves its NoncurrentDays to that condition.
 #[test]
 fn repeated_noncurrent_days_is_unknown() {
     for (first, second) in [("30", "1"), ("1", "30")] {
@@ -1091,13 +1220,19 @@ fn repeated_noncurrent_days_is_unknown() {
                  {MARKER}{ABORT_7}"
             ),
         ));
-        for (name, state) in [("noncurrent", &v.noncurrent), ("no_foreign", &v.no_foreign)] {
-            assert!(state.is_unknown(), "{first},{second} {name}: {state:?}");
-            assert!(
-                state.detail().contains("a repeated <NoncurrentDays>"),
-                "{first},{second} {name}: {state:?}"
-            );
-        }
+        assert!(
+            v.noncurrent.is_unknown(),
+            "{first},{second}: {:?}",
+            v.noncurrent
+        );
+        assert!(
+            v.noncurrent
+                .detail()
+                .contains("a repeated <NoncurrentDays>"),
+            "{first},{second}: {:?}",
+            v.noncurrent
+        );
+        assert_eq!(v.no_foreign, ConditionState::Pass, "{first},{second}");
     }
 }
 
@@ -1444,6 +1579,70 @@ fn missing_or_unrecognised_delete_marker_status_is_unknown() {
             .contains("no DeleteMarkerReplication element"),
         "{state:?}"
     );
+}
+
+/// One enabled replication rule on `t/<c>` for each character `c` of `chars`,
+/// each with DeleteMarkerReplication `dmr(c)`.
+fn replication_union(chars: &str, dmr: impl Fn(char) -> &'static str) -> String {
+    chars
+        .chars()
+        .map(|c| {
+            replication_rule(
+                "Enabled",
+                &format!("<Filter><Prefix>t/{c}</Prefix></Filter>"),
+                dmr(c),
+            )
+        })
+        .collect()
+}
+
+/// Sixteen enabled rules on `t/0` .. `t/f` cover t/ for replication exactly
+/// as they do for the lifecycle conditions: all replicating delete markers is
+/// Pass, and one that does not is Fail.
+#[test]
+fn complete_replication_union_covers_t() {
+    assert_eq!(
+        dmr_state(&replication_union(HEX_DIGITS, |_| "Enabled")),
+        ConditionState::Pass
+    );
+    let state = dmr_state(&replication_union(HEX_DIGITS, |c| {
+        if c == 'a' { "Disabled" } else { "Enabled" }
+    }));
+    assert!(state.is_fail(), "{state:?}");
+    assert!(
+        state.detail().contains("rule #11") && state.detail().contains("disagree"),
+        "{state:?}"
+    );
+}
+
+/// A union missing one digit, split one level further down for it, or
+/// spelling it in upper case does not provably cover t/: Unknown, naming
+/// the narrower rules.
+#[test]
+fn incomplete_replication_union_stays_unknown() {
+    let missing_f = replication_union("0123456789abcde", |_| "Enabled");
+    let deeper_f = format!(
+        "{missing_f}{}",
+        HEX_DIGITS
+            .chars()
+            .map(|c| replication_rule(
+                "Enabled",
+                &format!("<Filter><Prefix>t/f{c}</Prefix></Filter>"),
+                "Enabled"
+            ))
+            .collect::<String>()
+    );
+    let upper_f = format!("{missing_f}{}", replication_union("F", |_| "Enabled"));
+    for rules in [missing_f, deeper_f, upper_f] {
+        let state = dmr_state(&rules);
+        assert!(state.is_unknown(), "{state:?}");
+        assert!(
+            state
+                .detail()
+                .contains("might cover t/ as a union, but only one rule on each of t/0 .. t/f"),
+            "{state:?}"
+        );
+    }
 }
 
 // --- Versioning and Object Lock evaluation ---
@@ -2996,6 +3195,82 @@ fn union_members_that_disagree_on_noncurrent_days_fail() {
         v.noncurrent.is_fail() && v.noncurrent.detail().contains("disagree"),
         "{:?}",
         v.noncurrent
+    );
+}
+
+/// The sanctioned rule covering all of t/ with a NoncurrentDays below E_v is
+/// one misconfiguration: noncurrent-expiration fails on it and no-foreign-rule
+/// does not, since there is no foreign rule. The report carries one Fail, so
+/// failed_count() reads 1.
+#[test]
+fn short_noncurrent_days_on_the_covering_rule_fail_one_condition() {
+    let short = rule(
+        "ravel",
+        "<Filter/>",
+        &format!("{}{MARKER}{ABORT_7}", noncurrent("14")),
+    );
+    let v = evaluate(&short);
+    assert_eq!(
+        v.noncurrent,
+        ConditionState::Fail("rule \"ravel\": NoncurrentDays is 14, expected 30".to_string())
+    );
+    assert_eq!(v.no_foreign, ConditionState::Pass);
+
+    let body = format!("<LifecycleConfiguration>{short}</LifecycleConfiguration>");
+    let (report, _) = assemble_report(
+        &FetchOutcome::Present(VersioningConfig {
+            status: Some("Enabled".to_string()),
+            unrecognized: Vec::new(),
+        }),
+        &FetchOutcome::Present(parse_lifecycle(body.as_bytes()).expect("parse")),
+        &FetchOutcome::Unknown(REPLICATION_NOT_EXPECTED.to_string()),
+        &FetchOutcome::Present(ObjectLockConfig { enabled: true }),
+        &RetentionSample::NotSampled,
+        &BucketProtectionParams {
+            expected_noncurrent_days: Some(30),
+            ..BucketProtectionParams::default()
+        },
+    );
+    assert_eq!(report.failed_count(), 1, "{report:?}");
+
+    // A union member is the sanctioned rule for its digit, the same way.
+    let union = union_rules("t/", HEX_DIGITS, |c| {
+        let days = if c == '7' { "14" } else { "30" };
+        format!("{}{MARKER}{ABORT_7}", noncurrent(days))
+    });
+    let v = evaluate(&union);
+    assert_eq!(
+        v.noncurrent,
+        ConditionState::Fail("rule \"tenant-t/7\": NoncurrentDays is 14, expected 30".to_string())
+    );
+    assert_eq!(v.no_foreign, ConditionState::Pass);
+
+    // Covering rules that disagree leave no reference; neither is foreign.
+    let v = evaluate_without_e_v(&format!(
+        "{}{}",
+        rule("a", "<Filter/>", &noncurrent("30")),
+        rule("b", "<Filter/>", &noncurrent("14")),
+    ));
+    assert!(v.noncurrent.is_fail(), "{:?}", v.noncurrent);
+    assert_eq!(v.no_foreign, ConditionState::Pass);
+
+    // The covering rule is skipped for its NoncurrentDays only: a transition
+    // on it is still foreign.
+    let v = evaluate(&rule(
+        "ravel",
+        "<Filter/>",
+        &format!(
+            "{}<Transition><Days>30</Days><StorageClass>GLACIER</StorageClass></Transition>",
+            noncurrent("14")
+        ),
+    ));
+    assert_eq!(
+        v.no_foreign,
+        ConditionState::Fail(
+            "foreign expiration or transition rule targets a Ravel prefix: rule \"ravel\" on the \
+             whole bucket carries a transition"
+                .to_string()
+        )
     );
 }
 

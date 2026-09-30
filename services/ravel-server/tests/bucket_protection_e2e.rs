@@ -28,8 +28,8 @@ use std::sync::Arc;
 
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::conformance::{
-    BucketConfigProbe, BucketConfigProbeSource, LifecycleRuleStatus, ObjectLockProbe,
-    ObjectLockProbeSource, VersioningStatus,
+    BucketConfigProbe, BucketConfigProbeSource, BucketProbesSource, LifecycleRuleStatus,
+    ObjectLockProbe, ObjectLockProbeSource, VersioningStatus,
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_server::bucket_protection::{BucketProtectionOutcome, bucket_protection_unknown};
@@ -57,6 +57,8 @@ impl BucketConfigProbeSource for Fixture {
         self.config.clone()
     }
 }
+
+impl BucketProbesSource for Fixture {}
 
 fn clean_config() -> BucketConfigProbe {
     BucketConfigProbe {
