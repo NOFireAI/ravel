@@ -62,9 +62,14 @@
 //!   so a non-`Off` mode is a deployment assertion that the endpoint honors it.
 //!   `upload_checksum` is not in [`Capabilities::mandatory`] and gates no mode,
 //!   so either setting starts. See [`UploadIntegrity`] and `capabilities()`
-//!   below. The multipart per-part path keeps only the local pre-flight: a
-//!   multipart `UploadPart` takes no `with_checksum_algorithm` value in this
-//!   client, and there is no whole-object digest to attach at `complete`.
+//!   below. When on, `put()` keeps every size on the single-PUT path: one
+//!   billed request where multipart costs parts + 2, and one checksum over
+//!   the whole object where multipart gets one per part. The multipart path
+//!   could carry per-part checksums: with the algorithm set, `object_store`'s
+//!   `create_multipart` sends `x-amz-checksum-algorithm` and each `put_part`
+//!   goes through `PutRequest::with_payload`, which attaches the part's
+//!   digest. Routing large overwrites through it under integrity waits on a
+//!   real-endpoint check that the endpoint verifies those part checksums.
 //! - **Read-side checksum verification is header-driven, and a whole-object
 //!   read is only verifiable when one response carried the whole object**
 //!   (ADR-1696 decisions 2 to 4). `object_store` 0.14's `GetResult` exposes no
@@ -167,9 +172,10 @@ pub const MULTIPART_PART_SIZE: usize = 8 * 1024 * 1024;
 /// failure mode is re-sending the entire object.
 pub const MULTIPART_THRESHOLD: usize = 2 * MULTIPART_PART_SIZE;
 /// S3's single-request PUT ceiling. With upload integrity enabled, `put`
-/// stays on the single-PUT path (server-verified checksum, one billed
-/// request) up to this size and refuses above it rather than silently
-/// taking the unverified multipart path.
+/// stays on the single-PUT path (one billed request, one server-verified
+/// checksum over the whole object) up to this size and refuses above it
+/// rather than switching to multipart, whose per-part checksums have not
+/// been checked against a real endpoint.
 pub const SINGLE_PUT_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 // The chunking constants satisfy S3's part rules by construction, checked at
@@ -2307,16 +2313,19 @@ impl ObjectStoreBackend for S3Store {
             {
                 return self.put_via_multipart(key, data).await;
             }
-            // With upload integrity enabled the multipart path is excluded:
-            // its parts carry no server-verified checksum, and advertising
-            // `upload_checksum` while a large overwrite bypasses verification
-            // would be a lie. The single-PUT path covers every size up to
-            // S3's 5 GiB per-request ceiling -- which also costs ONE billed
-            // PUT where multipart costs parts + 2 -- and a payload above the
-            // ceiling is refused loudly rather than silently downgraded.
+            // With upload integrity enabled the multipart path is excluded.
+            // Its parts could carry checksums (`object_store` attaches one per
+            // `put_part` when the client has an algorithm), but no real
+            // endpoint has been checked to verify them, so `upload_checksum`
+            // rests on the single-PUT path alone: ONE billed PUT where
+            // multipart costs parts + 2, and one checksum over the whole
+            // object. That path covers every size up to S3's 5 GiB
+            // per-request ceiling, and a payload above it is refused loudly.
             if self.upload_integrity.is_enabled() && data.len() as u64 > SINGLE_PUT_MAX_BYTES {
                 return Err(StoreError::Permanent(format!(
-                    "put of {key}: {} bytes exceeds the {SINGLE_PUT_MAX_BYTES}-byte single-PUT                      ceiling, and multipart uploads carry no server-verified checksum; disable                      upload integrity (UploadIntegrity::Off) to write objects this large",
+                    "put of {key}: {} bytes exceeds the {SINGLE_PUT_MAX_BYTES}-byte single-PUT \
+                     ceiling, and with upload integrity on every put is a single PUT; disable \
+                     upload integrity (UploadIntegrity::Off) to write objects this large",
                     data.len(),
                 )));
             }

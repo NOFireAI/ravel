@@ -2500,10 +2500,10 @@ async fn multipart_part_failure_yields_permanent_and_no_visible_object() {
 /// endpoint must abort the upload and surface the error with no object at the
 /// key.
 /// #993 review finding: with upload integrity enabled, an Overwrite put above
-/// [`MULTIPART_THRESHOLD`] must NOT take the multipart path -- multipart parts
-/// carry no server-verified checksum, so the capability would overstate; the
-/// single-PUT path covers every size to the 5 GiB ceiling and costs one billed
-/// request where multipart costs parts + 2. The op counters are the proof.
+/// [`MULTIPART_THRESHOLD`] must NOT take the multipart path: the single-PUT
+/// path covers every size to the 5 GiB ceiling, carries one whole-object
+/// checksum, and costs one billed request where multipart costs parts + 2.
+/// The op counters are the proof.
 ///
 /// Demonstrated failing against the unguarded routing (dropping the
 /// `!upload_integrity.is_enabled()` term from `put`): CreateMultipart then

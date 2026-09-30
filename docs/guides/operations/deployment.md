@@ -112,20 +112,25 @@ can take. Three of those four prefix families are never touched by the three
 mechanisms that physically remove tenant data (supersession GC, retention
 deletion, and subject erasure), so locking them costs nothing against those
 three. Commit records are not exempt even that far: a maintenance sweep
-physically removes a superseded commit record, and a still-locked one refuses
-that delete until its retention period elapses, so the retention period chosen
-for commit records is also a bound on how long that sweep can pause; the
-contract page's "Required bucket configuration" names the default window to
-keep it inside.
+deletes a superseded commit record. Object Lock does not refuse that delete:
+Ravel's delete names no version, so on the versioned bucket Object Lock
+requires it succeeds and inserts a delete marker, and the sweep carries on.
+The locked version stays in storage until its retention period has passed and
+the noncurrent-version expiration rule removes it, so the retention period
+chosen for commit records bounds how long their bytes physically remain, not
+how long the sweep waits; the contract page's "Required bucket configuration"
+gives the bound.
 
 One of the other three families does carry a further cost, from a fourth
 mechanism: a compliance lock on `t/*/catalog/*/*` there
 costs an erasure obligation, not only a reclamation delay. The unreferenced-catalog sweep
 deletes the snapshot and index objects the current HEAD no longer names, and
 for a tenant that declares a typed string or bytes attribute column a per-part
-column-statistics object among them holds that subject's own column value; a
-lock over the keyspace delays that delete, and the value persists until the
-fold reconciles that hour and then a further retention period. The maintenance
+column-statistics object among them holds that subject's own column value. A
+lock over the keyspace does not delay that delete, which succeeds as a delete
+marker, but the locked version keeps the value in storage: it persists until
+the fold reconciles that hour and then until the retention period and the
+noncurrent-version expiration have both passed. The maintenance
 IAM policy Ravel ships permits that delete, with its catalog deny scoped to
 `catalog/<signal>/HEAD`; a copy of that template predating the narrowing
 denies it outright and leaves the bound open-ended until it is re-applied.
