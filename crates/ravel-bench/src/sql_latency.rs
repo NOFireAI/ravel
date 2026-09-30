@@ -4435,7 +4435,12 @@ mod tests {
         // over them. This object covers exactly the two fixed string columns
         // (severity_text and body, which the writer always lists); a fixture
         // with dynamic string columns carries one more id per such column.
-        assert_eq!(acc[0].object_store_bytes, 846, "cold run's store bytes");
+        // 851 = that 846 plus 5 from the observed_ts column reference
+        // (#2140): BLOCKS loses 1 byte (a 1-byte tag-11 page in place of a
+        // 2-byte constant page) and the zstd-compressed PAGE_DIR goes from 86
+        // to 92 bytes at the same 100 uncompressed: its ts and observed_ts
+        // page entries, identical down to their crc32c before, now differ.
+        assert_eq!(acc[0].object_store_bytes, 851, "cold run's store bytes");
 
         // Warm run: served from cache, so it drops to plan reads only.
         assert_eq!(
