@@ -24,6 +24,7 @@
 //! table a statement names, after resolving its manifest, and a session over
 //! them whose registry is a [`SingleStoreRegistry`].
 
+mod boundary;
 mod error;
 mod metadata_cache;
 mod provider;
