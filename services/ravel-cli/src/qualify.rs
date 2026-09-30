@@ -14,7 +14,10 @@ use ravel_object_store::conformance::{
     BucketConfigProbe, BucketProbesSource, CONFORMANCE_SUITE_VERSION, LifecycleRuleStatus,
     bucket_config_alarms, probe_bucket_lock_and_config, run_conformance_suite,
 };
+use ravel_object_store::s3::UploadIntegrity;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError};
+
+use crate::store::BuiltStore;
 
 // The record and its key now live in `ravel-object-store` so `ravel-server`
 // startup (ADR-0050 section 6) and this writer share one definition.
@@ -41,6 +44,25 @@ pub async fn qualify(
     run_id: &str,
     list_page_size: usize,
 ) -> anyhow::Result<()> {
+    qualify_built(
+        BuiltStore::Other(store),
+        backend_identity,
+        run_id,
+        list_page_size,
+    )
+    .await
+}
+
+/// [`qualify`] over a [`BuiltStore`]: when it holds the concrete S3 store,
+/// the bucket probes read the bucket's configuration and the stored-checksum
+/// echo check runs.
+pub async fn qualify_built(
+    built: BuiltStore,
+    backend_identity: String,
+    run_id: &str,
+    list_page_size: usize,
+) -> anyhow::Result<()> {
+    let store = built.backend();
     let scratch_prefix = format!("sys/qualify/{run_id}/");
     let report = run_conformance_suite(store.as_ref(), &scratch_prefix, list_page_size).await;
 
@@ -58,8 +80,9 @@ pub async fn qualify(
     // decision, and clearly labeled informational and non-blocking: it never
     // affects whether qualification passes, what is recorded in
     // `sys/qualification`, or whether the server starts (ADR-0050 section 6 is
-    // unaffected). Today it always reports "unknown" through the
-    // `ObjectStoreBackend` contract, which exposes no such query.
+    // unaffected). An S3 store answers from the bucket's own configuration;
+    // any other backend reports "unknown" through the `ObjectStoreBackend`
+    // contract, which exposes no such query.
     //
     // Informational required-bucket-configuration report (ADR-0064 §7, S2-16,
     // S4-12): bucket versioning state and the status of the two sanctioned
@@ -69,9 +92,12 @@ pub async fn qualify(
     // server starts; `object_store` cannot enforce bucket policy, so Ravel
     // reports what it can observe (unknown through the trait contract) and
     // documents what it requires.
-    for line in bucket_probe_lines(store.as_ref()).await {
+    for line in built_bucket_probe_lines(&built).await {
         println!("{line}");
     }
+
+    let echo = checksum_echo(&built, &format!("{scratch_prefix}checksum-echo")).await;
+    println!("{}", echo.line());
 
     if !report.passed() {
         let failed_names: Vec<&str> = report.failures().map(|r| r.property.name()).collect();
@@ -81,6 +107,12 @@ pub async fn qualify(
             backend_identity,
             if failed_names.len() == 1 { "y" } else { "ies" },
             failed_names.join(", "),
+        );
+    }
+    if let Some(failure) = echo.failure() {
+        anyhow::bail!(
+            "store qualification failed: {backend_identity} failed the stored-checksum echo \
+             check: {failure}"
         );
     }
 
@@ -205,6 +237,132 @@ async fn re_record_if_stale(
          qualify run; retried {MAX_RERECORD_ATTEMPTS} times without a stable version. Re-run \
          `ravel-cli store qualify` once concurrent runs have stopped"
     ))
+}
+
+/// [`bucket_probe_lines`] from the concrete S3 store when `built` holds one,
+/// else through the `dyn ObjectStoreBackend` impls.
+pub async fn built_bucket_probe_lines(built: &BuiltStore) -> Vec<String> {
+    match built {
+        BuiltStore::S3 { store, .. } => bucket_probe_lines(store.as_ref()).await,
+        BuiltStore::Other(store) => bucket_probe_lines(store.as_ref()).await,
+    }
+}
+
+/// Label of the stored-checksum echo line in `store qualify`'s output.
+pub const CHECKSUM_ECHO_LABEL: &str = "checksum/stored_echo";
+
+/// The body the echo check PUTs.
+const CHECKSUM_ECHO_BODY: &[u8] = b"ravel-cli store qualify stored-checksum echo probe";
+
+/// Outcome of the stored-checksum echo check: whether the endpoint returned,
+/// on a whole-object GET with checksum mode, the checksum it stored for a PUT
+/// that carried one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChecksumEcho {
+    /// The endpoint returned a stored checksum and it matched the body.
+    Verified,
+    /// The endpoint returned no stored checksum; reads are served unverified.
+    NotReturned,
+    /// The check did not run, for the stated reason.
+    NotChecked(String),
+    /// The endpoint returned a checksum that does not match the one sent, or
+    /// the probe itself failed. A qualify failure.
+    Failed(String),
+}
+
+impl ChecksumEcho {
+    /// The one line `store qualify` prints for this outcome.
+    pub fn line(&self) -> String {
+        let text = match self {
+            ChecksumEcho::Verified => "verified: the endpoint returned the crc64nvme checksum \
+                                      it stored for the probe PUT, and it matched the body"
+                .to_string(),
+            ChecksumEcho::NotReturned => "not returned: the endpoint returned no stored checksum \
+                                          for a crc64nvme PUT read back whole, so whole-object \
+                                          reads are served unverified"
+                .to_string(),
+            ChecksumEcho::NotChecked(reason) => format!("not checked ({reason})"),
+            ChecksumEcho::Failed(detail) => format!("FAIL {detail}"),
+        };
+        format!("{CHECKSUM_ECHO_LABEL:<40} {text}")
+    }
+
+    /// The failure this outcome carries, if it fails qualification.
+    pub fn failure(&self) -> Option<&str> {
+        match self {
+            ChecksumEcho::Failed(detail) => Some(detail),
+            ChecksumEcho::Verified | ChecksumEcho::NotReturned | ChecksumEcho::NotChecked(_) => {
+                None
+            }
+        }
+    }
+}
+
+/// PUT a probe object at `key` with the store's upload checksum, GET it whole
+/// with checksum mode, and report whether the endpoint returned the checksum
+/// it stored. The probe object is deleted whatever the outcome.
+///
+/// The S3 adapter verifies a returned CRC-64/NVME checksum against the body it
+/// received and fails the read as corrupted on a mismatch, and counts a read
+/// that came back with no checksum on [`S3Store::get_unverified`]; this reads
+/// that count around its own GET. A returned SHA-256 checksum is counted the
+/// same way, so under `sha256` a missing checksum cannot be told from a
+/// returned one and the check does not run.
+///
+/// [`S3Store::get_unverified`]: ravel_object_store::s3::S3Store::get_unverified
+pub async fn checksum_echo(built: &BuiltStore, key: &str) -> ChecksumEcho {
+    let BuiltStore::S3 { store, http } = built else {
+        return ChecksumEcho::NotChecked(
+            "not an S3 store: no upload checksum is stored or returned".to_string(),
+        );
+    };
+    match http.upload_integrity {
+        UploadIntegrity::Off => {
+            return ChecksumEcho::NotChecked("upload integrity off".to_string());
+        }
+        UploadIntegrity::Sha256 => {
+            return ChecksumEcho::NotChecked(
+                "upload integrity sha256: a stored SHA-256 checksum is not recomputed on read, so \
+                 its return cannot be observed"
+                    .to_string(),
+            );
+        }
+        UploadIntegrity::Crc64Nvme => {}
+    }
+    if !http.request_stored_checksum {
+        return ChecksumEcho::NotChecked(
+            "--s3-request-stored-checksum=false: the stored checksum is not requested".to_string(),
+        );
+    }
+
+    let body = Bytes::from_static(CHECKSUM_ECHO_BODY);
+    if let Err(err) = store.put(key, body.clone(), PutOptions::default()).await {
+        return ChecksumEcho::Failed(format!("the probe PUT of {key} failed: {err}"));
+    }
+    let unverified_before = store.get_unverified();
+    let read = store.get(key, GetRange::Full).await;
+    let unverified_after = store.get_unverified();
+    let outcome = match read {
+        Err(StoreError::Corrupted(detail)) => ChecksumEcho::Failed(format!(
+            "the endpoint returned a checksum for {key} that does not match the crc64nvme \
+             checksum sent with it: {detail}"
+        )),
+        Err(err) => ChecksumEcho::Failed(format!("the probe GET of {key} failed: {err}")),
+        Ok(got) if got.data != body => ChecksumEcho::Failed(format!(
+            "the probe GET of {key} returned {} bytes that differ from the {} bytes written",
+            got.data.len(),
+            body.len()
+        )),
+        Ok(_) if unverified_after == unverified_before => ChecksumEcho::Verified,
+        Ok(_) => ChecksumEcho::NotReturned,
+    };
+    match store.delete(key).await {
+        Ok(()) => outcome,
+        Err(err) if outcome.failure().is_none() => {
+            ChecksumEcho::Failed(format!("the probe object {key} was not deleted: {err}"))
+        }
+        Err(_) => outcome,
+    }
 }
 
 /// Probe `source` once for both informational reports and render them: the
