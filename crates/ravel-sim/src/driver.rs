@@ -143,14 +143,20 @@ impl ObjectStoreBackend for SharedStore {
 /// answer -- but the only `NotFound` this harness injects on the compaction
 /// read path is a one-shot eventual-consistency blip (`ScriptedFault::NotFoundBlip`,
 /// `Occurrence::Nth(1)`), and re-running the stateless, idempotent
-/// `compact_bucket` reads the object that is really there. Every other
-/// `MaintainError` (an invariant breach, a decode failure, a conservation
-/// violation) is surfaced immediately as a typed error, never retried.
+/// `compact_bucket` reads the object that is really there. `ClaimRenewFailed`
+/// carries the same retryable-store-fault shape as `Store` (ADR-1029, 2026-09-30
+/// amendment; issue #2156): the renewal it names failed with a genuine store
+/// error, not a lost claim, and the claim it left in place is this same
+/// process's to reclaim on the retried run. Every other `MaintainError` (an
+/// invariant breach, a decode failure, a conservation violation) is surfaced
+/// immediately as a typed error, never retried.
 fn is_recoverable_maintain_error(e: &MaintainError) -> bool {
-    matches!(
-        e,
-        MaintainError::Store(se) if se.is_retryable() || matches!(se, StoreError::NotFound)
-    )
+    let retryable = |se: &StoreError| se.is_retryable() || matches!(se, StoreError::NotFound);
+    match e {
+        MaintainError::Store(se) => retryable(se),
+        MaintainError::ClaimRenewFailed { source, .. } => retryable(source),
+        _ => false,
+    }
 }
 
 /// Knobs for [`run_cycle`]. `shard_count` applies uniformly to both

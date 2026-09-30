@@ -441,6 +441,79 @@ pub enum Steal {
     Refused(StealRefused),
 }
 
+/// The result of a [`reclaim`].
+#[derive(Debug)]
+pub enum Reclaim {
+    /// This owner took its own claim back. `version` is the fresh CAS token
+    /// for its renewals.
+    Acquired {
+        key: String,
+        version: Version,
+        payload: CompactionClaim,
+    },
+    /// The CAS precondition failed: a concurrent write (a sibling attempt in
+    /// this same process, or a second reclaim racing this one) moved the
+    /// version first.
+    Lost,
+    /// Refused locally, with no store request: the observed holder is not
+    /// this owner's own process id.
+    Refused,
+}
+
+/// Take back a claim this process itself is already holding, without
+/// requiring it to be expired (ADR-1029, 2026-09-30 amendment; issue #2156).
+///
+/// An observed claim whose holder process id equals `owner.process_id` can
+/// only be one of two things: a claim this process left in place after a
+/// renewal that failed with a genuine store error (never confirmed lost, so
+/// never stolen by anyone else), or, in the unlikely case of two concurrent
+/// runs of the same bucket in one process, a sibling attempt that will lose
+/// its next renewal and cancel. Either way, taking it back costs nothing
+/// correctness-wise: claims are advisory, and the worst case is a cancelled
+/// or duplicated merge, never incorrect data.
+///
+/// Refused locally, with no store request at all, unless
+/// `observed.holder_process_id() == Some(owner.process_id)`. Otherwise this
+/// CASes against the **observed** version exactly like [`steal`], so a
+/// concurrent write (a sibling's renewal, or a second reclaim) defeats it
+/// with [`Reclaim::Lost`]. Never a DELETE, and the payload format is
+/// unchanged: this writes the same [`CompactionClaim`] shape as every other
+/// mutation in this module.
+pub async fn reclaim(
+    store: &dyn ObjectStoreBackend,
+    observed: &ClaimObservation,
+    owner: &ClaimOwner,
+    cfg: &ClaimConfig,
+) -> Result<Reclaim, StoreError> {
+    if observed.holder_process_id() != Some(owner.process_id) {
+        return Ok(Reclaim::Refused);
+    }
+
+    // A fresh acquisition: `renewed_count` restarts at 0 and `attempt_id` is
+    // this call's own, so a reclaimed claim is distinguishable from one
+    // merely renewed in place.
+    let payload = owner.payload(cfg);
+    match store
+        .put(
+            &observed.key,
+            payload.encode_to_vec().into(),
+            PutOptions {
+                mode: PutMode::CasVersion(observed.version.clone()),
+                checksum: None,
+            },
+        )
+        .await
+    {
+        Ok(outcome) => Ok(Reclaim::Acquired {
+            key: observed.key.clone(),
+            version: outcome.version,
+            payload,
+        }),
+        Err(StoreError::PreconditionFailed) => Ok(Reclaim::Lost),
+        Err(err) => Err(err),
+    }
+}
+
 /// The result of a [`mark_completed`].
 #[derive(Debug)]
 pub enum Completion {

@@ -86,6 +86,19 @@
 //! steal answered either way is the same lost race
 //! ([`ClaimSkipReason::StealLost`]), and a completion answered either way is a
 //! no-op.
+//!
+//! # A process reclaims its own leftover claim at once
+//!
+//! A renewal that fails with a genuine store error aborts the run
+//! ([`crate::error::MaintainError::ClaimRenewFailed`]) and leaves the claim in
+//! place: it was never confirmed lost, so it is never released. The next time
+//! this same process contends for that bucket, [`ClaimGuard::contend`]
+//! recognizes the observed holder as itself (by process id) and reclaims the
+//! claim at once via [`ravel_fleet::claim::reclaim`], without waiting for the
+//! lease to expire and without the jitter wait a contended steal pays. A
+//! reclaim is reported as an acquisition, not a steal; a different process
+//! still waits out the lease as before (ADR-1029, 2026-09-30 amendment; issue
+//! #2156).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -93,8 +106,8 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 
 use ravel_fleet::claim::{
-    self, Acquisition, ClaimConfig, ClaimObservation, ClaimOwner, Completion, Renewal, Steal,
-    WorkId, WorkIdentity, jitter_ms,
+    self, Acquisition, ClaimConfig, ClaimObservation, ClaimOwner, Completion, Reclaim, Renewal,
+    Steal, WorkId, WorkIdentity, jitter_ms,
 };
 use ravel_object_store::{ObjectStoreBackend, StoreError, Version};
 use ravel_proto::sys::v1::CompactionClaim;
@@ -511,6 +524,39 @@ impl ClaimGuard {
             return Ok(self
                 .past_unreadable(&observed, now_ms)
                 .unwrap_or_else(|| skip(ClaimSkipReason::UnreadableClaim)));
+        }
+        if observed.holder_process_id() == Some(inner.owner.process_id) {
+            // This process's own claim, left in place by a renewal that
+            // failed with a genuine store error rather than being lost to
+            // another owner. No contention with another process, so no
+            // jitter wait, and no requirement that it be expired.
+            return match claim::reclaim(store, &observed, &inner.owner, &inner.cfg).await? {
+                Reclaim::Acquired {
+                    key,
+                    version,
+                    payload,
+                } => {
+                    self.note_requests(1).await;
+                    let now_ns = inner.clock.now_ns();
+                    let mut state = inner.state.lock().await;
+                    state.held = Some(Held {
+                        key,
+                        version,
+                        payload,
+                        last_write_ns: now_ns,
+                    });
+                    // `stolen` stays false: a reclaim of this process's own
+                    // claim is reported as an acquisition, not a steal.
+                    Ok(Acquire::Acquired)
+                }
+                Reclaim::Lost => {
+                    self.note_requests(1).await;
+                    Ok(skip(ClaimSkipReason::StealLost))
+                }
+                Reclaim::Refused => Err(MaintainError::Invariant(
+                    "reclaim refused despite a matching holder process id".to_string(),
+                )),
+            };
         }
         if !observed.is_expired(now_ms) {
             return Ok(skip(ClaimSkipReason::HeldByAnother));
