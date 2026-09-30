@@ -5091,6 +5091,7 @@ dependencies = [
  "ravel-pqtable",
  "ravel-query",
  "ravel-types",
+ "tempfile",
  "thiserror",
  "tokio",
  "url",
