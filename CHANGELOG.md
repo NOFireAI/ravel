@@ -625,14 +625,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   repeated element where one value is expected (a rule's `Status`,
   `NoncurrentDays`, `DeleteMarkerReplication`, and the rest), or a day count
   that does not parse, is `Unknown`); `no-foreign-rule` passes only when no
-  rule that can reach `t/`
-  or `sys/` carries a transition, a current-version expiration, or a
-  `NoncurrentDays` shorter than the reference (the expected value, else the one
-  value the covering rules agree on). A `NoncurrentDays` below the reference
-  fails `no-foreign-rule`, and also `noncurrent-expiration` when the rule
-  reaches part of `t/`; with no reference to compare against, the same rule is
-  `Unknown` there instead. `DeleteMarkerReplication` `Disabled` on a rule over
-  part of `t/` fails `delete-marker-replication`. A 404 is "not configured"
+  rule that can reach `t/` or `sys/` carries a transition or a current-version
+  expiration, and no rule other than a sanctioned covering rule or a member of
+  the complete `t/0` .. `t/f` union carries a `NoncurrentDays` shorter than
+  the reference (the expected value, else the one value the covering rules
+  agree on). Such a `NoncurrentDays` fails `no-foreign-rule`,
+  and also `noncurrent-expiration` when the rule reaches part of `t/`; with no
+  reference to compare against, the same rule is `Unknown` there instead. On
+  a sanctioned covering rule or union member it fails `noncurrent-expiration`
+  only, so one misconfiguration counts once. `DeleteMarkerReplication` `Disabled` on a rule
+  over part of `t/` fails `delete-marker-replication`. A 404 is "not configured"
   only when its `<Error><Code>` is that call's own code
   (`NoSuchLifecycleConfiguration`, `ReplicationConfigurationNotFoundError`,
   `ObjectLockConfigurationNotFoundError`, or `NoSuchObjectLockConfiguration`
@@ -672,10 +674,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   any status) and `response_bytes` (response-body wire bytes as received);
   the block is outside `StoreOp::ALL` and `StoreMetricsSnapshot`, so the
   data plane's `get` and `list` blocks are unchanged and nothing exports it
-  yet. The lifecycle conditions also accept a union of enabled rules on
-  exactly `t/0` through `t/f`, one per lowercase hex digit a tenant hash can
-  start with, each member's values checked as a covering rule's are; any other
-  set of narrower prefixes stays `Unknown`. `BucketProtectionParams` gains
+  yet. The lifecycle conditions and `delete-marker-replication` also accept a
+  union of enabled rules on exactly `t/0` through `t/f`, one per lowercase hex
+  digit a tenant hash can start with, each member's values checked as a
+  covering rule's are; any other set of narrower prefixes stays `Unknown`. The
+  signed `host` is the authority the request carries, derived from the parsed
+  URL as `reqwest` derives its `Host` (host lowercased, IDNA hosts in punycode,
+  IP literals normalised, the scheme's default port dropped), so an endpoint
+  configured as `https://host:443`, with an uppercase or non-ASCII host, or
+  with a leading-zero port is not answered 403. An endpoint carrying userinfo
+  (`https://user:secret@host`) is refused as `Unknown` rather than sent with
+  a second `Authorization` header. The server's `--require-bucket-protection` gate asks both probes through one
+  `BucketProbesSource` call too. Neither `store qualify` nor the server gate
+  is handed an `S3Store` yet: both probe through the `ObjectStoreBackend`
+  contract, so against a real bucket they report every condition `Unknown`
+  (issue #2197). `BucketProtectionParams` gains
   `expect_replication` (the CLI's `--expect-replication`): when it is off, as
   on the server, `?replication` is not fetched and `delete-marker-replication`
   is `Unknown` the way unsampled `object-retention` is, never `Fail`.
