@@ -106,8 +106,11 @@ HEAD no longer names, and a retention covering them pauses that sweep for the
 tenant and signal it fires on. A lock on a superseded *input* commit
 record extends the erasure bound rather than only deferring reclamation: the
 sweep deletes a chain's input commit records before the data they supersede,
-so a refusal there aborts the pass before the data-delete step and that data
-stays behind the locked record. A lock on a chain's own compaction or rewrite
+so a refusal there stops only the chain it belongs to, before that chain's
+data-delete step, and that data stays behind the locked record while every
+other chain in the pass is still collected. A pass in which every delete it
+attempted was refused fails with the first refusal's error. A lock on a
+chain's own compaction or rewrite
 record does not hold data that way: by the time the sweep reaches those
 records it has already deleted the chain's inputs and their data, so the
 refusal only leaves the chain's own record in place until its retention

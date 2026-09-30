@@ -28,13 +28,15 @@ use common::*;
 use ravel_commit::{erasure, keys, record, signal};
 use ravel_maintain::migrate::largest_overlap_component;
 use ravel_maintain::{
-    Bucket, CompactorConfig, FixedClock, HeldBucket, LeaseCheck, NoLeases, PendingErasureRequest,
-    SupersededSweepOutcome, bucket_erasure_completion, count_below_target, sweep_erasure_requests,
-    sweep_superseded, sweep_unreferenced_parts,
+    Bucket, CompactorConfig, FixedClock, HeldBucket, LeaseCheck, MaintainError, NoLeases,
+    PendingErasureRequest, SupersededSweepOutcome, bucket_erasure_completion, count_below_target,
+    sweep_erasure_requests, sweep_superseded, sweep_unreferenced_parts,
 };
-use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+use ravel_object_store::fault::{
+    FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+};
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{ObjectStoreBackend, PutOptions, list_all};
+use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreError, list_all};
 use ravel_proto::catalog::v1::{SnapshotEntry, SnapshotHead, SnapshotPartRef};
 use ravel_proto::commit::v1::{
     CompactionInputIdentity, CompactionPart, CompactionRecord, ErasureCompletion,
@@ -2007,12 +2009,69 @@ async fn rule_6_holds_a_request_whichever_duplicate_gather_comes_first() {
 }
 
 /// Two chains in one bucket, each a rewrite R over a compaction C over two
-/// raw inputs, and a store that refuses (a permanent error, as an Object Lock
-/// retention reads) every delete of chain A's first input commit record. Past
-/// every horizon with no HEAD, the pass returns `Ok`: chain B's two input
-/// records, their data, C_B and its part go, nothing of chain A is deleted,
-/// the refusal is counted once, and R_A's request is reported held. A clean
-/// pass afterwards collects chain A.
+/// raw inputs: chain A is R_A over C_A over inputs 0xB1 and 0xB2, chain B is
+/// R_B over C_B over inputs 0xB3 and 0xB4.
+struct TwoChains {
+    inputs: Vec<(String, String)>,
+    c_b: CompactionRecord,
+    c_b_key: String,
+    request_a: Uuid,
+    r_a: RewriteRecord,
+    r_b: RewriteRecord,
+}
+
+async fn seed_two_chains(store: &dyn ObjectStoreBackend, b: &Bucket) -> TwoChains {
+    let base = hour_ns();
+    let inputs = seed_inputs(store, &[(0xB1, 1), (0xB2, 2), (0xB3, 3), (0xB4, 4)]).await;
+    let c_a = version_1(
+        b,
+        vec![input(0xB1, 1), input(0xB2, 2)],
+        0x01,
+        part(0xa1, base, base + 10_000),
+    );
+    let c_a_key = put_compaction(store, &c_a).await;
+    let c_b = version_1(
+        b,
+        vec![input(0xB3, 3), input(0xB4, 4)],
+        0x02,
+        part(0xb1, base, base + 10_000),
+    );
+    let c_b_key = put_compaction(store, &c_b).await;
+    let request_a = Uuid::from_u128(0xa0);
+    let r_a = put_rewrite(
+        store,
+        b,
+        &c_a_key,
+        request_a,
+        part(0xa2, base, base + 10_000),
+    )
+    .await;
+    let r_b = put_rewrite(
+        store,
+        b,
+        &c_b_key,
+        Uuid::from_u128(0xb0),
+        part(0xb2, base, base + 10_000),
+    )
+    .await;
+    TwoChains {
+        inputs,
+        c_b,
+        c_b_key,
+        request_a,
+        r_a,
+        r_b,
+    }
+}
+
+/// [`seed_two_chains`] and a store that refuses every delete of chain A's
+/// first input commit record, as a deny policy on that one key does (403,
+/// access denied). FaultStore injects a permanent error because it cannot
+/// inject access denied on a delete; both are classified refused. Past every
+/// horizon with no HEAD, the pass returns `Ok`: chain B's two input records,
+/// their data, C_B and its part go, nothing of chain A is deleted, the
+/// refusal is counted once, and R_A's request is reported held. A clean pass
+/// afterwards collects chain A.
 ///
 /// Flipped line: the `Err(e) if delete_refused(&e)` arm in phase C of
 /// `sweep_superseded_impl` (sweep.rs) removed, so the refusal takes the
@@ -2022,45 +2081,20 @@ async fn rule_6_holds_a_request_whichever_duplicate_gather_comes_first() {
 async fn a_refused_record_delete_stops_only_its_own_chain() {
     let mem = Arc::new(MemoryStore::new());
     let b = logs_bucket();
-    let base = hour_ns();
-    let inputs = seed_inputs(mem.as_ref(), &[(0xB1, 1), (0xB2, 2), (0xB3, 3), (0xB4, 4)]).await;
-    let c_a = version_1(
-        &b,
-        vec![input(0xB1, 1), input(0xB2, 2)],
-        0x01,
-        part(0xa1, base, base + 10_000),
-    );
-    let c_a_key = put_compaction(mem.as_ref(), &c_a).await;
-    let c_b = version_1(
-        &b,
-        vec![input(0xB3, 3), input(0xB4, 4)],
-        0x02,
-        part(0xb1, base, base + 10_000),
-    );
-    let c_b_key = put_compaction(mem.as_ref(), &c_b).await;
-    let request_a = Uuid::from_u128(0xa0);
-    let r_a = put_rewrite(
-        mem.as_ref(),
-        &b,
-        &c_a_key,
+    let TwoChains {
+        inputs,
+        c_b,
+        c_b_key,
         request_a,
-        part(0xa2, base, base + 10_000),
-    )
-    .await;
-    let r_b = put_rewrite(
-        mem.as_ref(),
-        &b,
-        &c_b_key,
-        Uuid::from_u128(0xb0),
-        part(0xb2, base, base + 10_000),
-    )
-    .await;
+        r_a,
+        r_b,
+    } = seed_two_chains(mem.as_ref(), &b).await;
     let before = bucket_keys(mem.as_ref()).await;
 
-    let locked = inputs[0].0.clone();
+    let denied = inputs[0].0.clone();
     let plan = FaultPlan::empty().with_rule(
-        Rule::new(Op::Delete, ScriptedFault::Permanent("object locked".into()))
-            .with_key_contains(&locked),
+        Rule::new(Op::Delete, ScriptedFault::Permanent("delete denied".into()))
+            .with_key_contains(&denied),
     );
     let store = FaultStore::new(mem.clone(), plan);
     let outcome = sweep_at(&store, &b, past_horizon_ns(), &NoLeases).await;
@@ -2096,6 +2130,131 @@ async fn a_refused_record_delete_stops_only_its_own_chain() {
             rewrite_key(&r_b),
             rewrite_part_key(&r_b),
         ])
+    );
+}
+
+/// [`seed_two_chains`] under a store that refuses every delete, as a
+/// credential without delete permission does (403, access denied, on every
+/// key). FaultStore injects a permanent error because it cannot inject access
+/// denied on a delete; both are classified refused. Each chain's first
+/// delete, its first input commit record, is refused and stops that chain, so
+/// the pass attempts exactly two deletes, deletes nothing, and fails with the
+/// first refusal's error instead of returning `Ok` with both chains held.
+///
+/// Flipped line: the `return Err(e.into());` under `if deletes_succeeded == 0`
+/// at the end of phase C in `sweep_superseded_impl` (sweep.rs) removed. The
+/// pass then returns `Ok` with `deletes_refused` 2 and the `expect_err` below
+/// panics.
+#[tokio::test]
+async fn a_pass_whose_every_delete_is_refused_fails() {
+    let mem = Arc::new(MemoryStore::new());
+    let b = logs_bucket();
+    seed_two_chains(mem.as_ref(), &b).await;
+    let before = bucket_keys(mem.as_ref()).await;
+
+    let plan = FaultPlan::empty().with_rule(Rule::new(
+        Op::Delete,
+        ScriptedFault::Permanent("delete denied".into()),
+    ));
+    let store = FaultStore::new(mem.clone(), plan);
+    let err = sweep_superseded(
+        &store,
+        &FixedClock::new(past_horizon_ns()),
+        &cfg(),
+        &NoLeases,
+        &b.tenant_hash,
+        b.signal,
+        b.shard,
+    )
+    .await
+    .expect_err("a pass whose every attempted delete was refused fails");
+    assert!(
+        matches!(
+            &err,
+            MaintainError::Store(StoreError::Permanent(message)) if message == "delete denied"
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        store.fault_count(Op::Delete, FaultKind::Permanent),
+        2,
+        "one refused delete per chain, then each chain stops"
+    );
+    assert_eq!(bucket_keys(mem.as_ref()).await, before);
+}
+
+/// Two groups sharing one input commit record. C1 is a compaction over inputs
+/// 0xD2 then 0xD1 and R1 a rewrite over it, so R1's chain group deletes
+/// 0xD2's record and then 0xD1's. C2 is a live compaction over 0xD1 alone, so
+/// 0xD1 is also a raw L0 group of its own, under a different identity. The
+/// store refuses the first delete of 0xD1's record only (a deny policy on
+/// that key, injected as a permanent error because FaultStore cannot inject
+/// access denied on a delete; both are classified refused). Whichever group
+/// reaches 0xD1 first is refused there, and the other meets a key already
+/// refused and stops without asking again: one fault, one refusal, and only
+/// 0xD2's record deleted, whichever group comes first. That one successful
+/// delete keeps the pass `Ok`.
+///
+/// Flipped line: `|| refused.contains(k.as_str())` in phase C of
+/// `sweep_superseded_impl` (sweep.rs) removed. The second group then deletes
+/// 0xD1's record on its own attempt and goes on to delete data, so
+/// `(records_deleted, data_deleted)` reads (3, 3) or (2, 1), not (1, 0).
+#[tokio::test]
+async fn a_group_meeting_a_key_another_group_was_refused_on_stops() {
+    let mem = Arc::new(MemoryStore::new());
+    let b = logs_bucket();
+    let base = hour_ns();
+    let inputs = seed_inputs(mem.as_ref(), &[(0xD1, 1), (0xD2, 2)]).await;
+    let c1 = version_1(
+        &b,
+        vec![input(0xD2, 2), input(0xD1, 1)],
+        0x01,
+        part(0xd1, base, base + 10_000),
+    );
+    let c1_key = put_compaction(mem.as_ref(), &c1).await;
+    let c2 = version_1(
+        &b,
+        vec![input(0xD1, 1)],
+        0x02,
+        part(0xd2, base, base + 10_000),
+    );
+    put_compaction(mem.as_ref(), &c2).await;
+    let request = Uuid::from_u128(0xd0);
+    put_rewrite(
+        mem.as_ref(),
+        &b,
+        &c1_key,
+        request,
+        part(0xd3, base, base + 10_000),
+    )
+    .await;
+    let before = bucket_keys(mem.as_ref()).await;
+
+    let shared = inputs[0].0.clone();
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Delete, ScriptedFault::Permanent("delete denied".into()))
+            .with_key_contains(&shared)
+            .with_occurrence(Occurrence::Nth(1)),
+    );
+    let store = FaultStore::new(mem.clone(), plan);
+    let outcome = sweep_at(&store, &b, past_horizon_ns(), &NoLeases).await;
+    assert_eq!(store.fault_count(Op::Delete, FaultKind::Permanent), 1);
+    assert_eq!(
+        (
+            outcome.records_deleted,
+            outcome.data_deleted,
+            outcome.deletes_refused
+        ),
+        (1, 0, 1)
+    );
+    assert_eq!(
+        outcome.held_request_ids,
+        BTreeSet::from([request.to_string()])
+    );
+    let after = bucket_keys(mem.as_ref()).await;
+    assert_eq!(
+        before.difference(&after).cloned().collect::<BTreeSet<_>>(),
+        BTreeSet::from([inputs[1].0.clone()])
     );
 }
 

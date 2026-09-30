@@ -1045,11 +1045,14 @@ pub struct SupersededSweepOutcome {
     /// by a deleting pass only.
     pub dominated_records_unattached: usize,
     /// Deletes the store refused this pass (access denied, a failed
-    /// precondition, or a permanent error, such as an Object Lock retention
-    /// on one record). Not fatal: the refusing group keeps every key it had
-    /// not yet deleted, is reported held, and is retried next pass, while the
-    /// other groups are collected. A persistent nonzero value is an operator
-    /// signal. Counter seam for `ravel_maintain_superseded_deletes_refused_total`.
+    /// precondition, or a permanent error, such as a deny policy on part of
+    /// the keyspace). Not fatal while at least one delete in the pass
+    /// succeeds: the refusing group keeps every key it had not yet deleted and
+    /// is reported held, the next pass whose scope includes that hour retries
+    /// it, and the other groups are collected. A pass in which every delete it
+    /// attempted was refused fails with the first refusal's error instead. The
+    /// count is on this outcome and each refusal is logged at WARN; a
+    /// persistent nonzero value is an operator signal.
     pub deletes_refused: usize,
 }
 
@@ -1118,7 +1121,9 @@ impl SupersededHolds {
 /// A delete the store refuses (access denied, a failed precondition, or a
 /// permanent error) keeps the rest of its own supersession chain for the next
 /// pass and is counted in [`SupersededSweepOutcome::deletes_refused`]; the
-/// other chains are still collected. Any other store error fails the pass.
+/// other chains are still collected. A pass in which every delete it attempted
+/// was refused fails with the first refusal's error, and any other store error
+/// fails the pass.
 pub async fn sweep_superseded(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -1548,15 +1553,25 @@ async fn sweep_superseded_impl(
     // key is deleted and counted once per pass.
     //
     // A delete the store refuses ([`delete_refused`]) stops only the group it
-    // belongs to: none of that group's later keys is deleted this pass, in
-    // any of the three loops, so what survives of it is a suffix of its own
-    // delete order, the same state a crash at that point leaves. A group that
-    // meets a key another group's delete was refused on stops there too. Every
-    // stopped group is reported held, since objects it superseded may still
-    // be present. Any other store error fails the pass.
+    // belongs to: that group deletes none of its later keys this pass, in any
+    // of the three loops, so its own deletes stop where a crash at that key
+    // would stop them. A group that meets a key another group's delete was
+    // refused on stops there too. Another group can still delete a key in a
+    // stopped group's tail when the two share it, and that is safe: a group
+    // moves past a key only once that key is deleted, and every object a
+    // record supersedes sits earlier in that record's own group. Every stopped
+    // group is reported held, since objects it superseded may still be
+    // present.
+    //
+    // A pass in which every delete it attempted was refused fails with the
+    // first refusal's error: a credential that may not delete anywhere refuses
+    // every group, and that is a store-wide fault, not one chain's. Any other
+    // store error fails the pass.
     let mut deleted: HashSet<&str> = HashSet::new();
     let mut refused: HashSet<&str> = HashSet::new();
     let mut stopped: Vec<bool> = vec![false; cleared.len()];
+    let mut deletes_succeeded = 0usize;
+    let mut first_refusal: Option<StoreError> = None;
     for delete_loop in [
         DeleteLoop::InputRecords,
         DeleteLoop::Data,
@@ -1573,7 +1588,7 @@ async fn sweep_superseded_impl(
                 }
                 if !config.dry_run {
                     match store.delete(k).await {
-                        Ok(()) => {}
+                        Ok(()) => deletes_succeeded += 1,
                         Err(e) if delete_refused(&e) => {
                             tracing::warn!(
                                 tenant_hash = %tenant.to_hex(),
@@ -1583,11 +1598,12 @@ async fn sweep_superseded_impl(
                                 key = %k,
                                 error = %e,
                                 "superseded-input sweep: the store refused a delete; the rest of \
-                                 this supersession chain is kept and retried next pass, and the \
-                                 other chains are still collected"
+                                 this supersession chain is kept for the next pass over its hour, \
+                                 and the other chains are still collected"
                             );
                             refused.insert(k);
                             outcome.deletes_refused += 1;
+                            first_refusal.get_or_insert(e);
                             stopped[index] = true;
                             break;
                         }
@@ -1603,6 +1619,11 @@ async fn sweep_superseded_impl(
             }
         }
     }
+    if deletes_succeeded == 0
+        && let Some(e) = first_refusal
+    {
+        return Err(e.into());
+    }
     for (group, _) in cleared.iter().zip(&stopped).filter(|(_, s)| **s) {
         outcome.note_hold(group, shard);
     }
@@ -1610,10 +1631,13 @@ async fn sweep_superseded_impl(
 }
 
 /// Whether a failed delete is a refusal of that one object, which rule 2's
-/// phase C tolerates per supersession chain: access denied (an S3 Object Lock
-/// retention or a deny policy on the key), a failed precondition, and a
-/// permanent error. A retryable error, and a store that cannot delete at all
-/// (read-only, or no delete support), still fail the pass.
+/// phase C tolerates per supersession chain: access denied (a deny policy on
+/// part of the keyspace, for example), a failed precondition, and a permanent
+/// error. A pass in which every delete it attempted was refused still fails,
+/// with the first refusal's error; a pass with at least one successful delete
+/// and some refusals succeeds and counts them. A retryable error, a read-only
+/// store, and a backend with no delete support fail the pass on the first
+/// delete.
 fn delete_refused(e: &StoreError) -> bool {
     matches!(
         e,
@@ -3873,15 +3897,16 @@ mod tests {
     }
 
     /// Rule 2's phase C tolerates a refusal of one object and fails the pass
-    /// on anything else: a retryable error, and a store that cannot delete at
-    /// all.
+    /// on anything else: a retryable error, a read-only store, and a backend
+    /// with no delete support. A pass whose every attempted delete was refused
+    /// fails too, which the superseding_compaction_record tests cover.
     #[test]
     fn only_a_per_object_refusal_is_tolerated() {
         use ravel_object_store::StoreError;
         for refused in [
-            StoreError::AccessDenied("locked".into()),
+            StoreError::AccessDenied("denied".into()),
             StoreError::PreconditionFailed,
-            StoreError::Permanent("locked".into()),
+            StoreError::Permanent("denied".into()),
         ] {
             assert!(super::delete_refused(&refused), "{refused:?}");
         }

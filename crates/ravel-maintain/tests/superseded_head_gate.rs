@@ -784,7 +784,7 @@ async fn seed_dreq_and_done(
 ///
 /// Flip-line proof, two lines, one per direction. Drop the
 /// `holds.request_ids.contains(...)` arm of the `held` decision in
-/// `sweep_erasure_requests_inner` and the `.dreq` disappears at its horizon
+/// `sweep_erasure_requests` and the `.dreq` disappears at its horizon
 /// while the held inputs are still resolvable from the stale snapshot, failing
 /// the ordering assertion at step 3. Replace the `reach.object_gate(...)` match
 /// in `sweep_superseded_impl` with `SnapshotGate::Clear` and the inputs are
@@ -1352,7 +1352,7 @@ async fn three_deep_chain_holds_case(drops: Drops) {
 /// all three filters on the next pass.
 ///
 /// Flip-line proof, one per half. Drop the truncated-bucket arm of the `held`
-/// decision in `sweep_erasure_requests_inner` (keep only
+/// decision in `sweep_erasure_requests` (keep only
 /// `holds.request_ids.contains(...)`): X is named by no record, so its filter
 /// is deleted at step 3 and the `deleted == 0` assertion fails. For the
 /// termination half, make `gather_superseded_chain` return a group for a chain
@@ -1524,7 +1524,7 @@ async fn cut_chain_holds_the_bucket_case(drops: Drops) {
 /// clears it.
 ///
 /// Flip-line proof: replace the `held` decision in
-/// `sweep_erasure_requests_inner` with `false`. Both filters are then deleted
+/// `sweep_erasure_requests` with `false`. Both filters are then deleted
 /// at step 2 while the stale snapshot still names the inputs, and the ordering
 /// assertion at that step fails on `.dreq_X`.
 #[tokio::test]

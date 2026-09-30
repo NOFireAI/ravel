@@ -746,9 +746,12 @@ async fn row8d_locked_chain_record_aborts_after_inputs_and_data_gone() {
 
 // --- Row 8e: a refused commit-record delete stops only its own group -------
 
-/// Row 8e: the store refuses (a permanent error, as an Object Lock retention
-/// reads) every delete of one of the two superseded L0 commit records. A
-/// refusal is not a retryable error: the pass returns `Ok`, counts it once in
+/// Row 8e: the store refuses every delete of one of the two superseded L0
+/// commit records, as a deny policy on that one key does (403, access
+/// denied). FaultStore injects a permanent error because it cannot inject
+/// access denied on a delete; both are classified refused. A refusal is not a
+/// retryable error, and the other input's deletes succeed, so the pass
+/// returns `Ok`, counts it once in
 /// `deletes_refused`, keeps that input's commit record and data object, and
 /// still deletes the other input's commit record and data object, since each
 /// raw input is its own deletion group. The compaction record and its L1
@@ -768,10 +771,10 @@ async fn row8e_refused_commit_record_delete_stops_only_its_own_group() {
         let commits = l0_commit_keys(&inner, &bucket).await;
         assert_eq!(commits.len(), 2, "the fixture holds two superseded inputs");
         assert_eq!(l0_data_count(&inner, &bucket).await, 2);
-        let locked = commits[0].clone();
+        let denied = commits[0].clone();
         let plan = FaultPlan::empty().with_rule(
-            Rule::new(Op::Delete, ScriptedFault::Permanent("object locked".into()))
-                .with_key_contains(&locked),
+            Rule::new(Op::Delete, ScriptedFault::Permanent("delete denied".into()))
+                .with_key_contains(&denied),
         );
         let store = FaultStore::new(inner, plan);
 
@@ -794,7 +797,7 @@ async fn row8e_refused_commit_record_delete_stops_only_its_own_group() {
         );
         assert_eq!(outcome.deletes_refused, 1);
         assert_eq!((outcome.records_deleted, outcome.data_deleted), (1, 1));
-        assert_eq!(l0_commit_keys(&store, &bucket).await, vec![locked]);
+        assert_eq!(l0_commit_keys(&store, &bucket).await, vec![denied]);
         assert_eq!(
             l0_data_count(&store, &bucket).await,
             1,

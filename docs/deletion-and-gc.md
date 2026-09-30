@@ -803,17 +803,24 @@ into them. An operator with erasure obligations must budget them deliberately.
   commit records first, then every chain's input data objects, then every
   chain's own compaction or rewrite records last. A refused delete (access
   denied, a failed precondition, or a permanent error) stops only the chain
-  it belongs to: none of that chain's later keys is deleted in that pass, in
-  any of the three loops, so what survives is the tail of its own delete
-  order, the same state a crash at that point leaves. The pass reports the
-  chain's requests as held, counts the refusal in its `deletes_refused`, and
-  still collects every other chain. A lock on a chain's input commit record therefore holds that
+  it belongs to: that chain deletes none of its later keys in that pass, in
+  any of the three loops, so its own deletes stop where a crash at that key
+  would stop them. Another chain can still delete a key in the stopped
+  chain's tail when the two share it, and that is safe: a chain moves past a
+  key only once that key is deleted, and every object a record supersedes
+  sits earlier in that record's own chain. The pass reports the chain's
+  requests as held, counts the refusal in its `deletes_refused`, and still
+  collects every other chain, provided at least one delete in the pass
+  succeeds. A pass in which every delete it attempted was refused fails with
+  the first refusal's error, which is what a credential without delete
+  permission produces. A lock on a chain's input commit record therefore holds that
   chain's data at `max(bound, R)` until `R` elapses. A lock on a chain's own
   compaction or rewrite record is met only after that chain's input records
   and their data are already gone: it holds only that record, and the ones
   above it, at `max(bound, R)`, for the next pass to retry. A delete that
-  fails with a retryable error (a timeout, throttling, a transient fault), or
-  a store that cannot delete at all, still fails the whole pass. `sys/*`, `t/*/*/prov`, and
+  fails with a retryable error (a timeout, throttling, a transient fault), a
+  read-only store, or a backend with no delete support still fails the whole
+  pass. `sys/*`, `t/*/*/prov`, and
   `t/*/catalog/*/*` carry the same scoped retention but are never targets
   of supersession GC, ADR-0019 retention deletion, or ADR-0064 erasure.
   That is a statement about those three mechanisms and nothing wider: the
