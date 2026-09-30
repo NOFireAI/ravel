@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ravel_types::TenantHash;
 
-use crate::attribution::TenantPutAttribution;
+use crate::attribution::{TenantCount, TenantPutAttribution, TenantTopK};
 use crate::metrics::{FlushTrigger, ShardSkew, ShardSkewStats};
 
 #[derive(Debug, Default)]
@@ -284,11 +284,13 @@ pub struct LogIngestMetrics {
     put_attribution: TenantPutAttribution,
     /// Per-tenant count of flushed objects written with no sort descriptor and
     /// full bloom coverage because the tenant's stored clustering key or bloom
-    /// scope did not resolve against its declared typed columns (ADR-2135),
-    /// intended for export as `ingest_clustering_key_unresolved_total`
-    /// labelled by tenant. Only a tenant that hit that state has an entry.
-    /// Read via [`LogIngestMetrics::clustering_key_unresolved_by_tenant`].
-    clustering_key_unresolved: Mutex<HashMap<TenantHash, u64>>,
+    /// scope did not resolve (ADR-2135), intended for export as
+    /// `ingest_clustering_key_unresolved_total` labelled by tenant. Bounded
+    /// like `put_attribution` (ADR-0076 decision 2): the same top-K table, so
+    /// at most [`crate::MAX_TRACKED_TENANTS`] tenants carry a label, and the
+    /// tracked counts still sum to every unresolved flush recorded. Read via
+    /// [`LogIngestMetrics::clustering_key_unresolved_by_tenant`].
+    clustering_key_unresolved: TenantTopK,
 }
 
 /// Point-in-time copy of [`LogIngestMetrics`] for scraping. See the
@@ -730,22 +732,16 @@ impl LogIngestMetrics {
     /// full bloom coverage because the tenant's storage layout did not resolve
     /// (ADR-2135). Called from `run_flush` before the object is encoded.
     pub(crate) fn record_clustering_key_unresolved(&self, tenant: TenantHash) {
-        let mut map = self
-            .clustering_key_unresolved
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *map.entry(tenant).or_default() += 1;
+        self.clustering_key_unresolved.record(tenant, 1);
     }
 
     /// Point-in-time per-tenant unresolved-layout flush counts, sorted by
-    /// tenant hash. A tenant with no unresolved flush is absent.
-    pub fn clustering_key_unresolved_by_tenant(&self) -> Vec<(TenantHash, u64)> {
-        let map = self
-            .clustering_key_unresolved
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut counts: Vec<(TenantHash, u64)> = map.iter().map(|(&t, &n)| (t, n)).collect();
-        counts.sort_unstable_by_key(|&(tenant, _)| tenant);
+    /// tenant hash. A tenant with no unresolved flush is absent, and at most
+    /// [`crate::MAX_TRACKED_TENANTS`] tenants are present; a tenant admitted by
+    /// evicting another carries the evicted count in its `error` bound.
+    pub fn clustering_key_unresolved_by_tenant(&self) -> Vec<TenantCount> {
+        let mut counts = self.clustering_key_unresolved.counts();
+        counts.sort_unstable_by_key(|c| c.tenant);
         counts
     }
 
@@ -850,6 +846,38 @@ impl LogIngestMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-0076 decision 2: more tenants than the top-K cap, each with one
+    /// unresolved flush, leave exactly the cap's worth of labelled series, and
+    /// the tracked counts still sum to every flush recorded.
+    #[test]
+    fn unresolved_layout_counts_stay_bounded_and_keep_the_total() {
+        let metrics = LogIngestMetrics::default();
+        let extra = 5;
+        let tenants = crate::MAX_TRACKED_TENANTS + extra;
+        for i in 0..tenants {
+            let mut hash = [0u8; 16];
+            hash[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            metrics.record_clustering_key_unresolved(TenantHash(hash));
+        }
+        let counts = metrics.clustering_key_unresolved_by_tenant();
+        assert_eq!(counts.len(), crate::MAX_TRACKED_TENANTS);
+        assert_eq!(
+            counts.iter().map(|c| c.count).sum::<u64>(),
+            tenants as u64,
+            "every recorded flush stays in the tracked total"
+        );
+        // Each of the `extra` newcomers evicted a count-1 entry and inherited
+        // it; every other entry is exact.
+        let inherited: Vec<&TenantCount> = counts.iter().filter(|c| c.error > 0).collect();
+        assert_eq!(inherited.len(), extra);
+        assert!(inherited.iter().all(|c| c.count == 2 && c.error == 1));
+        assert_eq!(
+            metrics.tenant_put_attribution().tracked_len(),
+            0,
+            "the unresolved table is its own, not the PUT attribution"
+        );
+    }
 
     #[test]
     fn fresh_snapshot_is_all_zeros() {

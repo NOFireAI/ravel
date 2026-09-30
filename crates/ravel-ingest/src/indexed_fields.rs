@@ -324,9 +324,8 @@ impl IndexedFieldsOverlay {
             tracing::warn!(
                 tenant_hash = %tenant.to_hex(),
                 %error,
-                "tenant clustering key or bloom scope does not resolve against its declared \
-                 typed columns; log objects are written with no sort descriptor and full bloom \
-                 coverage"
+                "tenant clustering key or bloom scope does not resolve; log objects are written \
+                 with no sort descriptor and full bloom coverage"
             );
         }
         let mut inner = self.lock();
