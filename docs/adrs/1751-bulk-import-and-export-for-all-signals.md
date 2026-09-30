@@ -97,7 +97,8 @@ types across that boundary.
    `load(export(window))` round-trips every mapped field. An opt-in
    `attrs_map_column` carries the attributes the mapping does not name as
    one map column (not yet for spans; see the spans export amendment
-   below). Metrics samples are deduplicated per `(series, ts)` by
+   below, and the spans attrs map column amendment after it, which adds
+   it). Metrics samples are deduplicated per `(series, ts)` by
    bit pattern before writing, the rule the query path applies; logs and
    spans have no dedup and are exported as stored. (For metrics, which
    mapping shapes round-trip and how duplicates are resolved are settled by
@@ -267,6 +268,7 @@ carries in their rewritten form. Metrics export therefore narrows decision
 
 <!-- amendment-applies: sections="Decision" pointer="spans export amendment" -->
 
+<!-- amendment-supersedes-allow: the first sentence as first written; the paragraph closing this amendment names it as retired -->
 Decision 4's opt-in `attrs_map_column` is not available for spans yet: the
 `[spans]` mapping has no such key, on load or on export. Spans export
 therefore carries the mapped fields only, and narrows decision 4 as follows:
@@ -284,3 +286,56 @@ therefore carries the mapped fields only, and narrows decision 4 as follows:
   written. A span carrying one is exported without it rather than refused,
   and the report counts those spans as `spans_with_unwritten_data`, so a
   lossy export says how lossy it was.
+
+The spans attrs map column amendment below adds the key and retires this
+amendment's first sentence, "Decision 4's opt-in `attrs_map_column` is not
+available for spans yet: the `[spans]` mapping has no such key, on load or
+on export." The rest of this amendment stands for a mapping that leaves the
+key unset. With it set, an attribute the mapping does not name is written
+rather than counted, except where the load's per-span attribute cap leaves it
+no room, as that amendment says.
+
+## Amendment (2026-09-30): the spans mapping carries attrs_map_column
+
+<!-- amendment-applies: sections="Decision|Amendment (2026-09-30): spans export carries mapped fields only" pointer="spans attrs map column amendment" -->
+<!-- amendment-supersedes: phrase="not yet for spans" pointer="spans attrs map column amendment" -->
+<!-- amendment-supersedes: phrase="`attrs_map_column` is not available for spans yet: the `[spans]` mapping has no such key, on load or on export" pointer="spans attrs map column amendment" -->
+
+Issue #2216 gives the `[spans]` mapping the opt-in `attrs_map_column` that
+decision 4 promises. The spans export amendment's first sentence, which says
+the `[spans]` mapping has no such key, no longer holds; its second, that spans
+export carries the mapped fields only, holds only with the key unset; and its
+second bullet narrows to what the file still cannot carry:
+
+- The key has the logs section's spelling and output shape: one
+  `Map<Utf8, Utf8>` column after the mapped ones, under the export's refusal
+  of two fields on one output column. The export writes into it every stored
+  attribute the mapping does not name, as stored, up to the load's cap in the
+  next bullet, except the reserved keys holding span kind, trace state,
+  flags, events and links, which stay unwritten and counted in
+  `spans_with_unwritten_data`.
+- Unlike the logs load, which ignores the column, the spans load reads it
+  back: its entries merge into the span's attributes at span precedence as
+  written. They count toward the loader per-record cap of 1024 together with
+  the row's `[[spans.attribute]]` values, and a row over it is refused, while
+  a stored span can hold more (a load admits up to 1024 `[[spans.attribute]]`
+  values plus resource attributes). The export therefore writes at most that
+  cap less the span's written `[[spans.attribute]]` values into the map,
+  keeping the entries first in ascending byte order of key, and counts a span
+  that loses one in `spans_with_unwritten_data`. So `load(export(window))`
+  under a mapping that sets the key reproduces every stored attribute string
+  but the reserved ones and those the cap left out, and the report counts
+  every span missing one. A null map value is an attribute the row does not
+  carry and is skipped before the checks that follow. A row is refused when
+  its map holds, with a non-null value, a key a mapped attribute also names
+  (whether or not that attribute's cell holds a value), one key twice, or a
+  reserved key. That carries decision 2's mapping-level refusal of a key
+  declared twice or a reserved key down to the row. A key or value over its
+  length cap drops that attribute and is counted, as on the OTLP path.
+- The export chooses each mapped attribute's typed value by checking that the
+  load's own coercion of the candidate reproduces the stored string, so the
+  two share one coercion rather than keeping two copies that can drift. A
+  stored string the declared type cannot reproduce is still refused by name,
+  as the spans export amendment says.
+- With the key unset, spans load and export behave as the spans export
+  amendment describes.
