@@ -508,7 +508,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   upgrade; on SQL, a HEAD read by the column-statistics loader still answers
   500. So does a catalog decode job the read CPU gate cancelled or
   closed before it ran; one that panicked answers 500. Other store errors,
-  timeouts, cancellation and admission refusals keep their classes.
+  timeouts, cancellation and admission refusals keep their classes. The
+  commit-record validator now checks `format_version` before the `tenant_hash`
+  and `content_hash` lengths, as the compaction-record and retention-tombstone
+  validators already did, so a record from a newer version that also changed a
+  hash field's length is refused as `UnsupportedFormatVersion` rather than as
+  a corrupt field (issue #2272).
 - **A catalog decode declared over its ceiling now evicts decoded-cache entries
   until the budget admits it or the caches are empty** (issue #2132). Such a
   decode is charged 0 bytes, and a budget pushed over its limit by
