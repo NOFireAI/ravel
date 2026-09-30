@@ -357,20 +357,24 @@ signal. They count this server's own maintenance supervisor only: a
 `ravel-cli maintain compact-*` run is a separate process, reports its outcomes
 in its walk summary, and never moves these counters.
 
-- `ravel_maintain_claims_acquired_total` -- claims taken, fresh or taken over
-  from an expired claim.
+- `ravel_maintain_claims_acquired_total` -- claims taken: fresh, taken over
+  from an expired claim, or taken back from this process's own leftover
+  claim.
 - `ravel_maintain_claims_stolen_total` -- the subset of the above taken over
-  from an expired claim. A crash, a restart or a failed run leaves an expired
-  claim behind too, so steals on their own are expected after any of those.
+  from an expired claim. A crash or a restart leaves an expired claim behind
+  too, and so does a failed run whose process stopped maintaining that
+  bucket, so steals on their own are expected after any of those; a process
+  that is still running takes its own leftover claim back as an acquisition
+  instead.
 - `ravel_maintain_claims_lost_total` -- claims this process held and lost
   before publishing: another process took the claim over after its lease
   expired, or the claim object was deleted, and this run cancelled at its
   next checkpoint. A lifecycle rule or a manual delete on the claim prefix
   also moves it, so rule that out before raising the lease.
 - `ravel_maintain_claim_renew_failures_total` -- renewals that failed with a
-  store error, distinct from a lost claim. The run stops with an error and its
-  claim is left to expire, so the bucket is skipped (by this process too)
-  until then.
+  store error, distinct from a lost claim. The run stops with an error and
+  leaves its claim in place. The same process takes it back on its next pass
+  and compacts the bucket; any other process waits for the claim to expire.
 - `ravel_maintain_claims_skipped_total` -- bucket evaluations that did not
   compact because of a claim: most often an unexpired claim held the bucket,
   but also a lost steal race, a claim that could not be read, or one that
