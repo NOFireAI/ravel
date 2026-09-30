@@ -378,6 +378,24 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A compaction claim left in place by a failed renewal is reclaimed by
+  the same process at once, instead of waiting out the full lease**
+  (ADR-1029, 2026-09-30 amendment; issue #2156). When
+  `ClaimGuard::checkpoint` renewal fails with a store error other than a
+  lost race, the claim stays written under that process and `contend`
+  previously could not tell it from a claim held by another process, so
+  the process skipped its own bucket every pass until the lease expired
+  and then stole its own claim back, which the metrics reported as a
+  steal rather than as an acquisition. `ClaimGuard::contend` now checks
+  the observed claim's holder process id first and, when it matches its
+  own, calls a new `reclaim` primitive (`crates/ravel-fleet/src/claim.rs`)
+  that CAS-writes a fresh claim under the observed version with no
+  expiry requirement and no store request when the holder is a different
+  process. `claims_acquired` rises, not `claims_stolen` or
+  `claims_skipped`. `MaintainError::ClaimRenewFailed` carrying a
+  retryable store error is now classified recoverable in
+  `crates/ravel-sim/src/driver.rs`, matching a retryable
+  `MaintainError::Store`.
 - **One refused delete no longer stops the superseded-input sweep for every
   chain** (issue #1846). Rule 2 deletes every cleared chain's input commit
   records, then their data objects, then the chains' own records, and a
