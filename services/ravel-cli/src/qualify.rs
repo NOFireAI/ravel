@@ -305,9 +305,9 @@ impl ChecksumEcho {
 
 /// PUT a probe object at `key` with the store's upload checksum, GET it whole
 /// with checksum mode, and report whether the endpoint returned the checksum
-/// it stored. The probe object is deleted whatever the outcome; a delete the
-/// credential is not granted is returned beside the outcome rather than
-/// failing it, since the Admin role has no delete grant.
+/// it stored. The probe object is deleted whatever the outcome; a refused
+/// delete is returned beside the outcome rather than failing it, because it
+/// says nothing about the checksum.
 ///
 /// The S3 adapter verifies a returned CRC-64/NVME checksum against the body it
 /// received and fails the read as corrupted on a mismatch, and counts a read
@@ -775,8 +775,8 @@ mod tests {
         assert_eq!(fake.deletes(), vec![key.to_string()]);
     }
 
-    /// A credential with no delete grant, such as the Admin role, leaves the
-    /// probe object in place: the outcome stands, and the note names the key.
+    /// A credential that cannot delete the probe object leaves it in place:
+    /// the outcome stands, and the note names the key.
     #[tokio::test]
     async fn checksum_echo_keeps_its_outcome_when_the_probe_cannot_be_deleted() {
         use crate::fake_s3::{Echo, spawn};

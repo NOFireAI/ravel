@@ -75,9 +75,9 @@ with the stored checksum requested, and says what the endpoint did:
 - `FAIL`: the endpoint returned a checksum that does not match the one sent,
   or the probe PUT or GET failed. Qualification fails and nothing is recorded.
 
-The probe object is deleted afterwards. Under the Admin credential, which has
-no delete grant, the delete is refused, a `note:` line names the object left
-under `sys/qualify/<run-id>/`, and the outcome stands.
+The probe object sits under `sys/qualify/<run-id>/` and is deleted afterwards.
+If the credential cannot delete it, a `note:` line names the object left in
+place and the outcome stands.
 
 `store qualify --list-page-size` with a value other than the default builds
 the S3 store only under `--s3-upload-integrity off` and the stored checksum
