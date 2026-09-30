@@ -3737,7 +3737,8 @@ pub async fn start_with_heartbeat(
                     Arc::new(SystemClock),
                     distrib_live_workers.clone(),
                     hb_rx,
-                );
+                )
+                .map_err(|e| anyhow::anyhow!("query-worker heartbeat refused to start: {e}"))?;
                 Some(QueryWorkerHeartbeat {
                     shutdown: hb_shutdown,
                     handle,
@@ -3866,6 +3867,8 @@ pub async fn start_with_heartbeat(
             // amendment): the tenant's retention window caps the rotation
             // length below --scrub-period when it is shorter.
             Arc::new(config.maintain.retention.clone()),
+            // The same wall clock the maintenance and fold loops read.
+            maintain_clock.clone(),
         ),
         _ => scrub::ScrubTask::none(),
     };

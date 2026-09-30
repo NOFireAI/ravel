@@ -164,7 +164,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use ravel_commit::keys;
-use ravel_ingest::{Clock as _, SystemClock};
 use ravel_maintain::{
     Clock, RetentionConfig, SCRUB_REQUESTS_PER_OBJECT, ScrubLevel, ScrubResult, ScrubTarget,
     UnreadableReason, WorkerSet, scrub_one_object,
@@ -404,18 +403,6 @@ impl ScrubMetrics {
     }
 }
 
-/// The service-layer wall clock for [`ravel_maintain::Clock`], delegating to
-/// `ravel-ingest`'s [`SystemClock`] (the one blessed wall clock in this
-/// process), matching [`crate::maintain`]'s own `WallClock` so no scrub code
-/// path reads `SystemTime::now()` directly.
-struct WallClock;
-
-impl Clock for WallClock {
-    fn now_ns(&self) -> i64 {
-        SystemClock.now_ns()
-    }
-}
-
 /// Handle to the spawned scrub task, so shutdown can stop it cleanly (mirrors
 /// [`crate::admission_reconcile::AdmissionReconcileTask`]).
 pub struct ScrubTask {
@@ -449,6 +436,8 @@ impl ScrubTask {
 /// tenant scoping. Returns immediately; the task runs until
 /// [`ScrubTask::shutdown`]. The first cycle sleeps a full (jittered) interval
 /// before its first read, so co-started replicas do not scrub in lockstep.
+/// Every timestamp the loop reads (the live-set read, cursor stamps and rotation
+/// planning) comes from `clock`.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     store: Arc<dyn ObjectStoreBackend>,
@@ -458,6 +447,7 @@ pub fn spawn(
     metrics: Arc<ScrubMetrics>,
     worker: Arc<WorkerSet>,
     retention: Arc<RetentionConfig>,
+    clock: Arc<dyn Clock>,
 ) -> ScrubTask {
     let restrict = if restrict.is_empty() {
         None
@@ -489,7 +479,7 @@ pub fn spawn(
             // rotates over. A live-set read failure falls back to `{self}`
             // (owns everything: the fail-open direction, never scrubbing less
             // than a lone process would), ADR-0065 decision 1.
-            let now = SystemClock.now_ns();
+            let now = clock.now_ns();
             let live_set = worker
                 .live_set(store.as_ref(), now)
                 .await
@@ -510,6 +500,7 @@ pub fn spawn(
                 worker.as_ref(),
                 &live_set,
                 Some(retention.as_ref()),
+                clock.as_ref(),
             )
             .await;
         }
@@ -537,6 +528,7 @@ pub async fn run_cycle(
     worker: &WorkerSet,
     live_set: &[Uuid],
     retention: Option<&RetentionConfig>,
+    clock: &dyn Clock,
 ) {
     let outcome = match discover_and_restrict(store, restrict).await {
         Ok(outcome) => outcome,
@@ -549,7 +541,6 @@ pub async fn run_cycle(
         }
     };
 
-    let clock = WallClock;
     let mut worst_held = [0u32; MAINTAINED_SIGNALS.len()];
     // A shard whose cursor could not be read this cycle keeps whatever it last
     // persisted, which the gauge last reported as at most this.
@@ -622,7 +613,7 @@ pub async fn run_cycle(
                 }
                 let held = run_shard_tick(
                     store,
-                    &clock,
+                    clock,
                     tenant,
                     signal,
                     shard,
@@ -2064,6 +2055,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::maintain::WallClock;
 
     /// A single-replica worker for the scrub tests: its solo live set
     /// (`{self}`) owns every unit, so `run_cycle` gates nothing away and
@@ -2208,6 +2200,7 @@ mod tests {
             &worker,
             &worker.solo_live_set(),
             None,
+            &WallClock,
         )
         .await;
 
@@ -2228,6 +2221,43 @@ mod tests {
         let cursor: PersistedCursor = serde_json::from_slice(&got.data).expect("cursor decodes");
         // A completed rotation wraps to the start.
         assert_eq!(cursor.last_commit_key, None);
+    }
+
+    /// A scrub pass reads the clock it is handed, not wall time: the cursor it
+    /// persists carries the injected clock's reading as its rotation start.
+    #[tokio::test]
+    async fn scrub_pass_stamps_the_cursor_from_the_injected_clock() {
+        let store = MemoryStore::new();
+        let tenant_hash = tenant().hash();
+        publish_segment(&store, 1, &["cpu", "mem"]).await;
+
+        let injected_ns = 500_007 * NS_PER_HOUR + 13;
+        let clock = ravel_maintain::FixedClock::new(injected_ns);
+        let metrics = ScrubMetrics::default();
+        let worker = solo_worker();
+        run_cycle(
+            &store,
+            None,
+            1,
+            1,
+            1,
+            &metrics,
+            &worker,
+            &worker.solo_live_set(),
+            None,
+            &clock,
+        )
+        .await;
+
+        let got = store
+            .get(
+                &cursor_key(&tenant_hash, Signal::Metrics, 0),
+                GetRange::Full,
+            )
+            .await
+            .expect("cursor persisted");
+        let cursor: PersistedCursor = serde_json::from_slice(&got.data).expect("cursor decodes");
+        assert_eq!(cursor.rotation_started_unix_ns, injected_ns);
     }
 
     /// A single-bit flip in a committed data object surfaces as a checksum
@@ -2265,6 +2295,7 @@ mod tests {
             &worker,
             &worker.solo_live_set(),
             None,
+            &WallClock,
         )
         .await;
 
@@ -2298,6 +2329,7 @@ mod tests {
             &worker,
             &worker.solo_live_set(),
             None,
+            &WallClock,
         )
         .await;
         let after_first = metrics.cursor_position(Signal::Metrics);
@@ -2318,6 +2350,7 @@ mod tests {
                 &worker,
                 &worker.solo_live_set(),
                 None,
+                &WallClock,
             )
             .await;
             let tenant_hash = tenant().hash();
@@ -2349,6 +2382,7 @@ mod tests {
             &worker,
             &worker.solo_live_set(),
             None,
+            &WallClock,
         )
         .await;
         assert_eq!(
@@ -2420,6 +2454,7 @@ mod tests {
             &worker,
             &worker.solo_live_set(),
             None,
+            &WallClock,
         )
         .await;
 
@@ -2512,6 +2547,7 @@ mod tests {
             &worker,
             &worker.solo_live_set(),
             None,
+            &WallClock,
         )
         .await;
 
@@ -2600,6 +2636,7 @@ mod tests {
             &worker,
             &worker.solo_live_set(),
             None,
+            &WallClock,
         )
         .await;
         assert_eq!(
@@ -2627,6 +2664,7 @@ mod tests {
             &worker,
             &worker.solo_live_set(),
             None,
+            &WallClock,
         )
         .await;
         assert_eq!(
@@ -2765,6 +2803,7 @@ mod tests {
             &worker,
             &worker.solo_live_set(),
             None,
+            &WallClock,
         )
         .await;
         assert_eq!(
@@ -2794,6 +2833,7 @@ mod tests {
             &worker,
             &worker.solo_live_set(),
             None,
+            &WallClock,
         )
         .await;
         assert_eq!(
@@ -2978,6 +3018,7 @@ mod tests {
             &worker,
             &worker.solo_live_set(),
             None,
+            &WallClock,
         )
         .await;
         assert_eq!(
@@ -3007,6 +3048,7 @@ mod tests {
             &worker,
             &worker.solo_live_set(),
             None,
+            &WallClock,
         )
         .await;
         assert_eq!(
@@ -3195,6 +3237,7 @@ mod tests {
             &worker,
             &worker.solo_live_set(),
             None,
+            &WallClock,
         )
         .await;
         assert_eq!(
@@ -3223,6 +3266,7 @@ mod tests {
             &worker,
             &worker.solo_live_set(),
             None,
+            &WallClock,
         )
         .await;
         assert_eq!(
@@ -3244,6 +3288,7 @@ mod tests {
             &worker,
             &worker.solo_live_set(),
             None,
+            &WallClock,
         )
         .await;
         assert_eq!(
@@ -3627,6 +3672,7 @@ mod tests {
             &worker,
             &worker.solo_live_set(),
             None,
+            &WallClock,
         )
         .await;
         assert_eq!(
@@ -3655,6 +3701,7 @@ mod tests {
             &worker,
             &worker.solo_live_set(),
             None,
+            &WallClock,
         )
         .await;
         assert_eq!(
@@ -3676,6 +3723,7 @@ mod tests {
             &worker,
             &worker.solo_live_set(),
             None,
+            &WallClock,
         )
         .await;
         assert_eq!(
@@ -5274,6 +5322,7 @@ mod tests {
                 &worker,
                 &worker.solo_live_set(),
                 None,
+                &WallClock,
             )
             .await;
             assert_eq!(metrics.marker_held_ticks(Signal::Metrics), cycle);
@@ -5307,7 +5356,11 @@ mod tests {
         let metrics = ScrubMetrics::default();
         let worker = solo_worker();
         let live_set = worker.solo_live_set();
-        let cycle = || run_cycle(&store, None, 1, 2, 1, &metrics, &worker, &live_set, None);
+        let cycle = || {
+            run_cycle(
+                &store, None, 1, 2, 1, &metrics, &worker, &live_set, None, &WallClock,
+            )
+        };
         cycle().await;
         cycle().await;
         assert_eq!(metrics.marker_held_ticks(Signal::Metrics), 2);

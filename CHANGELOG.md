@@ -442,6 +442,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A zero loop interval is refused at startup** (issue #2256).
+  `--maintain-interval-secs 0`, `--fold-interval-secs 0`,
+  `--alert-eval-interval-secs 0` and `--oidc-jwks-refresh-interval-secs 0`
+  were accepted, and each loop they pace then ran back to back with no pause
+  for the life of the process: the maintenance loop repeated full tenant
+  discovery against object storage, and nothing reported it. `ravel-server`
+  now refuses a zero value for each of these flags at startup, with a message
+  naming the flag. The defaults are unchanged. The query-worker heartbeat
+  under `--distributed-query` also refuses a zero period rather than writing
+  heartbeats without pause; no flag sets that period today.
+
 - **A gateway starts under a small memory limit** (issue #2234).
   `ravel-server` refused to start in every mode under a cgroup memory limit of
   2 GiB or less, because the process memory budget (effective memory minus a
