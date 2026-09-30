@@ -952,8 +952,15 @@ mod tests {
     /// operator's qualify Job deadline budgets for (ravel-operator's
     /// `QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS`): 17 listings, since each
     /// listing-order drain over 1002 keys, and its `list_after` tail over
-    /// exactly 1000, costs two, and 2031 PUTs on a fresh bucket where no
-    /// concurrent create-if-absent writer retries.
+    /// exactly 1000, costs two; 2031 PUTs on a fresh bucket where no
+    /// concurrent create-if-absent writer retries; 10 GETs; 3 DELETEs; and 3
+    /// control-plane GETs. As sequential operations, with the 8 concurrent
+    /// create-if-absent PUTs as one round trip, and adding the budget this
+    /// fresh bucket does not exercise (up to 3 retries for each of the 8
+    /// writers, and the get and CAS put that replace an older
+    /// `sys/qualification` record), that is the operator's 2083. The 8 HEADs
+    /// the S3 store sends to disambiguate each losing create-if-absent PUT are
+    /// not in that figure, and are pinned apart from it.
     #[tokio::test]
     async fn one_attempt_at_the_default_page_size_issues_the_budgeted_requests() {
         use crate::fake_s3::{Echo, spawn};
@@ -969,12 +976,34 @@ mod tests {
         )
         .await
         .expect("the fake endpoint qualifies");
-        assert_eq!(fake.lists().len(), 5 + 6 + 2 + 4, "{:?}", fake.lists());
+        let lists = fake.lists().len();
+        let puts = fake.puts().len();
+        let gets = fake.gets().len();
+        let deletes = fake.deletes().len();
+        let control_plane = fake.control_plane().len();
+        assert_eq!(lists, 5 + 6 + 2 + 4, "{:?}", fake.lists());
+        assert_eq!(puts, 2 + 3 + 5 + 5 + 8 + 1002 + 1002 + 2 + 1 + 1);
+        // create-if-absent, CAS version, read-after-write, concurrent
+        // create-if-absent, delete visibility, then the echo probe.
+        assert_eq!(gets, 1 + 1 + 5 + 1 + 1 + 1, "{:?}", fake.gets());
+        // Delete visibility, then the echo probe.
+        assert_eq!(deletes, 2 + 1, "{:?}", fake.deletes());
+        assert_eq!(control_plane, 3);
+        // The losing create-if-absent PUT, then the 7 losing concurrent ones.
+        assert_eq!(fake.heads().len(), 1 + 7, "{:?}", fake.heads());
+
+        let requests = lists + puts + gets + deletes + control_plane;
+        assert_eq!(requests, 2064);
+        let concurrent_puts_as_one_round_trip = 8 - 1;
+        let writer_retries = 8 * 3;
+        let stale_record_get_and_cas_put = 2;
         assert_eq!(
-            fake.puts().len(),
-            2 + 3 + 5 + 5 + 8 + 1002 + 1002 + 2 + 1 + 1
+            requests - concurrent_puts_as_one_round_trip
+                + writer_retries
+                + stale_record_get_and_cas_put,
+            2083,
+            "the operations QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS budgets for"
         );
-        assert_eq!(fake.control_plane().len(), 3);
     }
 
     /// An endpoint that returns a stored checksum not matching the body fails

@@ -130,9 +130,9 @@ data; verification is reads of configuration.
    `GetBucketObjectLockConfiguration`, `GetObjectRetention`,
    `ListBucketVersions`) ship as a separate statement in the IAM templates,
    so the ingest and query roles gain nothing. (Narrowed by the
-   verify-protection sample amendment below: the retention sample is the
-   newest object a bounded listing finds per family, a lapsed lock on it
-   reads `Unknown`, and locating it also needs `ListBucket`.)
+   verify-protection retention amendment below: the command does not check
+   `object-retention` yet, takes no option for it, and prints it as not
+   checked without letting it affect the exit code.)
 
 5. **In-process gate and gauges.** Under `--require-bucket-protection` the
    startup check runs the same report. Fatal: `versioning` on without
@@ -298,83 +298,28 @@ cover `t/` in a form the code does not prove reads as "could not verify":
 the operator restates the rules as one rule over `t/` (or the whole
 bucket) or as the sixteen-rule union, or confirms coverage out of band.
 
-## Amendment (2026-09-30): the verify-protection retention sample and its permissions
+## Amendment (2026-09-30): verify-protection does not check object-retention yet
 
-<!-- amendment-applies: sections="Decision" pointer="verify-protection sample amendment" -->
+<!-- amendment-applies: sections="Decision" pointer="verify-protection retention amendment" -->
 
-`store verify-protection` as built (follow-up task 2) takes the
-`object-retention` sample more narrowly than decision 3's table states, and
-needs one permission decision 4 does not list.
+`store verify-protection` as built (follow-up task 2) does not check
+`object-retention`. It takes no option for it, samples no object, and
+prints the condition as not checked by this command; the condition never
+affects the exit code, so exit `0` says nothing about per-object retention.
 
-1. **The sample is the newest object older than the retention coverage
-   window that a bounded listing finds per family.** A mechanism that applies
-   retention after the write lags it: the scheduled batch job the disaster
-   recovery guide sanctions covers an object up to its schedule interval plus
-   the inventory delay after the write, and even the event-driven mechanism
-   lags by seconds. The newest object in a family is the one most likely
-   inside that lag, so on a compliant bucket it can carry no retention yet.
-   `--expect-object-retention` therefore requires
-   `--retention-coverage-window DURATION` (a humantime duration, such as
-   `25h`) and is refused without it, and every family's sample is the newest
-   current object whose `LastModified` is more than that window before now.
-   Three of the four protected prefix families (provisioning records, commit
-   records, the catalog keyspace) sit under a tenant hash, and a versions
-   listing takes a literal prefix, so the CLI locates one concrete object per
-   family first, over data-plane listings capped at 400 listing calls for
-   `sys/` and the tenant scan and 200 for commit records, and passes each
-   object's exact key to the control plane:
-   - `sys/`: the most recently modified object under `sys/`, skipping the
-     `sys/qualify/` and `sys/pq-probe/` scratch and the per-process
-     `sys/maintain/` and `sys/query/workers/` state, whose continuous
-     rewrites would otherwise make it the newest object every time;
-   - provisioning records: the newest `t/<h>/<signal>/prov` across tenants;
-   - catalog keyspace: the newest object under a `t/<h>/catalog/<signal>/`
-     across tenants: the head pointer, snapshot parts and index objects,
-     since a head rewritten on every fold is never older than the window on
-     an active tenant;
-   - commit records: the newest object in each shard's newest ingest hour
-     that holds one older than the window, in the tenant whose catalog was
-     written most recently, as a cheap stand-in for the tenant with the
-     newest commit. An hour that opens after the window's start is not
-     listed, since a record is never created before its ingest hour opens.
+Every sampling rule tried misreported a correctly configured bucket. The
+newest object in a family is not locked yet under a mechanism that applies
+retention after the write, and the newest object older than a fixed window
+still reads wrong under clock skew, under a retention period shorter than
+the window, for catalog snapshot and index objects the sanctioned HEAD-only
+posture never locks, and for create-if-absent keys that never have the
+noncurrent version the control plane samples. Which objects a sample should
+read is open, and is issue #2228's to decide. Until then an operator checks
+object retention by hand, as the disaster recovery guide describes.
 
-   The control plane then samples that object's current version and its
-   newest noncurrent version. Because the listing prefix is an exact key, the
-   versions listing holds that one object's versions and no other key's, so
-   other objects written under the same family cannot fill its page cap; an
-   object rewritten often, such as a catalog head, can still keep enough
-   noncurrent versions within the noncurrent retention period to fill it. A
-   family with no object to sample, or whose objects found are all inside the
-   window, leaves `object-retention` `Unknown`, never `Pass` and never
-   `Fail`, and the detail names the window; so a bucket with no tenant yet,
-   or one younger than the window, exits `2` under
-   `--expect-object-retention`. An object older than the window with no
-   retention still reads `Fail`.
-   When a listing budget runs out, the sample is the newest object found
-   rather than provably the newest, and an `Unknown` or `Fail` detail says
-   so; a locked sample still passes, since it is locked whether or not it is
-   the newest.
-2. **A lapsed lock is `Unknown`, not `Fail`.** Decision 3's table asks for a
-   recent current object carrying compliance-mode retention. A deployment's
-   retention is finite, so a sampled object whose `RetainUntilDate` has
-   passed is older than the retention period: it is not a recent object, and
-   its lapsed lock says nothing about the retention on new writes. It reads
-   `Unknown`, with a detail saying the sampled object's retention has lapsed.
-   The usual case is a provisioning record, written only when a tenant is
-   provisioned, resharded or has its floor raised. A sampled object with no
-   retention at all, or with governance-mode retention, still reads `Fail`.
-3. **Locating the sample needs `ListBucket`.** The objects are found with
-   `ListObjectsV2` calls over the data-plane client, which
-   `ListBucketVersions` does not grant. Under
-   `--expect-object-retention` the identity running the command needs
-   `ListBucket` beside the six actions decision 4 names; without it the
-   listing is denied and `object-retention` reads `Unknown`, exit `2`. The
-   other conditions need nothing beyond decision 4's list.
-
-Apart from the window, none of the three can turn a non-compliant bucket into
-exit `0`: each leaves a condition `Unknown` or `Fail` where a wider sample
-might have read `Pass`, and the lapsed-lock reading moves a `Fail` to
-`Unknown`, which still exits `2`. The window delays detection by design: a
-retention mechanism that stops covering writes is reported once the first
-uncovered object is older than the window, not before, so the window should
-be the mechanism's real lag and no longer.
+The control plane's reading of a sample is unchanged for any caller that
+supplies one: a sampled object whose `RetainUntilDate` has passed reads
+`Unknown`, not `Fail`, since a lapsed lock on an object older than the
+retention period says nothing about the retention on new writes. A sampled
+object with no retention at all, or with governance-mode retention, still
+reads `Fail`.

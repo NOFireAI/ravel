@@ -2,7 +2,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use ravel_object_store::conformance::{
@@ -13,7 +12,7 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::s3::{
     S3AuthMode, S3Config, S3HttpConfig, S3Store, UploadIntegrity, resolve_s3_allow_http,
 };
-use ravel_object_store::{DelimitedList, GetRange, ObjectMeta, ObjectStoreBackend, StoreError};
+use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_types::TenantHash;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -576,28 +575,21 @@ pub struct ProtectionExpectations {
     pub expected_noncurrent_days: u32,
     /// `--expect-replication`: `delete-marker-replication` is expected.
     pub expect_replication: bool,
-    /// `--expect-object-retention`: `object-retention` is expected.
-    pub expect_object_retention: bool,
-    /// `--retention-coverage-window`: how far the bucket's retention
-    /// mechanism may lag a write. The sample reads only objects older than
-    /// this.
-    pub retention_coverage_window: Option<Duration>,
 }
 
-/// Why `--expect-object-retention` is refused without
-/// `--retention-coverage-window`.
-pub const RETENTION_WINDOW_REQUIRED: &str = "--expect-object-retention requires \
-     --retention-coverage-window: an object newer than the bucket's retention mechanism's \
-     coverage lag (a scheduled batch job's schedule interval plus its inventory delay) carries \
-     no retention yet, so the sample reads only objects older than that window";
+/// What `store verify-protection` prints for `object-retention`, which it
+/// does not check (ADR-1727 decision 4).
+pub const OBJECT_RETENTION_NOT_CHECKED: &str =
+    "not checked by this command, does not affect the exit code";
 
 impl ProtectionExpectations {
     /// Whether condition `id` counts toward the exit code. Every condition is
-    /// expected except the two a deployment opts into.
+    /// expected except `delete-marker-replication`, which a deployment opts
+    /// into, and `object-retention`, which this command does not check.
     pub fn expects(&self, id: ProtectionConditionId) -> bool {
         match id {
             ProtectionConditionId::DeleteMarkerReplication => self.expect_replication,
-            ProtectionConditionId::ObjectRetention => self.expect_object_retention,
+            ProtectionConditionId::ObjectRetention => false,
             ProtectionConditionId::Versioning
             | ProtectionConditionId::NoncurrentExpiration
             | ProtectionConditionId::ExpiredDeleteMarker
@@ -608,13 +600,14 @@ impl ProtectionExpectations {
         }
     }
 
-    /// The control-plane parameters these expectations ask for.
-    pub fn params(&self, retention_prefixes: Vec<String>) -> BucketProtectionParams {
+    /// The control-plane parameters these expectations ask for. No object is
+    /// sampled for retention.
+    pub fn params(&self) -> BucketProtectionParams {
         BucketProtectionParams {
             expected_noncurrent_days: Some(self.expected_noncurrent_days),
             expect_replication: self.expect_replication,
-            sample_object_retention: self.expect_object_retention,
-            protected_retention_prefixes: retention_prefixes,
+            sample_object_retention: false,
+            protected_retention_prefixes: Vec::new(),
         }
     }
 }
@@ -627,385 +620,25 @@ pub struct VerifyProtectionOutcome {
     pub exit_code: i32,
 }
 
-/// The objects the `object-retention` sample reads, one per protected prefix
-/// family that could be located, plus the families that could not.
-///
-/// The families are the deployment records under `sys/`, the provisioning
-/// records, the commit records and the catalog keyspace. Each sample is the
-/// most recently modified current object the listing budget finds in its
-/// family whose `LastModified` is older than the retention coverage window:
-/// only a recent object is expected to still be locked, and an object inside
-/// the window may not carry retention yet on a correctly configured bucket.
-///
-/// - `sys/`: every object under `sys/` except the transient scratch under
-///   `sys/qualify/` and `sys/pq-probe/` and the per-process state under
-///   `sys/maintain/` and `sys/query/workers/`, which is rewritten
-///   continuously.
-/// - provisioning records: the newest `t/<h>/<signal>/prov` across tenants.
-/// - catalog keyspace: the newest object under a `t/<h>/catalog/<signal>/`
-///   (the head pointer, snapshot parts and index objects) across tenants.
-/// - commit records: the newest object in each shard's newest ingest hour that
-///   holds one older than the window, in the tenant whose catalog was written
-///   most recently.
-///
-/// Each sample is passed to the control plane as an exact key, so its versions
-/// listing holds that object's own versions and nothing else.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RetentionSamplePlan {
-    /// The sampled keys, in family order.
-    pub prefixes: Vec<String>,
-    /// Families with no object to sample, by name.
-    pub unsampled: Vec<&'static str>,
-    /// Families whose objects found are all inside the coverage window.
-    pub inside_window: Vec<&'static str>,
-    /// The retention coverage window the sample was taken with.
-    pub coverage_window: Duration,
-    /// A listing budget ran out before every candidate was listed, so a
-    /// sample is the newest object found rather than provably the newest.
-    pub budget_exhausted: bool,
-}
-
-const RETENTION_FAMILY_SYS: &str = "deployment records (sys/)";
-const RETENTION_FAMILY_PROV: &str = "provisioning records (t/*/*/prov)";
-const RETENTION_FAMILY_COMMIT: &str = "commit records (t/*/*/c/)";
-const RETENTION_FAMILY_CATALOG: &str = "catalog keyspace (t/*/catalog/)";
-
-/// Sub-prefixes of `sys/` the sample skips.
-const RETENTION_SYS_EXCLUDED: [&str; 4] = [
-    "sys/qualify/",
-    "sys/pq-probe/",
-    "sys/maintain/",
-    "sys/query/workers/",
-];
-
-/// Listing calls the sample may spend on `sys/` and the tenant scan, and then
-/// on the commit records of the chosen tenant.
-const RETENTION_SCAN_LIST_BUDGET: usize = 400;
-const RETENTION_COMMIT_LIST_BUDGET: usize = 200;
-
-/// Listing calls against a fixed budget. A call past the budget is not made:
-/// it returns `None` and marks the budget exhausted.
-struct BudgetedLister<'a> {
-    store: &'a dyn ObjectStoreBackend,
-    remaining: usize,
-    exhausted: bool,
-}
-
-impl<'a> BudgetedLister<'a> {
-    fn new(store: &'a dyn ObjectStoreBackend, budget: usize) -> Self {
-        Self {
-            store,
-            remaining: budget,
-            exhausted: false,
-        }
-    }
-
-    fn spend(&mut self) -> bool {
-        if self.remaining == 0 {
-            self.exhausted = true;
-            return false;
-        }
-        self.remaining -= 1;
-        true
-    }
-
-    async fn delimited(&mut self, prefix: &str) -> Result<Option<DelimitedList>, StoreError> {
-        if !self.spend() {
-            return Ok(None);
-        }
-        let mut listed = self.store.list_delimited(prefix).await?;
-        listed.common_prefixes.sort();
-        Ok(Some(listed))
-    }
-
-    /// Every object under `prefix`, page by page while the budget lasts.
-    async fn all(&mut self, prefix: &str) -> Result<Vec<ObjectMeta>, StoreError> {
-        let mut objects = Vec::new();
-        let mut token = None;
-        loop {
-            if !self.spend() {
-                return Ok(objects);
-            }
-            let page = self.store.list(prefix, token).await?;
-            objects.extend(page.objects);
-            match page.next {
-                Some(next) => token = Some(next),
-                None => return Ok(objects),
-            }
-        }
-    }
-}
-
-/// The most recently modified object offered that is older than a cutoff,
-/// ties broken by key, and the newest time offered at all.
-struct Newest {
-    cutoff_ms: i64,
-    older: Option<(i64, String)>,
-    newest_seen_ms: Option<i64>,
-}
-
-impl Newest {
-    fn before(cutoff_ms: i64) -> Self {
-        Self {
-            cutoff_ms,
-            older: None,
-            newest_seen_ms: None,
-        }
-    }
-
-    fn offer(&mut self, meta: &ObjectMeta) {
-        let at = meta.last_modified_unix_ms;
-        self.newest_seen_ms = Some(self.newest_seen_ms.map_or(at, |seen| seen.max(at)));
-        if at >= self.cutoff_ms {
-            return;
-        }
-        let candidate = (at, meta.key.as_str());
-        if self
-            .older
-            .as_ref()
-            .is_none_or(|(at, key)| candidate > (*at, key.as_str()))
-        {
-            self.older = Some((at, meta.key.clone()));
-        }
-    }
-
-    fn found(&self) -> bool {
-        self.older.is_some()
-    }
-}
-
-/// Locate one sample object per protected prefix family (see
-/// [`RetentionSamplePlan`]) with listings over the data plane, reading only
-/// objects last modified more than `coverage_window` before `now_unix_ms`.
-pub async fn retention_sample_plan(
-    store: &dyn ObjectStoreBackend,
-    coverage_window: Duration,
-    now_unix_ms: i64,
-) -> Result<RetentionSamplePlan, StoreError> {
-    retention_sample_plan_within(
-        store,
-        coverage_window,
-        now_unix_ms,
-        RETENTION_SCAN_LIST_BUDGET,
-        RETENTION_COMMIT_LIST_BUDGET,
-    )
-    .await
-}
-
-/// [`retention_sample_plan`] with explicit listing budgets.
-async fn retention_sample_plan_within(
-    store: &dyn ObjectStoreBackend,
-    coverage_window: Duration,
-    now_unix_ms: i64,
-    scan_budget: usize,
-    commit_budget: usize,
-) -> Result<RetentionSamplePlan, StoreError> {
-    let window_ms = i64::try_from(coverage_window.as_millis()).unwrap_or(i64::MAX);
-    let cutoff_ms = now_unix_ms.saturating_sub(window_ms);
-    let mut scan = BudgetedLister::new(store, scan_budget);
-    let mut sys = Newest::before(cutoff_ms);
-    let mut prov = Newest::before(cutoff_ms);
-    let mut catalog = Newest::before(cutoff_ms);
-
-    if let Some(root) = scan.delimited("sys/").await? {
-        root.objects.iter().for_each(|meta| sys.offer(meta));
-        for prefix in root
-            .common_prefixes
-            .iter()
-            .filter(|prefix| !RETENTION_SYS_EXCLUDED.contains(&prefix.as_str()))
-        {
-            scan.all(prefix)
-                .await?
-                .iter()
-                .filter(|meta| {
-                    !RETENTION_SYS_EXCLUDED
-                        .iter()
-                        .any(|excluded| meta.key.starts_with(excluded))
-                })
-                .for_each(|meta| sys.offer(meta));
-        }
-    }
-
-    // Per tenant: the newest catalog object's time, and its commit prefixes.
-    let mut tenants: Vec<(Option<i64>, String, Vec<String>)> = Vec::new();
-    let tenant_prefixes = scan
-        .delimited("t/")
-        .await?
-        .map(|listed| listed.common_prefixes)
-        .unwrap_or_default();
-    for tenant in tenant_prefixes {
-        let Some(dirs) = scan.delimited(&tenant).await? else {
-            break;
-        };
-        let catalog_prefix = format!("{tenant}catalog/");
-        let mut tenant_catalog = Newest::before(cutoff_ms);
-        if dirs.common_prefixes.contains(&catalog_prefix)
-            && let Some(signals) = scan.delimited(&catalog_prefix).await?
-        {
-            for signal in &signals.common_prefixes {
-                let Some(listed) = scan.delimited(signal).await? else {
-                    break;
-                };
-                let mut objects = listed.objects;
-                for sub in &listed.common_prefixes {
-                    objects.extend(scan.all(sub).await?);
-                }
-                for meta in &objects {
-                    tenant_catalog.offer(meta);
-                    catalog.offer(meta);
-                }
-            }
-        }
-        let mut commit_prefixes = Vec::new();
-        for dir in dirs
-            .common_prefixes
-            .iter()
-            .filter(|d| **d != catalog_prefix)
-        {
-            let Some(listed) = scan.delimited(dir).await? else {
-                break;
-            };
-            let prov_key = format!("{dir}prov");
-            listed
-                .objects
-                .iter()
-                .filter(|meta| meta.key == prov_key)
-                .for_each(|meta| prov.offer(meta));
-            let commit_prefix = format!("{dir}c/");
-            if listed.common_prefixes.contains(&commit_prefix) {
-                commit_prefixes.push(commit_prefix);
-            }
-        }
-        if !commit_prefixes.is_empty() {
-            tenants.push((tenant_catalog.newest_seen_ms, tenant, commit_prefixes));
-        }
-    }
-
-    // The tenant whose catalog was written last is the one most likely to hold
-    // the newest commit record; a tenant with no catalog object sorts last.
-    tenants.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    let mut commits = BudgetedLister::new(store, commit_budget);
-    let mut commit = Newest::before(cutoff_ms);
-    for (_, _, commit_prefixes) in &tenants {
-        for commit_prefix in commit_prefixes {
-            newest_commit_in(&mut commits, commit_prefix, &mut commit).await?;
-        }
-        if commit.found() || commits.exhausted {
-            break;
-        }
-    }
-
-    let mut plan = RetentionSamplePlan {
-        prefixes: Vec::new(),
-        unsampled: Vec::new(),
-        inside_window: Vec::new(),
-        coverage_window,
-        budget_exhausted: scan.exhausted || commits.exhausted,
-    };
-    for (found, family) in [
-        (sys, RETENTION_FAMILY_SYS),
-        (prov, RETENTION_FAMILY_PROV),
-        (commit, RETENTION_FAMILY_COMMIT),
-        (catalog, RETENTION_FAMILY_CATALOG),
-    ] {
-        match (found.older, found.newest_seen_ms) {
-            (Some((_, key)), _) => plan.prefixes.push(key),
-            (None, Some(_)) => plan.inside_window.push(family),
-            (None, None) => plan.unsampled.push(family),
-        }
-    }
-    Ok(plan)
-}
-
-/// Offer `commit`, for each shard under `commit_prefix` (`t/<h>/<signal>/c/`),
-/// every object in the newest ingest hour holding one older than its cutoff.
-/// An hour that starts at or after the cutoff is not listed: a record is never
-/// created before its ingest hour opens.
-async fn newest_commit_in(
-    lister: &mut BudgetedLister<'_>,
-    commit_prefix: &str,
-    commit: &mut Newest,
-) -> Result<(), StoreError> {
-    let Some(shards) = lister.delimited(commit_prefix).await? else {
-        return Ok(());
-    };
-    for shard in &shards.common_prefixes {
-        let Some(hours) = lister.delimited(shard).await? else {
-            return Ok(());
-        };
-        fn segment(hour: &str) -> &str {
-            hour.trim_end_matches('/').rsplit('/').next().unwrap_or("")
-        }
-        let mut hours: Vec<&String> = hours.common_prefixes.iter().collect();
-        hours.sort_by_cached_key(|hour| {
-            let segment = segment(hour);
-            std::cmp::Reverse((segment.parse::<u64>().ok(), segment.to_string()))
-        });
-        for hour in hours {
-            let opens_after_cutoff = ravel_commit::keys::parse_ingest_hour_string(segment(hour))
-                .is_ok_and(|bucket| i64::from(bucket) * 3_600_000 >= commit.cutoff_ms);
-            if opens_after_cutoff {
-                continue;
-            }
-            let Some(listed) = lister.delimited(hour).await? else {
-                return Ok(());
-            };
-            listed.objects.iter().for_each(|meta| commit.offer(meta));
-            if listed
-                .objects
-                .iter()
-                .any(|meta| meta.last_modified_unix_ms < commit.cutoff_ms)
-            {
-                break;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Run `store verify-protection` against `store`: locate the retention
-/// sample when retention is expected, read the bucket-protection report, and
-/// render it. `now_unix_ms` anchors the retention coverage window.
+/// Run `store verify-protection` against `store`: read the bucket-protection
+/// report and render it.
 pub async fn verify_protection(
     store: &BuiltStore,
     expectations: ProtectionExpectations,
-    now_unix_ms: i64,
 ) -> VerifyProtectionOutcome {
-    let plan = match (
-        expectations.expect_object_retention,
-        expectations.retention_coverage_window,
-    ) {
-        (false, _) => None,
-        (true, None) => Some(Err(RETENTION_WINDOW_REQUIRED.to_string())),
-        (true, Some(window)) => Some(
-            retention_sample_plan(store.backend().as_ref(), window, now_unix_ms)
-                .await
-                .map_err(|err| err.to_string()),
-        ),
-    };
     match store {
-        BuiltStore::S3 { store, .. } => {
-            verify_protection_with(store.as_ref(), expectations, plan.as_ref()).await
-        }
-        BuiltStore::Other(store) => {
-            verify_protection_with(store.as_ref(), expectations, plan.as_ref()).await
-        }
+        BuiltStore::S3 { store, .. } => verify_protection_with(store.as_ref(), expectations).await,
+        BuiltStore::Other(store) => verify_protection_with(store.as_ref(), expectations).await,
     }
 }
 
-/// [`verify_protection`] over any [`BucketControlPlane`], with the retention
-/// sample plan supplied by the caller.
+/// [`verify_protection`] over any [`BucketControlPlane`].
 pub async fn verify_protection_with<S: BucketControlPlane + ?Sized>(
     source: &S,
     expectations: ProtectionExpectations,
-    plan: Option<&Result<RetentionSamplePlan, String>>,
 ) -> VerifyProtectionOutcome {
-    let prefixes = match plan {
-        Some(Ok(plan)) => plan.prefixes.clone(),
-        Some(Err(_)) | None => Vec::new(),
-    };
-    let report = probe_bucket_protection(source, &expectations.params(prefixes)).await;
-    render_verify_protection(&report, expectations, plan)
+    let report = probe_bucket_protection(source, &expectations.params()).await;
+    render_verify_protection(&report, expectations)
 }
 
 /// Write `outcome`'s lines to `out` and flush it. A reader that closed the
@@ -1036,36 +669,34 @@ pub fn verify_protection_unreachable(
     let report = BucketProtectionReport::all_unknown(format!(
         "could not reach the bucket control plane: {err}"
     ));
-    render_verify_protection(&report, expectations, None)
+    render_verify_protection(&report, expectations)
 }
 
 /// Render `report` as one line per condition plus a summary line, and pick the
 /// exit code: [`VERIFY_PROTECTION_FAIL`] when any expected condition failed,
 /// else [`VERIFY_PROTECTION_UNKNOWN`] when any expected condition is unknown,
 /// else [`VERIFY_PROTECTION_PASS`]. A condition that is not expected is printed
-/// and marked as such, and never moves the exit code.
-///
-/// `plan` is the retention sample plan when retention is expected: a family
-/// that could not be sampled, or a plan that could not be built, keeps
-/// `object-retention` from reading as a pass. A condition the report does not
-/// carry is unknown.
+/// and marked as such, and never moves the exit code. A condition the report
+/// does not carry is unknown. `object-retention` is printed as not checked
+/// whatever the report says of it.
 pub fn render_verify_protection(
     report: &BucketProtectionReport,
     expectations: ProtectionExpectations,
-    plan: Option<&Result<RetentionSamplePlan, String>>,
 ) -> VerifyProtectionOutcome {
     let mut lines = Vec::with_capacity(ProtectionConditionId::ALL.len() + 1);
     let mut failed: Vec<&'static str> = Vec::new();
     let mut unknown: Vec<&'static str> = Vec::new();
     for id in ProtectionConditionId::ALL {
-        let reported = report.state(id).cloned().unwrap_or_else(|| {
+        if id == ProtectionConditionId::ObjectRetention {
+            lines.push(format!(
+                "{:<26} unknown {OBJECT_RETENTION_NOT_CHECKED}",
+                id.id()
+            ));
+            continue;
+        }
+        let state = report.state(id).cloned().unwrap_or_else(|| {
             ConditionState::Unknown("missing from the bucket-protection report".to_string())
         });
-        let state = if id == ProtectionConditionId::ObjectRetention {
-            retention_state_with_coverage(&reported, plan)
-        } else {
-            reported
-        };
         let expected = expectations.expects(id);
         if expected {
             match state {
@@ -1108,64 +739,6 @@ pub fn render_verify_protection(
     lines.push(summary);
     VerifyProtectionOutcome { lines, exit_code }
 }
-
-/// `object-retention` as the report states it, narrowed by what the sample
-/// covered: a pass over fewer than every protected prefix family is unknown.
-fn retention_state_with_coverage(
-    state: &ConditionState,
-    plan: Option<&Result<RetentionSamplePlan, String>>,
-) -> ConditionState {
-    let (gap, budget_exhausted) = match plan {
-        None => return state.clone(),
-        Some(Err(err)) => (
-            Some(format!(
-                "could not locate the protected prefix families to sample: {err}"
-            )),
-            false,
-        ),
-        Some(Ok(plan)) => {
-            let mut gaps = Vec::new();
-            if !plan.unsampled.is_empty() {
-                gaps.push(format!(
-                    "no object to sample for {}",
-                    plan.unsampled.join(", ")
-                ));
-            }
-            if !plan.inside_window.is_empty() {
-                gaps.push(format!(
-                    "no object older than the {} retention coverage window to sample for {}",
-                    humantime::format_duration(plan.coverage_window),
-                    plan.inside_window.join(", ")
-                ));
-            }
-            (
-                (!gaps.is_empty()).then(|| gaps.join("; ")),
-                plan.budget_exhausted,
-            )
-        }
-    };
-    // A locked sample passes whether or not it is the newest object, so the
-    // budget note only qualifies a state that is not a pass.
-    let note = budget_exhausted.then_some(RETENTION_BUDGET_NOTE);
-    let qualify = |detail: &str| {
-        [Some(detail), gap.as_deref(), note]
-            .into_iter()
-            .flatten()
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join("; ")
-    };
-    match (state, &gap) {
-        (ConditionState::Pass, None) => ConditionState::Pass,
-        (ConditionState::Pass, Some(_)) => ConditionState::Unknown(qualify("")),
-        (ConditionState::Unknown(detail), _) => ConditionState::Unknown(qualify(detail)),
-        (ConditionState::Fail(detail), _) => ConditionState::Fail(qualify(detail)),
-    }
-}
-
-const RETENTION_BUDGET_NOTE: &str = "the listing budget ran out before every candidate was \
-                                     listed, so a sample is the newest object found, not \
-                                     provably the newest";
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
@@ -1855,35 +1428,15 @@ mod tests {
     const EXPECT_CORE: ProtectionExpectations = ProtectionExpectations {
         expected_noncurrent_days: 30,
         expect_replication: false,
-        expect_object_retention: false,
-        retention_coverage_window: None,
     };
-
-    /// The coverage window and store time the sample tests run at: the cutoff
-    /// is 900 ms.
-    const TEST_WINDOW: Duration = Duration::from_millis(100);
-    const TEST_NOW_MS: i64 = 1_000;
 
     const EXPECT_ALL: ProtectionExpectations = ProtectionExpectations {
         expected_noncurrent_days: 30,
         expect_replication: true,
-        expect_object_retention: true,
-        retention_coverage_window: Some(TEST_WINDOW),
     };
 
-    fn plan(prefixes: &[&str], unsampled: &[&'static str]) -> RetentionSamplePlan {
-        RetentionSamplePlan {
-            prefixes: prefixes.iter().map(|key| key.to_string()).collect(),
-            unsampled: unsampled.to_vec(),
-            inside_window: Vec::new(),
-            coverage_window: TEST_WINDOW,
-            budget_exhausted: false,
-        }
-    }
-
-    fn full_plan() -> Result<RetentionSamplePlan, String> {
-        Ok(plan(&["sys/tenancy"], &[]))
-    }
+    const RETENTION_NOT_CHECKED_LINE: &str = "object-retention           unknown not checked by \
+                                              this command, does not affect the exit code";
 
     /// ADR-1727 follow-up task 2's acceptance test: two expected conditions
     /// fail, and the command prints each on its own line with its detail,
@@ -1904,7 +1457,7 @@ mod tests {
                 unknown("replication is not expected"),
             ),
         ]);
-        let outcome = verify_protection_with(&source, EXPECT_CORE, None).await;
+        let outcome = verify_protection_with(&source, EXPECT_CORE).await;
         assert_eq!(
             outcome.lines,
             vec![
@@ -1917,7 +1470,7 @@ mod tests {
                 "delete-marker-replication  unknown not expected, does not affect the exit code: \
                  replication is not expected",
                 "object-lock                fail    Object Lock is not enabled on the bucket",
-                "object-retention           pass    not expected, does not affect the exit code",
+                RETENTION_NOT_CHECKED_LINE,
                 "verify-protection: FAIL: failed: noncurrent-expiration, object-lock",
             ]
         );
@@ -1926,7 +1479,8 @@ mod tests {
 
     /// Exit 0 needs every expected condition `Pass`. An unknown the
     /// deployment did not opt into does not move it; the same unknown under
-    /// its flag does.
+    /// its flag does. `object-retention` is printed as not checked whatever
+    /// the report says of it, and never moves the exit code.
     #[tokio::test]
     async fn verify_protection_exits_0_only_when_every_expected_condition_passes() {
         let source = fixture(&[
@@ -1936,10 +1490,10 @@ mod tests {
             ),
             (
                 ProtectionConditionId::ObjectRetention,
-                unknown("object retention is not sampled"),
+                fail("sys/tenancy: no retention"),
             ),
         ]);
-        let outcome = verify_protection_with(&source, EXPECT_CORE, None).await;
+        let outcome = verify_protection_with(&source, EXPECT_CORE).await;
         assert_eq!(
             outcome.lines,
             vec![
@@ -1952,8 +1506,7 @@ mod tests {
                 "delete-marker-replication  unknown not expected, does not affect the exit code: \
                  replication is not expected",
                 "object-lock                pass",
-                "object-retention           unknown not expected, does not affect the exit code: \
-                 object retention is not sampled",
+                RETENTION_NOT_CHECKED_LINE,
                 "verify-protection: PASS: every expected condition passed",
             ]
         );
@@ -1963,7 +1516,7 @@ mod tests {
             expect_replication: true,
             ..EXPECT_CORE
         };
-        let outcome = verify_protection_with(&source, expecting_replication, None).await;
+        let outcome = verify_protection_with(&source, expecting_replication).await;
         assert_eq!(
             outcome.lines[6],
             "delete-marker-replication  unknown replication is not expected"
@@ -1975,7 +1528,7 @@ mod tests {
         assert_eq!(outcome.exit_code, VERIFY_PROTECTION_UNKNOWN);
 
         let all = fixture(&[]);
-        let outcome = verify_protection_with(&all, EXPECT_ALL, Some(&full_plan())).await;
+        let outcome = verify_protection_with(&all, EXPECT_ALL).await;
         assert_eq!(
             outcome.exit_code, VERIFY_PROTECTION_PASS,
             "{:?}",
@@ -1997,7 +1550,7 @@ mod tests {
                 unknown("rules cover t/ in a form that cannot be proven"),
             ),
         ]);
-        let outcome = verify_protection_with(&source, EXPECT_CORE, None).await;
+        let outcome = verify_protection_with(&source, EXPECT_CORE).await;
         assert_eq!(
             outcome.lines[4],
             "rule-scope                 unknown rules cover t/ in a form that cannot be proven"
@@ -2014,16 +1567,15 @@ mod tests {
     }
 
     /// Exit 2 for an expected unknown, for a control plane that could not be
-    /// reached, for a backend with no control plane, and for a retention
-    /// sample that missed a protected prefix family: never exit 0 for "could
-    /// not verify".
+    /// reached, and for a backend with no control plane: never exit 0 for
+    /// "could not verify". `object-retention` is not among the unknowns.
     #[tokio::test]
     async fn verify_protection_exits_2_when_an_expected_condition_is_unknown() {
         let source = fixture(&[(
             ProtectionConditionId::Versioning,
             unknown("GET ?versioning: 403 AccessDenied"),
         )]);
-        let outcome = verify_protection_with(&source, EXPECT_CORE, None).await;
+        let outcome = verify_protection_with(&source, EXPECT_CORE).await;
         assert_eq!(
             outcome.lines[0],
             "versioning                 unknown GET ?versioning: 403 AccessDenied"
@@ -2054,290 +1606,46 @@ mod tests {
         assert_eq!(unreachable.exit_code, VERIFY_PROTECTION_UNKNOWN);
 
         let memory = BuiltStore::Other(Arc::new(MemoryStore::new()));
-        let outcome = verify_protection(&memory, EXPECT_ALL, TEST_NOW_MS).await;
+        let outcome = verify_protection(&memory, EXPECT_ALL).await;
         assert_eq!(outcome.exit_code, VERIFY_PROTECTION_UNKNOWN);
+        assert_eq!(outcome.lines[8], RETENTION_NOT_CHECKED_LINE);
         assert_eq!(
             outcome.lines.last().map(String::as_str),
             Some(
                 "verify-protection: UNKNOWN: could not verify: versioning, \
                  noncurrent-expiration, expired-delete-marker, abort-multipart, rule-scope, \
-                 no-foreign-rule, delete-marker-replication, object-lock, object-retention"
+                 no-foreign-rule, delete-marker-replication, object-lock"
             )
         );
-
-        // Every sampled object carries retention, but the commit-record family
-        // had nothing to sample: the pass does not stand.
-        let partial = Ok(plan(&["sys/tenancy"], &[RETENTION_FAMILY_COMMIT]));
-        let outcome = verify_protection_with(&fixture(&[]), EXPECT_ALL, Some(&partial)).await;
-        assert_eq!(
-            outcome.lines[8],
-            "object-retention           unknown no object to sample for commit records (t/*/*/c/)"
-        );
-        assert_eq!(outcome.exit_code, VERIFY_PROTECTION_UNKNOWN);
     }
 
-    /// Put each `(key, last_modified_ms)` into `store` at that store time.
-    async fn seed_at(store: &MemoryStore, objects: &[(&str, u64)]) {
-        for (key, at) in objects {
-            store.set_clock_ms(*at);
-            store
-                .put(key, Bytes::from_static(b"x"), PutOptions::default())
-                .await
-                .expect("seed");
+    /// No object is sampled for retention: the control plane is asked for no
+    /// retention sample and no protected prefix.
+    #[tokio::test]
+    async fn verify_protection_asks_the_control_plane_for_no_retention_sample() {
+        struct Recording(std::sync::Mutex<Vec<BucketProtectionParams>>);
+
+        #[async_trait::async_trait]
+        impl BucketControlPlane for Recording {
+            async fn bucket_protection_report(
+                &self,
+                params: &BucketProtectionParams,
+            ) -> BucketProtectionReport {
+                self.0.lock().expect("lock").push(params.clone());
+                fixture(&[]).0
+            }
         }
-    }
 
-    async fn sample(store: &MemoryStore) -> RetentionSamplePlan {
-        retention_sample_plan(store, TEST_WINDOW, TEST_NOW_MS)
-            .await
-            .expect("lists")
-    }
-
-    /// The retention sample is, per family, the most recently modified current
-    /// object older than the coverage window, not the first tenant's records:
-    /// the newest `prov` across tenants, the newest catalog object, the newest
-    /// commit record in each shard's newest ingest hour of the tenant whose
-    /// catalog was written last, and the newest `sys/` record outside the
-    /// scratch prefixes. A family with nothing under it is named, not sampled.
-    #[tokio::test]
-    async fn retention_sample_plan_picks_the_newest_current_object_per_family() {
-        let store = MemoryStore::new();
-        assert_eq!(
-            sample(&store).await,
-            plan(
-                &[],
-                &[
-                    RETENTION_FAMILY_SYS,
-                    RETENTION_FAMILY_PROV,
-                    RETENTION_FAMILY_COMMIT,
-                    RETENTION_FAMILY_CATALOG,
-                ]
-            )
-        );
-
-        seed_at(
-            &store,
-            &[
-                ("sys/auth", 1),
-                ("sys/tenancy", 40),
-                ("sys/t/aa", 30),
-                ("sys/qualify/run/cas/create-if-absent", 90),
-                ("sys/pq-probe/probe", 91),
-                ("sys/maintain/workers/p1", 92),
-                ("t/aa/l/prov", 5),
-                ("t/aa/m/prov", 2),
-                ("t/aa/m/c/0/100/w.1.1.cmt", 6),
-                ("t/aa/catalog/m/HEAD", 10),
-                ("t/aa/config", 50),
-                ("t/bb/m/prov", 8),
-                ("t/bb/m/c/0/100/w.1.1.cmt", 21),
-                ("t/bb/m/c/0/101/w.1.2.cmt", 24),
-                ("t/bb/m/c/0/101/w.1.3.cmt", 25),
-                ("t/bb/m/c/1/99/w.2.1.cmt", 22),
-                ("t/bb/catalog/m/HEAD", 20),
-                ("t/bb/catalog/m/snap/20.0000000000000000.csnap", 19),
-            ],
-        )
-        .await;
-        assert_eq!(
-            sample(&store).await,
-            plan(
-                &[
-                    "sys/tenancy",
-                    "t/bb/m/prov",
-                    "t/bb/m/c/0/101/w.1.3.cmt",
-                    "t/bb/catalog/m/HEAD",
-                ],
-                &[]
-            )
-        );
-    }
-
-    /// Scratch and per-process state under `sys/qualify/`, `sys/pq-probe/`,
-    /// `sys/maintain/` and `sys/query/workers/` is never the `sys/` sample,
-    /// however new: with nothing else under `sys/` the family is unsampled.
-    #[tokio::test]
-    async fn retention_sample_plan_skips_sys_qualify_scratch() {
-        let store = MemoryStore::new();
-        seed_at(
-            &store,
-            &[
-                ("sys/qualify/run/checksum-echo", 90),
-                ("sys/pq-probe/probe", 91),
-                ("sys/maintain/workers/p1", 92),
-                ("sys/query/workers/w1", 93),
-            ],
-        )
-        .await;
-        let plan = sample(&store).await;
+        let source = Recording(std::sync::Mutex::new(Vec::new()));
+        let outcome = verify_protection_with(&source, EXPECT_ALL).await;
+        assert_eq!(outcome.exit_code, VERIFY_PROTECTION_PASS);
+        let asked = source.0.lock().expect("lock").clone();
+        assert_eq!(asked.len(), 1);
+        assert!(!asked[0].sample_object_retention, "{asked:?}");
         assert!(
-            plan.prefixes.is_empty() && plan.unsampled.contains(&RETENTION_FAMILY_SYS),
-            "{plan:?}"
+            asked[0].protected_retention_prefixes.is_empty(),
+            "{asked:?}"
         );
-
-        seed_at(&store, &[("sys/qualification", 10)]).await;
-        assert_eq!(sample(&store).await.prefixes, ["sys/qualification"]);
-    }
-
-    /// A control plane whose `object-retention` reads a sampled key as locked
-    /// when it is in the set and as carrying no retention otherwise, as the S3
-    /// verdict reads an absent retention. Every other condition passes.
-    struct LockedKeys(&'static [&'static str]);
-
-    #[async_trait::async_trait]
-    impl BucketControlPlane for LockedKeys {
-        async fn bucket_protection_report(
-            &self,
-            params: &BucketProtectionParams,
-        ) -> BucketProtectionReport {
-            let unlocked: Vec<&str> = params
-                .protected_retention_prefixes
-                .iter()
-                .map(String::as_str)
-                .filter(|key| !self.0.contains(key))
-                .collect();
-            let retention = if params.protected_retention_prefixes.is_empty() {
-                unknown("nothing sampled")
-            } else if unlocked.is_empty() {
-                ConditionState::Pass
-            } else {
-                fail(&format!("{}: no retention", unlocked.join(", ")))
-            };
-            fixture(&[(ProtectionConditionId::ObjectRetention, retention)]).0
-        }
-    }
-
-    /// Sample `store` and read the sample through `locked`.
-    async fn verify_sample(
-        store: &MemoryStore,
-        locked: &'static [&'static str],
-    ) -> VerifyProtectionOutcome {
-        let plan = Ok(sample(store).await);
-        verify_protection_with(&LockedKeys(locked), EXPECT_ALL, Some(&plan)).await
-    }
-
-    /// One locked object per family older than the window (cutoff 900 ms).
-    const OLDER_LOCKED: [(&str, u64); 4] = [
-        ("sys/tenancy", 100),
-        ("t/aa/m/prov", 200),
-        ("t/aa/m/c/0/100/w.1.1.cmt", 300),
-        ("t/aa/catalog/m/snap/1.0000000000000000.csnap", 400),
-    ];
-    const OLDER_LOCKED_KEYS: &[&str] = &[
-        "sys/tenancy",
-        "t/aa/m/prov",
-        "t/aa/m/c/0/100/w.1.1.cmt",
-        "t/aa/catalog/m/snap/1.0000000000000000.csnap",
-    ];
-
-    /// An object written inside the coverage window may not carry retention
-    /// yet on a compliant bucket, so it is not sampled even when it is the
-    /// newest: the older locked object is, and the condition passes.
-    #[tokio::test]
-    async fn an_object_inside_the_coverage_window_is_not_sampled() {
-        let store = MemoryStore::new();
-        seed_at(&store, &OLDER_LOCKED).await;
-        seed_at(
-            &store,
-            &[
-                ("t/aa/m/c/0/101/w.1.2.cmt", 950),
-                ("t/aa/catalog/m/HEAD", 960),
-            ],
-        )
-        .await;
-        assert_eq!(sample(&store).await, plan(OLDER_LOCKED_KEYS, &[]));
-        let outcome = verify_sample(&store, OLDER_LOCKED_KEYS).await;
-        assert_eq!(outcome.lines[8], "object-retention           pass");
-        assert_eq!(outcome.exit_code, VERIFY_PROTECTION_PASS);
-    }
-
-    /// An object older than the window with no retention still fails, even
-    /// when a newer object inside the window is locked.
-    #[tokio::test]
-    async fn an_unlocked_object_older_than_the_window_fails() {
-        let store = MemoryStore::new();
-        seed_at(&store, &OLDER_LOCKED).await;
-        seed_at(&store, &[("sys/auth", 950)]).await;
-        let outcome = verify_sample(
-            &store,
-            &[
-                "sys/auth",
-                "t/aa/m/prov",
-                "t/aa/m/c/0/100/w.1.1.cmt",
-                "t/aa/catalog/m/snap/1.0000000000000000.csnap",
-            ],
-        )
-        .await;
-        assert_eq!(
-            outcome.lines[8],
-            "object-retention           fail    sys/tenancy: no retention"
-        );
-        assert_eq!(outcome.exit_code, VERIFY_PROTECTION_FAIL);
-    }
-
-    /// A family whose every object is inside the window has nothing the
-    /// retention mechanism must already cover: it reads unknown, naming the
-    /// window, never fail.
-    #[tokio::test]
-    async fn a_family_with_only_objects_inside_the_window_reads_unknown() {
-        let store = MemoryStore::new();
-        seed_at(&store, &[OLDER_LOCKED[0], OLDER_LOCKED[1], OLDER_LOCKED[3]]).await;
-        seed_at(&store, &[("t/aa/m/c/0/101/w.1.2.cmt", 950)]).await;
-        let outcome = verify_sample(&store, OLDER_LOCKED_KEYS).await;
-        assert_eq!(
-            outcome.lines[8],
-            "object-retention           unknown no object older than the 100ms retention \
-             coverage window to sample for commit records (t/*/*/c/)"
-        );
-        assert_eq!(outcome.exit_code, VERIFY_PROTECTION_UNKNOWN);
-        assert_eq!(
-            sample(&store).await.inside_window,
-            [RETENTION_FAMILY_COMMIT]
-        );
-    }
-
-    /// A listing budget that runs out marks the plan, and the note qualifies
-    /// an unknown or failed `object-retention` but never demotes a pass.
-    #[tokio::test]
-    async fn an_exhausted_listing_budget_is_named_but_does_not_demote_a_pass() {
-        let store = MemoryStore::new();
-        seed_at(
-            &store,
-            &[
-                ("sys/tenancy", 1),
-                ("t/aa/m/prov", 2),
-                ("t/aa/m/c/0/100/w.1.1.cmt", 3),
-                ("t/aa/catalog/m/HEAD", 4),
-            ],
-        )
-        .await;
-        let within = retention_sample_plan_within(&store, TEST_WINDOW, TEST_NOW_MS, 1, 0)
-            .await
-            .expect("lists");
-        assert_eq!(within.prefixes, ["sys/tenancy"]);
-        assert!(within.budget_exhausted);
-
-        let full = Ok(RetentionSamplePlan {
-            budget_exhausted: true,
-            ..plan(&["sys/tenancy"], &[])
-        });
-        let outcome = verify_protection_with(&fixture(&[]), EXPECT_ALL, Some(&full)).await;
-        assert_eq!(outcome.lines[8], "object-retention           pass");
-        assert_eq!(outcome.exit_code, VERIFY_PROTECTION_PASS);
-
-        let lapsed = fixture(&[(
-            ProtectionConditionId::ObjectRetention,
-            unknown("sys/tenancy (newest current version): compliance retention lapsed"),
-        )]);
-        let outcome = verify_protection_with(&lapsed, EXPECT_ALL, Some(&full)).await;
-        assert_eq!(
-            outcome.lines[8],
-            format!(
-                "object-retention           unknown sys/tenancy (newest current version): \
-                 compliance retention lapsed; {RETENTION_BUDGET_NOTE}"
-            )
-        );
-        assert_eq!(outcome.exit_code, VERIFY_PROTECTION_UNKNOWN);
     }
 
     /// A writer that accepts `accept` bytes, then fails every write and flush
@@ -2401,7 +1709,7 @@ mod tests {
         report
             .conditions
             .retain(|entry| entry.id != ProtectionConditionId::ObjectLock);
-        let outcome = render_verify_protection(&report, EXPECT_CORE, None);
+        let outcome = render_verify_protection(&report, EXPECT_CORE);
         assert_eq!(
             outcome.lines[7],
             "object-lock                unknown missing from the bucket-protection report"
@@ -2416,7 +1724,7 @@ mod tests {
         report
             .conditions
             .retain(|entry| entry.id != ProtectionConditionId::DeleteMarkerReplication);
-        let outcome = render_verify_protection(&report, EXPECT_CORE, None);
+        let outcome = render_verify_protection(&report, EXPECT_CORE);
         assert_eq!(
             outcome.lines[6],
             "delete-marker-replication  unknown not expected, does not affect the exit code: \
@@ -2473,7 +1781,7 @@ mod tests {
             expect_replication: true,
             ..EXPECT_CORE
         };
-        let outcome = verify_protection(&built, expectations, TEST_NOW_MS).await;
+        let outcome = verify_protection(&built, expectations).await;
         assert_eq!(
             fake.control_plane(),
             vec!["versioning", "lifecycle", "replication", "object-lock"]
@@ -2491,13 +1799,7 @@ mod tests {
                 "object-lock                pass",
             ]
         );
-        assert!(
-            outcome.lines[8].starts_with(
-                "object-retention           unknown not expected, does not affect the exit code: "
-            ),
-            "{:?}",
-            outcome.lines[8]
-        );
+        assert_eq!(outcome.lines[8], RETENTION_NOT_CHECKED_LINE);
         assert_eq!(
             outcome.lines[9],
             "verify-protection: PASS: every expected condition passed"
@@ -2505,7 +1807,7 @@ mod tests {
         assert_eq!(outcome.exit_code, VERIFY_PROTECTION_PASS);
 
         let through_dyn = BuiltStore::Other(built.backend());
-        let outcome = verify_protection(&through_dyn, expectations, TEST_NOW_MS).await;
+        let outcome = verify_protection(&through_dyn, expectations).await;
         assert!(
             outcome.lines[..9]
                 .iter()

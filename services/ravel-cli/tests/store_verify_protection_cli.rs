@@ -63,32 +63,39 @@ fn verify_protection_without_a_bucket_exits_2() {
     );
 }
 
-/// `--expect-object-retention` without `--retention-coverage-window` is a
-/// usage error naming the option and why, and nothing is read: stdout stays
-/// empty. The window alone is refused too.
+/// `object-retention` is not checked by this command: it prints as not
+/// checked and is not named among the conditions that could not be verified.
+/// The retention options are not accepted, and nothing is read.
 #[test]
-fn expect_object_retention_requires_the_coverage_window() {
-    let output = verify_protection_with(&["--store", "memory"], &["--expect-object-retention"]);
-    assert_eq!(output.status.code(), Some(2));
+fn object_retention_is_reported_as_not_checked() {
+    let output = verify_protection(&["--store", "memory"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        "error: --expect-object-retention requires --retention-coverage-window: an object \
-         newer than the bucket's retention mechanism's coverage lag (a scheduled batch job's \
-         schedule interval plus its inventory delay) carries no retention yet, so the sample \
-         reads only objects older than that window\n"
+        lines[8],
+        "object-retention           unknown not checked by this command, does not affect the \
+         exit code",
+        "{stdout}"
     );
-    assert!(output.stdout.is_empty(), "nothing is read or printed");
+    assert!(!lines[9].contains("object-retention"), "{stdout}");
 
-    let output = verify_protection_with(
-        &["--store", "memory"],
-        &["--retention-coverage-window", "25h"],
-    );
-    assert_eq!(output.status.code(), Some(2), "clap's usage error");
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("--expect-object-retention"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    for extra in [
+        &["--expect-object-retention"][..],
+        &["--retention-coverage-window", "25h"][..],
+    ] {
+        let output = verify_protection_with(&["--store", "memory"], extra);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "clap's usage error: {extra:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("unexpected argument"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty(), "nothing is read or printed");
+    }
 }
 
 /// A report that could not be written to stdout is "could not report", exit

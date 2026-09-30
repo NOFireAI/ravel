@@ -286,14 +286,12 @@ Run the conformance suite against the configured backend and, on a pass, record 
 
 ### store verify-protection
 
-Read the bucket's protection configuration and check it against the deployment's expectations: one line per condition, then a summary. Exits 0 only when every expected condition passes, 1 when any fails, and 2 when any could not be verified or the bucket's control plane could not be reached. A usage error (a missing or malformed flag) also exits 2, before anything is read, and so does a report that could not be written to stdout (a closed pipe excepted). Read-only
+Read the bucket's protection configuration and check it against the deployment's expectations: one line per condition, then a summary. Exits 0 only when every expected condition passes, 1 when any fails, and 2 when any could not be verified or the bucket's control plane could not be reached. A usage error (a missing or malformed flag) also exits 2, before anything is read, and so does a report that could not be written to stdout (a closed pipe excepted). `object-retention` is not checked by this command: it is printed as not checked and does not affect the exit code. Read-only
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
-| `--expect-object-retention` |  |  | Expect per-object compliance-mode retention: in each protected prefix family, the most recently modified current object found that is older than `--retention-coverage-window`, and one noncurrent version, must carry unexpired compliance-mode retention. A family with no object older than the window reads unknown, and so does a sampled object whose lock has lapsed, since it is not a recent object. Requires `--retention-coverage-window`. Without this flag the condition is printed and does not affect the exit code |
 | `--expect-replication` |  |  | Expect replication: `delete-marker-replication` must pass. Without it the condition is printed and does not affect the exit code |
 | `--expected-noncurrent-days` |  |  | The noncurrent-version expiration, in days, the lifecycle rule covering `t/` must carry (`E_v`) |
-| `--retention-coverage-window` |  |  | How far the bucket's retention mechanism may lag a write, as a humantime duration (`25h`): for a scheduled batch job, its schedule interval plus the inventory delay plus its own execution and retry time; for an event-driven one, a few minutes. An object newer than this may not carry retention yet on a correctly configured bucket, so the sample skips it. Only with `--expect-object-retention`, which requires it |
 
 ## hold
 

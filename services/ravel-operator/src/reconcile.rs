@@ -7939,7 +7939,10 @@ mod tests {
         // precedence over backoffLimit, so the deadline must fit the intended
         // attempts end to end: 1182 s per attempt (2083 operations at 500 ms =
         // 1041.5 s, rounded up to 1042 s, + 140 s pod scheduling/pull) *
-        // (backoffLimit + 1) attempts.
+        // (backoffLimit + 1) attempts. The 2083 comes from, and is pinned
+        // against a qualify run on a fake S3 endpoint by, ravel-cli's
+        // `one_attempt_at_the_default_page_size_issues_the_budgeted_requests`
+        // (services/ravel-cli/src/qualify.rs).
         assert_eq!(
             QUALIFY_JOB_BACKOFF_LIMIT, 1,
             "one retry (two attempts total)"

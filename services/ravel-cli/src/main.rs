@@ -1167,7 +1167,9 @@ enum StoreCommand {
     /// when any could not be verified or the bucket's control plane could not
     /// be reached. A usage error (a missing or malformed flag) also exits 2,
     /// before anything is read, and so does a report that could not be written
-    /// to stdout (a closed pipe excepted). Read-only.
+    /// to stdout (a closed pipe excepted). `object-retention` is not checked
+    /// by this command: it is printed as not checked and does not affect the
+    /// exit code. Read-only.
     VerifyProtection {
         /// The noncurrent-version expiration, in days, the lifecycle rule
         /// covering `t/` must carry (`E_v`).
@@ -1177,29 +1179,6 @@ enum StoreCommand {
         /// it the condition is printed and does not affect the exit code.
         #[arg(long)]
         expect_replication: bool,
-        /// Expect per-object compliance-mode retention: in each protected
-        /// prefix family, the most recently modified current object found
-        /// that is older than `--retention-coverage-window`, and one
-        /// noncurrent version, must carry unexpired compliance-mode retention.
-        /// A family with no object older than the window reads unknown, and so
-        /// does a sampled object whose lock has lapsed, since it is not a
-        /// recent object. Requires `--retention-coverage-window`. Without this
-        /// flag the condition is printed and does not affect the exit code.
-        #[arg(long)]
-        expect_object_retention: bool,
-        /// How far the bucket's retention mechanism may lag a write, as a
-        /// humantime duration (`25h`): for a scheduled batch job, its schedule
-        /// interval plus the inventory delay plus its own execution and retry
-        /// time; for an event-driven one, a few minutes. An object newer than this may not carry retention yet on a
-        /// correctly configured bucket, so the sample skips it. Only with
-        /// `--expect-object-retention`, which requires it.
-        #[arg(
-            long,
-            value_name = "DURATION",
-            value_parser = humantime::parse_duration,
-            requires = "expect_object_retention"
-        )]
-        retention_coverage_window: Option<std::time::Duration>,
     },
 }
 
@@ -1931,31 +1910,14 @@ async fn main() -> anyhow::Result<()> {
                 StoreCommand::VerifyProtection {
                     expected_noncurrent_days,
                     expect_replication,
-                    expect_object_retention,
-                    retention_coverage_window,
                 },
         } => {
-            if expect_object_retention && retention_coverage_window.is_none() {
-                eprintln!("error: {}", store::RETENTION_WINDOW_REQUIRED);
-                std::process::exit(store::VERIFY_PROTECTION_UNKNOWN);
-            }
             let expectations = store::ProtectionExpectations {
                 expected_noncurrent_days,
                 expect_replication,
-                expect_object_retention,
-                retention_coverage_window,
             };
             let outcome = match store::build_store_handle(&cli.store, None) {
-                Ok(built) => {
-                    let now_unix_ms = match ravel_cli::now_ns() {
-                        Ok(now_ns) => now_ns / 1_000_000,
-                        Err(err) => {
-                            eprintln!("error: could not read the system clock: {err}");
-                            std::process::exit(store::VERIFY_PROTECTION_UNKNOWN);
-                        }
-                    };
-                    store::verify_protection(&built, expectations, now_unix_ms).await
-                }
+                Ok(built) => store::verify_protection(&built, expectations).await,
                 Err(err) => store::verify_protection_unreachable(&err, expectations),
             };
             if let Err(err) =

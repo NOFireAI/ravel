@@ -668,21 +668,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`ravel-cli store verify-protection` checks a bucket's protection
   configuration** (ADR-1727 decision 4, issues #1727, #2197). It reads the
   bucket's versioning, lifecycle, replication and Object Lock configuration,
-  and with `--expect-object-retention` samples the retention of the most
-  recently modified current object a bounded listing finds in each protected
-  prefix family that is older than `--retention-coverage-window` (skipping
-  the `sys/qualify/`, `sys/pq-probe/`, `sys/maintain/` and
-  `sys/query/workers/` scratch), then prints one line per condition (`pass`,
-  `fail` or `unknown`, with the reason) and a summary.
-  `--expect-object-retention` requires `--retention-coverage-window` (a
-  humantime duration such as `25h`): the retention mechanism can lag a write
-  by up to that window, so an object inside it may carry no retention yet on
-  a compliant bucket and is not sampled, and a family with no object older
-  than the window reads `unknown`. A sampled object whose compliance lock has
-  lapsed reads `unknown`, since it is not a recent object; one with no
-  retention at all reads `fail`. `--expected-noncurrent-days` is required,
-  and `--expect-replication` and `--expect-object-retention` add the two
-  conditions a deployment opts into. It exits `0` only when every expected
+  then prints one line per condition (`pass`, `fail` or `unknown`, with the
+  reason) and a summary. `object-retention` is reported as not checked by
+  this command and never affects the exit code (issue #2228).
+  `--expected-noncurrent-days` is required, and `--expect-replication` adds
+  the condition a deployment opts into. It exits `0` only when every expected
   condition passes, `1` when any fails, and `2` when any could not be
   verified, is missing from the report, or the control plane could not be
   reached, so "could not verify" never exits `0`. A usage error also exits

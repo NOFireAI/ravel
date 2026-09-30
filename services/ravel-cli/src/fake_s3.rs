@@ -3,8 +3,8 @@
 //! and `ListObjectsV2` over an in-memory map, and the bucket subresource GETs
 //! the bucket-protection control plane sends. It honors enough of the object
 //! store contract for the conformance suite to pass against it, and records
-//! what each PUT carried, each LIST asked for and which subresources were
-//! asked for, so a test can pin all three.
+//! what each PUT carried, each LIST asked for, which keys were read and
+//! deleted and which subresources were asked for, so a test can pin them.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -68,6 +68,10 @@ pub(crate) struct FakeS3 {
     next_etag: AtomicU64,
     pub puts: Mutex<Vec<SeenPut>>,
     pub lists: Mutex<Vec<SeenList>>,
+    /// The key of every object GET the endpoint served.
+    pub gets: Mutex<Vec<String>>,
+    /// The key of every object HEAD the endpoint served.
+    pub heads: Mutex<Vec<String>>,
     pub deletes: Mutex<Vec<String>>,
     /// The subresource of every control-plane GET, in arrival order.
     pub control_plane: Mutex<Vec<String>>,
@@ -86,6 +90,14 @@ impl FakeS3 {
 
     pub fn lists(&self) -> Vec<SeenList> {
         self.lists.lock().expect("lists lock").clone()
+    }
+
+    pub fn gets(&self) -> Vec<String> {
+        self.gets.lock().expect("gets lock").clone()
+    }
+
+    pub fn heads(&self) -> Vec<String> {
+        self.heads.lock().expect("heads lock").clone()
     }
 
     pub fn deletes(&self) -> Vec<String> {
@@ -141,6 +153,8 @@ pub(crate) async fn spawn(
         next_etag: AtomicU64::new(1),
         puts: Mutex::default(),
         lists: Mutex::default(),
+        gets: Mutex::default(),
+        heads: Mutex::default(),
         deletes: Mutex::default(),
         control_plane: Mutex::default(),
         refuse_deletes: AtomicBool::new(false),
@@ -209,7 +223,15 @@ fn handle(
             (StatusCode::FORBIDDEN, ACCESS_DENIED).into_response()
         }
         Method::PUT => put_object(state, &key, headers, body),
-        Method::GET | Method::HEAD => get_object(state, &key, headers),
+        Method::GET | Method::HEAD => {
+            let seen = if *method == Method::HEAD {
+                &state.heads
+            } else {
+                &state.gets
+            };
+            seen.lock().expect("reads lock").push(key.clone());
+            get_object(state, &key, headers)
+        }
         Method::DELETE => {
             delete_object(state, &key);
             StatusCode::NO_CONTENT.into_response()
