@@ -610,12 +610,13 @@ async fn bounded_topk_fires_on_a_parquet_plan_with_the_exact_answer() {
 }
 
 /// With no credential profile file a Parquet table is not queryable: the
-/// statement fails typed, after one LIST and no GET on either store.
+/// statement fails typed, after one LIST and one GET of the newest manifest on
+/// Ravel's store, and no GET on the lake.
 ///
-/// The Ravel-store GET count is what tells this early refusal from resolving
-/// the table anyway and refusing afterwards: a resolve LISTs the table's
-/// versions and then GETs its newest manifest, while the refusal stops after
-/// the LIST that says the name has versions at all.
+/// The manifest GET is what says the name is a live table rather than a
+/// dropped one. The Ravel-store GET count is what tells this early refusal
+/// from resolving the table anyway and refusing afterwards: a full resolve
+/// also GETs the grants record.
 #[tokio::test]
 async fn no_profile_file_is_a_typed_error_that_reads_nothing() {
     let lake = Lake::new(false, SqlConfig::default());
@@ -641,9 +642,9 @@ async fn no_profile_file_is_a_typed_error_that_reads_nothing() {
         err.client_message()
     );
     assert_eq!(
-        Lake::gets(&lake.ravel),
-        ravel_before,
-        "no manifest GET, which resolving the table would issue"
+        Lake::gets(&lake.ravel) - ravel_before,
+        1,
+        "the newest manifest, and not the grants record a full resolve reads"
     );
     assert_eq!(Lake::gets(&lake.lake), lake_before, "no file is read");
     assert_eq!(
@@ -763,6 +764,24 @@ async fn a_file_in_ravels_own_bucket_is_refused_on_read() {
     assert!(message.contains("Ravel's own data bucket"), "{message}");
 }
 
+/// Drop `table` of `tenant`: its newest manifest version becomes a drop.
+async fn drop_table(lake: &Lake, tenant: &TenantHash, table: &str) {
+    writer::apply(
+        lake.ravel.inner(),
+        tenant,
+        table,
+        Intent::Drop {
+            if_exists: false,
+            created_by: "test".to_string(),
+            statement: format!("DROP TABLE {table}"),
+        },
+        &FixedClock::new(NOW),
+        MIN_GRACE_MS,
+    )
+    .await
+    .expect("drop");
+}
+
 /// A dropped table is no table: the same planning failure as a name nobody
 /// created.
 #[tokio::test]
@@ -770,21 +789,75 @@ async fn a_dropped_table_is_an_unknown_table() {
     let lake = Lake::configured();
     let acme = tenant("acme");
     lake.hits_for(&acme).await;
-    writer::apply(
-        lake.ravel.inner(),
-        &acme,
-        "hits",
-        Intent::Drop {
-            if_exists: false,
-            created_by: "test".to_string(),
-            statement: "DROP TABLE hits".to_string(),
-        },
-        &FixedClock::new(NOW),
-        MIN_GRACE_MS,
-    )
-    .await
-    .expect("drop");
+    drop_table(&lake, &acme, "hits").await;
     unknown_table_error(&lake, &acme, "SELECT * FROM hits").await;
+}
+
+/// A dropped table beside a signal table is an unknown table, not a
+/// cross-signal statement: the early-exit resolve reads the name's newest
+/// manifest, finds a drop, and goes on.
+///
+/// FLIP: deciding from the LIST alone (a name with versions is found) makes
+/// this `CrossSignalQuery`.
+#[tokio::test]
+async fn a_dropped_table_beside_samples_is_an_unknown_table() {
+    let lake = Lake::configured();
+    let acme = tenant("acme");
+    lake.hits_for(&acme).await;
+    drop_table(&lake, &acme, "hits").await;
+    let before = reads(&lake);
+    let err = unknown_table_error(&lake, &acme, "SELECT 1 FROM samples, hits").await;
+    let nosuch = unknown_table_error(&lake, &acme, "SELECT 1 FROM samples, nosuch").await;
+    assert_eq!(err.class(), nosuch.class());
+    assert_eq!(
+        reads(&lake).2,
+        before.2,
+        "the dropped table's files are never read"
+    );
+}
+
+/// Without a profile file a dropped table is an unknown table, not
+/// `NotConfigured`; a live table named after it still decides
+/// `NotConfigured`, at one extra GET for the dropped name.
+///
+/// FLIP: deciding from the LIST alone makes the first statement
+/// `NotConfigured`.
+#[tokio::test]
+async fn a_dropped_table_without_a_profile_file_is_an_unknown_table() {
+    let lake = Lake::new(false, SqlConfig::default());
+    let acme = tenant("acme");
+    lake.hits_for(&acme).await;
+    let names = lake
+        .put_file(
+            "t/dropped_tbl/0.parquet",
+            parquet_bytes(&[1], &["x"], &[0.0]),
+        )
+        .await;
+    lake.create(&acme, "dropped_tbl", vec![names]).await;
+    drop_table(&lake, &acme, "dropped_tbl").await;
+
+    unknown_table_error(&lake, &acme, "SELECT * FROM dropped_tbl").await;
+
+    let before = reads(&lake);
+    let err = lake
+        .execute(&acme, "SELECT 1 FROM dropped_tbl, hits")
+        .await
+        .expect_err("hits decides");
+    assert!(
+        matches!(
+            parquet_error(&err),
+            Some(ParquetQueryError::NotConfigured { table }) if table == "hits"
+        ),
+        "{err}"
+    );
+    let after = reads(&lake);
+    assert_eq!(after.1 - before.1, 2, "one LIST per name");
+    assert_eq!(
+        after.0 - before.0,
+        2,
+        "one manifest GET per name that has versions, the dropped one included"
+    );
+    assert_eq!(after.2, before.2, "no file is read");
 }
 
 /// Two Parquet tables of one tenant join in one statement.
@@ -876,7 +949,7 @@ async fn a_statement_naming_the_cap_is_an_unknown_table_after_one_list_each() {
     );
 }
 
-/// With a signal table present, the first name with manifest versions decides
+/// With a signal table present, the first name that is a live table decides
 /// `CrossSignalQuery`: the unknown names after it are never listed.
 #[tokio::test]
 async fn samples_beside_a_parquet_table_stops_at_the_first_found_name() {
@@ -891,10 +964,14 @@ async fn samples_beside_a_parquet_table_stops_at_the_first_found_name() {
     assert!(matches!(err, SqlError::CrossSignalQuery), "{err}");
     let (ravel_gets, ravel_lists, lake_gets) = reads(&lake);
     assert_eq!(ravel_lists - before.1, 1, "one LIST, of hits's versions");
-    assert_eq!((ravel_gets, lake_gets), (before.0, before.2), "no GET");
+    assert_eq!(
+        (ravel_gets - before.0, lake_gets - before.2),
+        (1, 0),
+        "hits's newest manifest, and no file"
+    );
 }
 
-/// Without a profile file, the first name with manifest versions decides
+/// Without a profile file, the first name that is a live table decides
 /// `NotConfigured`: the unknown names after it are never listed.
 #[tokio::test]
 async fn not_configured_stops_at_the_first_found_name() {
@@ -915,16 +992,25 @@ async fn not_configured_stops_at_the_first_found_name() {
     );
     let (ravel_gets, ravel_lists, lake_gets) = reads(&lake);
     assert_eq!(ravel_lists - before.1, 1, "one LIST, of hits's versions");
-    assert_eq!((ravel_gets, lake_gets), (before.0, before.2), "no GET");
+    assert_eq!(
+        (ravel_gets - before.0, lake_gets - before.2),
+        (1, 0),
+        "hits's newest manifest, and no file"
+    );
 }
 
 /// A row window names an event-time column, which a Parquet table has none
-/// of: it is refused rather than silently ignored.
+/// of: it is refused rather than silently ignored, and before the table is
+/// resolved, so the refusal costs no store request.
+///
+/// FLIP: refusing in `plan_pinned_with`, after resolve, leaves a manifest LIST
+/// and two GETs in the counts.
 #[tokio::test]
 async fn a_row_window_is_refused_on_a_parquet_table() {
     let lake = Lake::configured();
     let acme = tenant("acme");
     lake.hits_for(&acme).await;
+    let before = reads(&lake);
     let mut req = request("SELECT * FROM hits");
     req.row_window = true;
     let err = lake
@@ -938,6 +1024,12 @@ async fn a_row_window_is_refused_on_a_parquet_table() {
             Some(ParquetQueryError::RowWindowUnsupported)
         ),
         "{err}"
+    );
+    assert_eq!(err.class(), ErrorClass::BadRequest);
+    assert_eq!(
+        reads(&lake),
+        before,
+        "refused before resolve: no LIST or GET reached either store"
     );
 }
 
