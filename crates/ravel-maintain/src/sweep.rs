@@ -210,6 +210,20 @@ pub struct SweepReport {
     /// `ravel_maintain_superseded_deletes_refused_total`. The steady state is
     /// `0`.
     pub superseded_deletes_refused: usize,
+    /// Rule 2: objects held this pass because the live catalog HEAD snapshot
+    /// still names them ([`SupersededSweepOutcome::held_by_snapshot`]); feeds
+    /// `ravel_maintain_superseded_inputs_held_total{reason="named"}`.
+    pub superseded_held_by_snapshot: usize,
+    /// Rule 2: objects held this pass because HEAD or a covering snapshot part
+    /// could not be read
+    /// ([`SupersededSweepOutcome::held_by_unreadable_head`]); feeds
+    /// `ravel_maintain_superseded_inputs_held_total{reason="unreadable_head"}`.
+    pub superseded_held_by_unreadable_head: usize,
+    /// Rule 2: chain groups skipped whole this pass because a legal hold
+    /// protects a key in them
+    /// ([`SupersededSweepOutcome::chain_groups_held_by_legal_hold`]); feeds
+    /// `ravel_maintain_superseded_groups_held_by_legal_hold_total`.
+    pub superseded_groups_held_by_legal_hold: usize,
     /// Rule 3: unreferenced `l1/` part objects deleted.
     pub unreferenced_parts_deleted: usize,
     /// Bytes of the objects [`Self::quarantine_reaped`] deleted this pass, from
@@ -344,6 +358,9 @@ pub async fn sweep_shard_with_holds(
             superseded_records_deleted: superseded.records_deleted,
             superseded_data_deleted: superseded.data_deleted,
             superseded_deletes_refused: superseded.deletes_refused,
+            superseded_held_by_snapshot: superseded.held_by_snapshot,
+            superseded_held_by_unreadable_head: superseded.held_by_unreadable_head,
+            superseded_groups_held_by_legal_hold: superseded.chain_groups_held_by_legal_hold,
             unreferenced_parts_deleted,
             quarantine_reaped_bytes: quarantine.reaped_bytes,
             unreferenced_parts_bytes,
@@ -542,6 +559,9 @@ pub async fn sweep_shard_zoned_with_holds(
             superseded_records_deleted: superseded.records_deleted,
             superseded_data_deleted: superseded.data_deleted,
             superseded_deletes_refused: superseded.deletes_refused,
+            superseded_held_by_snapshot: superseded.held_by_snapshot,
+            superseded_held_by_unreadable_head: superseded.held_by_unreadable_head,
+            superseded_groups_held_by_legal_hold: superseded.chain_groups_held_by_legal_hold,
             unreferenced_parts_deleted,
             quarantine_reaped_bytes: quarantine.reaped_bytes,
             unreferenced_parts_bytes,
@@ -556,11 +576,11 @@ pub async fn sweep_shard_zoned_with_holds(
 }
 
 /// Surface a superseded-input hold to an operator running the combined
-/// [`sweep_shard`] / [`sweep_shard_zoned`] pass. [`SweepReport`] carries no
-/// hold counter: the structured counters live on [`SupersededSweepOutcome`], which
-/// [`sweep_superseded`] returns directly, and this log line is what a caller
-/// that only has the combined report sees. Silent on a pass that held nothing,
-/// which is every ordinary pass.
+/// [`sweep_shard`] / [`sweep_shard_zoned`] pass. [`SweepReport`] carries the
+/// three hold counts and the refusal count; this line adds what it does not,
+/// the held request ids, the truncated buckets and the unattached dominated
+/// records, and names the shard. Silent on a pass that held nothing, which is
+/// every ordinary pass.
 fn log_superseded_holds(
     tenant: &TenantHash,
     signal: Signal,
@@ -1023,20 +1043,23 @@ pub struct SupersededSweepOutcome {
     pub data_deleted: usize,
     /// Objects (records plus data) held this pass because the live catalog HEAD
     /// snapshot still names them: a query over that hour would fail closed if
-    /// they were deleted now. Counter seam for
+    /// they were deleted now. The combined pass copies it into
+    /// [`SweepReport::superseded_held_by_snapshot`], which feeds
     /// `ravel_maintain_superseded_inputs_held_total{reason="named"}`.
     pub held_by_snapshot: usize,
     /// Objects held this pass because HEAD, or a snapshot part covering the
     /// record's hour, was present but could not be read: fail-closed, since
     /// non-reachability cannot be proven from data that cannot be read. A
     /// persistent nonzero value here is an operator signal, not the ordinary
-    /// lagging-fold case. Counter seam for
+    /// lagging-fold case. The combined pass copies it into
+    /// [`SweepReport::superseded_held_by_unreadable_head`], which feeds
     /// `ravel_maintain_superseded_inputs_held_total{reason="unreadable_head"}`.
     pub held_by_unreadable_head: usize,
     /// Chain groups skipped whole this pass because the [`LeaseCheck`] protects
     /// at least one key in them. The unit is the group, not the object: a
     /// group is one indivisible deletion unit, so a hold over any single key in
-    /// it stops all of it. Counter seam for
+    /// it stops all of it. The combined pass copies it into
+    /// [`SweepReport::superseded_groups_held_by_legal_hold`], which feeds
     /// `ravel_maintain_superseded_groups_held_by_legal_hold_total`.
     pub chain_groups_held_by_legal_hold: usize,
     /// Every erasure request id applied anywhere on a chain group this pass
@@ -3464,8 +3487,9 @@ pub struct ErasureRequestSweepOutcome {
     /// applying that request superseded is still physically present. Retiring
     /// the query-time exclusion filter while such an input exists would let a
     /// snapshot that still resolves it serve the erased subject again, so the
-    /// `.dreq` outlives every input its own rewrites superseded. Counter seam
-    /// for `ravel_maintain_dreq_held_by_superseded_inputs_total`.
+    /// `.dreq` outlives every input its own rewrites superseded. The server's
+    /// maintain loop sums it into
+    /// `ravel_maintain_dreq_held_by_superseded_inputs_total`.
     pub held_by_superseded_inputs: usize,
 }
 
