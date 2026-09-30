@@ -186,8 +186,9 @@ carries:
   `redact` renders it.
 
 The manifest carries no Arrow schema. Every file in a table must have the
-same Parquet schema, compared on the footer's schema elements when the
-table is created. The reader infers the Arrow schema from one file's footer
+same Parquet schema, compared on the footer's schema elements (narrowed by
+the schema comparison amendment below) when the table is created. The
+reader infers the Arrow schema from one file's footer
 at plan time, through DataFusion's own Parquet schema inference, so no
 schema is encoded by one arrow major and decoded by another.
 
@@ -836,3 +837,51 @@ Row-group statistics pruning and D6's `pushdown_filters` are unchanged. The
 cost is page-level pruning: on a file that carries a page index, a filter
 that only partly matches a row group reads every page of that row group's
 column chunks instead of only the pages its column index would have kept.
+
+## Amendment (2026-09-30): the schema comparison runs on the cleared Arrow schema, not raw footer schema elements
+
+<!-- amendment-applies: sections="D1. A table is a pinned snapshot of Parquet files where they already are" pointer="schema comparison amendment" -->
+<!-- amendment-supersedes: phrase="compared on the footer's schema elements" pointer="schema comparison amendment" -->
+<!-- amendment-applies: none reason="also records two implementation details, the single-object HEAD-only read and which listed keys the addressability check covers, that no earlier wording in this ADR asserts or contradicts" -->
+
+D1 said files are "compared on the footer's schema elements." A checkpoint
+review of epic #2040's task T3b found the code does not compare the
+footer's raw thrift schema elements: `ravel-parquet::snapshot::read_files`
+compares the Arrow `Schema` `ravel-parquet::provider::file_schema` builds
+from each footer, through `parquet_to_arrow_schema`, with every field's own
+metadata cleared and the schema's top-level metadata dropped, the same way
+the provider clears it when it later infers the table's schema. Two files
+share a schema when that cleared `Schema` agrees, not when their footers'
+schema elements are identical:
+
+- Two files whose only difference is a `PARQUET:field_id` on one field
+  share a schema once that per-field metadata is cleared, which the literal
+  footer-schema-elements rule would have refused.
+  `files_differing_only_in_field_metadata_share_a_schema` pins this.
+- `parquet_to_arrow_schema` also takes each footer's `key_value_metadata`,
+  which carries the embedded `ARROW:schema` hint when the writer left one,
+  and uses it to resolve field types the physical Parquet schema alone
+  cannot. Clearing runs on the metadata of its output, not on that
+  resolution: two files whose footer schema elements agree exactly but
+  whose `ARROW:schema` hint resolves a field to a different Arrow type
+  still compare unequal and refuse with `SchemaMismatch`, which the literal
+  rule would have admitted.
+
+The corrected rule: two files share a schema when the Arrow schema
+`parquet_to_arrow_schema` infers from their footers agrees after each
+field's own metadata and the schema's top-level metadata are cleared, so
+the provider's inferred schema never depends on which file among them it
+happened to read first.
+
+Two implementation details D1 and D2 do not spell out:
+
+- A `LOCATION` naming a single object (`ravel-parquet::snapshot::head_file`)
+  takes that file's ETag and size from one HEAD response. It is never
+  listed, whatever its suffix, and the skipped-keys counts D2 describes for
+  a prefix listing do not apply to it.
+- Of a prefix listing's keys, only one ending in exactly `.parquet` is
+  checked for whether the object-store client can address it exactly
+  (`ravel-parquet::snapshot::list_files` calls `check_file_key` only past
+  that suffix test). A directory marker or a key of any other suffix is
+  only ever counted among the skipped keys D2 already describes; the
+  object-store client is never asked to address it.
