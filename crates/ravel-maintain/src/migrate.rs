@@ -74,7 +74,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use ravel_catalog::{
-    current_floor_from_store, erasure_dominated_compaction_records,
+    current_floor_from_store, erasure_dominated_compaction_records, resolve_rewrite_supersession,
     select_authoritative_compaction_records,
 };
 use ravel_commit::{keys, record};
@@ -956,9 +956,13 @@ async fn read_shard_family(
                 rec,
             )?);
         }
+        // A record a present rewrite supersedes is in neither list: its parts
+        // belong to that rewrite's chain, which `sweep` reclaims, so it cannot
+        // name the bucket. Its parts still count in `l1` while it is listed.
         let part_versions = |records: &[&(String, CompactionRecord)]| -> Vec<u32> {
             records
                 .iter()
+                .filter(|(key, _)| !authority.rewrite_superseded.contains(key.as_str()))
                 .flat_map(|(_, rec)| rec.parts.iter().map(|p| p.segment_format_version))
                 .collect()
         };
@@ -988,8 +992,15 @@ struct BucketAuthority<'a> {
     authoritative: Vec<&'a (String, CompactionRecord)>,
     /// The records that lost their overlap component to another record
     /// ([`ravel_catalog::AuthoritativeSelection::losing`]). Nothing serves
-    /// their parts and nothing but retention reclaims them.
+    /// their parts, and nothing but retention reclaims a loser no present
+    /// rewrite record supersedes.
     losing: Vec<&'a (String, CompactionRecord)>,
+    /// The keys of the bucket's compaction records a present rewrite record
+    /// supersedes, directly or through its chain
+    /// ([`resolve_rewrite_supersession`]). Such a record can still be in
+    /// either list above, since the selector does not see rewrite records;
+    /// `sweep` deletes it and its parts with the rewrite's chain group.
+    rewrite_superseded: HashSet<&'a str>,
 }
 
 /// The compaction records of one bucket whose inputs the resolver treats as
@@ -1029,9 +1040,38 @@ fn authoritative_compaction_records<'a>(
         .collect();
     let selection =
         select_authoritative_compaction_records(&candidate_pairs).map_err(unresolvable)?;
+    let mut rewrite_superseded_keys: HashSet<String> = HashSet::new();
+    if !rewrite_records.is_empty() {
+        let compaction_by_key: HashMap<&str, &CompactionRecord> = compaction_records
+            .iter()
+            .map(|(key, rec)| (key.as_str(), rec))
+            .collect();
+        let rewrite_by_key: HashMap<&str, &RewriteRecord> = rewrite_records
+            .iter()
+            .map(|(key, rec)| (key.as_str(), rec))
+            .collect();
+        let mut inputs = HashSet::new();
+        for (key, rec) in rewrite_records {
+            resolve_rewrite_supersession(
+                key,
+                rec,
+                &prefix,
+                &compaction_by_key,
+                &rewrite_by_key,
+                &mut inputs,
+                &mut rewrite_superseded_keys,
+            )
+            .map_err(unresolvable)?;
+        }
+    }
     let mut authority = BucketAuthority {
         authoritative: Vec::new(),
         losing: Vec::new(),
+        rewrite_superseded: compaction_records
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .filter(|key| rewrite_superseded_keys.contains(*key))
+            .collect(),
     };
     for candidate in candidates {
         let key = candidate.0.as_str();
