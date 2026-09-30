@@ -563,7 +563,7 @@ impl FlightSqlService for RavelFlightSqlService {
             pending_erasure,
             declared_columns: declared,
             parquet_tables,
-            budgets: None,
+            budgets: req.budgets,
         };
         let info = info.with_endpoint(
             FlightEndpoint::new().with_ticket(self.encode_statement_ticket(tenant, ticket)?),
