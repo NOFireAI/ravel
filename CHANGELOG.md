@@ -78,8 +78,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   invocation found). A below-target part of an authoritative compaction record
   blocks the floor too and is reported as an `l1_compaction_parts` count with no
   `blocked_bucket` line (a losing record's parts get one when the bucket's
-  authoritative records are at the target and it lists no rewrite record; see
-  the next entry):
+  authoritative records are at the target and any rewrite record parts it
+  lists are too; see the next entry):
   nothing migrates one either, because compaction and the migration rewrite
   both refuse a bucket that already carries a compaction record, so ADR-0066
   decision 4 force 2 is unimplemented (issue #2093). The explanatory prose
@@ -99,12 +99,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   re-running `migrate` does not clear it and retention ageing the bucket out,
   under the format-version hold, does. Those parts still count in
   `l1_compaction_parts`, so the floor is still refused over them; only the
-  naming is new. A bucket whose authoritative records are below the target is
-  not named this way, a bucket that lists a rewrite record is never named this
-  way (it gets a `rewrite_parts` line only when its rewrite parts are below the
-  target), and a record a version 2 record supersedes is not a loser. A bucket
-  the walk names `loser_only_inputs` that also qualifies here gets this line
-  only, since the two clear the same way. `BlockedReason` gains
+  naming is new. A bucket listing a rewrite record whose parts are all at the
+  target is named this way too when its losers qualify (issue #2169). A
+  bucket whose authoritative records are below the target is not named this
+  way, a bucket whose rewrite record parts are below the target gets its
+  `rewrite_parts` line only, and a record a version 2 record supersedes is
+  not a loser. A record a rewrite record supersedes is left out of both sides
+  of the test, as a winner or as a loser. A bucket the walk names
+  `loser_only_inputs` that also qualifies here gets this line only, since the
+  two clear the same way. `BlockedReason` gains
   `LosingRecordParts { below_target }`.
 - **The background supervisor now takes an advisory claim before compacting a
   large bucket, so two processes whose ownership overlaps no longer both pay
