@@ -257,7 +257,15 @@ impl PinnedParquetReader {
                 .get_or_fetch(key, fetch)
                 .await
                 .map(|bytes| (bytes, Source::Upstream)),
-            Some(ReadCache::Tiered(cache)) => cache.get_or_fetch(key, fetch).await,
+            // The peek above already consulted both tiers and confirmed a
+            // miss (`get_off_worker`), so resolving through `get_or_fetch`
+            // here would consult the disk tier a second time and record a
+            // second, unaccounted miss. `resolve_peeked_miss` joins the same
+            // single flight without re-consulting either tier.
+            Some(ReadCache::Tiered(cache)) => cache
+                .resolve_peeked_miss(key, fetch)
+                .await
+                .map(|bytes| (bytes, Source::Upstream)),
             None => fetch()
                 .await
                 .map(|bytes| (bytes, Source::Upstream))
@@ -2238,5 +2246,173 @@ mod tests {
             .await
             .expect("a disk-tier hit needs no request, even at a zero-request budget");
         assert!(recording.ranges().is_empty(), "{:?}", recording.ranges());
+    }
+
+    /// A full miss on a `Tiered` cache consults the disk tier exactly once:
+    /// the peek in `read_range` (`get_off_worker`) already consulted both
+    /// tiers, so resolving the confirmed miss must not consult either tier
+    /// again.
+    ///
+    /// FLIP: resolving through `TieredCache::get_or_fetch` instead of
+    /// `resolve_peeked_miss` (the pre-fix code) makes the leader consult the
+    /// disk tier a second time, so the disk tier's own miss counter reads 2
+    /// for this one logical read instead of 1.
+    #[tokio::test]
+    async fn a_tiered_full_miss_consults_disk_exactly_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let memory = Arc::new(ravel_memory::MemoryBudget::unlimited());
+        let store = Arc::new(MemoryStore::new());
+        let recording = Arc::new(RecordingStore::new(Arc::clone(&store), false));
+        let fixture = Fixture::new_tiered(
+            Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>,
+            dir.path(),
+        )
+        .with_limits(limits_of(
+            &memory,
+            ByteLimit::Unlimited,
+            RequestLimit::Unlimited,
+        ));
+        let file = fixture
+            .put_file(
+                &store,
+                "lake/t/a.parquet",
+                parquet_bytes(&[1, 2, 3], &["one", "two", "tre"]),
+                false,
+            )
+            .await;
+        let reader = fixture.reader(file);
+        let Some(ReadCache::Tiered(tiered)) = &fixture.services().cache else {
+            panic!("fixture built with a Tiered cache");
+        };
+        let disk_metrics = tiered.disk_metrics();
+        let before = disk_metrics.snapshot();
+
+        reader
+            .read_range(0..4, QueryPhase::Scan)
+            .await
+            .expect("a full miss resolves through the upstream fetch");
+
+        let after = disk_metrics.snapshot();
+        assert_eq!(
+            after.misses,
+            before.misses + 1,
+            "the disk tier is consulted exactly once per logical miss: once \
+             by the peek, not again while resolving it"
+        );
+        assert_eq!(
+            recording.ranges().len(),
+            1,
+            "one GET for one logical full miss"
+        );
+    }
+
+    /// The peek-then-resolve rewrite (`get_off_worker` then
+    /// `resolve_peeked_miss`) must not break single-flight at the store
+    /// boundary: 8 concurrent `read_range` calls on the same range, each
+    /// having independently peeked and missed both tiers, still collapse
+    /// onto one upstream GET.
+    ///
+    /// FLIP: resolving through `TieredCache::get_or_fetch` instead of
+    /// `resolve_peeked_miss` (the pre-fix code) makes the leader itself
+    /// double-probe disk, so the wait below never reaches its expected count
+    /// of 8 (it sees 9, since the leader's second probe is unaccounted) and
+    /// the assertion on it fails before the GET count is even checked.
+    ///
+    /// The leader is held inside its GET by
+    /// `RecordingStore::pause_next_get_pinned`. Each follower's own peek
+    /// crosses a real (if fast) `spawn_blocking` disk consult, so a single
+    /// poll cannot prove it has reached `TieredCache`'s single-flight
+    /// in-flight map -- it may still be waiting on that blocking-pool round
+    /// trip. Instead of guessing how long that takes, this waits on an
+    /// observable count: the disk tier's own miss counter, which every
+    /// caller's peek bumps by exactly one regardless of leader/follower
+    /// role. Once it reaches 8, every caller has left the peek; one more
+    /// scheduler tick runs the purely synchronous steps from "peek missed"
+    /// to "joined the single flight". No `Duration`, `Instant`, or sleep is
+    /// used anywhere in this wait: it is bounded, cooperative polling of
+    /// real state, not a wall-clock guess.
+    #[tokio::test]
+    async fn a_tiered_concurrent_miss_collapses_to_one_get() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let memory = Arc::new(ravel_memory::MemoryBudget::unlimited());
+        let store = Arc::new(MemoryStore::new());
+        let recording = Arc::new(RecordingStore::new(Arc::clone(&store), false));
+        let fixture = Fixture::new_tiered(
+            Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>,
+            dir.path(),
+        )
+        .with_limits(limits_of(
+            &memory,
+            ByteLimit::Unlimited,
+            RequestLimit::Unlimited,
+        ));
+        let file = fixture
+            .put_file(
+                &store,
+                "lake/t/a.parquet",
+                parquet_bytes(&[7, 8, 9], &["sev", "eig", "nin"]),
+                false,
+            )
+            .await;
+        let reader = fixture.reader(file);
+        let Some(ReadCache::Tiered(tiered)) = &fixture.services().cache else {
+            panic!("fixture built with a Tiered cache");
+        };
+        let disk_metrics = tiered.disk_metrics();
+        let before_misses = disk_metrics.snapshot().misses;
+
+        let (entered_rx, release_tx) = recording.pause_next_get_pinned();
+
+        const CALLERS: u64 = 8;
+        let leader = {
+            let reader = reader.clone();
+            tokio::spawn(async move { reader.read_range(0..4, QueryPhase::Scan).await })
+        };
+        entered_rx.await.expect("the leader reaches its GET");
+
+        let mut followers = Vec::new();
+        for _ in 1..CALLERS {
+            let reader = reader.clone();
+            followers.push(tokio::spawn(async move {
+                reader.read_range(0..4, QueryPhase::Scan).await
+            }));
+        }
+
+        let mut reached = 0u64;
+        for _ in 0..10_000 {
+            reached = disk_metrics.snapshot().misses - before_misses;
+            if reached >= CALLERS {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            reached, CALLERS,
+            "all 8 callers must have peeked and missed both tiers before the \
+             leader is released"
+        );
+        // One more tick: nothing left between "peek missed" and "joined the
+        // single flight" is anything but synchronous code, so this is enough
+        // for every follower to register with the leader's in-flight entry.
+        tokio::task::yield_now().await;
+
+        release_tx.send(()).expect("the leader is still parked");
+
+        for follower in followers {
+            follower
+                .await
+                .expect("follower task")
+                .expect("every follower resolves");
+        }
+        leader
+            .await
+            .expect("leader task")
+            .expect("the leader's read resolves");
+
+        assert_eq!(
+            recording.ranges().len(),
+            1,
+            "8 concurrent misses on one range must produce exactly one GET"
+        );
     }
 }
