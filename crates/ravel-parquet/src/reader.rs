@@ -7,7 +7,7 @@
 use std::fmt;
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
 use datafusion::datasource::listing::PartitionedFile;
@@ -21,13 +21,14 @@ use parquet::file::metadata::{
     FooterTail, ParquetMetaData, ParquetMetaDataBuilder, ParquetMetaDataReader,
 };
 use ravel_cache::{CacheKey, PinnedIdentity, SingleFlightError, Source};
+use ravel_memory::Reservation;
 use ravel_object_store::{GetRange, ObjectStoreBackend, Pin, StoreError};
 use ravel_pqtable::manifest::ParquetFile;
 use ravel_query::{CacheFetchError, GetLimiter, PhaseAccounting, QueryPhase, ReadCache};
 use ravel_types::TenantHash;
-use ravel_types::accounting::AccountedOp;
 
 use crate::error::ParquetReadError;
+use crate::limits::{ReadLimits, attach};
 use crate::metadata_cache::{CachedFooter, MetadataCache, MetadataKey};
 use crate::store::file_path;
 
@@ -118,6 +119,7 @@ pub struct PinnedParquetReader {
     file: Arc<PinnedFile>,
     services: ReadServices,
     accounting: PhaseAccounting,
+    limits: ReadLimits,
 }
 
 impl PinnedParquetReader {
@@ -126,12 +128,14 @@ impl PinnedParquetReader {
         file: Arc<PinnedFile>,
         services: ReadServices,
         accounting: PhaseAccounting,
+        limits: ReadLimits,
     ) -> Self {
         PinnedParquetReader {
             tenant,
             file,
             services,
             accounting,
+            limits,
         }
     }
 
@@ -148,11 +152,23 @@ impl PinnedParquetReader {
 
     /// Read `range` of the file, from the cache or with one pinned GET,
     /// charging it to `phase`.
+    ///
+    /// The range's length is reserved against the process memory budget
+    /// before the cache is consulted or anything is requested, and the
+    /// reservation is released when the last clone of the returned `Bytes`
+    /// drops, not when the GET returns.
     pub async fn read_range(
         &self,
         range: Range<u64>,
         phase: QueryPhase,
     ) -> Result<Bytes, ParquetReadError> {
+        let len = self.checked_len(&range)?;
+        let reservation = self.limits.reserve(len)?;
+        self.read_reserved(range, phase, reservation).await
+    }
+
+    /// The length of `range`, which must lie inside the file.
+    fn checked_len(&self, range: &Range<u64>) -> Result<u64, ParquetReadError> {
         let size = self.file.file.size;
         if range.start > range.end || range.end > size {
             return Err(self.corrupt(format!(
@@ -160,12 +176,26 @@ impl PinnedParquetReader {
                 range.start, range.end
             )));
         }
+        Ok(range.end - range.start)
+    }
+
+    /// [`Self::read_range`] for a range whose length `reservation` already
+    /// holds.
+    async fn read_reserved(
+        &self,
+        range: Range<u64>,
+        phase: QueryPhase,
+        mut reservation: Reservation,
+    ) -> Result<Bytes, ParquetReadError> {
         let len = range.end - range.start;
         if len == 0 {
             return Ok(Bytes::new());
         }
         let key = self.cache_key(range.start, len);
         let accounting = self.accounting.phase(phase);
+        // A buffer the read cache holds is under both the cache's bound and
+        // this reservation, the overlap ADR-1170 decision 2 marks.
+        let cached = self.services.cache.is_some();
 
         let hit = match &self.services.cache {
             Some(ReadCache::Ram(cache)) => cache.get(&key),
@@ -174,25 +204,41 @@ impl PinnedParquetReader {
         if let Some(bytes) = hit {
             accounting.record_cache_hit();
             accounting.add_cache_bytes(bytes.len() as u64);
-            return Ok(bytes);
+            reservation.mark_handed_off();
+            return Ok(attach(bytes, reservation));
         }
 
+        self.limits.precheck(&self.accounting, len)?;
+        // The leader's own budget refusal, which the single flight would hand
+        // to every follower as a store error; it is returned to this caller
+        // typed instead.
+        let refused: Arc<Mutex<Option<ParquetReadError>>> = Arc::default();
         let fetch = {
             let file = Arc::clone(&self.file);
             let limiter = Arc::clone(&self.services.limiter);
-            let accounting = accounting.clone();
+            let limits = self.limits.clone();
+            let phases = self.accounting.clone();
+            let refused = Arc::clone(&refused);
             let (start, end) = (range.start, range.end);
             move || async move {
                 let _permit = limiter.acquire().await.map_err(|_| {
                     StoreError::Transient("GetLimiter semaphore closed unexpectedly".into())
                 })?;
-                accounting.record_s3_request(AccountedOp::Get);
+                let admission = match limits.admit(&phases, phase, end - start) {
+                    Ok(admission) => admission,
+                    Err(err) => {
+                        *refused.lock().unwrap_or_else(PoisonError::into_inner) = Some(err);
+                        return Err(CacheFetchError::Store(Arc::new(StoreError::Transient(
+                            "the query's request or byte budget refused this read".into(),
+                        ))));
+                    }
+                };
                 let read = file
                     .store
                     .get_pinned(&file.key_str(), GetRange::Range(start, end), &file.pin())
                     .await?;
                 let data = read.outcome.data;
-                accounting.add_s3_bytes(AccountedOp::Get, data.len() as u64);
+                admission.complete(&phases, phase, data.len() as u64);
                 if data.len() as u64 != end - start {
                     return Err(CacheFetchError::Corrupt {
                         key: file.key_str(),
@@ -216,18 +262,29 @@ impl PinnedParquetReader {
                 .map(|bytes| (bytes, Source::Upstream))
                 .map_err(SingleFlightError::Upstream),
         };
-        match fetched {
+        if let Some(err) = refused
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            return Err(err);
+        }
+        let bytes = match fetched {
             Ok((bytes, Source::Cache)) => {
                 accounting.record_cache_hit();
                 accounting.add_cache_bytes(bytes.len() as u64);
-                Ok(bytes)
+                bytes
             }
             Ok((bytes, Source::Upstream)) => {
                 accounting.record_cache_miss();
-                Ok(bytes)
+                bytes
             }
-            Err(err) => Err(self.map_fetch_error(err)),
+            Err(err) => return Err(self.map_fetch_error(err)),
+        };
+        if cached {
+            reservation.mark_handed_off();
         }
+        Ok(attach(bytes, reservation))
     }
 
     fn map_fetch_error(&self, err: SingleFlightError<CacheFetchError>) -> ParquetReadError {
@@ -416,11 +473,22 @@ impl AsyncFileReader for PinnedParquetReader {
         ranges: Vec<Range<u64>>,
     ) -> BoxFuture<'_, parquet::errors::Result<Vec<Bytes>>> {
         async move {
-            try_join_all(
-                ranges
-                    .into_iter()
-                    .map(|range| self.read_range(range, QueryPhase::Scan)),
-            )
+            // Every range is reserved before the first is read, so a refusal
+            // leaves the whole batch unrequested.
+            let mut reserved = Vec::with_capacity(ranges.len());
+            for range in ranges {
+                let len = self
+                    .checked_len(&range)
+                    .map_err(ParquetReadError::into_parquet)?;
+                let reservation = self
+                    .limits
+                    .reserve(len)
+                    .map_err(ParquetReadError::into_parquet)?;
+                reserved.push((range, reservation));
+            }
+            try_join_all(reserved.into_iter().map(|(range, reservation)| {
+                self.read_reserved(range, QueryPhase::Scan, reservation)
+            }))
             .await
             .map_err(ParquetReadError::into_parquet)
         }
@@ -453,6 +521,7 @@ pub struct PinnedReaderFactory {
     files: Arc<[Arc<PinnedFile>]>,
     services: ReadServices,
     accounting: PhaseAccounting,
+    limits: ReadLimits,
 }
 
 impl PinnedReaderFactory {
@@ -463,6 +532,7 @@ impl PinnedReaderFactory {
         files: Arc<[Arc<PinnedFile>]>,
         services: ReadServices,
         accounting: PhaseAccounting,
+        limits: ReadLimits,
     ) -> Self {
         PinnedReaderFactory {
             tenant,
@@ -471,6 +541,7 @@ impl PinnedReaderFactory {
             files,
             services,
             accounting,
+            limits,
         }
     }
 
@@ -482,6 +553,7 @@ impl PinnedReaderFactory {
             Arc::clone(file),
             self.services.clone(),
             self.accounting.clone(),
+            self.limits.clone(),
         ))
     }
 
@@ -531,6 +603,8 @@ mod tests {
     use proptest::prelude::*;
     use proptest::sample::Index;
     use ravel_object_store::memory::MemoryStore;
+    use ravel_query::{ByteLimit, RequestLimit};
+    use ravel_types::accounting::AccountedOp;
 
     const KEY: &str = "lake/t/bad.parquet";
 
@@ -1379,6 +1453,7 @@ mod tests {
             }),
             fixture.services(),
             accounting.clone(),
+            ReadLimits::unlimited(),
         );
         match reader.metadata().await {
             Err(ParquetReadError::Corrupt {
@@ -1878,5 +1953,234 @@ mod tests {
             "{ranges:?}"
         );
         assert_eq!(ranges.first(), Some(&footer), "{ranges:?}");
+    }
+    /// A fixture over one stored file, its recording store, and the file.
+    async fn recorded_file(limits: ReadLimits) -> (Fixture, Arc<RecordingStore>, ParquetFile) {
+        let memory = Arc::new(MemoryStore::new());
+        let recording = Arc::new(RecordingStore::new(Arc::clone(&memory), false));
+        let fixture =
+            Fixture::new(Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>).with_limits(limits);
+        let file = fixture
+            .put_file(
+                &memory,
+                "lake/t/a.parquet",
+                parquet_bytes(&[4, 5, 6], &["four", "five", "sixx"]),
+                false,
+            )
+            .await;
+        (fixture, recording, file)
+    }
+
+    fn limits_of(
+        memory: &Arc<ravel_memory::MemoryBudget>,
+        max_bytes: ByteLimit,
+        max_requests: RequestLimit,
+    ) -> ReadLimits {
+        ReadLimits::new(Arc::clone(memory), max_bytes, max_requests)
+    }
+
+    /// A range longer than the memory budget is refused with the budget's
+    /// figures and no GET for it.
+    ///
+    /// FLIP: reserving after the GET returns instead of before it leaves one
+    /// recorded read here.
+    #[tokio::test]
+    async fn a_read_past_the_memory_budget_is_refused_before_its_get() {
+        let memory = Arc::new(ravel_memory::MemoryBudget::new(10));
+        let (fixture, recording, file) = recorded_file(limits_of(
+            &memory,
+            ByteLimit::Unlimited,
+            RequestLimit::Unlimited,
+        ))
+        .await;
+        let reader = fixture.reader(file);
+
+        let err = reader
+            .read_range(0..11, QueryPhase::Scan)
+            .await
+            .expect_err("eleven bytes over a ten-byte budget");
+        assert!(
+            matches!(
+                err,
+                ParquetReadError::MemoryExhausted {
+                    requested: 11,
+                    reserved: 0,
+                    limit: 10
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(recording.ranges().is_empty(), "{:?}", recording.ranges());
+        assert_eq!(memory.reserved(), 0);
+    }
+
+    /// The reservation is held until the last clone of the returned bytes
+    /// drops, for a read that went to the store and for one the cache served,
+    /// and the cached read is marked as handed to the cache's own ledger.
+    ///
+    /// FLIP: releasing the reservation when the read returns leaves
+    /// `reserved()` at 0 while `bytes` is alive.
+    #[tokio::test]
+    async fn the_reservation_follows_the_returned_bytes() {
+        let memory = Arc::new(ravel_memory::MemoryBudget::new(1 << 20));
+        let (fixture, recording, file) = recorded_file(limits_of(
+            &memory,
+            ByteLimit::Unlimited,
+            RequestLimit::Unlimited,
+        ))
+        .await;
+        let reader = fixture.reader(file);
+
+        let fetched = reader
+            .read_range(0..16, QueryPhase::Scan)
+            .await
+            .expect("fetched");
+        assert_eq!(recording.ranges().len(), 1);
+        assert_eq!(memory.reserved(), 16, "held while the bytes are alive");
+        assert_eq!(
+            memory.handoff_overlap(),
+            16,
+            "the cache holds the buffer too"
+        );
+
+        let hit = reader
+            .read_range(0..16, QueryPhase::Scan)
+            .await
+            .expect("hit");
+        assert_eq!(
+            recording.ranges().len(),
+            1,
+            "the second read is a cache hit"
+        );
+        assert_eq!(memory.reserved(), 32, "a hit reserves its length too");
+
+        let clone = fetched.clone();
+        drop(fetched);
+        assert_eq!(memory.reserved(), 32, "a clone keeps the reservation");
+        drop(clone);
+        assert_eq!(memory.reserved(), 16);
+        drop(hit);
+        assert_eq!(memory.reserved(), 0);
+        assert_eq!(memory.handoff_overlap(), 0);
+    }
+
+    /// `get_byte_ranges` reserves every range before it reads any: one range
+    /// that does not fit leaves the ranges before it unread.
+    ///
+    /// FLIP: reserving each range inside its own read future lets the first
+    /// range's GET go out before the second is refused.
+    #[tokio::test]
+    async fn a_batch_with_a_range_over_the_budget_reads_nothing() {
+        let memory = Arc::new(ravel_memory::MemoryBudget::new(20));
+        let (fixture, recording, file) = recorded_file(limits_of(
+            &memory,
+            ByteLimit::Unlimited,
+            RequestLimit::Unlimited,
+        ))
+        .await;
+        let mut reader = fixture.reader(file);
+
+        let err = reader
+            .get_byte_ranges(vec![0..8, 8..24])
+            .await
+            .expect_err("8 + 16 bytes over a 20-byte budget");
+        assert!(err.to_string().contains("fetch memory exhausted"), "{err}");
+        assert!(recording.ranges().is_empty(), "{:?}", recording.ranges());
+        assert_eq!(
+            memory.reserved(),
+            0,
+            "the first range's reservation is released"
+        );
+
+        let ok = reader
+            .get_byte_ranges(vec![0..8, 8..16])
+            .await
+            .expect("16 bytes fit");
+        assert_eq!(ok.iter().map(Bytes::len).sum::<usize>(), 16);
+    }
+
+    /// The request that would be the `max_s3_requests + 1`th is refused
+    /// before it is issued: the store sees exactly `max` reads.
+    ///
+    /// FLIP: checking the budget after the GET, as the signal scan does per
+    /// segment, leaves three recorded reads.
+    #[tokio::test]
+    async fn a_read_past_the_request_budget_is_refused_before_its_get() {
+        let memory = Arc::new(ravel_memory::MemoryBudget::unlimited());
+        let (fixture, recording, file) = recorded_file(limits_of(
+            &memory,
+            ByteLimit::Unlimited,
+            RequestLimit::Bounded(2),
+        ))
+        .await;
+        let reader = fixture.reader(file);
+
+        reader
+            .read_range(0..4, QueryPhase::Scan)
+            .await
+            .expect("one");
+        reader
+            .read_range(4..8, QueryPhase::Scan)
+            .await
+            .expect("two");
+        let err = reader
+            .read_range(8..12, QueryPhase::Scan)
+            .await
+            .expect_err("three");
+        assert!(
+            matches!(
+                err,
+                ParquetReadError::RequestBudgetExceeded {
+                    requests: 3,
+                    max: 2
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(recording.ranges().len(), 2);
+        reader
+            .read_range(0..4, QueryPhase::Scan)
+            .await
+            .expect("a cache hit issues no request");
+        assert_eq!(recording.ranges().len(), 2);
+    }
+
+    /// A range whose body would take the wire bytes past `max_bytes_scanned`
+    /// is refused before its GET; one that lands exactly on the budget is not.
+    ///
+    /// FLIP: comparing only the bytes already recorded (not the range about to
+    /// be read) admits the 9-byte read and leaves two recorded reads.
+    #[tokio::test]
+    async fn a_read_past_the_byte_budget_is_refused_before_its_get() {
+        let memory = Arc::new(ravel_memory::MemoryBudget::unlimited());
+        let (fixture, recording, file) = recorded_file(limits_of(
+            &memory,
+            ByteLimit::Bounded(16),
+            RequestLimit::Unlimited,
+        ))
+        .await;
+        let reader = fixture.reader(file);
+
+        reader.read_range(0..8, QueryPhase::Scan).await.expect("8");
+        let err = reader
+            .read_range(8..17, QueryPhase::Scan)
+            .await
+            .expect_err("8 + 9 bytes over a 16-byte budget");
+        assert!(
+            matches!(
+                err,
+                ParquetReadError::BytesBudgetExceeded {
+                    scanned: 17,
+                    max: 16
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(recording.ranges().len(), 1);
+        reader
+            .read_range(8..16, QueryPhase::Scan)
+            .await
+            .expect("lands exactly on the budget");
+        assert_eq!(recording.ranges().len(), 2);
     }
 }

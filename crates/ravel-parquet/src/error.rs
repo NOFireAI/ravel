@@ -30,6 +30,29 @@ pub enum ParquetReadError {
     Corrupt { key: String, message: String },
     #[error("reading Parquet file {key}: the concurrent read it waited on was lost")]
     LeaderLost { key: String },
+    /// Reserving the bytes of a range against the process memory budget was
+    /// refused, so the range was not requested. The same facts as
+    /// `ravel_query::FetchError::FetchMemoryExhausted`, which the SQL layer
+    /// maps it to.
+    #[error(
+        "fetch memory exhausted: requested {requested} bytes, {reserved} of {limit} byte budget \
+         already reserved"
+    )]
+    MemoryExhausted {
+        requested: u64,
+        reserved: u64,
+        limit: u64,
+    },
+    /// The request would have taken the query's S3 request count past its
+    /// budget, so it was not issued. `requests` is the count it would have
+    /// reached.
+    #[error("S3 request budget exceeded: {requests} requests, maximum {max}")]
+    RequestBudgetExceeded { requests: u64, max: u64 },
+    /// The request would have taken the query's scanned wire bytes past its
+    /// budget, so it was not issued. `scanned` is the total it would have
+    /// reached.
+    #[error("bytes-scanned budget exceeded: {scanned} bytes, maximum {max}")]
+    BytesBudgetExceeded { scanned: u64, max: u64 },
 }
 
 impl ParquetReadError {

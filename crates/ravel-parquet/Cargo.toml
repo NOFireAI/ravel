@@ -9,6 +9,7 @@ description = "DataFusion table provider over Ravel Parquet tables (ADR-2040 D3)
 [dependencies]
 ravel-pqtable = { workspace = true }
 ravel-query = { workspace = true }
+ravel-memory = { workspace = true }
 ravel-cache = { workspace = true }
 ravel-object-store = { workspace = true }
 ravel-types = { workspace = true }
