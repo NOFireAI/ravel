@@ -1252,4 +1252,65 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
             }
         );
     }
+
+    /// When two resolvers in the chain both match one request with different
+    /// `ddl`, the first one's principal wins outright. A wrong implementation
+    /// that ORs `ddl` across the chain reports `true` here.
+    #[test]
+    fn fallback_first_match_decides_ddl_without_or_across_chain() {
+        struct Fixed(Principal);
+        impl TenantResolver for Fixed {
+            fn resolve(&self, _headers: &HeaderMap) -> Result<TenantId, AuthError> {
+                Ok(self.0.tenant.clone())
+            }
+            fn resolve_principal(&self, _headers: &HeaderMap) -> Result<Principal, AuthError> {
+                Ok(self.0.clone())
+            }
+        }
+        let denied = Principal {
+            tenant: TenantId::new("acme"),
+            ddl: false,
+        };
+        let granted = Principal {
+            tenant: TenantId::new("acme"),
+            ddl: true,
+        };
+        let first_denies = FallbackResolver::new(vec![
+            Arc::new(Fixed(denied.clone())),
+            Arc::new(Fixed(granted.clone())),
+        ]);
+        assert_eq!(
+            first_denies
+                .resolve_principal(&HeaderMap::new())
+                .expect("resolves"),
+            denied
+        );
+        let first_grants = FallbackResolver::new(vec![
+            Arc::new(Fixed(granted.clone())),
+            Arc::new(Fixed(denied)),
+        ]);
+        assert_eq!(
+            first_grants
+                .resolve_principal(&HeaderMap::new())
+                .expect("resolves"),
+            granted
+        );
+    }
+
+    /// A `[true]` array under the ddl claim is not the JSON boolean `true`, so
+    /// it grants nothing (the docs and `--oidc-ddl-claim` help promise this).
+    #[test]
+    fn oidc_ddl_claim_array_is_no_capability() {
+        let cache = cache_with(&jwks_with(KID));
+        let mut c = claims(Some("acme"), 3600);
+        c["can_ddl"] = serde_json::json!([true]);
+        let token = sign_es256(&c, KID, EC_PRIV_PEM);
+        let oidc = resolver(cache).with_ddl_claim("can_ddl");
+        assert!(
+            !oidc
+                .resolve_principal(&bearer(&token))
+                .expect("resolves")
+                .ddl
+        );
+    }
 }
