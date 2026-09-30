@@ -43,11 +43,10 @@ pub enum LogSegError {
     /// nothing has been decoded yet, so it is never `Corrupted`.
     #[error("inconsistent stream attrs: {0}")]
     InconsistentStreamAttrs(String),
-    /// The sort descriptor handed to the writer cannot be recorded or applied
-    /// for this object: its shape would not decode (no key or more than four,
-    /// an empty or repeated name, generation 0), or a key column is not a
-    /// per-record attribute of its declared type on any record of the object.
-    /// Writer-side input validation, never `Corrupted`.
+    /// The sort descriptor handed to the writer cannot be recorded for this
+    /// object because its shape would not decode (no key or more than four, an
+    /// empty or repeated name, generation 0). Writer-side input validation,
+    /// never `Corrupted`.
     #[error("invalid sort descriptor: {0}")]
     InvalidSortDescriptor(String),
     #[error("io: {0}")]

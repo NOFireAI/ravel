@@ -372,14 +372,15 @@ and the columnar write paths alike, which produce byte-identical objects:
 The writer refuses the whole object with `InvalidSortDescriptor` when it
 builds it (`finish` or `finish_compacted`), before encoding any block, for a
 descriptor with `clustering_generation` 0, with no key column or more than
-four, with an empty key column name or a name used twice, or with a key column
-that no record of the object carries as a per-record attribute of the declared
-type. The last covers a key carried only as a stream-level attribute and a key
-carried only with another type. The first four are the footer decoder's own
-descriptor checks, so a descriptor the writer records passes them. A key
-present on only some records is accepted, and so is a key some streams also
-carry at stream level: records whose value sits only on the stream layer have
-no value for it.
+four, or with an empty key column name or a name used twice. These are the
+footer decoder's own descriptor checks, so a descriptor the writer records
+passes them. A key column no record has a per-record value for, including a
+name that appears only as a stream-level attribute or only with another type,
+is accepted and orders nothing, since every row has an absent value for it.
+When no key column has a value on any row, the rows sort by
+`(stream_ref, bucket, ts_ns)` and the footer still records the descriptor and
+generation. A key present on only some records is accepted too, and records
+whose value sits only on the stream layer have no value for it.
 
 A **block** is a logical unit, not a byte range. It is what SKIP_IDX level 0,
 BLOOM, and POSTINGS are keyed by, and nothing about its size or its pruning
