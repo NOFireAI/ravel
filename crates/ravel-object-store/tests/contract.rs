@@ -852,8 +852,9 @@ async fn assert_multipart_sequence_rules(store: &dyn ObjectStoreBackend, prefix:
 
 /// Per-part checksums behave like `put`'s: a local CRC32C pre-flight that
 /// rejects a caller/payload mismatch before anything is sent, leaves the part
-/// uncounted, and leaves the upload usable. There is no whole-object checksum
-/// for a multipart upload; see docs/object-store-contract.md.
+/// uncounted, and leaves the upload usable. There is no caller-supplied
+/// whole-object checksum for a multipart upload; see
+/// docs/object-store-contract.md.
 async fn assert_multipart_part_checksum(store: &dyn ObjectStoreBackend, prefix: &str) {
     let key = format!("{prefix}object");
     let part = multipart_payload(MULTIPART_TAIL_SIZE);

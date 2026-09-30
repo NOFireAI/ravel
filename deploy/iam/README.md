@@ -34,20 +34,22 @@ sweep never deletes -- and `MaintainDelete` below now grants delete on
 This is a separate list from the Object Lock compliance-mode prefixes in
 `docs/object-store-contract.md`'s "Required bucket configuration" section,
 which does include commit records: they get bucket-layer, per-object
-retention so a compromised credential cannot delete or overwrite one
-before its retention period elapses, exactly the same as the other
-protected prefixes. The two lists disagree on commit records for a
-reason, not by accident: IAM's `DenyDeleteProtected` blocks Maintain's own
-role from ever deleting the prefix, which would break the sweep; Object
-Lock's per-object retention only delays a delete Maintain is allowed to
-attempt, and only for the retention period an operator chose. That
-retention period is the one bound the mechanism setting it must respect:
-kept inside the sweep's own default retention window (`protection_horizon`,
-about 25 hours with defaults), the sweep pauses on a locked commit record
-for at most that long and then completes; a longer period pauses the
-sweep on that record for the difference. See
+retention, exactly the same as the other protected prefixes. That retention
+protects object versions, not the key. A compromised credential that sends a
+`DeleteObjects` or a PUT with no version id still succeeds: on the versioned
+bucket Object Lock requires, the delete adds a delete marker and the PUT
+adds a new current version. The locked version stays in storage, and
+recoverable, until its retain-until. The two lists disagree on commit
+records for a reason, not by accident: IAM's `DenyDeleteProtected` blocks
+Maintain's own role from ever deleting the prefix, which would break the
+sweep; Object Lock's per-object retention does not refuse the sweep's
+delete at all. Ravel's delete names no version id, so on a locked commit
+record it lands as a delete marker and the sweep carries on as it would on
+an unlocked one; it does not pause. What the retention extends is how long
+the locked version physically remains: it is removed once its retain-until
+has passed and the noncurrent-version expiration rule has fired. See
 `docs/object-store-contract.md`'s "Required bucket configuration" section
-for the full retention/GC interaction.
+for the full retention/GC interaction and the physical-removal bound.
 
 ## Delete grants per role
 

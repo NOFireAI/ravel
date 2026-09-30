@@ -40,7 +40,9 @@ deliberately paired** with a noncurrent-version expiration rule
 every Ravel delete — retention, sweep, and erasure — into a soft delete;
 with the pairing, every physical-erasure and retention bound gains `+E_v`.
 ADR-0064 §6 adds: bucket-default Object Lock retention `D` makes the
-physical erasure bound `max(bound, D)`, and instructs operators with
+physical erasure bound `max(bound, D)` (corrected by the
+2026-09-30 Object Lock amendment below: it is `max(bound + E_v, D)`), and
+instructs operators with
 erasure obligations to prefer scoped legal holds or keep `D` inside their
 erasure SLA. So the standard S3 DR pattern is in direct tension with the
 erasure guarantee: turning on versioning extends the physical erasure
@@ -121,8 +123,9 @@ the ADR-0064 §7 tension is resolved by disclosure, never silently:
   any deployment with erasure obligations.**
 - **Tier 2 — Tier 1 plus Object Lock.** Bucket-default retention `D` on
   the primary (and/or replica). Erasure consequence per ADR-0064 §6:
-  physical bound becomes `max(bound, D)`; query-time exclusion stays
-  immediate. ADR-0064 §6's instruction carries forward unchanged: prefer
+  physical bound becomes `max(bound, D)` (corrected by the
+  2026-09-30 Object Lock amendment below: it is `max(bound + E_v, D)`);
+  query-time exclusion stays immediate. ADR-0064 §6's instruction carries forward unchanged: prefer
   scoped legal holds over blanket default retention, or keep `D` inside
   the erasure SLA. Supported, but **not part of the recommended DR
   baseline**,
@@ -334,8 +337,9 @@ over Tier 1 is against a compromised credential purging version history on
 the primary. But Tier 1 already contains that threat: version-id deletes
 never replicate, the replica lives in an account whose credentials Ravel
 never holds, and the replica retains deleted data as noncurrent versions
-for `E_v_r`. Making Object Lock mandatory would impose `max(bound, D)` on
-every DR-adopting deployment's erasure bound — exactly the collision
+for `E_v_r`. Making Object Lock mandatory would impose `max(bound, D)`
+(corrected by the 2026-09-30 Object Lock amendment below: it is
+`max(bound + E_v, D)`) on every DR-adopting deployment's erasure bound — exactly the collision
 ADR-0064 §6 warns about — to defend against a threat the cross-account
 replica already covers. Deployments whose compliance regime demands WORM
 get Tier 2, with the erasure consequence disclosed, as a choice rather
@@ -382,7 +386,9 @@ real and the signal clean.
 - **The erasure bound for DR-adopting operators is longer, and that is
   stated, not hidden**: an operator choosing Tier 1 accepts erased-subject
   residue for up to `E_v` on the primary and replication lag + `E_v_r` on
-  the replica; Tier 2 accepts `max(bound, D)`. Query-time exclusion stays
+  the replica; Tier 2 accepts `max(bound, D)` (corrected by the
+  2026-09-30 Object Lock amendment below: it is `max(bound + E_v, D)`).
+  Query-time exclusion stays
   immediate in every tier. The guide presents this as the deliberate
   trade it is.
 - **RPO/RTO are published only from rehearsal records.** Until the first
@@ -406,3 +412,23 @@ real and the signal clean.
   no RPO/RTO promise in code, no Object Lock enforcement, no change to
   erasure semantics — only to their disclosed bounds under configurations
   operators choose.
+
+## Amendment (2026-09-30, #2227): the Tier 2 erasure bound is `max(bound + E_v, D)`
+
+<!-- amendment-supersedes: phrase="`max(bound, D)`" pointer="2026-09-30 Object Lock amendment" -->
+
+This ADR took its Tier 2 erasure bound, `max(bound, D)`, from ADR-0064
+decision 6, which said S3 refuses the sweep's deletes until each object's
+retain-until passes. ADR-0064's 2026-09-30 Object Lock amendment corrects
+that: every Ravel delete names no version id, so on the versioned bucket
+Object Lock requires it succeeds and inserts a delete marker, and the locked
+version stays as a noncurrent version until both its retain-until has passed
+and the `NoncurrentDays = E_v` expiration rule has removed it. The bound is
+therefore `max(bound + E_v, D)`.
+
+`bound` in this ADR is ADR-0064's bound on an unversioned bucket, the one
+Tier 1 adds `+E_v` to; nothing in this ADR defines it as already including
+`E_v`. The context paragraph citing ADR-0064 §6, Tier 2 in decision 1, the
+Object Lock rejected alternative and the erasure-bound consequence each carry
+an inline pointer here. docs/guides/disaster-recovery.md states the same
+formula for level 2.
