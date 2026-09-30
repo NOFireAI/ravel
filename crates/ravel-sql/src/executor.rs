@@ -107,9 +107,9 @@ use ravel_promql::{LabelMatcher, MatchOp};
 use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
 use ravel_query::io_shape::{IoShapeCounts, PlanClass, QueryIoShape, count_unfolded_segments};
 use ravel_query::{
-    ByteLimit, LogSegmentFetcher, PhaseAccounting, PhaseAccountingSnapshot, QueryError,
-    RequestBudget, RequestBudgets, RequestLimit, SegmentAdmission, SegmentFetcher, admit,
-    request_budget_exceeded, resolved_fold_lag,
+    LogSegmentFetcher, PhaseAccounting, PhaseAccountingSnapshot, QueryError, RequestBudget,
+    RequestBudgets, SegmentAdmission, SegmentFetcher, admit, request_budget_exceeded,
+    resolved_fold_lag,
 };
 use ravel_types::accounting::{
     AccountedOp, CostEstimate, QueryAccounting, QueryAccountingSnapshot,
@@ -1638,11 +1638,13 @@ impl SqlExecutor {
         let parquet_tables = match (parquet, &self.parquet) {
             (Some(resolution), Some(sources)) => {
                 // One ledger per query, shared by every reader it opens, over
-                // the executor's process memory budget.
+                // the executor's process memory budget and the effective
+                // config's byte and request limits, which already carry a
+                // request's clamped budgets.
                 let limits = ReadLimits::new(
                     Arc::clone(&self.process_memory_budget),
-                    ByteLimit::Unlimited,
-                    RequestLimit::Unlimited,
+                    config.engine.max_bytes_scanned,
+                    config.engine.max_s3_requests,
                 );
                 let tables = parquet::build_tables(
                     sources,
@@ -2041,6 +2043,31 @@ impl SqlExecutor {
             .resolve_parquet_target(tenant_hash, &req.sql, &tables, phase_accounting)
             .await?
         {
+            // The request budget is checked here, as it is for a signal
+            // statement, on what the query is already known to cost: the
+            // manifest and grant reads this resolve made, plus one GET for
+            // each file it will open. Every read past that is admitted against
+            // the same budget as it is issued.
+            let estimate = parquet::estimate_cost(
+                &resolution,
+                phase_accounting.resolve().snapshot().total_s3_requests(),
+            );
+            if let Some(QueryError::RequestBudgetExceeded {
+                requests,
+                max,
+                fold_lag,
+            }) = request_budget_exceeded(
+                estimate.estimated_requests,
+                self.effective_config(req.budgets.as_ref())
+                    .engine
+                    .max_s3_requests,
+            ) {
+                return Err(SqlError::RequestBudgetExceeded {
+                    requests,
+                    max,
+                    fold_lag,
+                });
+            }
             return Ok(Resolved {
                 snapshot: Snapshot {
                     segments: Vec::new(),
@@ -2051,7 +2078,7 @@ impl SqlExecutor {
                     sealed_count: 0,
                     exempt_count: 0,
                 },
-                estimate: CostEstimate::new(0, 0, 0, 0, 0),
+                estimate,
                 unfolded_segments_resolved: 0,
                 target: TargetSignal::Parquet,
                 parquet: Some(resolution),

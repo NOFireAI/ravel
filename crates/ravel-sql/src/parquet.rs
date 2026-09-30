@@ -40,7 +40,7 @@ use ravel_pqtable::names::validate_table;
 use ravel_pqtable::resolve::{self, ResolveError};
 use ravel_query::{GetLimiter, PhaseAccounting, ReadCache};
 use ravel_types::TenantHash;
-use ravel_types::accounting::{AccountedOp, QueryAccounting};
+use ravel_types::accounting::{AccountedOp, CostEstimate, QueryAccounting};
 
 use crate::error::{ErrorClass, MSG_CORRUPT, MSG_PLAN, MSG_UNAVAILABLE};
 
@@ -633,6 +633,24 @@ pub(crate) async fn first_name_with_versions(
         }
     }
     Ok(None)
+}
+
+/// The cost of a resolved Parquet statement that is known before any file is
+/// read: the `resolve_requests` its resolve made, plus one GET for each file
+/// its manifests name, since a scan opens every file. The request figure is a
+/// floor, not a ceiling: a file whose footer is not cached costs another GET,
+/// and so does each column chunk. `estimated_store_bytes` is the total size of
+/// the files, which bounds the bytes a scan can read.
+pub(crate) fn estimate_cost(resolution: &ParquetResolution, resolve_requests: u64) -> CostEstimate {
+    let mut files = 0u64;
+    let mut bytes = 0u64;
+    for manifest in &resolution.manifests {
+        files = files.saturating_add(manifest.files.len() as u64);
+        for file in &manifest.files {
+            bytes = bytes.saturating_add(file.size);
+        }
+    }
+    CostEstimate::new(resolve_requests.saturating_add(files), bytes, 0, 0, 0)
 }
 
 /// Resolve the Parquet tables among `names`: the newest live manifest of each,
