@@ -191,17 +191,12 @@ impl SpanIngestRouter {
     }
 
     /// Whether every shard actor this router owns is live enough to serve:
-    /// false once any shard actor has died and been condemned (issue #1691).
-    /// The span router never respawns a dead actor, so a single death condemns
-    /// the shard immediately, unlike the metrics router
-    /// ([`crate::IngestRouter::ready`]), which condemns only after a respawn
-    /// budget is exhausted. `services/ravel-server` ANDs this into `/readyz`,
-    /// so a false here sheds traffic from this replica: Kubernetes removes the
-    /// pod from its Service endpoints. It does not restart or reschedule the pod
-    /// (`/healthz` is deliberately independent of ingest health), so recovering
-    /// the shard needs an operator to roll it. Monotonic: nothing un-condemns a
-    /// shard, and it reads the condemned-shard counter rather than live handles,
-    /// which the shard-actor sets never drop for the process lifetime.
+    /// false once the router has observed a shard actor dead (a write or ack
+    /// found its channel closed), since that first observed death condemns a
+    /// span shard (issue #1691; docs/ingest.md, Log pipeline and Span
+    /// pipeline, has the full rule). It reads the condemned-shard counter
+    /// rather than live handles, which the shard-actor sets never drop for the
+    /// process lifetime.
     pub fn ready(&self) -> bool {
         self.metrics.condemned_shards() == 0
     }
@@ -423,10 +418,7 @@ impl SpanIngestRouter {
     fn mark_shard_dead(&self, handle: &SpanShardHandle) {
         if !handle.dead.swap(true, Ordering::Relaxed) {
             self.metrics.record_shard_death();
-            // The span router never respawns a dead actor, so the first death is
-            // already permanent: condemn the shard in the same step, once per
-            // shard the way `record_shard_death` is (issue #1691). This is what
-            // `ready()` reads to turn `/readyz` to 503.
+            // The first death condemns a span shard (docs/ingest.md, Span pipeline).
             self.metrics.record_shard_condemned();
         }
     }

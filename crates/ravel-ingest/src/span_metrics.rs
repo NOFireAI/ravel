@@ -80,18 +80,14 @@ pub struct SpanIngestMetrics {
     /// (success-time).
     acks_err: AtomicU64,
     /// Distinct span shard actors observed dead by the router. Counted once
-    /// per shard on the first observation, so it never exceeds `shard_count`.
+    /// per shard of each live shard-actor set on the first observation, so it
+    /// is bounded by the sum of those sets' shard counts (one set per distinct
+    /// active `shard_count`).
     shard_deaths: AtomicU64,
-    /// Shards condemned and no longer serving (issue #1691). Unlike the metrics
-    /// pipeline, the span router does not respawn a dead shard actor, so a shard
-    /// is condemned on its FIRST death rather than after a respawn budget is
-    /// exhausted: the two counters move together here, one per shard. Nonzero
-    /// means at least one shard is permanently down in this process and its
-    /// traces keep failing until the process is replaced, which nothing does
-    /// automatically. It makes the router report itself not-ready
-    /// ([`crate::SpanIngestRouter::ready`]), which sheds traffic from this
-    /// replica (Kubernetes drops the pod from its Service endpoints) but does
-    /// not restart or reschedule it. This is the counter to alert on.
+    /// Shards condemned and no longer serving (issue #1691): a span shard is
+    /// condemned on its first death, so this moves with `shard_deaths`. The
+    /// counter to alert on; docs/ingest.md, Log pipeline and Span pipeline,
+    /// has the full rule.
     shards_condemned: AtomicU64,
     /// Flush-open stamps raised to this writer's monotonic floor because the
     /// injected clock read below the previous stamp (ADR-1307), the
@@ -225,10 +221,8 @@ pub struct SpanIngestMetricsSnapshot {
     pub acks_ok: u64,
     pub acks_err: u64,
     pub shard_deaths: u64,
-    /// Shards condemned after a permanent death (issue #1691). The span router
-    /// never respawns, so this equals `shard_deaths` for distinct shards.
-    /// Nonzero drives `/readyz` to 503. Exported as
-    /// `ravel_ingest_shards_condemned_total`.
+    /// Shards condemned on their first death (issue #1691; docs/ingest.md, Span
+    /// pipeline). Exported as `ravel_ingest_shards_condemned_total`.
     pub shards_condemned: u64,
     /// Flush-open stamps raised to this writer's monotonic floor after a
     /// backwards clock step (ADR-1307). Intended for export as
@@ -444,9 +438,8 @@ impl SpanIngestMetrics {
         self.shard_deaths.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// One shard condemned (issue #1691). The span router does not respawn, so a
-    /// shard is condemned on its first death; called once per shard beside
-    /// [`Self::record_shard_death`], with the same per-shard dedup.
+    /// One shard condemned (issue #1691; docs/ingest.md, Span pipeline). Called
+    /// once per shard beside [`Self::record_shard_death`], with the same dedup.
     pub(crate) fn record_shard_condemned(&self) {
         self.shards_condemned.fetch_add(1, Ordering::Relaxed);
     }

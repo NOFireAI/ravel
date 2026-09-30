@@ -550,10 +550,12 @@ fn handle_flush_join_result(shard: u32, result: Result<(), tokio::task::JoinErro
 /// before its first poll (a `JoinSet` dropped with tasks still queued, when the
 /// actor unwinds out of `handle_flush_join_result` or the router drops the
 /// actor), while dropping that task's future still fires the `Drop`. The gauge
-/// clamps at 0 on read so nothing underflows, but the negative bias persists in
-/// the map, and the router hands the same [`SpanIngestMetrics`] to the respawned
-/// actor for that shard index, so a shard biased to -2 would report 0 in flight
-/// while two real flushes ran.
+/// clamps at 0 on read so nothing underflows, but the negative bias would
+/// persist in that shard index's entry of the shared [`SpanIngestMetrics`] map
+/// for the process lifetime: entries are never removed, and every shard-actor
+/// set (one per active `shard_count`, ADR-0052) records into the same entry
+/// for a given index, so an entry biased to -2 would report 0 in flight while
+/// two real flushes ran on another set's actor at that index.
 ///
 /// The guard is constructed on the actor, in the same non-awaiting region that
 /// moves the buffer into the flush task, so the gauge counts a flush from the
