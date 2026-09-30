@@ -421,7 +421,8 @@ async fn information_schema_is_not_reachable() {
 /// (checkpoint review finding): they generate rows in memory, so
 /// `EmptyObjectStoreRegistry` does not block them the way it blocks
 /// `CREATE EXTERNAL TABLE`/`COPY`. `samples` must be the only table a query
-/// can read from.
+/// can read from. The executor refuses them before resolving anything, which
+/// tests/parquet_tables.rs pins with a store read count.
 #[tokio::test]
 async fn table_functions_are_not_reachable() {
     let tenant = tenant_id("acme");

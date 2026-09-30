@@ -1340,8 +1340,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that tenant's URL. `ParquetTableProvider` applies the D5 coercions
   (`binary_as_string` and the `ravel.cast.<column>` integer casts) and the D6
   file groups: up to `target_partitions` groups for a parallel scan, and one
-  group in manifest order, never re-split, otherwise. Nothing routes SQL to it
-  yet; issue #2053 does.
+  group in manifest order, never re-split, otherwise.
 - **The logs SQL scan skips segments whose declared-column statistics exclude
   the predicate** (ADR-2121 D1, issue #2151). A declared `i64`/`bool`
   comparison or `BETWEEN`, or a declared `i64` `IN`, now also drops every
@@ -1370,6 +1369,46 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the presence check and the value. Query results do not change: a non-UTF-8
   `str` cell still reads as absent and falls through to the resource or scope
   value, and a typed `str` column is still `Dictionary(Int32, Utf8)`.
+- Parquet tables answer `POST /api/v1/sql` and Flight SQL (ADR-2040 D3, D4
+  and D6, #2053). `ravel-server --parquet-profiles` (`RAVEL_PARQUET_PROFILES`)
+  loads the credential profile file `ravel-cli` uses, and each profile's
+  read-only store is opened per bucket the first time a query reads it. A
+  (profile, bucket) whose bucket address overlaps that of Ravel's own data
+  bucket (`--s3-bucket` at `--s3-endpoint` in `--s3-region`, path-style) is
+  refused with a typed error before that store is opened. A bucket address is
+  where the S3 client sends the bucket's requests: a virtual-hosted endpoint as
+  written, a path-style one with `/<bucket>` appended, AWS's regional endpoint
+  when there is none. Two overlap on the same AWS partition, on GCS, or on the
+  same host and port (a missing port read as the scheme's default) when one's
+  bucket and path segments begin with the other's, so a virtual-hosted profile
+  at Ravel's host that names no bucket is refused too. An S3 profile endpoint
+  carrying a path is refused whenever a store is opened from it, for a query
+  and for `tenant parquet-grant add` alike. A
+  statement whose only tables are Parquet tables of the caller's tenant
+  resolves each table's newest live manifest and the tenant's current grants
+  before its session is built: a file outside every current grant fails the
+  query with `LocationNotGranted`, and without a profile file a statement
+  naming a Parquet table fails with `NotConfigured` (HTTP 422). A Parquet
+  table beside a signal table is `CrossSignalQuery`; another tenant's table, a
+  dropped table and any other unknown name fail to plan as an unknown table
+  always has. Only a Parquet session's registry resolves a store, its own
+  tenant's `ravel-pq://` URL, and a statement naming a table function or a
+  URL-shaped table is refused before any store read. The reader evaluates
+  filters in the scan; an exact-typed statement scans in up to
+  `target_partitions` file groups with file-scan repartitioning on, any other
+  in one group in manifest order. The reader does not use a file's page
+  index: it hands the scan a footer with no column index or offset index, and
+  the scan runs with DataFusion's `enable_page_index` off, so every column
+  chunk is decoded by page header and a corrupt offset index changes no row,
+  including when a join or TopK pushes a dynamic filter into the scan.
+  Row-group statistics pruning and `pushdown_filters` are unchanged; there is
+  no page-level pruning. Decoded footers and refusals are cached per pinned
+  file and footer length the manifest recorded. A refusal is cached: a footer
+  length the file cannot hold, and a trailer or footer that does not decode or
+  disagrees with the manifest. A read that failed is not cached, whatever it
+  failed on: a store error or a read that came back short.
+  `tenant parquet-grant add` lists past a zero-byte directory blob, and says so
+  when its search for an object stopped at the listing page bound.
 
 ## [0.19.0] - 2026-09-27
 

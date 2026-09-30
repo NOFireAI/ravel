@@ -51,6 +51,12 @@ ravel-rspan = { workspace = true }
 # the number of active tenants. A leaf crate with no dependency beyond std, so
 # this adds no cycle and no external supply-chain surface.
 ravel-memory = { workspace = true }
+# Parquet tables queried in place (ADR-2040). ravel-pqtable resolves a tenant's
+# manifests and grants from Ravel's own store; ravel-parquet is the DataFusion
+# Parquet provider, reader and single-URL store registry, and the one crate
+# that links datafusion-datasource-parquet. Both are workspace crates.
+ravel-pqtable = { workspace = true }
+ravel-parquet = { workspace = true }
 
 # DataFusion pulls its own matching arrow (accessed via `datafusion::arrow`),
 # so this crate never depends on the workspace `arrow` pin directly. See the
@@ -59,9 +65,12 @@ ravel-memory = { workspace = true }
 # `sql` is the only feature enabled on top of `default-features = false`: it
 # supplies `datafusion-sql` (the sqlparser front end and the SQL-to-LogicalPlan
 # planner) that the `/api/v1/sql` endpoint parses and plans with. The flag does
-# keep the file-format factories off: no parquet/csv/avro/json readers, so a
-# `CREATE EXTERNAL TABLE` that slipped the parse gate has nothing to bind to
-# (security invariant 1), and crypto is off (no md5/sha256 in the live surface).
+# keep the facade's file-format factories off: no parquet/csv/avro/json format
+# is registered in any session, so a `CREATE EXTERNAL TABLE` that slipped the
+# parse gate has nothing to bind to, and crypto is off (no md5/sha256 in the
+# live surface). The Parquet reader that does link, through ravel-parquet
+# above, is reachable only through a `ParquetTableProvider` the executor
+# registers for a resolved Parquet table (ADR-2040 D3, D4).
 #
 # `default-features = false` is NOT the control over the expression packs, and
 # must not be read as one. datafusion 54 declares `datafusion-functions`,
@@ -83,8 +92,9 @@ ravel-memory = { workspace = true }
 datafusion = { version = "54", default-features = false, features = ["sql"] }
 
 # `url::Url` appears in the `ObjectStoreRegistry` trait signature, which
-# ravel-sql implements to install a registry that holds no stores at all
-# (security invariant 1: "the SQL RuntimeEnv registers no object store").
+# ravel-sql implements to install a registry that holds no stores at all in
+# every session that reads no Parquet table (ADR-0013 security invariant 1, as
+# ADR-2040 D4 replaces it for Parquet sessions).
 # datafusion does not re-export `url`, so it is named directly here; the crate
 # is already in the workspace lockfile as a transitive dependency of
 # object_store, so this adds no new supply-chain surface.
@@ -100,7 +110,9 @@ arrow-flight = { workspace = true, optional = true }
 #    in every `FlightSqlService` signature. arrow-flight does not re-export it.
 #  - `prost` supplies the `Message` trait used to encode a Flight SQL command
 #    into the opaque `Ticket` bytes the protocol dispatches on.
-#  - `bytes` supplies the `Bytes` the Flight protobuf fields are typed as.
+#  - `bytes` supplies the `Bytes` the Flight protobuf fields are typed as. It
+#    is an unconditional dependency below, since the Parquet resolve's
+#    `ObjectStoreBackend` wrapper (crate::parquet) names it too.
 #  - `uuid` types `SegmentPin::writer_id`, one of the `SegmentRef` fields the
 #    snapshot-pinning ticket carries.
 #  - `blake3` keys the ticket's integrity MAC; already a
@@ -113,7 +125,7 @@ arrow-flight = { workspace = true, optional = true }
 # adds nothing to the lockfile.
 tonic = { workspace = true, optional = true, features = ["tls-ring"] }
 prost = { workspace = true, optional = true }
-bytes = { workspace = true, optional = true }
+bytes = { workspace = true }
 uuid = { workspace = true, optional = true }
 blake3 = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
@@ -175,7 +187,6 @@ flight-sql = [
     "dep:arrow-flight",
     "dep:tonic",
     "dep:prost",
-    "dep:bytes",
     "dep:rand",
     "dep:ravel-maintain",
 ]
@@ -248,6 +259,11 @@ prost = { workspace = true }
 # read-only one to prove the `spill_unavailable` refusal. Already a workspace
 # pin, and already in the lockfile as a datafusion dependency.
 tempfile = { workspace = true }
+
+# Dev-only: tests/parquet_tables.rs writes the Parquet files its tables are
+# made of. The major ravel-parquet already links for DataFusion 54, so it adds
+# no lockfile entry.
+parquet = { version = "58", default-features = false, features = ["arrow"] }
 
 [[bench]]
 name = "samples_scan"
