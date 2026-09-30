@@ -14,7 +14,8 @@
 //! without it treats every name that is not a signal table exactly as it did
 //! before Parquet tables existed. With it but with no profiles configured, a
 //! statement naming a Parquet table fails with
-//! [`ParquetQueryError::NotConfigured`] after one LIST per name and no GET.
+//! [`ParquetQueryError::NotConfigured`] after one LIST per name, one GET of
+//! the newest manifest of each name that has versions, and no file read.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
@@ -52,8 +53,9 @@ pub const DEFAULT_PARQUET_METADATA_CACHE_BYTES: u64 = 64 << 20;
 /// statement may name ([`crate::SqlError::TooManyTables`] past it).
 ///
 /// Whether such a name is a Parquet table is a fact about the store, so each
-/// one can cost a LIST of its manifest prefix, issued one after another before
-/// the statement plans. This bound caps those LISTs per statement. Sixteen
+/// one can cost a LIST of its manifest prefix, and a name that has versions a
+/// GET of its newest manifest, issued one after another before the statement
+/// plans. This bound caps those reads per statement. Sixteen
 /// clears every join a dashboard or report realistically writes, while the
 /// statement complexity guard alone would admit several hundred names.
 pub const MAX_STATEMENT_TABLE_NAMES: usize = 16;
@@ -608,10 +610,14 @@ impl ParquetQueryError {
     }
 }
 
-/// The first name in `names` that has at least one manifest version for
-/// `tenant`, from one LIST per valid table name up to and including it and no
-/// GET.
-pub(crate) async fn first_name_with_versions(
+/// The first name in `names` that is a live Parquet table of `tenant`, from
+/// one LIST per valid table name up to and including it, plus one GET of the
+/// newest manifest for each name that has manifest versions.
+///
+/// A name whose newest version is a drop is no table, exactly as
+/// [`resolve_tables`] treats it, so the statements that stop here agree with
+/// the ones that resolve in full that a dropped table is an unknown one.
+pub(crate) async fn first_live_table(
     sources: &ParquetSources,
     tenant: &TenantHash,
     names: &BTreeSet<String>,
@@ -622,13 +628,13 @@ pub(crate) async fn first_name_with_versions(
         if validate_table(name).is_err() {
             continue;
         }
-        let versions = resolve::versions(&store, tenant, name)
+        let newest = resolve::newest(&store, tenant, name)
             .await
             .map_err(|source| ParquetQueryError::Resolve {
                 table: name.clone(),
                 source,
             })?;
-        if !versions.is_empty() {
+        if newest.is_some_and(|manifest| manifest.is_live()) {
             return Ok(Some(name.clone()));
         }
     }
@@ -659,6 +665,9 @@ pub(crate) fn estimate_cost(resolution: &ParquetResolution, resolve_requests: u6
 ///
 /// Every file must lie inside a grant that exists now under the profile the
 /// file is read through; the grant the manifest recorded is not consulted.
+///
+/// The caller has checked [`ParquetSources::is_configured`]; without profiles
+/// [`build_tables`] refuses with [`ParquetQueryError::NotConfigured`].
 pub(crate) async fn resolve_tables(
     sources: &ParquetSources,
     tenant: &TenantHash,
@@ -681,13 +690,8 @@ pub(crate) async fn resolve_tables(
             manifests.push(manifest);
         }
     }
-    let Some(first) = manifests.first() else {
+    if manifests.is_empty() {
         return Ok(None);
-    };
-    if !sources.is_configured() {
-        return Err(ParquetQueryError::NotConfigured {
-            table: first.table.clone(),
-        });
     }
     let granted = grants::list(&store, tenant)
         .await

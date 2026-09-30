@@ -347,6 +347,10 @@ pub(crate) fn referenced_base_tables(sql: &str) -> Result<BTreeSet<String>, Vali
 /// statement always fails to plan. The executor refuses it with the same
 /// planning error before resolving anything, so it reads no object from any
 /// store (ADR-2040 decision D4).
+///
+/// It must run before `resolve_parquet_target`'s `others.is_empty()`
+/// short-circuit, so a URL table is refused whether or not a Parquet name is
+/// present.
 pub(crate) fn unreadable_table_reference(sql: &str) -> Result<Option<String>, ValidationError> {
     let statements = complexity_guard::parse_guarded(sql)?;
     let mut found = None;
