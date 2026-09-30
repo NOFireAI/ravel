@@ -134,11 +134,17 @@ both is
 [S3 Object Lock](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html).
 
 `--require-bucket-protection` gates startup on the bucket half of that
-posture only: Object Lock enabled and versioning on. With the flag set, a
-bucket reporting Object Lock disabled, or a versioning misconfiguration,
-refuses to start; a backend that cannot disclose its state warns once and
-raises the `ravel_bucket_protection_unknown` gauge; a bucket reporting it
-enabled starts clean. The flag cannot see whether the retention mechanism is
+posture only: Object Lock, versioning and the lifecycle rules. On S3, with the
+flag set, the server refuses to start when Object Lock is disabled, when no
+enabled `AbortIncompleteMultipartUpload` rule of seven days or less covers
+`t/`, when a foreign expiration or transition rule targets `t/` or `sys/`, or
+when versioning is on and the noncurrent-version expiration rule is missing or
+fails its checks. Any other failed condition, and any condition it cannot
+determine (every condition on a backend other than S3, or under an identity
+without the read permissions, which no shipped IAM template grants), warns
+once, starts, and is counted in the `ravel_bucket_protection_*` gauges. The
+[deployment guide](operations/deployment.md#bucket-protection-at-startup)
+lists the exact conditions. The flag cannot see whether the retention mechanism is
 running, whether every protected object version carries retention, or whether
 a bucket default retention is set; those are verified out of band, with the
 commands in the "Platform-CLI verification checklist" below (`ravel-cli store
@@ -508,9 +514,17 @@ verified operation.
 5. **Re-protect before the first process starts.** The restore bucket must
    meet the baseline before Ravel writes to it: versioning on with the
    primary's `NoncurrentDays = E_v` rule and expired-delete-marker cleanup
-   installed (a promoted replica still carries `E_v_r`; replace it), and
-   Object Lock enabled. Without the lifecycle rules the erasure bound does
-   not hold for anything written from this point. At levels 0 and 1 that
+   installed (a promoted replica still carries `E_v_r`; replace it), the
+   `AbortIncompleteMultipartUpload` rule of seven days or less, and Object
+   Lock enabled. Without the lifecycle rules the erasure bound does not hold
+   for anything written from this point. A server started with
+   `--require-bucket-protection` refuses a bucket without Object Lock or the
+   multipart-abort rule only when its identity can read the bucket's
+   versioning, lifecycle and Object Lock configuration. No template under
+   `deploy/iam/` grants those reads, so under a shipped template the check
+   reads every condition unknown, warns and starts: grant the three reads to
+   the restore bucket's server role, or verify the bucket with `ravel-cli
+   store verify-protection` before the first start. At levels 0 and 1 that
    also means no default retention and the
    retention mechanism pointed at the restore bucket and backfilled over the
    restored objects: objects restored before the mechanism runs carry no
@@ -519,7 +533,10 @@ verified operation.
    in the platform-CLI verification checklist. At level 2 it means the bucket default retention `D`
    set on the restore bucket before the restore copy, so every restored
    object is locked as it lands. The startup flag checks only the bucket half
-   of this; the mechanism, or the default retention, is verified by hand.
+   of this (Object Lock, versioning and the lifecycle rules, but not the
+   `NoncurrentDays` value against `E_v`, which `ravel-cli store
+   verify-protection` checks); the mechanism, or the default retention, is
+   verified by hand.
 6. **Resume.** Start Ravel against the restored bucket. Disposable compute
    pays off here: processes mint fresh writer ids and epochs, no local state
    exists to reconcile, and the operator issues fresh per-mode storage
@@ -604,7 +621,7 @@ record: a real end-to-end run against RustFS is what fills a row.
 
 | Level | Controls | Erasure-bound consequence | RPO/RTO |
 |---|---|---|---|
-| **Every level** | Object Lock enabled on the bucket and versioning ON; at levels 0 and 1, no bucket default retention and an operator-run mechanism applying per-object retention in compliance mode to `sys/`, provisioning records, commit records and the catalog keyspace `t/*/catalog/*/*` (level 2 replaces the mechanism with its bucket default retention); `--require-bucket-protection` gates startup on the bucket half (Object Lock enabled, versioning on), and the mechanism or the default retention is verified out of band | None for `sys/` and the provisioning records (no erasable subject value, and no sweep deletes them). For the commit records, `max(bound, R)` where `R` is the chosen retention period, until it elapses. For the catalog keyspace, the unreferenced-catalog sweep does delete its snapshot and index objects, and for any tenant with a typed string or bytes attribute column a stale per-part column-statistics object stores an erased value verbatim. That bound is not `max(bound, R)`: the object stays referenced until the fold reconciles that hour or HEAD is rebuilt, so it is "until the fold reconciles, then plus `R`". The maintenance IAM policy Ravel ships permits that delete (its catalog deny is scoped to `catalog/<signal>/HEAD`); a copy of that template predating the narrowing denies it outright and leaves the bound open-ended until it is re-applied. Scope the mechanism to `catalog/<signal>/HEAD` alone to drop the retention half of it | Not a recovery control |
+| **Every level** | Object Lock enabled on the bucket and versioning ON; at levels 0 and 1, no bucket default retention and an operator-run mechanism applying per-object retention in compliance mode to `sys/`, provisioning records, commit records and the catalog keyspace `t/*/catalog/*/*` (level 2 replaces the mechanism with its bucket default retention); `--require-bucket-protection` gates startup on the bucket half (Object Lock, versioning and the lifecycle rules), and the mechanism or the default retention is verified out of band | None for `sys/` and the provisioning records (no erasable subject value, and no sweep deletes them). For the commit records, `max(bound, R)` where `R` is the chosen retention period, until it elapses. For the catalog keyspace, the unreferenced-catalog sweep does delete its snapshot and index objects, and for any tenant with a typed string or bytes attribute column a stale per-part column-statistics object stores an erased value verbatim. That bound is not `max(bound, R)`: the object stays referenced until the fold reconciles that hour or HEAD is rebuilt, so it is "until the fold reconciles, then plus `R`". The maintenance IAM policy Ravel ships permits that delete (its catalog deny is scoped to `catalog/<signal>/HEAD`); a copy of that template predating the narrowing denies it outright and leaves the bound open-ended until it is re-applied. Scope the mechanism to `catalog/<signal>/HEAD` alone to drop the retention half of it | Not a recovery control |
 | **level 0** (default) | Versioning + `NoncurrentDays = E_v` + expired-delete-marker cleanup; no replica | Primary `+E_v` | None; bucket loss is total loss |
 | **level 1** (recommended) | Level 0 plus a replica: different region/account/KMS key, replication v2 with `DeleteMarkerReplication`, RTC recommended; the replica versioned with `NoncurrentDays = E_v_r` and expired-delete-marker cleanup | Primary `+E_v`; replica residue is replication lag + `E_v_r` (requires `DeleteMarkerReplication`) | Defined here; **unmeasured** until a rehearsal record exists. RTC gives RPO a 15-minute ceiling; without RTC, unbounded |
 | **level 2** (optional) | level 1 plus a bucket default retention `D`, which S3 applies to every object including the data objects | `max(bound, D)`; query-time exclusion still immediate | As level 1 |

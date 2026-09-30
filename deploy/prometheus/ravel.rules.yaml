@@ -591,11 +591,33 @@ groups:
           severity: warning
         annotations:
           summary: >-
-            Ravel cannot see whether its bucket has Object Lock and versioning
-            on, while --require-bucket-protection is set
+            Ravel could not determine at least one bucket-protection condition
+            at startup, while --require-bucket-protection is set
           description: >-
             Not necessarily a misconfiguration, but the platform cannot see the
             protection it depends on. Confirm the bucket settings out of band.
+            While this fires, a zero count of failed bucket-protection
+            conditions is not evidence the bucket is compliant: only a zero
+            count of unknown conditions makes it one.
+          as_documented: >-
+            The guide states this condition with no duration, so no for: is
+            set.
+          runbook: docs/guides/operations/troubleshooting.md#readiness-storage-and-authentication
+      - alert: RavelBucketProtectionConditionsFailed
+        expr: |
+          ravel_bucket_protection_conditions_failed > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            The bucket failed at least one bucket-protection condition at
+            startup that does not refuse to start, while
+            --require-bucket-protection is set
+          description: >-
+            The process started, but the bucket fails a condition of the
+            required bucket configuration, such as versioning off or no
+            expired-delete-marker cleanup. The startup warning names each
+            failed condition; fix it at the bucket layer.
           as_documented: >-
             The guide states this condition with no duration, so no for: is
             set.
