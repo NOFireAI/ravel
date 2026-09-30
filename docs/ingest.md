@@ -739,6 +739,16 @@ the flush stamps statistics from, and the key's generation; a cleared key
 writes no descriptor and the generation it was cleared at. The `undeclared`
 scope leaves exactly those declared typed columns out of bloom coverage.
 
+Those declared typed columns are the config record's own `typed_attr_columns`
+list, not the server-resolved effective list: ingest carries no deployment
+default for typed columns, so a column declared only through the server's
+`--typed-attr-column` flags is invisible to the flush, for the key and for
+the `undeclared` scope alike (the same limit the declared statistics stamps
+already have). The key setter therefore accepts only columns present in the
+record's own list, which keeps a stored key resolvable here by construction;
+a column declared only by server flag stays covered by bloom under
+`undeclared`, which costs pruning precision, never rows.
+
 The layout is unresolved when the key names a column that is not a declared
 typed column, when the key is one the RLOG writer refuses to record (an empty
 or repeated column name, a column count outside 1 to 4, or generation 0), or
@@ -746,8 +756,10 @@ when the stored scope is a value this build does not know. Scope resolution
 never depends on the declared typed columns; it fails only on an unknown
 value. Either failure leaves the whole layout unresolved: the flush still
 writes, with no descriptor, generation 0 and full bloom coverage; the overlay
-logs one warning each time it refreshes that tenant's entry, and each such
-flush adds one to the tenant's `ingest_clustering_key_unresolved_total` count,
+logs one warning each time it refreshes that tenant's entry, and each flush
+that resolves the layout to that unkeyed default adds one to the tenant's
+`ingest_clustering_key_unresolved_total` count (counted at resolution, before
+the object is encoded, so a flush that later fails still counts),
 read through `LogIngestMetrics::clustering_key_unresolved_by_tenant`. That
 count is bounded the same way as the per-tenant PUT attribution (ADR-0076
 decision 2): at most `MAX_TRACKED_TENANTS` (1024) tenants carry a count, a

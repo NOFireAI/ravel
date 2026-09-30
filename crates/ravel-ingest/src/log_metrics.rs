@@ -728,9 +728,11 @@ impl LogIngestMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// One flush for `tenant` wrote its object with no sort descriptor and
-    /// full bloom coverage because the tenant's storage layout did not resolve
-    /// (ADR-2135). Called from `run_flush` before the object is encoded.
+    /// One flush for `tenant` resolved its storage layout to the unkeyed
+    /// default (no sort descriptor, full bloom coverage) because the stored
+    /// layout did not resolve (ADR-2135). Called from `run_flush` at
+    /// resolution, before the object is encoded, so a flush that later fails
+    /// to encode or PUT still counts.
     pub(crate) fn record_clustering_key_unresolved(&self, tenant: TenantHash) {
         self.clustering_key_unresolved.record(tenant, 1);
     }
