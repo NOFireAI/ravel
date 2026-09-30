@@ -1229,11 +1229,25 @@ async fn sweep_superseded_impl(
     let mut groups: Vec<SupersededGroup> = Vec::new();
     let mut by_identity: HashMap<String, usize> = HashMap::new();
     // Buckets holding a rewrite this deleting pass left for its horizon, and
-    // the buckets and applied requests of rewrite chains it refused at a
-    // version 2 link.
+    // the buckets and applied requests of the chains a walk refused.
     let mut young_rewrite_buckets: HashSet<u32> = HashSet::new();
     let mut refused_buckets: BTreeSet<u32> = BTreeSet::new();
     let mut refused_request_ids: BTreeSet<String> = BTreeSet::new();
+    let mut refuse = |bucket: u32, applied: Vec<String>, reason: ChainRefusal, entry_key: &str| {
+        refused_request_ids.extend(applied);
+        if refused_buckets.insert(bucket) {
+            tracing::warn!(
+                tenant_hash = %tenant.to_hex(),
+                signal = signal.key_prefix(),
+                shard,
+                ingest_hour_bucket = bucket,
+                record_key = %entry_key,
+                reason = reason.reason(),
+                "superseded-input sweep: a supersession chain walk was refused; nothing of the \
+                 chain is reclaimed, and it is held in a truncated bucket"
+            );
+        }
+    };
     for (key, entry) in &entries {
         // An observing pass gathers this entry too. The successor's own gather
         // covers the same chain only when the successor superseded a whole
@@ -1280,21 +1294,26 @@ async fn sweep_superseded_impl(
                 // group, gated on this record's horizon. Only a deleting pass
                 // gathers it. The group applied no erasure request and a
                 // missing link in it hides none, so it can add nothing to an
-                // observing pass's holds.
+                // observing pass's holds. A refused walk reclaims nothing the
+                // entry gathered.
                 if deleting && version_2.heads.contains(key) {
-                    gathered.extend(
-                        gather_superseded_chain(
-                            store,
-                            tenant,
-                            signal,
-                            shard,
-                            &record.superseded_record_key,
-                            ChainEntry::Version2,
-                            Version2Links::Follow,
-                        )
-                        .await?
-                        .unwrap_or_default(),
-                    );
+                    match gather_superseded_chain(
+                        store,
+                        tenant,
+                        signal,
+                        shard,
+                        &record.superseded_record_key,
+                        ChainEntry::Version2,
+                        Version2Links::Follow,
+                    )
+                    .await?
+                    {
+                        ChainWalk::Gathered(chain) => gathered.extend(chain),
+                        ChainWalk::Refused(reason) => {
+                            refuse(record.ingest_hour_bucket, Vec::new(), reason, key);
+                            continue;
+                        }
+                    }
                 }
                 (gathered, Vec::new())
             }
@@ -1344,17 +1363,18 @@ async fn sweep_superseded_impl(
                     // gone included.
                     //
                     // In a bucket whose version 2 supersession does not
-                    // resolve, a deleting pass does not follow a version 2
-                    // link, and reports the chain as held in a truncated
-                    // bucket. An observing pass does follow it: gathering more
-                    // can only add holds.
+                    // resolve, no pass follows a version 2 link. A walk
+                    // refused for that, or for a chain past the depth bound
+                    // or a revisit, is held in a truncated bucket in every
+                    // pass kind, so the two rule-6 entry points see the same
+                    // holds and the shard's other buckets are still swept.
                     let bucket = record.ingest_hour_bucket;
-                    let links = if deleting && version_2.unresolved.contains(&bucket) {
+                    let links = if version_2.unresolved.contains(&bucket) {
                         Version2Links::Refuse
                     } else {
                         Version2Links::Follow
                     };
-                    let Some(mut gathered) = gather_superseded_chain(
+                    let mut gathered = match gather_superseded_chain(
                         store,
                         tenant,
                         signal,
@@ -1364,23 +1384,12 @@ async fn sweep_superseded_impl(
                         links,
                     )
                     .await?
-                    else {
-                        // A chain this pass will not delete and cannot walk to
-                        // the end: held, and truncated, for rule 6.
-                        refused_request_ids.extend(applied);
-                        if refused_buckets.insert(bucket) {
-                            tracing::warn!(
-                                tenant_hash = %tenant.to_hex(),
-                                signal = signal.key_prefix(),
-                                shard,
-                                ingest_hour_bucket = bucket,
-                                rewrite_key = %key,
-                                "superseded-input sweep: a rewrite chain reaches a version 2 \
-                                 record in a bucket whose version 2 supersession does not \
-                                 resolve; nothing of the chain is reclaimed"
-                            );
+                    {
+                        ChainWalk::Gathered(gathered) => gathered,
+                        ChainWalk::Refused(reason) => {
+                            refuse(bucket, applied, reason, key);
+                            continue;
                         }
-                        continue;
                     };
                     if gathered.is_empty() {
                         gathered.push(SupersededGroup::over_absent_predecessor(
@@ -1435,8 +1444,8 @@ async fn sweep_superseded_impl(
             version_2.count_unattached(&groups, &young_rewrite_buckets, tenant, signal, shard);
     }
     // A refused chain is not deleted, so it is held. Its walk collected no
-    // request a rewrite between the refusing one and the link applied, so its
-    // bucket is reported as truncated.
+    // request a rewrite below the refusing one applied, so its bucket is
+    // reported as truncated.
     outcome.held_request_ids.extend(refused_request_ids);
     outcome
         .held_truncated_buckets
@@ -1746,8 +1755,8 @@ impl AuthoritativeInputs {
 /// A bucket whose supersession does not resolve (a cycle, a chain past the
 /// depth bound, a version 2 record whose inputs differ from the record it
 /// names) fails every resolve over it. It gets no version 2 chain group and no
-/// dominated record, and a deleting pass's rewrite chain walk does not step
-/// past a version 2 record in it ([`Version2Links::Refuse`]), so this pass
+/// dominated record, and no pass's rewrite chain walk steps past a version 2
+/// record in it ([`Version2Links::Refuse`]), so this pass
 /// reclaims nothing on account of its version 2 records. When it is the
 /// compaction selector that failed, [`AuthoritativeInputs`] likewise treats
 /// none of the bucket's inputs as superseded; when only the erasure-dominance
@@ -1996,9 +2005,10 @@ struct SupersededGroup {
     /// generation inside it. A hold on the group is a hold on each of these
     /// requests' `.dreq`s.
     request_ids: BTreeSet<String>,
-    /// The chain walk stopped at a generation whose record was already gone,
-    /// so whatever requests that generation applied are named by no surviving
-    /// record and cannot appear in `request_ids`.
+    /// The chain walk stopped at a generation whose record was already gone
+    /// and was not a compaction record, so whatever requests that generation
+    /// applied are named by no surviving record and cannot appear in
+    /// `request_ids`.
     truncated: bool,
     /// The absent record the chain walk ended at, if it ended at one. A
     /// dominated version 2 record naming it belongs to this group
@@ -2014,8 +2024,7 @@ impl SupersededGroup {
     /// gone: nothing of the chain is left, but a dominated version 2 record
     /// naming the same key may still be.
     ///
-    /// An absent compaction record applied no erasure request, so the group is
-    /// truncated only when the absent key is a rewrite record's. The group
+    /// The group is truncated only when [`absent_link_cuts_chain`] says so. It
     /// survives only when a dominated version 2 record joins it, and a version
     /// 2 record names only a compaction record key.
     fn over_absent_predecessor(ingest_hour_bucket: u32, absent_key: &str) -> Self {
@@ -2026,10 +2035,7 @@ impl SupersededGroup {
             chain_record_keys: Vec::new(),
             objects: Vec::new(),
             request_ids: BTreeSet::new(),
-            truncated: !matches!(
-                keys::partition_bucket_entry(absent_key),
-                Ok(BucketEntry::CompactionRecord(_))
-            ),
+            truncated: absent_link_cuts_chain(absent_key),
             absent_end: Some(absent_key.to_string()),
             identity: absent_key.to_string(),
         }
@@ -2352,8 +2358,8 @@ async fn load_chain_link(store: &dyn ObjectStoreBackend, key: &str) -> Result<Op
 /// it is entered from, which is the bound the catalog puts on the same chains.
 /// The charge follows the catalog's walks exactly (see
 /// [`ChainEntry::charges`]), so a chain is refused here exactly when the
-/// catalog refuses it: a stricter bound would fail the whole shard's pass over
-/// a chain every resolve accepts.
+/// catalog refuses it: a stricter bound would hold, and never reclaim, a chain
+/// every resolve accepts.
 const MAX_CHAIN_DEPTH: usize = 64;
 
 /// Which record a [`gather_superseded_chain`] walk starts from.
@@ -2403,6 +2409,53 @@ enum Version2Links {
     Refuse,
 }
 
+/// What a [`gather_superseded_chain`] walk found.
+enum ChainWalk {
+    /// At most one group: none when the record the walk was entered at is
+    /// absent.
+    Gathered(Vec<SupersededGroup>),
+    /// The walk gathered nothing and the chain is reported held in a truncated
+    /// bucket. Every reason is one the catalog's resolve over the same bucket
+    /// also fails on, so the chain is unservable either way, and refusing it
+    /// keeps the pass reclaiming and observing the shard's other buckets.
+    Refused(ChainRefusal),
+}
+
+/// Why a [`gather_superseded_chain`] walk refused its chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainRefusal {
+    /// A version 2 record under [`Version2Links::Refuse`].
+    Version2Link,
+    /// A chain charging more than [`MAX_CHAIN_DEPTH`] records.
+    TooDeep,
+    /// A chain revisiting a record.
+    Cycle,
+}
+
+impl ChainRefusal {
+    fn reason(self) -> &'static str {
+        match self {
+            ChainRefusal::Version2Link => {
+                "the chain reaches a version 2 record in a bucket whose version 2 supersession \
+                 does not resolve"
+            }
+            ChainRefusal::TooDeep => "the chain is longer than the depth bound",
+            ChainRefusal::Cycle => "the chain revisits a record",
+        }
+    }
+}
+
+/// Whether a chain walk that ends at the absent record `key` is cut: the
+/// requests that generation applied are named by no surviving record. An absent
+/// compaction record applied none, so only another kind of key, or one that
+/// does not parse, cuts the chain.
+fn absent_link_cuts_chain(key: &str) -> bool {
+    !matches!(
+        keys::partition_bucket_entry(key),
+        Ok(BucketEntry::CompactionRecord(_))
+    )
+}
+
 /// Gather the deletion targets for a rewrite record that superseded a whole
 /// prior compaction/rewrite record: the entire supersession chain behind
 /// `predecessor_key`, walked back generation by generation to the raw L0 inputs
@@ -2420,15 +2473,18 @@ enum Version2Links {
 /// clears while the inputs stay resolvable. The whole chain shares one gate, so
 /// a HEAD naming anything in it holds all of it.
 ///
-/// A chain truncated by an absent record yields whatever it reached before the
-/// gap, flagged [`SupersededGroup::truncated`] so a hold on it can be reported
-/// per bucket rather than per request; an absent `predecessor_key` yields no
-/// group at all, and any surviving parts below it are unreferenced under the
-/// live record and collected by rule 3. The absent record's key is kept as
+/// A chain ending at an absent record yields whatever it reached before the
+/// gap. When the absent record is not a compaction record's
+/// ([`absent_link_cuts_chain`]) the group is flagged
+/// [`SupersededGroup::truncated`], so a hold on it can be reported per bucket
+/// rather than per request. An absent `predecessor_key` yields no group at
+/// all, and any surviving parts below it are unreferenced under the live
+/// record and collected by rule 3. The absent record's key is kept as
 /// [`SupersededGroup::absent_end`].
 ///
-/// `Ok(None)` means the walk met a version 2 record under
-/// [`Version2Links::Refuse`] and gathered nothing.
+/// [`ChainWalk::Refused`] means the walk met a version 2 record under
+/// [`Version2Links::Refuse`], a chain past [`MAX_CHAIN_DEPTH`], or a revisited
+/// record, and gathered nothing.
 ///
 /// The group also carries every erasure request the generations it covers
 /// applied. Those requests' `.dreq`s cannot be retired while the group is
@@ -2444,7 +2500,7 @@ enum Version2Links {
 /// [`ChainEntry::Version2`] no raw L0 input joins the group at all. The walk is
 /// bounded by [`MAX_CHAIN_DEPTH`], charged as the catalog charges the same
 /// chain ([`ChainEntry::charges`]), and checked for a revisit, so a cycle or an
-/// over-deep chain is an error, never a guess.
+/// over-deep chain is refused, never a guess.
 async fn gather_superseded_chain(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
@@ -2453,7 +2509,7 @@ async fn gather_superseded_chain(
     predecessor_key: &str,
     entry: ChainEntry,
     links: Version2Links,
-) -> Result<Option<Vec<SupersededGroup>>> {
+) -> Result<ChainWalk> {
     let mut chain_record_keys: Vec<String> = Vec::new();
     let mut chain_part_keys: Vec<String> = Vec::new();
     let mut input_record_keys: Vec<String> = Vec::new();
@@ -2474,9 +2530,7 @@ async fn gather_superseded_chain(
 
     while let Some(key) = cursor {
         if !seen.insert(key.clone()) {
-            return Err(MaintainError::Invariant(format!(
-                "supersession chain from {predecessor_key} revisits {key}"
-            )));
+            return Ok(ChainWalk::Refused(ChainRefusal::Cycle));
         }
         let Some(link) = load_chain_link(store, &key).await? else {
             match version_2_above.take() {
@@ -2492,20 +2546,17 @@ async fn gather_superseded_chain(
                         }
                     }
                 }
-                None => truncated = true,
+                None => truncated = absent_link_cuts_chain(&key),
             }
             absent_end = Some(key);
             break;
         };
         if links == Version2Links::Refuse && link.is_version_2_compaction() {
-            return Ok(None);
+            return Ok(ChainWalk::Refused(ChainRefusal::Version2Link));
         }
         if entry.charges(&link) {
             if depth >= MAX_CHAIN_DEPTH {
-                return Err(MaintainError::Invariant(format!(
-                    "supersession chain from {predecessor_key} is longer than {MAX_CHAIN_DEPTH} \
-                     records"
-                )));
+                return Ok(ChainWalk::Refused(ChainRefusal::TooDeep));
             }
             depth += 1;
         }
@@ -2558,7 +2609,7 @@ async fn gather_superseded_chain(
     }
 
     let Some(ingest_hour_bucket) = ingest_hour_bucket else {
-        return Ok(Some(Vec::new()));
+        return Ok(ChainWalk::Gathered(Vec::new()));
     };
     // Oldest generation first: a record is deleted only after every object the
     // generations below it superseded, and after the generation it superseded.
@@ -2570,7 +2621,7 @@ async fn gather_superseded_chain(
         .first()
         .cloned()
         .unwrap_or_else(|| predecessor_key.to_string());
-    Ok(Some(vec![SupersededGroup {
+    Ok(ChainWalk::Gathered(vec![SupersededGroup {
         ingest_hour_bucket,
         record_keys: input_record_keys,
         data_keys: input_data_keys,
@@ -6264,13 +6315,23 @@ mod tests {
         assert_eq!(count, 3);
     }
 
-    fn assert_refused_as_too_deep(result: Result<Option<Vec<SupersededGroup>>>, case: &str) {
+    fn assert_refused_as_too_deep(result: Result<ChainWalk>, case: &str) {
         match result {
-            Err(MaintainError::Invariant(msg)) => {
-                assert!(msg.contains("longer than 64 records"), "{case}: {msg}")
+            Ok(ChainWalk::Refused(reason)) => {
+                assert_eq!(reason, ChainRefusal::TooDeep, "{case}")
             }
-            Err(other) => panic!("{case}: expected the depth refusal, got {other:?}"),
-            Ok(_) => panic!("{case}: expected the depth refusal, the walk was accepted"),
+            Ok(ChainWalk::Gathered(_)) => {
+                panic!("{case}: expected the depth refusal, the walk was accepted")
+            }
+            Err(error) => panic!("{case}: expected the depth refusal, got {error:?}"),
+        }
+    }
+
+    fn followed(result: Result<ChainWalk>, case: &str) -> Vec<SupersededGroup> {
+        match result {
+            Ok(ChainWalk::Gathered(groups)) => groups,
+            Ok(ChainWalk::Refused(reason)) => panic!("{case}: refused as {reason:?}"),
+            Err(error) => panic!("{case}: {error:?}"),
         }
     }
 
@@ -6327,7 +6388,7 @@ mod tests {
                 )
                 .await;
                 if accepted {
-                    let groups = walked.expect(&case).expect("followed");
+                    let groups = followed(walked, &case);
                     assert_eq!(groups.len(), 1, "{case}");
                     let expected = rewrites - 1 + compactions.len();
                     assert_eq!(groups[0].chain_record_keys.len(), expected, "{case}");
@@ -6365,7 +6426,7 @@ mod tests {
                 )
                 .await;
                 if accepted {
-                    let groups = walked.expect(&case).expect("followed");
+                    let groups = followed(walked, &case);
                     assert_eq!(groups.len(), 1, "{case}");
                     assert_eq!(
                         groups[0].chain_record_keys.len(),
@@ -6413,7 +6474,7 @@ mod tests {
             )
             .await;
             if accepted {
-                let groups = walked.expect(&case).expect("followed");
+                let groups = followed(walked, &case);
                 assert_eq!(groups.len(), 1, "{case}");
                 assert_eq!(groups[0].chain_record_keys.len(), rewrites + 1, "{case}");
             } else {
