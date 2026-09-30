@@ -181,9 +181,12 @@ path):
 5. immediately before record publish (`rewrite.rs:138`).
 
 At each checkpoint the guard renews if a third of the lease has elapsed,
-and cancels the run if renewal fails or the claim was observed stolen.
-Cancellation returns the existing `PublishOutcome::Abandoned` shape and
-inherits its safety argument verbatim (`publish.rs:31-45`): parts are
+and cancels the run if renewal fails or the claim was observed stolen. A
+renewal that fails with a store error other than a lost race, leaving the
+claim in place under this process, is reclaimed by the same process at its
+next attempt without waiting for the lease to expire; see the 2026-09-30
+amendment. Cancellation returns the existing `PublishOutcome::Abandoned`
+shape and inherits its safety argument verbatim (`publish.rs:31-45`): parts are
 content-addressed and deterministic over the frozen input set, a later
 run republishes byte-identical keys, and orphaned parts age out under
 sweep rule 3. No new durable mid-run state exists.
@@ -459,7 +462,8 @@ attempt". It now precedes only the contended ones. `ClaimGuard::acquire`
 `CreateIfAbsent` with no wait, and waits out the jitter, through the
 participant's `ClaimSleeper`, once before each of the two writes that can
 follow a refused create: the steal of an expired claim, and the second
-`CreateIfAbsent` after a claim vanished between the refusal and its read.
+`CreateIfAbsent` after a claim vanished between the refusal and its read
+(the same-process reclaim of the 2026-09-30 amendment pays none).
 
 The reason is cost with nothing bought. The first `CreateIfAbsent` resolves
 the race on its own, so a wait before it decorrelates nobody; jitter only
@@ -515,7 +519,11 @@ Three further facts about the landed implementation:
    too-short lease that rule was after. `contend` does not tell this
    process's own expired claim from another's, so after a renewal store
    error the process skips its own bucket until the lease expires and then
-   steals it back; that is reported on #1029 rather than changed here.
+   steals it back; that is reported on #1029 rather than changed here. The
+   2026-09-30 amendment closes this: a renewal failure that leaves the
+   claim in place is now reclaimed by the same process immediately,
+   without waiting out the lease, while another process's claim still
+   waits the full lease as before.
 3. **A held bucket is still retention-evaluated.** The supervisor's claim
    hold (`MaintainMemo::claim_deferred`) skips only the held bucket's
    compaction call. Retention and zone classification run for it as for any
@@ -530,3 +538,61 @@ Three further facts about the landed implementation:
    issued while the hold lasts. `a_held_bucket_still_reaches_the_zone_split`
    (`crates/ravel-maintain/tests/compaction_claims.rs`) pins the zone split,
    zero coordinate requests and zero compactions for a held bucket.
+
+## Amendment (2026-09-30): reclaim a same-process leftover claim without waiting out the lease (issue #2156)
+
+<!-- amendment-applies: sections="3. Cancellation checkpoints in the merge pipeline|Amendment (2026-09-28): jitter on the contended path only" pointer="2026-09-30 amendment" -->
+
+The 2026-09-28 amendment (fact 2 of "jitter on the contended path only")
+named a gap: `contend` does not tell this process's own expired claim from
+another's, so after a renewal store error (`MaintainError::ClaimRenewFailed`)
+the process skipped its own bucket every pass until the lease expired, then
+stole it back, and the metrics counted that as a steal rather than as the
+bucket having stayed held throughout.
+
+`ClaimGuard::contend` (`crates/ravel-maintain/src/claim_guard.rs`) now checks
+the observed claim's holder process id before the expiry check. When it
+equals the guard's own `owner.process_id`, the guard calls a new `reclaim`
+primitive (`crates/ravel-fleet/src/claim.rs`) instead of waiting: `reclaim`
+refuses locally, with no store request, unless the observed holder's
+process id matches the caller's, and otherwise CAS-writes a fresh claim (new
+attempt id, fresh lease) under the observed version, exactly as `steal`
+does, but without requiring the claim to be expired and never by DELETE. A
+same-process reclaim is reported as an acquisition (`claims_acquired`), not
+a steal, since there was never another contender; a lost CAS race, or a
+claim deleted before the CAS (`NotFound`), still counts as
+`ClaimSkipReason::StealLost`; a different process's claim is unaffected and
+still waits out the full lease as before. No jitter is paid, since there is
+no contention with another process to decorrelate from.
+
+The renewal store error is the case that motivated this, but a matching
+process id covers every claim this process left behind: one from a run that
+failed with any other error after taking it, and this process's own
+completed claim from an earlier run. Process ids are fresh per process
+start and per CLI invocation, so none of these is another process's claim.
+A concurrent sibling run of the same bucket in one process, which the
+supervisor and the CLI walk do not produce, would cancel at its next
+renewal if that fell before it published, and otherwise duplicate the
+merge; claims are advisory, so that is a cost, not a correctness problem.
+
+`crates/ravel-sim/src/driver.rs`'s `is_recoverable_maintain_error` now
+classifies `MaintainError::ClaimRenewFailed` carrying a retryable store
+error the same way as a retryable `MaintainError::Store`. The simulator
+installs no claim participant today, so this arm cannot fire there yet; a
+unit case pins the classification.
+
+Tests: in `crates/ravel-fleet/src/claim.rs`,
+`reclaim_succeeds_on_own_unexpired_claim`,
+`reclaim_refuses_locally_for_different_process` and
+`reclaim_cas_race_returns_lost` pin the primitive. In
+`crates/ravel-maintain/src/claim_guard.rs`,
+`renewal_store_error_is_claim_renew_failed_not_lost` pins that a renewal
+failing with a transient store error returns `ClaimRenewFailed` while
+leaving the claim held;
+`same_process_reclaims_leftover_claim_before_lease_expiry`,
+`different_process_still_skips_held_by_another_after_renew_failure` and
+`same_process_race_reclaim_cancels_the_original_guard` pin the guard
+branch. `services/ravel-server/src/maintain.rs`'s extended
+`claim_renewal_store_error_counts_as_a_renew_failure_not_a_loss` pins the
+supervisor's next tick compacting the bucket, with `claims_acquired` rising
+by one and `claims_skipped`/`claims_stolen` staying at zero.

@@ -415,6 +415,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   budget is not applicable in gateway mode. `all`, `query` and `maintain` keep
   the check and its message unchanged.
 
+- **A compaction claim left in place by a failed renewal is reclaimed by
+  the same process at once, instead of waiting out the full lease**
+  (ADR-1029, 2026-09-30 amendment; issue #2156). When
+  `ClaimGuard::checkpoint` renewal fails with a store error other than a
+  lost race, the claim stays written under that process and `contend`
+  previously could not tell it from a claim held by another process, so
+  the process skipped its own bucket every pass until the lease expired
+  and then stole its own claim back, which the metrics reported as a
+  steal. `ClaimGuard::contend` now checks the observed claim's holder
+  process id first and, when it is its own, takes the claim back at once
+  with a compare-and-swap on the observed version; a claim held by any
+  other process still waits out its lease. `claims_acquired` rises, not
+  `claims_stolen` or `claims_skipped`. The same applies to any claim this
+  process left behind, whatever ended the earlier run.
+
 - **One refused delete no longer stops the superseded-input sweep for every
   chain** (issue #1846). Rule 2 deletes every cleared chain's input commit
   records, then their data objects, then the chains' own records, and a

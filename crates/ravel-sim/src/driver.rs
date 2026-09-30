@@ -143,14 +143,21 @@ impl ObjectStoreBackend for SharedStore {
 /// answer -- but the only `NotFound` this harness injects on the compaction
 /// read path is a one-shot eventual-consistency blip (`ScriptedFault::NotFoundBlip`,
 /// `Occurrence::Nth(1)`), and re-running the stateless, idempotent
-/// `compact_bucket` reads the object that is really there. Every other
-/// `MaintainError` (an invariant breach, a decode failure, a conservation
-/// violation) is surfaced immediately as a typed error, never retried.
+/// `compact_bucket` reads the object that is really there. `ClaimRenewFailed`
+/// carries the same retryable-store-fault shape as `Store` (ADR-1029, 2026-09-30
+/// amendment; issue #2156) and is classified the same way. The simulator
+/// installs no claim participant today, so no run here takes a claim and this
+/// arm cannot fire; it keeps the classification right if one ever does. Every
+/// other `MaintainError` (an
+/// invariant breach, a decode failure, a conservation violation) is surfaced
+/// immediately as a typed error, never retried.
 fn is_recoverable_maintain_error(e: &MaintainError) -> bool {
-    matches!(
-        e,
-        MaintainError::Store(se) if se.is_retryable() || matches!(se, StoreError::NotFound)
-    )
+    let retryable = |se: &StoreError| se.is_retryable() || matches!(se, StoreError::NotFound);
+    match e {
+        MaintainError::Store(se) => retryable(se),
+        MaintainError::ClaimRenewFailed { source, .. } => retryable(source),
+        _ => false,
+    }
 }
 
 /// Knobs for [`run_cycle`]. `shard_count` applies uniformly to both
@@ -1826,6 +1833,19 @@ mod tests {
         assert!(is_recoverable_maintain_error(&MaintainError::Store(
             StoreError::NotFound
         )));
+        // A renewal store fault is classified like the same fault under `Store`.
+        assert!(is_recoverable_maintain_error(
+            &MaintainError::ClaimRenewFailed {
+                at: "merge_loop",
+                source: StoreError::Timeout,
+            }
+        ));
+        assert!(!is_recoverable_maintain_error(
+            &MaintainError::ClaimRenewFailed {
+                at: "merge_loop",
+                source: StoreError::PreconditionFailed,
+            }
+        ));
         // Not recoverable: a genuine precondition failure or an invariant breach.
         assert!(!is_recoverable_maintain_error(&MaintainError::Store(
             StoreError::PreconditionFailed
