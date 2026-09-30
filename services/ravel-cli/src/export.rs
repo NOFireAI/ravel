@@ -74,7 +74,7 @@
 //! The query path serves one sample per `(series, ts)`, chosen by
 //! [`ravel_query::serves_over`]; the export orders its candidates with
 //! [`ravel_query::DedupKey::serve_cmp`], the comparison that function is built
-//! on, so it cannot pick a different one. The export writes exactly that sample and
+//! on, so it compares candidates with the same function. The export writes exactly that sample and
 //! counts every other candidate as `samples_deduplicated`, so two loads of one
 //! sample export as one row whatever their bit patterns.
 //!
@@ -931,31 +931,55 @@ enum Refusal {
 /// not depend on the order the series were visited in.
 #[derive(Default)]
 struct SeriesRefusals {
-    /// Per kind, each offending series' output sort key and its message.
-    by_kind: BTreeMap<Refusal, Vec<(SeriesSortKey, String)>>,
+    by_kind: BTreeMap<Refusal, KindOffenders>,
+}
+
+/// The series one refusal kind covers: how many, and the first in the output
+/// file's series order with its message.
+struct KindOffenders {
+    count: usize,
+    first_key: SeriesSortKey,
+    first_message: String,
 }
 
 impl SeriesRefusals {
     /// Records one series under `kind`; a caller adds a series at most once
     /// per kind.
     fn add(&mut self, kind: Refusal, sort_key: &[(String, String)], message: String) {
-        self.by_kind
-            .entry(kind)
-            .or_default()
-            .push((sort_key.to_vec(), message));
+        match self.by_kind.get_mut(&kind) {
+            Some(offenders) => {
+                offenders.count += 1;
+                if sort_key < offenders.first_key.as_slice() {
+                    offenders.first_key = sort_key.to_vec();
+                    offenders.first_message = message;
+                }
+            }
+            None => {
+                self.by_kind.insert(
+                    kind,
+                    KindOffenders {
+                        count: 1,
+                        first_key: sort_key.to_vec(),
+                        first_message: message,
+                    },
+                );
+            }
+        }
     }
 
     /// Refuses on the first kind any series hit, naming the first offender in
-    /// the output file's series order and how many series that kind covers.
+    /// the output file's series order and how many series that kind covers;
+    /// series refused only for a later kind are not counted.
     fn into_result(self) -> anyhow::Result<()> {
-        let Some((_, offenders)) = self.by_kind.into_iter().next() else {
-            return Ok(());
-        };
-        let count = offenders.len();
-        match offenders.into_iter().min_by(|a, b| a.0.cmp(&b.0)) {
-            Some((_, message)) => {
-                anyhow::bail!("export --signal metrics refused on {count} series; first: {message}")
-            }
+        match self.by_kind.into_values().next() {
+            Some(KindOffenders {
+                count,
+                first_message,
+                ..
+            }) => anyhow::bail!(
+                "export --signal metrics refused on {count} series for this reason; first: \
+                 {first_message}"
+            ),
             None => Ok(()),
         }
     }

@@ -928,7 +928,7 @@ column = "host_col"
     .await;
     assert_eq!(
         err,
-        "export --signal metrics refused on 1 series; first: series cpu{host=\"h1\", \
+        "export --signal metrics refused on 1 series for this reason; first: series cpu{host=\"h1\", \
          job=\"api\"} cannot be exported under this mapping: no \
          name_column value loads back as \"cpu\" with unit = \"s\" and kind = \"gauge\" (written \
          as \"cpu\", a load names it \"cpu_seconds\"), so the exported file would re-load onto a \
@@ -958,7 +958,7 @@ column = "job_col"
     .await;
     assert_eq!(
         err,
-        "export --signal metrics refused on 1 series; first: series cpu{host=\"h1\", \
+        "export --signal metrics refused on 1 series for this reason; first: series cpu{host=\"h1\", \
          job=\"api\"} carries the label \"host\", which no [[metrics.label]] in the mapping \
          names; a load of the exported file would drop it and land the samples on a different \
          series. Add a [[metrics.label]] for it."
@@ -1004,7 +1004,7 @@ column = "job_col"
             .expect_err("the export is refused");
         assert_eq!(
             err.to_string(),
-            "export --signal metrics refused on 2 series; first: series \
+            "export --signal metrics refused on 2 series for this reason; first: series \
              cpu_seconds{host_name=\"h1\", job=\"api\"} carries the label \"host_name\", which no [[metrics.label]] in the mapping \
              names; a load of the exported file would drop it and land the samples on a \
              different series. Add a [[metrics.label]] for it.",
@@ -1040,12 +1040,79 @@ column = "host_col"
     assert_eq!(
         err,
         format!(
-            "export --signal metrics refused on 1 series; first: a sample of series \
+            "export --signal metrics refused on 1 series for this reason; first: a sample of series \
              cpu{{host=\"h1\", job=\"api\"}} is at {} ns, which is not a whole number of millis (the mapping's ts_unit); writing it in millis would move it onto a \
              different timestamp. Export with a finer ts_unit.",
             T0 + 1
         )
     );
+}
+
+/// Series refused for different reasons are refused once, on the kind that
+/// comes first in the fixed order, however many series a later kind covers
+/// and wherever its series sort. `mem` carries a label the mapping does not
+/// name; `cpu` and `cpu2`, which sort before it, have a sample finer than
+/// `ts_unit`.
+#[tokio::test]
+async fn several_refusal_kinds_refuse_on_the_first_kind_with_its_own_count() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let plain = metrics_mapping(
+        r#"
+[metrics]
+name_column = "name"
+value_column = "value"
+ts_column = "ts"
+ts_unit = "nanos"
+
+[[metrics.label]]
+name = "job"
+column = "job_col"
+
+[[metrics.label]]
+name = "host"
+column = "host_col"
+"#,
+    );
+    load_rows(
+        &store,
+        dir.path(),
+        "alpha",
+        &plain,
+        &[
+            ("cpu", T0 + 1, 1.0, "api", ""),
+            ("cpu2", T0 + 1, 2.0, "api", ""),
+            ("mem", T0, 3.0, "api", "h1"),
+        ],
+        LOAD_NS,
+        Arc::new(FixedClock(LOAD_NS)),
+    )
+    .await;
+    let job_only_millis = metrics_mapping(
+        r#"
+[metrics]
+name_column = "name"
+value_column = "value"
+ts_column = "ts"
+ts_unit = "millis"
+
+[[metrics.label]]
+name = "job"
+column = "job_col"
+"#,
+    );
+    let out = dir.path().join("out.parquet");
+    let err = export_window(&store, "alpha", T0, T2, &job_only_millis, &out, LOAD_NS)
+        .await
+        .expect_err("the export is refused");
+    assert_eq!(
+        err.to_string(),
+        "export --signal metrics refused on 1 series for this reason; first: series \
+         mem{host=\"h1\", job=\"api\"} carries the label \"host\", which no [[metrics.label]] \
+         in the mapping names; a load of the exported file would drop it and land the samples \
+         on a different series. Add a [[metrics.label]] for it."
+    );
+    assert!(!out.exists(), "a refused export writes no file");
 }
 
 /// Under `ts_unit = "millis"` the export writes each timestamp in
