@@ -199,7 +199,15 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(profiles = ?names, "Parquet table credential profiles loaded");
     }
 
-    let tenant_tokens = cli.parse_tenant_tokens()?;
+    // Parsed once here (issue #2238): every consumer below that only needs the
+    // bare tenant set (fold-tenant discovery, federation-mapping validation,
+    // shard_count validation) derives it from this same result via
+    // `tenant_tokens_from_principals`, rather than re-reading
+    // `--tenant-token-file` a second time for the resolver below. A file
+    // rotated on disk between two separate parses would otherwise let the
+    // resolver serve a tenant the checks above never validated.
+    let tenant_principals = cli.parse_tenant_principals()?;
+    let tenant_tokens = ravel_server::config::tenant_tokens_from_principals(&tenant_principals);
     // Fold and maintenance derive their tenant set from storage each cycle
     // (ADR-0048 decision 3), not from these flags. This is now
     // only an optional restriction: the union of the statically mapped bearer
@@ -269,8 +277,8 @@ async fn main() -> anyhow::Result<()> {
     // Federation TLS is on by default (ADR-0071 amendment), so a remote with
     // `tls` off is a deliberate operator choice; log it by name once here,
     // where the resolved remote-cluster config first exists. Parsed before
-    // `build_auth_resolver` consumes `tenant_tokens` and `auth`, so the
-    // tenant-mapping check can read every resolver input.
+    // `build_auth_resolver_with_principals` consumes `tenant_principals` and
+    // `auth`, so the tenant-mapping check can read every resolver input.
     let remote_clusters = cli
         .parse_remote_clusters()
         .context("failed to resolve --remote-cluster settings")?;
@@ -305,7 +313,6 @@ async fn main() -> anyhow::Result<()> {
     )?;
     ravel_server::warn_plaintext_federation(&remote_clusters);
 
-    let tenant_principals = cli.parse_tenant_principals()?;
     let resolver_bundle = ravel_server::tenant::build_auth_resolver_with_principals(
         tenant_principals,
         cli.dev_insecure_tenant_header,

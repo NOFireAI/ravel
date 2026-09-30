@@ -4281,6 +4281,24 @@ fn split_tenant_suffix(raw: &str) -> Result<(&str, bool), ()> {
     }
 }
 
+/// Derives the bare `TenantId` map [`Cli::parse_tenant_tokens`] returns from an
+/// already-parsed principals map. A caller that needs both views (the tenant
+/// set for fold discovery and federation-mapping validation, and the full
+/// [`Principal`] for resolver construction) must call
+/// [`Cli::parse_tenant_principals`] once and derive the tenant map from that
+/// result with this function, rather than parsing the token file a second
+/// time: a `--tenant-token-file` rotated between two parses would otherwise
+/// let the resolver serve a tenant the fold/federation checks never saw
+/// (issue #2238).
+pub fn tenant_tokens_from_principals(
+    principals: &HashMap<String, Principal>,
+) -> HashMap<String, TenantId> {
+    principals
+        .iter()
+        .map(|(token, principal)| (token.clone(), principal.tenant.clone()))
+        .collect()
+}
+
 impl Cli {
     /// Parses `args` as [`Parser::parse_from`] does, and then refuses the
     /// flags the parsed `--mode` never reads (ADR-1693): `--disable-fold` and
@@ -4367,11 +4385,7 @@ impl Cli {
     }
 
     pub fn parse_tenant_tokens(&self) -> anyhow::Result<HashMap<String, TenantId>> {
-        Ok(self
-            .parse_tenant_pairs()?
-            .into_iter()
-            .map(|(token, principal)| (token, principal.tenant))
-            .collect())
+        Ok(tenant_tokens_from_principals(&self.parse_tenant_pairs()?))
     }
 
     /// Same `TOKEN=TENANT` pairs as [`Self::parse_tenant_tokens`], but keeping
@@ -14350,6 +14364,49 @@ mod tests {
             .parse_tenant_tokens()
             .expect("ddl-suffixed tenant token parses");
         assert_eq!(tokens.get("dev"), Some(&TenantId::new("acme")));
+    }
+
+    /// `tenant_tokens_from_principals` derived from one `parse_tenant_principals`
+    /// call must equal `parse_tenant_tokens`'s own (independently parsed) map,
+    /// for both a plain tenant and a `;ddl`-suffixed one: the two views are
+    /// two projections of the same parse, not two independent parses that
+    /// happen to agree today. This is what issue #2238 fix 1 relies on: a
+    /// caller parses the token file once via `parse_tenant_principals` and
+    /// derives the bare tenant map from that single result instead of calling
+    /// `parse_tenant_tokens` a second time. A wrong implementation that
+    /// re-reads the token source for each view (rather than deriving one from
+    /// the other) still passes this on a stable file, since nothing here
+    /// mutates the file mid-test; it exists to pin the derivation itself, and
+    /// the class of bug it guards against (a file rotated between two
+    /// separate parses) is exercised at the startup level in `main.rs`, not
+    /// unit-testable here without a real filesystem race.
+    #[test]
+    fn tenant_tokens_from_principals_matches_parse_tenant_tokens() {
+        for args in [
+            vec!["--tenant-token", "dev=acme"],
+            vec!["--tenant-token", "dev=acme;ddl"],
+            vec!["--tenant-token", "dev=acme;ddl", "--tenant-token", "ops=beta"],
+        ] {
+            let c = cli(&args);
+            let principals = c
+                .parse_tenant_principals()
+                .expect("tenant token parses for tenant_tokens_from_principals derivation");
+            let derived = tenant_tokens_from_principals(&principals);
+            let independent = c
+                .parse_tenant_tokens()
+                .expect("tenant token parses via parse_tenant_tokens");
+            assert_eq!(
+                derived, independent,
+                "derived tenant map must equal parse_tenant_tokens's own map for {args:?}"
+            );
+            for (token, principal) in &principals {
+                assert_eq!(
+                    derived.get(token),
+                    Some(&principal.tenant),
+                    "derived map must carry each principal's tenant for {args:?}"
+                );
+            }
+        }
     }
 
     /// Every suffix other than exactly `;ddl`, and an empty tenant before the
