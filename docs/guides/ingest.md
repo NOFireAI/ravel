@@ -1211,17 +1211,30 @@ Run with the same mapping a load of that data used, it produces a file
 ravel-cli load --parquet acme-day.parquet --tenant acme-copy --mapping map.toml
 ```
 
-**Logs and metrics.** `--signal` has no default and accepts `logs` and
-`metrics`. The `--mapping` file must carry the section that signal names, under
-the same section rules `load` applies. `--signal metrics` has its own rules for
-duplicates, names and what round-trips, in [Metrics export](#metrics-export)
-below. The window, memory, listing-window, sort-order and deletion subsections
-and the `--shards` and `--parquet` notes apply to both signals; "What
+**Logs, metrics and spans.** `--signal` has no default and accepts `logs`,
+`metrics` and `spans`. The `--mapping` file must carry the section that signal
+names, under the same section rules `load` applies. `--signal metrics` has its
+own rules for duplicates, names and what round-trips, in
+[Metrics export](#metrics-export) below. The window, memory, listing-window,
+deletion subsections and the `--shards` and `--parquet` notes apply to every
+signal, and the sort-order subsection to logs and metrics; "What
 round-trips and what does not" is about logs, except where a bullet says
-otherwise. `--signal spans` is refused by
-name: bulk import for spans has landed (`load --signal spans` above), and the
-refusal says the export half of that round trip is the remaining work and that
-only `--signal logs` and `--signal metrics` are supported.
+otherwise.
+
+`--signal spans` exports every stored span whose start time falls in the
+window, one row per span with no deduplication, sorted by start time, then
+trace id, then span id. Every `[spans]` field is written: the trace, span and
+parent ids (a null parent is a root span), the name, `start_ts` and `end_ts`
+each in its own declared unit, and the status code and message. Each mapped
+attribute is written in its declared type. Spans store attributes as strings,
+so an attribute is written as the typed value that a load turns back into the
+same string. The export refuses the whole window by name, and writes nothing,
+when a span would not re-load as the same span: a start or end finer than its
+declared unit, a start a load would re-time or refuse, or a mapped attribute
+whose stored string its declared type cannot reproduce (`"007"` declared
+`i64`). Refusals are counted per kind and name the first offending span in
+output order. A `[spans]` mapping has no `attrs_map_column`, so a stored
+attribute the mapping does not name is not written.
 
 ### What the window means
 

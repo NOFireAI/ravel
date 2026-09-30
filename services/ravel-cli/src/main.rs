@@ -651,7 +651,7 @@ enum Command {
         #[arg(long, value_name = "DURATION", value_parser = ravel_cli::parse_max_flush_delay)]
         max_flush_delay: Option<Duration>,
     },
-    /// Bulk-export a tenant's stored logs or metrics to a Parquet file (ADR-1751).
+    /// Bulk-export a tenant's stored logs, metrics or spans to a Parquet file (ADR-1751).
     ///
     /// The inverse of `load`: it resolves the catalog once, reads the
     /// objects that snapshot names, and writes the columns the same
@@ -668,15 +668,15 @@ enum Command {
     /// memory before the first row is written, so export a wide range in
     /// several narrower windows.
     ///
-    /// `--signal logs` and `--signal metrics` work today. Spans are refused by
-    /// name until their export lands (ADR-1751 follow-up task 3). A metrics
-    /// mapping the export cannot invert, such as `[metrics.histogram]`, is
-    /// refused rather than written as a file that loads onto other series.
+    /// `--signal logs`, `--signal metrics` and `--signal spans` are supported.
+    /// A metrics mapping the export cannot invert, such as `[metrics.histogram]`,
+    /// is refused rather than written as a file that loads onto other series,
+    /// and a span a load would not read back as the same span is refused by
+    /// name.
     Export {
-        /// Signal to export: `logs` or `metrics`; `spans` is refused with the
-        /// follow-up it waits on. No default: a command that chooses for you
-        /// which data it touches is a silent wrong answer on a tenant that
-        /// holds more than one signal.
+        /// Signal to export: `logs`, `metrics` or `spans`. No default: a
+        /// command that chooses for you which data it touches is a silent
+        /// wrong answer on a tenant that holds more than one signal.
         #[arg(long, value_enum)]
         signal: SignalArg,
         /// Source tenant id (hashed under the bucket's pinned scheme).
@@ -703,8 +703,8 @@ enum Command {
         parquet: std::path::PathBuf,
         /// Path to the `--mapping` TOML naming the output columns. The same
         /// file a `load` of this data used produces a file that load reads
-        /// back, or, for metrics, refuses by name a series no file under it
-        /// re-loads onto the same series.
+        /// back, or, for metrics and spans, refuses by name a series or span no
+        /// file under it re-loads as the same one.
         #[arg(long, value_name = "TOML")]
         mapping: std::path::PathBuf,
         /// Configured shard count, used to resolve the catalog. The tenant's
