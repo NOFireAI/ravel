@@ -3623,3 +3623,172 @@ async fn delete_marker_replication_needs_a_replication_expectation() {
         "?replication must not be fetched"
     );
 }
+
+// --- Dev launcher bucket configuration ---
+
+/// How a launcher sends its bucket configuration: S3's own XML over curl, or
+/// the AWS CLI's JSON and shorthand arguments.
+#[derive(Debug, Clone, Copy)]
+enum LauncherForm {
+    Xml,
+    AwsCli,
+}
+
+/// Every dev launcher that creates a bucket a `--require-bucket-protection`
+/// server can meet, relative to the repository root. The first is the
+/// reference the others' rule sets are compared with.
+const LAUNCHERS: [(&str, LauncherForm); 4] = [
+    ("deploy/k8s/floci.yaml", LauncherForm::Xml),
+    ("deploy/k8s/rustfs.yaml", LauncherForm::AwsCli),
+    ("deploy/docker-compose/ravel.yml", LauncherForm::AwsCli),
+    ("deploy/docker-compose/rustfs.yml", LauncherForm::AwsCli),
+];
+
+/// The conditions `ravel-server`'s startup check evaluates in-process.
+const SERVER_CHECKED: [ProtectionConditionId; 7] = [
+    ProtectionConditionId::Versioning,
+    ProtectionConditionId::NoncurrentExpiration,
+    ProtectionConditionId::ExpiredDeleteMarker,
+    ProtectionConditionId::AbortMultipart,
+    ProtectionConditionId::RuleScope,
+    ProtectionConditionId::NoForeignRule,
+    ProtectionConditionId::ObjectLock,
+];
+
+fn launcher_text(path: &str) -> String {
+    let full = format!("{}/../../{path}", env!("CARGO_MANIFEST_DIR"));
+    std::fs::read_to_string(&full).unwrap_or_else(|err| panic!("read {full}: {err}"))
+}
+
+/// The one single-quoted `<name>='...'` shell assignment in `text`.
+fn launcher_assignment<'a>(path: &str, text: &'a str, name: &str) -> &'a str {
+    let open = format!("{name}='");
+    let starts: Vec<usize> = text
+        .match_indices(open.as_str())
+        .map(|(at, _)| at + open.len())
+        .collect();
+    assert_eq!(starts.len(), 1, "{path}: expected exactly one {open}...'");
+    let rest = &text[starts[0]..];
+    let end = rest
+        .find('\'')
+        .unwrap_or_else(|| panic!("{path}: {open} is never closed"));
+    &rest[..end]
+}
+
+/// The request body the AWS CLI sends for a `put-bucket-lifecycle-configuration
+/// --lifecycle-configuration` JSON argument: each member becomes an element of
+/// the same name, and the flattened `Rules` list becomes repeated `<Rule>`.
+fn aws_cli_lifecycle_xml(json: &str) -> String {
+    fn element(out: &mut String, name: &str, value: &serde_json::Value) {
+        match value {
+            serde_json::Value::Object(members) => {
+                out.push_str(&format!("<{name}>"));
+                for (key, member) in members {
+                    element(out, key, member);
+                }
+                out.push_str(&format!("</{name}>"));
+            }
+            serde_json::Value::Array(items) => {
+                assert_eq!(name, "Rules", "no other lifecycle list is modelled");
+                for item in items {
+                    element(out, "Rule", item);
+                }
+            }
+            serde_json::Value::String(text) => {
+                assert!(!text.contains(['<', '&']), "text needing escapes: {text:?}");
+                out.push_str(&format!("<{name}>{text}</{name}>"));
+            }
+            serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+                out.push_str(&format!("<{name}>{value}</{name}>"));
+            }
+            serde_json::Value::Null => panic!("null member {name}"),
+        }
+    }
+    let root: serde_json::Value = serde_json::from_str(json).expect("lifecycle JSON parses");
+    let serde_json::Value::Object(members) = &root else {
+        panic!("lifecycle JSON is not an object: {json}");
+    };
+    let mut out =
+        String::from("<LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+    for (key, member) in members {
+        element(&mut out, key, member);
+    }
+    out.push_str("</LifecycleConfiguration>");
+    out
+}
+
+/// The versioning and lifecycle configuration `path` sends, and whether it
+/// creates the bucket with Object Lock enabled.
+fn launcher_bucket_config(
+    path: &str,
+    form: LauncherForm,
+) -> (VersioningConfig, LifecycleConfig, bool) {
+    let text = launcher_text(path);
+    let lifecycle = launcher_assignment(path, &text, "LIFECYCLE");
+    let (versioning, lifecycle_xml, lock_flag) = match form {
+        LauncherForm::Xml => (
+            parse_versioning(launcher_assignment(path, &text, "VERSIONING").as_bytes())
+                .expect("versioning XML parses"),
+            lifecycle.to_string(),
+            "-H 'x-amz-bucket-object-lock-enabled: true'",
+        ),
+        LauncherForm::AwsCli => {
+            assert!(
+                text.contains("put-bucket-versioning")
+                    && text.contains("--versioning-configuration Status=Enabled"),
+                "{path}: versioning is not enabled"
+            );
+            (
+                VersioningConfig {
+                    status: Some("Enabled".to_string()),
+                    unrecognized: Vec::new(),
+                },
+                aws_cli_lifecycle_xml(lifecycle),
+                "create-bucket --bucket",
+            )
+        }
+    };
+    let locked = match form {
+        LauncherForm::Xml => text.contains(lock_flag),
+        LauncherForm::AwsCli => text
+            .lines()
+            .skip_while(|line| !line.contains(lock_flag))
+            .take(2)
+            .any(|line| line.contains("--object-lock-enabled-for-bucket")),
+    };
+    let lifecycle = parse_lifecycle(lifecycle_xml.as_bytes())
+        .unwrap_or_else(|err| panic!("{path}: lifecycle document does not parse: {err:?}"));
+    (versioning, lifecycle, locked)
+}
+
+/// Every dev launcher creates a bucket the server's startup check passes on
+/// all seven in-process conditions, with no expected `E_v`, and all of them
+/// send the same rule set. Each launcher's own lifecycle document goes through
+/// the lifecycle parser; the AWS CLI's JSON is first turned into the XML the
+/// CLI sends. Flipped line: dropping the `AbortIncompleteMultipartUpload`
+/// member from deploy/k8s/floci.yaml's `LIFECYCLE` fails `abort-multipart`.
+#[test]
+fn launcher_lifecycle_documents_pass_every_in_process_condition() {
+    let (_, reference, _) = launcher_bucket_config(LAUNCHERS[0].0, LAUNCHERS[0].1);
+    for (path, form) in LAUNCHERS {
+        let (versioning, lifecycle, locked) = launcher_bucket_config(path, form);
+        assert!(locked, "{path}: the bucket is not created with Object Lock");
+        assert_eq!(
+            lifecycle.rules, reference.rules,
+            "{path}: the rule set differs from {}",
+            LAUNCHERS[0].0
+        );
+        let (report, _) = assemble_report(
+            &FetchOutcome::Present(versioning),
+            &FetchOutcome::Present(lifecycle),
+            &FetchOutcome::Unknown(REPLICATION_NOT_EXPECTED.to_string()),
+            &FetchOutcome::Present(ObjectLockConfig { enabled: true }),
+            &RetentionSample::NotSampled,
+            &BucketProtectionParams::default(),
+        );
+        for id in SERVER_CHECKED {
+            let state = report.state(id).expect("every condition is reported");
+            assert!(state.is_pass(), "{path}: {} is {state:?}", id.id());
+        }
+    }
+}

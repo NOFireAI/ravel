@@ -131,9 +131,18 @@ spec:
 ---
 # Bucket creation, mirroring the `createbucket` sidecar in
 # deploy/docker-compose/rustfs.yml. floci needs no S3 client and no SigV4
-# signing (it accepts any credentials and does not verify signatures), so a plain
-# CreateBucket PUT with curl is enough -- the same approach the
-# object-store-contract CI job uses.
+# signing (it accepts any credentials and does not verify signatures), so plain
+# PUTs with curl are enough -- the same approach the object-store-contract CI
+# job uses.
+#
+# The operator passes --require-bucket-protection to every RavelCluster, so the
+# bucket must pass the startup check (docs/object-store-contract.md "Required
+# bucket configuration"): Object Lock enabled at creation, versioning on, and
+# one whole-bucket lifecycle rule carrying the sanctioned actions. The lifecycle
+# document below is the same rule set deploy/k8s/rustfs.yaml and the compose
+# files send, and crates/ravel-object-store's
+# `launcher_lifecycle_documents_pass_every_in_process_condition` test reads it
+# from this file.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -191,8 +200,15 @@ spec:
                 echo "floci S3 did not start in time" >&2
                 exit 1
               fi
+              # NoncurrentDays 1 keeps a dev bucket's noncurrent versions
+              # briefly; a production bucket sets its own E_v
+              # (docs/guides/disaster-recovery.md).
+              LIFECYCLE='<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ID>ravel</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status><Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration><NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration><AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>'
+              VERSIONING='<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>'
+              # Object Lock can only be enabled when the bucket is created.
               # Idempotent: a repeat PUT of an existing bucket also returns 200.
-              curl -fsS -o /dev/null -X PUT "${ENDPOINT}/${BUCKET}"
+              curl -fsS -o /dev/null -X PUT -H 'x-amz-bucket-object-lock-enabled: true' \
+                "${ENDPOINT}/${BUCKET}"
               # Verify rather than trust: HEAD on a missing bucket is 404, so a
               # 200 here proves the bucket Ravel needs actually exists.
               status="$(curl -sS -o /dev/null -w '%{http_code}' -I "${ENDPOINT}/${BUCKET}")"
@@ -200,7 +216,39 @@ spec:
                 echo "bucket ${BUCKET} missing after create (HEAD ${status})" >&2
                 exit 1
               fi
-              echo "bucket ${BUCKET} ready"
+              # Both PUTs replace the whole configuration, so a rerun is a no-op.
+              curl -fsS -o /dev/null -X PUT -H 'Content-Type: application/xml' \
+                --data-binary "$VERSIONING" "${ENDPOINT}/${BUCKET}?versioning"
+              curl -fsS -o /dev/null -X PUT -H 'Content-Type: application/xml' \
+                --data-binary "$LIFECYCLE" "${ENDPOINT}/${BUCKET}?lifecycle"
+              # Read back the three configurations the startup check reads. A
+              # bucket created by an older manifest without Object Lock fails
+              # here; delete the floci pod to start from an empty store.
+              if ! curl -fsS "${ENDPOINT}/${BUCKET}?object-lock" |
+                grep -q '<ObjectLockEnabled>Enabled</ObjectLockEnabled>'; then
+                echo "bucket ${BUCKET} does not have Object Lock enabled" >&2
+                exit 1
+              fi
+              if ! curl -fsS "${ENDPOINT}/${BUCKET}?versioning" | grep -q '<Status>Enabled</Status>'; then
+                echo "bucket ${BUCKET} does not have versioning enabled" >&2
+                exit 1
+              fi
+              lifecycle="$(curl -fsS "${ENDPOINT}/${BUCKET}?lifecycle")"
+              if ! printf '%s\n' "$lifecycle" |
+                grep -q '<DaysAfterInitiation>7</DaysAfterInitiation>'; then
+                echo "bucket ${BUCKET} does not carry the multipart-abort rule" >&2
+                exit 1
+              fi
+              if ! printf '%s\n' "$lifecycle" | grep -q '<NoncurrentDays>1</NoncurrentDays>'; then
+                echo "bucket ${BUCKET} does not carry the noncurrent-expiration rule" >&2
+                exit 1
+              fi
+              if ! printf '%s\n' "$lifecycle" |
+                grep -q '<ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker>'; then
+                echo "bucket ${BUCKET} does not carry the expired-delete-marker rule" >&2
+                exit 1
+              fi
+              echo "bucket ${BUCKET} ready: Object Lock, versioning and lifecycle rules set"
           resources:
             requests:
               cpu: 10m

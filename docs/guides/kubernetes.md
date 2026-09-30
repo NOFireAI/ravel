@@ -58,7 +58,8 @@ while. Later runs reuse the docker layer cache.
    and the `IfNotPresent` pull policy resolves against the node's own image
    store.
 4. It deploys the fake S3 backend, waits for it to actually serve S3, and
-   creates the `ravel` bucket.
+   creates the `ravel` bucket with the protection settings the operator's
+   startup gate checks.
 5. It installs the CRD, RBAC, and operator Deployment from `deploy/k8s/operator/`.
 6. It applies a `RavelCluster` named `dev`, pointed at that backend and those
    image tags.
@@ -91,7 +92,16 @@ leaves the cluster running so you can look at it.
 `deploy/k8s/floci.yaml` and `deploy/k8s/rustfs.yaml` are the same shape: a
 single-replica Deployment, a Service, and a bucket-create Job. The Job retries
 until the endpoint serves S3, creates the `ravel` bucket, and then verifies
-that it exists rather than assume the create took.
+that it exists rather than assume the create took. The operator starts every
+`ravel-server` pod with `--require-bucket-protection`, so the Job creates the
+bucket with Object Lock enabled, turns versioning on, and installs one enabled
+lifecycle rule over the whole bucket with `ExpiredObjectDeleteMarker`,
+`NoncurrentDays` 1 and `AbortIncompleteMultipartUpload` after 7 days, then
+reads each configuration back. `scripts/kind-up.sh` deletes a finished Job
+before it applies the manifest, so the Job runs again on a reused cluster. A
+backend pod still holding a bucket from an older manifest, created without
+Object Lock, fails that read-back; delete the pod to start from an empty
+store.
 
 floci is the default, gated by the `floci_contract` test in the object-store
 crate. That test runs the full object-store contract suite plus the mandatory
@@ -615,7 +625,27 @@ cluster.
 - Point `spec.storage.s3.endpoint` at real S3 (or omit it) and supply real
   credentials in the Secret.
 - Bucket lifecycle is the platform owner's job. The operator provisions no
-  buckets; the create-bucket Jobs exist only in the dev manifests. Store
+  buckets; the create-bucket Jobs exist only in the dev manifests. The
+  operator does start every pod with `--require-bucket-protection`, so a real
+  bucket must be created with Object Lock and carry versioning and the
+  sanctioned lifecycle rules before you apply a `RavelCluster`, or the pods
+  refuse to start. With the AWS CLI:
+
+  ```sh
+  aws s3api create-bucket --bucket my-ravel-bucket --object-lock-enabled-for-bucket
+  aws s3api put-bucket-versioning --bucket my-ravel-bucket \
+    --versioning-configuration Status=Enabled
+  aws s3api put-bucket-lifecycle-configuration --bucket my-ravel-bucket \
+    --lifecycle-configuration '{"Rules":[{"ID":"ravel","Filter":{"Prefix":""},"Status":"Enabled","Expiration":{"ExpiredObjectDeleteMarker":true},"NoncurrentVersionExpiration":{"NoncurrentDays":30},"AbortIncompleteMultipartUpload":{"DaysAfterInitiation":7}}]}'
+  ```
+
+  Replace `30` with your own `E_v` (the
+  [disaster recovery guide](disaster-recovery.md) explains the choice), and
+  outside `us-east-1` add
+  `--create-bucket-configuration LocationConstraint=<region>`. Unless the
+  pods' identity holds the three read permissions the check uses, it reads
+  every condition as unknown and starts with a warning; see
+  [Deployment](operations/deployment.md#bucket-protection-at-startup). Store
   qualification is not: the operator runs `ravel-cli store qualify` itself
   for every `RavelCluster` (see [store qualification](#store-qualification)),
   so a real bucket needs no hand-run qualify step before you apply one.

@@ -896,10 +896,10 @@ pub struct S3Store {
     store_time: Arc<ObservedStoreTime>,
     /// The read-only bucket-protection control plane (ADR-1727 decision 1). Signs
     /// its own SigV4 GETs with the same credential provider this store holds, so
-    /// there is no second credential path. `ravel-cli store qualify` and
-    /// `ravel-cli store verify-protection` reach it through the concrete store;
-    /// the server's startup gate still probes through `dyn ObjectStoreBackend`
-    /// and does not.
+    /// there is no second credential path. `ravel-cli store qualify`,
+    /// `ravel-cli store verify-protection` and `ravel-server`'s
+    /// `--require-bucket-protection` startup gate reach it through the concrete
+    /// store; a caller holding only `dyn ObjectStoreBackend` does not.
     control_plane: Arc<BucketControlPlaneClient>,
 }
 
@@ -1260,10 +1260,9 @@ impl S3Store {
 // `S3Store` answers all three probe seams affirmatively from its own read-only
 // SigV4 GETs, while the `dyn ObjectStoreBackend` impls in `conformance.rs` stay
 // as they are (every field `Unknown`). `ObjectStoreBackend` itself is unchanged.
-// `ravel-cli store qualify` and `ravel-cli store verify-protection` reach these
-// through the concrete store. The server's startup gate still probes through
-// `dyn ObjectStoreBackend`, so it reports `Unknown` until it is handed the
-// concrete store.
+// `ravel-cli store qualify`, `ravel-cli store verify-protection` and
+// `ravel-server`'s startup gate reach these through the concrete store; the
+// server keeps the base `S3Store` beside the wrapped handles for exactly this.
 
 #[async_trait::async_trait]
 impl crate::conformance::BucketControlPlane for S3Store {

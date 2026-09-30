@@ -105,6 +105,7 @@ async fn main() -> anyhow::Result<()> {
         metrics: store_metrics,
         cache,
         kms: tenant_kms,
+        s3: store_s3,
         classed: _classed,
     } = ravel_server::store::build_store(&cli, performance.cache_max_bytes)
         .context("failed to build object store backend")?;
@@ -125,18 +126,18 @@ async fn main() -> anyhow::Result<()> {
     .await
     .context("store backend is not qualified (sys/qualification); refusing to start")?;
 
-    // Bucket-protection contract gate (ADR-0072 decision 3), off by default:
-    // see docs/object-store-contract.md's "Required bucket configuration"
-    // section. `--require-bucket-protection` unset leaves this call a no-op
-    // (`enforce_if_required` returns `Ok(None)` without touching either
-    // probe), so the default path is unchanged from before this gate
-    // existed. When set, `ObjectLockStatus::Disabled` or an ADR-0064 section
-    // 7 bucket-configuration alarm refuses to start; `Unknown` (every
-    // backend reachable only through `ObjectStoreBackend` today) logs one
-    // warning and sets the `ravel_bucket_protection_unknown` gauge instead
-    // of blocking.
-    ravel_server::bucket_protection::enforce_at_startup(
+    // Bucket-protection contract gate (ADR-0072 decision 3, ADR-1727 decision
+    // 5), off by default: see docs/object-store-contract.md's "Required bucket
+    // configuration" section. `--require-bucket-protection` unset leaves this
+    // call a no-op that sends no request. When set, on `--store s3` it reads
+    // the bucket's protection report through the concrete base `S3Store`
+    // (three read-only GETs) and refuses to start on a fatal failed condition;
+    // an unknown condition, which is every condition on a backend other than
+    // S3, logs one warning and raises `ravel_bucket_protection_unknown`
+    // instead of blocking.
+    ravel_server::bucket_protection::enforce_at_startup_on(
         cli.require_bucket_protection,
+        store_s3.as_deref(),
         store.as_ref(),
     )
     .await?;
