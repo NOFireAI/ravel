@@ -263,14 +263,18 @@ const CHECKSUM_ECHO_BODY: &[u8] = b"ravel-cli store qualify stored-checksum echo
 /// that carried one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChecksumEcho {
-    /// The endpoint returned a stored checksum and it matched the body.
+    /// The endpoint returned a stored checksum (CRC-64/NVME or CRC-32C), and
+    /// the same algorithm over the body read matched it. The returned value
+    /// is not compared with the one the PUT sent: a CRC-32C the endpoint
+    /// computed itself satisfies this too.
     Verified,
     /// The endpoint returned no stored checksum; reads are served unverified.
     NotReturned,
     /// The check did not run, for the stated reason.
     NotChecked(String),
-    /// The endpoint returned a checksum that does not match the one sent, or
-    /// the probe itself failed. A qualify failure.
+    /// The endpoint returned a stored checksum that does not match the same
+    /// algorithm over the body read, or the probe itself failed. A qualify
+    /// failure.
     Failed(String),
 }
 
@@ -278,9 +282,10 @@ impl ChecksumEcho {
     /// The one line `store qualify` prints for this outcome.
     pub fn line(&self) -> String {
         let text = match self {
-            ChecksumEcho::Verified => "verified: the endpoint returned a stored checksum for \
-                                      the crc64nvme probe PUT read back whole, and it matched \
-                                      the body"
+            ChecksumEcho::Verified => "verified: the whole-object read of the crc64nvme probe \
+                                      PUT returned a stored checksum (crc64nvme or crc32c), \
+                                      and the same algorithm computed over the body read \
+                                      matched it"
                 .to_string(),
             ChecksumEcho::NotReturned => "not returned: the endpoint returned no stored checksum \
                                           for a crc64nvme PUT read back whole, so whole-object \
@@ -372,8 +377,8 @@ async fn checksum_echo_probe(
     let unverified_after = store.get_unverified();
     match read {
         Err(StoreError::Corrupted(detail)) => ChecksumEcho::Failed(format!(
-            "the endpoint returned a checksum for {key} that does not match the crc64nvme \
-             checksum sent with it: {detail}"
+            "the endpoint returned a stored checksum for {key} that does not match the same \
+             algorithm computed over the body read: {detail}"
         )),
         Err(err) => ChecksumEcho::Failed(format!("the probe GET of {key} failed: {err}")),
         Ok(got) if got.data != body => ChecksumEcho::Failed(format!(
@@ -644,6 +649,11 @@ mod tests {
     /// `--store s3` parsed as an operator types it, against `endpoint`, with
     /// `extra` flags appended.
     fn s3_store(endpoint: &str, extra: &[&str]) -> BuiltStore {
+        s3_store_paged(endpoint, extra, ravel_object_store::s3::LIST_PAGE_SIZE)
+    }
+
+    /// [`s3_store`] built with `page_size`, as `--list-page-size` builds it.
+    fn s3_store_paged(endpoint: &str, extra: &[&str], page_size: usize) -> BuiltStore {
         use clap::Parser;
         let mut argv = vec![
             "ravel-cli",
@@ -660,8 +670,7 @@ mod tests {
         ];
         argv.extend_from_slice(extra);
         let args = crate::store::StoreArgs::try_parse_from(argv).expect("flags parse");
-        crate::store::build_store_handle(&args, Some(ravel_object_store::s3::LIST_PAGE_SIZE))
-            .expect("s3 builds")
+        crate::store::build_store_handle(&args, Some(page_size)).expect("s3 builds")
     }
 
     fn bucket_answers() -> [(&'static str, axum::http::StatusCode, &'static str); 3] {
@@ -748,8 +757,9 @@ mod tests {
         assert_eq!(
             ChecksumEcho::Verified.line(),
             format!(
-                "{:<40} verified: the endpoint returned a stored checksum for the crc64nvme \
-                 probe PUT read back whole, and it matched the body",
+                "{:<40} verified: the whole-object read of the crc64nvme probe PUT returned a \
+                 stored checksum (crc64nvme or crc32c), and the same algorithm computed over \
+                 the body read matched it",
                 "checksum/stored_echo"
             )
         );
@@ -768,7 +778,10 @@ mod tests {
             .failure()
             .expect("a mismatched checksum fails qualify");
         assert!(
-            failure.contains("does not match the crc64nvme checksum sent with it"),
+            failure.contains(&format!(
+                "the endpoint returned a stored checksum for {key} that does not match the same \
+                 algorithm computed over the body read: "
+            )),
             "{failure}"
         );
         assert!(outcome.line().contains(" FAIL "), "{}", outcome.line());
@@ -834,5 +847,128 @@ mod tests {
             "nothing was sent: {:?}",
             fake.puts()
         );
+    }
+
+    const ECHO_RUN_ID: &str = "echo-run";
+    const ECHO_KEY: &str = "sys/qualify/echo-run/checksum-echo";
+    const ECHO_IDENTITY: &str = "s3://ravel-test@fake";
+
+    /// The whole of `store qualify` against a fresh fake endpoint at page
+    /// size 2, with `refuse` applied to it first: the endpoint, the outcome,
+    /// and whether `sys/qualification` was written.
+    async fn qualify_against_fake(
+        refuse: impl FnOnce(&crate::fake_s3::FakeS3),
+    ) -> (String, anyhow::Result<()>, bool) {
+        use crate::fake_s3::{Echo, spawn};
+
+        let (endpoint, fake) = spawn(Echo::Stored, &bucket_answers()).await;
+        refuse(&fake);
+        let outcome = qualify_built(
+            s3_store_paged(&endpoint, &[], 2),
+            ECHO_IDENTITY.to_string(),
+            ECHO_RUN_ID,
+            2,
+        )
+        .await;
+        let recorded = fake.has_object(QUALIFICATION_KEY)
+            || fake.puts().iter().any(|put| put.key == QUALIFICATION_KEY);
+        (endpoint, outcome, recorded)
+    }
+
+    /// `text` with the request's elapsed time, the one part of the S3
+    /// client's error that differs between runs, replaced by `<elapsed>`.
+    fn without_elapsed(text: &str) -> String {
+        let Some(end) = text.find(" - Server returned") else {
+            return text.to_string();
+        };
+        match text[..end].rfind(" in ") {
+            Some(start) => format!("{} in <elapsed>{}", &text[..start], &text[end..]),
+            None => text.to_string(),
+        }
+    }
+
+    /// The echo detail for a probe `op` (`PUT` or `GET`) the fake endpoint at
+    /// `endpoint` refused.
+    fn refused_probe_detail(op: &str, endpoint: &str) -> String {
+        format!(
+            "the probe {op} of {ECHO_KEY} failed: access denied: {ECHO_KEY}: Error performing \
+             {op} {endpoint}/ravel-test/{ECHO_KEY} in <elapsed> - Server returned non-2xx status \
+             code: 403 Forbidden: <Error><Code>AccessDenied</Code><Message>Access \
+             Denied</Message></Error>"
+        )
+    }
+
+    /// The fake endpoint passes the conformance suite and the echo check, so
+    /// `store qualify` against it records `sys/qualification`: the two
+    /// refusal tests below fail on the echo check and nothing else.
+    #[tokio::test]
+    async fn qualify_against_the_fake_endpoint_passes_and_records() {
+        let (_, outcome, recorded) = qualify_against_fake(|_| {}).await;
+        outcome.expect("the fake endpoint qualifies");
+        assert!(recorded, "a pass writes {QUALIFICATION_KEY}");
+    }
+
+    /// A refused probe PUT fails qualification with the PUT named, and no
+    /// `sys/qualification` record is written.
+    #[tokio::test]
+    async fn a_refused_echo_probe_put_fails_qualification_and_records_nothing() {
+        use crate::fake_s3::{Echo, spawn};
+
+        let (endpoint, fake) = spawn(Echo::Stored, &[]).await;
+        fake.refuse_puts_ending("checksum-echo");
+        let (echo, _) = checksum_echo(&s3_store(&endpoint, &[]), ECHO_KEY).await;
+        assert_eq!(
+            without_elapsed(&echo.line()),
+            format!(
+                "{CHECKSUM_ECHO_LABEL:<40} FAIL {}",
+                refused_probe_detail("PUT", &endpoint)
+            )
+        );
+
+        let (endpoint, outcome, recorded) =
+            qualify_against_fake(|fake| fake.refuse_puts_ending("checksum-echo")).await;
+        let err = outcome.expect_err("a refused probe PUT fails qualification");
+        assert_eq!(
+            without_elapsed(&err.to_string()),
+            format!(
+                "store qualification failed: {ECHO_IDENTITY} failed the stored-checksum echo \
+                 check: {}",
+                refused_probe_detail("PUT", &endpoint)
+            )
+        );
+        assert!(!recorded, "nothing is recorded on an echo failure");
+    }
+
+    /// A refused probe GET fails qualification with the GET named, and no
+    /// `sys/qualification` record is written. The probe object is still
+    /// deleted.
+    #[tokio::test]
+    async fn a_refused_echo_probe_get_fails_qualification_and_records_nothing() {
+        use crate::fake_s3::{Echo, spawn};
+
+        let (endpoint, fake) = spawn(Echo::Stored, &[]).await;
+        fake.refuse_gets_ending("checksum-echo");
+        let (echo, _) = checksum_echo(&s3_store(&endpoint, &[]), ECHO_KEY).await;
+        assert_eq!(
+            without_elapsed(&echo.line()),
+            format!(
+                "{CHECKSUM_ECHO_LABEL:<40} FAIL {}",
+                refused_probe_detail("GET", &endpoint)
+            )
+        );
+        assert_eq!(fake.deletes(), vec![ECHO_KEY.to_string()]);
+
+        let (endpoint, outcome, recorded) =
+            qualify_against_fake(|fake| fake.refuse_gets_ending("checksum-echo")).await;
+        let err = outcome.expect_err("a refused probe GET fails qualification");
+        assert_eq!(
+            without_elapsed(&err.to_string()),
+            format!(
+                "store qualification failed: {ECHO_IDENTITY} failed the stored-checksum echo \
+                 check: {}",
+                refused_probe_detail("GET", &endpoint)
+            )
+        );
+        assert!(!recorded, "nothing is recorded on an echo failure");
     }
 }

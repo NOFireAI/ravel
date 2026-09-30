@@ -378,16 +378,19 @@ verify-protection: FAIL: failed: noncurrent-expiration
 | `no-foreign-rule` | no other expiration or transition rule targets `t/` or `sys/` |
 | `delete-marker-replication` | replication carries `DeleteMarkerReplication` `Enabled` |
 | `object-lock` | Object Lock is enabled on the bucket |
-| `object-retention` | the newest current object in each protected prefix family, and one noncurrent version, carry compliance-mode retention that has not lapsed |
+| `object-retention` | the most recently modified current object found in each protected prefix family, and one noncurrent version, carry compliance-mode retention that has not lapsed |
 
 The exit code is the verdict: `0` only when every expected condition passes,
 `1` when any expected condition fails (the summary names each), and `2` when
 none fails but at least one could not be verified, or the bucket's control
 plane could not be reached at all (the summary names each). `unknown` is never
-`pass`: an access denial, an endpoint with no such API, and a response that
-does not parse all exit `2`, and so does a store other than `--store s3`. A
-condition that is not expected is still printed, marked as such, and does not
-move the exit code.
+`pass`: an access denial, an endpoint with no such API, a response that does
+not parse, and a condition missing from the report all exit `2`, and so does a
+store other than `--store s3`. A condition that is not expected is still
+printed, marked as such, and does not move the exit code. A usage error, such
+as a missing `--expected-noncurrent-days`, also exits `2`, before anything is
+read and without the per-condition lines, so a script that treats `2` as
+"could not verify" should also check that a summary line was printed.
 
 A lifecycle rule counts as covering `t/` when its scope is the whole bucket,
 exactly `t/`, or when enabled rules scoped to `t/0` through `t/f`, one per
@@ -398,19 +401,36 @@ shapes, or confirm the coverage by hand. A covering rule that also keeps
 and a rule over part of `t/` that expires noncurrent versions sooner than
 `E_v` each fail `noncurrent-expiration`.
 
-The retention sample reads one listing prefix per protected family: `sys/`,
-and, under the first tenant prefix in key order, its catalog keyspace and the
-provisioning record and commit records of the first signal that has them. A
-family with nothing to sample reads `unknown`, so a bucket with no tenant data
-yet cannot pass `object-retention`. A tenant whose newest commit record is
-older than the retention period reads `fail`, because its newest object is no
-longer locked; the family is judged by that one tenant.
+The retention sample reads one object per protected family, the most recently
+modified current object the command finds within a fixed listing budget (400
+listing calls for `sys/` and the tenant scan, 200 for commit records):
+
+- deployment records: the newest object under `sys/`, skipping the
+  `store qualify` scratch under `sys/qualify/`, the probe objects under
+  `sys/pq-probe/` and the per-process worker state under `sys/maintain/`;
+- provisioning records: the newest `t/<h>/<signal>/prov` across tenants;
+- catalog keyspace: the newest catalog head (`t/<h>/catalog/<signal>/HEAD`)
+  across tenants;
+- commit records: the newest record in each shard's newest ingest hour, in
+  the tenant whose catalog head was written most recently.
+
+The control plane then reads the retention of that object's current version
+and of its newest noncurrent version, if it has one. A family with nothing to
+sample reads `unknown`, so a bucket with no tenant data yet cannot pass
+`object-retention`. A sampled object with no retention at all reads `fail`. A
+sampled object whose compliance lock has lapsed reads `unknown`, not `fail`:
+retention is finite, so a lapsed lock only says the object is older than the
+retention period, not that new writes go unprotected. That is the usual
+answer for a provisioning record, which is written only when a tenant is
+provisioned, resharded or has its floor raised. When the listing budget runs
+out first, an `unknown` or `fail` detail says so, since a newer object may
+exist.
 
 The identity that runs it needs read-only access: `s3:GetBucketVersioning`,
 `s3:GetLifecycleConfiguration`, `s3:GetReplicationConfiguration`,
 `s3:GetBucketObjectLockConfiguration`, `s3:GetObjectRetention` and
 `s3:ListBucketVersions`, plus `s3:ListBucket` under `--expect-object-retention`,
-which locates the sample prefixes with a delimited listing. It writes nothing.
+which locates the sampled objects with listings. It writes nothing.
 
 ## Restore procedure: the replica is a restore source, never a live failover target
 

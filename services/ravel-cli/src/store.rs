@@ -10,10 +10,9 @@ use ravel_object_store::conformance::{
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::s3::{
-    LIST_PAGE_SIZE, S3AuthMode, S3Config, S3HttpConfig, S3Store, UploadIntegrity,
-    resolve_s3_allow_http,
+    S3AuthMode, S3Config, S3HttpConfig, S3Store, UploadIntegrity, resolve_s3_allow_http,
 };
-use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
+use ravel_object_store::{DelimitedList, GetRange, ObjectMeta, ObjectStoreBackend, StoreError};
 use ravel_types::TenantHash;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -532,24 +531,7 @@ pub fn build_store_handle(
             let http = args.s3_http_config();
             let store = match page_size {
                 None => S3Store::with_http_config(config, http.clone()),
-                Some(n) if n == LIST_PAGE_SIZE => S3Store::with_http_config(config, http.clone()),
-                // `S3Store::with_page_size` builds with the library's default
-                // HTTP configuration, and no constructor takes both.
-                Some(n) if checksum_settings_are_library_default(&http) => {
-                    S3Store::with_page_size(config, n)
-                }
-                Some(n) => {
-                    return Err(anyhow::anyhow!(
-                        "--list-page-size {n} with --store s3 needs --s3-upload-integrity off and \
-                         --s3-request-stored-checksum left on: the S3 store can be built with a \
-                         list page size other than {LIST_PAGE_SIZE} only under its default \
-                         checksum settings, and this invocation selected \
-                         --s3-upload-integrity {} --s3-request-stored-checksum={}. Drop \
-                         --list-page-size to keep them",
-                        args.s3_upload_integrity.flag_value(),
-                        args.s3_request_stored_checksum,
-                    ));
-                }
+                Some(n) => S3Store::with_http_config_and_page_size(config, http.clone(), n),
             }
             .map_err(|err| anyhow::anyhow!("failed to build S3 store: {err}"))?;
             Ok(BuiltStore::S3 {
@@ -558,12 +540,6 @@ pub fn build_store_handle(
             })
         }
     }
-}
-
-fn checksum_settings_are_library_default(http: &S3HttpConfig) -> bool {
-    let default = S3HttpConfig::default();
-    http.upload_integrity == default.upload_integrity
-        && http.request_stored_checksum == default.request_stored_checksum
 }
 
 /// Reads `key_or_path` from the local filesystem if it names an existing
@@ -639,18 +615,34 @@ pub struct VerifyProtectionOutcome {
     pub exit_code: i32,
 }
 
-/// The listing prefixes the `object-retention` sample reads, one per protected
-/// prefix family that could be located, plus the families that could not.
+/// The objects the `object-retention` sample reads, one per protected prefix
+/// family that could be located, plus the families that could not.
 ///
 /// The families are the deployment records under `sys/`, the provisioning
-/// records, the commit records and the catalog keyspace. The last three sit
-/// under a tenant, so they are located under the first tenant prefix in key
-/// order, in the first signal directory that holds each.
+/// records, the commit records and the catalog keyspace. Each sample is the
+/// most recently modified current object the listing budget finds in its
+/// family, because only a recent object is expected to still be locked:
+///
+/// - `sys/`: every object under `sys/` except the transient scratch under
+///   `sys/qualify/` and `sys/pq-probe/` and the per-process advisory state
+///   under `sys/maintain/`, which is rewritten continuously.
+/// - provisioning records: the newest `t/<h>/<signal>/prov` across tenants.
+/// - catalog keyspace: the newest object directly under a
+///   `t/<h>/catalog/<signal>/` (the head pointer) across tenants.
+/// - commit records: the newest object in each shard's newest ingest hour, in
+///   the tenant whose catalog was written most recently.
+///
+/// Each sample is passed to the control plane as an exact key, so its versions
+/// listing holds that object's own versions and nothing else.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetentionSamplePlan {
+    /// The sampled keys, in family order.
     pub prefixes: Vec<String>,
     /// Families with no object to sample, by name.
     pub unsampled: Vec<&'static str>,
+    /// A listing budget ran out before every candidate was listed, so a
+    /// sample is the newest object found rather than provably the newest.
+    pub budget_exhausted: bool,
 }
 
 const RETENTION_FAMILY_SYS: &str = "deployment records (sys/)";
@@ -658,49 +650,198 @@ const RETENTION_FAMILY_PROV: &str = "provisioning records (t/*/*/prov)";
 const RETENTION_FAMILY_COMMIT: &str = "commit records (t/*/*/c/)";
 const RETENTION_FAMILY_CATALOG: &str = "catalog keyspace (t/*/catalog/)";
 
-/// Locate one sample prefix per protected prefix family (see
-/// [`RetentionSamplePlan`]) with delimited listings over the data plane.
+/// Sub-prefixes of `sys/` the sample skips.
+const RETENTION_SYS_EXCLUDED: [&str; 3] = ["sys/qualify/", "sys/pq-probe/", "sys/maintain/"];
+
+/// Listing calls the sample may spend on `sys/` and the tenant scan, and then
+/// on the commit records of the chosen tenant.
+const RETENTION_SCAN_LIST_BUDGET: usize = 400;
+const RETENTION_COMMIT_LIST_BUDGET: usize = 200;
+
+/// Listing calls against a fixed budget. A call past the budget is not made:
+/// it returns `None` and marks the budget exhausted.
+struct BudgetedLister<'a> {
+    store: &'a dyn ObjectStoreBackend,
+    remaining: usize,
+    exhausted: bool,
+}
+
+impl<'a> BudgetedLister<'a> {
+    fn new(store: &'a dyn ObjectStoreBackend, budget: usize) -> Self {
+        Self {
+            store,
+            remaining: budget,
+            exhausted: false,
+        }
+    }
+
+    fn spend(&mut self) -> bool {
+        if self.remaining == 0 {
+            self.exhausted = true;
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+
+    async fn delimited(&mut self, prefix: &str) -> Result<Option<DelimitedList>, StoreError> {
+        if !self.spend() {
+            return Ok(None);
+        }
+        let mut listed = self.store.list_delimited(prefix).await?;
+        listed.common_prefixes.sort();
+        Ok(Some(listed))
+    }
+
+    /// Every object under `prefix`, page by page while the budget lasts.
+    async fn all(&mut self, prefix: &str) -> Result<Vec<ObjectMeta>, StoreError> {
+        let mut objects = Vec::new();
+        let mut token = None;
+        loop {
+            if !self.spend() {
+                return Ok(objects);
+            }
+            let page = self.store.list(prefix, token).await?;
+            objects.extend(page.objects);
+            match page.next {
+                Some(next) => token = Some(next),
+                None => return Ok(objects),
+            }
+        }
+    }
+}
+
+/// The most recently modified object offered, ties broken by key.
+#[derive(Default)]
+struct Newest(Option<(i64, String)>);
+
+impl Newest {
+    fn offer(&mut self, meta: &ObjectMeta) {
+        let candidate = (meta.last_modified_unix_ms, meta.key.as_str());
+        if self
+            .0
+            .as_ref()
+            .is_none_or(|(at, key)| candidate > (*at, key.as_str()))
+        {
+            self.0 = Some((meta.last_modified_unix_ms, meta.key.clone()));
+        }
+    }
+
+    fn at(&self) -> Option<i64> {
+        self.0.as_ref().map(|(at, _)| *at)
+    }
+
+    fn key(self) -> Option<String> {
+        self.0.map(|(_, key)| key)
+    }
+}
+
+/// Locate one sample object per protected prefix family (see
+/// [`RetentionSamplePlan`]) with listings over the data plane.
 pub async fn retention_sample_plan(
     store: &dyn ObjectStoreBackend,
 ) -> Result<RetentionSamplePlan, StoreError> {
-    let mut sys = None;
-    let mut prov = None;
-    let mut commit = None;
-    let mut catalog = None;
+    retention_sample_plan_within(
+        store,
+        RETENTION_SCAN_LIST_BUDGET,
+        RETENTION_COMMIT_LIST_BUDGET,
+    )
+    .await
+}
 
-    let root = store.list_delimited("sys/").await?;
-    if !root.objects.is_empty() || !root.common_prefixes.is_empty() {
-        sys = Some("sys/".to_string());
+/// [`retention_sample_plan`] with explicit listing budgets.
+async fn retention_sample_plan_within(
+    store: &dyn ObjectStoreBackend,
+    scan_budget: usize,
+    commit_budget: usize,
+) -> Result<RetentionSamplePlan, StoreError> {
+    let mut scan = BudgetedLister::new(store, scan_budget);
+    let mut sys = Newest::default();
+    let mut prov = Newest::default();
+    let mut catalog = Newest::default();
+
+    if let Some(root) = scan.delimited("sys/").await? {
+        root.objects.iter().for_each(|meta| sys.offer(meta));
+        for prefix in root
+            .common_prefixes
+            .iter()
+            .filter(|prefix| !RETENTION_SYS_EXCLUDED.contains(&prefix.as_str()))
+        {
+            scan.all(prefix)
+                .await?
+                .iter()
+                .for_each(|meta| sys.offer(meta));
+        }
     }
 
-    let mut tenants = store.list_delimited("t/").await?.common_prefixes;
-    tenants.sort();
-    if let Some(tenant) = tenants.first() {
-        let mut dirs = store.list_delimited(tenant).await?.common_prefixes;
-        dirs.sort();
+    // Per tenant: the newest catalog object's time, and its commit prefixes.
+    let mut tenants: Vec<(Option<i64>, String, Vec<String>)> = Vec::new();
+    let tenant_prefixes = scan
+        .delimited("t/")
+        .await?
+        .map(|listed| listed.common_prefixes)
+        .unwrap_or_default();
+    for tenant in tenant_prefixes {
+        let Some(dirs) = scan.delimited(&tenant).await? else {
+            break;
+        };
         let catalog_prefix = format!("{tenant}catalog/");
-        if dirs.contains(&catalog_prefix) {
-            catalog = Some(catalog_prefix.clone());
+        let mut tenant_catalog = Newest::default();
+        if dirs.common_prefixes.contains(&catalog_prefix)
+            && let Some(signals) = scan.delimited(&catalog_prefix).await?
+        {
+            for signal in &signals.common_prefixes {
+                if let Some(listed) = scan.delimited(signal).await? {
+                    for meta in &listed.objects {
+                        tenant_catalog.offer(meta);
+                        catalog.offer(meta);
+                    }
+                }
+            }
         }
-        for dir in dirs.iter().filter(|dir| **dir != catalog_prefix) {
-            if prov.is_some() && commit.is_some() {
+        let mut commit_prefixes = Vec::new();
+        for dir in dirs
+            .common_prefixes
+            .iter()
+            .filter(|d| **d != catalog_prefix)
+        {
+            let Some(listed) = scan.delimited(dir).await? else {
                 break;
-            }
-            let listed = store.list_delimited(dir).await?;
+            };
             let prov_key = format!("{dir}prov");
-            if prov.is_none() && listed.objects.iter().any(|object| object.key == prov_key) {
-                prov = Some(prov_key);
-            }
+            listed
+                .objects
+                .iter()
+                .filter(|meta| meta.key == prov_key)
+                .for_each(|meta| prov.offer(meta));
             let commit_prefix = format!("{dir}c/");
-            if commit.is_none() && listed.common_prefixes.contains(&commit_prefix) {
-                commit = Some(commit_prefix);
+            if listed.common_prefixes.contains(&commit_prefix) {
+                commit_prefixes.push(commit_prefix);
             }
+        }
+        if !commit_prefixes.is_empty() {
+            tenants.push((tenant_catalog.at(), tenant, commit_prefixes));
+        }
+    }
+
+    // The tenant whose catalog was written last is the one most likely to hold
+    // the newest commit record; a tenant with no catalog object sorts last.
+    tenants.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let mut commits = BudgetedLister::new(store, commit_budget);
+    let mut commit = Newest::default();
+    for (_, _, commit_prefixes) in &tenants {
+        for commit_prefix in commit_prefixes {
+            newest_commit_in(&mut commits, commit_prefix, &mut commit).await?;
+        }
+        if commit.at().is_some() || commits.exhausted {
+            break;
         }
     }
 
     let mut plan = RetentionSamplePlan {
         prefixes: Vec::new(),
         unsampled: Vec::new(),
+        budget_exhausted: scan.exhausted || commits.exhausted,
     };
     for (found, family) in [
         (sys, RETENTION_FAMILY_SYS),
@@ -708,12 +849,41 @@ pub async fn retention_sample_plan(
         (commit, RETENTION_FAMILY_COMMIT),
         (catalog, RETENTION_FAMILY_CATALOG),
     ] {
-        match found {
-            Some(prefix) => plan.prefixes.push(prefix),
+        match found.key() {
+            Some(key) => plan.prefixes.push(key),
             None => plan.unsampled.push(family),
         }
     }
     Ok(plan)
+}
+
+/// Offer `commit` every object in each shard's newest ingest hour under
+/// `commit_prefix` (`t/<h>/<signal>/c/`).
+async fn newest_commit_in(
+    lister: &mut BudgetedLister<'_>,
+    commit_prefix: &str,
+    commit: &mut Newest,
+) -> Result<(), StoreError> {
+    let Some(shards) = lister.delimited(commit_prefix).await? else {
+        return Ok(());
+    };
+    for shard in &shards.common_prefixes {
+        let Some(hours) = lister.delimited(shard).await? else {
+            return Ok(());
+        };
+        let newest_hour = hours.common_prefixes.iter().max_by_key(|hour| {
+            let segment = hour.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+            (segment.parse::<u64>().ok(), segment.to_string())
+        });
+        let Some(hour) = newest_hour else {
+            continue;
+        };
+        let Some(listed) = lister.delimited(hour).await? else {
+            return Ok(());
+        };
+        listed.objects.iter().for_each(|meta| commit.offer(meta));
+    }
+    Ok(())
 }
 
 /// Run `store verify-protection` against `store`: locate the retention
@@ -757,6 +927,24 @@ pub async fn verify_protection_with<S: BucketControlPlane + ?Sized>(
     render_verify_protection(&report, expectations, plan)
 }
 
+/// Write `outcome`'s lines to `out` and flush it. A reader that closed the
+/// pipe early (`| head`) is not an error: the exit code the outcome carries
+/// stands rather than turning into a write failure.
+pub fn write_verify_protection(
+    out: &mut impl std::io::Write,
+    outcome: &VerifyProtectionOutcome,
+) -> std::io::Result<()> {
+    let written = outcome
+        .lines
+        .iter()
+        .try_for_each(|line| writeln!(out, "{line}"))
+        .and_then(|()| out.flush());
+    match written {
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        other => other,
+    }
+}
+
 /// The outcome for a store that could not be built, so its control plane was
 /// never reached: every expected condition is unknown, and the exit code is
 /// [`VERIFY_PROTECTION_UNKNOWN`].
@@ -778,27 +966,31 @@ pub fn verify_protection_unreachable(
 ///
 /// `plan` is the retention sample plan when retention is expected: a family
 /// that could not be sampled, or a plan that could not be built, keeps
-/// `object-retention` from reading as a pass.
+/// `object-retention` from reading as a pass. A condition the report does not
+/// carry is unknown.
 pub fn render_verify_protection(
     report: &BucketProtectionReport,
     expectations: ProtectionExpectations,
     plan: Option<&Result<RetentionSamplePlan, String>>,
 ) -> VerifyProtectionOutcome {
-    let mut lines = Vec::with_capacity(report.conditions.len() + 1);
+    let mut lines = Vec::with_capacity(ProtectionConditionId::ALL.len() + 1);
     let mut failed: Vec<&'static str> = Vec::new();
     let mut unknown: Vec<&'static str> = Vec::new();
-    for entry in &report.conditions {
-        let state = if entry.id == ProtectionConditionId::ObjectRetention {
-            retention_state_with_coverage(&entry.state, plan)
+    for id in ProtectionConditionId::ALL {
+        let reported = report.state(id).cloned().unwrap_or_else(|| {
+            ConditionState::Unknown("missing from the bucket-protection report".to_string())
+        });
+        let state = if id == ProtectionConditionId::ObjectRetention {
+            retention_state_with_coverage(&reported, plan)
         } else {
-            entry.state.clone()
+            reported
         };
-        let expected = expectations.expects(entry.id);
+        let expected = expectations.expects(id);
         if expected {
             match state {
                 ConditionState::Pass => {}
-                ConditionState::Fail(_) => failed.push(entry.id.id()),
-                ConditionState::Unknown(_) => unknown.push(entry.id.id()),
+                ConditionState::Fail(_) => failed.push(id.id()),
+                ConditionState::Unknown(_) => unknown.push(id.id()),
             }
         }
         let detail = match (expected, state.detail()) {
@@ -807,9 +999,9 @@ pub fn render_verify_protection(
             (false, detail) => format!("not expected, does not affect the exit code: {detail}"),
         };
         lines.push(if detail.is_empty() {
-            format!("{:<26} {}", entry.id.id(), state.verdict())
+            format!("{:<26} {}", id.id(), state.verdict())
         } else {
-            format!("{:<26} {:<7} {detail}", entry.id.id(), state.verdict())
+            format!("{:<26} {:<7} {detail}", id.id(), state.verdict())
         });
     }
     let (summary, exit_code) = if !failed.is_empty() {
@@ -842,20 +1034,45 @@ fn retention_state_with_coverage(
     state: &ConditionState,
     plan: Option<&Result<RetentionSamplePlan, String>>,
 ) -> ConditionState {
-    let gap = match plan {
+    let (gap, budget_exhausted) = match plan {
         None => return state.clone(),
-        Some(Err(err)) => {
-            format!("could not locate the protected prefix families to sample: {err}")
-        }
-        Some(Ok(plan)) if plan.unsampled.is_empty() => return state.clone(),
-        Some(Ok(plan)) => format!("no object to sample for {}", plan.unsampled.join(", ")),
+        Some(Err(err)) => (
+            Some(format!(
+                "could not locate the protected prefix families to sample: {err}"
+            )),
+            false,
+        ),
+        Some(Ok(plan)) if plan.unsampled.is_empty() => (None, plan.budget_exhausted),
+        Some(Ok(plan)) => (
+            Some(format!(
+                "no object to sample for {}",
+                plan.unsampled.join(", ")
+            )),
+            plan.budget_exhausted,
+        ),
     };
-    match state {
-        ConditionState::Pass => ConditionState::Unknown(gap),
-        ConditionState::Unknown(detail) => ConditionState::Unknown(format!("{detail}; {gap}")),
-        ConditionState::Fail(detail) => ConditionState::Fail(format!("{detail}; {gap}")),
+    // A locked sample passes whether or not it is the newest object, so the
+    // budget note only qualifies a state that is not a pass.
+    let note = budget_exhausted.then_some(RETENTION_BUDGET_NOTE);
+    let qualify = |detail: &str| {
+        [Some(detail), gap.as_deref(), note]
+            .into_iter()
+            .flatten()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    match (state, &gap) {
+        (ConditionState::Pass, None) => ConditionState::Pass,
+        (ConditionState::Pass, Some(_)) => ConditionState::Unknown(qualify("")),
+        (ConditionState::Unknown(detail), _) => ConditionState::Unknown(qualify(detail)),
+        (ConditionState::Fail(detail), _) => ConditionState::Fail(qualify(detail)),
     }
 }
+
+const RETENTION_BUDGET_NOTE: &str = "the listing budget ran out before every candidate was \
+                                     listed, so a sample is the newest object found, not \
+                                     provably the newest";
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
@@ -1556,8 +1773,9 @@ mod tests {
 
     fn full_plan() -> Result<RetentionSamplePlan, String> {
         Ok(RetentionSamplePlan {
-            prefixes: vec!["sys/".to_string()],
+            prefixes: vec!["sys/tenancy".to_string()],
             unsampled: Vec::new(),
+            budget_exhausted: false,
         })
     }
 
@@ -1744,8 +1962,9 @@ mod tests {
         // Every sampled object carries retention, but the commit-record family
         // had nothing to sample: the pass does not stand.
         let partial = Ok(RetentionSamplePlan {
-            prefixes: vec!["sys/".to_string()],
+            prefixes: vec!["sys/tenancy".to_string()],
             unsampled: vec![RETENTION_FAMILY_COMMIT],
+            budget_exhausted: false,
         });
         let outcome = verify_protection_with(&fixture(&[]), EXPECT_ALL, Some(&partial)).await;
         assert_eq!(
@@ -1755,12 +1974,25 @@ mod tests {
         assert_eq!(outcome.exit_code, VERIFY_PROTECTION_UNKNOWN);
     }
 
-    /// The retention sample reads one prefix per protected family: `sys/`,
-    /// and under the first tenant in key order its catalog keyspace and the
-    /// first signal directory holding a provisioning record and commit
-    /// records. A family with nothing under it is named, not sampled.
+    /// Put each `(key, last_modified_ms)` into `store` at that store time.
+    async fn seed_at(store: &MemoryStore, objects: &[(&str, u64)]) {
+        for (key, at) in objects {
+            store.set_clock_ms(*at);
+            store
+                .put(key, Bytes::from_static(b"x"), PutOptions::default())
+                .await
+                .expect("seed");
+        }
+    }
+
+    /// The retention sample is, per family, the most recently modified current
+    /// object, not the first tenant's records: the newest `prov` across
+    /// tenants, the newest catalog head, the newest commit record in each
+    /// shard's newest ingest hour of the tenant whose catalog was written
+    /// last, and the newest `sys/` record outside the scratch prefixes. A
+    /// family with nothing under it is named, not sampled.
     #[tokio::test]
-    async fn retention_sample_plan_locates_one_prefix_per_family() {
+    async fn retention_sample_plan_picks_the_newest_current_object_per_family() {
         let store = MemoryStore::new();
         let empty = retention_sample_plan(&store)
             .await
@@ -1775,36 +2007,204 @@ mod tests {
                     RETENTION_FAMILY_COMMIT,
                     RETENTION_FAMILY_CATALOG,
                 ],
+                budget_exhausted: false,
             }
         );
 
-        for key in [
-            "sys/tenancy",
-            "t/bb/catalog/l/HEAD",
-            "t/aa/l/prov",
-            "t/aa/m/c/0/100/w.1.1.cmt",
-            "t/aa/m/prov",
-            "t/aa/catalog/m/HEAD",
-            "t/aa/config",
-        ] {
-            store
-                .put(key, Bytes::from_static(b"x"), PutOptions::default())
-                .await
-                .expect("seed");
-        }
+        seed_at(
+            &store,
+            &[
+                ("sys/auth", 1),
+                ("sys/tenancy", 40),
+                ("sys/t/aa", 30),
+                ("sys/qualify/run/cas/create-if-absent", 90),
+                ("sys/pq-probe/probe", 91),
+                ("sys/maintain/workers/p1", 92),
+                ("t/aa/l/prov", 5),
+                ("t/aa/m/prov", 2),
+                ("t/aa/m/c/0/100/w.1.1.cmt", 6),
+                ("t/aa/catalog/m/HEAD", 10),
+                ("t/aa/config", 50),
+                ("t/bb/m/prov", 8),
+                ("t/bb/m/c/0/100/w.1.1.cmt", 21),
+                ("t/bb/m/c/0/101/w.1.2.cmt", 24),
+                ("t/bb/m/c/0/101/w.1.3.cmt", 25),
+                ("t/bb/m/c/1/99/w.2.1.cmt", 22),
+                ("t/bb/catalog/m/HEAD", 20),
+                ("t/bb/catalog/m/snap/20.0000000000000000.csnap", 19),
+            ],
+        )
+        .await;
         let plan = retention_sample_plan(&store).await.expect("lists");
         assert_eq!(
             plan,
             RetentionSamplePlan {
                 prefixes: vec![
-                    "sys/".to_string(),
-                    "t/aa/l/prov".to_string(),
-                    "t/aa/m/c/".to_string(),
-                    "t/aa/catalog/".to_string(),
+                    "sys/tenancy".to_string(),
+                    "t/bb/m/prov".to_string(),
+                    "t/bb/m/c/0/101/w.1.3.cmt".to_string(),
+                    "t/bb/catalog/m/HEAD".to_string(),
                 ],
                 unsampled: Vec::new(),
+                budget_exhausted: false,
             }
         );
+    }
+
+    /// Scratch and per-process state under `sys/qualify/`, `sys/pq-probe/`
+    /// and `sys/maintain/` is never the `sys/` sample, however new: with
+    /// nothing else under `sys/` the family is unsampled.
+    #[tokio::test]
+    async fn retention_sample_plan_skips_sys_qualify_scratch() {
+        let store = MemoryStore::new();
+        seed_at(
+            &store,
+            &[
+                ("sys/qualify/run/checksum-echo", 90),
+                ("sys/pq-probe/probe", 91),
+                ("sys/maintain/workers/p1", 92),
+            ],
+        )
+        .await;
+        let plan = retention_sample_plan(&store).await.expect("lists");
+        assert!(
+            plan.prefixes.is_empty() && plan.unsampled.contains(&RETENTION_FAMILY_SYS),
+            "{plan:?}"
+        );
+
+        seed_at(&store, &[("sys/qualification", 10)]).await;
+        let plan = retention_sample_plan(&store).await.expect("lists");
+        assert_eq!(plan.prefixes, ["sys/qualification"]);
+    }
+
+    /// A listing budget that runs out marks the plan, and the note qualifies
+    /// an unknown or failed `object-retention` but never demotes a pass.
+    #[tokio::test]
+    async fn an_exhausted_listing_budget_is_named_but_does_not_demote_a_pass() {
+        let store = MemoryStore::new();
+        seed_at(
+            &store,
+            &[
+                ("sys/tenancy", 1),
+                ("t/aa/m/prov", 2),
+                ("t/aa/m/c/0/100/w.1.1.cmt", 3),
+                ("t/aa/catalog/m/HEAD", 4),
+            ],
+        )
+        .await;
+        let plan = retention_sample_plan_within(&store, 1, 0)
+            .await
+            .expect("lists");
+        assert_eq!(plan.prefixes, ["sys/tenancy"]);
+        assert!(plan.budget_exhausted);
+
+        let full = Ok(RetentionSamplePlan {
+            prefixes: vec!["sys/tenancy".to_string()],
+            unsampled: Vec::new(),
+            budget_exhausted: true,
+        });
+        let outcome = verify_protection_with(&fixture(&[]), EXPECT_ALL, Some(&full)).await;
+        assert_eq!(outcome.lines[8], "object-retention           pass");
+        assert_eq!(outcome.exit_code, VERIFY_PROTECTION_PASS);
+
+        let lapsed = fixture(&[(
+            ProtectionConditionId::ObjectRetention,
+            unknown("sys/tenancy (newest current version): compliance retention lapsed"),
+        )]);
+        let outcome = verify_protection_with(&lapsed, EXPECT_ALL, Some(&full)).await;
+        assert_eq!(
+            outcome.lines[8],
+            format!(
+                "object-retention           unknown sys/tenancy (newest current version): \
+                 compliance retention lapsed; {RETENTION_BUDGET_NOTE}"
+            )
+        );
+        assert_eq!(outcome.exit_code, VERIFY_PROTECTION_UNKNOWN);
+    }
+
+    /// A writer that accepts `accept` bytes, then fails every write and flush
+    /// with `kind`.
+    struct ClosingWriter {
+        accept: usize,
+        kind: std::io::ErrorKind,
+        written: Vec<u8>,
+    }
+
+    impl std::io::Write for ClosingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.written.len() + buf.len() > self.accept {
+                return Err(self.kind.into());
+            }
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.written.len() >= self.accept {
+                return Err(self.kind.into());
+            }
+            Ok(())
+        }
+    }
+
+    /// A reader that closed the pipe, on a write or on the flush, leaves the
+    /// outcome's exit code standing; any other write error is still an error.
+    #[test]
+    fn a_closed_pipe_does_not_replace_the_verify_protection_exit_code() {
+        let outcome = VerifyProtectionOutcome {
+            lines: vec!["versioning                 pass".to_string(); 3],
+            exit_code: VERIFY_PROTECTION_UNKNOWN,
+        };
+        let line_bytes = outcome.lines[0].len() + 1;
+        for accept in [0, line_bytes, 3 * line_bytes] {
+            let mut out = ClosingWriter {
+                accept,
+                kind: std::io::ErrorKind::BrokenPipe,
+                written: Vec::new(),
+            };
+            write_verify_protection(&mut out, &outcome).unwrap_or_else(|err| {
+                panic!("accept {accept}: a closed pipe is not an error: {err}")
+            });
+        }
+        let mut out = ClosingWriter {
+            accept: 0,
+            kind: std::io::ErrorKind::PermissionDenied,
+            written: Vec::new(),
+        };
+        assert!(write_verify_protection(&mut out, &outcome).is_err());
+    }
+
+    /// A report that does not carry an expected condition cannot pass: the
+    /// condition prints as unknown and the command exits 2. A missing
+    /// condition that is not expected does not move the exit code.
+    #[test]
+    fn a_condition_missing_from_the_report_is_unknown() {
+        let mut report = fixture(&[]).0;
+        report
+            .conditions
+            .retain(|entry| entry.id != ProtectionConditionId::ObjectLock);
+        let outcome = render_verify_protection(&report, EXPECT_CORE, None);
+        assert_eq!(
+            outcome.lines[7],
+            "object-lock                unknown missing from the bucket-protection report"
+        );
+        assert_eq!(
+            outcome.lines.last().map(String::as_str),
+            Some("verify-protection: UNKNOWN: could not verify: object-lock")
+        );
+        assert_eq!(outcome.exit_code, VERIFY_PROTECTION_UNKNOWN);
+
+        let mut report = fixture(&[]).0;
+        report
+            .conditions
+            .retain(|entry| entry.id != ProtectionConditionId::DeleteMarkerReplication);
+        let outcome = render_verify_protection(&report, EXPECT_CORE, None);
+        assert_eq!(
+            outcome.lines[6],
+            "delete-marker-replication  unknown not expected, does not affect the exit code: \
+             missing from the bucket-protection report"
+        );
+        assert_eq!(outcome.exit_code, VERIFY_PROTECTION_PASS);
     }
 
     const COMPLIANT_LIFECYCLE: &str = "<LifecycleConfiguration><Rule><Status>Enabled</Status>\
@@ -1841,7 +2241,7 @@ mod tests {
     }
 
     /// `--store s3` reaches the concrete `S3Store`, so verify-protection reads
-    /// the bucket: four signed control-plane GETs, every expected condition
+    /// the bucket: four control-plane GETs, every expected condition
     /// `Pass`, exit 0. The same store handed over as `dyn ObjectStoreBackend`
     /// reads nothing and reports every condition unknown, exit 2.
     #[tokio::test]
@@ -2027,42 +2427,62 @@ mod tests {
         );
     }
 
-    /// A list page size other than the production one can only be built
-    /// under the library's default checksum settings, so the combination with
-    /// the CLI's default is refused by name rather than built without the
+    /// `store qualify --list-page-size 2 --store s3`, as the disaster recovery
+    /// rehearsal runs it, builds under the default `crc64nvme`: the page size
+    /// reaches the store, so listing three keys takes two LIST requests where
+    /// the production page size takes one, and the PUTs still carry the
     /// checksum.
-    #[test]
-    fn a_custom_list_page_size_on_s3_refuses_non_default_checksum_settings() {
-        let err = match build_store_handle(&s3_args("http://127.0.0.1:9000", false), Some(10)) {
-            Ok(_) => panic!("crc64nvme with --list-page-size 10 must be refused"),
-            Err(err) => err.to_string(),
-        };
-        assert!(
-            err.contains("--list-page-size 10") && err.contains("--s3-upload-integrity crc64nvme"),
-            "{err}"
-        );
-        build_store_handle(
-            &s3_args("http://127.0.0.1:9000", false),
-            Some(LIST_PAGE_SIZE),
-        )
-        .expect("the production page size keeps the selected settings");
+    #[tokio::test]
+    async fn a_small_list_page_size_on_s3_keeps_the_upload_checksum() {
+        let (endpoint, fake) = crate::fake_s3::spawn(crate::fake_s3::Echo::Stored, &[]).await;
+        let args = s3_args(&endpoint, false);
+        assert_eq!(args.s3_upload_integrity, S3UploadIntegrity::Crc64Nvme);
+        let built = build_store_handle(&args, Some(2))
+            .expect("--list-page-size 2 builds under the default upload integrity");
+        assert!(matches!(built, BuiltStore::S3 { .. }));
+        let store = built.backend();
+        for key in ["t/pages/a", "t/pages/b", "t/pages/c"] {
+            store
+                .put(key, Bytes::from_static(b"page"), PutOptions::default())
+                .await
+                .expect("put");
+        }
 
-        let off = StoreArgs::try_parse_from([
-            "ravel-cli",
-            "--store",
-            "s3",
-            "--s3-bucket",
-            "ravel-test",
-            "--s3-endpoint",
-            "http://127.0.0.1:9000",
-            "--s3-access-key",
-            "test",
-            "--s3-secret-key",
-            "test",
-            "--s3-upload-integrity",
-            "off",
-        ])
-        .expect("parse");
-        build_store_handle(&off, Some(10)).expect("off with a custom page size builds");
+        let listed = ravel_object_store::list_all(store.as_ref(), "t/pages/")
+            .await
+            .expect("list");
+        let keys: Vec<&str> = listed.iter().map(|meta| meta.key.as_str()).collect();
+        assert_eq!(keys, ["t/pages/a", "t/pages/b", "t/pages/c"]);
+        let starts: Vec<Option<String>> = fake
+            .lists()
+            .into_iter()
+            .map(|list| list.start_after)
+            .collect();
+        assert_eq!(starts, [None, Some("t/pages/b".to_string())]);
+
+        let puts = fake.puts();
+        assert_eq!(puts.len(), 3, "{puts:?}");
+        for put in &puts {
+            assert_eq!(
+                put.checksum_headers
+                    .iter()
+                    .filter(|(name, _)| name == "x-amz-checksum-crc64nvme")
+                    .count(),
+                1,
+                "{puts:?}"
+            );
+        }
+
+        let production = build_store_handle(&args, Some(ravel_object_store::s3::LIST_PAGE_SIZE))
+            .expect("the production page size builds")
+            .backend();
+        ravel_object_store::list_all(production.as_ref(), "t/pages/")
+            .await
+            .expect("list");
+        assert_eq!(
+            fake.lists().len(),
+            3,
+            "one more LIST at the production size"
+        );
     }
 }

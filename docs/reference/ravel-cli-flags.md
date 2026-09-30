@@ -286,11 +286,11 @@ Run the conformance suite against the configured backend and, on a pass, record 
 
 ### store verify-protection
 
-Read the bucket's protection configuration and check it against the deployment's expectations: one line per condition, then a summary. Exits 0 only when every expected condition passes, 1 when any fails, and 2 when any could not be verified or the bucket's control plane could not be reached. Read-only
+Read the bucket's protection configuration and check it against the deployment's expectations: one line per condition, then a summary. Exits 0 only when every expected condition passes, 1 when any fails, and 2 when any could not be verified or the bucket's control plane could not be reached. A usage error (a missing or malformed flag) also exits 2, before anything is read. Read-only
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
-| `--expect-object-retention` |  |  | Expect per-object compliance-mode retention: the newest current object of each protected prefix family, and one noncurrent version, must carry it. Without it the condition is printed and does not affect the exit code |
+| `--expect-object-retention` |  |  | Expect per-object compliance-mode retention: the most recently modified current object found in each protected prefix family, and one noncurrent version, must carry unexpired compliance-mode retention. A sampled object whose lock has lapsed is not a recent object, so it reads unknown rather than fail. Without this flag the condition is printed and does not affect the exit code |
 | `--expect-replication` |  |  | Expect replication: `delete-marker-replication` must pass. Without it the condition is printed and does not affect the exit code |
 | `--expected-noncurrent-days` |  |  | The noncurrent-version expiration, in days, the lifecycle rule covering `t/` must carry (`E_v`) |
 

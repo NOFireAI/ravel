@@ -1234,7 +1234,18 @@ impl S3Store {
     /// probe against this backend needs more keys than this store's actual
     /// page size, not a smaller declared one.
     pub fn with_page_size(config: S3Config, page_size: usize) -> Result<Self, StoreError> {
-        let mut store = Self::new(config)?;
+        Self::with_http_config_and_page_size(config, S3HttpConfig::default(), page_size)
+    }
+
+    /// [`S3Store::with_page_size`] with an explicit [`S3HttpConfig`], so a
+    /// caller that needs a non-default page size keeps its checksum and
+    /// timeout settings rather than falling back to the library defaults.
+    pub fn with_http_config_and_page_size(
+        config: S3Config,
+        http: S3HttpConfig,
+        page_size: usize,
+    ) -> Result<Self, StoreError> {
+        let mut store = Self::with_http_config(config, http)?;
         store.page_size = page_size.max(1);
         Ok(store)
     }
