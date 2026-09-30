@@ -274,8 +274,9 @@ impl ChecksumEcho {
     /// The one line `store qualify` prints for this outcome.
     pub fn line(&self) -> String {
         let text = match self {
-            ChecksumEcho::Verified => "verified: the endpoint returned the crc64nvme checksum \
-                                      it stored for the probe PUT, and it matched the body"
+            ChecksumEcho::Verified => "verified: the endpoint returned a stored checksum for \
+                                      the crc64nvme probe PUT read back whole, and it matched \
+                                      the body"
                 .to_string(),
             ChecksumEcho::NotReturned => "not returned: the endpoint returned no stored checksum \
                                           for a crc64nvme PUT read back whole, so whole-object \
@@ -617,6 +618,179 @@ mod tests {
         assert_eq!(
             metrics.snapshot(),
             ravel_object_store::StoreMetricsSnapshot::default()
+        );
+    }
+
+    /// `--store s3` parsed as an operator types it, against `endpoint`, with
+    /// `extra` flags appended.
+    fn s3_store(endpoint: &str, extra: &[&str]) -> BuiltStore {
+        use clap::Parser;
+        let mut argv = vec![
+            "ravel-cli",
+            "--store",
+            "s3",
+            "--s3-bucket",
+            "ravel-test",
+            "--s3-endpoint",
+            endpoint,
+            "--s3-access-key",
+            "test",
+            "--s3-secret-key",
+            "test",
+        ];
+        argv.extend_from_slice(extra);
+        let args = crate::store::StoreArgs::try_parse_from(argv).expect("flags parse");
+        crate::store::build_store_handle(&args, Some(ravel_object_store::s3::LIST_PAGE_SIZE))
+            .expect("s3 builds")
+    }
+
+    fn bucket_answers() -> [(&'static str, axum::http::StatusCode, &'static str); 3] {
+        use axum::http::StatusCode;
+        [
+            ("versioning", StatusCode::OK, fake_bucket_body("versioning")),
+            ("lifecycle", StatusCode::OK, fake_bucket_body("lifecycle")),
+            (
+                "object-lock",
+                StatusCode::OK,
+                fake_bucket_body("object-lock"),
+            ),
+        ]
+    }
+
+    /// Issue #2197, CLI half: the store `store qualify` builds from `--store
+    /// s3` keeps the concrete `S3Store`, so its bucket probe lines read the
+    /// bucket (three control-plane GETs) and report `enabled` and `on`. The
+    /// same store as `dyn ObjectStoreBackend` reads nothing and reports
+    /// `unknown`, which is what qualify printed before.
+    #[tokio::test]
+    async fn qualify_probe_lines_read_the_bucket_through_the_concrete_s3_store() {
+        use crate::fake_s3::{Echo, spawn};
+
+        let (endpoint, fake) = spawn(Echo::Stored, &bucket_answers()).await;
+        let built = s3_store(&endpoint, &[]);
+        let lines = built_bucket_probe_lines(&built).await;
+        assert_eq!(
+            fake.control_plane(),
+            vec!["versioning", "lifecycle", "object-lock"]
+        );
+        assert!(
+            lines[0].starts_with(&format!("{:<40} enabled ", "object_lock/versioning")),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].starts_with(&format!("{:<40} on ", "bucket/versioning")),
+            "{lines:?}"
+        );
+
+        let through_dyn = built_bucket_probe_lines(&BuiltStore::Other(built.backend())).await;
+        assert!(
+            through_dyn[0].starts_with(&format!("{:<40} unknown ", "object_lock/versioning")),
+            "{through_dyn:?}"
+        );
+        assert!(
+            through_dyn[1].starts_with(&format!("{:<40} unknown ", "bucket/versioning")),
+            "{through_dyn:?}"
+        );
+        assert_eq!(fake.control_plane().len(), 3, "the dyn path reads nothing");
+    }
+
+    /// The echo check against an endpoint that returns the stored checksum,
+    /// one that returns none, and one that returns a different one: verified,
+    /// not returned, and a qualify failure. The probe PUT carries
+    /// `x-amz-checksum-crc64nvme`, and the probe object is deleted each time.
+    #[tokio::test]
+    async fn checksum_echo_reports_verified_not_returned_and_mismatch() {
+        use crate::fake_s3::{Echo, spawn};
+
+        let key = "sys/qualify/run/checksum-echo";
+        for (echo, expected) in [
+            (Echo::Stored, ChecksumEcho::Verified),
+            (Echo::Nothing, ChecksumEcho::NotReturned),
+        ] {
+            let (endpoint, fake) = spawn(echo, &[]).await;
+            let outcome = checksum_echo(&s3_store(&endpoint, &[]), key).await;
+            assert_eq!(outcome, expected, "{echo:?}");
+            assert_eq!(outcome.failure(), None);
+            let puts = fake.puts();
+            assert_eq!(puts.len(), 1, "{puts:?}");
+            assert!(
+                puts[0]
+                    .checksum_headers
+                    .iter()
+                    .any(|(name, _)| name == "x-amz-checksum-crc64nvme"),
+                "{puts:?}"
+            );
+            assert_eq!(fake.deletes(), vec![key.to_string()]);
+            assert_eq!(fake.object_count(), 0, "the probe object is cleaned up");
+        }
+
+        assert_eq!(
+            ChecksumEcho::Verified.line(),
+            format!(
+                "{:<40} verified: the endpoint returned a stored checksum for the crc64nvme \
+                 probe PUT read back whole, and it matched the body",
+                "checksum/stored_echo"
+            )
+        );
+        assert_eq!(
+            ChecksumEcho::NotReturned.line(),
+            format!(
+                "{:<40} not returned: the endpoint returned no stored checksum for a crc64nvme \
+                 PUT read back whole, so whole-object reads are served unverified",
+                "checksum/stored_echo"
+            )
+        );
+
+        let (endpoint, fake) = spawn(Echo::Wrong, &[]).await;
+        let outcome = checksum_echo(&s3_store(&endpoint, &[]), key).await;
+        let failure = outcome
+            .failure()
+            .expect("a mismatched checksum fails qualify");
+        assert!(
+            failure.contains("does not match the crc64nvme checksum sent with it"),
+            "{failure}"
+        );
+        assert!(outcome.line().contains(" FAIL "), "{}", outcome.line());
+        assert_eq!(fake.deletes(), vec![key.to_string()]);
+    }
+
+    /// With upload integrity off, with the stored checksum not requested, or
+    /// on a non-S3 backend, the check says why it did not run and sends
+    /// nothing.
+    #[tokio::test]
+    async fn checksum_echo_is_not_checked_without_a_stored_checksum_to_ask_for() {
+        use crate::fake_s3::{Echo, spawn};
+
+        let key = "sys/qualify/run/checksum-echo";
+        let (endpoint, fake) = spawn(Echo::Stored, &[]).await;
+        let off = checksum_echo(&s3_store(&endpoint, &["--s3-upload-integrity", "off"]), key).await;
+        assert_eq!(
+            off.line(),
+            format!(
+                "{:<40} not checked (upload integrity off)",
+                "checksum/stored_echo"
+            )
+        );
+        let not_requested = checksum_echo(
+            &s3_store(&endpoint, &["--s3-request-stored-checksum=false"]),
+            key,
+        )
+        .await;
+        assert!(
+            matches!(&not_requested, ChecksumEcho::NotChecked(reason)
+                if reason.starts_with("--s3-request-stored-checksum=false")),
+            "{not_requested:?}"
+        );
+        let memory = checksum_echo(
+            &BuiltStore::Other(Arc::new(ravel_object_store::memory::MemoryStore::new())),
+            key,
+        )
+        .await;
+        assert!(matches!(memory, ChecksumEcho::NotChecked(_)), "{memory:?}");
+        assert!(
+            fake.puts().is_empty(),
+            "nothing was sent: {:?}",
+            fake.puts()
         );
     }
 }
