@@ -8,6 +8,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`s3_e2e_bench` counts adaptive-age flushes** (issue #2186). Its printed
+  flush breakdown gains an `age_adaptive=` field between `age=` and
+  `age_floor=`, matching `ingest_bench`, its JSON report gains
+  `flushes_by_age_adaptive`, and `estimated_put_count` includes those
+  flushes. The counter is zero while the run leaves `adaptive_flush_delay`
+  off.
 - **RLOG log objects are now written and read at trailer version 5**
   (ADR-2135, issue #2139). The footer gains a sort descriptor and a clustering
   generation, the BLOOM section starts with the list of columns its filters
