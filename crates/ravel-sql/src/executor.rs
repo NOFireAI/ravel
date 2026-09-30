@@ -756,9 +756,9 @@ fn unbounded_estimate_components(target: TargetSignal) -> Vec<&'static str> {
         TargetSignal::Logs | TargetSignal::Spans | TargetSignal::Alerts | TargetSignal::Audit => {
             vec!["estimated_decompressed_bytes"]
         }
-        // `parquet::estimate_cost` reads the manifest and bounds
-        // `estimated_requests` and `estimated_store_bytes` (a cold-cache,
-        // full-scan upper envelope, like the segment estimators above); it
+        // `parquet::estimate_cost` reads the manifest and fills
+        // `estimated_requests` and `estimated_store_bytes` (assuming a cold
+        // cache and a full scan, like the segment estimators above); it
         // passes a literal zero for `estimated_decompressed_bytes` because
         // no Parquet estimator computes one, the same "unknown, not zero"
         // case as the logs/spans arm.
