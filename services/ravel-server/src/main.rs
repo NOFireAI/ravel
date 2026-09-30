@@ -305,10 +305,12 @@ async fn main() -> anyhow::Result<()> {
     )?;
     ravel_server::warn_plaintext_federation(&remote_clusters);
 
-    let resolver_bundle = ravel_server::tenant::build_auth_resolver(
-        tenant_tokens,
+    let tenant_principals = cli.parse_tenant_principals()?;
+    let resolver_bundle = ravel_server::tenant::build_auth_resolver_with_principals(
+        tenant_principals,
         cli.dev_insecure_tenant_header,
         auth,
+        cli.oidc_ddl_claim.clone(),
     )?;
     // Retention windows are validated at startup against the ADR-0019 floor,
     // using the SAME max_ingest_lag this process's catalog resolve window uses

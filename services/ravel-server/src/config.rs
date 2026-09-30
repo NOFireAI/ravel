@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use ravel_maintain::RetentionPolicy;
+use ravel_tenant_resolve::Principal;
 use ravel_types::cost_profile::StoreCostProfile;
 use ravel_types::{TenantHash, TenantId};
 
@@ -985,6 +986,16 @@ pub struct Cli {
     /// startup rather than silently doing nothing.
     #[arg(long, value_name = "CLAIM")]
     pub oidc_tenant_claim: Option<String>,
+
+    /// Boolean claim that grants the `ddl` capability (ADR-2040 decision 4,
+    /// "Who may run DDL"): a verified token carrying this claim as the JSON
+    /// boolean `true` may run tenant-scoped DDL once that capability is
+    /// consumed by a query path (issue #2054; nothing reads it yet). A string,
+    /// a number, an array, or a missing claim never grants it. Unset (the
+    /// default), the capability is never granted via OIDC. Setting it without
+    /// OIDC enabled fails startup rather than silently doing nothing.
+    #[arg(long, value_name = "CLAIM")]
+    pub oidc_ddl_claim: Option<String>,
 
     /// How often the JWKS document is refetched, in seconds (ADR-0042
     /// decision 6). Only used when OIDC is enabled.
@@ -4323,6 +4334,27 @@ fn parse_bool_field(spec: &str, key: &str, value: &str) -> anyhow::Result<bool> 
     }
 }
 
+/// Splits the tenant side of a `TOKEN=TENANT` pair on its LAST `;`, granting
+/// the `ddl` capability (ADR-2040 decision 4) when the suffix after it is
+/// exactly `ddl` and the text before it is non-empty. A tenant with no `;` is
+/// returned unchanged with `ddl: false`. Any other suffix (wrong case, a
+/// different word, or none at all after a trailing `;`) or an empty tenant
+/// before the `;` is `Err`, so a typo refuses startup instead of silently
+/// granting nothing or naming an empty tenant.
+fn split_tenant_suffix(raw: &str) -> Result<(&str, bool), ()> {
+    match raw.rfind(';') {
+        None => Ok((raw, false)),
+        Some(idx) => {
+            let (tenant, suffix) = (&raw[..idx], &raw[idx + 1..]);
+            if suffix == "ddl" && !tenant.is_empty() {
+                Ok((tenant, true))
+            } else {
+                Err(())
+            }
+        }
+    }
+}
+
 impl Cli {
     /// Parses `args` as [`Parser::parse_from`] does, and then refuses the
     /// flags the parsed `--mode` never reads (ADR-1693): `--disable-fold` and
@@ -4409,6 +4441,23 @@ impl Cli {
     }
 
     pub fn parse_tenant_tokens(&self) -> anyhow::Result<HashMap<String, TenantId>> {
+        Ok(self
+            .parse_tenant_pairs()?
+            .into_iter()
+            .map(|(token, principal)| (token, principal.tenant))
+            .collect())
+    }
+
+    /// Same `TOKEN=TENANT` pairs as [`Self::parse_tenant_tokens`], but keeping
+    /// the `ddl` capability a `;ddl` tenant suffix grants (ADR-2040 decision
+    /// 4). Both parse the same shared pairs; [`Self::parse_tenant_tokens`]
+    /// drops the capability for callers that only ever wanted the tenant
+    /// (fold-tenant discovery, federation-mapping validation).
+    pub fn parse_tenant_principals(&self) -> anyhow::Result<HashMap<String, Principal>> {
+        self.parse_tenant_pairs()
+    }
+
+    fn parse_tenant_pairs(&self) -> anyhow::Result<HashMap<String, Principal>> {
         let mut map = HashMap::new();
         // `ctx` names where a malformed pair came from (an argv position, or a
         // file and line number) but never the pair's own text: for the file
@@ -4416,14 +4465,23 @@ impl Cli {
         // error to stderr, so echoing it back would leak the secret into the
         // container log.
         let insert_pair =
-            |map: &mut HashMap<String, TenantId>, pair: &str, ctx: &str| -> anyhow::Result<()> {
-                let (token, tenant) = pair
+            |map: &mut HashMap<String, Principal>, pair: &str, ctx: &str| -> anyhow::Result<()> {
+                let (token, tenant_raw) = pair
                     .split_once('=')
                     .ok_or_else(|| anyhow::anyhow!("invalid {ctx}, expected TOKEN=TENANT"))?;
-                if token.is_empty() || tenant.is_empty() {
+                if token.is_empty() || tenant_raw.is_empty() {
                     anyhow::bail!("invalid {ctx}, expected TOKEN=TENANT");
                 }
-                map.insert(token.to_string(), TenantId::new(tenant));
+                let (tenant, ddl) = split_tenant_suffix(tenant_raw).map_err(|()| {
+                    anyhow::anyhow!("invalid {ctx}, expected TENANT or TENANT;ddl")
+                })?;
+                map.insert(
+                    token.to_string(),
+                    Principal {
+                        tenant: TenantId::new(tenant),
+                        ddl,
+                    },
+                );
                 Ok(())
             };
 
@@ -4695,6 +4753,12 @@ impl Cli {
             if self.oidc_tenant_claim.is_some() {
                 anyhow::bail!(
                     "--oidc-tenant-claim was set but OIDC is not enabled (set --oidc-issuer and \
+                     --oidc-jwks-url)"
+                );
+            }
+            if self.oidc_ddl_claim.is_some() {
+                anyhow::bail!(
+                    "--oidc-ddl-claim was set but OIDC is not enabled (set --oidc-issuer and \
                      --oidc-jwks-url)"
                 );
             }
@@ -14487,6 +14551,110 @@ mod tests {
         assert_eq!(
             from_lf, from_crlf,
             "a CRLF tenant token file must parse to the same map as its LF equivalent"
+        );
+    }
+
+    /// A `;ddl` tenant suffix grants the capability (ADR-2040 decision 4) from
+    /// both `--tenant-token` and `--tenant-token-file`, and a tenant with no
+    /// `;` keeps `ddl: false`. A wrong implementation that grants `ddl` to
+    /// every token (ignoring the suffix) fails the `plain` assertion; one that
+    /// never grants it fails the `granted` assertion.
+    #[test]
+    fn tenant_token_ddl_suffix_grants_capability_via_flag_and_file() {
+        let file = tempfile::NamedTempFile::new().expect("temp token file");
+        std::fs::write(file.path(), "filetoken=beta;ddl\nplaintoken=gamma\n")
+            .expect("write tenant token file");
+
+        let from_flags = cli(&[
+            "--tenant-token",
+            "dev=acme;ddl",
+            "--tenant-token",
+            "plaintoken=gamma",
+        ])
+        .parse_tenant_principals()
+        .expect("ddl-suffixed and plain tenant tokens parse");
+        let from_file = cli(&[
+            "--tenant-token-file",
+            file.path().to_str().expect("utf8 path"),
+        ])
+        .parse_tenant_principals()
+        .expect("ddl-suffixed and plain tenant tokens parse from file");
+
+        let granted = from_flags.get("dev").expect("dev token present");
+        assert_eq!(granted.tenant, TenantId::new("acme"));
+        assert!(granted.ddl, "a ';ddl' suffix must grant the capability");
+
+        let plain = from_flags.get("plaintoken").expect("plaintoken present");
+        assert_eq!(plain.tenant, TenantId::new("gamma"));
+        assert!(
+            !plain.ddl,
+            "a tenant with no ';' must never carry the capability"
+        );
+
+        let file_granted = from_file.get("filetoken").expect("filetoken present");
+        assert_eq!(file_granted.tenant, TenantId::new("beta"));
+        assert!(
+            file_granted.ddl,
+            "a ';ddl' suffix from --tenant-token-file must grant the capability"
+        );
+
+        assert_eq!(
+            from_flags.get("dev").map(|p| &p.tenant),
+            Some(&TenantId::new("acme")),
+            "parse_tenant_principals must not change the resolved tenant"
+        );
+    }
+
+    /// `parse_tenant_tokens` (the plain `TenantId`-only path fold-tenant
+    /// discovery and federation-mapping validation use) must strip the `;ddl`
+    /// suffix down to the bare tenant, not leave it embedded in the
+    /// `TenantId`. A wrong implementation that forgets to strip fails this.
+    #[test]
+    fn tenant_token_tokens_strips_ddl_suffix_from_tenant_id() {
+        let tokens = cli(&["--tenant-token", "dev=acme;ddl"])
+            .parse_tenant_tokens()
+            .expect("ddl-suffixed tenant token parses");
+        assert_eq!(tokens.get("dev"), Some(&TenantId::new("acme")));
+    }
+
+    /// Every suffix other than exactly `;ddl`, and an empty tenant before the
+    /// `;`, refuses startup, naming the source position and never the pair's
+    /// text (the file source's text is the bearer token itself). A wrong
+    /// implementation that accepts any suffix, or is case-insensitive, fails
+    /// one of these.
+    #[test]
+    fn tenant_token_ddl_suffix_variants_are_refused() {
+        for bad in [
+            "dev=acme;DDL",
+            "dev=acme;admin",
+            "dev=acme;",
+            "dev=;ddl",
+            "dev=;",
+        ] {
+            let err = match cli(&["--tenant-token", bad]).parse_tenant_principals() {
+                Err(e) => e,
+                Ok(_) => panic!("'{bad}' must refuse startup, not parse silently"),
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains("--tenant-token (position 1)"),
+                "'{bad}': error must name the flag position, got: {msg}"
+            );
+            assert!(
+                !msg.contains(bad),
+                "'{bad}': error must never echo the pair's text, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn oidc_ddl_claim_without_oidc_fails_startup() {
+        let err = cli(&["--oidc-ddl-claim", "can_ddl"])
+            .parse_auth_resolvers()
+            .expect_err("--oidc-ddl-claim with no OIDC fails startup");
+        assert!(
+            err.to_string().contains("--oidc-ddl-claim"),
+            "error names the flag: {err}"
         );
     }
 
