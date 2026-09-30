@@ -102,13 +102,14 @@ use datafusion::prelude::SessionContext;
 use futures::{Stream, StreamExt};
 use ravel_catalog::{Catalog, Snapshot};
 use ravel_memory::MemoryBudget;
+use ravel_parquet::ReadLimits;
 use ravel_promql::{LabelMatcher, MatchOp};
 use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
 use ravel_query::io_shape::{IoShapeCounts, PlanClass, QueryIoShape, count_unfolded_segments};
 use ravel_query::{
-    LogSegmentFetcher, PhaseAccounting, PhaseAccountingSnapshot, QueryError, RequestBudget,
-    RequestBudgets, SegmentAdmission, SegmentFetcher, admit, request_budget_exceeded,
-    resolved_fold_lag,
+    ByteLimit, LogSegmentFetcher, PhaseAccounting, PhaseAccountingSnapshot, QueryError,
+    RequestBudget, RequestBudgets, RequestLimit, SegmentAdmission, SegmentFetcher, admit,
+    request_budget_exceeded, resolved_fold_lag,
 };
 use ravel_types::accounting::{
     AccountedOp, CostEstimate, QueryAccounting, QueryAccountingSnapshot,
@@ -1636,11 +1637,19 @@ impl SqlExecutor {
         };
         let parquet_tables = match (parquet, &self.parquet) {
             (Some(resolution), Some(sources)) => {
+                // One ledger per query, shared by every reader it opens, over
+                // the executor's process memory budget.
+                let limits = ReadLimits::new(
+                    Arc::clone(&self.process_memory_budget),
+                    ByteLimit::Unlimited,
+                    RequestLimit::Unlimited,
+                );
                 let tables = parquet::build_tables(
                     sources,
                     tenant_hash,
                     &resolution,
                     phase_accounting,
+                    &limits,
                     false,
                 )
                 .await?;

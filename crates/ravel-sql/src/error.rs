@@ -34,6 +34,7 @@
 use datafusion::error::DataFusionError;
 use ravel_catalog::{CatalogError, LoadColumnStatsError};
 use ravel_object_store::StoreError;
+use ravel_parquet::{ParquetReadError, ParquetTableError};
 use ravel_query::{FetchError, FoldLag, LogFetchError};
 
 use crate::parquet::ParquetQueryError;
@@ -358,8 +359,38 @@ pub enum SqlError {
 }
 
 impl From<ParquetQueryError> for SqlError {
+    /// A Parquet read refused by the process memory budget or a query budget
+    /// is the error the signal scans raise for the same refusal, so it has
+    /// the same class, status and client message; every other Parquet failure
+    /// stays a [`SqlError::Parquet`].
     fn from(err: ParquetQueryError) -> Self {
-        SqlError::Parquet(Box::new(err))
+        let read = match &err {
+            ParquetQueryError::Read(read)
+            | ParquetQueryError::Table(ParquetTableError::Read { source: read, .. }) => Some(read),
+            _ => None,
+        };
+        match read {
+            Some(&ParquetReadError::MemoryExhausted {
+                requested,
+                reserved,
+                limit,
+            }) => SqlError::Fetch(FetchError::FetchMemoryExhausted {
+                requested,
+                reserved,
+                limit,
+            }),
+            Some(&ParquetReadError::RequestBudgetExceeded { requests, max }) => {
+                SqlError::RequestBudgetExceeded {
+                    requests,
+                    max,
+                    fold_lag: FoldLag::Healthy,
+                }
+            }
+            Some(&ParquetReadError::BytesBudgetExceeded { scanned, max }) => {
+                SqlError::TooManyBytesScanned { scanned, max }
+            }
+            _ => SqlError::Parquet(Box::new(err)),
+        }
     }
 }
 
