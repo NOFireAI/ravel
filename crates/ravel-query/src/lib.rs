@@ -4,6 +4,7 @@
 #[cfg(test)]
 mod cache_correctness;
 mod config;
+mod dedup_order;
 pub mod distrib;
 mod engine;
 pub mod erasure;
@@ -37,6 +38,7 @@ pub use config::{
     derive_max_s3_requests, derive_max_s3_requests_for, fold_lag_tail_threshold, healthy_tail_max,
     request_budget_parts, resolve_logs_fetch,
 };
+pub use dedup_order::{DedupKey, serves_over};
 pub use engine::{
     Coverage, LiveQueryAccounting, QueryEngine, QueryStats, snapshot_erasure_predicates,
 };

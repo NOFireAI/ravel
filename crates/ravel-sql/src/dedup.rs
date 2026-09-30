@@ -2,14 +2,11 @@
 //! `(series_id, ts)`-sorted stream.
 //!
 //! For each `(series_id, ts)` group of adjacent rows it emits the winning
-//! candidate under the full dedup total order (docs/catalog-and-mvcc.md,
-//! `is_greater` in crates/ravel-query/src/engine.rs): greatest
-//! `(created_unix_ns, writer_epoch, writer_seq, in_page_index)`, ties broken
-//! by greatest `value.to_bits()`. Because that order is total over the
-//! provenance tuple plus the value bits, the winner does not depend on
-//! arrival order within a group, so merge interleaving at equal keys cannot
-//! change the result. The operator holds one candidate of state
-//! per in-flight group, strips the provenance columns, emits the public
+//! candidate under [`ravel_query::serves_over`], the same total order the
+//! PromQL engine's merge applies. Because that order is total, the winner
+//! does not depend on arrival order within a group, so merge interleaving at
+//! equal keys cannot change the result. The operator holds one candidate of
+//! state per in-flight group, strips the provenance columns, emits the public
 //! schema, and counts yielded (post-dedup) rows against `max_samples`.
 
 use std::fmt;
@@ -36,13 +33,10 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
 use futures::{Stream, StreamExt};
+use ravel_query::{DedupKey, serves_over};
 
 use crate::error::SqlError;
 use crate::schema::{COL_LABELS, PUBLIC_COLUMNS, public_schema};
-
-/// The winner-selection key: greater wins. Value bits are the final
-/// tiebreak, exactly as `is_greater` orders candidates.
-type DedupKey = (i64, u64, u64, u32, u64);
 
 /// Streaming dedup operator. Input is the single-partition, `(series_id,
 /// ts)`-sorted stream produced by `SortPreservingMergeExec`.
@@ -393,16 +387,16 @@ impl DedupStream {
         for i in 0..batch.num_rows() {
             let series = cols.series_id(i)?;
             let ts = cols.ts(i);
-            let key: DedupKey = (
+            let key = DedupKey::from_parts(
                 cols.created(i),
                 cols.epoch(i),
                 cols.seq(i),
                 cols.in_page(i),
-                cols.value(i).to_bits(),
+                cols.value(i),
             );
             match &mut self.pending {
                 Some(p) if p.series == series && p.ts == ts => {
-                    if key > p.key {
+                    if serves_over(&key, &p.key) {
                         p.key = key;
                         p.row = batch.slice(i, 1);
                     }

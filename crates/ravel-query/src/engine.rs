@@ -3813,26 +3813,20 @@ struct Candidate {
     priority: (i64, u64, u64, u32),
 }
 
-/// Cross-segment (and within-segment) duplicate-sample total order
-/// (docs/catalog-and-mvcc.md): `(created_unix_ns, writer_epoch, writer_seq,
-/// in-page index)`, greatest wins; ties broken by raw value bit pattern for
-/// full determinism.
+/// Cross-segment (and within-segment) duplicate-sample order: the shared
+/// [`serves_over`](crate::serves_over) rule, which documents it.
 ///
-/// Cross-cluster limitation (ADR-0071): when this merge pool is fed
-/// by cross-cluster federation (`federate_scalar`), the provenance tuple is
-/// cluster-LOCAL state with no cross-cluster meaning -- two clusters mint
-/// `writer_epoch`/`writer_seq` independently. This order is therefore defined
-/// only for DISJOINT cross-cluster series identity (the intended deployment:
-/// one series lives in exactly one cluster). For a mirrored-ingest deployment
-/// where the same `(series_id, ts)` arrives from two clusters with different
-/// values, the winner is unspecified (still deterministic for fixed inputs, but
-/// not meaningfully ordered); a globally meaningful cross-cluster ordering is a
-/// separate ADR. See docs/query-engine.md "Cross-cluster duplicate tie-break
-/// limitation". The discovery union (`federate_discovery`) does not reach this
-/// site: it enumerates series identities with no per-sample tie-break, so
-/// duplicate identities collapse cleanly regardless of provenance.
+/// When this merge pool is fed by cross-cluster federation
+/// (`federate_scalar`) the winner for a mirrored `(series_id, ts)` is
+/// deterministic but not meaningfully ordered (ADR-0071). The discovery union
+/// (`federate_discovery`) does not reach this site: it enumerates series
+/// identities with no per-sample tie-break.
+#[inline]
 fn is_greater(a: &Candidate, b: &Candidate) -> bool {
-    (a.priority, a.value.to_bits()) > (b.priority, b.value.to_bits())
+    crate::serves_over(
+        &crate::DedupKey::new(a.priority, a.value),
+        &crate::DedupKey::new(b.priority, b.value),
+    )
 }
 
 /// Where one run's samples get their ADR-0010 §5 dedup priorities from. The
