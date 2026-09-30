@@ -107,31 +107,30 @@ pub enum ErasureError {
     Decode(#[from] prost::DecodeError),
 }
 
-/// The highest `ravel.commit.v1.Signal` value this build reads.
-const MAX_SIGNAL: i32 = ravel_proto::commit::v1::Signal::Audit as i32;
-
-/// The highest `ErasureDeferralCause` value this build reads.
-const MAX_DEFERRAL_CAUSE: i32 = ErasureDeferralCause::LegalHold as i32;
-
 impl ErasureError {
-    /// True when the record carries a format version, or a signal or deferral
-    /// cause enum value, above the highest this build reads: a peer on a newer
-    /// build can read it during a rolling upgrade, so a query surface answers
-    /// it as retryable. A new enum value can ship without a format version
-    /// bump, so it counts the same as a newer version. A version or value at
-    /// or below the supported minimum (proto3's default 0, an unstamped field,
-    /// or a negative value) is false, like every other variant: it is a fault
-    /// in immutable stored bytes that no build reads.
+    /// True when the record carries a format version above the highest this
+    /// build reads: a peer on a newer build can read it during a rolling
+    /// upgrade, so a query surface answers it as retryable. A version below
+    /// the supported one (proto3's default 0, an unstamped field) is false,
+    /// like every other variant: it is a fault in immutable stored bytes that
+    /// no build reads.
+    ///
+    /// An unknown signal is false for every value. Requests and rewrite
+    /// records are read only under their own signal's key prefix and checked
+    /// against it, and a newer build writes a new signal under a prefix this
+    /// build never lists, so an unknown signal read here is a record that
+    /// disagrees with its own key. An unknown deferral cause is false too: it
+    /// comes only from a completion record, which no query route decodes.
     ///
     /// Every variant is named, so a new one fails to compile until it is
     /// classified here.
     pub fn is_newer_format_version(&self) -> bool {
         match self {
             ErasureError::UnsupportedFormatVersion { expected, actual } => actual > expected,
-            ErasureError::UnknownSignal(value) => *value > MAX_SIGNAL,
-            ErasureError::UnknownDeferralCause(value) => *value > MAX_DEFERRAL_CAUSE,
 
-            ErasureError::InvalidTenantHashLen(_)
+            ErasureError::UnknownSignal(_)
+            | ErasureError::UnknownDeferralCause(_)
+            | ErasureError::InvalidTenantHashLen(_)
             | ErasureError::InvalidRequestId(_)
             | ErasureError::EmptyPredicate
             | ErasureError::EmptyPredicateMatcherKey
@@ -1615,50 +1614,43 @@ mod tests {
         haystack.windows(needle.len()).any(|w| w == needle)
     }
 
-    /// `MAX_SIGNAL` and `MAX_DEFERRAL_CAUSE` are the highest values the
-    /// validators accept: the value itself passes and the next one is refused.
+    /// Only a format version above the supported one is newer. A version of
+    /// 0 (an unstamped field) is not, and neither is any unknown signal or
+    /// deferral cause, including one above the highest value this build
+    /// knows.
     #[test]
-    fn enum_maxima_match_the_validators() {
-        assert_eq!(check_signal(MAX_SIGNAL), Ok(()));
+    fn only_a_format_version_above_the_supported_one_is_newer() {
+        let above_max_signal = ravel_proto::commit::v1::Signal::Audit as i32 + 1;
+        let above_max_cause = ErasureDeferralCause::LegalHold as i32 + 1;
         assert_eq!(
-            check_signal(MAX_SIGNAL + 1),
-            Err(ErasureError::UnknownSignal(MAX_SIGNAL + 1))
+            check_signal(above_max_signal),
+            Err(ErasureError::UnknownSignal(above_max_signal))
         );
-        let completion = |deferral_cause| ErasureCompletion {
-            deferral_cause,
-            ..valid_completion()
-        };
-        assert_eq!(validate_completion(&completion(MAX_DEFERRAL_CAUSE)), Ok(()));
         assert_eq!(
-            validate_completion(&completion(MAX_DEFERRAL_CAUSE + 1)),
-            Err(ErasureError::UnknownDeferralCause(MAX_DEFERRAL_CAUSE + 1))
+            validate_completion(&ErasureCompletion {
+                deferral_cause: above_max_cause,
+                ..valid_completion()
+            }),
+            Err(ErasureError::UnknownDeferralCause(above_max_cause))
         );
-    }
 
-    /// A version or enum value above the highest this build reads is newer; 0
-    /// (an unstamped field) and a negative value are not.
-    #[test]
-    fn only_values_above_the_supported_maximum_are_newer() {
-        let newer = [
+        assert!(
             ErasureError::UnsupportedFormatVersion {
                 expected: FORMAT_VERSION,
                 actual: FORMAT_VERSION + 1,
-            },
-            ErasureError::UnknownSignal(MAX_SIGNAL + 1),
-            ErasureError::UnknownDeferralCause(MAX_DEFERRAL_CAUSE + 1),
-        ];
-        for err in &newer {
-            assert!(err.is_newer_format_version(), "{err:?}");
-        }
+            }
+            .is_newer_format_version()
+        );
 
         let not_newer = [
             ErasureError::UnsupportedFormatVersion {
                 expected: FORMAT_VERSION,
                 actual: 0,
             },
+            ErasureError::UnknownSignal(above_max_signal),
             ErasureError::UnknownSignal(0),
             ErasureError::UnknownSignal(-1),
-            ErasureError::UnknownDeferralCause(0),
+            ErasureError::UnknownDeferralCause(above_max_cause),
             ErasureError::UnknownDeferralCause(-1),
             ErasureError::InvalidTenantHashLen(3),
         ];
