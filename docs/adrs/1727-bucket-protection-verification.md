@@ -144,8 +144,10 @@ data; verification is reads of configuration.
    `E_v` and no replication or retention expectation, so
    `noncurrent-expiration` checks presence in-process (narrowed by the
    server gate amendment below: the gate also fails the condition on rules
-   that keep noncurrent versions longer or expire them sooner) and the exact
-   value only in the CLI; `delete-marker-replication` and `object-retention` are
+   that keep noncurrent versions longer, covering rules that disagree on
+   `NoncurrentDays`, or rules that expire noncurrent versions sooner) and
+   the exact value only in the CLI; `delete-marker-replication` and
+   `object-retention` are
    CLI-only (and `object-retention` is not checked by the CLI either yet: see
    the verify-protection retention amendment below). `Unknown` stays a
    warning plus gauge, as ADR-0072 decided.
@@ -350,14 +352,17 @@ ways.
 
 2. **The bucket-configuration read has a deadline.** The server bounds its
    whole read of the report (the three GETs `?versioning`, `?lifecycle` and
-   `?object-lock`) with one 15 s deadline. A read that has not finished by
+   `?object-lock`) with one 10 s deadline. A read that has not finished by
    then counts every checked condition `Unknown`, which logs a warning,
    sets the gauges and starts, as decision 5 and ADR-0072 decided for
    `Unknown`; it never refuses. The value comes from the operator's liveness
    probe (5 s initial delay, 10 s period, failure threshold 3), which
    restarts a pod on its third consecutive failure, between about 25 s and
-   35 s after the pod starts depending on the probe's tick phase. 15 s
-   leaves at least 10 s of the earliest restart for the rest of startup.
+   35 s after the pod starts depending on the probe's tick phase. The
+   read-cache warm-up also runs before the main HTTP listener binds, which
+   the probe targets unless `dedicated_health_port` is set, and is bounded
+   by its own 10 s, so the two bounds together leave at least 5 s of the
+   earliest restart for the rest of startup.
    The deadline covers the bucket-configuration read only. The
    `sys/qualification` read that runs before it (ADR-0050 section 6) goes
    through the retrying data-plane store and is bounded only by the store's

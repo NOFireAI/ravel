@@ -181,10 +181,12 @@ per tenant. Each condition comes back passed, failed or unknown:
 - An unknown condition logs one warning and starts. On every backend other
   than S3 the check cannot read the configuration, so every condition is
   unknown.
-- The bucket-configuration read is bounded to 15 seconds. The Kubernetes
+- The bucket-configuration read is bounded to 10 seconds. The Kubernetes
   operator's liveness probe restarts a pod on its third consecutive failure,
-  between about 25 and 35 seconds after the pod starts, so the bound leaves at
-  least 10 seconds for the rest of startup. A read that has not finished by
+  between about 25 and 35 seconds after the pod starts. The read-cache
+  warm-up also runs before the main HTTP listener binds, bounded by its own
+  10 seconds, so the two bounds together leave at least 5 seconds for the
+  rest of startup. A read that has not finished by
   then leaves every condition unknown, which warns and starts.
 - The bound covers the bucket-configuration read only. The
   `sys/qualification` read runs before it, on the store's ordinary retrying

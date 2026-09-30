@@ -539,8 +539,8 @@ pub struct Cli {
     /// keeps NewerNoncurrentVersions, covering rules that disagree on
     /// NoncurrentDays, or a narrower rule that expires sooner) refuses to
     /// start; any other failed or undetermined condition, and a
-    /// bucket-configuration read that has not finished within 15 s, warns and
-    /// sets the `ravel_bucket_protection_*` gauges. The 15 s bound covers that
+    /// bucket-configuration read that has not finished within 10 s, warns and
+    /// sets the `ravel_bucket_protection_*` gauges. The 10 s bound covers that
     /// read only: the `sys/qualification` read before it is bounded by the
     /// store's own request timeout and retries.
     /// Default off: with the flag unset, startup is byte-identical to before

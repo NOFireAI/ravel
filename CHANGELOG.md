@@ -29,8 +29,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   whole-bucket lifecycle rule carrying the sanctioned actions, and their
   read-back checks all three actions, so a bucket left from an older launcher,
   or a backend that dropped one of the actions, fails it. The
-  bucket-configuration read is bounded to 15 s, which leaves at least 10 s
-  before the operator's liveness probe can first restart the pod (about 25 s
+  bucket-configuration read is bounded to 10 s, which, with the read-cache
+  warm-up's own 10 s bound, leaves at least 5 s before the operator's
+  liveness probe can first restart the pod (about 25 s
   after it starts); a read that has not finished by then leaves every
   condition unknown and starts. The bound covers that read only: the
   `sys/qualification` read that runs before it is bounded by the store's own

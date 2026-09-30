@@ -1351,9 +1351,11 @@ and `object-lock`. It never asks for `delete-marker-replication` or
   `rule-scope`, or `noncurrent-expiration` on an unversioned bucket) logs one
   warning and starts.
 - Every `Unknown` condition logs one warning and starts. The
-  bucket-configuration read is bounded to 15 seconds, which leaves at least 10
-  seconds before the Kubernetes operator's liveness probe can first restart
-  the pod (about 25 seconds after it starts); a read that has not finished by
+  bucket-configuration read is bounded to 10 seconds. With the read-cache
+  warm-up's own 10-second bound, which also runs before the main HTTP
+  listener binds, that leaves at least 5 seconds before the Kubernetes
+  operator's liveness probe can first restart the pod (about 25 seconds after
+  it starts); a read that has not finished by
   then leaves every condition `Unknown`. The bound covers that read only: the
   `sys/qualification` read that runs before it is bounded by the store's own
   request timeout and retries, so an endpoint that stalls every request holds

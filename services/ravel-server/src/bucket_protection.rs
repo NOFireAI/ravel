@@ -26,8 +26,9 @@
 //!   raises the `ravel_bucket_protection_unknown` gauge.
 //! - The bucket-configuration read is bounded by [`STARTUP_DEADLINE`]. A read
 //!   that has not finished by then makes every checked condition unknown, so
-//!   control-plane GETs that stall warn and start instead of holding startup
-//!   past the operator's earliest liveness restart. The bound covers this read
+//!   control-plane GETs that stall warn and start instead of holding startup,
+//!   together with the read-cache warm-up's own bound, past the operator's
+//!   earliest liveness restart. The bound covers this read
 //!   only: the `sys/qualification` read that runs before it goes through the
 //!   retrying store path and is bounded only by the store's own request
 //!   timeout and retries, so an endpoint that stalls every request holds
@@ -70,9 +71,11 @@ use ravel_object_store::s3::S3Store;
 /// before any listener binds, one after another, each bounded only by the
 /// store's request timeout (20 s by default). The operator's liveness probe
 /// restarts a pod on its third consecutive failure, which lands between about
-/// 25 s and 35 s after the pod starts depending on the probe's tick phase;
-/// 15 s leaves at least 10 s of that for the rest of startup.
-pub const STARTUP_DEADLINE: Duration = Duration::from_secs(15);
+/// 25 s and 35 s after the pod starts depending on the probe's tick phase.
+/// The read-cache warm-up also runs before the main HTTP listener binds and
+/// is bounded by its own 10 s, so 10 s here leaves at least 5 s of the
+/// earliest restart for the rest of startup.
+pub const STARTUP_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Count of checked conditions the last [`enforce`] call observed failed.
 /// Process-global, matching the other single-source, no-label `/metrics`
@@ -766,14 +769,19 @@ mod tests {
         let earliest_restart =
             Duration::from_secs(initial_delay_seconds + (failure_threshold - 1) * period_seconds);
         assert_eq!(earliest_restart, Duration::from_secs(25));
-        assert_eq!(STARTUP_DEADLINE, Duration::from_secs(15));
-        // The rest of startup (the qualification read on a store that
-        // answers, the tenancy and GC reads, the listener bind) needs the
-        // remainder.
-        assert_eq!(
-            earliest_restart.saturating_sub(STARTUP_DEADLINE),
-            Duration::from_secs(10)
-        );
+        assert_eq!(STARTUP_DEADLINE, Duration::from_secs(10));
+        // The read-cache warm-up also runs before the main HTTP listener
+        // binds, which the liveness probe targets unless
+        // `dedicated_health_port` is set, and the read cache is on by default.
+        let bounded = STARTUP_DEADLINE + crate::cache_warm::WARM_DEADLINE;
+        assert_eq!(bounded, Duration::from_secs(20));
+        assert!(bounded < earliest_restart);
+        // The warm-up is counted at its full bound above. The remainder
+        // covers the rest of startup up to the main HTTP listener bind: the
+        // qualification read on a store that answers, the tenancy and GC
+        // reads, the warm-up's return after its deadline cancels it, and the
+        // bind itself.
+        assert!(earliest_restart - bounded >= Duration::from_secs(5));
     }
 
     /// Flipped line: `enforce`'s single `probe_bucket_protection` call. One
