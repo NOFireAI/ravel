@@ -578,6 +578,11 @@ async fn deleting_a_keyed_record_resets_the_flush_after_a_refresh() {
     let cached = write(&router, clustering_records()).await;
     clock.advance_ns(PAST_HORIZON_NS);
     let reset = write(&router, clustering_records()).await;
+    assert_eq!(
+        router.metrics().clustering_key_unresolved_by_tenant(),
+        Vec::<TenantCount>::new(),
+        "a deleted record is the no-record default, not an unresolved layout"
+    );
     router.shutdown().await;
 
     for (token, generation) in [(keyed, 8), (cached, 8)] {

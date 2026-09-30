@@ -737,14 +737,24 @@ bytes as they were before this change. A set key writes a sort descriptor with
 the key's bucket width, key column types taken from the declared typed columns
 the flush stamps statistics from, and the key's generation; a cleared key
 writes no descriptor and the generation it was cleared at. The `undeclared`
-scope leaves exactly those declared typed columns out of bloom coverage. When
-the stored key or scope does not resolve against the record's declared typed
-columns (a key column that is not declared, for example), the flush still
+scope leaves exactly those declared typed columns out of bloom coverage.
+
+The layout is unresolved when the key names a column that is not a declared
+typed column, when the key is one the RLOG writer refuses to record (an empty
+or repeated column name, a column count outside 1 to 4, or generation 0), or
+when the stored scope is a value this build does not know. Scope resolution
+never depends on the declared typed columns; it fails only on an unknown
+value. Either failure leaves the whole layout unresolved: the flush still
 writes, with no descriptor, generation 0 and full bloom coverage; the overlay
 logs one warning each time it refreshes that tenant's entry, and each such
 flush adds one to the tenant's `ingest_clustering_key_unresolved_total` count,
-read through `LogIngestMetrics::clustering_key_unresolved_by_tenant`.
-`ravel-server` does not export that counter at `/metrics` yet.
+read through `LogIngestMetrics::clustering_key_unresolved_by_tenant`. That
+count is bounded the same way as the per-tenant PUT attribution (ADR-0076
+decision 2): at most `MAX_TRACKED_TENANTS` (1024) tenants carry a count, a
+new tenant past that replaces the one with the smallest count and inherits
+it, and each `TenantCount` carries that inherited part as its `error` bound,
+so the counts still sum to the total. `ravel-server` does not export that
+counter at `/metrics` yet.
 
 `LogIngestMetrics` mirrors `IngestMetrics` counter for counter under two
 renames that follow the unit change: `buffered_records_total` for
