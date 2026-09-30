@@ -1545,7 +1545,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   suffix, or an empty tenant before it, refuses startup. `--oidc-ddl-claim
   <CLAIM>` grants it from a verified OIDC token when that claim is present
   as the JSON boolean `true`. Nothing yet consumes the capability; it is
-  plumbing for `CREATE EXTERNAL TABLE` (#2054).
+  plumbing for `CREATE EXTERNAL TABLE` (#2054). Behaviour changes: a
+  static-map tenant containing `;` used to be accepted and now refuses
+  startup (the only static form for such a tenant would be `x;y;ddl`, which
+  also grants the capability); a token defined more than once with a
+  different tenant or capability, across flags and file, refuses startup
+  naming both positions instead of resolving last-wins (identical repeats
+  stay accepted); and an empty `--oidc-ddl-claim` refuses startup.
 
 ## [0.19.0] - 2026-09-27
 
