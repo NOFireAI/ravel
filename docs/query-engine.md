@@ -859,7 +859,12 @@ same RAII `reserve` API, so they read under `component="fetch"`.
 - All accept `min_commit_token`. Errors use the Prometheus JSON error
   envelope (`status:"error"`, `errorType`, `error`) with correct HTTP codes
   (400 bad_data, 422 unprocessable for unsupported constructs, 500 internal
-  for corrupt stored data, 503 unavailable for transient store failures).
+  for corrupt stored data, including a compaction record or erasure request
+  whose stored bytes fail to decode at a format version this build covers,
+  503 unavailable for transient store failures and for a catalog HEAD,
+  compaction record or erasure request written in a newer format version this
+  build cannot read, which a peer on a newer build can read during a rolling
+  upgrade).
 - Timestamps: Prometheus float seconds in, RFC3339 or float accepted like
   Prometheus; responses use float seconds with ms precision.
 - `resultType`: `vector`, `matrix`, `scalar`, `string`. A top-level scalar

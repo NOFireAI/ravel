@@ -13,7 +13,9 @@
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use ravel_catalog::CatalogError;
+use ravel_catalog::{CatalogError, SnapshotFormatError};
+use ravel_commit::erasure::ErasureError;
+use ravel_commit::record::RecordError;
 use ravel_cpu_gate::CpuGateError;
 use ravel_object_store::StoreError;
 
@@ -188,6 +190,14 @@ impl From<QueryError> for ApiError {
 /// unsatisfiable-token map to the retryable HTTP 503; each carries its own
 /// stable message so diagnosability survives redaction; the budget class
 /// keeps its own 422 mapping and unredacted counts.
+///
+/// The catalog arm follows the same rule the SQL boundary's `redact_catalog`
+/// does, so both surfaces answer the same fault the same way: a decode failure
+/// of stored bytes whose format version this build covers is corrupt (500,
+/// non-retryable), while a catalog object written in a newer format version
+/// this build cannot read stays unavailable (503, retryable), because a peer on
+/// a newer build can read it during a rolling upgrade. Every catalog variant is
+/// named (no wildcard) so a new one fails to compile until it is classified.
 fn redacted_storage_message(err: &QueryError) -> Option<&'static str> {
     match err {
         QueryError::Fetch(fetch) => Some(match fetch {
@@ -216,13 +226,55 @@ fn redacted_storage_message(err: &QueryError) -> Option<&'static str> {
         QueryError::Catalog(CatalogError::WindowTooWide { .. }) => None,
         QueryError::Catalog(catalog) => Some(match catalog {
             CatalogError::UnsatisfiableToken { .. } => MSG_UNSATISFIABLE,
+
+            // Corrupt stored data whose format version this build covers: a
+            // retry re-reads the same bytes and fails the same way, so it is
+            // the non-retryable 500, not the retryable 503.
             CatalogError::Reconstruction { .. }
             | CatalogError::FieldMismatch { .. }
             | CatalogError::Record(_)
             | CatalogError::Key(_) => MSG_CORRUPT,
-            // Store errors and any future catalog variant redact to the
-            // transient-unavailable message rather than risk leaking text.
-            _ => MSG_UNAVAILABLE,
+            CatalogError::CompactionRecordDecode {
+                source:
+                    RecordError::UnsupportedFormatVersion { .. }
+                    | RecordError::UnsupportedRecordFormatVersion { .. },
+                ..
+            } => MSG_UNAVAILABLE,
+            CatalogError::CompactionRecordDecode { .. } => MSG_CORRUPT,
+            CatalogError::ErasureRequestDecode {
+                source: ErasureError::UnsupportedFormatVersion { .. },
+                ..
+            } => MSG_UNAVAILABLE,
+            CatalogError::ErasureRequestDecode { .. } => MSG_CORRUPT,
+            CatalogError::SnapshotFormat(SnapshotFormatError::UnsupportedVersion(_)) => {
+                MSG_UNAVAILABLE
+            }
+            CatalogError::SnapshotFormat(_) => MSG_CORRUPT,
+
+            // A newer on-object format version this build cannot read is
+            // retryable: a peer on a newer build can read it during a rolling
+            // upgrade. 503.
+            CatalogError::UnsupportedHeadVersion { .. } => MSG_UNAVAILABLE,
+
+            // Never reached: the outer arm returns None for WindowTooWide.
+            // Matched only for exhaustiveness.
+            CatalogError::WindowTooWide { .. } => MSG_UNAVAILABLE,
+
+            // Transient storage faults, fold progress/liveness failures, and
+            // resource backpressure stay retryable. The rewrite/compaction
+            // structural faults are decode/consistency failures the same rule
+            // would call corrupt; they are not yet classified and keep the
+            // retryable message.
+            CatalogError::InvalidConfig(_)
+            | CatalogError::Store(_)
+            | CatalogError::FoldCasRetriesExhausted { .. }
+            | CatalogError::Provisioning(_)
+            | CatalogError::RewriteRecordDecode { .. }
+            | CatalogError::RewriteSupersessionChainTooDeep { .. }
+            | CatalogError::RewriteSupersessionCycle { .. }
+            | CatalogError::CompactionSupersessionInputMismatch { .. }
+            | CatalogError::ColumnStatsPartOverBound { .. }
+            | CatalogError::MemoryExhausted(_) => MSG_UNAVAILABLE,
         }),
         QueryError::NonMonotonicSamples { .. } => Some(MSG_CORRUPT),
         QueryError::SnapshotInvalidated => Some(MSG_UNAVAILABLE),
@@ -338,6 +390,7 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use ravel_commit::record::RecordKind;
     use ravel_object_store::StoreError;
 
     use super::*;
@@ -439,6 +492,104 @@ mod tests {
         let message = client_message(err);
         assert_eq!(message, MSG_UNAVAILABLE);
         assert_redacted(&message);
+    }
+
+    /// A decode failure of stored catalog bytes whose format version this build
+    /// covers is the non-retryable 500 `internal`: a retry re-reads the same
+    /// bytes. A newer format version this build cannot read stays the retryable
+    /// 503 `unavailable`, because a peer on a newer build can read it during a
+    /// rolling upgrade. The SQL boundary pins the same split, so both surfaces
+    /// answer alike.
+    #[test]
+    fn undecodable_catalog_objects_are_500_newer_versions_stay_503() {
+        let parts = |err: QueryError| ApiError::from(err).into_parts();
+
+        // Decode faults of a covered format version: non-retryable 500 internal.
+        let corrupt: Vec<fn() -> QueryError> = vec![
+            || {
+                QueryError::Catalog(CatalogError::CompactionRecordDecode {
+                    key: LEAKY_KEY.to_string(),
+                    source: RecordError::InvalidTenantHashLen(3),
+                })
+            },
+            || {
+                QueryError::Catalog(CatalogError::ErasureRequestDecode {
+                    key: LEAKY_KEY.to_string(),
+                    source: ErasureError::InvalidTenantHashLen(3),
+                })
+            },
+            || QueryError::Catalog(CatalogError::SnapshotFormat(SnapshotFormatError::BadMagic)),
+        ];
+        for make in &corrupt {
+            let p = parts(make());
+            assert_eq!(p.status.as_u16(), 500, "{:?}", make());
+            assert_eq!(p.error_type, "internal", "{:?}", make());
+            assert_eq!(p.message, MSG_CORRUPT, "{:?}", make());
+            assert_redacted(&p.message);
+        }
+
+        // Newer-format-version cases, including the unsupported-version case each
+        // decode fault carries in its source: retryable 503 unavailable.
+        let unavailable: Vec<fn() -> QueryError> = vec![
+            || QueryError::Catalog(CatalogError::UnsupportedHeadVersion { format_version: 2 }),
+            || {
+                QueryError::Catalog(CatalogError::SnapshotFormat(
+                    SnapshotFormatError::UnsupportedVersion(2),
+                ))
+            },
+            || {
+                QueryError::Catalog(CatalogError::CompactionRecordDecode {
+                    key: LEAKY_KEY.to_string(),
+                    source: RecordError::UnsupportedFormatVersion {
+                        expected: 1,
+                        actual: 2,
+                    },
+                })
+            },
+            || {
+                QueryError::Catalog(CatalogError::CompactionRecordDecode {
+                    key: LEAKY_KEY.to_string(),
+                    source: RecordError::UnsupportedRecordFormatVersion {
+                        kind: RecordKind::Compaction,
+                        min: 1,
+                        max: 2,
+                        actual: 3,
+                    },
+                })
+            },
+            || {
+                QueryError::Catalog(CatalogError::ErasureRequestDecode {
+                    key: LEAKY_KEY.to_string(),
+                    source: ErasureError::UnsupportedFormatVersion {
+                        expected: 1,
+                        actual: 2,
+                    },
+                })
+            },
+        ];
+        for make in &unavailable {
+            let p = parts(make());
+            assert_eq!(p.status.as_u16(), 503, "{:?}", make());
+            assert_eq!(p.error_type, "unavailable", "{:?}", make());
+            assert_eq!(p.message, MSG_UNAVAILABLE, "{:?}", make());
+            assert_redacted(&p.message);
+        }
+
+        // Control: an existing corrupt catalog variant stays 500, a transient
+        // store fault stays 503.
+        let field = parts(QueryError::Catalog(CatalogError::FieldMismatch {
+            key: LEAKY_KEY.to_string(),
+            field: "tenant_hash",
+            expected: "aaaa".to_string(),
+            actual: TENANT_HASH.to_string(),
+        }));
+        assert_eq!(field.status.as_u16(), 500);
+        assert_eq!(field.error_type, "internal");
+        let store = parts(QueryError::Catalog(CatalogError::Store(
+            StoreError::Permanent(RAW_STORE_TEXT.to_string()),
+        )));
+        assert_eq!(store.status.as_u16(), 503);
+        assert_eq!(store.error_type, "unavailable");
     }
 
     #[test]
