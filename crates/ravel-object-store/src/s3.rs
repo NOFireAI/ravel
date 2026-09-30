@@ -1245,8 +1245,9 @@ impl S3Store {
 // `S3Store` answers all three probe seams affirmatively from its own read-only
 // SigV4 GETs, while the `dyn ObjectStoreBackend` impls in `conformance.rs` stay
 // as they are (every field `Unknown`). `ObjectStoreBackend` itself is unchanged.
-// Nothing in the shipping binaries calls these yet (`ravel-cli store
-// verify-protection` and the server startup gate are tasks 2 and 3).
+// The shipping binaries do not reach these yet: `ravel-cli store qualify` and
+// the server's startup gate both probe through `dyn ObjectStoreBackend`, so
+// they report `Unknown` until they are handed the concrete store.
 
 #[async_trait::async_trait]
 impl crate::conformance::BucketControlPlane for S3Store {
