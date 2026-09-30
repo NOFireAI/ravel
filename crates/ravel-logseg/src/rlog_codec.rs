@@ -489,6 +489,30 @@ mod tests {
     }
 
     proptest! {
+        /// The stored-size winner never stores more bytes than the page
+        /// `encode_i64` or `encode_strings` alone would have produced, because
+        /// that page is one of the candidates.
+        #[test]
+        fn stored_choice_never_exceeds_the_codec_pick(
+            ints in proptest::collection::vec(
+                prop_oneof![any::<i64>(), 0i64..16, (0i64..50).prop_map(|s| s * 1_000_000_000)],
+                1..1500,
+            ),
+            strs in proptest::collection::vec(proptest::collection::vec(0u8..3, 0..12), 1..600),
+        ) {
+            use crate::page::{seal_page, smallest_stored};
+            let (enc, bytes) = encode_i64(&ints);
+            let before = seal_page(enc, bytes, 3).stored.len();
+            let after = smallest_stored(i64_candidates(&ints), 3).expect("candidate");
+            prop_assert!(after.stored.len() <= before, "{} > {before}", after.stored.len());
+
+            let refs: Vec<&[u8]> = strs.iter().map(Vec::as_slice).collect();
+            let (enc, bytes) = encode_strings(&refs);
+            let before = seal_page(enc, bytes, 3).stored.len();
+            let after = smallest_stored(string_candidates(&refs), 3).expect("candidate");
+            prop_assert!(after.stored.len() <= before, "{} > {before}", after.stored.len());
+        }
+
         #[test]
         fn i64_candidates_reproduce_encode_i64(
             vals in proptest::collection::vec(

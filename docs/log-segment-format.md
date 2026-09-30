@@ -42,9 +42,10 @@ Version 5 changed two byte layouts: the BLOOM section gained its
 covered-column list, and filters are no longer rounded to a power of two, so
 the version-4 BLOOM parser would misread a version-5 section. The footer gained
 two fields (`sort_descriptor`, `clustering_generation`). The writer at version
-5 still produces version 4's content: it records no sort descriptor and
-generation 0, covers every column version 4 indexed, and emits none of tags 10
-to 13. A version-4 object is refused with `UnsupportedVersion` from the
+5 records no sort descriptor and generation 0, covers every column version 4
+indexed, and emits neither tag 12 nor tag 13. It does emit tags 10 and 11, and
+it chooses each page's encoding by stored size (see "Encodings (tag
+registry)"). A version-4 object is refused with `UnsupportedVersion` from the
 trailer alone, before the footer or any section is requested. Under the
 pre-v1.0 posture below, a development store holding version-4 objects is wiped
 or re-ingested.
@@ -383,6 +384,13 @@ chunk, in that order, so one block contributes one or two pages to one chunk.
 A column absent from every row of a block is all-null and occupies zero bytes,
 and contributes no page to the chunk.
 
+`observed_ts` in a block where it equals `ts` row for row is stored as a
+column reference to `ts` (tag 11), a one-byte page, instead of a copy of the
+values. In any other block it is an ordinary i64 page. A reader decodes `ts`
+first, which every projection includes, and copies its values; a projection
+naming `observed_ts` therefore needs the `ts` page too, which it already
+fetches.
+
 The block's crc32c is stored in its SKIP_IDX level-0 entry, not inline, and
 covers the concatenation of the block's pages in ascending `column_id` order --
 which is what a whole-block read assembles once it has located them through
@@ -416,7 +424,8 @@ version-4 page through it.
    one row block, columnar (unchanged by version 4; only page placement moved):
 
    rows ->   r0 r1 r2 r3 r4 ... r8191
-   ts        [ delta / double-delta page       ]
+   ts        [ GCD / delta / double-delta page ]
+   observed  [ reference to ts, when equal     ]
    stream    [ RLE page: (ref,run)(ref,run) ...]
    sev_num   [ bit-packed FOR page             ]
    body      [ string plain: lengths | blob    ]
@@ -479,18 +488,37 @@ SKIP_IDX level-0 entry count.
 | 7 | dictionary | strings, f64 bits, fixed-width |
 | 8 | bitmap | bool columns, presence bitmaps |
 | 9 | fixed-width | trace_id (16B), span_id (8B) |
-| 10 | reserved: GCD i64 (ADR-2135 decision 3) | never written |
-| 11 | reserved: column reference (ADR-2135 decision 3) | never written |
+| 10 | GCD i64 (ADR-2135 decision 3) | i64 pages whose offsets from the page minimum share a divisor |
+| 11 | column reference (ADR-2135 decision 3) | `observed_ts` equal to `ts` |
 | 12 | reserved: row-group dictionary page (ADR-2135 decision 6) | never written |
 | 13 | reserved: row-group dictionary ids (ADR-2135 decision 6) | never written |
 
-Tags 10 to 13 are registered in the shared `ravel-codec` registry so the
-codecs of ADR-2135 decisions 3 and 6 can land without another registry
-change. At version 5 no writer emits them, and a PAGE_DIR page carrying one
-is `Corrupted`.
+Tags 10 to 13 are registered in the shared `ravel-codec` registry, whose
+encoders never emit them and whose decoders refuse them. Tags 10 and 11 are
+RLOG-only codecs, encoded and decoded in `ravel-logseg`. At version 5 no
+writer emits tag 12 or 13, and a PAGE_DIR page carrying one is `Corrupted`.
 
-The writer picks per page by measured encoded size, biased toward
-`constant` then `RLE` on ties (they also decode fastest). An unknown
+**Encoding choice (ADR-2135 decision 4).** The writer encodes every
+candidate encoding of a page once, passes each through the page
+compression envelope once (the 512-byte floor, zstd at the writer's
+`zstd_level` only when strictly smaller), and keeps the candidate with the
+fewest stored bytes. On a tie the earlier candidate in priority order wins.
+The candidates, in priority order:
+
+- i64 pages (`ts`, `observed_ts`, `stream_ref`, `severity_num`, `flags`,
+  i64 attributes): constant (only when every value is equal), RLE, plain,
+  delta-zigzag and double-delta (each only when no intermediate overflows),
+  FOR bit-pack, then GCD i64 (only when it applies). At most seven.
+- string pages (`severity_text`, `body`, `attrs_raw`, string and bytes
+  attributes): dictionary and plain. The one the `distinct / total <= 0.5`
+  heuristic would pick comes first. Two.
+- `observed_ts`, when it equals `ts` row for row: the column reference
+  alone, which is one byte.
+
+Bool, f64, `trace_id` and `span_id` pages and presence bitmaps keep their
+single encoding, chosen as before. A reader never needs to know which
+candidates the writer considered: the tag makes each page
+self-describing. An unknown
 `enc` byte is a typed `Corrupted` error, never a panic or a guess. All
 codecs are self-terminating against the caller-supplied element `count`
 and MUST consume exactly the bytes handed to them; trailing or missing
@@ -526,6 +554,32 @@ Comparisons are on the bit pattern, never `==`.
   for the encoded range (`min` is the true minimum). Packed byte length
   is `ceil(count * bit_width / 8)`; a `bit_width > 64` or a packed length
   that disagrees with the payload is `Corrupted`.
+- **GCD i64 (10):** `gcd` varint, `base` ivarint, the inner encoding tag
+  u8, then the inner encoding of the `count` quotients. The writer takes
+  `base` as the page minimum and each offset as `v.wrapping_sub(base)` in
+  u64, as FOR does, and offers the candidate only when the offsets share a
+  divisor of at least 2 and every quotient `offset / gcd` fits in i64. The
+  quotients are encoded with whatever the shared integer picker
+  (`encode_i64`) chooses for them by encoded length, which is one of tags 1
+  to 6. Decode reads the quotients with that inner codec, computes each
+  `quotient * gcd` with a checked u64 multiply, and adds it to `base` with
+  a wrapping add, which inverts the encoder exactly (a page spanning
+  `i64::MIN` and a large positive value round-trips). `Corrupted`: a `gcd`
+  below 2, an inner tag outside 1 to 6, a negative quotient, a multiply
+  that overflows u64, and trailing or missing bytes, including any the
+  inner codec rejects. Unlike RSEG's `TS_GCD_I64`, which divides the values
+  themselves, a page whose values share no divisor but whose offsets from
+  the minimum do still qualifies.
+- **column reference (11):** one varint, the column id of a column in the
+  same block whose values this column equals row for row, with identical
+  presence. The value is a copy of the referenced column's decoded values.
+  At version 5 the only permitted pair is `observed_ts` (column 1)
+  referring to `ts` (column 0); tag 11 on any other column, a target other
+  than `ts`, a presence that differs from the target's, or trailing bytes
+  are `Corrupted`. `ts` has the lowest column id, PAGE_DIR lists a block's
+  pages in ascending column id, and every projection decodes `ts`, so the
+  target is always decoded first; a reference whose target was not
+  decoded is `Corrupted`.
 
 ### Bitmap codec layout
 
@@ -535,8 +589,10 @@ Comparisons are on the bit pattern, never `==`.
 
 ### String codec layouts
 
-`encode_strings` chooses dictionary when `distinct / total <= 0.5`, else
-plain.
+The RLOG writer builds both layouts for every string page and keeps the
+one with fewer stored bytes (see "Encoding choice" above). A tie goes to
+the layout the `distinct / total <= 0.5` heuristic picks: dictionary when
+it holds, else plain.
 
 - **plain (1):** `count` lengths, each a varint, then the values
   concatenated as one blob. Decode reads the `count` lengths, then slices
@@ -575,7 +631,10 @@ compressed. The writer compresses a page only when its encoded length is
 at least the 512-byte floor and zstd is strictly smaller; below the floor
 zstd overhead exceeds the win and the page stays raw. The descriptor
 records `comp` (0=none, 2=zstd), `len` (stored bytes), and `uncomp_len`
-(encoded bytes before compression).
+(encoded bytes before compression). The writer applies this envelope to
+every candidate encoding of an i64 or string page and compares candidates
+by the resulting `len` (see "Encoding choice"), so a candidate under the
+floor competes with its raw length.
 
 Readers reject an unknown `comp` tag, an `uncomp_len` above the config cap
 (default 64 MiB per page) before allocating, and a decompressed length
@@ -1232,7 +1291,11 @@ All violations are `Corrupted`, never panics:
   unknown field type byte; unknown encoding or compression tag.
 - codec: id out of dictionary range; delta/double-delta accumulation
   overflow; FOR `bit_width > 64` or packed length mismatch; a codec not
-  consuming exactly its bytes.
+  consuming exactly its bytes; a GCD i64 page with `gcd < 2`, an inner tag
+  outside 1 to 6, a negative quotient, or a quotient whose product with
+  `gcd` overflows u64; a column reference on any column but `observed_ts`,
+  naming any column but `ts`, whose target was not decoded, or whose
+  presence differs from its target's.
 - bloom: `covered_count` over the object's column count; covered ids not
   strictly ascending, or a dynamic id FIELD_DIR does not name; `m_bits` not a
   multiple of 512 or below 512; `k = 0`; `bits` length wrong; entry crc
@@ -1260,7 +1323,7 @@ All violations are `Corrupted`, never panics:
   non-ascending `column_id` across a group's chunks; a page count outside
   `1..=2 * block_count`; a page naming a block outside its group or going
   backwards within a chunk; an unknown `enc` tag, or one of the reserved tags
-  10 to 13; an overflowing chunk length
+  12 and 13; an overflowing chunk length
   or extent; a chunk whose extent ends past the BLOCKS section; a total block
   count disagreeing with the SKIP_IDX level-0 entry count; truncation; trailing
   bytes.
