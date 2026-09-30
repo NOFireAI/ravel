@@ -217,7 +217,7 @@ which fails if a new versioned message lands unclassified):
 | `TenantRecoveryManifest` | never rewritten (write-once) | `sys/t/<h>`, CreateIfAbsent | {1} |
 | `AdmissionUsageSnapshot` | never rewritten (sole-writer Overwrite, fresh dump) | ADR-0057 snapshot, `PutMode::Overwrite` | {1} |
 | `WorkerHeartbeat` | never rewritten (sole-writer Overwrite, fresh dump) | ADR-0065 heartbeat, `PutMode::Overwrite` | {1} |
-| `ProvisioningRecord` | **CAS-mutable** | `provisioning::append_generation`, `raise_format_floor` | **{1, 2, 3}** (3 read, not written: ADR-1746 Release A) |
+| `ProvisioningRecord` | **CAS-mutable** | `provisioning::append_generation`, `raise_format_floor` | **{1, 2, 3}** (3 read, not written: ADR-1746 Release A; 3 is written since the Release B amendment below) |
 | `TenantConfigRecord` | **CAS-mutable** | `tenant_config::set_tenant_config` | **{1, 2, 3}** (3 read, not written: ADR-2135) |
 | `MetricMetadataRecord` | **CAS-mutable** | ingest metadata sink read→`merge_entries`→write | **{1, 2}** |
 | `AuthTokenMap` | **CAS-mutable** | `sys/auth` CAS-replace | {1, 2} (managed_by; floor added in R2) |
@@ -333,7 +333,8 @@ owns are stamped version 2 by every writer that emits them:
 unchanged at {1, 2}, so every version-1 record any earlier build wrote stays
 readable and nothing is migrated. The two CAS rewrite paths on
 `ProvisioningRecord` also re-stamp: a version-1 record they append to comes back
-as version 2.
+as version 2. (`ProvisioningRecord`'s writer has since moved to 3; see the
+Release B amendment below.)
 
 **What the flip buys, which is the whole point of the issue.** A binary that
 predates R1 accepts only version 1. Against a record this build wrote, it now
@@ -633,3 +634,32 @@ resolution in `ravel-catalog`; T4 sweep and erasure; T5 the re-encode
 primitive in `rewrite.rs`, writer switch off by default; T6 `migrate` wiring;
 T7 (optional) background low-priority re-encode. T2 to T4 release before T5 to
 T7 are switched on.
+
+## Amendment (2026-09-30, #1746): `ProvisioningRecord` writes version 3 (ADR-1746 Release B)
+
+<!-- amendment-applies: sections="Amendment (R2, 2026-09-07, #1300): the writer flip, and floors on the last two gates" pointer="Release B amendment" -->
+<!-- amendment-supersedes: phrase="3 read, not written: ADR-1746 Release A" pointer="Release B amendment" -->
+
+The R1 table row for `ProvisioningRecord` read "3 read, not written" after
+ADR-1746 Release A widened the read set to {1, 2, 3} one release ahead of the
+writer. Release B is the writer flip, the same step R2 was for version 2:
+every writer of the record (`validate_or_adopt`, `append_generation`,
+`raise_format_floor`) stamps 3, and the two CAS rewrite paths accept a
+version-3 record and re-stamp any version-1 or version-2 record they extend as
+3. The read set stays {1, 2, 3}, so nothing is migrated. The rewrite refusal
+now starts at 4.
+
+`raise_format_floor` takes the observation basis as a required argument and
+records it on the entry it appends; it refuses a basis whose shard range is 0,
+since every audit that can justify a raise scans at least one shard and an
+all-zero basis would decode as none. `migrate` passes the basis of the
+re-audit that found zero stragglers, from that same enumeration: the live
+entries it counted, the newest `created_unix_ns` among them, and the shard
+range it scanned. Floors already in a history keep their stored basis, so a
+floor raised before Release B stays basis-less and classifies `Unknown`.
+
+The rollout precondition is R2's, one version up: a binary predating Release A
+reads only {1, 2} and refuses a version-3 record on every path, including
+`GenerationSwitch`'s flush-time read, so every process must run a Release A
+build or later before any process runs Release B. A Release A binary reads a
+version-3 record and refuses to rewrite it, which is the intended strip guard.
