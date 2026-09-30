@@ -637,7 +637,10 @@ Stated explicitly, per ADR-0055's own consequence:
   required-configuration section instructs operators with erasure
   obligations to prefer scoped legal holds over blanket default retention, or keep D inside their
   erasure SLA. Ravel's code needs no change for this: sweep deletes
-  already treat per-object failures as retryable residue and the
+  already treat per-object failures as retryable residue (moot under the
+  2026-09-30 Object Lock amendment below: Object Lock refuses none of these
+  deletes, and that amendment states which sweeps tolerate a refusal from a
+  deny policy) and the
   tombstone/record-last ordering already tolerates partial passes.
 
 ### 7. Required bucket configuration
@@ -826,6 +829,7 @@ and PII-free) get permanent audit evidence without permanent PII.
 <!-- amendment-applies: sections="6. Interaction with ADR-0055 (WORM / credential scoping / legal hold) — the landed-second obligation" pointer="2026-09-30 Object Lock amendment" -->
 <!-- amendment-supersedes: phrase="refuses the sweep's deletes until each object's retain-until passes" pointer="2026-09-30 Object Lock amendment" -->
 <!-- amendment-supersedes: phrase="the physical bound becomes `max(bound, D)`" pointer="2026-09-30 Object Lock amendment" -->
+<!-- amendment-supersedes: phrase="treat per-object failures as retryable residue" pointer="2026-09-30 Object Lock amendment" -->
 
 Decision 6's "Bucket-level Object Lock" bullet says S3 refuses the sweep's
 deletes under a compliance-mode default retention `D`. It does not. Object

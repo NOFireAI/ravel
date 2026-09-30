@@ -590,6 +590,16 @@ fn delete_objects_entries(body: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Whether `body` holds a `VersionId` element anywhere, inside or outside an
+/// `Object`: an open tag, a self-closing one, or one carrying attributes.
+fn has_version_id_element(body: &str) -> bool {
+    body.split("<VersionId").skip(1).any(|rest| {
+        rest.chars()
+            .next()
+            .is_some_and(|c| c == '>' || c == '/' || c.is_whitespace())
+    })
+}
+
 /// A 200 `DeleteResult` carrying `entries` (`<Deleted>` and `<Error>`
 /// elements), the shape S3 answers every `DeleteObjects` request with.
 fn delete_result(entries: &str) -> Response {
@@ -1631,9 +1641,24 @@ async fn a_delete_is_one_delete_objects_request_with_no_version_id() {
         ["<Key>fault/deleted</Key>"],
         "the body must carry exactly one Object element naming only the key: {body}"
     );
+    for planted in [
+        "<Delete><VersionId/><Object><Key>k</Key></Object></Delete>",
+        "<Delete><Object><Key>k</Key></Object><VersionId id=\"v\">v1</VersionId></Delete>",
+        "<Delete><Object><Key>k</Key></Object><VersionId\n>v1</VersionId></Delete>",
+    ] {
+        assert!(
+            has_version_id_element(planted),
+            "the VersionId check must see a VersionId element outside Object: {planted}"
+        );
+    }
     assert!(
-        !body.contains("<VersionId>"),
-        "a delete must carry no VersionId element: {body}"
+        !has_version_id_element("<Delete><Object><Key>k</Key></Object></Delete>"),
+        "the VersionId check must pass a body with no VersionId element"
+    );
+    assert!(
+        !has_version_id_element(body),
+        "a delete must carry no VersionId element, open, self-closing or \
+         attributed, inside or outside Object: {body}"
     );
     assert_eq!(
         bulk[0].version_id, None,

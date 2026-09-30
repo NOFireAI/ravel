@@ -7348,14 +7348,19 @@ fn every_shipped_template_passes_the_choke_point() {
 /// The object-store contract's compliance-mode paragraph must state the true
 /// consequence of a locked commit record instead of the retired claim that
 /// Object Lock on the protected prefixes never conflicts with a legitimate
-/// erasure request, and must name `protection_horizon` as the bound an
-/// operator keeps the retention period inside. `t/*/*/c/*` must stay
-/// deletable: present in Maintain's own delete grant and absent from
-/// `PROTECTED_DELETE_KEYS` (`DenyDeleteProtected`), or the superseded sweep
-/// this doc claim rests on could not run at all. Reverting the doc edit
-/// restores the retired sentence and fails the first assertion below.
+/// erasure request: the sweep's delete on a locked record lands as a delete
+/// marker, and the locked version stays in storage until its retain-until
+/// `R` has passed and noncurrent-version expiry has removed it. The
+/// paragraph must not carry the withdrawn claims that the lock refuses the
+/// delete or that an operator keeps `R` inside `protection_horizon`; the
+/// scan stops at the paragraph's end, so the catalog-family text, which
+/// names `protection_horizon` for rule 5's age gate, cannot satisfy or
+/// fail it. `t/*/*/c/*` must stay deletable: present in Maintain's own
+/// delete grant and absent from `PROTECTED_DELETE_KEYS`
+/// (`DenyDeleteProtected`), or the superseded sweep this doc claim rests on
+/// could not run at all.
 #[test]
-fn commit_prefix_is_deletable_and_the_contract_bounds_its_retention() {
+fn commit_prefix_is_deletable_and_a_locked_record_delete_lands_as_a_marker() {
     let doc_path = format!(
         "{}/../../docs/object-store-contract.md",
         env!("CARGO_MANIFEST_DIR")
@@ -7366,29 +7371,53 @@ fn commit_prefix_is_deletable_and_the_contract_bounds_its_retention() {
         !doc.contains("never conflicts with a legitimate erasure request"),
         "{doc_path} still carries the retired claim that Object Lock on the \
          protected prefixes never conflicts with a legitimate erasure \
-         request; a locked commit record delays supersession GC, ADR-0019 \
-         retention deletion, and ADR-0064 erasure until its retention period \
-         elapses"
+         request; a locked commit record keeps an erased subject's bytes in \
+         storage as a noncurrent version until its retain-until has passed"
     );
 
     let commit_paragraph: String = doc
         .lines()
         .skip_while(|l| !l.contains("commit records `t/*/*/c/*`"))
-        .take_while(|l| !l.trim_start().starts_with("**How the prefix scoping"))
+        .take_while(|l| !l.trim().is_empty())
         .collect::<Vec<_>>()
-        .join("\n");
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(
         !commit_paragraph.is_empty(),
         "{doc_path}: could not find the paragraph naming commit records \
          `t/*/*/c/*` under the compliance-mode Object Lock point; the \
          anchor text this test scans for may have moved"
     );
-    assert!(
-        commit_paragraph.contains("protection_horizon"),
-        "the paragraph naming t/*/*/c/* must name protection_horizon as the \
-         bound an operator keeps the retention period inside; paragraph was:\n\
-         {commit_paragraph}"
-    );
+    for phrase in [
+        "on a still-locked commit record, retained until `R`, does not refuse that delete",
+        "it succeeds and inserts a delete marker",
+        "The locked version stays in storage as a noncurrent version",
+        "once both its retain-until has passed and `E_v` has elapsed since the delete",
+        "`max(bound + E_v, R)`",
+    ] {
+        assert!(
+            commit_paragraph.contains(phrase),
+            "the paragraph naming t/*/*/c/* must say a delete on a locked \
+             commit record lands as a delete marker and the locked version \
+             stays until its retain-until; missing {phrase:?}; paragraph \
+             was:\n{commit_paragraph}"
+        );
+    }
+    for retired in [
+        "refuses that delete until",
+        "`max(bound, R)`",
+        "protection_horizon",
+    ] {
+        assert!(
+            !commit_paragraph.contains(retired),
+            "the paragraph naming t/*/*/c/* still carries {retired:?}: Object \
+             Lock does not refuse the sweep's delete, so it neither delays \
+             the sweep nor asks an operator to keep the retention period \
+             inside protection_horizon; paragraph was:\n{commit_paragraph}"
+        );
+    }
 
     let policy = load_policy("maintain");
     let maintain_delete = policy_statements(&policy)
@@ -7405,9 +7434,9 @@ fn commit_prefix_is_deletable_and_the_contract_bounds_its_retention() {
     assert!(
         !PROTECTED_DELETE_KEYS.contains(&"t/*/*/c/*"),
         "t/*/*/c/* must stay out of PROTECTED_DELETE_KEYS (DenyDeleteProtected); \
-         an IAM Deny there would block every superseded-sweep delete of a \
-         commit record outright, which is a stronger and permanent block, not \
-         the bounded compliance-mode retention this doc claim describes"
+         an IAM Deny there would refuse every superseded-sweep delete of a \
+         commit record outright, where the compliance-mode lock this doc \
+         claim describes refuses none (each delete lands as a delete marker)"
     );
 }
 
@@ -7443,7 +7472,7 @@ fn commit_prefix_is_deletable_and_the_contract_bounds_its_retention() {
 /// consistency doc is now one of the rows, so no file that carried the claim
 /// is outside this pin.
 ///
-/// `commit_prefix_is_deletable_and_the_contract_bounds_its_retention` reads
+/// `commit_prefix_is_deletable_and_a_locked_record_delete_lands_as_a_marker` reads
 /// only the contract page, so reverting any other file left it green. This is
 /// the per-file pin: each row names the phrases only the corrected text
 /// carries and every phrase the three corrections retired, so reverting one

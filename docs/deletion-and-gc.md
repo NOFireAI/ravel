@@ -128,7 +128,7 @@ own parameters, not gaps a correctly declared config leaves open.
 protection-horizon arithmetic above bounds a *pinned in-flight reader* against
 the current snapshot's history; it does not on its own prove that the *current*
 HEAD snapshot has stopped naming the bucket. A retention tombstone is written at
-its own bucket's ingest-hour key, which is `R` (the tenant's retention window)
+its own bucket's ingest-hour key, which is the tenant's retention window
 behind the fold watermark, so it lands far outside the fold's fixed
 near-watermark reconcile window. To close the gap, the physical retention sweep,
 before deleting anything in a bucket, loads the `(tenant, signal)` HEAD and the

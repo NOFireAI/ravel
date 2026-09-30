@@ -464,7 +464,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the locked version is removed once its retain-until and noncurrent-version
   expiry have both passed. The advice to keep a commit-record retention
   inside `protection_horizon` so the sweep keeps making progress is
-  withdrawn, since the lock never pauses the sweep.
+  withdrawn, since the lock never pauses the sweep. Under a bucket default
+  retention `D`, ADR-0064, ADR-0077 and the disaster recovery guide now state
+  one physical erasure bound, `max(bound + E_v, D)`, where they said
+  `max(bound, D)`.
 
 - **A gateway starts under a small memory limit** (issue #2234).
   `ravel-server` refused to start in every mode under a cgroup memory limit of
