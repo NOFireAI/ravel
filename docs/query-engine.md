@@ -859,13 +859,19 @@ same RAII `reserve` API, so they read under `component="fetch"`.
 - All accept `min_commit_token`. Errors use the Prometheus JSON error
   envelope (`status:"error"`, `errorType`, `error`) with correct HTTP codes
   (400 bad_data, 422 unprocessable for unsupported constructs, 500 internal
-  for corrupt stored data, including a compaction record or erasure request
-  whose stored bytes fail to decode at a format version this build covers,
-  503 unavailable for transient store failures, for a catalog decode job the
-  read CPU gate cancelled at shutdown, and for a catalog object (HEAD, snapshot
-  part, postings, compaction record or erasure request) written in a newer
-  format version this build cannot read, which a peer on a newer build can
-  read during a rolling upgrade).
+  for corrupt stored data, including a catalog object (commit, compaction or
+  rewrite record, erasure request, HEAD, snapshot part or postings) whose
+  stored bytes fail to decode at a format version this build covers or carry
+  a format version below the lowest it supports, a supersession chain of
+  compaction or rewrite records that is cyclic, deeper than the resolver's
+  fixed bound, or names a predecessor with a different input set, a per-part
+  column-statistics object the fold cannot fit under its fixed ceiling, and a
+  catalog decode job that panicked, 503 unavailable for transient store
+  failures, for a catalog decode job the read CPU gate cancelled at shutdown,
+  and for a catalog object (commit, compaction or rewrite record, erasure
+  request, HEAD, snapshot part or postings) written in a format version above the highest this build reads, or a snapshot part
+  entry at a level above the highest it reads, either of which a peer on a
+  newer build can read during a rolling upgrade).
 - Timestamps: Prometheus float seconds in, RFC3339 or float accepted like
   Prometheus; responses use float seconds with ms precision.
 - `resultType`: `vector`, `matrix`, `scalar`, `string`. A top-level scalar
