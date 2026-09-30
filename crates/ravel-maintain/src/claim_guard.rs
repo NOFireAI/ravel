@@ -810,6 +810,8 @@ pub(crate) fn claims_bucket(config: &CompactorConfig, input_bytes: u64) -> bool 
 mod tests {
     use std::time::Duration;
 
+    use ravel_fleet::claim::COMPACTION_CLAIMS_PREFIX;
+    use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{GetRange, PutOptions};
     use ravel_types::{Signal, TenantId};
@@ -1492,5 +1494,180 @@ mod tests {
     fn bucket_identity() -> WorkIdentity {
         let b = bucket();
         WorkIdentity::new(b.tenant_hash, b.signal, b.shard, b.ingest_hour_bucket)
+    }
+
+    /// A scripted fault that rejects the SECOND PUT to the claim key: the
+    /// first is the acquisition's `CreateIfAbsent`, which must succeed for a
+    /// renewal to be reachable at all.
+    fn faulted_store() -> FaultStore<MemoryStore> {
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Put,
+                ScriptedFault::Transient("renewal store error".into()),
+            )
+            .with_key_contains(COMPACTION_CLAIMS_PREFIX)
+            .with_occurrence(Occurrence::Nth(2)),
+        );
+        FaultStore::new(MemoryStore::new(), plan)
+    }
+
+    /// A genuine store error on renewal surfaces as `ClaimRenewFailed`, never
+    /// swallowed into `ClaimLost`: the claim was never confirmed lost, so the
+    /// run must abort loudly rather than silently cancel. The fault counter
+    /// proves the scripted rejection actually fired.
+    #[tokio::test]
+    async fn renewal_store_error_is_claim_renew_failed_not_lost() {
+        let store = faulted_store();
+        let clock = FixedClock::new(0);
+        let guard = guard(&clock, 1, None);
+
+        assert!(matches!(
+            guard.acquire(&store).await.expect("acquire"),
+            Acquire::Acquired
+        ));
+
+        // One third of the 3 s lease: past the renewal cadence, nowhere near
+        // expiry.
+        clock.set(1_000_000_000);
+        let err = guard
+            .checkpoint(&store, Checkpoint::MergeLoop)
+            .await
+            .expect_err("a genuine store error on renewal must not be swallowed");
+        assert!(
+            matches!(err, MaintainError::ClaimRenewFailed { .. }),
+            "expected ClaimRenewFailed, got {err:?}"
+        );
+        assert_eq!(
+            store.fault_count(Op::Put, ravel_object_store::fault::FaultKind::Transient),
+            1,
+            "the scripted renewal fault fired exactly once"
+        );
+        assert!(
+            guard.is_held().await,
+            "the claim was never confirmed lost, so this run still believes it holds it"
+        );
+    }
+
+    /// After a renewal store error leaves the claim in place, a NEW guard for
+    /// the SAME bucket in the SAME process reclaims it at once, well before
+    /// the lease would expire, and reports the reclaim as an acquisition, not
+    /// a steal (ADR-1029, 2026-09-30 amendment; issue #2156).
+    ///
+    /// Demonstrated failing (mutation c) by reverting the `contend` branch
+    /// that recognizes a matching process id: the new guard would then read
+    /// the still-unexpired claim as `HeldByAnother` and skip its own bucket.
+    #[tokio::test]
+    async fn same_process_reclaims_leftover_claim_before_lease_expiry() {
+        let store = faulted_store();
+        let clock = FixedClock::new(0);
+        let first = guard(&clock, 1, None);
+        assert!(matches!(
+            first.acquire(&store).await.expect("acquire"),
+            Acquire::Acquired
+        ));
+
+        clock.set(1_000_000_000);
+        first
+            .checkpoint(&store, Checkpoint::MergeLoop)
+            .await
+            .expect_err("renewal store error");
+        assert_eq!(
+            store.fault_count(Op::Put, ravel_object_store::fault::FaultKind::Transient),
+            1,
+            "the scripted renewal fault fired exactly once"
+        );
+
+        // Nowhere near the 3 s lease's expiry (the store's clock never moved
+        // off 0): a plain `steal` would refuse this locally.
+        let retry = guard(&clock, 1, None);
+        assert!(
+            matches!(
+                retry.acquire(&store).await.expect("same-process reclaim"),
+                Acquire::Acquired
+            ),
+            "the same process reclaims its own leftover claim at once"
+        );
+        assert!(
+            !retry.stolen().await,
+            "a reclaim of this process's own claim is reported as an acquisition, not a steal"
+        );
+        assert!(retry.is_held().await);
+    }
+
+    /// A DIFFERENT process observing the same leftover claim still waits out
+    /// the lease as before: only a matching process id skips the expiry
+    /// check. Demonstrated failing (mutation a) by dropping the process-id
+    /// equality check from `contend`, which would let this different process
+    /// take the claim over immediately too.
+    #[tokio::test]
+    async fn different_process_still_skips_held_by_another_after_renew_failure() {
+        let store = faulted_store();
+        let clock = FixedClock::new(0);
+        let first = guard(&clock, 1, None);
+        assert!(matches!(
+            first.acquire(&store).await.expect("acquire"),
+            Acquire::Acquired
+        ));
+
+        clock.set(1_000_000_000);
+        first
+            .checkpoint(&store, Checkpoint::MergeLoop)
+            .await
+            .expect_err("renewal store error");
+
+        let other = guard(&clock, 2, None);
+        let skip = match other.acquire(&store).await.expect("other observes") {
+            Acquire::Skipped(skip) => skip,
+            other => panic!("expected a skip, got {other:?}"),
+        };
+        assert_eq!(skip.reason, ClaimSkipReason::HeldByAnother);
+        assert!(!other.is_held().await);
+    }
+
+    /// A same-process race: guard A still believes it holds the claim (its
+    /// last successful write was the original acquisition) when guard B, in
+    /// the SAME process, reclaims the same bucket. B's reclaim is a real CAS
+    /// against the version A last wrote, so it moves the version out from
+    /// under A, and A's next checkpoint discovers the loss exactly like a
+    /// steal by another process would.
+    ///
+    /// Demonstrated failing (mutation b) by setting `stolen` true on the
+    /// reclaim path: the counter assertion in the supervisor-level test would
+    /// then misreport this as a steal.
+    #[tokio::test]
+    async fn same_process_race_reclaim_cancels_the_original_guard() {
+        let store = MemoryStore::new();
+        store.set_clock_ms(1_700_000_000_000);
+        let clock = FixedClock::new(1_700_000_000_000 * 1_000_000);
+        let a = guard(&clock, 1, None);
+        assert!(matches!(
+            a.acquire(&store).await.expect("a acquires"),
+            Acquire::Acquired
+        ));
+
+        // B is a second guard in the same process, contending for the same
+        // bucket while A's claim is still live and unexpired.
+        let b = guard(&clock, 1, None);
+        assert!(
+            matches!(
+                b.acquire(&store).await.expect("b reclaims"),
+                Acquire::Acquired
+            ),
+            "the same process reclaims its own live claim without waiting for expiry"
+        );
+        assert!(!b.stolen().await);
+
+        // Past the renewal cadence (a third of the 3 s lease), so A's
+        // checkpoint actually attempts a renewal rather than short-circuiting
+        // on elapsed time.
+        clock.set(1_700_000_001_000 * 1_000_000);
+        assert_eq!(
+            a.checkpoint(&store, Checkpoint::PartBoundary)
+                .await
+                .expect("checkpoint"),
+            Verdict::Cancel,
+            "A's version was moved out from under it by B's reclaim"
+        );
+        assert!(!a.is_held().await);
     }
 }

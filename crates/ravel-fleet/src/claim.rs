@@ -1304,6 +1304,160 @@ mod tests {
         }
     }
 
+    fn owner_with_process(process_id: Uuid, clock_ns: i64) -> ClaimOwner {
+        ClaimOwner::new(process_id, Uuid::new_v4(), clock_ns)
+    }
+
+    /// A process reclaims its own unexpired claim at once (ADR-1029, 2026-09-30
+    /// amendment; issue #2156): no expiry requirement, unlike `steal`. The
+    /// reclaiming owner shares the process id with the original acquisition but
+    /// is otherwise a fresh attempt, and the fresh attempt id in the stored
+    /// payload after the reclaim proves the claim really changed CAS
+    /// generation rather than merely being re-observed.
+    #[tokio::test]
+    async fn reclaim_succeeds_on_own_unexpired_claim() {
+        let store = MemoryStore::new();
+        store.set_clock_ms(1_700_000_000_000);
+        let cfg = ClaimConfig::default();
+        let process = Uuid::new_v4();
+        let original = owner_with_process(process, 1);
+
+        let (key, _, original_payload) = acquired(
+            acquire(&store, &identity(), &original, &cfg)
+                .await
+                .expect("acquire"),
+        );
+
+        // Same process, a fresh attempt: this is what a new `ClaimGuard` in the
+        // same process looks like after the old attempt's renewal failed with a
+        // genuine store error and left the claim in place.
+        let same_process_retry = owner_with_process(process, 2);
+        let observed = held(
+            acquire(&store, &identity(), &same_process_retry, &cfg)
+                .await
+                .expect("acquire"),
+        );
+        assert!(
+            !observed.is_expired(1_700_000_000_000),
+            "the claim must still be unexpired for this test to pin the no-expiry-required claim"
+        );
+
+        let reclaimed = reclaim(&store, &observed, &same_process_retry, &cfg)
+            .await
+            .expect("reclaim is not a store error");
+        let (_, _, reclaimed_payload) = match reclaimed {
+            Reclaim::Acquired {
+                key,
+                version,
+                payload,
+            } => (key, version, payload),
+            other => panic!("expected Acquired, got {other:?}"),
+        };
+
+        assert_ne!(
+            reclaimed_payload.attempt_id, original_payload.attempt_id,
+            "the reclaim wrote a fresh attempt id"
+        );
+        assert_eq!(
+            stored_claim(&store, &key).await.attempt_id,
+            reclaimed_payload.attempt_id,
+            "the reclaimed payload is what's actually stored"
+        );
+    }
+
+    /// A reclaim attempt against a claim held by a DIFFERENT process is refused
+    /// locally, with ZERO store requests -- the same local-refusal shape as
+    /// `steal_before_expiry_is_refused`. `reclaim` must never let one process
+    /// take another's unexpired claim; that is still `steal`'s job, gated on
+    /// expiry.
+    #[tokio::test]
+    async fn reclaim_refuses_locally_for_different_process() {
+        let store = instrumented();
+        let cfg = ClaimConfig::default();
+        let owner = owner_at(1);
+        let other_process = owner_at(2);
+
+        acquire(&store, &identity(), &owner, &cfg)
+            .await
+            .expect("acquire");
+        let observed = held(
+            acquire(&store, &identity(), &other_process, &cfg)
+                .await
+                .expect("acquire"),
+        );
+        assert_ne!(
+            observed.holder_process_id(),
+            Some(other_process.process_id),
+            "the observing owner is a genuinely different process"
+        );
+        let before = counts(&store);
+
+        let refused = reclaim(&store, &observed, &other_process, &cfg)
+            .await
+            .expect("reclaim is not a store error");
+
+        assert!(
+            matches!(refused, Reclaim::Refused),
+            "a different process must be refused, got {refused:?}"
+        );
+        assert_eq!(
+            counts(&store),
+            before,
+            "no store request of any kind was issued"
+        );
+    }
+
+    /// Two reclaim attempts from the same process, racing on the same observed
+    /// version, behave like `steal_requires_matching_version`: exactly one CAS
+    /// lands and the other gets `Reclaim::Lost`. This is the same-process
+    /// sibling-attempt race the module doc describes.
+    #[tokio::test]
+    async fn reclaim_cas_race_returns_lost() {
+        let store = MemoryStore::new();
+        let cfg = ClaimConfig::default();
+        let process = Uuid::new_v4();
+        let original = owner_with_process(process, 1);
+
+        acquired(
+            acquire(&store, &identity(), &original, &cfg)
+                .await
+                .expect("acquire"),
+        );
+
+        let sibling_a = owner_with_process(process, 2);
+        let sibling_b = owner_with_process(process, 3);
+        let seen_a = held(
+            acquire(&store, &identity(), &sibling_a, &cfg)
+                .await
+                .expect("acquire"),
+        );
+        let seen_b = held(
+            acquire(&store, &identity(), &sibling_b, &cfg)
+                .await
+                .expect("acquire"),
+        );
+        assert_eq!(
+            seen_a.version, seen_b.version,
+            "both siblings observed the same version"
+        );
+
+        let first = reclaim(&store, &seen_a, &sibling_a, &cfg)
+            .await
+            .expect("reclaim is not a store error");
+        assert!(
+            matches!(first, Reclaim::Acquired { .. }),
+            "the first sibling must win, got {first:?}"
+        );
+
+        let second = reclaim(&store, &seen_b, &sibling_b, &cfg)
+            .await
+            .expect("reclaim is not a store error");
+        assert!(
+            matches!(second, Reclaim::Lost),
+            "the second sibling must lose on the stale version, got {second:?}"
+        );
+    }
+
     /// A store that rejects the renewal's conditional write surfaces as
     /// `ClaimLost`, the same typed outcome a real steal produces: the caller
     /// has one cancellation path, not two. The fault counter proves the

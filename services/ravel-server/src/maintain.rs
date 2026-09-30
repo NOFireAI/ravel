@@ -4013,6 +4013,41 @@ mod tests {
             0,
             "and not as a lost claim: nothing stole or cancelled this one"
         );
+        assert_eq!(safety.claims_acquired(Signal::Metrics), 0);
+        assert_eq!(safety.claims_stolen(Signal::Metrics), 0);
+        assert_eq!(safety.claims_skipped(Signal::Metrics), 0);
+
+        // A second tick, same process, same bucket: the claim the first tick
+        // left in place (never confirmed lost) is reclaimed at once rather
+        // than skipped as held by another owner, and the bucket compacts
+        // (ADR-1029, 2026-09-30 amendment; issue #2156). The scripted fault
+        // only fires on its first occurrence, so this tick's renewal (if any)
+        // succeeds normally.
+        //
+        // Shown failing (mutation c: reverting the `contend` branch that
+        // recognizes a matching process id) with claims_skipped rising to 1
+        // instead of claims_acquired.
+        run_tick_with_clock(
+            &clock, &store, &tenant, &config, &retention, 1, &mut memo, &safety, &ownership,
+            &worker, &live,
+        )
+        .await;
+
+        assert_eq!(
+            safety.claims_acquired(Signal::Metrics),
+            1,
+            "the second tick reclaims its own leftover claim and compacts the bucket"
+        );
+        assert_eq!(
+            safety.claims_stolen(Signal::Metrics),
+            0,
+            "a same-process reclaim is reported as an acquisition, not a steal"
+        );
+        assert_eq!(
+            safety.claims_skipped(Signal::Metrics),
+            0,
+            "the bucket is not skipped as held by another owner"
+        );
     }
 
     /// Parts a full merge of the acceptance fixture writes: one per input
