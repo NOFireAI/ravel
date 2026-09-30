@@ -2202,7 +2202,11 @@ mod tests {
             Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>,
             dir.path(),
         )
-        .with_limits(limits_of(&memory, ByteLimit::Unlimited, RequestLimit::Bounded(0)));
+        .with_limits(limits_of(
+            &memory,
+            ByteLimit::Unlimited,
+            RequestLimit::Bounded(0),
+        ));
         let file = fixture
             .put_file(
                 &store,
