@@ -858,8 +858,8 @@ same RAII `reserve` API, so they read under `component="fetch"`.
   attached the endpoint returns the empty object exactly as before.
 - All accept `min_commit_token`. Errors use the Prometheus JSON error
   envelope (`status:"error"`, `errorType`, `error`) with correct HTTP codes
-  (400 bad_data, 422 unprocessable for unsupported constructs, 503
-  unavailable for store failures).
+  (400 bad_data, 422 unprocessable for unsupported constructs, 500 internal
+  for corrupt stored data, 503 unavailable for transient store failures).
 - Timestamps: Prometheus float seconds in, RFC3339 or float accepted like
   Prometheus; responses use float seconds with ms precision.
 - `resultType`: `vector`, `matrix`, `scalar`, `string`. A top-level scalar

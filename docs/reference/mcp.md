@@ -194,7 +194,7 @@ time is reported under `coverage`, not here.
 | `snapshot_invalidated` | The pinned snapshot was invalidated by concurrent maintenance. Retryable once. |
 | `cursor_expired` | The cursor's minting process or its deadline is gone, or an erasure it did not pin now reaches its signal and time range. |
 | `cursor_invalid` | The cursor does not match the tenant, the tool, or the arguments presented with it. |
-| `internal` | An unexpected fault. The message is fixed and carries no storage detail. |
+| `internal` | A server-side fault, including corrupt stored data. Not retryable. The message is fixed and carries no storage detail. |
 
 A failure is a tool result with an error marker set, not a transport-level
 error, so the calling model can read `next_steps` and correct itself.

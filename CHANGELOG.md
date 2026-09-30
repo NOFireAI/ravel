@@ -351,6 +351,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **SQL answers corrupt stored data and a panicked decode as an internal error,
+  not a retryable unavailable** (issue #2097). `SqlError::class()` put every
+  metrics, logs and spans fetcher error, `Corrupt` included, in the
+  `Unavailable` class, so HTTP SQL answered 503 and Flight SQL `UNAVAILABLE`
+  for a fault that fails the same way on every retry. A new
+  `ErrorClass::Internal` now holds every error the redaction reports as
+  "stored data failed integrity validation": a fetcher `Corrupt` error (which
+  is also how a panicked read-gate decode job is reported), a store-side
+  checksum mismatch, a carry or tenant mismatch, a corrupt `stream_attrs`
+  blob, and a corrupt catalog record or column-statistics HEAD. HTTP SQL
+  answers it with 500 `internal` and Flight SQL with `INTERNAL`, the PromQL
+  surface's rule for the same fault. Other store errors, timeouts,
+  cancellation and admission refusals keep their classes.
 - **A catalog decode declared over its ceiling now evicts decoded-cache entries
   until the budget admits it or the caches are empty** (issue #2132). Such a
   decode is charged 0 bytes, and a budget pushed over its limit by

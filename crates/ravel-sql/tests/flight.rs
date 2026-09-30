@@ -486,6 +486,78 @@ async fn a_segment_that_stays_missing_fails_snapshot_invalidated() {
 }
 
 // ---------------------------------------------------------------------------
+// Permanent versus transient storage faults
+// ---------------------------------------------------------------------------
+
+/// A corrupt RSEG object fails the same way on every read, so the statement
+/// answers `INTERNAL` with the corruption message, never the retryable
+/// `UNAVAILABLE` a client would retry forever.
+#[tokio::test]
+async fn a_corrupt_segment_answers_internal_not_unavailable() {
+    let tenant = tenant_id("acme");
+    let seg_specs = specs();
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Get, ScriptedFault::CorruptRange)
+            .with_key_contains(".rseg")
+            .with_occurrence(Occurrence::Always),
+    );
+    let faults = Arc::new(ravel_object_store::fault::FaultStore::new(
+        MemoryStore::new(),
+        plan,
+    ));
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&faults) as Arc<dyn ObjectStoreBackend>;
+    let harness = Harness::build(store, &[(&tenant, &seg_specs)]).await;
+
+    let ticket = harness
+        .get_flight_info("acme", QUERY)
+        .await
+        .expect("flight info");
+    let status = harness
+        .do_get("acme", &ticket)
+        .await
+        .expect_err("a corrupt segment fails the statement");
+    assert!(
+        faults.fault_count(Op::Get, FaultKind::CorruptRange) >= 1,
+        "the corruption fault never fired"
+    );
+    assert_eq!(status.code(), tonic::Code::Internal, "{status:?}");
+    assert_eq!(status.message(), ravel_sql::MSG_CORRUPT);
+}
+
+/// A transient store fault on the same read keeps the retryable class.
+#[tokio::test]
+async fn a_transient_segment_fault_answers_unavailable() {
+    let tenant = tenant_id("acme");
+    let seg_specs = specs();
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Get, ScriptedFault::Transient("store blip".to_string()))
+            .with_key_contains(".rseg")
+            .with_occurrence(Occurrence::Always),
+    );
+    let faults = Arc::new(ravel_object_store::fault::FaultStore::new(
+        MemoryStore::new(),
+        plan,
+    ));
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&faults) as Arc<dyn ObjectStoreBackend>;
+    let harness = Harness::build(store, &[(&tenant, &seg_specs)]).await;
+
+    let ticket = harness
+        .get_flight_info("acme", QUERY)
+        .await
+        .expect("flight info");
+    let status = harness
+        .do_get("acme", &ticket)
+        .await
+        .expect_err("a failing store fails the statement");
+    assert!(
+        faults.fault_count(Op::Get, FaultKind::Transient) >= 1,
+        "the transient fault never fired"
+    );
+    assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
+    assert_eq!(status.message(), ravel_sql::MSG_UNAVAILABLE);
+}
+
+// ---------------------------------------------------------------------------
 // Cancellation
 // ---------------------------------------------------------------------------
 
