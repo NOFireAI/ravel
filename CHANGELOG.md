@@ -1281,8 +1281,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fan-out are unchanged.
 - **The logs SQL scan does less work per cell when it builds typed attribute
   columns** (ADR-2121 D2 and D3, issue #2152). When a block stores a typed
-  `i64`, `bool` or `bytes` key in exactly one record-level column, of the
-  declared type, each row's cell is appended straight to its Arrow array with
+  `i64`, `bool` or `bytes` key in exactly one column, of the declared type
+  (a resource or scope value of another type adds a column and turns this
+  off for the block), each row's cell is appended straight to its Arrow array with
   no intermediate attribute value; a row the record does not set still reads
   the resource or scope value. Building a typed `str` column validates each
   cell's UTF-8 at most once per block: a dictionary page validates each entry
