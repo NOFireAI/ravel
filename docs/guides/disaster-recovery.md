@@ -137,8 +137,9 @@ refuses to start; a backend that cannot disclose its state warns once and
 raises the `ravel_bucket_protection_unknown` gauge; a bucket reporting it
 enabled starts clean. The flag cannot see whether the retention mechanism is
 running, whether every protected object version carries retention, or whether
-a bucket default retention is set; those are verified out of band with the
-commands under "Verification" below. The flag is off by default, so an
+a bucket default retention is set; those are verified out of band, with
+`ravel-cli store verify-protection --expect-object-retention` or the commands
+under "Verification" below. The flag is off by default, so an
 existing deployment is unchanged until an operator turns it on. Enforcement
 itself stays at the bucket and IAM layer either way: nothing in a Ravel
 process can configure Object Lock.
@@ -270,15 +271,18 @@ service level agreement. This runbook refuses to pick a number for you.
 ## Platform-CLI verification checklist
 
 Ravel cannot enforce most of this and does not pretend to. `ravel-cli store
-qualify` probes whether Object Lock and versioning appear enabled and reports
-whether a lifecycle rule is present, not what the rule says, and
-**replication configuration is invisible to the object-store layer**, so
-verification of the lifecycle values and the replication controls is an
-explicit platform-CLI step and not something Ravel checked. The versioning
+verify-protection` runs the primary-bucket half of this checklist from the
+bucket's own configuration (see "Running the checklist with ravel-cli" below):
+versioning, the lifecycle values including `NoncurrentDays = E_v`, Object Lock,
+delete-marker replication, and a retention sample. It does not check the
+replica bucket, the replication destination's account, region and KMS key, or
+RTC; those stay platform-CLI steps. `ravel-cli store qualify` prints the same
+bucket probes as informational lines and never fails on them. The versioning
 and `NoncurrentDays = E_v` lifecycle checks apply at level 0 and level 1
-alike; the replication and replica checks are level 1 only. Run these against
-the actual buckets, and treat a missing row or a differing value as a failed
-check:
+alike; the replication and replica checks are level 1 only. The commands below
+are the manual form of every check, and the only form for the replica. Run
+them against the actual buckets, and treat a missing row or a differing value
+as a failed check:
 
 ```sh
 # Primary: versioning ON
@@ -327,6 +331,86 @@ region under a different `ReplicaKmsKeyID`, and, if you need a stated RPO,
 that RTC (`ReplicationTime`) is enabled. On an S3-compatible store that
 implements bucket replication, use that store's own replication
 configuration; the mandates above are what it has to satisfy.
+
+### Running the checklist with ravel-cli
+
+`ravel-cli store verify-protection` reads the primary bucket's versioning,
+lifecycle, replication and Object Lock configuration, and optionally samples
+object retention, over read-only requests signed with the same `--store s3`
+credentials every other `ravel-cli` command uses. Run it at least daily and
+after any change to the bucket's policy or lifecycle rules:
+
+```sh
+ravel-cli --store s3 --s3-bucket <primary> ... store verify-protection \
+  --expected-noncurrent-days <E_v> --expect-replication --expect-object-retention
+```
+
+- `--expected-noncurrent-days` is required: the `E_v` the noncurrent-version
+  expiration rule covering `t/` must carry.
+- `--expect-replication` makes `delete-marker-replication` count. Pass it at
+  level 1.
+- `--expect-object-retention` makes `object-retention` count. Pass it when a
+  retention mechanism or a bucket default retention is in place.
+
+It prints one line per condition, the condition's identifier, then `pass`,
+`fail` or `unknown`, then the reason, and a summary line last:
+
+```
+versioning                 pass
+noncurrent-expiration      fail    rule "ravel": NoncurrentDays is 10, expected 30
+expired-delete-marker      pass
+abort-multipart            pass
+rule-scope                 pass
+no-foreign-rule            pass
+delete-marker-replication  unknown not expected, does not affect the exit code: ...
+object-lock                pass
+object-retention           unknown not expected, does not affect the exit code: ...
+verify-protection: FAIL: failed: noncurrent-expiration
+```
+
+| Condition | Passes when |
+|---|---|
+| `versioning` | versioning is `Enabled` |
+| `noncurrent-expiration` | an enabled rule covering `t/` expires noncurrent versions after exactly `E_v` days |
+| `expired-delete-marker` | an enabled rule covering `t/` removes expired delete markers |
+| `abort-multipart` | an enabled rule covering `t/` aborts incomplete multipart uploads within 7 days |
+| `rule-scope` | the rules above cover every `t/` prefix |
+| `no-foreign-rule` | no other expiration or transition rule targets `t/` or `sys/` |
+| `delete-marker-replication` | replication carries `DeleteMarkerReplication` `Enabled` |
+| `object-lock` | Object Lock is enabled on the bucket |
+| `object-retention` | the newest current object in each protected prefix family, and one noncurrent version, carry compliance-mode retention that has not lapsed |
+
+The exit code is the verdict: `0` only when every expected condition passes,
+`1` when any expected condition fails (the summary names each), and `2` when
+none fails but at least one could not be verified, or the bucket's control
+plane could not be reached at all (the summary names each). `unknown` is never
+`pass`: an access denial, an endpoint with no such API, and a response that
+does not parse all exit `2`, and so does a store other than `--store s3`. A
+condition that is not expected is still printed, marked as such, and does not
+move the exit code.
+
+A lifecycle rule counts as covering `t/` when its scope is the whole bucket,
+exactly `t/`, or when enabled rules scoped to `t/0` through `t/f`, one per
+lowercase hex digit, each carry the value. Any other split of `t/` cannot be
+proven to cover it and reads `unknown`; restate the rules in one of those
+shapes, or confirm the coverage by hand. A covering rule that also keeps
+`NewerNoncurrentVersions`, covering rules that disagree on `NoncurrentDays`,
+and a rule over part of `t/` that expires noncurrent versions sooner than
+`E_v` each fail `noncurrent-expiration`.
+
+The retention sample reads one listing prefix per protected family: `sys/`,
+and, under the first tenant prefix in key order, its catalog keyspace and the
+provisioning record and commit records of the first signal that has them. A
+family with nothing to sample reads `unknown`, so a bucket with no tenant data
+yet cannot pass `object-retention`. A tenant whose newest commit record is
+older than the retention period reads `fail`, because its newest object is no
+longer locked; the family is judged by that one tenant.
+
+The identity that runs it needs read-only access: `s3:GetBucketVersioning`,
+`s3:GetLifecycleConfiguration`, `s3:GetReplicationConfiguration`,
+`s3:GetBucketObjectLockConfiguration`, `s3:GetObjectRetention` and
+`s3:ListBucketVersions`, plus `s3:ListBucket` under `--expect-object-retention`,
+which locates the sample prefixes with a delimited listing. It writes nothing.
 
 ## Restore procedure: the replica is a restore source, never a live failover target
 
