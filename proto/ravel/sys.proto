@@ -620,13 +620,12 @@ message TenantConfigRecord {
   //   2: the same field set; the ADR-0066 R2 writer flip, a floor signal that
   //      makes a pre-R1 binary refuse the record instead of rewriting it.
   //   3: adds clustering_key (field 13) and bloom_scope (field 14), ADR-2135.
-  //      Readers accepted 3 one release before any writer stamped it (the R1
-  //      reader-first step, exactly as version 2 was accepted before the R2
-  //      writer flip). Written on demand only: the storage-layout setters emit
-  //      either field, and stamp 3, only behind an explicit operator opt-in
-  //      stating every reader already runs a release with the version-3
-  //      reader.
-  //      A record carrying neither field is still stamped 2.
+  //      Written on demand only: the storage-layout setters emit either field,
+  //      and stamp 3, only behind an explicit operator opt-in stating that
+  //      every process reading the bucket's tenant config runs a release whose
+  //      reader accepts 3 (the R1 reader-first rule). The opt-in is the
+  //      operator's statement, not a check; a reader that predates 3 refuses a
+  //      version-3 record. A record carrying neither field is still stamped 2.
   //
   // This record is CAS-mutable (set_tenant_config rebuilds it whole under
   // CasVersion, naming every field it knows), so per the ADR-0066 R1 amendment

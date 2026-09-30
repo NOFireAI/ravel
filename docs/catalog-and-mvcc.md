@@ -307,16 +307,20 @@ The record's `format_version` history:
 - format version 2: the same field set, stamped by every writer by default; a
   floor signal that makes a binary predating the version-2 reader refuse the
   record rather than rewrite it.
-- format version 3: written on demand by the storage-layout setters behind an operator opt-in; every reader must run a release with the version-3 reader first
+- format version 3: written on demand by the storage-layout setters behind an
+  operator opt-in; every reader must run a release with the version-3 reader
+  first.
 
 Version 3 adds the clustering key (field 13) and bloom scope (field 14). They
 are written only through `TenantConfig::set_clustering_key`,
 `TenantConfig::clear_clustering_key` and `TenantConfig::set_bloom_scope`, each
 of which takes a `StorageLayoutWrite` token and refuses with
 `WriterCannotEmit` unless it is `ReadersRolledOut`, the operator's statement
-that the version-3 reader is deployed everywhere (the ADR-0066 R1
-reader-first rule: `set_tenant_config` rewrites the record whole, so a reader
-that predates a field would strip it on rewrite). A config that carries
+that the version-3 reader is deployed everywhere. That is the ADR-0066 R1
+reader-first rule: a binary whose reader predates version 3 has a read
+ceiling of 2 and refuses a version-3 record outright, so its reads of that
+tenant's config fail and it will not rewrite the record. The token is not
+checked against the readers actually deployed. A config that carries
 neither field, or only a bloom scope of `ALL` (the zero value, which is not
 written), is still stamped 2 byte for byte. `set_tenant_config` refuses to
 rewrite a record above version 3, and refuses a config carrying either field
@@ -336,10 +340,16 @@ the field present with an empty column list and a generation, while the footer
 `clustering_generation`. A set key names 1 to 4 distinct columns, each
 declared in the record's own `typed_attr_columns` (not the base columns a
 server falls back to when the record declares none), and a specified bucket
-width. `set_tenant_config` re-checks those rules on every write, and against
-the record it replaces also refuses a generation below the stored one, a
-different key at the stored generation, and, while the stored set key is
-current, a `typed_attr_columns` change that drops or retypes a key column
+width. On every write `set_tenant_config` runs the accessor's validation on a
+carried key, including those column rules, and refuses a bloom scope value
+the enum does not define. It does not repeat the setters' generation
+arithmetic. Against the record it replaces it enforces that the generation
+never goes down and that a key whose columns, or whose bucket width while
+set, differ from the stored key's carries a new generation; it does not
+require the stored generation plus one, so two setter calls on one
+in-memory config store the stored generation plus two. While the stored set
+key is current it also refuses a `typed_attr_columns` change that drops or
+retypes a key column
 (`ClusteringKeyColumnRemoved`, `ClusteringKeyColumnRetyped`, both naming the
 column and saying to clear the key first), since one generation names exactly
 one descriptor, column types included. Declaring new columns or retyping a

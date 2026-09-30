@@ -62,7 +62,8 @@ fn classification_table() -> BTreeMap<&'static str, Class> {
         // reader-first step (clustering_key and bloom_scope; the writer stamps 2
         // by default and 3 behind the storage-layout opt-in).
         // MetricMetadataRecord accepts {1, 2} after ADR-0066 R1; AuthTokenMap
-        // accepts {1, 2} (managed_by, ADR-0072 #897) and KeyEpochRecord {1}, both as a floor-and-ceiling set since ADR-0066 R2.
+        // accepts {1, 2} (managed_by, ADR-0072 #897) and KeyEpochRecord {1},
+        // both as a floor-and-ceiling set since ADR-0066 R2.
         // GcConfig and CompactionClaim still carry ceiling-only gates in their
         // own crates (ravel-maintain, ravel-fleet), outside this change's scope:
         // reported, not fixed. Every slice belonging to a ravel-catalog reader is

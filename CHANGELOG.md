@@ -738,7 +738,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **The per-tenant config record can store a clustering key and a bloom scope behind an operator opt-in** (ADR-2135 decision 7, issue #2146): `TenantConfig::set_clustering_key`, `TenantConfig::clear_clustering_key` and `TenantConfig::set_bloom_scope` take a `StorageLayoutWrite` token and refuse with `WriterCannotEmit` unless it is `ReadersRolledOut`, stating every reader runs a release with the version-3 reader; a config carrying either field is then stamped format version 3, and one carrying neither is still stamped 2 byte for byte. A set or clear stores the stored generation plus one, a clear keeps field 13 with no columns, and clearing a never-set key is refused. Key columns must be declared in the record's own `typed_attr_columns`, and the clustering-key accessor now validates against that list rather than a caller-passed effective list, superseding the #2138 entry below. `set_tenant_config` re-checks the setter's rules on every write, refuses a regressed generation or a different key at the stored generation, refuses a record above version 3, and refuses a `typed_attr_columns` change that drops or retypes a column the current key names, naming the column and saying to clear the key first. `resolve_declared_columns` now falls back to the base columns when the record's list fails validation. No ingest, compaction or CLI caller sets either field yet.
+- **The per-tenant config record can store a clustering key and a bloom scope behind an operator opt-in** (ADR-2135 decision 7, issue #2146): `TenantConfig::set_clustering_key`, `TenantConfig::clear_clustering_key` and `TenantConfig::set_bloom_scope` take a `StorageLayoutWrite` token and refuse with `WriterCannotEmit` unless it is `ReadersRolledOut`, stating every reader runs a release with the version-3 reader; a config carrying either field is then stamped format version 3, and one carrying neither is still stamped 2 byte for byte. A set or clear stores the stored generation plus one, a clear keeps field 13 with no columns, and clearing a never-set key is refused. Key columns must be declared in the record's own `typed_attr_columns`, the list the clustering-key accessor validates against. On every write `set_tenant_config` runs the accessor's validation on a carried key and refuses an unknown bloom scope value; against the record it replaces, it refuses a generation below the stored one and a key whose columns, or whose bucket width while set, differ from the stored key's at the stored generation, so the generation never goes down and changes with any such key change (it need not be the stored generation plus one: two setter calls on one config store plus two). It refuses a record above version 3, and refuses a `typed_attr_columns` change that drops or retypes a column the current key names, naming the column and saying to clear the key first. `resolve_declared_columns` now falls back to the base columns when the record's list fails validation. No ingest, compaction or CLI caller sets either field yet.
 - **The RLOG writer can sort an object by a clustering key and limit which columns BLOOM covers** (ADR-2135 decisions 1 and 5, issue #2141): `RlogWriter::with_sort_descriptor` orders rows by `(stream_ref, ts.div_euclid(bucket), key_1, ..., key_n, ts)` on resolved per-record values, identically on the row and columnar paths, and records the descriptor and clustering generation in the footer, refusing with `InvalidSortDescriptor` a descriptor the footer decoder would refuse and accepting a key no record has a value for, which orders nothing; `RlogWriter::with_bloom_scope` covers every string column (`All`, the default), `body`, `severity_text` and the string columns not in a declared-column list (`Undeclared`), or only `body` and `severity_text` (`Text`), and an uncovered column gets no bloom keys. With neither set the writer's output is byte-identical to before; no compaction caller sets either yet (the ingest flush does, issue #2142).
 - **The log ingest flush writes each RLOG object with the tenant's clustering key and bloom scope** (ADR-2135 decisions 1 and 5, issue #2142): the key and scope are read from config record fields 13 and 14 with the tenant's indexed fields and declared typed columns and cached beside them, a set key's column types come from those declared typed columns, a cleared key writes no descriptor and its generation, a tenant with neither field writes the same bytes as before, and a key or scope that does not resolve writes no descriptor and full bloom coverage, warns once per refresh, and counts each such flush in `ingest_clustering_key_unresolved_total` per tenant (read through `LogIngestMetrics::clustering_key_unresolved_by_tenant`; not yet exported by `ravel-server`).
 
@@ -1077,17 +1077,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   absent, generation 0), cleared (field present with no columns, at its
   generation), or set. An absent scope reads as all. The accessor refuses a
   present key with generation 0, and a set key that names more than four
-  columns, a duplicate column, a column outside the tenant's effective
-  declared typed attribute columns (which the caller passes, resolving the
-  record's override over the deployment default), or an unspecified or unknown
-  bucket width. A well-formed but invalid key is reported by the accessor, not
-  by record decode, so the rest of the record, retention included, still
-  reads. A key can fail record decode only by making the record invalid
-  protobuf, as a key column name that is not valid UTF-8 does. Setting and
-  clearing a key each store the previous generation plus one. The writer still
-  stamps version 2, and the setters and `set_tenant_config` refuse to write
-  either field until the writer moves to version 3 in a later release. Nothing
-  reads the new fields yet.
+  columns, a duplicate column, a column outside the record's own
+  `typed_attr_columns` (no columns when the record declares none), or an
+  unspecified or unknown bucket width. A well-formed but invalid key is
+  reported by the accessor, not by record decode, so the rest of the record,
+  retention included, still reads. A key can fail record decode only by making
+  the record invalid protobuf, as a key column name that is not valid UTF-8
+  does. Setting and clearing a key each store the previous generation plus
+  one. The writer stamps version 2 by default; the setters write either field,
+  and stamp version 3, on demand behind an operator opt-in (see the issue
+  #2146 entry under Added). The log ingest flush reads both fields (issue
+  #2142).
 - **The maintenance loop sweeps alert history older than `--alert-retention`,
   default 90 days** (ADR-1688 follow-up task 2, issue #1688). After upgrade
   the first tick deletes every alert transition older than 90 days except each

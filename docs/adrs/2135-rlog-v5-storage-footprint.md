@@ -269,10 +269,11 @@ What the codebase already guarantees, which bounds the change:
      The record is Class C and CAS-mutable, which ADR-0531's posture does not
      cover, so ADR-0066's R1 rule applies: one release teaches readers to
      accept `{1, 2, 3}` while the writer still stamps 2 and refuses to set
-     either field, and only a later release, after that one has rolled out,
-     flips the writer to 3 and enables the setters. Until the flip no tenant
-     has a key or a narrowed scope, and every v5 object is written with no
-     descriptor and full bloom coverage.
+     either field (narrowed by the rollout opt-in amendment below), and only
+     a later release, after that one has rolled out, flips the writer to 3
+     and enables the setters. Until the flip no tenant has a key or a
+     narrowed scope (see the rollout opt-in amendment), and every v5 object
+     is written with no descriptor and full bloom coverage.
    - **Documents and tools.** The format document is amended in the same
      change as the writer. `ravel-cli rlog inspect` prints the trailer's own
      version, the sort descriptor, the generation and the bloom coverage, and
@@ -373,7 +374,8 @@ the per-object record it would read.
   compress more slowly. Decompression cost does not depend on the level. Each
   stage reports its serialize and compaction CPU next to its bytes.
 - The clustering key and bloom scope cannot be set until the release after
-  the one carrying the record-version-3 reader has rolled out. While the
+  the one carrying the record-version-3 reader has rolled out, except behind
+  the operator opt-in the rollout opt-in amendment describes. While the
   writer release is rolling out, a node still on the reader-only build reads
   a version-3 record but refuses to rewrite it, so a tenant config change
   routed to that node fails with a refusal to rewrite a newer record until
@@ -384,3 +386,30 @@ the per-object record it would read.
   that includes it, per ADR-0531. Development stores are wiped or re-ingested.
 - Golden fixtures, `ravel-cli` inspector fixtures, version assertions in
   tests, and `docs/log-segment-format.md` change together with the version.
+
+## Amendment (2026-09-30): the rollout opt-in writes version 3 before the flip (issue #2146)
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="rollout opt-in amendment" -->
+<!-- amendment-supersedes: phrase="refuses to set either field" pointer="rollout opt-in amendment" -->
+<!-- amendment-supersedes: phrase="no tenant has a key" pointer="rollout opt-in amendment" -->
+<!-- amendment-supersedes: phrase="every v5 object is written with no descriptor and full bloom coverage" pointer="rollout opt-in amendment" -->
+
+Decision 7 had the writer refuse both tenant config fields until a later
+release flipped it to record version 3. The storage-layout setters instead
+take an opt-in token, and `StorageLayoutWrite::ReadersRolledOut` is the
+exception before the flip: given it, `TenantConfig::set_clustering_key`,
+`TenantConfig::clear_clustering_key` and `TenantConfig::set_bloom_scope`
+write the field, and `set_tenant_config` stamps the record version 3.
+
+- Passing `ReadersRolledOut` asserts that every process reading the bucket's
+  tenant config accepts record versions 1, 2 and 3. Nothing checks that
+  assertion. If it is false, a process whose reader predates version 3
+  refuses the version-3 record, so on that process the tenant's lifecycle
+  refresh and ingest overlay fail closed as on any failed read of the record.
+- A config carrying neither field still writes version 2 byte for byte. A
+  cleared key keeps field 13 present, so the record stays at version 3.
+- The later global flip only makes version 3 the default; it is no longer the
+  first release in which a version-3 record can exist.
+- An opted-in tenant can therefore have a key or a narrowed bloom scope
+  before the flip, and the ingest flush writes its v5 objects with a sort
+  descriptor and narrowed bloom coverage.
