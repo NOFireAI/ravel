@@ -848,28 +848,30 @@ D1 said files are "compared on the footer's schema elements." A checkpoint
 review of epic #2040's task T3b found the code does not compare the
 footer's raw thrift schema elements: `ravel-parquet::snapshot::read_files`
 compares the Arrow `Schema` `ravel-parquet::provider::file_schema` builds
-from each footer, through `parquet_to_arrow_schema`, with every field's own
-metadata cleared and the schema's top-level metadata dropped, the same way
+from each footer, through `parquet_to_arrow_schema`, with each top-level
+field's metadata cleared and the schema's own metadata dropped, the same way
 the provider clears it when it later infers the table's schema. Two files
 share a schema when that cleared `Schema` agrees, not when their footers'
 schema elements are identical:
 
-- Two files whose only difference is a `PARQUET:field_id` on one field
-  share a schema once that per-field metadata is cleared, which the literal
-  footer-schema-elements rule would have refused.
-  `files_differing_only_in_field_metadata_share_a_schema` pins this.
+- Two files whose only difference is a `PARQUET:field_id` on one top-level
+  field share a schema once that field's metadata is cleared, which the
+  literal footer-schema-elements rule would have refused.
+  `files_differing_only_in_field_metadata_share_a_schema` pins this. Metadata
+  on a nested field is not cleared, so such a difference still refuses.
 - `parquet_to_arrow_schema` also takes each footer's `key_value_metadata`,
   which carries the embedded `ARROW:schema` hint when the writer left one,
   and uses it to resolve field types the physical Parquet schema alone
   cannot. Clearing runs on the metadata of its output, not on that
-  resolution: two files whose footer schema elements agree exactly but
+  resolution, so two files whose footer schema elements agree exactly but
   whose `ARROW:schema` hint resolves a field to a different Arrow type
-  still compare unequal and refuse with `SchemaMismatch`, which the literal
-  rule would have admitted.
+  compare unequal and refuse with `SchemaMismatch`, which the literal rule
+  would have admitted. This follows from `file_schema` passing the footer's
+  `key_value_metadata` to `parquet_to_arrow_schema`; no test pins it yet.
 
 The corrected rule: two files share a schema when the Arrow schema
 `parquet_to_arrow_schema` infers from their footers agrees after each
-field's own metadata and the schema's top-level metadata are cleared, so
+top-level field's metadata and the schema's own metadata are cleared, so
 the provider's inferred schema never depends on which file among them it
 happened to read first.
 
