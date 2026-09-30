@@ -821,6 +821,12 @@ token file's line number, never the pair's text. A tenant with no `;` is
 unchanged and never carries the capability. See [Background](#background)
 for the decision behind this.
 
+`ravel-ingest-router` accepts the same `--tenant-token` spelling but does not
+know the `;ddl` suffix: it reads `acme;ddl` as a tenant named `acme;ddl`, so
+data it ingests for that token lands under a different tenant than the one
+`ravel-server` queries, with no error on either side. Keep `;ddl` pairs out of
+any token list or Secret you also pass to `ravel-ingest-router`.
+
 ### Production authentication
 
 Two additive resolvers join the same first-success chain. Enabling them does not
