@@ -514,3 +514,790 @@ async fn read_file(
     };
     Ok((file, schema))
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, PoisonError};
+    use std::task::Poll;
+
+    use async_trait::async_trait;
+    use datafusion::arrow::array::{ArrayRef, Int64Array};
+    use datafusion::arrow::datatypes::{DataType, Field};
+    use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{
+        Capabilities, DelimitedList, Etag, GetOutcome, ListPage, ObjectMeta, PageToken, PutOptions,
+        PutOutcome, Version,
+    };
+    use ravel_pqtable::grants::resolve_location;
+
+    use super::*;
+    use crate::test_support::{
+        BUCKET, PROFILE, arrow_schema_panicking, binary_parquet_bytes, footer_len_of,
+        int_parquet_bytes, parquet_bytes, write,
+    };
+
+    const DEADLINE: Duration = Duration::from_secs(60);
+
+    fn grant(prefix: &str) -> Grant {
+        Grant {
+            profile: PROFILE.to_string(),
+            scheme: "s3".to_string(),
+            bucket: BUCKET.to_string(),
+            prefix: prefix.to_string(),
+            created_unix_ns: 0,
+            created_by: "test".to_string(),
+        }
+    }
+
+    /// `url` resolved against a grant of `s3://lake/data`.
+    fn location(url: &str) -> GrantedLocation {
+        let (grant, key) = resolve_location(&[grant("data")], url).expect("granted");
+        GrantedLocation { grant, key }
+    }
+
+    async fn snapshot(
+        store: &dyn ObjectStoreBackend,
+        url: &str,
+    ) -> Result<LocationSnapshot, SnapshotError> {
+        let limiter = GetLimiter::new(4).expect("permits");
+        snapshot_location(
+            store,
+            &location(url),
+            &limiter,
+            DEADLINE,
+            &PhaseAccounting::new(),
+        )
+        .await
+    }
+
+    async fn put(store: &dyn ObjectStoreBackend, key: &str, bytes: Bytes) {
+        store
+            .put(key, bytes, PutOptions::default())
+            .await
+            .expect("put");
+    }
+
+    fn keys(snapshot: &LocationSnapshot) -> Vec<String> {
+        snapshot.files.iter().map(key_of).collect()
+    }
+
+    /// A store over a `MemoryStore` that records every LIST prefix, HEAD and
+    /// pinned GET, and can serve a synthetic listing, report its listing
+    /// differently from its reads, or repeat the last key of each page at the
+    /// start of the next.
+    #[derive(Default)]
+    struct Scripted {
+        inner: MemoryStore,
+        /// List this many `.parquet` keys that hold no object.
+        synthetic: Option<usize>,
+        /// Report each listed object's ETag prefixed with `listed:`, its size
+        /// one byte short, and a version of `listed-version`; strip the prefix
+        /// from a pin's ETag before reading.
+        misreport_listing: bool,
+        repeat_page_boundary: bool,
+        lists: Mutex<Vec<String>>,
+        heads: Mutex<Vec<String>>,
+        gets: Mutex<Vec<(String, GetRange)>>,
+    }
+
+    impl Scripted {
+        fn lists(&self) -> Vec<String> {
+            self.lists
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+
+        fn heads(&self) -> Vec<String> {
+            self.heads
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+
+        fn gets(&self) -> Vec<(String, GetRange)> {
+            self.gets
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+
+        fn synthetic_page(count: usize, page: Option<PageToken>) -> ListPage {
+            let start = page.map_or(0, |PageToken(at)| at.parse().expect("token"));
+            let end = count.min(start + 1000);
+            let objects = (start..end)
+                .map(|i| ObjectMeta {
+                    key: format!("data/{i:06}.parquet"),
+                    size: 100,
+                    etag: Etag(format!("e{i}")),
+                    version: Version(format!("v{i}")),
+                    last_modified_unix_ms: 0,
+                })
+                .collect();
+            let next = (end < count).then(|| PageToken(end.to_string()));
+            ListPage { objects, next }
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStoreBackend for Scripted {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn get_pinned(
+            &self,
+            key: &str,
+            range: GetRange,
+            pin: &Pin,
+        ) -> Result<PinnedRead, StoreError> {
+            self.gets
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((key.to_string(), range));
+            let mut pin = pin.clone();
+            if self.misreport_listing {
+                pin.etag = pin.etag.trim_start_matches("listed:").to_string();
+            }
+            self.inner.get_pinned(key, range, &pin).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.heads
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(key.to_string());
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.lists
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(prefix.to_string());
+            if let Some(count) = self.synthetic {
+                return Ok(Self::synthetic_page(count, page));
+            }
+            let repeated = match (&page, self.repeat_page_boundary) {
+                (Some(PageToken(after)), true) => Some(self.inner.head(after).await?),
+                _ => None,
+            };
+            let mut listed = self.inner.list(prefix, page).await?;
+            if let Some(repeated) = repeated {
+                listed.objects.insert(0, repeated);
+            }
+            if self.misreport_listing {
+                for object in &mut listed.objects {
+                    object.etag = Etag(format!("listed:{}", object.etag.0));
+                    object.size = object.size.saturating_sub(1);
+                    object.version = Version("listed-version".to_string());
+                }
+            }
+            Ok(listed)
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// A store holding `data/a.parquet` and `data/b.parquet`, both of schema
+    /// `a: Int64, b: Utf8`, behind a `FaultStore`.
+    async fn two_files() -> FaultStore<MemoryStore> {
+        let store = FaultStore::new(MemoryStore::new(), FaultPlan::empty());
+        put(store.inner(), "data/a.parquet", parquet_bytes(&[1], &["x"])).await;
+        put(store.inner(), "data/b.parquet", parquet_bytes(&[2], &["y"])).await;
+        store
+    }
+
+    /// Mutation that fails it: an unconditional footer read (`get_with_pin`
+    /// in place of `get_pinned` on the listed ETag) snapshots the new bytes.
+    #[tokio::test]
+    async fn a_file_changed_between_list_and_footer_refuses_create() {
+        let store = two_files().await;
+        let listed = store.inner().head("data/b.parquet").await.expect("head");
+        let gate = store.hold(Op::Get, Some("data/b.parquet".into()), Occurrence::Nth(1));
+        let overwrite = async {
+            gate.wait_until_held(1).await;
+            put(
+                store.inner(),
+                "data/b.parquet",
+                parquet_bytes(&[3, 4], &["z", "w"]),
+            )
+            .await;
+            for id in gate.held() {
+                gate.release(id);
+            }
+        };
+        let (result, ()) = tokio::join!(snapshot(&store, "s3://lake/data/"), overwrite);
+        match result {
+            Err(SnapshotError::FileChanged { key }) => assert_eq!(key, "data/b.parquet"),
+            other => panic!("expected FileChanged, got {other:?}"),
+        }
+
+        let current = store.inner().head("data/b.parquet").await.expect("head");
+        assert_ne!(current.etag, listed.etag);
+        let again = snapshot(&store, "s3://lake/data/").await.expect("snapshot");
+        assert_eq!(again.files[1].etag, current.etag.0);
+        assert_eq!(again.files[1].row_count, 2);
+    }
+
+    /// Mutation that fails it: mapping `NotFound` from the footer read to
+    /// `Store` instead of `FileMissing`.
+    #[tokio::test]
+    async fn a_file_deleted_between_list_and_footer_refuses_naming_it() {
+        let store = two_files().await;
+        let gate = store.hold(Op::Get, Some("data/b.parquet".into()), Occurrence::Nth(1));
+        let delete = async {
+            gate.wait_until_held(1).await;
+            store
+                .inner()
+                .delete("data/b.parquet")
+                .await
+                .expect("delete");
+            for id in gate.held() {
+                gate.release(id);
+            }
+        };
+        let (result, ()) = tokio::join!(snapshot(&store, "s3://lake/data/"), delete);
+        match result {
+            Err(SnapshotError::FileMissing { key }) => assert_eq!(key, "data/b.parquet"),
+            other => panic!("expected FileMissing, got {other:?}"),
+        }
+    }
+
+    /// Mutation that fails it: dropping the zero-size check reads the empty
+    /// object with a zero-length range, which the store refuses as a
+    /// `Store` error rather than `EmptyFile`.
+    #[tokio::test]
+    async fn a_zero_byte_file_refuses_naming_it() {
+        let store = two_files().await;
+        put(store.inner(), "data/c.parquet", Bytes::new()).await;
+        match snapshot(&store, "s3://lake/data/").await {
+            Err(SnapshotError::EmptyFile { key }) => assert_eq!(key, "data/c.parquet"),
+            other => panic!("expected EmptyFile, got {other:?}"),
+        }
+    }
+
+    fn assert_corrupt(result: Result<LocationSnapshot, SnapshotError>, key: &str, needle: &str) {
+        match result {
+            Err(SnapshotError::Corrupt { key: got, message }) => {
+                assert_eq!(got, key);
+                assert!(message.contains(needle), "{needle:?} not in {message:?}");
+            }
+            other => panic!("expected Corrupt with {needle:?}, got {other:?}"),
+        }
+    }
+
+    /// Three truncations: the end cut off (no magic), the start cut off below
+    /// the footer length the trailer records, and less than a trailer left.
+    /// Mutation that fails it: dropping the footer-length-versus-size check
+    /// (the second case then underflows computing where the footer starts).
+    #[tokio::test]
+    async fn a_truncated_file_refuses_naming_it() {
+        let valid = parquet_bytes(&[1, 2, 3], &["x", "y", "z"]);
+        let cases: [(Bytes, &str); 3] = [
+            (valid.slice(..valid.len() / 2), "footer trailer"),
+            (
+                valid.slice(valid.len() - 20..),
+                "-byte footer in a 20-byte file",
+            ),
+            (
+                Bytes::from_static(b"PAR1"),
+                "shorter than the 8-byte trailer",
+            ),
+        ];
+        for (bytes, needle) in cases {
+            let store = two_files().await;
+            put(store.inner(), "data/c.parquet", bytes).await;
+            assert_corrupt(
+                snapshot(&store, "s3://lake/data/").await,
+                "data/c.parquet",
+                needle,
+            );
+        }
+    }
+
+    /// The reader's own footer checks run at create: a file with enough of
+    /// its start cut off that its last column chunk ends past the footer's
+    /// start (`check_chunks`), and a malformed embedded `ARROW:schema` that
+    /// panics Arrow's decoder (the `catch_unwind` check). Mutation that fails
+    /// it: decoding the footer with `ParquetMetaDataReader::decode_metadata`
+    /// alone in place of `decode_footer`.
+    #[tokio::test]
+    async fn a_footer_the_scan_refuses_is_refused_at_create() {
+        let valid = parquet_bytes(&[1, 2, 3], &["x", "y", "z"]);
+        let footer_end = valid.len() - TRAILER_LEN as usize;
+        let data_end = footer_end - footer_len_of(&valid) as usize;
+        let metadata = parquet::file::metadata::ParquetMetaDataReader::decode_metadata(
+            &valid[data_end..footer_end],
+        )
+        .expect("footer");
+        let chunks_end = metadata
+            .row_groups()
+            .iter()
+            .flat_map(|group| group.columns())
+            .map(|chunk| {
+                let (start, len) = chunk.byte_range();
+                (start + len) as usize
+            })
+            .max()
+            .expect("a column chunk");
+        let cases = [
+            (valid.slice(data_end - chunks_end + 1..), "outside the"),
+            (
+                Bytes::from(arrow_schema_panicking(&valid)),
+                "embedded Arrow schema is malformed",
+            ),
+        ];
+        for (bytes, needle) in cases {
+            let store = two_files().await;
+            put(store.inner(), "data/c.parquet", bytes).await;
+            assert_corrupt(
+                snapshot(&store, "s3://lake/data/").await,
+                "data/c.parquet",
+                needle,
+            );
+        }
+    }
+
+    /// Mutations that fail it: `ends_with("parquet")` in place of
+    /// `ends_with(PARQUET_SUFFIX)` (`notparquet` becomes a file), and counting
+    /// a directory marker as an other suffix.
+    #[tokio::test]
+    async fn directory_markers_and_other_suffixes_are_skipped_and_counted() {
+        let store = MemoryStore::new();
+        let valid = parquet_bytes(&[1], &["x"]);
+        for key in ["data/", "data/year=2024/"] {
+            put(&store, key, Bytes::new()).await;
+        }
+        for key in ["data/year=2024/a.parquet", "data/b.parquet"] {
+            put(&store, key, valid.clone()).await;
+        }
+        for key in [
+            "data/c.csv",
+            "data/d.parquet.tmp",
+            "data/E.PARQUET",
+            "data/notparquet",
+            "data/_SUCCESS",
+        ] {
+            put(&store, key, Bytes::from_static(b"not parquet")).await;
+        }
+        let got = snapshot(&store, "s3://lake/data/").await.expect("snapshot");
+        assert_eq!(keys(&got), ["data/b.parquet", "data/year=2024/a.parquet"]);
+        assert_eq!(got.skipped_directory_markers, 2);
+        assert_eq!(got.skipped_other_suffixes, 5);
+        let names: Vec<&str> = got
+            .schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect();
+        assert_eq!(names, ["a", "b"], "a Hive directory adds no column");
+    }
+
+    /// A store may list a key again at the start of the next page. Mutation
+    /// that fails it: dropping the `seen` check lists the repeated file twice
+    /// and counts the repeated marker twice.
+    #[tokio::test]
+    async fn a_key_listed_on_two_pages_is_counted_once() {
+        let store = Scripted {
+            inner: MemoryStore::with_page_size(2),
+            repeat_page_boundary: true,
+            ..Scripted::default()
+        };
+        let valid = parquet_bytes(&[1], &["x"]);
+        put(&store, "data/", Bytes::new()).await;
+        put(&store, "data/a.parquet", valid.clone()).await;
+        put(&store, "data/b.csv", Bytes::from_static(b"csv")).await;
+        put(&store, "data/c.parquet", valid.clone()).await;
+        put(&store, "data/d/", Bytes::new()).await;
+        let got = snapshot(&store, "s3://lake/data/").await.expect("snapshot");
+        assert_eq!(store.lists().len(), 3, "three pages were listed");
+        assert_eq!(keys(&got), ["data/a.parquet", "data/c.parquet"]);
+        assert_eq!(got.skipped_directory_markers, 2);
+        assert_eq!(got.skipped_other_suffixes, 1);
+    }
+
+    /// Mutation that fails it: dropping the `key_is_addressable` check
+    /// (`MemoryStore` reads the key back, so the snapshot succeeds).
+    #[tokio::test]
+    async fn an_unaddressable_listed_key_refuses_naming_it() {
+        let store = Scripted::default();
+        let valid = parquet_bytes(&[1], &["x"]);
+        put(&store, "data/a.parquet", valid.clone()).await;
+        put(&store, "data/x//y.parquet", valid).await;
+        match snapshot(&store, "s3://lake/data/").await {
+            Err(SnapshotError::Unaddressable { key, .. }) => assert_eq!(key, "data/x//y.parquet"),
+            other => panic!("expected Unaddressable, got {other:?}"),
+        }
+        assert!(store.gets().is_empty(), "refused before any footer read");
+    }
+
+    /// A location handed in with a grant that does not admit it. Mutation
+    /// that fails it: dropping the `contains_key` check.
+    #[tokio::test]
+    async fn a_listed_key_outside_the_grant_refuses_naming_it() {
+        let store = two_files().await;
+        let (_, key) = resolve_location(&[grant("data")], "s3://lake/data/").expect("granted");
+        let location = GrantedLocation {
+            grant: grant("other"),
+            key,
+        };
+        let limiter = GetLimiter::new(4).expect("permits");
+        let result = snapshot_location(
+            &store,
+            &location,
+            &limiter,
+            DEADLINE,
+            &PhaseAccounting::new(),
+        )
+        .await;
+        match result {
+            Err(SnapshotError::OutsideGrant { key, grant, .. }) => {
+                assert_eq!(key, "data/a.parquet");
+                assert_eq!(grant, "s3://lake/other");
+            }
+            other => panic!("expected OutsideGrant, got {other:?}"),
+        }
+    }
+
+    /// Mutation that fails it: returning an empty snapshot with an empty
+    /// schema when no file was listed.
+    #[tokio::test]
+    async fn a_location_with_no_parquet_file_refuses() {
+        let store = MemoryStore::new();
+        put(&store, "other/a.parquet", parquet_bytes(&[1], &["x"])).await;
+        for url in ["s3://lake/data/", "s3://lake/data/empty/"] {
+            match snapshot(&store, url).await {
+                Err(SnapshotError::NoFiles { location }) => assert_eq!(location, url),
+                other => panic!("expected NoFiles, got {other:?}"),
+            }
+        }
+        put(&store, "data/", Bytes::new()).await;
+        put(&store, "data/c.csv", Bytes::from_static(b"csv")).await;
+        assert!(matches!(
+            snapshot(&store, "s3://lake/data/").await,
+            Err(SnapshotError::NoFiles { .. })
+        ));
+    }
+
+    /// Mutation that fails it: `MAX_TABLE_FILES` raised by one, or the limit
+    /// check moved after the push (`len > limit`), admits 100,001 files and
+    /// goes on to read their footers.
+    #[tokio::test]
+    async fn more_than_the_file_limit_refuses_before_any_footer_read() {
+        let store = Scripted {
+            synthetic: Some(MAX_TABLE_FILES + 1),
+            ..Scripted::default()
+        };
+        match snapshot(&store, "s3://lake/data/").await {
+            Err(SnapshotError::TooManyFiles { limit, .. }) => assert_eq!(limit, 100_000),
+            other => panic!("expected TooManyFiles, got {other:?}"),
+        }
+        assert_eq!(store.lists().len(), 101, "the whole listing was read");
+        assert!(store.gets().is_empty());
+    }
+
+    /// The limit admits exactly `limit` files. Mutation that fails it:
+    /// `len + 1 == limit` refuses a location holding exactly the limit.
+    #[tokio::test]
+    async fn exactly_the_file_limit_is_admitted() {
+        let store = two_files().await;
+        let limiter = GetLimiter::new(4).expect("permits");
+        let run = |limit| {
+            let (store, limiter) = (&store, &limiter);
+            async move {
+                snapshot_with_limit(
+                    store,
+                    &location("s3://lake/data/"),
+                    limiter,
+                    DEADLINE,
+                    &PhaseAccounting::new(),
+                    limit,
+                )
+                .await
+            }
+        };
+        assert_eq!(run(2).await.expect("two files").files.len(), 2);
+        assert!(matches!(
+            run(1).await,
+            Err(SnapshotError::TooManyFiles { limit: 1, .. })
+        ));
+    }
+
+    /// Mutation that fails it: comparing each file with the one before it
+    /// rather than with the first names `data/d.parquet` against
+    /// `data/c.parquet`; skipping the comparison admits both.
+    #[tokio::test]
+    async fn a_schema_mismatch_refuses_naming_the_first_file_that_differs() {
+        let store = two_files().await;
+        put(store.inner(), "data/c.parquet", int_parquet_bytes(&[1])).await;
+        put(
+            store.inner(),
+            "data/d.parquet",
+            binary_parquet_bytes(&[b"x"]),
+        )
+        .await;
+        match snapshot(&store, "s3://lake/data/").await {
+            Err(SnapshotError::SchemaMismatch { key, first }) => {
+                assert_eq!(key, "data/c.parquet");
+                assert_eq!(first, "data/a.parquet");
+            }
+            other => panic!("expected SchemaMismatch, got {other:?}"),
+        }
+    }
+
+    /// Two files whose columns differ only in field metadata (a
+    /// `PARQUET:field_id` on one) share a schema once that metadata is
+    /// cleared, as the provider clears it. Mutation that fails it: comparing
+    /// `parquet_to_arrow_schema`'s output uncleared.
+    #[tokio::test]
+    async fn files_differing_only_in_field_metadata_share_a_schema() {
+        let store = MemoryStore::new();
+        let column = || Arc::new(Int64Array::from(vec![1_i64])) as ArrayRef;
+        let plain = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let with_id = Arc::new(Schema::new(vec![
+            Field::new("n", DataType::Int64, false).with_metadata(HashMap::from([(
+                "PARQUET:field_id".to_string(),
+                "7".to_string(),
+            )])),
+        ]));
+        put(&store, "data/a.parquet", write(plain, vec![column()])).await;
+        put(&store, "data/b.parquet", write(with_id, vec![column()])).await;
+        let got = snapshot(&store, "s3://lake/data/").await.expect("snapshot");
+        assert_eq!(got.files.len(), 2);
+        assert!(got.schema.field(0).metadata().is_empty());
+    }
+
+    /// The listing reports an ETag spelled differently, a size one byte
+    /// short and a CAS version that is not the store's selector; the
+    /// recorded file carries what the footer read's response reported.
+    /// Mutations that fail it: taking the ETag, the version or the size from
+    /// the listing's `ObjectMeta`.
+    #[tokio::test]
+    async fn the_recorded_identity_comes_from_the_footer_read_not_the_listing() {
+        let store = Scripted {
+            misreport_listing: true,
+            ..Scripted::default()
+        };
+        let bytes = parquet_bytes(&[1, 2, 3], &["x", "y", "z"]);
+        put(&store, "data/a.parquet", bytes.clone()).await;
+        let (meta, pin) = store.inner.pin_of("data/a.parquet").await.expect("pin");
+        let version = pin.version.expect("MemoryStore reports a version");
+
+        let got = snapshot(&store, "s3://lake/data/").await.expect("snapshot");
+        assert_eq!(
+            got.files,
+            [ParquetFile {
+                profile: PROFILE.to_string(),
+                bucket: BUCKET.to_string(),
+                key: b"data/a.parquet".to_vec(),
+                size: bytes.len() as u64,
+                etag: meta.etag.0.clone(),
+                version: version.clone(),
+                row_count: 3,
+                footer_len: footer_len_of(&bytes),
+            }]
+        );
+        assert_ne!(version, "listed-version");
+        let size = bytes.len() as u64;
+        assert_eq!(
+            store.gets(),
+            [
+                ("data/a.parquet".to_string(), GetRange::Range(0, size - 1)),
+                ("data/a.parquet".to_string(), GetRange::Range(0, size)),
+            ],
+            "the misplaced first read is redone at the size the response reported"
+        );
+    }
+
+    /// `width` Int64 columns of one row, which puts a footer over
+    /// [`FOOTER_PREFETCH`] bytes.
+    fn wide_parquet_bytes(width: usize) -> Bytes {
+        let fields: Vec<Field> = (0..width)
+            .map(|i| Field::new(format!("column_{i}"), DataType::Int64, false))
+            .collect();
+        let columns = (0..width)
+            .map(|i| Arc::new(Int64Array::from(vec![i as i64])) as ArrayRef)
+            .collect();
+        write(Arc::new(Schema::new(fields)), columns)
+    }
+
+    /// Mutation that fails it: decoding only the prefetched bytes when the
+    /// footer is longer than them.
+    #[tokio::test]
+    async fn a_footer_longer_than_the_prefetch_is_read_in_two_gets() {
+        let store = Scripted::default();
+        let bytes = wide_parquet_bytes(1500);
+        let footer_len = footer_len_of(&bytes);
+        assert!(u64::from(footer_len) + TRAILER_LEN > FOOTER_PREFETCH);
+        put(&store, "data/wide.parquet", bytes.clone()).await;
+        let accounting = PhaseAccounting::new();
+        let limiter = GetLimiter::new(4).expect("permits");
+        let got = snapshot_location(
+            &store,
+            &location("s3://lake/data/"),
+            &limiter,
+            DEADLINE,
+            &accounting,
+        )
+        .await
+        .expect("snapshot");
+        assert_eq!(got.files[0].footer_len, footer_len);
+        assert_eq!(got.files[0].row_count, 1);
+        assert_eq!(got.schema.fields().len(), 1500);
+
+        let size = bytes.len() as u64;
+        let tail_start = size - FOOTER_PREFETCH;
+        let footer_start = size - u64::from(footer_len) - TRAILER_LEN;
+        assert_eq!(
+            store.gets(),
+            [
+                (
+                    "data/wide.parquet".to_string(),
+                    GetRange::Range(tail_start, size)
+                ),
+                (
+                    "data/wide.parquet".to_string(),
+                    GetRange::Range(footer_start, tail_start)
+                ),
+            ]
+        );
+        let spent = accounting.snapshot();
+        let get = AccountedOp::Get.index();
+        let list = AccountedOp::List.index();
+        assert_eq!(spent.probe.s3_requests[get], 2);
+        assert_eq!(spent.probe.s3_bytes[get], size - footer_start);
+        assert_eq!(spent.resolve.s3_requests[list], 1);
+        assert_eq!(spent.resolve.s3_requests[get], 0);
+        assert_eq!(spent.scan, Default::default());
+    }
+
+    /// Mutation that fails it: dropping the `tokio::time::timeout` around the
+    /// snapshot leaves it waiting on the held read forever.
+    #[tokio::test]
+    async fn a_snapshot_past_its_deadline_refuses_with_the_deadline_error() {
+        let store = two_files().await;
+        let _gate = store.hold(Op::Get, None, Occurrence::Always);
+        let limiter = GetLimiter::new(4).expect("permits");
+        let deadline = Duration::from_millis(20);
+        let result = snapshot_location(
+            &store,
+            &location("s3://lake/data/"),
+            &limiter,
+            deadline,
+            &PhaseAccounting::new(),
+        )
+        .await;
+        match result {
+            Err(SnapshotError::Deadline {
+                location,
+                deadline: got,
+            }) => {
+                assert_eq!(location, "s3://lake/data/");
+                assert_eq!(got, deadline);
+            }
+            other => panic!("expected Deadline, got {other:?}"),
+        }
+    }
+
+    /// Mutation that fails it: listing a single-object location as a prefix.
+    #[tokio::test]
+    async fn a_single_object_location_reads_that_object_and_lists_nothing() {
+        let store = Scripted::default();
+        put(&store, "data/one.parquet", parquet_bytes(&[1], &["x"])).await;
+        put(&store, "data/two.parquet", parquet_bytes(&[2], &["y"])).await;
+        let got = snapshot(&store, "s3://lake/data/one.parquet")
+            .await
+            .expect("snapshot");
+        assert_eq!(keys(&got), ["data/one.parquet"]);
+        assert!(store.lists().is_empty());
+        assert_eq!(store.heads(), ["data/one.parquet"]);
+        assert!(
+            store
+                .gets()
+                .iter()
+                .all(|(key, _)| key == "data/one.parquet"),
+            "{:?}",
+            store.gets()
+        );
+        assert_eq!(
+            (got.skipped_directory_markers, got.skipped_other_suffixes),
+            (0, 0)
+        );
+    }
+
+    /// Drive a snapshot of four files whose every GET is held, releasing the
+    /// held reads each round, and return the most held at once.
+    async fn peak_concurrent_reads(limiter: &GetLimiter) -> usize {
+        let store = FaultStore::new(MemoryStore::new(), FaultPlan::empty());
+        for i in 0..4 {
+            put(
+                store.inner(),
+                &format!("data/{i}.parquet"),
+                parquet_bytes(&[i], &["x"]),
+            )
+            .await;
+        }
+        let gate = store.hold(Op::Get, None, Occurrence::Always);
+        let location = location("s3://lake/data/");
+        let accounting = PhaseAccounting::new();
+        let mut run = std::pin::pin!(snapshot_location(
+            &store,
+            &location,
+            limiter,
+            DEADLINE,
+            &accounting,
+        ));
+        let mut peak = 0;
+        loop {
+            for _ in 0..16 {
+                if let Poll::Ready(result) = futures::poll!(run.as_mut()) {
+                    assert_eq!(result.expect("snapshot").files.len(), 4);
+                    return peak;
+                }
+                tokio::task::yield_now().await;
+            }
+            peak = peak.max(gate.held_count());
+            for id in gate.held() {
+                gate.release(id);
+            }
+        }
+    }
+
+    /// Mutations that fail it: `buffered(1)` (one read at a time), and
+    /// dropping the permit each read takes (the permit held outside no longer
+    /// narrows the snapshot).
+    #[tokio::test]
+    async fn footer_reads_run_concurrently_up_to_the_limiter() {
+        let limiter = GetLimiter::new(2).expect("permits");
+        assert_eq!(peak_concurrent_reads(&limiter).await, 2);
+        let _held_elsewhere = limiter.acquire().await.expect("permit");
+        assert_eq!(peak_concurrent_reads(&limiter).await, 1);
+    }
+}
