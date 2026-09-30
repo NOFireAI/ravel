@@ -417,10 +417,7 @@ impl PageDir {
                     }
                     prev_block = Some(block);
                     let enc = Enc::from_u8(read_u8(bytes, &mut pos)?)?;
-                    if matches!(
-                        enc,
-                        Enc::GcdI64 | Enc::ColumnRef | Enc::DictPage | Enc::DictIds
-                    ) {
+                    if matches!(enc, Enc::DictPage | Enc::DictIds) {
                         return Err(LogSegError::Corrupted(format!(
                             "page_dir enc tag {} is reserved and never written to RLOG",
                             enc.to_u8()
@@ -797,8 +794,17 @@ mod tests {
     }
 
     #[test]
+    fn accepts_the_rlog_integer_codec_tags() {
+        for enc in [Enc::GcdI64, Enc::ColumnRef] {
+            let mut dir = sample();
+            dir.groups[0].chunks[0].pages[0].enc = enc;
+            assert_eq!(PageDir::decode(&dir.encode()).expect("decodes"), dir);
+        }
+    }
+
+    #[test]
     fn rejects_reserved_enc_tags() {
-        for tag in 10u8..=13 {
+        for tag in 12u8..=13 {
             let mut bytes = sample().encode();
             assert_eq!(bytes[8], Enc::Plain.to_u8());
             bytes[8] = tag;
@@ -838,6 +844,8 @@ mod proptests {
             Enc::Dict,
             Enc::Bitmap,
             Enc::FixedWidth,
+            Enc::GcdI64,
+            Enc::ColumnRef,
         ])
     }
 

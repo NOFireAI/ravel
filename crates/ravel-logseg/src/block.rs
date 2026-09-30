@@ -15,15 +15,18 @@ use std::hash::{BuildHasherDefault, Hasher};
 
 use crate::encoding::{
     DecodedStrings, Enc, decode_bitmap, decode_f64, decode_fixed, decode_i64,
-    decode_strings_columnar, encode_bitmap, encode_f64, encode_fixed, encode_i64, encode_strings,
-    encode_strings_dict,
+    decode_strings_columnar, encode_bitmap, encode_f64, encode_fixed,
 };
 use crate::error::LogSegError;
-use crate::page::{PageDesc, write_page};
+use crate::page::{PageDesc, SealedPage, seal_page, smallest_stored};
 use crate::record::{
     COL_ATTRS_RAW, COL_BODY, COL_FLAGS, COL_OBSERVED_TS, COL_SEVERITY_NUM, COL_SEVERITY_TEXT,
     COL_SPAN_ID, COL_STREAM_REF, COL_TRACE_ID, COL_TS, ColumnValue, FieldType, ResolvedRow,
     SPAN_ID_WIDTH, TRACE_ID_WIDTH,
+};
+use crate::rlog_codec::{
+    decode_column_ref, decode_gcd_i64, encode_column_ref, i64_candidates, string_candidates,
+    string_dict_candidates,
 };
 
 /// Upper bound on a block's decoded record count (untrusted-input guard). A
@@ -143,44 +146,103 @@ pub struct BlockWriteOut {
     pub max_stream_ref: u32,
 }
 
-/// One page staged for a column: its encoding tag and the encoded value bytes.
+/// One page staged for a column, already through the compression envelope.
 struct StagedPage {
     column_id: u32,
-    enc: Enc,
-    bytes: Vec<u8>,
+    page: SealedPage,
 }
 
-/// Stages a column's pages: a presence bitmap page (only when the column is
-/// partially present) followed by the value page. A wholly-absent column
-/// stages nothing.
-fn stage_column(
-    pages: &mut Vec<StagedPage>,
-    column_id: u32,
-    present: &[bool],
-    value_enc: Enc,
-    value_bytes: Vec<u8>,
-) {
-    let mut any = false;
-    let mut all = true;
-    for &p in present {
-        any |= p;
-        all &= p;
+/// A block's pages in staging order, each sealed as it is staged.
+struct Stager {
+    pages: Vec<StagedPage>,
+    zstd_level: i32,
+}
+
+impl Stager {
+    fn new(zstd_level: i32) -> Self {
+        Stager {
+            pages: Vec::new(),
+            zstd_level,
+        }
     }
-    if !any {
-        return;
-    }
-    if !all {
-        pages.push(StagedPage {
+
+    /// Stages a column's pages: a presence bitmap page (only when the column is
+    /// partially present) followed by the value page `value` seals. A
+    /// wholly-absent column stages nothing and never calls `value`.
+    fn column(&mut self, column_id: u32, present: &[bool], value: impl FnOnce(i32) -> SealedPage) {
+        let mut any = false;
+        let mut all = true;
+        for &p in present {
+            any |= p;
+            all &= p;
+        }
+        if !any {
+            return;
+        }
+        if !all {
+            self.pages.push(StagedPage {
+                column_id,
+                page: seal_page(Enc::Bitmap, encode_bitmap(present), self.zstd_level),
+            });
+        }
+        self.pages.push(StagedPage {
             column_id,
-            enc: Enc::Bitmap,
-            bytes: encode_bitmap(present),
+            page: value(self.zstd_level),
         });
     }
-    pages.push(StagedPage {
-        column_id,
-        enc: value_enc,
-        bytes: value_bytes,
-    });
+
+    /// A value page with a single encoding (bitmap, f64, fixed-width).
+    fn single(&mut self, column_id: u32, present: &[bool], enc: Enc, bytes: Vec<u8>) {
+        self.column(column_id, present, |level| seal_page(enc, bytes, level));
+    }
+
+    /// An i64 value page: the candidate with the smallest stored size.
+    fn i64(&mut self, column_id: u32, present: &[bool], values: &[i64]) {
+        self.column(column_id, present, |level| {
+            stored_winner(i64_candidates(values), level)
+        });
+    }
+
+    /// `observed_ts`: a reference to `ts` when the two are equal row for row
+    /// (both columns are always present, so presence is identical too), else an
+    /// ordinary i64 page.
+    fn observed_ts(&mut self, present: &[bool], ts: &[i64], observed_ts: &[i64]) {
+        if ts == observed_ts {
+            self.single(
+                COL_OBSERVED_TS,
+                present,
+                Enc::ColumnRef,
+                encode_column_ref(COL_TS),
+            );
+        } else {
+            self.i64(COL_OBSERVED_TS, present, observed_ts);
+        }
+    }
+
+    /// A string value page: dictionary or plain, whichever stores smaller.
+    fn strings(&mut self, column_id: u32, present: &[bool], values: &[&[u8]]) {
+        self.column(column_id, present, |level| {
+            stored_winner(string_candidates(values), level)
+        });
+    }
+
+    /// Lays the sealed pages out in staging order.
+    fn finish(self) -> (Vec<PageDesc>, Vec<u8>) {
+        let mut payload = Vec::new();
+        let descs = self
+            .pages
+            .iter()
+            .map(|p| p.page.append(&mut payload, p.column_id))
+            .collect();
+        (descs, payload)
+    }
+}
+
+/// The candidate with the smallest stored size. Every candidate list holds at
+/// least one entry, so the empty-page fallback is unreachable in practice.
+fn stored_winner(candidates: Vec<(Enc, Vec<u8>)>, zstd_level: i32) -> SealedPage {
+    smallest_stored(candidates, zstd_level)
+        .unwrap_or_else(|| seal_page(Enc::Plain, Vec::new(), zstd_level))
 }
 
 /// i64 min/max stat over the contributing values (two's-complement bits).
@@ -315,34 +377,27 @@ pub fn write_block(
         return Err(LogSegError::Corrupted("empty block".into()));
     }
     let n = rows.len();
-    let mut pages: Vec<StagedPage> = Vec::new();
+    let mut pages = Stager::new(zstd_level);
     let mut stats: Vec<NumStat> = Vec::new();
 
     // Fixed always-present integer columns.
     let all_present = vec![true; n];
     let ts: Vec<i64> = rows.iter().map(|r| r.ts_ns).collect();
-    let (enc, b) = encode_i64(&ts);
-    stage_column(&mut pages, COL_TS, &all_present, enc, b);
+    pages.i64(COL_TS, &all_present, &ts);
     let obs: Vec<i64> = rows.iter().map(|r| r.observed_ts_ns).collect();
-    let (enc, b) = encode_i64(&obs);
-    stage_column(&mut pages, COL_OBSERVED_TS, &all_present, enc, b);
+    pages.observed_ts(&all_present, &ts, &obs);
     let sref: Vec<i64> = rows.iter().map(|r| i64::from(r.stream_ref)).collect();
-    let (enc, b) = encode_i64(&sref);
-    stage_column(&mut pages, COL_STREAM_REF, &all_present, enc, b);
+    pages.i64(COL_STREAM_REF, &all_present, &sref);
     let sev: Vec<i64> = rows.iter().map(|r| i64::from(r.severity_num)).collect();
-    let (enc, b) = encode_i64(&sev);
-    stage_column(&mut pages, COL_SEVERITY_NUM, &all_present, enc, b);
+    pages.i64(COL_SEVERITY_NUM, &all_present, &sev);
     let flags: Vec<i64> = rows.iter().map(|r| i64::from(r.flags)).collect();
-    let (enc, b) = encode_i64(&flags);
-    stage_column(&mut pages, COL_FLAGS, &all_present, enc, b);
+    pages.i64(COL_FLAGS, &all_present, &flags);
 
     // Fixed always-present string columns.
     let sev_text: Vec<&[u8]> = rows.iter().map(|r| r.severity_text.as_bytes()).collect();
-    let (enc, b) = encode_strings(&sev_text);
-    stage_column(&mut pages, COL_SEVERITY_TEXT, &all_present, enc, b);
+    pages.strings(COL_SEVERITY_TEXT, &all_present, &sev_text);
     let body: Vec<&[u8]> = rows.iter().map(|r| r.body.as_bytes()).collect();
-    let (enc, b) = encode_strings(&body);
-    stage_column(&mut pages, COL_BODY, &all_present, enc, b);
+    pages.strings(COL_BODY, &all_present, &body);
 
     // Fixed optional fixed-width id columns.
     let trace_present: Vec<bool> = rows.iter().map(|r| r.trace_id.is_some()).collect();
@@ -351,20 +406,19 @@ pub fn write_block(
         .filter_map(|r| r.trace_id.as_ref().map(|a| a.as_slice()))
         .collect();
     let (enc, b) = encode_fixed(&trace_vals, TRACE_ID_WIDTH);
-    stage_column(&mut pages, COL_TRACE_ID, &trace_present, enc, b);
+    pages.single(COL_TRACE_ID, &trace_present, enc, b);
     let span_present: Vec<bool> = rows.iter().map(|r| r.span_id.is_some()).collect();
     let span_vals: Vec<&[u8]> = rows
         .iter()
         .filter_map(|r| r.span_id.as_ref().map(|a| a.as_slice()))
         .collect();
     let (enc, b) = encode_fixed(&span_vals, SPAN_ID_WIDTH);
-    stage_column(&mut pages, COL_SPAN_ID, &span_present, enc, b);
+    pages.single(COL_SPAN_ID, &span_present, enc, b);
 
     // Fixed optional attrs_raw column (canonical overflow bytes per row).
     let raw_present: Vec<bool> = rows.iter().map(|r| r.attrs_raw.is_some()).collect();
     let raw_vals: Vec<&[u8]> = rows.iter().filter_map(|r| r.attrs_raw.as_deref()).collect();
-    let (enc, b) = encode_strings(&raw_vals);
-    stage_column(&mut pages, COL_ATTRS_RAW, &raw_present, enc, b);
+    pages.strings(COL_ATTRS_RAW, &raw_present, &raw_vals);
 
     // Dynamic columns, in plan order. The value pages carry each row's own
     // columnar occurrence ([`row_column`]); the stats carry each row's
@@ -392,9 +446,8 @@ pub fn write_block(
                     })
                     .collect();
                 let present_vals: Vec<i64> = vals.iter().flatten().copied().collect();
-                let (enc, b) = encode_i64(&present_vals);
                 stats.push(i64_stat(cid, &stat_vals));
-                stage_column(&mut pages, cid, &present, enc, b);
+                pages.i64(cid, &present, &present_vals);
             }
             FieldType::F64 => {
                 let vals: Vec<Option<u64>> = rows
@@ -414,7 +467,7 @@ pub fn write_block(
                 let present_vals: Vec<u64> = vals.iter().flatten().copied().collect();
                 let (enc, b) = encode_f64(&present_vals);
                 stats.push(f64_stat(cid, &stat_vals));
-                stage_column(&mut pages, cid, &present, enc, b);
+                pages.single(cid, &present, enc, b);
             }
             FieldType::Bool => {
                 let vals: Vec<Option<bool>> = rows
@@ -433,13 +486,7 @@ pub fn write_block(
                     .collect();
                 let present_vals: Vec<bool> = vals.iter().flatten().copied().collect();
                 stats.push(bool_stat(cid, &stat_vals));
-                stage_column(
-                    &mut pages,
-                    cid,
-                    &present,
-                    Enc::Bitmap,
-                    encode_bitmap(&present_vals),
-                );
+                pages.single(cid, &present, Enc::Bitmap, encode_bitmap(&present_vals));
             }
             FieldType::Str | FieldType::Bytes => {
                 let vals: Vec<&[u8]> = rows
@@ -451,24 +498,12 @@ pub fn write_block(
                         _ => None,
                     })
                     .collect();
-                let (enc, b) = encode_strings(&vals);
-                stage_column(&mut pages, cid, &present, enc, b);
+                pages.strings(cid, &present, &vals);
             }
         }
     }
 
-    // Compress pages into a payload buffer, collecting descriptors.
-    let mut payload = Vec::new();
-    let mut descs: Vec<PageDesc> = Vec::with_capacity(pages.len());
-    for p in &pages {
-        descs.push(write_page(
-            &mut payload,
-            p.column_id,
-            p.enc,
-            &p.bytes,
-            zstd_level,
-        ));
-    }
+    let (descs, payload) = pages.finish();
 
     let min_ts = ts.iter().copied().min().unwrap_or(0);
     let max_ts = ts.iter().copied().max().unwrap_or(0);
@@ -553,7 +588,7 @@ pub struct ColumnarBlockInput<'a> {
     pub stat_values: &'a [Vec<Option<ColumnValue>>],
     /// Per plan (in `plans` order): `Some` when the plan is a Str/Bytes column
     /// supplied in dictionary shape, in which case its value page is encoded
-    /// via [`encode_strings_dict`] (per distinct value, ADR-0109 decision 3)
+    /// via [`string_dict_candidates`] (per distinct value, ADR-0109 decision 3)
     /// and `values[idx]` is ignored for that plan. `None` keeps the plain
     /// per-row `values` path unchanged.
     pub str_dicts: &'a [Option<BlockStrDict<'a>>],
@@ -576,40 +611,32 @@ pub fn write_block_columnar(
     if n == 0 {
         return Err(LogSegError::Corrupted("empty block".into()));
     }
-    let mut pages: Vec<StagedPage> = Vec::new();
+    let mut pages = Stager::new(zstd_level);
     let mut stats: Vec<NumStat> = Vec::new();
 
     // Fixed always-present integer columns.
     let all_present = vec![true; n];
-    let (enc, b) = encode_i64(input.ts);
-    stage_column(&mut pages, COL_TS, &all_present, enc, b);
-    let (enc, b) = encode_i64(input.observed_ts);
-    stage_column(&mut pages, COL_OBSERVED_TS, &all_present, enc, b);
+    pages.i64(COL_TS, &all_present, input.ts);
+    pages.observed_ts(&all_present, input.ts, input.observed_ts);
     let sref: Vec<i64> = input.stream_ref.iter().map(|r| i64::from(*r)).collect();
-    let (enc, b) = encode_i64(&sref);
-    stage_column(&mut pages, COL_STREAM_REF, &all_present, enc, b);
+    pages.i64(COL_STREAM_REF, &all_present, &sref);
     let sev: Vec<i64> = input.severity_num.iter().map(|r| i64::from(*r)).collect();
-    let (enc, b) = encode_i64(&sev);
-    stage_column(&mut pages, COL_SEVERITY_NUM, &all_present, enc, b);
+    pages.i64(COL_SEVERITY_NUM, &all_present, &sev);
     let flags: Vec<i64> = input.flags.iter().map(|r| i64::from(*r)).collect();
-    let (enc, b) = encode_i64(&flags);
-    stage_column(&mut pages, COL_FLAGS, &all_present, enc, b);
+    pages.i64(COL_FLAGS, &all_present, &flags);
 
     // Fixed always-present string columns.
-    let (enc, b) = encode_strings(input.severity_text);
-    stage_column(&mut pages, COL_SEVERITY_TEXT, &all_present, enc, b);
-    let (enc, b) = encode_strings(input.body);
-    stage_column(&mut pages, COL_BODY, &all_present, enc, b);
+    pages.strings(COL_SEVERITY_TEXT, &all_present, input.severity_text);
+    pages.strings(COL_BODY, &all_present, input.body);
 
     // Fixed optional fixed-width id columns.
     let (enc, b) = encode_fixed(input.trace_vals, TRACE_ID_WIDTH);
-    stage_column(&mut pages, COL_TRACE_ID, input.trace_present, enc, b);
+    pages.single(COL_TRACE_ID, input.trace_present, enc, b);
     let (enc, b) = encode_fixed(input.span_vals, SPAN_ID_WIDTH);
-    stage_column(&mut pages, COL_SPAN_ID, input.span_present, enc, b);
+    pages.single(COL_SPAN_ID, input.span_present, enc, b);
 
     // Fixed optional attrs_raw column (canonical overflow bytes per row).
-    let (enc, b) = encode_strings(input.attrs_raw_vals);
-    stage_column(&mut pages, COL_ATTRS_RAW, input.attrs_raw_present, enc, b);
+    pages.strings(COL_ATTRS_RAW, input.attrs_raw_present, input.attrs_raw_vals);
 
     // Dynamic columns, in plan order.
     for (idx, plan) in input.plans.iter().enumerate() {
@@ -633,9 +660,8 @@ pub fn write_block_columnar(
                         _ => None,
                     })
                     .collect();
-                let (enc, b) = encode_i64(&present_vals);
                 stats.push(i64_stat(cid, &sv));
-                stage_column(&mut pages, cid, &present, enc, b);
+                pages.i64(cid, &present, &present_vals);
             }
             FieldType::F64 => {
                 let sv: Vec<Option<u64>> = stat_vals
@@ -654,7 +680,7 @@ pub fn write_block_columnar(
                     .collect();
                 let (enc, b) = encode_f64(&present_vals);
                 stats.push(f64_stat(cid, &sv));
-                stage_column(&mut pages, cid, &present, enc, b);
+                pages.single(cid, &present, enc, b);
             }
             FieldType::Bool => {
                 let sv: Vec<Option<bool>> = stat_vals
@@ -672,13 +698,7 @@ pub fn write_block_columnar(
                     })
                     .collect();
                 stats.push(bool_stat(cid, &sv));
-                stage_column(
-                    &mut pages,
-                    cid,
-                    &present,
-                    Enc::Bitmap,
-                    encode_bitmap(&present_vals),
-                );
+                pages.single(cid, &present, Enc::Bitmap, encode_bitmap(&present_vals));
             }
             FieldType::Str | FieldType::Bytes => {
                 if let Some(dp) = &input.str_dicts[idx] {
@@ -686,8 +706,9 @@ pub fn write_block_columnar(
                     let dpresent: Vec<bool> = dp.ids.iter().map(Option::is_some).collect();
                     let present_ids: Vec<u32> = dp.ids.iter().filter_map(|x| *x).collect();
                     let dref: Vec<&[u8]> = dp.dict.iter().map(Vec::as_slice).collect();
-                    let (enc, b) = encode_strings_dict(&dref, &present_ids);
-                    stage_column(&mut pages, cid, &dpresent, enc, b);
+                    pages.column(cid, &dpresent, |level| {
+                        stored_winner(string_dict_candidates(&dref, &present_ids), level)
+                    });
                 } else {
                     let vv: Vec<&[u8]> = vals
                         .iter()
@@ -698,25 +719,13 @@ pub fn write_block_columnar(
                             _ => None,
                         })
                         .collect();
-                    let (enc, b) = encode_strings(&vv);
-                    stage_column(&mut pages, cid, &present, enc, b);
+                    pages.strings(cid, &present, &vv);
                 }
             }
         }
     }
 
-    // Compress pages into a payload buffer, collecting descriptors.
-    let mut payload = Vec::new();
-    let mut descs: Vec<PageDesc> = Vec::with_capacity(pages.len());
-    for p in &pages {
-        descs.push(write_page(
-            &mut payload,
-            p.column_id,
-            p.enc,
-            &p.bytes,
-            zstd_level,
-        ));
-    }
+    let (descs, payload) = pages.finish();
 
     let min_ts = input.ts.iter().copied().min().unwrap_or(0);
     let max_ts = input.ts.iter().copied().max().unwrap_or(0);
@@ -1197,6 +1206,29 @@ pub struct PageCounters {
     pub decompressed_bytes: u64,
 }
 
+/// The values of a tag-11 column: a copy of `target`'s already-decoded values.
+/// Column ids ascend in PAGE_DIR, so `ts` is decoded before `observed_ts`; a
+/// target that was not decoded, or whose presence differs from the referencing
+/// column's, is `Corrupted`.
+fn referenced_i64(
+    out: &DecodedBlock,
+    target: u32,
+    column_id: u32,
+    present: &[bool],
+) -> Result<Vec<Option<i64>>, LogSegError> {
+    let values = out.i64_cols.get(target).ok_or_else(|| {
+        LogSegError::Corrupted(format!(
+            "column {column_id} references column {target}, which was not decoded before it"
+        ))
+    })?;
+    if values.len() != present.len() || values.iter().zip(present).any(|(v, &p)| v.is_some() != p) {
+        return Err(LogSegError::Corrupted(format!(
+            "column {column_id} references column {target} but their presence differs"
+        )));
+    }
+    Ok(values.clone())
+}
+
 /// Turns a block's page descriptors and their decompressed bytes into a
 /// [`DecodedBlock`].
 ///
@@ -1271,8 +1303,15 @@ fn decode_columns(
         let encoded = page(page_bytes, value_idx)?;
         match column_kind(column_id, plans)? {
             ColKind::I64 => {
-                let vals = decode_i64(enc, encoded, present_count)?;
-                out.i64_cols.insert(column_id, scatter(&present, vals)?);
+                let col = match enc {
+                    Enc::GcdI64 => scatter(&present, decode_gcd_i64(encoded, present_count)?)?,
+                    Enc::ColumnRef => {
+                        let target = decode_column_ref(column_id, encoded)?;
+                        referenced_i64(&out, target, column_id, &present)?
+                    }
+                    _ => scatter(&present, decode_i64(enc, encoded, present_count)?)?,
+                };
+                out.i64_cols.insert(column_id, col);
             }
             ColKind::F64 => {
                 let vals = decode_f64(enc, encoded, present_count)?;

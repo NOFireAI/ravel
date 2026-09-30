@@ -40,11 +40,13 @@ const NUM_COLUMNS: usize = 105;
 /// BLAKE3 of the synthetic object at each batch size. Regenerated when the
 /// default writer moved from RLOG version 4 to version 5 (ADR-2135): the BLOOM
 /// section and the trailer version changed, so these pins moved with the
-/// format bump, and again when BLOOM's covered-column list gained its crc.
+/// format bump, again when BLOOM's covered-column list gained its crc, and
+/// again when the writer began choosing each page's encoding by stored size
+/// with the GCD and column-reference codecs among the candidates (#2140).
 /// #682's invariant is unchanged -- the per-block cell materialization must not
 /// alter an output byte within a fixed writer version.
-const HASH_8K: &str = "e975238bf2afb678e7fce9cf656b91309c42392c1d0476b2e09ca7249d83bce7";
-const HASH_64K: &str = "60daa8fb1d766483a539a54eb4a5eee02ceaf9083ce445282ad21ccbec2967bd";
+const HASH_8K: &str = "dbb42113e56ee30e68497dbcd643aef00fc94acd5632d204b5f1ce6489d9837b";
+const HASH_64K: &str = "f1f8b951f3109cb42dd2168808e0c05ec95ede3dec4010c302d7fc31e1b116bc";
 
 /// Peak-live-bytes bound as a multiple of the total cell payload `P`. Measured
 /// K = peak(65536) / P = 1.865 after the fix; rounded up to the next 0.5. The
