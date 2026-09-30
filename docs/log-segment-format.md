@@ -578,8 +578,8 @@ Comparisons are on the bit pattern, never `==`.
   than `ts`, a presence that differs from the target's, or trailing bytes
   are `Corrupted`. `ts` has the lowest column id, PAGE_DIR lists a block's
   pages in ascending column id, and every projection decodes `ts`, so the
-  target is always decoded first; a reference whose target was not
-  decoded is `Corrupted`.
+  reader has decoded the target by the time it reaches `observed_ts`; a
+  reference whose target was not decoded is `Corrupted`.
 
 ### Bitmap codec layout
 

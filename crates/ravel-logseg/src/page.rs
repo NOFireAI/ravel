@@ -228,6 +228,33 @@ mod tests {
     }
 
     #[test]
+    fn sealed_page_stores_what_write_page_stores() {
+        for encoded in [vec![7u8; 100], vec![0u8; 4000]] {
+            let mut direct = Vec::new();
+            let desc = write_page(&mut direct, 4, Enc::Rle, &encoded, 3);
+            let mut via_seal = Vec::new();
+            let sealed_desc = seal_page(Enc::Rle, encoded.clone(), 3).append(&mut via_seal, 4);
+            assert_eq!((sealed_desc, via_seal), (desc, direct));
+        }
+    }
+
+    #[test]
+    fn smallest_stored_keeps_the_earlier_candidate_on_a_tie() {
+        // Under the floor both stay raw at 3 bytes: a tie.
+        let got = smallest_stored([(Enc::Rle, vec![1, 2, 3]), (Enc::Plain, vec![4, 5, 6])], 3)
+            .expect("candidate");
+        assert_eq!((got.enc, got.stored), (Enc::Rle, vec![1, 2, 3]));
+        // A later candidate that is strictly smaller after zstd wins even when
+        // it is larger before it.
+        let under_floor: Vec<u8> = (0..300u32).map(|i| i as u8).collect();
+        let got = smallest_stored([(Enc::Plain, under_floor), (Enc::Rle, vec![0u8; 4000])], 3)
+            .expect("candidate");
+        assert_eq!((got.enc, got.comp), (Enc::Rle, COMP_ZSTD));
+        assert!(got.stored.len() < 300);
+        assert_eq!(smallest_stored(std::iter::empty(), 3), None);
+    }
+
+    #[test]
     fn rejects_uncomp_len_over_cap_before_alloc() {
         let encoded = vec![0u8; 4000];
         let mut buf = Vec::new();
