@@ -296,14 +296,57 @@ typed-attribute-column set (ADR-0090; `str`/`i64`/`bool`/`bytes` only in v1),
 an optional clustering key (ADR-2135; its columns, bucket width and
 generation, where a cleared key keeps the field with an empty column list),
 a bloom scope (ADR-2135; an absent one reads as `ALL`), and
-`created`/`updated` timestamps (proto/ravel/sys.proto `TenantConfigRecord`;
-readers accept record version 3, which can carry the clustering key and bloom
-scope, while the writer still stamps version 2 until the writer flip, so
-neither is written yet). Defaults still come
-from flags/limits-file at startup; a field present here overrides the default
-for this tenant, an absent one leaves the default in place. Unlike the
-append-only `prov`/`enc` histories, it is mutated by **whole-record
-CAS-replace** (`ravel_catalog::set_tenant_config`, the `sys/gc` `set_gc_config`
+`created`/`updated` timestamps (proto/ravel/sys.proto `TenantConfigRecord`).
+Defaults still come from flags/limits-file at startup; a field present here
+overrides the default for this tenant, an absent one leaves the default in
+place.
+
+The record's `format_version` history:
+
+- format version 1: the original layout, fields 1 to 12.
+- format version 2: the same field set, stamped by every writer by default; a
+  floor signal that makes a binary predating the version-2 reader refuse the
+  record rather than rewrite it.
+- format version 3: written on demand by the storage-layout setters behind an operator opt-in; every reader must run a release with the version-3 reader first
+
+Version 3 adds the clustering key (field 13) and bloom scope (field 14). They
+are written only through `TenantConfig::set_clustering_key`,
+`TenantConfig::clear_clustering_key` and `TenantConfig::set_bloom_scope`, each
+of which takes a `StorageLayoutWrite` token and refuses with
+`WriterCannotEmit` unless it is `ReadersRolledOut`, the operator's statement
+that the version-3 reader is deployed everywhere (the ADR-0066 R1
+reader-first rule: `set_tenant_config` rewrites the record whole, so a reader
+that predates a field would strip it on rewrite). A config that carries
+neither field, or only a bloom scope of `ALL` (the zero value, which is not
+written), is still stamped 2 byte for byte. `set_tenant_config` refuses to
+rewrite a record above version 3, and refuses a config carrying either field
+that did not come from an opted-in setter or a decoded version-3 record, so a
+version-1 or version-2 record that carries field 13 or 14 cannot be written
+back. That opt-in check runs before any object-store request.
+
+The clustering generation follows ADR-2135. A key that was never set is an
+absent field 13 at generation 0. Every set and every clear stores the stored
+generation plus one: the first set is generation 1, and a clear of a key at
+generation `g` keeps field 13 present with an empty column list, an
+unspecified bucket width and generation `g + 1`, which ranks the clear above
+every earlier key. Clearing a key that was never set is refused. A record
+spells a cleared key differently from a log segment footer: the record keeps
+the field present with an empty column list and a generation, while the footer
+(docs/log-segment-format.md) carries no `sort_descriptor` and a nonzero
+`clustering_generation`. A set key names 1 to 4 distinct columns, each
+declared in the record's own `typed_attr_columns` (not the base columns a
+server falls back to when the record declares none), and a specified bucket
+width. `set_tenant_config` re-checks those rules on every write, and against
+the record it replaces also refuses a generation below the stored one, a
+different key at the stored generation, and, while the stored set key is
+current, a `typed_attr_columns` change that drops or retypes a key column
+(`ClusteringKeyColumnRemoved`, `ClusteringKeyColumnRetyped`, both naming the
+column and saying to clear the key first), since one generation names exactly
+one descriptor, column types included. Declaring new columns or retyping a
+column outside the key is allowed.
+
+Unlike the append-only `prov`/`enc` histories, the config record is mutated by
+**whole-record CAS-replace** (`ravel_catalog::set_tenant_config`, the `sys/gc` `set_gc_config`
 pattern): a config override is mutable current state whose latest value is the
 only one that matters and which must support lowering a limit or clearing an
 override, so the record is read for its version and swapped in place under
