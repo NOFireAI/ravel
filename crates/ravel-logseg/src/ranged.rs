@@ -76,7 +76,8 @@ impl StreamBlockSpan {
 /// GET; a caller that decodes that whole run at once holds decoded records
 /// proportional to the stream's size in that input. A k-way streaming merge
 /// instead fetches one block at a time via [`RlogRangeReader::stream_blocks`]
-/// (ascending, ts-order for the stream), decodes it with
+/// (ascending; ts-order for the stream when the footer carries no sort
+/// descriptor, `(bucket, key columns, ts)` order under one), decodes it with
 /// [`RlogRangeReader::decode_block`], drains it, and only then fetches the next,
 /// so at most one block's raw bytes and one decoded block are resident per
 /// input regardless of how many blocks the stream spans.
@@ -265,10 +266,10 @@ impl RlogRangeReader {
 
     /// The absolute byte range and candidate blocks covering `stream_id`, or
     /// `None` if the object does not carry the stream. A stream's records are
-    /// stored in a contiguous run of blocks (records sorted by
-    /// `(stream_ref, ts)`), so the span is that run plus at most the boundary
-    /// blocks it shares with its neighbours; fetching it stays proportional to
-    /// the one stream, never the whole object.
+    /// stored in a contiguous run of blocks (`stream_ref` is the primary sort
+    /// key with or without a sort descriptor), so the span is that run plus at
+    /// most the boundary blocks it shares with its neighbours; fetching it
+    /// stays proportional to the one stream, never the whole object.
     pub fn stream_block_span(
         &self,
         stream_id: &LogStreamId,
@@ -296,7 +297,9 @@ impl RlogRangeReader {
     /// Each candidate block is crc-verified and decoded, and only rows whose
     /// `stream_ref` matches the span's stream are rebuilt (a boundary block can
     /// hold rows of the neighbouring stream too). Records come back in stored
-    /// `(stream_ref, ts)` order across the span's blocks.
+    /// order across the span's blocks: `(stream_ref, ts)` when the footer
+    /// carries no sort descriptor, `(stream_ref, bucket, key columns, ts)`
+    /// under one.
     pub fn decode_stream(
         &self,
         span: &StreamBlockSpan,
@@ -324,9 +327,13 @@ impl RlogRangeReader {
     /// where that returns one fused range for a whole-run fetch, this returns
     /// each block separately so a memory-bounded merge can fetch and decode one
     /// block at a time, holding at most one block per input.
-    /// Because a stream's records are stored in `(stream_ref, ts)` order, the
-    /// ascending block order is ts-ascending for the stream, so decoding the
-    /// blocks in this order yields the stream's records already sorted.
+    /// When the footer carries no sort descriptor a stream's records are
+    /// stored in `(stream_ref, ts)` order, so the ascending block order is
+    /// ts-ascending for the stream and decoding the blocks in this order
+    /// yields the stream's records already sorted by `ts`. Under a sort
+    /// descriptor the stream is still one contiguous run, but its records
+    /// are in `(bucket, key columns, ts)` order, so a merge that needs
+    /// ts-ascending input must sort or re-key them (ADR-2135 decision 2).
     pub fn stream_blocks(
         &self,
         stream_id: &LogStreamId,
@@ -570,8 +577,9 @@ impl RlogRangeReader {
 /// demand, so the row-form residency is one record per cursor rather than one
 /// block.
 ///
-/// Rows come back in stored order (records are stored by `(stream_ref, ts)`, so
-/// that is ts-ascending within one stream), rebuilt through the same
+/// Rows come back in stored order (`(stream_ref, ts)` when the footer carries
+/// no sort descriptor, so ts-ascending within one stream; `(stream_ref,
+/// bucket, key columns, ts)` under one), rebuilt through the same
 /// [`crate::reader::rebuild_record`] the eager path uses, over the same rows in
 /// the same order. Draining this view therefore yields exactly the records
 /// [`RlogRangeReader::decode_block_in_group`] returns for the same block.
