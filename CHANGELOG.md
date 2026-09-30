@@ -1676,10 +1676,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   A Parquet statement is also held to `max_s3_requests` and
   `max_bytes_scanned` from the effective config, so a request's clamped
   budgets apply. At resolve, the requests the resolve made plus one GET per
-  file the statement opens (a cold-cache, full-scan upper envelope like the
-  segment estimators: a cached footer or column chunk costs no GET and a
-  LIMIT that stops the scan early costs fewer, though an uncached footer and
-  each column chunk still cost more) are checked against the request budget,
+  file the statement opens (assuming a cold cache and a full scan, like the
+  segment estimators, so the actual count can land on either side: a cached
+  footer or column chunk costs no GET and a LIMIT that stops the scan early
+  costs fewer, while an uncached footer and each column chunk cost more) are
+  checked against the request budget,
   and the estimate is no longer zero. At execution each GET is refused
   before it is issued if it would take the query's request count or
   scanned bytes past a budget (`RequestBudgetExceeded`,
