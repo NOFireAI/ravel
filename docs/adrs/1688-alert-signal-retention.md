@@ -355,8 +355,11 @@ and too wide in another, and decision 6 at odds with where the counter decision
 The Consequences section reported that the query-audit window had no flag.
 `ravel-server --audit-retention` now sets it, in the same shape as
 `--alert-retention`: unset keeps the 90-day default, `0` keeps every
-query-audit record, and a nonzero window below one hour plus the compactor's
-seal margin (the resolved `--gc-max-flush-lifetime` plus the clock-skew
-allowance) is refused before the server writes anything to the bucket. The
+query-audit record, and an unparseable value is refused before the server
+writes anything to the bucket. Unlike `--alert-retention`, any nonzero window
+is accepted: the audit sweep deletes a whole immutable record only once its
+newest event is older than the window and the record is past the protection
+horizon, and each flush writes a new record, so no hour-seal hazard bounds the
+window from below. The
 audit sweep has no disabled value of its own, so `0` reaches the compactor as
 the largest window, whose expiry floor no record is older than.

@@ -725,11 +725,12 @@ pub struct Cli {
     /// deleted once its newest event is older than this window and it is past
     /// the protection horizon; a legal hold covering the query-audit shard
     /// blocks the delete. Set it to the deployment's audit retention
-    /// obligation. `0` keeps every query-audit record forever. A nonzero
-    /// window shorter than one hour plus the compactor's seal margin
-    /// (`--gc-max-flush-lifetime` plus the clock-skew allowance) is refused at
-    /// startup: it would expire records from hours that are not yet sealed and
-    /// can still gain records from an in-flight flush. Omitted defaults to
+    /// obligation. `0` keeps every query-audit record forever. Any nonzero
+    /// window is accepted: each flush writes its own immutable record, so a
+    /// short window only expires records whose events are all older than it,
+    /// and a window shorter than the protection horizon leaves the horizon as
+    /// the effective minimum age. An unparseable value is refused at startup.
+    /// Omitted defaults to
     /// `ravel_maintain::config::DEFAULT_AUDIT_RETENTION_NS` (90 days).
     /// (default: 90d)
     #[arg(long, value_name = "DURATION")]
@@ -4803,8 +4804,8 @@ impl Cli {
         .validate()
         .map_err(|e| {
             anyhow::anyhow!(
-                "invalid ingest configuration: {e}. --idle-flush-byte-floor must be below \
-                 --min-flush-bytes, or 0 to disable the sub-floor hold"
+                "invalid ingest configuration: {}",
+                crate::ingest_config_refusal(&e)
             )
         })?;
         Ok(floor)
@@ -5503,13 +5504,11 @@ impl Cli {
     /// own, and the largest window puts its expiry floor before every event,
     /// so no record ever expires.
     ///
-    /// A nonzero window below one hour plus the seal margin
-    /// (`max_flush_lifetime_ns`, the resolved `--gc-max-flush-lifetime` the
-    /// compactor runs with, plus the default clock-skew allowance) fails
-    /// startup rather than being clamped. The hour covers the expiry floor and
-    /// a record's hour falling on opposite sides of an hour boundary, as in
-    /// [`Self::alert_retention_floor`].
-    pub fn parse_audit_retention(&self, max_flush_lifetime_ns: i64) -> anyhow::Result<i64> {
+    /// Any nonzero window is accepted. The sweep deletes a whole L0 record
+    /// only once every event in it is older than `now - window` and the
+    /// record is past the protection horizon, and every flush writes a new
+    /// immutable record, so no window deletes an event younger than itself.
+    pub fn parse_audit_retention(&self) -> anyhow::Result<i64> {
         let Some(s) = self.audit_retention.as_deref() else {
             return Ok(ravel_maintain::config::DEFAULT_AUDIT_RETENTION_NS);
         };
@@ -5517,25 +5516,6 @@ impl Cli {
             .map_err(|e| anyhow::anyhow!("invalid --audit-retention '{s}': {e}"))?;
         if dur.is_zero() {
             return Ok(i64::MAX);
-        }
-        let max_flush_lifetime = Duration::from_nanos(max_flush_lifetime_ns.max(0).unsigned_abs());
-        let clock_skew = Duration::from_nanos(
-            ravel_maintain::config::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS.unsigned_abs(),
-        );
-        let floor = max_flush_lifetime
-            .saturating_add(clock_skew)
-            .saturating_add(Duration::from_secs(3600));
-        if dur < floor {
-            anyhow::bail!(
-                "invalid --audit-retention '{s}': a nonzero window must be at least {}, one hour \
-                 plus the compactor's seal margin at --gc-max-flush-lifetime {} and a {} clock-skew \
-                 allowance; a shorter window expires query-audit records from hours that are not \
-                 yet sealed and can still gain records from an in-flight flush. Use 0 to keep \
-                 every query-audit record instead.",
-                humantime::format_duration(floor),
-                humantime::format_duration(max_flush_lifetime),
-                humantime::format_duration(clock_skew),
-            );
         }
         Ok(i64::try_from(dur.as_nanos()).unwrap_or(i64::MAX))
     }
@@ -5557,7 +5537,7 @@ impl Cli {
             .parse_alert_retention()
             .context("failed to parse --alert-retention")?;
         let audit_retention_window_ns = self
-            .parse_audit_retention(gc_runtime.max_flush_lifetime_ns)
+            .parse_audit_retention()
             .context("failed to parse --audit-retention")?;
         let claim_lease_duration = self
             .parse_maintain_claim_lease()
@@ -5748,7 +5728,7 @@ impl Cli {
         self.resolve_idle_flush_byte_floor()?;
         // Refused here rather than where the compactor is built, which runs
         // after the store's first write on a fresh bucket.
-        self.parse_audit_retention(self.resolve_gc_max_flush_lifetime_ns()?)?;
+        self.parse_audit_retention()?;
 
         // ADR-0076 decision 4: the idle tier (no strict waiter, below
         // min_flush_bytes) must never flush faster than the fast tier (a
@@ -11716,54 +11696,38 @@ mod tests {
         );
     }
 
-    /// A nonzero window below one hour plus the compactor's seal margin is
-    /// refused, with the exact message. On the defaults the margin is the 1 h
-    /// max flush lifetime plus the 5 m clock-skew allowance, so the minimum
-    /// is 2 h 5 m: `2h` is refused and `2h 5m` is not. A longer
-    /// `--gc-max-flush-lifetime` raises the minimum, and `0` stays the
-    /// keep-forever value at any lifetime.
+    /// Any nonzero window is accepted, however short and whatever the
+    /// `--gc-max-flush-lifetime`: the sweep decides per record on its newest
+    /// event, so there is no seal-margin floor to refuse. Only an unparseable
+    /// value is refused, and `validate` refuses it before `main` builds the
+    /// store.
     #[test]
-    fn audit_retention_refuses_a_window_below_the_seal_margin_floor() {
-        let err = compactor(&["--audit-retention", "2h"])
-            .expect_err("2h is below the floor at the default flush lifetime");
+    fn audit_retention_accepts_any_nonzero_window_and_validate_refuses_garbage() {
         assert_eq!(
-            format!("{err:#}"),
-            "failed to parse --audit-retention: invalid --audit-retention '2h': a nonzero window \
-             must be at least 2h 5m, one hour plus the compactor's seal margin at \
-             --gc-max-flush-lifetime 1h and a 5m clock-skew allowance; a shorter window expires \
-             query-audit records from hours that are not yet sealed and can still gain records \
-             from an in-flight flush. Use 0 to keep every query-audit record instead."
-        );
-
-        assert_eq!(
-            compactor(&["--audit-retention", "2h 5m"])
-                .expect("2h 5m is exactly the floor")
+            compactor(&["--audit-retention", "1s"])
+                .expect("a one-second window is accepted")
                 .audit_retention_window_ns,
-            (2 * 3_600 + 300) * 1_000_000_000
+            1_000_000_000
         );
-
-        let err = compactor(&["--audit-retention", "3h", "--gc-max-flush-lifetime", "2h"])
-            .expect_err("a 2 h flush lifetime raises the floor past 3 h");
-        assert!(format!("{err:#}").contains("at least 3h 5m"), "{err:#}");
-
-        // `main` runs `validate` before it builds the store, so the refusal
-        // lands before the first bucket write.
-        let err = cli(&["--audit-retention", "2h"])
+        assert_eq!(
+            compactor(&["--audit-retention", "2h", "--gc-max-flush-lifetime", "3h"])
+                .expect("a window below the flush lifetime is accepted")
+                .audit_retention_window_ns,
+            2 * 3_600 * 1_000_000_000
+        );
+        cli(&["--audit-retention", "1s"])
             .validate()
-            .expect_err("validate refuses a window below the floor");
+            .expect("validate accepts a one-second window");
+        cli(&["--audit-retention", "0", "--gc-max-flush-lifetime", "2h"])
+            .validate()
+            .expect("validate accepts the keep-forever value");
+
+        let err = cli(&["--audit-retention", "soon"])
+            .validate()
+            .expect_err("validate refuses an unparseable window");
         assert!(
-            format!("{err:#}").contains("invalid --audit-retention '2h': a nonzero window"),
+            format!("{err:#}").contains("invalid --audit-retention 'soon'"),
             "{err:#}"
-        );
-        cli(&["--audit-retention", "2h 5m"])
-            .validate()
-            .expect("validate accepts a window at the floor");
-
-        assert_eq!(
-            compactor(&["--audit-retention", "0", "--gc-max-flush-lifetime", "2h"])
-                .expect("zero keeps every record at any flush lifetime")
-                .audit_retention_window_ns,
-            i64::MAX
         );
     }
 
