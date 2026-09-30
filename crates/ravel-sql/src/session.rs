@@ -2,11 +2,12 @@
 //!
 //! [`build_session`] constructs a complete, throwaway DataFusion session for
 //! exactly one query: its own `SessionConfig`, its own `RuntimeEnv`, its own
-//! memory pool, and exactly one registered table -- either the requesting
-//! tenant's `samples` provider over a `Signal::Metrics` snapshot or its `logs`
-//! provider over a `Signal::Logs` snapshot (ADR-0033 decision C: no v1 query
-//! spans both signals, so the session registers one, chosen by
-//! [`SessionTable`]). Nothing is cached, pooled, or reused across queries or
+//! memory pool, and either exactly one signal table -- the requesting
+//! tenant's `samples` provider over a `Signal::Metrics` snapshot, its `logs`
+//! provider over a `Signal::Logs` snapshot, and so on (ADR-0033 decision C: no
+//! v1 query spans two signals, so the session registers one, chosen by
+//! [`SessionTable`]) -- or the requesting tenant's Parquet tables the statement
+//! names (ADR-2040). Nothing is cached, pooled, or reused across queries or
 //! tenants.
 //!
 //! The session widens no further than the one table the query needs (ADR-0033,
@@ -25,12 +26,20 @@
 //!
 //! - `information_schema` is disabled, so there is no metadata surface to
 //!   enumerate even within a single-tenant session.
-//! - The `RuntimeEnv` carries [`EmptyObjectStoreRegistry`], which holds no
-//!   stores and refuses every lookup. DataFusion's default registry
-//!   auto-registers a local filesystem store for `file://`; that default is
-//!   replaced here, so a `CREATE EXTERNAL TABLE`/`COPY` that somehow slipped
-//!   the parse gate has nothing to bind to. `RsegScanExec` does its own I/O
-//!   through `SegmentFetcher` and never consults this registry.
+//! - A signal-table session's `RuntimeEnv` carries
+//!   [`EmptyObjectStoreRegistry`], which holds no stores and refuses every
+//!   lookup. DataFusion's default registry auto-registers a local filesystem
+//!   store for `file://`; that default is replaced here, so a
+//!   `CREATE EXTERNAL TABLE`/`COPY` that somehow slipped the parse gate has
+//!   nothing to bind to. `RsegScanExec` does its own I/O through
+//!   `SegmentFetcher` and never consults this registry.
+//! - A Parquet session's `RuntimeEnv` carries a [`SingleStoreRegistry`]
+//!   instead (ADR-2040 decision D4). It answers exactly the requesting
+//!   tenant's `ravel-pq://<tenant_hash>/` URL, with a store that serves the
+//!   sizes of the files of the manifests this query resolved and refuses every
+//!   read, write and list; every other URL is an error, and `register_store`
+//!   installs nothing. The files themselves are read by the provider's own
+//!   pinned reader, never through this registry.
 //! - Function registration is an allowlist across every registry (ADR-0022
 //!   decision 2 for aggregates, ADR-0097 decisions 2/4/6 for the rest):
 //!   [`build_session`] enumerates each of `aggregate_functions()`,
@@ -47,11 +56,12 @@
 //! - The table-function admitted set is empty, so `range`/`generate_series`
 //!   (registered unconditionally by DataFusion's `with_default_features()`
 //!   inside `SessionContext::new_with_config_rt`) are deregistered like any
-//!   other non-admitted name. `EmptyObjectStoreRegistry` blocks reading
-//!   anything, but a table function generates rows in memory and needs no
-//!   store, so `SELECT count(*) FROM range(0, 1e18)` would otherwise reach the
-//!   planner as a second, ungoverned data source alongside the one registered
-//!   table.
+//!   other non-admitted name. Neither registry lets a table function read
+//!   anything, but one that generates rows in memory needs no store, so
+//!   `SELECT count(*) FROM range(0, 1e18)` would otherwise reach the planner
+//!   as a second, ungoverned data source alongside the registered tables. The
+//!   executor also refuses a statement naming a table function before it
+//!   resolves anything (crate::validate's `unreadable_table_reference`).
 //!
 //! Determinism:
 //! every `repartition_*` knob except aggregation is turned off unconditionally.
@@ -117,6 +127,7 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::registry::FunctionRegistry;
 use datafusion::object_store::ObjectStore;
 use datafusion::prelude::{SessionConfig, SessionContext};
+use ravel_parquet::SingleStoreRegistry;
 use url::Url;
 
 use crate::alerts_provider::AlertsTableProvider;
@@ -132,6 +143,7 @@ use crate::logs_udf::has_word_udf;
 use crate::map_field_planner::map_field_access_planner;
 use crate::metadata_agg::MetadataOnlyAggregate;
 use crate::minmax::{total_order_max_udaf, total_order_min_udaf};
+use crate::parquet::ParquetSession;
 use crate::provider::RavelTableProvider;
 use crate::spans_provider::SpansTableProvider;
 use crate::trace_id_planner::trace_id_hex_literal_planner;
@@ -174,6 +186,11 @@ pub enum SessionTable {
     /// The `audit` table over a resolved `Signal::Audit` snapshot (ADR-1101
     /// decision 1).
     Audit(Arc<AuditTableProvider>),
+    /// One or more Parquet tables of the caller's tenant (ADR-2040), each
+    /// under its own name. The only arm whose session carries an object store
+    /// registry that answers anything: a [`SingleStoreRegistry`] over the
+    /// session's [`TenantParquetStore`](ravel_parquet::TenantParquetStore).
+    Parquet(ParquetSession),
 }
 
 /// The v1 SQL aggregate allowlist (ADR-0022 decision 2). [`build_session`]
@@ -461,7 +478,7 @@ impl ObjectStoreRegistry for EmptyObjectStoreRegistry {
 
     fn get_store(&self, _url: &Url) -> DFResult<Arc<dyn ObjectStore>> {
         Err(DataFusionError::Execution(
-            "the SQL session registers no object store; \
+            "this SQL session registers no object store; \
              external table and file access are not available"
                 .to_string(),
         ))
@@ -645,11 +662,24 @@ pub fn build_session(
     exact_typed_aggregates: bool,
     spill: SpillDecision<'_>,
 ) -> DFResult<SessionContext> {
+    // ADR-2040 D4: only a Parquet session can resolve a store, and only its
+    // own tenant's `ravel-pq://<tenant_hash>/`; every other session keeps the
+    // registry that answers nothing.
+    let registry: Arc<dyn ObjectStoreRegistry> = match &table {
+        SessionTable::Parquet(session) => {
+            Arc::new(SingleStoreRegistry::new(Arc::clone(&session.store)))
+        }
+        _ => Arc::new(EmptyObjectStoreRegistry),
+    };
     let runtime = RuntimeEnvBuilder::new()
         .with_memory_pool(pool)
-        .with_object_store_registry(Arc::new(EmptyObjectStoreRegistry))
+        .with_object_store_registry(registry)
         .with_disk_manager_builder(disk_manager_builder(spill))
         .build_arc()?;
+    let mut session = session_config(config, exact_typed_aggregates, spill);
+    if matches!(table, SessionTable::Parquet(_)) {
+        session = parquet_session_config(session, exact_typed_aggregates);
+    }
 
     // `SessionContext::new_with_config_rt` with one extra physical optimizer
     // rule. `DictionaryGroupKeysAsViews` keeps a `GROUP BY` over a declared
@@ -661,7 +691,7 @@ pub fn build_session(
     // puts it: the rewrite must see the final partial/final aggregation split
     // that `EnforceDistribution` chose.
     let mut builder = SessionStateBuilder::new()
-        .with_config(session_config(config, exact_typed_aggregates, spill))
+        .with_config(session)
         .with_runtime_env(runtime)
         .with_default_features()
         .with_physical_optimizer_rule(Arc::new(DictionaryGroupKeysAsViews))
@@ -841,8 +871,27 @@ pub fn build_session(
         SessionTable::Audit(provider) => {
             ctx.register_table(AUDIT_TABLE, provider)?;
         }
+        SessionTable::Parquet(session) => {
+            for (name, provider) in session.tables {
+                ctx.register_table(name.as_str(), provider)?;
+            }
+        }
     }
     Ok(ctx)
+}
+
+/// ADR-2040 D6 on top of [`session_config`] for a Parquet session: the reader
+/// evaluates pushed-down filters, and file-scan repartitioning follows
+/// `exact_typed_aggregates`, the same value that chose the provider's file
+/// groups. A spill-enabled session keeps it: byte-range splits are scan
+/// partitions, not the `RepartitionExec` [`repartition_free`] removes.
+fn parquet_session_config(
+    mut session: SessionConfig,
+    exact_typed_aggregates: bool,
+) -> SessionConfig {
+    session = session.with_repartition_file_scans(exact_typed_aggregates);
+    session.options_mut().execution.parquet.pushdown_filters = true;
+    session
 }
 
 #[cfg(test)]
@@ -1221,6 +1270,24 @@ mod tests {
         )))
     }
 
+    /// A Parquet session over one empty table named `hits` for `tenant`.
+    fn parquet_table(tenant: ravel_types::TenantHash) -> SessionTable {
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new(
+                "id",
+                datafusion::arrow::datatypes::DataType::Int64,
+                false,
+            ),
+        ]));
+        SessionTable::Parquet(ParquetSession {
+            tables: vec![(
+                "hits".to_string(),
+                Arc::new(datafusion::datasource::empty::EmptyTable::new(schema)),
+            )],
+            store: Arc::new(ravel_parquet::TenantParquetStore::new(tenant)),
+        })
+    }
+
     fn audit_table(store: &Arc<dyn ravel_object_store::ObjectStoreBackend>) -> SessionTable {
         SessionTable::Audit(Arc::new(AuditTableProvider::new(
             empty_snapshot(),
@@ -1341,6 +1408,11 @@ mod tests {
             // addendum) on one of them fails here.
             ("alerts", alerts_table(&store), empty.clone()),
             ("audit", audit_table(&store), empty.clone()),
+            (
+                "parquet",
+                parquet_table(ravel_types::TenantHash([0u8; 16])),
+                empty.clone(),
+            ),
         ] {
             let ctx = build_session(
                 &SqlConfig::default(),
@@ -1452,6 +1524,123 @@ mod tests {
             metrics_scalars.contains_key("label_match"),
             "a metrics session must keep label_match after the scalar gate"
         );
+    }
+
+    /// ADR-2040 D6: a Parquet session evaluates filters in the reader and
+    /// repartitions file scans exactly when the statement is exact-typed,
+    /// spill or not; a signal-table session never repartitions a file scan.
+    #[test]
+    fn a_parquet_session_repartitions_file_scans_only_when_exact_typed() {
+        let dir = tempfile::tempdir().expect("scratch");
+        let spill = SpillDecision::Enabled {
+            dir: dir.path(),
+            max_bytes: 1 << 20,
+        };
+        for (exact, decision) in [
+            (true, SpillDecision::Disabled),
+            (false, SpillDecision::Disabled),
+            (true, spill),
+        ] {
+            let ctx = build_session(
+                &SqlConfig::default(),
+                test_pool(),
+                parquet_table(ravel_types::TenantHash([7u8; 16])),
+                exact,
+                decision,
+            )
+            .expect("parquet session");
+            let state = ctx.state();
+            let options = state.config().options();
+            assert_eq!(
+                options.optimizer.repartition_file_scans, exact,
+                "{decision:?}"
+            );
+            assert!(options.execution.parquet.pushdown_filters);
+        }
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let logs = build_session(
+            &SqlConfig::default(),
+            test_pool(),
+            logs_table(&store),
+            true,
+            SpillDecision::Disabled,
+        )
+        .expect("logs session");
+        assert!(
+            !logs
+                .state()
+                .config()
+                .options()
+                .optimizer
+                .repartition_file_scans
+        );
+    }
+
+    /// ADR-2040 D4 at the one place a session is built: a Parquet session's
+    /// runtime resolves its own tenant's `ravel-pq://` URL and nothing else,
+    /// and every other session's resolves nothing, not even the local
+    /// filesystem DataFusion's default registry answers `file://` with.
+    #[tokio::test]
+    async fn only_a_parquet_session_resolves_a_store_and_only_its_tenants() {
+        use datafusion::execution::object_store::ObjectStoreUrl;
+
+        let tenant = ravel_types::TenantHash([7u8; 16]);
+        let other = ravel_types::TenantHash([8u8; 16]);
+        let own = ObjectStoreUrl::parse(ravel_parquet::store_url(&tenant)).expect("url");
+        let refused = [
+            ravel_parquet::store_url(&other),
+            "s3://lake/".to_string(),
+            "gs://lake/".to_string(),
+            "az://lake/".to_string(),
+            "file:///".to_string(),
+            "http://example.com/".to_string(),
+            "https://example.com/".to_string(),
+        ];
+        let parquet = build_session(
+            &SqlConfig::default(),
+            test_pool(),
+            parquet_table(tenant),
+            false,
+            SpillDecision::Disabled,
+        )
+        .expect("parquet session");
+        let runtime = parquet.runtime_env();
+        let found = runtime.object_store(&own).expect("the tenant's own URL");
+        assert!(found.to_string().contains(&tenant.to_hex()), "{found}");
+        for url in &refused {
+            let url = ObjectStoreUrl::parse(url).expect("url");
+            let err = runtime
+                .object_store(&url)
+                .err()
+                .unwrap_or_else(|| panic!("{url} must not resolve"));
+            assert!(err.to_string().contains("reads only"), "{url}: {err}");
+        }
+        let intruder: Arc<dyn ObjectStore> =
+            Arc::new(ravel_parquet::TenantParquetStore::new(other));
+        let s3 = Url::parse("s3://lake/").expect("url");
+        runtime.register_object_store(&s3, intruder);
+        assert!(
+            runtime
+                .object_store(ObjectStoreUrl::parse("s3://lake/").expect("url"))
+                .is_err()
+        );
+
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let logs = build_session(
+            &SqlConfig::default(),
+            test_pool(),
+            logs_table(&store),
+            false,
+            SpillDecision::Disabled,
+        )
+        .expect("logs session");
+        for url in refused.iter().chain([&ravel_parquet::store_url(&tenant)]) {
+            let url = ObjectStoreUrl::parse(url).expect("url");
+            assert!(
+                logs.runtime_env().object_store(&url).is_err(),
+                "a logs session must not resolve {url}"
+            );
+        }
     }
 
     #[test]

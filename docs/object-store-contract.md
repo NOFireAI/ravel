@@ -1497,7 +1497,11 @@ endpoint are not the same object. `load_profiles` therefore rejects an empty
 name and a duplicate name rather than resolving a duplicate last-one-wins,
 because the pinned cache key (`ravel_cache::CacheKey::pinned`) hashes the
 profile name and two profiles sharing one would collide two credential sets
-into one key.
+into one key. An S3 profile whose endpoint carries a path, a query or a
+fragment (anything after the host and port other than trailing `/`s) is
+refused at `ExternalStore::open` with `ProfileError::EndpointPath`, because
+the adapter sends every request under the endpoint as written and a path
+would move the bucket the profile names under another one.
 
 **A profile holds where a secret is, never the secret.** Every credential
 value a profile carries is a `SecretSource`: `Env { name }` or `File { path }`

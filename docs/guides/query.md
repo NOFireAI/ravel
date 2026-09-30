@@ -550,9 +550,13 @@ transitions), and `audit` (audit records). The server parses the query's `FROM`
 clause before it plans, and registers only that one table for the query. A
 single query may reference exactly one of the five; naming two or more of
 them crosses signals and is rejected with an HTTP 400, before any catalog
-listing. The request body, auth, window
-(`start`/`end`), and `min_commit_token` handling are identical to the `samples`
-case.
+listing. The request body, auth, window (`start`/`end`), and
+`min_commit_token` handling are identical to the `samples` case.
+
+The same endpoint also serves the tenant's Parquet tables, which a query may
+join with each other but not with any of the five: one of the five beside a
+Parquet table is the same HTTP 400, returned after one listing per other name
+finds that it is a Parquet table.
 
 The `samples` table columns are `ts` (`Timestamp(ns)`), `value` (`Float64`),
 `series_id` (`FixedSizeBinary(16)`), and `labels` (a dictionary-encoded

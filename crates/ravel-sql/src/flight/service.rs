@@ -440,15 +440,21 @@ impl FlightSqlService for RavelFlightSqlService {
             &self.config,
         )?;
 
-        // Step 2: resolve exactly once. This snapshot, and only this
-        // snapshot, is what DoGet will execute against.
+        // Step 2: resolve exactly once. For the signal tables this snapshot,
+        // and only this snapshot, is what DoGet will execute against. Parquet
+        // tables are the exception: the ticket carries no Parquet state, so
+        // DoGet resolves each table's newest manifest and the tenant's grants
+        // again. A grant removed between the two RPCs fails DoGet with
+        // `LocationNotGranted`. A table replaced between them is read at its
+        // new version, whose schema can differ from the one this FlightInfo
+        // advertised (#2054).
         //
         // This accounting handle covers this RPC's resolve and logical plan.
         // DoGet (crate::flight::stream) builds its own handle for the execution
         // it runs, so a Flight SQL statement's cost is recorded as two folds,
         // one per RPC (ADR-0044's documented two-handle split): the resolve and
-        // plan cost here, the execution cost there. Both now reach `/metrics`
-        //. The `estimate` is this query's whole-query upper
+        // plan cost here, the execution cost there. Both now reach
+        // `/metrics`. The `estimate` is this query's whole-query upper
         // envelope, so it is recorded once, here, against this RPC's actual;
         // DoGet records its actual with a zero estimate so the two folds sum to
         // one whole-query estimate beside the summed whole-query actual.

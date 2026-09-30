@@ -31,7 +31,7 @@ names the path and symbol, never a line number.
 |---|---|---|
 | Tenant authentication: static bearer, OIDC JWT, durable `sys/auth`, mTLS proxy header | shipped | `crates/ravel-tenant-resolve/src/lib.rs::TenantResolver::resolve` |
 | SQL statement gate: one `SELECT`, no DDL, no DML, no `COPY`, no `CREATE EXTERNAL TABLE`, no `EXPLAIN`, no `SET` | shipped, structural | `crates/ravel-sql/src/validate.rs::validate`, `::reject_writes_in_query` |
-| Empty table-function registry, empty object-store registry, `information_schema` off | shipped | `crates/ravel-sql/src/session.rs::build_session`, `::EmptyObjectStoreRegistry` |
+| Empty table-function registry, empty object-store registry (a Parquet session's is `SingleStoreRegistry`; see the Parquet registry amendment below), `information_schema` off | shipped | `crates/ravel-sql/src/session.rs::build_session`, `::EmptyObjectStoreRegistry` |
 | Five SQL tables, one table per statement | gated (`sql`) | `crates/ravel-sql/src/session.rs::SessionTable`, `executor.rs::SqlExecutor::target_signal` |
 | Declared typed attribute columns, 60 s refresh horizon | shipped, CLI-declared | `services/ravel-server/src/declared_columns.rs::TenantConfigDeclaredColumns` |
 | Metric metadata (type, unit, help), one object per tenant | shipped | `crates/ravel-query/src/http/metadata_cache.rs::MetadataCache::get` |
@@ -898,3 +898,16 @@ left to the implementation.
    reads the first wording on an empty tenant concludes its own freshness is
    unknowable through this tool rather than that the window it asked about is
    empty, which is the opposite of what the call established.
+
+## Amendment (2026-09-29): Parquet sessions install `SingleStoreRegistry`
+
+<!-- amendment-applies: sections="What exists" pointer="Parquet registry amendment" -->
+
+ADR-2040 decision D4 replaces ADR-0013's first invariant for Parquet tables.
+A query session that reads a Parquet table installs `SingleStoreRegistry`,
+which answers exactly `ravel-pq://<tenant_hash>/` with that query's
+`TenantParquetStore`, errors for every other URL, and refuses
+`register_store`. Every other session keeps `EmptyObjectStoreRegistry`. The
+text above that treats the empty object-store registry as holding for every
+session holds for every session that reads no Parquet table; the code is
+`crates/ravel-sql/src/session.rs` and `crates/ravel-parquet/src/store.rs`.

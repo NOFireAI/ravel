@@ -374,10 +374,7 @@ pub fn build_store(cli: &Cli, cache_max_bytes: u64) -> anyhow::Result<BuiltStore
                 .s3_bucket
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("--store s3 requires RAVEL_S3_BUCKET"))?;
-            let region = cli
-                .s3_region
-                .clone()
-                .unwrap_or_else(|| "us-east-1".to_string());
+            let region = cli.s3_region_or_default();
             let auth = cli.s3_auth.mode();
             let (access_key_id, secret_access_key, session_token, credentials_file) = match auth {
                 S3AuthMode::Static => (
