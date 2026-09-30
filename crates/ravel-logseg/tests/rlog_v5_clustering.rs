@@ -990,6 +990,11 @@ fn bloom_scope_undeclared_with_nothing_declared_equals_all() {
     let all = write_scoped(&BloomScope::All);
     let none_declared = write_scoped(&BloomScope::Undeclared { declared: vec![] });
     assert!(all == none_declared, "object bytes differ");
+    // `code` has no Str column and `absent` no column at all.
+    let no_str_declared = write_scoped(&BloomScope::Undeclared {
+        declared: vec!["code".to_string(), "absent".to_string()],
+    });
+    assert!(all == no_str_declared, "non-string declared names");
     let (dir, _) = dir_and_bloom(&none_declared);
     let mut covered = vec![
         COL_SEVERITY_TEXT,

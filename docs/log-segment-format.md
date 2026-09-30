@@ -920,7 +920,12 @@ is its BLOOM scope, which its caller sets with `RlogWriter::with_bloom_scope`:
   column in FIELD_DIR, which is every column version 4 inserted.
 - `Undeclared`, given the tenant's declared-column names: `severity_text`,
   `body`, and every string attribute column in FIELD_DIR whose name is not
-  declared. A declared name that is not a string column changes nothing.
+  declared. Matching is by name alone, whatever type the name was declared
+  with: a declared name that is an i64 column in the object, say, also leaves
+  a string column of that name uncovered. That costs pruning only, since an
+  uncovered column is scanned and no matching row is dropped. A declared name
+  with no string column of that name changes nothing, and an empty declared
+  list covers exactly what `All` covers.
 - `Text`: `severity_text` and `body` only.
 
 The covered list is exactly that set, ascending, and no filter holds a key of
