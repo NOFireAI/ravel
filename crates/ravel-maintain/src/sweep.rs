@@ -2520,9 +2520,31 @@ async fn gather_superseded_chain(
         predecessor_key,
         entry,
         links,
-        async |key: &str| load_chain_link(store, key).await,
+        ChainLoader::Store,
     )
     .await
+}
+
+/// Where a [`walk_superseded_chain`] reads the chain's records from.
+///
+/// An enum rather than a generic async loader: a closure over the borrowed
+/// store makes the sweep future's `Send` bound higher-ranked, which the
+/// server's `tokio::spawn` of the maintain loop cannot prove.
+enum ChainLoader<'a> {
+    /// [`load_chain_link`] against the walk's store.
+    Store,
+    /// Rewrite records served from memory without key verification.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Memory(&'a HashMap<&'a str, RewriteRecord>),
+}
+
+impl ChainLoader<'_> {
+    async fn load(&self, store: &dyn ObjectStoreBackend, key: &str) -> Result<Option<ChainLink>> {
+        match self {
+            ChainLoader::Store => load_chain_link(store, key).await,
+            ChainLoader::Memory(records) => Ok(records.get(key).cloned().map(ChainLink::Rewrite)),
+        }
+    }
 }
 
 /// [`gather_superseded_chain`] with the chain's records read through `load`.
@@ -2538,7 +2560,7 @@ async fn walk_superseded_chain(
     predecessor_key: &str,
     entry: ChainEntry,
     links: Version2Links,
-    load: impl AsyncFn(&str) -> Result<Option<ChainLink>>,
+    load: ChainLoader<'_>,
 ) -> Result<ChainWalk> {
     let mut chain_record_keys: Vec<String> = Vec::new();
     let mut chain_part_keys: Vec<String> = Vec::new();
@@ -2562,7 +2584,7 @@ async fn walk_superseded_chain(
         if !seen.insert(key.clone()) {
             return Ok(ChainWalk::Refused(ChainRefusal::Cycle));
         }
-        let Some(link) = load(&key).await? else {
+        let Some(link) = load.load(store, &key).await? else {
             match version_2_above.take() {
                 Some(above) => {
                     if entry.gathers_raw_l0_inputs() {
@@ -6570,7 +6592,7 @@ mod tests {
                 "a",
                 ChainEntry::Rewrite,
                 Version2Links::Follow,
-                async |key: &str| Ok(records.get(key).cloned().map(ChainLink::Rewrite)),
+                ChainLoader::Memory(&records),
             )
             .await;
             match (walked, refusal) {
