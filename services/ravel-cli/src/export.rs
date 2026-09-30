@@ -71,10 +71,10 @@
 //!
 //! # Metrics: duplicates and series identity
 //!
-//! The query path serves one sample per `(series, ts)`: the candidate with the
-//! greatest `(created_unix_ns, writer_epoch, writer_seq, in_page_index)`
-//! provenance, ties broken by the greatest `f64::to_bits` of the value
-//! (docs/catalog-and-mvcc.md). The export writes exactly that sample and
+//! The query path serves one sample per `(series, ts)`, chosen by
+//! [`ravel_query::serves_over`]; the export orders its candidates with
+//! [`ravel_query::DedupKey::serve_cmp`], the comparison that function is built
+//! on, so it cannot pick a different one. The export writes exactly that sample and
 //! counts every other candidate as `samples_deduplicated`, so two loads of one
 //! sample export as one row whatever their bit patterns.
 //!
@@ -119,7 +119,7 @@ use ravel_query::erasure::{
     retain_histogram_series, retain_series_soa, retain_unerased_log_records,
     snapshot_pending_erasure_predicates,
 };
-use ravel_query::{FetchedSeriesSoa, LogQuery, LogSegmentFetcher, SegmentFetcher};
+use ravel_query::{DedupKey, FetchedSeriesSoa, LogQuery, LogSegmentFetcher, SegmentFetcher};
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::{LabelSet, METRIC_NAME_LABEL, SeriesId, Signal, TenantHash, TenantId, TimeRange};
 
@@ -655,11 +655,10 @@ pub async fn export_metrics(
 }
 
 /// One in-window sample of a series before duplicate resolution, with the
-/// provenance key the query path's merge orders duplicates by.
+/// key the query path's merge orders duplicates by.
 struct SampleCandidate {
     ts_ns: i64,
-    priority: (i64, u64, u64, u32),
-    value: f64,
+    key: DedupKey,
 }
 
 /// Every in-window candidate sample of one series, across all the runs and
@@ -726,41 +725,45 @@ fn collect_run(
         if !in_export_window(ts_ns, start_ns, end_ns) {
             continue;
         }
-        let priority = match run
+        let key = match run
             .per_sample_priorities
             .as_ref()
             .and_then(|column| column.get(pos))
         {
-            Some(priority) => priority.as_tuple(),
-            None => (
+            Some(priority) => DedupKey::from_parts(
+                priority.created_unix_ns,
+                priority.writer_epoch,
+                priority.writer_seq,
+                priority.in_page_index,
+                value,
+            ),
+            None => DedupKey::from_parts(
                 run.created_unix_ns,
                 run.writer_epoch,
                 run.writer_seq,
                 u32::try_from(pos).unwrap_or(u32::MAX),
+                value,
             ),
         };
-        entry.samples.push(SampleCandidate {
-            ts_ns,
-            priority,
-            value,
-        });
+        entry.samples.push(SampleCandidate { ts_ns, key });
     }
     Ok(())
 }
 
 /// Resolves duplicate timestamps the way the query path's merge does: at each
-/// `ts`, the candidate with the greatest `(priority, value.to_bits())` wins.
-/// Returns the winners in ascending `ts` and the number of candidates dropped.
+/// `ts`, the candidate [`DedupKey::serve_cmp`] orders greatest wins. Returns
+/// the winners in ascending `ts` and the number of candidates dropped.
 fn resolve_duplicates(mut samples: Vec<SampleCandidate>) -> (Vec<(i64, f64)>, u64) {
-    samples.sort_by_key(|c| (c.ts_ns, c.priority, c.value.to_bits()));
+    samples.sort_by(|a, b| a.ts_ns.cmp(&b.ts_ns).then(a.key.serve_cmp(&b.key)));
     let total = samples.len();
     let mut winners: Vec<(i64, f64)> = Vec::with_capacity(total);
     for candidate in samples {
-        // Ascending order puts the greatest candidate of a timestamp last, so
+        // Ascending order puts the served candidate of a timestamp last, so
         // the last one seen replaces every earlier one.
+        let sample = (candidate.ts_ns, f64::from_bits(candidate.key.value_bits));
         match winners.last_mut() {
-            Some(last) if last.0 == candidate.ts_ns => *last = (candidate.ts_ns, candidate.value),
-            _ => winners.push((candidate.ts_ns, candidate.value)),
+            Some(last) if last.0 == candidate.ts_ns => *last = sample,
+            _ => winners.push(sample),
         }
     }
     let dropped = (total - winners.len()) as u64;
