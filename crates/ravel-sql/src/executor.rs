@@ -1626,8 +1626,14 @@ impl SqlExecutor {
         let parquet = match extras.parquet {
             ParquetPlan::Resolved(resolution) => resolution,
             ParquetPlan::Unresolved => {
-                self.resolve_parquet_target(tenant_hash, sql, &tables, phase_accounting)
-                    .await?
+                self.resolve_parquet_target(
+                    tenant_hash,
+                    sql,
+                    &tables,
+                    extras.row_window.is_some(),
+                    phase_accounting,
+                )
+                .await?
             }
         };
         let target = if parquet.is_some() {
@@ -1867,6 +1873,8 @@ impl SqlExecutor {
         // schema).
         let window_predicate = match extras.row_window {
             Some(window) => {
+                // A Parquet target with a row window was refused at resolve
+                // (`resolve_parquet_target`); this is the type's fallback.
                 let ts_column =
                     window_ts_column(target).ok_or(ParquetQueryError::RowWindowUnsupported)?;
                 let (plan, predicate) =
@@ -2040,7 +2048,13 @@ impl SqlExecutor {
         // has no segments, so there is nothing to admit against
         // `max_segments`.
         if let Some(resolution) = self
-            .resolve_parquet_target(tenant_hash, &req.sql, &tables, phase_accounting)
+            .resolve_parquet_target(
+                tenant_hash,
+                &req.sql,
+                &tables,
+                req.row_window,
+                phase_accounting,
+            )
             .await?
         {
             // The request budget is checked here, as it is for a signal
@@ -2205,19 +2219,28 @@ impl SqlExecutor {
     /// The Parquet tables `sql` reads, when it reads any (ADR-2040 D3, D6).
     ///
     /// - A table function or a URL-shaped table name is refused with the
-    ///   planning error it would meet anyway, before anything is read.
+    ///   planning error it would meet anyway, before anything is read. This
+    ///   runs before the `others.is_empty()` short-circuit below so that a URL
+    ///   table is refused whether or not a Parquet name is present.
     /// - Without [`ParquetSources`], or when the statement names nothing but
     ///   signal tables, this is `None` and reads nothing.
-    /// - A signal table beside a name that has Parquet manifest versions is
+    /// - With Parquet sources, a statement that names only non-signal tables
+    ///   and carries a row window is [`ParquetQueryError::RowWindowUnsupported`],
+    ///   before anything is read: such a statement can only succeed as a
+    ///   Parquet query, and a Parquet table has no event-time column.
+    /// - A signal table beside a live Parquet table is
     ///   [`SqlError::CrossSignalQuery`].
-    /// - With no credential profiles configured, a name with manifest versions
-    ///   is [`ParquetQueryError::NotConfigured`].
-    /// - In both cases above the names are listed in order and the first one
-    ///   with versions decides: one LIST per name up to it and no GET.
+    /// - With no credential profiles configured, a live Parquet table is
+    ///   [`ParquetQueryError::NotConfigured`].
+    /// - In both cases above the names are listed in order and the first live
+    ///   table decides: one LIST per name up to it, and one GET of the newest
+    ///   manifest for each name that has versions, which is how a dropped
+    ///   table is told from a live one. No file is read.
     /// - Otherwise each name's newest live manifest, checked against the
-    ///   tenant's current grants; `None` when no name is a live Parquet table,
-    ///   so the statement then plans, and fails, as a statement naming an
-    ///   unknown table always has.
+    ///   tenant's current grants. A dropped table is no table on any of these
+    ///   paths: `None` when no name is a live Parquet table, so the statement
+    ///   then plans, and fails, as a statement naming an unknown table always
+    ///   has.
     ///
     /// Every read here is charged to the Resolve phase.
     async fn resolve_parquet_target(
@@ -2225,6 +2248,7 @@ impl SqlExecutor {
         tenant_hash: TenantHash,
         sql: &str,
         tables: &StatementTables,
+        row_window: bool,
         phase_accounting: &PhaseAccounting,
     ) -> Result<Option<ParquetResolution>, SqlError> {
         if let Some(name) = unreadable_table_reference(sql)? {
@@ -2239,17 +2263,16 @@ impl SqlExecutor {
         if tables.others.is_empty() {
             return Ok(None);
         }
+        if row_window && tables.signal.is_none() {
+            return Err(ParquetQueryError::RowWindowUnsupported.into());
+        }
         let accounting = phase_accounting.resolve();
         if tables.signal.is_some() || !sources.is_configured() {
-            // The first name with versions decides the outcome, so the
-            // resolve stops there rather than listing every name.
-            let named = parquet::first_name_with_versions(
-                sources,
-                &tenant_hash,
-                &tables.others,
-                accounting,
-            )
-            .await?;
+            // The first live table decides the outcome, so the resolve stops
+            // there rather than listing every name.
+            let named =
+                parquet::first_live_table(sources, &tenant_hash, &tables.others, accounting)
+                    .await?;
             return match named {
                 Some(_) if tables.signal.is_some() => Err(SqlError::CrossSignalQuery),
                 Some(table) => Err(ParquetQueryError::NotConfigured { table }.into()),
