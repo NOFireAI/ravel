@@ -917,8 +917,10 @@ pub struct RavelClusterStatus {
     #[serde(default)]
     pub gc_bootstrap_waiting_since: Option<String>,
 
-    /// The qualify-Job input hash (bucket, region, endpoint, image, credentials
-    /// Secret name) that store qualification last succeeded against (issue #36).
+    /// The qualify-Job input hash (bucket, region, endpoint, `allowHttp`,
+    /// `uploadIntegrity`, `requestStoredChecksum`, image, credentials Secret
+    /// name and that Secret's `resourceVersion`) that store qualification last
+    /// succeeded against (issue #36).
     /// The operator gates serving on `ravel-cli store qualify` before it creates any
     /// Deployment; recording the qualified inputs here makes that gate durable:
     /// a later pass whose inputs still hash to this value proceeds without

@@ -859,9 +859,18 @@ mod tests {
     async fn qualify_against_fake(
         refuse: impl FnOnce(&crate::fake_s3::FakeS3),
     ) -> (String, anyhow::Result<()>, bool) {
-        use crate::fake_s3::{Echo, spawn};
+        qualify_against_fake_echoing(crate::fake_s3::Echo::Stored, refuse).await
+    }
 
-        let (endpoint, fake) = spawn(Echo::Stored, &bucket_answers()).await;
+    /// [`qualify_against_fake`] against an endpoint that answers checksum
+    /// reads with `echo`.
+    async fn qualify_against_fake_echoing(
+        echo: crate::fake_s3::Echo,
+        refuse: impl FnOnce(&crate::fake_s3::FakeS3),
+    ) -> (String, anyhow::Result<()>, bool) {
+        use crate::fake_s3::spawn;
+
+        let (endpoint, fake) = spawn(echo, &bucket_answers()).await;
         refuse(&fake);
         let outcome = qualify_built(
             s3_store_paged(&endpoint, &[], 2),
@@ -937,6 +946,56 @@ mod tests {
             )
         );
         assert!(!recorded, "nothing is recorded on an echo failure");
+    }
+
+    /// One healthy attempt at the default page size issues the requests the
+    /// operator's qualify Job deadline budgets for (ravel-operator's
+    /// `QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS`): 17 listings, since each
+    /// listing-order drain over 1002 keys, and its `list_after` tail over
+    /// exactly 1000, costs two, and 2031 PUTs on a fresh bucket where no
+    /// concurrent create-if-absent writer retries.
+    #[tokio::test]
+    async fn one_attempt_at_the_default_page_size_issues_the_budgeted_requests() {
+        use crate::fake_s3::{Echo, spawn};
+
+        let page_size = ravel_object_store::s3::LIST_PAGE_SIZE;
+        assert_eq!(page_size, 1000);
+        let (endpoint, fake) = spawn(Echo::Stored, &bucket_answers()).await;
+        qualify_built(
+            s3_store_paged(&endpoint, &[], page_size),
+            ECHO_IDENTITY.to_string(),
+            ECHO_RUN_ID,
+            page_size,
+        )
+        .await
+        .expect("the fake endpoint qualifies");
+        assert_eq!(fake.lists().len(), 5 + 6 + 2 + 4, "{:?}", fake.lists());
+        assert_eq!(
+            fake.puts().len(),
+            2 + 3 + 5 + 5 + 8 + 1002 + 1002 + 2 + 1 + 1
+        );
+        assert_eq!(fake.control_plane().len(), 3);
+    }
+
+    /// An endpoint that returns a stored checksum not matching the body fails
+    /// qualification, and no `sys/qualification` record is written. The
+    /// conformance suite's own whole-object reads see the mismatch first, so
+    /// the failure names the properties those reads back.
+    #[tokio::test]
+    async fn a_checksum_mismatch_fails_qualification_and_records_nothing() {
+        let (_, outcome, recorded) =
+            qualify_against_fake_echoing(crate::fake_s3::Echo::Wrong, |_| {}).await;
+        let err = outcome.expect_err("a mismatched stored checksum fails qualification");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "store qualification failed: {ECHO_IDENTITY} does not satisfy the object store \
+                 contract (docs/object-store-contract.md); failing properties: \
+                 conditional_write_create_if_absent, conditional_write_cas_version, \
+                 consistent_read_after_write, concurrent_create_if_absent_single_winner"
+            )
+        );
+        assert!(!recorded, "nothing is recorded on a checksum mismatch");
     }
 
     /// A refused probe GET fails qualification with the GET named, and no

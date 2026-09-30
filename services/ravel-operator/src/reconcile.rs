@@ -2355,35 +2355,38 @@ pub const QUALIFY_JOB_TTL_SECONDS: i32 = 3600;
 ///
 /// Arithmetic. The Job runs `ravel-cli store qualify` at its default
 /// `--list-page-size` of 1000, so each listing probe writes 1000 + 2 = 1002
-/// keys and a listing drain costs one request per 1000 keys, rounded up. One
-/// healthy attempt runs 2082 sequential operations against the bucket. The
-/// conformance suite runs 2073: create-if-absent (put, put, get = 3), CAS
-/// version (put, put, put, get = 4), read-after-write (5 put+get = 10),
-/// list-after-write (5 put+list = 10), concurrent create-if-absent (8
-/// concurrent puts as 1 round trip, up to 3 sequential retries for each of the
-/// 8 writers = 24, and a get: 26), listing order (1002 puts, a 2-page `list`,
-/// a 2-page `list_after`, and a 1-page `list_after` from the second key: 1007),
-/// cross-page listing (1002 puts and a 2-page `list`: 1004), and delete
-/// visibility (put, put, delete, get, list, list_after, delete, list,
-/// list_after = 9). After it come the three bucket control-plane GETs
-/// (`?versioning`, `?lifecycle`, `?object-lock` = 3), the stored-checksum echo
-/// probe (put, get, delete = 3), and the `sys/qualification` record
-/// (create-if-absent put, then a get and a CAS put when an older record is
-/// there = 3): 2073 + 3 + 3 + 3 = 2082. Budgeting each at the S3 client's 20 s
-/// `request_timeout` would put one attempt at 41640 s, a bound that no longer
-/// stops a hung Job in useful time, so a slow-but-healthy operation is budgeted
-/// at 500 ms instead, several times a healthy endpoint's latency: 2082 *
-/// 0.5 s = 1041 s. Adding 140 s per attempt for pod scheduling and image pull
-/// gives an 1181 s per-attempt budget. With `QUALIFY_JOB_BACKOFF_LIMIT` = 1 the
-/// Job runs at most two attempts, so the Job-wide deadline is 2 * 1181 s =
-/// 2362 s: a slow-but-healthy initial attempt AND a full retry both complete
-/// before it fires. A hung attempt still terminates, at the 2362 s Job-wide
+/// keys and a listing drain costs one request per 1000 keys, plus one more
+/// when the last page is exactly full: a full page carries a continuation
+/// token, and following it returns an empty page. One healthy attempt runs
+/// 2083 sequential operations against the bucket. The conformance suite runs
+/// 2074: create-if-absent (put, put, get = 3), CAS version (put, put, put,
+/// get = 4), read-after-write (5 put+get = 10), list-after-write (5 put+list
+/// = 10), concurrent create-if-absent (8 concurrent puts as 1 round trip, up
+/// to 3 sequential retries for each of the 8 writers = 24, and a get: 26),
+/// listing order (1002 puts, a 2-page `list`, a 2-page `list_after`, and a
+/// `list_after` from the second key whose 1000-key tail fills one page and is
+/// followed by an empty one, 2 pages: 1008), cross-page listing (1002 puts and
+/// a 2-page `list`: 1004), and delete visibility (put, put, delete, get, list,
+/// list_after, delete, list, list_after = 9). After it come the three bucket
+/// control-plane GETs (`?versioning`, `?lifecycle`, `?object-lock` = 3), the
+/// stored-checksum echo probe (put, get, delete = 3), and the
+/// `sys/qualification` record (create-if-absent put, then a get and a CAS put
+/// when an older record is there = 3): 2074 + 3 + 3 + 3 = 2083. Budgeting each
+/// at the S3 client's 20 s `request_timeout` would put one attempt at 41660 s,
+/// a bound that no longer stops a hung Job in useful time, so a
+/// slow-but-healthy operation is budgeted at 500 ms instead, several times a
+/// healthy endpoint's latency: 2083 * 0.5 s = 1041.5 s, rounded up to whole
+/// seconds as 1042 s. Adding 140 s per attempt for pod scheduling and image
+/// pull gives an 1182 s per-attempt budget. With `QUALIFY_JOB_BACKOFF_LIMIT` =
+/// 1 the Job runs at most two attempts, so the Job-wide deadline is 2 * 1182 s
+/// = 2364 s: a slow-but-healthy initial attempt AND a full retry both complete
+/// before it fires. A hung attempt still terminates, at the 2364 s Job-wide
 /// bound at the latest (a hung endpoint stalls each operation at ~200 s =
 /// `retry_timeout` 180 s + `request_timeout` 20 s).
 ///
 /// Not part of [`qualify_job_input_hash`]: tuning this deadline (or the backoff
 /// limit) must not re-run a qualification that already passed.
-pub const QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS: i64 = 2362;
+pub const QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS: i64 = 2364;
 
 /// `StoreQualified` reason while the qualify Job is being created or is still
 /// running: serving is held until it reports success.
@@ -7934,17 +7937,18 @@ mod tests {
         );
         // activeDeadlineSeconds is Job-wide (summed across every retry) and takes
         // precedence over backoffLimit, so the deadline must fit the intended
-        // attempts end to end: 1181 s per attempt (2082 operations at 500 ms =
-        // 1041 s, + 140 s pod scheduling/pull) * (backoffLimit + 1) attempts.
+        // attempts end to end: 1182 s per attempt (2083 operations at 500 ms =
+        // 1041.5 s, rounded up to 1042 s, + 140 s pod scheduling/pull) *
+        // (backoffLimit + 1) attempts.
         assert_eq!(
             QUALIFY_JOB_BACKOFF_LIMIT, 1,
             "one retry (two attempts total)"
         );
-        let per_attempt_seconds = 2082 * 500 / 1000 + 140;
-        assert_eq!(per_attempt_seconds, 1181);
+        let per_attempt_seconds = (2083 * 500_u64).div_ceil(1000) as i64 + 140;
+        assert_eq!(per_attempt_seconds, 1182);
         assert_eq!(
-            QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS, 2362,
-            "the Job-wide deadline is 2362 s = 1181 s per attempt * 2 attempts, so a \
+            QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS, 2364,
+            "the Job-wide deadline is 2364 s = 1182 s per attempt * 2 attempts, so a \
              slow-but-healthy first attempt plus one full retry both fit before it fires"
         );
         assert_eq!(
