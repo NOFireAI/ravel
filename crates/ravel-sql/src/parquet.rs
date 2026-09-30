@@ -14,7 +14,10 @@
 //! without it treats every name that is not a signal table exactly as it did
 //! before Parquet tables existed. With it but with no profiles configured, a
 //! statement naming a Parquet table fails with
-//! [`ParquetQueryError::NotConfigured`] after one LIST per name and no GET.
+//! [`ParquetQueryError::NotConfigured`] after one LIST per name up to the first
+//! that has manifest versions, and no GET. With it, a statement naming more
+//! than [`MAX_NON_SIGNAL_TABLES`] names other than the signal tables is
+//! refused before any of them is listed.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
@@ -47,6 +50,15 @@ use crate::error::{ErrorClass, MSG_CORRUPT, MSG_PLAN, MSG_UNAVAILABLE};
 /// Bytes of decoded Parquet footers the process keeps, when the embedder does
 /// not choose a bound.
 pub const DEFAULT_PARQUET_METADATA_CACHE_BYTES: u64 = 64 << 20;
+
+/// The most base table names other than the signal tables one statement may
+/// name. Whether such a name is a Parquet table is a fact about the store, one
+/// LIST of its manifest versions per name, issued one after another before the
+/// statement plans; without a cap the statement-complexity guard alone would
+/// let one statement issue several hundred. Sixteen is well above the few
+/// tables a realistic join names, and bounds an unknown-name statement at
+/// sixteen LISTs.
+pub const MAX_NON_SIGNAL_TABLES: usize = 16;
 
 /// Why opening the store behind one (profile, bucket) failed.
 #[derive(Debug, thiserror::Error)]
@@ -594,16 +606,16 @@ impl ParquetQueryError {
     }
 }
 
-/// Every name in `names` that has at least one manifest version for `tenant`,
-/// from one LIST per valid table name and no GET.
-pub(crate) async fn names_with_versions(
+/// The first name in `names`, in name order, that has at least one manifest
+/// version for `tenant`, from one LIST per valid table name up to and
+/// including it, and no GET.
+pub(crate) async fn first_name_with_versions(
     sources: &ParquetSources,
     tenant: &TenantHash,
     names: &BTreeSet<String>,
     accounting: &QueryAccounting,
-) -> Result<Vec<String>, ParquetQueryError> {
+) -> Result<Option<String>, ParquetQueryError> {
     let store = sources.resolve_store(accounting);
-    let mut found = Vec::new();
     for name in names {
         if validate_table(name).is_err() {
             continue;
@@ -615,10 +627,10 @@ pub(crate) async fn names_with_versions(
                 source,
             })?;
         if !versions.is_empty() {
-            found.push(name.clone());
+            return Ok(Some(name.clone()));
         }
     }
-    Ok(found)
+    Ok(None)
 }
 
 /// Resolve the Parquet tables among `names`: the newest live manifest of each,

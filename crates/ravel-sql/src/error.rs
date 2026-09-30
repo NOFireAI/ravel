@@ -155,6 +155,17 @@ pub enum SqlError {
     )]
     CrossSignalQuery,
 
+    /// The statement names more tables other than the signal tables than
+    /// [`crate::MAX_NON_SIGNAL_TABLES`] (ADR-2040 D6), refused before any
+    /// store read: deciding whether such a name is a Parquet table costs one
+    /// LIST. The text carries only the two counts, so it is returned verbatim
+    /// and maps to HTTP 400.
+    #[error(
+        "a SQL query may name at most {max} tables other than samples, logs, spans, alerts \
+         and audit; this one names {count}"
+    )]
+    TooManyTables { count: usize, max: usize },
+
     /// Snapshot resolution failed.
     #[error("snapshot resolution failed: {0}")]
     Catalog(#[from] CatalogError),
@@ -397,7 +408,9 @@ impl SqlError {
     /// The client-visible class, for HTTP status selection.
     pub fn class(&self) -> ErrorClass {
         match self {
-            SqlError::Validation(_) | SqlError::CrossSignalQuery => ErrorClass::BadRequest,
+            SqlError::Validation(_)
+            | SqlError::CrossSignalQuery
+            | SqlError::TooManyTables { .. } => ErrorClass::BadRequest,
             // An over-wide window refused before any LIST is a
             // resource-budget rejection, the same class as the segment/sample
             // budgets below: a well-formed request the server declines to
@@ -446,6 +459,9 @@ impl SqlError {
             SqlError::Validation(e) => e.to_string(),
             // Safe to echo: the text names only the fixed table names.
             SqlError::CrossSignalQuery => self.to_string(),
+            // Safe to echo: the text carries only the statement's count and
+            // the fixed cap.
+            SqlError::TooManyTables { .. } => self.to_string(),
             // Safe to echo: `WindowTooWide` carries only the estimate and the
             // limit (counts, no object key or tenant identity), and its text
             // tells the caller to narrow the window. Same
@@ -872,6 +888,18 @@ mod tests {
             );
         }
         // It carries no server state to redact.
+        assert_redacted(&err.client_message());
+    }
+
+    #[test]
+    fn too_many_tables_is_a_bad_request_that_keeps_its_counts() {
+        let err = SqlError::TooManyTables { count: 17, max: 16 };
+        assert_eq!(err.class(), ErrorClass::BadRequest);
+        assert_eq!(
+            err.client_message(),
+            "a SQL query may name at most 16 tables other than samples, logs, spans, alerts \
+             and audit; this one names 17"
+        );
         assert_redacted(&err.client_message());
     }
 

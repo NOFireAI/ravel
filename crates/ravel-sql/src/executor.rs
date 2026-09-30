@@ -125,7 +125,10 @@ use crate::logs_provider::LogsTableProvider;
 use crate::logs_pushdown::extract_logs;
 use crate::memory::{CeilingBreach, TenantMemoryAccountant};
 use crate::output::QueryOutput;
-use crate::parquet::{self, ParquetQueryError, ParquetResolution, ParquetSession, ParquetSources};
+use crate::parquet::{
+    self, MAX_NON_SIGNAL_TABLES, ParquetQueryError, ParquetResolution, ParquetSession,
+    ParquetSources,
+};
 use crate::provider::RavelTableProvider;
 use crate::pushdown::extract;
 use crate::session::{
@@ -2169,11 +2172,15 @@ impl SqlExecutor {
     ///   planning error it would meet anyway, before anything is read.
     /// - Without [`ParquetSources`], or when the statement names nothing but
     ///   signal tables, this is `None` and reads nothing.
+    /// - More than [`crate::MAX_NON_SIGNAL_TABLES`] names other than the
+    ///   signal tables is [`SqlError::TooManyTables`], before any store read.
     /// - A signal table beside a name that has Parquet manifest versions is
     ///   [`SqlError::CrossSignalQuery`].
     /// - With no credential profiles configured, a name with manifest versions
-    ///   is [`ParquetQueryError::NotConfigured`], from one LIST per name and no
-    ///   GET.
+    ///   is [`ParquetQueryError::NotConfigured`].
+    /// - In both of those cases the names are listed in name order and the
+    ///   first with manifest versions decides the outcome: one LIST per name
+    ///   up to it, and no GET.
     /// - Otherwise each name's newest live manifest, checked against the
     ///   tenant's current grants; `None` when no name is a live Parquet table,
     ///   so the statement then plans, and fails, as a statement naming an
@@ -2199,12 +2206,22 @@ impl SqlExecutor {
         if tables.others.is_empty() {
             return Ok(None);
         }
+        if tables.others.len() > MAX_NON_SIGNAL_TABLES {
+            return Err(SqlError::TooManyTables {
+                count: tables.others.len(),
+                max: MAX_NON_SIGNAL_TABLES,
+            });
+        }
         let accounting = phase_accounting.resolve();
         if tables.signal.is_some() || !sources.is_configured() {
-            let named =
-                parquet::names_with_versions(sources, &tenant_hash, &tables.others, accounting)
-                    .await?;
-            return match named.into_iter().next() {
+            let named = parquet::first_name_with_versions(
+                sources,
+                &tenant_hash,
+                &tables.others,
+                accounting,
+            )
+            .await?;
+            return match named {
                 Some(_) if tables.signal.is_some() => Err(SqlError::CrossSignalQuery),
                 Some(table) => Err(ParquetQueryError::NotConfigured { table }.into()),
                 None => Ok(None),
