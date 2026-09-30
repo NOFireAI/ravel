@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, Float64Array, Int64Array,
-    StringArray,
+    Array, ArrayRef, AsArray, BinaryArray, BooleanArray, FixedSizeBinaryArray, Float64Array,
+    Int64Array, MapBuilder, StringArray, StringBuilder,
 };
 use arrow::record_batch::RecordBatch;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
@@ -1135,5 +1135,373 @@ async fn run_dispatches_signal_spans_to_the_spans_export() {
         err.to_string(),
         "the mapping writes two different fields to the output column \"name\"; give each one \
          its own column name"
+    );
+}
+
+/// [`SPANS_MAPPING`] with `attrs_map_column = "attrs"`.
+fn attrs_map_mapping() -> SpansMapping {
+    spans_mapping(&SPANS_MAPPING.replace(
+        "status_message_column = \"status_message\"\n",
+        "status_message_column = \"status_message\"\nattrs_map_column      = \"attrs\"\n",
+    ))
+}
+
+/// One `attrs` map cell: `None` is a null cell, a `None` value a null value.
+type MapCell<'a> = Option<Vec<(&'a str, Option<&'a str>)>>;
+
+/// `batch` with an `attrs` map column appended, one cell per row.
+fn with_attrs_map(batch: RecordBatch, cells: Vec<MapCell<'_>>) -> RecordBatch {
+    let mut map = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+    for cell in cells {
+        match cell {
+            None => map.append(false).expect("null map cell"),
+            Some(entries) => {
+                for (key, value) in entries {
+                    map.keys().append_value(key);
+                    map.values().append_option(value);
+                }
+                map.append(true).expect("map cell");
+            }
+        }
+    }
+    let mut columns: Vec<(String, ArrayRef)> = batch
+        .schema()
+        .fields()
+        .iter()
+        .zip(batch.columns())
+        .map(|(field, column)| (field.name().clone(), Arc::clone(column)))
+        .collect();
+    columns.push(("attrs".to_string(), Arc::new(map.finish())));
+    RecordBatch::try_from_iter(columns).expect("batch with an attrs map")
+}
+
+/// Each row's entries of the exported `attrs` map column, in stored order.
+fn map_values(batch: &RecordBatch, column: &str) -> Vec<Vec<(String, String)>> {
+    let map = batch
+        .column_by_name(column)
+        .unwrap_or_else(|| panic!("no {column} column"))
+        .as_map();
+    (0..map.len())
+        .map(|row| {
+            let entries = map.value(row);
+            let keys = entries.column(0).as_string::<i32>();
+            let values = entries.column(1).as_string::<i32>();
+            (0..entries.len())
+                .map(|i| (keys.value(i).to_string(), values.value(i).to_string()))
+                .collect()
+        })
+        .collect()
+}
+
+fn otlp_attr(key: &str, value: AnyValueVariant) -> KeyValue {
+    KeyValue {
+        key: key.to_string(),
+        value: Some(AnyValue { value: Some(value) }),
+        ..Default::default()
+    }
+}
+
+fn pairs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
+/// With `attrs_map_column` set, every stored attribute the mapping does not
+/// name travels through the map column: a load of the export stores every
+/// span with every attribute at its exact stored string, and only the
+/// reserved `_kind` is unwritten. Four of the six spans carry an unmapped
+/// attribute and two carry none, so the same store exported without the map
+/// column counts exactly four.
+#[tokio::test]
+async fn attrs_map_column_carries_every_unmapped_attribute_through_a_round_trip() {
+    use AnyValueVariant::{BoolValue, BytesValue, DoubleValue, IntValue, StringValue};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    // The root and the later trace carry the unmapped `tenant.tier`; the child
+    // and the earlier trace carry no unmapped attribute.
+    load_rows(
+        &store,
+        dir.path(),
+        "alpha",
+        &wide_mapping(),
+        &round_trip_rows(),
+    )
+    .await;
+    let typed = Span {
+        attributes: vec![
+            otlp_attr("retries", IntValue(3)),
+            otlp_attr("ratio", DoubleValue(0.1)),
+            otlp_attr("sampled", BoolValue(true)),
+            otlp_attr("blob", BytesValue(vec![0xab, 0xcd])),
+            otlp_attr("empty", StringValue(String::new())),
+            otlp_attr("padded", StringValue("007".to_string())),
+            otlp_attr("http.method", StringValue("GET".to_string())),
+        ],
+        ..otlp_span(4, 0x55, "typed", T0 + 3 * ONE_MS_NS, T0 + 4 * ONE_MS_NS)
+    };
+    let server = Span {
+        kind: 2,
+        attributes: vec![otlp_attr("peer", StringValue("db".to_string()))],
+        ..otlp_span(5, 0x66, "server", T0 + 5 * ONE_MS_NS, T0 + 6 * ONE_MS_NS)
+    };
+    ingest_otlp(&store, "alpha", vec![typed, server]).await;
+
+    let alpha = stored(&store, "alpha", T0, T1, LOAD_NS).await;
+    assert_eq!(alpha.len(), 6);
+    let attrs_of = |spans: &[SpanRecord], span_id: [u8; 8]| -> Vec<(String, String)> {
+        spans
+            .iter()
+            .find(|span| span.span_id == span_id)
+            .expect("span stored")
+            .attrs
+            .clone()
+    };
+    assert_eq!(
+        attrs_of(&alpha, [0x55; 8]),
+        pairs(&[
+            ("blob", "abcd"),
+            ("empty", ""),
+            ("http.method", "GET"),
+            ("padded", "007"),
+            ("ratio", "0.1"),
+            ("retries", "3"),
+            ("sampled", "true"),
+        ])
+    );
+    assert_eq!(
+        attrs_of(&alpha, [0x66; 8]),
+        pairs(&[("_kind", "server"), ("peer", "db")])
+    );
+
+    let mapping = attrs_map_mapping();
+    let export_pq = dir.path().join("export.parquet");
+    let report = export_window(&store, "alpha", T0, T1, &mapping, &export_pq)
+        .await
+        .expect("export succeeds");
+    assert_eq!(report.rows_written, 6);
+    assert_eq!(
+        report.spans_with_unwritten_data, 1,
+        "only the server span's reserved _kind has no column"
+    );
+    let batch = read_parquet(&export_pq);
+    assert_eq!(
+        column_names(&batch).last().map(String::as_str),
+        Some("attrs")
+    );
+    assert_eq!(
+        map_values(&batch, "attrs"),
+        vec![
+            pairs(&[("tenant.tier", "gold")]),
+            Vec::new(),
+            Vec::new(),
+            pairs(&[("tenant.tier", "bronze")]),
+            pairs(&[
+                ("blob", "abcd"),
+                ("empty", ""),
+                ("padded", "007"),
+                ("ratio", "0.1"),
+                ("retries", "3"),
+                ("sampled", "true"),
+            ]),
+            pairs(&[("peer", "db")]),
+        ],
+        "every unmapped, unreserved attribute as stored, in output order"
+    );
+
+    load_file(&store, &export_pq, "beta", &mapping, LOAD_NS + ONE_SEC_NS).await;
+    let beta = stored(&store, "beta", T0, T1, LOAD_NS + ONE_SEC_NS).await;
+    let expected: Vec<SpanRecord> = alpha
+        .iter()
+        .cloned()
+        .map(|mut span| {
+            span.attrs.retain(|(key, _)| key != "_kind");
+            span
+        })
+        .collect();
+    assert_eq!(
+        beta, expected,
+        "the re-loaded spans carry every attribute at its stored string, less the reserved _kind"
+    );
+
+    let plain_pq = dir.path().join("plain.parquet");
+    let plain = export_window(
+        &store,
+        "alpha",
+        T0,
+        T1,
+        &spans_mapping(SPANS_MAPPING),
+        &plain_pq,
+    )
+    .await
+    .expect("export without the map column succeeds");
+    assert_eq!(plain.rows_written, 6);
+    assert_eq!(
+        plain.spans_with_unwritten_data, 4,
+        "the root, the later trace, the typed span and the server span; not the child or the \
+         earlier trace"
+    );
+    assert!(
+        !column_names(&read_parquet(&plain_pq)).contains(&"attrs".to_string()),
+        "no map column without attrs_map_column"
+    );
+}
+
+/// Writes `batch` and loads it into `alpha` under `mapping`, returning the
+/// load's outcome rather than asserting it.
+async fn try_load_batch(
+    store: &Arc<dyn ObjectStoreBackend>,
+    dir: &Path,
+    mapping: &SpansMapping,
+    batch: &RecordBatch,
+) -> Result<load::SpansLoadReport, load::LoadError> {
+    let path = dir.join("with-map.parquet");
+    write_parquet(&path, batch);
+    load::load_spans(
+        Arc::clone(store),
+        &path,
+        "alpha",
+        mapping,
+        1,
+        10_000,
+        0,
+        1,
+        1,
+        1,
+        None,
+        LOAD_NS,
+        Arc::new(FixedClock(LOAD_NS)),
+    )
+    .await
+}
+
+/// A map key equal to a mapped attribute's key is refused on the row, as a
+/// mapping naming one key twice is refused, whether or not the mapped cell
+/// holds a value, and nothing is stored. The map's other keys are stored
+/// exactly as written once the collision is gone.
+#[tokio::test]
+async fn an_attrs_map_key_that_a_mapped_attribute_names_is_refused() {
+    for method in [Some("GET"), None] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let batch = with_attrs_map(
+            source_batch(&[Src {
+                method,
+                ..bare(1, 0x11, "collides", T0, T0 + ONE_MS_NS)
+            }]),
+            vec![Some(vec![
+                ("http.method", Some("POST")),
+                ("peer", Some("db")),
+            ])],
+        );
+        let err = try_load_batch(&store, dir.path(), &attrs_map_mapping(), &batch)
+            .await
+            .expect_err("the collision is refused");
+        assert_eq!(
+            err.to_string(),
+            "row 0: attrs_map_column \"attrs\" holds the key \"http.method\", which the mapping \
+             also reads from the column \"method\". A span carries one merged attrs map with \
+             unique keys, so one of the two would never reach the record; drop the key from the \
+             map or the entry from the mapping.",
+            "method cell {method:?}"
+        );
+        assert!(
+            stored(&store, "alpha", T0, T1, LOAD_NS).await.is_empty(),
+            "a refused row stores no span (method cell {method:?})"
+        );
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let batch = with_attrs_map(
+        source_batch(&[Src {
+            method: Some("GET"),
+            ..bare(1, 0x11, "distinct", T0, T0 + ONE_MS_NS)
+        }]),
+        vec![Some(vec![
+            ("http.verb", Some("POST")),
+            ("peer", Some("db")),
+        ])],
+    );
+    try_load_batch(&store, dir.path(), &attrs_map_mapping(), &batch)
+        .await
+        .expect("distinct keys load");
+    let spans = stored(&store, "alpha", T0, T1, LOAD_NS).await;
+    assert_eq!(spans.len(), 1);
+    assert_eq!(
+        spans[0].attrs,
+        pairs(&[
+            ("http.method", "GET"),
+            ("http.verb", "POST"),
+            ("peer", "db")
+        ])
+    );
+}
+
+/// A null map cell and a null map value carry no attribute; a map holding a
+/// reserved key or one key twice is refused on its row, and a column that is
+/// not a map of strings is refused by name.
+#[tokio::test]
+async fn attrs_map_column_cells_are_read_by_the_span_attribute_rules() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let batch = with_attrs_map(
+        source_batch(&[
+            bare(1, 0x11, "null cell", T0, T0 + ONE_MS_NS),
+            bare(1, 0x22, "null value", T0 + ONE_MS_NS, T0 + 2 * ONE_MS_NS),
+        ]),
+        vec![None, Some(vec![("peer", None), ("zone", Some("eu"))])],
+    );
+    try_load_batch(&store, dir.path(), &attrs_map_mapping(), &batch)
+        .await
+        .expect("null cells and values load");
+    let spans = stored(&store, "alpha", T0, T1, LOAD_NS).await;
+    assert_eq!(spans.len(), 2);
+    assert!(spans[0].attrs.is_empty());
+    assert_eq!(spans[1].attrs, pairs(&[("zone", "eu")]));
+
+    for (entries, want) in [
+        (
+            vec![("_kind", Some("server"))],
+            "row 0: attrs_map_column \"attrs\" holds the reserved attribute key \"_kind\", which \
+             holds a span field this version does not map",
+        ),
+        (
+            vec![("zone", Some("eu")), ("zone", Some("us"))],
+            "row 0: attrs_map_column \"attrs\" holds the key \"zone\" twice. A span carries one \
+             merged attrs map with unique keys, so one of the two would never reach the record.",
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let batch = with_attrs_map(
+            source_batch(&[bare(1, 0x11, "refused", T0, T0 + ONE_MS_NS)]),
+            vec![Some(entries)],
+        );
+        let err = try_load_batch(&store, dir.path(), &attrs_map_mapping(), &batch)
+            .await
+            .expect_err("the map is refused");
+        assert_eq!(err.to_string(), want);
+        assert!(stored(&store, "alpha", T0, T1, LOAD_NS).await.is_empty());
+    }
+
+    let mut not_a_map = attrs_map_mapping();
+    not_a_map.attrs_map_column = Some("start_ns".to_string());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let err = try_load_batch(
+        &store,
+        dir.path(),
+        &not_a_map,
+        &source_batch(&[bare(1, 0x11, "plain", T0, T0 + ONE_MS_NS)]),
+    )
+    .await
+    .expect_err("an integer column is not a map");
+    assert_eq!(
+        err.to_string(),
+        "attrs_map_column \"start_ns\" has type Int64; expected a map of string keys to string \
+         values"
     );
 }
