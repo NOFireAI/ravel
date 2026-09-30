@@ -25,6 +25,33 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   unverified. The operator exposes both as `spec.storage.s3.uploadIntegrity`
   and `spec.storage.s3.requestStoredChecksum` and applies them to its own S3
   client too.
+- **`ravel-cli --store s3` checksums every PUT with CRC-64/NVME by default,
+  and `store qualify` reads the bucket and reports whether the endpoint
+  returns the stored checksum** (ADR-1696 decisions 1 and 3, ADR-1727,
+  issues #1696, #2197). The CLI gains `--s3-upload-integrity`
+  (`off`, `crc64nvme`, `sha256`; default `crc64nvme`;
+  `RAVEL_S3_UPLOAD_INTEGRITY`) and `--s3-request-stored-checksum` (default
+  on, `--s3-request-stored-checksum=false` to stop sending
+  `x-amz-checksum-mode`; `RAVEL_S3_REQUEST_STORED_CHECKSUM`), both passed into
+  the S3 store's HTTP configuration. An endpoint that rejects the checksum
+  header now fails the CLI's first write, where it succeeded before; pass
+  `--s3-upload-integrity off` there. `store qualify` against S3 now reports
+  the bucket's Object Lock, versioning and lifecycle state from the bucket
+  itself instead of `unknown`, and prints a `checksum/stored_echo` line:
+  `verified`, `not returned`, or `not checked` with the reason. A returned
+  stored checksum that does not match the same algorithm computed over the
+  body read, or a refused probe PUT or GET, fails qualification and records
+  nothing. A
+  `--list-page-size` against S3 builds the store with that page size and the
+  selected checksum settings together, through the new
+  `S3Store::with_http_config_and_page_size`. The operator's store
+  qualification Job now always sets `RAVEL_S3_UPLOAD_INTEGRITY` and
+  `RAVEL_S3_REQUEST_STORED_CHECKSUM` from the cluster's
+  `spec.storage.s3.uploadIntegrity` and `requestStoredChecksum`, and both
+  fields join the qualification input hash, so editing either re-runs
+  qualification and every existing cluster re-qualifies once after the
+  operator upgrade. The Job's `activeDeadlineSeconds` rises from 1400 to 2362
+  to fit a slow but healthy run and its retry.
 - **The RLOG writer now chooses each i64 and string page's encoding by its stored size, and writes encoding tags 10 (GCD i64) and 11 (an `observed_ts` equal to `ts`, stored as a reference to it)** (ADR-2135 decisions 3 and 4, issue #2140); no i64 or string page stores more bytes than the encoding chosen before (a very small object can still grow by a few bytes, because a PAGE_DIR whose `ts` and `observed_ts` entries used to be identical compresses worse), each candidate encoding of a page is compressed at most once (up to six candidates for an i64 page, two for a string page), and the reader decodes both tags.
 - **`s3_e2e_bench` counts adaptive-age flushes** (issue #2186). Its printed
   flush breakdown gains an `age_adaptive=` field between `age=` and
@@ -638,6 +665,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`ravel-cli store verify-protection` checks a bucket's protection
+  configuration** (ADR-1727 decision 4, issues #1727, #2197). It reads the
+  bucket's versioning, lifecycle, replication and Object Lock configuration,
+  and with `--expect-object-retention` samples the retention of the most
+  recently modified current object a bounded listing finds in each protected
+  prefix family (skipping the `sys/qualify/`, `sys/pq-probe/` and
+  `sys/maintain/` scratch), then prints one line per condition (`pass`, `fail`
+  or `unknown`, with the reason) and a summary. A sampled object whose
+  compliance lock has lapsed reads `unknown`, since it is not a recent object;
+  one with no retention at all reads `fail`. `--expected-noncurrent-days` is
+  required, and `--expect-replication` and `--expect-object-retention` add
+  the two conditions a deployment opts into. It exits `0` only when every
+  expected condition passes, `1` when any fails, and `2` when any could not be
+  verified, is missing from the report, or the control plane could not be
+  reached, so "could not verify" never exits `0`. A usage error also exits
+  `2`. A reader that closes the pipe early does not change the exit code. It
+  is read-only.
 - **`--audit-retention` sets the query-audit retention window** (ADR-0062
   decision 2c, ADR-1688, issue #2126). The server built its compactor with
   the compiled-in 90-day audit window and no way to change it. The flag takes

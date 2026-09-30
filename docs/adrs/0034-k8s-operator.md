@@ -321,7 +321,8 @@ loop as everything else:
   active time summed across every retry, and it takes precedence over
   `backoffLimit`. So the two knobs are sized together, or a slow-but-healthy
   first attempt plus a retry would trip `DeadlineExceeded` before the retry
-  budget was ever spent. `ravel-cli store qualify` runs 28 sequential object
+  budget was ever spent (the counts and deadline below are superseded by the
+  qualification budget amendment). `ravel-cli store qualify` runs 28 sequential object
   operations (create-if-absent probe 3, CAS-version probe 4, read-after-write
   probe 10 = 5 cycles of put+get, list-after-write probe 10 = 5 cycles of
   put+list, and the final `sys/qualification` write 1; the two informational
@@ -537,3 +538,27 @@ downtime; subsequent reconciles are stable.
   bucket lifecycle belongs to the platform owner.
 - Shard count is immutable in the CRD; a resharding story, if ever
   needed, is a separate ADR.
+
+## Amendment (2026-09-30): the qualification budget
+
+<!-- amendment-supersedes: phrase="runs 28 sequential object" pointer="qualification budget amendment" -->
+
+The Decision's count of 28 sequential operations, and the 700 s and 1400 s
+figures derived from it, no longer describe `ravel-cli store qualify`. The
+suite now has eight probes, and the two listing probes write 1002 keys each at
+the default page size; qualification also reads the bucket's versioning,
+lifecycle and Object Lock configuration (three read-only control-plane GETs)
+and runs the upload-checksum echo probe (a PUT, a GET and a DELETE). One
+healthy attempt issues 2082 requests: 2073 for the suite, 3 control-plane
+GETs, 3 for the echo probe and 3 for the `sys/qualification` record.
+
+Budgeting each request at the S3 client's 20 s `request_timeout` would put one
+attempt over eleven hours, which bounds nothing, so the budget now assumes
+500 ms per request: 2082 x 0.5 s = 1041 s, plus the same ~140 s for
+scheduling and image pull, is 1181 s per attempt. `backoffLimit` stays 1, so
+the Job-wide `activeDeadlineSeconds` is 2 x 1181 s = 2362 s. The reasoning is
+otherwise unchanged: the deadline is Job-wide, sized so a slow but healthy
+attempt and one retry both finish before it fires, and it stays out of the
+qualified-input hash. The qualified-input hash itself, which already covered
+`allowHttp`, now also covers `uploadIntegrity` and `requestStoredChecksum`,
+since each changes what the qualification exercises.

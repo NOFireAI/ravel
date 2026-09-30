@@ -129,7 +129,10 @@ data; verification is reads of configuration.
    `GetLifecycleConfiguration`, `GetReplicationConfiguration`,
    `GetBucketObjectLockConfiguration`, `GetObjectRetention`,
    `ListBucketVersions`) ship as a separate statement in the IAM templates,
-   so the ingest and query roles gain nothing.
+   so the ingest and query roles gain nothing. (Narrowed by the
+   verify-protection sample amendment below: the retention sample is the
+   newest object a bounded listing finds per family, a lapsed lock on it
+   reads `Unknown`, and locating it also needs `ListBucket`.)
 
 5. **In-process gate and gauges.** Under `--require-bucket-protection` the
    startup check runs the same report. Fatal: `versioning` on without
@@ -294,3 +297,59 @@ makes `store verify-protection` exit `2`, never `0`. A bucket whose rules
 cover `t/` in a form the code does not prove reads as "could not verify":
 the operator restates the rules as one rule over `t/` (or the whole
 bucket) or as the sixteen-rule union, or confirms coverage out of band.
+
+## Amendment (2026-09-30): the verify-protection retention sample and its permissions
+
+<!-- amendment-applies: sections="Decision" pointer="verify-protection sample amendment" -->
+
+`store verify-protection` as built (follow-up task 2) takes the
+`object-retention` sample more narrowly than decision 3's table states, and
+needs one permission decision 4 does not list.
+
+1. **The sample is the newest object a bounded listing finds per family.**
+   Three of the four protected prefix families (provisioning records, commit
+   records, the catalog keyspace) sit under a tenant hash, and a versions
+   listing takes a literal prefix, so the CLI locates one concrete object per
+   family first, over data-plane listings capped at 400 listing calls for
+   `sys/` and the tenant scan and 200 for commit records, and passes each
+   object's exact key to the control plane:
+   - `sys/`: the most recently modified object under `sys/`, skipping the
+     `sys/qualify/` and `sys/pq-probe/` scratch and the per-process
+     `sys/maintain/` state, whose continuous rewrites would otherwise make it
+     the newest object every time;
+   - provisioning records: the newest `t/<h>/<signal>/prov` across tenants;
+   - catalog keyspace: the newest object directly under a
+     `t/<h>/catalog/<signal>/` (the head pointer) across tenants;
+   - commit records: the newest object in each shard's newest ingest hour,
+     in the tenant whose catalog head was written most recently, as a cheap
+     stand-in for the tenant with the newest commit.
+
+   The control plane then samples that object's current version and its
+   newest noncurrent version. Because the listing prefix is an exact key, a
+   busy prefix no longer fills the versions listing's page cap. A family with
+   no object to sample leaves `object-retention` `Unknown`, never `Pass`, so
+   a bucket with no tenant yet exits `2` under `--expect-object-retention`.
+   When a listing budget runs out, the sample is the newest object found
+   rather than provably the newest, and an `Unknown` or `Fail` detail says
+   so; a locked sample still passes, since it is locked whether or not it is
+   the newest.
+2. **A lapsed lock is `Unknown`, not `Fail`.** Decision 3's table asks for a
+   recent current object carrying compliance-mode retention. A deployment's
+   retention is finite, so a sampled object whose `RetainUntilDate` has
+   passed is older than the retention period: it is not a recent object, and
+   its lapsed lock says nothing about the retention on new writes. It reads
+   `Unknown`, with a detail saying the sampled object's retention has lapsed.
+   The usual case is a provisioning record, written only when a tenant is
+   provisioned, resharded or has its floor raised. A sampled object with no
+   retention at all, or with governance-mode retention, still reads `Fail`.
+3. **Locating the sample needs `ListBucket`.** The objects are found with
+   `ListObjectsV2` calls over the data-plane client, which
+   `ListBucketVersions` does not grant. Under
+   `--expect-object-retention` the identity running the command needs
+   `ListBucket` beside the six actions decision 4 names; without it the
+   listing is denied and `object-retention` reads `Unknown`, exit `2`. The
+   other conditions need nothing beyond decision 4's list.
+
+None of the three can turn a non-compliant bucket into exit `0`: each leaves a
+condition `Unknown` or `Fail` where a wider sample might have read `Pass`, and
+the lapsed-lock reading moves a `Fail` to `Unknown`, which still exits `2`.
