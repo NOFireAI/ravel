@@ -4007,4 +4007,105 @@ mod tests {
             "C1's two below-target parts count in l1 and name nothing"
         );
     }
+
+    /// The overlap WINNER is below the target and a live rewrite record
+    /// supersedes it; a separate overlap loser is below the target and no
+    /// rewrite supersedes it. The bucket is named `LosingRecordParts` for the
+    /// loser's parts, because the rewrite-superseded winner is dropped from the
+    /// authoritative side (its parts belong to the rewrite's chain, which
+    /// `sweep` reclaims), so its below-target part does not read as an
+    /// authoritative record that has not converged and does not suppress the
+    /// line. C2 is the winner over `{1, 2, 3, 4}` with one below-target part,
+    /// superseded by rewrite R whose two parts are at the target; C1 is the
+    /// overlap loser over `{2, 3}` with two below-target parts, superseded by
+    /// nothing. C1's two below-target parts name the bucket; C2's one and C1's
+    /// two all count in `l1`, R's count nowhere.
+    ///
+    /// Prove-the-test: remove the `.filter(|(key, _)|
+    /// !authority.rewrite_superseded.contains(key.as_str()))` from the
+    /// authoritative side of the `part_versions` closure in `read_shard_family`
+    /// (keep it on the losing side) and this fails with `blocked_buckets` empty
+    /// (`left: []`): C2's below-target part is read back as an unconverged
+    /// authoritative record, the `parts.authoritative.iter().any(...)` check in
+    /// `count_below_target` continues over the hour, and the loser is never
+    /// named.
+    #[tokio::test]
+    async fn a_rewrite_superseded_winner_below_target_does_not_suppress_loser_naming() {
+        let store = MemoryStore::new();
+        provision(&store, 1).await;
+        for (seq, metric) in [(1u64, "alpha"), (2, "beta"), (3, "gamma"), (4, "delta")] {
+            seed_at(&store, 0, 100, seq, metric, VERSION_V7 as u32).await;
+        }
+        let winner = put_compaction_fixture(
+            &store,
+            CompactionFixture {
+                shard: 0,
+                hour: 100,
+                input_seqs: &[1, 2, 3, 4],
+                hash_seed: 0x11,
+                part_versions: &[VERSION_V7 as u32],
+                supersedes: "",
+            },
+        )
+        .await;
+        let loser = put_compaction_fixture(
+            &store,
+            CompactionFixture {
+                shard: 0,
+                hour: 100,
+                input_seqs: &[2, 3],
+                hash_seed: 0x22,
+                part_versions: &[VERSION_V7 as u32, VERSION_V7 as u32, FUTURE_VERSION],
+                supersedes: "",
+            },
+        )
+        .await;
+        put_rewrite_record(
+            &store,
+            RewriteFixture {
+                shard: 0,
+                hour: 100,
+                input_seqs: &[],
+                hash_seed: 0x33,
+                part_version: FUTURE_VERSION,
+                part_count: 2,
+                supersedes: &winner,
+            },
+        )
+        .await;
+
+        // The fixture is what the test says it is: the selector reads the
+        // rewrite-superseded record as the overlap winner and the other as the
+        // loser.
+        let mut records = Vec::new();
+        for key in [&winner, &loser] {
+            let got = store.get(key, GetRange::Full).await.expect("get record");
+            let rec = record::decode_compaction(got.data.as_ref()).expect("decode record");
+            records.push((key.clone(), rec));
+        }
+        let selection = select_authoritative_compaction_records(&records).expect("select");
+        assert!(!selection.is_excluded(winner.as_str()));
+        assert!(selection.losing().contains(loser.as_str()));
+
+        let report = migrate_to_future(&store, 100).await;
+
+        let expected = vec![BlockedBucket {
+            shard: 0,
+            ingest_hour: 100,
+            reason: BlockedReason::LosingRecordParts { below_target: 2 },
+        }];
+        assert_eq!(report.blocked_buckets, expected);
+        assert_eq!(report.buckets_migrated, 0, "nothing is served raw");
+        assert_eq!(
+            report.verification,
+            Some(Verification::Stragglers {
+                l0: 0,
+                l1: 3,
+                rewrite_parts: 0,
+                blocked: expected,
+            }),
+            "the winner's one and the loser's two below-target parts all count \
+             in l1; the loser names the bucket and the rewrite parts count nowhere"
+        );
+    }
 }
