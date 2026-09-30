@@ -45,7 +45,7 @@ visible:
 
 | Flag | Default | What to change it for |
 |---|---|---|
-| `--maintain-interval-secs` | `300` | How often each tenant's tick runs. |
+| `--maintain-interval-secs` | `300` | How often each tenant's tick runs. `0` is refused at startup. |
 | `--maintain-unit-concurrency` | `4` | How many owned units this process maintains at once within one tenant's tick, so one pathological unit cannot starve the rest. Raise it on a process that owns many units and has spare request concurrency to spend, lower it on a host shared with other work. It is clamped to at least 1, and `0` degrades to a sequential walk rather than deadlocking. |
 | `--maintain-stalled-after-intervals` | `3` | Consecutive failed ticks a unit must accrue, with no intervening success, before it counts as stalled. Lower it to be paged sooner on a flaky unit at the cost of noise from transient faults; raise it to tolerate a noisier store at the cost of a slower page. A single success resets that unit's counter. |
 | `--maintain-interior-reverify` | `6h` | The slow safety-net cadence for hours that are neither at the head nor the tail of the keyspace this tick. An interior bucket's memoized state is re-verified no less often than this, and the sweeper runs a full-keyspace pass on the same cadence instead of its per-tick head-and-tail pass. Head and tail hours are unaffected and are evaluated every tick. Zero disables the safety net, which makes every interior bucket always due. |

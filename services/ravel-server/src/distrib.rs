@@ -2089,15 +2089,21 @@ fn decode_tenant_hash(bytes: &[u8]) -> Option<TenantHash> {
 /// The loop deletes nothing: the query role holds no delete grant (ADR-0055
 /// section 1). Dead records, drained or left behind by a panic, a kill or a
 /// node loss, are reaped by the maintain role.
+///
+/// A zero `workers.heartbeat_interval()` is refused with
+/// [`HeartbeatSpawnError::ZeroHeartbeatInterval`] and nothing is spawned.
 pub fn spawn_heartbeat(
     workers: Arc<QueryWorkers>,
     store: Arc<dyn ObjectStoreBackend>,
     clock: Arc<dyn Clock>,
     live_workers: Arc<RwLock<Arc<Vec<QueryWorkerRecord>>>>,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let interval = workers.heartbeat_interval();
+) -> Result<tokio::task::JoinHandle<()>, HeartbeatSpawnError> {
+    let interval = workers.heartbeat_interval();
+    if interval.is_zero() {
+        return Err(HeartbeatSpawnError::ZeroHeartbeatInterval);
+    }
+    Ok(tokio::spawn(async move {
         loop {
             let now_ns = clock.now_ns();
             if let Err(err) = workers.write_heartbeat(store.as_ref(), now_ns).await {
@@ -2124,7 +2130,18 @@ pub fn spawn_heartbeat(
                 }
             }
         }
-    })
+    }))
+}
+
+/// Why [`spawn_heartbeat`] refused to start the query-worker heartbeat loop.
+/// Nothing is spawned: the refusal is a startup error, never a loop that
+/// writes heartbeats back to back.
+#[derive(Debug, thiserror::Error)]
+pub enum HeartbeatSpawnError {
+    /// A zero period on the worker set. The loop sleeps that period between
+    /// writes, so zero would write and list `sys/query/workers/` without pause.
+    #[error("query-worker heartbeat_interval must be non-zero")]
+    ZeroHeartbeatInterval,
 }
 
 /// A [`SliceFetcher`] over one remote cluster's fragment `SeriesFetch` surface
@@ -3591,7 +3608,8 @@ mod tests {
             Arc::new(FixedClock(now_ns)),
             live_workers,
             stop_rx,
-        );
+        )
+        .expect("the default heartbeat period is non-zero");
         for _ in 0..5 {
             tokio::time::sleep(interval).await;
         }
@@ -3737,6 +3755,45 @@ mod tests {
             "the fallback entry names the unreachable remote endpoint it tried"
         );
         assert_eq!(fallback.segment_count, 1);
+    }
+
+    /// A zero query-worker heartbeat period is refused with a typed error and
+    /// spawns nothing. The `expect_err` is the proof; the empty listing after
+    /// one yield is a guard, since a spawned loop could need more than one
+    /// scheduling point before its first write lands.
+    #[tokio::test]
+    async fn zero_heartbeat_interval_is_refused_without_spawning() {
+        use ravel_fleet::query_workers::QUERY_WORKERS_PREFIX;
+
+        let memory = Arc::new(MemoryStore::new());
+        let store: Arc<dyn ObjectStoreBackend> = memory.clone();
+        let workers = Arc::new(QueryWorkers::new(
+            "127.0.0.1:7000",
+            "127.0.0.1:7100",
+            codec::PROTOCOL_VERSION,
+            Duration::ZERO,
+            3,
+        ));
+        let (_stop, stop_rx) = tokio::sync::oneshot::channel();
+        let refused = spawn_heartbeat(
+            workers,
+            store,
+            Arc::new(FixedClock(1_000)),
+            Arc::new(RwLock::new(Arc::new(Vec::new()))),
+            stop_rx,
+        )
+        .expect_err("a zero heartbeat period must be refused");
+        assert!(matches!(
+            refused,
+            HeartbeatSpawnError::ZeroHeartbeatInterval
+        ));
+
+        tokio::task::yield_now().await;
+        let page = memory
+            .list(QUERY_WORKERS_PREFIX, None)
+            .await
+            .expect("list sys/query/workers/");
+        assert!(page.objects.is_empty(), "no heartbeat was written");
     }
 
     // --- Cross-cluster federation auth (ADR-0071 security) ------------
