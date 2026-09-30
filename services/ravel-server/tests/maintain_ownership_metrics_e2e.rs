@@ -17,14 +17,16 @@
 //! forwards to `ravel_maintain::WorkerSet::new` in place of the real
 //! production default (`ravel_maintain::worker_set::DEFAULT_HEARTBEAT_INTERVAL`,
 //! 60s). Whichever of the two servers starts first only refreshes its own
-//! `workers_live` gauge on its second heartbeat tick (`run_loop`'s heartbeat
-//! task in `ravel_server::maintain`: `tokio::time::interval`'s first tick
-//! fires immediately, before the sibling has necessarily written its own
-//! heartbeat, so the live set the first tick reads can still be solo), so
-//! this test drives `TEST_HEARTBEAT_INTERVAL` below rather than waiting out
-//! two real `DEFAULT_HEARTBEAT_INTERVAL`s: the convergence under test is the
-//! workers' own liveness protocol, not wall time this test does not
-//! control.
+//! `workers_live` gauge on its first heartbeat tick after the sibling's first
+//! one (`run_loop`'s heartbeat task in `ravel_server::maintain`:
+//! `tokio::time::interval`'s first tick fires immediately, before the sibling
+//! has necessarily written its own heartbeat, so the live set that tick reads
+//! can still be solo). With H the heartbeat interval and g the gap between
+//! the two loops' first heartbeat ticks, that is at most g + H after the
+//! first loop began, H after the second, so this test drives
+//! `TEST_HEARTBEAT_INTERVAL` below rather than waiting out real
+//! `DEFAULT_HEARTBEAT_INTERVAL`s: the convergence under test is the workers'
+//! own liveness protocol, not wall time this test does not control.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -64,8 +66,8 @@ const SHARD_COUNT: u32 = 8;
 /// re-created the exact flake issue #1852 exists to fix, only tighter. 1s
 /// gives a 3s liveness window and a 6s reap horizon: a 10x margin over that
 /// 300ms failure point, while `H` itself stays 60x below the real 60s
-/// `DEFAULT_HEARTBEAT_INTERVAL`, so convergence below still costs about 1s
-/// of real wall time, not 60s.
+/// `DEFAULT_HEARTBEAT_INTERVAL`, so convergence below still costs at most
+/// the inter-server start gap plus 1s of real wall time, not 60s.
 const TEST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Build a `Mode::Maintain` config over `store`, with a 1-second maintenance
@@ -268,17 +270,25 @@ async fn two_maintain_workers_reach_and_report_full_ownership_on_real_metrics() 
             .expect("metrics body")
     }
 
-    // Poll until BOTH workers report the full two-member live set. Whichever
-    // started first only picks this up on its own second heartbeat tick:
-    // `tokio::time::interval`'s first tick fires immediately (t=0, possibly
-    // solo), its second one `TEST_HEARTBEAT_INTERVAL` later (t=H), so
-    // convergence is bounded by real `TEST_HEARTBEAT_INTERVAL` = 1s after
-    // that worker's own loop began. 100 iterations * 200ms sleep = 20s total
-    // window: a 20x margin over that 1s convergence bound, generous enough
-    // to survive a loaded box without the test depending on wall time it
-    // does not control (unlike the pre-#1852 version of this test, which
-    // waited on the real 60s `DEFAULT_HEARTBEAT_INTERVAL` with only a 2x
-    // margin).
+    // Poll until BOTH workers report the full two-member live set. Let tA and
+    // tB be the first heartbeat ticks of the earlier and the later worker
+    // (`tokio::time::interval`'s first tick fires immediately, when the
+    // spawned heartbeat task is first polled), g = tB - tA the gap between
+    // the two loop starts, and H = `TEST_HEARTBEAT_INTERVAL`. The later
+    // worker converges at tB: its first tick lists the earlier worker's
+    // heartbeat, at most H old and so inside the 3H liveness window. The
+    // earlier worker read a solo set at tA and ticks again only at
+    // tA + k*H, so it converges on its first tick after tB, at
+    // tA + (floor(g / H) + 1) * H <= tB + H = tA + g + H. The gap g is the
+    // dominant term whenever the second `ravel_server::start` runs longer
+    // than H, and the test does not bound it; but the poll below begins
+    // only after that call returns, and on this current-thread runtime the
+    // later worker's heartbeat task has run by the poll's first yield at the
+    // latest, so from the poll's start the bound is H = 1s plus scheduler
+    // delay on the heartbeat ticks. 100 iterations * 200ms sleep =
+    // 20s total window: a 20x margin over that bound (unlike the pre-#1852
+    // version of this test, which waited on the real 60s
+    // `DEFAULT_HEARTBEAT_INTERVAL` with only a 2x margin).
     let mut converged = false;
     for _ in 0..100 {
         let body_a = scrape(&client, &base_a).await;
@@ -294,45 +304,71 @@ async fn two_maintain_workers_reach_and_report_full_ownership_on_real_metrics() 
     assert!(
         converged,
         "both workers must report ravel_maintain_workers_live == 2 within the polling window \
-         (100 iterations * 200ms = 20s, a 20x margin over TEST_HEARTBEAT_INTERVAL = 1s)"
+         (100 iterations * 200ms = 20s): convergence is bounded by tA + g + H = tB + H, the \
+         later worker's first heartbeat tick plus TEST_HEARTBEAT_INTERVAL = 1s, and tB falls \
+         by the poll's first yield, so the window is a 20x margin over H"
     );
 
-    // A fresh discovery cycle must run under the now-converged live set
-    // before `units_owned` reflects the final partition (the maintenance
-    // interval is 1s), and a single scrape pair can also race
-    // `run_discovery_cycle`'s `set_units_owned(0)`-then-accumulate window
-    // (maintain.rs): a scrape landing between one worker's reset and its
-    // tenant loop finishing sees a transient undercount. Both are covered by
-    // polling to the same total window this used to spend as a fixed 3s sleep
-    // plus a shorter poll. A fixed sleep in front of a bounded poll only
-    // lengthens the test: it cannot make a slow discovery cycle arrive, and
-    // the poll already tolerates one.
+    // Poll until one scrape pair shows the final partition AND a completed
+    // cold first tick on both workers. The partition sum alone is not that
+    // state: the earlier worker's first heartbeat tick read a solo live set,
+    // and if its first discovery cycle reads the live set before its own
+    // second tick republishes it, that cycle claims all 24 units while the
+    // later worker, whose first cycle has not run yet, still reports 0 owned
+    // and 0 full sweeps. 24 + 0 matches `expected_total` with the later
+    // worker never having ticked. Requiring `full_sweeps >= owned > 0` on each
+    // side rules that state out: the inequality rules out a worker that has
+    // never ticked, and because `units_owned` is written per signal before
+    // that signal's sweeps run and a cold memo full-sweeps every owned unit,
+    // it holds together with the joint sum only once each worker has
+    // finished a cycle.
+    //
+    // The state is reached within one discovery cycle after convergence: the
+    // later worker converged on its first heartbeat tick, before its first
+    // cycle (due `interval` = 1s to 1.1s after its loop began, jitter
+    // included), and the earlier worker's next cycle starts at most 1.1s
+    // after its previous one ended. 100 iterations * 200ms = 20s is a margin
+    // of more than 10x over that, and a scrape landing inside a cycle's
+    // `set_units_owned(0)`-then-accumulate window only costs one more
+    // iteration.
     let expected_total = u64::from(SHARD_COUNT) * 3;
-    let mut owned_a = 0;
-    let mut owned_b = 0;
-    let mut settled = false;
-    for _ in 0..40 {
+    let owned_line = "ravel_maintain_units_owned{mode=\"maintain\"}";
+    let sweeps_line = "ravel_maintain_full_sweep_passes_total{mode=\"maintain\"}";
+    let cold_tick_done = |owned: Option<u64>, sweeps: Option<u64>| match (owned, sweeps) {
+        (Some(owned), Some(sweeps)) => owned > 0 && sweeps >= owned,
+        _ => false,
+    };
+    let mut observed = None;
+    let mut settled = None;
+    for _ in 0..100 {
         let body_a = scrape(&client, &base_a).await;
         let body_b = scrape(&client, &base_b).await;
-        owned_a = sample_value(&body_a, "ravel_maintain_units_owned{mode=\"maintain\"}")
-            .expect("units_owned present on a");
-        owned_b = sample_value(&body_b, "ravel_maintain_units_owned{mode=\"maintain\"}")
-            .expect("units_owned present on b");
-        if owned_a + owned_b == expected_total {
-            settled = true;
+        let owned_a = sample_value(&body_a, owned_line);
+        let owned_b = sample_value(&body_b, owned_line);
+        let sweeps_a = sample_value(&body_a, sweeps_line);
+        let sweeps_b = sample_value(&body_b, sweeps_line);
+        observed = Some((owned_a, sweeps_a, owned_b, sweeps_b));
+        let joint = owned_a.zip(owned_b).map(|(a, b)| a + b);
+        if joint == Some(expected_total)
+            && cold_tick_done(owned_a, sweeps_a)
+            && cold_tick_done(owned_b, sweeps_b)
+        {
+            settled = Some((body_a, body_b));
             break;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    assert!(
-        settled,
-        "the two workers must jointly own every (signal, shard) unit exactly once, no double-pay \
-         (ADR-0065 decision 2), regardless of how the rendezvous hash splits them: got \
-         owned_a={owned_a}, owned_b={owned_b}, expected total {expected_total}"
-    );
-
-    let body_a = scrape(&client, &base_a).await;
-    let body_b = scrape(&client, &base_b).await;
+    let Some((body_a, body_b)) = settled else {
+        let (owned_a, sweeps_a, owned_b, sweeps_b) = observed.unwrap_or_default();
+        panic!(
+            "within 100 iterations * 200ms = 20s of convergence, the two workers must jointly own \
+             every (signal, shard) unit exactly once, no double-pay (ADR-0065 decision 2), and \
+             each worker's cold-started first tick must have recorded at least one full sweep \
+             pass per owned unit; last observed: worker a units_owned={owned_a:?} \
+             full_sweep_passes_total={sweeps_a:?}, worker b units_owned={owned_b:?} \
+             full_sweep_passes_total={sweeps_b:?}, expected units_owned total {expected_total}"
+        );
+    };
 
     for (name, body) in [("a", &body_a), ("b", &body_b)] {
         assert!(
@@ -357,25 +393,6 @@ async fn two_maintain_workers_reach_and_report_full_ownership_on_real_metrics() 
              for both the transient and total kinds (ADR-0065 decision 4)"
         );
     }
-
-    // A cold-started memo runs its first pass as a full (unscoped) sweep for
-    // every owned unit, so this must already be nonzero on both sides, not
-    // merely present.
-    let full_sweeps_a = sample_value(
-        &body_a,
-        "ravel_maintain_full_sweep_passes_total{mode=\"maintain\"}",
-    )
-    .expect("full_sweep_passes_total present on a");
-    let full_sweeps_b = sample_value(
-        &body_b,
-        "ravel_maintain_full_sweep_passes_total{mode=\"maintain\"}",
-    )
-    .expect("full_sweep_passes_total present on b");
-    assert!(
-        full_sweeps_a > 0 && full_sweeps_b > 0,
-        "both workers' cold-started first tick must record at least one full sweep pass per owned \
-         unit"
-    );
 
     a.shutdown().await.expect("graceful shutdown a");
     b.shutdown().await.expect("graceful shutdown b");
