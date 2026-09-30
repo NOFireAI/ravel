@@ -1009,7 +1009,10 @@ costs every later query the bulk objects' fetch.
   loads. The spans load's refusal of a negative start or end names each of
   the two in the unit it was read in, by the same rule: `start_ts_unit` or
   `end_ts_unit` for an integer column, the column's own unit for a native
-  Arrow `Timestamp` column. Converting a unit never turns a
+  Arrow `Timestamp` column. An end cell of 0 takes the start, so a negative
+  start with a zero end refuses an end the end column does not hold; the
+  refusal then says the end was taken from `start_ts` because `end_ts` is 0.
+  Converting a unit never turns a
   positive value negative, so the refusal always means the column holds a
   negative cell; a mis-declared unit instead lands rows at the wrong time
   without a refusal.

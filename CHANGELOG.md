@@ -365,14 +365,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `decoded_charge`, now lives once in `ravel-memory`, and both the query
   fetcher and the catalog call it.
 - **`ravel-cli load --signal logs`, `--signal metrics` and `--signal spans`
-  name the unit a negative timestamp was read in** (issue #2133). For a
+  name the unit a negative timestamp was read in** (issues #2133, #2168). For a
   native Arrow `Timestamp` ts column the loader scales by the column's own
   unit, but the refusal named the declared `ts_unit` instead; a
   `Timestamp(Second)` cell of -5 under `ts_unit = "nanos"` reported "read as
   ts_unit = nanos". It now reports "read in the column's own Timestamp unit,
   seconds". An integer column still names `ts_unit`. The spans refusal, which
   named both declared units whatever the columns were, now names the start and
-  the end each by the same rule, against `start_ts_unit` and `end_ts_unit`.
+  the end each by the same rule, against `start_ts_unit` and `end_ts_unit`,
+  and an end substituted from the start for a zero end cell as "taken from
+  start_ts because end_ts is 0" rather than in the end column's unit.
 - **The maintain role reaps dead query-worker records under
   `sys/query/workers/`** (issue #1828). The query coordinator used to delete
   them under a role with no delete grant, so every delete was refused, logged
