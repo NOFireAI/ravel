@@ -34,10 +34,13 @@ pub(crate) struct SeenPut {
     pub checksum_headers: Vec<(String, String)>,
 }
 
+/// An object body and the checksum header, name and value, its PUT carried.
+type StoredObject = (Bytes, Option<(String, String)>);
+
 pub(crate) struct FakeS3 {
     echo: Echo,
     subresources: HashMap<&'static str, (StatusCode, String)>,
-    objects: Mutex<HashMap<String, (Bytes, Option<(String, String)>)>>,
+    objects: Mutex<HashMap<String, StoredObject>>,
     pub puts: Mutex<Vec<SeenPut>>,
     pub deletes: Mutex<Vec<String>>,
     /// The subresource of every control-plane GET, in arrival order.
