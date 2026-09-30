@@ -813,6 +813,14 @@ mount that failed to populate produces exactly this, with no error at startup.
 Tenant identity affects only key prefixing and authorization. It carries no
 other per-tenant configuration.
 
+A `TENANT` ending in `;ddl` (the tenant is the text before the LAST `;`)
+grants that token the `ddl` capability: absent by default, and nothing yet
+consumes it until `CREATE EXTERNAL TABLE` ships. Any other suffix, or an
+empty tenant before the `;`, refuses startup naming the flag position or the
+token file's line number, never the pair's text. A tenant with no `;` is
+unchanged and never carries the capability. See [Background](#background)
+for the decision behind this.
+
 ### Production authentication
 
 Two additive resolvers join the same first-success chain. Enabling them does not
@@ -830,7 +838,12 @@ algorithm-confusion tokens are rejected. A symmetric key in the key set is
 rejected outright, because a key set is a public document and a symmetric key
 inside one is a published verification secret. The tenant is read from
 `--oidc-tenant-claim` (default `tenant`) as a string, with no fallback to any
-other claim. The key set is cached in memory and refreshed on
+other claim. `--oidc-ddl-claim <CLAIM>` names a second, optional claim that
+grants the same `ddl` capability the `;ddl` tenant-token suffix grants: the
+capability is present only when the verified token carries that claim as
+the JSON boolean `true`, never for a string, a number, an array, or a
+missing claim. Unset (the default), OIDC never grants the capability. The
+key set is cached in memory and refreshed on
 `--oidc-jwks-refresh-interval-secs`, so the request path never makes a network
 call, and the fetch is bounded by a timeout so a stalled host cannot wedge the
 refresh loop or the readiness gate. The first fetch must succeed before the
@@ -871,8 +884,9 @@ Add `--mtls-trust-forwarded-header` to the argument vector to keep it starting.
 Nothing else about the deployment changes. A loopback-bound mTLS listener is
 unaffected.
 
-Dependent flags fail fast: `--oidc-tenant-claim` or `--oidc-audience` without
-OIDC enabled, `--mtls-header` or `--mtls-listener` without `--mtls-enabled`,
+Dependent flags fail fast: `--oidc-tenant-claim`, `--oidc-ddl-claim`, or
+`--oidc-audience` without OIDC enabled, `--mtls-header` or `--mtls-listener`
+without `--mtls-enabled`,
 `--mtls-enabled` without `--mtls-listener`, and `--mtls-trust-forwarded-header`
 without `--mtls-listener`, all refuse to start rather than quietly doing
 nothing.
@@ -1357,4 +1371,5 @@ Decision records behind the choices on this page:
 [logs postings](../../adrs/0049-rlog-postings.md),
 [typed attribute columns](../../adrs/0090-typed-attribute-columns-logs-sql.md),
 [wide-schema load](../../adrs/0100-wide-schema-load-and-sql-latency.md),
-and [operator-configurable query budgets](../../adrs/0088-operator-configurable-query-budgets.md).
+[operator-configurable query budgets](../../adrs/0088-operator-configurable-query-budgets.md),
+and [who may run DDL](../../adrs/2040-parquet-tables-queried-in-place.md).
