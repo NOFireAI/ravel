@@ -1296,7 +1296,11 @@ not applicable in gateway mode, and its `ravel_memory_budget_bytes` reads
 catalog byte cache, so its `/metrics` carries no `cache="catalog"` series
 for `ravel_cache_hits_total`, `ravel_cache_misses_total`,
 `ravel_cache_resident_entries`, `ravel_cache_resident_bytes` or
-`ravel_cache_max_bytes`. Every other mode (`all`, `query`, `maintain`) still needs
+`ravel_cache_max_bytes`. Likewise, unless `--cache-max-bytes` is set, a
+gateway builds no fetcher cache, and under `--cache-dir` no disk tier for it,
+so its `/metrics` carries no `cache="fetch"` series for any of those
+families. With neither flag set, no `ravel_cache_*` family renders at all.
+Every other mode (`all`, `query`, `maintain`) still needs
 effective memory above the 2 GiB reserve plus whatever its two cache
 ceilings claim. The current state is visible
 live at `/metrics`: `ravel_memory_budget_bytes` (the ceiling of that shared

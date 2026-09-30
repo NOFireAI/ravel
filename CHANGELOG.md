@@ -53,13 +53,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`RAVEL_S3_UPLOAD_INTEGRITY`) selects the algorithm; an endpoint that
   rejects the header fails every PUT from the first flush on, which can
   come after the process reports ready, and `--s3-upload-integrity off` is
-  the remedy.
-  Stores routed by `--tenant-kms-config` apply neither flag yet (issue
-  #2224). The new
+  the remedy. The new
   `--s3-request-stored-checksum` switch (`RAVEL_S3_REQUEST_STORED_CHECKSUM`,
   default `true`) controls the `x-amz-checksum-mode` request header;
   `--s3-request-stored-checksum=false` counts every full-object read as
-  unverified. The operator exposes both as `spec.storage.s3.uploadIntegrity`
+  unverified. Both flags apply to the per-tenant stores `--tenant-kms-config`
+  routes tenant writes to, as well as to the default store (issue #2224).
+  The operator exposes both as `spec.storage.s3.uploadIntegrity`
   and `spec.storage.s3.requestStoredChecksum` and applies them to its own S3
   client too.
 - **`ravel-cli --store s3` checksums every PUT with CRC-64/NVME by default,
@@ -450,7 +450,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fetcher and no cache it reads through. A gateway now derives no budget,
   subtracts no reserve and skips that check; its startup log says the memory
   budget is not applicable in gateway mode. `all`, `query` and `maintain` keep
-  the check and its message unchanged.
+  the check and its message unchanged. Unless `--cache-max-bytes` is set, a
+  gateway also builds no fetcher cache, and no disk tier for it under
+  `--cache-dir`, the way it builds no catalog byte cache unless
+  `--catalog-cache-max-bytes` is set, so its `/metrics` carries no
+  `cache="fetch"` series (issue #2241).
 
 - **A compaction claim left in place by a failed renewal is reclaimed by
   the same process at once, instead of waiting out the full lease**

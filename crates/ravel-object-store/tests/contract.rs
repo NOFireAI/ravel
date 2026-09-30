@@ -1173,6 +1173,7 @@ async fn kms_routing_store_contract_with_no_configured_tenants() {
     let store = KmsRoutingStore::new(
         Arc::new(MemoryStore::new()),
         test_s3_config(),
+        S3HttpConfig::default(),
         Arc::new(StoreMetrics::default()),
     );
     run_contract_suite(&store, "kms-routing-unconfigured").await;
