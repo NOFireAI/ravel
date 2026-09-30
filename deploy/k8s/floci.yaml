@@ -233,7 +233,25 @@ spec:
                 echo "bucket ${BUCKET} does not have versioning enabled" >&2
                 exit 1
               fi
+              # The lifecycle document is read once and checked whole: exactly
+              # one rule, enabled, scoped to the whole bucket (no non-empty
+              # prefix and no tag or size narrowing), carrying each action.
               lifecycle="$(curl -fsS "${ENDPOINT}/${BUCKET}?lifecycle")"
+              rules="$(printf '%s\n' "$lifecycle" | grep -o '<Rule>' | wc -l | tr -d ' ')"
+              if [ "$rules" != "1" ]; then
+                echo "bucket ${BUCKET} carries ${rules} lifecycle rules, not exactly one" >&2
+                exit 1
+              fi
+              if [ "$(printf '%s\n' "$lifecycle" | grep -o '<Status>[^<]*</Status>')" != \
+                '<Status>Enabled</Status>' ]; then
+                echo "bucket ${BUCKET} lifecycle rule is not enabled" >&2
+                exit 1
+              fi
+              if ! printf '%s\n' "$lifecycle" | grep -qE '<Filter|<Prefix' ||
+                printf '%s\n' "$lifecycle" | grep -qE '<Prefix>[^<]|<Tag>|<ObjectSize'; then
+                echo "bucket ${BUCKET} lifecycle rule is not scoped to the whole bucket" >&2
+                exit 1
+              fi
               if ! printf '%s\n' "$lifecycle" |
                 grep -q '<DaysAfterInitiation>7</DaysAfterInitiation>'; then
                 echo "bucket ${BUCKET} does not carry the multipart-abort rule" >&2
