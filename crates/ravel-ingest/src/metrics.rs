@@ -272,9 +272,10 @@ pub struct IngestMetrics {
     /// restart or reschedule it, so an operator has to roll the pod.
     /// Condemnation is deduped by the per-generation `ShardHandle`'s
     /// `condemned` bool, so it counts each shard at most once per live
-    /// generation and is bounded by `live_generations * shard_count`, not
-    /// `shard_count`: under resharding each live generation's handle for the
-    /// same shard index can condemn independently. Nonzero means at least one
+    /// shard-actor set and is bounded by the sum of those sets' shard counts
+    /// (one set per distinct active `shard_count`), not by `shard_count`:
+    /// under resharding each set's handle for a shard index can condemn
+    /// independently. Nonzero means at least one
     /// shard is permanently down in this process and its series keep failing
     /// until the process is replaced, which nothing does automatically: this is
     /// the counter to alert on.
@@ -1064,8 +1065,8 @@ impl IngestMetrics {
     }
 
     /// One shard condemned after exhausting its respawn budget (issue #1299).
-    /// Recorded at most once per shard per live generation (deduped by that
-    /// generation's `ShardHandle`, so a reshard's second live handle for the
+    /// Recorded at most once per shard of each live shard-actor set (deduped
+    /// by that set's `ShardHandle`, so a reshard's second live handle for the
     /// same shard index condemns independently), on the death that spends the
     /// last respawn; drives `IngestRouter::ready` false.
     pub(crate) fn record_shard_condemned(&self) {

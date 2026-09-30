@@ -401,11 +401,12 @@ Operationally (see docs/guides/operations/troubleshooting.md,
 "Readiness, storage and authentication"): on this pipeline `shard_deaths`
 counts every death including respawned incarnations, so it can exceed
 `shard_count` (the log and span pipelines never respawn and count once
-per shard per live generation, see their sections below); a low steady rate is
-transient recovery, a sustained climb on one shard is a poison-pill
+per shard of each live shard-actor set, see their sections below); a low
+steady rate is transient recovery, a sustained climb on one shard is a poison-pill
 input. `shards_condemned` counts each condemned shard at most once per live
-generation, so under resharding it is bounded by `live_generations *
-shard_count` rather than `shard_count`; any nonzero value means the process is
+shard-actor set (one set per distinct active `shard_count`), so under
+resharding it is bounded by the sum of those sets' shard counts rather than
+`shard_count`; any nonzero value means the process is
 not-ready and will stay that way until someone rolls it, so alert on
 `shards_condemned > 0`.
 
@@ -1424,13 +1425,14 @@ Counters recorded today:
   every death including each respawned incarnation and the figure can exceed
   `shard_count`; a low steady rate there is transient recovery. The log and
   span routers never respawn, so on `LogIngestMetrics` and `SpanIngestMetrics`
-  a death is already a condemnation: it is counted once per shard per live
-  generation, never more, and `shards_condemned` below moves on the same death
-  (see the Log and Span pipeline sections).
+  a death is already a condemnation: it is counted once per shard of each live
+  shard-actor set, never more, and `shards_condemned` below moves on the same
+  death (see the Log and Span pipeline sections).
 - `shards_condemned`: shards condemned and no longer accepting writes, counted
-  at most once per shard per live generation and bounded by
-  `live_generations * shard_count`, not `shard_count`: under resharding each
-  generation's handle for a shard index can condemn independently. On the
+  at most once per shard of each live shard-actor set (one set per distinct
+  active `shard_count`) and bounded by the sum of those sets' shard counts, not
+  `shard_count`: under resharding each set's handle for a shard index can
+  condemn independently. On the
   metrics pipeline a shard is condemned only after it exhausts its respawn
   budget within one decay window; `LogIngestMetrics` and `SpanIngestMetrics`
   carry the same counter but their routers never respawn, so the first

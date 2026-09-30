@@ -170,19 +170,14 @@ pub struct LogIngestMetrics {
     /// Distinct log shard actors observed dead by the router: its send half
     /// or a strict-mode ack found the shard channel closed, meaning the actor
     /// task ended (e.g. panicked) without the router shutting it down.
-    /// Counted once per shard on the first observation, so it never exceeds
-    /// `shard_count` and makes a permanently degraded process observable.
+    /// Counted once per shard of each live shard-actor set on the first
+    /// observation, so it is bounded by the sum of those sets' shard counts
+    /// (one set per distinct active `shard_count`) and makes a permanently
+    /// degraded process observable.
     shard_deaths: AtomicU64,
-    /// Shards condemned and no longer serving (issue #1691). Unlike the metrics
-    /// pipeline, the log router does not respawn a dead shard actor, so a shard
-    /// is condemned on its FIRST death rather than after a respawn budget is
-    /// exhausted: the two counters move together here, one per shard. Nonzero
-    /// means at least one shard is permanently down in this process and its
-    /// streams keep failing until the process is replaced, which nothing does
-    /// automatically. It makes the router report itself not-ready
-    /// ([`crate::LogIngestRouter::ready`]), which sheds traffic from this
-    /// replica (Kubernetes drops the pod from its Service endpoints) but does
-    /// not restart or reschedule it. This is the counter to alert on.
+    /// Shards condemned and no longer serving (issue #1691): a log shard is
+    /// condemned on its first death, so this moves with `shard_deaths`. The
+    /// counter to alert on; docs/ingest.md, Log pipeline, has the full rule.
     shards_condemned: AtomicU64,
     /// Flushes failed closed on a stale provisioning view (ADR-0052 section 3),
     /// the log-pipeline counterpart of `IngestMetrics::stale_provisioning_flushes`.
@@ -343,10 +338,8 @@ pub struct LogIngestMetricsSnapshot {
     /// multi-shard commit. Exported as `ravel_ingest_partial_writes_total`.
     pub partial_writes: u64,
     pub shard_deaths: u64,
-    /// Shards condemned after a permanent death (issue #1691). The log router
-    /// never respawns, so this equals `shard_deaths` for distinct shards.
-    /// Nonzero drives `/readyz` to 503. Exported as
-    /// `ravel_ingest_shards_condemned_total`.
+    /// Shards condemned on their first death (issue #1691; docs/ingest.md, Log
+    /// pipeline). Exported as `ravel_ingest_shards_condemned_total`.
     pub shards_condemned: u64,
     pub stale_provisioning_flushes: u64,
     pub grace_extended_stale_flushes: u64,
@@ -650,9 +643,8 @@ impl LogIngestMetrics {
         self.shard_deaths.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// One shard condemned (issue #1691). The log router does not respawn, so a
-    /// shard is condemned on its first death; called once per shard beside
-    /// [`Self::record_shard_death`], with the same per-shard dedup.
+    /// One shard condemned (issue #1691; docs/ingest.md, Log pipeline). Called
+    /// once per shard beside [`Self::record_shard_death`], with the same dedup.
     pub(crate) fn record_shard_condemned(&self) {
         self.shards_condemned.fetch_add(1, Ordering::Relaxed);
     }
