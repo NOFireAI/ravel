@@ -33,6 +33,7 @@
 //! | `Unsupported` | 422 | `FAILED_PRECONDITION` |
 //! | `Unavailable` | 503 | `UNAVAILABLE` |
 //! | `Timeout` | 504 | `DEADLINE_EXCEEDED` |
+//! | `Internal` | 500 | `INTERNAL` |
 //!
 //! `Unsupported` is `FAILED_PRECONDITION` rather than `INVALID_ARGUMENT`
 //! because the class covers requests that are well-formed but cannot be
@@ -150,6 +151,7 @@ pub(super) fn status_from_sql(err: &SqlError, tenant: TenantHash) -> Status {
         ErrorClass::Unsupported => tonic::Code::FailedPrecondition,
         ErrorClass::Unavailable => tonic::Code::Unavailable,
         ErrorClass::Timeout => tonic::Code::DeadlineExceeded,
+        ErrorClass::Internal => tonic::Code::Internal,
     };
 
     // Client-caused rejections are not operational events; log them at debug
@@ -269,6 +271,10 @@ mod tests {
                 tonic::Code::InvalidArgument,
             ),
             (SqlError::SnapshotInvalidated, tonic::Code::Unavailable),
+            (
+                SqlError::CorruptStreamAttrs("truncated".into()),
+                tonic::Code::Internal,
+            ),
             (
                 SqlError::DeadlineExceeded { millis: 30_000 },
                 tonic::Code::DeadlineExceeded,
