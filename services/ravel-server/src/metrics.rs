@@ -3518,6 +3518,10 @@ pub struct MaintenanceSafetySignalSnapshot {
     /// never runs when its copy did not). The steady state is a flat line, so
     /// an alert reads `increase(...) > 0` like the breaker-trip counter.
     pub orphans_quarantine_refused: u64,
+    /// Superseded-input deletes the store refused since process start. A
+    /// refusal stops only its own supersession chain and the pass succeeds,
+    /// so this counter is where it shows; the steady state is a flat line.
+    pub superseded_deletes_refused: u64,
     /// Objects physically deleted from `quarantine/` past the quarantine
     /// horizon since process start. Read against `orphans_quarantined`: that
     /// one climbing while this one stays flat is a quarantine prefix filling
@@ -3641,6 +3645,7 @@ impl MaintenanceSafetySnapshot {
                     orphans_present: metrics.orphans_present(signal),
                     orphans_quarantined: metrics.orphans_quarantined(signal),
                     orphans_quarantine_refused: metrics.orphans_quarantine_refused(signal),
+                    superseded_deletes_refused: metrics.superseded_deletes_refused(signal),
                     quarantine_reaped: metrics.quarantine_reaped(signal),
                     l0_records_pending: metrics.l0_records_pending(signal),
                     bytes_reclaimed: metrics.bytes_reclaimed(signal),
@@ -3818,6 +3823,24 @@ fn render_maintain_safety_family(
             "ravel_maintain_orphans_quarantine_refused_total",
             &labels(mode, signal.signal),
             signal.orphans_quarantine_refused,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_maintain_superseded_deletes_refused_total",
+        "Superseded-input deletes the store refused (access denied, a failed precondition, or a \
+         permanent error), by signal. A refusal keeps the rest of its supersession chain for a \
+         later pass and the pass still succeeds, so this is where a deny policy on part of the \
+         keyspace shows. The steady state is a flat line, so alert on increase() > 0.",
+        "counter",
+    );
+    for signal in &snapshot.signals {
+        write_sample(
+            out,
+            "ravel_maintain_superseded_deletes_refused_total",
+            &labels(mode, signal.signal),
+            signal.superseded_deletes_refused,
         );
     }
 
@@ -9868,6 +9891,7 @@ mod tests {
                     orphans_present: 9,
                     orphans_quarantined: 4,
                     orphans_quarantine_refused: 5,
+                    superseded_deletes_refused: 20,
                     quarantine_reaped: 6,
                     l0_records_pending: 8,
                     bytes_reclaimed: 4096,
@@ -9886,6 +9910,7 @@ mod tests {
                     orphans_present: 0,
                     orphans_quarantined: 0,
                     orphans_quarantine_refused: 0,
+                    superseded_deletes_refused: 0,
                     quarantine_reaped: 0,
                     l0_records_pending: 0,
                     bytes_reclaimed: 0,
@@ -10657,9 +10682,10 @@ mod tests {
     /// amendment), through the same `MaintenanceSafetyMetrics` the server
     /// already feeds every `SweepReport` into. The report is what a sweep pass
     /// returns, so this covers the whole chain the figures were stopping one
-    /// step short of: `SweepReport` to counter to rendered sample.
+    /// step short of: `SweepReport` to counter to rendered sample. Rule 2's
+    /// superseded-delete refusal counter rides the same chain.
     ///
-    /// Three distinct values, all asserted: a renderer reading the wrong field
+    /// Four distinct values, all asserted: a renderer reading the wrong field
     /// of the snapshot renders a plausible number and fails here.
     #[test]
     fn render_includes_orphan_quarantine_series() {
@@ -10671,6 +10697,7 @@ mod tests {
                 orphans_quarantined: 5,
                 orphans_quarantine_refused: 2,
                 quarantine_reaped: 3,
+                superseded_deletes_refused: 4,
                 ..Default::default()
             },
         );
@@ -10720,6 +10747,11 @@ mod tests {
                 "# TYPE ravel_maintain_quarantine_reaped_total counter",
                 "ravel_maintain_quarantine_reaped_total{mode=\"maintain\",signal=\"metrics\"} 3",
             ),
+            (
+                "# TYPE ravel_maintain_superseded_deletes_refused_total counter",
+                "ravel_maintain_superseded_deletes_refused_total{mode=\"maintain\",\
+                 signal=\"metrics\"} 4",
+            ),
         ] {
             assert!(body.contains(header), "missing TYPE line {header}:\n{body}");
             assert!(body.contains(sample), "missing sample {sample}:\n{body}");
@@ -10764,6 +10796,7 @@ mod tests {
                 orphans_present: 1,
                 orphans_quarantined: 1,
                 orphans_quarantine_refused: 1,
+                superseded_deletes_refused: 1,
                 quarantine_reaped: 1,
                 l0_records_pending: 1,
                 bytes_reclaimed: 1,
@@ -10817,6 +10850,7 @@ mod tests {
                     || line.starts_with("ravel_maintain_orphans_present")
                     || line.starts_with("ravel_maintain_orphans_quarantined_total")
                     || line.starts_with("ravel_maintain_orphans_quarantine_refused_total")
+                    || line.starts_with("ravel_maintain_superseded_deletes_refused_total")
                     || line.starts_with("ravel_maintain_quarantine_reaped_total")
                     || line.starts_with("ravel_maintain_l0_records_pending")
                     || line.starts_with("ravel_maintain_bytes_reclaimed_total")

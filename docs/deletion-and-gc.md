@@ -214,10 +214,9 @@ the observing pass walks every rewrite's chain: a deleting pass skips a
 rewrite still inside its horizon and every record below it. No observing pass
 walks a version 2 head's chain, and it needs none: that chain holds only
 compaction records, and a compaction record applies no erasure request, so a
-refusal there cannot hide a request a `.dreq` waits on. So only an erasure-request
-sweep that runs its own observing pass, as the maintain loop's does, is
-certain to see every refused chain and keep the signal's `.dreq`s that are
-past their horizon.
+refusal there cannot hide a request a `.dreq` waits on. So the erasure-request
+sweep decides only from an observing pass it runs itself, which sees every
+refused chain, and takes no deleting pass's holds in its place.
 
 A rewrite record landing outside both the fixed reconcile window and the
 frontier band is not left to wait indefinitely for one of those two passes to
@@ -406,16 +405,14 @@ prefix and a separate reaper deletes it only after a second horizon:
   the trip just held. Tying the reaper to candidate selection's cadence makes
   the hold hold by construction, with no breaker state persisted between
   passes. A `force_orphan_gc` override is not a trip and still reclaims.
-- **The event is visible in the logs, not yet on `/metrics`.** A pass counts
+- **The event is visible in the logs and on `/metrics`.** A pass counts
   objects quarantined (equal to the retained `orphans_deleted` count of
   candidates removed from the live set), refused, and reaped, and emits a
-  `warn`-level tracing event for each nonzero count. Today that tracing event
-  is the only operator-facing signal. The counter names
-  `ravel_maintain_orphans_quarantined` and
-  `ravel_maintain_orphans_quarantine_refused` are **not rendered on
-  `/metrics`** yet, so an alert rule written on either name can never fire.
-  Alert on `ravel_maintain_orphans_present` and on the tracing events
-  instead. `docs/observability.md` lists what `/metrics` actually exposes.
+  `warn`-level tracing event for each nonzero count. `/metrics` renders all
+  three per signal as `ravel_maintain_orphans_quarantined_total`,
+  `ravel_maintain_orphans_quarantine_refused_total` and
+  `ravel_maintain_quarantine_reaped_total`. The observability guide lists
+  what `/metrics` exposes.
 
 The cost is storage plus transfer. A quarantined object occupies the bucket
 for the second horizon before it is reclaimed, and the `quarantine/` prefix
@@ -697,10 +694,10 @@ every bound is measured.
   identifier, and is permanent, deny-delete audit evidence for every role
   (ADR-0055 amendment).
 
-- **The hold is read off the superseded-input sweep, not rediscovered.** That
-  sweep runs first in the same pass and already knows, per chain group, which
-  requests the chain applied and whether the group was deleted or held. It
-  reports two things: the request ids whose superseded inputs it held this
+- **The hold is read off the superseded-input sweep, not rediscovered.** The
+  erasure rule runs that sweep itself, as an observing pass that deletes
+  nothing, and that pass already knows, per chain group, which requests the
+  chain applied and whether the group was held. It reports two things: the request ids whose superseded inputs it held this
   pass, for either reason the gate holds them, and the buckets in which it
   held the inputs of a chain it could not walk back to a raw input. The
   erasure rule holds a `.dreq` past its horizon when its request id is in the
@@ -718,7 +715,14 @@ every bound is measured.
   chain in the signal and applies neither filter. A chain that is merely young
   contributes exactly the request ids and buckets it will contribute after its
   horizon; that a pass could not have deleted it is not recorded and not
-  consulted.
+  consulted. A deleting pass applies both filters, so its holds miss every
+  chain under a rewrite still inside its horizon; no entry to this rule takes
+  them in place of the observation. Without the second filter a chain group
+  is gathered more than once, from a predecessor's own entry and again from a
+  successor's chain walk, and the two gathers share their oldest record but
+  not the generations above it: the group is gated once, over the union of
+  both gathers' objects, so a HEAD naming a part only the successor's walk
+  reached holds it whichever entry the listing puts first.
 
   **A completion record's bucket list is informational only.** No part of this
   rule reads `bucket_drops`: not the hold decision, and not the scope of the
@@ -795,14 +799,27 @@ into them. An operator with erasure obligations must budget them deliberately.
   `R` refuses the same sweep delete `+D` describes. `sweep_superseded` runs
   three delete loops in order over every cleared chain: every chain's input
   commit records first, then every chain's input data objects, then every
-  chain's own compaction or rewrite records last. A lock on a chain's input
-  commit record aborts the pass at the first loop, so the data-delete loop
-  never runs for any chain in that pass and the physical-removal bound stays
-  at `max(bound, R)` until `R` elapses. A lock on a chain's own compaction or
-  rewrite record instead aborts the pass at the third loop, after that
-  chain's input records and their data are already gone: it holds only that
-  record at `max(bound, R)`, and the chain survives the retention period for
-  the next pass to retry. `sys/*`, `t/*/*/prov`, and
+  chain's own compaction or rewrite records last. A refused delete (access
+  denied, a failed precondition, or a permanent error) stops only the chain
+  it belongs to: that chain deletes none of its later keys in that pass, in
+  any of the three loops, so its own deletes stop where a crash at that key
+  would stop them. Another chain can still delete a key in the stopped
+  chain's tail when the two share it, and that is safe: a chain moves past a
+  key only once that key is deleted, and every object a record supersedes
+  sits earlier in that record's own chain. The pass reports the chain's
+  requests as held, counts the refusal in its `deletes_refused` (summed on
+  `/metrics` as `ravel_maintain_superseded_deletes_refused_total`), and still
+  collects every other chain, provided at least one delete in the pass
+  succeeds. A pass in which every delete it attempted was refused fails with
+  the first refusal's error, which is what a credential without delete
+  permission produces. A lock on a chain's input commit record therefore holds that
+  chain's data at `max(bound, R)` until `R` elapses. A lock on a chain's own
+  compaction or rewrite record is met only after that chain's input records
+  and their data are already gone: it holds only that record, and the ones
+  above it, at `max(bound, R)`, for the next pass to retry. A delete that
+  fails with a retryable error (a timeout, throttling, a transient fault), a
+  read-only store, or a backend with no delete support still fails the whole
+  pass. `sys/*`, `t/*/*/prov`, and
   `t/*/catalog/*/*` carry the same scoped retention but are never targets
   of supersession GC, ADR-0019 retention deletion, or ADR-0064 erasure.
   That is a statement about those three mechanisms and nothing wider: the

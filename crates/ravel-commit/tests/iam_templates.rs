@@ -3114,7 +3114,7 @@ fn maintain_template_grants_delete_on_erasure_requests() {
 /// prefix must be reachable under the shipped Maintain template, and nothing
 /// wider than those calls need may reach it.
 ///
-/// The sweep is `sweep_erasure_requests_inner` in
+/// The sweep is `sweep_erasure_requests` in
 /// `crates/ravel-maintain/src/sweep.rs`, and it touches `del/` three times:
 ///
 /// - `let prefix = keys::del_prefix(tenant, signal); let objects =
@@ -3153,7 +3153,7 @@ fn maintain_template_covers_every_erasure_request_sweep_call() {
         assert!(
             list_prefixes.iter().any(|p| glob_matches(p, &prefix)),
             "maintain: no ListBucket s3:prefix admits {prefix:?}, the prefix \
-             sweep_erasure_requests_inner passes to list_all. The pass is \
+             sweep_erasure_requests passes to list_all. The pass is \
              refused with AccessDenied before it reaches any .dreq, so the \
              delete grant is unreachable. s3:prefix values: {list_prefixes:?}"
         );
@@ -3164,7 +3164,7 @@ fn maintain_template_covers_every_erasure_request_sweep_call() {
         assert!(
             gets.iter().any(|p| glob_matches(p, &done)),
             "maintain: no GetObject Allow reaches the completion record \
-             {done:?}, which sweep_erasure_requests_inner GETs to decode the \
+             {done:?}, which sweep_erasure_requests GETs to decode the \
              completion timestamp that anchors the protection horizon. Without \
              it the pass fails on the first completed request. Grants: {gets:?}"
         );
@@ -3263,7 +3263,7 @@ fn maintain_template_covers_every_erasure_request_sweep_call() {
 }
 
 /// The `del/` calls the erasure lifecycle makes OUTSIDE
-/// `sweep_erasure_requests_inner`, which
+/// `sweep_erasure_requests`, which
 /// `maintain_template_covers_every_erasure_request_sweep_call` does not see.
 ///
 /// That test is scoped to one function, and scoping a reachability check by

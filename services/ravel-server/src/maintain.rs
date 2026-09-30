@@ -178,6 +178,7 @@ pub struct MaintenanceSafetyMetrics {
     orphans_present: [AtomicU64; MAINTAINED_SIGNALS.len()],
     orphans_quarantined: [AtomicU64; MAINTAINED_SIGNALS.len()],
     orphans_quarantine_refused: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    superseded_deletes_refused: [AtomicU64; MAINTAINED_SIGNALS.len()],
     quarantine_reaped: [AtomicU64; MAINTAINED_SIGNALS.len()],
     l0_records_pending: [AtomicU64; MAINTAINED_SIGNALS.len()],
     /// The in-progress cycle's L0-pending accumulator, paired with
@@ -442,6 +443,20 @@ impl MaintenanceSafetyMetrics {
         self.orphans_quarantine_refused[signal_index(signal)].load(Ordering::Relaxed)
     }
 
+    /// Superseded-input deletes the store refused (access denied, a failed
+    /// precondition, or a permanent error), summed over every sweep pass for
+    /// `signal` ([`ravel_maintain::SweepReport::superseded_deletes_refused`]).
+    /// A refusal stops only the supersession chain it belongs to and the pass
+    /// still succeeds, so this counter, not the unit's tick outcome, is where
+    /// a deny policy on part of the keyspace shows. Steady state is a flat
+    /// line; alert on `increase(...) > 0`, like
+    /// [`orphans_quarantine_refused`].
+    ///
+    /// [`orphans_quarantine_refused`]: Self::orphans_quarantine_refused
+    pub fn superseded_deletes_refused(&self, signal: Signal) -> u64 {
+        self.superseded_deletes_refused[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
     /// Objects physically deleted from `quarantine/` past the quarantine
     /// horizon, summed over every sweep pass for `signal`. This is the only
     /// place orphan-GC'd data is ever physically removed.
@@ -602,8 +617,9 @@ impl MaintenanceSafetyMetrics {
     /// its metric type. The withheld and present gauges are overwritten with
     /// this pass's counts (`store`, never `fetch_add`), matching
     /// [`orphans_withheld`]'s and [`orphans_present`]'s docs on why neither
-    /// gauge alone can be read as "resolved". The trip counter and the three
-    /// quarantine counters accumulate (`fetch_add`): each counts events the
+    /// gauge alone can be read as "resolved". The trip counter, the three
+    /// quarantine counters and the superseded-delete refusal counter
+    /// accumulate (`fetch_add`): each counts events the
     /// pass performed, which a later quiet pass does not undo, and
     /// [`SweepReport`] reports them per pass rather than as running totals, so
     /// the running total has to be kept here.
@@ -639,6 +655,8 @@ impl MaintenanceSafetyMetrics {
             .fetch_add(report.orphans_quarantined as u64, Ordering::Relaxed);
         self.orphans_quarantine_refused[index]
             .fetch_add(report.orphans_quarantine_refused as u64, Ordering::Relaxed);
+        self.superseded_deletes_refused[index]
+            .fetch_add(report.superseded_deletes_refused as u64, Ordering::Relaxed);
         self.quarantine_reaped[index].fetch_add(report.quarantine_reaped as u64, Ordering::Relaxed);
 
         // The `kind`-labeled deleted-objects family (issue #1729): the four
