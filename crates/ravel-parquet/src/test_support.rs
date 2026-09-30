@@ -4,6 +4,7 @@
 #![allow(clippy::expect_used)]
 
 use std::collections::{BTreeMap, HashMap};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -22,6 +23,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_datasource_parquet::source::ParquetSource;
 use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::file::metadata::ParquetMetaDataReader;
 use parquet::file::properties::WriterProperties;
 use ravel_cache::{Cache, CacheLimits};
@@ -99,6 +101,47 @@ pub(crate) fn footer_len_of(bytes: &[u8]) -> u32 {
     let mut word = [0u8; 4];
     word.copy_from_slice(&bytes[len - 8..len - 4]);
     u32::from_le_bytes(word)
+}
+
+/// `original` with one base64 character of its embedded `ARROW:schema`
+/// replaced so that Arrow's IPC decoder panics on it.
+pub(crate) fn arrow_schema_panicking(original: &[u8]) -> Vec<u8> {
+    const BASE64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let end = original.len() - 8;
+    let start = end - footer_len_of(original) as usize;
+    let decode = |bytes: &[u8]| ParquetMetaDataReader::decode_metadata(&bytes[start..end]);
+    let schema = decode(original)
+        .expect("footer")
+        .file_metadata()
+        .key_value_metadata()
+        .and_then(|kv| kv.iter().find(|kv| kv.key == "ARROW:schema"))
+        .and_then(|kv| kv.value.clone())
+        .expect("ArrowWriter embeds its schema");
+    let at = original[start..end]
+        .windows(schema.len())
+        .position(|window| window == schema.as_bytes())
+        .expect("the schema's bytes are in the footer")
+        + start;
+    let panics = |bytes: &[u8]| {
+        let Ok(metadata) = decode(bytes) else {
+            return false;
+        };
+        let metadata = Arc::new(metadata);
+        std::panic::catch_unwind(AssertUnwindSafe(|| {
+            ArrowReaderMetadata::try_new(metadata, ArrowReaderOptions::new()).map(|_| ())
+        }))
+        .is_err()
+    };
+    (at..at + schema.len())
+        .flat_map(|at| BASE64.iter().map(move |&c| (at, c)))
+        .filter(|&(at, c)| original[at] != c)
+        .map(|(at, c)| {
+            let mut bytes = original.to_vec();
+            bytes[at] = c;
+            bytes
+        })
+        .find(|bytes| panics(bytes))
+        .expect("a one-character change that panics Arrow's schema decoder")
 }
 
 pub(crate) fn manifest_for(table: &str, version: u64, files: &[(Vec<u8>, u64, u32)]) -> Manifest {
