@@ -140,6 +140,7 @@ impl TableOptions {
 #[derive(Debug)]
 pub struct ParquetTableProvider {
     raw: Arc<RawParquetScan>,
+    casts: BTreeMap<String, Cast>,
     /// The projection applying the table's casts; `None` without casts.
     cast_plan: Option<LogicalPlan>,
     schema: SchemaRef,
@@ -213,6 +214,9 @@ impl ParquetTableProvider {
         let mut parquet_options = TableParquetOptions::default();
         parquet_options.global.binary_as_string = options.binary_as_string;
         parquet_options.global.pushdown_filters = true;
+        // Without it the opener never builds a page pruning predicate, so it
+        // never asks the reader for a page index to prune with.
+        parquet_options.global.enable_page_index = false;
         // DataFusion's own schema inference clears the schema's metadata and
         // each top-level field's, then applies these two rewrites in this
         // order.
@@ -280,18 +284,46 @@ impl ParquetTableProvider {
             parallel,
         });
 
-        if options.casts.is_empty() {
+        Self::over(raw, options.casts)
+    }
+
+    /// The same table with its file grouping chosen by `parallel`, reading
+    /// nothing: the footer read when the table was built is reused.
+    pub fn with_parallel(&self, parallel: bool) -> Result<Self, ParquetTableError> {
+        let raw = Arc::new(RawParquetScan {
+            parallel,
+            ..self.raw.as_ref().clone()
+        });
+        Self::over(raw, self.casts.clone())
+    }
+
+    /// Whether the scan is split into up to `target_partitions` file groups.
+    pub fn parallel(&self) -> bool {
+        self.raw.parallel
+    }
+
+    fn over(
+        raw: Arc<RawParquetScan>,
+        casts: BTreeMap<String, Cast>,
+    ) -> Result<Self, ParquetTableError> {
+        if casts.is_empty() {
+            let schema = Arc::clone(&raw.schema);
             return Ok(ParquetTableProvider {
                 raw,
+                casts,
                 cast_plan: None,
-                schema: raw_schema,
+                schema,
             });
         }
-        let plan = cast_plan(&table, &raw, &options.casts)
-            .map_err(|source| ParquetTableError::Plan { table, source })?;
+        let plan =
+            cast_plan(&raw.table, &raw, &casts).map_err(|source| ParquetTableError::Plan {
+                table: raw.table.clone(),
+                source,
+            })?;
         let schema = Arc::new(plan.schema().as_arrow().clone());
         Ok(ParquetTableProvider {
             raw,
+            casts,
             cast_plan: Some(plan),
             schema,
         })
@@ -382,6 +414,7 @@ impl TableProvider for ParquetTableProvider {
 type ScanFile = (String, u64, Option<String>, Option<String>, u32);
 
 /// The Parquet scan itself, before any cast.
+#[derive(Clone)]
 struct RawParquetScan {
     table: String,
     schema: SchemaRef,
@@ -470,13 +503,19 @@ impl TableProvider for RawParquetScan {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let predicate = match conjunction(filters.to_vec()) {
+            Some(filter) => {
+                let df_schema = Arc::clone(&self.schema).to_dfschema()?;
+                Some(state.create_physical_expr(filter, &df_schema)?)
+            }
+            None => None,
+        };
         let mut source = ParquetSource::new(Arc::clone(&self.schema))
             .with_table_parquet_options(self.options.clone())
             .with_parquet_file_reader_factory(Arc::clone(&self.factory) as _)
             .with_pushdown_filters(self.options.global.pushdown_filters);
-        if let Some(filter) = conjunction(filters.to_vec()) {
-            let df_schema = Arc::clone(&self.schema).to_dfschema()?;
-            source = source.with_predicate(state.create_physical_expr(filter, &df_schema)?);
+        if let Some(predicate) = predicate {
+            source = source.with_predicate(predicate);
         }
         let groups = file_groups(
             self.partitioned_files(),
@@ -511,6 +550,8 @@ mod tests {
     use ravel_query::QueryPhase;
     use ravel_types::accounting::AccountedOp;
 
+    /// Each file's footer is one Probe read and its page index is never read;
+    /// the column chunks are Scan reads.
     #[tokio::test]
     async fn reads_exact_rows_with_footer_charged_to_probe_and_chunks_to_scan() {
         let store = Arc::new(MemoryStore::new());
@@ -533,6 +574,10 @@ mod tests {
             .await;
         let footers: u64 = [&a, &b].iter().map(|f| u64::from(f.footer_len) + 8).sum();
         let chunks = fixture.column_chunk_bytes(&[&a, &b]).await;
+        let (a_entry, b_entry) = (
+            fixture.decoded_footer_bytes(&a).await,
+            fixture.decoded_footer_bytes(&b).await,
+        );
 
         let accounting = PhaseAccounting::new();
         let table = fixture
@@ -546,10 +591,18 @@ mod tests {
         let probe = snapshot.phase(QueryPhase::Probe);
         let scan = snapshot.phase(QueryPhase::Scan);
         assert_eq!(probe.s3_bytes(AccountedOp::Get), footers);
-        assert_eq!(probe.s3_requests(AccountedOp::Get), 2);
+        assert_eq!(
+            probe.s3_requests(AccountedOp::Get),
+            2,
+            "one footer read per file"
+        );
         assert_eq!(
             probe.cache_hits, 1,
             "the scan finds a's footer decoded when the table was built"
+        );
+        assert_eq!(
+            probe.cache_bytes, a_entry,
+            "a footer cache hit charges the entry's size"
         );
         assert_eq!(scan.s3_bytes(AccountedOp::Get), chunks);
         assert_eq!(
@@ -569,6 +622,7 @@ mod tests {
         );
         assert_eq!(probe.s3_bytes(AccountedOp::Get), footers);
         assert_eq!(probe.cache_hits, 3, "one metadata cache hit per file");
+        assert_eq!(probe.cache_bytes, 2 * a_entry + b_entry);
         assert_eq!(
             second.phase(QueryPhase::Scan).s3_requests(AccountedOp::Get),
             4
@@ -611,6 +665,13 @@ mod tests {
         let serial = fixture.provider("t", 1, files, false).await;
         let groups = file_groups_of(serial.as_ref(), &ctx).await;
         assert_eq!(groups, vec![(0..5).map(path).collect::<Vec<_>>()]);
+
+        let regrouped = serial.with_parallel(true).expect("regroup");
+        assert!(regrouped.parallel());
+        assert_eq!(
+            file_groups_of(&regrouped, &ctx).await,
+            file_groups_of(parallel.as_ref(), &ctx).await
+        );
 
         let ctx = fixture.session(&[("t", serial)]);
         let plan = ctx
@@ -671,6 +732,38 @@ mod tests {
         let (parallel, rows) = partitions(true).await;
         assert_eq!(parallel, 4);
         assert_eq!(rows, expected);
+    }
+
+    /// ADR-2040 D6: the scan evaluates pushed-down filters inside the reader,
+    /// and does not prune pages with a page index.
+    #[tokio::test]
+    async fn the_scan_evaluates_filters_inside_the_reader_without_a_page_index() {
+        let store = Arc::new(MemoryStore::new());
+        let fixture = Fixture::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>);
+        let file = fixture
+            .put_file(
+                &store,
+                "lake/t/a.parquet",
+                parquet_bytes(&[1], &["x"]),
+                true,
+            )
+            .await;
+        let table = fixture.provider("t", 1, vec![file], false).await;
+        let ctx = fixture.session(&[]);
+        let filter = datafusion::logical_expr::ident("a").gt(datafusion::logical_expr::lit(0_i64));
+        let plan = table
+            .scan(&ctx.state(), None, &[filter], None)
+            .await
+            .expect("scan");
+        let exec = plan
+            .downcast_ref::<DataSourceExec>()
+            .expect("a Parquet scan");
+        let (_, source) = exec
+            .downcast_to_file_source::<ParquetSource>()
+            .expect("a Parquet file source");
+        assert!(source.table_parquet_options().global.pushdown_filters);
+        assert!(!source.table_parquet_options().global.enable_page_index);
+        assert!(datafusion::datasource::physical_plan::FileSource::filter(source).is_some());
     }
 
     #[test]
