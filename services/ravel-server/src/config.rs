@@ -93,6 +93,25 @@ pub enum StoreKind {
     S3,
 }
 
+/// `--parquet-profiles`, loaded, and Ravel's own data bucket, which no Parquet
+/// table may read a file from (ADR-2040 decision D4).
+#[derive(Debug, Clone)]
+pub struct ParquetProfiles {
+    pub profiles: Vec<ravel_object_store::external::ExternalProfile>,
+    /// `--s3-bucket` at `--s3-endpoint` under `--store s3`; `None` under
+    /// `--store memory`, whose objects no profile can reach.
+    pub ravel_bucket: Option<RavelS3Bucket>,
+}
+
+/// Ravel's own S3 bucket, the endpoint it is reached at (`None` for AWS's
+/// regional endpoint) and the region, as `--store s3` reaches it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RavelS3Bucket {
+    pub bucket: String,
+    pub endpoint: Option<String>,
+    pub region: String,
+}
+
 /// Which credential source `--store s3` uses (ADR-0106). The CLI-facing mirror
 /// of [`ravel_object_store::s3::S3AuthMode`], which lives in a crate that does
 /// not depend on clap.
@@ -618,6 +637,22 @@ pub struct Cli {
         value_name = "PATH"
     )]
     pub tenant_kms_config: Option<PathBuf>,
+
+    /// Path to the JSON file of credential profiles Parquet tables are read
+    /// through (ADR-2040 decision D1): the same file, and the same loader,
+    /// `ravel-cli --parquet-profiles` validates grants against. Each profile
+    /// names a store kind, its endpoint or account, and where its secret is
+    /// kept (an environment variable or a file), never the secret itself.
+    /// Absent (the default): no Parquet table is queryable, and a SQL query
+    /// naming one fails with a typed error that says so. Read at startup; a
+    /// malformed file stops the server. Used only by the `sql` feature's
+    /// endpoints.
+    #[arg(
+        long = "parquet-profiles",
+        env = "RAVEL_PARQUET_PROFILES",
+        value_name = "PATH"
+    )]
+    pub parquet_profiles: Option<PathBuf>,
 
     /// Disables the per-(tenant, signal) background catalog fold task, which
     /// runs in `--mode maintain` and `--mode all` and nowhere else. The other
@@ -6414,6 +6449,39 @@ impl Cli {
             .map_err(|e| anyhow::anyhow!("could not read --limits-file {path:?}: {e}"))?;
         limits::parse_limits_file(&text)
             .map_err(|e| anyhow::anyhow!("invalid --limits-file {}: {e}", path.display()))
+    }
+
+    /// `--s3-region`, or `us-east-1` when it is not set: the region
+    /// `--store s3` reaches its bucket in.
+    pub fn s3_region_or_default(&self) -> String {
+        self.s3_region
+            .clone()
+            .unwrap_or_else(|| "us-east-1".to_string())
+    }
+
+    /// Load and validate `--parquet-profiles` (ADR-2040 decision D1) through
+    /// [`ravel_object_store::external::load_profiles`], with Ravel's own data
+    /// bucket beside them. `None` when the flag is absent.
+    pub fn parse_parquet_profiles(&self) -> anyhow::Result<Option<ParquetProfiles>> {
+        let Some(path) = self.parquet_profiles.as_deref() else {
+            return Ok(None);
+        };
+        let json = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("could not read --parquet-profiles {path:?}: {e}"))?;
+        let profiles = ravel_object_store::external::load_profiles(&json)
+            .map_err(|e| anyhow::anyhow!("invalid --parquet-profiles {}: {e}", path.display()))?;
+        let ravel_bucket = match self.store {
+            StoreKind::Memory => None,
+            StoreKind::S3 => self.s3_bucket.clone().map(|bucket| RavelS3Bucket {
+                bucket,
+                endpoint: self.s3_endpoint.clone(),
+                region: self.s3_region_or_default(),
+            }),
+        };
+        Ok(Some(ParquetProfiles {
+            profiles,
+            ravel_bucket,
+        }))
     }
 
     /// Load and validate `--tenant-kms-config` (ADR-0062 decision 1,
@@ -12758,6 +12826,72 @@ mod tests {
             err.to_string().contains("--mtls-listener"),
             "the error names the flag it would apply to: {err}"
         );
+    }
+
+    /// `--parquet-profiles` is read through the loader ravel-cli uses: an
+    /// absent flag is no profiles, a valid file names its profiles, and a
+    /// malformed one or a duplicate name stops startup naming the flag. Ravel's
+    /// own bucket rides along: `--s3-bucket` at `--s3-endpoint` under
+    /// `--store s3`, and none under `--store memory`.
+    #[test]
+    fn parquet_profiles_are_loaded_through_the_shared_loader() {
+        assert!(cli(&[]).parse_parquet_profiles().expect("absent").is_none());
+        let good = tempfile::NamedTempFile::new().expect("temp file");
+        std::fs::write(
+            good.path(),
+            r#"[{"name": "lake", "kind": "gcs", "credentials": {"mode": "application_default"}}]"#,
+        )
+        .expect("write");
+        let path = good.path().to_str().expect("utf-8 path");
+        let profiles = cli(&["--parquet-profiles", path])
+            .parse_parquet_profiles()
+            .expect("valid file")
+            .expect("profiles");
+        assert_eq!(
+            profiles
+                .profiles
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["lake"]
+        );
+        assert_eq!(profiles.ravel_bucket, None, "--store memory has no bucket");
+        let s3 = cli(&[
+            "--parquet-profiles",
+            path,
+            "--store",
+            "s3",
+            "--s3-bucket",
+            "ravel-data",
+            "--s3-endpoint",
+            "http://127.0.0.1:9000",
+        ])
+        .parse_parquet_profiles()
+        .expect("valid file")
+        .expect("profiles");
+        assert_eq!(
+            s3.ravel_bucket,
+            Some(RavelS3Bucket {
+                bucket: "ravel-data".to_string(),
+                endpoint: Some("http://127.0.0.1:9000".to_string()),
+                region: "us-east-1".to_string(),
+            })
+        );
+        let duplicate = tempfile::NamedTempFile::new().expect("temp file");
+        std::fs::write(
+            duplicate.path(),
+            r#"[{"name": "lake", "kind": "gcs", "credentials": {"mode": "application_default"}},
+                {"name": "lake", "kind": "gcs", "credentials": {"mode": "application_default"}}]"#,
+        )
+        .expect("write");
+        let err = cli(&[
+            "--parquet-profiles",
+            duplicate.path().to_str().expect("utf-8 path"),
+        ])
+        .parse_parquet_profiles()
+        .expect_err("a duplicate name is refused");
+        assert!(err.to_string().contains("--parquet-profiles"), "{err}");
+        assert!(err.to_string().contains("duplicate"), "{err}");
     }
 
     #[test]

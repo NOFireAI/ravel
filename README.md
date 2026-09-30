@@ -150,6 +150,20 @@ and `audit`. SQL is the only way to query traces, alerts, and audit records.
 Logs are also queryable over PromQL, as `ravel_log_lines` and
 `ravel_log_bytes`.
 
+A tenant can also query Parquet tables: Parquet files read in place, in an S3,
+GCS or Azure location an operator granted the tenant with
+`ravel-cli tenant parquet-grant add`, through a credential profile from the
+file `ravel-server --parquet-profiles` names. A statement reads only Parquet
+tables or one of the five tables above, never both, and a table reads exactly
+the file versions it was defined over. Tables will be created with
+`CREATE EXTERNAL TABLE ... STORED AS PARQUET`, which SQL does not accept yet;
+until it does, a Parquet table exists only where an operator wrote its
+manifest. Such a table is queried by name:
+
+```text
+SELECT URL, count(*) AS c FROM hits WHERE CounterID = 62 GROUP BY URL ORDER BY c DESC LIMIT 10
+```
+
 The `samples` table has a `Float64` `value` column and nothing that can hold a
 native histogram, so a histogram sample is not a row there and `SELECT count(*)
 FROM samples` counts scalar samples only. A JSON response whose query met

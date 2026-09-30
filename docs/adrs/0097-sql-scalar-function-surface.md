@@ -232,7 +232,9 @@ reachable from both surfaces. It builds a bare
 `SessionContext::new()`, so it skips the aggregate deregistration loop
 entirely (the full default aggregate set is registered there) **and** carries
 the default `RuntimeEnv`, hence the default `ObjectStoreRegistry` rather than
-the `EmptyObjectStoreRegistry` that ADR-0013's security invariant 1 relies on.
+the `EmptyObjectStoreRegistry` that ADR-0013's security invariant 1 relies on
+(a session reading a Parquet table installs `SingleStoreRegistry` instead; see
+the Parquet registry amendment below).
 
 Its sibling throwaway-session site, `analyzed_classification_plan` (circa
 `executor.rs:944`), constructs correctly via `build_session`. Two throwaway
@@ -372,10 +374,11 @@ surface from a false model, which is how this gap survived.
 7. **The second session construction is unified.** `pushed_down_name_filter`
    routes through `build_session`, as `analyzed_classification_plan` already
    does. The inertness argument is real but it is an argument, and this
-   codebase treats `EmptyObjectStoreRegistry` and the aggregate
-   deregistration as invariants everywhere else. One construction path is
-   cheaper to keep correct than two plus a written justification for the
-   divergence.
+   codebase treats `EmptyObjectStoreRegistry` (in every session that reads
+   no Parquet table; see the Parquet registry amendment below) and the
+   aggregate deregistration as invariants everywhere else. One construction
+   path is cheaper to keep correct than two plus a written justification for
+   the divergence.
 
 8. **The claimed surface becomes auditable, at bounded cost.** Scalar and
    window functions enter `conformance.rs` following the ADR-0090 decision 8
@@ -562,3 +565,16 @@ the mechanism twice and leaving `uuid()` reachable in the interim.
   narrower than what this implements. ADR-0022 is not superseded; this ADR
   extends its mechanism to the registries it did not name, and its decision 1
   admission rule continues to govern the aggregate path unchanged.
+
+## Amendment (2026-09-29): Parquet sessions install `SingleStoreRegistry`
+
+<!-- amendment-applies: sections="A second session construction omits two invariants|Decision" pointer="Parquet registry amendment" -->
+
+ADR-2040 decision D4 replaces ADR-0013's first invariant for Parquet tables.
+A query session that reads a Parquet table installs `SingleStoreRegistry`,
+which answers exactly `ravel-pq://<tenant_hash>/` with that query's
+`TenantParquetStore`, errors for every other URL, and refuses
+`register_store`. Every other session keeps `EmptyObjectStoreRegistry`. The
+text above that treats the empty object-store registry as holding for every
+session holds for every session that reads no Parquet table; the code is
+`crates/ravel-sql/src/session.rs` and `crates/ravel-parquet/src/store.rs`.

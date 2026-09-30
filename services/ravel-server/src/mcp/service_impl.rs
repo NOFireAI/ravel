@@ -559,6 +559,7 @@ fn target_signal(target: ravel_sql::TargetSignal) -> &'static str {
         ravel_sql::TargetSignal::Spans => "traces",
         ravel_sql::TargetSignal::Alerts => "alerts",
         ravel_sql::TargetSignal::Audit => "audit",
+        ravel_sql::TargetSignal::Parquet => "parquet",
     }
 }
 

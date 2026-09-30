@@ -85,6 +85,7 @@ mod metadata_agg;
 mod minmax;
 mod output;
 mod page_plan;
+mod parquet;
 mod provider;
 mod pushdown;
 pub mod redact;
@@ -172,6 +173,10 @@ pub use output::QueryOutput;
 pub use page_plan::{
     NotTotalOrder, OrderTerm, PAGE_ALIAS, PagePlan, PagePlanError, ResumePosition, ResumeValue,
     plan_page,
+};
+pub use parquet::{
+    DEFAULT_PARQUET_METADATA_CACHE_BYTES, ExternalStoreError, ExternalStoreMap, ExternalStores,
+    ParquetQueryError, ParquetSession, ParquetSources, ProfileStores, RavelBucket,
 };
 pub use provider::RavelTableProvider;
 pub use pushdown::Pushdown;
