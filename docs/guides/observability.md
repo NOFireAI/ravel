@@ -1284,6 +1284,7 @@ and `kind` and no `signal`. These carry no `tenant_hash` label.
 | `ravel_maintain_orphans_present` | Gauge. Orphan candidates the last completed orphan pass found, by signal, whether or not the breaker tripped. |
 | `ravel_maintain_orphans_quarantined_total` | Orphan candidates moved from the live L0 set to the quarantine prefix, by signal. |
 | `ravel_maintain_orphans_quarantine_refused_total` | Orphan candidates whose copy to the quarantine prefix failed, by signal; the live object was left in place rather than deleted without a copy. |
+| `ravel_maintain_superseded_deletes_refused_total` | Superseded-input deletes the store refused (access denied, a failed precondition, or a permanent error), by signal. The refusing supersession chain keeps its remaining keys for a later pass and the pass still succeeds. |
 | `ravel_maintain_quarantine_reaped_total` | Objects physically deleted from the quarantine prefix past the quarantine horizon, by signal. |
 
 [Troubleshooting](operations/troubleshooting.md) gives the alert rules and the
@@ -1307,6 +1308,13 @@ before the delete, so a refused copy leaves the object in place rather than
 deleting it uncopied. Alert on `increase(...) > 0` there, the same shape as the
 breaker-trip counter, because the next pass retries the same candidate and
 refuses again.
+
+`ravel_maintain_superseded_deletes_refused_total` is the same shape for the
+superseded-input sweep. A refused delete stops only the supersession chain it
+belongs to, and a pass with at least one successful delete still succeeds, so
+the unit's tick is not recorded as failed and this counter is where a deny
+policy on part of the keyspace shows. Alert on `increase(...) > 0`: the next
+pass over that hour retries the chain and is refused again.
 
 `ravel_maintain_l0_records_pending` is a per-process total, not a per-bucket or
 per-tenant one: one maintenance cycle (default 300 s) sums every sealed bucket

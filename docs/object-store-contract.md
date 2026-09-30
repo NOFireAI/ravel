@@ -1132,18 +1132,20 @@ adapter contract:
    records first, then every chain's input data objects (its L0 data and
    pre-rewrite L1 segments), then every chain's own compaction or rewrite
    records last, so a rewrite record outlives every input it superseded.
-   A lock on a chain's input commit record therefore aborts the pass at
-   the first loop, before the data loop runs at all: the data-delete step
-   never runs for any chain in that pass, and the L0 data the pass would
-   otherwise collect stays in place, undeleted, until the record's
-   retention expires and a later pass completes the delete. A lock on a
-   chain's own compaction or rewrite record is different: by the time the
-   third loop reaches it the pass has already deleted that chain's input
-   records and their data, so the refusal holds only the chain's own
-   record, aborts the pass at the third loop, and leaves that record in
-   place through the retention period for the next pass to retry once `R`
-   elapses; the crash ordering the sweep is built around, a record
-   outliving the objects it superseded, is preserved either way. An
+   A refused delete stops only the chain it belongs to: that chain's later
+   keys are left for a later pass, in every loop, and every other chain in
+   the pass is still collected. A pass in which every delete it attempted
+   was refused still fails with the first refusal, so a credential without
+   delete permission stalls the unit rather than passing quietly. A lock
+   on a chain's input commit record
+   therefore leaves that chain's L0 data in place, undeleted, until the
+   record's retention expires and a later pass completes the delete. A
+   lock on a chain's own compaction or rewrite record is met only after
+   the pass has deleted that chain's input records and their data, so the
+   refusal holds only the chain's own record, and any above it, through
+   the retention period for the next pass to retry once `R` elapses; the
+   crash ordering the sweep is built around, a record outliving the
+   objects it superseded, is preserved either way. An
    operator who needs these sweeps to keep making progress keeps `R` at
    or under `protection_horizon` (about 25 hours with `CompactorConfig`
    defaults); an `R` longer than that pauses collection on that record

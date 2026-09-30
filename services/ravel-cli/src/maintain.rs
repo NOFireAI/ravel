@@ -1157,6 +1157,8 @@ pub async fn sweep(
         quarantine_reaped,
         superseded_records_deleted,
         superseded_data_deleted,
+        // Each refusal is logged at WARN by the sweep itself.
+        superseded_deletes_refused: _,
         unreferenced_parts_deleted,
         // Byte totals for the reclaimed-bytes metric (issue #1729); this CLI
         // reports counts, not bytes, so they are not printed here.

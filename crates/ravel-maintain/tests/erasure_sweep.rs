@@ -575,7 +575,7 @@ async fn held_dreq_survives_past_horizon() {
 /// chain-level hold (`chain_groups_held_by_legal_hold`) through
 /// `held_by_superseded_inputs`.
 ///
-/// Flip-line proof: in `sweep_erasure_requests_inner`, replace `let held =
+/// Flip-line proof: in `sweep_erasure_requests`, replace `let held =
 /// holds.request_ids.contains(&request_id_s) || !holds.truncated_buckets.is_empty();`
 /// with `let held = false;`: the held case then deletes the `.dreq` exactly
 /// like the control, failing `assert_eq!(held_out.deleted, 0, ...)` below.

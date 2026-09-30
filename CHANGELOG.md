@@ -378,6 +378,24 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **One refused delete no longer stops the superseded-input sweep for every
+  chain** (issue #1846). Rule 2 deletes every cleared chain's input commit
+  records, then their data objects, then the chains' own records, and a
+  delete the store refused (for example a deny policy on part of the
+  keyspace, answered 403 access denied) failed the whole pass before any
+  data object was deleted. A refusal (access denied, a failed precondition,
+  or a permanent error) now stops only the chain it belongs to: that chain
+  deletes none of its later keys that pass, its requests are reported held,
+  and the other chains are collected. The pass counts each refusal in
+  `SupersededSweepOutcome::deletes_refused` and
+  `SweepReport::superseded_deletes_refused` and logs it, and the server
+  sums the count per signal in the new
+  `ravel_maintain_superseded_deletes_refused_total` counter on `/metrics`,
+  since the unit's tick no longer records a refusal as failed. A pass in which
+  every delete it attempted was refused still fails, with the first
+  refusal's error, so a credential without delete permission fails the pass
+  as it did before. A retryable error, a read-only
+  store, or a backend with no delete support still fails the pass.
 - **SQL answers corrupt stored data and a panicked decode as an internal error,
   not a retryable unavailable** (issue #2097). `SqlError::class()` put every
   metrics, logs and spans fetcher error, `Corrupt` included, in the
@@ -848,8 +866,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   failing the pass, so the shard's other buckets are still reclaimed. The
   maintain loop's observing pass walks every chain and refuses the same way,
   so `sweep_erasure_requests` keeps a signal's `.dreq`s past their horizon for
-  any refused chain; a deleting pass does not walk a rewrite still inside its
-  horizon, so its holds can miss a refused chain below one. A chain ending at
+  any refused chain. It is now rule 6's only entry:
+  `sweep_erasure_requests_with_holds`, which took a deleting pass's holds, is
+  removed, since a deleting pass does not walk a rewrite still inside its
+  horizon and could let a `.dreq` retire while a stale HEAD still resolved
+  the inputs below one. A chain group the observing pass gathers twice, from
+  a predecessor's own entry and from a successor's chain walk, is gated over
+  the union of both gathers' parts, so a HEAD naming a part only the
+  successor's walk reached holds its requests whichever entry is listed
+  first. A chain ending at
   an absent compaction record is not marked truncated, since that record
   applied no erasure request. The erasure rewrite pass picks a bucket's live
   record through the catalog's shared supersession rules, so C1
