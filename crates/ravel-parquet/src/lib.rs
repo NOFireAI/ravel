@@ -7,7 +7,10 @@
 //!   reads through the process-wide `GetLimiter` and `ReadCache`, pins every
 //!   read to the manifest's ETag and version, and charges the footer read to
 //!   the Probe phase and every other read to the Scan phase; it does not use
-//!   the file's page index;
+//!   the file's page index. Every range it returns is reserved against the
+//!   process memory budget for as long as the bytes live, and every GET is
+//!   admitted against the query's request and byte budgets before it is
+//!   issued ([`ReadLimits`]);
 //!   [`PinnedReaderFactory`] builds one per file DataFusion opens;
 //! - [`MetadataCache`], a decoded-footer cache owned by Ravel, bounded in
 //!   bytes, keyed by tenant hash and pinned identity, held outside any
