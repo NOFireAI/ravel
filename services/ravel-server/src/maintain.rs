@@ -128,6 +128,17 @@ impl Clock for WallClock {
     }
 }
 
+/// The loop context's injected `Arc<dyn Clock>` as the cloneable concrete
+/// clock [`run_tick_with_clock`] takes. Clones share the one underlying clock.
+#[derive(Clone)]
+struct SharedClock(Arc<dyn Clock>);
+
+impl Clock for SharedClock {
+    fn now_ns(&self) -> i64 {
+        self.0.now_ns()
+    }
+}
+
 /// The data signals this server ingests, and therefore maintains, today.
 /// Metrics (RSEG), logs (RLOG), and spans all flow through the same
 /// signal-generic compaction/retention/sweep code (ADR-0032), carrying ADR-0019
@@ -1173,6 +1184,20 @@ impl Default for MaintenanceTaskConfig {
     }
 }
 
+/// Why [`spawn`] refused to start the maintenance loop. Either way nothing is
+/// spawned: the refusal is a startup error for the operator, never a loop that
+/// panics or deletes on an unsafe configuration.
+#[derive(Debug, thiserror::Error)]
+pub enum SpawnError {
+    /// The stored `sys/gc` horizon does not cover this sweeper's own skew.
+    #[error(transparent)]
+    GcConfig(#[from] ravel_maintain::GcConfigError),
+    /// A zero membership heartbeat period, which `tokio::time::interval`
+    /// panics on.
+    #[error("maintenance heartbeat_interval must be non-zero")]
+    ZeroHeartbeatInterval,
+}
+
 /// Handle to every spawned maintenance task, for clean shutdown (mirrors
 /// [`crate::fold::FoldTasks`]).
 pub struct MaintenanceTasks {
@@ -1217,13 +1242,18 @@ impl MaintenanceTasks {
 /// actually deletes. [`ravel_server::gc_config::validate_maintain`] does not
 /// catch it (it only checks that the configured horizon and grace EQUAL the
 /// stored ones; the skew term is in neither). So before spawning the loop that
-/// runs the delete/GC path, re-assert `protection_horizon >= max_query_duration
-/// + grace + clock_skew_allowance` using the running sweeper's OWN skew. On a
-/// violation this returns [`GcConfigError::MaintainSkewUncovered`] and spawns
-/// nothing: FAIL CLOSED. A misconfigured, unsafe GC is an operator error to fix,
-/// strictly better than silently deleting a live reader's snapshot. This is on
-/// the shipping maintain binary's path (`ravel_server::start` -> `spawn` ->
-/// `run_loop`), so no sweep loop is ever entered with a skew-uncovered horizon.
+/// runs the delete/GC path, re-assert
+/// `protection_horizon >= max_query_duration + grace + clock_skew_allowance`
+/// using the running sweeper's OWN skew. On a violation this returns
+/// [`GcConfigError::MaintainSkewUncovered`] (wrapped in
+/// [`SpawnError::GcConfig`]) and spawns nothing: FAIL CLOSED. A misconfigured,
+/// unsafe GC is an operator error to fix, strictly better than silently
+/// deleting a live reader's snapshot. This is on the shipping maintain binary's
+/// path (`ravel_server::start` -> `spawn` -> `run_loop`), so no sweep loop is
+/// ever entered with a skew-uncovered horizon.
+///
+/// A zero `heartbeat_interval` (on `config` or on `worker`) is refused the same
+/// way, with [`SpawnError::ZeroHeartbeatInterval`].
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     store: Arc<dyn ObjectStoreBackend>,
@@ -1236,9 +1266,16 @@ pub fn spawn(
     worker: Arc<WorkerSet>,
     live_tx: Arc<watch::Sender<Vec<Uuid>>>,
     clock: Arc<dyn Clock>,
-) -> Result<MaintenanceTasks, ravel_maintain::GcConfigError> {
+) -> Result<MaintenanceTasks, SpawnError> {
     if !config.enabled {
         return Ok(MaintenanceTasks::none());
+    }
+
+    // The heartbeat task's `tokio::time::interval` runs on the worker's period,
+    // which `ravel_server::start` builds from `config.heartbeat_interval`; a
+    // zero in either would panic that task rather than refuse to start.
+    if config.heartbeat_interval.is_zero() || worker.heartbeat_interval().is_zero() {
+        return Err(SpawnError::ZeroHeartbeatInterval);
     }
 
     // Fail-closed skew re-assert BEFORE any delete path can run:
@@ -1494,9 +1531,9 @@ async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> Loop
 
     // `clock` is the injected [`Clock`] from the context (the real [`WallClock`]
     // in the running service, a `FixedClock` in tests). Every cycle-completion
-    // stamp, memo timestamp, reseed "now", and heartbeat timestamp below reads
-    // it, so the liveness gauge and worker membership both advance by the same
-    // clock a test drives.
+    // stamp, memo timestamp, reseed "now", heartbeat timestamp, and tenant tick
+    // below reads it, so the liveness gauge, worker membership, and every
+    // sweep and retention horizon advance by the same clock a test drives.
 
     // Worker membership (ADR-0065 decision 1) runs on its own heartbeat cadence
     // `H`, independent of the (coarser) discovery interval, and in its OWN
@@ -1685,7 +1722,7 @@ async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> Loop
                         ownership.as_ref(),
                         &worker,
                         &live_set,
-                        clock.now_ns(),
+                        &SharedClock(Arc::clone(&clock)),
                     )
                     .await;
 
@@ -1802,9 +1839,12 @@ pub async fn reap_query_worker_heartbeats(
 ///
 /// Before discovery the cycle runs the one-per-deployment query-worker reap
 /// ([`reap_query_worker_heartbeats`]), gated on this process owning it and
-/// judged at `now_ns`, the caller's injected clock reading.
+/// judged at the caller's injected `clock`. Every tenant tick reads that same
+/// clock ([`run_tick_with_clock`]), so the running service passes the real
+/// [`WallClock`] and a test's clock governs every time-gated decision in the
+/// cycle.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_discovery_cycle(
+pub async fn run_discovery_cycle<C: Clock + Clone + 'static>(
     store: &dyn ObjectStoreBackend,
     fallback_allow: Option<&[TenantHash]>,
     compactor: &CompactorConfig,
@@ -1816,11 +1856,11 @@ pub async fn run_discovery_cycle(
     ownership: &MaintenanceOwnershipMetrics,
     worker: &WorkerSet,
     live_set: &[Uuid],
-    now_ns: i64,
+    clock: &C,
 ) -> MaintainReport {
     // Before discovery, so a failed tenant listing does not also stall the
     // query-worker prefix.
-    reap_query_worker_heartbeats(store, worker, live_set, now_ns).await;
+    reap_query_worker_heartbeats(store, worker, live_set, clock.now_ns()).await;
 
     let outcome = match discover_and_restrict_by_lifecycle(store, fallback_allow).await {
         Ok(outcome) => outcome,
@@ -1858,7 +1898,7 @@ pub async fn run_discovery_cycle(
     let mut total = MaintainReport::default();
     for tenant in &outcome.maintained {
         let report = run_tick_with_clock(
-            &WallClock,
+            clock,
             store,
             tenant,
             compactor,
@@ -4808,7 +4848,7 @@ mod tests {
             &ownership,
             &worker,
             &worker.solo_live_set(),
-            WallClock.now_ns(),
+            &WallClock,
         )
         .await;
         assert!(
@@ -5037,6 +5077,111 @@ mod tests {
             store.get(&superseded_key, GetRange::Full).await.is_err(),
             "an old catalog object no HEAD names must be swept by a real Metrics tick; \
              it survives if the sweep call is missing or gated on logs/spans"
+        );
+        assert!(
+            store.get(&referenced_key, GetRange::Full).await.is_ok(),
+            "the object the live HEAD still names must survive the sweep"
+        );
+    }
+
+    /// Every tenant tick inside a discovery cycle reads the clock the cycle is
+    /// given, not the wall clock (issue #2251). An unreferenced catalog object
+    /// is written with a store mtime in 2100, so by wall time it is decades
+    /// from being old enough to sweep; the injected clock sits two protection
+    /// horizons past that mtime, so a tick on it deletes the object.
+    ///
+    /// Flip to watch it fail: pass `&WallClock` instead of `clock` to
+    /// `run_tick_with_clock` in `run_discovery_cycle`. The sweep's age gate
+    /// then reads 2026, spares the object, and the `is_err()` assertion fails.
+    #[tokio::test]
+    async fn a_discovery_cycle_tick_reads_the_injected_clock() {
+        use ravel_proto::catalog::v1::{SnapshotHead, SnapshotPartRef};
+
+        /// 2100-01-01T00:00:00Z.
+        const WRITTEN_MS: u64 = 4_102_444_800_000;
+
+        let store = MemoryStore::new();
+        store.set_clock_ms(WRITTEN_MS);
+        let tenant = TenantId::new("acme").hash();
+        let signal = Signal::Metrics;
+        let snap_prefix = format!(
+            "t/{}/catalog/{}/snap/",
+            tenant.to_hex(),
+            signal.key_prefix()
+        );
+        let referenced_key = format!("{snap_prefix}21000101T01.aaaa.csnap");
+        let unreferenced_key = format!("{snap_prefix}21000101T00.cccc.csnap");
+        for key in [&referenced_key, &unreferenced_key] {
+            store
+                .put(
+                    key,
+                    bytes::Bytes::from_static(b"catalog-object"),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("seed catalog object");
+        }
+        let head = SnapshotHead {
+            format_version: 1,
+            tenant_hash: tenant.0.to_vec(),
+            signal: 0,
+            shard_count: 1,
+            watermark_hour: 100,
+            parts: vec![SnapshotPartRef {
+                key: referenced_key.clone(),
+                blake3: vec![1u8; 32],
+                size: 1,
+                entry_count: 1,
+                watermark_hour: 100,
+                min_hour: 0,
+                column_stats: None,
+            }],
+            folder_id: vec![0u8; 16],
+            created_unix_ns: 0,
+            postings: None,
+            shard_generation_count: 1,
+        };
+        store
+            .put(
+                &format!("t/{}/catalog/{}/HEAD", tenant.to_hex(), signal.key_prefix()),
+                bytes::Bytes::from(ravel_catalog::encode_head(&head).expect("valid HEAD encodes")),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed HEAD");
+
+        let compactor = CompactorConfig::default();
+        let written_ns = i64::try_from(WRITTEN_MS).expect("fits i64") * 1_000_000;
+        let clock = ravel_maintain::FixedClock::new(
+            written_ns + compactor.protection_horizon_ns.saturating_mul(2),
+        );
+        let metrics = TenantDiscoveryMetrics::default();
+        let worker = solo_worker();
+        run_discovery_cycle(
+            &store,
+            None,
+            &compactor,
+            &RetentionConfig::default(),
+            1,
+            &mut MaintainMemo::with_default_interval(),
+            &metrics,
+            &MaintenanceSafetyMetrics::default(),
+            &MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS),
+            &worker,
+            &worker.solo_live_set(),
+            &clock,
+        )
+        .await;
+
+        assert_eq!(
+            metrics.tenants_maintained(),
+            1,
+            "the cycle discovered and ticked the tenant"
+        );
+        assert!(
+            store.get(&unreferenced_key, GetRange::Full).await.is_err(),
+            "two protection horizons past its mtime by the injected clock, the unreferenced \
+             catalog object must be swept; it survives if the tick reads the wall clock"
         );
         assert!(
             store.get(&referenced_key, GetRange::Full).await.is_ok(),
@@ -6740,7 +6885,7 @@ mod tests {
             &ownership,
             &worker,
             &worker.solo_live_set(),
-            WallClock.now_ns(),
+            &WallClock,
         )
         .await;
 
@@ -6787,7 +6932,7 @@ mod tests {
             &ownership,
             &worker,
             &worker.solo_live_set(),
-            WallClock.now_ns(),
+            &WallClock,
         )
         .await;
 
@@ -6849,7 +6994,7 @@ mod tests {
             &ownership,
             &worker,
             &worker.solo_live_set(),
-            WallClock.now_ns(),
+            &WallClock,
         )
         .await;
 
@@ -8286,7 +8431,7 @@ mod tests {
                 &ownership,
                 &worker,
                 &live_solo,
-                WallClock.now_ns(),
+                &WallClock,
             )
             .await;
         }
@@ -8311,7 +8456,7 @@ mod tests {
             &ownership,
             &worker,
             &live_ab,
-            WallClock.now_ns(),
+            &WallClock,
         )
         .await;
 
@@ -8413,7 +8558,7 @@ mod tests {
                 &ownership,
                 &worker,
                 &live_solo,
-                WallClock.now_ns(),
+                &WallClock,
             )
             .await;
         }
@@ -8449,7 +8594,7 @@ mod tests {
             &ownership,
             &worker,
             &live_solo,
-            WallClock.now_ns(),
+            &WallClock,
         )
         .await;
         assert_eq!(
@@ -8491,7 +8636,7 @@ mod tests {
             &ownership,
             &worker,
             &live_solo,
-            WallClock.now_ns(),
+            &WallClock,
         )
         .await;
         assert!(
@@ -8532,7 +8677,7 @@ mod tests {
             &ownership,
             &worker,
             &live_ab,
-            WallClock.now_ns(),
+            &WallClock,
         )
         .await;
         assert_eq!(
@@ -9264,11 +9409,11 @@ mod tests {
             Arc::new(watch::channel(worker.solo_live_set()).0),
             Arc::new(WallClock),
         ) {
-            Err(ravel_maintain::GcConfigError::MaintainSkewUncovered {
+            Err(SpawnError::GcConfig(ravel_maintain::GcConfigError::MaintainSkewUncovered {
                 clock_skew_allowance_ns,
                 stored_horizon_ns,
                 ..
-            }) => {
+            })) => {
                 assert_eq!(clock_skew_allowance_ns, over_skew);
                 assert_eq!(stored_horizon_ns, stored_gc.protection_horizon_ns);
             }
@@ -9301,6 +9446,69 @@ mod tests {
         )
         .expect("a horizon that covers the running sweeper's skew spawns normally");
         tasks.shutdown().await;
+    }
+
+    /// A zero heartbeat period is refused at `spawn` with
+    /// [`SpawnError::ZeroHeartbeatInterval`] instead of reaching the heartbeat
+    /// task's `tokio::time::interval`, which panics on it (issue #1956). The
+    /// first case is the shape `ravel_server::start` builds, a worker made
+    /// from the config's zero; the other two cover each source on its own.
+    ///
+    /// Flip to watch it fail: delete the `is_zero()` guard in `spawn`. The
+    /// first case then spawns, the shutdown below lets the heartbeat task run,
+    /// it panics with "`period` must be non-zero.", and the `Ok` arm fails the
+    /// test.
+    #[tokio::test]
+    async fn spawn_refuses_a_zero_heartbeat_interval() {
+        let stored_gc = ravel_maintain::GcConfigValues::maintain_defaults();
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let zero_worker = || WorkerSet::new(0, Duration::ZERO, 3, DEFAULT_UNIT_CONCURRENCY);
+        let cases = [
+            (
+                "a zero heartbeat_interval on config and worker",
+                Duration::ZERO,
+                zero_worker(),
+            ),
+            (
+                "a zero config heartbeat_interval",
+                Duration::ZERO,
+                WorkerSet::with_defaults(0),
+            ),
+            (
+                "a worker built with a zero heartbeat period",
+                DEFAULT_HEARTBEAT_INTERVAL,
+                zero_worker(),
+            ),
+        ];
+        for (case, heartbeat_interval, worker) in cases {
+            let worker = Arc::new(worker);
+            let config = MaintenanceTaskConfig {
+                enabled: true,
+                heartbeat_interval,
+                ..MaintenanceTaskConfig::default()
+            };
+            match spawn(
+                Arc::clone(&store),
+                Vec::new(),
+                config,
+                stored_gc,
+                Arc::new(TenantDiscoveryMetrics::default()),
+                Arc::new(MaintenanceSafetyMetrics::default()),
+                Arc::new(MaintenanceOwnershipMetrics::new(
+                    DEFAULT_STALLED_AFTER_INTERVALS,
+                )),
+                Arc::clone(&worker),
+                Arc::new(watch::channel(worker.solo_live_set()).0),
+                Arc::new(WallClock),
+            ) {
+                Err(SpawnError::ZeroHeartbeatInterval) => {}
+                Err(other) => panic!("{case}: expected ZeroHeartbeatInterval, got: {other}"),
+                Ok(tasks) => {
+                    tasks.shutdown().await;
+                    panic!("{case} must be refused at spawn, not handed to the heartbeat task");
+                }
+            }
+        }
     }
 }
 
@@ -10666,8 +10874,8 @@ mod query_worker_reap_tests {
 
     /// The maintain tick is the caller: one discovery cycle on a single
     /// maintain process reaps a dead query-worker record, over a store holding
-    /// no tenant at all. The horizon is judged at the `now_ns` the caller
-    /// passes: [`NOW_NS`] is decades before the wall clock, so a cycle that
+    /// no tenant at all. The horizon is judged at the clock the caller
+    /// injects: [`NOW_NS`] is decades before the wall clock, so a cycle that
     /// read the wall clock instead would reap the live record too.
     #[tokio::test]
     async fn a_discovery_cycle_reaps_dead_query_worker_keys() {
@@ -10690,7 +10898,7 @@ mod query_worker_reap_tests {
             &MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS),
             &worker,
             &worker.solo_live_set(),
-            NOW_NS,
+            &ravel_maintain::FixedClock::new(NOW_NS),
         )
         .await;
 
