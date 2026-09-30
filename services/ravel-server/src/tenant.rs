@@ -9,6 +9,7 @@ use ravel_query::http::{
     DevHeaderTenantResolver, MtlsResolver, OidcJwksCache, OidcResolver, StaticBearerTokenResolver,
     TenantResolver,
 };
+use ravel_tenant_resolve::Principal;
 use ravel_types::TenantId;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -107,6 +108,62 @@ pub fn build_auth_resolver(
 
     // A single resolver wrapped in a FallbackResolver behaves identically to the
     // resolver alone, so this needs no special-case for len 1.
+    let resolver: Arc<dyn TenantResolver> = Arc::new(FallbackResolver::new(resolvers));
+    Ok(ResolverBundle {
+        resolver,
+        oidc_refresh,
+        mtls_resolver,
+    })
+}
+
+/// Same as [`build_auth_resolver`], but the static bearer map carries a
+/// [`Principal`] (tenant plus the `ddl` capability, ADR-2040 decision 4) per
+/// token instead of a bare [`TenantId`], and `oidc_ddl_claim` (from
+/// `--oidc-ddl-claim`, `None` by default) names the boolean OIDC claim that
+/// grants the capability when OIDC is configured. This is a parameter rather
+/// than a field on [`crate::config::OidcSettings`] so that struct's existing
+/// exhaustive constructors (in and out of this crate) keep compiling
+/// unchanged. `build_auth_resolver` itself is left untouched for callers that
+/// never need the capability.
+pub fn build_auth_resolver_with_principals(
+    tokens: HashMap<String, Principal>,
+    dev_header: bool,
+    auth: AuthResolverSettings,
+    oidc_ddl_claim: Option<String>,
+) -> anyhow::Result<ResolverBundle> {
+    let mut resolvers: Vec<Arc<dyn TenantResolver>> =
+        vec![Arc::new(StaticBearerTokenResolver::with_principals(tokens))];
+
+    let mtls_resolver: Option<Arc<dyn TenantResolver>> = auth
+        .mtls_header
+        .map(|header| Arc::new(MtlsResolver::new(header)) as Arc<dyn TenantResolver>);
+
+    if dev_header {
+        resolvers.push(Arc::new(DevHeaderTenantResolver::default()));
+    }
+
+    let mut oidc_refresh = None;
+    if let Some(oidc) = auth.oidc {
+        let cache = Arc::new(
+            OidcJwksCache::new().map_err(|e| anyhow::anyhow!("failed to build OIDC cache: {e}"))?,
+        );
+        let mut oidc_resolver = OidcResolver::new(
+            cache.clone(),
+            oidc.issuer,
+            oidc.audiences,
+            oidc.tenant_claim,
+        );
+        if let Some(ddl_claim) = oidc_ddl_claim {
+            oidc_resolver = oidc_resolver.with_ddl_claim(ddl_claim);
+        }
+        resolvers.push(Arc::new(oidc_resolver));
+        oidc_refresh = Some(OidcRefreshParams {
+            cache,
+            jwks_url: oidc.jwks_url,
+            interval: oidc.refresh_interval,
+        });
+    }
+
     let resolver: Arc<dyn TenantResolver> = Arc::new(FallbackResolver::new(resolvers));
     Ok(ResolverBundle {
         resolver,
