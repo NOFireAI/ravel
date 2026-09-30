@@ -185,8 +185,9 @@ pub struct MaintenanceSafetyMetrics {
     superseded_inputs_held:
         [[AtomicU64; SupersededHeldReason::ALL.len()]; MAINTAINED_SIGNALS.len()],
     superseded_groups_held_by_legal_hold: [AtomicU64; MAINTAINED_SIGNALS.len()],
-    /// `.dreq`s the erasure-request sweep kept past their horizon because an
-    /// input a rewrite applying them superseded is still present
+    /// `.dreq`s the erasure-request sweep kept past their horizon because its
+    /// observing pass held a chain group naming the request, or a chain it
+    /// could not walk to the end
     /// ([`ravel_maintain::ErasureRequestSweepOutcome::held_by_superseded_inputs`]).
     /// Backs `ravel_maintain_dreq_held_by_superseded_inputs_total`.
     dreq_held_by_superseded_inputs: [AtomicU64; MAINTAINED_SIGNALS.len()],
@@ -571,8 +572,10 @@ impl MaintenanceSafetyMetrics {
 
     /// Objects rule 2 held for `reason`, summed over every sweep pass for
     /// `signal`. A held object is counted again on every pass that holds it,
-    /// so this is held objects times passes: the operator question is whether
-    /// the rate stays above zero, not the total.
+    /// so this is held objects times passes. An interior hour is swept only on
+    /// the full-sweep cadence (`interior_reverify_ns`), so the operator
+    /// question is whether this grows over at least that interval, not its
+    /// rate or its total.
     pub fn superseded_inputs_held(&self, signal: Signal, reason: SupersededHeldReason) -> u64 {
         self.superseded_inputs_held[signal_index(signal)][reason.index()].load(Ordering::Relaxed)
     }
@@ -584,10 +587,12 @@ impl MaintenanceSafetyMetrics {
         self.superseded_groups_held_by_legal_hold[signal_index(signal)].load(Ordering::Relaxed)
     }
 
-    /// `.dreq`s the erasure-request sweep kept past their horizon because a
-    /// superseded input of one of their rewrites is still present, summed over
-    /// every pass for `signal`. Counted per pass, like
-    /// [`superseded_inputs_held`](Self::superseded_inputs_held).
+    /// `.dreq`s the erasure-request sweep kept past their horizon, summed over
+    /// every pass for `signal`: its own observing pass held a chain group
+    /// naming the request, or held a chain it could not walk to the end
+    /// anywhere in the signal. That pass runs on every tick and covers every
+    /// hour, so this can grow while
+    /// [`superseded_inputs_held`](Self::superseded_inputs_held) stays flat.
     pub fn dreq_held_by_superseded_inputs(&self, signal: Signal) -> u64 {
         self.dreq_held_by_superseded_inputs[signal_index(signal)].load(Ordering::Relaxed)
     }
@@ -2691,6 +2696,8 @@ async fn run_alert_retention(
                 "maintenance: alerts shard orphan sweep complete"
             );
             report_unmaintained_breaker_trip(safety, tenant, Signal::Alerts, ALERT_SHARD, &report);
+            // Zero today: nothing compacts or rewrites the alerts shard, so it
+            // has no supersession chain for rule 2 to refuse or hold.
             safety.record_unmaintained_superseded(Signal::Alerts, &report);
         }
         Err(err) => tracing::warn!(
@@ -5737,6 +5744,110 @@ mod tests {
         assert!(
             store.get(&done_key, GetRange::Full).await.is_ok(),
             ".done is permanent erasure evidence and must never be swept"
+        );
+    }
+
+    /// A `.dreq` the erasure-request sweep holds past its horizon reaches the
+    /// tick's safety snapshot, exactly once, under the signal it belongs to.
+    ///
+    /// Tick 1 rewrites the bucket and writes `.done`. A legal hold over the
+    /// shard's L0 data prefix then covers the input the rewrite superseded, but
+    /// not `del/`, so the `.dreq` itself is not protected: past the horizon it
+    /// is a candidate, and rule 6's observing pass holds it because a held
+    /// chain group names the request.
+    ///
+    /// Watch it fail: delete the `safety.record_erasure_sweep(signal, &outcome)`
+    /// call in `run_erasure_pass`. The `.dreq` is still held, and the metrics
+    /// count reads 0 instead of 1.
+    #[tokio::test]
+    async fn a_tick_counts_a_dreq_the_erasure_request_sweep_holds() {
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        publish_erasable_bucket(&store, &tenant_id).await;
+
+        let clock = ravel_maintain::FixedClock::new(TEST_ERASURE_NOW_NS);
+        let request_id = Uuid::from_u128(0xE7AD);
+        let dreq_key = submit_erasure_request(
+            &store,
+            &tenant,
+            Signal::Metrics,
+            request_id,
+            TEST_ERASED_SUBJECT,
+            1_000,
+        )
+        .await;
+        let done_key =
+            keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
+
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+
+        run_tick_with_clock(
+            &clock,
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+        assert!(
+            store.get(&done_key, GetRange::Full).await.is_ok(),
+            "tick 1 completes the request"
+        );
+
+        let l0_prefix = &shard_hold_scopes(&tenant, Signal::Metrics, 0).expect("scopes")[0];
+        write_hold_set(
+            &store,
+            &tenant,
+            Uuid::from_u128(0x401D),
+            TEST_ERASURE_NOW_NS,
+            l0_prefix,
+            "hold over the rewrite's superseded input",
+        )
+        .await
+        .expect("set hold");
+
+        clock.set(TEST_ERASURE_NOW_NS + compactor.protection_horizon_ns + 1);
+        run_tick_with_clock(
+            &clock,
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+
+        assert!(
+            store.get(&dreq_key, GetRange::Full).await.is_ok(),
+            "the .dreq outlives its horizon while the input its rewrite superseded is held"
+        );
+        let snapshot = crate::metrics::MaintenanceSafetySnapshot::from_metrics(&safety);
+        let held: Vec<(Signal, u64)> = snapshot
+            .signals
+            .iter()
+            .map(|s| (s.signal, s.dreq_held_by_superseded_inputs))
+            .collect();
+        assert_eq!(
+            held,
+            vec![(Signal::Metrics, 1), (Signal::Logs, 0), (Signal::Spans, 0)],
+            "tick 2's one held .dreq is counted once, under signal metrics"
         );
     }
 
@@ -10140,6 +10251,93 @@ mod alert_retention_tests {
                 .expect("list quarantine")
                 .is_empty(),
             "a tripped breaker quarantines nothing"
+        );
+    }
+
+    /// A legal hold over the query-audit shard's L0 data prefix stops rule 2
+    /// on that shard's supersession chain groups, and the tick counts them
+    /// under `signal="audit"` of the legal-hold family.
+    ///
+    /// Tick 1 compacts two sealed query-audit records. Each raw L0 input of a
+    /// compaction is its own chain group, so the count is 2. The hold lands
+    /// after tick 1, and tick 2, past the compaction's protection horizon, runs
+    /// the input-cleanup sweep that would otherwise delete both inputs.
+    ///
+    /// Watch it fail: delete the
+    /// `safety.record_unmaintained_superseded(Signal::Audit, &report)` call in
+    /// `run_tick_with_clock`'s query-audit block. The inputs are still kept,
+    /// and the audit entry's `groups_held_by_legal_hold` reads 0 instead of 2.
+    #[tokio::test]
+    async fn a_tick_counts_a_query_audit_chain_a_legal_hold_keeps() {
+        let store = MemoryStore::new();
+        store.set_clock_ms(((NOW_NS - 6 * NS_PER_HOUR) / 1_000_000) as u64);
+        let tenant = TenantId::new("acme").hash();
+        for text in ["up", "rate(x[5m])"] {
+            ravel_maintain::write_query_audit(
+                &store,
+                &tenant,
+                NOW_NS - 6 * NS_PER_HOUR,
+                text,
+                "promql",
+                ravel_maintain::QueryStatus::Ok,
+                0,
+                0,
+            )
+            .await
+            .expect("write a query-audit record");
+        }
+        let [l0_prefix, _, _] =
+            ravel_maintain::shard_hold_scopes(&tenant, Signal::Audit, QUERY_AUDIT_SHARD)
+                .expect("scopes");
+        let inputs = list_all(&store, &l0_prefix).await.expect("list inputs");
+        assert_eq!(inputs.len(), 2);
+
+        let compactor = CompactorConfig::default();
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        tick(&store, &tenant, &compactor, &safety, &worker, &live).await;
+        ravel_maintain::write_hold_set(
+            &store,
+            &tenant,
+            Uuid::from_u128(0xA0D1),
+            NOW_NS,
+            &l0_prefix,
+            "hold over the query-audit inputs",
+        )
+        .await
+        .expect("set hold");
+        tick_at(
+            NOW_NS + compactor.protection_horizon_ns + 1,
+            &store,
+            &tenant,
+            &compactor,
+            &safety,
+            &worker,
+            &live,
+        )
+        .await;
+
+        for meta in &inputs {
+            assert!(
+                exists(&store, &meta.key).await,
+                "{} is under the hold, so rule 2 keeps it",
+                meta.key
+            );
+        }
+        let snapshot = crate::metrics::MaintenanceSafetySnapshot::from_metrics(&safety);
+        assert_eq!(
+            snapshot.unmaintained_superseded,
+            vec![
+                (Signal::Alerts, UnmaintainedSupersededCounts::default()),
+                (
+                    Signal::Audit,
+                    UnmaintainedSupersededCounts {
+                        groups_held_by_legal_hold: 2,
+                        ..UnmaintainedSupersededCounts::default()
+                    }
+                ),
+            ],
+            "tick 2 skips both held chain groups, counted under signal audit"
         );
     }
 

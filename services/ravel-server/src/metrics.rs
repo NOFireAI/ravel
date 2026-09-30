@@ -292,7 +292,7 @@ pub enum Label {
     /// Why the alert retention driver skipped a tenant (ADR-1688 decision 3):
     /// `absent`, `undecodable`, `unsupported_version`, `watermark_below_floor`,
     /// or `store_error`. Shares the `reason` key with `RejectReason`,
-    /// `ScrubReason` and `ScrubUnreadableReason`.
+    /// `ScrubReason`, `ScrubUnreadableReason` and `SupersededHeldReason`.
     AlertRetentionSkipReason(crate::maintain::AlertRetentionSkipReason),
     /// Why rule 2 held a superseded input: `named` or `unreadable_head`.
     /// Shares the `reason` key with the other reason variants.
@@ -3541,9 +3541,10 @@ pub struct MaintenanceSafetySignalSnapshot {
     /// protects a key in them, summed per pass since process start. Backs
     /// `ravel_maintain_superseded_groups_held_by_legal_hold_total`.
     pub superseded_groups_held_by_legal_hold: u64,
-    /// `.dreq`s the erasure-request sweep kept past their horizon because a
-    /// superseded input of one of their rewrites is still present, summed per
-    /// pass since process start. Backs
+    /// `.dreq`s the erasure-request sweep kept past their horizon because its
+    /// own observing pass held a chain group naming the request, or held a
+    /// chain it could not walk to the end anywhere in the signal, summed per
+    /// tick since process start. Backs
     /// `ravel_maintain_dreq_held_by_superseded_inputs_total`.
     pub dreq_held_by_superseded_inputs: u64,
     /// Objects physically deleted from `quarantine/` past the quarantine
@@ -3874,9 +3875,12 @@ fn render_maintain_safety_family(
         "ravel_maintain_superseded_deletes_refused_total",
         "Superseded-input deletes the store refused (access denied, a failed precondition, or a \
          permanent error), by signal, including the alerts and query-audit shards (signal alerts \
-         and audit). A refusal keeps the rest of its supersession chain for a \
+         and audit; the alerts sample reads zero today, since nothing compacts or rewrites that \
+         shard). A refusal keeps the rest of its supersession chain for a \
          later pass and the pass still succeeds, so this is where a deny policy on part of the \
-         keyspace shows. The steady state is a flat line, so alert on increase() > 0.",
+         keyspace shows. The steady state is a flat line, so alert on increase() > 0 over at \
+         least the full-sweep interval (interior_reverify_ns, 6h by default), the only cadence \
+         on which an interior hour is retried.",
         "counter",
     );
     for signal in &snapshot.signals {
@@ -3897,18 +3901,22 @@ fn render_maintain_safety_family(
     }
 
     // Rule 2's holds. Each pass counts what it held again, so these are
-    // counters of per-pass holds: the question is whether the rate stays
-    // above zero, not the running total.
+    // counters of per-pass holds. An interior hour is swept only on the
+    // full-sweep cadence, so the question is whether they grow over at least
+    // that interval, not their rate or the running total.
     write_header(
         out,
         "ravel_maintain_superseded_inputs_held_total",
         "Superseded objects the superseded-input sweep held rather than deleted, by signal and \
-         reason, including the alerts and query-audit shards, counted once per pass that holds \
-         them. reason=named: the live catalog HEAD \
-         snapshot still names the object, which clears once the fold reconciles its hour or HEAD \
-         is rebuilt. reason=unreadable_head: HEAD or a covering snapshot part is present and \
-         cannot be read, so the sweep holds fail-closed; any sustained rate there needs an \
-         operator.",
+         reason, including the alerts and query-audit shards (the alerts sample reads zero \
+         today, since nothing compacts or rewrites that shard), counted once per pass that \
+         holds them. Tail hours and the query-audit shard count on every tick; interior hours \
+         count only on the full sweep (interior_reverify_ns, 6h by default), so read \
+         increase() over at least that interval, not rate(). reason=named: the live catalog \
+         HEAD snapshot still names the object, which clears once the fold reconciles its hour \
+         or HEAD is rebuilt. reason=unreadable_head: HEAD or a covering snapshot part is \
+         present and cannot be read, so the sweep holds fail-closed; any sustained growth there \
+         needs an operator.",
         "counter",
     );
     for signal in &snapshot.signals {
@@ -3963,8 +3971,9 @@ fn render_maintain_safety_family(
         "ravel_maintain_superseded_groups_held_by_legal_hold_total",
         "Supersession chain groups the superseded-input sweep skipped whole because a legal hold \
          protects at least one key in them, by signal, including the alerts and query-audit \
-         shards, counted once per pass that skips them. \
-         Expected while a hold is in force; it stops when the hold is lifted.",
+         shards (the alerts sample reads zero today), counted once per pass that skips them, \
+         on the same cadence as ravel_maintain_superseded_inputs_held_total. \
+         Expected while a hold is in force; it stops growing when the hold is lifted.",
         "counter",
     );
     for signal in &snapshot.signals {
@@ -3987,10 +3996,12 @@ fn render_maintain_safety_family(
     write_header(
         out,
         "ravel_maintain_dreq_held_by_superseded_inputs_total",
-        "Erasure requests (.dreq) kept past their protection horizon because an input one of \
-         their rewrites superseded is still present, by signal, counted once per pass that keeps \
-         them. The query-time exclusion filter stays in force meanwhile; the request is removed \
-         once the superseded-input sweep releases those inputs.",
+        "Erasure requests (.dreq) kept past their protection horizon, by signal, counted once \
+         per tick that keeps them. The erasure-request sweep's own observing pass of the \
+         superseded-input sweep, over every hour and chains of any age, held a chain group \
+         naming the request, or held a chain it could not walk to the end anywhere in the \
+         signal, which keeps every such .dreq. The query-time exclusion filter stays in force \
+         meanwhile. This can grow while the superseded hold counters stay flat.",
         "counter",
     );
     for signal in &snapshot.signals {

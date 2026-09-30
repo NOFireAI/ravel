@@ -1467,7 +1467,7 @@
       "id": 23,
       "type": "timeseries",
       "title": "Reclaim and safety brakes",
-      "description": "Physical deletes by kind, against the four brakes that stop the sweeper and the superseded-input sweep's refusals and holds. The breaker, the conservation aborts and the loop panics each mean reclaim stopped on purpose or on a crash, not that there was nothing to reclaim. A refused superseded delete is a store deny policy on part of the keyspace. A held superseded input with reason named waits for the fold; reason unreadable_head needs an operator. Holds by legal hold, and erasure requests held by superseded inputs, last as long as the hold or the held inputs do.",
+      "description": "Physical deletes by kind, against the four brakes that stop the sweeper and the superseded-input sweep's refusals and holds. The breaker, the conservation aborts and the loop panics each mean reclaim stopped on purpose or on a crash, not that there was nothing to reclaim. A refused superseded delete is a store deny policy on part of the keyspace. A held superseded input with reason named waits for the fold; reason unreadable_head needs an operator. Holds by legal hold, and erasure requests held by superseded inputs, last as long as the hold or the held inputs do. The superseded refusal and hold series plot increase over 6 h, the default full-sweep interval (interior_reverify_ns), not a rate: an interior hour is swept only on that cadence, so a rate spikes once per full sweep and reads zero between. Widen the window if interior_reverify_ns is set longer. The erasure-request series is decided every tick and uses the same window so the four read on one scale.",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -1544,7 +1544,7 @@
             "uid": "${ds}"
           },
           "legendFormat": "superseded deletes refused",
-          "expr": "sum(rate(ravel_maintain_superseded_deletes_refused_total[$__rate_interval]))"
+          "expr": "sum(increase(ravel_maintain_superseded_deletes_refused_total[6h]))"
         },
         {
           "refId": "H",
@@ -1553,7 +1553,7 @@
             "uid": "${ds}"
           },
           "legendFormat": "superseded held {{reason}}",
-          "expr": "sum by (reason) (rate(ravel_maintain_superseded_inputs_held_total[$__rate_interval]))"
+          "expr": "sum by (reason) (increase(ravel_maintain_superseded_inputs_held_total[6h]))"
         },
         {
           "refId": "I",
@@ -1562,7 +1562,7 @@
             "uid": "${ds}"
           },
           "legendFormat": "superseded groups held by legal hold",
-          "expr": "sum(rate(ravel_maintain_superseded_groups_held_by_legal_hold_total[$__rate_interval]))"
+          "expr": "sum(increase(ravel_maintain_superseded_groups_held_by_legal_hold_total[6h]))"
         },
         {
           "refId": "J",
@@ -1571,7 +1571,7 @@
             "uid": "${ds}"
           },
           "legendFormat": "erasure requests held by superseded inputs",
-          "expr": "sum(rate(ravel_maintain_dreq_held_by_superseded_inputs_total[$__rate_interval]))"
+          "expr": "sum(increase(ravel_maintain_dreq_held_by_superseded_inputs_total[6h]))"
         }
       ]
     },

@@ -3479,16 +3479,16 @@ pub struct ErasureRequestSweepOutcome {
     pub deleted: usize,
     /// `.dreq` objects left in place: no `.done` yet (erasure not complete),
     /// still inside the post-completion protection horizon, lease/legal-hold
-    /// protected, or held because an input one of its rewrites superseded is
-    /// still in the store (`held_by_superseded_inputs` below counts that
-    /// subset).
+    /// protected, or held off this pass's own observing rule-2 pass
+    /// (`held_by_superseded_inputs` below counts that subset).
     pub kept: usize,
-    /// The subset of `kept` held past their horizon because an input a rewrite
-    /// applying that request superseded is still physically present. Retiring
-    /// the query-time exclusion filter while such an input exists would let a
-    /// snapshot that still resolves it serve the erased subject again, so the
-    /// `.dreq` outlives every input its own rewrites superseded. The server's
-    /// maintain loop sums it into
+    /// The subset of `kept` held past their horizon because this pass's
+    /// observing rule-2 pass ([`SweepMode::GateOnly`], over every hour and
+    /// chains of any age) held a chain group naming the request, or held a
+    /// chain it could not walk to the end anywhere in the signal, which holds
+    /// every candidate. Retiring the query-time exclusion filter while such a
+    /// chain is held would let a snapshot that still resolves it serve the
+    /// erased subject again. The server's maintain loop sums it into
     /// `ravel_maintain_dreq_held_by_superseded_inputs_total`.
     pub held_by_superseded_inputs: usize,
 }
