@@ -4966,6 +4966,293 @@ mod tests {
         assert_eq!(acc.fetch_amplification, 0.0);
     }
 
+    // ---- Whole-object scan reads in wire_bytes_by_phase (#2130) ------------
+
+    /// GETs and bytes the store served, split by whether the key is a data
+    /// object (it parses as one) or anything else.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct DataSplit {
+        data_gets: u64,
+        data_bytes: u64,
+        other_gets: u64,
+        other_bytes: u64,
+    }
+
+    /// A pass-through store that tallies every GET into [`DataSplit`], so the
+    /// expected per-phase figures come from what the store served rather than
+    /// from the accounting the report is built on. A failed GET (a catalog
+    /// probe for a pointer that does not exist) still counts as a request, as
+    /// it does in `QueryAccounting`.
+    struct DataSplitStore {
+        inner: Arc<dyn ObjectStoreBackend>,
+        split: std::sync::Mutex<DataSplit>,
+    }
+
+    impl DataSplitStore {
+        fn new(inner: Arc<dyn ObjectStoreBackend>) -> Arc<Self> {
+            Arc::new(DataSplitStore {
+                inner,
+                split: std::sync::Mutex::new(DataSplit::default()),
+            })
+        }
+
+        fn snapshot(&self) -> DataSplit {
+            *self.split.lock().expect("split lock")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for DataSplitStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: ravel_object_store::GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+            let got = self.inner.get(key, range).await;
+            let bytes = got.as_ref().map_or(0, |g| g.data.len() as u64);
+            let mut split = self.split.lock().expect("split lock");
+            if keys::parse_data_key(key).is_ok() {
+                split.data_gets += 1;
+                split.data_bytes += bytes;
+            } else {
+                split.other_gets += 1;
+                split.other_bytes += bytes;
+            }
+            got
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            ravel_object_store::Capabilities {
+                multipart: false,
+                ..self.inner.capabilities()
+            }
+        }
+    }
+
+    /// Objects in the #2130 fixture: twice the partition count its settings
+    /// pin, so the whole-segment fast path is taken.
+    const WHOLE_OBJECTS: usize = 4;
+
+    /// The q02 shape from #2121 Stage 0: a count over a declared-column
+    /// predicate, which the whole-segment fast path serves.
+    const WHOLE_OBJECT_SQL: &str = "SELECT count(*) FROM logs WHERE duration_ms <> 0";
+
+    /// Measure [`WHOLE_OBJECT_SQL`] over [`WHOLE_OBJECTS`] one-record objects
+    /// through [`measure_corpus`], the core both the tenant and the generated
+    /// lanes drive, for two runs. Returns the per-run accounting, the object
+    /// bytes written, and the store's GET split across the whole measurement.
+    async fn whole_object_fixture_run(cache_bytes: u64) -> (Vec<RunAccounting>, u64, DataSplit) {
+        let store = DataSplitStore::new(empty_store());
+        let dyn_store: Arc<dyn ObjectStoreBackend> = store.clone();
+        let tenant = TenantId::new("whole-object-wire-tenant");
+        let objects = write_shard_objects(&dyn_store, &tenant, 0, WHOLE_OBJECTS).await;
+        let object_bytes: u64 = objects.iter().map(|o| o.len() as u64).sum();
+        let before = store.snapshot();
+        let (measured, skipped, failed) = measure_corpus(
+            &dyn_store,
+            tenant.hash(),
+            &[entry("q02", WHOLE_OBJECT_SQL)],
+            &[DeclaredColumn::new("duration_ms", DeclaredType::I64)],
+            2,
+            TimeRange {
+                start_ns: 0,
+                end_ns: NOW_NS,
+            },
+            NOW_NS,
+            cache_bytes,
+            Duration::from_secs(30),
+            false,
+            None,
+            ExecutorSettings {
+                fetch_concurrency: WHOLE_OBJECTS / 2,
+                ..ExecutorSettings::default()
+            },
+            false,
+            None,
+        )
+        .await
+        .expect("run");
+        assert!(skipped.is_empty() && failed.is_empty());
+        assert_eq!(
+            measured[0].rows_returned, 1,
+            "one count row, so the statement really executed"
+        );
+        let after = store.snapshot();
+        let split = DataSplit {
+            data_gets: after.data_gets - before.data_gets,
+            data_bytes: after.data_bytes - before.data_bytes,
+            other_gets: after.other_gets - before.other_gets,
+            other_bytes: after.other_bytes - before.other_bytes,
+        };
+        let acc = measured[0]
+            .per_run_accounting
+            .clone()
+            .expect("an in-process lane records per-run accounting");
+        (acc, object_bytes, split)
+    }
+
+    fn phase_bytes(acc: &RunAccounting, phase: QueryPhase) -> u64 {
+        acc.wire_bytes_by_phase[phase.index()].wire_bytes
+    }
+
+    fn phase_gets(acc: &RunAccounting, phase: QueryPhase) -> u64 {
+        acc.wire_bytes_by_phase[phase.index()].get_requests
+    }
+
+    /// Issue #2130: a statement that reads every object whole reports those
+    /// reads under `scan` in `wire_bytes_by_phase`, and
+    /// `wire_bytes_unattributed` holds only the bytes that are not log-object
+    /// reads.
+    ///
+    /// The cold run's split is exact: scan wire bytes are the bytes of the
+    /// objects written, scan GETs are one per object, resolve/plan/probe are
+    /// zero, and the residual is every byte and GET the store served for a
+    /// non-data key (the catalog's commit records and pointers). No cache is
+    /// attached, so the second run reads every object again and gets the same
+    /// scan figures; the store split covers both runs.
+    ///
+    /// Fails if the `self.wire_bytes.record(phase, ..)` line in
+    /// `LogSegmentFetcher::whole_object_bytes`'s no-cache branch is removed:
+    /// scan reads 0, the object bytes move into `wire_bytes_unattributed`, and
+    /// the residual no longer equals the non-data bytes. That is the shape
+    /// #2121's Stage 0 reported.
+    #[tokio::test]
+    async fn whole_object_scan_reads_reach_the_scan_phase_in_the_report() {
+        let (acc, object_bytes, split) = whole_object_fixture_run(0).await;
+        assert_eq!(acc.len(), 2);
+        assert_eq!(
+            split.data_bytes,
+            2 * object_bytes,
+            "no cache: each run reads every object once, whole"
+        );
+        assert_eq!(split.data_gets, 2 * WHOLE_OBJECTS as u64);
+
+        for (run, entry) in acc.iter().enumerate() {
+            assert_eq!(
+                entry.logs_whole_object_opens, WHOLE_OBJECTS as u64,
+                "run {run}: every object took the whole-object route"
+            );
+            assert_eq!(entry.logs_ranged_opens, 0);
+            assert_eq!(
+                phase_bytes(entry, QueryPhase::Scan),
+                object_bytes,
+                "run {run}"
+            );
+            assert_eq!(
+                phase_gets(entry, QueryPhase::Scan),
+                WHOLE_OBJECTS as u64,
+                "run {run}: one GET per object"
+            );
+            for phase in [QueryPhase::Resolve, QueryPhase::Plan, QueryPhase::Probe] {
+                assert_eq!(phase_bytes(entry, phase), 0, "run {run}: {}", phase.name());
+                assert_eq!(phase_gets(entry, phase), 0, "run {run}: {}", phase.name());
+            }
+            reconcile_run_accounting("q02", run, entry).expect("the run reconciles");
+        }
+
+        let unattributed_bytes: u64 = acc.iter().map(|a| a.wire_bytes_unattributed).sum();
+        let unattributed_gets: u64 = acc
+            .iter()
+            .map(|a| a.get_requests_unattributed.expect("a fresh run records it"))
+            .sum();
+        assert_eq!(
+            unattributed_bytes, split.other_bytes,
+            "the residual is exactly the non-data bytes"
+        );
+        assert_eq!(
+            unattributed_gets, split.other_gets,
+            "the residual GETs are exactly the non-data GETs"
+        );
+        assert!(
+            acc[0].wire_bytes_unattributed > 0,
+            "the cold catalog resolve reads commit records, which no phase claims"
+        );
+    }
+
+    /// With a read cache, the cold run's whole-object misses are scan-phase
+    /// wire bytes and the warm run, served from the cache, records zero scan
+    /// wire bytes and zero scan GETs. A hit's bytes are `cache_bytes`, never
+    /// wire bytes, and are not counted twice.
+    ///
+    /// Fails if the `self.wire_bytes.record(phase, ..)` line inside
+    /// `whole_object_bytes`'s cache fetch closure is removed (the cold scan
+    /// reads 0), or if its `Source::Cache` arm also charges the served bytes
+    /// to the wire counter: the warm run's attributed bytes then exceed its
+    /// pooled GET bytes (0) and `reconcile_run_accounting` fails the
+    /// measurement before the report is built.
+    #[tokio::test]
+    async fn warm_cache_run_records_no_scan_wire_bytes() {
+        let (acc, object_bytes, split) = whole_object_fixture_run(64 << 20).await;
+        assert_eq!(acc.len(), 2);
+        assert_eq!(
+            split.data_bytes, object_bytes,
+            "the store served each object once, to the cold run"
+        );
+        assert_eq!(split.data_gets, WHOLE_OBJECTS as u64);
+
+        let (cold, warm) = (&acc[0], &acc[1]);
+        for (run, entry) in acc.iter().enumerate() {
+            assert_eq!(
+                entry.logs_whole_object_opens, WHOLE_OBJECTS as u64,
+                "run {run}: every object took the whole-object route"
+            );
+            reconcile_run_accounting("q02", run, entry).expect("the run reconciles");
+        }
+        assert_eq!(phase_bytes(cold, QueryPhase::Scan), object_bytes);
+        assert_eq!(phase_gets(cold, QueryPhase::Scan), WHOLE_OBJECTS as u64);
+
+        assert_eq!(
+            phase_bytes(warm, QueryPhase::Scan),
+            0,
+            "a cache hit moves no wire bytes"
+        );
+        assert_eq!(phase_gets(warm, QueryPhase::Scan), 0);
+        assert!(
+            warm.cache_bytes >= object_bytes,
+            "the warm run's objects came from the cache"
+        );
+        let unattributed_bytes = cold.wire_bytes_unattributed + warm.wire_bytes_unattributed;
+        assert_eq!(
+            unattributed_bytes, split.other_bytes,
+            "the residual is exactly the non-data bytes on both runs"
+        );
+    }
+
     // ---- Phase reconciliation in the bench itself (#857) -------------------
 
     /// Measure the #913 fixture and pin the cold run's per-phase WIRE bytes to
