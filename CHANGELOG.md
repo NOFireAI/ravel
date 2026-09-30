@@ -1732,6 +1732,26 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with no credential profile file, at one extra GET of the newest manifest per
   name that has versions.
 
+- **A Flight SQL statement over a Parquet table reads the manifest version
+  `GetFlightInfo` resolved** (ADR-2040 D1 and D3, issue #2240). The Flight
+  SQL ticket is now version 8, and a version 7 ticket is refused as an
+  unsupported version. It pins, for each Parquet table the statement reads,
+  the table name and the version of the manifest object `GetFlightInfo`
+  resolved, and `DoGet` reads exactly those manifest objects by version,
+  with no LIST, where it used to resolve the table's newest manifest, so a
+  table replaced between the two RPCs streamed a schema other than the one
+  `FlightInfo` advertised. `DoGet` still checks the tenant's grants as they
+  are then, so a grant removed in between fails it with
+  `LocationNotGranted`, and a pinned manifest that has since been swept
+  fails it as `SnapshotInvalidated`. `GetFlightInfo` also resolves a Parquet
+  table once, not twice, which halves the manifest and grants reads it is
+  charged for against `max_s3_requests`. The request's lowered budgets are
+  applied to the pinned plan's scans on both RPCs and pinned into the
+  ticket; the Flight service's requests carry none today. `explain` over a
+  Parquet table again names `estimated_requests`, `estimated_store_bytes`
+  and `estimated_decompressed_bytes` as components the estimate does not
+  bound, so the MCP "does not bound" warning returns for all three.
+
 ## [0.19.0] - 2026-09-27
 
 ### Fixed
