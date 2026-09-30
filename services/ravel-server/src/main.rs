@@ -199,7 +199,12 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(profiles = ?names, "Parquet table credential profiles loaded");
     }
 
-    let tenant_tokens = cli.parse_tenant_tokens()?;
+    // Parsed once: the fold tenants, the federation mapping check, shard-count
+    // validation and the resolver all read this one result, so a token file
+    // rotated during startup cannot make the resolver serve a tenant the
+    // other checks never saw.
+    let tenant_principals = cli.parse_tenant_principals()?;
+    let tenant_tokens = ravel_server::config::tenant_map(&tenant_principals);
     // Fold and maintenance derive their tenant set from storage each cycle
     // (ADR-0048 decision 3), not from these flags. This is now
     // only an optional restriction: the union of the statically mapped bearer
@@ -269,7 +274,7 @@ async fn main() -> anyhow::Result<()> {
     // Federation TLS is on by default (ADR-0071 amendment), so a remote with
     // `tls` off is a deliberate operator choice; log it by name once here,
     // where the resolved remote-cluster config first exists. Parsed before
-    // `build_auth_resolver` consumes `tenant_tokens` and `auth`, so the
+    // `build_auth_resolver_with_principals` consumes `tenant_principals` and `auth`, so the
     // tenant-mapping check can read every resolver input.
     let remote_clusters = cli
         .parse_remote_clusters()
@@ -305,7 +310,6 @@ async fn main() -> anyhow::Result<()> {
     )?;
     ravel_server::warn_plaintext_federation(&remote_clusters);
 
-    let tenant_principals = cli.parse_tenant_principals()?;
     let resolver_bundle = ravel_server::tenant::build_auth_resolver_with_principals(
         tenant_principals,
         cli.dev_insecure_tenant_header,
@@ -490,7 +494,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // `cli.validate()` above refused startup unless --mtls-listener and
-    // --mtls-enabled are set together, and `build_auth_resolver` fills
+    // --mtls-enabled are set together, and `build_auth_resolver_with_principals` fills
     // `mtls_resolver` from that same --mtls-enabled flag, so this zip is
     // Some exactly when both were configured, and never partially.
     let mtls_listener = cli

@@ -66,54 +66,25 @@ pub struct OidcRefreshParams {
 /// section 1) - `resolver` backs every public listener, and a resolver that
 /// trusts an unauthenticated header has no business there.
 ///
-/// `FallbackResolver` tries every resolver and returns the first success, so
-/// order is functionally irrelevant (the resolvers key off disjoint headers or
-/// token shapes and never both claim one request). The static bearer map is a
-/// cheap `HashMap` lookup, so it goes first to fail fast for a dev/local token;
-/// the more expensive JWT verification is last. `StaticBearerTokenResolver` and
-/// `DevHeaderTenantResolver` keep their existing behavior unchanged.
+/// `FallbackResolver` tries every resolver in order and returns the first
+/// success, and that first match also decides the `ddl` capability: the
+/// resolvers key off disjoint headers or token shapes so no request is
+/// normally claimed by two, but if one were, the earlier resolver's principal
+/// (tenant and `ddl`) wins and later ones are never consulted. The static
+/// bearer map is a cheap `HashMap` lookup, so it goes first to fail fast for a
+/// dev/local token; the more expensive JWT verification is last. Delegates to
+/// [`build_auth_resolver_with_principals`] with every token carrying
+/// `ddl: false` and no OIDC ddl claim, so one code path builds the chain.
 pub fn build_auth_resolver(
     tokens: HashMap<String, TenantId>,
     dev_header: bool,
     auth: AuthResolverSettings,
 ) -> anyhow::Result<ResolverBundle> {
-    let mut resolvers: Vec<Arc<dyn TenantResolver>> =
-        vec![Arc::new(StaticBearerTokenResolver::new(tokens))];
-
-    let mtls_resolver: Option<Arc<dyn TenantResolver>> = auth
-        .mtls_header
-        .map(|header| Arc::new(MtlsResolver::new(header)) as Arc<dyn TenantResolver>);
-
-    if dev_header {
-        resolvers.push(Arc::new(DevHeaderTenantResolver::default()));
-    }
-
-    let mut oidc_refresh = None;
-    if let Some(oidc) = auth.oidc {
-        let cache = Arc::new(
-            OidcJwksCache::new().map_err(|e| anyhow::anyhow!("failed to build OIDC cache: {e}"))?,
-        );
-        resolvers.push(Arc::new(OidcResolver::new(
-            cache.clone(),
-            oidc.issuer,
-            oidc.audiences,
-            oidc.tenant_claim,
-        )));
-        oidc_refresh = Some(OidcRefreshParams {
-            cache,
-            jwks_url: oidc.jwks_url,
-            interval: oidc.refresh_interval,
-        });
-    }
-
-    // A single resolver wrapped in a FallbackResolver behaves identically to the
-    // resolver alone, so this needs no special-case for len 1.
-    let resolver: Arc<dyn TenantResolver> = Arc::new(FallbackResolver::new(resolvers));
-    Ok(ResolverBundle {
-        resolver,
-        oidc_refresh,
-        mtls_resolver,
-    })
+    let principals = tokens
+        .into_iter()
+        .map(|(token, tenant)| (token, Principal { tenant, ddl: false }))
+        .collect();
+    build_auth_resolver_with_principals(principals, dev_header, auth, None)
 }
 
 /// Same as [`build_auth_resolver`], but the static bearer map carries a
@@ -123,8 +94,7 @@ pub fn build_auth_resolver(
 /// grants the capability when OIDC is configured. This is a parameter rather
 /// than a field on [`crate::config::OidcSettings`] so that struct's existing
 /// exhaustive constructors (in and out of this crate) keep compiling
-/// unchanged. `build_auth_resolver` itself is left untouched for callers that
-/// never need the capability.
+/// unchanged.
 pub fn build_auth_resolver_with_principals(
     tokens: HashMap<String, Principal>,
     dev_header: bool,

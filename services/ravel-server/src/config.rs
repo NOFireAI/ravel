@@ -4355,6 +4355,17 @@ fn split_tenant_suffix(raw: &str) -> Result<(&str, bool), ()> {
     }
 }
 
+/// The bare token to tenant view of a parsed principal map, dropping the `ddl`
+/// capability. Every consumer that only needs tenants derives its map from the
+/// same [`Cli::parse_tenant_principals`] result through this, so no two views
+/// can come from two reads of the token file.
+pub fn tenant_map(principals: &HashMap<String, Principal>) -> HashMap<String, TenantId> {
+    principals
+        .iter()
+        .map(|(token, principal)| (token.clone(), principal.tenant.clone()))
+        .collect()
+}
+
 impl Cli {
     /// Parses `args` as [`Parser::parse_from`] does, and then refuses the
     /// flags the parsed `--mode` never reads (ADR-1693): `--disable-fold` and
@@ -4441,11 +4452,7 @@ impl Cli {
     }
 
     pub fn parse_tenant_tokens(&self) -> anyhow::Result<HashMap<String, TenantId>> {
-        Ok(self
-            .parse_tenant_pairs()?
-            .into_iter()
-            .map(|(token, principal)| (token, principal.tenant))
-            .collect())
+        Ok(tenant_map(&self.parse_tenant_pairs()?))
     }
 
     /// Same `TOKEN=TENANT` pairs as [`Self::parse_tenant_tokens`], but keeping
@@ -4459,35 +4466,52 @@ impl Cli {
 
     fn parse_tenant_pairs(&self) -> anyhow::Result<HashMap<String, Principal>> {
         let mut map = HashMap::new();
+        // Where each token was first seen, so a conflicting repeat can name
+        // both positions without naming the token.
+        let mut origins: HashMap<String, String> = HashMap::new();
         // `ctx` names where a malformed pair came from (an argv position, or a
         // file and line number) but never the pair's own text: for the file
         // source that text is the bearer token itself, and `main` prints this
         // error to stderr, so echoing it back would leak the secret into the
         // container log.
-        let insert_pair =
-            |map: &mut HashMap<String, Principal>, pair: &str, ctx: &str| -> anyhow::Result<()> {
-                let (token, tenant_raw) = pair
-                    .split_once('=')
-                    .ok_or_else(|| anyhow::anyhow!("invalid {ctx}, expected TOKEN=TENANT"))?;
-                if token.is_empty() || tenant_raw.is_empty() {
-                    anyhow::bail!("invalid {ctx}, expected TOKEN=TENANT");
-                }
-                let (tenant, ddl) = split_tenant_suffix(tenant_raw).map_err(|()| {
-                    anyhow::anyhow!("invalid {ctx}, expected TENANT or TENANT;ddl")
-                })?;
-                map.insert(
-                    token.to_string(),
-                    Principal {
-                        tenant: TenantId::new(tenant),
-                        ddl,
-                    },
-                );
-                Ok(())
+        let insert_pair = |map: &mut HashMap<String, Principal>,
+                           origins: &mut HashMap<String, String>,
+                           pair: &str,
+                           ctx: &str|
+         -> anyhow::Result<()> {
+            let (token, tenant_raw) = pair
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("invalid {ctx}, expected TOKEN=TENANT"))?;
+            if token.is_empty() || tenant_raw.is_empty() {
+                anyhow::bail!("invalid {ctx}, expected TOKEN=TENANT");
+            }
+            let (tenant, ddl) = split_tenant_suffix(tenant_raw)
+                .map_err(|()| anyhow::anyhow!("invalid {ctx}, expected TENANT or TENANT;ddl"))?;
+            let principal = Principal {
+                tenant: TenantId::new(tenant),
+                ddl,
             };
+            // A token repeated with a different tenant or capability would
+            // otherwise resolve by flag or line order. An identical repeat
+            // is harmless.
+            if let Some(existing) = map.get(token) {
+                if *existing != principal {
+                    let first = origins.get(token).map(String::as_str).unwrap_or("?");
+                    anyhow::bail!(
+                        "conflicting tenant token: the token at {ctx} is also defined at                              {first} with a different tenant or ddl capability"
+                    );
+                }
+                return Ok(());
+            }
+            origins.insert(token.to_string(), ctx.to_string());
+            map.insert(token.to_string(), principal);
+            Ok(())
+        };
 
         for (i, pair) in self.tenant_tokens.iter().enumerate() {
             insert_pair(
                 &mut map,
+                &mut origins,
                 pair,
                 &format!("--tenant-token (position {})", i + 1),
             )?;
@@ -4508,6 +4532,7 @@ impl Cli {
                 }
                 insert_pair(
                     &mut map,
+                    &mut origins,
                     line,
                     &format!("line {} in --tenant-token-file {}", i + 1, path.display()),
                 )?;
@@ -4748,6 +4773,10 @@ impl Cli {
                 "--oidc-issuer and --oidc-jwks-url must be set together to enable OIDC auth"
             ),
         };
+
+        if self.oidc_ddl_claim.as_deref() == Some("") {
+            anyhow::bail!("--oidc-ddl-claim must be non-empty");
+        }
 
         if oidc.is_none() {
             if self.oidc_tenant_claim.is_some() {
@@ -14617,20 +14646,32 @@ mod tests {
         assert_eq!(tokens.get("dev"), Some(&TenantId::new("acme")));
     }
 
-    /// Every suffix other than exactly `;ddl`, and an empty tenant before the
-    /// `;`, refuses startup, naming the source position and never the pair's
-    /// text (the file source's text is the bearer token itself). A wrong
-    /// implementation that accepts any suffix, or is case-insensitive, fails
-    /// one of these.
+    /// Every refusal path (argv and file; bad suffix, empty tenant, missing
+    /// `=`, conflicting duplicate) names the source position and echoes
+    /// neither the token nor the tenant. The token and tenant are distinctive
+    /// strings checked separately, so an implementation that echoes only the
+    /// token (or only the tenant) fails, which a whole-pair check would miss.
     #[test]
-    fn tenant_token_ddl_suffix_variants_are_refused() {
-        for bad in [
-            "dev=acme;DDL",
-            "dev=acme;admin",
-            "dev=acme;",
-            "dev=;ddl",
-            "dev=;",
-        ] {
+    fn tenant_token_refusals_never_echo_token_or_tenant() {
+        const TOKEN: &str = "TOKSECRET9f3c";
+        const TENANT: &str = "TENSECRET7a1d";
+        let bad_pairs = [
+            format!("{TOKEN}={TENANT};DDL"),
+            format!("{TOKEN}={TENANT};admin"),
+            format!("{TOKEN}={TENANT};"),
+            format!("{TOKEN}=;ddl"),
+            format!("{TOKEN}=;"),
+            format!("{TOKEN}="),
+            format!("{TOKEN}{TENANT}"),
+        ];
+        let assert_no_echo = |msg: &str, what: &str| {
+            assert!(!msg.contains(TOKEN), "{what}: message echoes token: {msg}");
+            assert!(
+                !msg.contains(TENANT),
+                "{what}: message echoes tenant: {msg}"
+            );
+        };
+        for bad in &bad_pairs {
             let err = match cli(&["--tenant-token", bad]).parse_tenant_principals() {
                 Err(e) => e,
                 Ok(_) => panic!("'{bad}' must refuse startup, not parse silently"),
@@ -14638,13 +14679,146 @@ mod tests {
             let msg = err.to_string();
             assert!(
                 msg.contains("--tenant-token (position 1)"),
-                "'{bad}': error must name the flag position, got: {msg}"
+                "argv: error must name the flag position, got: {msg}"
             );
+            assert_no_echo(&msg, "argv");
+
+            let file = tempfile::NamedTempFile::new().expect("temp token file");
+            std::fs::write(file.path(), format!("{bad}\n")).expect("write token file");
+            let err = match cli(&[
+                "--tenant-token-file",
+                file.path().to_str().expect("utf8 path"),
+            ])
+            .parse_tenant_principals()
+            {
+                Err(e) => e,
+                Ok(_) => panic!("'{bad}' in a file must refuse startup"),
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("line 1"), "file: must name the line: {msg}");
+            assert_no_echo(&msg, "file");
+        }
+
+        // Conflicting duplicates: different tenant, and different capability.
+        let file = tempfile::NamedTempFile::new().expect("temp token file");
+        std::fs::write(file.path(), format!("{TOKEN}=other\n")).expect("write");
+        let path = file.path().to_str().expect("utf8 path").to_string();
+        for (first, second) in [
+            (format!("{TOKEN}={TENANT}"), format!("{TOKEN}=other")),
+            (format!("{TOKEN}={TENANT}"), format!("{TOKEN}={TENANT};ddl")),
+            (format!("{TOKEN}={TENANT};ddl"), format!("{TOKEN}={TENANT}")),
+        ] {
+            let err = match cli(&["--tenant-token", &first, "--tenant-token", &second])
+                .parse_tenant_principals()
+            {
+                Err(e) => e,
+                Ok(_) => panic!("'{first}' vs '{second}' must refuse startup"),
+            };
+            let msg = err.to_string();
             assert!(
-                !msg.contains(bad),
-                "'{bad}': error must never echo the pair's text, got: {msg}"
+                msg.contains("position 1") && msg.contains("position 2"),
+                "duplicate refusal must name both positions: {msg}"
+            );
+            assert_no_echo(&msg, "argv duplicate");
+        }
+        let err = match cli(&[
+            "--tenant-token",
+            &format!("{TOKEN}={TENANT}"),
+            "--tenant-token-file",
+            &path,
+        ])
+        .parse_tenant_principals()
+        {
+            Err(e) => e,
+            Ok(_) => panic!("argv vs file conflict must refuse startup"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("position 1") && msg.contains("line 1"),
+            "flag/file duplicate refusal must name both positions: {msg}"
+        );
+        assert_no_echo(&msg, "file duplicate");
+    }
+
+    /// A token repeated with the same tenant and capability is accepted; the
+    /// same token with a different tenant or capability is refused, so grant or
+    /// deny never depends on flag or line order.
+    #[test]
+    fn tenant_token_duplicates_identical_accepted_conflicting_refused() {
+        let same = cli(&[
+            "--tenant-token",
+            "dev=acme;ddl",
+            "--tenant-token",
+            "dev=acme;ddl",
+        ])
+        .parse_tenant_principals()
+        .expect("identical duplicate is accepted");
+        assert_eq!(same.len(), 1);
+        assert!(same["dev"].ddl);
+
+        for args in [
+            [
+                "--tenant-token",
+                "dev=acme",
+                "--tenant-token",
+                "dev=acme;ddl",
+            ],
+            [
+                "--tenant-token",
+                "dev=acme;ddl",
+                "--tenant-token",
+                "dev=acme",
+            ],
+            ["--tenant-token", "dev=acme", "--tenant-token", "dev=beta"],
+        ] {
+            assert!(
+                cli(&args).parse_tenant_principals().is_err(),
+                "{args:?} must be refused"
             );
         }
+    }
+
+    /// Fold tenants, the federation mapping guard and the resolver all derive
+    /// from one parse: the tenant map equals the principals' tenants, with and
+    /// without `;ddl` entries.
+    #[test]
+    fn tenant_map_is_derived_from_the_same_principals() {
+        for args in [
+            vec!["--tenant-token", "a=acme", "--tenant-token", "b=beta"],
+            vec!["--tenant-token", "a=acme;ddl", "--tenant-token", "b=beta"],
+        ] {
+            let principals = cli(&args).parse_tenant_principals().expect("parses");
+            let tenants = tenant_map(&principals);
+            assert_eq!(tenants.len(), principals.len());
+            for (token, principal) in &principals {
+                assert_eq!(tenants.get(token), Some(&principal.tenant));
+            }
+            assert_eq!(
+                tenants,
+                cli(&args).parse_tenant_tokens().expect("parses"),
+                "parse_tenant_tokens is the tenant view of the principals"
+            );
+        }
+    }
+
+    #[test]
+    fn oidc_ddl_claim_empty_fails_startup() {
+        let err = cli(&[
+            "--oidc-issuer",
+            "https://issuer.example",
+            "--oidc-jwks-url",
+            "https://issuer.example/jwks",
+            "--oidc-audience",
+            "ravel",
+            "--oidc-ddl-claim",
+            "",
+        ])
+        .parse_auth_resolvers()
+        .expect_err("an empty --oidc-ddl-claim fails startup");
+        assert!(
+            err.to_string().contains("--oidc-ddl-claim"),
+            "error names the flag: {err}"
+        );
     }
 
     #[test]
