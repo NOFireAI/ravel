@@ -896,17 +896,20 @@ pub struct S3Store {
     store_time: Arc<ObservedStoreTime>,
     /// The read-only bucket-protection control plane (ADR-1727 decision 1). Signs
     /// its own SigV4 GETs with the same credential provider this store holds, so
-    /// there is no second credential path. Nothing in the shipping binaries calls
-    /// it yet: `ravel-cli store verify-protection` (task 2) and the server startup
-    /// gate (task 3) are what reach it.
+    /// there is no second credential path. `ravel-cli store qualify` and
+    /// `ravel-cli store verify-protection` reach it through the concrete store;
+    /// the server's startup gate still probes through `dyn ObjectStoreBackend`
+    /// and does not.
     control_plane: Arc<BucketControlPlaneClient>,
 }
 
 impl S3Store {
     /// Build with the deliberate [`S3HttpConfig::default`] HTTP-client tuning
-    /// (#851). Every current caller uses this; it sets the request/connect/
-    /// pool-idle timeouts and HTTP/2 keep-alive explicitly rather than
-    /// inheriting `object_store`'s defaults.
+    /// (#851). It sets the request/connect/pool-idle timeouts and HTTP/2
+    /// keep-alive explicitly rather than inheriting `object_store`'s defaults.
+    /// `ravel-server` and `ravel-cli` build their stores through the
+    /// `with_http_config*` constructors instead, to apply their checksum
+    /// flags.
     pub fn new(config: S3Config) -> Result<Self, StoreError> {
         Self::with_http_config(config, S3HttpConfig::default())
     }
@@ -1256,9 +1259,10 @@ impl S3Store {
 // `S3Store` answers all three probe seams affirmatively from its own read-only
 // SigV4 GETs, while the `dyn ObjectStoreBackend` impls in `conformance.rs` stay
 // as they are (every field `Unknown`). `ObjectStoreBackend` itself is unchanged.
-// The shipping binaries do not reach these yet: `ravel-cli store qualify` and
-// the server's startup gate both probe through `dyn ObjectStoreBackend`, so
-// they report `Unknown` until they are handed the concrete store.
+// `ravel-cli store qualify` and `ravel-cli store verify-protection` reach these
+// through the concrete store. The server's startup gate still probes through
+// `dyn ObjectStoreBackend`, so it reports `Unknown` until it is handed the
+// concrete store.
 
 #[async_trait::async_trait]
 impl crate::conformance::BucketControlPlane for S3Store {

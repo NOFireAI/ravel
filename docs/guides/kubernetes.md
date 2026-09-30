@@ -250,8 +250,8 @@ A minimal example is in
 | `spec.storage.s3.region` | string | `us-east-1` | |
 | `spec.storage.s3.endpoint` | string | none | Omit for real AWS S3. Path-style addressing is always used. |
 | `spec.storage.s3.allowHttp` | boolean | `false` | Renders `--s3-allow-http` on every server container, and `RAVEL_S3_ALLOW_HTTP=true` on the store-qualification Job that runs `ravel-cli store qualify` before any server pod exists. Required when `endpoint` is a plaintext `http://` URL whose host is not loopback: no pod reaches its object store over loopback, so without it the operator refuses the cluster at render time (`Degraded`, reason `PlaintextS3Endpoint`, message naming this field) and creates no Deployment, Service, or qualify Job, rather than moving telemetry and S3 credentials across the cluster network in the clear. The same rule governs the operator's own S3 client, the one that reconciles `sys/auth` and applies `shardOverrides`. Editing this field re-runs store qualification, since it changes whether that check can reach the store. Leave unset for an `https://` endpoint and for real AWS S3. |
-| `spec.storage.s3.uploadIntegrity` | string | `crc64nvme` | `crc64nvme`, `sha256`, or `off`: the server-verified checksum every PUT carries. Renders `--s3-upload-integrity` on every server container only when it is not `crc64nvme`, which is the server's own default, and sets the same on the operator's own S3 client. Set `off` only for an endpoint that rejects the checksum header; see [Upload and read checksums](operations/configuration.md#upload-and-read-checksums). Store qualification does not exercise it, so a passing qualification Job does not show that the endpoint accepts the header. |
-| `spec.storage.s3.requestStoredChecksum` | boolean | `true` | Whether requests ask the endpoint for the checksum it stored, so full-object reads are verified. `false` renders `--s3-request-stored-checksum=false` on every server container and applies to the operator's own S3 client; every full-object read is then counted in `ravel_store_get_unverified_total`. |
+| `spec.storage.s3.uploadIntegrity` | string | `crc64nvme` | `crc64nvme`, `sha256`, or `off`: the server-verified checksum every PUT carries. Renders `--s3-upload-integrity` on every server container only when it is not `crc64nvme`, which is the server's own default, and sets the same on the operator's own S3 client. Set `off` only for an endpoint that rejects the checksum header; see [Upload and read checksums](operations/configuration.md#upload-and-read-checksums). The store-qualification Job always carries the value as `RAVEL_S3_UPLOAD_INTEGRITY` and PUTs with it, so an endpoint that rejects the header fails qualification, and editing this field re-runs it. |
+| `spec.storage.s3.requestStoredChecksum` | boolean | `true` | Whether requests ask the endpoint for the checksum it stored, so full-object reads are verified. `false` renders `--s3-request-stored-checksum=false` on every server container and applies to the operator's own S3 client; every full-object read is then counted in `ravel_store_get_unverified_total`. The store-qualification Job always carries the value as `RAVEL_S3_REQUEST_STORED_CHECKSUM`, and editing this field re-runs it. |
 | `spec.storage.s3.credentialsSecretRef.name` | string | required | Secret with keys `accessKeyId` and `secretAccessKey`. |
 | `spec.tenantTokensSecretRef.name` | string | none | Secret whose keys are tenant names and whose values are bearer tokens. |
 | `spec.deploymentKeySecretRef.name` | string | none | Secret with one key, `key` (64 hex characters or 32 raw bytes): the deployment key. Enables the keyed tenant hash and `sys/auth` bearer-token reconciliation, see "`sys/auth` ownership" below. Omit to leave both off. |
@@ -430,8 +430,8 @@ out": wait for `StoreQualified=True` at
 can report ready before any pod has moved to the new spec.
 
 The Job is recreated only when its inputs change: the bucket, region,
-endpoint, server image, or the shared credentials Secret's name or
-`resourceVersion`. Rotating that Secret in place bumps its `resourceVersion`,
+endpoint, `allowHttp`, `uploadIntegrity`, `requestStoredChecksum`, server
+image, or the shared credentials Secret's name or `resourceVersion`. Rotating that Secret in place bumps its `resourceVersion`,
 so a rotation to credentials that no longer pass qualification re-qualifies
 too, within one resync interval; an unrelated spec edit (a replica count, a
 fold interval) does not. Qualification itself stays once-per-bucket: passing
@@ -439,9 +439,10 @@ it durably records `sys/qualification` in the bucket, so a qualified bucket
 handed to a new `RavelCluster` with the same inputs still gets its own Job
 run (the gate reads this `RavelCluster`'s own status, not the bucket record).
 That run re-runs the full conformance suite rather than short-circuiting on
-the existing record: the suite issues dozens of object operations against
-the bucket, several of them concurrent rather than sequential, so the Job
-can sit for minutes even on a bucket you know is qualified. It passes if the
+the existing record: at its default list page size the run issues about two
+thousand object operations against the bucket, almost all of them
+sequential, so the Job can sit for minutes even on a bucket you know is
+qualified. It passes if the
 backend still satisfies the contract, and the final `sys/qualification`
 write is then a no-op, unless the stored record predates this binary's
 suite version, in which case the run overwrites it in place and reports

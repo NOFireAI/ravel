@@ -44,7 +44,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   nothing. A
   `--list-page-size` against S3 builds the store with that page size and the
   selected checksum settings together, through the new
-  `S3Store::with_http_config_and_page_size`.
+  `S3Store::with_http_config_and_page_size`. The operator's store
+  qualification Job now always sets `RAVEL_S3_UPLOAD_INTEGRITY` and
+  `RAVEL_S3_REQUEST_STORED_CHECKSUM` from the cluster's
+  `spec.storage.s3.uploadIntegrity` and `requestStoredChecksum`, and both
+  fields join the qualification input hash, so editing either re-runs
+  qualification and every existing cluster re-qualifies once after the
+  operator upgrade. The Job's `activeDeadlineSeconds` rises from 1400 to 2362
+  to fit a slow but healthy run and its retry.
 - **The RLOG writer now chooses each i64 and string page's encoding by its stored size, and writes encoding tags 10 (GCD i64) and 11 (an `observed_ts` equal to `ts`, stored as a reference to it)** (ADR-2135 decisions 3 and 4, issue #2140); no i64 or string page stores more bytes than the encoding chosen before (a very small object can still grow by a few bytes, because a PAGE_DIR whose `ts` and `observed_ts` entries used to be identical compresses worse), each candidate encoding of a page is compressed at most once (up to six candidates for an i64 page, two for a string page), and the reader decodes both tags.
 - **`s3_e2e_bench` counts adaptive-age flushes** (issue #2186). Its printed
   flush breakdown gains an `age_adaptive=` field between `age=` and
