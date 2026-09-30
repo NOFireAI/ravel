@@ -1267,9 +1267,11 @@ Labels: `mode`.
 
 ### Maintenance safety (`ravel_maintain_legal_hold_*`, `ravel_maintain_conservation_*`, `ravel_maintain_orphan*`, `ravel_maintain_l0_records_pending`, `ravel_maintain_objects_deleted_total`, `ravel_maintain_bytes_reclaimed_total`, `ravel_maintain_retention_lag_seconds`)
 
-Labels: `mode`, plus `signal` on every series except the legal-hold counter
-(`mode` only) and `ravel_maintain_objects_deleted_total`, which carries `mode`
-and `kind` and no `signal`. These carry no `tenant_hash` label.
+Labels: `mode`, plus `signal` on every series except
+`ravel_maintain_legal_hold_refresh_failures_total` (`mode` only) and
+`ravel_maintain_objects_deleted_total`, which carries `mode` and `kind` and no
+`signal`. `ravel_maintain_superseded_inputs_held_total` adds
+`reason` to `mode` and `signal`. These carry no `tenant_hash` label.
 
 | Metric | Meaning |
 |---|---|
@@ -1279,12 +1281,15 @@ and `kind` and no `signal`. These carry no `tenant_hash` label.
 | `ravel_maintain_bytes_reclaimed_total` | Bytes of deleted objects reclaimed by the sweep, by signal. Counts only the quarantine reaper and the unreferenced-part delete, whose object sizes the sweep already listed; superseded and retention deletions are excluded because they delete by key without a listed size, so this is a lower bound. Per process. |
 | `ravel_maintain_retention_lag_seconds` | Gauge. How far past its retention deadline the oldest still-present expired bucket is, by signal, from this process's most recent completed cycle. 0 when none. A per-cycle maximum over the process's units, so it names the single worst bucket. |
 | `ravel_maintain_conservation_aborts_total` | Compaction publishes aborted by the record-count conservation gate, by signal. |
-| `ravel_maintain_orphan_breaker_tripped_total` | Orphan-GC mass-orphan circuit breaker trips, by signal. Also carries `signal="alerts"` and `signal="audit"` for the alerts shard's orphan sweep and the query-audit shard's input-cleanup sweep, which run outside the maintained signals; the other per-signal series here cover only metrics, logs and spans. |
+| `ravel_maintain_orphan_breaker_tripped_total` | Orphan-GC mass-orphan circuit breaker trips, by signal. Also carries `signal="alerts"` and `signal="audit"` for the alerts shard's orphan sweep and the query-audit shard's input-cleanup sweep, which run outside the maintained signals. The superseded refusal counter and the two superseded hold families below carry those two signals as well; every other per-signal series here covers only metrics, logs and spans. |
 | `ravel_maintain_orphans_withheld` | Gauge. Orphan candidates withheld by the last completed orphan pass, by signal. |
 | `ravel_maintain_orphans_present` | Gauge. Orphan candidates the last completed orphan pass found, by signal, whether or not the breaker tripped. |
 | `ravel_maintain_orphans_quarantined_total` | Orphan candidates moved from the live L0 set to the quarantine prefix, by signal. |
 | `ravel_maintain_orphans_quarantine_refused_total` | Orphan candidates whose copy to the quarantine prefix failed, by signal; the live object was left in place rather than deleted without a copy. |
-| `ravel_maintain_superseded_deletes_refused_total` | Superseded-input deletes the store refused (access denied, a failed precondition, or a permanent error), by signal. The refusing supersession chain keeps its remaining keys for a later pass and the pass still succeeds. |
+| `ravel_maintain_superseded_deletes_refused_total` | Superseded-input deletes the store refused (access denied, a failed precondition, or a permanent error), by signal. The refusing supersession chain keeps its remaining keys for a later pass and the pass still succeeds. Also carries `signal="alerts"` and `signal="audit"`; the alerts sample reads zero today, because nothing compacts or rewrites the alerts shard, so it has no supersession chain. |
+| `ravel_maintain_superseded_inputs_held_total` | Superseded objects the superseded-input sweep held instead of deleting, by signal and `reason`, counted once per pass that holds them. Objects a legal hold protects are not counted here; `ravel_maintain_superseded_groups_held_by_legal_hold_total` counts them, in chain groups. `reason="named"`: the live catalog HEAD snapshot still names the object. `reason="unreadable_head"`: HEAD or a covering snapshot part is present and cannot be read. Also carries `signal="alerts"`, which reads zero today for the same reason, and `signal="audit"`. |
+| `ravel_maintain_superseded_groups_held_by_legal_hold_total` | Supersession chain groups the superseded-input sweep skipped whole because a legal hold protects a key in them, by signal, counted once per pass that skips them. Also carries `signal="alerts"`, which reads zero today for the same reason, and `signal="audit"`. |
+| `ravel_maintain_dreq_held_by_superseded_inputs_total` | Erasure requests (`.dreq`) the erasure-request sweep kept past their protection horizon, by signal, counted once per tick that keeps them. The sweep decides from its own observing pass of the superseded-input sweep, which deletes nothing and covers every hour and every chain whatever its age. It keeps a `.dreq` when that pass held a chain group naming the request, or when it held a chain it could not walk to the end anywhere in the signal, which keeps every `.dreq` past its horizon. |
 | `ravel_maintain_quarantine_reaped_total` | Objects physically deleted from the quarantine prefix past the quarantine horizon, by signal. |
 
 [Troubleshooting](operations/troubleshooting.md) gives the alert rules and the
@@ -1313,8 +1318,64 @@ refuses again.
 superseded-input sweep. A refused delete stops only the supersession chain it
 belongs to, and a pass with at least one successful delete still succeeds, so
 the unit's tick is not recorded as failed and this counter is where a deny
-policy on part of the keyspace shows. Alert on `increase(...) > 0`: the next
-pass over that hour retries the chain and is refused again.
+policy on part of the keyspace shows. Alert on `increase(...[6h]) > 0`, not
+over a shorter window: the next pass over that hour retries the chain and is
+refused again, but for an interior hour that next pass is the next full sweep
+(below).
+
+The three hold counters beside it count what the sweep kept rather than what it
+failed to delete, and each pass that holds an object counts it again, so read
+how much they grew over a window, not their total. Which passes count a hold
+depends on the hour:
+
+- Most maintain ticks run the zoned sweep, which lists only head and tail
+  hours. On the default horizons a head hour never produces a hold: its
+  chains are younger than the protection horizon, and the sweep skips those
+  before the hold gate. A deployment whose head zone (`max_flush_lifetime`
+  plus clock skew plus one hour) outlasts its protection horizon does see
+  head-hour holds, on every tick.
+- A tail hour exists only under a retention policy, from the hour's retention
+  expiry through the protection horizon past it. A hold there counts on every
+  tick.
+- An interior hour, which is where a lagging fold's holds sit, is swept only on
+  the full-sweep cadence (`interior_reverify_ns`, 6 hours by default). Its
+  holds count once per full sweep, so a rate spikes every 6 hours and reads zero
+  between.
+- The query-audit shard is swept whole on every maintain tick of the process
+  that owns it, so its holds count on every tick.
+
+Read these counters with `increase(...[6h])`, or over a window at least as long
+as `interior_reverify_ns` where that is set longer, rather than as a rate; the
+standalone dashboard plots them that way. A nonzero
+`ravel_maintain_superseded_inputs_held_total{reason="named"}` increase is the
+ordinary lagging-fold case: a snapshot part the fold has not reconciled still
+names superseded inputs, and they are collected once the fold reconciles that
+hour or HEAD is rebuilt. It needs attention only when it keeps growing across
+many folds, which means the hour lies outside the fold's reconcile window and
+HEAD needs a rebuild.
+Any sustained growth on `reason="unreadable_head"` needs an operator: HEAD or a
+snapshot part is present and cannot be read, so the sweep holds every
+superseded input it gates, fail-closed, until the catalog object is repaired or
+HEAD is rebuilt. `ravel_maintain_superseded_groups_held_by_legal_hold_total`
+is expected while a legal hold covers the shard and stops growing when the hold
+is lifted; growth with no hold in force points at a hold nobody meant to keep.
+
+`ravel_maintain_dreq_held_by_superseded_inputs_total` counts erasure requests
+whose query-time exclusion filter stays in force past their horizon. The
+subject stays hidden from queries meanwhile, but the `.dreq`, which carries the
+subject identifier, outlives its horizon. This counter does not trace back to
+the three hold counters or the refusal counter. The erasure-request sweep
+decides from its own observing pass of the superseded-input sweep, which
+deletes nothing, runs on every tick while a `.dreq` is past its horizon, and
+covers every hour and every chain whatever its age, while the three hold
+counters come from deleting passes. A `.dreq` can therefore be held while all
+three stay flat, and a refused delete never holds one. The sweep holds a
+`.dreq` when its observing pass held a chain group naming the request, or when
+that pass held a chain it could not walk to the end anywhere in the signal,
+which holds every `.dreq` past its horizon at once. Its WARN line,
+`erasure-request sweep: holding a .dreq past its horizon`, names the request
+and carries how many requests and truncated buckets the observing pass held,
+which is where to start.
 
 `ravel_maintain_l0_records_pending` is a per-process total, not a per-bucket or
 per-tenant one: one maintenance cycle (default 300 s) sums every sealed bucket

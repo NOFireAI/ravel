@@ -689,6 +689,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reached, so "could not verify" never exits `0`. A usage error also exits
   `2`, and so does a report that could not be written to stdout. A reader
   that closes the pipe early does not change the exit code. It is read-only.
+- **`/metrics` exports the superseded-input sweep's hold counters** (issue
+  #2221). `ravel_maintain_superseded_inputs_held_total{reason="named"|"unreadable_head"}`
+  counts superseded objects the sweep held because HEAD still names them or
+  cannot be read, `ravel_maintain_superseded_groups_held_by_legal_hold_total`
+  counts chain groups a legal hold skipped, and
+  `ravel_maintain_dreq_held_by_superseded_inputs_total` counts erasure
+  requests the erasure-request sweep kept past their horizon because its own
+  observing pass held a chain naming the request or a truncated chain in the
+  signal, all by `mode` and `signal`. `SweepReport` carries the three rule-2 counts. The
+  alerts and query-audit shards' superseded refusals and holds now reach
+  `ravel_maintain_superseded_deletes_refused_total` and the hold families
+  under `signal="alerts"` and `signal="audit"`; the alerts samples read zero
+  today, since nothing compacts or rewrites the alerts shard. An interior hour
+  is swept only on the full-sweep cadence (`interior_reverify_ns`, 6 h by
+  default), so the refusal and hold counters are read with `increase()` over
+  at least that interval rather than as a rate. `ravel-cli maintain sweep`
+  prints the refusal and hold counts, and the standalone Grafana dashboard's
+  reclaim and safety brakes panel graphs all four families as increase over
+  6 h.
 - **`--audit-retention` sets the query-audit retention window** (ADR-0062
   decision 2c, ADR-1688, issue #2126). The server built its compactor with
   the compiled-in 90-day audit window and no way to change it. The flag takes
