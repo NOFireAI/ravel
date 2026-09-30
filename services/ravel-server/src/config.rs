@@ -4498,7 +4498,7 @@ impl Cli {
                 if *existing != principal {
                     let first = origins.get(token).map(String::as_str).unwrap_or("?");
                     anyhow::bail!(
-                        "conflicting tenant token: the token at {ctx} is also defined at                              {first} with a different tenant or ddl capability"
+                        "conflicting tenant token: the token at {ctx} is also defined at {first} with a different tenant or ddl capability"
                     );
                 }
                 return Ok(());
