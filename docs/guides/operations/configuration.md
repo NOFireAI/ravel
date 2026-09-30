@@ -698,13 +698,14 @@ Query-audit records have their own window, independent of tenant data
 retention. `--audit-retention <duration>` sets the age past which the
 maintenance loop deletes a query-audit record, measured from the newest event
 the record logs; the default is `90d`. Set it to your audit retention
-obligation. `0` keeps every query-audit record forever. A nonzero window must be
-at least one hour plus the compactor's seal margin (`--gc-max-flush-lifetime`
-plus the 5 minute clock-skew allowance, so `2h 5m` on the defaults); a shorter
-window fails startup. A legal hold covering the query-audit shard blocks the
-delete whatever the window. Like the tenant retention flags, it takes effect
-only in `--mode maintain`, but a nonzero window below the floor fails startup
-in every mode.
+obligation. `0` keeps every query-audit record forever. Any nonzero window is
+accepted: every flush writes its own immutable record, and the sweep deletes a
+record only once every event in it is older than the window, so a short window
+never deletes an event younger than itself. A record is also kept until it is
+past the protection horizon, so a window shorter than the horizon behaves as
+the horizon. A legal hold covering the query-audit shard blocks the delete
+whatever the window. Like the tenant retention flags, it takes effect only in
+`--mode maintain`, but an unparseable value fails startup in every mode.
 
 ## Tenancy setup
 

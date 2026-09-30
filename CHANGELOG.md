@@ -575,10 +575,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   decision 2c, ADR-1688, issue #2126). The server built its compactor with
   the compiled-in 90-day audit window and no way to change it. The flag takes
   a humantime duration and defaults to `90d`, so a deployment that does not
-  set it sweeps exactly as before. `0` keeps every query-audit record. A
-  nonzero window below one hour plus the compactor's seal margin
-  (`--gc-max-flush-lifetime` plus the clock-skew allowance, `2h 5m` on the
-  defaults) is refused at startup, in the same shape as `--alert-retention`.
+  set it sweeps exactly as before. `0` keeps every query-audit record. Any
+  nonzero window is accepted, since the sweep deletes a whole immutable record
+  only once its newest event is older than the window; an unparseable value
+  is refused at startup, before the server writes to the bucket.
 - **A read-only bucket-protection control plane in `ravel-object-store`**
   (ADR-1727 follow-up task 1, issue #1727). `S3Store` can now report, per
   condition, whether the bucket's protection configuration is Pass, Fail, or
