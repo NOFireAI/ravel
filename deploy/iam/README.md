@@ -93,7 +93,7 @@ two sentences of the same bullet: "Query and Maintain gain read on `del/**`
 `del/*.dreq` **only**" with "`del/*.done` joins the deny-delete set for every
 role including Maintain".
 
-The erasure-request sweep is `sweep_erasure_requests_inner` in
+The erasure-request sweep is `sweep_erasure_requests` in
 `crates/ravel-maintain/src/sweep.rs`. It runs under the Maintain role and
 retires a request object at
 `t/<tenant_hash>/<signal>/del/<request_id>.dreq` once its erasure is complete,
