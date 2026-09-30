@@ -226,8 +226,8 @@ impl RlogWriter {
     /// `(stream_ref, ts)` order and still records `generation`, which is how
     /// a cleared key is written. The build refuses, with
     /// [`LogSegError::InvalidSortDescriptor`], a descriptor with generation 0,
-    /// with no key or more than four, with an empty or repeated key name, or
-    /// naming a key no record carries as a per-record attribute of its type.
+    /// with no key or more than four, or with an empty or repeated key name. A
+    /// key no record has a value for is accepted and orders nothing.
     pub fn with_sort_descriptor(
         mut self,
         descriptor: Option<SortDescriptor>,
@@ -422,20 +422,16 @@ impl RlogWriter {
         // per-record layer only (ADR-2135 decision 1).
         let key_values: Vec<Vec<Option<KeyValue>>> = match &cluster {
             None => Vec::new(),
-            Some(order) => {
-                let values: Vec<Vec<Option<KeyValue>>> = order
-                    .keys
-                    .iter()
-                    .map(|(name, ty)| {
-                        self.records
-                            .iter()
-                            .map(|r| record_key_value(&r.attrs, name, *ty))
-                            .collect()
-                    })
-                    .collect();
-                check_keys_carried(order, &values, &streams)?;
-                values
-            }
+            Some(order) => order
+                .keys
+                .iter()
+                .map(|(name, ty)| {
+                    self.records
+                        .iter()
+                        .map(|r| record_key_value(&r.attrs, name, *ty))
+                        .collect()
+                })
+                .collect(),
         };
 
         // The caller's indexed-field list (docs/adrs/0049-rlog-postings.md
@@ -1022,11 +1018,7 @@ impl RlogWriter {
         // first per-record occurrence the row path reads.
         let key_values: Vec<Vec<Option<KeyValue>>> = match &cluster {
             None => Vec::new(),
-            Some(order) => {
-                let values = columnar_key_values(order, batches, &bases, total_rows);
-                check_keys_carried(order, &values, &streams)?;
-                values
-            }
+            Some(order) => columnar_key_values(order, batches, &bases, total_rows),
         };
 
         let indexed_names: std::collections::HashSet<&str> =
@@ -2854,37 +2846,6 @@ fn columnar_key_values(
             values
         })
         .collect()
-}
-
-/// Refuses an order with a key no record carries as a per-record attribute of
-/// its declared type: such a key orders nothing, and a value on the stream
-/// layer is not a per-record value.
-fn check_keys_carried(
-    order: &ClusterOrder,
-    key_values: &[Vec<Option<KeyValue>>],
-    streams: &BTreeMap<LogStreamId, &[u8]>,
-) -> Result<(), LogSegError> {
-    for ((name, ty), values) in order.keys.iter().zip(key_values) {
-        if values.iter().any(Option::is_some) {
-            continue;
-        }
-        let mut stream_level = false;
-        for blob in streams.values() {
-            if stream_attr_pairs(blob)?.iter().any(|(k, _)| k == name) {
-                stream_level = true;
-                break;
-            }
-        }
-        return Err(LogSegError::InvalidSortDescriptor(format!(
-            "key column {name:?} of type {ty:?} is not a per-record attribute of any record{}",
-            if stream_level {
-                " (it is a stream-level attribute only)"
-            } else {
-                ""
-            }
-        )));
-    }
-    Ok(())
 }
 
 /// The clustered row order (ADR-2135 decision 1) as a permutation of row
