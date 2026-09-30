@@ -26,7 +26,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::file::metadata::ParquetMetaDataReader;
 use parquet::file::properties::WriterProperties;
-use ravel_cache::{Cache, CacheLimits};
+use ravel_cache::{Cache, CacheLimits, DiskCache, TieredCache};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
@@ -204,6 +204,24 @@ impl Fixture {
             services: ReadServices {
                 limiter: Arc::new(GetLimiter::new(4).expect("limiter")),
                 cache: Some(ReadCache::Ram(Arc::new(cache))),
+                metadata: Arc::new(MetadataCache::new(8 << 20)),
+            },
+            registered: Arc::new(TenantParquetStore::new(TENANT)),
+            limits: ReadLimits::unlimited(),
+        }
+    }
+
+    /// Like [`Self::new`], but the read cache is a `Tiered` RAM-over-disk
+    /// cache with its disk tier rooted at `dir`, which the caller keeps alive
+    /// for as long as the fixture is used.
+    pub(crate) fn new_tiered(store: Arc<dyn ObjectStoreBackend>, dir: &std::path::Path) -> Self {
+        let ram = Cache::new(CacheLimits::new(64 << 20, 4096, 8 << 20));
+        let disk = DiskCache::new(dir.to_path_buf(), CacheLimits::new(64 << 20, 4096, 8 << 20));
+        Fixture {
+            store,
+            services: ReadServices {
+                limiter: Arc::new(GetLimiter::new(4).expect("limiter")),
+                cache: Some(ReadCache::Tiered(Arc::new(TieredCache::new(ram, disk)))),
                 metadata: Arc::new(MetadataCache::new(8 << 20)),
             },
             registered: Arc::new(TenantParquetStore::new(TENANT)),
