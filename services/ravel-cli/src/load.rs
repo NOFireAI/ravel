@@ -4270,9 +4270,10 @@ fn dictionary_key(arr: &ArrayRef, row: usize) -> Result<usize, String> {
 
 #[cfg(test)]
 thread_local! {
-    /// Columns [`resolve_dictionary_column`] has resolved on this thread, for
-    /// the test that pins one resolution per dictionary column per batch. A
-    /// thread local rather than a global: tests share a process.
+    /// Dictionary columns resolved once for a batch on this thread, by
+    /// [`resolve_dictionary_column`] or [`MapChild::resolve`], for the tests
+    /// that pin one resolution per dictionary column per batch. A thread local
+    /// rather than a global: tests share a process.
     static DICT_COLUMNS_RESOLVED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// The same for [`dictionary_key`], which is the per-cell cost.
     static DICT_CELL_KEYS_RESOLVED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -7307,6 +7308,69 @@ fn check_attrs_map_column(data_type: &DataType, column: &str) -> Result<(), Stri
     ))
 }
 
+/// One resolved child of a batch's `attrs_map_column`, read in place by
+/// [`MapChild::read`].
+///
+/// Resolving a dictionary child by copying its values (arrow's `take`)
+/// overflows i32 offsets once the referenced bytes pass the offset range and
+/// fails the whole batch, where reading the values in place drops and counts an
+/// over-cap entry exactly as the non-dictionary path does. So a dictionary
+/// child is kept as it is, with its `normalized_keys` computed once for the
+/// batch, and each entry indexes the dictionary's values at its key.
+enum MapChild {
+    /// Read by [`read_str`] in place: a plain `Utf8`/`LargeUtf8` child, or a
+    /// dictionary child whose dictionary is empty. The empty one is left
+    /// unresolved so an entry naming a value in it is refused on its own row
+    /// with [`EMPTY_DICTIONARY`]; [`dictionary_key`] refuses it before
+    /// `normalized_keys`, which asserts a non-empty values array.
+    Raw(ArrayRef),
+    /// A dictionary child kept as it is, with the per-batch key vector its
+    /// entries index its values by, computed once here rather than per entry
+    /// (`normalized_keys` builds a key vector the size of the whole child, so a
+    /// per-entry call would cost O(entries^2)).
+    Dict { child: ArrayRef, keys: Vec<usize> },
+}
+
+impl MapChild {
+    /// Resolve one map child: a non-empty dictionary child keeps its values and
+    /// carries its `normalized_keys`, computed once; every other child is read
+    /// as it is. Nothing is copied.
+    fn resolve(child: &ArrayRef) -> MapChild {
+        if let DataType::Dictionary(_, value_ty) = child.data_type()
+            && is_resolvable_dictionary_value(value_ty)
+        {
+            let dict = child.as_any_dictionary();
+            if dict.values().is_empty() {
+                return MapChild::Raw(Arc::clone(child));
+            }
+            #[cfg(test)]
+            DICT_COLUMNS_RESOLVED.with(|n| n.set(n.get() + 1));
+            return MapChild::Dict {
+                child: Arc::clone(child),
+                keys: dict.normalized_keys(),
+            };
+        }
+        MapChild::Raw(Arc::clone(child))
+    }
+
+    /// The string at entry `i`, or `None` for a null entry, without copying the
+    /// dictionary's values.
+    fn read(&self, i: usize) -> Result<Option<&str>, String> {
+        match self {
+            MapChild::Raw(arr) => read_str(arr, i),
+            MapChild::Dict { child, keys } => {
+                if child.is_null(i) {
+                    return Ok(None);
+                }
+                let key = *keys
+                    .get(i)
+                    .ok_or_else(|| format!("dictionary column has no key at row {i}"))?;
+                read_str(child.as_any_dictionary().values(), key)
+            }
+        }
+    }
+}
+
 /// One batch's `attrs_map_column`, resolved once by [`SpansAttrsMap::resolve`]
 /// for every row [`read_span_attrs_map`] reads out of it.
 struct SpansAttrsMap {
@@ -7314,10 +7378,9 @@ struct SpansAttrsMap {
     column: String,
     /// The batch's map column; its offsets and nulls index `keys` and `values`.
     map: MapArray,
-    /// The map's key and value children, each dictionary child resolved to its
-    /// value type for the whole batch.
-    keys: ArrayRef,
-    values: ArrayRef,
+    /// The map's key and value children, each read in place by [`MapChild`].
+    keys: MapChild,
+    values: MapChild,
     /// Every key a mapped attribute names, with the column it reads.
     mapped_keys: std::collections::HashMap<String, String>,
 }
@@ -7325,30 +7388,13 @@ struct SpansAttrsMap {
 impl SpansAttrsMap {
     /// Resolve the map column `arr` of one batch, already checked by
     /// [`check_attrs_map_column`].
-    ///
-    /// Reading a dictionary child per entry calls `normalized_keys`, which
-    /// builds a key vector the size of the whole child, so a row's entries
-    /// would cost O(entries^2); each child is resolved once here instead, as
-    /// [`ResolvedColumns`] resolves a mapped column. A child whose dictionary
-    /// is empty is left as it is, so an entry naming a value in it is refused
-    /// on its own row with [`EMPTY_DICTIONARY`], as before; such a child has
-    /// nothing to resolve, and [`dictionary_key`] refuses it before
-    /// `normalized_keys` is reached.
     fn resolve(arr: &ArrayRef, column: &str, mapping: &SpansMapping) -> Result<Self, String> {
         let map = arr
             .as_map_opt()
             .ok_or_else(|| format!("attrs_map_column {column:?} is not a map column"))?
             .clone();
-        let resolve_child = |child: &ArrayRef| -> Result<ArrayRef, String> {
-            if matches!(child.data_type(), DataType::Dictionary(_, _))
-                && child.as_any_dictionary().values().is_empty()
-            {
-                return Ok(Arc::clone(child));
-            }
-            Ok(resolve_dictionary_column(child)?.unwrap_or_else(|| Arc::clone(child)))
-        };
-        let keys = resolve_child(map.keys())?;
-        let values = resolve_child(map.values())?;
+        let keys = MapChild::resolve(map.keys());
+        let values = MapChild::resolve(map.values());
         let mut mapped_keys = std::collections::HashMap::new();
         for (spec, _) in mapping.mapped_attributes() {
             mapped_keys
@@ -7420,9 +7466,11 @@ fn read_span_attrs_map(
     for i in start..end {
         // Before the null-value skip, so an entry with both null is refused:
         // Arrow declares a map's key field non-nullable.
-        let key = read_str(&map.keys, i)?
+        let key = map
+            .keys
+            .read(i)?
             .ok_or_else(|| format!("attrs_map_column {column:?} holds a null key"))?;
-        let Some(value) = read_str(&map.values, i)? else {
+        let Some(value) = map.values.read(i)? else {
             continue;
         };
         if let Some(mapped_column) = map.mapped_keys.get(key) {
