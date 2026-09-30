@@ -33,9 +33,30 @@ fn bearer_token(headers: &HeaderMap) -> Result<&str, AuthError> {
     raw.strip_prefix("Bearer ").ok_or(AuthError)
 }
 
+/// A resolved caller identity: the tenant a request is attributed to, and
+/// whether it may run tenant-scoped DDL (ADR-2040 decision 4, "Who may run
+/// DDL"). `ddl` is absent unless a resolver's configuration explicitly grants
+/// it; nothing consumes it yet (issue #2054 is the first reader).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Principal {
+    pub tenant: TenantId,
+    pub ddl: bool,
+}
+
 /// Resolves the tenant for an incoming request from its headers.
 pub trait TenantResolver: Send + Sync {
     fn resolve(&self, headers: &HeaderMap) -> Result<TenantId, AuthError>;
+
+    /// Resolves the full [`Principal`], including the `ddl` capability. The
+    /// default forwards to [`resolve`](Self::resolve) and reports no
+    /// capability, so a resolver that does not override this keeps its
+    /// current behavior: `ddl` is opt-in per resolver, never inferred.
+    fn resolve_principal(&self, headers: &HeaderMap) -> Result<Principal, AuthError> {
+        Ok(Principal {
+            tenant: self.resolve(headers)?,
+            ddl: false,
+        })
+    }
 }
 
 /// Tries each resolver in order, returning the first successful match.
@@ -54,6 +75,15 @@ impl TenantResolver for FallbackResolver {
         for resolver in &self.resolvers {
             if let Ok(tenant) = resolver.resolve(headers) {
                 return Ok(tenant);
+            }
+        }
+        Err(AuthError)
+    }
+
+    fn resolve_principal(&self, headers: &HeaderMap) -> Result<Principal, AuthError> {
+        for resolver in &self.resolvers {
+            if let Ok(principal) = resolver.resolve_principal(headers) {
+                return Ok(principal);
             }
         }
         Err(AuthError)
@@ -97,15 +127,27 @@ fn random_hash_key() -> [u8; 32] {
 /// matched (mirroring `ravel_catalog::auth_token_map`).
 pub struct StaticBearerTokenResolver {
     hash_key: [u8; 32],
-    tokens: HashMap<[u8; 32], TenantId>,
+    tokens: HashMap<[u8; 32], Principal>,
 }
 
 impl StaticBearerTokenResolver {
     pub fn new(tokens: HashMap<String, TenantId>) -> Self {
+        Self::with_principals(
+            tokens
+                .into_iter()
+                .map(|(token, tenant)| (token, Principal { tenant, ddl: false }))
+                .collect(),
+        )
+    }
+
+    /// Same as [`new`](Self::new), but each token carries its own [`Principal`]
+    /// (and therefore its own `ddl` capability) instead of defaulting every
+    /// token to no capability.
+    pub fn with_principals(tokens: HashMap<String, Principal>) -> Self {
         let hash_key = random_hash_key();
         let tokens = tokens
             .into_iter()
-            .map(|(token, tenant)| (token_hash(&hash_key, token.as_bytes()), tenant))
+            .map(|(token, principal)| (token_hash(&hash_key, token.as_bytes()), principal))
             .collect();
         StaticBearerTokenResolver { hash_key, tokens }
     }
@@ -113,6 +155,10 @@ impl StaticBearerTokenResolver {
 
 impl TenantResolver for StaticBearerTokenResolver {
     fn resolve(&self, headers: &HeaderMap) -> Result<TenantId, AuthError> {
+        self.resolve_principal(headers).map(|p| p.tenant)
+    }
+
+    fn resolve_principal(&self, headers: &HeaderMap) -> Result<Principal, AuthError> {
         let token = bearer_token(headers)?;
         let hash = token_hash(&self.hash_key, token.as_bytes());
         self.tokens.get(&hash).cloned().ok_or(AuthError)
@@ -373,6 +419,7 @@ pub struct OidcResolver {
     issuer: String,
     audiences: Vec<String>,
     tenant_claim: String,
+    ddl_claim: Option<String>,
 }
 
 impl OidcResolver {
@@ -381,7 +428,10 @@ impl OidcResolver {
     /// `issuer` is the exact `iss` every token must carry. `audiences`, when
     /// non-empty, is the set of acceptable `aud` values (any match passes);
     /// empty disables audience checking. `tenant_claim` is the string claim the
-    /// tenant identity is read from (e.g. `tenant`).
+    /// tenant identity is read from (e.g. `tenant`). No `ddl` claim is
+    /// configured, so [`resolve_principal`](Self::resolve_principal) always
+    /// reports no `ddl` capability until [`with_ddl_claim`](Self::with_ddl_claim)
+    /// is used.
     pub fn new(
         cache: Arc<OidcJwksCache>,
         issuer: impl Into<String>,
@@ -393,17 +443,30 @@ impl OidcResolver {
             issuer: issuer.into(),
             audiences,
             tenant_claim: tenant_claim.into(),
+            ddl_claim: None,
         }
+    }
+
+    /// Configure the claim that grants the `ddl` capability (ADR-2040 decision
+    /// 4). The capability is present only when the verified token carries this
+    /// claim as the JSON boolean `true`; a string `"true"`, a number, an array,
+    /// or a missing claim all mean no capability. With no claim name configured
+    /// (the default), the capability is never granted via OIDC.
+    pub fn with_ddl_claim(mut self, ddl_claim: impl Into<String>) -> Self {
+        self.ddl_claim = Some(ddl_claim.into());
+        self
     }
 
     /// The shared JWKS cache, so the caller can drive its background refresh.
     pub fn cache(&self) -> &Arc<OidcJwksCache> {
         &self.cache
     }
-}
 
-impl TenantResolver for OidcResolver {
-    fn resolve(&self, headers: &HeaderMap) -> Result<TenantId, AuthError> {
+    /// Verify `headers` against the cached JWKS and return the claims of the
+    /// first token that validates. Shared by [`resolve`](TenantResolver::resolve)
+    /// and [`resolve_principal`](TenantResolver::resolve_principal) so both read
+    /// the same proven claim set.
+    fn verified_claims(&self, headers: &HeaderMap) -> Result<serde_json::Value, AuthError> {
         let token = bearer_token(headers)?;
         // The header is untrusted; decoding it only tells us which cached key to
         // try, never which algorithm to trust.
@@ -432,16 +495,42 @@ impl TenantResolver for OidcResolver {
             let Ok(data) = decode::<serde_json::Value>(token, &entry.key, &validation) else {
                 continue;
             };
-            // Signature, issuer, expiry (and audience) are now proven for this
-            // token. The tenant claim is authoritative from here: a missing or
-            // non-string value is a hard failure, never a fallback to another
-            // key or claim.
-            return match data.claims.get(&self.tenant_claim).and_then(|v| v.as_str()) {
-                Some(tenant) if !tenant.is_empty() => Ok(TenantId::new(tenant.to_string())),
-                _ => Err(AuthError),
-            };
+            return Ok(data.claims);
         }
         Err(AuthError)
+    }
+}
+
+impl TenantResolver for OidcResolver {
+    fn resolve(&self, headers: &HeaderMap) -> Result<TenantId, AuthError> {
+        let claims = self.verified_claims(headers)?;
+        // Signature, issuer, expiry (and audience) are now proven for this
+        // token. The tenant claim is authoritative from here: a missing or
+        // non-string value is a hard failure, never a fallback to another
+        // key or claim.
+        match claims.get(&self.tenant_claim).and_then(|v| v.as_str()) {
+            Some(tenant) if !tenant.is_empty() => Ok(TenantId::new(tenant.to_string())),
+            _ => Err(AuthError),
+        }
+    }
+
+    fn resolve_principal(&self, headers: &HeaderMap) -> Result<Principal, AuthError> {
+        let claims = self.verified_claims(headers)?;
+        let tenant = match claims.get(&self.tenant_claim).and_then(|v| v.as_str()) {
+            Some(tenant) if !tenant.is_empty() => TenantId::new(tenant.to_string()),
+            _ => return Err(AuthError),
+        };
+        // Strict boolean check: a string "true", a number, or an array is not a
+        // capability grant, only the JSON boolean `true` is (ADR-2040 decision
+        // 4). With no ddl claim configured, `ddl_claim` is `None` and `get` on a
+        // `None` claim name never runs, so the capability is never granted.
+        let ddl = self
+            .ddl_claim
+            .as_ref()
+            .and_then(|claim| claims.get(claim))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        Ok(Principal { tenant, ddl })
     }
 }
 
@@ -814,7 +903,13 @@ v6bMjpirtMaaPWvO2P5A4cSa7KfhIJqC4wghlS4L0XBZRxbg48yAf+JK\n\
             resolver.tokens.contains_key(&expected),
             "the entry must be keyed by the keyed hash of the token"
         );
-        assert_eq!(resolver.tokens.get(&expected), Some(&TenantId::new("acme")));
+        assert_eq!(
+            resolver.tokens.get(&expected),
+            Some(&Principal {
+                tenant: TenantId::new("acme"),
+                ddl: false,
+            })
+        );
 
         // The hash is not the plaintext, and every stored key is a 32-byte
         // hash, so no plaintext secret can be recovered from the map's keys.
@@ -1017,5 +1112,144 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
         let cache = cache_with(&jwks_rsa_with(RSA_KID));
         let token = sign_hs256_confused_rsa(&claims(Some("acme"), 3600), RSA_KID);
         assert!(resolver(cache).resolve(&bearer(&token)).is_err());
+    }
+
+    #[test]
+    fn ddl_capability_is_absent_by_default_and_granted_by_token_suffix_or_claim() {
+        // ADR-2040 decision 4 ("Who may run DDL"): `ddl` is absent unless a
+        // resolver's configuration explicitly grants it.
+
+        // Static token with no configured capability: no ddl.
+        let plain = StaticBearerTokenResolver::new(HashMap::from([(
+            "tok".to_string(),
+            TenantId::new("acme"),
+        )]));
+        assert_eq!(
+            plain
+                .resolve_principal(&static_bearer("tok"))
+                .expect("resolves"),
+            Principal {
+                tenant: TenantId::new("acme"),
+                ddl: false,
+            }
+        );
+
+        // Static token configured (the `;ddl` suffix's parsed result, at the
+        // config layer) with the capability: has it.
+        let granted = StaticBearerTokenResolver::with_principals(HashMap::from([(
+            "tok".to_string(),
+            Principal {
+                tenant: TenantId::new("acme"),
+                ddl: true,
+            },
+        )]));
+        assert_eq!(
+            granted
+                .resolve_principal(&static_bearer("tok"))
+                .expect("resolves"),
+            Principal {
+                tenant: TenantId::new("acme"),
+                ddl: true,
+            }
+        );
+
+        // OIDC: the configured claim as the JSON boolean `true` grants it.
+        let cache = cache_with(&jwks_with(KID));
+        let mut c = claims(Some("acme"), 3600);
+        c["can_ddl"] = serde_json::json!(true);
+        let token = sign_es256(&c, KID, EC_PRIV_PEM);
+        let oidc = resolver(cache).with_ddl_claim("can_ddl");
+        assert_eq!(
+            oidc.resolve_principal(&bearer(&token)).expect("resolves"),
+            Principal {
+                tenant: TenantId::new("acme"),
+                ddl: true,
+            }
+        );
+
+        // OIDC: a string "true" is not the JSON boolean true. Rules out wrong
+        // implementation (a): "any truthy claim" grants the capability.
+        let cache = cache_with(&jwks_with(KID));
+        let mut c = claims(Some("acme"), 3600);
+        c["can_ddl"] = serde_json::json!("true");
+        let token = sign_es256(&c, KID, EC_PRIV_PEM);
+        let oidc = resolver(cache).with_ddl_claim("can_ddl");
+        assert!(
+            !oidc
+                .resolve_principal(&bearer(&token))
+                .expect("resolves")
+                .ddl
+        );
+
+        // OIDC: a number is not the JSON boolean true either.
+        let cache = cache_with(&jwks_with(KID));
+        let mut c = claims(Some("acme"), 3600);
+        c["can_ddl"] = serde_json::json!(1);
+        let token = sign_es256(&c, KID, EC_PRIV_PEM);
+        let oidc = resolver(cache).with_ddl_claim("can_ddl");
+        assert!(
+            !oidc
+                .resolve_principal(&bearer(&token))
+                .expect("resolves")
+                .ddl
+        );
+
+        // OIDC: a missing claim is no capability.
+        let cache = cache_with(&jwks_with(KID));
+        let token = sign_es256(&claims(Some("acme"), 3600), KID, EC_PRIV_PEM);
+        let oidc = resolver(cache).with_ddl_claim("can_ddl");
+        assert!(
+            !oidc
+                .resolve_principal(&bearer(&token))
+                .expect("resolves")
+                .ddl
+        );
+
+        // OIDC: no claim name configured at all means never, even if the token
+        // happens to carry a same-named claim set to `true`.
+        let cache = cache_with(&jwks_with(KID));
+        let mut c = claims(Some("acme"), 3600);
+        c["can_ddl"] = serde_json::json!(true);
+        let token = sign_es256(&c, KID, EC_PRIV_PEM);
+        let oidc = resolver(cache); // no with_ddl_claim
+        assert!(
+            !oidc
+                .resolve_principal(&bearer(&token))
+                .expect("resolves")
+                .ddl
+        );
+
+        // DevHeaderTenantResolver and MtlsResolver take the default method:
+        // never ddl.
+        let dev = DevHeaderTenantResolver::default();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-ravel-tenant",
+            "acme".parse().expect("valid header value"),
+        );
+        assert!(!dev.resolve_principal(&headers).expect("resolves").ddl);
+
+        let mtls = MtlsResolver::default();
+        let mut headers = HeaderMap::new();
+        headers.insert(MtlsResolver::DEFAULT_HEADER, "acme".parse().unwrap());
+        assert!(!mtls.resolve_principal(&headers).expect("resolves").ddl);
+
+        // FallbackResolver returns the same resolver `resolve` would pick,
+        // including its capability. Rules out wrong implementation (b):
+        // FallbackResolver always reporting no capability regardless of which
+        // resolver in the chain actually matched.
+        let fallback = FallbackResolver::new(vec![
+            Arc::new(StaticBearerTokenResolver::new(HashMap::new())),
+            Arc::new(granted),
+        ]);
+        assert_eq!(
+            fallback
+                .resolve_principal(&static_bearer("tok"))
+                .expect("resolves"),
+            Principal {
+                tenant: TenantId::new("acme"),
+                ddl: true,
+            }
+        );
     }
 }
