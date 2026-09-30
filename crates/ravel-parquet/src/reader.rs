@@ -1638,6 +1638,102 @@ mod tests {
         prop_oneof![any_mutation(), page_index_mutation()]
     }
 
+    /// The error must be `Corrupt` for [`KEY`], reporting a decoder panic
+    /// while table `t` was scanned.
+    fn assert_decoder_panic(err: &DataFusionError) {
+        match read_error(err) {
+            Some(ParquetReadError::Corrupt { key, message }) => {
+                assert_eq!(key, KEY, "{err}");
+                assert!(
+                    message.contains("panicked while scanning table t"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected a Corrupt decoder panic, got {other:?} from {err}"),
+        }
+    }
+
+    /// The case CI's seed for the filtered byte-change property shrinks to,
+    /// `Splice(Index(847260924571603501), 14, [5, 22, 71, 25, 152])`: the
+    /// splice leaves a data page header without its data page fields, which
+    /// the parquet crate unwraps.
+    #[test]
+    fn the_filtered_scan_seed_ci_found_is_a_typed_corrupt_error() {
+        let mut bytes = valid();
+        // `Index::index`: a fixed-point multiply by the file's length.
+        let at = ((bytes.len() as u128 * 847_260_924_571_603_501_u128) >> 64) as usize;
+        let end = (at + 14).min(bytes.len());
+        bytes.splice(at..end, [5, 22, 71, 25, 152]);
+        let got = scan_second_file_where(bytes, Some(page_pruning_filter()));
+        assert_decoder_panic(&got.expect_err("the spliced file must fail the scan"));
+    }
+
+    /// [`valid`] with column `b`'s one data page header retyped as a
+    /// version 2 data page: the header keeps its version 1 fields and has no
+    /// version 2 fields.
+    fn data_page_retyped_as_v2() -> Vec<u8> {
+        let mut bytes = valid();
+        let end = bytes.len() - TRAILER_LEN as usize;
+        let metadata = ParquetMetaDataReader::decode_metadata(
+            &bytes[end - footer_len_of(&bytes) as usize..end],
+        )
+        .expect("footer");
+        let at = metadata.row_group(0).column(1).data_page_offset();
+        let at = usize::try_from(at).expect("offset");
+        // Field 1 (`type`, an i32) of the compact-protocol PageHeader:
+        // DATA_PAGE (0) as a zigzag varint becomes DATA_PAGE_V2 (3).
+        assert_eq!(bytes[at..at + 2], [0x15, 0x00], "a data page header");
+        bytes[at + 1] = 0x06;
+        bytes
+    }
+
+    /// A page header the parquet crate panics on, under a filtered scan that
+    /// skips a row of that page: the boundary's stream yields the intact
+    /// file's rows, one typed `Corrupt` error naming the corrupt file and the
+    /// table, and then ends, with no row of the corrupt file.
+    #[tokio::test]
+    async fn a_corrupt_page_header_under_a_filtered_scan_is_corrupt_and_yields_no_rows() {
+        use datafusion::catalog::TableProvider;
+        use futures::StreamExt;
+
+        let bytes = data_page_retyped_as_v2();
+        let (size, footer_len) = (bytes.len() as u64, footer_len_of(&bytes));
+        let store = Arc::new(MemoryStore::new());
+        let fixture = Fixture::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>);
+        let good = fixture
+            .put_file(
+                &store,
+                "lake/t/good.parquet",
+                parquet_bytes(&[1, 2, 3], &["one", "two", "six"]),
+                false,
+            )
+            .await;
+        let bad = fixture
+            .put_raw(&store, KEY, Bytes::from(bytes), size, footer_len)
+            .await;
+        let table = fixture.provider("t", 1, vec![good, bad], false).await;
+        let ctx = fixture.session(&[]);
+        // Keeps 1 and 2 of the intact file, and 5 and 6 of the corrupt one,
+        // whose 4 the reader skips by peeking at its page header.
+        let filter = page_pruning_filter().or(ident("a").lt(lit(3_i64)));
+        let plan = table
+            .scan(&ctx.state(), None, &[filter], None)
+            .await
+            .expect("scan");
+        let mut stream = plan.execute(0, ctx.task_ctx()).expect("execute");
+        let mut rows = Vec::new();
+        let err = loop {
+            match stream.next().await {
+                Some(Ok(batch)) => rows.push(render_rows(&[batch]).expect("render")),
+                Some(Err(err)) => break err,
+                None => panic!("the scan ended without an error: {rows:?}"),
+            }
+        };
+        assert_decoder_panic(&err);
+        assert!(stream.next().await.is_none(), "the stream ends after it");
+        assert_eq!(rows.join(","), "1|one,2|two");
+    }
+
     proptest! {
         /// A truncated file, or one whose trailer changed, fails the scan
         /// with a typed `Corrupt` error naming it, and returns no rows.

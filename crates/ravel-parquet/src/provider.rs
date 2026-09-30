@@ -542,13 +542,15 @@ mod tests {
     use super::*;
     use crate::test_support::{
         Fixture, binary_parquet_bytes, file_groups_of, int_parquet_bytes, parquet_bytes, read_all,
-        read_columns, scan_of,
+        read_columns, render_rows, scan_of,
     };
     use datafusion::arrow::array::{
         Array, Date32Array, Int64Array, TimestampMillisecondArray, TimestampSecondArray,
     };
+    use datafusion::logical_expr::JoinType;
     use datafusion::physical_plan::ExecutionPlanProperties;
     use datafusion::prelude::SessionConfig;
+    use datafusion::prelude::{DataFrame, SessionContext};
     use datafusion_datasource_parquet::ParquetFileReaderFactory;
     use ravel_object_store::memory::MemoryStore;
     use ravel_query::QueryPhase;
@@ -766,6 +768,328 @@ mod tests {
         assert!(source.table_parquet_options().global.pushdown_filters);
         assert!(!source.table_parquet_options().global.enable_page_index);
         assert!(datafusion::datasource::physical_plan::FileSource::filter(source).is_some());
+    }
+
+    /// Every [`ParquetPanicBoundaryExec`] in `plan`, outermost first.
+    fn boundaries(plan: &Arc<dyn ExecutionPlan>) -> Vec<&ParquetPanicBoundaryExec> {
+        let mut found = Vec::new();
+        let mut pending = vec![plan];
+        while let Some(node) = pending.pop() {
+            if let Some(boundary) = node.downcast_ref::<ParquetPanicBoundaryExec>() {
+                found.push(boundary);
+            }
+            pending.extend(node.children().into_iter().rev());
+        }
+        found
+    }
+
+    /// Over an intact five-file table, the boundary has the scan's own
+    /// properties and statistics, so the optimized plan keeps the D6 file
+    /// groups, one group when serial and up to `target_partitions` when
+    /// parallel, and file-scan repartitioning still reaches the scan under it;
+    /// every row comes back.
+    #[tokio::test]
+    async fn the_boundary_keeps_the_scans_partitions_statistics_and_rows() {
+        let store = Arc::new(MemoryStore::new());
+        let fixture = Fixture::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>);
+        let mut files = Vec::new();
+        for index in 0..5_i64 {
+            files.push(
+                fixture
+                    .put_file(
+                        &store,
+                        &format!("lake/t/{index}.parquet"),
+                        parquet_bytes(&[index], &["r"]),
+                        true,
+                    )
+                    .await,
+            );
+        }
+        let values: Vec<i64> = (0..2_000).collect();
+        let labels: Vec<String> = values.iter().map(|v| format!("row-{v}")).collect();
+        let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let big = fixture
+            .put_file(
+                &store,
+                "lake/t/big.parquet",
+                parquet_bytes(&values, &labels),
+                true,
+            )
+            .await;
+        let repartitioning = SessionConfig::new()
+            .with_target_partitions(4)
+            .with_repartition_file_scans(true)
+            .with_repartition_file_min_size(1);
+        let five: String = (0..5).map(|v| v.to_string()).collect::<Vec<_>>().join(",");
+        let all: String = values
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let cases = [
+            (files.clone(), false, SessionConfig::new(), 1, five.clone()),
+            (files, true, SessionConfig::new(), 4, five),
+            (
+                vec![big.clone()],
+                false,
+                repartitioning.clone(),
+                1,
+                all.clone(),
+            ),
+            (vec![big], true, repartitioning, 4, all),
+        ];
+        for (files, parallel, config, partitions, rows) in cases {
+            let label = format!("{} files, parallel {parallel}", files.len());
+            let table = fixture.provider("t", 1, files, parallel).await;
+            let ctx = fixture.session_with(config.with_target_partitions(4), &[("t", table)]);
+            let plan = ctx
+                .table("t")
+                .await
+                .expect("table")
+                .create_physical_plan()
+                .await
+                .expect("plan");
+            let found = boundaries(&plan);
+            let [boundary] = found.as_slice() else {
+                panic!("{label}: one boundary, found {}", found.len());
+            };
+            assert!(
+                Arc::ptr_eq(boundary.properties(), boundary.inner().properties()),
+                "{label}"
+            );
+            assert_eq!(
+                boundary.properties().partitioning.partition_count(),
+                partitions,
+                "{label}"
+            );
+            assert_eq!(plan.output_partitioning().partition_count(), partitions);
+            let (config, _) = boundary
+                .inner()
+                .downcast_ref::<DataSourceExec>()
+                .expect("the boundary sits directly on the scan")
+                .downcast_to_file_source::<ParquetSource>()
+                .expect("a Parquet file source");
+            assert_eq!(config.file_groups.len(), partitions, "{label}");
+            assert_eq!(
+                boundary.partition_statistics(None).expect("statistics"),
+                boundary
+                    .inner()
+                    .partition_statistics(None)
+                    .expect("statistics"),
+                "{label}"
+            );
+            let got = read_all(&ctx, "t", &["a"]).await.expect("rows");
+            assert_eq!(got, rows, "{label}");
+        }
+    }
+
+    /// A table whose scan is the unwrapped `DataSourceExec`, the plan the
+    /// provider returned before the boundary.
+    #[derive(Debug)]
+    struct Unwrapped(Arc<ParquetTableProvider>);
+
+    #[async_trait]
+    impl TableProvider for Unwrapped {
+        fn schema(&self) -> SchemaRef {
+            self.0.schema()
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        fn supports_filters_pushdown(
+            &self,
+            filters: &[&Expr],
+        ) -> DfResult<Vec<TableProviderFilterPushDown>> {
+            self.0.supports_filters_pushdown(filters)
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> DfResult<Arc<dyn ExecutionPlan>> {
+            let plan = self.0.scan(state, projection, filters, limit).await?;
+            Ok(Arc::clone(
+                plan.downcast_ref::<ParquetPanicBoundaryExec>()
+                    .expect("a panic boundary")
+                    .inner(),
+            ))
+        }
+    }
+
+    /// `plan` with every boundary line removed and the lines under it moved
+    /// up one level, after checking that each boundary's next line is a
+    /// `DataSourceExec` one level down.
+    fn without_boundaries(plan: &str) -> String {
+        let lines: Vec<&str> = plan.lines().collect();
+        let indent = |line: &str| line.len() - line.trim_start().len();
+        let mut out = Vec::new();
+        let mut removed: Vec<usize> = Vec::new();
+        for (at, line) in lines.iter().enumerate() {
+            let depth = indent(line);
+            while removed.last().is_some_and(|&d| depth <= d) {
+                removed.pop();
+            }
+            if line
+                .trim_start()
+                .starts_with("ParquetPanicBoundaryExec: table=t")
+            {
+                let next = lines.get(at + 1).expect("a node under the boundary");
+                assert!(
+                    indent(next) == depth + 2 && next.trim_start().starts_with("DataSourceExec:"),
+                    "{plan}"
+                );
+                removed.push(depth);
+                continue;
+            }
+            out.push(format!(
+                "{}{}",
+                " ".repeat(depth - 2 * removed.len()),
+                line.trim_start()
+            ));
+        }
+        out.join("\n")
+    }
+
+    /// The optimized plan of each statement is the plan without the boundary
+    /// with one `ParquetPanicBoundaryExec` directly above each scan: the
+    /// optimizer pushes the same projections, limits, filters and dynamic
+    /// filters into the scan, and places every repartition and sort where it
+    /// did.
+    #[tokio::test]
+    async fn explain_gains_one_boundary_node_above_each_scan_and_nothing_else() {
+        use datafusion::physical_plan::displayable;
+
+        let store = Arc::new(MemoryStore::new());
+        let fixture = Fixture::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>);
+        let mut files = Vec::new();
+        for index in 0..5_i64 {
+            files.push(
+                fixture
+                    .put_file(
+                        &store,
+                        &format!("lake/t/{index}.parquet"),
+                        parquet_bytes(&[index, index + 10], &["r", "s"]),
+                        true,
+                    )
+                    .await,
+            );
+        }
+        // DataFusion's defaults, and file-scan repartitioning admitting every
+        // file.
+        let configs = [
+            SessionConfig::new(),
+            SessionConfig::new().with_repartition_file_min_size(1),
+        ];
+        for (parallel, config) in [false, true]
+            .into_iter()
+            .flat_map(|parallel| configs.iter().map(move |config| (parallel, config)))
+        {
+            let config = config.clone().with_target_partitions(4);
+            let table = fixture.provider("t", 1, files.clone(), parallel).await;
+            let wrapped = fixture.session_with(
+                config.clone(),
+                &[("t", Arc::clone(&table)), ("u", Arc::clone(&table))],
+            );
+            let bare = fixture.session_with(config, &[]);
+            for name in ["t", "u"] {
+                bare.register_table(name, Arc::new(Unwrapped(Arc::clone(&table))))
+                    .expect("register");
+            }
+            for (index, (label, scans, order)) in STATEMENTS.iter().enumerate() {
+                let run = |ctx: SessionContext| async move {
+                    let frame = statement(&ctx, index).await.expect(label);
+                    let plan = frame.clone().create_physical_plan().await.expect("plan");
+                    let text = displayable(plan.as_ref()).indent(true).to_string();
+                    let rows = render_rows(&frame.collect().await.expect("rows")).expect("render");
+                    (plan, text, rows)
+                };
+                let (plan, with, rows) = run(wrapped.clone()).await;
+                let (_, without, bare_rows) = run(bare.clone()).await;
+                assert_eq!(boundaries(&plan).len(), *scans, "{label}\n{with}");
+                assert_eq!(
+                    without_boundaries(&with),
+                    without.trim_end(),
+                    "parallel {parallel}: {label}"
+                );
+                let (mut rows, mut bare_rows): (Vec<&str>, Vec<&str>) =
+                    (rows.split(',').collect(), bare_rows.split(',').collect());
+                match order {
+                    RowOrder::Fixed => {}
+                    RowOrder::Any => {
+                        rows.sort_unstable();
+                        bare_rows.sort_unstable();
+                    }
+                    RowOrder::AnyTwo => {
+                        assert_eq!(rows.len(), 2, "{label}");
+                        continue;
+                    }
+                }
+                assert_eq!(rows, bare_rows, "parallel {parallel}: {label}");
+            }
+        }
+    }
+
+    /// Which rows two runs of one statement must agree on.
+    enum RowOrder {
+        /// The same rows in the same order.
+        Fixed,
+        /// The same rows in any order.
+        Any,
+        /// Any two rows.
+        AnyTwo,
+    }
+
+    /// Each statement [`statement`] builds: its label, its scan count and the
+    /// order of its rows.
+    const STATEMENTS: [(&str, usize, RowOrder); 7] = [
+        ("a, b where a > 2", 1, RowOrder::Any),
+        ("b where a > 2 order by a desc limit 2", 1, RowOrder::Fixed),
+        ("a limit 2", 1, RowOrder::AnyTwo),
+        ("a + 1 as c order by c", 1, RowOrder::Fixed),
+        ("count(*)", 1, RowOrder::Fixed),
+        ("b, count(*), max(a) group by b", 1, RowOrder::Any),
+        ("t.a join u on a where u.b = 's'", 2, RowOrder::Any),
+    ];
+
+    /// Statement `index` of [`STATEMENTS`] over tables `t` and `u`.
+    async fn statement(ctx: &SessionContext, index: usize) -> DfResult<DataFrame> {
+        use datafusion::functions_aggregate::expr_fn::{count, max};
+        use datafusion::logical_expr::{col, lit};
+
+        let t = ctx.table("t").await?;
+        match index {
+            0 => t
+                .filter(ident("a").gt(lit(2_i64)))?
+                .select_columns(&["a", "b"]),
+            1 => t
+                .filter(ident("a").gt(lit(2_i64)))?
+                .sort(vec![ident("a").sort(false, false)])?
+                .limit(0, Some(2))?
+                .select_columns(&["b"]),
+            2 => t.select_columns(&["a"])?.limit(0, Some(2)),
+            3 => t
+                .select(vec![(ident("a") + lit(1_i64)).alias("c")])?
+                .sort(vec![ident("c").sort(true, false)]),
+            4 => t.aggregate(vec![], vec![count(lit(1_i64)).alias("n")]),
+            5 => t.aggregate(
+                vec![ident("b")],
+                vec![count(lit(1_i64)).alias("n"), max(ident("a")).alias("m")],
+            ),
+            _ => t
+                .join_on(
+                    ctx.table("u").await?,
+                    JoinType::Inner,
+                    [col("t.a").eq(col("u.a"))],
+                )?
+                .filter(col("u.b").eq(lit("s")))?
+                .select(vec![col("t.a")]),
+        }
     }
 
     #[test]
