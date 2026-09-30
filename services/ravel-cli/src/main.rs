@@ -670,9 +670,12 @@ enum Command {
     ///
     /// `--signal logs`, `--signal metrics` and `--signal spans` are supported.
     /// A metrics mapping the export cannot invert, such as `[metrics.histogram]`,
-    /// is refused rather than written as a file that loads onto other series,
-    /// and a span a load would not read back as the same span is refused by
-    /// name.
+    /// is refused rather than written as a file that loads onto other series.
+    /// A spans export writes the mapped fields only, and refuses by name a
+    /// span whose mapped fields a load would not read back as stored; span
+    /// kind, trace state, flags, events, links and any attribute the mapping
+    /// does not name are not written, and the report counts the spans that
+    /// lost them.
     Export {
         /// Signal to export: `logs`, `metrics` or `spans`. No default: a
         /// command that chooses for you which data it touches is a silent
@@ -703,8 +706,12 @@ enum Command {
         parquet: std::path::PathBuf,
         /// Path to the `--mapping` TOML naming the output columns. The same
         /// file a `load` of this data used produces a file that load reads
-        /// back, or, for metrics and spans, refuses by name a series or span no
-        /// file under it re-loads as the same one.
+        /// back, or, for metrics, refuses by name a series no file under it
+        /// re-loads as the same one. For spans, every mapped field round-trips
+        /// and a span whose mapped fields would not is refused by name; span
+        /// kind, trace state, flags, events, links and any attribute the
+        /// mapping does not name are not written, and the report counts the
+        /// spans that lost them.
         #[arg(long, value_name = "TOML")]
         mapping: std::path::PathBuf,
         /// Configured shard count, used to resolve the catalog. The tenant's
