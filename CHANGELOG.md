@@ -78,8 +78,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   invocation found). A below-target part of an authoritative compaction record
   blocks the floor too and is reported as an `l1_compaction_parts` count with no
   `blocked_bucket` line (a losing record's parts get one when the bucket's
-  authoritative records are at the target and it lists no rewrite record; see
-  the next entry):
+  authoritative records are at the target and any rewrite record parts it
+  lists are too; see the next entry):
   nothing migrates one either, because compaction and the migration rewrite
   both refuse a bucket that already carries a compaction record, so ADR-0066
   decision 4 force 2 is unimplemented (issue #2093). The explanatory prose

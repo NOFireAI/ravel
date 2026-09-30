@@ -706,7 +706,16 @@ command you run. A bucket whose authoritative records are themselves below the
 target is not named this way. Nor is a bucket whose rewrite record parts are
 below the target: it gets its `rewrite_parts` line only. A bucket that lists a
 rewrite record whose parts are all at the target is named this way when its
-losing records carry below-target parts.
+losing records carry below-target parts. A compaction record a live rewrite
+record supersedes is never counted as a losing record here, even when it lost
+its overlap: `sweep` deletes it and its parts together with that rewrite, and
+until then its below-target parts count in `l1_compaction_parts` without a
+`blocked_bucket` line. A `sweep` can therefore change the entry of a bucket
+that lists a rewrite record. Once it deletes a winning record the rewrite
+superseded, a losing record that overlapped only that winner becomes
+authoritative, and a bucket whose authoritative records are below the target
+is not named this way, so its `losing_record_parts` line goes away while those
+parts still count in `l1_compaction_parts`.
 
 **`rewrite_parts`.** The bucket holds a live selective-erasure rewrite record
 (the durable steady state of a bucket an erasure request touched), and
