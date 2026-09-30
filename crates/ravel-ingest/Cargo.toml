@@ -68,6 +68,9 @@ datafusion = { version = "54", default-features = false, features = ["sql"] }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 proptest = { workspace = true }
+# Captures the once-per-refresh unresolved-layout warning in
+# tests/clustering_key_warning.rs.
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

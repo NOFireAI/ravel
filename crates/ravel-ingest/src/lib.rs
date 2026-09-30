@@ -30,6 +30,7 @@ mod span_metrics;
 mod span_router;
 mod span_shard;
 mod stage_timing;
+mod storage_layout;
 mod value;
 
 pub use admission::{
