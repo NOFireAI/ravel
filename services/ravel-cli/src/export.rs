@@ -114,9 +114,11 @@
 //! load produced by coercing the typed cell; each mapped attribute is written
 //! as the value of its declared type that coerces back to the stored string,
 //! and a stored string no such value produces (`"007"` under `i64`) is
-//! refused by name. A `[spans]` mapping has no `attrs_map_column`, so a
-//! stored attribute the mapping does not name is not written, as for a logs
-//! mapping without one.
+//! refused by name. A `[spans]` mapping has no `attrs_map_column`, so only
+//! the mapped fields are written: the reserved attributes holding a span's
+//! kind, trace state, flags, events and links, and any stored attribute the
+//! mapping does not name, are not, and the report counts the spans that
+//! carried one ([`SpansExportReport::spans_with_unwritten_attributes`]).
 
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -215,6 +217,12 @@ pub struct SpansExportReport {
     pub segments_pruned: u64,
     /// Pending selective-erasure predicates applied to this read.
     pub erasure_predicates: usize,
+    /// Written spans that carried at least one stored attribute the file does
+    /// not carry: a reserved key holding a span field the `[spans]` mapping
+    /// cannot name (kind, trace state, flags, events, links), or a key the
+    /// mapping does not name. A load of the file gives those spans without
+    /// them.
+    pub spans_with_unwritten_attributes: u64,
 }
 
 /// The refusal a `[metrics.histogram]` mapping gets from `export --signal
@@ -310,6 +318,10 @@ pub async fn run(
         println!("segments_read: {}", report.segments_read);
         println!("segments_pruned: {}", report.segments_pruned);
         println!("erasure_predicates: {}", report.erasure_predicates);
+        println!(
+            "spans_with_unwritten_attributes: {}",
+            report.spans_with_unwritten_attributes
+        );
         return Ok(());
     }
     let mapping = crate::load::parse_mapping(&text)?;
@@ -1156,11 +1168,13 @@ fn build_metrics_batch(
 /// [`export_logs`]. Two fields sharing one output column, and an unusable
 /// `out`, are refused before any object-store request.
 ///
-/// The whole export is refused, and nothing is written, when a span in the
-/// window would not re-load as the same span under `mapping` (see the module
-/// documentation): a timestamp that is not a whole number of its declared
-/// unit, a start a load would re-time or refuse, or a mapped attribute whose
-/// stored string the declared type does not read back.
+/// The whole export is refused, and nothing is written, when a mapped field of
+/// a span in the window would not re-load as stored under `mapping` (see the
+/// module documentation): a timestamp that is not a whole number of its
+/// declared unit, a start a load would re-time or refuse, or a mapped
+/// attribute whose stored string the declared type does not read back. The
+/// attributes the mapping cannot or does not name are not written and are
+/// counted, not refused.
 #[allow(clippy::too_many_arguments)]
 pub async fn export_spans(
     store: Arc<dyn ObjectStoreBackend>,
@@ -1225,6 +1239,7 @@ pub async fn export_spans(
     spans.sort_by_key(|span| (span.start_ts_ns, span.trace_id, span.span_id));
 
     let rows = span_output_rows(mapping, &spans)?;
+    let spans_with_unwritten_attributes = spans_with_unwritten_attributes(mapping, &spans);
     let empty = build_spans_batch(mapping, &[])?;
     let rows_written = write_output(out, empty.schema(), |writer| {
         let mut rows_written = 0u64;
@@ -1243,7 +1258,26 @@ pub async fn export_spans(
         segments_read,
         segments_pruned: snapshot.segments_pruned,
         erasure_predicates,
+        spans_with_unwritten_attributes,
     })
+}
+
+/// How many of `spans` carry a stored attribute no mapped attribute names.
+fn spans_with_unwritten_attributes(mapping: &SpansMapping, spans: &[SpanRecord]) -> u64 {
+    let mapped: BTreeSet<&str> = span_mapped_attributes(mapping)
+        .map(|spec| spec.key.as_str())
+        .collect();
+    let mut unwritten = 0u64;
+    for span in spans {
+        if span
+            .attrs
+            .iter()
+            .any(|(key, _)| !mapped.contains(key.as_str()))
+        {
+            unwritten += 1;
+        }
+    }
+    unwritten
 }
 
 /// Why a span cannot be written. The declaration order is the order the
@@ -2323,5 +2357,80 @@ mod tests {
                 "the epoch-2 write is served"
             );
         }
+    }
+
+    /// A `[spans]` mapping with `start_ts` in `start_unit`, `end_ts` in nanos,
+    /// and `http.status_code` declared i64.
+    fn spans_mapping(start_unit: &str) -> SpansMapping {
+        crate::load::parse_spans_mapping(&format!(
+            "[spans]\ntrace_id_column = \"trace_id\"\nspan_id_column = \"span_id\"\n\
+             name_column = \"name\"\nstart_ts_column = \"start\"\n\
+             start_ts_unit = \"{start_unit}\"\nend_ts_column = \"end\"\n\
+             end_ts_unit = \"nanos\"\n\n\
+             [[spans.attribute]]\nkey = \"http.status_code\"\ncolumn = \"http_status\"\n\
+             type = \"i64\"\n"
+        ))
+        .expect("valid spans mapping")
+    }
+
+    fn span(name: &str, start_ts_ns: i64, end_ts_ns: i64) -> SpanRecord {
+        SpanRecord {
+            trace_id: [1; 16],
+            span_id: [0x11; 8],
+            parent_span_id: None,
+            name: name.to_string(),
+            start_ts_ns,
+            end_ts_ns,
+            status_code: ravel_rspan::StatusCode::Unset,
+            status_message: None,
+            attrs: Vec::new(),
+        }
+    }
+
+    fn span_refusal(mapping: &SpansMapping, span: SpanRecord) -> String {
+        match span_output_rows(mapping, &[span]) {
+            Ok(_) => panic!("the span is refused"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_span_starting_at_zero_is_refused_as_unloadable() {
+        assert_eq!(
+            span_refusal(&spans_mapping("nanos"), span("zero start", 0, 5)),
+            "export --signal spans refused on 1 spans for this reason; first: span \"zero \
+             start\" (trace_id 01010101010101010101010101010101, span_id 1111111111111111) \
+             starts at 0 ns and ends at 5 ns; a load reads a zero start as load time and refuses \
+             a negative start or an end before the start, so the exported file would not re-load \
+             as the same span"
+        );
+    }
+
+    #[test]
+    fn a_span_ending_before_its_start_is_refused_as_unloadable() {
+        assert_eq!(
+            span_refusal(&spans_mapping("nanos"), span("backwards", 10, 9)),
+            "export --signal spans refused on 1 spans for this reason; first: span \
+             \"backwards\" (trace_id 01010101010101010101010101010101, span_id \
+             1111111111111111) starts at 10 ns and ends at 9 ns; a load reads a zero start as \
+             load time and refuses a negative start or an end before the start, so the exported \
+             file would not re-load as the same span"
+        );
+    }
+
+    /// One span both finer than its `start_ts_unit` and carrying an attribute
+    /// its declared type does not read back is refused for the timestamp.
+    #[test]
+    fn a_sub_unit_timestamp_is_reported_before_an_unwritable_attribute() {
+        let mut both = span("both", 1_000_000_001, 2_000_000_000);
+        both.attrs = vec![("http.status_code".to_string(), "007".to_string())];
+        assert_eq!(
+            span_refusal(&spans_mapping("millis"), both),
+            "export --signal spans refused on 1 spans for this reason; first: span \"both\" \
+             (trace_id 01010101010101010101010101010101, span_id 1111111111111111) has start_ts \
+             1000000001 ns, which is not a whole number of millis (the mapping's start_ts_unit); \
+             writing it in millis would move it onto a different timestamp. Export with a finer \
+             start_ts_unit."
+        );
     }
 }

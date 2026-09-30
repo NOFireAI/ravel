@@ -12,12 +12,17 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, Float64Array, Int64Array,
     StringArray,
 };
 use arrow::record_batch::RecordBatch;
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
+use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use ravel_catalog::{Catalog, CatalogConfig};
@@ -26,10 +31,11 @@ use ravel_cli::export::{self, SpansExportReport};
 use ravel_cli::load::{self, SpansMapping};
 use ravel_cli::maintain::SignalArg;
 use ravel_cli::store::{StoreKind, StoreSelection};
-use ravel_ingest::Clock;
+use ravel_ingest::{Clock, IngestConfig, SpanIngestRouter, WriteMode};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::instrument::{InstrumentedStore, StoreMetricsSnapshot};
 use ravel_object_store::memory::MemoryStore;
+use ravel_otlp::{SpanIngestLimits, normalize_traces};
 use ravel_query::SpanSegmentFetcher;
 use ravel_rspan::{SpanQuery, SpanRecord, StatusCode};
 use ravel_types::accounting::QueryAccounting;
@@ -498,6 +504,10 @@ async fn load_then_export_then_load_round_trips_every_mapped_span_field() {
         .expect("export succeeds");
     assert_eq!(report.rows_written, 4);
     assert_eq!(report.erasure_predicates, 0);
+    assert_eq!(
+        report.spans_with_unwritten_attributes, 2,
+        "the root and the later trace carry the unmapped tenant.tier"
+    );
 
     let batch = read_parquet(&export_pq);
     assert_eq!(
@@ -704,6 +714,141 @@ async fn an_erased_span_is_not_exported() {
         str_values(&batch, "svc"),
         vec![Some("keep".to_string()), Some("keep".to_string())]
     );
+}
+
+/// Stores `spans` in `tenant` the way an OTLP-ingested span is stored:
+/// through `normalize_traces` and the span ingest router, so the store holds
+/// the reserved attributes (`_kind` and the rest) a Parquet load cannot write.
+async fn ingest_otlp(store: &Arc<dyn ObjectStoreBackend>, tenant: &str, spans: Vec<Span>) {
+    let out = normalize_traces(
+        ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: None,
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        },
+        &SpanIngestLimits::default(),
+        LOAD_NS,
+    );
+    assert!(out.rejected.is_empty(), "rejected: {:?}", out.rejected);
+    let router = SpanIngestRouter::new(
+        IngestConfig {
+            shard_count: 1,
+            target_bytes: 1,
+            ..IngestConfig::default()
+        },
+        Arc::clone(store),
+        Arc::new(FixedClock(LOAD_NS)),
+    );
+    router
+        .write(
+            TenantId::new(tenant),
+            out.spans,
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("the OTLP spans are written");
+    router.shutdown().await;
+}
+
+fn otlp_span(trace: u8, span: u8, name: &str, start_ns: i64, end_ns: i64) -> Span {
+    Span {
+        trace_id: vec![trace; 16],
+        span_id: vec![span; 8],
+        name: name.to_string(),
+        start_time_unix_nano: start_ns as u64,
+        end_time_unix_nano: end_ns as u64,
+        ..Default::default()
+    }
+}
+
+/// A stored span carrying an attribute the file has no column for, a reserved
+/// `_kind` or a key the mapping does not name, is exported without it and
+/// counted: the re-loaded tenant holds the same spans less exactly those
+/// attributes, and the report counts the two spans that carried one.
+#[tokio::test]
+async fn attributes_the_file_does_not_carry_are_counted_per_span() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let mapping = spans_mapping(SPANS_MAPPING);
+    load_rows(
+        &store,
+        dir.path(),
+        "alpha",
+        &mapping,
+        &[Src {
+            svc: Some("checkout"),
+            ..bare(1, 0x11, "mapped only", T0, T0 + ONE_MS_NS)
+        }],
+    )
+    .await;
+    let server = Span {
+        kind: 2,
+        ..otlp_span(2, 0x22, "server", T0 + 2 * ONE_MS_NS, T0 + 3 * ONE_MS_NS)
+    };
+    let tiered = Span {
+        attributes: vec![KeyValue {
+            key: "tenant.tier".to_string(),
+            value: Some(AnyValue {
+                value: Some(AnyValueVariant::StringValue("gold".to_string())),
+            }),
+            ..Default::default()
+        }],
+        ..otlp_span(3, 0x33, "tiered", T0 + 4 * ONE_MS_NS, T0 + 5 * ONE_MS_NS)
+    };
+    ingest_otlp(&store, "alpha", vec![server, tiered]).await;
+
+    let alpha = stored(&store, "alpha", T0, T1, LOAD_NS).await;
+    let attrs_of = |spans: &[SpanRecord], span_id: [u8; 8]| -> Vec<(String, String)> {
+        spans
+            .iter()
+            .find(|span| span.span_id == span_id)
+            .expect("span stored")
+            .attrs
+            .clone()
+    };
+    assert_eq!(
+        attrs_of(&alpha, [0x22; 8]),
+        vec![("_kind".to_string(), "server".to_string())],
+        "the OTLP path stores the span kind as a reserved attribute"
+    );
+    assert_eq!(
+        attrs_of(&alpha, [0x33; 8]),
+        vec![("tenant.tier".to_string(), "gold".to_string())]
+    );
+
+    let export_pq = dir.path().join("export.parquet");
+    let report = export_window(&store, "alpha", T0, T1, &mapping, &export_pq)
+        .await
+        .expect("export succeeds");
+    assert_eq!(report.rows_written, 3);
+    assert_eq!(
+        report.spans_with_unwritten_attributes, 2,
+        "the _kind span and the tenant.tier span; the mapped-only span lost nothing"
+    );
+
+    load_file(&store, &export_pq, "beta", &mapping, LOAD_NS + ONE_SEC_NS).await;
+    let beta = stored(&store, "beta", T0, T1, LOAD_NS + ONE_SEC_NS).await;
+    let expected: Vec<SpanRecord> = alpha
+        .into_iter()
+        .map(|mut span| {
+            span.attrs
+                .retain(|(key, _)| key != "_kind" && key != "tenant.tier");
+            span
+        })
+        .collect();
+    assert_eq!(
+        beta, expected,
+        "the re-loaded spans lack exactly the attributes the file does not carry"
+    );
+    assert!(attrs_of(&beta, [0x22; 8]).is_empty());
+    assert!(attrs_of(&beta, [0x33; 8]).is_empty());
 }
 
 /// Loads `rows` into tenant `alpha` under [`SPANS_MAPPING`], exports

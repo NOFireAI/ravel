@@ -1228,13 +1228,17 @@ parent ids (a null parent is a root span), the name, `start_ts` and `end_ts`
 each in its own declared unit, and the status code and message. Each mapped
 attribute is written in its declared type. Spans store attributes as strings,
 so an attribute is written as the typed value that a load turns back into the
-same string. The export refuses the whole window by name, and writes nothing,
-when a span would not re-load as the same span: a start or end finer than its
-declared unit, a start a load would re-time or refuse, or a mapped attribute
-whose stored string its declared type cannot reproduce (`"007"` declared
-`i64`). Refusals are counted per kind and name the first offending span in
-output order. A `[spans]` mapping has no `attrs_map_column`, so a stored
-attribute the mapping does not name is not written.
+same string. Every mapped field round-trips: the export refuses the whole
+window by name, and writes nothing, when a mapped field of a span would not
+re-load as stored: a start or end finer than its declared unit, a start a load
+would re-time or refuse, or a mapped attribute whose stored string its declared
+type cannot reproduce (`"007"` declared `i64`). Refusals are counted per kind
+and name the first offending span in output order. A `[spans]` mapping has no
+`attrs_map_column`, so the span kind, trace state, flags, events and links a
+span ingested over OTLP carries, and any attribute the mapping does not name,
+are not written. Those are not refused: the report line
+`spans_with_unwritten_attributes` counts the written spans that lost at least
+one of them, and a load of the file gives those spans without them.
 
 ### What the window means
 
@@ -1302,11 +1306,13 @@ visibility rules a query does:
   already absent from the snapshot the export resolves.
 - Subjects with an erasure request in flight are excluded from the decoded
   records, by the same predicates and the same function the SQL log scan
-  applies, so a subject erased but not yet rewritten out of its objects is not
-  exported. The predicates are matched against each record's merged resource,
-  scope and record attributes, as a query sees them, so a subject named only
-  in a resource attribute (a `[[resource_attribute]]` mapping entry, or an
-  OTLP resource attribute) or a scope attribute is excluded too.
+  applies to logs and the SQL spans scan applies to spans, so a subject erased
+  but not yet rewritten out of its objects is not exported. The predicates are
+  matched against each record's or span's merged resource, scope and record
+  attributes, as a query sees them, so a subject named only in a resource
+  attribute (a `[[resource_attribute]]` mapping entry, or an OTLP resource
+  attribute) or a scope attribute is excluded too. For spans, a request with a
+  time window is matched on the span's start time.
 - For metrics, the same predicates are matched against each series' labels by
   the same functions the query engine applies to its fetch: a request with no
   time window excludes every sample of a matching series, and a windowed one
