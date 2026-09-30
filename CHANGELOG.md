@@ -801,9 +801,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now runs through a version 2 record to the record it names, so a rewrite
   over C2 over C1 reclaims C1 too instead of leaving it to be served again,
   except in a bucket whose version 2 supersession does not resolve, where
-  such a chain reclaims nothing and the deleting pass reports it as held: its
+  such a chain reclaims nothing and the pass reports it as held: its
   rewrite's requests are held and its bucket is marked truncated. The chain
-  walk's depth bound counts records as the catalog's walks do. The erasure rewrite pass picks a bucket's live
+  walk's depth bound counts records as the catalog's walks do, and a chain
+  past it, or one that revisits a record, is held the same way instead of
+  failing the pass, so the shard's other buckets are still reclaimed. The
+  maintain loop's observing pass walks every chain and refuses the same way,
+  so `sweep_erasure_requests` keeps a signal's `.dreq`s past their horizon for
+  any refused chain; a deleting pass does not walk a rewrite still inside its
+  horizon, so its holds can miss a refused chain below one. A chain ending at
+  an absent compaction record is not marked truncated, since that record
+  applied no erasure request. The erasure rewrite pass picks a bucket's live
   record through the catalog's shared supersession rules, so C1
   with a version 2 C2 resolves to C2, a rewrite and a version 2 record over the
   same C1 resolve to the rewrite, and a cycle fails the pass with
