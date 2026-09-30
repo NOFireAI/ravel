@@ -4,6 +4,7 @@
 #![allow(clippy::expect_used)]
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
@@ -16,7 +17,7 @@ use datafusion::catalog::TableProvider;
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::logical_expr::ident;
+use datafusion::logical_expr::{Expr, ident};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_datasource_parquet::source::ParquetSource;
 use parquet::arrow::ArrowWriter;
@@ -155,7 +156,7 @@ impl Fixture {
             store,
             services: ReadServices {
                 limiter: Arc::new(GetLimiter::new(4).expect("limiter")),
-                cache: ReadCache::Ram(Arc::new(cache)),
+                cache: Some(ReadCache::Ram(Arc::new(cache))),
                 metadata: Arc::new(MetadataCache::new(8 << 20)),
             },
             registered: Arc::new(TenantParquetStore::new(TENANT)),
@@ -223,6 +224,11 @@ impl Fixture {
             row_count: 0,
             footer_len,
         }
+    }
+
+    /// The services this fixture's readers share, caches included.
+    pub(crate) fn services(&self) -> ReadServices {
+        self.services.clone()
     }
 
     fn pinned(&self, file: ParquetFile) -> Arc<PinnedFile> {
@@ -342,6 +348,25 @@ impl Fixture {
         total
     }
 
+    /// [`ParquetMetaData::memory_size`] of `file`'s footer, without its page
+    /// index, decoded from the stored bytes: the size its metadata cache entry
+    /// is charged.
+    ///
+    /// [`ParquetMetaData::memory_size`]: parquet::file::metadata::ParquetMetaData::memory_size
+    pub(crate) async fn decoded_footer_bytes(&self, file: &ParquetFile) -> u64 {
+        let key = String::from_utf8(file.key.clone()).expect("ascii key");
+        let bytes = self
+            .store
+            .get(&key, GetRange::Full)
+            .await
+            .expect("get")
+            .data;
+        let end = bytes.len() - 8;
+        ParquetMetaDataReader::decode_metadata(&bytes[end - file.footer_len as usize..end])
+            .expect("footer")
+            .memory_size() as u64
+    }
+
     pub(crate) fn session(&self, tables: &[(&str, Arc<ParquetTableProvider>)]) -> SessionContext {
         self.session_with(SessionConfig::new().with_target_partitions(4), tables)
     }
@@ -394,15 +419,33 @@ pub(crate) async fn read_all(
     table: &str,
     columns: &[&str],
 ) -> DfResult<String> {
-    let batches = ctx
-        .table(table)
-        .await?
+    read_where(ctx, table, columns, None).await
+}
+
+/// [`read_all`] of the rows `filter` keeps. The filter reaches the scan as its
+/// predicate, so DataFusion prunes with it and evaluates it in the reader.
+pub(crate) async fn read_where(
+    ctx: &SessionContext,
+    table: &str,
+    columns: &[&str],
+    filter: Option<Expr>,
+) -> DfResult<String> {
+    let mut frame = ctx.table(table).await?;
+    if let Some(filter) = filter {
+        frame = frame.filter(filter)?;
+    }
+    let batches = frame
         .select(columns.iter().map(|c| ident(*c)).collect::<Vec<_>>())?
         .sort(vec![ident(columns[0]).sort(true, false)])?
         .collect()
         .await?;
+    render_rows(&batches)
+}
+
+/// `batches` rendered as `v|v,v|v`, in their order.
+pub(crate) fn render_rows(batches: &[RecordBatch]) -> DfResult<String> {
     let mut rows = Vec::new();
-    for batch in &batches {
+    for batch in batches {
         for row in 0..batch.num_rows() {
             let cells = (0..batch.num_columns())
                 .map(|c| array_value_to_string(batch.column(c), row))
@@ -470,6 +513,8 @@ pub(crate) struct RecordingStore {
     inner: Arc<MemoryStore>,
     suffix_range: bool,
     ranges: Mutex<Vec<GetRange>>,
+    /// Pinned reads left until the one returned short; 0 when none is.
+    short_in: AtomicUsize,
 }
 
 impl RecordingStore {
@@ -478,7 +523,19 @@ impl RecordingStore {
             inner,
             suffix_range,
             ranges: Mutex::new(Vec::new()),
+            short_in: AtomicUsize::new(0),
         }
+    }
+
+    /// Return the next pinned read one byte short, as a store dropping the
+    /// end of a body would.
+    pub(crate) fn shorten_next_read(&self) {
+        self.shorten_read(1);
+    }
+
+    /// Return the `nth` pinned read from now (1 for the next) one byte short.
+    pub(crate) fn shorten_read(&self, nth: usize) {
+        self.short_in.store(nth, Ordering::SeqCst);
     }
 
     pub(crate) fn ranges(&self) -> Vec<GetRange> {
@@ -519,7 +576,17 @@ impl ObjectStoreBackend for RecordingStore {
         pin: &Pin,
     ) -> Result<PinnedRead, StoreError> {
         self.record(&range);
-        self.inner.get_pinned(key, range, pin).await
+        let mut read = self.inner.get_pinned(key, range, pin).await?;
+        let left = self
+            .short_in
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            });
+        if left == Ok(1) {
+            let data = &mut read.outcome.data;
+            *data = data.slice(..data.len().saturating_sub(1));
+        }
+        Ok(read)
     }
 
     async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {

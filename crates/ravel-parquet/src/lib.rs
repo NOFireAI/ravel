@@ -6,7 +6,8 @@
 //! - [`PinnedParquetReader`], an `AsyncFileReader` for one manifest file that
 //!   reads through the process-wide `GetLimiter` and `ReadCache`, pins every
 //!   read to the manifest's ETag and version, and charges the footer read to
-//!   the Probe phase and every other read to the Scan phase;
+//!   the Probe phase and every other read to the Scan phase; it does not use
+//!   the file's page index;
 //!   [`PinnedReaderFactory`] builds one per file DataFusion opens;
 //! - [`MetadataCache`], a decoded-footer cache owned by Ravel, bounded in
 //!   bytes, keyed by tenant hash and pinned identity, held outside any
@@ -19,8 +20,9 @@
 //!   by `ravel-pqtable` before the session is built, and never lists the
 //!   store while planning.
 //!
-//! Nothing outside this crate's tests constructs these yet: routing SQL to
-//! [`ParquetTableProvider`] is issue #2053.
+//! `ravel-sql`'s executor builds one [`ParquetTableProvider`] per Parquet
+//! table a statement names, after resolving its manifest, and a session over
+//! them whose registry is a [`SingleStoreRegistry`].
 
 mod error;
 mod metadata_cache;
