@@ -34,6 +34,25 @@ async fn start_test_server_with(
     fold_enabled: bool,
     heartbeat: Option<Heartbeat>,
 ) -> ravel_server::Running {
+    start_test_server_with_store_metrics(
+        mode,
+        process_memory_budget_bytes,
+        fold_enabled,
+        heartbeat,
+        Arc::new(StoreMetrics::default()),
+    )
+    .await
+}
+
+/// [`start_test_server_with`], serving the caller's `store_metrics` at
+/// `/metrics` so a test can move its counters and read them back scraped.
+async fn start_test_server_with_store_metrics(
+    mode: Mode,
+    process_memory_budget_bytes: u64,
+    fold_enabled: bool,
+    heartbeat: Option<Heartbeat>,
+    store_metrics: Arc<StoreMetrics>,
+) -> ravel_server::Running {
     let mut tokens = HashMap::new();
     tokens.insert(TOKEN.to_string(), TenantId::new("acme"));
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
@@ -95,7 +114,6 @@ async fn start_test_server_with(
             1024,
         ),
     };
-    let store_metrics = Arc::new(StoreMetrics::default());
     match heartbeat {
         Some(heartbeat) => ravel_server::start_with_heartbeat(
             config,
@@ -299,6 +317,170 @@ async fn metrics_store_probe_last_run_gauge_on_rendered_metrics() {
 
         running.shutdown().await.expect("graceful shutdown");
     }
+}
+
+/// Bodies a versioned, locked, compliant bucket answers the control plane's
+/// three server-side GETs with.
+fn fake_bucket_body(subresource: &str) -> &'static str {
+    match subresource {
+        "versioning" => {
+            "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"
+        }
+        "lifecycle" => {
+            "<LifecycleConfiguration><Rule><ID>ravel</ID><Status>Enabled</Status><Filter/>\
+             <NoncurrentVersionExpiration><NoncurrentDays>30</NoncurrentDays>\
+             </NoncurrentVersionExpiration>\
+             <Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration>\
+             <AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation>\
+             </AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>"
+        }
+        "object-lock" => {
+            "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+             </ObjectLockConfiguration>"
+        }
+        other => panic!("unexpected subresource {other:?}"),
+    }
+}
+
+/// A fake S3 endpoint over [`fake_bucket_body`], returning its base URL and
+/// the count of requests and body bytes it served.
+async fn spawn_fake_bucket() -> (
+    String,
+    Arc<std::sync::atomic::AtomicU64>,
+    Arc<std::sync::atomic::AtomicU64>,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let served = Arc::new(AtomicU64::new(0));
+    let served_bytes = Arc::new(AtomicU64::new(0));
+    let (requests, bytes) = (Arc::clone(&served), Arc::clone(&served_bytes));
+    let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+        let (requests, bytes) = (Arc::clone(&requests), Arc::clone(&bytes));
+        async move {
+            let query = uri.query().unwrap_or("");
+            let subresource = query.split(['=', '&']).next().unwrap_or("");
+            let body = fake_bucket_body(subresource);
+            requests.fetch_add(1, Ordering::Relaxed);
+            bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
+            body
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), served, served_bytes)
+}
+
+/// An `S3Store` on `endpoint` recording into `metrics`.
+fn s3_store_on(endpoint: String, metrics: &Arc<StoreMetrics>) -> ravel_object_store::s3::S3Store {
+    ravel_object_store::s3::S3Store::with_metrics(
+        ravel_object_store::s3::S3Config {
+            bucket: "ravel-test".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: Some(endpoint),
+            access_key_id: "test".to_string(),
+            secret_access_key: "test".to_string(),
+            allow_http: true,
+            force_path_style: true,
+            kms_key_id: None,
+            session_token: None,
+            credentials_file: None,
+            auth: Default::default(),
+            instance_metadata_endpoint: None,
+        },
+        Arc::clone(metrics),
+    )
+    .expect("store")
+}
+
+/// The one sample line of the unlabelled-but-`mode` family `name`. The same
+/// body as `family_samples` in `src/metrics.rs`'s test module; keep the two in
+/// step.
+fn mode_only_samples<'a>(body: &'a str, name: &str) -> Vec<&'a str> {
+    body.lines()
+        .filter(|line| {
+            line.strip_prefix(name)
+                .is_some_and(|rest| rest.starts_with('{') || rest.starts_with(' '))
+        })
+        .collect()
+}
+
+/// The unverified-read counter and the three bucket-protection control-plane
+/// counters on a live scrape, read from the `StoreMetrics` handle the server
+/// was started with. The control-plane counts are moved by real probes: one
+/// `S3Store` against a fake bucket (three GETs answered, 568 body bytes) and
+/// one against a closed port (three GETs sent, none answered), both recording
+/// into that handle, so `requests`, `calls` and `response_bytes` all differ and
+/// a family rendering the wrong field fails. None of it reaches the per-op
+/// `ravel_store_*` families.
+#[tokio::test]
+async fn metrics_render_get_unverified_and_control_plane_counters() {
+    use std::sync::atomic::Ordering;
+
+    use ravel_object_store::conformance::{BucketControlPlane, BucketProtectionParams};
+    use ravel_object_store::instrument::ControlPlaneMetricsSnapshot;
+
+    let metrics: Arc<StoreMetrics> = Arc::default();
+    for _ in 0..4 {
+        metrics.record_get_unverified();
+    }
+
+    let (endpoint, served, served_bytes) = spawn_fake_bucket().await;
+    s3_store_on(endpoint, &metrics)
+        .bucket_protection_report(&BucketProtectionParams::default())
+        .await;
+    assert_eq!(served.load(Ordering::Relaxed), 3);
+    assert_eq!(served_bytes.load(Ordering::Relaxed), 568);
+
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let closed_base = format!("http://{}", closed.local_addr().expect("addr"));
+    drop(closed);
+    s3_store_on(closed_base, &metrics)
+        .bucket_protection_report(&BucketProtectionParams::default())
+        .await;
+
+    assert_eq!(
+        metrics.control_plane(),
+        ControlPlaneMetricsSnapshot {
+            requests: 6,
+            calls: 3,
+            response_bytes: 568,
+        }
+    );
+
+    let running =
+        start_test_server_with_store_metrics(Mode::Query, u64::MAX, false, None, metrics).await;
+    let body = scrape(&running).await;
+    running.shutdown().await.expect("graceful shutdown");
+
+    for (name, value) in [
+        ("ravel_store_get_unverified_total", 4),
+        ("ravel_store_control_plane_requests_total", 6),
+        ("ravel_store_control_plane_calls_total", 3),
+        ("ravel_store_control_plane_response_bytes_total", 568),
+    ] {
+        assert_eq!(
+            body.matches(&format!("# TYPE {name} counter\n")).count(),
+            1,
+            "{name} TYPE line:\n{body}"
+        );
+        assert_eq!(
+            mode_only_samples(&body, name),
+            vec![format!("{name}{{mode=\"query\"}} {value}")],
+            "{name} sample:\n{body}"
+        );
+    }
+    assert!(
+        !body
+            .lines()
+            .any(|line| line.contains("control_plane") && line.contains("op=\"")),
+        "no control-plane series under an op label:\n{body}"
+    );
 }
 
 /// ADR-0873's three observability families on a live `/metrics` scrape.
