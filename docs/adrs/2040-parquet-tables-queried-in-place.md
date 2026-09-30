@@ -187,7 +187,7 @@ carries:
 
 The manifest carries no Arrow schema. Every file in a table must have the
 same Parquet schema, compared on the footer's schema elements when the
-table is created. The reader infers the Arrow schema from one file's footer
+table is created (narrowed by the schema-comparison amendment below). The reader infers the Arrow schema from one file's footer
 at plan time, through DataFusion's own Parquet schema inference, so no
 schema is encoded by one arrow major and decoded by another.
 
@@ -836,3 +836,39 @@ Row-group statistics pruning and D6's `pushdown_filters` are unchanged. The
 cost is page-level pruning: on a file that carries a page index, a filter
 that only partly matches a row group reads every page of that row group's
 column chunks instead of only the pages its column index would have kept.
+
+## Amendment (2026-09-30): the schema comparison uses the cleared Arrow schema, and two more implementation details from `snapshot_location`
+
+<!-- amendment-applies: sections="D1. A table is a pinned snapshot of Parquet files where they already are" pointer="schema-comparison amendment" -->
+<!-- amendment-supersedes: phrase="compared on the footer's schema elements" pointer="schema-comparison amendment" -->
+
+The wave 1 checkpoint review of task T3 (epic #2040, issue #2052) found D1
+describing a comparison the code does not make, and omitting two details
+`snapshot_location` (`crates/ravel-parquet/src/snapshot.rs`) already
+implements.
+
+**The schema comparison is on the cleared Arrow schema, not the footer's
+raw schema elements.** `snapshot_location` builds the Arrow schema from
+each file's footer the same way the provider infers it (`file_schema`),
+with the schema's and every top-level field's metadata cleared, and
+compares those. A `PARQUET:field_id` difference between two files' same
+column is admitted, since the provider's own metadata clearing would drop
+it anyway; two files differing only in an embedded `ARROW:schema` hint are
+refused, which the literal footer-schema-elements comparison D1 describes
+would admit. Comparing the raw footer elements would make the provider's
+inferred schema for the table depend on which file's footer it happened to
+read at plan time, since the provider reads one file's footer and clears
+the same fields; the cleared comparison at `CREATE` time is what keeps that
+choice immaterial.
+
+**A single-object `LOCATION` is pinned from one HEAD.** When `LOCATION`
+names one object rather than a prefix, `snapshot_location` never lists: it
+takes the object's ETag and size from a single HEAD request, then reads the
+footer under that pin, the same as a listed file's candidate.
+
+**Only a key that would become a file is refused as unaddressable.** The
+object-store-client addressability check (`key_is_addressable`) runs on a
+listed key only after it has already passed the `.parquet`-suffix filter.
+A directory marker or a key of any other suffix is counted among the
+statement's skipped counts and never reaches the addressability check, so
+such a key is never a reason to refuse the `CREATE`.
