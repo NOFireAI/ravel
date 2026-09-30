@@ -3281,8 +3281,11 @@ pub async fn start_with_heartbeat(
             live_set_tx.clone(),
             maintain_clock.clone(),
         )
-        .map_err(|e| {
-            anyhow::anyhow!("maintain GC-config skew re-assert failed against sys/gc: {e}")
+        .map_err(|e| match e {
+            maintain::SpawnError::GcConfig(e) => {
+                anyhow::anyhow!("maintain GC-config skew re-assert failed against sys/gc: {e}")
+            }
+            other => anyhow::anyhow!("maintain task refused to start: {other}"),
         })?
     } else {
         maintain::MaintenanceTasks::none()
