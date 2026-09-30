@@ -127,18 +127,11 @@ pub(super) async fn statement_stream(
     let snapshot = ticket.snapshot();
     let started = tokio::time::timeout(
         budget,
-        // The declared typed attribute columns pinned into the ticket at
-        // `get_flight_info` (ADR-0090): `DoGet` plans against exactly this
-        // list, never a re-resolution that a concurrent cache refresh could
-        // have changed.
-        start_pinned(
-            executor,
-            tenant,
-            &snapshot,
-            &ticket.statement,
-            distributed,
-            &ticket.declared_columns,
-        ),
+        // The declared typed attribute columns (ADR-0090) and the Parquet
+        // manifest versions pinned into the ticket at `get_flight_info`:
+        // `DoGet` plans against exactly these, never a re-resolution that a
+        // concurrent cache refresh or a replaced table could have changed.
+        start_pinned(executor, tenant, &snapshot, &ticket, distributed),
     )
     .await
     .unwrap_or_else(|_| {
@@ -669,25 +662,15 @@ async fn start_pinned(
     executor: &SqlExecutor,
     tenant: TenantHash,
     snapshot: &Snapshot,
-    sql: &str,
+    ticket: &FlightTicket,
     distributed: Option<DistributedScan>,
-    declared: &[crate::DeclaredColumn],
 ) -> Result<(Option<RecordBatch>, PinnedStream, QueryAccounting), SqlError> {
     // At most two passes: the original and the one retry the consistency
     // model allows. Both passes install the same distributed scan; it clones
     // cheaply (a slice `Vec` and an `Arc` client), so a retry re-plans over
     // the same fan-out rather than silently falling back to local.
     for attempt in 0..2u32 {
-        match first_batch(
-            executor,
-            tenant,
-            snapshot,
-            sql,
-            distributed.clone(),
-            declared,
-        )
-        .await
-        {
+        match first_batch(executor, tenant, snapshot, ticket, distributed.clone()).await {
             Ok(started) => return Ok(started),
             Err(err) => match retry_decision(err.is_segment_not_found(), 0, attempt) {
                 RetryDecision::RetryOnce => continue,
@@ -711,9 +694,8 @@ async fn first_batch(
     executor: &SqlExecutor,
     tenant: TenantHash,
     snapshot: &Snapshot,
-    sql: &str,
+    ticket: &FlightTicket,
     distributed: Option<DistributedScan>,
-    declared: &[crate::DeclaredColumn],
 ) -> Result<(Option<RecordBatch>, PinnedStream, QueryAccounting), SqlError> {
     // A fresh handle per attempt, matching `SqlExecutor::run`'s per-attempt
     // accounting so a retried attempt's counters never bleed in. Returned to
@@ -725,12 +707,12 @@ async fn first_batch(
         .plan_pinned_distributed(
             tenant,
             snapshot.clone(),
-            sql,
+            &ticket.statement,
             &accounting,
             distributed,
             PinnedPlanInputs {
-                declared: declared.to_vec(),
-                parquet: ParquetPlan::Unresolved,
+                declared: ticket.declared_columns.clone(),
+                parquet: ParquetPlan::Pinned(ticket.parquet_tables.clone()),
                 budgets: None,
             },
         )

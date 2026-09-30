@@ -59,6 +59,7 @@ use crate::flight::slice::{
 use crate::flight::stream::{DoGetStream, audited_stream, fragment_stream, statement_stream};
 use crate::flight::{ClockRef, FlightAuth, FlightClock, FlightSqlConfig, metadata};
 use crate::flight_ticket::{FlightTicket, SegmentPin, SqlTicketKeys, TicketKey, TicketSurface};
+use crate::parquet::ParquetResolution;
 use crate::validate::validate;
 
 /// The message every prepared-statement method returns. Prepared statements
@@ -441,13 +442,13 @@ impl FlightSqlService for RavelFlightSqlService {
         )?;
 
         // Step 2: resolve exactly once. For the signal tables this snapshot,
-        // and only this snapshot, is what DoGet will execute against. Parquet
-        // tables are the exception: the ticket carries no Parquet state, so
-        // DoGet resolves each table's newest manifest and the tenant's grants
-        // again. A grant removed between the two RPCs fails DoGet with
-        // `LocationNotGranted`. A table replaced between them is read at its
-        // new version, whose schema can differ from the one this FlightInfo
-        // advertised (#2054).
+        // and only this snapshot, is what DoGet will execute against. A
+        // Parquet table is pinned by the version of the manifest this resolve
+        // read, which the ticket carries: DoGet reads exactly that manifest
+        // object, so a table replaced between the RPCs streams the schema this
+        // FlightInfo advertised (#2054, #2240). The tenant's grants are not
+        // pinned: DoGet reads them again, and a grant removed between the two
+        // RPCs fails it with `LocationNotGranted` (ADR-2040 D3).
         //
         // This accounting handle covers this RPC's resolve and logical plan.
         // DoGet (crate::flight::stream) builds its own handle for the execution
@@ -485,6 +486,12 @@ impl FlightSqlService for RavelFlightSqlService {
         // resolve saw pending (ADR-0064 decision 3): `snapshot` is
         // moved into `plan_pinned` just below, so this must be derived first.
         let pending_erasure = ravel_query::erasure::snapshot_pending_erasure_predicates(&snapshot);
+        // The manifest versions this resolve read, for the same reason:
+        // `parquet` is moved into `plan_pinned_with_inputs` just below.
+        let parquet_tables = parquet
+            .as_ref()
+            .map(ParquetResolution::pins)
+            .unwrap_or_default();
 
         // Step 3: plan against the pinned snapshot so the FlightInfo can
         // carry the real result schema and so an unplannable query is
@@ -555,6 +562,8 @@ impl FlightSqlService for RavelFlightSqlService {
             slice_count: 1,
             pending_erasure,
             declared_columns: declared,
+            parquet_tables,
+            budgets: None,
         };
         let info = info.with_endpoint(
             FlightEndpoint::new().with_ticket(self.encode_statement_ticket(tenant, ticket)?),
