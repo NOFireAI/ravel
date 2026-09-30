@@ -1242,7 +1242,7 @@ is off.
 | Metric | Meaning |
 |---|---|
 | `ravel_bucket_protection_conditions_failed` | Gauge. Bucket-protection conditions the startup check observed failed. A failure outside the refusing set (see [Deployment](operations/deployment.md#bucket-protection-at-startup)) starts the process with a warning and counts here. |
-| `ravel_bucket_protection_conditions_unknown` | Gauge. Bucket-protection conditions the startup check could not determine: no API for the call, an access denial, or a response it could not parse. |
+| `ravel_bucket_protection_conditions_unknown` | Gauge. Bucket-protection conditions the startup check could not determine: no API for the call, an access denial, a response it could not parse, or a read that did not finish within 20 seconds. |
 | `ravel_bucket_protection_unknown` | Gauge. `1` whenever `ravel_bucket_protection_conditions_unknown` is nonzero, else `0`. |
 
 The startup check counts the seven conditions it evaluates: `versioning`,
@@ -1253,13 +1253,23 @@ verify-protection` checks, so neither ever counts here. On `--store s3` the
 check reads the bucket's configuration with three read-only GETs, counted in
 the control-plane counters above. On every other backend it cannot read the
 configuration at all, so all seven conditions count as unknown and
-`ravel_bucket_protection_unknown` reads `1`.
+`ravel_bucket_protection_unknown` reads `1`. The same happens on S3 when the
+read has not finished within 20 seconds, or when the process's identity lacks
+the three read permissions, which no shipped IAM template grants (see
+[Deployment](operations/deployment.md#bucket-protection-at-startup)).
 
 Alert on `ravel_bucket_protection_unknown == 1`: the shipped
-`RavelBucketProtectionUnknown` rule does. A zero on
-`ravel_bucket_protection_conditions_failed` is evidence that the bucket is
-compliant only when `ravel_bucket_protection_conditions_unknown` is also zero:
-a condition the check could not determine is not a condition that passed. A
+`RavelBucketProtectionUnknown` rule does. The shipped
+`RavelBucketProtectionConditionsFailed` rule alerts on
+`ravel_bucket_protection_conditions_failed > 0`, a process that started with
+a failed condition outside the refusing set. A zero on
+`ravel_bucket_protection_conditions_failed` is evidence that the bucket passes
+the seven conditions the server checks only when
+`ravel_bucket_protection_conditions_unknown` is also zero: a condition the
+check could not determine is not a condition that passed. Even then it says
+nothing about `delete-marker-replication` or the `NoncurrentDays` value, which
+`ravel-cli store verify-protection` checks, or about `object-retention`, which
+no Ravel command checks yet. A
 rule or dashboard that reads `conditions_failed == 0` as healthy must also
 require `conditions_unknown == 0`. The values are those of the last startup,
 so they do not move when the bucket's configuration changes under a running

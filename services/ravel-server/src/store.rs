@@ -1159,6 +1159,72 @@ mod tests {
         );
     }
 
+    /// `BuiltStore::s3` is the base store the data path writes through, not a
+    /// second store built from the same config. The observed store clock is
+    /// kept per `S3Store` instance, so a write through `foreground` leaves an
+    /// observation on `s3` only when the two share that instance. Covers the
+    /// plain chain and the `--tenant-kms-config` chain, whose unrouted writes
+    /// go to its default store. Flipped line: `let s3 = Some(Arc::clone(&store))`
+    /// in `build_store`, replaced by a fresh `S3Store` from the same config.
+    #[tokio::test]
+    async fn built_s3_handle_is_the_store_the_data_path_writes_through() {
+        use clap::Parser;
+        use std::io::Write;
+
+        let (endpoint, _mock) = spawn_mock_s3().await;
+        let mut kms_file = tempfile::NamedTempFile::new().expect("create temp tenant-kms-config");
+        kms_file
+            .write_all(
+                br#"
+                    [tenants]
+                    acme = "arn:aws:kms:us-east-1:111122223333:key/acme"
+                "#,
+            )
+            .expect("write temp file");
+        let kms_path = kms_file.path().to_str().expect("temp path is valid utf-8");
+
+        for kms_args in [vec![], vec!["--tenant-kms-config", kms_path]] {
+            let mut args = vec![
+                "ravel-server",
+                "--store",
+                "s3",
+                "--s3-bucket",
+                "ravel-test",
+                "--s3-endpoint",
+                &endpoint,
+                "--s3-access-key",
+                "test",
+                "--s3-secret-key",
+                "test",
+            ];
+            args.extend(kms_args.iter().copied());
+            let cli = Cli::try_parse_from(args).expect("flags parse");
+            let built = build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES)
+                .expect("dummy S3 config must build without network access");
+            let s3 = built.s3.expect("--store s3 must return the base S3Store");
+            assert_eq!(
+                ObjectStoreBackend::observed_store_time_ns(s3.as_ref()),
+                None,
+                "precondition: no response observed before any request ({kms_args:?})"
+            );
+
+            built
+                .foreground
+                .put(
+                    "unrouted/seg/0001",
+                    Bytes::from_static(b"payload"),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("put through the data path");
+
+            assert!(
+                ObjectStoreBackend::observed_store_time_ns(s3.as_ref()).is_some(),
+                "a write through the data path must land on BuiltStore::s3 ({kms_args:?})"
+            );
+        }
+    }
+
     /// A KMS-routed write's billed HTTP requests are counted into the SAME
     /// metrics handle the base store and the outer `InstrumentedStore` share
     /// (issue #928). Before the fix, `KmsRoutingStore` built its per-tenant

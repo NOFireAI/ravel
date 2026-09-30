@@ -1689,7 +1689,7 @@
       "id": 26,
       "type": "timeseries",
       "title": "Probe failures, cycle age and bucket protection",
-      "description": "Probe failures, how long ago the probe last completed a cycle, and whether Ravel could establish that the bucket is versioned and protected. The cycle age is the liveness signal: the failure counter and the protection gauge both move only while the probe task is alive, so a dead task freezes them at a healthy-looking value while the age keeps climbing. An unknown protection state is not a safe state.",
+      "description": "Probe failures, how long ago the probe last completed a cycle, and what the --require-bucket-protection startup check found: whether any bucket-protection condition was unknown, and how many failed without refusing startup. The cycle age is the liveness signal: the failure counter moves only while the probe task is alive, so a dead task freezes it at a healthy-looking value while the age keeps climbing. The protection gauges are set once per start and do not move while the process runs. An unknown protection state is not a safe state.",
       "gridPos": {
         "h": 8,
         "w": 8,
@@ -1730,6 +1730,30 @@
               {
                 "id": "custom.axisLabel",
                 "value": "protection unknown"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "protection conditions failed"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "none"
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "protection conditions failed"
               }
             ]
           },
@@ -1782,6 +1806,15 @@
           },
           "legendFormat": "probe cycle age",
           "expr": "max(time() - ravel_store_probe_last_run_timestamp_seconds)"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "legendFormat": "protection conditions failed",
+          "expr": "max(ravel_bucket_protection_conditions_failed)"
         }
       ]
     },

@@ -154,7 +154,11 @@ with three read-only GETs (`?versioning`, `?lifecycle`, `?object-lock`) signed
 with the store's own credentials, so that identity needs
 `s3:GetBucketVersioning`, `s3:GetLifecycleConfiguration` and
 `s3:GetBucketObjectLockConfiguration`; a denied call reads as unknown, not
-as a failure. Under `--tenant-kms-config` it reads the same bucket: every
+as a failure. None of the IAM templates under `deploy/iam/` grants those three
+actions to a server role, so on AWS a
+server running under a shipped template reads every condition as unknown and
+starts with a warning: attach the three actions to its role yourself for the
+check to see the bucket. Under `--tenant-kms-config` it reads the same bucket: every
 tenant's objects live in the one bucket, and only the encryption key differs
 per tenant. Each condition comes back passed, failed or unknown:
 
@@ -163,17 +167,28 @@ per tenant. Each condition comes back passed, failed or unknown:
   enabled `AbortIncompleteMultipartUpload` rule of seven days or less
   covering the data), `no-foreign-rule` (another expiration or transition
   rule targets `t/` or `sys/`), and `noncurrent-expiration` on a versioned
-  bucket (no enabled rule expiring noncurrent versions over `t/`). The server
-  checks only that such a rule exists, not its `NoncurrentDays`; `ravel-cli
-  store verify-protection --expected-noncurrent-days` checks the value.
+  bucket. That last one fails when no enabled rule expires noncurrent
+  versions over all of `t/`, when a covering rule also keeps
+  `NewerNoncurrentVersions`, when covering rules disagree on
+  `NoncurrentDays`, or when a rule over part of `t/` expires noncurrent
+  versions sooner than the covering rules do. The server has no expected
+  `E_v`, so it does not compare a covering rule's `NoncurrentDays` with one;
+  `ravel-cli store verify-protection --expected-noncurrent-days` checks the
+  value.
 - Any other failed condition (`versioning`, `expired-delete-marker`,
   `rule-scope`, or `noncurrent-expiration` on an unversioned bucket) logs one
   warning and starts.
 - An unknown condition logs one warning and starts. On every backend other
   than S3 the check cannot read the configuration, so every condition is
   unknown.
+- The whole read is bounded to 20 seconds, so a stalled endpoint cannot hold
+  startup past the Kubernetes operator's liveness probe (about 35 seconds).
+  A read that has not finished by then leaves every condition unknown, which
+  warns and starts.
 - `delete-marker-replication` and `object-retention` are not checked at
-  startup; run `ravel-cli store verify-protection` for them.
+  startup. `ravel-cli store verify-protection` checks the first; no Ravel
+  command checks object retention yet, so verify it by hand as the disaster
+  recovery guide describes.
 
 The check sets `ravel_bucket_protection_conditions_failed`,
 `ravel_bucket_protection_conditions_unknown` and
@@ -185,7 +200,13 @@ a running process is seen at the next restart.
 The flag is off by default, so a development process that does not pass it
 starts without the gate and sends none of those GETs. The Kubernetes operator sets it unconditionally for
 every cluster it reconciles: the custom resource carries no development or
-staging profile field to gate on.
+staging profile field to gate on. Every bucket a `RavelCluster` points at must
+therefore be created with Object Lock enabled, versioning on, and the
+sanctioned lifecycle rules, or its pods refuse to start. The dev bucket Jobs in
+`deploy/k8s/floci.yaml` and `deploy/k8s/rustfs.yaml`, and the compose
+`createbucket` one-shots, create such a bucket: one enabled rule over the whole
+bucket with `ExpiredObjectDeleteMarker`, `NoncurrentDays` 1 and
+`AbortIncompleteMultipartUpload` after 7 days.
 
 `ravel-cli store verify-protection --expected-noncurrent-days <E_v>` checks
 the whole bucket half of the contract against an S3 bucket's own

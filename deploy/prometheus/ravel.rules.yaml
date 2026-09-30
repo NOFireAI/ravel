@@ -603,6 +603,25 @@ groups:
             The guide states this condition with no duration, so no for: is
             set.
           runbook: docs/guides/operations/troubleshooting.md#readiness-storage-and-authentication
+      - alert: RavelBucketProtectionConditionsFailed
+        expr: |
+          ravel_bucket_protection_conditions_failed > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            The bucket failed at least one bucket-protection condition at
+            startup that does not refuse to start, while
+            --require-bucket-protection is set
+          description: >-
+            The process started, but the bucket fails a condition of the
+            required bucket configuration, such as versioning off or no
+            expired-delete-marker cleanup. The startup warning names each
+            failed condition; fix it at the bucket layer.
+          as_documented: >-
+            The guide states this condition with no duration, so no for: is
+            set.
+          runbook: docs/guides/operations/troubleshooting.md#readiness-storage-and-authentication
       - alert: RavelDurableAuthRefreshFailing
         expr: |
           increase(ravel_durable_auth_refresh_failures_total[15m]) > 0

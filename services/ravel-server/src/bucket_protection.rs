@@ -11,8 +11,11 @@
 //!   data), `no-foreign-rule` failed (another expiration or transition rule
 //!   targets `t/` or `sys/`), and `noncurrent-expiration` failed while
 //!   `versioning` passed (versioning on without a noncurrent-version
-//!   expiration rule). The server has no expected `E_v`, so
-//!   `noncurrent-expiration` asks only that a covering rule exists.
+//!   expiration rule). The server has no expected `E_v`, so it does not check
+//!   a covering rule's `NoncurrentDays` against one; the condition still
+//!   fails on a covering rule that also sets `NewerNoncurrentVersions`, on
+//!   covering rules that disagree on `NoncurrentDays`, and on a rule over part
+//!   of `t/` that expires noncurrent versions sooner than they agree on.
 //! - Any other failed condition is counted and logged, not fatal.
 //! - `delete-marker-replication` and `object-retention` are checked only by
 //!   `ravel-cli store verify-protection`. The server has no replication or
@@ -21,6 +24,10 @@
 //! - An unknown condition (no API for the call, an access denial, or a
 //!   response the reader cannot parse) never refuses: it logs one warning and
 //!   raises the `ravel_bucket_protection_unknown` gauge.
+//! - The whole read is bounded by [`STARTUP_DEADLINE`]. A read that has not
+//!   finished by then makes every checked condition unknown, so a stalled
+//!   endpoint warns and starts instead of holding startup past the liveness
+//!   probe.
 //!
 //! Each check sets three gauges: `ravel_bucket_protection_conditions_failed`
 //! and `ravel_bucket_protection_conditions_unknown` count the checked
@@ -45,6 +52,7 @@
 //! silently-unprotected production deployment impossible to start.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::Context;
 use ravel_object_store::ObjectStoreBackend;
@@ -53,6 +61,12 @@ use ravel_object_store::conformance::{
     ProtectionConditionId, probe_bucket_protection,
 };
 use ravel_object_store::s3::S3Store;
+
+/// Bound on the whole startup read of the protection report. Its GETs run
+/// before any listener binds, one after another, each bounded only by the
+/// store's request timeout (20 s by default), while the operator's liveness
+/// probe restarts a pod that has not answered about 35 s after it started.
+pub const STARTUP_DEADLINE: Duration = Duration::from_secs(20);
 
 /// Count of checked conditions the last [`enforce`] call observed failed.
 /// Process-global, matching the other single-source, no-label `/metrics`
@@ -179,7 +193,8 @@ pub struct BucketProtectionOutcome {
 
 impl BucketProtectionOutcome {
     /// Whether any checked condition was unknown, which is when a zero
-    /// `conditions_failed` is not evidence of a compliant bucket.
+    /// `conditions_failed` is not evidence that the bucket passes the
+    /// conditions the server checks.
     pub fn is_unknown(&self) -> bool {
         self.conditions_unknown > 0
     }
@@ -195,7 +210,8 @@ fn ids_where(report: &BucketProtectionReport, pick: fn(&ConditionState) -> bool)
         .join("; ")
 }
 
-/// Enforce the bucket-protection gate against `source`.
+/// Enforce the bucket-protection gate against `source`, within
+/// [`STARTUP_DEADLINE`].
 ///
 /// Always sets the gauges as a side effect, on a refusal too, so `/metrics`
 /// reflects the latest call. Read-only: the report is built from GETs alone
@@ -206,7 +222,40 @@ pub async fn enforce<S>(source: &S) -> Result<BucketProtectionOutcome, BucketPro
 where
     S: BucketControlPlane + ?Sized,
 {
-    let report = probe_bucket_protection(source, &BucketProtectionParams::default()).await;
+    enforce_within(source, STARTUP_DEADLINE).await
+}
+
+/// Every condition unknown, for a report read that missed its deadline. The
+/// report is assembled only once all of its GETs have answered, so no
+/// condition has been read when the deadline fires.
+fn timed_out_report(deadline: Duration) -> BucketProtectionReport {
+    let detail = format!(
+        "the bucket-protection read did not finish within {} ms",
+        deadline.as_millis()
+    );
+    BucketProtectionReport::from_states(
+        ProtectionConditionId::ALL
+            .iter()
+            .map(|id| (*id, ConditionState::Unknown(detail.clone()))),
+    )
+}
+
+/// [`enforce`] with an explicit bound on the report read. A read that has not
+/// finished within `deadline` is abandoned and every checked condition counts
+/// as unknown, which warns and starts.
+pub async fn enforce_within<S>(
+    source: &S,
+    deadline: Duration,
+) -> Result<BucketProtectionOutcome, BucketProtectionError>
+where
+    S: BucketControlPlane + ?Sized,
+{
+    let params = BucketProtectionParams::default();
+    let read = probe_bucket_protection(source, &params);
+    let report = match tokio::time::timeout(deadline, read).await {
+        Ok(report) => report,
+        Err(_) => timed_out_report(deadline),
+    };
     let checked = || {
         report
             .conditions
@@ -622,6 +671,97 @@ mod tests {
         }
     }
 
+    /// An `S3Store` on the fake endpoint at `addr`, counting into `metrics`,
+    /// with the default request timeout.
+    fn s3_store_at(
+        addr: std::net::SocketAddr,
+        metrics: std::sync::Arc<ravel_object_store::StoreMetrics>,
+    ) -> S3Store {
+        S3Store::with_metrics(
+            ravel_object_store::s3::S3Config {
+                bucket: "ravel-test".to_string(),
+                region: "us-east-1".to_string(),
+                endpoint: Some(format!("http://{addr}")),
+                access_key_id: "test".to_string(),
+                secret_access_key: "test".to_string(),
+                allow_http: true,
+                force_path_style: true,
+                kms_key_id: None,
+                session_token: None,
+                credentials_file: None,
+                auth: Default::default(),
+                instance_metadata_endpoint: None,
+            },
+            metrics,
+        )
+        .expect("store")
+    }
+
+    /// Flipped line: `enforce_within`'s `tokio::time::timeout(deadline, read)`.
+    /// The endpoint accepts every connection and never answers, so each GET
+    /// would otherwise wait out the store's 20 s request timeout, three in a
+    /// row. Under the deadline the check gives up after the first GET, counts
+    /// all seven checked conditions unknown, and starts.
+    #[tokio::test]
+    async fn a_stalled_endpoint_starts_within_the_deadline_with_every_condition_unknown() {
+        use std::sync::Arc;
+
+        use ravel_object_store::StoreMetrics;
+        use ravel_object_store::instrument::ControlPlaneMetricsSnapshot;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let metrics: Arc<StoreMetrics> = Arc::default();
+        let store = s3_store_at(addr, Arc::clone(&metrics));
+
+        let _guard = GAUGE_TEST_LOCK.lock().await;
+        let deadline = Duration::from_millis(500);
+        let started = std::time::Instant::now();
+        let outcome = enforce_within(&store, deadline)
+            .await
+            .expect("a stalled read must warn and start, not refuse");
+        let elapsed = started.elapsed();
+        // Far below one 20 s request timeout: the deadline, not the request
+        // timeout, ended the read.
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the check took {elapsed:?} against a {deadline:?} deadline"
+        );
+        assert_eq!(
+            outcome,
+            BucketProtectionOutcome {
+                conditions_failed: 0,
+                conditions_unknown: 7,
+            }
+        );
+        assert_eq!(bucket_protection_gauges(), gauges(1, 0, 7));
+        assert_eq!(
+            metrics.control_plane(),
+            ControlPlaneMetricsSnapshot {
+                requests: 1,
+                calls: 0,
+                response_bytes: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn the_startup_deadline_ends_before_the_operator_liveness_budget() {
+        // The operator's liveness probe: 5 s initial delay, then three failed
+        // 10 s periods (services/ravel-operator/src/reconcile.rs, `probes_on`).
+        let liveness_budget = Duration::from_secs(5 + 3 * 10);
+        assert_eq!(STARTUP_DEADLINE, Duration::from_secs(20));
+        assert!(STARTUP_DEADLINE < liveness_budget);
+    }
+
     /// Flipped line: `enforce`'s single `probe_bucket_protection` call. One
     /// startup check is one report, three GETs (versioning, lifecycle,
     /// object-lock), and a compliant bucket leaves every gauge at 0.
@@ -631,7 +771,6 @@ mod tests {
 
         use ravel_object_store::StoreMetrics;
         use ravel_object_store::instrument::ControlPlaneMetricsSnapshot;
-        use ravel_object_store::s3::S3Config;
 
         let served = Arc::new(AtomicU64::new(0));
         let served_bytes = Arc::new(AtomicU64::new(0));
@@ -656,24 +795,7 @@ mod tests {
         });
 
         let metrics: Arc<StoreMetrics> = Arc::default();
-        let store = S3Store::with_metrics(
-            S3Config {
-                bucket: "ravel-test".to_string(),
-                region: "us-east-1".to_string(),
-                endpoint: Some(format!("http://{addr}")),
-                access_key_id: "test".to_string(),
-                secret_access_key: "test".to_string(),
-                allow_http: true,
-                force_path_style: true,
-                kms_key_id: None,
-                session_token: None,
-                credentials_file: None,
-                auth: Default::default(),
-                instance_metadata_endpoint: None,
-            },
-            Arc::clone(&metrics),
-        )
-        .expect("store");
+        let store = s3_store_at(addr, Arc::clone(&metrics));
 
         let _guard = GAUGE_TEST_LOCK.lock().await;
         let outcome = enforce(&store)

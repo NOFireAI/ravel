@@ -533,10 +533,14 @@ pub struct Cli {
     /// Gate startup on the ADR-0072 decision 3 bucket-protection contract
     /// (docs/object-store-contract.md "Required bucket configuration"). On
     /// `--store s3` the check reads the bucket's versioning, lifecycle and
-    /// Object Lock configuration: Object Lock off, no abort-multipart rule, a
-    /// foreign lifecycle rule, or versioning on without noncurrent expiration
-    /// refuses to start; any other failed or undetermined condition warns and
-    /// sets the `ravel_bucket_protection_*` gauges.
+    /// Object Lock configuration: Object Lock off, no enabled abort-multipart
+    /// rule of 7 days or less, a foreign lifecycle rule, or versioning on with
+    /// a failing noncurrent expiration (no covering rule, a covering rule that
+    /// keeps NewerNoncurrentVersions, covering rules that disagree on
+    /// NoncurrentDays, or a narrower rule that expires sooner) refuses to
+    /// start; any other failed or undetermined condition, and a read that has
+    /// not finished within 20 s, warns and sets the
+    /// `ravel_bucket_protection_*` gauges.
     /// Default off: with the flag unset, startup is byte-identical to before
     /// this gate existed. Enforcement itself stays at the bucket/IAM layer
     /// (ADR-0042 decision 3); this only makes a silently-unprotected

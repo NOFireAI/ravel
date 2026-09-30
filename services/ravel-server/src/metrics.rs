@@ -3274,7 +3274,7 @@ fn render_bucket_protection_family(
         ),
         (
             "ravel_bucket_protection_conditions_failed",
-            "Bucket-protection conditions the --require-bucket-protection startup check observed failed, 0 when the flag is off. A zero is evidence of a compliant bucket only while ravel_bucket_protection_conditions_unknown is also 0.",
+            "Bucket-protection conditions the --require-bucket-protection startup check observed failed, 0 when the flag is off. A zero is evidence that the bucket passes the seven conditions the server checks only while ravel_bucket_protection_conditions_unknown is also 0.",
             gauges.conditions_failed,
         ),
         (

@@ -1319,27 +1319,61 @@ Which answer a caller gets depends on the type it probes. The
 [`ObjectLockStatus::Unknown`] and every `BucketConfigProbe` field `Unknown`,
 since the trait exposes no such query. `S3Store` implements them from the
 bucket reads above, so a caller holding the concrete store gets the bucket's
-real answers: `ravel-cli store qualify` and `ravel-cli store
-verify-protection` do. In `store qualify` the lines stay informational and
-never change whether qualification passes, exactly as ADR-0055 §3 designed
-them. `ravel-server` still probes through `dyn ObjectStoreBackend`, so its
-reporting and the startup gate below see `Unknown` for every backend.
+real answers: `ravel-cli store qualify`, `ravel-cli store
+verify-protection` and the `ravel-server` startup gate below do. In `store
+qualify` the lines stay informational and never change whether qualification
+passes, exactly as ADR-0055 §3 designed them. `ravel-server` keeps the base
+`S3Store` beside the wrapped handles it builds and reads the bucket's
+protection report through it; on every other backend it holds only
+`dyn ObjectStoreBackend`, which reports every condition `Unknown`.
 
-`ravel-server --require-bucket-protection` (ADR-0072 decision 3, default
-OFF, env `RAVEL_REQUIRE_BUCKET_PROTECTION`) turns the same probes into a
-startup gate instead of a print statement, so a deployment cannot go into
-production silently unprotected:
+`ravel-server --require-bucket-protection` (ADR-0072 decision 3, ADR-1727
+decision 5, default OFF, env `RAVEL_REQUIRE_BUCKET_PROTECTION`) turns that
+report into a startup gate instead of a print statement, so a deployment
+cannot go into production silently unprotected. On S3 it sends three
+read-only GETs (`?versioning`, `?lifecycle`, `?object-lock`) and evaluates
+seven of the report's conditions: `versioning`, `noncurrent-expiration`,
+`expired-delete-marker`, `abort-multipart`, `rule-scope`, `no-foreign-rule`
+and `object-lock`. It never asks for `delete-marker-replication` or
+`object-retention`.
 
-- `ObjectLockStatus::Disabled`, or a `bucket_config_alarms` `"ALARM:"`
-  entry (the versioning-without-expiration misconfiguration), is fatal:
-  the server refuses to start with a typed error.
-- `ObjectLockStatus::Unknown`, which is what the server sees today for
-  every backend, S3 included, because it probes through
-  `dyn ObjectStoreBackend` rather than the concrete `S3Store`, logs one
-  warning and sets the
-  `ravel_bucket_protection_unknown` gauge to `1`, so a fleet can alarm on
-  it without being blocked by it.
-- `ObjectLockStatus::Enabled` with no alarms starts clean, gauge at `0`.
+- Fatal, refusing to start with a typed error that names each condition:
+  `object-lock` failed (Object Lock disabled, point 4), `abort-multipart`
+  failed (no enabled `AbortIncompleteMultipartUpload` rule of 7 days or less
+  covering `t/`, point 3), `no-foreign-rule` failed (point 2), and
+  `noncurrent-expiration` failed while `versioning` passed (point 1). The
+  server has no expected `E_v`, so it does not compare a covering rule's
+  `NoncurrentDays` with one, but the condition still fails on a covering rule
+  that also keeps `NewerNoncurrentVersions`, on covering rules that disagree
+  on `NoncurrentDays`, and on a rule over part of `t/` that expires
+  noncurrent versions sooner than they agree on.
+- Every other failed condition (`versioning`, `expired-delete-marker`,
+  `rule-scope`, or `noncurrent-expiration` on an unversioned bucket) logs one
+  warning and starts.
+- Every `Unknown` condition logs one warning and starts. The whole read is
+  bounded to 20 seconds, shorter than the Kubernetes operator's liveness
+  probe; a read that has not finished by then leaves every condition
+  `Unknown`.
+- Three gauges carry the result: `ravel_bucket_protection_conditions_failed`
+  and `ravel_bucket_protection_conditions_unknown` count the seven checked
+  conditions observed `Fail` and `Unknown`, and
+  `ravel_bucket_protection_unknown` is `1` whenever the unknown count is
+  nonzero. All three are set on a refusal too, and read `0` with the flag
+  off. A zero failed count is evidence that the bucket passes the seven
+  conditions only while the unknown count is also zero.
+
+The three GETs need `s3:GetBucketVersioning`,
+`s3:GetLifecycleConfiguration` and `s3:GetBucketObjectLockConfiguration` on
+the server's identity. No IAM template under `deploy/iam/` grants them to a
+server role, so on AWS a server running under a shipped
+template reads every condition `Unknown` and starts with a warning until the
+operator attaches those actions.
+
+The Kubernetes operator passes the flag to every `RavelCluster`, so the dev
+bucket launchers (the create-bucket Jobs in `deploy/k8s/` and the compose
+`createbucket` one-shots) create the bucket with Object Lock, versioning on,
+and one enabled whole-bucket rule carrying `ExpiredObjectDeleteMarker`,
+`NoncurrentVersionExpiration` and `AbortIncompleteMultipartUpload` of 7 days.
 
 With the flag off (the default), none of this runs, and startup behavior
 is unchanged from before this gate existed. The flag makes an
