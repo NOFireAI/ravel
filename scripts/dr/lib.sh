@@ -127,6 +127,13 @@ DR_RESTORE_START_KEY="dr/restore-start.json"
 DR_BUCKET_MARKER_KEY="dr/rehearsal-bucket.json"
 DR_HARNESS_PREFIX="dr/"
 
+# The one whole-bucket lifecycle rule a --require-bucket-protection server
+# needs (docs/object-store-contract.md "Required bucket configuration"), the
+# same rule scripts/ci-create-bucket.sh sends. NoncurrentDays 1 keeps a
+# rehearsal bucket's noncurrent versions briefly; a production bucket sets its
+# own E_v (docs/guides/disaster-recovery.md).
+DR_BUCKET_LIFECYCLE='{"Rules":[{"ID":"ravel","Filter":{"Prefix":""},"Status":"Enabled","Expiration":{"ExpiredObjectDeleteMarker":true},"NoncurrentVersionExpiration":{"NoncurrentDays":1},"AbortIncompleteMultipartUpload":{"DaysAfterInitiation":7}}]}'
+
 # The scratch prefix `ravel-cli store qualify` writes under
 # (docs/catalog-and-mvcc.md: `sys/qualify/<run-id>/...`, transient probe
 # fixtures with no lifecycle guarantee beyond the run that wrote them). The
@@ -538,25 +545,91 @@ dr_bucket_marker_present() {
   return 0
 }
 
-# Create the bucket in DR_REGION if it is absent, and stamp it. A bucket
-# created with no region lands in the endpoint's default region, which is a
-# different bucket from the one the rest of the run addresses.
+# Read the bucket's protection configuration back and fail unless it is what a
+# --require-bucket-protection server needs: Object Lock enabled, versioning
+# Enabled, and exactly one enabled lifecycle rule scoped to the whole bucket
+# carrying each action of DR_BUCKET_LIFECYCLE. The lifecycle configuration is
+# read once, as tab-separated fields that each go through to_string so none is
+# empty: rule count, Status, scope (Filter and legacy Prefix as one JSON
+# object), then the three actions.
+dr_check_bucket_protection() {
+  local bucket="$1" got rules rule_status scope markers noncurrent abort
+  got="$(dr_aws s3api get-object-lock-configuration --bucket "${bucket}" \
+    --query ObjectLockConfiguration.ObjectLockEnabled --output text)" || got="(read failed)"
+  if [[ "${got}" != "Enabled" ]]; then
+    dr_log "bucket ${bucket} does not have Object Lock enabled (read ${got}); Object Lock can only be enabled at creation, so delete the bucket and rerun"
+    return 1
+  fi
+  got="$(dr_aws s3api get-bucket-versioning --bucket "${bucket}" \
+    --query Status --output text)" || got="(read failed)"
+  if [[ "${got}" != "Enabled" ]]; then
+    dr_log "bucket ${bucket} does not have versioning enabled (read ${got})"
+    return 1
+  fi
+  if ! got="$(dr_aws s3api get-bucket-lifecycle-configuration --bucket "${bucket}" \
+    --output text --query '[to_string(length(Rules)), to_string(Rules[0].Status), to_string({f: Rules[0].Filter, p: Rules[0].Prefix}), to_string(Rules[0].Expiration.ExpiredObjectDeleteMarker), to_string(Rules[0].NoncurrentVersionExpiration.NoncurrentDays), to_string(Rules[0].AbortIncompleteMultipartUpload.DaysAfterInitiation)]')"; then
+    dr_log "could not read the lifecycle configuration of bucket ${bucket}"
+    return 1
+  fi
+  IFS=$'\t' read -r rules rule_status scope markers noncurrent abort <<<"${got}"
+  if [[ "${rules}" != 1 ]]; then
+    dr_log "bucket ${bucket} carries ${rules} lifecycle rules, not exactly one"
+    return 1
+  fi
+  if [[ "${rule_status}" != Enabled ]]; then
+    dr_log "bucket ${bucket} lifecycle rule is not enabled (read ${rule_status})"
+    return 1
+  fi
+  # The whole-bucket spellings the server's rule parser reads as an empty prefix.
+  case "${scope}" in
+    '{"f":{"Prefix":""},"p":null}' | '{"f":{},"p":null}' | \
+      '{"f":{"And":{"Prefix":""}},"p":null}' | '{"f":null,"p":""}') ;;
+    *)
+      dr_log "bucket ${bucket} lifecycle rule is not scoped to the whole bucket (read ${scope})"
+      return 1
+      ;;
+  esac
+  if [[ "${markers}" != true || "${noncurrent}" != 1 || "${abort}" != 7 ]]; then
+    dr_log "bucket ${bucket} lifecycle rule does not carry each action (read ExpiredObjectDeleteMarker=${markers} NoncurrentDays=${noncurrent} DaysAfterInitiation=${abort})"
+    return 1
+  fi
+}
+
+# Create the bucket in DR_REGION if it is absent, stamp it, and configure it the
+# way a production bucket is (the rehearsal models a production restore):
+# Object Lock at creation, versioning, and the DR_BUCKET_LIFECYCLE rule. A
+# bucket created with no region lands in the endpoint's default region, which
+# is a different bucket from the one the rest of the run addresses.
+#
+# Versioning and lifecycle are put only on a bucket carrying this harness's
+# creation marker, so a bucket someone else configured is read back and never
+# rewritten. Every bucket is read back, and one this harness created before it
+# enabled Object Lock fails there.
 dr_ensure_bucket() {
   local bucket="$1"
-  if dr_bucket_exists "${bucket}"; then
-    return 0
+  if ! dr_bucket_exists "${bucket}"; then
+    dr_log "creating bucket ${bucket} in region ${DR_REGION} with Object Lock"
+    # S3 outside us-east-1 rejects a CreateBucket that carries no matching
+    # LocationConstraint, and us-east-1 rejects one that carries any.
+    if [[ "${DR_REGION}" == "us-east-1" ]]; then
+      dr_aws s3api create-bucket --bucket "${bucket}" \
+        --object-lock-enabled-for-bucket >/dev/null || return 1
+    else
+      dr_aws s3api create-bucket --bucket "${bucket}" \
+        --create-bucket-configuration "LocationConstraint=${DR_REGION}" \
+        --object-lock-enabled-for-bucket >/dev/null || return 1
+    fi
+    dr_write_bucket_marker "${bucket}" || return 1
   fi
-  dr_log "creating bucket ${bucket} in region ${DR_REGION}"
-  # S3 outside us-east-1 rejects a CreateBucket that carries no matching
-  # LocationConstraint, and us-east-1 rejects one that carries any.
-  if [[ "${DR_REGION}" == "us-east-1" ]]; then
-    dr_aws s3api create-bucket --bucket "${bucket}" >/dev/null || return 1
+  if dr_bucket_marker_present "${bucket}"; then
+    dr_aws s3api put-bucket-versioning --bucket "${bucket}" \
+      --versioning-configuration Status=Enabled >/dev/null || return 1
+    dr_aws s3api put-bucket-lifecycle-configuration --bucket "${bucket}" \
+      --lifecycle-configuration "${DR_BUCKET_LIFECYCLE}" >/dev/null || return 1
   else
-    dr_aws s3api create-bucket --bucket "${bucket}" \
-      --create-bucket-configuration "LocationConstraint=${DR_REGION}" \
-      >/dev/null || return 1
+    dr_log "bucket ${bucket} carries no rehearsal marker; reading its configuration back without changing it"
   fi
-  dr_write_bucket_marker "${bucket}"
+  dr_check_bucket_protection "${bucket}"
 }
 
 # Delete every object version and delete marker in a bucket, one DeleteObject
