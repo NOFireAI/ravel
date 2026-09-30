@@ -8,6 +8,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The RLOG writer now chooses each i64 and string page's encoding by its stored size, and writes encoding tags 10 (GCD i64) and 11 (an `observed_ts` equal to `ts`, stored as a reference to it)** (ADR-2135 decisions 3 and 4, issue #2140); no i64 or string page stores more bytes than the encoding chosen before, each page is compressed once per candidate encoding (up to seven for an i64 page, two for a string page), and the reader decodes both tags.
 - **`s3_e2e_bench` counts adaptive-age flushes** (issue #2186). Its printed
   flush breakdown gains an `age_adaptive=` field between `age=` and
   `age_floor=`, matching `ingest_bench`, its JSON report gains
