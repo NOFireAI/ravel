@@ -49,7 +49,8 @@ neither on the wire by default:
   2026-09-30 CLI amendment; `services/ravel-server/src/store.rs:409` via
   `with_metrics`, `s3.rs:638-639`).
   With integrity on, multipart is excluded and a payload above the single-PUT
-  ceiling is refused loudly (`s3.rs:1628-1646`).
+  ceiling is refused loudly (`s3.rs:1628-1646`); for why, and what the
+  multipart path could carry, see the 2026-09-30 multipart amendment below.
 - The GET path passes `range` and `if_match` only (`get_one`,
   `s3.rs:1453-1470`), asks for no checksum and verifies none. `GetOutcome`
   carries `data`, `etag`, `version`, `total_size` and no checksum
@@ -379,3 +380,30 @@ sets both environment variables from `spec.storage.s3.uploadIntegrity` and
 rendered only away from the default, and both fields are inputs to the
 qualification hash, so editing either re-runs the Job. A passing
 qualification now shows the endpoint accepted the configured upload checksum.
+
+## Amendment (2026-09-30, #2227): why multipart stays excluded under upload integrity
+
+<!-- amendment-applies: sections="Context" pointer="2026-09-30 multipart amendment" -->
+
+The adapter's own comments gave the exclusion a reason that is false: that
+multipart parts cannot carry a server-verified checksum. With a checksum
+algorithm set on the client, `object_store` 0.14.1's `create_multipart`
+sends `x-amz-checksum-algorithm`, and `put_part` sends each part through
+`PutRequest::with_payload`, which attaches `x-amz-checksum-crc64nvme` or
+`x-amz-checksum-sha256` whenever `config.checksum` is set. The algorithm is
+set for the whole client, so the explicit `put_multipart` path already sends
+those part checksums whenever integrity is on. `object_store` sends no
+`x-amz-checksum-type`, so what the endpoint records for the completed object
+is its default type for the algorithm: on AWS, a full-object checksum for
+CRC64-NVME and a composite one for SHA-256.
+
+The exclusion stands, with a true reason: a single PUT is one billed request
+where multipart costs parts + 2, and the whole object gets one checksum over
+its bytes as sent. No real endpoint has been checked to verify the part
+checksums, so switching large overwrites to multipart under integrity is a
+later change that needs that real-endpoint check first. The refusal of a
+payload above the single-PUT ceiling is unchanged; its error text no longer
+claims multipart carries no checksum. The Context's `s3.rs:1628-1646` cite
+for the exclusion and the refusal is stale: the exclusion is now at
+`s3.rs:2363-2368` and the refusal at `s3.rs:2377-2384`.
+
