@@ -99,13 +99,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   re-running `migrate` does not clear it and retention ageing the bucket out,
   under the format-version hold, does. Those parts still count in
   `l1_compaction_parts`, so the floor is still refused over them; only the
-  naming is new. A bucket whose authoritative records are below the target is
-  not named this way, a bucket that lists a rewrite record is never named this
-  way (it gets a `rewrite_parts` line only when its rewrite parts are below the
-  target), and a record a version 2 record supersedes is not a loser. A bucket
-  the walk names `loser_only_inputs` that also qualifies here gets this line
-  only, since the two clear the same way. `BlockedReason` gains
-  `LosingRecordParts { below_target }`.
+  naming is new. A bucket listing a rewrite record whose parts are all at the
+  target is named this way too when its losers qualify (issue #2169). A
+  bucket whose authoritative records are below the target is not named this
+  way, a bucket whose rewrite record parts are below the target gets its
+  `rewrite_parts` line only, and a record a version 2 record supersedes is not
+  a loser. A bucket the walk names `loser_only_inputs` that also qualifies
+  here gets this line only, since the two clear the same way. `BlockedReason`
+  gains `LosingRecordParts { below_target }`.
 - **The background supervisor now takes an advisory claim before compacting a
   large bucket, so two processes whose ownership overlaps no longer both pay
   for the same merge** (ADR-1029 decisions 3 to 5, issue #1033). The claim is
