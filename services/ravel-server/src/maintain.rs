@@ -1186,6 +1186,8 @@ impl MaintenanceOwnershipMetrics {
 #[derive(Debug, Clone)]
 pub struct MaintenanceTaskConfig {
     pub enabled: bool,
+    /// Pause between maintenance passes (`--maintain-interval-secs`). A zero
+    /// interval is refused at startup with [`SpawnError::ZeroMaintainInterval`].
     pub interval: Duration,
     pub shard_count: u32,
     /// Compactor knobs (seal margin, part cap, grace, protection horizon).
@@ -1244,6 +1246,22 @@ pub enum SpawnError {
     /// zero; the config's is refused with it so the two cannot disagree.
     #[error("maintenance heartbeat_interval must be non-zero")]
     ZeroHeartbeatInterval,
+    /// A zero `interval` would run every maintenance pass back to back.
+    #[error(
+        "--maintain-interval-secs must be non-zero: a zero maintain interval runs every pass back to back"
+    )]
+    ZeroMaintainInterval,
+}
+
+impl MaintenanceTaskConfig {
+    /// The interval refusal [`spawn`] applies before starting the loop; `start`
+    /// runs it before spawning anything else too.
+    pub fn check_spawnable(&self) -> Result<(), SpawnError> {
+        if self.enabled && self.interval.is_zero() {
+            return Err(SpawnError::ZeroMaintainInterval);
+        }
+        Ok(())
+    }
 }
 
 /// Handle to every spawned maintenance task, for clean shutdown (mirrors
@@ -1301,7 +1319,8 @@ impl MaintenanceTasks {
 /// ever entered with a skew-uncovered horizon.
 ///
 /// A zero `heartbeat_interval` (on `config` or on `worker`) is refused the same
-/// way, with [`SpawnError::ZeroHeartbeatInterval`].
+/// way, with [`SpawnError::ZeroHeartbeatInterval`], and a zero `interval` with
+/// [`SpawnError::ZeroMaintainInterval`].
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     store: Arc<dyn ObjectStoreBackend>,
@@ -1318,6 +1337,8 @@ pub fn spawn(
     if !config.enabled {
         return Ok(MaintenanceTasks::none());
     }
+
+    config.check_spawnable()?;
 
     // The heartbeat task's `tokio::time::interval` runs on the worker's period,
     // which `ravel_server::start` builds from `config.heartbeat_interval`; a

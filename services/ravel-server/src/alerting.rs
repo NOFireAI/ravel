@@ -261,6 +261,8 @@ pub struct AlertQueryEngines {
 #[derive(Debug, Clone)]
 pub struct AlertEvalConfig {
     pub enabled: bool,
+    /// Pause between evaluation ticks (`--alert-eval-interval-secs`). A zero
+    /// interval is refused at startup with [`SpawnError::ZeroEvalInterval`].
     pub interval: Duration,
     /// Static per-tenant rules (ADR-0043 decision 2), loaded once at startup by
     /// [`load_rules_file`]. One evaluator task is spawned per key.
@@ -287,6 +289,27 @@ impl Default for AlertEvalConfig {
             sink_timeout: DEFAULT_SINK_TIMEOUT,
             sql_lookback: DEFAULT_SQL_LOOKBACK,
         }
+    }
+}
+
+/// Why [`spawn`] refused to start the evaluator loops. Nothing is spawned.
+#[derive(Debug, thiserror::Error)]
+pub enum SpawnError {
+    /// A zero `interval` would run every evaluation tick back to back.
+    #[error(
+        "--alert-eval-interval-secs must be non-zero: a zero evaluation interval runs every tick back to back"
+    )]
+    ZeroEvalInterval,
+}
+
+impl AlertEvalConfig {
+    /// The refusal [`spawn`] applies before starting any evaluator; `start`
+    /// runs it before spawning anything else too.
+    pub fn check_spawnable(&self) -> Result<(), SpawnError> {
+        if self.enabled && self.interval.is_zero() {
+            return Err(SpawnError::ZeroEvalInterval);
+        }
+        Ok(())
     }
 }
 
@@ -318,14 +341,17 @@ impl AlertEvalTasks {
 /// Spawn one evaluator loop per tenant that has rules. Returns immediately;
 /// tasks run until [`AlertEvalTasks::shutdown`].
 ///
-/// Fails only if the shared HTTP client cannot be built, which is a startup
-/// misconfiguration rather than a runtime condition.
+/// Fails if the shared HTTP client cannot be built, or with
+/// [`SpawnError::ZeroEvalInterval`] for an enabled config with a zero
+/// `interval`: both are startup misconfigurations rather than runtime
+/// conditions.
 pub fn spawn(
     store: Arc<dyn ObjectStoreBackend>,
     engines: AlertQueryEngines,
     clock: Arc<dyn Clock>,
     config: AlertEvalConfig,
 ) -> anyhow::Result<AlertEvalTasks> {
+    config.check_spawnable()?;
     if !config.enabled || config.rules.is_empty() {
         return Ok(AlertEvalTasks::none());
     }

@@ -455,6 +455,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   throttle words and the timeout handling are unchanged, and every outcome
   stays retryable. The missing-bucket error now reads "bucket does not exist
   (NoSuchBucket)" instead of naming S3, since the GCS path reports it too.
+- **A server started through the library API refuses a zero loop interval**
+  (issue #2273). `ravel_server::start` now refuses a zero fold, maintain,
+  alert-evaluation or JWKS-refresh interval at startup with a typed error
+  naming the flag, as the CLI already did, instead of running that loop with
+  no pause.
 - **A delete against a missing S3 bucket fails instead of reporting success**
   (issue #2265). The S3 adapter read every whole-request 404 as a missing key,
   so a `DeleteObjects` answered `NoSuchBucket` returned the idempotent

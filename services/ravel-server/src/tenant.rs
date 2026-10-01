@@ -56,7 +56,33 @@ pub struct ResolverBundle {
 pub struct OidcRefreshParams {
     pub cache: Arc<OidcJwksCache>,
     pub jwks_url: String,
+    /// Pause between JWKS refetches (`--oidc-jwks-refresh-interval-secs`). A
+    /// zero interval is refused at startup with
+    /// [`JwksRefreshSpawnError::ZeroRefreshInterval`].
     pub interval: Duration,
+}
+
+/// Why [`spawn_jwks_refresh`] refused to start the refresh loop. Nothing is
+/// spawned.
+#[derive(Debug, thiserror::Error)]
+pub enum JwksRefreshSpawnError {
+    /// A zero `interval` would refetch the JWKS back to back.
+    #[error(
+        "--oidc-jwks-refresh-interval-secs must be non-zero: a zero refresh interval refetches the JWKS back to back"
+    )]
+    ZeroRefreshInterval,
+}
+
+impl OidcRefreshParams {
+    /// The refusal [`spawn_jwks_refresh`] applies before starting the loop;
+    /// `start` runs it before spawning anything else, and before the initial
+    /// JWKS fetch.
+    pub fn check_spawnable(&self) -> Result<(), JwksRefreshSpawnError> {
+        if self.interval.is_zero() {
+            return Err(JwksRefreshSpawnError::ZeroRefreshInterval);
+        }
+        Ok(())
+    }
 }
 
 /// Build the full tenant-resolution chain: the static bearer resolver always,
@@ -171,8 +197,12 @@ impl JwksRefreshTask {
 /// immediately; the task runs until [`JwksRefreshTask::shutdown`]. Follows the
 /// same shape as [`crate::maintain::spawn`]: a jittered interval and a `oneshot`
 /// shutdown. The request path never blocks on this: it only reads the cache the
-/// loop writes.
-pub fn spawn_jwks_refresh(params: OidcRefreshParams) -> JwksRefreshTask {
+/// loop writes. A zero `interval` is refused with
+/// [`JwksRefreshSpawnError::ZeroRefreshInterval`] and nothing is spawned.
+pub fn spawn_jwks_refresh(
+    params: OidcRefreshParams,
+) -> Result<JwksRefreshTask, JwksRefreshSpawnError> {
+    params.check_spawnable()?;
     let (tx, rx) = oneshot::channel();
     // Production OS-entropy jitter (ADR-0068 decision 2); the simulation
     // harness does not drive JWKS refresh, so there is no injected variant.
@@ -180,10 +210,10 @@ pub fn spawn_jwks_refresh(params: OidcRefreshParams) -> JwksRefreshTask {
     let handle = tokio::spawn(async move {
         refresh_loop(params.cache, params.jwks_url, params.interval, rng, rx).await;
     });
-    JwksRefreshTask {
+    Ok(JwksRefreshTask {
         shutdown: Some(tx),
         handle: Some(handle),
-    }
+    })
 }
 
 async fn refresh_loop(
@@ -220,4 +250,41 @@ fn jittered(base: Duration, rng: &dyn RngSource) -> Duration {
     }
     let extra_ms = rng.jitter_ms(jitter_bound_ms);
     base + Duration::from_millis(extra_ms)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn params(interval: Duration) -> OidcRefreshParams {
+        OidcRefreshParams {
+            cache: Arc::new(OidcJwksCache::new().expect("OIDC cache builds")),
+            jwks_url: "http://127.0.0.1:9/jwks".to_string(),
+            interval,
+        }
+    }
+
+    /// Flip to watch it fail: delete the `is_zero()` arm of
+    /// `OidcRefreshParams::check_spawnable`; the zero interval then spawns.
+    #[tokio::test]
+    async fn spawn_jwks_refresh_refuses_a_zero_interval() {
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let alive_before = metrics.num_alive_tasks();
+        match spawn_jwks_refresh(params(Duration::ZERO)) {
+            Err(JwksRefreshSpawnError::ZeroRefreshInterval) => {}
+            Ok(task) => {
+                task.shutdown().await;
+                panic!("a zero refresh interval must be refused at spawn");
+            }
+        }
+        assert_eq!(metrics.num_alive_tasks(), alive_before);
+    }
+
+    #[tokio::test]
+    async fn spawn_jwks_refresh_starts_on_a_non_zero_interval() {
+        let task = spawn_jwks_refresh(params(Duration::from_secs(300)))
+            .expect("a non-zero refresh interval spawns");
+        task.shutdown().await;
+    }
 }
