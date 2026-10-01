@@ -581,8 +581,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stays 503, while an undecodable, misfiled or structurally corrupt record, a
   version below the floor, or a checksum mismatch answers 500. A catalog
   decode job the read CPU gate cancelled or closed before it ran stays 503;
-  one that panicked answers 500. Other store errors, timeouts,
-  cancellation and admission refusals keep their classes.
+  one that panicked answers 500. A checksum mismatch on any catalog object
+  GET (`CatalogError::Store` with a `StoreError::Corrupted` source, and on SQL
+  the same source under `LoadColumnStatsError::Store`), which answered the
+  retryable 503, answers 500 on both surfaces, as it already did on a data
+  fetch and a provisioning read (issue #2279). Other store errors,
+  timeouts, cancellation and admission refusals keep their classes.
 - **A catalog decode declared over its ceiling now evicts decoded-cache entries
   until the budget admits it or the caches are empty** (issue #2132). Such a
   decode is charged 0 bytes, and a budget pushed over its limit by
