@@ -415,7 +415,13 @@ mod tests {
     fn reparse(sql: &str) {
         // guarded-parse-allow: the subject is the redacted output, which must
         // re-parse; guarding it would test the guard instead.
-        DFParser::parse_sql(sql).expect("redacted output re-parses as valid SQL");
+        let parsed =
+            DFParser::parse_sql(sql).expect("redacted output re-parses as valid SQL");
+        assert_eq!(
+            parsed.len(),
+            1,
+            "redacted output must re-parse as exactly one statement: {sql}"
+        );
     }
 
     #[test]
@@ -594,6 +600,44 @@ mod tests {
         .expect("CREATE OR REPLACE EXTERNAL TABLE must redact");
         assert!(out.contains("OR REPLACE"), "OR REPLACE preserved: {out}");
         assert!(!out.contains("s3://bucket/t1"), "LOCATION leaked: {out}");
+        reparse(&out);
+    }
+
+    #[test]
+    fn create_external_table_if_not_exists_is_redacted() {
+        let out = redact(
+            "CREATE EXTERNAL TABLE IF NOT EXISTS t1 STORED AS PARQUET LOCATION 's3://bucket/t1/'",
+            &KEY_A,
+        )
+        .expect("CREATE EXTERNAL TABLE IF NOT EXISTS must redact");
+        assert!(
+            out.contains("IF NOT EXISTS"),
+            "IF NOT EXISTS preserved: {out}"
+        );
+        assert!(!out.contains("s3://bucket/t1"), "LOCATION leaked: {out}");
+        reparse(&out);
+    }
+
+    #[test]
+    fn ravel_cast_option_key_with_mixed_case_column_is_rendered() {
+        // Fix for issue #2054: `ravel.cast.EventDate` (ADR-2040 D5's own
+        // example) must round-trip through the audit trail, not just through
+        // `validate_ddl`'s admission check.
+        let out = redact(
+            "CREATE EXTERNAL TABLE t1 STORED AS PARQUET LOCATION 's3://bucket/t1/' \
+             OPTIONS ('ravel.cast.EventDate' 'date-from-days')",
+            &KEY_A,
+        )
+        .expect("the admitted ravel.cast.EventDate form must redact, not reject");
+
+        assert!(
+            out.contains("ravel.cast.EventDate"),
+            "OPTIONS key preserved with its original case: {out}"
+        );
+        assert!(
+            !out.contains("date-from-days"),
+            "OPTIONS value leaked: {out}"
+        );
         reparse(&out);
     }
 
