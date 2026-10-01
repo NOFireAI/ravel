@@ -189,11 +189,23 @@ impl Harness {
 
     /// `GetFlightInfo` for `sql` as `token`, over the fixture's full window.
     pub async fn get_flight_info(&self, token: &str, sql: &str) -> Result<Ticket, Status> {
+        let info = self.get_flight_info_full(token, sql).await?;
+        let endpoint = info.endpoint.first().expect("one endpoint");
+        Ok(endpoint.ticket.clone().expect("endpoint carries a ticket"))
+    }
+
+    /// [`Self::get_flight_info`] returning the whole `FlightInfo`, for a test
+    /// that reads the schema it advertised.
+    pub async fn get_flight_info_full(
+        &self,
+        token: &str,
+        sql: &str,
+    ) -> Result<arrow_flight::FlightInfo, Status> {
         let mut request = Request::new(FlightDescriptor::new_cmd(sql.as_bytes().to_vec()));
         insert(request.metadata_mut(), TOKEN_KEY, token);
         window_metadata(request.metadata_mut());
 
-        let info = self
+        Ok(self
             .service
             .get_flight_info_statement(
                 CommandStatementQuery {
@@ -203,9 +215,7 @@ impl Harness {
                 request,
             )
             .await?
-            .into_inner();
-        let endpoint = info.endpoint.first().expect("one endpoint");
-        Ok(endpoint.ticket.clone().expect("endpoint carries a ticket"))
+            .into_inner())
     }
 
     /// `DoGet` for a ticket as `token`, returning the decoded batches.

@@ -347,6 +347,8 @@ async fn distributed_slice_do_get_excludes_what_the_resolve_saw_pending() {
         slice_count: 1,
         pending_erasure: ravel_query::erasure::snapshot_pending_erasure_predicates(&snapshot),
         declared_columns: Vec::new(),
+        parquet_tables: Vec::new(),
+        budgets: None,
     };
     let config = DistributedFlightConfig {
         workers: Arc::new(ravel_sql::StaticWorkerEndpoints::new([

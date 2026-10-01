@@ -71,7 +71,7 @@
 //!
 //! ```text
 //! magic         4   b"RFT1"
-//! version       1   = 5
+//! version       1   = 8
 //! tenant       16   TenantHash bytes
 //! now_ns        8   i64
 //! deadline_ns   8   i64
@@ -114,6 +114,17 @@
 //!     key_len        4   u32
 //!     key            N   attribute key (UTF-8)
 //!     type_tag       1   1=Str 2=I64 3=Bool 4=Bytes
+//! parquet_count 4   u32   (Parquet tables pinned, <= MAX_STATEMENT_TABLE_NAMES)
+//!   per table:
+//!     name_len       4   u32
+//!     name           N   table name (UTF-8, a valid table name)
+//!     version        8   u64  (the manifest object's version)
+//! budgets_flag  1   0 = none, 1 = the three limits below follow
+//!   if 1, three limits in this order: max_bytes_scanned, max_store_requests,
+//!   max_segments; each is:
+//!     tag            1   0 = absent, 1 = unlimited (not max_segments), 2 = bounded
+//!       if 2:
+//!         limit      8   u64
 //! stmt_len      4   u32   (<= MAX_STATEMENT_LEN)
 //! stmt          N   statement text (UTF-8)
 //! mac          32   keyed BLAKE3-256 over every preceding byte
@@ -245,14 +256,32 @@
 //! reinterpreted under the v7 layout. Consistent with every earlier extension,
 //! this is a version bump on an ephemeral MAC'd blob, not a `.proto` schema
 //! change and not an ADR of its own.
+//!
+//! Version 8 (issue #2240, ADR-2040 D1 and D3) carries the Parquet tables the
+//! statement reads ([`FlightTicket::parquet_tables`]): for each, the table
+//! name and the version of the immutable manifest object `GetFlightInfo`
+//! resolved. A Parquet table has no segment set, so before this version `DoGet`
+//! resolved each table's newest manifest again, and a table replaced between
+//! the two RPCs streamed a schema other than the one `FlightInfo` advertised.
+//! `DoGet` now reads exactly the pinned manifest objects and checks the tenant's
+//! grants as they are at redemption. It also carries the request's lowered
+//! budgets ([`FlightTicket::budgets`]), which `GetFlightInfo` applied while
+//! resolving and planning and which bind `DoGet`'s scans the same way. A v7 (or
+//! earlier) ticket is rejected with [`FlightTicketError::UnsupportedVersion`],
+//! never reinterpreted under the v8 layout. Consistent with every earlier
+//! extension, this is a version bump on an ephemeral MAC'd blob, not a `.proto`
+//! schema change and not an ADR of its own.
 
 use ravel_catalog::{SegmentLevel, SegmentRef};
+use ravel_pqtable::names::validate_table;
 use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest};
 use ravel_query::erasure::ErasurePredicate;
+use ravel_query::{ByteLimit, RequestBudgets, RequestLimit};
 use ravel_types::{CommitToken, TenantHash};
 use uuid::Uuid;
 
 use crate::declared::{DeclaredColumn, DeclaredType};
+use crate::parquet::{MAX_STATEMENT_TABLE_NAMES, ParquetPin};
 
 /// Maximum accepted SQL statement length, in bytes. 64 KiB. Longer
 /// statements are rejected at [`FlightTicket::encode`] time and refused at
@@ -260,7 +289,7 @@ use crate::declared::{DeclaredColumn, DeclaredType};
 pub const MAX_STATEMENT_LEN: usize = 64 * 1024;
 
 const MAGIC: [u8; 4] = *b"RFT1";
-const VERSION: u8 = 7;
+const VERSION: u8 = 8;
 
 /// Length in bytes of the trailing keyed-MAC tag ([`mac`]).
 const MAC_LEN: usize = 32;
@@ -453,9 +482,9 @@ impl SqlTicketKeys {
 
 /// Smallest possible encoded ticket: the fixed header (including the
 /// `slice_index`/`slice_count` pair) plus the trailing MAC, with zero tokens,
-/// zero segments, zero pending-erasure predicates, zero declared columns, and
-/// an empty statement.
-const MIN_ENCODED_LEN: usize = 4 + 1 + 16 + 8 + 8 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + MAC_LEN;
+/// zero segments, zero pending-erasure predicates, zero declared columns, zero
+/// Parquet tables, no budgets, and an empty statement.
+const MIN_ENCODED_LEN: usize = 4 + 1 + 16 + 8 + 8 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 1 + MAC_LEN;
 
 /// One pinned segment inside a [`FlightTicket`]: the wire mirror of a
 /// resolved [`SegmentRef`].
@@ -651,6 +680,17 @@ pub struct FlightTicket {
     /// advertised `FlightInfo` schema. Empty for a metrics/spans query or a
     /// tenant with no declared columns.
     pub declared_columns: Vec<DeclaredColumn>,
+    /// The Parquet tables the statement reads, each at the manifest version
+    /// `GetFlightInfo` resolved (ADR-2040 D1, D3). `DoGet` reads exactly these
+    /// manifest objects and never the table's newest, so the schema it streams
+    /// is the one the `FlightInfo` advertised; it checks the tenant's grants
+    /// as they are at redemption. At most [`MAX_STATEMENT_TABLE_NAMES`]; empty
+    /// for a statement over a signal table. A slice ticket carries none.
+    pub parquet_tables: Vec<ParquetPin>,
+    /// The request's lowered budgets (ADR-1374 decision 3), which can only
+    /// lower the executor's ceilings. `None` runs under the executor's own
+    /// configuration.
+    pub budgets: Option<RequestBudgets>,
 }
 
 impl FlightTicket {
@@ -704,6 +744,23 @@ impl FlightTicket {
             write_len_prefixed(&mut buf, column.key.as_bytes())?;
             buf.push(declared_type_tag(column.ty));
         }
+
+        if self.parquet_tables.len() > MAX_STATEMENT_TABLE_NAMES {
+            return Err(FlightTicketError::TooManyParquetTables {
+                count: self.parquet_tables.len(),
+                max: MAX_STATEMENT_TABLE_NAMES,
+            });
+        }
+        write_u32(&mut buf, u32_len(self.parquet_tables.len())?);
+        for pin in &self.parquet_tables {
+            if validate_table(&pin.table).is_err() {
+                return Err(FlightTicketError::InvalidParquetTable);
+            }
+            write_len_prefixed(&mut buf, pin.table.as_bytes())?;
+            buf.extend_from_slice(&pin.version.to_le_bytes());
+        }
+
+        write_budgets(&mut buf, self.budgets.as_ref());
 
         write_len_prefixed(&mut buf, self.statement.as_bytes())?;
 
@@ -790,6 +847,29 @@ impl FlightTicket {
             declared_columns.push(DeclaredColumn::new(key.to_owned(), ty));
         }
 
+        let parquet_count = cur.read_u32()? as usize;
+        if parquet_count > MAX_STATEMENT_TABLE_NAMES {
+            return Err(FlightTicketError::TooManyParquetTables {
+                count: parquet_count,
+                max: MAX_STATEMENT_TABLE_NAMES,
+            });
+        }
+        let mut parquet_tables = Vec::with_capacity(parquet_count);
+        for _ in 0..parquet_count {
+            let table = cur.read_len_prefixed()?;
+            let table = std::str::from_utf8(table).map_err(|_| FlightTicketError::InvalidUtf8)?;
+            if validate_table(table).is_err() {
+                return Err(FlightTicketError::InvalidParquetTable);
+            }
+            let version = u64::from_le_bytes(cur.read_array::<8>()?);
+            parquet_tables.push(ParquetPin {
+                table: table.to_owned(),
+                version,
+            });
+        }
+
+        let budgets = read_budgets(&mut cur)?;
+
         let stmt_len = cur.read_u32()? as usize;
         if stmt_len > MAX_STATEMENT_LEN {
             return Err(FlightTicketError::StatementTooLong {
@@ -816,6 +896,8 @@ impl FlightTicket {
             slice_count,
             pending_erasure,
             declared_columns,
+            parquet_tables,
+            budgets,
         })
     }
 
@@ -917,6 +999,17 @@ pub enum FlightTicketError {
     /// types (ADR-0090).
     #[error("ticket contains an invalid declared column type tag {0}")]
     InvalidDeclaredType(u8),
+    /// The ticket pins more Parquet tables than a statement may name
+    /// ([`MAX_STATEMENT_TABLE_NAMES`]), at encode or decode.
+    #[error("ticket pins {count} Parquet tables, more than the {max} a statement may name")]
+    TooManyParquetTables { count: usize, max: usize },
+    /// A pinned Parquet table's name is not a valid table name.
+    #[error("ticket contains an invalid Parquet table name")]
+    InvalidParquetTable,
+    /// A budget limit's tag byte, or the budgets flag, was not one the layout
+    /// defines.
+    #[error("ticket contains an invalid budget tag {0}")]
+    InvalidBudgetTag(u8),
     /// Bytes remained after the last field was read.
     #[error("ticket has trailing bytes")]
     TrailingBytes,
@@ -1064,6 +1157,96 @@ fn declared_type_from_tag(tag: u8) -> Result<DeclaredType, FlightTicketError> {
     }
 }
 
+const LIMIT_ABSENT: u8 = 0;
+const LIMIT_UNLIMITED: u8 = 1;
+const LIMIT_BOUNDED: u8 = 2;
+
+/// A request budget's one limit: absent, unlimited, or bounded to a value.
+type WireLimit = Option<Option<u64>>;
+
+fn write_limit(buf: &mut Vec<u8>, limit: WireLimit) {
+    match limit {
+        None => buf.push(LIMIT_ABSENT),
+        Some(None) => buf.push(LIMIT_UNLIMITED),
+        Some(Some(value)) => {
+            buf.push(LIMIT_BOUNDED);
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+}
+
+/// `unlimited_allowed` is false for `max_segments`, which has no unlimited
+/// spelling.
+fn read_limit(
+    cur: &mut Cursor<'_>,
+    unlimited_allowed: bool,
+) -> Result<WireLimit, FlightTicketError> {
+    match cur.read_u8()? {
+        LIMIT_ABSENT => Ok(None),
+        LIMIT_UNLIMITED if unlimited_allowed => Ok(Some(None)),
+        LIMIT_BOUNDED => Ok(Some(Some(u64::from_le_bytes(cur.read_array::<8>()?)))),
+        other => Err(FlightTicketError::InvalidBudgetTag(other)),
+    }
+}
+
+/// The request budgets: a presence byte, then the three limits in a fixed
+/// order. The bytes land in the payload before the MAC is computed, so a
+/// client cannot drop or raise a limit.
+fn write_budgets(buf: &mut Vec<u8>, budgets: Option<&RequestBudgets>) {
+    let Some(budgets) = budgets else {
+        buf.push(0);
+        return;
+    };
+    buf.push(1);
+    write_limit(
+        buf,
+        budgets.max_bytes_scanned.map(|limit| match limit {
+            ByteLimit::Bounded(value) => Some(value),
+            ByteLimit::Unlimited => None,
+        }),
+    );
+    write_limit(
+        buf,
+        budgets.max_store_requests.map(|limit| match limit {
+            RequestLimit::Bounded(value) => Some(value),
+            RequestLimit::Unlimited => None,
+        }),
+    );
+    write_limit(
+        buf,
+        budgets
+            .max_segments
+            .map(|segments| Some(u64::try_from(segments).unwrap_or(u64::MAX))),
+    );
+}
+
+fn read_budgets(cur: &mut Cursor<'_>) -> Result<Option<RequestBudgets>, FlightTicketError> {
+    match cur.read_u8()? {
+        0 => Ok(None),
+        1 => {
+            let max_bytes_scanned = read_limit(cur, true)?.map(|limit| match limit {
+                Some(value) => ByteLimit::Bounded(value),
+                None => ByteLimit::Unlimited,
+            });
+            let max_store_requests = read_limit(cur, true)?.map(|limit| match limit {
+                Some(value) => RequestLimit::Bounded(value),
+                None => RequestLimit::Unlimited,
+            });
+            // A limit past `usize` only ever lowers a ceiling by less than it
+            // could, so saturating is safe.
+            let max_segments = read_limit(cur, false)?
+                .flatten()
+                .map(|value| usize::try_from(value).unwrap_or(usize::MAX));
+            Ok(Some(RequestBudgets {
+                max_bytes_scanned,
+                max_store_requests,
+                max_segments,
+            }))
+        }
+        other => Err(FlightTicketError::InvalidBudgetTag(other)),
+    }
+}
+
 fn read_segment_level(cur: &mut Cursor<'_>) -> Result<SegmentLevel, FlightTicketError> {
     match cur.read_u8()? {
         0 => Ok(SegmentLevel::L0),
@@ -1176,6 +1359,8 @@ mod tests {
             slice_count: 1,
             pending_erasure: Vec::new(),
             declared_columns: Vec::new(),
+            parquet_tables: Vec::new(),
+            budgets: None,
         };
         let encoded = ticket.encode(&a).expect("encode");
         assert!(FlightTicket::decode(&encoded, &b).is_ok());
@@ -1308,6 +1493,23 @@ mod tests {
                 DeclaredColumn::new("ok", DeclaredType::Bool),
                 DeclaredColumn::new("payload", DeclaredType::Bytes),
             ],
+            parquet_tables: vec![
+                ParquetPin {
+                    table: "hits".to_owned(),
+                    version: 7,
+                },
+                ParquetPin {
+                    table: "_orders_2".to_owned(),
+                    version: u64::MAX,
+                },
+            ],
+            // Every limit kind, so the round-trip and single-flip tests
+            // exercise each budget wire tag.
+            budgets: Some(RequestBudgets {
+                max_bytes_scanned: Some(ByteLimit::Bounded(1 << 30)),
+                max_store_requests: Some(RequestLimit::Unlimited),
+                max_segments: Some(12),
+            }),
         }
     }
 
@@ -1481,7 +1683,8 @@ mod tests {
         write_u32(&mut body, 0);
         write_u32(&mut body, 0);
         write_u32(&mut body, 0); // erasure_count
-        write_u32(&mut body, 0); // declared_count, so this clears MIN_ENCODED_LEN
+        write_u32(&mut body, 0); // declared_count
+        pad_to_min_encoded_len(&mut body); // clears MIN_ENCODED_LEN
         // A valid MAC under the real key: the version check, not the MAC,
         // must be what rejects this.
         let tag = mac(&key, &body);
@@ -1517,6 +1720,7 @@ mod tests {
         write_u32(&mut body, 0); // erasure_count
         write_u32(&mut body, 0); // declared_count
         write_u32(&mut body, 0); // stmt_len
+        pad_to_min_encoded_len(&mut body);
         let tag = mac(&key, &body);
         body.extend_from_slice(&tag);
         assert_eq!(
@@ -1547,6 +1751,7 @@ mod tests {
         write_u32(&mut body, 0); // erasure_count
         write_u32(&mut body, 0); // declared_count, padding to v6's MIN_ENCODED_LEN
         write_u32(&mut body, 0); // stmt_len
+        pad_to_min_encoded_len(&mut body);
         let tag = mac(&key, &body);
         body.extend_from_slice(&tag);
         assert_eq!(
@@ -1577,11 +1782,317 @@ mod tests {
         write_u32(&mut body, 0); // erasure_count
         write_u32(&mut body, 0); // declared_count, padding to v6's MIN_ENCODED_LEN
         write_u32(&mut body, 0); // stmt_len
+        pad_to_min_encoded_len(&mut body);
         let tag = mac(&key, &body);
         body.extend_from_slice(&tag);
         assert_eq!(
             FlightTicket::decode(&body, &key),
             Err(FlightTicketError::UnsupportedVersion(5))
+        );
+    }
+
+    /// Pad a hand-built predecessor-version body to the current smallest
+    /// ticket, so the length guard passes and the version check is what
+    /// refuses it. The padding's content is irrelevant: the version byte is
+    /// read before anything after the header.
+    fn pad_to_min_encoded_len(body: &mut Vec<u8>) {
+        let want = MIN_ENCODED_LEN - MAC_LEN;
+        if body.len() < want {
+            body.resize(want, 0);
+        }
+    }
+
+    /// The v7 layout, which has no `parquet_tables` or `budgets` (issue
+    /// #2240): a v7 ticket carrying a valid MAC under this process's key is
+    /// refused on its version byte. Read under the v8 layout, its `stmt_len`
+    /// would be taken as `parquet_count` and every later field would desync.
+    /// The body is a real v7 ticket: the current ticket's bytes up to the end
+    /// of the declared columns, then the statement, with the version byte
+    /// changed.
+    #[test]
+    fn a_v7_envelope_is_rejected_as_unsupported_version() {
+        let key = test_key();
+        let ticket = FlightTicket {
+            parquet_tables: vec![],
+            budgets: None,
+            ..sample_ticket()
+        };
+        let v8 = ticket.encode(&key).expect("encode");
+        let payload = &v8[..v8.len() - MAC_LEN];
+        // v8 adds `parquet_count` (4) and `budgets_flag` (1) between the
+        // declared columns and the statement: lift them out to get v7's body.
+        let stmt_at = payload.len() - 4 - ticket.statement.len();
+        let added = 4 + 1;
+        let mut body = payload[..stmt_at - added].to_vec();
+        body.extend_from_slice(&payload[stmt_at..]);
+        body[MAGIC.len()] = 7;
+        let tag = mac(&key, &body);
+        body.extend_from_slice(&tag);
+        assert_eq!(
+            FlightTicket::decode(&body, &key),
+            Err(FlightTicketError::UnsupportedVersion(7))
+        );
+        // Non-vacuity: the same ticket as v8 decodes.
+        assert_eq!(FlightTicket::decode(&v8, &key), Ok(ticket));
+    }
+
+    /// A signed ticket whose `parquet_count` section and budgets section are
+    /// exactly `parquet` and `budgets`, with everything before them empty and
+    /// an empty statement after them: the way to put a malformed pin list or
+    /// budget under a valid MAC, which `encode` itself refuses to write.
+    fn spliced(parquet: &[u8], budgets: &[u8]) -> Vec<u8> {
+        let key = test_key();
+        let minimal = FlightTicket {
+            tenant: TenantHash([0u8; 16]),
+            statement: String::new(),
+            segments: vec![],
+            min_commit_tokens: vec![],
+            now_ns: 0,
+            deadline_ns: 0,
+            slice_index: 0,
+            slice_count: 1,
+            pending_erasure: vec![],
+            declared_columns: vec![],
+            parquet_tables: vec![],
+            budgets: None,
+        }
+        .encode(&key)
+        .expect("encode");
+        // parquet_count (4) + budgets_flag (1) + stmt_len (4) close the body.
+        let section_at = minimal.len() - MAC_LEN - 4 - 1 - 4;
+        let mut body = minimal[..section_at].to_vec();
+        body.extend_from_slice(parquet);
+        body.extend_from_slice(budgets);
+        write_u32(&mut body, 0); // stmt_len
+        let tag = mac(&key, &body);
+        body.extend_from_slice(&tag);
+        body
+    }
+
+    fn pin_section(pins: &[(&[u8], u64)]) -> Vec<u8> {
+        let mut section = Vec::new();
+        write_u32(&mut section, pins.len() as u32);
+        for (name, version) in pins {
+            write_u32(&mut section, name.len() as u32);
+            section.extend_from_slice(name);
+            section.extend_from_slice(&version.to_le_bytes());
+        }
+        section
+    }
+
+    /// The pinned Parquet tables round-trip with their versions, and they sit
+    /// inside the signed payload: flipping any bit of a pin's table name or
+    /// version is a MAC mismatch, and a ticket signed under another key does
+    /// not verify.
+    #[test]
+    fn parquet_pins_round_trip_and_are_covered_by_the_mac() {
+        let key = test_key();
+        let ticket = sample_ticket();
+        assert_eq!(ticket.parquet_tables.len(), 2);
+        let bytes = ticket.encode(&key).expect("encode");
+        let decoded = FlightTicket::decode(&bytes, &key).expect("decode");
+        assert_eq!(decoded.parquet_tables, ticket.parquet_tables);
+        assert_eq!(decoded.parquet_tables[1].version, u64::MAX);
+
+        let mut wire = Vec::new();
+        for pin in &ticket.parquet_tables {
+            write_len_prefixed(&mut wire, pin.table.as_bytes()).expect("len");
+            wire.extend_from_slice(&pin.version.to_le_bytes());
+        }
+        let at = bytes
+            .windows(wire.len())
+            .position(|window| window == wire.as_slice())
+            .expect("the pins' bytes appear verbatim in the ticket");
+        for offset in 0..wire.len() {
+            for bit in 0..8 {
+                let mut flipped = bytes.clone();
+                flipped[at + offset] ^= 1 << bit;
+                assert_eq!(
+                    FlightTicket::decode(&flipped, &key),
+                    Err(FlightTicketError::MacMismatch),
+                    "byte {offset} bit {bit} of the pin list"
+                );
+            }
+        }
+        assert_eq!(
+            FlightTicket::decode(&bytes, &[0x43u8; TICKET_KEY_LEN]),
+            Err(FlightTicketError::MacMismatch)
+        );
+    }
+
+    /// More pins than a statement may name is refused at encode, and at
+    /// decode before any entry is read, with the codec's typed error. The
+    /// exact cap encodes.
+    #[test]
+    fn an_oversize_pin_list_is_refused_both_ways() {
+        let key = test_key();
+        let pins = |count: u64| -> Vec<ParquetPin> {
+            (0..count)
+                .map(|i| ParquetPin {
+                    table: format!("t{i}"),
+                    version: i,
+                })
+                .collect()
+        };
+        let at_cap = FlightTicket {
+            parquet_tables: pins(MAX_STATEMENT_TABLE_NAMES as u64),
+            ..sample_ticket()
+        };
+        let bytes = at_cap.encode(&key).expect("the cap encodes");
+        assert_eq!(FlightTicket::decode(&bytes, &key), Ok(at_cap));
+
+        let over = FlightTicket {
+            parquet_tables: pins(MAX_STATEMENT_TABLE_NAMES as u64 + 1),
+            ..sample_ticket()
+        };
+        assert_eq!(
+            over.encode(&key),
+            Err(FlightTicketError::TooManyParquetTables {
+                count: MAX_STATEMENT_TABLE_NAMES + 1,
+                max: MAX_STATEMENT_TABLE_NAMES,
+            })
+        );
+
+        // Under a valid MAC, with no entries behind the count: the count alone
+        // is refused, and a count of u32::MAX drives no allocation.
+        for count in [MAX_STATEMENT_TABLE_NAMES as u32 + 1, u32::MAX] {
+            let mut section = Vec::new();
+            write_u32(&mut section, count);
+            assert_eq!(
+                FlightTicket::decode(&spliced(&section, &[0]), &key),
+                Err(FlightTicketError::TooManyParquetTables {
+                    count: count as usize,
+                    max: MAX_STATEMENT_TABLE_NAMES,
+                })
+            );
+        }
+    }
+
+    /// A pin whose name is not a table name, or whose bytes are cut short or
+    /// not UTF-8, is a typed error at decode, never a panic or a pin.
+    #[test]
+    fn a_malformed_pin_is_a_typed_error() {
+        let key = test_key();
+        let long = "a".repeat(64);
+        for name in [
+            b"".as_slice(),
+            b"Hits",
+            b"has-dash",
+            b"1starts_with_digit",
+            b"logs",
+            long.as_bytes(),
+        ] {
+            assert_eq!(
+                FlightTicket::decode(&spliced(&pin_section(&[(name, 1)]), &[0]), &key),
+                Err(FlightTicketError::InvalidParquetTable),
+                "{:?}",
+                String::from_utf8_lossy(name)
+            );
+        }
+        assert_eq!(
+            FlightTicket::decode(
+                &spliced(&pin_section(&[([0xffu8, 0xfe].as_slice(), 1)]), &[0]),
+                &key
+            ),
+            Err(FlightTicketError::InvalidUtf8)
+        );
+        // A name length that runs past the payload.
+        let mut section = Vec::new();
+        write_u32(&mut section, 1);
+        write_u32(&mut section, u32::MAX);
+        assert_eq!(
+            FlightTicket::decode(&spliced(&section, &[0]), &key),
+            Err(FlightTicketError::Truncated)
+        );
+        // A valid name with its version cut off.
+        let mut section = pin_section(&[(b"hits".as_slice(), 1)]);
+        section.truncate(section.len() - 3);
+        assert_eq!(
+            FlightTicket::decode(&spliced(&section, &[0]), &key),
+            Err(FlightTicketError::Truncated)
+        );
+        // Encode refuses the same names.
+        let bad = FlightTicket {
+            parquet_tables: vec![ParquetPin {
+                table: "Hits".to_owned(),
+                version: 1,
+            }],
+            ..sample_ticket()
+        };
+        assert_eq!(
+            bad.encode(&key),
+            Err(FlightTicketError::InvalidParquetTable)
+        );
+        // Non-vacuity: a well-formed pin in the same splice decodes.
+        let ok = FlightTicket::decode(
+            &spliced(&pin_section(&[(b"hits".as_slice(), 9)]), &[0]),
+            &key,
+        )
+        .expect("a valid pin");
+        assert_eq!(
+            ok.parquet_tables,
+            vec![ParquetPin {
+                table: "hits".to_owned(),
+                version: 9,
+            }]
+        );
+    }
+
+    /// Budgets round-trip in every shape, and a flag or limit tag the layout
+    /// does not define is a typed error.
+    #[test]
+    fn budgets_round_trip_and_bad_tags_are_typed_errors() {
+        let key = test_key();
+        for budgets in [
+            None,
+            Some(RequestBudgets::default()),
+            Some(RequestBudgets {
+                max_bytes_scanned: Some(ByteLimit::Unlimited),
+                max_store_requests: Some(RequestLimit::Bounded(0)),
+                max_segments: Some(0),
+            }),
+            Some(RequestBudgets {
+                max_bytes_scanned: Some(ByteLimit::Bounded(u64::MAX)),
+                max_store_requests: None,
+                max_segments: Some(usize::MAX),
+            }),
+        ] {
+            let ticket = FlightTicket {
+                budgets,
+                ..sample_ticket()
+            };
+            let bytes = ticket.encode(&key).expect("encode");
+            assert_eq!(FlightTicket::decode(&bytes, &key), Ok(ticket));
+        }
+
+        let none = pin_section(&[]);
+        assert_eq!(
+            FlightTicket::decode(&spliced(&none, &[2]), &key),
+            Err(FlightTicketError::InvalidBudgetTag(2)),
+            "a flag that is neither 0 nor 1"
+        );
+        assert_eq!(
+            FlightTicket::decode(&spliced(&none, &[1, 3, 0, 0]), &key),
+            Err(FlightTicketError::InvalidBudgetTag(3)),
+            "a limit tag past bounded"
+        );
+        assert_eq!(
+            FlightTicket::decode(&spliced(&none, &[1, 0, 0, 1]), &key),
+            Err(FlightTicketError::InvalidBudgetTag(1)),
+            "max_segments has no unlimited spelling"
+        );
+        assert_eq!(
+            FlightTicket::decode(&spliced(&none, &[1, 0, 0]), &key),
+            Err(FlightTicketError::Truncated),
+            "the third limit is missing, so the read runs into stmt_len and \
+             then past the payload"
+        );
+        // Non-vacuity: every limit absent decodes to the empty budgets.
+        assert_eq!(
+            FlightTicket::decode(&spliced(&none, &[1, 0, 0, 0]), &key)
+                .expect("decode")
+                .budgets,
+            Some(RequestBudgets::default())
         );
     }
 
@@ -1636,6 +2147,8 @@ mod tests {
             slice_count: 1,
             pending_erasure: vec![],
             declared_columns: vec![],
+            parquet_tables: vec![],
+            budgets: None,
         };
         let bytes = ticket.encode(&test_key()).expect("encode");
         assert_eq!(bytes.len(), MIN_ENCODED_LEN);
@@ -1691,6 +2204,13 @@ mod tests {
                     DeclaredColumn::new(format!("declared.{i}"), ty)
                 })
                 .collect(),
+            parquet_tables: (0..MAX_STATEMENT_TABLE_NAMES as u64)
+                .map(|i| ParquetPin {
+                    table: format!("table_{i}"),
+                    version: i,
+                })
+                .collect(),
+            budgets: None,
         };
         let bytes = ticket.encode(&test_key()).expect("encode");
         assert_eq!(
@@ -1736,6 +2256,8 @@ mod tests {
         write_u32(&mut body, 0); // segments
         write_u32(&mut body, 0); // erasure_count
         write_u32(&mut body, 0); // declared_count
+        write_u32(&mut body, 0); // parquet_count
+        body.push(0); // budgets_flag
         write_u32(&mut body, (MAX_STATEMENT_LEN + 1) as u32); // stmt_len
         // No stmt bytes follow, but the length check fires before the read.
         let tag = mac(&key, &body);
@@ -1848,6 +2370,8 @@ mod tests {
             slice_count: 1,
             pending_erasure: vec![],
             declared_columns: vec![],
+            parquet_tables: vec![],
+            budgets: None,
         };
         let mut bytes = ticket.encode(&key).expect("encode");
         // The level tag sits right after the per-segment fixed fields and the
@@ -1982,6 +2506,43 @@ mod tests {
         (".{0,32}", declared_type_strategy()).prop_map(|(key, ty)| DeclaredColumn::new(key, ty))
     }
 
+    fn parquet_pin_strategy() -> impl Strategy<Value = ParquetPin> {
+        ("[a-z_][a-z0-9_]{0,62}", any::<u64>())
+            .prop_filter("a reserved name is no table name", |(table, _)| {
+                validate_table(table).is_ok()
+            })
+            .prop_map(|(table, version)| ParquetPin { table, version })
+    }
+
+    fn limit_strategy() -> impl Strategy<Value = Option<Option<u64>>> {
+        prop_oneof![
+            Just(None),
+            Just(Some(None)),
+            any::<u64>().prop_map(|value| Some(Some(value))),
+        ]
+    }
+
+    fn budgets_strategy() -> impl Strategy<Value = Option<RequestBudgets>> {
+        prop::option::of(
+            (
+                limit_strategy(),
+                limit_strategy(),
+                prop::option::of(any::<u32>()),
+            )
+                .prop_map(|(bytes, requests, segments)| RequestBudgets {
+                    max_bytes_scanned: bytes.map(|limit| match limit {
+                        Some(value) => ByteLimit::Bounded(value),
+                        None => ByteLimit::Unlimited,
+                    }),
+                    max_store_requests: requests.map(|limit| match limit {
+                        Some(value) => RequestLimit::Bounded(value),
+                        None => RequestLimit::Unlimited,
+                    }),
+                    max_segments: segments.map(|value| value as usize),
+                }),
+        )
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -2001,6 +2562,11 @@ mod tests {
             slice_count in any::<u32>(),
             pending_erasure in prop::collection::vec(erasure_predicate_strategy(), 0..8),
             declared_columns in prop::collection::vec(declared_column_strategy(), 0..8),
+            parquet_tables in prop::collection::vec(
+                parquet_pin_strategy(),
+                0..=MAX_STATEMENT_TABLE_NAMES,
+            ),
+            budgets in budgets_strategy(),
         ) {
             let ticket = FlightTicket {
                 tenant: TenantHash(tenant),
@@ -2013,6 +2579,8 @@ mod tests {
                 slice_count,
                 pending_erasure,
                 declared_columns,
+                parquet_tables,
+                budgets,
             };
             let key = test_key();
             let bytes = ticket.encode(&key).expect("encode");
