@@ -55,7 +55,35 @@ pub const DEFAULT_FOLD_INTERVAL: Duration = Duration::from_secs(5 * 60);
 #[derive(Debug, Clone, Copy)]
 pub struct FoldTaskConfig {
     pub enabled: bool,
+    /// Pause between fold passes (`--fold-interval-secs`). A zero interval is
+    /// refused at startup with [`SpawnError::ZeroFoldInterval`], whether or not
+    /// the loop is enabled: `validate_loop_intervals` checks it regardless of
+    /// `enabled` because the interval also feeds the on-demand fold rate gate
+    /// and the fold-lag threshold. [`check_spawnable`](Self::check_spawnable)
+    /// re-refuses it at the enabled loop's spawn site.
     pub fold_interval: Duration,
+}
+
+/// Why [`spawn`] refused to start the fold loops. Nothing is spawned.
+#[derive(Debug, thiserror::Error)]
+pub enum SpawnError {
+    /// A zero `fold_interval` would run every fold pass back to back.
+    #[error(
+        "--fold-interval-secs must be non-zero: a zero fold interval runs every pass back to back"
+    )]
+    ZeroFoldInterval,
+}
+
+impl FoldTaskConfig {
+    /// The refusal [`spawn`] applies before starting any loop. `start` refuses
+    /// a zero interval earlier, before spawning anything, whether or not the
+    /// loop is enabled.
+    pub fn check_spawnable(&self) -> Result<(), SpawnError> {
+        if self.enabled && self.fold_interval.is_zero() {
+            return Err(SpawnError::ZeroFoldInterval);
+        }
+        Ok(())
+    }
 }
 
 impl Default for FoldTaskConfig {
@@ -238,7 +266,8 @@ pub struct FoldTickReport {
 /// durable config record (ADR-0048 decision 3, ADR-0066 decision 6). A tenant
 /// carrying a config record is maintained unconditionally, so no flag can
 /// exclude it. Returns immediately; tasks run in the background until
-/// [`FoldTasks::shutdown`].
+/// [`FoldTasks::shutdown`]. An enabled config with a zero `fold_interval` is
+/// refused with [`SpawnError::ZeroFoldInterval`] and nothing is spawned.
 ///
 /// `retention` is the same CLI-derived [`RetentionConfig`] the Maintain-mode
 /// physical sweep uses (`main.rs`, threaded into `MaintenanceTaskConfig`).
@@ -274,9 +303,10 @@ pub fn spawn(
     live_set: watch::Receiver<Vec<Uuid>>,
     clock: Arc<dyn Clock>,
     loop_metrics: Arc<FoldLoopMetrics>,
-) -> FoldTasks {
+) -> Result<FoldTasks, SpawnError> {
+    config.check_spawnable()?;
     if !config.enabled {
-        return FoldTasks::none();
+        return Ok(FoldTasks::none());
     }
 
     // Production OS-entropy randomness (ADR-0068 decision 2): the folder id
@@ -323,7 +353,7 @@ pub fn spawn(
         shutdown.push(tx);
         handles.push(handle);
     }
-    FoldTasks { shutdown, handles }
+    Ok(FoldTasks { shutdown, handles })
 }
 
 /// Everything one fold-loop attempt needs, bundled so the supervisor can clone
@@ -1259,5 +1289,47 @@ mod tests {
             0,
             "every tick panicked, so nothing was ever folded"
         );
+    }
+
+    /// [`spawn`] refuses an enabled fold config with a zero `fold_interval`
+    /// directly at its spawn site with [`SpawnError::ZeroFoldInterval`], before
+    /// any loop is spawned. `fold` is a `pub` module, so an outside caller
+    /// reaches this function without passing through `validate_loop_intervals`;
+    /// this pins the guard that caller depends on.
+    ///
+    /// Flip to watch it fail: delete the `config.check_spawnable()?` call at the
+    /// top of [`spawn`]. The function then builds the per-signal loop contexts
+    /// on a zero interval and returns `Ok`.
+    #[tokio::test]
+    async fn spawn_refuses_a_zero_fold_interval() {
+        let (store, catalog, tenant) = seeded_store().await;
+        let worker = Arc::new(WorkerSet::new(
+            NOW_NS,
+            HEARTBEAT,
+            DEFAULT_LIVENESS_FACTOR,
+            DEFAULT_UNIT_CONCURRENCY,
+        ));
+        let live_set = watch::channel(worker.solo_live_set()).0.subscribe();
+        let config = FoldTaskConfig {
+            enabled: true,
+            fold_interval: Duration::ZERO,
+        };
+        match spawn(
+            catalog,
+            store,
+            &[tenant],
+            config,
+            Arc::new(RetentionConfig::default()),
+            worker,
+            live_set,
+            Arc::new(FixedClock::new(NOW_NS)),
+            Arc::new(FoldLoopMetrics::default()),
+        ) {
+            Err(SpawnError::ZeroFoldInterval) => {}
+            Ok(tasks) => {
+                tasks.shutdown().await;
+                panic!("a zero fold_interval must be refused at spawn");
+            }
+        }
     }
 }
