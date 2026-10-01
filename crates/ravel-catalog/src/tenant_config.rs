@@ -426,7 +426,11 @@ pub struct StoredBloomScope {
     write: StorageLayoutWrite,
     /// Whether [`TenantConfig::set_bloom_scope`] changed the value to this one.
     /// The write gate refuses a scope that differs from the stored record's
-    /// without it. Not part of equality: it is not in the record.
+    /// without it. Not part of equality: it is not in the record. It holds only
+    /// for a config used for one [`set_tenant_config`] call: the gate compares
+    /// against whatever record that call reads, so a config written again, or
+    /// read before another writer changed the scope, can carry it over a scope
+    /// the setter never saw.
     from_setter: bool,
 }
 
@@ -562,11 +566,13 @@ pub enum StorageLayoutConfigError {
     UnknownBloomScope { got: i32 },
     /// A write carries a bloom scope that differs from the stored record's and
     /// that [`TenantConfig::set_bloom_scope`] did not produce, such as the
-    /// default `ALL` of a config built without reading the record.
+    /// default `ALL` of a config built without reading the record, or a config
+    /// read before another writer changed the scope.
     #[error(
         "the config carries bloom scope value {proposed} where the stored record carries \
-         {stored}, and set_bloom_scope did not produce it: change the scope only with \
-         set_bloom_scope on the config read from the record"
+         {stored}, and set_bloom_scope did not produce it, or the config was read before \
+         another writer changed the scope: change the scope only with set_bloom_scope on the \
+         config read from the record"
     )]
     BloomScopeChangedOutsideSetter { stored: i32, proposed: i32 },
     /// A write carries a bloom scope that differs from the stored record's at
@@ -876,7 +882,9 @@ impl TenantConfig {
 
     /// Set the bloom scope. A scope that differs from the stored one also
     /// increments the clustering generation and leaves the key's descriptor as
-    /// it was, so one generation names one key and one scope: a set key keeps
+    /// it was, so one generation names one key and one scope (and, under
+    /// [`BloomScope::Undeclared`], one declared column set, which
+    /// [`set_tenant_config`] keeps by taking a generation itself): a set key keeps
     /// its columns and width, a cleared key stays cleared, and a key that was
     /// never set takes field 13 in the cleared form (no columns) at generation
     /// 1, since field 13 is where the generation lives. Setting the scope the
@@ -898,8 +906,23 @@ impl TenantConfig {
         if value == self.stored_bloom_scope.value {
             return Ok(());
         }
+        self.stored_clustering_key = Some(self.key_at_next_generation(write)?);
+        self.stored_bloom_scope = StoredBloomScope {
+            from_setter: true,
+            ..StoredBloomScope::new(value, write)
+        };
+        Ok(())
+    }
+
+    /// Field 13 with the key's descriptor as it is at the next generation: a set
+    /// key keeps its columns and width, a cleared key stays cleared, and a key
+    /// that was never set takes the cleared form.
+    fn key_at_next_generation(
+        &self,
+        write: StorageLayoutWrite,
+    ) -> Result<StoredClusteringKey, StorageLayoutConfigError> {
         let generation = self.next_clustering_generation()?;
-        let key = match self.stored_clustering_key.take() {
+        Ok(match self.stored_clustering_key.clone() {
             Some(stored) => StoredClusteringKey {
                 generation,
                 write,
@@ -911,13 +934,41 @@ impl TenantConfig {
                 generation,
                 write,
             },
+        })
+    }
+
+    /// The config [`set_tenant_config`] writes in place of this one, when this
+    /// one moves bloom coverage without a new clustering generation: under
+    /// [`BloomScope::Undeclared`] the writer leaves out of the filter every
+    /// string column whose name the record declares as a typed column of any
+    /// type, so adding or removing a declared name at the stored generation
+    /// changes the coverage that generation names. The returned config carries
+    /// the key's descriptor at the next generation. `None` when the scope is not
+    /// undeclared, when this config already takes a new generation, or when the
+    /// declared names are the stored ones (a retype or a reorder keeps
+    /// coverage). Called after the write gate, which checks key columns against
+    /// the stored record only at the stored generation.
+    fn with_coverage_generation(
+        &self,
+        stored: &TenantConfig,
+    ) -> Result<Option<TenantConfig>, StorageLayoutConfigError> {
+        let declared_names = |config: &TenantConfig| {
+            config
+                .own_typed_columns()
+                .iter()
+                .map(|column| column.key.clone())
+                .collect::<std::collections::BTreeSet<_>>()
         };
-        self.stored_clustering_key = Some(key);
-        self.stored_bloom_scope = StoredBloomScope {
-            from_setter: true,
-            ..StoredBloomScope::new(value, write)
-        };
-        Ok(())
+        if self.stored_bloom_scope.value != sysproto::BloomScope::Undeclared as i32
+            || self.clustering_generation() != stored.clustering_generation()
+            || declared_names(self) == declared_names(stored)
+        {
+            return Ok(None);
+        }
+        let mut bumped = self.clone();
+        bumped.stored_clustering_key =
+            Some(self.key_at_next_generation(self.stored_bloom_scope.write)?);
+        Ok(Some(bumped))
     }
 
     /// The format version [`build_record`] stamps for this config:
@@ -959,7 +1010,8 @@ impl TenantConfig {
     /// descriptor without a new generation (ADR-2135 decision 2). Then a
     /// carried key runs the setter's validation, shape and membership in this
     /// config's own `typed_attr_columns`, and a carried bloom scope must be
-    /// known.
+    /// known. The scope check trusts `from_setter`, so it holds for a config
+    /// used for one write, against the record it was read from.
     fn check_storage_layout_writable(
         &self,
         stored: Option<&TenantConfig>,
@@ -1433,11 +1485,71 @@ pub enum SetOutcome {
 /// neither removed nor retyped; a carried key must also pass the setter's
 /// validation against `config`'s own `typed_attr_columns`. Each refusal is a
 /// [`TenantConfigError::InvalidStorageLayoutConfig`] and writes nothing.
+///
+/// Under [`BloomScope::Undeclared`], a write at the stored clustering generation
+/// that changes the set of declared typed column names is written at the next
+/// generation, with the key's descriptor unchanged, since the declared names
+/// decide which string columns the bloom filter covers; so a generation names
+/// one key, one scope and, under undeclared, one declared column set.
+///
+/// The read here is this call's own, so a record that moved after the caller
+/// read `config` is overwritten (the gate above still applies to it). A caller
+/// that read `config` with [`read_config`] and must not overwrite a write in
+/// between uses [`TenantConfig::write_if_unchanged`].
 pub async fn set_tenant_config(
     store: &dyn ObjectStoreBackend,
     tenant_hash: &TenantHash,
     config: &TenantConfig,
     now_ns: i64,
+) -> Result<SetOutcome, TenantConfigError> {
+    write_config(
+        store,
+        tenant_hash,
+        config,
+        now_ns,
+        ReadExpectation::Unchecked,
+    )
+    .await
+}
+
+impl TenantConfig {
+    /// [`set_tenant_config`], refused unless the record is still the one this
+    /// config was read from: `read_version` is the version [`read_config`]
+    /// returned with it, `None` when it returned no record. A record written,
+    /// created or deleted since is a [`TenantConfigError::CasConflict`], whose
+    /// message says to re-read and retry, and nothing is written.
+    pub async fn write_if_unchanged(
+        &self,
+        store: &dyn ObjectStoreBackend,
+        tenant_hash: &TenantHash,
+        read_version: Option<&Version>,
+        now_ns: i64,
+    ) -> Result<SetOutcome, TenantConfigError> {
+        let expectation = match read_version {
+            Some(version) => ReadExpectation::At(version),
+            None => ReadExpectation::Absent,
+        };
+        write_config(store, tenant_hash, self, now_ns, expectation).await
+    }
+}
+
+/// Which record a [`write_config`] call may replace.
+#[derive(Clone, Copy)]
+enum ReadExpectation<'a> {
+    /// Whatever record the write's own read finds.
+    Unchecked,
+    /// No record: the caller's read found none.
+    Absent,
+    /// The record at this version, the one the caller read.
+    At(&'a Version),
+}
+
+async fn write_config(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: &TenantHash,
+    config: &TenantConfig,
+    now_ns: i64,
+    expectation: ReadExpectation<'_>,
 ) -> Result<SetOutcome, TenantConfigError> {
     let key = config_key(tenant_hash);
 
@@ -1463,6 +1575,13 @@ pub async fn set_tenant_config(
 
     match store.get(&key, GetRange::Full).await {
         Ok(outcome) => {
+            match expectation {
+                ReadExpectation::Unchecked => {}
+                ReadExpectation::At(version) if *version == outcome.version => {}
+                ReadExpectation::Absent | ReadExpectation::At(_) => {
+                    return Err(TenantConfigError::CasConflict { key });
+                }
+            }
             // A record exists. Decode it only to carry its created_unix_ns
             // through (and to fail closed on a misfiled/future record rather than
             // overwrite one that is not this tenant's), then swap under
@@ -1496,6 +1615,10 @@ pub async fn set_tenant_config(
             config
                 .check_storage_layout_writable(Some(&existing_config))
                 .map_err(storage_layout_error)?;
+            let bumped = config
+                .with_coverage_generation(&existing_config)
+                .map_err(storage_layout_error)?;
+            let config = bumped.as_ref().unwrap_or(config);
             let created_unix_ns = existing.created_unix_ns;
             let record = build_record(tenant_hash, config, created_unix_ns, now_ns);
             match store
@@ -1515,6 +1638,9 @@ pub async fn set_tenant_config(
             }
         }
         Err(StoreError::NotFound) => {
+            if let ReadExpectation::At(_) = expectation {
+                return Err(TenantConfigError::CasConflict { key });
+            }
             config
                 .check_storage_layout_writable(None)
                 .map_err(storage_layout_error)?;
