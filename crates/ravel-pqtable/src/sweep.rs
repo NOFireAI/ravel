@@ -8,8 +8,12 @@
 //! The grace is measured from when a version stopped being its table's newest:
 //! a manifest version other than the newest is deleted once the version that
 //! superseded it (the next one present) is older than the grace plus
-//! [`SKEW_MS`]. What that protects is a writer's resolve-to-put window, not a
-//! query, which reads a manifest once, when it resolves: [`crate::writer`]
+//! [`SKEW_MS`]. What that protects is a writer's resolve-to-put window. A
+//! query reads a manifest when it resolves, except a Flight SQL `DoGet`, which
+//! reads the version `GetFlightInfo` pinned up to the ticket's deadline later;
+//! nothing ties that deadline to this grace, so a version swept in between
+//! fails `DoGet` as an invalidated snapshot rather than reading another one.
+//! For the writer: [`crate::writer`]
 //! finishes a put within half of the `min_grace_ms` its caller passes, so
 //! provided that value is no larger than the grace this sweep runs under,
 //! every version committed after the writer's resolve is too young for a

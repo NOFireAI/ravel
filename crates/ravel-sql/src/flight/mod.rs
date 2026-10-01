@@ -30,7 +30,9 @@
 //! from the resolve it just made, and `DoGet` reads exactly the pinned manifest
 //! objects by version (a GET each, no LIST), never the table's newest, so a
 //! table replaced between the RPCs streams the schema and rows `FlightInfo`
-//! advertised. The tenant's grants are the one thing not pinned: `DoGet` reads
+//! advertised. A table dropped between the RPCs is read the same way: the drop
+//! is a newer manifest version, so `DoGet` streams the pinned rows, as a
+//! segment pin streams segments a later deletion removed. The tenant's grants are the one thing not pinned: `DoGet` reads
 //! them again, and a grant removed since `GetFlightInfo` fails it with
 //! `LocationNotGranted` (ADR-2040 D3). A pinned manifest that has been swept
 //! fails `DoGet` with `SnapshotInvalidated`. The ticket also pins the request's
