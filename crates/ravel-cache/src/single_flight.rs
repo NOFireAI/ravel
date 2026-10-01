@@ -39,8 +39,7 @@ use tokio::sync::watch;
 
 /// Whether a `SingleFlight::run` call ran the fetch itself or joined an
 /// in-flight one. `Cache::get_or_fetch` uses this to decide whether to
-/// admit the result (leader only) and whether to count a collapse
-/// (follower only).
+/// count a collapse (follower only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Leader,
