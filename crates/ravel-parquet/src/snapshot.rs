@@ -880,6 +880,10 @@ mod tests {
         /// suffix read against a 0-byte object with a 416 rather than
         /// answering it with an empty body.
         invalid_range_on_first_get: bool,
+        /// Answer the 1-based `get_pinned` call numbered here with
+        /// `StoreError::NotFound` instead of calling through, simulating the
+        /// object vanishing between an earlier read of it and this one.
+        not_found_on_call: Option<usize>,
         /// Report `suffix_range: false`, as the Azure external store does,
         /// instead of the inner `MemoryStore`'s `true`.
         force_no_suffix_range: bool,
@@ -966,6 +970,9 @@ mod tests {
                 return Err(StoreError::InvalidRange(
                     "zero-length suffix not satisfiable".to_string(),
                 ));
+            }
+            if self.not_found_on_call == Some(call) {
+                return Err(StoreError::NotFound);
             }
             let mut sent_pin = pin.clone();
             if self.misreport_listing {
@@ -1284,6 +1291,30 @@ mod tests {
         match snapshot(&store, "s3://lake/data/").await {
             Err(SnapshotError::EmptyFile { key }) => assert_eq!(key, "data/c.parquet"),
             other => panic!("expected EmptyFile, got {other:?}"),
+        }
+    }
+
+    /// The size-mismatch retry (and the HEAD-driven re-read above it) have
+    /// already read this object once, at the first explicit-range read; a
+    /// `NotFound` there means the object changed since, not that it was
+    /// never there. Mutation that fails it: reporting `FileMissing` for
+    /// this retry's GET instead of remapping it to `FileChanged` (confirmed
+    /// against the code before this fix: the same scenario reported
+    /// `FileMissing`).
+    #[tokio::test]
+    async fn a_notfound_on_the_size_mismatch_retry_reports_the_file_changed() {
+        let bytes = parquet_bytes(&[4, 5], &["p", "q"]);
+        let real_size = bytes.len() as u64;
+        let store = Scripted {
+            force_no_suffix_range: true,
+            lie_listed_size: Some(real_size + 50),
+            not_found_on_call: Some(2),
+            ..Scripted::default()
+        };
+        put(&store, "data/a.parquet", bytes).await;
+        match snapshot(&store, "s3://lake/data/").await {
+            Err(SnapshotError::FileChanged { key }) => assert_eq!(key, "data/a.parquet"),
+            other => panic!("expected FileChanged, got {other:?}"),
         }
     }
 
