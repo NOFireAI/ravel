@@ -1,13 +1,25 @@
-//! Security invariant 1: read-only single-statement SQL.
+//! Security invariant 1: read-only single-statement SQL, and (ADR-2040 D2,
+//! D4) the three admitted Parquet DDL statement forms.
 //!
-//! [`validate`] runs on the raw request text *before* any planning, catalog
-//! resolution, or `SessionContext` construction. It accepts exactly one
-//! statement and only when that statement is a read-only `Statement::Query`.
-//! Everything else -- DDL in every form (including DataFusion's own
-//! `CREATE EXTERNAL TABLE` extension), DML, `COPY`, `SET`/`RESET`,
-//! transaction control, `EXPLAIN` (both the ANSI and the DataFusion
-//! extension form), and a multi-statement body -- is rejected with a typed
-//! error the endpoint maps to HTTP 400.
+//! [`validate_query`] runs on the raw request text *before* any planning,
+//! catalog resolution, or `SessionContext` construction. It accepts exactly
+//! one statement and only when that statement is a read-only
+//! `Statement::Query`. Everything else -- DDL in every form (including
+//! DataFusion's own `CREATE EXTERNAL TABLE` extension), DML, `COPY`,
+//! `SET`/`RESET`, transaction control, `EXPLAIN` (both the ANSI and the
+//! DataFusion extension form), and a multi-statement body -- is rejected
+//! with a typed error the endpoint maps to HTTP 400.
+//!
+//! [`validate_ddl`] is the sibling gate for the three statement forms D2
+//! admits: `CREATE EXTERNAL TABLE`, `CREATE OR REPLACE EXTERNAL TABLE`, and
+//! `DROP TABLE`, each over `PARQUET`. It never runs in the same request as
+//! [`validate_query`]: the executor's `execute_ddl` entry point (D4) is the
+//! only caller, and it is separate from `execute`/`execute_accounted`, which
+//! stay read-only and keep calling [`validate_query`]. Like `validate_query`,
+//! it is a pure text function with no session and no grants lookup: it
+//! checks statement shape and `LOCATION` URL syntax, never whether a
+//! `LOCATION` lies inside a grant (that needs the tenant's grants, and is
+//! `execute_ddl`'s job, D2).
 //!
 //! Parsing goes through [`complexity_guard::parse_guarded`], the crate's only
 //! parse of caller text, which runs the structural-complexity guard and then
@@ -21,7 +33,7 @@
 //!
 //! A `Query` is not automatically read-only in sqlparser's grammar: its body
 //! is a `SetExpr`, which has `Insert`/`Update`/`Delete`/`Merge` variants
-//! (`WITH ... INSERT ...` parses as `Statement::Query`). [`validate`]
+//! (`WITH ... INSERT ...` parses as `Statement::Query`). [`validate_query`]
 //! therefore walks the whole query tree -- body, set operations, CTEs, and
 //! parenthesized subqueries -- and rejects any statement-bearing node.
 //!
@@ -68,12 +80,14 @@
 //! replacement is structurally total.
 
 use crate::complexity_guard;
-use datafusion::sql::parser::Statement as DFStatement;
+use datafusion::sql::parser::{CreateExternalTable, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::{
-    Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectNamePart, Query,
-    SetExpr, Statement, TableFactor, Visit, Visitor,
+    Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectNamePart, ObjectType,
+    Query, SetExpr, Statement, TableFactor, Value as SqlValue, Visit, Visitor,
 };
-use std::collections::BTreeSet;
+use ravel_pqtable::grants::{self, GrantsError};
+use ravel_pqtable::names;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 
 /// Every aggregate UDAF name (primary spelling and alias) the default
@@ -244,7 +258,7 @@ impl From<complexity_guard::GuardedParseError> for ValidationError {
 /// the process rather than raising a catchable panic (issue #1680). That
 /// ordering is not this function's to remember: it is what
 /// [`complexity_guard::parse_guarded`] is, so every parse in the crate has it.
-pub fn validate(sql: &str) -> Result<(), ValidationError> {
+pub fn validate_query(sql: &str) -> Result<(), ValidationError> {
     let statements = complexity_guard::parse_guarded(sql)?;
 
     if statements.len() > 1 {
@@ -284,9 +298,300 @@ pub fn validate(sql: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
+/// A typed intent for one of the three statement forms ADR-2040 D2 admits.
+/// [`validate_ddl`] produces this from caller text; the executor's
+/// `execute_ddl` is the only consumer, and it is what actually checks the
+/// `location` against the tenant's grants, opens the external store, and
+/// writes a manifest (D2, D4). Nothing here reads a grant, a store, or a
+/// clock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DdlIntent {
+    /// `CREATE [OR REPLACE] EXTERNAL TABLE [IF NOT EXISTS] name STORED AS
+    /// PARQUET LOCATION '<url>' [OPTIONS (...)]`. `if_not_exists` and
+    /// `or_replace` are never both `true`: DataFusion's own parser accepts
+    /// at most one of `IF NOT EXISTS` and `OR REPLACE` in one statement.
+    CreateExternal {
+        name: String,
+        if_not_exists: bool,
+        or_replace: bool,
+        location: String,
+        options: BTreeMap<String, String>,
+    },
+    /// `DROP TABLE [IF EXISTS] name`.
+    Drop { name: String, if_exists: bool },
+}
+
+/// A request rejected by the DDL gate, before any grant, store, or manifest
+/// is touched.
+///
+/// No `Clone`/`PartialEq`/`Eq`: `GrantsError` (wrapped by [`Location`](
+/// DdlValidationError::Location)) implements neither, since one of its own
+/// variants wraps a `StoreError`. Tests match on the variant shape instead
+/// of equality.
+#[derive(Debug, thiserror::Error)]
+pub enum DdlValidationError {
+    /// The body contained no statement at all.
+    #[error("the SQL request contains no statement")]
+    Empty,
+
+    /// More than one statement in one request body.
+    #[error("only a single SQL statement is accepted; the request contains {count}")]
+    MultipleStatements { count: usize },
+
+    /// The body did not parse. The message quotes only the caller's own
+    /// input, so it is safe to return verbatim.
+    #[error("SQL parse error: {0}")]
+    Parse(String),
+
+    /// The statement text carries more structural tokens than
+    /// [`MAX_STATEMENT_COMPLEXITY`](crate::complexity_guard::MAX_STATEMENT_COMPLEXITY).
+    #[error("{0}")]
+    TooComplex(#[from] complexity_guard::StatementTooComplex),
+
+    /// The statement parsed but is not one of the three admitted DDL forms
+    /// (`CREATE EXTERNAL TABLE`, `CREATE OR REPLACE EXTERNAL TABLE`,
+    /// `DROP TABLE`).
+    #[error(
+        "{kind} is not permitted on the DDL SQL endpoint; only CREATE EXTERNAL TABLE, \
+         CREATE OR REPLACE EXTERNAL TABLE, and DROP TABLE are accepted (docs/adrs/\
+         2040-parquet-tables-queried-in-place.md)"
+    )]
+    NotDdl { kind: &'static str },
+
+    /// `TEMPORARY` is not part of the admitted subset (D2).
+    #[error("TEMPORARY is not supported for an external table (docs/adrs/2040-parquet-tables-queried-in-place.md)")]
+    Temporary,
+
+    /// `UNBOUNDED` is not part of the admitted subset (D2).
+    #[error("UNBOUNDED is not supported for an external table (docs/adrs/2040-parquet-tables-queried-in-place.md)")]
+    Unbounded,
+
+    /// `PARTITIONED BY` is not part of the admitted subset (D2).
+    #[error("PARTITIONED BY is not supported for an external table (docs/adrs/2040-parquet-tables-queried-in-place.md)")]
+    PartitionedBy,
+
+    /// `WITH ORDER` is not part of the admitted subset (D2).
+    #[error("WITH ORDER is not supported for an external table (docs/adrs/2040-parquet-tables-queried-in-place.md)")]
+    WithOrder,
+
+    /// A column list, or a table-level constraint, was given. The schema
+    /// comes from the Parquet footer, never from caller-supplied columns
+    /// (D1, D2).
+    #[error(
+        "a column list or table constraint is not supported; the schema is inferred \
+         from the Parquet footer (docs/adrs/2040-parquet-tables-queried-in-place.md)"
+    )]
+    ColumnList,
+
+    /// `STORED AS <file_type>` named something other than `PARQUET`.
+    #[error("STORED AS {file_type} is not supported; only STORED AS PARQUET is admitted")]
+    NotParquet { file_type: String },
+
+    /// An `OPTIONS` entry whose key is not `binary_as_string` or
+    /// `ravel.cast.<column>` (D5).
+    #[error(
+        "OPTIONS key {key:?} is not admitted; only binary_as_string and ravel.cast.<column> \
+         are supported (docs/adrs/2040-parquet-tables-queried-in-place.md)"
+    )]
+    UnsupportedOption { key: String },
+
+    /// An `OPTIONS` value that is not a plain quoted string literal.
+    #[error("OPTIONS value for {key:?} must be a quoted string literal")]
+    OptionValueNotString { key: String },
+
+    /// The table name failed ravel-pqtable's name rule.
+    #[error(transparent)]
+    InvalidTableName(#[from] names::NameError),
+
+    /// The `LOCATION` URL failed syntax validation: wrong scheme, a `..` or
+    /// empty segment, a glob, a percent-escape, or a query string (D2, D4).
+    /// `ravel_pqtable::grants::parse_location` is the sole source of this
+    /// error; it never returns any other `GrantsError` variant.
+    #[error(transparent)]
+    Location(#[from] GrantsError),
+
+    /// `DROP TABLE` named something other than exactly one table.
+    #[error("DROP TABLE admits exactly one table name; the request named {count}")]
+    DropMultipleTables { count: usize },
+
+    /// `DROP` named an object type other than `TABLE`.
+    #[error("only DROP TABLE is admitted; DROP {object_type} is not")]
+    DropNotTable { object_type: String },
+
+    /// `DROP TABLE` carried `CASCADE`, `RESTRICT`, `PURGE`, `TEMPORARY`, or
+    /// the MySQL `ON <table>` drop-index form, none of which this subset
+    /// supports.
+    #[error("DROP TABLE does not support {clause}")]
+    DropUnsupported { clause: &'static str },
+}
+
+impl From<complexity_guard::GuardedParseError> for DdlValidationError {
+    fn from(error: complexity_guard::GuardedParseError) -> Self {
+        match error {
+            complexity_guard::GuardedParseError::TooComplex(too_complex) => {
+                DdlValidationError::TooComplex(too_complex)
+            }
+            complexity_guard::GuardedParseError::Parse(message) => {
+                DdlValidationError::Parse(strip_prefix(&message))
+            }
+        }
+    }
+}
+
+/// Admitted `OPTIONS` key: exactly `binary_as_string`, or `ravel.cast.`
+/// followed by a non-empty column name (D5).
+fn is_admitted_option_key(key: &str) -> bool {
+    key == "binary_as_string" || key.strip_prefix("ravel.cast.").is_some_and(|c| !c.is_empty())
+}
+
+/// Parse `sql` and accept it only if it is exactly one of the three D2
+/// statement forms, returning the typed intent `execute_ddl` executes.
+/// Like [`validate_query`], this returns before any planning, and it checks
+/// no grant: `location`'s syntax is validated here (scheme, no `..`, no
+/// glob, no percent-escape, no query string), but whether it lies inside a
+/// grant is `execute_ddl`'s job, since that needs the tenant's grants (D2).
+pub fn validate_ddl(sql: &str) -> Result<DdlIntent, DdlValidationError> {
+    let statements = complexity_guard::parse_guarded(sql)?;
+
+    if statements.len() > 1 {
+        return Err(DdlValidationError::MultipleStatements {
+            count: statements.len(),
+        });
+    }
+    let statement = statements.front().ok_or(DdlValidationError::Empty)?;
+
+    match statement {
+        DFStatement::CreateExternalTable(create) => create_external_intent(create),
+        DFStatement::Statement(inner) => match inner.as_ref() {
+            Statement::Drop {
+                object_type,
+                if_exists,
+                names: drop_names,
+                cascade,
+                restrict,
+                purge,
+                temporary,
+                table,
+            } => drop_intent(
+                *object_type,
+                *if_exists,
+                drop_names,
+                *cascade,
+                *restrict,
+                *purge,
+                *temporary,
+                table.as_ref(),
+            ),
+            other => Err(DdlValidationError::NotDdl {
+                kind: ansi_statement_kind(other),
+            }),
+        },
+        DFStatement::CopyTo(_) => Err(DdlValidationError::NotDdl { kind: "COPY" }),
+        DFStatement::Explain(_) => Err(DdlValidationError::NotDdl { kind: "EXPLAIN" }),
+        DFStatement::Reset(_) => Err(DdlValidationError::NotDdl { kind: "RESET" }),
+    }
+}
+
+fn create_external_intent(create: &CreateExternalTable) -> Result<DdlIntent, DdlValidationError> {
+    if create.temporary {
+        return Err(DdlValidationError::Temporary);
+    }
+    if create.unbounded {
+        return Err(DdlValidationError::Unbounded);
+    }
+    if !create.table_partition_cols.is_empty() {
+        return Err(DdlValidationError::PartitionedBy);
+    }
+    if !create.order_exprs.is_empty() {
+        return Err(DdlValidationError::WithOrder);
+    }
+    if !create.columns.is_empty() || !create.constraints.is_empty() {
+        return Err(DdlValidationError::ColumnList);
+    }
+    if create.file_type != "PARQUET" {
+        return Err(DdlValidationError::NotParquet {
+            file_type: create.file_type.clone(),
+        });
+    }
+
+    let mut options = BTreeMap::new();
+    for (key, value) in &create.options {
+        if !is_admitted_option_key(key) {
+            return Err(DdlValidationError::UnsupportedOption { key: key.clone() });
+        }
+        let SqlValue::SingleQuotedString(value) = value else {
+            return Err(DdlValidationError::OptionValueNotString { key: key.clone() });
+        };
+        options.insert(key.clone(), value.clone());
+    }
+
+    // Syntax only: whether `location` lies inside a grant is execute_ddl's
+    // job (D2), which is the only caller that has a tenant's grants to check
+    // it against.
+    grants::parse_location(&create.location)?;
+
+    let name = create.name.to_string();
+    names::validate_table(&name)?;
+
+    Ok(DdlIntent::CreateExternal {
+        name,
+        if_not_exists: create.if_not_exists,
+        or_replace: create.or_replace,
+        location: create.location.clone(),
+        options,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drop_intent(
+    object_type: ObjectType,
+    if_exists: bool,
+    drop_names: &[datafusion::sql::sqlparser::ast::ObjectName],
+    cascade: bool,
+    restrict: bool,
+    purge: bool,
+    temporary: bool,
+    table: Option<&datafusion::sql::sqlparser::ast::ObjectName>,
+) -> Result<DdlIntent, DdlValidationError> {
+    if object_type != ObjectType::Table {
+        return Err(DdlValidationError::DropNotTable {
+            object_type: object_type.to_string(),
+        });
+    }
+    if cascade {
+        return Err(DdlValidationError::DropUnsupported { clause: "CASCADE" });
+    }
+    if restrict {
+        return Err(DdlValidationError::DropUnsupported {
+            clause: "RESTRICT",
+        });
+    }
+    if purge {
+        return Err(DdlValidationError::DropUnsupported { clause: "PURGE" });
+    }
+    if temporary {
+        return Err(DdlValidationError::DropUnsupported {
+            clause: "TEMPORARY",
+        });
+    }
+    if table.is_some() {
+        return Err(DdlValidationError::DropUnsupported {
+            clause: "the MySQL DROP INDEX ON <table> form",
+        });
+    }
+    if drop_names.len() != 1 {
+        return Err(DdlValidationError::DropMultipleTables {
+            count: drop_names.len(),
+        });
+    }
+    let name = drop_names[0].to_string();
+    names::validate_table(&name)?;
+    Ok(DdlIntent::Drop { name, if_exists })
+}
+
 /// The base table names `sql` references, lowercased and unqualified (the
 /// last identifier of any multi-part name). Parsing reuses the same
-/// `DFParser` front end as [`validate`], so the extraction is as robust
+/// `DFParser` front end as [`validate_query`], so the extraction is as robust
 /// against comments, string literals, and quoting as the planner itself --
 /// never a raw-text scan of the statement.
 ///
@@ -315,7 +620,7 @@ pub fn validate(sql: &str) -> Result<(), ValidationError> {
 /// reads as a base table without the query being nonsensical).
 pub(crate) fn referenced_base_tables(sql: &str) -> Result<BTreeSet<String>, ValidationError> {
     // This parses and walks a tree of its own, so it carries the same guard
-    // [`validate`] does rather than relying on every caller having run
+    // [`validate_query`] does rather than relying on every caller having run
     // `validate` on the same text first. The scan stops one token past the
     // bound, so a statement that already passed `validate` pays a bounded
     // rescan and nothing else.
@@ -470,6 +775,7 @@ fn ansi_statement_kind(statement: &Statement) -> &'static str {
         Statement::CreateFunction(_) => "CREATE FUNCTION",
         Statement::AlterTable { .. } => "ALTER TABLE",
         Statement::Drop { .. } => "DROP",
+        Statement::Query(_) => "a SELECT statement",
         Statement::Set(_) => "SET",
         Statement::StartTransaction { .. }
         | Statement::Commit { .. }
@@ -683,7 +989,7 @@ mod tests {
     use super::*;
 
     fn reject(sql: &str) -> ValidationError {
-        validate(sql).expect_err("must be rejected")
+        validate_query(sql).expect_err("must be rejected")
     }
 
     /// Table functions and URL-shaped names are found wherever they sit in
@@ -720,13 +1026,13 @@ mod tests {
 
     #[test]
     fn plain_select_is_accepted() {
-        validate("SELECT ts, value FROM samples WHERE ts > 0 ORDER BY ts LIMIT 10")
+        validate_query("SELECT ts, value FROM samples WHERE ts > 0 ORDER BY ts LIMIT 10")
             .expect("read-only select");
     }
 
     #[test]
     fn aggregates_in_the_v1_subset_are_accepted() {
-        validate(
+        validate_query(
             "SELECT series_id, count(value), sum(value) \
              FROM samples GROUP BY series_id ORDER BY series_id",
         )
@@ -749,7 +1055,7 @@ mod tests {
             "SELECT series_id FROM samples GROUP BY series_id ORDER BY max(value)",
             "SELECT series_id FROM samples GROUP BY series_id ORDER BY min(value) + 1",
         ] {
-            validate(sql).unwrap_or_else(|e| panic!("min/max must be accepted: {sql}: {e}"));
+            validate_query(sql).unwrap_or_else(|e| panic!("min/max must be accepted: {sql}: {e}"));
         }
     }
 
@@ -840,7 +1146,7 @@ mod tests {
     /// checked the outer variant would pass it straight to the planner.
     #[test]
     fn write_hidden_inside_a_query_body_is_rejected() {
-        let err = validate("WITH c AS (SELECT 1) INSERT INTO samples VALUES (1, 2.0)");
+        let err = validate_query("WITH c AS (SELECT 1) INSERT INTO samples VALUES (1, 2.0)");
         match err {
             // Either shape is a correct rejection: some dialect versions
             // parse this as a top-level INSERT, others as a Query whose body
@@ -868,7 +1174,7 @@ mod tests {
             "SELECT series_id, mean(value) FROM samples GROUP BY series_id",
             "SELECT series_id FROM samples GROUP BY series_id ORDER BY avg(value)",
         ] {
-            validate(sql).unwrap_or_else(|e| panic!("avg/mean must be accepted: {sql}: {e}"));
+            validate_query(sql).unwrap_or_else(|e| panic!("avg/mean must be accepted: {sql}: {e}"));
         }
     }
 
@@ -1111,9 +1417,9 @@ mod tests {
 
     #[test]
     fn empty_and_unparsable_bodies_are_rejected_without_planning() {
-        assert_eq!(validate(""), Err(ValidationError::Empty));
+        assert_eq!(validate_query(""), Err(ValidationError::Empty));
         assert!(matches!(
-            validate("SELECT ((( FROM samples"),
+            validate_query("SELECT ((( FROM samples"),
             Err(ValidationError::Parse(_))
         ));
     }
@@ -1240,5 +1546,394 @@ mod tests {
             both.contains("samples") && both.contains("logs"),
             "a genuine base reference must survive CTE collection: {both:?}"
         );
+    }
+
+    fn reject_ddl(sql: &str) -> DdlValidationError {
+        validate_ddl(sql).expect_err("must be rejected")
+    }
+
+    fn accept_create(sql: &str) -> (String, bool, bool, String, BTreeMap<String, String>) {
+        match validate_ddl(sql).unwrap_or_else(|e| panic!("must be accepted: {sql}: {e}")) {
+            DdlIntent::CreateExternal {
+                name,
+                if_not_exists,
+                or_replace,
+                location,
+                options,
+            } => (name, if_not_exists, or_replace, location, options),
+            other => panic!("expected CreateExternal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plain_create_external_table_is_admitted() {
+        let (name, if_not_exists, or_replace, location, options) = accept_create(
+            "CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION 's3://bucket/prefix/'",
+        );
+        assert_eq!(name, "orders");
+        assert!(!if_not_exists);
+        assert!(!or_replace);
+        assert_eq!(location, "s3://bucket/prefix/");
+        assert!(options.is_empty());
+    }
+
+    #[test]
+    fn create_external_table_if_not_exists_is_admitted() {
+        let (_, if_not_exists, or_replace, _, _) = accept_create(
+            "CREATE EXTERNAL TABLE IF NOT EXISTS orders STORED AS PARQUET \
+             LOCATION 's3://bucket/prefix/'",
+        );
+        assert!(if_not_exists);
+        assert!(!or_replace);
+    }
+
+    #[test]
+    fn create_or_replace_external_table_is_admitted() {
+        let (_, if_not_exists, or_replace, _, _) = accept_create(
+            "CREATE OR REPLACE EXTERNAL TABLE orders STORED AS PARQUET \
+             LOCATION 's3://bucket/prefix/'",
+        );
+        assert!(!if_not_exists);
+        assert!(or_replace);
+    }
+
+    #[test]
+    fn create_external_table_single_object_location_is_admitted() {
+        let (_, _, _, location, _) = accept_create(
+            "CREATE EXTERNAL TABLE orders STORED AS PARQUET \
+             LOCATION 's3://bucket/prefix/single.parquet'",
+        );
+        assert_eq!(location, "s3://bucket/prefix/single.parquet");
+    }
+
+    #[test]
+    fn create_external_table_options_are_admitted() {
+        let (_, _, _, _, options) = accept_create(
+            "CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION 's3://bucket/prefix/' \
+             OPTIONS (binary_as_string 'true', 'ravel.cast.created_at' 'date-from-days')",
+        );
+        assert_eq!(options.get("binary_as_string").map(String::as_str), Some("true"));
+        assert_eq!(
+            options.get("ravel.cast.created_at").map(String::as_str),
+            Some("date-from-days")
+        );
+    }
+
+    #[test]
+    fn drop_table_is_admitted() {
+        match validate_ddl("DROP TABLE orders").expect("must be accepted") {
+            DdlIntent::Drop { name, if_exists } => {
+                assert_eq!(name, "orders");
+                assert!(!if_exists);
+            }
+            other => panic!("expected Drop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_table_if_exists_is_admitted() {
+        match validate_ddl("DROP TABLE IF EXISTS orders").expect("must be accepted") {
+            DdlIntent::Drop { name, if_exists } => {
+                assert_eq!(name, "orders");
+                assert!(if_exists);
+            }
+            other => panic!("expected Drop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plain_select_is_not_ddl() {
+        assert!(matches!(
+            reject_ddl("SELECT * FROM orders"),
+            DdlValidationError::NotDdl {
+                kind: "a SELECT statement"
+            }
+        ));
+    }
+
+    #[test]
+    fn insert_is_not_ddl() {
+        assert!(matches!(
+            reject_ddl("INSERT INTO orders VALUES (1)"),
+            DdlValidationError::NotDdl { .. }
+        ));
+    }
+
+    #[test]
+    fn copy_to_is_not_ddl() {
+        assert!(matches!(
+            reject_ddl("COPY (SELECT 1) TO 's3://evil/out.parquet'"),
+            DdlValidationError::NotDdl { kind: "COPY" }
+        ));
+    }
+
+    #[test]
+    fn explain_is_not_ddl() {
+        assert!(matches!(
+            reject_ddl("EXPLAIN SELECT 1"),
+            DdlValidationError::NotDdl { kind: "EXPLAIN" }
+        ));
+    }
+
+    #[test]
+    fn set_is_not_ddl() {
+        assert!(matches!(
+            reject_ddl("SET time_zone = 'UTC'"),
+            DdlValidationError::NotDdl { .. }
+        ));
+    }
+
+    #[test]
+    fn multi_statement_ddl_body_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION 's3://bucket/prefix/'; \
+                 DROP TABLE orders"
+            ),
+            DdlValidationError::MultipleStatements { count: 2 }
+        ));
+    }
+
+    #[test]
+    fn empty_ddl_body_is_rejected() {
+        assert!(matches!(reject_ddl(""), DdlValidationError::Empty));
+    }
+
+    #[test]
+    fn temporary_external_table_is_rejected() {
+        // DataFusion's grammar places TEMPORARY after EXTERNAL, not before:
+        // `CREATE EXTERNAL TEMPORARY TABLE ...`.
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TEMPORARY TABLE orders STORED AS PARQUET \
+                 LOCATION 's3://bucket/prefix/'"
+            ),
+            DdlValidationError::Temporary
+        ));
+    }
+
+    #[test]
+    fn unbounded_external_table_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE UNBOUNDED EXTERNAL TABLE orders STORED AS PARQUET \
+                 LOCATION 's3://bucket/prefix/'"
+            ),
+            DdlValidationError::Unbounded
+        ));
+    }
+
+    #[test]
+    fn partitioned_by_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION 's3://bucket/prefix/' \
+                 PARTITIONED BY (day)"
+            ),
+            DdlValidationError::PartitionedBy
+        ));
+    }
+
+    #[test]
+    fn with_order_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION 's3://bucket/prefix/' \
+                 WITH ORDER (ts)"
+            ),
+            DdlValidationError::WithOrder
+        ));
+    }
+
+    #[test]
+    fn column_list_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders (a INT) STORED AS PARQUET \
+                 LOCATION 's3://bucket/prefix/'"
+            ),
+            DdlValidationError::ColumnList
+        ));
+    }
+
+    #[test]
+    fn non_parquet_stored_as_is_rejected() {
+        assert!(matches!(
+            reject_ddl("CREATE EXTERNAL TABLE orders STORED AS CSV LOCATION 's3://bucket/prefix/'"),
+            DdlValidationError::NotParquet { file_type } if file_type == "CSV"
+        ));
+    }
+
+    #[test]
+    fn unsupported_option_key_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION 's3://bucket/prefix/' \
+                 OPTIONS (evil_option 'true')"
+            ),
+            DdlValidationError::UnsupportedOption { key } if key == "evil_option"
+        ));
+    }
+
+    #[test]
+    fn ravel_cast_option_with_empty_column_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION 's3://bucket/prefix/' \
+                 OPTIONS ('ravel.cast.' 'date-from-days')"
+            ),
+            DdlValidationError::UnsupportedOption { key } if key == "ravel.cast."
+        ));
+    }
+
+    #[test]
+    fn option_value_must_be_a_string_literal() {
+        // DataFusion's OPTIONS grammar normalizes any bare word (quoted or
+        // not, including keywords like `true`) to the same
+        // `Value::SingleQuotedString`, so only a genuinely different token
+        // kind -- here a bare number -- exercises this rejection.
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION 's3://bucket/prefix/' \
+                 OPTIONS (binary_as_string 123)"
+            ),
+            DdlValidationError::OptionValueNotString { key } if key == "binary_as_string"
+        ));
+    }
+
+    #[test]
+    fn invalid_table_name_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE \"Orders\" STORED AS PARQUET LOCATION 's3://bucket/prefix/'"
+            ),
+            DdlValidationError::InvalidTableName(_)
+        ));
+    }
+
+    #[test]
+    fn reserved_table_name_is_rejected() {
+        assert!(matches!(
+            reject_ddl("CREATE EXTERNAL TABLE samples STORED AS PARQUET LOCATION 's3://bucket/prefix/'"),
+            DdlValidationError::InvalidTableName(_)
+        ));
+    }
+
+    #[test]
+    fn drop_reserved_table_name_is_rejected() {
+        assert!(matches!(
+            reject_ddl("DROP TABLE logs"),
+            DdlValidationError::InvalidTableName(_)
+        ));
+    }
+
+    #[test]
+    fn location_without_scheme_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION '/tmp/prefix/'"
+            ),
+            DdlValidationError::Location(_)
+        ));
+    }
+
+    #[test]
+    fn location_with_file_scheme_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION 'file:///etc/passwd'"
+            ),
+            DdlValidationError::Location(_)
+        ));
+    }
+
+    #[test]
+    fn location_with_http_scheme_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET \
+                 LOCATION 'http://bucket/prefix/'"
+            ),
+            DdlValidationError::Location(_)
+        ));
+    }
+
+    #[test]
+    fn location_with_dotdot_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET \
+                 LOCATION 's3://bucket/../prefix/'"
+            ),
+            DdlValidationError::Location(_)
+        ));
+    }
+
+    #[test]
+    fn location_with_empty_segment_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET \
+                 LOCATION 's3://bucket/prefix//double/'"
+            ),
+            DdlValidationError::Location(_)
+        ));
+    }
+
+    #[test]
+    fn location_with_glob_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET \
+                 LOCATION 's3://bucket/prefix/*.parquet'"
+            ),
+            DdlValidationError::Location(_)
+        ));
+    }
+
+    #[test]
+    fn location_with_percent_escape_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET \
+                 LOCATION 's3://bucket/prefix%2F/'"
+            ),
+            DdlValidationError::Location(_)
+        ));
+    }
+
+    #[test]
+    fn location_with_query_string_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET \
+                 LOCATION 's3://bucket/prefix/?x=1'"
+            ),
+            DdlValidationError::Location(_)
+        ));
+    }
+
+    #[test]
+    fn drop_multiple_tables_is_rejected() {
+        assert!(matches!(
+            reject_ddl("DROP TABLE orders, other"),
+            DdlValidationError::DropMultipleTables { count: 2 }
+        ));
+    }
+
+    #[test]
+    fn drop_view_is_rejected() {
+        assert!(matches!(
+            reject_ddl("DROP VIEW orders"),
+            DdlValidationError::DropNotTable { .. }
+        ));
+    }
+
+    #[test]
+    fn drop_table_cascade_is_rejected() {
+        assert!(matches!(
+            reject_ddl("DROP TABLE orders CASCADE"),
+            DdlValidationError::DropUnsupported { clause: "CASCADE" }
+        ));
     }
 }

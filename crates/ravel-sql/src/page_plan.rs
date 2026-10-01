@@ -261,7 +261,7 @@ use crate::logs_schema::logs_schema;
 use crate::schema::public_schema;
 use crate::session::{ALERTS_TABLE, AUDIT_TABLE, LOGS_TABLE, SAMPLES_TABLE, SPANS_TABLE};
 use crate::spans_schema::spans_schema;
-use crate::validate::{ValidationError, referenced_base_tables, validate};
+use crate::validate::{ValidationError, referenced_base_tables, validate_query};
 
 /// The alias the page statement gives the caller's own statement as a derived
 /// table. Exposed because it is part of the rewritten text: an operator reading
@@ -653,7 +653,7 @@ impl PagePlan {
 pub fn plan_page(sql: &str, resume: Option<&ResumePosition>) -> Result<PagePlan, PagePlanError> {
     // The security gate first, exactly as the executor runs it, so this
     // function never rewrites a statement the executor would refuse.
-    validate(sql)?;
+    validate_query(sql)?;
     let query = parse_query(sql)?;
 
     // Before anything else reads the `SELECT` body: a pipe operator makes that
@@ -725,7 +725,7 @@ pub fn plan_page(sql: &str, resume: Option<&ResumePosition>) -> Result<PagePlan,
 }
 
 /// The single `Statement::Query` of `sql`. Every other shape is unreachable:
-/// [`validate`] has already accepted the text, and it accepts exactly one
+/// [`validate_query`] has already accepted the text, and it accepts exactly one
 /// statement and only a `Statement::Query`.
 fn parse_query(sql: &str) -> Result<Query, PagePlanError> {
     // The complexity guard runs here as part of the parse rather than on the
