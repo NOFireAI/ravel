@@ -43,9 +43,11 @@ covered-column list, and filters are no longer rounded to a power of two, so
 the version-4 BLOOM parser would misread a version-5 section. The footer gained
 two fields (`sort_descriptor`, `clustering_generation`). By default the writer
 at version 5 records no sort descriptor and generation 0, covers every column
-version 4 indexed, and emits neither tag 12 nor tag 13. It does emit tags 10
-and 11, and it chooses each page's encoding by stored size (see "Encodings
-(tag registry)"). A version-4 object is refused with `UnsupportedVersion` from the
+version 4 indexed, and emits tags 10 to 13. It chooses each page's encoding
+by stored size, and stores a string column chunk on one row-group dictionary
+(tags 12 and 13) when that is strictly smaller (see "Encodings (tag
+registry)" and "Row-group string dictionaries"). A version-4 object is
+refused with `UnsupportedVersion` from the
 trailer alone, before the footer or any section is requested. Under the
 pre-v1.0 posture below, a development store holding version-4 objects is wiped
 or re-ingested.
@@ -420,6 +422,42 @@ chunk, in that order, so one block contributes one or two pages to one chunk.
 A column absent from every row of a block is all-null and occupies zero bytes,
 and contributes no page to the chunk.
 
+### Row-group string dictionaries
+
+A string column chunk (`severity_text`, `body`, `attrs_raw`, or a FIELD_DIR
+column of type `Str` or `Bytes`) may store its values on one row-group
+dictionary instead of per-block value pages (ADR-2135 decision 6). Its first
+page is then a **dictionary page** (tag 12) holding the group's distinct values
+for the column, and each block that carries the column stores a **dictionary
+id page** (tag 13) in place of its value page, still after the block's
+presence bitmap page when it has one:
+
+```
+chunk column c, dictionary form:
+  dict(tag 12)  [bitmap(b0)] ids(b0)  [bitmap(b1)] ids(b1) ...
+```
+
+The dictionary page belongs to the chunk, not to a block. It sits at the
+chunk's `offset`, and every id page of the chunk resolves through it, so a
+reader of any block of the chunk needs it.
+
+The writer considers a string column of a row group when its distinct values
+number at least one and at most half its present values (`2 * distinct <=
+present`), and takes the dictionary form only when the dictionary page plus
+the id pages store strictly fewer bytes than the value pages they replace
+(presence bitmap pages are the same either way and are not counted; the
+PAGE_DIR entries are not counted either, so a small chunk can make the whole
+object a few bytes larger). A tie keeps the per-block pages. Stored bytes are
+measured after the page compression envelope. The dictionary's entries are
+sorted bytewise and an id is the entry's rank, so the row-major and columnar
+write paths produce the same dictionary and the same bytes. A column whose
+group dictionary would pass 65,536 entries, or whose distinct bytes would take
+the group's total across string columns past the writer's `block_max_bytes`
+(8 MiB by default), is dropped from the decision and keeps its per-block
+pages. A decoded block's dictionary for a column is the subset of the group's
+entries that block uses, in the same order, so a reader sees the same
+per-block dictionary under either form.
+
 `observed_ts` in a block where it equals `ts` row for row is stored as a
 column reference to `ts` (tag 11), a one-byte page, instead of a copy of the
 values. In any other block it is an ordinary i64 page. A reader decodes `ts`
@@ -430,8 +468,12 @@ fetches.
 The block's crc32c is stored in its SKIP_IDX level-0 entry, not inline, and
 covers the concatenation of the block's pages in ascending `column_id` order --
 which is what a whole-block read assembles once it has located them through
-PAGE_DIR, and is the order PAGE_DIR lists them in. A whole-block reader
-verifies it; a reader taking a subset of the columns cannot (it does not have
+PAGE_DIR, and is the order PAGE_DIR lists them in. A row-group dictionary page
+is not one of the block's pages and the block crc does not cover it; every
+reader, whole-block or subset, verifies each dictionary page it uses against
+its own crc32c before decoding any id page of that chunk, so a corrupt
+dictionary fails every block of its chunk. A whole-block reader verifies the
+block crc; a reader taking a subset of the columns cannot (it does not have
 the other pages) and verifies each page's own crc32c instead. Both are
 mandatory on their own access path, which is what keeps every interpreted byte
 checksum-covered (ADR-0010 §4, "Checksum coverage map" below). This is what
@@ -445,7 +487,10 @@ A reader may decode a *subset* of a block's columns (`read_block_columns`,
 ADR-0087); the SQL logs scan uses this to decode only the columns a query
 references. Under version 4 the subset is also a *fetch* subset: PAGE_DIR gives
 each column chunk's byte extent, so a projection of `k` columns over a row
-group is `k` contiguous ranges instead of one range per block. A skipped column
+group is `k` contiguous ranges instead of one range per block. A fetch of some
+of a group's blocks takes each kept column chunk's dictionary page once,
+whatever number of its blocks it keeps, and nothing of a chunk it keeps no
+page of. A skipped column
 is indistinguishable from an absent one in the decoded result, so a reader that
 projects is responsible for having asked for every column it goes on to read.
 
@@ -506,6 +551,15 @@ column contributes its presence bitmap page and then its value page, so
 between one and two per block that carries it -- not the number of blocks that
 carry it.
 
+A row-group dictionary page (tag 12) is the one entry that relaxes three of
+these rules, and only as its chunk's first page: its `block` is the group's
+`block_count` (one past the last block, since it names none), it precedes the
+chunk's block 0 pages, and it may take `page_count` to `2 * block_count + 1`.
+A chunk carrying one has at least one id page (tag 13) after it, and an id page
+appears only in a chunk whose first page is a dictionary page. Every other page
+of the chunk keeps every rule. A reader listing a block's pages never returns
+the dictionary page among them; it locates it as the chunk's first page.
+
 Groups partition the object's blocks into consecutive runs starting at block 0:
 the first group's `first_block` is 0 and each subsequent group's continues
 where the previous ended. The whole directory's `block_count` total equals the
@@ -526,13 +580,14 @@ SKIP_IDX level-0 entry count.
 | 9 | fixed-width | trace_id (16B), span_id (8B) |
 | 10 | GCD i64 (ADR-2135 decision 3) | i64 pages whose offsets from the page minimum share a divisor |
 | 11 | column reference (ADR-2135 decision 3) | `observed_ts` equal to `ts` |
-| 12 | reserved: row-group dictionary page (ADR-2135 decision 6) | never written |
-| 13 | reserved: row-group dictionary ids (ADR-2135 decision 6) | never written |
+| 12 | row-group dictionary page (ADR-2135 decision 6) | a string column chunk's first page |
+| 13 | row-group dictionary ids (ADR-2135 decision 6) | a string page of a chunk whose first page is tag 12 |
 
 Tags 10 to 13 are registered in the shared `ravel-codec` registry, whose
-encoders never emit them and whose decoders refuse them. Tags 10 and 11 are
-RLOG-only codecs, encoded and decoded in `ravel-logseg`. At version 5 no
-writer emits tag 12 or 13, and a PAGE_DIR page carrying one is `Corrupted`.
+encoders never emit them and whose decoders refuse them, so RSEG and RSPAN
+keep refusing all four. They are RLOG-only codecs, encoded and decoded in
+`ravel-logseg`. A tag 12 or 13 page on a column that is not a string column,
+or placed other than as "PAGE_DIR" above describes, is `Corrupted`.
 
 **Encoding choice (ADR-2135 decision 4).** The writer encodes every
 candidate encoding of a page once, passes each through the page
@@ -640,6 +695,19 @@ it holds, else plain.
   `count` ids as a FOR bit-pack body (`bit_width` u8, then packed ids
   LSB-first) selecting into the dictionary. An id `>= dict_count` is
   `Corrupted`; a blob shorter than the offsets claim is `Corrupted`.
+- **row-group dictionary page (12):** `dict_count` varint, then
+  `dict_count` entries each `(len varint, bytes)`, strictly ascending by
+  byte value: the dictionary section of a tag 7 page with no ids after it.
+  A `dict_count` of zero, above 65,536, or above the page's byte length
+  plus one, entries not strictly ascending, a truncated entry, and
+  trailing bytes are `Corrupted`.
+- **row-group dictionary ids (13):** the block's `count` ids, one per
+  present value, packed LSB-first at `w = bit_width(dict_count - 1)` bits,
+  the width a tag 7 page over the same dictionary would use. The page
+  stores no width byte: the reader derives `w` from the chunk's tag 12
+  page, so a one-entry dictionary's id pages are empty. The payload length
+  MUST be exactly `ceil(count * w / 8)`, and an id `>= dict_count` is
+  `Corrupted`.
 
 ### f64-bits codec layouts
 
@@ -1251,7 +1319,8 @@ framing, which is checked structurally (see below):
 | SKIP_IDX stored bytes | `Section.crc32c` | footer section entry | before decoding the section |
 | PAGE_DIR stored bytes | `Section.crc32c` | footer section entry | before decoding the section |
 | one page's stored bytes | that page's `crc32c` | PAGE_DIR | before decompressing the page |
-| one block's pages concatenated in `column_id` order | `block_crc32c` | that block's SKIP_IDX level-0 entry | before decoding the block, by a reader that took every page of it |
+| one block's pages concatenated in `column_id` order (no row-group dictionary page) | `block_crc32c` | that block's SKIP_IDX level-0 entry | before decoding the block, by a reader that took every page of it |
+| one row-group dictionary page's stored bytes | that page's `crc32c` | PAGE_DIR | before decompressing it, and before any id page of its chunk is decoded, on every read path |
 | BLOOM covered-column list (`covered_count` and the id varints) | `covered_crc32c` | BLOOM, right after the ids | before any id is validated or used, in `RlogBloomSection::parse` |
 | one BLOOM entry's stored bytes | per-entry `crc32c` | BLOOM container framing | before probing the entry |
 | POSTINGS header (`column_id`, `capped`, `stride`, counts, `first_term`s, offsets, for every field) | whole-section `Section.crc32c` | footer section entry | before `PostingsSection::parse`, in `RlogReader::scan` |
@@ -1346,7 +1415,10 @@ All violations are `Corrupted`, never panics:
   outside 1 to 6, a negative quotient, or a quotient whose product with
   `gcd` overflows u64; a column reference on any column but `observed_ts`,
   naming any column but `ts`, whose target was not decoded, or whose
-  presence differs from its target's.
+  presence differs from its target's; a row-group dictionary page that is
+  empty, over 65,536 entries, not strictly ascending, truncated, or followed
+  by trailing bytes; a dictionary id page whose length is not exactly its
+  ids at the derived width, or with an id `>= dict_count`.
 - bloom: `covered_count` over the object's column count; covered ids not
   strictly ascending, or a dynamic id FIELD_DIR does not name; `m_bits` not a
   multiple of 512 or below 512; `k = 0`; `bits` length wrong; entry crc
@@ -1372,9 +1444,13 @@ All violations are `Corrupted`, never panics:
   a gap and an overlap in the block partition); a chunk count above what the
   group's blocks could carry pages for (`block_count * MAX_PAGES`);
   non-ascending `column_id` across a group's chunks; a page count outside
-  `1..=2 * block_count`; a page naming a block outside its group or going
-  backwards within a chunk; an unknown `enc` tag, or one of the reserved tags
-  12 and 13; an overflowing chunk length
+  `1..=2 * block_count` (`2 * block_count + 1` for a chunk whose first page
+  is a row-group dictionary page); a page other than that dictionary page
+  naming a block outside its group or going backwards within a chunk; an
+  unknown `enc` tag; a tag 12 page that is not its chunk's first page, names
+  a block other than the group's `block_count`, or has no tag 13 page after
+  it; a tag 13 page in a chunk with no tag 12 page; a tag 12 or 13 page in a
+  chunk whose column is not a string column; an overflowing chunk length
   or extent; a chunk whose extent ends past the BLOCKS section; a total block
   count disagreeing with the SKIP_IDX level-0 entry count; truncation; trailing
   bytes.

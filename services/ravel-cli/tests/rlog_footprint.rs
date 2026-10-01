@@ -289,17 +289,22 @@ fn footprint_sums_to_object_bytes() {
 
     // Exact page counts: one page per block for an always-present column, two
     // (presence bitmap then values) for `region`, which misses a row per block.
+    // `svc` (two distinct values) and `region` (one) take a row-group
+    // dictionary: one dictionary page per row group, and an id page per block
+    // in place of the value page. A has two row groups, B one.
     let oa = &objects[0]["columns"];
     let ob = &objects[1]["columns"];
     assert_eq!(u(oa, &["ts:fixed", "pages"]), 3);
     assert_eq!(u(oa, &["body:fixed", "pages"]), 3);
-    assert_eq!(u(oa, &["svc:str", "pages"]), 3);
-    assert_eq!(u(oa, &["svc:str", "encodings", "dictionary", "pages"]), 3);
+    assert_eq!(u(oa, &["svc:str", "pages"]), 5);
+    assert_eq!(u(oa, &["svc:str", "encodings", "dict_page", "pages"]), 2);
+    assert_eq!(u(oa, &["svc:str", "encodings", "dict_ids", "pages"]), 3);
     assert_eq!(u(oa, &["code:i64", "pages"]), 3);
     assert_eq!(u(ob, &["ts:fixed", "pages"]), 2);
     assert_eq!(u(ob, &["latency_ms:i64", "pages"]), 2);
-    assert_eq!(u(ob, &["region:str", "pages"]), 4);
+    assert_eq!(u(ob, &["region:str", "pages"]), 5);
     assert_eq!(u(ob, &["region:str", "encodings", "bitmap", "pages"]), 2);
+    assert_eq!(u(ob, &["region:str", "encodings", "dict_page", "pages"]), 1);
     assert!(oa.get("region:str").is_none() && ob.get("svc:str").is_none());
 
     // The body pages are zstd-compressed, so stored and uncompressed differ and
@@ -760,7 +765,8 @@ async fn footprint_refuses_pages_that_do_not_sum_to_blocks() {
 
 /// Page counts for a column absent from one block, fully present in one and
 /// partly present in two: one value page per block carrying it, plus one
-/// presence page per block where it is only partly present.
+/// presence page per block where it is only partly present, plus the row
+/// group's dictionary page (the column holds one distinct value).
 #[tokio::test]
 async fn partially_present_column_pages_count_value_and_presence_pages() {
     let cfg = RlogConfig {
@@ -782,9 +788,10 @@ async fn partially_present_column_pages_count_value_and_presence_pages() {
     assert_eq!(footer::open(&bytes).expect("open").block_count, 4);
     let report = footprint_of(&bytes).await.expect("footprint");
     let zone = &report.total.columns["zone:str"];
-    // Three blocks carry it, two of those partly: 3 + 2.
-    assert_eq!(zone.total.pages, 5);
+    // Three blocks carry it, two of those partly, one dictionary: 3 + 2 + 1.
+    assert_eq!(zone.total.pages, 6);
     assert_eq!(zone.encodings["bitmap"].pages, 2);
+    assert_eq!(zone.encodings["dict_page"].pages, 1);
     assert_eq!(report.total.columns["n:i64"].total.pages, 4);
 }
 

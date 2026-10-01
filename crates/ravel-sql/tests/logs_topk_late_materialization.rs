@@ -510,11 +510,12 @@ fn wide_statement(k: usize) -> String {
 ///
 /// The decode counters are the red side: with the rule off, `SELECT *` projects
 /// `attrs`, which resolves to every dynamic column plus the overflow, so the
-/// scan decodes 39 pages per block, 624 over the fixture, and skips none. With
+/// scan decodes 40 pages per block (39 columns plus `severity_text`'s
+/// row-group dictionary page), 640 over the fixture, and skips none. With
 /// the rule on, phase 1's scan projects `ts` and `body`, so it decodes three
 /// pages per block (`ts` and `stream_ref` from
 /// `ColumnSelection::fixed_only`, plus `body`) -- 48 over the fixture -- and
-/// walks past the other 36.
+/// walks past the other 37.
 #[tokio::test]
 async fn a_wide_topk_returns_identical_rows_while_decoding_only_the_narrow_columns() {
     for k in [1usize, 10, 20] {
@@ -560,8 +561,10 @@ async fn a_wide_topk_returns_identical_rows_while_decoding_only_the_narrow_colum
         assert_eq!(without.blocks_scanned, TOTAL_BLOCKS, "k={k}");
 
         // Phase 1 decodes three pages per block (ts, stream_ref, body) and
-        // walks past the other 36: the 32 declared columns, observed_ts,
-        // severity_num, severity_text, and flags. The baseline decodes all 39.
+        // walks past the other 37: the 32 declared columns, observed_ts,
+        // severity_num, severity_text's id page and its row-group dictionary
+        // page (every block reads its chunk's dictionary), and flags. The
+        // baseline decodes all 40.
         assert_eq!(
             with.pages_decoded,
             3 * TOTAL_BLOCKS,
@@ -569,12 +572,12 @@ async fn a_wide_topk_returns_identical_rows_while_decoding_only_the_narrow_colum
         );
         assert_eq!(
             with.pages_skipped,
-            36 * TOTAL_BLOCKS,
+            37 * TOTAL_BLOCKS,
             "k={k}: phase 1 walks past the wide columns' pages"
         );
         assert_eq!(
             without.pages_decoded,
-            39 * TOTAL_BLOCKS,
+            40 * TOTAL_BLOCKS,
             "k={k}: the single-phase scan decodes every column of every block"
         );
         assert_eq!(
@@ -683,19 +686,19 @@ async fn without_a_cache_phase_two_costs_exactly_one_get_per_fetched_block() {
     // its byte fetch is the query's normal fetch for that object: these fixture
     // objects are below the block-range threshold, so each block read is a
     // whole-object GET, exactly as the baseline's segment reads are. So the
-    // cost is one object's bytes per winner, not one block's. 27,635 is the
-    // four objects a single pass moves (the baseline); 96,572 is that plus
-    // 68,937 for the ten whole-object block reads, and 34,306 is that plus
-    // 6,671 for one. See ADR-0774's consequences: narrowing that fetch to the
+    // cost is one object's bytes per winner, not one block's. 27,573 is the
+    // four objects a single pass moves (the baseline); 96,356 is that plus
+    // 68,783 for the ten whole-object block reads, and 34,230 is that plus
+    // 6,657 for one. See ADR-0774's consequences: narrowing that fetch to the
     // named block indices is a ravel-query follow-up, and it is what would make
     // the byte cost per-block rather than per-object.
-    assert_eq!(baseline.bytes, 27_635, "the four objects, once");
+    assert_eq!(baseline.bytes, 27_573, "the four objects, once");
     assert_eq!(
-        one.bytes, 34_306,
+        one.bytes, 34_230,
         "one winner adds one whole-object block read"
     );
     assert_eq!(
-        all.bytes, 96_572,
+        all.bytes, 96_356,
         "ten winners add ten whole-object block reads"
     );
     // And the rows are still identical, so the extra reads bought nothing but

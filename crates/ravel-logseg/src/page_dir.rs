@@ -26,8 +26,10 @@ use std::collections::HashSet;
 use crate::block::MAX_PAGES;
 use crate::encoding::Enc;
 use crate::error::LogSegError;
+use crate::field_dir::FieldDir;
 use crate::page::PageDesc;
 use crate::reader::MAX_BLOCKS;
+use crate::record::{COL_ATTRS_RAW, COL_BODY, COL_SEVERITY_TEXT, FieldType};
 use crate::varint::{get_uvarint, put_uvarint};
 
 /// Upper bound on the number of pages one block may contribute to one column
@@ -88,6 +90,12 @@ impl ChunkEntry {
         Some((self.offset, len))
     }
 
+    /// The chunk's row group dictionary page (tag 12), if it has one. Decode
+    /// admits one only as the first page, which sits at the chunk's `offset`.
+    pub fn dict_page(&self) -> Option<&PageEntry> {
+        self.pages.first().filter(|p| p.enc == Enc::DictPage)
+    }
+
     /// The absolute offset of each page, derived by running `offset` forward
     /// over the preceding pages' stored lengths.
     pub fn page_offsets(&self) -> Option<Vec<u64>> {
@@ -145,6 +153,9 @@ impl PageDir {
     /// which is the order the block's SKIP_IDX level-0 crc32c covers them in
     /// (ADR-0699 decision 2). Returns `None` when `block` is outside the
     /// directory or a page offset overflows.
+    ///
+    /// A row group dictionary page is never one of them: it belongs to the
+    /// chunk, not to any block, and [`Self::block_dict_pages`] returns it.
     pub fn block_pages(&self, block: u32) -> Option<Vec<PageLoc>> {
         let (group, within) = self.locate_block(block)?;
         // The per-page offset is derived by running the chunk's offset forward,
@@ -155,7 +166,7 @@ impl PageDir {
         for chunk in &group.chunks {
             let mut at = chunk.offset;
             for p in &chunk.pages {
-                if p.block == within {
+                if p.block == within && p.enc != Enc::DictPage {
                     out.push(PageLoc {
                         desc: p.desc(chunk.column_id),
                         crc32c: p.crc32c,
@@ -163,6 +174,33 @@ impl PageDir {
                     });
                 }
                 at = at.checked_add(p.len)?;
+            }
+        }
+        Some(out)
+    }
+
+    /// The row group dictionary pages whole-object block index `block` needs,
+    /// in `column_id` order: one per column chunk of its group that has a
+    /// dictionary page and a page for `block`. Offsets are relative to BLOCKS,
+    /// as [`Self::block_pages`] returns them. `None` when `block` is outside
+    /// the directory.
+    pub fn block_dict_pages(&self, block: u32) -> Option<Vec<PageLoc>> {
+        let (group, within) = self.locate_block(block)?;
+        let mut out = Vec::new();
+        for chunk in &group.chunks {
+            let Some(d) = chunk.dict_page() else {
+                continue;
+            };
+            if chunk
+                .pages
+                .iter()
+                .any(|p| p.block == within && p.enc != Enc::DictPage)
+            {
+                out.push(PageLoc {
+                    desc: d.desc(chunk.column_id),
+                    crc32c: d.crc32c,
+                    offset: chunk.offset,
+                });
             }
         }
         Some(out)
@@ -215,6 +253,7 @@ impl PageDir {
                 None => true,
                 Some(set) => set.contains(&chunk.column_id),
             };
+            let chunk_start = out.len();
             let mut at = chunk.offset;
             for p in &chunk.pages {
                 let start = at;
@@ -223,9 +262,17 @@ impl PageDir {
                 // than a linear scan: a default-sized group has 32 blocks and a
                 // wide object has one chunk per column, so a linear membership
                 // test here would be quadratic in the group.
-                if keep && blocks.binary_search(&p.block).is_ok() {
+                if keep && p.enc != Enc::DictPage && blocks.binary_search(&p.block).is_ok() {
                     out.push((start, p.len));
                 }
+            }
+            // Every kept block's id pages resolve through the chunk's
+            // dictionary, so it is fetched once, ahead of them, whenever any
+            // of them is.
+            if out.len() > chunk_start
+                && let Some(d) = chunk.dict_page()
+            {
+                out.insert(chunk_start, (chunk.offset, d.len));
             }
         }
         Some(out)
@@ -252,6 +299,7 @@ impl PageDir {
         raw: &[u8],
         blocks_len: u64,
         l0_len: usize,
+        field_dir: &FieldDir,
     ) -> Result<Self, LogSegError> {
         let dir = PageDir::decode(raw)?;
         dir.validate_extents(blocks_len)?;
@@ -262,7 +310,36 @@ impl PageDir {
                 l0_len
             )));
         }
+        dir.validate_dict_columns(field_dir)?;
         Ok(dir)
+    }
+
+    /// Rejects a tag 12 or tag 13 page in a chunk whose column is not a string
+    /// column: `severity_text`, `body`, `attrs_raw`, or a FIELD_DIR column of
+    /// type `Str` or `Bytes`.
+    pub fn validate_dict_columns(&self, field_dir: &FieldDir) -> Result<(), LogSegError> {
+        for g in &self.groups {
+            for c in &g.chunks {
+                if !c
+                    .pages
+                    .iter()
+                    .any(|p| matches!(p.enc, Enc::DictPage | Enc::DictIds))
+                {
+                    continue;
+                }
+                let string = matches!(c.column_id, COL_SEVERITY_TEXT | COL_BODY | COL_ATTRS_RAW)
+                    || field_dir
+                        .by_column_id(c.column_id)
+                        .is_some_and(|e| matches!(e.ty, FieldType::Str | FieldType::Bytes));
+                if !string {
+                    return Err(LogSegError::Corrupted(format!(
+                        "page_dir column {} carries a dictionary page but is not a string column",
+                        c.column_id
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Rejects a directory whose page extents fall outside a BLOCKS section of
@@ -324,6 +401,14 @@ impl PageDir {
     /// presence page and a value page); a page naming a block outside the group
     /// or going backwards; an unknown `enc` tag; an overflowing chunk length;
     /// truncation; and trailing bytes.
+    ///
+    /// A row group dictionary page (tag 12) is the one exception to three of
+    /// those rules, and only as its chunk's first page: its block index is the
+    /// group's `block_count`, it precedes block 0, and it may take the chunk's
+    /// page count one past two per block. A tag 12 page anywhere else, a
+    /// second one, a tag 13 page in a chunk with none, and a tag 12 page with
+    /// no tag 13 page after it are all `Corrupted`. Which columns may carry
+    /// them needs FIELD_DIR, so [`Self::decode_validated`] checks that.
     pub fn decode(bytes: &[u8]) -> Result<Self, LogSegError> {
         let mut pos = 0usize;
         let group_count = get_uvarint(bytes, &mut pos)?;
@@ -377,8 +462,11 @@ impl PageDir {
                 prev_column = Some(column_id);
                 let offset = get_uvarint(bytes, &mut pos)?;
                 let page_count = get_uvarint(bytes, &mut pos)?;
+                // One more than two pages per block is only for a chunk whose
+                // first page is its row group dictionary, checked below once
+                // the first page has been read.
                 let max_pages = block_count.saturating_mul(MAX_PAGES_PER_BLOCK_PER_COLUMN);
-                if page_count == 0 || page_count > max_pages {
+                if page_count == 0 || page_count > max_pages.saturating_add(1) {
                     return Err(LogSegError::Corrupted(format!(
                         "page_dir page count {page_count} outside 1..={max_pages}"
                     )));
@@ -390,38 +478,60 @@ impl PageDir {
                 // chunk-wide cap above bounds their total, this bounds the run
                 // so no block can carry more than the presence-plus-value pair.
                 let mut run = 0u64;
-                for _ in 0..page_count {
+                let mut has_dict = false;
+                let mut has_ids = false;
+                for i in 0..page_count {
                     let block = read_u32_varint(bytes, &mut pos)?;
-                    if u64::from(block) >= block_count {
+                    let enc = Enc::from_u8(read_u8(bytes, &mut pos)?)?;
+                    // A row group dictionary page (ADR-2135 decision 6) is the
+                    // chunk's first page and names no block: its index is one
+                    // past the group's last. Every other page keeps every rule.
+                    if enc == Enc::DictPage {
+                        if i != 0 {
+                            return Err(LogSegError::Corrupted(format!(
+                                "page_dir column {column_id} dictionary page is not the \
+                                 chunk's first page"
+                            )));
+                        }
+                        if u64::from(block) != block_count {
+                            return Err(LogSegError::Corrupted(format!(
+                                "page_dir column {column_id} dictionary page names block \
+                                 {block}, not {block_count}"
+                            )));
+                        }
+                        has_dict = true;
+                    } else if enc == Enc::DictIds && !has_dict {
+                        return Err(LogSegError::Corrupted(format!(
+                            "page_dir column {column_id} has a dictionary id page but no \
+                             dictionary page"
+                        )));
+                    }
+                    has_ids |= enc == Enc::DictIds;
+                    if enc != Enc::DictPage && u64::from(block) >= block_count {
                         return Err(LogSegError::Corrupted(format!(
                             "page_dir page block {block} outside group of {block_count}"
                         )));
                     }
-                    if let Some(prev) = prev_block
-                        && block < prev
-                    {
-                        return Err(LogSegError::Corrupted(format!(
-                            "page_dir page blocks not ascending: {block} after {prev}"
-                        )));
-                    }
-                    run = if prev_block == Some(block) {
-                        run + 1
-                    } else {
-                        1
-                    };
-                    if run > MAX_PAGES_PER_BLOCK_PER_COLUMN {
-                        return Err(LogSegError::Corrupted(format!(
-                            "page_dir block {block} carries more than \
-                             {MAX_PAGES_PER_BLOCK_PER_COLUMN} pages in one column"
-                        )));
-                    }
-                    prev_block = Some(block);
-                    let enc = Enc::from_u8(read_u8(bytes, &mut pos)?)?;
-                    if matches!(enc, Enc::DictPage | Enc::DictIds) {
-                        return Err(LogSegError::Corrupted(format!(
-                            "page_dir enc tag {} is reserved and never written to RLOG",
-                            enc.to_u8()
-                        )));
+                    if enc != Enc::DictPage {
+                        if let Some(prev) = prev_block
+                            && block < prev
+                        {
+                            return Err(LogSegError::Corrupted(format!(
+                                "page_dir page blocks not ascending: {block} after {prev}"
+                            )));
+                        }
+                        run = if prev_block == Some(block) {
+                            run + 1
+                        } else {
+                            1
+                        };
+                        if run > MAX_PAGES_PER_BLOCK_PER_COLUMN {
+                            return Err(LogSegError::Corrupted(format!(
+                                "page_dir block {block} carries more than \
+                                 {MAX_PAGES_PER_BLOCK_PER_COLUMN} pages in one column"
+                            )));
+                        }
+                        prev_block = Some(block);
                     }
                     let comp = read_u8(bytes, &mut pos)?;
                     let len = get_uvarint(bytes, &mut pos)?;
@@ -438,6 +548,16 @@ impl PageDir {
                         uncomp_len,
                         crc32c,
                     });
+                }
+                if page_count > max_pages && !has_dict {
+                    return Err(LogSegError::Corrupted(format!(
+                        "page_dir page count {page_count} outside 1..={max_pages}"
+                    )));
+                }
+                if has_dict && !has_ids {
+                    return Err(LogSegError::Corrupted(format!(
+                        "page_dir column {column_id} dictionary page has no id page"
+                    )));
                 }
                 offset.checked_add(chunk_len).ok_or_else(|| {
                     LogSegError::Corrupted("page_dir chunk extent overflow".into())
@@ -802,17 +922,38 @@ mod tests {
         }
     }
 
+    /// The first page of the sample sits at block 0, so a dictionary page
+    /// there is out of place and an id page there has no dictionary page.
     #[test]
-    fn rejects_reserved_enc_tags() {
+    fn rejects_misplaced_dictionary_tags() {
         for tag in 12u8..=13 {
             let mut bytes = sample().encode();
             assert_eq!(bytes[8], Enc::Plain.to_u8());
             bytes[8] = tag;
-            let err = PageDir::decode(&bytes).expect_err("reserved tag must be refused");
+            let err = PageDir::decode(&bytes).expect_err("misplaced tag must be refused");
             assert!(
-                matches!(&err, LogSegError::Corrupted(msg) if msg.contains("reserved")),
+                matches!(&err, LogSegError::Corrupted(msg) if msg.contains("dictionary")),
                 "tag {tag}: {err:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_leading_dictionary_page_round_trips() {
+        let mut dir = sample();
+        let chunk = &mut dir.groups[0].chunks[1];
+        chunk.pages[1].enc = Enc::DictIds;
+        chunk.pages[2].enc = Enc::DictIds;
+        let mut dict = page(2, 5);
+        dict.enc = Enc::DictPage;
+        chunk.pages.insert(0, dict);
+        let decoded = PageDir::decode(&dir.encode()).expect("decodes");
+        assert_eq!(decoded, dir);
+        let chunk = &decoded.groups[0].chunks[1];
+        assert_eq!(chunk.dict_page(), Some(&dict));
+        for block in 0..2 {
+            let pages = decoded.block_pages(block).expect("block in range");
+            assert!(pages.iter().all(|p| p.desc.enc != Enc::DictPage));
         }
     }
 

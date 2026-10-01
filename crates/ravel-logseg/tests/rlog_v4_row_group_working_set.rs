@@ -187,12 +187,15 @@ fn row_group_buffer_is_one_row_group_and_does_not_grow_with_the_object() {
          holding back most of the object"
     );
 
-    // The version bump did not change how many bytes the pages are, only where
-    // they sit: the section is the same size whatever the group size.
+    // A block's own pages are the same whatever the group size; the group only
+    // adds the choice of a row-group string dictionary, taken when it stores
+    // strictly smaller (ADR-2135 decision 6). So grouping never grows the
+    // section, and on this corpus's repeating strings it shrinks it.
     let (_, ungrouped_blocks_len, ungrouped_groups) = measure(4 * GROUP, 1);
-    assert_eq!(
-        ungrouped_blocks_len, large_blocks_len,
-        "the row group size changes where pages sit, never how many bytes they are"
+    assert!(
+        large_blocks_len < ungrouped_blocks_len,
+        "row groups stored {large_blocks_len} B against {ungrouped_blocks_len} B \
+         ungrouped: a row-group dictionary is taken only when it is smaller"
     );
     assert_eq!(ungrouped_groups, 4 * GROUP);
     assert_eq!(

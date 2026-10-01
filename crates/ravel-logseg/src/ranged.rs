@@ -28,7 +28,8 @@ use crate::field_dir::FieldDir;
 use crate::footer::{LogFooter, kind};
 use crate::page_dir::PageDir;
 use crate::reader::{
-    MAX_BLOCKS, MAX_FIELDS, MAX_STREAMS, column_plans, decode_v4_block, i64_at, rebuild_record,
+    MAX_BLOCKS, MAX_FIELDS, MAX_STREAMS, column_plans, decode_v4_block, i64_at,
+    located_block_pages, rebuild_record,
 };
 use crate::record::{COL_STREAM_REF, COL_TS, LogRecord};
 use crate::skip_index::SkipIndex;
@@ -179,7 +180,7 @@ impl RlogRangeReader {
             let raw = page_dir_raw.ok_or_else(|| {
                 LogSegError::Corrupted("object opened without its PAGE_DIR section".into())
             })?;
-            PageDir::decode_validated(raw, blocks.len, skip.l0.len())?
+            PageDir::decode_validated(raw, blocks.len, skip.l0.len(), &field_dir)?
         };
         Ok(RlogRangeReader {
             stream_dir,
@@ -238,22 +239,14 @@ impl RlogRangeReader {
             .ok_or_else(|| LogSegError::Corrupted("skip block index out of range".into()))?;
         let index =
             u32::try_from(block).map_err(|_| LogSegError::Corrupted("block index range".into()))?;
-        let mut pages = self
-            .page_dir
-            .block_pages(index)
-            .ok_or_else(|| LogSegError::Corrupted("block not in page_dir".into()))?;
-        for p in &mut pages {
-            p.offset = self
-                .blocks_offset
-                .checked_add(p.offset)
-                .ok_or_else(|| LogSegError::Corrupted("page offset overflow".into()))?;
-        }
+        let (pages, dict_pages) = located_block_pages(&self.page_dir, self.blocks_offset, index)?;
         decode_v4_block(
             bytes,
             base,
             entry.record_count as usize,
             entry.block_crc32c,
             &pages,
+            &dict_pages,
             plans,
             None,
         )

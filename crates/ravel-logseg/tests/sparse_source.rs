@@ -74,7 +74,8 @@ fn arb_record() -> impl Strategy<Value = LogRecord> {
         })
 }
 
-/// Each block's absolute page extents, in PAGE_DIR order.
+/// Each block's absolute page extents, in PAGE_DIR order, then the row-group
+/// dictionary pages its string columns decode through.
 fn block_pages(object: &[u8]) -> Vec<Vec<(u64, u64)>> {
     let footer = open(object).expect("footer");
     let blocks = footer.section(kind::BLOCKS).expect("BLOCKS");
@@ -88,9 +89,11 @@ fn block_pages(object: &[u8]) -> Vec<Vec<(u64, u64)>> {
     let count: u32 = dir.groups.iter().map(|g| g.block_count).sum();
     (0..count)
         .map(|b| {
-            dir.block_pages(b)
-                .expect("block pages")
+            let pages = dir.block_pages(b).expect("block pages");
+            let dicts = dir.block_dict_pages(b).expect("block dictionary pages");
+            pages
                 .iter()
+                .chain(&dicts)
                 .map(|p| (blocks.offset + p.offset, p.desc.len))
                 .collect()
         })

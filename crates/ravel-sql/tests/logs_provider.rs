@@ -864,10 +864,14 @@ async fn column_projection_decodes_only_the_referenced_attribute_pages() {
     );
     // Everything else in the block: the remaining 118 dynamic columns plus the
     // four unprojected always-present fixed columns (observed_ts, severity_num,
-    // flags, severity_text).
+    // flags, severity_text). Each constant string among them (the 118 `v{i}`
+    // attributes and severity_text) is stored on a one-entry row-group
+    // dictionary, whose page every block reading the chunk walks past too
+    // (ADR-2135 decision 6); `r{ts}`, `s{ts}` and the body are distinct per row
+    // and keep per-block pages.
     assert_eq!(
         skipped,
-        (WIDE_ATTRS - 2 + 4) * blocks,
+        (WIDE_ATTRS - 2 + 4 + (WIDE_ATTRS - 2 + 1)) * blocks,
         "every unreferenced column's pages must be skipped, got {skipped} over \
          {blocks} blocks"
     );
@@ -939,10 +943,11 @@ async fn referencing_attrs_decodes_every_dynamic_column() {
     let blocks = scan_metric(&plan, "blocks_scanned");
     let skipped = scan_metric(&plan, "pages_skipped");
     // Only the five unprojected fixed columns (observed_ts, severity_num,
-    // flags, severity_text, body) are skipped; every dynamic column is decoded.
+    // flags, severity_text, body) are skipped, plus severity_text's row-group
+    // dictionary page (ADR-2135 decision 6); every dynamic column is decoded.
     assert_eq!(
         skipped,
-        5 * blocks,
+        6 * blocks,
         "referencing attrs must skip only the unprojected fixed columns"
     );
 }

@@ -9,7 +9,9 @@
 //! them against `ravel-codec`'s own output. Decoding tags 1 to 9 stays in
 //! `ravel-codec`.
 //!
-//! Tag 10 (GCD i64) and tag 11 (column reference) exist only in RLOG. Every
+//! Tag 10 (GCD i64), tag 11 (column reference), and tags 12 and 13 (the row
+//! group string dictionary page and its per-block id pages) exist only in
+//! RLOG; RSEG and RSPAN keep refusing 12 and 13. Every
 //! decoder here treats its input as untrusted and returns
 //! [`LogSegError::Corrupted`] on any violation.
 
@@ -329,12 +331,18 @@ fn ordered_string_candidates(
     }
 }
 
-/// Both string candidates for one page, dictionary and plain. The one
-/// `ravel-codec`'s `encode_strings` would pick comes first, so it wins a tie.
-pub fn string_candidates(values: &[&[u8]]) -> Vec<(Enc, Vec<u8>)> {
-    if values.is_empty() {
-        return vec![(Enc::Plain, Vec::new())];
-    }
+/// One string page's values in dictionary shape: the sorted distinct values
+/// and, per present value in row order, its index into them. Both writer
+/// paths reduce a string column to this before encoding, so the candidates
+/// and the row group dictionary see the same values however they arrived.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StrShape<'a> {
+    pub sorted: Vec<&'a [u8]>,
+    pub ids: Vec<u64>,
+}
+
+/// The [`StrShape`] of one page's present values.
+pub fn string_shape<'a>(values: &[&'a [u8]]) -> StrShape<'a> {
     let mut sorted: Vec<&[u8]> = values.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
@@ -342,19 +350,14 @@ pub fn string_candidates(values: &[&[u8]]) -> Vec<(Enc, Vec<u8>)> {
         .iter()
         .map(|v| sorted.partition_point(|e| e < v) as u64)
         .collect();
-    let dict = enc_dict_strings(&sorted, &ids);
-    let plain = enc_plain_strings(values.iter().copied());
-    ordered_string_candidates(sorted.len(), values.len(), dict, plain)
+    StrShape { sorted, ids }
 }
 
-/// [`string_candidates`] for a column already in dictionary shape:
-/// `present_ids[i]` indexes `dict` for present row `i`, and `dict` may hold
-/// entries no id references. Byte-identical to `string_candidates` over the
-/// per-row values, but the sort runs over the referenced distinct values only.
-pub fn string_dict_candidates(dict: &[&[u8]], present_ids: &[u32]) -> Vec<(Enc, Vec<u8>)> {
-    if present_ids.is_empty() {
-        return vec![(Enc::Plain, Vec::new())];
-    }
+/// The [`StrShape`] of a column already in dictionary shape: `present_ids[i]`
+/// indexes `dict` for present row `i`, and `dict` may hold entries no id
+/// references. Equal to [`string_shape`] over the per-row values, but the sort
+/// runs over the referenced distinct values only.
+pub fn string_dict_shape<'a>(dict: &[&'a [u8]], present_ids: &[u32]) -> StrShape<'a> {
     let mut referenced = vec![false; dict.len()];
     let mut distinct: Vec<&[u8]> = Vec::new();
     for &id in present_ids {
@@ -376,9 +379,161 @@ pub fn string_dict_candidates(dict: &[&[u8]], present_ids: &[u32]) -> Vec<(Enc, 
         .iter()
         .map(|&id| u64::from(pos_of[id as usize]))
         .collect();
-    let dict_bytes = enc_dict_strings(&distinct, &ids);
-    let plain = enc_plain_strings(present_ids.iter().map(|&id| dict[id as usize]));
-    ordered_string_candidates(distinct.len(), present_ids.len(), dict_bytes, plain)
+    StrShape {
+        sorted: distinct,
+        ids,
+    }
+}
+
+/// Both string candidates for a page of `shape`, dictionary and plain. The
+/// one `ravel-codec`'s `encode_strings` would pick comes first, so it wins a
+/// tie.
+pub fn shape_candidates(shape: &StrShape<'_>) -> Vec<(Enc, Vec<u8>)> {
+    if shape.ids.is_empty() {
+        return vec![(Enc::Plain, Vec::new())];
+    }
+    let dict = enc_dict_strings(&shape.sorted, &shape.ids);
+    let plain = enc_plain_strings(shape.ids.iter().map(|&i| shape.sorted[i as usize]));
+    ordered_string_candidates(shape.sorted.len(), shape.ids.len(), dict, plain)
+}
+
+/// Both string candidates for one page, dictionary and plain. The one
+/// `ravel-codec`'s `encode_strings` would pick comes first, so it wins a tie.
+pub fn string_candidates(values: &[&[u8]]) -> Vec<(Enc, Vec<u8>)> {
+    shape_candidates(&string_shape(values))
+}
+
+/// [`string_candidates`] for a column already in dictionary shape, as
+/// [`string_dict_shape`] reads it. Byte-identical to `string_candidates` over
+/// the per-row values.
+pub fn string_dict_candidates(dict: &[&[u8]], present_ids: &[u32]) -> Vec<(Enc, Vec<u8>)> {
+    shape_candidates(&string_dict_shape(dict, present_ids))
+}
+
+// ---------------------------------------------------------------------------
+// Row group string dictionaries (tags 12 and 13, ADR-2135 decision 6)
+// ---------------------------------------------------------------------------
+
+/// Most entries a tag 12 page may carry: the same cap `ravel-codec` puts on a
+/// tag 7 page's dictionary section.
+pub const MAX_DICT_ENTRIES: u64 = 1 << 16;
+
+/// A tag 12 page: `dict_count` varint, then each entry as `len` varint and its
+/// bytes, strictly ascending. The layout of a tag 7 page's dictionary section.
+pub fn encode_dict_page(sorted: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_uvarint(&mut out, sorted.len() as u64);
+    for entry in sorted {
+        put_uvarint(&mut out, entry.len() as u64);
+        out.extend_from_slice(entry);
+    }
+    out
+}
+
+/// Decodes a tag 12 page.
+///
+/// An empty dictionary, a `dict_count` above [`MAX_DICT_ENTRIES`] or above
+/// what the page's bytes could hold, entries not strictly ascending, and
+/// trailing or missing bytes are all `Corrupted`.
+pub fn decode_dict_page(bytes: &[u8]) -> Result<Vec<Vec<u8>>, LogSegError> {
+    let mut pos = 0usize;
+    let count = get_uvarint(bytes, &mut pos)?;
+    // Every entry costs at least its length varint, so a count past the page's
+    // bytes cannot be honest; the fixed cap bounds the allocation either way.
+    let cap = MAX_DICT_ENTRIES.min(bytes.len() as u64 + 1);
+    if count == 0 || count > cap {
+        return Err(LogSegError::Corrupted(format!(
+            "dictionary page count {count} outside 1..={cap}"
+        )));
+    }
+    let mut out: Vec<Vec<u8>> = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let len = get_uvarint(bytes, &mut pos)?;
+        let end = usize::try_from(len)
+            .ok()
+            .and_then(|l| pos.checked_add(l))
+            .filter(|e| *e <= bytes.len())
+            .ok_or_else(|| LogSegError::Corrupted("dictionary page entry truncated".into()))?;
+        let entry = &bytes[pos..end];
+        pos = end;
+        if let Some(prev) = out.last()
+            && prev.as_slice() >= entry
+        {
+            return Err(LogSegError::Corrupted(
+                "dictionary page entries not strictly ascending".into(),
+            ));
+        }
+        out.push(entry.to_vec());
+    }
+    if pos != bytes.len() {
+        return Err(LogSegError::Corrupted(
+            "dictionary page trailing bytes".into(),
+        ));
+    }
+    Ok(out)
+}
+
+/// The id width of a tag 13 page over a dictionary of `dict_len` entries: the
+/// width a tag 7 page over the same dictionary would use.
+fn dict_id_width(dict_len: usize) -> u32 {
+    width_for(dict_len.saturating_sub(1) as u64)
+}
+
+/// A tag 13 page: one id per present value packed LSB-first at
+/// `width_for(dict_len - 1)` bits. The page stores no width; the reader
+/// derives it from the chunk's tag 12 page, so a one-entry dictionary's id
+/// pages are empty.
+pub fn encode_dict_ids(ids: &[u64], dict_len: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    pack_bits(&mut out, ids, dict_id_width(dict_len));
+    out
+}
+
+/// Decodes `count` ids from a tag 13 page over a dictionary of `dict_len`
+/// entries.
+///
+/// An id at or past `dict_len`, and a page length other than `count` ids at
+/// the derived width need, are `Corrupted`.
+pub fn decode_dict_ids(
+    body: &[u8],
+    count: usize,
+    dict_len: usize,
+) -> Result<Vec<u32>, LogSegError> {
+    let w = dict_id_width(dict_len);
+    let need = (count as u64)
+        .checked_mul(u64::from(w))
+        .map(|bits| bits.div_ceil(8))
+        .ok_or_else(|| LogSegError::Corrupted("dictionary id page length overflow".into()))?;
+    if body.len() as u64 != need {
+        return Err(LogSegError::Corrupted(format!(
+            "dictionary id page holds {} bytes, {count} ids at width {w} need {need}",
+            body.len()
+        )));
+    }
+    let mask = if w == 0 { 0u64 } else { (1u64 << w) - 1 };
+    let mut out = Vec::with_capacity(count);
+    let mut acc: u64 = 0;
+    let mut nbits: u32 = 0;
+    let mut bytes_in = body.iter();
+    for _ in 0..count {
+        while nbits < w {
+            let b = bytes_in
+                .next()
+                .ok_or_else(|| LogSegError::Corrupted("dictionary id page truncated".into()))?;
+            acc |= u64::from(*b) << nbits;
+            nbits += 8;
+        }
+        let id = acc & mask;
+        acc >>= w;
+        nbits -= w;
+        if id >= dict_len as u64 {
+            return Err(LogSegError::Corrupted(format!(
+                "dictionary id {id} past a dictionary of {dict_len} entries"
+            )));
+        }
+        out.push(id as u32);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

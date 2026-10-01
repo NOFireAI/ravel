@@ -568,9 +568,19 @@ async fn fetch_accounted_charges_the_decode_decompression() {
     let mut page_total = 0u64;
     for group in &page_dir.groups {
         for chunk in &group.chunks {
+            // A row-group dictionary page is decoded once per block that reads
+            // through it: every block of its chunk.
+            let mut blocks: Vec<u32> = chunk.pages.iter().map(|p| p.block).collect();
+            blocks.dedup();
+            let readers = blocks.len() as u64 - u64::from(chunk.dict_page().is_some());
             for page in &chunk.pages {
                 if page.comp == ravel_logseg::footer::COMP_ZSTD {
-                    page_total += page.uncomp_len;
+                    let times = if page.enc == ravel_logseg::encoding::Enc::DictPage {
+                        readers
+                    } else {
+                        1
+                    };
+                    page_total += page.uncomp_len * times;
                 }
             }
         }

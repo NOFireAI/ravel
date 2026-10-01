@@ -15,16 +15,19 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use ravel_types::logstream::{AttrValue, LogStreamId, canonical_attr_bytes};
 
 use crate::block::{
-    BlockStrDict, BlockWriteOut, ColumnPlan, ColumnarBlockInput, write_block, write_block_columnar,
+    BlockStrDict, BlockStrValues, BlockWriteOut, ColumnPlan, ColumnarBlockInput, write_block,
+    write_block_columnar,
 };
 use crate::bloom::BloomBuilder;
 use crate::columnar_batch::ColumnarLogBatch;
+use crate::encoding::Enc;
 use crate::error::LogSegError;
 use crate::field_dir::{FieldDir, FieldEntry};
 use crate::footer::{
     COMP_NONE, COMP_ZSTD, LogFooter, MAX_SORT_KEY_COLUMNS, SectionDesc, SortDescriptor,
     SortKeyType, kind, write_footer_and_trailer,
 };
+use crate::page::{SealedPage, seal_page};
 use crate::page_dir::{ChunkEntry, GroupEntry, PageDir, PageEntry};
 use crate::postings::{DEFAULT_STRIDE, FieldTerms, encode_postings_section, term_key};
 use crate::reader::stream_attr_pairs;
@@ -33,6 +36,7 @@ use crate::record::{
     canonical_value_bytes, resolve_value,
 };
 use crate::rlog_bloom::encode_rlog_bloom_section;
+use crate::rlog_codec::{MAX_DICT_ENTRIES, encode_dict_ids, encode_dict_page};
 use crate::skip_index::{Level0Entry, SkipIndex};
 use crate::stream_dir::{StreamDir, StreamEntry};
 use crate::tokenizer::tokens;
@@ -305,6 +309,8 @@ impl RlogWriter {
     fn layout(&self) -> Layout {
         Layout {
             group_target_blocks: self.cfg.group_target_blocks,
+            zstd_level: self.cfg.zstd_level,
+            dict_budget: self.cfg.block_max_bytes,
         }
     }
 
@@ -2880,6 +2886,46 @@ fn clustered_permutation(
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Layout {
     group_target_blocks: usize,
+    /// The page envelope's zstd level, for the row-group dictionary pages.
+    zstd_level: i32,
+    /// The most distinct string bytes, summed over every string column, the
+    /// row-group dictionary candidates may hold at once.
+    dict_budget: usize,
+}
+
+impl Layout {
+    /// `group_target_blocks` with every other field at its [`RlogConfig`]
+    /// default.
+    fn with_group(group_target_blocks: usize) -> Self {
+        let cfg = RlogConfig::default();
+        Layout {
+            group_target_blocks,
+            zstd_level: cfg.zstd_level,
+            dict_budget: cfg.block_max_bytes,
+        }
+    }
+}
+
+/// One string column's values across the row group so far, interned for the
+/// row-group dictionary decision (ADR-2135 decision 6).
+#[derive(Default)]
+struct GroupStrColumn {
+    /// Each distinct value and its first-seen group id.
+    interner: HashMap<Vec<u8>, u32>,
+    /// Per block holding a value page for the column: its index in the group
+    /// and, per present value in row order, the value's group id.
+    blocks: Vec<(usize, Vec<u32>)>,
+    /// Present values across the group.
+    present: u64,
+    /// Bytes of the distinct values held in `interner`.
+    bytes: usize,
+}
+
+/// A string column chunk rewritten onto one row-group dictionary: the tag 12
+/// page and, per block of the group, the tag 13 page replacing its value page.
+struct GroupDict {
+    dict: SealedPage,
+    ids: Vec<Option<SealedPage>>,
 }
 
 /// Places encoded blocks into the BLOCKS section and builds the PAGE_DIR that
@@ -2898,6 +2944,14 @@ struct Layout {
 /// page span -- from its first page's offset to the end of its last -- which is
 /// a superset range containing every one of its pages, not an exact extent.
 /// Nothing locates a page through it; PAGE_DIR does that.
+///
+/// A string column chunk may instead store one row-group dictionary page (tag
+/// 12) ahead of one id page (tag 13) per block (ADR-2135 decision 6). Deciding
+/// that adds, per string column of the group, its distinct values and a `u32`
+/// id per present value. The distinct bytes across all string columns are
+/// capped at `dict_budget` and a column at [`MAX_DICT_ENTRIES`] entries; a
+/// column crossing either is dropped from the decision and keeps its per-block
+/// pages.
 pub struct BlocksBuilder {
     layout: Layout,
     /// The BLOCKS section bytes built so far. Offsets recorded in PAGE_DIR and
@@ -2908,6 +2962,12 @@ pub struct BlocksBuilder {
     pending: Vec<BlockWriteOut>,
     /// Level-0 entries in block order, complete once the block's group flushed.
     l0: Vec<Level0Entry>,
+    /// The current group's string columns, `None` once a column left the
+    /// dictionary decision. `BTreeMap` so the decision visits columns in a
+    /// fixed order.
+    str_group: BTreeMap<u32, Option<GroupStrColumn>>,
+    /// Sum of `GroupStrColumn::bytes` over the columns still in `str_group`.
+    str_bytes: usize,
 }
 
 impl BlocksBuilder {
@@ -2920,9 +2980,7 @@ impl BlocksBuilder {
     /// re-deriving the placement rule outside this module is exactly how the
     /// three drift apart.
     pub fn version_4(group_target_blocks: usize) -> Self {
-        BlocksBuilder::new(Layout {
-            group_target_blocks,
-        })
+        BlocksBuilder::new(Layout::with_group(group_target_blocks))
     }
 
     fn new(layout: Layout) -> Self {
@@ -2932,16 +2990,118 @@ impl BlocksBuilder {
             dir: PageDir::default(),
             pending: Vec::new(),
             l0: Vec::new(),
+            str_group: BTreeMap::new(),
+            str_bytes: 0,
         }
     }
 
     /// Adds one encoded block. The block is buffered and placed when its row
     /// group fills.
-    pub fn push(&mut self, out: BlockWriteOut) {
+    pub fn push(&mut self, mut out: BlockWriteOut) {
+        let block = self.pending.len();
+        for values in std::mem::take(&mut out.str_values) {
+            self.intern(block, values);
+        }
         self.pending.push(out);
         if self.pending.len() >= self.layout.group_target_blocks.max(1) {
             self.flush_group();
         }
+    }
+
+    /// Folds one block's values for a string column into the group's
+    /// dictionary candidate for it.
+    fn intern(&mut self, block: usize, values: BlockStrValues) {
+        let slot = self
+            .str_group
+            .entry(values.column_id)
+            .or_insert_with(|| Some(GroupStrColumn::default()));
+        let Some(col) = slot else {
+            return;
+        };
+        let mut local = Vec::with_capacity(values.sorted.len());
+        for value in values.sorted {
+            let next = col.interner.len() as u32;
+            let len = value.len();
+            let gid = *col.interner.entry(value).or_insert_with(|| {
+                col.bytes += len;
+                self.str_bytes += len;
+                next
+            });
+            local.push(gid);
+        }
+        col.present += values.ids.len() as u64;
+        let gids = values
+            .ids
+            .iter()
+            .map(|&i| local.get(i as usize).copied().unwrap_or(0))
+            .collect();
+        col.blocks.push((block, gids));
+        if col.interner.len() as u64 > MAX_DICT_ENTRIES || self.str_bytes > self.layout.dict_budget
+        {
+            self.str_bytes -= col.bytes;
+            *slot = None;
+        }
+    }
+
+    /// The current group's string chunks that store strictly smaller on one
+    /// row-group dictionary than on their per-block value pages. A chunk
+    /// qualifies only when its distinct values are at most half its present
+    /// values. Resets the group's string state.
+    fn group_dicts(&mut self, pending: &[BlockWriteOut]) -> BTreeMap<u32, GroupDict> {
+        let level = self.layout.zstd_level;
+        let mut out = BTreeMap::new();
+        self.str_bytes = 0;
+        for (column_id, col) in std::mem::take(&mut self.str_group) {
+            let Some(col) = col else {
+                continue;
+            };
+            let distinct = col.interner.len() as u64;
+            if distinct == 0 || 2 * distinct > col.present {
+                continue;
+            }
+            let mut entries: Vec<(Vec<u8>, u32)> = col.interner.into_iter().collect();
+            entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            let mut rank = vec![0u64; entries.len()];
+            for (r, (_, gid)) in entries.iter().enumerate() {
+                if let Some(slot) = rank.get_mut(*gid as usize) {
+                    *slot = r as u64;
+                }
+            }
+            let sorted: Vec<&[u8]> = entries.iter().map(|(v, _)| v.as_slice()).collect();
+            let dict = seal_page(Enc::DictPage, encode_dict_page(&sorted), level);
+            let mut ids: Vec<Option<SealedPage>> = vec![None; pending.len()];
+            let mut new_len = dict.stored.len() as u64;
+            let mut old_len = 0u64;
+            for (block, gids) in &col.blocks {
+                let remapped: Vec<u64> = gids
+                    .iter()
+                    .map(|&g| rank.get(g as usize).copied().unwrap_or(0))
+                    .collect();
+                let page = seal_page(
+                    Enc::DictIds,
+                    encode_dict_ids(&remapped, entries.len()),
+                    level,
+                );
+                new_len += page.stored.len() as u64;
+                old_len += pending
+                    .get(*block)
+                    .map(|b| {
+                        b.descs
+                            .iter()
+                            .filter(|d| d.column_id == column_id && d.enc != Enc::Bitmap)
+                            .map(|d| d.len)
+                            .sum::<u64>()
+                    })
+                    .unwrap_or(0);
+                if let Some(slot) = ids.get_mut(*block) {
+                    *slot = Some(page);
+                }
+            }
+            if new_len < old_len {
+                out.insert(column_id, GroupDict { dict, ids });
+            }
+        }
+        out
     }
 
     /// Places the buffered row group column-major and records its PAGE_DIR
@@ -2950,6 +3110,7 @@ impl BlocksBuilder {
     /// for the level.
     fn flush_group(&mut self) {
         let pending = std::mem::take(&mut self.pending);
+        let dicts = self.group_dicts(&pending);
         if pending.is_empty() {
             return;
         }
@@ -2998,24 +3159,50 @@ impl BlocksBuilder {
         let mut chunks = Vec::with_capacity(by_column.len());
         for (column_id, entries) in by_column {
             let offset = self.bytes.len() as u64;
-            let mut pages = Vec::with_capacity(entries.len());
+            let group_dict = dicts.get(&column_id);
+            let mut pages = Vec::with_capacity(entries.len() + 1);
+            // The dictionary page leads its chunk under the block index one
+            // past the group's last block. It belongs to no block, so neither
+            // a block's span nor its crc covers it; its own PAGE_DIR crc does.
+            if let Some(gd) = group_dict {
+                let stored = gd.dict.stored.as_slice();
+                self.bytes.extend_from_slice(stored);
+                pages.push(PageEntry {
+                    block: block_count as u32,
+                    enc: gd.dict.enc,
+                    comp: gd.dict.comp,
+                    len: stored.len() as u64,
+                    uncomp_len: gd.dict.uncomp_len,
+                    crc32c: crc32c::crc32c(stored),
+                });
+            }
             for (bi, di) in entries {
                 let out = &pending[bi];
                 let desc = out.descs[di];
+                let replacement = match group_dict {
+                    Some(gd) if desc.enc != Enc::Bitmap => gd.ids.get(bi).and_then(|p| p.as_ref()),
+                    _ => None,
+                };
+                let (stored, enc, comp, uncomp_len) = match replacement {
+                    Some(p) => (p.stored.as_slice(), p.enc, p.comp, p.uncomp_len),
+                    None => {
+                        let from = payload_offsets[bi][di] as usize;
+                        let to = from + desc.len as usize;
+                        (&out.payload[from..to], desc.enc, desc.comp, desc.uncomp_len)
+                    }
+                };
+                let len = stored.len() as u64;
                 let at = self.bytes.len() as u64;
-                let from = payload_offsets[bi][di] as usize;
-                let to = from + desc.len as usize;
-                let stored = &out.payload[from..to];
                 self.bytes.extend_from_slice(stored);
                 span_start[bi] = span_start[bi].min(at);
-                span_end[bi] = span_end[bi].max(at + desc.len);
+                span_end[bi] = span_end[bi].max(at + len);
                 block_crc[bi] = crc32c::crc32c_append(block_crc[bi], stored);
                 pages.push(PageEntry {
                     block: bi as u32,
-                    enc: desc.enc,
-                    comp: desc.comp,
-                    len: desc.len,
-                    uncomp_len: desc.uncomp_len,
+                    enc,
+                    comp,
+                    len,
+                    uncomp_len,
                     crc32c: crc32c::crc32c(stored),
                 });
             }
@@ -3145,15 +3332,14 @@ mod row_group_buffer {
             max_ts: 1,
             min_stream_ref: 0,
             max_stream_ref: 0,
+            str_values: Vec::new(),
         }
     }
 
     #[test]
     fn never_holds_more_than_group_target_blocks() {
         for group in [1usize, 3, 32] {
-            let mut builder = BlocksBuilder::new(Layout {
-                group_target_blocks: group,
-            });
+            let mut builder = BlocksBuilder::new(Layout::with_group(group));
             for _ in 0..(3 * group + 1) {
                 builder.push(block(64, &[0, 4, 9]));
                 assert!(
@@ -3180,9 +3366,7 @@ mod row_group_buffer {
     /// must not turn the bounded working set into an unbounded one.
     #[test]
     fn zero_group_target_does_not_buffer_the_object() {
-        let mut builder = BlocksBuilder::new(Layout {
-            group_target_blocks: 0,
-        });
+        let mut builder = BlocksBuilder::new(Layout::with_group(0));
         for _ in 0..5 {
             builder.push(block(64, &[0]));
             assert!(builder.pending.is_empty());

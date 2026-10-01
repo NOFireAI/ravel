@@ -466,9 +466,20 @@ fn two_column_projection_skips_the_other_103_columns_pages() {
         (BLOCKS * 2) as u64,
         "exactly the two selected columns' pages are decoded"
     );
+    // One string column chunk in each of the groups (4 + 4 + 1 blocks) stores a
+    // row-group dictionary page (ADR-2135 decision 6), and each block read
+    // that does not select the column skips it too: 4 + 4 + 1 skips.
+    for g in &dir.groups {
+        let dict_chunks = g.chunks.iter().filter(|c| c.dict_page().is_some()).count();
+        assert_eq!(dict_chunks, 1, "group at block {}", g.first_block);
+    }
+    let dict_pages: usize = (0..BLOCKS as u32)
+        .map(|b| dir.block_dict_pages(b).expect("block in page_dir").len())
+        .sum();
+    assert_eq!(dict_pages, 4 + 4 + 1, "one dictionary chunk per row group");
     assert_eq!(
         stats.pages_skipped,
-        (BLOCKS * 103) as u64,
+        (BLOCKS * 103 + dict_pages) as u64,
         "every other column's page is skipped"
     );
 
