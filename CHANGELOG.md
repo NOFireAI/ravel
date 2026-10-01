@@ -656,7 +656,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   GET (`CatalogError::Store` with a `StoreError::Corrupted` source, and on SQL
   the same source under `LoadColumnStatsError::Store`), which answered the
   retryable 503, answers 500 on both surfaces, as it already did on a data
-  fetch and a provisioning read (issue #2279). Other store errors,
+  fetch and a provisioning read (issue #2279). On SQL, a checksum mismatch on
+  a Parquet table's manifest, grants record or data file
+  (`ResolveError::Store`, `GrantsError::Store` or `ParquetReadError::Store`
+  with a `StoreError::Corrupted` source), which answered 503, answers 500 too
+  (issue #2291). Other store errors,
   timeouts, cancellation and admission refusals keep their classes.
 - **A catalog decode declared over its ceiling now evicts decoded-cache entries
   until the budget admits it or the caches are empty** (issue #2132). Such a
