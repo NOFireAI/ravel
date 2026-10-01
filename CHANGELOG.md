@@ -444,6 +444,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A delete against a missing S3 bucket fails instead of reporting success**
+  (issue #2265). The S3 adapter read every whole-request 404 as a missing key,
+  so a `DeleteObjects` answered `NoSuchBucket` returned the idempotent
+  missing-key success and the sweep counted the key as deleted. A 404 whose
+  body names `NoSuchBucket` is now `Permanent` on get, list, put, delete and
+  multipart, and on delete a whole-request 404 is `NotFound` only for
+  `NoSuchKey`. A HEAD 404 carries no body, so `head` and `pin_of` against a
+  missing bucket still read `NotFound`.
 - **A zero loop interval is refused at startup** (issue #2256).
   `--maintain-interval-secs 0`, `--fold-interval-secs 0`,
   `--alert-eval-interval-secs 0` and `--oidc-jwks-refresh-interval-secs 0`

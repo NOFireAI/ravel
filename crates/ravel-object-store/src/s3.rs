@@ -1432,9 +1432,16 @@ fn meta_to_pin(meta: object_store::ObjectMeta) -> Result<(ObjectMeta, Pin), Stor
 /// Error mapping shared by every non-`put` operation. `put` has its own
 /// mode-aware wrapper (see [`map_put_error`]) because conditional-write
 /// failures must be interpreted differently depending on `PutMode`.
+///
+/// A 404 is [`StoreError::NotFound`] unless its body names `NoSuchBucket`,
+/// which is [`StoreError::Permanent`] on every operation: a missing bucket is
+/// not a missing object. `object_store` reports the list 404 as `Generic`, so
+/// that branch checks for the code too. A HEAD 404 has no body and so no code,
+/// and stays `NotFound`.
 pub(crate) fn map_error_common(e: object_store::Error) -> StoreError {
     use object_store::Error as E;
     match e {
+        E::NotFound { path, source } if is_no_such_bucket(source.as_ref()) => no_such_bucket(&path),
         E::NotFound { .. } => StoreError::NotFound,
         E::AlreadyExists { .. } => StoreError::AlreadyExists,
         E::Precondition { .. } => StoreError::PreconditionFailed,
@@ -1455,9 +1462,32 @@ pub(crate) fn map_error_common(e: object_store::Error) -> StoreError {
         E::UnknownConfigurationKey { store, key } => {
             StoreError::Permanent(format!("unknown configuration key '{key}' for {store}"))
         }
+        E::Generic { store, source } if is_no_such_bucket(source.as_ref()) => no_such_bucket(store),
         E::Generic { store, source } => classify_generic(store, source.as_ref()),
         other => StoreError::Permanent(other.to_string()),
     }
+}
+
+/// The `<Error><Code>` of the S3 error body an `object_store` error carries.
+///
+/// `object_store` keeps a failed response's body only inside its crate-private
+/// `RetryError`, whose `Display` ends with the body, so the text is the one
+/// place the code survives. `None` when the response had no XML error body.
+fn s3_error_code(source: &(dyn std::error::Error + Send + Sync + 'static)) -> Option<String> {
+    let text = source.to_string();
+    let start = text.find("<Error>")?;
+    bucket_config::parse_error_code(&text.as_bytes()[start..])
+}
+
+fn is_no_such_bucket(source: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    s3_error_code(source).as_deref() == Some("NoSuchBucket")
+}
+
+/// The body is left out: an S3 error body can echo the request it refuses.
+fn no_such_bucket(context: &str) -> StoreError {
+    StoreError::Permanent(format!(
+        "{context}: S3 bucket does not exist (NoSuchBucket)"
+    ))
 }
 
 /// `put`-specific mapping: conditional-write failures surface mode-aware
@@ -1510,7 +1540,22 @@ pub(crate) fn map_get_error(e: object_store::Error) -> StoreError {
 /// other code falls through to [`classify_generic`]. A response naming
 /// `SlowDown` or `InternalError` never gets here: `object_store` retries the
 /// whole request on either, and an exhausted retry is an ordinary `Generic`.
+///
+/// A whole-request 404 is different: `DeleteObjects` addresses the bucket, and
+/// S3 reports a missing key per key, so a request-level 404 is the bucket
+/// itself missing (`NoSuchBucket`). Only a `NoSuchKey` code reads as
+/// [`StoreError::NotFound`] there; any other code, or none, is
+/// [`StoreError::Permanent`], and so is a per-key `NoSuchBucket`.
 fn map_delete_error(e: object_store::Error) -> StoreError {
+    if let object_store::Error::NotFound { path, source } = &e {
+        return match s3_error_code(source.as_ref()).as_deref() {
+            Some("NoSuchKey") => StoreError::NotFound,
+            Some(code) => {
+                StoreError::Permanent(format!("{path}: DeleteObjects refused with 404 {code}"))
+            }
+            None => StoreError::Permanent(format!("{path}: DeleteObjects refused with 404")),
+        };
+    }
     if let object_store::Error::Generic { store, source } = &e
         && let Some(code) = delete_objects_key_code(source.as_ref())
     {
@@ -1524,6 +1569,7 @@ fn map_delete_error(e: object_store::Error) -> StoreError {
                 return StoreError::AccessDenied(format!("{store}: {source}"));
             }
             "NoSuchKey" => return StoreError::NotFound,
+            "NoSuchBucket" => return no_such_bucket(&format!("{store}: {source}")),
             "PreconditionFailed" => return StoreError::PreconditionFailed,
             "ServiceUnavailable" => {
                 return StoreError::Throttled {
@@ -3674,6 +3720,64 @@ mod tests {
         });
         assert!(matches!(precondition, StoreError::PreconditionFailed));
         assert!(!precondition.is_retryable());
+    }
+
+    /// A 404 is classified by the S3 code at the end of `object_store`'s
+    /// `RetryError` text: `NoSuchBucket` is `Permanent` on every path, a
+    /// whole-request `DeleteObjects` 404 is `NotFound` only for `NoSuchKey`, and
+    /// a bodiless 404 (a HEAD) is `NotFound` except on `DeleteObjects`.
+    #[test]
+    fn a_404_is_classified_by_its_s3_error_code() {
+        const NO_BUCKET: &str = "Error performing GET http://h/b/k in 1ms - Server returned \
+             non-2xx status code: 404 Not Found: <?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <Error><Code>NoSuchBucket</Code><Message>m</Message></Error>";
+        const NO_KEY: &str = "Error performing GET http://h/b/k in 1ms - Server returned \
+             non-2xx status code: 404 Not Found: \
+             <Error><Code>NoSuchKey</Code><Message>m</Message></Error>";
+        const BODILESS: &str = "Error performing HEAD http://h/b/k in 1ms - Server returned \
+             non-2xx status code: 404 Not Found: ";
+        let not_found = |text: &'static str| object_store::Error::NotFound {
+            path: "k".into(),
+            source: Box::new(TextError(text)),
+        };
+
+        assert!(matches!(
+            map_error_common(not_found(NO_BUCKET)),
+            StoreError::Permanent(_)
+        ));
+        assert!(matches!(
+            map_get_error(not_found(NO_BUCKET)),
+            StoreError::Permanent(_)
+        ));
+        assert!(matches!(
+            map_put_error(not_found(NO_BUCKET), &PutMode::CreateIfAbsent),
+            StoreError::Permanent(_)
+        ));
+        assert!(matches!(
+            map_error_common(generic(TextError(NO_BUCKET))),
+            StoreError::Permanent(_)
+        ));
+        assert!(matches!(
+            map_error_common(not_found(NO_KEY)),
+            StoreError::NotFound
+        ));
+        assert!(matches!(
+            map_error_common(not_found(BODILESS)),
+            StoreError::NotFound
+        ));
+
+        assert!(matches!(
+            map_delete_error(not_found(NO_BUCKET)),
+            StoreError::Permanent(_)
+        ));
+        assert!(matches!(
+            map_delete_error(not_found(NO_KEY)),
+            StoreError::NotFound
+        ));
+        assert!(matches!(
+            map_delete_error(not_found(BODILESS)),
+            StoreError::Permanent(_)
+        ));
     }
 
     /// `map_put_error` remaps a conditional-write precondition failure by mode,
