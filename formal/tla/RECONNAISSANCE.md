@@ -88,7 +88,7 @@ No Accepted-ADR-without-symbol in this area. Inverse: ADR-0873 Proposed but ship
 | Conditional-write algebra | object-store-contract.md; ADR-0010 s12 | `PutMode`, `StoreError`, `s3::map_put_error`, `MemoryStore::put` | assert_create_if_absent_atomicity, assert_cas_version_semantics | Implemented | P0 |
 | List pagination + duplicates | object-store-contract.md | `list`/`list_after`, `list_all` | assert_paginated_listing_completeness | Implemented; dups never produced | P1 |
 | Idempotent delete; last_modified advisory | contract | `delete`, `ObjectMeta` | assert_idempotent_delete | Implemented | P2 |
-| Multipart | contract | `MultipartUpload`, `PartSequence` | assert_multipart_*, completion_ordering | Implemented; no production caller | P2 |
+| Multipart | contract | `MultipartUpload`, `PartSequence`, `ClassedStore` scheduling | assert_multipart_*, completion_ordering, multipart_parts_carry_checksums_under_integrity, a_multipart_part_waits_for_a_permit_of_its_class | Implemented, including part-level checksum and scheduling; no production caller found in this checkout | P2 |
 | Pinned flush identity | ADR-0010 s1; catalog-and-mvcc | `PinnedFlush`, `ShardActor::flush_tenant`, `FlushCtx::run_flush` | retry_storm_* | Implemented | P0 |
 | Two-object commit | ADR-0002; ADR-0010 s7 | `put_data_object`, `publish_with_rng`, `data_key`, `commit_key_for_record` | publish tests; crash_matrix rows 1-2 | Implemented; ingest.md wrong | P0 |
 | Retry idempotency asymmetry | ADR-0002 | `put_data_object` vs `resolve_already_exists`/`SplitBrain` | put_data_object_is_idempotent_on_already_exists, republishing_with_different_content_hash_is_split_brain | Implemented | P0 |

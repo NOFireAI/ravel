@@ -444,6 +444,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A scheduled store's multipart upload could write parts past its class's
+  permit budget** (issue #2062). `ClassedStore::put_multipart` took one
+  permit for initiation and then handed back the inner upload unwrapped, so
+  every `put_part`, `complete` and `abort` call on it bypassed the scheduler
+  entirely: a multipart upload could keep writing parts after its class was
+  fully exhausted. Each of those calls now takes one permit of the owning
+  handle's class before reaching the inner upload, and each part is counted
+  as one `Put` with its byte count, same as a single-PUT write of that size.
+  `complete` and `abort` stay uncounted, matching initiation. Also proved
+  (not changed): with upload integrity on, the explicit `put_multipart` path
+  already sent a server-verified checksum on every part, not only the first,
+  and `CompleteMultipartUpload`'s body carries one too whenever the
+  endpoint's `UploadPart` response echoes it back. Both are now pinned by
+  tests against a fake S3 endpoint instead of resting on the module doc's
+  word alone.
 - **A delete against a missing S3 bucket fails instead of reporting success**
   (issue #2265). The S3 adapter read every whole-request 404 as a missing key,
   so a `DeleteObjects` answered `NoSuchBucket` returned the idempotent
