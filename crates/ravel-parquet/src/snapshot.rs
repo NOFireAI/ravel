@@ -219,10 +219,11 @@ async fn snapshot_with_limit(
 }
 
 /// An object the listing (or the HEAD) reported, before its footer is read.
+/// The listing's reported size is never trusted for the read: the first
+/// footer read is a suffix read that is correct whatever the real size is.
 struct Candidate {
     key: String,
     etag: String,
-    size: u64,
 }
 
 struct Listed {
@@ -306,7 +307,6 @@ async fn list_files(
             listed.candidates.push(Candidate {
                 key: object.key,
                 etag: object.etag.0,
-                size: object.size,
             });
             Ok(DrainStep::Continue)
         },
@@ -340,7 +340,6 @@ async fn head_file(
         candidates: vec![Candidate {
             key,
             etag: meta.etag.0,
-            size: meta.size,
         }],
         directory_markers: 0,
         other_suffixes: 0,
@@ -393,11 +392,10 @@ fn key_of(file: &ParquetFile) -> String {
     String::from_utf8_lossy(&file.key).into_owned()
 }
 
-/// `NotFound` means `FileMissing` here because every call site but two is a
-/// read that has not yet proved the object exists. The two exceptions -- the
-/// tail read retried after the listing misreported the size, and the second
-/// GET of a long footer -- have each already read this same object once and
-/// remap `FileMissing` to `FileChanged` at their own call site below.
+/// `NotFound` means `FileMissing` here because every call site but one is a
+/// read that has not yet proved the object exists. The one exception -- the
+/// second GET of a long footer -- has already read this same object once and
+/// remaps `FileMissing` to `FileChanged` at its own call site below.
 fn read_error(key: &str, source: StoreError) -> SnapshotError {
     let key = key.to_string();
     match source {
@@ -407,28 +405,52 @@ fn read_error(key: &str, source: StoreError) -> SnapshotError {
     }
 }
 
-/// One pinned GET of bytes `start..end` of `key`, under a `limiter` permit,
-/// charged to Probe. Reserves `end - start` bytes against `memory` before the
-/// GET is issued; a refusal is returned with no GET issued. The caller holds
-/// the returned [`Reservation`] until the footer it reads is decoded.
+/// The two range shapes `pinned_get` issues for a footer read. Each carries
+/// its own byte length to reserve, so a caller can never pass a length that
+/// disagrees with the range it describes.
+enum FooterRange {
+    Suffix(u64),
+    Range(u64, u64),
+}
+
+impl FooterRange {
+    fn len(&self) -> u64 {
+        match *self {
+            FooterRange::Suffix(n) => n,
+            FooterRange::Range(start, end) => end - start,
+        }
+    }
+
+    fn as_get_range(&self) -> GetRange {
+        match *self {
+            FooterRange::Suffix(n) => GetRange::Suffix(n),
+            FooterRange::Range(start, end) => GetRange::Range(start, end),
+        }
+    }
+}
+
+/// One pinned GET of `range` under a `limiter` permit, accounted to Probe.
+/// Reserves `range`'s byte length against `memory` before the GET is issued;
+/// a refusal is returned with no GET issued. The caller holds the returned
+/// [`Reservation`] until the footer it reads is decoded.
 async fn pinned_get(
     store: &dyn ObjectStoreBackend,
     limiter: &GetLimiter,
     memory: &Arc<MemoryBudget>,
     accounting: &PhaseAccounting,
     key: &str,
-    (start, end): (u64, u64),
+    range: FooterRange,
     pin: &Pin,
 ) -> Result<(PinnedRead, Reservation), SnapshotError> {
-    let requested = end - start;
-    let reservation = memory
-        .reserve(requested)
-        .map_err(|exhausted| SnapshotError::MemoryExhausted {
-            key: key.to_string(),
-            requested: exhausted.requested,
-            reserved: exhausted.reserved,
-            limit: exhausted.limit,
-        })?;
+    let reservation =
+        memory
+            .reserve(range.len())
+            .map_err(|exhausted| SnapshotError::MemoryExhausted {
+                key: key.to_string(),
+                requested: exhausted.requested,
+                reserved: exhausted.reserved,
+                limit: exhausted.limit,
+            })?;
     let _permit = limiter.acquire().await.map_err(|_| SnapshotError::Store {
         key: key.to_string(),
         source: StoreError::Transient("GetLimiter semaphore closed unexpectedly".into()),
@@ -436,20 +458,19 @@ async fn pinned_get(
     let probe = accounting.phase(QueryPhase::Probe);
     probe.record_s3_request(AccountedOp::Get);
     let read = store
-        .get_pinned(key, GetRange::Range(start, end), pin)
+        .get_pinned(key, range.as_get_range(), pin)
         .await
         .map_err(|source| read_error(key, source))?;
     probe.add_s3_bytes(AccountedOp::Get, read.outcome.data.len() as u64);
     Ok((read, reservation))
 }
 
-/// The last [`FOOTER_PREFETCH`] bytes of a `size`-byte object, or all of it.
-fn tail_range(size: u64) -> (u64, u64) {
-    (size.saturating_sub(FOOTER_PREFETCH), size)
-}
-
 /// Read and check one file's footer, and describe the file as the read's
-/// response reported it.
+/// response reported it. The first read is a suffix read of
+/// [`FOOTER_PREFETCH`] bytes, so the listing's reported size (which
+/// [`Candidate`] does not even carry) has no bearing on where it lands: a
+/// listing that under- or over-reports a file's size, in either direction,
+/// cannot misplace it.
 async fn read_file(
     store: &dyn ObjectStoreBackend,
     grant: &Grant,
@@ -463,58 +484,25 @@ async fn read_file(
         key: key.clone(),
         message,
     };
-    if candidate.size == 0 {
-        return Err(SnapshotError::EmptyFile { key: key.clone() });
-    }
     let listed_pin = Pin::etag(candidate.etag);
-    let (mut tail, mut _tail_reservation) = pinned_get(
+    let (tail, _tail_reservation) = pinned_get(
         store,
         limiter,
         memory,
         accounting,
         &key,
-        tail_range(candidate.size),
+        FooterRange::Suffix(FOOTER_PREFETCH),
         &listed_pin,
     )
     .await?;
     let size = tail.outcome.total_size;
-    if size != candidate.size {
-        // The listing misreported the size of the object its ETag names, so
-        // the first read did not end at the end of the file: read the tail
-        // the response's size places.
-        if size == 0 {
-            return Err(SnapshotError::EmptyFile { key: key.clone() });
-        }
-        (tail, _tail_reservation) = pinned_get(
-            store,
-            limiter,
-            memory,
-            accounting,
-            &key,
-            tail_range(size),
-            &listed_pin,
-        )
-        .await
-        .map_err(|err| match err {
-            // The first read already proved this object exists at this
-            // pin; a NotFound here means it changed since that read, not
-            // that it was never there.
-            SnapshotError::FileMissing { key } => SnapshotError::FileChanged { key },
-            other => other,
-        })?;
-        if tail.outcome.total_size != size {
-            return Err(SnapshotError::FileChanged { key: key.clone() });
-        }
+    if size == 0 {
+        return Err(SnapshotError::EmptyFile { key: key.clone() });
     }
     let recorded = tail.pin.clone();
-    let tail_start = tail_range(size).0;
     let data = tail.outcome.data;
     let fetched = data.len() as u64;
-    if fetched != size - tail_start {
-        return Err(corrupt(format!(
-            "read of bytes {tail_start}..{size} returned {fetched} bytes"
-        )));
-    }
+    let tail_start = size - fetched;
     if fetched < TRAILER_LEN {
         return Err(corrupt(format!(
             "the file is {size} bytes, shorter than the {TRAILER_LEN}-byte trailer"
@@ -545,7 +533,7 @@ async fn read_file(
             memory,
             accounting,
             &key,
-            (footer_start, tail_start),
+            FooterRange::Range(footer_start, tail_start),
             &pin,
         )
         .await
@@ -676,19 +664,17 @@ mod tests {
         /// one byte short, and a version of `listed-version`; strip the prefix
         /// from a pin's ETag before reading.
         misreport_listing: bool,
+        /// Replace every listed object's reported `size` with this value,
+        /// independent of `misreport_listing`, to prove the footer read
+        /// never trusts the listing's size: it only ever informs a
+        /// zero-size refusal or an out-of-range explicit GET if something
+        /// still reads it.
+        lie_listed_size: Option<u64>,
         repeat_page_boundary: bool,
-        /// Replace the reported `total_size` on the 1-based `get_pinned` call
-        /// numbered here, to synthesize a retry or a long-footer second read
-        /// that disagrees on size without racing a real overwrite.
-        lie_total_size_on_call: Option<(usize, u64)>,
         /// Replace the reported pin's version on the 1-based `get_pinned`
         /// call numbered here, to synthesize a long-footer second read that
         /// disagrees with the first without racing a real overwrite.
         lie_pin_version_on_call: Option<(usize, String)>,
-        /// Fail the 1-based `get_pinned` call numbered here with `NotFound`,
-        /// to synthesize a deletion racing a retry without touching the real
-        /// object (so a later assertion can still read it back).
-        not_found_on_call: Option<usize>,
         /// Serve `.csv` keys instead of `.parquet` ones from `synthetic`, so
         /// a synthetic listing can exercise the skip-and-count path instead
         /// of the candidate path.
@@ -768,19 +754,11 @@ mod tests {
                 gets.push((key.to_string(), range, pin.clone()));
                 gets.len()
             };
-            if self.not_found_on_call == Some(call) {
-                return Err(StoreError::NotFound);
-            }
             let mut sent_pin = pin.clone();
             if self.misreport_listing {
                 sent_pin.etag = sent_pin.etag.trim_start_matches("listed:").to_string();
             }
             let mut read = self.inner.get_pinned(key, range, &sent_pin).await?;
-            if let Some((n, size)) = self.lie_total_size_on_call
-                && n == call
-            {
-                read.outcome.total_size = size;
-            }
             if let Some((n, ref version)) = self.lie_pin_version_on_call
                 && n == call
             {
@@ -836,6 +814,11 @@ mod tests {
                     object.etag = Etag(format!("listed:{}", object.etag.0));
                     object.size = object.size.saturating_sub(1);
                     object.version = Version("listed-version".to_string());
+                }
+            }
+            if let Some(size) = self.lie_listed_size {
+                for object in &mut listed.objects {
+                    object.size = size;
                 }
             }
             Ok(listed)
@@ -919,9 +902,11 @@ mod tests {
         }
     }
 
-    /// Mutation that fails it: dropping the zero-size check reads the empty
-    /// object with a zero-length range, which the store refuses as a
-    /// `Store` error rather than `EmptyFile`.
+    /// A `Suffix(FOOTER_PREFETCH)` read of a zero-byte object succeeds with
+    /// zero bytes, so the zero-size check runs on the GET response's
+    /// `total_size`, not on a failed read. Mutation that fails it: dropping
+    /// that check falls through to the `fetched < TRAILER_LEN` branch and
+    /// refuses as `Corrupt` instead of `EmptyFile`.
     #[tokio::test]
     async fn a_zero_byte_file_refuses_naming_it() {
         let store = two_files().await;
@@ -1370,25 +1355,57 @@ mod tests {
             }]
         );
         assert_ne!(version, "listed-version");
-        let size = bytes.len() as u64;
         let listed_pin = Pin::etag(format!("listed:{}", meta.etag.0));
         assert_eq!(
             store.gets(),
-            [
-                (
-                    "data/a.parquet".to_string(),
-                    GetRange::Range(0, size - 1),
-                    listed_pin.clone()
-                ),
-                (
-                    "data/a.parquet".to_string(),
-                    GetRange::Range(0, size),
-                    listed_pin
-                ),
-            ],
-            "the misplaced first read is redone at the size the response reported, \
-             both reads pinned on the listed (misreported) ETag"
+            [(
+                "data/a.parquet".to_string(),
+                GetRange::Suffix(FOOTER_PREFETCH),
+                listed_pin
+            )],
+            "the one footer read is a suffix read pinned on the listed (misreported) ETag; \
+             its response, not the listing, supplies the recorded size"
         );
+    }
+
+    /// A listing that reports size 0 for a non-empty file snapshots it
+    /// correctly: the first read is a suffix read of the real object, not a
+    /// zero-length range computed from the listing. Mutation that fails it:
+    /// deriving the first read's range from `Candidate`'s (now-removed)
+    /// listed size instead of always reading the last [`FOOTER_PREFETCH`]
+    /// bytes.
+    #[tokio::test]
+    async fn a_listing_that_reports_zero_size_snapshots_the_file_correctly() {
+        let store = Scripted {
+            lie_listed_size: Some(0),
+            ..Scripted::default()
+        };
+        let bytes = parquet_bytes(&[1, 2, 3], &["x", "y", "z"]);
+        put(&store, "data/a.parquet", bytes.clone()).await;
+        let got = snapshot(&store, "s3://lake/data/").await.expect("snapshot");
+        assert_eq!(got.files.len(), 1);
+        assert_eq!(got.files[0].size, bytes.len() as u64);
+        assert_eq!(got.files[0].row_count, 3);
+    }
+
+    /// A listing that over-reports a file's size by more than
+    /// [`FOOTER_PREFETCH`] snapshots it correctly, never refusing with a
+    /// generic `Store` error: the first read is a suffix read of the real
+    /// object, independent of what the listing claimed. Mutation that fails
+    /// it: computing the first read's start from the listed size, which
+    /// would place it past the real object's end.
+    #[tokio::test]
+    async fn a_listing_that_overreports_size_snapshots_the_file_correctly() {
+        let bytes = parquet_bytes(&[1, 2, 3], &["x", "y", "z"]);
+        let store = Scripted {
+            lie_listed_size: Some(bytes.len() as u64 + FOOTER_PREFETCH + 1),
+            ..Scripted::default()
+        };
+        put(&store, "data/a.parquet", bytes.clone()).await;
+        let got = snapshot(&store, "s3://lake/data/").await.expect("snapshot");
+        assert_eq!(got.files.len(), 1);
+        assert_eq!(got.files[0].size, bytes.len() as u64);
+        assert_eq!(got.files[0].row_count, 3);
     }
 
     /// `width` Int64 columns of one row, which puts a footer over
@@ -1439,7 +1456,7 @@ mod tests {
             [
                 (
                     "data/wide.parquet".to_string(),
-                    GetRange::Range(tail_start, size),
+                    GetRange::Suffix(FOOTER_PREFETCH),
                     Pin::etag(meta.etag.0.clone())
                 ),
                 (
@@ -1505,47 +1522,6 @@ mod tests {
         }
     }
 
-    /// A retry (forced here by a misreported listed size) whose second read
-    /// again disagrees on `total_size` refuses instead of looping or reading
-    /// past the file. Mutation that fails it: dropping the second
-    /// `total_size` check and trusting the first mismatch was the only one.
-    #[tokio::test]
-    async fn a_size_that_disagrees_again_on_retry_refuses_as_changed() {
-        let bytes = parquet_bytes(&[1, 2, 3], &["x", "y", "z"]);
-        let lie = bytes.len() as u64 + 1;
-        let store = Scripted {
-            misreport_listing: true,
-            lie_total_size_on_call: Some((2, lie)),
-            ..Scripted::default()
-        };
-        put(&store, "data/a.parquet", bytes).await;
-        match snapshot(&store, "s3://lake/data/").await {
-            Err(SnapshotError::FileChanged { key }) => assert_eq!(key, "data/a.parquet"),
-            other => panic!("expected FileChanged, got {other:?}"),
-        }
-    }
-
-    /// The size-mismatch retry has already read this object once, at the
-    /// first (mismatched) tail read above; a `NotFound` on the retry means
-    /// the object changed since, not that it was never there. Mutation that
-    /// fails it: reporting `FileMissing` for this GET instead of remapping
-    /// it to `FileChanged` (confirmed against the code before this fix: the
-    /// same scenario reported `FileMissing`).
-    #[tokio::test]
-    async fn a_notfound_on_the_size_mismatch_retry_reports_the_file_changed() {
-        let bytes = parquet_bytes(&[1, 2, 3], &["x", "y", "z"]);
-        let store = Scripted {
-            misreport_listing: true,
-            not_found_on_call: Some(2),
-            ..Scripted::default()
-        };
-        put(&store, "data/a.parquet", bytes).await;
-        match snapshot(&store, "s3://lake/data/").await {
-            Err(SnapshotError::FileChanged { key }) => assert_eq!(key, "data/a.parquet"),
-            other => panic!("expected FileChanged, got {other:?}"),
-        }
-    }
-
     /// Mutation that fails it: reporting the expiry as any other error.
     #[tokio::test]
     async fn a_snapshot_past_its_deadline_refuses_with_the_deadline_error() {
@@ -1605,7 +1581,11 @@ mod tests {
             let size = bytes.len() as u64;
             assert_eq!(
                 store.gets(),
-                [(key.to_string(), GetRange::Range(0, size), Pin::etag(etag))]
+                [(
+                    key.to_string(),
+                    GetRange::Suffix(FOOTER_PREFETCH),
+                    Pin::etag(etag)
+                )]
             );
             assert_eq!(
                 (got.skipped_directory_markers, got.skipped_other_suffixes),
@@ -1666,7 +1646,7 @@ mod tests {
             put(store.inner(), key, bytes.clone()).await;
         }
         let limiter = GetLimiter::new(1).expect("permits");
-        let memory = Arc::new(MemoryBudget::new(bytes.len() as u64));
+        let memory = Arc::new(MemoryBudget::new(FOOTER_PREFETCH));
         let got = snapshot_location(
             &store,
             &location("s3://lake/data/"),
