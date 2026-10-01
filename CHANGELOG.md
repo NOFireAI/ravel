@@ -444,6 +444,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Query tiers classify fold lag against the maintain tier's fold interval**
+  (issue #2074). A request-budget refusal names fold lag once the unsealed
+  tail passes `healthy_tail_max + fold_interval + head_cache_ttl` (ADR-1306
+  decision 6), and a `--mode query` process, which runs no scheduled fold and
+  may not set `--fold-interval-secs`, always used the 300 s default. With the
+  maintain tier folding every 900 s, its refusals blamed a fold that was
+  keeping up for tails between 8,730 s and 9,330 s. The new
+  `--fold-lag-interval-secs` flag, accepted only in `--mode query`, sets the
+  interval that classification uses and configures no fold; `--mode all`,
+  `--mode maintain` and `--mode gateway` refuse it, and so does a zero value.
+  The operator renders it on the query Deployment from
+  `spec.maintain.fold.intervalSecs` whenever that field is set.
+
 - **A zero loop interval is refused at startup** (issue #2256).
   `--maintain-interval-secs 0`, `--fold-interval-secs 0`,
   `--alert-eval-interval-secs 0` and `--oidc-jwks-refresh-interval-secs 0`
