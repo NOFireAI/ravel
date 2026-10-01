@@ -439,6 +439,80 @@ async fn ravel_bucket_location_is_refused() {
 }
 
 #[tokio::test]
+async fn folder_marker_object_is_not_treated_as_the_probe_object() {
+    // Some writers leave a zero-byte object named exactly like the directory
+    // (`t/hits/`) as a folder marker. Listing `t/hits/` returns it, but it is
+    // not a `.parquet` file and must not satisfy the probe.
+    let lake = Lake::memory_store();
+    let t = tenant("acme");
+    lake.grant(&t).await;
+    lake.put_file("t/hits/", Bytes::new()).await;
+
+    let sql = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
+    let err = lake
+        .executor
+        .execute_ddl(t, &sql, CREATED_BY, deadline())
+        .await
+        .expect_err("a bare folder marker must not qualify as the probe object");
+
+    assert!(
+        matches!(err, DdlExecuteError::ProbeObjectEmpty { .. }),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn sibling_directory_sharing_the_same_string_prefix_is_not_a_match() {
+    // `t/hits-archive/0.parquet` shares the string prefix "t/hits" with the
+    // LOCATION "t/hits/" but is not inside it. A listing scoped to the bare
+    // key "t/hits" (no trailing slash) would match it anyway; one scoped to
+    // "t/hits/" must not.
+    let lake = Lake::memory_store();
+    let t = tenant("acme");
+    lake.grant(&t).await;
+    lake.put_file(
+        "t/hits-archive/0.parquet",
+        parquet_bytes(&[1], &["a"], &[0.5]),
+    )
+    .await;
+
+    let sql = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
+    let err = lake
+        .executor
+        .execute_ddl(t, &sql, CREATED_BY, deadline())
+        .await
+        .expect_err("a sibling directory's file must not qualify as the probe object");
+
+    assert!(
+        matches!(err, DdlExecuteError::ProbeObjectEmpty { .. }),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn zero_byte_object_under_the_location_is_not_treated_as_a_match() {
+    // A zero-byte object named like a real data file (e.g. an interrupted or
+    // placeholder upload) must not satisfy the probe: `snapshot_location`
+    // could never derive a schema from it.
+    let lake = Lake::memory_store();
+    let t = tenant("acme");
+    lake.grant(&t).await;
+    lake.put_file("t/hits/0.parquet", Bytes::new()).await;
+
+    let sql = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
+    let err = lake
+        .executor
+        .execute_ddl(t, &sql, CREATED_BY, deadline())
+        .await
+        .expect_err("a zero-byte object must not qualify as the probe object");
+
+    assert!(
+        matches!(err, DdlExecuteError::ProbeObjectEmpty { .. }),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
 async fn precondition_probe_failure_is_refused_before_any_manifest_write() {
     // The lake store refuses the FIRST pinned read of the probe object
     // (the matching-pin read `probe_preconditions` makes to confirm the
