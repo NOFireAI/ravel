@@ -15,6 +15,7 @@ use bytes::Bytes;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use futures::StreamExt;
 use futures::stream;
+use ravel_memory::{MemoryBudget, Reservation};
 use ravel_object_store::{
     DrainStep, GetRange, MAX_LIST_PAGES, ObjectStoreBackend, Pin, PinnedRead, StoreError,
     drain_pages,
@@ -137,6 +138,16 @@ pub enum SnapshotError {
         location: String,
         deadline: Duration,
     },
+    #[error(
+        "Parquet file {key:?}: memory exhausted reading its footer: requested {requested} \
+         bytes, {reserved} of {limit} byte budget already reserved"
+    )]
+    MemoryExhausted {
+        key: String,
+        requested: u64,
+        reserved: u64,
+        limit: u64,
+    },
 }
 
 /// Snapshot `location` through `store`, the store of the grant's profile.
@@ -150,10 +161,13 @@ pub enum SnapshotError {
 /// more than [`MAX_TABLE_FILES`] files, or none at all, refuses the
 /// snapshot.
 ///
-/// Each file's footer read carries `If-Match` on the ETag the listing (or
-/// the HEAD) reported, takes a `limiter` permit, and is charged to
-/// [`QueryPhase::Probe`]; the LIST pages and the HEAD are charged to
-/// [`QueryPhase::Resolve`]. The recorded ETag, version and size come from
+/// Each file's footer read reserves its bytes against `memory` before the
+/// GET is issued and releases the reservation once the footer is decoded; a
+/// refusal is a typed [`SnapshotError::MemoryExhausted`] naming the file,
+/// with no GET issued for that read. Each read carries `If-Match` on the
+/// ETag the listing (or the HEAD) reported, takes a `limiter` permit, and is
+/// charged to [`QueryPhase::Probe`]; the LIST pages and the HEAD are charged
+/// to [`QueryPhase::Resolve`]. The recorded ETag, version and size come from
 /// that read's response. Up to `limiter.permits()` footer reads run at once.
 /// A file changed or deleted after the listing, an empty file, and a file
 /// whose trailer or footer the reader would refuse each refuse the whole
@@ -163,6 +177,7 @@ pub async fn snapshot_location(
     store: &dyn ObjectStoreBackend,
     location: &GrantedLocation,
     limiter: &GetLimiter,
+    memory: &Arc<MemoryBudget>,
     deadline: Duration,
     accounting: &PhaseAccounting,
 ) -> Result<LocationSnapshot, SnapshotError> {
@@ -170,6 +185,7 @@ pub async fn snapshot_location(
         store,
         location,
         limiter,
+        memory,
         deadline,
         accounting,
         MAX_TABLE_FILES,
@@ -181,6 +197,7 @@ async fn snapshot_with_limit(
     store: &dyn ObjectStoreBackend,
     location: &GrantedLocation,
     limiter: &GetLimiter,
+    memory: &Arc<MemoryBudget>,
     deadline: Duration,
     accounting: &PhaseAccounting,
     limit: usize,
@@ -191,7 +208,7 @@ async fn snapshot_with_limit(
         } else {
             head_file(store, location, accounting).await?
         };
-        read_files(store, location, limiter, accounting, listed).await
+        read_files(store, location, limiter, memory, accounting, listed).await
     };
     tokio::time::timeout(deadline, snapshot)
         .await
@@ -334,6 +351,7 @@ async fn read_files(
     store: &dyn ObjectStoreBackend,
     location: &GrantedLocation,
     limiter: &GetLimiter,
+    memory: &Arc<MemoryBudget>,
     accounting: &PhaseAccounting,
     listed: Listed,
 ) -> Result<LocationSnapshot, SnapshotError> {
@@ -341,7 +359,7 @@ async fn read_files(
     let mut files = Vec::with_capacity(listed.candidates.len());
     let mut first: Option<(String, Schema)> = None;
     let mut reads = stream::iter(listed.candidates)
-        .map(|candidate| read_file(store, grant, limiter, accounting, candidate))
+        .map(|candidate| read_file(store, grant, limiter, memory, accounting, candidate))
         .buffered(limiter.permits());
     while let Some(read) = reads.next().await {
         let (file, schema) = read?;
@@ -390,15 +408,27 @@ fn read_error(key: &str, source: StoreError) -> SnapshotError {
 }
 
 /// One pinned GET of bytes `start..end` of `key`, under a `limiter` permit,
-/// charged to Probe.
+/// charged to Probe. Reserves `end - start` bytes against `memory` before the
+/// GET is issued; a refusal is returned with no GET issued. The caller holds
+/// the returned [`Reservation`] until the footer it reads is decoded.
 async fn pinned_get(
     store: &dyn ObjectStoreBackend,
     limiter: &GetLimiter,
+    memory: &Arc<MemoryBudget>,
     accounting: &PhaseAccounting,
     key: &str,
     (start, end): (u64, u64),
     pin: &Pin,
-) -> Result<PinnedRead, SnapshotError> {
+) -> Result<(PinnedRead, Reservation), SnapshotError> {
+    let requested = end - start;
+    let reservation = memory
+        .reserve(requested)
+        .map_err(|exhausted| SnapshotError::MemoryExhausted {
+            key: key.to_string(),
+            requested: exhausted.requested,
+            reserved: exhausted.reserved,
+            limit: exhausted.limit,
+        })?;
     let _permit = limiter.acquire().await.map_err(|_| SnapshotError::Store {
         key: key.to_string(),
         source: StoreError::Transient("GetLimiter semaphore closed unexpectedly".into()),
@@ -410,7 +440,7 @@ async fn pinned_get(
         .await
         .map_err(|source| read_error(key, source))?;
     probe.add_s3_bytes(AccountedOp::Get, read.outcome.data.len() as u64);
-    Ok(read)
+    Ok((read, reservation))
 }
 
 /// The last [`FOOTER_PREFETCH`] bytes of a `size`-byte object, or all of it.
@@ -424,6 +454,7 @@ async fn read_file(
     store: &dyn ObjectStoreBackend,
     grant: &Grant,
     limiter: &GetLimiter,
+    memory: &Arc<MemoryBudget>,
     accounting: &PhaseAccounting,
     candidate: Candidate,
 ) -> Result<(ParquetFile, Schema), SnapshotError> {
@@ -436,9 +467,10 @@ async fn read_file(
         return Err(SnapshotError::EmptyFile { key: key.clone() });
     }
     let listed_pin = Pin::etag(candidate.etag);
-    let mut tail = pinned_get(
+    let (mut tail, mut _tail_reservation) = pinned_get(
         store,
         limiter,
+        memory,
         accounting,
         &key,
         tail_range(candidate.size),
@@ -453,9 +485,10 @@ async fn read_file(
         if size == 0 {
             return Err(SnapshotError::EmptyFile { key: key.clone() });
         }
-        tail = pinned_get(
+        (tail, _tail_reservation) = pinned_get(
             store,
             limiter,
+            memory,
             accounting,
             &key,
             tail_range(size),
@@ -495,6 +528,7 @@ async fn read_file(
             "the trailer records a {footer_len}-byte footer in a {size}-byte file"
         )));
     }
+    let mut _before_reservation: Option<Reservation> = None;
     let footer = if footer_and_trailer <= fetched {
         data.slice(split - footer_len as usize..split)
     } else {
@@ -505,9 +539,10 @@ async fn read_file(
             version: recorded.version.clone(),
         };
         let footer_start = size - footer_and_trailer;
-        let before = pinned_get(
+        let (before, before_reservation) = pinned_get(
             store,
             limiter,
+            memory,
             accounting,
             &key,
             (footer_start, tail_start),
@@ -521,6 +556,7 @@ async fn read_file(
             SnapshotError::FileMissing { key } => SnapshotError::FileChanged { key },
             other => other,
         })?;
+        _before_reservation = Some(before_reservation);
         if before.outcome.total_size != size || before.pin != recorded {
             return Err(SnapshotError::FileChanged { key: key.clone() });
         }
@@ -604,10 +640,12 @@ mod tests {
         url: &str,
     ) -> Result<LocationSnapshot, SnapshotError> {
         let limiter = GetLimiter::new(4).expect("permits");
+        let memory = Arc::new(MemoryBudget::unlimited());
         snapshot_location(
             store,
             &location(url),
             &limiter,
+            &memory,
             DEADLINE,
             &PhaseAccounting::new(),
         )
@@ -1170,10 +1208,12 @@ mod tests {
             key,
         };
         let limiter = GetLimiter::new(4).expect("permits");
+        let memory = Arc::new(MemoryBudget::unlimited());
         let result = snapshot_location(
             &store,
             &location,
             &limiter,
+            &memory,
             DEADLINE,
             &PhaseAccounting::new(),
         )
@@ -1233,13 +1273,15 @@ mod tests {
     async fn exactly_the_file_limit_is_admitted() {
         let store = two_files().await;
         let limiter = GetLimiter::new(4).expect("permits");
+        let memory = Arc::new(MemoryBudget::unlimited());
         let run = |limit| {
-            let (store, limiter) = (&store, &limiter);
+            let (store, limiter, memory) = (&store, &limiter, &memory);
             async move {
                 snapshot_with_limit(
                     store,
                     &location("s3://lake/data/"),
                     limiter,
+                    memory,
                     DEADLINE,
                     &PhaseAccounting::new(),
                     limit,
@@ -1374,10 +1416,12 @@ mod tests {
         let version = pin.version.clone().expect("MemoryStore reports a version");
         let accounting = PhaseAccounting::new();
         let limiter = GetLimiter::new(4).expect("permits");
+        let memory = Arc::new(MemoryBudget::unlimited());
         let got = snapshot_location(
             &store,
             &location("s3://lake/data/"),
             &limiter,
+            &memory,
             DEADLINE,
             &accounting,
         )
@@ -1508,11 +1552,13 @@ mod tests {
         let store = two_files().await;
         let _gate = store.hold(Op::Get, None, Occurrence::Always);
         let limiter = GetLimiter::new(4).expect("permits");
+        let memory = Arc::new(MemoryBudget::unlimited());
         let deadline = Duration::from_millis(20);
         let result = snapshot_location(
             &store,
             &location("s3://lake/data/"),
             &limiter,
+            &memory,
             deadline,
             &PhaseAccounting::new(),
         )
@@ -1542,10 +1588,12 @@ mod tests {
             let etag = store.inner.head(key).await.expect("head").etag.0;
             let accounting = PhaseAccounting::new();
             let limiter = GetLimiter::new(4).expect("permits");
+            let memory = Arc::new(MemoryBudget::unlimited());
             let got = snapshot_location(
                 &store,
                 &location(&format!("s3://lake/{key}")),
                 &limiter,
+                &memory,
                 DEADLINE,
                 &accounting,
             )
@@ -1571,6 +1619,67 @@ mod tests {
         }
     }
 
+    /// Mutation that fails it: reserving after the GET is issued, which would
+    /// leave the GET recorded in `store.gets()` despite the refusal.
+    #[tokio::test]
+    async fn a_footer_read_past_the_memory_budget_is_refused_before_its_get() {
+        let store = Scripted::default();
+        put(&store, "data/wide.parquet", wide_parquet_bytes(1500)).await;
+        let limiter = GetLimiter::new(4).expect("permits");
+        let memory = Arc::new(MemoryBudget::new(FOOTER_PREFETCH - 1));
+        let result = snapshot_location(
+            &store,
+            &location("s3://lake/data/"),
+            &limiter,
+            &memory,
+            DEADLINE,
+            &PhaseAccounting::new(),
+        )
+        .await;
+        match result {
+            Err(SnapshotError::MemoryExhausted {
+                key,
+                requested,
+                reserved,
+                limit,
+            }) => {
+                assert_eq!(key, "data/wide.parquet");
+                assert_eq!(requested, FOOTER_PREFETCH);
+                assert_eq!(reserved, 0);
+                assert_eq!(limit, FOOTER_PREFETCH - 1);
+            }
+            other => panic!("expected MemoryExhausted, got {other:?}"),
+        }
+        assert!(store.gets().is_empty(), "refused before any footer read");
+    }
+
+    /// A budget sized for exactly one footer read at a time snapshots
+    /// several files when a one-permit limiter serializes the reads.
+    /// Mutation that fails it: never releasing the reservation (the second
+    /// file's reserve then finds the first file's bytes still held and
+    /// refuses).
+    #[tokio::test]
+    async fn a_budget_that_fits_one_footer_snapshots_several_files_when_reads_are_serialized() {
+        let store = FaultStore::new(MemoryStore::new(), FaultPlan::empty());
+        let bytes = parquet_bytes(&[1], &["x"]);
+        for key in ["data/a.parquet", "data/b.parquet", "data/c.parquet"] {
+            put(store.inner(), key, bytes.clone()).await;
+        }
+        let limiter = GetLimiter::new(1).expect("permits");
+        let memory = Arc::new(MemoryBudget::new(bytes.len() as u64));
+        let got = snapshot_location(
+            &store,
+            &location("s3://lake/data/"),
+            &limiter,
+            &memory,
+            DEADLINE,
+            &PhaseAccounting::new(),
+        )
+        .await
+        .expect("snapshot");
+        assert_eq!(got.files.len(), 3);
+    }
+
     /// Drive a snapshot of four files whose every GET is held, releasing the
     /// held reads each round, and return the most held at once.
     async fn peak_concurrent_reads(limiter: &GetLimiter) -> usize {
@@ -1586,10 +1695,12 @@ mod tests {
         let gate = store.hold(Op::Get, None, Occurrence::Always);
         let location = location("s3://lake/data/");
         let accounting = PhaseAccounting::new();
+        let memory = Arc::new(MemoryBudget::unlimited());
         let mut run = std::pin::pin!(snapshot_location(
             &store,
             &location,
             limiter,
+            &memory,
             DEADLINE,
             &accounting,
         ));
