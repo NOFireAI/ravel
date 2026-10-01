@@ -449,6 +449,21 @@ impl ParquetSources {
         &self.services.metadata
     }
 
+    /// Ravel's own store, which holds the manifests and the grants record.
+    /// Unlike [`ParquetSources::resolve_store`], this is unaccounted direct
+    /// write access: `crate::ddl::execute_ddl` is the one caller, and grants
+    /// reads and manifest writes are outside query-cost accounting (ADR-2040
+    /// grants-and-DDL-cost amendment, 2026-10-01).
+    pub(crate) fn ravel_store(&self) -> &Arc<dyn ObjectStoreBackend> {
+        &self.ravel
+    }
+
+    /// The process-wide GET limiter the signal-table fetchers share, for
+    /// `crate::ddl::execute_ddl`'s `snapshot_location` call.
+    pub(crate) fn get_limiter(&self) -> &Arc<GetLimiter> {
+        &self.services.limiter
+    }
+
     fn resolve_store(&self, accounting: &QueryAccounting) -> ResolveStore {
         ResolveStore {
             inner: Arc::clone(&self.ravel),

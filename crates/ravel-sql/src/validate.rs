@@ -359,19 +359,27 @@ pub enum DdlValidationError {
     NotDdl { kind: &'static str },
 
     /// `TEMPORARY` is not part of the admitted subset (D2).
-    #[error("TEMPORARY is not supported for an external table (docs/adrs/2040-parquet-tables-queried-in-place.md)")]
+    #[error(
+        "TEMPORARY is not supported for an external table (docs/adrs/2040-parquet-tables-queried-in-place.md)"
+    )]
     Temporary,
 
     /// `UNBOUNDED` is not part of the admitted subset (D2).
-    #[error("UNBOUNDED is not supported for an external table (docs/adrs/2040-parquet-tables-queried-in-place.md)")]
+    #[error(
+        "UNBOUNDED is not supported for an external table (docs/adrs/2040-parquet-tables-queried-in-place.md)"
+    )]
     Unbounded,
 
     /// `PARTITIONED BY` is not part of the admitted subset (D2).
-    #[error("PARTITIONED BY is not supported for an external table (docs/adrs/2040-parquet-tables-queried-in-place.md)")]
+    #[error(
+        "PARTITIONED BY is not supported for an external table (docs/adrs/2040-parquet-tables-queried-in-place.md)"
+    )]
     PartitionedBy,
 
     /// `WITH ORDER` is not part of the admitted subset (D2).
-    #[error("WITH ORDER is not supported for an external table (docs/adrs/2040-parquet-tables-queried-in-place.md)")]
+    #[error(
+        "WITH ORDER is not supported for an external table (docs/adrs/2040-parquet-tables-queried-in-place.md)"
+    )]
     WithOrder,
 
     /// A column list, or a table-level constraint, was given. The schema
@@ -441,7 +449,10 @@ impl From<complexity_guard::GuardedParseError> for DdlValidationError {
 /// Admitted `OPTIONS` key: exactly `binary_as_string`, or `ravel.cast.`
 /// followed by a non-empty column name (D5).
 fn is_admitted_option_key(key: &str) -> bool {
-    key == "binary_as_string" || key.strip_prefix("ravel.cast.").is_some_and(|c| !c.is_empty())
+    key == "binary_as_string"
+        || key
+            .strip_prefix("ravel.cast.")
+            .is_some_and(|c| !c.is_empty())
 }
 
 /// Parse `sql` and accept it only if it is exactly one of the three D2
@@ -567,9 +578,7 @@ fn drop_intent(
         return Err(DdlValidationError::DropUnsupported { clause: "CASCADE" });
     }
     if restrict {
-        return Err(DdlValidationError::DropUnsupported {
-            clause: "RESTRICT",
-        });
+        return Err(DdlValidationError::DropUnsupported { clause: "RESTRICT" });
     }
     if purge {
         return Err(DdlValidationError::DropUnsupported { clause: "PURGE" });
@@ -1617,7 +1626,10 @@ mod tests {
             "CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION 's3://bucket/prefix/' \
              OPTIONS (binary_as_string 'true', 'ravel.cast.created_at' 'date-from-days')",
         );
-        assert_eq!(options.get("binary_as_string").map(String::as_str), Some("true"));
+        assert_eq!(
+            options.get("binary_as_string").map(String::as_str),
+            Some("true")
+        );
         assert_eq!(
             options.get("ravel.cast.created_at").map(String::as_str),
             Some("date-from-days")
@@ -1819,7 +1831,9 @@ mod tests {
     #[test]
     fn reserved_table_name_is_rejected() {
         assert!(matches!(
-            reject_ddl("CREATE EXTERNAL TABLE samples STORED AS PARQUET LOCATION 's3://bucket/prefix/'"),
+            reject_ddl(
+                "CREATE EXTERNAL TABLE samples STORED AS PARQUET LOCATION 's3://bucket/prefix/'"
+            ),
             DdlValidationError::InvalidTableName(_)
         ));
     }
@@ -1835,9 +1849,7 @@ mod tests {
     #[test]
     fn location_without_scheme_is_rejected() {
         assert!(matches!(
-            reject_ddl(
-                "CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION '/tmp/prefix/'"
-            ),
+            reject_ddl("CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION '/tmp/prefix/'"),
             DdlValidationError::Location(_)
         ));
     }
