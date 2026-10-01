@@ -89,6 +89,14 @@ Retry classification: `Throttled`, `Timeout`, `Transient` are retryable with
 jittered exponential backoff. `AlreadyExists` on `CreateIfAbsent` is a
 *protocol signal*, not an error to retry. `AccessDenied` is permanent and
 alerts differently (misconfigured credentials or prefix policy).
+A 404 is not always `NotFound`. On the S3 adapter a 404 whose error body
+names `NoSuchBucket` is `Permanent` on get, list, put, delete and multipart,
+because a missing bucket is not a missing object and a delete must never
+report it as an idempotent success; any other 404 is
+`NotFound`, except a whole-request 404 on `delete`, which is described with
+the per-key `DeleteObjects` codes under "Required bucket configuration". A HEAD
+response has no body, so `head` and `pin_of` against a missing bucket still
+read `NotFound`: telling the two apart would cost a second request.
 `PreconditionFailed`, `Unsupported` and `ReadOnly` are never retryable: a
 retry of a pinned read reads the same changed object, and neither an
 unimplemented operation nor a read-only store changes between attempts.
@@ -329,7 +337,8 @@ retryable `Transient`, not `NotFound`. A pin built from store metadata
 through `Pin::from_store` does not carry such an id. Both codes reach the rows above
 through `map_get_error`, which defers to `map_error_common` for everything
 but a 416: that maps `object_store`'s `NotFound` to `StoreError::NotFound`
-and its `Precondition` to `StoreError::PreconditionFailed`.
+(unless the 404 body names `NoSuchBucket`, which is `Permanent`) and its
+`Precondition` to `StoreError::PreconditionFailed`.
 
 `MemoryStore` is the oracle for this, and it models the rule rather than the
 storage: it does not retain superseded versions, so a pin naming one is
@@ -1198,13 +1207,18 @@ adapter contract:
    (`AccessDenied`, `AllAccessDisabled`, `AccountProblem`,
    `InvalidAccessKeyId`, `InvalidObjectState`, `SignatureDoesNotMatch`) to
    `AccessDenied`, `NoSuchKey` to the idempotent missing-key success,
-   `PreconditionFailed` to `PreconditionFailed`, and `ServiceUnavailable`
-   to `Throttled`. `object_store` retries the whole request on a per-key
-   `SlowDown` or `InternalError`, and any other code takes the generic
-   classification (`Transient` unless its text reads as a throttle or a
-   timeout), which is retryable and fails the pass. A whole-request 403 is
-   `AccessDenied` too. It runs three delete loops in order over every cleared
-   chain in the pass: every chain's input commit records first, then every
+   `NoSuchBucket` to `Permanent`, `PreconditionFailed` to
+   `PreconditionFailed`, and `ServiceUnavailable` to `Throttled`.
+   `object_store` retries the whole request on a per-key `SlowDown` or
+   `InternalError`, and any other code takes the generic classification
+   (`Transient` unless its text reads as a throttle or a timeout), which is
+   retryable and fails the pass. A whole-request 403 is `AccessDenied` too.
+   A whole-request 404 is not a missing key: `DeleteObjects` addresses the
+   bucket and S3 reports a missing key per key, so S3 answers a request-level
+   404 when the bucket itself is gone (`NoSuchBucket`). Only a `NoSuchKey`
+   code reads as the missing-key success there; any other code, or none, is
+   `Permanent` and fails the pass. It runs three delete loops in order over
+   every cleared chain in the pass: every chain's input commit records first, then every
    chain's input data objects (its L0 data and pre-rewrite L1 segments),
    then every chain's own compaction or rewrite records last, so a rewrite
    record outlives every input it superseded. A refused delete stops only

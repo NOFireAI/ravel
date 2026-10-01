@@ -155,6 +155,11 @@ enum Fault {
     /// a create conflict, so the S3 adapter's HEAD disambiguation is what turns
     /// an absent-key 409 into a retryable `Transient` (#1302).
     ConditionalConflict,
+    /// A whole-request 404 whose `<Error><Code>` is this code: `NoSuchBucket`
+    /// from a bucket that does not exist or was deleted, `NoSuchKey` from a
+    /// missing key. A HEAD response carries no body, so on a HEAD the code
+    /// never reaches the client.
+    NotFoundCode(&'static str),
     /// A 200 HEAD whose `Last-Modified` cannot be parsed. The status line says
     /// success, but `object_store` cannot turn the response into `ObjectMeta`,
     /// so the HEAD determined nothing about whether the key is present. That
@@ -801,6 +806,9 @@ async fn handle(
             "ConditionalRequestConflict",
             "The conditional request could not be satisfied.",
         ),
+        Some(Fault::NotFoundCode(code)) => {
+            error_response(StatusCode::NOT_FOUND, code, "The resource does not exist.")
+        }
         Some(Fault::InconclusiveHead) => build(
             StatusCode::OK,
             vec![
@@ -1781,6 +1789,216 @@ async fn per_key_delete_objects_codes_map_by_their_http_status() {
         };
         assert_eq!(got, want, "{code} classified as {error:?}");
     }
+}
+
+/// A `DeleteObjects` against a bucket that does not exist is refused as a
+/// whole: S3 answers 404 `NoSuchBucket` before it looks at any key. That must
+/// fail the delete with a non-retryable `Permanent`, never read as the
+/// idempotent missing-key success, or a sweep counts every key of a deleted
+/// bucket as deleted.
+#[tokio::test]
+async fn a_delete_answered_no_such_bucket_fails_permanent() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+    fake.seed("fault/no-bucket", b"kept");
+    fake.always(Op::DeleteObjects, Fault::NotFoundCode("NoSuchBucket"));
+
+    let error = store
+        .delete("fault/no-bucket")
+        .await
+        .expect_err("a delete answered NoSuchBucket must fail");
+    assert!(
+        matches!(error, StoreError::Permanent(_)),
+        "NoSuchBucket on DeleteObjects must map to Permanent, got {error:?}"
+    );
+    assert!(!error.is_retryable(), "{error:?} must not be retryable");
+    assert_eq!(fake.count(Op::DeleteObjects), 1, "a 404 is not retried");
+    assert!(fake.object("fault/no-bucket").is_some());
+}
+
+/// The same refusal reported per key inside a 200 `DeleteResult`, which an
+/// S3-compatible endpoint could send in place of the whole-request 404. A
+/// missing bucket must not read as a deleted key on that path either.
+#[tokio::test]
+async fn a_per_key_no_such_bucket_in_delete_objects_fails_permanent() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+    fake.always(
+        Op::DeleteObjects,
+        Fault::DeleteKeyError {
+            code: "NoSuchBucket",
+            message: "The specified bucket does not exist",
+        },
+    );
+
+    let error = store
+        .delete("fault/no-bucket-per-key")
+        .await
+        .expect_err("a per-key NoSuchBucket must fail the delete");
+    assert!(
+        matches!(error, StoreError::Permanent(_)),
+        "a per-key NoSuchBucket must map to Permanent, got {error:?}"
+    );
+}
+
+/// A whole-request 404 `NoSuchKey` on a delete is still the idempotent
+/// missing-key success, and on a get still `NotFound`: only the bucket code
+/// changes class.
+#[tokio::test]
+async fn no_such_key_still_reads_as_not_found_on_delete_and_get() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+    fake.seed("fault/no-key", b"served only if the fault is skipped");
+    fake.script(Op::DeleteObjects, [Fault::NotFoundCode("NoSuchKey")]);
+    fake.script(Op::Get, [Fault::NotFoundCode("NoSuchKey")]);
+
+    store
+        .delete("fault/no-key")
+        .await
+        .expect("a delete answered NoSuchKey is an idempotent success");
+    let error = store
+        .get("fault/no-key", GetRange::Full)
+        .await
+        .expect_err("a get answered NoSuchKey must fail");
+    assert!(
+        matches!(error, StoreError::NotFound),
+        "NoSuchKey on GET must map to NotFound, got {error:?}"
+    );
+    assert_eq!(fake.count(Op::DeleteObjects), 1);
+    assert_eq!(fake.count(Op::Get), 1);
+}
+
+/// A get answered `NoSuchBucket` is not a missing object: the 404 body carries
+/// the code, and the read fails `Permanent` instead of `NotFound`.
+#[tokio::test]
+async fn a_get_answered_no_such_bucket_is_not_a_missing_object() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+    fake.seed("fault/get-no-bucket", b"never served");
+    fake.always(Op::Get, Fault::NotFoundCode("NoSuchBucket"));
+
+    let error = store
+        .get("fault/get-no-bucket", GetRange::Full)
+        .await
+        .expect_err("a get answered NoSuchBucket must fail");
+    assert!(
+        matches!(error, StoreError::Permanent(_)),
+        "NoSuchBucket on GET must map to Permanent, got {error:?}"
+    );
+    assert_eq!(fake.count(Op::Get), 1, "a 404 is not retried");
+}
+
+/// A HEAD response has no body, so the `NoSuchBucket` code the endpoint sent
+/// never reaches the client, and `head` and `pin_of` cannot tell a missing
+/// bucket from a missing key without a second request. This pins that limit:
+/// the fault was served, one HEAD went out, and the answer is `NotFound`.
+#[tokio::test]
+async fn a_head_answered_no_such_bucket_reads_as_not_found_for_lack_of_a_body() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+    fake.seed("fault/head-no-bucket", b"never served");
+    fake.always(Op::Head, Fault::NotFoundCode("NoSuchBucket"));
+
+    let head = store
+        .head("fault/head-no-bucket")
+        .await
+        .expect_err("a head answered 404 must fail");
+    assert!(
+        matches!(head, StoreError::NotFound),
+        "a bodiless 404 carries no code to classify, got {head:?}"
+    );
+    let pin = store
+        .pin_of("fault/head-no-bucket")
+        .await
+        .expect_err("a pin_of answered 404 must fail");
+    assert!(
+        matches!(pin, StoreError::NotFound),
+        "a bodiless 404 carries no code to classify, got {pin:?}"
+    );
+    let heads = fake.requests(Op::Head);
+    assert_eq!(heads.len(), 2, "one HEAD per call, no follow-up probe");
+    assert!(
+        heads
+            .iter()
+            .all(|seen| seen.fault == Some(Fault::NotFoundCode("NoSuchBucket"))),
+        "every HEAD must have been answered NoSuchBucket"
+    );
+}
+
+/// Every other operation that reaches the bucket fails `Permanent` on
+/// `NoSuchBucket`: `put` and multipart creation, part upload and completion
+/// (where `object_store` reports the 404 as `NotFound`), and `list` and
+/// `list_delimited` (where it reports the 404 as a `Generic` error that would
+/// otherwise classify as a retryable `Transient`).
+#[tokio::test]
+async fn no_such_bucket_is_permanent_on_put_list_and_multipart() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+    let permanent = |what: &str, error: StoreError| {
+        assert!(
+            matches!(error, StoreError::Permanent(_)),
+            "NoSuchBucket on {what} must map to Permanent, got {error:?}"
+        );
+    };
+
+    fake.script(Op::Put, [Fault::NotFoundCode("NoSuchBucket")]);
+    let put = store
+        .put(
+            "fault/put-no-bucket",
+            Bytes::from_static(b"payload"),
+            PutOptions::default(),
+        )
+        .await
+        .expect_err("put");
+    permanent("PUT", put);
+
+    fake.script(Op::List, [Fault::NotFoundCode("NoSuchBucket")]);
+    permanent("LIST", store.list("fault/", None).await.expect_err("list"));
+    fake.script(Op::List, [Fault::NotFoundCode("NoSuchBucket")]);
+    permanent(
+        "delimited LIST",
+        store
+            .list_delimited("fault/")
+            .await
+            .expect_err("list_delimited"),
+    );
+
+    fake.script(Op::CreateMultipart, [Fault::NotFoundCode("NoSuchBucket")]);
+    let create = match store.put_multipart("fault/mp-no-bucket").await {
+        Ok(_) => panic!("CreateMultipartUpload answered NoSuchBucket must fail"),
+        Err(error) => error,
+    };
+    permanent("CreateMultipartUpload", create);
+
+    fake.script(Op::UploadPart, [Fault::NotFoundCode("NoSuchBucket")]);
+    let mut upload = store
+        .put_multipart("fault/mp-no-bucket")
+        .await
+        .expect("CreateMultipartUpload must succeed");
+    let part = upload
+        .put_part(Bytes::from_static(b"one small part"), None)
+        .await
+        .expect_err("put_part");
+    permanent("UploadPart", part);
+    let _ = upload.abort().await;
+
+    fake.script(Op::CompleteMultipart, [Fault::NotFoundCode("NoSuchBucket")]);
+    let mut upload = store
+        .put_multipart("fault/mp-no-bucket")
+        .await
+        .expect("CreateMultipartUpload must succeed");
+    upload
+        .put_part(Bytes::from_static(b"one small part"), None)
+        .await
+        .expect("the only part must upload");
+    let complete = upload.complete().await.expect_err("complete");
+    permanent("CompleteMultipartUpload", complete);
+
+    assert_eq!(fake.count(Op::Put), 1, "a 404 is not retried");
+    assert_eq!(fake.count(Op::List), 2, "a 404 is not retried");
+    assert_eq!(fake.count(Op::CompleteMultipart), 1, "a 404 is not retried");
+    assert_eq!(fake.object("fault/put-no-bucket"), None);
+    assert_eq!(fake.object("fault/mp-no-bucket"), None);
 }
 
 /// An endpoint that throttles forever eventually gives up, and the error that
