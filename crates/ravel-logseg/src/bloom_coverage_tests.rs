@@ -278,3 +278,61 @@ fn flipped_coverage_list_is_refused_and_prunes_nothing() {
         Ok(s) => panic!("flipped list parsed as {:?}", s.covered()),
     }
 }
+
+/// A BLOOM entry whose own crc fails is not a section degrade: the section
+/// still parses, `bloom_degraded` stays clear, and only that entry's block
+/// skips bloom pruning and reaches the exact scan. The entry's filter bits are
+/// left intact and only its stored crc is flipped, so a reader that skipped
+/// the entry crc would prune the block on the absent word, and one that
+/// treated the failure as a degrade would set the flag.
+#[test]
+fn corrupt_bloom_entry_leaves_only_its_block_unpruned() {
+    let mut object = object_without_note_coverage();
+    let absent = has_word(FieldSel::Attr("region".into()), "east");
+    assert_pruned(&object, &absent);
+
+    let bloom = open(&object)
+        .expect("open")
+        .section(kind::BLOOM)
+        .copied()
+        .expect("BLOOM");
+    let raw = bloom_raw_of(&object);
+    let intact = RlogBloomSection::parse(&raw, &field_dir_of(&object)).expect("parse");
+    assert_eq!(intact.len(), 1, "one block, one entry");
+    // The last entry runs to the section's end, so its crc is the one u32
+    // that matches the crc of every byte after it.
+    let crc_at: Vec<usize> = (0..raw.len().saturating_sub(4))
+        .filter(|&p| raw[p..p + 4] == crc32c::crc32c(&raw[p + 4..]).to_le_bytes())
+        .collect();
+    assert_eq!(crc_at.len(), 1, "the entry crc sits in front of its bytes");
+    object[bloom.offset as usize + crc_at[0]] ^= 0x01;
+
+    let section = bloom_raw_of_unchecked(&object);
+    let parsed = RlogBloomSection::parse(&section, &field_dir_of(&object))
+        .expect("an entry crc is not checked at parse");
+    match parsed.entry(0) {
+        Err(LogSegError::Corrupted(m)) => assert_eq!(m, "bloom entry 0 crc mismatch"),
+        Err(other) => panic!("expected Corrupted, got {other:?}"),
+        Ok(_) => panic!("the flipped entry crc was accepted"),
+    }
+
+    let cfg = RlogConfig::default();
+    let reader = RlogReader::new(&object, &cfg).expect("reader");
+    let (rows, stats) = reader.scan(&absent).expect("scan");
+    assert!(rows.is_empty());
+    assert!(!stats.bloom_degraded, "one bad entry is not a bad section");
+    assert_eq!(stats.blocks_after_postings, 1);
+    assert_eq!(stats.blocks_after_bloom, 1, "the block must not be pruned");
+    assert_eq!(stats.blocks_scanned, 1);
+}
+
+/// The stored BLOOM bytes sliced straight from the object, as the scan path
+/// reads them, without the whole-section crc `read_section` checks.
+fn bloom_raw_of_unchecked(object: &[u8]) -> Vec<u8> {
+    let desc = open(object)
+        .expect("open")
+        .section(kind::BLOOM)
+        .copied()
+        .expect("BLOOM");
+    object[desc.offset as usize..(desc.offset + desc.len) as usize].to_vec()
+}
