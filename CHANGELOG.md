@@ -1037,6 +1037,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   every process that serves Flight SQL. A forged ticket, or one minted under a
   key the node does not hold, is not recognised as a slice ticket on the public
   listener and is not counted.
+- **`/metrics` exports the fragment capability rejects** (ADR-0071 amendment
+  decision 2, issue #2314).
+  `ravel_distrib_fragment_capability_rejects_total{reason="missing"|"bad_mac"|"expired"|"tenant_mismatch"|"query_mismatch"}`
+  counts inbound `Pinned` fragment requests refused at fragment capability
+  verification, by `mode` and `reason`, every reason rendered from zero, on
+  every process that serves the fragment lane (`--distributed-query` in `all`
+  or `query` mode), where before they were counted in-process only.
 - **`/metrics` exports the superseded-input sweep's hold counters** (issue
   #2221). `ravel_maintain_superseded_inputs_held_total{reason="named"|"unreadable_head"}`
   counts superseded objects the sweep held because HEAD still names them or

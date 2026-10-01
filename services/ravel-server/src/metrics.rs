@@ -32,11 +32,12 @@
 //! ADR-0873 decision 2 to split the declared-statistics drop tally across
 //! its four carriers, and `gate`, `site` and `worker` added by ADR-1702
 //! decision 11 for the CPU gate and tokio runtime families). The twenty-one
-//! keys come from twenty-eight `Label` variants (twenty-nine in a `flight-sql`
+//! keys come from twenty-nine `Label` variants (thirty in a `flight-sql`
 //! build), because some variants share a
 //! key: `RejectReason`, `ScrubReason`, `ScrubUnreadableReason`,
-//! `AlertRetentionSkipReason`, `SupersededHeldReason` and, in a `flight-sql`
-//! build, `SliceRejectReason` all render `reason`,
+//! `AlertRetentionSkipReason`, `SupersededHeldReason`,
+//! `CapabilityRejectReason` and, in a `flight-sql` build,
+//! `SliceRejectReason` all render `reason`,
 //! `Level` (log/tracing
 //! severity) and `ScrubLevel` (issue #1686, which part of the commit lineage
 //! -- `l0`/`l1`/`rewrite` -- a scrub target came from) both render `level`,
@@ -336,6 +337,12 @@ pub enum Label {
     /// closed enum owned by [`crate::distrib`], since the classes are the
     /// admission layer's own, not a dimension this renderer invents.
     AdmissionClass(crate::distrib::AdmissionClass),
+    /// Why a worker refused a `Pinned` fragment capability (ADR-0071
+    /// amendment, decision 2): `missing`, `bad_mac`, `expired`,
+    /// `tenant_mismatch`, or `query_mismatch`. A closed enum owned by
+    /// [`crate::distrib`], which also owns the label spelling. Shares the
+    /// `reason` key with the other reason variants.
+    CapabilityRejectReason(crate::distrib::CapabilityReject),
     /// Why a SQL slice capability was refused (ADR-1689 decision 2):
     /// `missing`, `bad_mac`, `expired`, or `wrong_surface`. A closed enum
     /// owned by `ravel_sql`, which also owns the label spelling. Shares the
@@ -535,6 +542,7 @@ impl Label {
             Label::AllocatorStat(_) => "stat",
             Label::MemoryComponent(_) => "component",
             Label::AdmissionClass(_) => "class",
+            Label::CapabilityRejectReason(_) => "reason",
             #[cfg(feature = "flight-sql")]
             Label::SliceRejectReason(_) => "reason",
             Label::StatCarrier(_) => "carrier",
@@ -570,6 +578,7 @@ impl Label {
             Label::AllocatorStat(stat) => stat.name().to_string(),
             Label::MemoryComponent(component) => component.name().to_string(),
             Label::AdmissionClass(class) => admission_class_name(*class).to_string(),
+            Label::CapabilityRejectReason(reason) => reason.reason().to_string(),
             #[cfg(feature = "flight-sql")]
             Label::SliceRejectReason(reason) => reason.reason().to_string(),
             Label::StatCarrier(carrier) => carrier.label().to_string(),
@@ -6226,11 +6235,15 @@ fn render_attribution_family(out: &mut String, mode: Mode, rows: &[TenantAttribu
 /// at scrape time from [`crate::distrib::FragmentMetrics`]; `Some` only when the
 /// process serves queries with `--distributed-query` on. Carries no per-shard,
 /// per-worker, or per-tenant field: the `ravel_distrib_*` family renders under
-/// the closed `{mode}` label alone (ADR-0044 section 4).
+/// the closed `{mode}` label, plus the closed `class` or `reason` label on the
+/// per-class and per-reason series (ADR-0044 section 4).
 #[derive(Debug, Clone)]
 pub struct DistribSnapshot {
     pub fragment_requests_total: u64,
     pub fragment_auth_failures_total: u64,
+    /// Refused `Pinned` fragment capabilities per reason, every reason
+    /// present (ADR-0071 amendment, decision 2).
+    pub fragment_capability_rejects_by_reason: [(crate::distrib::CapabilityReject, u64); 5],
     /// In-flight fragment requests per fragment admission class
     /// (`Pinned`, `Resolve`; issue #1722).
     pub fragment_inflight_by_class: [(crate::distrib::AdmissionClass, u64); 2],
@@ -6267,6 +6280,7 @@ impl DistribSnapshot {
         DistribSnapshot {
             fragment_requests_total: metrics.fragment_requests_total(),
             fragment_auth_failures_total: metrics.fragment_auth_failures_total(),
+            fragment_capability_rejects_by_reason: metrics.capability_rejects_by_reason(),
             fragment_inflight_by_class: metrics.fragment_inflight_by_class(),
             fragment_admission_waits_by_class: metrics.fragment_admission_waits_by_class(),
             fragment_record_get_requests_total: metrics.fragment_record_get_requests_total(),
@@ -6285,8 +6299,9 @@ impl DistribSnapshot {
 }
 
 /// The ADR-0071 distributed read fan-out family. Follows the store
-/// and maintenance families exactly: every series carries only `{mode}`, and the
-/// three slice-routing outcomes are distinct metric names rather than one metric
+/// and maintenance families exactly: every series carries `{mode}` (plus the
+/// closed `class` on the admission series and `reason` on the capability
+/// reject counter), and the three slice-routing outcomes are distinct metric names rather than one metric
 /// with a `route` label, so no label outside the closed [`Label`] allowlist is
 /// introduced. The slice-fetch histogram reuses the store-latency bucket layout
 /// (`LATENCY_BUCKET_BOUNDS_MICROS`).
@@ -6316,6 +6331,22 @@ fn render_distrib_family(out: &mut String, mode: Mode, snapshot: &DistribSnapsho
         &[Label::Mode(mode)],
         snapshot.fragment_auth_failures_total,
     );
+
+    write_header(
+        out,
+        "ravel_distrib_fragment_capability_rejects_total",
+        "Inbound Pinned fragment requests refused at fragment capability verification, by \
+         reason (ADR-0071 amendment, decision 2).",
+        "counter",
+    );
+    for (reason, count) in snapshot.fragment_capability_rejects_by_reason {
+        write_sample(
+            out,
+            "ravel_distrib_fragment_capability_rejects_total",
+            &[Label::Mode(mode), Label::CapabilityRejectReason(reason)],
+            count,
+        );
+    }
 
     write_header(
         out,
@@ -7573,6 +7604,7 @@ mod tests {
             Label::AllocatorStat(AllocatorStat::Allocated),
             Label::MemoryComponent(MemoryComponent::Sql),
             Label::AdmissionClass(crate::distrib::AdmissionClass::Pinned),
+            Label::CapabilityRejectReason(crate::distrib::CapabilityReject::Missing),
             Label::StatCarrier(ravel_commit::declared_stats::StatCarrier::CommitRecord),
             Label::CpuGate(ravel_cpu_gate::GateKind::Read),
             Label::ReadGateSite(ravel_cpu_gate::ReadSite::CatalogPart),
@@ -7605,6 +7637,7 @@ mod tests {
                 Label::AllocatorStat(_) => "stat",
                 Label::MemoryComponent(_) => "component",
                 Label::AdmissionClass(_) => "class",
+                Label::CapabilityRejectReason(_) => "reason",
                 // Asserted by `sql_slice_reject_family_renders_each_reason_exactly`,
                 // since `one_of_each` is the default build's set.
                 #[cfg(feature = "flight-sql")]
@@ -7659,6 +7692,8 @@ mod tests {
                 "stat",
                 "component",
                 "class",
+                // CapabilityRejectReason (issue #2314) reuses the `reason` key.
+                "reason",
                 "carrier",
                 "gate",
                 "site",
@@ -7678,8 +7713,8 @@ mod tests {
         );
         assert_eq!(
             one_of_each.len(),
-            28,
-            "exactly 28 label variants in a default build (flight-sql adds SliceRejectReason), 21 distinct keys"
+            29,
+            "exactly 29 label variants in a default build (flight-sql adds SliceRejectReason), 21 distinct keys"
         );
         assert_eq!(
             keys.iter().collect::<HashSet<_>>().len(),
@@ -10508,6 +10543,8 @@ mod tests {
         let snapshot = DistribSnapshot {
             fragment_requests_total: 11,
             fragment_auth_failures_total: 2,
+            fragment_capability_rejects_by_reason: crate::distrib::FragmentMetrics::new()
+                .capability_rejects_by_reason(),
             fragment_inflight_by_class: [
                 (crate::distrib::AdmissionClass::Pinned, 1),
                 (crate::distrib::AdmissionClass::Resolve, 4),
@@ -10600,7 +10637,8 @@ mod tests {
         // Every ravel_distrib_ series line carries exactly the `{mode}` label
         // (plus `le` on histogram buckets, and `class` on the per-admission-class
         // fragment in-flight gauge and admission-wait counter, ADR-0071 issue
-        // #1722); no other label leaks in.
+        // #1722, and `reason` on the capability reject counter alone, issue
+        // #2314); no other label leaks in.
         for line in body.lines() {
             if !line.starts_with("ravel_distrib_") {
                 continue;
@@ -10610,10 +10648,15 @@ mod tests {
                 .and_then(|(_, rest)| rest.split_once('}'))
                 .map(|(labels, _)| labels)
                 .unwrap_or("");
+            let capability_reject =
+                line.starts_with("ravel_distrib_fragment_capability_rejects_total{");
             for pair in labels.split(',').filter(|p| !p.is_empty()) {
                 let key = pair.split('=').next().unwrap_or(pair);
                 assert!(
-                    key == "mode" || key == "le" || key == "class",
+                    key == "mode"
+                        || key == "le"
+                        || key == "class"
+                        || (capability_reject && key == "reason"),
                     "disallowed label `{key}` on ravel_distrib series: {line}"
                 );
             }
@@ -10654,6 +10697,77 @@ mod tests {
         assert!(
             !off.contains("ravel_distrib_"),
             "the distrib family must be absent without --distributed-query:\n{off}"
+        );
+    }
+
+    /// Issue #2314: the fragment capability reject counter renders one sample
+    /// per `CapabilityReject` reason under exactly `{mode, reason}`, each
+    /// carrying its own reason's count, every reason present at zero, and
+    /// nothing at all for a process that does not serve the fragment lane.
+    #[test]
+    fn distrib_capability_reject_family_renders_each_reason_exactly() {
+        use crate::distrib::{CapabilityReject, FragmentMetrics};
+
+        let mut snapshot = DistribSnapshot::from_metrics(&FragmentMetrics::new());
+        snapshot.fragment_capability_rejects_by_reason = [
+            (CapabilityReject::Missing, 2),
+            (CapabilityReject::BadMac, 3),
+            (CapabilityReject::Expired, 5),
+            (CapabilityReject::TenantMismatch, 7),
+            (CapabilityReject::QueryMismatch, 11),
+        ];
+        let family = "ravel_distrib_fragment_capability_rejects_total";
+        let samples_of = |body: &str| -> Vec<String> {
+            body.lines()
+                .filter(|l| l.starts_with(&format!("{family}{{")))
+                .map(str::to_string)
+                .collect()
+        };
+
+        let body = render_distrib_and_metadata(Mode::Query, Some(&snapshot), None);
+        assert_eq!(
+            body.matches(&format!("# TYPE {family} counter\n")).count(),
+            1,
+            "exactly one counter TYPE header:\n{body}"
+        );
+        assert_eq!(
+            samples_of(&body),
+            vec![
+                "ravel_distrib_fragment_capability_rejects_total{mode=\"query\",reason=\"missing\"} 2",
+                "ravel_distrib_fragment_capability_rejects_total{mode=\"query\",reason=\"bad_mac\"} 3",
+                "ravel_distrib_fragment_capability_rejects_total{mode=\"query\",reason=\"expired\"} 5",
+                "ravel_distrib_fragment_capability_rejects_total{mode=\"query\",reason=\"tenant_mismatch\"} 7",
+                "ravel_distrib_fragment_capability_rejects_total{mode=\"query\",reason=\"query_mismatch\"} 11",
+            ],
+        );
+        assert_eq!(
+            Label::CapabilityRejectReason(CapabilityReject::Missing).key(),
+            "reason"
+        );
+
+        // Fresh counters, read the way the handler reads them, render all five
+        // reasons at zero.
+        let zero = render_distrib_and_metadata(
+            Mode::All,
+            Some(&DistribSnapshot::from_metrics(&FragmentMetrics::new())),
+            None,
+        );
+        assert_eq!(
+            samples_of(&zero),
+            vec![
+                "ravel_distrib_fragment_capability_rejects_total{mode=\"all\",reason=\"missing\"} 0",
+                "ravel_distrib_fragment_capability_rejects_total{mode=\"all\",reason=\"bad_mac\"} 0",
+                "ravel_distrib_fragment_capability_rejects_total{mode=\"all\",reason=\"expired\"} 0",
+                "ravel_distrib_fragment_capability_rejects_total{mode=\"all\",reason=\"tenant_mismatch\"} 0",
+                "ravel_distrib_fragment_capability_rejects_total{mode=\"all\",reason=\"query_mismatch\"} 0",
+            ],
+        );
+
+        // No fragment lane: no header and no sample.
+        let off = render_distrib_and_metadata(Mode::Query, None, None);
+        assert!(
+            !off.contains(family),
+            "a process not serving the fragment lane must render no capability reject family:\n{off}"
         );
     }
 
@@ -12953,6 +13067,8 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
         let snapshot = DistribSnapshot {
             fragment_requests_total: 0,
             fragment_auth_failures_total: 0,
+            fragment_capability_rejects_by_reason: crate::distrib::FragmentMetrics::new()
+                .capability_rejects_by_reason(),
             fragment_inflight_by_class: [
                 (crate::distrib::AdmissionClass::Pinned, 0),
                 (crate::distrib::AdmissionClass::Resolve, 0),

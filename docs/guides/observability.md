@@ -53,7 +53,8 @@ The renderer can attach only these label keys: `tenant_hash`, `signal`,
 `carrier`, `gate`, `site`, `worker`, and `shard`, twenty-one in all.
 `reason` is shared by several families: the admission-rejection counter, the
 scrub counters, the alert retention-skip counter, the superseded-inputs-held
-counter, and the SQL slice capability reject counter. `cache` and `tier` split the read-cache family across its two caches
+counter, the fragment capability reject counter, and the SQL slice capability
+reject counter. `cache` and `tier` split the read-cache family across its two caches
 and, when a disk tier is configured, its two tiers; the [caching
 guide](caching.md) documents both. `kind` splits the maintenance
 merge-memory gauge into its transient and total high-water marks. `class`
@@ -2319,9 +2320,9 @@ operator alerts on the increase rather than on a threshold.
 
 ### Distributed read fan-out (`ravel_distrib_*`)
 
-Labels: `mode` only, plus `le` on the histogram buckets and `class`
+Labels: `mode` only, plus `le` on the histogram buckets, `class`
 (`pinned`|`resolve`) on the fragment in-flight gauge and admission-wait
-counter. This
+counter, and `reason` on the fragment capability reject counter. This
 family carries no per-shard, per-worker, or per-tenant label: a fan-out
 spanning many workers and tenants must not turn one query into a cardinality
 explosion. It renders only when the process runs with `--distributed-query`;
@@ -2330,7 +2331,8 @@ a local-only process omits the family entirely.
 | Metric | Meaning |
 |---|---|
 | `ravel_distrib_fragment_requests_total` | Inbound fragment (`SeriesFetch`) requests served after passing token auth and fragment admission. Worker side. |
-| `ravel_distrib_fragment_auth_failures_total` | Inbound `Resolve`-scope (cross-cluster federation) fragment requests whose presented credential did not resolve to a tenant. Worker side. It does not count `Pinned` capability rejections (missing, bad MAC, expired, tenant mismatch, query mismatch): those are counted per reason in-process only and are not rendered here. |
+| `ravel_distrib_fragment_auth_failures_total` | Inbound `Resolve`-scope (cross-cluster federation) fragment requests whose presented credential did not resolve to a tenant. Worker side. It does not count `Pinned` capability rejections: those are `ravel_distrib_fragment_capability_rejects_total`. |
+| `ravel_distrib_fragment_capability_rejects_total{reason}` | Counter. Inbound `Pinned` (intra-cluster) fragment requests refused at fragment capability verification, refused `Unauthenticated`. Worker side. One series per reason, each rendered from zero. The checks run in a fixed order and a refusal counts under the first one it fails, so a capability that is both expired and minted for another tenant counts as `expired`. `reason="missing"`: the request carried no capability at all. `reason="bad_mac"`: the capability is malformed (it does not decode as a capability) or its MAC verifies under none of this node's fragment keys, which is the reason a coordinator minting under a key this worker does not hold produces. `reason="expired"`: the capability's expiry is at or before this worker's clock. `reason="tenant_mismatch"`: the request names a tenant other than the one the capability was minted for. `reason="query_mismatch"`: the request's query id or signal differs from the capability's. The coordinator whose capability was refused records no reason, so this counter, on the worker, is where a refusal is attributed. |
 | `ravel_distrib_fragment_inflight{class}` | Gauge. Fragment requests currently holding a fragment-admission permit, by admission class: `class="pinned"` for intra-cluster requests (admits against `--max-inflight-fragments`), `class="resolve"` for cross-cluster federation requests (admits against `--max-inflight-federated-resolves`). The two classes never share a permit pool, so a peer cluster saturating `resolve` cannot starve this cluster's own `pinned` slices. |
 | `ravel_distrib_fragment_admission_waits_total{class}` | Counter. Inbound fragment requests, by admission class, that found their class's semaphore saturated at acquire time and had to queue. |
 | `ravel_distrib_fragment_record_get_requests_total` | Counter. Object-store GETs this worker's pinned resolves issued to read each pinned segment's own durable record: one per pinned L0 segment, one per pinned L1 segment, and two for an L1 segment that only an erasure rewrite record describes. Worker side. These GETs are charged to no query's accounting and the slice summary cannot carry them, so this counter is the only report of the resolve phase's request cost: expect it to track `ravel_distrib_fragment_requests_total` times the mean pinned segments per slice, and read a rise against that ratio as rewrite-record fallbacks. |
