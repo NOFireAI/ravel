@@ -540,6 +540,44 @@ async fn file_groups(lake: &Lake, tenant: &TenantHash, sql: &str) -> usize {
         .unwrap_or_else(|_| panic!("unparsed groups in {text}"))
 }
 
+/// `explain` over a Parquet table reports the estimate's requests and store
+/// bytes, and names all three components as unbounded: the requests assume a
+/// cold cache and one GET per file, and the bytes count each file once, so a
+/// real scan can exceed either, and the decompressed bytes are not computed at
+/// all.
+///
+/// FLIP: listing only `estimated_decompressed_bytes` fails the equality.
+#[tokio::test]
+async fn the_parquet_estimate_names_every_component_it_does_not_bound() {
+    let lake = Lake::configured();
+    let acme = tenant("acme");
+    lake.hits_for(&acme).await;
+    let report = lake
+        .executor
+        .explain(acme, &request("SELECT id FROM hits"))
+        .await
+        .expect("explain");
+    assert_eq!(report.target, TargetSignal::Parquet);
+    assert_eq!(
+        report.unbounded_components,
+        vec![
+            "estimated_requests",
+            "estimated_store_bytes",
+            "estimated_decompressed_bytes",
+        ]
+    );
+    let files = hits_files();
+    assert_eq!(
+        report.estimate.estimated_store_bytes,
+        files
+            .iter()
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum::<u64>(),
+        "the figures are still reported"
+    );
+    assert_eq!(report.estimate.estimated_decompressed_bytes, 0);
+}
+
 /// ADR-2040 D6: an exact-typed statement scans in one group per file (three
 /// files, eight target partitions), and one whose float sum is not exact
 /// scans in exactly one.
