@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Changelog guard (issue #1719): a pull request whose feat/fix commits touch
-# crates/ or services/ must also touch CHANGELOG.md somewhere in the same
-# range, or carry an explicit opt-out trailer.
+# crates/ or services/ must also add a changelog fragment under changelog.d/
+# (preferred, issue #2323) or touch CHANGELOG.md somewhere in the same range,
+# or carry an explicit opt-out trailer.
 #
 # Usage:
 #   scripts/guards/check-changelog-touched.sh <base-ref> [<head-ref>]
@@ -15,14 +16,16 @@
 # AND its own diff touches a path under crates/ or services/. Whether the
 # range as a whole is exempt is decided over the WHOLE range, not per commit:
 #
+#   - a file under changelog.d/ other than changelog.d/README.md was added or
+#     changed between base and head (a fragment; see changelog.d/README.md),
 #   - CHANGELOG.md changed anywhere between base and head, or
 #   - some commit in the range carries a trailer line reading exactly
 #     `Changelog: none`
 #
-# Exit 0: no qualifying commit, or the range is exempt by either rule above.
-# Exit 1: a qualifying commit exists and neither exemption applies. Findings
-#         print the exact fix: add a CHANGELOG.md entry, or add the
-#         `Changelog: none` trailer to the commit.
+# Exit 0: no qualifying commit, or the range is exempt by any rule above.
+# Exit 1: a qualifying commit exists and no exemption applies. Findings
+#         print the exact fix: add a fragment under changelog.d/ (preferred),
+#         or add the `Changelog: none` trailer to the commit.
 # Exit 2: the question could not be answered (missing argument, a ref git
 #         cannot resolve, or a git command failing outright). Could-not-check
 #         is never reported as a pass.
@@ -32,7 +35,7 @@ repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "${repo_root}" || exit 2
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-  sed -n '2,28p' "$0"
+  sed -n '2,31p' "$0"
   exit 0
 fi
 
@@ -94,6 +97,14 @@ if ! changed_changelog="$(git diff --name-only "${range}" -- CHANGELOG.md 2>/dev
 fi
 [[ -n "${changed_changelog}" ]] && changelog_touched=1
 
+fragment_touched=0
+if ! changed_fragments="$(git diff --name-only --diff-filter=ACMR "${range}" -- \
+    changelog.d/ ':(exclude)changelog.d/README.md' 2>/dev/null)"; then
+  echo "check-changelog-touched.sh: git diff failed for ${range}" >&2
+  exit 2
+fi
+[[ -n "${changed_fragments}" ]] && fragment_touched=1
+
 trailer_present=0
 if ! messages="$(git log --format=%B "${range}" 2>/dev/null)"; then
   echo "check-changelog-touched.sh: git log failed for ${range}" >&2
@@ -125,6 +136,11 @@ if [[ -z "${qualifying_sha}" ]]; then
   exit 0
 fi
 
+if [[ "${fragment_touched}" -eq 1 ]]; then
+  echo "check-changelog-touched.sh: clean (a changelog fragment under changelog.d/ added or changed in ${range})"
+  exit 0
+fi
+
 if [[ "${changelog_touched}" -eq 1 ]]; then
   echo "check-changelog-touched.sh: clean (CHANGELOG.md touched in ${range})"
   exit 0
@@ -135,7 +151,8 @@ if [[ "${trailer_present}" -eq 1 ]]; then
   exit 0
 fi
 
-echo "check-changelog-touched.sh: ${qualifying_sha:0:12} (${qualifying_subject}) touches crates/ or services/ but CHANGELOG.md is untouched in ${range}" >&2
-echo "  Fix: add a CHANGELOG.md entry under [Unreleased] describing this change," >&2
-echo "  or add a trailer reading exactly 'Changelog: none' to the commit if none is needed." >&2
+echo "check-changelog-touched.sh: ${qualifying_sha:0:12} (${qualifying_subject}) touches crates/ or services/ but no changelog fragment is added and CHANGELOG.md is untouched in ${range}" >&2
+echo "  Fix: add a fragment changelog.d/<issue>.<section>.md holding this change's" >&2
+echo "  bullet (see changelog.d/README.md), or add a trailer reading exactly" >&2
+echo "  'Changelog: none' to the commit if none is needed." >&2
 exit 1

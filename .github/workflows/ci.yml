@@ -341,6 +341,13 @@ jobs:
         # reachable from it and the guard attributes a neighbour's feat commit
         # to this pull request. head.sha is the branch tip itself.
         run: scripts/guards/check-changelog-touched.sh "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
+      # Changelog fragments under changelog.d/ are folded into CHANGELOG.md
+      # before a release tag is cut (issue #2323). Validating them here makes
+      # a malformed fragment fail at its pull request, not at release time.
+      - name: Changelog fragment assembler cases (issue #2323)
+        run: bash scripts/changelog-assemble.test.sh
+      - name: Changelog fragments are well formed (issue #2323)
+        run: bash scripts/changelog-assemble.sh --check
       - name: Injected-clock helper guard cases (issue #1260)
         run: bash scripts/tests/check-injected-clock-helpers.test.sh
       - name: Injected-clock helper guard (issue #1260)

@@ -223,5 +223,60 @@ merge="$(git -C "${d}" commit-tree "$(git -C "${d}" rev-parse "${feature_tip}^{t
 check "an ordinary merge on the branch still walks its own feat commit" \
   "${d}" "${base}" "${merge}" 1 "add feature with no changelog entry"
 
+# --- changelog fragments (issue #2323) ----------------------------------------
+#
+# A fragment under changelog.d/ exempts the range on its own, CHANGELOG.md
+# untouched. changelog.d/README.md is not a fragment and exempts nothing.
+
+d="$(new_repo fragment-alone)"
+base="$(git -C "${d}" rev-parse HEAD)"
+mkdir -p "${d}/changelog.d"
+echo 'fn feature() {}' >"${d}/crates/c/feature.rs"
+printf -- '- new feature entry\n' >"${d}/changelog.d/42.added.md"
+git -C "${d}" add crates/c/feature.rs changelog.d/42.added.md
+git -C "${d}" commit -q -m "feat(c): add feature with a fragment"
+head="$(git -C "${d}" rev-parse HEAD)"
+check "a changelog fragment alone exempts the range" "${d}" "${base}" "${head}" 0 \
+  "changelog fragment"
+
+d="$(new_repo fragment-separate-commit)"
+base="$(git -C "${d}" rev-parse HEAD)"
+mkdir -p "${d}/changelog.d"
+echo 'fn feature() {}' >"${d}/services/s/feature.rs"
+git -C "${d}" add services/s/feature.rs
+git -C "${d}" commit -q -m "fix(s): correct feature"
+printf -- '- corrected feature\n' >"${d}/changelog.d/42-2.fixed.md"
+git -C "${d}" add changelog.d/42-2.fixed.md
+git -C "${d}" commit -q -m "docs: add the changelog fragment"
+head="$(git -C "${d}" rev-parse HEAD)"
+check "a fragment added in a later commit of the range exempts it" "${d}" "${base}" "${head}" 0 \
+  "changelog fragment"
+
+d="$(new_repo fragment-readme-only)"
+base="$(git -C "${d}" rev-parse HEAD)"
+mkdir -p "${d}/changelog.d"
+echo 'fn feature() {}' >"${d}/crates/c/feature.rs"
+printf '# Changelog fragments\n' >"${d}/changelog.d/README.md"
+git -C "${d}" add crates/c/feature.rs changelog.d/README.md
+git -C "${d}" commit -q -m "feat(c): add feature, touch only the fragment README"
+head="$(git -C "${d}" rev-parse HEAD)"
+check "changelog.d/README.md alone does not exempt the range" "${d}" "${base}" "${head}" 1 \
+  "changelog.d/<issue>.<section>.md"
+
+# Deleting a fragment (what the release fold does) is not adding one.
+d="$(new_repo fragment-deleted)"
+mkdir -p "${d}/changelog.d"
+printf -- '- older entry\n' >"${d}/changelog.d/7.fixed.md"
+git -C "${d}" add changelog.d/7.fixed.md
+git -C "${d}" commit -q -m "docs: an older fragment"
+base="$(git -C "${d}" rev-parse HEAD)"
+echo 'fn feature() {}' >"${d}/crates/c/feature.rs"
+git -C "${d}" rm -q changelog.d/7.fixed.md
+git -C "${d}" add crates/c/feature.rs
+git -C "${d}" commit -q -m "feat(c): add feature and delete someone else's fragment"
+head="$(git -C "${d}" rev-parse HEAD)"
+check "deleting a fragment does not exempt the range" "${d}" "${base}" "${head}" 1 \
+  "no changelog fragment is added"
+
 printf '\n%d passed, %d failed\n' "${passes}" "${fails}"
 [[ "${fails}" -eq 0 ]]

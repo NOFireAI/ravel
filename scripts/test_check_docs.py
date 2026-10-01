@@ -726,6 +726,24 @@ class TestChangelogScope(RepoCase):
         self.assertTrue(self.rules(f, "SRCPATH"))
         self.assertTrue(self.rules(f, "SUPERLATIVE"))
 
+    def test_fragment_scope(self):
+        self.assertEqual(check_docs.classify("changelog.d/2323.changed.md"), "changelog")
+        self.assertEqual(check_docs.classify("changelog.d/README.md"), "changelog")
+        self.assertIsNone(check_docs.classify("changelog.d/sub/1.fixed.md"))
+
+    def test_fragment_held_to_the_changelog_rules(self):
+        f = self.findings({
+            "changelog.d/123.added.md": (
+                "- Typed statistics (ADR-0850, #123) in "
+                "crates/x/src/y.rs, a seamless change.\n"
+            ),
+        })
+        self.assertEqual(self.rules(f, "TRACKER"), [])
+        self.assertEqual(
+            [x.path for x in self.rules(f, "SRCPATH")], ["changelog.d/123.added.md"]
+        )
+        self.assertTrue(self.rules(f, "SUPERLATIVE"))
+
 
 if __name__ == "__main__":
     unittest.main()

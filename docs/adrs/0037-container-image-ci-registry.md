@@ -631,3 +631,27 @@ the mirror's workflow path,
 is now this repository's own. The identity string does not change, so the
 invocation documented in README.md stays correct as written and consumers
 verifying released images need do nothing.
+
+## Amendment (2026-10-01): changelog fragments are folded before the tag
+
+<!-- amendment-applies: none reason="this adds a release-preparation step beside decision 11's version bump; no earlier wording in this ADR is retired or narrowed" -->
+
+No document in this repository wrote down the steps for cutting a release;
+decision 11's version bump was the only one. This amendment records the
+second, because the release job depends on it.
+
+Changelog entries no longer go straight into `CHANGELOG.md`. Each change adds
+one fragment under `changelog.d/` (the format is in `changelog.d/README.md`),
+so pull requests in flight together stop conflicting on the `[Unreleased]`
+section. The release job reads the version's `CHANGELOG.md` section from the
+tagged tree (ADR-0086 decision 5), so a fragment that is still a separate
+file when the tag is cut never reaches that release's notes.
+
+The pull request that prepares release `vX.Y.Z` therefore does two things
+before the tag is cut: it bumps the workspace version (decision 11), and it
+runs `scripts/changelog-assemble.sh` and commits the result before tagging.
+The script folds every fragment into `[Unreleased]` under its section heading
+and deletes the fragments it folded; it refuses, and changes nothing, on a
+malformed fragment. CI runs `scripts/changelog-assemble.sh --check` on every
+pull request, so a malformed fragment is caught where it was written rather
+than during a release.

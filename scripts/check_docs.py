@@ -66,6 +66,10 @@ def classify(rel):
         # change is doing its job, so the tracker rule does not apply. Every
         # other rule does: a source path or a commit hash is still noise here.
         return "changelog"
+    if rel.startswith("changelog.d/") and rel.endswith(".md") and rel.count("/") == 1:
+        # A fragment is a CHANGELOG.md bullet waiting to be folded in, so it
+        # is held to the same rules. The README here passes them too.
+        return "changelog"
     if rel in ("README.md", "docs/README.md"):
         return "user"
     if rel.startswith("docs/guides/") and rel.endswith(".md"):
