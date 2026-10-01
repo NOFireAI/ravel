@@ -189,7 +189,10 @@ Also live:
 - A Kubernetes operator with a `RavelCluster` custom resource.
 - Per-tenant typed attribute columns on the `logs` SQL table, so typed
   comparisons and aggregates need no `CAST` over the stringified `attrs` map.
-  See the [query guide](docs/guides/query.md).
+  See the [query guide](docs/guides/query.md). A tenant's config record can
+  also carry a clustering key and a bloom scope, which
+  `ravel-cli clustering-key show` and `ravel-cli bloom-scope show` print;
+  this build reads both fields, and nothing sets them yet.
 
 The PromQL conformance table in the
 [query engine spec](docs/query-engine.md) classifies every construct as
