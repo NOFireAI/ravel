@@ -265,12 +265,51 @@ pub async fn retention_sweep_bucket_with_reach(
     lease: &dyn LeaseCheck,
     bucket: &Bucket,
 ) -> Result<RetentionOutcome> {
+    let (outcome, _expiry) =
+        retention_sweep_bucket_observed(reach, store, clock, config, window_ns, lease, bucket)
+            .await?;
+    Ok(outcome)
+}
+
+/// When an expired bucket expired, as far as one retention evaluation knows
+/// it without a request beyond the ones the evaluation already made. Feeds the
+/// scan's retention lag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObservedExpiry {
+    /// `max_event_ts + window` from the bucket's own records, which the pass
+    /// that writes the tombstone reads to decide expiry.
+    Exact(i64),
+    /// The tombstone's `retired_at_ns`. The tombstone records no event
+    /// timestamp, but it is written only once the bucket has expired, so the
+    /// expiry is at or before this instant.
+    NoLaterThan(i64),
+    /// The tombstone's `retired_at_ns`, for a bucket that lists a rewrite
+    /// record. A rewrite with no parts puts its `created_unix_ns` into
+    /// [`max_event_ts`], and an erasure can publish one at any time before the
+    /// bucket expires, so the hour's nominal deadline is no bound on the
+    /// expiry here; only this instant is.
+    NoLaterThanOnly(i64),
+}
+
+/// [`retention_sweep_bucket_with_reach`], also returning the bucket's
+/// [`ObservedExpiry`] on every outcome that leaves an expired bucket present
+/// or retires it, and `None` on the rest.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn retention_sweep_bucket_observed(
+    reach: &mut SnapshotReachability,
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    window_ns: Option<i64>,
+    lease: &dyn LeaseCheck,
+    bucket: &Bucket,
+) -> Result<(RetentionOutcome, Option<ObservedExpiry>)> {
     let Some(window_ns) = window_ns else {
-        return Ok(RetentionOutcome::NoPolicy);
+        return Ok((RetentionOutcome::NoPolicy, None));
     };
     let now = clock.now_ns();
     if !bucket.is_sealed(now, config) {
-        return Ok(RetentionOutcome::NotSealed);
+        return Ok((RetentionOutcome::NotSealed, None));
     }
 
     let listing = list_bucket(store, bucket).await?;
@@ -280,12 +319,17 @@ pub async fn retention_sweep_bucket_with_reach(
     // anchors on the compaction record's created_unix_ns.
     if let Some(tombstone_key) = &listing.tombstone_key {
         let tombstone = get_tombstone(store, tombstone_key).await?;
+        let expiry = Some(if listing.rewrite_record_keys.is_empty() {
+            ObservedExpiry::NoLaterThan(tombstone.retired_at_ns)
+        } else {
+            ObservedExpiry::NoLaterThanOnly(tombstone.retired_at_ns)
+        });
         if now
             >= tombstone
                 .retired_at_ns
                 .saturating_add(config.protection_horizon_ns)
         {
-            return physical_sweep(
+            let outcome = physical_sweep(
                 reach,
                 store,
                 lease,
@@ -294,9 +338,10 @@ pub async fn retention_sweep_bucket_with_reach(
                 tombstone_key,
                 config.dry_run,
             )
-            .await;
+            .await?;
+            return Ok((outcome, expiry));
         }
-        return Ok(RetentionOutcome::Tombstoned);
+        return Ok((RetentionOutcome::Tombstoned, expiry));
     }
 
     // Not tombstoned: evaluate expiry from the bucket's records (no footer
@@ -315,11 +360,12 @@ pub async fn retention_sweep_bucket_with_reach(
     }
     let max_event = max_event_ts(&commit_records, &compaction_records, &rewrite_records);
     if !is_expired(max_event, now, window_ns) {
-        return Ok(RetentionOutcome::NotExpired);
+        return Ok((RetentionOutcome::NotExpired, None));
     }
 
     write_tombstone(store, bucket, now, window_ns, &listing, config.dry_run).await?;
-    Ok(RetentionOutcome::Tombstoned)
+    let expiry = max_event.map(|max| ObservedExpiry::Exact(max.saturating_add(window_ns)));
+    Ok((RetentionOutcome::Tombstoned, expiry))
 }
 
 /// Run retention before compaction over one bucket (ADR-0019 decision 6): the
@@ -371,8 +417,30 @@ pub async fn maintain_bucket_with_reach(
     Option<ClaimedCompaction>,
     Option<ClaimAcquisition>,
 )> {
-    let outcome =
-        retention_sweep_bucket_with_reach(reach, store, clock, config, window_ns, lease, bucket)
+    let (outcome, _expiry, compaction, acquisition) =
+        maintain_bucket_observed(reach, store, clock, config, window_ns, lease, bucket).await?;
+    Ok((outcome, compaction, acquisition))
+}
+
+/// [`maintain_bucket_with_reach`], also returning the retention evaluation's
+/// [`ObservedExpiry`] (see [`retention_sweep_bucket_observed`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn maintain_bucket_observed(
+    reach: &mut SnapshotReachability,
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    window_ns: Option<i64>,
+    lease: &dyn LeaseCheck,
+    bucket: &Bucket,
+) -> Result<(
+    RetentionOutcome,
+    Option<ObservedExpiry>,
+    Option<ClaimedCompaction>,
+    Option<ClaimAcquisition>,
+)> {
+    let (outcome, expiry) =
+        retention_sweep_bucket_observed(reach, store, clock, config, window_ns, lease, bucket)
             .await?;
     let (compaction, acquisition) = match outcome {
         // The bucket is (or is being) retired, or its delete is blocked by a
@@ -387,7 +455,7 @@ pub async fn maintain_bucket_with_reach(
             (Some(compaction), acquisition)
         }
     };
-    Ok((outcome, compaction, acquisition))
+    Ok((outcome, expiry, compaction, acquisition))
 }
 
 /// The maximum `max_event_ts_ns` across a bucket's L0 commit records,
@@ -1104,5 +1172,116 @@ mod tests {
             ),
             other => panic!("expected Invariant from the version gate, got {other:?}"),
         }
+    }
+
+    /// A pass over an already-tombstoned bucket reports the tombstone's
+    /// `retired_at_ns` as the bucket's expiry bound, and marks it as the only
+    /// bound once the bucket lists a rewrite record: an erasure's parts-less
+    /// rewrite stands its `created_unix_ns` in for an event time, so the
+    /// hour's nominal deadline can sit far before the real expiry (issue
+    /// #2073). Flipped line: always return `ObservedExpiry::NoLaterThan` on the
+    /// tombstoned path of `retention_sweep_bucket_observed`; "a rewritten
+    /// bucket is bounded by its tombstone alone" reads `NoLaterThan` against
+    /// `NoLaterThanOnly`.
+    #[tokio::test]
+    async fn a_tombstoned_bucket_listing_a_rewrite_is_bounded_by_its_tombstone_alone() {
+        const HOUR: u32 = 1;
+        let retired_at_ns = 100 * crate::config::NS_PER_HOUR;
+        let window_ns = 10 * crate::config::NS_PER_HOUR;
+        let store = MemoryStore::new();
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let tombstone = RetentionTombstone {
+            format_version: 1,
+            tenant_hash: tenant.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(signal) as i32,
+            shard: 0,
+            ingest_hour_bucket: HOUR,
+            retired_at_ns,
+            retention_window_ns: window_ns as u64,
+            record_count_observed: 1,
+        };
+        store
+            .put(
+                &keys::retention_tombstone_key_for(&tombstone).expect("key"),
+                record::encode_tombstone(&tombstone),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed tombstone");
+
+        let bucket = Bucket::new(tenant, signal, 0, HOUR);
+        async fn observe(
+            store: &MemoryStore,
+            bucket: &Bucket,
+            now_ns: i64,
+            window_ns: i64,
+        ) -> (RetentionOutcome, Option<ObservedExpiry>) {
+            retention_sweep_bucket_observed(
+                &mut SnapshotReachability::new(),
+                store,
+                &crate::clock::FixedClock::new(now_ns),
+                &CompactorConfig::default(),
+                Some(window_ns),
+                &crate::sweep::NoLeases,
+                bucket,
+            )
+            .await
+            .expect("retention pass")
+        }
+
+        assert_eq!(
+            observe(&store, &bucket, retired_at_ns + 1, window_ns).await,
+            (
+                RetentionOutcome::Tombstoned,
+                Some(ObservedExpiry::NoLaterThan(retired_at_ns))
+            ),
+            "a bucket with no rewrite keeps the nominal deadline as a bound"
+        );
+
+        let inputs = vec![ravel_proto::commit::v1::CompactionInputIdentity {
+            writer_id: uuid::Uuid::from_u128(1).to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        }];
+        let request_id = uuid::Uuid::from_u128(7).to_string();
+        let rewrite = RewriteRecord {
+            format_version: 1,
+            tenant_hash: tenant.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(signal) as i32,
+            shard: 0,
+            ingest_hour_bucket: HOUR,
+            input_set_hash: ravel_commit::erasure::compute_rewrite_input_set_hash(
+                &inputs,
+                None,
+                std::slice::from_ref(&request_id),
+            )
+            .to_vec(),
+            inputs,
+            parts: Vec::new(),
+            drops: vec![ravel_proto::commit::v1::RewriteDrop {
+                request_id,
+                dropped_count: 1,
+            }],
+            created_unix_ns: retired_at_ns - window_ns - 1,
+            superseded_record_key: String::new(),
+        };
+        store
+            .put(
+                &keys::rewrite_record_key_for(&rewrite).expect("key"),
+                ravel_commit::erasure::encode_rewrite(&rewrite),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed rewrite");
+
+        assert_eq!(
+            observe(&store, &bucket, retired_at_ns + 1, window_ns).await,
+            (
+                RetentionOutcome::Tombstoned,
+                Some(ObservedExpiry::NoLaterThanOnly(retired_at_ns))
+            ),
+            "a rewritten bucket is bounded by its tombstone alone"
+        );
     }
 }

@@ -442,6 +442,47 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The maintenance backlog metrics no longer read healthy in three cases
+  where they were not** (issue #2073). A unit whose retention and compaction
+  scan fails every tick reported no retention lag, so
+  `ravel_maintain_retention_lag_seconds` could read 0 for exactly the signal
+  whose sweep was stuck. The new gauge `ravel_maintain_units_scan_failed`
+  counts, by signal, the units whose scan failed in the same cycle the lag
+  comes from, and the units a failed provisioning check or shard-generation
+  read skipped before scanning, which no counter saw when the read failed
+  with a store error. The lag was measured from the ingest hour's nominal
+  deadline, and an event can sit up to `max_ingest_lag` before its ingest
+  hour, so a bucket read up to one hour plus `max_ingest_lag` (three hours at
+  the defaults) less lag than it had. It is now measured from the bucket's
+  newest event plus the retention window, which the pass that writes the
+  tombstone reads anyway and keeps in memory for the bucket's later passes;
+  after a restart or on another replica's bucket it falls back to the earlier
+  of the nominal deadline and the tombstone's write time, which can still
+  under-read by up to that same bound. A tombstoned bucket that holds a
+  rewrite record falls back to the tombstone's write time alone: an erasure
+  that dropped every record leaves a rewrite whose publish time stands in for
+  its newest event, and measuring that bucket from the nominal deadline
+  over-read its lag by up to the time between the hour's end and the erasure,
+  enough to fire the lag alert after a restart.
+  `ravel_maintain_bytes_reclaimed_total` left out superseded L0 data, most of
+  the bytes freed in steady state. It
+  now charges each object the superseded-input sweep deletes at the
+  `object_size` its commit, compaction or rewrite record carries, with no
+  extra request, a superseded L1 segment on the pass that deletes the record
+  naming it so a refused record delete cannot charge it twice, and its HELP
+  text says it counts object sizes, not wire bytes.
+
+- **The alerts shard sweep skips its six listings for tenants with no alert
+  objects** (issue #2134). It ran six listings per tenant on every tick,
+  including on deployments with no alert rules and under
+  `--alert-retention 0`. It now first lists the tenant's alert keyspace and
+  the quarantine copies taken from it, one bounded listing each, and skips
+  the sweep when both are empty, so such a tenant pays those two listings,
+  or three with a nonzero window, instead of six; a tenant whose alert state
+  memo was just read skips those two listings too, and a gate listing that
+  fails runs the sweep. The mass-orphan breaker's runbook log line now comes
+  from one function shared by every shard.
+
 - **A gateway starts under a small memory limit** (issue #2234).
   `ravel-server` refused to start in every mode under a cgroup memory limit of
   2 GiB or less, because the process memory budget (effective memory minus a

@@ -427,7 +427,20 @@ async fn publish_l0_segment(
     shard: u32,
     hour: u32,
     writer_seq: u64,
-) {
+) -> u64 {
+    publish_l0_segment_with_samples(store, tenant, shard, hour, writer_seq, 1).await
+}
+
+/// [`publish_l0_segment`] with `sample_count` samples, one nanosecond apart and
+/// each with its own value, so two segments can carry distinct recorded sizes.
+async fn publish_l0_segment_with_samples(
+    store: &MemoryStore,
+    tenant: &TenantId,
+    shard: u32,
+    hour: u32,
+    writer_seq: u64,
+    sample_count: i64,
+) -> u64 {
     let tenant_hash = tenant.hash();
     let writer_id = Uuid::from_u128(7);
     let created_unix_ns = i64::from(hour) * NS_PER_HOUR + 1_000_000_000;
@@ -440,10 +453,12 @@ async fn publish_l0_segment(
     let series = vec![SeriesInput {
         series_id,
         labels,
-        samples: vec![Sample {
-            ts_ns: created_unix_ns,
-            value: writer_seq as f64,
-        }],
+        samples: (0..sample_count)
+            .map(|offset| Sample {
+                ts_ns: created_unix_ns + offset,
+                value: writer_seq as f64 + offset as f64,
+            })
+            .collect(),
     }];
     let identity = SegmentIdentity {
         tenant_hash: tenant_hash.0,
@@ -487,6 +502,7 @@ async fn publish_l0_segment(
     publish::publish(store, &rec, &RetryPolicy::default())
         .await
         .expect("publish commit record");
+    rec.object_size
 }
 
 /// Issue #1729 acceptance test: the L0-pending gauge and the deleted-objects
@@ -973,8 +989,9 @@ const QUARANTINED_LEN: usize = 234;
 /// Tick 1 runs at `min_compaction_inputs = 4`, so A (3) and C (1) are both
 /// pending: the gauge reads exactly 4. Nothing is old enough to sweep yet, so
 /// every deleted and reclaimed figure reads 0. R is tombstoned, still present,
-/// and its hour's retention deadline is `(hour + 1) h + 30 d`, so the lag reads
-/// exactly 23.5 h = 84600 s.
+/// and its one event is 1 s into its hour, so it expires at `hour h + 1 s +
+/// 30 d` and the lag reads exactly 24.5 h less 1 s = 88199 s, where the hour's
+/// nominal deadline would read 23.5 h (issue #2073).
 ///
 /// Tick 2 runs 48 h later at `min_compaction_inputs = 2`. A compacts its three
 /// records; C stays below threshold. The pending gauge must drop by exactly
@@ -982,8 +999,10 @@ const QUARANTINED_LEN: usize = 234;
 /// protection horizon, so rule 2 deletes exactly its two input records and
 /// their two data objects; the part and the quarantined object are past their
 /// own gates, so rule 3 and the reaper delete exactly one each. The reclaimed
-/// bytes counter must rise by exactly `UNREFERENCED_PART_LEN + QUARANTINED_LEN`:
-/// it sums the listed sizes of those two deletions and nothing else. R's
+/// bytes counter must rise by exactly `UNREFERENCED_PART_LEN + QUARANTINED_LEN`
+/// plus the two B inputs' recorded `object_size`: the listed sizes of the two
+/// size-listed deletions and the commit records' sizes of the superseded data
+/// (issue #2073), and nothing else. R's
 /// tombstone is past its horizon, the bucket is physically swept, and no
 /// expired bucket is left present, so the lag gauge falls to 0.
 ///
@@ -1011,17 +1030,37 @@ async fn one_clocked_tick_moves_every_backlog_and_throughput_figure_by_the_exact
     let hour_r = tick_1_hour - 31 * 24;
 
     let mut writer_seq = 0u64;
+    let mut bucket_b_input_sizes = Vec::new();
     for (hour, depth) in [
         (hour_a, COMPACTING_DEPTH),
         (hour_c, RESIDENT_DEPTH),
         (hour_b, 2),
         (hour_r, 1),
     ] {
-        for _ in 0..depth {
+        for index in 0..depth {
             writer_seq += 1;
-            publish_l0_segment(store.as_ref(), &tenant, 0, hour, writer_seq).await;
+            // Bucket B's inputs carry one and 64 samples, so their recorded
+            // sizes differ and one size charged for both cannot pass.
+            let samples = if hour == hour_b && index == 1 { 64 } else { 1 };
+            let size = publish_l0_segment_with_samples(
+                store.as_ref(),
+                &tenant,
+                0,
+                hour,
+                writer_seq,
+                samples,
+            )
+            .await;
+            if hour == hour_b {
+                bucket_b_input_sizes.push(size);
+            }
         }
     }
+    assert_ne!(
+        bucket_b_input_sizes[0], bucket_b_input_sizes[1],
+        "bucket B's inputs have distinct recorded sizes"
+    );
+    let bucket_b_input_bytes: u64 = bucket_b_input_sizes.iter().sum();
 
     let bucket_b = ravel_maintain::Bucket::new(tenant_hash, Signal::Metrics, 0, hour_b);
     let offline = ravel_maintain::compact_bucket(
@@ -1162,12 +1201,14 @@ async fn one_clocked_tick_moves_every_backlog_and_throughput_figure_by_the_exact
         Some(0),
         "tick 1: nothing reclaimed"
     );
-    let deadline_r = (i64::from(hour_r) + 1) * NS_PER_HOUR + RETENTION_WINDOW_NS;
-    assert_eq!(TICK_1_NS - deadline_r, 84_600_000_000_000);
+    // R's one event is 1 s into its hour, so it expires 3599 s before the
+    // hour's nominal deadline would put it.
+    let expiry_r = i64::from(hour_r) * NS_PER_HOUR + 1_000_000_000 + RETENTION_WINDOW_NS;
+    assert_eq!(TICK_1_NS - expiry_r, 88_199_000_000_000);
     assert_eq!(
         sample_value(&body_1, LAG_LINE),
-        Some(84_600),
-        "tick 1: bucket R is tombstoned and still present, 23.5 h past its deadline"
+        Some(88_199),
+        "tick 1: bucket R is tombstoned and still present, 24.5 h less 1 s past its expiry"
     );
 
     // Tick 2.
@@ -1218,9 +1259,9 @@ async fn one_clocked_tick_moves_every_backlog_and_throughput_figure_by_the_exact
     assert_eq!(
         sample_value(&body_2, BYTES_LINE)
             .and_then(|now| now.checked_sub(sample_value(&body_1, BYTES_LINE)?)),
-        Some((UNREFERENCED_PART_LEN + QUARANTINED_LEN) as u64),
+        Some((UNREFERENCED_PART_LEN + QUARANTINED_LEN) as u64 + bucket_b_input_bytes),
         "tick 2: reclaimed bytes rise by exactly the listed sizes of the deleted part and the \
-         reaped quarantine object"
+         reaped quarantine object, plus the recorded sizes of bucket B's two superseded inputs"
     );
     assert_eq!(
         sample_value(&body_2, LAG_LINE),

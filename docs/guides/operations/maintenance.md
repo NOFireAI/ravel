@@ -468,6 +468,25 @@ swept as usual. The check reads the trailer only, not the footer checksum, so
 damage confined to the version field reads as an unreadable version and holds
 the bucket rather than sweeping it.
 
+The alerts shard is swept by the same three rules on every tick, for each
+tenant whose alert unit the process owns, whatever `--alert-retention` is: the
+alert evaluator can abandon a write under any window, and this sweep is what
+reclaims it. A full sweep of that shard costs six listings even when there is
+nothing in it, so a tenant with nothing to sweep pays two bounded listings
+instead: one of its whole alert keyspace (`t/<tenant_hash>/a/`, which holds
+every commit record, L0 data object and L1 segment the rules look at) and one
+of the quarantine copies taken from it. When both come back empty the sweep is
+skipped for that tick; when either listing fails, the sweep runs, since a failed
+listing has not shown the keyspace empty. A tenant that runs alert rules has an alert state memo
+under that keyspace, so with a nonzero `--alert-retention` the memo read already
+shows the keyspace is in use and the sweep runs without the extra listings. With
+the default 90-day window a tenant with no alert rules pays one memo GET and
+three listings per tick (the retention sweep's own check of the alert commit
+prefix, then the two above); with `--alert-retention 0`, two listings. For 1000
+such tenants on a 5-minute tick that is about 3000 LIST requests per tick on the
+default window, and 2000 under `0`, where running the sweep would cost about
+7000 and 6000.
+
 ### The two timing values
 
 - `grace`, default 24h, is the floor for the orphan and unreferenced-L1 age
