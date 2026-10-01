@@ -190,12 +190,14 @@ fn row_group_buffer_is_one_row_group_and_does_not_grow_with_the_object() {
     // A block's own pages are the same whatever the group size; the group only
     // adds the choice of a row-group string dictionary, taken when it stores
     // strictly smaller (ADR-2135 decision 6). So grouping never grows the
-    // section, and on this corpus's repeating strings it shrinks it.
+    // section, and on this corpus's repeating strings it shrinks it. Both
+    // lengths are pinned: the corpus and the writer are deterministic, so a
+    // change to either is a format-size change to look at, not noise.
     let (_, ungrouped_blocks_len, ungrouped_groups) = measure(4 * GROUP, 1);
-    assert!(
-        large_blocks_len < ungrouped_blocks_len,
-        "row groups stored {large_blocks_len} B against {ungrouped_blocks_len} B \
-         ungrouped: a row-group dictionary is taken only when it is smaller"
+    assert_eq!(
+        (large_blocks_len, ungrouped_blocks_len),
+        (1_306_629, 1_307_501),
+        "BLOCKS bytes with 32-block row groups and with one-block groups"
     );
     assert_eq!(ungrouped_groups, 4 * GROUP);
     assert_eq!(

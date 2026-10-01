@@ -1091,7 +1091,9 @@ mod proptests {
 
     /// A directory in exactly the shape the writer produces: groups covering
     /// consecutive blocks from 0, chunks in ascending column order, pages in
-    /// ascending block order with derived contiguous offsets.
+    /// ascending block order with derived contiguous offsets. A chunk drawn
+    /// with `dict` set takes the dictionary form instead: a tag 12 page first,
+    /// naming block `block_count`, then one tag 13 page per block it covers.
     fn arb_page_dir() -> impl Strategy<Value = PageDir> {
         proptest::collection::vec(
             (
@@ -1099,6 +1101,7 @@ mod proptests {
                 proptest::collection::vec(
                     (
                         0u32..40,
+                        any::<bool>(),
                         proptest::collection::vec(
                             (arb_enc(), any::<u8>(), 0u64..64, any::<u32>()),
                             1..5,
@@ -1115,22 +1118,23 @@ mod proptests {
             let mut offset = 0u64;
             for (block_count, raw_chunks) in groups {
                 // Distinct, ascending column ids.
-                let mut ids: Vec<u32> = raw_chunks.iter().map(|(c, _)| *c).collect();
+                let mut ids: Vec<u32> = raw_chunks.iter().map(|(c, _, _)| *c).collect();
                 ids.sort_unstable();
                 ids.dedup();
                 let mut chunks = Vec::new();
                 for (i, column_id) in ids.into_iter().enumerate() {
-                    let (_, raw_pages) = &raw_chunks[i];
+                    let (_, dict, raw_pages) = &raw_chunks[i];
                     // Ascending block indices inside the group, at most two per
                     // block (presence page plus value page), so a chunk never
-                    // exceeds the `2 * block_count` pages decode allows.
-                    let keep = raw_pages.len().min(2 * block_count as usize);
+                    // exceeds the `2 * block_count` pages decode allows. A
+                    // dictionary chunk holds one id page per block.
+                    let per_block = if *dict { 1 } else { 2 };
+                    let keep = raw_pages.len().min(per_block * block_count as usize);
                     let mut pages = Vec::new();
                     for (j, (enc, comp, len, crc)) in raw_pages[..keep].iter().enumerate() {
-                        let block = j as u32 / 2;
                         pages.push(PageEntry {
-                            block,
-                            enc: *enc,
+                            block: j as u32 / per_block as u32,
+                            enc: if *dict { Enc::DictIds } else { *enc },
                             comp: *comp,
                             len: *len,
                             uncomp_len: *len,
@@ -1138,6 +1142,20 @@ mod proptests {
                         });
                     }
                     pages.sort_by_key(|p| p.block);
+                    if *dict {
+                        let (_, comp, len, crc) = raw_pages[0];
+                        pages.insert(
+                            0,
+                            PageEntry {
+                                block: block_count,
+                                enc: Enc::DictPage,
+                                comp,
+                                len: len + 1,
+                                uncomp_len: len + 1,
+                                crc32c: crc.rotate_left(7),
+                            },
+                        );
+                    }
                     let total: u64 = pages.iter().map(|p| p.len).sum();
                     chunks.push(ChunkEntry {
                         column_id,
@@ -1183,6 +1201,36 @@ mod proptests {
                         at += p.len;
                     }
                     prop_assert_eq!(at, offset + len);
+                }
+            }
+        }
+
+        /// A dictionary page is never one of a block's pages, and is the one
+        /// dictionary page, at its chunk's offset, of every block its chunk
+        /// carries an id page for.
+        #[test]
+        fn dictionary_pages_belong_to_their_chunk(dir in arb_page_dir()) {
+            let dir = PageDir::decode(&dir.encode()).expect("decode");
+            for g in &dir.groups {
+                for b in g.first_block..g.first_block + g.block_count {
+                    let pages = dir.block_pages(b).expect("block pages");
+                    prop_assert!(pages.iter().all(|p| p.desc.enc != Enc::DictPage));
+                    let dicts = dir.block_dict_pages(b).expect("dict pages");
+                    let want: Vec<(u32, u64)> = g
+                        .chunks
+                        .iter()
+                        .filter(|c| {
+                            c.dict_page().is_some()
+                                && c.pages.iter().any(|p| {
+                                    p.block == b - g.first_block && p.enc == Enc::DictIds
+                                })
+                        })
+                        .map(|c| (c.column_id, c.offset))
+                        .collect();
+                    let got: Vec<(u32, u64)> =
+                        dicts.iter().map(|d| (d.desc.column_id, d.offset)).collect();
+                    prop_assert_eq!(got, want);
+                    prop_assert!(dicts.iter().all(|d| d.desc.enc == Enc::DictPage));
                 }
             }
         }

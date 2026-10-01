@@ -28,7 +28,7 @@ use crate::field_dir::FieldDir;
 use crate::footer::{LogFooter, kind};
 use crate::page_dir::PageDir;
 use crate::reader::{
-    MAX_BLOCKS, MAX_FIELDS, MAX_STREAMS, column_plans, decode_v4_block, i64_at,
+    DictCache, MAX_BLOCKS, MAX_FIELDS, MAX_STREAMS, column_plans, decode_v4_block, i64_at,
     located_block_pages, rebuild_record,
 };
 use crate::record::{COL_STREAM_REF, COL_TS, LogRecord};
@@ -231,6 +231,7 @@ impl RlogRangeReader {
         base: u64,
         bytes: &[u8],
         plans: &[crate::block::ColumnPlan],
+        dicts: &mut DictCache,
     ) -> Result<DecodedBlock, LogSegError> {
         let entry = self
             .skip
@@ -239,7 +240,8 @@ impl RlogRangeReader {
             .ok_or_else(|| LogSegError::Corrupted("skip block index out of range".into()))?;
         let index =
             u32::try_from(block).map_err(|_| LogSegError::Corrupted("block index range".into()))?;
-        let (pages, dict_pages) = located_block_pages(&self.page_dir, self.blocks_offset, index)?;
+        let (pages, dict_pages) =
+            located_block_pages(&self.page_dir, self.blocks_offset, index, dicts)?;
         decode_v4_block(
             bytes,
             base,
@@ -247,6 +249,7 @@ impl RlogRangeReader {
             entry.block_crc32c,
             &pages,
             &dict_pages,
+            dicts,
             plans,
             None,
         )
@@ -305,8 +308,9 @@ impl RlogRangeReader {
         }
         let plans = column_plans(&self.field_dir);
         let mut out = Vec::new();
+        let mut dicts = DictCache::default();
         for &b in &span.blocks {
-            let decoded = self.decode_one_block(b, span.start, span_bytes, &plans)?;
+            let decoded = self.decode_one_block(b, span.start, span_bytes, &plans, &mut dicts)?;
             self.push_stream_rows(&decoded, span.stream_ref, &mut out)?;
         }
         Ok(out)
@@ -446,8 +450,9 @@ impl RlogRangeReader {
     ) -> Result<Vec<LogRecord>, LogSegError> {
         let plans = self.check_loc_bytes(loc, block_bytes)?;
         let mut out = Vec::new();
+        let mut dicts = DictCache::default();
         for &b in &loc.blocks {
-            let decoded = self.decode_one_block(b, loc.start, block_bytes, &plans)?;
+            let decoded = self.decode_one_block(b, loc.start, block_bytes, &plans, &mut dicts)?;
             self.push_stream_rows(&decoded, loc.stream_ref, &mut out)?;
         }
         Ok(out)
@@ -480,7 +485,13 @@ impl RlogRangeReader {
                 "block index is not in this loc".into(),
             ));
         }
-        let decoded = self.decode_one_block(block, loc.start, group_bytes, &plans)?;
+        let decoded = self.decode_one_block(
+            block,
+            loc.start,
+            group_bytes,
+            &plans,
+            &mut DictCache::default(),
+        )?;
         let mut out = Vec::new();
         self.push_stream_rows(&decoded, loc.stream_ref, &mut out)?;
         Ok(out)
@@ -514,7 +525,13 @@ impl RlogRangeReader {
                 "block index is not in this loc".into(),
             ));
         }
-        let decoded = self.decode_one_block(block, loc.start, group_bytes, &plans)?;
+        let decoded = self.decode_one_block(
+            block,
+            loc.start,
+            group_bytes,
+            &plans,
+            &mut DictCache::default(),
+        )?;
         StreamBlockRows::new(self, decoded, loc.stream_ref)
     }
 
@@ -853,6 +870,51 @@ mod tests {
 
     fn slice(object: &[u8], start: u64, end: u64) -> Vec<u8> {
         object[start as usize..end as usize].to_vec()
+    }
+
+    /// `decode_stream` over a whole span and `decode_block` over each row
+    /// group's loc decode each dictionary page once per chunk, not once per
+    /// block, and both return every record in order.
+    ///
+    /// Wrong implementations this rules out, each shown failing: no cache (a
+    /// decode per block); a cache cleared before every block; a cache keyed by
+    /// column id alone (the second group reads the first group's dictionary).
+    #[test]
+    fn ranged_decodes_each_dictionary_page_once_per_chunk() {
+        use crate::reader::dict_fixture::{STREAM, dictionary_reads, two_group_object};
+        use crate::reader::dict_page_decodes;
+        let (records, object) = two_group_object();
+        let (dict_pages, per_block) = dictionary_reads(&object);
+        assert!(per_block > dict_pages, "{per_block} vs {dict_pages}");
+        let reader = reader_of(&object);
+
+        let span = reader
+            .stream_block_span(&STREAM)
+            .expect("span")
+            .expect("stream present");
+        let before = dict_page_decodes();
+        let rows = reader
+            .decode_stream(&span, &slice(&object, span.start(), span.end()))
+            .expect("decode_stream");
+        assert_eq!(dict_page_decodes() - before, dict_pages);
+        assert_eq!(rows, records);
+
+        let locs = reader
+            .stream_blocks(&STREAM)
+            .expect("locs")
+            .expect("stream present");
+        assert_eq!(locs.len(), 2);
+        let before = dict_page_decodes();
+        let mut rows = Vec::new();
+        for loc in &locs {
+            rows.extend(
+                reader
+                    .decode_block(loc, &slice(&object, loc.start(), loc.end()))
+                    .expect("decode_block"),
+            );
+        }
+        assert_eq!(dict_page_decodes() - before, dict_pages);
+        assert_eq!(rows, records);
     }
 
     /// Decoding a version-4 object one block at a time out of its row group's
