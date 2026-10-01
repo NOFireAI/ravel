@@ -16,26 +16,30 @@ use std::time::Duration;
 use bytes::Bytes;
 use datafusion::arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::util::display::array_value_to_string;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_memory::MemoryBudget;
-use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+use ravel_object_store::external::probe::{PreconditionProbeFailure, RavelBucketProbeFailure};
+use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
 use ravel_object_store::instrument::{InstrumentedStore, StoreOp};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, PutOptions, PutOutcome, StoreError,
 };
+use ravel_parquet::snapshot::SnapshotError;
 use ravel_pqtable::clock::{Clock, FixedClock};
 use ravel_pqtable::grants::{self, GrantsError};
 use ravel_pqtable::writer::WriteError;
 use ravel_query::{GetLimiter, LogSegmentFetcher, SegmentFetcher};
 use ravel_sql::{
     DEFAULT_PARQUET_METADATA_CACHE_BYTES, DdlExecuteError, DdlOutcome, ExternalStoreMap,
-    ParquetSources, SpanSegmentFetcher, SqlConfig, SqlExecutor,
+    ParquetSources, SpanSegmentFetcher, SqlConfig, SqlExecutor, SqlOutcome,
 };
 use ravel_types::{TenantHash, TenantId};
+use util::request;
 
 const PROFILE: &str = "lake";
 const GRANT: &str = "s3://lake/t";
@@ -148,6 +152,27 @@ impl Lake {
         .await
         .expect("grant");
     }
+
+    async fn query(&self, tenant: TenantHash, sql: &str) -> SqlOutcome {
+        self.executor
+            .execute(tenant, &request(sql))
+            .await
+            .expect("select")
+    }
+}
+
+/// Every row of `outcome`, each rendered as `v|v|...`, in result order.
+fn rows(outcome: &SqlOutcome) -> Vec<String> {
+    let mut out = Vec::new();
+    for batch in outcome.output.batches() {
+        for row in 0..batch.num_rows() {
+            let cells: Vec<String> = (0..batch.num_columns())
+                .map(|column| array_value_to_string(batch.column(column), row).expect("cell"))
+                .collect();
+            out.push(cells.join("|"));
+        }
+    }
+    out
 }
 
 #[tokio::test]
@@ -189,6 +214,11 @@ async fn create_external_table_then_read_back() {
     let grants = grants::list(lake.ravel.inner(), &t).await.expect("list");
     assert_eq!(grants.len(), 1);
     assert_eq!(grants[0].profile, PROFILE);
+
+    let select = lake
+        .query(t, "SELECT id, name, score FROM hits ORDER BY id")
+        .await;
+    assert_eq!(rows(&select), vec!["1|a|0.5", "2|b|1.5"]);
 }
 
 #[tokio::test]
@@ -271,6 +301,17 @@ async fn plain_create_on_existing_table_is_table_exists() {
     assert!(
         matches!(err, DdlExecuteError::Write(WriteError::TableExists { ref table }) if table == "hits"),
         "{err:?}"
+    );
+
+    let tables = ravel_pqtable::resolve::tables(lake.ravel.inner(), &t)
+        .await
+        .expect("tables");
+    assert_eq!(
+        tables
+            .get("hits")
+            .and_then(|versions| versions.last().copied()),
+        Some(1),
+        "a refused plain CREATE must not advance the manifest version"
     );
 }
 
@@ -425,6 +466,14 @@ async fn drop_without_if_exists_on_a_missing_table_is_table_not_found() {
         matches!(err, DdlExecuteError::Write(WriteError::TableNotFound { ref table }) if table == "ghost"),
         "{err:?}"
     );
+
+    let tables = ravel_pqtable::resolve::tables(lake.ravel.inner(), &t)
+        .await
+        .expect("tables");
+    assert!(
+        tables.is_empty(),
+        "no manifest may exist for a missing table"
+    );
 }
 
 #[tokio::test]
@@ -449,6 +498,14 @@ async fn tenant_isolation_a_grant_on_one_tenant_does_not_admit_another() {
             DdlExecuteError::Location(GrantsError::LocationNotGranted { .. })
         ),
         "{err:?}"
+    );
+
+    let tables = ravel_pqtable::resolve::tables(lake.ravel.inner(), &stranger)
+        .await
+        .expect("tables");
+    assert!(
+        tables.is_empty(),
+        "no manifest may be written for the refused tenant"
     );
 }
 
@@ -512,8 +569,22 @@ async fn ravel_bucket_location_is_refused() {
         .expect_err("a location inside Ravel's own bucket must be refused");
 
     assert!(
-        matches!(err, DdlExecuteError::RavelBucketProbe { .. }),
+        matches!(
+            err,
+            DdlExecuteError::RavelBucketProbe {
+                source: RavelBucketProbeFailure::SameBucket { .. },
+                ..
+            }
+        ),
         "{err:?}"
+    );
+
+    let tables = ravel_pqtable::resolve::tables(ravel.inner(), &t)
+        .await
+        .expect("tables");
+    assert!(
+        tables.is_empty(),
+        "no manifest may be written for a location inside Ravel's own bucket"
     );
 }
 
@@ -537,6 +608,14 @@ async fn folder_marker_object_is_not_treated_as_the_probe_object() {
     assert!(
         matches!(err, DdlExecuteError::ProbeObjectEmpty { .. }),
         "{err:?}"
+    );
+
+    let tables = ravel_pqtable::resolve::tables(lake.ravel.inner(), &t)
+        .await
+        .expect("tables");
+    assert!(
+        tables.is_empty(),
+        "no manifest may be written when the probe object is a folder marker"
     );
 }
 
@@ -566,6 +645,14 @@ async fn sibling_directory_sharing_the_same_string_prefix_is_not_a_match() {
         matches!(err, DdlExecuteError::ProbeObjectEmpty { .. }),
         "{err:?}"
     );
+
+    let tables = ravel_pqtable::resolve::tables(lake.ravel.inner(), &t)
+        .await
+        .expect("tables");
+    assert!(
+        tables.is_empty(),
+        "no manifest may be written when the probe object is a sibling directory's file"
+    );
 }
 
 #[tokio::test]
@@ -589,6 +676,14 @@ async fn zero_byte_object_under_the_location_is_not_treated_as_a_match() {
         matches!(err, DdlExecuteError::ProbeObjectEmpty { .. }),
         "{err:?}"
     );
+
+    let tables = ravel_pqtable::resolve::tables(lake.ravel.inner(), &t)
+        .await
+        .expect("tables");
+    assert!(
+        tables.is_empty(),
+        "no manifest may be written when the probe object is zero bytes"
+    );
 }
 
 #[tokio::test]
@@ -601,7 +696,8 @@ async fn precondition_probe_failure_is_refused_before_any_manifest_write() {
     let plan = FaultPlan::empty().with_rule(
         Rule::new(Op::Get, ScriptedFault::FailedPrecondition).with_key_contains("hits/0.parquet"),
     );
-    let lake = Arc::new(FaultStore::new(MemoryStore::new(), plan)) as Arc<dyn ObjectStoreBackend>;
+    let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+    let lake = Arc::clone(&fault_store) as Arc<dyn ObjectStoreBackend>;
     lake.put(
         "t/hits/0.parquet",
         parquet_bytes(&[1], &["a"], &[0.5]),
@@ -622,8 +718,19 @@ async fn precondition_probe_failure_is_refused_before_any_manifest_write() {
         .expect_err("a store that refuses a matching pin must be refused");
 
     assert!(
-        matches!(err, DdlExecuteError::PreconditionProbe { .. }),
+        matches!(
+            err,
+            DdlExecuteError::PreconditionProbe {
+                source: PreconditionProbeFailure::MatchingPinRefused { .. },
+                ..
+            }
+        ),
         "{err:?}"
+    );
+    assert_eq!(
+        fault_store.fault_count(Op::Get, FaultKind::FailedPrecondition),
+        1,
+        "the scripted precondition fault must have fired exactly once"
     );
 
     let grants = grants::list(fixture.ravel.inner(), &t).await.expect("list");
@@ -631,6 +738,14 @@ async fn precondition_probe_failure_is_refused_before_any_manifest_write() {
         grants.len(),
         1,
         "the grant must still be the only record written"
+    );
+
+    let tables = ravel_pqtable::resolve::tables(fixture.ravel.inner(), &t)
+        .await
+        .expect("tables");
+    assert!(
+        tables.is_empty(),
+        "no manifest may be written when the precondition probe is refused"
     );
 }
 
@@ -688,7 +803,24 @@ async fn memory_budget_refusal_leaves_no_manifest() {
         .await
         .expect_err("a 1-byte process memory budget cannot decode this file's footer");
 
-    assert!(matches!(err, DdlExecuteError::Snapshot { .. }), "{err:?}");
+    assert!(
+        matches!(
+            err,
+            DdlExecuteError::Snapshot {
+                source: SnapshotError::MemoryExhausted { .. },
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+
+    let tables = ravel_pqtable::resolve::tables(fixture.ravel.inner(), &t)
+        .await
+        .expect("tables");
+    assert!(
+        tables.is_empty(),
+        "no manifest may be written when the memory budget refuses the footer read"
+    );
 }
 
 /// A store double that advances a shared [`FixedClock`] the first time its
