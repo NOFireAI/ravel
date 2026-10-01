@@ -248,6 +248,77 @@ async fn create_external_table_then_read_back() {
 }
 
 #[tokio::test]
+async fn create_external_table_over_a_single_object_location_then_read_back() {
+    // A LOCATION naming one object directly (no trailing slash) takes
+    // `one_object_under`'s HEAD path, not the directory-listing path: it
+    // must still succeed and the table must still read back.
+    let lake = Lake::memory_store();
+    let t = tenant("acme");
+    lake.grant(&t).await;
+    lake.put_file(
+        "t/hits/0.parquet",
+        parquet_bytes(&[1, 2], &["a", "b"], &[0.5, 1.5]),
+    )
+    .await;
+
+    let outcome = lake
+        .executor
+        .execute_ddl(
+            t,
+            &format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/0.parquet'"),
+            CREATED_BY,
+            deadline(),
+        )
+        .await
+        .expect("create over a single-object location");
+
+    match outcome {
+        DdlOutcome::Created {
+            table,
+            version,
+            files,
+            ..
+        } => {
+            assert_eq!(table, "hits");
+            assert_eq!(version, 1);
+            assert_eq!(files, 1);
+        }
+        other => panic!("expected Created, got {other:?}"),
+    }
+
+    let select = lake
+        .query(t, "SELECT id, name, score FROM hits ORDER BY id")
+        .await;
+    assert_eq!(rows(&select), vec!["1|a|0.5", "2|b|1.5"]);
+}
+
+#[tokio::test]
+async fn create_external_table_over_a_zero_byte_single_object_is_refused() {
+    // The HEAD path's own emptiness check (`one_object_under`, ddl.rs): a
+    // zero-byte object at the named key is not a snapshot-able Parquet file.
+    let lake = Lake::memory_store();
+    let t = tenant("acme");
+    lake.grant(&t).await;
+    lake.put_file("t/hits/0.parquet", Bytes::new()).await;
+
+    let err = lake
+        .executor
+        .execute_ddl(
+            t,
+            &format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/0.parquet'"),
+            CREATED_BY,
+            deadline(),
+        )
+        .await
+        .expect_err("a zero-byte single object must be refused");
+
+    assert!(
+        matches!(err, DdlExecuteError::ProbeObjectEmpty { ref location } if location == &format!("{GRANT}/hits/0.parquet")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
 async fn ravel_cast_naming_a_column_absent_from_the_snapshot_schema_is_refused() {
     // `validate_ddl` admits `ravel.cast.<column>` for any column name that
     // passes the charset rule; it has no schema to check the column against.
