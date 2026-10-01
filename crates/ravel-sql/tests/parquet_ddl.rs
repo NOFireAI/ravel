@@ -823,11 +823,14 @@ async fn memory_budget_refusal_leaves_no_manifest() {
     );
 }
 
-/// A store double that advances a shared [`FixedClock`] the first time its
-/// `list` is called, then leaves the clock alone on every later call.
+/// A store double that advances a shared [`FixedClock`] the second time its
+/// `list` is called, then leaves the clock alone on every other call.
 /// Standing in for a manifest-prefix LIST slow enough to burn
 /// `writer::apply`'s resolve-to-put budget, without an actual wall-clock
-/// sleep. Every other method delegates to `inner` unchanged.
+/// sleep. The first `list` call is `execute_ddl`'s own existence check
+/// (`resolve::newest`, before `writer::apply` is ever entered); the second is
+/// `apply`'s own initial resolve, which is the LIST whose slowness this double
+/// models. Every other method delegates to `inner` unchanged.
 struct ListAdvancingStore {
     inner: Arc<dyn ObjectStoreBackend>,
     clock: FixedClock,
@@ -872,8 +875,8 @@ impl ObjectStoreBackend for ListAdvancingStore {
     }
 
     async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
-        self.list_calls.fetch_add(1, Ordering::SeqCst);
-        if !self.advanced.swap(true, Ordering::SeqCst) {
+        let call = self.list_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == 2 && !self.advanced.swap(true, Ordering::SeqCst) {
             self.clock.advance(self.advance_once_ns);
         }
         self.inner.list(prefix, page).await
@@ -899,7 +902,10 @@ impl ObjectStoreBackend for ListAdvancingStore {
 /// re-resolves instead of putting a manifest against a listing that may
 /// already be stale. [`ListAdvancingStore`] stands in for a resolve whose
 /// LIST took that long, by advancing the executor's own injected clock
-/// immediately after the first LIST returns.
+/// immediately after `apply`'s own first LIST returns (the second LIST
+/// against Ravel's store in the whole statement -- the first is
+/// `execute_ddl`'s existence check, which runs before `apply` is ever
+/// entered and must not be mistaken for the slow resolve).
 ///
 /// Before this fix, `execute_ddl` built its own `FixedClock::new(now_ns)`
 /// internally on every call and never read the clock installed through
@@ -907,9 +913,12 @@ impl ObjectStoreBackend for ListAdvancingStore {
 /// `writer::apply` never advances between the resolve and the
 /// remaining-budget check, so `remaining_ns` always computes to the full
 /// budget and `apply` never re-resolves: this store double would see exactly
-/// one `list` call before the put committed. `with_clock` existing and being
-/// threaded into `writer::apply` is what makes `list_calls() == 2` below
-/// observable at all.
+/// one `list` call from `apply` before the put committed (two overall,
+/// counting the existence check). `with_clock` existing and being threaded
+/// into `writer::apply` is what makes `list_calls() == 3` below observable
+/// at all: the existence check's LIST, `apply`'s first resolve (the one the
+/// advance lands inside), and the forced re-resolve the exhausted budget
+/// triggers.
 #[tokio::test]
 async fn exhausted_resolve_to_put_budget_forces_a_second_resolve() {
     let t = tenant("acme");
@@ -986,8 +995,10 @@ async fn exhausted_resolve_to_put_budget_forces_a_second_resolve() {
 
     assert_eq!(
         listing.list_calls(),
-        2,
-        "a budget exhausted between the first resolve and the put must force exactly one re-resolve"
+        3,
+        "expected the existence check's LIST, apply's first resolve, and the \
+         forced re-resolve a budget exhausted between resolve and put must \
+         trigger"
     );
 }
 
