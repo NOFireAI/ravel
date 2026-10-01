@@ -938,7 +938,9 @@ impl DecodedBlock {
     /// decode-time column-filtering measurement. Summed from each
     /// [`PageDesc::len`], so it counts stored (post-compression) bytes, the same
     /// units the block's payload occupies -- decode-time accounting, not wire
-    /// bytes.
+    /// bytes. A row-group dictionary page (tag 12) is counted in every block
+    /// that reads through it, so a sum over a group's blocks adds each
+    /// dictionary page once per block of its chunk, not once per fetch.
     pub fn page_bytes_fetched(&self) -> u64 {
         self.page_bytes_fetched
     }

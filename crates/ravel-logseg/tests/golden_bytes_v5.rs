@@ -148,9 +148,10 @@ fn matches_golden_fixture() {
     // fully present column contributes its value page, a partially present one
     // its presence bitmap page as well. Both shapes occur in this fixture, which
     // is why a chunk's page_count is not the count of blocks carrying the
-    // column. A one-block group never takes a row-group dictionary (ADR-2135
-    // decision 6): the dictionary page holds what the block's own dictionary
-    // page holds, plus a PAGE_DIR entry of its own, so it cannot be smaller.
+    // column. No chunk here takes a row-group dictionary (ADR-2135 decision
+    // 6): every page is under the compression floor, and uncompressed a
+    // one-block dictionary form holds the block's tag 7 bytes less its width
+    // byte plus a second PAGE_DIR entry, so it cannot be smaller.
     assert!(
         dir.groups[0].chunks.iter().all(|c| c.pages.len() <= 2),
         "a one-block group's column chunks are a value page and at most a \
