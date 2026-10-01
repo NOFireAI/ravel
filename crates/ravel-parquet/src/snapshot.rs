@@ -1585,6 +1585,44 @@ mod tests {
         assert_eq!(spent.scan, Default::default());
     }
 
+    /// A budget that holds exactly the first footer read's reservation plus
+    /// one byte less than the second read needs refuses the second read:
+    /// the first GET's `FOOTER_PREFETCH`-byte reservation is still held when
+    /// the second is requested, not released as soon as its own GET
+    /// returns. Mutation that fails it: dropping (or releasing early) the
+    /// tail reservation once the first GET completes, which would leave the
+    /// whole budget free for the second read's smaller request.
+    #[tokio::test]
+    async fn a_long_footers_second_get_is_refused_when_the_first_reservation_is_still_held() {
+        let store = Scripted::default();
+        let bytes = wide_parquet_bytes(1500);
+        let footer_len = footer_len_of(&bytes);
+        let size = bytes.len() as u64;
+        let tail_start = size - FOOTER_PREFETCH;
+        let footer_start = size - u64::from(footer_len) - TRAILER_LEN;
+        let before_len = tail_start - footer_start;
+        put(&store, "data/wide.parquet", bytes).await;
+        let limiter = GetLimiter::new(4).expect("permits");
+        let memory = Arc::new(MemoryBudget::new(FOOTER_PREFETCH + before_len - 1));
+        let accounting = PhaseAccounting::new();
+        match snapshot_location(
+            &store,
+            &location("s3://lake/data/"),
+            &limiter,
+            &memory,
+            DEADLINE,
+            &accounting,
+        )
+        .await
+        {
+            Err(SnapshotError::MemoryExhausted { key, requested, .. }) => {
+                assert_eq!(key, "data/wide.parquet");
+                assert_eq!(requested, before_len);
+            }
+            other => panic!("expected MemoryExhausted, got {other:?}"),
+        }
+    }
+
     /// The long footer's second GET has already read this object once, at
     /// the tail read above; a `NotFound` there means the object changed
     /// since, not that it was never there. Mutation that fails it: reporting
