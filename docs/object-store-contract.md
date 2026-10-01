@@ -450,20 +450,24 @@ expiration, SSE/KMS headers.
 
 `multipart` is not in `Capabilities::mandatory()`;
 `required_capabilities(Mode::Maintain)` adds it, and no other mode requires it.
-That gate is **forward-looking**, not a description of current behavior: today
-`ravel-maintain` writes its compaction outputs as single-PUT content-addressed
-objects (`crates/ravel-maintain/src/build.rs`, a module of the crate and not a
-cargo build script, is where that `put` is issued), and no production
-caller invokes `put_multipart` yet. The maintain-mode requirement stands so
-that once compaction does stream large L1/L2 segments as multipart uploads, the
-backend is already known to serve the create/upload-part/complete/abort
-sequence rather than discovering the gap at runtime. `MemoryStore` and
-`S3Store` both report `multipart: true` and implement the sequence, so
-`--mode maintain` starts against the memory oracle and against any
-S3-compatible endpoint whether or not any caller exercises the path yet.
-(`S3Store::put` does take an internal multipart path above its threshold, but
-that is a size-driven implementation detail of `put`, not a caller reaching for
-`put_multipart`; see "When `put()` uses it" below.)
+Today `ravel-maintain` writes its compaction outputs as single-PUT
+content-addressed objects (`crates/ravel-maintain/src/build.rs`, a module of
+the crate and not a cargo build script, is where that `put` is issued). The
+explicit `put_multipart` path itself is exercised end-to-end regardless of
+who calls it: `ClassedStore` schedules each part by its handle's class
+permit like any other op
+(`scheduling::tests::a_multipart_part_waits_for_a_permit_of_its_class`), and
+`s3::tests::multipart_parts_carry_checksums_under_integrity` proves every
+part carries a server-verified checksum, not only the first, under
+`upload_integrity`. The maintain-mode requirement stands so that compaction
+can stream large L1/L2 segments as multipart uploads once it is written to
+use them; `MemoryStore` and `S3Store` both report `multipart: true` and
+implement the sequence, so `--mode maintain` starts against the memory
+oracle and against any S3-compatible endpoint regardless of whether a
+caller exercises the path. (`S3Store::put` does take an internal multipart
+path above its threshold, but that is a size-driven implementation detail of
+`put`, not a caller reaching for `put_multipart`; see "When `put()` uses it"
+below.)
 
 ### Multipart upload
 
@@ -584,12 +588,20 @@ selects, which this path already sends whenever integrity is on, because the
 algorithm is set for the whole client: `object_store` 0.14.1's
 `create_multipart` sends `x-amz-checksum-algorithm`, and each `put_part` goes
 through `PutRequest::with_payload`, which attaches that part's
-`x-amz-checksum-crc64nvme` or `x-amz-checksum-sha256`. It sends no
-`x-amz-checksum-type`, so what the endpoint records for the completed object
-is its default type for the algorithm (on AWS, a full-object checksum for
-CRC64-NVME and a composite one for SHA-256). `put()` does not route large
-overwrites here under integrity yet (see "Upload checksums"), pending a
-real-endpoint check that the endpoint verifies the part checksums.
+`x-amz-checksum-crc64nvme` or `x-amz-checksum-sha256` --- proven on the wire,
+part by part (not only the first), by
+`s3::tests::multipart_parts_carry_checksums_under_integrity` against a fake
+endpoint. Whether `CompleteMultipartUpload`'s body then carries a per-part
+checksum is not this client's choice: `object_store` reads each part's
+checksum off `UploadPart`'s *response* headers, not off what it sent, so the
+Complete body carries one only when the endpoint's `UploadPart` response
+echoes the same header back; the same test confirms this against a fake
+endpoint that does. It sends no `x-amz-checksum-type`, so what the endpoint
+records for the completed object is its default type for the algorithm (on
+AWS, a full-object checksum for CRC64-NVME and a composite one for
+SHA-256). `put()` does not route large overwrites here under integrity yet
+(see "Upload checksums"): sending the part checksums is now proven, but
+server-side verification of them still waits on a real-endpoint check.
 A mismatch fails that
 `put_part` with `Corrupted`, does not count as a part, and leaves the upload
 open, so the caller may re-send the same bytes with a correct checksum. There
