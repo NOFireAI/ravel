@@ -144,6 +144,14 @@ What the codebase already guarantees, which bounds the change:
    generation amendment below). Audit and alert RLOG writers never take a
    key.
 
+   stored with it. Clearing a key keeps the config record's field 13 present
+   with the incremented generation and an empty column list, so generation 0
+   means only "never set", and a clear outranks every earlier key in
+   compaction exactly as a new key would. An object written after a clear
+   carries no sort descriptor and that nonzero generation, because the footer
+   decoder refuses a descriptor with no key columns (see the #2145
+   amendment). Audit and alert RLOG writers never take a key.
+
 2. **Every v5 object records its sort order, and compaction merges on it.**
    The v5 footer records the object's sort descriptor (bucket width and key
    columns, or none) and the clustering generation it was written under (0
@@ -253,7 +261,9 @@ What the codebase already guarantees, which bounds the change:
    descriptor from (see the #2143 amendment).
 
 6. **String dictionaries are shared across a row group.** For a string column
-   whose distinct values in a row group are at most half its values, the
+   whose distinct values in a row group are at most half its values, and
+   whose chunk then stores strictly smaller that way than on per-block value
+   pages (see the #2145 amendment), the
    column chunk starts with one dictionary page, and each block's page holds
    only bit-packed ids into it (new tags 12, dictionary page, and 13,
    dictionary ids). The dictionary page belongs to the chunk, not to a
@@ -270,8 +280,12 @@ What the codebase already guarantees, which bounds the change:
    page that breaks those rules, or a second dictionary page in one chunk,
    is still `Corrupted`. The ranged fetch plans pages by surviving block, and
    the dictionary page belongs to none, so both the projected page ranges
-   and `read_block_columns` add the dictionary page's extent for every kept
-   chunk that has one, whichever of its blocks survive. Both writer paths build
+   and the block decode (`decode_v4_block_with`, which reads pages through
+   `read_block_pages_with_dicts`) take the dictionary page for every kept
+   chunk that has one, whichever of its blocks survive. A scan, and a ranged
+   decode of a stream span or a row group, verifies and decodes each
+   dictionary page once and shares it among the chunk's blocks it reads
+   (see the #2145 amendment). Both writer paths build
    the row-group dictionary the same way. Every object of the measured
    corpus is a single row group, so the -5.5% measured for one dictionary
    per object is the row-group figure there, and an upper bound for
@@ -518,3 +532,56 @@ declared column set.
   and write back with `TenantConfig::write_if_unchanged` against the version
   they read, so a record another writer changed in between refuses the
   command with `CasConflict` instead of being overwritten.
+
+## Amendment (2026-10-01): a cleared key in the object footer, the block decode seam, and the dictionary choice (issue #2145)
+
+<!-- amendment-applies: sections="Decision" pointer="#2145 amendment" -->
+<!-- amendment-supersedes: phrase="read_block_columns" pointer="#2145 amendment" -->
+<!-- amendment-supersedes: phrase="Clearing a key keeps the field present" pointer="#2145 amendment" -->
+
+Three statements in the Decision did not match the implementation, and
+decisions 1 and 6 now carry the corrected text in place:
+
+- **A cleared key.** Decision 1 said clearing a key keeps "the field" present
+  with an empty column list. That holds for the tenant config record, whose
+  field 13 keeps the incremented generation and no columns. It does not hold
+  for an RLOG object: the footer decoder refuses a sort descriptor with no key
+  columns ("0 key columns, not 1..=4"), so an object written after a clear
+  carries no descriptor and the clear's nonzero generation, and generation 0
+  in a footer still means the tenant never set a key.
+- **The block decode seam.** Decision 6 named `read_block_columns` as the
+  subset decode that takes a kept chunk's dictionary page. No function of
+  that name exists. The seam is `decode_v4_block_with`, which reads the wanted
+  columns' pages, dictionary pages included, through
+  `read_block_pages_with_dicts`. A scan and a ranged decode of a stream span
+  or a row group keep each dictionary they decode for the rest of its row
+  group, so each dictionary page is crc-checked and decoded once per chunk
+  rather than once per block; only a successful decode is kept, so a corrupt
+  dictionary still fails every block of its chunk. Scan statistics still
+  charge the page to every block that reads it, and the compaction path
+  decodes it per block.
+- **The dictionary choice.** Decision 6 read as if every string chunk with at
+  most half as many distinct values as values is stored on a dictionary. That
+  is the condition for trying one. The writer then compares the dictionary
+  form's stored bytes, PAGE_DIR entries included, with the per-block value
+  pages and keeps the dictionary only when it is strictly smaller, as
+  decision 4 does for every page.
+
+The decisions landed in these pull requests:
+
+- Decisions 2, 5 and 7 (the RLOG v5 object: footer sort descriptor and
+  clustering generation, BLOOM covered columns and exact sizing): #2173.
+- Decision 7 (the tenant config record version 3 reader): #2162.
+- Decisions 3 and 4 (GCD and column-reference codecs, encoding chosen by
+  stored size): #2211.
+- Decisions 1 and 5 (the writer's clustering key sort and bloom scope):
+  #2231; the ingest flush writing them from tenant config: #2252.
+- Decision 6 (row-group dictionaries): #2261.
+- Decision 7 (the opted-in setters, see the rollout opt-in amendment): #2262.
+- Decisions 4 and 7 (the loader's zstd level, the clustering key and bloom
+  scope show commands): #2274.
+- Decisions 2, 4 and 5 (compaction on the descriptor, its zstd level and
+  bloom scope): #2276.
+
+No pull request yet adds the CLI commands that set a clustering key or a
+bloom scope (issue #2146), so the status stays Proposed.

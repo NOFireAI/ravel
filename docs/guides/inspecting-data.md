@@ -211,6 +211,8 @@ stream_count: 2
 level: 0
 input_set_hash: 
 part_index: 0
+sort_descriptor: none
+clustering_generation: 0
 sections:
   kind=1 name=STREAM_DIR offset=0 len=64 comp=zstd uncompressed_len=96
   kind=2 name=FIELD_DIR offset=64 len=30 comp=zstd uncompressed_len=21
@@ -230,12 +232,16 @@ stream_dir (2 entry(ies)):
 field_dir (2 entry(ies)):
   column_id=10 name=code type=i64 present_blocks=2 null_count=0
   column_id=11 name=svc type=str present_blocks=2 null_count=0
+bloom_coverage (3 column(s)):
+  column_id=4 name=severity_text kind=fixed
+  column_id=5 name=body kind=fixed
+  column_id=11 name=svc kind=str
 ```
 
 Field by field:
 
 - `total_size`, `version`, `signal`: the byte length of the object, the
-  trailer format version (`4`; the reader accepts exactly this one version,
+  trailer format version (`5`; the reader accepts exactly this one version,
   and anything else gets a typed error), and the signal byte (`2` = logs). Like
   RSEG, the object is footer-first-readable. The 16-byte trailer at the end
   gives the footer's length and crc. A reader therefore validates the footer
@@ -253,6 +259,12 @@ Field by field:
   the same convention that RSEG uses. An L0 flush object (every object shown in
   this guide) stamps the sentinels `level=0`, empty `input_set_hash`, and
   `part_index=0`. An L1 compacted object carries real values.
+- `sort_descriptor`, `clustering_generation`: the clustering key the object's
+  records were sorted by and the tenant clustering generation it
+  was written under. `none` means the default order, each stream's records by
+  `ts`; with generation `0` the tenant never set a key, and with a nonzero
+  generation the key was cleared. A clustered object prints `sort_descriptor: bucket_width=6h key_columns=2`
+  followed by one `key[i] name=... type=...` line per key column.
 - `sections`: the mandatory sections and their byte ranges. `kind=1`
   `STREAM_DIR` (stream_id to canonical resource+scope blob and block range),
   `kind=2` `FIELD_DIR` (dynamic attribute columns), `kind=3` `BLOCKS` (the
@@ -303,12 +315,20 @@ Field by field:
   `name`, `type`, `present_blocks` (blocks with at least one value), and the
   object-wide `null_count`. A key seen with two value types appears as two
   entries (per-type splitting).
+- `bloom_coverage`: the columns BLOOM's filters cover, named through
+  FIELD_DIR (`kind=fixed` for the fixed columns, otherwise the attribute
+  column's type). The default scope covers `body`, `severity_text`, and every
+  string attribute column; a word or equality predicate on a column the list
+  omits is never bloom-pruned.
 
-A corrupt object never half-prints. The footer open protocol and every
-section decode return a typed `Corrupted` error with a non-zero exit. A
-corrupt SKIP_IDX in particular is loud, not a degrade, because its
-level-0 entries are the only source of block byte ranges and per-block
-checksums.
+A corrupt object never inspects as a success. The footer open protocol and
+every section decode return a typed `Corrupted` error with a non-zero exit;
+the lines printed before the failing section stay on stdout. A corrupt
+SKIP_IDX in particular is loud, not a degrade, because its level-0 entries
+are the only source of block byte ranges and per-block checksums. BLOOM is
+read with its whole-section crc verified, so a damaged BLOOM fails `rlog
+inspect` even though a query scan over the same object at worst prunes fewer
+blocks and still answers exactly.
 
 ## `rlog footprint`: where a log segment's bytes go
 

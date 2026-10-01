@@ -3497,8 +3497,10 @@ Two consequences an operator and a plan reader both see:
 
 - **The scan declares no output ordering.** It used to declare `ts` ascending
   per partition, which it earned by sorting the collected partition.
-  `RlogReader` emits a segment's records grouped by `(stream_ref, ts)`, not
-  globally by `ts`, and a partition spans several segments, so a
+  `RlogReader` emits a segment's records grouped by `stream_ref`, with `ts`
+  ascending within a stream only when the object carries no sort descriptor
+  (under one, ADR-2135, a stream's records are ordered by time bucket, then
+  clustering key, then `ts`), never globally by `ts`, and a partition spans several segments, so a
   block-at-a-time scan cannot truthfully claim that order. `ORDER BY ts` still
   returns correctly sorted results; the ordering now comes from a `SortExec`
   DataFusion inserts above the scan, visible in `EXPLAIN`. Any downstream

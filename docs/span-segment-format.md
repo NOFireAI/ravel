@@ -78,8 +78,11 @@ bytes and readers reject overlong encodings.
 RSPAN reuses RLOG's proven mechanics with exactly two decided differences,
 both driven by the shape of span data rather than by a new mechanism:
 
-1. **Sort/lookup key.** RLOG sorts records by `(stream_ref, ts)`, where a
-   stream is a derived resource+scope identity. A span has no stream: a
+1. **Sort/lookup key.** RLOG sorts records by `stream_ref` first, where a
+   stream is a derived resource+scope identity, so each stream is one
+   contiguous run; within it records are in `ts` order when the object carries
+   no sort descriptor, and by time bucket, clustering key, then `ts` under one
+   (ADR-2135). A span has no stream: a
    trace's spans deliberately cross services. `trace_id` *is* the primary key,
    so RSPAN sorts records by `(trace_id, start_ts)` and has no STREAM_DIR. A
    trace-id lookup is a bounded scan of the contiguous blocks whose trace_id

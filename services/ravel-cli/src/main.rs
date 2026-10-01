@@ -2955,7 +2955,10 @@ fn rlog_stat_value(ty: FieldType, bits: u64) -> String {
 /// column stats), the stream directory, the field directory, and the columns
 /// BLOOM covers. Every decode is the reader's own path, so a corrupt SKIP_IDX or a
 /// section crc mismatch surfaces as a typed error with a non-zero exit, never a
-/// panic.
+/// panic. BLOOM also goes through `read_section`, so its whole-section crc is
+/// verified and a damaged BLOOM is refused here, where a scan never consults
+/// that crc and at worst prunes less: an inspector reports damage that a query
+/// is allowed to survive.
 fn rlog_inspect(bytes: &[u8]) -> anyhow::Result<()> {
     let footer = footer::open(bytes)
         .map_err(|err| anyhow::anyhow!("failed to parse rlog segment: {err}"))?;

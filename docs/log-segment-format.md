@@ -497,7 +497,8 @@ pruned blocks, and of columns the projection dropped -- may still be fetched
 when coalescing folds them into a requested range, but they are never
 interpreted, so nothing depends on a checksum over them.
 
-A reader may decode a *subset* of a block's columns (`read_block_columns`,
+A reader may decode a *subset* of a block's columns (`decode_v4_block_with`,
+which reads the wanted columns' pages through `read_block_pages_with_dicts`;
 ADR-0087); the SQL logs scan uses this to decode only the columns a query
 references. Under version 4 the subset is also a *fetch* subset: PAGE_DIR gives
 each column chunk's byte extent, so a projection of `k` columns over a row
@@ -1425,8 +1426,12 @@ proves absent.
 - Regex/substring predicates consult blooms only when the planner can
   extract word literals that any match must contain; otherwise only
   time/stream/min-max pruning applies and the scan evaluates exactly.
-- A missing or corrupt BLOOM section degrades to scanning without bloom
-  pruning and surfaces a counter, never wrong results. A missing POSTINGS
+- A corrupt BLOOM section (one that fails to parse, including a covered-column
+  list that fails its own crc) degrades to scanning without bloom pruning and
+  sets `ScanStats`' `bloom_degraded`, never wrong results; an entry that fails
+  its own crc only leaves its block unpruned. A missing BLOOM section is not
+  a degrade: footer open refuses it as `Corrupted`, as it does a missing
+  STREAM_DIR, FIELD_DIR, BLOCKS or SKIP_IDX. A missing POSTINGS
   section, a missing per-field entry, or a corrupt section/entry likewise
   degrades to no postings pruning for the affected arm (`ScanStats`'
   `postings_degraded`), never wrong results. A corrupt or undecodable
