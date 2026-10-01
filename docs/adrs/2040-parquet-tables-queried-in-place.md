@@ -867,7 +867,12 @@ schema elements are identical:
   whose `ARROW:schema` hint resolves a field to a different Arrow type
   compare unequal and refuse with `SchemaMismatch`, which the literal rule
   would have admitted. This follows from `file_schema` passing the footer's
-  `key_value_metadata` to `parquet_to_arrow_schema`; no test pins it yet.
+  `key_value_metadata` to `parquet_to_arrow_schema`.
+  `an_arrow_schema_hint_divergence_with_identical_physical_schema_refuses`
+  pins this: a plain `Utf8` column and a `Dictionary(Int32, Utf8)` column
+  write identical physical schema elements (proven in the test by rendering
+  both footers' schema trees with `parquet::schema::printer::print_schema`
+  and comparing the output), and the two files still refuse as a mismatch.
 
 The corrected rule: two files share a schema when the Arrow schema
 `parquet_to_arrow_schema` infers from their footers agrees after each
