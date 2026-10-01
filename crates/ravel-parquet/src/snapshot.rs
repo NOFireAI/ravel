@@ -618,58 +618,62 @@ async fn read_file(
             "the trailer records a {footer_len}-byte footer in a {size}-byte file"
         )));
     }
-    let (footer, _extra_reservations): (Bytes, Vec<Reservation>) =
-        if footer_and_trailer <= fetched {
-            (data.slice(split - footer_len as usize..split), Vec::new())
-        } else {
-            // Select the version the first read saw, so both reads are of one
-            // object's bytes; If-Match stays on the listed ETag.
-            let pin = Pin {
-                etag: listed_pin.etag.clone(),
-                version: recorded.version.clone(),
-            };
-            let footer_start = size - footer_and_trailer;
-            let (before, before_reservation) = pinned_get(
-                store,
-                limiter,
-                memory,
-                accounting,
-                &key,
-                FooterRange::Range(footer_start, tail_start),
-                &pin,
-            )
-            .await
-            .map_err(|err| match err {
-                // The one exception `read_error`'s doc comment names.
-                SnapshotError::FileMissing { key } => SnapshotError::FileChanged { key },
-                other => other,
-            })?;
-            if before.outcome.total_size != size || before.pin != recorded {
-                return Err(SnapshotError::FileChanged { key: key.clone() });
-            }
-            let before = before.outcome.data;
-            if before.len() as u64 != tail_start - footer_start {
-                return Err(corrupt(format!(
-                    "read of bytes {footer_start}..{tail_start} returned {} bytes",
-                    before.len()
-                )));
-            }
-            // The concatenation is a third buffer, live alongside the tail
-            // and before reads it copies, so it needs its own reservation:
-            // the two GETs' reservations cover only their own bytes.
-            let concat_reservation = memory.reserve(footer_len).map_err(|exhausted| {
-                SnapshotError::MemoryExhausted {
+    let (footer, _extra_reservations): (Bytes, Vec<Reservation>) = if footer_and_trailer <= fetched
+    {
+        (data.slice(split - footer_len as usize..split), Vec::new())
+    } else {
+        // Select the version the first read saw, so both reads are of one
+        // object's bytes; If-Match stays on the listed ETag.
+        let pin = Pin {
+            etag: listed_pin.etag.clone(),
+            version: recorded.version.clone(),
+        };
+        let footer_start = size - footer_and_trailer;
+        let (before, before_reservation) = pinned_get(
+            store,
+            limiter,
+            memory,
+            accounting,
+            &key,
+            FooterRange::Range(footer_start, tail_start),
+            &pin,
+        )
+        .await
+        .map_err(|err| match err {
+            // The one exception `read_error`'s doc comment names.
+            SnapshotError::FileMissing { key } => SnapshotError::FileChanged { key },
+            other => other,
+        })?;
+        if before.outcome.total_size != size || before.pin != recorded {
+            return Err(SnapshotError::FileChanged { key: key.clone() });
+        }
+        let before = before.outcome.data;
+        if before.len() as u64 != tail_start - footer_start {
+            return Err(corrupt(format!(
+                "read of bytes {footer_start}..{tail_start} returned {} bytes",
+                before.len()
+            )));
+        }
+        // The concatenation is a third buffer, live alongside the tail
+        // and before reads it copies, so it needs its own reservation:
+        // the two GETs' reservations cover only their own bytes.
+        let concat_reservation =
+            memory
+                .reserve(footer_len)
+                .map_err(|exhausted| SnapshotError::MemoryExhausted {
                     key: key.clone(),
                     requested: exhausted.requested,
                     reserved: exhausted.reserved,
                     limit: exhausted.limit,
-                }
-            })?;
-            let mut footer = Vec::with_capacity(footer_len as usize);
-            footer.extend_from_slice(&before);
-            footer.extend_from_slice(&data[..split]);
-            (Bytes::from(footer), vec![before_reservation, concat_reservation])
-        };
+                })?;
+        let mut footer = Vec::with_capacity(footer_len as usize);
+        footer.extend_from_slice(&before);
+        footer.extend_from_slice(&data[..split]);
+        (
+            Bytes::from(footer),
+            vec![before_reservation, concat_reservation],
+        )
+    };
     let metadata = decode_footer(&footer, size - footer_and_trailer).map_err(&corrupt)?;
     let row_count = u64::try_from(metadata.file_metadata().num_rows())
         .map_err(|_| corrupt("the footer records a negative row count".to_string()))?;
@@ -790,6 +794,9 @@ mod tests {
         /// suffix read against a 0-byte object with a 416 rather than
         /// answering it with an empty body.
         invalid_range_on_first_get: bool,
+        /// Report `suffix_range: false`, as the Azure external store does,
+        /// instead of the inner `MemoryStore`'s `true`.
+        force_no_suffix_range: bool,
         /// Serve `.csv` keys instead of `.parquet` ones from `synthetic`, so
         /// a synthetic listing can exercise the skip-and-count path instead
         /// of the candidate path.
@@ -953,7 +960,11 @@ mod tests {
         }
 
         fn capabilities(&self) -> Capabilities {
-            self.inner.capabilities()
+            let mut caps = self.inner.capabilities();
+            if self.force_no_suffix_range {
+                caps.suffix_range = false;
+            }
+            caps
         }
     }
 
@@ -1053,6 +1064,89 @@ mod tests {
         match snapshot(&store, "s3://lake/data/").await {
             Err(SnapshotError::EmptyFile { key }) => assert_eq!(key, "data/c.parquet"),
             other => panic!("expected EmptyFile, got {other:?}"),
+        }
+    }
+
+    /// A store without `suffix_range` (Azure, in production) must never see
+    /// a `GetRange::Suffix`: it refuses one before the request is even
+    /// sent. Mutation that fails it: branching the first footer read on
+    /// anything but `capabilities().suffix_range` still issues
+    /// `GetRange::Suffix(FOOTER_PREFETCH)`, which this assertion catches
+    /// against the code before this fix.
+    #[tokio::test]
+    async fn a_store_without_suffix_range_reads_an_explicit_footer_range() {
+        let store = Scripted {
+            force_no_suffix_range: true,
+            ..Scripted::default()
+        };
+        assert!(!store.capabilities().suffix_range);
+        put(
+            &store,
+            "data/a.parquet",
+            parquet_bytes(&[4, 5], &["p", "q"]),
+        )
+        .await;
+        let result = snapshot(&store, "s3://lake/data/").await.expect("snapshot");
+        assert_eq!(keys(&result), vec!["data/a.parquet"]);
+        let ranges: Vec<GetRange> = store
+            .gets()
+            .into_iter()
+            .map(|(_, range, _)| range)
+            .collect();
+        assert!(!ranges.is_empty());
+        assert!(
+            ranges
+                .iter()
+                .all(|range| !matches!(range, GetRange::Suffix(_))),
+            "{ranges:?}"
+        );
+    }
+
+    /// Without `suffix_range`, the first footer read is placed from the
+    /// listing's reported size, which can be stale in either direction. One
+    /// retry, placed from the size the first read's own response reports,
+    /// corrects it. Mutation that fails it: trusting the listed size
+    /// outright (no retry) either snapshots the wrong bytes (over-report:
+    /// the read lands short of the real tail) or refuses a valid file as
+    /// `Corrupt` (under-report: the read returns fewer bytes than the
+    /// trailer records).
+    #[tokio::test]
+    async fn a_stale_listed_size_without_suffix_range_is_corrected_by_one_retry() {
+        let bytes = parquet_bytes(&[4, 5], &["p", "q"]);
+        let real_size = bytes.len() as u64;
+        for lied_size in [real_size + 50, real_size.saturating_sub(10)] {
+            let store = Scripted {
+                force_no_suffix_range: true,
+                lie_listed_size: Some(lied_size),
+                ..Scripted::default()
+            };
+            put(&store, "data/a.parquet", bytes.clone()).await;
+            let result = snapshot(&store, "s3://lake/data/")
+                .await
+                .unwrap_or_else(|err| panic!("lied_size={lied_size} real_size={real_size}: {err}"));
+            assert_eq!(
+                keys(&result),
+                vec!["data/a.parquet"],
+                "lied_size={lied_size}"
+            );
+            assert_eq!(result.files[0].row_count, 2, "lied_size={lied_size}");
+            let ranges: Vec<GetRange> = store
+                .gets()
+                .into_iter()
+                .map(|(_, range, _)| range)
+                .collect();
+            assert!(
+                ranges
+                    .iter()
+                    .all(|range| !matches!(range, GetRange::Suffix(_))),
+                "lied_size={lied_size}: {ranges:?}"
+            );
+            assert_eq!(
+                ranges.len(),
+                2,
+                "a mismatched listed size costs exactly one retry: lied_size={lied_size}: \
+                 {ranges:?}"
+            );
         }
     }
 
@@ -1712,6 +1806,44 @@ mod tests {
             Err(SnapshotError::MemoryExhausted { key, requested, .. }) => {
                 assert_eq!(key, "data/wide.parquet");
                 assert_eq!(requested, before_len);
+            }
+            other => panic!("expected MemoryExhausted, got {other:?}"),
+        }
+    }
+
+    /// A budget that holds exactly both GETs' reservations, with nothing
+    /// left over, refuses building the concatenated footer: that buffer is
+    /// a third copy of the same bytes, live alongside the two GETs' own
+    /// buffers, and needs its own reservation rather than riding on theirs.
+    /// Mutation that fails it: dropping the concatenation's reservation
+    /// lets this budget through, resident bytes briefly twice what is
+    /// reserved while all three buffers are live.
+    #[tokio::test]
+    async fn a_long_footers_concatenation_is_refused_when_only_the_two_gets_are_reserved() {
+        let store = Scripted::default();
+        let bytes = wide_parquet_bytes(1500);
+        let footer_len = footer_len_of(&bytes);
+        let size = bytes.len() as u64;
+        let tail_start = size - FOOTER_PREFETCH;
+        let footer_start = size - u64::from(footer_len) - TRAILER_LEN;
+        let before_len = tail_start - footer_start;
+        put(&store, "data/wide.parquet", bytes).await;
+        let limiter = GetLimiter::new(4).expect("permits");
+        let memory = Arc::new(MemoryBudget::new(FOOTER_PREFETCH + before_len));
+        let accounting = PhaseAccounting::new();
+        match snapshot_location(
+            &store,
+            &location("s3://lake/data/"),
+            &limiter,
+            &memory,
+            DEADLINE,
+            &accounting,
+        )
+        .await
+        {
+            Err(SnapshotError::MemoryExhausted { key, requested, .. }) => {
+                assert_eq!(key, "data/wide.parquet");
+                assert_eq!(requested, u64::from(footer_len));
             }
             other => panic!("expected MemoryExhausted, got {other:?}"),
         }
