@@ -1203,6 +1203,142 @@ async fn retention_of_out_of_window_hour_never_leaves_snapshot_naming_deleted_ob
     }
 }
 
+/// Uncovered-hour case (ADR-0020 amendment 2026-10-01, issue #1133),
+/// `age_and_clear`'s neighbour-anchor branch: once the retention-frontier
+/// reconcile drops a far-behind hour, no surviving part's `[min_hour,
+/// watermark_hour]` range covers it any more -- the gate anchors instead on
+/// the nearest right-neighbour part (the surviving recent-hour part, the only
+/// part left, picked up as the smallest `min_hour` above the dropped hour).
+/// Exercises both sides of that neighbour's own pinned-query-window boundary:
+/// blocked immediately after the general protection horizon clears (the
+/// neighbour part is fresher than the horizon alone would require), then
+/// swept once the neighbour ages past its own window. To watch this FAIL,
+/// anchor the neighbour-branch on a fixed/zero timestamp instead of its own
+/// `last_modified` (the gate would then never block here), or drop the
+/// `max_query_duration_ns`/`clock_skew_allowance_ns` terms from the threshold
+/// (the intermediate PinnedWindow assertion below would then not hold).
+#[tokio::test]
+async fn pinned_window_blocks_uncovered_hour_until_neighbor_part_ages() {
+    let store = Arc::new(MemoryStore::new());
+    let config = cfg();
+
+    let recent_hour = HOUR;
+    let old_hour = HOUR - 100;
+
+    seed_input(
+        store.as_ref(),
+        &InputSpec::new_at(
+            old_hour,
+            Uuid::from_u128(0xA5),
+            1,
+            1,
+            vec![raw_series(
+                "m",
+                &[("k", "old")],
+                &[(i64::from(old_hour) * NS_PER_HOUR + 1_000, 1.0)],
+            )],
+        ),
+    )
+    .await;
+    seed_input(
+        store.as_ref(),
+        &InputSpec::new_at(
+            recent_hour,
+            Uuid::from_u128(0xB6),
+            1,
+            1,
+            vec![raw_series(
+                "m",
+                &[("k", "recent")],
+                &[(i64::from(recent_hour) * NS_PER_HOUR + 1_000, 2.0)],
+            )],
+        ),
+    )
+    .await;
+
+    let retention_window_ns = 90 * NS_PER_HOUR;
+    let retention = RetentionConfig::from_policy(
+        RetentionPolicy {
+            default: None,
+            tenants: vec![(TENANT.to_string(), retention_window_ns)],
+        },
+        &config,
+        DEFAULT_MAX_INGEST_LAG_NS,
+    )
+    .expect("retention config");
+    write_tenant_retention(store.as_ref(), retention_window_ns).await;
+
+    let created = sealed_now_ns();
+    store.set_clock_ms((created / 1_000_000) as u64);
+    let clock = FixedClock::new(created);
+    let old_bucket = bucket_at(old_hour);
+
+    // 1. Fold: the snapshot names both hours.
+    fold_head(&store, Signal::Metrics, created, None).await;
+
+    // 2. Retire the old hour.
+    let tombstoned = retention_sweep_bucket(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        &old_bucket,
+    )
+    .await
+    .expect("tombstone");
+    assert_eq!(tombstoned, RetentionOutcome::Tombstoned);
+
+    // 3. Reconcile fold close to (but before) the general protection
+    //    horizon: the surviving recent-hour part's own pinned-query window
+    //    therefore outlives the protection horizon, making the intermediate
+    //    PinnedWindow state observable below instead of masked by it.
+    let t1 = created + 24 * NS_PER_HOUR;
+    store.set_clock_ms((t1 / 1_000_000) as u64);
+    fold_head(&store, Signal::Metrics, t1, None).await;
+
+    // 4. Past the general protection horizon, but before the neighbouring
+    //    part has aged past its own pinned-query window: blocked.
+    clock.set(created + config.protection_horizon_ns + 1);
+    let still_pinned = retention_sweep_bucket(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        &old_bucket,
+    )
+    .await
+    .expect("gate");
+    assert_eq!(
+        still_pinned,
+        RetentionOutcome::BlockedBySnapshot(SnapshotBlock::PinnedWindow),
+        "the surviving neighbour part has not yet aged past its own \
+         pinned-query window"
+    );
+    assert!(!bucket_is_empty(store.as_ref(), &old_bucket).await);
+
+    // 5. Past the neighbour's own pinned-query window: proceeds and deletes.
+    clock.set(
+        t1 + 1_000_000_000
+            + config.max_query_duration_ns
+            + config.clock_skew_allowance_ns
+            + 1,
+    );
+    let swept = retention_sweep_bucket(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        &old_bucket,
+    )
+    .await
+    .expect("sweep");
+    assert_eq!(swept, RetentionOutcome::Swept);
+    assert!(bucket_is_empty(store.as_ref(), &old_bucket).await);
+}
+
 /// ADR-0078 acceptance test: a deployment configured with ONLY a
 /// `RetentionConfig` deployment default (the CLI-flag path: `--retention-default`
 /// / `--retention-tenant`) and NO durable `TenantConfig.retention_ns` write must
