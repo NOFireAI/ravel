@@ -278,8 +278,8 @@ DROP TABLE [IF EXISTS] name;
   shared `GetLimiter` and run under the SQL deadline. A prefix too large to
   read within the deadline fails with the deadline error; the file cap
   bounds the worst case (see the grants and DDL cost amendment below for
-  the memory and request budgets). Queries never list the location. Files added later
-  are picked up by `CREATE OR REPLACE`.
+  the memory and request budgets). Queries never list the location. Files
+  added later are picked up by `CREATE OR REPLACE`.
 - `OPTIONS` admits `binary_as_string` and `ravel.cast.<column>` (D5), and
   nothing else.
 - Refused: `TEMPORARY`, `UNBOUNDED`, `PARTITIONED BY`, `WITH ORDER`, a
@@ -922,11 +922,16 @@ unstated for `CREATE`.
   just as deleting committed data does not stop a pinned segment read.
 - **What bounds a `CREATE`.** D2 bounds a `CREATE` by the 100,000-file cap,
   the shared `GetLimiter` and the SQL deadline. Two further rules apply.
-  - Each footer read reserves its bytes against the process memory budget
-    before it is issued, the same reservation a query's Parquet reads make
-    (ADR-1170 decision 2), and a refusal fails the `CREATE` with the same
-    typed memory error.
+  - A `CREATE`'s footer reads must reserve their bytes against the process
+    memory budget before each is issued, the same reservation a query's
+    Parquet reads make (ADR-1170 decision 2), and a refusal fails the
+    `CREATE` with the same typed memory error. `ravel-parquet::snapshot`
+    does not reserve today; #2283 adds it before #2054 wires `CREATE` to
+    it.
   - A `CREATE` is not held to the per-query `max_s3_requests` or byte
-    budgets. Those size a read of committed data; a `CREATE` makes one
-    listing pass and one or two footer GETs per file, a count the file cap
-    already bounds, and it is admitted only with the `ddl` capability.
+    budgets. Those size a read of committed data. A `CREATE` makes one
+    listing pass, bounded by the 100,000-page list ceiling
+    (`ravel_object_store::MAX_LIST_PAGES`) and the SQL deadline, not by
+    the file cap, since keys that are not `.parquet` files are counted and
+    skipped; and one to three footer GETs per file, which the file cap
+    bounds. It is admitted only with the `ddl` capability.
