@@ -630,7 +630,7 @@ Bulk-import a Parquet file into the signal named by `--signal` (ADR-0089, widene
 | `--skip-rows` |  | `0` | Number of leading rows, by file-absolute position, to drop before mapping (issue #1713). Exact at any cursor count, and reported as `rows_skipped`. Resuming a FAILED load with `rows_skipped + rows_written` is sound only when that run used `--read-cursors 1 --pipeline-depth 1`; at any other settings the rows that landed are not a prefix of the file and the offset both duplicates and drops rows. There is no idempotency marker, so nothing checks the value. See docs/guides/ingest.md. Defaults to 0 (no skip) |
 | `--target-bytes` |  | `1` | Estimated in-memory bytes a shard's buffer accumulates before it flushes as one RLOG object (issue #801). At the default `1` every batch flushes as its own object the moment it is written: one object per involved shard per batch, `--batch-rows` sets its size, and no buffer lingers. A larger value lets a shard hold several batches' records in one buffer until the target is reached, so objects grow without any more Arrow batches being held in memory -- unlike raising `--batch-rows`, whose memory cost is linear because each batch is buffered whole |
 | `--tenant` |  |  | Target tenant id (hashed under the bucket's pinned scheme) |
-| `--zstd-level` |  | `3` | The zstd level of every page and section the loader's RLOG objects compress with zstd. Compaction re-encodes the objects it merges at its own level (3), so this sets only the load's own objects |
+| `--zstd-level` |  | `3` | The zstd level of every page and section the loader's RLOG objects compress with zstd. Compaction re-encodes the objects it merges at compaction's own level, so this sets only the load's own objects |
 
 ## export
 

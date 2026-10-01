@@ -14901,7 +14901,7 @@ type = "str"
         /// A non-default `--zstd-level` on a metrics or spans load is named as
         /// ignored; the default, or any level on a logs load, is not.
         #[test]
-        fn a_non_default_zstd_level_is_named_on_a_sequential_load_only() {
+        fn metrics_and_spans_warn_on_a_non_default_zstd_level_and_logs_does_not() {
             let nineteen = RlogZstdLevel::new(19).expect("in range");
             assert_eq!(unused_zstd_level_warning(nineteen, SignalArg::Logs), None);
             assert_eq!(

@@ -368,14 +368,6 @@ control state only; the bounded-staleness refresh loop that reads it on a
 horizon and re-invokes the admission controller's `set_tenant_limits` is a
 separate concern.
 
-Config record format versions (readers accept 1 to 3; the writer stamps 2):
-
-| version | fields | status |
-|---|---|---|
-| 1 | 1 to 12 | read; no longer written |
-| 2 | 1 to 12, unchanged; a floor signal (ADR-0066 R2 writer flip) so a pre-R1 binary refuses the record instead of rewriting it | read and written |
-| 3 | adds `clustering_key` (13) and `bloom_scope` (14), ADR-2135 | read only: readers accept it ahead of any writer (reader-first); a later writer opt-in stamps 3 and sets either field |
-
 `ravel-cli clustering-key show --tenant <t>` and `ravel-cli bloom-scope show
 --tenant <t>` print fields 13 and 14 of a tenant's record, including one of
 version 3.

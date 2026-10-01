@@ -471,7 +471,7 @@ impl RlogZstdLevel {
     pub const DEFAULT: RlogZstdLevel = RlogZstdLevel(3);
 
     /// The level, or [`RlogZstdLevelError::OutOfRange`] when it is outside
-    /// `MIN..=MAX`. Level 0 is zstd's own default level.
+    /// `MIN..=MAX`.
     pub fn new(level: i32) -> Result<Self, RlogZstdLevelError> {
         if (Self::MIN..=Self::MAX).contains(&level) {
             Ok(RlogZstdLevel(level))
