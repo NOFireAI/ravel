@@ -456,6 +456,46 @@ pub(crate) fn idle_age_threshold(
     }
 }
 
+/// The zstd level a log flush compresses its RLOG object at (ADR-2135 decision
+/// 4). Built only through [`RlogZstdLevel::new`], which refuses a level outside
+/// zstd's accepted range, so an [`IngestConfig`] cannot carry one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RlogZstdLevel(i32);
+
+impl RlogZstdLevel {
+    /// The lowest level zstd accepts, libzstd's `ZSTD_minCLevel()`.
+    pub const MIN: i32 = -131_072;
+    /// The highest level zstd accepts, libzstd's `ZSTD_maxCLevel()`.
+    pub const MAX: i32 = 22;
+    /// The ingest default.
+    pub const DEFAULT: RlogZstdLevel = RlogZstdLevel(3);
+
+    /// The level, or [`RlogZstdLevelError::OutOfRange`] when it is outside
+    /// `MIN..=MAX`. Level 0 is zstd's own default level.
+    pub fn new(level: i32) -> Result<Self, RlogZstdLevelError> {
+        if (Self::MIN..=Self::MAX).contains(&level) {
+            Ok(RlogZstdLevel(level))
+        } else {
+            Err(RlogZstdLevelError::OutOfRange {
+                level,
+                min: Self::MIN,
+                max: Self::MAX,
+            })
+        }
+    }
+
+    /// The level as zstd takes it.
+    pub fn get(self) -> i32 {
+        self.0
+    }
+}
+
+impl Default for RlogZstdLevel {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 /// All fields are overridable; defaults match the dev-sizing table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IngestConfig {
@@ -604,6 +644,9 @@ pub struct IngestConfig {
     /// default therefore matches the new `max_flush_delay` default (2s)
     /// rather than retaining the old hard-coded 1s value.
     pub strict_visibility_budget_ns: i64,
+    /// The zstd level of every page and whole-read section of each RLOG object
+    /// a log flush writes. Metrics and span flushes do not read it.
+    pub rlog_zstd_level: RlogZstdLevel,
 }
 
 impl Default for IngestConfig {
@@ -656,6 +699,7 @@ impl Default for IngestConfig {
             // unconditionally.
             strict_visibility_budget_ns: max_flush_delay.as_nanos() as i64
                 + STRICT_VISIBILITY_RESERVE_NS,
+            rlog_zstd_level: RlogZstdLevel::DEFAULT,
         }
     }
 }
@@ -676,6 +720,14 @@ pub enum IngestConfigError {
         floor: usize,
         min_flush_bytes: usize,
     },
+}
+
+/// A level [`RlogZstdLevel::new`] refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RlogZstdLevelError {
+    /// The level is outside the range zstd accepts.
+    #[error("RLOG zstd level {level} is outside zstd's accepted range {min}..={max}")]
+    OutOfRange { level: i32, min: i32, max: i32 },
 }
 
 impl IngestConfig {
@@ -997,5 +1049,25 @@ mod tests {
         assert!(plausible_ingest_clock(NS_PER_HOUR * 3).is_err());
         assert!(plausible_ingest_clock(0).is_err());
         assert!(plausible_ingest_clock(-1).is_err());
+    }
+
+    #[test]
+    fn rlog_zstd_level_refuses_a_level_outside_zstds_range() {
+        for level in [23, i32::MAX, -131_073, i32::MIN] {
+            assert_eq!(
+                RlogZstdLevel::new(level),
+                Err(RlogZstdLevelError::OutOfRange {
+                    level,
+                    min: -131_072,
+                    max: 22,
+                }),
+                "level {level}"
+            );
+        }
+        for level in [-131_072, -1, 0, 1, 3, 19, 22] {
+            assert_eq!(RlogZstdLevel::new(level).map(RlogZstdLevel::get), Ok(level));
+        }
+        assert_eq!(IngestConfig::default().rlog_zstd_level.get(), 3);
+        assert_eq!(RlogZstdLevel::default(), RlogZstdLevel::DEFAULT);
     }
 }

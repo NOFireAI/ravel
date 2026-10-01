@@ -657,7 +657,11 @@ impl LogFlushCtx {
         // PUT below.
         #[cfg(feature = "stage-timing")]
         let encode_start = std::time::Instant::now();
-        let mut writer = RlogWriter::new(RlogConfig::default(), identity)
+        let rlog_config = RlogConfig {
+            zstd_level: self.config.rlog_zstd_level.get(),
+            ..RlogConfig::default()
+        };
+        let mut writer = RlogWriter::new(rlog_config, identity)
             .with_indexed_fields(indexed_fields)
             .with_sort_descriptor(writer_layout.descriptor, writer_layout.generation)
             .with_bloom_scope(writer_layout.bloom_scope);
