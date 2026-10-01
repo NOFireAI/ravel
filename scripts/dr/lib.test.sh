@@ -573,31 +573,54 @@ vp_report() {
 
 # ensure_probe <dir> <marked 0|1>: runs dr_ensure_bucket on the existing
 # replica bucket and prints its exit code. The stub aws answers Object Lock
-# from <dir>/lock, versioning Enabled, the whole-lifecycle read-back from
-# <dir>/fields and the NoncurrentDays listing from <dir>/days. The stub
-# ravel-cli prints <dir>/verify-<E_v>, else <dir>/verify, and exits with
-# <dir>/cli-rc (default 0). Calls are logged to <dir>/calls and the refusal
-# reason is left in <dir>/error.
+# from <dir>/lock, versioning from <dir>/versioning, the whole-lifecycle
+# read-back from <dir>/fields and the per-rule listing the unmarked check reads
+# from <dir>/rules. The versioning and fields files hold one answer per line,
+# the nth call answering line n and every later call the last line; a line
+# FAIL fails that call, as does a rules file holding only FAIL. The stub ravel-cli prints <dir>/verify-<E_v>, else
+# <dir>/verify, and exits with <dir>/cli-rc (default 0). ravel-cli or cargo is
+# missing from PATH when <dir>/no-ravel-cli or <dir>/no-cargo exists. Calls are
+# logged to <dir>/calls and the refusal reason is left in <dir>/error.
 ensure_probe() {
   local dir="$1" marked="$2" code=0
   : >"${dir}/calls"
   : >"${dir}/error"
+  rm -f "${dir}"/*.n
   (
     DR_BUCKET_PRIMARY=dr-primary
     DR_BUCKET_REPLICA=dr-replica
     dr_bucket_exists() { return 0; }
     dr_bucket_marker_present() { [[ "${marked}" == 1 ]]; }
-    dr_ravel_binaries_available() { return 0; }
+    dr_have_command() {
+      case "$1" in
+        ravel-cli | cargo) [[ ! -e "${dir}/no-$1" ]] ;;
+        *) command -v "$1" >/dev/null 2>&1 ;;
+      esac
+    }
+    answer() {
+      local n line
+      n=$(( $(cat "$1.n" 2>/dev/null || echo 0) + 1 ))
+      printf '%s\n' "${n}" >"$1.n"
+      line="$(sed -n "${n}p" "$1")"
+      [[ -n "${line}" ]] || line="$(tail -n 1 "$1")"
+      [[ "${line}" != FAIL ]] || return 254
+      printf '%s\n' "${line}"
+    }
     dr_aws() {
       printf '%s\n' "$*" >>"${dir}/calls"
       case "$2" in
         get-object-lock-configuration) cat "${dir}/lock" ;;
-        get-bucket-versioning) printf 'Enabled\n' ;;
+        get-bucket-versioning) answer "${dir}/versioning" ;;
         get-bucket-lifecycle-configuration)
-          if [[ "$*" == *'length(Rules)'* ]]; then cat "${dir}/fields"; else cat "${dir}/days"; fi
+          if [[ "$*" == *'length(Rules)'* ]]; then
+            answer "${dir}/fields"
+          elif [[ "$(cat "${dir}/rules")" == FAIL ]]; then
+            return 254
+          else
+            cat "${dir}/rules"
+          fi
           ;;
       esac
-      return 0
     }
     dr_ravel_cli() {
       printf 'ravel-cli %s\n' "$*" >>"${dir}/calls"
@@ -614,15 +637,30 @@ ensure_probe() {
 }
 
 # ensure_dir <name>: a fresh directory for one ensure_probe case, set up as a
-# compliant bucket with no lifecycle rule carrying NoncurrentDays listed.
+# compliant bucket already carrying everything dr_ensure_bucket puts.
 ensure_dir() {
   local dir="${ENSURE_TMP}/$1"
   mkdir -p "${dir}"
   printf 'Enabled\n' >"${dir}/lock"
+  printf 'Enabled\n' >"${dir}/versioning"
   printf '1\tEnabled\t{"f":{"Prefix":""},"p":null}\ttrue\t1\t7\n' >"${dir}/fields"
-  : >"${dir}/days"
+  ensure_rules "${dir}" 'Enabled|{"f":{"Prefix":""},"p":null}|1'
   vp_report >"${dir}/verify"
   printf '%s\n' "${dir}"
+}
+
+# ensure_rules <dir> <rule>...: the per-rule listing, one "Status|scope|days"
+# argument per rule.
+ensure_rules() {
+  local dir="$1" rule
+  shift
+  : >"${dir}/rules"
+  for rule in "$@"; do printf '%s\n' "${rule//|/$'\t'}" >>"${dir}/rules"; done
+}
+
+# The ravel-cli calls a case made, "|" after each.
+ensure_cli_calls() {
+  grep '^ravel-cli' "$1/calls" | tr '\n' '|'
 }
 
 # The subcommands a case sent to aws, in order, space separated.
@@ -636,26 +674,53 @@ ensure_has() {
 
 ENSURE_TMP="$(mktemp -d)"
 
-# A marked bucket is checked for Object Lock before versioning is switched on,
-# then configured with DR_BUCKET_LIFECYCLE and read back whole. ravel-cli is
-# never asked.
-d="$(ensure_dir marked-compliant)"
-check "ensure: a marked compliant bucket passes" "0" "$(ensure_probe "${d}" 1)"
-check "ensure: a marked bucket is configured after its Object Lock check and read back" \
-  "get-object-lock-configuration put-bucket-versioning put-bucket-lifecycle-configuration get-object-lock-configuration get-bucket-versioning get-bucket-lifecycle-configuration " \
+# A fresh marked bucket is checked for Object Lock before versioning is
+# switched on, then gets versioning and DR_BUCKET_LIFECYCLE, each read first and
+# read back after its put. ravel-cli is never asked.
+d="$(ensure_dir marked-fresh)"
+printf 'None\nEnabled\n' >"${d}/versioning"
+printf 'FAIL\n1\tEnabled\t{"f":{"Prefix":""},"p":null}\ttrue\t1\t7\n' >"${d}/fields"
+check "ensure: a fresh marked bucket passes" "0" "$(ensure_probe "${d}" 1)"
+check "ensure: a fresh marked bucket issues both puts, each between its read and read-back" \
+  "get-object-lock-configuration get-bucket-versioning put-bucket-versioning get-bucket-versioning get-bucket-lifecycle-configuration put-bucket-lifecycle-configuration get-bucket-lifecycle-configuration " \
   "$(ensure_sequence "${d}")"
 check "ensure: a marked bucket gets DR_BUCKET_LIFECYCLE" \
   "yes" "$(ensure_has "${d}/calls" "--lifecycle-configuration ${DR_BUCKET_LIFECYCLE}")"
 check "ensure: a marked bucket never runs ravel-cli" "no" "$(ensure_has "${d}/calls" ravel-cli)"
 
+# An existing marked bucket already Enabled and already carrying the rule
+# issues no put: RustFS answers InternalError to a second PutBucketVersioning on
+# an Object Lock bucket, so a rerun that put again would fail.
+d="$(ensure_dir marked-settled)"
+check "ensure: a settled marked bucket passes" "0" "$(ensure_probe "${d}" 1)"
+check "ensure: a settled marked bucket issues no put and reads each setting once" \
+  "get-object-lock-configuration get-bucket-versioning get-bucket-lifecycle-configuration " \
+  "$(ensure_sequence "${d}")"
+
+# Only the setting that does not already match is put.
+d="$(ensure_dir marked-other-rule)"
+printf '1\tEnabled\t{"f":{"Prefix":""},"p":null}\ttrue\t30\t7\n1\tEnabled\t{"f":{"Prefix":""},"p":null}\ttrue\t1\t7\n' \
+  >"${d}/fields"
+check "ensure: a marked bucket carrying another rule gets only the lifecycle put" "0" \
+  "$(ensure_probe "${d}" 1)"
+check "ensure: that bucket's versioning is read and not put" \
+  "get-object-lock-configuration get-bucket-versioning get-bucket-lifecycle-configuration put-bucket-lifecycle-configuration get-bucket-lifecycle-configuration " \
+  "$(ensure_sequence "${d}")"
+
 # The read-back is exact for a marked bucket: the harness put NoncurrentDays 1,
-# so a bucket reading 30 did not take the configuration.
+# so a bucket still reading 30 did not take the configuration.
 d="$(ensure_dir marked-other-noncurrent-days)"
 printf '1\tEnabled\t{"f":{"Prefix":""},"p":null}\ttrue\t30\t7\n' >"${d}/fields"
 check "ensure: a marked bucket reading back another NoncurrentDays is refused" \
   "1" "$(ensure_probe "${d}" 1)"
 check "ensure: the exact read-back names what it read" \
   "yes" "$(ensure_has "${d}/error" "does not carry each action (read ExpiredObjectDeleteMarker=true NoncurrentDays=30")"
+d="$(ensure_dir marked-versioning-not-taken)"
+printf 'Suspended\n' >"${d}/versioning"
+check "ensure: a marked bucket whose versioning reads back Suspended is refused" \
+  "1" "$(ensure_probe "${d}" 1)"
+check "ensure: that refusal names what it read" \
+  "yes" "$(ensure_has "${d}/error" "does not have versioning enabled (read Suspended)")"
 
 # A marked bucket without Object Lock is refused before versioning, which cannot
 # be switched off again, is turned on.
@@ -668,12 +733,13 @@ check "ensure: a marked bucket without Object Lock is told to delete and rerun" 
   "yes" "$(ensure_has "${d}/error" "delete the bucket and rerun")"
 
 # An unmarked bucket with its own E_v and a second rule over logs/ passes the
-# server's checks and is never reconfigured. verify-protection needs an E_v, so
-# it runs per NoncurrentDays value the rules carry; the logs/ rule's 7 fails
-# noncurrent-expiration on the whole-bucket rule's 30, and 30 passes.
+# server's checks and is never reconfigured. verify-protection needs an E_v; it
+# runs once, with the NoncurrentDays of the rule covering t/ (30), which is the
+# reference the server measures other rules against. The logs/ rule's 7 does
+# not cover t/ and is never tried.
 d="$(ensure_dir unmarked-own-ev-and-logs-rule)"
-printf '2\tEnabled\t{"f":{"Prefix":""},"p":null}\ttrue\t30\t7\n' >"${d}/fields"
-printf '30\t7\n' >"${d}/days"
+ensure_rules "${d}" 'Enabled|{"f":{"Prefix":""},"p":null}|30' \
+  'Enabled|{"f":{"Prefix":"logs/"},"p":null}|7'
 vp_report noncurrent-expiration=fail >"${d}/verify-7"
 vp_report >"${d}/verify-30"
 check "ensure: an unmarked bucket with its own E_v and a logs/ rule passes" \
@@ -681,9 +747,70 @@ check "ensure: an unmarked bucket with its own E_v and a logs/ rule passes" \
 check "ensure: an unmarked bucket is never written" "no" "$(ensure_has "${d}/calls" " put-")"
 check "ensure: an unmarked bucket is never read back exactly" \
   "no" "$(ensure_has "${d}/calls" "length(Rules)")"
-check "ensure: verify-protection runs once per NoncurrentDays value, ascending" \
-  "ravel-cli --store s3 store verify-protection --expected-noncurrent-days 7|ravel-cli --store s3 store verify-protection --expected-noncurrent-days 30|" \
-  "$(grep '^ravel-cli' "${d}/calls" | tr '\n' '|')"
+check "ensure: verify-protection runs once, with the covering rule's NoncurrentDays" \
+  "ravel-cli --store s3 store verify-protection --expected-noncurrent-days 30|" \
+  "$(ensure_cli_calls "${d}")"
+
+# The reference is the server's, not any value that happens to pass. A covering
+# rule at 30 and a t/a rule at 7 with versioning unknown: the server takes 30,
+# fails no-foreign-rule on the t/a rule and refuses. A run with E_v 7 would show
+# nothing fatal (noncurrent-expiration fails, but versioning is not pass), and
+# must not be what the bucket is judged by.
+d="$(ensure_dir unmarked-early-rule-versioning-unknown)"
+ensure_rules "${d}" 'Enabled|{"f":{"Prefix":""},"p":null}|30' \
+  'Enabled|{"f":{"Prefix":"t/a"},"p":null}|7'
+vp_report noncurrent-expiration=fail versioning=unknown >"${d}/verify-7"
+vp_report no-foreign-rule=fail versioning=unknown >"${d}/verify-30"
+check "ensure: an early t/ rule under unknown versioning is refused" \
+  "1" "$(ensure_probe "${d}" 0)"
+check "ensure: that bucket is checked only with the server's reference, 30" \
+  "ravel-cli --store s3 store verify-protection --expected-noncurrent-days 30|" \
+  "$(ensure_cli_calls "${d}")"
+check "ensure: that refusal names no-foreign-rule" \
+  "yes" "$(ensure_has "${d}/error" "refuses to start on: no-foreign-rule (store verify-protection --expected-noncurrent-days 30,")"
+
+# The covering rules can be a union of t/<d> rules over all sixteen hex digits,
+# or a legacy t/ Prefix or an And holding only a prefix. Disabled, tagged and
+# partial-union rules cover nothing.
+d="$(ensure_dir unmarked-union-reference)"
+union_rules=()
+for digit in 0 1 2 3 4 5 6 7 8 9 a b c d e f; do
+  union_rules+=("Enabled|{\"f\":{\"Prefix\":\"t/${digit}\"},\"p\":null}|14")
+done
+ensure_rules "${d}" "${union_rules[@]}" 'Disabled|{"f":{"Prefix":""},"p":null}|3' \
+  'Enabled|{"f":{"And":{"Prefix":"","Tags":[{"Key":"k","Value":"v"}]}},"p":null}|2'
+check "ensure: a complete t/<d> union gives the reference" "0" "$(ensure_probe "${d}" 0)"
+check "ensure: that bucket is checked with the union's NoncurrentDays" \
+  "ravel-cli --store s3 store verify-protection --expected-noncurrent-days 14|" \
+  "$(ensure_cli_calls "${d}")"
+d="$(ensure_dir unmarked-legacy-and-reference)"
+ensure_rules "${d}" 'Enabled|{"f":null,"p":"t/"}|9' \
+  'Enabled|{"f":{"And":{"Prefix":"t"}},"p":null}|9'
+check "ensure: a legacy t/ Prefix and an And prefix agreeing give the reference" \
+  "0" "$(ensure_probe "${d}" 0)"
+check "ensure: that bucket is checked with their NoncurrentDays" \
+  "ravel-cli --store s3 store verify-protection --expected-noncurrent-days 9|" \
+  "$(ensure_cli_calls "${d}")"
+
+# With no reference the bucket is refused, saying why, and ravel-cli never runs.
+d="$(ensure_dir unmarked-partial-union)"
+ensure_rules "${d}" "${union_rules[@]:1}"
+check "ensure: an incomplete t/<d> union gives no reference and refuses" \
+  "1" "$(ensure_probe "${d}" 0)"
+check "ensure: that refusal says no covering rule carries NoncurrentDays" \
+  "yes" "$(ensure_has "${d}/error" "no enabled lifecycle rule covering t/ carries NoncurrentDays, so the NoncurrentDays a --require-bucket-protection server measures other rules against cannot be determined")"
+check "ensure: no reference never runs ravel-cli" "" "$(ensure_cli_calls "${d}")"
+d="$(ensure_dir unmarked-covering-rules-disagree)"
+ensure_rules "${d}" 'Enabled|{"f":{"Prefix":""},"p":null}|30' \
+  'Enabled|{"f":{"Prefix":"t/"},"p":null}|7'
+check "ensure: covering rules that disagree refuse" "1" "$(ensure_probe "${d}" 0)"
+check "ensure: that refusal names both values" \
+  "yes" "$(ensure_has "${d}/error" "the enabled lifecycle rules covering t/ disagree on NoncurrentDays (7 30)")"
+d="$(ensure_dir unmarked-lifecycle-unreadable)"
+printf 'FAIL\n' >"${d}/rules"
+check "ensure: an unreadable lifecycle configuration refuses" "1" "$(ensure_probe "${d}" 0)"
+check "ensure: that refusal says the reference cannot be determined" \
+  "yes" "$(ensure_has "${d}/error" "could not read the lifecycle configuration of bucket dr-replica, so the NoncurrentDays a --require-bucket-protection server measures other rules against cannot be determined")"
 
 # An unmarked bucket without Object Lock is refused, and told what to change
 # rather than to delete a bucket the harness does not own.
@@ -696,11 +823,21 @@ check "ensure: the refusal says Object Lock is set at creation and names the var
   "yes" "$(ensure_has "${d}/error" "Object Lock can only be enabled when a bucket is created, so this bucket can never pass: set DR_BUCKET_REPLICA to a bucket created with Object Lock")"
 check "ensure: the refusal does not tell the operator to delete the bucket" \
   "no" "$(ensure_has "${d}/error" "delete the bucket")"
-check "ensure: with no NoncurrentDays listed verify-protection runs once with 1" \
-  "ravel-cli --store s3 store verify-protection --expected-noncurrent-days 1|" \
-  "$(grep '^ravel-cli' "${d}/calls" | tr '\n' '|')"
 check "ensure: an unmarked bucket without Object Lock is never written" \
   "no" "$(ensure_has "${d}/calls" " put-")"
+
+# Checking an unmarked bucket needs ravel-cli, prebuilt or through cargo, and
+# nothing else: with neither the bucket is refused and the message names both.
+d="$(ensure_dir unmarked-no-ravel-cli-no-cargo)"
+: >"${d}/no-ravel-cli"
+: >"${d}/no-cargo"
+check "ensure: no ravel-cli and no cargo refuses" "1" "$(ensure_probe "${d}" 0)"
+check "ensure: that refusal names what is missing" \
+  "yes" "$(ensure_has "${d}/error" "needs ravel-cli store verify-protection, but there is no ravel-cli on PATH and no cargo to build one")"
+check "ensure: that bucket is never read" "" "$(ensure_sequence "${d}")"
+d="$(ensure_dir unmarked-cargo-only)"
+: >"${d}/no-ravel-cli"
+check "ensure: cargo without a prebuilt ravel-cli is enough" "0" "$(ensure_probe "${d}" 0)"
 
 # The server refuses on no-foreign-rule, abort-multipart, and on
 # noncurrent-expiration only while versioning passes; every other failure and

@@ -28,7 +28,9 @@ mkdir -p "${STUB_BIN}"
 # Every other call is keyed by its --query value, or by its subcommand when it
 # has none, and answers the compliant value for that key. Override file: one
 # line per override, "<key substring>[@<n>]<TAB><exit status>[:<error
-# code>]<TAB><stdout>". "@<n>" limits the override to the key's nth call; the
+# code>]<TAB><stdout>". A key written "=<key>" matches only that whole key, so
+# "=Status" names the versioning read and not the lifecycle query that also
+# mentions Status. "@<n>" limits the override to the key's nth call; the
 # error code (default StubbedFailure) is the one a failing call names on
 # stderr; each "|" in stdout stands for a tab, since the lifecycle read-back
 # prints tab-separated fields.
@@ -69,8 +71,13 @@ while IFS=$'\t' read -r match orc oout; do
     only=${match##*@}
     match=${match%@*}
   fi
-  if [ -n "${match}" ] && [[ "${key}" == *"${match}"* ]] &&
-    { [ -z "${only}" ] || [ "${only}" = "${n}" ]; }; then
+  hit=0
+  case "${match}" in
+    '') ;;
+    =*) [ "${key}" = "${match#=}" ] && hit=1 ;;
+    *) [[ "${key}" == *"${match}"* ]] && hit=1 ;;
+  esac
+  if [ "${hit}" = 1 ] && { [ -z "${only}" ] || [ "${only}" = "${n}" ]; }; then
     rc=${orc%%:*}
     [[ "${orc}" == *:* ]] && code=${orc#*:}
     out=${oout}
@@ -94,8 +101,16 @@ OK=$'0\t'
 WHOLE='{"f":{"Prefix":""},"p":null}'
 LIFECYCLE_OK="1|Enabled|${WHOLE}|true|1|7"
 
-# A full run after the create: two puts and three read-backs.
-AFTER_CREATE=5
+# The stub answers a bucket that already carries every setting, so a run after
+# the create reads Object Lock, versioning and the lifecycle once each and puts
+# nothing.
+AFTER_CREATE=3
+
+# A fresh bucket: versioning reads unset and the lifecycle configuration absent
+# on the first read, so both are put and read back. After the create: Object
+# Lock, versioning, its put and read-back, lifecycle, its put and read-back.
+FRESH=$'=Status@1\t0\tNone\nlength(Rules)@1\t254:NoSuchLifecycleConfiguration\t'
+FRESH_AFTER_CREATE=7
 
 # Overrides for the next case_ call, one "<key>\t<exit>\t<stdout>" per line.
 override=
@@ -142,7 +157,18 @@ log_has() {
   fi
 }
 
-case_ clean-create 0 1 $((1 + AFTER_CREATE)) "${OK}"
+# log_lacks <case name> <fixed string>: no aws call in the case's log contains
+# the string.
+log_lacks() {
+  if grep -qF -- "$2" "${TMP}/$1/log"; then
+    fails=$((fails + 1))
+    echo "FAIL $1: an aws call contains: $2"
+    sed 's/^/    /' "${TMP}/$1/log"
+  else passes=$((passes + 1)); fi
+}
+
+override="${FRESH}"
+case_ clean-create 0 1 $((1 + FRESH_AFTER_CREATE)) "${OK}"
 case_ bad-credentials-fail-at-once 254 1 1 "${BADKEY}"
 case_ already-owned-on-first-call-succeeds 0 1 $((1 + AFTER_CREATE)) "${OWNED}"
 case_ connection-error-then-created 0 2 $((2 + AFTER_CREATE)) "${CONN}" "${OK}"
@@ -152,58 +178,85 @@ case_ service-unavailable-is-retried 0 3 $((3 + AFTER_CREATE)) "${UNAVAIL}" "${U
 case_ persistent-connection-error-gives-up 1 5 5 "${CONN}"
 case_ transient-then-permanent-fails-with-its-code 254 2 2 "${CONN}" "${BADKEY}"
 
-# The configuration the clean create sends.
+# A fresh bucket gets both puts, each after its read.
 log_has clean-create 'put-bucket-versioning --bucket b --versioning-configuration Status=Enabled'
 log_has clean-create 'put-bucket-lifecycle-configuration --bucket b --lifecycle-configuration {"Rules":[{"ID":"ravel","Filter":{"Prefix":""},"Status":"Enabled","Expiration":{"ExpiredObjectDeleteMarker":true},"NoncurrentVersionExpiration":{"NoncurrentDays":1},"AbortIncompleteMultipartUpload":{"DaysAfterInitiation":7}}]}'
+clean_sequence=$(awk '{ printf "%s ", $4 }' "${TMP}/clean-create/log")
+want_sequence='create-bucket get-object-lock-configuration get-bucket-versioning put-bucket-versioning get-bucket-versioning get-bucket-lifecycle-configuration put-bucket-lifecycle-configuration get-bucket-lifecycle-configuration '
+if [ "${clean_sequence}" = "${want_sequence}" ]; then passes=$((passes + 1)); else
+  fails=$((fails + 1)); echo "FAIL clean-create: want calls ${want_sequence}, got ${clean_sequence}"
+fi
+
+# An existing bucket already Enabled and already carrying the rule issues no
+# put: RustFS answers InternalError to a second PutBucketVersioning on an Object
+# Lock bucket, so a rerun that put again would fail. Each setting is read once.
+case_ existing-settled-bucket-issues-no-put 0 1 $((1 + AFTER_CREATE)) "${OWNED}"
+log_lacks existing-settled-bucket-issues-no-put ' put-'
+for sub in get-object-lock-configuration get-bucket-versioning get-bucket-lifecycle-configuration; do
+  reads=$(grep -c " ${sub} " "${TMP}/existing-settled-bucket-issues-no-put/log")
+  if [ "${reads}" = 1 ]; then passes=$((passes + 1)); else
+    fails=$((fails + 1)); echo "FAIL existing-settled-bucket-issues-no-put: want 1 ${sub}, got ${reads}"
+  fi
+done
+# Only the setting that does not already match is put.
+override=$'length(Rules)@1\t254:NoSuchLifecycleConfiguration\t'
+case_ existing-versioned-bucket-puts-only-the-lifecycle 0 1 $((1 + 5)) "${OWNED}"
+log_lacks existing-versioned-bucket-puts-only-the-lifecycle 'put-bucket-versioning'
+override=$'=Status@1\t0\tSuspended'
+case_ existing-suspended-bucket-puts-only-versioning 0 1 $((1 + 5)) "${OWNED}"
+log_lacks existing-suspended-bucket-puts-only-versioning 'put-bucket-lifecycle-configuration'
+override=$'length(Rules)@1\t0\t'"1|Enabled|${WHOLE}|true|30|7"
+case_ existing-bucket-with-other-rule-gets-the-lifecycle-put 0 1 $((1 + 5)) "${OWNED}"
+log_has existing-bucket-with-other-rule-gets-the-lifecycle-put 'put-bucket-lifecycle-configuration'
 
 # A put that fails non-transiently stops the run at once with its exit status.
-override=$'put-bucket-versioning\t254\t'
-case_ versioning-put-fails 254 1 2 "${OK}"
-override=$'put-bucket-lifecycle-configuration\t254\t'
-case_ lifecycle-put-fails 254 1 3 "${OK}"
-override=$'put-bucket-versioning\t254:AccessDenied\t'
-case_ versioning-put-access-denied-fails-at-once 254 1 2 "${OK}"
-override=$'put-bucket-lifecycle-configuration\t254:MalformedXML\t'
-case_ lifecycle-put-malformed-fails-at-once 254 1 3 "${OK}"
+override="${FRESH}"$'\nput-bucket-versioning\t254\t'
+case_ versioning-put-fails 254 1 4 "${OK}"
+override="${FRESH}"$'\nput-bucket-lifecycle-configuration\t254\t'
+case_ lifecycle-put-fails 254 1 7 "${OK}"
+override="${FRESH}"$'\nput-bucket-versioning\t254:AccessDenied\t'
+case_ versioning-put-access-denied-fails-at-once 254 1 4 "${OK}"
+override="${FRESH}"$'\nput-bucket-lifecycle-configuration\t254:MalformedXML\t'
+case_ lifecycle-put-malformed-fails-at-once 254 1 7 "${OK}"
 
 # A put that fails transiently is retried like the create, and one that keeps
 # failing transiently gives up after the same five attempts.
-override=$'put-bucket-versioning@1\t254:ServiceUnavailable\t'
-case_ versioning-put-unavailable-is-retried 0 1 $((2 + AFTER_CREATE)) "${OK}"
-override=$'put-bucket-versioning@1\t255\t\nput-bucket-versioning@2\t254:InternalError\t'
-case_ versioning-put-connection-error-is-retried 0 1 $((3 + AFTER_CREATE)) "${OK}"
-override=$'put-bucket-lifecycle-configuration@1\t254:ServiceUnavailable\t'
-case_ lifecycle-put-unavailable-is-retried 0 1 $((2 + AFTER_CREATE)) "${OK}"
-override=$'put-bucket-lifecycle-configuration@1\t254:SlowDown\t\nput-bucket-lifecycle-configuration@2\t254:AccessDenied\t'
-case_ lifecycle-put-transient-then-permanent-fails 254 1 4 "${OK}"
-override=$'put-bucket-versioning\t254:ServiceUnavailable\t'
-case_ versioning-put-persistently-unavailable-gives-up 1 1 6 "${OK}"
-override=$'put-bucket-lifecycle-configuration\t255\t'
-case_ lifecycle-put-persistent-connection-error-gives-up 1 1 7 "${OK}"
+override="${FRESH}"$'\nput-bucket-versioning@1\t254:ServiceUnavailable\t'
+case_ versioning-put-unavailable-is-retried 0 1 $((2 + FRESH_AFTER_CREATE)) "${OK}"
+override="${FRESH}"$'\nput-bucket-versioning@1\t255\t\nput-bucket-versioning@2\t254:InternalError\t'
+case_ versioning-put-connection-error-is-retried 0 1 $((3 + FRESH_AFTER_CREATE)) "${OK}"
+override="${FRESH}"$'\nput-bucket-lifecycle-configuration@1\t254:ServiceUnavailable\t'
+case_ lifecycle-put-unavailable-is-retried 0 1 $((2 + FRESH_AFTER_CREATE)) "${OK}"
+override="${FRESH}"$'\nput-bucket-lifecycle-configuration@1\t254:SlowDown\t\nput-bucket-lifecycle-configuration@2\t254:AccessDenied\t'
+case_ lifecycle-put-transient-then-permanent-fails 254 1 8 "${OK}"
+override="${FRESH}"$'\nput-bucket-versioning\t254:ServiceUnavailable\t'
+case_ versioning-put-persistently-unavailable-gives-up 1 1 8 "${OK}"
+override="${FRESH}"$'\nput-bucket-lifecycle-configuration\t255\t'
+case_ lifecycle-put-persistent-connection-error-gives-up 1 1 11 "${OK}"
 
-# Each read-back that does not confirm its setting fails the run, and the run
-# stops at the first one.
+# Each read that does not confirm its setting fails the run, and the run stops
+# at the first one. A bucket without Object Lock is refused before anything is
+# put on it.
 override=$'ObjectLockEnabled\t254\t'
-case_ existing-bucket-without-object-lock-fails 1 1 4 "${OWNED}"
+case_ existing-bucket-without-object-lock-fails 1 1 2 "${OWNED}"
 override=$'ObjectLockEnabled\t0\tNone'
-case_ object-lock-not-enabled-fails 1 1 4 "${OK}"
-override=$'Status\t0\tSuspended'
+case_ object-lock-not-enabled-fails 1 1 2 "${OK}"
+log_lacks object-lock-not-enabled-fails ' put-'
+override=$'=Status\t0\tSuspended'
 case_ versioning-suspended-fails 1 1 5 "${OK}"
-override=$'Status\t254\t'
-case_ versioning-read-error-fails 1 1 5 "${OK}"
+override=$'=Status\t254\t'
+case_ versioning-read-error-fails 1 1 3 "${OK}"
 
-# The lifecycle configuration is read once, whatever the verdict.
-log_has clean-create "get-bucket-lifecycle-configuration --bucket b --output text --query"
-lifecycle_reads=$(grep -c 'get-bucket-lifecycle-configuration' "${TMP}/clean-create/log")
-if [ "${lifecycle_reads}" = 1 ]; then passes=$((passes + 1)); else
-  fails=$((fails + 1)); echo "FAIL clean-create: want 1 lifecycle read, got ${lifecycle_reads}"
-fi
-
-# lifecycle_case_ <name> <want exit> <read-back fields>: a run whose lifecycle
-# read-back answers the given fields ("|" between them).
+# lifecycle_case_ <name> <want exit> <read fields>: a run whose lifecycle reads
+# all answer the given fields ("|" between them). A passing document is read
+# once and never put; a failing one is put and read back once more.
 lifecycle_case_() {
   override="length(Rules)"$'\t0\t'"$3"
-  case_ "$1" "$2" 1 $((1 + AFTER_CREATE)) "${OK}"
+  if [ "$2" = 0 ]; then
+    case_ "$1" "$2" 1 $((1 + AFTER_CREATE)) "${OK}"
+  else
+    case_ "$1" "$2" 1 $((3 + AFTER_CREATE)) "${OK}"
+  fi
 }
 override=$'length(Rules)\t254\t'
 case_ lifecycle-read-error-fails 1 1 $((1 + AFTER_CREATE)) "${OK}"
@@ -222,21 +275,21 @@ lifecycle_case_ empty-filter-passes 0 '1|Enabled|{"f":{},"p":null}|true|1|7'
 lifecycle_case_ and-empty-prefix-passes 0 '1|Enabled|{"f":{"And":{"Prefix":""}},"p":null}|true|1|7'
 lifecycle_case_ legacy-empty-prefix-passes 0 '1|Enabled|{"f":null,"p":""}|true|1|7'
 
-# A read-back that fails transiently is retried like the puts, and one that
-# keeps failing transiently gives up after the same five attempts.
+# A read that fails transiently is retried like the puts, and one that keeps
+# failing transiently gives up after the same five attempts.
 override=$'ObjectLockEnabled@1\t254:ServiceUnavailable\t'
 case_ object-lock-read-unavailable-is-retried 0 1 $((2 + AFTER_CREATE)) "${OK}"
 override=$'length(Rules)@1\t255\t\nlength(Rules)@2\t254:SlowDown\t'
 case_ lifecycle-read-transient-is-retried 0 1 $((3 + AFTER_CREATE)) "${OK}"
 override=$'ObjectLockEnabled\t254:InternalError\t'
-case_ object-lock-read-persistently-failing-gives-up 1 1 8 "${OK}"
+case_ object-lock-read-persistently-failing-gives-up 1 1 6 "${OK}"
 
 # --- deploy/k8s/floci.yaml's create Job ------------------------------------
 #
 # The Job's shell is cut out of the manifest (the block scalar under the
 # create-bucket container's `- |`, dedented) and run against a stub curl that
 # answers a compliant bucket and serves the case's lifecycle document. It runs
-# under busybox sh with busybox grep, tr and wc first on PATH when busybox is
+# under busybox sh with busybox grep, sed, tr and wc first on PATH when busybox is
 # installed, as in the curlimages/curl image.
 FLOCI_YAML="${HERE}/../deploy/k8s/floci.yaml"
 FLOCI_SCRIPT="${TMP}/floci-create-bucket.sh"
@@ -293,9 +346,9 @@ chmod +x "${FLOCI_BIN}/sleep"
 floci_sh=(sh)
 if command -v busybox >/dev/null 2>&1; then
   floci_sh=(busybox sh)
-  for applet in grep tr wc; do ln -s "$(command -v busybox)" "${FLOCI_BIN}/${applet}"; done
+  for applet in grep sed tr wc; do ln -s "$(command -v busybox)" "${FLOCI_BIN}/${applet}"; done
 else
-  echo "note: busybox not installed; the floci cases run under sh with the host's grep, tr and wc"
+  echo "note: busybox not installed; the floci cases run under sh with the host's grep, sed, tr and wc"
 fi
 
 RULE_ACTIONS='<Status>Enabled</Status><Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration><NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration><AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation></AbortIncompleteMultipartUpload>'
@@ -336,6 +389,11 @@ floci_rule_ self-closing-filter 0 '<Filter/>'
 floci_rule_ legacy-empty-prefix 0 '<Prefix></Prefix>'
 floci_rule_ legacy-self-closing-prefix 0 '<Prefix/>'
 floci_rule_ space-inside-the-prefix-tag 0 '<Filter><Prefix ></Prefix></Filter>'
+floci_rule_ space-inside-the-and-prefix-tag 0 '<Filter><And><Prefix ></Prefix></And></Filter>'
+floci_rule_ space-inside-the-legacy-prefix-tag 0 '<Prefix ></Prefix>'
+floci_rule_ space-inside-a-self-closing-prefix-tag 0 '<Filter><Prefix /></Filter>'
+floci_rule_ newline-inside-the-prefix-tag 0 '<Filter><Prefix
+></Prefix></Filter>'
 floci_case_ pretty-printed 0 '<?xml version="1.0" encoding="UTF-8"?>
 <LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Rule>
@@ -378,6 +436,15 @@ floci_rule_ repeated-legacy-prefix 1 '<Prefix/><Prefix/>'
 floci_rule_ space-prefix 1 '<Filter><Prefix> </Prefix></Filter>'
 floci_rule_ newline-prefix 1 '<Prefix>
 </Prefix>'
+# A space inside the open tag hides nothing: the server still reads the text
+# after it as a prefix of spaces, at every level a Prefix can sit.
+floci_rule_ spaced-tag-space-prefix 1 '<Filter><Prefix > </Prefix></Filter>'
+floci_rule_ spaced-tag-space-and-prefix 1 '<Filter><And><Prefix > </Prefix></And></Filter>'
+floci_rule_ spaced-tag-space-legacy-prefix 1 '<Prefix > </Prefix>'
+floci_rule_ spaced-tag-newline-prefix 1 '<Filter><Prefix
+>
+</Prefix></Filter>'
+floci_rule_ and-space-prefix 1 '<Filter><And><Prefix> </Prefix></And></Filter>'
 floci_rule_ non-empty-prefix 1 '<Filter><Prefix>t/</Prefix></Filter>'
 floci_rule_ tag 1 '<Filter><Tag><Key>k</Key><Value>v</Value></Tag></Filter>'
 floci_rule_ and-prefix-and-size 1 '<Filter><And><Prefix/><ObjectSizeGreaterThan>1</ObjectSizeGreaterThan></And></Filter>'

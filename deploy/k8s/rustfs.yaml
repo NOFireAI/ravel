@@ -204,76 +204,105 @@ spec:
               # Verify rather than trust: head-bucket fails if the bucket is
               # absent, so getting past it proves it exists.
               aws --endpoint-url "$ENDPOINT" s3api head-bucket --bucket "$BUCKET" >/dev/null
-              # Both calls replace the whole configuration, so a rerun is a no-op.
-              aws --endpoint-url "$ENDPOINT" s3api put-bucket-versioning --bucket "$BUCKET" \
-                --versioning-configuration Status=Enabled
-              aws --endpoint-url "$ENDPOINT" s3api put-bucket-lifecycle-configuration \
-                --bucket "$BUCKET" --lifecycle-configuration "$LIFECYCLE"
-              # Read back the three configurations the startup check reads. A
-              # bucket created by an older manifest without Object Lock fails
-              # here; delete the rustfs pod to start from an empty store.
+              # Object Lock is read before anything is put. A bucket created by
+              # an older manifest without Object Lock fails here; delete the
+              # rustfs pod to start from an empty store.
               lock="$(aws --endpoint-url "$ENDPOINT" s3api get-object-lock-configuration \
                 --bucket "$BUCKET" --query ObjectLockConfiguration.ObjectLockEnabled --output text)"
               if [ "$lock" != "Enabled" ]; then
                 echo "bucket ${BUCKET} does not have Object Lock enabled (${lock})" >&2
                 exit 1
               fi
+              # Versioning and the lifecycle rule are each read first and put
+              # only when the read does not already match, then read back.
+              # RustFS answers InternalError to every PutBucketVersioning after
+              # the first on an Object Lock bucket, so a rerun of this Job
+              # against an existing bucket must not put again.
               versioning="$(aws --endpoint-url "$ENDPOINT" s3api get-bucket-versioning \
                 --bucket "$BUCKET" --query Status --output text)"
-              if [ "$versioning" != "Enabled" ]; then
-                echo "bucket ${BUCKET} does not have versioning enabled (${versioning})" >&2
-                exit 1
-              fi
-              # The lifecycle configuration is read once and checked whole, as
-              # tab-separated fields: rule count, Status, scope (the rule's
-              # Filter and legacy Prefix as one JSON object), then the three
-              # actions. Every field goes through to_string, so none is empty.
-              lifecycle="$(aws --endpoint-url "$ENDPOINT" s3api get-bucket-lifecycle-configuration \
-                --bucket "$BUCKET" --output text --query '[to_string(length(Rules)), to_string(Rules[0].Status), to_string({f: Rules[0].Filter, p: Rules[0].Prefix}), to_string(Rules[0].Expiration.ExpiredObjectDeleteMarker), to_string(Rules[0].NoncurrentVersionExpiration.NoncurrentDays), to_string(Rules[0].AbortIncompleteMultipartUpload.DaysAfterInitiation)]')"
-              tab="$(printf '\t')"
-              set -f
-              IFS="$tab"
-              set -- $lifecycle
-              unset IFS
-              set +f
-              if [ "$#" -ne 6 ]; then
-                echo "bucket ${BUCKET} lifecycle read-back is malformed (${lifecycle})" >&2
-                exit 1
-              fi
-              if [ "$1" != "1" ]; then
-                echo "bucket ${BUCKET} carries $1 lifecycle rules, not exactly one" >&2
-                exit 1
-              fi
-              if [ "$2" != "Enabled" ]; then
-                echo "bucket ${BUCKET} lifecycle rule is not enabled ($2)" >&2
-                exit 1
-              fi
-              # The whole-bucket spellings the server's rule parser reads as an
-              # empty prefix. This reads through botocore, which drops unknown
-              # elements and text inside Filter and keeps only the first of two
-              # Filters, so such a rule reads back as an accepted spelling here.
-              # The server's parser reads it as an unrecognized filter, reports
-              # the lifecycle conditions unknown, and starts with a warning
-              # rather than refusing.
-              case "$3" in
-                '{"f":{"Prefix":""},"p":null}' | '{"f":{},"p":null}' | \
-                  '{"f":{"And":{"Prefix":""}},"p":null}' | '{"f":null,"p":""}') ;;
-                *)
-                  echo "bucket ${BUCKET} lifecycle rule is not scoped to the whole bucket ($3)" >&2
+              if [ "$versioning" = "Enabled" ]; then
+                echo "bucket ${BUCKET} already has versioning Enabled; not putting it"
+              else
+                aws --endpoint-url "$ENDPOINT" s3api put-bucket-versioning --bucket "$BUCKET" \
+                  --versioning-configuration Status=Enabled
+                versioning="$(aws --endpoint-url "$ENDPOINT" s3api get-bucket-versioning \
+                  --bucket "$BUCKET" --query Status --output text)"
+                if [ "$versioning" != "Enabled" ]; then
+                  echo "bucket ${BUCKET} does not have versioning enabled (${versioning})" >&2
                   exit 1
-                  ;;
-              esac
-              if [ "$4" != "true" ]; then
-                echo "bucket ${BUCKET} does not carry the expired-delete-marker rule ($4)" >&2
-                exit 1
+                fi
               fi
-              if [ "$5" != "1" ]; then
-                echo "bucket ${BUCKET} does not carry the noncurrent-expiration rule ($5)" >&2
-                exit 1
-              fi
-              if [ "$6" != "7" ]; then
-                echo "bucket ${BUCKET} does not carry the multipart-abort rule ($6)" >&2
-                exit 1
+              # lifecycle_ok reads the lifecycle configuration once and checks
+              # it whole, as tab-separated fields: rule count, Status, scope
+              # (the rule's Filter and legacy Prefix as one JSON object), then
+              # the three actions. Every field goes through to_string, so none
+              # is empty. It returns 1 with the mismatch in $why, including
+              # when the read fails because the bucket has no configuration.
+              lifecycle_ok() {
+                if ! lifecycle="$(aws --endpoint-url "$ENDPOINT" s3api get-bucket-lifecycle-configuration \
+                  --bucket "$BUCKET" --output text --query '[to_string(length(Rules)), to_string(Rules[0].Status), to_string({f: Rules[0].Filter, p: Rules[0].Prefix}), to_string(Rules[0].Expiration.ExpiredObjectDeleteMarker), to_string(Rules[0].NoncurrentVersionExpiration.NoncurrentDays), to_string(Rules[0].AbortIncompleteMultipartUpload.DaysAfterInitiation)]')"; then
+                  why="could not read the lifecycle configuration of bucket ${BUCKET}"
+                  return 1
+                fi
+                tab="$(printf '\t')"
+                set -f
+                IFS="$tab"
+                set -- $lifecycle
+                unset IFS
+                set +f
+                if [ "$#" -ne 6 ]; then
+                  why="bucket ${BUCKET} lifecycle read-back is malformed (${lifecycle})"
+                  return 1
+                fi
+                if [ "$1" != "1" ]; then
+                  why="bucket ${BUCKET} carries $1 lifecycle rules, not exactly one"
+                  return 1
+                fi
+                if [ "$2" != "Enabled" ]; then
+                  why="bucket ${BUCKET} lifecycle rule is not enabled ($2)"
+                  return 1
+                fi
+                # The whole-bucket spellings the server's rule parser reads as
+                # an empty prefix. This reads through botocore, which drops
+                # unknown elements and text inside Filter and keeps only the
+                # first of two Filters. Text beside a Filter's one Prefix is
+                # harmless: the server ignores it too and reads the whole
+                # bucket. An unknown element inside Filter, text in a Filter
+                # with no child, or a second Filter reads back as an accepted
+                # spelling here, while the server reads it as an unrecognized
+                # filter, reports the lifecycle conditions unknown, and starts
+                # with a warning rather than refusing.
+                case "$3" in
+                  '{"f":{"Prefix":""},"p":null}' | '{"f":{},"p":null}' | \
+                    '{"f":{"And":{"Prefix":""}},"p":null}' | '{"f":null,"p":""}') ;;
+                  *)
+                    why="bucket ${BUCKET} lifecycle rule is not scoped to the whole bucket ($3)"
+                    return 1
+                    ;;
+                esac
+                if [ "$4" != "true" ]; then
+                  why="bucket ${BUCKET} does not carry the expired-delete-marker rule ($4)"
+                  return 1
+                fi
+                if [ "$5" != "1" ]; then
+                  why="bucket ${BUCKET} does not carry the noncurrent-expiration rule ($5)"
+                  return 1
+                fi
+                if [ "$6" != "7" ]; then
+                  why="bucket ${BUCKET} does not carry the multipart-abort rule ($6)"
+                  return 1
+                fi
+              }
+              if lifecycle_ok 2>/dev/null; then
+                echo "bucket ${BUCKET} already carries the lifecycle rule; not putting it"
+              else
+                echo "putting the lifecycle rule: ${why}"
+                aws --endpoint-url "$ENDPOINT" s3api put-bucket-lifecycle-configuration \
+                  --bucket "$BUCKET" --lifecycle-configuration "$LIFECYCLE"
+                if ! lifecycle_ok; then
+                  echo "$why" >&2
+                  exit 1
+                fi
               fi
               echo "bucket ${BUCKET} ready: Object Lock, versioning and lifecycle rules set"
           resources:

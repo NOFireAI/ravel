@@ -17,7 +17,7 @@
 #
 # Credentials and region come from the standard AWS_ACCESS_KEY_ID,
 # AWS_SECRET_ACCESS_KEY and AWS_DEFAULT_REGION variables. Every s3api call (the
-# create, both puts and the three read-backs) is retried with backoff only when
+# create, each put and each read) is retried with backoff only when
 # it failed transiently: exit 255 (the CLI got no usable response: connection
 # refused, reset or timed out) or a 5xx-class S3 error code. RustFS can answer
 # the create and still be settling, so a put or a read can fail transiently
@@ -29,12 +29,15 @@
 # CI_CREATE_BUCKET_BACKOFF_SECONDS (default 5) is the backoff unit; attempt n
 # waits n units before the next.
 #
-# Versioning and the lifecycle rule are put, which replaces the whole
-# configuration, so a rerun is a no-op. Every setting is read back and checked;
-# an existing bucket created without Object Lock fails the read-back, since
-# Object Lock can only be enabled at creation. The lifecycle configuration is
-# read once and checked whole: exactly one rule, enabled, scoped to the whole
-# bucket (ADR-1727 rule-scope and no-foreign-rule), carrying each action.
+# Object Lock is read first: an existing bucket created without it fails before
+# anything is changed, since Object Lock can only be enabled at creation.
+# Versioning and the lifecycle rule are each read before they are put and put
+# only when the read does not already match, then read back. RustFS answers
+# InternalError to every PutBucketVersioning after the first on an Object Lock
+# bucket, so a rerun against an existing bucket must not put again. The
+# lifecycle configuration is read and checked whole: exactly one rule, enabled,
+# scoped to the whole bucket (ADR-1727 rule-scope and no-foreign-rule),
+# carrying each action.
 #
 # Cases: scripts/ci-create-bucket.test.sh.
 set -uo pipefail
@@ -98,67 +101,101 @@ if grep -q '(BucketAlreadyOwnedByYou)' "$err"; then
 else
   echo "created bucket $bucket at $endpoint"
 fi
-retry '' put-bucket-versioning --bucket "$bucket" \
-  --versioning-configuration Status=Enabled
-retry '' put-bucket-lifecycle-configuration \
-  --bucket "$bucket" --lifecycle-configuration "$LIFECYCLE"
-
-# readback <setting> <want> <get-subcommand> <query>: read one value of the
-# bucket's configuration and fail unless it is <want>. The read goes through
-# retry, since a backend still settling can answer a GET transiently too.
-readback() {
-  local setting=$1 want=$2 subcommand=$3 query=$4 got rc=0
+# read_setting <setting> <get-subcommand> <query>: print one value of the
+# bucket's configuration. The read goes through retry, since a backend still
+# settling can answer a GET transiently too.
+read_setting() {
+  local setting=$1 subcommand=$2 query=$3 got rc=0
   got=$(retry '' "$subcommand" --bucket "$bucket" \
     --query "$query" --output text) || rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "::error::$subcommand on $bucket failed (exit $rc); cannot confirm $setting" >&2
     exit 1
   fi
-  if [ "$got" != "$want" ]; then
-    echo "::error::bucket $bucket does not carry $setting (want $want, read $got)" >&2
+  printf '%s\n' "$got"
+}
+
+# readback <setting> <want> <get-subcommand> <query>: read one value and fail
+# unless it is <want>.
+readback() {
+  local got
+  got=$(read_setting "$1" "$3" "$4") || exit 1
+  if [ "$got" != "$2" ]; then
+    echo "::error::bucket $bucket does not carry $1 (want $2, read $got)" >&2
     exit 1
+  fi
+}
+
+# lifecycle_matches: one read of the whole lifecycle configuration, printed as
+# tab-separated fields: rule count, Status, scope, then the three actions.
+# Every field goes through to_string, so none is empty and the split cannot
+# shift. The scope is the rule's Filter and legacy rule-level Prefix as one JSON
+# object. Returns 1 with the mismatch in $why when the configuration is absent
+# or differs; exits on a read that fails any other way.
+lifecycle_matches() {
+  local got rc=0 rules rule_status scope markers noncurrent abort
+  got=$(retry '(NoSuchLifecycleConfiguration)' get-bucket-lifecycle-configuration \
+    --bucket "$bucket" --output text --query '[to_string(length(Rules)), to_string(Rules[0].Status), to_string({f: Rules[0].Filter, p: Rules[0].Prefix}), to_string(Rules[0].Expiration.ExpiredObjectDeleteMarker), to_string(Rules[0].NoncurrentVersionExpiration.NoncurrentDays), to_string(Rules[0].AbortIncompleteMultipartUpload.DaysAfterInitiation)]') || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "::error::get-bucket-lifecycle-configuration on $bucket failed (exit $rc)" >&2
+    exit 1
+  fi
+  if grep -q '(NoSuchLifecycleConfiguration)' "$err"; then
+    why="bucket $bucket carries no lifecycle configuration"
+    return 1
+  fi
+  IFS=$'\t' read -r rules rule_status scope markers noncurrent abort <<<"$got"
+  lifecycle_want "exactly one lifecycle rule" 1 "$rules" || return 1
+  lifecycle_want "an enabled lifecycle rule" Enabled "$rule_status" || return 1
+  # The whole-bucket spellings the server's rule parser reads as an empty
+  # prefix. This reads through botocore, which drops unknown elements and text
+  # inside Filter and keeps only the first of two Filters. Text beside a
+  # Filter's one Prefix is harmless: the server ignores it too and reads the
+  # whole bucket. An unknown element inside Filter, text in a Filter with no
+  # child, or a second Filter reads back as an accepted spelling here, while the
+  # server reads it as an unrecognized filter, reports the lifecycle conditions
+  # unknown, and starts with a warning rather than refusing.
+  case "$scope" in
+    '{"f":{"Prefix":""},"p":null}' | '{"f":{},"p":null}' | \
+      '{"f":{"And":{"Prefix":""}},"p":null}' | '{"f":null,"p":""}') ;;
+    *)
+      why="bucket $bucket lifecycle rule is not scoped to the whole bucket (read $scope)"
+      return 1
+      ;;
+  esac
+  lifecycle_want "the expired-delete-marker rule" true "$markers" || return 1
+  lifecycle_want "the noncurrent-expiration rule" 1 "$noncurrent" || return 1
+  lifecycle_want "the multipart-abort rule" 7 "$abort"
+}
+lifecycle_want() {
+  if [ "$3" != "$2" ]; then
+    why="bucket $bucket does not carry $1 (want $2, read $3)"
+    return 1
   fi
 }
 
 readback "Object Lock" Enabled get-object-lock-configuration \
   ObjectLockConfiguration.ObjectLockEnabled
-readback versioning Enabled get-bucket-versioning Status
 
-# One read of the whole lifecycle configuration, printed as tab-separated
-# fields: rule count, Status, scope, then the three actions. Every field goes
-# through to_string, so none is empty and the split cannot shift. The scope is
-# the rule's Filter and legacy rule-level Prefix as one JSON object.
-rc=0
-got=$(retry '' get-bucket-lifecycle-configuration \
-  --bucket "$bucket" --output text --query '[to_string(length(Rules)), to_string(Rules[0].Status), to_string({f: Rules[0].Filter, p: Rules[0].Prefix}), to_string(Rules[0].Expiration.ExpiredObjectDeleteMarker), to_string(Rules[0].NoncurrentVersionExpiration.NoncurrentDays), to_string(Rules[0].AbortIncompleteMultipartUpload.DaysAfterInitiation)]') || rc=$?
-if [ "$rc" -ne 0 ]; then
-  echo "::error::get-bucket-lifecycle-configuration on $bucket failed (exit $rc)" >&2
-  exit 1
+versioning=$(read_setting versioning get-bucket-versioning Status) || exit 1
+if [ "$versioning" = Enabled ]; then
+  echo "bucket $bucket already has versioning Enabled; not putting it"
+else
+  retry '' put-bucket-versioning --bucket "$bucket" \
+    --versioning-configuration Status=Enabled
+  readback versioning Enabled get-bucket-versioning Status
 fi
-IFS=$'\t' read -r rules rule_status scope markers noncurrent abort <<<"$got"
-lifecycle_want() {
-  if [ "$3" != "$2" ]; then
-    echo "::error::bucket $bucket does not carry $1 (want $2, read $3)" >&2
+
+why=
+if lifecycle_matches; then
+  echo "bucket $bucket already carries the lifecycle rule; not putting it"
+else
+  echo "putting the lifecycle rule: $why"
+  retry '' put-bucket-lifecycle-configuration \
+    --bucket "$bucket" --lifecycle-configuration "$LIFECYCLE"
+  if ! lifecycle_matches; then
+    echo "::error::$why" >&2
     exit 1
   fi
-}
-lifecycle_want "exactly one lifecycle rule" 1 "$rules"
-lifecycle_want "an enabled lifecycle rule" Enabled "$rule_status"
-# The whole-bucket spellings the server's rule parser reads as an empty prefix.
-# This reads through botocore, which drops unknown elements and text inside
-# Filter and keeps only the first of two Filters, so such a rule reads back as
-# an accepted spelling here. The server's parser reads it as an unrecognized
-# filter, reports the lifecycle conditions unknown, and starts with a warning
-# rather than refusing.
-case "$scope" in
-  '{"f":{"Prefix":""},"p":null}' | '{"f":{},"p":null}' | \
-    '{"f":{"And":{"Prefix":""}},"p":null}' | '{"f":null,"p":""}') ;;
-  *)
-    echo "::error::bucket $bucket lifecycle rule is not scoped to the whole bucket (read $scope)" >&2
-    exit 1
-    ;;
-esac
-lifecycle_want "the expired-delete-marker rule" true "$markers"
-lifecycle_want "the noncurrent-expiration rule" 1 "$noncurrent"
-lifecycle_want "the multipart-abort rule" 7 "$abort"
+fi
 echo "bucket $bucket ready: Object Lock, versioning and lifecycle rules set"
