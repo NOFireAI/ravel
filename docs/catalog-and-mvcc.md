@@ -316,7 +316,10 @@ are written only through `TenantConfig::set_clustering_key`,
 `TenantConfig::clear_clustering_key` and `TenantConfig::set_bloom_scope`, each
 of which takes a `StorageLayoutWrite` token and refuses with
 `WriterCannotEmit` unless it is `ReadersRolledOut`, the operator's statement
-that the version-3 reader is deployed everywhere. That is the ADR-0066 R1
+that the version-3 reader is deployed everywhere. `ravel-cli clustering-key
+set`, `ravel-cli clustering-key clear` and `ravel-cli bloom-scope set` call
+them, passing `ReadersRolledOut` only under their required
+`--readers-rolled-out` flag. That is the ADR-0066 R1
 reader-first rule: a binary whose reader predates version 3 has a read
 ceiling of 2 and refuses a version-3 record outright, so its reads of that
 tenant's config fail and it will not rewrite the record. The token is not
@@ -328,12 +331,19 @@ that did not come from an opted-in setter or a decoded version-3 record, so a
 version-1 or version-2 record that carries field 13 or 14 cannot be written
 back. That opt-in check runs before any object-store request.
 
-The clustering generation follows ADR-2135. A key that was never set is an
-absent field 13 at generation 0. Every set and every clear stores the stored
-generation plus one: the first set is generation 1, and a clear of a key at
-generation `g` keeps field 13 present with an empty column list, an
-unspecified bucket width and generation `g + 1`, which ranks the clear above
-every earlier key. Clearing a key that was never set is refused. A record
+The clustering generation follows ADR-2135. A tenant that never set a key or
+a bloom scope has an absent field 13 at generation 0. Every set and every
+clear stores the stored generation plus one: the first set is generation 1,
+and a clear of a key at generation `g` keeps field 13 present with an empty
+column list, an unspecified bucket width and generation `g + 1`, which ranks
+the clear above every earlier key. A bloom scope change takes a generation
+too, so one generation names exactly one key and one scope:
+`set_bloom_scope` with a scope other than the stored one stores the stored
+generation plus one and leaves the key's columns and bucket width as they
+were, and on a tenant with no field 13 it writes field 13 in its cleared form
+at generation 1. Setting the scope already stored changes nothing. Clearing a
+key that was never set, or one already cleared, is refused and takes no
+generation. A record
 spells a cleared key differently from a log segment footer: the record keeps
 the field present with an empty column list and a generation, while the footer
 (docs/log-segment-format.md) carries no `sort_descriptor` and a nonzero
@@ -342,10 +352,15 @@ declared in the record's own `typed_attr_columns` (not the base columns a
 server falls back to when the record declares none), and a specified bucket
 width. On every write `set_tenant_config` runs the accessor's validation on a
 carried key, including those column rules, and refuses a bloom scope value
-the enum does not define. It does not repeat the setters' generation
-arithmetic. Against the record it replaces it enforces that the generation
-never goes down and that a key whose columns, or whose bucket width while
-set, differ from the stored key's carries a new generation; it does not
+the enum does not define. Field 14 follows the setter rule too: against the
+record it replaces, `set_tenant_config` refuses a bloom scope that differs
+from the stored one unless `set_bloom_scope` produced it
+(`BloomScopeChangedOutsideSetter`), and a scope change at the stored
+clustering generation (`BloomScopeChangedWithoutGeneration`), since that
+config was not read from the current record. It does not repeat the setters'
+generation arithmetic. Against the record it replaces it enforces that the
+generation never goes down and that a key whose columns, or whose bucket
+width while set, differ from the stored key's carries a new generation; it does not
 require the stored generation plus one, so two setter calls on one
 in-memory config store the stored generation plus two. While the stored set
 key is current it also refuses a `typed_attr_columns` change that drops or
@@ -370,7 +385,8 @@ separate concern.
 
 `ravel-cli clustering-key show --tenant <t>` and `ravel-cli bloom-scope show
 --tenant <t>` print fields 13 and 14 of a tenant's record, including one of
-version 3.
+version 3; `clustering-key set`/`clear` and `bloom-scope set` write them (see
+the [ingest guide](guides/ingest.md#setting-a-tenants-clustering-key-and-bloom-scope)).
 
 `t/<tenant_hash>/m/meta` (ADR-0085 §1) is the durable per-tenant metric
 metadata record: one entry per metric **family name** (never per series)

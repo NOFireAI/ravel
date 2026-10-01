@@ -1133,8 +1133,9 @@ size and never the records read back.
 The level applies only to the objects the load writes. Compaction decodes the
 records of the objects it merges and writes them again at its own level, so a
 compacted object carries no trace of the load's level. A metrics or spans load
-ignores the flag and prints a warning when it is set to anything but 3. `ravel-server` has no matching
-flag yet; its log flush writes at the default level.
+ignores the flag and prints a warning when it is set to anything but 3.
+`ravel-server` has no matching flag yet; its log flush writes at the default
+level.
 
 ### Checking a tenant's clustering key and bloom scope
 
@@ -1165,12 +1166,88 @@ leaves such a key unresolved and writes the tenant's log objects without it.
 `bloom-scope show` prints `all`, `undeclared` or `text`; a tenant with no
 config record reads as `all`. For either command, a failed read of the record,
 or a stored value the catalog refuses, is an error with a non-zero exit and
-nothing on stdout. The catalog can set either field, and stamps format
-version 3 on a config record carrying one, but only behind the
-`StorageLayoutWrite::ReadersRolledOut` opt-in, and no ingest, compaction or
-`ravel-cli` path in this build calls those setters yet. A tenant whose config
-record only this build's commands have written therefore reads as never set
-and `all`.
+nothing on stdout.
+
+### Setting a tenant's clustering key and bloom scope
+
+Three commands write the two fields:
+
+```sh
+ravel-cli clustering-key set --tenant acme --column region --column code \
+  --bucket-width 6h --readers-rolled-out
+ravel-cli clustering-key clear --tenant acme --readers-rolled-out
+ravel-cli bloom-scope set --tenant acme --scope text --readers-rolled-out
+```
+
+Each writes a version-3 config record: it swaps the tenant's record in place
+with `CasVersion`, carrying every other field through unchanged, or creates
+one with `lifecycle_state=active` when the tenant has none. These commands are
+the first production path that writes a version-3 record.
+
+`--readers-rolled-out` is required on all three. It asserts that every process
+reading this bucket's tenant config runs a release that reads record version
+3; a process that does not refuses the record, and that tenant's ingest and
+lifecycle fail closed. Without the flag the command exits 2 with a usage
+error, before any store request.
+
+- `clustering-key set` takes one to four `--column` names in key order and a
+  `--bucket-width` of `1h`, `6h` or `1d`, and sets the key at the stored
+  clustering generation plus one. Every column must be a typed attribute
+  column the tenant's own config record declares (`ravel-cli
+  typed-attr-column set`), each named once. A tenant with no typed attribute
+  column override declares none, so every key is refused there. A refused key
+  prints the catalog's reason, exits non-zero and writes nothing.
+- `clustering-key clear` removes the key at the stored generation plus one,
+  so the clear ranks above every key set before it. It is refused, writing
+  nothing, when the tenant never set a key or the key is already cleared.
+- `bloom-scope set --scope` chooses which string columns an RLOG object's
+  BLOOM section covers: `all` (the default) covers `body`, `severity_text` and
+  every string attribute column; `undeclared` drops the string columns the
+  tenant's config record declares as typed; `text` covers `body` and
+  `severity_text` only. A column outside the scope is scanned rather than
+  pruned on. A change increments the clustering generation and leaves the
+  clustering key as it is; setting the scope already stored prints that it is
+  already set and writes nothing.
+
+From the first `set`, every RLOG object the tenant's log flushes write, from
+ingest and from `ravel-cli load` alike, carries the key and the scope. A
+flushing process reads the record through the same bounded-staleness tenant
+config read that supplies its indexed fields, so objects it flushes shortly
+after a change can still carry the earlier key and scope. With a
+key, an object's rows sort by stream, time bucket, the key columns and then
+timestamp, and its footer records the key as a sort descriptor beside the
+clustering generation. Objects already written keep their order and their
+filters; a change applies to later flushes only.
+
+A worked example: declare two typed columns, cluster on both at 6h, keep the
+blooms on the text columns, load, and inspect one of the objects the load
+wrote ([inspecting-data.md](inspecting-data.md) lists a tenant's objects).
+
+```sh
+ravel-cli typed-attr-column set acme region:str code:i64
+ravel-cli clustering-key set --tenant acme --column region --column code \
+  --bucket-width 6h --readers-rolled-out
+ravel-cli bloom-scope set --tenant acme --scope text --readers-rolled-out
+ravel-cli load --parquet events.parquet --tenant acme --mapping map.toml
+ravel-cli rlog inspect "t/<tenant hash>/l/l0/<shard>/<object>.rlog"
+```
+
+The `clustering-key set` sets generation 1 and the scope change takes
+generation 2, so the inspected object reads, among its other lines:
+
+```
+version: 5
+sort_descriptor: bucket_width=6h key_columns=2
+  key[0] name=region type=str
+  key[1] name=code type=i64
+clustering_generation: 2
+bloom_coverage (2 column(s)):
+  column_id=4 name=severity_text kind=fixed
+  column_id=5 name=body kind=fixed
+```
+
+A query filtering on `region` or another string attribute column returns the
+same rows as before; it scans that column instead of pruning on its filter.
 
 ### Failure, retention, and performance
 

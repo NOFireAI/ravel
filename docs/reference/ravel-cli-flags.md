@@ -475,21 +475,41 @@ Replace the tenant's declaration wholesale, validating it first and swapping the
 
 ## clustering-key
 
-Show a tenant's clustering key (ADR-2135 decision 1), field 13 of its config record at `t/<tenant_hash>/config`. Read-only
+Show, set or clear a tenant's clustering key (ADR-2135 decision 1), field 13 of its config record at `t/<tenant_hash>/config`
 
 _No flags._
 
 ### clustering-key show
 
-Print the tenant's clustering key: never set, cleared at a generation, or set, with its columns and their declared types, bucket width and generation. A stored key the record's validation refuses is an error
+Print the tenant's clustering key: never set, absent at a generation, or set, with its columns and their declared types, bucket width and generation. A stored key the record's validation refuses is an error
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
 | `--tenant` |  |  | The tenant whose clustering key to print |
 
+### clustering-key set
+
+Set the tenant's clustering key at the stored clustering generation plus one, writing a version-3 config record. Every column must be a typed attribute column the tenant's config record itself declares, at most four, each named once; a refused key writes nothing. Log objects flushed after an ingest process reads the new record sort by (stream, time bucket, key columns, timestamp); objects already written keep their order
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--bucket-width` |  |  | The time bucket width that leads the key |
+| `--column` |  |  | A key column, in key order; repeat or list several |
+| `--readers-rolled-out` |  |  | Assert that every process reading this bucket's tenant config runs a release that reads record version 3; a process that does not refuses the record, and that tenant's ingest and lifecycle fail closed |
+| `--tenant` |  |  | The tenant whose clustering key to set |
+
+### clustering-key clear
+
+Clear the tenant's clustering key at the stored clustering generation plus one, keeping the generation in a version-3 config record. Refused, writing nothing, when the tenant has no key to clear
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--readers-rolled-out` |  |  | Assert that every process reading this bucket's tenant config runs a release that reads record version 3; a process that does not refuses the record, and that tenant's ingest and lifecycle fail closed |
+| `--tenant` |  |  | The tenant whose clustering key to clear |
+
 ## bloom-scope
 
-Show a tenant's bloom scope (ADR-2135), field 14 of its config record at `t/<tenant_hash>/config`. Read-only
+Show or set a tenant's bloom scope (ADR-2135), field 14 of its config record at `t/<tenant_hash>/config`
 
 _No flags._
 
@@ -500,6 +520,16 @@ Print the tenant's bloom scope: all (the default, and what a record without the 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
 | `--tenant` |  |  | The tenant whose bloom scope to print |
+
+### bloom-scope set
+
+Set the tenant's bloom scope, writing a version-3 config record. A change increments the clustering generation and leaves the clustering key as it is; the scope already stored writes nothing
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--readers-rolled-out` |  |  | Assert that every process reading this bucket's tenant config runs a release that reads record version 3; a process that does not refuses the record, and that tenant's ingest and lifecycle fail closed |
+| `--scope` |  |  | Which string columns get bloom filters |
+| `--tenant` |  |  | The tenant whose bloom scope to set |
 
 ## tenant
 
