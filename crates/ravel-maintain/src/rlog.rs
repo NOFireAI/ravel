@@ -5263,13 +5263,11 @@ mod tests {
         // as in `stored_target_closes_parts_on_actual_encoded_object_bytes`
         // (same `ratio_record` fixture), 16.2 probes per part by the geometric
         // model, 5 closing parts = 81 plus the trailing part's partial ladder and
-        // the per-part spread around the model = 92 (91 before the parts' string
-        // chunks took row-group dictionaries, #2144, which moved one probe
-        // ladder by one step and left the part count at 6). Under the
-        // rate-model scheduler that test names it runs 16.
+        // the per-part spread around the model = 91. Under the rate-model
+        // scheduler that test names it runs 16.
         assert_eq!(
             tracker.probes_run(),
-            92,
+            91,
             "the probe count is deterministic for this corpus: 16.2 per part by \
              the geometric model over the {} closing parts",
             parts.len() - 1
@@ -6306,9 +6304,11 @@ mod tests {
     /// constants were re-captured under version 5 and the part count stayed
     /// six. They were re-captured once more when the writer began choosing each
     /// page's encoding by stored size, with the GCD and column-reference codecs
-    /// among the candidates (#2140), and again when string chunks gained
-    /// row-group dictionaries (#2144), the part count staying six both times;
-    /// between that change and here a diff can only come from this crate.
+    /// among the candidates (#2140), and the part count again stayed six.
+    /// Row-group string dictionaries (#2144) leave them unchanged: no string
+    /// chunk in these parts stores smaller on one once each side counts its
+    /// PAGE_DIR entries. Between that change and here a diff can only come
+    /// from this crate.
     ///
     /// The stored-target geometry #872 introduced is pinned separately, by
     /// [`stored_target_closes_parts_on_actual_encoded_object_bytes`] (band plus
@@ -6323,12 +6323,12 @@ mod tests {
         /// `l1_part_memory_target_bytes: 32 * 1024`, re-captured at the
         /// stored-size encoding choice (see the note above).
         const EXPECTED_PART_HASHES: &[&str] = &[
-            "c633aaac4dc1b1b1e9eedd26ba3262d58a73b64ecc75199c689e19389caf0ad4",
-            "4ee08c9051ba53a2c78f9e49b726d948d90422b5a705622d68b28394bca78994",
-            "617947cc5ca7a1b192772c18bddfb156f01c6a21a8c238e7758f68d5a9d2608b",
-            "bbe8c635839ea5e73984edefae44dec177ef47da9f4b9c921dc71b644bd7216d",
-            "9826450b8d5a8116d681b7407d4bc6a32e076c0cc95b4487383dd2df67b41060",
-            "47703ea0200c4b6d718279141cb96b33c07268d3455440c3f3953a79b52baf80",
+            "59bc1b97b30c22fefd37082ca13fcea3f9ca413d184d4dad958c425918116463",
+            "79911944901ebc86cabe2f98a3638524e381cb454b292f161b7222c2b2e211a9",
+            "65c1b3b869e6ff4f5511b0860722faee7a9f8e7b418715f1a9f80a2edacb8e16",
+            "fff6977ad871a741019d199d2e08993db2201acfce64b14f9b5fdd1f74f3176e",
+            "d90295bbc856d208095d72acc9da9ff4e1ffd3865148efd87f80783c7ae0d3b5",
+            "71bd01a6239b6173a9bec9780947073323b3fdc799fc4604a1c00996413932d1",
         ];
 
         let (hashes, rows) = differential_hash_run().await;
@@ -6671,7 +6671,7 @@ mod tests {
         // The exact bytes, not only the order: the part hashes under overlap-gated
         // and eager all-open admission, pinned as literals.
         const EXPECTED_HASHES: [&str; 1] =
-            ["f64c46dfc9bbbae92e781f89ecb94f3b0517b12e87be977737647edd9babeacf"];
+            ["6dad4dabf2d0cddd34b0969b97cfe933985533b7dc5578fa0cc19d620b696338"];
         let overlap = compact_part_hashes(&inputs, &CompactorConfig::default()).await;
         let eager = compact_part_hashes(
             &inputs,
