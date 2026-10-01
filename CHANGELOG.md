@@ -471,6 +471,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   so served, and is redundant when the block rode a flight whose leader
   already verified it. Such a block is no longer counted in the fetch span's
   `s3_requests` and `s3_bytes` either, since this read made no GET for it.
+  The RAM-only cache (no `--cache-dir`) no longer issues that duplicate GET
+  either (issue #2284): its leader admits the bytes to RAM before the flight
+  ends and a new leader rechecks RAM before fetching. In a log read's query
+  accounting, a block of a coalesced run that this read did not fetch itself
+  now counts as one cache miss and nothing else. Before, a non-lead block that
+  another flight admitted in the meantime also counted a cache hit and its
+  bytes, and one served by the RAM recheck counted a second miss (issue
+  #2293).
 - **A zero loop interval is refused at startup** (issue #2256).
   `--maintain-interval-secs 0`, `--fold-interval-secs 0`,
   `--alert-eval-interval-secs 0` and `--oidc-jwks-refresh-interval-secs 0`
