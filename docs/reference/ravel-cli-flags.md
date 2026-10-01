@@ -471,6 +471,34 @@ Replace the tenant's declaration wholesale, validating it first and swapping the
 | `<KEY:TYPE>` |  |  | The declaration, as `KEY:TYPE` specs in schema-append order, where TYPE is one of str/i64/bool/bytes (case-insensitive). A key may contain `:`; the type is split off the right. Mutually exclusive with `--from-mapping` |
 | `<TENANT>` |  |  | The tenant whose declaration to replace |
 
+## clustering-key
+
+Show a tenant's clustering key (ADR-2135 decision 1), field 13 of its config record at `t/<tenant_hash>/config`. Read-only
+
+_No flags._
+
+### clustering-key show
+
+Print the tenant's clustering key: never set, cleared at a generation, or set, with its columns and their declared types, bucket width and generation. A stored key the record's validation refuses is an error
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--tenant` |  |  | The tenant whose clustering key to print |
+
+## bloom-scope
+
+Show a tenant's bloom scope (ADR-2135), field 14 of its config record at `t/<tenant_hash>/config`. Read-only
+
+_No flags._
+
+### bloom-scope show
+
+Print the tenant's bloom scope: all (the default, and what a record without the field reads as), undeclared, or text
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--tenant` |  |  | The tenant whose bloom scope to print |
+
 ## tenant
 
 Per-tenant operator records: the deployment-wide bearer-token map `sys/auth` (ADR-0072 decision 4) and the Parquet location grants record (ADR-2040 decision D1)
@@ -602,6 +630,7 @@ Bulk-import a Parquet file into the signal named by `--signal` (ADR-0089, widene
 | `--skip-rows` |  | `0` | Number of leading rows, by file-absolute position, to drop before mapping (issue #1713). Exact at any cursor count, and reported as `rows_skipped`. Resuming a FAILED load with `rows_skipped + rows_written` is sound only when that run used `--read-cursors 1 --pipeline-depth 1`; at any other settings the rows that landed are not a prefix of the file and the offset both duplicates and drops rows. There is no idempotency marker, so nothing checks the value. See docs/guides/ingest.md. Defaults to 0 (no skip) |
 | `--target-bytes` |  | `1` | Estimated in-memory bytes a shard's buffer accumulates before it flushes as one RLOG object (issue #801). At the default `1` every batch flushes as its own object the moment it is written: one object per involved shard per batch, `--batch-rows` sets its size, and no buffer lingers. A larger value lets a shard hold several batches' records in one buffer until the target is reached, so objects grow without any more Arrow batches being held in memory -- unlike raising `--batch-rows`, whose memory cost is linear because each batch is buffered whole |
 | `--tenant` |  |  | Target tenant id (hashed under the bucket's pinned scheme) |
+| `--zstd-level` |  | `3` | The zstd level of every page and section the loader's RLOG objects compress with zstd. Compaction re-encodes the objects it merges at its own level (3), so this sets only the load's own objects |
 
 ## export
 

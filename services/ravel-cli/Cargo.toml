@@ -160,6 +160,10 @@ opentelemetry-proto = { workspace = true }
 # `ravel_fleet::claim::acquire` a supervisor uses. Workspace pin, already a
 # dependency of ravel-maintain; adds no new external crate.
 ravel-fleet = { workspace = true }
+# tests/load_zstd_level.rs checks `--zstd-level`'s accepted range against the
+# linked libzstd's own. Workspace pin, already in the lock through
+# ravel-logseg; test-only here.
+zstd = { workspace = true }
 # A real deployment-key file on disk for the `tenant_token` CLI tests (they
 # exercise `--deployment-key-file`, not an in-memory key). Already a
 # workspace pin; adds no new external crate.
