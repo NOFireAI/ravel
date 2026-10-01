@@ -70,8 +70,11 @@
 //! resolved *coalesced* -- so concurrent callers for one key collapse onto a
 //! single upstream fetch -- uses [`tiered::TieredCache::resolve_peeked_miss`]:
 //! it joins the same single-flight `get_or_fetch` uses and admits to both tiers
-//! on success, but consults neither tier and records no miss of its own,
-//! because the caller's earlier `get` already accounted the one miss.
+//! on success, but makes no counted tier consultation and records no hit or
+//! miss of its own, because the caller's earlier `get` already accounted the
+//! one miss. Its leader does check the RAM tier once, uncounted, so a caller
+//! whose peek raced a flight that has since finished is served that flight's
+//! bytes when the RAM tier still holds them.
 //!
 //! No disk operation reached through [`tiered::TieredCache`] runs on a runtime
 //! worker thread (issue #1891): every `std::fs` call it makes is dispatched to

@@ -611,9 +611,11 @@ mod tests {
     use parquet::file::page_index::offset_index::PageLocation;
     use proptest::prelude::*;
     use proptest::sample::Index;
+    use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
     use ravel_object_store::memory::MemoryStore;
     use ravel_query::{ByteLimit, RequestLimit};
     use ravel_types::accounting::AccountedOp;
+    use std::task::Poll;
 
     const KEY: &str = "lake/t/bad.parquet";
 
@@ -2306,39 +2308,31 @@ mod tests {
         );
     }
 
-    /// The peek-then-resolve rewrite (`get_off_worker` then
-    /// `resolve_peeked_miss`) must not break single-flight at the store
-    /// boundary: 8 concurrent `read_range` calls on the same range, each
-    /// having independently peeked and missed both tiers, still collapse
-    /// onto one upstream GET.
+    /// 8 concurrent `read_range` misses on one range, each peeking both tiers
+    /// (`get_off_worker`) while the leader's GET is in flight, collapse onto
+    /// one upstream GET and every caller receives identical bytes.
     ///
-    /// FLIP: resolving through `TieredCache::get_or_fetch` instead of
-    /// `resolve_peeked_miss` (the pre-fix code) makes the leader itself
-    /// double-probe disk, so the wait below never reaches its expected count
-    /// of 8 (it sees 9, since the leader's second probe is unaccounted) and
-    /// the assertion on it fails before the GET count is even checked.
+    /// A `FaultStore` gate holds the leader's GET open until every caller has
+    /// peeked and missed. Six of them are then parked on the leader's single
+    /// flight, counted by `TieredCache::in_flight_waiters`. The seventh is
+    /// polled only up to its disk peek and resumed after the leader has
+    /// finished and left the single-flight map: the interleaving a slow
+    /// `spawn_blocking` disk peek produces on a loaded machine, which is how
+    /// this test once saw two GETs.
     ///
-    /// The leader is held inside its GET by
-    /// `RecordingStore::pause_next_get_pinned`. Each follower's own peek
-    /// crosses a real (if fast) `spawn_blocking` disk consult, so a single
-    /// poll cannot prove it has reached `TieredCache`'s single-flight
-    /// in-flight map -- it may still be waiting on that blocking-pool round
-    /// trip. Instead of guessing how long that takes, this waits on an
-    /// observable count: the disk tier's own miss counter, which every
-    /// caller's peek bumps by exactly one regardless of leader/follower
-    /// role. Once it reaches 8, every caller has left the peek; one more
-    /// scheduler tick runs the purely synchronous steps from "peek missed"
-    /// to "joined the single flight". No `Duration`, `Instant`, or sleep is
-    /// used anywhere in this wait: it is bounded, cooperative polling of
-    /// real state, not a wall-clock guess.
+    /// FLIP: removing the leader's `self.ram.get_uncounted(&key)` check in
+    /// `TieredCache::resolve_peeked_miss` lets the seventh caller lead a
+    /// second flight with its own GET, so the GET count reads 2.
     #[tokio::test]
     async fn a_tiered_concurrent_miss_collapses_to_one_get() {
         let dir = tempfile::tempdir().expect("tempdir");
         let memory = Arc::new(ravel_memory::MemoryBudget::unlimited());
         let store = Arc::new(MemoryStore::new());
         let recording = Arc::new(RecordingStore::new(Arc::clone(&store), false));
+        let faults = Arc::new(FaultStore::new(Arc::clone(&recording), FaultPlan::empty()));
+        let gate = faults.hold(Op::Get, None, Occurrence::Nth(1));
         let fixture = Fixture::new_tiered(
-            Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>,
+            Arc::clone(&faults) as Arc<dyn ObjectStoreBackend>,
             dir.path(),
         )
         .with_limits(limits_of(
@@ -2358,61 +2352,111 @@ mod tests {
         let Some(ReadCache::Tiered(tiered)) = &fixture.services().cache else {
             panic!("fixture built with a Tiered cache");
         };
+        let key = reader.cache_key(0, 4);
         let disk_metrics = tiered.disk_metrics();
         let before_misses = disk_metrics.snapshot().misses;
 
-        let (entered_rx, release_tx) = recording.pause_next_get_pinned();
-
-        const CALLERS: u64 = 8;
+        const CALLERS: usize = 8;
+        const PARKED: usize = CALLERS - 2;
         let leader = {
             let reader = reader.clone();
             tokio::spawn(async move { reader.read_range(0..4, QueryPhase::Scan).await })
         };
-        entered_rx.await.expect("the leader reaches its GET");
+        gate.wait_until_held(1).await;
 
-        let mut followers = Vec::new();
-        for _ in 1..CALLERS {
-            let reader = reader.clone();
-            followers.push(tokio::spawn(async move {
-                reader.read_range(0..4, QueryPhase::Scan).await
-            }));
-        }
-
-        let mut reached = 0u64;
-        for _ in 0..10_000 {
-            reached = disk_metrics.snapshot().misses - before_misses;
-            if reached >= CALLERS {
-                break;
+        // Polled before any parked caller exists, so a disk peek fast enough to
+        // finish inside this one poll and join the flight shows as one waiter
+        // here rather than hiding among the parked ones. Such an attempt is a
+        // follower, not the late interleaving under test: it is dropped and the
+        // late caller rebuilt. Every attempt's peek records one disk miss.
+        let mut late_peeks = 0u64;
+        let late = loop {
+            let mut late = Box::pin(reader.read_range(0..4, QueryPhase::Scan));
+            let first = std::future::poll_fn(|cx| {
+                Poll::Ready(std::future::Future::poll(late.as_mut(), cx))
+            })
+            .await;
+            assert!(
+                first.is_pending(),
+                "the late caller waits on its disk peek or the held flight"
+            );
+            late_peeks += 1;
+            if tiered.in_flight_waiters(&key) == 0 {
+                break late;
             }
-            tokio::task::yield_now().await;
+            assert!(
+                late_peeks < 20,
+                "the late caller's disk peek finished inside its first poll every time"
+            );
+            drop(late);
+            assert_eq!(
+                tiered.in_flight_waiters(&key),
+                0,
+                "a dropped follower leaves the leader's flight"
+            );
+        };
+
+        let parked: Vec<_> = (0..PARKED)
+            .map(|_| {
+                let reader = reader.clone();
+                tokio::spawn(async move { reader.read_range(0..4, QueryPhase::Scan).await })
+            })
+            .collect();
+
+        // Each disk miss is recorded inside a caller's `spawn_blocking` peek
+        // once it has missed, so reaching the leader's, the parked callers' and
+        // every late attempt's means every peek missed while the leader's GET
+        // was held. The timeout only turns a hang into a failure.
+        let peeks = (CALLERS - 1) as u64 + late_peeks;
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while disk_metrics.snapshot().misses - before_misses < peeks
+                || tiered.in_flight_waiters(&key) < PARKED
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("every caller peeks and misses, and six park on the held leader");
+        assert_eq!(
+            tiered.in_flight_waiters(&key),
+            PARKED,
+            "exactly the parked callers follow the leader; the late caller does not"
+        );
+        assert_eq!(gate.held_count(), 1, "only the leader's GET was issued");
+        assert!(recording.ranges().is_empty(), "{:?}", recording.ranges());
+
+        for id in gate.held() {
+            gate.release(id);
+        }
+        let mut served = vec![
+            leader
+                .await
+                .expect("leader task")
+                .expect("the leader's read resolves"),
+        ];
+        for task in parked {
+            served.push(
+                task.await
+                    .expect("parked task")
+                    .expect("every parked caller resolves"),
+            );
         }
         assert_eq!(
-            reached, CALLERS,
-            "all 8 callers must have peeked and missed both tiers before the \
-             leader is released"
+            tiered.in_flight_waiters(&key),
+            0,
+            "the leader's flight has finished before the late caller resumes"
         );
-        // One more tick: nothing left between "peek missed" and "joined the
-        // single flight" is anything but synchronous code, so this is enough
-        // for every follower to register with the leader's in-flight entry.
-        tokio::task::yield_now().await;
-
-        release_tx.send(()).expect("the leader is still parked");
-
-        for follower in followers {
-            follower
-                .await
-                .expect("follower task")
-                .expect("every follower resolves");
-        }
-        leader
-            .await
-            .expect("leader task")
-            .expect("the leader's read resolves");
+        served.push(late.await.expect("the late caller resolves"));
 
         assert_eq!(
             recording.ranges().len(),
             1,
             "8 concurrent misses on one range must produce exactly one GET"
         );
+        assert_eq!(served.len(), CALLERS);
+        assert_eq!(&served[0][..], b"PAR1", "the file's first 4 bytes");
+        for bytes in &served {
+            assert_eq!(bytes, &served[0], "every caller receives identical bytes");
+        }
     }
 }
