@@ -165,6 +165,7 @@ services:
     # buckets exist, which mimir depends_on below. Each bucket is created only
     # if head-bucket does not find it, so a rerun on the kept rustfs-data
     # volume still exits 0 whatever RustFS answers to a repeated CreateBucket.
+    # Stays plain: these are Mimir's buckets, which no Ravel server checks.
     entrypoint: >
       /bin/sh -c "
       until aws --endpoint-url http://rustfs:9000 s3api list-buckets >/dev/null 2>&1; do

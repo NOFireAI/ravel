@@ -338,6 +338,7 @@ rustfs_up() {
   log "ensuring bucket ${RAVEL_S3_BUCKET} exists"
   # The `|| true` covers a bucket left over on a reused data directory; the
   # emptying step below then works on whichever bucket is there.
+  # Stays plain: the current-version `s3 rm` below cannot empty a versioned bucket.
   chaos_aws s3api create-bucket --bucket "$RAVEL_S3_BUCKET" >/dev/null 2>&1 || true
 
   # Start every scenario on an empty store. The compose file bind-mounts

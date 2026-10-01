@@ -13,9 +13,6 @@ cd "$ROOT_DIR"
 
 RUSTFS_COMPOSE="deploy/docker-compose/rustfs.yml"
 RUSTFS_ENDPOINT="http://127.0.0.1:9000"
-# Pinned by tag and digest, from a registry outside Docker Hub's per-IP
-# anonymous pull allowance; see deploy/README.md.
-AWS_CLI_IMAGE="public.ecr.aws/aws-cli/aws-cli:2.37.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed"
 FIXTURE_PATH="examples/otlp_metrics_fixture.pb"
 
 export RAVEL_S3_ENDPOINT="$RUSTFS_ENDPOINT"
@@ -67,27 +64,28 @@ wait_for() {
   return 1
 }
 
+# The compose file's createbucket service creates the ravel-dev bucket with
+# Object Lock, versioning and the lifecycle rule and reads all three back. The
+# demo does not create the bucket itself: a plain create racing that service
+# would leave a bucket without Object Lock, and the service's read-back would
+# then fail. `docker compose wait` (Compose 2.20 or later) exits with the
+# service's own exit code.
 if rustfs_healthy; then
-  log "RustFS already running at ${RUSTFS_ENDPOINT}"
+  log "RustFS already running at ${RUSTFS_ENDPOINT}; ${RAVEL_S3_BUCKET} is expected to exist (the qualify step below reports it if not)"
 else
   log "starting RustFS via docker compose"
   docker compose -f "$RUSTFS_COMPOSE" up -d
   STARTED_RUSTFS=1
   wait_for "RustFS to become healthy" rustfs_healthy
+  log "waiting for the createbucket service to set up ${RAVEL_S3_BUCKET}"
+  createbucket_rc=0
+  docker compose -f "$RUSTFS_COMPOSE" wait createbucket >/dev/null || createbucket_rc=$?
+  if [[ "$createbucket_rc" -ne 0 ]]; then
+    log "the createbucket service failed (exit ${createbucket_rc}); its output:"
+    docker compose -f "$RUSTFS_COMPOSE" logs createbucket >&2 || true
+    exit 1
+  fi
 fi
-
-log "ensuring bucket ${RAVEL_S3_BUCKET} exists"
-# The `|| true` covers a bucket that already exists on a kept volume, and a
-# store that is reachable but refusing for another reason, which the qualify
-# step below then reports properly.
-docker run --rm --network host \
-  -e "AWS_ACCESS_KEY_ID=${RAVEL_S3_ACCESS_KEY}" \
-  -e "AWS_SECRET_ACCESS_KEY=${RAVEL_S3_SECRET_KEY}" \
-  -e "AWS_DEFAULT_REGION=${RAVEL_S3_REGION}" \
-  -e AWS_EC2_METADATA_DISABLED=true \
-  "$AWS_CLI_IMAGE" \
-  --endpoint-url "$RUSTFS_ENDPOINT" \
-  s3api create-bucket --bucket "$RAVEL_S3_BUCKET" >/dev/null 2>&1 || true
 
 log "building ravel-server and ravel-cli"
 cargo build --quiet -p ravel-server -p ravel-cli

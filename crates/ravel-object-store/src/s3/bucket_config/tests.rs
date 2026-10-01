@@ -3634,15 +3634,18 @@ enum LauncherForm {
     AwsCli,
 }
 
-/// Every dev launcher and CI helper that creates a bucket a
-/// `--require-bucket-protection` server can meet, relative to the repository
+/// Every dev launcher, CI helper and DR rehearsal library that creates a bucket
+/// a `--require-bucket-protection` server can meet, relative to the repository
 /// root. The first is the reference the others' rule sets are compared with.
-const LAUNCHERS: [(&str, LauncherForm); 5] = [
+/// scripts/dr/lib.sh's `DR_BUCKET_LIFECYCLE='...'` is the one `LIFECYCLE='`
+/// assignment in that file.
+const LAUNCHERS: [(&str, LauncherForm); 6] = [
     ("deploy/k8s/floci.yaml", LauncherForm::Xml),
     ("deploy/k8s/rustfs.yaml", LauncherForm::AwsCli),
     ("deploy/docker-compose/ravel.yml", LauncherForm::AwsCli),
     ("deploy/docker-compose/rustfs.yml", LauncherForm::AwsCli),
     ("scripts/ci-create-bucket.sh", LauncherForm::AwsCli),
+    ("scripts/dr/lib.sh", LauncherForm::AwsCli),
 ];
 
 /// The conditions `ravel-server`'s startup check evaluates in-process.

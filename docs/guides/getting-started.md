@@ -261,7 +261,8 @@ make demo
 
 `make demo` builds `ravel-server` and `ravel-cli` in release mode, then runs
 [scripts/demo.sh](../../scripts/demo.sh), which starts RustFS if it is not
-already up, creates the bucket, generates a fresh OTLP metrics export with
+already up, waits for the Compose `createbucket` service to set up the bucket,
+generates a fresh OTLP metrics export with
 current timestamps, starts `ravel-server --store s3` on `127.0.0.1:14318`
 (HTTP) and `127.0.0.1:14317` (gRPC) against RustFS, posts the export, captures
 the `x-ravel-commit-token`, and queries the series back with that token as

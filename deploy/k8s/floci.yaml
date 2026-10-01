@@ -233,7 +233,63 @@ spec:
                 echo "bucket ${BUCKET} does not have versioning enabled" >&2
                 exit 1
               fi
+              # The lifecycle document is read once and checked whole: exactly
+              # one rule, enabled, scoped to the whole bucket, carrying each
+              # action. flat is the document on one line with every whitespace
+              # character turned into a space, doc the same with no spaces.
               lifecycle="$(curl -fsS "${ENDPOINT}/${BUCKET}?lifecycle")"
+              flat="$(printf '%s' "$lifecycle" | tr '\r\n\t' '   ')"
+              doc="$(printf '%s' "$flat" | tr -d ' ')"
+              count() { printf '%s\n' "$1" | grep -o "$2" | wc -l | tr -d ' '; }
+              rules="$(count "$flat" '<Rule[ />]')"
+              if [ "$rules" != "1" ]; then
+                echo "bucket ${BUCKET} carries ${rules} lifecycle rules, not exactly one" >&2
+                exit 1
+              fi
+              if [ "$(printf '%s\n' "$lifecycle" | grep -o '<Status>[^<]*</Status>')" != \
+                '<Status>Enabled</Status>' ]; then
+                echo "bucket ${BUCKET} lifecycle rule is not enabled" >&2
+                exit 1
+              fi
+              # The rule's filter must be exactly one spelling the server's rule
+              # parser reads as the whole bucket: a Filter holding only an empty
+              # Prefix (directly or inside And), an empty Filter, or a rule-level
+              # empty Prefix with no Filter. The spelling must be a direct child
+              # of Rule (as many tags opened as closed before it), and nothing
+              # else in the rule may name a filter element. Whitespace right
+              # after <Prefix> is prefix text to the server, so it is refused
+              # before whitespace is stripped.
+              rule="${doc#*<Rule>}"
+              rule="${rule%%</Rule>*}"
+              whole=
+              case "$doc" in
+                *'<Rule>'*'</Rule>'*) ;;
+                *) rule= ;;
+              esac
+              case "$flat" in
+                *'<Prefix> '*) rule= ;;
+              esac
+              for spelling in '<Filter><Prefix></Prefix></Filter>' '<Filter><Prefix/></Filter>' \
+                '<Filter><And><Prefix></Prefix></And></Filter>' '<Filter><And><Prefix/></And></Filter>' \
+                '<Filter></Filter>' '<Filter/>' '<Prefix></Prefix>' '<Prefix/>'; do
+                case "$rule" in
+                  *"$spelling"*) ;;
+                  *) continue ;;
+                esac
+                before="${rule%%"$spelling"*}"
+                case "${before}${rule#*"$spelling"}" in
+                  *'<Filter'* | *'<Prefix'* | *'<And'* | *'<Tag'* | *'<ObjectSize'*) continue ;;
+                esac
+                opened="$(count "$before" '<[^/!?]')"
+                closed="$(( $(count "$before" '</') + $(count "$before" '/>') ))"
+                if [ "$opened" -eq "$closed" ]; then
+                  whole="$spelling"
+                fi
+              done
+              if [ -z "$whole" ]; then
+                echo "bucket ${BUCKET} lifecycle rule is not scoped to the whole bucket (read ${flat})" >&2
+                exit 1
+              fi
               if ! printf '%s\n' "$lifecycle" |
                 grep -q '<DaysAfterInitiation>7</DaysAfterInitiation>'; then
                 echo "bucket ${BUCKET} does not carry the multipart-abort rule" >&2

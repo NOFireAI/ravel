@@ -84,9 +84,28 @@ services:
         s3 put-bucket-lifecycle-configuration --bucket ravel-dev --lifecycle-configuration "$$LIFECYCLE"
         test "$$(s3 get-object-lock-configuration --bucket ravel-dev --query ObjectLockConfiguration.ObjectLockEnabled --output text)" = Enabled
         test "$$(s3 get-bucket-versioning --bucket ravel-dev --query Status --output text)" = Enabled
-        test "$$(s3 get-bucket-lifecycle-configuration --bucket ravel-dev --query 'Rules[0].AbortIncompleteMultipartUpload.DaysAfterInitiation' --output text)" = 7
-        test "$$(s3 get-bucket-lifecycle-configuration --bucket ravel-dev --query 'Rules[0].NoncurrentVersionExpiration.NoncurrentDays' --output text)" = 1
-        test "$$(s3 get-bucket-lifecycle-configuration --bucket ravel-dev --query 'to_string(Rules[0].Expiration.ExpiredObjectDeleteMarker)' --output text)" = true
+        # One read of the whole lifecycle configuration, tab separated: rule
+        # count, Status, scope (Filter and legacy Prefix as one JSON object),
+        # then the three actions. Every field goes through to_string.
+        lc="$$(s3 get-bucket-lifecycle-configuration --bucket ravel-dev --output text --query '[to_string(length(Rules)), to_string(Rules[0].Status), to_string({f: Rules[0].Filter, p: Rules[0].Prefix}), to_string(Rules[0].Expiration.ExpiredObjectDeleteMarker), to_string(Rules[0].NoncurrentVersionExpiration.NoncurrentDays), to_string(Rules[0].AbortIncompleteMultipartUpload.DaysAfterInitiation)]')"
+        want() { test "$$2" = "$$3" || { echo "bucket ravel-dev lifecycle: want $$1 $$2, read $$3 ($$lc)"; exit 1; }; }
+        tab="$$(printf '\t')"; set -f; IFS="$$tab"; set -- $$lc; unset IFS; set +f
+        want fields 6 "$$#"
+        want rules 1 "$$1"
+        want status Enabled "$$2"
+        # The whole-bucket spellings the server's rule parser reads as an empty
+        # prefix. This reads through botocore, which drops unknown elements and
+        # text inside Filter and keeps only the first of two Filters, so such a
+        # rule reads back as an accepted spelling here. The server's parser
+        # reads it as an unrecognized filter, reports the lifecycle conditions
+        # unknown, and starts with a warning rather than refusing.
+        case "$$3" in
+          '{"f":{"Prefix":""},"p":null}' | '{"f":{},"p":null}' | '{"f":{"And":{"Prefix":""}},"p":null}' | '{"f":null,"p":""}') ;;
+          *) echo "bucket ravel-dev lifecycle rule is not scoped to the whole bucket ($$3)"; exit 1 ;;
+        esac
+        want ExpiredObjectDeleteMarker true "$$4"
+        want NoncurrentDays 1 "$$5"
+        want DaysAfterInitiation 7 "$$6"
         echo 'bucket ravel-dev ready: Object Lock, versioning and lifecycle rules set'
 
   # Store qualification (ADR-0050 section 6): ravel-server refuses to start on a
