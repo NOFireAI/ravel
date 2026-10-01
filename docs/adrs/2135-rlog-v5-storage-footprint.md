@@ -1,6 +1,6 @@
 # ADR-2135: RLOG v5, a smaller on-object footprint for wide typed tenants
 
-Status: Proposed. Issue #2135.
+Status: Accepted. Issue #2135.
 Migration class A for the RLOG object (trailer version 4 to 5); class C for the
 two `TenantConfigRecord` fields, 13 and 14, added at record `format_version`
 3 under ADR-0066's R1 readers-before-writers rule (the clustering generation
@@ -134,23 +134,19 @@ What the codebase already guarantees, which bounds the change:
    the bucket width instead of disappearing. The three widths nest (1 h
    divides 6 h divides 1 d), which decision 2 relies on. Every change to a
    tenant's key, including clearing it, increments a clustering generation
-   stored with it. Clearing a key keeps the field present with the
-   incremented generation and an empty column list, so generation 0 means
+   stored with it. Clearing a key keeps the config record's field 13 present
+   (see the #2145 amendment) with the incremented generation and an empty
+   column list, so generation 0 means
    only "never set" (superseded by the scope generation amendment below:
    neither a key nor a bloom scope ever set), and a clear outranks every
    earlier key in compaction exactly as a new key would. A bloom scope
    change increments the same generation, and so does a change to the
    declared typed column names under the `undeclared` scope (see the scope
-   generation amendment below). Audit and alert RLOG writers never take a
-   key.
-
-   stored with it. Clearing a key keeps the config record's field 13 present
-   with the incremented generation and an empty column list, so generation 0
-   means only "never set", and a clear outranks every earlier key in
-   compaction exactly as a new key would. An object written after a clear
-   carries no sort descriptor and that nonzero generation, because the footer
-   decoder refuses a descriptor with no key columns (see the #2145
-   amendment). Audit and alert RLOG writers never take a key.
+   generation amendment below). The cleared form lives in the config
+   record's field 13; an object written after a clear carries no sort
+   descriptor and that nonzero generation, because the footer decoder
+   refuses a descriptor with no key columns (see the #2145 amendment). Audit
+   and alert RLOG writers never take a key.
 
 2. **Every v5 object records its sort order, and compaction merges on it.**
    The v5 footer records the object's sort descriptor (bucket width and key
@@ -583,5 +579,9 @@ The decisions landed in these pull requests:
 - Decisions 2, 4 and 5 (compaction on the descriptor, its zstd level and
   bloom scope): #2276.
 
-No pull request yet adds the CLI commands that set a clustering key or a
-bloom scope (issue #2146), so the status stays Proposed.
+- Decision 7 (the CLI commands that set and clear a clustering key and set
+  a bloom scope, and the scope and declared-column generation bumps, see the
+  scope generation amendment): #2281.
+
+With that last pull request every decision has an implementation on main,
+and the status moved from Proposed to Accepted.
