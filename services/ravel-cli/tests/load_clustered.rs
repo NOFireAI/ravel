@@ -789,7 +789,8 @@ async fn clear_then_load_writes_no_descriptor_and_the_generation() {
         printed,
         format!(
             "{UPDATED}tenant acme has no clustering key at generation 2 (cleared, or never set \
-             and given a generation by a bloom scope change)\n"
+             and given a generation by a bloom scope change or by a declared column change \
+         under the undeclared scope)\n"
         )
     );
     assert_eq!(
@@ -829,7 +830,8 @@ async fn clear_then_load_writes_no_descriptor_and_the_generation() {
     assert_eq!(
         String::from_utf8(shown).expect("utf8"),
         "tenant acme has no clustering key at generation 2 (cleared, or never set and given a \
-         generation by a bloom scope change)\n"
+         generation by a bloom scope change or by a declared column change \
+         under the undeclared scope)\n"
     );
 }
 
@@ -846,7 +848,7 @@ async fn bloom_scope_set_reaches_the_object() {
         format!(
             "{UPDATED}tenant acme bloom scope: undeclared\ntenant acme has no clustering key at \
              generation 1 (cleared, or never set and given a generation by a bloom scope \
-             change)\n"
+             change or by a declared column change under the undeclared scope)\n"
         )
     );
     // The stored scope again writes nothing and says so.
@@ -861,7 +863,8 @@ async fn bloom_scope_set_reaches_the_object() {
         printed,
         "tenant acme bloom scope is already undeclared; nothing written\ntenant acme bloom \
          scope: undeclared\ntenant acme has no clustering key at generation 1 (cleared, or \
-         never set and given a generation by a bloom scope change)\n"
+         never set and given a generation by a bloom scope change or by a declared column change \
+         under the undeclared scope)\n"
     );
 
     let object = load_one(&store, &fx).await;
@@ -898,7 +901,8 @@ async fn bloom_scope_set_reaches_the_object() {
              and no override but this command's\n",
             note!(),
             "tenant acme bloom scope: text\ntenant acme has no clustering key at generation 1 \
-             (cleared, or never set and given a generation by a bloom scope change)\n"
+             (cleared, or never set and given a generation by a bloom scope change or by a declared column change \
+         under the undeclared scope)\n"
         )
     );
 }
@@ -938,7 +942,8 @@ async fn an_undeclared_scope_declaration_takes_a_generation_the_object_names() {
     assert_eq!(
         shown,
         "tenant acme has no clustering key at generation 2 (cleared, or never set and given a \
-         generation by a bloom scope change)\n"
+         generation by a bloom scope change or by a declared column change \
+         under the undeclared scope)\n"
     );
 
     let object = load_one(&store, &fx).await;

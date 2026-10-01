@@ -119,7 +119,8 @@ async fn clustering_key_show_reports_absent_before_the_writer_flip() {
     assert_eq!(bloom_scope(&store).await, "tenant acme bloom scope: all\n");
 
     // An absent key with a generation is not "never set": it carries the
-    // generation of the clear or bloom scope change that stored it.
+    // generation of the clear, bloom scope change or undeclared-scope
+    // declared column change that stored it.
     let cleared = store_with(&v3_record(
         Some(sysproto::ClusteringKeyConfig {
             columns: Vec::new(),
@@ -132,7 +133,8 @@ async fn clustering_key_show_reports_absent_before_the_writer_flip() {
     assert_eq!(
         clustering_key(&cleared).await,
         "tenant acme has no clustering key at generation 7 (cleared, or never set and given a \
-         generation by a bloom scope change)\n"
+         generation by a bloom scope change or by a declared column change under the \
+         undeclared scope)\n"
     );
 }
 
