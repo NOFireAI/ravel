@@ -398,10 +398,12 @@ fn key_of(file: &ParquetFile) -> String {
     String::from_utf8_lossy(&file.key).into_owned()
 }
 
-/// `NotFound` means `FileMissing` here because every call site but one is a
-/// read that has not yet proved the object exists. The one exception -- the
-/// second GET of a long footer -- has already read this same object once and
-/// remaps `FileMissing` to `FileChanged` at its own call site below.
+/// `NotFound` means `FileMissing` here because most call sites are a read
+/// that has not yet proved the object exists. Three exceptions have already
+/// read (or, for the third, HEADed) this same object once, and each remaps
+/// `FileMissing` to `FileChanged` at its own call site: the second GET of a
+/// long footer, the stale-listed-size retry in [`first_footer_read`], and
+/// the explicit-range read [`head_corrected_read`] issues after its HEAD.
 fn read_error(key: &str, source: StoreError) -> SnapshotError {
     let key = key.to_string();
     match source {
@@ -504,6 +506,13 @@ fn tail_range(size: u64) -> FooterRange {
 /// `listed_size`, the listing was stale: retry once, placed from the size
 /// this read just reported, and refuse `FileChanged` if the retry's own
 /// reported size disagrees too.
+///
+/// A `listed_size` of 0 is not evidence the object is empty: it issues no
+/// zero-length range at all. Nor is a `listed_size` that over-reports by
+/// more than `FOOTER_PREFETCH`, which would place the range past the
+/// object's real end; the store refuses that one client-side as
+/// `InvalidRange`, before any size can be compared. Both recover through
+/// [`head_corrected_read`].
 async fn first_footer_read(
     store: &dyn ObjectStoreBackend,
     limiter: &GetLimiter,
@@ -526,7 +535,10 @@ async fn first_footer_read(
         .await
         .map_err(|err| empty_file_on_invalid_range(key, err));
     }
-    let (tail, reservation) = pinned_get(
+    if listed_size == 0 {
+        return head_corrected_read(store, limiter, memory, accounting, key, pin).await;
+    }
+    let first = pinned_get(
         store,
         limiter,
         memory,
@@ -535,8 +547,15 @@ async fn first_footer_read(
         tail_range(listed_size),
         pin,
     )
-    .await
-    .map_err(|err| empty_file_on_invalid_range(key, err))?;
+    .await;
+    let (tail, reservation) = match first {
+        Ok(ok) => ok,
+        Err(SnapshotError::Store {
+            source: StoreError::InvalidRange(_),
+            ..
+        }) => return head_corrected_read(store, limiter, memory, accounting, key, pin).await,
+        Err(err) => return Err(err),
+    };
     if tail.outcome.total_size == listed_size {
         return Ok((tail, reservation));
     }
@@ -551,7 +570,13 @@ async fn first_footer_read(
         pin,
     )
     .await
-    .map_err(|err| empty_file_on_invalid_range(key, err))?;
+    .map_err(|err| match err {
+        // One of the exceptions `read_error`'s doc comment names: this GET
+        // has already read the object once, at the first explicit-range
+        // read above.
+        SnapshotError::FileMissing { key } => SnapshotError::FileChanged { key },
+        other => empty_file_on_invalid_range(key, other),
+    })?;
     if retry.outcome.total_size != real_size {
         return Err(SnapshotError::FileChanged {
             key: key.to_string(),
@@ -560,12 +585,73 @@ async fn first_footer_read(
     Ok((retry, retry_reservation))
 }
 
+/// Recover the first footer read on a store without `suffix_range` when the
+/// explicit range computed from a stale listed size could not even be
+/// issued: a `listed_size` of 0 (no range to request) or one that places
+/// the range past the object's real end (refused client-side as
+/// `InvalidRange`). One HEAD, charged to [`QueryPhase::Resolve`] like the
+/// snapshot's other HEAD, learns the real size: an ETag that disagrees with
+/// `pin` means the object changed since the listing, a reported size of 0
+/// means it really is empty, and otherwise one explicit-range read placed
+/// at that size is the first footer read, refusing `FileChanged` if its own
+/// reported size still disagrees with the HEAD's.
+async fn head_corrected_read(
+    store: &dyn ObjectStoreBackend,
+    limiter: &GetLimiter,
+    memory: &Arc<MemoryBudget>,
+    accounting: &PhaseAccounting,
+    key: &str,
+    pin: &Pin,
+) -> Result<(PinnedRead, Reservation), SnapshotError> {
+    accounting
+        .phase(QueryPhase::Resolve)
+        .record_s3_request(AccountedOp::Head);
+    let meta = store
+        .head(key)
+        .await
+        .map_err(|source| read_error(key, source))?;
+    if meta.etag.0 != pin.etag {
+        return Err(SnapshotError::FileChanged {
+            key: key.to_string(),
+        });
+    }
+    if meta.size == 0 {
+        return Err(SnapshotError::EmptyFile {
+            key: key.to_string(),
+        });
+    }
+    let (read, reservation) = pinned_get(
+        store,
+        limiter,
+        memory,
+        accounting,
+        key,
+        tail_range(meta.size),
+        pin,
+    )
+    .await
+    .map_err(|err| match err {
+        // The other exception `read_error`'s doc comment names: this GET
+        // has already been proved to exist, by the HEAD just above.
+        SnapshotError::FileMissing { key } => SnapshotError::FileChanged { key },
+        other => other,
+    })?;
+    if read.outcome.total_size != meta.size {
+        return Err(SnapshotError::FileChanged {
+            key: key.to_string(),
+        });
+    }
+    Ok((read, reservation))
+}
+
 /// Read and check one file's footer, and describe the file as the read's
 /// response reported it. See [`first_footer_read`] for how the first read
 /// is placed and self-corrected; the listing's reported size otherwise has
 /// no bearing on where it lands, so a listing that under- or over-reports a
 /// file's size, in either direction, cannot misplace a read on a store with
-/// `suffix_range`, and costs at most one retry on one without.
+/// `suffix_range`, and costs at most one retry on one without -- or, when
+/// the listed size left no valid range to read at all, one HEAD plus one
+/// read (see [`head_corrected_read`]).
 async fn read_file(
     store: &dyn ObjectStoreBackend,
     grant: &Grant,
@@ -1147,6 +1233,57 @@ mod tests {
                 "a mismatched listed size costs exactly one retry: lied_size={lied_size}: \
                  {ranges:?}"
             );
+        }
+    }
+
+    /// Without `suffix_range`, a listing that reports size 0 for a
+    /// non-empty file leaves no range to request at all, and one that
+    /// over-reports by more than `FOOTER_PREFETCH` places the range past
+    /// the object's real end, which the store refuses client-side as
+    /// `InvalidRange` before any size can be compared. Neither is evidence
+    /// the object is empty: both now snapshot the file correctly, recovered
+    /// by one HEAD plus one explicit-range read at the HEAD's reported
+    /// size. A genuinely empty object still refuses `EmptyFile`, now
+    /// reached the same way (its listed size is really 0). Mutation that
+    /// fails it: mapping the first explicit read's `InvalidRange` straight
+    /// to `EmptyFile` -- the code before this fix -- which refuses all
+    /// three cases, wrongly for the first two: both lying cases return
+    /// `EmptyFile` against that code instead of a snapshot.
+    #[tokio::test]
+    async fn a_listed_size_that_leaves_no_valid_range_is_corrected_by_a_head() {
+        let bytes = parquet_bytes(&[4, 5], &["p", "q"]);
+        let real_size = bytes.len() as u64;
+        for lied_size in [0, real_size + FOOTER_PREFETCH + 1] {
+            let store = Scripted {
+                force_no_suffix_range: true,
+                lie_listed_size: Some(lied_size),
+                ..Scripted::default()
+            };
+            put(&store, "data/a.parquet", bytes.clone()).await;
+            let result = snapshot(&store, "s3://lake/data/")
+                .await
+                .unwrap_or_else(|err| panic!("lied_size={lied_size} real_size={real_size}: {err}"));
+            assert_eq!(
+                keys(&result),
+                vec!["data/a.parquet"],
+                "lied_size={lied_size}"
+            );
+            assert_eq!(result.files[0].row_count, 2, "lied_size={lied_size}");
+            assert_eq!(
+                store.heads(),
+                ["data/a.parquet"],
+                "lied_size={lied_size}: recovery takes one HEAD"
+            );
+        }
+
+        let store = Scripted {
+            force_no_suffix_range: true,
+            ..Scripted::default()
+        };
+        put(&store, "data/c.parquet", Bytes::new()).await;
+        match snapshot(&store, "s3://lake/data/").await {
+            Err(SnapshotError::EmptyFile { key }) => assert_eq!(key, "data/c.parquet"),
+            other => panic!("expected EmptyFile, got {other:?}"),
         }
     }
 
