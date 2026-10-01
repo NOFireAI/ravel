@@ -277,7 +277,8 @@ DROP TABLE [IF EXISTS] name;
   manifest that snapshots the file list. Its footer reads go through the
   shared `GetLimiter` and run under the SQL deadline. A prefix too large to
   read within the deadline fails with the deadline error; the file cap
-  bounds the worst case. Queries never list the location. Files added later
+  bounds the worst case (see the grants and DDL cost amendment below for
+  the memory and request budgets). Queries never list the location. Files added later
   are picked up by `CREATE OR REPLACE`.
 - `OPTIONS` admits `binary_as_string` and `ravel.cast.<column>` (D5), and
   nothing else.
@@ -369,13 +370,15 @@ each Parquet table's newest manifest, and registers the provider with
 `register_table`. There is no async catalog provider doing I/O during
 planning, so store I/O stays at the one resolve site and under its retry
 contract. A table dropped by the time a query resolves it is a
-`TableNotFound` error.
+`TableNotFound` error (an unknown table, as the grants and DDL cost
+amendment below states).
 
 Resolution also re-checks the grants. Each file's (profile, bucket, key)
 must lie inside a grant that exists now, with the same profile, or the
 query fails with a typed `LocationNotGranted` error. The grant the
 manifest recorded is kept for audit and plays no part in this check. The
-grants record is cached per tenant for at most 60 seconds, so a revoked
+grants record is cached per tenant for at most 60 seconds (read on every
+query instead, per the grants and DDL cost amendment below), so a revoked
 grant stops admitting reads within 60 seconds.
 
 A file changed or deleted under a table fails the
@@ -441,7 +444,8 @@ instead of rejecting them.
   Ravel's bucket is refused on read, whatever wrote it.
 - Grants of one tenant that overlap under two profiles are refused.
 - A read after the grant is removed fails with `LocationNotGranted` once
-  the grants cache has refreshed.
+  the grants cache has refreshed (on the next query, per the grants and DDL
+  cost amendment below).
 - `sql_endpoint.rs` `rejected_statement_kinds_return_400_over_http`: the
   capability is checked before the statement is validated, so a caller
   without `ddl` learns nothing about validation. Its existing `s3://evil/x`
@@ -887,3 +891,37 @@ Two implementation details D1 and D2 do not spell out:
   that suffix test). A directory marker or a key of any other suffix is
   only ever counted among the skipped keys D2 already describes; the
   object-store client is never asked to address it.
+
+## Amendment (2026-10-01): grants and DDL cost
+
+<!-- amendment-applies: sections="D2. SQL defines tables over granted locations|D3. The reader: DataFusion's Parquet scan through Ravel's fetch path|D4. ADR-0013's first invariant, replaced for Parquet tables" pointer="grants and DDL cost amendment" -->
+<!-- amendment-supersedes: phrase="cached per tenant for at most 60 seconds" pointer="grants and DDL cost amendment" -->
+<!-- amendment-supersedes: phrase="`TableNotFound` error" pointer="grants and DDL cost amendment" -->
+<!-- amendment-supersedes: phrase="the grants cache has refreshed" pointer="grants and DDL cost amendment" -->
+
+D3 described two behaviours the code does not have, and D2 left two budgets
+unstated for `CREATE`.
+
+- **Grants are read on every query.** D3 said the grants record is cached
+  per tenant for up to 60 seconds. The reader reads it on every resolve
+  (`ravel-sql::parquet` calls `grants::list` there), so a revoked grant
+  stops admitting reads on the next query, not within 60 seconds. A Flight
+  SQL `DoGet` reads it again too. A cache may be added later; until then
+  the D4 test reads "on the next query".
+- **A dropped table is an unknown table.** D3 named a typed `TableNotFound`
+  error. A dropped table plans like a name that was never created: the
+  same error class, on every resolve path, and its files
+  are never read (`a_dropped_table_beside_samples_is_an_unknown_table` and
+  `a_dropped_table_without_a_profile_file_is_an_unknown_table`). A caller
+  cannot tell a dropped table from one that never existed, which is the
+  same information a caller without the table's name already has.
+- **What bounds a `CREATE`.** D2 bounds a `CREATE` by the 100,000-file cap,
+  the shared `GetLimiter` and the SQL deadline. Two further rules apply.
+  - Each footer read reserves its bytes against the process memory budget
+    before it is issued, the same reservation a query's Parquet reads make
+    (ADR-1170 decision 2), and a refusal fails the `CREATE` with the same
+    typed memory error.
+  - A `CREATE` is not held to the per-query `max_s3_requests` or byte
+    budgets. Those size a read of committed data; a `CREATE` makes one
+    listing pass and one or two footer GETs per file, a count the file cap
+    already bounds, and it is admitted only with the `ddl` capability.
