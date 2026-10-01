@@ -3810,12 +3810,15 @@ mod tests {
                 .expect("present")
         };
         let bytes = || async { store.get(&key, GetRange::Full).await.expect("present").data };
-        let conflict = |result: Result<SetOutcome, TenantConfigError>| match result {
-            Err(err @ TenantConfigError::CasConflict { .. }) => {
-                assert!(err.to_string().contains("re-read and retry"), "got: {err}");
+        #[track_caller]
+        fn conflict(result: Result<SetOutcome, TenantConfigError>) {
+            match result {
+                Err(err @ TenantConfigError::CasConflict { .. }) => {
+                    assert!(err.to_string().contains("re-read and retry"), "got: {err}");
+                }
+                other => panic!("expected a CAS conflict, got {other:?}"),
             }
-            other => panic!("expected a CAS conflict, got {other:?}"),
-        };
+        }
         let seed = TenantConfig {
             retention_ns: Some(1),
             ..TenantConfig::new(TenantLifecycleState::Active)

@@ -489,7 +489,7 @@ Print the tenant's clustering key: never set, absent at a generation, or set, wi
 
 ### clustering-key set
 
-Set the tenant's clustering key at the stored clustering generation plus one, writing a version-3 config record. Every column must be a typed attribute column the tenant's config record itself declares, at most four, each named once; a refused key writes nothing. Log objects flushed after an ingest process reads the new record sort by (stream, time bucket, key columns, timestamp); objects already written keep their order
+Set the tenant's clustering key at the stored clustering generation plus one, writing a version-3 config record. Every column must be a typed attribute column the tenant's config record itself declares, at most four, each named once; a refused key writes nothing. Log objects flushed after an ingest process reads the new record sort by (stream, time bucket, key columns, timestamp). Objects already written keep their order and their filters until compaction rewrites them: L1 compaction and the erasure rewrite take the sort descriptor and bloom coverage of the input with the highest generation, re-sort every part by that descriptor, and compress at zstd level 9
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
