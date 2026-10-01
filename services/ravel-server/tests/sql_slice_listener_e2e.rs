@@ -620,6 +620,17 @@ fn slice_capability() -> Vec<u8> {
         .expect("encode")
 }
 
+async fn scrape_metrics(base: &str) -> String {
+    reqwest::Client::new()
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .expect("metrics request completes")
+        .text()
+        .await
+        .expect("metrics body is text")
+}
+
 /// A slice `DoGet`: the capability as the statement handle, and no metadata.
 fn slice_do_get(handle: Vec<u8>) -> Request<Ticket> {
     let query = TicketStatementQuery {
@@ -777,6 +788,26 @@ async fn a_slice_ticket_on_the_public_listener_is_refused_once_a_fragment_listen
     assert_eq!(status.code(), tonic::Code::PermissionDenied, "{status:?}");
     assert_eq!(status.message(), "slice fetch rejected: wrong_surface");
     assert_eq!(rejects.get(SliceReject::WrongSurface), 1);
+
+    // /metrics renders the counters the Flight service records into, not a
+    // set of its own.
+    let body = scrape_metrics(&format!("http://{}", node.http_addr)).await;
+    for reason in SliceReject::ALL {
+        let expected = if reason == SliceReject::WrongSurface {
+            rejects.get(SliceReject::WrongSurface)
+        } else {
+            0
+        };
+        let line = format!(
+            "ravel_sql_slice_rejects_total{{mode=\"all\",reason=\"{}\"}} {expected}",
+            reason.reason()
+        );
+        assert_eq!(
+            body.lines().filter(|l| *l == line).count(),
+            1,
+            "exactly one `{line}` sample on /metrics:\n{body}"
+        );
+    }
 
     let mut dedicated = dedicated_client(node.fragment_addr.expect("listener binds"), true)
         .await
