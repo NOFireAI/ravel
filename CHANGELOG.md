@@ -917,14 +917,24 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   size was stale, and refusing `FileChanged` if the two reads still
   disagree; a store that cannot take a suffix range (Azure) never
   receives one. A snapshot's footer reads are now one or two GETs per
-  file on a suffix-capable store, up to three on one that is not. A
+  file on a suffix-capable store, up to three on one that is not, plus
+  one HEAD on a store without `suffix_range` when the listed size left
+  no valid range to request at all (a listed size of 0, or one that
+  overshoots the object's real end by more than `FOOTER_PREFETCH`). A
   listing that under- or over-reports a file's size, in either
-  direction, can no longer misplace the read. An `InvalidRange` on that
-  first read (an endpoint answering a
-  suffix read against a 0-byte object with 416 instead of an empty body)
-  now reports `EmptyFile`, the same as a GET that answers it with an empty
-  body; every other `InvalidRange` case still reports as a generic `Store`
-  error. A footer read returning a different number of bytes than
+  direction, can no longer misplace the read. On a suffix-capable store,
+  an `InvalidRange` on the first read (an endpoint answering a suffix
+  read against a 0-byte object with 416 instead of an empty body) still
+  reports `EmptyFile` directly, the same as a GET that answers it with an
+  empty body. On a store without `suffix_range`, a listed size of 0 or
+  an `InvalidRange` from the first explicit-range read no longer reports
+  `EmptyFile` outright: one HEAD, charged to the same `Resolve` phase as
+  the snapshot's other HEAD, refuses `FileChanged` if its ETag disagrees
+  with the listing's pin, `EmptyFile` if it reports a real size of 0,
+  and otherwise re-reads once at the size it reports, still refusing
+  `FileChanged` if that read's own size disagrees. Every other
+  `InvalidRange` case still reports as a generic `Store` error. A footer
+  read returning a different number of bytes than
   requested, or more bytes than the same response's own reported size,
   now refuses as `Corrupt` naming the key, instead of risking an
   arithmetic underflow computing where the trailer starts. The zero-size
@@ -940,9 +950,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   whose physical footer schema elements agree exactly but whose embedded
   `ARROW:schema` hint resolves a column to a different Arrow type, a
   footer read that returns the wrong number of bytes, a long footer's
-  second read sharing the memory budget with the first, and the
-  `InvalidRange`-as-`EmptyFile` mapping above, each asserting its typed
-  error.
+  second read sharing the memory budget with the first, the
+  suffix-capable `InvalidRange`-as-`EmptyFile` mapping above, the
+  HEAD-driven recovery on a store without `suffix_range` (a listed size
+  of 0, an over-report past the object's real end, and a genuinely empty
+  object, each asserting the right outcome), and a `NotFound` on the
+  size-mismatch retry reporting `FileChanged` rather than `FileMissing`,
+  each asserting its typed error.
 
 - **An RLOG write refuses a broken clustered row order, and a read decodes
   each row-group dictionary once per chunk** (ADR-2135 decisions 1 and 6,
