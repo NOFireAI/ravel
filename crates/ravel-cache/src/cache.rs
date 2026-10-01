@@ -79,7 +79,10 @@ struct Inner {
 /// and cannot reach a query node's RAM, so the bound is enforced locally.
 pub struct Cache<E> {
     inner: Arc<Inner>,
-    single_flight: SingleFlight<CacheKey, Bytes, E>,
+    /// The stored value is `(clean_bytes, from_cache)`: `true` when the
+    /// leader's RAM recheck in [`get_or_fetch`](Self::get_or_fetch) served the
+    /// bytes, so they are corruption-gated like any other hit.
+    single_flight: SingleFlight<CacheKey, (Bytes, bool), E>,
     corrupt_hits: bool,
     /// Handle to the background age-sweep task, present only when the cache was
     /// constructed inside a Tokio runtime (production always is). Aborted on
@@ -208,7 +211,7 @@ where
     /// (ADR-0046 decision 5) and, on a leader miss that succeeds, admits the
     /// result before returning it.
     ///
-    /// Does not consult the cache itself first: both call sites in
+    /// Does not record a lookup of its own: both call sites in
     /// `ravel-query` already call `get` to decide their own hit/miss
     /// accounting (ADR-0044's `QueryAccounting` needs that branch either
     /// way) and call this only on that miss. An earlier version re-checked
@@ -216,6 +219,16 @@ where
     /// misses -- one from the caller's `get`, one from this method's own --
     /// corrupting the request-hit-rate SLI ADR-0046 lists. Call `get`
     /// yourself first if you need the hit path; this is the miss-only half.
+    ///
+    /// A caller's `get` can miss while a flight for `key` is running and the
+    /// caller reach here after that flight has left the single-flight map. Two
+    /// things keep it from fetching the range a second time: the leader admits
+    /// its bytes to RAM inside the flight, before the slot is removed, and a
+    /// new leader rechecks RAM, uncounted, before it fetches. Such a caller is
+    /// served the finished flight's bytes and records nothing beyond its own
+    /// `get`'s miss. An entry over the size limit is not admitted, so that
+    /// recheck misses and the caller fetches again; a failed fetch admits
+    /// nothing.
     pub async fn get_or_fetch<F, Fut>(
         &self,
         key: CacheKey,
@@ -225,13 +238,26 @@ where
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = Result<Bytes, E>> + Send,
     {
-        let (result, role) = self.single_flight.run(key, fetch).await;
-        match (&result, role) {
-            (Ok(bytes), Role::Leader) => self.insert(key, bytes.clone()),
-            (Ok(_), Role::Follower) => self.inner.metrics.record_collapse(),
-            (Err(_), _) => {}
+        let (result, role) = self
+            .single_flight
+            .run(key, move || async move {
+                if let Some(bytes) = self.inner.lookup(&key) {
+                    return Ok((bytes, true));
+                }
+                let bytes = fetch().await?;
+                self.insert(key, bytes.clone());
+                Ok((bytes, false))
+            })
+            .await;
+        let (bytes, from_cache) = result?;
+        if role == Role::Follower {
+            self.inner.metrics.record_collapse();
         }
-        result
+        Ok(if from_cache {
+            self.maybe_corrupt(bytes)
+        } else {
+            bytes
+        })
     }
 
     /// Runs one age sweep synchronously: every entry older than
@@ -360,7 +386,9 @@ fn spawn_sweeper(inner: &Arc<Inner>) -> Option<tokio::task::JoinHandle<()>> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    use tokio::sync::oneshot;
 
     use super::*;
 
@@ -581,6 +609,197 @@ mod tests {
             0,
             "the sweep must drop a one-ns-old entry when max-age is 0"
         );
+    }
+
+    /// A caller whose `get` missed while a fetch for the key was in flight, and
+    /// that reaches `get_or_fetch` only after that flight has finished and left
+    /// the single-flight map, is served the finished flight's bytes: the fetch
+    /// closure runs once in total, and nothing is recorded beyond the late
+    /// caller's own `get` miss.
+    ///
+    /// FLIP: removing the leader's `self.inner.lookup(&key)` recheck in
+    /// `get_or_fetch` makes the late caller lead a second flight, so
+    /// `fetches` reads 2.
+    #[tokio::test]
+    async fn get_or_fetch_after_the_flight_finished_reuses_its_bytes() {
+        let cache: Arc<Cache<&'static str>> = Arc::new(Cache::new(generous_limits()));
+        let payload = Bytes::from_static(b"fetched once");
+        let key = test_key_with_len(1, payload.len() as u64);
+        let fetches = Arc::new(AtomicUsize::new(0));
+
+        assert!(cache.get(&key).is_none(), "the leader's own get misses");
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let leader = {
+            let cache = cache.clone();
+            let payload = payload.clone();
+            let fetches = fetches.clone();
+            tokio::spawn(async move {
+                cache
+                    .get_or_fetch(key, move || async move {
+                        fetches.fetch_add(1, Ordering::SeqCst);
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.await;
+                        Ok::<Bytes, &'static str>(payload)
+                    })
+                    .await
+            })
+        };
+        entered_rx.await.expect("the leader reaches its fetch");
+
+        assert!(
+            cache.get(&key).is_none(),
+            "the late caller's get misses while the leader's fetch is in flight"
+        );
+        let after_gets = cache.metrics().snapshot();
+        release_tx.send(()).expect("the leader is still parked");
+        let leader_bytes = leader.await.unwrap().unwrap();
+        assert!(
+            !cache.single_flight.is_in_flight(&key),
+            "the flight has finished and left the map"
+        );
+
+        let ran = fetches.clone();
+        let late_bytes = cache
+            .get_or_fetch(key, move || async move {
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok::<Bytes, &'static str>(Bytes::from_static(b"second fetch"))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            1,
+            "a miss peeked during the flight must not fetch again"
+        );
+        assert_eq!(late_bytes, payload);
+        assert_eq!(leader_bytes, late_bytes);
+        let after = cache.metrics().snapshot();
+        assert_eq!(
+            after.misses, after_gets.misses,
+            "the recheck records no miss"
+        );
+        assert_eq!(after.hits, after_gets.hits, "the recheck records no hit");
+        assert_eq!(after.bytes_served, after_gets.bytes_served);
+        assert_eq!(after.bytes_admitted, payload.len() as u64, "admitted once");
+        assert_eq!(after.single_flight_collapses, 0);
+    }
+
+    /// A clock that, on every read, records whether `key`'s flight is still in
+    /// `cache`'s single-flight map. A fresh cache reads the clock only to stamp
+    /// an admission, so each record says whether that admission ran inside the
+    /// flight.
+    struct FlightProbeClock {
+        cache: std::sync::OnceLock<Weak<Cache<&'static str>>>,
+        key: CacheKey,
+        in_flight_at_read: Mutex<Vec<bool>>,
+    }
+
+    impl Clock for FlightProbeClock {
+        fn now_ns(&self) -> u64 {
+            if let Some(cache) = self.cache.get().and_then(Weak::upgrade) {
+                let in_flight = cache.single_flight.is_in_flight(&self.key);
+                self.in_flight_at_read.lock().push(in_flight);
+            }
+            1
+        }
+    }
+
+    /// The leader admits its bytes to RAM before its slot leaves the
+    /// single-flight map, so a caller that finds no slot finds the bytes: there
+    /// is no window between the slot's removal and the admission in which a
+    /// new caller would lead a second fetch.
+    ///
+    /// FLIP: moving `self.insert(key, bytes.clone())` out of the flight
+    /// closure to after `single_flight.run` returns records the admission with
+    /// the flight already gone, so `in_flight_at_read` reads `[false]`.
+    #[tokio::test]
+    async fn get_or_fetch_admits_to_ram_before_the_flight_leaves_the_map() {
+        let key = test_key_with_len(1, 5);
+        let clock = Arc::new(FlightProbeClock {
+            cache: std::sync::OnceLock::new(),
+            key,
+            in_flight_at_read: Mutex::new(Vec::new()),
+        });
+        let cache: Arc<Cache<&'static str>> =
+            Arc::new(Cache::new_with_clock(generous_limits(), clock.clone()));
+        assert!(clock.cache.set(Arc::downgrade(&cache)).is_ok());
+
+        let bytes = cache
+            .get_or_fetch(key, || async {
+                Ok::<Bytes, &'static str>(Bytes::from_static(b"hello"))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(bytes.as_ref(), b"hello");
+        assert_eq!(
+            *clock.in_flight_at_read.lock(),
+            vec![true],
+            "one admission, made while the flight still held its slot"
+        );
+        assert_eq!(cache.len(), 1);
+    }
+
+    /// The recheck changes nothing for an entry the RAM tier refuses or a fetch
+    /// that fails: neither is admitted, so the next leader fetches again.
+    #[tokio::test]
+    async fn get_or_fetch_admits_no_oversized_entry_and_no_failed_fetch() {
+        let limits = CacheLimits::new(64 * 1024 * 1024, 10_000, 4);
+        let cache: Cache<&'static str> = Cache::new(limits);
+        let fetches = AtomicUsize::new(0);
+        let big = test_key_with_len(1, 5);
+        for _ in 0..2 {
+            let bytes = cache
+                .get_or_fetch(big, || async {
+                    fetches.fetch_add(1, Ordering::SeqCst);
+                    Ok::<Bytes, &'static str>(Bytes::from_static(b"hello"))
+                })
+                .await
+                .unwrap();
+            assert_eq!(bytes.as_ref(), b"hello");
+        }
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            2,
+            "an entry over the size limit is never served by the recheck"
+        );
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.metrics().snapshot().admissions_rejected_size, 2);
+
+        let failing = test_key_with_len(2, 3);
+        let result = cache
+            .get_or_fetch(failing, || async { Err::<Bytes, &'static str>("boom") })
+            .await;
+        assert!(matches!(result, Err(SingleFlightError::Upstream("boom"))));
+        assert_eq!(cache.len(), 0, "a failed fetch admits nothing");
+        assert_eq!(cache.metrics().snapshot().bytes_admitted, 0);
+    }
+
+    /// In corruption mode a late caller served by the recheck gets corrupted
+    /// bytes, like any other RAM hit, while the fetching leader gets the clean
+    /// upstream bytes.
+    #[tokio::test]
+    async fn get_or_fetch_recheck_serve_is_corrupted_in_corruption_mode() {
+        let cache: Cache<&'static str> = Cache::with_corruption(generous_limits());
+        let key = test_key_with_len(1, 5);
+        let clean = Bytes::from_static(b"hello");
+        let fresh = cache
+            .get_or_fetch(key, || async { Ok::<Bytes, &'static str>(clean.clone()) })
+            .await
+            .unwrap();
+        assert_eq!(
+            fresh, clean,
+            "the fetching leader's bytes are not corrupted"
+        );
+        let late = cache
+            .get_or_fetch(key, || async {
+                Ok::<Bytes, &'static str>(Bytes::from_static(b"never"))
+            })
+            .await
+            .unwrap();
+        assert_eq!(late, corrupt_bytes(&clean));
     }
 
     /// A backward clock jump (a stamp newer than "now") must not wrap into a
