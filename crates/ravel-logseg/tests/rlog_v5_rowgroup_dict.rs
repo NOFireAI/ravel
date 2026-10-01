@@ -417,12 +417,19 @@ fn row_and_columnar_paths_identical_with_row_group_dictionaries() {
 /// before any tag 13 page is decoded. The change bumps the last byte of the
 /// last entry, which keeps the entries ascending and the page decodable, so
 /// only the page's own crc32c can see it; the block crc covers no dictionary
-/// page and still matches. A projection that leaves the column out still reads
-/// every block.
+/// page and still matches. A projection keeping the column,
+/// `fixed_only().with_attr("svc")`, fails the same way, on the whole object and
+/// on a sparse object holding only the projection's fetched ranges; a subset
+/// read checks no block crc, so there too only the page crc can refuse it. A
+/// projection that leaves the column out
+/// still reads every block.
 ///
 /// Wrong implementations this rules out, each shown failing: no dictionary crc
 /// check (every read returns the altered value); a check made only for the
-/// group's first block (blocks 1 and 2 read the altered value).
+/// group's first block (blocks 1 and 2 read the altered value); a check made
+/// only when no column selection is given, and one made only when every page of
+/// the block is read (both projected reads return the altered value, the
+/// sparse one also on its own with the whole-object assertion removed).
 #[test]
 fn corrupt_dictionary_page_fails_a_whole_block_read_of_every_other_block() {
     let (_, object) = three_block_object();
@@ -437,6 +444,7 @@ fn corrupt_dictionary_page_fails_a_whole_block_read_of_every_other_block() {
     let entries = decode_dict_page(&dict_page_bytes(&bad, &c)).expect("still a valid page");
     assert_eq!(entries.len(), 3);
 
+    let subset = ColumnSelection::fixed_only().with_attr("svc");
     for block in 0..3 {
         let whole = scan_block(&bad, block, &ColumnSelection::all());
         assert!(is_corrupted(&whole), "scan block {block}: {whole:?}");
@@ -444,6 +452,27 @@ fn corrupt_dictionary_page_fails_a_whole_block_read_of_every_other_block() {
         assert!(is_corrupted(&ranged), "ranged block {block}: {ranged:?}");
         let without = scan_block(&bad, block, &ColumnSelection::fixed_only());
         assert_eq!(without.expect("svc not read").len(), 4);
+
+        let projected = scan_block(&bad, block, &subset);
+        assert!(
+            is_corrupted(&projected),
+            "subset block {block}: {projected:?}"
+        );
+        let ranges = dir
+            .projected_page_ranges(
+                0,
+                &[block as u32],
+                Some(&HashSet::from([COL_TS, COL_STREAM_REF, svc])),
+            )
+            .expect("ranges");
+        assert!(ranges.contains(&(c.offset, d.len)));
+        let sparse = sparse_with(&bad, &ranges);
+        let reader = RlogReader::from_source(&sparse, &RlogConfig::default()).expect("reader");
+        let mut scan = reader
+            .scan_blocks_subset(&Predicate::And(vec![]), &[], &subset, &[block])
+            .expect("scan");
+        let fetched = scan.next_block(&sparse);
+        assert!(is_corrupted(&fetched), "fetched block {block}: {fetched:?}");
     }
 }
 
