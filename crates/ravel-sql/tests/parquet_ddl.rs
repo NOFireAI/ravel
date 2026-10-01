@@ -265,7 +265,9 @@ async fn create_external_table_over_a_single_object_location_then_read_back() {
         .executor
         .execute_ddl(
             t,
-            &format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/0.parquet'"),
+            &format!(
+                "CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/0.parquet'"
+            ),
             CREATED_BY,
             deadline(),
         )
@@ -305,7 +307,9 @@ async fn create_external_table_over_a_zero_byte_single_object_is_refused() {
         .executor
         .execute_ddl(
             t,
-            &format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/0.parquet'"),
+            &format!(
+                "CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/0.parquet'"
+            ),
             CREATED_BY,
             deadline(),
         )
@@ -516,6 +520,35 @@ async fn create_if_not_exists_on_existing_table_issues_no_lake_store_calls() {
     assert_eq!(
         after.op(StoreOp::List).calls,
         before.op(StoreOp::List).calls
+    );
+
+    // The plain-CREATE case (no IF NOT EXISTS) hits the identical
+    // before-any-grant-or-store-call existence check, on its way to a
+    // `TableExists` error instead of a `NoOp`: that outcome must cost
+    // exactly as little.
+    let before_plain = lake_store.metrics().snapshot();
+    let err = lake
+        .executor
+        .execute_ddl(t, &sql, CREATED_BY, deadline())
+        .await
+        .expect_err("plain CREATE over an existing table must fail");
+    assert!(
+        matches!(err, DdlExecuteError::Write(WriteError::TableExists { ref table }) if table == "hits"),
+        "{err:?}"
+    );
+    let after_plain = lake_store.metrics().snapshot();
+    assert_eq!(
+        after_plain.op(StoreOp::Get).calls,
+        before_plain.op(StoreOp::Get).calls,
+        "TableExists short-circuit must not read a footer"
+    );
+    assert_eq!(
+        after_plain.op(StoreOp::Head).calls,
+        before_plain.op(StoreOp::Head).calls
+    );
+    assert_eq!(
+        after_plain.op(StoreOp::List).calls,
+        before_plain.op(StoreOp::List).calls
     );
 }
 
