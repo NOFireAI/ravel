@@ -2034,6 +2034,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Parquet table again names `estimated_requests`, `estimated_store_bytes`
   and `estimated_decompressed_bytes` as components the estimate does not
   bound, so the MCP "does not bound" warning returns for all three.
+- **`ravel-sql` gains a typed DDL core for the three ADR-2040 D2 Parquet
+  statement forms** (ADR-2040 decisions D2 and D4, issue #2054):
+  `CREATE EXTERNAL TABLE`, `CREATE OR REPLACE EXTERNAL TABLE` and
+  `DROP TABLE`, each `STORED AS PARQUET`. `validate_ddl` is the sibling
+  gate to `validate_query`: a pure text function over `parse_guarded`'s
+  output that checks statement shape and `LOCATION` URL syntax and never
+  runs in the same request as the read-only query gate. `SqlExecutor::
+  execute_ddl` resolves the caller's tenant grant for the location,
+  refuses a location inside Ravel's own bucket, probes the named Parquet
+  file's preconditions before any manifest write, snapshots it, and
+  commits the manifest through `ravel_pqtable::writer` under the calling
+  tenant; `CREATE EXTERNAL TABLE IF NOT EXISTS` on a live table and
+  `DROP TABLE IF EXISTS` on a missing one are no-ops, and the non-`IF`
+  forms return `TableExists`/`TableNotFound`. `redact` renders all three
+  admitted forms for logging instead of rejecting them. This is the SQL
+  core only: no HTTP route, capability check or audit write yet exists
+  for it (next task).
 
 ## [0.19.0] - 2026-09-27
 
