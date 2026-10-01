@@ -919,11 +919,7 @@ async fn sweep_respects_pre_fold_head_then_deletes_after_fold_drops_bucket() {
     // Advance past the pinned-query window: the 1s granularity correction,
     // plus max_query_duration, plus clock_skew_allowance, past the fold.
     clock.set(
-        fold_ns
-            + 1_000_000_000
-            + config.max_query_duration_ns
-            + config.clock_skew_allowance_ns
-            + 1,
+        fold_ns + 1_000_000_000 + config.max_query_duration_ns + config.clock_skew_allowance_ns + 1,
     );
 
     // Ordering B, once the window has elapsed: proceeds and deletes.
@@ -1019,10 +1015,7 @@ async fn pinned_window_survives_repeated_fold_rewrites_of_head() {
     // now_ns is well past t1's pinned-query window but nowhere near t2's: a
     // gate anchored on HEAD's own rewrite time would still block here.
     clock.set(
-        t1 + 1_000_000_000
-            + config.max_query_duration_ns
-            + config.clock_skew_allowance_ns
-            + 1,
+        t1 + 1_000_000_000 + config.max_query_duration_ns + config.clock_skew_allowance_ns + 1,
     );
     let swept = retention_sweep_bucket(
         store.as_ref(),
@@ -1328,10 +1321,7 @@ async fn pinned_window_blocks_uncovered_hour_until_neighbor_part_ages() {
 
     // 5. Past the neighbour's own pinned-query window: proceeds and deletes.
     clock.set(
-        t1 + 1_000_000_000
-            + config.max_query_duration_ns
-            + config.clock_skew_allowance_ns
-            + 1,
+        t1 + 1_000_000_000 + config.max_query_duration_ns + config.clock_skew_allowance_ns + 1,
     );
     let swept = retention_sweep_bucket(
         store.as_ref(),
@@ -1404,7 +1394,10 @@ async fn sweep_blocked_fail_closed_when_anchor_part_missing() {
     // an out-of-band deletion): read HEAD, delete every part it names.
     let head_bytes = get_full(store.as_ref(), &head_key(Signal::Metrics)).await;
     let head = ravel_catalog::decode_head(head_bytes.as_ref()).expect("HEAD decodes");
-    assert!(!head.parts.is_empty(), "fixture HEAD names at least one part");
+    assert!(
+        !head.parts.is_empty(),
+        "fixture HEAD names at least one part"
+    );
     for part_ref in &head.parts {
         store
             .delete(&part_ref.key)
@@ -1416,11 +1409,7 @@ async fn sweep_blocked_fail_closed_when_anchor_part_missing() {
     // readable anchor would clear by now. The missing part must still block,
     // fail-closed.
     clock.set(
-        fold_ns
-            + 1_000_000_000
-            + config.max_query_duration_ns
-            + config.clock_skew_allowance_ns
-            + 1,
+        fold_ns + 1_000_000_000 + config.max_query_duration_ns + config.clock_skew_allowance_ns + 1,
     );
     let blocked = retention_sweep_bucket(
         store.as_ref(),

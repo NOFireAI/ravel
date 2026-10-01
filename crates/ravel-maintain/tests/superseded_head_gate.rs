@@ -679,10 +679,7 @@ async fn reconciled_hour_lets_the_sweep_delete_exactly_the_superseded_inputs() {
     // Advance past the pinned-query window: the 1s granularity correction,
     // plus max_query_duration, plus clock_skew_allowance, past `ph`.
     clock.set(
-        ph + 1_000_000_000
-            + config.max_query_duration_ns
-            + config.clock_skew_allowance_ns
-            + 1,
+        ph + 1_000_000_000 + config.max_query_duration_ns + config.clock_skew_allowance_ns + 1,
     );
     let outcome = sweep(mem.as_ref(), &clock).await.expect("sweep");
     assert_eq!(outcome.records_deleted, 2, "both input commit records gone");
