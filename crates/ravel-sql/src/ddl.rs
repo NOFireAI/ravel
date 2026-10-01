@@ -99,10 +99,10 @@ pub enum DdlOutcome {
 ///
 /// Every variant short of [`DdlExecuteError::Write`] is a refusal before any
 /// manifest write is attempted; [`DdlExecuteError::Write`] is a refusal or a
-/// failure of the write itself. The HTTP status each should take (the `ddl`
-/// capability wiring, services/ravel-server, is this task's sibling and not
-/// yet in place) is noted per variant, but is a decision for that caller, not
-/// encoded here: `DdlExecuteError` carries the distinction, not the mapping.
+/// failure of the write itself. The HTTP status each should take is noted per
+/// variant below, and [`DdlExecuteError::class`] encodes that mapping (the
+/// `ddl` capability wiring itself, services/ravel-server, is this task's
+/// sibling and not yet in place).
 #[derive(Debug, thiserror::Error)]
 pub enum DdlExecuteError {
     /// The statement failed the DDL gate (`crate::validate::validate_ddl`),
@@ -186,7 +186,11 @@ pub enum DdlExecuteError {
 
     /// Reading the `LOCATION`'s file list and schema failed, including the
     /// process memory budget refusing a footer's reservation. 422-class,
-    /// except a storage fault, which is 503-class.
+    /// except a storage fault ([`SnapshotError::List`], [`SnapshotError::Store`]),
+    /// which is 503-class; a corrupt or mismatched file
+    /// ([`SnapshotError::Corrupt`], [`SnapshotError::SchemaMismatch`]), which
+    /// is 500-class; and the inner snapshot deadline
+    /// ([`SnapshotError::Deadline`]), which is 504-class like the outer one.
     #[error("reading the Parquet file list of {location:?}: {source}")]
     Snapshot {
         location: String,
@@ -206,7 +210,15 @@ pub enum DdlExecuteError {
     /// The manifest write failed. [`WriteError::TableExists`] is a plain
     /// `CREATE` on a table that already exists, without `IF NOT EXISTS`
     /// (409-class); [`WriteError::TableNotFound`] is `DROP TABLE` without `IF
-    /// EXISTS` on a table that is not there (404-class).
+    /// EXISTS` on a table that is not there (404-class);
+    /// [`WriteError::Store`], [`WriteError::Resolve`] and
+    /// [`WriteError::RetriesExhausted`] are retryable storage contention
+    /// (503-class); the remaining variants
+    /// ([`WriteError::EmptyFileList`], [`WriteError::NoPutBudget`],
+    /// [`WriteError::VersionOverflow`], [`WriteError::Manifest`],
+    /// [`WriteError::Key`], [`WriteError::Name`]) are a malformed or
+    /// internally inconsistent write (422/500-class; see
+    /// [`DdlExecuteError::class`]).
     #[error(transparent)]
     Write(#[from] WriteError),
 
@@ -218,6 +230,144 @@ pub enum DdlExecuteError {
     /// 504-class.
     #[error("the statement did not complete within its deadline of {deadline:?}")]
     Deadline { deadline: Duration },
+}
+
+/// The client-visible class of a [`DdlExecuteError`], for HTTP status
+/// selection. Plays the same role [`crate::error::ErrorClass`] plays for
+/// [`crate::SqlError`], extended with the two statuses a DDL statement can
+/// also return: a plain `CREATE` colliding with an existing table (409), and
+/// a plain `DROP` naming a table that is not there (404).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DdlErrorClass {
+    /// The statement is malformed or outside the accepted DDL subset. 400.
+    BadRequest,
+    /// A plain `CREATE` on a table that already exists. 409.
+    Conflict,
+    /// A plain `DROP` on a table that is not there. 404.
+    NotFound,
+    /// The statement is well-formed but cannot be served: no object admits
+    /// the `LOCATION`, no file to snapshot, a budget exceeded. 422.
+    Unsupported,
+    /// A transient storage-layer fault, or contention a retry can resolve.
+    /// 503.
+    Unavailable,
+    /// The wall deadline expired. 504.
+    Timeout,
+    /// A permanent data-integrity fault: a corrupt or misfiled stored
+    /// record, or an internally inconsistent key or version. 500.
+    Internal,
+}
+
+impl DdlExecuteError {
+    /// The client-visible class, for HTTP status selection.
+    pub fn class(&self) -> DdlErrorClass {
+        match self {
+            DdlExecuteError::Validation(_) => DdlErrorClass::BadRequest,
+            DdlExecuteError::NotConfigured => DdlErrorClass::Unsupported,
+            DdlExecuteError::Location(source) => grants_error_class(source),
+            DdlExecuteError::ExternalStore { .. } => DdlErrorClass::Unavailable,
+            DdlExecuteError::ProbeList { .. } => DdlErrorClass::Unavailable,
+            DdlExecuteError::ProbeObjectEmpty { .. } => DdlErrorClass::Unsupported,
+            DdlExecuteError::ProbeObjectPageCapReached { .. } => DdlErrorClass::Unsupported,
+            DdlExecuteError::PreconditionProbe { .. } => DdlErrorClass::Unsupported,
+            DdlExecuteError::RavelBucketProbe { .. } => DdlErrorClass::Unsupported,
+            DdlExecuteError::Snapshot { source, .. } => snapshot_error_class(source),
+            DdlExecuteError::UnknownCastColumn { .. } => DdlErrorClass::Unsupported,
+            DdlExecuteError::Write(source) => write_error_class(source),
+            DdlExecuteError::Deadline { .. } => DdlErrorClass::Timeout,
+        }
+    }
+
+    /// The message a client may see. A storage fault or an internal
+    /// data-integrity fault collapses to a fixed string; every other class
+    /// keeps its own text, derived only from the statement's own `LOCATION`,
+    /// table name, and OPTIONS, which the caller already supplied.
+    ///
+    /// The full `Display` of `self` stays available to the caller for
+    /// server-side logging and is never produced here.
+    pub fn client_message(&self) -> String {
+        match self.class() {
+            DdlErrorClass::Unavailable => crate::error::MSG_UNAVAILABLE.to_string(),
+            DdlErrorClass::Internal => crate::error::MSG_INTERNAL.to_string(),
+            DdlErrorClass::BadRequest
+            | DdlErrorClass::Conflict
+            | DdlErrorClass::NotFound
+            | DdlErrorClass::Unsupported
+            | DdlErrorClass::Timeout => self.to_string(),
+        }
+    }
+}
+
+/// [`DdlExecuteError::Location`]'s class: a storage fault or exhausted
+/// compare-and-swap retry is retryable (503); a corrupt or misversioned
+/// grants record is a permanent data fault (500); every other variant is a
+/// well-formed statement this tenant's grants do not admit (422).
+fn grants_error_class(err: &GrantsError) -> DdlErrorClass {
+    match err {
+        GrantsError::Store { .. } | GrantsError::RetriesExhausted { .. } => {
+            DdlErrorClass::Unavailable
+        }
+        GrantsError::Decode { .. }
+        | GrantsError::UnsupportedVersion { .. }
+        | GrantsError::VersionBelowFloor { .. }
+        | GrantsError::Misfiled { .. } => DdlErrorClass::Internal,
+        GrantsError::InvalidLocation { .. }
+        | GrantsError::EmptyProfile
+        | GrantsError::NonCanonicalGrant { .. }
+        | GrantsError::OverlapsOtherProfile { .. }
+        | GrantsError::DuplicateGrant { .. }
+        | GrantsError::LocationNotGranted { .. }
+        | GrantsError::GrantNotFound { .. } => DdlErrorClass::Unsupported,
+        GrantsError::Key(_) => DdlErrorClass::Internal,
+    }
+}
+
+/// [`DdlExecuteError::Snapshot`]'s class: a listing or read fault is
+/// retryable (503); a corrupt file or a schema mismatch across the
+/// `LOCATION`'s files is a permanent data fault (500); the inner snapshot
+/// deadline is a timeout (504), the same class as the outer
+/// [`DdlExecuteError::Deadline`]; every other variant is a well-formed
+/// `LOCATION` this build will not snapshot as given (422).
+fn snapshot_error_class(err: &SnapshotError) -> DdlErrorClass {
+    match err {
+        SnapshotError::List { .. } | SnapshotError::Store { .. } => DdlErrorClass::Unavailable,
+        SnapshotError::Corrupt { .. } | SnapshotError::SchemaMismatch { .. } => {
+            DdlErrorClass::Internal
+        }
+        SnapshotError::Deadline { .. } => DdlErrorClass::Timeout,
+        SnapshotError::NoFiles { .. }
+        | SnapshotError::TooManyFiles { .. }
+        | SnapshotError::Unaddressable { .. }
+        | SnapshotError::OutsideGrant { .. }
+        | SnapshotError::FileChanged { .. }
+        | SnapshotError::FileMissing { .. }
+        | SnapshotError::EmptyFile { .. }
+        | SnapshotError::MemoryExhausted { .. } => DdlErrorClass::Unsupported,
+    }
+}
+
+/// [`DdlExecuteError::Write`]'s class: [`WriteError::TableExists`] and
+/// [`WriteError::TableNotFound`] are the two statuses a DDL statement can
+/// return besides the shared set (409 and 404); a storage fault or
+/// exhausted compare-and-swap retry is retryable (503); a version that has
+/// no successor, a corrupt manifest, or a malformed key or table name is a
+/// permanent data fault (500); an empty file list or an unusable grace
+/// budget is a well-formed statement this write refuses (422).
+fn write_error_class(err: &WriteError) -> DdlErrorClass {
+    match err {
+        WriteError::TableExists { .. } => DdlErrorClass::Conflict,
+        WriteError::TableNotFound { .. } => DdlErrorClass::NotFound,
+        WriteError::Store { .. } | WriteError::Resolve(_) | WriteError::RetriesExhausted { .. } => {
+            DdlErrorClass::Unavailable
+        }
+        WriteError::EmptyFileList { .. } | WriteError::NoPutBudget { .. } => {
+            DdlErrorClass::Unsupported
+        }
+        WriteError::VersionOverflow { .. }
+        | WriteError::Manifest(_)
+        | WriteError::Key(_)
+        | WriteError::Name(_) => DdlErrorClass::Internal,
+    }
 }
 
 /// What [`one_object_under`] found under a resolved `LOCATION`.
@@ -537,5 +687,404 @@ impl SqlExecutor {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use ravel_pqtable::grants::LocationDefect;
+    use ravel_pqtable::keys::KeyError;
+    use ravel_pqtable::manifest::ManifestError;
+    use ravel_pqtable::names::{NameError, TableDefect};
+    use ravel_pqtable::resolve::ResolveError;
+
+    use super::*;
+    use crate::validate::DdlValidationError;
+
+    fn store_error() -> StoreError {
+        StoreError::NotFound
+    }
+
+    #[test]
+    fn validation_is_bad_request() {
+        let err = DdlExecuteError::Validation(DdlValidationError::Empty);
+        assert_eq!(err.class(), DdlErrorClass::BadRequest);
+    }
+
+    #[test]
+    fn not_configured_is_unsupported() {
+        assert_eq!(
+            DdlExecuteError::NotConfigured.class(),
+            DdlErrorClass::Unsupported
+        );
+    }
+
+    #[test]
+    fn external_store_is_unavailable() {
+        let err = DdlExecuteError::ExternalStore {
+            profile: "p".to_string(),
+            source: ExternalStoreError::UnknownProfile {
+                profile: "p".to_string(),
+            },
+        };
+        assert_eq!(err.class(), DdlErrorClass::Unavailable);
+    }
+
+    #[test]
+    fn probe_list_is_unavailable() {
+        let err = DdlExecuteError::ProbeList {
+            location: "s3://b/p".to_string(),
+            source: store_error(),
+        };
+        assert_eq!(err.class(), DdlErrorClass::Unavailable);
+    }
+
+    #[test]
+    fn probe_object_empty_is_unsupported() {
+        let err = DdlExecuteError::ProbeObjectEmpty {
+            location: "s3://b/p".to_string(),
+        };
+        assert_eq!(err.class(), DdlErrorClass::Unsupported);
+    }
+
+    #[test]
+    fn probe_object_page_cap_reached_is_unsupported() {
+        let err = DdlExecuteError::ProbeObjectPageCapReached {
+            location: "s3://b/p".to_string(),
+            pages: MAX_PROBE_LIST_PAGES,
+        };
+        assert_eq!(err.class(), DdlErrorClass::Unsupported);
+    }
+
+    #[test]
+    fn precondition_probe_is_unsupported() {
+        let err = DdlExecuteError::PreconditionProbe {
+            location: "s3://b/p".to_string(),
+            source: PreconditionProbeFailure::WrongPinAccepted {
+                key: "k".to_string(),
+            },
+        };
+        assert_eq!(err.class(), DdlErrorClass::Unsupported);
+    }
+
+    #[test]
+    fn ravel_bucket_probe_is_unsupported() {
+        let err = DdlExecuteError::RavelBucketProbe {
+            location: "s3://b/p".to_string(),
+            source: RavelBucketProbeFailure::SameBucket {
+                key: "k".to_string(),
+            },
+        };
+        assert_eq!(err.class(), DdlErrorClass::Unsupported);
+    }
+
+    #[test]
+    fn unknown_cast_column_is_unsupported() {
+        let err = DdlExecuteError::UnknownCastColumn {
+            column: "c".to_string(),
+        };
+        assert_eq!(err.class(), DdlErrorClass::Unsupported);
+    }
+
+    #[test]
+    fn deadline_is_timeout() {
+        let err = DdlExecuteError::Deadline {
+            deadline: Duration::from_secs(5),
+        };
+        assert_eq!(err.class(), DdlErrorClass::Timeout);
+    }
+
+    #[test]
+    fn grants_store_and_retries_exhausted_are_unavailable() {
+        assert_eq!(
+            grants_error_class(&GrantsError::Store {
+                key: "k".to_string(),
+                source: store_error(),
+            }),
+            DdlErrorClass::Unavailable
+        );
+        assert_eq!(
+            grants_error_class(&GrantsError::RetriesExhausted { attempts: 3 }),
+            DdlErrorClass::Unavailable
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn grants_decode_and_version_and_misfiled_are_internal() {
+        for err in [
+            GrantsError::Decode {
+                key: "k".to_string(),
+                source: prost::DecodeError::new("bad"),
+            },
+            GrantsError::UnsupportedVersion {
+                key: "k".to_string(),
+                got: 9,
+                ceiling: 1,
+            },
+            GrantsError::VersionBelowFloor {
+                key: "k".to_string(),
+                got: 0,
+                floor: 1,
+            },
+            GrantsError::Misfiled {
+                key: "k".to_string(),
+                expected: "a".to_string(),
+                actual: "b".to_string(),
+            },
+            GrantsError::Key(KeyError::ZeroVersion),
+        ] {
+            assert_eq!(grants_error_class(&err), DdlErrorClass::Internal, "{err}");
+        }
+    }
+
+    #[test]
+    fn grants_semantic_refusals_are_unsupported() {
+        for err in [
+            GrantsError::InvalidLocation {
+                url: "s3://b/..".to_string(),
+                defect: LocationDefect::DotDot,
+            },
+            GrantsError::EmptyProfile,
+            GrantsError::NonCanonicalGrant {
+                url: "s3://b/p".to_string(),
+                prefix: "/p/".to_string(),
+            },
+            GrantsError::OverlapsOtherProfile {
+                url: "s3://b/p".to_string(),
+                profile: "a".to_string(),
+                existing: "s3://b/p".to_string(),
+                existing_profile: "b".to_string(),
+            },
+            GrantsError::DuplicateGrant {
+                url: "s3://b/p".to_string(),
+                profile: "a".to_string(),
+            },
+            GrantsError::LocationNotGranted {
+                url: "s3://b/p".to_string(),
+            },
+            GrantsError::GrantNotFound {
+                url: "s3://b/p".to_string(),
+            },
+        ] {
+            assert_eq!(
+                grants_error_class(&err),
+                DdlErrorClass::Unsupported,
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_storage_faults_are_unavailable() {
+        for err in [
+            SnapshotError::List {
+                location: "l".to_string(),
+                source: store_error(),
+            },
+            SnapshotError::Store {
+                key: "k".to_string(),
+                source: store_error(),
+            },
+        ] {
+            assert_eq!(
+                snapshot_error_class(&err),
+                DdlErrorClass::Unavailable,
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_corrupt_and_schema_mismatch_are_internal() {
+        for err in [
+            SnapshotError::Corrupt {
+                key: "k".to_string(),
+                message: "m".to_string(),
+            },
+            SnapshotError::SchemaMismatch {
+                key: "k".to_string(),
+                first: "f".to_string(),
+            },
+        ] {
+            assert_eq!(snapshot_error_class(&err), DdlErrorClass::Internal, "{err}");
+        }
+    }
+
+    #[test]
+    fn snapshot_deadline_is_timeout() {
+        let err = SnapshotError::Deadline {
+            location: "l".to_string(),
+            deadline: Duration::from_secs(1),
+        };
+        assert_eq!(snapshot_error_class(&err), DdlErrorClass::Timeout);
+    }
+
+    #[test]
+    fn snapshot_semantic_refusals_are_unsupported() {
+        for err in [
+            SnapshotError::NoFiles {
+                location: "l".to_string(),
+            },
+            SnapshotError::TooManyFiles {
+                location: "l".to_string(),
+                limit: 1,
+            },
+            SnapshotError::Unaddressable {
+                location: "l".to_string(),
+                key: "k".to_string(),
+            },
+            SnapshotError::OutsideGrant {
+                location: "l".to_string(),
+                key: "k".to_string(),
+                grant: "g".to_string(),
+            },
+            SnapshotError::FileChanged {
+                key: "k".to_string(),
+            },
+            SnapshotError::FileMissing {
+                key: "k".to_string(),
+            },
+            SnapshotError::EmptyFile {
+                key: "k".to_string(),
+            },
+            SnapshotError::MemoryExhausted {
+                key: "k".to_string(),
+                requested: 1,
+                reserved: 1,
+                limit: 1,
+            },
+        ] {
+            assert_eq!(
+                snapshot_error_class(&err),
+                DdlErrorClass::Unsupported,
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_table_exists_is_conflict_and_table_not_found_is_not_found() {
+        assert_eq!(
+            write_error_class(&WriteError::TableExists {
+                table: "t".to_string()
+            }),
+            DdlErrorClass::Conflict
+        );
+        assert_eq!(
+            write_error_class(&WriteError::TableNotFound {
+                table: "t".to_string()
+            }),
+            DdlErrorClass::NotFound
+        );
+    }
+
+    #[test]
+    fn write_store_resolve_and_retries_exhausted_are_unavailable() {
+        for err in [
+            WriteError::Store {
+                key: "k".to_string(),
+                source: store_error(),
+            },
+            WriteError::Resolve(ResolveError::Vanished {
+                table: "t".to_string(),
+                attempts: 3,
+            }),
+            WriteError::RetriesExhausted {
+                table: "t".to_string(),
+                attempts: 3,
+            },
+        ] {
+            assert_eq!(write_error_class(&err), DdlErrorClass::Unavailable, "{err}");
+        }
+    }
+
+    #[test]
+    fn write_empty_file_list_and_no_put_budget_are_unsupported() {
+        for err in [
+            WriteError::EmptyFileList {
+                table: "t".to_string(),
+            },
+            WriteError::NoPutBudget { min_grace_ms: 1 },
+        ] {
+            assert_eq!(write_error_class(&err), DdlErrorClass::Unsupported, "{err}");
+        }
+    }
+
+    #[test]
+    fn write_version_overflow_manifest_key_and_name_are_internal() {
+        for err in [
+            WriteError::VersionOverflow {
+                table: "t".to_string(),
+                version: u64::MAX,
+            },
+            WriteError::Manifest(ManifestError::UnsupportedVersion {
+                key: "k".to_string(),
+                got: 9,
+                ceiling: 1,
+            }),
+            WriteError::Key(KeyError::ZeroVersion),
+            WriteError::Name(NameError::InvalidTable {
+                table: "T".to_string(),
+                defect: TableDefect::Uppercase,
+            }),
+        ] {
+            assert_eq!(write_error_class(&err), DdlErrorClass::Internal, "{err}");
+        }
+    }
+
+    #[test]
+    fn location_maps_through_grants_error_class() {
+        let err = DdlExecuteError::Location(GrantsError::LocationNotGranted {
+            url: "s3://b/p".to_string(),
+        });
+        assert_eq!(err.class(), DdlErrorClass::Unsupported);
+    }
+
+    #[test]
+    fn snapshot_maps_through_snapshot_error_class() {
+        let err = DdlExecuteError::Snapshot {
+            location: "l".to_string(),
+            source: SnapshotError::Corrupt {
+                key: "k".to_string(),
+                message: "m".to_string(),
+            },
+        };
+        assert_eq!(err.class(), DdlErrorClass::Internal);
+    }
+
+    #[test]
+    fn write_maps_through_write_error_class() {
+        let err = DdlExecuteError::Write(WriteError::TableExists {
+            table: "t".to_string(),
+        });
+        assert_eq!(err.class(), DdlErrorClass::Conflict);
+    }
+
+    #[test]
+    fn client_message_redacts_unavailable_and_internal() {
+        let unavailable = DdlExecuteError::ProbeList {
+            location: "l".to_string(),
+            source: store_error(),
+        };
+        assert_eq!(unavailable.client_message(), crate::error::MSG_UNAVAILABLE);
+
+        let internal = DdlExecuteError::Snapshot {
+            location: "l".to_string(),
+            source: SnapshotError::Corrupt {
+                key: "k".to_string(),
+                message: "m".to_string(),
+            },
+        };
+        assert_eq!(internal.client_message(), crate::error::MSG_INTERNAL);
+    }
+
+    #[test]
+    fn client_message_echoes_everything_else() {
+        let err = DdlExecuteError::UnknownCastColumn {
+            column: "c".to_string(),
+        };
+        assert_eq!(err.client_message(), err.to_string());
     }
 }
