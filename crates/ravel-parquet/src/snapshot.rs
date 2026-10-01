@@ -1599,6 +1599,71 @@ mod tests {
         }
     }
 
+    /// A single-object LOCATION whose key the object-store client cannot
+    /// address exactly. The key must still pass the location URL parser's
+    /// own, narrower refusals (no `#`, `?`, `%`, or glob character) to reach
+    /// `check_file_key` at all: `<` is outside that set but still a byte
+    /// `key_is_addressable` refuses. Mutation that fails it: dropping the
+    /// `key_is_addressable` check for the single-object path (`MemoryStore`
+    /// reads the key back, so the snapshot would otherwise succeed).
+    #[tokio::test]
+    async fn an_unaddressable_single_object_key_refuses_naming_it() {
+        let store = Scripted::default();
+        put(&store, "data/a<b.parquet", parquet_bytes(&[1], &["x"])).await;
+        match snapshot(&store, "s3://lake/data/a<b.parquet").await {
+            Err(SnapshotError::Unaddressable { key, .. }) => assert_eq!(key, "data/a<b.parquet"),
+            other => panic!("expected Unaddressable, got {other:?}"),
+        }
+        assert!(store.heads().is_empty(), "refused before any HEAD");
+    }
+
+    /// A single-object LOCATION handed in with a grant that does not admit
+    /// it. Mutation that fails it: dropping the `contains_key` check for the
+    /// single-object path.
+    #[tokio::test]
+    async fn a_single_object_key_outside_the_grant_refuses_naming_it() {
+        let store = two_files().await;
+        let (_, key) =
+            resolve_location(&[grant("data")], "s3://lake/data/a.parquet").expect("granted");
+        let location = GrantedLocation {
+            grant: grant("other"),
+            key,
+        };
+        let limiter = GetLimiter::new(4).expect("permits");
+        let memory = Arc::new(MemoryBudget::unlimited());
+        let result = snapshot_location(
+            &store,
+            &location,
+            &limiter,
+            &memory,
+            DEADLINE,
+            &PhaseAccounting::new(),
+        )
+        .await;
+        match result {
+            Err(SnapshotError::OutsideGrant { key, grant, .. }) => {
+                assert_eq!(key, "data/a.parquet");
+                assert_eq!(grant, "s3://lake/other");
+            }
+            other => panic!("expected OutsideGrant, got {other:?}"),
+        }
+    }
+
+    /// A single-object LOCATION naming a key that does not exist: the HEAD
+    /// reports `NotFound`, which refuses as `FileMissing` with no footer
+    /// read attempted. Mutation that fails it: treating a HEAD's `NotFound`
+    /// as any other `Store` error instead of `FileMissing`.
+    #[tokio::test]
+    async fn a_single_object_locations_missing_head_refuses_as_file_missing() {
+        let store = Scripted::default();
+        match snapshot(&store, "s3://lake/data/missing.parquet").await {
+            Err(SnapshotError::FileMissing { key }) => assert_eq!(key, "data/missing.parquet"),
+            other => panic!("expected FileMissing, got {other:?}"),
+        }
+        assert_eq!(store.heads(), ["data/missing.parquet"]);
+        assert!(store.gets().is_empty(), "refused before any footer read");
+    }
+
     /// Mutation that fails it: reserving after the GET is issued, which would
     /// leave the GET recorded in `store.gets()` despite the refusal.
     #[tokio::test]
