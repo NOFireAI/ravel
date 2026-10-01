@@ -941,6 +941,100 @@ async fn sweep_respects_pre_fold_head_then_deletes_after_fold_drops_bucket() {
     assert!(bucket_is_empty(store.as_ref(), &bucket).await);
 }
 
+/// Stall check (ADR-0020 amendment 2026-10-01, issue #1133): the pinned-query
+/// window is anchored on the covering/neighbouring part's own store-assigned
+/// `last_modified`, not on HEAD's. HEAD is rewritten by every fold regardless
+/// of whether any part's content changed; a gate anchored on HEAD's own
+/// timestamp would therefore never age under a steady fold cadence. Here a
+/// SECOND fold runs long after the first reconcile, with nothing left to
+/// retire, so the covering part is carried forward by reference (unchanged
+/// content, same key, `last_modified` untouched -- `docs/catalog-and-mvcc.md`
+/// S7, ADR-0063) even though HEAD itself is rewritten at a much later
+/// store-clock time. The gate must still clear based on the first reconcile's
+/// timestamp. To watch this FAIL, anchor `age_and_clear` on
+/// `SnapshotHead.created_unix_ns` (or any HEAD-derived timestamp) instead of
+/// the part's own `last_modified`.
+#[tokio::test]
+async fn pinned_window_survives_repeated_fold_rewrites_of_head() {
+    let store = Arc::new(MemoryStore::new());
+    let created = sealed_now_ns();
+    store.set_clock_ms((created / 1_000_000) as u64);
+    let clock = FixedClock::new(created);
+    let bucket = seed_two(store.as_ref(), Sig::Metrics).await;
+    seed_input(
+        store.as_ref(),
+        &InputSpec::new_at(
+            HOUR + 1,
+            Uuid::from_u128(0xD4),
+            1,
+            1,
+            vec![raw_series(
+                "m",
+                &[("k", "live")],
+                &[(i64::from(HOUR + 1) * NS_PER_HOUR + 1_000, 5.0)],
+            )],
+        ),
+    )
+    .await;
+    let config = cfg();
+
+    fold_head(&store, Signal::Metrics, created, None).await;
+    let retention = retention_at_floor(&config);
+    retention_sweep_bucket(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        &bucket,
+    )
+    .await
+    .expect("tombstone");
+    clock.set(created + config.protection_horizon_ns + 1);
+
+    // First reconcile fold: drops the tombstoned bucket from the covering
+    // part. The rewritten part's `last_modified` is set here, at t1.
+    let t1 = clock.now_ns();
+    store.set_clock_ms((t1 / 1_000_000) as u64);
+    fold_head(&store, Signal::Metrics, t1, None).await;
+
+    // Second fold, much later by the store's clock, but with the IDENTICAL
+    // logical `now_ns` (so the retention frontier and any watermark derived
+    // from it are unchanged): the covering part's content is therefore
+    // byte-identical, so it is adopted via `AlreadyExists` self-heal rather
+    // than re-PUT (`docs/catalog-and-mvcc.md` S7, ADR-0063 S5), even though
+    // HEAD itself is rewritten at t2.
+    let t2 = t1 + 50 * config.protection_horizon_ns;
+    store.set_clock_ms((t2 / 1_000_000) as u64);
+    fold_head(&store, Signal::Metrics, t1, None).await;
+
+    // now_ns is well past t1's pinned-query window but nowhere near t2's: a
+    // gate anchored on HEAD's own rewrite time would still block here.
+    clock.set(
+        t1 + 1_000_000_000
+            + config.max_query_duration_ns
+            + config.clock_skew_allowance_ns
+            + 1,
+    );
+    let swept = retention_sweep_bucket(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        &bucket,
+    )
+    .await
+    .expect("sweep");
+    assert_eq!(
+        swept,
+        RetentionOutcome::Swept,
+        "anchored on the covering part's own last_modified (t1), not HEAD's \
+         later, content-unchanged rewrite (t2)"
+    );
+    assert!(bucket_is_empty(store.as_ref(), &bucket).await);
+}
+
 /// The epic exit criterion: retention of an hour whose tombstone lands FAR
 /// behind the fold watermark (outside the fixed reconcile window) never leaves
 /// the snapshot naming a deleted object. The fold's retention-frontier
