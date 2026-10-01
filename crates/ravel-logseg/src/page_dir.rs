@@ -977,6 +977,76 @@ mod tests {
         dir.groups[0].chunks[0].pages[1].len = u64::MAX;
         assert!(is_corrupted(PageDir::decode(&dir.encode())));
     }
+
+    /// A tag 12 page and its tag 13 pages decode on `severity_text`, `body`,
+    /// `attrs_raw` and a FIELD_DIR `Str` or `Bytes` column, and `decode_validated`
+    /// refuses them on `ts`, `severity_num`, a FIELD_DIR `I64` column and a
+    /// column FIELD_DIR does not name. The same chunk with plain pages decodes
+    /// on every one of them.
+    ///
+    /// Wrong implementations this rules out, each shown failing: no column check
+    /// in `decode_validated` (every refused case decodes); a check that treats a
+    /// column FIELD_DIR does not name as a string column (`ts` decodes).
+    #[test]
+    fn dictionary_pages_only_on_string_columns() {
+        use crate::field_dir::FieldEntry;
+        use crate::record::{
+            COL_ATTRS_RAW, COL_BODY, COL_SEVERITY_NUM, COL_SEVERITY_TEXT, COL_TS, FieldType,
+        };
+        let entry = |name: &str, ty, column_id| FieldEntry {
+            name: name.into(),
+            ty,
+            column_id,
+            present_blocks: 2,
+            null_count: 0,
+        };
+        let fields = FieldDir::new(vec![
+            entry("b", FieldType::Bytes, 12),
+            entry("n", FieldType::I64, 10),
+            entry("s", FieldType::Str, 11),
+        ]);
+        let chunk = |column_id, pages| PageDir {
+            groups: vec![GroupEntry {
+                first_block: 0,
+                block_count: 2,
+                chunks: vec![ChunkEntry {
+                    column_id,
+                    offset: 0,
+                    pages,
+                }],
+            }],
+        };
+        let dict = |block, enc| PageEntry {
+            enc,
+            ..page(block, 4)
+        };
+        let dict_pages = || {
+            vec![
+                dict(2, Enc::DictPage),
+                dict(0, Enc::DictIds),
+                dict(1, Enc::DictIds),
+            ]
+        };
+        let open = |dir: PageDir| PageDir::decode_validated(&dir.encode(), 100, 2, &fields);
+
+        for column_id in [COL_SEVERITY_TEXT, COL_BODY, COL_ATTRS_RAW, 11, 12] {
+            let dir = chunk(column_id, dict_pages());
+            assert_eq!(open(dir.clone()).expect("a string column"), dir);
+        }
+        for column_id in [COL_TS, COL_SEVERITY_NUM, 10, 13] {
+            match open(chunk(column_id, dict_pages())) {
+                Err(LogSegError::Corrupted(m)) => assert_eq!(
+                    m,
+                    format!(
+                        "page_dir column {column_id} carries a dictionary page but is not a \
+                         string column"
+                    )
+                ),
+                other => panic!("column {column_id}: {other:?}"),
+            }
+            open(chunk(column_id, vec![page(0, 4), page(1, 4)])).expect("plain pages");
+        }
+    }
 }
 
 /// Any well-formed directory round-trips exactly, and no byte string whatsoever
