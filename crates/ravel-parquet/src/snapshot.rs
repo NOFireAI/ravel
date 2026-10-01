@@ -618,58 +618,62 @@ async fn read_file(
             "the trailer records a {footer_len}-byte footer in a {size}-byte file"
         )));
     }
-    let (footer, _extra_reservations): (Bytes, Vec<Reservation>) =
-        if footer_and_trailer <= fetched {
-            (data.slice(split - footer_len as usize..split), Vec::new())
-        } else {
-            // Select the version the first read saw, so both reads are of one
-            // object's bytes; If-Match stays on the listed ETag.
-            let pin = Pin {
-                etag: listed_pin.etag.clone(),
-                version: recorded.version.clone(),
-            };
-            let footer_start = size - footer_and_trailer;
-            let (before, before_reservation) = pinned_get(
-                store,
-                limiter,
-                memory,
-                accounting,
-                &key,
-                FooterRange::Range(footer_start, tail_start),
-                &pin,
-            )
-            .await
-            .map_err(|err| match err {
-                // The one exception `read_error`'s doc comment names.
-                SnapshotError::FileMissing { key } => SnapshotError::FileChanged { key },
-                other => other,
-            })?;
-            if before.outcome.total_size != size || before.pin != recorded {
-                return Err(SnapshotError::FileChanged { key: key.clone() });
-            }
-            let before = before.outcome.data;
-            if before.len() as u64 != tail_start - footer_start {
-                return Err(corrupt(format!(
-                    "read of bytes {footer_start}..{tail_start} returned {} bytes",
-                    before.len()
-                )));
-            }
-            // The concatenation is a third buffer, live alongside the tail
-            // and before reads it copies, so it needs its own reservation:
-            // the two GETs' reservations cover only their own bytes.
-            let concat_reservation = memory.reserve(footer_len).map_err(|exhausted| {
-                SnapshotError::MemoryExhausted {
+    let (footer, _extra_reservations): (Bytes, Vec<Reservation>) = if footer_and_trailer <= fetched
+    {
+        (data.slice(split - footer_len as usize..split), Vec::new())
+    } else {
+        // Select the version the first read saw, so both reads are of one
+        // object's bytes; If-Match stays on the listed ETag.
+        let pin = Pin {
+            etag: listed_pin.etag.clone(),
+            version: recorded.version.clone(),
+        };
+        let footer_start = size - footer_and_trailer;
+        let (before, before_reservation) = pinned_get(
+            store,
+            limiter,
+            memory,
+            accounting,
+            &key,
+            FooterRange::Range(footer_start, tail_start),
+            &pin,
+        )
+        .await
+        .map_err(|err| match err {
+            // The one exception `read_error`'s doc comment names.
+            SnapshotError::FileMissing { key } => SnapshotError::FileChanged { key },
+            other => other,
+        })?;
+        if before.outcome.total_size != size || before.pin != recorded {
+            return Err(SnapshotError::FileChanged { key: key.clone() });
+        }
+        let before = before.outcome.data;
+        if before.len() as u64 != tail_start - footer_start {
+            return Err(corrupt(format!(
+                "read of bytes {footer_start}..{tail_start} returned {} bytes",
+                before.len()
+            )));
+        }
+        // The concatenation is a third buffer, live alongside the tail
+        // and before reads it copies, so it needs its own reservation:
+        // the two GETs' reservations cover only their own bytes.
+        let concat_reservation =
+            memory
+                .reserve(footer_len)
+                .map_err(|exhausted| SnapshotError::MemoryExhausted {
                     key: key.clone(),
                     requested: exhausted.requested,
                     reserved: exhausted.reserved,
                     limit: exhausted.limit,
-                }
-            })?;
-            let mut footer = Vec::with_capacity(footer_len as usize);
-            footer.extend_from_slice(&before);
-            footer.extend_from_slice(&data[..split]);
-            (Bytes::from(footer), vec![before_reservation, concat_reservation])
-        };
+                })?;
+        let mut footer = Vec::with_capacity(footer_len as usize);
+        footer.extend_from_slice(&before);
+        footer.extend_from_slice(&data[..split]);
+        (
+            Bytes::from(footer),
+            vec![before_reservation, concat_reservation],
+        )
+    };
     let metadata = decode_footer(&footer, size - footer_and_trailer).map_err(&corrupt)?;
     let row_count = u64::try_from(metadata.file_metadata().num_rows())
         .map_err(|_| corrupt("the footer records a negative row count".to_string()))?;
@@ -1076,12 +1080,19 @@ mod tests {
             ..Scripted::default()
         };
         assert!(!store.capabilities().suffix_range);
-        put(&store, "data/a.parquet", parquet_bytes(&[4, 5], &["p", "q"])).await;
-        let result = snapshot(&store, "s3://lake/data/")
-            .await
-            .expect("snapshot");
+        put(
+            &store,
+            "data/a.parquet",
+            parquet_bytes(&[4, 5], &["p", "q"]),
+        )
+        .await;
+        let result = snapshot(&store, "s3://lake/data/").await.expect("snapshot");
         assert_eq!(keys(&result), vec!["data/a.parquet"]);
-        let ranges: Vec<GetRange> = store.gets().into_iter().map(|(_, range, _)| range).collect();
+        let ranges: Vec<GetRange> = store
+            .gets()
+            .into_iter()
+            .map(|(_, range, _)| range)
+            .collect();
         assert!(!ranges.is_empty());
         assert!(
             ranges
@@ -1113,10 +1124,17 @@ mod tests {
             let result = snapshot(&store, "s3://lake/data/")
                 .await
                 .unwrap_or_else(|err| panic!("lied_size={lied_size} real_size={real_size}: {err}"));
-            assert_eq!(keys(&result), vec!["data/a.parquet"], "lied_size={lied_size}");
+            assert_eq!(
+                keys(&result),
+                vec!["data/a.parquet"],
+                "lied_size={lied_size}"
+            );
             assert_eq!(result.files[0].row_count, 2, "lied_size={lied_size}");
-            let ranges: Vec<GetRange> =
-                store.gets().into_iter().map(|(_, range, _)| range).collect();
+            let ranges: Vec<GetRange> = store
+                .gets()
+                .into_iter()
+                .map(|(_, range, _)| range)
+                .collect();
             assert!(
                 ranges
                     .iter()
