@@ -1152,20 +1152,21 @@ ravel-cli bloom-scope show --tenant acme
 the key was cleared at generation N, or the key is set, followed by its
 generation, bucket width (`1h`, `6h` or `1d`) and one `column:type` line per
 key column in key order. The type is the record's own declared type for that
-column. A tenant with no typed attribute column override prints
-`deployment-default` in place of each type, since the deployment's declaration
-lives in server flags the command cannot read, and ends with a `note:` line
-saying that resolution depends on that declaration: ingest leaves a key
-naming a column the deployment does not declare unresolved and writes the
-tenant's log objects without it. `bloom-scope show` prints `all`, `undeclared`
-or `text`; a tenant with no config record reads as `all`. A failed read of the
-record, or a stored value the catalog refuses, is an error with a non-zero
-exit and nothing on stdout. A set key naming a column the record's own
-override does not declare is refused; without an override the key is checked
-for shape only (its generation, column count, duplicate columns and bucket
-width), and a bad shape is refused the same way. This build's writer
-does not set either field yet, so a tenant configured through this build
-always reads as never set and `all`.
+column, and a key naming a column that override does not declare is refused.
+
+A tenant with no typed attribute column override prints `deployment-default`
+in place of each type, since the deployment's declaration lives in server
+flags the command cannot read. The key is then checked for shape only (its
+generation, column count, duplicate columns and bucket width), and a set key
+ends with a `note:` line saying so. The note also says that this build's log
+ingest flush resolves a key against the record's own override alone, so it
+leaves such a key unresolved and writes the tenant's log objects without it.
+
+`bloom-scope show` prints `all`, `undeclared` or `text`; a tenant with no
+config record reads as `all`. For either command, a failed read of the record,
+or a stored value the catalog refuses, is an error with a non-zero exit and
+nothing on stdout. This build's writer does not set either field yet, so a
+tenant configured through this build always reads as never set and `all`.
 
 ### Failure, retention, and performance
 
