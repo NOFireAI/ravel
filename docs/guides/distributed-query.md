@@ -191,8 +191,9 @@ what crosses the hop is a capability the coordinator mints per query:
   cannot authorize a fetch that names another, and one minted for one query
   cannot authorize another query.
 - Every rejection is one of five typed reasons (missing, bad MAC, expired,
-  tenant mismatch, query mismatch), counted per reason inside the process, and
-  returned to the coordinator as gRPC `Unauthenticated`.
+  tenant mismatch, query mismatch), counted per reason on the worker's
+  `ravel_distrib_fragment_capability_rejects_total{reason}`, and returned to
+  the coordinator as gRPC `Unauthenticated`.
 - The slice a coordinator owns by rendezvous runs in-process on the same code
   path and mints nothing: there is no hop to authorize.
 
@@ -204,15 +205,17 @@ coordinators mint under the new key, which every node already verifies. Then
 delete the old line and roll a third time. At no point in that sequence is a
 node presented a capability it cannot verify.
 
-A stale key set on one node is not silent, but it does not show up where you
-might look first. The worker's `Unauthenticated` reaches the coordinator as a
-transport-class failure, so the slice is re-dispatched to the next rendezvous
-worker, that endpoint is quarantined, and the slice ends up running
-coordinator-local. Watch `ravel_distrib_slices_redispatched_total`,
+A stale key set on one node is not silent. On the worker that holds it,
+`ravel_distrib_fragment_capability_rejects_total{reason="bad_mac"}` rises: it
+is refusing capabilities minted under a key it does not hold. On the
+coordinator, the worker's `Unauthenticated` arrives as a transport-class
+failure, so the slice is re-dispatched to the next rendezvous worker, that
+endpoint is quarantined, and the slice ends up running coordinator-local.
+Watch `ravel_distrib_slices_redispatched_total`,
 `ravel_distrib_slices_fallback_total`, and
-`ravel_distrib_quarantine_marks_total`, plus the coordinator's `warn` log
-naming the endpoint. The per-reason capability reject counters are kept
-in-process and are not rendered on `/metrics`.
+`ravel_distrib_quarantine_marks_total` there, plus the coordinator's `warn`
+log naming the endpoint, whose error text carries the worker's refusal
+message.
 
 Keep the cluster-internal gRPC listener off any network a client can reach. A
 capability authorizes a read of one tenant's pinned segments for the lifetime
@@ -751,8 +754,9 @@ label.
 `GET /metrics` renders the `ravel_distrib_*` family on any process with
 distribution enabled, under the closed `mode` label alone (no per-shard,
 per-worker, or per-tenant label), except the fragment in-flight gauge and
-admission-wait counter, which also carry a `class` label (`pinned`|`resolve`).
-The family is
+admission-wait counter, which also carry a `class` label (`pinned`|`resolve`),
+and the fragment capability reject counter, which also carries a `reason`
+label. The family is
 absent entirely when distribution is off. `ravel_sql_slice_rejects_total` is
 listed here because it counts the SQL lane's slice fetches, but it is not part
 of that family: it carries a `reason` label beside `mode`, and it renders on
@@ -761,7 +765,8 @@ every process that serves Flight SQL, with or without distribution.
 | Metric | Type | What it tells you |
 |---|---|---|
 | `ravel_distrib_fragment_requests_total` | counter | Inbound slice fetches this process served for other coordinators. |
-| `ravel_distrib_fragment_auth_failures_total` | counter | Inbound `Resolve`-scope federation requests whose presented credential did not resolve to a tenant. It does not count `Pinned` capability rejections: those are counted per reason in-process only, and reach the coordinator as re-dispatch and fallback. |
+| `ravel_distrib_fragment_auth_failures_total` | counter | Inbound `Resolve`-scope federation requests whose presented credential did not resolve to a tenant. It does not count `Pinned` capability rejections: those are `ravel_distrib_fragment_capability_rejects_total`, and reach the coordinator as re-dispatch and fallback. |
+| `ravel_distrib_fragment_capability_rejects_total{reason}` | counter | Inbound `Pinned` fragment requests this worker refused at fragment capability verification, one series per reason, each rendered from zero: `missing`, `bad_mac`, `expired`, `tenant_mismatch`, `query_mismatch`. What each reason counts is defined in [the observability guide](observability.md#distributed-read-fan-out-ravel_distrib_). A rising `bad_mac` during a key rotation means some coordinator is minting under a key this worker does not hold. A `Pinned` fetch refused on the public listener because `--fragment-listener` is set is refused before verification and counted under no reason. |
 | `ravel_sql_slice_rejects_total{reason}` | counter | Inbound SQL slice `DoGet` requests refused at slice capability verification, one series per reason, each rendered from zero: `missing`, `bad_mac`, `expired`, `wrong_surface`. What each reason counts, and which refusals are counted under none, is defined in [the observability guide](observability.md#sql-slice-capability-rejects-ravel_sql_slice_rejects_total). Absent on a process that serves no Flight SQL. |
 | `ravel_distrib_fragment_inflight{class}` | gauge | Fragments in flight now, split by admission class. `class="pinned"` riding at `--max-inflight-fragments` or `class="resolve"` riding at `--max-inflight-federated-resolves` means that class's inbound slices are queueing; the two never contend for the same permits. |
 | `ravel_distrib_fragment_admission_waits_total{class}` | counter | Inbound fragment requests, by admission class, that found their class's semaphore saturated and had to queue rather than being admitted immediately. |

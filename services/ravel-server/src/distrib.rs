@@ -202,8 +202,8 @@ impl AdmissionClass {
 
 /// The `ravel_distrib_*` metric family (ADR-0071). Process-global
 /// atomics, read at `/metrics` scrape time. Carries only the closed `mode`
-/// label (and, for the admission series, the closed `class` label) at render
-/// time; never a per-shard, per-worker, or per-tenant label (ADR-0044 section
+/// label (and the closed `class` label on the admission series and `reason` on
+/// the capability reject counter) at render time; never a per-shard, per-worker, or per-tenant label (ADR-0044 section
 /// 4).
 #[derive(Debug)]
 pub struct FragmentMetrics {
@@ -215,7 +215,7 @@ pub struct FragmentMetrics {
     fragment_auth_failures_total: AtomicU64,
     /// Inbound `Pinned` fetches refused by capability verification, indexed by
     /// [`CapabilityReject`] (ADR-0071 amendment, decision 2). Rendered under the
-    /// closed `reason` label.
+    /// closed `reason` label as `ravel_distrib_fragment_capability_rejects_total`.
     fragment_capability_rejects: [AtomicU64; 5],
     /// Fragment requests currently holding an admission permit (gauge),
     /// indexed by [`AdmissionClass`]. Rendered under the closed `class` label.
@@ -403,10 +403,11 @@ impl FragmentMetrics {
         self.fragment_capability_rejects[reason.index()].load(Ordering::Relaxed)
     }
 
-    /// The per-reason capability-reject counts paired with their stable `reason`
-    /// label, for the `/metrics` renderer to emit one series per reason.
-    pub fn capability_rejects_by_reason(&self) -> [(&'static str, u64); 5] {
-        CapabilityReject::ALL.map(|reason| (reason.reason(), self.capability_rejects(reason)))
+    /// The per-reason capability-reject counts paired with their
+    /// [`CapabilityReject`], for the `/metrics` renderer to emit one series per
+    /// reason under the `reason` label.
+    pub fn capability_rejects_by_reason(&self) -> [(CapabilityReject, u64); 5] {
+        CapabilityReject::ALL.map(|reason| (reason, self.capability_rejects(reason)))
     }
 
     pub fn fragment_inflight(&self, class: AdmissionClass) -> u64 {
@@ -1136,7 +1137,7 @@ impl FragmentService {
     }
 
     /// Execute one slice in-process with no network hop, returning the same
-    /// [`SliceResponse`] a remote fetch would. Skips token auth and fragment
+    /// [`SliceResponse`] a remote fetch would. Skips capability auth and fragment
     /// admission: this is the coordinator's own work under its client-query
     /// permit, not an inbound request from another coordinator.
     ///
