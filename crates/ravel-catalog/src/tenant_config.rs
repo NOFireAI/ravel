@@ -3614,4 +3614,285 @@ mod tests {
             "got: {err}"
         );
     }
+
+    /// Re-declare the stored config's typed columns as `columns` and write it
+    /// at the generation it was read at.
+    async fn redeclare(
+        store: &dyn ObjectStoreBackend,
+        columns: &[(&str, DeclaredColumnType)],
+    ) -> Result<SetOutcome, TenantConfigError> {
+        let mut cfg = read_config(store, &tenant())
+            .await
+            .expect("read")
+            .expect("present")
+            .0;
+        cfg.typed_attr_columns = Some(
+            columns
+                .iter()
+                .map(|(key, ty)| DeclaredTypedColumn {
+                    key: (*key).into(),
+                    ty: *ty,
+                })
+                .collect(),
+        );
+        set_tenant_config(store, &tenant(), &cfg, 2).await
+    }
+
+    /// The stored clustering key state and bloom scope.
+    async fn stored_layout(store: &dyn ObjectStoreBackend) -> (ClusteringKeyState, BloomScope) {
+        let cfg = read_config(store, &tenant())
+            .await
+            .expect("read")
+            .expect("present")
+            .0;
+        (
+            cfg.clustering_key().expect("valid key"),
+            cfg.bloom_scope().expect("known scope"),
+        )
+    }
+
+    /// A store holding a config that declares `a:str`, keys on `a` at six-hour
+    /// buckets, and carries `scope`, at the generation those setters gave it.
+    async fn keyed_on_a(scope: BloomScope) -> Arc<dyn ObjectStoreBackend> {
+        let v3 = StorageLayoutWrite::ReadersRolledOut;
+        let store = mem();
+        let mut cfg = TenantConfig {
+            typed_attr_columns: Some(vec![str_col("a")]),
+            ..TenantConfig::new(TenantLifecycleState::Active)
+        };
+        cfg.set_clustering_key(names(&["a"]), ClusteringBucketWidth::SixHours, v3)
+            .expect("set key");
+        cfg.set_bloom_scope(scope, v3).expect("set scope");
+        set_tenant_config(store.as_ref(), &tenant(), &cfg, 1)
+            .await
+            .expect("seed");
+        store
+    }
+
+    fn key_a_at(generation: u64) -> ClusteringKeyState {
+        ClusteringKeyState::Set(ClusteringKey {
+            columns: names(&["a"]),
+            bucket_width: ClusteringBucketWidth::SixHours,
+            generation,
+        })
+    }
+
+    /// Under the undeclared scope the writer leaves out of the bloom filter
+    /// every string column whose name is declared, whatever the declared type,
+    /// so a write that adds or removes a declared name at the stored generation
+    /// takes the next generation, the key's columns and width unchanged. A
+    /// retype or a reorder keeps the names, the coverage and the generation.
+    /// The gate still runs at the stored generation first, so dropping or
+    /// retyping a key column alongside a name change is refused as before.
+    #[tokio::test]
+    async fn an_undeclared_scope_takes_a_generation_when_the_declared_names_change() {
+        use DeclaredColumnType::{I64, Str};
+        let store = keyed_on_a(BloomScope::Undeclared).await;
+        let store = store.as_ref();
+        assert_eq!(
+            stored_layout(store).await,
+            (key_a_at(2), BloomScope::Undeclared)
+        );
+
+        redeclare(store, &[("a", Str), ("b", Str)])
+            .await
+            .expect("add b:str");
+        assert_eq!(
+            stored_layout(store).await,
+            (key_a_at(3), BloomScope::Undeclared)
+        );
+        redeclare(store, &[("a", Str), ("b", Str), ("c", I64)])
+            .await
+            .expect("add c:i64");
+        assert_eq!(stored_layout(store).await.0, key_a_at(4));
+        redeclare(store, &[("a", Str), ("b", I64), ("c", I64)])
+            .await
+            .expect("retype b");
+        assert_eq!(stored_layout(store).await.0, key_a_at(4));
+        redeclare(store, &[("c", I64), ("b", I64), ("a", Str)])
+            .await
+            .expect("reorder");
+        assert_eq!(stored_layout(store).await.0, key_a_at(4));
+        redeclare(store, &[("a", Str), ("b", I64)])
+            .await
+            .expect("remove c");
+        assert_eq!(
+            stored_layout(store).await,
+            (key_a_at(5), BloomScope::Undeclared)
+        );
+
+        let refused = |result: Result<SetOutcome, TenantConfigError>| match result {
+            Err(TenantConfigError::InvalidStorageLayoutConfig { source, .. }) => source,
+            other => panic!("expected a storage-layout refusal, got {other:?}"),
+        };
+        assert_eq!(
+            refused(redeclare(store, &[("b", I64)]).await),
+            StorageLayoutConfigError::ClusteringKeyColumnRemoved { column: "a".into() }
+        );
+        assert_eq!(
+            refused(redeclare(store, &[("a", I64), ("b", I64), ("d", Str)]).await),
+            StorageLayoutConfigError::ClusteringKeyColumnRetyped {
+                column: "a".into(),
+                from: Str,
+                to: I64,
+            }
+        );
+        assert_eq!(
+            stored_layout(store).await.0,
+            key_a_at(5),
+            "refusals write nothing"
+        );
+    }
+
+    /// A key never set under the undeclared scope sits in the cleared form at
+    /// the scope's generation, and a declared name change moves it to the next
+    /// generation still cleared.
+    #[tokio::test]
+    async fn an_undeclared_scope_without_a_key_takes_a_generation_in_the_cleared_form() {
+        let v3 = StorageLayoutWrite::ReadersRolledOut;
+        let store = mem();
+        let mut cfg = TenantConfig::new(TenantLifecycleState::Active);
+        cfg.set_bloom_scope(BloomScope::Undeclared, v3)
+            .expect("set");
+        set_tenant_config(store.as_ref(), &tenant(), &cfg, 1)
+            .await
+            .expect("seed");
+        redeclare(store.as_ref(), &[("b", DeclaredColumnType::Str)])
+            .await
+            .expect("add b");
+        assert_eq!(
+            stored_layout(store.as_ref()).await,
+            (
+                ClusteringKeyState::Cleared { generation: 2 },
+                BloomScope::Undeclared
+            )
+        );
+    }
+
+    /// Under the text and all scopes the declared names decide no coverage, so
+    /// adding or removing a declared column of either type keeps the generation.
+    #[tokio::test]
+    async fn text_and_all_scopes_keep_the_generation_across_declared_name_changes() {
+        use DeclaredColumnType::{I64, Str};
+        for (scope, generation) in [(BloomScope::Text, 2), (BloomScope::All, 1)] {
+            let store = keyed_on_a(scope).await;
+            let store = store.as_ref();
+            assert_eq!(stored_layout(store).await, (key_a_at(generation), scope));
+            redeclare(store, &[("a", Str), ("b", Str)])
+                .await
+                .expect("add b");
+            redeclare(store, &[("a", Str), ("b", Str), ("c", I64)])
+                .await
+                .expect("add c");
+            redeclare(store, &[("a", Str), ("c", I64)])
+                .await
+                .expect("remove b");
+            assert_eq!(
+                stored_layout(store).await,
+                (key_a_at(generation), scope),
+                "{scope:?}"
+            );
+        }
+    }
+
+    /// `write_if_unchanged` writes only over the record version the config was
+    /// read at. A record another writer changed, deleted or created since is a
+    /// `CasConflict` saying to re-read and retry, and writes nothing; at the
+    /// version just read it writes.
+    #[tokio::test]
+    async fn write_if_unchanged_refuses_a_record_that_moved_since_the_read() {
+        let store = mem();
+        let key = config_key(&tenant());
+        let read = || async {
+            read_config(store.as_ref(), &tenant())
+                .await
+                .expect("read")
+                .expect("present")
+        };
+        let bytes = || async { store.get(&key, GetRange::Full).await.expect("present").data };
+        let conflict = |result: Result<SetOutcome, TenantConfigError>| match result {
+            Err(err @ TenantConfigError::CasConflict { .. }) => {
+                assert!(err.to_string().contains("re-read and retry"), "got: {err}");
+            }
+            other => panic!("expected a CAS conflict, got {other:?}"),
+        };
+        let seed = TenantConfig {
+            retention_ns: Some(1),
+            ..TenantConfig::new(TenantLifecycleState::Active)
+        };
+        set_tenant_config(store.as_ref(), &tenant(), &seed, 1)
+            .await
+            .expect("seed");
+
+        let (mine, version) = read().await;
+        let theirs = TenantConfig {
+            retention_ns: Some(2),
+            ..mine.clone()
+        };
+        set_tenant_config(store.as_ref(), &tenant(), &theirs, 2)
+            .await
+            .expect("the other write");
+        let moved = bytes().await;
+        let mine = TenantConfig {
+            max_active_series: Some(7),
+            ..mine
+        };
+        conflict(
+            mine.write_if_unchanged(store.as_ref(), &tenant(), Some(&version), 3)
+                .await,
+        );
+        assert_eq!(bytes().await, moved, "the refusal writes nothing");
+
+        let (fresh, version) = read().await;
+        let fresh = TenantConfig {
+            max_active_series: Some(7),
+            ..fresh
+        };
+        assert_eq!(
+            fresh
+                .write_if_unchanged(store.as_ref(), &tenant(), Some(&version), 4)
+                .await
+                .expect("unchanged"),
+            SetOutcome::Updated
+        );
+        let (written, version) = read().await;
+        assert_eq!(
+            (written.retention_ns, written.max_active_series),
+            (Some(2), Some(7))
+        );
+
+        store.delete(&key).await.expect("delete");
+        conflict(
+            written
+                .write_if_unchanged(store.as_ref(), &tenant(), Some(&version), 5)
+                .await,
+        );
+        assert!(
+            read_config(store.as_ref(), &tenant())
+                .await
+                .expect("read")
+                .is_none(),
+            "a deleted record is not re-created"
+        );
+
+        set_tenant_config(store.as_ref(), &tenant(), &seed, 6)
+            .await
+            .expect("another writer creates it");
+        let created = bytes().await;
+        conflict(
+            written
+                .write_if_unchanged(store.as_ref(), &tenant(), None, 7)
+                .await,
+        );
+        assert_eq!(bytes().await, created, "the refusal writes nothing");
+
+        let empty = mem();
+        assert_eq!(
+            written
+                .write_if_unchanged(empty.as_ref(), &tenant(), None, 8)
+                .await
+                .expect("still absent"),
+            SetOutcome::Created
+        );
+    }
 }
