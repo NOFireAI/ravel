@@ -26,6 +26,7 @@
         "arn:aws:s3:::my-ravel-bucket/sys/tenancy",
         "arn:aws:s3:::my-ravel-bucket/sys/qualification",
         "arn:aws:s3:::my-ravel-bucket/sys/gc",
+        "arn:aws:s3:::my-ravel-bucket/sys/auth",
         "arn:aws:s3:::my-ravel-bucket/sys/query/workers/*"
       ]
     },

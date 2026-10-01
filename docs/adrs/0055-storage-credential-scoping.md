@@ -176,6 +176,10 @@ the final `sys/qualification` record. All four are corrected in place above
 rather than left wrong with a note, since this ADR had not yet been acted
 on by any deployment at the time of correction.
 
+The table also omits the control-plane keys `sys/auth`, `sys/t/<hash>` and
+the `sys/maintain/memo/` listing; the control-plane key amendment below adds
+them.
+
 This is not a literal "ingest, compaction, query, and sweep" four-way split
 — sweep is not split into its own process here. Sweep
 runs inside the same `Mode::Maintain` process as compaction and retention
@@ -961,3 +965,45 @@ context's list of what the code deletes, §1's Query and Maintain delete
 columns, §2's list of what a compromised Maintain credential can delete, the
 recaps in the query-audit and `del/` amendments, and the worker-heartbeat
 amendment's sentence that left this case undecided.
+
+## Amendment (2026-10-01): the control-plane keys each role reads and writes
+
+<!-- amendment-applies: sections="1. Four roles, mapped to existing process boundaries" pointer="control-plane key amendment" -->
+
+§1's table was derived from the data-path call sites and left
+out three control-plane keys the code reads or writes in a named role's
+mode. IAM is default-deny, so each omission was a refused request under the
+shipped templates. The grants below are the narrowest that cover each call:
+
+- **`sys/auth`, the durable bearer-token map (ADR-0066 decision 6).** Gateway
+  and Query read it: on a keyed bucket `Mode::Gateway`, `Mode::Query` and
+  `Mode::All` refresh it at startup, on a horizon and on a token miss, and a
+  process that cannot refresh fails durable-token auth closed: its tokens
+  never resolve before a first refresh, and stop resolving past the
+  hard-stale bound. `GatewayRead` and `QueryRead` gain `sys/auth`. Admin
+  writes it: `ravel-cli tenant token upsert` and `revoke` read the map and
+  PUT it back with `CreateIfAbsent` or `CasVersion`, so `AdminWrite` gains
+  `sys/auth`. No server role writes it; the only production writers are
+  `ravel-cli` under Admin and the operator, which uses the shared storage
+  credential its CRD names rather than one of these templates. Nothing
+  deletes it.
+- **`sys/t/<hash>`, the per-tenant recovery manifest (ADR-0050 section 3).**
+  Every ingest handler writes it with `CreateIfAbsent` on a keyed tenant's
+  first request in a process, so it is a Gateway write. `GatewayWrite`
+  gains `sys/t/*`. A refused write does not fail ingest, but the tenant gets
+  no manifest and the writer retries on every later request.
+- **`sys/maintain/memo/`, the maintain memo snapshots (ADR-0065 decision 3).**
+  The warm start LISTs the prefix and then GETs each snapshot. The GET and
+  the snapshot PUT were already covered by `sys/maintain/*`; the LIST was
+  not, and a refused LIST degrades to a cold start: each maintain cycle logs
+  a warning and retries.
+  `MaintainList` gains `sys/maintain/memo/*`.
+
+Two candidates were examined and are not granted. Query still deletes
+nothing: a draining query worker overwrites its own record and Maintain
+reaps it, as the query-worker reap amendment records. Gateway and Query
+still cannot create `sys/gc`: every mode runs the bootstrap at startup, but
+§4 keeps creation with Maintain and Admin, and the deployment guides and
+the operator start Maintain first on a fresh bucket for that reason.
+
+Recorded as an appended amendment, with an inline pointer added to §1.
