@@ -1691,9 +1691,16 @@ a candidate for the mandatory-capability check above, which governs the
 bucket Ravel writes. On the read side it reports `consistent_read`,
 `consistent_list` and `prefix_list` true for every kind, and `suffix_range`
 true for S3 and GCS but false for Azure, whose `object_store` client refuses
-a suffix range before sending it. The `ravel-parquet` footer read asks for an
-explicit range ending at the size the manifest pinned, so it issues no suffix
-range on any kind.
+a suffix range before sending it. Once a file has a manifest entry, the
+`ravel-parquet` reader's footer read asks for an explicit range ending at
+the pinned size, so it issues no suffix range on any kind. Before that --
+`ravel-parquet::snapshot`, building the manifest entry -- no pinned size
+exists yet: the first footer read is a suffix read where `suffix_range` is
+true, and otherwise an explicit range over the last `min(FOOTER_PREFETCH,
+size)` bytes of the size the listing (or a single-object HEAD) reported,
+self-correcting with one retry at the size its own response reports if
+that listed size was stale, and refusing `FileChanged` if the two reads
+still disagree.
 
 Two probes qualify a grant before anything reads through it, both in
 `external::probe`, both fail-closed, and both run at grant creation rather
