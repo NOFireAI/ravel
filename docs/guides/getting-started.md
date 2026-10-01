@@ -209,9 +209,13 @@ normative for both.
 docker compose -f deploy/docker-compose/ravel.yml down
 ```
 
-`rustfs-data/` on your machine persists across runs, and the store-qualify
-one-shot is idempotent, so bringing the stack up again on the same directory is
-safe. Delete that directory to start from an empty store.
+`rustfs-data/` on your machine persists across runs. The `createbucket`
+one-shot reads the bucket's versioning and lifecycle configuration first and
+puts only what is not already set, and the store-qualify one-shot is
+idempotent, so bringing the stack up again on the same directory is safe. The
+same holds for `deploy/docker-compose/rustfs.yml` below, which shares that
+directory and that `createbucket` script. Delete the directory to start from an
+empty store.
 
 ## Where to go next
 
@@ -261,8 +265,13 @@ make demo
 
 `make demo` builds `ravel-server` and `ravel-cli` in release mode, then runs
 [scripts/demo.sh](../../scripts/demo.sh), which starts RustFS if it is not
-already up, waits for the Compose `createbucket` service to set up the bucket,
-generates a fresh OTLP metrics export with
+already up. Only when it started RustFS itself does it wait for the Compose
+`createbucket` service to exit, and it stops if that service failed. When
+RustFS is already running, as after `make rustfs`, it neither waits for nor
+checks that service, so let `createbucket` finish first
+(`docker compose -f deploy/docker-compose/rustfs.yml ps --all createbucket`
+shows it exited 0); if the bucket is missing, the store-qualify step reports
+it. The demo then generates a fresh OTLP metrics export with
 current timestamps, starts `ravel-server --store s3` on `127.0.0.1:14318`
 (HTTP) and `127.0.0.1:14317` (gRPC) against RustFS, posts the export, captures
 the `x-ravel-commit-token`, and queries the series back with that token as

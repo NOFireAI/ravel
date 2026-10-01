@@ -236,10 +236,12 @@ spec:
               # The lifecycle document is read once and checked whole: exactly
               # one rule, enabled, scoped to the whole bucket, carrying each
               # action. flat is the document on one line with every whitespace
-              # character turned into a space, doc the same with no spaces.
+              # character turned into a space, tagged the same with the spaces
+              # inside each tag removed, and doc the same with no spaces at all.
               lifecycle="$(curl -fsS "${ENDPOINT}/${BUCKET}?lifecycle")"
               flat="$(printf '%s' "$lifecycle" | tr '\r\n\t' '   ')"
-              doc="$(printf '%s' "$flat" | tr -d ' ')"
+              tagged="$(printf '%s\n' "$flat" | sed -e ':a' -e 's/\(<[^>]*\) /\1/' -e 'ta')"
+              doc="$(printf '%s' "$tagged" | tr -d ' ')"
               count() { printf '%s\n' "$1" | grep -o "$2" | wc -l | tr -d ' '; }
               rules="$(count "$flat" '<Rule[ />]')"
               if [ "$rules" != "1" ]; then
@@ -256,9 +258,10 @@ spec:
               # Prefix (directly or inside And), an empty Filter, or a rule-level
               # empty Prefix with no Filter. The spelling must be a direct child
               # of Rule (as many tags opened as closed before it), and nothing
-              # else in the rule may name a filter element. Whitespace right
-              # after <Prefix> is prefix text to the server, so it is refused
-              # before whitespace is stripped.
+              # else in the rule may name a filter element. The server keeps a
+              # Prefix's text as it is, so whitespace there is a prefix of
+              # spaces: any Prefix holding text is refused, read from tagged,
+              # where only the whitespace inside tags is gone.
               rule="${doc#*<Rule>}"
               rule="${rule%%</Rule>*}"
               whole=
@@ -266,8 +269,8 @@ spec:
                 *'<Rule>'*'</Rule>'*) ;;
                 *) rule= ;;
               esac
-              case "$flat" in
-                *'<Prefix> '*) rule= ;;
+              case "$tagged" in
+                *'<Prefix>'[!\<]*) rule= ;;
               esac
               for spelling in '<Filter><Prefix></Prefix></Filter>' '<Filter><Prefix/></Filter>' \
                 '<Filter><And><Prefix></Prefix></And></Filter>' '<Filter><And><Prefix/></And></Filter>' \

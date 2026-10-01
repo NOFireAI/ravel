@@ -68,8 +68,30 @@ wait_for() {
 # Object Lock, versioning and the lifecycle rule and reads all three back. The
 # demo does not create the bucket itself: a plain create racing that service
 # would leave a bucket without Object Lock, and the service's read-back would
-# then fail. `docker compose wait` (Compose 2.20 or later) exits with the
-# service's own exit code.
+# then fail.
+#
+# createbucket_exit_code prints the service's exit code once it has exited. It
+# polls `docker compose ps --all`, which lists an exited container with its
+# exit code. `docker compose wait` would not do: once the service has already
+# exited, it prints "no containers for project" and exits 1 whatever the
+# service's own exit code was.
+createbucket_exit_code() {
+  local attempt line=""
+  for attempt in $(seq 1 180); do
+    line="$(docker compose -f "$RUSTFS_COMPOSE" ps --all \
+      --format '{{.State}} {{.ExitCode}}' createbucket 2>/dev/null)" || line=""
+    case "$line" in
+      "exited "*)
+        printf '%s\n' "${line#exited }"
+        return 0
+        ;;
+    esac
+    sleep 1
+  done
+  log "timed out waiting for the createbucket service to exit (last state: ${line:-not listed})"
+  return 1
+}
+
 if rustfs_healthy; then
   log "RustFS already running at ${RUSTFS_ENDPOINT}; ${RAVEL_S3_BUCKET} is expected to exist (the qualify step below reports it if not)"
 else
@@ -78,9 +100,8 @@ else
   STARTED_RUSTFS=1
   wait_for "RustFS to become healthy" rustfs_healthy
   log "waiting for the createbucket service to set up ${RAVEL_S3_BUCKET}"
-  createbucket_rc=0
-  docker compose -f "$RUSTFS_COMPOSE" wait createbucket >/dev/null || createbucket_rc=$?
-  if [[ "$createbucket_rc" -ne 0 ]]; then
+  createbucket_rc="$(createbucket_exit_code)" || createbucket_rc=timeout
+  if [[ "$createbucket_rc" != 0 ]]; then
     log "the createbucket service failed (exit ${createbucket_rc}); its output:"
     docker compose -f "$RUSTFS_COMPOSE" logs createbucket >&2 || true
     exit 1

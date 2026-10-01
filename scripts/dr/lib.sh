@@ -573,22 +573,24 @@ dr_check_object_lock() {
   fi
 }
 
-# Read a bucket this harness created back and fail unless it carries exactly
-# what dr_ensure_bucket put: Object Lock enabled, versioning Enabled, and
-# exactly one enabled lifecycle rule scoped to the whole bucket carrying each
-# action of DR_BUCKET_LIFECYCLE. The lifecycle configuration is read once, as
-# tab-separated fields that each go through to_string so none is empty: rule
-# count, Status, scope (Filter and legacy Prefix as one JSON object), then the
-# three actions.
-dr_check_bucket_protection() {
-  local bucket="$1" got rules rule_status scope markers noncurrent abort
-  dr_check_object_lock "${bucket}" || return 1
+# Fail unless a bucket this harness created has versioning Enabled.
+dr_check_versioning() {
+  local bucket="$1" got
   got="$(dr_aws s3api get-bucket-versioning --bucket "${bucket}" \
     --query Status --output text)" || got="(read failed)"
   if [[ "${got}" != "Enabled" ]]; then
     dr_bucket_refuse "bucket ${bucket} does not have versioning enabled (read ${got})"
-    return 1
   fi
+}
+
+# Fail unless a bucket this harness created carries exactly the lifecycle
+# configuration dr_ensure_bucket puts: one enabled rule scoped to the whole
+# bucket carrying each action of DR_BUCKET_LIFECYCLE. The configuration is read
+# once, as tab-separated fields that each go through to_string so none is empty:
+# rule count, Status, scope (Filter and legacy Prefix as one JSON object), then
+# the three actions.
+dr_check_lifecycle() {
+  local bucket="$1" got rules rule_status scope markers noncurrent abort
   if ! got="$(dr_aws s3api get-bucket-lifecycle-configuration --bucket "${bucket}" \
     --output text --query '[to_string(length(Rules)), to_string(Rules[0].Status), to_string({f: Rules[0].Filter, p: Rules[0].Prefix}), to_string(Rules[0].Expiration.ExpiredObjectDeleteMarker), to_string(Rules[0].NoncurrentVersionExpiration.NoncurrentDays), to_string(Rules[0].AbortIncompleteMultipartUpload.DaysAfterInitiation)]')"; then
     dr_bucket_refuse "could not read the lifecycle configuration of bucket ${bucket}"
@@ -605,10 +607,12 @@ dr_check_bucket_protection() {
   fi
   # The whole-bucket spellings the server's rule parser reads as an empty prefix.
   # This reads through botocore, which drops unknown elements and text inside
-  # Filter and keeps only the first of two Filters, so such a rule reads back as
-  # an accepted spelling here. The server's parser reads it as an unrecognized
-  # filter, reports the lifecycle conditions unknown, and starts with a warning
-  # rather than refusing.
+  # Filter and keeps only the first of two Filters. Text beside a Filter's one
+  # Prefix is harmless: the server ignores it too and reads the whole bucket. An
+  # unknown element inside Filter, text in a Filter with no child, or a second
+  # Filter reads back as an accepted spelling here, while the server reads it as
+  # an unrecognized filter, reports the lifecycle conditions unknown, and starts
+  # with a warning rather than refusing.
   case "${scope}" in
     '{"f":{"Prefix":""},"p":null}' | '{"f":{},"p":null}' | \
       '{"f":{"And":{"Prefix":""}},"p":null}' | '{"f":null,"p":""}') ;;
@@ -649,79 +653,125 @@ dr_protection_verdict() {
 # over prefixes Ravel does not write, so it is not held to DR_BUCKET_LIFECYCLE.
 #
 # `ravel-cli store verify-protection` reads the conditions. It requires an
-# expected E_v, which the server does not have, so it runs once per
-# NoncurrentDays value the bucket's rules carry (once with 1 when none does),
-# and the bucket passes when one run shows no condition the server refuses on.
-# The run whose E_v is the value the rules covering t/ agree on reads every
-# condition as the server does, and a run with another E_v fails
-# noncurrent-expiration on those rules. The one bucket this can pass and the
-# server refuse has versioning not Enabled under Object Lock, which S3 does not
-# allow, and a rule over part of t/ expiring noncurrent versions sooner than
-# the covering rules. An unknown condition does not refuse, as the server warns
-# and starts.
+# expected E_v, which the server does not have: the server measures every
+# narrower rule's NoncurrentDays against the value the rules covering t/ agree
+# on (dr_reference_noncurrent_days). verify-protection runs once, with that
+# value as its E_v, so it reads every condition the way the server does. A
+# bucket whose reference cannot be determined is refused rather than checked
+# against a guess. An unknown condition does not refuse, as the server warns and
+# starts.
 dr_check_server_protection() {
-  local bucket="$1" variable listing day days="" report code id verdict
-  local versioning noncurrent fatal best_fatal="" best_day="" best_report="" advice
+  local bucket="$1" variable listing day report code id verdict
+  local versioning noncurrent fatal="" advice
   variable="$(dr_bucket_variable "${bucket}")"
-  if ! dr_ravel_binaries_available; then
-    dr_bucket_refuse "bucket ${bucket} carries no rehearsal marker, and checking it needs ravel-cli store verify-protection, but there is no ravel-cli and no cargo"
+  if ! dr_have_command ravel-cli && ! dr_have_command cargo; then
+    dr_bucket_refuse "bucket ${bucket} carries no rehearsal marker, and checking it needs ravel-cli store verify-protection, but there is no ravel-cli on PATH and no cargo to build one"
     return 1
   fi
-  listing="$(dr_aws s3api get-bucket-lifecycle-configuration --bucket "${bucket}" \
-    --query 'Rules[].NoncurrentVersionExpiration.NoncurrentDays' --output text \
-    2>/dev/null)" || listing=""
-  while IFS= read -r day; do
-    if [[ "${day}" =~ ^[0-9]{1,9}$ ]]; then days+="${day}"$'\n'; fi
-  done < <(dr_text_list_lines "${listing}")
-  days="$(sort -un <<<"${days}" | awk 'NF > 0')"
-  [[ -n "${days}" ]] || days=1
-  while IFS= read -r day; do
-    code=0
-    report="$(
-      dr_export_s3_env "${bucket}"
-      dr_ravel_cli --store s3 store verify-protection --expected-noncurrent-days "${day}" \
-        </dev/null
-    )" || code=$?
-    if [[ "${code}" -gt 2 ]]; then
-      dr_bucket_refuse "could not run ravel-cli store verify-protection against bucket ${bucket} (exit ${code})"
+  if ! listing="$(dr_aws s3api get-bucket-lifecycle-configuration --bucket "${bucket}" \
+    --query 'Rules[].[Status, to_string({f: Filter, p: Prefix}), to_string(NoncurrentVersionExpiration.NoncurrentDays)]' \
+    --output text 2>/dev/null)"; then
+    dr_bucket_refuse "could not read the lifecycle configuration of bucket ${bucket}, so the NoncurrentDays a --require-bucket-protection server measures other rules against cannot be determined; store verify-protection needs that value to check the bucket the way the server does"
+    return 1
+  fi
+  if dr_reference_noncurrent_days "${listing}"; then
+    day="${DR_REFERENCE_DAYS}"
+  else
+    dr_bucket_refuse "bucket ${bucket}: ${DR_REFERENCE_ERROR}, so the NoncurrentDays a --require-bucket-protection server measures other rules against cannot be determined; store verify-protection needs that value to check the bucket the way the server does. Give the bucket one enabled rule over t/ (or the whole bucket) carrying NoncurrentVersionExpiration, or set ${variable} to a name that does not exist yet so the harness creates and configures one"
+    return 1
+  fi
+  code=0
+  report="$(
+    dr_export_s3_env "${bucket}"
+    dr_ravel_cli --store s3 store verify-protection --expected-noncurrent-days "${day}" \
+      </dev/null
+  )" || code=$?
+  if [[ "${code}" -gt 2 ]]; then
+    dr_bucket_refuse "could not run ravel-cli store verify-protection against bucket ${bucket} (exit ${code})"
+    return 1
+  fi
+  for id in "${DR_SERVER_FATAL_CONDITIONS[@]}" noncurrent-expiration versioning; do
+    if ! verdict="$(dr_protection_verdict "${report}" "${id}")"; then
+      dr_bucket_refuse "ravel-cli store verify-protection printed no single verdict for ${id} on bucket ${bucket}"
       return 1
     fi
-    fatal=""
-    for id in "${DR_SERVER_FATAL_CONDITIONS[@]}" noncurrent-expiration versioning; do
-      if ! verdict="$(dr_protection_verdict "${report}" "${id}")"; then
-        dr_bucket_refuse "ravel-cli store verify-protection printed no single verdict for ${id} on bucket ${bucket}"
-        return 1
-      fi
-      case "${id}:${verdict}" in
-        versioning:*) versioning="${verdict}" ;;
-        noncurrent-expiration:*) noncurrent="${verdict}" ;;
-        *:fail) fatal+=" ${id}" ;;
-      esac
-    done
-    if [[ "${noncurrent}" == fail && "${versioning}" == pass ]]; then
-      fatal+=" noncurrent-expiration"
-    fi
-    if [[ -z "${fatal}" ]]; then
-      dr_log "bucket ${bucket} passes every condition a --require-bucket-protection server refuses to start on (store verify-protection --expected-noncurrent-days ${day})"
-      awk '$2 != "pass" && $1 != "delete-marker-replication" && $1 != "object-retention" && $1 != "verify-protection:" {
-        print "  the server would still warn on: " $0 }' <<<"${report}" >&2
-      return 0
-    fi
-    if [[ -z "${best_day}" ]] || [[ "$(wc -w <<<"${fatal}")" -lt "$(wc -w <<<"${best_fatal}")" ]]; then
-      best_fatal="${fatal}"
-      best_day="${day}"
-      best_report="${report}"
-    fi
-  done <<<"${days}"
-  for id in ${best_fatal}; do
-    awk -v id="${id}" '$1 == id { print "  " $0 }' <<<"${best_report}" >&2
+    case "${id}:${verdict}" in
+      versioning:*) versioning="${verdict}" ;;
+      noncurrent-expiration:*) noncurrent="${verdict}" ;;
+      *:fail) fatal+=" ${id}" ;;
+    esac
   done
-  if [[ " ${best_fatal} " == *" object-lock "* ]]; then
+  if [[ "${noncurrent}" == fail && "${versioning}" == pass ]]; then
+    fatal+=" noncurrent-expiration"
+  fi
+  if [[ -z "${fatal}" ]]; then
+    dr_log "bucket ${bucket} passes every condition a --require-bucket-protection server refuses to start on (store verify-protection --expected-noncurrent-days ${day}, the NoncurrentDays its rules covering t/ agree on)"
+    awk '$2 != "pass" && $1 != "delete-marker-replication" && $1 != "object-retention" && $1 != "verify-protection:" {
+      print "  the server would still warn on: " $0 }' <<<"${report}" >&2
+    return 0
+  fi
+  for id in ${fatal}; do
+    awk -v id="${id}" '$1 == id { print "  " $0 }' <<<"${report}" >&2
+  done
+  if [[ " ${fatal} " == *" object-lock "* ]]; then
     advice="Object Lock can only be enabled when a bucket is created, so this bucket can never pass: set ${variable} to a bucket created with Object Lock, or to a name that does not exist yet so the harness creates and configures one"
   else
     advice="change the bucket's configuration to meet docs/object-store-contract.md \"Required bucket configuration\", or set ${variable} to a name that does not exist yet so the harness creates and configures one"
   fi
-  dr_bucket_refuse "bucket ${bucket} fails what a --require-bucket-protection server refuses to start on:${best_fatal} (store verify-protection --expected-noncurrent-days ${best_day}, detail above). It carries no ${DR_BUCKET_MARKER_KEY} rehearsal marker, so this harness did not create it and changes nothing on it: ${advice}"
+  dr_bucket_refuse "bucket ${bucket} fails what a --require-bucket-protection server refuses to start on:${fatal} (store verify-protection --expected-noncurrent-days ${day}, detail above). It carries no ${DR_BUCKET_MARKER_KEY} rehearsal marker, so this harness did not create it and changes nothing on it: ${advice}"
+}
+
+# The last dr_reference_noncurrent_days call's reference, or why it found none.
+DR_REFERENCE_DAYS=""
+DR_REFERENCE_ERROR=""
+
+# The NoncurrentDays a --require-bucket-protection server measures a narrower
+# rule's noncurrent expiration against, mirroring covering_noncurrent_days in
+# crates/ravel-object-store/src/s3/bucket_config.rs: the one value carried by
+# the enabled rules that cover every key under t/, either alone (a rule scoped
+# to the whole bucket, `t` or `t/`) or as members of a union of `t/<d>` rules
+# that carry NoncurrentDays for every lowercase hex digit <d>. A rule narrowed
+# by a tag or a size, or with a filter not read here, covers nothing.
+#
+# $1 is one line per rule: Status, scope (Filter and legacy Prefix as one JSON
+# object, as dr_check_lifecycle reads it) and NoncurrentDays, tab separated.
+# Sets DR_REFERENCE_DAYS to the value; fails with the reason in
+# DR_REFERENCE_ERROR when the covering rules carry none, or disagree.
+dr_reference_noncurrent_days() {
+  local rule_status scope days prefix values="" union="" digits
+  local filter_re='^\{"f":\{"Prefix":"([^"\\]*)"\},"p":null\}$'
+  local and_re='^\{"f":\{"And":\{"Prefix":"([^"\\]*)"\}\},"p":null\}$'
+  local legacy_re='^\{"f":null,"p":"([^"\\]*)"\}$'
+  DR_REFERENCE_DAYS=""
+  DR_REFERENCE_ERROR=""
+  while IFS=$'\t' read -r rule_status scope days; do
+    [[ "${rule_status}" == Enabled && "${days}" =~ ^[0-9]{1,9}$ ]] || continue
+    if [[ "${scope}" == '{"f":{},"p":null}' ]]; then
+      prefix=""
+    elif [[ "${scope}" =~ ${filter_re} || "${scope}" =~ ${and_re} || "${scope}" =~ ${legacy_re} ]]; then
+      prefix="${BASH_REMATCH[1]}"
+    else
+      continue
+    fi
+    case "${prefix}" in
+      '' | t | t/) values+="${days}"$'\n' ;;
+      t/[0-9a-f]) union+="${prefix#t/} ${days}"$'\n' ;;
+    esac
+  done <<<"$1"
+  digits="$(awk 'NF == 2 { print $1 }' <<<"${union}" | sort -u | wc -l | tr -d ' ')"
+  if [[ "${digits}" == 16 ]]; then
+    values+="$(awk 'NF == 2 { print $2 }' <<<"${union}")"$'\n'
+  fi
+  values="$(awk 'NF > 0' <<<"${values}" | sort -un)"
+  if [[ -z "${values}" ]]; then
+    DR_REFERENCE_ERROR="no enabled lifecycle rule covering t/ carries NoncurrentDays"
+    return 1
+  fi
+  if [[ "${values}" == *$'\n'* ]]; then
+    DR_REFERENCE_ERROR="the enabled lifecycle rules covering t/ disagree on NoncurrentDays (${values//$'\n'/ })"
+    return 1
+  fi
+  DR_REFERENCE_DAYS="${values}"
 }
 
 # Create the bucket in DR_REGION if it is absent, stamp it, and configure it the
@@ -732,7 +782,11 @@ dr_check_server_protection() {
 #
 # Only a bucket carrying this harness's creation marker is configured, and it is
 # read back exactly; its Object Lock is checked before versioning is switched
-# on, since versioning cannot be switched off again. Any other bucket is never
+# on, since versioning cannot be switched off again. Versioning and the
+# lifecycle rule are each read first and put only when the read does not
+# already match: RustFS answers InternalError to every PutBucketVersioning after
+# the first on an Object Lock bucket, so a rerun must not put again. Any other
+# bucket is never
 # changed and is checked only for what the server checks
 # (dr_check_server_protection). On a refusal DR_BUCKET_ERROR says why.
 dr_ensure_bucket() {
@@ -761,13 +815,26 @@ dr_ensure_bucket() {
     return
   fi
   dr_check_object_lock "${bucket}" || return 1
-  dr_aws s3api put-bucket-versioning --bucket "${bucket}" \
-    --versioning-configuration Status=Enabled >/dev/null ||
-    { dr_bucket_refuse "could not put versioning on bucket ${bucket}"; return 1; }
-  dr_aws s3api put-bucket-lifecycle-configuration --bucket "${bucket}" \
-    --lifecycle-configuration "${DR_BUCKET_LIFECYCLE}" >/dev/null ||
-    { dr_bucket_refuse "could not put the lifecycle configuration on bucket ${bucket}"; return 1; }
-  dr_check_bucket_protection "${bucket}"
+  if dr_check_versioning "${bucket}"; then
+    dr_log "bucket ${bucket} already has versioning Enabled; not putting it"
+  else
+    dr_log "putting versioning on bucket ${bucket}: ${DR_BUCKET_ERROR}"
+    DR_BUCKET_ERROR=""
+    dr_aws s3api put-bucket-versioning --bucket "${bucket}" \
+      --versioning-configuration Status=Enabled >/dev/null ||
+      { dr_bucket_refuse "could not put versioning on bucket ${bucket}"; return 1; }
+    dr_check_versioning "${bucket}" || return 1
+  fi
+  if dr_check_lifecycle "${bucket}"; then
+    dr_log "bucket ${bucket} already carries the lifecycle rule; not putting it"
+  else
+    dr_log "putting the lifecycle rule on bucket ${bucket}: ${DR_BUCKET_ERROR}"
+    DR_BUCKET_ERROR=""
+    dr_aws s3api put-bucket-lifecycle-configuration --bucket "${bucket}" \
+      --lifecycle-configuration "${DR_BUCKET_LIFECYCLE}" >/dev/null ||
+      { dr_bucket_refuse "could not put the lifecycle configuration on bucket ${bucket}"; return 1; }
+    dr_check_lifecycle "${bucket}"
+  fi
 }
 
 # Delete every object version and delete marker in a bucket, one DeleteObject
