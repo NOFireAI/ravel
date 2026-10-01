@@ -55,9 +55,10 @@ pub async fn clustering_key_show_to(
         )?;
         return Ok(());
     };
-    let state = match config.typed_attr_columns.as_deref() {
-        Some(declared) => config.clustering_key(declared)?,
-        None => clustering_key_shape_only(&config)?,
+    let state = if config.typed_attr_columns.is_some() {
+        config.clustering_key()?
+    } else {
+        clustering_key_shape_only(&config)?
     };
     match state {
         ClusteringKeyState::NeverSet => writeln!(
@@ -132,17 +133,21 @@ pub async fn bloom_scope_show_to(
 /// declaration is the deployment default this command cannot see.
 ///
 /// The stored key is opaque outside [`TenantConfig::clustering_key`], which
-/// checks shape before declaredness and names the first undeclared column. So
-/// each refusal of that kind adds its column to a declaration naming only key
-/// columns, until the accessor accepts. Shape is checked first on every call,
-/// so a key with too many or duplicate columns is refused before any column
-/// is added, and the loop ends within `MAX_CLUSTERING_KEY_COLUMNS + 1` calls.
+/// checks shape before declaredness, validates against the config's own
+/// `typed_attr_columns`, and names the first undeclared column. So the accessor
+/// runs on a copy of the config whose `typed_attr_columns` starts empty, and
+/// each refusal of that kind adds its column to the copy, until the accessor
+/// accepts. Shape is checked first on every call, so a key with too many or
+/// duplicate columns is refused before any column is added, and the loop ends
+/// within `MAX_CLUSTERING_KEY_COLUMNS + 1` calls.
 fn clustering_key_shape_only(
     config: &TenantConfig,
 ) -> Result<ClusteringKeyState, StorageLayoutConfigError> {
+    let mut probe = config.clone();
     let mut declared: Vec<DeclaredTypedColumn> = Vec::new();
     loop {
-        match config.clustering_key(&declared) {
+        probe.typed_attr_columns = Some(declared.clone());
+        match probe.clustering_key() {
             Err(StorageLayoutConfigError::UndeclaredClusteringKeyColumn { column })
                 if declared.len() < MAX_CLUSTERING_KEY_COLUMNS =>
             {
