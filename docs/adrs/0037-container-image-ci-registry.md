@@ -631,3 +631,43 @@ the mirror's workflow path,
 is now this repository's own. The identity string does not change, so the
 invocation documented in README.md stays correct as written and consumers
 verifying released images need do nothing.
+
+## Amendment (2026-10-01): changelog fragments are folded before the tag
+
+<!-- amendment-applies: none reason="this adds a release-preparation step beside decision 11's version bump; no earlier wording in this ADR is retired or narrowed" -->
+
+No single document in this repository lists the steps for cutting a release;
+decision 11's version bump and ADR-0081 decision 1's quickstart image pin are
+recorded where they were decided. This amendment records the changelog steps
+beside them, because the release job depends on those steps and on their
+order.
+
+Changelog entries no longer go straight into `CHANGELOG.md`. Each change adds
+one fragment under `changelog.d/` (the format is in `changelog.d/README.md`),
+so pull requests in flight together stop conflicting on the `[Unreleased]`
+section. The release job reads the version's `CHANGELOG.md` section from the
+tagged tree (ADR-0086 decision 5), so a fragment that is still a separate
+file when the tag is cut never reaches that release's notes.
+
+That job reads only the `## [X.Y.Z]` section, never `[Unreleased]`, so the
+pull request that prepares release `vX.Y.Z` does these steps in this order:
+
+1. Run `scripts/changelog-assemble.sh`. It folds every fragment into
+   `[Unreleased]` under its section heading and deletes the fragments it
+   folded; it refuses, and changes nothing, on a malformed fragment.
+2. Turn the filled `[Unreleased]` into `## [X.Y.Z] - DATE`, with a new, empty
+   `## [Unreleased]` above it.
+3. Bump the workspace version (decision 11) and the quickstart image pins
+   (ADR-0081 decision 1).
+4. Commit and merge.
+5. On the merged commit, confirm `scripts/changelog-assemble.sh --check`
+   reports `0 fragment(s) valid`, then tag that commit. A pull request that
+   merges between the fold and the tag can add a fragment, and that entry
+   would miss this release; if one did, fold it in a follow-up pull request
+   before tagging.
+
+The order of steps 1 and 2 is the one that matters: folding after the version
+heading is cut puts every fragment in the new, empty `[Unreleased]`, and the
+release notes miss them without any error. CI runs
+`scripts/changelog-assemble.sh --check` on every pull request, so a malformed
+fragment is caught where it was written rather than during a release.

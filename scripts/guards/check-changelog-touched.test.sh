@@ -42,7 +42,7 @@ new_repo() {
 check() {
   local name="$1" dir="$2" base="$3" head="$4" want_rc="$5" want_sub="${6:-}"
   local out rc=0
-  out="$(cd "${dir}" && bash scripts/guards/check-changelog-touched.sh "${base}" "${head}" 2>&1)" || rc=$?
+  out="$(cd "${dir}" && "${BASH}" scripts/guards/check-changelog-touched.sh "${base}" "${head}" 2>&1)" || rc=$?
   if [[ "${rc}" != "${want_rc}" ]]; then
     printf 'FAIL  %s: exit %s, wanted %s\n' "${name}" "${rc}" "${want_rc}"
     printf '%s\n' "${out}" | sed 's/^/      /'
@@ -222,6 +222,122 @@ merge="$(git -C "${d}" commit-tree "$(git -C "${d}" rev-parse "${feature_tip}^{t
   -p "${feature_tip}" -p "${side_tip}" -m "Merge side into feature")"
 check "an ordinary merge on the branch still walks its own feat commit" \
   "${d}" "${base}" "${merge}" 1 "add feature with no changelog entry"
+
+# --- changelog fragments (issue #2323) ----------------------------------------
+#
+# A fragment under changelog.d/ exempts the range on its own, CHANGELOG.md
+# untouched. changelog.d/README.md is not a fragment and exempts nothing.
+
+d="$(new_repo fragment-alone)"
+base="$(git -C "${d}" rev-parse HEAD)"
+mkdir -p "${d}/changelog.d"
+echo 'fn feature() {}' >"${d}/crates/c/feature.rs"
+printf -- '- new feature entry\n' >"${d}/changelog.d/42.added.md"
+git -C "${d}" add crates/c/feature.rs changelog.d/42.added.md
+git -C "${d}" commit -q -m "feat(c): add feature with a fragment"
+head="$(git -C "${d}" rev-parse HEAD)"
+check "a changelog fragment alone exempts the range" "${d}" "${base}" "${head}" 0 \
+  "changelog fragment"
+
+d="$(new_repo fragment-separate-commit)"
+base="$(git -C "${d}" rev-parse HEAD)"
+mkdir -p "${d}/changelog.d"
+echo 'fn feature() {}' >"${d}/services/s/feature.rs"
+git -C "${d}" add services/s/feature.rs
+git -C "${d}" commit -q -m "fix(s): correct feature"
+printf -- '- corrected feature\n' >"${d}/changelog.d/42-2.fixed.md"
+git -C "${d}" add changelog.d/42-2.fixed.md
+git -C "${d}" commit -q -m "docs: add the changelog fragment"
+head="$(git -C "${d}" rev-parse HEAD)"
+check "a fragment added in a later commit of the range exempts it" "${d}" "${base}" "${head}" 0 \
+  "changelog fragment"
+
+d="$(new_repo fragment-readme-only)"
+base="$(git -C "${d}" rev-parse HEAD)"
+mkdir -p "${d}/changelog.d"
+echo 'fn feature() {}' >"${d}/crates/c/feature.rs"
+printf '# Changelog fragments\n' >"${d}/changelog.d/README.md"
+git -C "${d}" add crates/c/feature.rs changelog.d/README.md
+git -C "${d}" commit -q -m "feat(c): add feature, touch only the fragment README"
+head="$(git -C "${d}" rev-parse HEAD)"
+check "changelog.d/README.md alone does not exempt the range" "${d}" "${base}" "${head}" 1 \
+  "changelog.d/<issue>.<section>.md"
+
+# Deleting a fragment (what the release fold does) is not adding one.
+d="$(new_repo fragment-deleted)"
+mkdir -p "${d}/changelog.d"
+printf -- '- older entry\n' >"${d}/changelog.d/7.fixed.md"
+git -C "${d}" add changelog.d/7.fixed.md
+git -C "${d}" commit -q -m "docs: an older fragment"
+base="$(git -C "${d}" rev-parse HEAD)"
+echo 'fn feature() {}' >"${d}/crates/c/feature.rs"
+git -C "${d}" rm -q changelog.d/7.fixed.md
+git -C "${d}" add crates/c/feature.rs
+git -C "${d}" commit -q -m "feat(c): add feature and delete someone else's fragment"
+head="$(git -C "${d}" rev-parse HEAD)"
+check "deleting a fragment does not exempt the range" "${d}" "${base}" "${head}" 1 \
+  "no changelog fragment is added"
+
+# Renaming someone else's fragment adds no entry.
+d="$(new_repo fragment-renamed)"
+mkdir -p "${d}/changelog.d"
+printf -- '- older entry\n' >"${d}/changelog.d/7.fixed.md"
+git -C "${d}" add changelog.d/7.fixed.md
+git -C "${d}" commit -q -m "docs: an older fragment"
+base="$(git -C "${d}" rev-parse HEAD)"
+echo 'fn feature() {}' >"${d}/crates/c/feature.rs"
+git -C "${d}" mv changelog.d/7.fixed.md changelog.d/7.changed.md
+git -C "${d}" add crates/c/feature.rs
+git -C "${d}" commit -q -m "feat(c): add feature and rename someone else's fragment"
+head="$(git -C "${d}" rev-parse HEAD)"
+check "renaming a fragment does not exempt the range" "${d}" "${base}" "${head}" 1 \
+  "no changelog fragment is added"
+
+# Editing an unreleased entry's fragment is how a fix to that entry is recorded.
+d="$(new_repo fragment-edited)"
+mkdir -p "${d}/changelog.d"
+printf -- '- older entry\n' >"${d}/changelog.d/7.added.md"
+git -C "${d}" add changelog.d/7.added.md
+git -C "${d}" commit -q -m "docs: an unreleased entry"
+base="$(git -C "${d}" rev-parse HEAD)"
+echo 'fn feature() {}' >"${d}/crates/c/feature.rs"
+printf -- '- older entry, now also covering the fix\n' >"${d}/changelog.d/7.added.md"
+git -C "${d}" add crates/c/feature.rs changelog.d/7.added.md
+git -C "${d}" commit -q -m "fix(c): correct the unreleased feature"
+head="$(git -C "${d}" rev-parse HEAD)"
+check "editing an existing fragment exempts the range" "${d}" "${base}" "${head}" 0 \
+  "changelog fragment"
+
+# Rewording an unreleased entry and moving it to another section is a rename
+# with edits, and counts like any other edit.
+d="$(new_repo fragment-edited-and-moved)"
+mkdir -p "${d}/changelog.d"
+printf -- '- an older entry about the loader and its refusal messages\n' \
+  >"${d}/changelog.d/7.fixed.md"
+git -C "${d}" add changelog.d/7.fixed.md
+git -C "${d}" commit -q -m "docs: an unreleased entry"
+base="$(git -C "${d}" rev-parse HEAD)"
+echo 'fn feature() {}' >"${d}/crates/c/feature.rs"
+git -C "${d}" mv changelog.d/7.fixed.md changelog.d/7.changed.md
+printf -- '- an older entry about the loader and its refusal messages, reworded\n' \
+  >"${d}/changelog.d/7.changed.md"
+git -C "${d}" add crates/c/feature.rs changelog.d/7.changed.md
+git -C "${d}" commit -q -m "fix(c): correct the unreleased feature and move its entry"
+head="$(git -C "${d}" rev-parse HEAD)"
+check "editing and moving a fragment exempts the range" "${d}" "${base}" "${head}" 0 \
+  "changelog fragment"
+
+# A file under changelog.d/ that is not named like a fragment is not one.
+d="$(new_repo fragment-misnamed)"
+base="$(git -C "${d}" rev-parse HEAD)"
+mkdir -p "${d}/changelog.d"
+echo 'fn feature() {}' >"${d}/crates/c/feature.rs"
+printf 'notes\n' >"${d}/changelog.d/notes.txt"
+git -C "${d}" add crates/c/feature.rs changelog.d/notes.txt
+git -C "${d}" commit -q -m "feat(c): add feature with a stray notes file"
+head="$(git -C "${d}" rev-parse HEAD)"
+check "a misnamed file under changelog.d/ does not exempt the range" "${d}" "${base}" "${head}" 1 \
+  "no changelog fragment is added"
 
 printf '\n%d passed, %d failed\n' "${passes}" "${fails}"
 [[ "${fails}" -eq 0 ]]
