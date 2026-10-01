@@ -46,12 +46,13 @@ const COMPRESSION_NONE: i32 = 0;
 /// `guarded_get` routes cache-eligible ranges through `cached_get`, which on a
 /// hit returns bytes with no store round trip at all
 /// (`accounting.record_cache_hit`, never an `AccountedOp::Get`). A cache hit
-/// therefore contributes `{0, 0}` here. A store GET -- the uncached path, a
-/// cache miss's leader, or a single-flight follower riding another caller's
-/// in-flight GET -- contributes `{1, bytes_len}`, matching `log_fetcher.rs`'s
-/// `fetch_accounted_with_tenant`: a follower still attributes one logical GET,
-/// which bounds this call's own attribution and never under-counts the query
-/// total, which is what the span is for.
+/// therefore contributes `{0, 0}` here, and so does a RAM-only cache's recheck
+/// serve or single-flight follower, which `cached_get` reports as a hit. A store
+/// GET -- the uncached path, or a cache miss's leader -- contributes
+/// `{1, bytes_len}`, and so does a tiered-cache follower riding another caller's
+/// in-flight GET: that cache does not tell a follower from its leader, and one
+/// logical GET bounds this call's own attribution and never under-counts the
+/// query total, which is what the span is for.
 ///
 /// A local per-call value is used rather than a before/after `QueryAccounting`
 /// delta because `engine.rs` runs one segment future per `buffer_unordered`
@@ -397,8 +398,9 @@ impl From<StoreError> for CacheFetchError {
 /// - [`ReadCache::Ram`] is the RAM tier alone: the bare RAM [`Cache`]. It is
 ///   what production builds with no `--cache-dir` (#97), byte-for-byte the
 ///   pre-disk-tier behavior; it writes no local files and needs no Tokio runtime
-///   to construct. Its [`Cache::get_or_fetch`] is miss-only and never re-peeks,
-///   so a caller may peek with [`ReadCache::get`] and then resolve a miss through
+///   to construct. Its [`Cache::get_or_fetch`] is miss-only: its leader rechecks
+///   RAM uncounted before fetching and it records no lookup of its own, so a
+///   caller may peek with [`ReadCache::get`] and then resolve a miss through
 ///   [`ReadCache::fetch_peeked`] with the peek as the one accounted miss.
 /// - [`ReadCache::Tiered`] is the RAM-over-disk handle: a disk-served hit is
 ///   single-flighted and corruption-gated per ADR-0046 decisions 3-5. Production
@@ -482,11 +484,13 @@ impl ReadCache {
     ///
     /// The tiered tier's [`TieredCache::get_or_fetch`] peeks both tiers
     /// internally and returns the real [`Source`]. The RAM tier's
-    /// [`Cache::get_or_fetch`] is miss-only, so the RAM branch peeks once here (a
-    /// hit is [`Source::Cache`]) and runs the miss-only fetch on a miss, which it
-    /// always reports as [`Source::Upstream`], including when that call's
-    /// uncounted RAM recheck served the bytes without a GET; neither branch
-    /// counts the miss twice.
+    /// [`Cache::get_or_fetch_with_source`] is miss-only, so the RAM branch peeks
+    /// once here (a hit is [`Source::Cache`]) and runs the miss-only fetch on a
+    /// miss. That reports [`Source::Upstream`] only for the call that ran
+    /// `fetch`, and [`Source::Cache`] for one its uncounted RAM recheck served
+    /// or that followed another caller's flight, so neither made a GET. The
+    /// tiered tier still reports a follower of an upstream fetch as
+    /// [`Source::Upstream`]. Neither branch counts the miss twice.
     pub(crate) async fn get_or_fetch<F, Fut>(
         &self,
         key: CacheKey,
@@ -502,10 +506,20 @@ impl ReadCache {
                 if let Some(bytes) = ram.get(&key) {
                     return Ok((bytes, Source::Cache));
                 }
-                ram.get_or_fetch(key, fetch)
-                    .await
-                    .map(|bytes| (bytes, Source::Upstream))
+                ram.get_or_fetch_with_source(key, fetch).await
             }
+        }
+    }
+
+    /// Look `key` up again, in every tier, recording no hit or miss: for a
+    /// caller whose earlier [`get`](Self::get) already accounted this request
+    /// and that re-checks because the entry may have been admitted since
+    /// (`BlockRangeFetcher::fetch_run`'s re-peek of a run's non-lead blocks). A
+    /// hit is served exactly as `get` serves one, corruption mode included.
+    pub(crate) async fn peek_uncounted(&self, key: &CacheKey) -> Option<Bytes> {
+        match self {
+            ReadCache::Ram(ram) => ram.peek_uncounted(key),
+            ReadCache::Tiered(tiered) => tiered.peek_uncounted_off_worker(*key).await,
         }
     }
 
@@ -521,8 +535,8 @@ impl ReadCache {
     /// variant (ADR-0102 decision 1, ADR-0046 decision 5).
     ///
     /// The RAM tier uses its miss-only [`Cache::get_or_fetch`], which
-    /// single-flights concurrent callers onto one `fetch` and never re-peeks, so
-    /// the caller's earlier `get` stays the one accounted miss. The tiered tier
+    /// single-flights concurrent callers onto one `fetch` and rechecks RAM only
+    /// uncounted, so the caller's earlier `get` stays the one accounted miss. The tiered tier
     /// cannot reuse its own [`TieredCache::get_or_fetch`] here: that re-peeks
     /// both tiers, recording a SECOND miss for a key the caller already peeked
     /// ([`TieredCache::get`]'s documented double-count pitfall). It instead uses
@@ -1190,7 +1204,8 @@ impl SegmentFetcher {
     /// Returns the `GetOutcome` alongside the [`GetCost`] this single call
     /// contributes to its caller's per-span S3 counts: `{1, bytes_len}` when
     /// the bytes came from the store (this uncached path, or a cache
-    /// miss/follower inside `cached_get`), `{0, 0}` on a cache hit. The caller
+    /// miss, or a tiered-cache follower, inside `cached_get`), `{0, 0}` when
+    /// `cached_get` reports [`Source::Cache`]. The caller
     /// folds that cost in rather than re-deriving hit-vs-miss, so the
     /// store-vs-cache branch lives once, at the seam that already knows the
     /// answer (`store_get` for the store round trip, `cached_get`'s explicit
@@ -1261,15 +1276,10 @@ impl SegmentFetcher {
     /// absolute byte bounds the `CacheKey` and the fabricated hit
     /// `GetOutcome` use.
     ///
-    /// Hit/miss is decided by an explicit `cache.get` before touching
-    /// `get_or_fetch`, rather than inferring it from whether `get_or_fetch`
-    /// ran its fetch closure: a single-flight follower's closure never
-    /// runs either, but a follower is not a "hit" in the accounting sense
-    /// used here (a store round trip still happened, just not this
-    /// caller's own) -- it is what ADR-0046 amendment's documented gap
-    /// (see the crate-level test module for the resulting corruption-gate
-    /// reach) turns on. Only bytes resident *before* this call asked
-    /// count as a hit.
+    /// Hit/miss follows the [`Source`] [`ReadCache::get_or_fetch`] returns: a
+    /// hit is a call that made no store round trip of its own. On the tiered
+    /// cache a single-flight follower of an upstream fetch is still a miss; on
+    /// the RAM-only cache a follower, like a recheck serve, is a hit.
     ///
     /// On a miss, the store GET inside the `get_or_fetch` closure is
     /// checked against `expected_etag` exactly like the uncached path in
@@ -1297,11 +1307,12 @@ impl SegmentFetcher {
         // One read-through call, then account for it from the returned
         // [`Source`]. A single call avoids the peek-then-`get_or_fetch`
         // double-count on the tiered tier (see [`ReadCache::get_or_fetch`] and
-        // [`TieredCache::get`]): [`Source::Cache`] means the bytes were resident
-        // in a tier before this call asked (a hit, possibly disk-served -- no
-        // store round trip, so nothing added to this span's S3 counts), and
-        // [`Source::Upstream`] means the store GET inside the closure ran (a
-        // leader miss) or this call rode another's in-flight GET (a follower).
+        // [`TieredCache::get`]): [`Source::Cache`] means this call made no
+        // store round trip (a hit, possibly disk-served; on the RAM-only cache
+        // also a recheck serve or a follower of another caller's GET), so
+        // nothing is added to this span's S3 counts, and [`Source::Upstream`]
+        // means the store GET inside the closure ran (a leader miss) or, on the
+        // tiered cache only, this call rode another's in-flight GET.
         // A leader miss runs the closure and learns the store's real etag; a
         // hit or a single-flight follower does not, and no etag is knowable
         // from this call. `open_segment` pins later range reads to the footer
@@ -1375,12 +1386,11 @@ impl SegmentFetcher {
                     GetCost::default(),
                 ))
             }
-            // A miss issued one store GET for these bytes (leader), or rode
-            // another caller's in-flight GET (follower). Either way attribute one
-            // logical GET, as `log_fetcher.rs`'s `fetch_accounted_with_tenant`
-            // does: it does not try to distinguish the rare follower, since
-            // recording one GET bounds this call's own attribution and never
-            // under-counts the query total.
+            // A miss issued one store GET for these bytes (leader), or, on the
+            // tiered cache, rode another caller's in-flight GET (follower).
+            // Either way attribute one logical GET: the tiered cache does not
+            // distinguish the rare follower, and recording one GET bounds this
+            // call's own attribution and never under-counts the query total.
             Source::Upstream => {
                 accounting.record_cache_miss();
                 let cost = GetCost {
@@ -3975,6 +3985,104 @@ mod tests {
             object_bytes.len() as u64,
             "the whole-object GET charges exactly the object's byte length at completion"
         );
+    }
+
+    /// Two `cached_get` calls for one range on a RAM-only cache, the second
+    /// joining the first's in-flight GET as a single-flight follower, charge
+    /// exactly one GET between them: the follower's `GetCost` is `{0, 0}` and
+    /// its query accounting records a cache hit, because it made no store
+    /// round trip of its own. The hold gate keeps the leader's GET parked until
+    /// the follower's peek has missed, which `MemoryStore` alone cannot do.
+    ///
+    /// FLIP: mapping the RAM branch of `ReadCache::get_or_fetch` back to
+    /// `.map(|bytes| (bytes, Source::Upstream))` makes the follower's
+    /// `GetCost::requests` 1 and the total 2.
+    #[tokio::test]
+    async fn a_ram_only_follower_charges_no_get_of_its_own() {
+        use ravel_object_store::fault::{GateHandle, Occurrence};
+
+        let (source, tenant_hash, seg_ref) = write_test_segment().await;
+        let object_bytes = source
+            .get(&seg_ref.data_object_key, GetRange::Full)
+            .await
+            .expect("read back test segment")
+            .data;
+        let memory = MemoryStore::new();
+        memory
+            .put(
+                &seg_ref.data_object_key,
+                object_bytes.clone(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put segment object");
+        let fault = Arc::new(FaultStore::new(memory, FaultPlan::default()));
+        let gate: GateHandle = fault.hold(Op::Get, None, Occurrence::Always);
+        let backend: Arc<dyn ObjectStoreBackend> = fault;
+        let limits = ravel_cache::CacheLimits::new(64 * 1024 * 1024, 1024, 64 * 1024 * 1024);
+        let ram: Arc<Cache<CacheFetchError>> = Arc::new(Cache::new(limits));
+        let ram_metrics = ram.metrics();
+        let fetcher = SegmentFetcher::new(backend).with_cache(ram);
+
+        let len = object_bytes.len() as u64;
+        let leader_acc = QueryAccounting::new();
+        let follower_acc = QueryAccounting::new();
+        let release = async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                gate.wait_until_held(1).await;
+                // The follower joins the flight in the same poll that records
+                // its peek's miss, so two misses mean it is parked on the flight.
+                while ram_metrics.snapshot().misses < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the leader's GET is held and the follower peeked within 30 s");
+            assert_eq!(gate.held_count(), 1, "one GET reached the store");
+            for id in gate.held() {
+                assert!(gate.release(id), "held id must release");
+            }
+        };
+        let (leader, follower, ()) = tokio::join!(
+            fetcher.guarded_get(
+                &seg_ref,
+                tenant_hash,
+                GetRange::Range(0, len),
+                None,
+                &leader_acc
+            ),
+            fetcher.guarded_get(
+                &seg_ref,
+                tenant_hash,
+                GetRange::Range(0, len),
+                None,
+                &follower_acc
+            ),
+            release,
+        );
+        let (leader_got, leader_cost) = leader.expect("leader read");
+        let (follower_got, follower_cost) = follower.expect("follower read");
+        assert_eq!(leader_got.data, object_bytes);
+        assert_eq!(follower_got.data, object_bytes);
+
+        assert_eq!((leader_cost.requests, leader_cost.bytes), (1, len));
+        assert_eq!((follower_cost.requests, follower_cost.bytes), (0, 0));
+        assert_eq!(leader_cost.requests + follower_cost.requests, 1);
+
+        let leader_snap = leader_acc.snapshot();
+        assert_eq!(leader_snap.s3_requests(AccountedOp::Get), 1);
+        assert_eq!(leader_snap.cache_misses, 1);
+        assert_eq!(leader_snap.cache_hits, 0);
+        let follower_snap = follower_acc.snapshot();
+        assert_eq!(follower_snap.s3_requests(AccountedOp::Get), 0);
+        assert_eq!(follower_snap.cache_misses, 0);
+        assert_eq!(follower_snap.cache_hits, 1);
+        assert_eq!(follower_snap.cache_bytes, len);
+
+        let tier = ram_metrics.snapshot();
+        assert_eq!(tier.misses, 2, "one peek miss per caller");
+        assert_eq!(tier.hits, 0);
+        assert_eq!(tier.single_flight_collapses, 1);
     }
 
     /// ADR-1195: two `SegmentFetcher`s sharing one `GetLimiter::new(1)` must

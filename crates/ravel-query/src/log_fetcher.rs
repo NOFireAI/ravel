@@ -2576,8 +2576,9 @@ impl LogSegmentFetcher {
                 reservation.mark_handed_off();
             }
             // A miss issues one store GET for the resulting bytes. A
-            // single-flight follower that rode another caller's GET is the
-            // rare exception; recording one GET here still bounds this call's
+            // tiered-cache follower that rode another caller's GET is the rare
+            // exception (the RAM-only cache reports its follower as
+            // `Source::Cache`); recording one GET here still bounds this call's
             // own attribution and never under-counts the query total, which is
             // what the span is for.
             Source::Upstream => {
@@ -3160,7 +3161,13 @@ pub struct BlockRangeStats {
     pub metadata_gets: u64,
     /// Store GETs for coalesced candidate-block ranges (cache misses only).
     pub block_range_gets: u64,
-    /// Candidate blocks served from the read cache with no store round trip.
+    /// Candidate blocks (page ranges, on a page-granular read) served from the
+    /// read cache with no store round trip, counted exactly where the query
+    /// accounting records a cache hit for them. A block-range read decides that
+    /// at each block's peek: a block whose peek missed and that was then served
+    /// with no GET of this call's own (another caller's flight, a recheck, or
+    /// `fetch_run`'s re-peek) stays a miss in the accounting and is counted in
+    /// neither this nor [`block_range_gets`](Self::block_range_gets).
     pub block_cache_hits: u64,
     /// Stored bytes of candidate blocks read from the store (cache hits excluded).
     pub block_bytes_fetched: u64,
@@ -4334,10 +4341,11 @@ impl BlockRangeFetcher {
     /// while still keying as the absolute extent it returns.
     ///
     /// The returned flag is true when this call crossed the network, so callers
-    /// count only real store GETs. A single-flight follower that rode another
-    /// caller's in-flight GET reports true as well: the same attribution
-    /// convention `tenant_bytes` documents, which bounds this call's own cost
-    /// and never under-counts the query total.
+    /// count only real store GETs. On the tiered cache a single-flight follower
+    /// that rode another caller's in-flight GET reports true as well: the same
+    /// attribution convention `tenant_bytes` documents, which bounds this call's
+    /// own cost and never under-counts the query total. The RAM-only cache tells
+    /// a follower from its leader, so there a follower reports false.
     ///
     /// `phase` is the [`QueryPhase`] a LIVE fetch's wire bytes are charged to
     /// (#913). A cache hit crossed no network and is charged nothing: its bytes
@@ -4366,10 +4374,8 @@ impl BlockRangeFetcher {
         // One read-through call, accounted from the returned [`Source`]: a single
         // call avoids the peek-then-`get_or_fetch` double-count on the tiered
         // tier (see [`ReadCache::get_or_fetch`]). The returned flag is `live`,
-        // which is [`Source::Upstream`]: this call's flight fetched, or it rode
-        // another caller's flight. On the RAM-only cache it is also true for a
-        // leader the RAM recheck served, which made no GET, so `live_gets` and
-        // `live_bytes` overstate wire bytes there.
+        // which is [`Source::Upstream`]: this call ran the fetch, or, on the
+        // tiered cache, it rode another caller's flight.
         let (bytes, source) = cache
             .get_or_fetch(cache_key, || async move {
                 let got = self
@@ -6275,7 +6281,6 @@ impl BlockRangeFetcher {
         for outcome in outcomes {
             let run = outcome?;
             stats.block_range_gets += run.gets;
-            stats.block_cache_hits += run.cache_hits;
             stats.block_bytes_fetched = stats.block_bytes_fetched.saturating_add(run.bytes);
             for (start, bytes) in run.blocks {
                 asm.place(key, start, bytes)?;
@@ -6321,7 +6326,6 @@ impl BlockRangeFetcher {
                 blocks,
                 gets: 1,
                 bytes: got.data.len() as u64,
-                cache_hits: 0,
             });
         };
         let Some(lead) = blocks.first().copied() else {
@@ -6388,7 +6392,6 @@ impl BlockRangeFetcher {
                 blocks: split.clone(),
                 gets: 1,
                 bytes: *bytes,
-                cache_hits: 0,
             });
         }
         // Not this call's own fetch: the lead block rode another caller's
@@ -6402,14 +6405,14 @@ impl BlockRangeFetcher {
         let mut outcome = RunOutcome::default();
         // Every block of the run already recorded its one query-accounting
         // outcome, a miss, when `fetch_blocks` peeked it. Served from the cache
-        // now, it stays a miss with no GET (docs/guides/caching.md); only a
-        // block this call's own GET fetches adds a request.
+        // now, it stays a miss with no GET (docs/guides/caching.md), and the
+        // re-peek is uncounted so the tier metrics keep that one lookup too;
+        // only a block this call's own GET fetches adds a request.
         for ext in blocks.iter().skip(1) {
             let block_key =
                 CacheKey::new(tenant_hash.0, seg_ref.content_hash, ext.abs_start, ext.len);
-            if let Some(bytes) = cache.get(&block_key).await {
+            if let Some(bytes) = cache.peek_uncounted(&block_key).await {
                 verify_block_crc(key, &bytes, ext)?;
-                outcome.cache_hits += 1;
                 out.push((ext.abs_start, bytes));
                 continue;
             }
@@ -6487,12 +6490,14 @@ impl BlockRangeFetcher {
 
 /// One coalesced run's fetched blocks (`(abs_start, bytes)`, crc-verified) plus
 /// the store cost this caller paid for them: `gets` real range GETs moving
-/// `bytes` stored bytes, and `cache_hits` blocks served with no round trip.
+/// `bytes` stored bytes. A block served from the cache here adds nothing to
+/// [`BlockRangeStats::block_cache_hits`]: its `fetch_blocks` peek already
+/// decided its one hit-or-miss outcome.
 ///
 /// A single-flight follower that rode another caller's GET reports zero gets and
 /// zero bytes here, unlike [`BlockRangeFetcher::cached_extent`] and the
-/// whole-object funnels, which attribute one request to a follower because they
-/// cannot tell one from a leader. This path can tell a GET it made from one it
+/// whole-object funnels on the tiered cache, which attribute one request to a
+/// follower because they cannot tell one from a leader. This path can tell a GET it made from one it
 /// did not: a block counts as fetched only when this call ran the closure, so
 /// a leader served by the RAM recheck, which runs no closure, reports zero gets
 /// like a follower. Reporting what actually crossed the network is strictly
@@ -6503,7 +6508,6 @@ struct RunOutcome {
     blocks: Vec<(u64, Bytes)>,
     gets: u64,
     bytes: u64,
-    cache_hits: u64,
 }
 
 /// The etag every LIVE GET of one fetch sequence is checked against (ADR-0107
@@ -11096,8 +11100,8 @@ mod fetch_run_corruption_gate_tests {
             }
             assert_eq!(
                 ram_metrics.snapshot().misses,
-                misses_before + 1,
-                "the poll stopped in the tail block's disk peek, after its RAM peek missed"
+                misses_before,
+                "the poll stopped in the tail block's uncounted disk re-peek"
             );
             tiered.insert(tail_key, tail_block.clone());
             assert_eq!(tiered.disk_len(), 0, "the disk tier declined both blocks");
@@ -11221,6 +11225,8 @@ mod fetch_run_corruption_gate_tests {
         ));
         let ram_metrics = tiered.ram_metrics();
         let ram_misses = || ram_metrics.snapshot().misses;
+        let disk_metrics = tiered.disk_metrics();
+        let disk_misses = || disk_metrics.snapshot().misses;
         let fetcher = BlockRangeFetcher::new(Arc::new(store)).with_cache(tiered.clone());
         let acc = QueryAccounting::new();
         let mut stats = BlockRangeStats::default();
@@ -11263,16 +11269,19 @@ mod fetch_run_corruption_gate_tests {
         let re_peek_gate = if let TailServe::RamRecheck = tail {
             // Then in `fetch_run`'s re-peek of the tail block, after the lead
             // was served by the RAM recheck and before the tail's own
-            // `fetch_peeked`.
+            // `fetch_peeked`. The re-peek is uncounted, so the checkpoint is
+            // the tail block's disk peek having recorded its miss: the next
+            // pending poll is the re-peek's own disk lookup, held by the gate.
             let re_peek_gate = hold_blocking_pool();
             drop(tail_peek_gate);
             poll_until(
                 fetch.as_mut(),
-                || ram_misses() >= 3,
+                || disk_misses() >= 2,
                 "fetch_run's re-peek of the tail block",
             )
             .await;
-            assert_eq!(ram_misses(), 3, "held in the tail block's re-peek");
+            assert_eq!(disk_misses(), 2, "the tail block's disk peek finished");
+            assert_eq!(ram_misses(), 2, "the re-peek recorded no RAM miss");
             assert!(!tiered.is_in_flight(&tail_key));
             re_peek_gate
         } else {
@@ -11318,7 +11327,10 @@ mod fetch_run_corruption_gate_tests {
     ///
     /// FLIP: restoring `accounting.record_cache_hit()` and
     /// `accounting.add_cache_bytes(..)` on that re-peek's hit makes
-    /// `cache_hits` read 1 and `cache_bytes` 16.
+    /// `cache_hits` read 1 and `cache_bytes` 16. Restoring
+    /// `outcome.cache_hits += 1` on that hit, folded into
+    /// `stats.block_cache_hits` by `fetch_blocks`, makes `block_cache_hits`
+    /// read 1 against the accounting's 0.
     #[test]
     fn a_late_ram_served_log_run_counts_no_hit_for_a_re_peeked_block() {
         let (snapshot, stats) = late_ram_served_run(TailServe::RePeekHit);
@@ -11329,5 +11341,311 @@ mod fetch_run_corruption_gate_tests {
         assert_eq!(snapshot.total_s3_bytes(), 0);
         assert_eq!(stats.block_range_gets, 0);
         assert_eq!(stats.block_bytes_fetched, 0);
+        assert_eq!(stats.block_cache_hits, snapshot.cache_hits);
+        assert_eq!(stats.block_cache_hits, 0);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod late_serve_accounting_tests {
+    //! Two callers reading the same bytes through a cache at once, the second
+    //! joining the first's in-flight GET, report what each actually did: one
+    //! GET between them, one tier lookup per block each caller peeked, and a
+    //! `block_cache_hits` that agrees with the query accounting. A `FaultStore`
+    //! hold gate parks the leader's GET until the follower is in position;
+    //! `MemoryStore` alone never yields, so it cannot produce the overlap.
+
+    use super::*;
+    use crate::fetcher::CacheFetchError;
+    use ravel_cache::{Cache, CacheLimits, CacheMetrics, DiskCache, TieredCache};
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::fault::{FaultPlan, FaultStore, GateHandle, Occurrence, Op};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_types::accounting::QueryAccountingSnapshot;
+    use uuid::Uuid;
+
+    const TENANT: TenantHash = TenantHash([7u8; 16]);
+    const CONTENT_HASH: [u8; 32] = [9u8; 32];
+    const KEY: &str = "t/late-serve.rlog";
+    const BLOCK: u64 = 16;
+    const BLOCKS: u64 = 3;
+
+    fn seg_ref(size: u64) -> SegmentRef {
+        SegmentRef {
+            data_object_key: KEY.to_string(),
+            object_size: size,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: 0,
+            ingest_hour_bucket: 0,
+            sample_count: 1,
+            series_count: 0,
+            shard: 0,
+            content_hash: CONTENT_HASH,
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            declared_column_stats: Default::default(),
+        }
+    }
+
+    fn object() -> Bytes {
+        Bytes::from((0..(BLOCK * BLOCKS) as u8).collect::<Vec<u8>>())
+    }
+
+    fn limits() -> CacheLimits {
+        CacheLimits::new(1024 * 1024, 100, 1024 * 1024)
+    }
+
+    /// `object()` under `KEY`, behind a gate holding every GET.
+    async fn held_store() -> (Arc<dyn ObjectStoreBackend>, GateHandle) {
+        let memory = MemoryStore::new();
+        memory
+            .put(KEY, object(), PutOptions::default())
+            .await
+            .expect("put");
+        let fault = Arc::new(FaultStore::new(memory, FaultPlan::default()));
+        let gate = fault.hold(Op::Get, None, Occurrence::Always);
+        (fault, gate)
+    }
+
+    /// Releases the one held GET once `ready` says the second caller is parked
+    /// on the first's flight.
+    async fn release_when(gate: &GateHandle, ready: impl Fn() -> bool) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            gate.wait_until_held(1).await;
+            while !ready() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the leader's GET is held and the follower parked within 30 s");
+        assert_eq!(gate.held_count(), 1, "exactly one GET reached the store");
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+    }
+
+    fn extents() -> Vec<BlockExtent> {
+        let object = object();
+        (0..BLOCKS)
+            .map(|i| {
+                let start = i * BLOCK;
+                BlockExtent {
+                    abs_start: start,
+                    len: BLOCK,
+                    crc32c: crc32c::crc32c(&object[start as usize..(start + BLOCK) as usize]),
+                }
+            })
+            .collect()
+    }
+
+    /// Two concurrent `fetch_blocks` calls over one coalesced run of
+    /// [`BLOCKS`] blocks; returns each caller's accounting and stats.
+    async fn race_one_run(
+        cache: ReadCache,
+        ready: impl Fn() -> bool,
+    ) -> [(QueryAccountingSnapshot, BlockRangeStats); 2] {
+        let (store, gate) = held_store().await;
+        let fetcher = BlockRangeFetcher::new(store).with_cache(cache);
+        let seg = seg_ref(BLOCK * BLOCKS);
+        let pin = EtagPin::default();
+        let extents = extents();
+        let run = |acc: QueryAccounting| {
+            let fetcher = &fetcher;
+            let seg = &seg;
+            let pin = &pin;
+            let extents = &extents;
+            async move {
+                let mut stats = BlockRangeStats::default();
+                let mut asm = ObjectAssembler::new(&fetcher.assembly_gauge, BLOCK * BLOCKS);
+                fetcher
+                    .fetch_blocks(
+                        seg,
+                        TENANT,
+                        pin,
+                        extents,
+                        QueryPhase::Scan,
+                        &mut asm,
+                        &acc,
+                        &mut stats,
+                    )
+                    .await
+                    .expect("both callers' blocks verify");
+                assert_eq!(
+                    asm.slice(KEY, 0, BLOCK * BLOCKS)
+                        .expect("every block placed")
+                        .as_ref(),
+                    object().as_ref()
+                );
+                (acc.snapshot(), stats)
+            }
+        };
+        let (first, second, ()) = tokio::join!(
+            run(QueryAccounting::new()),
+            run(QueryAccounting::new()),
+            release_when(&gate, ready),
+        );
+        [first, second]
+    }
+
+    /// The figures both cache shapes share: one GET in total, every block a
+    /// query-accounting miss for each caller, and `block_cache_hits` agreeing
+    /// with the accounting's hits for each caller.
+    fn assert_one_get_and_agreeing_hits(callers: &[(QueryAccountingSnapshot, BlockRangeStats); 2]) {
+        let gets: u64 = callers.iter().map(|(acc, _)| acc.total_s3_requests()).sum();
+        assert_eq!(gets, 1, "one store GET across both callers");
+        let range_gets: u64 = callers.iter().map(|(_, s)| s.block_range_gets).sum();
+        assert_eq!(range_gets, 1);
+        for (acc, stats) in callers {
+            assert_eq!(acc.cache_misses, BLOCKS, "one miss per peeked block");
+            assert_eq!(acc.cache_hits, 0);
+            assert_eq!(stats.block_cache_hits, acc.cache_hits);
+        }
+    }
+
+    fn assert_one_lookup_per_peek(tier: &CacheMetrics, name: &str) {
+        let snap = tier.snapshot();
+        assert_eq!(snap.hits, 0, "{name}: no lookup beyond the peeks hit");
+        assert_eq!(
+            snap.misses,
+            2 * BLOCKS,
+            "{name}: one lookup per block per caller"
+        );
+    }
+
+    /// RAM-only cache: the follower's re-peek of the two non-lead blocks finds
+    /// them resident and records nothing on the RAM tier or in its stats.
+    ///
+    /// FLIP: restoring `cache.get(&block_key)` for the re-peek in `fetch_run`
+    /// makes the RAM tier read 2 hits; restoring `outcome.cache_hits += 1` on
+    /// that hit (folded into `stats.block_cache_hits` by `fetch_blocks`) makes
+    /// the follower's `block_cache_hits` 2 against its accounting's 0.
+    #[tokio::test]
+    async fn a_ram_only_follower_run_records_one_lookup_per_peeked_block() {
+        let ram: Arc<Cache<CacheFetchError>> = Arc::new(Cache::new(limits()));
+        let ram_metrics = ram.metrics();
+        // The follower joins the flight in the same poll that records its last
+        // peek's miss.
+        let ready_metrics = ram_metrics.clone();
+        let callers = race_one_run(ReadCache::Ram(ram), move || {
+            ready_metrics.snapshot().misses >= 2 * BLOCKS
+        })
+        .await;
+        assert_one_get_and_agreeing_hits(&callers);
+        assert_one_lookup_per_peek(&ram_metrics, "ram");
+        assert_eq!(ram_metrics.snapshot().single_flight_collapses, 1);
+    }
+
+    /// Tiered cache whose RAM tier admits nothing, so the follower's re-peek
+    /// falls through to the disk tier, which holds every block: neither tier
+    /// records the re-peek.
+    ///
+    /// FLIP: restoring `cache.get(&block_key)` for the re-peek in `fetch_run`
+    /// makes the RAM tier read 8 misses and the disk tier 2 hits.
+    #[tokio::test]
+    async fn a_tiered_follower_run_records_one_lookup_per_peeked_block() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let ram_declines_all = CacheLimits::new(1024 * 1024, 100, 1);
+        let tiered = Arc::new(TieredCache::new(
+            Cache::new(ram_declines_all),
+            DiskCache::new(tmp.path().to_path_buf(), limits()),
+        ));
+        let ram_metrics = tiered.ram_metrics();
+        let disk_metrics = tiered.disk_metrics();
+        let lead_key = CacheKey::new(TENANT.0, CONTENT_HASH, 0, BLOCK);
+        let ready_tiered = tiered.clone();
+        let callers = race_one_run(ReadCache::Tiered(tiered.clone()), move || {
+            ready_tiered.in_flight_waiters(&lead_key) >= 1
+        })
+        .await;
+        assert_one_get_and_agreeing_hits(&callers);
+        assert_one_lookup_per_peek(&ram_metrics, "ram");
+        assert_one_lookup_per_peek(&disk_metrics, "disk");
+        assert_eq!(
+            tiered.disk_len(),
+            BLOCKS as usize,
+            "the disk tier holds every block"
+        );
+        assert_eq!(tiered.ram_len(), 0, "the RAM tier declined every block");
+    }
+
+    /// Two `cached_extent` calls for one extent on a RAM-only cache: only the
+    /// call whose GET ran reports `live`.
+    ///
+    /// FLIP: mapping the RAM branch of `ReadCache::get_or_fetch` back to
+    /// `.map(|bytes| (bytes, Source::Upstream))` makes both calls live.
+    #[tokio::test]
+    async fn a_ram_only_cached_extent_follower_is_not_live() {
+        let (store, gate) = held_store().await;
+        let ram: Arc<Cache<CacheFetchError>> = Arc::new(Cache::new(limits()));
+        let ram_metrics = ram.metrics();
+        let fetcher = BlockRangeFetcher::new(store).with_cache(ram);
+        let seg = seg_ref(BLOCK * BLOCKS);
+        let pin = EtagPin::default();
+        let leader_acc = QueryAccounting::new();
+        let follower_acc = QueryAccounting::new();
+        let extent = |acc| {
+            fetcher.cached_extent(
+                &seg,
+                TENANT,
+                0,
+                BLOCK,
+                GetRange::Range(0, BLOCK),
+                QueryPhase::Scan,
+                &pin,
+                acc,
+            )
+        };
+        let (leader, follower, ()) = tokio::join!(
+            extent(&leader_acc),
+            extent(&follower_acc),
+            release_when(&gate, || ram_metrics.snapshot().misses >= 2),
+        );
+        let (leader_bytes, leader_live) = leader.expect("leader extent");
+        let (follower_bytes, follower_live) = follower.expect("follower extent");
+        assert_eq!(leader_bytes, object().slice(0..BLOCK as usize));
+        assert_eq!(follower_bytes, leader_bytes);
+        assert!(leader_live, "the leader's GET crossed the network");
+        assert!(!follower_live, "the follower made no GET of its own");
+        assert_eq!(leader_acc.snapshot().total_s3_requests(), 1);
+        assert_eq!(follower_acc.snapshot().total_s3_requests(), 0);
+        assert_eq!(follower_acc.snapshot().cache_hits, 1);
+        assert_eq!(follower_acc.snapshot().cache_misses, 0);
+    }
+
+    /// Two whole-object reads of one object on a RAM-only cache: one GET, one
+    /// miss and one hit between them in the query accounting.
+    ///
+    /// FLIP: mapping the RAM branch of `ReadCache::get_or_fetch` back to
+    /// `.map(|bytes| (bytes, Source::Upstream))` makes both reads misses.
+    #[tokio::test]
+    async fn a_ram_only_whole_object_follower_is_a_hit_with_no_get() {
+        let (store, gate) = held_store().await;
+        let ram: Arc<Cache<CacheFetchError>> = Arc::new(Cache::new(limits()));
+        let ram_metrics = ram.metrics();
+        let fetcher = LogSegmentFetcher::new(store).with_cache(ram);
+        let seg = seg_ref(BLOCK * BLOCKS);
+        let leader_acc = QueryAccounting::new();
+        let follower_acc = QueryAccounting::new();
+        let (leader, follower, ()) = tokio::join!(
+            fetcher.whole_object_bytes(&seg, TENANT, QueryPhase::Scan, &leader_acc),
+            fetcher.whole_object_bytes(&seg, TENANT, QueryPhase::Scan, &follower_acc),
+            release_when(&gate, || ram_metrics.snapshot().misses >= 2),
+        );
+        leader.expect("leader read");
+        follower.expect("follower read");
+        let leader_snap = leader_acc.snapshot();
+        let follower_snap = follower_acc.snapshot();
+        assert_eq!(leader_snap.total_s3_requests(), 1);
+        assert_eq!(leader_snap.cache_misses, 1);
+        assert_eq!(leader_snap.cache_hits, 0);
+        assert_eq!(follower_snap.total_s3_requests(), 0);
+        assert_eq!(follower_snap.cache_misses, 0);
+        assert_eq!(follower_snap.cache_hits, 1);
+        assert_eq!(follower_snap.cache_bytes, BLOCK * BLOCKS);
     }
 }
