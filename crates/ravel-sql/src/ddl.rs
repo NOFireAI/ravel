@@ -462,12 +462,12 @@ impl SqlExecutor {
                 // the snapshot above has read it, so the column's presence
                 // is checked here instead.
                 for key in options.keys() {
-                    if let Some(column) = key.strip_prefix("ravel.cast.") {
-                        if schema.column_with_name(column).is_none() {
-                            return Err(DdlExecuteError::UnknownCastColumn {
-                                column: column.to_string(),
-                            });
-                        }
+                    if let Some(column) = key.strip_prefix("ravel.cast.")
+                        && schema.column_with_name(column).is_none()
+                    {
+                        return Err(DdlExecuteError::UnknownCastColumn {
+                            column: column.to_string(),
+                        });
                     }
                 }
 
