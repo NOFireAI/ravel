@@ -454,6 +454,38 @@ async fn precondition_probe_failure_is_refused_before_any_manifest_write() {
 }
 
 #[tokio::test]
+async fn manifest_is_written_under_the_callers_tenant_not_any_other() {
+    let lake = Lake::memory_store();
+    let caller = tenant("acme");
+    let someone_else = tenant("other");
+    lake.grant(&caller).await;
+    lake.put_file("t/hits/0.parquet", parquet_bytes(&[1], &["a"], &[0.5]))
+        .await;
+
+    let sql = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
+    lake.executor
+        .execute_ddl(caller, &sql, CREATED_BY, NOW, deadline())
+        .await
+        .expect("create");
+
+    let caller_tables = ravel_pqtable::resolve::tables(lake.ravel.inner(), &caller)
+        .await
+        .expect("tables for caller");
+    assert!(
+        caller_tables.contains_key("hits"),
+        "the manifest must be visible under the tenant that ran CREATE"
+    );
+
+    let other_tables = ravel_pqtable::resolve::tables(lake.ravel.inner(), &someone_else)
+        .await
+        .expect("tables for someone_else");
+    assert!(
+        !other_tables.contains_key("hits"),
+        "the manifest must not be visible under any other tenant"
+    );
+}
+
+#[tokio::test]
 async fn memory_budget_refusal_leaves_no_manifest() {
     let lake = Arc::new(MemoryStore::new()) as Arc<dyn ObjectStoreBackend>;
     lake.put(
