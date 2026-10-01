@@ -74,12 +74,21 @@ wait_for() {
 # polls `docker compose ps --all`, which lists an exited container with its
 # exit code. `docker compose wait` would not do: once the service has already
 # exited, it prints "no containers for project" and exits 1 whatever the
-# service's own exit code was.
+# service's own exit code was. The listing also carries any container a
+# `docker compose run createbucket` left behind (named
+# <project>-createbucket-run-<id>), so only the service's own container,
+# <project>-createbucket-<index>, is read.
 createbucket_exit_code() {
-  local attempt line=""
+  local attempt line="" listing name rest
   for attempt in $(seq 1 180); do
-    line="$(docker compose -f "$RUSTFS_COMPOSE" ps --all \
-      --format '{{.State}} {{.ExitCode}}' createbucket 2>/dev/null)" || line=""
+    listing="$(docker compose -f "$RUSTFS_COMPOSE" ps --all \
+      --format '{{.Name}} {{.State}} {{.ExitCode}}' createbucket 2>/dev/null)" || listing=""
+    line=""
+    while read -r name rest; do
+      if [[ "$name" =~ -createbucket-[0-9]+$ ]]; then
+        line="$rest"
+      fi
+    done <<<"$listing"
     case "$line" in
       "exited "*)
         printf '%s\n' "${line#exited }"
