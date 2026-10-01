@@ -384,7 +384,10 @@ On a keyed bucket, a request-serving process (`all`, `gateway`, `query`)
 resolves bearer tokens against a cached copy of the durable `sys/auth` map as
 well as the static and OIDC resolvers, and keeps that copy current with a
 background refresh loop. The durable resolver is appended after the static and
-OIDC chain, so it only ever answers a request the others could not.
+OIDC chain, so it only ever answers a request the others could not. The
+shipped Gateway and Query policy documents grant the read on `sys/auth`; of the
+four shipped roles only Admin may write it, through `ravel-cli tenant token
+upsert` and `revoke`.
 
 The loop re-reads `sys/auth`. On success it advances the staleness gate; on any
 read or decode failure it keeps the last known map and leaves the gate where it
