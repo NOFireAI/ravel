@@ -137,13 +137,16 @@ What the codebase already guarantees, which bounds the change:
    stored with it. Clearing a key keeps the field present with the
    incremented generation and an empty column list, so generation 0 means
    only "never set", and a clear outranks every earlier key in compaction
-   exactly as a new key would. Audit and alert RLOG writers never take a key.
+   exactly as a new key would. A bloom scope change increments the same
+   generation (see the scope generation amendment below). Audit and alert
+   RLOG writers never take a key.
 
 2. **Every v5 object records its sort order, and compaction merges on it.**
    The v5 footer records the object's sort descriptor (bucket width and key
    columns, or none) and the clustering generation it was written under (0
-   for a tenant that never set a key). A generation names exactly one key, so
-   two objects with the same generation carry the same descriptor.
+   for a tenant that never set a key or a bloom scope). A generation names
+   exactly one key and one bloom scope (the scope generation amendment
+   below), so two objects with the same generation carry the same descriptor.
    - **Output descriptor.** Compaction and erasure rewrite take the
      descriptor of the input with the highest clustering generation. A key
      change therefore reaches compacted data as new data arrives, compaction
@@ -471,3 +474,26 @@ and 5 and the Consequences now carry the corrected text in place:
   was, and inputs written under two scopes at one generation resolve by the
   tie rule: the scope reaches compacted data when an input written under it
   is the first input at the highest generation.
+
+## Amendment (2026-10-01): a bloom scope change takes a clustering generation (issue #2146)
+
+<!-- amendment-applies: sections="Decision" pointer="scope generation amendment" -->
+
+Decision 1 incremented the clustering generation only on a key change, so
+two objects written under one generation could carry different bloom
+coverage. A bloom scope change now takes a generation of its own, and a
+generation names one key and one bloom scope.
+
+- `TenantConfig::set_bloom_scope` increments the clustering generation when
+  the scope changes and leaves the key's columns and bucket width as they
+  were. Setting the scope already stored changes nothing and takes no
+  generation.
+- The generation lives in field 13, so a tenant that never set a key gets
+  field 13 in its cleared form (no columns) at the new generation. Generation
+  0 therefore means that neither the key nor the bloom scope was ever set.
+- `set_tenant_config` refuses a config whose bloom scope differs from the
+  stored record's unless `set_bloom_scope` produced it, and refuses a scope
+  change at the stored record's generation. A config built without reading
+  the record cannot reset a narrowed scope to `all` this way.
+- `TenantConfig::clear_clustering_key` refuses a key that is already absent,
+  cleared or never set, instead of taking another generation for no change.

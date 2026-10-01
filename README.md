@@ -191,9 +191,10 @@ Also live:
   comparisons and aggregates need no `CAST` over the stringified `attrs` map.
   See the [query guide](docs/guides/query.md). A tenant's config record can
   also carry a clustering key and a bloom scope, which
-  `ravel-cli clustering-key show` and `ravel-cli bloom-scope show` print;
-  no ingest, compaction or CLI path in this build sets either field yet (see
-  the [ingest guide](docs/guides/ingest.md#checking-a-tenants-clustering-key-and-bloom-scope)).
+  `ravel-cli clustering-key set`/`clear` and `ravel-cli bloom-scope set`
+  write and the matching `show` commands print. Every RLOG object a tenant's
+  log flushes write after a set carries the key and the scope (see the
+  [ingest guide](docs/guides/ingest.md#setting-a-tenants-clustering-key-and-bloom-scope)).
 
 The PromQL conformance table in the
 [query engine spec](docs/query-engine.md) classifies every construct as
