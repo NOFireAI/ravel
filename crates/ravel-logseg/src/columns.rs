@@ -1,6 +1,7 @@
 //! The column set a scan needs decoded (ADR-0087 decision 3).
 //!
-//! [`crate::block::read_block_columns`] takes raw column ids, but a caller
+//! The block decode (`decode_v4_block_with` in the reader, then
+//! [`crate::block::read_block_pages_with_dicts`]) takes raw column ids, but a caller
 //! outside this crate cannot know a dynamic attribute's column id: ids are
 //! assigned per object by its FIELD_DIR. [`ColumnSelection`] is the caller-facing
 //! form -- fixed columns by name, dynamic columns by *attribute* name -- which
@@ -159,8 +160,8 @@ impl ColumnSelection {
     }
 
     /// Resolve to the concrete block column ids for one object, or `None` when
-    /// every column is wanted (which [`crate::block::read_block_columns`] takes
-    /// as "no filter").
+    /// every column is wanted (which the block decode,
+    /// [`crate::block::read_block_pages_with_dicts`], takes as "no filter").
     ///
     /// Public because ADR-0699 decision 5 makes this selection a *fetch*
     /// selection as well as a decode one: `ravel-query`'s version-4 fetcher
@@ -173,6 +174,9 @@ impl ColumnSelection {
         }
         let mut out: HashSet<u32> = HashSet::new();
         // Always needed: the exact ts re-check and the stream-identity lookup.
+        // `ts` has a second reason: a tag-11 `observed_ts` page copies the
+        // already-decoded `ts` column, so a projection without `ts` would turn
+        // every read of such a page into `Corrupted`.
         out.insert(COL_TS);
         out.insert(COL_STREAM_REF);
         out.extend(self.fixed.iter().copied());

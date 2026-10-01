@@ -24,8 +24,8 @@ use crate::encoding::Enc;
 use crate::error::LogSegError;
 use crate::field_dir::{FieldDir, FieldEntry};
 use crate::footer::{
-    COMP_NONE, COMP_ZSTD, LogFooter, MAX_SORT_KEY_COLUMNS, SectionDesc, SortDescriptor,
-    SortKeyType, kind, write_footer_and_trailer,
+    COMP_NONE, COMP_ZSTD, LogFooter, SectionDesc, SortDescriptor, SortKeyType, kind,
+    write_footer_and_trailer,
 };
 use crate::page::{SealedPage, seal_page};
 use crate::page_dir::{ChunkEntry, GroupEntry, PageDir, PageEntry};
@@ -613,8 +613,7 @@ impl RlogWriter {
                 let stream_refs: Vec<u32> = rows.iter().map(|r| r.stream_ref).collect();
                 let ts: Vec<i64> = rows.iter().map(|r| r.ts_ns).collect();
                 let perm = clustered_permutation(order, &stream_refs, &ts, &key_values);
-                let mut slots: Vec<Option<ResolvedRow>> = rows.into_iter().map(Some).collect();
-                rows = perm.iter().filter_map(|&i| slots[i].take()).collect();
+                rows = permute(rows, &perm)?;
             }
         }
 
@@ -1294,7 +1293,11 @@ impl RlogWriter {
                 });
                 perm
             }
-            Some(order) => clustered_permutation(order, &g_stream_ref, &g_ts, &key_values),
+            Some(order) => {
+                let perm = clustered_permutation(order, &g_stream_ref, &g_ts, &key_values);
+                check_permutation(&perm, total_rows)?;
+                perm
+            }
         };
 
         // Chunk into blocks, reproducing chunk_blocks/row_estimate. The dynamic
@@ -2755,32 +2758,20 @@ fn cluster_order(
     let Some(d) = descriptor else {
         return Ok(None);
     };
-    let invalid = |why: String| Err(LogSegError::InvalidSortDescriptor(why));
-    if generation == 0 {
-        return invalid("a descriptor needs a nonzero clustering generation".into());
-    }
-    if d.key_columns.is_empty() || d.key_columns.len() > MAX_SORT_KEY_COLUMNS {
-        return invalid(format!(
-            "{} key columns, not 1..={MAX_SORT_KEY_COLUMNS}",
-            d.key_columns.len()
-        ));
-    }
-    let mut keys: Vec<(String, FieldType)> = Vec::with_capacity(d.key_columns.len());
-    for c in &d.key_columns {
-        if c.name.is_empty() {
-            return invalid("key column name empty".into());
-        }
-        if keys.iter().any(|(name, _)| *name == c.name) {
-            return invalid(format!("key column {:?} named twice", c.name));
-        }
-        let ty = match c.ty {
-            SortKeyType::Str => FieldType::Str,
-            SortKeyType::I64 => FieldType::I64,
-            SortKeyType::Bool => FieldType::Bool,
-            SortKeyType::Bytes => FieldType::Bytes,
-        };
-        keys.push((c.name.clone(), ty));
-    }
+    d.validate(generation)?;
+    let keys: Vec<(String, FieldType)> = d
+        .key_columns
+        .iter()
+        .map(|c| {
+            let ty = match c.ty {
+                SortKeyType::Str => FieldType::Str,
+                SortKeyType::I64 => FieldType::I64,
+                SortKeyType::Bool => FieldType::Bool,
+                SortKeyType::Bytes => FieldType::Bytes,
+            };
+            (c.name.clone(), ty)
+        })
+        .collect();
     Ok(Some(ClusterOrder {
         bucket_ns: d.bucket_width.width_ns(),
         keys,
@@ -2878,7 +2869,66 @@ fn clustered_permutation(
             })
             .then_with(|| ts[a].cmp(&ts[b]))
     });
+    #[cfg(test)]
+    if let Some(forced) = test_hooks::FORCED_PERMUTATION.with(|f| f.borrow_mut().take()) {
+        return forced;
+    }
     perm
+}
+
+/// Refuses `perm` unless it names every index below `len` exactly once.
+fn check_permutation(perm: &[usize], len: usize) -> Result<(), LogSegError> {
+    if perm.len() != len {
+        return Err(LogSegError::InvalidRowOrder(format!(
+            "{} indices for {len} rows",
+            perm.len()
+        )));
+    }
+    let mut seen = vec![false; len];
+    for &i in perm {
+        match seen.get_mut(i) {
+            Some(s) if !*s => *s = true,
+            Some(_) => {
+                return Err(LogSegError::InvalidRowOrder(format!(
+                    "row {i} placed twice"
+                )));
+            }
+            None => {
+                return Err(LogSegError::InvalidRowOrder(format!(
+                    "row {i} out of range for {len} rows"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `items` reordered by `perm`, refused unless `perm` names every index of
+/// `items` exactly once.
+fn permute<T>(items: Vec<T>, perm: &[usize]) -> Result<Vec<T>, LogSegError> {
+    check_permutation(perm, items.len())?;
+    let mut slots: Vec<Option<T>> = items.into_iter().map(Some).collect();
+    let mut out = Vec::with_capacity(perm.len());
+    for &i in perm {
+        let item = slots.get_mut(i).and_then(Option::take).ok_or_else(|| {
+            LogSegError::InvalidRowOrder(format!("row {i} unavailable to the row order"))
+        })?;
+        out.push(item);
+    }
+    Ok(out)
+}
+
+/// Seams the writer's unit tests use to drive a path no valid input reaches.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// When set, the next [`super::clustered_permutation`] call returns this
+        /// instead of the order it computed.
+        pub(crate) static FORCED_PERMUTATION: RefCell<Option<Vec<usize>>> =
+            const { RefCell::new(None) };
+    }
 }
 
 /// Bytes charged to `Layout::dict_budget` per present string value: the `u32`
@@ -5802,5 +5852,127 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod row_order_tests {
+    use super::test_hooks::FORCED_PERMUTATION;
+    use super::*;
+    use crate::footer::{SortBucketWidth, SortKeyColumn};
+    use crate::record::stream_attrs_bytes;
+    use ravel_types::logstream::AttrValue;
+
+    fn records() -> Vec<LogRecord> {
+        let attrs = stream_attrs_bytes(
+            &[("service.name".into(), AttrValue::Str("svc".into()))],
+            "scope",
+            "1.0",
+            &[],
+        );
+        (0..3)
+            .map(|i| LogRecord {
+                stream_id: LogStreamId([7; 16]),
+                stream_attrs: attrs.clone(),
+                ts_ns: 1_000 + i,
+                observed_ts_ns: 1_000 + i,
+                severity_num: 9,
+                severity_text: "INFO".into(),
+                body: format!("r{i}"),
+                trace_id: None,
+                span_id: None,
+                flags: 0,
+                attrs: vec![("code".into(), AttrValue::Str(format!("c{i}")))],
+            })
+            .collect()
+    }
+
+    fn keyed_writer() -> RlogWriter {
+        let identity = ObjectIdentity {
+            tenant_hash: [1; 16],
+            shard: 0,
+            writer_id: [2; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let d = SortDescriptor {
+            bucket_width: SortBucketWidth::OneHour,
+            key_columns: vec![SortKeyColumn {
+                name: "code".into(),
+                ty: SortKeyType::Str,
+            }],
+        };
+        RlogWriter::new(RlogConfig::default(), identity).with_sort_descriptor(Some(d), 1)
+    }
+
+    /// Finishes a keyed writer over [`records`] with the clustered order forced
+    /// to `perm`, on the row path or the columnar one.
+    fn finish_forced(perm: &[usize], columnar: bool) -> Result<Vec<u8>, LogSegError> {
+        let mut w = keyed_writer();
+        if columnar {
+            w.push_columnar(ColumnarLogBatch::from_records(&records()))?;
+        } else {
+            for r in records() {
+                w.push(r)?;
+            }
+        }
+        FORCED_PERMUTATION.with(|f| *f.borrow_mut() = Some(perm.to_vec()));
+        let out = w.finish();
+        FORCED_PERMUTATION.with(|f| f.borrow_mut().take());
+        out
+    }
+
+    /// A row order that repeats, skips, overruns or misses a row is refused
+    /// with `InvalidRowOrder` on both write paths, before any object exists,
+    /// instead of an object holding fewer (or repeated) records than were
+    /// pushed. A valid reversed order still writes all three rows in it.
+    #[test]
+    fn a_row_order_that_is_not_a_permutation_is_refused_on_both_paths() {
+        let refused: [(&[usize], &str); 4] = [
+            (&[0, 0, 2], "row 0 placed twice"),
+            (&[0, 1, 3], "row 3 out of range for 3 rows"),
+            (&[0, 1], "2 indices for 3 rows"),
+            (&[2, 1, 0, 0], "4 indices for 3 rows"),
+        ];
+        for columnar in [false, true] {
+            for (perm, want) in refused {
+                match finish_forced(perm, columnar) {
+                    Err(LogSegError::InvalidRowOrder(m)) => {
+                        assert_eq!(m, want, "columnar {columnar}, {perm:?}")
+                    }
+                    other => panic!(
+                        "columnar {columnar}, {perm:?}: got {:?}",
+                        other.map(|o| o.len())
+                    ),
+                }
+            }
+            let object = finish_forced(&[2, 1, 0], columnar).expect("a true permutation");
+            let reader =
+                crate::reader::RlogReader::new(&object, &RlogConfig::default()).expect("reader");
+            let (rows, _) = reader
+                .scan(&crate::record::Predicate::And(vec![]))
+                .expect("scan");
+            let bodies: Vec<String> = rows.into_iter().map(|r| r.body).collect();
+            assert_eq!(bodies, ["r2", "r1", "r0"], "columnar {columnar}");
+        }
+    }
+
+    #[test]
+    fn permute_refuses_every_non_permutation() {
+        assert_eq!(
+            permute(vec!['a', 'b', 'c'], &[1, 2, 0]).expect("valid"),
+            ['b', 'c', 'a']
+        );
+        for perm in [&[0usize, 0, 1][..], &[0, 1, 5], &[0, 1], &[], &[0, 1, 2, 0]] {
+            assert!(
+                matches!(
+                    permute(vec!['a', 'b', 'c'], perm),
+                    Err(LogSegError::InvalidRowOrder(_))
+                ),
+                "{perm:?}"
+            );
+        }
+        permute(Vec::<char>::new(), &[]).expect("empty is a permutation of nothing");
     }
 }

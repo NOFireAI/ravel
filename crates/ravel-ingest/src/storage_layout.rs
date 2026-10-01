@@ -13,9 +13,7 @@ use ravel_catalog::{
     DeclaredTypedColumn, StorageLayoutConfigError, TenantConfig,
 };
 use ravel_logseg::BloomScope as RlogBloomScope;
-use ravel_logseg::footer::{
-    MAX_SORT_KEY_COLUMNS, SortBucketWidth, SortDescriptor, SortKeyColumn, SortKeyType,
-};
+use ravel_logseg::{LogSegError, SortBucketWidth, SortDescriptor, SortKeyColumn, SortKeyType};
 
 /// A tenant's clustering key and bloom scope as last resolved from its config.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,31 +141,15 @@ pub(crate) fn writer_layout(
 }
 
 /// `key` as the sort descriptor the writer records, each column typed from
-/// `typed_columns`. Refuses a key column with no type there, and every
-/// descriptor the writer's own check refuses at `finish`: a zero generation,
-/// a column count outside 1..=[`MAX_SORT_KEY_COLUMNS`], an empty column name,
-/// or a column named twice.
+/// `typed_columns`. Refuses a key column with no type there, and then every
+/// descriptor [`SortDescriptor::validate`] refuses, with its message: the
+/// writer runs the same check at `finish`.
 fn sort_descriptor(
     key: &ClusteringKey,
     typed_columns: &[DeclaredTypedColumn],
 ) -> Result<SortDescriptor, String> {
-    if key.generation == 0 {
-        return Err("a descriptor needs a nonzero clustering generation".into());
-    }
-    if key.columns.is_empty() || key.columns.len() > MAX_SORT_KEY_COLUMNS {
-        return Err(format!(
-            "{} key columns, not 1..={MAX_SORT_KEY_COLUMNS}",
-            key.columns.len()
-        ));
-    }
     let mut key_columns: Vec<SortKeyColumn> = Vec::with_capacity(key.columns.len());
     for name in &key.columns {
-        if name.is_empty() {
-            return Err("key column name empty".into());
-        }
-        if key_columns.iter().any(|col| &col.name == name) {
-            return Err(format!("key column {name:?} named twice"));
-        }
         let Some(declared) = typed_columns.iter().find(|col| &col.key == name) else {
             return Err(format!("key column {name:?} has no declared type"));
         };
@@ -176,10 +158,15 @@ fn sort_descriptor(
             ty: sort_key_type(declared.ty),
         });
     }
-    Ok(SortDescriptor {
+    let descriptor = SortDescriptor {
         bucket_width: sort_bucket_width(key.bucket_width),
         key_columns,
-    })
+    };
+    match descriptor.validate(key.generation) {
+        Ok(()) => Ok(descriptor),
+        Err(LogSegError::InvalidSortDescriptor(why)) => Err(why),
+        Err(other) => Err(other.to_string()),
+    }
 }
 
 fn sort_bucket_width(width: ClusteringBucketWidth) -> SortBucketWidth {
@@ -331,6 +318,13 @@ mod tests {
     /// holding one record. The record carries no key column, which a keyed
     /// writer stores as absent key values.
     fn writer_accepts(descriptor: SortDescriptor, generation: u64) -> bool {
+        writer_refusal(descriptor, generation).is_none()
+    }
+
+    /// The `InvalidSortDescriptor` message a writer given `descriptor` and
+    /// `generation` refuses its one-record object with, `None` when it
+    /// finishes. Any other error fails the test.
+    fn writer_refusal(descriptor: SortDescriptor, generation: u64) -> Option<String> {
         let res = vec![("service.name".to_string(), AttrValue::Str("api".into()))];
         let record = LogRecord {
             stream_id: log_stream_id(&res, "scope", "", &[]),
@@ -355,7 +349,59 @@ mod tests {
         let mut writer = RlogWriter::new(RlogConfig::default(), identity)
             .with_sort_descriptor(Some(descriptor), generation);
         writer.push(record).expect("push");
-        writer.finish().is_ok()
+        match writer.finish() {
+            Ok(_) => None,
+            Err(LogSegError::InvalidSortDescriptor(why)) => Some(why),
+            Err(other) => panic!("unexpected writer error {other:?}"),
+        }
+    }
+
+    /// The ingest resolution and the writer refuse each shape for the same
+    /// reason, in the words `SortDescriptor::validate` uses: one check, three
+    /// call sites (ingest, writer `finish`, footer decode).
+    #[test]
+    fn ingest_refusals_carry_the_writer_message() {
+        let typed: Vec<DeclaredTypedColumn> = ["", "a", "b", "c", "d", "e"]
+            .iter()
+            .map(|k| col(k, DeclaredColumnType::Str))
+            .collect();
+        let cases: [(&[&str], u64, &str); 5] = [
+            (&[""], 1, "key column name empty"),
+            (&["a", "a"], 1, "key column \"a\" named twice"),
+            (&["a", "b", "c", "d", "e"], 1, "5 key columns, not 1..=4"),
+            (&[], 1, "0 key columns, not 1..=4"),
+            (
+                &["a"],
+                0,
+                "a descriptor needs a nonzero clustering generation",
+            ),
+        ];
+        for (columns, generation, want) in cases {
+            let key = ClusteringKey {
+                columns: columns.iter().map(|c| c.to_string()).collect(),
+                bucket_width: ClusteringBucketWidth::OneHour,
+                generation,
+            };
+            assert_eq!(
+                sort_descriptor(&key, &typed),
+                Err(want.to_string()),
+                "{columns:?} at generation {generation}"
+            );
+            assert_eq!(
+                writer_refusal(str_key(columns), generation).as_deref(),
+                Some(want),
+                "{columns:?} at generation {generation}"
+            );
+        }
+        let undeclared = ClusteringKey {
+            columns: vec!["zone".into()],
+            bucket_width: ClusteringBucketWidth::OneHour,
+            generation: 1,
+        };
+        assert_eq!(
+            sort_descriptor(&undeclared, &typed),
+            Err("key column \"zone\" has no declared type".to_string())
+        );
     }
 
     fn str_key(columns: &[&str]) -> SortDescriptor {

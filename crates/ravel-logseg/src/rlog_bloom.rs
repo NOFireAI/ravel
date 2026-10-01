@@ -219,6 +219,29 @@ mod tests {
         assert!(RlogBloomSection::parse(&long, &field_dir()).is_err());
     }
 
+    /// A coverage list cut short is refused by name at each of its three
+    /// parts: one byte off the count, off the ids, and off the list crc. None
+    /// reads past the buffer, pads it, or stops the id loop early and parses.
+    #[test]
+    fn rejects_a_coverage_list_cut_in_each_part() {
+        let covered = [COL_SEVERITY_TEXT, COL_BODY, FIRST_DYNAMIC_COL];
+        let bytes = encode_rlog_bloom_section(&covered, &entries());
+        // 4 count bytes, one varint byte per id (each below 128), 4 crc bytes.
+        let list_len = 4 + covered.len() + 4;
+        let cases = [
+            (3, "bloom section truncated at covered count"),
+            (4 + covered.len() - 1, "varint truncated"),
+            (list_len - 1, "bloom section truncated at covered crc"),
+        ];
+        for (cut, want) in cases {
+            match RlogBloomSection::parse(&bytes[..cut], &field_dir()) {
+                Err(LogSegError::Corrupted(m)) => assert_eq!(m, want, "cut at {cut}"),
+                Err(other) => panic!("cut at {cut}: {other:?}"),
+                Ok(s) => panic!("cut at {cut} parsed as {:?}", s.covered()),
+            }
+        }
+    }
+
     #[test]
     fn rejects_an_entry_with_a_crc_flip() {
         let mut bytes = encode_rlog_bloom_section(&[COL_BODY], &entries());

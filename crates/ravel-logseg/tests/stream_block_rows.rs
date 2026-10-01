@@ -142,6 +142,7 @@ fn variant(e: &LogSegError) -> &'static str {
         LogSegError::Unplaced { .. } => "Unplaced",
         LogSegError::InconsistentStreamAttrs(_) => "InconsistentStreamAttrs",
         LogSegError::InvalidSortDescriptor(_) => "InvalidSortDescriptor",
+        LogSegError::InvalidRowOrder(_) => "InvalidRowOrder",
         LogSegError::Io(_) => "Io",
     }
 }

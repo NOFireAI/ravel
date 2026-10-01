@@ -258,7 +258,7 @@ impl SortDescriptor {
         }
     }
 
-    fn from_proto(p: pb::SortDescriptor) -> Result<Self, LogSegError> {
+    fn from_proto(p: pb::SortDescriptor, generation: u64) -> Result<Self, LogSegError> {
         let bucket_width = match pb::SortBucketWidth::try_from(p.bucket_width) {
             Ok(pb::SortBucketWidth::OneHour) => SortBucketWidth::OneHour,
             Ok(pb::SortBucketWidth::SixHours) => SortBucketWidth::SixHours,
@@ -270,25 +270,8 @@ impl SortDescriptor {
                 )));
             }
         };
-        if p.key_columns.is_empty() || p.key_columns.len() > MAX_SORT_KEY_COLUMNS {
-            return Err(LogSegError::Corrupted(format!(
-                "footer sort descriptor has {} key columns, not 1..={MAX_SORT_KEY_COLUMNS}",
-                p.key_columns.len()
-            )));
-        }
         let mut key_columns: Vec<SortKeyColumn> = Vec::with_capacity(p.key_columns.len());
         for c in p.key_columns {
-            if c.name.is_empty() {
-                return Err(LogSegError::Corrupted(
-                    "footer sort key column name empty".into(),
-                ));
-            }
-            if key_columns.iter().any(|k| k.name == c.name) {
-                return Err(LogSegError::Corrupted(format!(
-                    "footer sort key column {:?} named twice",
-                    c.name
-                )));
-            }
             let ty = match pb::SortKeyColumnType::try_from(c.r#type) {
                 Ok(pb::SortKeyColumnType::Str) => SortKeyType::Str,
                 Ok(pb::SortKeyColumnType::I64) => SortKeyType::I64,
@@ -303,10 +286,53 @@ impl SortDescriptor {
             };
             key_columns.push(SortKeyColumn { name: c.name, ty });
         }
-        Ok(SortDescriptor {
+        let d = SortDescriptor {
             bucket_width,
             key_columns,
-        })
+        };
+        d.validate(generation).map_err(|e| match e {
+            LogSegError::InvalidSortDescriptor(why) => {
+                LogSegError::Corrupted(format!("footer sort descriptor: {why}"))
+            }
+            other => other,
+        })?;
+        Ok(d)
+    }
+
+    /// Refuses a descriptor no writer, footer or catalog key may carry: one
+    /// paired with clustering generation 0, one with a key column count outside
+    /// 1..=[`MAX_SORT_KEY_COLUMNS`], an empty key column name, or a name given
+    /// twice. The bucket width and column types are closed enums, so an
+    /// unspecified width or type cannot reach this check; the footer decoder
+    /// refuses those while it builds the descriptor. Every refusal is
+    /// [`LogSegError::InvalidSortDescriptor`]; the footer decoder reports the
+    /// same message as `Corrupted`.
+    pub fn validate(&self, generation: u64) -> Result<(), LogSegError> {
+        if generation == 0 {
+            return Err(LogSegError::InvalidSortDescriptor(
+                "a descriptor needs a nonzero clustering generation".into(),
+            ));
+        }
+        let n = self.key_columns.len();
+        if n == 0 || n > MAX_SORT_KEY_COLUMNS {
+            return Err(LogSegError::InvalidSortDescriptor(format!(
+                "{n} key columns, not 1..={MAX_SORT_KEY_COLUMNS}"
+            )));
+        }
+        for (i, c) in self.key_columns.iter().enumerate() {
+            if c.name.is_empty() {
+                return Err(LogSegError::InvalidSortDescriptor(
+                    "key column name empty".into(),
+                ));
+            }
+            if self.key_columns[..i].iter().any(|k| k.name == c.name) {
+                return Err(LogSegError::InvalidSortDescriptor(format!(
+                    "key column {:?} named twice",
+                    c.name
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -370,13 +396,8 @@ impl LogFooter {
         }
         let sort_descriptor = p
             .sort_descriptor
-            .map(SortDescriptor::from_proto)
+            .map(|d| SortDescriptor::from_proto(d, p.clustering_generation))
             .transpose()?;
-        if sort_descriptor.is_some() && p.clustering_generation == 0 {
-            return Err(LogSegError::Corrupted(
-                "footer sort descriptor present with clustering generation 0".into(),
-            ));
-        }
         Ok(LogFooter {
             tenant_hash,
             shard: p.shard,
@@ -1183,7 +1204,7 @@ mod tests {
             key("region", SortKeyType::Str),
             key("zone", SortKeyType::Str),
         ]);
-        let decoded = SortDescriptor::from_proto(ok).expect("distinct names decode");
+        let decoded = SortDescriptor::from_proto(ok, 1).expect("distinct names decode");
         assert_eq!(decoded.key_columns.len(), 2);
 
         let refused = [
@@ -1209,10 +1230,94 @@ mod tests {
             ),
         ];
         for (columns, needle) in refused {
-            match SortDescriptor::from_proto(descriptor(columns.clone())) {
+            match SortDescriptor::from_proto(descriptor(columns.clone()), 1) {
                 Err(LogSegError::Corrupted(m)) => assert!(m.contains(needle), "{m}"),
                 other => panic!("{columns:?}: expected Corrupted({needle}), got {other:?}"),
             }
         }
+    }
+
+    /// The shapes `SortDescriptor::validate` refuses, each with the generation
+    /// it is paired with and the exact message.
+    fn refused_shapes() -> Vec<(Vec<SortKeyColumn>, u64, &'static str)> {
+        let s = |n: &str| key(n, SortKeyType::Str);
+        vec![
+            (Vec::new(), 1, "0 key columns, not 1..=4"),
+            (
+                vec![s("a"), s("b"), s("c"), s("d"), s("e")],
+                1,
+                "5 key columns, not 1..=4",
+            ),
+            (
+                vec![s("code")],
+                0,
+                "a descriptor needs a nonzero clustering generation",
+            ),
+            (vec![s("a"), s("")], 1, "key column name empty"),
+            (
+                vec![s("code"), key("code", SortKeyType::I64)],
+                1,
+                "key column \"code\" named twice",
+            ),
+        ]
+    }
+
+    /// One case per rule: an empty column list under a nonzero generation, more
+    /// than the maximum, a descriptor under generation 0, an empty name and a
+    /// repeated name. The width and column types are closed enums here, so an
+    /// unspecified width has no domain value to pass; the footer decoder
+    /// refuses it from the proto (`rejects_an_unspecified_bucket_width`).
+    #[test]
+    fn validate_refuses_each_rule_with_its_message() {
+        for (columns, generation, want) in refused_shapes() {
+            let d = SortDescriptor {
+                bucket_width: SortBucketWidth::OneHour,
+                key_columns: columns.clone(),
+            };
+            match d.validate(generation) {
+                Err(LogSegError::InvalidSortDescriptor(m)) => assert_eq!(m, want, "{columns:?}"),
+                other => panic!("{columns:?}/{generation}: expected {want:?}, got {other:?}"),
+            }
+        }
+        let max = SortDescriptor {
+            bucket_width: SortBucketWidth::OneDay,
+            key_columns: ["a", "b", "c", "d"]
+                .iter()
+                .map(|n| key(n, SortKeyType::Bytes))
+                .collect(),
+        };
+        max.validate(1)
+            .expect("four distinct columns under generation 1");
+        max.validate(u64::MAX).expect("any nonzero generation");
+    }
+
+    /// The footer decoder refuses every shape `validate` refuses, as
+    /// `Corrupted` carrying validate's own message.
+    #[test]
+    fn footer_decode_refuses_the_shapes_validate_refuses() {
+        for (columns, generation, want) in refused_shapes() {
+            let mut f = sample_footer(Vec::new());
+            f.sort_descriptor = Some(SortDescriptor {
+                bucket_width: SortBucketWidth::SixHours,
+                key_columns: columns.clone(),
+            });
+            f.clustering_generation = generation;
+            match LogFooter::from_proto(f.to_proto()) {
+                Err(LogSegError::Corrupted(m)) => {
+                    assert_eq!(m, format!("footer sort descriptor: {want}"), "{columns:?}")
+                }
+                other => panic!("{columns:?}/{generation}: expected Corrupted, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_an_unspecified_bucket_width() {
+        let mut p = descriptor(vec![key("code", SortKeyType::Str)]);
+        p.bucket_width = pb::SortBucketWidth::Unspecified as i32;
+        assert!(matches!(
+            SortDescriptor::from_proto(p, 1),
+            Err(LogSegError::Corrupted(m)) if m == "footer sort descriptor bucket width 0 unknown"
+        ));
     }
 }
