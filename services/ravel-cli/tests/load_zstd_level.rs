@@ -272,7 +272,9 @@ async fn load_zstd_level_reaches_every_written_page() {
     }
     assert_eq!(at3.objects.len(), 1, "one shard, one batch, one object");
     assert_eq!(rows3, ROWS, "every row landed");
-    assert_eq!(zpage_count, 15, "zstd pages compared");
+    // 15 before row-group dictionaries (#2144) replaced some per-block string
+    // pages on this corpus with a dictionary page and id pages.
+    assert_eq!(zpage_count, 13, "zstd pages compared");
     // A level that reached only the sections leaves every page the same size.
     // Measured 343647 against 420260 bytes (81.8%).
     assert!(
