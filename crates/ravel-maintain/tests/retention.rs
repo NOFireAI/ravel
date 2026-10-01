@@ -808,19 +808,46 @@ async fn sweep_blocked_fail_closed_when_head_undecodable() {
     assert!(has_tombstone(store.as_ref(), &bucket).await);
 }
 
-/// Deliverable 4 (interleaving): the two serialized fold/sweep orderings. A
+/// Deliverable 4 (interleaving): the two serialized fold/sweep orderings, plus
+/// the pinned-query window (ADR-0020 amendment 2026-10-01, issue #1133). A
 /// sweep whose gate reads the PRE-fold HEAD (which still names the bucket) must
-/// not delete the bucket's objects; only after a later fold drops the bucket
-/// does the sweep proceed. This covers both orderings a genuine concurrent
-/// fold+sweep collapses to, since the gate reads one atomic HEAD version: the
-/// pre-fold version (blocks) or the post-fold version (bucket already dropped,
-/// safe to delete).
+/// not delete the bucket's objects; a later fold that drops the bucket is not
+/// enough on its own either, because a reader that pinned the pre-fold HEAD
+/// could still be resolving the bucket's objects -- the rewritten covering
+/// part must also age past `max_query_duration + 1s granularity +
+/// clock_skew_allowance` before the sweep may proceed. This covers both
+/// orderings a genuine concurrent fold+sweep collapses to, since the gate
+/// reads one atomic HEAD version: the pre-fold version (blocks on `Named`), or
+/// the post-fold version (bucket already dropped, but still blocked on
+/// `PinnedWindow` until the rewritten part ages, then safe to delete).
+///
+/// A second, never-tombstoned input at a different hour keeps a live part in
+/// HEAD after the fold drops `bucket`'s hour, so the gate has a real anchor
+/// (a covering or neighbouring part with a store-assigned `last_modified`) to
+/// age, rather than hitting the degenerate "HEAD names no part at all" terminal
+/// block, which this test is not exercising.
 #[tokio::test]
 async fn sweep_respects_pre_fold_head_then_deletes_after_fold_drops_bucket() {
     let store = Arc::new(MemoryStore::new());
     let created = sealed_now_ns();
+    store.set_clock_ms((created / 1_000_000) as u64);
     let clock = FixedClock::new(created);
     let bucket = seed_two(store.as_ref(), Sig::Metrics).await;
+    seed_input(
+        store.as_ref(),
+        &InputSpec::new_at(
+            HOUR + 1,
+            Uuid::from_u128(0xC3),
+            1,
+            1,
+            vec![raw_series(
+                "m",
+                &[("k", "live")],
+                &[(i64::from(HOUR + 1) * NS_PER_HOUR + 1_000, 4.0)],
+            )],
+        ),
+    )
+    .await;
     let config = cfg();
 
     // Pre-fold HEAD names the bucket.
@@ -859,11 +886,47 @@ async fn sweep_respects_pre_fold_head_then_deletes_after_fold_drops_bucket() {
         "the pre-fold HEAD named the bucket, so nothing was deleted"
     );
 
-    // The fold completes and drops the tombstoned bucket from the snapshot.
-    fold_head(&store, Signal::Metrics, clock.now_ns(), None).await;
+    // The fold completes, freshly, at the current clock, and drops the
+    // tombstoned bucket from the snapshot. The rewritten covering/neighbouring
+    // part's store-assigned `last_modified` is therefore "now", not stale.
+    let fold_ns = clock.now_ns();
+    store.set_clock_ms((fold_ns / 1_000_000) as u64);
+    fold_head(&store, Signal::Metrics, fold_ns, None).await;
 
-    // Ordering B: the sweep's gate now reads the post-fold HEAD (bucket
-    // dropped) -> proceeds and deletes.
+    // Ordering B, immediately after the fold: HEAD no longer names the
+    // bucket, but the rewritten anchor part has not yet aged past the
+    // pinned-query window -- a reader that pinned the PRE-fold HEAD could
+    // still be resolving the bucket's objects. Blocked, not swept.
+    let still_pinned = retention_sweep_bucket(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        &bucket,
+    )
+    .await
+    .expect("gate");
+    assert_eq!(
+        still_pinned,
+        RetentionOutcome::BlockedBySnapshot(SnapshotBlock::PinnedWindow)
+    );
+    assert!(
+        !bucket_is_empty(store.as_ref(), &bucket).await,
+        "the rewritten anchor part has not yet aged past the pinned-query window"
+    );
+
+    // Advance past the pinned-query window: the 1s granularity correction,
+    // plus max_query_duration, plus clock_skew_allowance, past the fold.
+    clock.set(
+        fold_ns
+            + 1_000_000_000
+            + config.max_query_duration_ns
+            + config.clock_skew_allowance_ns
+            + 1,
+    );
+
+    // Ordering B, once the window has elapsed: proceeds and deletes.
     let swept = retention_sweep_bucket(
         store.as_ref(),
         &clock,
