@@ -513,6 +513,13 @@ async fn read_file(
     let recorded = tail.pin.clone();
     let data = tail.outcome.data;
     let fetched = data.len() as u64;
+    let expected = size.min(FOOTER_PREFETCH);
+    if fetched != expected {
+        return Err(corrupt(format!(
+            "footer read of {FOOTER_PREFETCH} bytes from a {size}-byte file returned {fetched} \
+             bytes"
+        )));
+    }
     let tail_start = size - fetched;
     if fetched < TRAILER_LEN {
         return Err(corrupt(format!(
@@ -1793,6 +1800,111 @@ mod tests {
             other => panic!("expected MemoryExhausted, got {other:?}"),
         }
         assert!(store.gets().is_empty(), "refused before any footer read");
+    }
+
+    /// A store whose `get_pinned` ignores the requested range entirely and
+    /// always answers with canned bytes and a canned total size, for the one
+    /// invariant a listing-backed double cannot misreport: the relationship
+    /// between the first footer read's declared length and what its response
+    /// actually carries.
+    struct LyingGet {
+        returned_len: usize,
+        total_size: u64,
+    }
+
+    #[async_trait]
+    impl ObjectStoreBackend for LyingGet {
+        async fn put(&self, _key: &str, _data: Bytes, _opts: PutOptions) -> Result<PutOutcome, StoreError> {
+            unreachable!("not exercised by a footer read")
+        }
+
+        async fn get(&self, _key: &str, _range: GetRange) -> Result<GetOutcome, StoreError> {
+            unreachable!("not exercised by a footer read")
+        }
+
+        async fn get_pinned(
+            &self,
+            _key: &str,
+            _range: GetRange,
+            pin: &Pin,
+        ) -> Result<PinnedRead, StoreError> {
+            Ok(PinnedRead {
+                outcome: GetOutcome {
+                    data: Bytes::from(vec![0u8; self.returned_len]),
+                    etag: Etag("e".to_string()),
+                    version: Version("v".to_string()),
+                    total_size: self.total_size,
+                },
+                pin: pin.clone(),
+            })
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            Ok(ObjectMeta {
+                key: key.to_string(),
+                size: self.total_size,
+                etag: Etag("e".to_string()),
+                version: Version("v".to_string()),
+                last_modified_unix_ms: 0,
+            })
+        }
+
+        async fn list(
+            &self,
+            _prefix: &str,
+            _page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            unreachable!("a single-object location lists nothing")
+        }
+
+        async fn list_delimited(&self, _prefix: &str) -> Result<DelimitedList, StoreError> {
+            unreachable!("not exercised by a footer read")
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), StoreError> {
+            unreachable!("not exercised by a footer read")
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::mandatory()
+        }
+    }
+
+    /// An endpoint whose suffix read ignores `FOOTER_PREFETCH` and returns
+    /// more bytes than were requested (an endpoint that does not honor
+    /// `Range`/suffix semantics at all). Mutation that fails it: dropping the
+    /// `fetched != expected` guard lets `split`/`trailer_footer_len` run on
+    /// however many bytes came back instead of refusing up front.
+    #[tokio::test]
+    async fn a_footer_read_returning_more_bytes_than_requested_refuses_as_corrupt() {
+        let store = LyingGet {
+            returned_len: (FOOTER_PREFETCH + 10) as usize,
+            total_size: 200_000,
+        };
+        assert_corrupt(
+            snapshot(&store, "s3://lake/data/one.parquet").await,
+            "data/one.parquet",
+            "returned",
+        );
+    }
+
+    /// An endpoint whose suffix read returns more bytes than the same
+    /// response's own reported `total_size`. Mutation that fails it:
+    /// dropping the `fetched != expected` guard computes
+    /// `tail_start = size - fetched` with `fetched > size`, which underflows
+    /// (panics in debug, wraps in release); confirmed against the code
+    /// before this fix, which panics on exactly this input.
+    #[tokio::test]
+    async fn a_footer_read_returning_more_bytes_than_the_reported_size_refuses_as_corrupt() {
+        let store = LyingGet {
+            returned_len: 150,
+            total_size: 100,
+        };
+        assert_corrupt(
+            snapshot(&store, "s3://lake/data/one.parquet").await,
+            "data/one.parquet",
+            "returned",
+        );
     }
 
     /// A budget sized for exactly one footer read at a time snapshots
