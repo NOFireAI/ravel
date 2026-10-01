@@ -670,7 +670,7 @@ enum Command {
         max_flush_delay: Option<Duration>,
         /// The zstd level of every page and section the loader's RLOG objects
         /// compress with zstd. Compaction re-encodes the objects it merges at
-        /// its own level (3), so this sets only the load's own objects.
+        /// compaction's own level, so this sets only the load's own objects.
         ///
         /// A page or section is stored compressed only when that is smaller
         /// than storing it raw, and a page's encoding is chosen by stored

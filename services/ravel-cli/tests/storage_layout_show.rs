@@ -8,16 +8,25 @@ use std::sync::Arc;
 
 use prost::Message;
 use ravel_catalog::{
-    DeclaredColumnType, DeclaredTypedColumn, TenantConfig, TenantLifecycleState, config_key,
-    set_tenant_config,
+    DeclaredColumnType, DeclaredTypedColumn, StorageLayoutConfigError, TenantConfig,
+    TenantLifecycleState, config_key, set_tenant_config,
 };
 use ravel_cli::storage_layout::{bloom_scope_show_to, clustering_key_show_to};
+use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_proto::sys::v1 as sysproto;
 use ravel_types::TenantId;
 
 const TENANT: &str = "acme";
+
+/// The line a set key ends with when the record has no typed_attr_columns
+/// override.
+const NO_OVERRIDE_NOTE: &str = "note: tenant acme has no typed attribute column override, so \
+                                each column's type and whether it is declared come from the \
+                                deployment's declaration, which this command cannot read; \
+                                ingest leaves the key unresolved when it names a column that \
+                                declaration does not declare\n";
 
 fn column(key: &str, ty: sysproto::TypedAttrColumnType) -> sysproto::TypedAttrColumn {
     sysproto::TypedAttrColumn {
@@ -155,8 +164,26 @@ async fn clustering_key_show_reports_a_v3_record() {
     let store = store_with(&record).await;
     assert_eq!(
         clustering_key(&store).await,
-        "tenant acme clustering key at generation 9, bucket width 1d, 2 column(s) in key \
-         order:\n  code:deployment-default\n  svc:deployment-default\n"
+        format!(
+            "tenant acme clustering key at generation 9, bucket width 1d, 2 column(s) in key \
+             order:\n  code:deployment-default\n  svc:deployment-default\n{NO_OVERRIDE_NOTE}"
+        )
+    );
+
+    // The third bucket width, with the override, so the note is absent.
+    let store = store_with(&v3_record(
+        Some(sysproto::ClusteringKeyConfig {
+            columns: vec!["svc".to_string()],
+            bucket_width: sysproto::ClusteringBucketWidth::OneHour as i32,
+            generation: 3,
+        }),
+        sysproto::BloomScope::All,
+    ))
+    .await;
+    assert_eq!(
+        clustering_key(&store).await,
+        "tenant acme clustering key at generation 3, bucket width 1h, 1 column(s) in key \
+         order:\n  svc:str\n"
     );
 
     // A key the accessor refuses is an error, never printed.
@@ -183,6 +210,110 @@ async fn clustering_key_show_reports_a_v3_record() {
         assert!(result.is_err(), "{invalid:?} must be refused");
         assert!(out.is_empty(), "{invalid:?} must print nothing");
     }
+}
+
+/// Without a typed_attr_columns override the key is checked for shape only,
+/// and a shape the accessor refuses is still an error naming that shape rule,
+/// with nothing printed.
+#[tokio::test]
+async fn clustering_key_show_refuses_a_bad_shape_without_an_override() {
+    let key = |columns: &[&str], bucket_width: sysproto::ClusteringBucketWidth, generation| {
+        sysproto::ClusteringKeyConfig {
+            columns: columns.iter().map(|c| c.to_string()).collect(),
+            bucket_width: bucket_width as i32,
+            generation,
+        }
+    };
+    use sysproto::ClusteringBucketWidth::{OneHour, Unspecified};
+    for (invalid, expected) in [
+        (
+            key(&["code"], OneHour, 0),
+            StorageLayoutConfigError::ZeroClusteringGeneration,
+        ),
+        (
+            key(&["code"], Unspecified, 2),
+            StorageLayoutConfigError::UnspecifiedBucketWidth,
+        ),
+        (
+            key(&["a", "b", "c", "d", "e"], OneHour, 2),
+            StorageLayoutConfigError::TooManyClusteringKeyColumns { count: 5, max: 4 },
+        ),
+        (
+            key(&["code", "code"], OneHour, 2),
+            StorageLayoutConfigError::DuplicateClusteringKeyColumn {
+                column: "code".to_string(),
+            },
+        ),
+    ] {
+        let mut record = v3_record(Some(invalid.clone()), sysproto::BloomScope::All);
+        record.typed_attr_columns = None;
+        let store = store_with(&record).await;
+        let mut out = Vec::new();
+        let err = clustering_key_show_to(store, TENANT, &mut out)
+            .await
+            .expect_err("a bad shape without an override must be refused");
+        assert_eq!(
+            err.downcast_ref::<StorageLayoutConfigError>(),
+            Some(&expected),
+            "{invalid:?}: {err:#}"
+        );
+        assert!(out.is_empty(), "{invalid:?} must print nothing");
+    }
+}
+
+/// A store with one config record whose every GET of that record fails with
+/// a permanent error.
+fn store_failing_the_config_get() -> Arc<FaultStore<MemoryStore>> {
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(
+            Op::Get,
+            ScriptedFault::Permanent("simulated config read failure".to_string()),
+        )
+        .with_key_contains(config_key(&TenantId::new(TENANT).hash())),
+    );
+    Arc::new(FaultStore::new(MemoryStore::new(), plan))
+}
+
+/// A failed read of the config record is an error with nothing printed, not
+/// the no-record output.
+#[tokio::test]
+async fn clustering_key_show_fails_closed_on_a_config_read_error() {
+    let store = store_failing_the_config_get();
+    let mut out = Vec::new();
+    let result = clustering_key_show_to(
+        store.clone() as Arc<dyn ObjectStoreBackend>,
+        TENANT,
+        &mut out,
+    )
+    .await;
+    assert_eq!(store.fault_count(Op::Get, FaultKind::Permanent), 1);
+    let err = result.expect_err("a failed config read must be an error");
+    assert!(
+        format!("{err:#}").contains("simulated config read failure"),
+        "the error carries the store failure: {err:#}"
+    );
+    assert!(out.is_empty(), "printed: {}", String::from_utf8_lossy(&out));
+}
+
+/// [`clustering_key_show_fails_closed_on_a_config_read_error`] for
+/// `bloom-scope show`.
+#[tokio::test]
+async fn bloom_scope_show_fails_closed_on_a_config_read_error() {
+    let store = store_failing_the_config_get();
+    let mut out = Vec::new();
+    let result = bloom_scope_show_to(
+        store.clone() as Arc<dyn ObjectStoreBackend>,
+        TENANT,
+        &mut out,
+    )
+    .await;
+    assert_eq!(store.fault_count(Op::Get, FaultKind::Permanent), 1);
+    let err = result.expect_err("a failed config read must be an error");
+    assert!(
+        format!("{err:#}").contains("simulated config read failure"),
+        "the error carries the store failure: {err:#}"
+    );
+    assert!(out.is_empty(), "printed: {}", String::from_utf8_lossy(&out));
 }
 
 #[tokio::test]

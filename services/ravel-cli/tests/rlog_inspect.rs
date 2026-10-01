@@ -309,6 +309,37 @@ fn rlog_inspect_prints_the_sort_descriptor_generation_and_bloom_coverage() {
         ]
     );
 
+    // The other two bucket widths, under a one-column key.
+    for (width, spelling) in [
+        (SortBucketWidth::OneHour, "1h"),
+        (SortBucketWidth::OneDay, "1d"),
+    ] {
+        let object = build_object_with(|w| {
+            w.with_sort_descriptor(
+                Some(SortDescriptor {
+                    bucket_width: width,
+                    key_columns: vec![SortKeyColumn {
+                        name: "svc".to_string(),
+                        ty: SortKeyType::Str,
+                    }],
+                }),
+                2,
+            )
+        });
+        let stdout = inspect_stdout(&object, &format!("clustered-{spelling}"));
+        assert_eq!(
+            block(&stdout, "sort_descriptor: "),
+            [
+                format!("sort_descriptor: bucket_width={spelling} key_columns=1").as_str(),
+                "  key[0] name=svc type=str",
+            ]
+        );
+        assert_eq!(
+            block(&stdout, "clustering_generation: "),
+            ["clustering_generation: 2"]
+        );
+    }
+
     // Scope all adds the string attribute column, named through FIELD_DIR.
     let unclustered = inspect_stdout(&build_object(), "unclustered");
     assert_eq!(

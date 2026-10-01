@@ -1131,9 +1131,9 @@ which encoding a page keeps. zstd is lossless, so the level changes object
 size and never the records read back.
 
 The level applies only to the objects the load writes. Compaction decodes the
-records of the objects it merges and writes them again at its own level (3),
-so a compacted object carries no trace of the load's level. A metrics or spans load ignores the flag and prints
-a warning when it is set to anything but 3. `ravel-server` has no matching
+records of the objects it merges and writes them again at its own level, so a
+compacted object carries no trace of the load's level. A metrics or spans load
+ignores the flag and prints a warning when it is set to anything but 3. `ravel-server` has no matching
 flag yet; its log flush writes at the default level.
 
 ### Checking a tenant's clustering key and bloom scope
@@ -1152,12 +1152,18 @@ ravel-cli bloom-scope show --tenant acme
 the key was cleared at generation N, or the key is set, followed by its
 generation, bucket width (`1h`, `6h` or `1d`) and one `column:type` line per
 key column in key order. The type is the record's own declared type for that
-column; a tenant with no typed attribute column override prints
-`deployment-default`, since the deployment's declaration lives in server flags
-the command cannot read. `bloom-scope show` prints `all`, `undeclared` or
-`text`; a tenant with no config record reads as `all`. A stored value the
-catalog refuses (for example a set key naming a column the tenant does not
-declare) is an error with a non-zero exit, never a guess. This build's writer
+column. A tenant with no typed attribute column override prints
+`deployment-default` in place of each type, since the deployment's declaration
+lives in server flags the command cannot read, and ends with a `note:` line
+saying that resolution depends on that declaration: ingest leaves a key
+naming a column the deployment does not declare unresolved and writes the
+tenant's log objects without it. `bloom-scope show` prints `all`, `undeclared`
+or `text`; a tenant with no config record reads as `all`. A failed read of the
+record, or a stored value the catalog refuses, is an error with a non-zero
+exit and nothing on stdout. A set key naming a column the record's own
+override does not declare is refused; without an override the key is checked
+for shape only (its generation, column count, duplicate columns and bucket
+width), and a bad shape is refused the same way. This build's writer
 does not set either field yet, so a tenant configured through this build
 always reads as never set and `all`.
 
