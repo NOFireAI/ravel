@@ -613,8 +613,11 @@ async fn head_named_superseded_inputs_are_held_not_deleted() {
 // --- (b) the gate delays, never prevents ------------------------------------
 
 /// Once the fold has reconciled the hour, the snapshot names the rewrite's
-/// output part instead of the pre-rewrite inputs, and the very next sweep
-/// deletes exactly those inputs: two records, two data objects, nothing held.
+/// output part instead of the pre-rewrite inputs. Past the record's own
+/// protection horizon, the inputs are held under `PinnedWindow` until the
+/// rewrite's output part ages past the pinned-query window (ADR-0020
+/// amendment 2026-10-01, issue #1133), then the sweep deletes exactly those
+/// inputs: two records, two data objects, nothing held.
 ///
 /// Flip-line proof: make `SnapshotReachability::object_gate` return
 /// `SnapshotGate::Blocked(SnapshotBlock::Named)` unconditionally (or drop the
@@ -624,14 +627,23 @@ async fn head_named_superseded_inputs_are_held_not_deleted() {
 async fn reconciled_hour_lets_the_sweep_delete_exactly_the_superseded_inputs() {
     let mem = Arc::new(MemoryStore::new());
     let created = sealed_now_ns();
+    let config = cfg();
+    mem.set_clock_ms((created / 1_000_000) as u64);
     let clock = FixedClock::new(created);
     let commit_keys = seed_two_hours(mem.as_ref()).await;
     let input_data_keys = seeded_input_data_keys(mem.as_ref(), &commit_keys).await;
 
     fold_head(&mem, created, 1, None).await;
     run_rewrite(mem.as_ref(), &clock).await;
+
     // A reconcile window wide enough to reach 100 hours back: the fold now
-    // observes the late rewrite record and republishes the hour.
+    // observes the late rewrite record and republishes the hour. The store
+    // clock is set to the record's own protection-horizon instant right
+    // before this fold, so the freshly rewritten output part's
+    // store-assigned `last_modified` is exactly "now" at the point the
+    // record-age gate first clears, not stale.
+    let ph = past_horizon(created);
+    mem.set_clock_ms((ph / 1_000_000) as u64);
     fold_head(&mem, created + 3 * NS_PER_HOUR, 2, Some(200)).await;
 
     let named = head_named_data_keys(mem.as_ref(), OLD_HOUR).await;
@@ -645,12 +657,39 @@ async fn reconciled_hour_lets_the_sweep_delete_exactly_the_superseded_inputs() {
         "it names exactly the rewrite's single output part"
     );
 
-    clock.set(past_horizon(created));
+    // The rewrite's own protection horizon has just elapsed, but the
+    // rewritten output part was only just written: the pinned-query window
+    // has not aged yet, so the sweep holds, not deletes.
+    clock.set(ph);
+    let pinned = sweep(mem.as_ref(), &clock).await.expect("sweep");
+    assert_eq!(pinned.records_deleted, 0, "nothing deleted while pinned");
+    assert_eq!(pinned.data_deleted, 0, "nothing deleted while pinned");
+    assert_eq!(pinned.held_by_snapshot, 0);
+    assert_eq!(pinned.held_by_unreadable_head, 0);
+    assert_eq!(
+        pinned.held_by_pinned_window, 4,
+        "two commit records and two data objects held, reported as PinnedWindow"
+    );
+    assert_eq!(
+        present_keys(mem.as_ref(), &input_data_keys).await,
+        input_data_keys,
+        "nothing was deleted while the output part ages"
+    );
+
+    // Advance past the pinned-query window: the 1s granularity correction,
+    // plus max_query_duration, plus clock_skew_allowance, past `ph`.
+    clock.set(
+        ph + 1_000_000_000
+            + config.max_query_duration_ns
+            + config.clock_skew_allowance_ns
+            + 1,
+    );
     let outcome = sweep(mem.as_ref(), &clock).await.expect("sweep");
     assert_eq!(outcome.records_deleted, 2, "both input commit records gone");
     assert_eq!(outcome.data_deleted, 2, "both input data objects gone");
     assert_eq!(outcome.held_by_snapshot, 0);
     assert_eq!(outcome.held_by_unreadable_head, 0);
+    assert_eq!(outcome.held_by_pinned_window, 0);
 
     assert_eq!(
         present_keys(mem.as_ref(), &input_data_keys).await,
