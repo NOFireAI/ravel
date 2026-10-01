@@ -341,9 +341,19 @@ too, so one generation names exactly one key and one scope:
 `set_bloom_scope` with a scope other than the stored one stores the stored
 generation plus one and leaves the key's columns and bucket width as they
 were, and on a tenant with no field 13 it writes field 13 in its cleared form
-at generation 1. Setting the scope already stored changes nothing. Clearing a
-key that was never set, or one already cleared, is refused and takes no
-generation. A record
+at generation 1. Setting the scope already stored changes nothing. Under
+the `undeclared` scope the writer's bloom coverage also depends on which
+typed attribute column names the record declares, so `set_tenant_config`
+takes a generation itself for a write at the stored generation whose declared
+name set differs from the stored record's: the stored generation plus one,
+keeping the key's columns and bucket width, or field 13 in its cleared form
+when there is no key. A retype or a reorder of the same names keeps the
+generation, and so does the same change under `all` or `text`. One
+generation therefore names one key, one scope and, under `undeclared`, one
+set of typed attribute column names. That generation is taken after the checks below, so a
+`typed_attr_columns` change the current key refuses is still refused.
+Clearing a key that was never set, or one already cleared, is refused and
+takes no generation. A record
 spells a cleared key differently from a log segment footer: the record keeps
 the field present with an empty column list and a generation, while the footer
 (docs/log-segment-format.md) carries no `sort_descriptor` and a nonzero
@@ -377,7 +387,15 @@ only one that matters and which must support lowering a limit or clearing an
 override, so the record is read for its version and swapped in place under
 `CasVersion`; a concurrent write is a typed conflict the loser re-reads, never
 a silent overwrite. On a tenant with no record the first write bootstraps with
-`CreateIfAbsent`. A tenant with no `config` record runs entirely on the
+`CreateIfAbsent`. `set_tenant_config` takes that version from its own read,
+so it guards only the window between its read and its swap: a caller that
+read the record earlier, changed it and passes the result overwrites a write
+that landed in between. `TenantConfig::write_if_unchanged` closes that window
+for a read-modify-write caller: it takes the version the caller read (or
+`None` for a record the caller found absent) and refuses with `CasConflict`,
+writing nothing, when the record now carries another version, was deleted,
+or was created since. The `ravel-cli clustering-key` and `bloom-scope`
+commands write through it. A tenant with no `config` record runs entirely on the
 deployment defaults (`read_config` returns `Ok(None)`). This record is durable
 control state only; the bounded-staleness refresh loop that reads it on a
 horizon and re-invokes the admission controller's `set_tenant_limits` is a

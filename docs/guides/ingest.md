@@ -1148,12 +1148,17 @@ ravel-cli clustering-key show --tenant acme
 ravel-cli bloom-scope show --tenant acme
 ```
 
-`clustering-key show` prints one of three states: the tenant never set a key
-(clustering generation 0, also printed when the tenant has no config record),
-the key was cleared at generation N, or the key is set, followed by its
-generation, bucket width (`1h`, `6h` or `1d`) and one `column:type` line per
-key column in key order. The type is the record's own declared type for that
-column, and a key naming a column that override does not declare is refused.
+`clustering-key show` prints one of three states:
+
+- never set: `never set a clustering key (clustering generation 0)`, also
+  printed when the tenant has no config record;
+- `has no clustering key at generation N (cleared, or never set and given a
+  generation by a bloom scope change or by a typed attribute column change
+  under the undeclared scope)`: the record carries field 13 with no columns;
+- set: the generation, bucket width (`1h`, `6h` or `1d`) and one
+  `column:type` line per key column in key order. The type is the record's
+  own declared type for that column, and a key naming a column that override
+  does not declare is refused.
 
 A tenant with no typed attribute column override prints `deployment-default`
 in place of each type, since the deployment's declaration lives in server
@@ -1180,9 +1185,14 @@ ravel-cli bloom-scope set --tenant acme --scope text --readers-rolled-out
 ```
 
 Each writes a version-3 config record: it swaps the tenant's record in place
-with `CasVersion`, carrying every other field through unchanged, or creates
-one with `lifecycle_state=active` when the tenant has none. These commands are
-the first production path that writes a version-3 record.
+with `CasVersion` against the version the command read, carrying every other
+field through unchanged, or creates one with `lifecycle_state=active` when the
+tenant had none. A record another writer changed, created or deleted between
+that read and the write refuses the command with a CAS conflict error that
+says to re-read and retry, and writes nothing; run the command again. These
+commands are the first production path that writes a version-3 record. Each
+ends its output with a `note:` line naming the staleness bound described
+below.
 
 `--readers-rolled-out` is required on all three. It asserts that every process
 reading this bucket's tenant config runs a release that reads record version
@@ -1207,17 +1217,41 @@ error, before any store request.
   `severity_text` only. A column outside the scope is scanned rather than
   pruned on. A change increments the clustering generation and leaves the
   clustering key as it is; setting the scope already stored prints that it is
-  already set and writes nothing.
+  already set and writes nothing. Under `undeclared`, a config write that
+  changes the set of declared typed attribute column names (`ravel-cli
+  typed-attr-column set` adding or removing a column) also takes the next
+  generation, since it moves which columns the BLOOM section covers; a retype
+  or a reorder of the same names does not. A generation therefore names one
+  key, one scope and, under `undeclared`, one set of typed attribute column
+  names.
 
-From the first `set`, every RLOG object the tenant's log flushes write, from
-ingest and from `ravel-cli load` alike, carries the key and the scope. A
-flushing process reads the record through the same bounded-staleness tenant
-config read that supplies its indexed fields, so objects it flushes shortly
-after a change can still carry the earlier key and scope. With a
-key, an object's rows sort by stream, time bucket, the key columns and then
-timestamp, and its footer records the key as a sort descriptor beside the
+After a `set`, the RLOG objects the tenant's log flushes write, from ingest
+and from `ravel-cli load` alike, carry the key and the scope, with three
+exceptions on a server's log ingest flush:
+
+- Staleness. A flushing process reads the record through the same
+  bounded-staleness tenant config read that supplies its indexed fields, so
+  for up to its staleness horizon (60 s) after a change it can still write
+  the earlier key and scope.
+- An unresolved layout. A layout the flush cannot resolve (a key column the
+  record's own typed columns do not declare, a key the RLOG writer refuses to
+  record, or a scope value the build does not know) writes the unkeyed
+  default: no sort descriptor, generation 0 and a BLOOM section over every
+  string column. Each such flush adds one to the tenant's
+  `ingest_clustering_key_unresolved_total` count; see
+  [ingest.md](../ingest.md) for when a layout is unresolved and where the
+  count is read.
+- A failed config read. While its config read fails, the flush serves the
+  layout it last read, however old, or the default layout when it never read
+  one.
+
+With a key, an object's rows sort by stream, time bucket, the key columns and
+then timestamp, and its footer records the key as a sort descriptor beside the
 clustering generation. Objects already written keep their order and their
-filters; a change applies to later flushes only.
+filters until compaction rewrites them. L1 compaction and the erasure rewrite
+take the sort descriptor and bloom coverage of the input with the highest
+generation, re-sort every part by that descriptor, and compress at zstd level
+9.
 
 A worked example: declare two typed columns, cluster on both at 6h, keep the
 blooms on the text columns, load, and inspect one of the objects the load
