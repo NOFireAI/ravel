@@ -125,7 +125,7 @@ pub use config::{
     GROUP_VALUES_RESIZE_TRANSIENT_FACTOR, GROUP_VALUES_UNDERCOUNT_FACTOR, SpillConfig,
     SpillConfigError, SqlConfig, compensated_group_values_ceiling,
 };
-pub use ddl::{DEFAULT_MIN_GRACE_MS, DdlExecuteError, DdlOutcome};
+pub use ddl::{DEFAULT_MIN_GRACE_MS, DdlErrorClass, DdlExecuteError, DdlOutcome};
 pub use declared::{DeclaredColumn, DeclaredColumnSource, DeclaredType, StaticDeclaredColumns};
 #[cfg(feature = "flight-sql")]
 pub use distributed::{
