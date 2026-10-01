@@ -460,19 +460,46 @@ impl From<complexity_guard::GuardedParseError> for DdlValidationError {
     }
 }
 
+/// Longest `ravel.cast.<column>` column name [`is_admitted_cast_column`]
+/// admits, matching [`names::MAX_TABLE_NAME_LEN`] so a cast key's rendered
+/// form stays bounded the same way a table name's does.
+const MAX_CAST_COLUMN_LEN: usize = names::MAX_TABLE_NAME_LEN;
+
+/// Whether `column` is an admitted `ravel.cast.<column>` column name: ASCII
+/// letters of either case, digits, and `_`, first character a letter or `_`,
+/// up to [`MAX_CAST_COLUMN_LEN`] bytes, with no quote or other punctuation.
+/// D5 names no charset for a cast column, so this is deliberately not
+/// [`names::validate_table`]'s table-name rule (lowercase only, reserved
+/// names): that rule refuses D5's own example, `ravel.cast.EventDate`. The
+/// column lookup [`crate::ddl::execute_ddl`] runs at execute time against the
+/// snapshotted schema stays case-sensitive, since a Parquet column name is
+/// case-sensitive; this rule exists only to keep the audit text this key
+/// renders into ([`crate::redact::redact`]) unambiguous, the same reason
+/// [`is_admitted_option_key`] exists at all.
+fn is_admitted_cast_column(column: &str) -> bool {
+    if column.is_empty() || column.len() > MAX_CAST_COLUMN_LEN {
+        return false;
+    }
+    let mut chars = column.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Admitted `OPTIONS` key: exactly `binary_as_string`, or `ravel.cast.`
-/// followed by a column name that passes ravel-pqtable's own name rule (D5).
-/// Reusing [`names::validate_table`] here, rather than a second charset copy,
-/// is what keeps a key like `ravel.cast.x'); DROP TABLE y--` out of both
-/// [`validate_ddl`] and [`crate::redact::redact`] (they share this function
-/// through [`create_external_intent`]): unchecked, that key reached
+/// followed by a column name [`is_admitted_cast_column`] admits. Keeping that
+/// rule narrow is what keeps a key like `ravel.cast.x'); DROP TABLE y--` out
+/// of both [`validate_ddl`] and [`crate::redact::redact`] (they share this
+/// function through [`create_external_intent`]): unchecked, that key reached
 /// `render_create_external` and was written inside single quotes with no
 /// escaping of its own.
 fn is_admitted_option_key(key: &str) -> bool {
     key == "binary_as_string"
         || key
             .strip_prefix("ravel.cast.")
-            .is_some_and(|column| names::validate_table(column).is_ok())
+            .is_some_and(is_admitted_cast_column)
 }
 
 /// Whether `value` is one of the literals D5 admits for `key`. Only called
@@ -1878,6 +1905,40 @@ mod tests {
             DdlValidationError::UnsupportedOption { key }
                 if key == "ravel.cast.x'); DROP TABLE evil--"
         ));
+    }
+
+    #[test]
+    fn ravel_cast_option_naming_a_mixed_case_column_is_admitted() {
+        // ADR-2040 D5's own example (`ravel.cast.EventDate`): the cast
+        // column rule is not the table-name rule, which admits lowercase
+        // only and would wrongly refuse this.
+        let (_, _, _, _, options) = accept_create(
+            "CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION 's3://bucket/prefix/' \
+             OPTIONS ('ravel.cast.EventDate' 'date-from-days')",
+        );
+        assert_eq!(
+            options.get("ravel.cast.EventDate").map(String::as_str),
+            Some("date-from-days")
+        );
+    }
+
+    #[test]
+    fn ravel_cast_option_with_punctuation_in_the_column_is_rejected() {
+        for suffix in ["x'y", "x;y", "x.y", "x y"] {
+            let key = format!("ravel.cast.{suffix}");
+            let sql = format!(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION 's3://bucket/prefix/' \
+                 OPTIONS ('{}' 'date-from-days')",
+                key.replace('\'', "''")
+            );
+            assert!(
+                matches!(
+                    reject_ddl(&sql),
+                    DdlValidationError::UnsupportedOption { key: ref rejected } if *rejected == key
+                ),
+                "expected {key:?} to be rejected"
+            );
+        }
     }
 
     #[test]
