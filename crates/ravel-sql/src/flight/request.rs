@@ -107,6 +107,9 @@ pub(super) fn sql_request(
         deadline,
         row_window: false,
         max_rows: None,
+        // No metadata key carries a budget yet. Whatever this field holds is
+        // applied to both RPCs: `GetFlightInfo` resolves and plans under it and
+        // pins it into the ticket for `DoGet`.
         budgets: None,
     })
 }
