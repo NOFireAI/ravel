@@ -68,12 +68,23 @@
 //!   client, so the explicit `put_multipart` path already sends checksums
 //!   under integrity: `object_store`'s `create_multipart` sends
 //!   `x-amz-checksum-algorithm` and each `put_part` goes through
-//!   `PutRequest::with_payload`, which attaches the part's digest. It sends
-//!   no `x-amz-checksum-type`, so what the endpoint records for the completed
+//!   `PutRequest::with_payload`, which attaches the part's digest --- proven
+//!   on the wire, part by part (not only the first), by
+//!   `s3::tests::multipart_parts_carry_checksums_under_integrity` against a
+//!   fake endpoint. Whether `CompleteMultipartUpload`'s body then carries a
+//!   per-part checksum is not this client's choice to make: `object_store`
+//!   reads each part's checksum off `UploadPart`'s *response* headers, not
+//!   off what it sent, to build that part's serialized `PartId`, so the
+//!   Complete body only carries one when the endpoint's `UploadPart`
+//!   response echoes the same checksum header back. The same test records
+//!   this against a fake endpoint that does echo it; an endpoint that does
+//!   not would silently fall back to a bare e_tag there instead. It sends no
+//!   `x-amz-checksum-type`, so what the endpoint records for the completed
 //!   object is its default type for the algorithm (on AWS, a full-object
 //!   checksum for CRC64-NVME and a composite one for SHA-256). Routing large
-//!   overwrites through it under integrity waits on a real-endpoint check
-//!   that the endpoint verifies those part checksums.
+//!   overwrites through this path under integrity still waits on a
+//!   real-endpoint check that it verifies-or-rejects those part checksums:
+//!   sending them is now proven, server-side verification is not.
 //! - **Read-side checksum verification is header-driven, and a whole-object
 //!   read is only verifiable when one response carried the whole object**
 //!   (ADR-1696 decisions 2 to 4). `object_store` 0.14's `GetResult` exposes no
@@ -2418,13 +2429,14 @@ impl ObjectStoreBackend for S3Store {
                 return self.put_via_multipart(key, data).await;
             }
             // With upload integrity enabled the multipart path is excluded.
-            // Its part requests carry checksums (`object_store` attaches one
-            // to each `put_part` when the client has an algorithm), but no real
-            // endpoint has been checked to verify them, so `upload_checksum`
-            // rests on the single-PUT path alone: ONE billed PUT where
-            // multipart costs parts + 2, and one checksum over the whole
-            // object. That path covers every size up to S3's 5 GiB
-            // per-request ceiling, and a payload above it is refused loudly.
+            // Its part requests carry checksums on the wire, proven part by
+            // part by s3::tests::multipart_parts_carry_checksums_under_integrity,
+            // but no real endpoint has been checked to verify-or-reject them,
+            // so `upload_checksum` rests on the single-PUT path alone: ONE
+            // billed PUT where multipart costs parts + 2, and one checksum
+            // over the whole object. That path covers every size up to S3's
+            // 5 GiB per-request ceiling, and a payload above it is refused
+            // loudly.
             if self.upload_integrity.is_enabled() && data.len() as u64 > SINGLE_PUT_MAX_BYTES {
                 return Err(StoreError::Permanent(format!(
                     "put of {key}: {} bytes exceeds the {SINGLE_PUT_MAX_BYTES}-byte single-PUT \
@@ -2951,6 +2963,230 @@ mod tests {
             1,
             "a disarmed guard must not count on drop"
         );
+    }
+
+    /// What the fake endpoint below recorded off real HTTP requests for one
+    /// multipart upload: the checksum algorithm `CreateMultipartUpload`
+    /// carried, each `UploadPart`'s checksum header value (in part order,
+    /// `None` where absent), and the raw `CompleteMultipartUpload` request
+    /// body.
+    #[derive(Default)]
+    struct MultipartCapture {
+        create_checksum_algorithm: Option<String>,
+        part_checksums: Vec<Option<String>>,
+        complete_body: Option<String>,
+    }
+
+    #[derive(Clone)]
+    struct MultipartCaptureState {
+        capture: Arc<parking_lot::Mutex<MultipartCapture>>,
+    }
+
+    /// Answers the three explicit multipart requests `object_store` issues,
+    /// distinguished by method and query string (S3 has no other signal: all
+    /// three share one path). `UploadPart` echoes back whatever
+    /// `x-amz-checksum-crc64nvme` it received as a response header, because
+    /// `object_store` reads a part's checksum off the *response*, not off what
+    /// it sent, to build `CompleteMultipartUpload`'s per-part checksum --- a
+    /// fake that does not echo it would make every Complete-body assertion a
+    /// false negative unrelated to whether the client sent anything.
+    async fn multipart_capture_handler(
+        axum::extract::State(state): axum::extract::State<MultipartCaptureState>,
+        method: axum::http::Method,
+        uri: axum::http::Uri,
+        headers: axum::http::HeaderMap,
+        body: Bytes,
+    ) -> axum::response::Response {
+        let query = uri.query().unwrap_or("");
+        let header = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+
+        if method == axum::http::Method::PUT && query.contains("partNumber") {
+            let part_checksum = header("x-amz-checksum-crc64nvme");
+            state
+                .capture
+                .lock()
+                .part_checksums
+                .push(part_checksum.clone());
+            let mut response = axum::response::Response::builder()
+                .status(axum::http::StatusCode::OK)
+                .header("etag", "\"fake-part-etag\"");
+            if let Some(sum) = &part_checksum {
+                response = response.header("x-amz-checksum-crc64nvme", sum.as_str());
+            }
+            return response.body(axum::body::Body::empty()).expect("response");
+        }
+
+        if method == axum::http::Method::POST && query.contains("uploads") {
+            state.capture.lock().create_checksum_algorithm = header("x-amz-checksum-algorithm");
+            let xml = "<InitiateMultipartUploadResult><UploadId>fake-upload-id</UploadId>\
+                       </InitiateMultipartUploadResult>";
+            return axum::response::Response::builder()
+                .status(axum::http::StatusCode::OK)
+                .body(axum::body::Body::from(xml))
+                .expect("response");
+        }
+
+        if method == axum::http::Method::POST && query.contains("uploadId") {
+            state.capture.lock().complete_body = Some(String::from_utf8_lossy(&body).into_owned());
+            let xml = "<CompleteMultipartUploadResult><ETag>\"fake-complete-etag\"</ETag>\
+                       </CompleteMultipartUploadResult>";
+            return axum::response::Response::builder()
+                .status(axum::http::StatusCode::OK)
+                .body(axum::body::Body::from(xml))
+                .expect("response");
+        }
+
+        // AbortMultipartUpload (DELETE) or anything unrecognized: succeed
+        // emptily, since neither test below drives an abort.
+        axum::response::Response::builder()
+            .status(axum::http::StatusCode::NO_CONTENT)
+            .body(axum::body::Body::empty())
+            .expect("response")
+    }
+
+    /// Stand up the fake multipart endpoint, returning its base URL and the
+    /// capture handle.
+    async fn spawn_multipart_capture() -> (String, Arc<parking_lot::Mutex<MultipartCapture>>) {
+        use axum::Router;
+        use axum::routing::any;
+
+        let capture = Arc::new(parking_lot::Mutex::new(MultipartCapture::default()));
+        let state = MultipartCaptureState {
+            capture: Arc::clone(&capture),
+        };
+        let app = Router::new()
+            .route("/", any(multipart_capture_handler))
+            .route("/{*rest}", any(multipart_capture_handler))
+            .layer(axum::extract::DefaultBodyLimit::disable())
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (endpoint, capture)
+    }
+
+    /// With upload integrity on, the explicit `put_multipart` path sends a
+    /// server-verified checksum on every part request, not only the first ---
+    /// the wrong implementation this rules out is a harness assertion that
+    /// only checks the first part, which would pass even if `object_store`
+    /// sent a checksum on part 1 and silently dropped it afterward (e.g. by
+    /// reusing a stale request builder). It also records whether
+    /// `CompleteMultipartUpload`'s body carries a per-part checksum, which
+    /// `object_store` only includes when `UploadPart`'s response echoes the
+    /// checksum back (see `multipart_capture_handler`): with the echo in
+    /// place, it does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multipart_parts_carry_checksums_under_integrity() {
+        let (endpoint, capture) = spawn_multipart_capture().await;
+        let store = S3Store::with_http_config(
+            S3Config {
+                endpoint: Some(endpoint),
+                ..test_config()
+            },
+            S3HttpConfig {
+                upload_integrity: UploadIntegrity::Crc64Nvme,
+                ..S3HttpConfig::default()
+            },
+        )
+        .expect("store builds with integrity on");
+
+        let mut upload = store
+            .put_multipart("checksum-key")
+            .await
+            .expect("initiate multipart");
+        let full_part = Bytes::from(vec![0u8; crate::MULTIPART_MIN_PART_SIZE]);
+        upload
+            .put_part(full_part.clone(), None)
+            .await
+            .expect("part 1");
+        upload.put_part(full_part, None).await.expect("part 2");
+        upload
+            .put_part(Bytes::from_static(b"final small part"), None)
+            .await
+            .expect("part 3 (final, under the minimum)");
+        upload.complete().await.expect("complete");
+
+        let captured = capture.lock();
+        assert_eq!(
+            captured.create_checksum_algorithm.as_deref(),
+            Some("CRC64NVME"),
+            "CreateMultipartUpload must carry the checksum algorithm under integrity"
+        );
+        assert_eq!(
+            captured.part_checksums.len(),
+            3,
+            "all 3 parts must have reached the fake endpoint"
+        );
+        for (index, checksum) in captured.part_checksums.iter().enumerate() {
+            assert!(
+                checksum.is_some(),
+                "part {index} (0-based) must carry x-amz-checksum-crc64nvme, not only part 0"
+            );
+        }
+        assert!(
+            captured
+                .complete_body
+                .as_deref()
+                .expect("complete body captured")
+                .contains("ChecksumCRC64NVME"),
+            "CompleteMultipartUpload must carry a per-part checksum when UploadPart's \
+             response echoed one back, got: {:?}",
+            captured.complete_body
+        );
+    }
+
+    /// With upload integrity off (the default), the explicit `put_multipart`
+    /// path sends no checksum header on any request: the client-wide
+    /// `object_store` checksum algorithm is simply unset.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multipart_parts_carry_no_checksums_with_integrity_off() {
+        let (endpoint, capture) = spawn_multipart_capture().await;
+        let store = S3Store::with_http_config(
+            S3Config {
+                endpoint: Some(endpoint),
+                ..test_config()
+            },
+            S3HttpConfig::default(),
+        )
+        .expect("store builds with default (off) integrity");
+
+        let mut upload = store
+            .put_multipart("no-checksum-key")
+            .await
+            .expect("initiate multipart");
+        let full_part = Bytes::from(vec![0u8; crate::MULTIPART_MIN_PART_SIZE]);
+        upload
+            .put_part(full_part.clone(), None)
+            .await
+            .expect("part 1");
+        upload.put_part(full_part, None).await.expect("part 2");
+        upload
+            .put_part(Bytes::from_static(b"final small part"), None)
+            .await
+            .expect("part 3 (final, under the minimum)");
+        upload.complete().await.expect("complete");
+
+        let captured = capture.lock();
+        assert_eq!(
+            captured.create_checksum_algorithm, None,
+            "CreateMultipartUpload must carry no checksum algorithm with integrity off"
+        );
+        assert_eq!(captured.part_checksums.len(), 3);
+        for (index, checksum) in captured.part_checksums.iter().enumerate() {
+            assert!(
+                checksum.is_none(),
+                "part {index} (0-based) must carry no checksum header with integrity off"
+            );
+        }
     }
 
     /// Issue #1911, at the one decision every binary routes through. An
