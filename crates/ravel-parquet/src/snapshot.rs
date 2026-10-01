@@ -588,8 +588,8 @@ mod tests {
     use std::task::Poll;
 
     use async_trait::async_trait;
-    use datafusion::arrow::array::{ArrayRef, Int64Array};
-    use datafusion::arrow::datatypes::{DataType, Field};
+    use datafusion::arrow::array::{ArrayRef, DictionaryArray, Int64Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Int32Type};
     use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{
@@ -1322,6 +1322,65 @@ mod tests {
         let got = snapshot(&store, "s3://lake/data/").await.expect("snapshot");
         assert_eq!(got.files.len(), 2);
         assert!(got.schema.field(0).metadata().is_empty());
+    }
+
+    /// The physical Parquet schema the writer emits for `bytes`, rendered by
+    /// `parquet`'s own schema printer: name, physical type, logical type and
+    /// repetition for every column, nothing else (key-value metadata,
+    /// including `ARROW:schema`, lives outside this tree).
+    fn physical_schema(bytes: &[u8]) -> String {
+        let footer_end = bytes.len() - TRAILER_LEN as usize;
+        let data_end = footer_end - footer_len_of(bytes) as usize;
+        let metadata = parquet::file::metadata::ParquetMetaDataReader::decode_metadata(
+            &bytes[data_end..footer_end],
+        )
+        .expect("footer");
+        let mut out = Vec::new();
+        parquet::schema::printer::print_schema(&mut out, metadata.file_metadata().schema());
+        String::from_utf8(out).expect("printer writes utf8")
+    }
+
+    /// Two files whose physical Parquet schema elements agree exactly --
+    /// proven below by rendering both with `parquet`'s own schema printer --
+    /// but whose embedded `ARROW:schema` hint resolves column `b`
+    /// differently: plain `Utf8` on one file, `Dictionary(Int32, Utf8)` on
+    /// the other. Parquet has no physical representation for an Arrow
+    /// dictionary, so the writer encodes both columns identically and only
+    /// the hint carries the difference. `file_schema` resolves the hint, so
+    /// the two files still refuse as a mismatch. Mutation that fails it:
+    /// comparing the raw physical schema instead of `file_schema`'s resolved
+    /// `Schema`, which would let the two files through as sharing a schema.
+    #[tokio::test]
+    async fn an_arrow_schema_hint_divergence_with_identical_physical_schema_refuses() {
+        let store = MemoryStore::new();
+        let plain = Arc::new(Schema::new(vec![Field::new("b", DataType::Utf8, false)]));
+        let dictionary = Arc::new(Schema::new(vec![Field::new(
+            "b",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            false,
+        )]));
+        let plain_bytes = write(
+            plain,
+            vec![Arc::new(StringArray::from(vec!["x"])) as ArrayRef],
+        );
+        let dictionary_bytes = write(
+            dictionary,
+            vec![Arc::new(DictionaryArray::<Int32Type>::from_iter(vec!["x"])) as ArrayRef],
+        );
+        assert_eq!(
+            physical_schema(&plain_bytes),
+            physical_schema(&dictionary_bytes),
+            "the two files' physical Parquet schemas must agree for this test to prove anything"
+        );
+        put(&store, "data/a.parquet", plain_bytes).await;
+        put(&store, "data/b.parquet", dictionary_bytes).await;
+        match snapshot(&store, "s3://lake/data/").await {
+            Err(SnapshotError::SchemaMismatch { key, first }) => {
+                assert_eq!(key, "data/b.parquet");
+                assert_eq!(first, "data/a.parquet");
+            }
+            other => panic!("expected SchemaMismatch, got {other:?}"),
+        }
     }
 
     /// The listing reports an ETag spelled differently, a size one byte
