@@ -339,8 +339,8 @@ fn clustering_key_lines(
         ClusteringKeyState::Cleared { generation } => writeln!(
             out,
             "tenant {tenant} has no clustering key at generation {generation} (cleared, or \
-             never set and given a generation by a bloom scope change or by a declared column \
-             change under the undeclared scope)"
+             never set and given a generation by a bloom scope change or by a typed attribute \
+             column change under the undeclared scope)"
         )?,
         ClusteringKeyState::Set(key) => {
             writeln!(
