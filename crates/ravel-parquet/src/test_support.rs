@@ -597,14 +597,6 @@ pub(crate) struct RecordingStore {
     ranges: Mutex<Vec<GetRange>>,
     /// Pinned reads left until the one returned short; 0 when none is.
     short_in: AtomicUsize,
-    /// Set by [`Self::pause_next_get_pinned`]; taken and consumed by the next
-    /// `get_pinned` call.
-    gate: Mutex<
-        Option<(
-            tokio::sync::oneshot::Sender<()>,
-            tokio::sync::oneshot::Receiver<()>,
-        )>,
-    >,
 }
 
 impl RecordingStore {
@@ -614,26 +606,7 @@ impl RecordingStore {
             suffix_range,
             ranges: Mutex::new(Vec::new()),
             short_in: AtomicUsize::new(0),
-            gate: Mutex::new(None),
         }
-    }
-
-    /// Pause the next `get_pinned` call after it has been recorded: it sends
-    /// on the returned receiver's paired sender once it has begun, then
-    /// blocks until the returned sender's paired receiver fires. Lets a test
-    /// hold a single-flight leader inside its GET while concurrent followers
-    /// join, proving a collapse at the store boundary rather than only
-    /// inside the cache crate.
-    pub(crate) fn pause_next_get_pinned(
-        &self,
-    ) -> (
-        tokio::sync::oneshot::Receiver<()>,
-        tokio::sync::oneshot::Sender<()>,
-    ) {
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        *self.gate.lock().unwrap_or_else(PoisonError::into_inner) = Some((entered_tx, release_rx));
-        (entered_rx, release_tx)
     }
 
     /// Return the next pinned read one byte short, as a store dropping the
@@ -685,15 +658,6 @@ impl ObjectStoreBackend for RecordingStore {
         pin: &Pin,
     ) -> Result<PinnedRead, StoreError> {
         self.record(&range);
-        let gate = self
-            .gate
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some((entered_tx, release_rx)) = gate {
-            let _ = entered_tx.send(());
-            let _ = release_rx.await;
-        }
         let mut read = self.inner.get_pinned(key, range, pin).await?;
         let left = self
             .short_in
