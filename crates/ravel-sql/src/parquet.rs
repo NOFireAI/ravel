@@ -40,7 +40,7 @@ use ravel_parquet::{
     ReadServices, TenantParquetStore,
 };
 use ravel_pqtable::grants::{self, GrantsError};
-use ravel_pqtable::manifest::Manifest;
+use ravel_pqtable::manifest::{Manifest, ManifestError};
 use ravel_pqtable::names::validate_table;
 use ravel_pqtable::resolve::{self, ResolveError};
 use ravel_query::{GetLimiter, PhaseAccounting, ReadCache};
@@ -566,7 +566,8 @@ pub enum ParquetQueryError {
 impl ParquetQueryError {
     /// The client-visible class: 400 for a request this surface cannot take,
     /// 422 for a refusal or a permanent state a retry cannot change, 503 for
-    /// a transient storage fault, 500 for an integrity fault or a store read
+    /// a transient storage fault or a manifest or grants record above the
+    /// version ceiling, 500 for an integrity fault or a store read
     /// that failed its checksum. It agrees with `client_message`: a variant
     /// answered `MSG_CORRUPT` there is `Internal` here.
     pub(crate) fn class(&self) -> ErrorClass {
@@ -623,6 +624,15 @@ impl ParquetQueryError {
             }
             | ParquetQueryError::Grants(GrantsError::Store { .. })
             | ParquetQueryError::PinnedManifestGone { .. } => ErrorClass::Unavailable,
+            // A record above the version ceiling is not corrupt: a peer on a
+            // newer build reads it (ADR-0066 decision 2). Below the floor is.
+            ParquetQueryError::Resolve {
+                source: ResolveError::Manifest(ManifestError::UnsupportedVersion { .. }),
+                ..
+            }
+            | ParquetQueryError::Grants(GrantsError::UnsupportedVersion { .. }) => {
+                ErrorClass::Unavailable
+            }
             // Every other manifest or grants fault is answered MSG_CORRUPT by
             // `client_message`, so it is corrupt here too.
             ParquetQueryError::Resolve { .. } | ParquetQueryError::Grants(_) => {
@@ -706,6 +716,13 @@ impl ParquetQueryError {
             }
             | ParquetQueryError::Grants(GrantsError::Store { .. }) => MSG_UNAVAILABLE.to_string(),
             ParquetQueryError::PinnedManifestGone { .. } => MSG_UNAVAILABLE.to_string(),
+            ParquetQueryError::Resolve {
+                source: ResolveError::Manifest(ManifestError::UnsupportedVersion { .. }),
+                ..
+            }
+            | ParquetQueryError::Grants(GrantsError::UnsupportedVersion { .. }) => {
+                MSG_UNAVAILABLE.to_string()
+            }
             ParquetQueryError::Resolve { .. } | ParquetQueryError::Grants(_) => {
                 MSG_CORRUPT.to_string()
             }
@@ -1226,6 +1243,138 @@ mod tests {
             let err = crate::SqlError::from(build(transient()));
             assert_eq!(err.client_message(), MSG_UNAVAILABLE, "{name}");
             assert_eq!(err.class(), ErrorClass::Unavailable, "{name}");
+        }
+    }
+
+    /// ADR-0066 decision 2: a manifest or grants record above the version
+    /// ceiling this build reads is retryable (503), since a peer on a newer
+    /// build can read it; one below the floor, a corrupt data file and every
+    /// other resolve or grants fault is corrupt (500). Each case is checked
+    /// in its own `class()` and `client_message()` and through the `SqlError`
+    /// the server maps to a status.
+    ///
+    /// FLIP: drop the `ResolveError::Manifest(ManifestError::UnsupportedVersion
+    /// { .. })` pattern from the retryable version arm of `class()` and the
+    /// manifest above-ceiling case fails with `left: (Internal, "upstream
+    /// storage temporarily unavailable")`.
+    #[test]
+    fn a_version_above_the_ceiling_is_retryable_and_below_the_floor_is_corrupt() {
+        fn resolve(source: ResolveError) -> ParquetQueryError {
+            ParquetQueryError::Resolve {
+                table: "t".to_string(),
+                source,
+            }
+        }
+        fn corrupt_read() -> ParquetReadError {
+            ParquetReadError::Corrupt {
+                key: "lake/part-0.parquet".to_string(),
+                message: "raw-decoder-detail".to_string(),
+            }
+        }
+        let cases: Vec<(&str, fn() -> ParquetQueryError, ErrorClass, &str)> = vec![
+            (
+                "manifest above ceiling",
+                || {
+                    resolve(ResolveError::Manifest(ManifestError::UnsupportedVersion {
+                        key: "manifest-key".to_string(),
+                        got: 9,
+                        ceiling: 1,
+                    }))
+                },
+                ErrorClass::Unavailable,
+                MSG_UNAVAILABLE,
+            ),
+            (
+                "grants above ceiling",
+                || {
+                    ParquetQueryError::Grants(GrantsError::UnsupportedVersion {
+                        key: "grants-key".to_string(),
+                        got: 9,
+                        ceiling: 1,
+                    })
+                },
+                ErrorClass::Unavailable,
+                MSG_UNAVAILABLE,
+            ),
+            (
+                "manifest below floor",
+                || {
+                    resolve(ResolveError::Manifest(ManifestError::VersionBelowFloor {
+                        key: "manifest-key".to_string(),
+                        got: 0,
+                        floor: 1,
+                    }))
+                },
+                ErrorClass::Internal,
+                MSG_CORRUPT,
+            ),
+            (
+                "grants below floor",
+                || {
+                    ParquetQueryError::Grants(GrantsError::VersionBelowFloor {
+                        key: "grants-key".to_string(),
+                        got: 0,
+                        floor: 1,
+                    })
+                },
+                ErrorClass::Internal,
+                MSG_CORRUPT,
+            ),
+            (
+                "corrupt data read",
+                || ParquetQueryError::Read(corrupt_read()),
+                ErrorClass::Internal,
+                MSG_CORRUPT,
+            ),
+            (
+                "corrupt table build read",
+                || {
+                    ParquetQueryError::Table(ParquetTableError::Read {
+                        table: "t".to_string(),
+                        source: corrupt_read(),
+                    })
+                },
+                ErrorClass::Internal,
+                MSG_CORRUPT,
+            ),
+            (
+                "resolve foreign key",
+                || {
+                    resolve(ResolveError::ForeignKey {
+                        key: "foreign-key".to_string(),
+                        prefix: "prefix".to_string(),
+                        reason: "raw-key-detail".to_string(),
+                    })
+                },
+                ErrorClass::Internal,
+                MSG_CORRUPT,
+            ),
+            (
+                "grants decode",
+                || {
+                    ParquetQueryError::Grants(GrantsError::Decode {
+                        key: "grants-key".to_string(),
+                        source: prost::encoding::decode_varint(&mut &[0x80u8][..])
+                            .expect_err("a truncated varint"),
+                    })
+                },
+                ErrorClass::Internal,
+                MSG_CORRUPT,
+            ),
+        ];
+        for (name, build, class, message) in cases {
+            let err = build();
+            assert_eq!(
+                (err.class(), err.client_message().as_str()),
+                (class, message),
+                "{name}"
+            );
+            let err = crate::SqlError::from(build());
+            assert_eq!(
+                (err.class(), err.client_message().as_str()),
+                (class, message),
+                "{name}"
+            );
         }
     }
 
