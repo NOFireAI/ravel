@@ -107,6 +107,53 @@ pub enum ErasureError {
     Decode(#[from] prost::DecodeError),
 }
 
+impl ErasureError {
+    /// True when the record carries a format version above the highest this
+    /// build reads: a peer on a newer build can read it during a rolling
+    /// upgrade, so a query surface answers it as retryable. A version below
+    /// the supported one (proto3's default 0, an unstamped field) is false,
+    /// like every other variant: it is a fault in immutable stored bytes that
+    /// no build reads.
+    ///
+    /// An unknown signal is false for every value. Requests and rewrite
+    /// records are read only under their own signal's key prefix and checked
+    /// against it, and a newer build writes a new signal under a prefix this
+    /// build never lists, so an unknown signal read here is a record that
+    /// disagrees with its own key. An unknown deferral cause is false too: it
+    /// comes only from a completion record, which no query route decodes.
+    ///
+    /// Every variant is named, so a new one fails to compile until it is
+    /// classified here.
+    pub fn is_newer_format_version(&self) -> bool {
+        match self {
+            ErasureError::UnsupportedFormatVersion { expected, actual } => actual > expected,
+
+            ErasureError::UnknownSignal(_)
+            | ErasureError::UnknownDeferralCause(_)
+            | ErasureError::InvalidTenantHashLen(_)
+            | ErasureError::InvalidRequestId(_)
+            | ErasureError::EmptyPredicate
+            | ErasureError::EmptyPredicateMatcherKey
+            | ErasureError::WindowOutOfOrder { .. }
+            | ErasureError::InvalidPredicateHashLen(_)
+            | ErasureError::TimestampsOutOfOrder { .. }
+            | ErasureError::InvalidInputSetHashLen(_)
+            | ErasureError::BothInputsAndSuperseded
+            | ErasureError::NeitherInputsNorSuperseded
+            | ErasureError::InputSetHashMismatch
+            | ErasureError::InvalidSupersededRecordKey(_)
+            | ErasureError::NonCanonicalSupersededRecordKey(_)
+            | ErasureError::SupersededRecordKeyBucketMismatch { .. }
+            | ErasureError::DuplicateAppliedRequestId(_)
+            | ErasureError::InputsNotSorted { .. }
+            | ErasureError::BucketDropSignalMismatch { .. }
+            | ErasureError::EmptyDrops
+            | ErasureError::InvalidPartContentHashLen(_)
+            | ErasureError::Decode(_) => false,
+        }
+    }
+}
+
 fn check_tenant_hash(bytes: &[u8]) -> Result<(), ErasureError> {
     if bytes.len() == 16 {
         Ok(())
@@ -1565,5 +1612,50 @@ mod tests {
 
     fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// Only a format version above the supported one is newer. A version of
+    /// 0 (an unstamped field) is not, and neither is any unknown signal or
+    /// deferral cause, including one above the highest value this build
+    /// knows.
+    #[test]
+    fn only_a_format_version_above_the_supported_one_is_newer() {
+        let above_max_signal = ravel_proto::commit::v1::Signal::Audit as i32 + 1;
+        let above_max_cause = ErasureDeferralCause::LegalHold as i32 + 1;
+        assert_eq!(
+            check_signal(above_max_signal),
+            Err(ErasureError::UnknownSignal(above_max_signal))
+        );
+        assert_eq!(
+            validate_completion(&ErasureCompletion {
+                deferral_cause: above_max_cause,
+                ..valid_completion()
+            }),
+            Err(ErasureError::UnknownDeferralCause(above_max_cause))
+        );
+
+        assert!(
+            ErasureError::UnsupportedFormatVersion {
+                expected: FORMAT_VERSION,
+                actual: FORMAT_VERSION + 1,
+            }
+            .is_newer_format_version()
+        );
+
+        let not_newer = [
+            ErasureError::UnsupportedFormatVersion {
+                expected: FORMAT_VERSION,
+                actual: 0,
+            },
+            ErasureError::UnknownSignal(above_max_signal),
+            ErasureError::UnknownSignal(0),
+            ErasureError::UnknownSignal(-1),
+            ErasureError::UnknownDeferralCause(above_max_cause),
+            ErasureError::UnknownDeferralCause(-1),
+            ErasureError::InvalidTenantHashLen(3),
+        ];
+        for err in &not_newer {
+            assert!(!err.is_newer_format_version(), "{err:?}");
+        }
     }
 }
