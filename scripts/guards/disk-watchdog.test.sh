@@ -37,6 +37,49 @@ check_contains() {
   fi
 }
 
+# How long a wait below polls before giving up. Generous, because a loaded CI
+# runner can take seconds to fork the watchdog and finish its first scan. The
+# override exists so the give-up path can be exercised; nothing else reads it.
+POLL_DEADLINE_S="${DISK_WATCHDOG_TEST_POLL_DEADLINE_S:-60}"
+
+# poll_until <pid-or-empty> <command...>: reruns the command until it succeeds
+# or POLL_DEADLINE_S passes. When a pid is given and that process exits, it
+# checks once more and stops, so a watchdog that died without doing the thing
+# fails at once instead of after the deadline.
+poll_until() {
+  local watch="$1" start="${SECONDS}"
+  shift
+  while :; do
+    "$@" && return 0
+    if [[ -n "${watch}" ]] && ! kill -0 "${watch}" 2>/dev/null; then
+      "$@"
+      return
+    fi
+    (( SECONDS - start >= POLL_DEADLINE_S )) && return 1
+    sleep 0.1
+  done
+}
+
+file_has() { grep -qF -- "$2" "$1" 2>/dev/null; }
+is_present() { [[ -e "$1" ]]; }
+is_absent() { [[ ! -e "$1" ]]; }
+is_dead() { ! kill -0 "$1" 2>/dev/null; }
+runs_as() {
+  local comm
+  comm="$(ps -o comm= -p "$1" 2>/dev/null)" || return 1
+  comm="${comm//[[:space:]]/}"
+  [[ "${comm##*/}" == "$2" ]]
+}
+
+# A fixture is matchable only once its exec has landed: until then `ps comm`
+# names the subshell, and a scan in that window misses it.
+wait_runs_as() {
+  local pid="$1" name="$2"
+  poll_until "${pid}" runs_as "${pid}" "${name}" && return 0
+  printf 'FAIL  fixture %s never ran as %s within %ss\n' "${pid}" "${name}" "${POLL_DEADLINE_S}"
+  fails=$((fails + 1))
+}
+
 TMP="$(mktemp -d)"
 trap 'rm -rf "${TMP}"' EXIT
 
@@ -75,15 +118,16 @@ check_contains "no scope argument: says what it wanted" "usage" "${out}"
 # directory with no builds under it. It must report finding nothing rather
 # than fall back to matching by name.
 pid_a="$(start_fake_build)"
-sleep 1
+wait_runs_as "${pid_a}" cargo
 mkdir -p "${TMP}/no-builds-here"
 # Backgrounded, because below the floor with nothing of ours running the
 # watchdog keeps sampling rather than exiting; see the no-disarm case below
 # for why. A foreground run here would hang the suite.
 "${WATCHDOG}" "${TMP}/no-builds-here" 999999 1000000 1 >"${TMP}/oos.out" 2>&1 &
 pid_oos=$!
-sleep 3
+poll_until "${pid_oos}" file_has "${TMP}/oos.out" "no cargo/rustc under"
 kill -KILL "${pid_oos}" 2>/dev/null || true
+wait "${pid_oos}" 2>/dev/null || true
 check_contains "out of scope: reports no build under that path" "no cargo/rustc under" \
   "$(cat "${TMP}/oos.out" 2>/dev/null)"
 check_eq "out of scope: the build outside it is untouched" "alive" \
@@ -126,7 +170,7 @@ check_eq "dry run: writes no marker" "absent" \
 echo "fired_at=1999-01-01T00:00:00Z" > "${SCOPE}/.disk-watchdog-fired"
 "${WATCHDOG}" "${SCOPE}" 0 0 1 >/dev/null 2>&1 &
 arm_pid=$!
-sleep 1
+poll_until "${arm_pid}" is_absent "${SCOPE}/.disk-watchdog-fired"
 check_eq "arming clears a marker from an earlier firing" "absent" \
   "$([[ -e "${SCOPE}/.disk-watchdog-fired" ]] && echo present || echo absent)"
 kill "${arm_pid}" 2>/dev/null || true
@@ -146,7 +190,9 @@ rm -f "${SCOPE}/.disk-watchdog-fired"
 
 # --- firing kills the scoped build and leaves the marker ------------------
 out="$("${WATCHDOG}" "${SCOPE}" 999999 1000000 1 2>&1)"
-sleep 1
+# pid_a was started inside a command substitution, so init reaps it, on its
+# own schedule; until then kill -0 still sees the zombie.
+poll_until "" is_dead "${pid_a}"
 check_eq "firing: the scoped process is dead" "dead" \
   "$(kill -0 "${pid_a}" 2>/dev/null && echo alive || echo dead)"
 check_eq "firing: writes the marker" "present" \
@@ -174,7 +220,7 @@ ln -s /bin/sh "${SIB}/bin/cargo"
 ( cd "${SIB}" && exec "${SIB}/bin/cargo" -c 'while :; do sleep 1; done' ) \
   >/dev/null 2>&1 &
 pid_sibling=$!
-sleep 1
+wait_runs_as "${pid_sibling}" cargo
 out="$(WATCHDOG_DRY_RUN=1 "${WATCHDOG}" "${SCOPE}" 999999 1000000 1 2>&1)"
 check_eq "a name-prefix sibling of the scope is not matched" "0" \
   "$(printf '%s' "${out}" | grep -c "${pid_sibling}")"
@@ -191,7 +237,7 @@ mkdir -p "${SUB}"
 ( cd "${SUB}" && exec "${SCOPE}/bin/cargo" -c 'while :; do sleep 1; done' ) \
   >/dev/null 2>&1 &
 pid_sub=$!
-sleep 1
+wait_runs_as "${pid_sub}" cargo
 out="$(WATCHDOG_DRY_RUN=1 "${WATCHDOG}" "${SCOPE}" 999999 1000000 1 2>&1)"
 check_eq "a build in a subdirectory of the scope is matched" "1" \
   "$(printf '%s' "${out}" | grep -c "${pid_sub}")"
@@ -207,12 +253,17 @@ kill -KILL "${pid_sub}" 2>/dev/null || true
 mkdir -p "${TMP}/empty-scope"
 "${WATCHDOG}" "${TMP}/empty-scope" 999999 1000000 1 >"${TMP}/starve.out" 2>&1 &
 pid_wd=$!
-sleep 3
+poll_until "${pid_wd}" file_has "${TMP}/starve.out" "still watching"
+# The line is printed just before the next sample, so a watchdog that exits
+# there is still alive at that instant. Outliving two more 1 s samples is
+# what shows it did not disarm; a slow box can only lengthen this, not fail it.
+sleep 2
 check_eq "below the floor with nothing of ours: still running" "alive" \
   "$(kill -0 "${pid_wd}" 2>/dev/null && echo alive || echo dead)"
 check_contains "below the floor with nothing of ours: says it is still watching" \
   "still watching" "$(cat "${TMP}/starve.out" 2>/dev/null)"
 kill -KILL "${pid_wd}" 2>/dev/null || true
+wait "${pid_wd}" 2>/dev/null || true
 
 # --- a build outside the scope survives a real firing ---------------------
 #
@@ -225,9 +276,10 @@ ln -s /bin/sh "${OTHER}/bin/cargo"
   >/dev/null 2>&1 &
 pid_other=$!
 pid_b="$(start_fake_build)"
-sleep 1
+wait_runs_as "${pid_other}" cargo
+wait_runs_as "${pid_b}" cargo
 "${WATCHDOG}" "${SCOPE}" 999999 1000000 1 >/dev/null 2>&1
-sleep 1
+poll_until "" is_dead "${pid_b}"
 check_eq "firing: kills the build inside the scope" "dead" \
   "$(kill -0 "${pid_b}" 2>/dev/null && echo alive || echo dead)"
 check_eq "firing: leaves another session's build alone" "alive" \
@@ -242,7 +294,7 @@ kill -KILL "${pid_other}" 2>/dev/null || true
 # returned, and no case saw it because every dry-run case above passes an
 # impossible floor. Default floor here, real free space.
 pid_dry="$(start_fake_build)"
-sleep 1
+wait_runs_as "${pid_dry}" cargo
 dry_out=""
 if dry_out="$(WATCHDOG_DRY_RUN=1 timeout 10 "${WATCHDOG}" "${SCOPE}" 2>&1)"; then dry_rc=0; else dry_rc=$?; fi
 check_eq "dry run above the floor returns instead of looping" "0" "${dry_rc}"
@@ -274,11 +326,14 @@ mkdir -p "${ORD}/bin"
 ln -s /bin/sh "${ORD}/bin/cargo"
 ORD_MARKER="${ORD}/.disk-watchdog-fired"
 ORD_SEEN="${ORD}/seen"
+ORD_READY="${TMP}/ordering.ready"
 : > "${ORD_SEEN}"
-( cd "${ORD}" && exec "${ORD}/bin/cargo" -c "trap '' TERM; while :; do if [ -e '${ORD_MARKER}' ]; then echo yes >> '${ORD_SEEN}'; fi; sleep 1; done" ) \
+# The ready file is written after the trap, since a TERM that lands before it
+# kills the victim outright and it never looks for the marker.
+( cd "${ORD}" && exec "${ORD}/bin/cargo" -c "trap '' TERM; : > '${ORD_READY}'; while :; do if [ -e '${ORD_MARKER}' ]; then echo yes >> '${ORD_SEEN}'; fi; sleep 1; done" ) \
   >/dev/null 2>&1 &
 pid_ord=$!
-sleep 1
+poll_until "${pid_ord}" is_present "${ORD_READY}"
 "${WATCHDOG}" "${ORD}" 999999 1000000 1 >/dev/null 2>&1
 check_eq "the marker exists while the build is still alive" "yes" \
   "$(head -1 "${ORD_SEEN}" 2>/dev/null)"
@@ -298,9 +353,10 @@ for tool in cc ld collect2 rust-lld clang clang++; do
   ln -s /bin/sh "${LINKERS}/bin/${tool}"
   ( cd "${LINKERS}" && exec "${LINKERS}/bin/${tool}" -c 'while :; do sleep 1; done' ) \
     >/dev/null 2>&1 &
-  eval "pid_${tool//[!a-z0-9]/_}=$!"
+  tool_pid=$!
+  eval "pid_${tool//[!a-z0-9]/_}=${tool_pid}"
+  wait_runs_as "${tool_pid}" "${tool}"
 done
-sleep 1
 link_out="$(WATCHDOG_DRY_RUN=1 timeout 10 "${WATCHDOG}" "${LINKERS}" 2>&1)"
 for tool in cc ld collect2 rust-lld clang clang++; do
   eval "tool_pid=\${pid_${tool//[!a-z0-9]/_}}"
@@ -328,14 +384,17 @@ on_term() {
   exit 0
 }
 trap on_term TERM
+: > "${RESCAN_READY}"
 while :; do sleep 1; done
 EOF
 RESCAN_CHILD="${RESCAN}/child.pid"
+RESCAN_READY="${TMP}/rescan.ready"
 : > "${RESCAN_CHILD}"
 ( cd "${RESCAN}" && RESCAN_BIN="${RESCAN}/bin" RESCAN_CHILD="${RESCAN_CHILD}" \
+    RESCAN_READY="${RESCAN_READY}" \
     exec "${RESCAN}/bin/cargo" "${RESCAN}/spawn-on-term.sh" ) >/dev/null 2>&1 &
 pid_rescan=$!
-sleep 1
+poll_until "${pid_rescan}" is_present "${RESCAN_READY}"
 rescan_out="$(timeout 60 "${WATCHDOG}" "${RESCAN}" 999999 1000000 1 2>&1)"; rescan_rc=$?
 child_pid="$(cat "${RESCAN_CHILD}" 2>/dev/null)"
 check_contains "the re-scan reports the child left behind" "still running under" "${rescan_out}"
