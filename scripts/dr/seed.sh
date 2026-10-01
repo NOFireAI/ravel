@@ -189,7 +189,7 @@ dr_export_s3_env "${DR_BUCKET_PRIMARY}"
 
 dr_log "ensuring bucket ${DR_BUCKET_PRIMARY} exists in region ${DR_REGION}"
 dr_ensure_bucket "${DR_BUCKET_PRIMARY}" || dr_die "${DR_EX_PRECONDITION}" \
-  "could not create bucket ${DR_BUCKET_PRIMARY} in region ${DR_REGION}"
+  "${DR_BUCKET_ERROR:-could not prepare bucket ${DR_BUCKET_PRIMARY} in region ${DR_REGION}}"
 
 existing="$(dr_list_all_versions "${DR_BUCKET_PRIMARY}")" || dr_die "${DR_EX_PRECONDITION}" \
   "could not list ${DR_BUCKET_PRIMARY}"
