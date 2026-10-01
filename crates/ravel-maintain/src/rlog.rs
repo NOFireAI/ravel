@@ -15,11 +15,28 @@
 //!   (a disagreement is an upstream bug or a hash collision, and a merge is the
 //!   first place it becomes visible across objects) -- a mismatch is a typed
 //!   [`MaintainError::StreamAttrsConflict`], never a silent pick;
-//! - re-sorts the merged record set by `(stream_ref, ts)` ascending, rebuilds
+//! - re-sorts the merged record set into the output's stored order, rebuilds
 //!   `FIELD_DIR` from the merged column set under the same 1000-dynamic-column
 //!   cap with overflow folded into `attrs_raw`, and rebuilds `SKIP_IDX`, the
 //!   per-block `BLOOM`s, and `POSTINGS` over the merged, re-blocked contents at
 //!   the same 8192 record block target.
+//!
+//! # Order under a sort descriptor (ADR-2135 decisions 2 and 5)
+//!
+//! The output takes the sort descriptor, clustering generation, and BLOOM
+//! coverage of the input with the highest clustering generation (the first such
+//! input in canonical order on a tie); with no keyed input it writes no
+//! descriptor and the highest generation, 0 when every input is unclustered.
+//! Compaction reads no tenant config: the descriptor and coverage come only from
+//! the input footers. The writer stores the output in `(stream_ref,
+//! ts.div_euclid(w), keys, ts)` order for the output descriptor's bucket width
+//! `w` and key columns, or `(stream_ref, ts)` without one, ties kept in push
+//! order. The merge pushes each stream's records ordered by `(ts.div_euclid(W),
+//! input_index)`, `W` the widest bucket width among the inputs' descriptors (1
+//! ns when none has one), each input's records in their stored order within a
+//! coarse bucket. The widths nest, so that push order is a stable sort of the
+//! inputs' slices by `(ts.div_euclid(W), input_index)`, and with no keyed input
+//! it is the `(ts, input_index)` order unkeyed compaction has always produced.
 //!
 //! # POSTINGS is rebuilt, never merged (ADR-0049 decision 6)
 //!
@@ -96,11 +113,11 @@
 //! materializes nothing; exactly one record is materialized per record
 //! emitted, through the same `rebuild_record` path the eager decode used, in
 //! the same order. Total decode and rebuild work is unchanged; only when a row
-//! is rebuilt moves. A record's `(stream_ref, ts)`
-//! stored order makes each input's stream one ts-ascending sequence spread
-//! across ascending blocks, so N inputs carrying the same stream are a standard
-//! k-way merge ordered by `ts_ns`, ties broken by canonical input order. That
-//! is byte-for-byte the ordering the old "gather everything then stable-sort by
+//! is rebuilt moves. Each input's stream is one sequence spread across
+//! ascending blocks that is non-decreasing in `ts.div_euclid(W)`, so N inputs
+//! carrying the same stream are a standard k-way merge ordered by that coarse
+//! bucket, ties broken by canonical input order. Without keyed inputs that is
+//! byte-for-byte the ordering the old "gather everything then stable-sort by
 //! `ts_ns`" produced, which matters because parts are content-addressed and any
 //! reordering would change every downstream hash. Merged records feed straight
 //! into the in-progress part's [`RlogWriter`]; there is no intermediate
@@ -198,7 +215,7 @@ use std::sync::Arc;
 use futures::stream::{StreamExt, TryStreamExt, iter as stream_iter};
 use ravel_commit::keys;
 use ravel_logseg::field_dir::FieldDir;
-use ravel_logseg::footer::{self, SuffixOutcome, kind};
+use ravel_logseg::footer::{self, COMP_NONE, SortDescriptor, SuffixOutcome, kind};
 use ravel_logseg::page_dir::PageDir;
 use ravel_logseg::postings::PostingsSection;
 use ravel_logseg::reader::MAX_BLOCKS;
@@ -207,8 +224,8 @@ use ravel_logseg::record::{
 };
 use ravel_logseg::skip_index::SkipIndex;
 use ravel_logseg::{
-    AttrValue, FieldType, LogRecord, LogStreamId, RlogConfig, RlogRangeReader, RlogWriter,
-    StreamBlockLoc, StreamBlockRows, decode_section, stream_attr_pairs,
+    AttrValue, BloomScope, FieldType, LogRecord, LogStreamId, RlogConfig, RlogRangeReader,
+    RlogWriter, StreamBlockLoc, StreamBlockRows, decode_section, stream_attr_pairs,
     writer::{ObjectIdentity, WriteStats},
 };
 use ravel_object_store::{GetRange, ObjectStoreBackend};
@@ -279,6 +296,20 @@ pub struct RlogInputCatalog {
     /// Never empty on a loaded catalog: an input with no PAGE_DIR is refused at
     /// load with [`MaintainError::MergeCursorInputMissingPageDir`].
     pub pricing: InputCursorPricing,
+    /// This input's footer sort descriptor and clustering generation (ADR-2135
+    /// decision 2), from the footer this load already read. The merge order's
+    /// coarse width and the output part's descriptor are derived from them
+    /// ([`OutputClustering::from_inputs`]).
+    pub sort_descriptor: Option<SortDescriptor>,
+    pub clustering_generation: u64,
+    /// This input's BLOOM section location. Only the input the output descriptor
+    /// is taken from has its covered-column list read, once per merge
+    /// ([`read_bloom_scope`]); no other BLOOM byte is fetched.
+    pub bloom_section: Option<footer::SectionDesc>,
+    /// This input's FIELD_DIR string (`FieldType::Str`) entries, the columns a
+    /// BLOOM covered list names, so the coverage maps to column names without
+    /// refetching FIELD_DIR.
+    pub string_fields: FieldDir,
 }
 
 /// The pre-decode admission pricing metadata of one input: the per-block shape
@@ -471,6 +502,19 @@ pub(crate) async fn load_catalog_from_object(
     // reader's own `from_sections_with_page_dir` below re-decodes and fully
     // validates the same bytes, so a corrupt directory still fails loud there.
     let pricing = input_cursor_pricing(&field_dir_raw, &skip_idx_raw, &page_dir_raw)?;
+    let string_fields = FieldDir::new(
+        FieldDir::decode(&field_dir_raw, MAX_FIELD_DIR_ENTRIES)?
+            .entries()
+            .iter()
+            .filter(|e| matches!(e.ty, FieldType::Str))
+            .cloned()
+            .collect(),
+    );
+    let string_field_bytes: u64 = string_fields
+        .entries()
+        .iter()
+        .map(|e| (e.name.len() + std::mem::size_of::<ravel_logseg::field_dir::FieldEntry>()) as u64)
+        .sum();
     // Input read / catalog load phase (issue #977): the reader below retains a
     // decoded form of these directory sections for the whole merge. Charge the
     // decoded section payload lengths (what `fetch_section` returns after
@@ -487,10 +531,15 @@ pub(crate) async fn load_catalog_from_object(
             + (pricing.block_rows.len() as u64)
                 .saturating_mul(std::mem::size_of::<u32>() as u64)
             + (pricing.block_string_uncomp_lens.len() as u64)
-                .saturating_mul(std::mem::size_of::<u64>() as u64);
+                .saturating_mul(std::mem::size_of::<u64>() as u64)
+            // The string FIELD_DIR entries kept for the output bloom scope.
+            + string_field_bytes;
         t.add_catalog_directory_bytes(dir_bytes);
     }
     let record_count = ftr.record_count;
+    let sort_descriptor = ftr.sort_descriptor.clone();
+    let clustering_generation = ftr.clustering_generation;
+    let bloom_section = ftr.section(kind::BLOOM).copied();
     let reader = RlogRangeReader::from_sections_with_page_dir(
         &ftr,
         &stream_dir_raw,
@@ -504,6 +553,10 @@ pub(crate) async fn load_catalog_from_object(
         indexed_fields,
         record_count,
         pricing,
+        sort_descriptor,
+        clustering_generation,
+        bloom_section,
+        string_fields,
     })
 }
 
@@ -671,7 +724,9 @@ fn block_decode_ceiling_bytes(pricing: &InputCursorPricing, block: usize) -> Res
 ///
 /// `buffered`, not `buffer_unordered`: the returned catalogs stay aligned
 /// one-to-one with `object_keys` in canonical order, which is the k-way
-/// merge's tie-break on equal `ts_ns` (see [`merge_stream_into_parts`]).
+/// merge's tie-break on an equal coarse bucket (see
+/// [`merge_stream_into_parts`]) and the output clustering's tie-break on an
+/// equal clustering generation.
 pub(crate) async fn load_catalogs_by_key(
     store: &dyn ObjectStoreBackend,
     config: &CompactorConfig,
@@ -693,6 +748,165 @@ pub(crate) async fn load_catalogs_by_key(
         .await
 }
 
+/// The clustering one merge writes its output with and merges its inputs under
+/// (ADR-2135 decision 2), derived from the inputs' footers alone: compaction and
+/// the erasure rewrite read no tenant config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OutputClustering {
+    /// The output parts' sort descriptor: that of the input with the highest
+    /// clustering generation, `None` when that input has no key.
+    pub sort_descriptor: Option<SortDescriptor>,
+    /// The output parts' clustering generation: the highest among the inputs,
+    /// 0 when every input carries 0.
+    pub clustering_generation: u64,
+    /// Index in the input list of the input the descriptor is taken from, the
+    /// first one carrying the highest generation. `None` only for no inputs.
+    pub source: Option<usize>,
+    /// `W`, the coarse width in nanoseconds the merge orders heads by: the
+    /// widest bucket width among the inputs' descriptors, 1 when none has one.
+    pub merge_width_ns: i64,
+}
+
+impl OutputClustering {
+    /// Derive the output clustering from the inputs. Ties on the highest
+    /// generation resolve to the first such input in canonical input order; a
+    /// generation names exactly one key, so tied inputs carry one descriptor.
+    pub(crate) fn from_inputs(catalogs: &[RlogInputCatalog]) -> Self {
+        let mut source: Option<usize> = None;
+        for (i, c) in catalogs.iter().enumerate() {
+            match source {
+                Some(s) if catalogs[s].clustering_generation >= c.clustering_generation => {}
+                _ => source = Some(i),
+            }
+        }
+        let merge_width_ns = catalogs
+            .iter()
+            .filter_map(|c| c.sort_descriptor.as_ref())
+            .map(|d| d.bucket_width.width_ns())
+            .max()
+            .unwrap_or(1);
+        let chosen = source.and_then(|s| catalogs.get(s));
+        OutputClustering {
+            sort_descriptor: chosen.and_then(|c| c.sort_descriptor.clone()),
+            clustering_generation: chosen.map_or(0, |c| c.clustering_generation),
+            source,
+            merge_width_ns,
+        }
+    }
+}
+
+/// How every part of one merge is encoded: the configured zstd level
+/// (ADR-2135 decision 4) and the clustering and bloom scope the merge derived
+/// from its inputs (decisions 2 and 5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PartWriterSettings {
+    zstd_level: i32,
+    sort_descriptor: Option<SortDescriptor>,
+    clustering_generation: u64,
+    bloom_scope: BloomScope,
+}
+
+/// Bytes of the four-byte little-endian `covered_count` and `covered_crc32c`
+/// fields that frame a BLOOM covered-column list.
+const BLOOM_LIST_FRAME_BYTES: u64 = 8;
+
+/// The longest uvarint a `u32` column id encodes to.
+const MAX_U32_UVARINT_BYTES: u64 = 5;
+
+/// The bloom scope an input was written under, recovered from its BLOOM
+/// covered-column list (ADR-2135 decision 5) mapped to names through its
+/// FIELD_DIR string entries:
+///
+/// - every string attribute column covered, or the input has none: `All`;
+/// - no string attribute column covered (the list holds only the two fixed
+///   text columns): `Text`;
+/// - otherwise `Undeclared` with the uncovered string columns as `declared`.
+///
+/// An input with no string attribute column cannot tell `Text` from `All`; it
+/// resolves to `All`, the default scope, and costs no request. Otherwise this
+/// is one ranged GET of the list's prefix, at most
+/// `8 + 5 x (FIRST_DYNAMIC_COL + string columns)` bytes, since the writer
+/// stores BLOOM uncompressed; a compressed BLOOM is fetched whole.
+async fn read_bloom_scope(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    catalog: &RlogInputCatalog,
+) -> Result<BloomScope> {
+    let strings = &catalog.string_fields;
+    if strings.is_empty() {
+        return Ok(BloomScope::All);
+    }
+    let desc = catalog.bloom_section.ok_or_else(|| {
+        MaintainError::Invariant(format!(
+            "input .rlog object {:?} carries no BLOOM section",
+            catalog.object_key
+        ))
+    })?;
+    let ledger = config.request_ledger.as_ref();
+    let section = if desc.comp == COMP_NONE {
+        let known = u64::from(FIRST_DYNAMIC_COL) + strings.len() as u64;
+        let max_list =
+            BLOOM_LIST_FRAME_BYTES.saturating_add(known.saturating_mul(MAX_U32_UVARINT_BYTES));
+        let len = desc.len.min(max_list);
+        let got = store
+            .get(
+                &catalog.object_key,
+                GetRange::Range(desc.offset, desc.offset + len),
+            )
+            .await;
+        note_get(ledger, RequestPhase::CatalogRead, &got);
+        got?.data.to_vec()
+    } else {
+        let got = store
+            .get(
+                &catalog.object_key,
+                GetRange::Range(desc.offset, desc.offset + desc.len),
+            )
+            .await;
+        note_get(ledger, RequestPhase::CatalogRead, &got);
+        decode_section(got?.data.as_ref(), &desc, &RlogConfig::default())?
+    };
+    // Cut the section after its covered list and give it an empty entry table,
+    // so the section parser verifies the list crc, its order, and that every id
+    // names a column, without the entries being fetched.
+    let mut pos = 0usize;
+    let count_bytes = section.get(0..4).ok_or_else(|| {
+        MaintainError::Invariant("BLOOM section truncated at covered count".into())
+    })?;
+    pos += 4;
+    let count = u32::from_le_bytes([
+        count_bytes[0],
+        count_bytes[1],
+        count_bytes[2],
+        count_bytes[3],
+    ]);
+    for _ in 0..count {
+        ravel_logseg::varint::get_uvarint(&section, &mut pos)?;
+    }
+    let list_end = pos.saturating_add(4);
+    let mut head = section
+        .get(..list_end)
+        .ok_or_else(|| MaintainError::Invariant("BLOOM section truncated at covered crc".into()))?
+        .to_vec();
+    head.extend_from_slice(&0u32.to_le_bytes());
+    let parsed = ravel_logseg::rlog_bloom::RlogBloomSection::parse(&head, strings)?;
+    let uncovered: Vec<String> = strings
+        .entries()
+        .iter()
+        .filter(|e| !parsed.covers(e.column_id))
+        .map(|e| e.name.clone())
+        .collect();
+    Ok(if uncovered.is_empty() {
+        BloomScope::All
+    } else if uncovered.len() == strings.len() {
+        BloomScope::Text
+    } else {
+        BloomScope::Undeclared {
+            declared: uncovered,
+        }
+    })
+}
+
 /// What one run of [`merge_catalogs`] produced: the parts, and the record
 /// counts the caller's conservation gates need.
 pub(crate) struct MergeOutput {
@@ -704,8 +918,10 @@ pub(crate) struct MergeOutput {
     pub output_record_count: u64,
 }
 
-/// The shared k-way block-streaming merge: every input's records, in global
-/// `(stream_id, ts)` order, filtered through `keep`, partitioned into parts
+/// The shared k-way block-streaming merge: every input's records, in
+/// `(stream_id, ts.div_euclid(W), input_index)` order within each reservation
+/// batch (see the module docs' order under a sort descriptor and
+/// [`merge_stream_into_parts`]), filtered through `keep`, partitioned into parts
 /// closed at the memory split target `l1_part_memory_target_bytes` or the stored-size
 /// target `max_l1_part_bytes`, whichever is reached first.
 ///
@@ -747,6 +963,7 @@ pub(crate) async fn merge_catalogs(
     retain_bytes: bool,
     keep: &mut (dyn FnMut(&LogRecord) -> Result<bool> + Send),
 ) -> Result<MergeOutput> {
+    let zstd_level = crate::config::validate_rlog_zstd_level(config.rlog_zstd_level)?;
     // Global stream_ref remap + cross-object stream-identity check. The
     // merged set is the sorted union of every input's STREAM_DIR; the dense
     // merged stream_ref is the ordinal in this set (the writer re-derives it
@@ -783,6 +1000,20 @@ pub(crate) async fn merge_catalogs(
     // here, decoded once, rather than re-derived per record in the fold.
     let declared = Arc::new(DeclaredSchema::build(&declared, &merged));
 
+    // The output descriptor, generation, and bloom scope all come from one
+    // input, the highest-generation one (ADR-2135 decisions 2 and 5).
+    let clustering = OutputClustering::from_inputs(catalogs);
+    let bloom_scope = match clustering.source.and_then(|s| catalogs.get(s)) {
+        Some(catalog) => read_bloom_scope(store, config, catalog).await?,
+        None => BloomScope::All,
+    };
+    let writer = Arc::new(PartWriterSettings {
+        zstd_level,
+        sort_descriptor: clustering.sort_descriptor.clone(),
+        clustering_generation: clustering.clustering_generation,
+        bloom_scope,
+    });
+
     let identity = compactor_identity(bucket, config);
     let tracker = config.merge_memory_tracker.as_ref();
     let mut sink = PartSink {
@@ -793,6 +1024,7 @@ pub(crate) async fn merge_catalogs(
         identity,
         indexed_fields,
         declared,
+        writer,
         tracker,
         dry_run,
         retain_bytes,
@@ -803,8 +1035,9 @@ pub(crate) async fn merge_catalogs(
     let mut counts = RecordCounts::default();
 
     // Merge stream by stream in sorted stream_id order. Each stream is
-    // k-way merged from every input carrying it (ts-ascending, canonical
-    // input-order tie-break) straight into the current part's writer, and
+    // k-way merged from every input carrying it (by `(ts.div_euclid(W),
+    // input_index)`, which is `(ts, input_index)` when no input has a key)
+    // straight into the current part's writer, and
     // the part flushes the moment its accumulated record-heap estimate
     // reaches `l1_part_memory_target_bytes` (the memory split target) or an
     // exact-encode probe shows its object bytes reaching `max_l1_part_bytes`
@@ -823,6 +1056,7 @@ pub(crate) async fn merge_catalogs(
             store,
             catalogs,
             stream_id,
+            clustering.merge_width_ns,
             &mut sink,
             tracker,
             keep,
@@ -894,11 +1128,16 @@ impl RecordCounts {
 ///   geometry is unchanged until an operator lowers the stored target.
 ///
 /// Consecutive parts may therefore carry the same `stream_id` at their shared
-/// boundary, with adjacent, non-overlapping `(series_id, ts)` ranges. Records
-/// still enter each part in global `(stream_id, ts)` order, so every part is
-/// individually sorted and is written by the frozen [`RlogWriter`] unchanged:
-/// only the partitioning of records into parts differs, never a part's bytes
-/// given its record set.
+/// boundary. Records enter the sink in the merge's order, `stream_id` then
+/// `(ts.div_euclid(W), input_index)` ([`merge_stream_into_parts`]), and the
+/// writer re-sorts each part by the output sort descriptor. With no input keyed
+/// (`W` = 1 ns) that order is `(stream_id, ts)` and parts of one stream cover
+/// adjacent, non-overlapping ts ranges. With a key they may overlap in key and
+/// ts ranges, both within one coarse bucket a cut falls inside and across a
+/// reservation batch boundary, which costs pruning precision, not correctness
+/// (ADR-2135 decision 2, "Part cuts"). Either way only the partitioning of
+/// records into parts depends on the cut, never a part's bytes given its record
+/// sequence.
 struct PartSink<'a> {
     store: &'a dyn ObjectStoreBackend,
     bucket: &'a Bucket,
@@ -911,6 +1150,9 @@ struct PartSink<'a> {
     /// Empty on the erasure-rewrite route, whose parts stay unstamped (the
     /// wave-3 staleness rule), and on metrics/spans buckets.
     declared: Arc<DeclaredSchema>,
+    /// The zstd level, sort descriptor, generation, and bloom scope every part
+    /// of this merge is written with.
+    writer: Arc<PartWriterSettings>,
     tracker: Option<&'a MergeMemoryTracker>,
     /// Whether a closed part is encoded but not PUT. Not read from `config`:
     /// the erasure rewrite defers every part PUT to its own publish path (which
@@ -937,6 +1179,7 @@ impl PartSink<'_> {
                 &self.identity,
                 &self.indexed_fields,
                 Arc::clone(&self.declared),
+                Arc::clone(&self.writer),
             ));
         }
         let mut over_memory = false;
@@ -1520,8 +1763,11 @@ struct PartBuilder {
     identity: ObjectIdentity,
     /// The POSTINGS field list every part is written with (ADR-0049 decision 6).
     indexed_fields: Vec<String>,
-    /// The merged records buffered for this part, in canonical `(stream_id, ts)`
-    /// order.
+    /// The zstd level, sort descriptor, generation, and bloom scope the part is
+    /// encoded with, shared by every part of the merge.
+    writer: Arc<PartWriterSettings>,
+    /// The merged records buffered for this part, in the merge's emission order;
+    /// the writer re-sorts them by the output descriptor at encode.
     records: Vec<LogRecord>,
     /// Sum of [`estimate_record`] over every pushed record: the **memory split
     /// target**'s trigger (compared against `l1_part_memory_target_bytes`) and
@@ -1561,10 +1807,12 @@ impl PartBuilder {
         identity: &ObjectIdentity,
         indexed_fields: &[String],
         declared: Arc<DeclaredSchema>,
+        writer: Arc<PartWriterSettings>,
     ) -> Self {
         PartBuilder {
             identity: *identity,
             indexed_fields: indexed_fields.to_vec(),
+            writer,
             records: Vec::new(),
             estimate: 0,
             stored_estimate: 0,
@@ -1615,16 +1863,24 @@ impl PartBuilder {
         Ok(())
     }
 
-    /// Build a fresh writer over `records`. `RlogConfig::default()` and the
-    /// indexed-field list match the L0 write path, so an L0 write and this L1
-    /// merge cannot drift on encoding.
+    /// Build a fresh writer over `records`. The writer configuration is the L0
+    /// write path's `RlogConfig::default()` except for the zstd level, which is
+    /// the compaction level (ADR-2135 decision 4), and the writer sorts the part
+    /// by the merge's output descriptor and limits BLOOM to its bloom scope.
     fn build_writer(
         identity: &ObjectIdentity,
         indexed_fields: &[String],
+        writer: &PartWriterSettings,
         records: Vec<LogRecord>,
     ) -> Result<RlogWriter> {
-        let mut w = RlogWriter::new(RlogConfig::default(), *identity)
-            .with_indexed_fields(indexed_fields.to_vec());
+        let cfg = RlogConfig {
+            zstd_level: writer.zstd_level,
+            ..RlogConfig::default()
+        };
+        let mut w = RlogWriter::new(cfg, *identity)
+            .with_indexed_fields(indexed_fields.to_vec())
+            .with_sort_descriptor(writer.sort_descriptor.clone(), writer.clustering_generation)
+            .with_bloom_scope(writer.bloom_scope.clone());
         for r in records {
             w.push(r)?;
         }
@@ -1642,7 +1898,12 @@ impl PartBuilder {
         input_set_hash: &[u8; 32],
         part_index: u32,
     ) -> Result<(Vec<u8>, WriteStats)> {
-        let w = Self::build_writer(&self.identity, &self.indexed_fields, self.records.clone())?;
+        let w = Self::build_writer(
+            &self.identity,
+            &self.indexed_fields,
+            &self.writer,
+            self.records.clone(),
+        )?;
         Ok(w.finish_compacted_with_stats(1, input_set_hash.to_vec(), part_index)?)
     }
 
@@ -1656,10 +1917,11 @@ impl PartBuilder {
         let PartBuilder {
             identity,
             indexed_fields,
+            writer,
             records,
             ..
         } = self;
-        let w = Self::build_writer(&identity, &indexed_fields, records)?;
+        let w = Self::build_writer(&identity, &indexed_fields, &writer, records)?;
         Ok(w.finish_compacted_with_stats(1, input_set_hash.to_vec(), part_index)?)
     }
 
@@ -1721,12 +1983,13 @@ impl PartBuilder {
 }
 
 /// One input's cursor over a single stream's records, yielding them in stored
-/// (ts-ascending) order one block at a time. At most one decoded block is
+/// order (ts-ascending, or the input descriptor's bucket-then-keys order) one
+/// block at a time. At most one decoded block is
 /// resident, held in COLUMNAR form: `block` is the current block's
 /// [`StreamBlockRows`] view, positioned at the next row to merge, and the next
 /// block is decoded only once the current one is drained. `input_index` is the
 /// cursor's canonical position in `catalogs`, the k-way merge's tie-break on
-/// equal `ts_ns`.
+/// an equal coarse bucket `ts_ns.div_euclid(W)`.
 ///
 /// The cursor holds NO materialized records (ADR-0979 decision 1). The merge
 /// orders cursors by [`Self::peek_ts`], which reads the decoded timestamp
@@ -2146,13 +2409,82 @@ async fn fetch_block(
 }
 
 /// One input queued for overlap-gated admission (ADR-0979 decision 2): its
-/// canonical `input_index`, the SKIP_IDX ts lower bound its cursor's first
-/// record cannot precede, and the pre-decode reservation admitting it charges
-/// against the merge budget (ADR-0979 decision 4).
+/// canonical `input_index`, the SKIP_IDX ts envelope of its slice of the stream
+/// (no record of the slice falls outside it), and the pre-decode reservation
+/// admitting it charges against the merge budget (ADR-0979 decision 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PendingCursor {
     input_index: usize,
     lower_bound: i64,
+    upper_bound: i64,
     reservation: u64,
+}
+
+/// Partition one stream's inputs into the batches the merge runs one after
+/// another (ADR-2135 decision 2, "Batches sized by reservation").
+///
+/// `carriers` is in canonical input order. Each input's reservation is summed
+/// into every coarse bucket `ts.div_euclid(width_ns)` its SKIP_IDX envelope
+/// touches. When no bucket's sum exceeds `budget`, the stream is one batch.
+/// Otherwise the inputs are cut, in input order, greedily on the running sum of
+/// their reservations into batches whose sum stays within `budget`; an input
+/// whose own reservation exceeds the budget is a batch of its own, and its
+/// admission refuses exactly as an unbatched merge would. The partition depends
+/// only on the input set, so both admission modes see the same batches.
+///
+/// With `width_ns` = 1 (no input keyed) the stream is always one batch, so an
+/// unkeyed merge keeps ADR-0979's admission and refusals unchanged.
+fn reservation_batches(
+    carriers: &[PendingCursor],
+    width_ns: i64,
+    budget: u64,
+) -> Vec<Vec<PendingCursor>> {
+    if width_ns <= 1 || carriers.is_empty() {
+        return vec![carriers.to_vec()];
+    }
+    // Sweep over bucket boundaries: an envelope contributes from its first
+    // bucket through its last, and at one position removals apply before
+    // additions so two envelopes that only abut never count as overlapping.
+    let mut events: Vec<(i64, bool, u64)> = Vec::with_capacity(carriers.len() * 2);
+    for c in carriers {
+        events.push((c.lower_bound.div_euclid(width_ns), true, c.reservation));
+        events.push((
+            c.upper_bound.div_euclid(width_ns).saturating_add(1),
+            false,
+            c.reservation,
+        ));
+    }
+    events.sort_by_key(|&(pos, add, _)| (pos, add));
+    let mut running: u128 = 0;
+    let mut max_bucket: u128 = 0;
+    for (_, add, r) in events {
+        if add {
+            running += u128::from(r);
+            max_bucket = max_bucket.max(running);
+        } else {
+            running = running.saturating_sub(u128::from(r));
+        }
+    }
+    if max_bucket <= u128::from(budget) {
+        return vec![carriers.to_vec()];
+    }
+    let mut batches = Vec::new();
+    let mut current: Vec<PendingCursor> = Vec::new();
+    let mut sum: u128 = 0;
+    for c in carriers {
+        let next = sum + u128::from(c.reservation);
+        if !current.is_empty() && next > u128::from(budget) {
+            batches.push(std::mem::take(&mut current));
+            sum = u128::from(c.reservation);
+        } else {
+            sum = next;
+        }
+        current.push(*c);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
 }
 
 /// The merge's live cursor-budget accounting, handed to
@@ -2347,13 +2679,18 @@ fn cursor_reservation_bytes(
     Ok(Some(two_g.saturating_add(loc_meta).saturating_add(b_dec)))
 }
 
-/// K-way merge one stream from every input carrying it into `part`, in
-/// ts-ascending order with ties broken by canonical input order. This is
-/// byte-for-byte the ordering the old "concatenate every input's decoded
-/// records, then stable-sort by `ts_ns`" produced -- each input's stream is
-/// already ts-ascending (the format's `(stream_ref, ts)` order), so a stable
-/// sort of the concatenation orders equal-`ts_ns` records by (input, position),
-/// exactly what selecting the minimum `(ts_ns, input_index)` head does here.
+/// K-way merge one stream from every input carrying it into `part`, ordering
+/// heads by `(ts.div_euclid(W), input_index)` (ADR-2135 decision 2), where `W`
+/// is `width_ns`, the widest bucket width among the inputs' sort descriptors and
+/// 1 ns when none has one. Each input's stream is stored in its own descriptor's
+/// order, `(ts.div_euclid(w), keys, ts)`, or ts-ascending without one; the
+/// widths nest (1 h, 6 h, 1 day), so every input is non-decreasing in
+/// `ts.div_euclid(W)` along its stored order. Selecting the minimum head is
+/// therefore a stable sort of the inputs' concatenated slices by
+/// `(ts.div_euclid(W), input_index)`, keeping each input's stored order within a
+/// coarse bucket, and with `W` = 1 it is the `(ts, input_index)` order an
+/// unkeyed merge has always had. The writer then re-sorts each part by the
+/// output descriptor.
 ///
 /// Every merged record is tallied in `counts` and offered to `keep`; the ones
 /// it keeps go into `sink`, which closes the in-progress part and opens the
@@ -2368,16 +2705,18 @@ fn cursor_reservation_bytes(
 ///
 /// Cursors are not all opened up front. Each input carrying the stream is
 /// queued with its SKIP_IDX ts lower bound (`stream_ts_bounds`, a sound lower
-/// bound on the first timestamp that input's cursor can yield). The merge
-/// maintains the invariant: before emitting a record with key `(ts,
-/// input_index)`, every queued cursor whose lower bound is `<= ts` is opened.
-/// Because a queued cursor's true first timestamp is `>= its lower bound`, an
-/// unopened cursor left behind (lower bound `> ts`) can hold no record that
-/// precedes the candidate, and equality forces admission so exact-`ts` ties
-/// still resolve by `input_index` exactly as an all-open merge would. The
-/// emitted sequence -- and therefore every part boundary and every part byte --
-/// is identical to opening every cursor at once; only WHEN a cursor opens
-/// changes. The number of simultaneously open cursors becomes `D`, the max
+/// bound on every timestamp that input's cursor can yield). The merge
+/// maintains the invariant: before emitting a record with key `(b,
+/// input_index)`, `b` its coarse bucket `ts.div_euclid(W)`, every queued cursor
+/// whose lower bound's coarse bucket is `<= b` is opened. Because every record
+/// of a queued cursor lies in a bucket `>=` its lower bound's, an unopened
+/// cursor left behind can hold no record that precedes the candidate, and
+/// equality forces admission so same-bucket ties still resolve by
+/// `input_index` exactly as an all-open merge would. The emitted sequence --
+/// and therefore every part boundary and every part byte -- is identical to
+/// opening every cursor at once; only WHEN a cursor opens changes. The number
+/// of simultaneously open cursors becomes the number of input slices touching
+/// the current coarse bucket: with no input keyed that is `D`, the max
 /// concurrent ts-overlap of the stream's input slices, instead of `n`, the
 /// input count. Admitted cursors open `input_read_concurrency` at a time in
 /// canonical order (so a stream carried by hundreds of inputs does not
@@ -2398,11 +2737,75 @@ fn cursor_reservation_bytes(
 /// publishing. Once a cursor's decode completes, its charge is reconciled down
 /// to what it actually holds ([`reconcile_cursor_charge`]), which is what the
 /// default budget is sized from. A drained cursor releases its charge, so the
-/// charge tracks `D`, not `n`.
+/// charge tracks the open-cursor set, not `n`.
+///
+/// # Reservation batches (ADR-2135 decision 2)
+///
+/// With `W` wider than 1 ns the open-cursor set can be every input of the
+/// stream, so before admission the stream's inputs are partitioned by
+/// [`reservation_batches`]. Each batch is merged on its own, in batch order, by
+/// the same admission and head order, into the same sink; the writer re-sorts
+/// each part, so a batched stream inside one part is written exactly as the
+/// one-pass merge writes it, and only where a part cut falls does batching
+/// change which records share a part.
+#[allow(clippy::too_many_arguments)]
 async fn merge_stream_into_parts(
     store: &dyn ObjectStoreBackend,
     catalogs: &[RlogInputCatalog],
     stream_id: &LogStreamId,
+    width_ns: i64,
+    sink: &mut PartSink<'_>,
+    tracker: Option<&MergeMemoryTracker>,
+    keep: &mut (dyn FnMut(&LogRecord) -> Result<bool> + Send),
+    counts: &mut RecordCounts,
+) -> Result<()> {
+    let width_ns = width_ns.max(1);
+    let mut carriers: Vec<PendingCursor> = Vec::new();
+    for (idx, catalog) in catalogs.iter().enumerate() {
+        let Some((lower_bound, upper_bound)) = catalog.reader.stream_ts_bounds(stream_id) else {
+            continue;
+        };
+        let Some(reservation) = cursor_reservation_bytes(catalog, stream_id)? else {
+            continue;
+        };
+        carriers.push(PendingCursor {
+            input_index: idx,
+            lower_bound,
+            upper_bound,
+            reservation,
+        });
+    }
+    let inputs_carrying_stream = carriers.len();
+    let budget = sink.config.merge_cursor_budget_bytes;
+    for batch in reservation_batches(&carriers, width_ns, budget) {
+        merge_cursor_batch(
+            store,
+            catalogs,
+            stream_id,
+            width_ns,
+            batch,
+            inputs_carrying_stream,
+            sink,
+            tracker,
+            keep,
+            counts,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Merge one reservation batch of a stream's inputs into `sink`: the admission
+/// loop and head order [`merge_stream_into_parts`] describes, over `pending`
+/// alone.
+#[allow(clippy::too_many_arguments)]
+async fn merge_cursor_batch(
+    store: &dyn ObjectStoreBackend,
+    catalogs: &[RlogInputCatalog],
+    stream_id: &LogStreamId,
+    width_ns: i64,
+    mut pending: Vec<PendingCursor>,
+    inputs_carrying_stream: usize,
     sink: &mut PartSink<'_>,
     tracker: Option<&MergeMemoryTracker>,
     keep: &mut (dyn FnMut(&LogRecord) -> Result<bool> + Send),
@@ -2415,23 +2818,9 @@ async fn merge_stream_into_parts(
     // shared reference field, so the ledger handle outlives them.
     let ledger = sink.config.request_ledger.as_ref();
 
-    // The admission queue: one entry per input carrying the stream, ordered by
-    // (lower_bound, input_index) so opens follow the frontier and ties keep
-    // canonical order.
-    let mut pending: Vec<PendingCursor> = Vec::new();
-    for (idx, catalog) in catalogs.iter().enumerate() {
-        let Some((lower_bound, _upper)) = catalog.reader.stream_ts_bounds(stream_id) else {
-            continue;
-        };
-        let Some(reservation) = cursor_reservation_bytes(catalog, stream_id)? else {
-            continue;
-        };
-        pending.push(PendingCursor {
-            input_index: idx,
-            lower_bound,
-            reservation,
-        });
-    }
+    // The admission queue, ordered by (lower_bound, input_index) so opens
+    // follow the frontier and ties keep canonical order. The coarse bucket is
+    // monotone in the lower bound, so the order is the same under any `W`.
     pending.sort_by_key(|a| (a.lower_bound, a.input_index));
 
     // Box each open-and-first-refill with an explicit `+ Send` bound before
@@ -2448,12 +2837,17 @@ async fn merge_stream_into_parts(
     loop {
         // Admission (ADR-0979 decision 2): open every queued cursor the
         // invariant requires before the next emit. The frontier is the min
-        // peek_ts over open cursors; under `Overlap` a queued cursor is admitted
-        // when its lower bound is at or below the frontier (with a single
-        // bootstrap open when nothing is open yet so a frontier exists), under
-        // `EagerAll` every remaining cursor is admitted regardless.
+        // coarse bucket of peek_ts over open cursors; under `Overlap` a queued
+        // cursor is admitted when its lower bound's coarse bucket is at or
+        // below the frontier (with a single bootstrap open when nothing is open
+        // yet so a frontier exists), under `EagerAll` every remaining cursor is
+        // admitted regardless.
         loop {
-            let frontier = open.iter().filter_map(|c| c.peek_ts()).min();
+            let frontier = open
+                .iter()
+                .filter_map(|c| c.peek_ts())
+                .map(|ts| ts.div_euclid(width_ns))
+                .min();
             // The prefix of `pending` (sorted by lower bound) to admit this
             // round.
             let mut batch_len = 0usize;
@@ -2465,7 +2859,7 @@ async fn merge_stream_into_parts(
                         // lowest-lower-bound cursor, then re-derive the frontier
                         // from it on the next round.
                         None => batch_len == 0,
-                        Some(ts) => p.lower_bound <= ts,
+                        Some(bucket) => p.lower_bound.div_euclid(width_ns) <= bucket,
                     },
                 };
                 if !admit {
@@ -2499,7 +2893,7 @@ async fn merge_stream_into_parts(
                         charged_bytes: open_charge,
                         budget_bytes: budget,
                         required_bytes: required,
-                        inputs_carrying_stream: pending.len(),
+                        inputs_carrying_stream,
                         site: MergeCursorBudgetSite::Admission {
                             batch_position: k,
                             batch_len,
@@ -2550,7 +2944,8 @@ async fn merge_stream_into_parts(
             }
         }
 
-        // Pick the cursor whose next row has the minimum (ts_ns, input_index).
+        // Pick the cursor whose next row has the minimum (ts_ns.div_euclid(W),
+        // input_index).
         // input_index is unique per cursor, so the key is a total order and the
         // tie-break is deterministic. peek_ts is only valid immediately after a
         // refill: every open cursor was refilled when it was admitted or after
@@ -2563,10 +2958,10 @@ async fn merge_stream_into_parts(
         let mut best: Option<(usize, i64, usize)> = None;
         for (i, cursor) in open.iter().enumerate() {
             if let Some(ts) = cursor.peek_ts() {
-                let key = (ts, cursor.input_index);
+                let key = (ts.div_euclid(width_ns), cursor.input_index);
                 match best {
-                    Some((_, bts, bidx)) if (bts, bidx) <= key => {}
-                    _ => best = Some((i, ts, cursor.input_index)),
+                    Some((_, bbucket, bidx)) if (bbucket, bidx) <= key => {}
+                    _ => best = Some((i, key.0, key.1)),
                 }
             }
         }
@@ -2595,7 +2990,7 @@ async fn merge_stream_into_parts(
             charged: &mut charged,
             stream_id,
             open_cursors: open.len(),
-            inputs_carrying_stream: pending.len(),
+            inputs_carrying_stream,
         };
         open[bi]
             .refill(store, tracker, ledger, Some(&mut cursor_budget))
@@ -4793,13 +5188,16 @@ mod tests {
     /// `PROBE_MIN_STEP_BYTES / r`), plus the crossing probe itself -- which is
     /// `r * ln(d0 / PROBE_MIN_STEP_BYTES) + r` for large `r`.
     ///
-    /// This fixture measures `r` = 7.26 (`ratio` below, printed by the run), so
-    /// `d0` = 14_127, the ladder is `ln(14127 / 4096) / ln(7.26 / 6.26)` = 8.4
-    /// probes, the floor tail is 7.3, and with the crossing probe that is 16.6
-    /// per part. 10 of the 11 parts close on the target (166 probes) and the
-    /// trailing part runs its own partial ladder without ever closing (its proxy
-    /// passes the target, its records run out), which with the per-part spread
-    /// around the model accounts for the remaining 29 of the 195 pinned below.
+    /// This fixture measures `r` = 7.23 (`ratio` below, printed by the run, at
+    /// the compactor's default zstd level 9), so `d0` = 14_118, the ladder is
+    /// `ln(14118 / 4096) / ln(7.23 / 6.23)` = 8.3 probes, the floor tail is 7.2,
+    /// and with the crossing probe that is 16.5 per part. 10 of the 11 parts
+    /// close on the target (165 probes) and the trailing part runs its own
+    /// partial ladder without ever closing (its proxy passes the target, its
+    /// records run out), which with the per-part spread around the model
+    /// accounts for the remaining 32 of the 197 pinned below. At zstd level 3
+    /// the same fixture measured `r` = 7.26 and ran 195 probes over the same 11
+    /// parts.
     /// The model treats `r` as constant along a part and ignores that a
     /// floored step overshoots, so a few percent is the
     /// expected agreement; a change that made probing linear in the deficit, or
@@ -4903,16 +5301,16 @@ mod tests {
         );
         // The probe cost, pinned exactly (the corpus is deterministic) and cross
         // checked against the geometric model in the doc comment above:
-        // r = 7.26, d0 = STORED_TARGET * (1 - 1/r) = 14_127, ladder
-        // ln(14127/4096) / ln(7.26/6.26) = 8.4, floor tail r = 7.3, crossing
-        // probe 1, so 16.6 per part; 10 closing parts = 166, plus the trailing
-        // part's partial ladder and the per-part spread around the model = 195
+        // r = 7.23, d0 = STORED_TARGET * (1 - 1/r) = 14_118, ladder
+        // ln(14118/4096) / ln(7.23/6.23) = 8.3, floor tail r = 7.2, crossing
+        // probe 1, so 16.5 per part; 10 closing parts = 165, plus the trailing
+        // part's partial ladder and the per-part spread around the model = 197
         // pinned.
         assert_eq!(
             tracker.probes_run(),
-            195,
+            197,
             "the exact-encode probe count for this fixture is deterministic; the \
-             geometric model predicts about 16.6 probes per part for r={ratio:.2} \
+             geometric model predicts about 16.5 probes per part for r={ratio:.2} \
              over {} parts",
             parts.len()
         );
@@ -4986,8 +5384,13 @@ mod tests {
             + recs
                 .first()
                 .map_or(0, |r| estimate_stored_stream(&r.stream_attrs));
-        let identity = compactor_identity(&bucket(), &CompactorConfig::default());
-        let mut w = RlogWriter::new(RlogConfig::default(), identity);
+        let config = CompactorConfig::default();
+        let identity = compactor_identity(&bucket(), &config);
+        let writer_config = RlogConfig {
+            zstd_level: config.rlog_zstd_level,
+            ..RlogConfig::default()
+        };
+        let mut w = RlogWriter::new(writer_config, identity);
         for r in recs {
             w.push(r.clone()).expect("push");
         }
@@ -5020,7 +5423,8 @@ mod tests {
     /// .max(f64::MIN_POSITIVE); let step = (((deficit as f64) / rate).ceil() as
     /// u64).max(PROBE_MIN_STEP_BYTES);` in place of
     /// `let step = deficit.max(PROBE_MIN_STEP_BYTES);` -- and the probe pin below
-    /// fails first at 71 against 123, then, with the pin relaxed to 71, this
+    /// fails first at 71 against 123 (both measured at zstd level 3, where the
+    /// pin was 123), then, with the pin relaxed to 71, this
     /// fixture emits 25 parts whose first object is 228_222 bytes, 13.9x the
     /// 16 KiB target, failing the band assertion at part 0. The remaining parts
     /// land between 9_914 (the trailing part) and 18_731 bytes, inside the
@@ -5109,14 +5513,17 @@ mod tests {
         // The probe cost, pinned exactly rather than as `> 0`: the corpus is
         // deterministic, so the geometric model is checkable against it. Almost
         // every part of this fixture lies past the collapse, where
-        // r = 1 / post_rate = 1.60, so d0 = STORED_TARGET * (1 - 1/r) = 6_131,
-        // the ladder to the floor is ln(6131/4096) / ln(1.60/0.60) = 0.4 probes,
+        // r = 1 / post_rate = 1.60, so d0 = STORED_TARGET * (1 - 1/r) = 6_129,
+        // the ladder to the floor is ln(6129/4096) / ln(1.60/0.60) = 0.4 probes,
         // the floor tail is r = 1.6, and the crossing probe makes 3.0 per part:
-        // 39 closing parts = 117, plus the first part's longer ladder across the
-        // compressible prefix (r = 1/pre_rate = 70 there) = 123 pinned.
+        // 40 closing parts = 120, plus the first part's longer ladder across the
+        // compressible prefix (r = 1/pre_rate = 70 there) and the per-part spread
+        // = 124 pinned. At zstd level 3 the run closed 39 parts of 40 and ran 123;
+        // at level 9 the incompressible suffix encodes a few bytes larger, so it
+        // closes one part more.
         assert_eq!(
             tracker.probes_run(),
-            123,
+            124,
             "the exact-encode probe count for this fixture is deterministic; the \
              geometric model predicts about 3.0 probes per part for \
              r={:.2} past the collapse, over {} parts",
@@ -5259,16 +5666,17 @@ mod tests {
             parts.len(),
             tracker.probes_run()
         );
-        // Deterministic corpus, so the probe count is pinned here too: r = 7.08
+        // Deterministic corpus, so the probe count is pinned here too: r = 7.23
         // as in `stored_target_closes_parts_on_actual_encoded_object_bytes`
-        // (same `ratio_record` fixture), 16.2 probes per part by the geometric
-        // model, 5 closing parts = 81 plus the trailing part's partial ladder and
-        // the per-part spread around the model = 91. Under the rate-model
-        // scheduler that test names it runs 16.
+        // (same `ratio_record` fixture), 16.5 probes per part by the geometric
+        // model, 5 closing parts = 83 plus the trailing part's partial ladder and
+        // the per-part spread around the model = 92 (91 at zstd level 3, over
+        // the same 6 parts). Under the rate-model scheduler that test names it
+        // ran 16 at level 3.
         assert_eq!(
             tracker.probes_run(),
-            91,
-            "the probe count is deterministic for this corpus: 16.2 per part by \
+            92,
+            "the probe count is deterministic for this corpus: 16.5 per part by \
              the geometric model over the {} closing parts",
             parts.len() - 1
         );
@@ -6144,14 +6552,27 @@ mod tests {
         }
 
         // Build the reference part through the same writer, identity, indexed
-        // fields, input_set_hash, and part_index the compaction used.
+        // fields, input_set_hash, and part_index the compaction used, at the
+        // compactor's zstd level and with the output descriptor the unkeyed
+        // inputs resolve to (none, generation 0).
         let ftr = footer::open(actual).expect("open actual part");
         assert_eq!(ftr.input_set_hash.len(), 32, "input_set_hash is 32 bytes");
+        assert_eq!(
+            ftr.sort_descriptor, None,
+            "unkeyed inputs write no descriptor"
+        );
+        assert_eq!(ftr.clustering_generation, 0);
         let mut ish = [0u8; 32];
         ish.copy_from_slice(&ftr.input_set_hash);
-        let identity = compactor_identity(&bucket(), &CompactorConfig::default());
-        let mut writer = RlogWriter::new(RlogConfig::default(), identity)
-            .with_indexed_fields(vec!["svc".to_string()]);
+        let config = CompactorConfig::default();
+        let identity = compactor_identity(&bucket(), &config);
+        let writer_config = RlogConfig {
+            zstd_level: config.rlog_zstd_level,
+            ..RlogConfig::default()
+        };
+        let mut writer = RlogWriter::new(writer_config, identity)
+            .with_indexed_fields(vec!["svc".to_string()])
+            .with_sort_descriptor(None, 0);
         for r in old_order {
             writer.push(r).expect("push");
         }
@@ -6224,9 +6645,10 @@ mod tests {
         }
     }
 
-    /// Seed [`differential_hash_inputs`], compact, and return each L1 part's
-    /// `content_hash` as hex plus the total record count over the parts.
-    async fn differential_hash_run() -> (Vec<String>, usize) {
+    /// Seed [`differential_hash_inputs`], compact at `rlog_zstd_level`, and
+    /// return each L1 part's `content_hash` as hex plus the total record count
+    /// over the parts.
+    async fn differential_hash_run(rlog_zstd_level: i32) -> (Vec<String>, usize) {
         let store = MemoryStore::new();
         for (i, recs) in differential_hash_inputs().iter().enumerate() {
             seed_l0(
@@ -6246,6 +6668,7 @@ mod tests {
             // target change, so this pin stays reproducible independently of
             // object-geometry knobs.
             l1_part_memory_target_bytes: 32 * 1024,
+            rlog_zstd_level,
             ..CompactorConfig::default()
         };
         let clock = FixedClock::new(sealed_now_ns());
@@ -6310,6 +6733,14 @@ mod tests {
     /// PAGE_DIR entries. Between that change and here a diff can only come
     /// from this crate.
     ///
+    /// The compactor's zstd level moved from the writer's 3 to 9 (ADR-2135
+    /// decision 4). That changes every part's bytes and none of its records, so
+    /// the lineage above is kept by running the fixture twice: at level 3 the
+    /// six constants it already carried must still come out, which proves the
+    /// clustered merge order left this unkeyed corpus's sequence and part
+    /// boundaries untouched, and at the default level a second vector, captured
+    /// from that run with the part count still six, pins the shipped bytes.
+    ///
     /// The stored-target geometry #872 introduced is pinned separately, by
     /// [`stored_target_closes_parts_on_actual_encoded_object_bytes`] (band plus
     /// decode-equality against a single-part baseline) and
@@ -6320,9 +6751,9 @@ mod tests {
         /// (30 + 1) + 4 x (30 + 1) + 4 x (40 + 1).
         const EXPECTED_ROWS: usize = 4 * 31 + 4 * 31 + 4 * 41;
         /// Part `content_hash` values, in `part_index` order, under
-        /// `l1_part_memory_target_bytes: 32 * 1024`, re-captured at the
-        /// stored-size encoding choice (see the note above).
-        const EXPECTED_PART_HASHES: &[&str] = &[
+        /// `l1_part_memory_target_bytes: 32 * 1024` at zstd level 3,
+        /// re-captured at the stored-size encoding choice (see the note above).
+        const LEVEL_3_PART_HASHES: &[&str] = &[
             "59bc1b97b30c22fefd37082ca13fcea3f9ca413d184d4dad958c425918116463",
             "79911944901ebc86cabe2f98a3638524e381cb454b292f161b7222c2b2e211a9",
             "65c1b3b869e6ff4f5511b0860722faee7a9f8e7b418715f1a9f80a2edacb8e16",
@@ -6330,15 +6761,30 @@ mod tests {
             "d90295bbc856d208095d72acc9da9ff4e1ffd3865148efd87f80783c7ae0d3b5",
             "71bd01a6239b6173a9bec9780947073323b3fdc799fc4604a1c00996413932d1",
         ];
+        /// The same parts at the compactor's default zstd level.
+        const DEFAULT_LEVEL_PART_HASHES: &[&str] = &[
+            "f818074dc4d98f63e542c0cee25857c382a4ca5af9e8420bea8e926f4ebfbd27",
+            "af1862540c68aa757aff3d102f15117588b51e7521ef8d2d5e1055d8ce9aa9d4",
+            "ef43879c673212c0f4f683035f251cf967c6aa0abb5b6915048a7605f3dd749a",
+            "3c98dd49618002dd85d6724a4c05bd0664d0e578b6650ac6c3314cb0f5de7e7e",
+            "db516727d8dcac498cd6d8d859cda3668a3952992c206258aab466cf6cc92a51",
+            "e078f0a2251f0f327fcb0c3b716af828294815e0b9f0853076057001f50c083d",
+        ];
 
-        let (hashes, rows) = differential_hash_run().await;
+        let (hashes, rows) = differential_hash_run(3).await;
         assert_eq!(
             rows, EXPECTED_ROWS,
             "every seeded record survived the merge"
         );
         assert_eq!(
-            hashes, EXPECTED_PART_HASHES,
+            hashes, LEVEL_3_PART_HASHES,
             "part content_hash vector diverged from the pre-columnar-cursor pin"
+        );
+        let (hashes, rows) = differential_hash_run(crate::config::DEFAULT_RLOG_ZSTD_LEVEL).await;
+        assert_eq!(rows, EXPECTED_ROWS);
+        assert_eq!(
+            hashes, DEFAULT_LEVEL_PART_HASHES,
+            "part content_hash vector diverged at the default zstd level"
         );
     }
 
@@ -6572,7 +7018,8 @@ mod tests {
     ///
     /// Demonstrated red by making the overlap predicate drop the second input:
     /// in the admission loop, replacing `AdmissionMode::Overlap => match frontier
-    /// { ... Some(ts) => p.lower_bound <= ts }` so `p.input_index != 1` is
+    /// { ... Some(bucket) => p.lower_bound.div_euclid(width_ns) <= bucket }` so
+    /// `p.input_index != 1` is
     /// additionally required to admit -- input 1 (B) is then never opened, B's
     /// stream-0 records vanish from the overlap run, and the two hash vectors
     /// diverge (or the record-count gate aborts the run).
@@ -6618,17 +7065,20 @@ mod tests {
     ///
     /// Input 1 bootstraps (lowest bound). Input 0 stays queued while the frontier
     /// is 10 and 20, and is admitted exactly when the frontier reaches 30 --
-    /// `lower_bound <= ts` with equality. Both cursors then head at ts 30, and
-    /// the `(ts, input_index)` minimum is input 0's "b30".
+    /// `lower_bound <= ts` with equality (no input is keyed, so the coarse
+    /// bucket width is 1 ns and a bucket is a timestamp). Both cursors then head
+    /// at ts 30, and the `(ts, input_index)` minimum is input 0's "b30".
     ///
     /// Under a `<` regression at the admission predicate, input 0 is not admitted
     /// at the boundary: input 1 emits "a30" and drains, and only then does input 0
     /// bootstrap. The record sequence reorders to a30-before-b30 and the part's
     /// bytes -- and so its `content_hash` -- change. Demonstrated red by editing
     /// the `AdmissionMode::Overlap` arm of the admission predicate in
-    /// `merge_stream_into_parts` from `p.lower_bound <= ts` to `p.lower_bound <
-    /// ts`: the decoded-sequence assertion below fails with `["a30", "b30"]` and
-    /// the pinned hash no longer matches.
+    /// `merge_cursor_batch` from `p.lower_bound.div_euclid(width_ns) <= bucket`
+    /// to `<`: the decoded-sequence assertion below fails with `["a30", "b30"]`
+    /// and the pinned hash no longer matches. The pinned hash is the same at
+    /// zstd level 3 and 9: this five-record part compresses to the same bytes at
+    /// both.
     #[tokio::test]
     async fn admission_boundary_tie_orders_by_input_index() {
         // The premise the fixture rests on: the DEFERRED input is the one with

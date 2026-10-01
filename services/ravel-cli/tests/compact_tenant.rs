@@ -284,6 +284,7 @@ async fn compact_tenant_compacts_only_the_sealed_hour_of_every_shard() {
         None,
         None,
         1,
+        None,
         now_ns(),
         &ClaimOptions::fresh(),
     )
@@ -348,6 +349,7 @@ async fn max_flush_lifetime_zero_seals_and_compacts_every_hour() {
         None,
         None,
         1,
+        None,
         now_ns(),
         &ClaimOptions::fresh(),
     )
@@ -391,6 +393,7 @@ async fn dry_run_reports_the_same_plan_and_writes_nothing() {
         None,
         None,
         1,
+        None,
         now_ns(),
         &ClaimOptions::fresh(),
     )
@@ -425,6 +428,7 @@ async fn dry_run_reports_the_same_plan_and_writes_nothing() {
         None,
         None,
         1,
+        None,
         now_ns(),
         &ClaimOptions::fresh(),
     )
@@ -451,6 +455,7 @@ async fn missing_shards_and_no_provisioning_record_is_a_typed_error_naming_the_t
         None,
         None,
         1,
+        None,
         now_ns(),
         &ClaimOptions::fresh(),
     )
@@ -493,6 +498,7 @@ async fn from_hour_and_to_hour_bound_the_walk() {
         None,
         None,
         1,
+        None,
         now_ns(),
         &ClaimOptions::fresh(),
     )
@@ -539,6 +545,7 @@ async fn zero_knob_is_refused_before_shard_resolution() {
         None,
         None,
         1,
+        None,
         now_ns(),
         &ClaimOptions::fresh(),
     )
@@ -586,6 +593,7 @@ async fn defaulted_store_with_nothing_under_the_tenant_prefix_is_a_typed_refusal
         None,
         None,
         1,
+        None,
         now_ns(),
         &ClaimOptions::fresh(),
     )
@@ -655,6 +663,7 @@ async fn defaulted_store_refuses_when_no_hour_resolves_under_a_provisioned_tenan
         None,
         None,
         1,
+        None,
         now_ns(),
         &ClaimOptions::fresh(),
     )
@@ -700,6 +709,7 @@ async fn explicit_memory_with_an_empty_store_still_reports_zero_counters() {
         None,
         None,
         1,
+        None,
         now_ns(),
         &ClaimOptions::fresh(),
     )
@@ -749,6 +759,7 @@ async fn a_defaulted_store_that_does_hold_data_walks_normally() {
         None,
         None,
         1,
+        None,
         now_ns(),
         &ClaimOptions::fresh(),
     )
@@ -817,6 +828,7 @@ async fn bucket_concurrency_one_is_todays_sequential_report() {
         None,
         None,
         1,
+        None,
         now_ns(),
         &ClaimOptions::fresh(),
     )
@@ -892,6 +904,7 @@ async fn bucket_concurrency_four_writes_identical_objects_to_n1() {
         None,
         None,
         4,
+        None,
         now_ns(),
         &ClaimOptions::fresh(),
     )
@@ -912,6 +925,7 @@ async fn bucket_concurrency_four_writes_identical_objects_to_n1() {
         None,
         None,
         1,
+        None,
         now_ns(),
         &ClaimOptions::fresh(),
     )
@@ -975,6 +989,7 @@ async fn one_bucket_failure_does_not_abort_its_siblings() {
         None,
         None,
         4,
+        None,
         now_ns(),
         &ClaimOptions::fresh(),
     )
@@ -1045,6 +1060,7 @@ async fn zero_bucket_concurrency_is_refused_typed() {
         None,
         None,
         0,
+        None,
         now_ns(),
         &ClaimOptions::fresh(),
     )
@@ -1130,6 +1146,7 @@ async fn streaming_preserves_walk_order_across_out_of_order_completion() {
         None,
         None,
         2,
+        None,
         now_ns(),
         &claims,
     );
@@ -1550,6 +1567,7 @@ async fn run_claim_walk(
         None,
         None,
         concurrency,
+        None,
         now_ns(),
         claims,
     )
@@ -1819,6 +1837,7 @@ async fn a_merge_longer_than_a_third_of_the_lease_renews_its_claim() {
         None,
         None,
         1,
+        None,
         now_ns(),
         &claims,
     );
@@ -1900,6 +1919,7 @@ async fn a_bucket_whose_claim_is_taken_over_mid_merge_is_reported_cancelled() {
         None,
         None,
         1,
+        None,
         now_ns(),
         &claims,
     );
@@ -1991,6 +2011,7 @@ async fn compact_bucket_skips_a_claimed_bucket_and_no_claim_compacts_it() {
                 HOUR_OLD,
                 dry_run,
                 Some(0),
+                None,
                 FixedClock::new(now_ns()),
                 &claims,
             )
@@ -2126,6 +2147,7 @@ async fn compact_bucket_reports_a_claim_lost_mid_merge_and_exits_zero() {
         HOUR_OLD,
         false,
         Some(0),
+        None,
         FixedClock::new(now_ns()),
         &claims,
     );

@@ -821,6 +821,13 @@ pub struct Cli {
     #[arg(long = "maintain-claim-min-input-bytes", value_name = "BYTES")]
     pub maintain_claim_min_input_bytes: Option<u64>,
 
+    /// The zstd level RLOG compaction and the erasure rewrite write their L1
+    /// segments at (ADR-2135 decision 4). Omitted defaults to
+    /// [`ravel_maintain::config::DEFAULT_RLOG_ZSTD_LEVEL`] (9). A level
+    /// outside 1..=22 is refused at startup.
+    #[arg(long = "maintain-compaction-zstd-level", value_name = "LEVEL")]
+    pub maintain_compaction_zstd_level: Option<i32>,
+
     /// Whether this process takes advisory compaction claims at all
     /// (ADR-1029 decision 5's escape hatch). `off` is the fleet-wide
     /// fallback for a store whose qualification record predates the CAS
@@ -5730,6 +5737,17 @@ impl Cli {
         }
     }
 
+    /// Parse `--maintain-compaction-zstd-level` (ADR-2135 decision 4),
+    /// defaulting to [`ravel_maintain::config::DEFAULT_RLOG_ZSTD_LEVEL`] when
+    /// unset and refusing a level outside 1..=22.
+    pub fn parse_maintain_compaction_zstd_level(&self) -> anyhow::Result<i32> {
+        match self.maintain_compaction_zstd_level {
+            None => Ok(ravel_maintain::config::DEFAULT_RLOG_ZSTD_LEVEL),
+            Some(level) => ravel_maintain::validate_rlog_zstd_level(level)
+                .map_err(|e| anyhow::anyhow!("--maintain-compaction-zstd-level: {e}")),
+        }
+    }
+
     /// Parse `--alert-retention` into nanoseconds (ADR-1688 decision 5),
     /// defaulting to [`ravel_maintain::config::DEFAULT_ALERT_RETENTION_NS`].
     /// Zero is accepted and returned verbatim: it is the documented "disable
@@ -5828,6 +5846,9 @@ impl Cli {
         let claim_min_input_bytes = self
             .parse_maintain_claim_min_input_bytes()
             .context("failed to parse --maintain-claim-min-input-bytes")?;
+        let rlog_zstd_level = self
+            .parse_maintain_compaction_zstd_level()
+            .context("failed to parse --maintain-compaction-zstd-level")?;
         Ok(ravel_maintain::CompactorConfig {
             protection_horizon_ns: gc_runtime.protection_horizon_ns,
             grace_ns: gc_runtime.grace_ns,
@@ -5838,6 +5859,7 @@ impl Cli {
             coordination: self.maintain_claims.mode(),
             claim_lease_duration,
             claim_min_input_bytes,
+            rlog_zstd_level,
             ..ravel_maintain::CompactorConfig::default()
         })
     }
@@ -12386,6 +12408,26 @@ mod tests {
             .parse_maintain_claim_min_input_bytes()
             .expect_err("zero is refused");
         assert!(err.to_string().contains("must be nonzero"), "{err}");
+    }
+
+    /// `--maintain-compaction-zstd-level` unset leaves the compactor at level
+    /// 9, a set level reaches `CompactorConfig::rlog_zstd_level`, and a level
+    /// outside 1..=22 fails startup naming the flag.
+    #[test]
+    fn maintain_compaction_zstd_level_reaches_the_compactor() {
+        assert_eq!(compactor(&[]).expect("default").rlog_zstd_level, 9);
+        assert_eq!(
+            compactor(&["--maintain-compaction-zstd-level", "4"])
+                .expect("4")
+                .rlog_zstd_level,
+            4
+        );
+        for level in ["0", "23"] {
+            let err = compactor(&["--maintain-compaction-zstd-level", level])
+                .expect_err("out of range is refused");
+            let text = format!("{err:#}");
+            assert!(text.contains("--maintain-compaction-zstd-level"), "{text}");
+        }
     }
 
     /// `--maintain-claims` defaults to on and its `.mode()` maps each variant

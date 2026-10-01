@@ -234,6 +234,8 @@ pub enum MaintainError {
         /// The RLOG output format version PAGE_DIR is mandatory in.
         format_version: u32,
     },
+    #[error("RLOG compaction refused before reading any input: {0}")]
+    InvalidRlogZstdLevel(#[from] crate::config::RlogZstdLevelError),
     #[error("compaction invariant breach: {0}")]
     Invariant(String),
     #[error(

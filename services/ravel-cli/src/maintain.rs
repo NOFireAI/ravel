@@ -207,6 +207,8 @@ pub enum CompactorKnobError {
          in-progress L1 part is closed at, and 0 would close a part before any bytes are written"
     )]
     ZeroMaxL1PartBytes,
+    #[error("--compaction-zstd-level: {0}")]
+    InvalidRlogZstdLevel(#[from] ravel_maintain::RlogZstdLevelError),
 }
 
 /// The compactor config a `compact-bucket` / `compact-tenant` invocation runs
@@ -227,13 +229,16 @@ pub enum CompactorKnobError {
 /// The two byte-target overrides are validated: zero is refused with a typed
 /// [`CompactorKnobError`] because each field's own doc frames it as the byte
 /// budget a part is closed at. `input_read_concurrency` is not floored here:
-/// its field doc already states below-1 is treated as 1.
+/// its field doc already states below-1 is treated as 1. `rlog_zstd_level`
+/// replaces [`CompactorConfig::rlog_zstd_level`] and is refused outside the
+/// range [`ravel_maintain::validate_rlog_zstd_level`] accepts.
 pub fn build_compactor_config(
     dry_run: bool,
     max_flush_lifetime_ns: Option<i64>,
     l1_part_memory_target_bytes: Option<u64>,
     max_l1_part_bytes: Option<u64>,
     input_read_concurrency: Option<usize>,
+    rlog_zstd_level: Option<i32>,
 ) -> Result<CompactorConfig, CompactorKnobError> {
     let mut config = CompactorConfig {
         dry_run,
@@ -257,6 +262,9 @@ pub fn build_compactor_config(
     }
     if let Some(n) = input_read_concurrency {
         config.input_read_concurrency = n;
+    }
+    if let Some(level) = rlog_zstd_level {
+        config.rlog_zstd_level = ravel_maintain::validate_rlog_zstd_level(level)?;
     }
     Ok(config)
 }
@@ -285,6 +293,7 @@ pub async fn compact(
     hour: u32,
     dry_run: bool,
     max_flush_lifetime_ns: Option<i64>,
+    rlog_zstd_level: Option<i32>,
     claims: &ClaimOptions,
 ) -> anyhow::Result<()> {
     let mut out = std::io::stdout();
@@ -298,6 +307,7 @@ pub async fn compact(
         hour,
         dry_run,
         max_flush_lifetime_ns,
+        rlog_zstd_level,
         wall_clock()?,
         claims,
     )
@@ -317,12 +327,20 @@ pub async fn compact_to(
     hour: u32,
     dry_run: bool,
     max_flush_lifetime_ns: Option<i64>,
+    rlog_zstd_level: Option<i32>,
     clock: FixedClock,
     claims: &ClaimOptions,
 ) -> anyhow::Result<()> {
     let tenant_hash = TenantId::new(tenant).hash();
     let bucket = Bucket::new(tenant_hash, signal.to_signal(), shard, hour);
-    let mut config = build_compactor_config(dry_run, max_flush_lifetime_ns, None, None, None)?;
+    let mut config = build_compactor_config(
+        dry_run,
+        max_flush_lifetime_ns,
+        None,
+        None,
+        None,
+        rlog_zstd_level,
+    )?;
     let claims_line = install_claims(&mut config, dry_run, claims);
 
     selection.print_header();
@@ -647,6 +665,7 @@ pub async fn compact_tenant(
     max_l1_part_bytes: Option<u64>,
     input_read_concurrency: Option<usize>,
     bucket_concurrency: usize,
+    rlog_zstd_level: Option<i32>,
     now_ns: i64,
     claims: &ClaimOptions,
 ) -> anyhow::Result<CompactTenantReport> {
@@ -666,6 +685,7 @@ pub async fn compact_tenant(
         max_l1_part_bytes,
         input_read_concurrency,
         bucket_concurrency,
+        rlog_zstd_level,
         now_ns,
         claims,
     )
@@ -694,6 +714,7 @@ pub async fn compact_tenant_to(
     max_l1_part_bytes: Option<u64>,
     input_read_concurrency: Option<usize>,
     bucket_concurrency: usize,
+    rlog_zstd_level: Option<i32>,
     now_ns: i64,
     claims: &ClaimOptions,
 ) -> anyhow::Result<CompactTenantReport> {
@@ -711,6 +732,7 @@ pub async fn compact_tenant_to(
         l1_part_memory_target_bytes,
         max_l1_part_bytes,
         input_read_concurrency,
+        rlog_zstd_level,
     )?;
     let claims_line = install_claims(&mut config, dry_run, claims);
     // A zero fan-out is refused before any store access, like the byte-target

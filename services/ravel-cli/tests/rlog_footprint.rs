@@ -453,6 +453,7 @@ async fn tenant_footprint_reads_only_directories() {
         None,
         None,
         1,
+        None,
         BASE_NS + 2 * NS_PER_HOUR,
         &ClaimOptions::fresh(),
     )

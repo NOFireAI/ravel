@@ -666,6 +666,35 @@ pub enum AdmissionMode {
     EagerAll,
 }
 
+/// Default `rlog_zstd_level`: 9 (ADR-2135 decision 4). Compaction and the
+/// erasure rewrite write once per bucket and are read many times, so they take
+/// a higher level than the ingest path's 3; readers are indifferent to it.
+pub const DEFAULT_RLOG_ZSTD_LEVEL: i32 = 9;
+/// Lowest accepted `rlog_zstd_level`. zstd's negative "fast" levels are refused.
+pub const MIN_RLOG_ZSTD_LEVEL: i32 = 1;
+/// Highest accepted `rlog_zstd_level`: zstd's maximum level.
+pub const MAX_RLOG_ZSTD_LEVEL: i32 = 22;
+
+/// An `rlog_zstd_level` outside
+/// [`MIN_RLOG_ZSTD_LEVEL`]`..=`[`MAX_RLOG_ZSTD_LEVEL`] was configured.
+#[derive(Debug, Clone, Copy, thiserror::Error, PartialEq, Eq)]
+#[error(
+    "rlog zstd level {level} is outside the accepted range {MIN_RLOG_ZSTD_LEVEL}..={MAX_RLOG_ZSTD_LEVEL}"
+)]
+pub struct RlogZstdLevelError {
+    /// The refused level.
+    pub level: i32,
+}
+
+/// Validate a compaction zstd level, returning it unchanged when accepted.
+pub fn validate_rlog_zstd_level(level: i32) -> Result<i32, RlogZstdLevelError> {
+    if (MIN_RLOG_ZSTD_LEVEL..=MAX_RLOG_ZSTD_LEVEL).contains(&level) {
+        Ok(level)
+    } else {
+        Err(RlogZstdLevelError { level })
+    }
+}
+
 /// Default `grace`: 24 hours (docs/consistency-model.md "Deletion and GC").
 /// A shared floor for the orphan and unreferenced-part age gates.
 pub const DEFAULT_GRACE_NS: i64 = 24 * NS_PER_HOUR;
@@ -1078,6 +1107,13 @@ pub struct CompactorConfig {
     /// differential part-hash test sets [`AdmissionMode::EagerAll`]; output
     /// bytes are identical either way.
     pub merge_admission: AdmissionMode,
+    /// zstd level the RLOG compaction merge and the erasure rewrite write their
+    /// parts at (ADR-2135 decision 4). Checked by [`validate_rlog_zstd_level`]
+    /// before a merge reads anything; a level outside
+    /// [`MIN_RLOG_ZSTD_LEVEL`]`..=`[`MAX_RLOG_ZSTD_LEVEL`] fails the run with
+    /// [`crate::error::MaintainError::InvalidRlogZstdLevel`]. Default
+    /// [`DEFAULT_RLOG_ZSTD_LEVEL`] (9).
+    pub rlog_zstd_level: i32,
     /// This compactor process's uuid. Informational only: it is recorded in
     /// each part's footer `writer_id` and never enters dedup priority.
     /// Default is the nil uuid; the service sets a real one.
@@ -1266,6 +1302,7 @@ impl Default for CompactorConfig {
             input_read_concurrency: DEFAULT_INPUT_READ_CONCURRENCY,
             merge_cursor_budget_bytes: DEFAULT_MERGE_CURSOR_BUDGET_BYTES,
             merge_admission: AdmissionMode::Overlap,
+            rlog_zstd_level: DEFAULT_RLOG_ZSTD_LEVEL,
             compactor_writer_id: Uuid::nil(),
             grace_ns: DEFAULT_GRACE_NS,
             protection_horizon_ns: DEFAULT_PROTECTION_HORIZON_NS,
