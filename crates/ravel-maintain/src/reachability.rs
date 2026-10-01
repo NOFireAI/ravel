@@ -354,6 +354,7 @@ impl SnapshotReachability {
     /// degenerate state (the tenant's whole live snapshot for this signal is
     /// empty) the anti-stall requirement does not need to cover, since no
     /// steady fold cadence exists to stall.
+    #[allow(clippy::too_many_arguments)]
     async fn age_and_clear(
         &mut self,
         store: &dyn ObjectStoreBackend,
