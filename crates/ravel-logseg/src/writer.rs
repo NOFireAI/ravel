@@ -3046,7 +3046,10 @@ impl BlocksBuilder {
     /// The current group's string chunks that store strictly smaller on one
     /// row-group dictionary than on their per-block value pages. A chunk
     /// qualifies only when its distinct values are at most half its present
-    /// values. Resets the group's string state.
+    /// values. Each side counts its pages' stored bytes plus their PAGE_DIR
+    /// entries as the uncompressed section encodes them, so the dictionary
+    /// page's own entry is charged to the dictionary. Resets the group's string
+    /// state.
     fn group_dicts(&mut self, pending: &[BlockWriteOut]) -> BTreeMap<u32, GroupDict> {
         let level = self.layout.zstd_level;
         let mut out = BTreeMap::new();
@@ -3070,7 +3073,7 @@ impl BlocksBuilder {
             let sorted: Vec<&[u8]> = entries.iter().map(|(v, _)| v.as_slice()).collect();
             let dict = seal_page(Enc::DictPage, encode_dict_page(&sorted), level);
             let mut ids: Vec<Option<SealedPage>> = vec![None; pending.len()];
-            let mut new_len = dict.stored.len() as u64;
+            let mut new_len = dict.stored.len() as u64 + sealed_entry_len(pending.len(), &dict);
             let mut old_len = 0u64;
             for (block, gids) in &col.blocks {
                 let remapped: Vec<u64> = gids
@@ -3082,14 +3085,16 @@ impl BlocksBuilder {
                     encode_dict_ids(&remapped, entries.len()),
                     level,
                 );
-                new_len += page.stored.len() as u64;
+                new_len += page.stored.len() as u64 + sealed_entry_len(*block, &page);
                 old_len += pending
                     .get(*block)
                     .map(|b| {
                         b.descs
                             .iter()
                             .filter(|d| d.column_id == column_id && d.enc != Enc::Bitmap)
-                            .map(|d| d.len)
+                            .map(|d| {
+                                d.len + dir_entry_len(*block, d.enc, d.comp, d.len, d.uncomp_len)
+                            })
                             .sum::<u64>()
                     })
                     .unwrap_or(0);
@@ -3237,6 +3242,31 @@ impl BlocksBuilder {
         self.flush_group();
         (self.bytes, self.l0, self.dir)
     }
+}
+
+/// Bytes the PAGE_DIR entry of a page at `block` with these fields takes. The
+/// crc32c is four fixed bytes whatever its value, so it is not an input.
+fn dir_entry_len(block: usize, enc: Enc, comp: u8, len: u64, uncomp_len: u64) -> u64 {
+    PageEntry {
+        block: block as u32,
+        enc,
+        comp,
+        len,
+        uncomp_len,
+        crc32c: 0,
+    }
+    .encoded_len()
+}
+
+/// [`dir_entry_len`] for a sealed page placed at `block`.
+fn sealed_entry_len(block: usize, page: &SealedPage) -> u64 {
+    dir_entry_len(
+        block,
+        page.enc,
+        page.comp,
+        page.stored.len() as u64,
+        page.uncomp_len,
+    )
 }
 
 /// The SKIP_IDX level-0 entry for one encoded block.

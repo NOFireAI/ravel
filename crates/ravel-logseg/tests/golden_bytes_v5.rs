@@ -148,16 +148,13 @@ fn matches_golden_fixture() {
     // fully present column contributes its value page, a partially present one
     // its presence bitmap page as well. Both shapes occur in this fixture, which
     // is why a chunk's page_count is not the count of blocks carrying the
-    // column. A string chunk may lead with a row-group dictionary page on top
-    // (ADR-2135 decision 6), and this fixture's repeated `INFO` and `GET`
-    // strings take one.
+    // column. A one-block group never takes a row-group dictionary (ADR-2135
+    // decision 6): the dictionary page holds what the block's own dictionary
+    // page holds, plus a PAGE_DIR entry of its own, so it cannot be smaller.
     assert!(
-        dir.groups[0]
-            .chunks
-            .iter()
-            .all(|c| c.pages.len() - usize::from(c.dict_page().is_some()) <= 2),
+        dir.groups[0].chunks.iter().all(|c| c.pages.len() <= 2),
         "a one-block group's column chunks are a value page and at most a \
-         presence page, past any dictionary page"
+         presence page"
     );
     assert!(
         dir.groups[0]
@@ -167,8 +164,8 @@ fn matches_golden_fixture() {
         "the fixture has a partially present column, so a presence page exists"
     );
     assert!(
-        dir.groups[0].chunks.iter().any(|c| c.dict_page().is_some()),
-        "the fixture has a string chunk stored on a row-group dictionary"
+        dir.groups[0].chunks.iter().all(|c| c.dict_page().is_none()),
+        "the fixture's repeated `INFO` and `GET` strings stay on per-block pages"
     );
     assert_eq!(dir.block_count(), 1);
 }

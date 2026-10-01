@@ -67,6 +67,24 @@ impl PageEntry {
             uncomp_len: self.uncomp_len,
         }
     }
+
+    /// Appends the entry's PAGE_DIR encoding: `block` varint, `enc`, `comp`,
+    /// `len` varint, `uncomp_len` varint, then the crc32c little-endian.
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        put_uvarint(out, u64::from(self.block));
+        out.push(self.enc.to_u8());
+        out.push(self.comp);
+        put_uvarint(out, self.len);
+        put_uvarint(out, self.uncomp_len);
+        out.extend_from_slice(&self.crc32c.to_le_bytes());
+    }
+
+    /// Bytes this entry takes in the uncompressed PAGE_DIR section.
+    pub fn encoded_len(&self) -> u64 {
+        let mut out = Vec::with_capacity(32);
+        self.encode_into(&mut out);
+        out.len() as u64
+    }
 }
 
 /// One column chunk: every page one column has in one row group, contiguous.
@@ -378,12 +396,7 @@ impl PageDir {
                 put_uvarint(&mut out, c.offset);
                 put_uvarint(&mut out, c.pages.len() as u64);
                 for p in &c.pages {
-                    put_uvarint(&mut out, u64::from(p.block));
-                    out.push(p.enc.to_u8());
-                    out.push(p.comp);
-                    put_uvarint(&mut out, p.len);
-                    put_uvarint(&mut out, p.uncomp_len);
-                    out.extend_from_slice(&p.crc32c.to_le_bytes());
+                    p.encode_into(&mut out);
                 }
             }
         }

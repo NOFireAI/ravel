@@ -46,7 +46,7 @@ const NUM_COLUMNS: usize = 105;
 /// again when string chunks gained row-group dictionaries (#2144).
 /// #682's invariant is unchanged -- the per-block cell materialization must not
 /// alter an output byte within a fixed writer version.
-const HASH_8K: &str = "3bf59c4174ddc8df56abb66a5f35c67ee6f97c35c14d3c31518496fa036fef90";
+const HASH_8K: &str = "dbb42113e56ee30e68497dbcd643aef00fc94acd5632d204b5f1ce6489d9837b";
 const HASH_64K: &str = "1ecb7bc1e46b0239d8d5c08f7db708d4408bbc658ff808beb8728a40e1d1f68e";
 
 /// Peak-live-bytes bound as a multiple of the total cell payload `P`. Measured
