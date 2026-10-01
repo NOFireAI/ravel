@@ -1,13 +1,13 @@
 //! Validation of grouped `MIN`/`MAX` and the `stddev`/`var` family in the v1
 //! SQL subset.
 //!
-//! These probe only `ravel_sql::validate`, which is a pure function of the
+//! These probe only `ravel_sql::validate_query`, which is a pure function of the
 //! request text: no DataFusion session, catalog, or fixture is required, so
 //! the tests are fully deterministic.
 
 #![allow(clippy::expect_used)]
 
-use ravel_sql::validate;
+use ravel_sql::validate_query;
 
 /// A grouped `MIN`/`MAX` reachable only through a query-level `ORDER BY` (a
 /// field of `Query`, not `Select`) once escaped the `reject_grouped_min_max`
@@ -25,11 +25,11 @@ use ravel_sql::validate;
 /// DataFusion session this validate-only file deliberately avoids.
 #[test]
 fn grouped_min_max_in_order_by_is_now_accepted() {
-    validate("SELECT series_id FROM samples GROUP BY series_id ORDER BY max(value)")
+    validate_query("SELECT series_id FROM samples GROUP BY series_id ORDER BY max(value)")
         .expect("grouped max() in ORDER BY is in the v1 subset (ADR-0023)");
     // Symmetric MIN case, and the same shape reached through arithmetic on the
     // aggregate rather than a bare call.
-    validate("SELECT series_id FROM samples GROUP BY series_id ORDER BY min(value) + 1")
+    validate_query("SELECT series_id FROM samples GROUP BY series_id ORDER BY min(value) + 1")
         .expect("grouped min() in ORDER BY is in the v1 subset (ADR-0023)");
 }
 
@@ -51,7 +51,7 @@ fn stddev_and_variance_family_must_be_handled_like_avg() {
         "SELECT var_pop(value) FROM samples",
     ] {
         assert!(
-            validate(sql).is_err(),
+            validate_query(sql).is_err(),
             "{sql}: shares avg's floating-mean intermediate and must be excluded \
              from the v1 subset (or the reference executor must cover it)"
         );

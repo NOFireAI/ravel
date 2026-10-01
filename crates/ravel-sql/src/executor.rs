@@ -139,7 +139,7 @@ use crate::session::{
 use crate::spans_fetcher::SpanSegmentFetcher;
 use crate::spans_provider::SpansTableProvider;
 use crate::spill::{OperatorSpill, SpillCounts, SpillScratch, accumulate_spill_counts};
-use crate::validate::{referenced_base_tables, unreadable_table_reference, validate};
+use crate::validate::{referenced_base_tables, unreadable_table_reference, validate_query};
 
 /// Which of the five v1 tables (and thus which `Signal`) a query targets, or
 /// whether it reads Parquet tables instead (ADR-2040).
@@ -1229,7 +1229,7 @@ impl SqlExecutor {
         live: &LiveAccounting,
     ) -> Result<SqlOutcome, SqlError> {
         // Step 1: the security gate runs before any catalog or plan work.
-        validate(&req.sql)?;
+        validate_query(&req.sql)?;
 
         let millis = u64::try_from(req.deadline.as_millis()).unwrap_or(u64::MAX);
         tokio::time::timeout(req.deadline, self.run(tenant_hash, req, live))
@@ -1284,7 +1284,7 @@ impl SqlExecutor {
         // Same order as `execute`: the security gate first, so a rejected
         // statement costs no catalog LIST here either, and it runs outside the
         // timeout because a rejection is not a thing that can time out.
-        validate(&req.sql)?;
+        validate_query(&req.sql)?;
 
         let millis = u64::try_from(req.deadline.as_millis()).unwrap_or(u64::MAX);
         tokio::time::timeout(

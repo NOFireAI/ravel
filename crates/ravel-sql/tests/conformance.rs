@@ -36,7 +36,7 @@ use ravel_sql::conformance::{
     Category, Classification, Construct, Verdict, Verified, registry, render_document,
     render_example_manifest, score,
 };
-use ravel_sql::{QueryOutput, SqlError, ValidationError, validate};
+use ravel_sql::{QueryOutput, SqlError, ValidationError, validate_query};
 use ravel_types::{Signal, TenantId, logstream};
 use util::{Fixture, SegSpec, SeriesSpec, request, tenant_id};
 use uuid::Uuid;
@@ -483,7 +483,7 @@ async fn verify(construct: &Construct, fixture: &Fixture) -> Verdict {
                     },
                 }
             } else if construct.category == Category::WindowFrame {
-                // Moving-frame `avg` is not refused by `validate` (`avg` is
+                // Moving-frame `avg` is not refused by `validate_query` (`avg` is
                 // admitted) nor by a registry gate: it fails closed inside
                 // DataFusion's sliding-window planner, so it must be executed to
                 // see the typed error, and only over a fixture with rows (an
@@ -507,7 +507,7 @@ async fn verify(construct: &Construct, fixture: &Fixture) -> Verdict {
                 // Every other rejected construct is refused by the read-only
                 // single-statement gate before any planning, so the typed
                 // error is a `ValidationError`.
-                match validate(&construct.example) {
+                match validate_query(&construct.example) {
                     Ok(()) => Verdict::Broken {
                         observed: "statement was accepted by the gate".to_string(),
                     },

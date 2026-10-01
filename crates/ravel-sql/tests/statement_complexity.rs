@@ -1,8 +1,8 @@
 //! The pre-parse structural-complexity gate on the SQL surface (issue #1680).
 //!
-//! `validate` is the single funnel every SQL surface reaches (the HTTP
+//! `validate_query` is the single funnel every SQL surface reaches (the HTTP
 //! handler, `get_flight_info_statement`, `do_get_statement`, and the page
-//! plan), so these cases exercise the gate through `validate` itself rather
+//! plan), so these cases exercise the gate through `validate_query` itself rather
 //! than through the guard module directly: what matters is that a statement
 //! whose tree would abort the process never reaches `DFParser::parse_sql`, and
 //! that an ordinary analytic statement still does.
@@ -13,7 +13,7 @@
 //! on it would prove nothing about the endpoint.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use ravel_sql::{MAX_STATEMENT_COMPLEXITY, ValidationError, structural_count, validate};
+use ravel_sql::{MAX_STATEMENT_COMPLEXITY, ValidationError, structural_count, validate_query};
 
 /// A tokio worker's stack budget.
 const WORKER_STACK_BYTES: usize = 2 << 20;
@@ -29,14 +29,14 @@ fn on_worker_stack<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static)
 }
 
 /// The payload from the ticket: a 1 MiB body holding `SELECT 1` and `+1`
-/// 500,000 times. Before the guard, `validate` parsed this and then walked the
+/// 500,000 times. Before the guard, `validate_query` parsed this and then walked the
 /// 500,000-level tree, overflowing the worker stack and aborting the process.
 /// It is now a typed rejection carrying both counts.
 #[test]
 fn the_half_million_operator_statement_is_rejected_with_the_typed_error() {
     let err = on_worker_stack(|| {
         let sql = format!("SELECT 1{}", "+1".repeat(500_000));
-        validate(&sql).expect_err("must be rejected")
+        validate_query(&sql).expect_err("must be rejected")
     });
     match err {
         ValidationError::TooComplex(too_complex) => {
@@ -53,7 +53,7 @@ fn the_half_million_operator_statement_is_rejected_with_the_typed_error() {
 fn a_concatenation_chain_is_rejected_too() {
     let err = on_worker_stack(|| {
         let sql = format!("SELECT 'a'{}", "||'a'".repeat(500_000));
-        validate(&sql).expect_err("must be rejected")
+        validate_query(&sql).expect_err("must be rejected")
     });
     assert!(
         matches!(err, ValidationError::TooComplex(_)),
@@ -70,7 +70,7 @@ fn a_long_boolean_chain_is_rejected_too() {
             "SELECT ts FROM samples WHERE 1=1{}",
             " AND 1=1".repeat(500_000)
         );
-        validate(&sql).expect_err("must be rejected")
+        validate_query(&sql).expect_err("must be rejected")
     });
     assert!(
         matches!(err, ValidationError::TooComplex(_)),
@@ -105,7 +105,7 @@ fn a_realistic_analytic_statement_is_accepted() {
              LIMIT 100",
             in_list.join(", ")
         );
-        validate(&sql).expect("a statement a real user would write must be accepted");
+        validate_query(&sql).expect("a statement a real user would write must be accepted");
         sql
     });
     // The statement is substantial, not a token gesture at one: pin its size
@@ -134,7 +134,7 @@ fn every_clickbench_corpus_statement_is_accepted() {
     for entry in entries {
         let sql = entry["sql"].as_str().expect("entry has sql");
         let id = entry["id"].as_str().unwrap_or("<unnamed>").to_string();
-        validate(sql).unwrap_or_else(|err| panic!("{id} must pass the gate: {err}"));
+        validate_query(sql).unwrap_or_else(|err| panic!("{id} must pass the gate: {err}"));
         let count = structural_count(sql);
         if count > widest.0 {
             widest = (count, id);
@@ -163,7 +163,7 @@ fn nested_parentheses_are_refused_by_the_parser_recursion_limit() {
     on_worker_stack(|| {
         let deep = format!("SELECT {}1{}", "(".repeat(200), ")".repeat(200));
         assert!(structural_count(&deep) < MAX_STATEMENT_COMPLEXITY);
-        match validate(&deep).expect_err("must be refused") {
+        match validate_query(&deep).expect_err("must be refused") {
             ValidationError::Parse(message) => assert!(
                 message.contains("Recursion"),
                 "the parser's own limit must be what refuses it: {message}"
@@ -171,7 +171,7 @@ fn nested_parentheses_are_refused_by_the_parser_recursion_limit() {
             other => panic!("expected a parse error, got {other:?}"),
         }
 
-        validate("SELECT ((((((((((1))))))))))").expect("shallow nesting still parses");
+        validate_query("SELECT ((((((((((1))))))))))").expect("shallow nesting still parses");
     });
 }
 
@@ -212,7 +212,7 @@ fn operator_characters_inside_a_string_literal_do_not_count() {
     on_worker_stack(|| {
         let payload = "+1".repeat(500_000);
         let sql = format!("SELECT ts FROM logs WHERE body = '{payload}'");
-        validate(&sql).expect("a long literal is not structure");
+        validate_query(&sql).expect("a long literal is not structure");
     });
 }
 
@@ -222,14 +222,14 @@ fn operator_characters_inside_a_string_literal_do_not_count() {
 fn a_long_comment_does_not_count() {
     on_worker_stack(|| {
         let payload = "+1".repeat(500_000);
-        validate(&format!("SELECT ts FROM logs -- {payload}\n"))
+        validate_query(&format!("SELECT ts FROM logs -- {payload}\n"))
             .expect("a line comment is not structure");
-        validate(&format!("SELECT ts FROM logs /* {payload} */"))
+        validate_query(&format!("SELECT ts FROM logs /* {payload} */"))
             .expect("a block comment is not structure");
     });
 }
 
-/// The boundary itself, through `validate` rather than through the guard's own
+/// The boundary itself, through `validate_query` rather than through the guard's own
 /// unit tests: a statement at the bound passes the gate and is accepted, and
 /// two characters more are refused by the gate with the exact counts.
 ///
@@ -253,10 +253,10 @@ fn the_gate_fires_one_character_past_the_bound() {
             MAX_STATEMENT_COMPLEXITY,
             "the probe must sit exactly on the bound for this case to pin it"
         );
-        validate(&at_bound).expect("a statement at the bound passes the gate");
+        validate_query(&at_bound).expect("a statement at the bound passes the gate");
 
         let over = format!("{at_bound},1");
-        match validate(&over).expect_err("one item more is refused") {
+        match validate_query(&over).expect_err("one item more is refused") {
             ValidationError::TooComplex(too_complex) => {
                 assert_eq!(too_complex.count, MAX_STATEMENT_COMPLEXITY + 1);
                 assert_eq!(too_complex.max, MAX_STATEMENT_COMPLEXITY);
