@@ -192,6 +192,34 @@ async fn create_external_table_then_read_back() {
 }
 
 #[tokio::test]
+async fn ravel_cast_naming_a_column_absent_from_the_snapshot_schema_is_refused() {
+    // `validate_ddl` admits `ravel.cast.<column>` for any column name that
+    // passes the charset rule; it has no schema to check the column against.
+    // The Parquet file under LOCATION has `id`, `name`, `score`, not
+    // `missing`, and that can only be known once the snapshot above has run.
+    let lake = Lake::memory_store();
+    let t = tenant("acme");
+    lake.grant(&t).await;
+    lake.put_file("t/hits/0.parquet", parquet_bytes(&[1], &["a"], &[0.5]))
+        .await;
+
+    let sql = format!(
+        "CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/' \
+         OPTIONS ('ravel.cast.missing' 'date-from-days')"
+    );
+    let err = lake
+        .executor
+        .execute_ddl(t, &sql, CREATED_BY, deadline())
+        .await
+        .expect_err("a cast naming an absent column must be refused");
+
+    assert!(
+        matches!(err, DdlExecuteError::UnknownCastColumn { ref column } if column == "missing"),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
 async fn create_if_not_exists_on_existing_table_is_a_no_op() {
     let lake = Lake::memory_store();
     let t = tenant("acme");
