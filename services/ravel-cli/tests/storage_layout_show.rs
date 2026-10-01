@@ -23,10 +23,10 @@ const TENANT: &str = "acme";
 /// The line a set key ends with when the record has no typed_attr_columns
 /// override.
 const NO_OVERRIDE_NOTE: &str = "note: tenant acme has no typed attribute column override, so \
-                                each column's type and whether it is declared come from the \
-                                deployment's declaration, which this command cannot read; \
-                                ingest leaves the key unresolved when it names a column that \
-                                declaration does not declare\n";
+                                this command checked the key's shape only; this build's log \
+                                ingest flush resolves a key against that override alone, so it \
+                                leaves this key unresolved and writes the tenant's log objects \
+                                without it\n";
 
 fn column(key: &str, ty: sysproto::TypedAttrColumnType) -> sysproto::TypedAttrColumn {
     sysproto::TypedAttrColumn {

@@ -38,9 +38,9 @@ pub async fn clustering_key_show(
 /// deployment default, which this command cannot read, so the column prints
 /// `deployment-default` in place of a type and the key is checked for shape
 /// only (generation, column count, duplicates, bucket width). A set key then
-/// ends with a `note:` line saying so, since ingest resolves the key against
-/// that declaration and leaves it unresolved when it names a column the
-/// deployment does not declare.
+/// ends with a `note:` line saying so, and that the log ingest flush, which
+/// resolves a key against the record's own override alone, leaves it
+/// unresolved.
 pub async fn clustering_key_show_to(
     store: Arc<dyn ObjectStoreBackend>,
     tenant: &str,
@@ -88,10 +88,10 @@ pub async fn clustering_key_show_to(
             if config.typed_attr_columns.is_none() {
                 writeln!(
                     out,
-                    "note: tenant {tenant} has no typed attribute column override, so each \
-                     column's type and whether it is declared come from the deployment's \
-                     declaration, which this command cannot read; ingest leaves the key \
-                     unresolved when it names a column that declaration does not declare"
+                    "note: tenant {tenant} has no typed attribute column override, so this \
+                     command checked the key's shape only; this build's log ingest flush \
+                     resolves a key against that override alone, so it leaves this key \
+                     unresolved and writes the tenant's log objects without it"
                 )?;
             }
         }
