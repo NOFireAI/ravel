@@ -1,6 +1,6 @@
 # ADR-1133: an unnamed-since marker gates sweep deletes on the pinned-query window
 
-Status: Accepted (2026-10-01)
+Status: Accepted (2026-10-01; revised 2026-10-02 after review)
 
 ## Context
 
@@ -18,7 +18,7 @@ Neither condition says when HEAD *stopped* naming the object. A query resolves o
 
 The lifecycle model confirms this: formal/tla/lifecycle/results.md, "Candidate #1133: CONFIRMED unsafe", has a six-state trace violating `NoDeleteInsideProtectionWindow`, and its pinned-query clause (`HorizonGuardsPinnedQueries`) is load-bearing. The Rust gates do not implement that clause.
 
-What the clause needs is a durable time that is **never earlier than the moment HEAD stopped naming the object**, plus `max_query_duration`. Every timestamp that exists today fails that test or stalls the sweeps (see Rejected alternatives).
+What the clause needs is a durable time that is **never earlier than the moment HEAD stopped naming the object**, bound to the delete it gates, plus the longest time a query can keep reading after that moment. Every timestamp that exists today fails that test or stalls the sweeps (see Rejected alternatives).
 
 ## Decision
 
@@ -26,84 +26,122 @@ What the clause needs is a durable time that is **never earlier than the moment 
 
 The first time a sweep pass finds a delete candidate past its horizon and not named by the live HEAD, it writes an **unnamed-since marker** with `PutMode::CreateIfAbsent`. `AlreadyExists` counts as success: the existing marker stands, and its body is read back.
 
-The markers live under their own per-signal prefix, `t/<tenant_hash>/<signal>/unn/`, never under the commit prefix `c/<shard>/<ingest_hour>/`. Keys there must match a known shape, and `partition_bucket_entry` (crates/ravel-commit/src/keys.rs) fails loud on anything else, including in a build older than this one.
+The markers live under the per-signal maintenance prefix:
 
-- **Retention:** one marker per tombstoned bucket, `t/<tenant_hash>/<signal>/unn/<shard>/<ingest_hour>/retire.unn`.
-- **Superseded inputs:** one marker per chain group, keyed by the record the group is entered from (the record whose `created_unix_ns` anchors the horizon): `t/<tenant_hash>/<signal>/unn/<shard>/<ingest_hour>/<record file stem>.unn`.
+- **Retention:** one marker per tombstoned bucket, `t/<tenant_hash>/<signal>/maint/unn/<shard>/<ingest_hour>/retire.unn`.
+- **Superseded inputs:** one marker per chain group, keyed by the record the group is entered from (the record whose `created_unix_ns` anchors the horizon), `t/<tenant_hash>/<signal>/maint/unn/<shard>/<ingest_hour>/<record file stem>.unn`.
+
+This placement avoids two problems:
+- **Commit-path classification.** The commit prefix `c/<shard>/<ingest_hour>/` holds only shapes that `partition_bucket_entry` (crates/ravel-commit/src/keys.rs) classifies. Any other key there is a fail-loud error, in this build and in older ones.
+- **IAM.** The maintain role's write grant already covers `t/*/*/maint/*` (deploy/iam/maintain.json), as it does for the scrub cursor. A new sibling prefix would have no grant, so under per-role credentials every marker write would fail and, by decision 6, every delete would stall.
 
 The marker is immutable, small and versioned, and holds no tenant data. Its body carries:
+
 - `format_version`;
-- `observed_unix_ns`, the writing sweeper's own clock reading when it found the candidate unnamed;
-- for forensics only, the HEAD version it observed.
+- `observed_unix_ns`: the writing sweeper's own clock reading when it found the candidate unnamed;
+- **anchor identity**: the kind (retention or superseded), the anchor's key (`retire.tmb` or the record), its anchoring timestamp (`retired_at_ns` or `created_unix_ns`) and its store version;
+- for forensics only, the HEAD version observed.
 
-The anchor is `observed_unix_ns`. The store's `last_modified` is not used: docs/object-store-contract.md reserves it for advisory age decisions and rules it out as a correctness input. That keeps this gate on the same footing as the existing horizon rules, which anchor on durable timestamps and compare them with the sweeper's own clock (docs/deletion-and-gc.md).
+The anchor time is `observed_unix_ns`. The store's `last_modified` is not used: docs/object-store-contract.md reserves it for advisory age decisions and rules it out as a correctness input. This keeps the gate on the same footing as the existing horizon rules, which compare durable timestamps with the sweeper's own clock.
 
-### 2. A delete waits until the marker is older than the pinned-query window
+### 2. A marker counts only for the anchor it was written for
+
+A marker whose anchor identity does not match the current tombstone or record is treated as absent: it is deleted, a fresh one is written, and the window restarts.
+
+The mismatch case is real. An older sweeper running beside a newer one can delete a tombstone or record by the old rule and leave the newer sweeper's marker behind. A later tombstone or record for the same bucket or group would then find an already-aged marker and clear at once.
+
+### 3. A delete waits until the marker is older than the pinned-query window
 
 A candidate the HEAD does not name is deleted only when
 
 ```
-marker.observed_unix_ns + max_query_duration + head_cache_ttl + 2 * clock_skew_allowance <= now_ns
+marker.observed_unix_ns + max_query_duration + head_cache_ttl + 4 * clock_skew_allowance <= now_ns
 ```
 
 Until then the gate answers a new block reason, `SnapshotBlock::PinnedWindow`. Each existing block counter, report field and `/metrics` `reason` label gains its own `pinned_window` value.
 
-**Why this is safe.** Write `t_drop` for the true time a HEAD that names X is first replaced by one that does not.
-- A query resolves HEAD through a TTL cache (`head_cache_ttl`, docs/catalog-and-mvcc.md), so a query can still be handed a HEAD that names X until `t_drop + head_cache_ttl`. It then reads for at most `max_query_duration`; the query engine's deadline is validated `<= max_query_duration` at startup (docs/deletion-and-gc.md). Every query that could need X has therefore ended by `t_drop + head_cache_ttl + max_query_duration`.
-- A sweep can only observe X unnamed after `t_drop`, so the marker's true observation time `t_m` satisfies `t_m >= t_drop`.
-- `observed_unix_ns` is the writing sweeper's clock at `t_m`, and the deleting sweeper's `now` is its own clock. These may be different processes. docs/deletion-and-gc.md already bounds every sweeper's clock within `clock_skew_allowance` of true time; the horizon arithmetic rests on that. Comparing two such clocks costs up to `2 * clock_skew_allowance`.
-- So the condition implies the deleting sweeper's true time is at least `t_m + max_query_duration + head_cache_ttl >= t_drop + head_cache_ttl + max_query_duration`, and every query that could hold X has ended.
+**Why this is safe**, for every query the consistency model covers. Write `t_drop` for the true time a HEAD that names X is first replaced by one that does not, and `σ` for `clock_skew_allowance`, which bounds every process clock against true time (docs/deletion-and-gc.md).
 
-`head_cache_ttl` in the term is the largest TTL any query process in the deployment may run with. The implementation establishes that bound:
-- if the TTL is not operator-configurable, it is the compiled `DEFAULT_HEAD_CACHE_TTL_NS`;
-- if it is configurable, it is a validated deployment-wide ceiling, which a query process is refused above.
+- **The cache delays the pin.** A resolve can be served a cached HEAD (`head_cache_ttl`, crates/ravel-catalog/src/snapshot_resolve.rs). A query can still be handed a HEAD that names X until `t_drop + head_cache_ttl`, measured on the resolving process's clock. Within one process the TTL check and the query deadline share that clock, so its offset cancels.
+- **A query ends within `max_query_duration`.** Its engine deadline is validated `<= max_query_duration` at startup (docs/deletion-and-gc.md).
+- **A Flight SQL ticket can extend that by `2σ`.** The ticket is minted on process A with A's deadline and redeemed on process B against B's clock (crates/ravel-sql/src/flight/mod.rs, `clamp_ticket_deadline_ns`). Its reads can end up to `2σ` later in true time than A's own deadline.
+- **So every covered reader of X has ended by** `t_drop + head_cache_ttl + max_query_duration + 2σ`.
+- **The marker cannot be early.** A sweep can only observe X unnamed after `t_drop`, so the marker's true observation time `t_m >= t_drop`. Its `observed_unix_ns` is the writer's clock, at most `σ` behind true time. The deleting sweeper's `now` is its own clock, at most `σ` ahead. Comparing the two costs up to `2σ`.
+- Altogether the gate needs `max_query_duration + head_cache_ttl + 4σ` past `observed_unix_ns`, and that is the condition.
 
-If neither holds, the implementation stops and this ADR is revisited.
+Readers outside the consistency model carry no validated deadline, so this ADR does not bound them: the fold, scrub, compaction, erasure rewrite, `ravel-cli export` (which resolves once and has no deadline) and the bench harness. docs/consistency-model.md says so.
 
 **Why it cannot stall.** Nothing rewrites the marker. Folds, compactions and HEAD rewrites do not touch it, so a candidate that stays unnamed is deleted once its window passes, whatever the fold cadence.
 
-### 3. `max_query_duration` comes from `sys/gc`
+### 4. The window's terms are validated, deployment-wide values in `sys/gc`
 
-The term uses the validated, deployment-wide `max_query_duration_ns` from `sys/gc` (ADR-0050 §4), the same value the protection horizon is checked against. It does not use a compiled default. The server's maintenance supervisor and `ravel-cli maintain sweep` both read it. Today the CLI builds `CompactorConfig::default()` and never reads `sys/gc`; that is fixed in the same change.
+- **`sys/gc` gains `head_cache_ttl_ns`.** `max_query_duration_ns` is already there (ADR-0050 §4), and `GC_FORMAT_VERSION` goes from 1 to 2.
+- **Query processes must match it.** Today `head_cache_ttl` is a public `CatalogConfig` field that tests and tools set freely, and no flag sets it in the server. A query-mode process now refuses to start if its effective head-cache TTL exceeds the recorded value. The field's doc comment says it is a correctness input, not only a cost knob.
+- **The version bump is the rollout ratchet.** A build refuses a `sys/gc` `format_version` it does not understand (crates/ravel-maintain/src/gc_config.rs). New builds read versions 1 and 2:
+  - on version 1 they use the compiled `DEFAULT_HEAD_CACHE_TTL_NS` and still enforce the marker gate;
+  - `ravel-cli gc-config set` writes version 2 once every process runs a build that understands it;
+  - from then on no older process can start, so no older sweeper can delete by the old rule beside the new ones.
 
-### 4. A re-named candidate restarts its window
+  docs/guides/operations/maintenance.md gives this as the upgrade procedure, and the guarantee is complete only after the flip.
+- **The CLI uses the same values.** `ravel-cli maintain sweep` reads `sys/gc` and runs the same skew validation the server's maintain mode runs (`validate_maintain_skew`). Today it builds `CompactorConfig::default()`, reads neither, and so can run with a weaker configuration than the server.
 
-If a pass finds a candidate that has a marker named by HEAD again, it deletes the marker. A later unnamed observation writes a fresh one. This is defence in depth. A dropped object is not expected to be named again, since tombstones and supersession are one-way, and ADR-1693's HEAD compare-and-swap serializes concurrent folders so that a losing folder re-reads rather than republishing a HEAD that names X. The implementation must confirm this against the fold (crates/ravel-catalog/src/fold.rs). If a dropped object can be re-named between two passes, the implementation stops and this ADR is revisited before any gate ships. Deleting a marker only ever delays a delete.
+### 5. A re-named candidate restarts its window
 
-### 5. Fail-closed, ordering and cleanup
+If a pass finds a candidate that has a marker named by HEAD again, it deletes the marker, and a later unnamed observation writes a fresh one.
 
-- A `get`, `put` or `delete` error on a marker, or a body that does not decode, blocks the delete (`Unreadable`), never permits it. A HEAD that is absent or unreadable keeps its existing ADR-0020 answer, except that a Clear verdict still requires an aged marker: no Clear path skips decision 2.
-- **Retention:** the bucket's objects are deleted, then the marker, then `retire.tmb` last, after the existing LIST-verified-empty check. The marker's prefix is outside the bucket's commit prefix, so that check is unaffected.
+This is defence in depth. A dropped object is not expected to be named again: tombstones and supersession are one-way, and ADR-1693's HEAD compare-and-swap serializes concurrent folders so that a losing folder re-reads rather than republishing a HEAD that names X. The implementation confirms this against crates/ravel-catalog/src/fold.rs and catalog.rs, including the "largest input set wins" selection. If a dropped object can be re-named between two passes, the implementation stops and this ADR is revisited before any gate ships.
+
+### 6. Fail-closed, ordering, scope and cleanup
+
+- **Any doubt blocks.** A `get`, `put` or `delete` error on a marker, a body that does not decode, or an anchor that cannot be read blocks the delete (`Unreadable`) and never permits it. A HEAD that is absent or unreadable keeps its existing ADR-0020 answer, except that a Clear verdict still requires an aged, matching marker: no Clear path skips decision 3.
+- **Retention:** the bucket's objects are deleted, then the marker, then `retire.tmb` last, after the existing LIST-verified-empty check. The marker sits outside the bucket's commit prefix, so that check is unaffected.
 - **Superseded:** the group's objects are deleted, then the marker, then the record it is keyed by.
-- **Orphan markers.** A marker whose tombstone or record no longer exists is left by a crash between the deletes. It is removed by a new sweep rule that is added to docs/deletion-and-gc.md's rule table:
-  - each sweep pass lists `t/<tenant_hash>/<signal>/unn/<shard>/`;
-  - it deletes any marker whose tombstone or record key is absent and whose `observed_unix_ns` is older than `protection_horizon`.
+- **Scope.** Markers are written only by the retention and superseded-input sweeps, never for the alerts signal: its tombstone-free retention rule is separate, and its keyspace probe lists all of `t/<hex>/a/`. A dry run writes no marker.
+- **Orphan markers.** A chain group can be re-rooted when a later rewrite record pulls the group's entering record into its own group (crates/ravel-maintain/src/sweep.rs), so the key a marker was named by is not stable for the candidate's lifetime. That is the main source of orphans, with crashes between the deletes and the mixed-version case from decision 2. A new rule in docs/deletion-and-gc.md's rule table reaps them:
+  - once per `protection_horizon` per `(tenant, signal)`, or on any pass that gated a candidate, one signal-wide LIST of `maint/unn/`, which spans every shard, including after a reshard;
+  - it deletes each marker whose anchor no longer exists and whose `observed_unix_ns` is older than `protection_horizon` on the sweeper's clock;
+  - a key under `maint/unn/` that does not parse is counted and skipped, never deleted and never fatal.
 
-  No existing rule reaps these keys.
+  A tenant with leftover markers stays in tenant discovery until they are reaped.
 
-### 6. Cost
+### 7. The lifecycle model proves the gate, not only the need for one
 
-- One `put` per delete candidate, once in its lifetime.
-- One `get` of the small body per candidate per pass while its window runs, cached per pass in `SnapshotReachability`.
-- One `delete` when the candidate goes.
-- One `list` page of `unn/<shard>/` per shard per pass for the orphan rule.
+formal/tla/lifecycle/LifecycleGC.tla gains:
+- a per-candidate observation time;
+- a head-cache delay on the pin;
+- the window gate.
 
-The superseded sweep's markers are per chain group, not per object. All of this is counted under the sweep's existing request accounting.
+`NoDeleteInsideProtectionWindow` is checked with `HorizonGuardsPinnedQueries` FALSE and the window gate on, which must pass. Each of these must fail as its own negative control:
+- `candidate-1133.cfg` promoted to `negative/pinned-query-ungated.cfg`, the gate off;
+- the gate with a single skew term;
+- the gate with no cache delay;
+- a marker accepted for the wrong anchor.
+
+traceability.md maps the new actions to the Rust gate.
+
+### 8. Cost
+
+Per candidate:
+- one `put`, once in its lifetime;
+- one `get` of the small body per pass while its window runs, cached per pass in `SnapshotReachability`;
+- one `delete` when it goes.
+
+Per tenant and signal, one LIST of `maint/unn/` per `protection_horizon` or gating pass. The superseded sweep's markers are per chain group, not per object. All of it is counted under the sweep's existing request accounting.
 
 ```mermaid
 sequenceDiagram
     participant F as Fold
     participant H as HEAD (TTL-cached by readers)
     participant S as Sweep pass
-    participant M as Marker (unn/...)
-    participant Q as Query
+    participant M as Marker (maint/unn/...)
+    participant Q as Query / Flight ticket
     Q->>H: resolve HEAD naming X (until t_drop + head_cache_ttl)
     F->>H: CAS HEAD without X (t_drop)
     S->>H: X unnamed, horizon passed
-    S->>M: CreateIfAbsent, body observed_unix_ns (t_m >= t_drop)
+    S->>M: CreateIfAbsent, body {observed, anchor identity} (t_m >= t_drop)
     S-->>S: block PinnedWindow
-    Q-->>Q: ends by t_drop + head_cache_ttl + max_query_duration
-    S->>M: get: observed + D + ttl + 2*skew <= now
+    Q-->>Q: ends by t_drop + head_cache_ttl + max_query_duration + 2σ
+    S->>M: get: anchor matches, observed + D + ttl + 4σ <= now
     S->>S: delete X, then marker, then record/tombstone
 ```
 
@@ -113,31 +151,47 @@ sequenceDiagram
    - A fold PUTs its parts well before its HEAD compare-and-swap (fold.rs ~2047-2067 against ~2241), and its CAS retries re-adopt the first write. A fold longer than the skew allowance therefore opens the gate early.
    - A fold that dies between the part PUT and the CAS leaves bytes a later fold adopts in the first HEAD that drops X, with a timestamp up to about a day old.
    - A single-part HEAD embeds the watermark and is rewritten every hour, so a window of more than an hour never elapses and both sweeps stall for every small tenant.
-2. **A new `SnapshotPartHeader` timestamp field.** It has the same write-ahead problem as alternative 1, since parts are written before the HEAD CAS that names them, and it is a frozen-format change on top.
+2. **A drop time written by the fold** (a new `SnapshotPartHeader` field, a per-hour "dropped at", or a HEAD-version log). It is stamped before the HEAD CAS that publishes it, so it has the same write-ahead flaw as alternative 1. It is a frozen-format change, and a log grows without bound.
 3. **HEAD's own timestamp** (`SnapshotHead.created_unix_ns` or HEAD's `last_modified`). It is safe, since it is never earlier than the drop, but every fold rewrites HEAD. On a fold cadence shorter than the window the gate never opens, and both sweeps stall permanently.
-4. **A per-query pin registry or reader leases.** Exact, but it needs every query process to write durable state on its read path, which ADR-0020 rejected for cost. The `LeaseCheck` hook exists and always answers "unprotected".
-5. **Extending the protection horizon.** A longer horizon does not help: the race starts when HEAD drops the object, which can be any time after the horizon.
+4. **An in-process "first seen unnamed" time**, optionally carried in the ADR-0065 memo snapshot. It has the same safety argument with no new keys. But a restart or an ownership handoff restarts the window, and the one-shot `ravel-cli maintain sweep` has no memory, so it could never clear the gate.
+5. **The tombstone or record time plus a fixed bound.** Fold lag is unbounded, so no constant bound exists.
+6. **A per-query pin registry or reader leases.** Exact, but it needs every query process to write durable state on its read path, which ADR-0020 rejected for cost. The `LeaseCheck` hook exists and always answers "unprotected".
+7. **Extending the protection horizon.** A longer horizon does not help: the race starts when HEAD drops the object, which can be any time after the horizon.
 
 ## Consequences
 
-- **Key layout.** `unn/<shard>/<ingest_hour>/retire.unn` and `unn/<shard>/<ingest_hour>/<record file stem>.unn` are new keys under a new per-signal prefix.
+- **Key layout.** `maint/unn/<shard>/<ingest_hour>/retire.unn` and `maint/unn/<shard>/<ingest_hour>/<record file stem>.unn` are additive keys under the existing per-signal `maint/` prefix, following the `idem/`, `del/` and `sys/maintain/memo` precedent.
   - docs/catalog-and-mvcc.md "Key layout" gains both, and the key-layout contract test pins them.
-  - The implementation confirms that no existing listing of `t/<tenant_hash>/<signal>/` classifies an unknown sub-prefix fail-loud, as `partition_bucket_entry` does for `c/`. If one does, the implementation stops before writing any marker.
-  - An older build never lists `unn/`, so it ignores the markers. But an older sweeper running beside a newer one still deletes by the old rule, so the guarantee holds only once every maintain process runs this version; docs/guides/operations/maintenance.md says so.
+  - The implementation confirms that no existing listing of `t/<tenant_hash>/<signal>/` or of `maint/` classifies an unknown key fail-loud. The scan cursor `maint/<shard>/cursor` shares the prefix. If anything does, the implementation stops before writing a marker.
+- **IAM.** deploy/iam/maintain.json's ListBucket `s3:prefix` condition does not include `t/*/*/maint/*` today. It is added for the orphan LIST, and crates/ravel-commit/tests/iam_templates.rs gains a witness for both the marker write and the list.
+- **Rollout.** Decision 4's `sys/gc` version 2 is the ratchet. Until it is written, an older maintain process can still delete by the old rule. After it is written, every older process refuses to start, so every process, not only maintain, must be upgraded first.
 - **Normative docs this makes false, all updated in the same change:**
-  - docs/deletion-and-gc.md: the retention and superseded-input rows of the rule table, the "HEAD-referenced snapshot delete blocker" section, and the new orphan-marker rule;
-  - docs/consistency-model.md, where it describes the delete guarantee as resting on the horizon plus the blocker;
-  - the `LeaseCheck` doc comment in crates/ravel-maintain/src/sweep.rs, which says the horizon and the age gates are what protect in-flight readers.
-- **Latency.** A delete candidate's physical delete moves later by at most `max_query_duration + head_cache_ttl + 2 * clock_skew_allowance` after a sweep first sees it unnamed, plus one pass interval.
-- **Lifecycle model.** In formal/tla/lifecycle, `candidate-1133.cfg` becomes the negative control `negative/pinned-query-ungated.cfg`, and traceability.md maps `HorizonGuardsPinnedQueries` to the marker gate. The model's `QueryPermits` reads a query's needs directly, so it shows a guard is required, not that this one is sufficient. The argument in decision 2 is what covers sufficiency.
+  - **docs/deletion-and-gc.md:**
+    - the retention and superseded-input rows of the rule table;
+    - the "HEAD-referenced snapshot delete blocker" section;
+    - the new orphan-marker rule;
+    - the claim that no reachable sweeper configuration can delete a pinned object, which becomes true only once the CLI reads `sys/gc` and validates skew.
+  - **docs/consistency-model.md:**
+    - the delete guarantee resting on the horizon plus the blocker;
+    - the physical-erasure bound `.done + protection_horizon + one sweep interval`, which grows by the window;
+    - the list of readers the guarantee does not cover.
+  - **Code comments:** the `LeaseCheck` doc comment in crates/ravel-maintain/src/sweep.rs, and `head_cache_ttl`'s doc comment in crates/ravel-catalog/src/config.rs.
+- **Latency.** A delete candidate's physical delete moves later by at most `max_query_duration + head_cache_ttl + 4 * clock_skew_allowance` after a sweep first sees it unnamed, plus one pass interval.
 - **Reuse.** From the preserved branch `task/1adcccde-8eaa-42d2-ab7d-a45949fdbbc6/result`, these carry over: the `PinnedWindow` block reason, its `/metrics` label and CLI line, the repaired negative control and its `.expect`, and the pinned-reader and stall-test scaffolding. Its anchor code does not carry over.
 - **Tests the implementation owes:**
-  - each term of the condition pinned one nanosecond each side: `max_query_duration`, `head_cache_ttl` and `2 * clock_skew_allowance`;
+  - each term of the condition pinned one nanosecond each side: `max_query_duration`, `head_cache_ttl` and `4 * clock_skew_allowance`;
   - a stall test with folds that rewrite HEAD and its single part every hour;
   - the fold-dies-after-part-PUT interleaving from rejected alternative 1, shown to stay blocked;
   - a query served a cached pre-drop HEAD just before `t_drop + head_cache_ttl`, shown to stay protected;
+  - a Flight ticket minted on one clock and redeemed on another;
+  - a stale marker surviving a replacement tombstone or record, treated as absent;
   - a re-named candidate restarting its window;
-  - a marker `get`, `put` or `delete` error, and an undecodable body, each blocking;
-  - an orphan marker reaped only after its tombstone or record is gone and its horizon has passed;
-  - an older-shape listing of `c/` unaffected by the markers;
-  - the CLI reading `max_query_duration` from `sys/gc`.
+  - a marker `get`, `put` or `delete` error, an undecodable body and an unreadable anchor, each blocking, with FaultStore counters asserted;
+  - a dry run writing no marker;
+  - no marker for the alerts signal;
+  - an orphan marker reaped only after its anchor is gone and its horizon has passed, with the LIST paginated under `MemoryStore::with_page_size(2)`, and an unparseable key under `maint/unn/` counted and skipped;
+  - a `c/` listing unaffected by the markers;
+  - the CLI reading `max_query_duration` and `head_cache_ttl` from `sys/gc` and running the skew validation;
+  - a build that understands only version 1 refusing a version 2 `sys/gc`;
+  - the IAM witness;
+  - the TLA+ checks in decision 7.
