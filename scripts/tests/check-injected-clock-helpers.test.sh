@@ -544,6 +544,26 @@ rc=$?
 check_eq "a cfg(test) mention in a doc comment does not move the scan start" "0" "${rc}"
 check_eq "only the real test module's helper is scanned past a doc-comment mention"   "1" "$(helper_count_of "${out}")"
 
+# === (t) the default target is the load/ directory, not one file ===========
+# The loader's helpers live in several files under load/, including test-only
+# files that carry no cfg(test) attribute of their own. Naming that directory
+# explicitly is the default scan (same count, floor applied); any other
+# directory is bad usage rather than a silent zero-helper scan.
+default_out="$(bash "${CHECK}" 2>&1)"
+out="$(bash "${CHECK}" "${SCRIPT_DIR}/../services/ravel-cli/src/load" 2>&1)"
+rc=$?
+check_eq "naming the default directory explicitly scans clean" "0" "${rc}"
+check_eq "naming the default directory explicitly scans the same helpers" \
+  "$(helper_count_of "${default_out}")" "$(helper_count_of "${out}")"
+check_ge "the default directory's scanned-helper count clears the floor" \
+  "${REAL_TARGET_HELPER_FLOOR}" "$(helper_count_of "${out}")"
+otherdir="${tmproot}/otherdir"
+mkdir -p "${otherdir}"
+cp "${anchor}" "${otherdir}/tests.rs"
+bash "${CHECK}" "${otherdir}" >/dev/null 2>&1
+rc=$?
+check_eq "a directory other than the default target is refused as bad usage" "64" "${rc}"
+
 echo
 echo "passed: ${pass}  failed: ${fail}"
 [[ ${fail} -eq 0 ]]
