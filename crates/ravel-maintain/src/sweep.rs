@@ -219,6 +219,12 @@ pub struct SweepReport {
     /// ([`SupersededSweepOutcome::held_by_unreadable_head`]); feeds
     /// `ravel_maintain_superseded_inputs_held_total{reason="unreadable_head"}`.
     pub superseded_held_by_unreadable_head: usize,
+    /// Rule 2: objects held this pass because the anchoring snapshot part's
+    /// `last_modified` has not yet aged past the pinned-query window
+    /// ([`SupersededSweepOutcome::held_by_pinned_window`], ADR-0020 amendment
+    /// 2026-10-01, issue #1133); feeds
+    /// `ravel_maintain_superseded_inputs_held_total{reason="pinned_window"}`.
+    pub superseded_held_by_pinned_window: usize,
     /// Rule 2: chain groups skipped whole this pass because a legal hold
     /// protects a key in them
     /// ([`SupersededSweepOutcome::chain_groups_held_by_legal_hold`]); feeds
@@ -360,6 +366,7 @@ pub async fn sweep_shard_with_holds(
             superseded_deletes_refused: superseded.deletes_refused,
             superseded_held_by_snapshot: superseded.held_by_snapshot,
             superseded_held_by_unreadable_head: superseded.held_by_unreadable_head,
+            superseded_held_by_pinned_window: superseded.held_by_pinned_window,
             superseded_groups_held_by_legal_hold: superseded.chain_groups_held_by_legal_hold,
             unreferenced_parts_deleted,
             quarantine_reaped_bytes: quarantine.reaped_bytes,
@@ -561,6 +568,7 @@ pub async fn sweep_shard_zoned_with_holds(
             superseded_deletes_refused: superseded.deletes_refused,
             superseded_held_by_snapshot: superseded.held_by_snapshot,
             superseded_held_by_unreadable_head: superseded.held_by_unreadable_head,
+            superseded_held_by_pinned_window: superseded.held_by_pinned_window,
             superseded_groups_held_by_legal_hold: superseded.chain_groups_held_by_legal_hold,
             unreferenced_parts_deleted,
             quarantine_reaped_bytes: quarantine.reaped_bytes,
@@ -1055,6 +1063,14 @@ pub struct SupersededSweepOutcome {
     /// [`SweepReport::superseded_held_by_unreadable_head`], which feeds
     /// `ravel_maintain_superseded_inputs_held_total{reason="unreadable_head"}`.
     pub held_by_unreadable_head: usize,
+    /// Objects held this pass because no entry names them but the anchoring
+    /// snapshot part's `last_modified` has not yet aged past the pinned-query
+    /// window (ADR-0020 amendment 2026-10-01, issue #1133): a reader that
+    /// pinned the HEAD from before the fold dropped this hour may still be
+    /// resolving it. The combined pass copies it into
+    /// [`SweepReport::superseded_held_by_pinned_window`], which feeds
+    /// `ravel_maintain_superseded_inputs_held_total{reason="pinned_window"}`.
+    pub held_by_pinned_window: usize,
     /// Chain groups skipped whole this pass because the [`LeaseCheck`] protects
     /// at least one key in them. The unit is the group, not the object: a
     /// group is one indivisible deletion unit, so a hold over any single key in
@@ -1095,7 +1111,7 @@ pub struct SupersededSweepOutcome {
 impl SupersededSweepOutcome {
     /// Objects held this pass for any reason.
     pub fn held(&self) -> usize {
-        self.held_by_snapshot + self.held_by_unreadable_head
+        self.held_by_snapshot + self.held_by_unreadable_head + self.held_by_pinned_window
     }
 
     /// Record what a held group means for rule 6: every request the group's
@@ -1543,6 +1559,9 @@ async fn sweep_superseded_impl(
                 signal,
                 group.ingest_hour_bucket,
                 &group.objects,
+                now,
+                config.max_query_duration_ns,
+                config.clock_skew_allowance_ns,
             )
             .await?
         {
@@ -1553,6 +1572,10 @@ async fn sweep_superseded_impl(
             }
             SnapshotGate::Blocked(SnapshotBlock::Unreadable) => {
                 outcome.held_by_unreadable_head += group.object_count();
+                outcome.note_hold(group, shard);
+            }
+            SnapshotGate::Blocked(SnapshotBlock::PinnedWindow) => {
+                outcome.held_by_pinned_window += group.object_count();
                 outcome.note_hold(group, shard);
             }
         }

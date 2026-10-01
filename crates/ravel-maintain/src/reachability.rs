@@ -8,7 +8,7 @@
 //! (a compaction or rewrite record's inputs) therefore ask the same question
 //! before deleting: does the live HEAD snapshot still reach this object?
 //!
-//! The three answers are fixed and identical for both callers:
+//! The four answers are fixed and identical for both callers:
 //!
 //! - **HEAD absent**: no snapshot names anything, so nothing is blocked
 //!   (ADR-0020: the catalog index is a pure optimization; a missing HEAD
@@ -19,12 +19,17 @@
 //!   is not.
 //! - **A decoded snapshot entry names the object**: blocked. The ordinary
 //!   lagging-fold case.
+//! - **No entry names the object, but the anchoring part's store-assigned
+//!   `last_modified` has not yet aged past the pinned-query window**: blocked
+//!   (ADR-0020 amendment 2026-10-01, issue #1133). HEAD stopping naming an
+//!   object does not by itself prove a reader that pinned the *previous* HEAD
+//!   has stopped resolving it; see [`SnapshotBlock::PinnedWindow`].
 //!
 //! [`SnapshotReachability`] is the per-pass cache that keeps this affordable:
-//! HEAD is read at most once per pass and each covering part at most once, so
-//! a pass that gates many buckets or many superseded inputs of one
-//! `(tenant, signal)` never pays a HEAD GET per candidate (ADR-0076 request
-//! cost).
+//! HEAD is read at most once per pass and each covering part's entries and
+//! `last_modified` are each read at most once, so a pass that gates many
+//! buckets or many superseded inputs of one `(tenant, signal)` never pays a
+//! HEAD GET per candidate (ADR-0076 request cost).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -55,6 +60,18 @@ pub enum SnapshotBlock {
     /// non-reachability cannot be proven from data that cannot be read, and a
     /// wrongly-permitted delete is unrecoverable while a delayed one is not.
     Unreadable,
+    /// No decoded entry names the candidate, but the live HEAD has not
+    /// provably stopped naming it long enough ago: the anchoring part's
+    /// store-assigned `last_modified` (docs/adrs/0020-metric-index.md
+    /// amendment 2026-10-01, issue #1133) has not yet aged past
+    /// `max_query_duration + 1s granularity + clock_skew_allowance`. Without
+    /// this term a reader that pinned the *previous* HEAD (which still named
+    /// the object) could still be resolving it when the very next sweep pass
+    /// deletes it, violating `NoDeleteInsideProtectionWindow`
+    /// (formal/tla/lifecycle/results.md, "Candidate #1133"). The ordinary
+    /// case: a fold just dropped the object from HEAD and the pinned-query
+    /// window for readers of the prior HEAD has not yet elapsed.
+    PinnedWindow,
 }
 
 /// The result of gating one delete candidate on HEAD reachability.
@@ -149,6 +166,11 @@ pub struct SnapshotReachability {
     /// Decoded snapshot parts by object key. `None` = present but unreadable
     /// (fail-closed); `Some` = decoded and usable.
     parts: HashMap<String, Option<Arc<DecodedPart>>>,
+    /// Each anchoring part's store-assigned `last_modified`, by object key,
+    /// read via a `head()` call at most once per pass per part (ADR-0076
+    /// request cost, same discipline as `parts`). `None` = the `head()` call
+    /// failed (fail-closed, [`SnapshotBlock::Unreadable`]).
+    part_last_modified: HashMap<String, Option<i64>>,
 }
 
 /// The catalog HEAD as read once for a sweep pass.
@@ -179,10 +201,14 @@ impl SnapshotReachability {
     /// HEAD or any covering part unreadable -> fail-closed
     /// [`SnapshotBlock::Unreadable`]; a decoded entry naming this bucket's
     /// shard+hour -> [`SnapshotBlock::Named`].
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn bucket_gate(
         &mut self,
         store: &dyn ObjectStoreBackend,
         bucket: &Bucket,
+        now_ns: i64,
+        max_query_duration_ns: i64,
+        clock_skew_allowance_ns: i64,
     ) -> Result<SnapshotGate> {
         let (covering, skipped) = match self
             .covering_parts(
@@ -216,7 +242,16 @@ impl SnapshotReachability {
                 }
             }
         }
-        self.clear_or_block_on_skipped(store, &skipped).await
+        self.age_and_clear(
+            store,
+            &covering,
+            &skipped,
+            bucket.ingest_hour_bucket,
+            now_ns,
+            max_query_duration_ns,
+            clock_skew_allowance_ns,
+        )
+        .await
     }
 
     /// Whether the live HEAD snapshot still names any of `objects`, all of
@@ -234,6 +269,7 @@ impl SnapshotReachability {
     /// lookup per snapshot entry rather than a scan of every candidate: a group
     /// holding a long supersession chain gates in time linear in the covering
     /// parts' entry count, not in its product with the group's size.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn object_gate(
         &mut self,
         store: &dyn ObjectStoreBackend,
@@ -241,6 +277,9 @@ impl SnapshotReachability {
         signal: Signal,
         ingest_hour_bucket: u32,
         objects: &[SnapshotObject],
+        now_ns: i64,
+        max_query_duration_ns: i64,
+        clock_skew_allowance_ns: i64,
     ) -> Result<SnapshotGate> {
         if objects.is_empty() {
             return Ok(SnapshotGate::Clear);
@@ -270,34 +309,151 @@ impl SnapshotReachability {
                 }
             }
         }
-        self.clear_or_block_on_skipped(store, &skipped).await
+        self.age_and_clear(
+            store,
+            &covering,
+            &skipped,
+            ingest_hour_bucket,
+            now_ns,
+            max_query_duration_ns,
+            clock_skew_allowance_ns,
+        )
+        .await
     }
 
     /// The last step of both gates, reached only when every covering part came
-    /// back clear and the gate is about to permit a delete: prove that the
-    /// parts the hour-range filter skipped really were outside the hour.
+    /// back clear and the gate is otherwise about to permit a delete: prove
+    /// the pinned-query window has elapsed, then prove that the parts the
+    /// hour-range filter skipped really were outside the hour.
     ///
-    /// [`Self::covering_parts`] reads each part's range from the HEAD-level
-    /// reference, not from the part itself. A reference whose declared range is
-    /// narrower than the part it names would silently exclude a part that does
-    /// hold entries for the gated hour, so a skip is only sound once
-    /// [`Self::ensure_part`] has confirmed the two agree; it returns `None`
-    /// when they do not, and that is the fail-closed answer here too.
+    /// The anchor is the covering part(s)' store-assigned `last_modified`
+    /// when `covering` is non-empty (the ordinary case: HEAD dropped this
+    /// hour recently, and the part(s) that used to cover it are still in
+    /// HEAD's part list, just no longer covering). When `covering` is empty
+    /// -- no live part covers this hour at all, the retired-frontier case --
+    /// the anchor is the nearest neighbouring part by declared hour range:
+    /// the smallest-`min_hour` part with `min_hour` above the gated hour, or
+    /// failing that the largest-`watermark_hour` part with `watermark_hour`
+    /// below it (docs/adrs/0020-metric-index.md amendment
+    /// 2026-10-01). Both are conservative (never-too-early) bounds: retention
+    /// retires the oldest frontier first, so a part still covering hours on
+    /// either side of a gap was live at least as recently as that part's own
+    /// `last_modified`, before the gap opened.
     ///
-    /// Done last, and only on the clearing path, so the ordinary held pass
-    /// still reads nothing beyond HEAD and the covering parts: a delete this
-    /// pass would not have performed anyway never pays for the proof.
-    async fn clear_or_block_on_skipped(
+    /// Anchoring on HEAD's own `last_modified` or `created_unix_ns` instead
+    /// would stall forever under a steady fold cadence: every fold rewrites
+    /// HEAD (even when a part is only carried forward by reference), so
+    /// HEAD's own timestamp never ages past the window. Anchoring on the
+    /// covering/neighbouring *part's* timestamp does not have this problem:
+    /// an unchanged part is carried forward by reference, never re-PUT, so
+    /// its `last_modified` stays fixed at the part's real last write.
+    ///
+    /// When HEAD names no part at all (`covering` and `skipped` both empty),
+    /// there is no anchor to read and the gate blocks
+    /// ([`SnapshotBlock::PinnedWindow`]) rather than guess: this is a
+    /// degenerate state (the tenant's whole live snapshot for this signal is
+    /// empty) the anti-stall requirement does not need to cover, since no
+    /// steady fold cadence exists to stall.
+    async fn age_and_clear(
         &mut self,
         store: &dyn ObjectStoreBackend,
+        covering: &[SnapshotPartRef],
         skipped: &[SnapshotPartRef],
+        ingest_hour_bucket: u32,
+        now_ns: i64,
+        max_query_duration_ns: i64,
+        clock_skew_allowance_ns: i64,
     ) -> Result<SnapshotGate> {
+        let anchors: Vec<&SnapshotPartRef> = if !covering.is_empty() {
+            covering.iter().collect()
+        } else {
+            let right_neighbor = skipped
+                .iter()
+                .filter(|p| p.min_hour > ingest_hour_bucket)
+                .min_by_key(|p| p.min_hour);
+            let neighbor = right_neighbor.or_else(|| {
+                skipped
+                    .iter()
+                    .filter(|p| p.watermark_hour < ingest_hour_bucket)
+                    .max_by_key(|p| p.watermark_hour)
+            });
+            match neighbor {
+                Some(part_ref) => vec![part_ref],
+                None => return Ok(SnapshotGate::Blocked(SnapshotBlock::PinnedWindow)),
+            }
+        };
+
+        // `anchors` is non-empty in every path above, so this loop runs at
+        // least once and `anchor_ms` is always overwritten with a real
+        // `last_modified` before use.
+        let mut anchor_ms = i64::MIN;
+        for part_ref in &anchors {
+            match self
+                .ensure_part_last_modified_ms(store, &part_ref.key)
+                .await?
+            {
+                None => return Ok(SnapshotGate::Blocked(SnapshotBlock::Unreadable)),
+                Some(ms) => anchor_ms = anchor_ms.max(ms),
+            }
+        }
+
+        // 1_000_000_000 ns: the store's `last_modified` may have 1-second
+        // granularity (ravel-object-store's `ObjectMeta::last_modified_unix_ms`
+        // doc comment), so a write can read back up to 1s older than it truly
+        // was; the term corrects for that before the query-duration and
+        // clock-skew allowances.
+        let threshold_ns = anchor_ms
+            .saturating_mul(1_000_000)
+            .saturating_add(1_000_000_000)
+            .saturating_add(max_query_duration_ns)
+            .saturating_add(clock_skew_allowance_ns);
+        if now_ns < threshold_ns {
+            return Ok(SnapshotGate::Blocked(SnapshotBlock::PinnedWindow));
+        }
+
+        // [`Self::covering_parts`] reads each part's range from the
+        // HEAD-level reference, not from the part itself. A reference whose
+        // declared range is narrower than the part it names would silently
+        // exclude a part that does hold entries for the gated hour, so a skip
+        // is only sound once [`Self::ensure_part`] has confirmed the two
+        // agree; it returns `None` when they do not, and that is the
+        // fail-closed answer here too.
         for part_ref in skipped {
             if self.ensure_part(store, part_ref).await?.is_none() {
                 return Ok(SnapshotGate::Blocked(SnapshotBlock::Unreadable));
             }
         }
         Ok(SnapshotGate::Clear)
+    }
+
+    /// Read one snapshot part's store-assigned `last_modified` via `head()`,
+    /// once per pass per key, caching the result the way [`Self::ensure_part`]
+    /// caches the part itself. `Ok(None)` is the fail-closed "present but its
+    /// metadata could not be read" case (a HEAD-named part that is missing);
+    /// a transient store fault propagates, exactly as [`Self::ensure_part`]'s
+    /// own `head`-equivalent GET does.
+    async fn ensure_part_last_modified_ms(
+        &mut self,
+        store: &dyn ObjectStoreBackend,
+        key: &str,
+    ) -> Result<Option<i64>> {
+        if let Some(cached) = self.part_last_modified.get(key) {
+            return Ok(*cached);
+        }
+        let loaded = match store.head(key).await {
+            Ok(meta) => Some(meta.last_modified_unix_ms),
+            Err(StoreError::NotFound) => {
+                tracing::warn!(
+                    key = %key,
+                    "maintain sweep: HEAD-named snapshot part is missing; blocking deletes \
+                     fail-closed"
+                );
+                None
+            }
+            Err(err) => return Err(MaintainError::Store(err)),
+        };
+        self.part_last_modified.insert(key.to_string(), loaded);
+        Ok(loaded)
     }
 
     /// Load HEAD once for the pass and split its part refs into the ones whose

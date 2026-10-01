@@ -134,6 +134,16 @@ pub struct MaintainReport {
     /// refused. A persistent nonzero value is an operator signal that a HEAD or
     /// part object is corrupt or missing, not the ordinary lagging-fold case.
     pub blocked_by_unreadable_head: usize,
+    /// Expired buckets whose physical sweep was blocked because the covering
+    /// or anchor snapshot part has not yet aged past the pinned-query window
+    /// ([`RetentionOutcome::BlockedBySnapshot`] with
+    /// [`crate::retention::SnapshotBlock::PinnedWindow`], ADR-0020 amendment
+    /// 2026-10-01, issue #1133). Nothing was deleted; a later sweep finishes
+    /// once `part_last_modified_ms` ages past `max_query_duration_ns +
+    /// clock_skew_allowance_ns`. A nonzero steady-state value that never
+    /// clears means the anchor part itself is never aging (a stalled fold or
+    /// a permanently uncovered hour), not ordinary pinned-window lag.
+    pub blocked_by_pinned_window: usize,
     /// Buckets skipped this pass because the [`MaintainMemo`] already knows them
     /// terminal, so no per-bucket LIST/GET was issued for them.
     /// Always zero on a cold pass and for the non-memoized
@@ -1444,6 +1454,7 @@ pub async fn scan_and_maintain_with_memo(
                 match reason {
                     SnapshotBlock::Named => report.blocked_by_snapshot += 1,
                     SnapshotBlock::Unreadable => report.blocked_by_unreadable_head += 1,
+                    SnapshotBlock::PinnedWindow => report.blocked_by_pinned_window += 1,
                 }
                 report.retention_lag_ns = report.retention_lag_ns.max(
                     expired_bucket_retention_lag_ns(hour, now, retention_window_ns),

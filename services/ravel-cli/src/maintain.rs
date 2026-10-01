@@ -1160,6 +1160,7 @@ pub async fn sweep(
         superseded_deletes_refused,
         superseded_held_by_snapshot,
         superseded_held_by_unreadable_head,
+        superseded_held_by_pinned_window,
         superseded_groups_held_by_legal_hold,
         unreferenced_parts_deleted,
         // Byte totals for the reclaimed-bytes metric (issue #1729); this CLI
@@ -1211,6 +1212,7 @@ pub async fn sweep(
     println!("superseded deletes refused (kept for a later pass): {superseded_deletes_refused}");
     println!("superseded held (HEAD still names them): {superseded_held_by_snapshot}");
     println!("superseded held (HEAD unreadable): {superseded_held_by_unreadable_head}");
+    println!("superseded held (pinned-query window): {superseded_held_by_pinned_window}");
     println!("superseded groups held (legal hold): {superseded_groups_held_by_legal_hold}");
     println!("unreferenced_parts ({verb}): {unreferenced_parts_deleted}");
     println!("full_pass: {full_pass}");

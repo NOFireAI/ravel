@@ -297,18 +297,25 @@ pub enum SupersededHeldReason {
     /// HEAD or a covering snapshot part was present and could not be read
     /// ([`ravel_maintain::SweepReport::superseded_held_by_unreadable_head`]).
     UnreadableHead,
+    /// No entry names the object, but the anchoring snapshot part's
+    /// `last_modified` has not yet aged past the pinned-query window
+    /// (ADR-0020 amendment 2026-10-01, issue #1133;
+    /// [`ravel_maintain::SweepReport::superseded_held_by_pinned_window`]).
+    PinnedWindow,
 }
 
 impl SupersededHeldReason {
-    pub const ALL: [SupersededHeldReason; 2] = [
+    pub const ALL: [SupersededHeldReason; 3] = [
         SupersededHeldReason::Named,
         SupersededHeldReason::UnreadableHead,
+        SupersededHeldReason::PinnedWindow,
     ];
 
     fn index(self) -> usize {
         match self {
             SupersededHeldReason::Named => 0,
             SupersededHeldReason::UnreadableHead => 1,
+            SupersededHeldReason::PinnedWindow => 2,
         }
     }
 
@@ -317,6 +324,7 @@ impl SupersededHeldReason {
         match self {
             SupersededHeldReason::Named => "named",
             SupersededHeldReason::UnreadableHead => "unreadable_head",
+            SupersededHeldReason::PinnedWindow => "pinned_window",
         }
     }
 
@@ -324,6 +332,7 @@ impl SupersededHeldReason {
         match self {
             SupersededHeldReason::Named => report.superseded_held_by_snapshot,
             SupersededHeldReason::UnreadableHead => report.superseded_held_by_unreadable_head,
+            SupersededHeldReason::PinnedWindow => report.superseded_held_by_pinned_window,
         }
     }
 }
@@ -335,6 +344,7 @@ pub struct UnmaintainedSupersededCounts {
     pub deletes_refused: u64,
     pub held_named: u64,
     pub held_unreadable_head: u64,
+    pub held_pinned_window: u64,
     pub groups_held_by_legal_hold: u64,
 }
 
@@ -447,6 +457,8 @@ impl MaintenanceSafetyMetrics {
                     .load(Ordering::Relaxed),
                 held_named: held[SupersededHeldReason::Named.index()].load(Ordering::Relaxed),
                 held_unreadable_head: held[SupersededHeldReason::UnreadableHead.index()]
+                    .load(Ordering::Relaxed),
+                held_pinned_window: held[SupersededHeldReason::PinnedWindow.index()]
                     .load(Ordering::Relaxed),
                 groups_held_by_legal_hold: self.unmaintained_superseded_groups_held_by_legal_hold
                     [i]
@@ -1295,6 +1307,11 @@ pub fn spawn(
     // informational, never dedup-priority).
     let mut compactor = config.compactor.clone();
     compactor.compactor_writer_id = rng.new_uuid();
+    // The HEAD-reachability pinned-query gate (ADR-0020 amendment
+    // 2026-10-01, issue #1133) anchors on this same durable value the skew
+    // re-assert above just checked against `clock_skew_allowance_ns`, not on
+    // whatever `config.compactor` happened to default to.
+    compactor.max_query_duration_ns = stored_gc.max_query_duration_ns;
     let compactor = Arc::new(compactor);
     let retention = Arc::new(config.retention.clone());
     let fallback_allow = if fallback_allow.is_empty() {

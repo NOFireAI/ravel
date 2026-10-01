@@ -293,6 +293,9 @@ pub async fn retention_sweep_bucket_with_reach(
                 &listing,
                 tombstone_key,
                 config.dry_run,
+                now,
+                config.max_query_duration_ns,
+                config.clock_skew_allowance_ns,
             )
             .await;
         }
@@ -501,6 +504,7 @@ async fn write_tombstone(
 /// `keys::partition_bucket_entry` classifies in the commit prefix, which is
 /// the same set [`bucket_is_empty_but_tombstone`] refuses to call empty: a
 /// shape deleted by neither is residue forever (issue #1321).
+#[allow(clippy::too_many_arguments)]
 async fn physical_sweep(
     reach: &mut SnapshotReachability,
     store: &dyn ObjectStoreBackend,
@@ -509,6 +513,9 @@ async fn physical_sweep(
     listing: &BucketListing,
     tombstone_key: &str,
     dry_run: bool,
+    now_ns: i64,
+    max_query_duration_ns: i64,
+    clock_skew_allowance_ns: i64,
 ) -> Result<RetentionOutcome> {
     // HEAD-reachability gate (ADR-0020 delete-blocker): before deleting
     // anything, refuse if the live catalog HEAD snapshot still names an object
@@ -520,7 +527,16 @@ async fn physical_sweep(
     // proceeds (ADR-0020: the index is a pure optimization). The tombstone is
     // left in place on a block, so bucket-wide exclusion holds and a later
     // pass finishes once the fold has caught up.
-    match reach.bucket_gate(store, bucket).await? {
+    match reach
+        .bucket_gate(
+            store,
+            bucket,
+            now_ns,
+            max_query_duration_ns,
+            clock_skew_allowance_ns,
+        )
+        .await?
+    {
         SnapshotGate::Clear => {}
         SnapshotGate::Blocked(reason) => {
             return Ok(RetentionOutcome::BlockedBySnapshot(reason));

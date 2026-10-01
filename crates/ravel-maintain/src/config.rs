@@ -1096,6 +1096,18 @@ pub struct CompactorConfig {
     /// leads the reader's. Default [`DEFAULT_PROTECTION_HORIZON_NS`]
     /// (25 h 5 min).
     pub protection_horizon_ns: i64,
+    /// Longest a resolved query may still be reading its pinned inputs
+    /// (ADR-0020 amendment 2026-10-01, issue #1133): the HEAD-reachability
+    /// delete blocker (`crate::reachability::SnapshotReachability`) will not
+    /// clear a delete candidate until the anchoring snapshot part's
+    /// store-assigned `last_modified` has aged past this plus the 1s
+    /// store-granularity allowance plus [`Self::clock_skew_allowance_ns`].
+    /// The server sets this from the durable [`crate::GcConfigValues`] at
+    /// spawn time (`services/ravel-server/src/maintain.rs`), the same value
+    /// [`crate::validate_maintain_skew`] already checks against
+    /// `clock_skew_allowance_ns`. Default [`DEFAULT_MAX_QUERY_DURATION_NS`]
+    /// (1 h).
+    pub max_query_duration_ns: i64,
     /// Mass-orphan circuit breaker minimum candidate count (ADR-0048
     /// decision 4). The breaker trips a pass only when it would delete at
     /// least this many orphan candidates AND more than
@@ -1269,6 +1281,7 @@ impl Default for CompactorConfig {
             compactor_writer_id: Uuid::nil(),
             grace_ns: DEFAULT_GRACE_NS,
             protection_horizon_ns: DEFAULT_PROTECTION_HORIZON_NS,
+            max_query_duration_ns: DEFAULT_MAX_QUERY_DURATION_NS,
             orphan_breaker_min_count: DEFAULT_ORPHAN_BREAKER_MIN_COUNT,
             orphan_breaker_max_ratio: DEFAULT_ORPHAN_BREAKER_MAX_RATIO,
             quarantine_horizon_ns: DEFAULT_QUARANTINE_HORIZON_NS,
