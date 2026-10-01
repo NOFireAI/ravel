@@ -817,7 +817,7 @@ impl RlogWriter {
             .collect();
         let field_dir = FieldDir::new(field_entries);
 
-        let (blocks_bytes, l0, page_dir) = blocks.finish();
+        let (blocks_bytes, l0, page_dir) = blocks.finish_checked()?;
         let skip = SkipIndex::build(l0);
 
         // Final per-field postings verdict: capped fields get `Capped`
@@ -1696,7 +1696,7 @@ impl RlogWriter {
             .collect();
         let field_dir = FieldDir::new(field_entries);
 
-        let (blocks_bytes, l0, page_dir) = blocks.finish();
+        let (blocks_bytes, l0, page_dir) = blocks.finish_checked()?;
         let skip = SkipIndex::build(l0);
 
         let postings_capped_fields = postings_capped.len() as u32;
@@ -2976,6 +2976,11 @@ pub struct BlocksBuilder {
     str_group: BTreeMap<u32, Option<GroupStrColumn>>,
     /// Sum of `GroupStrColumn::bytes` over the columns still in `str_group`.
     str_bytes: usize,
+    /// The first internal inconsistency the dictionary decision met: a value
+    /// id outside its block's distinct values, or a group id outside its
+    /// column's dictionary. The column it names keeps its per-block pages, and
+    /// [`BlocksBuilder::finish_checked`] returns it.
+    fault: Option<LogSegError>,
 }
 
 impl BlocksBuilder {
@@ -3000,6 +3005,7 @@ impl BlocksBuilder {
             l0: Vec::new(),
             str_group: BTreeMap::new(),
             str_bytes: 0,
+            fault: None,
         }
     }
 
@@ -3008,7 +3014,9 @@ impl BlocksBuilder {
     pub fn push(&mut self, mut out: BlockWriteOut) {
         let block = self.pending.len();
         for values in std::mem::take(&mut out.str_values) {
-            self.intern(block, values);
+            if let Err(e) = self.intern(block, values) {
+                self.fault.get_or_insert(e);
+            }
         }
         self.pending.push(out);
         if self.pending.len() >= self.layout.group_target_blocks.max(1) {
@@ -3026,13 +3034,16 @@ impl BlocksBuilder {
     /// `dict_budget` by one block's new distinct bytes plus its ids for the
     /// column. Per-entry overhead (a `Vec<u8>` header and a `u32` in a hash
     /// slot) is not charged and is bounded by that entry count instead.
-    fn intern(&mut self, block: usize, values: BlockStrValues) {
+    ///
+    /// A value id outside the block's distinct values drops the column from
+    /// the decision and is `Corrupted`.
+    fn intern(&mut self, block: usize, values: BlockStrValues) -> Result<(), LogSegError> {
         let slot = self
             .str_group
             .entry(values.column_id)
             .or_insert_with(|| Some(GroupStrColumn::default()));
         let Some(col) = slot else {
-            return;
+            return Ok(());
         };
         let mut local = Vec::with_capacity(values.sorted.len());
         for value in values.sorted {
@@ -3045,12 +3056,22 @@ impl BlocksBuilder {
             });
             local.push(gid);
         }
-        col.present += values.ids.len() as u64;
-        let gids: Vec<u32> = values
+        let gids: Option<Vec<u32>> = values
             .ids
             .iter()
-            .map(|&i| local.get(i as usize).copied().unwrap_or(0))
+            .map(|&i| local.get(i as usize).copied())
             .collect();
+        let Some(gids) = gids else {
+            self.str_bytes -= col.bytes;
+            *slot = None;
+            return Err(LogSegError::Corrupted(format!(
+                "row-group dictionary for column {}: block {block} has a value id past \
+                 its {} distinct values",
+                values.column_id,
+                local.len()
+            )));
+        };
+        col.present += gids.len() as u64;
         let id_bytes = DICT_ID_BYTES * gids.len();
         col.bytes += id_bytes;
         self.str_bytes += id_bytes;
@@ -3060,6 +3081,7 @@ impl BlocksBuilder {
             self.str_bytes -= col.bytes;
             *slot = None;
         }
+        Ok(())
     }
 
     /// The current group's string chunks that store strictly smaller on one
@@ -3069,11 +3091,20 @@ impl BlocksBuilder {
     /// entries as the uncompressed section encodes them, so the dictionary
     /// page's own entry is charged to the dictionary. Resets the group's string
     /// state.
+    ///
+    /// A group id outside its column's dictionary records a `Corrupted` fault
+    /// and leaves that column on its per-block pages.
     fn group_dicts(&mut self, pending: &[BlockWriteOut]) -> BTreeMap<u32, GroupDict> {
         let level = self.layout.zstd_level;
         let mut out = BTreeMap::new();
         self.str_bytes = 0;
-        for (column_id, col) in std::mem::take(&mut self.str_group) {
+        let outside = |column_id: u32, gid: u32, len: usize| {
+            LogSegError::Corrupted(format!(
+                "row-group dictionary for column {column_id}: group id {gid} past its \
+                 {len} entries"
+            ))
+        };
+        'columns: for (column_id, col) in std::mem::take(&mut self.str_group) {
             let Some(col) = col else {
                 continue;
             };
@@ -3085,9 +3116,12 @@ impl BlocksBuilder {
             entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
             let mut rank = vec![0u64; entries.len()];
             for (r, (_, gid)) in entries.iter().enumerate() {
-                if let Some(slot) = rank.get_mut(*gid as usize) {
-                    *slot = r as u64;
-                }
+                let Some(slot) = rank.get_mut(*gid as usize) else {
+                    self.fault
+                        .get_or_insert(outside(column_id, *gid, entries.len()));
+                    continue 'columns;
+                };
+                *slot = r as u64;
             }
             let sorted: Vec<&[u8]> = entries.iter().map(|(v, _)| v.as_slice()).collect();
             let dict = seal_page(Enc::DictPage, encode_dict_page(&sorted), level);
@@ -3095,10 +3129,18 @@ impl BlocksBuilder {
             let mut new_len = dict.stored.len() as u64 + sealed_entry_len(pending.len(), &dict);
             let mut old_len = 0u64;
             for (block, gids) in &col.blocks {
-                let remapped: Vec<u64> = gids
+                let remapped: Result<Vec<u64>, u32> = gids
                     .iter()
-                    .map(|&g| rank.get(g as usize).copied().unwrap_or(0))
+                    .map(|&g| rank.get(g as usize).copied().ok_or(g))
                     .collect();
+                let remapped = match remapped {
+                    Ok(r) => r,
+                    Err(g) => {
+                        self.fault
+                            .get_or_insert(outside(column_id, g, entries.len()));
+                        continue 'columns;
+                    }
+                };
                 let page = seal_page(
                     Enc::DictIds,
                     encode_dict_ids(&remapped, entries.len()),
@@ -3257,9 +3299,23 @@ impl BlocksBuilder {
 
     /// The finished BLOCKS bytes, the level-0 entries, and the PAGE_DIR (empty
     /// under version 3, where no such section is written).
+    ///
+    /// A column whose dictionary decision met an internal inconsistency keeps
+    /// its per-block pages, so the bytes still hold its values; only
+    /// [`BlocksBuilder::finish_checked`], which the writer calls, reports it.
     pub fn finish(mut self) -> (Vec<u8>, Vec<Level0Entry>, PageDir) {
         self.flush_group();
         (self.bytes, self.l0, self.dir)
+    }
+
+    /// [`BlocksBuilder::finish`], or the first internal inconsistency the
+    /// row-group dictionary decision met, as `Corrupted`.
+    pub fn finish_checked(mut self) -> Result<(Vec<u8>, Vec<Level0Entry>, PageDir), LogSegError> {
+        self.flush_group();
+        match self.fault {
+            Some(e) => Err(e),
+            None => Ok((self.bytes, self.l0, self.dir)),
+        }
     }
 }
 
@@ -3426,12 +3482,12 @@ mod row_group_buffer {
     }
 }
 
-/// The row-group dictionary decision's budget, pinned on the builder's own
-/// accounting. `tests/columnar_writer_dict_ids_memory.rs` pins the peak it
-/// bounds.
+/// The row-group dictionary decision's budget and its internal-index faults,
+/// pinned on the builder's own state. `tests/columnar_writer_dict_ids_memory.rs`
+/// pins the peak the budget bounds.
 #[cfg(test)]
 #[allow(clippy::expect_used)]
-mod dict_budget {
+mod group_dict_decision {
     use super::*;
     use crate::encoding::Enc;
     use crate::page::PageDesc;
@@ -3519,20 +3575,118 @@ mod dict_budget {
             ),
             (None, Some(82), 82)
         );
-        let (_, _, dir) = builder.finish();
-        let encs = |column_id: u32| -> Vec<Enc> {
-            dir.groups[0]
-                .chunks
-                .iter()
-                .find(|c| c.column_id == column_id)
-                .expect("chunk")
-                .pages
-                .iter()
-                .map(|p| p.enc)
-                .collect()
+        let (_, _, dir) = builder.finish_checked().expect("no fault");
+        assert_eq!(encs(&dir, A), vec![Enc::Plain, Enc::Plain]);
+        assert_eq!(
+            encs(&dir, B),
+            vec![Enc::DictPage, Enc::DictIds, Enc::DictIds]
+        );
+    }
+
+    fn encs(dir: &PageDir, column_id: u32) -> Vec<Enc> {
+        dir.groups[0]
+            .chunks
+            .iter()
+            .find(|c| c.column_id == column_id)
+            .expect("chunk")
+            .pages
+            .iter()
+            .map(|p| p.enc)
+            .collect()
+    }
+
+    fn builder() -> BlocksBuilder {
+        BlocksBuilder::new(Layout {
+            group_target_blocks: 4,
+            zstd_level: 3,
+            dict_budget: 1 << 20,
+        })
+    }
+
+    fn corrupted(r: Result<(Vec<u8>, Vec<Level0Entry>, PageDir), LogSegError>) -> String {
+        match r {
+            Err(LogSegError::Corrupted(m)) => m,
+            other => panic!("expected Corrupted, got {:?}", other.map(|(_, _, d)| d)),
+        }
+    }
+
+    /// A block's value id past its distinct values fails the build as
+    /// `Corrupted`, and the column keeps its plain pages rather than resolving
+    /// the id to some dictionary entry.
+    ///
+    /// Wrong implementations this rules out, each shown failing: the id
+    /// resolved to entry 0 (the build succeeds with both columns on
+    /// dictionaries); the fault recorded but the column left in the decision
+    /// (`A` takes a dictionary).
+    #[test]
+    fn value_id_past_the_block_values_fails_the_build() {
+        let mut bad = block();
+        bad.str_values[0].ids[3] = 1;
+        let mut b = builder();
+        b.push(bad);
+        b.push(block());
+        assert_eq!(
+            corrupted(b.finish_checked()),
+            "row-group dictionary for column 20: block 0 has a value id past its 1 distinct values"
+        );
+
+        let mut bad = block();
+        bad.str_values[0].ids[3] = 1;
+        let mut b = builder();
+        b.push(bad);
+        b.push(block());
+        let (_, _, dir) = b.finish();
+        assert_eq!(encs(&dir, A), vec![Enc::Plain, Enc::Plain]);
+        assert_eq!(
+            encs(&dir, B),
+            vec![Enc::DictPage, Enc::DictIds, Enc::DictIds]
+        );
+    }
+
+    /// A held group id past the column's dictionary, set on the builder's own
+    /// state, fails the build as `Corrupted` at the group's flush.
+    ///
+    /// Wrong implementations this rules out, each shown failing: the id
+    /// ranked as entry 0 (the build succeeds); the fault recorded but the
+    /// column's dictionary still written (`A` takes a dictionary).
+    #[test]
+    fn group_id_past_the_dictionary_fails_the_build() {
+        let corrupt = |b: &mut BlocksBuilder| {
+            if let Some(Some(col)) = b.str_group.get_mut(&A) {
+                col.blocks[1].1[3] = 7;
+            }
         };
-        assert_eq!(encs(A), vec![Enc::Plain, Enc::Plain]);
-        assert_eq!(encs(B), vec![Enc::DictPage, Enc::DictIds, Enc::DictIds]);
+        let mut b = builder();
+        b.push(block());
+        b.push(block());
+        corrupt(&mut b);
+        assert_eq!(
+            corrupted(b.finish_checked()),
+            "row-group dictionary for column 20: group id 7 past its 1 entries"
+        );
+
+        let mut b = builder();
+        b.push(block());
+        b.push(block());
+        corrupt(&mut b);
+        let (_, _, dir) = b.finish();
+        assert_eq!(encs(&dir, A), vec![Enc::Plain, Enc::Plain]);
+        assert_eq!(
+            encs(&dir, B),
+            vec![Enc::DictPage, Enc::DictIds, Enc::DictIds]
+        );
+
+        // The same id held as an interner entry's own group id is refused
+        // while the ranks are built, before any id is remapped.
+        let mut b = builder();
+        b.push(block());
+        if let Some(Some(col)) = b.str_group.get_mut(&A) {
+            col.interner.insert(b"xy".to_vec(), 7);
+        }
+        assert_eq!(
+            corrupted(b.finish_checked()),
+            "row-group dictionary for column 20: group id 7 past its 1 entries"
+        );
     }
 }
 
