@@ -73,7 +73,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use crate::instrument::{InstantClock, MonotonicClock, StoreMetrics, StoreOp};
 use crate::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
-    ObjectStoreBackend, PageToken, PutOptions, PutOutcome, StoreError,
+    ObjectStoreBackend, PageToken, PutOptions, PutOutcome, StoreError, UploadChecksum,
 };
 
 /// The class a store handle belongs to. Attached to the handle at construction,
@@ -597,13 +597,20 @@ impl ObjectStoreBackend for ScheduledHandle {
         &'a self,
         key: &str,
     ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
-        // The initiation is one scheduled request; the returned handle's parts
-        // are not scheduled (no production caller uses multipart yet, per
-        // `Capabilities::mandatory`). Uncounted, like `InstrumentedStore`: a
-        // multipart upload is a handle, not a call any single `StoreOp`
-        // describes. The permit releases when this call returns the handle.
+        // Initiation takes one permit of this handle's class, uncounted like
+        // `InstrumentedStore` (a multipart upload is a handle, not a call any
+        // single `StoreOp` describes). The returned handle takes one more
+        // permit per `put_part`/`complete`/`abort`, so the whole sequence
+        // shares this handle's class admission rather than only its start.
         let _permit = self.scheduler.acquire(self.class).await;
-        self.inner.put_multipart(key).await
+        let inner = self.inner.put_multipart(key).await?;
+        Ok(Box::new(ScheduledMultipartUpload {
+            inner,
+            scheduler: Arc::clone(&self.scheduler),
+            class: self.class,
+            metrics: Arc::clone(&self.metrics),
+            clock: Arc::clone(&self.clock),
+        }))
     }
 
     async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
@@ -661,6 +668,49 @@ impl ObjectStoreBackend for ScheduledHandle {
     /// store's last observation issues no request, so it takes no permit.
     fn observed_store_time_ns(&self) -> Option<i64> {
         self.inner.observed_store_time_ns()
+    }
+}
+
+/// The handle `ScheduledHandle::put_multipart` returns: each `put_part`,
+/// `complete`, and `abort` call takes one permit of the owning handle's
+/// class before delegating to the inner upload, so a multipart sequence
+/// shares the same admission budget as every other op on that class. Each
+/// `put_part` is additionally recorded as one [`StoreOp::Put`] with its byte
+/// count (one `UploadPart` request is one billed PUT); `complete` and `abort`
+/// stay uncounted, matching initiation.
+struct ScheduledMultipartUpload<'a> {
+    inner: Box<dyn MultipartUpload + 'a>,
+    scheduler: Arc<RequestScheduler>,
+    class: RequestClass,
+    metrics: Arc<StoreMetrics>,
+    clock: Arc<dyn MonotonicClock>,
+}
+
+#[async_trait::async_trait]
+impl MultipartUpload for ScheduledMultipartUpload<'_> {
+    async fn put_part(
+        &mut self,
+        data: Bytes,
+        checksum: Option<UploadChecksum>,
+    ) -> Result<(), StoreError> {
+        let bytes = data.len() as u64;
+        let _permit = self.scheduler.acquire(self.class).await;
+        let start = self.clock.now_nanos();
+        let result = self.inner.put_part(data, checksum).await;
+        let elapsed = self.clock.now_nanos().saturating_sub(start);
+        self.metrics
+            .record_op(StoreOp::Put, elapsed, bytes, result.as_ref().err());
+        result
+    }
+
+    async fn complete(&mut self) -> Result<PutOutcome, StoreError> {
+        let _permit = self.scheduler.acquire(self.class).await;
+        self.inner.complete().await
+    }
+
+    async fn abort(&mut self) -> Result<(), StoreError> {
+        let _permit = self.scheduler.acquire(self.class).await;
+        self.inner.abort().await
     }
 }
 
@@ -886,6 +936,81 @@ mod tests {
         );
         assert_eq!(bg_m.delete.calls, 1, "one background delete");
         assert_eq!(bg_m.put.calls, 0, "no background put");
+    }
+
+    /// A multipart part takes a permit of its handle's class like any other
+    /// scheduled op: with the class's permits exhausted, a `put_part` call
+    /// must wait, and completes only once a permit frees, counted as one
+    /// `StoreOp::Put` with the part's byte count. The wrong implementation
+    /// this rules out is today's initiation-only permit, where a part
+    /// completes even while the class is fully exhausted because only
+    /// `put_multipart`'s own initiation ever acquired one.
+    #[tokio::test]
+    async fn a_multipart_part_waits_for_a_permit_of_its_class() {
+        let (cs, gate) = scheduled_rig(SchedulerConfig::new(2, 2, 1));
+        let fg = cs.foreground();
+
+        let (init_done_tx, init_done_rx) = tokio::sync::oneshot::channel::<()>();
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+
+        let part = Bytes::from_static(b"a multipart part's bytes");
+        let part_len = part.len() as u64;
+
+        let fg_task = fg.clone();
+        tokio::spawn(async move {
+            let mut upload = fg_task
+                .put_multipart("k")
+                .await
+                .expect("initiate multipart");
+            // Initiation is done (and its own permit already released) before
+            // the permits are exhausted below; only the `put_part` call below
+            // runs into the exhausted class.
+            let _ = init_done_tx.send(());
+            let _ = go_rx.await;
+            let result = upload.put_part(part, None).await;
+            let _ = result_tx.send(result);
+        });
+        init_done_rx.await.expect("multipart initiated");
+
+        // Exhaust the class's permits with two held gets.
+        let f0 = fg.clone();
+        let f1 = fg.clone();
+        tokio::spawn(async move { f0.get("f0", GetRange::Full).await });
+        tokio::spawn(async move { f1.get("f1", GetRange::Full).await });
+        gate.wait_until_held(2).await;
+
+        // Let the part attempt proceed now that the class is exhausted.
+        let _ = go_tx.send(());
+
+        assert!(
+            spin_until(|| scheduler(&cs).fg_waiters.load(Ordering::SeqCst) == 1).await,
+            "a put_part on an exhausted class must register as a waiter"
+        );
+        let before = cs
+            .metrics(RequestClass::Foreground)
+            .expect("scheduled has metrics")
+            .snapshot();
+        assert_eq!(
+            before.put.calls, 0,
+            "the part must not complete while the class is exhausted"
+        );
+
+        // Release one held get, freeing exactly one permit.
+        assert!(release_key(&gate, "f0"));
+
+        let result = result_rx.await.expect("put_part task did not panic");
+        result.expect("put_part succeeds once a permit frees");
+
+        let after = cs
+            .metrics(RequestClass::Foreground)
+            .expect("scheduled has metrics")
+            .snapshot();
+        assert_eq!(after.put.calls, 1, "the part is counted as one Put");
+        assert_eq!(
+            after.put.bytes, part_len,
+            "counted with the part's byte count"
+        );
     }
 
     /// A pinned read spends a permit of its class and is counted in that
