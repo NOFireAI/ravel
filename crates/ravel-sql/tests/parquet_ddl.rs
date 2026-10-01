@@ -790,9 +790,8 @@ async fn whole_statement_deadline_expires_during_the_grants_read_and_writes_no_m
     .await
     .expect("put");
 
-    let catalog = Arc::new(
-        Catalog::new(Arc::clone(&stalling), CatalogConfig::default()).expect("catalog"),
-    );
+    let catalog =
+        Arc::new(Catalog::new(Arc::clone(&stalling), CatalogConfig::default()).expect("catalog"));
     let external = Arc::new(ExternalStoreMap::new(HashMap::from([(
         PROFILE.to_string(),
         Arc::clone(&lake),
