@@ -2881,6 +2881,10 @@ fn clustered_permutation(
     perm
 }
 
+/// Bytes charged to `Layout::dict_budget` per present string value: the `u32`
+/// group id `GroupStrColumn::blocks` holds for it until the group flushes.
+const DICT_ID_BYTES: usize = std::mem::size_of::<u32>();
+
 /// The BLOCKS layout a build emits (ADR-0699 decision 1): row groups of
 /// `group_target_blocks` consecutive blocks, pages column-major inside a group.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2888,10 +2892,11 @@ struct Layout {
     group_target_blocks: usize,
     /// The page envelope's zstd level, for the row-group dictionary pages.
     zstd_level: i32,
-    /// The most distinct string value bytes, summed over every string column,
-    /// the row-group dictionary candidates may hold at once. Value bytes only:
-    /// each entry's key buffer and hash slot, and the `u32` id per present
-    /// value, are not charged to it (see `BlocksBuilder::intern`).
+    /// The most bytes the row-group dictionary candidates may hold at once,
+    /// summed over every string column: each distinct value's bytes plus
+    /// [`DICT_ID_BYTES`] for the id held per present value. Each entry's key
+    /// buffer and hash slot are not charged to it (see
+    /// `BlocksBuilder::intern`).
     dict_budget: usize,
 }
 
@@ -2919,7 +2924,8 @@ struct GroupStrColumn {
     blocks: Vec<(usize, Vec<u32>)>,
     /// Present values across the group.
     present: u64,
-    /// Bytes of the distinct values held in `interner`.
+    /// Bytes charged to `Layout::dict_budget` for this column: the distinct
+    /// values held in `interner` plus [`DICT_ID_BYTES`] per id in `blocks`.
     bytes: usize,
 }
 
@@ -2950,10 +2956,10 @@ struct GroupDict {
 /// A string column chunk may instead store one row-group dictionary page (tag
 /// 12) ahead of one id page (tag 13) per block (ADR-2135 decision 6). Deciding
 /// that adds, per string column of the group, its distinct values and a `u32`
-/// id per present value. The distinct bytes across all string columns are
+/// id per present value. Those two, summed across all string columns, are
 /// capped at `dict_budget` and a column at [`MAX_DICT_ENTRIES`] entries; a
-/// column crossing either is dropped from the decision and keeps its per-block
-/// pages.
+/// column crossing either is dropped from the decision, frees both, and keeps
+/// its per-block pages.
 pub struct BlocksBuilder {
     layout: Layout,
     /// The BLOCKS section bytes built so far. Offsets recorded in PAGE_DIR and
@@ -3013,13 +3019,13 @@ impl BlocksBuilder {
     /// Folds one block's values for a string column into the group's
     /// dictionary candidate for it.
     ///
-    /// `dict_budget` counts distinct value bytes only. Both caps are checked
-    /// after the block is folded, so a column holds at most
-    /// [`MAX_DICT_ENTRIES`] entries plus one block's new values before it is
-    /// dropped, and `str_bytes` can pass `dict_budget` by one block's new
-    /// distinct bytes. Per-entry overhead (a `Vec<u8>` header and a `u32` in a
-    /// hash slot) is therefore bounded by that entry count, not by the budget,
-    /// and the `u32` id per present value by the group's row count.
+    /// Each new distinct value is charged its length and each present value
+    /// [`DICT_ID_BYTES`] for its id. Both caps are checked after the block is
+    /// folded, so a column holds at most [`MAX_DICT_ENTRIES`] entries plus one
+    /// block's new values before it is dropped, and `str_bytes` can pass
+    /// `dict_budget` by one block's new distinct bytes plus its ids for the
+    /// column. Per-entry overhead (a `Vec<u8>` header and a `u32` in a hash
+    /// slot) is not charged and is bounded by that entry count instead.
     fn intern(&mut self, block: usize, values: BlockStrValues) {
         let slot = self
             .str_group
@@ -3040,11 +3046,14 @@ impl BlocksBuilder {
             local.push(gid);
         }
         col.present += values.ids.len() as u64;
-        let gids = values
+        let gids: Vec<u32> = values
             .ids
             .iter()
             .map(|&i| local.get(i as usize).copied().unwrap_or(0))
             .collect();
+        let id_bytes = DICT_ID_BYTES * gids.len();
+        col.bytes += id_bytes;
+        self.str_bytes += id_bytes;
         col.blocks.push((block, gids));
         if col.interner.len() as u64 > MAX_DICT_ENTRIES || self.str_bytes > self.layout.dict_budget
         {
@@ -3414,6 +3423,116 @@ mod row_group_buffer {
         let (_, l0, dir) = builder.finish();
         assert_eq!(l0.len(), 5);
         assert_eq!(dir.groups.len(), 5);
+    }
+}
+
+/// The row-group dictionary decision's budget, pinned on the builder's own
+/// accounting. `tests/columnar_writer_dict_ids_memory.rs` pins the peak it
+/// bounds.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod dict_budget {
+    use super::*;
+    use crate::encoding::Enc;
+    use crate::page::PageDesc;
+
+    const A: u32 = 20;
+    const B: u32 = 21;
+    const ROWS: usize = 10;
+
+    /// A block whose string columns `A` and `B` hold `xy` in each of its
+    /// `ROWS` rows, their value pages 200-byte plain pages.
+    fn block() -> BlockWriteOut {
+        let columns = [A, B];
+        BlockWriteOut {
+            descs: columns
+                .iter()
+                .map(|&column_id| PageDesc {
+                    column_id,
+                    enc: Enc::Plain,
+                    comp: 0,
+                    len: 200,
+                    uncomp_len: 200,
+                })
+                .collect(),
+            payload: vec![7u8; 400],
+            record_count: ROWS as u32,
+            stats: Vec::new(),
+            min_ts: 0,
+            max_ts: 1,
+            min_stream_ref: 0,
+            max_stream_ref: 0,
+            str_values: columns
+                .iter()
+                .map(|&column_id| BlockStrValues {
+                    column_id,
+                    sorted: vec![b"xy".to_vec()],
+                    ids: vec![0; ROWS],
+                })
+                .collect(),
+        }
+    }
+
+    fn charged(builder: &BlocksBuilder, column_id: u32) -> Option<usize> {
+        builder
+            .str_group
+            .get(&column_id)
+            .and_then(|c| c.as_ref())
+            .map(|c| c.bytes)
+    }
+
+    /// Two columns of one 2-byte value over two 10-row blocks: 4 distinct
+    /// bytes against a 100-byte budget, 160 bytes of ids. The ids alone push
+    /// the group over the budget, and the column folding when it does is
+    /// dropped and keeps its plain pages.
+    ///
+    /// Wrong implementations this rules out, each shown failing: ids uncharged
+    /// (nothing is dropped and both columns take a dictionary); one id charged
+    /// per distinct value rather than per present value (6 bytes a column,
+    /// nothing is dropped); ids charged to the column but not to `str_bytes`
+    /// (the budget never trips).
+    #[test]
+    fn ids_alone_can_drop_a_column_from_the_decision() {
+        let mut builder = BlocksBuilder::new(Layout {
+            group_target_blocks: 4,
+            zstd_level: 3,
+            dict_budget: 100,
+        });
+        builder.push(block());
+        // Each column: 2 distinct bytes + 10 ids * 4 bytes = 42.
+        assert_eq!(
+            (
+                charged(&builder, A),
+                charged(&builder, B),
+                builder.str_bytes
+            ),
+            (Some(42), Some(42), 84)
+        );
+        builder.push(block());
+        // A folds first: 84 + 40 = 124 > 100 drops it, freeing its 82 bytes;
+        // B then folds to 82 and the group total is B's 82.
+        assert_eq!(
+            (
+                charged(&builder, A),
+                charged(&builder, B),
+                builder.str_bytes
+            ),
+            (None, Some(82), 82)
+        );
+        let (_, _, dir) = builder.finish();
+        let encs = |column_id: u32| -> Vec<Enc> {
+            dir.groups[0]
+                .chunks
+                .iter()
+                .find(|c| c.column_id == column_id)
+                .expect("chunk")
+                .pages
+                .iter()
+                .map(|p| p.enc)
+                .collect()
+        };
+        assert_eq!(encs(A), vec![Enc::Plain, Enc::Plain]);
+        assert_eq!(encs(B), vec![Enc::DictPage, Enc::DictIds, Enc::DictIds]);
     }
 }
 
