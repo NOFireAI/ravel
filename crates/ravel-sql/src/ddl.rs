@@ -43,7 +43,9 @@ use ravel_object_store::external::probe::{
     PreconditionProbeFailure, RavelBucketProbeFailure, probe_not_ravel_bucket, probe_preconditions,
 };
 use ravel_object_store::{ObjectStoreBackend, PageToken, StoreError};
-use ravel_parquet::snapshot::{GrantedLocation, LocationSnapshot, SnapshotError, snapshot_location};
+use ravel_parquet::snapshot::{
+    GrantedLocation, LocationSnapshot, SnapshotError, snapshot_location,
+};
 use ravel_pqtable::clock::FixedClock;
 use ravel_pqtable::grants::{self, Grant, GrantsError, KeyPrefix};
 use ravel_pqtable::writer::{self, WriteError};
@@ -236,13 +238,14 @@ async fn one_object_under(
     }
     let mut page: Option<PageToken> = None;
     for _ in 0..MAX_PROBE_LIST_PAGES {
-        let listed = store
-            .list(&key.key, page)
-            .await
-            .map_err(|source| DdlExecuteError::ProbeList {
-                location: key.key.clone(),
-                source,
-            })?;
+        let listed =
+            store
+                .list(&key.key, page)
+                .await
+                .map_err(|source| DdlExecuteError::ProbeList {
+                    location: key.key.clone(),
+                    source,
+                })?;
         for meta in &listed.objects {
             if grants::contains_key(grant, &grant.profile, &grant.bucket, meta.key.as_bytes()) {
                 return Ok(ProbeObject::Found(meta.key.clone()));
@@ -420,9 +423,10 @@ impl SqlExecutor {
                 )
                 .await?;
                 Ok(match outcome {
-                    writer::Outcome::Committed { version } => {
-                        DdlOutcome::Dropped { table: name, version }
-                    }
+                    writer::Outcome::Committed { version } => DdlOutcome::Dropped {
+                        table: name,
+                        version,
+                    },
                     writer::Outcome::NoOp => DdlOutcome::NoOp { table: name },
                 })
             }

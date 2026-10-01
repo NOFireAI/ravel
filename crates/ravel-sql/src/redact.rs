@@ -535,9 +535,15 @@ mod tests {
         )
         .expect("the admitted form must redact, not reject");
 
-        assert!(out.contains("CREATE EXTERNAL TABLE"), "kind preserved: {out}");
+        assert!(
+            out.contains("CREATE EXTERNAL TABLE"),
+            "kind preserved: {out}"
+        );
         assert!(out.contains("t1"), "table name preserved: {out}");
-        assert!(out.contains("binary_as_string"), "OPTIONS key preserved: {out}");
+        assert!(
+            out.contains("binary_as_string"),
+            "OPTIONS key preserved: {out}"
+        );
         assert!(!out.contains("s3://bucket"), "LOCATION leaked: {out}");
         assert!(!out.contains("secret-prefix"), "LOCATION leaked: {out}");
         assert!(!out.contains("'true'"), "OPTIONS value leaked: {out}");
@@ -562,7 +568,10 @@ mod tests {
         // DROP TABLE parses as an ordinary `Statement::Drop`, so it already
         // takes the generic walk below and was never rejected.
         let out = redact("DROP TABLE IF EXISTS t1", &KEY_A).expect("DROP TABLE must redact");
-        assert!(out.to_uppercase().contains("DROP TABLE"), "kind preserved: {out}");
+        assert!(
+            out.to_uppercase().contains("DROP TABLE"),
+            "kind preserved: {out}"
+        );
         assert!(out.contains("t1"), "table name preserved: {out}");
         reparse(&out);
     }

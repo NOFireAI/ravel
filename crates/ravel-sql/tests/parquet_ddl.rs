@@ -170,7 +170,12 @@ async fn create_external_table_then_read_back() {
         .expect("create");
 
     match outcome {
-        DdlOutcome::Created { table, version, files, .. } => {
+        DdlOutcome::Created {
+            table,
+            version,
+            files,
+            ..
+        } => {
             assert_eq!(table, "hits");
             assert_eq!(version, 1);
             assert_eq!(files, 1);
@@ -188,11 +193,8 @@ async fn create_if_not_exists_on_existing_table_is_a_no_op() {
     let lake = Lake::memory_store();
     let t = tenant("acme");
     lake.grant(&t).await;
-    lake.put_file(
-        "t/hits/0.parquet",
-        parquet_bytes(&[1], &["a"], &[0.5]),
-    )
-    .await;
+    lake.put_file("t/hits/0.parquet", parquet_bytes(&[1], &["a"], &[0.5]))
+        .await;
     let sql = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
     lake.executor
         .execute_ddl(t, &sql, CREATED_BY, NOW, deadline())
@@ -208,7 +210,12 @@ async fn create_if_not_exists_on_existing_table_is_a_no_op() {
         .await
         .expect("second create is a no-op, not an error");
 
-    assert_eq!(outcome, DdlOutcome::NoOp { table: "hits".to_string() });
+    assert_eq!(
+        outcome,
+        DdlOutcome::NoOp {
+            table: "hits".to_string()
+        }
+    );
 }
 
 #[tokio::test]
@@ -260,7 +267,12 @@ async fn or_replace_commits_a_new_version_over_an_existing_table() {
         .expect("replace");
 
     match outcome {
-        DdlOutcome::Created { table, version, files, .. } => {
+        DdlOutcome::Created {
+            table,
+            version,
+            files,
+            ..
+        } => {
             assert_eq!(table, "hits");
             assert_eq!(version, 2);
             assert_eq!(files, 2);
@@ -290,7 +302,10 @@ async fn drop_table_commits_a_tombstone_version() {
 
     assert_eq!(
         outcome,
-        DdlOutcome::Dropped { table: "hits".to_string(), version: 2 }
+        DdlOutcome::Dropped {
+            table: "hits".to_string(),
+            version: 2
+        }
     );
 }
 
@@ -305,7 +320,12 @@ async fn drop_if_exists_on_a_missing_table_is_a_no_op() {
         .await
         .expect("drop if exists on a missing table is a no-op, not an error");
 
-    assert_eq!(outcome, DdlOutcome::NoOp { table: "ghost".to_string() });
+    assert_eq!(
+        outcome,
+        DdlOutcome::NoOp {
+            table: "ghost".to_string()
+        }
+    );
 }
 
 #[tokio::test]
@@ -342,7 +362,10 @@ async fn tenant_isolation_a_grant_on_one_tenant_does_not_admit_another() {
         .expect_err("a tenant with no grant on this location must be refused");
 
     assert!(
-        matches!(err, DdlExecuteError::Location(GrantsError::LocationNotGranted { .. })),
+        matches!(
+            err,
+            DdlExecuteError::Location(GrantsError::LocationNotGranted { .. })
+        ),
         "{err:?}"
     );
 }
@@ -447,10 +470,12 @@ async fn precondition_probe_failure_is_refused_before_any_manifest_write() {
         "{err:?}"
     );
 
-    let grants = grants::list(fixture.ravel.inner(), &t)
-        .await
-        .expect("list");
-    assert_eq!(grants.len(), 1, "the grant must still be the only record written");
+    let grants = grants::list(fixture.ravel.inner(), &t).await.expect("list");
+    assert_eq!(
+        grants.len(),
+        1,
+        "the grant must still be the only record written"
+    );
 }
 
 #[tokio::test]
