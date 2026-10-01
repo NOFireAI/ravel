@@ -907,6 +907,34 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dictionary still resolves to an all-null column. The columnar path's
   empty-dictionary handling is unchanged: its per-cell readers answer an empty
   dictionary chunk as they did before.
+- **`snapshot_location` reserves each footer read's bytes before issuing it
+  and trusts a prefix listing for a file's key and pin only, never its
+  size** (ADR-2040, issue #2283). The first footer read is now a suffix
+  read of `FOOTER_PREFETCH` bytes, so a listing that under- or
+  over-reports a file's size, in either direction, can no longer misplace
+  the read. An `InvalidRange` on that first read (an endpoint answering a
+  suffix read against a 0-byte object with 416 instead of an empty body)
+  now reports `EmptyFile`, the same as a GET that answers it with an empty
+  body; every other `InvalidRange` case still reports as a generic `Store`
+  error. A footer read returning a different number of bytes than
+  requested, or more bytes than the same response's own reported size,
+  now refuses as `Corrupt` naming the key, instead of risking an
+  arithmetic underflow computing where the trailer starts. The zero-size
+  refusal runs on the GET response's reported size, not the listing's.
+  Each footer GET reserves its byte length against the snapshot's
+  `MemoryBudget` before the GET is issued, and the first read's
+  reservation is held until the footer is decoded, including across the
+  second read a long footer needs, not released as soon as its own GET
+  returns; a footer read refuses with `MemoryExhausted` with no GET
+  issued when the budget is exhausted. New tests cover a single-object
+  `LOCATION` whose key the object-store client cannot address exactly,
+  one outside its grant, one whose HEAD reports `NotFound`, two files
+  whose physical footer schema elements agree exactly but whose embedded
+  `ARROW:schema` hint resolves a column to a different Arrow type, a
+  footer read that returns the wrong number of bytes, a long footer's
+  second read sharing the memory budget with the first, and the
+  `InvalidRange`-as-`EmptyFile` mapping above, each asserting its typed
+  error.
 
 - **An RLOG write refuses a broken clustered row order, and a read decodes
   each row-group dictionary once per chunk** (ADR-2135 decisions 1 and 6,
@@ -1939,21 +1967,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Parquet table again names `estimated_requests`, `estimated_store_bytes`
   and `estimated_decompressed_bytes` as components the estimate does not
   bound, so the MCP "does not bound" warning returns for all three.
-- **`snapshot_location` reserves each footer read's bytes before issuing it
-  and trusts a prefix listing for a file's key and pin only, never its
-  size** (ADR-2040, issue #2283). The first footer read is now a suffix
-  read of `FOOTER_PREFETCH` bytes, so a listing that under- or
-  over-reports a file's size, in either direction, can no longer misplace
-  the read or trip a spurious `Store` error; the zero-size refusal runs on
-  the GET response's reported size, not the listing's. Each footer GET
-  reserves its byte length against the snapshot's `MemoryBudget` before
-  the GET is issued, releasing it once the footer is decoded, and refuses
-  with `MemoryExhausted` with no GET issued when the budget is exhausted.
-  New tests cover a single-object `LOCATION` whose key the object-store
-  client cannot address exactly, one outside its grant, one whose HEAD
-  reports `NotFound`, and two files whose physical footer schema elements
-  agree exactly but whose embedded `ARROW:schema` hint resolves a column
-  to a different Arrow type, each asserting its typed error.
 
 ## [0.19.0] - 2026-09-27
 

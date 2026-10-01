@@ -534,48 +534,47 @@ async fn read_file(
             "the trailer records a {footer_len}-byte footer in a {size}-byte file"
         )));
     }
-    let (footer, _before_reservation): (Bytes, Option<Reservation>) = if footer_and_trailer
-        <= fetched
-    {
-        (data.slice(split - footer_len as usize..split), None)
-    } else {
-        // Select the version the first read saw, so both reads are of one
-        // object's bytes; If-Match stays on the listed ETag.
-        let pin = Pin {
-            etag: listed_pin.etag.clone(),
-            version: recorded.version.clone(),
+    let (footer, _before_reservation): (Bytes, Option<Reservation>) =
+        if footer_and_trailer <= fetched {
+            (data.slice(split - footer_len as usize..split), None)
+        } else {
+            // Select the version the first read saw, so both reads are of one
+            // object's bytes; If-Match stays on the listed ETag.
+            let pin = Pin {
+                etag: listed_pin.etag.clone(),
+                version: recorded.version.clone(),
+            };
+            let footer_start = size - footer_and_trailer;
+            let (before, before_reservation) = pinned_get(
+                store,
+                limiter,
+                memory,
+                accounting,
+                &key,
+                FooterRange::Range(footer_start, tail_start),
+                &pin,
+            )
+            .await
+            .map_err(|err| match err {
+                // The one exception `read_error`'s doc comment names.
+                SnapshotError::FileMissing { key } => SnapshotError::FileChanged { key },
+                other => other,
+            })?;
+            if before.outcome.total_size != size || before.pin != recorded {
+                return Err(SnapshotError::FileChanged { key: key.clone() });
+            }
+            let before = before.outcome.data;
+            if before.len() as u64 != tail_start - footer_start {
+                return Err(corrupt(format!(
+                    "read of bytes {footer_start}..{tail_start} returned {} bytes",
+                    before.len()
+                )));
+            }
+            let mut footer = Vec::with_capacity(footer_len as usize);
+            footer.extend_from_slice(&before);
+            footer.extend_from_slice(&data[..split]);
+            (Bytes::from(footer), Some(before_reservation))
         };
-        let footer_start = size - footer_and_trailer;
-        let (before, before_reservation) = pinned_get(
-            store,
-            limiter,
-            memory,
-            accounting,
-            &key,
-            FooterRange::Range(footer_start, tail_start),
-            &pin,
-        )
-        .await
-        .map_err(|err| match err {
-            // The one exception `read_error`'s doc comment names.
-            SnapshotError::FileMissing { key } => SnapshotError::FileChanged { key },
-            other => other,
-        })?;
-        if before.outcome.total_size != size || before.pin != recorded {
-            return Err(SnapshotError::FileChanged { key: key.clone() });
-        }
-        let before = before.outcome.data;
-        if before.len() as u64 != tail_start - footer_start {
-            return Err(corrupt(format!(
-                "read of bytes {footer_start}..{tail_start} returned {} bytes",
-                before.len()
-            )));
-        }
-        let mut footer = Vec::with_capacity(footer_len as usize);
-        footer.extend_from_slice(&before);
-        footer.extend_from_slice(&data[..split]);
-        (Bytes::from(footer), Some(before_reservation))
-    };
     let metadata = decode_footer(&footer, size - footer_and_trailer).map_err(&corrupt)?;
     let row_count = u64::try_from(metadata.file_metadata().num_rows())
         .map_err(|_| corrupt("the footer records a negative row count".to_string()))?;
@@ -1852,7 +1851,12 @@ mod tests {
 
     #[async_trait]
     impl ObjectStoreBackend for LyingGet {
-        async fn put(&self, _key: &str, _data: Bytes, _opts: PutOptions) -> Result<PutOutcome, StoreError> {
+        async fn put(
+            &self,
+            _key: &str,
+            _data: Bytes,
+            _opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
             unreachable!("not exercised by a footer read")
         }
 
