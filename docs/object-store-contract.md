@@ -94,9 +94,14 @@ names `NoSuchBucket` is `Permanent` on get, list, put, delete and multipart,
 because a missing bucket is not a missing object and a delete must never
 report it as an idempotent success; any other 404 is
 `NotFound`, except a whole-request 404 on `delete`, which is described with
-the per-key `DeleteObjects` codes under "Required bucket configuration". A HEAD
-response has no body, so `head` and `pin_of` against a missing bucket still
-read `NotFound`: telling the two apart would cost a second request.
+the per-key `DeleteObjects` codes under "Required bucket configuration". On
+`ExternalStore`'s Azure arm a 404 whose body names `ContainerNotFound` is
+`Permanent` on get and list, and its GCS arm, which `object_store` reaches
+through the XML API, reads `NoSuchBucket` the same way; that store is
+read-only, so it has no delete to cover. A HEAD response has no body on any
+of these backends, so `head` and `pin_of` against a missing bucket or
+container still read `NotFound`: telling the two apart would cost a second
+request.
 `PreconditionFailed`, `Unsupported` and `ReadOnly` are never retryable: a
 retry of a pinned read reads the same changed object, and neither an
 unimplemented operation nor a read-only store changes between attempts.
@@ -335,10 +340,12 @@ this crate verifies that against a live endpoint. A malformed or foreign
 version id can instead draw a 400, which `classify_generic` maps to a
 retryable `Transient`, not `NotFound`. A pin built from store metadata
 through `Pin::from_store` does not carry such an id. Both codes reach the rows above
-through `map_get_error`, which defers to `map_error_common` for everything
-but a 416: that maps `object_store`'s `NotFound` to `StoreError::NotFound`
-(unless the 404 body names `NoSuchBucket`, which is `Permanent`) and its
-`Precondition` to `StoreError::PreconditionFailed`.
+through `map_get_error` (on `ExternalStore`'s GCS and Azure arms, through a
+wrapper that first reads a `ContainerNotFound` body as `Permanent`), which
+defers to `map_error_common` for everything but a 416: that maps
+`object_store`'s `NotFound` to `StoreError::NotFound` (unless the 404 body
+names `NoSuchBucket`, which is `Permanent`) and its `Precondition` to
+`StoreError::PreconditionFailed`.
 
 `MemoryStore` is the oracle for this, and it models the rule rather than the
 storage: it does not retain superseded versions, so a pin naming one is
