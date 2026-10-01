@@ -566,7 +566,8 @@ pub enum ParquetQueryError {
 impl ParquetQueryError {
     /// The client-visible class: 400 for a request this surface cannot take,
     /// 422 for a refusal or a permanent state a retry cannot change, 503 for
-    /// a storage or integrity fault.
+    /// a storage or integrity fault, 500 for a store read that failed its
+    /// checksum.
     pub(crate) fn class(&self) -> ErrorClass {
         match self {
             ParquetQueryError::RowWindowUnsupported => ErrorClass::BadRequest,
@@ -575,6 +576,15 @@ impl ParquetQueryError {
                 match read {
                     ParquetReadError::FileChanged { .. } | ParquetReadError::FileMissing { .. } => {
                         ErrorClass::Unsupported
+                    }
+                    // A data file is an external object Ravel did not write,
+                    // and one stored without a checksum never fails as
+                    // `Corrupted`; where one was stored, the mismatch follows
+                    // the same rule as the manifest and grants reads below.
+                    ParquetReadError::Store { source, .. }
+                        if matches!(source.as_ref(), StoreError::Corrupted(_)) =>
+                    {
+                        ErrorClass::Internal
                     }
                     ParquetReadError::Store { .. }
                     | ParquetReadError::Corrupt { .. }
@@ -591,6 +601,20 @@ impl ParquetQueryError {
                     | ParquetReadError::BytesBudgetExceeded { .. } => ErrorClass::Unsupported,
                 }
             }
+            // A checksum mismatch on a manifest or grants record Ravel wrote:
+            // a retry reads the same bytes, as under `CatalogError::Store`.
+            ParquetQueryError::Resolve {
+                source:
+                    ResolveError::Store {
+                        source: StoreError::Corrupted(_),
+                        ..
+                    },
+                ..
+            }
+            | ParquetQueryError::Grants(GrantsError::Store {
+                source: StoreError::Corrupted(_),
+                ..
+            }) => ErrorClass::Internal,
             ParquetQueryError::Resolve { .. }
             | ParquetQueryError::Grants(_)
             | ParquetQueryError::PinnedManifestGone { .. } => ErrorClass::Unavailable,
@@ -622,6 +646,12 @@ impl ParquetQueryError {
                     ParquetReadError::RequestBudgetExceeded { .. }
                     | ParquetReadError::BytesBudgetExceeded { .. } => read.to_string(),
                     ParquetReadError::Corrupt { .. } => MSG_CORRUPT.to_string(),
+                    // The checksum split of the matching arm in `class()`.
+                    ParquetReadError::Store { source, .. }
+                        if matches!(source.as_ref(), StoreError::Corrupted(_)) =>
+                    {
+                        MSG_CORRUPT.to_string()
+                    }
                     ParquetReadError::Store { .. } | ParquetReadError::LeaderLost { .. } => {
                         MSG_UNAVAILABLE.to_string()
                     }
@@ -648,6 +678,18 @@ impl ParquetQueryError {
                 "Parquet table {table} is read through a credential profile this server cannot \
                  open"
             ),
+            ParquetQueryError::Resolve {
+                source:
+                    ResolveError::Store {
+                        source: StoreError::Corrupted(_),
+                        ..
+                    },
+                ..
+            }
+            | ParquetQueryError::Grants(GrantsError::Store {
+                source: StoreError::Corrupted(_),
+                ..
+            }) => MSG_CORRUPT.to_string(),
             ParquetQueryError::Resolve {
                 source: ResolveError::Store { .. } | ResolveError::Vanished { .. },
                 ..
