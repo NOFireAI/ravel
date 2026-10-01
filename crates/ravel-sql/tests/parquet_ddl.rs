@@ -10,6 +10,7 @@ mod util;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -22,8 +23,11 @@ use ravel_memory::MemoryBudget;
 use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
 use ravel_object_store::instrument::InstrumentedStore;
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_pqtable::clock::FixedClock;
+use ravel_object_store::{
+    Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
+    PageToken, PutOptions, PutOutcome, StoreError,
+};
+use ravel_pqtable::clock::{Clock, FixedClock};
 use ravel_pqtable::grants::{self, GrantsError};
 use ravel_pqtable::writer::WriteError;
 use ravel_query::{GetLimiter, LogSegmentFetcher, SegmentFetcher};
@@ -163,7 +167,6 @@ async fn create_external_table_then_read_back() {
             t,
             &format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'"),
             CREATED_BY,
-            NOW,
             deadline(),
         )
         .await
@@ -197,7 +200,7 @@ async fn create_if_not_exists_on_existing_table_is_a_no_op() {
         .await;
     let sql = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
     lake.executor
-        .execute_ddl(t, &sql, CREATED_BY, NOW, deadline())
+        .execute_ddl(t, &sql, CREATED_BY, deadline())
         .await
         .expect("first create");
 
@@ -206,7 +209,7 @@ async fn create_if_not_exists_on_existing_table_is_a_no_op() {
     );
     let outcome = lake
         .executor
-        .execute_ddl(t, &sql_if_not_exists, CREATED_BY, NOW, deadline())
+        .execute_ddl(t, &sql_if_not_exists, CREATED_BY, deadline())
         .await
         .expect("second create is a no-op, not an error");
 
@@ -227,13 +230,13 @@ async fn plain_create_on_existing_table_is_table_exists() {
         .await;
     let sql = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
     lake.executor
-        .execute_ddl(t, &sql, CREATED_BY, NOW, deadline())
+        .execute_ddl(t, &sql, CREATED_BY, deadline())
         .await
         .expect("first create");
 
     let err = lake
         .executor
-        .execute_ddl(t, &sql, CREATED_BY, NOW, deadline())
+        .execute_ddl(t, &sql, CREATED_BY, deadline())
         .await
         .expect_err("plain CREATE over an existing table must fail");
 
@@ -252,7 +255,7 @@ async fn or_replace_commits_a_new_version_over_an_existing_table() {
         .await;
     let create = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
     lake.executor
-        .execute_ddl(t, &create, CREATED_BY, NOW, deadline())
+        .execute_ddl(t, &create, CREATED_BY, deadline())
         .await
         .expect("first create");
 
@@ -262,7 +265,7 @@ async fn or_replace_commits_a_new_version_over_an_existing_table() {
         format!("CREATE OR REPLACE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
     let outcome = lake
         .executor
-        .execute_ddl(t, &replace, CREATED_BY, NOW, deadline())
+        .execute_ddl(t, &replace, CREATED_BY, deadline())
         .await
         .expect("replace");
 
@@ -290,13 +293,13 @@ async fn drop_table_commits_a_tombstone_version() {
         .await;
     let create = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
     lake.executor
-        .execute_ddl(t, &create, CREATED_BY, NOW, deadline())
+        .execute_ddl(t, &create, CREATED_BY, deadline())
         .await
         .expect("create");
 
     let outcome = lake
         .executor
-        .execute_ddl(t, "DROP TABLE hits", CREATED_BY, NOW, deadline())
+        .execute_ddl(t, "DROP TABLE hits", CREATED_BY, deadline())
         .await
         .expect("drop");
 
@@ -316,7 +319,7 @@ async fn drop_if_exists_on_a_missing_table_is_a_no_op() {
 
     let outcome = lake
         .executor
-        .execute_ddl(t, "DROP TABLE IF EXISTS ghost", CREATED_BY, NOW, deadline())
+        .execute_ddl(t, "DROP TABLE IF EXISTS ghost", CREATED_BY, deadline())
         .await
         .expect("drop if exists on a missing table is a no-op, not an error");
 
@@ -335,7 +338,7 @@ async fn drop_without_if_exists_on_a_missing_table_is_table_not_found() {
 
     let err = lake
         .executor
-        .execute_ddl(t, "DROP TABLE ghost", CREATED_BY, NOW, deadline())
+        .execute_ddl(t, "DROP TABLE ghost", CREATED_BY, deadline())
         .await
         .expect_err("plain DROP on a missing table must fail");
 
@@ -357,7 +360,7 @@ async fn tenant_isolation_a_grant_on_one_tenant_does_not_admit_another() {
     let sql = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
     let err = lake
         .executor
-        .execute_ddl(stranger, &sql, CREATED_BY, NOW, deadline())
+        .execute_ddl(stranger, &sql, CREATED_BY, deadline())
         .await
         .expect_err("a tenant with no grant on this location must be refused");
 
@@ -425,7 +428,7 @@ async fn ravel_bucket_location_is_refused() {
 
     let sql = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
     let err = executor
-        .execute_ddl(t, &sql, CREATED_BY, NOW, deadline())
+        .execute_ddl(t, &sql, CREATED_BY, deadline())
         .await
         .expect_err("a location inside Ravel's own bucket must be refused");
 
@@ -461,7 +464,7 @@ async fn precondition_probe_failure_is_refused_before_any_manifest_write() {
     let sql = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
     let err = fixture
         .executor
-        .execute_ddl(t, &sql, CREATED_BY, NOW, deadline())
+        .execute_ddl(t, &sql, CREATED_BY, deadline())
         .await
         .expect_err("a store that refuses a matching pin must be refused");
 
@@ -489,7 +492,7 @@ async fn manifest_is_written_under_the_callers_tenant_not_any_other() {
 
     let sql = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
     lake.executor
-        .execute_ddl(caller, &sql, CREATED_BY, NOW, deadline())
+        .execute_ddl(caller, &sql, CREATED_BY, deadline())
         .await
         .expect("create");
 
@@ -528,9 +531,177 @@ async fn memory_budget_refusal_leaves_no_manifest() {
     let sql = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
     let err = fixture
         .executor
-        .execute_ddl(t, &sql, CREATED_BY, NOW, deadline())
+        .execute_ddl(t, &sql, CREATED_BY, deadline())
         .await
         .expect_err("a 1-byte process memory budget cannot decode this file's footer");
 
     assert!(matches!(err, DdlExecuteError::Snapshot { .. }), "{err:?}");
+}
+
+/// A store double that advances a shared [`FixedClock`] the first time its
+/// `list` is called, then leaves the clock alone on every later call.
+/// Standing in for a manifest-prefix LIST slow enough to burn
+/// `writer::apply`'s resolve-to-put budget, without an actual wall-clock
+/// sleep. Every other method delegates to `inner` unchanged.
+struct ListAdvancingStore {
+    inner: Arc<dyn ObjectStoreBackend>,
+    clock: FixedClock,
+    advance_once_ns: i64,
+    advanced: AtomicBool,
+    list_calls: AtomicUsize,
+}
+
+impl ListAdvancingStore {
+    fn new(inner: Arc<dyn ObjectStoreBackend>, clock: FixedClock, advance_once_ns: i64) -> Self {
+        ListAdvancingStore {
+            inner,
+            clock,
+            advance_once_ns,
+            advanced: AtomicBool::new(false),
+            list_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn list_calls(&self) -> usize {
+        self.list_calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreBackend for ListAdvancingStore {
+    async fn put(
+        &self,
+        key: &str,
+        data: Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        self.inner.put(key, data, opts).await
+    }
+
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        self.inner.get(key, range).await
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.inner.head(key).await
+    }
+
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.list_calls.fetch_add(1, Ordering::SeqCst);
+        if !self.advanced.swap(true, Ordering::SeqCst) {
+            self.clock.advance(self.advance_once_ns);
+        }
+        self.inner.list(prefix, page).await
+    }
+
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+}
+
+/// Required regression test for the clock-injection fix (issue #2054,
+/// blocking finding 1). `writer::apply` budgets half of `min_grace_ms`
+/// between the manifest it resolves and the put it attempts
+/// (`DEFAULT_MIN_GRACE_MS / 2`); when that budget is gone before the put, it
+/// re-resolves instead of putting a manifest against a listing that may
+/// already be stale. [`ListAdvancingStore`] stands in for a resolve whose
+/// LIST took that long, by advancing the executor's own injected clock
+/// immediately after the first LIST returns.
+///
+/// Before this fix, `execute_ddl` built its own `FixedClock::new(now_ns)`
+/// internally on every call and never read the clock installed through
+/// `SqlExecutor::with_clock`. Against that code, `clock.now_ns()` inside
+/// `writer::apply` never advances between the resolve and the
+/// remaining-budget check, so `remaining_ns` always computes to the full
+/// budget and `apply` never re-resolves: this store double would see exactly
+/// one `list` call before the put committed. `with_clock` existing and being
+/// threaded into `writer::apply` is what makes `list_calls() == 2` below
+/// observable at all.
+#[tokio::test]
+async fn exhausted_resolve_to_put_budget_forces_a_second_resolve() {
+    let t = tenant("acme");
+    let ravel = Arc::new(MemoryStore::new());
+    grants::add(
+        ravel.as_ref(),
+        &t,
+        PROFILE,
+        GRANT,
+        CREATED_BY,
+        &FixedClock::new(NOW),
+    )
+    .await
+    .expect("grant");
+
+    let budget_ns = i64::try_from(ravel_sql::DEFAULT_MIN_GRACE_MS / 2)
+        .expect("budget_ms fits i64")
+        .saturating_mul(1_000_000);
+    let apply_clock = FixedClock::new(NOW);
+    let listing = Arc::new(ListAdvancingStore::new(
+        ravel.clone() as Arc<dyn ObjectStoreBackend>,
+        apply_clock.clone(),
+        budget_ns + 1,
+    ));
+    let store = listing.clone() as Arc<dyn ObjectStoreBackend>;
+
+    let lake: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    lake.put(
+        "t/hits/0.parquet",
+        parquet_bytes(&[1], &["a"], &[0.5]),
+        PutOptions::default(),
+    )
+    .await
+    .expect("put");
+
+    let catalog =
+        Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+    let external = Arc::new(ExternalStoreMap::new(HashMap::from([(
+        PROFILE.to_string(),
+        Arc::clone(&lake),
+    )]))) as Arc<dyn ravel_sql::ExternalStores>;
+    let sources = ParquetSources::new(
+        Arc::clone(&store),
+        Some(external),
+        Arc::new(GetLimiter::new(8).expect("limiter")),
+        None,
+        DEFAULT_PARQUET_METADATA_CACHE_BYTES,
+    );
+    let executor = SqlExecutor::new(
+        catalog,
+        SegmentFetcher::new(Arc::clone(&store)),
+        LogSegmentFetcher::new(Arc::clone(&store)),
+        SpanSegmentFetcher::new(Arc::clone(&store)),
+        SqlConfig::default(),
+        1 << 30,
+    )
+    .with_parquet_sources(sources)
+    .with_process_memory_budget(Arc::new(MemoryBudget::unlimited()))
+    .with_clock(Arc::new(apply_clock) as Arc<dyn Clock>);
+
+    let sql = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
+    let outcome = executor
+        .execute_ddl(t, &sql, CREATED_BY, deadline())
+        .await
+        .expect("create succeeds once the second resolve lands inside budget");
+
+    match outcome {
+        DdlOutcome::Created { table, version, .. } => {
+            assert_eq!(table, "hits");
+            assert_eq!(version, 1);
+        }
+        other => panic!("expected Created, got {other:?}"),
+    }
+
+    assert_eq!(
+        listing.list_calls(),
+        2,
+        "a budget exhausted between the first resolve and the put must force exactly one re-resolve"
+    );
 }
