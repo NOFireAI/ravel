@@ -21,7 +21,7 @@
 //! guarantees is re-checked rather than assumed, and every violation is
 //! [`LogSegError::Corrupted`], never a panic and never a silent misread.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::block::MAX_PAGES;
 use crate::encoding::Enc;
@@ -336,6 +336,9 @@ impl PageDir {
     /// column: `severity_text`, `body`, `attrs_raw`, or a FIELD_DIR column of
     /// type `Str` or `Bytes`.
     pub fn validate_dict_columns(&self, field_dir: &FieldDir) -> Result<(), LogSegError> {
+        // Each column id's type as `FieldDir::by_column_id` would find it (the
+        // first entry naming it), built on the first dictionary chunk.
+        let mut types: Option<HashMap<u32, FieldType>> = None;
         for g in &self.groups {
             for c in &g.chunks {
                 if !c
@@ -345,10 +348,17 @@ impl PageDir {
                 {
                     continue;
                 }
+                let types = types.get_or_insert_with(|| {
+                    let mut m = HashMap::with_capacity(field_dir.entries().len());
+                    for e in field_dir.entries() {
+                        m.entry(e.column_id).or_insert(e.ty);
+                    }
+                    m
+                });
                 let string = matches!(c.column_id, COL_SEVERITY_TEXT | COL_BODY | COL_ATTRS_RAW)
-                    || field_dir
-                        .by_column_id(c.column_id)
-                        .is_some_and(|e| matches!(e.ty, FieldType::Str | FieldType::Bytes));
+                    || types
+                        .get(&c.column_id)
+                        .is_some_and(|ty| matches!(ty, FieldType::Str | FieldType::Bytes));
                 if !string {
                     return Err(LogSegError::Corrupted(format!(
                         "page_dir column {} carries a dictionary page but is not a string column",
@@ -479,9 +489,11 @@ impl PageDir {
                 // first page is its row group dictionary, checked below once
                 // the first page has been read.
                 let max_pages = block_count.saturating_mul(MAX_PAGES_PER_BLOCK_PER_COLUMN);
-                if page_count == 0 || page_count > max_pages.saturating_add(1) {
+                let max_with_dict = max_pages.saturating_add(1);
+                if page_count == 0 || page_count > max_with_dict {
                     return Err(LogSegError::Corrupted(format!(
-                        "page_dir page count {page_count} outside 1..={max_pages}"
+                        "page_dir page count {page_count} outside 1..={max_with_dict} for a \
+                         chunk of {block_count} blocks that may carry a dictionary page"
                     )));
                 }
                 let mut pages = Vec::with_capacity(cap(page_count));
@@ -562,9 +574,13 @@ impl PageDir {
                         crc32c,
                     });
                 }
+                // The run cap above already refuses this while blocks ascend
+                // below `block_count`; kept so the chunk-wide bound does not
+                // rest on that.
                 if page_count > max_pages && !has_dict {
                     return Err(LogSegError::Corrupted(format!(
-                        "page_dir page count {page_count} outside 1..={max_pages}"
+                        "page_dir page count {page_count} outside 1..={max_pages} for a \
+                         chunk of {block_count} blocks without a dictionary page"
                     )));
                 }
                 if has_dict && !has_ids {

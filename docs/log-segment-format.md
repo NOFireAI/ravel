@@ -457,12 +457,14 @@ section compression, a decision can still move the finished object by a few
 bytes either way. The dictionary's entries are
 sorted bytewise and an id is the entry's rank, so the row-major and columnar
 write paths produce the same dictionary and the same bytes. A column whose
-group dictionary would pass 65,536 entries, or whose distinct bytes would take
-the group's total across string columns past the writer's `block_max_bytes`
-(8 MiB by default), is dropped from the decision and keeps its per-block
-pages. A decoded block's dictionary for a column is the subset of the group's
-entries that block uses, in the same order: the dictionary a tag 7 page over
-the same values would hold. Where the per-block page chose another encoding
+group dictionary would pass 65,536 entries, or whose distinct bytes plus 4
+bytes for each present value's id would take the group's total across string
+columns past the writer's `block_max_bytes` (8 MiB by default), is dropped
+from the decision and keeps its per-block pages. The writer holds those ids
+until the group flushes, so they take at most the budget plus one block's ids,
+the most one block's fold can pass it by. A decoded block's dictionary for a
+column is the subset of the group's entries that block uses, in the same
+order: the dictionary a tag 7 page over the same values would hold. Where the per-block page chose another encoding
 (plain, for example) a reader sees no per-block dictionary for it, but decodes
 the same values under either form.
 
