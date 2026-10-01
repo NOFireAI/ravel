@@ -52,6 +52,7 @@ use ravel_parquet::snapshot::{
     GrantedLocation, LocationSnapshot, SnapshotError, snapshot_location,
 };
 use ravel_pqtable::grants::{self, Grant, GrantsError, KeyPrefix};
+use ravel_pqtable::resolve;
 use ravel_pqtable::writer::{self, WriteError};
 use ravel_query::PhaseAccounting;
 use ravel_types::TenantHash;
@@ -360,6 +361,27 @@ impl SqlExecutor {
                 location,
                 options,
             } => {
+                // Plain `CREATE [IF NOT EXISTS]` (never `OR REPLACE`, which
+                // always writes a fresh snapshot over whatever is there) on a
+                // table that already exists is decided here, before any
+                // grant is read, any store opened, or any object probed or
+                // snapshotted: `writer::apply` would reach the same
+                // NoOp/TableExists verdict itself, but only after paying for
+                // the whole snapshot first.
+                if !or_replace {
+                    let existing = resolve::newest(ravel_store, &tenant, &name)
+                        .await
+                        .map_err(WriteError::from)?;
+                    if existing.is_some_and(|manifest| manifest.is_live()) {
+                        if if_not_exists {
+                            return Ok(DdlOutcome::NoOp { table: name });
+                        }
+                        return Err(DdlExecuteError::Write(WriteError::TableExists {
+                            table: name,
+                        }));
+                    }
+                }
+
                 let external_stores = parquet
                     .external_stores()
                     .ok_or(DdlExecuteError::NotConfigured)?;
