@@ -9,8 +9,9 @@ from the pinned shape fails that suite.
 ## Commit records (`t/*/*/c/*`) are deletable by design
 
 `DenyDeleteProtected` in `maintain.json` denies delete on `sys/tenancy`,
-`sys/qualification`, `sys/gc`, `t/*/*/prov`, `t/*/catalog/*/HEAD`, and the
-legal-hold audit shard (`t/*/u/*/0000/*`). Commit records are absent from
+`sys/qualification`, `sys/gc`, `t/*/*/prov`, `t/*/catalog/*/HEAD`, the
+legal-hold audit shard (`t/*/u/*/0000/*`), the durable token map `sys/auth`,
+and the write-once recovery manifests `sys/t/*`. Commit records are absent from
 that list on purpose: `MaintainDelete` grants delete on `t/*/*/c/*`
 because the maintenance sweep physically removes a commit record once
 it is superseded, and an IAM deny there would make every sweep pass fail.
@@ -19,6 +20,11 @@ The other three templates (`gateway.json`, `query.json`, `admin.json`) deny
 the whole catalog family, `t/*/catalog/*/*`, instead: none of those roles
 deletes a catalog object, so nothing narrower is needed there. Maintain is
 the one role where narrowing to `HEAD` alone is load-bearing.
+
+All four templates also deny delete on `sys/auth` and `sys/t/*`: no role
+deletes either on its normal path, a deleted `sys/auth` reads as absent and
+installs an empty token map that revokes every durable token, and `sys/t/*`
+recovery manifests are write-once (ADR-0050).
 
 Catalog snapshot and index objects (`t/*/catalog/*/snap/*`,
 `t/*/catalog/*/idx/*`) used to be caught by the same `t/*/catalog/*/*`
@@ -270,6 +276,52 @@ Two known gaps are recorded here and are NOT closed by the grants above.
   than in this template, but this template's write grant is what lets the
   write happen on a shipped deployment, so it is recorded here. Tracked in
   issue #1979.
+
+## Control-plane keys outside the data path
+
+Four control-plane keys are read or written by a server role or by Admin on
+their normal path. Each grant names the one key or prefix the call uses:
+
+| Call | Mode | S3 operation | Grant |
+|---|---|---|---|
+| `DurableAuthState::refresh` reads `sys/auth` (startup, refresh horizon, token miss) | `gateway`, `query`, `all`, keyed bucket | `s3:GetObject` | `GatewayRead` and `QueryRead` `sys/auth` |
+| `ravel-cli tenant token upsert` and `revoke` write `sys/auth` (`CreateIfAbsent`, then `CasVersion`) | Admin | `s3:PutObject` | `AdminWrite` `sys/auth` (the read is `AdminRead` `sys/*`) |
+| `RecoveryManifestWriter::ensure` writes `sys/t/<tenant_hash>` (`CreateIfAbsent`) on a keyed tenant's first ingest request | `gateway`, `all` | `s3:PutObject` | `GatewayWrite` `sys/t/*` |
+| `read_all_memo_snapshots` lists `sys/maintain/memo/` on a maintain warm start | `maintain` | `s3:ListBucket` with `prefix=sys/maintain/memo/` | `MaintainList` `s3:prefix` `sys/maintain/memo/*` (the GETs and the snapshot PUT fall under `MaintainRead` and `MaintainWrite` `sys/maintain/*`) |
+| `read_config` reads `t/<tenant_hash>/config` (the tenant config record, ADR-0066) | `maintain`, `query`, `gateway` | `s3:GetObject` | `MaintainRead`, `QueryRead` and `GatewayRead` `t/*/config` (Admin reads it through its blanket `t/*`) |
+
+Without the `sys/auth` read, every durable auth refresh fails, so durable
+bearer tokens never resolve in a process that has not refreshed yet, and stop
+resolving once a cached map passes its hard-stale bound.
+Without the Admin write, every token upsert and revoke is refused. Without the
+manifest write, ingest proceeds but the tenant has no recovery manifest and
+the writer retries, and logs a warning, on every later request. Without the
+memo list, every maintain cycle logs a warning and retries, and the process
+runs cold until the list succeeds. Without the `t/*/config` read, `read_config`
+propagates the refusal (it swallows only `NotFound`), so retention passes fail
+under `maintain`, the durable `typed_attr_columns` override never resolves under
+`query` and statements run on the base schema, and the config-limits refresh
+fails under `gateway` so per-tenant admission overrides never apply.
+
+No server role may write `sys/auth`: the only production writers are
+`ravel-cli` under Admin and the operator, which uses the shared credential
+named by `spec.storage.s3.credentials_secret_ref` rather than any of these
+templates. The tenant config record `t/<tenant_hash>/config` is likewise
+written only by `ravel-cli` under Admin (`set_tenant_config`), never by a
+server role; this change grants only the server-role reads, and whether the
+Admin template should carry the config write is tracked separately.
+
+`sys/auth` and `sys/t/*` are also deny-delete in every template (see the
+delete-grant section above): no role deletes either, a deleted `sys/auth`
+installs an empty token map that revokes every durable token, and recovery
+manifests are write-once.
+
+Gateway and Query carry no write on `sys/gc`, although every mode runs the
+`sys/gc` bootstrap at startup: creating it stays with Maintain and Admin, and a
+fresh bucket needs the `maintain` process started first, or the object created
+with `ravel-cli gc-config set` under Admin (see
+`docs/guides/operations/deployment.md`, "The first deployment against a fresh
+bucket").
 
 ## Bucket-configuration reads: granted by no template
 

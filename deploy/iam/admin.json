@@ -30,6 +30,7 @@
         "arn:aws:s3:::my-ravel-bucket/sys/qualification",
         "arn:aws:s3:::my-ravel-bucket/sys/qualify/*",
         "arn:aws:s3:::my-ravel-bucket/sys/gc",
+        "arn:aws:s3:::my-ravel-bucket/sys/auth",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/c/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/u/*",
@@ -58,7 +59,9 @@
         "arn:aws:s3:::my-ravel-bucket/sys/gc",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
         "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/*",
-        "arn:aws:s3:::my-ravel-bucket/t/*/u/*/0000/*"
+        "arn:aws:s3:::my-ravel-bucket/t/*/u/*/0000/*",
+        "arn:aws:s3:::my-ravel-bucket/sys/auth",
+        "arn:aws:s3:::my-ravel-bucket/sys/t/*"
       ]
     }
   ]
