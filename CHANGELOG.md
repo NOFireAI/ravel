@@ -1007,6 +1007,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   its chunk, and `ScanStats` still charge the page to each block that reads
   it. A BLOOM covered-column list cut short in its count, its ids or its crc
   was already refused as `Corrupted`; tests now pin each message.
+- **A Parquet data page that falsely claims dictionary encoding fails the
+  scan with a typed, file-naming error instead of a bare panic** (issue
+  #2214). The panic boundary already converted any scan-time panic to
+  `ParquetReadError::Corrupt`, and footer admission already refused a
+  schema the Arrow decoder cannot represent; a test now pins the remaining
+  shape, a data page encoded `RLE_DICTIONARY` in a chunk with no dictionary
+  page, which reaches an unguarded `.expect` in the parquet crate's column
+  reader. Two existing corrupt-input property tests now run 20,000 cases
+  each with no new failure.
 
 ### Added
 

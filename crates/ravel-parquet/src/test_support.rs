@@ -145,6 +145,28 @@ pub(crate) fn arrow_schema_panicking(original: &[u8]) -> Vec<u8> {
         .expect("a one-character change that panics Arrow's schema decoder")
 }
 
+/// `original` with the compact-protocol i32 field whose header byte is at
+/// `at` changed from `from_value` to `to_value` (a one-byte field header,
+/// `0x15`, followed by the field's value as a one-byte zigzag varint; every
+/// `Encoding` ordinal this crate's tests flip fits one byte as
+/// `ordinal * 2`). Used to retype a nested `DataPageHeader`'s `encoding`
+/// field, `at` found relative to a chunk's `data_page_offset`.
+pub(crate) fn retype_page_header(
+    original: &[u8],
+    at: usize,
+    from_value: i32,
+    to_value: i32,
+) -> Vec<u8> {
+    let mut bytes = original.to_vec();
+    assert_eq!(
+        bytes[at..at + 2],
+        [0x15, (from_value * 2) as u8],
+        "a field of the expected value at {at}"
+    );
+    bytes[at + 1] = (to_value * 2) as u8;
+    bytes
+}
+
 pub(crate) fn manifest_for(table: &str, version: u64, files: &[(Vec<u8>, u64, u32)]) -> Manifest {
     manifest(
         table,

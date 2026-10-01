@@ -606,7 +606,7 @@ mod tests {
     use super::*;
     use crate::test_support::{
         Fixture, RecordingStore, arrow_schema_panicking, assert_file_changed, footer_len_of,
-        parquet_bytes, read_all, read_error, read_where, render_rows,
+        parquet_bytes, read_all, read_error, read_where, render_rows, retype_page_header,
     };
     use datafusion::logical_expr::{Expr, JoinType, col, ident, lit};
     use parquet::file::metadata::PageIndexPolicy;
@@ -1751,6 +1751,57 @@ mod tests {
         assert_eq!(bytes[at..at + 2], [0x15, 0x00], "a data page header");
         bytes[at + 1] = 0x06;
         bytes
+    }
+
+    /// [`valid`] with column `a`'s one data page retyped from `PLAIN` to
+    /// `RLE_DICTIONARY`: the file has no dictionary page (`write` disables
+    /// dictionary encoding), so nothing ever registers a dictionary decoder
+    /// for the column.
+    ///
+    /// The retyped byte sits inside the nested `DataPageHeader` the page's
+    /// own header carries, 9 bytes past [`ParquetMetaData::data_page_offset`]
+    /// confirmed by dumping that range: a one-byte `PageHeader.type` field
+    /// (`[0x15, 0x00]`, `DATA_PAGE`), a one-byte `uncompressed_page_size`,
+    /// a one-byte `compressed_page_size`, the `data_page_header` struct's own
+    /// field header, then `DataPageHeader.num_values` before `.encoding`.
+    fn data_page_retyped_as_dictionary_encoded() -> Vec<u8> {
+        let bytes = valid();
+        let end = bytes.len() - TRAILER_LEN as usize;
+        let metadata = ParquetMetaDataReader::decode_metadata(
+            &bytes[end - footer_len_of(&bytes) as usize..end],
+        )
+        .expect("footer");
+        let at = metadata.row_group(0).column(0).data_page_offset();
+        let at = usize::try_from(at).expect("offset") + 9;
+        // PLAIN (0) as a zigzag varint becomes RLE_DICTIONARY (8).
+        retype_page_header(&bytes, at, 0, 8)
+    }
+
+    /// A data page that claims `RLE_DICTIONARY` encoding in a file with no
+    /// dictionary page fails the scan with a typed `Corrupt` error naming the
+    /// file, not a generic operator error: the boundary's catch_unwind maps
+    /// the panic (the parquet crate's column reader expects a dictionary
+    /// decoder to already be set for this encoding, and none was) to
+    /// `Corrupt` by itself, with no footer-level check needed for this shape
+    /// (the footer cannot tell whether a chunk's first page is a dictionary
+    /// page).
+    ///
+    /// Retyping an actual dictionary page's own top-level header (the literal
+    /// shape its name describes) does not reach this panic in parquet-58.4.0:
+    /// `decode_page` has an explicit typed-error path for a mismatch between
+    /// a `PageHeader`'s `type` field and the nested header struct it carries,
+    /// which a type that no longer matches its own nested header always is.
+    /// A data page's nested `DataPageHeader.encoding` field carries no such
+    /// cross-check: a page stays a well-formed `DATA_PAGE` whatever value
+    /// that field names, so `decode_page` passes it through, and the
+    /// unguarded `.expect` in `column/reader/decoder.rs` is reached only once
+    /// the column reader tries to use the decoder slot the claimed encoding
+    /// names.
+    #[test]
+    fn a_dictionary_page_retyped_as_a_data_page_is_refused_as_corrupt() {
+        let bytes = data_page_retyped_as_dictionary_encoded();
+        let got = scan_second_file_where(bytes, Some(page_pruning_filter()));
+        assert_decoder_panic(&got.expect_err("the retyped data page must fail the scan"));
     }
 
     /// A page header the parquet crate panics on, under a filtered scan that
