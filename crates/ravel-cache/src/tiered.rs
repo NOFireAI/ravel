@@ -284,8 +284,12 @@ where
     /// A caller can peek while another flight for `key` is running and arrive
     /// here after that flight has finished and left the single-flight map. Its
     /// leader therefore checks the RAM tier once, uncounted, before fetching:
-    /// every leader admits to RAM before it leaves the map, so such a caller is
-    /// served the finished flight's bytes rather than issuing a second fetch.
+    /// on success, when the RAM tier admits the bytes, a leader admits them
+    /// before it leaves the map, so such a caller is served the finished
+    /// flight's bytes rather than issuing a second fetch. After an upstream
+    /// error or a lost leader, an entry over the RAM tier's size limit, or an
+    /// eviction in the meantime, the RAM check misses and the caller fetches
+    /// again.
     ///
     /// This is the coalesced companion to [`get`](Self::get)'s peek-then-defer
     /// discipline (ADR-0046 decision 5), and it exists apart from
@@ -348,9 +352,11 @@ where
             .run(key, move || async move {
                 // The caller's peek may have missed while an earlier flight
                 // for `key` was running and reached here after that flight
-                // left the map. Every leader admits to RAM before it leaves,
-                // so those bytes are served instead of a second fetch.
-                // Uncounted: the peek already recorded this request's miss.
+                // left the map. On success, when the RAM tier admits the
+                // bytes, a leader admits them before it leaves, so those bytes
+                // are served instead of a second fetch; otherwise this misses
+                // and the fetch below runs. Uncounted: the peek already
+                // recorded this request's miss.
                 if let Some(bytes) = self.ram.get_uncounted(&key) {
                     return Ok((bytes, true));
                 }
@@ -979,7 +985,8 @@ mod tests {
     ///
     /// FLIP: removing the leader's `self.ram.get_uncounted(&key)` check in
     /// `resolve_peeked_miss` runs the late caller's fetch, so `late_fetches`
-    /// reads 1.
+    /// reads 1; replacing it with the counted `self.ram.get(&key)` records a
+    /// RAM hit, so the hit count moves.
     #[tokio::test]
     async fn resolve_peeked_miss_after_the_flight_finished_reuses_its_bytes() {
         let tmp = TempDir::new().unwrap();
@@ -1014,6 +1021,7 @@ mod tests {
             "the late caller peeks while the leader's fetch is in flight"
         );
         let misses_after_peeks = ram_metrics.snapshot().misses;
+        let hits_after_peeks = ram_metrics.snapshot().hits;
         release_tx.send(()).expect("the leader is still parked");
         let leader_bytes = leader.await.unwrap().unwrap();
         assert_eq!(
@@ -1043,6 +1051,11 @@ mod tests {
             ram_metrics.snapshot().misses,
             misses_after_peeks,
             "the RAM check records no miss of its own"
+        );
+        assert_eq!(
+            ram_metrics.snapshot().hits,
+            hits_after_peeks,
+            "the RAM check records no hit of its own"
         );
     }
 

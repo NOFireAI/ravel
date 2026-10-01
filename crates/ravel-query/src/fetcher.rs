@@ -526,9 +526,11 @@ impl ReadCache {
     /// ([`TieredCache::get`]'s documented double-count pitfall). It instead uses
     /// [`TieredCache::resolve_peeked_miss`], which joins the same single-flight
     /// as `get_or_fetch` (so concurrent callers coalesce onto one leader) but
-    /// skips the tier consultation and records no miss of its own, admitting the
-    /// fetched bytes to both tiers -- the fetch-free-on-peek discipline ADR-0046
-    /// prescribes for a peeked-then-deferred key. `fetch`'s own coalescing --
+    /// skips the counted tier consultation (its leader only rechecks RAM,
+    /// uncounted, to reuse a flight that finished after the peek) and records
+    /// no miss of its own, admitting the fetched bytes to both tiers -- the
+    /// fetch-free-on-peek discipline ADR-0046 prescribes for a
+    /// peeked-then-deferred key. `fetch`'s own coalescing --
     /// `BlockRangeFetcher` splits one range GET into per-block entries inside the
     /// closure -- is unaffected either way.
     pub(crate) async fn fetch_peeked<F, Fut>(

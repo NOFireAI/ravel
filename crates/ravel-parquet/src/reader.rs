@@ -2364,23 +2364,52 @@ mod tests {
         };
         gate.wait_until_held(1).await;
 
+        // Polled before any parked caller exists, so a disk peek fast enough to
+        // finish inside this one poll and join the flight shows as one waiter
+        // here rather than hiding among the parked ones. Such an attempt is a
+        // follower, not the late interleaving under test: it is dropped and the
+        // late caller rebuilt. Every attempt's peek records one disk miss.
+        let mut late_peeks = 0u64;
+        let late = loop {
+            let mut late = Box::pin(reader.read_range(0..4, QueryPhase::Scan));
+            let first = std::future::poll_fn(|cx| {
+                Poll::Ready(std::future::Future::poll(late.as_mut(), cx))
+            })
+            .await;
+            assert!(
+                first.is_pending(),
+                "the late caller waits on its disk peek or the held flight"
+            );
+            late_peeks += 1;
+            if tiered.in_flight_waiters(&key) == 0 {
+                break late;
+            }
+            assert!(
+                late_peeks < 20,
+                "the late caller's disk peek finished inside its first poll every time"
+            );
+            drop(late);
+            assert_eq!(
+                tiered.in_flight_waiters(&key),
+                0,
+                "a dropped follower leaves the leader's flight"
+            );
+        };
+
         let parked: Vec<_> = (0..PARKED)
             .map(|_| {
                 let reader = reader.clone();
                 tokio::spawn(async move { reader.read_range(0..4, QueryPhase::Scan).await })
             })
             .collect();
-        let mut late = Box::pin(reader.read_range(0..4, QueryPhase::Scan));
-        let first =
-            std::future::poll_fn(|cx| Poll::Ready(std::future::Future::poll(late.as_mut(), cx)))
-                .await;
-        assert!(first.is_pending(), "the late caller waits on its disk peek");
 
         // Each disk miss is recorded inside a caller's `spawn_blocking` peek
-        // once it has missed, so reaching 8 means every peek missed while the
-        // leader's GET was held. The timeout only turns a hang into a failure.
+        // once it has missed, so reaching the leader's, the parked callers' and
+        // every late attempt's means every peek missed while the leader's GET
+        // was held. The timeout only turns a hang into a failure.
+        let peeks = (CALLERS - 1) as u64 + late_peeks;
         tokio::time::timeout(std::time::Duration::from_secs(60), async {
-            while disk_metrics.snapshot().misses - before_misses < CALLERS as u64
+            while disk_metrics.snapshot().misses - before_misses < peeks
                 || tiered.in_flight_waiters(&key) < PARKED
             {
                 tokio::task::yield_now().await;
@@ -2388,6 +2417,11 @@ mod tests {
         })
         .await
         .expect("every caller peeks and misses, and six park on the held leader");
+        assert_eq!(
+            tiered.in_flight_waiters(&key),
+            PARKED,
+            "exactly the parked callers follow the leader; the late caller does not"
+        );
         assert_eq!(gate.held_count(), 1, "only the leader's GET was issued");
         assert!(recording.ranges().is_empty(), "{:?}", recording.ranges());
 
