@@ -415,8 +415,7 @@ mod tests {
     fn reparse(sql: &str) {
         // guarded-parse-allow: the subject is the redacted output, which must
         // re-parse; guarding it would test the guard instead.
-        let parsed =
-            DFParser::parse_sql(sql).expect("redacted output re-parses as valid SQL");
+        let parsed = DFParser::parse_sql(sql).expect("redacted output re-parses as valid SQL");
         assert_eq!(
             parsed.len(),
             1,

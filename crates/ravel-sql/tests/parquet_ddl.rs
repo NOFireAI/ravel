@@ -265,7 +265,9 @@ async fn create_external_table_over_a_single_object_location_then_read_back() {
         .executor
         .execute_ddl(
             t,
-            &format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/0.parquet'"),
+            &format!(
+                "CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/0.parquet'"
+            ),
             CREATED_BY,
             deadline(),
         )
@@ -305,7 +307,9 @@ async fn create_external_table_over_a_zero_byte_single_object_is_refused() {
         .executor
         .execute_ddl(
             t,
-            &format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/0.parquet'"),
+            &format!(
+                "CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/0.parquet'"
+            ),
             CREATED_BY,
             deadline(),
         )
