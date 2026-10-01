@@ -18,11 +18,14 @@ use ravel_logseg::block::{PageCounters, read_block_pages_with_dicts};
 use ravel_logseg::encoding::Enc;
 use ravel_logseg::field_dir::FieldDir;
 use ravel_logseg::footer::{kind, open};
-use ravel_logseg::page::{COMP_NONE, PageDesc, SealedPage, seal_page, smallest_stored};
+use ravel_logseg::page::{
+    COMP_NONE, COMP_ZSTD, COMPRESSION_FLOOR, PageDesc, SealedPage, seal_page, smallest_stored,
+};
 use ravel_logseg::page_dir::{ChunkEntry, GroupEntry, PageDir, PageEntry};
 use ravel_logseg::record::{COL_SEVERITY_TEXT, COL_STREAM_REF, COL_TS};
 use ravel_logseg::rlog_codec::{
-    decode_dict_ids, decode_dict_page, encode_dict_ids, encode_dict_page, string_candidates,
+    MAX_DICT_ENTRIES, decode_dict_ids, decode_dict_page, encode_dict_ids, encode_dict_page,
+    string_candidates,
 };
 use ravel_logseg::{
     AttrValue, ColumnSelection, ColumnarLogBatch, FieldType, LogRecord, LogSegError, LogStreamId,
@@ -650,6 +653,100 @@ fn dictionary_is_only_chosen_when_it_is_smaller() {
         assert_eq!(encs(&got), [Enc::Plain, Enc::Plain]);
         assert_eq!(extent(&got), c.per_block_pages);
         assert_eq!(object.len(), object_len);
+    }
+}
+
+/// The size rule compares stored bytes, after the page envelope decides on
+/// zstd. Four blocks of 16 values over 8 own 23-byte strings each: every
+/// per-block page stays under the 512-byte compression floor and is stored
+/// raw, while the 32-entry dictionary page, 769 bytes encoded, is above it and
+/// compresses to 134. With PAGE_DIR entries, on encoded sizes the dictionary
+/// is the larger side (856 against 844) and the chunk would keep its per-block
+/// pages; on stored sizes it is the smaller one (221 against 844) and the chunk
+/// takes it.
+///
+/// Wrong implementations this rules out, each shown failing: a rule comparing
+/// every page's encoded length, and one counting only the dictionary page at
+/// its encoded length.
+#[test]
+fn dictionary_size_rule_compares_bytes_after_compression() {
+    let blocks: Vec<Vec<String>> = (0..4)
+        .map(|b| {
+            (0..16)
+                .map(|i| format!("region-cluster-node-{:03}", b * 8 + i % 8))
+                .collect()
+        })
+        .collect();
+    let c = chunk_costs(&blocks);
+    assert!(c.per_block_encoded < c.dict_encoded, "{c:?}");
+    assert!(c.dict < c.per_block, "{c:?}");
+    assert_eq!(
+        (c.per_block_encoded, c.dict_encoded, c.per_block, c.dict),
+        (844, 856, 844, 221)
+    );
+
+    let (got, len) = write_k_blocks(&blocks);
+    let mut want = vec![Enc::DictPage];
+    want.extend([Enc::DictIds; 4]);
+    assert_eq!(encs(&got), want);
+    assert_eq!(extent(&got), c.dict_pages);
+    let dict = got.dict_page().expect("dictionary page");
+    assert_eq!(dict.comp, COMP_ZSTD);
+    assert!(dict.uncomp_len >= COMPRESSION_FLOOR as u64);
+    assert_eq!((dict.uncomp_len, dict.len), (769, 134));
+    assert!(got.pages[1..].iter().all(|p| p.comp == COMP_NONE));
+    assert_eq!(len, 1134);
+}
+
+/// A row-group dictionary holds at most `MAX_DICT_ENTRIES` (65,536) entries.
+/// One full group, 32 blocks of 4,100 12-byte values, each value present about
+/// twice: at 65,536 distinct values the chunk takes a dictionary, and at 65,537
+/// it keeps its per-block pages though the dictionary would still store
+/// smaller. The decoder refuses a tag 12 page counting 65,537 entries and
+/// accepts one counting 65,536.
+///
+/// Wrong implementations this rules out, each shown failing: a writer with no
+/// entry cap (it emits the 65,537-entry dictionary and its own reader refuses
+/// the object); a cap checked with `>=` (65,536 falls back).
+#[test]
+fn dictionary_entry_cap_is_inclusive() {
+    const ROWS_PER_BLOCK: usize = 4_100;
+    let cap = MAX_DICT_ENTRIES as usize;
+    for (distinct, takes) in [(cap, true), (cap + 1, false)] {
+        let blocks: Vec<Vec<String>> = (0..32)
+            .map(|b| {
+                (0..ROWS_PER_BLOCK)
+                    .map(|i| word((b * ROWS_PER_BLOCK + i) % distinct, 12))
+                    .collect()
+            })
+            .collect();
+        let unique: HashSet<&String> = blocks.iter().flatten().collect();
+        assert_eq!(unique.len(), distinct);
+        let c = chunk_costs(&blocks);
+        assert!(c.dict < c.per_block, "{distinct}: {c:?}");
+        let (got, _) = write_k_blocks(&blocks);
+        if takes {
+            let mut want = vec![Enc::DictPage];
+            want.extend([Enc::DictIds; 32]);
+            assert_eq!(encs(&got), want);
+            assert_eq!(extent(&got), c.dict_pages);
+        } else {
+            assert!(got.dict_page().is_none());
+            assert_eq!(got.pages.len(), 32);
+            assert!(got.pages.iter().all(|p| p.enc != Enc::DictIds));
+            assert_eq!(extent(&got), c.per_block_pages);
+        }
+    }
+
+    let entries: Vec<String> = (0..=cap).map(|i| format!("{i:05}")).collect();
+    let refs: Vec<&[u8]> = entries.iter().map(|e| e.as_bytes()).collect();
+    let at_cap = decode_dict_page(&encode_dict_page(&refs[..cap])).expect("at the cap");
+    assert_eq!(at_cap.len(), cap);
+    match decode_dict_page(&encode_dict_page(&refs)) {
+        Err(LogSegError::Corrupted(m)) => {
+            assert!(m.contains("count 65537 outside 1..=65536"), "{m}")
+        }
+        other => panic!("65,537 entries: {:?}", other.map(|e| e.len())),
     }
 }
 
