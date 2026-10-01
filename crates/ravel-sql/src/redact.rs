@@ -121,10 +121,12 @@ pub enum RedactError {
 /// Returns [`RedactError::Parse`] if `query` does not parse, and
 /// [`RedactError::Unsupported`] if any parsed statement is an
 /// `EXPLAIN`/`COPY`/`RESET` extension, or a `CREATE EXTERNAL TABLE` that is
-/// not one of the two admitted forms (see the module docs). The whole call
-/// fails on the first such statement: a multi-statement input is never
-/// partially redacted, because returning the redacted prefix of a batch whose
-/// remainder went unredacted would still leak.
+/// not one of the two admitted `CREATE [OR REPLACE] EXTERNAL TABLE` forms
+/// (see the module docs; `DROP TABLE` is a separate, always-admitted third
+/// form that never reaches this arm). The whole call fails on the first such
+/// statement: a multi-statement input is never partially redacted, because
+/// returning the redacted prefix of a batch whose remainder went unredacted
+/// would still leak.
 pub fn redact(query: &str, token_key: &[u8; 32]) -> Result<String, RedactError> {
     // This entry point is NOT behind `validate`: `sql_execute` audits the raw
     // statement before it returns the executor's result, so text that
@@ -167,9 +169,16 @@ pub fn redact(query: &str, token_key: &[u8; 32]) -> Result<String, RedactError> 
                     &options,
                     token_key,
                 )),
-                // Unreachable: `create_external_intent` only ever builds a
-                // `CreateExternal` intent; it never sees a DROP statement.
-                Ok(DdlIntent::Drop { .. }) => unreachable!(),
+                // `create_external_intent` takes a `&CreateExternalTable` and
+                // only ever builds a `CreateExternal` intent from it, never a
+                // DROP statement, so this arm cannot be reached today. A typed
+                // refusal survives a future change to that contract; a panic
+                // here would crash the request whose audit trail triggered it.
+                Ok(DdlIntent::Drop { .. }) => {
+                    return Err(RedactError::Unsupported {
+                        kind: "CREATE EXTERNAL TABLE",
+                    });
+                }
                 Err(_) => {
                     return Err(RedactError::Unsupported {
                         kind: "CREATE EXTERNAL TABLE",
@@ -598,6 +607,86 @@ mod tests {
             "kind preserved: {out}"
         );
         assert!(out.contains("t1"), "table name preserved: {out}");
+        reparse(&out);
+    }
+
+    #[test]
+    fn drop_table_restrict_is_redacted() {
+        let out =
+            redact("DROP TABLE t1 RESTRICT", &KEY_A).expect("DROP TABLE RESTRICT must redact");
+        assert!(
+            out.to_uppercase().contains("DROP TABLE"),
+            "kind preserved: {out}"
+        );
+        assert!(out.contains("t1"), "table name preserved: {out}");
+        assert!(
+            out.to_uppercase().contains("RESTRICT"),
+            "RESTRICT preserved: {out}"
+        );
+        reparse(&out);
+    }
+
+    #[test]
+    fn drop_table_purge_is_redacted() {
+        let out = redact("DROP TABLE t1 PURGE", &KEY_A).expect("DROP TABLE PURGE must redact");
+        assert!(
+            out.to_uppercase().contains("DROP TABLE"),
+            "kind preserved: {out}"
+        );
+        assert!(out.contains("t1"), "table name preserved: {out}");
+        assert!(
+            out.to_uppercase().contains("PURGE"),
+            "PURGE preserved: {out}"
+        );
+        reparse(&out);
+    }
+
+    #[test]
+    fn drop_table_temporary_is_redacted() {
+        let out =
+            redact("DROP TEMPORARY TABLE t1", &KEY_A).expect("DROP TEMPORARY TABLE must redact");
+        assert!(out.to_uppercase().contains("DROP"), "kind preserved: {out}");
+        assert!(
+            out.to_uppercase().contains("TEMPORARY"),
+            "TEMPORARY preserved: {out}"
+        );
+        assert!(out.contains("t1"), "table name preserved: {out}");
+        reparse(&out);
+    }
+
+    #[test]
+    fn drop_schema_is_redacted() {
+        let out = redact("DROP SCHEMA s1", &KEY_A).expect("DROP SCHEMA must redact");
+        assert!(
+            out.to_uppercase().contains("DROP SCHEMA"),
+            "kind preserved: {out}"
+        );
+        assert!(out.contains("s1"), "schema name preserved: {out}");
+        reparse(&out);
+    }
+
+    #[test]
+    fn drop_table_qualified_name_is_redacted() {
+        let out =
+            redact("DROP TABLE IF EXISTS s1.t1", &KEY_A).expect("qualified DROP TABLE must redact");
+        assert!(
+            out.to_uppercase().contains("DROP TABLE"),
+            "kind preserved: {out}"
+        );
+        assert!(out.contains("s1"), "schema name preserved: {out}");
+        assert!(out.contains("t1"), "table name preserved: {out}");
+        reparse(&out);
+    }
+
+    #[test]
+    fn drop_table_quoted_name_is_redacted() {
+        let out =
+            redact("DROP TABLE \"Weird Name\"", &KEY_A).expect("quoted DROP TABLE must redact");
+        assert!(
+            out.to_uppercase().contains("DROP TABLE"),
+            "kind preserved: {out}"
+        );
+        assert!(out.contains("Weird Name"), "table name preserved: {out}");
         reparse(&out);
     }
 
