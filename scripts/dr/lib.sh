@@ -545,54 +545,183 @@ dr_bucket_marker_present() {
   return 0
 }
 
-# Read the bucket's protection configuration back and fail unless it is what a
-# --require-bucket-protection server needs: Object Lock enabled, versioning
-# Enabled, and exactly one enabled lifecycle rule scoped to the whole bucket
-# carrying each action of DR_BUCKET_LIFECYCLE. The lifecycle configuration is
-# read once, as tab-separated fields that each go through to_string so none is
-# empty: rule count, Status, scope (Filter and legacy Prefix as one JSON
-# object), then the three actions.
-dr_check_bucket_protection() {
-  local bucket="$1" got rules rule_status scope markers noncurrent abort
+# Why the last dr_ensure_bucket call refused the bucket, for its caller's
+# message.
+DR_BUCKET_ERROR=""
+
+dr_bucket_refuse() {
+  DR_BUCKET_ERROR="$*"
+  return 1
+}
+
+# The variable naming bucket $1, for a message saying what to change.
+dr_bucket_variable() {
+  if [[ "$1" == "${DR_BUCKET_PRIMARY}" ]]; then
+    printf 'DR_BUCKET_PRIMARY\n'
+  else
+    printf 'DR_BUCKET_REPLICA\n'
+  fi
+}
+
+# Fail unless a bucket this harness created has Object Lock enabled.
+dr_check_object_lock() {
+  local bucket="$1" got
   got="$(dr_aws s3api get-object-lock-configuration --bucket "${bucket}" \
     --query ObjectLockConfiguration.ObjectLockEnabled --output text)" || got="(read failed)"
   if [[ "${got}" != "Enabled" ]]; then
-    dr_log "bucket ${bucket} does not have Object Lock enabled (read ${got}); Object Lock can only be enabled at creation, so delete the bucket and rerun"
-    return 1
+    dr_bucket_refuse "bucket ${bucket} does not have Object Lock enabled (read ${got}); Object Lock can only be enabled at creation, so delete the bucket and rerun"
   fi
+}
+
+# Read a bucket this harness created back and fail unless it carries exactly
+# what dr_ensure_bucket put: Object Lock enabled, versioning Enabled, and
+# exactly one enabled lifecycle rule scoped to the whole bucket carrying each
+# action of DR_BUCKET_LIFECYCLE. The lifecycle configuration is read once, as
+# tab-separated fields that each go through to_string so none is empty: rule
+# count, Status, scope (Filter and legacy Prefix as one JSON object), then the
+# three actions.
+dr_check_bucket_protection() {
+  local bucket="$1" got rules rule_status scope markers noncurrent abort
+  dr_check_object_lock "${bucket}" || return 1
   got="$(dr_aws s3api get-bucket-versioning --bucket "${bucket}" \
     --query Status --output text)" || got="(read failed)"
   if [[ "${got}" != "Enabled" ]]; then
-    dr_log "bucket ${bucket} does not have versioning enabled (read ${got})"
+    dr_bucket_refuse "bucket ${bucket} does not have versioning enabled (read ${got})"
     return 1
   fi
   if ! got="$(dr_aws s3api get-bucket-lifecycle-configuration --bucket "${bucket}" \
     --output text --query '[to_string(length(Rules)), to_string(Rules[0].Status), to_string({f: Rules[0].Filter, p: Rules[0].Prefix}), to_string(Rules[0].Expiration.ExpiredObjectDeleteMarker), to_string(Rules[0].NoncurrentVersionExpiration.NoncurrentDays), to_string(Rules[0].AbortIncompleteMultipartUpload.DaysAfterInitiation)]')"; then
-    dr_log "could not read the lifecycle configuration of bucket ${bucket}"
+    dr_bucket_refuse "could not read the lifecycle configuration of bucket ${bucket}"
     return 1
   fi
   IFS=$'\t' read -r rules rule_status scope markers noncurrent abort <<<"${got}"
   if [[ "${rules}" != 1 ]]; then
-    dr_log "bucket ${bucket} carries ${rules} lifecycle rules, not exactly one"
+    dr_bucket_refuse "bucket ${bucket} carries ${rules} lifecycle rules, not exactly one"
     return 1
   fi
   if [[ "${rule_status}" != Enabled ]]; then
-    dr_log "bucket ${bucket} lifecycle rule is not enabled (read ${rule_status})"
+    dr_bucket_refuse "bucket ${bucket} lifecycle rule is not enabled (read ${rule_status})"
     return 1
   fi
   # The whole-bucket spellings the server's rule parser reads as an empty prefix.
+  # This reads through botocore, which drops unknown elements and text inside
+  # Filter and keeps only the first of two Filters, so such a rule reads back as
+  # an accepted spelling here. The server's parser reads it as an unrecognized
+  # filter, reports the lifecycle conditions unknown, and starts with a warning
+  # rather than refusing.
   case "${scope}" in
     '{"f":{"Prefix":""},"p":null}' | '{"f":{},"p":null}' | \
       '{"f":{"And":{"Prefix":""}},"p":null}' | '{"f":null,"p":""}') ;;
     *)
-      dr_log "bucket ${bucket} lifecycle rule is not scoped to the whole bucket (read ${scope})"
+      dr_bucket_refuse "bucket ${bucket} lifecycle rule is not scoped to the whole bucket (read ${scope})"
       return 1
       ;;
   esac
   if [[ "${markers}" != true || "${noncurrent}" != 1 || "${abort}" != 7 ]]; then
-    dr_log "bucket ${bucket} lifecycle rule does not carry each action (read ExpiredObjectDeleteMarker=${markers} NoncurrentDays=${noncurrent} DaysAfterInitiation=${abort})"
+    dr_bucket_refuse "bucket ${bucket} lifecycle rule does not carry each action (read ExpiredObjectDeleteMarker=${markers} NoncurrentDays=${noncurrent} DaysAfterInitiation=${abort})"
     return 1
   fi
+}
+
+# The conditions whose failure makes a --require-bucket-protection server
+# refuse to start (fatal_when_failed in
+# services/ravel-server/src/bucket_protection.rs). noncurrent-expiration is
+# fatal too, but only while versioning passes.
+DR_SERVER_FATAL_CONDITIONS=(object-lock abort-multipart no-foreign-rule)
+
+# The verdict `store verify-protection` printed for condition $2: the second
+# field of the one line of $1 whose first field is the condition id. Fails
+# unless exactly one such line carries pass, fail or unknown.
+dr_protection_verdict() {
+  local lines verdict
+  lines="$(awk -v id="$2" '$1 == id' <<<"$1")"
+  [[ -n "${lines}" && "${lines}" != *$'\n'* ]] || return 1
+  verdict="$(awk '{ print $2 }' <<<"${lines}")"
+  case "${verdict}" in
+    pass | fail | unknown) printf '%s\n' "${verdict}" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Check a bucket this harness did not create for what a
+# --require-bucket-protection server checks at startup, and nothing more. Such a
+# bucket models a production one, which sets its own E_v and may carry rules
+# over prefixes Ravel does not write, so it is not held to DR_BUCKET_LIFECYCLE.
+#
+# `ravel-cli store verify-protection` reads the conditions. It requires an
+# expected E_v, which the server does not have, so it runs once per
+# NoncurrentDays value the bucket's rules carry (once with 1 when none does),
+# and the bucket passes when one run shows no condition the server refuses on.
+# The run whose E_v is the value the rules covering t/ agree on reads every
+# condition as the server does, and a run with another E_v fails
+# noncurrent-expiration on those rules. The one bucket this can pass and the
+# server refuse has versioning not Enabled under Object Lock, which S3 does not
+# allow, and a rule over part of t/ expiring noncurrent versions sooner than
+# the covering rules. An unknown condition does not refuse, as the server warns
+# and starts.
+dr_check_server_protection() {
+  local bucket="$1" variable listing day days="" report code id verdict
+  local versioning noncurrent fatal best_fatal="" best_day="" best_report="" advice
+  variable="$(dr_bucket_variable "${bucket}")"
+  if ! dr_ravel_binaries_available; then
+    dr_bucket_refuse "bucket ${bucket} carries no rehearsal marker, and checking it needs ravel-cli store verify-protection, but there is no ravel-cli and no cargo"
+    return 1
+  fi
+  listing="$(dr_aws s3api get-bucket-lifecycle-configuration --bucket "${bucket}" \
+    --query 'Rules[].NoncurrentVersionExpiration.NoncurrentDays' --output text \
+    2>/dev/null)" || listing=""
+  while IFS= read -r day; do
+    if [[ "${day}" =~ ^[0-9]{1,9}$ ]]; then days+="${day}"$'\n'; fi
+  done < <(dr_text_list_lines "${listing}")
+  days="$(sort -un <<<"${days}" | awk 'NF > 0')"
+  [[ -n "${days}" ]] || days=1
+  while IFS= read -r day; do
+    code=0
+    report="$(
+      dr_export_s3_env "${bucket}"
+      dr_ravel_cli --store s3 store verify-protection --expected-noncurrent-days "${day}" \
+        </dev/null
+    )" || code=$?
+    if [[ "${code}" -gt 2 ]]; then
+      dr_bucket_refuse "could not run ravel-cli store verify-protection against bucket ${bucket} (exit ${code})"
+      return 1
+    fi
+    fatal=""
+    for id in "${DR_SERVER_FATAL_CONDITIONS[@]}" noncurrent-expiration versioning; do
+      if ! verdict="$(dr_protection_verdict "${report}" "${id}")"; then
+        dr_bucket_refuse "ravel-cli store verify-protection printed no single verdict for ${id} on bucket ${bucket}"
+        return 1
+      fi
+      case "${id}:${verdict}" in
+        versioning:*) versioning="${verdict}" ;;
+        noncurrent-expiration:*) noncurrent="${verdict}" ;;
+        *:fail) fatal+=" ${id}" ;;
+      esac
+    done
+    if [[ "${noncurrent}" == fail && "${versioning}" == pass ]]; then
+      fatal+=" noncurrent-expiration"
+    fi
+    if [[ -z "${fatal}" ]]; then
+      dr_log "bucket ${bucket} passes every condition a --require-bucket-protection server refuses to start on (store verify-protection --expected-noncurrent-days ${day})"
+      awk '$2 != "pass" && $1 != "delete-marker-replication" && $1 != "object-retention" && $1 != "verify-protection:" {
+        print "  the server would still warn on: " $0 }' <<<"${report}" >&2
+      return 0
+    fi
+    if [[ -z "${best_day}" ]] || [[ "$(wc -w <<<"${fatal}")" -lt "$(wc -w <<<"${best_fatal}")" ]]; then
+      best_fatal="${fatal}"
+      best_day="${day}"
+      best_report="${report}"
+    fi
+  done <<<"${days}"
+  for id in ${best_fatal}; do
+    awk -v id="${id}" '$1 == id { print "  " $0 }' <<<"${best_report}" >&2
+  done
+  if [[ " ${best_fatal} " == *" object-lock "* ]]; then
+    advice="Object Lock can only be enabled when a bucket is created, so this bucket can never pass: set ${variable} to a bucket created with Object Lock, or to a name that does not exist yet so the harness creates and configures one"
+  else
+    advice="change the bucket's configuration to meet docs/object-store-contract.md \"Required bucket configuration\", or set ${variable} to a name that does not exist yet so the harness creates and configures one"
+  fi
+  dr_bucket_refuse "bucket ${bucket} fails what a --require-bucket-protection server refuses to start on:${best_fatal} (store verify-protection --expected-noncurrent-days ${best_day}, detail above). It carries no ${DR_BUCKET_MARKER_KEY} rehearsal marker, so this harness did not create it and changes nothing on it: ${advice}"
 }
 
 # Create the bucket in DR_REGION if it is absent, stamp it, and configure it the
@@ -601,34 +730,43 @@ dr_check_bucket_protection() {
 # bucket created with no region lands in the endpoint's default region, which
 # is a different bucket from the one the rest of the run addresses.
 #
-# Versioning and lifecycle are put only on a bucket carrying this harness's
-# creation marker, so a bucket someone else configured is read back and never
-# rewritten. Every bucket is read back, and one this harness created before it
-# enabled Object Lock fails there.
+# Only a bucket carrying this harness's creation marker is configured, and it is
+# read back exactly; its Object Lock is checked before versioning is switched
+# on, since versioning cannot be switched off again. Any other bucket is never
+# changed and is checked only for what the server checks
+# (dr_check_server_protection). On a refusal DR_BUCKET_ERROR says why.
 dr_ensure_bucket() {
   local bucket="$1"
+  DR_BUCKET_ERROR=""
   if ! dr_bucket_exists "${bucket}"; then
     dr_log "creating bucket ${bucket} in region ${DR_REGION} with Object Lock"
     # S3 outside us-east-1 rejects a CreateBucket that carries no matching
     # LocationConstraint, and us-east-1 rejects one that carries any.
     if [[ "${DR_REGION}" == "us-east-1" ]]; then
       dr_aws s3api create-bucket --bucket "${bucket}" \
-        --object-lock-enabled-for-bucket >/dev/null || return 1
+        --object-lock-enabled-for-bucket >/dev/null ||
+        { dr_bucket_refuse "could not create bucket ${bucket} in region ${DR_REGION}"; return 1; }
     else
       dr_aws s3api create-bucket --bucket "${bucket}" \
         --create-bucket-configuration "LocationConstraint=${DR_REGION}" \
-        --object-lock-enabled-for-bucket >/dev/null || return 1
+        --object-lock-enabled-for-bucket >/dev/null ||
+        { dr_bucket_refuse "could not create bucket ${bucket} in region ${DR_REGION}"; return 1; }
     fi
-    dr_write_bucket_marker "${bucket}" || return 1
+    dr_write_bucket_marker "${bucket}" ||
+      { dr_bucket_refuse "created bucket ${bucket} but could not write its ${DR_BUCKET_MARKER_KEY} rehearsal marker"; return 1; }
   fi
-  if dr_bucket_marker_present "${bucket}"; then
-    dr_aws s3api put-bucket-versioning --bucket "${bucket}" \
-      --versioning-configuration Status=Enabled >/dev/null || return 1
-    dr_aws s3api put-bucket-lifecycle-configuration --bucket "${bucket}" \
-      --lifecycle-configuration "${DR_BUCKET_LIFECYCLE}" >/dev/null || return 1
-  else
-    dr_log "bucket ${bucket} carries no rehearsal marker; reading its configuration back without changing it"
+  if ! dr_bucket_marker_present "${bucket}"; then
+    dr_log "bucket ${bucket} carries no rehearsal marker; checking it the way a --require-bucket-protection server does, without changing it"
+    dr_check_server_protection "${bucket}"
+    return
   fi
+  dr_check_object_lock "${bucket}" || return 1
+  dr_aws s3api put-bucket-versioning --bucket "${bucket}" \
+    --versioning-configuration Status=Enabled >/dev/null ||
+    { dr_bucket_refuse "could not put versioning on bucket ${bucket}"; return 1; }
+  dr_aws s3api put-bucket-lifecycle-configuration --bucket "${bucket}" \
+    --lifecycle-configuration "${DR_BUCKET_LIFECYCLE}" >/dev/null ||
+    { dr_bucket_refuse "could not put the lifecycle configuration on bucket ${bucket}"; return 1; }
   dr_check_bucket_protection "${bucket}"
 }
 

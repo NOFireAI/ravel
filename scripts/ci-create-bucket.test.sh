@@ -5,7 +5,9 @@
 # stderr); every other call answers what a compliant bucket would, unless the
 # case overrides it. A green CI run only ever takes the clean-create path with
 # every read-back passing, so the retry classification and each read-back
-# failure are covered here or nowhere.
+# failure are covered here or nowhere. The cases at the end run the create Job
+# of deploy/k8s/floci.yaml, the other launcher that checks a lifecycle
+# document in shell, against a stub curl.
 #
 # Run: bash scripts/ci-create-bucket.test.sh
 set -uo pipefail
@@ -219,6 +221,169 @@ lifecycle_case_ missing-multipart-abort-fails 1 "1|Enabled|${WHOLE}|true|1|null"
 lifecycle_case_ empty-filter-passes 0 '1|Enabled|{"f":{},"p":null}|true|1|7'
 lifecycle_case_ and-empty-prefix-passes 0 '1|Enabled|{"f":{"And":{"Prefix":""}},"p":null}|true|1|7'
 lifecycle_case_ legacy-empty-prefix-passes 0 '1|Enabled|{"f":null,"p":""}|true|1|7'
+
+# A read-back that fails transiently is retried like the puts, and one that
+# keeps failing transiently gives up after the same five attempts.
+override=$'ObjectLockEnabled@1\t254:ServiceUnavailable\t'
+case_ object-lock-read-unavailable-is-retried 0 1 $((2 + AFTER_CREATE)) "${OK}"
+override=$'length(Rules)@1\t255\t\nlength(Rules)@2\t254:SlowDown\t'
+case_ lifecycle-read-transient-is-retried 0 1 $((3 + AFTER_CREATE)) "${OK}"
+override=$'ObjectLockEnabled\t254:InternalError\t'
+case_ object-lock-read-persistently-failing-gives-up 1 1 8 "${OK}"
+
+# --- deploy/k8s/floci.yaml's create Job ------------------------------------
+#
+# The Job's shell is cut out of the manifest (the block scalar under the
+# create-bucket container's `- |`, dedented) and run against a stub curl that
+# answers a compliant bucket and serves the case's lifecycle document. It runs
+# under busybox sh with busybox grep, tr and wc first on PATH when busybox is
+# installed, as in the curlimages/curl image.
+FLOCI_YAML="${HERE}/../deploy/k8s/floci.yaml"
+FLOCI_SCRIPT="${TMP}/floci-create-bucket.sh"
+in_container=0
+in_script=0
+: >"${FLOCI_SCRIPT}"
+while IFS= read -r line; do
+  if [ "${in_script}" = 1 ]; then
+    case "${line}" in
+      '              '*) printf '%s\n' "${line:14}" >>"${FLOCI_SCRIPT}" ;;
+      '') printf '\n' >>"${FLOCI_SCRIPT}" ;;
+      *) break ;;
+    esac
+  elif [ "${line}" = '        - name: create-bucket' ]; then
+    in_container=1
+  elif [ "${in_container}" = 1 ] && [ "${line}" = '            - |' ]; then
+    in_script=1
+  fi
+done <"${FLOCI_YAML}"
+if grep -q 'bucket ${BUCKET} ready' "${FLOCI_SCRIPT}"; then passes=$((passes + 1)); else
+  fails=$((fails + 1)); echo "FAIL floci: could not cut the create Job's shell out of ${FLOCI_YAML}"
+fi
+
+FLOCI_BIN="${TMP}/floci-bin"
+mkdir -p "${FLOCI_BIN}"
+cat >"${FLOCI_BIN}/curl" <<'STUB'
+#!/usr/bin/env bash
+url=
+head=0
+method=GET
+prev=
+for arg in "$@"; do
+  case "${arg}" in http://*) url=${arg} ;; -I) head=1 ;; esac
+  [ "${prev}" = -X ] && method=${arg}
+  prev=${arg}
+done
+case "${url}" in
+  */_floci/health) echo '{"services":{"s3":"running"}}' ;;
+  *) if [ "${head}" = 1 ]; then printf 200
+     elif [ "${method}" = PUT ]; then :
+     else case "${url}" in
+       *'?object-lock') echo '<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>' ;;
+       *'?versioning') echo '<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>' ;;
+       *'?lifecycle') cat "${FLOCI_LIFECYCLE}" ;;
+     esac
+     fi ;;
+esac
+STUB
+chmod +x "${FLOCI_BIN}/curl"
+# The health wait never sleeps in a case: a stub that answers it wrong fails
+# after 60 quick polls rather than two minutes.
+printf '#!/bin/sh\nexit 0\n' >"${FLOCI_BIN}/sleep"
+chmod +x "${FLOCI_BIN}/sleep"
+floci_sh=(sh)
+if command -v busybox >/dev/null 2>&1; then
+  floci_sh=(busybox sh)
+  for applet in grep tr wc; do ln -s "$(command -v busybox)" "${FLOCI_BIN}/${applet}"; done
+else
+  echo "note: busybox not installed; the floci cases run under sh with the host's grep, tr and wc"
+fi
+
+RULE_ACTIONS='<Status>Enabled</Status><Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration><NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration><AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation></AbortIncompleteMultipartUpload>'
+
+# floci_case_ <name> <want exit> <lifecycle document>: a passing run prints the
+# ready line, and a refused one the scope refusal, so a case cannot pass on
+# some other check's verdict.
+floci_case_() {
+  local name=$1 want_rc=$2 dir="${TMP}/floci-$1" rc=0 want_line
+  mkdir -p "${dir}"
+  printf '%s\n' "$3" >"${dir}/lifecycle"
+  PATH="${FLOCI_BIN}:${PATH}" FLOCI_LIFECYCLE="${dir}/lifecycle" \
+    BUCKET=ravel ENDPOINT=http://floci.ravel-system.svc:4566 \
+    "${floci_sh[@]}" "${FLOCI_SCRIPT}" >"${dir}/out" 2>&1 || rc=$?
+  want_line='bucket ravel ready'
+  [ "${want_rc}" = 0 ] || want_line='lifecycle rule is not scoped to the whole bucket'
+  if [ "${rc}" = "${want_rc}" ] && grep -qF "${want_line}" "${dir}/out"; then
+    passes=$((passes + 1))
+  else
+    fails=$((fails + 1))
+    echo "FAIL floci ${name}: want exit ${want_rc} and \"${want_line}\", got exit ${rc}"
+    sed 's/^/    /' "${dir}/out"
+  fi
+}
+# floci_rule_ <name> <want exit> <rule children before the actions>
+floci_rule_() {
+  floci_case_ "$1" "$2" "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule><ID>ravel</ID>$3${RULE_ACTIONS}</Rule></LifecycleConfiguration>"
+}
+
+# Every spelling the server's rule parser reads as the whole bucket passes.
+floci_rule_ filter-empty-prefix 0 '<Filter><Prefix></Prefix></Filter>'
+floci_rule_ filter-self-closing-prefix 0 '<Filter><Prefix/></Filter>'
+floci_rule_ filter-and-empty-prefix 0 '<Filter><And><Prefix></Prefix></And></Filter>'
+floci_rule_ filter-and-self-closing-prefix 0 '<Filter><And><Prefix/></And></Filter>'
+floci_rule_ empty-filter 0 '<Filter></Filter>'
+floci_rule_ self-closing-filter 0 '<Filter/>'
+floci_rule_ legacy-empty-prefix 0 '<Prefix></Prefix>'
+floci_rule_ legacy-self-closing-prefix 0 '<Prefix/>'
+floci_rule_ space-inside-the-prefix-tag 0 '<Filter><Prefix ></Prefix></Filter>'
+floci_case_ pretty-printed 0 '<?xml version="1.0" encoding="UTF-8"?>
+<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Rule>
+    <ID>ravel</ID>
+    <Filter>
+      <Prefix></Prefix>
+    </Filter>
+    <Status>Enabled</Status>
+    <Expiration>
+      <ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker>
+    </Expiration>
+    <NoncurrentVersionExpiration>
+      <NoncurrentDays>1</NoncurrentDays>
+    </NoncurrentVersionExpiration>
+    <AbortIncompleteMultipartUpload>
+      <DaysAfterInitiation>7</DaysAfterInitiation>
+    </AbortIncompleteMultipartUpload>
+  </Rule>
+</LifecycleConfiguration>'
+floci_case_ legacy-prefix-after-the-actions 0 "<LifecycleConfiguration><Rule><ID>ravel</ID>${RULE_ACTIONS}<Prefix/></Rule></LifecycleConfiguration>"
+
+# Every other filter is refused. The server's parser reads each as
+# unrecognized or as narrower than the whole bucket, except text beside a
+# Filter's one Prefix, which it ignores; the check refuses that too, since it
+# accepts only the exact spellings.
+floci_rule_ filter-empty-and 1 '<Filter><And></And></Filter>'
+floci_rule_ filter-self-closing-and 1 '<Filter><And/></Filter>'
+floci_rule_ filter-unknown-child 1 '<Filter><Unknown/></Filter>'
+floci_rule_ filter-unknown-child-beside-prefix 1 '<Filter><Prefix></Prefix><Unknown/></Filter>'
+floci_rule_ filter-unknown-child-before-prefix 1 '<Filter><Unknown/><Prefix/></Filter>'
+floci_rule_ and-unknown-child 1 '<Filter><And><Prefix/><Unknown/></And></Filter>'
+floci_rule_ filter-repeated-prefix 1 '<Filter><Prefix></Prefix><Prefix></Prefix></Filter>'
+floci_rule_ and-repeated-prefix 1 '<Filter><And><Prefix/><Prefix/></And></Filter>'
+floci_rule_ filter-text 1 '<Filter>x</Filter>'
+floci_rule_ filter-text-beside-prefix 1 '<Filter>x<Prefix></Prefix></Filter>'
+floci_rule_ legacy-prefix-beside-filter 1 '<Prefix></Prefix><Filter></Filter>'
+floci_rule_ legacy-prefix-beside-filter-prefix 1 '<Filter><Prefix/></Filter><Prefix/>'
+floci_rule_ two-filters 1 '<Filter/><Filter/>'
+floci_rule_ repeated-legacy-prefix 1 '<Prefix/><Prefix/>'
+floci_rule_ space-prefix 1 '<Filter><Prefix> </Prefix></Filter>'
+floci_rule_ newline-prefix 1 '<Prefix>
+</Prefix>'
+floci_rule_ non-empty-prefix 1 '<Filter><Prefix>t/</Prefix></Filter>'
+floci_rule_ tag 1 '<Filter><Tag><Key>k</Key><Value>v</Value></Tag></Filter>'
+floci_rule_ and-prefix-and-size 1 '<Filter><And><Prefix/><ObjectSizeGreaterThan>1</ObjectSizeGreaterThan></And></Filter>'
+floci_rule_ prefix-inside-an-unknown-element 1 '<Unknown><Prefix/></Unknown>'
+floci_rule_ prefix-inside-an-unknown-element-with-siblings 1 '<Unknown><ID>x</ID><Prefix/><ID>y</ID></Unknown>'
+floci_rule_ no-filter 1 ''
 
 # Usage errors never call aws.
 rc=0

@@ -112,7 +112,7 @@ expect_commits="$(dr_expect DR_EXPECT_COMMIT_RECORDS)"
 
 dr_log "ensuring bucket ${DR_BUCKET_REPLICA} exists in region ${DR_REGION}"
 dr_ensure_bucket "${DR_BUCKET_REPLICA}" || dr_die "${DR_EX_PRECONDITION}" \
-  "could not create bucket ${DR_BUCKET_REPLICA} in region ${DR_REGION}"
+  "${DR_BUCKET_ERROR:-could not prepare bucket ${DR_BUCKET_REPLICA} in region ${DR_REGION}}"
 
 # Emptiness is asserted over ALL versions. On a versioned bucket a recursive
 # delete writes delete markers and leaves every prior version in place, so a

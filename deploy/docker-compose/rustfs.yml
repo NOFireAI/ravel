@@ -77,6 +77,12 @@ services:
         want fields 6 "$$#"
         want rules 1 "$$1"
         want status Enabled "$$2"
+        # The whole-bucket spellings the server's rule parser reads as an empty
+        # prefix. This reads through botocore, which drops unknown elements and
+        # text inside Filter and keeps only the first of two Filters, so such a
+        # rule reads back as an accepted spelling here. The server's parser
+        # reads it as an unrecognized filter, reports the lifecycle conditions
+        # unknown, and starts with a warning rather than refusing.
         case "$$3" in
           '{"f":{"Prefix":""},"p":null}' | '{"f":{},"p":null}' | '{"f":{"And":{"Prefix":""}},"p":null}' | '{"f":null,"p":""}') ;;
           *) echo "bucket ravel-dev lifecycle rule is not scoped to the whole bucket ($$3)"; exit 1 ;;

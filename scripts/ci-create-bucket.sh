@@ -16,13 +16,13 @@
 # lifecycle document from this file.
 #
 # Credentials and region come from the standard AWS_ACCESS_KEY_ID,
-# AWS_SECRET_ACCESS_KEY and AWS_DEFAULT_REGION variables. The create-bucket,
-# put-bucket-versioning and put-bucket-lifecycle-configuration calls are
-# retried with backoff only when they failed transiently: exit 255 (the CLI got
-# no usable response: connection refused, reset or timed out) or a 5xx-class S3
-# error code. RustFS can answer the create and still be settling, so a put can
-# fail transiently right after a create that succeeded. Any other failure (bad
-# credentials, an invalid bucket name) is permanent and fails at once. A bucket
+# AWS_SECRET_ACCESS_KEY and AWS_DEFAULT_REGION variables. Every s3api call (the
+# create, both puts and the three read-backs) is retried with backoff only when
+# it failed transiently: exit 255 (the CLI got no usable response: connection
+# refused, reset or timed out) or a 5xx-class S3 error code. RustFS can answer
+# the create and still be settling, so a put or a read can fail transiently
+# right after a create that succeeded. Any other failure (bad credentials, an
+# invalid bucket name) is permanent and fails at once. A bucket
 # already owned by these credentials counts as created on any attempt, the
 # first included: an earlier attempt may have created it before its response
 # was lost, and a rerun against a populated endpoint should not fail.
@@ -104,10 +104,11 @@ retry '' put-bucket-lifecycle-configuration \
   --bucket "$bucket" --lifecycle-configuration "$LIFECYCLE"
 
 # readback <setting> <want> <get-subcommand> <query>: read one value of the
-# bucket's configuration and fail unless it is <want>.
+# bucket's configuration and fail unless it is <want>. The read goes through
+# retry, since a backend still settling can answer a GET transiently too.
 readback() {
   local setting=$1 want=$2 subcommand=$3 query=$4 got rc=0
-  got=$(aws --endpoint-url "$endpoint" s3api "$subcommand" --bucket "$bucket" \
+  got=$(retry '' "$subcommand" --bucket "$bucket" \
     --query "$query" --output text) || rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "::error::$subcommand on $bucket failed (exit $rc); cannot confirm $setting" >&2
@@ -128,7 +129,7 @@ readback versioning Enabled get-bucket-versioning Status
 # through to_string, so none is empty and the split cannot shift. The scope is
 # the rule's Filter and legacy rule-level Prefix as one JSON object.
 rc=0
-got=$(aws --endpoint-url "$endpoint" s3api get-bucket-lifecycle-configuration \
+got=$(retry '' get-bucket-lifecycle-configuration \
   --bucket "$bucket" --output text --query '[to_string(length(Rules)), to_string(Rules[0].Status), to_string({f: Rules[0].Filter, p: Rules[0].Prefix}), to_string(Rules[0].Expiration.ExpiredObjectDeleteMarker), to_string(Rules[0].NoncurrentVersionExpiration.NoncurrentDays), to_string(Rules[0].AbortIncompleteMultipartUpload.DaysAfterInitiation)]') || rc=$?
 if [ "$rc" -ne 0 ]; then
   echo "::error::get-bucket-lifecycle-configuration on $bucket failed (exit $rc)" >&2
@@ -144,6 +145,11 @@ lifecycle_want() {
 lifecycle_want "exactly one lifecycle rule" 1 "$rules"
 lifecycle_want "an enabled lifecycle rule" Enabled "$rule_status"
 # The whole-bucket spellings the server's rule parser reads as an empty prefix.
+# This reads through botocore, which drops unknown elements and text inside
+# Filter and keeps only the first of two Filters, so such a rule reads back as
+# an accepted spelling here. The server's parser reads it as an unrecognized
+# filter, reports the lifecycle conditions unknown, and starts with a warning
+# rather than refusing.
 case "$scope" in
   '{"f":{"Prefix":""},"p":null}' | '{"f":{},"p":null}' | \
     '{"f":{"And":{"Prefix":""}},"p":null}' | '{"f":null,"p":""}') ;;
