@@ -586,6 +586,8 @@ mod tests {
             "quote must be doubled, not dropped: {out}"
         );
 
+        // guarded-parse-allow: test code parses this module's own rendered
+        // output to prove the escaped key yields one statement.
         let parsed = DFParser::parse_sql(&out).expect("redacted output re-parses as valid SQL");
         assert_eq!(parsed.len(), 1, "must re-parse as exactly one statement");
     }
