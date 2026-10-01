@@ -205,107 +205,156 @@ spec:
               # (docs/guides/disaster-recovery.md).
               LIFECYCLE='<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ID>ravel</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status><Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration><NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration><AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>'
               VERSIONING='<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>'
-              # Object Lock can only be enabled when the bucket is created.
-              # Idempotent: a repeat PUT of an existing bucket also returns 200.
-              curl -fsS -o /dev/null -X PUT -H 'x-amz-bucket-object-lock-enabled: true' \
-                "${ENDPOINT}/${BUCKET}"
-              # Verify rather than trust: HEAD on a missing bucket is 404, so a
-              # 200 here proves the bucket Ravel needs actually exists.
+              # The bucket is created only when HEAD says it is absent, and
+              # versioning and the lifecycle rule are each read first and put
+              # only when the read does not already match, then read back, so
+              # a rerun of this Job against a bucket that is already set up
+              # issues no put. Object Lock can only be enabled when the bucket
+              # is created.
               status="$(curl -sS -o /dev/null -w '%{http_code}' -I "${ENDPOINT}/${BUCKET}")"
               if [ "$status" != "200" ]; then
-                echo "bucket ${BUCKET} missing after create (HEAD ${status})" >&2
-                exit 1
+                curl -fsS -o /dev/null -X PUT -H 'x-amz-bucket-object-lock-enabled: true' \
+                  "${ENDPOINT}/${BUCKET}"
+                # Verify rather than trust: HEAD on a missing bucket is 404, so
+                # a 200 here proves the bucket Ravel needs actually exists.
+                status="$(curl -sS -o /dev/null -w '%{http_code}' -I "${ENDPOINT}/${BUCKET}")"
+                if [ "$status" != "200" ]; then
+                  echo "bucket ${BUCKET} missing after create (HEAD ${status})" >&2
+                  exit 1
+                fi
               fi
-              # Both PUTs replace the whole configuration, so a rerun is a no-op.
-              curl -fsS -o /dev/null -X PUT -H 'Content-Type: application/xml' \
-                --data-binary "$VERSIONING" "${ENDPOINT}/${BUCKET}?versioning"
-              curl -fsS -o /dev/null -X PUT -H 'Content-Type: application/xml' \
-                --data-binary "$LIFECYCLE" "${ENDPOINT}/${BUCKET}?lifecycle"
-              # Read back the three configurations the startup check reads. A
-              # bucket created by an older manifest without Object Lock fails
-              # here; delete the floci pod to start from an empty store.
+              # Object Lock is read before anything else is put. A bucket
+              # created by an older manifest without Object Lock fails here;
+              # delete the floci pod to start from an empty store.
               if ! curl -fsS "${ENDPOINT}/${BUCKET}?object-lock" |
                 grep -q '<ObjectLockEnabled>Enabled</ObjectLockEnabled>'; then
                 echo "bucket ${BUCKET} does not have Object Lock enabled" >&2
                 exit 1
               fi
-              if ! curl -fsS "${ENDPOINT}/${BUCKET}?versioning" | grep -q '<Status>Enabled</Status>'; then
-                echo "bucket ${BUCKET} does not have versioning enabled" >&2
-                exit 1
-              fi
-              # The lifecycle document is read once and checked whole: exactly
-              # one rule, enabled, scoped to the whole bucket, carrying each
-              # action. flat is the document on one line with every whitespace
-              # character turned into a space, tagged the same with the spaces
-              # inside each tag removed, and doc the same with no spaces at all.
-              lifecycle="$(curl -fsS "${ENDPOINT}/${BUCKET}?lifecycle")"
-              flat="$(printf '%s' "$lifecycle" | tr '\r\n\t' '   ')"
-              tagged="$(printf '%s\n' "$flat" | sed -e ':a' -e 's/\(<[^>]*\) /\1/' -e 'ta')"
-              doc="$(printf '%s' "$tagged" | tr -d ' ')"
-              count() { printf '%s\n' "$1" | grep -o "$2" | wc -l | tr -d ' '; }
-              rules="$(count "$flat" '<Rule[ />]')"
-              if [ "$rules" != "1" ]; then
-                echo "bucket ${BUCKET} carries ${rules} lifecycle rules, not exactly one" >&2
-                exit 1
-              fi
-              if [ "$(printf '%s\n' "$lifecycle" | grep -o '<Status>[^<]*</Status>')" != \
-                '<Status>Enabled</Status>' ]; then
-                echo "bucket ${BUCKET} lifecycle rule is not enabled" >&2
-                exit 1
-              fi
-              # The rule's filter must be exactly one spelling the server's rule
-              # parser reads as the whole bucket: a Filter holding only an empty
-              # Prefix (directly or inside And), an empty Filter, or a rule-level
-              # empty Prefix with no Filter. The spelling must be a direct child
-              # of Rule (as many tags opened as closed before it), and nothing
-              # else in the rule may name a filter element. The server keeps a
-              # Prefix's text as it is, so whitespace there is a prefix of
-              # spaces: any Prefix holding text is refused, read from tagged,
-              # where only the whitespace inside tags is gone.
-              rule="${doc#*<Rule>}"
-              rule="${rule%%</Rule>*}"
-              whole=
-              case "$doc" in
-                *'<Rule>'*'</Rule>'*) ;;
-                *) rule= ;;
-              esac
-              case "$tagged" in
-                *'<Prefix>'[!\<]*) rule= ;;
-              esac
-              for spelling in '<Filter><Prefix></Prefix></Filter>' '<Filter><Prefix/></Filter>' \
-                '<Filter><And><Prefix></Prefix></And></Filter>' '<Filter><And><Prefix/></And></Filter>' \
-                '<Filter></Filter>' '<Filter/>' '<Prefix></Prefix>' '<Prefix/>'; do
-                case "$rule" in
-                  *"$spelling"*) ;;
-                  *) continue ;;
+              enabled() {
+                case "$1" in
+                  *'<Status>Enabled</Status>'*) return 0 ;;
                 esac
-                before="${rule%%"$spelling"*}"
-                case "${before}${rule#*"$spelling"}" in
-                  *'<Filter'* | *'<Prefix'* | *'<And'* | *'<Tag'* | *'<ObjectSize'*) continue ;;
-                esac
-                opened="$(count "$before" '<[^/!?]')"
-                closed="$(( $(count "$before" '</') + $(count "$before" '/>') ))"
-                if [ "$opened" -eq "$closed" ]; then
-                  whole="$spelling"
+                return 1
+              }
+              versioning="$(curl -fsS "${ENDPOINT}/${BUCKET}?versioning")"
+              if enabled "$versioning"; then
+                echo "bucket ${BUCKET} already has versioning Enabled; not putting it"
+              else
+                curl -fsS -o /dev/null -X PUT -H 'Content-Type: application/xml' \
+                  --data-binary "$VERSIONING" "${ENDPOINT}/${BUCKET}?versioning"
+                versioning="$(curl -fsS "${ENDPOINT}/${BUCKET}?versioning")"
+                if ! enabled "$versioning"; then
+                  echo "bucket ${BUCKET} does not have versioning enabled" >&2
+                  exit 1
                 fi
-              done
-              if [ -z "$whole" ]; then
-                echo "bucket ${BUCKET} lifecycle rule is not scoped to the whole bucket (read ${flat})" >&2
-                exit 1
               fi
-              if ! printf '%s\n' "$lifecycle" |
-                grep -q '<DaysAfterInitiation>7</DaysAfterInitiation>'; then
-                echo "bucket ${BUCKET} does not carry the multipart-abort rule" >&2
-                exit 1
-              fi
-              if ! printf '%s\n' "$lifecycle" | grep -q '<NoncurrentDays>1</NoncurrentDays>'; then
-                echo "bucket ${BUCKET} does not carry the noncurrent-expiration rule" >&2
-                exit 1
-              fi
-              if ! printf '%s\n' "$lifecycle" |
-                grep -q '<ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker>'; then
-                echo "bucket ${BUCKET} does not carry the expired-delete-marker rule" >&2
-                exit 1
+              # lifecycle_ok reads the lifecycle document once and checks it
+              # whole: exactly one rule, enabled, scoped to the whole bucket,
+              # carrying each action. It returns 1 with the mismatch in $why,
+              # including when the read fails because the bucket has no
+              # configuration. flat is the document on one line with every
+              # whitespace character turned into a space, tagged the same with
+              # the spaces inside each tag removed, and doc the same with no
+              # spaces at all.
+              count() { printf '%s\n' "$1" | grep -o "$2" | wc -l | tr -d ' '; }
+              lifecycle_ok() {
+                if ! got="$(curl -sS -w '\n%{http_code}' "${ENDPOINT}/${BUCKET}?lifecycle")"; then
+                  why="could not read the lifecycle configuration of bucket ${BUCKET}"
+                  return 1
+                fi
+                code="${got##*[!0-9]}"
+                lifecycle="$(printf '%s' "${got%"$code"}")"
+                if [ "$code" != "200" ]; then
+                  why="bucket ${BUCKET} lifecycle read answered HTTP ${code:-none} (read ${lifecycle})"
+                  return 1
+                fi
+                flat="$(printf '%s' "$lifecycle" | tr '\r\n\t' '   ')"
+                tagged="$(printf '%s\n' "$flat" | sed -e ':a' -e 's/\(<[^>]*\) /\1/' -e 'ta')"
+                doc="$(printf '%s' "$tagged" | tr -d ' ')"
+                rules="$(count "$flat" '<Rule[ />]')"
+                if [ "$rules" != "1" ]; then
+                  why="bucket ${BUCKET} carries ${rules} lifecycle rules, not exactly one"
+                  return 1
+                fi
+                if [ "$(printf '%s\n' "$lifecycle" | grep -o '<Status>[^<]*</Status>')" != \
+                  '<Status>Enabled</Status>' ]; then
+                  why="bucket ${BUCKET} lifecycle rule is not enabled"
+                  return 1
+                fi
+                # The rule's filter must be exactly one spelling the server's
+                # rule parser reads as the whole bucket: a Filter holding only
+                # an empty Prefix (directly or inside And), an empty Filter, or
+                # a rule-level empty Prefix with no Filter. The spelling must be
+                # a direct child of Rule (as many tags opened as closed before
+                # it), and nothing else in the rule may name a filter element.
+                # The server keeps a Prefix's text as it is, so whitespace there
+                # is a prefix of spaces: any Prefix holding text is refused,
+                # read from tagged, where only the whitespace inside tags is
+                # gone. The server reads a Filter, Prefix or And written with a
+                # namespace prefix (s3:Filter) as an unrecognized filter, so any
+                # such tag is refused too, read from flat, where the space
+                # before an attribute still ends the tag name.
+                rule="${doc#*<Rule>}"
+                rule="${rule%%</Rule>*}"
+                whole=
+                case "$doc" in
+                  *'<Rule>'*'</Rule>'*) ;;
+                  *) rule= ;;
+                esac
+                case "$tagged" in
+                  *'<Prefix>'[!\<]*) rule= ;;
+                esac
+                if printf '%s\n' "$flat" | grep -qE '</?[^ />]*:(Filter|Prefix|And)[ />]'; then
+                  rule=
+                fi
+                for spelling in '<Filter><Prefix></Prefix></Filter>' '<Filter><Prefix/></Filter>' \
+                  '<Filter><And><Prefix></Prefix></And></Filter>' '<Filter><And><Prefix/></And></Filter>' \
+                  '<Filter></Filter>' '<Filter/>' '<Prefix></Prefix>' '<Prefix/>'; do
+                  case "$rule" in
+                    *"$spelling"*) ;;
+                    *) continue ;;
+                  esac
+                  before="${rule%%"$spelling"*}"
+                  case "${before}${rule#*"$spelling"}" in
+                    *'<Filter'* | *'<Prefix'* | *'<And'* | *'<Tag'* | *'<ObjectSize'*) continue ;;
+                  esac
+                  opened="$(count "$before" '<[^/!?]')"
+                  closed="$(( $(count "$before" '</') + $(count "$before" '/>') ))"
+                  if [ "$opened" -eq "$closed" ]; then
+                    whole="$spelling"
+                  fi
+                done
+                if [ -z "$whole" ]; then
+                  why="bucket ${BUCKET} lifecycle rule is not scoped to the whole bucket (read ${flat})"
+                  return 1
+                fi
+                if ! printf '%s\n' "$lifecycle" |
+                  grep -q '<DaysAfterInitiation>7</DaysAfterInitiation>'; then
+                  why="bucket ${BUCKET} does not carry the multipart-abort rule"
+                  return 1
+                fi
+                if ! printf '%s\n' "$lifecycle" | grep -q '<NoncurrentDays>1</NoncurrentDays>'; then
+                  why="bucket ${BUCKET} does not carry the noncurrent-expiration rule"
+                  return 1
+                fi
+                if ! printf '%s\n' "$lifecycle" |
+                  grep -q '<ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker>'; then
+                  why="bucket ${BUCKET} does not carry the expired-delete-marker rule"
+                  return 1
+                fi
+              }
+              why=
+              if lifecycle_ok; then
+                echo "bucket ${BUCKET} already carries the lifecycle rule; not putting it"
+              else
+                echo "putting the lifecycle rule: ${why}"
+                curl -fsS -o /dev/null -X PUT -H 'Content-Type: application/xml' \
+                  --data-binary "$LIFECYCLE" "${ENDPOINT}/${BUCKET}?lifecycle"
+                if ! lifecycle_ok; then
+                  echo "$why" >&2
+                  exit 1
+                fi
               fi
               echo "bucket ${BUCKET} ready: Object Lock, versioning and lifecycle rules set"
           resources:

@@ -579,8 +579,11 @@ vp_report() {
 # the nth call answering line n and every later call the last line; a line
 # FAIL fails that call, as does a rules file holding only FAIL. The stub ravel-cli prints <dir>/verify-<E_v>, else
 # <dir>/verify, and exits with <dir>/cli-rc (default 0). ravel-cli or cargo is
-# missing from PATH when <dir>/no-ravel-cli or <dir>/no-cargo exists. Calls are
-# logged to <dir>/calls and the refusal reason is left in <dir>/error.
+# missing from PATH when <dir>/no-ravel-cli or <dir>/no-cargo exists. The bucket
+# is absent when <dir>/absent exists; its create-bucket then fails when
+# <dir>/create-fails exists and the marker upload when <dir>/marker-fails does,
+# and DR_REGION is <dir>/region (default us-east-1). Calls are logged to
+# <dir>/calls and the refusal reason is left in <dir>/error.
 ensure_probe() {
   local dir="$1" marked="$2" code=0
   : >"${dir}/calls"
@@ -589,7 +592,8 @@ ensure_probe() {
   (
     DR_BUCKET_PRIMARY=dr-primary
     DR_BUCKET_REPLICA=dr-replica
-    dr_bucket_exists() { return 0; }
+    DR_REGION="$(cat "${dir}/region" 2>/dev/null || echo us-east-1)"
+    dr_bucket_exists() { [[ ! -e "${dir}/absent" ]]; }
     dr_bucket_marker_present() { [[ "${marked}" == 1 ]]; }
     dr_have_command() {
       case "$1" in
@@ -609,6 +613,11 @@ ensure_probe() {
     dr_aws() {
       printf '%s\n' "$*" >>"${dir}/calls"
       case "$2" in
+        create-bucket) [[ ! -e "${dir}/create-fails" ]] ;;
+        cp)
+          cat >/dev/null
+          [[ ! -e "${dir}/marker-fails" ]]
+          ;;
         get-object-lock-configuration) cat "${dir}/lock" ;;
         get-bucket-versioning) answer "${dir}/versioning" ;;
         get-bucket-lifecycle-configuration)
@@ -732,6 +741,47 @@ check "ensure: a marked bucket without Object Lock never gets versioning" \
 check "ensure: a marked bucket without Object Lock is told to delete and rerun" \
   "yes" "$(ensure_has "${d}/error" "delete the bucket and rerun")"
 
+# An absent bucket is created with Object Lock, in us-east-1 with no
+# LocationConstraint and elsewhere with one naming DR_REGION, then stamped with
+# the marker before anything else is sent.
+d="$(ensure_dir absent-us-east-1)"
+: >"${d}/absent"
+check "ensure: an absent bucket in us-east-1 is created and passes" "0" "$(ensure_probe "${d}" 1)"
+check "ensure: the us-east-1 create carries Object Lock and no LocationConstraint" \
+  "s3api create-bucket --bucket dr-replica --object-lock-enabled-for-bucket" \
+  "$(grep ' create-bucket ' "${d}/calls")"
+check "ensure: the created bucket is stamped before it is read" \
+  "s3api create-bucket|s3 cp|s3api get-object-lock-configuration|" \
+  "$(awk '{ printf "%s %s|", $1, $2 }' "${d}/calls" | cut -d'|' -f1-3)|"
+check "ensure: the marker goes to the bucket just created" \
+  "yes" "$(ensure_has "${d}/calls" "s3 cp - s3://dr-replica/${DR_BUCKET_MARKER_KEY}")"
+d="$(ensure_dir absent-eu-west-2)"
+: >"${d}/absent"
+printf 'eu-west-2\n' >"${d}/region"
+check "ensure: an absent bucket outside us-east-1 is created and passes" "0" \
+  "$(ensure_probe "${d}" 1)"
+check "ensure: that create names DR_REGION as its LocationConstraint and carries Object Lock" \
+  "s3api create-bucket --bucket dr-replica --create-bucket-configuration LocationConstraint=eu-west-2 --object-lock-enabled-for-bucket" \
+  "$(grep ' create-bucket ' "${d}/calls")"
+# A create or marker upload that fails refuses, and nothing more is sent: a
+# bucket with no marker is one this harness would never reconfigure or delete.
+d="$(ensure_dir absent-create-fails)"
+: >"${d}/absent"
+: >"${d}/create-fails"
+check "ensure: a failed create refuses" "1" "$(ensure_probe "${d}" 1)"
+check "ensure: that refusal names the bucket and region" \
+  "yes" "$(ensure_has "${d}/error" "could not create bucket dr-replica in region us-east-1")"
+check "ensure: a failed create sends nothing after it" "create-bucket " "$(ensure_sequence "${d}")"
+d="$(ensure_dir absent-marker-fails)"
+: >"${d}/absent"
+: >"${d}/marker-fails"
+printf 'eu-west-2\n' >"${d}/region"
+check "ensure: a failed marker write refuses" "1" "$(ensure_probe "${d}" 1)"
+check "ensure: that refusal says the bucket was created without its marker" \
+  "yes" "$(ensure_has "${d}/error" "created bucket dr-replica but could not write its ${DR_BUCKET_MARKER_KEY} rehearsal marker")"
+check "ensure: a failed marker write sends nothing after the upload" \
+  "s3api create-bucket|s3 cp|" "$(awk '{ printf "%s %s|", $1, $2 }' "${d}/calls")"
+
 # An unmarked bucket with its own E_v and a second rule over logs/ passes the
 # server's checks and is never reconfigured. verify-protection needs an E_v; it
 # runs once, with the NoncurrentDays of the rule covering t/ (30), which is the
@@ -800,6 +850,54 @@ check "ensure: an incomplete t/<d> union gives no reference and refuses" \
 check "ensure: that refusal says no covering rule carries NoncurrentDays" \
   "yes" "$(ensure_has "${d}/error" "no enabled lifecycle rule covering t/ carries NoncurrentDays, so the NoncurrentDays a --require-bucket-protection server measures other rules against cannot be determined")"
 check "ensure: no reference never runs ravel-cli" "" "$(ensure_cli_calls "${d}")"
+check "ensure: that refusal says the harness is stricter than the server" \
+  "yes" "$(ensure_has "${d}/error" "This harness is stricter than the server here: the server refuses such a bucket only while versioning passes, and otherwise starts with warnings")"
+d="$(ensure_dir unmarked-ten-digit-reference)"
+ensure_rules "${d}" 'Enabled|{"f":{"Prefix":""},"p":null}|1000000000'
+check "ensure: a ten-digit NoncurrentDays gives the reference" "0" "$(ensure_probe "${d}" 0)"
+check "ensure: that bucket is checked with it" \
+  "ravel-cli --store s3 store verify-protection --expected-noncurrent-days 1000000000|" \
+  "$(ensure_cli_calls "${d}")"
+
+# ref_of <rule>...: the reference dr_reference_noncurrent_days finds in the
+# per-rule lines ("Status|scope|days"), or "none: <reason>". It runs with
+# globasciiranges off under en_US.UTF-8 when that locale is installed, so a
+# bracket range follows the locale's collation the way it does under bash 3.2.
+UTF8_LOCALE="$(locale -a 2>/dev/null | awk 'tolower($0) ~ /^en_us\.utf-?8$/ { print; exit }')"
+if [[ -z "${UTF8_LOCALE}" ]]; then
+  printf 'note: en_US.UTF-8 is not installed; the hex-digit case below runs under the default collation\n'
+fi
+ref_of() {
+  local listing="" rule
+  for rule in "$@"; do listing+="${rule//|/$'\t'}"$'\n'; done
+  (
+    shopt -u globasciiranges 2>/dev/null || true
+    if [[ -n "${UTF8_LOCALE}" ]]; then LC_ALL="${UTF8_LOCALE}"; fi
+    if dr_reference_noncurrent_days "${listing}"; then
+      printf '%s\n' "${DR_REFERENCE_DAYS}"
+    else
+      printf 'none: %s\n' "${DR_REFERENCE_ERROR}"
+    fi
+  )
+}
+whole_rule() { printf 'Enabled|{"f":{"Prefix":""},"p":null}|%s\n' "$1"; }
+check "reference: the lowercase t/<d> union gives its NoncurrentDays" "14" \
+  "$(ref_of "${union_rules[@]}")"
+check "reference: a t/A rule in place of t/a completes no union" \
+  "none: no enabled lifecycle rule covering t/ carries NoncurrentDays" \
+  "$(ref_of "${union_rules[@]:0:10}" 'Enabled|{"f":{"Prefix":"t/A"},"p":null}|14' \
+    "${union_rules[@]:11}")"
+check "reference: NoncurrentDays 0 parses, as the server's parse_decimal reads it" "0" \
+  "$(ref_of "$(whole_rule 0)")"
+check "reference: a ten-digit NoncurrentDays parses" "1000000000" \
+  "$(ref_of "$(whole_rule 1000000000)")"
+check "reference: the u32 maximum parses" "4294967295" "$(ref_of "$(whole_rule 4294967295)")"
+check "reference: one past the u32 maximum does not, as the server's does not" \
+  "none: no enabled lifecycle rule covering t/ carries NoncurrentDays" \
+  "$(ref_of "$(whole_rule 4294967296)")"
+check "reference: an eleven-digit NoncurrentDays does not parse" \
+  "none: no enabled lifecycle rule covering t/ carries NoncurrentDays" \
+  "$(ref_of "$(whole_rule 10000000000)")"
 d="$(ensure_dir unmarked-covering-rules-disagree)"
 ensure_rules "${d}" 'Enabled|{"f":{"Prefix":""},"p":null}|30' \
   'Enabled|{"f":{"Prefix":"t/"},"p":null}|7'
@@ -892,7 +990,7 @@ printf '\nlib.test.sh: %s passed, %s failed\n' "${PASSED}" "${FAILED}"
 if [[ "${FAILED}" -ne 0 ]]; then
   exit 1
 fi
-if [[ "${PASSED}" -lt 104 ]]; then
+if [[ "${PASSED}" -lt 149 ]]; then
   printf 'lib.test.sh: only %s cases ran; a suite that shrank silently is not a pass\n' \
     "${PASSED}" >&2
   exit 1
