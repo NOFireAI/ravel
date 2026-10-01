@@ -1552,12 +1552,16 @@ fn section(footer: &LogFooter, k: u32) -> Result<&SectionDesc, LogSegError> {
 /// stored bytes from `desc`, verify `crc32c` against `desc.crc32c`, reject an
 /// `uncomp_len` over `cfg.max_uncomp_section`, then zstd-decompress or pass the
 /// raw bytes through, checking the result is exactly `desc.uncomp_len` long.
-/// BLOCKS and BLOOM are not whole-read sections and have their own per-block or
-/// per-entry access paths; do not route them through here.
+/// BLOCKS has its own per-block access path and never routes through here. A
+/// scan reads BLOOM through its stored bytes and per-entry crcs so a damaged
+/// section degrades instead of refusing; the `ravel-cli` inspector reads BLOOM
+/// through here on purpose, so that it refuses damage a query is allowed to
+/// survive.
 ///
 /// Exposed so tools (the `ravel-cli` inspector) can reconstruct a section from
 /// its public [`SectionDesc`] without reimplementing the crc-and-decompress
-/// discipline. [`RlogReader::new`] is the only in-crate caller.
+/// discipline. In this crate, [`RlogReader::new`] and the bloom coverage tests
+/// call it.
 pub fn read_section(
     bytes: &[u8],
     desc: &SectionDesc,
@@ -2347,10 +2351,10 @@ mod tests {
     /// reads through, so they match a per-block decode exactly.
     ///
     /// Wrong implementations this rules out, each shown failing: no cache (a
-    /// decode per block); a cache cleared before every block; a cache keyed by
-    /// column id alone (the second group reads the first group's dictionary);
-    /// a reused dictionary left out of `pages_decoded` or of
-    /// `decompressed_bytes`.
+    /// decode per block); a cache cleared before every block; a reused
+    /// dictionary left out of `pages_decoded` or of `decompressed_bytes`. It
+    /// does not pin the cache's residency: a cache that never empties on a
+    /// group change passes it too, since each group has one chunk per column.
     #[test]
     fn scan_decodes_each_dictionary_page_once_per_chunk() {
         let (records, object) = dict_fixture::two_group_object();

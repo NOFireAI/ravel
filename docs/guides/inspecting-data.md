@@ -262,8 +262,10 @@ Field by field:
 - `sort_descriptor`, `clustering_generation`: the clustering key the object's
   records were sorted by and the tenant clustering generation it
   was written under. `none` means the default order, each stream's records by
-  `ts`; with generation `0` the tenant never set a key, and with a nonzero
-  generation the key was cleared. A clustered object prints `sort_descriptor: bucket_width=6h key_columns=2`
+  `ts`; with generation `0` the tenant never set a key or a bloom scope, and
+  with a nonzero generation the key was cleared, or the tenant never set one
+  and a bloom scope or declared-column change gave it a generation. A
+  clustered object prints `sort_descriptor: bucket_width=6h key_columns=2`
   followed by one `key[i] name=... type=...` line per key column.
 - `sections`: the mandatory sections and their byte ranges. `kind=1`
   `STREAM_DIR` (stream_id to canonical resource+scope blob and block range),

@@ -877,8 +877,8 @@ mod tests {
     /// block, and both return every record in order.
     ///
     /// Wrong implementations this rules out, each shown failing: no cache (a
-    /// decode per block); a cache cleared before every block; a cache keyed by
-    /// column id alone (the second group reads the first group's dictionary).
+    /// decode per block); a cache cleared before every block. It does not pin
+    /// the cache's residency across groups.
     #[test]
     fn ranged_decodes_each_dictionary_page_once_per_chunk() {
         use crate::reader::dict_fixture::{STREAM, dictionary_reads, two_group_object};

@@ -543,8 +543,11 @@ decisions 1 and 6 now carry the corrected text in place:
   field 13 keeps the incremented generation and no columns. It does not hold
   for an RLOG object: the footer decoder refuses a sort descriptor with no key
   columns ("0 key columns, not 1..=4"), so an object written after a clear
-  carries no descriptor and the clear's nonzero generation, and generation 0
-  in a footer still means the tenant never set a key.
+  carries no descriptor and the clear's nonzero generation. A footer with no
+  descriptor and a nonzero generation can also come from a bloom scope or
+  declared-column change on a tenant that never set a key (the scope
+  generation amendment), and generation 0 in a footer means neither a key
+  nor a bloom scope was ever set.
 - **The block decode seam.** Decision 6 named `read_block_columns` as the
   subset decode that takes a kept chunk's dictionary page. No function of
   that name exists. The seam is `decode_v4_block_with`, which reads the wanted
