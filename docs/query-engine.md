@@ -1388,12 +1388,12 @@ from what this process is actually running, in the one place it turns a
 (`services/ravel-server/src/query.rs`'s `build_engine_config`): the seal margin
 and the HEAD cache TTL off the `CatalogConfig` of the catalog it hands to both
 resolve and the fold, and the fold interval off the `FoldTaskConfig` it spawns
-the fold with. The fold interval is the real one only in a process that runs
-the scheduled fold (`--mode all` and `--mode maintain`); a `query` or `gateway`
-process keeps the 300 s default, so where the `maintain` processes fold on a longer
-interval, a query node's threshold is too short by the difference and can
-blame a fold that is keeping up. The compiled-in defaults remain what an `EngineConfig` built
-with no deployment context falls back to.
+the fold with. In a `--mode query` process, which runs no scheduled fold, the
+fold interval comes from `--fold-lag-interval-secs` when it is set, so a query
+node can classify against the interval the `maintain` processes fold on; the
+operator passes it from `spec.maintain.fold.intervalSecs` when that fold runs.
+Unset, a query node keeps the 300 s default. The compiled-in defaults remain
+what an `EngineConfig` built with no deployment context falls back to.
 
 The tail is read off the origins the resolve already produced, never a new
 store request, and it is reported only when that resolve actually read a folded

@@ -728,11 +728,13 @@ pub struct MaintainSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interval_secs: Option<u64>,
 
-    /// Catalog fold tuning, rendered onto this tier alone (ADR-1693). The
-    /// scheduled fold runs in `--mode maintain` and `--mode all`, so these are
-    /// the only replicas the flags reach; a `maintain` tier turned off by
-    /// `enabled: false` renders no fold flags because it renders no
-    /// Deployment.
+    /// Catalog fold tuning, rendered onto this tier's fold flags (ADR-1693).
+    /// The scheduled fold runs in `--mode maintain` and `--mode all`, so these
+    /// are the only replicas the fold flags reach; a `maintain` tier turned
+    /// off by `enabled: false` renders no fold flags because it renders no
+    /// Deployment. When this fold runs, `intervalSecs` also reaches the query
+    /// tier as `--fold-lag-interval-secs`, the interval its request-budget
+    /// refusals classify fold lag against.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fold: Option<FoldSpec>,
 

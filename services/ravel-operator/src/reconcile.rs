@@ -1052,6 +1052,21 @@ pub fn desired_gateway_deployment(
     )
 }
 
+/// The interval of a scheduled fold the maintain tier really runs: set only
+/// when the maintain Deployment renders, its fold is not disabled, and
+/// `spec.maintain.fold.intervalSecs` is set. With no running fold there is
+/// no interval to classify fold lag against.
+fn running_fold_interval_secs(spec: &RavelClusterSpec) -> Option<u64> {
+    if !spec.maintain.enabled {
+        return None;
+    }
+    spec.maintain
+        .fold
+        .as_ref()
+        .filter(|f| !f.disabled)
+        .and_then(|f| f.interval_secs)
+}
+
 /// The query Deployment: `--mode query`, HTTP listener only, tenant tokens.
 /// RollingUpdate strategy.
 pub fn desired_query_deployment(
@@ -1067,6 +1082,14 @@ pub fn desired_query_deployment(
     ];
     args.extend(common_store_args(spec));
     args.extend(tenant_token_args(spec, ctx));
+    // The query tier runs no scheduled fold, so its request-budget refusals
+    // classify fold lag against the maintain tier's interval, passed here
+    // (ADR-1306 decision 6). It is not `--fold-interval-secs`, which
+    // `ravel-server` refuses in `--mode query` (ADR-1693).
+    if let Some(secs) = running_fold_interval_secs(spec) {
+        args.push("--fold-lag-interval-secs".to_string());
+        args.push(secs.to_string());
+    }
 
     let tier_override = spec.query.credentials_secret_ref.as_ref();
     let mut env = s3_credential_env(spec, tier_override);
@@ -4712,6 +4735,93 @@ mod tests {
         let args = args_of(&m);
         assert!(!args.iter().any(|a| a == "--disable-fold"));
         assert!(arg_value(&args, "--fold-interval-secs").is_none());
+    }
+
+    #[test]
+    fn the_query_tier_carries_the_maintain_fold_interval_for_fold_lag() {
+        // ADR-1306 decision 6: the query tier classifies fold lag against the
+        // interval the maintain tier folds on, and only the maintain tier
+        // carries the flag that sets it.
+        let mut spec = base_spec();
+        spec.maintain.fold = Some(FoldSpec {
+            disabled: false,
+            interval_secs: Some(900),
+        });
+        let q = args_of(&desired_query_deployment(&spec, "prod", &ctx()));
+        assert_eq!(
+            arg_value(&q, "--fold-lag-interval-secs").as_deref(),
+            Some("900")
+        );
+        assert_eq!(
+            q.iter()
+                .filter(|a| *a == "--fold-lag-interval-secs")
+                .count(),
+            1
+        );
+        assert!(arg_value(&q, "--fold-interval-secs").is_none());
+
+        let m = args_of(
+            &desired_maintain_deployment(&spec, "prod", &ctx())
+                .expect("a maintain fold block renders")
+                .expect("the maintain tier is enabled"),
+        );
+        assert!(!m.iter().any(|a| a == "--fold-lag-interval-secs"));
+        assert_eq!(
+            arg_value(&m, "--fold-interval-secs").as_deref(),
+            Some("900")
+        );
+
+        let g = args_of(&desired_gateway_deployment(&spec, "prod", &ctx()));
+        assert!(!g.iter().any(|a| a == "--fold-lag-interval-secs"));
+    }
+
+    #[test]
+    fn the_query_tier_carries_no_fold_lag_interval_without_a_running_fold() {
+        // An interval only means something while the maintain tier runs that
+        // fold. Each case below changes one field from the rendering case.
+        let no_flag = |spec: &RavelClusterSpec| {
+            let q = args_of(&desired_query_deployment(spec, "prod", &ctx()));
+            !q.iter().any(|a| a == "--fold-lag-interval-secs")
+        };
+
+        // The fold is disabled: maintain pods get --disable-fold.
+        let mut spec = base_spec();
+        spec.maintain.fold = Some(FoldSpec {
+            disabled: true,
+            interval_secs: Some(900),
+        });
+        assert!(
+            no_flag(&spec),
+            "a disabled fold has no interval to classify against"
+        );
+
+        // The maintain tier is disabled: no maintain Deployment renders.
+        let mut spec = base_spec();
+        spec.maintain.enabled = false;
+        spec.maintain.fold = Some(FoldSpec {
+            disabled: false,
+            interval_secs: Some(900),
+        });
+        assert!(
+            desired_maintain_deployment(&spec, "prod", &ctx())
+                .expect("a maintain fold block renders")
+                .is_none(),
+            "the case is a maintain tier that renders nothing"
+        );
+        assert!(
+            no_flag(&spec),
+            "a maintain tier that does not render runs no fold"
+        );
+
+        // The interval is unset: ravel-server's default classification.
+        let mut spec = base_spec();
+        spec.maintain.fold = Some(FoldSpec {
+            disabled: false,
+            interval_secs: None,
+        });
+        assert!(no_flag(&spec), "an unset interval renders no flag");
+        spec.maintain.fold = None;
+        assert!(no_flag(&spec), "no fold block renders no flag");
     }
 
     #[test]

@@ -324,7 +324,11 @@ pub fn build_catalog_for_server(
 ///   and `fold::spawn`;
 /// - `fold_interval` from `config.fold`, the same [`crate::FoldTaskConfig`]
 ///   value `start` passes to `fold::spawn`, so it is the interval the fold
-///   loop really sleeps;
+///   loop really sleeps; or, when `query_budgets.fold_lag_interval` is set,
+///   from that, the interval of the maintain tier's fold (ADR-1306 decision
+///   6, amendment of 2026-10-01). This function applies it in any mode; it is
+///   `Cli::parse_validated_from` that admits `--fold-lag-interval-secs` only
+///   in `--mode query`, which spawns no scheduled fold;
 /// - `head_cache_ttl` from the same `catalog_config`, the TTL the HEAD cache
 ///   a resolve reads its watermark through really runs on.
 ///
@@ -359,7 +363,10 @@ pub fn build_engine_config(
         // `--shards`, the flush cadence and [`server_seal_margin`].
         max_s3_requests: config.max_s3_requests,
         seal_margin: ravel_query::SealMargin::from_catalog_config(catalog_config),
-        fold_interval: config.fold.fold_interval,
+        fold_interval: config
+            .query_budgets
+            .fold_lag_interval
+            .unwrap_or(config.fold.fold_interval),
         head_cache_ttl: Duration::from_nanos(catalog_config.head_cache_ttl_ns.unsigned_abs()),
         ..EngineConfig::default()
     })
@@ -1517,6 +1524,98 @@ mod catalog_cache_tests {
             ),
             "the fold-lag refusal threshold must be the one this deployment's fold and \
              catalog imply"
+        );
+    }
+
+    /// The `ServerConfig` a `--mode query` process builds from `args`, with
+    /// its query budgets resolved through the same `Cli` methods `main` calls.
+    fn query_mode_config(args: &[&str]) -> crate::ServerConfig {
+        let mut argv = vec!["ravel-server", "--mode", "query"];
+        argv.extend_from_slice(args);
+        let cli = crate::Cli::parse_validated_from(argv).expect("flags parse");
+        cli.validate().expect("flags validate");
+        let resolved = cli
+            .resolve_performance(crate::config::HostProfile::new(16, Some(32_212_254_720)))
+            .expect("performance defaults resolve");
+        crate::ServerConfig {
+            mode: crate::Mode::Query,
+            fold: crate::FoldTaskConfig {
+                fold_interval: Duration::from_secs(cli.fold_interval_secs),
+                ..crate::FoldTaskConfig::default()
+            },
+            query_budgets: cli.query_budgets(&resolved).expect("budgets resolve"),
+            ..server_config()
+        }
+    }
+
+    /// ADR-1306 decision 6, amendment of 2026-10-01: a `--mode query` process
+    /// runs no scheduled fold, so the fold interval its refusals classify
+    /// against is `--fold-lag-interval-secs`, the maintain tier's interval,
+    /// and not the 300 s default of a `--fold-interval-secs` it may not set.
+    ///
+    /// RED: in [`build_engine_config`], take `fold_interval` from
+    /// `config.fold.fold_interval` alone, as before the amendment.
+    #[test]
+    fn query_mode_engine_classifies_against_the_fold_lag_interval() {
+        let config = query_mode_config(&["--fold-lag-interval-secs", "900"]);
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog =
+            build_catalog_for_server(store, &config, 7_200_000_000_000).expect("catalog builds");
+        let engine = build_engine_config(&config, catalog.config()).expect("valid");
+        assert_eq!(
+            engine.fold_interval,
+            Duration::from_secs(900),
+            "--fold-lag-interval-secs must reach the engine's fold interval"
+        );
+
+        // Unset, the classification keeps the default interval.
+        let unset = query_mode_config(&[]);
+        let engine_unset = build_engine_config(&unset, catalog.config()).expect("valid");
+        assert_eq!(
+            engine_unset.fold_interval,
+            crate::fold::DEFAULT_FOLD_INTERVAL
+        );
+    }
+
+    /// The issue #2074 case end to end through the refusal text: a maintain
+    /// tier folding every 900 s can leave a 9,000 s tail while keeping up
+    /// (threshold 8,400 + 900 + 30 = 9,330 s), so a query tier told that
+    /// interval must not blame the fold for it. The same tail against the
+    /// 300 s default (threshold 8,730 s) does name fold lag, which is what
+    /// keeps the first half from passing vacuously.
+    #[test]
+    fn a_tail_a_900_s_fold_can_leave_is_not_refused_as_fold_lag() {
+        let tail = Duration::from_secs(9_000);
+        let refusal = |config: &crate::ServerConfig| {
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let catalog =
+                build_catalog_for_server(store, config, 7_200_000_000_000).expect("catalog builds");
+            let engine = build_engine_config(config, catalog.config()).expect("valid");
+            let budget = ravel_query::RequestBudget::new(
+                ravel_query::RequestLimit::Bounded(10),
+                ravel_query::FoldLag::from_resolved_tail(Some(tail), engine.fold_lag_threshold()),
+            );
+            ravel_query::request_budget_exceeded(11, budget)
+                .expect("11 requests exceed a budget of 10")
+                .to_string()
+        };
+
+        let with_flag = refusal(&query_mode_config(&["--fold-lag-interval-secs", "900"]));
+        assert!(
+            !with_flag.contains(ravel_query::FOLD_LAST_SUCCESS_GAUGE)
+                && !with_flag.contains("fold is behind"),
+            "a 9,000 s tail is inside what a 900 s fold keeping up can leave, so the refusal \
+             must not name fold lag, got: {with_flag}"
+        );
+        assert_eq!(
+            with_flag,
+            "query issued 11 S3 requests, exceeding the budget of 10"
+        );
+
+        let without_flag = refusal(&query_mode_config(&[]));
+        assert!(
+            without_flag.contains("the catalog's unsealed tail is 9000 s, longer than the 8730 s"),
+            "against the 300 s default the same tail names fold lag, got: {without_flag}"
         );
     }
 
