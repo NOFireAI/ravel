@@ -3573,11 +3573,14 @@ pub struct MaintenanceSafetySignalSnapshot {
     /// value that keeps rising means buckets for this signal are sealing
     /// faster than they cross the compaction threshold.
     pub l0_records_pending: u64,
-    /// Bytes reclaimed for this signal since process start by the two sweep
-    /// deletions whose object size the pass already listed: the quarantine
-    /// reaper and rule 3's unreferenced-part delete (issue #1729). A counter.
-    /// Superseded and retention deletions are excluded; they delete by key
-    /// without a listed size, so counting them would need an extra request.
+    /// Bytes reclaimed for this signal since process start by the three sweep
+    /// deletions whose object size is known without an extra request: the
+    /// quarantine reaper and rule 3's unreferenced-part delete at their listed
+    /// size (issue #1729), and rule 2's superseded data at the `object_size`
+    /// its commit, compaction or rewrite record carries (issue #2073), a part
+    /// on the pass that deletes the record naming it. A counter. Retention
+    /// deletions are excluded; they delete by key without a known size, so
+    /// counting them would need an extra request.
     pub bytes_reclaimed: u64,
     /// Retention lag for this signal, in nanoseconds, from the most recent
     /// completed maintenance cycle (issue #1729): for the oldest bucket that is
@@ -3586,6 +3589,13 @@ pub struct MaintenanceSafetySignalSnapshot {
     /// and a per-cycle maximum over this process's units, rendered in seconds as
     /// `ravel_maintain_retention_lag_seconds`.
     pub retention_lag_ns: i64,
+    /// Units of this signal whose retention/compaction scan failed, or that a
+    /// failed provisioning or shard-generation read skipped, in the most
+    /// recent completed maintenance cycle (issue #2073). A gauge, rendered as
+    /// `ravel_maintain_units_scan_failed`: a failed unit reports no retention
+    /// lag, so a nonzero value means `retention_lag_ns` did not cover every
+    /// unit.
+    pub units_scan_failed: u64,
     /// Claim acquisitions for this signal since process start, fresh or
     /// stolen (ADR-1029 decision 3, issue #1035). A counter, backing
     /// `ravel_maintain_claims_acquired_total`.
@@ -3704,6 +3714,7 @@ impl MaintenanceSafetySnapshot {
                     l0_records_pending: metrics.l0_records_pending(signal),
                     bytes_reclaimed: metrics.bytes_reclaimed(signal),
                     retention_lag_ns: metrics.retention_lag_ns(signal),
+                    units_scan_failed: metrics.units_scan_failed(signal),
                     claims_acquired: metrics.claims_acquired(signal),
                     claims_stolen: metrics.claims_stolen(signal),
                     claims_lost: metrics.claims_lost(signal),
@@ -4071,11 +4082,14 @@ fn render_maintain_safety_family(
         out,
         "ravel_maintain_bytes_reclaimed_total",
         "Bytes of deleted objects reclaimed by the GC sweeper, by signal, summed since process \
-         start. Counts only the two deletions whose object size the pass already listed: the \
-         quarantine reaper and rule 3's unreferenced-part delete. Superseded and retention \
-         deletions are excluded because they delete by key without a listed size, so this is a \
-         lower bound on total bytes reclaimed, not the whole of it. Per process: sum across \
-         maintain replicas for the fleet.",
+         start. Object sizes, not wire bytes: the quarantine reaper and rule 3's unreferenced-part \
+         delete count each object at the size their listing returned, and the superseded-input \
+         sweep counts each superseded data object and part at the object_size its commit, \
+         compaction or rewrite record carries, a part on the pass that deletes the record naming \
+         it, so each is counted once. Retention deletions are excluded because they \
+         delete by key without a known size, so this undercounts the bytes reclaimed, except \
+         that two replicas sweeping one unit during an ownership handoff can each count the \
+         same object. Per process: sum across maintain replicas for the fleet.",
         "counter",
     );
     for signal in &snapshot.signals {
@@ -4093,8 +4107,17 @@ fn render_maintain_safety_family(
         "How far past its retention deadline the oldest still-present expired bucket is, by \
          signal, as observed by this process's most recent completed maintenance cycle. 0 when no \
          expired bucket is still present. A gauge and a per-cycle maximum over this process's \
-         units: it names the single worst bucket, not a sum. A value that keeps climbing means \
-         retention's physical sweep is not keeping pace; see the troubleshooting guide.",
+         units: it names the single worst bucket, not a sum. The deadline is exact, the \
+         bucket's newest event plus the retention window, when this process tombstoned the \
+         bucket itself; otherwise the earlier of its ingest hour's end plus the window and its \
+         tombstone time, which under-reads by up to one hour plus max_ingest_lag (three hours at \
+         the defaults) and over-reads by at most the allowed future clock skew; and for a \
+         tombstoned bucket holding a rewrite record with no parts, its tombstone time alone, \
+         which never over-reads and under-reads by however late the tombstone was written. A \
+         unit whose scan failed, or that a failed provisioning read skipped, contributes \
+         nothing, so read this beside ravel_maintain_units_scan_failed. A value that keeps \
+         climbing means retention's physical sweep is not keeping pace; see the troubleshooting \
+         guide.",
         "gauge",
     );
     for signal in &snapshot.signals {
@@ -4103,6 +4126,26 @@ fn render_maintain_safety_family(
             "ravel_maintain_retention_lag_seconds",
             &labels(mode, signal.signal),
             signal.retention_lag_ns as f64 / 1e9,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_maintain_units_scan_failed",
+        "Units (tenant, shard) of this signal whose retention and compaction scan returned an \
+         error in this process's most recent completed maintenance cycle, or that were skipped \
+         unscanned because their provisioning check or shard-generation read failed, by signal. \
+         A gauge. A failed unit reports no retention lag, so while this is nonzero \
+         ravel_maintain_retention_lag_seconds does not cover every unit and can read 0 for a \
+         signal whose sweep is stuck. Per process: sum across maintain replicas for the fleet.",
+        "gauge",
+    );
+    for signal in &snapshot.signals {
+        write_sample(
+            out,
+            "ravel_maintain_units_scan_failed",
+            &labels(mode, signal.signal),
+            signal.units_scan_failed,
         );
     }
 
@@ -10124,6 +10167,7 @@ mod tests {
                     l0_records_pending: 8,
                     bytes_reclaimed: 4096,
                     retention_lag_ns: 90_000_000_000,
+                    units_scan_failed: 2,
                     claims_acquired: 15,
                     claims_stolen: 14,
                     claims_lost: 17,
@@ -10147,6 +10191,7 @@ mod tests {
                     l0_records_pending: 0,
                     bytes_reclaimed: 0,
                     retention_lag_ns: 0,
+                    units_scan_failed: 0,
                     claims_acquired: 0,
                     claims_stolen: 0,
                     claims_lost: 0,
@@ -10299,6 +10344,20 @@ mod tests {
             body.contains(
                 "ravel_maintain_retention_lag_seconds{mode=\"maintain\",signal=\"logs\"} 0"
             ),
+            "a zero-valued signal must still render:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE ravel_maintain_units_scan_failed gauge"),
+            "units_scan_failed must carry a gauge TYPE header:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_units_scan_failed{mode=\"maintain\",signal=\"metrics\"} 2"
+            ),
+            "missing units_scan_failed sample:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_maintain_units_scan_failed{mode=\"maintain\",signal=\"logs\"} 0"),
             "a zero-valued signal must still render:\n{body}"
         );
         // Advisory compaction claim counters (ADR-1029 decision 3, #1035): all
@@ -11128,6 +11187,7 @@ mod tests {
                 l0_records_pending: 1,
                 bytes_reclaimed: 1,
                 retention_lag_ns: 1,
+                units_scan_failed: 1,
                 claims_acquired: 1,
                 claims_stolen: 1,
                 claims_lost: 1,
@@ -11184,6 +11244,7 @@ mod tests {
                     || line.starts_with("ravel_maintain_l0_records_pending")
                     || line.starts_with("ravel_maintain_bytes_reclaimed_total")
                     || line.starts_with("ravel_maintain_retention_lag_seconds")
+                    || line.starts_with("ravel_maintain_units_scan_failed")
                 {
                     vec!["mode", "signal"]
                 } else if line.starts_with("ravel_maintain_superseded_inputs_held_total") {
