@@ -7,8 +7,8 @@
 //! [`TenantConfig::clustering_key`] and [`TenantConfig::bloom_scope`], so a
 //! stored value those accessors refuse is an error here too, never a guess.
 //! A config record of format version 3, the first that can carry the fields,
-//! reads like any other; this build's writer still stamps version 2 and
-//! cannot set them.
+//! reads like any other. No ingest, compaction or CLI path in this build sets
+//! either field yet; docs/guides/ingest.md says what can.
 
 use std::io::Write;
 use std::sync::Arc;

@@ -1165,8 +1165,12 @@ leaves such a key unresolved and writes the tenant's log objects without it.
 `bloom-scope show` prints `all`, `undeclared` or `text`; a tenant with no
 config record reads as `all`. For either command, a failed read of the record,
 or a stored value the catalog refuses, is an error with a non-zero exit and
-nothing on stdout. This build's writer does not set either field yet, so a
-tenant configured through this build always reads as never set and `all`.
+nothing on stdout. The catalog can set either field, and stamps format
+version 3 on a config record carrying one, but only behind the
+`StorageLayoutWrite::ReadersRolledOut` opt-in, and no ingest, compaction or
+`ravel-cli` path in this build calls those setters yet. A tenant whose config
+record only this build's commands have written therefore reads as never set
+and `all`.
 
 ### Failure, retention, and performance
 

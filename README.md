@@ -192,7 +192,8 @@ Also live:
   See the [query guide](docs/guides/query.md). A tenant's config record can
   also carry a clustering key and a bloom scope, which
   `ravel-cli clustering-key show` and `ravel-cli bloom-scope show` print;
-  this build reads both fields, and nothing sets them yet.
+  no ingest, compaction or CLI path in this build sets either field yet (see
+  the [ingest guide](docs/guides/ingest.md#checking-a-tenants-clustering-key-and-bloom-scope)).
 
 The PromQL conformance table in the
 [query engine spec](docs/query-engine.md) classifies every construct as
