@@ -10527,7 +10527,7 @@ mod read_gate_tests {
     /// handle the caller passed in.
     ///
     /// FLIP: reading the sizing PAGE_DIR through `ravel_logseg::read_section`
-    /// instead of `read_section_accounted` reads `left: 0, right: 173` on the
+    /// instead of `read_section_accounted` reads `left: 0, right: 326` on the
     /// charge assertion.
     #[test]
     fn block_job_size_is_the_largest_uncompressed_block() {
@@ -10549,6 +10549,9 @@ mod read_gate_tests {
         big.body = "x".repeat(10_000);
         writer.push(record(0)).expect("push");
         writer.push(big).expect("push");
+        for ts in 2..4 {
+            writer.push(record(ts)).expect("push");
+        }
         let bytes = writer.finish().expect("finish");
         let page_dir = {
             let footer = footer::open(&bytes).expect("footer");
@@ -10556,8 +10559,10 @@ mod read_gate_tests {
             PageDir::decode(&ravel_logseg::read_section(&bytes, &desc, &cfg).expect("read"))
                 .expect("decode")
         };
-        // Both records carry the same severity text, so its chunk stores one
-        // row-group dictionary page that each block decodes through.
+        // All four records carry the same severity text, so its chunk stores
+        // one row-group dictionary page that each block decodes through. Two
+        // one-record blocks would not: the dictionary page's own PAGE_DIR
+        // entry outweighs what two id pages save.
         let dict_pages = |block: u32| page_dir.block_dict_pages(block).expect("block");
         assert!(
             !dict_pages(1).is_empty(),

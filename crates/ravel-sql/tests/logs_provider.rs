@@ -943,11 +943,14 @@ async fn referencing_attrs_decodes_every_dynamic_column() {
     let blocks = scan_metric(&plan, "blocks_scanned");
     let skipped = scan_metric(&plan, "pages_skipped");
     // Only the five unprojected fixed columns (observed_ts, severity_num,
-    // flags, severity_text, body) are skipped, plus severity_text's row-group
-    // dictionary page (ADR-2135 decision 6); every dynamic column is decoded.
+    // flags, severity_text, body) are skipped; every dynamic column is decoded.
+    // Six records make two blocks, one row group, and there a constant string
+    // keeps its per-block pages: for `INFO`, two 7-byte pages with 9-byte
+    // PAGE_DIR entries is 32 bytes against a 6-byte dictionary page and two
+    // empty id pages with their entries, 33 (ADR-2135 decision 6).
     assert_eq!(
         skipped,
-        6 * blocks,
+        5 * blocks,
         "referencing attrs must skip only the unprojected fixed columns"
     );
 }

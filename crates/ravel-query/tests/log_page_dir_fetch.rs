@@ -2335,7 +2335,7 @@ async fn fetch_amplification_pins_exact_wire_and_stored_page_bytes() {
          becomes one whole-object GET"
     );
     assert_eq!(
-        hole_numerator, 78_885,
+        hole_numerator, 78_899,
         "exact object size for this fixture, once coalescing crosses the \
          covering-read threshold"
     );
@@ -2345,7 +2345,7 @@ async fn fetch_amplification_pins_exact_wire_and_stored_page_bytes() {
     );
     assert_eq!(
         hole_numerator as f64 / hole_acc.page_bytes_decoded as f64,
-        78_885.0 / 30.0,
+        78_899.0 / 30.0,
         "exact amplification once coalescing crosses the covering-read threshold"
     );
 }
@@ -2433,12 +2433,12 @@ async fn narrow_projection_amplification_is_below_the_legacy_page_byte_ratio() {
         expected_present_page_bytes(&bytes, &all_blocks),
         "the legacy numerator is every present page's stored length"
     );
-    assert_eq!(acc.page_bytes_fetched, 74_333);
+    assert_eq!(acc.page_bytes_fetched, 74_321);
     assert_eq!(acc.page_bytes_decoded, 30);
 
     let legacy = acc.page_bytes_fetched as f64 / acc.page_bytes_decoded as f64;
     let measured = wire.phase(QueryPhase::Scan) as f64 / acc.page_bytes_decoded as f64;
-    assert_eq!(legacy, 74_333.0 / 30.0, "exact legacy ratio");
+    assert_eq!(legacy, 74_321.0 / 30.0, "exact legacy ratio");
     assert_eq!(
         measured,
         46.0 / 30.0,
@@ -2454,7 +2454,7 @@ async fn narrow_projection_amplification_is_below_the_legacy_page_byte_ratio() {
     // version-4 read never asks the store for, less the bridging slack the
     // 4-run cap adds back on this fixture (9 candidate runs bridge down to 4).
     let never_fetched = acc.page_bytes_fetched - acc.page_bytes_decoded;
-    assert_eq!(never_fetched, 74_303);
+    assert_eq!(never_fetched, 74_291);
     let bridging_slack = wire.phase(QueryPhase::Scan) - acc.page_bytes_decoded;
     assert_eq!(
         bridging_slack, 16,
@@ -2501,7 +2501,7 @@ fn narrow_projection_placed_bytes(bytes: &[u8]) -> (u64, ColumnSelection) {
     // bytes are the wire figure the amplification test above pins.
     assert_eq!(
         (tail_len(bytes), front, runs),
-        (4_501, 84, 46),
+        (4_494, 84, 46),
         "tail probe, front span, bridged runs"
     );
     (tail_len(bytes) + front + runs, sel)
@@ -2510,29 +2510,29 @@ fn narrow_projection_placed_bytes(bytes: &[u8]) -> (u64, ColumnSelection) {
 /// Issue #2066: a narrow projection over a three-row-group version-4 object
 /// holds exactly the bytes it placed, not the object. The assembly gauge and
 /// the fetch budget's `fetch_reserved` both read the placed figure -- the tail
-/// probe, the front-section span and the four bridged chunk runs, 4,501 + 84 +
-/// 46 = 4,631 of a 78,885-byte object -- while the reader holds the bytes,
+/// probe, the front-section span and the four bridged chunk runs, 4,494 + 84 +
+/// 46 = 4,624 of a 78,899-byte object -- while the reader holds the bytes,
 /// and both return to zero when it drops them.
 ///
 /// With no cache wired nothing is offered to a second byte ledger, so the
 /// placed regions are this read's alone and `handoff_overlap` stays 0.
 ///
 /// Prove-the-test: against the object-sized pooled buffer this replaced, the
-/// gauge and `fetch_reserved` both read 78,885 at the first figure asserted
+/// gauge and `fetch_reserved` both read 78,899 at the first figure asserted
 /// after the fetch. A sparse assembler that still reserved the object size
 /// fails the `fetch_reserved` assertion; one that kept a pooled object-sized
 /// buffer beside its regions and charged it fails the gauge assertion. Making
 /// `hold_placement` mark every reservation handed off unconditionally, instead
 /// of only when a cache is wired, fails the `handoff_overlap` assertion below
-/// with 4,631 against 0.
+/// with 4,624 against 0.
 #[tokio::test]
 async fn version_4_narrow_projection_holds_exactly_its_placed_bytes() {
     let recs = records();
     let bytes = build_object(&recs);
     let object_size = bytes.len() as u64;
     let (placed, sel) = narrow_projection_placed_bytes(&bytes);
-    assert_eq!(object_size, 78_885, "fixture object size");
-    assert_eq!(placed, 4_631, "placed bytes of the narrow projection");
+    assert_eq!(object_size, 78_899, "fixture object size");
+    assert_eq!(placed, 4_624, "placed bytes of the narrow projection");
 
     let recording = RecordingStore::new(store_with(&bytes).await);
     let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>;
@@ -2595,7 +2595,7 @@ async fn version_4_narrow_projection_holds_exactly_its_placed_bytes() {
 ///
 /// Prove-the-test: against the object-sized reservation this replaced, the
 /// in-flight figure read the object size plus the transient run reservation,
-/// 78,885 + 46 = 78,931, not 4,631.
+/// 78,899 + 46 = 78,945, not 4,624.
 #[tokio::test]
 async fn version_4_ranged_read_reserves_its_placed_bytes_while_a_get_is_in_flight() {
     let recs = records();
@@ -2717,12 +2717,12 @@ async fn version_4_ranged_read_refuses_a_placement_before_issuing_its_get() {
 /// The figure bounds the overlap from above rather than counting it exactly:
 /// the mark is made per placement, not per admission, so a value the cache
 /// refused over its single-entry cap still counts. This fixture's cache admits
-/// every region (64 MiB single-entry cap against a 4,631-byte read), so the
+/// every region (64 MiB single-entry cap against a 4,624-byte read), so the
 /// bound is tight here.
 ///
 /// Prove-the-test: dropping the `reservation.mark_handed_off()` call from
 /// `hold_placement` leaves `handoff_overlap()` at 0 on both reads below, so
-/// the first cached assertion fails with 0 against 4,631.
+/// the first cached assertion fails with 0 against 4,624.
 #[tokio::test]
 async fn version_4_cached_ranged_read_marks_its_placements_handed_off() {
     let recs = records();
