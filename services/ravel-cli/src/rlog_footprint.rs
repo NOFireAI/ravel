@@ -457,7 +457,10 @@ fn section_name(k: u32) -> String {
     }
 }
 
-fn column_name(column_id: u32, field_dir: &FieldDir) -> (String, String) {
+/// A column's name and kind: `fixed` for the ten fixed columns, the FIELD_DIR
+/// type for a dynamic one, and `column_<id>`/`unknown` for an id FIELD_DIR
+/// does not name.
+pub fn column_name(column_id: u32, field_dir: &FieldDir) -> (String, String) {
     let fixed = match column_id {
         COL_TS => Some("ts"),
         COL_OBSERVED_TS => Some("observed_ts"),
