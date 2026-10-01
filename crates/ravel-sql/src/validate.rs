@@ -1061,6 +1061,7 @@ impl Visitor for ExcludedFunctionFinder {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use ravel_pqtable::grants::LocationDefect;
 
     fn reject(sql: &str) -> ValidationError {
         validate_query(sql).expect_err("must be rejected")
@@ -1961,7 +1962,24 @@ mod tests {
     fn location_without_scheme_is_rejected() {
         assert!(matches!(
             reject_ddl("CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION '/tmp/prefix/'"),
-            DdlValidationError::Location(_)
+            DdlValidationError::Location(GrantsError::InvalidLocation {
+                defect: LocationDefect::NoScheme,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn location_as_a_relative_path_with_no_leading_slash_is_rejected() {
+        // Same defect as the leading-slash case above, under a shape the
+        // `split_once("://")` check cannot tell apart from a bucket name: a
+        // bare relative path has no scheme either.
+        assert!(matches!(
+            reject_ddl("CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION 'tmp/prefix/'"),
+            DdlValidationError::Location(GrantsError::InvalidLocation {
+                defect: LocationDefect::NoScheme,
+                ..
+            })
         ));
     }
 
@@ -1971,7 +1989,10 @@ mod tests {
             reject_ddl(
                 "CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION 'file:///etc/passwd'"
             ),
-            DdlValidationError::Location(_)
+            DdlValidationError::Location(GrantsError::InvalidLocation {
+                defect: LocationDefect::UnsupportedScheme(ref scheme),
+                ..
+            }) if scheme == "file"
         ));
     }
 
@@ -1982,7 +2003,10 @@ mod tests {
                 "CREATE EXTERNAL TABLE orders STORED AS PARQUET \
                  LOCATION 'http://bucket/prefix/'"
             ),
-            DdlValidationError::Location(_)
+            DdlValidationError::Location(GrantsError::InvalidLocation {
+                defect: LocationDefect::UnsupportedScheme(ref scheme),
+                ..
+            }) if scheme == "http"
         ));
     }
 
@@ -1993,7 +2017,10 @@ mod tests {
                 "CREATE EXTERNAL TABLE orders STORED AS PARQUET \
                  LOCATION 's3://bucket/../prefix/'"
             ),
-            DdlValidationError::Location(_)
+            DdlValidationError::Location(GrantsError::InvalidLocation {
+                defect: LocationDefect::DotDot,
+                ..
+            })
         ));
     }
 
@@ -2004,7 +2031,10 @@ mod tests {
                 "CREATE EXTERNAL TABLE orders STORED AS PARQUET \
                  LOCATION 's3://bucket/prefix//double/'"
             ),
-            DdlValidationError::Location(_)
+            DdlValidationError::Location(GrantsError::InvalidLocation {
+                defect: LocationDefect::EmptySegment,
+                ..
+            })
         ));
     }
 
@@ -2015,7 +2045,10 @@ mod tests {
                 "CREATE EXTERNAL TABLE orders STORED AS PARQUET \
                  LOCATION 's3://bucket/prefix/*.parquet'"
             ),
-            DdlValidationError::Location(_)
+            DdlValidationError::Location(GrantsError::InvalidLocation {
+                defect: LocationDefect::Glob,
+                ..
+            })
         ));
     }
 
@@ -2026,7 +2059,10 @@ mod tests {
                 "CREATE EXTERNAL TABLE orders STORED AS PARQUET \
                  LOCATION 's3://bucket/prefix%2F/'"
             ),
-            DdlValidationError::Location(_)
+            DdlValidationError::Location(GrantsError::InvalidLocation {
+                defect: LocationDefect::PercentEscape,
+                ..
+            })
         ));
     }
 
@@ -2037,7 +2073,10 @@ mod tests {
                 "CREATE EXTERNAL TABLE orders STORED AS PARQUET \
                  LOCATION 's3://bucket/prefix/?x=1'"
             ),
-            DdlValidationError::Location(_)
+            DdlValidationError::Location(GrantsError::InvalidLocation {
+                defect: LocationDefect::Query,
+                ..
+            })
         ));
     }
 
