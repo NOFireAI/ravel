@@ -21,7 +21,7 @@ use parquet::file::properties::WriterProperties;
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_memory::MemoryBudget;
 use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
-use ravel_object_store::instrument::InstrumentedStore;
+use ravel_object_store::instrument::{InstrumentedStore, StoreOp};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
@@ -243,6 +243,57 @@ async fn plain_create_on_existing_table_is_table_exists() {
     assert!(
         matches!(err, DdlExecuteError::Write(WriteError::TableExists { ref table }) if table == "hits"),
         "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn create_if_not_exists_on_existing_table_issues_no_lake_store_calls() {
+    // The existence check runs against ravel's own manifest store, before the
+    // grant is resolved or the lake store is ever touched: a plain `CREATE [IF
+    // NOT EXISTS]` on a table that already exists must cost zero GET, HEAD,
+    // or LIST calls against the lake, not merely return the right outcome.
+    let lake_store = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+    let lake = Lake::unlimited(Arc::clone(&lake_store) as Arc<dyn ObjectStoreBackend>);
+    let t = tenant("acme");
+    lake.grant(&t).await;
+    lake.put_file("t/hits/0.parquet", parquet_bytes(&[1], &["a"], &[0.5]))
+        .await;
+    let sql = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
+    lake.executor
+        .execute_ddl(t, &sql, CREATED_BY, deadline())
+        .await
+        .expect("first create");
+
+    let before = lake_store.metrics().snapshot();
+
+    let sql_if_not_exists = format!(
+        "CREATE EXTERNAL TABLE IF NOT EXISTS hits STORED AS PARQUET LOCATION '{GRANT}/hits/'"
+    );
+    let outcome = lake
+        .executor
+        .execute_ddl(t, &sql_if_not_exists, CREATED_BY, deadline())
+        .await
+        .expect("second create is a no-op, not an error");
+    assert_eq!(
+        outcome,
+        DdlOutcome::NoOp {
+            table: "hits".to_string()
+        }
+    );
+
+    let after = lake_store.metrics().snapshot();
+    assert_eq!(
+        after.op(StoreOp::Get).calls,
+        before.op(StoreOp::Get).calls,
+        "existing-table short-circuit must not read a footer"
+    );
+    assert_eq!(
+        after.op(StoreOp::Head).calls,
+        before.op(StoreOp::Head).calls
+    );
+    assert_eq!(
+        after.op(StoreOp::List).calls,
+        before.op(StoreOp::List).calls
     );
 }
 
