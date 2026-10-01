@@ -200,13 +200,21 @@ pub struct MaintainReport {
     /// one hour plus `max_ingest_lag` (three hours at the defaults), and an
     /// event running past its ingest hour by the allowed future clock skew can
     /// make the nominal figure over-read by up to that skew. A tombstoned
-    /// bucket that lists a rewrite record measures from `retired_at_ns` alone,
-    /// because a rewrite with no parts stands its `created_unix_ns` in for an
-    /// event time and can move the expiry to any instant before the tombstone:
-    /// that figure never over-reads, and under-reads by how long after its
-    /// expiry the tombstone was written. It is the figure
+    /// bucket that lists a rewrite record with no parts measures from
+    /// `retired_at_ns` alone, because such a rewrite stands its
+    /// `created_unix_ns` in for an event time and can move the expiry to any
+    /// instant before the tombstone: that figure never over-reads, and
+    /// under-reads by how long after its expiry the tombstone was written, with
+    /// no fixed bound. A rewrite that keeps parts carries their event times, so
+    /// its bucket keeps the nominal-or-tombstone figure. It is the figure
     /// `ravel_maintain_retention_lag_seconds` renders (issue #1729).
     pub retention_lag_ns: i64,
+    /// Rewrite-record GETs this pass issued only to bound the retention lag of
+    /// a tombstoned bucket that lists rewrite records and whose exact expiry
+    /// this process does not hold: each read tells a parts-less rewrite, which
+    /// leaves the tombstone as the only bound, from one that keeps parts.
+    /// Never issued for a bucket whose exact expiry [`MaintainMemo`] holds.
+    pub lag_bound_gets: usize,
 }
 
 /// The claim hold a skipped bucket earns, as the injected clock reads it: the
@@ -231,10 +239,11 @@ fn reschedule_ns(skip: &ClaimSkip) -> i64 {
 /// clock skew can put it after the nominal one, so the fallback under-reads by
 /// how far the earlier of the two sits past the true expiry: at most one hour
 /// plus `max_ingest_lag`, since an event can sit that far before its ingest
-/// hour. For a bucket that lists a rewrite record
+/// hour. For a bucket that lists a rewrite record with no parts
 /// ([`ObservedExpiry::NoLaterThanOnly`]) the nominal deadline bounds nothing,
-/// so the lag is `now` past `retired_at_ns` alone. Uses saturating arithmetic
-/// throughout, matching [`classify_zone`].
+/// so the lag is `now` past `retired_at_ns` alone, which under-reads by however
+/// long after the true expiry the tombstone was written. Uses saturating
+/// arithmetic throughout, matching [`classify_zone`].
 fn expired_bucket_retention_lag_ns(
     hour: u32,
     now_ns: i64,
@@ -1461,6 +1470,10 @@ pub async fn scan_and_maintain_with_memo(
         }
 
         let bucket = Bucket::new(tenant_hash, signal, shard, hour);
+        // A memoised exact expiry supersedes any tombstone bound, so the
+        // rewrite-record GET that sharpens that bound is skipped.
+        let rewrite_gets =
+            (!memo.exact_expiry_ns.contains_key(&key)).then_some(&mut report.lag_bound_gets);
         let (retention_outcome, observed_expiry, compaction, acquisition) = if claim_deferred {
             let (outcome, expiry) = retention_sweep_bucket_observed(
                 &mut reach,
@@ -1470,6 +1483,7 @@ pub async fn scan_and_maintain_with_memo(
                 retention_window_ns,
                 lease,
                 &bucket,
+                rewrite_gets,
             )
             .await?;
             (outcome, expiry, None, None)
@@ -1482,6 +1496,7 @@ pub async fn scan_and_maintain_with_memo(
                 retention_window_ns,
                 lease,
                 &bucket,
+                rewrite_gets,
             )
             .await?
         };
@@ -2702,6 +2717,136 @@ mod invalidate_tests {
             cold.retention_lag_ns,
             6 * NS_PER_HOUR,
             "a cold memo reads now past the nominal deadline, the earlier bound here"
+        );
+    }
+
+    /// A tombstoned bucket with a parts-less rewrite (issue #2073 review): the
+    /// pass whose memo holds the exact expiry reads the rewrite record no
+    /// further, and a cold pass reads it exactly once, counts that GET in
+    /// `lag_bound_gets`, and measures from the tombstone alone. Flipped lines:
+    /// the `!memo.exact_expiry_ns.contains_key(&key)` gate replaced with `true`
+    /// reads the warm pass's `lag_bound_gets` as 1 against 0; the
+    /// `then_some(&mut report.lag_bound_gets)` replaced with `None` reads the
+    /// cold pass's as 0 against 1.
+    #[tokio::test]
+    async fn only_a_pass_without_the_exact_expiry_reads_the_rewrite_record() {
+        use crate::config::{DEFAULT_MAX_INGEST_LAG_NS, RetentionPolicy};
+        use ravel_object_store::InstrumentedStore;
+        use ravel_object_store::instrument::StoreOp;
+        use ravel_proto::commit::v1::{CompactionInputIdentity, RewriteDrop, RewriteRecord};
+
+        let store = InstrumentedStore::new(MemoryStore::new());
+        seed_metrics(&store).await;
+        let t = tenant_hash();
+        let inputs = vec![CompactionInputIdentity {
+            writer_id: Uuid::from_u128(1).to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        }];
+        let request_id = Uuid::from_u128(7).to_string();
+        let created_unix_ns = i64::from(HOUR) * NS_PER_HOUR + 2;
+        let rewrite = RewriteRecord {
+            format_version: 1,
+            tenant_hash: t.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            shard: SHARD,
+            ingest_hour_bucket: HOUR,
+            input_set_hash: ravel_commit::erasure::compute_rewrite_input_set_hash(
+                &inputs,
+                None,
+                std::slice::from_ref(&request_id),
+            )
+            .to_vec(),
+            inputs,
+            parts: Vec::new(),
+            drops: vec![RewriteDrop {
+                request_id,
+                dropped_count: 1,
+            }],
+            created_unix_ns,
+            superseded_record_key: String::new(),
+        };
+        store
+            .put(
+                &keys::rewrite_record_key_for(&rewrite).expect("key"),
+                ravel_commit::erasure::encode_rewrite(&rewrite),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed rewrite");
+
+        let config = CompactorConfig::default();
+        let window = config.retention_floor_ns(DEFAULT_MAX_INGEST_LAG_NS);
+        let retention = RetentionConfig::from_policy(
+            RetentionPolicy {
+                default: None,
+                tenants: vec![(TENANT.to_string(), window)],
+            },
+            &config,
+            DEFAULT_MAX_INGEST_LAG_NS,
+        )
+        .expect("valid retention config");
+        let bucket_end = (i64::from(HOUR) + 1) * NS_PER_HOUR;
+        let tombstoned_at = bucket_end + window + 5 * NS_PER_HOUR;
+        let clock = FixedClock::new(tombstoned_at);
+        let gets = || store.metrics().snapshot().op(StoreOp::Get).calls;
+        let pass = |memo: MaintainMemo| {
+            let (store, clock, config, retention) = (&store, &clock, &config, &retention);
+            async move {
+                let mut memo = memo;
+                let report = scan_and_maintain_with_memo(
+                    &mut memo,
+                    store,
+                    clock,
+                    config,
+                    retention,
+                    &NoLeases,
+                    t,
+                    Signal::Metrics,
+                    SHARD,
+                )
+                .await
+                .expect("scan");
+                (memo, report)
+            }
+        };
+
+        let (warm, first) = pass(MaintainMemo::new(0)).await;
+        assert_eq!(first.retired, 1, "the first pass tombstones the bucket");
+        assert_eq!(
+            first.lag_bound_gets, 0,
+            "the tombstoning pass knows the expiry"
+        );
+
+        clock.set(tombstoned_at + NS_PER_HOUR);
+        let before = gets();
+        let (_, second) = pass(warm).await;
+        let warm_gets = gets() - before;
+        assert_eq!(
+            second.lag_bound_gets, 0,
+            "a memoised exact expiry needs no GET"
+        );
+        assert_eq!(
+            second.retention_lag_ns,
+            tombstoned_at + NS_PER_HOUR - (created_unix_ns + window),
+            "the warm pass reads the exact lag"
+        );
+
+        let before = gets();
+        let (_, cold) = pass(MaintainMemo::new(0)).await;
+        let cold_gets = gets() - before;
+        assert_eq!(
+            cold.lag_bound_gets, 1,
+            "the cold pass reads the rewrite once"
+        );
+        assert_eq!(
+            cold_gets,
+            warm_gets + 1,
+            "exactly one GET more than the pass with the exact expiry"
+        );
+        assert_eq!(
+            cold.retention_lag_ns, NS_PER_HOUR,
+            "a parts-less rewrite leaves the tombstone as the only bound"
         );
     }
 }

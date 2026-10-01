@@ -1969,6 +1969,7 @@ pub async fn run_discovery_cycle<C: Clock + Clone + 'static>(
         total.claims_acquired += report.claims_acquired;
         total.claims_stolen += report.claims_stolen;
         total.l0_records_pending += report.l0_records_pending;
+        total.lag_bound_gets += report.lag_bound_gets;
         total.retention_lag_ns = total.retention_lag_ns.max(report.retention_lag_ns);
     }
 
@@ -2447,6 +2448,7 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
                         claim_cancelled = report.claim_cancelled,
                         claims_acquired = report.claims_acquired,
                         claims_stolen = report.claims_stolen,
+                        lag_bound_gets = report.lag_bound_gets,
                         "maintenance: retention + compaction pass complete"
                     );
                     safety.record_scan(signal, &report);
@@ -2460,6 +2462,7 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
                     total.claims_acquired += report.claims_acquired;
                     total.claims_stolen += report.claims_stolen;
                     total.l0_records_pending += report.l0_records_pending;
+                    total.lag_bound_gets += report.lag_bound_gets;
                     total.retention_lag_ns = total.retention_lag_ns.max(report.retention_lag_ns);
                 }
                 Err(MaintainError::ConservationViolation {
@@ -10867,6 +10870,72 @@ mod alert_retention_tests {
         let mut expected = vec![keyspace];
         expected.extend(sweep_listings(&tenant, false));
         assert_eq!(store.take_alert_listings(&tenant), expected);
+    }
+
+    /// Issue #2134: a memo read puts an object under the alert keyspace, so a
+    /// tick that read one, whether the memo was usable or a skip reason, issues
+    /// neither of the gate's two listings and runs the sweep's listings
+    /// directly. Watch it fail: return `false` from the `Ready` arm of
+    /// `run_alert_retention_sweep`, and the usable-memo tick reads the gate's
+    /// two listings ahead of the sweep's; the same from the `Skip` arm, and the
+    /// undecodable-memo tick does.
+    #[tokio::test]
+    async fn a_memo_read_issues_neither_gate_listing() {
+        let skip_body: &[u8] = b"not json";
+        for usable in [true, false] {
+            let memory = MemoryStore::new();
+            memory.set_clock_ms(((NOW_NS - 100 * NS_PER_DAY) / 1_000_000) as u64);
+            let tenant = TenantId::new("memo-only").hash();
+            if usable {
+                write_memo(&memory, &tenant, hour_of(NOW_NS) - 1, &[]).await;
+            } else {
+                memory
+                    .put(
+                        &alert_state_memo_key(&tenant),
+                        Bytes::from_static(skip_body),
+                        PutOptions::default(),
+                    )
+                    .await
+                    .expect("put memo");
+            }
+            let store = ListLog::new(memory);
+            let safety = MaintenanceSafetyMetrics::default();
+            let (worker, live) = solo();
+
+            tick(
+                &store,
+                &tenant,
+                &CompactorConfig::default(),
+                &safety,
+                &worker,
+                &live,
+            )
+            .await;
+
+            let case = if usable { "usable memo" } else { "skip memo" };
+            let keyspace = alert_keyspace(&tenant);
+            let listings = store.take_alert_listings(&tenant);
+            for gate in [keyspace.clone(), format!("quarantine/{keyspace}")] {
+                assert!(!listings.contains(&gate), "{case}: no gate listing {gate}");
+            }
+            // A usable memo runs the retention sweep, which lists the commit
+            // prefix once ahead of the orphan sweep.
+            let mut expected = Vec::new();
+            if usable {
+                expected.push(
+                    keys::commit_shard_prefix(&tenant, Signal::Alerts, ALERT_SHARD)
+                        .expect("prefix"),
+                );
+            }
+            expected.extend(sweep_listings(&tenant, false));
+            assert_eq!(listings, expected, "{case}");
+            let expected_skips = if usable {
+                no_skips()
+            } else {
+                skipped_once(AlertRetentionSkipReason::Undecodable)
+            };
+            assert_eq!(skipped(&safety), expected_skips, "{case}");
+        }
     }
 
     /// A memo read that fails against object storage with something other than

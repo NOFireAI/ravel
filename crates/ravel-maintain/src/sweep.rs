@@ -6752,6 +6752,113 @@ mod tests {
         assert_eq!(first_bytes + second_bytes, PART_SIZES.iter().sum::<u64>());
     }
 
+    /// Two parts per record, with sizes distinct across both records, so a
+    /// total missing either record's parts cannot pass.
+    fn sized_parts(sizes: [u64; 2]) -> Vec<CompactionPart> {
+        sizes
+            .iter()
+            .zip(0u8..)
+            .map(|(&object_size, index)| CompactionPart {
+                part_index: u32::from(index),
+                content_hash: vec![0x60 + index; 32],
+                object_size,
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    /// Issue #2073 review: a superseded rewrite record's parts and an
+    /// erasure-dominated version 2 compaction record's parts are each charged
+    /// at their recorded sizes. A version 1 record C1 holds no parts; R1, a
+    /// rewrite over C1 with parts of 300 and 4,000 bytes, is superseded by R2;
+    /// C2, a version 2 record over C1 with parts of 50,000 and 600,000 bytes,
+    /// is dominated by R2's chain and joins its group. Flipped lines:
+    /// `part.object_size` in the `ChainLink::Rewrite` arm of
+    /// `ChainLink::part_targets` replaced with `0` reads left 650000, right
+    /// 654300; `record_part_bytes` in `Version2Groups::join_dominated`'s
+    /// `part_bytes.insert` replaced with `0` reads left 4300, right 654300.
+    #[tokio::test]
+    async fn superseded_rewrite_and_dominated_version_2_parts_are_charged_at_their_sizes() {
+        let store = MemoryStore::new();
+        let (c1_key, c1) =
+            put_chain_bottom(&store, ChainEnd::PresentVersion1, &mut Vec::new()).await;
+        let mut part_keys = Vec::new();
+
+        let request_id = Uuid::from_u128(0x51).to_string();
+        let r1 = RewriteRecord {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Logs).into(),
+            shard: DEPTH_SHARD,
+            ingest_hour_bucket: 1,
+            inputs: Vec::new(),
+            input_set_hash: ravel_commit::erasure::compute_rewrite_input_set_hash(
+                &[],
+                Some(&c1_key),
+                std::slice::from_ref(&request_id),
+            )
+            .to_vec(),
+            parts: sized_parts([300, 4_000]),
+            drops: vec![ravel_proto::commit::v1::RewriteDrop {
+                request_id,
+                dropped_count: 1,
+            }],
+            created_unix_ns: 0,
+            superseded_record_key: c1_key.clone(),
+        };
+        let r1_key = keys::rewrite_record_key_for(&r1).expect("key");
+        store
+            .put(
+                &r1_key,
+                ravel_commit::erasure::encode_rewrite(&r1),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed rewrite");
+        for part in &r1.parts {
+            part_keys.push(keys::reconstruct_rewrite_part_key(&r1, part).expect("part key"));
+        }
+        put_rewrites_over(&store, r1_key.clone(), 1).await;
+
+        let c2 = CompactionRecord {
+            format_version: 2,
+            input_set_hash: ravel_commit::erasure::compute_superseding_compaction_input_set_hash(
+                &c1.inputs, &c1_key,
+            )
+            .to_vec(),
+            superseded_record_key: c1_key.clone(),
+            parts: sized_parts([50_000, 600_000]),
+            ..c1.clone()
+        };
+        let c2_key = keys::compaction_record_key_for(&c2).expect("key");
+        store
+            .put(
+                &c2_key,
+                record::encode_compaction(&c2),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed version 2");
+        for part in &c2.parts {
+            part_keys.push(keys::reconstruct_l1_part_key(&c2, part).expect("part key"));
+        }
+        for key in &part_keys {
+            store
+                .put(key, Bytes::from_static(b"part"), PutOptions::default())
+                .await
+                .expect("seed part");
+        }
+
+        let (outcome, bytes) = sized_chain_pass(&store).await.expect("pass");
+
+        assert_eq!(outcome.data_deleted, 4, "R1's and C2's parts");
+        assert_eq!(outcome.records_deleted, 3, "C1, R1 and C2");
+        assert_eq!(bytes, 654_300, "each part at its recorded size");
+        for key in part_keys.iter().chain([&c1_key, &r1_key, &c2_key]) {
+            assert!(!present(&store, key).await, "{key} deleted");
+        }
+    }
+
     fn assert_refused_as_too_deep(result: Result<ChainWalk>, case: &str) {
         match result {
             Ok(ChainWalk::Refused(reason)) => {

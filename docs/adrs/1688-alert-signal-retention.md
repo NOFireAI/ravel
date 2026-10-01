@@ -377,13 +377,15 @@ pays them for nothing (issue #2134). It is now skipped for a tenant whose alert
 keyspace holds no object at all.
 
 - **The gate.** When the tick's memo read found no memo object and the
-  absent-memo listing found no alert commit record (or the window is `0`, so
-  neither ran), the driver issues two bounded listings: one of the tenant's
-  whole alert keyspace, `t/<tenant_hash>/a/`, and one of its quarantine mirror,
+  absent-memo listing found no alert commit record, when the memo read or that
+  listing failed against the store, or when the window is `0` (so neither ran),
+  the driver issues two bounded listings: one of the tenant's whole alert
+  keyspace, `t/<tenant_hash>/a/`, and one of its quarantine mirror,
   `quarantine/t/<tenant_hash>/a/`. The sweep is skipped for that tick only when
   both come back empty. A memo object or an alert commit record already puts an
-  object under the keyspace, so a tenant that runs alert rules pays neither
-  listing.
+  object under the keyspace, so with a nonzero `--alert-retention` a tick that
+  found either pays neither listing. Under `--alert-retention 0` no memo is
+  read, so every tenant pays both, including one that runs alert rules.
 - **Why the commit prefix is not the gate.** An empty commit prefix is exactly
   the state the orphan rule exists for: a data object whose first commit record
   never landed sits under `l0/` beside an empty `c/`. And once orphan GC has
@@ -401,7 +403,8 @@ keyspace holds no object at all.
 - **A failed gate listing runs the sweep.** A listing error has not shown the
   keyspace empty, so the driver logs it and sweeps; the sweep's own listings
   then report the store fault the way they did before the gate existed.
-- **What a quiet tenant still pays.** Two listings per tick with
-  `--alert-retention 0`, three with a nonzero window (the absent-memo listing of
-  the commit prefix, then the two gate listings), plus the memo GET, instead of
-  the sweep's six.
+- **What a quiet tenant still pays.** With `--alert-retention 0`, which reads
+  no memo, two listings per tick instead of the sweep's six. With a nonzero
+  window, the memo GET and three listings (the absent-memo listing of the commit
+  prefix, then the two gate listings) instead of the memo GET and seven (that
+  absent-memo listing, then the sweep's six).

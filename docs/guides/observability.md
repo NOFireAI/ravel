@@ -1321,7 +1321,7 @@ Labels: `mode`, plus `signal` on every series except
 | `ravel_maintain_l0_records_pending` | Gauge. L0 commit records sitting below `min_compaction_inputs` in a sealed bucket, by signal, summed over every tenant and shard this process maintains. |
 | `ravel_maintain_objects_deleted_total` | Objects the sweep physically deleted, by `kind`: `superseded_records_deleted`, `superseded_data_deleted`, `unreferenced_parts_deleted`, `quarantine_reaped`. |
 | `ravel_maintain_bytes_reclaimed_total` | Bytes of deleted objects reclaimed by the sweep, by signal. Object sizes, not wire bytes: the quarantine reaper and the unreferenced-part delete at their listed size, and the superseded-input sweep at the `object_size` the commit, compaction or rewrite record naming each object carries, a superseded L1 segment on the pass that deletes that record, so it is charged once. Retention deletions are excluded because they delete by key without a known size, so it undercounts the bytes reclaimed, except that two replicas sweeping one unit during an ownership handoff can each count the same object. Per process. |
-| `ravel_maintain_retention_lag_seconds` | Gauge. How far past its retention expiry the oldest still-present expired bucket is, by signal, from this process's most recent completed cycle. 0 when none. A per-cycle maximum over the process's units, so it names the single worst bucket. Exact when this process tombstoned the bucket; otherwise it can under-read by up to one hour plus `max_ingest_lag` (three hours at the defaults), and over-read by at most the allowed future clock skew. A unit whose scan failed, or that a failed provisioning read skipped, contributes nothing: read it beside `ravel_maintain_units_scan_failed`. |
+| `ravel_maintain_retention_lag_seconds` | Gauge. How far past its retention expiry the oldest still-present expired bucket is, by signal, from this process's most recent completed cycle. 0 when none. A per-cycle maximum over the process's units, so it names the single worst bucket. Three cases: exact when this process tombstoned the bucket; otherwise measured from the earlier of the ingest hour's end plus the window and the tombstone time, which can under-read by up to one hour plus `max_ingest_lag` (three hours at the defaults) and over-read by at most the allowed future clock skew; and, for a bucket holding a rewrite record with no parts, from the tombstone time alone, which never over-reads and under-reads by however long after the bucket expired its tombstone was written, with no fixed bound. A unit whose scan failed, or that a failed provisioning read skipped, contributes nothing: read it beside `ravel_maintain_units_scan_failed`. |
 | `ravel_maintain_units_scan_failed` | Gauge. Units whose retention and compaction scan returned an error in this process's most recent completed cycle, or that a failed provisioning check or shard-generation read skipped unscanned, by signal. While it is nonzero the retention lag does not cover every unit. |
 | `ravel_maintain_conservation_aborts_total` | Compaction publishes aborted by the record-count conservation gate, by signal. |
 | `ravel_maintain_orphan_breaker_tripped_total` | Orphan-GC mass-orphan circuit breaker trips, by signal. Also carries `signal="alerts"` and `signal="audit"` for the alerts shard's orphan sweep and the query-audit shard's input-cleanup sweep, which run outside the maintained signals. The superseded refusal counter and the two superseded hold families below carry those two signals as well; every other per-signal series here covers only metrics, logs and spans. |
@@ -1469,7 +1469,9 @@ them. Retention deletions delete by object
 key without a known size, and charging their bytes would cost an extra HEAD per
 object, so they are deliberately excluded and the counter still undercounts all
 bytes reclaimed; `ravel_maintain_objects_deleted_total{kind=...}` counts objects
-on every sweep path. It can also count one object twice when two replicas sweep
+on the same sweep paths and leaves retention deletions out too. No metric
+counts retention deletions; `ravel_maintain_retention_lag_seconds` is where
+retention's progress shows. It can also count one object twice when two replicas sweep
 a unit during an ownership handoff, since deleting a missing key succeeds. It is
 a per-process counter: sum it across maintain replicas for a deployment-wide
 figure.
@@ -1497,12 +1499,15 @@ tombstone's write time. Admission accepts an event up to `max_ingest_lag` before
 its ingest hour, so that fallback under-reads the lag by up to one hour plus
 `max_ingest_lag`, three hours at the defaults; an event running past its ingest
 hour by the allowed future clock skew can also make it over-read by up to that
-skew. A tombstoned bucket that holds a rewrite record is measured from the
-tombstone's write time alone: an erasure that dropped every record in the bucket
-leaves a rewrite whose publish time stands in for its newest event, so its
-expiry can sit anywhere up to the tombstone, and the ingest hour's end bounds
-nothing. That figure never over-reads, and under-reads by how long after its
-expiry the tombstone was written.
+skew. A tombstoned bucket that holds a rewrite record with no parts is measured
+from the tombstone's write time alone: an erasure that dropped every record in
+the bucket leaves a rewrite whose publish time stands in for its newest event, so
+its expiry can sit anywhere up to the tombstone, and the ingest hour's end bounds
+nothing. That figure never over-reads, and under-reads by however long after its
+expiry the tombstone was written, which has no fixed bound. Telling that rewrite
+apart costs one GET of the rewrite record, issued only when this process does not
+hold the exact expiry. A rewrite that keeps parts carries their event times, so
+its bucket keeps the earlier-of-the-two figure above and its bound.
 
 A unit whose retention and compaction scan fails contributes no lag at all, so a
 signal whose sweep is stuck on a failing listing could read `0` here.
