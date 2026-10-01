@@ -232,6 +232,28 @@ fn fleet_witness_keys() -> Vec<String> {
     ]
 }
 
+/// The memo-snapshot prefix the maintain warm start lists:
+/// `MEMO_PREFIX` in `crates/ravel-maintain/src/memo_snapshot.rs`.
+const MEMO_PREFIX: &str = "sys/maintain/memo/";
+
+/// The control-plane keys whose constructors live in crates this test cannot
+/// depend on without a cycle through `ravel-commit`, written in the shape each
+/// constructor produces:
+///
+/// - `sys/auth`, the durable bearer-token map (`AUTH_KEY` in
+///   `crates/ravel-catalog/src/auth_token_map.rs`);
+/// - `sys/maintain/memo/<process_id>`, one maintain process's memo snapshot
+///   (`memo_key` in `crates/ravel-maintain/src/memo_snapshot.rs`);
+/// - `sys/t/<tenant_hash>`, one tenant's recovery manifest
+///   (`recovery_manifest_key` in `services/ravel-server/src/tenancy.rs`).
+fn control_plane_witness_keys() -> Vec<String> {
+    vec![
+        "sys/auth".to_string(),
+        format!("{MEMO_PREFIX}{}", Uuid::from_u128(WITNESS_PROCESS_ID)),
+        format!("sys/t/{}", test_tenant().to_hex()),
+    ]
+}
+
 /// One literal key per TENANT-ROUTED keyspace the templates name that
 /// `ravel-commit` has no key constructor for, so `representative_keys` produces
 /// no witness for it: `catalog/`, `prov`, tenant `idem/`, and tenant
@@ -289,6 +311,7 @@ fn key_domain() -> &'static [String] {
         let mut keys = representative_keys();
         keys.extend(NON_TENANT_WITNESS_KEYS.iter().map(|k| (*k).to_string()));
         keys.extend(fleet_witness_keys());
+        keys.extend(control_plane_witness_keys());
         keys.extend(constructor_free_tenant_witness_keys());
         keys.extend(quarantine_witness_keys());
         keys
@@ -1814,7 +1837,10 @@ struct ExpectedRolePatterns {
 const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // Gateway: ingest. Writes L0 data, commit records, idempotency and
     // admission records, provenance, and the catalog objects a commit
-    // publishes; deletes nothing.
+    // publishes; deletes nothing. sys/auth is the durable token map the auth
+    // refresh reads, and sys/t/* the per-tenant recovery manifest every keyed
+    // ingest path creates; asserted by tenant_resolving_roles_read_the_auth_map
+    // and gateway_template_covers_the_recovery_manifest_write.
     ExpectedRolePatterns {
         role: "gateway",
         list_prefixes: &[
@@ -1835,6 +1861,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/tenancy",
             "sys/qualification",
             "sys/gc",
+            "sys/auth",
         ],
         get_actions: &["s3:GetObject"],
         puts: &[
@@ -1847,6 +1874,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/catalog/*/HEAD",
             "t/*/catalog/*/idx/*",
             "sys/tenancy",
+            "sys/t/*",
         ],
         put_actions: &["s3:PutObject"],
         deletes: &[],
@@ -1859,7 +1887,8 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // Query: reads every level, writes catalog-fold output, the query-audit
     // prefix and its worker registration; deletes nothing. A drained query
     // worker overwrites its own registration rather than deleting it, and the
-    // maintain role reaps dead registrations (issue #1828).
+    // maintain role reaps dead registrations (issue #1828). sys/auth is read
+    // by the durable auth refresh (tenant_resolving_roles_read_the_auth_map).
     ExpectedRolePatterns {
         role: "query",
         list_prefixes: &[
@@ -1880,6 +1909,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/tenancy",
             "sys/qualification",
             "sys/gc",
+            "sys/auth",
             "sys/query/workers/*",
         ],
         get_actions: &["s3:GetObject"],
@@ -1979,6 +2009,11 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // key past the reap horizon, judged from LIST metadata, so it reads no
     // record and writes none. Asserted call by call by
     // maintain_template_covers_every_query_worker_reap_call.
+    //
+    // sys/maintain/memo/* appears on the list axis for the warm start, which
+    // LISTs the prefix before it GETs each snapshot (both under the wider
+    // sys/maintain/* read). Asserted by
+    // maintain_template_covers_every_memo_snapshot_read_call.
     ExpectedRolePatterns {
         role: "maintain",
         list_prefixes: &[
@@ -1991,6 +2026,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/catalog/*/snap/*",
             "t/*/catalog/*/idx/*",
             "sys/maintain/workers/*",
+            "sys/maintain/memo/*",
             "sys/query/workers/*",
             "quarantine/t/*/*/l0/*",
         ],
@@ -2048,7 +2084,9 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
         kms_resources: &[("MaintainTenantKms", &[TENANT_KMS_KEY_ARN])],
     },
     // Admin: broad read, narrow create-only writes, and the one delete grant
-    // ADR-0050's qualification probe needs. Decrypt-only on KMS.
+    // ADR-0050's qualification probe needs. Decrypt-only on KMS. The sys/auth
+    // write is ravel-cli's tenant token upsert and revoke
+    // (admin_template_covers_every_auth_map_write_call).
     ExpectedRolePatterns {
         role: "admin",
         list_prefixes: &["t/*", "sys/*"],
@@ -2060,6 +2098,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/qualification",
             "sys/qualify/*",
             "sys/gc",
+            "sys/auth",
             "t/*/*/prov",
             "t/*/*/c/*",
             "t/*/u/*",
@@ -3828,6 +3867,169 @@ fn maintain_template_covers_every_query_worker_reap_call() {
         query_deletes.is_empty(),
         "query: the role must grant no delete at all (ADR-0055 section 1); the \
          maintain role reaps its dead registrations. Grants: {query_deletes:?}"
+    );
+}
+
+/// Assert every `role` pattern on `axis` that reaches `witness` reaches no key in
+/// `key_domain()` outside `scope`, so a grant added for one control-plane key
+/// cannot quietly cover a neighbour.
+fn assert_reaches_nothing_outside(
+    role: &str,
+    axis: &str,
+    patterns: &[String],
+    witness: &str,
+    scope: &str,
+) {
+    let outside: Vec<&String> = key_domain()
+        .iter()
+        .filter(|key| !key.starts_with(scope))
+        .collect();
+    assert!(
+        !outside.is_empty(),
+        "the key domain models no key outside {scope:?}"
+    );
+    for pattern in patterns {
+        if !glob_matches(pattern, witness) {
+            continue;
+        }
+        for key in &outside {
+            assert!(
+                !glob_matches(pattern, key),
+                "{role}: {axis} pattern {pattern:?} reaches {witness:?} AND \
+                 {key:?}, which lies outside {scope:?}"
+            );
+        }
+    }
+}
+
+/// The durable bearer-token map's writer is `ravel-cli tenant token upsert`
+/// and `revoke` (`services/ravel-cli/src/tenant_token.rs`), which go through
+/// `write_map` in `crates/ravel-catalog/src/auth_token_map.rs`: one GET of
+/// `sys/auth`, then a PUT of the same key, `CreateIfAbsent` on a fresh bucket
+/// and `CasVersion` after. Both modes are `s3:PutObject`. Nothing deletes the
+/// map. No server role writes it: the server only reads it.
+#[test]
+fn admin_template_covers_every_auth_map_write_call() {
+    const AUTH_KEY: &str = "sys/auth";
+    let admin = load_policy("admin");
+    let gets = key_patterns_for(&admin, &["s3:GetObject"], Some("Allow"));
+    let puts = key_patterns_for(&admin, &["s3:PutObject"], Some("Allow"));
+    let deletes = delete_key_patterns(&admin, "Allow");
+
+    assert!(
+        gets.iter().any(|p| glob_matches(p, AUTH_KEY)),
+        "admin: no GetObject Allow reaches {AUTH_KEY:?}, which read_auth_map \
+         reads before every write. Grants: {gets:?}"
+    );
+    assert!(
+        puts.iter().any(|p| glob_matches(p, AUTH_KEY)),
+        "admin: no PutObject Allow reaches {AUTH_KEY:?}, which write_map PUTs on \
+         every tenant token upsert and revoke. Every one is refused. Grants: \
+         {puts:?}"
+    );
+    assert!(
+        !deletes.iter().any(|p| glob_matches(p, AUTH_KEY)),
+        "admin: a delete Allow reaches {AUTH_KEY:?}; nothing deletes the token \
+         map. Grants: {deletes:?}"
+    );
+    assert_reaches_nothing_outside("admin", "s3:PutObject Allow", &puts, AUTH_KEY, AUTH_KEY);
+
+    for role in ["gateway", "query", "maintain"] {
+        let puts = key_patterns_for(&load_policy(role), &["s3:PutObject"], Some("Allow"));
+        assert!(
+            !puts.iter().any(|p| glob_matches(p, AUTH_KEY)),
+            "{role}: a PutObject Allow reaches {AUTH_KEY:?}. The only production \
+             writers are ravel-cli under Admin and the operator; a server role \
+             only reads the map. Grants: {puts:?}"
+        );
+    }
+}
+
+/// `DurableAuthState::refresh` (`services/ravel-server/src/lifecycle_refresh.rs`)
+/// GETs `sys/auth` through `read_auth_map` at startup, on every refresh horizon
+/// and on a rate-limited token miss. `start` in `services/ravel-server/src/lib.rs`
+/// builds that state in `Mode::All`, `Mode::Gateway` and `Mode::Query` on a
+/// keyed bucket, and never in `Mode::Maintain`. A refused GET counts as a failed
+/// refresh, and past the hard-stale bound durable tokens fail closed.
+#[test]
+fn tenant_resolving_roles_read_the_auth_map() {
+    const AUTH_KEY: &str = "sys/auth";
+    for role in ["gateway", "query"] {
+        let gets = key_patterns_for(&load_policy(role), &["s3:GetObject"], Some("Allow"));
+        assert!(
+            gets.iter().any(|p| glob_matches(p, AUTH_KEY)),
+            "{role}: no GetObject Allow reaches {AUTH_KEY:?}, which the durable \
+             auth refresh reads in this role's mode. Every refresh fails and \
+             durable bearer tokens are refused. Grants: {gets:?}"
+        );
+        assert_reaches_nothing_outside(role, "s3:GetObject Allow", &gets, AUTH_KEY, AUTH_KEY);
+    }
+}
+
+/// The maintain warm start (`read_all_memo_snapshots` in
+/// `crates/ravel-maintain/src/memo_snapshot.rs`, called from the maintain loop
+/// in `services/ravel-server/src/maintain.rs` on every membership change) LISTs
+/// `sys/maintain/memo/` and GETs each snapshot it finds. A refused LIST is
+/// treated fail-open, as a cold start for every unit, so without the list grant
+/// every warm start is a cold start and nothing reports why.
+#[test]
+fn maintain_template_covers_every_memo_snapshot_read_call() {
+    let maintain = load_policy("maintain");
+    let list_prefixes = list_prefix_patterns(&maintain, Some("Allow"));
+    let gets = key_patterns_for(&maintain, &["s3:GetObject"], Some("Allow"));
+    let puts = key_patterns_for(&maintain, &["s3:PutObject"], Some("Allow"));
+    let snapshot = format!("{MEMO_PREFIX}{}", Uuid::from_u128(WITNESS_PROCESS_ID));
+
+    assert!(
+        list_prefixes.iter().any(|p| glob_matches(p, MEMO_PREFIX)),
+        "maintain: no ListBucket s3:prefix admits {MEMO_PREFIX:?}, the prefix \
+         read_all_memo_snapshots lists. The warm start is refused and every \
+         seeding runs cold. s3:prefix values: {list_prefixes:?}"
+    );
+    assert!(
+        gets.iter().any(|p| glob_matches(p, &snapshot)),
+        "maintain: no GetObject Allow reaches the memo snapshot {snapshot:?}. \
+         Grants: {gets:?}"
+    );
+    assert!(
+        puts.iter().any(|p| glob_matches(p, &snapshot)),
+        "maintain: no PutObject Allow reaches the memo snapshot {snapshot:?}, \
+         which write_memo_snapshot writes. Grants: {puts:?}"
+    );
+    assert_reaches_nothing_outside(
+        "maintain",
+        "s3:prefix Allow",
+        &list_prefixes,
+        MEMO_PREFIX,
+        MEMO_PREFIX,
+    );
+}
+
+/// `RecoveryManifestWriter::ensure` (`services/ravel-server/src/tenancy.rs`)
+/// writes `sys/t/<tenant_hash>` with `CreateIfAbsent` on a keyed tenant's first
+/// ingest request in a process. Every ingest handler calls it, so it runs in
+/// `Mode::Gateway` and the gateway half of `Mode::All`. A refused write is
+/// logged and ingest continues, but the tenant never gets a manifest and the
+/// writer retries, and warns, on every later request.
+#[test]
+fn gateway_template_covers_the_recovery_manifest_write() {
+    const MANIFEST_SCOPE: &str = "sys/t/";
+    let gateway = load_policy("gateway");
+    let puts = key_patterns_for(&gateway, &["s3:PutObject"], Some("Allow"));
+    let manifest = format!("{MANIFEST_SCOPE}{}", test_tenant().to_hex());
+
+    assert!(
+        puts.iter().any(|p| glob_matches(p, &manifest)),
+        "gateway: no PutObject Allow reaches the recovery manifest {manifest:?}, \
+         which every keyed ingest path writes for a tenant's first request. \
+         Grants: {puts:?}"
+    );
+    assert_reaches_nothing_outside(
+        "gateway",
+        "s3:PutObject Allow",
+        &puts,
+        &manifest,
+        MANIFEST_SCOPE,
     );
 }
 

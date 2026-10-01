@@ -281,8 +281,8 @@ choice for a development or single-operator deployment.
 
 | Role | Process | What it does |
 |---|---|---|
-| Gateway | `--mode gateway`, and the ingest half of `--mode all` | Writes L0 segments and their commit records, idempotency markers, and a tenant's provisioning record on adopt. Runs the catalog fold, so it also writes catalog snapshot parts, `HEAD`, and name-postings objects. |
-| Query | `--mode query`, and the query half of `--mode all` | Lists and reads commit records, catalog objects and segment data. Runs the catalog fold too, and appends query-audit records. |
+| Gateway | `--mode gateway`, and the ingest half of `--mode all` | Writes L0 segments and their commit records, idempotency markers, a tenant's provisioning record on adopt, and on a keyed bucket each tenant's recovery manifest under `sys/t/`. Runs the catalog fold, so it also writes catalog snapshot parts, `HEAD`, and name-postings objects. Reads the durable token map `sys/auth`. |
+| Query | `--mode query`, and the query half of `--mode all` | Lists and reads commit records, catalog objects and segment data. Runs the catalog fold too, and appends query-audit records. Reads the durable token map `sys/auth`. |
 | Maintain | `--mode maintain` | Compaction, retention and the sweeper. The only role that may delete anything, and only under the L0, L1, commit and idempotency prefixes plus the query-audit shard. |
 | Admin | `ravel-cli` | One-off bootstrap and mutation commands. Invoked by an operator or a CI job, never by a long-running server. The broadest of the four. See [the Admin credential](deployment.md#the-admin-credential). |
 

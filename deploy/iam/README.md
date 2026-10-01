@@ -271,6 +271,35 @@ Two known gaps are recorded here and are NOT closed by the grants above.
   write happen on a shipped deployment, so it is recorded here. Tracked in
   issue #1979.
 
+## Control-plane keys outside the data path
+
+Three control-plane keys are read or written by a server role or by Admin on
+their normal path. Each grant names the one key or prefix the call uses:
+
+| Call | Mode | S3 operation | Grant |
+|---|---|---|---|
+| `DurableAuthState::refresh` reads `sys/auth` (startup, refresh horizon, token miss) | `gateway`, `query`, `all`, keyed bucket | `s3:GetObject` | `GatewayRead` and `QueryRead` `sys/auth` |
+| `ravel-cli tenant token upsert` and `revoke` write `sys/auth` (`CreateIfAbsent`, then `CasVersion`) | Admin | `s3:PutObject` | `AdminWrite` `sys/auth` (the read is `AdminRead` `sys/*`) |
+| `RecoveryManifestWriter::ensure` writes `sys/t/<tenant_hash>` (`CreateIfAbsent`) on a keyed tenant's first ingest request | `gateway`, `all` | `s3:PutObject` | `GatewayWrite` `sys/t/*` |
+| `read_all_memo_snapshots` lists `sys/maintain/memo/` on a maintain warm start | `maintain` | `s3:ListBucket` with `prefix=sys/maintain/memo/` | `MaintainList` `s3:prefix` `sys/maintain/memo/*` (the GETs and the snapshot PUT fall under `MaintainRead` and `MaintainWrite` `sys/maintain/*`) |
+
+Without the `sys/auth` read, every durable auth refresh fails and durable
+bearer tokens are refused once the cached map passes its hard-stale bound.
+Without the Admin write, every token upsert and revoke is refused. Without the
+manifest write, ingest proceeds but the tenant has no recovery manifest and
+the writer retries, and logs a warning, on every later request. Without the
+memo list, every warm start silently runs cold.
+
+No server role may write `sys/auth`: the only production writers are
+`ravel-cli` under Admin and the operator. No role may delete it.
+
+Gateway and Query carry no write on `sys/gc`, although every mode runs the
+`sys/gc` bootstrap at startup: creating it stays with Maintain and Admin, and a
+fresh bucket needs the `maintain` process started first, or the object created
+with `ravel-cli gc-config set` under Admin (see
+`docs/guides/operations/deployment.md`, "The first deployment against a fresh
+bucket").
+
 ## Bucket-configuration reads: granted by no template
 
 No template here grants the read-only bucket-configuration actions

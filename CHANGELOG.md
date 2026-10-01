@@ -444,6 +444,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The shipped IAM templates grant the control-plane keys each role uses** (issue #1995). Gateway and Query gain `s3:GetObject` on `sys/auth`, so the durable bearer-token refresh is no longer refused; Admin gains `s3:PutObject` on `sys/auth`, so `ravel-cli tenant token upsert` and `revoke` can write the token map; Gateway gains `s3:PutObject` on `sys/t/*`, so keyed ingest can create each tenant's recovery manifest; and Maintain gains the `sys/maintain/memo/*` list prefix, so a maintain warm start reads its memo snapshots instead of running cold. Re-apply the four documents under `deploy/iam/` to pick these up.
 - **A store error reads as throttled only for a 429 or 503 status** (issue
   #2307). With no typed transport error in the chain, the S3 and external
   stores classified an error as `Throttled` whenever its text held the digits
