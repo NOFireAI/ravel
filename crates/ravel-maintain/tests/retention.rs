@@ -1339,6 +1339,102 @@ async fn pinned_window_blocks_uncovered_hour_until_neighbor_part_ages() {
     assert!(bucket_is_empty(store.as_ref(), &old_bucket).await);
 }
 
+/// Fail-closed case (ADR-0020 amendment 2026-10-01, issue #1133): when the
+/// anchor part HEAD names is MISSING from the store, `ensure_part_last_modified_ms`
+/// cannot read a `last_modified` at all, and the gate must answer
+/// `SnapshotBlock::Unreadable`, never `SnapshotBlock::PinnedWindow` (which
+/// would imply a real, if too-recent, timestamp was read) and never `Swept`.
+/// To watch this FAIL, collapse `ensure_part_last_modified_ms`'s `NotFound`
+/// case to a synthesized timestamp (e.g. 0 or `now_ns`) instead of `None`:
+/// a 0 timestamp would make the gate clear immediately (unsafe), and a
+/// `now_ns` timestamp would read as `PinnedWindow`, not `Unreadable`.
+#[tokio::test]
+async fn sweep_blocked_fail_closed_when_anchor_part_missing() {
+    let store = Arc::new(MemoryStore::new());
+    let created = sealed_now_ns();
+    store.set_clock_ms((created / 1_000_000) as u64);
+    let clock = FixedClock::new(created);
+    let bucket = seed_two(store.as_ref(), Sig::Metrics).await;
+    seed_input(
+        store.as_ref(),
+        &InputSpec::new_at(
+            HOUR + 1,
+            Uuid::from_u128(0xE7),
+            1,
+            1,
+            vec![raw_series(
+                "m",
+                &[("k", "live")],
+                &[(i64::from(HOUR + 1) * NS_PER_HOUR + 1_000, 6.0)],
+            )],
+        ),
+    )
+    .await;
+    let config = cfg();
+
+    fold_head(&store, Signal::Metrics, created, None).await;
+    let retention = retention_at_floor(&config);
+    retention_sweep_bucket(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        &bucket,
+    )
+    .await
+    .expect("tombstone");
+    clock.set(created + config.protection_horizon_ns + 1);
+
+    // The reconcile fold drops the tombstoned bucket and rewrites the
+    // covering part.
+    let fold_ns = clock.now_ns();
+    store.set_clock_ms((fold_ns / 1_000_000) as u64);
+    fold_head(&store, Signal::Metrics, fold_ns, None).await;
+
+    // The covering part HEAD names goes missing (corruption, a lost write,
+    // an out-of-band deletion): read HEAD, delete every part it names.
+    let head_bytes = get_full(store.as_ref(), &head_key(Signal::Metrics)).await;
+    let head = ravel_catalog::decode_head(head_bytes.as_ref()).expect("HEAD decodes");
+    assert!(!head.parts.is_empty(), "fixture HEAD names at least one part");
+    for part_ref in &head.parts {
+        store
+            .delete(&part_ref.key)
+            .await
+            .expect("delete the covering part");
+    }
+
+    // Well past the pinned-query window that would otherwise apply: a
+    // readable anchor would clear by now. The missing part must still block,
+    // fail-closed.
+    clock.set(
+        fold_ns
+            + 1_000_000_000
+            + config.max_query_duration_ns
+            + config.clock_skew_allowance_ns
+            + 1,
+    );
+    let blocked = retention_sweep_bucket(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        &bucket,
+    )
+    .await
+    .expect("gate");
+    assert_eq!(
+        blocked,
+        RetentionOutcome::BlockedBySnapshot(SnapshotBlock::Unreadable),
+        "a missing anchor part blocks fail-closed, not PinnedWindow and not Swept"
+    );
+    assert!(
+        !bucket_is_empty(store.as_ref(), &bucket).await,
+        "nothing is deleted when the anchor's timestamp cannot be read"
+    );
+}
+
 /// ADR-0078 acceptance test: a deployment configured with ONLY a
 /// `RetentionConfig` deployment default (the CLI-flag path: `--retention-default`
 /// / `--retention-tenant`) and NO durable `TenantConfig.retention_ns` write must
