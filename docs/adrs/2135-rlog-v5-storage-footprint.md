@@ -148,33 +148,41 @@ What the codebase already guarantees, which bounds the change:
      descriptor of the input with the highest clustering generation. A key
      change therefore reaches compacted data as new data arrives, compaction
      still reads no tenant config, and the choice does not depend on writer
-     identity or input order.
+     identity or input order. The bloom scope comes from the same input, the
+     first in input order on a generation tie (see the #2143 amendment).
    - **Merge order.** The k-way merge orders heads by
      `(stream_id, ts.div_euclid(W), input_index)`, where `W` is the widest
      bucket among the inputs (1 ns when no input has a key, which is today's
      order). Every input, whatever its own key, is sorted on the coarse prefix
      because the widths nest, and both admission modes follow the same rule,
-     so they emit the same sequence and stay byte-identical.
+     so when both complete they emit the same sequence and write the same
+     bytes. `EagerAll` charges a batch's reservations at once and can refuse
+     a batch `Overlap` merges (see the #2143 amendment).
    - **Open-cursor set.** When `W` is wider than 1 ns, every input whose
      slice of a stream reaches the current coarse bucket must be open at
      once, keyed or not. In a merge where no input is keyed the set is
-     ADR-0979's `D`, unchanged. Otherwise it is every input whose slice of the
-     stream touches one bucket, which for a 1-day bucket can be every input of
-     a sealed hour.
+     ADR-0979's `D`, unchanged. Otherwise `Overlap` opens every pending input
+     whose slice of the stream starts in or before the current coarse bucket,
+     including one whose slice ends before that bucket, so the open set can
+     exceed the inputs touching any one bucket (see the #2143 amendment). For
+     a 1-day bucket it can be every input of a sealed hour.
    - **Batches sized by reservation.** Before admission, for each stream, the
      compactor sums the `cursor_reservation_bytes` of the inputs touching each
      coarse bucket, using the SKIP_IDX bounds admission already reads. If no
      bucket's sum exceeds `merge_cursor_budget_bytes`, the stream merges in
-     one pass as above. If one does, the stream's inputs are partitioned in
+     one pass as above, as one batch that admission can still refuse (see the
+     #2143 amendment). If one does, the stream's inputs are partitioned in
      input order, greedily on the running sum of their reservations, into
      batches whose sum stays within the budget, and each batch is merged on
      its own. Reservations differ widely between inputs, which is why the cap
      is on bytes, not on a count of inputs. The partition depends only on the
      input set, so both admission modes see the same batches. A single input
      whose own reservation exceeds the budget aborts exactly as it does today
-     in an unkeyed merge; batching adds no abort of its own. A batched stream
-     yields more parts, clustering across batches is lost, and each part is
-     still sorted by the output descriptor.
+     in an unkeyed merge; batching adds no abort of its own. Batches merge one
+     after another into the same part sink, so batching adds no part boundary
+     and a part holding several batches is sorted and clustered as one; only
+     a target-driven cut can leave two parts of one stream overlapping in key
+     and time ranges (see the #2143 amendment).
    - **Part cuts.** Parts close on the same memory and stored-size targets as
      today, including in the middle of a coarse bucket (issue #711 stands).
      The merge's emission order is deterministic for a fixed input set, so
@@ -232,7 +240,9 @@ What the codebase already guarantees, which bounds the change:
    no matching row is dropped. Filter size becomes `max(512, ceil(9.585 n))`
    rounded up to a multiple of 512 bits instead of a power of two; the probe
    already reduces the block index modulo the block count. The RLOG builder
-   and parser are new functions; RSPAN's bloom is unchanged.
+   and parser are new functions; RSPAN's bloom is unchanged. Compaction
+   carries the scope over from one input, the one decision 2 takes the
+   descriptor from (see the #2143 amendment).
 
 6. **String dictionaries are shared across a row group.** For a string column
    whose distinct values in a row group are at most half its values, the
@@ -380,8 +390,9 @@ the per-object record it would read.
   a version-3 record but refuses to rewrite it, so a tenant config change
   routed to that node fails with a refusal to rewrite a newer record until
   the rollout finishes.
-- Keyed compaction may split a stream into reservation-sized batches, which
-  yields more parts for that stream than an unbatched merge.
+- Keyed compaction may merge a stream in reservation-sized batches. The
+  batches share one part sink, so batching adds no part boundary of its own
+  (see the #2143 amendment).
 - Every RLOG object written before this change becomes unreadable by a build
   that includes it, per ADR-0531. Development stores are wiped or re-ingested.
 - Golden fixtures, `ravel-cli` inspector fixtures, version assertions in
@@ -413,3 +424,50 @@ write the field, and `set_tenant_config` stamps the record version 3.
 - An opted-in tenant can therefore have a key or a narrowed bloom scope
   before the flip, and the ingest flush writes its v5 objects with a sort
   descriptor and narrowed bloom coverage.
+
+## Amendment (2026-10-01): batches share one part sink, admission is narrower than the batch rule, and the bloom scope follows the generation (issue #2143)
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="#2143 amendment" -->
+<!-- amendment-supersedes: phrase="clustering across batches is lost" pointer="#2143 amendment" -->
+<!-- amendment-supersedes: phrase="which yields more parts for that stream than an unbatched merge" pointer="#2143 amendment" -->
+<!-- amendment-supersedes: phrase="so they emit the same sequence and stay byte-identical" pointer="#2143 amendment" -->
+<!-- amendment-supersedes: phrase="every input whose slice of the stream touches one bucket" pointer="#2143 amendment" -->
+
+Decision 2 as first written said that a batched stream yields more parts and
+that clustering across batches is lost, that both admission modes stay
+byte-identical, and that the open-cursor set of a keyed merge is the inputs
+touching one bucket. Decision 5 did not say where a compacted object's bloom
+scope comes from. The implementation differs on each point, and decisions 2
+and 5 and the Consequences now carry the corrected text in place:
+
+- **Batches.** Batches of one stream merge one after another into the same
+  part sink. A batch boundary is not a part boundary, and the writer sorts
+  each part by the output descriptor, so a part holding records of several
+  batches is sorted and clustered as one. Only a cut on the memory or
+  stored-size target can leave two parts of one stream overlapping in key and
+  time ranges, as decision 2's "Part cuts" already allows. Earlier wording
+  held that a batched stream yields more parts, clustering across batches is
+  lost, and batching yields more parts for that stream than an unbatched
+  merge; none of that holds.
+- **Admission modes.** Both modes see the same batches, and when both
+  complete they write the same bytes. They do not always both complete:
+  `EagerAll` charges every reservation of a batch at once, while `Overlap`
+  charges an open cursor at its reconciled residency, so `EagerAll` can
+  refuse a batch that `Overlap` merges. The earlier wording, so they emit the
+  same sequence and stay byte-identical, held only when both complete.
+- **Open-cursor set.** The per-bucket sum decides only whether to batch.
+  `Overlap` opens every pending input whose slice of the stream starts in or
+  before the frontier's coarse bucket, including one whose slice ends before
+  that bucket, so the open set is not bounded by every input whose slice of
+  the stream touches one bucket, and a stream that is one batch can still be
+  refused at admission.
+- **Bloom scope.** Compaction takes the bloom scope of the same input it takes
+  the descriptor from: the input with the highest clustering generation, the
+  first such input in input order on a tie. The scope carries over, not the
+  covered column names, so a string column only other inputs carry is covered
+  or not by that scope's rule. A bloom scope change is to bump the clustering
+  generation as a key change does; the catalog does that in the CLI task of
+  issue #2146. Until it lands, a scope-only change leaves the generation as it
+  was, and inputs written under two scopes at one generation resolve by the
+  tie rule: the scope reaches compacted data when an input written under it
+  is the first input at the highest generation.

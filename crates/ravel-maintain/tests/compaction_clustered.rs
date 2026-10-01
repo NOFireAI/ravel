@@ -1,10 +1,11 @@
 //! RLOG compaction over clustered inputs (ADR-2135 decisions 2, 4 and 5,
 //! docs/log-segment-format.md "Compaction (L0 → L1)"): the output descriptor,
-//! generation and BLOOM coverage come from the highest-generation input, the
-//! merge pushes each stream by `(ts.div_euclid(W), input_index)` for the widest
-//! input bucket `W`, a coarse bucket whose cursor reservations pass the budget
-//! merges in input-order batches into the same parts, and parts are written at
-//! `CompactorConfig::rlog_zstd_level`.
+//! generation and BLOOM scope come from the highest-generation input (the first
+//! such input on a tie), the merge pushes each stream by
+//! `(ts.div_euclid(W), input_index)` for the widest input bucket `W` across
+//! part cuts as well as inside a part, a coarse bucket whose cursor
+//! reservations pass the budget merges in input-order batches into the same
+//! parts, and parts are written at `CompactorConfig::rlog_zstd_level`.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::BTreeSet;
@@ -539,6 +540,45 @@ async fn merge_order_is_bucket_then_input_index() {
     }
 }
 
+/// The pinned part hashes [`order_inputs`] compacts to under a memory target
+/// small enough to cut each stream into several parts.
+const ORDER_MULTI_PART_HASHES: &[&str] = &[
+    "2b27d5771d9e59c556ad175ce21360b838d8a7fa02c950b501060250a30bf4a2",
+    "b3101deba268f08a8e8f2ed8a85fa936fe55a1eb3eafdf6a8a64d2daf2fff820",
+    "cbf8ce717079e18d7ffa00e932a8999d65ab4f905d72ca15bd77db9f3ced0400",
+    "4851b9df83d7f2dbf629c03804bf7e23ea6188ee2f8c9384372f65a6274857f3",
+    "256ccff6107deabaefcf1fa29574909fcc61192848e1405d3a7f73de9ef3d63c",
+    "31f761cc74fd46e0cd2744a817c193f185594c82fbdbf097cf4b9ced732594b4",
+];
+
+/// With the output cut into several parts, which records land in which part
+/// follows the push order, so the parts' bytes pin `(day bucket,
+/// input_index)` across cuts, not only inside one part.
+///
+/// Demonstrated red against: concatenating each stream's inputs in input
+/// order (merge width `i64::MAX`), which the one-part test above passes,
+/// since the writer re-sorts a part and ties keep input order either way;
+/// pushing by raw ts (width 1, the order before ADR-2135); and pushing by the
+/// narrowest input bucket (six hours).
+#[tokio::test]
+async fn merge_order_holds_across_part_cuts() {
+    let config = CompactorConfig {
+        l1_part_memory_target_bytes: 4 * 1024,
+        ..CompactorConfig::default()
+    };
+    let (_objects, parts) = compact(&order_inputs(), &config).await.expect("compact");
+    let hashes: Vec<String> = parts.iter().map(|p| hash_hex(p)).collect();
+    assert_eq!(hashes, ORDER_MULTI_PART_HASHES);
+    for p in &parts {
+        assert_eq!(
+            clustering(p),
+            (Some(descriptor(SortBucketWidth::OneDay, "k")), 2)
+        );
+    }
+    let records: usize = parts.iter().map(|p| scan(p).len()).sum();
+    assert_eq!(records, 64);
+}
+
 // ---------------------------------------------------------------------------
 // BLOOM coverage
 // ---------------------------------------------------------------------------
@@ -620,6 +660,119 @@ async fn coverage_follows_the_highest_generation_input() {
     ])
     .await;
     assert_eq!(covered, all);
+}
+
+/// Hour-keyed records carrying exactly the string attributes `names`.
+fn carrying(tag: &str, names: &[&str], scope: BloomScope, generation: u64) -> Input {
+    let records = (0..4)
+        .map(|i| {
+            record(
+                0,
+                T0 + i * NS_PER_HOUR,
+                &format!("{tag} request {i}"),
+                names
+                    .iter()
+                    .map(|&n| (n, s(&format!("{n}-{tag}-{i}"))))
+                    .collect(),
+            )
+        })
+        .collect();
+    Input {
+        records,
+        descriptor: Some(descriptor(SortBucketWidth::OneHour, "k")),
+        generation,
+        scope,
+    }
+}
+
+fn undeclared(names: &[&str]) -> BloomScope {
+    BloomScope::Undeclared {
+        declared: names.iter().map(|n| n.to_string()).collect(),
+    }
+}
+
+/// When the inputs carry different string columns, the chosen input's
+/// coverage maps to a scope, not to a name list: a column only another input
+/// carries is covered, except when the chosen input covers none of the string
+/// columns it carries (`text`). Output order is column-id order.
+///
+/// Demonstrated red, at the case named, against: covering exactly the chosen
+/// input's covered names (case 1 drops `region`); the union of every input's
+/// coverage (case 2 drops `region`); the intersection (case 1 drops
+/// `region`); mapping a chosen input that covers none of its string columns
+/// to `undeclared` over them rather than to `text` (case 3 adds `region`);
+/// and an output that is always `all`, as before ADR-2135 (case 1 adds
+/// `note`).
+#[tokio::test]
+async fn coverage_maps_the_chosen_scope_over_differing_columns() {
+    // 1. The chosen input covers `k` and leaves `note` uncovered: undeclared
+    //    over `note`, so `region`, which only input 0 carries, is covered.
+    let covered = output_coverage(vec![
+        carrying("x", &["k", "region"], BloomScope::All, 1),
+        carrying("y", &["k", "note"], undeclared(&["note"]), 2),
+    ])
+    .await;
+    assert_eq!(covered, ["severity_text", "body", "k", "region"]);
+
+    // 2. The chosen input covers every string column it carries (its declared
+    //    `region` is a column it does not carry): all.
+    let covered = output_coverage(vec![
+        carrying("x", &["k", "region"], BloomScope::Text, 1),
+        carrying("y", &["k", "note"], undeclared(&["region"]), 2),
+    ])
+    .await;
+    assert_eq!(covered, ["severity_text", "body", "k", "note", "region"]);
+
+    // 3. The chosen input covers none of the string columns it carries: text.
+    let covered = output_coverage(vec![
+        carrying("x", &["k", "region"], BloomScope::All, 1),
+        carrying("y", &["k", "note"], undeclared(&["k", "note"]), 2),
+    ])
+    .await;
+    assert_eq!(covered, ["severity_text", "body"]);
+
+    // 4. The chosen input carries no string column: all, over the columns the
+    //    other input carries.
+    let covered = output_coverage(vec![
+        carrying("x", &["k", "region"], BloomScope::Text, 1),
+        carrying("y", &[], BloomScope::Text, 2),
+    ])
+    .await;
+    assert_eq!(covered, ["severity_text", "body", "k", "region"]);
+}
+
+/// At a generation tie the first input in canonical order is the chosen one:
+/// two generation-0 unkeyed inputs, one `text` and one `all`, write the
+/// coverage of whichever is input 0.
+///
+/// Demonstrated red against the last tied input winning (`>=` flipped to `>`
+/// in `OutputClustering::from_inputs`), the union of the two (`all` in the
+/// first case), the intersection (`text` in the second), and an output that
+/// is always `all` (the first case).
+#[tokio::test]
+async fn a_generation_tie_takes_the_first_inputs_coverage() {
+    let unkeyed = |tag: &str, scope: BloomScope| Input {
+        descriptor: None,
+        generation: 0,
+        ..carrying(tag, &["k", "note", "region"], scope, 0)
+    };
+    let covered = output_coverage(vec![
+        unkeyed("x", BloomScope::Text),
+        unkeyed("y", BloomScope::All),
+    ])
+    .await;
+    assert_eq!(covered, ["severity_text", "body"], "input 0 is text");
+
+    let covered = output_coverage(vec![
+        unkeyed("x", BloomScope::All),
+        unkeyed("y", BloomScope::Text),
+    ])
+    .await;
+    assert_eq!(
+        covered,
+        ["severity_text", "body", "k", "note", "region"],
+        "input 0 is all"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -793,10 +946,11 @@ const UNKEYED_PART_HASHES: &[&str] = &[
 ];
 
 /// Unkeyed inputs merge by `(ts, input_index)` exactly as before ADR-2135:
-/// at the level-3 setting every part's bytes are pinned by hash, the hashes
-/// the pre-change compactor wrote for this corpus. The memory target cuts the
-/// output mid-stream, so a merge pushing records in any other order puts
-/// different records in each part.
+/// at level 3 every part's bytes are pinned by hash, and these are the hashes
+/// the compactor at 655e56fc (fixed level 3, no clustered merge) writes for
+/// this corpus, checked by running the same corpus there. The memory target
+/// cuts the output mid-stream, so a merge pushing records in any other order
+/// puts different records in each part.
 #[tokio::test]
 async fn unkeyed_inputs_merge_exactly_as_before() {
     let config = CompactorConfig {

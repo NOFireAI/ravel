@@ -23,12 +23,17 @@
 //!
 //! # Order under a sort descriptor (ADR-2135 decisions 2 and 5)
 //!
-//! The output takes the sort descriptor, clustering generation, and BLOOM
-//! coverage of the input with the highest clustering generation (the first such
-//! input in canonical order on a tie); with no keyed input it writes no
-//! descriptor and the highest generation, 0 when every input is unclustered.
-//! Compaction reads no tenant config: the descriptor and coverage come only from
-//! the input footers. The writer stores the output in `(stream_ref,
+//! The output takes the sort descriptor, clustering generation, and bloom scope
+//! of the input with the highest clustering generation (the first such input in
+//! canonical order on a tie); with no keyed input it writes no descriptor and the
+//! highest generation, 0 when every input is unclustered. The scope, not the
+//! covered names, is what carries over ([`read_bloom_scope`]), so a string
+//! column only other inputs carry is covered or not by that scope's rule.
+//! Compaction reads no tenant config: the descriptor and scope come only from
+//! the input footers. A bloom scope change is meant to bump the generation; until
+//! the catalog does so (issue #2146), a scope-only change reaches compacted data
+//! only through the tie rule, when an input written under the new scope is the
+//! first one at the highest generation. The writer stores the output in `(stream_ref,
 //! ts.div_euclid(w), keys, ts)` order for the output descriptor's bucket width
 //! `w` and key columns, or `(stream_ref, ts)` without one, ties kept in push
 //! order. The merge pushes each stream's records ordered by `(ts.div_euclid(W),
@@ -195,15 +200,21 @@
 //!
 //! # What a reader must tolerate after the split
 //!
-//! Two consecutive parts of one compaction may carry the same `stream_id`,
-//! with adjacent, non-overlapping `(first_series_id, last_series_id)` bounds
-//! (part `k`'s last equals part `k+1`'s first) and adjacent event-time ranges.
-//! Nothing in the read path prunes on those bounds -- the catalog turns every
-//! part into its own `SegmentRef` and the resolver unions them -- so a split
-//! stream reads back as the same row set in the same order. Record
-//! conservation (`sum(part.sample_count)`, the compaction and ADR-0064 erasure
-//! gates) is likewise unaffected: splitting repartitions records, it never
-//! adds or drops one. The one aggregate that does change is
+//! Two consecutive parts of one compaction may carry the same `stream_id`, with
+//! adjacent `(first_series_id, last_series_id)` bounds (part `k`'s last equals
+//! part `k+1`'s first), since streams are merged one after another in stream-id
+//! order. A part's event-time bounds are its writer footer's `min_ts_ns` and
+//! `max_ts_ns` ([`finalize_part`]). With no keyed input, parts of one stream cover
+//! adjacent, non-overlapping event-time ranges. With a keyed input the merge
+//! order is by coarse bucket, not by ts, so keyed parts of one stream may
+//! overlap in key and event-time ranges on either side of a cut ([`PartSink`]).
+//! The catalog turns every part into its own `SegmentRef` and the resolver
+//! unions them, and time pruning tests each part's own range against the
+//! query's, so overlap between parts costs pruning precision, not correctness
+//! (ADR-2135 decision 2, "Part cuts"), and a split stream reads back as the same
+//! row set. Record conservation (`sum(part.sample_count)`, the compaction and
+//! ADR-0064 erasure gates) is likewise unaffected: splitting repartitions
+//! records, it never adds or drops one. The one aggregate that does change is
 //! `sum(part.series_count)`, which counts a straddling stream once per part it
 //! appears in; it is reported, never used as a gate.
 
@@ -1157,9 +1168,13 @@ impl RecordCounts {
 /// writer re-sorts each part by the output sort descriptor. With no input keyed
 /// (`W` = 1 ns) that order is `(stream_id, ts)` and parts of one stream cover
 /// adjacent, non-overlapping ts ranges. With a key they may overlap in key and
-/// ts ranges, both within one coarse bucket a cut falls inside and across a
-/// reservation batch boundary, which costs pruning precision, not correctness
-/// (ADR-2135 decision 2, "Part cuts"). Either way only the partitioning of
+/// ts ranges on either side of a cut: within the coarse bucket the cut falls
+/// inside, and, when the stream is merged in reservation batches, between the
+/// part holding an earlier batch's records and the part holding a later
+/// batch's. Batches flow into this one sink, so a batch boundary is not itself
+/// a cut, and a part holding records of several batches is re-sorted and
+/// clustered as one. Overlap costs pruning precision, not correctness (ADR-2135
+/// decision 2, "Part cuts"). Either way only the partitioning of
 /// records into parts depends on the cut, never a part's bytes given its record
 /// sequence.
 struct PartSink<'a> {
@@ -2449,12 +2464,26 @@ struct PendingCursor {
 ///
 /// `carriers` is in canonical input order. Each input's reservation is summed
 /// into every coarse bucket `ts.div_euclid(width_ns)` its SKIP_IDX envelope
-/// touches. When no bucket's sum exceeds `budget`, the stream is one batch.
-/// Otherwise the inputs are cut, in input order, greedily on the running sum of
-/// their reservations into batches whose sum stays within `budget`; an input
-/// whose own reservation exceeds the budget is a batch of its own, and its
-/// admission refuses exactly as an unbatched merge would. The partition depends
-/// only on the input set, so both admission modes see the same batches.
+/// touches; envelopes that only abut do not share a bucket. When no bucket's sum
+/// exceeds `budget`, the stream is one batch. Otherwise the inputs are cut, in
+/// input order, greedily on the running sum: an input starts a new batch when
+/// adding its reservation to the current batch's would exceed `budget`, so a
+/// batch of two or more inputs sums to at most `budget`, and an input whose own
+/// reservation exceeds the budget is a batch of its own whose admission refuses
+/// exactly as an unbatched merge would.
+///
+/// The per-bucket sum decides only whether to batch; it does not bound what
+/// admission charges. [`AdmissionMode::Overlap`] opens at once every pending
+/// input whose lower bound's bucket is at or below the frontier, including an
+/// input whose envelope ends before the frontier's bucket, so a stream that is
+/// one batch here can still be refused at admission
+/// (`one_batch_stream_can_still_be_refused_at_admission`).
+///
+/// The partition depends only on the input set, so both admission modes see the
+/// same batches. Within a batch [`AdmissionMode::EagerAll`] charges every
+/// reservation at once, where `Overlap` charges an open cursor at its reconciled
+/// residency, so `EagerAll` can refuse a batch `Overlap` merges; when both
+/// complete they write the same bytes.
 ///
 /// With `width_ns` = 1 (no input keyed) the stream is always one batch, so an
 /// unkeyed merge keeps ADR-0979's admission and refusals unchanged.
@@ -2738,11 +2767,16 @@ fn cursor_reservation_bytes(
 /// equality forces admission so same-bucket ties still resolve by
 /// `input_index` exactly as an all-open merge would. The emitted sequence --
 /// and therefore every part boundary and every part byte -- is identical to
-/// opening every cursor at once; only WHEN a cursor opens changes. The number
-/// of simultaneously open cursors becomes the number of input slices touching
-/// the current coarse bucket: with no input keyed that is `D`, the max
-/// concurrent ts-overlap of the stream's input slices, instead of `n`, the
-/// input count. Admitted cursors open `input_read_concurrency` at a time in
+/// opening every cursor at once; only WHEN a cursor opens changes. The frontier
+/// is the lowest coarse bucket among the open cursors' heads, and every queued
+/// cursor whose lower bound's bucket is at or below it is admitted in the same
+/// round, so a cursor can open while the frontier is past its whole envelope
+/// and the open set can exceed the inputs touching any one bucket. What
+/// admission does bound is a slice that lies wholly after the open ones: it
+/// stays queued until the frontier reaches it, so a stream's open set follows
+/// the overlap of its slices rather than `n`, the input count
+/// (`admission_bounds_open_cursors_to_the_overlap_degree`). Admitted cursors open
+/// `input_read_concurrency` at a time in
 /// canonical order (so a stream carried by hundreds of inputs does not
 /// serialize hundreds of round trips), and a drained cursor releases its
 /// residency immediately. [`AdmissionMode::EagerAll`] opens every cursor up
@@ -3635,6 +3669,20 @@ mod tests {
         cfg: RlogConfig,
         indexed: &[&str],
     ) -> Bytes {
+        seed_l0_clustered(store, writer_id, seq, records, cfg, indexed, None).await
+    }
+
+    /// [`seed_l0`] with the L0 writer's sort descriptor and clustering
+    /// generation under test control.
+    async fn seed_l0_clustered(
+        store: &dyn ObjectStoreBackend,
+        writer_id: Uuid,
+        seq: u64,
+        records: &[LogRecord],
+        cfg: RlogConfig,
+        indexed: &[&str],
+        clustering: Option<(SortDescriptor, u64)>,
+    ) -> Bytes {
         let th = tenant_hash();
         let identity = ObjectIdentity {
             tenant_hash: th.0,
@@ -3643,8 +3691,13 @@ mod tests {
             writer_epoch: EPOCH,
             writer_seq: seq,
         };
+        let (descriptor, generation) = match clustering {
+            Some((d, g)) => (Some(d), g),
+            None => (None, 0),
+        };
         let mut w = RlogWriter::new(cfg, identity)
-            .with_indexed_fields(indexed.iter().map(|s| (*s).to_string()).collect());
+            .with_indexed_fields(indexed.iter().map(|s| (*s).to_string()).collect())
+            .with_sort_descriptor(descriptor, generation);
         for r in records {
             w.push(r.clone()).expect("push");
         }
@@ -7841,6 +7894,405 @@ mod tests {
                 assert_eq!(inputs_carrying_stream, 3);
             }
             other => panic!("expected MergeCursorBudgetExceeded, got {other:?}"),
+        }
+    }
+
+    // --- ADR-2135 D2 reservation batches -------------------------------------
+
+    fn pending(input_index: usize, lower_bound: i64, upper_bound: i64, r: u64) -> PendingCursor {
+        PendingCursor {
+            input_index,
+            lower_bound,
+            upper_bound,
+            reservation: r,
+        }
+    }
+
+    /// Each batch's input indices, in batch order.
+    fn batch_indices(batches: &[Vec<PendingCursor>]) -> Vec<Vec<usize>> {
+        batches
+            .iter()
+            .map(|b| b.iter().map(|c| c.input_index).collect())
+            .collect()
+    }
+
+    /// The partition is pinned index by index. In one shared bucket the cut is
+    /// greedy in input order and only when the running sum would EXCEED the
+    /// budget: at a budget of exactly two reservations, or between two and
+    /// three, inputs 0 and 1 share a batch and input 2 stands alone. Inputs in
+    /// separate buckets, or whose envelopes only abut, are one batch however
+    /// large their whole-stream sum, and so is any stream at width 1.
+    ///
+    /// Demonstrated red against: a cut on `next >= budget` ([[0], [1], [2]] at
+    /// budget 20); a greedy pass from the last input ([[0], [1, 2]]); one batch
+    /// per input once batching is needed ([[0], [1], [2]] at budget 25); the
+    /// whole-stream sum in place of the per-bucket maximum ([[0, 1], [2]] for
+    /// the separate-bucket and abutting cases); and additions sorted before
+    /// removals at one sweep position ([[0], [1]] for the abutting case).
+    #[test]
+    fn reservation_batches_cut_greedily_in_input_order() {
+        let w = 100;
+        let shared = [
+            pending(0, 0, 99, 10),
+            pending(1, 10, 90, 10),
+            pending(2, 50, 60, 10),
+        ];
+        assert_eq!(
+            batch_indices(&reservation_batches(&shared, w, 20)),
+            [vec![0, 1], vec![2]],
+            "a batch may sum to exactly the budget"
+        );
+        assert_eq!(
+            batch_indices(&reservation_batches(&shared, w, 25)),
+            [vec![0, 1], vec![2]],
+            "a budget between two and three reservations"
+        );
+        assert_eq!(
+            batch_indices(&reservation_batches(&shared, w, 30)),
+            [vec![0, 1, 2]],
+            "the bucket's sum within the budget is one batch"
+        );
+
+        let uneven = [
+            pending(0, 0, 99, 10),
+            pending(1, 0, 99, 30),
+            pending(2, 0, 99, 10),
+        ];
+        assert_eq!(
+            batch_indices(&reservation_batches(&uneven, w, 25)),
+            [vec![0], vec![1], vec![2]],
+            "an input over the budget is a batch of its own"
+        );
+        let uneven = [
+            pending(0, 0, 99, 30),
+            pending(1, 0, 99, 10),
+            pending(2, 0, 99, 10),
+        ];
+        assert_eq!(
+            batch_indices(&reservation_batches(&uneven, w, 25)),
+            [vec![0], vec![1, 2]]
+        );
+
+        let separate = [
+            pending(0, 0, 99, 10),
+            pending(1, 100, 199, 10),
+            pending(2, 200, 299, 10),
+        ];
+        assert_eq!(
+            batch_indices(&reservation_batches(&separate, w, 25)),
+            [vec![0, 1, 2]],
+            "the per-bucket maximum, not the whole-stream sum, decides"
+        );
+
+        // Input 0's envelope ends in bucket 0 and input 1's starts in bucket 1;
+        // bounds 99 and 100 sweep to the same position.
+        let abutting = [pending(0, 0, 99, 15), pending(1, 100, 150, 15)];
+        assert_eq!(
+            batch_indices(&reservation_batches(&abutting, w, 20)),
+            [vec![0, 1]],
+            "abutting envelopes do not share a bucket"
+        );
+        let sharing = [pending(0, 0, 100, 15), pending(1, 100, 150, 15)];
+        assert_eq!(
+            batch_indices(&reservation_batches(&sharing, w, 20)),
+            [vec![0], vec![1]],
+            "envelopes that both reach bucket 1 share it"
+        );
+
+        assert_eq!(
+            batch_indices(&reservation_batches(&shared, 1, 5)),
+            [vec![0, 1, 2]],
+            "width 1 is always one batch"
+        );
+        assert_eq!(reservation_batches(&shared, w, 20)[1], [shared[2]]);
+    }
+
+    fn keyed_on_k(width: footer::SortBucketWidth) -> SortDescriptor {
+        SortDescriptor {
+            bucket_width: width,
+            key_columns: vec![footer::SortKeyColumn {
+                name: "k".to_string(),
+                ty: footer::SortKeyType::Str,
+            }],
+        }
+    }
+
+    /// `n` stream-0 records keyed on `k`, `step` ns apart from `base`, each
+    /// body `pad` bytes past its tag.
+    fn keyed_records(tag: &str, base: i64, n: i64, step: i64, pad: usize) -> Vec<LogRecord> {
+        (0..n)
+            .map(|i| {
+                record(
+                    0,
+                    base + i * step,
+                    &format!("{tag} {i:03} {}", "p".repeat(pad)),
+                    vec![(
+                        "k".to_string(),
+                        AttrValue::Str(["a", "b", "c"][(i % 3) as usize].to_string()),
+                    )],
+                )
+            })
+            .collect()
+    }
+
+    /// Seeds each input as writer `i + 1` under `d` at generation 1 and returns
+    /// each input's object bytes and stream-0 cursor reservation.
+    async fn seed_keyed(
+        store: &MemoryStore,
+        inputs: &[Vec<LogRecord>],
+        d: &SortDescriptor,
+    ) -> (Vec<Bytes>, Vec<u64>) {
+        let mut objects = Vec::new();
+        let mut reservations = Vec::new();
+        for (i, recs) in inputs.iter().enumerate() {
+            let writer_id = Uuid::from_u128(i as u128 + 1);
+            let seq = i as u64 + 1;
+            let bytes = seed_l0_clustered(
+                store,
+                writer_id,
+                seq,
+                recs,
+                RlogConfig::default(),
+                &[],
+                Some((d.clone(), 1)),
+            )
+            .await;
+            reservations.push(stream0_reservation(store, writer_id, seq, &bytes).await);
+            objects.push(bytes);
+        }
+        (objects, reservations)
+    }
+
+    /// Compacts keyed `inputs` on a fresh store under `config` with a tracker
+    /// installed: the parts' bytes and `max_open_cursors_per_stream`, or the
+    /// error.
+    async fn compact_keyed(
+        inputs: &[Vec<LogRecord>],
+        d: &SortDescriptor,
+        config: &CompactorConfig,
+    ) -> Result<(Vec<Bytes>, u64)> {
+        let tracker = MergeMemoryTracker::new();
+        let config = CompactorConfig {
+            merge_memory_tracker: Some(tracker.clone()),
+            ..config.clone()
+        };
+        let store = MemoryStore::new();
+        seed_keyed(&store, inputs, d).await;
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(&store, &clock, &config, &bucket()).await?;
+        let (_rec, parts) = read_output(&store).await;
+        Ok((parts, tracker.max_open_cursors_per_stream()))
+    }
+
+    const NS_PER_DAY: i64 = 24 * NS_PER_HOUR;
+    /// A day-aligned event time, so every bucket width divides it.
+    const DAY0: i64 = 20_000 * NS_PER_DAY;
+
+    /// A shared day bucket over a budget of exactly inputs 0 and 1's
+    /// reservations merges as batches {0, 1} then {2}: both admission modes
+    /// complete, at most two cursors are ever open where the one-pass merge
+    /// opens three, and the part's bytes equal the one-pass merge's.
+    ///
+    /// Demonstrated red against `reservation_batches` returning one batch
+    /// always, the behavior before batching (both modes refuse), a cut on
+    /// `next >= budget`, and one batch per input (one cursor open at most).
+    #[tokio::test]
+    async fn a_shared_bucket_merges_in_greedy_input_order_batches() {
+        let d = keyed_on_k(footer::SortBucketWidth::OneDay);
+        let inputs: Vec<Vec<LogRecord>> = (0..3i64)
+            .map(|n| keyed_records(&format!("in{n}"), DAY0 + n, 48, 1_800_000_000_000, 40))
+            .collect();
+        let (_objects, r) = seed_keyed(&MemoryStore::new(), &inputs, &d).await;
+        assert!(
+            r[2] <= r[0] + r[1],
+            "input 2 alone is within the budget: {r:?}"
+        );
+        let budget = r[0] + r[1];
+
+        let (one_pass, one_pass_open) = compact_keyed(&inputs, &d, &CompactorConfig::default())
+            .await
+            .expect("one-pass merge");
+        assert_eq!(one_pass.len(), 1);
+        assert_eq!(one_pass_open, 3, "the one-pass merge opens all three");
+
+        for mode in [AdmissionMode::Overlap, AdmissionMode::EagerAll] {
+            let config = CompactorConfig {
+                merge_cursor_budget_bytes: budget,
+                merge_admission: mode,
+                ..CompactorConfig::default()
+            };
+            let (parts, max_open) = compact_keyed(&inputs, &d, &config)
+                .await
+                .unwrap_or_else(|e| panic!("{mode:?}: batched merge: {e}"));
+            assert_eq!(max_open, 2, "{mode:?}: batch {{0, 1}} opens two cursors");
+            assert_eq!(parts, one_pass, "{mode:?}: batching adds no part boundary");
+        }
+    }
+
+    /// Day-keyed inputs in three different days never share a bucket, so at a
+    /// budget below their whole-stream sum they are still one batch:
+    /// `EagerAll` charges all three reservations at once and refuses at the
+    /// third, while `Overlap` opens one cursor at a time and completes.
+    ///
+    /// Demonstrated red against the whole-stream sum in place of the
+    /// per-bucket maximum, and against a sweep that never retires an envelope
+    /// past its last bucket (both cut {0, 1} then {2}, and `EagerAll`
+    /// completes).
+    #[tokio::test]
+    async fn inputs_in_separate_buckets_are_one_batch() {
+        let d = keyed_on_k(footer::SortBucketWidth::OneDay);
+        let inputs: Vec<Vec<LogRecord>> = (0..3i64)
+            .map(|n| {
+                keyed_records(
+                    &format!("in{n}"),
+                    DAY0 + n * NS_PER_DAY,
+                    48,
+                    1_800_000_000_000,
+                    40,
+                )
+            })
+            .collect();
+        let (_objects, r) = seed_keyed(&MemoryStore::new(), &inputs, &d).await;
+        let budget = r[0] + r[1];
+        assert!(r.iter().all(|&x| x <= budget), "{r:?}");
+        let sum: u64 = r.iter().sum();
+
+        let config = CompactorConfig {
+            merge_cursor_budget_bytes: budget,
+            merge_admission: AdmissionMode::Overlap,
+            ..CompactorConfig::default()
+        };
+        let (parts, max_open) = compact_keyed(&inputs, &d, &config)
+            .await
+            .expect("Overlap merges one bucket at a time");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(max_open, 1, "the slices are time-disjoint");
+
+        let config = CompactorConfig {
+            merge_admission: AdmissionMode::EagerAll,
+            ..config
+        };
+        match compact_keyed(&inputs, &d, &config).await {
+            Err(MaintainError::MergeCursorBudgetExceeded {
+                open_cursors,
+                charged_bytes,
+                required_bytes,
+                budget_bytes,
+                inputs_carrying_stream,
+                site,
+                ..
+            }) => {
+                assert_eq!(
+                    site,
+                    MergeCursorBudgetSite::Admission {
+                        batch_position: 2,
+                        batch_len: 3,
+                    },
+                    "all three admitted as one batch"
+                );
+                assert_eq!(open_cursors, 0);
+                assert_eq!(charged_bytes, 0);
+                assert_eq!(required_bytes, sum);
+                assert_eq!(budget_bytes, budget);
+                assert_eq!(inputs_carrying_stream, 3);
+            }
+            Err(other) => panic!("expected MergeCursorBudgetExceeded, got {other:?}"),
+            Ok(_) => panic!("EagerAll over one batch summing past the budget must refuse"),
+        }
+    }
+
+    /// The per-bucket sum decides only whether to batch. Hour-keyed input 0
+    /// (two records, hours 0 and 5) spans the hours where inputs 1 (hour 1)
+    /// and 2 (hour 3) sit, so no bucket sums past `R0 + max(R1, R2)` and the
+    /// stream is one batch at that budget. Under `Overlap`, input 0 opens
+    /// alone, and once its next record is at hour 5 the frontier admits inputs
+    /// 1 and 2 together, though they share no bucket: the charge reaches input
+    /// 0's residency plus both reservations, and admission refuses at the
+    /// batch's second member.
+    ///
+    /// Demonstrated red against admission narrowed to one input per round
+    /// (input 1 drains before input 2 opens, and the merge completes) and
+    /// against the whole-stream sum in place of the per-bucket maximum and a
+    /// sweep that never retires an envelope past its last bucket (both cut
+    /// {0, 1} then {2}, which the partition assertion rejects).
+    #[tokio::test]
+    async fn one_batch_stream_can_still_be_refused_at_admission() {
+        let d = keyed_on_k(footer::SortBucketWidth::OneHour);
+        let inputs = vec![
+            vec![
+                record(
+                    0,
+                    DAY0,
+                    "y0",
+                    vec![("k".into(), AttrValue::Str("a".into()))],
+                ),
+                record(
+                    0,
+                    DAY0 + 5 * NS_PER_HOUR,
+                    "y1",
+                    vec![("k".into(), AttrValue::Str("a".into()))],
+                ),
+            ],
+            keyed_records("p1", DAY0 + NS_PER_HOUR, 48, 1_000, 200),
+            keyed_records("p2", DAY0 + 3 * NS_PER_HOUR, 48, 1_000, 200),
+        ];
+        let probe = MemoryStore::new();
+        let (objects, r) = seed_keyed(&probe, &inputs, &d).await;
+        let resident_y = stream0_resident_bytes(&probe, Uuid::from_u128(1), 1, &objects[0]).await;
+        let budget = r[0] + r[1].max(r[2]);
+
+        let w = NS_PER_HOUR;
+        let carriers = [
+            pending(0, DAY0, DAY0 + 5 * NS_PER_HOUR, r[0]),
+            pending(1, DAY0 + NS_PER_HOUR, DAY0 + NS_PER_HOUR + 47_000, r[1]),
+            pending(
+                2,
+                DAY0 + 3 * NS_PER_HOUR,
+                DAY0 + 3 * NS_PER_HOUR + 47_000,
+                r[2],
+            ),
+        ];
+        assert_eq!(
+            batch_indices(&reservation_batches(&carriers, w, budget)),
+            [vec![0, 1, 2]],
+            "no bucket sums past the budget"
+        );
+        assert!(
+            resident_y + r[1] + r[2] > budget,
+            "the fixture's two late inputs together pass the budget: {r:?}, {resident_y}"
+        );
+
+        let config = CompactorConfig {
+            merge_cursor_budget_bytes: budget,
+            ..CompactorConfig::default()
+        };
+        assert_eq!(config.merge_admission, AdmissionMode::Overlap);
+        match compact_keyed(&inputs, &d, &config).await {
+            Err(MaintainError::MergeCursorBudgetExceeded {
+                open_cursors,
+                charged_bytes,
+                required_bytes,
+                budget_bytes,
+                inputs_carrying_stream,
+                site,
+                ..
+            }) => {
+                assert_eq!(
+                    site,
+                    MergeCursorBudgetSite::Admission {
+                        batch_position: 1,
+                        batch_len: 2,
+                    },
+                    "inputs 1 and 2 admit together"
+                );
+                assert_eq!(open_cursors, 1);
+                assert_eq!(charged_bytes, resident_y);
+                assert_eq!(required_bytes, resident_y + r[1] + r[2]);
+                assert_eq!(budget_bytes, budget);
+                assert_eq!(inputs_carrying_stream, 3);
+            }
+            Err(other) => panic!("expected MergeCursorBudgetExceeded, got {other:?}"),
+            Ok(_) => panic!("the frontier admits inputs 1 and 2 together and must refuse"),
         }
     }
 
