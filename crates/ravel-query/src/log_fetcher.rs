@@ -11130,19 +11130,55 @@ mod fetch_run_corruption_gate_tests {
         RamRecheck,
     }
 
-    fn poll_once<F: std::future::Future + ?Sized>(
+    /// Occupies the blocking pool's only thread until the returned sender is
+    /// dropped. The pool queues blocking tasks first in, first out, so a disk
+    /// peek spawned after this call cannot start before the drop.
+    fn hold_blocking_pool() -> std::sync::mpsc::Sender<()> {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        drop(tokio::task::spawn_blocking(move || {
+            let _ = held.recv();
+        }));
+        release
+    }
+
+    /// Polls `fut` until `reached` holds after a poll, waiting between polls on
+    /// `fut`'s own wakeups. `fut` finishing first fails the test with
+    /// `checkpoint`, the point it should have stopped at.
+    async fn poll_until<F: std::future::Future + ?Sized>(
         mut fut: std::pin::Pin<&mut F>,
-    ) -> impl std::future::Future<Output = std::task::Poll<F::Output>> + '_ {
-        std::future::poll_fn(move |cx| std::task::Poll::Ready(fut.as_mut().poll(cx)))
+        reached: impl Fn() -> bool,
+        checkpoint: &str,
+    ) {
+        std::future::poll_fn(move |cx| match fut.as_mut().poll(cx) {
+            std::task::Poll::Ready(_) => panic!("the run finished before {checkpoint}"),
+            std::task::Poll::Pending if reached() => std::task::Poll::Ready(()),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        })
+        .await;
     }
 
     /// Runs `fetch_blocks` over a two-block run whose blocks both peek a miss
     /// and are then served from RAM without a GET: the lead block by the RAM
-    /// recheck of `fetch_peeked`, the tail block as `tail` says. Every peek is
-    /// driven to a known point by polling and reading the RAM tier's miss count;
-    /// an attempt that ran past that point is rebuilt. The disk tier declines
-    /// every entry, so each admission lands in RAM only.
-    async fn late_ram_served_run(
+    /// recheck of `fetch_peeked`, the tail block as `tail` says. The run gets a
+    /// runtime with one blocking thread, which [`hold_blocking_pool`] keeps
+    /// busy, so each `spawn_blocking` disk peek is held behind a gate the test
+    /// releases: the run stops at a peek once its RAM tier miss is counted. The
+    /// disk tier declines every entry, so each admission lands in RAM only.
+    fn late_ram_served_run(
+        tail: TailServe,
+    ) -> (
+        ravel_types::accounting::QueryAccountingSnapshot,
+        BlockRangeStats,
+    ) {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime")
+            .block_on(late_ram_served_run_on_one_blocking_thread(tail))
+    }
+
+    async fn late_ram_served_run_on_one_blocking_thread(
         tail: TailServe,
     ) -> (
         ravel_types::accounting::QueryAccountingSnapshot,
@@ -11170,87 +11206,89 @@ mod fetch_run_corruption_gate_tests {
         let seg = seg_ref(object.len() as u64);
         let pin = EtagPin::default();
 
-        let mut attempts = 0;
-        'attempt: loop {
-            attempts += 1;
-            assert!(
-                attempts <= 20,
-                "a disk peek finished inside the poll that started it every time"
-            );
-            let store = MemoryStore::new();
-            store
-                .put(KEY, object.clone(), PutOptions::default())
-                .await
-                .expect("put");
-            let tmp = tempfile::TempDir::new().expect("tempdir");
-            let tiered = Arc::new(TieredCache::new(
-                Cache::new(limits),
-                DiskCache::new(tmp.path().to_path_buf(), disk_declines_all),
-            ));
-            let ram_metrics = tiered.ram_metrics();
-            let ram_misses = || ram_metrics.snapshot().misses;
-            let fetcher = BlockRangeFetcher::new(Arc::new(store)).with_cache(tiered.clone());
-            let acc = QueryAccounting::new();
-            let mut stats = BlockRangeStats::default();
-            let mut asm = ObjectAssembler::new(&fetcher.assembly_gauge, object.len() as u64);
-            let mut fetch = Box::pin(fetcher.fetch_blocks(
-                &seg,
-                TENANT,
-                &pin,
-                &extents,
-                QueryPhase::Scan,
-                &mut asm,
-                &acc,
-                &mut stats,
-            ));
+        let store = MemoryStore::new();
+        store
+            .put(KEY, object.clone(), PutOptions::default())
+            .await
+            .expect("put");
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let tiered = Arc::new(TieredCache::new(
+            Cache::new(limits),
+            DiskCache::new(tmp.path().to_path_buf(), disk_declines_all),
+        ));
+        let ram_metrics = tiered.ram_metrics();
+        let ram_misses = || ram_metrics.snapshot().misses;
+        let fetcher = BlockRangeFetcher::new(Arc::new(store)).with_cache(tiered.clone());
+        let acc = QueryAccounting::new();
+        let mut stats = BlockRangeStats::default();
+        let mut asm = ObjectAssembler::new(&fetcher.assembly_gauge, object.len() as u64);
+        let mut fetch = Box::pin(fetcher.fetch_blocks(
+            &seg,
+            TENANT,
+            &pin,
+            &extents,
+            QueryPhase::Scan,
+            &mut asm,
+            &acc,
+            &mut stats,
+        ));
 
-            // Stopped in the lead block's disk peek after its RAM peek missed.
-            if poll_once(fetch.as_mut()).await.is_ready() || ram_misses() != 1 {
-                continue;
-            }
-            tiered.insert(lead_key, lead_block.clone());
-            // Then in the tail block's disk peek: the lead's peek missed, and
-            // the run has not reached `fetch_run` yet.
-            loop {
-                if poll_once(fetch.as_mut()).await.is_ready() || ram_misses() > 2 {
-                    continue 'attempt;
-                }
-                if ram_misses() == 2 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-            if let TailServe::RamRecheck = tail {
-                // Then in `fetch_run`'s re-peek of the tail block, after the
-                // lead was served by the RAM recheck and before the tail's
-                // own `fetch_peeked`.
-                loop {
-                    if poll_once(fetch.as_mut()).await.is_ready()
-                        || tiered.is_in_flight(&tail_key)
-                        || acc.snapshot().total_s3_requests() > 0
-                        || ram_misses() > 3
-                    {
-                        continue 'attempt;
-                    }
-                    if ram_misses() == 3 {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            }
-            tiered.insert(tail_key, tail_block.clone());
-            assert_eq!(tiered.disk_len(), 0, "the disk tier declined both blocks");
-            fetch.await.expect("both blocks verify");
-            assert_eq!(
-                asm.slice(KEY, 0, 16).expect("lead placed").as_ref(),
-                lead_block.as_ref()
-            );
-            assert_eq!(
-                asm.slice(KEY, 16, 16).expect("tail placed").as_ref(),
-                tail_block.as_ref()
-            );
-            return (acc.snapshot(), stats);
-        }
+        // Each gate is queued before the one ahead of it is released, so it
+        // takes the blocking thread before the next disk peek can.
+        let lead_peek_gate = hold_blocking_pool();
+        poll_until(
+            fetch.as_mut(),
+            || ram_misses() >= 1,
+            "the lead block's disk peek",
+        )
+        .await;
+        assert_eq!(ram_misses(), 1, "held in the lead block's disk peek");
+        tiered.insert(lead_key, lead_block.clone());
+
+        // Then in the tail block's disk peek: the lead's peek missed, and the
+        // run has not reached `fetch_run` yet.
+        let tail_peek_gate = hold_blocking_pool();
+        drop(lead_peek_gate);
+        poll_until(
+            fetch.as_mut(),
+            || ram_misses() >= 2,
+            "the tail block's disk peek",
+        )
+        .await;
+        assert_eq!(ram_misses(), 2, "held in the tail block's disk peek");
+
+        let re_peek_gate = if let TailServe::RamRecheck = tail {
+            // Then in `fetch_run`'s re-peek of the tail block, after the lead
+            // was served by the RAM recheck and before the tail's own
+            // `fetch_peeked`.
+            let re_peek_gate = hold_blocking_pool();
+            drop(tail_peek_gate);
+            poll_until(
+                fetch.as_mut(),
+                || ram_misses() >= 3,
+                "fetch_run's re-peek of the tail block",
+            )
+            .await;
+            assert_eq!(ram_misses(), 3, "held in the tail block's re-peek");
+            assert!(!tiered.is_in_flight(&tail_key));
+            re_peek_gate
+        } else {
+            tail_peek_gate
+        };
+        assert_eq!(acc.snapshot().total_s3_requests(), 0);
+        tiered.insert(tail_key, tail_block.clone());
+        assert_eq!(tiered.disk_len(), 0, "the disk tier declined both blocks");
+        drop(re_peek_gate);
+        fetch.await.expect("both blocks verify");
+        assert_eq!(
+            asm.slice(KEY, 0, 16).expect("lead placed").as_ref(),
+            lead_block.as_ref()
+        );
+        assert_eq!(
+            asm.slice(KEY, 16, 16).expect("tail placed").as_ref(),
+            tail_block.as_ref()
+        );
+        (acc.snapshot(), stats)
     }
 
     /// A late RAM serve is a cache miss with zero GETs and zero fetched bytes
@@ -11259,9 +11297,9 @@ mod fetch_run_corruption_gate_tests {
     ///
     /// FLIP: restoring `accounting.record_cache_miss()` before the non-lead
     /// block's `fetch_peeked` in `fetch_run` makes `cache_misses` read 3.
-    #[tokio::test]
-    async fn a_late_ram_served_log_run_counts_one_miss_per_block_and_no_get() {
-        let (snapshot, stats) = late_ram_served_run(TailServe::RamRecheck).await;
+    #[test]
+    fn a_late_ram_served_log_run_counts_one_miss_per_block_and_no_get() {
+        let (snapshot, stats) = late_ram_served_run(TailServe::RamRecheck);
         assert_eq!(snapshot.cache_misses, 2, "one miss per block");
         assert_eq!(snapshot.cache_hits, 0);
         assert_eq!(snapshot.cache_bytes, 0);
@@ -11278,9 +11316,9 @@ mod fetch_run_corruption_gate_tests {
     /// FLIP: restoring `accounting.record_cache_hit()` and
     /// `accounting.add_cache_bytes(..)` on that re-peek's hit makes
     /// `cache_hits` read 1 and `cache_bytes` 16.
-    #[tokio::test]
-    async fn a_late_ram_served_log_run_counts_no_hit_for_a_re_peeked_block() {
-        let (snapshot, stats) = late_ram_served_run(TailServe::RePeekHit).await;
+    #[test]
+    fn a_late_ram_served_log_run_counts_no_hit_for_a_re_peeked_block() {
+        let (snapshot, stats) = late_ram_served_run(TailServe::RePeekHit);
         assert_eq!(snapshot.cache_misses, 2, "one miss per block");
         assert_eq!(snapshot.cache_hits, 0);
         assert_eq!(snapshot.cache_bytes, 0);
