@@ -1,6 +1,7 @@
 //! `ravel-cli clustering-key show` and `ravel-cli bloom-scope show` (issue
 //! #2145): the output for each state of config record fields 13 and 14,
-//! including a raw format-version-3 record no writer in this build can stamp.
+//! including a raw format-version-3 record, which no ingest, compaction or CLI
+//! path in this build writes.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -97,7 +98,8 @@ async fn clustering_key_show_reports_absent_before_the_writer_flip() {
          generation 0)\n"
     );
 
-    // This build's writer stamps version 2, which cannot carry field 13.
+    // This write carries no storage-layout opt-in, so it stamps version 2,
+    // which cannot carry field 13.
     let config = TenantConfig {
         typed_attr_columns: Some(vec![DeclaredTypedColumn {
             key: "svc".to_string(),
