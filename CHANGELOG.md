@@ -471,6 +471,29 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   so served, and is redundant when the block rode a flight whose leader
   already verified it. Such a block is no longer counted in the fetch span's
   `s3_requests` and `s3_bytes` either, since this read made no GET for it.
+- **Query processes classify fold lag against the maintain processes' fold
+  interval** (issue #2074). A request-budget refusal names fold lag once the
+  unsealed tail passes `healthy_tail_max + fold_interval + head_cache_ttl`
+  (ADR-1306 decision 6), and a `--mode query` process, which runs no scheduled
+  fold and may not set `--fold-interval-secs`, always used the 300 s default.
+  With the maintain processes folding every 900 s, its refusals blamed a fold
+  that was keeping up for tails between 8,730 s and 9,330 s. The new
+  `--fold-lag-interval-secs` flag, accepted only in `--mode query`, sets the
+  interval that classification uses and configures no fold; `--mode all`,
+  `--mode maintain` and `--mode gateway` refuse it, and so does a zero value.
+  `--mode all` classifies against its own `--fold-interval-secs`; maintain and
+  gateway serve no query. The operator renders it on the query Deployment from
+  `spec.maintain.fold.intervalSecs` only when the maintain Deployment renders
+  (`spec.maintain.enabled` true), its fold runs (`spec.maintain.fold.disabled`
+  false), and that field is set. Upgrade `spec.image` to a `ravel-server`
+  image from this release or newer before or together with the operator: on
+  a cluster where those three conditions hold, the upgraded operator adds the
+  flag to the query Deployment and rolls the query pods, and an older server
+  rejects the unknown flag at startup, so the pods restart-loop. From this
+  release on, editing `spec.maintain.fold.intervalSecs`,
+  `spec.maintain.fold.disabled` or `spec.maintain.enabled` rolls the query
+  pods as well as the maintain pods whenever the change adds, removes or
+  changes the flag.
 - **A zero loop interval is refused at startup** (issue #2256).
   `--maintain-interval-secs 0`, `--fold-interval-secs 0`,
   `--alert-eval-interval-secs 0` and `--oidc-jwks-refresh-interval-secs 0`

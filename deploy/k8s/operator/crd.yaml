@@ -337,7 +337,7 @@
                         "type": "boolean"
                       },
                       "fold": {
-                        "description": "Catalog fold tuning, rendered onto this tier alone (ADR-1693). The\nscheduled fold runs in `--mode maintain` and `--mode all`, so these are\nthe only replicas the flags reach; a `maintain` tier turned off by\n`enabled: false` renders no fold flags because it renders no\nDeployment.",
+                        "description": "Catalog fold tuning, rendered onto this tier's fold flags (ADR-1693).\nThe scheduled fold runs in `--mode maintain` and `--mode all`, so these\nare the only replicas the fold flags reach; a `maintain` tier turned\noff by `enabled: false` renders no fold flags because it renders no\nDeployment. When this fold runs, `intervalSecs` also reaches the query\ntier as `--fold-lag-interval-secs`, the interval its request-budget\nrefusals classify fold lag against.",
                         "nullable": true,
                         "properties": {
                           "disabled": {
