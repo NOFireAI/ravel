@@ -349,6 +349,28 @@ pub struct InputCursorPricing {
     pub string_cols: u64,
 }
 
+/// Whether a run over `bucket` writes `.rlog` parts: a logs bucket, or the
+/// query-audit shard, whose records ride RLOG (`crate::query_audit`).
+fn writes_rlog(bucket: &Bucket) -> bool {
+    match bucket.signal {
+        ravel_types::Signal::Logs => true,
+        ravel_types::Signal::Audit => bucket.shard == crate::query_audit::QUERY_AUDIT_SHARD,
+        _ => false,
+    }
+}
+
+/// Refuse an out-of-range [`CompactorConfig::rlog_zstd_level`] for a run over
+/// `bucket` that writes `.rlog` parts. Every entry point that can reach
+/// [`merge_catalogs`] (compaction, format migration, the shared rewrite
+/// primitive, and the erasure rewrite) calls this before its first store
+/// request; a bucket of another signal is not checked.
+pub(crate) fn check_rlog_zstd_level(config: &CompactorConfig, bucket: &Bucket) -> Result<()> {
+    if writes_rlog(bucket) {
+        crate::config::validate_rlog_zstd_level(config.rlog_zstd_level)?;
+    }
+    Ok(())
+}
+
 /// The logs codec: implements the [`SegmentCodec`] seam for `.rlog` objects.
 pub struct RlogCodec;
 
@@ -963,6 +985,8 @@ pub(crate) async fn merge_catalogs(
     retain_bytes: bool,
     keep: &mut (dyn FnMut(&LogRecord) -> Result<bool> + Send),
 ) -> Result<MergeOutput> {
+    // The entry points refuse a bad level before their first store request
+    // ([`check_rlog_zstd_level`]); this covers a direct `build_parts` caller.
     let zstd_level = crate::config::validate_rlog_zstd_level(config.rlog_zstd_level)?;
     // Global stream_ref remap + cross-object stream-identity check. The
     // merged set is the sorted union of every input's STREAM_DIR; the dense

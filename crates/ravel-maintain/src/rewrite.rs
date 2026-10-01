@@ -193,6 +193,7 @@ async fn load_then_rewrite<C: SegmentCodec>(
     conservation: impl ConservationPredicate,
     start_ns: i64,
 ) -> Result<RewriteOutcome> {
+    crate::rlog::check_rlog_zstd_level(config, bucket)?;
     let inputs = load_inputs_with_ledger(
         store,
         bucket,
@@ -449,6 +450,7 @@ async fn migrate_bucket_format_scoped(
     bucket: &Bucket,
     target_version: u32,
 ) -> Result<MigrateOutcome> {
+    crate::rlog::check_rlog_zstd_level(config, bucket)?;
     let start_ns = clock.now_ns();
     if !bucket.is_sealed(start_ns, config) {
         return Ok(MigrateOutcome::NotSealed);

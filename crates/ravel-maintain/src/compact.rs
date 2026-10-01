@@ -211,6 +211,7 @@ async fn compact_bucket_scoped(
     bucket: &Bucket,
     coordinate: Coordinate,
 ) -> Result<(ClaimedCompaction, Option<ClaimAcquisition>)> {
+    crate::rlog::check_rlog_zstd_level(config, bucket)?;
     let start_ns = clock.now_ns();
     if !bucket.is_sealed(start_ns, config) {
         return Ok((ClaimedCompaction::Ran(CompactionOutcome::NotSealed), None));
