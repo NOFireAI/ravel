@@ -679,8 +679,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a Parquet table's manifest, grants record or data file
   (`ResolveError::Store`, `GrantsError::Store` or `ParquetReadError::Store`
   with a `StoreError::Corrupted` source), which answered 503, answers 500 too
-  (issue #2291). Other store errors,
-  timeouts, cancellation and admission refusals keep their classes.
+  (issue #2291). A Parquet manifest or grants record above the version
+  ceiling this build reads (`ManifestError::UnsupportedVersion` or
+  `GrantsError::UnsupportedVersion`), which answered 500, now answers the
+  retryable 503, since a peer on a newer build can read it (issue #2304).
+  Other store errors, timeouts, cancellation and admission refusals keep
+  their classes.
 - **A catalog decode declared over its ceiling now evicts decoded-cache entries
   until the budget admits it or the caches are empty** (issue #2132). Such a
   decode is charged 0 bytes, and a budget pushed over its limit by
