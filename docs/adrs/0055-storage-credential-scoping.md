@@ -176,6 +176,13 @@ the final `sys/qualification` record. All four are corrected in place above
 rather than left wrong with a note, since this ADR had not yet been acted
 on by any deployment at the time of correction.
 
+The table also omits the control-plane keys `sys/auth`, `sys/t/<hash>`, the
+`sys/maintain/memo/` listing, the tenant config record `t/<hash>/config`, the
+key-epoch record `t/<hash>/enc`, the metric metadata record `t/<hash>/m/meta`,
+and the alert evaluator's lease and state memo under `t/<hash>/a/`, along with
+the alert transition writes the Query role makes; the control-plane key
+amendment below adds them and lists every control-plane key each role uses.
+
 This is not a literal "ingest, compaction, query, and sweep" four-way split
 — sweep is not split into its own process here. Sweep
 runs inside the same `Mode::Maintain` process as compaction and retention
@@ -321,6 +328,14 @@ where the backend distinguishes it, `s3:DeleteObjectVersion`) on:
 - `t/<hash>/u/<AUDIT_HOLD_SHARD>/**` (legal-hold records only — the query-audit
   shard was removed from this deny by the query-audit shard amendment below,
   so it can be age-swept; legal-hold shard 0 stays deny-delete-forever)
+- `sys/auth` and `sys/t/<hash>`, added by the control-plane key amendment below:
+  a deleted `sys/auth` reads as absent and installs an empty token map, silently
+  revoking every durable token, and `sys/t/<hash>` recovery manifests are
+  write-once (ADR-0050). No role grants a delete on either, so the deny is
+  belt-and-suspenders like the other create-once keys here.
+- `t/<hash>/enc`, also added by the control-plane key amendment below, as the
+  `t/<hash>/enc` key-epoch amendment asked: the record is append-only history,
+  and a deleted one reads as "no per-tenant key was ever configured".
 
 This closes the brick-the-deployment risk directly: nobody, including a fully compromised Maintain
 process, can delete `sys/tenancy` and brick every process's fail-closed
@@ -657,6 +672,10 @@ bootstrap fail closed with an access-denied error on every affected role's
 first `--tenant-kms-config` startup — this is flagged as a required
 follow-up, not fixed here.
 
+The control-plane key amendment below provisions it: the read, write and
+deny-delete above are in the templates. The `ListBucket` prefix is not, because
+no code lists `t/<hash>/enc`.
+
 ## Amendment: the selective-erasure `del/` paths
 
 <!-- amendment-applies: sections="1. Four roles, mapped to existing process boundaries|2. Durable-data delete stays exclusively with Maintain|Consequences" pointer="selective-erasure `del/` amendment" -->
@@ -961,3 +980,136 @@ context's list of what the code deletes, §1's Query and Maintain delete
 columns, §2's list of what a compromised Maintain credential can delete, the
 recaps in the query-audit and `del/` amendments, and the worker-heartbeat
 amendment's sentence that left this case undecided.
+
+## Amendment (2026-10-01): the control-plane keys each role reads and writes
+
+<!-- amendment-applies: sections="1. Four roles, mapped to existing process boundaries|3. Deny-delete, everywhere, on the four prefixes nothing deletes|Amendment: the `t/<hash>/enc` key-epoch record needs a read/write grant" pointer="control-plane key amendment" -->
+
+§1's table was derived from the data-path call sites and left
+out eight control-plane keys the code reads or writes in a named role's
+mode, and the alert evaluator's transition writes. IAM is default-deny, so
+each omission was a refused request under the shipped templates. The grants
+below are the narrowest that cover each call:
+
+- **`sys/auth`, the durable bearer-token map (ADR-0066 decision 6).** Gateway
+  and Query read it: on a keyed bucket `Mode::Gateway`, `Mode::Query` and
+  `Mode::All` refresh it at startup, on a horizon and on a token miss, and a
+  process that cannot refresh fails durable-token auth closed: its tokens
+  never resolve before a first refresh, and stop resolving past the
+  hard-stale bound. `GatewayRead` and `QueryRead` gain `sys/auth`. Admin
+  writes it: `ravel-cli tenant token upsert` and `revoke` read the map and
+  PUT it back with `CreateIfAbsent` or `CasVersion`, so `AdminWrite` gains
+  `sys/auth`. No server role writes it; the only production writers are
+  `ravel-cli` under Admin and the operator, which uses the shared storage
+  credential its CRD names rather than one of these templates. Nothing
+  deletes it.
+- **`sys/t/<hash>`, the per-tenant recovery manifest (ADR-0050 section 3).**
+  Every ingest handler writes it with `CreateIfAbsent` on a keyed tenant's
+  first request in a process, so it is a Gateway write. `GatewayWrite`
+  gains `sys/t/*`. A refused write does not fail ingest, but the tenant gets
+  no manifest and the writer retries on every later request.
+- **`sys/maintain/memo/`, the maintain memo snapshots (ADR-0065 decision 3).**
+  The warm start LISTs the prefix and then GETs each snapshot. The GET and
+  the snapshot PUT were already covered by `sys/maintain/*`; the LIST was
+  not, and a refused LIST degrades to a cold start: each maintain cycle logs
+  a warning and retries.
+  `MaintainList` gains `sys/maintain/memo/*`.
+- **`t/<hash>/config`, the tenant config record (ADR-0066 decision 6).** It is
+  tenant-scoped, not per-signal, and `read_config` GETs it and propagates every
+  store error except `NotFound`, so a refused GET is not read as "no overrides"
+  but fails each reading role in its own mode: Maintain's
+  `resolve_retention_window_ns` maps it to `MaintainError::Invariant` and every
+  retention pass fails; Query's declared-columns source never resolves the
+  durable `typed_attr_columns` override, so queries run on the base schema; and
+  Gateway's lifecycle config-limits refresh fails every cycle, so per-tenant
+  admission overrides never apply. `MaintainRead`, `QueryRead` and `GatewayRead`
+  gain `t/*/config`; Admin already reads it through its blanket `t/*`. The only
+  production writers are `ravel-cli typed-attr-column set`, `clustering-key set`
+  and `clear`, and `bloom-scope set` under Admin, which GET the record and PUT
+  it back with `CreateIfAbsent` or `CasVersion`, so `AdminWrite` gains
+  `t/*/config` (issue #2340). No server role writes it, so no server template
+  gains a write grant.
+- **`t/<hash>/enc`, the per-tenant KMS key-epoch record (ADR-0062 decision
+  1b).** With `--tenant-kms-config` set, startup runs `configure_tenant_kms` in
+  every mode: for each configured tenant it GETs the record and, for a tenant
+  with no record or a changed key, PUTs it with `CreateIfAbsent` for epoch 0
+  and `CasVersion` for each appended epoch. Only `NotFound` reads as absence,
+  so a refused GET or PUT stops the process from starting. `GatewayRead`,
+  `QueryRead`, `MaintainRead`, `GatewayWrite`, `QueryWrite` and
+  `MaintainWrite` gain `t/*/enc`. Admin reads it for `ravel-cli
+  verify-custody` through its blanket `t/*` and writes it nowhere. Nothing
+  lists it, so no `ListBucket` prefix is added, unlike the follow-up the
+  `t/<hash>/enc` amendment above proposed.
+- **`t/<hash>/m/meta`, the metric metadata record (ADR-0085 decision 1).** The
+  ingest metadata sink in `Mode::Gateway` and `Mode::All` GETs it and PUTs it
+  with `CreateIfAbsent` or `CasVersion`; the query metadata cache in
+  `Mode::Query` and `Mode::All` GETs it to serve `/api/v1/metadata`. Both log
+  and swallow a refusal, so metric metadata was never persisted or served.
+  `GatewayRead`, `GatewayWrite` and `QueryRead` gain `t/*/m/meta`.
+- **`t/<hash>/a/alert-lease` and `t/<hash>/a/state/latest`, the alert
+  evaluator's lease and state memo (ADR-0043).** The evaluator runs inside the
+  query-serving block, so under the Query role. Each tick it GETs the memo,
+  PUTs the lease with `CreateIfAbsent` or, when one exists, GETs it and PUTs
+  it back with `CasVersion`, and the lease holder overwrites the memo. A
+  refused lease PUT reports the lease unavailable and evaluates no rule.
+  `QueryRead` and `QueryWrite` gain both keys. Nothing releases or deletes
+  either. The evaluator also publishes each transition as an L0 data object
+  and a commit record with `CreateIfAbsent`; the Query role could read those
+  but not write them, so `QueryWrite` gains `t/*/a/l0/*` and `t/*/a/c/*`,
+  scoped to the alerts signal.
+- **The maintain alert retention reads.** `alert_keep_set` GETs the state memo
+  and propagates every error but `NotFound`, so a refused GET skipped alert
+  retention for the tenant every tick: `MaintainRead` gains
+  `t/*/a/state/latest`. `alert_keyspace_is_empty` LISTs `t/<hash>/a/` and
+  `quarantine/t/<hash>/a/` for a tenant with no alert history, and a refused
+  LIST logged a warning and ran the orphan sweep anyway: `MaintainList` gains
+  both as `s3:prefix` values `t/*/a/` and `quarantine/t/*/a/`.
+
+`sys/auth`, `sys/t/*` and `t/*/enc` also join the §3 deny-delete set in every
+template: no role deletes any of them on its normal path, a deleted `sys/auth`
+reads as absent and installs an empty token map that revokes every durable
+token, `sys/t/*` recovery manifests are write-once (ADR-0050), and a deleted
+key-epoch record reads as "no per-tenant key was ever configured", so
+`verify-custody` stops checking the tenant and the next startup rewrites its
+history from epoch 0.
+
+With these grants, sixteen control-plane keys and prefixes are read or written
+on a role's normal path, and every one is granted to the roles that use it.
+Admin reads all of them through `t/*` and `sys/*`; the operations below are
+the others:
+
+- `sys/tenancy`: Gateway, Query and Maintain get and put; Admin puts.
+- `sys/qualification`: Gateway, Query and Maintain get; Admin puts.
+- `sys/qualify/*`: Admin puts and deletes.
+- `sys/gc`: Gateway and Query get; Maintain gets and puts; Admin puts.
+- `sys/auth`: Gateway and Query get; Admin puts.
+- `sys/t/*`: Gateway puts.
+- `sys/maintain/workers/*`: Maintain lists, gets, puts and deletes.
+- `sys/maintain/memo/*`: Maintain lists, gets and puts.
+- `sys/maintain/claims/compaction/*`: Maintain gets and puts.
+- `sys/query/workers/*`: Query lists, gets and puts; Maintain lists and
+  deletes.
+- `admission/query/*`: Query lists, gets and puts.
+- `t/*/config`: Gateway, Query and Maintain get; Admin puts.
+- `t/*/enc`: Gateway, Query and Maintain get and put.
+- `t/*/m/meta`: Gateway gets and puts; Query gets.
+- `t/*/a/alert-lease`: Query gets and puts.
+- `t/*/a/state/latest`: Query gets and puts; Maintain gets.
+
+Three groups of control-plane calls stay ungranted, because each needs a
+decision rather than a narrow grant: the Parquet table keys under
+`t/<hash>/pq/` and the `sys/pq-probe/` probe object, which Query reads and
+Admin writes, lists and deletes; the compaction claims and L1 output
+`ravel-cli maintain compact-bucket` and `compact-tenant` write under Admin; and
+the dead admission-snapshot deletes Gateway's reconcile issues, which §2
+reserves for Maintain. `deploy/iam/README.md` lists their call sites.
+
+Two candidates were examined and are not granted. Query still deletes
+nothing: a draining query worker overwrites its own record and Maintain
+reaps it, as the query-worker reap amendment records. Gateway and Query
+still cannot create `sys/gc`: every mode runs the bootstrap at startup, but
+§4 keeps creation with Maintain and Admin, and the deployment guides and
+the operator start Maintain first on a fresh bucket for that reason.
+
+Recorded as an appended amendment, with an inline pointer added to §1, §3 and
+the `t/<hash>/enc` amendment.
