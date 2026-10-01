@@ -3022,24 +3022,30 @@ async fn alert_keep_set(
     )))
 }
 
-/// Whether the tenant's alert commit prefix holds nothing, in one bounded
-/// listing.
+/// Whether `prefix` holds nothing, in one bounded listing.
 ///
 /// A page that carries a continuation token counts as non-empty even when its
 /// own object list is empty: the store is entitled to return one, and the
-/// conservative answer here is the one that keeps the existing skip accounting.
+/// conservative answer is the one under which every caller still does its
+/// work.
+async fn prefix_is_empty(store: &dyn ObjectStoreBackend, prefix: &str) -> anyhow::Result<bool> {
+    let page = store.list(prefix, None).await?;
+    Ok(page.objects.is_empty() && page.next.is_none())
+}
+
+/// Whether the tenant's alert commit prefix holds nothing, by
+/// [`prefix_is_empty`].
 async fn alert_commit_prefix_is_empty(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
 ) -> anyhow::Result<bool> {
     let prefix = keys::commit_shard_prefix(tenant, Signal::Alerts, ALERT_SHARD)?;
-    let page = store.list(&prefix, None).await?;
-    Ok(page.objects.is_empty() && page.next.is_none())
+    prefix_is_empty(store, &prefix).await
 }
 
 /// Whether the alerts shard's `sweep_shard` has nothing to look at for
-/// `tenant`, in at most two bounded listings, each read like
-/// [`alert_commit_prefix_is_empty`]'s.
+/// `tenant`, in at most two bounded listings, each read by
+/// [`prefix_is_empty`].
 ///
 /// The commit prefix alone cannot answer it. Rule 1 exists for the data object
 /// whose first commit record never landed, which sits under `l0/` beside an
@@ -3057,8 +3063,7 @@ async fn alert_keyspace_is_empty(
     let keyspace = format!("t/{}/{}/", tenant.to_hex(), Signal::Alerts.key_prefix());
     let quarantine = format!("quarantine/{keyspace}");
     for prefix in [keyspace, quarantine] {
-        let page = store.list(&prefix, None).await?;
-        if !page.objects.is_empty() || page.next.is_some() {
+        if !prefix_is_empty(store, &prefix).await? {
             return Ok(false);
         }
     }
@@ -11449,9 +11454,9 @@ mod alert_retention_tests {
     /// continuation token: the keyspace may hold records, so it is counted as
     /// `absent`, exactly once, not taken for an unused alert keyspace.
     ///
-    /// Watch it fail: in `alert_commit_prefix_is_empty`, drop
-    /// `&& page.next.is_none()`. The empty first page then reads as an unused
-    /// keyspace and nothing is counted.
+    /// Watch it fail: in `prefix_is_empty`, drop `&& page.next.is_none()`. The
+    /// empty first page then reads as an unused keyspace and nothing is
+    /// counted.
     #[tokio::test]
     async fn an_empty_first_page_with_a_continuation_token_is_not_an_unused_keyspace() {
         let memory = MemoryStore::new();
@@ -11487,6 +11492,58 @@ mod alert_retention_tests {
             skipped_once(AlertRetentionSkipReason::Absent)
         );
         assert_eq!(alert_keys(&store, &tenant).await, keys_of(&[&written]));
+    }
+
+    /// The same page shape at the orphan sweep's gate: the gate's listing of
+    /// the alert keyspace comes back empty with a continuation token, over a
+    /// keyspace that really holds a record-less data object. The gate reads
+    /// that as non-empty, issues no quarantine listing, and the sweep runs and
+    /// quarantines the orphan.
+    ///
+    /// Watch it fail: in `prefix_is_empty`, drop `&& page.next.is_none()`. The
+    /// gate then lists the quarantine mirror too, finds it empty and skips the
+    /// sweep, and the listings read a list of 2 against 8.
+    #[tokio::test]
+    async fn an_empty_first_gate_page_with_a_continuation_token_still_sweeps() {
+        let memory = MemoryStore::new();
+        memory.set_clock_ms(((NOW_NS - 100 * NS_PER_DAY) / 1_000_000) as u64);
+        let tenant = TenantId::new("acme").hash();
+        let orphan = orphan_data_key(&tenant);
+        memory
+            .put(
+                &orphan,
+                Bytes::from_static(b"orphan"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put orphan");
+        let keyspace = alert_keyspace(&tenant);
+        let store = ListLog::new(EmptyFirstPage {
+            inner: memory,
+            prefix: keyspace.clone(),
+            served: std::sync::atomic::AtomicBool::new(false),
+        });
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        let disabled = CompactorConfig {
+            alert_retention_window_ns: 0,
+            ..CompactorConfig::default()
+        };
+
+        tick(&store, &tenant, &disabled, &safety, &worker, &live).await;
+
+        assert!(
+            store.inner.served.load(std::sync::atomic::Ordering::SeqCst),
+            "the gate's keyspace listing saw the empty page"
+        );
+        let mut expected = vec![keyspace];
+        expected.extend(sweep_listings(&tenant, true));
+        assert_eq!(store.take_alert_listings(&tenant), expected);
+        assert!(
+            !exists(&store.inner.inner, &orphan).await,
+            "the sweep quarantined the orphan"
+        );
+        assert_eq!(quarantined(&store.inner.inner, &tenant).await.len(), 1);
     }
 }
 
