@@ -2888,8 +2888,10 @@ struct Layout {
     group_target_blocks: usize,
     /// The page envelope's zstd level, for the row-group dictionary pages.
     zstd_level: i32,
-    /// The most distinct string bytes, summed over every string column, the
-    /// row-group dictionary candidates may hold at once.
+    /// The most distinct string value bytes, summed over every string column,
+    /// the row-group dictionary candidates may hold at once. Value bytes only:
+    /// each entry's key buffer and hash slot, and the `u32` id per present
+    /// value, are not charged to it (see `BlocksBuilder::intern`).
     dict_budget: usize,
 }
 
@@ -3010,6 +3012,14 @@ impl BlocksBuilder {
 
     /// Folds one block's values for a string column into the group's
     /// dictionary candidate for it.
+    ///
+    /// `dict_budget` counts distinct value bytes only. Both caps are checked
+    /// after the block is folded, so a column holds at most
+    /// [`MAX_DICT_ENTRIES`] entries plus one block's new values before it is
+    /// dropped, and `str_bytes` can pass `dict_budget` by one block's new
+    /// distinct bytes. Per-entry overhead (a `Vec<u8>` header and a `u32` in a
+    /// hash slot) is therefore bounded by that entry count, not by the budget,
+    /// and the `u32` id per present value by the group's row count.
     fn intern(&mut self, block: usize, values: BlockStrValues) {
         let slot = self
             .str_group

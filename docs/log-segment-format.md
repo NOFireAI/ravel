@@ -443,20 +443,28 @@ reader of any block of the chunk needs it.
 
 The writer considers a string column of a row group when its distinct values
 number at least one and at most half its present values (`2 * distinct <=
-present`), and takes the dictionary form only when the dictionary page plus
-the id pages store strictly fewer bytes than the value pages they replace
-(presence bitmap pages are the same either way and are not counted; the
-PAGE_DIR entries are not counted either, so a small chunk can make the whole
-object a few bytes larger). A tie keeps the per-block pages. Stored bytes are
-measured after the page compression envelope. The dictionary's entries are
+present`), and takes the dictionary form only when it is strictly smaller.
+Each side counts its pages' stored bytes, measured after the page compression
+envelope, plus each page's PAGE_DIR entry at the length the uncompressed
+PAGE_DIR encoding gives it; presence bitmap pages are the same either way and
+are not counted. A tie keeps the per-block pages. A chunk with one block's
+value page in it therefore keeps that page whenever neither form is
+compressed: its dictionary form holds the bytes of the block's tag 7 page less
+the width byte, split over two pages that each carry an entry of at least 9
+bytes, and the per-block page was already the smallest of its candidates,
+tag 7 among them. Because the entries are counted before PAGE_DIR's own
+section compression, a decision can still move the finished object by a few
+bytes either way. The dictionary's entries are
 sorted bytewise and an id is the entry's rank, so the row-major and columnar
 write paths produce the same dictionary and the same bytes. A column whose
 group dictionary would pass 65,536 entries, or whose distinct bytes would take
 the group's total across string columns past the writer's `block_max_bytes`
 (8 MiB by default), is dropped from the decision and keeps its per-block
 pages. A decoded block's dictionary for a column is the subset of the group's
-entries that block uses, in the same order, so a reader sees the same
-per-block dictionary under either form.
+entries that block uses, in the same order: the dictionary a tag 7 page over
+the same values would hold. Where the per-block page chose another encoding
+(plain, for example) a reader sees no per-block dictionary for it, but decodes
+the same values under either form.
 
 `observed_ts` in a block where it equals `ts` row for row is stored as a
 column reference to `ts` (tag 11), a one-byte page, instead of a copy of the
