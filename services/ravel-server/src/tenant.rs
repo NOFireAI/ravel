@@ -251,3 +251,40 @@ fn jittered(base: Duration, rng: &dyn RngSource) -> Duration {
     let extra_ms = rng.jitter_ms(jitter_bound_ms);
     base + Duration::from_millis(extra_ms)
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn params(interval: Duration) -> OidcRefreshParams {
+        OidcRefreshParams {
+            cache: Arc::new(OidcJwksCache::new().expect("OIDC cache builds")),
+            jwks_url: "http://127.0.0.1:9/jwks".to_string(),
+            interval,
+        }
+    }
+
+    /// Flip to watch it fail: delete the `is_zero()` arm of
+    /// `OidcRefreshParams::check_spawnable`; the zero interval then spawns.
+    #[tokio::test]
+    async fn spawn_jwks_refresh_refuses_a_zero_interval() {
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let alive_before = metrics.num_alive_tasks();
+        match spawn_jwks_refresh(params(Duration::ZERO)) {
+            Err(JwksRefreshSpawnError::ZeroRefreshInterval) => {}
+            Ok(task) => {
+                task.shutdown().await;
+                panic!("a zero refresh interval must be refused at spawn");
+            }
+        }
+        assert_eq!(metrics.num_alive_tasks(), alive_before);
+    }
+
+    #[tokio::test]
+    async fn spawn_jwks_refresh_starts_on_a_non_zero_interval() {
+        let task = spawn_jwks_refresh(params(Duration::from_secs(300)))
+            .expect("a non-zero refresh interval spawns");
+        task.shutdown().await;
+    }
+}

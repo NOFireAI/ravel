@@ -5357,3 +5357,189 @@ mod idle_flush_byte_floor_mode_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod loop_interval_startup_tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    /// The loop whose interval a case zeroes.
+    #[derive(Debug, Clone, Copy)]
+    enum Loop {
+        Fold,
+        Maintain,
+        AlertEval,
+        JwksRefresh,
+    }
+
+    const LOOPS: [Loop; 4] = [Loop::Fold, Loop::Maintain, Loop::AlertEval, Loop::JwksRefresh];
+
+    /// A config in the mode that spawns `which`, with that loop enabled on
+    /// `interval` and everything else valid. The JWKS URL points at a closed
+    /// loopback port: only a refusal before the initial fetch returns the
+    /// typed error.
+    fn config_with(which: Loop, interval: Duration) -> ServerConfig {
+        let mode = match which {
+            Loop::Maintain => Mode::Maintain,
+            Loop::Fold | Loop::AlertEval | Loop::JwksRefresh => Mode::All,
+        };
+        let mut config = release_b_warning_tests::server_config(
+            mode,
+            release_b_warning_tests::settings(false, false),
+        );
+        config.distrib = None;
+        match which {
+            Loop::Fold => {
+                config.fold = FoldTaskConfig {
+                    enabled: true,
+                    fold_interval: interval,
+                };
+            }
+            Loop::Maintain => {
+                config.maintain = MaintenanceTaskConfig {
+                    enabled: true,
+                    interval,
+                    ..MaintenanceTaskConfig::default()
+                };
+            }
+            Loop::AlertEval => {
+                config.alerting = AlertEvalConfig {
+                    enabled: true,
+                    interval,
+                    ..AlertEvalConfig::default()
+                };
+            }
+            Loop::JwksRefresh => {
+                config.oidc_refresh = Some(tenant::OidcRefreshParams {
+                    cache: Arc::new(
+                        ravel_query::http::OidcJwksCache::new().expect("OIDC cache builds"),
+                    ),
+                    jwks_url: "http://127.0.0.1:9/jwks".to_string(),
+                    interval,
+                });
+            }
+        }
+        config
+    }
+
+    /// True when `err` carries the typed zero-interval refusal for `which`.
+    fn is_zero_interval_refusal(which: Loop, err: &anyhow::Error) -> bool {
+        match which {
+            Loop::Fold => matches!(
+                err.downcast_ref::<fold::SpawnError>(),
+                Some(fold::SpawnError::ZeroFoldInterval)
+            ),
+            Loop::Maintain => matches!(
+                err.downcast_ref::<maintain::SpawnError>(),
+                Some(maintain::SpawnError::ZeroMaintainInterval)
+            ),
+            Loop::AlertEval => matches!(
+                err.downcast_ref::<alerting::SpawnError>(),
+                Some(alerting::SpawnError::ZeroEvalInterval)
+            ),
+            Loop::JwksRefresh => matches!(
+                err.downcast_ref::<tenant::JwksRefreshSpawnError>(),
+                Some(tenant::JwksRefreshSpawnError::ZeroRefreshInterval)
+            ),
+        }
+    }
+
+    fn memory_store() -> Arc<dyn ObjectStoreBackend> {
+        Arc::new(ravel_object_store::memory::MemoryStore::new())
+    }
+
+    /// Each loop's zero interval is refused by [`start_with_heartbeat`] with
+    /// that loop's typed error, and the runtime holds exactly the tasks it
+    /// held before the call: nothing was spawned ahead of the refusal. The
+    /// heartbeat is built but never spawned so the count measures `start`
+    /// alone.
+    ///
+    /// Flip to watch it fail: delete the `is_zero()` arm of a loop's
+    /// `check_spawnable`. Fold, maintain, and alert evaluation then start and
+    /// hit the `Ok` arm; JWKS refresh fails on the initial fetch with no typed
+    /// error. Deleting only the `validate_loop_intervals` call in
+    /// `start_with_heartbeat` keeps the variant but fails the task count.
+    #[tokio::test]
+    async fn start_with_heartbeat_refuses_each_zero_interval_before_spawning() {
+        for which in LOOPS {
+            let store = memory_store();
+            let metrics = tokio::runtime::Handle::current().metrics();
+            let alive_before = metrics.num_alive_tasks();
+            let result = start_with_heartbeat(
+                config_with(which, Duration::ZERO),
+                store.clone(),
+                store,
+                Arc::new(StoreMetrics::default()),
+                None,
+                health_listener::Heartbeat::new(Arc::new(SystemClock)),
+            )
+            .await;
+            let err = match result {
+                Err(err) => err,
+                Ok(running) => {
+                    running.shutdown().await.expect("server shuts down");
+                    panic!("{which:?}: a zero interval must refuse startup");
+                }
+            };
+            assert!(
+                is_zero_interval_refusal(which, &err),
+                "{which:?}: expected the typed zero-interval refusal, got: {err:#}"
+            );
+            assert_eq!(
+                metrics.num_alive_tasks(),
+                alive_before,
+                "{which:?}: a refused start must leave no task running"
+            );
+        }
+    }
+
+    /// [`start`] surfaces the same typed refusal as a startup error.
+    #[tokio::test]
+    async fn start_refuses_each_zero_interval_with_a_typed_error() {
+        for which in LOOPS {
+            let store = memory_store();
+            let result = start(
+                config_with(which, Duration::ZERO),
+                store.clone(),
+                store,
+                Arc::new(StoreMetrics::default()),
+                None,
+            )
+            .await;
+            let err = match result {
+                Err(err) => err,
+                Ok(running) => {
+                    running.shutdown().await.expect("server shuts down");
+                    panic!("{which:?}: a zero interval must refuse startup");
+                }
+            };
+            assert!(
+                is_zero_interval_refusal(which, &err),
+                "{which:?}: expected the typed zero-interval refusal, got: {err:#}"
+            );
+        }
+    }
+
+    /// A non-zero interval on the fold, maintain, and alert-evaluation loops
+    /// still starts. JWKS refresh has no positive case here because a start
+    /// with OIDC needs a reachable issuer for the initial fetch;
+    /// `spawn_jwks_refresh_starts_on_a_non_zero_interval` in `tenant` covers it.
+    #[tokio::test]
+    async fn a_non_zero_interval_still_starts() {
+        for which in [Loop::Fold, Loop::Maintain, Loop::AlertEval] {
+            let store = memory_store();
+            let running = start(
+                config_with(which, Duration::from_secs(300)),
+                store.clone(),
+                store,
+                Arc::new(StoreMetrics::default()),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{which:?}: a non-zero interval starts: {e:#}"));
+            running.shutdown().await.expect("server shuts down");
+        }
+    }
+}
