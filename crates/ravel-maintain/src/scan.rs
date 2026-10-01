@@ -18,8 +18,9 @@ use crate::compact::{ClaimedCompaction, CompactionOutcome, compact_bucket};
 use crate::config::{CompactorConfig, NS_PER_HOUR, RetentionConfig};
 use crate::error::{MaintainError, Result};
 use crate::retention::{
-    RetentionOutcome, SnapshotBlock, SnapshotReachability, maintain_bucket_with_reach,
-    resolve_retention_window_ns, retention_sweep_bucket_with_reach,
+    ObservedExpiry, RetentionOutcome, RewriteBound, RewriteBoundRead, SnapshotBlock,
+    SnapshotReachability, maintain_bucket_observed, resolve_retention_window_ns,
+    retention_sweep_bucket_observed,
 };
 use crate::sweep::LeaseCheck;
 
@@ -188,17 +189,42 @@ pub struct MaintainReport {
     /// found no still-present expired bucket. A fully swept-empty bucket
     /// contributes nothing: its data is gone, so there is no lag to report.
     ///
-    /// The deadline is the hour's nominal expiry (`(hour + 1) * NS_PER_HOUR +
-    /// retention_window_ns`), the same instant [`classify_zone`] uses to open a
-    /// bucket's tail window, not the bucket's exact maximum-event expiry (which
-    /// needs decoded records). Buckets are grouped by ingest hour while expiry
-    /// follows the largest event timestamp, and an event can run past the end
-    /// of its ingest hour by the allowed future clock skew, so this nominal
-    /// deadline can be earlier than the true expiry by up to that skew and the
-    /// lag reported here can over-estimate by as much; otherwise it is at or
-    /// under the true lag. It is the figure `ravel_maintain_retention_lag_seconds`
-    /// renders (issue #1729).
+    /// The deadline is the bucket's exact expiry, `max_event_ts + window`, when
+    /// this process knows it: the pass that writes the tombstone reads it from
+    /// the bucket's records, and [`MaintainMemo`] carries it to the later
+    /// passes of the same process. The tombstone itself records no event
+    /// timestamp, so a pass over a bucket another process (or an earlier run of
+    /// this one) tombstoned measures from the earlier of the hour's nominal
+    /// expiry (`(hour + 1) * NS_PER_HOUR + retention_window_ns`) and the
+    /// tombstone's `retired_at_ns`. An event can sit up to `max_ingest_lag`
+    /// before its ingest hour, so that fallback under-reads the lag by up to
+    /// one hour plus `max_ingest_lag` (three hours at the defaults), and an
+    /// event running past its ingest hour by the allowed future clock skew can
+    /// make the nominal figure over-read by up to that skew. It over-reads by
+    /// more, transiently, after a physical sweep that stopped partway: the
+    /// sweep deletes rewrite records before data, L1 segments and the tombstone,
+    /// so a process that holds neither the exact expiry nor an earlier read of
+    /// those rewrites lists none, or only some that keep parts, and can
+    /// over-read by a deleted parts-less
+    /// rewrite's `created_unix_ns` minus the hour's end, until the next pass
+    /// finishes the sweep. A tombstoned
+    /// bucket that lists a rewrite record with no parts measures from
+    /// `retired_at_ns` alone, because such a rewrite stands its
+    /// `created_unix_ns` in for an event time and can move the expiry to any
+    /// instant before the tombstone: that figure never over-reads, and
+    /// under-reads by how long after its expiry the tombstone was written, with
+    /// no fixed bound. A rewrite that keeps parts carries their event times, so
+    /// its bucket keeps the nominal-or-tombstone figure. It is the figure
+    /// `ravel_maintain_retention_lag_seconds` renders (issue #1729).
     pub retention_lag_ns: i64,
+    /// Rewrite-record GETs this pass issued only to bound the retention lag of
+    /// a tombstoned bucket that lists rewrite records and whose exact expiry
+    /// this process does not hold: each read tells a parts-less rewrite, which
+    /// leaves the tombstone as the only bound, from one that keeps parts, and
+    /// the reads stop at the first parts-less one. Never issued for a bucket
+    /// whose exact expiry, or whose earlier complete read, [`MaintainMemo`]
+    /// holds.
+    pub lag_bound_gets: usize,
 }
 
 /// The claim hold a skipped bucket earns, as the injected clock reads it: the
@@ -211,24 +237,51 @@ fn reschedule_ns(skip: &ClaimSkip) -> i64 {
 }
 
 /// Retention lag, in nanoseconds, of a bucket that is expired yet still present:
-/// how far `now_ns` is past the hour's nominal retention deadline
-/// (`(hour + 1) * NS_PER_HOUR + retention_window_ns`). `0` when the tenant has
-/// no retention policy, or `now` has not yet reached the deadline (which a
-/// still-present expired bucket has, so this clamps only a benign clock/rounding
-/// edge). Uses saturating arithmetic throughout, matching [`classify_zone`].
+/// how far `now_ns` is past the bucket's expiry, clamped at zero. `0` when the
+/// tenant has no retention policy.
+///
+/// With the exact expiry (`max_event_ts + window`, [`ObservedExpiry::Exact`])
+/// known, the lag is `now` past it. Without it, the lag is the larger of `now`
+/// past the hour's nominal deadline (`(hour + 1) * NS_PER_HOUR +
+/// retention_window_ns`) and `now` past the tombstone's `retired_at_ns`
+/// ([`ObservedExpiry::NoLaterThan`]). The true expiry is at or before both
+/// instants, except that an event running past its ingest hour by the allowed
+/// clock skew can put it after the nominal one, so the fallback under-reads by
+/// how far the earlier of the two sits past the true expiry: at most one hour
+/// plus `max_ingest_lag`, since an event can sit that far before its ingest
+/// hour. Its over-read is bounded by that skew except transiently after a
+/// physical sweep that stopped partway, which deletes a parts-less rewrite
+/// before the tombstone (see [`MaintainReport::retention_lag_ns`]). For a bucket that lists a rewrite record with no parts
+/// ([`ObservedExpiry::NoLaterThanOnly`]) the nominal deadline bounds nothing,
+/// so the lag is `now` past `retired_at_ns` alone, which under-reads by however
+/// long after the true expiry the tombstone was written. Uses saturating
+/// arithmetic throughout, matching [`classify_zone`].
 fn expired_bucket_retention_lag_ns(
     hour: u32,
     now_ns: i64,
     retention_window_ns: Option<i64>,
+    expiry: Option<ObservedExpiry>,
 ) -> i64 {
     let Some(window_ns) = retention_window_ns else {
         return 0;
     };
-    let bucket_end_ns = i64::from(hour)
-        .saturating_add(1)
-        .saturating_mul(NS_PER_HOUR);
-    let deadline_ns = bucket_end_ns.saturating_add(window_ns);
-    now_ns.saturating_sub(deadline_ns).max(0)
+    let since = |instant_ns: i64| now_ns.saturating_sub(instant_ns).max(0);
+    match expiry {
+        Some(ObservedExpiry::Exact(expiry_ns)) => since(expiry_ns),
+        Some(ObservedExpiry::NoLaterThanOnly(retired_at_ns)) => since(retired_at_ns),
+        fallback => {
+            let bucket_end_ns = i64::from(hour)
+                .saturating_add(1)
+                .saturating_mul(NS_PER_HOUR);
+            let nominal = since(bucket_end_ns.saturating_add(window_ns));
+            match fallback {
+                Some(ObservedExpiry::NoLaterThan(retired_at_ns)) => {
+                    nominal.max(since(retired_at_ns))
+                }
+                _ => nominal,
+            }
+        }
+    }
 }
 
 /// List every ingest-hour bucket present under one `(tenant, signal, shard)`,
@@ -499,6 +552,25 @@ pub struct MaintainMemo {
     /// never (a cold worker's first tick), which [`Self::full_sweep_due`]
     /// treats as due, matching this memo's own cold-start behavior.
     last_full_sweep_ns: HashMap<(TenantHash, Signal, u32), i64>,
+    /// The exact expiry (`max_event_ts + window`) of each still-present
+    /// expired bucket whose tombstone this process wrote, taken from the
+    /// records that pass read. The tombstone records no event timestamp, so
+    /// the later passes over the bucket read its retention lag from here.
+    ///
+    /// In memory only, like `claim_deferred_until_ns`: a restarted or newly
+    /// assigned worker falls back to the tombstone's own bound.
+    exact_expiry_ns: HashMap<BucketKey, i64>,
+    /// For a tombstoned bucket whose exact expiry this process does not hold,
+    /// whether its rewrite records keep the hour's nominal deadline as an
+    /// expiry bound (none of them has no parts), as the first pass that read
+    /// them all found it. The records are immutable and an erasure checks for
+    /// the tombstone before it rewrites a bucket, so later passes reuse the
+    /// answer instead of re-reading every record; a rewrite published in the
+    /// race with another replica's tombstone write is not seen. Only an
+    /// answer whose reads all succeeded is kept.
+    ///
+    /// In memory only, like `exact_expiry_ns`.
+    rewrites_keep_nominal_bound: HashMap<BucketKey, bool>,
 }
 
 impl MaintainMemo {
@@ -512,6 +584,8 @@ impl MaintainMemo {
             claim_deferred_until_ns: HashMap::new(),
             reverify_interval_ns,
             last_full_sweep_ns: HashMap::new(),
+            exact_expiry_ns: HashMap::new(),
+            rewrites_keep_nominal_bound: HashMap::new(),
         }
     }
 
@@ -671,11 +745,32 @@ impl MaintainMemo {
                     true
                 }
             });
+        let mut moved_expiry = HashMap::new();
+        self.exact_expiry_ns.retain(|(t, s, sh, hour), expiry| {
+            if *t == tenant && *s == signal && *sh == shard {
+                moved_expiry.insert((*t, *s, *sh, *hour), *expiry);
+                false
+            } else {
+                true
+            }
+        });
+        let mut moved_bound = HashMap::new();
+        self.rewrites_keep_nominal_bound
+            .retain(|(t, s, sh, hour), keeps| {
+                if *t == tenant && *s == signal && *sh == shard {
+                    moved_bound.insert((*t, *s, *sh, *hour), *keeps);
+                    false
+                } else {
+                    true
+                }
+            });
         MaintainMemo {
             entries: moved,
             claim_deferred_until_ns: moved_defer,
             reverify_interval_ns: self.reverify_interval_ns,
             last_full_sweep_ns: moved_sweep,
+            exact_expiry_ns: moved_expiry,
+            rewrites_keep_nominal_bound: moved_bound,
         }
     }
 
@@ -687,6 +782,31 @@ impl MaintainMemo {
         self.claim_deferred_until_ns
             .extend(unit.claim_deferred_until_ns);
         self.last_full_sweep_ns.extend(unit.last_full_sweep_ns);
+        self.exact_expiry_ns.extend(unit.exact_expiry_ns);
+        self.rewrites_keep_nominal_bound
+            .extend(unit.rewrites_keep_nominal_bound);
+    }
+
+    /// The most precise expiry known for `key` after this pass observed
+    /// `observed`: an exact expiry is remembered and returned, and a pass that
+    /// only saw the tombstone's bound gets the exact expiry an earlier pass of
+    /// this process remembered, if any.
+    fn best_expiry(
+        &mut self,
+        key: BucketKey,
+        observed: Option<ObservedExpiry>,
+    ) -> Option<ObservedExpiry> {
+        match observed {
+            Some(ObservedExpiry::Exact(expiry_ns)) => {
+                self.exact_expiry_ns.insert(key, expiry_ns);
+                observed
+            }
+            _ => self
+                .exact_expiry_ns
+                .get(&key)
+                .map(|&expiry_ns| ObservedExpiry::Exact(expiry_ns))
+                .or(observed),
+        }
     }
 
     /// Hold `key` until `until_ns`: another attempt holds its advisory
@@ -762,6 +882,13 @@ impl MaintainMemo {
         self.claim_deferred_until_ns.retain(|(t, s, sh, hour), _| {
             *t != tenant || *s != signal || *sh != shard || present.contains(hour)
         });
+        self.exact_expiry_ns.retain(|(t, s, sh, hour), _| {
+            *t != tenant || *s != signal || *sh != shard || present.contains(hour)
+        });
+        self.rewrites_keep_nominal_bound
+            .retain(|(t, s, sh, hour), _| {
+                *t != tenant || *s != signal || *sh != shard || present.contains(hour)
+            });
     }
 
     /// Seed one terminal entry from a durable snapshot (ADR-0065 decision 3),
@@ -1384,8 +1511,19 @@ pub async fn scan_and_maintain_with_memo(
         }
 
         let bucket = Bucket::new(tenant_hash, signal, shard, hour);
-        let (retention_outcome, compaction, acquisition) = if claim_deferred {
-            let outcome = retention_sweep_bucket_with_reach(
+        // A memoised exact expiry supersedes any tombstone bound, so the
+        // rewrite-record GETs that sharpen that bound are skipped, and so are
+        // they once an earlier pass has read their answer.
+        let mut bound_read = RewriteBoundRead::default();
+        let rewrite_bound = if memo.exact_expiry_ns.contains_key(&key) {
+            RewriteBound::Unread
+        } else if let Some(&keeps) = memo.rewrites_keep_nominal_bound.get(&key) {
+            RewriteBound::Known(keeps)
+        } else {
+            RewriteBound::Read(&mut bound_read)
+        };
+        let (retention_outcome, observed_expiry, compaction, acquisition) = if claim_deferred {
+            let (outcome, expiry) = retention_sweep_bucket_observed(
                 &mut reach,
                 store,
                 clock,
@@ -1393,11 +1531,12 @@ pub async fn scan_and_maintain_with_memo(
                 retention_window_ns,
                 lease,
                 &bucket,
+                rewrite_bound,
             )
             .await?;
-            (outcome, None, None)
+            (outcome, expiry, None, None)
         } else {
-            maintain_bucket_with_reach(
+            maintain_bucket_observed(
                 &mut reach,
                 store,
                 clock,
@@ -1405,9 +1544,15 @@ pub async fn scan_and_maintain_with_memo(
                 retention_window_ns,
                 lease,
                 &bucket,
+                rewrite_bound,
             )
             .await?
         };
+        report.lag_bound_gets += bound_read.gets;
+        if let Some(keeps) = bound_read.learned {
+            memo.rewrites_keep_nominal_bound.insert(key, keeps);
+        }
+        let expiry = memo.best_expiry(key, observed_expiry);
         // Counts a claim this bucket's run acquired, whether the compaction then
         // ran or was cancelled at a checkpoint. A `claim_deferred` bucket never
         // attempts one, so `acquisition` is `None` there. A run that errors after
@@ -1424,6 +1569,8 @@ pub async fn scan_and_maintain_with_memo(
             // still-present expired bucket and contributes no retention lag.
             RetentionOutcome::Swept => {
                 report.retired += 1;
+                memo.exact_expiry_ns.remove(&key);
+                memo.rewrites_keep_nominal_bound.remove(&key);
             }
             // Expired but still present (tombstoned within the horizon, or
             // horizon elapsed with residue left for the next pass); compaction
@@ -1432,7 +1579,7 @@ pub async fn scan_and_maintain_with_memo(
             RetentionOutcome::Tombstoned | RetentionOutcome::SweptPartial => {
                 report.retired += 1;
                 report.retention_lag_ns = report.retention_lag_ns.max(
-                    expired_bucket_retention_lag_ns(hour, now, retention_window_ns),
+                    expired_bucket_retention_lag_ns(hour, now, retention_window_ns, expiry),
                 );
             }
             // The expired bucket's physical sweep was blocked by HEAD
@@ -1446,7 +1593,7 @@ pub async fn scan_and_maintain_with_memo(
                     SnapshotBlock::Unreadable => report.blocked_by_unreadable_head += 1,
                 }
                 report.retention_lag_ns = report.retention_lag_ns.max(
-                    expired_bucket_retention_lag_ns(hour, now, retention_window_ns),
+                    expired_bucket_retention_lag_ns(hour, now, retention_window_ns, expiry),
                 );
             }
             // Retention left the bucket live; the compaction outcome classifies
@@ -2431,34 +2578,78 @@ mod invalidate_tests {
         );
     }
 
-    /// The pure lag function (issue #1729): the deadline is the hour's nominal
-    /// end plus the retention window, and the lag is `now` past it, clamped at
-    /// zero, and `0` with no policy.
+    /// The pure lag function (issues #1729, #2073): with no expiry observed
+    /// the deadline is the hour's nominal end plus the retention window; an
+    /// exact expiry replaces it; a tombstone's `retired_at_ns` can only move
+    /// the deadline earlier. Clamped at zero, and `0` with no policy.
     #[test]
-    fn expired_bucket_retention_lag_ns_is_now_past_the_nominal_deadline() {
+    fn expired_bucket_retention_lag_ns_is_now_past_the_best_known_expiry() {
         let window = 6 * NS_PER_HOUR;
-        let bucket_end = (i64::from(HOUR) + 1) * NS_PER_HOUR;
+        let hour_start = i64::from(HOUR) * NS_PER_HOUR;
+        let bucket_end = hour_start + NS_PER_HOUR;
         let now = bucket_end + window + 5 * NS_PER_HOUR;
         assert_eq!(
-            expired_bucket_retention_lag_ns(HOUR, now, Some(window)),
+            expired_bucket_retention_lag_ns(HOUR, now, Some(window), None),
             5 * NS_PER_HOUR,
             "lag is now minus (bucket_end + window)"
         );
         // Not yet at the deadline: clamped to zero, never negative.
         assert_eq!(
-            expired_bucket_retention_lag_ns(HOUR, bucket_end, Some(window)),
+            expired_bucket_retention_lag_ns(HOUR, bucket_end, Some(window), None),
             0
         );
         // No retention policy: no deadline, no lag.
-        assert_eq!(expired_bucket_retention_lag_ns(HOUR, now, None), 0);
+        assert_eq!(expired_bucket_retention_lag_ns(HOUR, now, None, None), 0);
+
+        // An exact expiry 1 ns into the hour: the full six hours minus 1 ns,
+        // not the nominal five.
+        let exact = Some(ObservedExpiry::Exact(hour_start + 1 + window));
+        assert_eq!(
+            expired_bucket_retention_lag_ns(HOUR, now, Some(window), exact),
+            6 * NS_PER_HOUR - 1
+        );
+        // A tombstone written 20 minutes before the nominal deadline moves it
+        // earlier; one written after the nominal deadline does not move it.
+        let early = Some(ObservedExpiry::NoLaterThan(
+            bucket_end + window - NS_PER_HOUR / 3,
+        ));
+        assert_eq!(
+            expired_bucket_retention_lag_ns(HOUR, now, Some(window), early),
+            5 * NS_PER_HOUR + NS_PER_HOUR / 3
+        );
+        let late = Some(ObservedExpiry::NoLaterThan(
+            bucket_end + window + NS_PER_HOUR,
+        ));
+        assert_eq!(
+            expired_bucket_retention_lag_ns(HOUR, now, Some(window), late),
+            5 * NS_PER_HOUR
+        );
+        // A bucket listing a rewrite record: an erasure's parts-less rewrite
+        // can push the expiry past the nominal deadline, so only the tombstone
+        // bounds it and the lag is `now` past `retired_at_ns`. Flipped line:
+        // delete the `NoLaterThanOnly` arm in `expired_bucket_retention_lag_ns`;
+        // "only the tombstone bounds a rewritten bucket" reads left 18000000000000,
+        // right 14400000000000.
+        let rewritten = Some(ObservedExpiry::NoLaterThanOnly(
+            bucket_end + window + NS_PER_HOUR,
+        ));
+        assert_eq!(
+            expired_bucket_retention_lag_ns(HOUR, now, Some(window), rewritten),
+            4 * NS_PER_HOUR,
+            "only the tombstone bounds a rewritten bucket"
+        );
     }
 
     /// End to end through `scan_and_maintain` with an injected clock: a sealed,
     /// expired, still-present (freshly tombstoned) bucket makes
     /// `MaintainReport::retention_lag_ns` the exact distance from `now` to the
-    /// bucket's nominal retention deadline (issue #1729). Flip-line proof:
-    /// dropping the `retention_lag_ns` update from the Tombstoned arm leaves this
-    /// at `0`.
+    /// bucket's retention expiry by its newest event (issues #1729, #2073). The
+    /// fixture's one event is 1 ns into its hour, so that is one hour minus 1
+    /// ns more than the nominal deadline gives. Flip-line proof: dropping the
+    /// `retention_lag_ns` update from the Tombstoned arm leaves this at `0`,
+    /// and replacing the `ObservedExpiry::Exact` on the tombstoning path of
+    /// `retention_sweep_bucket_observed` with `None` reads the nominal five
+    /// hours.
     #[tokio::test]
     async fn scan_reports_exact_retention_lag_for_a_still_present_expired_bucket() {
         use crate::config::{DEFAULT_MAX_INGEST_LAG_NS, RetentionPolicy};
@@ -2501,15 +2692,232 @@ mod invalidate_tests {
         .expect("scan");
 
         assert_eq!(report.retired, 1, "the expired bucket was tombstoned");
+        let max_event = i64::from(HOUR) * NS_PER_HOUR + 1;
         assert_eq!(
             report.retention_lag_ns,
-            now - (bucket_end + window),
-            "lag is now past the nominal deadline"
+            now - (max_event + window),
+            "lag is now past the newest event's expiry"
         );
         assert_eq!(
             report.retention_lag_ns,
-            5 * NS_PER_HOUR,
-            "the bucket is exactly five hours past its retention deadline"
+            6 * NS_PER_HOUR - 1,
+            "the bucket is six hours less 1 ns past its retention expiry"
+        );
+    }
+
+    /// The passes after the tombstoning one (issue #2073). The tombstone
+    /// records no event time, so a memo that saw the tombstone written keeps
+    /// the exact lag, and a cold memo falls back to the earlier of the nominal
+    /// deadline and the tombstone's `retired_at_ns`. Here the tombstone was
+    /// written after the nominal deadline, so the fallback reads the nominal
+    /// figure: exactly one hour less 1 ns under the true lag, the documented
+    /// under-read. Flip-line proof: returning `observed` unconditionally from
+    /// `MaintainMemo::best_expiry` makes the warm pass read the nominal figure.
+    #[tokio::test]
+    async fn later_passes_keep_the_exact_lag_only_on_the_memo_that_tombstoned() {
+        use crate::config::{DEFAULT_MAX_INGEST_LAG_NS, RetentionPolicy};
+
+        let store = MemoryStore::new();
+        seed_metrics(&store).await;
+        let t = tenant_hash();
+        let config = CompactorConfig::default();
+        let window = config.retention_floor_ns(DEFAULT_MAX_INGEST_LAG_NS);
+        let retention = RetentionConfig::from_policy(
+            RetentionPolicy {
+                default: None,
+                tenants: vec![(TENANT.to_string(), window)],
+            },
+            &config,
+            DEFAULT_MAX_INGEST_LAG_NS,
+        )
+        .expect("valid retention config");
+        let bucket_end = (i64::from(HOUR) + 1) * NS_PER_HOUR;
+        let tombstoned_at = bucket_end + window + 5 * NS_PER_HOUR;
+        let clock = FixedClock::new(tombstoned_at);
+        let pass = |memo: MaintainMemo| {
+            let (store, clock, config, retention) = (&store, &clock, &config, &retention);
+            async move {
+                let mut memo = memo;
+                let report = scan_and_maintain_with_memo(
+                    &mut memo,
+                    store,
+                    clock,
+                    config,
+                    retention,
+                    &NoLeases,
+                    t,
+                    Signal::Metrics,
+                    SHARD,
+                )
+                .await
+                .expect("scan");
+                (memo, report)
+            }
+        };
+
+        let (warm, first) = pass(MaintainMemo::new(0)).await;
+        assert_eq!(first.retention_lag_ns, 6 * NS_PER_HOUR - 1);
+
+        clock.set(tombstoned_at + NS_PER_HOUR);
+        let (_, second) = pass(warm).await;
+        assert_eq!(
+            second.retention_lag_ns,
+            7 * NS_PER_HOUR - 1,
+            "the memo that wrote the tombstone keeps the exact expiry"
+        );
+        let (_, cold) = pass(MaintainMemo::new(0)).await;
+        assert_eq!(
+            cold.retention_lag_ns,
+            6 * NS_PER_HOUR,
+            "a cold memo reads now past the nominal deadline, the earlier bound here"
+        );
+    }
+
+    /// A tombstoned bucket with a parts-less rewrite (issue #2073 review): the
+    /// pass whose memo holds the exact expiry reads the rewrite record no
+    /// further, and a cold pass reads it exactly once, counts that GET in
+    /// `lag_bound_gets`, and measures from the tombstone alone; the next pass
+    /// on that same memo reuses the answer and reads it no more. Flipped
+    /// lines: the `memo.exact_expiry_ns.contains_key(&key)` branch removed
+    /// reads the warm pass's `lag_bound_gets` as 1 against 0; the
+    /// `report.lag_bound_gets += bound_read.gets` removed reads the cold
+    /// pass's as 0 against 1; the `memo.rewrites_keep_nominal_bound.insert`
+    /// removed reads the second cold-memo pass's as 1 against 0.
+    #[tokio::test]
+    async fn only_a_pass_without_the_exact_expiry_reads_the_rewrite_record() {
+        use crate::config::{DEFAULT_MAX_INGEST_LAG_NS, RetentionPolicy};
+        use ravel_object_store::InstrumentedStore;
+        use ravel_object_store::instrument::StoreOp;
+        use ravel_proto::commit::v1::{CompactionInputIdentity, RewriteDrop, RewriteRecord};
+
+        let store = InstrumentedStore::new(MemoryStore::new());
+        seed_metrics(&store).await;
+        let t = tenant_hash();
+        let inputs = vec![CompactionInputIdentity {
+            writer_id: Uuid::from_u128(1).to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        }];
+        let request_id = Uuid::from_u128(7).to_string();
+        let created_unix_ns = i64::from(HOUR) * NS_PER_HOUR + 2;
+        let rewrite = RewriteRecord {
+            format_version: 1,
+            tenant_hash: t.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            shard: SHARD,
+            ingest_hour_bucket: HOUR,
+            input_set_hash: ravel_commit::erasure::compute_rewrite_input_set_hash(
+                &inputs,
+                None,
+                std::slice::from_ref(&request_id),
+            )
+            .to_vec(),
+            inputs,
+            parts: Vec::new(),
+            drops: vec![RewriteDrop {
+                request_id,
+                dropped_count: 1,
+            }],
+            created_unix_ns,
+            superseded_record_key: String::new(),
+        };
+        store
+            .put(
+                &keys::rewrite_record_key_for(&rewrite).expect("key"),
+                ravel_commit::erasure::encode_rewrite(&rewrite),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed rewrite");
+
+        let config = CompactorConfig::default();
+        let window = config.retention_floor_ns(DEFAULT_MAX_INGEST_LAG_NS);
+        let retention = RetentionConfig::from_policy(
+            RetentionPolicy {
+                default: None,
+                tenants: vec![(TENANT.to_string(), window)],
+            },
+            &config,
+            DEFAULT_MAX_INGEST_LAG_NS,
+        )
+        .expect("valid retention config");
+        let bucket_end = (i64::from(HOUR) + 1) * NS_PER_HOUR;
+        let tombstoned_at = bucket_end + window + 5 * NS_PER_HOUR;
+        let clock = FixedClock::new(tombstoned_at);
+        let gets = || store.metrics().snapshot().op(StoreOp::Get).calls;
+        let pass = |memo: MaintainMemo| {
+            let (store, clock, config, retention) = (&store, &clock, &config, &retention);
+            async move {
+                let mut memo = memo;
+                let report = scan_and_maintain_with_memo(
+                    &mut memo,
+                    store,
+                    clock,
+                    config,
+                    retention,
+                    &NoLeases,
+                    t,
+                    Signal::Metrics,
+                    SHARD,
+                )
+                .await
+                .expect("scan");
+                (memo, report)
+            }
+        };
+
+        let (warm, first) = pass(MaintainMemo::new(0)).await;
+        assert_eq!(first.retired, 1, "the first pass tombstones the bucket");
+        assert_eq!(
+            first.lag_bound_gets, 0,
+            "the tombstoning pass knows the expiry"
+        );
+
+        clock.set(tombstoned_at + NS_PER_HOUR);
+        let before = gets();
+        let (_, second) = pass(warm).await;
+        let warm_gets = gets() - before;
+        assert_eq!(
+            second.lag_bound_gets, 0,
+            "a memoised exact expiry needs no GET"
+        );
+        assert_eq!(
+            second.retention_lag_ns,
+            tombstoned_at + NS_PER_HOUR - (created_unix_ns + window),
+            "the warm pass reads the exact lag"
+        );
+
+        let before = gets();
+        let (cold_memo, cold) = pass(MaintainMemo::new(0)).await;
+        let cold_gets = gets() - before;
+        assert_eq!(
+            cold.lag_bound_gets, 1,
+            "the cold pass reads the rewrite once"
+        );
+        assert_eq!(
+            cold_gets,
+            warm_gets + 1,
+            "exactly one GET more than the pass with the exact expiry"
+        );
+        assert_eq!(
+            cold.retention_lag_ns, NS_PER_HOUR,
+            "a parts-less rewrite leaves the tombstone as the only bound"
+        );
+
+        let before = gets();
+        let (_, again) = pass(cold_memo).await;
+        assert_eq!(
+            again.lag_bound_gets, 0,
+            "the memo keeps the answer the cold pass read"
+        );
+        assert_eq!(
+            gets() - before,
+            warm_gets,
+            "the second pass without the exact expiry issues no rewrite GET"
+        );
+        assert_eq!(
+            again.retention_lag_ns, NS_PER_HOUR,
+            "the memoised answer keeps the tombstone as the only bound"
         );
     }
 }

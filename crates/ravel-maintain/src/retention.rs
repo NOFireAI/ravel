@@ -265,12 +265,99 @@ pub async fn retention_sweep_bucket_with_reach(
     lease: &dyn LeaseCheck,
     bucket: &Bucket,
 ) -> Result<RetentionOutcome> {
+    let (outcome, _expiry) = retention_sweep_bucket_observed(
+        reach,
+        store,
+        clock,
+        config,
+        window_ns,
+        lease,
+        bucket,
+        RewriteBound::Unread,
+    )
+    .await?;
+    Ok(outcome)
+}
+
+/// When an expired bucket expired, as far as one retention evaluation knows
+/// it without a request beyond the ones the evaluation already made. Feeds the
+/// scan's retention lag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObservedExpiry {
+    /// `max_event_ts + window` from the bucket's own records, which the pass
+    /// that writes the tombstone reads to decide expiry.
+    Exact(i64),
+    /// The tombstone's `retired_at_ns`. The tombstone records no event
+    /// timestamp, but it is written only once the bucket has expired, so the
+    /// expiry is at or before this instant.
+    NoLaterThan(i64),
+    /// The tombstone's `retired_at_ns`, for a bucket that lists a rewrite
+    /// record with no parts, or one this evaluation did not read or failed to
+    /// read. A parts-less
+    /// rewrite puts its `created_unix_ns` into [`max_event_ts`], and an erasure
+    /// can publish one at any time before the bucket expires, so the hour's
+    /// nominal deadline is no bound on the expiry here; only this instant is.
+    NoLaterThanOnly(i64),
+}
+
+/// How a tombstoned bucket's evaluation learns whether its listed rewrite
+/// records keep the hour's nominal deadline as an expiry bound, which only a
+/// parts-less one does not.
+pub(crate) enum RewriteBound<'a> {
+    /// Read nothing: any listed rewrite leaves the tombstone as the only bound.
+    Unread,
+    /// The answer an earlier evaluation of the same bucket read. Rewrite
+    /// records are immutable, and an erasure checks for the tombstone before
+    /// it rewrites a bucket, so the answer is reused for the bucket's
+    /// tombstoned life, including after a partial sweep has deleted its
+    /// rewrite records. A rewrite published in the race between that check
+    /// and another replica's tombstone write is not seen; its publish time
+    /// is after the tombstone, so the expiry the tombstone acted on stands.
+    Known(bool),
+    /// Read the listed records until the first parts-less one.
+    Read(&'a mut RewriteBoundRead),
+}
+
+/// What one [`RewriteBound::Read`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct RewriteBoundRead {
+    /// Rewrite-record GETs issued.
+    pub(crate) gets: usize,
+    /// The answer, when every GET it needed succeeded. `None` when the bucket
+    /// listed no rewrite, or a read failed and the evaluation fell back to the
+    /// tombstone-only bound.
+    pub(crate) learned: Option<bool>,
+}
+
+/// [`retention_sweep_bucket_with_reach`], also returning the bucket's
+/// [`ObservedExpiry`] on every outcome that leaves an expired bucket present
+/// or retires it, and `None` on the rest.
+///
+/// For a tombstoned bucket that lists rewrite records, `rewrite_bound` decides
+/// the bound: a parts-less rewrite makes it
+/// [`ObservedExpiry::NoLaterThanOnly`], and rewrites that all keep parts make
+/// it [`ObservedExpiry::NoLaterThan`]. [`RewriteBound::Unread`] reads nothing
+/// and returns [`ObservedExpiry::NoLaterThanOnly`], the bound that holds
+/// without the read; the scan passes it when it already holds the bucket's
+/// exact expiry. The read only feeds the retention lag, so a failed one falls
+/// back to that same bound and never fails the evaluation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn retention_sweep_bucket_observed(
+    reach: &mut SnapshotReachability,
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    window_ns: Option<i64>,
+    lease: &dyn LeaseCheck,
+    bucket: &Bucket,
+    rewrite_bound: RewriteBound<'_>,
+) -> Result<(RetentionOutcome, Option<ObservedExpiry>)> {
     let Some(window_ns) = window_ns else {
-        return Ok(RetentionOutcome::NoPolicy);
+        return Ok((RetentionOutcome::NoPolicy, None));
     };
     let now = clock.now_ns();
     if !bucket.is_sealed(now, config) {
-        return Ok(RetentionOutcome::NotSealed);
+        return Ok((RetentionOutcome::NotSealed, None));
     }
 
     let listing = list_bucket(store, bucket).await?;
@@ -280,12 +367,20 @@ pub async fn retention_sweep_bucket_with_reach(
     // anchors on the compaction record's created_unix_ns.
     if let Some(tombstone_key) = &listing.tombstone_key {
         let tombstone = get_tombstone(store, tombstone_key).await?;
+        let nominal_bounds =
+            rewrites_keep_nominal_bound(store, bucket, &listing.rewrite_record_keys, rewrite_bound)
+                .await;
+        let expiry = Some(if nominal_bounds {
+            ObservedExpiry::NoLaterThan(tombstone.retired_at_ns)
+        } else {
+            ObservedExpiry::NoLaterThanOnly(tombstone.retired_at_ns)
+        });
         if now
             >= tombstone
                 .retired_at_ns
                 .saturating_add(config.protection_horizon_ns)
         {
-            return physical_sweep(
+            let outcome = physical_sweep(
                 reach,
                 store,
                 lease,
@@ -294,9 +389,10 @@ pub async fn retention_sweep_bucket_with_reach(
                 tombstone_key,
                 config.dry_run,
             )
-            .await;
+            .await?;
+            return Ok((outcome, expiry));
         }
-        return Ok(RetentionOutcome::Tombstoned);
+        return Ok((RetentionOutcome::Tombstoned, expiry));
     }
 
     // Not tombstoned: evaluate expiry from the bucket's records (no footer
@@ -315,11 +411,12 @@ pub async fn retention_sweep_bucket_with_reach(
     }
     let max_event = max_event_ts(&commit_records, &compaction_records, &rewrite_records);
     if !is_expired(max_event, now, window_ns) {
-        return Ok(RetentionOutcome::NotExpired);
+        return Ok((RetentionOutcome::NotExpired, None));
     }
 
     write_tombstone(store, bucket, now, window_ns, &listing, config.dry_run).await?;
-    Ok(RetentionOutcome::Tombstoned)
+    let expiry = max_event.map(|max| ObservedExpiry::Exact(max.saturating_add(window_ns)));
+    Ok((RetentionOutcome::Tombstoned, expiry))
 }
 
 /// Run retention before compaction over one bucket (ADR-0019 decision 6): the
@@ -371,9 +468,50 @@ pub async fn maintain_bucket_with_reach(
     Option<ClaimedCompaction>,
     Option<ClaimAcquisition>,
 )> {
-    let outcome =
-        retention_sweep_bucket_with_reach(reach, store, clock, config, window_ns, lease, bucket)
-            .await?;
+    let (outcome, _expiry, compaction, acquisition) = maintain_bucket_observed(
+        reach,
+        store,
+        clock,
+        config,
+        window_ns,
+        lease,
+        bucket,
+        RewriteBound::Unread,
+    )
+    .await?;
+    Ok((outcome, compaction, acquisition))
+}
+
+/// [`maintain_bucket_with_reach`], also returning the retention evaluation's
+/// [`ObservedExpiry`] (see [`retention_sweep_bucket_observed`], which takes
+/// `rewrite_bound`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn maintain_bucket_observed(
+    reach: &mut SnapshotReachability,
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    window_ns: Option<i64>,
+    lease: &dyn LeaseCheck,
+    bucket: &Bucket,
+    rewrite_bound: RewriteBound<'_>,
+) -> Result<(
+    RetentionOutcome,
+    Option<ObservedExpiry>,
+    Option<ClaimedCompaction>,
+    Option<ClaimAcquisition>,
+)> {
+    let (outcome, expiry) = retention_sweep_bucket_observed(
+        reach,
+        store,
+        clock,
+        config,
+        window_ns,
+        lease,
+        bucket,
+        rewrite_bound,
+    )
+    .await?;
     let (compaction, acquisition) = match outcome {
         // The bucket is (or is being) retired, or its delete is blocked by a
         // still-reaching snapshot: never compact it.
@@ -387,7 +525,7 @@ pub async fn maintain_bucket_with_reach(
             (Some(compaction), acquisition)
         }
     };
-    Ok((outcome, compaction, acquisition))
+    Ok((outcome, expiry, compaction, acquisition))
 }
 
 /// The maximum `max_event_ts_ns` across a bucket's L0 commit records,
@@ -924,6 +1062,64 @@ async fn get_rewrite_record(store: &dyn ObjectStoreBackend, key: &str) -> Result
     Ok(record)
 }
 
+/// Whether the hour's nominal deadline still bounds a tombstoned bucket's
+/// expiry given its listed rewrite records: true unless one of them has no
+/// parts, since only a parts-less rewrite stands its `created_unix_ns` in for
+/// an event time in [`max_event_ts`]. [`RewriteBound::Unread`] answers false
+/// whenever any are listed, and [`RewriteBound::Known`] answers what it holds
+/// without reading. A record that fails to read answers false, whatever the
+/// error: false is the bound that never over-reads, and the answer only feeds
+/// the retention lag, so it must not stop the retention pass that reads it.
+async fn rewrites_keep_nominal_bound(
+    store: &dyn ObjectStoreBackend,
+    bucket: &Bucket,
+    rewrite_keys: &[String],
+    bound: RewriteBound<'_>,
+) -> bool {
+    let read = match bound {
+        RewriteBound::Known(keeps) => return keeps,
+        _ if rewrite_keys.is_empty() => return true,
+        RewriteBound::Unread => return false,
+        RewriteBound::Read(read) => read,
+    };
+    for key in rewrite_keys {
+        read.gets += 1;
+        match get_rewrite_record(store, key).await {
+            Ok(record) if record.parts.is_empty() => {
+                read.learned = Some(false);
+                return false;
+            }
+            Ok(_) => {}
+            // Another replica's sweep deleted it after the listing.
+            Err(MaintainError::Store(StoreError::NotFound)) => {
+                tracing::debug!(
+                    tenant = %bucket.tenant_hash.to_hex(),
+                    signal = ?bucket.signal,
+                    shard = bucket.shard,
+                    ingest_hour_bucket = bucket.ingest_hour_bucket,
+                    key = %key,
+                    "rewrite record gone before its lag-bound read; using the tombstone-only bound"
+                );
+                return false;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    tenant = %bucket.tenant_hash.to_hex(),
+                    signal = ?bucket.signal,
+                    shard = bucket.shard,
+                    ingest_hour_bucket = bucket.ingest_hour_bucket,
+                    key = %key,
+                    %error,
+                    "rewrite record lag-bound read failed; using the tombstone-only bound"
+                );
+                return false;
+            }
+        }
+    }
+    read.learned = Some(true);
+    true
+}
+
 /// GET, decode, and key-verify one retention tombstone (ADR-0010 §7 discipline).
 async fn get_tombstone(store: &dyn ObjectStoreBackend, key: &str) -> Result<RetentionTombstone> {
     let got = store.get(key, GetRange::Full).await?;
@@ -936,6 +1132,8 @@ async fn get_tombstone(store: &dyn ObjectStoreBackend, key: &str) -> Result<Rete
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    use ravel_object_store::InstrumentedStore;
+    use ravel_object_store::instrument::StoreOp;
     use ravel_object_store::memory::MemoryStore;
     use ravel_types::Signal;
 
@@ -1104,5 +1302,425 @@ mod tests {
             ),
             other => panic!("expected Invariant from the version gate, got {other:?}"),
         }
+    }
+
+    const RETIRED_AT_NS: i64 = 100 * crate::config::NS_PER_HOUR;
+    const WINDOW_NS: i64 = 10 * crate::config::NS_PER_HOUR;
+
+    /// Seed a tombstone retired at [`RETIRED_AT_NS`] for `hour` of the test
+    /// tenant's metrics shard 0, and return that bucket.
+    async fn put_tombstone(store: &dyn ObjectStoreBackend, hour: u32) -> Bucket {
+        let tombstone = RetentionTombstone {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            shard: 0,
+            ingest_hour_bucket: hour,
+            retired_at_ns: RETIRED_AT_NS,
+            retention_window_ns: WINDOW_NS as u64,
+            record_count_observed: 1,
+        };
+        store
+            .put(
+                &keys::retention_tombstone_key_for(&tombstone).expect("key"),
+                record::encode_tombstone(&tombstone),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed tombstone");
+        Bucket::new(tenant(), Signal::Metrics, 0, hour)
+    }
+
+    /// A rewrite record with `parts` over one L0 input of `bucket`, its key set
+    /// by `seed`.
+    fn rewrite_record(
+        bucket: &Bucket,
+        seed: u128,
+        parts: Vec<ravel_proto::commit::v1::CompactionPart>,
+    ) -> RewriteRecord {
+        let inputs = vec![ravel_proto::commit::v1::CompactionInputIdentity {
+            writer_id: uuid::Uuid::from_u128(seed).to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        }];
+        let request_id = uuid::Uuid::from_u128(7).to_string();
+        RewriteRecord {
+            format_version: 1,
+            tenant_hash: bucket.tenant_hash.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(bucket.signal) as i32,
+            shard: bucket.shard,
+            ingest_hour_bucket: bucket.ingest_hour_bucket,
+            input_set_hash: ravel_commit::erasure::compute_rewrite_input_set_hash(
+                &inputs,
+                None,
+                std::slice::from_ref(&request_id),
+            )
+            .to_vec(),
+            inputs,
+            parts,
+            drops: vec![ravel_proto::commit::v1::RewriteDrop {
+                request_id,
+                dropped_count: 1,
+            }],
+            created_unix_ns: RETIRED_AT_NS - WINDOW_NS - 1,
+            superseded_record_key: String::new(),
+        }
+    }
+
+    /// Seed a rewrite record with `parts` over one L0 input of `bucket`, with
+    /// the key `seed` sets, and return that key.
+    async fn put_rewrite_seeded(
+        store: &dyn ObjectStoreBackend,
+        bucket: &Bucket,
+        seed: u128,
+        parts: Vec<ravel_proto::commit::v1::CompactionPart>,
+    ) -> String {
+        let rewrite = rewrite_record(bucket, seed, parts);
+        let key = keys::rewrite_record_key_for(&rewrite).expect("key");
+        store
+            .put(
+                &key,
+                ravel_commit::erasure::encode_rewrite(&rewrite),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed rewrite");
+        key
+    }
+
+    /// [`put_rewrite_seeded`] with seed 1.
+    async fn put_rewrite(
+        store: &dyn ObjectStoreBackend,
+        bucket: &Bucket,
+        parts: Vec<ravel_proto::commit::v1::CompactionPart>,
+    ) -> String {
+        put_rewrite_seeded(store, bucket, 1, parts).await
+    }
+
+    /// One part, so a rewrite carrying it keeps the nominal bound.
+    fn a_part() -> ravel_proto::commit::v1::CompactionPart {
+        ravel_proto::commit::v1::CompactionPart {
+            content_hash: vec![0x40; 32],
+            object_size: 1,
+            sample_count: 1,
+            max_event_ts_ns: crate::config::NS_PER_HOUR + 1,
+            ..Default::default()
+        }
+    }
+
+    /// One retention evaluation of `bucket` at `now_ns`.
+    async fn evaluate_at(
+        store: &dyn ObjectStoreBackend,
+        bucket: &Bucket,
+        now_ns: i64,
+        bound: RewriteBound<'_>,
+    ) -> Result<(RetentionOutcome, Option<ObservedExpiry>)> {
+        retention_sweep_bucket_observed(
+            &mut SnapshotReachability::new(),
+            store,
+            &crate::clock::FixedClock::new(now_ns),
+            &CompactorConfig::default(),
+            Some(WINDOW_NS),
+            &crate::sweep::NoLeases,
+            bucket,
+            bound,
+        )
+        .await
+    }
+
+    /// One retention evaluation of `bucket` just after [`RETIRED_AT_NS`]:
+    /// its outcome and expiry, what its rewrite read did (`None` when the
+    /// evaluation was told not to read), and the GETs the store saw.
+    async fn observe(
+        store: &InstrumentedStore<MemoryStore>,
+        bucket: &Bucket,
+        read_rewrites: bool,
+    ) -> (
+        RetentionOutcome,
+        Option<ObservedExpiry>,
+        Option<RewriteBoundRead>,
+        u64,
+    ) {
+        let gets = || store.metrics().snapshot().op(StoreOp::Get).calls;
+        let before = gets();
+        let mut read = RewriteBoundRead::default();
+        let bound = if read_rewrites {
+            RewriteBound::Read(&mut read)
+        } else {
+            RewriteBound::Unread
+        };
+        let (outcome, expiry) = evaluate_at(store, bucket, RETIRED_AT_NS + 1, bound)
+            .await
+            .expect("retention pass");
+        (
+            outcome,
+            expiry,
+            read_rewrites.then_some(read),
+            gets() - before,
+        )
+    }
+
+    /// A pass over an already-tombstoned bucket reports the tombstone's
+    /// `retired_at_ns` as the bucket's expiry bound, and marks it as the only
+    /// bound once the bucket lists a rewrite record with no parts: such a
+    /// rewrite stands its `created_unix_ns` in for an event time, so the
+    /// hour's nominal deadline can sit far before the real expiry (issue
+    /// #2073). Telling that apart for one rewrite costs exactly one GET of the
+    /// record, counted, and none without a read. Flipped lines: the parts-less
+    /// arm in `rewrites_keep_nominal_bound` removed reads `NoLaterThan` against
+    /// `NoLaterThanOnly`; the `read.gets += 1` removed reads the counter as 0
+    /// against 1.
+    #[tokio::test]
+    async fn a_tombstoned_bucket_with_a_parts_less_rewrite_is_bounded_by_its_tombstone_alone() {
+        let store = InstrumentedStore::new(MemoryStore::new());
+        let bucket = put_tombstone(&store, 1).await;
+
+        let (outcome, expiry, read, _) = observe(&store, &bucket, true).await;
+        assert_eq!(outcome, RetentionOutcome::Tombstoned);
+        assert_eq!(
+            expiry,
+            Some(ObservedExpiry::NoLaterThan(RETIRED_AT_NS)),
+            "a bucket with no rewrite keeps the nominal deadline as a bound"
+        );
+        assert_eq!(
+            read,
+            Some(RewriteBoundRead::default()),
+            "no rewrite, no rewrite GET, nothing learned"
+        );
+
+        put_rewrite(&store, &bucket, Vec::new()).await;
+        let (_, unread, _, gets_unread) = observe(&store, &bucket, false).await;
+        assert_eq!(
+            unread,
+            Some(ObservedExpiry::NoLaterThanOnly(RETIRED_AT_NS)),
+            "an unread rewrite leaves the tombstone as the only bound"
+        );
+        let (outcome, expiry, read, gets_read) = observe(&store, &bucket, true).await;
+        assert_eq!(outcome, RetentionOutcome::Tombstoned);
+        assert_eq!(
+            expiry,
+            Some(ObservedExpiry::NoLaterThanOnly(RETIRED_AT_NS)),
+            "a bucket with a parts-less rewrite is bounded by its tombstone alone"
+        );
+        assert_eq!(
+            read,
+            Some(RewriteBoundRead {
+                gets: 1,
+                learned: Some(false),
+            }),
+            "the rewrite GET is counted and its answer learned"
+        );
+        assert_eq!(
+            gets_read,
+            gets_unread + 1,
+            "reading the rewrite costs exactly one GET"
+        );
+    }
+
+    /// A rewrite that keeps parts carries their event times into
+    /// [`max_event_ts`], so its tombstoned bucket keeps the nominal deadline as
+    /// a bound alongside the tombstone (issue #2073 review). Flipped line: the
+    /// closing `true` of `rewrites_keep_nominal_bound` replaced with `false`
+    /// reads `NoLaterThanOnly` against `NoLaterThan`.
+    #[tokio::test]
+    async fn a_tombstoned_bucket_whose_rewrite_keeps_parts_keeps_the_nominal_bound() {
+        let store = InstrumentedStore::new(MemoryStore::new());
+        let bucket = put_tombstone(&store, 1).await;
+        put_rewrite(&store, &bucket, vec![a_part()]).await;
+
+        let (_, _, _, gets_unread) = observe(&store, &bucket, false).await;
+        let (outcome, expiry, read, gets_read) = observe(&store, &bucket, true).await;
+        assert_eq!(outcome, RetentionOutcome::Tombstoned);
+        assert_eq!(
+            expiry,
+            Some(ObservedExpiry::NoLaterThan(RETIRED_AT_NS)),
+            "a rewrite that keeps parts leaves the nominal deadline a bound"
+        );
+        assert_eq!(
+            read,
+            Some(RewriteBoundRead {
+                gets: 1,
+                learned: Some(true),
+            })
+        );
+        assert_eq!(gets_read, gets_unread + 1);
+    }
+
+    /// The rewrite read only feeds the retention lag, so a failed one never
+    /// fails the retention evaluation (issue #2073 review): a store error, a
+    /// record that does not decode, and a record gone before its GET each
+    /// leave the evaluation `Ok`, give the tombstone-only bound (the rewrite
+    /// here keeps parts, so a read that succeeded would give `NoLaterThan`),
+    /// learn nothing, and still let the physical sweep run once the protection
+    /// horizon has elapsed. Flipped lines: the `return false` of the arm that
+    /// logs a failed read removed reads `NoLaterThan` against
+    /// `NoLaterThanOnly` in the `Transient` case; the `return false` of the
+    /// `NotFound` arm removed reads the same in the `NotFoundBlip` case.
+    #[tokio::test]
+    async fn a_failed_rewrite_read_falls_back_to_the_tombstone_bound_and_still_sweeps() {
+        use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+
+        for fault in [
+            ScriptedFault::Transient("rewrite GET refused".to_string()),
+            ScriptedFault::CorruptRange,
+            ScriptedFault::NotFoundBlip,
+        ] {
+            let kind = fault.kind();
+            let bucket = Bucket::new(tenant(), Signal::Metrics, 0, 1);
+            let rewrite_key =
+                keys::rewrite_record_key_for(&rewrite_record(&bucket, 1, Vec::new())).expect("key");
+            let plan = FaultPlan::empty()
+                .with_rule(Rule::new(Op::Get, fault).with_key_contains(rewrite_key.clone()));
+            let store = FaultStore::new(MemoryStore::new(), plan);
+            put_tombstone(&store, 1).await;
+            assert_eq!(
+                put_rewrite(&store, &bucket, vec![a_part()]).await,
+                rewrite_key
+            );
+
+            let mut read = RewriteBoundRead::default();
+            let (outcome, expiry) = evaluate_at(
+                &store,
+                &bucket,
+                RETIRED_AT_NS + 1,
+                RewriteBound::Read(&mut read),
+            )
+            .await
+            .expect("a failed rewrite read must not fail the evaluation");
+            assert_eq!(outcome, RetentionOutcome::Tombstoned, "{kind:?}");
+            assert_eq!(
+                expiry,
+                Some(ObservedExpiry::NoLaterThanOnly(RETIRED_AT_NS)),
+                "{kind:?}: a failed read gives the bound that never over-reads"
+            );
+            assert_eq!(
+                read,
+                RewriteBoundRead {
+                    gets: 1,
+                    learned: None,
+                },
+                "{kind:?}: one GET issued, and a failed read is not an answer"
+            );
+            assert_eq!(store.fault_count(Op::Get, kind), 1, "{kind:?} fired");
+
+            let past_horizon = RETIRED_AT_NS + CompactorConfig::default().protection_horizon_ns;
+            let mut read = RewriteBoundRead::default();
+            let (outcome, expiry) =
+                evaluate_at(&store, &bucket, past_horizon, RewriteBound::Read(&mut read))
+                    .await
+                    .expect("a failed rewrite read must not fail the evaluation");
+            assert_eq!(
+                outcome,
+                RetentionOutcome::Swept,
+                "{kind:?}: the physical sweep still runs"
+            );
+            assert_eq!(expiry, Some(ObservedExpiry::NoLaterThanOnly(RETIRED_AT_NS)));
+            assert_eq!(store.fault_count(Op::Get, kind), 2, "{kind:?} fired again");
+            let left = list_bucket(store.inner(), &bucket).await.expect("list");
+            assert!(
+                left.rewrite_record_keys.is_empty() && left.tombstone_key.is_none(),
+                "{kind:?}: the sweep deleted the rewrite and the tombstone: {left:?}"
+            );
+        }
+    }
+
+    /// The read stops at the first parts-less rewrite in key order: with two
+    /// rewrites, one that keeps parts listed first costs two GETs, and the
+    /// parts-less one listed first costs one. Flipped lines: the parts-less
+    /// arm's `return false` removed, with the closing answer replaced by
+    /// `*read.learned.get_or_insert(true)` so the answer stays right, reads
+    /// 2 GETs against 1 in the second arrangement.
+    #[tokio::test]
+    async fn the_rewrite_read_stops_at_the_first_parts_less_record() {
+        let bucket = Bucket::new(tenant(), Signal::Metrics, 0, 1);
+        let key_of =
+            |seed| keys::rewrite_record_key_for(&rewrite_record(&bucket, seed, Vec::new()));
+        let (first, second) = if key_of(1).expect("key") < key_of(2).expect("key") {
+            (1, 2)
+        } else {
+            (2, 1)
+        };
+
+        for (parts_less_first, want_gets) in [(false, 2), (true, 1)] {
+            let store = InstrumentedStore::new(MemoryStore::new());
+            put_tombstone(&store, 1).await;
+            let (first_parts, second_parts) = if parts_less_first {
+                (Vec::new(), vec![a_part()])
+            } else {
+                (vec![a_part()], Vec::new())
+            };
+            let first_key = put_rewrite_seeded(&store, &bucket, first, first_parts).await;
+            let second_key = put_rewrite_seeded(&store, &bucket, second, second_parts).await;
+            assert_eq!(
+                list_bucket(&store, &bucket)
+                    .await
+                    .expect("list")
+                    .rewrite_record_keys,
+                vec![first_key, second_key],
+                "the listing is in key order"
+            );
+
+            let (_, _, _, gets_unread) = observe(&store, &bucket, false).await;
+            let (_, expiry, read, gets_read) = observe(&store, &bucket, true).await;
+            assert_eq!(
+                expiry,
+                Some(ObservedExpiry::NoLaterThanOnly(RETIRED_AT_NS)),
+                "parts-less first: {parts_less_first}"
+            );
+            assert_eq!(
+                read,
+                Some(RewriteBoundRead {
+                    gets: want_gets,
+                    learned: Some(false),
+                }),
+                "parts-less first: {parts_less_first}"
+            );
+            assert_eq!(
+                gets_read,
+                gets_unread + want_gets as u64,
+                "parts-less first: {parts_less_first}"
+            );
+        }
+    }
+
+    /// A known answer is used without a GET, and wins over the listing: a
+    /// partial sweep deletes rewrite records before the tombstone, and the
+    /// expiry the parts-less one set does not change with it. Flipped line:
+    /// the `Known` arm moved after the empty-listing check reads `NoLaterThan`
+    /// against `NoLaterThanOnly`.
+    #[tokio::test]
+    async fn a_known_answer_needs_no_read_and_outlives_the_listing() {
+        let store = InstrumentedStore::new(MemoryStore::new());
+        let bucket = put_tombstone(&store, 1).await;
+        let gets = || store.metrics().snapshot().op(StoreOp::Get).calls;
+
+        let before = gets();
+        let (_, expiry) = evaluate_at(
+            &store,
+            &bucket,
+            RETIRED_AT_NS + 1,
+            RewriteBound::Known(false),
+        )
+        .await
+        .expect("retention pass");
+        assert_eq!(expiry, Some(ObservedExpiry::NoLaterThanOnly(RETIRED_AT_NS)));
+        let no_rewrite_gets = gets() - before;
+
+        put_rewrite(&store, &bucket, Vec::new()).await;
+        let before = gets();
+        let (_, expiry) = evaluate_at(
+            &store,
+            &bucket,
+            RETIRED_AT_NS + 1,
+            RewriteBound::Known(true),
+        )
+        .await
+        .expect("retention pass");
+        assert_eq!(expiry, Some(ObservedExpiry::NoLaterThan(RETIRED_AT_NS)));
+        assert_eq!(
+            gets() - before,
+            no_rewrite_gets,
+            "a known answer reads no rewrite record"
+        );
     }
 }
