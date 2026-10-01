@@ -444,6 +444,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A tiered-cache miss no longer issues a duplicate GET** (issue #2280).
+  A read that peeked both cache tiers while a GET for the same range was in
+  flight, but reached the single flight only after that GET had finished,
+  led a new flight and fetched the range again. The disk peek runs on the
+  blocking pool, so a loaded machine could stretch that gap past a whole
+  GET. A flight's leader now serves the bytes the previous flight left in
+  the RAM tier instead, without recording a second miss.
 - **A zero loop interval is refused at startup** (issue #2256).
   `--maintain-interval-secs 0`, `--fold-interval-secs 0`,
   `--alert-eval-interval-secs 0` and `--oidc-jwks-refresh-interval-secs 0`

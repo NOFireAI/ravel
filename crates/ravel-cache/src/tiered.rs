@@ -156,6 +156,12 @@ where
         self.disk.as_ref()
     }
 
+    /// How many callers are parked as followers on the in-flight fetch for
+    /// `key`; 0 when none is in flight.
+    pub fn in_flight_waiters(&self, key: &CacheKey) -> usize {
+        self.single_flight.waiters(key)
+    }
+
     /// Read `key` through both tiers, fetching upstream only if both miss.
     ///
     /// Returns the served bytes and the [`Source`] they came from. Order:
@@ -272,8 +278,14 @@ where
 
     /// Resolve a miss the caller ALREADY confirmed with [`get`](Self::get):
     /// run `fetch` once behind single-flight and admit its result to **both**
-    /// tiers, **without** re-consulting either tier and **without** recording a
-    /// miss of this method's own.
+    /// tiers, **without** re-consulting the disk tier and **without** recording
+    /// a miss of this method's own.
+    ///
+    /// A caller can peek while another flight for `key` is running and arrive
+    /// here after that flight has finished and left the single-flight map. Its
+    /// leader therefore checks the RAM tier once, uncounted, before fetching:
+    /// every leader admits to RAM before it leaves the map, so such a caller is
+    /// served the finished flight's bytes rather than issuing a second fetch.
     ///
     /// This is the coalesced companion to [`get`](Self::get)'s peek-then-defer
     /// discipline (ADR-0046 decision 5), and it exists apart from
@@ -292,12 +304,12 @@ where
     /// `get_or_fetch` uses, not a second coordinator, so a concurrent
     /// `get_or_fetch` and a `resolve_peeked_miss` on the same key still coalesce
     /// onto each other correctly. The stored single-flight value is
-    /// `(clean_bytes, false)`: this method's own leader never serves from a tier
-    /// (`false` = "not from cache", so the bytes are the fresh upstream fetch and
-    /// are never corrupted). A follower may instead ride a concurrent
-    /// `get_or_fetch` leader that served from disk (`true`); that flag is honored
-    /// on the way out so a disk-served ride is corruption-gated identically to
-    /// `get_or_fetch`.
+    /// `(clean_bytes, false)` for a fetch (`false` = "not from cache", so the
+    /// bytes are the fresh upstream fetch and are never corrupted), and
+    /// `(clean_bytes, true)` when the leader's RAM check above served them. A
+    /// follower may instead ride a concurrent `get_or_fetch` leader that served
+    /// from disk (`true`); that flag is honored on the way out so a cache-served
+    /// result is corruption-gated identically to `get_or_fetch`.
     ///
     /// Accounting discipline (the invariant this method depends on): it records
     /// **no miss** on either tier -- the caller's earlier `get` already recorded
@@ -325,15 +337,23 @@ where
         F: FnOnce() -> Fut + Send,
         Fut: std::future::Future<Output = Result<Bytes, E>> + Send,
     {
-        // No tier consultation: the caller peeked both tiers with `get` and got
-        // a confirmed miss, so re-reading here would be redundant and could
-        // count a second, unaccounted miss. The leader runs the upstream fetch
-        // once and, on success, admits to BOTH tiers (decision 3). `false`
-        // records that these bytes are the fresh upstream fetch, never a cache
-        // serve, so they are never corrupted.
+        // No counted tier consultation: the caller peeked both tiers with `get`
+        // and got a confirmed miss, so a counted re-read here would record a
+        // second miss. The leader runs the upstream fetch once and, on success,
+        // admits to BOTH tiers (decision 3). `false` records that these bytes
+        // are the fresh upstream fetch, never a cache serve, so they are never
+        // corrupted.
         let (outcome, role) = self
             .single_flight
             .run(key, move || async move {
+                // The caller's peek may have missed while an earlier flight
+                // for `key` was running and reached here after that flight
+                // left the map. Every leader admits to RAM before it leaves,
+                // so those bytes are served instead of a second fetch.
+                // Uncounted: the peek already recorded this request's miss.
+                if let Some(bytes) = self.ram.get_uncounted(&key) {
+                    return Ok((bytes, true));
+                }
                 let bytes = fetch().await?;
                 self.ram.insert(key, bytes.clone());
                 // `DiskCache::insert` is std::fs I/O; run it on the blocking
@@ -361,10 +381,11 @@ where
             // accounted miss for this logical request.
             self.ram.metrics().record_collapse();
         }
-        // `from_cache` is `false` for this method's own leader (it consults no
-        // tier), but a follower may have ridden a concurrent `get_or_fetch`
-        // leader that served from disk (`true`); honor it so a disk-served ride
-        // is corruption-gated exactly as `get_or_fetch`'s is.
+        // `from_cache` is `false` for this method's own fetching leader, but
+        // `true` for one served by its RAM check or a follower that rode a
+        // concurrent `get_or_fetch` leader that served from disk; honor it so
+        // a cache-served result is corruption-gated exactly as
+        // `get_or_fetch`'s is.
         Ok(self.maybe_corrupt(bytes, from_cache))
     }
 
@@ -906,6 +927,11 @@ mod tests {
                 "a follower parks on the held leader instead of completing on its own"
             );
         }
+        assert_eq!(
+            tiered.in_flight_waiters(&key),
+            CALLERS - 1,
+            "every follower is parked on the held leader"
+        );
         release_tx.send(()).expect("the leader is still parked");
 
         for follower in followers {
@@ -941,6 +967,82 @@ mod tests {
         assert!(
             tiered.disk.get(&key).is_some(),
             "a successful resolve admits to the disk tier, not RAM alone"
+        );
+    }
+
+    /// A caller that peeks while a fetch for the key is in flight, and reaches
+    /// `resolve_peeked_miss` only after that fetch has finished and left the
+    /// single-flight map, is served the finished fetch's bytes: no second
+    /// fetch, and no miss recorded beyond its own peek. In `read_range` the gap
+    /// between peek and resolve is the disk consult's `spawn_blocking` round
+    /// trip, which a loaded machine can stretch past a whole upstream GET.
+    ///
+    /// FLIP: removing the leader's `self.ram.get_uncounted(&key)` check in
+    /// `resolve_peeked_miss` runs the late caller's fetch, so `late_fetches`
+    /// reads 1.
+    #[tokio::test]
+    async fn resolve_peeked_miss_after_the_flight_finished_reuses_its_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        let ram: Cache<&'static str> = Cache::new(generous_limits());
+        let ram_metrics = ram.metrics();
+        let tiered = Arc::new(TieredCache::new(ram, disk));
+
+        let payload = Bytes::from_static(b"fetched once");
+        let key = test_key(1, payload.len() as u64);
+
+        assert!(tiered.get(&key).is_none(), "the leader's own peek misses");
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let leader = {
+            let tiered = tiered.clone();
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                tiered
+                    .resolve_peeked_miss(key, move || async move {
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.await;
+                        Ok::<Bytes, &'static str>(payload)
+                    })
+                    .await
+            })
+        };
+        entered_rx.await.expect("the leader reaches its fetch");
+
+        assert!(
+            tiered.get(&key).is_none(),
+            "the late caller peeks while the leader's fetch is in flight"
+        );
+        let misses_after_peeks = ram_metrics.snapshot().misses;
+        release_tx.send(()).expect("the leader is still parked");
+        let leader_bytes = leader.await.unwrap().unwrap();
+        assert_eq!(
+            tiered.in_flight_waiters(&key),
+            0,
+            "the flight has finished and left the map"
+        );
+
+        let late_fetches = Arc::new(AtomicUsize::new(0));
+        let ran = late_fetches.clone();
+        let late_bytes = tiered
+            .resolve_peeked_miss(key, move || async move {
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok::<Bytes, &'static str>(Bytes::from_static(b"second fetch"))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            late_fetches.load(Ordering::SeqCst),
+            0,
+            "a miss peeked during the flight must not fetch again"
+        );
+        assert_eq!(late_bytes, payload);
+        assert_eq!(leader_bytes, late_bytes);
+        assert_eq!(
+            ram_metrics.snapshot().misses,
+            misses_after_peeks,
+            "the RAM check records no miss of its own"
         );
     }
 
