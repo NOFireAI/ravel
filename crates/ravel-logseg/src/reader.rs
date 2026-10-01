@@ -68,7 +68,10 @@ pub struct ScanStats {
     /// Stored bytes of pages present in the blocks this scan decoded,
     /// regardless of the [`ColumnSelection`]. A decode-time column-filtering
     /// measurement, distinct from any wire-byte count. Grows as blocks are
-    /// decoded (ADR-0107 decision 4).
+    /// decoded (ADR-0107 decision 4). A row-group dictionary page (tag 12) is
+    /// counted in every block that reads through it, so a scan over a whole
+    /// group adds each dictionary page once per block of its chunk, not once
+    /// per fetch; `page_bytes_decoded` counts a kept one the same way.
     pub page_bytes_fetched: u64,
     /// Stored bytes of the pages this scan actually decoded after column
     /// filtering. Equal to `page_bytes_fetched` for an all-columns scan; the

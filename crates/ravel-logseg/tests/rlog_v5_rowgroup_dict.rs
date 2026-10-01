@@ -1052,6 +1052,107 @@ fn page_dir_relaxations_apply_only_to_the_dictionary_page() {
     }
 }
 
+/// The page-count refusal read before the first page names the bound it
+/// applies, `1..=2 * block_count + 1`, for a count past it and for zero. Five
+/// pages over two blocks with a dictionary page decodes; without one, the
+/// fifth page is refused by the per-block run cap before the chunk-wide
+/// `1..=2 * block_count` check is reached.
+///
+/// Wrong implementations this rules out, each shown failing: the earlier text,
+/// which named `1..=4` for a check that admits five pages; the right bound
+/// under the chunk-wide check's wording, which cannot be told from it.
+#[test]
+fn page_count_refusals_name_the_bound_they_apply() {
+    let with_dict = vec![
+        page(2, Enc::DictPage),
+        page(0, Enc::Bitmap),
+        page(0, Enc::DictIds),
+        page(1, Enc::Bitmap),
+        page(1, Enc::DictIds),
+    ];
+    decodes(&one_chunk(2, with_dict.clone())).expect("five pages with a dictionary page");
+
+    let mut six = with_dict;
+    six.push(page(1, Enc::DictIds));
+    let without_dict = vec![
+        page(0, Enc::Bitmap),
+        page(0, Enc::Plain),
+        page(1, Enc::Bitmap),
+        page(1, Enc::Plain),
+        page(1, Enc::Plain),
+    ];
+    let cases = [
+        (
+            six,
+            "page_dir page count 6 outside 1..=5 for a chunk of 2 blocks that may carry a \
+             dictionary page",
+        ),
+        (
+            Vec::new(),
+            "page_dir page count 0 outside 1..=5 for a chunk of 2 blocks that may carry a \
+             dictionary page",
+        ),
+        (
+            without_dict,
+            "page_dir block 1 carries more than 2 pages in one column",
+        ),
+    ];
+    for (pages, want) in cases {
+        match decodes(&one_chunk(2, pages)) {
+            Err(LogSegError::Corrupted(m)) => assert_eq!(m, want),
+            other => panic!("{want}: {other:?}"),
+        }
+    }
+}
+
+/// A whole scan's `page_bytes_fetched` and `page_bytes_decoded` count a
+/// dictionary page once per block of its chunk: over the three-block object,
+/// every block page once plus each dictionary page, `svc`'s among them, three
+/// times.
+///
+/// Wrong implementations this rules out, each shown failing: the dictionary
+/// page left out of `page_bytes_fetched`; the dictionary page left out of
+/// `page_bytes_decoded`.
+#[test]
+fn scan_page_bytes_count_the_dictionary_page_per_block() {
+    let (_, object) = three_block_object();
+    let dir = page_dir(&object);
+    assert_eq!(dir.groups.len(), 1);
+    let svc = dyn_column(&object, "svc");
+    let mut block_pages = 0u64;
+    let mut dicts_per_block = 0u64;
+    let mut dict_chunks = Vec::new();
+    for c in &dir.groups[0].chunks {
+        let blocks: HashSet<u32> = c
+            .pages
+            .iter()
+            .filter(|p| p.enc != Enc::DictPage)
+            .map(|p| p.block)
+            .collect();
+        block_pages += c
+            .pages
+            .iter()
+            .filter(|p| p.enc != Enc::DictPage)
+            .map(|p| p.len)
+            .sum::<u64>();
+        if let Some(d) = c.dict_page() {
+            assert_eq!(blocks.len(), 3, "column {}", c.column_id);
+            dicts_per_block += 3 * d.len;
+            dict_chunks.push(c.column_id);
+        }
+    }
+    assert!(dict_chunks.contains(&svc), "{dict_chunks:?}");
+    let want = block_pages + dicts_per_block;
+
+    let reader = RlogReader::new(&object, &RlogConfig::default()).expect("reader");
+    let (rows, stats) = reader.scan(&Predicate::And(vec![])).expect("scan");
+    assert_eq!(rows.len(), 12);
+    assert_eq!(
+        (stats.page_bytes_fetched, stats.page_bytes_decoded),
+        (want, want)
+    );
+}
+
 /// A tag 13 id at or past the dictionary's length is `Corrupted` in the codec
 /// and through the block decode, for every width, including an id equal to the
 /// length and a one-entry dictionary's zero-width page.
