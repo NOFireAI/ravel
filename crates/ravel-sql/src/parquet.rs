@@ -566,7 +566,9 @@ pub enum ParquetQueryError {
 impl ParquetQueryError {
     /// The client-visible class: 400 for a request this surface cannot take,
     /// 422 for a refusal or a permanent state a retry cannot change, 503 for
-    /// a storage or integrity fault.
+    /// a transient storage fault, 500 for an integrity fault or a store read
+    /// that failed its checksum. It agrees with `client_message`: a variant
+    /// answered `MSG_CORRUPT` there is `Internal` here.
     pub(crate) fn class(&self) -> ErrorClass {
         match self {
             ParquetQueryError::RowWindowUnsupported => ErrorClass::BadRequest,
@@ -576,9 +578,19 @@ impl ParquetQueryError {
                     ParquetReadError::FileChanged { .. } | ParquetReadError::FileMissing { .. } => {
                         ErrorClass::Unsupported
                     }
-                    ParquetReadError::Store { .. }
-                    | ParquetReadError::Corrupt { .. }
-                    | ParquetReadError::LeaderLost { .. } => ErrorClass::Unavailable,
+                    // A data file is an external object Ravel did not write,
+                    // and one stored without a checksum never fails as
+                    // `Corrupted`; where one was stored, the mismatch follows
+                    // the same rule as the manifest and grants reads below.
+                    ParquetReadError::Store { source, .. }
+                        if matches!(source.as_ref(), StoreError::Corrupted(_)) =>
+                    {
+                        ErrorClass::Internal
+                    }
+                    ParquetReadError::Corrupt { .. } => ErrorClass::Internal,
+                    ParquetReadError::Store { .. } | ParquetReadError::LeaderLost { .. } => {
+                        ErrorClass::Unavailable
+                    }
                     // Unreachable in practice: `From<ParquetQueryError> for
                     // SqlError` (ravel-sql/src/error.rs) converts this to
                     // `SqlError::Fetch` before a boxed `SqlError::Parquet`
@@ -591,9 +603,31 @@ impl ParquetQueryError {
                     | ParquetReadError::BytesBudgetExceeded { .. } => ErrorClass::Unsupported,
                 }
             }
-            ParquetQueryError::Resolve { .. }
-            | ParquetQueryError::Grants(_)
+            // A checksum mismatch on a manifest or grants record Ravel wrote:
+            // a retry reads the same bytes, as under `CatalogError::Store`.
+            ParquetQueryError::Resolve {
+                source:
+                    ResolveError::Store {
+                        source: StoreError::Corrupted(_),
+                        ..
+                    },
+                ..
+            }
+            | ParquetQueryError::Grants(GrantsError::Store {
+                source: StoreError::Corrupted(_),
+                ..
+            }) => ErrorClass::Internal,
+            ParquetQueryError::Resolve {
+                source: ResolveError::Store { .. } | ResolveError::Vanished { .. },
+                ..
+            }
+            | ParquetQueryError::Grants(GrantsError::Store { .. })
             | ParquetQueryError::PinnedManifestGone { .. } => ErrorClass::Unavailable,
+            // Every other manifest or grants fault is answered MSG_CORRUPT by
+            // `client_message`, so it is corrupt here too.
+            ParquetQueryError::Resolve { .. } | ParquetQueryError::Grants(_) => {
+                ErrorClass::Internal
+            }
             ParquetQueryError::NotConfigured { .. }
             | ParquetQueryError::LocationNotGranted { .. }
             | ParquetQueryError::Store { .. }
@@ -622,6 +656,12 @@ impl ParquetQueryError {
                     ParquetReadError::RequestBudgetExceeded { .. }
                     | ParquetReadError::BytesBudgetExceeded { .. } => read.to_string(),
                     ParquetReadError::Corrupt { .. } => MSG_CORRUPT.to_string(),
+                    // The checksum split of the matching arm in `class()`.
+                    ParquetReadError::Store { source, .. }
+                        if matches!(source.as_ref(), StoreError::Corrupted(_)) =>
+                    {
+                        MSG_CORRUPT.to_string()
+                    }
                     ParquetReadError::Store { .. } | ParquetReadError::LeaderLost { .. } => {
                         MSG_UNAVAILABLE.to_string()
                     }
@@ -648,6 +688,18 @@ impl ParquetQueryError {
                 "Parquet table {table} is read through a credential profile this server cannot \
                  open"
             ),
+            ParquetQueryError::Resolve {
+                source:
+                    ResolveError::Store {
+                        source: StoreError::Corrupted(_),
+                        ..
+                    },
+                ..
+            }
+            | ParquetQueryError::Grants(GrantsError::Store {
+                source: StoreError::Corrupted(_),
+                ..
+            }) => MSG_CORRUPT.to_string(),
             ParquetQueryError::Resolve {
                 source: ResolveError::Store { .. } | ResolveError::Vanished { .. },
                 ..
@@ -1113,6 +1165,68 @@ mod tests {
         assert!(message.contains("Ravel's own data bucket"), "{message}");
         assert!(!message.contains("ravel-data"), "{message}");
         assert!(!message.contains("lake"), "{message}");
+    }
+
+    /// Every Parquet store-error arm (a data read, directly and under a table
+    /// build, a manifest resolve and a grants read) answers a checksum
+    /// mismatch as corrupt (500) and a transient store fault as retryable
+    /// (503), in its own `class()` and through the `SqlError` the server maps
+    /// to a status.
+    ///
+    /// FLIP: drop the `ResolveError::Store { source: StoreError::Corrupted(_),
+    /// .. }` pattern from the corrupt arm of `client_message()` and the
+    /// resolve case fails with `left: "upstream storage temporarily
+    /// unavailable"`, `right: "stored data failed integrity validation"`.
+    #[test]
+    fn a_store_checksum_mismatch_is_corrupt_and_a_transient_fault_is_retryable() {
+        type Build = fn(StoreError) -> ParquetQueryError;
+        let cases: [(&str, Build); 4] = [
+            ("data read", |source| {
+                ParquetQueryError::Read(ParquetReadError::Store {
+                    key: "lake/part-0.parquet".to_string(),
+                    source: Arc::new(source),
+                })
+            }),
+            ("table build read", |source| {
+                ParquetQueryError::Table(ParquetTableError::Read {
+                    table: "t".to_string(),
+                    source: ParquetReadError::Store {
+                        key: "lake/part-0.parquet".to_string(),
+                        source: Arc::new(source),
+                    },
+                })
+            }),
+            ("resolve", |source| ParquetQueryError::Resolve {
+                table: "t".to_string(),
+                source: ResolveError::Store {
+                    key: "manifest-key".to_string(),
+                    source,
+                },
+            }),
+            ("grants", |source| {
+                ParquetQueryError::Grants(GrantsError::Store {
+                    key: "grants-key".to_string(),
+                    source,
+                })
+            }),
+        ];
+        let corrupt = || StoreError::Corrupted("checksum mismatch on raw-store-detail".to_string());
+        let transient = || StoreError::Transient("raw-store-detail".to_string());
+        for (name, build) in cases {
+            let err = build(corrupt());
+            assert_eq!(err.client_message(), MSG_CORRUPT, "{name}");
+            assert_eq!(err.class(), ErrorClass::Internal, "{name}");
+            let err = crate::SqlError::from(build(corrupt()));
+            assert_eq!(err.client_message(), MSG_CORRUPT, "{name}");
+            assert_eq!(err.class(), ErrorClass::Internal, "{name}");
+
+            let err = build(transient());
+            assert_eq!(err.client_message(), MSG_UNAVAILABLE, "{name}");
+            assert_eq!(err.class(), ErrorClass::Unavailable, "{name}");
+            let err = crate::SqlError::from(build(transient()));
+            assert_eq!(err.client_message(), MSG_UNAVAILABLE, "{name}");
+            assert_eq!(err.class(), ErrorClass::Unavailable, "{name}");
+        }
     }
 
     /// The service comparison: one AWS partition for no endpoint or any
