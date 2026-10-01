@@ -823,9 +823,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`snapshot_location` reserves each footer read's bytes before issuing it
   and trusts a prefix listing for a file's key and pin only, never its
   size** (ADR-2040, issue #2283). The first footer read is now a suffix
-  read of `FOOTER_PREFETCH` bytes, so a listing that under- or
-  over-reports a file's size, in either direction, can no longer misplace
-  the read. An `InvalidRange` on that first read (an endpoint answering a
+  read of `FOOTER_PREFETCH` bytes on a store whose capabilities report
+  `suffix_range`, and otherwise an explicit range over the last
+  `min(FOOTER_PREFETCH, size)` bytes of the listed size, self-correcting
+  with one retry at the size its own response reports if that listed
+  size was stale, and refusing `FileChanged` if the two reads still
+  disagree; a store that cannot take a suffix range (Azure) never
+  receives one. A snapshot's footer reads are now one or two GETs per
+  file on a suffix-capable store, up to three on one that is not. A
+  listing that under- or over-reports a file's size, in either
+  direction, can no longer misplace the read. An `InvalidRange` on that
+  first read (an endpoint answering a
   suffix read against a 0-byte object with 416 instead of an empty body)
   now reports `EmptyFile`, the same as a GET that answers it with an empty
   body; every other `InvalidRange` case still reports as a generic `Store`
