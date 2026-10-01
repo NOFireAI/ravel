@@ -483,8 +483,10 @@ impl ReadCache {
     /// The tiered tier's [`TieredCache::get_or_fetch`] peeks both tiers
     /// internally and returns the real [`Source`]. The RAM tier's
     /// [`Cache::get_or_fetch`] is miss-only, so the RAM branch peeks once here (a
-    /// hit is [`Source::Cache`]) and runs the miss-only fetch on a miss (always
-    /// [`Source::Upstream`]); neither branch counts the miss twice.
+    /// hit is [`Source::Cache`]) and runs the miss-only fetch on a miss, which it
+    /// always reports as [`Source::Upstream`], including when that call's
+    /// uncounted RAM recheck served the bytes without a GET; neither branch
+    /// counts the miss twice.
     pub(crate) async fn get_or_fetch<F, Fut>(
         &self,
         key: CacheKey,
