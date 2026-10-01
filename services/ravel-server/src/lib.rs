@@ -1014,8 +1014,8 @@ pub struct Running {
     pub fragment_addr: Option<SocketAddr>,
     /// Refused SQL slice capabilities by reason (ADR-1689 decision 2), one set
     /// shared by the Flight service on every listener of this process, `Some`
-    /// whenever Flight SQL is served. Public as a test seam: the counts are not
-    /// rendered on `/metrics` yet.
+    /// whenever Flight SQL is served. The same set `/metrics` renders as
+    /// `ravel_sql_slice_rejects_total`; public as a test seam.
     #[cfg(feature = "flight-sql")]
     pub sql_slice_rejects: Option<ravel_sql::SliceRejectCounters>,
     /// The SQL lane's worker roster, resolved per query exactly as the
@@ -2661,6 +2661,10 @@ pub async fn start_with_heartbeat(
         ingest_concurrency: ingest_concurrency.clone(),
         ingest_buffer_budget: ingest_buffer_budget.clone(),
         distrib: distrib_metrics.clone(),
+        // Filled in below, once the query-serving block has decided whether
+        // the Flight service is built.
+        #[cfg(feature = "flight-sql")]
+        sql_slice_rejects: None,
         durable_auth: durable_auth.clone(),
         ingest_byte_metrics: ingest_byte_metrics.clone(),
         normalize_reject_metrics: normalize_reject_metrics.clone(),
@@ -3190,6 +3194,17 @@ pub async fn start_with_heartbeat(
         }
     }
 
+    // One set of slice reject counters for the Flight service on every
+    // listener (ADR-1689 decision 2), created here so `/metrics` holds the
+    // same set. The Flight service below is built exactly when `sql_state` is
+    // `Some`, so that is when the counters are rendered.
+    #[cfg(feature = "flight-sql")]
+    let slice_rejects = ravel_sql::SliceRejectCounters::default();
+    #[cfg(feature = "flight-sql")]
+    {
+        metrics_state.sql_slice_rejects = sql_state.as_ref().map(|_| slice_rejects.clone());
+    }
+
     // Merged after the query-serving block so the exposition can carry that
     // block's audit pipeline. Route order is irrelevant: `/metrics` collides
     // with nothing above.
@@ -3442,7 +3457,6 @@ pub async fn start_with_heartbeat(
             .as_ref()
             .filter(|_| matches!(config.mode, Mode::All | Mode::Query))
             .and_then(|settings| settings.fragment_listener.as_ref());
-        let slice_rejects = ravel_sql::SliceRejectCounters::default();
         // The dedicated listener verifies what this process's coordinator mints,
         // so it holds the same keys: the file's, or the release A derived key.
         let slice_keys = ticket_keys.clone().or_else(|| {

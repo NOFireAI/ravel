@@ -211,6 +211,8 @@ fn surfaces(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Surfaces {
             ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(1024),
         ),
         distrib: None,
+        #[cfg(feature = "flight-sql")]
+        sql_slice_rejects: None,
         durable_auth: None,
         ingest_byte_metrics: std::sync::Arc::new(
             ravel_server::ingest_byte_metrics::IngestByteMetrics::new(),
@@ -631,6 +633,8 @@ mod flight {
                     ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(1024),
                 ),
             distrib: None,
+            #[cfg(feature = "flight-sql")]
+            sql_slice_rejects: None,
             durable_auth: None,
             ingest_byte_metrics: std::sync::Arc::new(
                 ravel_server::ingest_byte_metrics::IngestByteMetrics::new(),
