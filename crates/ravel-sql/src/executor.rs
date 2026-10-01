@@ -2414,13 +2414,8 @@ impl SqlExecutor {
             .into());
         };
         Ok(Some(
-            parquet::resolve_pinned_tables(
-                sources,
-                &tenant_hash,
-                pins,
-                phase_accounting.resolve(),
-            )
-            .await?,
+            parquet::resolve_pinned_tables(sources, &tenant_hash, pins, phase_accounting.resolve())
+                .await?,
         ))
     }
 

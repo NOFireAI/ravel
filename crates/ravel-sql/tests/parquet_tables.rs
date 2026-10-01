@@ -238,6 +238,28 @@ impl Lake {
         .expect("create");
     }
 
+    /// Replace `table` with one made of `files`: a newer manifest version.
+    #[cfg(feature = "flight-sql")]
+    async fn replace(&self, tenant: &TenantHash, table: &str, files: Vec<ParquetFile>) {
+        writer::apply(
+            self.ravel.inner(),
+            tenant,
+            table,
+            Intent::CreateOrReplace {
+                location: format!("{GRANT}/{table}/"),
+                grant: GRANT.to_string(),
+                files,
+                options: BTreeMap::new(),
+                created_by: "test".to_string(),
+                statement: format!("CREATE OR REPLACE EXTERNAL TABLE {table} ..."),
+            },
+            &FixedClock::new(NOW),
+            MIN_GRACE_MS,
+        )
+        .await
+        .expect("replace");
+    }
+
     /// Grant [`GRANT`] to `tenant` and create `hits` over [`hits_files`].
     async fn hits_for(&self, tenant: &TenantHash) {
         let mut files = Vec::new();
@@ -1151,6 +1173,243 @@ async fn get_flight_info_resolves_a_parquet_table_once() {
         Lake::gets(&lake.ravel) - gets,
         2,
         "one GET of the newest manifest and one of the grants record"
+    );
+}
+
+/// One row group of `id: Int64` and `extra: Utf8`: a schema other than
+/// [`parquet_bytes`]'s, for a table replaced by one of another shape.
+#[cfg(feature = "flight-sql")]
+fn replacement_parquet_bytes(ids: &[i64], extras: &[&str]) -> Bytes {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("extra", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(ids.to_vec())) as ArrayRef,
+            Arc::new(StringArray::from(extras.to_vec())),
+        ],
+    )
+    .expect("batch");
+    let mut out = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut out, schema, None).expect("writer");
+    writer.write(&batch).expect("write");
+    writer.close().expect("close");
+    Bytes::from(out)
+}
+
+#[cfg(feature = "flight-sql")]
+fn field_names(schema: &Schema) -> Vec<String> {
+    schema
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect()
+}
+
+/// A table replaced between `GetFlightInfo` and `DoGet` (a newer manifest
+/// version with another schema) is still read at the version `GetFlightInfo`
+/// resolved: `DoGet` streams that version's rows under the schema the
+/// `FlightInfo` advertised, and a statement planned after the replacement sees
+/// the new table.
+///
+/// FLIP: a `DoGet` that resolves the table's newest manifest streams the
+/// replacement's `id, extra` schema and rows.
+#[cfg(feature = "flight-sql")]
+#[tokio::test]
+async fn a_table_replaced_between_the_rpcs_is_read_at_the_pinned_version() {
+    use util::flight_harness::merged;
+
+    let lake = Lake::configured();
+    let acme = TenantId::new("acme");
+    lake.hits_for(&acme.hash()).await;
+    let harness = flight_harness(&lake, &acme);
+    let sql = "SELECT * FROM hits ORDER BY id";
+
+    let info = harness
+        .get_flight_info_full("acme", sql)
+        .await
+        .expect("flight info");
+    let ticket = info.endpoint[0].ticket.clone().expect("ticket");
+    let advertised = info.try_decode_schema().expect("schema");
+    assert_eq!(field_names(&advertised), vec!["id", "name", "score"]);
+
+    let replacement = lake
+        .put_file(
+            "t/hits/replacement.parquet",
+            replacement_parquet_bytes(&[10, 20], &["x", "y"]),
+        )
+        .await;
+    lake.replace(&acme.hash(), "hits", vec![replacement]).await;
+
+    let streamed = harness.do_get("acme", &ticket).await.expect("do get");
+    let batch = merged(&streamed);
+    assert_eq!(
+        field_names(batch.schema().as_ref()),
+        vec!["id", "name", "score"],
+        "the schema GetFlightInfo advertised"
+    );
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id");
+    assert_eq!(
+        (0..ids.len()).map(|row| ids.value(row)).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5, 6],
+        "the rows of the pinned version"
+    );
+
+    // Non-vacuity: the replacement is live, so a statement planned now sees it.
+    let later = harness
+        .get_flight_info_full("acme", sql)
+        .await
+        .expect("flight info after the replacement");
+    assert_eq!(
+        field_names(&later.try_decode_schema().expect("schema")),
+        vec!["id", "extra"]
+    );
+}
+
+/// A grant removed between the RPCs fails `DoGet` with the typed refusal the
+/// one-shot path gives, before any file is read: the ticket pins manifests, not
+/// the tenant's grants (ADR-2040 D3).
+#[cfg(feature = "flight-sql")]
+#[tokio::test]
+async fn a_grant_removed_between_the_rpcs_fails_do_get() {
+    let lake = Lake::configured();
+    let acme = TenantId::new("acme");
+    lake.hits_for(&acme.hash()).await;
+    let harness = flight_harness(&lake, &acme);
+    let ticket = harness
+        .get_flight_info("acme", "SELECT id FROM hits ORDER BY id")
+        .await
+        .expect("flight info");
+
+    grants::remove(lake.ravel.inner(), &acme.hash(), GRANT)
+        .await
+        .expect("revoke");
+    let lake_before = Lake::gets(&lake.lake);
+    let status = harness
+        .do_get("acme", &ticket)
+        .await
+        .expect_err("the grant is gone");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status
+            .message()
+            .contains("outside every location currently granted"),
+        "{}",
+        status.message()
+    );
+    assert_eq!(
+        Lake::gets(&lake.lake),
+        lake_before,
+        "no file of the table was read"
+    );
+}
+
+/// `DoGet` reads the pinned manifest object by its version and the grants
+/// record: two GETs on Ravel's store and no LIST of the manifest prefix.
+///
+/// FLIP: resolving the newest manifest at `DoGet` adds one LIST.
+#[cfg(feature = "flight-sql")]
+#[tokio::test]
+async fn do_get_reads_the_pinned_manifest_without_a_list() {
+    let lake = Lake::configured();
+    let acme = TenantId::new("acme");
+    lake.hits_for(&acme.hash()).await;
+    let harness = flight_harness(&lake, &acme);
+    let ticket = harness
+        .get_flight_info("acme", "SELECT id FROM hits ORDER BY id")
+        .await
+        .expect("flight info");
+
+    let (gets, lists) = (Lake::gets(&lake.ravel), Lake::lists(&lake.ravel));
+    harness.do_get("acme", &ticket).await.expect("do get");
+    assert_eq!(Lake::lists(&lake.ravel) - lists, 0, "no LIST");
+    assert_eq!(
+        Lake::gets(&lake.ravel) - gets,
+        2,
+        "the pinned manifest and the grants record"
+    );
+}
+
+/// A pinned manifest version that no longer exists (swept after a newer one
+/// replaced it) invalidates the ticket: `DoGet` does not fall back to the
+/// newest version.
+#[cfg(feature = "flight-sql")]
+#[tokio::test]
+async fn a_pinned_manifest_that_is_gone_invalidates_the_ticket() {
+    let lake = Lake::configured();
+    let acme = TenantId::new("acme");
+    lake.hits_for(&acme.hash()).await;
+    let harness = flight_harness(&lake, &acme);
+    let ticket = harness
+        .get_flight_info("acme", "SELECT id FROM hits ORDER BY id")
+        .await
+        .expect("flight info");
+
+    let replacement = lake
+        .put_file(
+            "t/hits/replacement.parquet",
+            replacement_parquet_bytes(&[10, 20], &["x", "y"]),
+        )
+        .await;
+    lake.replace(&acme.hash(), "hits", vec![replacement]).await;
+    let pinned = ravel_pqtable::keys::manifest_key(&acme.hash(), "hits", 1).expect("key");
+    lake.ravel.inner().delete(&pinned).await.expect("sweep");
+
+    let status = harness
+        .do_get("acme", &ticket)
+        .await
+        .expect_err("the pinned version is gone");
+    assert_eq!(status.code(), tonic::Code::Unavailable);
+}
+
+/// A statement over two Parquet tables pins both, and each is read at the
+/// version `GetFlightInfo` saw: replacing one of them afterwards changes
+/// neither the join's schema nor its rows.
+#[cfg(feature = "flight-sql")]
+#[tokio::test]
+async fn a_flight_join_of_two_parquet_tables_pins_both() {
+    use util::flight_harness::merged;
+
+    let lake = Lake::configured();
+    let acme = TenantId::new("acme");
+    lake.hits_for(&acme.hash()).await;
+    let names = lake
+        .put_file(
+            "t/names/0.parquet",
+            parquet_bytes(&[1, 5], &["first", "fifth"], &[0.0, 0.0]),
+        )
+        .await;
+    lake.create(&acme.hash(), "names", vec![names]).await;
+    let harness = flight_harness(&lake, &acme);
+    let sql = "SELECT h.id, n.name FROM hits h JOIN names n ON h.id = n.id ORDER BY h.id";
+    let ticket = harness
+        .get_flight_info("acme", sql)
+        .await
+        .expect("flight info");
+
+    let replacement = lake
+        .put_file(
+            "t/names/1.parquet",
+            parquet_bytes(&[2], &["second"], &[0.0]),
+        )
+        .await;
+    lake.replace(&acme.hash(), "names", vec![replacement]).await;
+
+    let streamed = harness.do_get("acme", &ticket).await.expect("do get");
+    let batch = merged(&streamed);
+    let names: Vec<String> = (0..batch.num_rows())
+        .map(|row| array_value_to_string(batch.column(1), row).expect("cell"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["first", "fifth"],
+        "the join reads `names` at the version it had when the ticket was minted"
     );
 }
 

@@ -1048,6 +1048,12 @@ pub fn plan_distributed_slices(
                     // attribute columns never apply; copied from the template
                     // (empty for a metrics query) for uniformity, ADR-0090.
                     declared_columns: template.declared_columns.clone(),
+                    // A slice fetch reads no manifest, and a Parquet statement
+                    // is never distributed (`plan_distributed_slices_for`), so
+                    // a slice pins no Parquet table even if the template does.
+                    parquet_tables: Vec::new(),
+                    // A worker slice runs under the worker's own ceilings.
+                    budgets: None,
                 };
                 WorkerSlice { location, ticket }
             })

@@ -154,7 +154,11 @@ pub(super) fn verify_slice(
 }
 
 /// The checks after the MAC, for a ticket that already verified under a slice
-/// key: expiry, then `slice_count > 1`.
+/// key: expiry, then `slice_count > 1`, then no pinned Parquet table. A slice
+/// fetch serves the raw samples scan over its pinned segments and never reads
+/// a manifest, so a ticket that names a Parquet table is not a slice this
+/// worker can serve, and is refused rather than read at the table's newest
+/// version.
 pub(super) fn check_slice_claims(
     ticket: FlightTicket,
     now_ns: i64,
@@ -162,7 +166,7 @@ pub(super) fn check_slice_claims(
     if ticket.is_expired(now_ns) {
         return Err(SliceReject::Expired);
     }
-    if ticket.slice_count <= 1 {
+    if ticket.slice_count <= 1 || !ticket.parquet_tables.is_empty() {
         return Err(SliceReject::WrongSurface);
     }
     Ok(ticket)
@@ -187,7 +191,33 @@ mod tests {
             slice_count: 2,
             pending_erasure: Vec::new(),
             declared_columns: Vec::new(),
+            parquet_tables: Vec::new(),
+            budgets: None,
         }
+    }
+
+    /// A slice fetch reads no manifest, so a slice capability that names a
+    /// Parquet table is refused as not a slice, under a valid MAC, rather than
+    /// served without the table or read at its newest version.
+    #[test]
+    fn a_slice_ticket_naming_a_parquet_table_is_refused() {
+        let keys = SqlTicketKeys::from_file_key(&[0x42; 32]);
+        let pinned = FlightTicket {
+            parquet_tables: vec![crate::parquet::ParquetPin {
+                table: "hits".to_string(),
+                version: 3,
+            }],
+            ..slice_ticket()
+        };
+        let encoded = keys.encode(&pinned, TicketSurface::Slice).expect("encode");
+        assert_eq!(
+            verify_slice(&keys, &encoded, NOW_NS),
+            Err(SliceReject::WrongSurface)
+        );
+        let plain = keys
+            .encode(&slice_ticket(), TicketSurface::Slice)
+            .expect("encode");
+        assert_eq!(verify_slice(&keys, &plain, NOW_NS), Ok(slice_ticket()));
     }
 
     /// A handle cut short of the smallest possible ticket never reaches a MAC
@@ -205,10 +235,10 @@ mod tests {
         );
 
         // A ticket with no statement, pins or columns is the smallest one the
-        // decoder accepts, so 97 bytes is the full handle verified above and
-        // 96 is the longest length the guard still refuses.
-        assert_eq!(encoded.len(), 97, "the fixture sits on the length guard");
-        for len in [1, 4, 16, 32, 96] {
+        // decoder accepts, so 102 bytes is the full handle verified above and
+        // 101 is the longest length the guard still refuses.
+        assert_eq!(encoded.len(), 102, "the fixture sits on the length guard");
+        for len in [1, 4, 16, 32, 101] {
             assert_eq!(
                 verify_slice(&keys, &encoded[..len], NOW_NS),
                 Err(SliceReject::Missing),
@@ -222,7 +252,7 @@ mod tests {
         assert_eq!(
             verify_slice(&keys, &forged, NOW_NS),
             Err(SliceReject::BadMac),
-            "a 97-byte handle clears the length guard, so its MAC is checked"
+            "a 102-byte handle clears the length guard, so its MAC is checked"
         );
     }
 }

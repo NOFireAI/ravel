@@ -612,6 +612,8 @@ fn slice_capability() -> Vec<u8> {
         slice_count: 2,
         pending_erasure: Vec::new(),
         declared_columns: Vec::new(),
+        parquet_tables: Vec::new(),
+        budgets: None,
     };
     SqlTicketKeys::from_file_key(&key)
         .encode(&ticket, TicketSurface::Slice)

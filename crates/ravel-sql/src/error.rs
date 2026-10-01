@@ -1331,6 +1331,25 @@ mod tests {
         assert_eq!(err.class(), ErrorClass::Unavailable);
     }
 
+    /// A Flight ticket whose pinned Parquet manifest is gone is an invalidated
+    /// snapshot, like a pinned segment that vanished, and not a Parquet
+    /// refusal; every other Parquet refusal stays one.
+    #[test]
+    fn a_gone_pinned_manifest_is_a_snapshot_invalidation() {
+        let gone = ParquetQueryError::PinnedManifestGone {
+            table: "hits".to_string(),
+            version: 3,
+        };
+        assert!(matches!(
+            SqlError::from(gone),
+            SqlError::SnapshotInvalidated
+        ));
+        let refused = ParquetQueryError::LocationNotGranted {
+            table: "hits".to_string(),
+        };
+        assert!(matches!(SqlError::from(refused), SqlError::Parquet(_)));
+    }
+
     #[test]
     fn segment_not_found_is_the_only_retry_trigger() {
         let not_found = SqlError::Fetch(FetchError::Store {
