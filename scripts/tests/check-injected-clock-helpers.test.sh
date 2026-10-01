@@ -496,9 +496,9 @@ check_contains "the non-clock receiver finding is reported as sleep()" "${out}" 
 # === (r) the real default target stays above the helper-count floor ========
 # The zero-helpers guard only catches a predicate that finds NOTHING. This
 # catches one that narrows: dropping FixedClock from the gate's CLOCK_TYPES
-# takes the real file from 26 scanned helpers to 5, and dropping both clock
-# types to 2, each of which passed every other case in this suite. A floor,
-# not an exact count, so a new helper in load.rs never fails the gate.
+# takes the default target from 35 scanned helpers to 5, and dropping both
+# clock types to 2, each of which passed every other case in this suite. A
+# floor, not an exact count, so a new helper under load/ never fails the gate.
 REAL_TARGET_HELPER_FLOOR=20
 check_eq "the gate declares the expected default-target helper floor" \
   "DEFAULT_TARGET_MIN_HELPERS=${REAL_TARGET_HELPER_FLOOR}" \
@@ -543,6 +543,33 @@ out="$(bash "${CHECK}" "${anchor}" 2>&1)"
 rc=$?
 check_eq "a cfg(test) mention in a doc comment does not move the scan start" "0" "${rc}"
 check_eq "only the real test module's helper is scanned past a doc-comment mention"   "1" "$(helper_count_of "${out}")"
+
+# === (t) the default target is the load/ directory, not one file ===========
+# The loader's helpers live in several files under load/, including test-only
+# files that carry no cfg(test) attribute of their own. Naming that directory
+# explicitly is the default scan (same count, floor applied); any other
+# directory is bad usage rather than a silent zero-helper scan.
+default_out="$(bash "${CHECK}" 2>&1)"
+out="$(bash "${CHECK}" "${SCRIPT_DIR}/../services/ravel-cli/src/load" 2>&1)"
+rc=$?
+check_eq "naming the default directory explicitly scans clean" "0" "${rc}"
+check_eq "naming the default directory explicitly scans the same helpers" \
+  "$(helper_count_of "${default_out}")" "$(helper_count_of "${out}")"
+check_ge "the default directory's scanned-helper count clears the floor" \
+  "${REAL_TARGET_HELPER_FLOOR}" "$(helper_count_of "${out}")"
+otherdir="${tmproot}/otherdir"
+mkdir -p "${otherdir}"
+cp "${anchor}" "${otherdir}/tests.rs"
+bash "${CHECK}" "${otherdir}" >/dev/null 2>&1
+rc=$?
+check_eq "a directory other than the default target is refused as bad usage" "64" "${rc}"
+
+# A test-only file named on its own is scanned whole, as in the directory scan:
+# the loader's logs tests carry no cfg(test) line of their own.
+out="$(bash "${CHECK}" "${SCRIPT_DIR}/../services/ravel-cli/src/load/logs/tests.rs" 2>&1)"
+rc=$?
+check_eq "a test-only file argument scans clean" "0" "${rc}"
+check_ge "a test-only file argument finds its helpers" "1" "$(helper_count_of "${out}")"
 
 echo
 echo "passed: ${pass}  failed: ${fail}"
