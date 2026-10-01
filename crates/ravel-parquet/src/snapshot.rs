@@ -538,9 +538,7 @@ async fn read_file(
         )
         .await
         .map_err(|err| match err {
-            // The first read already proved this object exists at this
-            // pin; a NotFound here means it changed since that read, not
-            // that it was never there.
+            // The one exception `read_error`'s doc comment names.
             SnapshotError::FileMissing { key } => SnapshotError::FileChanged { key },
             other => other,
         })?;
