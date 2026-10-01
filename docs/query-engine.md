@@ -870,9 +870,11 @@ same RAII `reserve` API, so they read under `component="fetch"`.
   build supports, a supersession chain of compaction or rewrite records that
   is cyclic, deeper than the resolver's fixed bound, or names a predecessor
   with a different input set, and a catalog decode job that panicked, 503
-  unavailable for transient store failures, for a catalog decode job the read
-  CPU gate cancelled at shutdown, and for a catalog object (commit,
-  compaction or rewrite record, erasure request, HEAD, snapshot part or
+  unavailable for transient store failures other than a checksum mismatch,
+  which answers 500 on a catalog read as on a segment fetch, for a catalog
+  decode job the read CPU gate cancelled at shutdown, and for a catalog
+  object (commit, compaction or rewrite record, erasure request, HEAD,
+  snapshot part or
   postings) written in a format version above the highest this build reads
   or carrying an enum value above the highest it reads (a snapshot part entry
   level), or a provisioning record written in a format version above the
