@@ -18,7 +18,7 @@ use ravel_logseg::block::{PageCounters, read_block_pages_with_dicts};
 use ravel_logseg::encoding::Enc;
 use ravel_logseg::field_dir::FieldDir;
 use ravel_logseg::footer::{kind, open};
-use ravel_logseg::page::{COMP_NONE, PageDesc, seal_page, smallest_stored};
+use ravel_logseg::page::{COMP_NONE, PageDesc, SealedPage, seal_page, smallest_stored};
 use ravel_logseg::page_dir::{ChunkEntry, GroupEntry, PageDir, PageEntry};
 use ravel_logseg::record::{COL_SEVERITY_TEXT, COL_STREAM_REF, COL_TS};
 use ravel_logseg::rlog_codec::{
@@ -444,40 +444,86 @@ fn corrupt_dictionary_page_fails_a_whole_block_read_of_every_other_block() {
     }
 }
 
-/// The stored bytes a chunk takes on per-block value pages, and on one
-/// dictionary page plus per-block id pages, for `blocks` of values.
-fn chunk_costs(blocks: &[Vec<String>]) -> (u64, u64) {
+/// A page's cost under the writer's size rule when placed at `block`: its
+/// stored bytes plus its PAGE_DIR entry, then the same over its encoded
+/// length, which is what a rule comparing sizes before the envelope counts.
+fn page_cost(page: &SealedPage, block: usize) -> (u64, u64) {
+    let entry = |comp: u8, len: u64| {
+        PageEntry {
+            block: block as u32,
+            enc: page.enc,
+            comp,
+            len,
+            uncomp_len: page.uncomp_len,
+            crc32c: 0,
+        }
+        .encoded_len()
+    };
+    let stored = page.stored.len() as u64;
+    (
+        stored + entry(page.comp, stored),
+        page.uncomp_len + entry(COMP_NONE, page.uncomp_len),
+    )
+}
+
+/// A chunk's two layouts for `blocks` of values, costed page by page with the
+/// codec the writer uses: per-block value pages, and one dictionary page plus
+/// per-block id pages.
+#[derive(Debug)]
+struct ChunkCosts {
+    /// Stored bytes plus PAGE_DIR entries: the size rule's two sides.
+    per_block: u64,
+    dict: u64,
+    /// The same over encoded sizes.
+    per_block_encoded: u64,
+    dict_encoded: u64,
+    /// Stored page bytes alone, the chunk's extent under each layout.
+    per_block_pages: u64,
+    dict_pages: u64,
+}
+
+fn chunk_costs(blocks: &[Vec<String>]) -> ChunkCosts {
     let mut sorted: Vec<&[u8]> = blocks.iter().flatten().map(|v| v.as_bytes()).collect();
     sorted.sort_unstable();
     sorted.dedup();
-    let mut per_block = 0u64;
-    let mut dict = seal_page(Enc::DictPage, encode_dict_page(&sorted), ZSTD_LEVEL)
-        .stored
-        .len() as u64;
-    for b in blocks {
+    let dict_page = seal_page(Enc::DictPage, encode_dict_page(&sorted), ZSTD_LEVEL);
+    let (dict, dict_encoded) = page_cost(&dict_page, blocks.len());
+    let mut c = ChunkCosts {
+        per_block: 0,
+        dict,
+        per_block_encoded: 0,
+        dict_encoded,
+        per_block_pages: 0,
+        dict_pages: dict_page.stored.len() as u64,
+    };
+    for (block, b) in blocks.iter().enumerate() {
         let values: Vec<&[u8]> = b.iter().map(|v| v.as_bytes()).collect();
-        per_block += smallest_stored(string_candidates(&values), ZSTD_LEVEL)
-            .expect("candidates")
-            .stored
-            .len() as u64;
+        let own = smallest_stored(string_candidates(&values), ZSTD_LEVEL).expect("candidates");
+        let (stored, encoded) = page_cost(&own, block);
+        c.per_block += stored;
+        c.per_block_encoded += encoded;
+        c.per_block_pages += own.stored.len() as u64;
         let ids: Vec<u64> = values
             .iter()
             .map(|v| sorted.partition_point(|e| e < v) as u64)
             .collect();
-        dict += seal_page(
+        let id_page = seal_page(
             Enc::DictIds,
             encode_dict_ids(&ids, sorted.len()),
             ZSTD_LEVEL,
-        )
-        .stored
-        .len() as u64;
+        );
+        let (stored, encoded) = page_cost(&id_page, block);
+        c.dict += stored;
+        c.dict_encoded += encoded;
+        c.dict_pages += id_page.stored.len() as u64;
     }
-    (per_block, dict)
+    c
 }
 
-/// Writes `blocks` (all the same length) as one row group of attribute `k` and
-/// returns the chunk's page encodings and its stored bytes.
-fn write_k_blocks(blocks: &[Vec<String>]) -> (Vec<Enc>, u64) {
+/// Writes `blocks` (each but the last of the first's length) as one row group
+/// of attribute `k`, checks it scans back, and returns the chunk and the
+/// object's length.
+fn write_k_blocks(blocks: &[Vec<String>]) -> (ChunkEntry, usize) {
     let per = blocks[0].len();
     let records: Vec<LogRecord> = blocks
         .iter()
@@ -490,61 +536,121 @@ fn write_k_blocks(blocks: &[Vec<String>]) -> (Vec<Enc>, u64) {
     let dir = page_dir(&object);
     assert_eq!(dir.groups.len(), 1);
     assert_eq!(dir.block_count(), blocks.len() as u64);
-    let c = chunk(&dir, 0, dyn_column(&object, "k"));
-    (encs(&c), c.extent().expect("extent").1)
+    (chunk(&dir, 0, dyn_column(&object, "k")), object.len())
+}
+
+fn extent(c: &ChunkEntry) -> u64 {
+    c.extent().expect("extent").1
 }
 
 /// The dictionary is taken only when the chunk's distinct values are at most
 /// half its values and the dictionary page plus the id pages store strictly
 /// smaller than the per-block value pages would.
 ///
-/// Three chunks, each costed against the per-block pages the codec would
-/// otherwise write: `AB|AB`, exactly half, shrinks and takes the dictionary;
-/// 32 blocks of one own value twice, exactly half as well, where 32 entries
-/// need 5-bit ids and the dictionary stores one byte more, keeps per-block
-/// pages; `ABCD|AB`, four distinct in six (one over half), would shrink too and
-/// keeps per-block pages.
+/// Each case is costed with the writer's own codec and PAGE_DIR encoder, as
+/// stored page bytes plus one 9-byte entry per page (every varint here is
+/// under 128, except the 32-entry dictionary page's two lengths):
 ///
-/// Wrong implementations this rules out, each shown failing: the half rule
-/// alone, with no size comparison (the 32-block chunk takes it); a strict half
-/// (`2 * distinct < present`, `AB|AB` keeps per-block pages); no half rule, size
-/// only (`ABCD|AB` takes it).
+/// - one block `ABAB` of 8-byte words: a 21-byte tag 7 page, 30 with its
+///   entry, against a 19-byte dictionary page and a 1-byte id page, 38.
+///   Keeps its tag 7 page: a one-block group never profits from a
+///   dictionary, since the ids and a second entry only add to it.
+/// - two blocks `ABAB|ABAB`, the same column: 60 against 19 + 9 + 2 * 10,
+///   48. Takes the dictionary.
+/// - two blocks `VV|VV` of one 5-byte value: an 8-byte tag 7 page per block,
+///   34, against a 7-byte dictionary page and two empty id pages, also 34. A
+///   tie keeps the per-block pages. With a 6-byte value, 36 against 35,
+///   takes the dictionary.
+/// - `AB|AB`, exactly half: two 18-byte plain pages, 54, against 48. Takes
+///   the dictionary.
+/// - `ABC|AB`, three distinct in five, one over half: 63 against 57, and
+///   keeps its per-block pages on the half rule alone.
+/// - 32 blocks of one own value twice, exactly half: 640 against 652, where
+///   32 entries need 5-bit ids. Keeps per-block pages.
+/// - `ABCD|AB`, four distinct in six: 72 against 66, keeps per-block pages.
+///
+/// Wrong implementations this rules out, each shown failing: comparing page
+/// bytes with no PAGE_DIR entries (the one-block case takes it at 21 against
+/// 20); not charging the dictionary page's own entry (one block, 29 against
+/// 30); `<=` in place of `<` (the 5-byte tie takes it); the half rule alone,
+/// with no size comparison (the 32-block chunk takes it); a strict half
+/// (`2 * distinct < present`, `AB|AB` keeps per-block pages); a loose half
+/// by one (`2 * distinct > present + 1` or `distinct > present.div_ceil(2)`,
+/// `ABC|AB` takes it); no half rule, size only (`ABCD|AB` takes it).
 #[test]
 fn dictionary_is_only_chosen_when_it_is_smaller() {
     let w = |i: usize| word(100 + i, 8);
+    let takes = |blocks: &[Vec<String>], object_len: usize| {
+        let c = chunk_costs(blocks);
+        let (got, len) = write_k_blocks(blocks);
+        let mut want = vec![Enc::DictPage];
+        want.extend(vec![Enc::DictIds; blocks.len()]);
+        assert_eq!(encs(&got), want, "{c:?}");
+        assert_eq!(extent(&got), c.dict_pages);
+        assert_eq!(len, object_len);
+        c
+    };
+    let keeps = |blocks: &[Vec<String>], enc: Enc, object_len: usize| {
+        let c = chunk_costs(blocks);
+        let (got, len) = write_k_blocks(blocks);
+        assert_eq!(encs(&got), vec![enc; blocks.len()], "{c:?}");
+        assert!(got.dict_page().is_none());
+        assert_eq!(extent(&got), c.per_block_pages);
+        assert_eq!(len, object_len);
+        c
+    };
 
-    let half_smaller = vec![vec![w(0), w(1)], vec![w(0), w(1)]];
-    let (per_block, dict) = chunk_costs(&half_smaller);
-    assert!(dict < per_block, "{dict} < {per_block}");
-    let (got, stored) = write_k_blocks(&half_smaller);
-    assert_eq!(got, [Enc::DictPage, Enc::DictIds, Enc::DictIds]);
-    assert_eq!(stored, dict);
+    let one = vec![vec![w(0), w(1), w(0), w(1)]];
+    let c = keeps(&one, Enc::Dict, 540);
+    assert_eq!((c.per_block, c.dict), (30, 38));
+    assert_eq!((c.per_block_pages, c.dict_pages), (21, 20));
+    let two = vec![one[0].clone(), one[0].clone()];
+    let c = takes(&two, 701);
+    assert_eq!((c.per_block, c.dict), (60, 48));
+
+    let v = |n: usize| vec![vec![word(7, n); 2], vec![word(7, n); 2]];
+    let c = keeps(&v(5), Enc::Dict, 682);
+    assert_eq!((c.per_block, c.dict), (34, 34));
+    let c = takes(&v(6), 681);
+    assert_eq!((c.per_block, c.dict), (36, 35));
+
+    let half = vec![vec![w(0), w(1)], vec![w(0), w(1)]];
+    let c = takes(&half, 699);
+    assert_eq!((c.per_block, c.dict), (54, 48));
 
     let half_larger: Vec<Vec<String>> = (0..32).map(|i| vec![w(i), w(i)]).collect();
-    let (per_block, dict) = chunk_costs(&half_larger);
-    assert_eq!(dict, per_block + 1);
-    let (got, stored) = write_k_blocks(&half_larger);
-    assert_eq!(got, vec![Enc::Dict; 32]);
-    assert_eq!(stored, per_block);
+    let c = keeps(&half_larger, Enc::Dict, 4503);
+    assert_eq!((c.per_block, c.dict), (640, 652));
 
-    let over_half = vec![vec![w(0), w(1), w(2), w(3)], vec![w(0), w(1)]];
-    let (per_block, dict) = chunk_costs(&over_half);
-    assert!(dict < per_block, "{dict} < {per_block}");
-    let records: Vec<LogRecord> = over_half
-        .iter()
-        .flatten()
-        .enumerate()
-        .map(|(i, v)| record(1_000 + i as i64, vec![("k", v.as_str())]))
-        .collect();
-    let object = write_rows(&blocks_cfg(4), &records);
-    assert_eq!(scan_all(&object), records);
-    let dir = page_dir(&object);
-    assert_eq!(dir.block_count(), 2);
-    let c = chunk(&dir, 0, dyn_column(&object, "k"));
-    assert_eq!(c.pages.len(), 2);
-    assert!(c.dict_page().is_none());
-    assert!(c.pages.iter().all(|p| p.enc != Enc::DictIds));
-    assert_eq!(c.extent().expect("extent").1, per_block);
+    for (blocks, costs, object_len) in [
+        (
+            vec![vec![w(0), w(1), w(2)], vec![w(0), w(1)]],
+            (63, 57),
+            717,
+        ),
+        (
+            vec![vec![w(0), w(1), w(2), w(3)], vec![w(0), w(1)]],
+            (72, 66),
+            726,
+        ),
+    ] {
+        let c = chunk_costs(&blocks);
+        assert_eq!((c.per_block, c.dict), costs);
+        let records: Vec<LogRecord> = blocks
+            .iter()
+            .flatten()
+            .enumerate()
+            .map(|(i, v)| record(1_000 + i as i64, vec![("k", v.as_str())]))
+            .collect();
+        let object = write_rows(&blocks_cfg(blocks[0].len()), &records);
+        assert_eq!(scan_all(&object), records);
+        let dir = page_dir(&object);
+        assert_eq!(dir.block_count(), 2);
+        let got = chunk(&dir, 0, dyn_column(&object, "k"));
+        assert_eq!(encs(&got), [Enc::Plain, Enc::Plain]);
+        assert_eq!(extent(&got), c.per_block_pages);
+        assert_eq!(object.len(), object_len);
+    }
 }
 
 fn page(block: u32, enc: Enc) -> PageEntry {
