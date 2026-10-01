@@ -944,16 +944,19 @@ async fn sweep_respects_pre_fold_head_then_deletes_after_fold_drops_bucket() {
 /// Stall check (ADR-0020 amendment 2026-10-01, issue #1133): the pinned-query
 /// window is anchored on the covering/neighbouring part's own store-assigned
 /// `last_modified`, not on HEAD's. HEAD is rewritten by every fold regardless
-/// of whether any part's content changed; a gate anchored on HEAD's own
-/// timestamp would therefore never age under a steady fold cadence. Here a
-/// SECOND fold runs long after the first reconcile, with nothing left to
-/// retire, so the covering part is carried forward by reference (unchanged
-/// content, same key, `last_modified` untouched -- `docs/catalog-and-mvcc.md`
-/// S7, ADR-0063) even though HEAD itself is rewritten at a much later
-/// store-clock time. The gate must still clear based on the first reconcile's
-/// timestamp. To watch this FAIL, anchor `age_and_clear` on
-/// `SnapshotHead.created_unix_ns` (or any HEAD-derived timestamp) instead of
-/// the part's own `last_modified`.
+/// of whether any part's content changed (`reachability.rs`'s own doc comment
+/// on `age_and_clear`); a gate anchored on HEAD's own timestamp would
+/// therefore never age under a steady fold cadence. Rather than depend on
+/// `Catalog::fold`'s own idempotent-no-op behavior (which, at this fixture's
+/// scale, skips writing HEAD at all when truly nothing changed, so it cannot
+/// exercise "HEAD rewritten, part unchanged" on its own), this test
+/// reproduces that exact premise directly: after the reconcile fold rewrites
+/// the covering part at t1, the IDENTICAL HEAD bytes are re-PUT (same
+/// content, a fresh physical write) at a much later store-clock time t2,
+/// while the covering part object is left untouched. The gate must still
+/// clear based on t1, the part's real `last_modified`, not t2. To watch this
+/// FAIL, anchor `age_and_clear` on HEAD's own `last_modified` (or
+/// `SnapshotHead.created_unix_ns`) instead of the part's.
 #[tokio::test]
 async fn pinned_window_survives_repeated_fold_rewrites_of_head() {
     let store = Arc::new(MemoryStore::new());
@@ -992,21 +995,26 @@ async fn pinned_window_survives_repeated_fold_rewrites_of_head() {
     .expect("tombstone");
     clock.set(created + config.protection_horizon_ns + 1);
 
-    // First reconcile fold: drops the tombstoned bucket from the covering
-    // part. The rewritten part's `last_modified` is set here, at t1.
+    // Reconcile fold: drops the tombstoned bucket from the covering part.
+    // The rewritten part's `last_modified` is set here, at t1.
     let t1 = clock.now_ns();
     store.set_clock_ms((t1 / 1_000_000) as u64);
     fold_head(&store, Signal::Metrics, t1, None).await;
 
-    // Second fold, much later by the store's clock, but with the IDENTICAL
-    // logical `now_ns` (so the retention frontier and any watermark derived
-    // from it are unchanged): the covering part's content is therefore
-    // byte-identical, so it is adopted via `AlreadyExists` self-heal rather
-    // than re-PUT (`docs/catalog-and-mvcc.md` S7, ADR-0063 S5), even though
-    // HEAD itself is rewritten at t2.
+    // A later fold pass rewrites HEAD with byte-identical content (nothing
+    // changed): reproduced directly as a re-PUT of the same HEAD bytes at a
+    // much later store-clock time t2, without touching the covering part.
+    let head_bytes = get_full(store.as_ref(), &head_key(Signal::Metrics)).await;
     let t2 = t1 + 50 * config.protection_horizon_ns;
     store.set_clock_ms((t2 / 1_000_000) as u64);
-    fold_head(&store, Signal::Metrics, t1, None).await;
+    store
+        .put(
+            &head_key(Signal::Metrics),
+            head_bytes,
+            PutOptions::default(),
+        )
+        .await
+        .expect("rewrite HEAD with identical bytes");
 
     // now_ns is well past t1's pinned-query window but nowhere near t2's: a
     // gate anchored on HEAD's own rewrite time would still block here.
