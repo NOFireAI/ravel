@@ -447,12 +447,18 @@ impl From<complexity_guard::GuardedParseError> for DdlValidationError {
 }
 
 /// Admitted `OPTIONS` key: exactly `binary_as_string`, or `ravel.cast.`
-/// followed by a non-empty column name (D5).
+/// followed by a column name that passes ravel-pqtable's own name rule (D5).
+/// Reusing [`names::validate_table`] here, rather than a second charset copy,
+/// is what keeps a key like `ravel.cast.x'); DROP TABLE y--` out of both
+/// [`validate_ddl`] and [`crate::redact::redact`] (they share this function
+/// through [`create_external_intent`]): unchecked, that key reached
+/// `render_create_external` and was written inside single quotes with no
+/// escaping of its own.
 fn is_admitted_option_key(key: &str) -> bool {
     key == "binary_as_string"
         || key
             .strip_prefix("ravel.cast.")
-            .is_some_and(|c| !c.is_empty())
+            .is_some_and(|column| names::validate_table(column).is_ok())
 }
 
 /// Parse `sql` and accept it only if it is exactly one of the three D2
@@ -1800,6 +1806,22 @@ mod tests {
                  OPTIONS ('ravel.cast.' 'date-from-days')"
             ),
             DdlValidationError::UnsupportedOption { key } if key == "ravel.cast."
+        ));
+    }
+
+    #[test]
+    fn ravel_cast_option_with_a_quote_or_semicolon_in_the_column_is_rejected() {
+        // The column name itself reaches `render_create_external` verbatim
+        // (only the value is tokenized); a charset that admitted `'` or `;`
+        // would let a crafted key carry injected SQL into redacted output.
+        // `is_admitted_option_key` must refuse it before it ever gets there.
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION 's3://bucket/prefix/' \
+                 OPTIONS ('ravel.cast.x''); DROP TABLE evil--' 'date-from-days')"
+            ),
+            DdlValidationError::UnsupportedOption { key }
+                if key == "ravel.cast.x'); DROP TABLE evil--"
         ));
     }
 
