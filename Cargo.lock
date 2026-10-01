@@ -4759,6 +4759,7 @@ dependencies = [
  "toml",
  "tower",
  "uuid",
+ "zstd",
 ]
 
 [[package]]

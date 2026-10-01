@@ -41,8 +41,8 @@ use ravel_catalog::{AbsentPolicy, validate_or_adopt};
 use ravel_ingest::LogStageSnapshot;
 use ravel_ingest::{
     Clock, FlushTriggerMix, IngestConfig, IngestRouter, LogIngestMetricsSnapshot, LogIngestRouter,
-    LogWriteError, LogWriteReceipt, STRICT_VISIBILITY_RESERVE_NS, SpanIngestRouter, SpanWriteError,
-    SpanWriteReceipt, SystemClock, WriteError, WriteMode, WriteReceipt,
+    LogWriteError, LogWriteReceipt, RlogZstdLevel, STRICT_VISIBILITY_RESERVE_NS, SpanIngestRouter,
+    SpanWriteError, SpanWriteReceipt, SystemClock, WriteError, WriteMode, WriteReceipt,
 };
 use ravel_logseg::{
     Bitmap, ColumnarLogBatch, DynColumn, FieldType, StrColumnDict, stream_attrs_bytes,
@@ -1320,6 +1320,7 @@ pub async fn run(
     decode_queue_batches: usize,
     target_bytes: usize,
     max_flush_delay: Option<Duration>,
+    zstd_level: RlogZstdLevel,
     now_ns: i64,
 ) -> anyhow::Result<()> {
     run_warning_to(
@@ -1337,6 +1338,7 @@ pub async fn run(
         decode_queue_batches,
         target_bytes,
         max_flush_delay,
+        zstd_level,
         now_ns,
         &mut std::io::stderr(),
     )
@@ -1366,6 +1368,7 @@ pub(crate) async fn run_warning_to(
     decode_queue_batches: usize,
     target_bytes: usize,
     max_flush_delay: Option<Duration>,
+    zstd_level: RlogZstdLevel,
     now_ns: i64,
     warnings: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
@@ -1377,6 +1380,9 @@ pub(crate) async fn run_warning_to(
         SignalArg::Logs => ADMISSION_BYPASS_WARNING,
     };
     let _ = writeln!(warnings, "{admission_warning}");
+    if let Some(warning) = unused_zstd_level_warning(zstd_level, signal) {
+        let _ = writeln!(warnings, "{warning}");
+    }
 
     let mapping_text = std::fs::read_to_string(mapping_path)
         .map_err(|e| anyhow::anyhow!("failed to read --mapping {}: {e}", mapping_path.display()))?;
@@ -1428,7 +1434,7 @@ pub(crate) async fn run_warning_to(
     // The production entry point drives the columnar fast path (ADR-0109) with
     // the operator-configured decode-queue depth; `load` keeps a stable
     // signature for tests and callers that want the default depth.
-    match load_instrumented(
+    match load_instrumented_at(
         store,
         parquet_path,
         tenant,
@@ -1447,6 +1453,7 @@ pub(crate) async fn run_warning_to(
         LoadPath::Columnar,
         None,
         None,
+        zstd_level,
     )
     .await
     {
@@ -1480,8 +1487,9 @@ pub(crate) async fn run_warning_to(
             {
                 let _ = writeln!(warnings, "{warning}");
             }
-            // The loader's writer uses `RlogConfig::default()` (log_shard.rs), so
-            // its per-object dynamic-column budget is that default.
+            // The loader's writer uses `RlogConfig::default()` apart from its zstd
+            // level (log_shard.rs), so its per-object dynamic-column budget is
+            // that default.
             let max_dynamic_columns = ravel_logseg::RlogConfig::default().max_dynamic_columns;
             for warning in dynamic_column_warnings(&report.metrics, max_dynamic_columns) {
                 let _ = writeln!(warnings, "{warning}");
@@ -1748,6 +1756,24 @@ fn unused_lever_warning(
          --pipeline-depth all apply.",
         unused.join(" and ")
     ))
+}
+
+/// The warning for a `--zstd-level` a metrics or spans load cannot use, or
+/// `None` when the level is the default or the load is a logs load. The level
+/// reaches only the RLOG writer a logs flush runs.
+fn unused_zstd_level_warning(zstd_level: RlogZstdLevel, signal: SignalArg) -> Option<String> {
+    let noun = match signal {
+        SignalArg::Logs => return None,
+        SignalArg::Metrics => "metrics",
+        SignalArg::Spans => "spans",
+    };
+    (zstd_level != RlogZstdLevel::DEFAULT).then(|| {
+        format!(
+            "warning: a {noun} load ignores --zstd-level {}. The level applies only to the \
+             RLOG objects a logs load writes.",
+            zstd_level.get()
+        )
+    })
 }
 
 /// Print the metrics load's completion summary to stdout.
@@ -2519,6 +2545,55 @@ async fn load_instrumented(
     on_build_start: Option<BuildStartHook>,
     on_batch_queued: Option<BuildStartHook>,
 ) -> Result<LoadReport, LoadError> {
+    load_instrumented_at(
+        store,
+        parquet_path,
+        tenant,
+        mapping,
+        shards,
+        batch_rows,
+        skip_rows,
+        read_cursors,
+        pipeline_depth,
+        max_inflight_flushes,
+        decode_queue_batches,
+        target_bytes,
+        max_flush_delay,
+        now_ns,
+        clock,
+        path,
+        on_build_start,
+        on_batch_queued,
+        RlogZstdLevel::DEFAULT,
+    )
+    .await
+}
+
+/// [`load_instrumented`] with the `--zstd-level` lever: `zstd_level` becomes
+/// the router's [`IngestConfig::rlog_zstd_level`], the level every page and
+/// section of each object the load writes compresses at.
+#[allow(clippy::too_many_arguments)]
+async fn load_instrumented_at(
+    store: Arc<dyn ObjectStoreBackend>,
+    parquet_path: &Path,
+    tenant: &str,
+    mapping: &Mapping,
+    shards: u32,
+    batch_rows: usize,
+    skip_rows: u64,
+    read_cursors: Option<usize>,
+    pipeline_depth: usize,
+    max_inflight_flushes: u32,
+    decode_queue_batches: usize,
+    target_bytes: usize,
+    max_flush_delay: Option<Duration>,
+    now_ns: i64,
+    clock: Arc<dyn Clock>,
+    path: LoadPath,
+    on_build_start: Option<BuildStartHook>,
+    on_batch_queued: Option<BuildStartHook>,
+    zstd_level: RlogZstdLevel,
+) -> Result<LoadReport, LoadError> {
     // Reject a zero batch size with a typed error rather than silently clamping
     // it to 1: `batch_rows` is the operator-facing `--batch-rows` lever, and a
     // silent clamp would hide a misconfigured value that changes object layout.
@@ -2650,7 +2725,10 @@ async fn load_instrumented(
     // (`Semaphore::new(config.max_inflight_flushes as usize)` in
     // crates/ravel-ingest/src/log_shard.rs); nothing downstream clamps it.
     let router = Arc::new(LogIngestRouter::new(
-        build_ingest_config(shards, target_bytes, max_inflight_flushes, max_flush_delay),
+        IngestConfig {
+            rlog_zstd_level: zstd_level,
+            ..build_ingest_config(shards, target_bytes, max_inflight_flushes, max_flush_delay)
+        },
         Arc::clone(&store),
         clock,
     ));
@@ -8705,6 +8783,7 @@ type = "i64"
             DEFAULT_DECODE_QUEUE_BATCHES,
             DEFAULT_TARGET_BYTES,
             None,
+            RlogZstdLevel::DEFAULT,
             NOW_NS,
             &mut sink,
         )
@@ -10346,6 +10425,7 @@ type = "i64"
                     DEFAULT_DECODE_QUEUE_BATCHES,
                     target_bytes,
                     None,
+                    RlogZstdLevel::DEFAULT,
                     NOW_NS,
                     &mut sink,
                 )
@@ -11128,6 +11208,7 @@ type = "i64"
             DEFAULT_DECODE_QUEUE_BATCHES,
             DEFAULT_TARGET_BYTES,
             None,
+            RlogZstdLevel::DEFAULT,
             NOW_NS,
             &mut sink,
         )
@@ -11160,6 +11241,7 @@ type = "i64"
             DEFAULT_DECODE_QUEUE_BATCHES,
             DEFAULT_TARGET_BYTES,
             None,
+            RlogZstdLevel::DEFAULT,
             NOW_NS,
             &mut sink,
         )
@@ -11206,6 +11288,7 @@ type = "i64"
             DEFAULT_DECODE_QUEUE_BATCHES,
             DEFAULT_TARGET_BYTES,
             None,
+            RlogZstdLevel::DEFAULT,
             NOW_NS,
             &mut sink,
         )
@@ -13985,6 +14068,7 @@ type = "i64"
                 DEFAULT_DECODE_QUEUE_BATCHES,
                 DEFAULT_TARGET_BYTES,
                 None,
+                RlogZstdLevel::DEFAULT,
                 NOW_NS,
                 &mut sink,
             )
@@ -14065,6 +14149,7 @@ type = "i64"
                 DEFAULT_DECODE_QUEUE_BATCHES,
                 DEFAULT_TARGET_BYTES,
                 None,
+                RlogZstdLevel::DEFAULT,
                 NOW_NS,
                 &mut sink,
             )
@@ -14602,6 +14687,7 @@ type = "str"
                     decode_queue_batches,
                     DEFAULT_TARGET_BYTES,
                     None,
+                    RlogZstdLevel::DEFAULT,
                     NOW_NS,
                     &mut sink,
                 )
@@ -14634,6 +14720,7 @@ type = "str"
                 8,
                 DEFAULT_TARGET_BYTES,
                 None,
+                RlogZstdLevel::DEFAULT,
                 NOW_NS,
                 &mut sink,
             )
@@ -14809,6 +14896,32 @@ type = "str"
         fn a_logs_load_has_no_unused_lever_warning() {
             assert_eq!(unused_lever_warning(Some(4), 8, SignalArg::Logs), None);
             assert!(unused_lever_warning(Some(4), 8, SignalArg::Metrics).is_some());
+        }
+
+        /// A non-default `--zstd-level` on a metrics or spans load is named as
+        /// ignored; the default, or any level on a logs load, is not.
+        #[test]
+        fn a_non_default_zstd_level_is_named_on_a_sequential_load_only() {
+            let nineteen = RlogZstdLevel::new(19).expect("in range");
+            assert_eq!(unused_zstd_level_warning(nineteen, SignalArg::Logs), None);
+            assert_eq!(
+                unused_zstd_level_warning(RlogZstdLevel::DEFAULT, SignalArg::Spans),
+                None
+            );
+            assert_eq!(
+                unused_zstd_level_warning(nineteen, SignalArg::Metrics).as_deref(),
+                Some(
+                    "warning: a metrics load ignores --zstd-level 19. The level applies only to \
+                     the RLOG objects a logs load writes."
+                )
+            );
+            assert_eq!(
+                unused_zstd_level_warning(nineteen, SignalArg::Spans).as_deref(),
+                Some(
+                    "warning: a spans load ignores --zstd-level 19. The level applies only to \
+                     the RLOG objects a logs load writes."
+                )
+            );
         }
 
         /// The future-skew bound is kept and the past-lag bound is relaxed,
@@ -16554,6 +16667,7 @@ type = "str"
                 decode_queue_batches,
                 DEFAULT_TARGET_BYTES,
                 None,
+                RlogZstdLevel::DEFAULT,
                 NOW_NS,
                 &mut sink,
             )

@@ -89,7 +89,7 @@ fn parse_spec(spec: &str) -> anyhow::Result<DeclaredTypedColumn> {
 }
 
 /// The flag spelling for a declared type, so `show` reads back what `set` took.
-fn spelling(ty: DeclaredColumnType) -> &'static str {
+pub(crate) fn spelling(ty: DeclaredColumnType) -> &'static str {
     match ty {
         DeclaredColumnType::Str => "str",
         DeclaredColumnType::I64 => "i64",

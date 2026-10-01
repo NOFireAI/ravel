@@ -23,6 +23,7 @@ pub mod provision;
 pub mod qualify;
 pub mod reconstruct;
 pub mod rlog_footprint;
+pub mod storage_layout;
 pub mod store;
 pub mod tenancy;
 pub mod tenant_token;
@@ -91,6 +92,15 @@ pub fn parse_max_flush_delay(s: &str) -> Result<std::time::Duration, String> {
         Ok(ns) if ns <= ceiling => Ok(dur),
         _ => Err(format!("--max-flush-delay '{s}' is too large")),
     }
+}
+
+/// Parse a `load --zstd-level` value, refusing a level outside zstd's accepted
+/// range with [`ravel_ingest::RlogZstdLevelError`]'s message.
+pub fn parse_zstd_level(s: &str) -> Result<ravel_ingest::RlogZstdLevel, String> {
+    let level: i32 = s
+        .parse()
+        .map_err(|e| format!("invalid --zstd-level '{s}': {e}"))?;
+    ravel_ingest::RlogZstdLevel::new(level).map_err(|e| format!("invalid --zstd-level: {e}"))
 }
 
 /// Parse an `export --max-ingest-lag` value into nanoseconds.

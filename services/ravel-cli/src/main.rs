@@ -111,6 +111,8 @@ fn command_hashes_tenant(command: &Command) -> bool {
         // typed-attr-column hashes a tenant (unlike gc-config, whose object is
         // at the bucket root).
         | Command::TypedAttrColumn { .. }
+        | Command::ClusteringKey { .. }
+        | Command::BloomScope { .. }
         | Command::Load { .. }
         // `export` resolves the catalog under `t/<tenant_hash>/logs/...` from
         // its `--tenant`, exactly as `catalog list` does.
@@ -188,6 +190,8 @@ fn command_is_write(command: &Command) -> bool {
         Command::TypedAttrColumn { command } => {
             matches!(command, TypedAttrColumnCommand::Set { .. })
         }
+        // Both have only a `show`; this build cannot write the fields.
+        Command::ClusteringKey { .. } | Command::BloomScope { .. } => false,
         Command::Hold { command } => {
             matches!(command, HoldCommand::Set { .. } | HoldCommand::Clear { .. })
         }
@@ -372,6 +376,18 @@ enum Command {
     TypedAttrColumn {
         #[command(subcommand)]
         command: TypedAttrColumnCommand,
+    },
+    /// Show a tenant's clustering key (ADR-2135 decision 1), field 13 of its
+    /// config record at `t/<tenant_hash>/config`. Read-only.
+    ClusteringKey {
+        #[command(subcommand)]
+        command: ClusteringKeyCommand,
+    },
+    /// Show a tenant's bloom scope (ADR-2135), field 14 of its config record at
+    /// `t/<tenant_hash>/config`. Read-only.
+    BloomScope {
+        #[command(subcommand)]
+        command: BloomScopeCommand,
     },
     /// Per-tenant operator records: the deployment-wide bearer-token map
     /// `sys/auth` (ADR-0072 decision 4) and the Parquet location grants
@@ -651,6 +667,23 @@ enum Command {
         /// slower idle timer instead).
         #[arg(long, value_name = "DURATION", value_parser = ravel_cli::parse_max_flush_delay)]
         max_flush_delay: Option<Duration>,
+        /// The zstd level of every page and section the loader's RLOG objects
+        /// compress with zstd. Compaction re-encodes the objects it merges at
+        /// its own level (3), so this sets only the load's own objects.
+        ///
+        /// A page or section is stored compressed only when that is smaller
+        /// than storing it raw, and a page's encoding is chosen by stored
+        /// size, so the level can change which encoding a page keeps. Accepts
+        /// zstd's range, -131072 to 22, and refuses a level outside it. A
+        /// metrics or spans load ignores this flag and says so.
+        #[arg(
+            long,
+            value_name = "LEVEL",
+            default_value = "3",
+            allow_hyphen_values = true,
+            value_parser = ravel_cli::parse_zstd_level
+        )]
+        zstd_level: ravel_ingest::RlogZstdLevel,
     },
     /// Bulk-export a tenant's stored logs, metrics or spans to a Parquet file (ADR-1751).
     ///
@@ -903,6 +936,29 @@ enum TenantTokenCommand {
         /// 32 raw bytes); the same key used for `--tenant-hash-key-file`.
         #[arg(long, value_name = "PATH")]
         deployment_key_file: std::path::PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ClusteringKeyCommand {
+    /// Print the tenant's clustering key: never set, cleared at a generation,
+    /// or set, with its columns and their declared types, bucket width and
+    /// generation. A stored key the record's validation refuses is an error.
+    Show {
+        /// The tenant whose clustering key to print.
+        #[arg(long)]
+        tenant: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BloomScopeCommand {
+    /// Print the tenant's bloom scope: all (the default, and what a record
+    /// without the field reads as), undeclared, or text.
+    Show {
+        /// The tenant whose bloom scope to print.
+        #[arg(long)]
+        tenant: String,
     },
 }
 
@@ -2098,6 +2154,18 @@ async fn main() -> anyhow::Result<()> {
         Command::TypedAttrColumn {
             command: TypedAttrColumnCommand::Show { tenant },
         } => ravel_cli::typed_attr_column::show(store::build_store(&cli.store)?, &tenant).await,
+        Command::ClusteringKey {
+            command: ClusteringKeyCommand::Show { tenant },
+        } => {
+            ravel_cli::storage_layout::clustering_key_show(store::build_store(&cli.store)?, &tenant)
+                .await
+        }
+        Command::BloomScope {
+            command: BloomScopeCommand::Show { tenant },
+        } => {
+            ravel_cli::storage_layout::bloom_scope_show(store::build_store(&cli.store)?, &tenant)
+                .await
+        }
         Command::TypedAttrColumn {
             command:
                 TypedAttrColumnCommand::Set {
@@ -2268,6 +2336,7 @@ async fn main() -> anyhow::Result<()> {
             decode_queue_batches,
             target_bytes,
             max_flush_delay,
+            zstd_level,
         } => {
             let profile = ravel_cli::cli_profiling::ProfileSession::from_env("ravel-cli-load");
             let result = ravel_cli::load::run(
@@ -2285,6 +2354,7 @@ async fn main() -> anyhow::Result<()> {
                 decode_queue_batches,
                 target_bytes,
                 max_flush_delay,
+                zstd_level,
                 now_ns()?,
             )
             .await;
@@ -3364,6 +3434,44 @@ mod tests {
             Some(std::time::Duration::from_secs(600)),
             "--max-flush-delay 10m reaches the field as 600s"
         );
+    }
+
+    /// `--zstd-level` defaults to 3, carries a negative level, and is refused
+    /// at parse time outside zstd's range with the typed error's message.
+    #[test]
+    fn zstd_level_flag_defaults_to_3_and_refuses_out_of_range() {
+        let base = [
+            "ravel",
+            "load",
+            "--parquet",
+            "hits.parquet",
+            "--tenant",
+            "acme",
+            "--mapping",
+            "hits.toml",
+        ];
+        let level_of = |extra: &[&str]| match Cli::try_parse_from(
+            base.iter().copied().chain(extra.iter().copied()),
+        )
+        .map(|cli| cli.command)
+        {
+            Ok(Command::Load { zstd_level, .. }) => Ok(zstd_level.get()),
+            Ok(_) => panic!("expected the load subcommand"),
+            Err(e) => Err(e.to_string()),
+        };
+        assert_eq!(level_of(&[]), Ok(3));
+        assert_eq!(level_of(&["--zstd-level", "19"]), Ok(19));
+        assert_eq!(level_of(&["--zstd-level", "-5"]), Ok(-5));
+        assert_eq!(level_of(&["--zstd-level", "22"]), Ok(22));
+        for bad in ["23", "-131073"] {
+            let err = level_of(&["--zstd-level", bad]).expect_err("out of range");
+            assert!(
+                err.contains(&format!(
+                    "RLOG zstd level {bad} is outside zstd's accepted range -131072..=22"
+                )),
+                "{err}"
+            );
+        }
     }
 
     /// Issue #1184's classification: `load`, `typed-attr-column set`, `hold
