@@ -190,6 +190,26 @@ pub enum ManifestError {
     Name(#[from] NameError),
 }
 
+impl ManifestError {
+    /// True only for a manifest a newer build wrote (ADR-0066 decision 2):
+    /// retryable at a query surface, where every other variant is corrupt.
+    /// One below the floor is false: no supported writer produced it.
+    ///
+    /// Every variant is named, so a new one fails to compile until it is
+    /// classified here.
+    pub fn is_newer_format_version(&self) -> bool {
+        match self {
+            ManifestError::UnsupportedVersion { .. } => true,
+            ManifestError::Decode { .. }
+            | ManifestError::VersionBelowFloor { .. }
+            | ManifestError::Misfiled { .. }
+            | ManifestError::Invalid { .. }
+            | ManifestError::Key(_)
+            | ManifestError::Name(_) => false,
+        }
+    }
+}
+
 impl Manifest {
     /// Check the body against the rules in the module docs.
     pub fn validate(&self) -> Result<(), ManifestError> {
@@ -389,6 +409,29 @@ mod tests {
 
     const TENANT: TenantHash = TenantHash([0x5c; 16]);
     const OTHER_TENANT: TenantHash = TenantHash([0x6d; 16]);
+
+    #[test]
+    fn only_a_version_above_the_ceiling_is_newer() {
+        let above = ManifestError::UnsupportedVersion {
+            key: "k".into(),
+            got: 9,
+            ceiling: 1,
+        };
+        assert!(above.is_newer_format_version());
+        let below = ManifestError::VersionBelowFloor {
+            key: "k".into(),
+            got: 0,
+            floor: 1,
+        };
+        assert!(!below.is_newer_format_version());
+        let invalid = ManifestError::Invalid {
+            table: "hits".into(),
+            version: 1,
+            defect: ManifestDefect::ZeroVersion,
+        };
+        assert!(!invalid.is_newer_format_version());
+        assert!(!ManifestError::Key(KeyError::ZeroVersion).is_newer_format_version());
+    }
 
     fn file(seed: u8) -> ParquetFile {
         ParquetFile {

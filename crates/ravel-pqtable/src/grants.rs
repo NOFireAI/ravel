@@ -194,6 +194,33 @@ pub enum GrantsError {
     Key(#[from] KeyError),
 }
 
+impl GrantsError {
+    /// True only for a grants record a newer build wrote (ADR-0066 decision
+    /// 2): retryable at a query surface, where every other record fault is
+    /// corrupt. One below the floor is false: no supported writer produced it.
+    ///
+    /// Every variant is named, so a new one fails to compile until it is
+    /// classified here.
+    pub fn is_newer_format_version(&self) -> bool {
+        match self {
+            GrantsError::UnsupportedVersion { .. } => true,
+            GrantsError::Store { .. }
+            | GrantsError::Decode { .. }
+            | GrantsError::VersionBelowFloor { .. }
+            | GrantsError::Misfiled { .. }
+            | GrantsError::InvalidLocation { .. }
+            | GrantsError::EmptyProfile
+            | GrantsError::NonCanonicalGrant { .. }
+            | GrantsError::OverlapsOtherProfile { .. }
+            | GrantsError::DuplicateGrant { .. }
+            | GrantsError::LocationNotGranted { .. }
+            | GrantsError::GrantNotFound { .. }
+            | GrantsError::RetriesExhausted { .. }
+            | GrantsError::Key(_) => false,
+        }
+    }
+}
+
 fn store_error(key: &str, source: StoreError) -> GrantsError {
     GrantsError::Store {
         key: key.to_string(),
@@ -586,6 +613,28 @@ mod tests {
     use crate::test_util::{TENANT_A, TENANT_B};
 
     const NOW: i64 = 1_700_000_000_000_000_000;
+
+    #[test]
+    fn only_a_version_above_the_ceiling_is_newer() {
+        let above = GrantsError::UnsupportedVersion {
+            key: "k".into(),
+            got: 9,
+            ceiling: 1,
+        };
+        assert!(above.is_newer_format_version());
+        let below = GrantsError::VersionBelowFloor {
+            key: "k".into(),
+            got: 0,
+            floor: 1,
+        };
+        assert!(!below.is_newer_format_version());
+        let store = GrantsError::Store {
+            key: "k".into(),
+            source: StoreError::Corrupted("checksum".into()),
+        };
+        assert!(!store.is_newer_format_version());
+        assert!(!GrantsError::EmptyProfile.is_newer_format_version());
+    }
 
     fn clock() -> FixedClock {
         FixedClock::new(NOW)

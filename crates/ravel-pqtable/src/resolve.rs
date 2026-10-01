@@ -44,6 +44,23 @@ pub enum ResolveError {
     Manifest(#[from] ManifestError),
 }
 
+impl ResolveError {
+    /// True only for a manifest a newer build wrote; see
+    /// [`ManifestError::is_newer_format_version`].
+    ///
+    /// Every variant is named, so a new one fails to compile until it is
+    /// classified here.
+    pub fn is_newer_format_version(&self) -> bool {
+        match self {
+            ResolveError::Manifest(err) => err.is_newer_format_version(),
+            ResolveError::Store { .. }
+            | ResolveError::ForeignKey { .. }
+            | ResolveError::Vanished { .. }
+            | ResolveError::Key(_) => false,
+        }
+    }
+}
+
 fn store_error(key: &str, source: StoreError) -> ResolveError {
     ResolveError::Store {
         key: key.to_string(),
@@ -169,6 +186,32 @@ mod tests {
     use super::*;
     use crate::manifest::encode_manifest;
     use crate::test_util::{CountingStore, TENANT_A, TENANT_B, live_manifest};
+
+    #[test]
+    fn only_a_manifest_above_the_ceiling_is_newer() {
+        let above = ResolveError::Manifest(ManifestError::UnsupportedVersion {
+            key: "k".into(),
+            got: 9,
+            ceiling: 1,
+        });
+        assert!(above.is_newer_format_version());
+        let below = ResolveError::Manifest(ManifestError::VersionBelowFloor {
+            key: "k".into(),
+            got: 0,
+            floor: 1,
+        });
+        assert!(!below.is_newer_format_version());
+        let vanished = ResolveError::Vanished {
+            table: "hits".into(),
+            attempts: 3,
+        };
+        assert!(!vanished.is_newer_format_version());
+        let store = ResolveError::Store {
+            key: "k".into(),
+            source: StoreError::Timeout,
+        };
+        assert!(!store.is_newer_format_version());
+    }
 
     async fn put_version(store: &MemoryStore, tenant: &TenantHash, version: u64) {
         let m = live_manifest("hits", version, &[version as u8]);

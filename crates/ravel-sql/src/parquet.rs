@@ -40,7 +40,7 @@ use ravel_parquet::{
     ReadServices, TenantParquetStore,
 };
 use ravel_pqtable::grants::{self, GrantsError};
-use ravel_pqtable::manifest::{Manifest, ManifestError};
+use ravel_pqtable::manifest::Manifest;
 use ravel_pqtable::names::validate_table;
 use ravel_pqtable::resolve::{self, ResolveError};
 use ravel_query::{GetLimiter, PhaseAccounting, ReadCache};
@@ -627,11 +627,10 @@ impl ParquetQueryError {
             // A record above the version ceiling is not corrupt (ADR-0066
             // decision 2): a peer on a newer build reads it. One below the
             // floor stays in the corrupt catch-all, as on the catalog surface.
-            ParquetQueryError::Resolve {
-                source: ResolveError::Manifest(ManifestError::UnsupportedVersion { .. }),
-                ..
+            ParquetQueryError::Resolve { source, .. } if source.is_newer_format_version() => {
+                ErrorClass::Unavailable
             }
-            | ParquetQueryError::Grants(GrantsError::UnsupportedVersion { .. }) => {
+            ParquetQueryError::Grants(err) if err.is_newer_format_version() => {
                 ErrorClass::Unavailable
             }
             // Every other manifest or grants fault is answered MSG_CORRUPT by
@@ -717,11 +716,10 @@ impl ParquetQueryError {
             }
             | ParquetQueryError::Grants(GrantsError::Store { .. }) => MSG_UNAVAILABLE.to_string(),
             ParquetQueryError::PinnedManifestGone { .. } => MSG_UNAVAILABLE.to_string(),
-            ParquetQueryError::Resolve {
-                source: ResolveError::Manifest(ManifestError::UnsupportedVersion { .. }),
-                ..
+            ParquetQueryError::Resolve { source, .. } if source.is_newer_format_version() => {
+                MSG_UNAVAILABLE.to_string()
             }
-            | ParquetQueryError::Grants(GrantsError::UnsupportedVersion { .. }) => {
+            ParquetQueryError::Grants(err) if err.is_newer_format_version() => {
                 MSG_UNAVAILABLE.to_string()
             }
             ParquetQueryError::Resolve { .. } | ParquetQueryError::Grants(_) => {
@@ -1038,6 +1036,8 @@ impl ObjectStoreBackend for ResolveStore {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use ravel_pqtable::manifest::ManifestError;
+
     use super::*;
 
     /// A static-key S3 profile reaching `endpoint`, its keys read from files
@@ -1255,9 +1255,9 @@ mod tests {
     /// in its own `class()` and `client_message()` and through the `SqlError`
     /// the server maps to a status.
     ///
-    /// FLIP: drop the `ResolveError::Manifest(ManifestError::UnsupportedVersion
-    /// { .. })` pattern from the retryable version arm of `class()` and the
-    /// manifest above-ceiling case fails with `left: (Internal, "upstream
+    /// FLIP: drop the `ParquetQueryError::Resolve { source, .. } if
+    /// source.is_newer_format_version()` arm of `class()` and the manifest
+    /// above-ceiling case fails with `left: (Internal, "upstream
     /// storage temporarily unavailable")`.
     #[test]
     fn a_version_above_the_ceiling_is_retryable_and_below_the_floor_is_corrupt() {
