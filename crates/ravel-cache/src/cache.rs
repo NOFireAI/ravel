@@ -175,6 +175,13 @@ where
         self.inner.get(key).map(|bytes| self.maybe_corrupt(bytes))
     }
 
+    /// The resident bytes for `key`, exactly as inserted, recording neither a
+    /// hit nor a miss and applying no corruption: for a caller whose earlier
+    /// [`get`](Self::get) already accounted this request.
+    pub(crate) fn get_uncounted(&self, key: &CacheKey) -> Option<Bytes> {
+        self.inner.lookup(key)
+    }
+
     /// Admit `value` under `key`. Not an error, and a no-op on the
     /// eviction state, if `value` is larger than the configured maximum
     /// single-entry size: the caller still has its own copy of the bytes.
@@ -264,12 +271,22 @@ impl Inner {
     /// no max-age expiry counter, so an aged-out read moves the same `misses`
     /// counter a cold miss does and nothing else.
     fn get(&self, key: &CacheKey) -> Option<Bytes> {
+        match self.lookup(key) {
+            Some(bytes) => {
+                self.metrics.record_hit(bytes.len() as u64);
+                Some(bytes)
+            }
+            None => {
+                self.metrics.record_miss();
+                None
+            }
+        }
+    }
+
+    /// [`Self::get`] without recording a hit or a miss.
+    fn lookup(&self, key: &CacheKey) -> Option<Bytes> {
         let mut fifo = self.fifo.lock();
-        let Some(entry) = fifo.get(key) else {
-            drop(fifo);
-            self.metrics.record_miss();
-            return None;
-        };
+        let entry = fifo.get(key)?;
         if self.clock.now_ns().saturating_sub(entry.written_at_ns) > self.limits.max_entry_age_ns {
             // Older than the configured max-age: an erased subject's bytes must
             // not outlive the sweep in a query node's RAM by more than this
@@ -278,12 +295,8 @@ impl Inner {
             // newer than "now") from wrapping into a huge age: such an entry is
             // simply treated as not yet expired, mirroring the disk tier.
             fifo.remove(key);
-            drop(fifo);
-            self.metrics.record_miss();
             return None;
         }
-        drop(fifo);
-        self.metrics.record_hit(entry.bytes.len() as u64);
         Some(entry.bytes)
     }
 

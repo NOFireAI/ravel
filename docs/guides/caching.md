@@ -274,7 +274,12 @@ below can be computed per cache or summed across both:
   with no disk tier never emits it. The RAM tier applies the same max-age but
   has no counter of its own: an over-age RAM entry is reported as an ordinary
   miss, so a workload whose entries routinely age out shows a hit rate lower
-  than its access pattern would suggest and nothing else.
+  than its access pattern would suggest and nothing else. A read whose peek
+  missed while a fetch for the same range was in flight, and that reached the
+  single flight only after that fetch finished, is served from the RAM tier
+  with nothing recorded beyond its peek's miss: no hit, no `bytes_served`, no
+  `bytes_admitted` and no single-flight collapse; a Parquet read counts it in
+  its query accounting as a cache miss with zero GETs.
 
 With both caches off (`--disable-cache`), none of these samples appear on
 `/metrics` at all: neither `cache="fetch"` nor `cache="catalog"`. A fetcher

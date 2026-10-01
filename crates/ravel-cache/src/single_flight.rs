@@ -122,6 +122,20 @@ where
         }
     }
 
+    /// How many followers are parked on the in-flight call for `key`; 0 when
+    /// none is in flight.
+    pub fn waiters(&self, key: &K) -> usize {
+        self.inflight
+            .lock()
+            .get(key)
+            .map_or(0, |slot| slot.tx.receiver_count())
+    }
+
+    /// Whether a call for `key` is in flight, followers or not.
+    pub fn is_in_flight(&self, key: &K) -> bool {
+        self.inflight.lock().contains_key(key)
+    }
+
     async fn wait(rx: &mut watch::Receiver<Option<Outcome<V, E>>>) -> Outcome<V, E> {
         loop {
             let current = rx.borrow_and_update().clone();
