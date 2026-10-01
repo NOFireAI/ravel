@@ -8,6 +8,10 @@
 //! statement then carries a [`SingleStoreRegistry`] answering only the
 //! tenant's `ravel-pq://<tenant_hash>/` URL (crate::session).
 //!
+//! A Flight SQL ticket pins each table's manifest version instead
+//! ([`ParquetPin`]): `DoGet` reads those manifest objects by version
+//! ([`resolve_pinned_tables`]) and still checks the grants as they are then.
+//!
 //! What a server wires in is [`ParquetSources`]: Ravel's store, the external
 //! stores its credential profiles reach ([`ExternalStores`]), and the read
 //! services the reader shares with the rest of the query path. An executor

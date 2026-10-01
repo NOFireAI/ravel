@@ -24,6 +24,20 @@
 //! snapshot from the ticket. There is no second `Catalog::resolve` anywhere on
 //! the redemption path.
 //!
+//! A Parquet table (ADR-2040) has no segment set, so its pin is the table's
+//! name and the version of the manifest object `GetFlightInfo` resolved. A
+//! statement's Parquet tables are resolved once per RPC: `GetFlightInfo` plans
+//! from the resolve it just made, and `DoGet` reads exactly the pinned manifest
+//! objects by version (a GET each, no LIST), never the table's newest, so a
+//! table replaced between the RPCs streams the schema and rows `FlightInfo`
+//! advertised. The tenant's grants are the one thing not pinned: `DoGet` reads
+//! them again, and a grant removed since `GetFlightInfo` fails it with
+//! `LocationNotGranted` (ADR-2040 D3). A pinned manifest that has been swept
+//! fails `DoGet` with `SnapshotInvalidated`. The ticket also pins the request's
+//! lowered budgets, so `DoGet` scans under the limits `GetFlightInfo` applied.
+//! A Parquet statement is never distributed, and a slice ticket that names a
+//! Parquet table is refused.
+//!
 //! # A client ticket's tenant is never trusted
 //!
 //! A client whole-set ticket carries a tenant field, but it is not a trust
