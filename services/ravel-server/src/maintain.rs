@@ -10877,8 +10877,9 @@ mod alert_retention_tests {
     /// neither of the gate's two listings and runs the sweep's listings
     /// directly. Watch it fail: return `false` from the `Ready` arm of
     /// `run_alert_retention_sweep`, and the usable-memo tick reads the gate's
-    /// two listings ahead of the sweep's; the same from the `Skip` arm, and the
-    /// undecodable-memo tick does.
+    /// keyspace listing ahead of the sweep's (one listing, not two: the memo
+    /// object it finds there ends the gate before the quarantine listing); the
+    /// same from the `Skip` arm, and the undecodable-memo tick does.
     #[tokio::test]
     async fn a_memo_read_issues_neither_gate_listing() {
         let skip_body: &[u8] = b"not json";

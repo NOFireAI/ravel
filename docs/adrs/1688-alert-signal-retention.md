@@ -385,7 +385,11 @@ keyspace holds no object at all.
   both come back empty. A memo object or an alert commit record already puts an
   object under the keyspace, so with a nonzero `--alert-retention` a tick that
   found either pays neither listing. Under `--alert-retention 0` no memo is
-  read, so every tenant pays both, including one that runs alert rules.
+  read, so every tenant pays the keyspace listing. A tenant that runs alert
+  rules pays that one alone: its memo at `t/<tenant_hash>/a/state/latest` is
+  under the keyspace, so the first listing comes back non-empty and the
+  quarantine listing is never issued. Only a tenant whose live keyspace is
+  empty pays both.
 - **Why the commit prefix is not the gate.** An empty commit prefix is exactly
   the state the orphan rule exists for: a data object whose first commit record
   never landed sits under `l0/` beside an empty `c/`. And once orphan GC has

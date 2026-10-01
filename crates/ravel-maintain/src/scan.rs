@@ -18,8 +18,9 @@ use crate::compact::{ClaimedCompaction, CompactionOutcome, compact_bucket};
 use crate::config::{CompactorConfig, NS_PER_HOUR, RetentionConfig};
 use crate::error::{MaintainError, Result};
 use crate::retention::{
-    ObservedExpiry, RetentionOutcome, SnapshotBlock, SnapshotReachability,
-    maintain_bucket_observed, resolve_retention_window_ns, retention_sweep_bucket_observed,
+    ObservedExpiry, RetentionOutcome, RewriteBound, RewriteBoundRead, SnapshotBlock,
+    SnapshotReachability, maintain_bucket_observed, resolve_retention_window_ns,
+    retention_sweep_bucket_observed,
 };
 use crate::sweep::LeaseCheck;
 
@@ -199,7 +200,13 @@ pub struct MaintainReport {
     /// before its ingest hour, so that fallback under-reads the lag by up to
     /// one hour plus `max_ingest_lag` (three hours at the defaults), and an
     /// event running past its ingest hour by the allowed future clock skew can
-    /// make the nominal figure over-read by up to that skew. A tombstoned
+    /// make the nominal figure over-read by up to that skew. It over-reads by
+    /// more, transiently, after a physical sweep that stopped partway: the
+    /// sweep deletes rewrite records before data, L1 segments and the tombstone,
+    /// so a process that holds neither the exact expiry nor an earlier read of
+    /// those rewrites lists none and can over-read by a deleted parts-less
+    /// rewrite's `created_unix_ns` minus the hour's end, until the next pass
+    /// finishes the sweep. A tombstoned
     /// bucket that lists a rewrite record with no parts measures from
     /// `retired_at_ns` alone, because such a rewrite stands its
     /// `created_unix_ns` in for an event time and can move the expiry to any
@@ -212,8 +219,10 @@ pub struct MaintainReport {
     /// Rewrite-record GETs this pass issued only to bound the retention lag of
     /// a tombstoned bucket that lists rewrite records and whose exact expiry
     /// this process does not hold: each read tells a parts-less rewrite, which
-    /// leaves the tombstone as the only bound, from one that keeps parts.
-    /// Never issued for a bucket whose exact expiry [`MaintainMemo`] holds.
+    /// leaves the tombstone as the only bound, from one that keeps parts, and
+    /// the reads stop at the first parts-less one. Never issued for a bucket
+    /// whose exact expiry, or whose earlier complete read, [`MaintainMemo`]
+    /// holds.
     pub lag_bound_gets: usize,
 }
 
@@ -239,7 +248,9 @@ fn reschedule_ns(skip: &ClaimSkip) -> i64 {
 /// clock skew can put it after the nominal one, so the fallback under-reads by
 /// how far the earlier of the two sits past the true expiry: at most one hour
 /// plus `max_ingest_lag`, since an event can sit that far before its ingest
-/// hour. For a bucket that lists a rewrite record with no parts
+/// hour. Its over-read is bounded by that skew except transiently after a
+/// physical sweep that stopped partway, which deletes a parts-less rewrite
+/// before the tombstone (see [`MaintainReport::retention_lag_ns`]). For a bucket that lists a rewrite record with no parts
 /// ([`ObservedExpiry::NoLaterThanOnly`]) the nominal deadline bounds nothing,
 /// so the lag is `now` past `retired_at_ns` alone, which under-reads by however
 /// long after the true expiry the tombstone was written. Uses saturating
@@ -548,6 +559,15 @@ pub struct MaintainMemo {
     /// In memory only, like `claim_deferred_until_ns`: a restarted or newly
     /// assigned worker falls back to the tombstone's own bound.
     exact_expiry_ns: HashMap<BucketKey, i64>,
+    /// For a tombstoned bucket whose exact expiry this process does not hold,
+    /// whether its rewrite records keep the hour's nominal deadline as an
+    /// expiry bound (none of them has no parts), as the first pass that read
+    /// them all found it. The records are immutable and a tombstoned bucket
+    /// gets no new one, so later passes reuse the answer instead of re-reading
+    /// every record. Only an answer whose reads all succeeded is kept.
+    ///
+    /// In memory only, like `exact_expiry_ns`.
+    rewrites_keep_nominal_bound: HashMap<BucketKey, bool>,
 }
 
 impl MaintainMemo {
@@ -562,6 +582,7 @@ impl MaintainMemo {
             reverify_interval_ns,
             last_full_sweep_ns: HashMap::new(),
             exact_expiry_ns: HashMap::new(),
+            rewrites_keep_nominal_bound: HashMap::new(),
         }
     }
 
@@ -730,12 +751,23 @@ impl MaintainMemo {
                 true
             }
         });
+        let mut moved_bound = HashMap::new();
+        self.rewrites_keep_nominal_bound
+            .retain(|(t, s, sh, hour), keeps| {
+                if *t == tenant && *s == signal && *sh == shard {
+                    moved_bound.insert((*t, *s, *sh, *hour), *keeps);
+                    false
+                } else {
+                    true
+                }
+            });
         MaintainMemo {
             entries: moved,
             claim_deferred_until_ns: moved_defer,
             reverify_interval_ns: self.reverify_interval_ns,
             last_full_sweep_ns: moved_sweep,
             exact_expiry_ns: moved_expiry,
+            rewrites_keep_nominal_bound: moved_bound,
         }
     }
 
@@ -748,6 +780,8 @@ impl MaintainMemo {
             .extend(unit.claim_deferred_until_ns);
         self.last_full_sweep_ns.extend(unit.last_full_sweep_ns);
         self.exact_expiry_ns.extend(unit.exact_expiry_ns);
+        self.rewrites_keep_nominal_bound
+            .extend(unit.rewrites_keep_nominal_bound);
     }
 
     /// The most precise expiry known for `key` after this pass observed
@@ -848,6 +882,10 @@ impl MaintainMemo {
         self.exact_expiry_ns.retain(|(t, s, sh, hour), _| {
             *t != tenant || *s != signal || *sh != shard || present.contains(hour)
         });
+        self.rewrites_keep_nominal_bound
+            .retain(|(t, s, sh, hour), _| {
+                *t != tenant || *s != signal || *sh != shard || present.contains(hour)
+            });
     }
 
     /// Seed one terminal entry from a durable snapshot (ADR-0065 decision 3),
@@ -1471,9 +1509,16 @@ pub async fn scan_and_maintain_with_memo(
 
         let bucket = Bucket::new(tenant_hash, signal, shard, hour);
         // A memoised exact expiry supersedes any tombstone bound, so the
-        // rewrite-record GET that sharpens that bound is skipped.
-        let rewrite_gets =
-            (!memo.exact_expiry_ns.contains_key(&key)).then_some(&mut report.lag_bound_gets);
+        // rewrite-record GETs that sharpen that bound are skipped, and so are
+        // they once an earlier pass has read their answer.
+        let mut bound_read = RewriteBoundRead::default();
+        let rewrite_bound = if memo.exact_expiry_ns.contains_key(&key) {
+            RewriteBound::Unread
+        } else if let Some(&keeps) = memo.rewrites_keep_nominal_bound.get(&key) {
+            RewriteBound::Known(keeps)
+        } else {
+            RewriteBound::Read(&mut bound_read)
+        };
         let (retention_outcome, observed_expiry, compaction, acquisition) = if claim_deferred {
             let (outcome, expiry) = retention_sweep_bucket_observed(
                 &mut reach,
@@ -1483,7 +1528,7 @@ pub async fn scan_and_maintain_with_memo(
                 retention_window_ns,
                 lease,
                 &bucket,
-                rewrite_gets,
+                rewrite_bound,
             )
             .await?;
             (outcome, expiry, None, None)
@@ -1496,10 +1541,14 @@ pub async fn scan_and_maintain_with_memo(
                 retention_window_ns,
                 lease,
                 &bucket,
-                rewrite_gets,
+                rewrite_bound,
             )
             .await?
         };
+        report.lag_bound_gets += bound_read.gets;
+        if let Some(keeps) = bound_read.learned {
+            memo.rewrites_keep_nominal_bound.insert(key, keeps);
+        }
         let expiry = memo.best_expiry(key, observed_expiry);
         // Counts a claim this bucket's run acquired, whether the compaction then
         // ran or was cancelled at a checkpoint. A `claim_deferred` bucket never
@@ -1518,6 +1567,7 @@ pub async fn scan_and_maintain_with_memo(
             RetentionOutcome::Swept => {
                 report.retired += 1;
                 memo.exact_expiry_ns.remove(&key);
+                memo.rewrites_keep_nominal_bound.remove(&key);
             }
             // Expired but still present (tombstoned within the horizon, or
             // horizon elapsed with residue left for the next pass); compaction
@@ -2723,11 +2773,13 @@ mod invalidate_tests {
     /// A tombstoned bucket with a parts-less rewrite (issue #2073 review): the
     /// pass whose memo holds the exact expiry reads the rewrite record no
     /// further, and a cold pass reads it exactly once, counts that GET in
-    /// `lag_bound_gets`, and measures from the tombstone alone. Flipped lines:
-    /// the `!memo.exact_expiry_ns.contains_key(&key)` gate replaced with `true`
+    /// `lag_bound_gets`, and measures from the tombstone alone; the next pass
+    /// on that same memo reuses the answer and reads it no more. Flipped
+    /// lines: the `memo.exact_expiry_ns.contains_key(&key)` branch removed
     /// reads the warm pass's `lag_bound_gets` as 1 against 0; the
-    /// `then_some(&mut report.lag_bound_gets)` replaced with `None` reads the
-    /// cold pass's as 0 against 1.
+    /// `report.lag_bound_gets += bound_read.gets` removed reads the cold
+    /// pass's as 0 against 1; the `memo.rewrites_keep_nominal_bound.insert`
+    /// removed reads the second cold-memo pass's as 1 against 0.
     #[tokio::test]
     async fn only_a_pass_without_the_exact_expiry_reads_the_rewrite_record() {
         use crate::config::{DEFAULT_MAX_INGEST_LAG_NS, RetentionPolicy};
@@ -2833,7 +2885,7 @@ mod invalidate_tests {
         );
 
         let before = gets();
-        let (_, cold) = pass(MaintainMemo::new(0)).await;
+        let (cold_memo, cold) = pass(MaintainMemo::new(0)).await;
         let cold_gets = gets() - before;
         assert_eq!(
             cold.lag_bound_gets, 1,
@@ -2847,6 +2899,22 @@ mod invalidate_tests {
         assert_eq!(
             cold.retention_lag_ns, NS_PER_HOUR,
             "a parts-less rewrite leaves the tombstone as the only bound"
+        );
+
+        let before = gets();
+        let (_, again) = pass(cold_memo).await;
+        assert_eq!(
+            again.lag_bound_gets, 0,
+            "the memo keeps the answer the cold pass read"
+        );
+        assert_eq!(
+            gets() - before,
+            warm_gets,
+            "the second pass without the exact expiry issues no rewrite GET"
+        );
+        assert_eq!(
+            again.retention_lag_ns, NS_PER_HOUR,
+            "the memoised answer keeps the tombstone as the only bound"
         );
     }
 }

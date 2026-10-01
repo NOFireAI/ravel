@@ -4111,7 +4111,8 @@ fn render_maintain_safety_family(
          bucket's newest event plus the retention window, when this process tombstoned the \
          bucket itself; otherwise the earlier of its ingest hour's end plus the window and its \
          tombstone time, which under-reads by up to one hour plus max_ingest_lag (three hours at \
-         the defaults) and over-reads by at most the allowed future clock skew; and for a \
+         the defaults) and over-reads by at most the allowed future clock skew, except \
+         transiently after a physical sweep that stopped partway; and for a \
          tombstoned bucket holding a rewrite record with no parts, its tombstone time alone, \
          which never over-reads and under-reads by however late the tombstone was written. A \
          unit whose scan failed, or that a failed provisioning read skipped, contributes \
