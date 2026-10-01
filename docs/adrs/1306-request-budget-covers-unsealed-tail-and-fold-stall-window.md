@@ -169,7 +169,9 @@ Two related facts bound what any fix here can promise:
    `healthy_tail_max`, the error text says so (the threshold is
    `healthy_tail_max` plus the fold interval plus the HEAD cache TTL, and the
    verdict needs a resolve that read a snapshot part; see the 2026-09-27
-   refusal-threshold amendment below). It gives the tail's length and
+   refusal-threshold amendment below; a `query` process takes that fold
+   interval from `--fold-lag-interval-secs`, see the 2026-10-01 fold-lag
+   interval amendment below). It gives the tail's length and
    names `ravel_catalog_fold_last_success_timestamp_seconds`. The status stays
    422 and the result stays refused. This changes what the operator reads, not
    what the query returns.
@@ -755,7 +757,9 @@ to the constant above; wiring the running server's `FoldTaskConfig` and
 has changed them is classified against the defaults until then. (Since done,
 as the wiring of follow-up task 5, for the seal margin and HEAD cache TTL everywhere, and for
 the fold interval in `all` and `maintain` processes; a `query` or `gateway`
-process still uses the default fold interval.)
+process still uses the default fold interval. The 2026-10-01 fold-lag interval
+amendment below gives a `query` process the maintain tier's interval through
+`--fold-lag-interval-secs`; a `gateway` serves no query and classifies nothing.)
 
 ### A resolve that read no snapshot part has no tail to report
 
@@ -800,3 +804,45 @@ session config, and the exemplars read
 (`services/ravel-server/src/exemplars.rs`) checks a bare `RequestLimit`; both
 render the plain message. `docs/query-engine.md` states this rather than
 leaving a reader to infer it from a refusal that did not name the gauge.
+
+## Amendment (2026-10-01, #2074): a query process classifies against the maintain tier's fold interval
+
+<!-- amendment-applies: sections="Decision|Amendment (2026-09-27, #1306): the fold-lag refusal threshold adds the fold interval and the HEAD cache TTL" pointer="2026-10-01 fold-lag interval amendment" -->
+
+The 2026-09-27 refusal-threshold amendment wired the fold interval into
+`fold_lag_threshold` from the `FoldTaskConfig` a process spawns its fold with.
+Only `--mode all` and `--mode maintain` run the scheduled fold, and ADR-1693
+refuses `--fold-interval-secs` in every other mode, so a `query` process always
+classified against the 300 s default. In the operator's split topology the
+fold runs on the maintain tier: with `spec.maintain.fold.intervalSecs` at 900,
+a fold that is keeping up can show a tail of up to 8,400 + 900 + 30 = 9,330 s,
+while the query tier classified against 8,730 s and blamed a healthy fold for
+the last ten minutes of every cycle.
+
+### The flag
+
+`ravel-server` gains `--fold-lag-interval-secs`. It sets the fold interval
+decision 6's threshold uses and nothing else: it configures no fold, starts no
+fold loop, and does not move `--fold-interval-secs`. Unset, the threshold keeps
+the default fold interval.
+
+- It is accepted only in `--mode query`, the one mode that serves queries and
+  runs no scheduled fold.
+- `--mode all` and `--mode maintain` refuse it at startup: they run the fold,
+  and classify against their own `--fold-interval-secs`. `--mode gateway`
+  refuses it too, since it serves no query and classifies nothing.
+- A zero value is refused at startup, as a zero `--fold-interval-secs` is: no
+  maintain tier can run a fold at that interval.
+
+ADR-1693's rule stands unchanged. `--disable-fold` and `--fold-interval-secs`
+are still refused in `--mode query` and `--mode gateway`; the new flag is a
+separate input to a query-side classification, not a fold setting.
+
+### The operator
+
+The operator renders `--fold-lag-interval-secs` on the query Deployment, the
+only query-serving tier it renders, from `spec.maintain.fold.intervalSecs`
+whenever that field is set, alongside the `--fold-interval-secs` the maintain
+Deployment already carries. The maintain and gateway Deployments never carry
+it. A cluster that leaves the field unset renders no flag on either tier, and
+both classify against the same default.
