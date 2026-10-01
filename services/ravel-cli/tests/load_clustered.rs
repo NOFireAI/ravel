@@ -800,7 +800,7 @@ async fn clear_then_load_writes_no_descriptor_and_the_generation() {
 #[tokio::test]
 async fn bloom_scope_set_reaches_the_object() {
     let fx = fixture();
-    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let (store, metrics) = counted_store();
     declare_region_and_code(&store, fx.now_ns).await;
     let printed = set_scope(&store, BloomScopeArg::Undeclared, fx.now_ns)
         .await
@@ -814,9 +814,13 @@ async fn bloom_scope_set_reaches_the_object() {
         )
     );
     // The stored scope again writes nothing and says so.
+    let writes_before = writes(&metrics.snapshot());
+    let contents_before = contents(store.as_ref()).await;
     let printed = set_scope(&store, BloomScopeArg::Undeclared, fx.now_ns)
         .await
         .expect("same scope");
+    assert_eq!(writes(&metrics.snapshot()), writes_before);
+    assert_eq!(contents(store.as_ref()).await, contents_before);
     assert_eq!(
         printed,
         "tenant acme bloom scope is already undeclared; nothing written\ntenant acme bloom \
