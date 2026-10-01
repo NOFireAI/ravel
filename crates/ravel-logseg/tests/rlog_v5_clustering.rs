@@ -1242,3 +1242,43 @@ fn bloom_scope_undeclared_matches_declared_names_across_types() {
         assert_eq!(hits.len(), 4, "{scope}: every row carrying the word");
     }
 }
+
+/// A columnar batch whose key `(name, type)` sits only in `residual_attrs`,
+/// with no dynamic column for it, is still keyed by that value: the writer
+/// folds the residual into `attrs_raw`, where the row path's reader finds the
+/// attribute, so the columnar order matches the row path's. `from_records`
+/// never builds this shape (the first occurrence always takes the column
+/// cell); a hand-built batch can.
+#[test]
+fn columnar_key_held_only_in_residual_attrs_still_orders_rows() {
+    let k = |v: &str| vec![("tenant", s(v))];
+    let records = vec![
+        rec(STREAM_A, T0 + 100, "r0", k("c")),
+        rec(STREAM_A, T0 + 200, "r1", k("a")),
+        rec(STREAM_A, T0 + 300, "r2", k("b")),
+        rec(STREAM_A, T0 + 400, "r3", Vec::new()),
+    ];
+    let d = descriptor(&[("tenant", SortKeyType::Str)]);
+    let cfg = RlogConfig::default();
+    let rows = write_rows(&cfg, Some(&d), 1, &records).expect("row path");
+    assert_eq!(bodies(&rows), ["r3", "r1", "r2", "r0"]);
+
+    let mut b = ColumnarLogBatch::from_records(&records);
+    let col = b
+        .dyn_columns
+        .iter()
+        .position(|c| c.name == "tenant")
+        .expect("tenant column");
+    b.dyn_columns.remove(col);
+    b.residual_attrs = records.iter().map(|r| r.attrs.clone()).collect();
+    let mut w = writer(&cfg, Some(&d), 1);
+    w.push_columnar(b).expect("push");
+    let cols = w.finish().expect("columnar");
+    assert_eq!(bodies(&cols), bodies(&rows));
+    let tenants: Vec<Vec<(String, AttrValue)>> = scan(&cols).into_iter().map(|r| r.attrs).collect();
+    let want: Vec<Vec<(String, AttrValue)>> = [vec![], k("a"), k("b"), k("c")]
+        .into_iter()
+        .map(|a| a.into_iter().map(|(n, v)| (n.to_string(), v)).collect())
+        .collect();
+    assert_eq!(tenants, want);
+}

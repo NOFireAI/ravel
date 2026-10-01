@@ -14,7 +14,8 @@
 /// empty object). `InconsistentStreamAttrs` is writer-side input validation:
 /// two records claiming one stream id but disagreeing on the resource+scope
 /// bytes behind it. `InvalidSortDescriptor` is writer-side validation of a
-/// caller's sort descriptor. `Io` wraps compression backend failures.
+/// caller's sort descriptor. `InvalidRowOrder` is a writer-side internal check
+/// on its own row order. `Io` wraps compression backend failures.
 #[derive(Debug, thiserror::Error)]
 pub enum LogSegError {
     #[error("corrupted segment: {0}")]
@@ -49,6 +50,12 @@ pub enum LogSegError {
     /// never `Corrupted`.
     #[error("invalid sort descriptor: {0}")]
     InvalidSortDescriptor(String),
+    /// The row order the writer computed is not a permutation of its rows: an
+    /// index is repeated, out of range, or missing. The writer refuses the
+    /// object rather than write one whose rows, footer and counters silently
+    /// drop or repeat a record. Nothing was decoded, so it is never `Corrupted`.
+    #[error("invalid row order: {0}")]
+    InvalidRowOrder(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }

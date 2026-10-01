@@ -223,7 +223,7 @@ pub fn i64_candidates(values: &[i64]) -> Vec<(Enc, Vec<u8>)> {
     else {
         return vec![(Enc::Plain, Vec::new())];
     };
-    let mut candidates: Vec<(Enc, Vec<u8>)> = Vec::with_capacity(7);
+    let mut candidates: Vec<(Enc, Vec<u8>)> = Vec::with_capacity(6);
     if min == max {
         let mut b = Vec::new();
         put_ivarint(&mut b, min);
