@@ -756,9 +756,10 @@ pub(crate) async fn resolve_tables(
 /// The manifests a Flight ticket pinned, read by their exact version (one GET
 /// each, no LIST) and checked against the tenant's grants as they are now.
 ///
-/// A pinned version that is gone, or that is a drop, is
-/// [`ParquetQueryError::PinnedManifestGone`]: the newest version never stands
-/// in for it. The caller has checked that `pins` is not empty.
+/// A pinned version that is gone is [`ParquetQueryError::PinnedManifestGone`]:
+/// the newest version never stands in for it. A pinned version that is a drop
+/// is refused the same way, as a defensive check only, since `GetFlightInfo`
+/// pins live versions. The caller has checked that `pins` is not empty.
 pub(crate) async fn resolve_pinned_tables(
     sources: &ParquetSources,
     tenant: &TenantHash,
