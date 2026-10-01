@@ -4,13 +4,15 @@
 # "No wall-clock wait in an injected-clock test helper" cost two gate reruns
 # (the flaky pair test, then its rewrite under #1235). That rule is now a
 # check, not a paragraph: this scans every injected-clock test helper in
-# services/ravel-cli/src/load.rs for thread::sleep, tokio::time::sleep,
+# services/ravel-cli/src/load/ for thread::sleep, tokio::time::sleep,
 # a bare/aliased sleep() call, tokio::time::timeout, Instant::, .elapsed()
 # and SystemTime, and fails on a hit.
 #
-# Scan span and predicate. The whole `#[cfg(test)]` module (from the first
-# `#[cfg(test)]` line to end of file) is the scan region, not a hand-picked
-# set of helper spans. Inside it, a function item is scanned when its
+# Scan span and predicate. Each file is scanned from its first `#[cfg(test)]`
+# line to end of file, except a test-only file (tests.rs, test_support.rs, or
+# a file under a tests/ directory), which is scanned from line 1 because its
+# `#[cfg(test)]` sits on the parent's `mod` declaration. That region, not a
+# hand-picked set of helper spans, is what is scanned. Inside it, a function item is scanned when its
 # signature or body mentions one of the injected-clock types named once in
 # CLOCK_TYPES below (TestClock, FixedClock), plus the two helpers issue #1260
 # names by name (load_two_writes_across_one_clock_advance,
@@ -39,21 +41,23 @@
 #
 # Helper-count floor on the default target. The zero-helpers guard below
 # catches a predicate that finds nothing at all, but not one that narrows: as
-# shipped the real file scans 26 helpers, and dropping FixedClock from
+# shipped the default target scans 35 helpers, and dropping FixedClock from
 # CLOCK_TYPES takes that to 5 (dropping both clock types, to 2) while still
 # exiting 0. So a scan of the default target that finds fewer than
 # DEFAULT_TARGET_MIN_HELPERS helpers fails. It is a floor rather than an exact
-# count on purpose: a new injected-clock helper in load.rs must never fail the
-# gate, only a predicate that stops seeing the ones already there.
+# count on purpose: a new injected-clock helper under load/ must never fail
+# the gate, only a predicate that stops seeing the ones already there.
 #
-# Scope note. This guard scans one file, services/ravel-cli/src/load.rs. It is
+# Scope note. This guard scans the bulk loader's module directory,
+# services/ravel-cli/src/load/. It is
 # not yet enforced workspace-wide: other crates hold injected-clock tests it
 # does not read (see CLAUDE.md for the measured out-of-scope counts).
 #
 # Usage:
 #   scripts/check-injected-clock-helpers.sh [file]
-#     file defaults to services/ravel-cli/src/load.rs (relative to the repo
-#     root). Tests pass a throwaway fixture path here instead.
+#     with no argument, scans every .rs file under services/ravel-cli/src/load/
+#     (relative to the repo root). A file argument is scanned alone; tests
+#     pass a throwaway fixture path here.
 #
 # Exit 0 clean, 1 on a wall-clock hit, on a zero-helpers scan, or on a
 # default-target scan under the helper-count floor, 64 on bad usage, 70 if the
@@ -64,7 +68,7 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 
 case "${1:-}" in
   -h | --help)
-    sed -n '2,60p' "$0"
+    awk 'NR > 1 && !/^#/ { exit } NR > 1' "$0"
     exit 0
     ;;
 esac
@@ -74,28 +78,34 @@ if [[ $# -gt 1 ]]; then
   exit 64
 fi
 
-default_target="${repo_root}/services/ravel-cli/src/load.rs"
+# The default target is the bulk loader's module directory: its injected-clock
+# helpers live in several files there. A file argument is still scanned alone.
+default_target="${repo_root}/services/ravel-cli/src/load"
 target="${1:-${default_target}}"
 
-if [[ ! -f "${target}" ]]; then
-  echo "check-injected-clock-helpers.sh: no such file: ${target}" >&2
-  exit 64
-fi
-
 # The helper-count floor applies to the default target only (see the header):
-# a fixture legitimately holds a handful of helpers. `-ef` compares the files
-# themselves, so a relative path or a symlink to load.rs is still the default
-# target.
+# a fixture legitimately holds a handful of helpers. `-ef` compares the
+# directories themselves, so a relative path or a symlink to load/ is still
+# the default target.
 is_default=0
-if [[ "${target}" -ef "${default_target}" ]]; then
+if [[ -d "${target}" && "${target}" -ef "${default_target}" ]]; then
   is_default=1
+elif [[ ! -f "${target}" ]]; then
+  echo "check-injected-clock-helpers.sh: not a file, and not the default load/ directory: ${target}" >&2
+  exit 64
 fi
 DEFAULT_TARGET_MIN_HELPERS=20
 
 # --- the scan ---------------------------------------------------------------
 #
-# Single-file scan, so no per-file state reset is needed (unlike
-# check-test-hygiene.sh, which processes many files through one awk pass).
+# One awk pass reads every file; the line buffers and the string/comment state
+# reset at each file's first line, and scan_file runs once per file.
+#
+# A file is scanned from its first `#[cfg(test)]` line, or from line 1 when it
+# is one of the default target's test-only files (tests.rs, test_support.rs,
+# anything under a tests/ directory, all relative to whole_prefix): those are
+# compiled through a `#[cfg(test)] mod` declaration in their parent and carry
+# no attribute of their own.
 #
 # strip_both computes two views of each line in one walk that carries string
 # and block-comment state across lines:
@@ -243,48 +253,14 @@ function mask_clock_calls(s,   out, rest, pos, len, base, chain) {
     rest = substr(rest, pos + len)
   }
 }
-BEGIN { SQ = sprintf("%c", 39) }
-{
-  nlines++
-  strip_both($0)
-  raw[nlines] = $0
-  clean[nlines] = CLEAN
-  nostr[nlines] = NOSTR
-  # Anchored on the stripped line like every other predicate here: a doc
-  # comment or string literal mentioning the attribute would otherwise start
-  # the scan above the real test module and pull production functions in.
-  if (cfg_test_line == 0 && CLEAN ~ /#\[cfg\(test\)\]/) cfg_test_line = nlines
-}
-END {
-  if (nlines == 0) {
-    print "check-injected-clock-helpers.sh: " FILENAME " is empty" > "/dev/stderr"
-    exit 70
-  }
-  scan_start = (cfg_test_line > 0) ? cfg_test_line : nlines + 1
-
-  NAMED_1 = "load_two_writes_across_one_clock_advance"
-  NAMED_2 = "load_with_released_tail"
-
-  # The injected-clock types, named once. A function that mentions any of
-  # these (or is one of the two named helpers) is scanned.
-  nct = 0
-  clock_types[++nct] = "TestClock"
-  clock_types[++nct] = "FixedClock"
-
-  # Wall-clock constructs, matched as regexes on the clean line. First match
-  # per line wins, so the qualified sleep names report before the bare
-  # sleep() pattern (which exists to catch an aliased `use ...::sleep`).
-  np = 0
-  pname[++np] = "thread::sleep";        pre[np] = "thread::sleep"
-  pname[++np] = "tokio::time::sleep";   pre[np] = "tokio::time::sleep"
-  pname[++np] = "tokio::time::timeout"; pre[np] = "tokio::time::timeout"
-  pname[++np] = "Instant::";            pre[np] = "Instant::"
-  pname[++np] = "SystemTime";           pre[np] = "SystemTime"
-  pname[++np] = ".elapsed()";           pre[np] = "\\.elapsed\\(\\)"
-  pname[++np] = "sleep()";              pre[np] = "(^|[^A-Za-z0-9_:])sleep[ \t]*\\("
-
-  helper_count = 0
-  finding_count = 0
+# Scan the file whose lines are buffered in raw/clean/nostr. Counts accumulate
+# across files in helper_count and finding_count.
+function scan_file(   rel, whole) {
+  rel = substr(cur_file, length(whole_prefix) + 1)
+  whole = (whole_prefix != "" && substr(cur_file, 1, length(whole_prefix)) == whole_prefix \
+    && rel ~ /(^|\/)(tests|test_support)\.rs$|(^|\/)tests\//)
+  if (whole) scan_start = 1
+  else scan_start = (cfg_test_line > 0) ? cfg_test_line : nlines + 1
 
   i = scan_start
   while (i <= nlines) {
@@ -346,12 +322,63 @@ END {
         # requiring a non-empty reason.
         if (nostr[k] ~ /\/\/ allow-wall-clock:[ \t]*[^ \t]/) continue
         finding_count++
-        printf "%s:%d: %s in %s\n", FILENAME, k, sym, name
+        printf "%s:%d: %s in %s\n", cur_file, k, sym, name
       }
     }
 
     i = end_line + 1
   }
+}
+BEGIN {
+  SQ = sprintf("%c", 39)
+
+  NAMED_1 = "load_two_writes_across_one_clock_advance"
+  NAMED_2 = "load_with_released_tail"
+
+  # The injected-clock types, named once. A function that mentions any of
+  # these (or is one of the two named helpers) is scanned.
+  nct = 0
+  clock_types[++nct] = "TestClock"
+  clock_types[++nct] = "FixedClock"
+
+  # Wall-clock constructs, matched as regexes on the clean line. First match
+  # per line wins, so the qualified sleep names report before the bare
+  # sleep() pattern (which exists to catch an aliased `use ...::sleep`).
+  np = 0
+  pname[++np] = "thread::sleep";        pre[np] = "thread::sleep"
+  pname[++np] = "tokio::time::sleep";   pre[np] = "tokio::time::sleep"
+  pname[++np] = "tokio::time::timeout"; pre[np] = "tokio::time::timeout"
+  pname[++np] = "Instant::";            pre[np] = "Instant::"
+  pname[++np] = "SystemTime";           pre[np] = "SystemTime"
+  pname[++np] = ".elapsed()";           pre[np] = "\\.elapsed\\(\\)"
+  pname[++np] = "sleep()";              pre[np] = "(^|[^A-Za-z0-9_:])sleep[ \t]*\\("
+
+  helper_count = 0
+  finding_count = 0
+}
+FNR == 1 {
+  if (NR > 1) scan_file()
+  cur_file = FILENAME
+  nlines = 0; cfg_test_line = 0
+  bdepth = 0; sstate = 0; sesc = 0; shashes = 0
+}
+{
+  nlines++
+  strip_both($0)
+  raw[nlines] = $0
+  clean[nlines] = CLEAN
+  nostr[nlines] = NOSTR
+  # Anchored on the stripped line like every other predicate here: a doc
+  # comment or string literal mentioning the attribute would otherwise start
+  # the scan above the real test module and pull production functions in.
+  if (cfg_test_line == 0 && CLEAN ~ /#\[cfg\(test\)\]/) cfg_test_line = nlines
+}
+END {
+  if (NR == 0) {
+    print "check-injected-clock-helpers.sh: " scan_name " is empty" > "/dev/stderr"
+    exit 70
+  }
+  scan_file()
 
   if (finding_count > 0) {
     printf "check-injected-clock-helpers.sh: %d finding(s) across %d scanned helper(s)\n", \
@@ -361,13 +388,13 @@ END {
   if (helper_count == 0) {
     printf "check-injected-clock-helpers.sh: 0 injected-clock helpers scanned in %s -- " \
       "a clock type renamed, or the named helpers (%s / %s) removed?\n", \
-      FILENAME, NAMED_1, NAMED_2 > "/dev/stderr"
+      scan_name, NAMED_1, NAMED_2 > "/dev/stderr"
     exit 1
   }
   if (is_default && helper_count < min_helpers) {
     printf "check-injected-clock-helpers.sh: only %d injected-clock helper(s) scanned in %s, " \
       "under the floor of %d -- did the helper predicate narrow (a clock type dropped from " \
-      "CLOCK_TYPES)?\n", helper_count, FILENAME, min_helpers > "/dev/stderr"
+      "CLOCK_TYPES)?\n", helper_count, scan_name, min_helpers > "/dev/stderr"
     exit 1
   }
   printf "check-injected-clock-helpers.sh: clean (%d helper(s) scanned)\n", helper_count
@@ -375,9 +402,28 @@ END {
 }
 '
 
+# The default target is scanned as every .rs file under it, in a stable order;
+# whole_prefix marks which of them may be test-only files (see scan_file). A
+# single file argument gets its own directory as the prefix, so naming one of
+# the loader's tests.rs files scans it whole, as the directory scan does.
+files=("${target}")
+whole_prefix="$(dirname "${target}")/"
+if [[ ${is_default} -eq 1 ]]; then
+  files=()
+  while IFS= read -r -d '' f; do
+    files+=("${f}")
+  done < <(find -H "${target}" -type f -name '*.rs' -print0 | LC_ALL=C sort -z)
+  if [[ ${#files[@]} -eq 0 ]]; then
+    echo "check-injected-clock-helpers.sh: no .rs files under ${target}" >&2
+    exit 70
+  fi
+  whole_prefix="${target%/}/"
+fi
+
 scan_status=0
 awk -v is_default="${is_default}" -v min_helpers="${DEFAULT_TARGET_MIN_HELPERS}" \
-  "${awk_prog}" "${target}" || scan_status=$?
+  -v scan_name="${target}" -v whole_prefix="${whole_prefix}" \
+  "${awk_prog}" "${files[@]}" || scan_status=$?
 if [[ ${scan_status} -gt 1 ]]; then
   echo "check-injected-clock-helpers.sh: the scan failed (awk exit ${scan_status})" >&2
   exit 70
