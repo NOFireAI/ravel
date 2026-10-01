@@ -12,10 +12,17 @@
 //! The `set` and `clear` commands are the production path that writes a
 //! version-3 record. Each reads the current record, applies the catalog setter
 //! with [`StorageLayoutWrite::ReadersRolledOut`], and writes the whole record
-//! back through [`set_tenant_config`], every other field carried through; a
-//! refusal from the setter or the write gate writes nothing. From the first
-//! write, the log ingest flush and the bulk loader write the tenant's RLOG
-//! objects with the key and scope the record carries.
+//! back through [`TenantConfig::write_if_unchanged`] against the version it
+//! read, every other field carried through; a refusal from the setter or the
+//! write gate, or a record another writer changed in between, writes nothing.
+//! After the write, the bulk loader and the log ingest flush write the
+//! tenant's RLOG objects with the key and scope the record carries, with three
+//! exceptions on the flush: a server keeps the layout it read before the write
+//! for up to its staleness horizon (60 s); a layout that does not resolve
+//! writes the unkeyed default, no descriptor and every string column in the
+//! filter, counted on `ingest_clustering_key_unresolved_total`; and while its
+//! config read fails it serves the layout it last read, or the default layout
+//! when it never read one.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -25,9 +32,10 @@ use ravel_catalog::{
     BloomScope, ClusteringBucketWidth, ClusteringKeyState, DeclaredColumnType, DeclaredTypedColumn,
     MAX_CLUSTERING_KEY_COLUMNS, StorageLayoutConfigError, StorageLayoutWrite,
     TENANT_CONFIG_FORMAT_VERSION, TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION, TenantConfig,
-    TenantConfigSetOutcome, TenantLifecycleState, read_config, set_tenant_config,
+    TenantConfigSetOutcome, TenantLifecycleState, read_config,
 };
-use ravel_object_store::ObjectStoreBackend;
+use ravel_ingest::DEFAULT_LIFECYCLE_REFRESH_INTERVAL_NS;
+use ravel_object_store::{ObjectStoreBackend, Version};
 use ravel_types::TenantId;
 
 use crate::typed_attr_column::spelling;
@@ -113,9 +121,10 @@ pub async fn clustering_key_set_to(
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     require_opt_in("clustering_key", write)?;
-    let mut config = read_or_new(store.as_ref(), tenant).await?;
+    let read = read_or_new(store.as_ref(), tenant).await?;
+    let mut config = read.config.clone();
     config.set_clustering_key(columns, bucket_width.into(), write)?;
-    let outcome = write_back(store.as_ref(), tenant, &config, now_ns).await?;
+    let outcome = write_back(store.as_ref(), tenant, &read, &config, now_ns).await?;
     print_outcome(out, tenant, outcome)?;
     clustering_key_lines(out, tenant, &config)
 }
@@ -142,9 +151,10 @@ pub async fn clustering_key_clear_to(
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     require_opt_in("clustering_key", write)?;
-    let mut config = read_or_new(store.as_ref(), tenant).await?;
+    let read = read_or_new(store.as_ref(), tenant).await?;
+    let mut config = read.config.clone();
     config.clear_clustering_key(write)?;
-    let outcome = write_back(store.as_ref(), tenant, &config, now_ns).await?;
+    let outcome = write_back(store.as_ref(), tenant, &read, &config, now_ns).await?;
     print_outcome(out, tenant, outcome)?;
     clustering_key_lines(out, tenant, &config)
 }
@@ -174,17 +184,17 @@ pub async fn bloom_scope_set_to(
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     require_opt_in("bloom_scope", write)?;
-    let mut config = read_or_new(store.as_ref(), tenant).await?;
-    let before = config.clone();
+    let read = read_or_new(store.as_ref(), tenant).await?;
+    let mut config = read.config.clone();
     config.set_bloom_scope(scope.into(), write)?;
-    if config == before {
+    if config == read.config {
         writeln!(
             out,
             "tenant {tenant} bloom scope is already {}; nothing written",
             bloom_scope_spelling(scope.into())
         )?;
     } else {
-        let outcome = write_back(store.as_ref(), tenant, &config, now_ns).await?;
+        let outcome = write_back(store.as_ref(), tenant, &read, &config, now_ns).await?;
         print_outcome(out, tenant, outcome)?;
     }
     bloom_scope_line(out, tenant, &config)?;
@@ -205,24 +215,43 @@ fn require_opt_in(field: &'static str, write: StorageLayoutWrite) -> anyhow::Res
     }
 }
 
-/// The tenant's config read from its record, or a new active config with no
-/// override when it has none.
-async fn read_or_new(store: &dyn ObjectStoreBackend, tenant: &str) -> anyhow::Result<TenantConfig> {
-    let tenant_hash = TenantId::new(tenant).hash();
-    Ok(read_config(store, &tenant_hash).await?.map_or_else(
-        || TenantConfig::new(TenantLifecycleState::Active),
-        |(c, _)| c,
-    ))
+/// The config a write command changes, with the version of the record it was
+/// read from (`None` when there was no record).
+struct ReadConfig {
+    config: TenantConfig,
+    version: Option<Version>,
 }
 
+/// The tenant's config read from its record, or a new active config with no
+/// override when it has none.
+async fn read_or_new(store: &dyn ObjectStoreBackend, tenant: &str) -> anyhow::Result<ReadConfig> {
+    let tenant_hash = TenantId::new(tenant).hash();
+    Ok(match read_config(store, &tenant_hash).await? {
+        Some((config, version)) => ReadConfig {
+            config,
+            version: Some(version),
+        },
+        None => ReadConfig {
+            config: TenantConfig::new(TenantLifecycleState::Active),
+            version: None,
+        },
+    })
+}
+
+/// Write `config` back only over the record `read` came from, so a write that
+/// landed in between is refused with "re-read and retry" rather than
+/// overwritten.
 async fn write_back(
     store: &dyn ObjectStoreBackend,
     tenant: &str,
+    read: &ReadConfig,
     config: &TenantConfig,
     now_ns: i64,
 ) -> anyhow::Result<TenantConfigSetOutcome> {
     let tenant_hash = TenantId::new(tenant).hash();
-    Ok(set_tenant_config(store, &tenant_hash, config, now_ns).await?)
+    Ok(config
+        .write_if_unchanged(store, &tenant_hash, read.version.as_ref(), now_ns)
+        .await?)
 }
 
 fn print_outcome(
@@ -238,10 +267,18 @@ fn print_outcome(
         )?,
         TenantConfigSetOutcome::Updated => writeln!(
             out,
-            "updated tenant {tenant}'s config record (swapped in place with CasVersion); every \
-             other field carried through unchanged"
+            "updated tenant {tenant}'s config record (swapped in place with CasVersion against \
+             the version this command read); every other field carried through unchanged"
         )?,
     }
+    writeln!(
+        out,
+        "note: a server's log ingest flush can keep the layout it read before this write for up \
+         to {}s (its tenant config staleness horizon), and longer while its config reads fail, \
+         when it keeps serving the layout it last read; a key it cannot resolve writes no \
+         clustering descriptor, counted on ingest_clustering_key_unresolved_total",
+        DEFAULT_LIFECYCLE_REFRESH_INTERVAL_NS / 1_000_000_000
+    )?;
     Ok(())
 }
 
