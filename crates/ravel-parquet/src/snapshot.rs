@@ -534,9 +534,10 @@ async fn read_file(
             "the trailer records a {footer_len}-byte footer in a {size}-byte file"
         )));
     }
-    let mut _before_reservation: Option<Reservation> = None;
-    let footer = if footer_and_trailer <= fetched {
-        data.slice(split - footer_len as usize..split)
+    let (footer, _before_reservation): (Bytes, Option<Reservation>) = if footer_and_trailer
+        <= fetched
+    {
+        (data.slice(split - footer_len as usize..split), None)
     } else {
         // Select the version the first read saw, so both reads are of one
         // object's bytes; If-Match stays on the listed ETag.
@@ -560,7 +561,6 @@ async fn read_file(
             SnapshotError::FileMissing { key } => SnapshotError::FileChanged { key },
             other => other,
         })?;
-        _before_reservation = Some(before_reservation);
         if before.outcome.total_size != size || before.pin != recorded {
             return Err(SnapshotError::FileChanged { key: key.clone() });
         }
@@ -574,7 +574,7 @@ async fn read_file(
         let mut footer = Vec::with_capacity(footer_len as usize);
         footer.extend_from_slice(&before);
         footer.extend_from_slice(&data[..split]);
-        Bytes::from(footer)
+        (Bytes::from(footer), Some(before_reservation))
     };
     let metadata = decode_footer(&footer, size - footer_and_trailer).map_err(&corrupt)?;
     let row_count = u64::try_from(metadata.file_metadata().num_rows())
