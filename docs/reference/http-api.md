@@ -168,11 +168,14 @@ For the query routes, the status codes come from one shared error mapping:
   this build reads, or carrying an enum value above the highest it reads (a
   snapshot part entry level), which a peer on a newer build can read during a
   rolling upgrade, a provisioning record written in a format version above
-  the highest this build reads, a catalog decode job the read CPU gate
-  cancelled at shutdown, or an unsatisfiable `min_commit_token`. Retryable. A
-  store fault that is a checksum mismatch answers 500 instead, on a catalog
-  read as on a segment fetch and on a SQL read of a Parquet table's manifest,
-  grants record or data file. A column-statistics object this build cannot
+  the highest this build reads, a Parquet table's manifest or grants record
+  written in a format version above the highest this build reads, a catalog
+  decode job the read CPU gate cancelled at shutdown, or an unsatisfiable
+  `min_commit_token`. Retryable. A store fault that is a checksum mismatch
+  answers 500 instead, on a catalog read as on a segment fetch and on a SQL
+  read of a Parquet table's manifest, grants record or data file. A Parquet
+  table's manifest or grants record written in a format version below the
+  lowest this build supports answers 500. A column-statistics object this build cannot
   decode answers no error: the query reads the data instead.
 - 504 `timeout`: the query passed its deadline.
 - 401 `unauthorized`: no resolvable credential.
