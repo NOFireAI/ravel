@@ -750,14 +750,19 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for InstrumentedStore<S> {
     }
 
     /// Passthrough, uncounted. A multipart upload is a handle, not a call:
-    /// counting it would mean wrapping the returned [`MultipartUpload`] and
-    /// attributing its parts to some [`StoreOp`], and no `StoreOp` describes
-    /// them (folding part bytes into `put` would make `put.calls` disagree with
-    /// the number of `put()` calls a caller made). Multipart traffic is
-    /// therefore invisible to these counters; only compaction writes it, and
-    /// its own metrics cover part counts and bytes. `put()`'s own
-    /// above-threshold multipart path *is* counted, as one `put`, because that
-    /// is what the caller invoked.
+    /// counting it here would mean wrapping the returned [`MultipartUpload`]
+    /// and attributing its parts to some [`StoreOp`], and folding part bytes
+    /// into `put` would make this decorator's `put.calls` disagree with the
+    /// number of `put()` calls a caller made. Explicit multipart traffic is
+    /// therefore invisible to these counters. `put()`'s own above-threshold
+    /// multipart path *is* counted, as one `put`, because that is what the
+    /// caller invoked.
+    ///
+    /// The decision is local to this decorator. The per-class counters of
+    /// [`crate::scheduling::ClassedStore`] count each explicit `put_part` as
+    /// one `put` (see `ScheduledMultipartUpload`), so for the same explicit
+    /// multipart traffic the per-class `put` block reads one call per part
+    /// while this block reads none. The two count it differently on purpose.
     async fn put_multipart<'a>(
         &'a self,
         key: &str,

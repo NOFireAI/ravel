@@ -675,9 +675,13 @@ impl ObjectStoreBackend for ScheduledHandle {
 /// `complete`, and `abort` call takes one permit of the owning handle's
 /// class before delegating to the inner upload, so a multipart sequence
 /// shares the same admission budget as every other op on that class. Each
-/// `put_part` is additionally recorded as one [`StoreOp::Put`] with its byte
-/// count (one `UploadPart` request is one billed PUT); `complete` and `abort`
-/// stay uncounted, matching initiation.
+/// `put_part` call is additionally recorded as one [`StoreOp::Put`] with its
+/// byte count, whether or not the inner upload sends a request for it (a part
+/// refused locally, on a finished or poisoned upload, still counts), the same
+/// convention as [`ScheduledHandle`]'s `put`. `complete` and `abort` stay
+/// uncounted, matching initiation. [`crate::instrument::InstrumentedStore`]
+/// does not count explicit multipart parts at all, so the per-class and
+/// global `put` blocks differ by design for this traffic.
 struct ScheduledMultipartUpload<'a> {
     inner: Box<dyn MultipartUpload + 'a>,
     scheduler: Arc<RequestScheduler>,
