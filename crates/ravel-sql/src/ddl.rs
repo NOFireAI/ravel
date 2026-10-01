@@ -231,36 +231,59 @@ enum ProbeObject {
 /// is the key space `execute_ddl` already has in hand from
 /// [`grants::resolve_location`]. Admission is decided by
 /// [`grants::contains_key`], the same segment-wise rule the read path
-/// applies.
+/// applies, together with a `.parquet` suffix and a non-zero size: a bare
+/// prefix match admits a folder-marker object (zero bytes, often named
+/// exactly like the directory key) and a sibling whose key happens to share
+/// the same string prefix, neither of which `snapshot_location` would ever
+/// treat as a data file.
+///
+/// A non-directory `key` names one object directly; it is resolved with a
+/// single HEAD and never falls through to a listing, which -- scoped to the
+/// exact object key as a string prefix -- would also match an unrelated
+/// sibling like `<key>.bak`.
 async fn one_object_under(
     store: &dyn ObjectStoreBackend,
     grant: &Grant,
     key: &KeyPrefix,
 ) -> Result<ProbeObject, DdlExecuteError> {
-    if !key.directory && !key.key.is_empty() {
-        match store.head(&key.key).await {
-            Ok(meta) if meta.size > 0 => return Ok(ProbeObject::Found(key.key.clone())),
-            Ok(_) | Err(StoreError::NotFound) => {}
-            Err(source) => {
-                return Err(DdlExecuteError::ProbeList {
-                    location: key.key.clone(),
-                    source,
-                });
+    if !key.directory {
+        return match store.head(&key.key).await {
+            Ok(meta) if meta.size > 0 && key.key.ends_with(".parquet") => {
+                Ok(ProbeObject::Found(key.key.clone()))
             }
-        }
+            Ok(_) | Err(StoreError::NotFound) => Ok(ProbeObject::Empty),
+            Err(source) => Err(DdlExecuteError::ProbeList {
+                location: key.key.clone(),
+                source,
+            }),
+        };
     }
+
+    // `key.key` carries no trailing slash (`KeyPrefix`'s own invariant), so
+    // listing it bare would also match a sibling directory sharing the same
+    // string prefix (`data/orders` also prefixes `data/orders-backup/...`).
+    // Scoping the listing to `<key>/` keeps it to this directory's own
+    // children.
+    let list_prefix = if key.key.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", key.key)
+    };
     let mut page: Option<PageToken> = None;
     for _ in 0..MAX_PROBE_LIST_PAGES {
         let listed =
             store
-                .list(&key.key, page)
+                .list(&list_prefix, page)
                 .await
                 .map_err(|source| DdlExecuteError::ProbeList {
                     location: key.key.clone(),
                     source,
                 })?;
         for meta in &listed.objects {
-            if grants::contains_key(grant, &grant.profile, &grant.bucket, meta.key.as_bytes()) {
+            if meta.size > 0
+                && meta.key.ends_with(".parquet")
+                && grants::contains_key(grant, &grant.profile, &grant.bucket, meta.key.as_bytes())
+            {
                 return Ok(ProbeObject::Found(meta.key.clone()));
             }
         }
