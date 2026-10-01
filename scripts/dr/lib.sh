@@ -658,8 +658,16 @@ dr_protection_verdict() {
 # on (dr_reference_noncurrent_days). verify-protection runs once, with that
 # value as its E_v, so it reads every condition the way the server does. A
 # bucket whose reference cannot be determined is refused rather than checked
-# against a guess. An unknown condition does not refuse, as the server warns and
-# starts.
+# against a guess. Where the rules covering all of t/ disagree, or no rule
+# carries NoncurrentDays over t/ at all (a rule narrowed by a tag or an object
+# size does not count), the server fails noncurrent-expiration, which refuses
+# to start while versioning passes. Where what carries it is a rule the server
+# cannot read (an unrecognised Status or filter, a value that does not parse)
+# or rules on prefixes under t/ that form no complete union of t/0 to t/f, the
+# server reads the condition as unknown and only warns, so the harness is
+# stricter there: verify-protection cannot be run without
+# --expected-noncurrent-days. An unknown condition does not refuse, as the
+# server warns and starts.
 dr_check_server_protection() {
   local bucket="$1" variable listing day report code id verdict
   local versioning noncurrent fatal="" advice
@@ -677,7 +685,7 @@ dr_check_server_protection() {
   if dr_reference_noncurrent_days "${listing}"; then
     day="${DR_REFERENCE_DAYS}"
   else
-    dr_bucket_refuse "bucket ${bucket}: ${DR_REFERENCE_ERROR}, so the NoncurrentDays a --require-bucket-protection server measures other rules against cannot be determined; store verify-protection needs that value to check the bucket the way the server does. Give the bucket one enabled rule over t/ (or the whole bucket) carrying NoncurrentVersionExpiration, or set ${variable} to a name that does not exist yet so the harness creates and configures one"
+    dr_bucket_refuse "bucket ${bucket}: ${DR_REFERENCE_ERROR}, so the NoncurrentDays a --require-bucket-protection server measures other rules against cannot be determined; store verify-protection needs that value to check the bucket the way the server does. A --require-bucket-protection server refuses to start on such a bucket, while versioning passes, where the rules covering all of t/ disagree, or where no rule carries NoncurrentDays over t/ at all (a rule narrowed by a tag or an object size does not count). It warns and starts instead where what carries it is a rule it cannot read (a Status other than Enabled or Disabled, a filter it does not recognise, a NoncurrentDays that does not parse) or rules on prefixes under t/ that do not form a complete union of t/0 to t/f. Give the bucket one enabled rule over t/ (or the whole bucket) carrying NoncurrentVersionExpiration, or set ${variable} to a name that does not exist yet so the harness creates and configures one"
     return 1
   fi
   code=0
@@ -731,7 +739,12 @@ DR_REFERENCE_ERROR=""
 # the enabled rules that cover every key under t/, either alone (a rule scoped
 # to the whole bucket, `t` or `t/`) or as members of a union of `t/<d>` rules
 # that carry NoncurrentDays for every lowercase hex digit <d>. A rule narrowed
-# by a tag or a size, or with a filter not read here, covers nothing.
+# by a tag or a size, or with a filter not read here, covers nothing. A day
+# count is read as the server's parse_decimal reads it: decimal digits with no
+# leading zero, up to the u32 maximum. Digits and hex digits are spelled out
+# rather than written as ranges, since a range in a bracket expression follows
+# the locale's collation and, under bash 3.2 with a UTF-8 locale, a-f also
+# takes uppercase letters.
 #
 # $1 is one line per rule: Status, scope (Filter and legacy Prefix as one JSON
 # object, as dr_check_lifecycle reads it) and NoncurrentDays, tab separated.
@@ -742,10 +755,12 @@ dr_reference_noncurrent_days() {
   local filter_re='^\{"f":\{"Prefix":"([^"\\]*)"\},"p":null\}$'
   local and_re='^\{"f":\{"And":\{"Prefix":"([^"\\]*)"\}\},"p":null\}$'
   local legacy_re='^\{"f":null,"p":"([^"\\]*)"\}$'
+  local days_re='^(0|[123456789][0123456789]{0,9})$'
   DR_REFERENCE_DAYS=""
   DR_REFERENCE_ERROR=""
   while IFS=$'\t' read -r rule_status scope days; do
-    [[ "${rule_status}" == Enabled && "${days}" =~ ^[0-9]{1,9}$ ]] || continue
+    [[ "${rule_status}" == Enabled && "${days}" =~ ${days_re} ]] || continue
+    ((days <= 4294967295)) || continue
     if [[ "${scope}" == '{"f":{},"p":null}' ]]; then
       prefix=""
     elif [[ "${scope}" =~ ${filter_re} || "${scope}" =~ ${and_re} || "${scope}" =~ ${legacy_re} ]]; then
@@ -755,7 +770,7 @@ dr_reference_noncurrent_days() {
     fi
     case "${prefix}" in
       '' | t | t/) values+="${days}"$'\n' ;;
-      t/[0-9a-f]) union+="${prefix#t/} ${days}"$'\n' ;;
+      t/[0123456789abcdef]) union+="${prefix#t/} ${days}"$'\n' ;;
     esac
   done <<<"$1"
   digits="$(awk 'NF == 2 { print $1 }' <<<"${union}" | sort -u | wc -l | tr -d ' ')"

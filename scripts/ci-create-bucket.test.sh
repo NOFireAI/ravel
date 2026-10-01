@@ -236,16 +236,23 @@ case_ lifecycle-put-persistent-connection-error-gives-up 1 1 11 "${OK}"
 
 # Each read that does not confirm its setting fails the run, and the run stops
 # at the first one. A bucket without Object Lock is refused before anything is
-# put on it.
+# put on it. A read that fails non-transiently exits with the CLI's own status,
+# as a put does; one that answers the wrong value exits 1.
 override=$'ObjectLockEnabled\t254\t'
-case_ existing-bucket-without-object-lock-fails 1 1 2 "${OWNED}"
+case_ existing-bucket-without-object-lock-fails 254 1 2 "${OWNED}"
+override=$'ObjectLockEnabled\t253\t'
+case_ object-lock-read-fails-with-its-code 253 1 2 "${OWNED}"
 override=$'ObjectLockEnabled\t0\tNone'
 case_ object-lock-not-enabled-fails 1 1 2 "${OK}"
 log_lacks object-lock-not-enabled-fails ' put-'
 override=$'=Status\t0\tSuspended'
 case_ versioning-suspended-fails 1 1 5 "${OK}"
 override=$'=Status\t254\t'
-case_ versioning-read-error-fails 1 1 3 "${OK}"
+case_ versioning-read-error-fails 254 1 3 "${OK}"
+override="${FRESH}"$'\n=Status@2\t254:AccessDenied\t'
+case_ versioning-read-back-error-fails-with-its-code 254 1 5 "${OK}"
+override="${FRESH}"$'\nlength(Rules)@2\t254:AccessDenied\t'
+case_ lifecycle-read-back-error-fails-with-its-code 254 1 $((1 + FRESH_AFTER_CREATE)) "${OK}"
 
 # lifecycle_case_ <name> <want exit> <read fields>: a run whose lifecycle reads
 # all answer the given fields ("|" between them). A passing document is read
@@ -259,7 +266,7 @@ lifecycle_case_() {
   fi
 }
 override=$'length(Rules)\t254\t'
-case_ lifecycle-read-error-fails 1 1 $((1 + AFTER_CREATE)) "${OK}"
+case_ lifecycle-read-error-fails 254 1 $((1 + AFTER_CREATE)) "${OK}"
 lifecycle_case_ disabled-rule-fails 1 "1|Disabled|${WHOLE}|true|1|7"
 lifecycle_case_ second-rule-fails 1 "2|Enabled|${WHOLE}|true|1|7"
 lifecycle_case_ prefixed-filter-fails 1 '1|Enabled|{"f":{"Prefix":"t/"},"p":null}|true|1|7'
@@ -315,28 +322,74 @@ fi
 
 FLOCI_BIN="${TMP}/floci-bin"
 mkdir -p "${FLOCI_BIN}"
+# The stub curl serves one bucket from the files in FLOCI_STATE: "bucket" and
+# "lock" exist once the bucket does and has Object Lock, and "versioning" and
+# "lifecycle" hold the stored documents (an absent lifecycle answers 404
+# NoSuchLifecycleConfiguration). A PUT is stored only when FLOCI_PUTS_STICK is
+# set; otherwise it answers 200 and changes nothing, so a refused document reads
+# back unchanged. Every call is logged to FLOCI_LOG as "<method> <path>".
 cat >"${FLOCI_BIN}/curl" <<'STUB'
 #!/usr/bin/env bash
 url=
 head=0
 method=GET
+fail=0
+out=1
+lock=0
+data=
+wfmt=
 prev=
 for arg in "$@"; do
-  case "${arg}" in http://*) url=${arg} ;; -I) head=1 ;; esac
+  case "${arg}" in
+    http://*) url=${arg} ;;
+    -I) head=1 ;;
+    -fsS) fail=1 ;;
+    *object-lock-enabled:*) lock=1 ;;
+  esac
   [ "${prev}" = -X ] && method=${arg}
+  [ "${prev}" = -o ] && out=0
+  [ "${prev}" = --data-binary ] && data=${arg}
+  [ "${prev}" = -w ] && wfmt=${arg}
   prev=${arg}
 done
-case "${url}" in
-  */_floci/health) echo '{"services":{"s3":"running"}}' ;;
-  *) if [ "${head}" = 1 ]; then printf 200
-     elif [ "${method}" = PUT ]; then :
-     else case "${url}" in
-       *'?object-lock') echo '<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>' ;;
-       *'?versioning') echo '<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>' ;;
-       *'?lifecycle') cat "${FLOCI_LIFECYCLE}" ;;
-     esac
-     fi ;;
+[ "${head}" = 1 ] && method=HEAD
+s=${FLOCI_STATE}
+echo "${method} ${url#http://floci.ravel-system.svc:4566}" >>"${FLOCI_LOG}"
+code=200
+body=
+case "${method} ${url}" in
+  *'/_floci/health') body='{"services":{"s3":"running"}}' ;;
+  'HEAD '*) [ -e "${s}/bucket" ] || code=404 ;;
+  'PUT '*'?versioning' | 'PUT '*'?lifecycle')
+    [ -z "${FLOCI_PUTS_STICK:-}" ] || printf '%s' "${data}" >"${s}/${url##*\?}" ;;
+  'PUT '*)
+    if [ -n "${FLOCI_PUTS_STICK:-}" ] && [ ! -e "${s}/bucket" ]; then
+      : >"${s}/bucket"
+      [ "${lock}" = 0 ] || : >"${s}/lock"
+    fi ;;
+  'GET '*'?object-lock')
+    if [ -e "${s}/lock" ]; then
+      body='<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>'
+    else
+      code=404
+      body='<Error><Code>ObjectLockConfigurationNotFoundError</Code></Error>'
+    fi ;;
+  'GET '*'?versioning')
+    body=$(cat "${s}/versioning" 2>/dev/null) ||
+      body='<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>' ;;
+  'GET '*'?lifecycle')
+    if ! body=$(cat "${s}/lifecycle" 2>/dev/null); then
+      code=404
+      body='<Error><Code>NoSuchLifecycleConfiguration</Code></Error>'
+    fi ;;
 esac
+if [ "${fail}" = 1 ] && [ "${code}" -ge 400 ]; then
+  echo "curl: (22) The requested URL returned error: ${code}" >&2
+  exit 22
+fi
+[ "${out}" = 0 ] || printf '%s\n' "${body}"
+[ -z "${wfmt}" ] || printf '%b' "${wfmt/'%{http_code}'/${code}}"
+exit 0
 STUB
 chmod +x "${FLOCI_BIN}/curl"
 # The health wait never sleeps in a case: a stub that answers it wrong fails
@@ -353,23 +406,44 @@ fi
 
 RULE_ACTIONS='<Status>Enabled</Status><Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration><NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration><AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation></AbortIncompleteMultipartUpload>'
 
-# floci_case_ <name> <want exit> <lifecycle document>: a passing run prints the
-# ready line, and a refused one the scope refusal, so a case cannot pass on
-# some other check's verdict.
-floci_case_() {
-  local name=$1 want_rc=$2 dir="${TMP}/floci-$1" rc=0 want_line
-  mkdir -p "${dir}"
-  printf '%s\n' "$3" >"${dir}/lifecycle"
-  PATH="${FLOCI_BIN}:${PATH}" FLOCI_LIFECYCLE="${dir}/lifecycle" \
-    BUCKET=ravel ENDPOINT=http://floci.ravel-system.svc:4566 \
+VERSIONED='<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>'
+
+# floci_run_ <dir> [VAR=value ...]: run the Job's shell once against the state
+# in <dir>/state, appending to <dir>/log and writing <dir>/out; prints the exit
+# status.
+floci_run_() {
+  local dir=$1 rc=0
+  shift
+  : >"${dir}/out"
+  env PATH="${FLOCI_BIN}:${PATH}" FLOCI_STATE="${dir}/state" FLOCI_LOG="${dir}/log" \
+    BUCKET=ravel ENDPOINT=http://floci.ravel-system.svc:4566 "$@" \
     "${floci_sh[@]}" "${FLOCI_SCRIPT}" >"${dir}/out" 2>&1 || rc=$?
+  printf '%s\n' "${rc}"
+}
+
+# floci_case_ <name> <want exit> <lifecycle document>: a run against an existing
+# Object Lock bucket with versioning Enabled that stores the given lifecycle
+# document. A passing run prints the ready line last and issues no PUT, and a
+# refused one ends on the scope refusal, so a case cannot pass on some other
+# check's verdict.
+floci_case_() {
+  local name=$1 want_rc=$2 dir="${TMP}/floci-$1" rc want_line puts
+  mkdir -p "${dir}/state"
+  : >"${dir}/state/bucket"
+  : >"${dir}/state/lock"
+  printf '%s\n' "${VERSIONED}" >"${dir}/state/versioning"
+  printf '%s\n' "$3" >"${dir}/state/lifecycle"
+  : >"${dir}/log"
+  rc=$(floci_run_ "${dir}")
+  puts=$(grep -c '^PUT ' "${dir}/log")
   want_line='bucket ravel ready'
   [ "${want_rc}" = 0 ] || want_line='lifecycle rule is not scoped to the whole bucket'
-  if [ "${rc}" = "${want_rc}" ] && grep -qF "${want_line}" "${dir}/out"; then
+  if [ "${rc}" = "${want_rc}" ] && tail -n 1 "${dir}/out" | grep -qF "${want_line}" &&
+    { [ "${want_rc}" != 0 ] || [ "${puts}" = 0 ]; }; then
     passes=$((passes + 1))
   else
     fails=$((fails + 1))
-    echo "FAIL floci ${name}: want exit ${want_rc} and \"${want_line}\", got exit ${rc}"
+    echo "FAIL floci ${name}: want exit ${want_rc} and \"${want_line}\" last, got exit ${rc} after ${puts} PUT(s)"
     sed 's/^/    /' "${dir}/out"
   fi
 }
@@ -451,6 +525,79 @@ floci_rule_ and-prefix-and-size 1 '<Filter><And><Prefix/><ObjectSizeGreaterThan>
 floci_rule_ prefix-inside-an-unknown-element 1 '<Unknown><Prefix/></Unknown>'
 floci_rule_ prefix-inside-an-unknown-element-with-siblings 1 '<Unknown><ID>x</ID><Prefix/><ID>y</ID></Unknown>'
 floci_rule_ no-filter 1 ''
+# A Filter, Prefix or And written with a namespace prefix is refused wherever
+# it sits: the Job's match keys on unprefixed tag names and cannot read it.
+NS='xmlns:s3="http://s3.amazonaws.com/doc/2006-03-01/"'
+floci_rule_ namespaced-filter 1 "<s3:Filter ${NS}><s3:Prefix></s3:Prefix></s3:Filter>"
+floci_rule_ namespaced-filter-beside-legacy-prefix 1 "<Prefix/><s3:Filter ${NS}><s3:Prefix>t/</s3:Prefix></s3:Filter>"
+floci_rule_ namespaced-prefix-beside-filter 1 "<Filter/><s3:Prefix ${NS}>t/</s3:Prefix>"
+floci_rule_ namespaced-prefix-inside-filter 1 "<Filter ${NS}><s3:Prefix/></Filter>"
+floci_rule_ namespaced-and-beside-filter 1 "<Filter><Prefix/></Filter><s3:And ${NS}/>"
+floci_rule_ namespaced-and-inside-filter 1 "<Filter ${NS}><s3:And><Prefix/></s3:And></Filter>"
+floci_rule_ namespaced-prefix-after-a-newline 1 "<Filter/><s3:Prefix
+${NS}>t/</s3:Prefix>"
+
+# floci_calls_ <case> <want> <got>: one comparison of a floci call sequence.
+floci_calls_() {
+  if [ "$3" = "$2" ]; then passes=$((passes + 1)); else
+    fails=$((fails + 1)); echo "FAIL floci $1: want calls \"$2\", got \"$3\""
+  fi
+}
+# The calls a floci run made after the health wait, "|" after each.
+floci_log_() { grep -v '_floci/health' "$1" | tr '\n' '|'; }
+
+# The Job reads before it puts. On an empty store it creates the bucket with
+# Object Lock and puts both settings, each between its read and its read-back;
+# a second run on the same store finds everything set and issues no PUT.
+d="${TMP}/floci-fresh-then-rerun"
+mkdir -p "${d}/state"
+: >"${d}/log"
+check_rc=$(floci_run_ "${d}" FLOCI_PUTS_STICK=1)
+floci_calls_ fresh-run-exit 0 "${check_rc}"
+floci_calls_ fresh-run \
+  'HEAD /ravel|PUT /ravel|HEAD /ravel|GET /ravel?object-lock|GET /ravel?versioning|PUT /ravel?versioning|GET /ravel?versioning|GET /ravel?lifecycle|PUT /ravel?lifecycle|GET /ravel?lifecycle|' \
+  "$(floci_log_ "${d}/log")"
+: >"${d}/log"
+check_rc=$(floci_run_ "${d}" FLOCI_PUTS_STICK=1)
+floci_calls_ rerun-exit 0 "${check_rc}"
+floci_calls_ rerun-issues-no-put \
+  'HEAD /ravel|GET /ravel?object-lock|GET /ravel?versioning|GET /ravel?lifecycle|' \
+  "$(floci_log_ "${d}/log")"
+floci_calls_ rerun-says-so 2 "$(grep -c 'not putting it' "${d}/out")"
+
+# Only the setting that does not already match is put.
+d="${TMP}/floci-suspended"
+mkdir -p "${d}/state"
+: >"${d}/state/bucket"
+: >"${d}/state/lock"
+printf '%s\n' '<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>' \
+  >"${d}/state/versioning"
+cp "${TMP}/floci-filter-empty-prefix/state/lifecycle" "${d}/state/lifecycle"
+: >"${d}/log"
+floci_calls_ suspended-exit 0 "$(floci_run_ "${d}" FLOCI_PUTS_STICK=1)"
+floci_calls_ suspended-puts-only-versioning \
+  'HEAD /ravel|GET /ravel?object-lock|GET /ravel?versioning|PUT /ravel?versioning|GET /ravel?versioning|GET /ravel?lifecycle|' \
+  "$(floci_log_ "${d}/log")"
+d="${TMP}/floci-other-rule"
+mkdir -p "${d}/state"
+: >"${d}/state/bucket"
+: >"${d}/state/lock"
+printf '%s\n' "${VERSIONED}" >"${d}/state/versioning"
+printf '%s\n' "<LifecycleConfiguration><Rule><ID>other</ID><Filter><Prefix/></Filter>${RULE_ACTIONS//<NoncurrentDays>1</<NoncurrentDays>30<}</Rule></LifecycleConfiguration>" \
+  >"${d}/state/lifecycle"
+: >"${d}/log"
+floci_calls_ other-rule-exit 0 "$(floci_run_ "${d}" FLOCI_PUTS_STICK=1)"
+floci_calls_ other-rule-puts-only-the-lifecycle \
+  'HEAD /ravel|GET /ravel?object-lock|GET /ravel?versioning|GET /ravel?lifecycle|PUT /ravel?lifecycle|GET /ravel?lifecycle|' \
+  "$(floci_log_ "${d}/log")"
+# A bucket without Object Lock is refused before anything is put on it.
+d="${TMP}/floci-no-object-lock"
+mkdir -p "${d}/state"
+: >"${d}/state/bucket"
+: >"${d}/log"
+floci_calls_ no-object-lock-exit 1 "$(floci_run_ "${d}" FLOCI_PUTS_STICK=1)"
+floci_calls_ no-object-lock-puts-nothing 'HEAD /ravel|GET /ravel?object-lock|' \
+  "$(floci_log_ "${d}/log")"
 
 # Usage errors never call aws.
 rc=0

@@ -22,7 +22,11 @@
 # refused, reset or timed out) or a 5xx-class S3 error code. RustFS can answer
 # the create and still be settling, so a put or a read can fail transiently
 # right after a create that succeeded. Any other failure (bad credentials, an
-# invalid bucket name) is permanent and fails at once. A bucket
+# invalid bucket name) is permanent and fails at once. One exit rule holds for
+# every call, the create, a put or a read: a permanent failure exits with the
+# aws CLI's own status, and a call still failing transiently after the last
+# attempt exits 1. A read that succeeds and does not show the setting also
+# exits 1. A bucket
 # already owned by these credentials counts as created on any attempt, the
 # first included: an earlier attempt may have created it before its response
 # was lost, and a rerun against a populated endpoint should not fail.
@@ -72,7 +76,9 @@ trap 'rm -f "$err"' EXIT
 # retrying it while it fails transiently. A failure whose stderr matches
 # <accept-pattern> (skipped when empty) counts as success. Exits the script with
 # the call's own status on a non-transient failure, and with 1 once every
-# attempt failed transiently. The last attempt's stderr is left in "$err".
+# attempt failed transiently. Inside a command substitution that exit ends only
+# the subshell, so a caller reading through retry passes the status on with
+# `|| exit $?`. The last attempt's stderr is left in "$err".
 retry() {
   local accept=$1 subcommand=$2 attempt rc
   shift
@@ -110,7 +116,7 @@ read_setting() {
     --query "$query" --output text) || rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "::error::$subcommand on $bucket failed (exit $rc); cannot confirm $setting" >&2
-    exit 1
+    exit "$rc"
   fi
   printf '%s\n' "$got"
 }
@@ -119,7 +125,7 @@ read_setting() {
 # unless it is <want>.
 readback() {
   local got
-  got=$(read_setting "$1" "$3" "$4") || exit 1
+  got=$(read_setting "$1" "$3" "$4") || exit $?
   if [ "$got" != "$2" ]; then
     echo "::error::bucket $bucket does not carry $1 (want $2, read $got)" >&2
     exit 1
@@ -138,7 +144,7 @@ lifecycle_matches() {
     --bucket "$bucket" --output text --query '[to_string(length(Rules)), to_string(Rules[0].Status), to_string({f: Rules[0].Filter, p: Rules[0].Prefix}), to_string(Rules[0].Expiration.ExpiredObjectDeleteMarker), to_string(Rules[0].NoncurrentVersionExpiration.NoncurrentDays), to_string(Rules[0].AbortIncompleteMultipartUpload.DaysAfterInitiation)]') || rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "::error::get-bucket-lifecycle-configuration on $bucket failed (exit $rc)" >&2
-    exit 1
+    exit "$rc"
   fi
   if grep -q '(NoSuchLifecycleConfiguration)' "$err"; then
     why="bucket $bucket carries no lifecycle configuration"
@@ -177,7 +183,7 @@ lifecycle_want() {
 readback "Object Lock" Enabled get-object-lock-configuration \
   ObjectLockConfiguration.ObjectLockEnabled
 
-versioning=$(read_setting versioning get-bucket-versioning Status) || exit 1
+versioning=$(read_setting versioning get-bucket-versioning Status) || exit $?
 if [ "$versioning" = Enabled ]; then
   echo "bucket $bucket already has versioning Enabled; not putting it"
 else
