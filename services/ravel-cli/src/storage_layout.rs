@@ -234,7 +234,7 @@ fn print_outcome(
         TenantConfigSetOutcome::Created => writeln!(
             out,
             "created the config record for tenant {tenant} (it had none), with \
-             lifecycle_state=active and no other override"
+             lifecycle_state=active and no override but this command's"
         )?,
         TenantConfigSetOutcome::Updated => writeln!(
             out,
