@@ -442,6 +442,29 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Retention and the superseded-input sweep no longer delete an object a
+  pinned-in-flight query still needs, once HEAD alone has stopped naming
+  it** (ADR-0020 amendment 2026-10-01; issue #1133). The HEAD-reachability
+  delete gate (`SnapshotReachability` in `crates/ravel-maintain`) blocked a
+  delete only on the protection horizon and on whether the live HEAD
+  snapshot currently names the candidate. A query that pinned the *prior*
+  HEAD, which still named the object, just before a fold dropped it could
+  still be resolving it when the very next sweep pass deleted it
+  (`SnapshotInvalidated`, 503), violating docs/consistency-model.md. A
+  TLA+ trace confirms this was reachable
+  (`formal/tla/lifecycle/results.md`, "Candidate #1133"; the permanent
+  negative control `formal/tla/lifecycle/negative/pinned-query-ungated.cfg`).
+  Both gates now also require that `max_query_duration_ns +
+  clock_skew_allowance_ns` (plus one second of store `last_modified`
+  granularity) have passed since the covering, or nearest surviving
+  neighbor, snapshot part's own store-assigned `last_modified`, never
+  `SnapshotHead.created_unix_ns` or HEAD's own timestamp, since every fold
+  rewrites HEAD regardless of content. A new `SnapshotBlock::PinnedWindow`
+  reports this hold distinctly from `Named` and `Unreadable`, surfaced as
+  `reason="pinned_window"` on `ravel_maintain_superseded_inputs_held_total`
+  and as a new `superseded held (pinned-query window)` line in
+  `ravel-cli maintain sweep`'s output.
+
 - **A gateway starts under a small memory limit** (issue #2234).
   `ravel-server` refused to start in every mode under a cgroup memory limit of
   2 GiB or less, because the process memory budget (effective memory minus a

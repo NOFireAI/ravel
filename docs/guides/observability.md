@@ -1329,7 +1329,7 @@ Labels: `mode`, plus `signal` on every series except
 | `ravel_maintain_orphans_quarantined_total` | Orphan candidates moved from the live L0 set to the quarantine prefix, by signal. |
 | `ravel_maintain_orphans_quarantine_refused_total` | Orphan candidates whose copy to the quarantine prefix failed, by signal; the live object was left in place rather than deleted without a copy. |
 | `ravel_maintain_superseded_deletes_refused_total` | Superseded-input deletes the store refused (access denied, a failed precondition, or a permanent error), by signal. The refusing supersession chain keeps its remaining keys for a later pass and the pass still succeeds. Also carries `signal="alerts"` and `signal="audit"`; the alerts sample reads zero today, because nothing compacts or rewrites the alerts shard, so it has no supersession chain. |
-| `ravel_maintain_superseded_inputs_held_total` | Superseded objects the superseded-input sweep held instead of deleting, by signal and `reason`, counted once per pass that holds them. Objects a legal hold protects are not counted here; `ravel_maintain_superseded_groups_held_by_legal_hold_total` counts them, in chain groups. `reason="named"`: the live catalog HEAD snapshot still names the object. `reason="unreadable_head"`: HEAD or a covering snapshot part is present and cannot be read. Also carries `signal="alerts"`, which reads zero today for the same reason, and `signal="audit"`. |
+| `ravel_maintain_superseded_inputs_held_total` | Superseded objects the superseded-input sweep held instead of deleting, by signal and `reason`, counted once per pass that holds them. Objects a legal hold protects are not counted here; `ravel_maintain_superseded_groups_held_by_legal_hold_total` counts them, in chain groups. `reason="named"`: the live catalog HEAD snapshot still names the object. `reason="unreadable_head"`: HEAD or a covering snapshot part is present and cannot be read. `reason="pinned_window"`: HEAD has stopped naming the object, but the covering or neighboring snapshot part's own `last_modified` has not yet aged past the pinned-query window. Also carries `signal="alerts"`, which reads zero today for the same reason, and `signal="audit"`. |
 | `ravel_maintain_superseded_groups_held_by_legal_hold_total` | Supersession chain groups the superseded-input sweep skipped whole because a legal hold protects a key in them, by signal, counted once per pass that skips them. Also carries `signal="alerts"`, which reads zero today for the same reason, and `signal="audit"`. |
 | `ravel_maintain_dreq_held_by_superseded_inputs_total` | Erasure requests (`.dreq`) the erasure-request sweep kept past their protection horizon, by signal, counted once per tick that keeps them. The sweep decides from its own observing pass of the superseded-input sweep, which deletes nothing and covers every hour and every chain whatever its age. It keeps a `.dreq` when that pass held a chain group naming the request, or when it held a chain it could not walk to the end anywhere in the signal, which keeps every `.dreq` past its horizon. |
 | `ravel_maintain_quarantine_reaped_total` | Objects physically deleted from the quarantine prefix past the quarantine horizon, by signal. |
@@ -1398,7 +1398,14 @@ HEAD needs a rebuild.
 Any sustained growth on `reason="unreadable_head"` needs an operator: HEAD or a
 snapshot part is present and cannot be read, so the sweep holds every
 superseded input it gates, fail-closed, until the catalog object is repaired or
-HEAD is rebuilt. `ravel_maintain_superseded_groups_held_by_legal_hold_total`
+HEAD is rebuilt.
+A `reason="pinned_window"` increase that clears within one
+`max_query_duration_ns + clock_skew_allowance_ns` window (defaults: 1 h 5 min)
+is ordinary: a fold just dropped the input from HEAD and the sweep is waiting
+out the window for any reader that pinned the prior HEAD. It needs an operator
+only when it never clears: that means the anchor part itself is never aging
+(a stalled fold, or an hour no part ever covers), not ordinary pinned-window
+lag. `ravel_maintain_superseded_groups_held_by_legal_hold_total`
 is expected while a legal hold covers the shard and stops growing when the hold
 is lifted; growth with no hold in force points at a hold nobody meant to keep.
 
@@ -2428,4 +2435,6 @@ metadata cache: ADR-0085. Alert evaluation and its at-least-once notification
 contract: ADR-0043. Per-shard ingest skew metrics and the `shard` label:
 ADR-1692. The retiring-generation shard set that family also renders:
 ADR-0052. The sub-floor hold counter and the flag that turns it on:
-ADR-1737. The CPU gates and the tokio runtime families: ADR-1702.
+ADR-1737. The CPU gates and the tokio runtime families: ADR-1702. The
+`reason="pinned_window"` value on `ravel_maintain_superseded_inputs_held_total`:
+ADR-0020 amendment 2026-10-01.

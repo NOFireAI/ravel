@@ -127,9 +127,48 @@ review, corrupt-input property tests, inspector support.
   publish durable, listable transaction records; the folder applies
   them so snapshots stop referencing compacted-away or retired
   segments, and GC must treat reachability from HEAD-referenced
-  snapshots (within the protection horizon) as a delete blocker. The
+  snapshots (within the protection horizon) as a delete blocker, a rule
+  narrowed by the pinned-query delete-gate amendment below. The
   snapshot entry format carries a `level` field from day one so L1
   outputs need no format bump.
 - Old snapshot parts and CAS-loser parts become garbage; they are
   GC-eligible once unreferenced by HEAD beyond the protection horizon
   (folded into the GC track's rules).
+
+## Amendment: pinned-query delete-gate (2026-10-01)
+
+<!-- amendment-applies: sections="Consequences" pointer="pinned-query delete-gate amendment" -->
+
+Issue #1133 found that the delete blocker described above was incomplete.
+"Reachability from HEAD-referenced snapshots (within the protection
+horizon)" blocks a delete on two conditions only: the protection horizon,
+and HEAD currently naming the object. Neither condition accounts for a
+query that pinned an earlier HEAD before a later fold dropped the object
+from it: the horizon can pass and HEAD can stop naming the object in the
+same tick a fold runs, and the very next sweep pass then deletes an
+object a still-active, in-window query needs. A TLA+ trace confirms this
+is reachable (`formal/tla/lifecycle/negative/pinned-query-ungated.cfg`,
+`counterexamples/pinned-query-ungated.md`; the same scenario was first
+investigated manually as `formal/tla/lifecycle/candidate-1133.cfg`).
+
+The delete blocker is revised to add a third condition. Both
+`SnapshotReachability` gates (retention sweep and superseded-input sweep,
+`crates/ravel-maintain/src/reachability.rs`) additionally require that at
+least `max_query_duration_ns + clock_skew_allowance_ns` have passed since
+the covering, or nearest surviving neighbor, snapshot part's own
+store-assigned `last_modified` (one second of store `last_modified`
+granularity is added to that anchor before the comparison). The anchor is
+the part object's own `last_modified`, read via a `head()` call,
+never `SnapshotHead.created_unix_ns` and never HEAD's own `last_modified`:
+HEAD is the mutable pointer whose timing this gate cannot trust, since
+the whole failure mode is HEAD moving out from under a pinned query. A
+delete blocked only by this new condition is reported as
+`SnapshotBlock::PinnedWindow` and surfaces on the `reason="pinned_window"`
+metric label.
+
+This is additive to the existing rule, not a replacement: the horizon and
+HEAD-reachability conditions still apply unchanged, and the age condition
+narrows further rather than loosening anything. The shipped code is
+`crates/ravel-maintain/src/reachability.rs`; the gate formula and its
+tests are traced in `formal/tla/lifecycle/traceability.md` under
+`QueryPermits / HorizonGuardsPinnedQueries`.

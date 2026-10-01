@@ -124,28 +124,48 @@ own parameters, not gaps a correctly declared config leaves open.
 
 ## HEAD-referenced snapshot delete blocker
 
-**A HEAD-referenced snapshot blocks retention deletion (ADR-0020).** The
-protection-horizon arithmetic above bounds a *pinned in-flight reader* against
-the current snapshot's history; it does not on its own prove that the *current*
-HEAD snapshot has stopped naming the bucket. A retention tombstone is written at
-its own bucket's ingest-hour key, which is `R` (the tenant's retention window)
-behind the fold watermark, so it lands far outside the fold's fixed
-near-watermark reconcile window. To close the gap, the physical retention sweep,
-before deleting anything in a bucket, loads the `(tenant, signal)` HEAD and the
-snapshot part(s) whose hour range covers the bucket's ingest hour, and refuses
-the delete if any snapshot entry names an object inside the bucket (same shard
-and ingest hour). Nothing is deleted and the tombstone is left in place, so
-bucket-wide exclusion still holds and a later sweep finishes the job. The block
-is cleared by the fold: its retention-frontier reconcile pass re-lists the
-snapshot-named hours at or approaching the tenant's retirement frontier (derived
-from the tenant's durable retention window and the protection horizon, bounded
-per fold and carried across folds), observes the out-of-window tombstone, and
-drops the bucket from the next published snapshot. Once HEAD no longer names the
-bucket, the sweep proceeds. Together these guarantee that **no object a
-HEAD-referenced snapshot still names is ever deleted by retention**, while
+**A HEAD-referenced snapshot blocks retention deletion (ADR-0020, amendment
+2026-10-01).** The protection-horizon arithmetic above bounds a *pinned
+in-flight reader* against the current snapshot's history; it does not on its
+own prove that the *current* HEAD snapshot has stopped naming the bucket. A
+retention tombstone is written at its own bucket's ingest-hour key, which is
+`R` (the tenant's retention window) behind the fold watermark, so it lands far
+outside the fold's fixed near-watermark reconcile window. To close the gap, the
+physical retention sweep, before deleting anything in a bucket, loads the
+`(tenant, signal)` HEAD and the snapshot part(s) whose hour range covers the
+bucket's ingest hour, and refuses the delete if any snapshot entry names an
+object inside the bucket (same shard and ingest hour). Nothing is deleted and
+the tombstone is left in place, so bucket-wide exclusion still holds and a
+later sweep finishes the job. The block is cleared by the fold: its
+retention-frontier reconcile pass re-lists the snapshot-named hours at or
+approaching the tenant's retirement frontier (derived from the tenant's durable
+retention window and the protection horizon, bounded per fold and carried
+across folds), observes the out-of-window tombstone, and drops the bucket from
+the next published snapshot. Once HEAD no longer names the bucket, the sweep
+proceeds.
+
+HEAD no longer naming the bucket is not enough by itself (ADR-0020 amendment,
+2026-10-01): a reader that pinned the *prior* HEAD, which still named the
+bucket, can still be resolving it when the fold's drop makes the current HEAD
+clear. So the sweep also requires that the covering (or, when no part covers
+the gated hour, the nearest neighboring) snapshot part's own store-assigned
+`last_modified` has aged past `max_query_duration_ns + clock_skew_allowance_ns`
+(plus one second of store `last_modified` granularity) before it treats "HEAD
+no longer names it" as proof the bucket is safe to delete. The anchor is the
+part object's own `last_modified`, read with a `head()` call, never
+`SnapshotHead.created_unix_ns` and never HEAD's own `last_modified`: every fold
+rewrites HEAD regardless of content, so anchoring there would never age, while
+an unchanged covering part is carried forward by reference and its
+`last_modified` stays fixed at its real last write. Together these guarantee
+that **no object a HEAD-referenced snapshot still names, or a snapshot a
+still-in-window query may have pinned, is ever deleted by retention**, while
 retention still completes (it is not permanently blocked). Without the
-blocker, a query that resolved a stale snapshot naming an already-deleted
-object would fail permanently with `SnapshotInvalidated` (503).
+horizon-and-HEAD blocker, a query that resolved a stale snapshot naming an
+already-deleted object would fail permanently with `SnapshotInvalidated`
+(503); without the age term added by the amendment, that same failure was
+reachable one pinned-query window earlier than HEAD's own history could show
+(`formal/tla/lifecycle/results.md`, the candidate-1133 investigation;
+`negative/pinned-query-ungated.cfg`).
 
 **The superseded-input sweep is gated the same way.** The same blocker, the
 same three answers, and the same per-pass cache apply to a compaction or
@@ -153,15 +173,20 @@ rewrite record's superseded inputs, with the question asked per object rather
 than per bucket: after a compaction or a rewrite the snapshot legitimately
 names the output parts sitting in the same bucket, so only the specific objects
 a delete would remove may be tested. The horizon alone is not enough there for
-the same reason it is not enough for retention. A selective-erasure rewrite
-record can land in any sealed hour, including one both the fold's fixed
-reconcile window and its retention-frontier band miss, and the snapshot part
-covering that hour then keeps naming the pre-rewrite inputs. An input the live
-HEAD still names is held for a later pass instead of deleted, and the pass
-reports how many objects it held under each of the two reasons below, summed on
-`/metrics` as `ravel_maintain_superseded_inputs_held_total` with
-`reason="named"` for an object HEAD still names and `reason="unreadable_head"`
-for a HEAD or covering part that cannot be read.
+the same reason it is not enough for retention, and neither is "HEAD no longer
+names it" alone, for the same pinned-query reason as retention above. A
+selective-erasure rewrite record can land in any sealed hour, including one
+both the fold's fixed reconcile window and its retention-frontier band miss,
+and the snapshot part covering that hour then keeps naming the pre-rewrite
+inputs. An input the live HEAD still names, or that HEAD has stopped naming too
+recently for the pinned-query age term to have cleared, is held for a later
+pass instead of deleted, and the pass reports how many objects it held under
+each of the three reasons below, summed on `/metrics` as
+`ravel_maintain_superseded_inputs_held_total` with `reason="named"` for an
+object HEAD still names, `reason="unreadable_head"` for a HEAD or covering part
+that cannot be read, and `reason="pinned_window"` for an object HEAD has
+stopped naming but whose anchor part has not yet aged past the pinned-query
+window.
 
 A rewrite record can itself be superseded by a later rewrite applying a
 different erasure request, so the objects one delete unit covers are a whole
@@ -443,12 +468,17 @@ than deletes, so even a forced pass keeps the recovery window.
   retention is (ADR-0020, "HEAD-referenced snapshot delete blocker" above),
   asked per object rather than per bucket. The horizon bounds a pinned
   in-flight reader; it does not prove the *current* snapshot has stopped
-  naming the input. An input a part named by the live HEAD still references
-  is skipped, and the record that superseded it stays in place so the next
-  pass retries. A superseded predecessor record and the parts it names are
-  held or deleted together: dropping the record while a still-named part is
-  held would leave that part unreferenced, and the unreferenced-part rule
-  would then collect it and undo the hold.
+  naming the input, and stopping naming it is not by itself enough either
+  (the same ADR-0020 amendment as above): the covering or neighboring part's
+  own `last_modified` must
+  also have aged past the pinned-query window before the input counts as
+  safe to delete. An input a part named by the live HEAD still references,
+  or one HEAD has stopped naming too recently for that window to have
+  cleared, is skipped, and the record that superseded it stays in place so
+  the next pass retries. A superseded predecessor record and the parts it
+  names are held or deleted together: dropping the record while a
+  still-named part is held would leave that part unreferenced, and the
+  unreferenced-part rule would then collect it and undo the hold.
 - **An input is superseded only where the record a query reads names it.**
   When two compaction records in one bucket name overlapping input sets, the
   resolver picks one authoritative record per overlap group and serves every
