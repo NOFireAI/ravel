@@ -32,9 +32,11 @@
 //! ADR-0873 decision 2 to split the declared-statistics drop tally across
 //! its four carriers, and `gate`, `site` and `worker` added by ADR-1702
 //! decision 11 for the CPU gate and tokio runtime families). The twenty-one
-//! keys come from twenty-eight `Label` variants, because some variants share a
+//! keys come from twenty-eight `Label` variants (twenty-nine in a `flight-sql`
+//! build), because some variants share a
 //! key: `RejectReason`, `ScrubReason`, `ScrubUnreadableReason`,
-//! `AlertRetentionSkipReason` and `SupersededHeldReason` all render `reason`,
+//! `AlertRetentionSkipReason`, `SupersededHeldReason` and, in a `flight-sql`
+//! build, `SliceRejectReason` all render `reason`,
 //! `Level` (log/tracing
 //! severity) and `ScrubLevel` (issue #1686, which part of the commit lineage
 //! -- `l0`/`l1`/`rewrite` -- a scrub target came from) both render `level`,
@@ -334,6 +336,13 @@ pub enum Label {
     /// closed enum owned by [`crate::distrib`], since the classes are the
     /// admission layer's own, not a dimension this renderer invents.
     AdmissionClass(crate::distrib::AdmissionClass),
+    /// Why a SQL slice capability was refused (ADR-1689 decision 2):
+    /// `missing`, `bad_mac`, `expired`, or `wrong_surface`. A closed enum
+    /// owned by `ravel_sql`, which also owns the label spelling. Shares the
+    /// `reason` key with the other reason variants; present only in a
+    /// `flight-sql` build, the only one with a Flight service to count.
+    #[cfg(feature = "flight-sql")]
+    SliceRejectReason(ravel_sql::SliceReject),
     /// Which ADR-0873 declared-statistics carrier a
     /// `ravel_declared_stats_drops_observed_total` sample counts drops under.
     /// A closed enum owned by [`ravel_commit::declared_stats`], which is also
@@ -526,6 +535,8 @@ impl Label {
             Label::AllocatorStat(_) => "stat",
             Label::MemoryComponent(_) => "component",
             Label::AdmissionClass(_) => "class",
+            #[cfg(feature = "flight-sql")]
+            Label::SliceRejectReason(_) => "reason",
             Label::StatCarrier(_) => "carrier",
             Label::CpuGate(_) => "gate",
             Label::ReadGateSite(_) => "site",
@@ -559,6 +570,8 @@ impl Label {
             Label::AllocatorStat(stat) => stat.name().to_string(),
             Label::MemoryComponent(component) => component.name().to_string(),
             Label::AdmissionClass(class) => admission_class_name(*class).to_string(),
+            #[cfg(feature = "flight-sql")]
+            Label::SliceRejectReason(reason) => reason.reason().to_string(),
             Label::StatCarrier(carrier) => carrier.label().to_string(),
             Label::CpuGate(gate) => gate.name().to_string(),
             Label::ReadGateSite(site) => ravel_cpu_gate::GateSite::name(*site).to_string(),
@@ -6493,6 +6506,54 @@ fn render_distrib_family(out: &mut String, mode: Mode, snapshot: &DistribSnapsho
     );
 }
 
+/// One scrape's refused SQL slice capabilities (ADR-1689 decision 2), read at
+/// scrape time from the [`ravel_sql::SliceRejectCounters`] the Flight service
+/// counts into on every listener. Carries every reason, zero included.
+#[cfg(feature = "flight-sql")]
+#[derive(Debug, Clone)]
+pub struct SqlSliceRejectSnapshot {
+    pub by_reason: [(ravel_sql::SliceReject, u64); 4],
+}
+
+#[cfg(feature = "flight-sql")]
+impl SqlSliceRejectSnapshot {
+    pub fn from_counters(counters: &ravel_sql::SliceRejectCounters) -> Self {
+        SqlSliceRejectSnapshot {
+            by_reason: ravel_sql::SliceReject::ALL.map(|reason| (reason, counters.get(reason))),
+        }
+    }
+}
+
+/// The ADR-1689 slice reject counter. Not a `ravel_distrib_*` series: it
+/// renders whenever the process built the Flight service, with or without
+/// `--distributed-query`, and carries `reason` beside `mode`. `None` (no
+/// Flight service in this process) renders nothing.
+#[cfg(feature = "flight-sql")]
+fn render_sql_slice_reject_family(
+    out: &mut String,
+    mode: Mode,
+    snapshot: Option<&SqlSliceRejectSnapshot>,
+) {
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+    write_header(
+        out,
+        "ravel_sql_slice_rejects_total",
+        "Inbound SQL slice DoGet requests refused at slice capability verification, by \
+         reason (ADR-1689 decision 2).",
+        "counter",
+    );
+    for (reason, count) in snapshot.by_reason {
+        write_sample(
+            out,
+            "ravel_sql_slice_rejects_total",
+            &[Label::Mode(mode), Label::SliceRejectReason(reason)],
+            count,
+        );
+    }
+}
+
 // One argument per metric source, each a distinct snapshot type: bundling
 // them into one struct would only move the same list behind a name without
 // removing a caller's need to build every field, so the sources stay
@@ -6840,6 +6901,12 @@ pub struct MetricsState {
     /// when the process serves queries with `--distributed-query` on; `None`
     /// otherwise leaves the whole `ravel_distrib_*` family off the exposition.
     pub distrib: Option<Arc<crate::distrib::FragmentMetrics>>,
+    /// Refused SQL slice capabilities by reason (ADR-1689 decision 2), the
+    /// counters the Flight service shares across every listener. `Some` only
+    /// when the process built the Flight service; `None` leaves
+    /// `ravel_sql_slice_rejects_total` off the exposition.
+    #[cfg(feature = "flight-sql")]
+    pub sql_slice_rejects: Option<ravel_sql::SliceRejectCounters>,
     /// The durable `sys/auth` background-refresh state (ADR-0066 decision 6),
     /// read at scrape time for its three refresh-loop counters. `Some` only
     /// when `--deployment-key` is set in a request-serving mode
@@ -7185,6 +7252,18 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         memory_budget_snapshot,
         state.can_fold,
     );
+    // Appended after `render` like the families below: the counters exist only
+    // in a `flight-sql` build, and `render`'s signature is feature-independent.
+    #[cfg(feature = "flight-sql")]
+    render_sql_slice_reject_family(
+        &mut body,
+        state.mode,
+        state
+            .sql_slice_rejects
+            .as_ref()
+            .map(SqlSliceRejectSnapshot::from_counters)
+            .as_ref(),
+    );
     // Appended after `render` rather than threaded through it: the CPU gate
     // and runtime figures are read here, at scrape time, like every other
     // family, and `render`'s positional signature is shared by every render
@@ -7526,6 +7605,10 @@ mod tests {
                 Label::AllocatorStat(_) => "stat",
                 Label::MemoryComponent(_) => "component",
                 Label::AdmissionClass(_) => "class",
+                // Asserted by `sql_slice_reject_family_renders_each_reason_exactly`,
+                // since `one_of_each` is the default build's set.
+                #[cfg(feature = "flight-sql")]
+                Label::SliceRejectReason(_) => "reason",
                 Label::StatCarrier(_) => "carrier",
                 Label::CpuGate(_) => "gate",
                 Label::ReadGateSite(_) => "site",
@@ -7596,7 +7679,7 @@ mod tests {
         assert_eq!(
             one_of_each.len(),
             28,
-            "exactly 28 label variants, 21 distinct keys"
+            "exactly 28 label variants in a default build (flight-sql adds SliceRejectReason), 21 distinct keys"
         );
         assert_eq!(
             keys.iter().collect::<HashSet<_>>().len(),
@@ -10572,6 +10655,73 @@ mod tests {
             !off.contains("ravel_distrib_"),
             "the distrib family must be absent without --distributed-query:\n{off}"
         );
+    }
+
+    /// ADR-1689 decision 2: the slice reject counter renders one sample per
+    /// `SliceReject` reason under exactly `{mode, reason}`, each carrying its
+    /// own reason's count, every reason present at zero, and nothing at all
+    /// for a process that built no Flight service.
+    #[cfg(feature = "flight-sql")]
+    #[test]
+    fn sql_slice_reject_family_renders_each_reason_exactly() {
+        use ravel_sql::SliceReject;
+
+        let snapshot = SqlSliceRejectSnapshot {
+            by_reason: [
+                (SliceReject::Missing, 3),
+                (SliceReject::BadMac, 5),
+                (SliceReject::Expired, 7),
+                (SliceReject::WrongSurface, 11),
+            ],
+        };
+        let mut body = String::new();
+        render_sql_slice_reject_family(&mut body, Mode::Query, Some(&snapshot));
+        assert_eq!(
+            body.matches("# TYPE ravel_sql_slice_rejects_total counter\n")
+                .count(),
+            1,
+            "exactly one counter TYPE header:\n{body}"
+        );
+        let samples: Vec<&str> = body.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(
+            samples,
+            vec![
+                "ravel_sql_slice_rejects_total{mode=\"query\",reason=\"missing\"} 3",
+                "ravel_sql_slice_rejects_total{mode=\"query\",reason=\"bad_mac\"} 5",
+                "ravel_sql_slice_rejects_total{mode=\"query\",reason=\"expired\"} 7",
+                "ravel_sql_slice_rejects_total{mode=\"query\",reason=\"wrong_surface\"} 11",
+            ],
+        );
+        assert_eq!(
+            Label::SliceRejectReason(SliceReject::Missing).key(),
+            "reason"
+        );
+
+        // A fresh set of counters, read the way the handler reads it, renders
+        // all four reasons at zero.
+        let mut zero = String::new();
+        render_sql_slice_reject_family(
+            &mut zero,
+            Mode::All,
+            Some(&SqlSliceRejectSnapshot::from_counters(
+                &ravel_sql::SliceRejectCounters::default(),
+            )),
+        );
+        let zero_samples: Vec<&str> = zero.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(
+            zero_samples,
+            vec![
+                "ravel_sql_slice_rejects_total{mode=\"all\",reason=\"missing\"} 0",
+                "ravel_sql_slice_rejects_total{mode=\"all\",reason=\"bad_mac\"} 0",
+                "ravel_sql_slice_rejects_total{mode=\"all\",reason=\"expired\"} 0",
+                "ravel_sql_slice_rejects_total{mode=\"all\",reason=\"wrong_surface\"} 0",
+            ],
+        );
+
+        // No Flight service: no header and no sample.
+        let mut off = String::new();
+        render_sql_slice_reject_family(&mut off, Mode::Query, None);
+        assert_eq!(off, "", "no Flight service must render no family");
     }
 
     #[test]
