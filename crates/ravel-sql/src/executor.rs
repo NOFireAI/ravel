@@ -103,6 +103,7 @@ use futures::{Stream, StreamExt};
 use ravel_catalog::{Catalog, Snapshot};
 use ravel_memory::MemoryBudget;
 use ravel_parquet::ReadLimits;
+use ravel_pqtable::clock::Clock;
 use ravel_promql::{LabelMatcher, MatchOp};
 use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
 use ravel_query::io_shape::{IoShapeCounts, PlanClass, QueryIoShape, count_unfolded_segments};
@@ -118,6 +119,7 @@ use ravel_types::{CommitToken, METRIC_NAME_LABEL, Signal, TenantHash, TimeRange}
 
 use crate::alerts_provider::AlertsTableProvider;
 use crate::audit_provider::AuditTableProvider;
+use crate::clock::SystemClock;
 use crate::config::SqlConfig;
 use crate::cost::{estimate_logs_cost, estimate_metrics_cost, estimate_spans_cost};
 use crate::declared::{DeclaredColumn, DeclaredColumnSource, default_declared_source};
@@ -1014,6 +1016,12 @@ pub struct SqlExecutor {
     /// name that is not a signal table resolving exactly as it did before
     /// Parquet tables existed.
     parquet: Option<ParquetSources>,
+    /// The clock `execute_ddl` threads into `ravel_pqtable::writer::apply`
+    /// for a manifest's `created_unix_ns` and the resolve-to-put elapsed-time
+    /// check. [`SqlExecutor::new`] defaults it to [`SystemClock`]; a test
+    /// installs a `ravel_pqtable::clock::FixedClock` with
+    /// [`Self::with_clock`] to drive that elapsed time deterministically.
+    clock: Arc<dyn Clock>,
 }
 
 /// One tenant's memory accountant plus the last-touch stamp idle-tenant
@@ -1047,6 +1055,7 @@ impl SqlExecutor {
             process_memory_budget: Arc::new(MemoryBudget::unlimited()),
             declared_source: default_declared_source(),
             parquet: None,
+            clock: Arc::new(SystemClock),
         }
     }
 
@@ -1083,6 +1092,23 @@ impl SqlExecutor {
     /// bytes and assert the configured budget actually reached the executor.
     pub fn process_memory_budget(&self) -> &Arc<MemoryBudget> {
         &self.process_memory_budget
+    }
+
+    /// Install the clock `execute_ddl` threads into
+    /// `ravel_pqtable::writer::apply`, replacing the [`SystemClock`] default
+    /// [`Self::new`] starts with. This is the seam a test installs a
+    /// `ravel_pqtable::clock::FixedClock` through, so a resolve-to-put
+    /// elapsed-time check can be driven deterministically instead of
+    /// sleeping.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// The clock [`Self::with_clock`] installed, or the [`SystemClock`]
+    /// default.
+    pub fn clock(&self) -> &Arc<dyn Clock> {
+        &self.clock
     }
 
     /// Install the source of per-tenant declared typed attribute columns for the
