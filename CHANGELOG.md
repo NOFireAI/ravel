@@ -347,6 +347,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   resident the next read of the object serves both from cache. No default or
   config surface changes.
 
+### Fixed
+
+- **`ravel-ingest-router --tenant-token` now strips the same `;ddl` capability
+  suffix `ravel-server` does, instead of routing by a tenant name that still
+  carries it** (issue #2243). `tok=acme;ddl` on
+  `ravel-server` resolves the bearer token to tenant `acme`, but the router
+  parsed the same pair with its own logic, which did not know the suffix, and
+  routed by `acme;ddl`: the two processes attributed one request to two
+  different tenant keys. The router and server now share
+  `ravel_tenant_resolve::split_tenant_suffix`; the router discards the `ddl`
+  bool the split returns, since it never runs DDL. An unknown suffix
+  (anything but exactly `;ddl` after a non-empty tenant) is refused at
+  startup on the router the same way it already was on the server.
+
 ### Security
 
 - **A distributed SQL slice fetch no longer carries the client's credential**
