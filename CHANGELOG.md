@@ -2065,18 +2065,26 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `CREATE EXTERNAL TABLE`, `CREATE OR REPLACE EXTERNAL TABLE` and
   `DROP TABLE`, each `STORED AS PARQUET`. `validate_ddl` is the sibling
   gate to `validate_query`: a pure text function over `parse_guarded`'s
-  output that checks statement shape and `LOCATION` URL syntax and never
-  runs in the same request as the read-only query gate. `SqlExecutor::
-  execute_ddl` resolves the caller's tenant grant for the location,
-  refuses a location inside Ravel's own bucket, probes the named Parquet
-  file's preconditions before any manifest write, snapshots it, and
-  commits the manifest through `ravel_pqtable::writer` under the calling
-  tenant; `CREATE EXTERNAL TABLE IF NOT EXISTS` on a live table and
-  `DROP TABLE IF EXISTS` on a missing one are no-ops, and the non-`IF`
-  forms return `TableExists`/`TableNotFound`. `redact` renders all three
-  admitted forms for logging instead of rejecting them. This is the SQL
-  core only: no HTTP route, capability check or audit write yet exists
-  for it (next task).
+  output that checks statement shape, `LOCATION` URL syntax, and every
+  `OPTIONS` key and value (an unadmitted key, a duplicate key, or a
+  non-string value is refused before any grant is read), and never runs
+  in the same request as the read-only query gate. A plain `CREATE` (not
+  `OR REPLACE`) on a table that already exists is decided first, by a
+  manifest existence check, before any grant is read, any store opened,
+  or any object probed or snapshotted. `SqlExecutor::execute_ddl` then
+  resolves the caller's tenant grant for the location, refuses a
+  location inside Ravel's own bucket, probes the named Parquet file's
+  preconditions, snapshots it, and commits the manifest through
+  `ravel_pqtable::writer` under the calling tenant; `CREATE EXTERNAL
+  TABLE IF NOT EXISTS` on a live table and `DROP TABLE IF EXISTS` on a
+  missing one are no-ops, and the non-`IF` forms return
+  `TableExists`/`TableNotFound`. The whole statement, from grant
+  resolution through the manifest write, is bound by a caller-supplied
+  deadline (`DdlExecuteError::Deadline`), independent of the snapshot
+  step's own inner deadline. `redact` renders all three admitted forms
+  for logging instead of rejecting them. This is the SQL core only: no
+  HTTP route, capability check or audit write yet exists for it (next
+  task).
 
 ## [0.19.0] - 2026-09-27
 
