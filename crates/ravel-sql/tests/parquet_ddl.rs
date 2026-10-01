@@ -81,6 +81,32 @@ fn parquet_bytes(ids: &[i64], names: &[&str], scores: &[f64]) -> Bytes {
     Bytes::from(out)
 }
 
+/// One row group of `id: Int64`, `EventDate: Int64`, a real Parquet file
+/// whose `EventDate` column holds days-since-epoch values for a
+/// `ravel.cast.EventDate` `date-from-days` cast to exercise.
+fn event_date_parquet_bytes(ids: &[i64], days: &[i64]) -> Bytes {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("EventDate", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(ids.to_vec())) as ArrayRef,
+            Arc::new(Int64Array::from(days.to_vec())) as ArrayRef,
+        ],
+    )
+    .expect("batch");
+    let mut out = Vec::new();
+    let properties = WriterProperties::builder()
+        .set_dictionary_enabled(false)
+        .build();
+    let mut writer = ArrowWriter::try_new(&mut out, schema, Some(properties)).expect("writer");
+    writer.write(&batch).expect("write");
+    writer.close().expect("close");
+    Bytes::from(out)
+}
+
 struct Lake {
     ravel: Arc<InstrumentedStore<MemoryStore>>,
     lake: Arc<dyn ObjectStoreBackend>,
@@ -246,6 +272,62 @@ async fn ravel_cast_naming_a_column_absent_from_the_snapshot_schema_is_refused()
     assert!(
         matches!(err, DdlExecuteError::UnknownCastColumn { ref column } if column == "missing"),
         "{err:?}"
+    );
+
+    let tables = ravel_pqtable::resolve::tables(lake.ravel.inner(), &t)
+        .await
+        .expect("tables");
+    assert!(
+        tables.is_empty(),
+        "a refused cast column must not write a manifest: {tables:?}"
+    );
+}
+
+#[tokio::test]
+async fn ravel_cast_option_naming_a_mixed_case_column_casts_and_reads_back() {
+    // Fix for issue #2054: `ravel.cast.EventDate` (ADR-2040 D5's own
+    // example) must be admitted end to end, not merely by `validate_ddl`:
+    // `execute_ddl` must accept it over a file carrying an actual
+    // `EventDate` column, and the cast must take effect on SELECT.
+    let lake = Lake::memory_store();
+    let t = tenant("acme");
+    lake.grant(&t).await;
+    lake.put_file(
+        "t/hits/0.parquet",
+        event_date_parquet_bytes(&[1, 2], &[0, 1]),
+    )
+    .await;
+
+    let sql = format!(
+        "CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/' \
+         OPTIONS ('ravel.cast.EventDate' 'date-from-days')"
+    );
+    let outcome = lake
+        .executor
+        .execute_ddl(t, &sql, CREATED_BY, deadline())
+        .await
+        .expect("create with a mixed-case ravel.cast column");
+    match outcome {
+        DdlOutcome::Created {
+            table,
+            version,
+            files,
+            ..
+        } => {
+            assert_eq!(table, "hits");
+            assert_eq!(version, 1);
+            assert_eq!(files, 1);
+        }
+        other => panic!("expected Created, got {other:?}"),
+    }
+
+    let select = lake
+        .query(t, "SELECT id, \"EventDate\" FROM hits ORDER BY id")
+        .await;
+    assert_eq!(
+        rows(&select),
+        vec!["1|1970-01-01", "2|1970-01-02"],
+        "EventDate must read back as a DATE, not the raw day count"
     );
 }
 
