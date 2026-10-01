@@ -42,7 +42,9 @@ use ravel_logseg::rlog_bloom::RlogBloomSection;
 use ravel_logseg::{FieldType, LogRecord, Predicate, RlogConfig, RlogReader, read_section};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
-    GetRange, InstrumentedStore, ObjectStoreBackend, StoreMetrics, StoreMetricsSnapshot, list_all,
+    Capabilities, DelimitedList, GetOutcome, GetRange, InstrumentedStore, ListPage, ObjectMeta,
+    ObjectStoreBackend, PageToken, PutOptions, PutOutcome, StoreError, StoreMetrics,
+    StoreMetricsSnapshot, list_all,
 };
 use ravel_query::{LogSegmentFetcher, SegmentFetcher};
 use ravel_sql::{SpanSegmentFetcher, SqlConfig, SqlExecutor, SqlRequest};
@@ -444,8 +446,21 @@ fn open_footer(object: &[u8]) -> LogFooter {
     footer::open(object).expect("footer")
 }
 
-const UPDATED: &str = "updated tenant acme's config record (swapped in place with CasVersion); \
-                       every other field carried through unchanged\n";
+/// The staleness note every write command prints after its outcome line.
+macro_rules! note {
+    () => {
+        "note: a server's log ingest flush can keep the layout it read before this write for up \
+         to 60s (its tenant config staleness horizon), and longer while its config reads fail, \
+         when it keeps serving the layout it last read; a key it cannot resolve writes no \
+         clustering descriptor, counted on ingest_clustering_key_unresolved_total\n"
+    };
+}
+
+const UPDATED: &str = concat!(
+    "updated tenant acme's config record (swapped in place with CasVersion against the version \
+     this command read); every other field carried through unchanged\n",
+    note!()
+);
 
 /// Declare two typed columns, key on both at six hours, narrow the bloom scope
 /// to text, load, and read the one object back.
@@ -764,7 +779,7 @@ async fn set_refuses_an_undeclared_column_and_writes_nothing() {
 #[tokio::test]
 async fn clear_then_load_writes_no_descriptor_and_the_generation() {
     let fx = fixture();
-    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let (store, metrics) = counted_store();
     declare_region_and_code(&store, fx.now_ns).await;
     set_key(&store, &["region", "code"], fx.now_ns)
         .await
@@ -777,6 +792,11 @@ async fn clear_then_load_writes_no_descriptor_and_the_generation() {
              and given a generation by a bloom scope change)\n"
         )
     );
+    assert_eq!(
+        writes(&metrics.snapshot()),
+        (3, 0),
+        "declare, set and clear, one PUT each"
+    );
 
     let object = load_one(&store, &fx).await;
     assert_eq!(trailer_version(&object), 5);
@@ -788,12 +808,28 @@ async fn clear_then_load_writes_no_descriptor_and_the_generation() {
         by_stream_id(&object, API_UNKEYED, WEB_UNKEYED)
     );
 
-    // A second clear has nothing to clear and writes nothing.
-    let err = clear_key(&store, fx.now_ns).await.expect_err("refused");
-    assert_eq!(
-        err.to_string(),
+    // A second clear has nothing to clear and writes nothing: no PUT or
+    // DELETE, the record's bytes unchanged, and it still shows cleared at
+    // generation 2.
+    let (_, record_before) = config_record(store.as_ref()).await;
+    refused_writing_nothing(
+        &store,
+        &metrics,
         "there is no clustering key to clear: this tenant's clustering key is already absent at \
-         generation 2"
+         generation 2",
+        || clear_key(&store, fx.now_ns),
+    )
+    .await;
+    let (_, record_after) = config_record(store.as_ref()).await;
+    assert_eq!(record_after, record_before);
+    let mut shown = Vec::new();
+    storage_layout::clustering_key_show_to(Arc::clone(&store), TENANT, &mut shown)
+        .await
+        .expect("show");
+    assert_eq!(
+        String::from_utf8(shown).expect("utf8"),
+        "tenant acme has no clustering key at generation 2 (cleared, or never set and given a \
+         generation by a bloom scope change)\n"
     );
 }
 
@@ -857,9 +893,188 @@ async fn bloom_scope_set_reaches_the_object() {
         .expect("set scope");
     assert_eq!(
         printed,
-        "created the config record for tenant acme (it had none), with lifecycle_state=active \
-         and no override but this command's\ntenant acme bloom scope: text\ntenant acme has no \
-         clustering key at generation 1 (cleared, or never set and given a generation by a \
-         bloom scope change)\n"
+        concat!(
+            "created the config record for tenant acme (it had none), with lifecycle_state=active \
+             and no override but this command's\n",
+            note!(),
+            "tenant acme bloom scope: text\ntenant acme has no clustering key at generation 1 \
+             (cleared, or never set and given a generation by a bloom scope change)\n"
+        )
     );
+}
+
+/// Under the undeclared scope, declaring a column changes which string
+/// columns the filter covers, so the declaration takes a clustering
+/// generation and the next object names it. The declared column here is an
+/// i64 while the loaded `user` values are strings: the writer matches by name,
+/// so `user` loses its filter all the same.
+#[tokio::test]
+async fn an_undeclared_scope_declaration_takes_a_generation_the_object_names() {
+    let fx = fixture();
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    declare_region_and_code(&store, fx.now_ns).await;
+    set_scope(&store, BloomScopeArg::Undeclared, fx.now_ns)
+        .await
+        .expect("set scope");
+    typed_attr_column::set(
+        Arc::clone(&store),
+        TENANT,
+        &[
+            "region:str".to_string(),
+            "code:i64".to_string(),
+            "user:i64".to_string(),
+        ],
+        fx.now_ns,
+    )
+    .await
+    .expect("declare user");
+    let shown = {
+        let mut out = Vec::new();
+        storage_layout::clustering_key_show_to(Arc::clone(&store), TENANT, &mut out)
+            .await
+            .expect("show");
+        String::from_utf8(out).expect("utf8")
+    };
+    assert_eq!(
+        shown,
+        "tenant acme has no clustering key at generation 2 (cleared, or never set and given a \
+         generation by a bloom scope change)\n"
+    );
+
+    let object = load_one(&store, &fx).await;
+    let ftr = open_footer(&object);
+    assert_eq!(ftr.sort_descriptor, None);
+    assert_eq!(ftr.clustering_generation, 2);
+    let (dir, covered) = bloom(&object);
+    assert_eq!(covered, sorted(vec![COL_SEVERITY_TEXT, COL_BODY]));
+    assert!(!covered.contains(&str_col(&dir, "user")));
+    assert_eq!(
+        sql_rows(
+            &store,
+            &fx,
+            "SELECT ts FROM logs WHERE attrs['user'] = 'u-1'"
+        )
+        .await,
+        3
+    );
+}
+
+/// A store that, on the `nth` GET of a tenant config record, first overwrites
+/// that record with `moved` (another writer's record), so a command's read
+/// and its write see different records.
+struct MovingStore {
+    inner: Arc<dyn ObjectStoreBackend>,
+    nth: usize,
+    gets: AtomicUsize,
+    moved: bytes::Bytes,
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreBackend for MovingStore {
+    async fn put(
+        &self,
+        key: &str,
+        data: bytes::Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        self.inner.put(key, data, opts).await
+    }
+
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        if key.ends_with("/config") && self.gets.fetch_add(1, Ordering::SeqCst) + 1 == self.nth {
+            self.inner
+                .put(key, self.moved.clone(), PutOptions::default())
+                .await?;
+        }
+        self.inner.get(key, range).await
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.inner.head(key).await
+    }
+
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.inner.list(prefix, page).await
+    }
+
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+}
+
+/// The one config record in `store`.
+async fn config_record(store: &dyn ObjectStoreBackend) -> (String, bytes::Bytes) {
+    let mut records: Vec<_> = contents(store)
+        .await
+        .into_iter()
+        .filter(|(key, _)| key.ends_with("/config"))
+        .collect();
+    assert_eq!(records.len(), 1);
+    records.pop().expect("one record")
+}
+
+/// A record another writer changes between a write command's read and its
+/// write refuses the command with the catalog's re-read-and-retry error, and
+/// the other writer's record stands. Each command reads the record once and
+/// writes against that read's version.
+#[tokio::test]
+async fn a_record_moved_after_the_read_refuses_the_write() {
+    // The other writer's record: region, code and user declared.
+    let theirs: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    declare_region_and_code(&theirs, 1).await;
+    typed_attr_column::set(
+        Arc::clone(&theirs),
+        TENANT,
+        &[
+            "region:str".to_string(),
+            "code:i64".to_string(),
+            "user:str".to_string(),
+        ],
+        2,
+    )
+    .await
+    .expect("declare user");
+    let (_, moved) = config_record(theirs.as_ref()).await;
+
+    for command in [
+        "clustering-key set",
+        "clustering-key clear",
+        "bloom-scope set",
+    ] {
+        let inner: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        declare_region_and_code(&inner, 1).await;
+        if command == "clustering-key clear" {
+            set_key(&inner, &["region"], 1).await.expect("set key");
+        }
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MovingStore {
+            inner: Arc::clone(&inner),
+            nth: 2,
+            gets: AtomicUsize::new(0),
+            moved: moved.clone(),
+        });
+        let result = match command {
+            "clustering-key set" => set_key(&store, &["region"], 3).await,
+            "clustering-key clear" => clear_key(&store, 3).await,
+            _ => set_scope(&store, BloomScopeArg::Text, 3).await,
+        };
+        let (key, stored) = config_record(inner.as_ref()).await;
+        let err = result.expect_err(command);
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "a concurrent write changed config record {key:?} since this one read it (CAS \
+                 precondition failed): re-read and retry rather than overwrite the other write"
+            ),
+            "{command}"
+        );
+        assert_eq!(stored, moved, "{command}: the other writer's record stands");
+    }
 }

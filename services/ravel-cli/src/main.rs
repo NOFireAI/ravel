@@ -960,8 +960,11 @@ enum ClusteringKeyCommand {
     /// typed attribute column the tenant's config record itself declares, at
     /// most four, each named once; a refused key writes nothing. Log objects
     /// flushed after an ingest process reads the new record sort by
-    /// (stream, time bucket, key columns, timestamp); objects already written
-    /// keep their order.
+    /// (stream, time bucket, key columns, timestamp). Objects already written
+    /// keep their order and their filters until compaction rewrites them: L1
+    /// compaction and the erasure rewrite take the sort descriptor and bloom
+    /// coverage of the input with the highest generation, re-sort every part
+    /// by that descriptor, and compress at zstd level 9.
     Set {
         /// The tenant whose clustering key to set.
         #[arg(long)]
@@ -3446,7 +3449,7 @@ mod tests {
     use clap::Parser;
 
     use super::rspan_status_mask_names;
-    use super::{Cli, Command, tenancy};
+    use super::{BloomScopeCommand, Cli, ClusteringKeyCommand, Command, tenancy};
     use ravel_rspan::skip_index::{STATUS_BIT_ERROR, STATUS_BIT_OK, STATUS_BIT_UNSET};
 
     /// This unit test binary is built from this binary root, so it links the
@@ -3525,6 +3528,71 @@ mod tests {
             };
             assert_eq!(signal, want, "--signal {name} reaches the field");
         }
+    }
+
+    /// `clustering-key set --bucket-width` and `bloom-scope set --scope` take
+    /// the spellings the guide documents, each reaching its own variant, and
+    /// refuse clap's derived spelling of a variant name.
+    #[test]
+    fn storage_layout_value_names_parse_to_their_variants() {
+        use ravel_cli::storage_layout::{BloomScopeArg, BucketWidthArg};
+        let key_set = |width: &str| {
+            Cli::try_parse_from([
+                "ravel",
+                "clustering-key",
+                "set",
+                "--tenant",
+                "t",
+                "--column",
+                "k",
+                "--bucket-width",
+                width,
+                "--readers-rolled-out",
+            ])
+            .map(|cli| match cli.command {
+                Command::ClusteringKey {
+                    command: ClusteringKeyCommand::Set { bucket_width, .. },
+                } => bucket_width,
+                _ => panic!("expected clustering-key set"),
+            })
+        };
+        for (name, want) in [
+            ("1h", BucketWidthArg::OneHour),
+            ("6h", BucketWidthArg::SixHours),
+            ("1d", BucketWidthArg::OneDay),
+        ] {
+            let got = key_set(name).unwrap_or_else(|e| panic!("--bucket-width {name}: {e}"));
+            assert_eq!(got, want, "--bucket-width {name}");
+        }
+        assert!(key_set("six-hours").is_err());
+
+        let scope_set = |scope: &str| {
+            Cli::try_parse_from([
+                "ravel",
+                "bloom-scope",
+                "set",
+                "--tenant",
+                "t",
+                "--scope",
+                scope,
+                "--readers-rolled-out",
+            ])
+            .map(|cli| match cli.command {
+                Command::BloomScope {
+                    command: BloomScopeCommand::Set { scope, .. },
+                } => scope,
+                _ => panic!("expected bloom-scope set"),
+            })
+        };
+        for (name, want) in [
+            ("all", BloomScopeArg::All),
+            ("undeclared", BloomScopeArg::Undeclared),
+            ("text", BloomScopeArg::Text),
+        ] {
+            let got = scope_set(name).unwrap_or_else(|e| panic!("--scope {name}: {e}"));
+            assert_eq!(got, want, "--scope {name}");
+        }
+        assert!(scope_set("none").is_err());
     }
 
     /// The shipped write-concurrency defaults, read where an operator meets
