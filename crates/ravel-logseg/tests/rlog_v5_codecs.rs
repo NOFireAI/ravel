@@ -721,8 +721,11 @@ fn row_and_columnar_paths_identical_with_the_new_codecs() {
             )
         })
         .collect();
+    // One block per row group, so the per-block string codecs are what this
+    // pins; `rlog_v5_rowgroup_dict.rs` covers the row-group dictionary.
     let cfg = RlogConfig {
         block_target_records: 256,
+        group_target_blocks: 1,
         ..RlogConfig::default()
     };
 
@@ -750,7 +753,20 @@ fn row_and_columnar_paths_identical_with_the_new_codecs() {
     let s = value_pages(&rows, dyn_column(&rows, "s", FieldType::Str));
     assert!(s.iter().all(|p| p.enc == Enc::Plain), "{s:?}");
     let u = value_pages(&rows, dyn_column(&rows, "u", FieldType::Str));
-    assert!(u.iter().all(|p| p.enc == Enc::Dict), "{u:?}");
+    // Four hosts in each 256-row block: a dictionary stores smaller than plain,
+    // and split into a tag 12 page and a tag 13 page it saves the tag 7 id
+    // width byte, so even a one-block row group takes it.
+    assert!(
+        u.iter()
+            .filter(|p| p.enc != Enc::DictPage)
+            .all(|p| p.enc == Enc::DictIds),
+        "{u:?}"
+    );
+    assert_eq!(
+        u.iter().filter(|p| p.enc == Enc::DictPage).count(),
+        5,
+        "one dictionary page per one-block row group"
+    );
 
     let got = scan_all(&rows);
     assert_eq!(got.len(), n);

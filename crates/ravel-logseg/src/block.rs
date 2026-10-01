@@ -25,8 +25,8 @@ use crate::record::{
     SPAN_ID_WIDTH, TRACE_ID_WIDTH,
 };
 use crate::rlog_codec::{
-    decode_column_ref, decode_gcd_i64, encode_column_ref, i64_candidates, string_candidates,
-    string_dict_candidates,
+    StrShape, decode_column_ref, decode_dict_ids, decode_gcd_i64, encode_column_ref,
+    i64_candidates, shape_candidates, string_dict_shape, string_shape,
 };
 
 /// Upper bound on a block's decoded record count (untrusted-input guard). A
@@ -144,6 +144,21 @@ pub struct BlockWriteOut {
     pub max_ts: i64,
     pub min_stream_ref: u32,
     pub max_stream_ref: u32,
+    /// Every string column the block carries a value page for, in dictionary
+    /// shape, so the row group can decide whether one dictionary for the whole
+    /// group stores smaller than the per-block value pages (ADR-2135 decision
+    /// 6). Empty means the group keeps this block's pages as they are.
+    pub str_values: Vec<BlockStrValues>,
+}
+
+/// One string column's present values in one block, in dictionary shape.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BlockStrValues {
+    pub column_id: u32,
+    /// The block's distinct values, strictly ascending.
+    pub sorted: Vec<Vec<u8>>,
+    /// Per present value in row order, its index into `sorted`.
+    pub ids: Vec<u32>,
 }
 
 /// One page staged for a column, already through the compression envelope.
@@ -155,6 +170,7 @@ struct StagedPage {
 /// A block's pages in staging order, each sealed as it is staged.
 struct Stager {
     pages: Vec<StagedPage>,
+    str_values: Vec<BlockStrValues>,
     zstd_level: i32,
 }
 
@@ -162,6 +178,7 @@ impl Stager {
     fn new(zstd_level: i32) -> Self {
         Stager {
             pages: Vec::new(),
+            str_values: Vec::new(),
             zstd_level,
         }
     }
@@ -221,20 +238,34 @@ impl Stager {
 
     /// A string value page: dictionary or plain, whichever stores smaller.
     fn strings(&mut self, column_id: u32, present: &[bool], values: &[&[u8]]) {
+        self.string_shape(column_id, present, string_shape(values));
+    }
+
+    /// A string value page from values already reduced to `shape`, recorded
+    /// for the row group dictionary decision too.
+    fn string_shape(&mut self, column_id: u32, present: &[bool], shape: StrShape<'_>) {
+        if !present.iter().any(|&p| p) {
+            return;
+        }
         self.column(column_id, present, |level| {
-            stored_winner(string_candidates(values), level)
+            stored_winner(shape_candidates(&shape), level)
+        });
+        self.str_values.push(BlockStrValues {
+            column_id,
+            sorted: shape.sorted.iter().map(|v| v.to_vec()).collect(),
+            ids: shape.ids.iter().map(|&i| i as u32).collect(),
         });
     }
 
     /// Lays the sealed pages out in staging order.
-    fn finish(self) -> (Vec<PageDesc>, Vec<u8>) {
+    fn finish(self) -> (Vec<PageDesc>, Vec<u8>, Vec<BlockStrValues>) {
         let mut payload = Vec::new();
         let descs = self
             .pages
             .iter()
             .map(|p| p.page.append(&mut payload, p.column_id))
             .collect();
-        (descs, payload)
+        (descs, payload, self.str_values)
     }
 }
 
@@ -503,7 +534,7 @@ pub fn write_block(
         }
     }
 
-    let (descs, payload) = pages.finish();
+    let (descs, payload, str_values) = pages.finish();
 
     let min_ts = ts.iter().copied().min().unwrap_or(0);
     let max_ts = ts.iter().copied().max().unwrap_or(0);
@@ -519,6 +550,7 @@ pub fn write_block(
         max_ts,
         min_stream_ref,
         max_stream_ref,
+        str_values,
     })
 }
 
@@ -706,9 +738,7 @@ pub fn write_block_columnar(
                     let dpresent: Vec<bool> = dp.ids.iter().map(Option::is_some).collect();
                     let present_ids: Vec<u32> = dp.ids.iter().filter_map(|x| *x).collect();
                     let dref: Vec<&[u8]> = dp.dict.iter().map(Vec::as_slice).collect();
-                    pages.column(cid, &dpresent, |level| {
-                        stored_winner(string_dict_candidates(&dref, &present_ids), level)
-                    });
+                    pages.string_shape(cid, &dpresent, string_dict_shape(&dref, &present_ids));
                 } else {
                     let vv: Vec<&[u8]> = vals
                         .iter()
@@ -725,7 +755,7 @@ pub fn write_block_columnar(
         }
     }
 
-    let (descs, payload) = pages.finish();
+    let (descs, payload, str_values) = pages.finish();
 
     let min_ts = input.ts.iter().copied().min().unwrap_or(0);
     let max_ts = input.ts.iter().copied().max().unwrap_or(0);
@@ -741,6 +771,7 @@ pub fn write_block_columnar(
         max_ts,
         min_stream_ref,
         max_stream_ref,
+        str_values,
     })
 }
 
@@ -1163,6 +1194,22 @@ pub fn read_block_pages(
     plans: &[ColumnPlan],
     counters: PageCounters,
 ) -> Result<DecodedBlock, LogSegError> {
+    read_block_pages_with_dicts(record_count, descs, page_bytes, &[], plans, counters)
+}
+
+/// [`read_block_pages`] for a block whose row group carries string
+/// dictionaries (ADR-2135 decision 6). `dicts` holds, per column, the decoded
+/// tag 12 page of the block's column chunk, already checksum-verified by the
+/// caller; a tag 13 page resolves its ids through the entry for its column,
+/// and one whose column has no entry is `Corrupted`.
+pub fn read_block_pages_with_dicts(
+    record_count: usize,
+    descs: &[PageDesc],
+    page_bytes: &[Option<Vec<u8>>],
+    dicts: &[(u32, &[Vec<u8>])],
+    plans: &[ColumnPlan],
+    counters: PageCounters,
+) -> Result<DecodedBlock, LogSegError> {
     if record_count > MAX_RECORDS as usize {
         return Err(LogSegError::Corrupted(format!(
             "record_count {record_count} over cap"
@@ -1187,7 +1234,7 @@ pub fn read_block_pages(
             )));
         }
     }
-    decode_columns(record_count, descs, page_bytes, plans, counters)
+    decode_columns(record_count, descs, page_bytes, dicts, plans, counters)
 }
 
 /// How much of a block's page bytes a read actually touched
@@ -1229,6 +1276,26 @@ fn referenced_i64(
     Ok(values.clone())
 }
 
+/// Narrows a row group dictionary to the entries one block's `ids` reference,
+/// renumbering the ids to match. The group dictionary is ascending, so the
+/// narrowed one is too: the block decodes to exactly the dictionary and ids a
+/// tag 7 page over the same values would have given it.
+fn block_dict(group: &[Vec<u8>], ids: Vec<u32>) -> (Vec<Vec<u8>>, Vec<u32>) {
+    let mut remap = vec![u32::MAX; group.len()];
+    for &id in &ids {
+        remap[id as usize] = 0;
+    }
+    let mut dict = Vec::new();
+    for (i, slot) in remap.iter_mut().enumerate() {
+        if *slot == 0 {
+            *slot = dict.len() as u32;
+            dict.push(group[i].clone());
+        }
+    }
+    let ids = ids.into_iter().map(|id| remap[id as usize]).collect();
+    (dict, ids)
+}
+
 /// Turns a block's page descriptors and their decompressed bytes into a
 /// [`DecodedBlock`].
 ///
@@ -1238,6 +1305,7 @@ fn decode_columns(
     record_count: usize,
     descs: &[PageDesc],
     page_bytes: &[Option<Vec<u8>>],
+    dicts: &[(u32, &[Vec<u8>])],
     plans: &[ColumnPlan],
     counters: PageCounters,
 ) -> Result<DecodedBlock, LogSegError> {
@@ -1331,12 +1399,30 @@ fn decode_columns(
                 // bitmap; the page's ids are per present row, so an absent row
                 // gets a `None` slot rather than a sentinel id (ADR-0099
                 // decision 4). A dict page keeps its distinct set intact.
-                let col = match decode_strings_columnar(enc, encoded, present_count)? {
-                    DecodedStrings::Plain(vals) => StrColumn::Plain(scatter(&present, vals)?),
-                    DecodedStrings::Dict { dict, ids } => StrColumn::Dict {
+                let col = if enc == Enc::DictIds {
+                    let dict = dicts
+                        .iter()
+                        .find(|(cid, _)| *cid == column_id)
+                        .map(|(_, d)| *d)
+                        .ok_or_else(|| {
+                            LogSegError::Corrupted(format!(
+                                "column {column_id} has a dictionary id page but no dictionary page"
+                            ))
+                        })?;
+                    let (dict, ids) =
+                        block_dict(dict, decode_dict_ids(encoded, present_count, dict.len())?);
+                    StrColumn::Dict {
                         dict,
                         ids: scatter(&present, ids)?,
-                    },
+                    }
+                } else {
+                    match decode_strings_columnar(enc, encoded, present_count)? {
+                        DecodedStrings::Plain(vals) => StrColumn::Plain(scatter(&present, vals)?),
+                        DecodedStrings::Dict { dict, ids } => StrColumn::Dict {
+                            dict,
+                            ids: scatter(&present, ids)?,
+                        },
+                    }
                 };
                 out.str_cols.insert(column_id, col);
             }

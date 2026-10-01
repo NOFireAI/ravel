@@ -11770,9 +11770,10 @@ type = "i64"
         // Pinned so a drift in either direction is a test failure, not a silent
         // re-baseline of both sides at once. The value moves only with the
         // writer: this one is the RLOG version 5 layout (ADR-2135) with each
-        // page's encoding chosen by stored size (#2140).
+        // page's encoding chosen by stored size (#2140) and repeated strings
+        // on row-group dictionaries (#2144).
         const RICH_OBJECT_BLAKE3: &str =
-            "ea47c829f32093565b57cab1ff344a55180f7b350a620ad287ff2ec739871c22";
+            "5688a7c8fb29f7629b74ba0c8661058b866bde514a93c48a72bf60437adbe90c";
         assert_eq!(
             blake3::hash(&bytes_off).to_hex().as_str(),
             RICH_OBJECT_BLAKE3,

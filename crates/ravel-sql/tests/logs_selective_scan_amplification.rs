@@ -915,12 +915,12 @@ async fn selective_numeric_reads_only_surviving_blocks() {
         "full scan decodes every block"
     );
     assert_eq!(full.rows, TOTAL_BLOCKS, "full scan returns every record");
-    // 630,505 = the eight version-5 objects' bytes exactly (their sizes
+    // 630,401 = the eight version-5 objects' bytes exactly (their sizes
     // differ: each block's bloom filter is sized to its own token count). One
     // whole-object GET per segment and nothing else, so this is the object
     // bytes and not a byte more.
     assert_eq!(
-        full.bytes, 630_505,
+        full.bytes, 630_401,
         "full scan reads exactly the object bytes"
     );
     assert_eq!(full.plan_full_reads, 0, "full scan skips the plan phase");
@@ -976,18 +976,19 @@ async fn selective_numeric_reads_only_surviving_blocks() {
         q37.bytes,
         q37_block_bytes
     );
-    // 165,425 = 99,217 chunk-run bytes + 65,536 probe bytes (8 x 8 KiB) + 672
+    // 165,393 = 99,185 chunk-run bytes + 65,536 probe bytes (8 x 8 KiB) + 672
     // front-section bytes (8 x (STREAM_DIR 62 + FIELD_DIR 22)). The chunk-run
-    // term is 99,137 page bytes (the 8 surviving blocks' pages; blocks differ
+    // term is 99,145 page bytes (the 8 surviving blocks' pages, each with its
+    // segment's 6-byte `severity_text` row-group dictionary page; blocks differ
     // slightly in encoded size -- segment 0's surviving block also carries
     // `MARKER_RARE` -- so the term is the measured sum, not blocks x a
-    // constant) plus 80 bridged gap bytes: the L0 cap merges each segment's
-    // two smallest gaps, 5 bytes each. The chunk-run term is 15% of the full
+    // constant) plus 40 bridged gap bytes: the L0 cap merges one gap per
+    // segment, 5 bytes each. The chunk-run term is 15% of the full
     // scan; the probe term is the fixed per-object directory cost, which on
     // this deliberately tiny fixture is 40% of the total and on a production
     // 1.3 MB object is a rounding error.
     assert_eq!(
-        q37.bytes, 165_425,
+        q37.bytes, 165_393,
         "q37 moves the surviving blocks' page bytes plus the probe and the two \
          front sections, not the object"
     );
@@ -1030,13 +1031,13 @@ async fn selective_numeric_reads_only_surviving_blocks() {
         q20.bytes,
         q20_block_bytes
     );
-    // 264,439 = 198,231 chunk-run bytes + the same 65,536 probe and 672
-    // front-section bytes q37 pays. The chunk-run term is 198,167 page bytes
-    // (16 surviving blocks) plus 64 bridged gap bytes: the L0 cap merges each
-    // segment's two smallest gaps, 4 bytes each. About twice q37's page term,
-    // identical fixed term.
+    // 264,375 = 198,167 chunk-run bytes + the same 65,536 probe and 672
+    // front-section bytes q37 pays. The chunk-run term is 198,135 page bytes
+    // (16 surviving blocks) plus 32 bridged gap bytes: the L0 cap merges one
+    // gap per segment, 4 bytes each. About twice q37's page term, identical
+    // fixed term.
     assert_eq!(
-        q20.bytes, 264_439,
+        q20.bytes, 264_375,
         "q20 moves about twice q37's page bytes and the same fixed directory bytes"
     );
     assert!(
@@ -1105,7 +1106,7 @@ async fn text_predicate_falls_back_to_full_object_read() {
     );
     assert_eq!(text.rows, SEGMENTS, "one matching record per segment");
     // The whole objects are read: bytes ~ a full scan plus the probes, the
-    // amplification #761 cannot remove for a text predicate. 696,041 = 630,505
+    // amplification #761 cannot remove for a text predicate. 695,937 = 630,401
     // object bytes + 65,536 probe bytes (8 x 8 KiB). The 176 FIELD_DIR bytes
     // (8 x 22) this figure carried before #835 were the scan open's, not the
     // plan's: the plan fallback selects every column, while the scan's
@@ -1114,7 +1115,7 @@ async fn text_predicate_falls_back_to_full_object_read() {
     // short-circuits that open, so the read goes with it.
     let full = measure("full_scan", &[], cache).await;
     assert_eq!(
-        text.bytes, 696_041,
+        text.bytes, 695_937,
         "text fallback: the whole objects plus one plan probe each"
     );
     assert!(
@@ -1177,27 +1178,27 @@ async fn selective_third_no_partition_multiplication_under_cache_pressure() {
         small.bytes,
         full.bytes
     );
-    // 264,439 with no eviction: the figure
+    // 264,375 with no eviction: the figure
     // `selective_numeric_reads_only_surviving_blocks` decomposes for q20.
     //
-    // 479,195 under pressure =
+    // 479,083 under pressure =
     //   65,536 (8 plan probes, 8 KiB each)
     // + 65,536 (8 probe-window range re-reads of an evicted tail, 8 KiB each)
     // +    176 (8 plan FIELD_DIR GETs, 22 each)
     // +    672 (8 combined STREAM_DIR+FIELD_DIR front GETs, 84 each, where
     //           eviction left both sections cold)
     // +    372 (6 lone STREAM_DIR front GETs, 62 each)
-    // + 346,903 (56 chunk-run GETs: 14 sets of 4 runs, because 6 of the 8
+    // + 346,791 (56 chunk-run GETs: 14 sets of 4 runs, because 6 of the 8
     //           segments have their runs fetched twice -- the two partitions
     //           owning that segment's two surviving blocks each read runs that
     //           span both blocks' pages, and the first copy is evicted before
-    //           the second read; each set carries its segment's 8 bridged gap
+    //           the second read; each set carries its segment's 4 bridged gap
     //           bytes).
     // Pages are re-read under pressure, so the bound is one full pass, not
-    // the no-eviction figure: both stay under the 630,505 a full pass moves.
-    assert_eq!(big.bytes, 264_439, "q20 with no eviction");
+    // the no-eviction figure: both stay under the 630,401 a full pass moves.
+    assert_eq!(big.bytes, 264_375, "q20 with no eviction");
     assert_eq!(
-        small.bytes, 479_195,
+        small.bytes, 479_083,
         "q20 under eviction: directory and chunk-run re-reads, still under one full pass"
     );
 }
@@ -1272,11 +1273,11 @@ async fn text_predicate_no_second_wire_read_regardless_of_cache() {
              nothing beyond that -- the scan adds no GET of any shape",
             s.label
         );
-        // 696,041: identical to the big-cache figure
+        // 695,937: identical to the big-cache figure
         // (`text_predicate_falls_back_to_full_object_read`), proving the byte
         // cost no longer depends on cache size.
         assert_eq!(
-            s.bytes, 696_041,
+            s.bytes, 695_937,
             "{}: exactly the corpus bytes plus the fixed per-segment plan \
              overhead, moved once, never twice",
             s.label
@@ -1302,11 +1303,11 @@ async fn text_predicate_no_second_wire_read_regardless_of_cache() {
             "{}: one matching record per segment",
             s.label
         );
-        // 630,505: the whole corpus (see `full.bytes` in the sibling test),
+        // 630,401: the whole corpus (see `full.bytes` in the sibling test),
         // charged as reused rather than folded into the GET-bytes figure the
         // plan phase already recorded -- the truthful-accounting deliverable.
         assert_eq!(
-            s.acc_bytes_reused, 630_505,
+            s.acc_bytes_reused, 630_401,
             "{}: the scan's reuse of every carried whole object is charged via \
              bytes_reused, not silently absorbed into acc_bytes",
             s.label
@@ -1377,11 +1378,11 @@ async fn text_predicate_prunes_most_scan_adds_no_gets() {
         "only the one segment carrying the marker survives"
     );
     assert_eq!(s.rows, 1, "exactly one matching record, from segment 0");
-    // 78,739: segment 0's whole-object size (its block 0 carries
+    // 78,740: segment 0's whole-object size (its block 0 carries
     // `MARKER_RARE` in addition to `MARKER_FEW`) -- the only segment whose
     // carry the scan ever reuses.
     assert_eq!(
-        s.acc_bytes_reused, 78_739,
+        s.acc_bytes_reused, 78_740,
         "the one surviving segment's scan reuses its plan-carried bytes \
          rather than issuing a second GET"
     );

@@ -9,6 +9,7 @@
 //!   cargo test -p ravel-logseg --test golden_bytes_v5 -- --ignored --nocapture
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use ravel_logseg::encoding::Enc;
 use ravel_logseg::footer::{self, kind, open};
 use ravel_logseg::page_dir::PageDir;
 use ravel_logseg::{
@@ -143,18 +144,31 @@ fn matches_golden_fixture() {
     assert_eq!(dir.groups.len(), 1, "one block is one row group");
     assert_eq!(dir.groups[0].first_block, 0);
     assert_eq!(dir.groups[0].block_count, 1);
-    // One block per group means one or two pages per column chunk: a fully
-    // present column contributes its value page, a partially present one its
-    // presence bitmap page as well. Both shapes occur in this fixture, which is
-    // why a chunk's page_count is not the count of blocks carrying the column.
+    // One block per group means one or two block pages per column chunk: a
+    // fully present column contributes its value page, a partially present one
+    // its presence bitmap page as well. Both shapes occur in this fixture, which
+    // is why a chunk's page_count is not the count of blocks carrying the
+    // column. A string chunk may lead with a row-group dictionary page on top
+    // (ADR-2135 decision 6), and this fixture's repeated `INFO` and `GET`
+    // strings take one.
     assert!(
-        dir.groups[0].chunks.iter().all(|c| c.pages.len() <= 2),
+        dir.groups[0]
+            .chunks
+            .iter()
+            .all(|c| c.pages.len() - usize::from(c.dict_page().is_some()) <= 2),
         "a one-block group's column chunks are a value page and at most a \
-         presence page"
+         presence page, past any dictionary page"
     );
     assert!(
-        dir.groups[0].chunks.iter().any(|c| c.pages.len() == 2),
+        dir.groups[0]
+            .chunks
+            .iter()
+            .any(|c| c.pages.iter().any(|p| p.enc == Enc::Bitmap)),
         "the fixture has a partially present column, so a presence page exists"
+    );
+    assert!(
+        dir.groups[0].chunks.iter().any(|c| c.dict_page().is_some()),
+        "the fixture has a string chunk stored on a row-group dictionary"
     );
     assert_eq!(dir.block_count(), 1);
 }

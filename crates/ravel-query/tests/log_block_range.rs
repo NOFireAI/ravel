@@ -322,10 +322,15 @@ fn subset_object() -> (Vec<LogRecord>, Vec<u8>) {
 fn dirtying_object() -> (Vec<LogRecord>, Vec<u8>) {
     let records: Vec<LogRecord> = (0..20)
         .map(|ts| {
+            // Distinct per record, so a row-group dictionary cannot fold the
+            // bodies and shrink this object below the one under test.
             record(
                 "billing",
                 ts,
-                "an entirely different body, long enough that this object is the larger of the two",
+                &format!(
+                    "an entirely different body {ts}, long enough that this object is the \
+                     larger of the two"
+                ),
             )
         })
         .collect();

@@ -6878,7 +6878,8 @@ fn scan_lost(key: &str) -> LogFetchError {
 }
 
 /// The largest uncompressed block in `bytes`' PAGE_DIR, summed over every
-/// page of the block. `u64::MAX` when the directory cannot be read, so a
+/// page of the block and each row-group dictionary page it decodes through.
+/// `u64::MAX` when the directory cannot be read, so a
 /// block of unknown size is never taken for a small one; the scan's own open
 /// already refused such an object.
 ///
@@ -6902,9 +6903,19 @@ fn max_block_uncompressed_len<S: ByteSource + ?Sized>(
     let mut largest = 0u64;
     for group in &page_dir.groups {
         let mut per_block = vec![0u64; group.block_count as usize];
-        for page in group.chunks.iter().flat_map(|chunk| &chunk.pages) {
-            if let Some(len) = per_block.get_mut(page.block as usize) {
-                *len = len.saturating_add(page.uncomp_len);
+        for chunk in &group.chunks {
+            // A row-group dictionary page decodes alongside every block of its
+            // chunk, so each such block is charged it once.
+            let dict_len = chunk.dict_page().map_or(0, |d| d.uncomp_len);
+            let mut charged: Option<u32> = None;
+            for page in &chunk.pages {
+                if let Some(len) = per_block.get_mut(page.block as usize) {
+                    *len = len.saturating_add(page.uncomp_len);
+                    if charged != Some(page.block) {
+                        *len = len.saturating_add(dict_len);
+                        charged = Some(page.block);
+                    }
+                }
             }
         }
         largest = per_block.into_iter().fold(largest, u64::max);
@@ -10545,11 +10556,19 @@ mod read_gate_tests {
             PageDir::decode(&ravel_logseg::read_section(&bytes, &desc, &cfg).expect("read"))
                 .expect("decode")
         };
+        // Both records carry the same severity text, so its chunk stores one
+        // row-group dictionary page that each block decodes through.
+        let dict_pages = |block: u32| page_dir.block_dict_pages(block).expect("block");
+        assert!(
+            !dict_pages(1).is_empty(),
+            "the fixture has a dictionary page"
+        );
         let per_block = |block: u32| -> u64 {
             page_dir
                 .block_pages(block)
                 .expect("block")
                 .iter()
+                .chain(&dict_pages(block))
                 .map(|page| page.desc.uncomp_len)
                 .sum()
         };

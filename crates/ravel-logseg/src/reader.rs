@@ -13,7 +13,9 @@ use std::sync::Arc;
 
 use ravel_types::logstream::AttrValue;
 
-use crate::block::{ColumnIdSet, ColumnPlan, DecodedBlock, PageCounters, read_block_pages};
+use crate::block::{
+    ColumnIdSet, ColumnPlan, DecodedBlock, PageCounters, read_block_pages_with_dicts,
+};
 use crate::columnar::ColumnarBlockView;
 use crate::columns::ColumnSelection;
 use crate::error::LogSegError;
@@ -27,6 +29,7 @@ use crate::record::{
     COL_STREAM_REF, COL_TRACE_ID, COL_TS, FieldSel, FieldType, LogRecord, Predicate, resolve_value,
 };
 use crate::rlog_bloom::RlogBloomSection;
+use crate::rlog_codec::decode_dict_page;
 use crate::skip_index::{NumRangeArm, SkipIndex};
 use crate::source::ByteSource;
 use crate::stream_dir::StreamDir;
@@ -161,7 +164,12 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
                 .ok_or_else(|| LogSegError::Corrupted("missing PAGE_DIR section".into()))?;
             let raw = read_section_from(source, &desc, cfg)?;
             open_decompressed_bytes += section_decompressed_len(&desc, &raw);
-            Arc::new(PageDir::decode_validated(&raw, blocks.len, skip.l0.len())?)
+            Arc::new(PageDir::decode_validated(
+                &raw,
+                blocks.len,
+                skip.l0.len(),
+                &field_dir,
+            )?)
         };
         Ok(RlogReader {
             source,
@@ -983,21 +991,14 @@ impl BlockScan {
         // returns offsets relative to the BLOCKS section; shift them to
         // absolute object offsets, exactly what the scan-time build produced,
         // so the decode is byte-identical.
-        let mut pages = self
-            .page_dir
-            .block_pages(loc.block_index)
-            .ok_or_else(|| LogSegError::Corrupted("block not in page_dir".into()))?;
-        for p in &mut pages {
-            p.offset = self
-                .blocks_offset
-                .checked_add(p.offset)
-                .ok_or_else(|| LogSegError::Corrupted("page offset overflow".into()))?;
-        }
+        let (pages, dict_pages) =
+            located_block_pages(&self.page_dir, self.blocks_offset, loc.block_index)?;
         let decoded = decode_v4_block_with(
             |p: &PageLoc| source_extent(object_bytes, p.offset, p.desc.len, "page"),
             loc.record_count,
             loc.crc32c,
             &pages,
+            &dict_pages,
             &self.plans,
             self.columns.as_ref(),
         )?;
@@ -1052,12 +1053,14 @@ impl BlockScan {
 /// `bytes` need not be the whole object: `base` is the absolute offset its
 /// first byte sits at, so a caller holding one fetched range passes that
 /// range's start and a whole-object caller passes 0.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_v4_block(
     bytes: &[u8],
     base: u64,
     record_count: usize,
     block_crc32c: u32,
     pages: &[PageLoc],
+    dict_pages: &[PageLoc],
     plans: &[ColumnPlan],
     columns: Option<&ColumnIdSet>,
 ) -> Result<DecodedBlock, LogSegError> {
@@ -1068,16 +1071,53 @@ pub(crate) fn decode_v4_block(
             .ok_or_else(|| LogSegError::Corrupted("page before fetched range".into()))?;
         source_extent(bytes, rel, p.desc.len, "page")
     };
-    decode_v4_block_with(page, record_count, block_crc32c, pages, plans, columns)
+    decode_v4_block_with(
+        page,
+        record_count,
+        block_crc32c,
+        pages,
+        dict_pages,
+        plans,
+        columns,
+    )
+}
+
+/// Block `block`'s pages and the row group dictionary pages they need, each
+/// with its offset shifted from BLOCKS-relative to absolute in the object.
+pub(crate) fn located_block_pages(
+    page_dir: &PageDir,
+    blocks_offset: u64,
+    block: u32,
+) -> Result<(Vec<PageLoc>, Vec<PageLoc>), LogSegError> {
+    let mut pages = page_dir
+        .block_pages(block)
+        .ok_or_else(|| LogSegError::Corrupted("block not in page_dir".into()))?;
+    let mut dict_pages = page_dir
+        .block_dict_pages(block)
+        .ok_or_else(|| LogSegError::Corrupted("block not in page_dir".into()))?;
+    for p in pages.iter_mut().chain(dict_pages.iter_mut()) {
+        p.offset = blocks_offset
+            .checked_add(p.offset)
+            .ok_or_else(|| LogSegError::Corrupted("page offset overflow".into()))?;
+    }
+    Ok((pages, dict_pages))
 }
 
 /// [`decode_v4_block`] with each kept page's stored bytes supplied by `page`,
 /// which is only called for a page the projection keeps.
+///
+/// `dict_pages` are the row group dictionary pages of the block's column
+/// chunks (ADR-2135 decision 6). Each one whose column the projection keeps is
+/// checksum-verified against its own PAGE_DIR crc and decoded before any of
+/// the block's pages is, on the whole-block and the subset path alike, so a
+/// corrupt dictionary fails every block of its chunk. It belongs to the
+/// chunk rather than the block, so the block crc does not cover it.
 fn decode_v4_block_with<'s>(
     page: impl Fn(&PageLoc) -> Result<Cow<'s, [u8]>, LogSegError>,
     record_count: usize,
     block_crc32c: u32,
     pages: &[PageLoc],
+    dict_pages: &[PageLoc],
     plans: &[ColumnPlan],
     columns: Option<&ColumnIdSet>,
 ) -> Result<DecodedBlock, LogSegError> {
@@ -1088,6 +1128,17 @@ fn decode_v4_block_with<'s>(
     let mut descs: Vec<crate::page::PageDesc> = Vec::with_capacity(pages.len());
     let mut page_bytes: Vec<Option<Vec<u8>>> = Vec::with_capacity(pages.len());
     let mut counters = PageCounters::default();
+    let mut dicts: Vec<(u32, Vec<Vec<u8>>)> = Vec::with_capacity(dict_pages.len());
+    for p in dict_pages {
+        counters.bytes_fetched = counters.bytes_fetched.saturating_add(p.desc.len);
+        if !wanted(p.desc.column_id) {
+            counters.skipped += 1;
+            continue;
+        }
+        let stored = page(p)?;
+        let produced = verify_and_read(&stored, p, &mut counters)?;
+        dicts.push((p.desc.column_id, decode_dict_page(&produced)?));
+    }
     let mut block_crc = 0u32;
     let mut all_read = true;
     for p in pages {
@@ -1100,31 +1151,41 @@ fn decode_v4_block_with<'s>(
             continue;
         }
         let stored = page(p)?;
-        let stored: &[u8] = &stored;
-        if crc32c::crc32c(stored) != p.crc32c {
-            return Err(LogSegError::Corrupted(format!(
-                "page crc mismatch for column {}",
-                p.desc.column_id
-            )));
-        }
-        block_crc = crc32c::crc32c_append(block_crc, stored);
-        let produced = read_page(stored, &p.desc, DEFAULT_MAX_UNCOMP)?;
-        // Only a zstd page was decompressed; count what it actually produced
-        // (equal to `uncomp_len` for a valid page, which `read_page` already
-        // checked). A raw page was copied, not decompressed (issue #1401).
-        if p.desc.comp == crate::page::COMP_ZSTD {
-            counters.decompressed_bytes = counters
-                .decompressed_bytes
-                .saturating_add(produced.len() as u64);
-        }
-        page_bytes.push(Some(produced));
-        counters.decoded += 1;
-        counters.bytes_decoded = counters.bytes_decoded.saturating_add(p.desc.len);
+        block_crc = crc32c::crc32c_append(block_crc, &stored);
+        page_bytes.push(Some(verify_and_read(&stored, p, &mut counters)?));
     }
     if all_read && block_crc != block_crc32c {
         return Err(LogSegError::Corrupted("block crc mismatch".into()));
     }
-    read_block_pages(record_count, &descs, &page_bytes, plans, counters)
+    let dicts: Vec<(u32, &[Vec<u8>])> = dicts.iter().map(|(cid, d)| (*cid, d.as_slice())).collect();
+    read_block_pages_with_dicts(record_count, &descs, &page_bytes, &dicts, plans, counters)
+}
+
+/// Checks one kept page's stored bytes against its PAGE_DIR crc, then
+/// decompresses them, counting the page as decoded.
+fn verify_and_read(
+    stored: &[u8],
+    p: &PageLoc,
+    counters: &mut PageCounters,
+) -> Result<Vec<u8>, LogSegError> {
+    if crc32c::crc32c(stored) != p.crc32c {
+        return Err(LogSegError::Corrupted(format!(
+            "page crc mismatch for column {}",
+            p.desc.column_id
+        )));
+    }
+    let produced = read_page(stored, &p.desc, DEFAULT_MAX_UNCOMP)?;
+    // Only a zstd page was decompressed; count what it actually produced
+    // (equal to `uncomp_len` for a valid page, which `read_page` already
+    // checked). A raw page was copied, not decompressed (issue #1401).
+    if p.desc.comp == crate::page::COMP_ZSTD {
+        counters.decompressed_bytes = counters
+            .decompressed_bytes
+            .saturating_add(produced.len() as u64);
+    }
+    counters.decoded += 1;
+    counters.bytes_decoded = counters.bytes_decoded.saturating_add(p.desc.len);
+    Ok(produced)
 }
 
 // --- exact evaluation -------------------------------------------------------
