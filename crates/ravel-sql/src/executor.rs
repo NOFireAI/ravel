@@ -127,8 +127,8 @@ use crate::logs_pushdown::extract_logs;
 use crate::memory::{CeilingBreach, TenantMemoryAccountant};
 use crate::output::QueryOutput;
 use crate::parquet::{
-    self, MAX_STATEMENT_TABLE_NAMES, ParquetQueryError, ParquetResolution, ParquetSession,
-    ParquetSources,
+    self, MAX_STATEMENT_TABLE_NAMES, ParquetPin, ParquetQueryError, ParquetResolution,
+    ParquetSession, ParquetSources,
 };
 use crate::provider::RavelTableProvider;
 use crate::pushdown::extract;
@@ -189,14 +189,57 @@ struct StatementTables {
     others: BTreeSet<String>,
 }
 
+/// Refuse a statement that names a table function or a URL-shaped table, with
+/// the planning error it would meet anyway, before anything is read.
+fn refuse_unreadable_table_reference(sql: &str) -> Result<(), SqlError> {
+    match unreadable_table_reference(sql)? {
+        Some(name) => Err(SqlError::Plan(format!(
+            "{name} is not a table this session can read: table functions and URL tables \
+             are not admitted"
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// The Parquet resolve a plan starts from.
-enum ParquetPlan {
-    /// Not resolved yet: the plan resolves it itself. The Flight SQL pinned
-    /// path plans from a ticket that carries no Parquet state.
+#[derive(Debug, Clone)]
+pub enum ParquetPlan {
+    /// Not resolved yet: the plan resolves each table's newest manifest
+    /// itself. What [`SqlExecutor::plan_pinned`] does, for a caller that has
+    /// no resolution in hand.
     Unresolved,
     /// Resolved by this request's own resolve; `None` when the statement
     /// names no live Parquet table.
     Resolved(Option<ParquetResolution>),
+    /// The manifest versions a Flight ticket pinned: the plan reads exactly
+    /// these objects, never a newer version, and checks the tenant's grants as
+    /// they are now. Empty when the statement named no Parquet table.
+    Pinned(Vec<ParquetPin>),
+}
+
+/// What a two-RPC (Flight SQL) plan takes beyond the snapshot and the
+/// statement.
+#[derive(Debug, Clone)]
+pub struct PinnedPlanInputs {
+    /// The tenant's declared typed attribute columns (ADR-0090).
+    pub declared: Vec<DeclaredColumn>,
+    /// Where the statement's Parquet tables come from.
+    pub parquet: ParquetPlan,
+    /// The request's lowered budgets, which bind the plan's scans as they bind
+    /// a one-shot [`SqlExecutor::execute`]. `None` plans under the executor's
+    /// own configuration.
+    pub budgets: Option<RequestBudgets>,
+}
+
+/// What [`SqlExecutor::resolve_pinned`] produced: the snapshot to pin, the
+/// statement's cost estimate, and the Parquet tables the resolve read.
+#[derive(Debug, Clone)]
+pub struct PinnedResolve {
+    pub snapshot: Snapshot,
+    pub estimate: CostEstimate,
+    /// The live Parquet tables the statement names, resolved once here so the
+    /// plan that follows reads no manifest again; `None` when it names none.
+    pub parquet: Option<ParquetResolution>,
 }
 
 /// What one resolve produced for one statement.
@@ -1467,23 +1510,52 @@ impl SqlExecutor {
     /// `accounting` receives this resolve's store counters; the returned
     /// [`CostEstimate`] is the two-part estimate for the query this snapshot
     /// will be planned against.
+    ///
+    /// A statement over Parquet tables also resolves them here, and this call
+    /// throws that resolution away: pair it with [`Self::plan_pinned`], which
+    /// then resolves the tables again. A caller that plans the statement next
+    /// uses [`Self::resolve_pinned`] and hands the resolution on.
     pub async fn resolve_snapshot(
         &self,
         tenant_hash: TenantHash,
         req: &SqlRequest,
         accounting: &QueryAccounting,
     ) -> Result<(Snapshot, CostEstimate), SqlError> {
+        let PinnedResolve {
+            snapshot, estimate, ..
+        } = self.resolve_pinned(tenant_hash, req, accounting).await?;
+        Ok((snapshot, estimate))
+    }
+
+    /// [`Self::resolve_snapshot`] keeping the Parquet tables it resolved, so
+    /// the plan that follows ([`Self::plan_pinned_with_inputs`] with
+    /// [`ParquetPlan::Resolved`]) reads each table's manifests and the grants
+    /// record once for the whole `GetFlightInfo`, not once here and again at
+    /// plan time.
+    pub async fn resolve_pinned(
+        &self,
+        tenant_hash: TenantHash,
+        req: &SqlRequest,
+        accounting: &QueryAccounting,
+    ) -> Result<PinnedResolve, SqlError> {
         // Kept on the pooled `&QueryAccounting` signature (this is the public
         // Flight SQL `GetFlightInfo`-side resolve, and its caller has no
         // phase-split handle to hand in): `pooled_over` shares this same
         // handle's counters across all four phases, so the resolve's cost
         // still lands on `accounting` exactly as before.
         let Resolved {
-            snapshot, estimate, ..
+            snapshot,
+            estimate,
+            parquet,
+            ..
         } = self
             .resolve(tenant_hash, req, &PhaseAccounting::pooled_over(accounting))
             .await?;
-        Ok((snapshot, estimate))
+        Ok(PinnedResolve {
+            snapshot,
+            estimate,
+            parquet,
+        })
     }
 
     /// Build the fresh per-query, single-tenant session over an already
@@ -1511,6 +1583,37 @@ impl SqlExecutor {
         accounting: &QueryAccounting,
         declared: &[DeclaredColumn],
     ) -> Result<PinnedQuery, SqlError> {
+        self.plan_pinned_with_inputs(
+            tenant_hash,
+            snapshot,
+            sql,
+            accounting,
+            PinnedPlanInputs {
+                declared: declared.to_vec(),
+                parquet: ParquetPlan::Unresolved,
+                budgets: None,
+            },
+        )
+        .await
+    }
+
+    /// [`Self::plan_pinned`] with everything a two-RPC plan carries beyond the
+    /// snapshot: the Parquet tables the resolve already read (or the versions
+    /// a ticket pinned) and the request's lowered budgets.
+    ///
+    /// `GetFlightInfo` passes [`ParquetPlan::Resolved`] with what
+    /// [`Self::resolve_pinned`] returned and `DoGet` passes
+    /// [`ParquetPlan::Pinned`] with the ticket's pins; both pass the request's
+    /// budgets, so the scans are admitted against the clamped ceilings the
+    /// resolve already applied.
+    pub async fn plan_pinned_with_inputs(
+        &self,
+        tenant_hash: TenantHash,
+        snapshot: Snapshot,
+        sql: &str,
+        accounting: &QueryAccounting,
+        inputs: PinnedPlanInputs,
+    ) -> Result<PinnedQuery, SqlError> {
         let (window, now_ns) = snapshot_covering_window(&snapshot);
         // Public two-RPC Flight SQL surface: the caller holds a pooled
         // `&QueryAccounting`, so `pooled_over` bridges it to the phase-split
@@ -1522,32 +1625,32 @@ impl SqlExecutor {
             sql,
             &PhaseAccounting::pooled_over(accounting),
             PlanExtras {
-                declared: declared.to_vec(),
+                declared: inputs.declared,
                 // Explicit per-field so this compiles clean whether or not the
                 // `flight-sql` feature adds `distributed`; a `..default()` would
                 // be a needless update on the single-field local build.
                 #[cfg(feature = "flight-sql")]
                 distributed: None,
                 row_window: None,
-                budgets: None,
+                budgets: inputs.budgets,
                 column_stats_window: window,
                 column_stats_now_ns: now_ns,
-                parquet: ParquetPlan::Unresolved,
+                parquet: inputs.parquet,
             },
         )
         .await
     }
 
-    /// [`Self::plan_pinned`] with a coordinator-side distributed scan installed
-    /// on the metrics provider for THIS query only (ADR-0071).
+    /// [`Self::plan_pinned_with_inputs`] with a coordinator-side distributed
+    /// scan installed on the metrics provider for THIS query only (ADR-0071).
     ///
     /// `distributed`, when `Some`, carries the minted worker slices and the
     /// production [`WorkerSliceClient`](crate::distributed::WorkerSliceClient)
     /// the provider fans the samples scan out over. `None` is byte-identical to
-    /// [`Self::plan_pinned`]. The distribution decision itself is made by the
-    /// caller ([`Self::plan_distributed_slices_for`]); this method only installs
-    /// an already-made decision, so the local and distributed plans share this
-    /// one construction path and cannot drift.
+    /// [`Self::plan_pinned_with_inputs`]. The distribution decision itself is
+    /// made by the caller ([`Self::plan_distributed_slices_for`]); this method
+    /// only installs an already-made decision, so the local and distributed
+    /// plans share this one construction path and cannot drift.
     #[cfg(feature = "flight-sql")]
     pub async fn plan_pinned_distributed(
         &self,
@@ -1556,7 +1659,7 @@ impl SqlExecutor {
         sql: &str,
         accounting: &QueryAccounting,
         distributed: Option<DistributedScan>,
-        declared: &[DeclaredColumn],
+        inputs: PinnedPlanInputs,
     ) -> Result<PinnedQuery, SqlError> {
         let (window, now_ns) = snapshot_covering_window(&snapshot);
         self.plan_pinned_with(
@@ -1565,19 +1668,19 @@ impl SqlExecutor {
             sql,
             &PhaseAccounting::pooled_over(accounting),
             PlanExtras {
-                declared: declared.to_vec(),
+                declared: inputs.declared,
                 distributed,
                 row_window: None,
-                budgets: None,
+                budgets: inputs.budgets,
                 column_stats_window: window,
                 column_stats_now_ns: now_ns,
-                parquet: ParquetPlan::Unresolved,
+                parquet: inputs.parquet,
             },
         )
         .await
     }
 
-    /// The one body behind [`Self::plan_pinned`] and
+    /// The one body behind [`Self::plan_pinned_with_inputs`] and
     /// [`Self::plan_pinned_distributed`]. `extras` carries the optional
     /// coordinator-side distributed scan; with the `flight-sql` feature off it
     /// is a zero-field struct and the metrics provider is always the local one.
@@ -1619,12 +1722,16 @@ impl SqlExecutor {
         // once. The build happens only when a consumer will read it.
         //
         // ADR-2040: a statement over Parquet tables resolves them here unless
-        // its request's resolve already did (the Flight SQL pinned path plans
-        // from a ticket that carries none), and builds each table's provider
-        // before classification, which plans against their schemas.
+        // its request's resolve already did, or a Flight ticket pinned their
+        // manifest versions, and builds each table's provider before
+        // classification, which plans against their schemas.
         let tables = Self::statement_tables(sql)?;
         let parquet = match extras.parquet {
             ParquetPlan::Resolved(resolution) => resolution,
+            ParquetPlan::Pinned(pins) => {
+                self.resolve_pinned_parquet(tenant_hash, sql, &pins, phase_accounting)
+                    .await?
+            }
             ParquetPlan::Unresolved => {
                 self.resolve_parquet_target(
                     tenant_hash,
@@ -2251,12 +2358,7 @@ impl SqlExecutor {
         row_window: bool,
         phase_accounting: &PhaseAccounting,
     ) -> Result<Option<ParquetResolution>, SqlError> {
-        if let Some(name) = unreadable_table_reference(sql)? {
-            return Err(SqlError::Plan(format!(
-                "{name} is not a table this session can read: table functions and URL tables \
-                 are not admitted"
-            )));
-        }
+        refuse_unreadable_table_reference(sql)?;
         let Some(sources) = &self.parquet else {
             return Ok(None);
         };
@@ -2280,6 +2382,46 @@ impl SqlExecutor {
             };
         }
         Ok(parquet::resolve_tables(sources, &tenant_hash, &tables.others, accounting).await?)
+    }
+
+    /// The Parquet tables a Flight ticket pinned, read at exactly those
+    /// manifest versions (ADR-2040 D1, D3).
+    ///
+    /// The statement gets the same table-function and URL-table refusal
+    /// [`Self::resolve_parquet_target`] gives it. Then each pin is read by its
+    /// version, a GET with no LIST, and every file is checked against the
+    /// grants that exist now, so a grant removed since `GetFlightInfo` fails
+    /// here with [`ParquetQueryError::LocationNotGranted`]. No pins is `None`:
+    /// the statement named no live Parquet table when it was planned, and no
+    /// newest manifest stands in for one.
+    ///
+    /// Every read here is charged to the Resolve phase.
+    async fn resolve_pinned_parquet(
+        &self,
+        tenant_hash: TenantHash,
+        sql: &str,
+        pins: &[ParquetPin],
+        phase_accounting: &PhaseAccounting,
+    ) -> Result<Option<ParquetResolution>, SqlError> {
+        refuse_unreadable_table_reference(sql)?;
+        if pins.is_empty() {
+            return Ok(None);
+        }
+        let Some(sources) = &self.parquet else {
+            return Err(ParquetQueryError::NotConfigured {
+                table: pins[0].table.clone(),
+            }
+            .into());
+        };
+        Ok(Some(
+            parquet::resolve_pinned_tables(
+                sources,
+                &tenant_hash,
+                pins,
+                phase_accounting.resolve(),
+            )
+            .await?,
+        ))
     }
 
     /// This query's [`QueryIoShape`] (issue #1214), mirroring

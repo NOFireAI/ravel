@@ -462,11 +462,38 @@ impl fmt::Debug for ParquetSources {
     }
 }
 
-/// The newest live manifest of each Parquet table a statement names, every
-/// file of which lay inside one of the tenant's grants when it was resolved.
+/// The live manifest of each Parquet table a statement names, every file of
+/// which lay inside one of the tenant's grants when it was resolved. The
+/// manifests are the newest ones when the statement resolved them
+/// ([`resolve_tables`]) and the pinned ones when a Flight ticket redeemed them
+/// ([`resolve_pinned_tables`]).
 #[derive(Debug, Clone)]
-pub(crate) struct ParquetResolution {
+pub struct ParquetResolution {
     pub(crate) manifests: Vec<Manifest>,
+}
+
+impl ParquetResolution {
+    /// The table name and manifest version of each resolved table: what a
+    /// Flight ticket pins so that `DoGet` reads these manifest objects and no
+    /// newer ones.
+    pub fn pins(&self) -> Vec<ParquetPin> {
+        self.manifests
+            .iter()
+            .map(|manifest| ParquetPin {
+                table: manifest.table.clone(),
+                version: manifest.version,
+            })
+            .collect()
+    }
+}
+
+/// One Parquet table a Flight ticket pins: the table's name and the version of
+/// the immutable manifest object (`ravel-pqtable`'s `v/<version>` key) that
+/// `GetFlightInfo` resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParquetPin {
+    pub table: String,
+    pub version: u64,
 }
 
 /// The tables of one Parquet session, and the store its registry answers with.
@@ -524,6 +551,12 @@ pub enum ParquetQueryError {
          filter on the table's own columns instead"
     )]
     RowWindowUnsupported,
+    /// A Flight ticket pins a manifest version of the table that is no longer
+    /// there, or is a drop. Reported to the client as
+    /// [`crate::SqlError::SnapshotInvalidated`]: the pinned state is gone and
+    /// no other version may stand in for it.
+    #[error("the pinned manifest version {version} of Parquet table {table} is gone")]
+    PinnedManifestGone { table: String, version: u64 },
 }
 
 impl ParquetQueryError {
@@ -554,9 +587,9 @@ impl ParquetQueryError {
                     | ParquetReadError::BytesBudgetExceeded { .. } => ErrorClass::Unsupported,
                 }
             }
-            ParquetQueryError::Resolve { .. } | ParquetQueryError::Grants(_) => {
-                ErrorClass::Unavailable
-            }
+            ParquetQueryError::Resolve { .. }
+            | ParquetQueryError::Grants(_)
+            | ParquetQueryError::PinnedManifestGone { .. } => ErrorClass::Unavailable,
             ParquetQueryError::NotConfigured { .. }
             | ParquetQueryError::LocationNotGranted { .. }
             | ParquetQueryError::Store { .. }
@@ -616,6 +649,7 @@ impl ParquetQueryError {
                 ..
             }
             | ParquetQueryError::Grants(GrantsError::Store { .. }) => MSG_UNAVAILABLE.to_string(),
+            ParquetQueryError::PinnedManifestGone { .. } => MSG_UNAVAILABLE.to_string(),
             ParquetQueryError::Resolve { .. } | ParquetQueryError::Grants(_) => {
                 MSG_CORRUPT.to_string()
             }
@@ -712,7 +746,49 @@ pub(crate) async fn resolve_tables(
     if manifests.is_empty() {
         return Ok(None);
     }
-    let granted = grants::list(&store, tenant)
+    Ok(Some(granted_resolution(&store, tenant, manifests).await?))
+}
+
+/// The manifests a Flight ticket pinned, read by their exact version (one GET
+/// each, no LIST) and checked against the tenant's grants as they are now.
+///
+/// A pinned version that is gone, or that is a drop, is
+/// [`ParquetQueryError::PinnedManifestGone`]: the newest version never stands
+/// in for it. The caller has checked that `pins` is not empty.
+pub(crate) async fn resolve_pinned_tables(
+    sources: &ParquetSources,
+    tenant: &TenantHash,
+    pins: &[ParquetPin],
+    accounting: &QueryAccounting,
+) -> Result<ParquetResolution, ParquetQueryError> {
+    let store = sources.resolve_store(accounting);
+    let mut manifests = Vec::with_capacity(pins.len());
+    for pin in pins {
+        let gone = || ParquetQueryError::PinnedManifestGone {
+            table: pin.table.clone(),
+            version: pin.version,
+        };
+        let manifest = resolve::read_version(&store, tenant, &pin.table, pin.version)
+            .await
+            .map_err(|source| ParquetQueryError::Resolve {
+                table: pin.table.clone(),
+                source,
+            })?
+            .filter(Manifest::is_live)
+            .ok_or_else(gone)?;
+        manifests.push(manifest);
+    }
+    granted_resolution(&store, tenant, manifests).await
+}
+
+/// `manifests` as a [`ParquetResolution`], once every file of each lies inside
+/// a grant the tenant holds now, under the profile the file is read through.
+async fn granted_resolution(
+    store: &ResolveStore,
+    tenant: &TenantHash,
+    manifests: Vec<Manifest>,
+) -> Result<ParquetResolution, ParquetQueryError> {
+    let granted = grants::list(store, tenant)
         .await
         .map_err(ParquetQueryError::Grants)?;
     for manifest in &manifests {
@@ -727,7 +803,7 @@ pub(crate) async fn resolve_tables(
             });
         }
     }
-    Ok(Some(ParquetResolution { manifests }))
+    Ok(ParquetResolution { manifests })
 }
 
 /// Build one provider per resolved table, reading each table's first footer

@@ -141,8 +141,9 @@ pub use error::{
     MSG_SPILL_QUOTA_MARKER, MSG_SPILL_UNAVAILABLE, MSG_UNAVAILABLE, MSG_UNSATISFIABLE, SqlError,
 };
 pub use executor::{
-    ExplainReport, HISTOGRAM_EXCLUDED_WARNING, LiveAccounting, PinnedQuery, PinnedStream,
-    ScanTiming, SegmentTiming, SqlExecutor, SqlOutcome, SqlRequest, SqlStats, TargetSignal,
+    ExplainReport, HISTOGRAM_EXCLUDED_WARNING, LiveAccounting, ParquetPlan, PinnedPlanInputs,
+    PinnedQuery, PinnedResolve, PinnedStream, ScanTiming, SegmentTiming, SqlExecutor, SqlOutcome,
+    SqlRequest, SqlStats, TargetSignal,
 };
 #[cfg(feature = "flight-sql")]
 pub use flight::{
@@ -176,8 +177,8 @@ pub use page_plan::{
 };
 pub use parquet::{
     DEFAULT_PARQUET_METADATA_CACHE_BYTES, ExternalStoreError, ExternalStoreMap, ExternalStores,
-    MAX_STATEMENT_TABLE_NAMES, ParquetQueryError, ParquetSession, ParquetSources, ProfileStores,
-    RavelBucket,
+    MAX_STATEMENT_TABLE_NAMES, ParquetPin, ParquetQueryError, ParquetResolution, ParquetSession,
+    ParquetSources, ProfileStores, RavelBucket,
 };
 pub use provider::RavelTableProvider;
 pub use pushdown::Pushdown;
