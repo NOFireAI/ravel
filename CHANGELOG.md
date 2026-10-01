@@ -2073,16 +2073,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   manifest existence check, before any grant is read, any store opened,
   or any object probed or snapshotted. `SqlExecutor::execute_ddl` then
   resolves the caller's tenant grant for the location, refuses a
-  location inside Ravel's own bucket, probes the named Parquet file's
-  preconditions, snapshots it, and commits the manifest through
-  `ravel_pqtable::writer` under the calling tenant; `CREATE EXTERNAL
-  TABLE IF NOT EXISTS` on a live table and `DROP TABLE IF EXISTS` on a
-  missing one are no-ops, and the non-`IF` forms return
-  `TableExists`/`TableNotFound`. The whole statement, from grant
-  resolution through the manifest write, is bound by a caller-supplied
-  deadline (`DdlExecuteError::Deadline`), independent of the snapshot
-  step's own inner deadline. `redact` renders all three admitted forms
-  for logging instead of rejecting them. This is the SQL core only: no
+  location inside Ravel's own bucket, probes the preconditions of the
+  location's first non-empty `.parquet` object (a directory `LOCATION`)
+  or of the named object itself (a `LOCATION` with no trailing slash),
+  snapshots it, and commits the manifest through `ravel_pqtable::writer`
+  under the calling tenant; `CREATE EXTERNAL TABLE IF NOT EXISTS` on a
+  live table and `DROP TABLE IF EXISTS` on a missing one are no-ops,
+  and the non-`IF` forms return `TableExists`/`TableNotFound`. A
+  `ravel.cast.<column>` option naming a column absent from the
+  snapshotted schema is refused (`UnknownCastColumn`) before the
+  manifest write, so a bad cast never produces a live table version.
+  The whole statement, from grant resolution through the manifest
+  write, is bound by a caller-supplied deadline
+  (`DdlExecuteError::Deadline`); a write already in flight when the
+  deadline fires is not rolled back, so a manifest that lands just
+  before the deadline can still surface as a `Deadline` error to the
+  caller that issued it. `redact` renders all three admitted forms for
+  logging instead of rejecting them. This is the SQL core only: no
   HTTP route, capability check or audit write yet exists for it (next
   task).
 
