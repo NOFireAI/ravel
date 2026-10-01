@@ -46,7 +46,6 @@ use ravel_object_store::{ObjectStoreBackend, PageToken, StoreError};
 use ravel_parquet::snapshot::{
     GrantedLocation, LocationSnapshot, SnapshotError, snapshot_location,
 };
-use ravel_pqtable::clock::FixedClock;
 use ravel_pqtable::grants::{self, Grant, GrantsError, KeyPrefix};
 use ravel_pqtable::writer::{self, WriteError};
 use ravel_query::PhaseAccounting;
@@ -268,9 +267,10 @@ impl SqlExecutor {
     /// this method performs no authorization of its own, the same contract
     /// [`SqlExecutor::execute`] and [`SqlExecutor::execute_accounted`] have
     /// for read access. `created_by` is recorded on the manifest verbatim
-    /// (the caller's identity, however the caller names it); `now_ns` is the
-    /// commit timestamp, read by the caller so this method stays a pure
-    /// function of its inputs; `deadline` bounds the wall time of the
+    /// (the caller's identity, however the caller names it); the manifest's
+    /// own commit timestamp comes from this executor's injected
+    /// `ravel_pqtable::clock::Clock` ([`SqlExecutor::with_clock`]), not from
+    /// a caller-supplied value. `deadline` bounds the wall time of the
     /// snapshot read and the manifest write, the same role it plays for
     /// [`SqlExecutor::execute_accounted`].
     ///
@@ -282,7 +282,6 @@ impl SqlExecutor {
         tenant: TenantHash,
         statement: &str,
         created_by: &str,
-        now_ns: i64,
         deadline: Duration,
     ) -> Result<DdlOutcome, DdlExecuteError> {
         let intent = validate_ddl(statement)?;
@@ -290,7 +289,7 @@ impl SqlExecutor {
             .parquet_sources()
             .ok_or(DdlExecuteError::NotConfigured)?;
         let ravel_store = parquet.ravel_store().as_ref();
-        let clock = FixedClock::new(now_ns);
+        let clock = self.clock().as_ref();
 
         match intent {
             DdlIntent::CreateExternal {
@@ -391,7 +390,7 @@ impl SqlExecutor {
                     &tenant,
                     &name,
                     write_intent,
-                    &clock,
+                    clock,
                     DEFAULT_MIN_GRACE_MS,
                 )
                 .await?;
@@ -418,7 +417,7 @@ impl SqlExecutor {
                     &tenant,
                     &name,
                     write_intent,
-                    &clock,
+                    clock,
                     DEFAULT_MIN_GRACE_MS,
                 )
                 .await?;
