@@ -931,12 +931,16 @@ unstated for `CREATE`.
     memory budget before each is issued, the same reservation a query's
     Parquet reads make (ADR-1170 decision 2), and a refusal fails the
     `CREATE` with the same typed memory error. `ravel-parquet::snapshot`
-    does not reserve today; #2283 adds it before #2054 wires `CREATE` to
-    it.
+    reserves them today (#2283), including the long footer's
+    concatenation buffer, a third copy of the same bytes that needs its
+    own reservation alongside the two GETs that fill it.
   - A `CREATE` is not held to the per-query `max_s3_requests` or byte
     budgets. Those size a read of committed data. A `CREATE` makes one
     listing pass, bounded by the 100,000-page list ceiling
     (`ravel_object_store::MAX_LIST_PAGES`) and the SQL deadline, not by
     the file cap, since keys that are not `.parquet` files are counted and
-    skipped; and one to three footer GETs per file, which the file cap
-    bounds. It is admitted only with the `ddl` capability.
+    skipped; and, per file, one or two footer GETs on a store that
+    supports a suffix range, up to three on one that does not (Azure):
+    there, the first read is placed from the listing's reported size
+    instead, and a stale size costs one retry. The file cap bounds all of
+    these. It is admitted only with the `ddl` capability.
