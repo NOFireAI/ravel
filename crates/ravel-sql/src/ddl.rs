@@ -34,8 +34,13 @@
 //!
 //! A `CREATE` is not checked against `max_s3_requests` or any byte budget:
 //! grants-and-DDL work is outside query-cost accounting (ADR-2040
-//! grants-and-DDL-cost amendment, 2026-10-01). `deadline` still bounds the
-//! wall time of the snapshot read and the manifest write.
+//! grants-and-DDL-cost amendment, 2026-10-01). `deadline` bounds the wall
+//! time of the whole statement -- the grants read, both qualification
+//! probes, the snapshot read, and the manifest write, not only the snapshot
+//! step within it ([`DdlExecuteError::Deadline`] on expiry). The snapshot
+//! step keeps its own inner `deadline` as well, so a snapshot that alone
+//! would run past it is reported as [`DdlExecuteError::Snapshot`] before the
+//! outer timeout ever fires.
 
 use std::time::Duration;
 
@@ -194,6 +199,15 @@ pub enum DdlExecuteError {
     /// EXISTS` on a table that is not there (404-class).
     #[error(transparent)]
     Write(#[from] WriteError),
+
+    /// The whole statement -- the grants read, both qualification probes,
+    /// the snapshot read, and the manifest write -- did not complete within
+    /// `deadline`. A write already in flight when this fires is not rolled
+    /// back: `deadline` bounds how long this call waits for the outcome, not
+    /// whether `ravel_pqtable::writer::apply`'s own put reaches the store.
+    /// 504-class.
+    #[error("the statement did not complete within its deadline of {deadline:?}")]
+    Deadline { deadline: Duration },
 }
 
 /// What [`one_object_under`] found under a resolved `LOCATION`.
@@ -270,14 +284,38 @@ impl SqlExecutor {
     /// (the caller's identity, however the caller names it); the manifest's
     /// own commit timestamp comes from this executor's injected
     /// `ravel_pqtable::clock::Clock` ([`SqlExecutor::with_clock`]), not from
-    /// a caller-supplied value. `deadline` bounds the wall time of the
-    /// snapshot read and the manifest write, the same role it plays for
-    /// [`SqlExecutor::execute_accounted`].
+    /// a caller-supplied value. `deadline` bounds the wall time of the whole
+    /// statement -- from the grants read through the manifest write, not
+    /// only the snapshot step within it -- the same role it plays for
+    /// [`SqlExecutor::execute_accounted`]; past it this call returns
+    /// [`DdlExecuteError::Deadline`].
     ///
     /// A `CREATE` is not checked against `max_s3_requests` or any byte
     /// budget: grants-and-DDL work is outside query-cost accounting
     /// (ADR-2040 grants-and-DDL-cost amendment, 2026-10-01).
     pub async fn execute_ddl(
+        &self,
+        tenant: TenantHash,
+        statement: &str,
+        created_by: &str,
+        deadline: Duration,
+    ) -> Result<DdlOutcome, DdlExecuteError> {
+        match tokio::time::timeout(
+            deadline,
+            self.execute_ddl_within_deadline(tenant, statement, created_by, deadline),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_elapsed) => Err(DdlExecuteError::Deadline { deadline }),
+        }
+    }
+
+    /// The body of [`Self::execute_ddl`], run under its caller's
+    /// `tokio::time::timeout`. `deadline` is threaded through unchanged to
+    /// [`snapshot_location`]'s own inner bound; see [`Self::execute_ddl`]'s
+    /// doc comment for how the two compose.
+    async fn execute_ddl_within_deadline(
         &self,
         tenant: TenantHash,
         statement: &str,

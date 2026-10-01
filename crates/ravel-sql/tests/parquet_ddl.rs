@@ -705,3 +705,133 @@ async fn exhausted_resolve_to_put_budget_forces_a_second_resolve() {
         "a budget exhausted between the first resolve and the put must force exactly one re-resolve"
     );
 }
+
+/// A store double whose `get` never returns, standing in for a grants read
+/// that stalls. Every other method delegates to `inner` unchanged. None of
+/// `ravel_object_store::fault`'s `ScriptedFault` variants fit this: every one
+/// of them (including `ScriptedFault::Timeout`) resolves immediately with a
+/// simulated error, so none can stall a caller's own `tokio::time::timeout`
+/// race the way an actual stuck call would.
+struct StallingStore {
+    inner: Arc<dyn ObjectStoreBackend>,
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreBackend for StallingStore {
+    async fn put(
+        &self,
+        key: &str,
+        data: Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        self.inner.put(key, data, opts).await
+    }
+
+    async fn get(&self, _key: &str, _range: GetRange) -> Result<GetOutcome, StoreError> {
+        std::future::pending().await
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.inner.head(key).await
+    }
+
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.inner.list(prefix, page).await
+    }
+
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+}
+
+/// Required regression test for the whole-statement deadline fix (issue
+/// #2054, blocking finding 2). Before this fix, only `snapshot_location`'s
+/// own call was bounded by `deadline`; the grants read ahead of it
+/// ([`grants::list`], a plain `store.get`) had no bound at all, so a grants
+/// read that never returned would hang `execute_ddl` forever regardless of
+/// the caller's `deadline`. [`StallingStore`] makes that read never return;
+/// with the fix, `execute_ddl`'s own `tokio::time::timeout(deadline, ...)`
+/// now wraps the grants read too, so this fails with
+/// `DdlExecuteError::Deadline` instead of hanging, and no manifest is ever
+/// written.
+#[tokio::test]
+async fn whole_statement_deadline_expires_during_the_grants_read_and_writes_no_manifest() {
+    let t = tenant("acme");
+    let ravel_inner = Arc::new(MemoryStore::new());
+    grants::add(
+        ravel_inner.as_ref(),
+        &t,
+        PROFILE,
+        GRANT,
+        CREATED_BY,
+        &FixedClock::new(NOW),
+    )
+    .await
+    .expect("grant");
+
+    let stalling: Arc<dyn ObjectStoreBackend> = Arc::new(StallingStore {
+        inner: ravel_inner.clone() as Arc<dyn ObjectStoreBackend>,
+    });
+
+    let lake: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    lake.put(
+        "t/hits/0.parquet",
+        parquet_bytes(&[1], &["a"], &[0.5]),
+        PutOptions::default(),
+    )
+    .await
+    .expect("put");
+
+    let catalog = Arc::new(
+        Catalog::new(Arc::clone(&stalling), CatalogConfig::default()).expect("catalog"),
+    );
+    let external = Arc::new(ExternalStoreMap::new(HashMap::from([(
+        PROFILE.to_string(),
+        Arc::clone(&lake),
+    )]))) as Arc<dyn ravel_sql::ExternalStores>;
+    let sources = ParquetSources::new(
+        Arc::clone(&stalling),
+        Some(external),
+        Arc::new(GetLimiter::new(8).expect("limiter")),
+        None,
+        DEFAULT_PARQUET_METADATA_CACHE_BYTES,
+    );
+    let executor = SqlExecutor::new(
+        catalog,
+        SegmentFetcher::new(Arc::clone(&stalling)),
+        LogSegmentFetcher::new(Arc::clone(&stalling)),
+        SpanSegmentFetcher::new(Arc::clone(&stalling)),
+        SqlConfig::default(),
+        1 << 30,
+    )
+    .with_parquet_sources(sources)
+    .with_process_memory_budget(Arc::new(MemoryBudget::unlimited()));
+
+    let short_deadline = Duration::from_millis(20);
+    let sql = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
+    let err = executor
+        .execute_ddl(t, &sql, CREATED_BY, short_deadline)
+        .await
+        .expect_err("a grants read that never returns must fail with the statement deadline");
+
+    assert!(
+        matches!(err, DdlExecuteError::Deadline { deadline } if deadline == short_deadline),
+        "{err:?}"
+    );
+
+    let tables = ravel_pqtable::resolve::tables(ravel_inner.as_ref(), &t)
+        .await
+        .expect("tables");
+    assert!(
+        tables.is_empty(),
+        "no manifest may be written when the grants read never completed"
+    );
+}
