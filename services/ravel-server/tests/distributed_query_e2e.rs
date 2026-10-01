@@ -18,10 +18,11 @@
 //!    fan-out is silently skipped; the `data` equality is what flips if the
 //!    distributed path diverges from local.
 //!
-//! 2. `fragment_surface_requires_token_and_flag`: the internal `SeriesFetch`
-//!    gRPC surface rejects a missing or wrong bearer token with
-//!    `Unauthenticated`, accepts the configured cluster token, and is absent
-//!    entirely (`Unimplemented`) on a process started without
+//! 2. `fragment_surface_requires_capability_and_flag`: the internal
+//!    `SeriesFetch` gRPC surface refuses a `Pinned` fetch whose fragment
+//!    capability is missing or does not verify, counts each refusal under its
+//!    reason on `/metrics`, accepts a capability minted under the cluster key,
+//!    and is absent entirely (`Unimplemented`) on a process started without
 //!    `--distributed-query`.
 //!
 //! 3. `fragment_admits_while_client_cap_saturated_no_deadlock`: with the
@@ -453,19 +454,25 @@ async fn distributed_query_http_equals_local_http() {
 
     // Every ravel_distrib_ series carries only the allowlisted {mode} label
     // (plus {le} on histogram buckets, and {class} on the fragment admission
-    // series split into Pinned/Resolve classes by ADR-0071, issue #1722):
+    // series split into Pinned/Resolve classes by ADR-0071, issue #1722, and
+    // {reason} on the capability reject counter alone, issue #2314):
     // ADR-0044 forbids per-shard, per-worker, or per-tenant labels on this
     // family.
     for line in metrics.lines() {
         if !line.starts_with("ravel_distrib_") {
             continue;
         }
+        let capability_reject =
+            line.starts_with("ravel_distrib_fragment_capability_rejects_total{");
         if let Some((_, rest)) = line.split_once('{') {
             let labels = rest.split_once('}').map(|(l, _)| l).unwrap_or("");
             for pair in labels.split(',').filter(|p| !p.is_empty()) {
                 let key = pair.split('=').next().unwrap_or(pair);
                 assert!(
-                    key == "mode" || key == "le" || key == "class",
+                    key == "mode"
+                        || key == "le"
+                        || key == "class"
+                        || (capability_reject && key == "reason"),
                     "disallowed label `{key}` on a ravel_distrib series: {line}"
                 );
             }
@@ -562,6 +569,26 @@ async fn fragment_surface_requires_capability_and_flag() {
         ok.is_ok(),
         "a valid capability under the cluster key must be accepted, got: {:?}",
         ok.err()
+    );
+
+    // `/metrics` reads the counters the fragment service recorded into: one
+    // `missing` and one `bad_mac` reject, every other reason at zero (issue
+    // #2314).
+    let metrics = scrape_metrics(&format!("http://{}", distributed.http_addr)).await;
+    let rejects: Vec<&str> = metrics
+        .lines()
+        .filter(|l| l.starts_with("ravel_distrib_fragment_capability_rejects_total{"))
+        .collect();
+    assert_eq!(
+        rejects,
+        vec![
+            "ravel_distrib_fragment_capability_rejects_total{mode=\"all\",reason=\"missing\"} 1",
+            "ravel_distrib_fragment_capability_rejects_total{mode=\"all\",reason=\"bad_mac\"} 1",
+            "ravel_distrib_fragment_capability_rejects_total{mode=\"all\",reason=\"expired\"} 0",
+            "ravel_distrib_fragment_capability_rejects_total{mode=\"all\",reason=\"tenant_mismatch\"} 0",
+            "ravel_distrib_fragment_capability_rejects_total{mode=\"all\",reason=\"query_mismatch\"} 0",
+        ],
+        "each refused capability must reach /metrics under its own reason:\n{metrics}"
     );
 
     // Server B: no --distributed-query, so the service is not registered at all.
