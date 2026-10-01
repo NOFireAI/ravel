@@ -543,29 +543,47 @@ pub fn validate_ddl(sql: &str) -> Result<DdlIntent, DdlValidationError> {
 pub(crate) fn create_external_intent(
     create: &CreateExternalTable,
 ) -> Result<DdlIntent, DdlValidationError> {
-    if create.temporary {
+    // Every field named, no `..`: a field a future datafusion-sql adds to
+    // this struct must fail this match until it is given an admitted-or-
+    // refused decision here, rather than silently riding along unexamined.
+    let CreateExternalTable {
+        name,
+        columns,
+        file_type,
+        location,
+        table_partition_cols,
+        order_exprs,
+        if_not_exists,
+        or_replace,
+        temporary,
+        unbounded,
+        options: raw_options,
+        constraints,
+    } = create;
+
+    if *temporary {
         return Err(DdlValidationError::Temporary);
     }
-    if create.unbounded {
+    if *unbounded {
         return Err(DdlValidationError::Unbounded);
     }
-    if !create.table_partition_cols.is_empty() {
+    if !table_partition_cols.is_empty() {
         return Err(DdlValidationError::PartitionedBy);
     }
-    if !create.order_exprs.is_empty() {
+    if !order_exprs.is_empty() {
         return Err(DdlValidationError::WithOrder);
     }
-    if !create.columns.is_empty() || !create.constraints.is_empty() {
+    if !columns.is_empty() || !constraints.is_empty() {
         return Err(DdlValidationError::ColumnList);
     }
-    if create.file_type != "PARQUET" {
+    if file_type != "PARQUET" {
         return Err(DdlValidationError::NotParquet {
-            file_type: create.file_type.clone(),
+            file_type: file_type.clone(),
         });
     }
 
     let mut options = BTreeMap::new();
-    for (key, value) in &create.options {
+    for (key, value) in raw_options {
         if !is_admitted_option_key(key) {
             return Err(DdlValidationError::UnsupportedOption { key: key.clone() });
         }
@@ -586,16 +604,16 @@ pub(crate) fn create_external_intent(
     // Syntax only: whether `location` lies inside a grant is execute_ddl's
     // job (D2), which is the only caller that has a tenant's grants to check
     // it against.
-    grants::parse_location(&create.location)?;
+    grants::parse_location(location)?;
 
-    let name = create.name.to_string();
+    let name = name.to_string();
     names::validate_table(&name)?;
 
     Ok(DdlIntent::CreateExternal {
         name,
-        if_not_exists: create.if_not_exists,
-        or_replace: create.or_replace,
-        location: create.location.clone(),
+        if_not_exists: *if_not_exists,
+        or_replace: *or_replace,
+        location: location.clone(),
         options,
     })
 }
