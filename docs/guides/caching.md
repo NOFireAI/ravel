@@ -277,9 +277,16 @@ below can be computed per cache or summed across both:
   than its access pattern would suggest and nothing else. A read whose peek
   missed while a fetch for the same range was in flight, and that reached the
   single flight only after that fetch finished, is served from the RAM tier
-  with nothing recorded beyond its peek's miss: no hit, no `bytes_served`, no
-  `bytes_admitted` and no single-flight collapse; a Parquet read counts it in
-  its query accounting as a cache miss with zero GETs.
+  with nothing recorded beyond its peek's misses, a RAM miss plus a disk miss
+  when a disk tier is configured: no hit, no `bytes_served` and no
+  `bytes_admitted`. When two such reads arrive together, one leads the RAM
+  recheck and the other follows it and records a single-flight collapse. This
+  holds with a RAM tier only as well. One exception on the tier metrics: a
+  log read peeks every block of a coalesced run other than the first a second
+  time just before fetching it, so such a block records a second RAM miss
+  (and disk miss), or, when that second peek finds it, a hit and its
+  `bytes_served`. A Parquet read or a log read counts a late serve in its
+  query accounting as one cache miss with zero GETs and zero fetched bytes.
 
 With both caches off (`--disable-cache`), none of these samples appear on
 `/metrics` at all: neither `cache="fetch"` nor `cache="catalog"`. A fetcher

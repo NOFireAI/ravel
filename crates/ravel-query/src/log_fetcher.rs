@@ -4365,8 +4365,11 @@ impl BlockRangeFetcher {
         let cache_key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, start, len);
         // One read-through call, accounted from the returned [`Source`]: a single
         // call avoids the peek-then-`get_or_fetch` double-count on the tiered
-        // tier (see [`ReadCache::get_or_fetch`]). The returned flag is `live`
-        // (this call crossed the network), which is [`Source::Upstream`].
+        // tier (see [`ReadCache::get_or_fetch`]). The returned flag is `live`,
+        // which is [`Source::Upstream`]: this call's flight fetched, or it rode
+        // another caller's flight. On the RAM-only cache it is also true for a
+        // leader the RAM recheck served, which made no GET, so `live_gets` and
+        // `live_bytes` overstate wire bytes there.
         let (bytes, source) = cache
             .get_or_fetch(cache_key, || async move {
                 let got = self
@@ -6333,19 +6336,21 @@ impl BlockRangeFetcher {
             lead.abs_start,
             lead.len,
         );
-        // Set by our own closure, so `Some` after the await means this call led
-        // the fetch and already holds every block of the run; `None` means it
-        // followed another caller's in-flight GET.
+        // Set by our own closure, so `Some` after the await means this call's
+        // own GET fetched the run and it already holds every block; `None`
+        // means the closure never ran: this call followed another caller's
+        // in-flight GET, or it led the flight and the leader's RAM recheck
+        // served the lead block from a flight that finished after the peek.
         let led: std::sync::OnceLock<(Vec<(u64, Bytes)>, u64)> = std::sync::OnceLock::new();
         // `fetch_peeked`, not `get_or_fetch`: fetch_blocks already peeked every
         // block of this run with `cache.get` (the one accounted miss), so a
         // second read-through here would re-peek and double-count the miss on
-        // the tiered tier. The RAM tier's `fetch_peeked` is its miss-only
-        // `get_or_fetch` and keeps single-flight (concurrent partitions collapse
-        // onto one leader); the tiered tier runs the fetch and `insert`s with no
-        // second miss. Either way `led` is set inside the closure iff THIS call
-        // ran it, so `led.get().is_some()` still distinguishes leader from
-        // follower.
+        // the tiered tier. Both tiers' `fetch_peeked` keep single-flight
+        // (concurrent partitions collapse onto one leader), and both leaders
+        // recheck RAM, uncounted, before running the closure. `led` is set
+        // inside the closure iff THIS call ran it, so `led.get().is_some()`
+        // says whether this call's own GET produced the run, not whether it
+        // led the flight.
         let lead_bytes = cache
             .fetch_peeked(lead_key, || async {
                 let got = self
@@ -6395,23 +6400,24 @@ impl BlockRangeFetcher {
         let mut out = Vec::with_capacity(blocks.len());
         out.push((lead.abs_start, lead_bytes));
         let mut outcome = RunOutcome::default();
+        // Every block of the run already recorded its one query-accounting
+        // outcome, a miss, when `fetch_blocks` peeked it. Served from the cache
+        // now, it stays a miss with no GET (docs/guides/caching.md); only a
+        // block this call's own GET fetches adds a request.
         for ext in blocks.iter().skip(1) {
             let block_key =
                 CacheKey::new(tenant_hash.0, seg_ref.content_hash, ext.abs_start, ext.len);
             if let Some(bytes) = cache.get(&block_key).await {
                 verify_block_crc(key, &bytes, ext)?;
-                accounting.record_cache_hit();
-                accounting.add_cache_bytes(bytes.len() as u64);
                 outcome.cache_hits += 1;
                 out.push((ext.abs_start, bytes));
                 continue;
             }
-            accounting.record_cache_miss();
             // `fetch_peeked` for the same reason as the lead above: this block
             // was just peeked with `cache.get`, so the deferred fetch must not
             // re-count the miss on the tiered tier. Bytes this call's closure
-            // did not produce (another caller's flight, or the tiered leader's
-            // RAM recheck) are verified after it returns.
+            // did not produce (another caller's flight, or a leader's RAM
+            // recheck) are verified after it returns.
             let fetched_here = std::sync::atomic::AtomicBool::new(false);
             let bytes = cache
                 .fetch_peeked(block_key, || async {
@@ -6486,8 +6492,10 @@ impl BlockRangeFetcher {
 /// A single-flight follower that rode another caller's GET reports zero gets and
 /// zero bytes here, unlike [`BlockRangeFetcher::cached_extent`] and the
 /// whole-object funnels, which attribute one request to a follower because they
-/// cannot tell one from a leader. This path can: the leader is whichever call
-/// ran the closure. Reporting what actually crossed the network is strictly
+/// cannot tell one from a leader. This path can tell a GET it made from one it
+/// did not: a block counts as fetched only when this call ran the closure, so
+/// a leader served by the RAM recheck, which runs no closure, reports zero gets
+/// like a follower. Reporting what actually crossed the network is strictly
 /// better information, and the block-range GET count is the figure ADR-0107's
 /// acceptance test is written against.
 #[derive(Default)]
@@ -10869,12 +10877,17 @@ mod read_gate_tests {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod fetch_run_corruption_gate_tests {
-    //! ADR-0046 decision 4's corruption gate on `fetch_run`'s lead block when
-    //! this call did not run the fetch itself. A caller whose peek missed while
-    //! a flight was running and that reached the single flight only after it
-    //! finished is served the RAM tier's bytes as a cache hit; in
-    //! `with_corruption` mode those bytes arrive corrupted and must be refused
-    //! exactly as a corrupted peek hit is.
+    //! ADR-0046 decision 4's corruption gate on the blocks `fetch_run` did not
+    //! fetch itself: the lead block, and a non-lead block resolved through
+    //! `fetch_peeked` whose CRC is checked after it returns. A caller whose peek
+    //! missed while a flight was running and that reached the single flight
+    //! only after it finished is served the RAM tier's bytes by the leader's
+    //! RAM recheck; in `with_corruption` mode those bytes arrive corrupted and
+    //! must be refused exactly as a corrupted peek hit is.
+    //!
+    //! The same late RAM serve is also pinned here for its query accounting:
+    //! a cache miss with zero GETs and zero fetched bytes, per
+    //! docs/guides/caching.md.
 
     use super::*;
     use ravel_cache::{Cache, CacheLimits, DiskCache, TieredCache};
@@ -10993,8 +11006,11 @@ mod fetch_run_corruption_gate_tests {
     /// `spawn_blocking` disk peek after its RAM peek missed; the tail block is
     /// then admitted to RAM only (the disk tier declines every entry), so the
     /// resumed peek misses and the RAM recheck serves the corrupted bytes. An
-    /// attempt whose disk peek finished inside that one poll ran the whole
-    /// fetch itself and is rebuilt.
+    /// attempt whose disk peek finished inside that one poll went on to lead
+    /// the tail block's flight with an empty RAM tier and fetch the block from
+    /// the store; it is still pending then, parked in the disk-tier admission,
+    /// so the guard detects it by the tail key's flight still being in flight
+    /// or a store request already made, and rebuilds it.
     ///
     /// FLIP: removing the `verify_block_crc` after the non-lead block's
     /// `fetch_peeked` returns the corrupted tail block as `Ok`, and the test
@@ -11072,7 +11088,10 @@ mod fetch_run_corruption_gate_tests {
                 std::task::Poll::Ready(std::future::Future::poll(fetch.as_mut(), cx))
             })
             .await;
-            if first.is_ready() {
+            if first.is_ready()
+                || tiered.is_in_flight(&tail_key)
+                || acc.snapshot().total_s3_requests() > 0
+            {
                 continue;
             }
             assert_eq!(
@@ -11101,5 +11120,214 @@ mod fetch_run_corruption_gate_tests {
             requests, 0,
             "both blocks were served from RAM, none refetched"
         );
+    }
+
+    /// How the tail block of [`late_ram_served_run`]'s run reaches `fetch_run`'s
+    /// non-lead branch.
+    #[derive(Clone, Copy)]
+    enum TailServe {
+        /// Admitted before `fetch_run` re-peeks it, so the re-peek hits.
+        RePeekHit,
+        /// Admitted after the re-peek missed, so `fetch_peeked`'s RAM recheck
+        /// serves it.
+        RamRecheck,
+    }
+
+    /// Occupies the blocking pool's only thread until the returned sender is
+    /// dropped. The pool queues blocking tasks first in, first out, so a disk
+    /// peek spawned after this call cannot start before the drop.
+    fn hold_blocking_pool() -> std::sync::mpsc::Sender<()> {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        drop(tokio::task::spawn_blocking(move || {
+            let _ = held.recv();
+        }));
+        release
+    }
+
+    /// Polls `fut` until `reached` holds after a poll, waiting between polls on
+    /// `fut`'s own wakeups. `fut` finishing first fails the test with
+    /// `checkpoint`, the point it should have stopped at.
+    async fn poll_until<F: std::future::Future + ?Sized>(
+        mut fut: std::pin::Pin<&mut F>,
+        reached: impl Fn() -> bool,
+        checkpoint: &str,
+    ) {
+        std::future::poll_fn(move |cx| match fut.as_mut().poll(cx) {
+            std::task::Poll::Ready(_) => panic!("the run finished before {checkpoint}"),
+            std::task::Poll::Pending if reached() => std::task::Poll::Ready(()),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        })
+        .await;
+    }
+
+    /// Runs `fetch_blocks` over a two-block run whose blocks both peek a miss
+    /// and are then served from RAM without a GET: the lead block by the RAM
+    /// recheck of `fetch_peeked`, the tail block as `tail` says. The run gets a
+    /// runtime with one blocking thread, which [`hold_blocking_pool`] keeps
+    /// busy, so each `spawn_blocking` disk peek is held behind a gate the test
+    /// releases: the run stops at a peek once its RAM tier miss is counted. The
+    /// disk tier declines every entry, so each admission lands in RAM only.
+    fn late_ram_served_run(
+        tail: TailServe,
+    ) -> (
+        ravel_types::accounting::QueryAccountingSnapshot,
+        BlockRangeStats,
+    ) {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime")
+            .block_on(late_ram_served_run_on_one_blocking_thread(tail))
+    }
+
+    async fn late_ram_served_run_on_one_blocking_thread(
+        tail: TailServe,
+    ) -> (
+        ravel_types::accounting::QueryAccountingSnapshot,
+        BlockRangeStats,
+    ) {
+        let object = Bytes::from_static(b"block-range bytes the corruption gate covers");
+        let lead_block = object.slice(0..16);
+        let tail_block = object.slice(16..32);
+        let lead_key = CacheKey::new(TENANT.0, CONTENT_HASH, 0, 16);
+        let tail_key = CacheKey::new(TENANT.0, CONTENT_HASH, 16, 16);
+        let limits = CacheLimits::new(1024 * 1024, 100, 1024 * 1024);
+        let disk_declines_all = CacheLimits::new(1024 * 1024, 100, 1);
+        let extents = [
+            BlockExtent {
+                abs_start: 0,
+                len: 16,
+                crc32c: crc32c::crc32c(&lead_block),
+            },
+            BlockExtent {
+                abs_start: 16,
+                len: 16,
+                crc32c: crc32c::crc32c(&tail_block),
+            },
+        ];
+        let seg = seg_ref(object.len() as u64);
+        let pin = EtagPin::default();
+
+        let store = MemoryStore::new();
+        store
+            .put(KEY, object.clone(), PutOptions::default())
+            .await
+            .expect("put");
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let tiered = Arc::new(TieredCache::new(
+            Cache::new(limits),
+            DiskCache::new(tmp.path().to_path_buf(), disk_declines_all),
+        ));
+        let ram_metrics = tiered.ram_metrics();
+        let ram_misses = || ram_metrics.snapshot().misses;
+        let fetcher = BlockRangeFetcher::new(Arc::new(store)).with_cache(tiered.clone());
+        let acc = QueryAccounting::new();
+        let mut stats = BlockRangeStats::default();
+        let mut asm = ObjectAssembler::new(&fetcher.assembly_gauge, object.len() as u64);
+        let mut fetch = Box::pin(fetcher.fetch_blocks(
+            &seg,
+            TENANT,
+            &pin,
+            &extents,
+            QueryPhase::Scan,
+            &mut asm,
+            &acc,
+            &mut stats,
+        ));
+
+        // Each gate is queued before the one ahead of it is released, so it
+        // takes the blocking thread before the next disk peek can.
+        let lead_peek_gate = hold_blocking_pool();
+        poll_until(
+            fetch.as_mut(),
+            || ram_misses() >= 1,
+            "the lead block's disk peek",
+        )
+        .await;
+        assert_eq!(ram_misses(), 1, "held in the lead block's disk peek");
+        tiered.insert(lead_key, lead_block.clone());
+
+        // Then in the tail block's disk peek: the lead's peek missed, and the
+        // run has not reached `fetch_run` yet.
+        let tail_peek_gate = hold_blocking_pool();
+        drop(lead_peek_gate);
+        poll_until(
+            fetch.as_mut(),
+            || ram_misses() >= 2,
+            "the tail block's disk peek",
+        )
+        .await;
+        assert_eq!(ram_misses(), 2, "held in the tail block's disk peek");
+
+        let re_peek_gate = if let TailServe::RamRecheck = tail {
+            // Then in `fetch_run`'s re-peek of the tail block, after the lead
+            // was served by the RAM recheck and before the tail's own
+            // `fetch_peeked`.
+            let re_peek_gate = hold_blocking_pool();
+            drop(tail_peek_gate);
+            poll_until(
+                fetch.as_mut(),
+                || ram_misses() >= 3,
+                "fetch_run's re-peek of the tail block",
+            )
+            .await;
+            assert_eq!(ram_misses(), 3, "held in the tail block's re-peek");
+            assert!(!tiered.is_in_flight(&tail_key));
+            re_peek_gate
+        } else {
+            tail_peek_gate
+        };
+        assert_eq!(acc.snapshot().total_s3_requests(), 0);
+        tiered.insert(tail_key, tail_block.clone());
+        assert_eq!(tiered.disk_len(), 0, "the disk tier declined both blocks");
+        drop(re_peek_gate);
+        fetch.await.expect("both blocks verify");
+        assert_eq!(
+            asm.slice(KEY, 0, 16).expect("lead placed").as_ref(),
+            lead_block.as_ref()
+        );
+        assert_eq!(
+            asm.slice(KEY, 16, 16).expect("tail placed").as_ref(),
+            tail_block.as_ref()
+        );
+        (acc.snapshot(), stats)
+    }
+
+    /// A late RAM serve is a cache miss with zero GETs and zero fetched bytes
+    /// in the query's accounting (docs/guides/caching.md): the run records
+    /// exactly one miss per block, from `fetch_blocks`' peek, and nothing else.
+    ///
+    /// FLIP: restoring `accounting.record_cache_miss()` before the non-lead
+    /// block's `fetch_peeked` in `fetch_run` makes `cache_misses` read 3.
+    #[test]
+    fn a_late_ram_served_log_run_counts_one_miss_per_block_and_no_get() {
+        let (snapshot, stats) = late_ram_served_run(TailServe::RamRecheck);
+        assert_eq!(snapshot.cache_misses, 2, "one miss per block");
+        assert_eq!(snapshot.cache_hits, 0);
+        assert_eq!(snapshot.cache_bytes, 0);
+        assert_eq!(snapshot.total_s3_requests(), 0);
+        assert_eq!(snapshot.total_s3_bytes(), 0);
+        assert_eq!(stats.block_range_gets, 0);
+        assert_eq!(stats.block_bytes_fetched, 0);
+    }
+
+    /// The tail block of a run whose lead was served late from RAM, served by
+    /// `fetch_run`'s re-peek rather than the recheck, is accounted the same
+    /// way: its `fetch_blocks` peek already recorded its miss.
+    ///
+    /// FLIP: restoring `accounting.record_cache_hit()` and
+    /// `accounting.add_cache_bytes(..)` on that re-peek's hit makes
+    /// `cache_hits` read 1 and `cache_bytes` 16.
+    #[test]
+    fn a_late_ram_served_log_run_counts_no_hit_for_a_re_peeked_block() {
+        let (snapshot, stats) = late_ram_served_run(TailServe::RePeekHit);
+        assert_eq!(snapshot.cache_misses, 2, "one miss per block");
+        assert_eq!(snapshot.cache_hits, 0);
+        assert_eq!(snapshot.cache_bytes, 0);
+        assert_eq!(snapshot.total_s3_requests(), 0);
+        assert_eq!(snapshot.total_s3_bytes(), 0);
+        assert_eq!(stats.block_range_gets, 0);
+        assert_eq!(stats.block_bytes_fetched, 0);
     }
 }
