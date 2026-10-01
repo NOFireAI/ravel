@@ -216,14 +216,6 @@ pub fn build(input: NewCommitRecord) -> Result<CommitRecord, RecordError> {
 /// a flush that spans into a later hour (bounded elsewhere by
 /// `max_flush_lifetime`) still validates.
 pub fn validate(record: &CommitRecord) -> Result<(), RecordError> {
-    if record.tenant_hash.len() != 16 {
-        return Err(RecordError::InvalidTenantHashLen(record.tenant_hash.len()));
-    }
-    if record.content_hash.len() != 32 {
-        return Err(RecordError::InvalidContentHashLen(
-            record.content_hash.len(),
-        ));
-    }
     // First: a newer version may change any field's shape, so a record it
     // wrote must fail as a newer version, not as a corrupt field.
     if record.format_version != FORMAT_VERSION {
@@ -231,6 +223,14 @@ pub fn validate(record: &CommitRecord) -> Result<(), RecordError> {
             expected: FORMAT_VERSION,
             actual: record.format_version,
         });
+    }
+    if record.tenant_hash.len() != 16 {
+        return Err(RecordError::InvalidTenantHashLen(record.tenant_hash.len()));
+    }
+    if record.content_hash.len() != 32 {
+        return Err(RecordError::InvalidContentHashLen(
+            record.content_hash.len(),
+        ));
     }
     if record.min_event_ts_ns > record.max_event_ts_ns {
         return Err(RecordError::EventTsOutOfOrder {
