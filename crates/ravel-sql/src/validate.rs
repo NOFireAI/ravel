@@ -2019,6 +2019,39 @@ mod tests {
         ));
     }
 
+    /// `name.to_string()` relies on `ObjectName`'s own `Display` joining a
+    /// multi-part name with `.`, which `names::validate_table` then rejects
+    /// as an invalid character -- so the refusal rests on a third-party
+    /// `Display` detail rather than an explicit check of the name's part
+    /// count. Pinned here so a future change to how the table name is
+    /// extracted (e.g. taking only the last identifier) cannot silently
+    /// start admitting a schema- or catalog-qualified name.
+    #[test]
+    fn create_external_table_with_schema_qualified_name_is_rejected() {
+        for sql in [
+            "CREATE EXTERNAL TABLE s.orders STORED AS PARQUET LOCATION 's3://bucket/prefix/'",
+            "CREATE EXTERNAL TABLE c.s.orders STORED AS PARQUET LOCATION 's3://bucket/prefix/'",
+        ] {
+            assert!(
+                matches!(reject_ddl(sql), DdlValidationError::InvalidTableName(_)),
+                "{sql}"
+            );
+        }
+    }
+
+    /// Same rule as
+    /// [`create_external_table_with_schema_qualified_name_is_rejected`], for
+    /// `DROP TABLE`.
+    #[test]
+    fn drop_table_with_schema_qualified_name_is_rejected() {
+        for sql in ["DROP TABLE s.orders", "DROP TABLE c.s.orders"] {
+            assert!(
+                matches!(reject_ddl(sql), DdlValidationError::InvalidTableName(_)),
+                "{sql}"
+            );
+        }
+    }
+
     #[test]
     fn location_without_scheme_is_rejected() {
         assert!(matches!(
