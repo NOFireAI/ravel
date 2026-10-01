@@ -219,11 +219,15 @@ async fn snapshot_with_limit(
 }
 
 /// An object the listing (or the HEAD) reported, before its footer is read.
-/// The listing's reported size is never trusted for the read: the first
-/// footer read is a suffix read that is correct whatever the real size is.
+/// On a store with `suffix_range`, the first footer read is a suffix read
+/// that is correct whatever the real size is, so `size` has no bearing on
+/// it. On a store without it, `size` shapes where that first explicit-range
+/// read lands; a stale `size` costs one retry rather than a misplaced read
+/// (see [`read_file`]).
 struct Candidate {
     key: String,
     etag: String,
+    size: u64,
 }
 
 struct Listed {
@@ -307,6 +311,7 @@ async fn list_files(
             listed.candidates.push(Candidate {
                 key: object.key,
                 etag: object.etag.0,
+                size: object.size,
             });
             Ok(DrainStep::Continue)
         },
@@ -340,6 +345,7 @@ async fn head_file(
         candidates: vec![Candidate {
             key,
             etag: meta.etag.0,
+            size: meta.size,
         }],
         directory_markers: 0,
         other_suffixes: 0,
@@ -465,12 +471,101 @@ async fn pinned_get(
     Ok((read, reservation))
 }
 
+/// The object exists, at the pinned ETag, and has no bytes to read: an
+/// endpoint that answers a footer read with `InvalidRange` (a 416) instead
+/// of an empty body is reporting the same thing `size == 0` below reports
+/// for one that answers it with an empty body.
+fn empty_file_on_invalid_range(key: &str, err: SnapshotError) -> SnapshotError {
+    match err {
+        SnapshotError::Store {
+            source: StoreError::InvalidRange(_),
+            ..
+        } => SnapshotError::EmptyFile {
+            key: key.to_string(),
+        },
+        other => other,
+    }
+}
+
+/// The last `min(FOOTER_PREFETCH, size)` bytes of an object reported to be
+/// `size` bytes long.
+fn tail_range(size: u64) -> FooterRange {
+    FooterRange::Range(size - size.min(FOOTER_PREFETCH), size)
+}
+
+/// The first footer read: a suffix read where the store can serve one, or
+/// an explicit range over the last `min(FOOTER_PREFETCH, size)` bytes of
+/// `listed_size` (the listing's, or a single-object HEAD's, reported size)
+/// otherwise. A store without `suffix_range` (Azure; see
+/// `docs/object-store-contract.md`) refuses a suffix range before sending
+/// it, so there the read has to be placed from a size learned ahead of
+/// time, and `listed_size` is the only one available before this read's own
+/// response. If that response's own reported size disagrees with
+/// `listed_size`, the listing was stale: retry once, placed from the size
+/// this read just reported, and refuse `FileChanged` if the retry's own
+/// reported size disagrees too.
+async fn first_footer_read(
+    store: &dyn ObjectStoreBackend,
+    limiter: &GetLimiter,
+    memory: &Arc<MemoryBudget>,
+    accounting: &PhaseAccounting,
+    key: &str,
+    pin: &Pin,
+    listed_size: u64,
+) -> Result<(PinnedRead, Reservation), SnapshotError> {
+    if store.capabilities().suffix_range {
+        return pinned_get(
+            store,
+            limiter,
+            memory,
+            accounting,
+            key,
+            FooterRange::Suffix(FOOTER_PREFETCH),
+            pin,
+        )
+        .await
+        .map_err(|err| empty_file_on_invalid_range(key, err));
+    }
+    let (tail, reservation) = pinned_get(
+        store,
+        limiter,
+        memory,
+        accounting,
+        key,
+        tail_range(listed_size),
+        pin,
+    )
+    .await
+    .map_err(|err| empty_file_on_invalid_range(key, err))?;
+    if tail.outcome.total_size == listed_size {
+        return Ok((tail, reservation));
+    }
+    let real_size = tail.outcome.total_size;
+    let (retry, retry_reservation) = pinned_get(
+        store,
+        limiter,
+        memory,
+        accounting,
+        key,
+        tail_range(real_size),
+        pin,
+    )
+    .await
+    .map_err(|err| empty_file_on_invalid_range(key, err))?;
+    if retry.outcome.total_size != real_size {
+        return Err(SnapshotError::FileChanged {
+            key: key.to_string(),
+        });
+    }
+    Ok((retry, retry_reservation))
+}
+
 /// Read and check one file's footer, and describe the file as the read's
-/// response reported it. The first read is a suffix read of
-/// [`FOOTER_PREFETCH`] bytes, so the listing's reported size (which
-/// [`Candidate`] does not even carry) has no bearing on where it lands: a
-/// listing that under- or over-reports a file's size, in either direction,
-/// cannot misplace it.
+/// response reported it. See [`first_footer_read`] for how the first read
+/// is placed and self-corrected; the listing's reported size otherwise has
+/// no bearing on where it lands, so a listing that under- or over-reports a
+/// file's size, in either direction, cannot misplace a read on a store with
+/// `suffix_range`, and costs at most one retry on one without.
 async fn read_file(
     store: &dyn ObjectStoreBackend,
     grant: &Grant,
@@ -485,27 +580,16 @@ async fn read_file(
         message,
     };
     let listed_pin = Pin::etag(candidate.etag);
-    let (tail, _tail_reservation) = pinned_get(
+    let (tail, _tail_reservation) = first_footer_read(
         store,
         limiter,
         memory,
         accounting,
         &key,
-        FooterRange::Suffix(FOOTER_PREFETCH),
         &listed_pin,
+        candidate.size,
     )
-    .await
-    .map_err(|err| match err {
-        // The object exists, at the pinned ETag, and has no bytes to read: an
-        // endpoint that answers this suffix read with a 416 instead of an
-        // empty body is reporting the same thing `size == 0` below reports
-        // for one that answers it.
-        SnapshotError::Store {
-            source: StoreError::InvalidRange(_),
-            ..
-        } => SnapshotError::EmptyFile { key: key.clone() },
-        other => other,
-    })?;
+    .await?;
     let size = tail.outcome.total_size;
     if size == 0 {
         return Err(SnapshotError::EmptyFile { key: key.clone() });
@@ -534,9 +618,9 @@ async fn read_file(
             "the trailer records a {footer_len}-byte footer in a {size}-byte file"
         )));
     }
-    let (footer, _before_reservation): (Bytes, Option<Reservation>) =
+    let (footer, _extra_reservations): (Bytes, Vec<Reservation>) =
         if footer_and_trailer <= fetched {
-            (data.slice(split - footer_len as usize..split), None)
+            (data.slice(split - footer_len as usize..split), Vec::new())
         } else {
             // Select the version the first read saw, so both reads are of one
             // object's bytes; If-Match stays on the listed ETag.
@@ -570,10 +654,21 @@ async fn read_file(
                     before.len()
                 )));
             }
+            // The concatenation is a third buffer, live alongside the tail
+            // and before reads it copies, so it needs its own reservation:
+            // the two GETs' reservations cover only their own bytes.
+            let concat_reservation = memory.reserve(footer_len).map_err(|exhausted| {
+                SnapshotError::MemoryExhausted {
+                    key: key.clone(),
+                    requested: exhausted.requested,
+                    reserved: exhausted.reserved,
+                    limit: exhausted.limit,
+                }
+            })?;
             let mut footer = Vec::with_capacity(footer_len as usize);
             footer.extend_from_slice(&before);
             footer.extend_from_slice(&data[..split]);
-            (Bytes::from(footer), Some(before_reservation))
+            (Bytes::from(footer), vec![before_reservation, concat_reservation])
         };
     let metadata = decode_footer(&footer, size - footer_and_trailer).map_err(&corrupt)?;
     let row_count = u64::try_from(metadata.file_metadata().num_rows())
