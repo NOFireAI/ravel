@@ -459,11 +459,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   after a restart or on another replica's bucket it falls back to the earlier
   of the nominal deadline and the tombstone's write time, which can still
   under-read by up to that same bound. A tombstoned bucket that holds a
-  rewrite record falls back to the tombstone's write time alone: an erasure
-  that dropped every record leaves a rewrite whose publish time stands in for
-  its newest event, and measuring that bucket from the nominal deadline
-  over-read its lag by up to the time between the hour's end and the erasure,
-  enough to fire the lag alert after a restart.
+  rewrite record with no parts falls back to the tombstone's write time
+  alone: an erasure that dropped every record leaves a rewrite whose publish
+  time stands in for its newest event, and measuring that bucket from the
+  nominal deadline over-read its lag by up to the time between the hour's end
+  and the erasure, enough to fire the lag alert after a restart. That figure
+  under-reads by however late the tombstone was written, with no fixed bound.
+  Telling such a rewrite from one that keeps parts costs one GET of the
+  rewrite record, issued only when the exact expiry is not held in memory; a
+  bucket whose rewrite keeps parts keeps the earlier-of-the-two fallback.
   `ravel_maintain_bytes_reclaimed_total` left out superseded L0 data, most of
   the bytes freed in steady state. It
   now charges each object the superseded-input sweep deletes at the
@@ -477,10 +481,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   including on deployments with no alert rules and under
   `--alert-retention 0`. It now first lists the tenant's alert keyspace and
   the quarantine copies taken from it, one bounded listing each, and skips
-  the sweep when both are empty, so such a tenant pays those two listings,
-  or three with a nonzero window, instead of six; a tenant whose alert state
-  memo was just read skips those two listings too, and a gate listing that
-  fails runs the sweep. The mass-orphan breaker's runbook log line now comes
+  the sweep when both are empty, so such a tenant pays those two listings
+  instead of six under `--alert-retention 0`, and three instead of seven with
+  a nonzero window, whose absent-memo check lists the commit prefix first; a
+  tenant whose alert state memo was just read skips those two listings too,
+  and a gate listing that fails runs the sweep. The mass-orphan breaker's runbook log line now comes
   from one function shared by every shard.
 
 - **A gateway starts under a small memory limit** (issue #2234).
