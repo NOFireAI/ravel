@@ -30,7 +30,6 @@ use arrow::array::{
     TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::array::{BinaryArray, FixedSizeBinaryArray, MapArray, new_null_array};
-use arrow::compute::take;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::{
@@ -1031,6 +1030,19 @@ impl SpansMapping {
             .iter()
             .map(|a| (a, AttrScope::Resource))
             .chain(self.attributes.iter().map(|a| (a, AttrScope::Span)))
+    }
+
+    /// Every key a mapped attribute names, with the column it reads: the keys
+    /// an `attrs_map_column` entry may not repeat. Constant for a load, so a
+    /// load builds it once rather than once per batch.
+    fn mapped_keys(&self) -> MappedKeys {
+        let mut mapped_keys = MappedKeys::new();
+        for (spec, _) in self.mapped_attributes() {
+            mapped_keys
+                .entry(spec.key.clone())
+                .or_insert_with(|| spec.column.clone());
+        }
+        mapped_keys
     }
 
     /// The checks a spans mapping fails before any Parquet byte is read.
@@ -3981,10 +3993,28 @@ impl ColumnIndex {
         })
     }
 
-    /// Column `i` as the row path must read it: resolved when it was a mapped
-    /// dictionary column, the batch's own otherwise.
-    fn col<'a>(&'a self, batch: &'a RecordBatch, i: usize) -> &'a ArrayRef {
-        self.columns.col(batch, i)
+    /// The array and index the row path reads the cell at (`row`, column `i`)
+    /// from: a mapped dictionary column's own values when it was resolved, the
+    /// batch's column otherwise.
+    fn cell<'a>(
+        &'a self,
+        batch: &'a RecordBatch,
+        i: usize,
+        row: usize,
+    ) -> Result<(&'a ArrayRef, usize), String> {
+        self.columns.cell(batch, i, row)
+    }
+
+    /// Read the cell at (`row`, column `i`) with `read`, as
+    /// [`ResolvedColumns::read`].
+    fn read<T>(
+        &self,
+        batch: &RecordBatch,
+        i: usize,
+        row: usize,
+        read: impl FnOnce(&ArrayRef, usize) -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.columns.read(batch, i, row, read)
     }
 }
 
@@ -3999,8 +4029,8 @@ fn build_record(
     row: usize,
 ) -> Result<NormalizedLogRecord, String> {
     // Timestamp is required; a null or unreadable ts is a row rejection.
-    let ts_col = cols.col(batch, cols.ts);
-    let raw_ts = read_ts(ts_col, row, mapping.ts_unit)?
+    let (ts_col, ts_at) = cols.cell(batch, cols.ts, row)?;
+    let raw_ts = read_ts(ts_col, ts_at, mapping.ts_unit)?
         .ok_or_else(|| format!("ts column {:?} is null", mapping.ts_column))?;
     if raw_ts < 0 {
         return Err(negative_ts_rejection(
@@ -4022,7 +4052,7 @@ fn build_record(
 
     // Body (optional). Kept: max_body_len.
     let body = match cols.body {
-        Some(i) => read_string(cols.col(batch, i), row)?.unwrap_or_default(),
+        Some(i) => cols.read(batch, i, row, read_string)?.unwrap_or_default(),
         None => String::new(),
     };
     if body.len() > limits.max_body_len {
@@ -4036,24 +4066,25 @@ fn build_record(
     let severity_num = match cols.severity_number {
         // OTLP severity_number is 0..=24; an out-of-u8 value normalizes to 0
         // (UNSPECIFIED), matching ravel-otlp rather than truncating.
-        Some(i) => read_i64(cols.col(batch, i), row)?
+        Some(i) => cols
+            .read(batch, i, row, read_i64)?
             .and_then(|v| u8::try_from(v).ok())
             .unwrap_or(0),
         None => 0,
     };
     let severity_text = match cols.severity_text {
-        Some(i) => read_string(cols.col(batch, i), row)?.unwrap_or_default(),
+        Some(i) => cols.read(batch, i, row, read_string)?.unwrap_or_default(),
         None => String::new(),
     };
 
     // Trace/span ids: exact byte length or absent (never padded or truncated),
     // matching ravel-otlp.
     let trace_id = match cols.trace_id {
-        Some(i) => read_id::<16>(cols.col(batch, i), row)?,
+        Some(i) => cols.read(batch, i, row, read_id::<16>)?,
         None => None,
     };
     let span_id = match cols.span_id {
-        Some(i) => read_id::<8>(cols.col(batch, i), row)?,
+        Some(i) => cols.read(batch, i, row, read_id::<8>)?,
         None => None,
     };
 
@@ -4061,7 +4092,9 @@ fn build_record(
     let mut resource_attrs: Vec<(String, AttrValue)> = Vec::with_capacity(cols.resource.len());
     for (col_idx, map_idx) in &cols.resource {
         let spec = &mapping.resource_attributes[*map_idx];
-        if let Some(value) = read_attr(cols.col(batch, *col_idx), row, spec.value_type)? {
+        if let Some(value) = cols.read(batch, *col_idx, row, |arr, at| {
+            read_attr(arr, at, spec.value_type)
+        })? {
             check_attr(&spec.key, &value, limits)?;
             resource_attrs.push((spec.key.clone(), value));
         }
@@ -4071,7 +4104,9 @@ fn build_record(
     let mut attrs: Vec<(String, AttrValue)> = Vec::with_capacity(cols.record.len());
     for (col_idx, map_idx) in &cols.record {
         let spec = &mapping.attributes[*map_idx];
-        if let Some(value) = read_attr(cols.col(batch, *col_idx), row, spec.value_type)? {
+        if let Some(value) = cols.read(batch, *col_idx, row, |arr, at| {
+            read_attr(arr, at, spec.value_type)
+        })? {
             check_attr(&spec.key, &value, limits)?;
             attrs.push((spec.key.clone(), value));
         }
@@ -4255,15 +4290,71 @@ fn is_resolvable_dictionary_value(ty: &DataType) -> bool {
     )
 }
 
-/// Resolve a dictionary-encoded string or binary column to a flat column of its
-/// value type, or `None` for a column the per-cell readers already index in
-/// place.
+/// A dictionary-encoded string or binary column, its keys normalized once for
+/// the batch. Each cell is read out of the dictionary's own `values` in place:
+/// copying the values the cells reference would overflow a `Utf8` or `Binary`
+/// column's i32 offsets once the referenced bytes pass 2 GiB, failing the
+/// whole batch.
+struct DictionaryColumn {
+    column: ArrayRef,
+    values: ArrayRef,
+    keys: Vec<usize>,
+}
+
+impl DictionaryColumn {
+    /// The array and index cell `row` is read from: the dictionary value its
+    /// key names, or the column itself at `row` for a null key, which every
+    /// reader answers as null before it reads a value.
+    fn cell(&self, row: usize) -> Result<(&ArrayRef, usize), String> {
+        if self.column.is_null(row) {
+            return Ok((&self.column, row));
+        }
+        let key = self
+            .keys
+            .get(row)
+            .copied()
+            .ok_or_else(|| format!("dictionary column has no key at row {row}"))?;
+        Ok((&self.values, key))
+    }
+}
+
+/// A mapped column as [`resolve_dictionary_column`] resolved it for the row
+/// readers.
+enum RowColumn {
+    /// A column read where it is: the all-null column of an empty
+    /// dictionary's value type, or (from [`id_column`]) the batch's own.
+    Plain(ArrayRef),
+    /// A dictionary column read in place.
+    Dictionary(DictionaryColumn),
+}
+
+impl RowColumn {
+    /// The array and index cell `row` is read from.
+    fn cell(&self, row: usize) -> Result<(&ArrayRef, usize), String> {
+        match self {
+            RowColumn::Plain(arr) => Ok((arr, row)),
+            RowColumn::Dictionary(dict) => dict.cell(row),
+        }
+    }
+
+    /// The array every non-null cell is read out of.
+    #[cfg(test)]
+    fn values(&self) -> &ArrayRef {
+        match self {
+            RowColumn::Plain(arr) => arr,
+            RowColumn::Dictionary(dict) => &dict.values,
+        }
+    }
+}
+
+/// Resolve a dictionary-encoded string or binary column for the row readers,
+/// or `None` for a column the per-cell readers already index in place.
 ///
 /// `DictionaryArray::normalized_keys` builds a key vector the size of the whole
 /// batch on every call, so a reader that resolves a dictionary cell per row
 /// costs O(rows^2) per dictionary column. Every row path resolves its mapped
-/// dictionary columns once, here, and indexes the result.
-fn resolve_dictionary_column(arr: &ArrayRef) -> Result<Option<ArrayRef>, String> {
+/// dictionary columns once, here, and reads each cell through the result.
+fn resolve_dictionary_column(arr: &ArrayRef) -> Result<Option<RowColumn>, String> {
     let DataType::Dictionary(_, value_ty) = arr.data_type() else {
         return Ok(None);
     };
@@ -4277,44 +4368,48 @@ fn resolve_dictionary_column(arr: &ArrayRef) -> Result<Option<ArrayRef>, String>
         // An all-null chunk with an empty dictionary is a shape a Parquet
         // writer emits, and resolves to an all-null column of the value type,
         // the same answer `str_src` gives it. Anything else over an empty
-        // dictionary is corrupt.
+        // dictionary is corrupt. Either way `normalized_keys`, which asserts
+        // the values array is non-empty, is never reached.
         if arr.null_count() != arr.len() {
             return Err(EMPTY_DICTIONARY.to_string());
         }
-        return Ok(Some(new_null_array(value_ty, arr.len())));
+        return Ok(Some(RowColumn::Plain(new_null_array(value_ty, arr.len()))));
     }
-    take(dict.values().as_ref(), dict.keys(), None)
-        .map(Some)
-        .map_err(|e| format!("could not resolve a dictionary-encoded column: {e}"))
+    Ok(Some(RowColumn::Dictionary(DictionaryColumn {
+        column: Arc::clone(arr),
+        values: Arc::clone(dict.values()),
+        keys: dict.normalized_keys(),
+    })))
 }
 
 /// One batch's columns, with every mapped dictionary column resolved once by
 /// [`resolve_dictionary_column`]. Every other column is the batch's own.
 struct ResolvedColumns {
-    columns: Vec<ArrayRef>,
+    /// Indexed by column; `None` for a column read as the batch's own.
+    columns: Vec<Option<RowColumn>>,
 }
 
 impl ResolvedColumns {
     /// Resolve the columns `mapped` names. A column named twice (two attributes
-    /// reading one column) resolves on the first pass and is already flat on
-    /// the second.
+    /// reading one column) resolves on the first pass only.
     fn resolve(
         batch: &RecordBatch,
         mapped: impl IntoIterator<Item = usize>,
     ) -> Result<ResolvedColumns, String> {
-        let mut columns = batch.columns().to_vec();
+        let mut columns: Vec<Option<RowColumn>> = Vec::new();
+        columns.resize_with(batch.num_columns(), || None);
         for i in mapped {
-            let Some(column) = columns.get(i) else {
+            let Some(slot) = columns.get_mut(i) else {
                 continue;
             };
-            if let Some(resolved) = resolve_dictionary_column(column)? {
-                columns[i] = resolved;
+            if slot.is_none() {
+                *slot = resolve_dictionary_column(batch.column(i))?;
             }
         }
         Ok(ResolvedColumns { columns })
     }
 
-    /// No column resolved: [`ResolvedColumns::col`] answers every index with
+    /// No column resolved: [`ResolvedColumns::cell`] answers every index with
     /// the batch's own column.
     fn none() -> ResolvedColumns {
         ResolvedColumns {
@@ -4322,9 +4417,41 @@ impl ResolvedColumns {
         }
     }
 
-    /// Column `i` of the batch these columns were resolved from.
+    /// The array and index the cell at (`row`, column `i`) of `batch` is read
+    /// from.
+    fn cell<'a>(
+        &'a self,
+        batch: &'a RecordBatch,
+        i: usize,
+        row: usize,
+    ) -> Result<(&'a ArrayRef, usize), String> {
+        match self.columns.get(i).and_then(Option::as_ref) {
+            Some(resolved) => resolved.cell(row),
+            None => Ok((batch.column(i), row)),
+        }
+    }
+
+    /// Read the cell at (`row`, column `i`) of `batch` with `read`, from where
+    /// [`ResolvedColumns::cell`] says it is.
+    fn read<T>(
+        &self,
+        batch: &RecordBatch,
+        i: usize,
+        row: usize,
+        read: impl FnOnce(&ArrayRef, usize) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let (arr, at) = self.cell(batch, i, row)?;
+        read(arr, at)
+    }
+
+    /// The array column `i`'s non-null cells are read out of: a resolved
+    /// dictionary column's own values, the batch's column otherwise.
+    #[cfg(test)]
     fn col<'a>(&'a self, batch: &'a RecordBatch, i: usize) -> &'a ArrayRef {
-        self.columns.get(i).unwrap_or_else(|| batch.column(i))
+        match self.columns.get(i).and_then(Option::as_ref) {
+            Some(resolved) => resolved.values(),
+            None => batch.column(i),
+        }
     }
 }
 
@@ -4953,6 +5080,12 @@ impl TsSrc<'_> {
 enum IdSrc<'a> {
     Hex(&'a ArrayRef),
     Bin(&'a ArrayRef),
+    /// A dictionary id column read in place, by the [`IdSrc::Hex`] rule when
+    /// `hex` is set and the [`IdSrc::Bin`] rule otherwise.
+    Dict {
+        column: &'a DictionaryColumn,
+        hex: bool,
+    },
     Bad(&'a ArrayRef),
 }
 
@@ -4964,11 +5097,26 @@ fn id_src(arr: &ArrayRef) -> IdSrc<'_> {
     }
 }
 
-/// An id column as [`IdSrc`] reads it: a dictionary-encoded string or binary
-/// column resolved to its flat value type (a null key is a null cell), any
-/// other column unchanged.
-fn flat_id_column(arr: &ArrayRef) -> Result<ArrayRef, String> {
-    Ok(resolve_dictionary_column(arr)?.unwrap_or_else(|| Arc::clone(arr)))
+/// An id column as [`id_column_src`] reads it: a dictionary-encoded string or
+/// binary column resolved by [`resolve_dictionary_column`] (a null key is a
+/// null cell), any other column the batch's own.
+fn id_column(arr: &ArrayRef) -> Result<RowColumn, String> {
+    Ok(resolve_dictionary_column(arr)?.unwrap_or_else(|| RowColumn::Plain(Arc::clone(arr))))
+}
+
+/// The [`IdSrc`] over an [`id_column`]: a dictionary column's cells are read
+/// out of its own values, by the rule [`id_src`] picks for the value type.
+fn id_column_src(col: &RowColumn) -> IdSrc<'_> {
+    match col {
+        RowColumn::Plain(arr) => id_src(arr),
+        RowColumn::Dictionary(column) => IdSrc::Dict {
+            column,
+            hex: matches!(
+                column.values.data_type(),
+                DataType::Utf8 | DataType::LargeUtf8
+            ),
+        },
+    }
 }
 
 impl IdSrc<'_> {
@@ -4976,6 +5124,14 @@ impl IdSrc<'_> {
         match self {
             IdSrc::Hex(arr) => Ok(read_string(arr, row)?.and_then(|s| hex::decode(s).ok())),
             IdSrc::Bin(arr) => read_bytes(arr, row),
+            IdSrc::Dict { column, hex } => {
+                let (arr, at) = column.cell(row)?;
+                if *hex {
+                    Ok(read_string(arr, at)?.and_then(|s| hex::decode(s).ok()))
+                } else {
+                    read_bytes(arr, at)
+                }
+            }
             IdSrc::Bad(arr) => {
                 if arr.is_null(row) {
                     Ok(None)
@@ -5163,21 +5319,21 @@ fn build_columnar_batch(
         let body = cols.body.map(|i| str_src(span.column(i)));
         let sev_num = cols.severity_number.map(|i| int_src(span.column(i)));
         let sev_text = cols.severity_text.map(|i| str_src(span.column(i)));
-        // The id columns are the only ones resolved from a dictionary here:
-        // `IdSrc` reads flat string or binary cells, and a default Parquet
-        // writer dictionary-encodes a hex id column.
+        // The id columns are the only ones resolved from a dictionary here, and
+        // are read in place: a default Parquet writer dictionary-encodes a hex
+        // id column.
         let trace_col = cols
             .trace_id
-            .map(|i| flat_id_column(span.column(i)))
+            .map(|i| id_column(span.column(i)))
             .transpose()
             .map_err(ColBuildError::Batch)?;
         let span_id_col = cols
             .span_id
-            .map(|i| flat_id_column(span.column(i)))
+            .map(|i| id_column(span.column(i)))
             .transpose()
             .map_err(ColBuildError::Batch)?;
-        let trace = trace_col.as_ref().map(id_src);
-        let span_id_src = span_id_col.as_ref().map(id_src);
+        let trace = trace_col.as_ref().map(id_column_src);
+        let span_id_src = span_id_col.as_ref().map(id_column_src);
         let resource: Vec<(usize, AttrSrc)> = cols
             .resource
             .iter()
@@ -5552,10 +5708,27 @@ impl MetricsColumnIndex {
         })
     }
 
-    /// Column `i` as the row readers must read it: resolved when it was a
-    /// mapped dictionary column, the batch's own otherwise.
-    fn col<'a>(&'a self, batch: &'a RecordBatch, i: usize) -> &'a ArrayRef {
-        self.columns.col(batch, i)
+    /// The array and index the row readers read the cell at (`row`, column
+    /// `i`) from, as [`ResolvedColumns::cell`].
+    fn cell<'a>(
+        &'a self,
+        batch: &'a RecordBatch,
+        i: usize,
+        row: usize,
+    ) -> Result<(&'a ArrayRef, usize), String> {
+        self.columns.cell(batch, i, row)
+    }
+
+    /// Read the cell at (`row`, column `i`) with `read`, as
+    /// [`ResolvedColumns::read`].
+    fn read<T>(
+        &self,
+        batch: &RecordBatch,
+        i: usize,
+        row: usize,
+        read: impl FnOnce(&ArrayRef, usize) -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.columns.read(batch, i, row, read)
     }
 }
 
@@ -5720,8 +5893,8 @@ fn build_metric_row(
     now_ns: i64,
     row: usize,
 ) -> Result<MetricRow, String> {
-    let ts_col = cols.col(batch, cols.ts);
-    let raw_ts = read_ts(ts_col, row, mapping.ts_unit)?
+    let (ts_col, ts_at) = cols.cell(batch, cols.ts, row)?;
+    let raw_ts = read_ts(ts_col, ts_at, mapping.ts_unit)?
         .ok_or_else(|| format!("ts column {:?} is null", mapping.ts_column))?;
     if raw_ts < 0 {
         return Err(negative_ts_rejection(
@@ -5748,7 +5921,7 @@ fn build_metric_row(
     // admitted over OTLP.
     let name = match (cols.name, &cols.literal_family_name) {
         (Some(i), _) => {
-            let raw = read_string(cols.col(batch, i), row)?.ok_or_else(|| {
+            let raw = cols.read(batch, i, row, read_string)?.ok_or_else(|| {
                 format!(
                     "metric name column {:?} is null",
                     mapping.name_column.as_deref().unwrap_or_default()
@@ -5768,7 +5941,7 @@ fn build_metric_row(
     // one series here too.
     let mut labels: Vec<Label> = Vec::with_capacity(cols.labels.len());
     for (name, col_idx) in &cols.labels {
-        if let Some(value) = read_label_value(cols.col(batch, *col_idx), row)? {
+        if let Some(value) = cols.read(batch, *col_idx, row, read_label_value)? {
             if value.is_empty() {
                 continue;
             }
@@ -5791,11 +5964,12 @@ fn build_metric_row(
 
     let payload = match &cols.histogram {
         None => RowPayload::Scalar(
-            read_metric_number(cols.col(batch, cols.value), row)?
+            cols.read(batch, cols.value, row, read_metric_number)?
                 .ok_or_else(|| format!("value column {:?} is null", mapping.value_column))?,
         ),
         Some(h) => {
-            let le = read_metric_number(cols.col(batch, h.le), row)?
+            let le = cols
+                .read(batch, h.le, row, read_metric_number)?
                 .ok_or_else(|| "histogram le column is null".to_string())?;
             if !le.is_finite() {
                 // Matches `Rejection::NonFiniteHistogramBound`: OTLP's
@@ -5808,7 +5982,8 @@ fn build_metric_row(
             }
             // With a histogram mapping the value column is this bucket's own
             // count, so it is read as a count, not as a sample value.
-            let own_count = read_count(cols.col(batch, cols.value), row)
+            let own_count = cols
+                .read(batch, cols.value, row, read_count)
                 .map_err(|e| {
                     format!(
                         "value column {:?} is this bucket's own count on a classic-histogram \
@@ -5817,8 +5992,9 @@ fn build_metric_row(
                     )
                 })?
                 .ok_or_else(|| format!("value column {:?} is null", mapping.value_column))?;
-            let sum = read_metric_number(cols.col(batch, h.sum), row)?;
-            let count = read_count(cols.col(batch, h.count), row)?
+            let sum = cols.read(batch, h.sum, row, read_metric_number)?;
+            let count = cols
+                .read(batch, h.count, row, read_count)?
                 .ok_or_else(|| "histogram count column is null".to_string())?;
             RowPayload::Bucket(BucketRow {
                 le,
@@ -6898,7 +7074,7 @@ impl SpansLoadReport {
 }
 
 /// Resolved column indices for the mapped fields of one spans batch.
-struct SpansColumnIndex {
+struct SpansColumnIndex<'a> {
     trace_id: usize,
     span_id: usize,
     parent_span_id: Option<usize>,
@@ -6912,24 +7088,28 @@ struct SpansColumnIndex {
     /// One column index per `[[spans.attribute]]`, in mapping order.
     attributes: Vec<usize>,
     /// The `attrs_map_column`, already checked to be a map of strings.
-    attrs_map: Option<SpansAttrsMap>,
+    attrs_map: Option<SpansAttrsMap<'a>>,
     /// The batch's columns with every mapped dictionary column resolved once.
     columns: ResolvedColumns,
 }
 
-impl SpansColumnIndex {
+impl<'a> SpansColumnIndex<'a> {
     /// Resolve every mapped column against this batch's schema, and check the
     /// id columns' types and declared widths here rather than per row: a
     /// `FixedSizeBinary(n)` states its width in the schema, so a mapping that
     /// points `trace_id_column` at an 8-byte column is a mapping error that
     /// can be reported before the first row is decoded.
     ///
-    /// Each mapped dictionary column is resolved to its value type here too,
-    /// once for the whole batch rather than once per cell
-    /// ([`resolve_dictionary_column`]). The `attrs_map_column`'s key and value
-    /// dictionaries have their keys normalized once and are read in place
-    /// ([`SpansAttrsMap::resolve`]).
-    fn resolve(batch: &RecordBatch, mapping: &SpansMapping) -> Result<SpansColumnIndex, String> {
+    /// Each mapped dictionary column has its keys normalized here too, once
+    /// for the whole batch rather than once per cell, and is read in place
+    /// ([`resolve_dictionary_column`]), as the `attrs_map_column`'s key and
+    /// value dictionaries are ([`SpansAttrsMap::resolve`]). `mapped_keys` is
+    /// the mapping's [`SpansMapping::mapped_keys`], built once per load.
+    fn resolve(
+        batch: &RecordBatch,
+        mapping: &SpansMapping,
+        mapped_keys: &'a MappedKeys,
+    ) -> Result<SpansColumnIndex<'a>, String> {
         let schema = batch.schema();
         let idx = |name: &str| -> Result<usize, String> {
             schema
@@ -6972,7 +7152,7 @@ impl SpansColumnIndex {
             Some(c) => {
                 let i = idx(c)?;
                 check_attrs_map_column(schema.field(i).data_type(), c)?;
-                Some(SpansAttrsMap::resolve(batch.column(i), c, mapping)?)
+                Some(SpansAttrsMap::resolve(batch.column(i), c, mapped_keys)?)
             }
             None => None,
         };
@@ -7002,10 +7182,34 @@ impl SpansColumnIndex {
         })
     }
 
-    /// Column `i` as the row readers must read it: resolved when it was a
-    /// mapped dictionary column, the batch's own otherwise.
-    fn col<'a>(&'a self, batch: &'a RecordBatch, i: usize) -> &'a ArrayRef {
+    /// The array column `i`'s non-null cells are read out of, as
+    /// [`ResolvedColumns::col`].
+    #[cfg(test)]
+    fn col<'b>(&'b self, batch: &'b RecordBatch, i: usize) -> &'b ArrayRef {
         self.columns.col(batch, i)
+    }
+
+    /// The array and index the row readers read the cell at (`row`, column
+    /// `i`) from, as [`ResolvedColumns::cell`].
+    fn cell<'b>(
+        &'b self,
+        batch: &'b RecordBatch,
+        i: usize,
+        row: usize,
+    ) -> Result<(&'b ArrayRef, usize), String> {
+        self.columns.cell(batch, i, row)
+    }
+
+    /// Read the cell at (`row`, column `i`) with `read`, as
+    /// [`ResolvedColumns::read`].
+    fn read<T>(
+        &self,
+        batch: &RecordBatch,
+        i: usize,
+        row: usize,
+        read: impl FnOnce(&ArrayRef, usize) -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.columns.read(batch, i, row, read)
     }
 }
 
@@ -7114,7 +7318,8 @@ fn build_span(
     row: usize,
     dropped: &mut u64,
 ) -> Result<NormalizedSpan, String> {
-    let name = read_string(cols.col(batch, cols.name), row)?
+    let name = cols
+        .read(batch, cols.name, row, read_string)?
         .ok_or_else(|| format!("name column {:?} is null", mapping.name_column))?;
     if name.len() > limits.max_name_len {
         return Err(format!(
@@ -7128,20 +7333,24 @@ fn build_span(
     // a wrong width is a rejection and never a pad or a truncation. `read_id`
     // reports a wrong width as `None`, which is indistinguishable here from a
     // null cell; both are the same refusal, since neither can name a span.
-    let trace_id = read_id::<16>(cols.col(batch, cols.trace_id), row)?.ok_or_else(|| {
-        format!(
-            "trace_id column {:?} is null, or is not a 16-byte value (or a 32-character hex \
+    let trace_id = cols
+        .read(batch, cols.trace_id, row, read_id::<16>)?
+        .ok_or_else(|| {
+            format!(
+                "trace_id column {:?} is null, or is not a 16-byte value (or a 32-character hex \
              string). Ravel never pads or truncates an id.",
-            mapping.trace_id_column
-        )
-    })?;
-    let span_id = read_id::<8>(cols.col(batch, cols.span_id), row)?.ok_or_else(|| {
-        format!(
-            "span_id column {:?} is null, or is not an 8-byte value (or a 16-character hex \
+                mapping.trace_id_column
+            )
+        })?;
+    let span_id = cols
+        .read(batch, cols.span_id, row, read_id::<8>)?
+        .ok_or_else(|| {
+            format!(
+                "span_id column {:?} is null, or is not an 8-byte value (or a 16-character hex \
              string). Ravel never pads or truncates an id.",
-            mapping.span_id_column
-        )
-    })?;
+                mapping.span_id_column
+            )
+        })?;
     // A null parent cell and an EMPTY one are both a root span: OTLP reads an
     // empty `parent_span_id` field as a root, and empty bytes or "" is how
     // common trace exports write one. A present, non-empty, wrong-width value
@@ -7152,11 +7361,11 @@ fn build_span(
     let parent_span_id = match cols.parent_span_id {
         None => None,
         Some(i) => {
-            let column = cols.col(batch, i);
-            if id_cell_is_empty(column, row)? {
+            let (column, at) = cols.cell(batch, i, row)?;
+            if id_cell_is_empty(column, at)? {
                 None
             } else {
-                Some(read_id::<8>(column, row)?.ok_or_else(|| {
+                Some(read_id::<8>(column, at)?.ok_or_else(|| {
                     format!(
                         "parent_span_id column {:?} is not an 8-byte value (or a 16-character hex \
                          string). Ravel never pads or truncates an id; leave the cell null or \
@@ -7173,13 +7382,15 @@ fn build_span(
     // emits. A NULL cell has no OTLP counterpart and is refused instead: in a
     // file the operator controls it is a mapping or export mistake, and
     // placing a span at load time because a column was empty would hide it.
-    let start_cell_ns = read_ts(cols.col(batch, cols.start_ts), row, mapping.start_ts_unit)?
+    let (start_col, start_at) = cols.cell(batch, cols.start_ts, row)?;
+    let start_cell_ns = read_ts(start_col, start_at, mapping.start_ts_unit)?
         .ok_or_else(|| format!("start_ts column {:?} is null", mapping.start_ts_column))?;
     let start_ts_ns = match start_cell_ns {
         0 => now_ns,
         v => v,
     };
-    let end_cell_ns = read_ts(cols.col(batch, cols.end_ts), row, mapping.end_ts_unit)?
+    let (end_col, end_at) = cols.cell(batch, cols.end_ts, row)?;
+    let end_cell_ns = read_ts(end_col, end_at, mapping.end_ts_unit)?
         .ok_or_else(|| format!("end_ts column {:?} is null", mapping.end_ts_column))?;
     let end_ts_ns = match end_cell_ns {
         0 => start_ts_ns,
@@ -7197,7 +7408,7 @@ fn build_span(
             "taken from load time because start_ts is 0".to_string()
         } else {
             ts_read_unit(
-                cols.col(batch, cols.start_ts).data_type(),
+                start_col.data_type(),
                 mapping.start_ts_unit,
                 "start_ts_unit",
             )
@@ -7205,11 +7416,7 @@ fn build_span(
         let end_unit = if end_cell_ns == 0 {
             "taken from start_ts because end_ts is 0".to_string()
         } else {
-            ts_read_unit(
-                cols.col(batch, cols.end_ts).data_type(),
-                mapping.end_ts_unit,
-                "end_ts_unit",
-            )
+            ts_read_unit(end_col.data_type(), mapping.end_ts_unit, "end_ts_unit")
         };
         return Err(format!(
             "span timestamps are before the Unix epoch (start {start_ts_ns} ns, {start_unit}; \
@@ -7233,11 +7440,11 @@ fn build_span(
 
     let status_code = match cols.status_code {
         None => StatusCode::Unset,
-        Some(i) => read_status_code(cols.col(batch, i), row)?,
+        Some(i) => cols.read(batch, i, row, read_status_code)?,
     };
     let status_message = match cols.status_message {
         None => None,
-        Some(i) => match read_string(cols.col(batch, i), row)? {
+        Some(i) => match cols.read(batch, i, row, read_string)? {
             None => None,
             Some(message) => {
                 if message.len() > limits.max_status_message_len {
@@ -7322,7 +7529,10 @@ fn read_span_attrs(
         // OTLP span that simply omits the key. An EMPTY string is a value and
         // is stored: unlike a metric label, an empty attribute value is
         // meaningful on the span path and OTLP keeps it.
-        let Some(value) = read_attr(cols.col(batch, *col), row, map.value_type)? else {
+        let Some(value) = cols.read(batch, *col, row, |arr, at| {
+            read_attr(arr, at, map.value_type)
+        })?
+        else {
             continue;
         };
         let value = span_attr_string(&map.key, &value)?;
@@ -7389,7 +7599,7 @@ fn check_attrs_map_column(data_type: &DataType, column: &str) -> Result<(), Stri
 
 /// One batch's `attrs_map_column`, resolved once by [`SpansAttrsMap::resolve`]
 /// for every row [`read_span_attrs_map`] reads out of it.
-struct SpansAttrsMap {
+struct SpansAttrsMap<'a> {
     /// The mapping's name for the column, as a refusal quotes it.
     column: String,
     /// The batch's map column; its offsets and nulls index `keys` and `values`.
@@ -7398,8 +7608,12 @@ struct SpansAttrsMap {
     keys: MapChild,
     values: MapChild,
     /// Every key a mapped attribute names, with the column it reads.
-    mapped_keys: std::collections::HashMap<String, String>,
+    mapped_keys: &'a MappedKeys,
 }
+
+/// Every key a spans mapping's attributes name, with the column each reads:
+/// [`SpansMapping::mapped_keys`].
+type MappedKeys = std::collections::HashMap<String, String>;
 
 /// One string child of a spans attrs map, read per entry by [`MapChild::get`].
 enum MapChild {
@@ -7463,24 +7677,18 @@ impl MapChild {
     }
 }
 
-impl SpansAttrsMap {
+impl<'a> SpansAttrsMap<'a> {
     /// Resolve the map column `arr` of one batch, already checked by
     /// [`check_attrs_map_column`]: each child's dictionary keys once, as
-    /// [`MapChild::new`] describes, and the mapped keys a map entry may not
-    /// repeat.
-    fn resolve(arr: &ArrayRef, column: &str, mapping: &SpansMapping) -> Result<Self, String> {
+    /// [`MapChild::new`] describes. `mapped_keys` holds the mapped keys a map
+    /// entry may not repeat.
+    fn resolve(arr: &ArrayRef, column: &str, mapped_keys: &'a MappedKeys) -> Result<Self, String> {
         let map = arr
             .as_map_opt()
             .ok_or_else(|| format!("attrs_map_column {column:?} is not a map column"))?
             .clone();
         let keys = MapChild::new(map.keys());
         let values = MapChild::new(map.values());
-        let mut mapped_keys = std::collections::HashMap::new();
-        for (spec, _) in mapping.mapped_attributes() {
-            mapped_keys
-                .entry(spec.key.clone())
-                .or_insert_with(|| spec.column.clone());
-        }
         Ok(SpansAttrsMap {
             column: column.to_string(),
             map,
@@ -7630,6 +7838,7 @@ enum SpansDecoded {
 fn decode_spans_batch(
     state: &mut SpansDecodeState,
     mapping: &SpansMapping,
+    mapped_keys: &MappedKeys,
     limits: &SpanIngestLimits,
     now_ns: i64,
     batch_rows: usize,
@@ -7669,7 +7878,7 @@ fn decode_spans_batch(
         }
     };
 
-    let cols = match SpansColumnIndex::resolve(&batch, mapping) {
+    let cols = match SpansColumnIndex::resolve(&batch, mapping, mapped_keys) {
         Ok(cols) => cols,
         Err(reason) => return SpansDecoded::Failed(reason),
     };
@@ -7868,18 +8077,21 @@ async fn load_spans_into(
 
     let mut state = SpansDecodeState { cursor, skip_rows };
     let mapping = Arc::new(mapping.clone());
+    let mapped_keys = Arc::new(mapping.mapped_keys());
 
     let mut inflight: std::collections::VecDeque<Inflight<SpanWriteReceipt, SpanWriteError>> =
         std::collections::VecDeque::with_capacity(pipeline_depth);
 
     loop {
         let mapping_for_decode = Arc::clone(&mapping);
+        let mapped_keys_for_decode = Arc::clone(&mapped_keys);
         let limits_for_decode = limits.clone();
         let (returned, decoded) = tokio::task::spawn_blocking(move || {
             let mut state = state;
             let outcome = decode_spans_batch(
                 &mut state,
                 &mapping_for_decode,
+                &mapped_keys_for_decode,
                 &limits_for_decode,
                 now_ns,
                 batch_rows,
@@ -12277,6 +12489,217 @@ type = "i64"
         );
     }
 
+    /// A dictionary column of optional strings, nulls as null keys.
+    fn opt_dict_col(vals: Vec<Option<&str>>) -> ArrayRef {
+        Arc::new(vals.into_iter().collect::<DictionaryArray<Int32Type>>())
+    }
+
+    /// The logs row path reads every mapped dictionary column in place: each
+    /// non-null cell is read out of the batch's own dictionary values, not out
+    /// of a copy of the values the keys reference, which overflows a `Utf8`
+    /// copy's i32 offsets once those bytes pass 2 GiB and fails the batch. A
+    /// null key still reads as a null cell.
+    #[test]
+    fn the_logs_row_path_reads_dictionary_columns_in_place() {
+        let trace_hex = hex::encode([1u8; 16]);
+        let span_hex = hex::encode([2u8; 8]);
+        let b = batch(vec![
+            ("ts", i64_col(vec![NOW_NS; 3])),
+            ("body", opt_dict_col(vec![Some("hello"), None, Some("bye")])),
+            ("sev", opt_dict_col(vec![Some("WARN"), Some("INFO"), None])),
+            (
+                "trace_id",
+                opt_dict_col(vec![
+                    Some(trace_hex.as_str()),
+                    None,
+                    Some(trace_hex.as_str()),
+                ]),
+            ),
+            (
+                "span_id",
+                opt_dict_col(vec![Some(span_hex.as_str()), Some(span_hex.as_str()), None]),
+            ),
+            (
+                "svc",
+                opt_dict_col(vec![Some("api"), Some("web"), Some("api")]),
+            ),
+            ("cat", opt_dict_col(vec![None, Some("beta"), Some("alpha")])),
+        ]);
+        let mut m = base_mapping();
+        m.body_column = Some("body".to_string());
+        m.severity_text_column = Some("sev".to_string());
+        m.trace_id_column = Some("trace_id".to_string());
+        m.span_id_column = Some("span_id".to_string());
+        m.resource_attributes = vec![attr("service.name", "svc", ColType::Str)];
+        m.attributes = vec![attr("cat", "cat", ColType::Str)];
+
+        let cols = ColumnIndex::resolve(&b, &m).expect("columns resolve");
+        for name in ["body", "sev", "trace_id", "span_id", "svc", "cat"] {
+            let i = b.schema().index_of(name).expect("a mapped column");
+            let own = b.column(i).as_any_dictionary().values();
+            let row = (0..b.num_rows())
+                .find(|row| b.column(i).is_valid(*row))
+                .expect("a non-null cell");
+            let (read_from, _) = cols.cell(&b, i, row).expect("the cell reads");
+            assert!(
+                Arc::ptr_eq(read_from, own),
+                "the logs row path reads {name} out of the batch's own dictionary values"
+            );
+        }
+
+        let limits = LogIngestLimits::default();
+        let records: Vec<NormalizedLogRecord> = (0..b.num_rows())
+            .map(|row| build_record(&b, &cols, &m, &limits, NOW_NS, row).expect("the row builds"))
+            .collect();
+        let str_attr = |key: &str, value: &str| (key.to_string(), AttrValue::Str(value.into()));
+        let got: Vec<_> = records
+            .iter()
+            .map(|r| {
+                (
+                    r.body.as_str(),
+                    r.severity_text.as_str(),
+                    r.trace_id,
+                    r.span_id,
+                    r.attrs.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("hello", "WARN", Some([1u8; 16]), Some([2u8; 8]), vec![]),
+                (
+                    "",
+                    "INFO",
+                    None,
+                    Some([2u8; 8]),
+                    vec![str_attr("cat", "beta")]
+                ),
+                (
+                    "bye",
+                    "",
+                    Some([1u8; 16]),
+                    None,
+                    vec![str_attr("cat", "alpha")]
+                ),
+            ]
+        );
+        assert_eq!(
+            records[0].stream_id, records[2].stream_id,
+            "the resource dictionary reads one value for both of its keys"
+        );
+        assert_ne!(records[0].stream_id, records[1].stream_id);
+    }
+
+    /// The columnar path's id columns are read in place: a dictionary id
+    /// column's cells are read out of the batch's own dictionary values, by the
+    /// hex rule for a string dictionary and the binary rule otherwise, and a
+    /// null key is a null cell.
+    #[test]
+    fn the_columnar_id_columns_are_read_in_place() {
+        let trace_hex = hex::encode([1u8; 16]);
+        let hex_ids = opt_dict_col(vec![Some(trace_hex.as_str()), None, Some("not hex")]);
+        let bin_ids: ArrayRef = Arc::new(DictionaryArray::<Int32Type>::new(
+            Int32Array::from(vec![Some(0), None, Some(0)]),
+            Arc::new(BinaryArray::from(vec![[2u8; 8].as_slice()])),
+        ));
+        for (name, arr, want_hex, want) in [
+            (
+                "hex",
+                &hex_ids,
+                true,
+                vec![Some([1u8; 16].to_vec()), None, None],
+            ),
+            (
+                "binary",
+                &bin_ids,
+                false,
+                vec![Some([2u8; 8].to_vec()), None, Some([2u8; 8].to_vec())],
+            ),
+        ] {
+            let column = id_column(arr).expect("the id column resolves");
+            let src = id_column_src(&column);
+            let IdSrc::Dict { column: dict, hex } = &src else {
+                panic!("the {name} id column is read as a dictionary");
+            };
+            assert!(
+                Arc::ptr_eq(&dict.values, arr.as_any_dictionary().values()),
+                "the {name} id column reads the batch's own dictionary values"
+            );
+            assert_eq!(*hex, want_hex, "the {name} id column's read rule");
+            let got: Vec<Option<Vec<u8>>> = (0..arr.len())
+                .map(|row| src.get(row).expect("the cell reads"))
+                .collect();
+            assert_eq!(got, want, "the {name} id column's cells");
+        }
+    }
+
+    /// The metrics row path reads its name and label dictionary columns in
+    /// place, and reads the same rows a plain copy of the batch reads, a null
+    /// label key omitting its label.
+    #[test]
+    fn the_metrics_row_path_reads_dictionary_columns_in_place() {
+        const TEXT: &str = "[metrics]\nname_column = \"metric\"\nvalue_column = \"value\"\n\
+                            ts_column = \"ts\"\nts_unit = \"nanos\"\nkind = \"gauge\"\n\n\
+                            [[metrics.label]]\nname = \"host\"\ncolumn = \"host\"\n";
+        let MappingSection::Metrics(mapping) =
+            parse_mapping_document(TEXT, SignalArg::Metrics).expect("valid mapping")
+        else {
+            panic!("a [metrics] section parses as metrics");
+        };
+        let names = vec![Some("cpu"), Some("mem"), Some("cpu")];
+        let hosts = vec![Some("a"), None, Some("b")];
+        let columns = |metric: ArrayRef, host: ArrayRef| {
+            batch(vec![
+                ("ts", i64_col(vec![NOW_NS; 3])),
+                (
+                    "value",
+                    Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0])) as ArrayRef,
+                ),
+                ("metric", metric),
+                ("host", host),
+            ])
+        };
+        let dict = columns(opt_dict_col(names.clone()), opt_dict_col(hosts.clone()));
+        let plain = columns(
+            Arc::new(StringArray::from(names)),
+            Arc::new(StringArray::from(hosts)),
+        );
+
+        let cols = MetricsColumnIndex::resolve(&dict, &mapping).expect("columns resolve");
+        for name in ["metric", "host"] {
+            let i = dict.schema().index_of(name).expect("a mapped column");
+            let (read_from, _) = cols.cell(&dict, i, 0).expect("the cell reads");
+            assert!(
+                Arc::ptr_eq(read_from, dict.column(i).as_any_dictionary().values()),
+                "the metrics row path reads {name} out of the batch's own dictionary values"
+            );
+        }
+
+        let limits = IngestLimits::default();
+        let rows = |b: &RecordBatch| -> Vec<(String, Vec<Label>)> {
+            let cols = MetricsColumnIndex::resolve(b, &mapping).expect("columns resolve");
+            (0..b.num_rows())
+                .map(|row| {
+                    let r = build_metric_row(b, &cols, &mapping, &limits, NOW_NS, row)
+                        .expect("the row builds");
+                    (r.name, r.labels)
+                })
+                .collect()
+        };
+        let got = rows(&dict);
+        assert_eq!(
+            got,
+            rows(&plain),
+            "the dictionary batch reads the plain rows"
+        );
+        assert_eq!(
+            got.iter().map(|(_, l)| l.len()).collect::<Vec<_>>(),
+            vec![1, 0, 1],
+            "the null host key omits its label"
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn load_row(
         store: Arc<dyn ObjectStoreBackend>,
@@ -14820,7 +15243,9 @@ type = "str"
             let text = MAPPING_TOML.replace("[spans]\n", "[spans]\nattrs_map_column = \"attrs\"\n");
             let mapping = parse_spans_mapping(&text).expect("valid mapping");
             let limits = SpanIngestLimits::default();
-            let resolved = SpansAttrsMap::resolve(&map, "attrs", &mapping).expect("map resolves");
+            let mapped_keys = mapping.mapped_keys();
+            let resolved =
+                SpansAttrsMap::resolve(&map, "attrs", &mapped_keys).expect("map resolves");
             let mut dropped = 0;
             let rows: Vec<Vec<(String, String)>> = (0..2)
                 .map(|row| {
@@ -14940,7 +15365,9 @@ type = "str"
                     ("end_ns", i64_col(vec![end_ns])),
                     ("method", str_col(vec!["GET"])),
                 ]);
-                let cols = SpansColumnIndex::resolve(&batch, &mapping).expect("columns resolve");
+                let mapped_keys = mapping.mapped_keys();
+                let cols = SpansColumnIndex::resolve(&batch, &mapping, &mapped_keys)
+                    .expect("columns resolve");
                 build_span(&batch, &cols, &mapping, &limits, NOW_NS, 0, &mut 0)
             };
 
@@ -15002,7 +15429,9 @@ type = "str"
             ]);
 
             let counters = dict_counters();
-            let cols = SpansColumnIndex::resolve(&batch, &mapping).expect("columns resolve");
+            let mapped_keys = mapping.mapped_keys();
+            let cols =
+                SpansColumnIndex::resolve(&batch, &mapping, &mapped_keys).expect("columns resolve");
             assert_eq!(
                 counters.columns(),
                 4,
@@ -15164,7 +15593,9 @@ type = "str"
             let limits = SpanIngestLimits::default();
             let (mapping, batch) = dict_attrs_map_fixture();
             let counters = dict_counters();
-            let cols = SpansColumnIndex::resolve(&batch, &mapping).expect("columns resolve");
+            let mapped_keys = mapping.mapped_keys();
+            let cols =
+                SpansColumnIndex::resolve(&batch, &mapping, &mapped_keys).expect("columns resolve");
             assert_eq!(
                 counters.columns(),
                 2,
@@ -15228,7 +15659,9 @@ type = "str"
             let cap = LOADER_MAX_ATTRIBUTES_PER_RECORD;
             let limits = SpanIngestLimits::default();
             let (mapping, batch) = dict_attrs_map_fixture();
-            let cols = SpansColumnIndex::resolve(&batch, &mapping).expect("columns resolve");
+            let mapped_keys = mapping.mapped_keys();
+            let cols =
+                SpansColumnIndex::resolve(&batch, &mapping, &mapped_keys).expect("columns resolve");
             /// A row's stored attributes and dropped count, or its refusal.
             type Outcome = Result<(Vec<(String, String)>, u64), String>;
             let got: Vec<Outcome> = (0..batch.num_rows())
@@ -15303,7 +15736,9 @@ type = "str"
             let (mapping, batch) = dict_attrs_map_fixture();
             type Outcome = Result<(Vec<(String, String)>, u64), String>;
             let outcomes = |batch: &RecordBatch| -> Vec<Outcome> {
-                let cols = SpansColumnIndex::resolve(batch, &mapping).expect("columns resolve");
+                let mapped_keys = mapping.mapped_keys();
+                let cols = SpansColumnIndex::resolve(batch, &mapping, &mapped_keys)
+                    .expect("columns resolve");
                 (0..batch.num_rows())
                     .map(|row| {
                         let mut dropped = 0;
@@ -15350,7 +15785,9 @@ type = "str"
                 ("svc", str_col(vec!["cart"; 2])),
                 ("attrs", dict_attrs_map(&cells)),
             ]);
-            let cols = SpansColumnIndex::resolve(&batch, &mapping).expect("columns resolve");
+            let mapped_keys = mapping.mapped_keys();
+            let cols =
+                SpansColumnIndex::resolve(&batch, &mapping, &mapped_keys).expect("columns resolve");
             let got: Vec<Result<Vec<(String, String)>, String>> = (0..2)
                 .map(|row| {
                     build_span(&batch, &cols, &mapping, &limits, NOW_NS, row, &mut 0)
@@ -15425,7 +15862,9 @@ type = "str"
                 ])
             };
             let outcomes = |batch: &RecordBatch| -> Vec<Result<Vec<(String, String)>, String>> {
-                let cols = SpansColumnIndex::resolve(batch, &mapping).expect("columns resolve");
+                let mapped_keys = mapping.mapped_keys();
+                let cols = SpansColumnIndex::resolve(batch, &mapping, &mapped_keys)
+                    .expect("columns resolve");
                 (0..ROWS)
                     .map(|row| {
                         build_span(batch, &cols, &mapping, &limits, NOW_NS, row, &mut 0)
@@ -15459,7 +15898,9 @@ type = "str"
         #[test]
         fn attrs_map_dictionaries_are_read_in_place() {
             let (mapping, batch) = dict_attrs_map_fixture();
-            let cols = SpansColumnIndex::resolve(&batch, &mapping).expect("columns resolve");
+            let mapped_keys = mapping.mapped_keys();
+            let cols =
+                SpansColumnIndex::resolve(&batch, &mapping, &mapped_keys).expect("columns resolve");
             let resolved = cols.attrs_map.as_ref().expect("the mapping names a map");
             let source = batch
                 .column_by_name("attrs")
@@ -15577,6 +16018,298 @@ type = "str"
             );
         }
 
+        /// `MAPPING_TOML` plus every other string column a spans row reader
+        /// reads: the parent id, the status message and a resource attribute.
+        fn every_string_column_mapping() -> SpansMapping {
+            let text = MAPPING_TOML.replace(
+                "[spans]\n",
+                "[spans]\nparent_span_id_column = \"parent\"\nstatus_message_column = \
+                 \"status_msg\"\n",
+            ) + "\n[[spans.resource_attribute]]\nkey = \"service.name\"\ncolumn = \
+                 \"svc\"\ntype = \"str\"\n";
+            parse_spans_mapping(&text).expect("valid mapping")
+        }
+
+        /// Five spans whose every string column [`every_string_column_mapping`]
+        /// maps is dictionary encoded, each row distinct, with null keys and an
+        /// empty parent among them. Row 2's name is null and refuses its row.
+        fn every_string_column_dict_batch() -> RecordBatch {
+            const ROWS: usize = 5;
+            let opt_dict = |vals: Vec<Option<String>>| -> ArrayRef {
+                opt_dict_col(vals.iter().map(Option::as_deref).collect())
+            };
+            let hex_u64 = |i: u64| Some(hex::encode(i.to_be_bytes()));
+            let some = |s: &str| Some(s.to_string());
+            batch(vec![
+                (
+                    "trace_id",
+                    opt_dict(
+                        (0..ROWS)
+                            .map(|i| Some(hex::encode([1 + (i % 2) as u8; 16])))
+                            .collect(),
+                    ),
+                ),
+                (
+                    "span_id",
+                    opt_dict((0..ROWS as u64).map(|i| hex_u64(i + 1)).collect()),
+                ),
+                (
+                    "parent",
+                    opt_dict(vec![None, some(""), hex_u64(1), hex_u64(1), hex_u64(4)]),
+                ),
+                (
+                    "name",
+                    opt_dict(vec![some("a"), some("b"), None, some("a"), some("c")]),
+                ),
+                ("start_ns", i64_col(vec![NOW_NS; ROWS])),
+                ("end_ns", i64_col(vec![NOW_NS; ROWS])),
+                (
+                    "status_msg",
+                    opt_dict(vec![some("ok"), None, some("ok"), some(""), some("boom")]),
+                ),
+                (
+                    "method",
+                    opt_dict(vec![
+                        some("GET"),
+                        some("PUT"),
+                        None,
+                        some("GET"),
+                        some("POST"),
+                    ]),
+                ),
+                (
+                    "svc",
+                    opt_dict(vec![
+                        some("cart"),
+                        some("web"),
+                        some("cart"),
+                        None,
+                        some("web"),
+                    ]),
+                ),
+            ])
+        }
+
+        /// The spans row path reads every mapped dictionary column in place:
+        /// each non-null cell is read out of the batch's own dictionary values,
+        /// not out of a copy of the values the keys reference. A copy of a
+        /// `Utf8` column overflows its i32 offsets once those bytes pass 2 GiB,
+        /// failing the whole batch where each over-cap value is dropped and
+        /// counted.
+        #[test]
+        fn mapped_dictionary_columns_are_read_in_place() {
+            let limits = SpanIngestLimits::default();
+            let mapping = every_string_column_mapping();
+            let batch = every_string_column_dict_batch();
+            let mapped_keys = mapping.mapped_keys();
+            let cols =
+                SpansColumnIndex::resolve(&batch, &mapping, &mapped_keys).expect("columns resolve");
+            for name in [
+                "trace_id",
+                "span_id",
+                "parent",
+                "name",
+                "status_msg",
+                "method",
+                "svc",
+            ] {
+                let i = batch.schema().index_of(name).expect("a mapped column");
+                let row = (0..batch.num_rows())
+                    .find(|row| batch.column(i).is_valid(*row))
+                    .expect("a non-null cell");
+                let (read_from, _) = cols.cell(&batch, i, row).expect("the cell reads");
+                assert!(
+                    Arc::ptr_eq(read_from, batch.column(i).as_any_dictionary().values()),
+                    "the spans row path reads {name} out of the batch's own dictionary values"
+                );
+            }
+
+            let span =
+                |row: usize| build_span(&batch, &cols, &mapping, &limits, NOW_NS, row, &mut 0);
+            let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+            let first = span(0).expect("row 0 builds");
+            assert_eq!(
+                (
+                    first.trace_id,
+                    first.span_id,
+                    first.parent_span_id,
+                    first.name.as_str(),
+                    first.status_message.as_deref(),
+                ),
+                ([1u8; 16], 1u64.to_be_bytes(), None, "a", Some("ok"))
+            );
+            assert_eq!(
+                first.attrs,
+                vec![pair("http.method", "GET"), pair("service.name", "cart")]
+            );
+            let second = span(1).expect("row 1 builds");
+            assert_eq!(
+                (second.parent_span_id, second.status_message.as_deref()),
+                (None, None),
+                "an empty parent is a root and a null message is no message"
+            );
+            assert_eq!(
+                span(2).expect_err("a null name is refused"),
+                "name column \"name\" is null"
+            );
+            let fourth = span(3).expect("row 3 builds");
+            assert_eq!(
+                (
+                    fourth.parent_span_id,
+                    fourth.status_message.as_deref(),
+                    fourth.attrs
+                ),
+                (
+                    Some(1u64.to_be_bytes()),
+                    None,
+                    vec![pair("http.method", "GET")]
+                ),
+                "an empty message is no message and a null resource key no attribute"
+            );
+        }
+
+        /// The rows `--skip-rows` keeps read the outcomes they read in the whole
+        /// batch. The slice it takes keeps each dictionary's whole values array
+        /// and shifts only the keys, so a cell is found by the sliced key, not
+        /// by the row's position in the values.
+        #[test]
+        fn a_sliced_batch_reads_the_dictionary_rows_it_kept() {
+            let limits = SpanIngestLimits::default();
+            let mapping = every_string_column_mapping();
+            let batch = every_string_column_dict_batch();
+            let mapped_keys = mapping.mapped_keys();
+            let outcomes = |batch: &RecordBatch| -> Vec<Result<NormalizedSpan, String>> {
+                let cols = SpansColumnIndex::resolve(batch, &mapping, &mapped_keys)
+                    .expect("columns resolve");
+                (0..batch.num_rows())
+                    .map(|row| build_span(batch, &cols, &mapping, &limits, NOW_NS, row, &mut 0))
+                    .collect()
+            };
+            let whole = outcomes(&batch);
+            assert_eq!(
+                whole.iter().filter(|o| o.is_ok()).count(),
+                4,
+                "every row but the null-name one builds"
+            );
+            let name = batch.schema().index_of("name").expect("the name column");
+            for cut in 1..batch.num_rows() {
+                let sliced = batch.slice(cut, batch.num_rows() - cut);
+                let cols = SpansColumnIndex::resolve(&sliced, &mapping, &mapped_keys)
+                    .expect("columns resolve");
+                let row = (0..sliced.num_rows())
+                    .find(|row| sliced.column(name).is_valid(*row))
+                    .expect("a non-null name");
+                let (read_from, _) = cols.cell(&sliced, name, row).expect("the cell reads");
+                assert!(
+                    Arc::ptr_eq(read_from, batch.column(name).as_any_dictionary().values()),
+                    "the slice at {cut} reads the whole batch's own dictionary values"
+                );
+                assert_eq!(outcomes(&sliced), whole[cut..], "the slice at {cut}");
+            }
+        }
+
+        /// A Parquet round trip over a dictionary-encoded attribute column
+        /// whose 2049 rows all reference one 1 MiB value: every value is over
+        /// the cap, dropped and counted, and the load succeeds. The referenced
+        /// bytes pass the i32 offset range (2049 MiB), so the copy arrow's
+        /// `take` made of this column failed the batch with an offset overflow
+        /// and no row number.
+        #[tokio::test]
+        async fn a_dictionary_attribute_referencing_past_the_offset_range_loads() {
+            use parquet::file::properties::WriterProperties;
+            use ravel_object_store::memory::MemoryStore;
+
+            const ROWS: usize = 2049;
+            const VALUE_LEN: usize = 1 << 20;
+            assert!(
+                ROWS * VALUE_LEN > i32::MAX as usize,
+                "the referenced bytes pass the i32 offset range"
+            );
+            let long = "v".repeat(VALUE_LEN);
+            let method: ArrayRef = Arc::new(DictionaryArray::<Int32Type>::new(
+                Int32Array::from(vec![0; ROWS]),
+                Arc::new(StringArray::from(vec![long.as_str()])),
+            ));
+            let mapping = parse_spans_mapping(MAPPING_TOML).expect("valid mapping");
+            let batch = batch(vec![
+                ("trace_id", bin_col(vec![vec![1u8; 16]; ROWS])),
+                (
+                    "span_id",
+                    bin_col(
+                        (0..ROWS as u64)
+                            .map(|i| (i + 1).to_be_bytes().to_vec())
+                            .collect(),
+                    ),
+                ),
+                ("name", str_col(vec!["op"; ROWS])),
+                ("start_ns", i64_col(vec![NOW_NS; ROWS])),
+                ("end_ns", i64_col(vec![NOW_NS; ROWS])),
+                ("method", method),
+            ]);
+            let dir = tempfile::tempdir().expect("tempdir");
+            let pq = dir.path().join("spans.parquet");
+            let file = std::fs::File::create(&pq).expect("create parquet");
+            // The dictionary page must hold the one value, or the writer falls
+            // back to plain pages and the column no longer reads as a
+            // dictionary.
+            let props = WriterProperties::builder()
+                .set_dictionary_page_size_limit(4 * VALUE_LEN)
+                .build();
+            let mut writer =
+                parquet::arrow::ArrowWriter::try_new(file, batch.schema(), Some(props))
+                    .expect("arrow writer");
+            writer.write(&batch).expect("write batch");
+            writer.close().expect("close writer");
+            assert!(
+                std::fs::metadata(&pq).expect("the file").len() < 4 * VALUE_LEN as u64,
+                "the file holds the value once, in its dictionary page"
+            );
+
+            let schema = match reader_schema_for_path(&pq).expect("the footer parses") {
+                Some(schema) => schema,
+                None => ParquetRecordBatchReaderBuilder::try_new(
+                    std::fs::File::open(&pq).expect("open parquet"),
+                )
+                .expect("reader")
+                .schema()
+                .clone(),
+            };
+            let method_type = schema
+                .field_with_name("method")
+                .expect("the method column")
+                .data_type();
+            assert!(
+                matches!(method_type, DataType::Dictionary(_, _)),
+                "the method column reads as a dictionary, not {method_type:?}"
+            );
+
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let mut report = SpansLoadReport::default();
+            load_spans_into(
+                &mut report,
+                store,
+                &pq,
+                "acme",
+                &mapping,
+                1,
+                10_000,
+                0,
+                1,
+                1,
+                1,
+                None,
+                NOW_NS,
+                Arc::new(SystemClock),
+            )
+            .await
+            .expect("the load succeeds");
+            assert_eq!(report.rows_processed, ROWS as u64, "every span is kept");
+            assert_eq!(
+                report.attributes_dropped, ROWS as u64,
+                "every row's over-cap value is dropped and counted"
+            );
+        }
+
         /// A dictionary chunk whose dictionary is empty is answered rather than
         /// aborting inside arrow's `normalized_keys`, which asserts the values
         /// array is non-empty: an all-null chunk resolves to an all-null column
@@ -15589,9 +16322,11 @@ type = "str"
             let values = Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef;
             let arr: ArrayRef = Arc::new(DictionaryArray::<Int32Type>::new(keys, values));
 
-            let resolved = resolve_dictionary_column(&arr)
+            let Some(RowColumn::Plain(resolved)) = resolve_dictionary_column(&arr)
                 .expect("an all-null chunk is answered, not refused")
-                .expect("a dictionary column resolves");
+            else {
+                panic!("a dictionary column resolves, to a column of its value type");
+            };
             assert_eq!(
                 resolved.data_type(),
                 &DataType::Utf8,
@@ -15645,7 +16380,9 @@ type = "str"
                 ("end_ns", i64_col(vec![NOW_NS - 1])),
                 ("method", str_col(vec!["GET"])),
             ]);
-            let cols = SpansColumnIndex::resolve(&batch, &mapping).expect("columns resolve");
+            let mapped_keys = mapping.mapped_keys();
+            let cols =
+                SpansColumnIndex::resolve(&batch, &mapping, &mapped_keys).expect("columns resolve");
             let err = build_span(&batch, &cols, &mapping, &limits, NOW_NS, 0, &mut 0)
                 .expect_err("end before start");
             assert_eq!(
@@ -15739,7 +16476,9 @@ type = "str"
                 ("status_msg", row.status_msg),
                 ("method", row.method),
             ]);
-            let cols = SpansColumnIndex::resolve(&batch, &mapping).expect("columns resolve");
+            let mapped_keys = mapping.mapped_keys();
+            let cols =
+                SpansColumnIndex::resolve(&batch, &mapping, &mapped_keys).expect("columns resolve");
             build_span(&batch, &cols, &mapping, &limits, NOW_NS, 0, dropped)
         }
 
@@ -16147,7 +16886,9 @@ type = "str"
                     ("method", str_col(vec!["GET"])),
                     ("digest", bin_col(vec![raw])),
                 ]);
-                let cols = SpansColumnIndex::resolve(&batch, &mapping).expect("columns resolve");
+                let mapped_keys = mapping.mapped_keys();
+                let cols = SpansColumnIndex::resolve(&batch, &mapping, &mapped_keys)
+                    .expect("columns resolve");
                 let mut dropped = 0u64;
                 let span = build_span(&batch, &cols, &mapping, &limits, NOW_NS, 0, &mut dropped)
                     .expect("an over-cap attribute value does not reject the span");
