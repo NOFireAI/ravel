@@ -306,6 +306,11 @@ jobs:
       # classification is covered by these cases or not at all (issue #2036).
       - name: CI bucket-create cases (issue #2036)
         run: bash scripts/ci-create-bucket.test.sh
+      # A filter that stopped matching the service container would surface in
+      # the demo as a timeout three minutes later instead of the real exit code
+      # (issue #2308).
+      - name: Demo createbucket container-filter cases (issue #2308)
+        run: bash scripts/demo.test.sh
 
       # An ADR amendment sometimes claims it updated other places in the same
       # document to point back at it; review kept finding the edit only

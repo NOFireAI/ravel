@@ -77,10 +77,15 @@ wait_for() {
 # service's own exit code was. The listing also carries any container a
 # `docker compose run createbucket` left behind (named
 # <project>-createbucket-run-<id>), so only the service's own container,
-# <project>-createbucket-<index>, is read.
+# <project>-createbucket-<index>, is read. DEMO_CREATEBUCKET_POLLS overrides
+# the 180 one-second polls; scripts/demo.test.sh sets it.
 createbucket_exit_code() {
-  local attempt line="" listing name rest
-  for attempt in $(seq 1 180); do
+  local attempt line="" listing name rest polls="${DEMO_CREATEBUCKET_POLLS:-180}"
+  if [[ ! "$polls" =~ ^[1-9][0-9]*$ ]]; then
+    log "DEMO_CREATEBUCKET_POLLS must be a positive whole number of polls, not '${polls}'"
+    return 1
+  fi
+  for attempt in $(seq 1 "$polls"); do
     listing="$(docker compose -f "$RUSTFS_COMPOSE" ps --all \
       --format '{{.Name}} {{.State}} {{.ExitCode}}' createbucket 2>/dev/null)" || listing=""
     line=""
