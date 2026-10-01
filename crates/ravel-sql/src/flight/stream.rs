@@ -79,7 +79,7 @@ use crate::flight::ClockRef;
 use crate::flight::FlightSqlConfig;
 use crate::flight::request::status_from_sql;
 use crate::flight_ticket::FlightTicket;
-use crate::validate::validate;
+use crate::validate::validate_query;
 
 /// The `DoGet` response stream type the blanket `FlightService` impl expects.
 pub(super) type DoGetStream =
@@ -109,7 +109,8 @@ pub(super) async fn statement_stream(
     // bytes a client holds, and the gate is cheap; running it again means a
     // tampered or replayed ticket cannot reach the planner even if it somehow
     // survived the MAC.
-    validate(&ticket.statement).map_err(|err| status_from_sql(&SqlError::from(err), tenant))?;
+    validate_query(&ticket.statement)
+        .map_err(|err| status_from_sql(&SqlError::from(err), tenant))?;
 
     let now_ns = clock.now_ns();
     // The ticket's own deadline_ns is client-supplied and may only shorten
@@ -223,7 +224,7 @@ pub(super) async fn statement_stream(
 /// redeemed ticket is a slice ticket (`slice_count > 1`). It differs from
 /// [`statement_stream`] in exactly the ways ADR-0071 requires, and no others:
 ///
-/// - No [`validate`]: a slice ticket carries no SQL statement
+/// - No [`validate_query`]: a slice ticket carries no SQL statement
 ///   (`statement: String::new()`), so there is nothing to re-gate. The ticket
 ///   MAC already authenticated that this coordinator minted it; only the
 ///   coordinator, never an external client, ever holds one.
