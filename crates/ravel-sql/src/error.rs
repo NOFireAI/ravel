@@ -32,7 +32,7 @@
 //! errors (which carry only counts and limits an operator needs).
 
 use datafusion::error::DataFusionError;
-use ravel_catalog::{CatalogError, LoadColumnStatsError, SnapshotFormatError};
+use ravel_catalog::{CatalogError, HEAD_FORMAT_VERSION, LoadColumnStatsError, SnapshotFormatError};
 use ravel_commit::erasure::ErasureError;
 use ravel_commit::record::RecordError;
 use ravel_cpu_gate::CpuGateError;
@@ -526,7 +526,15 @@ impl SqlError {
             SqlError::ColumnStats(
                 LoadColumnStatsError::Store { .. } | LoadColumnStatsError::MemoryExhausted(_),
             ) => MSG_UNAVAILABLE.to_string(),
-            SqlError::ColumnStats(_) => MSG_CORRUPT.to_string(),
+            // A HEAD the loader cannot decode takes the class the catalog's own
+            // HEAD read gives the same `SnapshotFormatError`, so a newer-version
+            // HEAD is retryable on both paths.
+            SqlError::ColumnStats(LoadColumnStatsError::HeadCorrupt { source, .. }) => {
+                redact_snapshot_format(source).to_string()
+            }
+            SqlError::ColumnStats(LoadColumnStatsError::TenantHashMismatch { .. }) => {
+                MSG_CORRUPT.to_string()
+            }
             SqlError::Fetch(fetch) => match fetch {
                 // A store-side checksum mismatch is the same permanent data
                 // fault as a failed decode, as on the PromQL path.
@@ -628,20 +636,36 @@ impl SqlError {
 ///
 /// The rule is whether a retry, possibly routed to another node, can succeed:
 ///
-/// - A decode failure of stored bytes whose format version this build covers is
-///   a permanent data fault ([`MSG_CORRUPT`], `ErrorClass::Internal`, 500):
+/// - A fault in stored bytes whose format version this build covers is a
+///   permanent data fault ([`MSG_CORRUPT`], `ErrorClass::Internal`, 500):
 ///   re-reading the same object on any node fails the same way. That is
-///   `CompactionRecordDecode`, `ErasureRequestDecode`, and `SnapshotFormat`,
-///   alongside the existing corrupt group (`Reconstruction`, `FieldMismatch`,
-///   `Record`, `Key`).
-/// - "This build cannot read a newer format version" is retryable
+///   `Reconstruction`, `FieldMismatch`, `Key`, every decode failure of `Record`,
+///   `CompactionRecordDecode`, `ErasureRequestDecode`, `RewriteRecordDecode` and
+///   `SnapshotFormat`, and the structural faults of stored records:
+///   `RewriteSupersessionChainTooDeep` (the depth bound is a fixed constant, the
+///   same on every build), `RewriteSupersessionCycle`, and
+///   `CompactionSupersessionInputMismatch`. `ColumnStatsPartOverBound` is here
+///   too: the ceiling is a fixed format constant, so every node refuses the same
+///   part. A version or enum value below the supported minimum (a writer that
+///   left proto3's default 0) is corrupt as well: no build reads it. So is an
+///   erasure request or rewrite record with an unknown signal, whatever its
+///   value: it is read only under its own signal's key prefix, so it disagrees
+///   with its own key.
+/// - A version or enum value above the highest this build reads is retryable
 ///   ([`MSG_UNAVAILABLE`], `ErrorClass::Unavailable`, 503): during a rolling
-///   upgrade a peer on a newer build can read it. That is `UnsupportedHeadVersion`,
-///   every unsupported-version case of `SnapshotFormat` (part, HEAD, postings,
-///   column-stats), and the unsupported-version case each of
-///   `CompactionRecordDecode` and `ErasureRequestDecode` carries in its source.
-///   Those two source variants do not separate a newer version from one below
-///   the floor (an unstamped 0), so a below-floor record answers 503 too.
+///   upgrade a peer on a newer build can read it. That is an
+///   `UnsupportedHeadVersion` above [`HEAD_FORMAT_VERSION`], every case
+///   [`SnapshotFormatError::is_newer_format_version`] reports, the
+///   above-maximum unsupported-version case of the record inside `Record` and
+///   `CompactionRecordDecode`, and the above-maximum format version
+///   [`ErasureError::is_newer_format_version`] reports for the erasure object
+///   inside `ErasureRequestDecode` and `RewriteRecordDecode`.
+/// - `Provisioning` takes the class
+///   [`ravel_catalog::ProvisioningError::is_retryable`] gives
+///   it: a record version above the read ceiling, a lost CAS race and a store
+///   fault other than a checksum mismatch are retryable; an undecodable,
+///   misfiled or structurally corrupt record, a version below the floor, and a
+///   checksum mismatch are corrupt.
 /// - Transient storage faults and fold-progress/liveness failures stay
 ///   retryable, as does a `SnapshotFormat` decode job the read CPU gate
 ///   cancelled or refused while closed; a panicked decode job is corrupt.
@@ -659,61 +683,115 @@ fn redact_catalog(err: &CatalogError) -> &'static str {
         // any node re-reads the same bytes and fails the same way. 500.
         CatalogError::Reconstruction { .. }
         | CatalogError::FieldMismatch { .. }
-        | CatalogError::Record(_)
-        | CatalogError::Key(_) => MSG_CORRUPT,
-        CatalogError::CompactionRecordDecode {
-            source:
-                RecordError::UnsupportedFormatVersion { .. }
-                | RecordError::UnsupportedRecordFormatVersion { .. },
-            ..
-        } => MSG_UNAVAILABLE,
-        CatalogError::CompactionRecordDecode { .. } => MSG_CORRUPT,
-        CatalogError::ErasureRequestDecode {
-            source: ErasureError::UnsupportedFormatVersion { .. },
-            ..
-        } => MSG_UNAVAILABLE,
-        CatalogError::ErasureRequestDecode { .. } => MSG_CORRUPT,
-        // A decode job the read CPU gate dropped at shutdown, or a closed gate,
-        // never ran, so a retry on a healthy node can succeed; one that
-        // panicked panics again on the same bytes.
-        CatalogError::SnapshotFormat(
-            SnapshotFormatError::UnsupportedVersion(_)
-            | SnapshotFormatError::UnsupportedHeadVersion(_)
-            | SnapshotFormatError::PostingsUnsupportedVersion(_)
-            | SnapshotFormatError::ColumnStatsUnsupportedVersion(_)
-            | SnapshotFormatError::DecodeJob(CpuGateError::Cancelled | CpuGateError::Closed),
-        ) => MSG_UNAVAILABLE,
-        // Of SnapshotFormatError's dozens of variants only the ones above are
-        // retryable; every other one is a fault in bytes of a covered format
-        // version, or a panicked decode. UnsupportedLevel is here on the
-        // assumption that a new entry level ships with a part version bump,
-        // which UnsupportedVersion reports first.
-        CatalogError::SnapshotFormat(_) => MSG_CORRUPT,
+        | CatalogError::Key(_)
+        | CatalogError::RewriteSupersessionChainTooDeep { .. }
+        | CatalogError::RewriteSupersessionCycle { .. }
+        | CatalogError::CompactionSupersessionInputMismatch { .. }
+        | CatalogError::ColumnStatsPartOverBound { .. } => MSG_CORRUPT,
+        CatalogError::Record(source) | CatalogError::CompactionRecordDecode { source, .. } => {
+            redact_record(source)
+        }
+        CatalogError::ErasureRequestDecode { source, .. }
+        | CatalogError::RewriteRecordDecode { source, .. } => redact_erasure(source),
+        CatalogError::SnapshotFormat(source) => redact_snapshot_format(source),
 
         // A newer on-object format version this build cannot read: a peer on a
         // newer build can during a rolling upgrade, so it is retryable. 503.
-        CatalogError::UnsupportedHeadVersion { .. } => MSG_UNAVAILABLE,
+        // A HEAD below the floor is corrupt. 500.
+        CatalogError::UnsupportedHeadVersion { format_version } => {
+            if *format_version > HEAD_FORMAT_VERSION {
+                MSG_UNAVAILABLE
+            } else {
+                MSG_CORRUPT
+            }
+        }
 
         // Echoed verbatim by `client_message` before it reaches here; matched
         // only for exhaustiveness.
         CatalogError::WindowTooWide { .. } => MSG_UNAVAILABLE,
 
+        // A provisioning record's version above the read ceiling, a lost CAS
+        // race or a transient store fault is retryable (503); a corrupt or
+        // below-floor record is not (500).
+        CatalogError::Provisioning(source) => {
+            if source.is_retryable() {
+                MSG_UNAVAILABLE
+            } else {
+                MSG_CORRUPT
+            }
+        }
+
         // Transient storage faults, fold progress/liveness failures, and
         // resource backpressure: a retry (here or elsewhere) can succeed, so
-        // they keep the retryable message. The rewrite/compaction structural
-        // faults listed here are decode/consistency failures of stored records
-        // the same rule would call corrupt; they are not yet classified and
-        // keep the retryable message.
+        // they keep the retryable message.
         CatalogError::InvalidConfig(_)
         | CatalogError::Store(_)
         | CatalogError::FoldCasRetriesExhausted { .. }
-        | CatalogError::Provisioning(_)
-        | CatalogError::RewriteRecordDecode { .. }
-        | CatalogError::RewriteSupersessionChainTooDeep { .. }
-        | CatalogError::RewriteSupersessionCycle { .. }
-        | CatalogError::CompactionSupersessionInputMismatch { .. }
-        | CatalogError::ColumnStatsPartOverBound { .. }
         | CatalogError::MemoryExhausted(_) => MSG_UNAVAILABLE,
+    }
+}
+
+/// A commit or compaction record: retryable only for a format version above the
+/// highest this build reads. The same `RecordError` answers the same way under
+/// `CatalogError::Record` and `CatalogError::CompactionRecordDecode`. Every
+/// variant is named, so a new one fails to compile until it is classified here.
+fn redact_record(err: &RecordError) -> &'static str {
+    match err {
+        RecordError::UnsupportedFormatVersion { expected, actual } => {
+            if actual > expected {
+                MSG_UNAVAILABLE
+            } else {
+                MSG_CORRUPT
+            }
+        }
+        RecordError::UnsupportedRecordFormatVersion { max, actual, .. } => {
+            if actual > max {
+                MSG_UNAVAILABLE
+            } else {
+                MSG_CORRUPT
+            }
+        }
+        RecordError::InvalidTenantHashLen(_)
+        | RecordError::InvalidContentHashLen(_)
+        | RecordError::EventTsOutOfOrder { .. }
+        | RecordError::IngestTsOutOfOrder { .. }
+        | RecordError::IngestHourInconsistent { .. }
+        | RecordError::InvalidWriterId(_)
+        | RecordError::SupersededRecordKeyOnVersionOne(_)
+        | RecordError::MissingSupersededRecordKey
+        | RecordError::InvalidSupersededRecordKey(_)
+        | RecordError::NonCanonicalSupersededRecordKey(_)
+        | RecordError::SupersededRecordKeyBucketMismatch { .. }
+        | RecordError::SupersedingInputSetHashMismatch
+        | RecordError::Key(_)
+        | RecordError::Decode(_) => MSG_CORRUPT,
+    }
+}
+
+/// An erasure request or rewrite record: retryable only for a format version
+/// above the highest this build reads.
+fn redact_erasure(err: &ErasureError) -> &'static str {
+    if err.is_newer_format_version() {
+        MSG_UNAVAILABLE
+    } else {
+        MSG_CORRUPT
+    }
+}
+
+/// A snapshot part, HEAD, postings or column-stats fault, from the catalog or
+/// from the column-statistics loader's HEAD read. A decode job the read CPU gate
+/// dropped at shutdown, or a closed gate, never ran, so a retry on a healthy
+/// node can succeed; one that panicked panics again on the same bytes.
+fn redact_snapshot_format(err: &SnapshotFormatError) -> &'static str {
+    if err.is_newer_format_version()
+        || matches!(
+            err,
+            SnapshotFormatError::DecodeJob(CpuGateError::Cancelled | CpuGateError::Closed)
+        )
+    {
+        MSG_UNAVAILABLE
+    } else {
+        MSG_CORRUPT
     }
 }
 
@@ -840,6 +918,78 @@ mod tests {
         assert_eq!(err.class(), ErrorClass::Unavailable);
     }
 
+    /// A provisioning record above the read ceiling, a lost CAS race and a
+    /// transient store fault are retryable; an undecodable, misfiled or
+    /// structurally corrupt record, a version below the floor, a checksum
+    /// mismatch and a refused reshard argument are corrupt. The PromQL
+    /// boundary pins the same split.
+    ///
+    /// FLIP: put `CatalogError::Provisioning(_)` back in the `MSG_UNAVAILABLE`
+    /// arm of `redact_catalog` and the first corrupt case fails with
+    /// `left: "upstream storage temporarily unavailable"`,
+    /// `right: "stored data failed integrity validation"`.
+    #[test]
+    fn provisioning_faults_take_the_class_of_the_record_fault() {
+        use ravel_catalog::{
+            GenerationDefect, PROVISIONING_MAX_READ_VERSION, PROVISIONING_MIN_READ_VERSION,
+            ProvisioningError,
+        };
+
+        let key = || LEAKY_KEY.to_string();
+        let provisioning = |err: ProvisioningError| SqlError::Catalog(CatalogError::from(err));
+
+        let unavailable = [
+            provisioning(ProvisioningError::UnsupportedVersion {
+                key: key(),
+                got: PROVISIONING_MAX_READ_VERSION + 1,
+                ceiling: PROVISIONING_MAX_READ_VERSION,
+            }),
+            provisioning(ProvisioningError::Store {
+                key: key(),
+                source: StoreError::Timeout,
+            }),
+            provisioning(ProvisioningError::ReshardCasConflict { key: key() }),
+        ];
+        for err in &unavailable {
+            assert_eq!(err.client_message(), MSG_UNAVAILABLE, "{err}");
+            assert_eq!(err.class(), ErrorClass::Unavailable, "{err}");
+            assert_redacted(&err.client_message());
+        }
+
+        let corrupt = [
+            provisioning(ProvisioningError::Decode {
+                key: key(),
+                source: <() as prost::Message>::decode(&[0xff][..])
+                    .expect_err("a lone 0xff is not a valid message"),
+            }),
+            provisioning(ProvisioningError::VersionBelowFloor {
+                key: key(),
+                got: 0,
+                floor: PROVISIONING_MIN_READ_VERSION,
+            }),
+            provisioning(ProvisioningError::CorruptRecord {
+                key: key(),
+                field: "signal",
+                expected: "Metrics".to_string(),
+                actual: "Logs".to_string(),
+            }),
+            provisioning(ProvisioningError::CorruptGenerations {
+                key: key(),
+                defect: GenerationDefect::NotDense,
+            }),
+            provisioning(ProvisioningError::Store {
+                key: key(),
+                source: StoreError::Corrupted(RAW_STORE_TEXT.to_string()),
+            }),
+            provisioning(ProvisioningError::ReshardSameCount { shard_count: 4 }),
+        ];
+        for err in &corrupt {
+            assert_eq!(err.client_message(), MSG_CORRUPT, "{err}");
+            assert_eq!(err.class(), ErrorClass::Internal, "{err}");
+            assert_redacted(&err.client_message());
+        }
+    }
+
     /// Catalog errors are classified by whether a retry, possibly routed to
     /// another node, can succeed. A decode failure of stored bytes whose format
     /// version this build covers is corrupt (`Internal`, 500); a newer format
@@ -923,11 +1073,12 @@ mod tests {
     }
 
     /// Every snapshot-format object's newer-version case (part, HEAD, postings,
-    /// column-stats) is unavailable, as is a decode job the read CPU gate
-    /// cancelled or refused while closed. A panicked decode job, an entry level
-    /// outside the covered version, and a declared body over the decode cap
-    /// (a catalog cap no server flag sets, so every node refuses it) are corrupt.
-    /// The PromQL boundary pins the same split.
+    /// column-stats, and an entry level above the highest this build reads) is
+    /// unavailable, as is a decode job the read CPU gate cancelled or refused
+    /// while closed. A panicked decode job, a retired column-stats version below
+    /// the accepted one, and a declared body over the decode cap (a catalog cap
+    /// no server flag sets, so every node refuses it) are corrupt. The PromQL
+    /// boundary pins the same split.
     #[test]
     fn snapshot_format_newer_versions_and_gate_aborts_are_unavailable() {
         let catalog =
@@ -938,6 +1089,7 @@ mod tests {
             SnapshotFormatError::UnsupportedHeadVersion(2),
             SnapshotFormatError::PostingsUnsupportedVersion(2),
             SnapshotFormatError::ColumnStatsUnsupportedVersion(4),
+            SnapshotFormatError::UnsupportedLevel(2),
             SnapshotFormatError::DecodeJob(CpuGateError::Cancelled),
             SnapshotFormatError::DecodeJob(CpuGateError::Closed),
         ];
@@ -949,7 +1101,7 @@ mod tests {
 
         let corrupt = [
             SnapshotFormatError::DecodeJob(CpuGateError::Panicked),
-            SnapshotFormatError::UnsupportedLevel(2),
+            SnapshotFormatError::ColumnStatsUnsupportedVersion(2),
             SnapshotFormatError::DecompressedTooLarge {
                 declared: 2,
                 cap: 1,
@@ -964,6 +1116,263 @@ mod tests {
             assert_eq!(err.client_message(), MSG_CORRUPT, "{err}");
             assert_eq!(err.class(), ErrorClass::Internal, "{err}");
         }
+    }
+
+    /// A version below the supported minimum (a writer that left proto3's
+    /// default 0) is permanent corruption of an immutable object, not a newer
+    /// version a peer can read: 500 for every version kind, record, erasure
+    /// object and snapshot format alike.
+    ///
+    /// FLIP: answer every `UnsupportedHeadVersion` with `MSG_UNAVAILABLE` in
+    /// `redact_catalog` and the first case fails with
+    /// `left: "upstream storage temporarily unavailable"`,
+    /// `right: "stored data failed integrity validation"`.
+    #[test]
+    fn below_floor_versions_are_corrupt_not_retryable() {
+        let key = || LEAKY_KEY.to_string();
+        let below_floor = [
+            SqlError::Catalog(CatalogError::UnsupportedHeadVersion { format_version: 0 }),
+            SqlError::Catalog(CatalogError::CompactionRecordDecode {
+                key: key(),
+                source: RecordError::UnsupportedFormatVersion {
+                    expected: 1,
+                    actual: 0,
+                },
+            }),
+            SqlError::Catalog(CatalogError::Record(
+                RecordError::UnsupportedFormatVersion {
+                    expected: 1,
+                    actual: 0,
+                },
+            )),
+            SqlError::Catalog(CatalogError::CompactionRecordDecode {
+                key: key(),
+                source: RecordError::UnsupportedRecordFormatVersion {
+                    kind: RecordKind::Compaction,
+                    min: 1,
+                    max: 2,
+                    actual: 0,
+                },
+            }),
+            SqlError::Catalog(CatalogError::ErasureRequestDecode {
+                key: key(),
+                source: ErasureError::UnsupportedFormatVersion {
+                    expected: 1,
+                    actual: 0,
+                },
+            }),
+            SqlError::Catalog(CatalogError::RewriteRecordDecode {
+                key: key(),
+                source: ErasureError::UnsupportedFormatVersion {
+                    expected: 1,
+                    actual: 0,
+                },
+            }),
+            SqlError::Catalog(CatalogError::SnapshotFormat(
+                SnapshotFormatError::UnsupportedVersion(0),
+            )),
+            SqlError::Catalog(CatalogError::SnapshotFormat(
+                SnapshotFormatError::UnsupportedHeadVersion(0),
+            )),
+            SqlError::Catalog(CatalogError::SnapshotFormat(
+                SnapshotFormatError::PostingsUnsupportedVersion(0),
+            )),
+            SqlError::Catalog(CatalogError::SnapshotFormat(
+                SnapshotFormatError::ColumnStatsUnsupportedVersion(0),
+            )),
+            SqlError::ColumnStats(LoadColumnStatsError::HeadCorrupt {
+                key: key(),
+                source: SnapshotFormatError::UnsupportedHeadVersion(0),
+            }),
+        ];
+        for err in &below_floor {
+            assert_eq!(err.client_message(), MSG_CORRUPT, "{err}");
+            assert_eq!(err.class(), ErrorClass::Internal, "{err}");
+            assert_redacted(&err.client_message());
+        }
+    }
+
+    /// An entry level or column declared type above the highest this build
+    /// reads is retryable, because a new value can ship without a format
+    /// version bump and a peer on a newer build can read it; a declared type
+    /// of 0, proto3's default and an unstamped field, is corrupt. An erasure
+    /// signal or deferral cause is corrupt at every value, under both erasure
+    /// wrappers: a newer build writes a new signal under a key prefix this
+    /// build never lists, so an unknown one read here disagrees with its own
+    /// key. The PromQL boundary pins the same split.
+    ///
+    /// FLIP: classify `ColumnStatsUnknownDeclaredType` as never newer and the
+    /// declared-type case fails with
+    /// `left: "stored data failed integrity validation"`,
+    /// `right: "upstream storage temporarily unavailable"`. Classify
+    /// `ErasureError::UnknownSignal` above `Signal::Audit` as newer and the
+    /// first erasure case fails with
+    /// `left: "upstream storage temporarily unavailable"`,
+    /// `right: "stored data failed integrity validation"`.
+    #[test]
+    fn unknown_level_and_type_above_the_maximum_are_unavailable_erasure_enums_corrupt() {
+        let key = || LEAKY_KEY.to_string();
+        let snapshot =
+            |err: SnapshotFormatError| SqlError::Catalog(CatalogError::SnapshotFormat(err));
+        let declared = |declared_type: u32| {
+            snapshot(SnapshotFormatError::ColumnStatsUnknownDeclaredType {
+                name: "c".to_string(),
+                declared_type,
+            })
+        };
+        let erasure = |source: fn() -> ErasureError| {
+            [
+                SqlError::Catalog(CatalogError::ErasureRequestDecode {
+                    key: key(),
+                    source: source(),
+                }),
+                SqlError::Catalog(CatalogError::RewriteRecordDecode {
+                    key: key(),
+                    source: source(),
+                }),
+            ]
+        };
+
+        let unavailable = [
+            snapshot(SnapshotFormatError::UnsupportedLevel(2)),
+            declared(5),
+        ];
+        for err in &unavailable {
+            assert_eq!(err.client_message(), MSG_UNAVAILABLE, "{err}");
+            assert_eq!(err.class(), ErrorClass::Unavailable, "{err}");
+            assert_redacted(&err.client_message());
+        }
+
+        let mut corrupt = Vec::from(erasure(|| ErasureError::UnknownSignal(7)));
+        corrupt.extend(erasure(|| ErasureError::UnknownSignal(0)));
+        corrupt.extend(erasure(|| ErasureError::UnknownDeferralCause(2)));
+        corrupt.push(declared(0));
+        for err in &corrupt {
+            assert_eq!(err.client_message(), MSG_CORRUPT, "{err}");
+            assert_eq!(err.class(), ErrorClass::Internal, "{err}");
+            assert_redacted(&err.client_message());
+        }
+    }
+
+    /// A commit record with a newer format version reaches the surface as
+    /// `CatalogError::Record` (`record::decode` then `?`), and answers as the
+    /// same `RecordError` does under `CompactionRecordDecode`: retryable.
+    ///
+    /// FLIP: put `CatalogError::Record(_)` back in the `MSG_CORRUPT` arm of
+    /// `redact_catalog` and the first assertion fails with
+    /// `left: "stored data failed integrity validation"`,
+    /// `right: "upstream storage temporarily unavailable"`.
+    #[test]
+    fn newer_commit_record_through_record_is_unavailable() {
+        let sources: [fn() -> RecordError; 2] = [
+            || RecordError::UnsupportedFormatVersion {
+                expected: 1,
+                actual: 2,
+            },
+            || RecordError::UnsupportedRecordFormatVersion {
+                kind: RecordKind::Commit,
+                min: 1,
+                max: 1,
+                actual: 2,
+            },
+        ];
+        for source in sources {
+            let record = SqlError::Catalog(CatalogError::Record(source()));
+            assert_eq!(record.client_message(), MSG_UNAVAILABLE, "{record}");
+            assert_eq!(record.class(), ErrorClass::Unavailable, "{record}");
+            let compaction = SqlError::Catalog(CatalogError::CompactionRecordDecode {
+                key: LEAKY_KEY.to_string(),
+                source: source(),
+            });
+            assert_eq!(record.client_message(), compaction.client_message());
+            assert_eq!(record.class(), compaction.class());
+        }
+        // Control: a non-version record fault stays corrupt.
+        let corrupt = SqlError::Catalog(CatalogError::Record(RecordError::InvalidTenantHashLen(3)));
+        assert_eq!(corrupt.client_message(), MSG_CORRUPT);
+        assert_eq!(corrupt.class(), ErrorClass::Internal);
+    }
+
+    /// The column-statistics loader's HEAD read answers as the catalog's own
+    /// HEAD read does for the same `SnapshotFormatError`: a newer-version HEAD
+    /// is retryable, a corrupt one is not.
+    ///
+    /// FLIP: collapse the `HeadCorrupt` arm back into `MSG_CORRUPT` and the
+    /// first assertion fails with
+    /// `left: "stored data failed integrity validation"`,
+    /// `right: "upstream storage temporarily unavailable"`.
+    #[test]
+    fn newer_version_head_through_column_stats_is_unavailable() {
+        let loader = SqlError::ColumnStats(LoadColumnStatsError::HeadCorrupt {
+            key: LEAKY_KEY.to_string(),
+            source: SnapshotFormatError::UnsupportedHeadVersion(2),
+        });
+        assert_eq!(loader.client_message(), MSG_UNAVAILABLE);
+        assert_eq!(loader.class(), ErrorClass::Unavailable);
+        assert_redacted(&loader.client_message());
+        let catalog = SqlError::Catalog(CatalogError::SnapshotFormat(
+            SnapshotFormatError::UnsupportedHeadVersion(2),
+        ));
+        assert_eq!(loader.client_message(), catalog.client_message());
+
+        let corrupt = SqlError::ColumnStats(LoadColumnStatsError::HeadCorrupt {
+            key: LEAKY_KEY.to_string(),
+            source: SnapshotFormatError::HeadNoParts,
+        });
+        assert_eq!(corrupt.client_message(), MSG_CORRUPT);
+        assert_eq!(corrupt.class(), ErrorClass::Internal);
+    }
+
+    /// The five catalog variants that used to answer 503 unclassified. A
+    /// rewrite record that fails to decode is corrupt unless its version is
+    /// above the highest this build reads; a supersession chain past the fixed
+    /// depth bound, a cycle, and a version 2 record naming a different input
+    /// set are properties of the stored records; and the per-part column-stats
+    /// ceiling is a fixed format constant. None of those clears on a retry.
+    ///
+    /// FLIP: move `RewriteSupersessionChainTooDeep` back to the `MSG_UNAVAILABLE`
+    /// arm and its case fails with
+    /// `left: "upstream storage temporarily unavailable"`,
+    /// `right: "stored data failed integrity validation"`.
+    #[test]
+    fn rewrite_and_supersession_faults_are_corrupt_newer_rewrites_unavailable() {
+        let key = || LEAKY_KEY.to_string();
+        let corrupt = [
+            SqlError::Catalog(CatalogError::RewriteRecordDecode {
+                key: key(),
+                source: ErasureError::InvalidTenantHashLen(3),
+            }),
+            SqlError::Catalog(CatalogError::RewriteSupersessionChainTooDeep {
+                bucket: key(),
+                max: 64,
+            }),
+            SqlError::Catalog(CatalogError::RewriteSupersessionCycle { key: key() }),
+            SqlError::Catalog(CatalogError::CompactionSupersessionInputMismatch {
+                key: key(),
+                superseded_key: key(),
+            }),
+            SqlError::Catalog(CatalogError::ColumnStatsPartOverBound {
+                part_key: key(),
+                declared: 2,
+                ceiling: 1,
+            }),
+        ];
+        for err in &corrupt {
+            assert_eq!(err.client_message(), MSG_CORRUPT, "{err}");
+            assert_eq!(err.class(), ErrorClass::Internal, "{err}");
+            assert_redacted(&err.client_message());
+        }
+
+        let newer_rewrite = SqlError::Catalog(CatalogError::RewriteRecordDecode {
+            key: key(),
+            source: ErasureError::UnsupportedFormatVersion {
+                expected: 1,
+                actual: 2,
+            },
+        });
+        assert_eq!(newer_rewrite.client_message(), MSG_UNAVAILABLE);
+        assert_eq!(newer_rewrite.class(), ErrorClass::Unavailable);
+        assert_redacted(&newer_rewrite.client_message());
     }
 
     #[test]

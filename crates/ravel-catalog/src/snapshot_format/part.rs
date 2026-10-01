@@ -363,6 +363,33 @@ mod tests {
         assert!(peeked.entries_uncompressed_len > 0);
     }
 
+    /// The level match in `validate_entries` accepts every level up to
+    /// `MAX_ENTRY_LEVEL`, the bound `SnapshotFormatError::is_newer_format_version`
+    /// reads, and refuses the next one.
+    #[test]
+    fn entry_levels_accepted_end_at_max_entry_level() {
+        use super::super::error::MAX_ENTRY_LEVEL;
+
+        let validate = |level: u32| {
+            let mut e = entry(1);
+            e.level = level;
+            validate_entries(&[e], 0, 10)
+        };
+        for level in 0..=MAX_ENTRY_LEVEL {
+            assert!(
+                !matches!(
+                    validate(level),
+                    Err(SnapshotFormatError::UnsupportedLevel(_))
+                ),
+                "level {level} is refused as unsupported"
+            );
+        }
+        assert_eq!(
+            validate(MAX_ENTRY_LEVEL + 1),
+            Err(SnapshotFormatError::UnsupportedLevel(MAX_ENTRY_LEVEL + 1))
+        );
+    }
+
     /// The header peek returns on every truncation of a valid part, never
     /// panics.
     #[test]
