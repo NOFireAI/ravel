@@ -1574,6 +1574,7 @@ async fn a_compacted_bucket_exports_each_record_exactly_once() {
         None,
         None,
         1,
+        None,
         compact_now_ns,
         &ravel_cli::maintain::ClaimOptions::fresh(),
     )

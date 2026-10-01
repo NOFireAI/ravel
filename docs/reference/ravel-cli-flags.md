@@ -188,6 +188,7 @@ Run one compaction pass over a single sealed bucket. A bucket with at least 64 M
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
+| `--compaction-zstd-level` |  |  | The zstd level an RLOG compaction writes its L1 segments at. Higher levels store smaller segments for more compaction CPU; reads decode any level the same way. Refused outside 1..=22. Default 9 (the compactor default) |
 | `--dry-run` |  |  | Compute the plan and report it, but write no L1 segments or record. Takes no compaction claim |
 | `--hour` |  |  |  |
 | `--max-flush-lifetime` |  |  | Override the compactor's `max_flush_lifetime` (humantime duration, e.g. `30m`, `0s`; the same grammar and unit as ravel-server's `--gc-max-flush-lifetime`). A bucket seals only at its hour's end plus this plus the clock-skew allowance, so lowering it seals buckets sooner. UNSAFE below the ingest path's real flush lifetime: a bucket a writer is still flushing into can then be sealed and compacted, and that writer's later-published object is missed by the compaction. The default is the safe 1h; use this only for a tenant known quiescent, such as one whose bulk load has finished |
@@ -203,6 +204,7 @@ Compact every sealed bucket of a whole tenant signal: walk each shard's ingest h
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
 | `--bucket-concurrency` |  | `1` | Number of buckets to compact CONCURRENTLY. Buckets are independent by construction (disjoint per-(shard, hour) input sets, separate content-addressed segments, separate CAS-published records), so the walk is embarrassingly parallel: N > 1 runs up to N buckets' compactions at once. Default 1, which is today's fully sequential behavior byte-for-byte (report line order included). Refused at 0 |
+| `--compaction-zstd-level` |  |  | The zstd level an RLOG compaction writes its L1 segments at. Higher levels store smaller segments for more compaction CPU; reads decode any level the same way. Refused outside 1..=22. Default 9 (the compactor default) |
 | `--dry-run` |  |  | Compute each bucket's plan and report it, but write no L1 segments or records. Takes no compaction claims |
 | `--from-hour` |  |  | First ingest-hour bucket to consider, inclusive. Omit to start at each shard's oldest present hour |
 | `--input-read-concurrency` |  |  | Number of per-input reads a compaction keeps in flight at once (the commit-record GET and catalog load per input). Raise it to hide store round-trip latency on a many-input bucket; it never changes output bytes. Default 8 (the compactor default); values below 1 act as 1 |

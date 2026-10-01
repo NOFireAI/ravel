@@ -1245,8 +1245,13 @@ The merge is defined entirely in terms of this format:
   the output object's sort descriptor: `(stream_ref ascending, ts
   ascending)` when the output carries none, and `(stream_ref, time bucket,
   key columns, ts)` when it carries one (ADR-2135 decision 2 picks the
-  output descriptor). The compactor sets no descriptor on its writer yet, so
-  a compacted part today is sorted `(stream_ref, ts)`. The records are then
+  output descriptor). The output takes the descriptor and
+  `clustering_generation` of the input with the highest generation (the first
+  such input in input order on a tie); with no input carrying a descriptor
+  the output carries none, at the inputs' highest generation (0 when every
+  input is unkeyed). Compaction reads no tenant config: a key the tenant
+  declared after the newest input was written reaches the data at its next
+  write, not at compaction. The records are then
   re-chunked at the same 8192 record block target, then placed into row groups of `group_target_blocks`
   consecutive blocks with their pages column-major (ADR-0699 decision 1).
   Compaction is where full row groups arise: an L0 flush object is usually one
@@ -1264,7 +1269,18 @@ The merge is defined entirely in terms of this format:
   merged, re-blocked contents (each bloom sized by its own block's
   distinct-token count); an input's `SKIP_IDX`/`BLOOM` bytes are never
   reused or concatenated, since the merged block boundaries differ from
-  any input's.
+  any input's. The BLOOM covered set follows the same input the descriptor
+  comes from: every string column when that input covers them all, only the
+  two fixed text columns when it covers nothing else, and otherwise the
+  string columns it covers by name. The coverages of the inputs are never
+  unioned. Reading that input's covered list costs one ranged GET per merge
+  of at most `8 + 5 * (10 + string columns)` bytes (the whole section when
+  its BLOOM is compressed), and none when that input holds no string column,
+  in which case the output covers every string column.
+- **Compression level.** The compactor and the erasure rewrite encode every
+  L1 page and zstd section at `CompactorConfig::rlog_zstd_level`, default 9
+  (ADR-2135 decision 4), not the writer's level-3 default. The level changes
+  stored bytes only; a reader decodes any level the same way.
 
 Because these are exactly the steps `RlogWriter` already performs for an
 L0 write, the compactor performs them by decoding each input back to

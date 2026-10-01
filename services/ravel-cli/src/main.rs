@@ -1362,6 +1362,12 @@ enum MaintainCommand {
         #[arg(long, value_name = "DURATION",
               value_parser = parse_max_flush_lifetime_ns)]
         max_flush_lifetime: Option<i64>,
+        /// The zstd level an RLOG compaction writes its L1 segments at. Higher
+        /// levels store smaller segments for more compaction CPU; reads decode
+        /// any level the same way. Refused outside 1..=22. Default 9 (the
+        /// compactor default).
+        #[arg(long, value_name = "LEVEL")]
+        compaction_zstd_level: Option<i32>,
     },
     /// Compact every sealed bucket of a whole tenant signal: walk each shard's
     /// ingest hours and run the same per-bucket compaction `compact-bucket`
@@ -1462,6 +1468,12 @@ enum MaintainCommand {
         /// total in-flight reads can reach N times --input-read-concurrency.
         #[arg(long, value_name = "N", default_value_t = 1)]
         bucket_concurrency: usize,
+        /// The zstd level an RLOG compaction writes its L1 segments at. Higher
+        /// levels store smaller segments for more compaction CPU; reads decode
+        /// any level the same way. Refused outside 1..=22. Default 9 (the
+        /// compactor default).
+        #[arg(long, value_name = "LEVEL")]
+        compaction_zstd_level: Option<i32>,
     },
     /// Run one sweep pass (orphan GC, superseded, unreferenced segments) over a shard.
     Sweep {
@@ -1811,6 +1823,7 @@ async fn main() -> anyhow::Result<()> {
                     dry_run,
                     no_claim,
                     max_flush_lifetime,
+                    compaction_zstd_level,
                 },
         } => {
             maintain::compact(
@@ -1822,6 +1835,7 @@ async fn main() -> anyhow::Result<()> {
                 hour,
                 dry_run,
                 max_flush_lifetime,
+                compaction_zstd_level,
                 &maintain::ClaimOptions::for_invocation(no_claim),
             )
             .await
@@ -1841,6 +1855,7 @@ async fn main() -> anyhow::Result<()> {
                     max_l1_part_bytes,
                     input_read_concurrency,
                     bucket_concurrency,
+                    compaction_zstd_level,
                 },
         } => maintain::compact_tenant(
             store::build_store(&cli.store)?,
@@ -1856,6 +1871,7 @@ async fn main() -> anyhow::Result<()> {
             max_l1_part_bytes,
             input_read_concurrency,
             bucket_concurrency,
+            compaction_zstd_level,
             now_ns()?,
             &maintain::ClaimOptions::for_invocation(no_claim),
         )
@@ -3974,6 +3990,7 @@ mod tests {
             mem_target,
             max_bytes,
             concurrency,
+            None,
         )
         .expect("nonzero knobs build a config");
 
@@ -4094,15 +4111,107 @@ mod tests {
     #[test]
     fn compact_tenant_zero_byte_targets_are_refused() {
         assert_eq!(
-            maintain::build_compactor_config(false, None, Some(0), None, None)
+            maintain::build_compactor_config(false, None, Some(0), None, None, None)
                 .expect_err("--l1-part-memory-target-bytes 0 must be refused"),
             CompactorKnobError::ZeroL1PartMemoryTarget,
         );
         assert_eq!(
-            maintain::build_compactor_config(false, None, None, Some(0), None)
+            maintain::build_compactor_config(false, None, None, Some(0), None, None)
                 .expect_err("--max-l1-part-bytes 0 must be refused"),
             CompactorKnobError::ZeroMaxL1PartBytes,
         );
+    }
+
+    /// `--compaction-zstd-level` on both `compact-bucket` and `compact-tenant`
+    /// arrives in the built `CompactorConfig::rlog_zstd_level`, its absence
+    /// leaves the compactor default (9), and a level outside 1..=22 is refused
+    /// with the typed error before any store access.
+    ///
+    /// Non-vacuity (prove-the-test), each flip named:
+    /// - Pass `None` for `rlog_zstd_level` in `compact_to`'s
+    ///   `build_compactor_config` call: unreachable from this parse test, so
+    ///   the per-subcommand field match below is what pins the flag; changing
+    ///   either subcommand's `#[arg(long, value_name = "LEVEL")]` to
+    ///   `#[arg(skip)]` fails its `try_parse_from` with "unexpected argument".
+    /// - Drop the `if let Some(level) = rlog_zstd_level` block from
+    ///   `build_compactor_config`: the `== 4` assertion reads the default 9.
+    /// - Drop the `validate_rlog_zstd_level` call there: the 0 and 23 refusals
+    ///   build `Ok`.
+    #[test]
+    fn compaction_zstd_level_flag_reaches_the_built_config() {
+        let bucket = Cli::try_parse_from([
+            "ravel",
+            "maintain",
+            "compact-bucket",
+            "--tenant",
+            "acme",
+            "--signal",
+            "logs",
+            "--shard",
+            "0",
+            "--hour",
+            "100",
+            "--compaction-zstd-level",
+            "4",
+        ])
+        .expect("compact-bucket with --compaction-zstd-level parses");
+        let Command::Maintain {
+            command:
+                super::MaintainCommand::CompactBucket {
+                    compaction_zstd_level,
+                    ..
+                },
+        } = bucket.command
+        else {
+            panic!("expected the maintain compact-bucket subcommand");
+        };
+        assert_eq!(compaction_zstd_level, Some(4));
+        let tenant = Cli::try_parse_from([
+            "ravel",
+            "maintain",
+            "compact-tenant",
+            "--tenant",
+            "acme",
+            "--signal",
+            "logs",
+            "--compaction-zstd-level",
+            "4",
+        ])
+        .expect("compact-tenant with --compaction-zstd-level parses");
+        let Command::Maintain {
+            command:
+                super::MaintainCommand::CompactTenant {
+                    compaction_zstd_level: tenant_level,
+                    ..
+                },
+        } = tenant.command
+        else {
+            panic!("expected the maintain compact-tenant subcommand");
+        };
+        assert_eq!(tenant_level, Some(4));
+
+        let config =
+            maintain::build_compactor_config(false, None, None, None, None, compaction_zstd_level)
+                .expect("level 4 builds a config");
+        assert_eq!(
+            config.rlog_zstd_level, 4,
+            "the flag must arrive in the config"
+        );
+        let default = maintain::build_compactor_config(false, None, None, None, None, None)
+            .expect("no flag builds a config");
+        assert_eq!(
+            default.rlog_zstd_level, 9,
+            "no flag keeps the compactor default"
+        );
+        for level in [0, 23] {
+            assert_eq!(
+                maintain::build_compactor_config(false, None, None, None, None, Some(level))
+                    .expect_err("an out-of-range level must be refused"),
+                CompactorKnobError::InvalidRlogZstdLevel(ravel_maintain::RlogZstdLevelError {
+                    level
+                }),
+            );
+        }
     }
 
     /// `--input-read-concurrency 0` is NOT refused: its config-field doc states
@@ -4115,7 +4224,7 @@ mod tests {
     /// fails.
     #[test]
     fn compact_tenant_zero_input_read_concurrency_is_allowed() {
-        let config = maintain::build_compactor_config(false, None, None, None, Some(0))
+        let config = maintain::build_compactor_config(false, None, None, None, Some(0), None)
             .expect("zero input-read-concurrency is tolerated, not refused");
         assert_eq!(
             config.input_read_concurrency, 0,

@@ -82,6 +82,7 @@ pub use compact::{
 pub use config::{
     AdmissionMode, AuditMode, AuditPipelineConfig, ClaimParticipant, CompactorConfig, Coordination,
     MergeMemoryTracker, MergePhasePeaks, RetentionConfig, RetentionConfigError, RetentionPolicy,
+    RlogZstdLevelError, validate_rlog_zstd_level,
 };
 pub use discover::discover_tenants;
 pub use erasure_rewrite::{

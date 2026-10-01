@@ -257,6 +257,7 @@ async fn compact_empty_bucket_is_below_min() {
         0,
         true,
         None,
+        None,
         &ClaimOptions::fresh(),
     )
     .await
@@ -390,6 +391,7 @@ async fn cli_compact_bucket_publishes_without_holding_ownership() {
         100,
         false,
         None,
+        None,
         &ClaimOptions::fresh(),
     )
     .await
@@ -440,6 +442,7 @@ async fn cli_compact_bucket_below_the_claim_gate_takes_no_claim() {
         0,
         100,
         false,
+        None,
         None,
         &ClaimOptions::fresh(),
     )
