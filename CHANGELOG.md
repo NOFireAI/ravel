@@ -1828,6 +1828,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Parquet table again names `estimated_requests`, `estimated_store_bytes`
   and `estimated_decompressed_bytes` as components the estimate does not
   bound, so the MCP "does not bound" warning returns for all three.
+- **`snapshot_location` reserves each footer read's bytes before issuing it
+  and trusts a prefix listing for a file's key and pin only, never its
+  size** (ADR-2040, issue #2283). The first footer read is now a suffix
+  read of `FOOTER_PREFETCH` bytes, so a listing that under- or
+  over-reports a file's size, in either direction, can no longer misplace
+  the read or trip a spurious `Store` error; the zero-size refusal runs on
+  the GET response's reported size, not the listing's. Each footer GET
+  reserves its byte length against the snapshot's `MemoryBudget` before
+  the GET is issued, releasing it once the footer is decoded, and refuses
+  with `MemoryExhausted` with no GET issued when the budget is exhausted.
+  New tests cover a single-object `LOCATION` whose key the object-store
+  client cannot address exactly, one outside its grant, one whose HEAD
+  reports `NotFound`, and two files whose physical footer schema elements
+  agree exactly but whose embedded `ARROW:schema` hint resolves a column
+  to a different Arrow type, each asserting its typed error.
 
 ## [0.19.0] - 2026-09-27
 
