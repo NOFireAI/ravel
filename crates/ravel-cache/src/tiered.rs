@@ -162,6 +162,11 @@ where
         self.single_flight.waiters(key)
     }
 
+    /// Whether a fetch for `key` is in flight, with or without followers.
+    pub fn is_in_flight(&self, key: &CacheKey) -> bool {
+        self.single_flight.is_in_flight(key)
+    }
+
     /// Read `key` through both tiers, fetching upstream only if both miss.
     ///
     /// Returns the served bytes and the [`Source`] they came from. Order:
@@ -1024,9 +1029,8 @@ mod tests {
         let hits_after_peeks = ram_metrics.snapshot().hits;
         release_tx.send(()).expect("the leader is still parked");
         let leader_bytes = leader.await.unwrap().unwrap();
-        assert_eq!(
-            tiered.in_flight_waiters(&key),
-            0,
+        assert!(
+            !tiered.is_in_flight(&key),
             "the flight has finished and left the map"
         );
 

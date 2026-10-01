@@ -131,6 +131,11 @@ where
             .map_or(0, |slot| slot.tx.receiver_count())
     }
 
+    /// Whether a call for `key` is in flight, followers or not.
+    pub fn is_in_flight(&self, key: &K) -> bool {
+        self.inflight.lock().contains_key(key)
+    }
+
     async fn wait(rx: &mut watch::Receiver<Option<Outcome<V, E>>>) -> Outcome<V, E> {
         loop {
             let current = rx.borrow_and_update().clone();

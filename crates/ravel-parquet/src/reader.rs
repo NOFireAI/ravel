@@ -261,7 +261,9 @@ impl PinnedParquetReader {
             // miss (`get_off_worker`), so resolving through `get_or_fetch`
             // here would consult the disk tier a second time and record a
             // second, unaccounted miss. `resolve_peeked_miss` joins the same
-            // single flight without re-consulting either tier.
+            // single flight without consulting the disk tier again; its leader
+            // rechecks only the RAM tier, uncounted, to reuse the bytes of a
+            // flight that finished after the peek.
             Some(ReadCache::Tiered(cache)) => cache
                 .resolve_peeked_miss(key, fetch)
                 .await
@@ -2252,8 +2254,8 @@ mod tests {
 
     /// A full miss on a `Tiered` cache consults the disk tier exactly once:
     /// the peek in `read_range` (`get_off_worker`) already consulted both
-    /// tiers, so resolving the confirmed miss must not consult either tier
-    /// again.
+    /// tiers, so resolving the confirmed miss must not consult the disk tier
+    /// again. The leader's one RAM recheck is uncounted and touches no disk.
     ///
     /// FLIP: resolving through `TieredCache::get_or_fetch` instead of
     /// `resolve_peeked_miss` (the pre-fix code) makes the leader consult the
@@ -2441,10 +2443,9 @@ mod tests {
                     .expect("every parked caller resolves"),
             );
         }
-        assert_eq!(
-            tiered.in_flight_waiters(&key),
-            0,
-            "the leader's flight has finished before the late caller resumes"
+        assert!(
+            !tiered.is_in_flight(&key),
+            "the leader's flight has finished and left the map before the late caller resumes"
         );
         served.push(late.await.expect("the late caller resolves"));
 
