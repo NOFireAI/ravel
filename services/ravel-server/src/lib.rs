@@ -2510,8 +2510,10 @@ pub async fn start_with_heartbeat(
     // running source each is read from: the validated deadline, the
     // `--limits-file` bytes-scanned budget, the derived S3 request budget, the
     // ADR-0088 budgets, the resolved ADR-0996 logs fetch quantities, and the
-    // three ADR-1306 fold-lag threshold inputs off `config.fold` and the
-    // catalog just built). `build_app_state` and `build_sql_state` below both
+    // three ADR-1306 fold-lag threshold inputs: the seal margin and HEAD cache
+    // TTL off the catalog just built, and the fold interval off `config.fold`,
+    // or in `--mode query` off `config.query_budgets` when
+    // `--fold-lag-interval-secs` is set). `build_app_state` and `build_sql_state` below both
     // take this same value, so the configured budgets are the enforced ones on
     // the PromQL/HTTP and SQL/HTTP paths alike.
     //

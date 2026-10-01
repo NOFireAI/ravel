@@ -772,9 +772,10 @@ pub struct Cli {
     /// names fold lag once the unsealed tail passes `healthy_tail_max +
     /// fold_interval + head_cache_ttl` (ADR-1306 decision 6); it configures no
     /// fold. Accepted only in `--mode query`, which serves queries but runs no
-    /// scheduled fold. The modes that run the fold classify against their own
-    /// `--fold-interval-secs` and refuse this flag, as does `--mode gateway`,
-    /// which serves no query. Unset, the classification uses
+    /// scheduled fold. `--mode all` refuses this flag because it classifies
+    /// against its own `--fold-interval-secs`; `--mode maintain` and
+    /// `--mode gateway` refuse it because they serve no query. Unset, the
+    /// classification uses
     /// `--fold-interval-secs`'s default. Zero is refused at startup.
     #[arg(long, value_name = "SECS")]
     pub fold_lag_interval_secs: Option<u64>,
@@ -4422,9 +4423,10 @@ impl Cli {
     /// passed `--fold-interval-secs 300` explicitly.
     ///
     /// It also refuses `--fold-lag-interval-secs` outside the modes
-    /// [`Mode::takes_fold_lag_interval`] names (ADR-1306 decision 6): a mode
-    /// that runs the scheduled fold classifies against its own
-    /// `--fold-interval-secs`, and a gateway classifies nothing.
+    /// [`Mode::takes_fold_lag_interval`] names (ADR-1306 decision 6):
+    /// [`Mode::All`] classifies against its own `--fold-interval-secs`, and
+    /// [`Mode::Maintain`] and [`Mode::Gateway`] serve no query, so classify
+    /// nothing.
     ///
     /// The error is a [`clap::Error`] rather than an [`anyhow::Error`] so the
     /// binary reports it exactly as it reports an unknown flag, and so `--help`
@@ -4449,11 +4451,10 @@ impl Cli {
             .to_possible_value()
             .map_or_else(|| "gateway".to_string(), |v| v.get_name().to_string());
         if passed("fold_lag_interval_secs") && !cli.mode.takes_fold_lag_interval() {
-            let why = if cli.mode.runs_scheduled_fold() {
+            let why = if cli.mode.installs_query_audit_pipeline() {
                 format!(
-                    "--mode {mode} runs the scheduled catalog fold and classifies fold lag \
-                     against its own --fold-interval-secs. Drop the flag, or set \
-                     --fold-interval-secs instead."
+                    "--mode {mode} classifies fold lag against its own --fold-interval-secs. \
+                     Drop the flag, or set --fold-interval-secs instead."
                 )
             } else {
                 format!(
@@ -8564,14 +8565,38 @@ mod tests {
     }
 
     /// ADR-1306 decision 6, amendment of 2026-10-01: `--fold-lag-interval-secs`
-    /// is accepted only in `--mode query`. The modes that run the scheduled
-    /// fold refuse it, naming the `--fold-interval-secs` they classify
-    /// against; the gateway refuses it because it classifies nothing; and a
-    /// zero value fails validate as a zero `--fold-interval-secs` does.
+    /// is accepted only in `--mode query`. `--mode all` refuses it, naming
+    /// the `--fold-interval-secs` it classifies against, and without claiming
+    /// a fold runs, since `--disable-fold` may have stopped it; maintain and
+    /// gateway refuse it because they serve no query; and a zero value fails
+    /// validate as a zero `--fold-interval-secs` does.
     #[test]
     fn fold_lag_interval_is_accepted_only_in_query_mode() {
-        for mode in ["maintain", "all"] {
-            let err = Cli::parse_validated_from([
+        for extra in [&[][..], &["--disable-fold"][..]] {
+            let mut argv = vec![
+                "ravel-server",
+                "--mode",
+                "all",
+                "--fold-lag-interval-secs",
+                "900",
+            ];
+            argv.extend_from_slice(extra);
+            let message = Cli::parse_validated_from(argv)
+                .expect_err("--mode all must refuse --fold-lag-interval-secs")
+                .to_string();
+            assert!(
+                message.contains("--fold-lag-interval-secs")
+                    && message.contains(
+                        "--mode all classifies fold lag against its own --fold-interval-secs"
+                    )
+                    && !message.contains("runs the scheduled"),
+                "the refusal must name the flag and the mode's own interval, and claim no \
+                 running fold ({extra:?}), got: {message}"
+            );
+        }
+
+        for mode in ["maintain", "gateway"] {
+            let message = Cli::parse_validated_from([
                 "ravel-server",
                 "--mode",
                 mode,
@@ -8580,31 +8605,15 @@ mod tests {
             ])
             .expect_err(&format!(
                 "--mode {mode} must refuse --fold-lag-interval-secs"
-            ));
-            let message = err.to_string();
+            ))
+            .to_string();
             assert!(
-                message.contains("--fold-lag-interval-secs")
-                    && message.contains(&format!(
-                        "--mode {mode} runs the scheduled catalog fold and classifies fold lag \
-                         against its own --fold-interval-secs"
-                    )),
-                "the refusal must name the flag and the mode's own interval, got: {message}"
+                message.contains(&format!(
+                    "--mode {mode} serves no query, so it never classifies"
+                )) && !message.contains("--fold-interval-secs"),
+                "got: {message}"
             );
         }
-
-        let err = Cli::parse_validated_from([
-            "ravel-server",
-            "--mode",
-            "gateway",
-            "--fold-lag-interval-secs",
-            "900",
-        ])
-        .expect_err("--mode gateway must refuse --fold-lag-interval-secs");
-        assert!(
-            err.to_string()
-                .contains("--mode gateway serves no query, so it never classifies"),
-            "got: {err}"
-        );
 
         let cli = Cli::parse_validated_from([
             "ravel-server",
@@ -8615,10 +8624,6 @@ mod tests {
         ])
         .expect("--mode query accepts --fold-lag-interval-secs");
         assert_eq!(cli.fold_lag_interval_secs, Some(900));
-        assert_eq!(
-            cli.fold_interval_secs, 300,
-            "the flag sets nothing about the fold"
-        );
         cli.validate().expect("a positive interval validates");
 
         let err = Cli::parse_validated_from([

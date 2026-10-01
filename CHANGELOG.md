@@ -454,8 +454,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--fold-lag-interval-secs` flag, accepted only in `--mode query`, sets the
   interval that classification uses and configures no fold; `--mode all`,
   `--mode maintain` and `--mode gateway` refuse it, and so does a zero value.
-  The operator renders it on the query Deployment from
-  `spec.maintain.fold.intervalSecs` whenever that field is set.
+  `--mode all` classifies against its own `--fold-interval-secs`; maintain and
+  gateway serve no query. The operator renders it on the query Deployment from
+  `spec.maintain.fold.intervalSecs` only when the maintain Deployment renders
+  (`spec.maintain.enabled` true), its fold runs (`spec.maintain.fold.disabled`
+  false), and that field is set. Upgrade `spec.image` to a `ravel-server`
+  image from this release or newer before or together with the operator: on
+  a cluster that sets that field, the upgraded operator adds the flag to the
+  query Deployment and rolls the query pods, and an older server rejects the
+  unknown flag at startup, so the pods restart-loop. From this release on,
+  editing `spec.maintain.fold.intervalSecs`, `spec.maintain.fold.disabled` or
+  `spec.maintain.enabled` rolls the query pods as well as the maintain pods
+  whenever the change adds, removes or changes the flag.
 
 - **A zero loop interval is refused at startup** (issue #2256).
   `--maintain-interval-secs 0`, `--fold-interval-secs 0`,

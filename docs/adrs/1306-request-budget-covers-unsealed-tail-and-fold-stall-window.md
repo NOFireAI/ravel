@@ -828,9 +828,9 @@ the default fold interval.
 
 - It is accepted only in `--mode query`, the one mode that serves queries and
   runs no scheduled fold.
-- `--mode all` and `--mode maintain` refuse it at startup: they run the fold,
-  and classify against their own `--fold-interval-secs`. `--mode gateway`
-  refuses it too, since it serves no query and classifies nothing.
+- `--mode all` refuses it at startup, since it classifies against its own
+  `--fold-interval-secs`. `--mode maintain` and `--mode gateway` refuse it
+  too, since they serve no query and classify nothing.
 - A zero value is refused at startup, as a zero `--fold-interval-secs` is: no
   maintain tier can run a fold at that interval.
 
@@ -841,8 +841,17 @@ separate input to a query-side classification, not a fold setting.
 ### The operator
 
 The operator renders `--fold-lag-interval-secs` on the query Deployment, the
-only query-serving tier it renders, from `spec.maintain.fold.intervalSecs`
-whenever that field is set, alongside the `--fold-interval-secs` the maintain
-Deployment already carries. The maintain and gateway Deployments never carry
-it. A cluster that leaves the field unset renders no flag on either tier, and
-both classify against the same default.
+only query-serving tier it renders, from `spec.maintain.fold.intervalSecs`,
+alongside the `--fold-interval-secs` the maintain Deployment already carries.
+It renders the flag only when the maintain Deployment renders
+(`spec.maintain.enabled` true), its fold runs (`spec.maintain.fold.disabled`
+false), and the field is set: with no running fold there is no interval to
+classify against. The maintain and gateway Deployments never carry it. In
+every other case the query Deployment carries no flag and classifies against
+the default.
+
+Rendering the flag changes the query Deployment's arguments, so upgrading the
+operator on a cluster that sets the field rolls the query pods, as does any
+later edit to those three fields that adds, removes or changes the flag. The
+query pods' `spec.image` must carry `--fold-lag-interval-secs` before or with
+that operator upgrade: an older server rejects the unknown flag at startup.

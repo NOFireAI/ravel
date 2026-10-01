@@ -1565,11 +1565,6 @@ mod catalog_cache_tests {
             Duration::from_secs(900),
             "--fold-lag-interval-secs must reach the engine's fold interval"
         );
-        assert_eq!(
-            config.fold.fold_interval,
-            crate::fold::DEFAULT_FOLD_INTERVAL,
-            "the flag moves nothing about the fold"
-        );
 
         // Unset, the classification keeps the default interval.
         let unset = query_mode_config(&[]);

@@ -288,7 +288,7 @@ A minimal example is in
 | `spec.maintain.replicas` | integer | `1` | |
 | `spec.maintain.intervalSecs` | integer | none | `--maintain-interval-secs`. Minimum `1`: `0` is refused at admission, since the server refuses a zero interval at startup. |
 | `spec.maintain.fold.disabled` | boolean | `false` | `--disable-fold` on the maintain pods, the only Deployment the operator renders that runs the scheduled fold. Fold is a query-cost optimization only; disabling it never changes results. |
-| `spec.maintain.fold.intervalSecs` | integer | none | `--fold-interval-secs` on the maintain pods. The operator also passes it to the query pods as `--fold-lag-interval-secs`, so their request-budget refusals classify fold lag against the interval the maintain pods really fold on rather than the 300 s default. Minimum `1`: `0` is refused at admission, since the server refuses a zero interval at startup. |
+| `spec.maintain.fold.intervalSecs` | integer | none | `--fold-interval-secs` on the maintain pods. While the maintain Deployment renders (`spec.maintain.enabled` true) and its fold runs (`spec.maintain.fold.disabled` false), the operator also passes it to the query pods as `--fold-lag-interval-secs`, so their request-budget refusals classify fold lag against the interval the maintain pods really fold on rather than the 300 s default; otherwise the query pods get no such flag. That flag requires a server image that has `--fold-lag-interval-secs`, and editing this field rolls the query pods too. See "The fold-lag interval on the query pods" below. Minimum `1`: `0` is refused at admission, since the server refuses a zero interval at startup. |
 | `spec.maintain.resources` | object | `requests: {cpu: 100m, memory: 256Mi}`, no limits | An explicit block replaces the default entirely rather than merging with it. |
 | `spec.gc.protectionHorizon` | string | none | `--gc-protection-horizon` on the maintain pods, a duration such as `25h5m`. It must equal the protection horizon stored in the bucket's `sys/gc`, read with `ravel-cli gc-config show`, or the maintain pods refuse to start. Unset renders no flag and the server's default applies. |
 | `spec.gc.grace` | string | none | `--gc-grace` on the maintain pods, a duration such as `24h`. It must equal the grace stored in the bucket's `sys/gc`, read with `ravel-cli gc-config show`, or the maintain pods refuse to start. Unset renders no flag and the server's default applies. |
@@ -527,6 +527,30 @@ yourself" above), every `RavelCluster` also carries a
 `KubernetesVersionUnsupported=True` condition naming the floor and the
 detected version, alongside `Available`/`Degraded` rather than instead of
 them.
+
+### The fold-lag interval on the query pods
+
+The query pods run no scheduled fold, so a request-budget refusal there
+classifies fold lag against the interval the maintain pods fold on. The
+operator renders `--fold-lag-interval-secs` on the query
+Deployment, set to `spec.maintain.fold.intervalSecs`, only when all three of
+these hold: `spec.maintain.enabled` is true, so the maintain Deployment
+renders; `spec.maintain.fold.disabled` is false, so its fold runs; and
+`spec.maintain.fold.intervalSecs` is set. In every other case the query pods
+get no such flag and classify against the server's 300 s default.
+
+Two consequences follow when you upgrade the operator or edit those fields:
+
+- The flag requires a `ravel-server` image that has `--fold-lag-interval-secs`,
+  meaning the release that added it or newer. On a cluster that already sets
+  `spec.maintain.fold.intervalSecs`, upgrading the operator adds the flag to
+  the query Deployment and rolls the query pods. `spec.image` is yours to
+  pin, and an older server rejects the unknown flag at startup, so those pods
+  restart-loop. Upgrade `spec.image` before or together with the operator.
+- Editing `spec.maintain.fold.intervalSecs`, `spec.maintain.fold.disabled` or
+  `spec.maintain.enabled` changes the query Deployment's arguments whenever
+  the change adds, removes or changes the flag, so it rolls the query pods as
+  well as the maintain pods.
 
 ## Probe semantics
 
