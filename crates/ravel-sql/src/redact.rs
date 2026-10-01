@@ -238,7 +238,7 @@ fn render_create_external(
                 out.push_str(", ");
             }
             out.push('\'');
-            out.push_str(key);
+            out.push_str(&key.replace('\'', "''"));
             out.push_str("' '");
             out.push_str(&audit_token(token_key, value.as_bytes()));
             out.push('\'');
@@ -549,6 +549,31 @@ mod tests {
         assert!(!out.contains("'true'"), "OPTIONS value leaked: {out}");
         assert!(out.contains("tok_"), "tokens expected: {out}");
         reparse(&out);
+    }
+
+    #[test]
+    fn render_create_external_escapes_a_quote_in_an_options_key() {
+        // `create_external_intent`'s own charset check keeps a key like this
+        // from reaching `render_create_external` through `redact()`, but
+        // `render_create_external` must not rely on that alone: a key
+        // carrying an unescaped `'` would close the key's own string early
+        // and let the rest run as SQL text. Call it directly, bypassing the
+        // charset gate, to prove the escaping itself -- not just the gate in
+        // front of it -- is what keeps the output a single statement.
+        let mut options = BTreeMap::new();
+        options.insert(
+            "ravel.cast.x'); DROP TABLE evil--".to_string(),
+            "date-from-days".to_string(),
+        );
+        let out = render_create_external("t1", false, false, "s3://bucket/t1/", &options, &KEY_A);
+
+        assert!(
+            out.contains("x''); DROP TABLE evil--"),
+            "quote must be doubled, not dropped: {out}"
+        );
+
+        let parsed = DFParser::parse_sql(&out).expect("redacted output re-parses as valid SQL");
+        assert_eq!(parsed.len(), 1, "must re-parse as exactly one statement");
     }
 
     #[test]
