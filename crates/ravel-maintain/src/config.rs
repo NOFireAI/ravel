@@ -1109,7 +1109,13 @@ pub struct CompactorConfig {
     pub merge_admission: AdmissionMode,
     /// zstd level the RLOG compaction merge and the erasure rewrite write their
     /// parts at (ADR-2135 decision 4). Checked by [`validate_rlog_zstd_level`]
-    /// before a merge reads anything; a level outside
+    /// on a logs or query-audit bucket at the start of
+    /// [`crate::compact::compact_bucket`] and its claimed variants,
+    /// [`crate::rewrite::migrate_bucket_format`],
+    /// [`crate::rewrite::rewrite_and_publish`],
+    /// [`crate::erasure_rewrite::erasure_rewrite_bucket`], and
+    /// [`crate::erasure_rewrite::build_rewrite_logs`], before the run's first
+    /// store request; a level outside
     /// [`MIN_RLOG_ZSTD_LEVEL`]`..=`[`MAX_RLOG_ZSTD_LEVEL`] fails the run with
     /// [`crate::error::MaintainError::InvalidRlogZstdLevel`]. Default
     /// [`DEFAULT_RLOG_ZSTD_LEVEL`] (9).

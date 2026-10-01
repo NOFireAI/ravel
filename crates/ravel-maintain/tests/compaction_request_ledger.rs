@@ -18,14 +18,18 @@
 mod common;
 
 use common::*;
+use ravel_commit::{keys, signal};
 use ravel_maintain::request_ledger::RunRequestReport;
 use ravel_maintain::{
-    CompactionOutcome, CompactorConfig, FixedClock, MaintainError, PublishOutcome, RequestLedger,
-    RlogCodec, compact_bucket, conserve_exact, read, rewrite_and_publish,
+    CompactionOutcome, CompactorConfig, FixedClock, MaintainError, MaintainMemo, NoLeases,
+    PendingErasureRequest, PublishOutcome, RequestLedger, RlogCodec, compact_bucket,
+    conserve_exact, erasure_rewrite_bucket, migrate_bucket_format, read, rewrite_and_publish,
 };
 use ravel_object_store::instrument::{InstrumentedStore, StoreMetricsSnapshot};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, list_all};
+use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest};
+use ravel_types::Signal;
 use uuid::Uuid;
 
 /// A config with a ledger installed and nothing else changed from the shipped
@@ -556,4 +560,173 @@ async fn the_rseg_and_rspan_paths_report_under_the_same_phases() {
         assert_eq!(report.publish.requests, 1, "{signal}: the record PUT");
         assert_reconciles(&report, &before, &after);
     }
+}
+
+/// The four RLOG-writing entry points a `CompactorConfig` reaches.
+#[derive(Clone, Copy, Debug)]
+enum RlogEntry {
+    Compact,
+    Migrate,
+    Rewrite,
+    Erasure,
+}
+
+const RLOG_ENTRIES: [RlogEntry; 4] = [
+    RlogEntry::Compact,
+    RlogEntry::Migrate,
+    RlogEntry::Rewrite,
+    RlogEntry::Erasure,
+];
+
+/// A windowless logs erasure request whose predicate matches nothing in the
+/// fixture.
+fn logs_erasure_request() -> PendingErasureRequest {
+    let request_id = Uuid::from_u128(42);
+    PendingErasureRequest {
+        request_key: keys::erasure_request_key(&tenant_hash(), Signal::Logs, request_id)
+            .expect("dreq key"),
+        request: ErasureRequest {
+            format_version: 1,
+            tenant_hash: tenant_hash().0.to_vec(),
+            signal: signal::to_proto(Signal::Logs) as i32,
+            request_id: request_id.to_string(),
+            created_unix_ns: 0,
+            predicate: vec![ErasurePredicateMatcher {
+                key: "service.name".to_string(),
+                value: "absent".to_string(),
+            }],
+            window_start_ns: 0,
+            window_end_ns: 0,
+            reason: String::new(),
+        },
+    }
+}
+
+/// Run `entry` once over a freshly seeded two-input logs bucket at `level` and
+/// return its result with the store requests it issued, as the oracle counts
+/// them and as the ledger attributes them.
+async fn run_rlog_entry_at(entry: RlogEntry, level: i32) -> (Result<(), MaintainError>, u64, u64) {
+    let store = InstrumentedStore::new(MemoryStore::new());
+    let bucket = seed_rlog_two_inputs(&store).await;
+    let listing = read::list_bucket(&store, &bucket).await.expect("list");
+    let metrics = store.metrics();
+    let before = metrics.snapshot();
+    let ledger = RequestLedger::new();
+    let config = CompactorConfig {
+        rlog_zstd_level: level,
+        ..config_with(&ledger)
+    };
+    let clock = FixedClock::new(sealed_now_ns());
+    let result = match entry {
+        RlogEntry::Compact => compact_bucket(&store, &clock, &config, &bucket)
+            .await
+            .map(drop),
+        RlogEntry::Migrate => migrate_bucket_format(&store, &clock, &config, &bucket, u32::MAX)
+            .await
+            .map(drop),
+        RlogEntry::Rewrite => rewrite_and_publish::<RlogCodec>(
+            &store,
+            &clock,
+            &config,
+            &bucket,
+            &listing.commit_keys,
+            conserve_exact(),
+            sealed_now_ns(),
+        )
+        .await
+        .map(drop),
+        RlogEntry::Erasure => {
+            let mut memo = MaintainMemo::with_default_interval();
+            erasure_rewrite_bucket(
+                &store,
+                &clock,
+                &config,
+                &NoLeases,
+                &bucket,
+                &[logs_erasure_request()],
+                &mut memo,
+            )
+            .await
+            .map(drop)
+        }
+    };
+    let after = metrics.snapshot();
+    (
+        result,
+        oracle_requests(&before, &after),
+        ledger.report().total_requests(),
+    )
+}
+
+/// An out-of-range `rlog_zstd_level` is refused by every RLOG-writing entry
+/// point before its first store request: the oracle sees zero requests and the
+/// ledger attributes zero, at both ends of the refused range.
+///
+/// The control below runs each entry point over the same fixture at the
+/// default level and pins the requests it then issues, so a zero here is the
+/// check firing first and not an entry point that never touches the store.
+#[tokio::test]
+async fn a_bad_rlog_zstd_level_is_refused_before_any_store_request() {
+    for level in [0, 23] {
+        for entry in RLOG_ENTRIES {
+            let (result, oracle, attributed) = run_rlog_entry_at(entry, level).await;
+            match result {
+                Err(MaintainError::InvalidRlogZstdLevel(e)) => assert_eq!(e.level, level),
+                other => panic!("{entry:?} at level {level}: expected a refusal, got {other:?}"),
+            }
+            assert_eq!(oracle, 0, "{entry:?} at level {level}: store requests");
+            assert_eq!(attributed, 0, "{entry:?} at level {level}: ledger requests");
+        }
+    }
+}
+
+/// The control for the refusal test: at the default level each entry point
+/// issues requests over the same fixture. Figures are the oracle's, pinned as
+/// measured on this fixture: compaction's 19 is the headline test's figure,
+/// and the bare rewrite's 18 is that less the LIST its caller already did.
+#[tokio::test]
+async fn the_default_level_runs_each_rlog_entry_point_against_the_store() {
+    for (entry, expected) in RLOG_ENTRIES.into_iter().zip([19, 21, 18, 19]) {
+        let (result, oracle, _) = run_rlog_entry_at(entry, 9).await;
+        assert!(result.is_ok(), "{entry:?}: {result:?}");
+        assert_eq!(oracle, expected, "{entry:?}: store requests");
+    }
+}
+
+/// A bucket that writes no `.rlog` part is not checked: a metrics compaction
+/// at level 0 issues exactly the requests it issues at the default level.
+#[tokio::test]
+async fn a_metrics_bucket_ignores_the_rlog_zstd_level() {
+    let mut requests = Vec::new();
+    for level in [0, 9] {
+        let store = InstrumentedStore::new(MemoryStore::new());
+        for (i, ts) in [(1u128, 10), (2, 20)] {
+            seed_input(
+                &store,
+                &InputSpec::new(
+                    Uuid::from_u128(i),
+                    10,
+                    i as u64,
+                    vec![raw_series("m", &[], &[(ts, 1.0)])],
+                ),
+            )
+            .await;
+        }
+        let metrics = store.metrics();
+        let before = metrics.snapshot();
+        let config = CompactorConfig {
+            rlog_zstd_level: level,
+            ..CompactorConfig::default()
+        };
+        let clock = FixedClock::new(sealed_now_ns());
+        let outcome = compact_bucket(&store, &clock, &config, &common::bucket())
+            .await
+            .expect("metrics compaction");
+        assert!(
+            matches!(outcome, CompactionOutcome::Compacted { parts: 1, .. }),
+            "level {level}: {outcome:?}"
+        );
+        requests.push(oracle_requests(&before, &metrics.snapshot()));
+    }
+    assert_eq!(requests[0], requests[1]);
 }

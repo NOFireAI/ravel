@@ -1418,6 +1418,7 @@ pub async fn build_rewrite_logs(
     requests: &[ApplicableLogRequest],
     input_set_hash: &[u8; 32],
 ) -> Result<RewriteBuild> {
+    crate::config::validate_rlog_zstd_level(config.rlog_zstd_level)?;
     // `false`: this pass writes its parts with no indexed fields, so recovering
     // each input's POSTINGS field list would cost a ranged GET per input and be
     // discarded.
@@ -2005,6 +2006,7 @@ pub async fn erasure_rewrite_bucket(
     pending: &[PendingErasureRequest],
     memo: &mut MaintainMemo,
 ) -> Result<ErasureRewriteOutcome> {
+    crate::rlog::check_rlog_zstd_level(config, bucket)?;
     let start_ns = clock.now_ns();
     if !bucket.is_sealed(start_ns, config) {
         return Ok(ErasureRewriteOutcome::NotSealed);
