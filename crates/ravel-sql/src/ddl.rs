@@ -38,9 +38,11 @@
 //! time of the whole statement -- the grants read, both qualification
 //! probes, the snapshot read, and the manifest write, not only the snapshot
 //! step within it ([`DdlExecuteError::Deadline`] on expiry). The snapshot
-//! step keeps its own inner `deadline` as well, so a snapshot that alone
-//! would run past it is reported as [`DdlExecuteError::Snapshot`] before the
-//! outer timeout ever fires.
+//! step is passed that same `deadline` value for its own inner timeout, but
+//! it only starts once the grants read and both qualification probes have
+//! already spent part of that budget, so its timeout instant is always
+//! later than the outer one's: the outer [`DdlExecuteError::Deadline`]
+//! always fires first, never the inner `SnapshotError::Deadline`.
 
 use std::time::Duration;
 
@@ -269,8 +271,8 @@ impl DdlExecuteError {
             DdlExecuteError::ProbeList { .. } => DdlErrorClass::Unavailable,
             DdlExecuteError::ProbeObjectEmpty { .. } => DdlErrorClass::Unsupported,
             DdlExecuteError::ProbeObjectPageCapReached { .. } => DdlErrorClass::Unsupported,
-            DdlExecuteError::PreconditionProbe { .. } => DdlErrorClass::Unsupported,
-            DdlExecuteError::RavelBucketProbe { .. } => DdlErrorClass::Unsupported,
+            DdlExecuteError::PreconditionProbe { source, .. } => precondition_probe_class(source),
+            DdlExecuteError::RavelBucketProbe { source, .. } => ravel_bucket_probe_class(source),
             DdlExecuteError::Snapshot { source, .. } => snapshot_error_class(source),
             DdlExecuteError::UnknownCastColumn { .. } => DdlErrorClass::Unsupported,
             DdlExecuteError::Write(source) => write_error_class(source),
@@ -281,19 +283,47 @@ impl DdlExecuteError {
     /// The message a client may see. A storage fault or an internal
     /// data-integrity fault collapses to a fixed string; every other class
     /// keeps its own text, derived only from the statement's own `LOCATION`,
-    /// table name, and OPTIONS, which the caller already supplied.
+    /// table name, and OPTIONS, which the caller already supplied --
+    /// [`DdlExecuteError::PreconditionProbe`] and
+    /// [`DdlExecuteError::RavelBucketProbe`] are handled separately below
+    /// rather than through `self.to_string()`, because their own `Display`
+    /// interpolates the probe's inner [`PreconditionProbeFailure`] or
+    /// [`RavelBucketProbeFailure`], which for several variants carries a raw
+    /// [`StoreError`] (backend host or response text) verbatim; each of
+    /// those two variants instead gets a fixed message naming only
+    /// `location`.
     ///
     /// The full `Display` of `self` stays available to the caller for
     /// server-side logging and is never produced here.
     pub fn client_message(&self) -> String {
-        match self.class() {
-            DdlErrorClass::Unavailable => crate::error::MSG_UNAVAILABLE.to_string(),
-            DdlErrorClass::Internal => crate::error::MSG_INTERNAL.to_string(),
-            DdlErrorClass::BadRequest
-            | DdlErrorClass::Conflict
-            | DdlErrorClass::NotFound
-            | DdlErrorClass::Unsupported
-            | DdlErrorClass::Timeout => self.to_string(),
+        match self {
+            DdlExecuteError::PreconditionProbe { location, source } => {
+                match precondition_probe_class(source) {
+                    DdlErrorClass::Unavailable => crate::error::MSG_UNAVAILABLE.to_string(),
+                    _ => format!(
+                        "the store behind {location:?} does not qualify for pinned reads: it \
+                         does not honor read preconditions correctly"
+                    ),
+                }
+            }
+            DdlExecuteError::RavelBucketProbe { location, source } => {
+                match ravel_bucket_probe_class(source) {
+                    DdlErrorClass::Unavailable => crate::error::MSG_UNAVAILABLE.to_string(),
+                    _ => format!(
+                        "the bucket behind {location:?} did not qualify as external: it is \
+                         Ravel's own bucket"
+                    ),
+                }
+            }
+            _ => match self.class() {
+                DdlErrorClass::Unavailable => crate::error::MSG_UNAVAILABLE.to_string(),
+                DdlErrorClass::Internal => crate::error::MSG_INTERNAL.to_string(),
+                DdlErrorClass::BadRequest
+                | DdlErrorClass::Conflict
+                | DdlErrorClass::NotFound
+                | DdlErrorClass::Unsupported
+                | DdlErrorClass::Timeout => self.to_string(),
+            },
         }
     }
 }
@@ -319,6 +349,42 @@ fn grants_error_class(err: &GrantsError) -> DdlErrorClass {
         | GrantsError::LocationNotGranted { .. }
         | GrantsError::GrantNotFound { .. } => DdlErrorClass::Unsupported,
         GrantsError::Key(_) => DdlErrorClass::Internal,
+    }
+}
+
+/// [`DdlExecuteError::PreconditionProbe`]'s class. [`PreconditionProbeFailure::Head`]
+/// and [`PreconditionProbeFailure::MatchingPinRefused`] are a failure to ask
+/// the question at all: a HEAD, or a ranged read pinned to the object's own
+/// identity, that itself errored for a store or network reason the probe
+/// cannot attribute to the store's precondition support -- retryable (503).
+/// [`PreconditionProbeFailure::WrongPinAccepted`] and
+/// [`PreconditionProbeFailure::WrongPinWrongError`] are a genuine
+/// qualification verdict: the store answered, and the answer disqualifies
+/// it (422).
+fn precondition_probe_class(err: &PreconditionProbeFailure) -> DdlErrorClass {
+    match err {
+        PreconditionProbeFailure::Head { .. }
+        | PreconditionProbeFailure::MatchingPinRefused { .. } => DdlErrorClass::Unavailable,
+        PreconditionProbeFailure::WrongPinAccepted { .. }
+        | PreconditionProbeFailure::WrongPinWrongError { .. } => DdlErrorClass::Unsupported,
+    }
+}
+
+/// [`DdlExecuteError::RavelBucketProbe`]'s class.
+/// [`RavelBucketProbeFailure::ProbeWriteFailed`] (the probe object never
+/// reached Ravel's own bucket, so the question was never asked) and
+/// [`RavelBucketProbeFailure::Inconclusive`] (the candidate's read answered
+/// neither a hit nor a clean miss) are a failure to ask -- retryable (503).
+/// [`RavelBucketProbeFailure::SameBucket`] and
+/// [`RavelBucketProbeFailure::TenancyMarkerPresent`] are a genuine
+/// qualification verdict: the probe proves the candidate is Ravel's own
+/// bucket (422).
+fn ravel_bucket_probe_class(err: &RavelBucketProbeFailure) -> DdlErrorClass {
+    match err {
+        RavelBucketProbeFailure::ProbeWriteFailed { .. }
+        | RavelBucketProbeFailure::Inconclusive { .. } => DdlErrorClass::Unavailable,
+        RavelBucketProbeFailure::SameBucket { .. }
+        | RavelBucketProbeFailure::TenancyMarkerPresent { .. } => DdlErrorClass::Unsupported,
     }
 }
 
@@ -706,6 +772,16 @@ mod tests {
         StoreError::NotFound
     }
 
+    /// A distinctive marker that stands in for backend-specific detail (an
+    /// endpoint host, a raw response body) a [`StoreError`] can carry. Used
+    /// to prove a client message derives only from `location`, never from
+    /// the store's own error text.
+    const SENTINEL: &str = "SENTINEL-BACKEND-DETAIL-9f3a";
+
+    fn sentinel_store_error() -> StoreError {
+        StoreError::Transient(SENTINEL.to_string())
+    }
+
     #[test]
     fn validation_is_bad_request() {
         let err = DdlExecuteError::Validation(DdlValidationError::Empty);
@@ -757,26 +833,139 @@ mod tests {
         assert_eq!(err.class(), DdlErrorClass::Unsupported);
     }
 
+    // `PreconditionProbeFailure::Head` and `::MatchingPinRefused` are a
+    // failure to ask (a HEAD or a matching-pin read that itself errored),
+    // never a qualification verdict: `Unavailable`, and `client_message`
+    // must redact the inner `StoreError` rather than echo `self.to_string()`.
+
     #[test]
-    fn precondition_probe_is_unsupported() {
+    fn precondition_probe_head_is_unavailable_and_redacted() {
         let err = DdlExecuteError::PreconditionProbe {
             location: "s3://b/p".to_string(),
-            source: PreconditionProbeFailure::WrongPinAccepted {
+            source: PreconditionProbeFailure::Head {
                 key: "k".to_string(),
+                source: sentinel_store_error(),
             },
         };
-        assert_eq!(err.class(), DdlErrorClass::Unsupported);
+        assert_eq!(err.class(), DdlErrorClass::Unavailable);
+        let message = err.client_message();
+        assert_eq!(message, crate::error::MSG_UNAVAILABLE);
+        assert!(!message.contains(SENTINEL), "{message}");
     }
 
     #[test]
-    fn ravel_bucket_probe_is_unsupported() {
-        let err = DdlExecuteError::RavelBucketProbe {
+    fn precondition_probe_matching_pin_refused_is_unavailable_and_redacted() {
+        let err = DdlExecuteError::PreconditionProbe {
             location: "s3://b/p".to_string(),
-            source: RavelBucketProbeFailure::SameBucket {
+            source: PreconditionProbeFailure::MatchingPinRefused {
                 key: "k".to_string(),
+                source: sentinel_store_error(),
+            },
+        };
+        assert_eq!(err.class(), DdlErrorClass::Unavailable);
+        let message = err.client_message();
+        assert_eq!(message, crate::error::MSG_UNAVAILABLE);
+        assert!(!message.contains(SENTINEL), "{message}");
+    }
+
+    // `WrongPinAccepted` and `WrongPinWrongError` are a genuine qualification
+    // verdict: `Unsupported`, with a fixed client message naming only
+    // `location` -- never the probe's own key, and never (for
+    // `WrongPinWrongError`) the inner `StoreError` its `Display` carries.
+
+    #[test]
+    fn precondition_probe_wrong_pin_accepted_is_unsupported_and_names_location_only() {
+        let err = DdlExecuteError::PreconditionProbe {
+            location: "s3://b/p".to_string(),
+            source: PreconditionProbeFailure::WrongPinAccepted {
+                key: "distinct-probe-key-123".to_string(),
             },
         };
         assert_eq!(err.class(), DdlErrorClass::Unsupported);
+        let message = err.client_message();
+        assert!(message.contains("s3://b/p"), "{message}");
+        assert!(!message.contains("distinct-probe-key-123"), "{message}");
+    }
+
+    #[test]
+    fn precondition_probe_wrong_pin_wrong_error_is_unsupported_and_redacted() {
+        let err = DdlExecuteError::PreconditionProbe {
+            location: "s3://b/p".to_string(),
+            source: PreconditionProbeFailure::WrongPinWrongError {
+                key: "k".to_string(),
+                source: sentinel_store_error(),
+            },
+        };
+        assert_eq!(err.class(), DdlErrorClass::Unsupported);
+        let message = err.client_message();
+        assert!(message.contains("s3://b/p"), "{message}");
+        assert!(!message.contains(SENTINEL), "{message}");
+    }
+
+    // `ProbeWriteFailed` and `Inconclusive` are a failure to ask (the probe
+    // object never reached Ravel's own bucket, or the candidate's read had
+    // no clean answer): `Unavailable`, redacted.
+
+    #[test]
+    fn ravel_bucket_probe_write_failed_is_unavailable_and_redacted() {
+        let err = DdlExecuteError::RavelBucketProbe {
+            location: "s3://b/p".to_string(),
+            source: RavelBucketProbeFailure::ProbeWriteFailed {
+                key: "k".to_string(),
+                source: sentinel_store_error(),
+            },
+        };
+        assert_eq!(err.class(), DdlErrorClass::Unavailable);
+        let message = err.client_message();
+        assert_eq!(message, crate::error::MSG_UNAVAILABLE);
+        assert!(!message.contains(SENTINEL), "{message}");
+    }
+
+    #[test]
+    fn ravel_bucket_probe_inconclusive_is_unavailable_and_redacted() {
+        let err = DdlExecuteError::RavelBucketProbe {
+            location: "s3://b/p".to_string(),
+            source: RavelBucketProbeFailure::Inconclusive {
+                key: "k".to_string(),
+                detail: SENTINEL.to_string(),
+            },
+        };
+        assert_eq!(err.class(), DdlErrorClass::Unavailable);
+        let message = err.client_message();
+        assert_eq!(message, crate::error::MSG_UNAVAILABLE);
+        assert!(!message.contains(SENTINEL), "{message}");
+    }
+
+    // `SameBucket` and `TenancyMarkerPresent` are a genuine qualification
+    // verdict (the probe proves the candidate is Ravel's own bucket):
+    // `Unsupported`, with a fixed client message naming only `location`.
+
+    #[test]
+    fn ravel_bucket_probe_same_bucket_is_unsupported_and_names_location_only() {
+        let err = DdlExecuteError::RavelBucketProbe {
+            location: "s3://b/p".to_string(),
+            source: RavelBucketProbeFailure::SameBucket {
+                key: "distinct-probe-key-123".to_string(),
+            },
+        };
+        assert_eq!(err.class(), DdlErrorClass::Unsupported);
+        let message = err.client_message();
+        assert!(message.contains("s3://b/p"), "{message}");
+        assert!(!message.contains("distinct-probe-key-123"), "{message}");
+    }
+
+    #[test]
+    fn ravel_bucket_probe_tenancy_marker_present_is_unsupported_and_names_location_only() {
+        let err = DdlExecuteError::RavelBucketProbe {
+            location: "s3://b/p".to_string(),
+            source: RavelBucketProbeFailure::TenancyMarkerPresent {
+                key: "distinct-probe-key-123".to_string(),
+            },
+        };
+        assert_eq!(err.class(), DdlErrorClass::Unsupported);
+        let message = err.client_message();
+        assert!(message.contains("s3://b/p"), "{message}");
+        assert!(!message.contains("distinct-probe-key-123"), "{message}");
     }
 
     #[test]
