@@ -452,6 +452,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   multipart, and on delete a whole-request 404 is `NotFound` only for
   `NoSuchKey`. A HEAD 404 carries no body, so `head` and `pin_of` against a
   missing bucket still read `NotFound`.
+- **A tiered-cache miss no longer issues a duplicate GET** on success, when
+  the RAM tier admits the bytes (issue #2280).
+  A read that peeked both cache tiers while a GET for the same range was in
+  flight, but reached the single flight only after that GET had finished,
+  led a new flight and fetched the range again. The disk peek runs on the
+  blocking pool, so a loaded machine could stretch that gap past a whole
+  GET. A flight's leader now serves the bytes the previous flight left in
+  the RAM tier instead, without recording a second miss. A read still
+  fetches again when the previous flight failed or lost its leader, or when
+  its bytes were over the RAM tier's size limit or evicted in the meantime.
+  The log block fetcher now CRC-verifies every block of a coalesced run that
+  its own fetch did not produce: one served by that RAM recheck, by another
+  caller's flight, or by a concurrent read-through's disk hit. Before, such a
+  non-lead block was used unchecked, so a corrupt RAM or disk entry reached
+  this way now fails the query with `LogFetchError::Corrupt` where it used to
+  pass corrupt bytes on to the decoder. The check costs one crc32c per block
+  so served, and is redundant when the block rode a flight whose leader
+  already verified it. Such a block is no longer counted in the fetch span's
+  `s3_requests` and `s3_bytes` either, since this read made no GET for it.
 - **A zero loop interval is refused at startup** (issue #2256).
   `--maintain-interval-secs 0`, `--fold-interval-secs 0`,
   `--alert-eval-interval-secs 0` and `--oidc-jwks-refresh-interval-secs 0`

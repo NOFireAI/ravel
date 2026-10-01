@@ -6386,8 +6386,12 @@ impl BlockRangeFetcher {
                 cache_hits: 0,
             });
         }
-        // Follower: the lead block is the leader's own verified bytes, and the
-        // leader admitted the rest of the run before it returned.
+        // Not this call's own fetch: the lead block rode another caller's
+        // flight or was served from the cache (a disk hit of a concurrent
+        // `get_or_fetch`, or the RAM tier after a finished flight), so it is
+        // verified like every other cache-served block before use. The leader
+        // admitted the rest of the run before it returned.
+        verify_block_crc(key, &lead_bytes, &lead)?;
         let mut out = Vec::with_capacity(blocks.len());
         out.push((lead.abs_start, lead_bytes));
         let mut outcome = RunOutcome::default();
@@ -6405,7 +6409,10 @@ impl BlockRangeFetcher {
             accounting.record_cache_miss();
             // `fetch_peeked` for the same reason as the lead above: this block
             // was just peeked with `cache.get`, so the deferred fetch must not
-            // re-count the miss on the tiered tier.
+            // re-count the miss on the tiered tier. Bytes this call's closure
+            // did not produce (another caller's flight, or the tiered leader's
+            // RAM recheck) are verified after it returns.
+            let fetched_here = std::sync::atomic::AtomicBool::new(false);
             let bytes = cache
                 .fetch_peeked(block_key, || async {
                     let got = self
@@ -6419,12 +6426,18 @@ impl BlockRangeFetcher {
                         .await
                         .map_err(to_cache_error)?;
                     verify_block_crc(key, &got.data, ext).map_err(to_cache_error)?;
+                    fetched_here.store(true, std::sync::atomic::Ordering::Relaxed);
                     Ok(got.data)
                 })
                 .await
                 .map_err(|err| from_cache_error(key, err))?;
-            outcome.gets += 1;
-            outcome.bytes = outcome.bytes.saturating_add(bytes.len() as u64);
+            if fetched_here.load(std::sync::atomic::Ordering::Relaxed) {
+                // Only a block this call's own GET produced is a store read.
+                outcome.gets += 1;
+                outcome.bytes = outcome.bytes.saturating_add(bytes.len() as u64);
+            } else {
+                verify_block_crc(key, &bytes, ext)?;
+            }
             out.push((ext.abs_start, bytes));
         }
         outcome.blocks = out;
@@ -10850,5 +10863,243 @@ mod read_gate_tests {
             .next_block()
             .expect_err("the inline exit has no cursor either");
         assert_eq!(class(&inline), class(&first), "{inline:?}");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod fetch_run_corruption_gate_tests {
+    //! ADR-0046 decision 4's corruption gate on `fetch_run`'s lead block when
+    //! this call did not run the fetch itself. A caller whose peek missed while
+    //! a flight was running and that reached the single flight only after it
+    //! finished is served the RAM tier's bytes as a cache hit; in
+    //! `with_corruption` mode those bytes arrive corrupted and must be refused
+    //! exactly as a corrupted peek hit is.
+
+    use super::*;
+    use ravel_cache::{Cache, CacheLimits, DiskCache, TieredCache};
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::memory::MemoryStore;
+    use uuid::Uuid;
+
+    const TENANT: TenantHash = TenantHash([7u8; 16]);
+    const CONTENT_HASH: [u8; 32] = [9u8; 32];
+    const KEY: &str = "t/corrupt-gate.rlog";
+
+    fn seg_ref(size: u64) -> SegmentRef {
+        SegmentRef {
+            data_object_key: KEY.to_string(),
+            object_size: size,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: 0,
+            ingest_hour_bucket: 0,
+            sample_count: 1,
+            series_count: 0,
+            shard: 0,
+            content_hash: CONTENT_HASH,
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            declared_column_stats: Default::default(),
+        }
+    }
+
+    /// FLIP: removing the follower branch's `verify_block_crc` on the lead
+    /// block returns the late caller's corrupted bytes as `Ok`.
+    #[tokio::test]
+    async fn a_late_ram_served_lead_block_is_crc_verified_under_corruption() {
+        let object = Bytes::from_static(b"block-range bytes the corruption gate covers");
+        let store = MemoryStore::new();
+        store
+            .put(KEY, object.clone(), PutOptions::default())
+            .await
+            .expect("put");
+        let block = object.slice(0..16);
+        let ext = BlockExtent {
+            abs_start: 0,
+            len: block.len() as u64,
+            crc32c: crc32c::crc32c(&block),
+        };
+
+        let limits = CacheLimits::new(1024 * 1024, 100, 1024 * 1024);
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let tiered = Arc::new(TieredCache::new(
+            Cache::with_corruption(limits),
+            DiskCache::new(tmp.path().to_path_buf(), limits),
+        ));
+        let fetcher = BlockRangeFetcher::new(Arc::new(store)).with_cache(tiered.clone());
+        let seg = seg_ref(object.len() as u64);
+
+        // The leader: runs the fetch, verifies the fresh bytes, admits them.
+        let leader_acc = QueryAccounting::new();
+        let led = fetcher
+            .fetch_run(
+                &seg,
+                TENANT,
+                &EtagPin::default(),
+                ext,
+                vec![ext],
+                QueryPhase::Scan,
+                &leader_acc,
+            )
+            .await
+            .expect("the leader's fresh fetch verifies");
+        assert_eq!(led.gets, 1);
+        assert_eq!(led.blocks, vec![(0, block.clone())]);
+        assert_eq!(leader_acc.snapshot().total_s3_requests(), 1);
+
+        // The late caller: its peek missed during the flight, and it reaches
+        // the single flight after the flight left the map, so the RAM tier
+        // serves it, corrupted.
+        let late_acc = QueryAccounting::new();
+        let Err(err) = fetcher
+            .fetch_run(
+                &seg,
+                TENANT,
+                &EtagPin::default(),
+                ext,
+                vec![ext],
+                QueryPhase::Scan,
+                &late_acc,
+            )
+            .await
+        else {
+            panic!("a corrupted late RAM serve must be refused");
+        };
+        assert!(
+            matches!(
+                &err,
+                LogFetchError::Corrupt { key, source }
+                    if key == KEY && source.to_string().contains("block crc mismatch")
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            late_acc.snapshot().total_s3_requests(),
+            0,
+            "the late caller was served from RAM, not refetched"
+        );
+    }
+
+    /// A non-lead block whose peek missed, and which the tiered leader's RAM
+    /// recheck then serves because the block was admitted in between, is
+    /// verified after `fetch_peeked` returns, not only inside this call's own
+    /// fetch closure.
+    ///
+    /// The run is polled once, which stops it in the tail block's
+    /// `spawn_blocking` disk peek after its RAM peek missed; the tail block is
+    /// then admitted to RAM only (the disk tier declines every entry), so the
+    /// resumed peek misses and the RAM recheck serves the corrupted bytes. An
+    /// attempt whose disk peek finished inside that one poll ran the whole
+    /// fetch itself and is rebuilt.
+    ///
+    /// FLIP: removing the `verify_block_crc` after the non-lead block's
+    /// `fetch_peeked` returns the corrupted tail block as `Ok`, and the test
+    /// panics with "a corrupted late RAM serve of a non-lead block must be
+    /// refused".
+    #[tokio::test]
+    async fn a_late_ram_served_non_lead_block_is_crc_verified_under_corruption() {
+        let object = Bytes::from_static(b"block-range bytes the corruption gate covers");
+        let lead_block = object.slice(0..16);
+        let tail_block = object.slice(16..32);
+        let lead_key = CacheKey::new(TENANT.0, CONTENT_HASH, 0, 16);
+        let tail_key = CacheKey::new(TENANT.0, CONTENT_HASH, 16, 16);
+        let limits = CacheLimits::new(1024 * 1024, 100, 1024 * 1024);
+        let disk_declines_all = CacheLimits::new(1024 * 1024, 100, 1);
+
+        // Corruption mode serves every RAM hit corrupted, the lead's included.
+        // The lead extent carries the crc of those served bytes so the lead
+        // passes its gate and the run reaches the tail block, whose extent
+        // carries the true crc.
+        let probe: Cache<&'static str> = Cache::with_corruption(limits);
+        probe.insert(lead_key, lead_block.clone());
+        let served_lead = probe.get(&lead_key).expect("probe RAM hit");
+        assert_ne!(served_lead, lead_block, "corruption mode changes the bytes");
+        let lead = BlockExtent {
+            abs_start: 0,
+            len: 16,
+            crc32c: crc32c::crc32c(&served_lead),
+        };
+        let tail = BlockExtent {
+            abs_start: 16,
+            len: 16,
+            crc32c: crc32c::crc32c(&tail_block),
+        };
+        let run = BlockExtent {
+            abs_start: 0,
+            len: 32,
+            crc32c: 0,
+        };
+        let seg = seg_ref(object.len() as u64);
+
+        let mut attempts = 0;
+        let (result, requests) = loop {
+            attempts += 1;
+            assert!(
+                attempts <= 20,
+                "the tail block's disk peek finished inside the first poll every time"
+            );
+            let store = MemoryStore::new();
+            store
+                .put(KEY, object.clone(), PutOptions::default())
+                .await
+                .expect("put");
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let tiered = Arc::new(TieredCache::new(
+                Cache::with_corruption(limits),
+                DiskCache::new(tmp.path().to_path_buf(), disk_declines_all),
+            ));
+            let ram_metrics = tiered.ram_metrics();
+            tiered.insert(lead_key, lead_block.clone());
+            let fetcher = BlockRangeFetcher::new(Arc::new(store)).with_cache(tiered.clone());
+            let acc = QueryAccounting::new();
+            let misses_before = ram_metrics.snapshot().misses;
+            let pin = EtagPin::default();
+
+            let mut fetch = Box::pin(fetcher.fetch_run(
+                &seg,
+                TENANT,
+                &pin,
+                run,
+                vec![lead, tail],
+                QueryPhase::Scan,
+                &acc,
+            ));
+            let first = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(fetch.as_mut(), cx))
+            })
+            .await;
+            if first.is_ready() {
+                continue;
+            }
+            assert_eq!(
+                ram_metrics.snapshot().misses,
+                misses_before + 1,
+                "the poll stopped in the tail block's disk peek, after its RAM peek missed"
+            );
+            tiered.insert(tail_key, tail_block.clone());
+            assert_eq!(tiered.disk_len(), 0, "the disk tier declined both blocks");
+            let result = fetch.await;
+            break (result, acc.snapshot().total_s3_requests());
+        };
+
+        let Err(err) = result else {
+            panic!("a corrupted late RAM serve of a non-lead block must be refused");
+        };
+        assert!(
+            matches!(
+                &err,
+                LogFetchError::Corrupt { key, source }
+                    if key == KEY && source.to_string().contains("block crc mismatch")
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            requests, 0,
+            "both blocks were served from RAM, none refetched"
+        );
     }
 }
