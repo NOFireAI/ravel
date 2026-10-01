@@ -53,6 +53,7 @@ mod audit_scan;
 mod audit_schema;
 mod avg;
 mod bounded_topk;
+mod clock;
 pub mod complexity_guard;
 mod config;
 pub mod conformance;

@@ -163,7 +163,6 @@ async fn create_external_table_then_read_back() {
             t,
             &format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'"),
             CREATED_BY,
-            NOW,
             deadline(),
         )
         .await
@@ -197,7 +196,7 @@ async fn create_if_not_exists_on_existing_table_is_a_no_op() {
         .await;
     let sql = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
     lake.executor
-        .execute_ddl(t, &sql, CREATED_BY, NOW, deadline())
+        .execute_ddl(t, &sql, CREATED_BY, deadline())
         .await
         .expect("first create");
 
@@ -206,7 +205,7 @@ async fn create_if_not_exists_on_existing_table_is_a_no_op() {
     );
     let outcome = lake
         .executor
-        .execute_ddl(t, &sql_if_not_exists, CREATED_BY, NOW, deadline())
+        .execute_ddl(t, &sql_if_not_exists, CREATED_BY, deadline())
         .await
         .expect("second create is a no-op, not an error");
 
@@ -227,13 +226,13 @@ async fn plain_create_on_existing_table_is_table_exists() {
         .await;
     let sql = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
     lake.executor
-        .execute_ddl(t, &sql, CREATED_BY, NOW, deadline())
+        .execute_ddl(t, &sql, CREATED_BY, deadline())
         .await
         .expect("first create");
 
     let err = lake
         .executor
-        .execute_ddl(t, &sql, CREATED_BY, NOW, deadline())
+        .execute_ddl(t, &sql, CREATED_BY, deadline())
         .await
         .expect_err("plain CREATE over an existing table must fail");
 
@@ -252,7 +251,7 @@ async fn or_replace_commits_a_new_version_over_an_existing_table() {
         .await;
     let create = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
     lake.executor
-        .execute_ddl(t, &create, CREATED_BY, NOW, deadline())
+        .execute_ddl(t, &create, CREATED_BY, deadline())
         .await
         .expect("first create");
 
@@ -262,7 +261,7 @@ async fn or_replace_commits_a_new_version_over_an_existing_table() {
         format!("CREATE OR REPLACE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
     let outcome = lake
         .executor
-        .execute_ddl(t, &replace, CREATED_BY, NOW, deadline())
+        .execute_ddl(t, &replace, CREATED_BY, deadline())
         .await
         .expect("replace");
 
@@ -290,13 +289,13 @@ async fn drop_table_commits_a_tombstone_version() {
         .await;
     let create = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
     lake.executor
-        .execute_ddl(t, &create, CREATED_BY, NOW, deadline())
+        .execute_ddl(t, &create, CREATED_BY, deadline())
         .await
         .expect("create");
 
     let outcome = lake
         .executor
-        .execute_ddl(t, "DROP TABLE hits", CREATED_BY, NOW, deadline())
+        .execute_ddl(t, "DROP TABLE hits", CREATED_BY, deadline())
         .await
         .expect("drop");
 
@@ -316,7 +315,7 @@ async fn drop_if_exists_on_a_missing_table_is_a_no_op() {
 
     let outcome = lake
         .executor
-        .execute_ddl(t, "DROP TABLE IF EXISTS ghost", CREATED_BY, NOW, deadline())
+        .execute_ddl(t, "DROP TABLE IF EXISTS ghost", CREATED_BY, deadline())
         .await
         .expect("drop if exists on a missing table is a no-op, not an error");
 
@@ -335,7 +334,7 @@ async fn drop_without_if_exists_on_a_missing_table_is_table_not_found() {
 
     let err = lake
         .executor
-        .execute_ddl(t, "DROP TABLE ghost", CREATED_BY, NOW, deadline())
+        .execute_ddl(t, "DROP TABLE ghost", CREATED_BY, deadline())
         .await
         .expect_err("plain DROP on a missing table must fail");
 
@@ -357,7 +356,7 @@ async fn tenant_isolation_a_grant_on_one_tenant_does_not_admit_another() {
     let sql = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
     let err = lake
         .executor
-        .execute_ddl(stranger, &sql, CREATED_BY, NOW, deadline())
+        .execute_ddl(stranger, &sql, CREATED_BY, deadline())
         .await
         .expect_err("a tenant with no grant on this location must be refused");
 
@@ -425,7 +424,7 @@ async fn ravel_bucket_location_is_refused() {
 
     let sql = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
     let err = executor
-        .execute_ddl(t, &sql, CREATED_BY, NOW, deadline())
+        .execute_ddl(t, &sql, CREATED_BY, deadline())
         .await
         .expect_err("a location inside Ravel's own bucket must be refused");
 
@@ -461,7 +460,7 @@ async fn precondition_probe_failure_is_refused_before_any_manifest_write() {
     let sql = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
     let err = fixture
         .executor
-        .execute_ddl(t, &sql, CREATED_BY, NOW, deadline())
+        .execute_ddl(t, &sql, CREATED_BY, deadline())
         .await
         .expect_err("a store that refuses a matching pin must be refused");
 
@@ -489,7 +488,7 @@ async fn manifest_is_written_under_the_callers_tenant_not_any_other() {
 
     let sql = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
     lake.executor
-        .execute_ddl(caller, &sql, CREATED_BY, NOW, deadline())
+        .execute_ddl(caller, &sql, CREATED_BY, deadline())
         .await
         .expect("create");
 
@@ -528,7 +527,7 @@ async fn memory_budget_refusal_leaves_no_manifest() {
     let sql = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
     let err = fixture
         .executor
-        .execute_ddl(t, &sql, CREATED_BY, NOW, deadline())
+        .execute_ddl(t, &sql, CREATED_BY, deadline())
         .await
         .expect_err("a 1-byte process memory budget cannot decode this file's footer");
 
