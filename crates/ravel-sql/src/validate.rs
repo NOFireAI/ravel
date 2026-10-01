@@ -492,7 +492,12 @@ pub fn validate_ddl(sql: &str) -> Result<DdlIntent, DdlValidationError> {
     }
 }
 
-fn create_external_intent(create: &CreateExternalTable) -> Result<DdlIntent, DdlValidationError> {
+/// `pub(crate)` beyond this module so [`crate::redact::redact`] can classify
+/// and render the one admitted `CREATE EXTERNAL TABLE` shape with the exact
+/// same rules [`validate_ddl`] enforces, rather than a second copy of them.
+pub(crate) fn create_external_intent(
+    create: &CreateExternalTable,
+) -> Result<DdlIntent, DdlValidationError> {
     if create.temporary {
         return Err(DdlValidationError::Temporary);
     }
