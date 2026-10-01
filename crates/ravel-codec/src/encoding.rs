@@ -21,17 +21,21 @@ pub enum Enc {
     Dict = 7,
     Bitmap = 8,
     FixedWidth = 9,
-    /// Reserved for the GCD-scaled integer codec (ADR-2135 decision 3). No
-    /// encoder in this crate emits it and every decoder refuses it.
+    /// The GCD-scaled integer codec. Implemented in ravel-logseg (ADR-2135
+    /// decision 3). No encoder in this crate emits it and every decoder
+    /// refuses it.
     GcdI64 = 10,
-    /// Reserved for the column-reference codec (ADR-2135 decision 3). No
-    /// encoder in this crate emits it and every decoder refuses it.
+    /// The column-reference codec. Implemented in ravel-logseg (ADR-2135
+    /// decision 3). No encoder in this crate emits it and every decoder
+    /// refuses it.
     ColumnRef = 11,
-    /// Reserved for the paged-dictionary page (ADR-2135 decision 6). No
-    /// encoder in this crate emits it and every decoder refuses it.
+    /// The row-group dictionary page. Implemented in ravel-logseg (ADR-2135
+    /// decision 6). No encoder in this crate emits it and every decoder
+    /// refuses it.
     DictPage = 12,
-    /// Reserved for the ids page of a paged dictionary (ADR-2135 decision 6).
-    /// No encoder in this crate emits it and every decoder refuses it.
+    /// The ids page of a row-group dictionary. Implemented in ravel-logseg
+    /// (ADR-2135 decision 6). No encoder in this crate emits it and every
+    /// decoder refuses it.
     DictIds = 13,
 }
 

@@ -5276,9 +5276,12 @@ mod tests {
     /// the same fixture measured `r` = 7.26 and ran 195 probes over the same 11
     /// parts.
     /// The model treats `r` as constant along a part and ignores that a
-    /// floored step overshoots, so a few percent is the
-    /// expected agreement; a change that made probing linear in the deficit, or
-    /// per-record, would miss it by an order of magnitude. Demonstrated red by
+    /// floored step overshoots. Applied to all 11 parts it gives 16.5 * 11 =
+    /// 181.5 probes, and the 197 pinned is 8.5% above that: that is the
+    /// agreement this fixture shows. A change that made probing linear in the
+    /// deficit, or per-record, would miss it by an order of magnitude. The part
+    /// count is pinned too, since the model's figure scales with it.
+    /// Demonstrated red by
     /// the rate-model scheduler named in
     /// [`stored_target_overshoot_is_bounded_when_compressibility_collapses`]
     /// (an uncapped cumulative-rate step in place of
@@ -5343,10 +5346,11 @@ mod tests {
             .expect("compact");
 
         let (rec, parts) = read_output(store.as_ref()).await;
-        assert!(
-            parts.len() >= 4,
-            "fixture must split several times, got {}",
-            parts.len()
+        assert_eq!(
+            parts.len(),
+            11,
+            "the corpus is deterministic: 5000 records split into 10 closed parts \
+             and a trailing one"
         );
         assert_eq!(
             tracker.memory_target_flushes(),
@@ -5382,7 +5386,7 @@ mod tests {
         // ln(14118/4096) / ln(7.23/6.23) = 8.3, floor tail r = 7.2, crossing
         // probe 1, so 16.5 per part; 10 closing parts = 165, plus the trailing
         // part's partial ladder and the per-part spread around the model = 197
-        // pinned.
+        // pinned, 8.5% above the model's 181.5 for all 11 parts.
         assert_eq!(
             tracker.probes_run(),
             197,
@@ -5595,7 +5599,8 @@ mod tests {
         // the floor tail is r = 1.6, and the crossing probe makes 3.0 per part:
         // 40 closing parts = 120, plus the first part's longer ladder across the
         // compressible prefix (r = 1/pre_rate = 70 there) and the per-part spread
-        // = 124 pinned. At zstd level 3 the run closed 39 parts of 40 and ran 123;
+        // = 124 pinned, 0.8% above the model's 3.0 * 41 = 123 for the 41 parts
+        // this run writes. At zstd level 3 the run closed 39 parts of 40 and ran 123;
         // at level 9 the incompressible suffix encodes a few bytes larger, so it
         // closes one part more.
         assert_eq!(
@@ -5748,8 +5753,9 @@ mod tests {
         // (same `ratio_record` fixture), 16.5 probes per part by the geometric
         // model, 5 closing parts = 83 plus the trailing part's partial ladder and
         // the per-part spread around the model = 92 (91 at zstd level 3, over
-        // the same 6 parts). Under the rate-model scheduler that test names it
-        // ran 16 at level 3.
+        // the same 6 parts), 7.1% below the model's 16.5 * 6 = 99 for all 6
+        // parts. Under the rate-model scheduler that test names it ran 16 at
+        // level 3.
         assert_eq!(
             tracker.probes_run(),
             92,
