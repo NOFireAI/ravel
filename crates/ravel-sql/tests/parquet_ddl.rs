@@ -586,6 +586,51 @@ async fn drop_table_commits_a_tombstone_version() {
 }
 
 #[tokio::test]
+async fn create_after_drop_on_the_same_name_proceeds() {
+    // The existence check at ddl.rs (`resolve::newest` plus `is_live()`)
+    // must treat a dropped manifest as not existing: a tombstone version is
+    // still the newest manifest for the name, so a check that tested
+    // `is_some()` instead of liveness would wrongly refuse this CREATE with
+    // `TableExists`.
+    let lake = Lake::memory_store();
+    let t = tenant("acme");
+    lake.grant(&t).await;
+    lake.put_file("t/hits/0.parquet", parquet_bytes(&[1], &["a"], &[0.5]))
+        .await;
+    let create = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
+    lake.executor
+        .execute_ddl(t, &create, CREATED_BY, deadline())
+        .await
+        .expect("first create");
+
+    lake.executor
+        .execute_ddl(t, "DROP TABLE hits", CREATED_BY, deadline())
+        .await
+        .expect("drop");
+
+    lake.put_file("t/hits/1.parquet", parquet_bytes(&[2], &["b"], &[1.5]))
+        .await;
+    let outcome = lake
+        .executor
+        .execute_ddl(t, &create, CREATED_BY, deadline())
+        .await
+        .expect("create after drop must proceed, not report TableExists");
+
+    match outcome {
+        DdlOutcome::Created { table, version, .. } => {
+            assert_eq!(table, "hits");
+            assert_eq!(version, 3, "tombstone (2) then this create (3)");
+        }
+        other => panic!("expected Created, got {other:?}"),
+    }
+
+    let select = lake
+        .query(t, "SELECT id, name, score FROM hits ORDER BY id")
+        .await;
+    assert_eq!(rows(&select), vec!["1|a|0.5", "2|b|1.5"]);
+}
+
+#[tokio::test]
 async fn drop_if_exists_on_a_missing_table_is_a_no_op() {
     let lake = Lake::memory_store();
     let t = tenant("acme");
