@@ -212,6 +212,8 @@ fn harness(
             ravel_ingest::IngestByteBudgetLimit::Unlimited,
         ),
         distrib: None,
+        #[cfg(feature = "flight-sql")]
+        sql_slice_rejects: None,
         durable_auth: None,
         ingest_byte_metrics: std::sync::Arc::new(
             crate::ingest_byte_metrics::IngestByteMetrics::new(),
@@ -430,6 +432,8 @@ fn promql_harness(
             ravel_ingest::IngestByteBudgetLimit::Unlimited,
         ),
         distrib: None,
+        #[cfg(feature = "flight-sql")]
+        sql_slice_rejects: None,
         durable_auth: None,
         ingest_byte_metrics: std::sync::Arc::new(
             crate::ingest_byte_metrics::IngestByteMetrics::new(),
@@ -1230,6 +1234,8 @@ fn sql_budget_harness(
             ravel_ingest::IngestByteBudgetLimit::Unlimited,
         ),
         distrib: None,
+        #[cfg(feature = "flight-sql")]
+        sql_slice_rejects: None,
         durable_auth: None,
         ingest_byte_metrics: std::sync::Arc::new(
             crate::ingest_byte_metrics::IngestByteMetrics::new(),

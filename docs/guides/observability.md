@@ -50,9 +50,10 @@ series colliding.
 The renderer can attach only these label keys: `tenant_hash`, `signal`,
 `mode`, `op`, `error_kind`, `workload_class`, `level`, `reason`, `cache`,
 `tier`, `kind`, `outcome`, `allocator`, `stat`, `component`, `class`,
-`carrier`, `gate`, `site`, `worker`, and `shard`, twenty-one in all. `reason` is shared by two
-families, the admission-rejection counter and the scrub seal-divergence
-counter. `cache` and `tier` split the read-cache family across its two caches
+`carrier`, `gate`, `site`, `worker`, and `shard`, twenty-one in all.
+`reason` is shared by several families: the admission-rejection counter, the
+scrub counters, the alert retention-skip counter, the superseded-inputs-held
+counter, and the SQL slice capability reject counter. `cache` and `tier` split the read-cache family across its two caches
 and, when a disk tier is configured, its two tiers; the [caching
 guide](caching.md) documents both. `kind` splits the maintenance
 merge-memory gauge into its transient and total high-water marks. `class`
@@ -2329,7 +2330,7 @@ a local-only process omits the family entirely.
 | Metric | Meaning |
 |---|---|
 | `ravel_distrib_fragment_requests_total` | Inbound fragment (`SeriesFetch`) requests served after passing token auth and fragment admission. Worker side. |
-| `ravel_distrib_fragment_auth_failures_total` | Inbound fragment requests refused at capability auth: missing, bad MAC, expired, tenant mismatch, or query mismatch. |
+| `ravel_distrib_fragment_auth_failures_total` | Inbound `Resolve`-scope (cross-cluster federation) fragment requests whose presented credential did not resolve to a tenant. Worker side. It does not count `Pinned` capability rejections (missing, bad MAC, expired, tenant mismatch, query mismatch): those are counted per reason in-process only and are not rendered here. |
 | `ravel_distrib_fragment_inflight{class}` | Gauge. Fragment requests currently holding a fragment-admission permit, by admission class: `class="pinned"` for intra-cluster requests (admits against `--max-inflight-fragments`), `class="resolve"` for cross-cluster federation requests (admits against `--max-inflight-federated-resolves`). The two classes never share a permit pool, so a peer cluster saturating `resolve` cannot starve this cluster's own `pinned` slices. |
 | `ravel_distrib_fragment_admission_waits_total{class}` | Counter. Inbound fragment requests, by admission class, that found their class's semaphore saturated at acquire time and had to queue. |
 | `ravel_distrib_fragment_record_get_requests_total` | Counter. Object-store GETs this worker's pinned resolves issued to read each pinned segment's own durable record: one per pinned L0 segment, one per pinned L1 segment, and two for an L1 segment that only an erasure rewrite record describes. Worker side. These GETs are charged to no query's accounting and the slice summary cannot carry them, so this counter is the only report of the resolve phase's request cost: expect it to track `ravel_distrib_fragment_requests_total` times the mean pinned segments per slice, and read a rise against that ratio as rewrite-record fallbacks. |
@@ -2355,6 +2356,24 @@ results (the coordinator can read any slice itself), but latency will climb.
 A worker-reported `CORRUPT` status is never re-dispatched or masked by
 fallback: it fails the query typed so the corruption is not silently papered
 over.
+
+### SQL slice capability rejects (`ravel_sql_slice_rejects_total`)
+
+Labels: `mode` and `reason`. The family renders on every process that built
+the Flight SQL service, with or without `--distributed-query`, and every
+reason renders from zero. A process that serves no Flight SQL (a `gateway` or
+`maintain` mode process, or a build without the `flight-sql` feature) omits
+the family entirely.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_sql_slice_rejects_total{reason}` | Inbound SQL slice `DoGet` requests refused at slice capability verification. Worker side. `reason="missing"`: no slice ticket, or a handle too short or malformed to be one. `reason="bad_mac"`: the ticket verifies under neither this node's slice keys nor its client keys. `reason="expired"`: the ticket's deadline has passed. `reason="wrong_surface"`: a client ticket presented as a slice, a slice-key ticket that is not a servable slice, or a slice ticket on the public listener once `--fragment-listener` is set. |
+
+Only the dedicated fragment listener counts `missing` and `bad_mac`. The public
+listener recognises a slice ticket only when its MAC verifies under this
+node's slice keys, so a forged ticket, or one minted under a key this node
+does not hold, is not recognised as a slice ticket and is not counted: it
+takes the client path and is refused there.
 
 ### CPU gates, the tokio runtime and the heartbeat (`ravel_cpu_gate_*`, `ravel_runtime_*`, `ravel_health_heartbeat_age_seconds`)
 

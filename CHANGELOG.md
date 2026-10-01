@@ -1019,6 +1019,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reached, so "could not verify" never exits `0`. A usage error also exits
   `2`, and so does a report that could not be written to stdout. A reader
   that closes the pipe early does not change the exit code. It is read-only.
+- **`/metrics` exports the Flight SQL slice capability rejects** (ADR-1689
+  decision 2, issue #1689).
+  `ravel_sql_slice_rejects_total{reason="missing"|"bad_mac"|"expired"|"wrong_surface"}`
+  counts inbound SQL slice `DoGet` requests refused at slice capability
+  verification, by `mode` and `reason`, every reason rendered from zero, on
+  every process that serves Flight SQL. A forged ticket, or one minted under a
+  key the node does not hold, is not recognised as a slice ticket on the public
+  listener and is not counted.
 - **`/metrics` exports the superseded-input sweep's hold counters** (issue
   #2221). `ravel_maintain_superseded_inputs_held_total{reason="named"|"unreadable_head"}`
   counts superseded objects the sweep held because HEAD still names them or
