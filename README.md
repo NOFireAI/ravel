@@ -192,8 +192,13 @@ Also live:
   See the [query guide](docs/guides/query.md). A tenant's config record can
   also carry a clustering key and a bloom scope, which
   `ravel-cli clustering-key set`/`clear` and `ravel-cli bloom-scope set`
-  write and the matching `show` commands print. Every RLOG object a tenant's
-  log flushes write after a set carries the key and the scope (see the
+  write and the matching `show` commands print. The RLOG objects a tenant's
+  log flushes write after a set carry the key and the scope, except for up to
+  a server's 60 s tenant config staleness horizon, a layout the flush cannot
+  resolve (written unkeyed and counted on
+  `ingest_clustering_key_unresolved_total`), and a failed config read (the
+  last layout read, or the default, is served); compaction carries them
+  through a rewrite (see the
   [ingest guide](docs/guides/ingest.md#setting-a-tenants-clustering-key-and-bloom-scope)).
 
 The PromQL conformance table in the

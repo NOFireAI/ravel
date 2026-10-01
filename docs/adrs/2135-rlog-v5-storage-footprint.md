@@ -136,17 +136,22 @@ What the codebase already guarantees, which bounds the change:
    tenant's key, including clearing it, increments a clustering generation
    stored with it. Clearing a key keeps the field present with the
    incremented generation and an empty column list, so generation 0 means
-   only "never set", and a clear outranks every earlier key in compaction
-   exactly as a new key would. A bloom scope change increments the same
-   generation (see the scope generation amendment below). Audit and alert
-   RLOG writers never take a key.
+   only "never set" (superseded by the scope generation amendment below:
+   neither a key nor a bloom scope ever set), and a clear outranks every
+   earlier key in compaction exactly as a new key would. A bloom scope
+   change increments the same generation, and so does a change to the
+   declared typed column names under the `undeclared` scope (see the scope
+   generation amendment below). Audit and alert RLOG writers never take a
+   key.
 
 2. **Every v5 object records its sort order, and compaction merges on it.**
    The v5 footer records the object's sort descriptor (bucket width and key
    columns, or none) and the clustering generation it was written under (0
    for a tenant that never set a key or a bloom scope). A generation names
-   exactly one key and one bloom scope (the scope generation amendment
-   below), so two objects with the same generation carry the same descriptor.
+   exactly one key, one bloom scope value and, under `undeclared`, one
+   declared column set (the scope generation amendment below), so two
+   objects with the same generation carry the same descriptor and apply the
+   same bloom scope rule.
    - **Output descriptor.** Compaction and erasure rewrite take the
      descriptor of the input with the highest clustering generation. A key
      change therefore reaches compacted data as new data arrives, compaction
@@ -478,11 +483,13 @@ and 5 and the Consequences now carry the corrected text in place:
 ## Amendment (2026-10-01): a bloom scope change takes a clustering generation (issue #2146)
 
 <!-- amendment-applies: sections="Decision" pointer="scope generation amendment" -->
+<!-- amendment-supersedes: phrase="generation 0 means only" pointer="scope generation amendment" -->
 
 Decision 1 incremented the clustering generation only on a key change, so
 two objects written under one generation could carry different bloom
 coverage. A bloom scope change now takes a generation of its own, and a
-generation names one key and one bloom scope.
+generation names one key, one bloom scope value and, under `undeclared`, one
+declared column set.
 
 - `TenantConfig::set_bloom_scope` increments the clustering generation when
   the scope changes and leaves the key's columns and bucket width as they
@@ -497,3 +504,17 @@ generation names one key and one bloom scope.
   the record cannot reset a narrowed scope to `all` this way.
 - `TenantConfig::clear_clustering_key` refuses a key that is already absent,
   cleared or never set, instead of taking another generation for no change.
+- Under `undeclared` the writer leaves the record's declared typed column
+  names out of bloom coverage, so a change to that name set moves the
+  coverage as a scope change does. `set_tenant_config` takes the stored
+  generation plus one itself for a write at the stored generation whose
+  declared name set differs from the stored record's, keeping the key, or
+  writing field 13 in its cleared form when there is none. A retype or a
+  reorder of the same names keeps the generation, as does any declared
+  column change under `all` or `text`. The generation is taken after the
+  write gate, so a declared column change that drops or retypes a key column
+  is still refused.
+- The `ravel-cli` storage layout commands read the record, apply one setter
+  and write back with `TenantConfig::write_if_unchanged` against the version
+  they read, so a record another writer changed in between refuses the
+  command with `CasConflict` instead of being overwritten.
