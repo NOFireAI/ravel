@@ -60,7 +60,7 @@ use crate::flight::stream::{DoGetStream, audited_stream, fragment_stream, statem
 use crate::flight::{ClockRef, FlightAuth, FlightClock, FlightSqlConfig, metadata};
 use crate::flight_ticket::{FlightTicket, SegmentPin, SqlTicketKeys, TicketKey, TicketSurface};
 use crate::parquet::ParquetResolution;
-use crate::validate::validate;
+use crate::validate::validate_query;
 
 /// The message every prepared-statement method returns. Prepared statements
 /// are out of the v1 Flight SQL scope;
@@ -416,7 +416,7 @@ impl FlightSqlService for RavelFlightSqlService {
         let min_tokens = self.auth.min_commit_tokens(request.metadata())?;
 
         // Step 1: the security gate, before any catalog or plan work.
-        validate(&query.query).map_err(|err| status_from_sql(&err.into(), tenant))?;
+        validate_query(&query.query).map_err(|err| status_from_sql(&err.into(), tenant))?;
 
         // Fleet-global concurrency admission (ADR-0061 decision 2): decide before
         // the resolve below (and so before any GET). This permit covers only this
