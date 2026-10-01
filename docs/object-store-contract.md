@@ -1700,7 +1700,13 @@ true, and otherwise an explicit range over the last `min(FOOTER_PREFETCH,
 size)` bytes of the size the listing (or a single-object HEAD) reported,
 self-correcting with one retry at the size its own response reports if
 that listed size was stale, and refusing `FileChanged` if the two reads
-still disagree.
+still disagree. A listed size of 0, or one that overshoots the object's
+real end past what a valid range can express, issues no explicit range at
+all on a store without `suffix_range`: one HEAD recovers the real size
+instead, refusing `FileChanged` if its ETag disagrees with the listing's
+pin and `EmptyFile` if it reports a real size of 0, otherwise re-reading
+once at the size it reports. A request count for such a store can
+therefore include one HEAD in addition to its footer GETs.
 
 Two probes qualify a grant before anything reads through it, both in
 `external::probe`, both fail-closed, and both run at grant creation rather
