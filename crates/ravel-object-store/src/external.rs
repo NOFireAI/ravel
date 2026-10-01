@@ -831,6 +831,8 @@ impl ObjectStoreBackend for ExternalStore {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     /// A distinctive string planted in every place a profile could leak one:
@@ -1298,14 +1300,25 @@ mod tests {
     /// A loopback endpoint answering every request with a 404 carrying `body`,
     /// and the method of every request it saw.
     async fn fake_404(body: &'static str) -> (String, Arc<parking_lot::Mutex<Vec<String>>>) {
+        fake_status(axum::http::StatusCode::NOT_FOUND, body, Duration::ZERO).await
+    }
+
+    /// A loopback endpoint answering every request with `status` and `body`
+    /// after `delay`, and the method of every request it saw.
+    async fn fake_status(
+        status: axum::http::StatusCode,
+        body: &'static str,
+        delay: Duration,
+    ) -> (String, Arc<parking_lot::Mutex<Vec<String>>>) {
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let recorded = Arc::clone(&seen);
         let app = axum::Router::new().fallback(move |method: axum::http::Method| {
             let recorded = Arc::clone(&recorded);
             async move {
                 recorded.lock().push(method.to_string());
+                tokio::time::sleep(delay).await;
                 (
-                    axum::http::StatusCode::NOT_FOUND,
+                    status,
                     [(axum::http::header::CONTENT_TYPE, "application/xml")],
                     body,
                 )
@@ -1446,5 +1459,102 @@ mod tests {
             assert_not_found(store.head("k").await, kind);
             assert_not_found(store.pin_of("k").await, kind);
         }
+    }
+
+    /// A GCS store against `endpoint` that retries once after 1 ms and times a
+    /// request out after `timeout`, so a throttle or a stall surfaces in
+    /// milliseconds instead of after `object_store`'s default retry budget.
+    fn gcs_fast_at(endpoint: String, timeout: Duration) -> ExternalStore {
+        let retry = object_store::RetryConfig {
+            backoff: object_store::BackoffConfig {
+                init_backoff: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(1),
+                base: 2.0,
+            },
+            max_retries: 1,
+            retry_timeout: Duration::from_secs(30),
+        };
+        let store = GoogleCloudStorageBuilder::new()
+            .with_bucket_name("exports")
+            .with_base_url(&endpoint)
+            .with_client_options(
+                object_store::ClientOptions::new()
+                    .with_allow_http(true)
+                    .with_timeout(timeout),
+            )
+            .with_retry(retry)
+            .with_skip_signature(true)
+            .build()
+            .expect("a GCS store against the fake endpoint builds");
+        generic(store, true)
+    }
+
+    /// Through the real `object_store` client, a 400 on a get and a 404 on a
+    /// list whose request URL carries 503 and 429 are not throttles: a throttle
+    /// is read from the status's reason phrase, not from digits in the key or
+    /// the query.
+    #[tokio::test]
+    async fn digits_in_the_request_url_are_not_a_throttle() {
+        let (endpoint, _) =
+            fake_status(axum::http::StatusCode::BAD_REQUEST, "", Duration::ZERO).await;
+        let store = gcs_fast_at(endpoint, Duration::from_secs(30));
+        match store.get("k503/k429", GetRange::Full).await {
+            Err(StoreError::Transient(message)) => {
+                assert!(
+                    message.contains("/exports/k503%2Fk429 in ")
+                        && message.contains("Server returned non-2xx status code: 400 Bad Request"),
+                    "the text must carry both the digits and the real status: {message:?}"
+                );
+            }
+            other => panic!("a 400 must read Transient, got {other:?}"),
+        }
+
+        let (endpoint, _) = fake_404(GCS_NO_OBJECT).await;
+        let store = gcs_fast_at(endpoint, Duration::from_secs(30));
+        match store.list("p503/p429/", None).await {
+            Err(StoreError::Transient(message)) => {
+                assert!(
+                    message.contains("p503%2Fp429%2F")
+                        && message.contains("Server returned non-2xx status code: 404 Not Found"),
+                    "the text must carry both the digits and the real status: {message:?}"
+                );
+            }
+            other => panic!("a list 404 must read Transient, got {other:?}"),
+        }
+    }
+
+    /// Through the real `object_store` client, an exhausted 429 or 503 reads
+    /// Throttled even with the other code in its URL and the exhausted-retry
+    /// suffix, whose `retry_timeout` carries "timeout", in the text; and a
+    /// request that times out reads Timeout even with both codes in its URL.
+    #[tokio::test]
+    async fn a_real_throttle_and_a_real_timeout_keep_their_class() {
+        for (status, key) in [
+            (axum::http::StatusCode::TOO_MANY_REQUESTS, "k503"),
+            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "k429"),
+        ] {
+            let (endpoint, seen) = fake_status(status, "", Duration::ZERO).await;
+            let store = gcs_fast_at(endpoint, Duration::from_secs(30));
+            let result = store.get(key, GetRange::Full).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(StoreError::Throttled {
+                        retry_after_ms: 1000
+                    })
+                ),
+                "{status}: got {result:?}"
+            );
+            assert_eq!(seen.lock().len(), 2, "{status}: one attempt and one retry");
+        }
+
+        let (endpoint, _) =
+            fake_status(axum::http::StatusCode::OK, "", Duration::from_secs(30)).await;
+        let store = gcs_fast_at(endpoint, Duration::from_millis(100));
+        let result = store.get("k503/k429", GetRange::Full).await;
+        assert!(
+            matches!(result, Err(StoreError::Timeout)),
+            "a stalled request must read Timeout, got {result:?}"
+        );
     }
 }

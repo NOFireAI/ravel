@@ -444,6 +444,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A store error reads as throttled only for a 429 or 503 status** (issue
+  #2307). With no typed transport error in the chain, the S3 and external
+  stores classified an error as `Throttled` whenever its text held the digits
+  429 or 503 anywhere, including in the request URL's port, key or query, the
+  elapsed time, or a request id, so a 400, a list 404, a 500 or a timeout could
+  read `Throttled` depending on incidental digits. The bare digit match is
+  gone: a real 429 or 503 is still caught by the reason phrase that always
+  follows its status ("Too Many Requests", "Service Unavailable"), the other
+  throttle words and the timeout handling are unchanged, and every outcome
+  stays retryable. The missing-bucket error now reads "bucket does not exist
+  (NoSuchBucket)" instead of naming S3, since the GCS path reports it too.
 - **A delete against a missing S3 bucket fails instead of reporting success**
   (issue #2265). The S3 adapter read every whole-request 404 as a missing key,
   so a `DeleteObjects` answered `NoSuchBucket` returned the idempotent

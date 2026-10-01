@@ -32,8 +32,9 @@
 //!   inside `pub(crate) mod client::retry`, so not nameable, and not
 //!   downcastable, from this crate). That type is where the HTTP status code
 //!   (429, 503, ...) lives, so 429/503/throttle classification has no typed
-//!   floor at this layer and stays a `Display`-text heuristic (`"429"`,
-//!   `"503"`, `"too many requests"`, `"throttl"`, ...). Timeouts and
+//!   floor at this layer and stays a `Display`-text heuristic (the reason
+//!   phrases `"too many requests"` and `"service unavailable"` that always
+//!   follow a 429 or 503 status, `"throttl"`, ...). Timeouts and
 //!   connection failures are different: the `RetryError`'s own `source()`
 //!   chain contains a publicly nameable [`object_store::client::HttpError`]
 //!   whose [`object_store::client::HttpErrorKind`] is a typed
@@ -1489,9 +1490,7 @@ fn is_no_such_bucket(source: &(dyn std::error::Error + Send + Sync + 'static)) -
 
 /// The body is left out: an S3 error body can echo the request it refuses.
 fn no_such_bucket(context: &str) -> StoreError {
-    StoreError::Permanent(format!(
-        "{context}: S3 bucket does not exist (NoSuchBucket)"
-    ))
+    StoreError::Permanent(format!("{context}: bucket does not exist (NoSuchBucket)"))
 }
 
 /// `put`-specific mapping: conditional-write failures surface mode-aware
@@ -1645,7 +1644,11 @@ fn typed_http_kind(
 ///    chain (notably the 429/503 throttle case, whose status is trapped in
 ///    `object_store`'s crate-private `RetryError`), match the lowercased
 ///    message for well-known signals: timeout words to [`StoreError::Timeout`],
-///    429/503/throttle words to [`StoreError::Throttled`].
+///    throttle words, including the reason phrases `object_store` always
+///    prints after a 429 or 503 status ("too many requests", "service
+///    unavailable"), to [`StoreError::Throttled`]. A bare "429" or "503"
+///    digit run is not a signal: a port, a key, an elapsed time or a request
+///    id can carry one.
 ///
 /// Anything unmatched is [`StoreError::Transient`], never `Permanent`:
 /// `object_store` already retried its own retryable classes (5xx, connection
@@ -1686,12 +1689,10 @@ fn classify_generic(
     // throttle (429/503/SlowDown) as Timeout. Genuine timeouts are matched by
     // "timed out"/"deadline", which that wrapper text does not carry, so the
     // real timeout case is preserved while the throttle case wins.
-    if lower.contains("429")
-        || lower.contains("too many requests")
+    if lower.contains("too many requests")
         || lower.contains("slow down")
         || lower.contains("slowdown")
         || lower.contains("throttl")
-        || lower.contains("503")
         || lower.contains("service unavailable")
     {
         return StoreError::Throttled {
@@ -3697,6 +3698,82 @@ mod tests {
             "a genuine timeout without throttle language must stay Timeout, \
              got {mapped:?}"
         );
+    }
+
+    /// A 429 or 503 elsewhere in `object_store`'s `RetryError` text (a port, a
+    /// key, a query, the elapsed time, a request id in the body) is not a
+    /// throttle: only the status's reason phrase is. Each text is the exact shape
+    /// `RetryError` renders: `"Error performing {method} {uri} in {elapsed:?}"`,
+    /// the exhausted-retry suffix when there were retries, then
+    /// `" - Server returned non-2xx status code: {status}: {body}"`.
+    #[test]
+    fn digits_outside_the_status_segment_are_not_a_throttle() {
+        let transient = [
+            "Error performing GET http://127.0.0.1:50321/b/k in 1.503ms - Server \
+             returned non-2xx status code: 400 Bad Request: \
+             <Error><Code>InvalidArgument</Code><RequestId>4291503</RequestId></Error>",
+            "Error performing GET http://127.0.0.1:42900/b/k503 in 2.1ms - Server \
+             returned non-2xx status code: 400 Bad Request: ",
+            "Error performing GET http://127.0.0.1:9000/b?list-type=2&prefix=p%2F429%2F \
+             in 3.429ms - Server returned non-2xx status code: 404 Not Found: ",
+        ];
+        for text in transient {
+            let mapped = map_error_common(generic(TextError(text)));
+            assert!(
+                matches!(mapped, StoreError::Transient(_)),
+                "a non-throttle status must not read Throttled from incidental \
+                 digits, got {mapped:?} for {text:?}"
+            );
+        }
+
+        // The exhausted-retry suffix's `retry_timeout` matches the timeout
+        // heuristic, so this reads Timeout; what it must not read is Throttled.
+        let exhausted = "Error performing GET http://127.0.0.1:5030/b/k in 180.0503s, \
+                         after 10 retries, max_retries: 10, retry_timeout: 180s  - Server \
+                         returned non-2xx status code: 500 Internal Server Error: \
+                         request id 503429";
+        let mapped = map_error_common(generic(TextError(exhausted)));
+        assert!(
+            !matches!(mapped, StoreError::Throttled { .. }) && mapped.is_retryable(),
+            "an exhausted 500 must not read Throttled from incidental digits, \
+             got {mapped:?}"
+        );
+
+        // No typed HttpError in the chain, so this is the text heuristic's
+        // timeout, and the 503/429 digits in the port and elapsed time must not
+        // turn it into a throttle.
+        let timeout = "Error performing GET http://127.0.0.1:50329/b/k429 in 30.000503s \
+                       - HTTP error: error sending request: operation timed out";
+        let mapped = map_error_common(generic(TextError(timeout)));
+        assert!(
+            matches!(mapped, StoreError::Timeout),
+            "a timeout whose URL and elapsed time carry 503/429 must stay Timeout, \
+             got {mapped:?}"
+        );
+    }
+
+    /// A real 429 or 503 status reads Throttled whatever other digits the text
+    /// carries, with and without the exhausted-retry suffix.
+    #[test]
+    fn a_429_or_503_status_reads_throttled() {
+        for text in [
+            "Error performing GET http://127.0.0.1:5030/b/k in 1.4ms - Server \
+             returned non-2xx status code: 429 Too Many Requests: ",
+            "Error performing GET http://127.0.0.1:4290/b/k in 1.4s, after 10 retries, \
+             max_retries: 10, retry_timeout: 180s  - Server returned non-2xx status \
+             code: 503 Service Unavailable: <Error><Code>ServiceUnavailable</Code></Error>",
+        ] {
+            let mapped = map_error_common(generic(TextError(text)));
+            assert!(
+                matches!(
+                    mapped,
+                    StoreError::Throttled {
+                        retry_after_ms: 1000
+                    }
+                ),
+                "got {mapped:?} for {text:?}"
+            );
+        }
     }
 
     /// The typed variants object_store already surfaces are mapped by variant,

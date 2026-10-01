@@ -1,8 +1,8 @@
 //! HTTP-layer fault injection for [`S3Store`].
 //!
 //! `src/s3.rs`'s own unit tests pin error *classification* against synthetic
-//! `object_store::Error` values: they prove `classify_generic` turns a "503"
-//! text into `Throttled`, but nothing there proves `S3Store` ever issues a
+//! `object_store::Error` values: they prove `classify_generic` turns a "503
+//! Service Unavailable" text into `Throttled`, but nothing there proves `S3Store` ever issues a
 //! second HTTP request after a 503, that the pause between attempts grows, or
 //! that a multipart upload whose part fails leaves no object at the key. Those
 //! are properties of the whole stack (adapter + `object_store` client +
@@ -2008,8 +2008,9 @@ async fn no_such_bucket_is_permanent_on_put_list_and_multipart() {
 ///
 /// **Retry classification per docs/object-store-contract.md.** The contract
 /// classifies a throttle as `Throttled { retry_after_ms }`, and `s3.rs`'s
-/// tier-2 heuristic has a branch for exactly that ("429"/"503"/"slow
-/// down"/"throttl"). Over real HTTP the error text `classify_generic` sees is
+/// tier-2 heuristic has a branch for exactly that ("too many requests",
+/// "service unavailable", "slow down", "throttl"). Over real HTTP the error
+/// text `classify_generic` sees is
 /// `object_store`'s `RetryError` `Display`, which writes `", after {retries}
 /// retries, max_retries: {n}, retry_timeout: {d} "` whenever `retries != 0`.
 /// That literal `retry_timeout` substring once shadowed the throttle branch
