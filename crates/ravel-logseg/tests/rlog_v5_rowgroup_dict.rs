@@ -17,7 +17,7 @@ use proptest::prelude::*;
 use ravel_logseg::block::{PageCounters, read_block_pages_with_dicts};
 use ravel_logseg::encoding::Enc;
 use ravel_logseg::field_dir::FieldDir;
-use ravel_logseg::footer::{kind, open};
+use ravel_logseg::footer::{self, kind, open, write_footer_and_trailer_versioned};
 use ravel_logseg::page::{
     COMP_NONE, COMP_ZSTD, COMPRESSION_FLOOR, PageDesc, SealedPage, seal_page, smallest_stored,
 };
@@ -122,6 +122,10 @@ fn blocks_offset(object: &[u8]) -> u64 {
 }
 
 fn dyn_column(object: &[u8], name: &str) -> u32 {
+    typed_column(object, name, FieldType::Str)
+}
+
+fn typed_column(object: &[u8], name: &str, ty: FieldType) -> u32 {
     let cfg = RlogConfig::default();
     let ftr = open(object).expect("open");
     let raw = read_section(
@@ -132,7 +136,7 @@ fn dyn_column(object: &[u8], name: &str) -> u32 {
     .expect("read FIELD_DIR");
     FieldDir::decode(&raw, u64::MAX)
         .expect("decode FIELD_DIR")
-        .column(name, FieldType::Str)
+        .column(name, ty)
         .expect("column")
         .column_id
 }
@@ -806,6 +810,130 @@ fn one_chunk(block_count: u32, pages: Vec<PageEntry>) -> PageDir {
 
 fn decodes(dir: &PageDir) -> Result<PageDir, LogSegError> {
     PageDir::decode(&dir.encode())
+}
+
+/// `object` with its PAGE_DIR section replaced by `dir`, stored raw, and every
+/// section offset, length and crc recomputed, so the directory is the object's
+/// only change.
+fn with_page_dir(object: &[u8], dir: &PageDir) -> Vec<u8> {
+    let mut ftr = open(object).expect("open footer");
+    let mut out = Vec::new();
+    for d in &mut ftr.sections {
+        let stored = if d.kind == kind::PAGE_DIR {
+            let raw = dir.encode();
+            d.comp = COMP_NONE;
+            d.uncomp_len = raw.len() as u64;
+            raw
+        } else {
+            object[d.offset as usize..(d.offset + d.len) as usize].to_vec()
+        };
+        d.offset = out.len() as u64;
+        d.len = stored.len() as u64;
+        d.crc32c = crc32c::crc32c(&stored);
+        out.extend_from_slice(&stored);
+    }
+    write_footer_and_trailer_versioned(&mut out, &ftr, footer::VERSION);
+    out
+}
+
+/// A dictionary on a column that is not a string column is refused when either
+/// reader opens the object, before any page is read. Twelve rows over three
+/// blocks carry `svc` (a string column on a real dictionary) and `n` (an `I64`
+/// column); the `ts` chunk and then the `n` chunk are retagged in PAGE_DIR as a
+/// tag 12 page taken from the first page's first byte followed by tag 13 pages,
+/// which leaves every extent where it was. The unmodified directory re-encoded
+/// the same way opens on both readers.
+///
+/// Wrong implementations this rules out, each shown failing: no column check
+/// when the readers decode PAGE_DIR (the scan reader opens the retagged `ts`
+/// chunk); a range reader decoding PAGE_DIR without the shared validation (it
+/// opens the `ts` chunk); a check that treats a column FIELD_DIR does not name
+/// as a string column (the scan reader opens the `ts` chunk).
+#[test]
+fn readers_refuse_a_dictionary_on_a_non_string_column() {
+    let values: Vec<String> = (0..3).map(|i| word(i, 24)).collect();
+    let records: Vec<LogRecord> = (0..12)
+        .map(|i| {
+            let mut r = record(1_000 + i as i64, vec![("svc", values[i % 3].as_str())]);
+            r.attrs
+                .push(("n".to_string(), AttrValue::I64(i as i64 * 7)));
+            r
+        })
+        .collect();
+    let object = write_rows(&blocks_cfg(4), &records);
+    let dir = page_dir(&object);
+    assert_eq!(dir.block_count(), 3);
+    let svc = dyn_column(&object, "svc");
+    assert_eq!(
+        chunk(&dir, 0, svc).dict_page().map(|p| p.enc),
+        Some(Enc::DictPage)
+    );
+    let n = typed_column(&object, "n", FieldType::I64);
+    let opens = |object: &[u8]| {
+        let scan = RlogReader::new(object, &RlogConfig::default()).map(|_| ());
+        let ftr = open(object).expect("open footer");
+        let section = |k: u32| {
+            read_section(
+                object,
+                ftr.section(k).expect("section"),
+                &RlogConfig::default(),
+            )
+            .expect("section")
+        };
+        let ranged = RlogRangeReader::from_sections_with_page_dir(
+            &ftr,
+            &section(kind::STREAM_DIR),
+            &section(kind::FIELD_DIR),
+            &section(kind::SKIP_IDX),
+            Some(&section(kind::PAGE_DIR)),
+        )
+        .map(|_| ());
+        (scan, ranged)
+    };
+
+    let (scan, ranged) = opens(&with_page_dir(&object, &dir));
+    scan.expect("scan reader opens");
+    ranged.expect("range reader opens");
+
+    for column_id in [COL_TS, n] {
+        let mut bad = dir.clone();
+        let c = bad.groups[0]
+            .chunks
+            .iter_mut()
+            .find(|c| c.column_id == column_id)
+            .expect("chunk");
+        let extent = c.extent();
+        let mut pages = vec![PageEntry {
+            block: 3,
+            enc: Enc::DictPage,
+            comp: COMP_NONE,
+            len: 1,
+            uncomp_len: 1,
+            crc32c: 0,
+        }];
+        for p in &c.pages {
+            let mut p = *p;
+            if p.enc != Enc::Bitmap {
+                p.enc = Enc::DictIds;
+            }
+            pages.push(p);
+        }
+        pages[1].len -= 1;
+        c.pages = pages;
+        assert_eq!(c.extent(), extent);
+        assert_eq!(decodes(&bad).expect("decodes"), bad);
+
+        let (scan, ranged) = opens(&with_page_dir(&object, &bad));
+        let want = format!(
+            "page_dir column {column_id} carries a dictionary page but is not a string column"
+        );
+        for (path, got) in [("scan", scan), ("ranged", ranged)] {
+            match got {
+                Err(LogSegError::Corrupted(m)) => assert_eq!(m, want, "{path}"),
+                other => panic!("{path} reader, column {column_id}: {other:?}"),
+            }
+        }
+    }
 }
 
 /// A tag 12 page may name the block one past the group's last, precede block
