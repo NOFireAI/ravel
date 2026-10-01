@@ -1067,6 +1067,14 @@ pub fn desired_query_deployment(
     ];
     args.extend(common_store_args(spec));
     args.extend(tenant_token_args(spec, ctx));
+    // The query tier runs no scheduled fold, so its request-budget refusals
+    // classify fold lag against the maintain tier's interval, passed here
+    // (ADR-1306 decision 6). It is not `--fold-interval-secs`, which
+    // `ravel-server` refuses in `--mode query` (ADR-1693).
+    if let Some(secs) = spec.maintain.fold.as_ref().and_then(|f| f.interval_secs) {
+        args.push("--fold-lag-interval-secs".to_string());
+        args.push(secs.to_string());
+    }
 
     let tier_override = spec.query.credentials_secret_ref.as_ref();
     let mut env = s3_credential_env(spec, tier_override);
@@ -4712,6 +4720,55 @@ mod tests {
         let args = args_of(&m);
         assert!(!args.iter().any(|a| a == "--disable-fold"));
         assert!(arg_value(&args, "--fold-interval-secs").is_none());
+    }
+
+    #[test]
+    fn the_query_tier_carries_the_maintain_fold_interval_for_fold_lag() {
+        // ADR-1306 decision 6: the query tier classifies fold lag against the
+        // interval the maintain tier folds on, and only the maintain tier
+        // carries the flag that sets it.
+        let mut spec = base_spec();
+        spec.maintain.fold = Some(FoldSpec {
+            disabled: false,
+            interval_secs: Some(900),
+        });
+        let q = args_of(&desired_query_deployment(&spec, "prod", &ctx()));
+        assert_eq!(
+            arg_value(&q, "--fold-lag-interval-secs").as_deref(),
+            Some("900")
+        );
+        assert_eq!(
+            q.iter()
+                .filter(|a| *a == "--fold-lag-interval-secs")
+                .count(),
+            1
+        );
+        assert!(arg_value(&q, "--fold-interval-secs").is_none());
+
+        let m = args_of(
+            &desired_maintain_deployment(&spec, "prod", &ctx())
+                .expect("a maintain fold block renders")
+                .expect("the maintain tier is enabled"),
+        );
+        assert!(!m.iter().any(|a| a == "--fold-lag-interval-secs"));
+        assert_eq!(
+            arg_value(&m, "--fold-interval-secs").as_deref(),
+            Some("900")
+        );
+
+        let g = args_of(&desired_gateway_deployment(&spec, "prod", &ctx()));
+        assert!(!g.iter().any(|a| a == "--fold-lag-interval-secs"));
+
+        // Unset, the query tier keeps ravel-server's default classification.
+        spec.maintain.fold = Some(FoldSpec {
+            disabled: true,
+            interval_secs: None,
+        });
+        let q = args_of(&desired_query_deployment(&spec, "prod", &ctx()));
+        assert!(!q.iter().any(|a| a == "--fold-lag-interval-secs"));
+        spec.maintain.fold = None;
+        let q = args_of(&desired_query_deployment(&spec, "prod", &ctx()));
+        assert!(!q.iter().any(|a| a == "--fold-lag-interval-secs"));
     }
 
     #[test]
