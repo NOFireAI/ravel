@@ -651,6 +651,94 @@ mod tests {
         parquet_bytes(&[4, 5, 6], &["four", "five", "sixx"]).to_vec()
     }
 
+    /// A 3-row file (`a`: 1,2,3; `b`: "one","two","three") with a bloom
+    /// filter on column `b`, whose bitset bytes are zeroed: every membership
+    /// probe against it reads as absent, the shape a corrupted (not merely
+    /// absent) filter takes, since the on-disk bitset stays the length and
+    /// format its own header describes.
+    ///
+    /// The header (the filter's algorithm, hash, compression and bitset
+    /// size) is the Thrift-compact encoding of four i32 fields, each 1 to 5
+    /// bytes, so at most 20 bytes total; parquet-58.4.0's own internal test
+    /// `bloom_filter::mod::test_bloom_filter_header_size_assumption` uses
+    /// the same bound. The bitset itself is always a whole number of
+    /// 32-byte blocks (the SBBF block size), so `bloom_filter_length % 32`
+    /// recovers the header's length without decoding it: the header is
+    /// shorter than one block, and everything past it is whole blocks.
+    fn bloom_filter_with_a_zeroed_bitset() -> Vec<u8> {
+        use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use parquet::file::properties::WriterProperties;
+        use parquet::schema::types::ColumnPath;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Utf8, false),
+        ]));
+        let batch = datafusion::arrow::array::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["one", "two", "three"])),
+            ],
+        )
+        .expect("batch");
+        let properties = WriterProperties::builder()
+            .set_column_bloom_filter_enabled(ColumnPath::from("b"), true)
+            .build();
+        let mut bytes = Vec::new();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(&mut bytes, schema, Some(properties))
+            .expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+
+        let end = bytes.len() - TRAILER_LEN as usize;
+        let metadata = ParquetMetaDataReader::decode_metadata(
+            &bytes[end - footer_len_of(&bytes) as usize..end],
+        )
+        .expect("footer");
+        let column = metadata.row_group(0).column(1);
+        let offset = usize::try_from(column.bloom_filter_offset().expect("b has a bloom filter"))
+            .expect("offset");
+        let length = usize::try_from(column.bloom_filter_length().expect("b has a bloom filter"))
+            .expect("length");
+        let header_len = length % 32;
+        assert!(
+            (1..=20).contains(&header_len),
+            "a plausible bloom filter header length, got {header_len}"
+        );
+        for byte in &mut bytes[offset + header_len..offset + length] {
+            *byte = 0;
+        }
+        bytes
+    }
+
+    /// A corrupt bloom filter bitset must not drop a row the scan should
+    /// return: zeroing the bits for `b`'s bloom filter makes every probe
+    /// against it read "not present", which a reader that trusted the
+    /// filter would use to skip the row group holding `b = 'two'` before
+    /// ever reading `b`'s page.
+    ///
+    /// This rules out setting `bloom_filter_on_read` on a
+    /// `TableParquetOptions` copy that never reaches the real
+    /// `ParquetSource`: that mistake would leave the real source's default
+    /// (`true`) in effect, and this scan would drop the row.
+    #[tokio::test]
+    async fn a_corrupt_bloom_filter_cannot_drop_rows() {
+        let bytes = bloom_filter_with_a_zeroed_bitset();
+        let store = Arc::new(MemoryStore::new());
+        let fixture = Fixture::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>);
+        let file = fixture
+            .put_file(&store, "lake/t/bloom.parquet", Bytes::from(bytes), false)
+            .await;
+        let table = fixture.provider("t", 1, vec![file], false).await;
+        let ctx = fixture.session(&[("t", table)]);
+        let got = read_where(&ctx, "t", &["a", "b"], Some(ident("b").eq(lit("two"))))
+            .await
+            .expect("scan");
+        assert_eq!(got, "2|two");
+    }
+
     #[tokio::test]
     async fn a_read_outside_the_recorded_size_is_refused() {
         let bytes = valid();

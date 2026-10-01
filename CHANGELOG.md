@@ -1016,6 +1016,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   page, which reaches an unguarded `.expect` in the parquet crate's column
   reader. Two existing corrupt-input property tests now run 20,000 cases
   each with no new failure.
+- **A Parquet query no longer prunes with bloom filters, so a corrupt bitset
+  cannot drop a row that matches** (issue #2188). The reader already left
+  page-index pruning off; `bloom_filter_on_read` is now off beside it, and a
+  test writes a file whose bloom filter bitset is zeroed (the header is left
+  intact, so the filter still parses) and confirms a matching row survives a
+  filtered scan. See the amendment to
+  `docs/adrs/2040-parquet-tables-queried-in-place.md`.
 
 ### Added
 

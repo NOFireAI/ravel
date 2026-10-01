@@ -342,7 +342,8 @@ untouched.
   default `get_ranges` coalesces ranges within 1 MiB (the 0.13 crate
   DataFusion's reader calls, `object_store-0.13.2/src/util.rs:92`), so a
   store cannot tell a footer read from a column chunk. The reader hands
-  DataFusion no Parquet page index (see the page index amendment below).
+  DataFusion no Parquet page index (see the page index amendment below) and
+  no bloom filter probes (see the bloom filter amendment below).
 - **A decoded-metadata cache.** It is owned by Ravel, bounded in bytes, and
   keyed by tenant hash and the same content key. DataFusion's own
   `FileMetadataCache` lives in the per-query `RuntimeEnv` and dies with the
@@ -558,11 +559,12 @@ they split by what they match:
   on the scan, and task T4a of epic #2040 (issue #2053) pins it with a
   Parquet-plan test.
 
-DataFusion's row-group and bloom-filter pruning apply to Parquet plans;
-page-index pruning does not (see the page index amendment below). A query may name several Parquet tables. A Parquet table and a
-signal table in one statement is a `CrossSignalQuery` error, as two signal
-tables are today. `target_signal` gains a Parquet arm, since today a name
-it does not know routes to Metrics.
+DataFusion's row-group pruning applies to Parquet plans; page-index pruning
+and bloom-filter pruning do not (see the page index amendment and the bloom
+filter amendment below). A query may name several Parquet tables. A Parquet
+table and a signal table in one statement is a `CrossSignalQuery` error, as
+two signal tables are today. `target_signal` gains a Parquet arm, since
+today a name it does not know routes to Metrics.
 
 ### D7. Validation and the performance bar
 
@@ -944,3 +946,21 @@ unstated for `CREATE`.
     there, the first read is placed from the listing's reported size
     instead, and a stale size costs one retry. The file cap bounds all of
     these. It is admitted only with the `ddl` capability.
+
+## Amendment (2026-10-01): the reader does not use bloom filters
+
+<!-- amendment-applies: sections="D3. The reader: DataFusion's Parquet scan through Ravel's fetch path|D6. Session settings for Parquet tables follow the measurement" pointer="bloom filter amendment" -->
+<!-- amendment-supersedes: phrase="row-group and bloom-filter pruning apply" pointer="bloom filter amendment" -->
+
+D3's scan prunes row groups by footer statistics and does not read bloom
+filters. Statistics are trusted as the producer's description of its own
+file, the same trust the scan places in page values and column chunk
+offsets: a file whose statistics disagree with its pages was malformed
+when it was granted (the ETag pin rules out later change), and the reader
+cannot detect that from metadata, so no check is attempted. A validation
+of statistics against the physical type was considered and rejected: it
+catches only order-flipping corruption, and deprecated byte-array
+statistics and float NaN ordering make a wrong refusal of a valid file
+likely. Bloom filters are off because each probe is one budgeted GET per
+candidate row group per column and no measurement shows a gain (the
+ClickBench file carries none); turning them on needs a measured amendment.
