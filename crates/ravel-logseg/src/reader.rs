@@ -59,7 +59,9 @@ pub struct ScanStats {
     pub postings_degraded: bool,
     /// Block pages this scan decompressed and decoded. Grows as blocks are
     /// decoded, so a partially-drained [`BlockScan`] reports what it has read
-    /// so far, not what it will read.
+    /// so far, not what it will read. A row-group dictionary page (tag 12) is
+    /// counted for every block that reads through it, though the scan verifies
+    /// and decodes it once per chunk and shares the result.
     pub pages_decoded: u64,
     /// Block pages this scan skipped because the [`ColumnSelection`] excluded
     /// their column. Zero for an all-columns scan; the observable proof that
@@ -84,7 +86,10 @@ pub struct ScanStats {
     /// partially-drained [`BlockScan`] reports the directories plus what it has
     /// decoded so far. A raw/`COMP_NONE` section or page contributes nothing (it
     /// was never decompressed); a zstd one contributes its decompressed buffer's
-    /// actual length. Decompressed, not stored or wire, bytes.
+    /// actual length. Decompressed, not stored or wire, bytes. A dictionary
+    /// page is charged to every block that reads through it, like
+    /// `pages_decoded`: the figure is the decompressed bytes each block
+    /// consumed, which bounds the bytes actually inflated from above.
     pub decompressed_bytes: u64,
 }
 
@@ -494,6 +499,7 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
             stats,
             current: None,
             surviving: Vec::new(),
+            dicts: DictCache::default(),
         })
     }
 
@@ -566,6 +572,7 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
             stats,
             current: None,
             surviving: Vec::new(),
+            dicts: DictCache::default(),
         }
     }
 
@@ -849,6 +856,8 @@ pub struct BlockScan {
     current: Option<DecodedBlock>,
     /// Row positions of [`Self::current`] that matched `content`, ascending.
     surviving: Vec<usize>,
+    /// The current row group's decoded dictionaries, shared by its blocks.
+    dicts: DictCache,
 }
 
 impl BlockScan {
@@ -994,14 +1003,19 @@ impl BlockScan {
         // returns offsets relative to the BLOCKS section; shift them to
         // absolute object offsets, exactly what the scan-time build produced,
         // so the decode is byte-identical.
-        let (pages, dict_pages) =
-            located_block_pages(&self.page_dir, self.blocks_offset, loc.block_index)?;
+        let (pages, dict_pages) = located_block_pages(
+            &self.page_dir,
+            self.blocks_offset,
+            loc.block_index,
+            &mut self.dicts,
+        )?;
         let decoded = decode_v4_block_with(
             |p: &PageLoc| source_extent(object_bytes, p.offset, p.desc.len, "page"),
             loc.record_count,
             loc.crc32c,
             &pages,
             &dict_pages,
+            &mut self.dicts,
             &self.plans,
             self.columns.as_ref(),
         )?;
@@ -1055,7 +1069,9 @@ impl BlockScan {
 /// block's pages.
 /// `bytes` need not be the whole object: `base` is the absolute offset its
 /// first byte sits at, so a caller holding one fetched range passes that
-/// range's start and a whole-object caller passes 0.
+/// range's start and a whole-object caller passes 0. A caller decoding
+/// several blocks of one row group passes the same `dicts` to each, so each
+/// dictionary page is decoded once per chunk rather than once per block.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_v4_block(
     bytes: &[u8],
@@ -1064,6 +1080,7 @@ pub(crate) fn decode_v4_block(
     block_crc32c: u32,
     pages: &[PageLoc],
     dict_pages: &[PageLoc],
+    dicts: &mut DictCache,
     plans: &[ColumnPlan],
     columns: Option<&ColumnIdSet>,
 ) -> Result<DecodedBlock, LogSegError> {
@@ -1080,6 +1097,7 @@ pub(crate) fn decode_v4_block(
         block_crc32c,
         pages,
         dict_pages,
+        dicts,
         plans,
         columns,
     )
@@ -1087,11 +1105,15 @@ pub(crate) fn decode_v4_block(
 
 /// Block `block`'s pages and the row group dictionary pages they need, each
 /// with its offset shifted from BLOCKS-relative to absolute in the object.
+/// `dicts` is readied for the block, so the decode that follows shares the
+/// dictionaries already decoded for its row group and no other.
 pub(crate) fn located_block_pages(
     page_dir: &PageDir,
     blocks_offset: u64,
     block: u32,
+    dicts: &mut DictCache,
 ) -> Result<(Vec<PageLoc>, Vec<PageLoc>), LogSegError> {
+    dicts.enter_block(page_dir, block);
     let mut pages = page_dir
         .block_pages(block)
         .ok_or_else(|| LogSegError::Corrupted("block not in page_dir".into()))?;
@@ -1106,6 +1128,56 @@ pub(crate) fn located_block_pages(
     Ok((pages, dict_pages))
 }
 
+/// Row group dictionaries (tag-12 pages) already verified and decoded, so the
+/// blocks of one column chunk share one decode (ADR-2135 decision 6).
+///
+/// Keyed by the dictionary page's `(offset, column_id)`. That page leads its
+/// chunk, so its offset is the chunk's, and no two chunks share one. The cache
+/// holds one row group at a time: [`Self::enter_block`] empties it when a
+/// block of another group comes up, so residency stays one group's
+/// dictionaries however many groups a scan crosses. Only a successful decode
+/// is stored, so a corrupt dictionary still fails every block of its chunk.
+#[derive(Debug, Default)]
+pub(crate) struct DictCache {
+    group: Option<u32>,
+    entries: Vec<(DictKey, Vec<Vec<u8>>)>,
+}
+
+/// A dictionary page's `(offset, column_id)`.
+type DictKey = (u64, u32);
+
+impl DictCache {
+    /// Prepares the cache for whole-object block index `block`: entries of
+    /// any other row group are dropped.
+    pub(crate) fn enter_block(&mut self, page_dir: &PageDir, block: u32) {
+        let group = page_dir.locate_block(block).map(|(g, _)| g.first_block);
+        if group != self.group || group.is_none() {
+            self.entries.clear();
+            self.group = group;
+        }
+    }
+
+    fn get(&self, key: DictKey) -> Option<&[Vec<u8>]> {
+        self.entries
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, d)| d.as_slice())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Dictionary pages `decode_v4_block_with` has decoded on this thread.
+    static DICT_PAGE_DECODES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Dictionary pages decoded on this thread so far, for tests that pin one
+/// decode per chunk.
+#[cfg(test)]
+pub(crate) fn dict_page_decodes() -> u64 {
+    DICT_PAGE_DECODES.with(std::cell::Cell::get)
+}
+
 /// [`decode_v4_block`] with each kept page's stored bytes supplied by `page`,
 /// which is only called for a page the projection keeps.
 ///
@@ -1115,12 +1187,20 @@ pub(crate) fn located_block_pages(
 /// the block's pages is, on the whole-block and the subset path alike, so a
 /// corrupt dictionary fails every block of its chunk. It belongs to the
 /// chunk rather than the block, so the block crc does not cover it.
+///
+/// A dictionary already in `dicts` is reused rather than fetched through
+/// `page`, verified and decoded again. The block is charged for it exactly as
+/// if it had been (one decoded page, its stored and decompressed lengths), so
+/// [`ScanStats`] figures do not depend on which block of a chunk came first.
+/// [`located_block_pages`] readies `dicts` for the block.
+#[allow(clippy::too_many_arguments)]
 fn decode_v4_block_with<'s>(
     page: impl Fn(&PageLoc) -> Result<Cow<'s, [u8]>, LogSegError>,
     record_count: usize,
     block_crc32c: u32,
     pages: &[PageLoc],
     dict_pages: &[PageLoc],
+    dicts: &mut DictCache,
     plans: &[ColumnPlan],
     columns: Option<&ColumnIdSet>,
 ) -> Result<DecodedBlock, LogSegError> {
@@ -1131,16 +1211,29 @@ fn decode_v4_block_with<'s>(
     let mut descs: Vec<crate::page::PageDesc> = Vec::with_capacity(pages.len());
     let mut page_bytes: Vec<Option<Vec<u8>>> = Vec::with_capacity(pages.len());
     let mut counters = PageCounters::default();
-    let mut dicts: Vec<(u32, Vec<Vec<u8>>)> = Vec::with_capacity(dict_pages.len());
     for p in dict_pages {
         counters.bytes_fetched = counters.bytes_fetched.saturating_add(p.desc.len);
+        let key = (p.offset, p.desc.column_id);
         if !wanted(p.desc.column_id) {
             counters.skipped += 1;
             continue;
         }
+        if dicts.get(key).is_some() {
+            if p.desc.comp == crate::page::COMP_ZSTD {
+                counters.decompressed_bytes = counters
+                    .decompressed_bytes
+                    .saturating_add(p.desc.uncomp_len);
+            }
+            counters.decoded += 1;
+            counters.bytes_decoded = counters.bytes_decoded.saturating_add(p.desc.len);
+            continue;
+        }
         let stored = page(p)?;
         let produced = verify_and_read(&stored, p, &mut counters)?;
-        dicts.push((p.desc.column_id, decode_dict_page(&produced)?));
+        let decoded = decode_dict_page(&produced)?;
+        #[cfg(test)]
+        DICT_PAGE_DECODES.with(|n| n.set(n.get() + 1));
+        dicts.entries.push((key, decoded));
     }
     let mut block_crc = 0u32;
     let mut all_read = true;
@@ -1160,7 +1253,21 @@ fn decode_v4_block_with<'s>(
     if all_read && block_crc != block_crc32c {
         return Err(LogSegError::Corrupted("block crc mismatch".into()));
     }
-    let dicts: Vec<(u32, &[Vec<u8>])> = dicts.iter().map(|(cid, d)| (*cid, d.as_slice())).collect();
+    let dicts: Vec<(u32, &[Vec<u8>])> = dict_pages
+        .iter()
+        .filter(|p| wanted(p.desc.column_id))
+        .map(|p| {
+            dicts
+                .get((p.offset, p.desc.column_id))
+                .map(|d| (p.desc.column_id, d))
+                .ok_or_else(|| {
+                    LogSegError::Corrupted(format!(
+                        "dictionary for column {} not decoded",
+                        p.desc.column_id
+                    ))
+                })
+        })
+        .collect::<Result<_, _>>()?;
     read_block_pages_with_dicts(record_count, &descs, &page_bytes, &dicts, plans, counters)
 }
 
@@ -1841,6 +1948,130 @@ fn decode_attr_value(bytes: &[u8], pos: &mut usize, depth: u32) -> Result<AttrVa
     })
 }
 
+/// A one-stream object of two row groups of four blocks, each group's `svc`
+/// chunk a dictionary over three long values of its own, for tests that count
+/// dictionary decodes on the scan and the ranged paths.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(crate) mod dict_fixture {
+    use super::*;
+    use crate::encoding::Enc;
+    use crate::footer::open;
+    use crate::record::LogRecord;
+    use crate::writer::{ObjectIdentity, RlogWriter};
+    use ravel_types::logstream::LogStreamId;
+
+    pub(crate) const STREAM: LogStreamId = LogStreamId([5u8; 16]);
+
+    fn word(i: usize) -> String {
+        let mut x = 0x9E37_79B9u64.wrapping_mul(i as u64 + 1);
+        (0..24)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                char::from(b'a' + ((x >> 33) % 26) as u8)
+            })
+            .collect()
+    }
+
+    /// 32 records, four to a block and four blocks to a group.
+    pub(crate) fn two_group_object() -> (Vec<LogRecord>, Vec<u8>) {
+        let records: Vec<LogRecord> = (0..32usize)
+            .map(|i| LogRecord {
+                stream_id: STREAM,
+                stream_attrs: crate::record::stream_attrs_bytes(
+                    &[("service.name".into(), AttrValue::Str("svc".into()))],
+                    "scope",
+                    "1",
+                    &[],
+                ),
+                ts_ns: 1_000 + i as i64,
+                observed_ts_ns: 1_000 + i as i64,
+                severity_num: 9,
+                severity_text: "INFO".into(),
+                body: "ok".into(),
+                trace_id: None,
+                span_id: None,
+                flags: 0,
+                attrs: vec![(
+                    "svc".into(),
+                    AttrValue::Str(word(3 * (i / 16) + i % 3).repeat(8)),
+                )],
+            })
+            .collect();
+        let cfg = RlogConfig {
+            block_target_records: 4,
+            group_target_blocks: 4,
+            ..RlogConfig::default()
+        };
+        let identity = ObjectIdentity {
+            tenant_hash: [1u8; 16],
+            shard: 0,
+            writer_id: [2u8; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let mut w = RlogWriter::new(cfg, identity);
+        for r in records.clone() {
+            w.push(r).expect("push");
+        }
+        (records, w.finish().expect("finish"))
+    }
+
+    pub(crate) fn page_dir(object: &[u8]) -> PageDir {
+        let footer = open(object).expect("open");
+        let desc = footer.section(kind::PAGE_DIR).expect("PAGE_DIR");
+        let raw = read_section(object, desc, &RlogConfig::default()).expect("PAGE_DIR bytes");
+        PageDir::decode(&raw).expect("parse PAGE_DIR")
+    }
+
+    /// `(dictionary pages, block reads through one)` over the whole object:
+    /// one decode per chunk is the first figure, one per block the second.
+    pub(crate) fn dictionary_reads(object: &[u8]) -> (u64, u64) {
+        let dir = page_dir(object);
+        assert_eq!(dir.groups.len(), 2, "fixture must hold two row groups");
+        let mut pages = 0u64;
+        let mut per_block = 0u64;
+        for group in &dir.groups {
+            assert_eq!(group.block_count, 4, "fixture groups hold four blocks");
+            let mut zstd_dicts = 0;
+            for c in &group.chunks {
+                if let Some(dict) = c.dict_page() {
+                    pages += 1;
+                    per_block += u64::from(group.block_count);
+                    zstd_dicts += u32::from(dict.comp == COMP_ZSTD);
+                }
+            }
+            assert!(
+                zstd_dicts > 0,
+                "every group must carry a zstd dictionary, or the byte charge proves nothing"
+            );
+        }
+        (pages, per_block)
+    }
+
+    /// `(pages, zstd decompressed bytes)` a whole-object read charges with
+    /// every dictionary page charged once per block that reads through it.
+    pub(crate) fn per_block_charges(object: &[u8]) -> (u64, u64) {
+        let mut pages = 0u64;
+        let mut bytes = 0u64;
+        for chunk in page_dir(object).groups.iter().flat_map(|g| &g.chunks) {
+            let mut blocks: Vec<u32> = chunk.pages.iter().map(|p| p.block).collect();
+            blocks.dedup();
+            let readers = blocks.len() as u64 - u64::from(chunk.dict_page().is_some());
+            for p in &chunk.pages {
+                let times = if p.enc == Enc::DictPage { readers } else { 1 };
+                pages += times;
+                if p.comp == COMP_ZSTD {
+                    bytes += p.uncomp_len * times;
+                }
+            }
+        }
+        (pages, bytes)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -2108,6 +2339,62 @@ mod tests {
             total,
             "a re-scan of the same reader charges the same, not double"
         );
+    }
+
+    /// A scan over two row groups of four blocks decodes each dictionary page
+    /// once per chunk, not once per block, and still returns every record in
+    /// order. The scan's stats still charge each block for the dictionary it
+    /// reads through, so they match a per-block decode exactly.
+    ///
+    /// Wrong implementations this rules out, each shown failing: no cache (a
+    /// decode per block); a cache cleared before every block; a cache keyed by
+    /// column id alone (the second group reads the first group's dictionary);
+    /// a reused dictionary left out of `pages_decoded` or of
+    /// `decompressed_bytes`.
+    #[test]
+    fn scan_decodes_each_dictionary_page_once_per_chunk() {
+        let (records, object) = dict_fixture::two_group_object();
+        let (dict_pages, per_block) = dict_fixture::dictionary_reads(&object);
+        assert!(per_block > dict_pages, "{per_block} vs {dict_pages}");
+        let (charged_pages, charged_bytes) = dict_fixture::per_block_charges(&object);
+
+        let reader = RlogReader::new(&object, &RlogConfig::default()).expect("open");
+        // No block survives this range, so the scan's decompressed bytes are
+        // the directories alone.
+        let (none, dirs) = reader
+            .scan(&Predicate::TsRange {
+                min_ns: 0,
+                max_ns: 10,
+            })
+            .expect("empty scan");
+        assert!(none.is_empty());
+        let before = dict_page_decodes();
+        let (rows, stats) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
+        assert_eq!(dict_page_decodes() - before, dict_pages);
+        assert_eq!(rows, records);
+        assert_eq!(
+            (stats.pages_decoded, stats.pages_skipped),
+            (charged_pages, 0)
+        );
+        assert_eq!(
+            stats.decompressed_bytes - dirs.decompressed_bytes,
+            charged_bytes
+        );
+
+        // A projection that drops `svc` skips its dictionary in every block
+        // and decodes none, so decoded plus skipped is the same figure.
+        let mut narrow = reader
+            .scan_blocks(
+                &Predicate::And(Vec::new()),
+                &[],
+                &ColumnSelection::fixed_only(),
+            )
+            .expect("scan");
+        let before = dict_page_decodes();
+        while narrow.next_block(&object).expect("next").is_some() {}
+        let narrow = narrow.stats();
+        assert_eq!(dict_page_decodes() - before, 0);
+        assert_eq!(narrow.pages_decoded + narrow.pages_skipped, charged_pages);
     }
 
     /// A record carrying `cols` int columns and `cols` string columns, all

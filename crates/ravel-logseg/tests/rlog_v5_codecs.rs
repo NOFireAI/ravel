@@ -485,7 +485,8 @@ fn projected_observed_ts_reads_ts_through_a_ranged_fetch() {
 /// Wrong implementations this rules out, each shown failing: a reader that
 /// copies whatever column the reference names (the stream_ref target decodes);
 /// a reader that accepts tag 11 on any column (the stream_ref and dynamic
-/// column cases decode).
+/// column cases decode); a string decoder that takes tag 11 and an f64 decoder
+/// that takes tag 10 (the typed refusals are not reached).
 #[test]
 fn column_ref_refuses_other_targets() {
     let ts = [10i64, 20, 30];
@@ -594,6 +595,44 @@ fn column_ref_refuses_other_targets() {
         let got = decode_pages(3, pages, plans);
         assert!(is_corrupted(&got), "{name}: {:?}", got.map(|_| ()));
     }
+
+    // Each integer codec on a column of another type: tag 11 on a string
+    // column, tag 10 on an f64 column.
+    let str_plan = [ColumnPlan {
+        column_id: 11,
+        ty: FieldType::Str,
+    }];
+    let f64_plan = [ColumnPlan {
+        column_id: 12,
+        ty: FieldType::F64,
+    }];
+    type TypedCase<'a> = (&'a str, Vec<(PageDesc, Vec<u8>)>, &'a [ColumnPlan], &'a str);
+    let typed: Vec<TypedCase> = vec![
+        (
+            "tag 11 on a dynamic str column",
+            vec![
+                ts_page(),
+                raw_page(11, Enc::ColumnRef, encode_column_ref(COL_TS)),
+            ],
+            &str_plan,
+            "enc ColumnRef is not a string codec",
+        ),
+        (
+            "tag 10 on a dynamic f64 column",
+            vec![
+                ts_page(),
+                raw_page(12, Enc::GcdI64, encode_gcd_i64(&ts).expect("gcd page")),
+            ],
+            &f64_plan,
+            "enc GcdI64 is not an f64 codec",
+        ),
+    ];
+    for (name, pages, plans, want) in typed {
+        match decode_pages(3, pages, plans) {
+            Err(LogSegError::Corrupted(m)) => assert_eq!(m, want, "{name}"),
+            other => panic!("{name}: {:?}", other.map(|_| ())),
+        }
+    }
 }
 
 /// The writer keeps the candidate with the smallest stored size. On the i64
@@ -676,6 +715,52 @@ fn encoding_choice_uses_stored_size() {
             "row {i}"
         );
     }
+}
+
+/// The same one-block object written at zstd levels 1 and 19 stores different
+/// BLOCKS bytes, its body page zstd-compressed at both, and reads back the same
+/// records: the configured level reaches the block pages.
+///
+/// Wrong implementations this rules out, each shown failing: a block writer
+/// that seals pages at a fixed level; a page sealer that ignores the level it
+/// is given.
+#[test]
+fn zstd_level_reaches_the_block_pages() {
+    let mut x = 7u64;
+    let records: Vec<LogRecord> = (0..200)
+        .map(|i| {
+            let words: Vec<String> = (0..12)
+                .map(|_| {
+                    x = x
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    format!("w{}", (x >> 40) % 97)
+                })
+                .collect();
+            let mut r = record(1_000 + i, 1_000 + i, Vec::new());
+            r.body = words.join(" ");
+            r
+        })
+        .collect();
+    let at = |zstd_level| {
+        let cfg = RlogConfig {
+            zstd_level,
+            ..RlogConfig::default()
+        };
+        let object = write_rows(&cfg, &records);
+        assert_eq!(page_dir(&object).block_count(), 1);
+        let body = only_value_page(&object, ravel_logseg::record::COL_BODY);
+        assert_eq!(body.comp, COMP_ZSTD, "level {zstd_level}");
+        let blocks = *open(&object)
+            .expect("open")
+            .section(kind::BLOCKS)
+            .expect("BLOCKS");
+        let stored = object[blocks.offset as usize..(blocks.offset + blocks.len) as usize].to_vec();
+        assert_eq!(scan_all(&object), records, "level {zstd_level}");
+        stored
+    };
+    let (fast, slow) = (at(1), at(19));
+    assert_ne!(fast, slow, "levels 1 and 19 stored the same BLOCKS bytes");
 }
 
 /// The row path and both columnar paths (plain cells and dictionary-shaped

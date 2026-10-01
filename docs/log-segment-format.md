@@ -482,7 +482,11 @@ PAGE_DIR, and is the order PAGE_DIR lists them in. A row-group dictionary page
 is not one of the block's pages and the block crc does not cover it; every
 reader, whole-block or subset, verifies each dictionary page it uses against
 its own crc32c before decoding any id page of that chunk, so a corrupt
-dictionary fails every block of its chunk. A whole-block reader verifies the
+dictionary fails every block of its chunk. A scan, and a ranged decode of a
+stream span or a row group loc, verifies and decodes each dictionary page once
+and shares the result among the chunk's blocks it reads; only a successful
+decode is kept. Scan statistics still charge the page to every block that
+reads through it. A whole-block reader verifies the
 block crc; a reader taking a subset of the columns cannot (it does not have
 the other pages) and verifies each page's own crc32c instead. Both are
 mandatory on their own access path, which is what keeps every interpreted byte
