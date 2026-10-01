@@ -35,12 +35,13 @@ use futures::StreamExt;
 use proptest::prelude::*;
 use ravel_cache::{Cache, CacheLimits};
 use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
-use ravel_codec::encoding::{Enc, encode_strings};
+use ravel_codec::encoding::Enc;
 use ravel_logseg::block::{ColumnPlan, write_block};
 use ravel_logseg::field_dir::FieldDir;
 use ravel_logseg::footer::{
     COMP_NONE, LogFooter, SectionDesc, kind, open as open_footer, write_footer_and_trailer,
 };
+use ravel_logseg::page_dir::PageDir;
 use ravel_logseg::reader::read_section;
 use ravel_logseg::record::{ColumnValue, ResolvedRow};
 use ravel_logseg::skip_index::SkipIndex;
@@ -1920,6 +1921,21 @@ fn str_column_id(obj: &[u8], cfg: RlogConfig, key: &str) -> u32 {
         .column_id
 }
 
+/// The encodings PAGE_DIR records for `column_id`'s pages in `obj`, in order.
+fn column_page_encs(obj: &[u8], cfg: RlogConfig, column_id: u32) -> Vec<Enc> {
+    let footer = open_footer(obj).expect("open footer");
+    let desc = *footer.section(kind::PAGE_DIR).expect("a PAGE_DIR section");
+    let bytes = read_section(obj, &desc, &cfg).expect("read PAGE_DIR");
+    PageDir::decode(&bytes)
+        .expect("decode PAGE_DIR")
+        .groups
+        .iter()
+        .flat_map(|g| &g.chunks)
+        .filter(|c| c.column_id == column_id)
+        .flat_map(|c| c.pages.iter().map(|p| p.enc))
+        .collect()
+}
+
 /// A declared `Str` cell whose bytes are not UTF-8 means the record does not set
 /// the key, so the resource value shows through -- on both paths.
 ///
@@ -2139,28 +2155,21 @@ async fn dict_page_and_plain_page_both_read_correct_values() {
         ("logs/dictpage.rlog", &dict_records),
         ("logs/plainpage.rlog", &plain_records),
     ] {
-        // Assert each fixture's declared `name` value set actually produces the
-        // encoding its name claims. `encode_strings` is the exact codec the
-        // writer stages a dynamic string column with, so this ties the fixture
-        // to the live `dict_is_worth_it` heuristic: move that heuristic and the
-        // "dict page" fixture becomes a plain page, failing here rather than
+        // Assert each fixture's `name` page is stored with the encoding its name
+        // claims, read from the written object's PAGE_DIR: the writer keeps
+        // whichever candidate stores smallest, so a change to that choice turns
+        // the "dict page" fixture into a plain page and fails here rather than
         // silently exercising the identity branch twice.
-        let name_vals: Vec<&[u8]> = recs
-            .iter()
-            .map(|r| match &r.attrs[0].1 {
-                AttrValue::Str(s) => s.as_bytes(),
-                _ => unreachable!(),
-            })
-            .collect();
         let want_enc = if key == "logs/dictpage.rlog" {
             Enc::Dict
         } else {
             Enc::Plain
         };
+        let object = encode_object(recs, cfg);
         assert_eq!(
-            encode_strings(&name_vals).0,
-            want_enc,
-            "fixture {key} must actually produce {want_enc:?}"
+            column_page_encs(&object, cfg, str_column_id(&object, cfg, "name")),
+            [want_enc],
+            "fixture {key} must actually store {want_enc:?}"
         );
 
         let store = MemoryStore::new();
@@ -2267,17 +2276,16 @@ async fn dict_page_with_non_utf8_entry_and_resource_fallback_append() {
         None,
         None,
     ];
-    // The page holds only the present cells; assert it truly encodes as a dict
-    // page (three distinct of six present), with the non-UTF-8 byte string among
-    // its entries.
-    let present: Vec<&[u8]> = cells.iter().filter_map(|c| c.as_deref()).collect();
-    assert_eq!(
-        encode_strings(&present).0,
-        Enc::Dict,
-        "the present cells must encode as a dict page"
-    );
-
+    // The value page holds only the present cells (three distinct of six
+    // present), with the non-UTF-8 byte string among its entries; assert the
+    // rewritten object's PAGE_DIR stores it as a dict page, after the presence
+    // bitmap the two absent rows need.
     let patched = rewrite_str_column_cells(&clean, cfg, &records, column_id, &cells);
+    assert_eq!(
+        column_page_encs(&patched, cfg, column_id),
+        [Enc::Bitmap, Enc::Dict],
+        "the present cells must be stored as a dict page"
+    );
 
     let store = MemoryStore::new();
     let seg = put_object(

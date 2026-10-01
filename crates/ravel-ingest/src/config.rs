@@ -644,8 +644,9 @@ pub struct IngestConfig {
     /// default therefore matches the new `max_flush_delay` default (2s)
     /// rather than retaining the old hard-coded 1s value.
     pub strict_visibility_budget_ns: i64,
-    /// The zstd level of every page and whole-read section of each RLOG object
-    /// a log flush writes. Metrics and span flushes do not read it.
+    /// The zstd level of every page, the four compressed sections and the
+    /// POSTINGS term blocks of each RLOG object a log flush writes. Metrics and
+    /// span flushes do not read it.
     pub rlog_zstd_level: RlogZstdLevel,
 }
 
