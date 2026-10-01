@@ -1069,23 +1069,19 @@ async fn the_pinned_surface_reads_the_same_rows() {
     assert_eq!(rows(&http), vec!["1", "4"]);
 }
 
-/// Flight SQL reaches Parquet tables through the same executor funnel:
-/// `GetFlightInfo` then `DoGet` return the rows `execute` returns.
+/// A Flight SQL service over `lake`'s executor, authenticating `tenant` under
+/// the token `acme`.
 #[cfg(feature = "flight-sql")]
-#[tokio::test]
-async fn flight_sql_reads_a_parquet_table() {
+fn flight_harness(lake: &Lake, tenant: &TenantId) -> util::flight_harness::Harness {
     use std::time::Duration;
 
     use ravel_sql::{FlightClock, FlightSqlConfig, RavelFlightSqlService};
-    use util::flight_harness::{Harness, TestAuth, TestClock, merged};
+    use util::flight_harness::{Harness, TestAuth, TestClock};
 
-    let lake = Lake::configured();
-    let acme = TenantId::new("acme");
-    lake.hits_for(&acme.hash()).await;
     let clock = TestClock::at(util::NOW_NS);
     let service = RavelFlightSqlService::new(
         Arc::clone(&lake.executor),
-        TestAuth::new(&[("acme", &acme)]),
+        TestAuth::new(&[("acme", tenant)]),
         Arc::clone(&clock) as Arc<dyn FlightClock>,
         FlightSqlConfig {
             max_deadline: Duration::from_secs(30),
@@ -1096,12 +1092,25 @@ async fn flight_sql_reads_a_parquet_table() {
             ravel_query::QueryConcurrencyLimit::Unlimited,
         ),
     );
-    let harness = Harness {
+    Harness {
         service,
         executor: Arc::clone(&lake.executor),
         clock,
         store: Arc::clone(&lake.ravel) as Arc<dyn ObjectStoreBackend>,
-    };
+    }
+}
+
+/// Flight SQL reaches Parquet tables through the same executor funnel:
+/// `GetFlightInfo` then `DoGet` return the rows `execute` returns.
+#[cfg(feature = "flight-sql")]
+#[tokio::test]
+async fn flight_sql_reads_a_parquet_table() {
+    use util::flight_harness::merged;
+
+    let lake = Lake::configured();
+    let acme = TenantId::new("acme");
+    lake.hits_for(&acme.hash()).await;
+    let harness = flight_harness(&lake, &acme);
     let sql = "SELECT id, name FROM hits WHERE id >= 4 ORDER BY id";
     let ticket = harness
         .get_flight_info("acme", sql)
@@ -1111,6 +1120,38 @@ async fn flight_sql_reads_a_parquet_table() {
     let http = lake.execute(&acme.hash(), sql).await.expect("execute");
     assert_eq!(rows(&http), vec!["4|a", "5|b", "6|c"]);
     assert_eq!(merged(&flight), merged(http.output.batches()));
+}
+
+/// `GetFlightInfo` resolves a Parquet table once: one LIST of its manifest
+/// prefix, one GET of the newest manifest and one GET of the grants record on
+/// Ravel's store, which is what a single `execute` reads too. Planning the
+/// statement after the resolve used to resolve the table a second time.
+///
+/// FLIP: planning with `ParquetPlan::Unresolved` in `get_flight_info_statement`
+/// reads 2 LISTs and 4 GETs.
+#[cfg(feature = "flight-sql")]
+#[tokio::test]
+async fn get_flight_info_resolves_a_parquet_table_once() {
+    let lake = Lake::configured();
+    let acme = TenantId::new("acme");
+    lake.hits_for(&acme.hash()).await;
+    let harness = flight_harness(&lake, &acme);
+
+    let (gets, lists) = (Lake::gets(&lake.ravel), Lake::lists(&lake.ravel));
+    harness
+        .get_flight_info("acme", "SELECT id FROM hits ORDER BY id")
+        .await
+        .expect("flight info");
+    assert_eq!(
+        Lake::lists(&lake.ravel) - lists,
+        1,
+        "one LIST of the manifest prefix"
+    );
+    assert_eq!(
+        Lake::gets(&lake.ravel) - gets,
+        2,
+        "one GET of the newest manifest and one of the grants record"
+    );
 }
 
 /// `groups` row groups of `rows` rows each, so every column chunk is about

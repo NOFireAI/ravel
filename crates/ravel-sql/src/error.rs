@@ -392,7 +392,12 @@ impl From<ParquetQueryError> for SqlError {
             Some(&ParquetReadError::BytesBudgetExceeded { scanned, max }) => {
                 SqlError::TooManyBytesScanned { scanned, max }
             }
-            _ => SqlError::Parquet(Box::new(err)),
+            _ => match err {
+                // The pinned state is gone, the same outcome as a pinned
+                // segment that vanished: the client takes a new ticket.
+                ParquetQueryError::PinnedManifestGone { .. } => SqlError::SnapshotInvalidated,
+                err => SqlError::Parquet(Box::new(err)),
+            },
         }
     }
 }
