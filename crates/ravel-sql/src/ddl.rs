@@ -114,10 +114,10 @@ pub enum DdlExecuteError {
     #[error(transparent)]
     Validation(#[from] DdlValidationError),
 
-    /// This executor has no Parquet sources configured at all, or has sources
-    /// but no credential profiles: no external store can be opened for a
-    /// `CREATE`, and [`ravel_pqtable::writer`] has nowhere to write a `DROP`
-    /// either. 422-class.
+    /// This executor has no Parquet sources configured at all, so neither a
+    /// `CREATE` nor a `DROP` has a store to write to; or it has sources but
+    /// no credential profiles, so a `CREATE` has no external store to open
+    /// (a `DROP` still writes through Ravel's own store). 422-class.
     #[error(
         "this server has no Parquet credential profiles configured; CREATE EXTERNAL TABLE and \
          DROP TABLE cannot be served"
@@ -133,7 +133,9 @@ pub enum DdlExecuteError {
     Location(#[from] GrantsError),
 
     /// The external store the resolved grant's profile names could not be
-    /// opened. 503-class.
+    /// opened. 503-class when opening it failed; 422-class when this server
+    /// does not configure the profile, or the profile and bucket reach
+    /// Ravel's own data bucket.
     #[error("opening the external store for profile {profile:?}: {source}")]
     ExternalStore {
         profile: String,
@@ -269,7 +271,7 @@ impl DdlExecuteError {
             DdlExecuteError::Validation(_) => DdlErrorClass::BadRequest,
             DdlExecuteError::NotConfigured => DdlErrorClass::Unsupported,
             DdlExecuteError::Location(source) => grants_error_class(source),
-            DdlExecuteError::ExternalStore { .. } => DdlErrorClass::Unavailable,
+            DdlExecuteError::ExternalStore { source, .. } => external_store_class(source),
             DdlExecuteError::ProbeList { .. } => DdlErrorClass::Unavailable,
             DdlExecuteError::ProbeObjectEmpty { .. } => DdlErrorClass::Unsupported,
             DdlExecuteError::ProbeObjectPageCapReached { .. } => DdlErrorClass::Unsupported,
@@ -330,6 +332,27 @@ impl DdlExecuteError {
                     ),
                 }
             }
+            DdlExecuteError::ExternalStore { source, .. } => match source {
+                ExternalStoreError::Open { .. } => crate::error::MSG_UNAVAILABLE.to_string(),
+                ExternalStoreError::UnknownProfile { .. } => {
+                    "the credential profile this LOCATION's grant names is not configured on \
+                     this server"
+                        .to_string()
+                }
+                ExternalStoreError::RavelBucket { .. } => {
+                    "the bucket this LOCATION's grant names is Ravel's own data bucket".to_string()
+                }
+            },
+            DdlExecuteError::Snapshot {
+                location,
+                source: SnapshotError::MemoryExhausted { .. },
+            } => match self.class() {
+                DdlErrorClass::Unavailable => crate::error::MSG_UNAVAILABLE.to_string(),
+                _ => format!(
+                    "a Parquet footer under {location:?} is larger than this server's whole \
+                     memory budget"
+                ),
+            },
             _ => match self.class() {
                 DdlErrorClass::Unavailable => crate::error::MSG_UNAVAILABLE.to_string(),
                 DdlErrorClass::Internal => crate::error::MSG_INTERNAL.to_string(),
@@ -415,15 +438,40 @@ fn ravel_bucket_probe_class(err: &RavelBucketProbeFailure) -> DdlErrorClass {
     }
 }
 
+/// [`DdlExecuteError::ExternalStore`]'s class: a store that failed to open
+/// is retryable (503); a profile the grant names that this server does not
+/// configure, and a profile and bucket that reach Ravel's own data bucket,
+/// are configuration verdicts no retry changes (422).
+fn external_store_class(err: &ExternalStoreError) -> DdlErrorClass {
+    match err {
+        ExternalStoreError::Open { .. } => DdlErrorClass::Unavailable,
+        ExternalStoreError::UnknownProfile { .. } | ExternalStoreError::RavelBucket { .. } => {
+            DdlErrorClass::Unsupported
+        }
+    }
+}
+
 /// [`DdlExecuteError::Snapshot`]'s class: a listing or read fault is
 /// retryable (503); a corrupt file or a schema mismatch across the
 /// `LOCATION`'s files is a permanent data fault (500); the inner snapshot
 /// deadline is a timeout (504), the same class as the outer
-/// [`DdlExecuteError::Deadline`]; every other variant is a well-formed
-/// `LOCATION` this build will not snapshot as given (422).
+/// [`DdlExecuteError::Deadline`]. A footer read the memory budget refused
+/// is retryable (503) when the read alone fits the budget's limit, since
+/// other reservations free up, and 422 when it does not fit even an empty
+/// budget. Every other variant is a well-formed `LOCATION` this build will
+/// not snapshot as given (422).
 fn snapshot_error_class(err: &SnapshotError) -> DdlErrorClass {
     match err {
         SnapshotError::List { .. } | SnapshotError::Store { .. } => DdlErrorClass::Unavailable,
+        SnapshotError::MemoryExhausted {
+            requested, limit, ..
+        } => {
+            if requested <= limit {
+                DdlErrorClass::Unavailable
+            } else {
+                DdlErrorClass::Unsupported
+            }
+        }
         SnapshotError::Corrupt { .. } | SnapshotError::SchemaMismatch { .. } => {
             DdlErrorClass::Internal
         }
@@ -434,23 +482,32 @@ fn snapshot_error_class(err: &SnapshotError) -> DdlErrorClass {
         | SnapshotError::OutsideGrant { .. }
         | SnapshotError::FileChanged { .. }
         | SnapshotError::FileMissing { .. }
-        | SnapshotError::EmptyFile { .. }
-        | SnapshotError::MemoryExhausted { .. } => DdlErrorClass::Unsupported,
+        | SnapshotError::EmptyFile { .. } => DdlErrorClass::Unsupported,
     }
 }
 
 /// [`DdlExecuteError::Write`]'s class: [`WriteError::TableExists`] and
 /// [`WriteError::TableNotFound`] are the two statuses a DDL statement can
-/// return besides the shared set (409 and 404); a storage fault or
-/// exhausted compare-and-swap retry is retryable (503); a version that has
-/// no successor, a corrupt manifest, or a malformed key or table name is a
-/// permanent data fault (500); an empty file list or an unusable grace
-/// budget is a well-formed statement this write refuses (422).
+/// return besides the shared set (409 and 404); a storage fault, a newest
+/// version deleted under every read attempt, or an exhausted
+/// compare-and-swap retry is retryable (503); a version that has no
+/// successor, a corrupt or newer-format manifest, a misfiled object under
+/// the table prefix, or a malformed key or table name is a permanent data
+/// fault (500); an empty file list or an unusable grace budget is a
+/// well-formed statement this write refuses (422).
 fn write_error_class(err: &WriteError) -> DdlErrorClass {
     match err {
         WriteError::TableExists { .. } => DdlErrorClass::Conflict,
         WriteError::TableNotFound { .. } => DdlErrorClass::NotFound,
-        WriteError::Store { .. } | WriteError::Resolve(_) | WriteError::RetriesExhausted { .. } => {
+        WriteError::Resolve(source) => match source {
+            resolve::ResolveError::Store { .. } | resolve::ResolveError::Vanished { .. } => {
+                DdlErrorClass::Unavailable
+            }
+            resolve::ResolveError::ForeignKey { .. }
+            | resolve::ResolveError::Key(_)
+            | resolve::ResolveError::Manifest(_) => DdlErrorClass::Internal,
+        },
+        WriteError::Store { .. } | WriteError::RetriesExhausted { .. } => {
             DdlErrorClass::Unavailable
         }
         WriteError::EmptyFileList { .. } | WriteError::NoPutBudget { .. } => {
@@ -482,13 +539,15 @@ enum ProbeObject {
 /// scoped to the statement's own resolved `KeyPrefix` (which can be narrower
 /// than the whole grant's prefix) rather than the grant's prefix, since that
 /// is the key space `execute_ddl` already has in hand from
-/// [`grants::resolve_location`]. Admission is decided by
-/// [`grants::contains_key`], the same segment-wise rule the read path
-/// applies, together with a `.parquet` suffix and a non-zero size: a bare
-/// prefix match admits a folder-marker object (zero bytes, often named
-/// exactly like the directory key) and a sibling whose key happens to share
-/// the same string prefix, neither of which `snapshot_location` would ever
-/// treat as a data file.
+/// [`grants::resolve_location`]. The listing runs under the directory key
+/// with a trailing `/`, which is what excludes a sibling whose key merely
+/// shares the same string prefix (`data/t10/` against `data/t1`). An object
+/// is admitted when it has a `.parquet` suffix and a non-zero size, which
+/// excludes a folder-marker object (zero bytes, often named exactly like
+/// the directory key); neither would `snapshot_location` treat as a data
+/// file. The [`grants::contains_key`] check on each listed key cannot fail
+/// for a key under a location `resolve_location` admitted, and is kept as
+/// defence in depth.
 ///
 /// A non-directory `key` names one object directly; it is resolved with a
 /// single HEAD and never falls through to a listing, which -- scoped to the
@@ -827,15 +886,28 @@ mod tests {
         );
     }
 
+    // A profile the server does not configure, and a profile that reaches
+    // Ravel's own bucket, are configuration verdicts no retry changes; the
+    // client message names neither the profile nor the bucket.
     #[test]
-    fn external_store_is_unavailable() {
-        let err = DdlExecuteError::ExternalStore {
-            profile: "p".to_string(),
-            source: ExternalStoreError::UnknownProfile {
-                profile: "p".to_string(),
+    fn external_store_configuration_verdicts_are_unsupported_and_redacted() {
+        for source in [
+            ExternalStoreError::UnknownProfile {
+                profile: SENTINEL.to_string(),
             },
-        };
-        assert_eq!(err.class(), DdlErrorClass::Unavailable);
+            ExternalStoreError::RavelBucket {
+                profile: SENTINEL.to_string(),
+                bucket: SENTINEL.to_string(),
+            },
+        ] {
+            let err = DdlExecuteError::ExternalStore {
+                profile: SENTINEL.to_string(),
+                source,
+            };
+            assert_eq!(err.class(), DdlErrorClass::Unsupported, "{err}");
+            let message = err.client_message();
+            assert!(!message.contains(SENTINEL), "{message}");
+        }
     }
 
     #[test]
@@ -1239,8 +1311,8 @@ mod tests {
             },
             SnapshotError::MemoryExhausted {
                 key: "k".to_string(),
-                requested: 1,
-                reserved: 1,
+                requested: 2,
+                reserved: 0,
                 limit: 1,
             },
         ] {
@@ -1250,6 +1322,46 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    // A footer read that fits the budget's limit was refused because other
+    // reservations hold the rest, which frees up: retryable, and the client
+    // message must not carry the shared budget's occupancy.
+    #[test]
+    fn snapshot_memory_refusal_within_the_limit_is_unavailable_and_redacted() {
+        let err = DdlExecuteError::Snapshot {
+            location: "s3://b/p".to_string(),
+            source: SnapshotError::MemoryExhausted {
+                key: "k".to_string(),
+                requested: 4096,
+                reserved: 987_654_321,
+                limit: 1_000_000_000,
+            },
+        };
+        assert_eq!(err.class(), DdlErrorClass::Unavailable);
+        let message = err.client_message();
+        assert_eq!(message, crate::error::MSG_UNAVAILABLE);
+        assert!(!message.contains("987654321"), "{message}");
+    }
+
+    // A footer larger than the whole budget never fits: 422, with a message
+    // naming the location and none of the budget's figures.
+    #[test]
+    fn snapshot_memory_refusal_over_the_limit_is_unsupported_and_redacted() {
+        let err = DdlExecuteError::Snapshot {
+            location: "s3://b/p".to_string(),
+            source: SnapshotError::MemoryExhausted {
+                key: "k".to_string(),
+                requested: 2_000_000_000,
+                reserved: 987_654_321,
+                limit: 1_000_000_000,
+            },
+        };
+        assert_eq!(err.class(), DdlErrorClass::Unsupported);
+        let message = err.client_message();
+        assert!(message.contains("s3://b/p"), "{message}");
+        assert!(!message.contains("987654321"), "{message}");
+        assert!(!message.contains("1000000000"), "{message}");
     }
 
     #[test]
@@ -1285,6 +1397,26 @@ mod tests {
             },
         ] {
             assert_eq!(write_error_class(&err), DdlErrorClass::Unavailable, "{err}");
+        }
+    }
+
+    // A manifest a newer build wrote, or a misfiled object under the table
+    // prefix, does not clear on retry, whichever resolve reports it.
+    #[test]
+    fn write_resolve_data_faults_are_internal() {
+        for err in [
+            WriteError::Resolve(ResolveError::Manifest(ManifestError::UnsupportedVersion {
+                key: "k".to_string(),
+                got: 9,
+                ceiling: 1,
+            })),
+            WriteError::Resolve(ResolveError::ForeignKey {
+                key: "k".to_string(),
+                prefix: "p".to_string(),
+                reason: "r".to_string(),
+            }),
+        ] {
+            assert_eq!(write_error_class(&err), DdlErrorClass::Internal, "{err}");
         }
     }
 
