@@ -1186,6 +1186,12 @@ impl MaintenanceOwnershipMetrics {
 #[derive(Debug, Clone)]
 pub struct MaintenanceTaskConfig {
     pub enabled: bool,
+    /// Pause between maintenance passes (`--maintain-interval-secs`). A zero
+    /// interval is refused at startup with [`SpawnError::ZeroMaintainInterval`],
+    /// whether or not the loop is enabled: `validate_loop_intervals` checks it
+    /// regardless of `enabled`, matching `Cli::validate`.
+    /// [`check_spawnable`](Self::check_spawnable) re-refuses it at the enabled
+    /// loop's spawn site.
     pub interval: Duration,
     pub shard_count: u32,
     /// Compactor knobs (seal margin, part cap, grace, protection horizon).
@@ -1244,6 +1250,23 @@ pub enum SpawnError {
     /// zero; the config's is refused with it so the two cannot disagree.
     #[error("maintenance heartbeat_interval must be non-zero")]
     ZeroHeartbeatInterval,
+    /// A zero `interval` would run every maintenance pass back to back.
+    #[error(
+        "--maintain-interval-secs must be non-zero: a zero maintain interval runs every pass back to back"
+    )]
+    ZeroMaintainInterval,
+}
+
+impl MaintenanceTaskConfig {
+    /// The interval refusal [`spawn`] applies before starting the loop. `start`
+    /// refuses a zero interval earlier, before spawning anything, whether or
+    /// not the loop is enabled.
+    pub fn check_spawnable(&self) -> Result<(), SpawnError> {
+        if self.enabled && self.interval.is_zero() {
+            return Err(SpawnError::ZeroMaintainInterval);
+        }
+        Ok(())
+    }
 }
 
 /// Handle to every spawned maintenance task, for clean shutdown (mirrors
@@ -1301,7 +1324,8 @@ impl MaintenanceTasks {
 /// ever entered with a skew-uncovered horizon.
 ///
 /// A zero `heartbeat_interval` (on `config` or on `worker`) is refused the same
-/// way, with [`SpawnError::ZeroHeartbeatInterval`].
+/// way, with [`SpawnError::ZeroHeartbeatInterval`], and a zero `interval` with
+/// [`SpawnError::ZeroMaintainInterval`].
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     store: Arc<dyn ObjectStoreBackend>,
@@ -1318,6 +1342,8 @@ pub fn spawn(
     if !config.enabled {
         return Ok(MaintenanceTasks::none());
     }
+
+    config.check_spawnable()?;
 
     // The heartbeat task's `tokio::time::interval` runs on the worker's period,
     // which `ravel_server::start` builds from `config.heartbeat_interval`; a
@@ -9926,6 +9952,49 @@ mod tests {
                     tasks.shutdown().await;
                     panic!("{case} must be refused at spawn, not handed to the heartbeat task");
                 }
+            }
+        }
+    }
+
+    /// [`spawn`] refuses an enabled config with a zero `interval` directly at
+    /// its spawn site with [`SpawnError::ZeroMaintainInterval`], before any task
+    /// is spawned, with the default (non-zero) heartbeat so the refusal is the
+    /// interval and not the heartbeat. `maintain` is a `pub` module, so an
+    /// outside caller reaches this function without passing through
+    /// `validate_loop_intervals`.
+    ///
+    /// Flip to watch it fail: delete the `config.check_spawnable()?` call in
+    /// [`spawn`]. The function then proceeds past the interval on a zero and
+    /// spawns the maintenance supervisor.
+    #[tokio::test]
+    async fn spawn_refuses_a_zero_maintain_interval() {
+        let stored_gc = ravel_maintain::GcConfigValues::maintain_defaults();
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let worker = Arc::new(WorkerSet::with_defaults(0));
+        let config = MaintenanceTaskConfig {
+            enabled: true,
+            interval: Duration::ZERO,
+            ..MaintenanceTaskConfig::default()
+        };
+        match spawn(
+            Arc::clone(&store),
+            Vec::new(),
+            config,
+            stored_gc,
+            Arc::new(TenantDiscoveryMetrics::default()),
+            Arc::new(MaintenanceSafetyMetrics::default()),
+            Arc::new(MaintenanceOwnershipMetrics::new(
+                DEFAULT_STALLED_AFTER_INTERVALS,
+            )),
+            Arc::clone(&worker),
+            Arc::new(watch::channel(worker.solo_live_set()).0),
+            Arc::new(WallClock),
+        ) {
+            Err(SpawnError::ZeroMaintainInterval) => {}
+            Err(other) => panic!("expected ZeroMaintainInterval, got: {other}"),
+            Ok(tasks) => {
+                tasks.shutdown().await;
+                panic!("a zero maintain interval must be refused at spawn");
             }
         }
     }

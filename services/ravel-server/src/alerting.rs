@@ -261,6 +261,12 @@ pub struct AlertQueryEngines {
 #[derive(Debug, Clone)]
 pub struct AlertEvalConfig {
     pub enabled: bool,
+    /// Pause between evaluation ticks (`--alert-eval-interval-secs`). A zero
+    /// interval is refused at startup with [`SpawnError::ZeroEvalInterval`],
+    /// whether or not the loop is enabled: `validate_loop_intervals` checks it
+    /// regardless of `enabled`, matching `Cli::validate`.
+    /// [`check_spawnable`](Self::check_spawnable) re-refuses it at the enabled
+    /// loop's spawn site.
     pub interval: Duration,
     /// Static per-tenant rules (ADR-0043 decision 2), loaded once at startup by
     /// [`load_rules_file`]. One evaluator task is spawned per key.
@@ -287,6 +293,28 @@ impl Default for AlertEvalConfig {
             sink_timeout: DEFAULT_SINK_TIMEOUT,
             sql_lookback: DEFAULT_SQL_LOOKBACK,
         }
+    }
+}
+
+/// Why [`spawn`] refused to start the evaluator loops. Nothing is spawned.
+#[derive(Debug, thiserror::Error)]
+pub enum SpawnError {
+    /// A zero `interval` would run every evaluation tick back to back.
+    #[error(
+        "--alert-eval-interval-secs must be non-zero: a zero evaluation interval runs every tick back to back"
+    )]
+    ZeroEvalInterval,
+}
+
+impl AlertEvalConfig {
+    /// The refusal [`spawn`] applies before starting any evaluator. `start`
+    /// refuses a zero interval earlier, before spawning anything, whether or
+    /// not evaluation is enabled.
+    pub fn check_spawnable(&self) -> Result<(), SpawnError> {
+        if self.enabled && self.interval.is_zero() {
+            return Err(SpawnError::ZeroEvalInterval);
+        }
+        Ok(())
     }
 }
 
@@ -318,14 +346,17 @@ impl AlertEvalTasks {
 /// Spawn one evaluator loop per tenant that has rules. Returns immediately;
 /// tasks run until [`AlertEvalTasks::shutdown`].
 ///
-/// Fails only if the shared HTTP client cannot be built, which is a startup
-/// misconfiguration rather than a runtime condition.
+/// Fails if the shared HTTP client cannot be built, or with
+/// [`SpawnError::ZeroEvalInterval`] for an enabled config with a zero
+/// `interval`: both are startup misconfigurations rather than runtime
+/// conditions.
 pub fn spawn(
     store: Arc<dyn ObjectStoreBackend>,
     engines: AlertQueryEngines,
     clock: Arc<dyn Clock>,
     config: AlertEvalConfig,
 ) -> anyhow::Result<AlertEvalTasks> {
+    config.check_spawnable()?;
     if !config.enabled || config.rules.is_empty() {
         return Ok(AlertEvalTasks::none());
     }
@@ -7122,6 +7153,44 @@ mod tick_tests {
             NOW_NS,
             "the gauge still carries the first tick's reading: a tick that could \
              not reach the store must not look alive"
+        );
+    }
+
+    /// [`spawn`] refuses an enabled config with a zero `interval` directly at
+    /// its spawn site with [`SpawnError::ZeroEvalInterval`], before any
+    /// evaluator is spawned. `alerting` is a `pub` module, so an outside caller
+    /// reaches this function without passing through `validate_loop_intervals`;
+    /// `check_spawnable` runs ahead of the empty-rules short circuit, so an
+    /// empty rule set still exercises the guard.
+    ///
+    /// Flip to watch it fail: delete the `config.check_spawnable()?` call at the
+    /// top of [`spawn`]. With no rules the function then returns
+    /// `Ok(AlertEvalTasks::none())` on a zero interval.
+    #[tokio::test]
+    async fn spawn_refuses_a_zero_eval_interval() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog =
+            Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+        let engine = QueryEngine::new(catalog, Arc::clone(&store), EngineConfig::default());
+        let engines = AlertQueryEngines {
+            promql: Arc::new(engine),
+            #[cfg(feature = "sql")]
+            sql: None,
+        };
+        let config = AlertEvalConfig {
+            enabled: true,
+            interval: Duration::ZERO,
+            ..AlertEvalConfig::default()
+        };
+        let err = spawn(store, engines, TestClock::at(NOW_NS), config)
+            .err()
+            .expect("a zero eval interval must be refused at spawn");
+        assert!(
+            matches!(
+                err.downcast_ref::<SpawnError>(),
+                Some(SpawnError::ZeroEvalInterval)
+            ),
+            "expected ZeroEvalInterval, got: {err:#}"
         );
     }
 }
