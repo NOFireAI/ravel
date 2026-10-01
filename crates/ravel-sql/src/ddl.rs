@@ -39,10 +39,10 @@
 //! probes, the snapshot read, and the manifest write, not only the snapshot
 //! step within it ([`DdlExecuteError::Deadline`] on expiry). The snapshot
 //! step is passed that same `deadline` value for its own inner timeout, but
-//! it only starts once the grants read and both qualification probes have
-//! already spent part of that budget, so its timeout instant is always
-//! later than the outer one's: the outer [`DdlExecuteError::Deadline`]
-//! always fires first, never the inner `SnapshotError::Deadline`.
+//! it starts only after the grants read and both qualification probes, so
+//! its timer expires no earlier than the outer one. A statement that runs
+//! out of time therefore reports [`DdlExecuteError::Deadline`], not the
+//! snapshot's own deadline error.
 
 use std::time::Duration;
 
@@ -65,7 +65,9 @@ use crate::validate::{DdlIntent, DdlValidationError, validate_ddl};
 
 /// The grace a manifest write holds before another apply may supersede it
 /// (`ravel_pqtable::writer::apply`'s `min_grace_ms`), sourced from ADR-2040's
-/// own Lifecycle text: 11 minutes.
+/// own Lifecycle text: 11 minutes. This is the default used until a caller
+/// passes the deployment's own sweep grace (`sys/gc`'s
+/// `max_query_duration`), which the HTTP wiring of issue #2054 does.
 pub const DEFAULT_MIN_GRACE_MS: u64 = 660_000;
 
 /// How many listing pages [`one_object_under`] reads while looking for one
@@ -298,9 +300,17 @@ impl DdlExecuteError {
     pub fn client_message(&self) -> String {
         match self {
             DdlExecuteError::PreconditionProbe { location, source } => {
-                match precondition_probe_class(source) {
-                    DdlErrorClass::Unavailable => crate::error::MSG_UNAVAILABLE.to_string(),
-                    _ => format!(
+                if precondition_probe_class(source) == DdlErrorClass::Unavailable {
+                    return crate::error::MSG_UNAVAILABLE.to_string();
+                }
+                match source {
+                    PreconditionProbeFailure::Head { .. }
+                    | PreconditionProbeFailure::MatchingPinRefused { .. } => format!(
+                        "the store behind {location:?} refused a read of the probe object, so \
+                         it cannot be qualified for pinned reads"
+                    ),
+                    PreconditionProbeFailure::WrongPinAccepted { .. }
+                    | PreconditionProbeFailure::WrongPinWrongError { .. } => format!(
                         "the store behind {location:?} does not qualify for pinned reads: it \
                          does not honor read preconditions correctly"
                     ),
@@ -309,7 +319,12 @@ impl DdlExecuteError {
             DdlExecuteError::RavelBucketProbe { location, source } => {
                 match ravel_bucket_probe_class(source) {
                     DdlErrorClass::Unavailable => crate::error::MSG_UNAVAILABLE.to_string(),
-                    _ => format!(
+                    DdlErrorClass::Internal => crate::error::MSG_INTERNAL.to_string(),
+                    DdlErrorClass::BadRequest
+                    | DdlErrorClass::Conflict
+                    | DdlErrorClass::NotFound
+                    | DdlErrorClass::Unsupported
+                    | DdlErrorClass::Timeout => format!(
                         "the bucket behind {location:?} did not qualify as external: it is \
                          Ravel's own bucket"
                     ),
@@ -352,37 +367,49 @@ fn grants_error_class(err: &GrantsError) -> DdlErrorClass {
     }
 }
 
-/// [`DdlExecuteError::PreconditionProbe`]'s class. [`PreconditionProbeFailure::Head`]
-/// and [`PreconditionProbeFailure::MatchingPinRefused`] are a failure to ask
-/// the question at all: a HEAD, or a ranged read pinned to the object's own
-/// identity, that itself errored for a store or network reason the probe
-/// cannot attribute to the store's precondition support -- retryable (503).
-/// [`PreconditionProbeFailure::WrongPinAccepted`] and
-/// [`PreconditionProbeFailure::WrongPinWrongError`] are a genuine
-/// qualification verdict: the store answered, and the answer disqualifies
-/// it (422).
+/// [`DdlExecuteError::PreconditionProbe`]'s class. A probe read that failed
+/// with a retryable [`StoreError`] (throttling, a timeout, a transient
+/// fault) never got an answer, so it is retryable (503) whichever half
+/// failed. Any other failure is an answer, and it disqualifies the store
+/// (422): a HEAD or a matching-pin read the store refuses outright, a
+/// wrong-pin read it serves, or a wrong-pin read it refuses with something
+/// other than a precondition failure. A permanent refusal is not reported as
+/// retryable, because retrying it gets the same refusal.
 fn precondition_probe_class(err: &PreconditionProbeFailure) -> DdlErrorClass {
     match err {
-        PreconditionProbeFailure::Head { .. }
-        | PreconditionProbeFailure::MatchingPinRefused { .. } => DdlErrorClass::Unavailable,
-        PreconditionProbeFailure::WrongPinAccepted { .. }
-        | PreconditionProbeFailure::WrongPinWrongError { .. } => DdlErrorClass::Unsupported,
+        PreconditionProbeFailure::Head { source, .. }
+        | PreconditionProbeFailure::MatchingPinRefused { source, .. }
+        | PreconditionProbeFailure::WrongPinWrongError { source, .. } => {
+            if source.is_retryable() {
+                DdlErrorClass::Unavailable
+            } else {
+                DdlErrorClass::Unsupported
+            }
+        }
+        PreconditionProbeFailure::WrongPinAccepted { .. } => DdlErrorClass::Unsupported,
     }
 }
 
 /// [`DdlExecuteError::RavelBucketProbe`]'s class.
-/// [`RavelBucketProbeFailure::ProbeWriteFailed`] (the probe object never
-/// reached Ravel's own bucket, so the question was never asked) and
+/// [`RavelBucketProbeFailure::ProbeWriteFailed`] is a failure to write the
+/// probe object into Ravel's own bucket, so the question was never asked:
+/// retryable (503) when the [`StoreError`] is, and otherwise a fault in
+/// Ravel's own storage rather than in the caller's statement (500).
 /// [`RavelBucketProbeFailure::Inconclusive`] (the candidate's read answered
-/// neither a hit nor a clean miss) are a failure to ask -- retryable (503).
+/// neither a hit nor a clean miss) is retryable (503).
 /// [`RavelBucketProbeFailure::SameBucket`] and
-/// [`RavelBucketProbeFailure::TenancyMarkerPresent`] are a genuine
-/// qualification verdict: the probe proves the candidate is Ravel's own
-/// bucket (422).
+/// [`RavelBucketProbeFailure::TenancyMarkerPresent`] are a qualification
+/// verdict: the probe proves the candidate is Ravel's own bucket (422).
 fn ravel_bucket_probe_class(err: &RavelBucketProbeFailure) -> DdlErrorClass {
     match err {
-        RavelBucketProbeFailure::ProbeWriteFailed { .. }
-        | RavelBucketProbeFailure::Inconclusive { .. } => DdlErrorClass::Unavailable,
+        RavelBucketProbeFailure::ProbeWriteFailed { source, .. } => {
+            if source.is_retryable() {
+                DdlErrorClass::Unavailable
+            } else {
+                DdlErrorClass::Internal
+            }
+        }
+        RavelBucketProbeFailure::Inconclusive { .. } => DdlErrorClass::Unavailable,
         RavelBucketProbeFailure::SameBucket { .. }
         | RavelBucketProbeFailure::TenancyMarkerPresent { .. } => DdlErrorClass::Unsupported,
     }
@@ -782,6 +809,10 @@ mod tests {
         StoreError::Transient(SENTINEL.to_string())
     }
 
+    fn permanent_sentinel_store_error() -> StoreError {
+        StoreError::Permanent(SENTINEL.to_string())
+    }
+
     #[test]
     fn validation_is_bad_request() {
         let err = DdlExecuteError::Validation(DdlValidationError::Empty);
@@ -833,10 +864,10 @@ mod tests {
         assert_eq!(err.class(), DdlErrorClass::Unsupported);
     }
 
-    // `PreconditionProbeFailure::Head` and `::MatchingPinRefused` are a
-    // failure to ask (a HEAD or a matching-pin read that itself errored),
-    // never a qualification verdict: `Unavailable`, and `client_message`
-    // must redact the inner `StoreError` rather than echo `self.to_string()`.
+    // `PreconditionProbeFailure::Head` and `::MatchingPinRefused` with a
+    // retryable `StoreError` are a failure to ask: `Unavailable`, and
+    // `client_message` must redact the inner `StoreError` rather than echo
+    // `self.to_string()`.
 
     #[test]
     fn precondition_probe_head_is_unavailable_and_redacted() {
@@ -893,7 +924,7 @@ mod tests {
             location: "s3://b/p".to_string(),
             source: PreconditionProbeFailure::WrongPinWrongError {
                 key: "k".to_string(),
-                source: sentinel_store_error(),
+                source: permanent_sentinel_store_error(),
             },
         };
         assert_eq!(err.class(), DdlErrorClass::Unsupported);
@@ -902,9 +933,77 @@ mod tests {
         assert!(!message.contains(SENTINEL), "{message}");
     }
 
-    // `ProbeWriteFailed` and `Inconclusive` are a failure to ask (the probe
-    // object never reached Ravel's own bucket, or the candidate's read had
-    // no clean answer): `Unavailable`, redacted.
+    // A retryable store error on the wrong-pin read is a failure to ask, not
+    // a verdict on the store's precondition support.
+    #[test]
+    fn precondition_probe_wrong_pin_transient_error_is_unavailable() {
+        let err = DdlExecuteError::PreconditionProbe {
+            location: "s3://b/p".to_string(),
+            source: PreconditionProbeFailure::WrongPinWrongError {
+                key: "k".to_string(),
+                source: sentinel_store_error(),
+            },
+        };
+        assert_eq!(err.class(), DdlErrorClass::Unavailable);
+        assert_eq!(err.client_message(), crate::error::MSG_UNAVAILABLE);
+    }
+
+    // A HEAD or a matching-pin read the store refuses permanently is an
+    // answer: retrying it gets the same refusal, so it is not `Unavailable`.
+    #[test]
+    fn precondition_probe_permanent_head_refusal_is_unsupported_and_redacted() {
+        let err = DdlExecuteError::PreconditionProbe {
+            location: "s3://b/p".to_string(),
+            source: PreconditionProbeFailure::Head {
+                key: "k".to_string(),
+                source: StoreError::AccessDenied(SENTINEL.to_string()),
+            },
+        };
+        assert_eq!(err.class(), DdlErrorClass::Unsupported);
+        let message = err.client_message();
+        assert!(message.contains("s3://b/p"), "{message}");
+        assert!(
+            message.contains("refused a read of the probe object"),
+            "{message}"
+        );
+        assert!(!message.contains(SENTINEL), "{message}");
+    }
+
+    #[test]
+    fn precondition_probe_permanent_matching_pin_refusal_is_unsupported_and_redacted() {
+        let err = DdlExecuteError::PreconditionProbe {
+            location: "s3://b/p".to_string(),
+            source: PreconditionProbeFailure::MatchingPinRefused {
+                key: "k".to_string(),
+                source: permanent_sentinel_store_error(),
+            },
+        };
+        assert_eq!(err.class(), DdlErrorClass::Unsupported);
+        let message = err.client_message();
+        assert!(message.contains("s3://b/p"), "{message}");
+        assert!(!message.contains(SENTINEL), "{message}");
+    }
+
+    // A probe write into Ravel's own bucket that fails permanently is a
+    // fault in Ravel's storage, not in the caller's statement.
+    #[test]
+    fn ravel_bucket_probe_permanent_write_failure_is_internal_and_redacted() {
+        let err = DdlExecuteError::RavelBucketProbe {
+            location: "s3://b/p".to_string(),
+            source: RavelBucketProbeFailure::ProbeWriteFailed {
+                key: "k".to_string(),
+                source: permanent_sentinel_store_error(),
+            },
+        };
+        assert_eq!(err.class(), DdlErrorClass::Internal);
+        let message = err.client_message();
+        assert_eq!(message, crate::error::MSG_INTERNAL);
+        assert!(!message.contains(SENTINEL), "{message}");
+    }
+
+    // A retryable `ProbeWriteFailed` and `Inconclusive` are a failure to ask
+    // (the probe object never reached Ravel's own bucket, or the candidate's
+    // read had no clean answer): `Unavailable`, redacted.
 
     #[test]
     fn ravel_bucket_probe_write_failed_is_unavailable_and_redacted() {
