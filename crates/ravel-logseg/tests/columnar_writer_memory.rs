@@ -26,9 +26,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
+use ravel_logseg::footer::{kind, open};
+use ravel_logseg::page_dir::PageDir;
 use ravel_logseg::{
     AttrValue, Bitmap, ColumnarLogBatch, DynColumn, FieldType, LogStreamId, ObjectIdentity,
-    RlogConfig, RlogWriter, VarBytes, stream_attrs_bytes,
+    RlogConfig, RlogWriter, VarBytes, read_section, stream_attrs_bytes,
 };
 use stats_alloc::{INSTRUMENTED_SYSTEM, StatsAlloc};
 
@@ -50,15 +52,24 @@ const HASH_8K: &str = "dbb42113e56ee30e68497dbcd643aef00fc94acd5632d204b5f1ce648
 const HASH_64K: &str = "1ecb7bc1e46b0239d8d5c08f7db708d4408bbc658ff808beb8728a40e1d1f68e";
 
 /// Peak-live-bytes bound as a multiple of the total cell payload `P`. Measured
-/// K = peak(65536) / P = 1.865 after the fix; rounded up to the next 0.5. The
-/// pre-fix writer measured K ~= 44 (peak ~4.0 GB against P ~90 MB), so this
-/// bound is red before the fix by more than an order of magnitude.
+/// K = peak(65536) / P = 1.676 (151,509,919 over 90,400,596); rounded up to the
+/// next 0.5. The pre-fix writer measured K ~= 44 (peak ~4.0 GB against P ~90
+/// MB), so this bound is red before the fix by more than an order of magnitude.
 const K_PEAK_OVER_P: f64 = 2.0;
 
 /// Peak-memory ratio between the two batch sizes. The fix makes the peak
-/// independent of batch size (measured 1.16); the pre-fix writer's peak is
+/// independent of batch size (measured 1.242); the pre-fix writer's peak is
 /// linear in batch size, so this ratio was ~7 (8x the rows, ~8x the peak).
 const MAX_BATCH_PEAK_RATIO: f64 = 2.0;
+
+/// Peak-live-bytes bound over `P` for the group fixture: 65,536 rows in 2,048-row
+/// blocks, one full 32-block row group, short repeated strings, so every string
+/// chunk takes a row-group dictionary. Until the group flushes the writer holds
+/// a u32 id per present string cell (27 Str columns at 90% present plus body and
+/// severity_text, about 1.72M cells or 6.9 MB, 17% of `P`) and a 16-entry
+/// interner per column. Measured K = 1.521 (63,250,642 over 41,582,596); rounded
+/// up to the next 0.5.
+const K_GROUP_PEAK_OVER_P: f64 = 2.0;
 
 /// A deterministic pool of variable-length strings (8..=64 bytes). Low
 /// cardinality so the compressed BLOCKS section stays small relative to one
@@ -81,8 +92,7 @@ fn string_pool() -> Vec<Vec<u8>> {
 /// one stream, deterministically. Returns the batch and `P`, the total resolved
 /// cell payload in bytes (string/bytes cells count their length, numeric cells
 /// 8), computed from the batch itself.
-fn build_batch(n: usize) -> (ColumnarLogBatch, u64) {
-    let pool = string_pool();
+fn build_batch(n: usize, pool: &[Vec<u8>]) -> (ColumnarLogBatch, u64) {
     let mut batch = ColumnarLogBatch::new();
     batch.num_rows = n;
 
@@ -160,12 +170,12 @@ fn build_batch(n: usize) -> (ColumnarLogBatch, u64) {
     (batch, p)
 }
 
-fn cfg() -> RlogConfig {
+/// Record-count governed, uniform blocks of `block_target_records` rows, so one
+/// block's working set is the same constant regardless of the batch size;
+/// block_max_bytes is lifted out of the way.
+fn cfg(block_target_records: usize) -> RlogConfig {
     RlogConfig {
-        // Record-count governed, uniform 8192-row blocks at both batch sizes,
-        // so one block's working set is the same constant regardless of the
-        // batch size; block_max_bytes is lifted out of the way.
-        block_target_records: 8192,
+        block_target_records,
         block_max_bytes: 1 << 30,
         ..RlogConfig::default()
     }
@@ -215,22 +225,51 @@ fn measure_peak<R, F: FnOnce() -> R>(f: F) -> (R, usize) {
     (r, peak.load(Ordering::Relaxed))
 }
 
-/// Builds one object through the columnar writer, returning its bytes, `P`, and
-/// the peak live bytes during `finish`.
-fn build_object(n: usize) -> (Vec<u8>, u64, usize) {
-    let (batch, p) = build_batch(n);
+/// Builds one object of `n` rows over `pool` in blocks of `block_rows` through
+/// the columnar writer, returning its bytes, `P`, and the peak live bytes
+/// during `push_columnar` and `finish`.
+fn build_object(n: usize, block_rows: usize, pool: &[Vec<u8>]) -> (Vec<u8>, u64, usize) {
+    let (batch, p) = build_batch(n, pool);
     let (bytes, peak) = measure_peak(|| {
-        let mut w = RlogWriter::new(cfg(), identity());
+        let mut w = RlogWriter::new(cfg(block_rows), identity());
         w.push_columnar(batch).expect("push");
         w.finish().expect("finish")
     });
     (bytes, p, peak)
 }
 
+/// Sixteen 3-byte strings, so every string column of the group fixture repeats
+/// enough to take a row-group dictionary.
+fn short_pool() -> Vec<Vec<u8>> {
+    (0..16u32)
+        .map(|i| format!("s{i:02}").into_bytes())
+        .collect()
+}
+
+/// The group fixture's PAGE_DIR: its row groups' block counts, and how many of
+/// its chunks store a row-group dictionary.
+fn group_shape(object: &[u8]) -> (Vec<u32>, usize) {
+    let cfg = RlogConfig::default();
+    let ftr = open(object).expect("open");
+    let raw = read_section(object, ftr.section(kind::PAGE_DIR).expect("PAGE_DIR"), &cfg)
+        .expect("read PAGE_DIR");
+    let dir = PageDir::decode(&raw).expect("decode PAGE_DIR");
+    let blocks = dir.groups.iter().map(|g| g.block_count).collect();
+    let dicts = dir
+        .groups
+        .iter()
+        .flat_map(|g| &g.chunks)
+        .filter(|c| c.dict_page().is_some())
+        .count();
+    (blocks, dicts)
+}
+
 #[test]
 fn columnar_writer_peak_is_bounded_and_batch_independent() {
-    let (obj8k, _p8k, peak8k) = build_object(8_192);
-    let (obj64k, p64k, peak64k) = build_object(65_536);
+    let pool = string_pool();
+    let (obj8k, _p8k, peak8k) = build_object(8_192, 8_192, &pool);
+    let (obj64k, p64k, peak64k) = build_object(65_536, 8_192, &pool);
+    let (obj_group, p_group, peak_group) = build_object(65_536, 2_048, &short_pool());
 
     // Byte identity: the fix must not change any output byte.
     assert_eq!(
@@ -265,9 +304,22 @@ fn columnar_writer_peak_is_bounded_and_batch_independent() {
          peak(8192)={peak8k}, peak(65536)={peak64k}",
     );
 
+    // A full row group of dictionary chunks holds its string ids for all 32
+    // blocks until the group flushes.
+    assert_eq!(group_shape(&obj_group), (vec![32], 29));
+    let bound = (K_GROUP_PEAK_OVER_P * p_group as f64) as usize;
+    assert!(
+        peak_group <= bound,
+        "group peak {peak_group} exceeds K*P: K={K_GROUP_PEAK_OVER_P}, P={p_group}, \
+         bound={bound} (measured K={:.3})",
+        peak_group as f64 / p_group as f64,
+    );
+
     eprintln!(
         "peak(8192)={peak8k} peak(65536)={peak64k} P(65536)={p64k} \
-         K={:.3} ratio={ratio:.3}",
+         K={:.3} ratio={ratio:.3} peak(group)={peak_group} P(group)={p_group} \
+         K(group)={:.3}",
         peak64k as f64 / p64k as f64,
+        peak_group as f64 / p_group as f64,
     );
 }
