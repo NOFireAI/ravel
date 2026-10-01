@@ -1830,6 +1830,21 @@ fn validated_ingest_config(config: IngestConfig, signal: Signal) -> anyhow::Resu
     Ok(config)
 }
 
+/// Runs each loop's own spawn-site interval refusal before [`start`] spawns
+/// anything, so a zero fold, maintain, alert-evaluation, or JWKS-refresh
+/// interval fails startup with that loop's typed error instead of leaving the
+/// tasks spawned ahead of it running. Mode is not consulted: the refusal holds
+/// wherever the config enables the loop, as `Cli::validate` refuses the flags.
+fn validate_loop_intervals(config: &ServerConfig) -> anyhow::Result<()> {
+    config.fold.check_spawnable()?;
+    config.maintain.check_spawnable()?;
+    config.alerting.check_spawnable()?;
+    if let Some(params) = &config.oidc_refresh {
+        params.check_spawnable()?;
+    }
+    Ok(())
+}
+
 /// Refuses a `--idle-flush-byte-floor` at or above `--min-flush-bytes` in
 /// every [`Mode`], so a process that builds no ingest router (`--mode query`,
 /// `--mode maintain`) cannot start on a flag combination its help says is
@@ -2015,6 +2030,7 @@ pub async fn start_with_heartbeat(
     heartbeat: health_listener::Heartbeat,
 ) -> anyhow::Result<Running> {
     validate_idle_flush_byte_floor(&config)?;
+    validate_loop_intervals(&config)?;
 
     // Install the rustls process-level crypto provider before any TLS endpoint
     // is built (ADR-0071 amendment decision 1: the dedicated fragment listener
@@ -3262,7 +3278,7 @@ pub async fn start_with_heartbeat(
             live_set_rx,
             maintain_clock.clone(),
             fold_loop_metrics.clone(),
-        )
+        )?
     } else {
         fold::FoldTasks::none()
     };
@@ -3303,7 +3319,7 @@ pub async fn start_with_heartbeat(
             maintain::SpawnError::GcConfig(e) => {
                 anyhow::anyhow!("maintain GC-config skew re-assert failed against sys/gc: {e}")
             }
-            other => anyhow::anyhow!("maintain task refused to start: {other}"),
+            other => anyhow::Error::new(other).context("maintain task refused to start"),
         })?
     } else {
         maintain::MaintenanceTasks::none()
@@ -3802,7 +3818,7 @@ pub async fn start_with_heartbeat(
                 )
             })?;
             tracing::info!(jwks_url = %params.jwks_url, "OIDC JWKS loaded; starting refresh task");
-            tenant::spawn_jwks_refresh(params)
+            tenant::spawn_jwks_refresh(params)?
         }
         None => tenant::JwksRefreshTask::none(),
     };
