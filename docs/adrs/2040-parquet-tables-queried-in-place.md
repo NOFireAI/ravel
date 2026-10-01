@@ -909,12 +909,17 @@ unstated for `CREATE`.
   SQL `DoGet` reads it again too. A cache may be added later; until then
   the D4 test reads "on the next query".
 - **A dropped table is an unknown table.** D3 named a typed `TableNotFound`
-  error. A dropped table plans like a name that was never created: the
-  same error class, on every resolve path, and its files
-  are never read (`a_dropped_table_beside_samples_is_an_unknown_table` and
+  error. On every path that resolves a table's newest manifest (planning a
+  query, and Flight SQL's `GetFlightInfo`), a dropped table plans like a
+  name that was never created: the same error class, and its files are
+  never read (`a_dropped_table_beside_samples_is_an_unknown_table` and
   `a_dropped_table_without_a_profile_file_is_an_unknown_table`). A caller
   cannot tell a dropped table from one that never existed, which is the
-  same information a caller without the table's name already has.
+  same information a caller without the table's name already has. A Flight
+  SQL ticket minted before the drop still streams the version it pinned:
+  the drop is a newer manifest version, and `DoGet` reads only the pinned
+  one. A `DROP` therefore does not stop a Flight read already in flight,
+  just as deleting committed data does not stop a pinned segment read.
 - **What bounds a `CREATE`.** D2 bounds a `CREATE` by the 100,000-file cap,
   the shared `GetLimiter` and the SQL deadline. Two further rules apply.
   - Each footer read reserves its bytes against the process memory budget
