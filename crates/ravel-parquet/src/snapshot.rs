@@ -494,7 +494,18 @@ async fn read_file(
         FooterRange::Suffix(FOOTER_PREFETCH),
         &listed_pin,
     )
-    .await?;
+    .await
+    .map_err(|err| match err {
+        // The object exists, at the pinned ETag, and has no bytes to read: an
+        // endpoint that answers this suffix read with a 416 instead of an
+        // empty body is reporting the same thing `size == 0` below reports
+        // for one that answers it.
+        SnapshotError::Store {
+            source: StoreError::InvalidRange(_),
+            ..
+        } => SnapshotError::EmptyFile { key: key.clone() },
+        other => other,
+    })?;
     let size = tail.outcome.total_size;
     if size == 0 {
         return Err(SnapshotError::EmptyFile { key: key.clone() });
@@ -673,6 +684,11 @@ mod tests {
         /// call numbered here, to synthesize a long-footer second read that
         /// disagrees with the first without racing a real overwrite.
         lie_pin_version_on_call: Option<(usize, String)>,
+        /// Answer the first `get_pinned` call with `StoreError::InvalidRange`
+        /// instead of calling through, simulating an endpoint that rejects a
+        /// suffix read against a 0-byte object with a 416 rather than
+        /// answering it with an empty body.
+        invalid_range_on_first_get: bool,
         /// Serve `.csv` keys instead of `.parquet` ones from `synthetic`, so
         /// a synthetic listing can exercise the skip-and-count path instead
         /// of the candidate path.
@@ -752,6 +768,11 @@ mod tests {
                 gets.push((key.to_string(), range, pin.clone()));
                 gets.len()
             };
+            if self.invalid_range_on_first_get && call == 1 {
+                return Err(StoreError::InvalidRange(
+                    "zero-length suffix not satisfiable".to_string(),
+                ));
+            }
             let mut sent_pin = pin.clone();
             if self.misreport_listing {
                 sent_pin.etag = sent_pin.etag.trim_start_matches("listed:").to_string();
@@ -909,6 +930,25 @@ mod tests {
     async fn a_zero_byte_file_refuses_naming_it() {
         let store = two_files().await;
         put(store.inner(), "data/c.parquet", Bytes::new()).await;
+        match snapshot(&store, "s3://lake/data/").await {
+            Err(SnapshotError::EmptyFile { key }) => assert_eq!(key, "data/c.parquet"),
+            other => panic!("expected EmptyFile, got {other:?}"),
+        }
+    }
+
+    /// An endpoint that answers a suffix read of a 0-byte object with a 416
+    /// (`InvalidRange`) instead of an empty body: the object exists, at the
+    /// pinned ETag, and simply has no bytes to read, so this is `EmptyFile`,
+    /// not a generic `Store` error. Mutation that fails it: dropping the
+    /// `InvalidRange` mapping on the first footer read reports `Store`
+    /// instead.
+    #[tokio::test]
+    async fn an_invalid_range_on_the_first_footer_read_refuses_as_empty_file() {
+        let store = Scripted {
+            invalid_range_on_first_get: true,
+            ..Scripted::default()
+        };
+        put(&store, "data/c.parquet", Bytes::new()).await;
         match snapshot(&store, "s3://lake/data/").await {
             Err(SnapshotError::EmptyFile { key }) => assert_eq!(key, "data/c.parquet"),
             other => panic!("expected EmptyFile, got {other:?}"),
