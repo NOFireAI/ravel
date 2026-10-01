@@ -136,6 +136,39 @@ pub enum RecordError {
     Decode(#[from] prost::DecodeError),
 }
 
+impl RecordError {
+    /// True when the commit or compaction record carries a format version
+    /// above the highest this build reads: a peer on a newer build can read it
+    /// during a rolling upgrade, so a query surface answers it as retryable. A
+    /// version below the supported floor (proto3's default 0, an unstamped
+    /// field) is false, like every other variant: it is a fault in immutable
+    /// stored bytes that no build reads.
+    ///
+    /// Every variant is named, so a new one fails to compile until it is
+    /// classified here.
+    pub fn is_newer_format_version(&self) -> bool {
+        match self {
+            RecordError::UnsupportedFormatVersion { expected, actual } => actual > expected,
+            RecordError::UnsupportedRecordFormatVersion { max, actual, .. } => actual > max,
+
+            RecordError::InvalidTenantHashLen(_)
+            | RecordError::InvalidContentHashLen(_)
+            | RecordError::EventTsOutOfOrder { .. }
+            | RecordError::IngestTsOutOfOrder { .. }
+            | RecordError::IngestHourInconsistent { .. }
+            | RecordError::InvalidWriterId(_)
+            | RecordError::SupersededRecordKeyOnVersionOne(_)
+            | RecordError::MissingSupersededRecordKey
+            | RecordError::InvalidSupersededRecordKey(_)
+            | RecordError::NonCanonicalSupersededRecordKey(_)
+            | RecordError::SupersededRecordKeyBucketMismatch { .. }
+            | RecordError::SupersedingInputSetHashMismatch
+            | RecordError::Key(_)
+            | RecordError::Decode(_) => false,
+        }
+    }
+}
+
 /// Inputs to [`build`]. Every timestamp is caller-supplied: this crate never
 /// reads the system clock (ADR-0010 §1); the pinned flush identity is the
 /// writer's responsibility.
@@ -1189,6 +1222,41 @@ mod tests {
                     ));
                 }
             }
+        }
+    }
+
+    /// Only a version above the highest this build reads is newer; the same
+    /// unsupported-version variants below the floor, and every non-version
+    /// fault, are not.
+    #[test]
+    fn only_a_version_above_the_ceiling_is_newer() {
+        let version_err = |version: u32| {
+            let mut record = build(base_input()).expect("valid record");
+            record.format_version = version;
+            validate(&record).expect_err("unsupported version")
+        };
+        let compaction_err = |version: u32| {
+            let mut record = sample_compaction();
+            record.format_version = version;
+            decode_compaction(&record.encode_to_vec()).expect_err("unsupported version")
+        };
+
+        assert!(version_err(FORMAT_VERSION + 1).is_newer_format_version());
+        assert!(
+            compaction_err(COMPACTION_SUPERSEDING_FORMAT_VERSION + 1).is_newer_format_version()
+        );
+
+        let not_newer = [
+            version_err(0),
+            compaction_err(0),
+            RecordError::InvalidTenantHashLen(3),
+            RecordError::SupersedingInputSetHashMismatch,
+            RecordError::Decode(
+                CommitRecord::decode(&[0xff][..]).expect_err("a lone 0xff is not a valid message"),
+            ),
+        ];
+        for err in &not_newer {
+            assert!(!err.is_newer_format_version(), "{err}");
         }
     }
 }

@@ -520,9 +520,15 @@ impl SqlError {
             // A tenant-hash mismatch would otherwise embed both hashes and
             // an object key in its `Display`; corrupt HEAD/part errors embed
             // a key and the decode failure. Neither reaches the client.
-            // A store read that failed (issue #1976: most often AccessDenied
-            // on a missing read grant) is not corruption; it redacts to the
-            // same transient message a segment store fault does.
+            // A store-side checksum mismatch is a permanent data fault, as it
+            // is under `CatalogError::Store`.
+            SqlError::ColumnStats(LoadColumnStatsError::Store {
+                source: StoreError::Corrupted(_),
+                ..
+            }) => MSG_CORRUPT.to_string(),
+            // Any other store read that failed (issue #1976: most often
+            // AccessDenied on a missing read grant) is not corruption; it
+            // redacts to the same transient message a segment store fault does.
             // A memory-budget refusal is not corruption either: it carries
             // only the budget's three figures, and retrying under less
             // pressure can succeed, so it redacts to the same transient
@@ -671,6 +677,9 @@ impl SqlError {
 ///   fault other than a checksum mismatch are retryable; an undecodable,
 ///   misfiled or structurally corrupt record, a version below the floor, and a
 ///   checksum mismatch are corrupt.
+/// - `Store` with a `StoreError::Corrupted` source, a checksum mismatch on a
+///   catalog HEAD or part GET, is corrupt: the stored bytes do not match the
+///   checksum written with them. Every other store fault keeps its class.
 /// - Transient storage faults and fold-progress/liveness failures stay
 ///   retryable, as does a `SnapshotFormat` decode job the read CPU gate
 ///   cancelled or refused while closed; a panicked decode job is corrupt.
@@ -726,6 +735,10 @@ fn redact_catalog(err: &CatalogError) -> &'static str {
             }
         }
 
+        // A checksum mismatch: the stored bytes fail the same way on every
+        // re-read. 500.
+        CatalogError::Store(StoreError::Corrupted(_)) => MSG_CORRUPT,
+
         // Transient storage faults, fold progress/liveness failures, and
         // resource backpressure: a retry (here or elsewhere) can succeed, so
         // they keep the retryable message.
@@ -738,38 +751,12 @@ fn redact_catalog(err: &CatalogError) -> &'static str {
 
 /// A commit or compaction record: retryable only for a format version above the
 /// highest this build reads. The same `RecordError` answers the same way under
-/// `CatalogError::Record` and `CatalogError::CompactionRecordDecode`. Every
-/// variant is named, so a new one fails to compile until it is classified here.
+/// `CatalogError::Record` and `CatalogError::CompactionRecordDecode`.
 fn redact_record(err: &RecordError) -> &'static str {
-    match err {
-        RecordError::UnsupportedFormatVersion { expected, actual } => {
-            if actual > expected {
-                MSG_UNAVAILABLE
-            } else {
-                MSG_CORRUPT
-            }
-        }
-        RecordError::UnsupportedRecordFormatVersion { max, actual, .. } => {
-            if actual > max {
-                MSG_UNAVAILABLE
-            } else {
-                MSG_CORRUPT
-            }
-        }
-        RecordError::InvalidTenantHashLen(_)
-        | RecordError::InvalidContentHashLen(_)
-        | RecordError::EventTsOutOfOrder { .. }
-        | RecordError::IngestTsOutOfOrder { .. }
-        | RecordError::IngestHourInconsistent { .. }
-        | RecordError::InvalidWriterId(_)
-        | RecordError::SupersededRecordKeyOnVersionOne(_)
-        | RecordError::MissingSupersededRecordKey
-        | RecordError::InvalidSupersededRecordKey(_)
-        | RecordError::NonCanonicalSupersededRecordKey(_)
-        | RecordError::SupersededRecordKeyBucketMismatch { .. }
-        | RecordError::SupersedingInputSetHashMismatch
-        | RecordError::Key(_)
-        | RecordError::Decode(_) => MSG_CORRUPT,
+    if err.is_newer_format_version() {
+        MSG_UNAVAILABLE
+    } else {
+        MSG_CORRUPT
     }
 }
 
@@ -912,8 +899,16 @@ mod tests {
         assert_eq!(err.class(), ErrorClass::Internal);
     }
 
+    /// A catalog store fault is retryable unless the store reports a checksum
+    /// mismatch, which is corrupt on the catalog path and on the column-stats
+    /// loader's own store reads alike. The PromQL boundary pins the same split.
+    ///
+    /// FLIP: drop the `CatalogError::Store(StoreError::Corrupted(_))` arm of
+    /// `redact_catalog` and the first corrupt case fails with
+    /// `left: "upstream storage temporarily unavailable"`,
+    /// `right: "stored data failed integrity validation"`.
     #[test]
-    fn catalog_store_error_redacts_to_unavailable() {
+    fn catalog_store_error_is_unavailable_unless_a_checksum_mismatch() {
         let err = SqlError::Catalog(CatalogError::Store(StoreError::Permanent(
             RAW_STORE_TEXT.to_string(),
         )));
@@ -921,6 +916,21 @@ mod tests {
         assert_eq!(err.client_message(), MSG_UNAVAILABLE);
         assert_redacted(&err.client_message());
         assert_eq!(err.class(), ErrorClass::Unavailable);
+
+        let corrupt = [
+            SqlError::Catalog(CatalogError::Store(StoreError::Corrupted(
+                RAW_STORE_TEXT.to_string(),
+            ))),
+            SqlError::ColumnStats(LoadColumnStatsError::Store {
+                key: LEAKY_KEY.to_string(),
+                source: StoreError::Corrupted(RAW_STORE_TEXT.to_string()),
+            }),
+        ];
+        for err in &corrupt {
+            assert_eq!(err.client_message(), MSG_CORRUPT, "{err}");
+            assert_redacted(&err.client_message());
+            assert_eq!(err.class(), ErrorClass::Internal, "{err}");
+        }
     }
 
     /// A provisioning record above the read ceiling, a lost CAS race and a

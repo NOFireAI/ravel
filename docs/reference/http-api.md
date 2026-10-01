@@ -170,7 +170,8 @@ For the query routes, the status codes come from one shared error mapping:
   rolling upgrade, a provisioning record written in a format version above
   the highest this build reads, a catalog decode job the read CPU gate
   cancelled at shutdown, or an unsatisfiable `min_commit_token`. Retryable. A
-  column-statistics object this build cannot decode answers no error: the
+  store fault that is a checksum mismatch answers 500 instead, on a catalog
+  read as on a segment fetch. A column-statistics object this build cannot decode answers no error: the
   query reads the data instead.
 - 504 `timeout`: the query passed its deadline.
 - 401 `unauthorized`: no resolvable credential.

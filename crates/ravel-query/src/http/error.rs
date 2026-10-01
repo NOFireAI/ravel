@@ -200,7 +200,9 @@ impl From<QueryError> for ApiError {
 /// newer build can read it during a rolling upgrade. An erasure request's or
 /// rewrite record's unknown signal is corrupt at every value, since it is read
 /// only under its own signal's key prefix, and a provisioning fault takes the
-/// class [`ravel_catalog::ProvisioningError::is_retryable`] gives it. Every
+/// class [`ravel_catalog::ProvisioningError::is_retryable`] gives it. A catalog
+/// store fault is retryable except a checksum mismatch (`StoreError::Corrupted`),
+/// which is corrupt. Every
 /// catalog variant is named (no wildcard) so a new one fails to compile until
 /// it is classified.
 fn redacted_storage_message(err: &QueryError) -> Option<&'static str> {
@@ -279,6 +281,10 @@ fn redacted_storage_message(err: &QueryError) -> Option<&'static str> {
                 }
             }
 
+            // A checksum mismatch on a catalog HEAD or part GET: the stored
+            // bytes fail the same way on every re-read. 500.
+            CatalogError::Store(StoreError::Corrupted(_)) => MSG_CORRUPT,
+
             // Transient storage faults, fold progress/liveness failures, and
             // resource backpressure stay retryable.
             CatalogError::InvalidConfig(_)
@@ -294,38 +300,12 @@ fn redacted_storage_message(err: &QueryError) -> Option<&'static str> {
 
 /// A commit or compaction record: retryable only for a format version above the
 /// highest this build reads. A version below the floor (a writer that left
-/// proto3's default 0) is corrupt, since no build reads it. Every variant is
-/// named, so a new one fails to compile until it is classified here.
+/// proto3's default 0) is corrupt, since no build reads it.
 fn redacted_record_message(err: &RecordError) -> &'static str {
-    match err {
-        RecordError::UnsupportedFormatVersion { expected, actual } => {
-            if actual > expected {
-                MSG_UNAVAILABLE
-            } else {
-                MSG_CORRUPT
-            }
-        }
-        RecordError::UnsupportedRecordFormatVersion { max, actual, .. } => {
-            if actual > max {
-                MSG_UNAVAILABLE
-            } else {
-                MSG_CORRUPT
-            }
-        }
-        RecordError::InvalidTenantHashLen(_)
-        | RecordError::InvalidContentHashLen(_)
-        | RecordError::EventTsOutOfOrder { .. }
-        | RecordError::IngestTsOutOfOrder { .. }
-        | RecordError::IngestHourInconsistent { .. }
-        | RecordError::InvalidWriterId(_)
-        | RecordError::SupersededRecordKeyOnVersionOne(_)
-        | RecordError::MissingSupersededRecordKey
-        | RecordError::InvalidSupersededRecordKey(_)
-        | RecordError::NonCanonicalSupersededRecordKey(_)
-        | RecordError::SupersededRecordKeyBucketMismatch { .. }
-        | RecordError::SupersedingInputSetHashMismatch
-        | RecordError::Key(_)
-        | RecordError::Decode(_) => MSG_CORRUPT,
+    if err.is_newer_format_version() {
+        MSG_UNAVAILABLE
+    } else {
+        MSG_CORRUPT
     }
 }
 
@@ -556,15 +536,34 @@ mod tests {
         assert_redacted(&message);
     }
 
+    /// A catalog store fault is the retryable 503 unless the store reports a
+    /// checksum mismatch, which is the non-retryable 500. The SQL boundary pins
+    /// the same split.
+    ///
+    /// FLIP: drop the `CatalogError::Store(StoreError::Corrupted(_))` arm of
+    /// `redacted_storage_message` and the corrupt case fails with
+    /// `left: "upstream storage temporarily unavailable"`,
+    /// `right: "stored data failed integrity validation"`.
     #[test]
-    fn catalog_store_error_redacts_to_unavailable() {
+    fn catalog_store_error_is_503_unless_a_checksum_mismatch() {
         let err = QueryError::Catalog(CatalogError::Store(StoreError::Permanent(
             RAW_STORE_TEXT.to_string(),
         )));
         assert!(err.to_string().contains(RAW_STORE_TEXT));
-        let message = client_message(err);
-        assert_eq!(message, MSG_UNAVAILABLE);
-        assert_redacted(&message);
+        let p = ApiError::from(err).into_parts();
+        assert_eq!(p.message, MSG_UNAVAILABLE);
+        assert_redacted(&p.message);
+        assert_eq!(p.status.as_u16(), 503);
+        assert_eq!(p.error_type, "unavailable");
+
+        let corrupt = QueryError::Catalog(CatalogError::Store(StoreError::Corrupted(
+            RAW_STORE_TEXT.to_string(),
+        )));
+        let p = ApiError::from(corrupt).into_parts();
+        assert_eq!(p.message, MSG_CORRUPT);
+        assert_redacted(&p.message);
+        assert_eq!(p.status.as_u16(), 500);
+        assert_eq!(p.error_type, "internal");
     }
 
     /// A decode failure of stored catalog bytes whose format version this build
