@@ -191,8 +191,12 @@ fn command_is_write(command: &Command) -> bool {
         Command::TypedAttrColumn { command } => {
             matches!(command, TypedAttrColumnCommand::Set { .. })
         }
-        // Both have only a `show`; this build cannot write the fields.
-        Command::ClusteringKey { .. } | Command::BloomScope { .. } => false,
+        // `set` and `clear` swap the tenant's config record; `show` reads it.
+        Command::ClusteringKey { command } => matches!(
+            command,
+            ClusteringKeyCommand::Set { .. } | ClusteringKeyCommand::Clear { .. }
+        ),
+        Command::BloomScope { command } => matches!(command, BloomScopeCommand::Set { .. }),
         Command::Hold { command } => {
             matches!(command, HoldCommand::Set { .. } | HoldCommand::Clear { .. })
         }
@@ -378,14 +382,14 @@ enum Command {
         #[command(subcommand)]
         command: TypedAttrColumnCommand,
     },
-    /// Show a tenant's clustering key (ADR-2135 decision 1), field 13 of its
-    /// config record at `t/<tenant_hash>/config`. Read-only.
+    /// Show, set or clear a tenant's clustering key (ADR-2135 decision 1),
+    /// field 13 of its config record at `t/<tenant_hash>/config`.
     ClusteringKey {
         #[command(subcommand)]
         command: ClusteringKeyCommand,
     },
-    /// Show a tenant's bloom scope (ADR-2135), field 14 of its config record at
-    /// `t/<tenant_hash>/config`. Read-only.
+    /// Show or set a tenant's bloom scope (ADR-2135), field 14 of its config
+    /// record at `t/<tenant_hash>/config`.
     BloomScope {
         #[command(subcommand)]
         command: BloomScopeCommand,
@@ -943,13 +947,43 @@ enum TenantTokenCommand {
 
 #[derive(Debug, Subcommand)]
 enum ClusteringKeyCommand {
-    /// Print the tenant's clustering key: never set, cleared at a generation,
+    /// Print the tenant's clustering key: never set, absent at a generation,
     /// or set, with its columns and their declared types, bucket width and
     /// generation. A stored key the record's validation refuses is an error.
     Show {
         /// The tenant whose clustering key to print.
         #[arg(long)]
         tenant: String,
+    },
+    /// Set the tenant's clustering key at the stored clustering generation
+    /// plus one, writing a version-3 config record. Every column must be a
+    /// typed attribute column the tenant's config record itself declares, at
+    /// most four, each named once; a refused key writes nothing. Log objects
+    /// flushed after an ingest process reads the new record sort by
+    /// (stream, time bucket, key columns, timestamp); objects already written
+    /// keep their order.
+    Set {
+        /// The tenant whose clustering key to set.
+        #[arg(long)]
+        tenant: String,
+        /// A key column, in key order; repeat or list several.
+        #[arg(long = "column", value_name = "NAME", required = true, num_args = 1..)]
+        columns: Vec<String>,
+        /// The time bucket width that leads the key.
+        #[arg(long, value_enum)]
+        bucket_width: ravel_cli::storage_layout::BucketWidthArg,
+        #[command(flatten)]
+        rollout: ReadersRolledOutArg,
+    },
+    /// Clear the tenant's clustering key at the stored clustering generation
+    /// plus one, keeping the generation in a version-3 config record. Refused,
+    /// writing nothing, when the tenant has no key to clear.
+    Clear {
+        /// The tenant whose clustering key to clear.
+        #[arg(long)]
+        tenant: String,
+        #[command(flatten)]
+        rollout: ReadersRolledOutArg,
     },
 }
 
@@ -962,6 +996,41 @@ enum BloomScopeCommand {
         #[arg(long)]
         tenant: String,
     },
+    /// Set the tenant's bloom scope, writing a version-3 config record. A
+    /// change increments the clustering generation and leaves the clustering
+    /// key as it is; the scope already stored writes nothing.
+    Set {
+        /// The tenant whose bloom scope to set.
+        #[arg(long)]
+        tenant: String,
+        /// Which string columns get bloom filters.
+        #[arg(long, value_enum)]
+        scope: ravel_cli::storage_layout::BloomScopeArg,
+        #[command(flatten)]
+        rollout: ReadersRolledOutArg,
+    },
+}
+
+/// The storage-layout write opt-in every clustering-key and bloom-scope write
+/// requires (ADR-0066 R1); without it the command exits 2 before any store
+/// request.
+#[derive(Debug, clap::Args)]
+struct ReadersRolledOutArg {
+    /// Assert that every process reading this bucket's tenant config runs a
+    /// release that reads record version 3; a process that does not refuses
+    /// the record, and that tenant's ingest and lifecycle fail closed.
+    #[arg(long, required = true)]
+    readers_rolled_out: bool,
+}
+
+impl ReadersRolledOutArg {
+    fn write(&self) -> ravel_catalog::StorageLayoutWrite {
+        if self.readers_rolled_out {
+            ravel_catalog::StorageLayoutWrite::ReadersRolledOut
+        } else {
+            ravel_catalog::StorageLayoutWrite::Disabled
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -2178,11 +2247,58 @@ async fn main() -> anyhow::Result<()> {
             ravel_cli::storage_layout::clustering_key_show(store::build_store(&cli.store)?, &tenant)
                 .await
         }
+        Command::ClusteringKey {
+            command:
+                ClusteringKeyCommand::Set {
+                    tenant,
+                    columns,
+                    bucket_width,
+                    rollout,
+                },
+        } => {
+            ravel_cli::storage_layout::clustering_key_set(
+                store::build_store(&cli.store)?,
+                &tenant,
+                columns,
+                bucket_width,
+                rollout.write(),
+                now_ns()?,
+            )
+            .await
+        }
+        Command::ClusteringKey {
+            command: ClusteringKeyCommand::Clear { tenant, rollout },
+        } => {
+            ravel_cli::storage_layout::clustering_key_clear(
+                store::build_store(&cli.store)?,
+                &tenant,
+                rollout.write(),
+                now_ns()?,
+            )
+            .await
+        }
         Command::BloomScope {
             command: BloomScopeCommand::Show { tenant },
         } => {
             ravel_cli::storage_layout::bloom_scope_show(store::build_store(&cli.store)?, &tenant)
                 .await
+        }
+        Command::BloomScope {
+            command:
+                BloomScopeCommand::Set {
+                    tenant,
+                    scope,
+                    rollout,
+                },
+        } => {
+            ravel_cli::storage_layout::bloom_scope_set(
+                store::build_store(&cli.store)?,
+                &tenant,
+                scope,
+                rollout.write(),
+                now_ns()?,
+            )
+            .await
         }
         Command::TypedAttrColumn {
             command:
@@ -3539,8 +3655,9 @@ mod tests {
         }
     }
 
-    /// Issue #1184's classification: `load`, `typed-attr-column set`, `hold
-    /// set`/`clear`, `erase submit`, `provision adopt`/`reshard`, `gc-config
+    /// Issue #1184's classification: `load`, `typed-attr-column set`,
+    /// `clustering-key set`/`clear`, `bloom-scope set`, `hold set`/`clear`,
+    /// `erase submit`, `provision adopt`/`reshard`, `gc-config
     /// set`, `commit reconstruct`, `catalog fold`, and the mutating `maintain`
     /// subcommands write; their `show`/`list`/`status`/`decode`/`inspect`
     /// siblings do not, and neither do the bucket-root writers `store
@@ -3564,6 +3681,47 @@ mod tests {
             ),
             (&["ravel", "typed-attr-column", "set", "t", "k:str"], true),
             (&["ravel", "typed-attr-column", "show", "t"], false),
+            (
+                &[
+                    "ravel",
+                    "clustering-key",
+                    "set",
+                    "--tenant",
+                    "t",
+                    "--column",
+                    "k",
+                    "--bucket-width",
+                    "6h",
+                    "--readers-rolled-out",
+                ],
+                true,
+            ),
+            (
+                &[
+                    "ravel",
+                    "clustering-key",
+                    "clear",
+                    "--tenant",
+                    "t",
+                    "--readers-rolled-out",
+                ],
+                true,
+            ),
+            (&["ravel", "clustering-key", "show", "--tenant", "t"], false),
+            (
+                &[
+                    "ravel",
+                    "bloom-scope",
+                    "set",
+                    "--tenant",
+                    "t",
+                    "--scope",
+                    "text",
+                    "--readers-rolled-out",
+                ],
+                true,
+            ),
+            (&["ravel", "bloom-scope", "show", "--tenant", "t"], false),
             (
                 &["ravel", "hold", "set", "--tenant", "t", "--scope", "t/x/"],
                 true,
