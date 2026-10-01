@@ -1473,7 +1473,11 @@ pub(crate) fn map_error_common(e: object_store::Error) -> StoreError {
 /// `object_store` keeps a failed response's body only inside its crate-private
 /// `RetryError`, whose `Display` ends with the body, so the text is the one
 /// place the code survives. `None` when the response had no XML error body.
-fn s3_error_code(source: &(dyn std::error::Error + Send + Sync + 'static)) -> Option<String> {
+/// Azure Blob Storage and the GCS XML API wrap their codes in the same
+/// envelope, so the external store reads theirs through this too.
+pub(crate) fn s3_error_code(
+    source: &(dyn std::error::Error + Send + Sync + 'static),
+) -> Option<String> {
     let text = source.to_string();
     let start = text.find("<Error>")?;
     bucket_config::parse_error_code(&text.as_bytes()[start..])

@@ -545,6 +545,38 @@ fn map_external_meta(meta: object_store::ObjectMeta) -> Result<ObjectMeta, Store
     })
 }
 
+/// Error mapping for the GCS/Azure path: [`crate::s3::map_error_common`],
+/// except that a 404 or a list failure whose body names Azure's
+/// `ContainerNotFound` is [`StoreError::Permanent`], because a missing
+/// container is not a missing blob. GCS needs nothing here: its XML API answers
+/// a missing bucket with S3's `NoSuchBucket`, which the common mapping already
+/// reads as `Permanent`. A HEAD 404 has no body and stays `NotFound` on both.
+fn map_external_error(e: object_store::Error) -> StoreError {
+    missing_container(&e).unwrap_or_else(|| crate::s3::map_error_common(e))
+}
+
+/// [`map_external_error`] for a get, which also recognizes an unsatisfiable
+/// range (see [`crate::s3::map_get_error`]).
+fn map_external_get_error(e: object_store::Error) -> StoreError {
+    missing_container(&e).unwrap_or_else(|| crate::s3::map_get_error(e))
+}
+
+/// `object_store` reports the get 404 as `NotFound` and the list 404 as
+/// `Generic`; the body, and so the code, survives in the text of both. The body
+/// is left out of the message: it can echo the request.
+fn missing_container(e: &object_store::Error) -> Option<StoreError> {
+    let (context, source) = match e {
+        object_store::Error::NotFound { path, source } => (path.as_str(), source),
+        object_store::Error::Generic { store, source } => (*store, source),
+        _ => return None,
+    };
+    (crate::s3::s3_error_code(source.as_ref()).as_deref() == Some("ContainerNotFound")).then(|| {
+        StoreError::Permanent(format!(
+            "{context}: Azure container does not exist (ContainerNotFound)"
+        ))
+    })
+}
+
 /// The read half of `object_store`'s API, for the backends Ravel reaches only
 /// through an external grant. Not an [`ObjectStoreBackend`] itself: it has no
 /// write path to implement, and giving it one that refuses would put the
@@ -587,14 +619,14 @@ impl GenericStore {
                 },
             )
             .await
-            .map_err(crate::s3::map_get_error)?;
+            .map_err(map_external_get_error)?;
         let etag = result.meta.e_tag.clone().ok_or_else(|| {
             StoreError::Permanent(format!("the store returned no ETag for {key}"))
         })?;
         let reported_version = result.meta.version.clone();
         let version = reported_version.clone().unwrap_or_else(|| etag.clone());
         let total_size = result.meta.size;
-        let data = result.bytes().await.map_err(crate::s3::map_error_common)?;
+        let data = result.bytes().await.map_err(map_external_error)?;
         Ok(crate::PinnedRead {
             pin: Pin::from_store(etag.clone(), reported_version),
             outcome: GetOutcome {
@@ -613,7 +645,7 @@ impl GenericStore {
             .store
             .head(&crate::s3::path_of(key))
             .await
-            .map_err(crate::s3::map_error_common)?;
+            .map_err(map_external_error)?;
         let reported_version = raw.version.clone();
         let meta = map_external_meta(raw)?;
         let pin = Pin::from_store(meta.etag.0.clone(), reported_version);
@@ -625,7 +657,7 @@ impl GenericStore {
             .store
             .head(&crate::s3::path_of(key))
             .await
-            .map_err(crate::s3::map_error_common)?;
+            .map_err(map_external_error)?;
         map_external_meta(meta)
     }
 
@@ -651,7 +683,7 @@ impl GenericStore {
         while out.len() < EXTERNAL_PAGE_SIZE {
             match stream.next().await {
                 Some(Ok(meta)) => out.push(map_external_meta(meta)?),
-                Some(Err(e)) => return Err(crate::s3::map_error_common(e)),
+                Some(Err(e)) => return Err(map_external_error(e)),
                 None => break,
             }
         }
@@ -669,7 +701,7 @@ impl GenericStore {
             .store
             .list_with_delimiter(prefix_path.as_ref())
             .await
-            .map_err(crate::s3::map_error_common)?;
+            .map_err(map_external_error)?;
         let objects = result
             .objects
             .into_iter()
@@ -1244,5 +1276,175 @@ mod tests {
         })
         .expect_err("an object with no ETag cannot be pinned");
         assert!(matches!(err, StoreError::Permanent(_)), "got {err:?}");
+    }
+
+    /// Azure's 404 for a blob in a container that does not exist.
+    const AZURE_NO_CONTAINER: &str = "\u{feff}<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+        <Error><Code>ContainerNotFound</Code><Message>The specified container does not \
+        exist.\nRequestId:0\nTime:2026-10-01T00:00:00.0000000Z</Message></Error>";
+    /// Azure's 404 for a blob that does not exist in a container that does.
+    const AZURE_NO_BLOB: &str = "\u{feff}<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+        <Error><Code>BlobNotFound</Code><Message>The specified blob does not \
+        exist.\nRequestId:0\nTime:2026-10-01T00:00:00.0000000Z</Message></Error>";
+    /// The GCS XML API's 404 for a bucket that does not exist.
+    const GCS_NO_BUCKET: &str = "<?xml version='1.0' encoding='UTF-8'?>\
+        <Error><Code>NoSuchBucket</Code><Message>The specified bucket does not \
+        exist.</Message></Error>";
+    /// The GCS XML API's 404 for an object that does not exist.
+    const GCS_NO_OBJECT: &str = "<?xml version='1.0' encoding='UTF-8'?>\
+        <Error><Code>NoSuchKey</Code><Message>The specified key does not \
+        exist.</Message></Error>";
+
+    /// A loopback endpoint answering every request with a 404 carrying `body`,
+    /// and the method of every request it saw.
+    async fn fake_404(body: &'static str) -> (String, Arc<parking_lot::Mutex<Vec<String>>>) {
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        let app = axum::Router::new().fallback(move |method: axum::http::Method| {
+            let recorded = Arc::clone(&recorded);
+            async move {
+                recorded.lock().push(method.to_string());
+                (
+                    axum::http::StatusCode::NOT_FOUND,
+                    [(axum::http::header::CONTENT_TYPE, "application/xml")],
+                    body,
+                )
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the fake endpoint must bind a loopback port");
+        let addr = listener.local_addr().expect("a bound listener's address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn generic(store: impl OsObjectStore, suffix_range: bool) -> ExternalStore {
+        ExternalStore {
+            profile: "lake".to_string(),
+            bucket: "exports".to_string(),
+            backend: Backend::Generic(GenericStore {
+                store: Arc::new(store),
+            }),
+            suffix_range,
+        }
+    }
+
+    fn azure_at(endpoint: String) -> ExternalStore {
+        let store = MicrosoftAzureBuilder::new()
+            .with_account("devstoreaccount1")
+            .with_container_name("exports")
+            .with_endpoint(endpoint)
+            .with_allow_http(true)
+            .with_skip_signature(true)
+            .build()
+            .expect("an Azure store against the fake endpoint builds");
+        generic(store, false)
+    }
+
+    fn gcs_at(endpoint: String) -> ExternalStore {
+        let store = GoogleCloudStorageBuilder::new()
+            .with_bucket_name("exports")
+            .with_base_url(&endpoint)
+            .with_client_options(object_store::ClientOptions::new().with_allow_http(true))
+            .with_skip_signature(true)
+            .build()
+            .expect("a GCS store against the fake endpoint builds");
+        generic(store, true)
+    }
+
+    fn assert_hard_error<T: std::fmt::Debug>(
+        result: Result<T, StoreError>,
+        operation: &str,
+        code: &str,
+    ) {
+        match result {
+            Err(StoreError::Permanent(message)) => assert!(
+                message.contains(code),
+                "{operation}: the error {message:?} does not name {code}"
+            ),
+            other => panic!("{operation}: expected Permanent naming {code}, got {other:?}"),
+        }
+    }
+
+    fn assert_not_found<T: std::fmt::Debug>(result: Result<T, StoreError>, operation: &str) {
+        assert!(
+            matches!(result, Err(StoreError::NotFound)),
+            "{operation}: expected NotFound, got {result:?}"
+        );
+    }
+
+    /// Every operation that sends a GET against a missing container or bucket
+    /// reads it as a hard error, through the real `object_store` client: the
+    /// code survives in the body. A HEAD response has no body, so `head` and
+    /// `pin_of` still read `NotFound`, with exactly one HEAD each.
+    async fn assert_missing_bucket_is_hard(store: &ExternalStore, code: &str) {
+        let pin = Pin::from_store("\"e\"", None);
+        assert_hard_error(store.get("k", GetRange::Full).await, "get", code);
+        assert_hard_error(store.get("k", GetRange::Range(0, 4)).await, "get", code);
+        assert_hard_error(
+            store.get_with_pin("k", GetRange::Full).await,
+            "get_with_pin",
+            code,
+        );
+        assert_hard_error(
+            store.get_pinned("k", GetRange::Full, &pin).await,
+            "get_pinned",
+            code,
+        );
+        assert_hard_error(store.list("p/", None).await, "list", code);
+        assert_hard_error(
+            store.list_after("p/", Some("p/a"), None).await,
+            "list_after",
+            code,
+        );
+        assert_hard_error(store.list_delimited("p/").await, "list_delimited", code);
+    }
+
+    #[tokio::test]
+    async fn a_missing_azure_container_is_a_hard_error() {
+        let (endpoint, seen) = fake_404(AZURE_NO_CONTAINER).await;
+        let store = azure_at(endpoint);
+        assert_missing_bucket_is_hard(&store, "ContainerNotFound").await;
+        assert!(seen.lock().iter().all(|method| method == "GET"), "{seen:?}");
+
+        seen.lock().clear();
+        assert_not_found(store.head("k").await, "head");
+        assert_not_found(store.pin_of("k").await, "pin_of");
+        assert_eq!(*seen.lock(), ["HEAD", "HEAD"]);
+    }
+
+    #[tokio::test]
+    async fn a_missing_gcs_bucket_is_a_hard_error() {
+        let (endpoint, seen) = fake_404(GCS_NO_BUCKET).await;
+        let store = gcs_at(endpoint);
+        assert_missing_bucket_is_hard(&store, "NoSuchBucket").await;
+        assert!(seen.lock().iter().all(|method| method == "GET"), "{seen:?}");
+
+        seen.lock().clear();
+        assert_not_found(store.head("k").await, "head");
+        assert_not_found(store.pin_of("k").await, "pin_of");
+        assert_eq!(*seen.lock(), ["HEAD", "HEAD"]);
+    }
+
+    /// A missing blob or object is still `NotFound` on every read of a key.
+    #[tokio::test]
+    async fn a_missing_blob_or_object_is_still_not_found() {
+        for (kind, body) in [("azure", AZURE_NO_BLOB), ("gcs", GCS_NO_OBJECT)] {
+            let (endpoint, _) = fake_404(body).await;
+            let store = match kind {
+                "azure" => azure_at(endpoint),
+                _ => gcs_at(endpoint),
+            };
+            let pin = Pin::from_store("\"e\"", None);
+            assert_not_found(store.get("k", GetRange::Full).await, kind);
+            assert_not_found(store.get("k", GetRange::Range(0, 4)).await, kind);
+            assert_not_found(store.get_with_pin("k", GetRange::Full).await, kind);
+            assert_not_found(store.get_pinned("k", GetRange::Full, &pin).await, kind);
+            assert_not_found(store.head("k").await, kind);
+            assert_not_found(store.pin_of("k").await, kind);
+        }
     }
 }

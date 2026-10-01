@@ -452,6 +452,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   multipart, and on delete a whole-request 404 is `NotFound` only for
   `NoSuchKey`. A HEAD 404 carries no body, so `head` and `pin_of` against a
   missing bucket still read `NotFound`.
+- **A read through a missing Azure container fails instead of reading as a
+  missing blob** (issue #2297). The external store's Azure path read a 404
+  answered `ContainerNotFound` as `NotFound` on get and as a retryable error
+  on list. It is now `Permanent` on get, get_pinned, get_with_pin, list,
+  list_after and list_delimited; `BlobNotFound` stays `NotFound`. The store
+  is read-only, so it has no delete to protect. GCS needed no change: its XML
+  API answers a missing bucket with `NoSuchBucket`, which the shared mapping
+  already reads as `Permanent`, and new tests pin that. A HEAD 404 carries no
+  body, so `head` and `pin_of` against a missing container or bucket still
+  read `NotFound`.
 - **A tiered-cache miss no longer issues a duplicate GET** on success, when
   the RAM tier admits the bytes (issue #2280).
   A read that peeked both cache tiers while a GET for the same range was in
