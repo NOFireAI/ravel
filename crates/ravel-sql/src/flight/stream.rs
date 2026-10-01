@@ -713,7 +713,7 @@ async fn first_batch(
             PinnedPlanInputs {
                 declared: ticket.declared_columns.clone(),
                 parquet: ParquetPlan::Pinned(ticket.parquet_tables.clone()),
-                budgets: None,
+                budgets: ticket.budgets,
             },
         )
         .await?;

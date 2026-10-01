@@ -1091,6 +1091,13 @@ async fn the_pinned_surface_reads_the_same_rows() {
     assert_eq!(rows(&http), vec!["1", "4"]);
 }
 
+/// The keys the services from [`flight_harness`] sign their tickets with, so
+/// a test can open a ticket, change a field, and sign it again.
+#[cfg(feature = "flight-sql")]
+fn flight_ticket_keys() -> ravel_sql::SqlTicketKeys {
+    ravel_sql::SqlTicketKeys::from_file_key(b"parquet-tables-test-key")
+}
+
 /// A Flight SQL service over `lake`'s executor, authenticating `tenant` under
 /// the token `acme`.
 #[cfg(feature = "flight-sql")]
@@ -1113,7 +1120,8 @@ fn flight_harness(lake: &Lake, tenant: &TenantId) -> util::flight_harness::Harne
         ravel_query::QueryAdmissionController::shared(
             ravel_query::QueryConcurrencyLimit::Unlimited,
         ),
-    );
+    )
+    .with_ticket_keys(flight_ticket_keys());
     Harness {
         service,
         executor: Arc::clone(&lake.executor),
@@ -1905,4 +1913,157 @@ async fn a_clamped_request_budget_governs_a_parquet_query() {
         matches!(err, SqlError::RequestBudgetExceeded { max, .. } if max == total - 1),
         "{err:?}"
     );
+}
+
+/// Plan `sql` over an already-resolved statement the way the Flight service
+/// does and drain it, so a refusal at plan time or at scan time is one error.
+async fn plan_and_drain(
+    lake: &Lake,
+    tenant: TenantHash,
+    resolved: &ravel_sql::PinnedResolve,
+    sql: &str,
+    accounting: &ravel_types::accounting::QueryAccounting,
+    budgets: Option<RequestBudgets>,
+) -> Result<Vec<RecordBatch>, SqlError> {
+    let planned = lake
+        .executor
+        .plan_pinned_with_inputs(
+            tenant,
+            resolved.snapshot.clone(),
+            sql,
+            accounting,
+            ravel_sql::PinnedPlanInputs {
+                declared: Vec::new(),
+                parquet: ravel_sql::ParquetPlan::Resolved(resolved.parquet.clone()),
+                budgets,
+            },
+        )
+        .await?;
+    let mut stream = planned.execute().await?;
+    let mut batches = Vec::new();
+    while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+        batches.push(batch?);
+    }
+    Ok(batches)
+}
+
+/// A request's clamped `max_store_requests` binds the scan of a pinned plan,
+/// not only the resolve: `resolve_pinned` admits a statement at exactly its
+/// floor, and the plan built from that resolve is refused at scan by the
+/// clamped figure, not run under the executor's far higher ceiling.
+///
+/// FLIP: a plan built with `budgets: None`, which is what `plan_pinned` builds,
+/// runs the same statement to its end (the control below).
+#[tokio::test]
+async fn a_clamped_request_budget_binds_the_pinned_plans_scan() {
+    let acme = tenant("acme");
+    let sql = "SELECT sum(id) FROM hits";
+    let (resolve, _, _) = unbudgeted_cost(sql).await;
+    let floor = resolve + hits_files().len() as u64;
+
+    let lake = Lake::configured();
+    lake.hits_for(&acme).await;
+    let mut req = request(sql);
+    req.budgets = Some(RequestBudgets {
+        max_store_requests: Some(RequestLimit::Bounded(floor)),
+        ..RequestBudgets::default()
+    });
+
+    let accounting = ravel_types::accounting::QueryAccounting::new();
+    let resolved = lake
+        .executor
+        .resolve_pinned(acme, &req, &accounting)
+        .await
+        .expect("the resolve admits a budget of exactly its floor");
+    let err = plan_and_drain(&lake, acme, &resolved, sql, &accounting, req.budgets)
+        .await
+        .expect_err("refused at scan");
+    assert!(
+        matches!(
+            err,
+            SqlError::RequestBudgetExceeded { requests, max, .. }
+                if max == floor && requests > max
+        ),
+        "{err:?}"
+    );
+    assert!(Lake::gets(&lake.lake) > 0, "it got as far as reading data");
+
+    // Control: the same resolve, planned with no budgets, runs to its end.
+    let accounting = ravel_types::accounting::QueryAccounting::new();
+    let resolved = lake
+        .executor
+        .resolve_pinned(acme, &req, &accounting)
+        .await
+        .expect("resolve");
+    let batches = plan_and_drain(&lake, acme, &resolved, sql, &accounting, None)
+        .await
+        .expect("no budgets, no refusal");
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+}
+
+/// A ticket that carries a clamped `max_store_requests` has `DoGet` refuse
+/// the scan by that figure: the ticket pins the budget along with the
+/// manifests. The same ticket without it streams the rows.
+///
+/// FLIP: `DoGet` planning with `budgets: None` streams the statement under the
+/// executor's own ceiling, and the `expect_err` below fails.
+#[cfg(feature = "flight-sql")]
+#[tokio::test]
+async fn do_get_applies_the_budgets_its_ticket_carries() {
+    use arrow_flight::Ticket;
+    use arrow_flight::sql::{ProstMessageExt, TicketStatementQuery};
+    use prost::Message as _;
+    use ravel_sql::TicketSurface;
+    use util::flight_harness::{merged, statement_ticket};
+
+    let lake = Lake::configured();
+    let acme = TenantId::new("acme");
+    lake.hits_for(&acme.hash()).await;
+    let harness = flight_harness(&lake, &acme);
+    let ticket = harness
+        .get_flight_info("acme", "SELECT sum(id) FROM hits")
+        .await
+        .expect("flight info");
+
+    let keys = flight_ticket_keys();
+    let handle = statement_ticket(&ticket).statement_handle;
+    let mut decoded = keys
+        .decode(&handle, TicketSurface::Client)
+        .expect("the service's own ticket");
+    assert_eq!(decoded.budgets, None);
+    assert_eq!(decoded.parquet_tables.len(), 1);
+
+    // DoGet's own reads are the pinned manifest, the grants record, three
+    // footers and then data: a budget of five is passed on the way.
+    const BUDGET: u64 = 5;
+    decoded.budgets = Some(RequestBudgets {
+        max_store_requests: Some(RequestLimit::Bounded(BUDGET)),
+        ..RequestBudgets::default()
+    });
+    let lowered = Ticket::new(
+        TicketStatementQuery {
+            statement_handle: keys
+                .encode(&decoded, TicketSurface::Client)
+                .expect("encode")
+                .into(),
+        }
+        .as_any()
+        .encode_to_vec(),
+    );
+    let status = harness
+        .do_get("acme", &lowered)
+        .await
+        .expect_err("refused by the ticket's budget");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status
+            .message()
+            .contains(&format!("exceeding the budget of {BUDGET}")),
+        "{}",
+        status.message()
+    );
+
+    // Control: the ticket as the service minted it streams the sum.
+    let streamed = harness.do_get("acme", &ticket).await.expect("do get");
+    assert_eq!(merged(&streamed).num_rows(), 1);
 }
