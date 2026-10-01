@@ -1799,7 +1799,9 @@ job as the smoke gate.
 
 `README.md` now reads eighteen safety invariants (TypeOK plus seventeen named)
 and lists `CompletionCoversEveryBucketOpenAtRequest`; its negative-controls
-section reads eleven switch constants, nine controls and all eighteen INVARIANT
+section reads eleven switch constants, nine controls (ten from issue #1133
+onward, which promoted `HorizonGuardsPinnedQueries`/candidate-1133 to
+`negative/pinned-query-ungated.cfg`) and all eighteen INVARIANT
 lines; its Non-vacuity section records nine behaviour mutants and the new
 control; "What the model contains" gains the open ingest bucket actor and the
 two new witness fields; and the Running section records the bound move with its

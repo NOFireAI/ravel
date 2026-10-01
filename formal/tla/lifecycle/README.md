@@ -259,7 +259,7 @@ seventeen named) from `smoke.cfg` (finding 5), and names the single invariant
 it must break, so a
 guard silently deleted from the spec fails a control rather than passing
 unnoticed under a reduction that happened to dodge the other invariants. There
-are nine controls, one per `negative/*.cfg`; each has a note under
+are ten controls, one per `negative/*.cfg`; each has a note under
 `counterexamples/`.
 
 The controls run at `MaxClock = 2`, one step above the smoke lane's bound. Each
@@ -272,7 +272,7 @@ operator names the model carried at the time, so a note from an earlier round
 may name an action this spec has since split or renamed (`PerformRewrite`,
 split into `StartRewrite` and `PublishRewrite` in round eight;
 `RewriteOutputContent`, now `RecordSetContent`). Renaming them in place would
-falsify the record. The notes for the nine live controls, which describe traces
+falsify the record. The notes for the ten live controls, which describe traces
 the current lane still produces, do use the current names.
 
 The two constants added for issues #1289 and #1221 are
@@ -286,11 +286,17 @@ under an ADR-0065 membership transition, so it does not get a
 `negative/*.cfg` of its own; `counterexamples/compaction-ignores-rewrite.md`
 records what TLC finds with it `FALSE`.
 
-`HorizonGuardsPinnedQueries` is candidate #1133: with it FALSE a sweep delete
+`HorizonGuardsPinnedQueries` was candidate #1133: with it FALSE a sweep delete
 gates on the horizon and an unnamed HEAD but not on an in-window pinned query.
-`candidate-1133.cfg` runs that configuration and it is unsafe;
-`counterexamples/candidate-1133.md` has the trace. The shipped model keeps the
-switch TRUE.
+Issue #1133 shipped the fix (`crates/ravel-maintain/src/reachability.rs`'s age
+gate, anchored on the covering or neighboring snapshot part's own
+`last_modified`), so the switch is now a tenth negative control like the other
+nine: `negative/pinned-query-ungated.cfg` runs the configuration and it is
+unsafe, `counterexamples/pinned-query-ungated.md` has the trace.
+`candidate-1133.cfg` and `counterexamples/candidate-1133.md` remain as the
+original manual investigation (a different, supersession-shaped trace under a
+short invariant list); both still parse and still fail the same way. The
+shipped model keeps the switch TRUE.
 
 ## Non-vacuity
 
@@ -306,7 +312,7 @@ scratch action that mutates a raw input's content, disjuncted into `Next`,
 which is not part of the shipped model). The mutations and the exact TLC
 violation lines are recorded under `counterexamples/*-mutant.md`, except the
 `CompletionCoversEveryBucketOpenAtRequest` pair, which sits with its control in
-`counterexamples/completion-ignores-open-bucket.md`. The nine
+`counterexamples/completion-ignores-open-bucket.md`. The ten
 negative controls provide the same evidence for their target invariants by
 switch (two targets, `RewriteOutputsAreInputsMinusErased` and
 `CompletionCoversEveryBucketOpenAtRequest`, are also covered by
