@@ -418,12 +418,22 @@ impl BloomScope {
 /// the proto zero value, `ALL`, which is what an absent field 14 decodes to.
 /// Opaque for the same reason as [`StoredClusteringKey`]; read it through
 /// [`TenantConfig::bloom_scope`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Eq, Default)]
 pub struct StoredBloomScope {
     value: i32,
     /// As [`StoredClusteringKey`]'s, and always `Disabled` for the zero value,
     /// which is not written to the record.
     write: StorageLayoutWrite,
+    /// Whether [`TenantConfig::set_bloom_scope`] changed the value to this one.
+    /// The write gate refuses a scope that differs from the stored record's
+    /// without it. Not part of equality: it is not in the record.
+    from_setter: bool,
+}
+
+impl PartialEq for StoredBloomScope {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value && self.write == other.write
+    }
 }
 
 impl StoredBloomScope {
@@ -433,7 +443,11 @@ impl StoredBloomScope {
         } else {
             write
         };
-        StoredBloomScope { value, write }
+        StoredBloomScope {
+            value,
+            write,
+            from_setter: false,
+        }
     }
 
     /// Whether the record carries field 14: a zero value is not written.
@@ -493,6 +507,14 @@ pub enum StorageLayoutConfigError {
     /// set.
     #[error("there is no clustering key to clear: this tenant never set one")]
     ClusteringKeyNeverSet,
+    /// [`TenantConfig::clear_clustering_key`] on a config whose key is already
+    /// absent: cleared, or never set and given a generation by
+    /// [`TenantConfig::set_bloom_scope`].
+    #[error(
+        "there is no clustering key to clear: this tenant's clustering key is already absent at \
+         generation {generation}"
+    )]
+    ClusteringKeyAlreadyCleared { generation: u64 },
     /// A write carries a lower clustering generation than the stored record,
     /// which would let an older generation name a second key.
     #[error(
@@ -538,14 +560,35 @@ pub enum StorageLayoutConfigError {
     /// The record carries a bloom scope value this build does not know.
     #[error("the bloom scope has an unknown value {got}: it must be all, undeclared, or text")]
     UnknownBloomScope { got: i32 },
+    /// A write carries a bloom scope that differs from the stored record's and
+    /// that [`TenantConfig::set_bloom_scope`] did not produce, such as the
+    /// default `ALL` of a config built without reading the record.
+    #[error(
+        "the config carries bloom scope value {proposed} where the stored record carries \
+         {stored}, and set_bloom_scope did not produce it: change the scope only with \
+         set_bloom_scope on the config read from the record"
+    )]
+    BloomScopeChangedOutsideSetter { stored: i32, proposed: i32 },
+    /// A write carries a bloom scope that differs from the stored record's at
+    /// the same clustering generation, so one generation would name two scopes.
+    #[error(
+        "the config carries a bloom scope different from the stored record's at the same \
+         clustering generation {generation}: set_bloom_scope increments the generation, so this \
+         config was not read from the current record"
+    )]
+    BloomScopeChangedWithoutGeneration { generation: u64 },
     /// A storage-layout field was set, or reached [`set_tenant_config`],
-    /// without [`StorageLayoutWrite::ReadersRolledOut`].
+    /// without [`StorageLayoutWrite::ReadersRolledOut`]. The message names the
+    /// setter that produces the field, which is the only remediation:
+    /// [`set_tenant_config`] takes no opt-in of its own.
     #[error(
         "cannot set {field} without the storage-layout write opt-in: this build's config record \
          writer stamps format_version {writer_version} by default, and {field} needs a \
          version-{required} record, which a reader from a release that predates version \
-         {required} refuses. Opt in only once every process reading this bucket runs a release \
-         whose reader accepts version {required} (ADR-0066 R1)"
+         {required} refuses. Produce {field} with {setter} given \
+         StorageLayoutWrite::ReadersRolledOut, and only once every process reading this \
+         bucket runs a release whose reader accepts version {required} (ADR-0066 R1)",
+        setter = setter_for(field)
     )]
     WriterCannotEmit {
         field: &'static str,
@@ -625,6 +668,18 @@ fn check_opted_in(
             writer_version: TENANT_CONFIG_FORMAT_VERSION,
             required: TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION,
         }),
+    }
+}
+
+/// The setters that produce the storage-layout `field`, for
+/// [`StorageLayoutConfigError::WriterCannotEmit`]'s message.
+fn setter_for(field: &str) -> &'static str {
+    match field {
+        "clustering_key" => {
+            "TenantConfig::set_clustering_key or TenantConfig::clear_clustering_key"
+        }
+        "bloom_scope" => "TenantConfig::set_bloom_scope",
+        _ => "the field's TenantConfig setter",
     }
 }
 
@@ -780,16 +835,25 @@ impl TenantConfig {
     /// generation that lets ADR-2135 decision 1 rank the clear above every
     /// earlier key. Refuses with
     /// [`StorageLayoutConfigError::ClusteringKeyNeverSet`] when no key was ever
-    /// set, and with [`StorageLayoutConfigError::ClusteringGenerationExhausted`]
-    /// and [`StorageLayoutConfigError::WriterCannotEmit`] as
+    /// set, with [`StorageLayoutConfigError::ClusteringKeyAlreadyCleared`] when
+    /// field 13 is present with no columns (a clear changes nothing there, so it
+    /// takes no generation), and with
+    /// [`StorageLayoutConfigError::ClusteringGenerationExhausted`] and
+    /// [`StorageLayoutConfigError::WriterCannotEmit`] as
     /// [`TenantConfig::set_clustering_key`] does; on any error the config is
     /// unchanged.
     pub fn clear_clustering_key(
         &mut self,
         write: StorageLayoutWrite,
     ) -> Result<(), StorageLayoutConfigError> {
-        if self.stored_clustering_key.is_none() {
-            return Err(StorageLayoutConfigError::ClusteringKeyNeverSet);
+        match self.stored_clustering_key.as_ref() {
+            None => return Err(StorageLayoutConfigError::ClusteringKeyNeverSet),
+            Some(stored) if stored.columns.is_empty() => {
+                return Err(StorageLayoutConfigError::ClusteringKeyAlreadyCleared {
+                    generation: stored.generation,
+                });
+            }
+            Some(_) => {}
         }
         let key = StoredClusteringKey {
             columns: Vec::new(),
@@ -810,9 +874,18 @@ impl TenantConfig {
             .ok_or(StorageLayoutConfigError::ClusteringGenerationExhausted { generation })
     }
 
-    /// Set the bloom scope. Refuses with
-    /// [`StorageLayoutConfigError::WriterCannotEmit`] unless `write` is
-    /// [`StorageLayoutWrite::ReadersRolledOut`]; on that error the config is
+    /// Set the bloom scope. A scope that differs from the stored one also
+    /// increments the clustering generation and leaves the key's descriptor as
+    /// it was, so one generation names one key and one scope: a set key keeps
+    /// its columns and width, a cleared key stays cleared, and a key that was
+    /// never set takes field 13 in the cleared form (no columns) at generation
+    /// 1, since field 13 is where the generation lives. Setting the scope the
+    /// config already carries changes nothing, the generation included.
+    ///
+    /// Refuses with [`StorageLayoutConfigError::WriterCannotEmit`] unless
+    /// `write` is [`StorageLayoutWrite::ReadersRolledOut`], and with
+    /// [`StorageLayoutConfigError::ClusteringGenerationExhausted`] when a change
+    /// needs a generation above `u64::MAX`; on any error the config is
     /// unchanged. [`BloomScope::All`] is the proto zero value, which the record
     /// does not carry, so setting it removes field 14.
     pub fn set_bloom_scope(
@@ -821,7 +894,29 @@ impl TenantConfig {
         write: StorageLayoutWrite,
     ) -> Result<(), StorageLayoutConfigError> {
         check_opted_in("bloom_scope", write)?;
-        self.stored_bloom_scope = StoredBloomScope::new(scope.to_proto() as i32, write);
+        let value = scope.to_proto() as i32;
+        if value == self.stored_bloom_scope.value {
+            return Ok(());
+        }
+        let generation = self.next_clustering_generation()?;
+        let key = match self.stored_clustering_key.take() {
+            Some(stored) => StoredClusteringKey {
+                generation,
+                write,
+                ..stored
+            },
+            None => StoredClusteringKey {
+                columns: Vec::new(),
+                bucket_width: sysproto::ClusteringBucketWidth::Unspecified as i32,
+                generation,
+                write,
+            },
+        };
+        self.stored_clustering_key = Some(key);
+        self.stored_bloom_scope = StoredBloomScope {
+            from_setter: true,
+            ..StoredBloomScope::new(value, write)
+        };
         Ok(())
     }
 
@@ -852,20 +947,42 @@ impl TenantConfig {
     /// The rest of the [`set_tenant_config`] gate, checked against `stored`, the
     /// config decoded from the record being replaced (`None` when there is none).
     ///
-    /// The clustering generation may not fall below the stored one, and at the
-    /// stored generation the key must be the stored key. When the key is the
-    /// stored set key, the write may neither drop nor retype a typed attribute
-    /// column it names: that changes the key's descriptor without a new
-    /// generation (ADR-2135 decision 2). Then a carried key runs the setter's
-    /// validation, shape and membership in this config's own
-    /// `typed_attr_columns`, and a carried bloom scope must be known.
+    /// A bloom scope that differs from the stored one must have been produced
+    /// by [`TenantConfig::set_bloom_scope`], so a config that carries no scope
+    /// (the default `ALL`) while the stored record carries one is refused unless
+    /// `set_bloom_scope(BloomScope::All)` produced it; a config built without
+    /// reading the record would otherwise drop the stored scope. The clustering
+    /// generation may not fall below the stored one, and at the stored
+    /// generation the key must be the stored key and the scope the stored
+    /// scope. When the key is the stored set key, the write may neither drop
+    /// nor retype a typed attribute column it names: that changes the key's
+    /// descriptor without a new generation (ADR-2135 decision 2). Then a
+    /// carried key runs the setter's validation, shape and membership in this
+    /// config's own `typed_attr_columns`, and a carried bloom scope must be
+    /// known.
     fn check_storage_layout_writable(
         &self,
         stored: Option<&TenantConfig>,
     ) -> Result<(), StorageLayoutConfigError> {
         if let Some(stored_cfg) = stored {
+            let stored_scope = stored_cfg.stored_bloom_scope.value;
+            let proposed_scope = self.stored_bloom_scope.value;
+            let scope_changed = proposed_scope != stored_scope;
+            if scope_changed && !self.stored_bloom_scope.from_setter {
+                return Err(StorageLayoutConfigError::BloomScopeChangedOutsideSetter {
+                    stored: stored_scope,
+                    proposed: proposed_scope,
+                });
+            }
             let stored_generation = stored_cfg.clustering_generation();
             let proposed = self.clustering_generation();
+            if scope_changed && proposed == stored_generation {
+                return Err(
+                    StorageLayoutConfigError::BloomScopeChangedWithoutGeneration {
+                        generation: proposed,
+                    },
+                );
+            }
             if proposed < stored_generation {
                 return Err(StorageLayoutConfigError::ClusteringGenerationRegressed {
                     stored: stored_generation,
@@ -1306,8 +1423,12 @@ pub enum SetOutcome {
 /// [`TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION`]. Either field is refused with
 /// [`StorageLayoutConfigError::WriterCannotEmit`], before any I/O, unless it was
 /// produced under [`StorageLayoutWrite::ReadersRolledOut`] (by a setter, or by
-/// decoding a version-3 record). Against the record being replaced, the
-/// clustering generation may not regress, a key may not change without a new
+/// decoding a version-3 record); the error names that setter. Against the
+/// record being replaced, a bloom scope that differs from the stored one must
+/// come from [`TenantConfig::set_bloom_scope`] (so a config that carries no
+/// scope while the record carries one is refused unless
+/// `set_bloom_scope(BloomScope::All)` produced it), the clustering generation
+/// may not regress, neither the key nor the scope may change without a new
 /// generation, and a typed attribute column the current key names may be
 /// neither removed nor retyped; a carried key must also pass the setter's
 /// validation against `config`'s own `typed_attr_columns`. Each refusal is a
@@ -2844,7 +2965,8 @@ mod tests {
 
     /// Every set and every clear stores the previous generation plus one, never a
     /// caller's value, starting from 0 for a key that was never set. A clear keeps
-    /// field 13 present with no columns through the record round trip.
+    /// field 13 present with no columns through the record round trip. A second
+    /// clear has its own test, `a_clear_of_an_absent_key_is_refused`.
     #[tokio::test]
     async fn set_and_clear_increment_the_stored_generation() {
         let v3 = StorageLayoutWrite::ReadersRolledOut;
@@ -2860,8 +2982,6 @@ mod tests {
             .expect("set the same key again");
         seen.push(cfg.clustering_key().expect("valid"));
         cfg.clear_clustering_key(v3).expect("clear");
-        seen.push(cfg.clustering_key().expect("valid"));
-        cfg.clear_clustering_key(v3).expect("clear again");
         seen.push(cfg.clustering_key().expect("valid"));
         cfg.set_clustering_key(names(&["a", "b"]), ClusteringBucketWidth::OneHour, v3)
             .expect("set after a clear");
@@ -2880,11 +3000,10 @@ mod tests {
                 b_one_day(8),
                 b_one_day(9),
                 ClusteringKeyState::Cleared { generation: 10 },
-                ClusteringKeyState::Cleared { generation: 11 },
                 ClusteringKeyState::Set(ClusteringKey {
                     columns: names(&["a", "b"]),
                     bucket_width: ClusteringBucketWidth::OneHour,
-                    generation: 12,
+                    generation: 11,
                 }),
             ]
         );
@@ -3007,15 +3126,16 @@ mod tests {
     /// field 14, and the value reads back as the same scope through the record.
     /// The sequence starts from the default `ALL` and changes the scope on every
     /// step, so a setter that stores nothing fails too. `ALL` is the zero value,
-    /// which leaves field 14 off the record and the record at version 2.
+    /// which leaves field 14 off the record; the record stays at version 3
+    /// because each change put its generation in field 13.
     #[tokio::test]
     async fn set_bloom_scope_stores_every_variant_through_the_record() {
         let v3 = StorageLayoutWrite::ReadersRolledOut;
         let mut cfg = TenantConfig::new(TenantLifecycleState::Active);
-        for (scope, proto, version) in [
-            (BloomScope::Text, sysproto::BloomScope::Text, 3),
-            (BloomScope::Undeclared, sysproto::BloomScope::Undeclared, 3),
-            (BloomScope::All, sysproto::BloomScope::All, 2),
+        for (scope, proto, generation) in [
+            (BloomScope::Text, sysproto::BloomScope::Text, 1),
+            (BloomScope::Undeclared, sysproto::BloomScope::Undeclared, 2),
+            (BloomScope::All, sysproto::BloomScope::All, 3),
         ] {
             cfg.set_bloom_scope(scope, v3).expect("opted in");
             assert_eq!(cfg.stored_bloom_scope.value, proto as i32);
@@ -3023,10 +3143,280 @@ mod tests {
 
             let record = build_record(&tenant(), &cfg, 0, 0);
             assert_eq!(record.bloom_scope, proto as i32);
-            assert_eq!(record.format_version, version, "{scope:?}");
+            assert_eq!(record.format_version, 3, "{scope:?}");
+            assert_eq!(
+                record.clustering_key.as_ref().map(|key| key.generation),
+                Some(generation),
+                "{scope:?}"
+            );
             let read = store_and_read(&record).await;
             assert_eq!(read.stored_bloom_scope, cfg.stored_bloom_scope);
             assert_eq!(read.bloom_scope(), Ok(scope));
+        }
+    }
+
+    /// A scope change at clustering generation N stores N+1 and leaves the
+    /// key's descriptor as it was: a set key keeps its columns and width, a
+    /// cleared key stays cleared, and a never-set key takes the cleared form at
+    /// generation 1. Setting the scope the config already carries changes
+    /// nothing, and an exhausted generation refuses the change.
+    #[tokio::test]
+    async fn set_bloom_scope_increments_the_generation_and_keeps_the_descriptor() {
+        let v3 = StorageLayoutWrite::ReadersRolledOut;
+        let declared = vec![str_col("a"), str_col("b")];
+
+        let mut keyed =
+            decoded_v3_with_stored_key(Some(declared.clone()), &["a", "b"], SIX_HOURS, 7).await;
+        keyed.set_bloom_scope(BloomScope::Text, v3).expect("set");
+        let a_b_six_hours = |generation| {
+            Ok(ClusteringKeyState::Set(ClusteringKey {
+                columns: names(&["a", "b"]),
+                bucket_width: ClusteringBucketWidth::SixHours,
+                generation,
+            }))
+        };
+        assert_eq!(keyed.clustering_key(), a_b_six_hours(8));
+        let unchanged = keyed.clone();
+        keyed
+            .set_bloom_scope(BloomScope::Text, v3)
+            .expect("same scope");
+        assert_eq!(keyed.clustering_key(), a_b_six_hours(8));
+        assert_eq!(keyed, unchanged);
+        keyed
+            .set_bloom_scope(BloomScope::Undeclared, v3)
+            .expect("set");
+        assert_eq!(keyed.clustering_key(), a_b_six_hours(9));
+        let read = store_and_read(&build_record(&tenant(), &keyed, 0, 0)).await;
+        assert_eq!(read.clustering_key(), a_b_six_hours(9));
+        assert_eq!(read.bloom_scope(), Ok(BloomScope::Undeclared));
+
+        let mut cleared =
+            decoded_v3_with_stored_key(Some(declared.clone()), &[], UNSPECIFIED, 4).await;
+        cleared.set_bloom_scope(BloomScope::Text, v3).expect("set");
+        assert_eq!(
+            cleared.clustering_key(),
+            Ok(ClusteringKeyState::Cleared { generation: 5 })
+        );
+
+        let mut never = TenantConfig::new(TenantLifecycleState::Active);
+        never.set_bloom_scope(BloomScope::Text, v3).expect("set");
+        let record = build_record(&tenant(), &never, 0, 0);
+        assert_eq!(
+            record.clustering_key,
+            Some(sysproto::ClusteringKeyConfig {
+                columns: Vec::new(),
+                bucket_width: UNSPECIFIED,
+                generation: 1,
+            })
+        );
+        assert_eq!(
+            store_and_read(&record).await.clustering_key(),
+            Ok(ClusteringKeyState::Cleared { generation: 1 })
+        );
+
+        let mut exhausted =
+            decoded_v3_with_stored_key(Some(declared), &["a"], SIX_HOURS, u64::MAX).await;
+        let before = exhausted.clone();
+        assert_eq!(
+            exhausted.set_bloom_scope(BloomScope::Text, v3),
+            Err(StorageLayoutConfigError::ClusteringGenerationExhausted {
+                generation: u64::MAX
+            })
+        );
+        assert_eq!(exhausted, before);
+    }
+
+    /// The write gate protects the stored bloom scope. A config that carries no
+    /// scope while the record carries one is refused when it was built without
+    /// reading the record, or had its scope reset by hand before another setter
+    /// raised its generation, and accepted when `set_bloom_scope(All)` produced
+    /// it. A scope set on a config read before another scope change lands at the
+    /// stored generation and is refused too. Each refusal writes nothing.
+    #[tokio::test]
+    async fn the_write_gate_refuses_a_bloom_scope_the_setter_did_not_produce() {
+        let v3 = StorageLayoutWrite::ReadersRolledOut;
+        let text = sysproto::BloomScope::Text as i32;
+        let store = mem();
+        let base = TenantConfig {
+            typed_attr_columns: Some(vec![str_col("a")]),
+            ..TenantConfig::new(TenantLifecycleState::Active)
+        };
+        let mut scoped = base.clone();
+        scoped.set_bloom_scope(BloomScope::Text, v3).expect("set");
+        set_tenant_config(store.as_ref(), &tenant(), &scoped, 1)
+            .await
+            .expect("write the scope");
+        let stored_bytes = || async {
+            store
+                .get(&config_key(&tenant()), GetRange::Full)
+                .await
+                .expect("read")
+                .data
+        };
+        let seeded = stored_bytes().await;
+        let read = || async {
+            read_config(store.as_ref(), &tenant())
+                .await
+                .expect("read")
+                .expect("present")
+                .0
+        };
+        let refused = |cfg: TenantConfig| {
+            let store = store.clone();
+            async move {
+                match set_tenant_config(store.as_ref(), &tenant(), &cfg, 2).await {
+                    Err(TenantConfigError::InvalidStorageLayoutConfig { source, .. }) => source,
+                    other => panic!("expected a storage-layout refusal, got {other:?}"),
+                }
+            }
+        };
+
+        let outside = StorageLayoutConfigError::BloomScopeChangedOutsideSetter {
+            stored: text,
+            proposed: 0,
+        };
+        assert_eq!(refused(base.clone()).await, outside);
+        let mut reset = read().await;
+        reset.stored_bloom_scope = StoredBloomScope::default();
+        reset
+            .set_clustering_key(names(&["a"]), ClusteringBucketWidth::OneHour, v3)
+            .expect("set");
+        assert_eq!(reset.clustering_generation(), 2);
+        assert_eq!(refused(reset).await, outside);
+        assert_eq!(stored_bytes().await, seeded, "the refusals write nothing");
+
+        let stale = read().await;
+        let mut other = read().await;
+        other
+            .set_bloom_scope(BloomScope::Undeclared, v3)
+            .expect("set");
+        set_tenant_config(store.as_ref(), &tenant(), &other, 3)
+            .await
+            .expect("another scope change lands first");
+        let after_other = stored_bytes().await;
+        let mut late = stale;
+        late.set_bloom_scope(BloomScope::All, v3).expect("set");
+        assert_eq!(
+            refused(late).await,
+            StorageLayoutConfigError::BloomScopeChangedWithoutGeneration { generation: 2 }
+        );
+        assert_eq!(stored_bytes().await, after_other);
+
+        let mut all = read().await;
+        all.set_bloom_scope(BloomScope::All, v3).expect("set");
+        set_tenant_config(store.as_ref(), &tenant(), &all, 4)
+            .await
+            .expect("set_bloom_scope(All) may drop the scope");
+        let back = read().await;
+        assert_eq!(back.bloom_scope(), Ok(BloomScope::All));
+        assert_eq!(back.clustering_generation(), 3);
+
+        // A record written with a scope before the scope took a generation
+        // carries generation 0, so only the scope rule refuses a fresh config.
+        let legacy = mem();
+        let mut record = build_record(&tenant(), &base, 0, 0);
+        record.format_version = 3;
+        record.bloom_scope = text;
+        legacy
+            .put(
+                &config_key(&tenant()),
+                record.encode_to_vec().into(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed");
+        match set_tenant_config(legacy.as_ref(), &tenant(), &base, 5).await {
+            Err(TenantConfigError::InvalidStorageLayoutConfig { source, .. }) => {
+                assert_eq!(source, outside)
+            }
+            other => panic!("expected a storage-layout refusal, got {other:?}"),
+        }
+    }
+
+    /// A clear needs a key to clear. A never-set key refuses with
+    /// `ClusteringKeyNeverSet`; a cleared key, and the cleared form a scope
+    /// change gives a never-set key, refuse with `ClusteringKeyAlreadyCleared`
+    /// at the stored generation. Neither refusal changes the config, so the
+    /// generation does not move.
+    #[tokio::test]
+    async fn a_clear_of_an_absent_key_is_refused() {
+        let v3 = StorageLayoutWrite::ReadersRolledOut;
+        let mut never = TenantConfig::new(TenantLifecycleState::Active);
+        assert_eq!(
+            never.clear_clustering_key(v3),
+            Err(StorageLayoutConfigError::ClusteringKeyNeverSet)
+        );
+        assert_eq!(never, TenantConfig::new(TenantLifecycleState::Active));
+
+        let mut cleared =
+            decoded_v3_with_stored_key(Some(vec![str_col("a")]), &[], UNSPECIFIED, 10).await;
+        let before = cleared.clone();
+        assert_eq!(
+            cleared.clear_clustering_key(v3),
+            Err(StorageLayoutConfigError::ClusteringKeyAlreadyCleared { generation: 10 })
+        );
+        assert_eq!(cleared, before);
+        assert_eq!(cleared.clustering_generation(), 10);
+
+        let mut scoped = TenantConfig::new(TenantLifecycleState::Active);
+        scoped.set_bloom_scope(BloomScope::Text, v3).expect("set");
+        assert_eq!(
+            scoped.clear_clustering_key(v3),
+            Err(StorageLayoutConfigError::ClusteringKeyAlreadyCleared { generation: 1 })
+        );
+        assert_eq!(scoped.clustering_generation(), 1);
+    }
+
+    /// The writer refusal `set_tenant_config` raises for a field produced
+    /// without the opt-in names the setter that produces the field, with
+    /// `ReadersRolledOut`, since `set_tenant_config` takes no opt-in itself.
+    #[tokio::test]
+    async fn writer_cannot_emit_names_the_setter_and_the_opt_in() {
+        let disabled = StorageLayoutWrite::Disabled;
+        let with_key = TenantConfig {
+            typed_attr_columns: Some(vec![str_col("a")]),
+            stored_clustering_key: Some(StoredClusteringKey {
+                columns: names(&["a"]),
+                bucket_width: SIX_HOURS,
+                generation: 1,
+                write: disabled,
+            }),
+            ..TenantConfig::new(TenantLifecycleState::Active)
+        };
+        let with_scope = TenantConfig {
+            stored_bloom_scope: StoredBloomScope::new(sysproto::BloomScope::Text as i32, disabled),
+            ..TenantConfig::new(TenantLifecycleState::Active)
+        };
+        let tail = "given StorageLayoutWrite::ReadersRolledOut, and only once every process \
+                    reading this bucket runs a release whose reader accepts version 3 (ADR-0066 R1)";
+        for (cfg, expected) in [
+            (
+                with_key,
+                format!(
+                    "cannot set clustering_key without the storage-layout write opt-in: this \
+                     build's config record writer stamps format_version 2 by default, and \
+                     clustering_key needs a version-3 record, which a reader from a release that \
+                     predates version 3 refuses. Produce clustering_key with \
+                     TenantConfig::set_clustering_key or TenantConfig::clear_clustering_key {tail}"
+                ),
+            ),
+            (
+                with_scope,
+                format!(
+                    "cannot set bloom_scope without the storage-layout write opt-in: this \
+                     build's config record writer stamps format_version 2 by default, and \
+                     bloom_scope needs a version-3 record, which a reader from a release that \
+                     predates version 3 refuses. Produce bloom_scope with \
+                     TenantConfig::set_bloom_scope {tail}"
+                ),
+            ),
+        ] {
+            match set_tenant_config(mem().as_ref(), &tenant(), &cfg, 1).await {
+                Err(TenantConfigError::InvalidStorageLayoutConfig { source, .. }) => {
+                    assert_eq!(source.to_string(), expected)
+                }
+                other => panic!("expected the writer refusal, got {other:?}"),
+            }
         }
     }
 
