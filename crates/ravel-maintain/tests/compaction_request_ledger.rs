@@ -21,7 +21,7 @@ use common::*;
 use ravel_commit::{keys, signal};
 use ravel_maintain::request_ledger::RunRequestReport;
 use ravel_maintain::{
-    CompactionOutcome, CompactorConfig, FixedClock, MaintainError, MaintainMemo, NoLeases,
+    Bucket, CompactionOutcome, CompactorConfig, FixedClock, MaintainError, MaintainMemo, NoLeases,
     PendingErasureRequest, PublishOutcome, RequestLedger, RlogCodec, compact_bucket,
     conserve_exact, erasure_rewrite_bucket, migrate_bucket_format, read, rewrite_and_publish,
 };
@@ -169,6 +169,182 @@ async fn per_phase_counts_match_the_instrumented_oracle_exactly() {
     assert_eq!(report.catalog_read.wire_bytes_sent, 0);
     assert_eq!(report.block_read.wire_bytes_sent, 0);
     assert_eq!(report.part_put.wire_bytes_received, 0);
+}
+
+/// The headline fixture with string attribute columns: input 0 carries two
+/// (`route`, `user`) and an `I64` one (`code`), input 1 carries one (`route`).
+async fn seed_rlog_two_inputs_with_strings(store: &dyn ObjectStoreBackend) -> Bucket {
+    use ravel_types::logstream::AttrValue;
+    let with = |mut r: ravel_logseg::LogRecord, attrs: &[(&str, AttrValue)]| {
+        r.attrs = attrs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        r
+    };
+    let s = |v: &str| AttrValue::Str(v.to_string());
+    seed_rlog_input(
+        store,
+        Uuid::from_u128(1),
+        10,
+        1,
+        &[
+            with(
+                log_record(0, 10, "alpha"),
+                &[
+                    ("code", AttrValue::I64(200)),
+                    ("route", s("/a")),
+                    ("user", s("u1")),
+                ],
+            ),
+            with(log_record(1, 20, "bravo"), &[("route", s("/b"))]),
+        ],
+    )
+    .await;
+    seed_rlog_input(
+        store,
+        Uuid::from_u128(2),
+        10,
+        2,
+        &[
+            with(log_record(0, 15, "charlie"), &[("route", s("/c"))]),
+            log_record(2, 5, "delta"),
+        ],
+    )
+    .await;
+    logs_bucket()
+}
+
+/// Per input, in canonical input order: the object's size, the summed lengths
+/// of the four directory sections the merge reads whole, and its BLOOM section
+/// with the number of `Str` FIELD_DIR entries.
+async fn rlog_input_layout(
+    store: &dyn ObjectStoreBackend,
+    bucket: &Bucket,
+) -> Vec<(u64, u64, ravel_logseg::footer::SectionDesc, u64)> {
+    use ravel_logseg::field_dir::FieldDir;
+    use ravel_logseg::footer::{self, kind};
+    let listing = read::list_bucket(store, bucket).await.expect("list");
+    let inputs = read::load_inputs(store, bucket, &listing.commit_keys, 1)
+        .await
+        .expect("inputs");
+    let mut out = Vec::new();
+    for input in &inputs {
+        let key = keys::reconstruct_data_key(&input.record).expect("data key");
+        let object = store
+            .get(&key, GetRange::Full)
+            .await
+            .expect("get input")
+            .data;
+        let ftr = footer::open(&object).expect("open footer");
+        let directories: u64 = [
+            kind::STREAM_DIR,
+            kind::FIELD_DIR,
+            kind::SKIP_IDX,
+            kind::PAGE_DIR,
+        ]
+        .iter()
+        .map(|&k| ftr.section(k).expect("directory section").len)
+        .sum();
+        let dir_raw = ravel_logseg::read_section(
+            &object,
+            ftr.section(kind::FIELD_DIR).expect("FIELD_DIR"),
+            &ravel_logseg::RlogConfig::default(),
+        )
+        .expect("FIELD_DIR");
+        let strings = FieldDir::decode(&dir_raw, u64::MAX)
+            .expect("decode FIELD_DIR")
+            .entries()
+            .iter()
+            .filter(|e| matches!(e.ty, ravel_logseg::FieldType::Str))
+            .count() as u64;
+        let bloom = *ftr.section(kind::BLOOM).expect("BLOOM");
+        out.push((object.len() as u64, directories, bloom, strings));
+    }
+    out
+}
+
+/// The bloom-scope read (ADR-2135 decision 5) is one `catalog_read` GET of
+/// the chosen input's BLOOM covered-column prefix, `8 + 5 x (10 + n)` bytes
+/// for its `n` string columns, and nothing else. Both inputs carry generation
+/// 0, so the chosen input is input 0, whose `n` is 2 (the `I64` column does
+/// not count): 68 bytes, against a BLOOM section longer than that, so the
+/// figure is the prefix rather than the section.
+///
+/// Every other phase matches the headline fixture's counts, and the catalog
+/// figure is pinned exactly: per input the whole object (the footer probe
+/// covers it) plus the four directory sections, plus the prefix.
+///
+/// Flip proofs, each run against this test, with the figure that failed:
+/// charging the read to `BlockRead` (catalog requests 10); fetching the whole
+/// BLOOM section (catalog bytes 1887 against 1859); dropping its `note_get`
+/// (catalog requests 10); leaving `FIRST_DYNAMIC_COL` out of the bound (an
+/// 18-byte range, catalog bytes 1809); and the pre-change merge that reads no
+/// scope at all (catalog requests 10).
+#[tokio::test]
+async fn the_bloom_scope_read_is_one_catalog_get_of_the_list_prefix() {
+    let store = InstrumentedStore::new(MemoryStore::new());
+    let bucket = seed_rlog_two_inputs_with_strings(&store).await;
+    let layout = rlog_input_layout(&store, &bucket).await;
+    assert_eq!(layout.len(), 2);
+    assert_eq!(
+        layout.iter().map(|l| l.3).collect::<Vec<_>>(),
+        [2, 1],
+        "string columns per input"
+    );
+    let (_, _, bloom, strings) = layout[0];
+    let prefix = 8 + 5 * (10 + strings);
+    assert_eq!(prefix, 68);
+    assert_eq!(bloom.comp, ravel_logseg::footer::COMP_NONE);
+    assert!(
+        bloom.len > prefix,
+        "the BLOOM section ({} bytes) must outrun the prefix",
+        bloom.len
+    );
+
+    let metrics = store.metrics();
+    let before = metrics.snapshot();
+    let ledger = RequestLedger::new();
+    let clock = FixedClock::new(sealed_now_ns());
+    let outcome = compact_bucket(&store, &clock, &config_with(&ledger), &bucket)
+        .await
+        .expect("compact");
+    assert_eq!(
+        outcome,
+        CompactionOutcome::Compacted {
+            parts: 1,
+            publish: PublishOutcome::Published,
+        }
+    );
+    let after = metrics.snapshot();
+    let report = ledger.report();
+
+    assert_eq!(report.list.requests, 1);
+    assert_eq!(report.record_read.requests, 2);
+    assert_eq!(
+        report.catalog_read.requests, 11,
+        "the headline's 10 plus one bloom-scope GET"
+    );
+    assert_eq!(report.block_read.requests, 4);
+    assert_eq!(report.part_put.requests, 1);
+    assert_eq!(report.publish.requests, 1);
+    assert_eq!(report.total_requests(), 20);
+    assert_reconciles(&report, &before, &after);
+
+    let probe = CompactorConfig::default().footer_probe_bytes;
+    assert!(
+        layout.iter().all(|(size, ..)| *size <= probe),
+        "the footer probe covers each whole input object"
+    );
+    let catalog: u64 = layout
+        .iter()
+        .map(|(size, directories, _, _)| size + directories)
+        .sum();
+    assert_eq!(
+        report.catalog_read.wire_bytes_received,
+        catalog + prefix,
+        "probes and directories ({catalog}) plus the {prefix}-byte list prefix"
+    );
 }
 
 /// Wire bytes are proportional to the fixture's ACTUAL object sizes, per

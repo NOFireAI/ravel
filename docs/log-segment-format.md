@@ -1269,11 +1269,21 @@ The merge is defined entirely in terms of this format:
   merged, re-blocked contents (each bloom sized by its own block's
   distinct-token count); an input's `SKIP_IDX`/`BLOOM` bytes are never
   reused or concatenated, since the merged block boundaries differ from
-  any input's. The BLOOM covered set follows the same input the descriptor
-  comes from: every string column when that input covers them all, only the
-  two fixed text columns when it covers nothing else, and otherwise the
-  string columns it covers by name. The coverages of the inputs are never
-  unioned. Reading that input's covered list costs one ranged GET per merge
+  any input's. The BLOOM covered set follows the bloom scope of the same
+  input the descriptor comes from, recovered from that input's covered list
+  and applied to the output's columns rather than copied by name. When that
+  input covers every string attribute column it carries, or carries none,
+  the output covers every string column. When it covers none of them, the
+  output covers only the two fixed text columns. Otherwise the output covers
+  every string column except the ones that input carries uncovered, so a
+  string column that only other inputs carry is covered. The coverages of
+  the inputs are never unioned. A tie on the highest generation goes to the
+  first such input in input order for the scope as for the descriptor. A
+  bloom scope change is meant to bump the clustering generation, and until
+  the catalog does so a scope-only change reaches compacted
+  data only through this tie rule: it reaches the output when an input
+  written under the new scope is the first input at the highest
+  generation. Reading that input's covered list costs one ranged GET per merge
   of at most `8 + 5 * (10 + string columns)` bytes (the whole section when
   its BLOOM is compressed), and none when that input holds no string column,
   in which case the output covers every string column.
