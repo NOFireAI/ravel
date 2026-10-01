@@ -775,6 +775,7 @@ fn ansi_statement_kind(statement: &Statement) -> &'static str {
         Statement::CreateFunction(_) => "CREATE FUNCTION",
         Statement::AlterTable { .. } => "ALTER TABLE",
         Statement::Drop { .. } => "DROP",
+        Statement::Query(_) => "a SELECT statement",
         Statement::Set(_) => "SET",
         Statement::StartTransaction { .. }
         | Statement::Commit { .. }
@@ -1545,5 +1546,394 @@ mod tests {
             both.contains("samples") && both.contains("logs"),
             "a genuine base reference must survive CTE collection: {both:?}"
         );
+    }
+
+    fn reject_ddl(sql: &str) -> DdlValidationError {
+        validate_ddl(sql).expect_err("must be rejected")
+    }
+
+    fn accept_create(sql: &str) -> (String, bool, bool, String, BTreeMap<String, String>) {
+        match validate_ddl(sql).unwrap_or_else(|e| panic!("must be accepted: {sql}: {e}")) {
+            DdlIntent::CreateExternal {
+                name,
+                if_not_exists,
+                or_replace,
+                location,
+                options,
+            } => (name, if_not_exists, or_replace, location, options),
+            other => panic!("expected CreateExternal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plain_create_external_table_is_admitted() {
+        let (name, if_not_exists, or_replace, location, options) = accept_create(
+            "CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION 's3://bucket/prefix/'",
+        );
+        assert_eq!(name, "orders");
+        assert!(!if_not_exists);
+        assert!(!or_replace);
+        assert_eq!(location, "s3://bucket/prefix/");
+        assert!(options.is_empty());
+    }
+
+    #[test]
+    fn create_external_table_if_not_exists_is_admitted() {
+        let (_, if_not_exists, or_replace, _, _) = accept_create(
+            "CREATE EXTERNAL TABLE IF NOT EXISTS orders STORED AS PARQUET \
+             LOCATION 's3://bucket/prefix/'",
+        );
+        assert!(if_not_exists);
+        assert!(!or_replace);
+    }
+
+    #[test]
+    fn create_or_replace_external_table_is_admitted() {
+        let (_, if_not_exists, or_replace, _, _) = accept_create(
+            "CREATE OR REPLACE EXTERNAL TABLE orders STORED AS PARQUET \
+             LOCATION 's3://bucket/prefix/'",
+        );
+        assert!(!if_not_exists);
+        assert!(or_replace);
+    }
+
+    #[test]
+    fn create_external_table_single_object_location_is_admitted() {
+        let (_, _, _, location, _) = accept_create(
+            "CREATE EXTERNAL TABLE orders STORED AS PARQUET \
+             LOCATION 's3://bucket/prefix/single.parquet'",
+        );
+        assert_eq!(location, "s3://bucket/prefix/single.parquet");
+    }
+
+    #[test]
+    fn create_external_table_options_are_admitted() {
+        let (_, _, _, _, options) = accept_create(
+            "CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION 's3://bucket/prefix/' \
+             OPTIONS (binary_as_string 'true', 'ravel.cast.created_at' 'date-from-days')",
+        );
+        assert_eq!(options.get("binary_as_string").map(String::as_str), Some("true"));
+        assert_eq!(
+            options.get("ravel.cast.created_at").map(String::as_str),
+            Some("date-from-days")
+        );
+    }
+
+    #[test]
+    fn drop_table_is_admitted() {
+        match validate_ddl("DROP TABLE orders").expect("must be accepted") {
+            DdlIntent::Drop { name, if_exists } => {
+                assert_eq!(name, "orders");
+                assert!(!if_exists);
+            }
+            other => panic!("expected Drop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_table_if_exists_is_admitted() {
+        match validate_ddl("DROP TABLE IF EXISTS orders").expect("must be accepted") {
+            DdlIntent::Drop { name, if_exists } => {
+                assert_eq!(name, "orders");
+                assert!(if_exists);
+            }
+            other => panic!("expected Drop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plain_select_is_not_ddl() {
+        assert!(matches!(
+            reject_ddl("SELECT * FROM orders"),
+            DdlValidationError::NotDdl {
+                kind: "a SELECT statement"
+            }
+        ));
+    }
+
+    #[test]
+    fn insert_is_not_ddl() {
+        assert!(matches!(
+            reject_ddl("INSERT INTO orders VALUES (1)"),
+            DdlValidationError::NotDdl { .. }
+        ));
+    }
+
+    #[test]
+    fn copy_to_is_not_ddl() {
+        assert!(matches!(
+            reject_ddl("COPY (SELECT 1) TO 's3://evil/out.parquet'"),
+            DdlValidationError::NotDdl { kind: "COPY" }
+        ));
+    }
+
+    #[test]
+    fn explain_is_not_ddl() {
+        assert!(matches!(
+            reject_ddl("EXPLAIN SELECT 1"),
+            DdlValidationError::NotDdl { kind: "EXPLAIN" }
+        ));
+    }
+
+    #[test]
+    fn set_is_not_ddl() {
+        assert!(matches!(
+            reject_ddl("SET time_zone = 'UTC'"),
+            DdlValidationError::NotDdl { .. }
+        ));
+    }
+
+    #[test]
+    fn multi_statement_ddl_body_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION 's3://bucket/prefix/'; \
+                 DROP TABLE orders"
+            ),
+            DdlValidationError::MultipleStatements { count: 2 }
+        ));
+    }
+
+    #[test]
+    fn empty_ddl_body_is_rejected() {
+        assert!(matches!(reject_ddl(""), DdlValidationError::Empty));
+    }
+
+    #[test]
+    fn temporary_external_table_is_rejected() {
+        // DataFusion's grammar places TEMPORARY after EXTERNAL, not before:
+        // `CREATE EXTERNAL TEMPORARY TABLE ...`.
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TEMPORARY TABLE orders STORED AS PARQUET \
+                 LOCATION 's3://bucket/prefix/'"
+            ),
+            DdlValidationError::Temporary
+        ));
+    }
+
+    #[test]
+    fn unbounded_external_table_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE UNBOUNDED EXTERNAL TABLE orders STORED AS PARQUET \
+                 LOCATION 's3://bucket/prefix/'"
+            ),
+            DdlValidationError::Unbounded
+        ));
+    }
+
+    #[test]
+    fn partitioned_by_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION 's3://bucket/prefix/' \
+                 PARTITIONED BY (day)"
+            ),
+            DdlValidationError::PartitionedBy
+        ));
+    }
+
+    #[test]
+    fn with_order_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION 's3://bucket/prefix/' \
+                 WITH ORDER (ts)"
+            ),
+            DdlValidationError::WithOrder
+        ));
+    }
+
+    #[test]
+    fn column_list_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders (a INT) STORED AS PARQUET \
+                 LOCATION 's3://bucket/prefix/'"
+            ),
+            DdlValidationError::ColumnList
+        ));
+    }
+
+    #[test]
+    fn non_parquet_stored_as_is_rejected() {
+        assert!(matches!(
+            reject_ddl("CREATE EXTERNAL TABLE orders STORED AS CSV LOCATION 's3://bucket/prefix/'"),
+            DdlValidationError::NotParquet { file_type } if file_type == "CSV"
+        ));
+    }
+
+    #[test]
+    fn unsupported_option_key_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION 's3://bucket/prefix/' \
+                 OPTIONS (evil_option 'true')"
+            ),
+            DdlValidationError::UnsupportedOption { key } if key == "evil_option"
+        ));
+    }
+
+    #[test]
+    fn ravel_cast_option_with_empty_column_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION 's3://bucket/prefix/' \
+                 OPTIONS ('ravel.cast.' 'date-from-days')"
+            ),
+            DdlValidationError::UnsupportedOption { key } if key == "ravel.cast."
+        ));
+    }
+
+    #[test]
+    fn option_value_must_be_a_string_literal() {
+        // DataFusion's OPTIONS grammar normalizes any bare word (quoted or
+        // not, including keywords like `true`) to the same
+        // `Value::SingleQuotedString`, so only a genuinely different token
+        // kind -- here a bare number -- exercises this rejection.
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION 's3://bucket/prefix/' \
+                 OPTIONS (binary_as_string 123)"
+            ),
+            DdlValidationError::OptionValueNotString { key } if key == "binary_as_string"
+        ));
+    }
+
+    #[test]
+    fn invalid_table_name_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE \"Orders\" STORED AS PARQUET LOCATION 's3://bucket/prefix/'"
+            ),
+            DdlValidationError::InvalidTableName(_)
+        ));
+    }
+
+    #[test]
+    fn reserved_table_name_is_rejected() {
+        assert!(matches!(
+            reject_ddl("CREATE EXTERNAL TABLE samples STORED AS PARQUET LOCATION 's3://bucket/prefix/'"),
+            DdlValidationError::InvalidTableName(_)
+        ));
+    }
+
+    #[test]
+    fn drop_reserved_table_name_is_rejected() {
+        assert!(matches!(
+            reject_ddl("DROP TABLE logs"),
+            DdlValidationError::InvalidTableName(_)
+        ));
+    }
+
+    #[test]
+    fn location_without_scheme_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION '/tmp/prefix/'"
+            ),
+            DdlValidationError::Location(_)
+        ));
+    }
+
+    #[test]
+    fn location_with_file_scheme_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION 'file:///etc/passwd'"
+            ),
+            DdlValidationError::Location(_)
+        ));
+    }
+
+    #[test]
+    fn location_with_http_scheme_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET \
+                 LOCATION 'http://bucket/prefix/'"
+            ),
+            DdlValidationError::Location(_)
+        ));
+    }
+
+    #[test]
+    fn location_with_dotdot_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET \
+                 LOCATION 's3://bucket/../prefix/'"
+            ),
+            DdlValidationError::Location(_)
+        ));
+    }
+
+    #[test]
+    fn location_with_empty_segment_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET \
+                 LOCATION 's3://bucket/prefix//double/'"
+            ),
+            DdlValidationError::Location(_)
+        ));
+    }
+
+    #[test]
+    fn location_with_glob_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET \
+                 LOCATION 's3://bucket/prefix/*.parquet'"
+            ),
+            DdlValidationError::Location(_)
+        ));
+    }
+
+    #[test]
+    fn location_with_percent_escape_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET \
+                 LOCATION 's3://bucket/prefix%2F/'"
+            ),
+            DdlValidationError::Location(_)
+        ));
+    }
+
+    #[test]
+    fn location_with_query_string_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET \
+                 LOCATION 's3://bucket/prefix/?x=1'"
+            ),
+            DdlValidationError::Location(_)
+        ));
+    }
+
+    #[test]
+    fn drop_multiple_tables_is_rejected() {
+        assert!(matches!(
+            reject_ddl("DROP TABLE orders, other"),
+            DdlValidationError::DropMultipleTables { count: 2 }
+        ));
+    }
+
+    #[test]
+    fn drop_view_is_rejected() {
+        assert!(matches!(
+            reject_ddl("DROP VIEW orders"),
+            DdlValidationError::DropNotTable { .. }
+        ));
+    }
+
+    #[test]
+    fn drop_table_cascade_is_rejected() {
+        assert!(matches!(
+            reject_ddl("DROP TABLE orders CASCADE"),
+            DdlValidationError::DropUnsupported { clause: "CASCADE" }
+        ));
     }
 }
