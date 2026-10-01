@@ -194,6 +194,15 @@ pub enum DdlExecuteError {
         source: SnapshotError,
     },
 
+    /// A `ravel.cast.<column>` option named a column the snapshotted Parquet
+    /// schema does not have. `validate_ddl` cannot catch this: it has no
+    /// schema to check against, only the statement's own options. 422-class.
+    #[error(
+        "OPTIONS key \"ravel.cast.{column}\" names a column that the Parquet schema under \
+         LOCATION does not have"
+    )]
+    UnknownCastColumn { column: String },
+
     /// The manifest write failed. [`WriteError::TableExists`] is a plain
     /// `CREATE` on a table that already exists, without `IF NOT EXISTS`
     /// (409-class); [`WriteError::TableNotFound`] is `DROP TABLE` without `IF
@@ -429,7 +438,7 @@ impl SqlExecutor {
                 let phase_accounting = PhaseAccounting::new();
                 let LocationSnapshot {
                     files,
-                    schema: _,
+                    schema,
                     skipped_directory_markers,
                     skipped_other_suffixes,
                 } = snapshot_location(
@@ -446,6 +455,21 @@ impl SqlExecutor {
                     source,
                 })?;
                 let file_count = files.len();
+
+                // `validate_ddl` admits any `ravel.cast.<column>` key whose
+                // column name passes the charset rule (D5): it has no schema
+                // to check the column against. The schema only exists once
+                // the snapshot above has read it, so the column's presence
+                // is checked here instead.
+                for key in options.keys() {
+                    if let Some(column) = key.strip_prefix("ravel.cast.") {
+                        if schema.column_with_name(column).is_none() {
+                            return Err(DdlExecuteError::UnknownCastColumn {
+                                column: column.to_string(),
+                            });
+                        }
+                    }
+                }
 
                 let write_intent = if or_replace {
                     writer::Intent::CreateOrReplace {

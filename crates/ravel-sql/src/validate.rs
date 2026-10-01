@@ -407,6 +407,20 @@ pub enum DdlValidationError {
     #[error("OPTIONS value for {key:?} must be a quoted string literal")]
     OptionValueNotString { key: String },
 
+    /// An `OPTIONS` value admitted by key but not one of its allowed
+    /// literals (D5): `binary_as_string` admits only `'true'`;
+    /// `ravel.cast.<column>` admits only `'date-from-days'`,
+    /// `'timestamp-from-seconds'`, or `'timestamp-from-millis'`.
+    #[error(
+        "OPTIONS value {value:?} for {key:?} is not admitted \
+         (docs/adrs/2040-parquet-tables-queried-in-place.md)"
+    )]
+    InvalidOptionValue { key: String, value: String },
+
+    /// The same `OPTIONS` key was given more than once.
+    #[error("OPTIONS key {key:?} was given more than once")]
+    DuplicateOption { key: String },
+
     /// The table name failed ravel-pqtable's name rule.
     #[error(transparent)]
     InvalidTableName(#[from] names::NameError),
@@ -459,6 +473,20 @@ fn is_admitted_option_key(key: &str) -> bool {
         || key
             .strip_prefix("ravel.cast.")
             .is_some_and(|column| names::validate_table(column).is_ok())
+}
+
+/// Whether `value` is one of the literals D5 admits for `key`. Only called
+/// once `is_admitted_option_key(key)` is already true, so `key` is either
+/// exactly `binary_as_string` or a `ravel.cast.` key with an admitted column.
+fn is_admitted_option_value(key: &str, value: &str) -> bool {
+    if key == "binary_as_string" {
+        value == "true"
+    } else {
+        matches!(
+            value,
+            "date-from-days" | "timestamp-from-seconds" | "timestamp-from-millis"
+        )
+    }
 }
 
 /// Parse `sql` and accept it only if it is exactly one of the three D2
@@ -544,7 +572,15 @@ pub(crate) fn create_external_intent(
         let SqlValue::SingleQuotedString(value) = value else {
             return Err(DdlValidationError::OptionValueNotString { key: key.clone() });
         };
-        options.insert(key.clone(), value.clone());
+        if !is_admitted_option_value(key, value) {
+            return Err(DdlValidationError::InvalidOptionValue {
+                key: key.clone(),
+                value: value.clone(),
+            });
+        }
+        if options.insert(key.clone(), value.clone()).is_some() {
+            return Err(DdlValidationError::DuplicateOption { key: key.clone() });
+        }
     }
 
     // Syntax only: whether `location` lies inside a grant is execute_ddl's
@@ -1837,6 +1873,41 @@ mod tests {
                  OPTIONS (binary_as_string 123)"
             ),
             DdlValidationError::OptionValueNotString { key } if key == "binary_as_string"
+        ));
+    }
+
+    #[test]
+    fn binary_as_string_with_a_value_other_than_true_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION 's3://bucket/prefix/' \
+                 OPTIONS (binary_as_string 'yes')"
+            ),
+            DdlValidationError::InvalidOptionValue { key, value }
+                if key == "binary_as_string" && value == "yes"
+        ));
+    }
+
+    #[test]
+    fn ravel_cast_with_an_unlisted_coercion_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION 's3://bucket/prefix/' \
+                 OPTIONS ('ravel.cast.created_at' 'to-the-moon')"
+            ),
+            DdlValidationError::InvalidOptionValue { key, value }
+                if key == "ravel.cast.created_at" && value == "to-the-moon"
+        ));
+    }
+
+    #[test]
+    fn duplicate_options_key_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET LOCATION 's3://bucket/prefix/' \
+                 OPTIONS (binary_as_string 'true', binary_as_string 'true')"
+            ),
+            DdlValidationError::DuplicateOption { key } if key == "binary_as_string"
         ));
     }
 
