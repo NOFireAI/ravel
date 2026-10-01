@@ -676,7 +676,8 @@ enum Command {
         /// than storing it raw, and a page's encoding is chosen by stored
         /// size, so the level can change which encoding a page keeps. Accepts
         /// zstd's range, -131072 to 22, and refuses a level outside it. A
-        /// metrics or spans load ignores this flag and says so.
+        /// metrics or spans load ignores this flag and warns when it is set
+        /// to anything but 3.
         #[arg(
             long,
             value_name = "LEVEL",

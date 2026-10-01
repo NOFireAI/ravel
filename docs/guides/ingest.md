@@ -1120,6 +1120,47 @@ overflowed key a typed column at query time, declare it with
 declaring does not change what the object already stored, so the two-step flow
 is load, then declare, then query.
 
+### `--zstd-level`: the RLOG compression level
+
+`--zstd-level <LEVEL>` (default `3`) sets the zstd level of every page and
+section a logs load's RLOG objects compress with zstd. It accepts zstd's range,
+-131072 to 22; a level outside it is refused before anything is read. A page or
+section is stored compressed only when that is smaller than storing it raw,
+and a page's encoding is chosen by stored size, so the level can also change
+which encoding a page keeps. zstd is lossless, so the level changes object
+size and never the records read back.
+
+The level applies only to the objects the load writes. Compaction decodes the
+records of the objects it merges and writes them again at its own level (3),
+so a compacted object carries no trace of the load's level. A metrics or spans load ignores the flag and prints
+a warning when it is set to anything but 3. `ravel-server` has no matching
+flag yet; its log flush writes at the default level.
+
+### Checking a tenant's clustering key and bloom scope
+
+A tenant's config record can carry a clustering key and a bloom scope
+(fields 13 and 14, see [catalog-and-mvcc.md](../catalog-and-mvcc.md)). Two
+read-only commands print them:
+
+```sh
+ravel-cli clustering-key show --tenant acme
+ravel-cli bloom-scope show --tenant acme
+```
+
+`clustering-key show` prints one of three states: the tenant never set a key
+(clustering generation 0, also printed when the tenant has no config record),
+the key was cleared at generation N, or the key is set, followed by its
+generation, bucket width (`1h`, `6h` or `1d`) and one `column:type` line per
+key column in key order. The type is the record's own declared type for that
+column; a tenant with no typed attribute column override prints
+`deployment-default`, since the deployment's declaration lives in server flags
+the command cannot read. `bloom-scope show` prints `all`, `undeclared` or
+`text`; a tenant with no config record reads as `all`. A stored value the
+catalog refuses (for example a set key naming a column the tenant does not
+declare) is an error with a non-zero exit, never a guess. This build's writer
+does not set either field yet, so a tenant configured through this build
+always reads as never set and `all`.
+
 ### Failure, retention, and performance
 
 A row that fails a kept check (future skew, a length cap, or the 1024 attribute
