@@ -10,8 +10,9 @@ use ravel_cli::{
 };
 use ravel_logseg::block::NumStat;
 use ravel_logseg::field_dir::FieldDir;
-use ravel_logseg::footer::{self, COMP_NONE, COMP_ZSTD, kind};
+use ravel_logseg::footer::{self, COMP_NONE, COMP_ZSTD, SortBucketWidth, SortKeyType, kind};
 use ravel_logseg::record::FieldType;
+use ravel_logseg::rlog_bloom::RlogBloomSection;
 use ravel_logseg::skip_index::SkipIndex;
 use ravel_logseg::stream_dir::StreamDir;
 use ravel_logseg::{RlogConfig, read_section};
@@ -2813,9 +2814,10 @@ fn rlog_stat_value(ty: FieldType, bits: u64) -> String {
 }
 
 /// Inspects a whole RLOG object (docs/log-segment-format.md): footer identity
-/// and summary, the section table, the level-0 skip index (one line per block
-/// plus its numeric column stats), the stream directory, and the field
-/// directory. Every decode is the reader's own path, so a corrupt SKIP_IDX or a
+/// and summary, the sort descriptor and clustering generation (ADR-2135), the
+/// section table, the level-0 skip index (one line per block plus its numeric
+/// column stats), the stream directory, the field directory, and the columns
+/// BLOOM covers. Every decode is the reader's own path, so a corrupt SKIP_IDX or a
 /// section crc mismatch surfaces as a typed error with a non-zero exit, never a
 /// panic.
 fn rlog_inspect(bytes: &[u8]) -> anyhow::Result<()> {
@@ -2842,6 +2844,24 @@ fn rlog_inspect(bytes: &[u8]) -> anyhow::Result<()> {
     println!("level: {}", footer.level);
     println!("input_set_hash: {}", hex::encode(&footer.input_set_hash));
     println!("part_index: {}", footer.part_index);
+    match &footer.sort_descriptor {
+        None => println!("sort_descriptor: none"),
+        Some(descriptor) => {
+            println!(
+                "sort_descriptor: bucket_width={} key_columns={}",
+                rlog_sort_bucket_width_name(descriptor.bucket_width),
+                descriptor.key_columns.len()
+            );
+            for (i, key) in descriptor.key_columns.iter().enumerate() {
+                println!(
+                    "  key[{i}] name={} type={}",
+                    key.name,
+                    rlog_sort_key_type_name(key.ty)
+                );
+            }
+        }
+    }
+    println!("clustering_generation: {}", footer.clustering_generation);
     println!("sections:");
     for section in &footer.sections {
         println!(
@@ -2922,7 +2942,35 @@ fn rlog_inspect(bytes: &[u8]) -> anyhow::Result<()> {
         );
     }
 
+    // BLOOM coverage: the columns the filters cover, named through FIELD_DIR.
+    let bloom_raw = read_section(bytes, section(kind::BLOOM)?, &cfg)
+        .map_err(|err| anyhow::anyhow!("failed to read bloom section: {err}"))?;
+    let bloom = RlogBloomSection::parse(&bloom_raw, &field_dir)
+        .map_err(|err| anyhow::anyhow!("failed to decode bloom section: {err}"))?;
+    println!("bloom_coverage ({} column(s)):", bloom.covered().len());
+    for &column_id in bloom.covered() {
+        let (name, column_kind) = rlog_footprint::column_name(column_id, &field_dir);
+        println!("  column_id={column_id} name={name} kind={column_kind}");
+    }
+
     Ok(())
+}
+
+fn rlog_sort_bucket_width_name(width: SortBucketWidth) -> &'static str {
+    match width {
+        SortBucketWidth::OneHour => "1h",
+        SortBucketWidth::SixHours => "6h",
+        SortBucketWidth::OneDay => "1d",
+    }
+}
+
+fn rlog_sort_key_type_name(ty: SortKeyType) -> &'static str {
+    match ty {
+        SortKeyType::Str => "str",
+        SortKeyType::I64 => "i64",
+        SortKeyType::Bool => "bool",
+        SortKeyType::Bytes => "bytes",
+    }
 }
 
 /// Readable flag names for an RSPAN v2 block `status_mask`
