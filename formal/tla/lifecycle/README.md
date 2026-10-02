@@ -399,6 +399,13 @@ What the window gate as modelled does not cover at all:
   version in the anchor identity, and the `sys/gc` version ratchet.
 - Liveness: ADR-1133's "cannot stall" argument is not checked; `FairSpec` gives
   the marker actions no fairness.
+- The widened pin against the erasure invariants. `CachedNames` and the Flight
+  ticket term make `ServesAny` strictly larger, so they can only make
+  `ErasedSubjectNeverServedAfterRequest` and `DreqRemovalCannotResurrect`
+  easier to violate. No cfg checks that combination: the window cfgs, the only
+  ones with `HeadCacheTtl` and `ClockSkew` nonzero, do not list those two
+  invariants and prune the erasure request with `WindowGateScope`, and every
+  cfg that lists them sets both constants to 0. Issue #2358 tracks it.
 
 ## Non-vacuity
 
