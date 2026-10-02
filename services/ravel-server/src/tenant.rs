@@ -132,7 +132,10 @@ pub fn build_auth_resolver_with_principals(
     oidc_ddl_claim: Option<String>,
 ) -> anyhow::Result<ResolverBundle> {
     if oidc_ddl_claim.is_some() && auth.oidc.is_none() {
-        anyhow::bail!("--oidc-ddl-claim requires OIDC to be configured (--oidc-issuer)");
+        anyhow::bail!(
+            "--oidc-ddl-claim was set but OIDC is not enabled (set --oidc-issuer and \
+             --oidc-jwks-url)"
+        );
     }
     let mut resolvers: Vec<Arc<dyn TenantResolver>> =
         vec![Arc::new(StaticBearerTokenResolver::with_principals(tokens))];

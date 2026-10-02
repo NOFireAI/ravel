@@ -47,7 +47,9 @@
 //! - `query.language` = the query language, `sql` today;
 //! - `query.tenant` = the tenant's hex hash (the record is attributed to the
 //!   resolved tenant, never to a client-supplied identity);
-//! - `query.status` = `ok` or `error`, the request's outcome;
+//! - `query.status` = `ok` or `error`, the request's outcome, or `attempted`,
+//!   which a DDL statement writes before it touches storage and follows with
+//!   its own `ok` or `error` record;
 //! - `query.window_start_ns` / `query.window_end_ns` = the request's resolved
 //!   time range (ADR-0042 decision 4 names time range as part of the record,
 //!   alongside tenant, query text, and result status);
