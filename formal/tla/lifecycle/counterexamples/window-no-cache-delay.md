@@ -14,7 +14,10 @@ Exact TLC line:
 Error: Invariant NoDeleteInsideProtectionWindow is violated.
 ```
 
-## Trace (twelve states, as TLC printed it)
+## Trace (eleven states, as TLC printed it)
+
+Recorded after reader deadlines became exclusive (issue #2339, round fifteen):
+a query reads while `clock < deadline`, and the gate compares with `<=`.
 
 1. Initial: `head = {raw1}`, `clock = 0`.
 2. `RetireBucket`: `tombRetiredAt["b1"] = 0`.
@@ -25,16 +28,17 @@ Error: Invariant NoDeleteInsideProtectionWindow is violated.
 7. `Tick`: `clock = 3`.
 8. `PinQuery`: the current HEAD names nothing, but the resolve is served the
    cached HEAD (`3 <= cacheUntil[raw1]`), so the query pins `raw1`. Its Flight
-   ticket term is 2, so `deadline = 3 + 1 + 2 = 6`.
-9. to 11. `Tick` three times: `clock = 6`.
-12. `RetentionSweep(raw1)`: the sweeper reads 7 (one ahead). The shortened gate
-    `1 + 5 < 7` opens (shifted, `obs + 5 < clock + ClockSkew + lead`, `7 < 8`). The
-    witness records `deleted |-> {raw1}, permittedNeeds |-> {raw1}` at clock 6.
+   ticket term is 2, so `deadline = 3 + 1 + 2 = 6` and it reads through clock 5.
+9. `Tick`, 10. `Tick`: `clock = 5`.
+11. `RetentionSweep(raw1)`: the sweeper reads 6 (one ahead). The shortened gate
+    `1 + 5 <= 6` opens (shifted, `obs + 5 <= clock + ClockSkew + lead`,
+    `7 <= 7`). The witness records
+    `deleted |-> {raw1}, permittedNeeds |-> {raw1}` at clock 5.
 
 ## The step that breaks safety
 
-State 12. The query pinned in state 8 through the cache, after the drop, and is
-still in its window (`6 <= 6`). The pin in state 8 is only possible through the
+State 11. The query pinned in state 8 through the cache, after the drop, and is
+still in its window (`5 < 6`). The pin in state 8 is only possible through the
 cache: HEAD had named nothing since state 5. With the `HeadCacheTtl` term the
-gate would need the sweeper's clock past `1 + 6 = 7`, true clock 7, one tick
-after the deadline.
+gate would need the sweeper's clock at `1 + 6 = 7`, true clock 6, the first
+tick at which the query no longer reads.

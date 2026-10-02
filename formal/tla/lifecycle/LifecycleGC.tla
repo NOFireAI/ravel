@@ -119,7 +119,7 @@ CONSTANTS
     HeadCacheTtl,               \* head_cache_ttl: a pin may still be handed a cached
                                 \* HEAD naming an object for this long after the HEAD
                                 \* that drops it is published
-    WindowSingleSkew,           \* negative control: the gate uses 1 * ClockSkew
+    WindowThreeSkew,            \* negative control: the gate uses 3 * ClockSkew
     WindowNoCacheDelay,         \* negative control: the gate omits HeadCacheTtl
                                 \* while the pin keeps its cache delay
     MarkerIgnoresAnchor         \* negative control: a marker counts whatever anchor
@@ -127,7 +127,7 @@ CONSTANTS
 
 ASSUME ProtectionHorizon \in Nat /\ Grace \in Nat
 ASSUME HeadCacheTtl \in Nat
-ASSUME WindowGate \in BOOLEAN /\ WindowSingleSkew \in BOOLEAN
+ASSUME WindowGate \in BOOLEAN /\ WindowThreeSkew \in BOOLEAN
 ASSUME WindowNoCacheDelay \in BOOLEAN /\ MarkerIgnoresAnchor \in BOOLEAN
 ASSUME SealBound \in Nat
 ASSUME MaxQueryDuration \in Nat /\ ClockSkew \in Nat
@@ -1221,7 +1221,7 @@ QueryPermits(o) ==
 WindowLength ==
     MaxQueryDuration
       + (IF WindowNoCacheDelay THEN 0 ELSE HeadCacheTtl)
-      + (IF WindowSingleSkew THEN 1 ELSE 4) * ClockSkew
+      + (IF WindowThreeSkew THEN 3 ELSE 4) * ClockSkew
 
 AnchorOf(k) == IF k \in Buckets THEN tombRetiredAt[k] ELSE supersededAt[k]
 

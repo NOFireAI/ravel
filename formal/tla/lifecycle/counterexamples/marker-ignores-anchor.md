@@ -16,25 +16,29 @@ Exact TLC line:
 Error: Invariant NoDeleteInsideProtectionWindow is violated.
 ```
 
-## Trace (eleven states, as TLC printed it)
+## Trace (ten states, as TLC printed it)
+
+Recorded after reader deadlines became exclusive (issue #2339, round fifteen):
+a query reads while `clock < deadline`, and the gate compares with `<=`.
 
 1. Initial: `head = {raw1}`, `clock = 0`.
 2. `RetireBucket`: `tombRetiredAt["b1"] = 0`.
-3. to 7. `Tick` five times: `clock = 5`.
-8. `PinQuery`: a query pins the current HEAD, which names `raw1`, with
-   `deadline = 5 + 1 + 0 = 6`.
-9. `DropRetiredBucketFromHead`: `head = {}` at clock 5.
-10. `StaleMarker(b1)`: a marker for anchor 9 (`StaleAnchor`, no live anchor)
-    with `obs = 0` appears under `b1`.
-11. `RetentionSweep(raw1)`: the anchor does not match `tombRetiredAt["b1"] = 0`,
-    but the switch accepts it; its window has long passed
-    (`0 + 6 < 5 + 1 + 1`). The witness records
-    `deleted |-> {raw1}, permittedNeeds |-> {raw1}` at clock 5.
+3. to 6. `Tick` four times: `clock = 4`.
+7. `PinQuery`: a query pins the current HEAD, which names `raw1`, with
+   `deadline = 4 + 1 + 0 = 5`.
+8. `DropRetiredBucketFromHead`: `head = {}` at clock 4, and
+   `cacheUntil[raw1] = 5`.
+9. `StaleMarker(b1)`: a marker for anchor 9 (`StaleAnchor`, no live anchor)
+   with `obs = 0` appears under `b1`.
+10. `RetentionSweep(raw1)`: the anchor does not match `tombRetiredAt["b1"] = 0`,
+    but the switch accepts it; its window has passed
+    (`0 + 6 <= 4 + 1 + 1`). The witness records
+    `deleted |-> {raw1}, permittedNeeds |-> {raw1}` at clock 4.
 
 ## The step that breaks safety
 
-State 11, in the same tick as the drop. No window has passed since HEAD stopped
-naming `raw1`; the marker's reading predates the drop because it was written
-for another anchor. With the anchor check, state 10's marker would count as
-absent and `RenewMarker` would rewrite it with a fresh reading, restarting the
-window.
+State 10, in the same tick as the drop, while the query reads (`4 < 5`). No
+window has passed since HEAD stopped naming `raw1`; the marker's reading
+predates the drop because it was written for another anchor. With the anchor
+check, state 9's marker would count as absent and `RenewMarker` would rewrite
+it with a fresh reading, restarting the window.

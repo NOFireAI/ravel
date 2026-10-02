@@ -17,25 +17,29 @@ Exact TLC line:
 Error: Invariant NoDeleteInsideProtectionWindow is violated.
 ```
 
-## Trace (six states, as TLC printed it)
+## Trace (seven states, as TLC printed it)
+
+Recorded after reader deadlines became exclusive (issue #2339, round fifteen):
+a query reads while `clock < deadline`.
 
 1. Initial: `head = {raw1}`, `clock = 0`, no query, no tombstone.
-2. `PinQuery`: a query pins the current HEAD.
-   `query = [active |-> TRUE, needs |-> {raw1}, deadline |-> 1]`.
+2. `Tick`: `clock = 1`.
 3. `RetireBucket`: the retention tombstone for `b1` lands with
-   `tombRetiredAt["b1"] = 0`.
-4. `DropRetiredBucketFromHead`: the fold drops `b1` from HEAD, `head = {}`. The
+   `tombRetiredAt["b1"] = 1`, so the retention horizon is clock 2.
+4. `Tick`: `clock = 2`.
+5. `PinQuery`: a query pins the current HEAD, which still names `raw1`.
+   `query = [active |-> TRUE, needs |-> {raw1}, deadline |-> 3]`.
+6. `DropRetiredBucketFromHead`: the fold drops `b1` from HEAD, `head = {}`. The
    query keeps reading the HEAD it pinned.
-5. `Tick`: `clock = 1`, so the retention horizon `0 + 1` has passed. The query is
-   still in its window (`1 <= 1`).
-6. `RetentionSweep(raw1)`: horizon passed, HEAD names nothing in `b1`, and
-   nothing else is checked. The witness records
+7. `RetentionSweep(raw1)` at clock 2: horizon passed, HEAD names nothing in
+   `b1`, and nothing else is checked. The query is still in its window
+   (`2 < 3`). The witness records
    `rule |-> retention, deleted |-> {raw1}, permittedNeeds |-> {raw1}`.
 
 ## The step that breaks safety
 
-State 6. Clause 4 of `NoDeleteInsideProtectionWindow` requires
+State 7. Clause 4 of `NoDeleteInsideProtectionWindow` requires
 `deleted \cap permittedNeeds = {}` for every horizon-gated delete; here it is
 `{raw1}`. The original candidate trace in `candidate-1133.md` reaches the same
 violation through the superseded sweep; the trace TLC printed for this run is
-the retention path, the same length.
+the retention path.

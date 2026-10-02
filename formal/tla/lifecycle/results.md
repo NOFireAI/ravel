@@ -1913,7 +1913,7 @@ model as committed.
 | exhaustive.cfg | PASS, FairSpec with EventuallySwept and EventuallyCompleted | 2835448 | 31 | 0 | 2672s |
 | positive/window-gate.cfg | PASS | 543543 | 20 | 0 | 49s |
 | negative/pinned-query-ungated.cfg | VIOLATED NoDeleteInsideProtectionWindow | 2408 at the violation | - | 12 | 2s |
-| negative/window-single-skew.cfg | VIOLATED NoDeleteInsideProtectionWindow | 12325 at the violation | - | 12 | 3s |
+| negative/window-single-skew.cfg (replaced in round fifteen) | VIOLATED NoDeleteInsideProtectionWindow | 12325 at the violation | - | 12 | 3s |
 | negative/window-no-cache-delay.cfg | VIOLATED NoDeleteInsideProtectionWindow | 45086 at the violation | - | 12 | 5s |
 | negative/marker-ignores-anchor.cfg | VIOLATED NoDeleteInsideProtectionWindow | 23290 at the violation | - | 12 | 4s |
 
@@ -1957,17 +1957,19 @@ none of it is committed. Each is violated, exit 12:
 
 ### Each control fails for its own reason
 
+Round fifteen below replaced `window-single-skew` with `window-three-skew` and
+re-recorded every window control's trace under exclusive deadlines; the notes
+under `counterexamples/` carry the current traces. In round fourteen:
+
 - `pinned-query-ungated`: a pin, the tombstone, the fold's drop, one tick, and
   the retention delete while the query is in window.
-  `counterexamples/pinned-query-ungated.md`.
-- `window-single-skew`: the delete at clock 4 inside a deadline of 4, spending
-  the writer's lag, the sweeper's lead and one Flight ticket term.
-  `counterexamples/window-single-skew.md`.
+- `window-single-skew` (gate `1 * ClockSkew`): the delete at clock 4 inside a
+  deadline of 4, spending the writer's lag, the sweeper's lead and one Flight
+  ticket term.
 - `window-no-cache-delay`: the query pins through the cache after HEAD has
   dropped the object, and the shortened gate opens on its deadline tick.
-  `counterexamples/window-no-cache-delay.md`.
 - `marker-ignores-anchor`: a stale marker lets the delete land in the drop's own
-  tick. `counterexamples/marker-ignores-anchor.md`.
+  tick.
 
 ### Other changes
 
@@ -2034,3 +2036,60 @@ constants (only `FairSpec` and the two liveness properties differ), so the
 nightly lane's next run should find smoke.cfg's new figures and fail the band
 until the row is re-measured.
 
+
+### The gate is exact
+
+Four scratch copies of the model, none committed, each with one edit to
+`WindowLength` or `WindowPermits`, ran `positive/window-gate.cfg` through TLC
+directly (`-workers 2`, `-Xmx2g`):
+
+| gate | result | distinct | exit |
+|---|---|---|---|
+| decision 3: `4 * ClockSkew`, `HeadCacheTtl`, `<=` (the committed model) | PASS | 581630 | 0 |
+| `3 * ClockSkew` | VIOLATED NoDeleteInsideProtectionWindow | 24017 at the violation | 12 |
+| no `HeadCacheTtl` term | VIOLATED NoDeleteInsideProtectionWindow | 23975 at the violation | 12 |
+| `<` in place of `<=` | PASS | 543547 | 0 |
+
+The first row is the positive run in the table above. One sigma less or no
+cache term opens the gate while a covered query can still read, so neither
+can be dropped; `<` passes because it is strictly stronger than `<=`. Under
+exclusive reader deadlines and the inclusive cache bound, decision 3's `<=` is
+the weakest of these comparisons that holds.
+
+### The three-skew control
+
+`negative/window-single-skew.cfg` cut the gate's skew term to `1 * ClockSkew`,
+which removes three of the four sigma at once and so does not show the fourth
+is needed. It is replaced by `negative/window-three-skew.cfg`
+(`WindowThreeSkew = TRUE`, gate `3 * ClockSkew`), one sigma short of decision
+3. It violates `NoDeleteInsideProtectionWindow`, exit 12: a query pins through
+the cache at clock 3 with both Flight ticket terms (deadline 6), and the
+retention delete runs at clock 5 with the writer's lag and the sweeper's lead,
+spending all four sigma. `counterexamples/window-three-skew.md` has the trace.
+
+### Negative controls
+
+One `scripts/check-tla.sh negative -a lifecycle` run, same host and settings:
+all thirteen gave `VIOLATED as expected` with their own target, exit 12.
+
+| cfg | target | distinct at the violation | wall |
+|---|---|---|---|
+| compaction-ignores-rewrite | AtMostOneLiveRecordSetServed | 10519 | 2s |
+| complete-ignores-served-set | CompletionImpliesNoPreRewriteExposure | 129 | 1s |
+| completion-ignores-open-bucket | CompletionCoversEveryBucketOpenAtRequest | 12390 | 2s |
+| delete-before-horizon | NoDeleteInsideProtectionWindow | 447 | 1s |
+| dreq-ignores-held-inputs | DreqSweepRespectsLegalHold | 26408 | 3s |
+| marker-ignores-anchor | NoDeleteInsideProtectionWindow | 12040 | 2s |
+| pinned-query-ungated | NoDeleteInsideProtectionWindow | 4245 | 2s |
+| refresh-failure-is-no-hold | RefreshFailureNeverSweeps | 3499 | 1s |
+| rewrite-identity-omits-requests | IdenticalInputSetsDoNotCollide | 321 | 1s |
+| rewrite-keeps-erased-records | RewriteOutputsAreInputsMinusErased | 327 | 1s |
+| superseded-sweep-ungated | HeadNamedObjectNeverDeletedBySupersededSweep | 1357 | 1s |
+| window-no-cache-delay | NoDeleteInsideProtectionWindow | 24014 | 3s |
+| window-three-skew | NoDeleteInsideProtectionWindow | 24055 | 3s |
+
+The traces of `pinned-query-ungated`, `window-no-cache-delay` and
+`marker-ignores-anchor` changed with the deadline boundary, and their notes
+under `counterexamples/` are re-recorded from this run. A distinct count at
+the violation is where TLC stopped with two workers and moves slightly between
+runs.

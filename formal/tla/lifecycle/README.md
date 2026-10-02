@@ -329,9 +329,10 @@ What the model adds, all inert at `WindowGate = FALSE` and `HeadCacheTtl = 0`:
   has no choice of its own.
 - `WindowPermits`, the gate: a matching marker whose reading plus
   `MaxQueryDuration + HeadCacheTtl + 4 * ClockSkew` is at most the deleting
-  sweeper's clock, decision 3's `<=`. `RetentionSweep` and `SupersededSweep` require it.
-- Three switches, each a negative control: `WindowSingleSkew`
-  (`1 * ClockSkew`), `WindowNoCacheDelay` (no `HeadCacheTtl` term while the pin
+  sweeper's clock, decision 3's `<=`. `RetentionSweep` and `SupersededSweep`
+  require it.
+- Three switches, each a negative control: `WindowThreeSkew`
+  (`3 * ClockSkew`, one sigma short), `WindowNoCacheDelay` (no `HeadCacheTtl` term while the pin
   keeps its delay) and `MarkerIgnoresAnchor` (any marker counts, and
   `RenewMarker` is off). Each violates `NoDeleteInsideProtectionWindow`; the
   notes under `counterexamples/` give the traces.
@@ -411,10 +412,11 @@ have a recorded TLC violation.
 the deletes it judges safe actually happen. Scratch cover invariants (a delete
 never happens, a pinned object is never deleted, a pin through the cache is
 never enabled, `RenewMarker` is never enabled) each fail under its bounds;
-results.md, issue
-#2339 round, has the runs. Its three switch controls show that the full
-`4 * ClockSkew` term, the `HeadCacheTtl` term and the anchor check are each
-load-bearing.
+results.md, "Round fourteen", has the runs. Its three switch controls show that
+the full `4 * ClockSkew` term (`WindowThreeSkew` is one sigma short, and its
+trace spends all four sigma), the `HeadCacheTtl` term and the anchor check are
+each load-bearing: each removal alone violates
+`NoDeleteInsideProtectionWindow`.
 
 ## State-space control
 
