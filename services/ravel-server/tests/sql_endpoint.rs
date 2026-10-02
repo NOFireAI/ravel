@@ -2000,6 +2000,46 @@ async fn rejected_statement_kinds_return_400_over_http() {
     }
 }
 
+/// A malformed `timeout` is refused with 400 before any statement handling,
+/// whether or not the caller holds `ddl`, and writes no audit record, the
+/// same as a body that is not valid JSON. Without the parse ahead of the
+/// capability check, a plain token would get 403 with an `error` record and
+/// a `ddl` token a 400 with none.
+#[tokio::test]
+async fn a_malformed_timeout_on_ddl_is_refused_before_any_audit_record() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let sink = Arc::new(RecordingAuditSink::default());
+    let app = build_router_principals(
+        store,
+        HashMap::from([
+            (
+                "plain-token".to_string(),
+                Principal {
+                    tenant: TenantId::new("acme".to_string()),
+                    ddl: false,
+                },
+            ),
+            (
+                "ddl-token".to_string(),
+                Principal {
+                    tenant: TenantId::new("acme".to_string()),
+                    ddl: true,
+                },
+            ),
+        ]),
+        sink.clone(),
+        None,
+    );
+    let payload = serde_json::json!({"query": "DROP TABLE clicks", "timeout": -1}).to_string();
+    for token in ["plain-token", "ddl-token"] {
+        let (status, bytes) = post(&app, Some(token), None, payload.clone()).await;
+        let value: Value = serde_json::from_slice(&bytes).expect("JSON body");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{token}: {value}");
+        assert_eq!(value["errorType"], "bad_data", "{token}: {value}");
+        assert!(sink.take().is_empty(), "{token}: no audit record");
+    }
+}
+
 /// A token that DOES hold the `ddl` capability still gets routed to the DDL
 /// path on the leading keyword alone, and only there does `validate_ddl`
 /// discover that `CREATE ROLE` is not one of the three admitted forms: 400
