@@ -1,0 +1,26 @@
+# ClickBench Parquet lane: per-statement comparator overrides, plus the
+# Ravel CREATE EXTERNAL TABLE template that mounts the fixture's hits.parquet.
+#
+# `queries.sql` is upstream text (frozen; pinned by blake3 in suite.rs) and is
+# never edited for Ravel's grammar. Where a statement's ORDER BY clause does
+# not resolve to a projection index under the comparator's textual rules
+# (alias match, bare column, unaliased expression text match), its ORDER BY
+# key is given here instead.
+
+[table]
+# `{location}` is substituted with the fixture's hits.parquet object URL.
+# `ravel.cast.EventDate` reproduces upstream's view cast
+# `CAST(CAST("EventDate" AS INTEGER) AS DATE)` at the table level, since the
+# admitted DDL (ravel-sql::validate::validate_ddl) has no CREATE VIEW form.
+template = "CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{location}' OPTIONS ('binary_as_string' 'true', 'ravel.cast.EventDate' 'date-from-days')"
+
+# Q43: `ORDER BY DATE_TRUNC('minute', M)` matches neither the alias `M` alone
+# (rule a), nor a bare column (rule b), nor the unaliased projection
+# expression text (rule c: the projection is
+# `DATE_TRUNC('minute', to_timestamp_seconds("EventTime"))`, not
+# `DATE_TRUNC('minute', M)`). `DATE_TRUNC('minute', M)` is a no-op given `M`
+# is already minute-truncated, so the tie-breaking key is the first
+# (0-indexed) projection column.
+[[statement]]
+number = 43
+order_key = [0]
