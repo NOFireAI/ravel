@@ -213,10 +213,16 @@ impl GcConfigValues {
 pub enum GcConfigError {
     #[error("object store error accessing sys/gc: {0}")]
     Store(String),
-    /// The store refused this process's credential on the `sys/gc` read or on
-    /// the bootstrap create. Kept apart from [`GcConfigError::Store`] because
-    /// under per-role credentials it means start order (only Maintain and Admin
-    /// may create `sys/gc`, ADR-0055 section 4), not a broken store.
+    /// The store refused this process's credential on the `sys/gc` GET
+    /// ([`GcAccessOp::Read`], from [`read_gc_config`], including the read
+    /// [`set_gc_config`] issues first) or on [`bootstrap_gc_config`]'s create
+    /// ([`GcAccessOp::Create`]). Kept apart from [`GcConfigError::Store`]
+    /// because it is a credential grant problem, not a broken store. A refused
+    /// create from a per-role Gateway or Query credential means start order
+    /// (only Maintain and Admin may create `sys/gc`, ADR-0055 section 4); a
+    /// refused read, or a refused create under a credential that should hold
+    /// the grant, means the credential lacks it. [`set_gc_config`]'s own
+    /// refused PUT still surfaces as [`GcConfigError::Store`].
     #[error("access to sys/gc was refused on {op}: {detail}")]
     AccessDenied { op: GcAccessOp, detail: String },
     #[error("sys/gc is corrupt and could not be decoded: {0}")]

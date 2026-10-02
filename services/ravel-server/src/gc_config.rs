@@ -15,11 +15,13 @@
 //! fails startup for any process whose credential may create `sys/gc`; only a
 //! *present* object that a mode really violates refuses. Under per-role
 //! credentials Gateway and Query may not create it, and their refused bootstrap
-//! fails with [`bootstrap_failure_context`]'s start-order fix.
+//! fails with [`bootstrap_failure_context`]'s start-order fix; a refusal in
+//! any other case names the missing grant instead.
 
 use std::time::Duration;
 
-use ravel_maintain::{CompactorConfig, GcConfigError, GcConfigValues};
+use crate::Mode;
+use ravel_maintain::{CompactorConfig, GcAccessOp, GcConfigError, GcConfigValues};
 use ravel_object_store::ObjectStoreBackend;
 
 /// A `Duration` as saturating `i64` nanoseconds, matching how every ns knob in
@@ -39,19 +41,39 @@ pub async fn bootstrap(
     ravel_maintain::bootstrap_gc_config(store, GcConfigValues::maintain_defaults(), now_ns).await
 }
 
-/// The context startup attaches to a failed [`bootstrap`]. A refused access is
-/// a start-order problem under per-role credentials (ADR-0055 section 4: only
-/// the Maintain and Admin roles may create `sys/gc`), so it names the fix rather
-/// than reading like a broken credential; every other failure keeps the generic
-/// context.
-pub fn bootstrap_failure_context(err: &GcConfigError) -> String {
+/// The context startup attaches to a failed [`bootstrap`] in `mode`. A refused
+/// access names the grant or start order that fixes it, chosen by which request
+/// was refused and by whether this mode's role may create `sys/gc` (ADR-0055
+/// section 4: only the Maintain and Admin roles may); every other failure keeps
+/// the generic context.
+pub fn bootstrap_failure_context(err: &GcConfigError, mode: Mode) -> String {
     match err {
-        GcConfigError::AccessDenied { .. } => "sys/gc could not be read or created with this \
-             process's object-store credential. Under per-role credentials only the Maintain \
-             and Admin roles create sys/gc, so a gateway or query process started on a bucket \
-             where it does not exist yet is refused. Start the maintain process first, or run \
-             `ravel-cli gc-config set` under the Admin credential, then restart this process"
+        GcConfigError::AccessDenied {
+            op: GcAccessOp::Read,
+            ..
+        } => "this process's object-store credential was refused GetObject on sys/gc. Every \
+             server role needs read on sys/gc, plus kms:Decrypt on the bucket's default key if \
+             the bucket uses SSE-KMS. Restarting will not help until that grant is fixed"
             .to_string(),
+        GcConfigError::AccessDenied {
+            op: GcAccessOp::Create,
+            ..
+        } => match mode {
+            Mode::Gateway | Mode::Query => "sys/gc does not exist yet and this process's \
+                 object-store credential was refused its create. Under per-role credentials \
+                 only the Maintain and Admin roles create sys/gc: start the maintain process \
+                 first, or run `ravel-cli gc-config set` under the Admin credential, then \
+                 restart this process. Under a shared credential the same refusal means this \
+                 credential lacks PutObject on sys/gc or kms:GenerateDataKey on the bucket's \
+                 default key"
+                .to_string(),
+            Mode::Maintain | Mode::All => "sys/gc does not exist yet and this process's \
+                 object-store credential was refused its create. The Maintain role needs \
+                 PutObject on sys/gc, plus kms:GenerateDataKey on the bucket's default key if \
+                 the bucket uses SSE-KMS; check this credential against \
+                 deploy/iam/maintain.json"
+                .to_string(),
+        },
         _ => "failed to bootstrap or read the durable GC config (sys/gc)".to_string(),
     }
 }
@@ -92,29 +114,80 @@ pub fn flight_ceiling(stored: &GcConfigValues) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ravel_maintain::gc_config::GcAccessOp;
+
+    fn denied(op: GcAccessOp) -> GcConfigError {
+        GcConfigError::AccessDenied {
+            op,
+            detail: "sys/gc: AccessDenied".into(),
+        }
+    }
 
     #[test]
-    fn refused_bootstrap_names_the_start_order_fix() {
-        let err = GcConfigError::AccessDenied {
-            op: GcAccessOp::Create,
-            detail: "sys/gc: AccessDenied".into(),
-        };
-        let msg = bootstrap_failure_context(&err);
-        assert!(msg.contains("Start the maintain process first"), "{msg}");
-        assert!(
-            msg.contains("`ravel-cli gc-config set` under the Admin credential"),
-            "{msg}"
-        );
-        assert!(
-            msg.contains("only the Maintain and Admin roles create sys/gc"),
-            "{msg}"
-        );
+    fn refused_create_in_gateway_or_query_names_the_start_order_fix() {
+        for mode in [Mode::Gateway, Mode::Query] {
+            let msg = bootstrap_failure_context(&denied(GcAccessOp::Create), mode);
+            assert!(msg.contains("start the maintain process first"), "{msg}");
+            assert!(
+                msg.contains("`ravel-cli gc-config set` under the Admin credential"),
+                "{msg}"
+            );
+            assert!(
+                msg.contains("only the Maintain and Admin roles create sys/gc"),
+                "{msg}"
+            );
+            assert!(
+                msg.contains(
+                    "Under a shared credential the same refusal means this credential lacks \
+                     PutObject on sys/gc or kms:GenerateDataKey"
+                ),
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn refused_create_in_maintain_or_all_names_the_maintain_grant() {
+        for mode in [Mode::Maintain, Mode::All] {
+            let msg = bootstrap_failure_context(&denied(GcAccessOp::Create), mode);
+            assert!(
+                msg.contains("The Maintain role needs PutObject on sys/gc"),
+                "{msg}"
+            );
+            assert!(msg.contains("kms:GenerateDataKey"), "{msg}");
+            assert!(msg.contains("deploy/iam/maintain.json"), "{msg}");
+            assert!(
+                !msg.to_lowercase().contains("start the maintain process"),
+                "{msg}"
+            );
+            assert!(!msg.contains("gc-config set"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn refused_read_names_the_read_grant_in_every_mode() {
+        for mode in [Mode::All, Mode::Gateway, Mode::Query, Mode::Maintain] {
+            let msg = bootstrap_failure_context(&denied(GcAccessOp::Read), mode);
+            assert!(msg.contains("refused GetObject on sys/gc"), "{msg}");
+            assert!(
+                msg.contains("Every server role needs read on sys/gc"),
+                "{msg}"
+            );
+            assert!(msg.contains("kms:Decrypt"), "{msg}");
+            assert!(
+                msg.contains("Restarting will not help until that grant is fixed"),
+                "{msg}"
+            );
+            assert!(
+                !msg.to_lowercase().contains("start the maintain process"),
+                "{msg}"
+            );
+            assert!(!msg.contains("gc-config set"), "{msg}");
+        }
     }
 
     #[test]
     fn other_bootstrap_failures_keep_the_generic_context() {
-        let msg = bootstrap_failure_context(&GcConfigError::Store("timeout".into()));
+        let msg = bootstrap_failure_context(&GcConfigError::Store("timeout".into()), Mode::Gateway);
         assert_eq!(
             msg,
             "failed to bootstrap or read the durable GC config (sys/gc)"

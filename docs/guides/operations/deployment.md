@@ -252,7 +252,10 @@ per-role tables imply. Know this before your first deployment:
   reaches an empty bucket under its scoped credential is refused and exits
   with an error saying that `sys/gc` could not be created with its
   credential and naming that fix; it keeps exiting until the object exists,
-  so a restart policy brings it up after maintain has created it. Under one
+  so a restart policy brings it up after maintain has created it. A maintain
+  process refused that create instead gets an error naming the PutObject grant
+  on `sys/gc` (and `kms:GenerateDataKey` under SSE-KMS) its role needs, checked
+  against `deploy/iam/maintain.json`, not start-order advice. Under one
   shared credential any server process creates `sys/gc`, so start order does
   not matter there. The mutation path that changes an existing `sys/gc` is
   Admin-only, matching that it is an explicit operator action rather than

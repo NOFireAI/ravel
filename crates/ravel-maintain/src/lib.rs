@@ -93,7 +93,7 @@ pub use erasure_rewrite::{
 };
 pub use error::{MaintainError, MergeCursorBudgetSite, Result};
 pub use gc_config::{
-    GC_CONFIG_KEY, GcConfigError, GcConfigValues, SetOutcome, bootstrap_gc_config,
+    GC_CONFIG_KEY, GcAccessOp, GcConfigError, GcConfigValues, SetOutcome, bootstrap_gc_config,
     ingest_max_flush_lifetime_floor_ns, read_gc_config, set_gc_config, validate_flight_ceiling,
     validate_maintain, validate_maintain_skew, validate_query_deadline,
 };

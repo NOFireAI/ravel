@@ -797,10 +797,12 @@ ready and unavailable replica counts, so you can see whether it is coming up.
 A gateway or query process that does start before `sys/gc` exists under a
 per-role credential (a hand-applied Deployment, or `maintain.enabled: false`
 below) is refused and exits at startup with an error that names the
-cause: `sys/gc` could not be read or created with this process's credential,
-only the Maintain and Admin roles create it, and the fix is to start the
-maintain process first or run `ravel-cli gc-config set` under the Admin
-credential. It keeps exiting with that error until `sys/gc` exists; the
+cause: `sys/gc` does not exist yet and this process's credential was refused
+its create, only the Maintain and Admin roles create it, and the fix is to start
+the maintain process first or run `ravel-cli gc-config set` under the Admin
+credential. The same error adds that under a shared credential this refusal
+instead means the credential lacks PutObject on `sys/gc` or
+`kms:GenerateDataKey` on the bucket's default key. It keeps exiting with that error until `sys/gc` exists; the
 Deployment's restart policy brings it up on the first restart after maintain
 (or `gc-config set`) has created the object, with no other action needed.
 
