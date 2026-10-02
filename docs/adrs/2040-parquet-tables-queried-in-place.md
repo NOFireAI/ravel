@@ -978,12 +978,15 @@ by statement kind, without stating the routing rule or the per-path event
 count. Both are narrower, and one test case was wrong about the status it
 named.
 
-**Audit.** A statement refused for the `ddl` capability submits one audit
-event (`error`). A statement handed to `execute_ddl` submits two:
-`attempted` before it runs, awaited so a failed submission refuses it
-before any store call, and `ok` or `error` after it finishes, from a task
-a client disconnect cannot cancel. A failed outcome submission never
-changes the response: the statement is already on record.
+**Audit.** A request whose `timeout` is malformed is refused with 400
+before any statement handling, for every caller, and writes no record, the
+same as a body that is not valid JSON. A statement refused for the `ddl`
+capability submits one audit event (`error`). A statement past that check
+submits two: `attempted` first, awaited so a failed submission refuses it
+before any store call, and `ok` or `error` once it is refused by admission
+or finishes in `execute_ddl`, from a task a client disconnect cannot
+cancel. A failed outcome submission never changes the response: the
+statement is already on record.
 
 **Routing.** A statement routes to the DDL path iff its first real token --
 skipping whitespace, `--` comments, and nested plain `/* */` comments --

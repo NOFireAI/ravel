@@ -142,11 +142,11 @@ pub struct SqlState {
     /// before running the statement (ADR-0062 §2a). Every query surface
     /// audits through this one seam rather than a direct `write_query_audit`
     /// call. A query submits one event per request. A statement refused for
-    /// the `ddl` capability submits one event (`error`). A statement handed
-    /// to [`SqlExecutor::execute_ddl`] submits two: `attempted` before it
-    /// runs, awaited so a failed submission refuses it before any store call,
-    /// and `ok` or `error` after it finishes, from a task a client disconnect
-    /// cannot cancel (see [`run_ddl`]). Defaults to
+    /// the `ddl` capability submits one event (`error`). A statement past
+    /// that check submits two: `attempted` first, awaited so a failed
+    /// submission refuses it before any store call, and `ok` or `error` once
+    /// admission refuses it or [`SqlExecutor::execute_ddl`] finishes, from a
+    /// task a client disconnect cannot cancel (see [`run_ddl`]). Defaults to
     /// [`NoopQueryAuditSink`](ravel_maintain::NoopQueryAuditSink); a deployment
     /// attaches the one shared pipeline.
     pub audit_sink: Arc<dyn QueryAuditSink>,
@@ -309,12 +309,15 @@ fn request_deadline(body: &SqlBody, max_deadline: Duration) -> Result<Duration, 
 /// which is also what the manifest records as its creator; no header or body
 /// value can name another.
 ///
-/// A statement refused for the `ddl` capability submits one audit event
-/// (`error`). A statement handed to [`SqlExecutor::execute_ddl`] submits two:
-/// `attempted` before it runs, awaited so a failed submission refuses it
-/// before any store call, and `ok` or `error` after it finishes, from a task
-/// a client disconnect cannot cancel. A failed outcome submission never
-/// changes the response: the statement is already on record.
+/// A request whose `timeout` is malformed is refused with 400 before any
+/// statement handling, for every caller, and writes no audit record, the
+/// same as a body that is not valid JSON. A statement refused for the `ddl`
+/// capability submits one audit event (`error`). A statement past that check
+/// submits two: `attempted` first, awaited so a failed submission refuses it
+/// before any store call, and `ok` or `error` once it is refused by admission
+/// or finishes in [`SqlExecutor::execute_ddl`], from a task a client
+/// disconnect cannot cancel. A failed outcome submission never changes the
+/// response: the statement is already on record.
 async fn run_ddl(
     state: &SqlState,
     principal: &Principal,
@@ -324,6 +327,7 @@ async fn run_ddl(
     let now_ns = state.clock.now_ns();
     let service = state.service();
     let controls = service.controls();
+    let deadline = request_deadline(body, state.max_deadline)?;
 
     if !principal.ddl {
         controls
@@ -340,8 +344,6 @@ async fn run_ddl(
             "this credential does not hold the ddl capability".to_string(),
         ));
     }
-
-    let deadline = request_deadline(body, state.max_deadline)?;
 
     // The `attempted` record: submitted and awaited before anything is read
     // or written, so a failed submission (today's 503 `unavailable`) refuses
