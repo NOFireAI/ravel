@@ -511,7 +511,7 @@ two-step operation rather than a rolling configuration change. See
 for the order to change them in.
 
 `ravel-cli maintain sweep` reads the same `sys/gc` object. It sweeps on the
-stored protection horizon and grace, and refuses before it sweeps
+stored protection horizon, grace and maximum flush lifetime, and refuses before it sweeps
 when the stored horizon does not cover its own 5 min clock-skew allowance, the
 check the server's maintain mode runs at startup. On a bucket with no `sys/gc`
 it bootstraps the object from the maintain defaults, as the server does; a

@@ -1129,13 +1129,15 @@ where
 /// `sys/gc` (ADR-1133 decision 4), validated the way the server's maintain mode
 /// validates its own before it sweeps.
 ///
-/// `protection_horizon`, `grace`, `max_query_duration` and `head_cache_ttl`
-/// come from `sys/gc`, which is bootstrapped from the maintain defaults when
-/// absent, as the server's startup does. A dry run writes nothing, so on a
-/// bucket with no `sys/gc` it uses those same defaults without writing them.
-/// [`ravel_maintain::validate_maintain`] and
-/// [`ravel_maintain::validate_maintain_skew`] then run against this sweep's
-/// own `clock_skew_allowance`, and a violation is an error before any delete.
+/// `protection_horizon`, `grace`, `max_flush_lifetime`, `max_query_duration`
+/// and `head_cache_ttl` come from `sys/gc`, which is bootstrapped from the
+/// maintain defaults when absent, as the server's startup does. A dry run
+/// writes nothing, so on a bucket with no `sys/gc` it uses those same defaults
+/// without writing them. [`ravel_maintain::validate_maintain_skew`] then runs
+/// against this sweep's own `clock_skew_allowance`, and a violation is an error
+/// before any delete. [`ravel_maintain::validate_maintain`] also runs, but
+/// since horizon and grace are copied from the same `sys/gc`, it can only fail
+/// if a later edit stops sourcing them from there.
 pub async fn sweep_compactor_config(
     store: &dyn ObjectStoreBackend,
     dry_run: bool,
@@ -1159,6 +1161,7 @@ pub async fn sweep_compactor_config(
         force_orphan_gc,
         protection_horizon_ns: gc.protection_horizon_ns,
         grace_ns: gc.grace_ns,
+        max_flush_lifetime_ns: gc.max_flush_lifetime_ns,
         max_query_duration_ns: gc.max_query_duration_ns,
         head_cache_ttl_ns: gc.head_cache_ttl_ns,
         ..CompactorConfig::default()

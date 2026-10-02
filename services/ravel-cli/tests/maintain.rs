@@ -902,6 +902,7 @@ fn non_default_gc_proposal() -> ravel_maintain::GcConfigProposal {
             + defaults.grace_ns
             + ravel_maintain::config::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
         max_query_duration_ns,
+        max_flush_lifetime_ns: 6 * NS_PER_HOUR,
         head_cache_ttl_ns: Some(10_000_000_000),
         ..defaults.into()
     }
@@ -936,6 +937,12 @@ async fn sweep_config_carries_the_stored_sys_gc_values() {
     assert_eq!(config.head_cache_ttl_ns, 10_000_000_000);
     assert_eq!(config.protection_horizon_ns, proposal.protection_horizon_ns);
     assert_eq!(config.grace_ns, proposal.grace_ns);
+    assert_eq!(config.max_flush_lifetime_ns, 6 * NS_PER_HOUR);
+    assert_eq!(
+        config.orphan_age_gate_ns(),
+        proposal.grace_ns + 6 * NS_PER_HOUR,
+        "the orphan gate sums grace and max_flush_lifetime, both from sys/gc"
+    );
     assert_eq!(
         config.clock_skew_allowance_ns,
         ravel_maintain::config::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
