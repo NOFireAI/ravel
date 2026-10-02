@@ -442,7 +442,7 @@ _No flags._
 
 ### gc-config set
 
-Write a full new `sys/gc`, enforcing `protection_horizon >= max_query_duration + grace + clock_skew_allowance` at write time and swapping the durable object with `CasVersion`. All durations are humantime strings (e.g. `25h5m`)
+Write a full new `sys/gc`, enforcing `protection_horizon >= max_query_duration + grace + clock_skew_allowance` and `protection_horizon >= max_compaction_lifetime + 4 * clock_skew_allowance` (this build's compiled 1h compaction lifetime) at write time and swapping the durable object with `CasVersion`. All durations are humantime strings (e.g. `25h5m`)
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |

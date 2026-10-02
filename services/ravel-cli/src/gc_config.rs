@@ -5,7 +5,9 @@
 //! it at startup). It enforces `protection_horizon >= max_query_duration +
 //! grace + clock_skew_allowance` at write time -- refusing a violating proposal
 //! without writing anything (S1-02: the skew term stops a sweeper whose clock
-//! leads a reader's from deleting a pinned snapshot) -- and swaps the durable
+//! leads a reader's from deleting a pinned snapshot), and `protection_horizon
+//! >= max_compaction_lifetime + 4 * clock_skew_allowance` against this build's
+//! compiled compaction lifetime (ADR-1133) -- and swaps the durable
 //! object with `CasVersion`, so a concurrent `gc-config set` is caught as a
 //! conflict rather than silently overwritten. Both operations delegate to
 //! [`ravel_maintain::gc_config`]; there is no CLI-side reimplementation of the
@@ -266,6 +268,49 @@ mod tests {
             .expect("read")
             .expect("present");
         assert_eq!(v.protection_horizon_ns, 25 * 3_600_000_000_000);
+    }
+
+    /// `set` refuses a horizon below `max_compaction_lifetime + 4 *
+    /// clock_skew_allowance` for this build's compiled lifetime and the default
+    /// skew, and writes nothing, though the skew-covering bound accepts it.
+    /// `--clock-skew-allowance` reaches this bound too: with `0s` the same
+    /// horizon clears it.
+    ///
+    /// Flip to watch it fail: remove the `satisfies_compaction_lifetime` check
+    /// in `ravel_maintain::set_gc_config`; the `expect_err` panics.
+    #[tokio::test]
+    async fn set_refuses_a_horizon_a_compaction_run_can_outlive() {
+        let store = store();
+        let bound = ravel_maintain::config::DEFAULT_MAX_COMPACTION_LIFETIME_NS
+            + 4 * DEFAULT_CLOCK_SKEW_ALLOWANCE_NS;
+        let below = format!("{}ns", bound - 1);
+        let err = set(store.clone(), &below, "1m", "1m", "1h", None, None, 1)
+            .await
+            .expect_err("a horizon a compaction run can outlive must be refused");
+        assert!(
+            err.to_string().contains("max_compaction_lifetime"),
+            "the error names the compaction-lifetime bound: {err}"
+        );
+        let got = store
+            .get(ravel_maintain::GC_CONFIG_KEY, GetRange::Full)
+            .await;
+        assert!(
+            matches!(got, Err(StoreError::NotFound)),
+            "a refused set writes no object"
+        );
+
+        set(store.clone(), &below, "1m", "1m", "1h", Some("0s"), None, 2)
+            .await
+            .expect("with a zero skew allowance the bound is the lifetime alone");
+        let at_bound = format!("{bound}ns");
+        set(store.clone(), &at_bound, "1m", "1m", "1h", None, None, 3)
+            .await
+            .expect("a horizon at the bound with the default skew is accepted");
+        let (v, _) = read_gc_config(store.as_ref())
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(v.protection_horizon_ns, bound);
     }
 
     /// The stored proto's `format_version`, read without the decoder's

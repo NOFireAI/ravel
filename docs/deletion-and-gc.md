@@ -52,7 +52,9 @@ mutates it, enforcing the constraint at write time and swapping with
 `CasVersion`; `set --head-cache-ttl` writes version 2, and `set` without the
 flag keeps the stored version and its recorded TTL. Every mode then validates
 itself against `sys/gc` at startup and refuses to start on a real violation:
-maintain's configured horizon and grace must equal the stored values; a query
+maintain's configured horizon and grace must equal the stored values, and the
+stored horizon must cover its clock-skew allowance and its compaction lifetime
+(the two maintain-startup checks below); a query
 engine's deadline must be `<= max_query_duration`, and the HEAD cache TTL its
 catalog runs on `<= head_cache_ttl`; a Flight SQL ticket-TTL ceiling must be
 `<= protection_horizon - grace`. `ravel-cli maintain sweep` reads `sys/gc` the
@@ -113,6 +115,27 @@ that actually deletes:
    stored values, and the skew term is in neither field.) `ravel-cli maintain
    sweep` runs `validate_maintain` and `validate_maintain_skew` against its own
    `clock_skew_allowance` the same way, and refuses before it sweeps.
+
+The same two choke points hold a second bound on the horizon, the premise the
+pinned-query window's one marker per record rests on (ADR-1133, its
+compaction-lifetime amendment):
+
+```text
+protection_horizon >= max_compaction_lifetime + 4 * clock_skew_allowance
+```
+
+A compaction or rewrite run that could still publish over a record's inputs
+must do so before the sweeper finds that record past its horizon, and a run
+past `max_compaction_lifetime` abandons without publishing. `gc-config set`
+refuses a horizon below the bound with `GcConfigError::CompactionLifetimeViolation`,
+against this build's compiled `max_compaction_lifetime` (1 h, no flag) and the
+CLI's `--clock-skew-allowance`. At maintain startup
+`ravel_maintain::validate_maintain_compaction_lifetime` re-checks it against
+the running process's own `CompactorConfig::max_compaction_lifetime_ns` and
+`clock_skew_allowance_ns`, beside `validate_maintain_skew` in both
+`maintain::spawn` and `ravel-cli maintain sweep`, and a violation
+(`GcConfigError::MaintainCompactionLifetimeUncovered`) refuses before any
+delete. The defaults (a 25 h 5 min horizon against a 1 h 20 min bound) pass.
 
 Because both fences hold, a skew-uncovered horizon can neither be written nor
 run against. The horizon on its own does not keep a pinned reader safe: it is

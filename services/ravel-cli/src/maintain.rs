@@ -1378,7 +1378,10 @@ where
 /// writes nothing, so on a bucket with no `sys/gc` it uses those same defaults
 /// without writing them. [`ravel_maintain::validate_maintain_skew`] then runs
 /// against this sweep's own `clock_skew_allowance`, and a violation is an error
-/// before any delete. [`ravel_maintain::validate_maintain`] also runs, but
+/// before any delete. So does
+/// [`ravel_maintain::validate_maintain_compaction_lifetime`], against this
+/// build's `max_compaction_lifetime` and the same skew allowance.
+/// [`ravel_maintain::validate_maintain`] also runs, but
 /// since horizon and grace are copied from the same `sys/gc`, it can only fail
 /// if a later edit stops sourcing them from there.
 pub async fn sweep_compactor_config(
@@ -1411,6 +1414,13 @@ pub async fn sweep_compactor_config(
     };
     ravel_maintain::validate_maintain(&gc, config.protection_horizon_ns, config.grace_ns)
         .and_then(|()| ravel_maintain::validate_maintain_skew(&gc, config.clock_skew_allowance_ns))
+        .and_then(|()| {
+            ravel_maintain::validate_maintain_compaction_lifetime(
+                &gc,
+                config.max_compaction_lifetime_ns,
+                config.clock_skew_allowance_ns,
+            )
+        })
         .map_err(|err| {
             anyhow::anyhow!("maintain sweep GC-config validation failed against sys/gc: {err}")
         })?;

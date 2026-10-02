@@ -101,8 +101,8 @@ pub use gc_config::{
     GC_CONFIG_KEY, GC_FORMAT_VERSION, GC_FORMAT_VERSION_V1, GcAccessOp, GcConfigError,
     GcConfigProposal, GcConfigValues, SetOutcome, bootstrap_gc_config,
     ingest_max_flush_lifetime_floor_ns, read_gc_config, set_gc_config, validate_flight_ceiling,
-    validate_maintain, validate_maintain_skew, validate_query_deadline,
-    validate_query_head_cache_ttl,
+    validate_maintain, validate_maintain_compaction_lifetime, validate_maintain_skew,
+    validate_query_deadline, validate_query_head_cache_ttl,
 };
 pub use legal_hold::{
     AUDIT_HOLD_SHARD, LegalHoldCheck, shard_hold_scopes, write_hold_clear, write_hold_set,

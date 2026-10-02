@@ -1082,6 +1082,87 @@ async fn sweep_refuses_a_skew_uncovered_sys_gc_before_any_store_write() {
     );
 }
 
+/// A stored `sys/gc` horizon one nanosecond below
+/// `max_compaction_lifetime + 4 * clock_skew_allowance` for this sweep's
+/// compiled config (ADR-1133) makes `maintain sweep` refuse before any store
+/// write, though the skew-covering bound accepts it. The horizon is written
+/// with a zero write-time skew, which the write fence then accepts. The
+/// control at the bound reaches a write on the same store and orphan.
+///
+/// Flip to watch it fail: drop the `validate_maintain_compaction_lifetime`
+/// call in `sweep_compactor_config`; the `expect_err` panics.
+#[tokio::test]
+async fn sweep_refuses_a_horizon_a_compaction_run_can_outlive_before_any_store_write() {
+    use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+
+    let compiled = ravel_maintain::CompactorConfig::default();
+    let bound = compiled.max_compaction_lifetime_ns + 4 * compiled.clock_skew_allowance_ns;
+    async fn seeded(protection_horizon_ns: i64) -> MemoryStore {
+        let store = MemoryStore::new();
+        seed_orphan_l0(&store, "acme", 0, 1).await;
+        ravel_maintain::set_gc_config(
+            &store,
+            ravel_maintain::GcConfigProposal {
+                protection_horizon_ns,
+                grace_ns: 60_000_000_000,
+                max_query_duration_ns: 60_000_000_000,
+                ..ravel_maintain::GcConfigValues::maintain_defaults().into()
+            },
+            0,
+            1,
+        )
+        .await
+        .expect("set sys/gc");
+        store
+    }
+    fn faulting(inner: MemoryStore) -> Arc<FaultStore<MemoryStore>> {
+        let plan = FaultPlan::empty()
+            .with_rule(Rule::new(
+                Op::Put,
+                ScriptedFault::Permanent("no put".into()),
+            ))
+            .with_rule(Rule::new(
+                Op::Delete,
+                ScriptedFault::Permanent("no delete".into()),
+            ));
+        Arc::new(FaultStore::new(inner, plan))
+    }
+    async fn run(store: &Arc<FaultStore<MemoryStore>>) -> anyhow::Result<()> {
+        ravel_cli::maintain::sweep_at(
+            store.clone() as Arc<dyn ObjectStoreBackend>,
+            MEMORY,
+            "acme",
+            SignalArg::Metrics,
+            0,
+            false,
+            false,
+            ravel_maintain::FixedClock::new(SWEEP_NOW_NS),
+        )
+        .await
+    }
+    let writes = |store: &FaultStore<MemoryStore>| {
+        store.fault_count(Op::Put, FaultKind::Permanent)
+            + store.fault_count(Op::Delete, FaultKind::Permanent)
+    };
+
+    let short = faulting(seeded(bound - 1).await);
+    let err = run(&short)
+        .await
+        .expect_err("a horizon a compaction run can outlive must refuse the sweep");
+    assert!(
+        err.to_string().contains("max_compaction_lifetime"),
+        "the refusal is the compaction-lifetime validation: {err}"
+    );
+    assert_eq!(writes(&short), 0, "the sweep refused before any write");
+
+    let at_bound = faulting(seeded(bound).await);
+    let _ = run(&at_bound).await;
+    assert!(
+        writes(&at_bound) > 0,
+        "control: a horizon at the bound lets the same sweep reach a write"
+    );
+}
+
 /// `maintain sweep` holds a superseded input on the stored `sys/gc` protection
 /// horizon, not the compiled default: with a stored horizon of 200h and the
 /// compaction record 150h old, the input survives, and the control bucket on
