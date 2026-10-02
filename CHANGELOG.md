@@ -1900,7 +1900,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   range share one fetch; when the leading query's own request or byte budget
   refuses it (`CacheFetchError::BudgetRefused`), a follower checks the cache
   again and retries under its own budget, making at most three attempts in
-  all, before reporting a refusal of its own (issue #2248).
+  all. It reports its own budget's refusal when its own budget refuses, and a
+  store-shaped error when every attempt followed another query's refusal
+  (issue #2248).
 - **The logs SQL scan skips segments whose declared-column statistics exclude
   the predicate** (ADR-2121 D1, issue #2151). A declared `i64`/`bool`
   comparison or `BETWEEN`, or a declared `i64` `IN`, now also drops every
