@@ -1602,8 +1602,10 @@ async fn sweep_superseded_impl(
     // The pinned-query window (ADR-1133). Every group a record's entry
     // gathered shares that record's one unnamed-since marker, so the marker
     // stands for all of them: it is written only when HEAD names none of
-    // them, and a group whose siblings are named, unreadable or lease-held
-    // waits with them. An observing pass and a dry run only read markers.
+    // them, and a group whose siblings are named or unreadable waits with
+    // them. A lease-held group's HEAD answer counts too, so the marker covers
+    // it once the hold lifts, and the marker is kept while it is held. An
+    // observing pass and a dry run only read markers.
     let policy = if deleting && !config.dry_run {
         MarkerPolicy::Write
     } else {
@@ -1612,9 +1614,8 @@ async fn sweep_superseded_impl(
     let ctx = MarkerContext::new(clock, config, policy);
     let mut head_gates: Vec<SnapshotGate> = Vec::with_capacity(groups.len());
     let mut marker_keys: Vec<Option<String>> = Vec::with_capacity(groups.len());
-    // Per marker key: the combined HEAD answer of its groups, and whether a
-    // lease-held group shares it.
-    let mut combined: HashMap<String, (SnapshotGate, bool)> = HashMap::new();
+    // Per marker key: the combined HEAD answer of every group sharing it.
+    let mut combined: HashMap<String, SnapshotGate> = HashMap::new();
     for (group, entry_key) in groups.iter().zip(&entered_from) {
         let head_gate = reach
             .object_gate(
@@ -1631,12 +1632,10 @@ async fn sweep_superseded_impl(
             continue;
         }
         let marker_key = keys::record_unnamed_marker_key(entry_key).unwrap_or_default();
-        let held = group.protected_key(lease).is_some();
         let slot = combined
             .entry(marker_key.clone())
-            .or_insert((SnapshotGate::Clear, false));
-        slot.0 = combine_head_gates(slot.0, head_gate);
-        slot.1 |= held;
+            .or_insert(SnapshotGate::Clear);
+        *slot = combine_head_gates(*slot, head_gate);
         marker_keys.push(Some(marker_key));
     }
     let mut verdicts: HashMap<String, SnapshotGate> = HashMap::new();
@@ -1647,18 +1646,15 @@ async fn sweep_superseded_impl(
         if verdicts.contains_key(marker_key) {
             continue;
         }
-        let (head_gate, lease_held) = combined
+        let head_gate = combined
             .get(marker_key)
             .copied()
-            .unwrap_or((SnapshotGate::Blocked(SnapshotBlock::Unreadable), false));
+            .unwrap_or(SnapshotGate::Blocked(SnapshotBlock::Unreadable));
         let anchor = superseded_anchor(entry_key, &compactions, &rewrites, &record_versions);
         let verdict = match (marker_key.is_empty(), anchor) {
             // A key that does not reconstruct, or an anchor this pass did
             // not read: the marker cannot be checked, so the group blocks.
             (true, _) | (_, None) => SnapshotGate::Blocked(SnapshotBlock::Unreadable),
-            // A lease-held sibling's HEAD answer is not acted on: it neither
-            // starts the window nor resets it.
-            (false, Some(_)) if lease_held => SnapshotGate::Blocked(SnapshotBlock::PinnedWindow),
             (false, Some(anchor)) => {
                 reach
                     .marker_gate(store, &ctx, tenant, signal, marker_key, &anchor, head_gate)

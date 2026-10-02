@@ -850,12 +850,8 @@ async fn physical_sweep(
     if !dry_run && reach.retire_marker(store, &marker_key).await.is_err() {
         return Ok(RetentionOutcome::SweptPartial);
     }
-    if !lease.is_protected(tombstone_key) {
-        if !dry_run {
-            store.delete(tombstone_key).await?;
-        }
-    } else {
-        return Ok(RetentionOutcome::SweptPartial);
+    if !dry_run {
+        store.delete(tombstone_key).await?;
     }
     Ok(RetentionOutcome::Swept)
 }

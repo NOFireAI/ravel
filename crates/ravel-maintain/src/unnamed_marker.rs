@@ -195,6 +195,11 @@ pub struct MarkerReapOutcome {
     /// Markers whose anchor is gone but whose body could not be read or
     /// decoded: left in place.
     pub unreadable: usize,
+    /// Anchor HEADs, marker body GETs and marker DELETEs the reap issued, on
+    /// top of the LIST.
+    pub head_requests: usize,
+    pub get_requests: usize,
+    pub delete_requests: usize,
 }
 
 /// The orphan-marker rule: LIST every marker of one `(tenant, signal)`, across
@@ -272,11 +277,13 @@ pub(crate) async fn reap_listed(
         if known_present.contains(&anchor_key) {
             continue;
         }
+        outcome.head_requests += 1;
         match store.head(&anchor_key).await {
             Ok(_) => continue,
             Err(StoreError::NotFound) => {}
             Err(e) => return Err(MaintainError::Store(e)),
         }
+        outcome.get_requests += 1;
         let body = match store
             .get(&meta.key, ravel_object_store::GetRange::Full)
             .await
@@ -306,6 +313,7 @@ pub(crate) async fn reap_listed(
             continue;
         }
         if !config.dry_run {
+            outcome.delete_requests += 1;
             store.delete(&meta.key).await?;
         }
         outcome.reaped += 1;

@@ -305,10 +305,10 @@ impl SnapshotReachability {
     ///   deleted and rewritten (under [`MarkerPolicy::Write`]); both answer
     ///   [`SnapshotBlock::PinnedWindow`], as does an unaged one.
     ///
-    /// Any marker request error, an undecodable body, or a LIST failure on the
-    /// re-name path answers [`SnapshotBlock::Unreadable`]: nothing here ever
-    /// turns a doubt into a delete. The alerts signal gets no marker and every
-    /// clear candidate there holds.
+    /// Any marker GET, PUT or DELETE error, or an undecodable body, answers
+    /// [`SnapshotBlock::Unreadable`]: nothing here ever turns a doubt into a
+    /// delete. A failed marker LIST only makes the pass read each marker by
+    /// GET. The alerts signal gets no marker and keeps its HEAD answer.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn marker_gate(
         &mut self,
@@ -320,11 +320,10 @@ impl SnapshotReachability {
         anchor: &MarkerAnchor,
         head_gate: SnapshotGate,
     ) -> SnapshotGate {
+        // Alert records are never folded into a catalog HEAD, so no query
+        // pins one that names them; ADR-1133 scopes the marker out of them.
         if signal == Signal::Alerts {
-            return match head_gate {
-                SnapshotGate::Clear => SnapshotGate::Blocked(SnapshotBlock::PinnedWindow),
-                blocked => blocked,
-            };
+            return head_gate;
         }
         match head_gate {
             SnapshotGate::Blocked(SnapshotBlock::Named) => {
