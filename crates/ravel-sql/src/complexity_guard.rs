@@ -399,6 +399,76 @@ pub fn structural_count(sql: &str) -> usize {
     scan(sql, usize::MAX)
 }
 
+/// `sql`'s first real token, if that token is an identifier or keyword run.
+///
+/// Skips exactly what [`scan`]'s `Normal` mode skips before a statement's
+/// first real token: whitespace, `--` line comments, and nested plain
+/// `/* ... */` block comments. A `/*!...*/` hint is not comment to this
+/// dialect (see the module documentation's "What is excluded" section) and
+/// is left in place: a `/*!` immediately starts a token for the tokenizer, so
+/// it is read as this statement's first token here too, which is neither
+/// alphanumeric nor `_` and so yields `None`.
+///
+/// Returns the maximal `[A-Za-z0-9_]` run starting at the first such
+/// position, or `None` when that position holds something else (a string or
+/// delimited-identifier quote, punctuation, a `/*!` hint, or no token at
+/// all). Unlike [`scan`]'s run rule, a run here is not split on whether it
+/// starts with a digit: the caller only ever compares the result against the
+/// `CREATE`/`DROP` keywords, which cannot start with one.
+///
+/// [`crate::validate::statement_kind`] uses this to route a statement on its
+/// leading keyword alone, without building a parser, so every `SELECT` pays
+/// no parse at all for routing.
+pub(crate) fn leading_keyword(sql: &str) -> Option<&str> {
+    let mut depth: usize = 0;
+    let mut i = 0;
+    while i < sql.len() {
+        let rest = &sql[i..];
+        if depth > 0 {
+            if rest.starts_with("/*") {
+                depth += 1;
+                i += 2;
+                continue;
+            }
+            if rest.starts_with("*/") {
+                depth -= 1;
+                i += 2;
+                continue;
+            }
+            i += rest.chars().next().map(char::len_utf8).unwrap_or(1);
+            continue;
+        }
+        if rest.starts_with("--") {
+            match rest.find('\n') {
+                Some(pos) => i += pos + 1,
+                None => return None,
+            }
+            continue;
+        }
+        if rest.starts_with("/*!") {
+            return None;
+        }
+        if rest.starts_with("/*") {
+            depth = 1;
+            i += 2;
+            continue;
+        }
+        let c = rest.chars().next()?;
+        if c.is_whitespace() {
+            i += c.len_utf8();
+            continue;
+        }
+        if c.is_ascii_alphanumeric() || c == '_' {
+            let end = rest
+                .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                .unwrap_or(rest.len());
+            return Some(&rest[..end]);
+        }
+        return None;
+    }
+    None
+}
+
 /// Count tokens outside literals and comments, stopping as soon as the count exceeds
 /// `stop_above`. The returned count is then `stop_above + 1`, never the full
 /// figure: that is all [`check`] needs, and it keeps a 1 MiB adversarial body
@@ -1403,5 +1473,28 @@ mod tests {
         assert!(msg.contains(&MAX_STATEMENT_COMPLEXITY.to_string()), "{msg}");
         assert!(!msg.contains("nest"), "{msg}");
         assert!(!msg.contains("depth"), "{msg}");
+    }
+
+    #[test]
+    fn leading_keyword_finds_the_first_identifier_run() {
+        assert_eq!(leading_keyword("CREATE TABLE t (a INT)"), Some("CREATE"));
+        assert_eq!(leading_keyword("  \n\t DROP TABLE t"), Some("DROP"));
+        assert_eq!(leading_keyword("create table t (a int)"), Some("create"));
+        assert_eq!(leading_keyword("-- note\nCREATE TABLE t"), Some("CREATE"));
+        assert_eq!(leading_keyword("/* c */ DROP TABLE t"), Some("DROP"));
+        assert_eq!(leading_keyword("/* /* c */ */ DROP TABLE t"), Some("DROP"));
+        assert_eq!(leading_keyword("SELECT 1"), Some("SELECT"));
+    }
+
+    #[test]
+    fn leading_keyword_is_none_for_a_non_identifier_start() {
+        assert_eq!(leading_keyword("'CREATE'"), None);
+        assert_eq!(leading_keyword("\"CREATE\""), None);
+        assert_eq!(leading_keyword("(SELECT 1)"), None);
+        assert_eq!(leading_keyword(""), None);
+        assert_eq!(leading_keyword("   "), None);
+        assert_eq!(leading_keyword("-- only a comment"), None);
+        assert_eq!(leading_keyword("/* unterminated"), None);
+        assert_eq!(leading_keyword("/*! CREATE TABLE t */"), None);
     }
 }
