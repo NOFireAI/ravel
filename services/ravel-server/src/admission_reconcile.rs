@@ -81,17 +81,41 @@ impl AdmissionReconcileTask {
     }
 }
 
+/// Why [`spawn`] (or [`crate::query_admission_reconcile::spawn`], which reads
+/// the same interval) refused to start a reconciliation loop. Nothing is
+/// spawned.
+#[derive(Debug, thiserror::Error)]
+pub enum SpawnError {
+    /// A zero interval `R` would write and list the reconciliation keys back to
+    /// back.
+    #[error(
+        "--admission-reconcile-interval must be non-zero: a zero reconciliation interval writes and lists the store back to back"
+    )]
+    ZeroReconcileInterval,
+}
+
+/// The refusal [`spawn`] applies before starting the loop. `start` applies it
+/// earlier, before spawning anything, in every mode.
+pub fn check_spawnable(interval: Duration) -> Result<(), SpawnError> {
+    if interval.is_zero() {
+        return Err(SpawnError::ZeroReconcileInterval);
+    }
+    Ok(())
+}
+
 /// Spawn the reconciliation loop for `controller` against `store` on interval
 /// `R`. Returns immediately; the task runs in the background until
 /// [`AdmissionReconcileTask::shutdown`]. The first cycle sleeps a full
 /// (jittered) interval before its first write/read, so a fleet of replicas
-/// started together do not reconcile in lockstep forever.
+/// started together do not reconcile in lockstep forever. A zero `interval` is
+/// refused with [`SpawnError::ZeroReconcileInterval`].
 pub fn spawn(
     controller: Arc<AdmissionController>,
     store: Arc<dyn ObjectStoreBackend>,
     interval: Duration,
     cycle_metrics: Arc<ReconcileCycleMetrics>,
-) -> AdmissionReconcileTask {
+) -> Result<AdmissionReconcileTask, SpawnError> {
+    check_spawnable(interval)?;
     let (tx, mut rx) = oneshot::channel();
     // Production OS-entropy jitter (ADR-0068 decision 2), the same default the
     // fold and maintenance loops use; the harness does not drive this loop.
@@ -117,8 +141,64 @@ pub fn spawn(
             );
         }
     });
-    AdmissionReconcileTask {
+    Ok(AdmissionReconcileTask {
         shutdown: Some(tx),
         handle: Some(handle),
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use ravel_ingest::AdmissionLimits;
+    use ravel_object_store::memory::MemoryStore;
+
+    use super::*;
+
+    /// Only zero is refused: the smallest non-zero interval passes, since the
+    /// command line accepts sub-millisecond values such as `500us`.
+    ///
+    /// Flip to watch it fail: change `interval.is_zero()` in [`check_spawnable`] to
+    /// `interval < Duration::from_millis(1)`.
+    #[test]
+    fn check_spawnable_accepts_the_smallest_nonzero_interval() {
+        check_spawnable(Duration::from_nanos(1)).expect("a 1 ns interval passes");
+    }
+
+    /// A zero interval is refused with the typed error naming the flag, and no
+    /// task is spawned.
+    ///
+    /// Flip to watch it fail: delete `check_spawnable(interval)?;` in
+    /// [`spawn`], and the refusal expectation fails.
+    #[tokio::test]
+    async fn spawn_refuses_a_zero_reconcile_interval() {
+        let controller = Arc::new(AdmissionController::new(
+            Arc::new(SystemClock),
+            AdmissionLimits::default(),
+        ));
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let alive_before = metrics.num_alive_tasks();
+        let err = spawn(
+            controller,
+            store,
+            Duration::ZERO,
+            Arc::new(ReconcileCycleMetrics::default()),
+        )
+        .err()
+        .expect("a zero reconcile interval must be refused at spawn");
+        assert!(
+            matches!(err, SpawnError::ZeroReconcileInterval),
+            "expected ZeroReconcileInterval, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("--admission-reconcile-interval"),
+            "the refusal must name the flag, got: {err}"
+        );
+        assert_eq!(
+            metrics.num_alive_tasks(),
+            alive_before,
+            "a refused spawn must leave no task running"
+        );
     }
 }

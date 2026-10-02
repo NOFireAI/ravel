@@ -218,12 +218,36 @@ impl StoreProbeTask {
     }
 }
 
+/// Why [`spawn`] refused to start the probe task. Nothing is spawned and the
+/// liveness gauge is not stamped.
+#[derive(Debug, thiserror::Error)]
+pub enum SpawnError {
+    /// A zero `interval` would issue the probe GET back to back.
+    #[error(
+        "--store-probe-interval must be non-zero: a zero probe interval issues store GETs back to back"
+    )]
+    ZeroProbeInterval,
+}
+
+/// The refusal [`spawn`] applies before starting the probe. `start` applies it
+/// earlier, before spawning anything.
+pub fn check_spawnable(interval: Duration) -> Result<(), SpawnError> {
+    if interval.is_zero() {
+        return Err(SpawnError::ZeroProbeInterval);
+    }
+    Ok(())
+}
+
 /// Spawn the single background store probe (ADR-0050 section 7). Every
 /// `interval` (jittered by the same helper the fold and maintenance tasks use,
 /// so replicas do not tick in lockstep) it runs one [`run_probe_cycle`],
 /// maintaining the process-global reachability atomic [`crate::health::Readiness`]
 /// reads. Returns immediately; the task runs until [`StoreProbeTask::shutdown`].
-pub fn spawn(store: Arc<dyn ObjectStoreBackend>, interval: Duration) -> StoreProbeTask {
+/// A zero `interval` is refused with [`SpawnError::ZeroProbeInterval`].
+pub fn spawn(
+    store: Arc<dyn ObjectStoreBackend>,
+    interval: Duration,
+) -> Result<StoreProbeTask, SpawnError> {
     spawn_with_clock(store, interval, Arc::new(SystemClock))
 }
 
@@ -233,7 +257,8 @@ pub fn spawn_with_clock(
     store: Arc<dyn ObjectStoreBackend>,
     interval: Duration,
     clock: Arc<dyn Clock>,
-) -> StoreProbeTask {
+) -> Result<StoreProbeTask, SpawnError> {
+    check_spawnable(interval)?;
     // The spawn stamp (issue #1728). Written here, synchronously, before the
     // task exists and therefore before its first jittered sleep, so the gauge
     // is real from the instant a probe exists. Without it the gauge would hold
@@ -265,16 +290,92 @@ pub fn spawn_with_clock(
             }
         }
     });
-    StoreProbeTask {
+    Ok(StoreProbeTask {
         shutdown: Some(tx),
         handle: Some(handle),
-    }
+    })
 }
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+    use ravel_object_store::memory::MemoryStore;
+
     use super::*;
+
+    struct FixedClock(i64);
+
+    impl Clock for FixedClock {
+        fn now_ns(&self) -> i64 {
+            self.0
+        }
+    }
+
+    /// Only zero is refused: the smallest non-zero interval passes, since the
+    /// command line accepts sub-millisecond values such as `500us`.
+    ///
+    /// Flip to watch it fail: change `interval.is_zero()` in [`check_spawnable`] to
+    /// `interval < Duration::from_millis(1)`.
+    #[test]
+    fn check_spawnable_accepts_the_smallest_nonzero_interval() {
+        check_spawnable(Duration::from_nanos(1)).expect("a 1 ns interval passes");
+    }
+
+    /// A zero interval is refused with the typed error before anything runs:
+    /// no task is spawned, the liveness gauge is not stamped, and the store
+    /// sees no GET. Every GET would fire the `NotFoundBlip` rule, so its
+    /// counter is the store's request count.
+    ///
+    /// Flip to watch it fail: delete `check_spawnable(interval)?;` in
+    /// `spawn_with_clock`, and the refusal expectation fails.
+    #[tokio::test]
+    async fn spawn_refuses_a_zero_probe_interval() {
+        const SPAWN_NS: i64 = 1_600_000_000_987_654_321;
+        let store = Arc::new(FaultStore::new(
+            MemoryStore::new(),
+            FaultPlan::empty().with_rule(Rule::new(Op::Get, ScriptedFault::NotFoundBlip)),
+        ));
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let alive_before = metrics.num_alive_tasks();
+        let result = spawn_with_clock(
+            store.clone() as Arc<dyn ObjectStoreBackend>,
+            Duration::ZERO,
+            Arc::new(FixedClock(SPAWN_NS)) as Arc<dyn Clock>,
+        );
+        // The refusal is the `Err` below. The yields give a task that was
+        // wrongly spawned a chance to issue its GET before the counter check
+        // further down, which is a secondary, scheduling-dependent check.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        let err = result
+            .err()
+            .expect("a zero probe interval must be refused at spawn");
+        assert!(
+            matches!(err, SpawnError::ZeroProbeInterval),
+            "expected ZeroProbeInterval, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("--store-probe-interval"),
+            "the refusal must name the flag, got: {err}"
+        );
+        assert_eq!(
+            metrics.num_alive_tasks(),
+            alive_before,
+            "a refused spawn must leave no task running"
+        );
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::NotFoundBlip),
+            0,
+            "a refused spawn must issue no store GET"
+        );
+        assert_ne!(
+            probe_last_run_unix_ns(),
+            SPAWN_NS,
+            "a refused spawn must not stamp the liveness gauge"
+        );
+    }
 
     /// The core of ADR-0050 section 7, in isolation: K consecutive failures are
     /// required to go unhealthy, and a single success recovers immediately.
