@@ -14,14 +14,15 @@
 //!    kind. `s3://` needs an `s3` profile, `gs://` a `gcs` one, `az://` an
 //!    `azure` one. A profile of the wrong kind would reach a different service
 //!    with the same bucket name.
-//! 2. The granted location holds at least one non-empty object inside it,
-//!    whatever its suffix (the object itself, for a location naming one), found by
+//! 2. The granted location holds at least one non-empty object inside it
+//!    (the object itself, for a location naming one), preferring a
+//!    `.parquet` key but accepting any suffix, found by
 //!    [`grants::one_object_under`], and [`probe_preconditions`] qualifies the
-//!    store on it. A store that serves a
-//!    read carrying an ETag it never issued cannot pin a Parquet file, so a
-//!    manifest over it would name bytes that can change underneath a query. A
-//!    prefix with no such object is refused too: there is nothing to probe, so
-//!    the grant would be admitted unqualified.
+//!    store on it. A store that serves a read carrying an ETag it never
+//!    issued cannot pin a Parquet file, so a manifest over it would name
+//!    bytes that can change underneath a query. A prefix with no such object
+//!    is refused too: there is nothing to probe, so the grant would be
+//!    admitted unqualified.
 //! 3. [`probe_not_ravel_bucket`] qualifies the bucket itself. Anything but a
 //!    clean pass is a refusal, including an inconclusive answer: a grant on
 //!    Ravel's own bucket under another handle would let an external table read
@@ -762,11 +763,13 @@ mod tests {
     #[tokio::test]
     async fn a_listing_stopped_at_the_page_bound_is_refused_as_such() {
         let store = MemoryStore::with_page_size(1);
+        // Zero-byte keys are never probeable, so the listing reads every page
+        // up to the bound without finding an object.
         for index in 0..=MAX_PROBE_LIST_PAGES {
             store
                 .put(
-                    &format!("data/{index}.txt"),
-                    Bytes::from_static(b"x"),
+                    &format!("data/{index}.parquet"),
+                    Bytes::from_static(b""),
                     PutOptions::default(),
                 )
                 .await

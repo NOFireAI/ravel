@@ -413,7 +413,11 @@ fn is_probeable(grant: &Grant, key: &str, size: u64) -> bool {
 /// No suffix is required, of the location's own object or of a listed one:
 /// the probe only needs one non-empty object a ranged read can hit, and
 /// ADR-2040 reads a single-object location whatever its suffix, so a
-/// location holding only such objects must still qualify.
+/// location holding only such objects must still qualify. The listing does
+/// prefer a `.parquet` key, which is what the reader scans under a prefix: it
+/// returns the first one it meets, and falls back to the first admitted
+/// non-empty key of any suffix only when the listing ends, or reaches the
+/// page cap, without one.
 pub async fn one_object_under(
     store: &dyn ObjectStoreBackend,
     grant: &Grant,
@@ -435,21 +439,26 @@ pub async fn one_object_under(
         format!("{location_key}/")
     };
     let mut page: Option<PageToken> = None;
+    let mut fallback: Option<String> = None;
     for _ in 0..MAX_PROBE_LIST_PAGES {
         let listed = store.list(&list_prefix, page).await?;
-        if let Some(meta) = listed
-            .objects
-            .iter()
-            .find(|meta| is_probeable(grant, &meta.key, meta.size))
-        {
-            return Ok(ProbeObject::Found(meta.key.clone()));
+        for meta in &listed.objects {
+            if !is_probeable(grant, &meta.key, meta.size) {
+                continue;
+            }
+            if meta.key.ends_with(".parquet") {
+                return Ok(ProbeObject::Found(meta.key.clone()));
+            }
+            if fallback.is_none() {
+                fallback = Some(meta.key.clone());
+            }
         }
         match listed.next {
             Some(next) => page = Some(next),
-            None => return Ok(ProbeObject::Empty),
+            None => return Ok(fallback.map_or(ProbeObject::Empty, ProbeObject::Found)),
         }
     }
-    Ok(ProbeObject::PageCapReached)
+    Ok(fallback.map_or(ProbeObject::PageCapReached, ProbeObject::Found))
 }
 
 /// Check that `grant` may join `grants`: no overlap with another profile, and
@@ -1363,9 +1372,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_listing_stopped_at_the_page_cap_is_not_reported_empty() {
+        // Zero-byte keys are never probeable, so every page is read without a
+        // hit and without a fallback.
         let store = MemoryStore::with_page_size(1);
         for index in 0..=MAX_PROBE_LIST_PAGES {
-            put_sized(&store, &format!("data/{index}.txt"), b"x").await;
+            put_sized(&store, &format!("data/{index}.parquet"), b"").await;
         }
         assert_eq!(
             probe(&store, "s3://b/data/").await,
@@ -1373,7 +1384,7 @@ mod tests {
         );
         let exact = MemoryStore::with_page_size(1);
         for index in 0..MAX_PROBE_LIST_PAGES {
-            put_sized(&exact, &format!("data/{index}.txt"), b"x").await;
+            put_sized(&exact, &format!("data/{index}.parquet"), b"").await;
         }
         // The last page is full, so its token still points at a next page that
         // turns out to be empty: the cap is reached, not the end.
