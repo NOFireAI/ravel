@@ -243,14 +243,35 @@ per-role tables imply. Know this before your first deployment:
   does not weaken the delete boundary: a create-if-absent write cannot overwrite
   or delete an existing object, and `sys/tenancy` is deny-delete for every role.
   The effect is only that a fresh operator-managed cluster boots without a
-  manual bootstrap step.
+  manual bootstrap step, except on AWS S3 under per-role credentials (see the
+  `sys/gc` entry below).
 - **`sys/gc`**, the durable garbage-collection configuration, is created by
   the first process to reach a fresh bucket, and only the Maintain and Admin
   roles carry a write grant on it. Under per-role credentials, start the
   `maintain` process first on a fresh bucket, or create the object with
-  `ravel-cli gc-config set` under Admin; a gateway or query process that
-  reaches an empty bucket under its scoped credential cannot create the object
-  and does not start. The mutation path that changes an existing `sys/gc` is
+  `ravel-cli gc-config set` under Admin, giving it the protection horizon and
+  grace the maintain process runs with (`--gc-protection-horizon` and
+  `--gc-grace`, or their defaults), since maintain refuses to start against a
+  `sys/gc` whose horizon or grace differs from its own, and a max query
+  duration and max flush lifetime matching the `--gc-max-query-duration` and
+  `--gc-max-flush-lifetime` the processes run with. A gateway or query process
+  that reaches an empty bucket under its scoped credential is refused and exits
+  with an error saying that `sys/gc` could not be created with its
+  credential and naming that fix; it keeps exiting until the object exists,
+  so a restart policy brings it up after maintain has created it. A maintain
+  process refused that create instead gets an error naming the PutObject grant
+  on `sys/gc` its role needs (and `kms:GenerateDataKey` on the bucket's
+  default key under SSE-KMS, which the shipped templates grant only on the
+  tenant key), not start-order advice. On AWS S3, a GET of an absent key is
+  refused rather than reported missing when the credential holds no
+  `s3:ListBucket` covering it, and the gateway, query and maintain templates
+  grant none covering `sys/tenancy` or `sys/gc`. Every server process reads
+  `sys/tenancy` before `sys/gc`, and no `ravel-cli` command creates
+  `sys/tenancy`, so on a fresh AWS bucket under those templates start order
+  does not solve the first startup yet: run it under one shared credential
+  that can create both objects, then move to per-role credentials. Under one
+  shared credential any server process creates `sys/gc`, so start order does
+  not matter there. The mutation path that changes an existing `sys/gc` is
   Admin-only, matching that it is an explicit operator action rather than
   something a server does on its own.
 

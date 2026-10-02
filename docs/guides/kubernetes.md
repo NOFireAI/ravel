@@ -816,6 +816,38 @@ enable `spec.maintain`). A `RavelCluster` with only the shared
 `spec.storage.s3.credentialsSecretRef` keeps the original order and never waits,
 because any pod holding that credential can create the object.
 
+A gateway or query process that starts before `sys/gc` exists under a
+per-role credential (a hand-applied Deployment, or `maintain.enabled: false`
+above) is refused and exits at startup with an error that names the cause:
+`sys/gc` has not been created yet and this process's credential was refused
+its create, only the Maintain and Admin roles create it, and the fix is to
+start the maintain process first or run `ravel-cli gc-config set` under the
+Admin credential, with the protection horizon and grace the maintain process
+runs with (`--gc-protection-horizon` and `--gc-grace`, or their defaults),
+since maintain refuses to start against a `sys/gc` whose horizon or grace
+differs from its own, and a max query duration and max flush lifetime matching
+the `--gc-max-query-duration` and `--gc-max-flush-lifetime` the processes run
+with. The same error adds that under a shared credential this
+refusal instead means the credential lacks PutObject on `sys/gc` or
+`kms:GenerateDataKey` on the bucket's default key. It keeps exiting with that
+error until `sys/gc` exists; the Deployment's restart policy brings it up on
+the first restart after maintain (or `gc-config set`) has created the object,
+with no other action needed.
+
+On AWS S3, a GET of an absent key is refused rather than reported missing when
+the credential holds no `s3:ListBucket` covering that key, and the gateway,
+query and maintain templates grant none covering `sys/tenancy` or `sys/gc`.
+Every server process reads `sys/qualification` and `sys/tenancy` before
+`sys/gc`, and these templates list none of the three. `ravel-cli store
+qualify` under Admin writes `sys/qualification`, but on a fresh
+AWS bucket under those templates any of the three, maintain included, can be
+refused the read of `sys/tenancy` before it gets to `sys/gc`, and no
+`ravel-cli` command creates `sys/tenancy`. A first startup there is not solved
+by start order yet: run the first startup against a fresh AWS bucket under a
+single credential that can create both objects (the shared
+`spec.storage.s3.credentialsSecretRef` form above), then move to per-role
+Secrets.
+
 ## Background
 
 The operator's design, its condition set and its reconcile model are
