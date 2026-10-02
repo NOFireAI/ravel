@@ -378,6 +378,18 @@ pub enum CacheFetchError {
         key: String,
         message: String,
     },
+    /// The closure's own query refused the read against its request or byte
+    /// budget ([`ravel_parquet`]'s `ReadLimits::admit`), before any store GET
+    /// ran. Its own variant so a single-flight follower is told this is a
+    /// budget refusal from whichever caller computed it, not a store error it
+    /// would retry; the follower's own budget was not consulted and must be
+    /// checked separately. Neither the RSEG closure below nor the RLOG/RSPAN
+    /// ones (`log_fetcher.rs`, `span_fetcher.rs`) hold a `ReadLimits` and
+    /// never produce this.
+    BudgetRefused {
+        key: String,
+        message: String,
+    },
 }
 
 /// Lets a `get_or_fetch` closure use `?` directly on a `store.get(..)` call
@@ -1408,6 +1420,20 @@ impl SegmentFetcher {
                         source: StoreError::Transient(format!(
                             "cache single-flight closure reported corrupt bytes, which the RSEG \
                              funnel never produces: {message}"
+                        )),
+                    }
+                }
+                // Unreachable from this closure: it holds no `ReadLimits` and
+                // never admits against a request or byte budget, so it never
+                // constructs `BudgetRefused`. Handled explicitly rather than
+                // through a wildcard so a future budget check added here
+                // cannot silently fall through as a store error.
+                SingleFlightError::Upstream(CacheFetchError::BudgetRefused { key, message }) => {
+                    FetchError::Store {
+                        key,
+                        source: StoreError::Transient(format!(
+                            "cache single-flight closure reported a budget refusal, which the \
+                             RSEG funnel never produces: {message}"
                         )),
                     }
                 }
