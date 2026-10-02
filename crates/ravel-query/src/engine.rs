@@ -9970,3 +9970,165 @@ mod get_limiter_tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod log_prefetch_deadline_tests {
+    use ravel_catalog::{Catalog, CatalogConfig};
+    use ravel_commit::publish::RetryPolicy;
+    use ravel_commit::record::NewCommitRecord;
+    use ravel_commit::{keys, publish, record};
+    use ravel_logseg::writer::ObjectIdentity;
+    use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_types::TenantId;
+    use uuid::Uuid;
+
+    use super::*;
+
+    const NS: i64 = 1_000_000_000;
+    const NS_PER_HOUR: i64 = 3_600 * NS;
+    const BASE_NS: i64 = 1_700_000_000 * NS;
+    const NOW_NS: i64 = BASE_NS + NS_PER_HOUR;
+    const QUERY: &str = "count_over_time(ravel_log_lines[1h])";
+
+    /// Publishes one RLOG object holding three records on one stream, with
+    /// its `Signal::Logs` commit record.
+    async fn publish_log_segment(store: &MemoryStore, tenant_hash: TenantHash) {
+        let resource = vec![(
+            "service.name".to_string(),
+            AttrValue::Str("api".to_string()),
+        )];
+        let mut writer = RlogWriter::new(
+            RlogConfig::default(),
+            ObjectIdentity {
+                tenant_hash: tenant_hash.0,
+                shard: 0,
+                writer_id: [3u8; 16],
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+        );
+        for i in 0..3 {
+            writer
+                .push(LogRecord {
+                    stream_id: ravel_types::logstream::log_stream_id(
+                        &resource,
+                        "scope",
+                        "1.0",
+                        &[],
+                    ),
+                    stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+                    ts_ns: BASE_NS + i * NS,
+                    observed_ts_ns: BASE_NS + i * NS,
+                    severity_num: 9,
+                    severity_text: "INFO".into(),
+                    body: "x".into(),
+                    trace_id: None,
+                    span_id: None,
+                    flags: 0,
+                    attrs: Vec::new(),
+                })
+                .expect("push log record");
+        }
+        let object = bytes::Bytes::from(writer.finish().expect("finish rlog"));
+        let max_ts = BASE_NS + 2 * NS;
+        let commit = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Logs,
+            shard: 0,
+            writer_id: Uuid::from_bytes([3u8; 16]),
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: object.len() as u64,
+            content_hash: *blake3::hash(&object).as_bytes(),
+            sample_count: 3,
+            series_count: 1,
+            min_event_ts_ns: BASE_NS,
+            max_event_ts_ns: max_ts,
+            min_ingest_ts_ns: BASE_NS,
+            max_ingest_ts_ns: max_ts,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            created_unix_ns: max_ts,
+            ingest_hour_bucket: u32::try_from(max_ts / NS_PER_HOUR).expect("fits u32"),
+        })
+        .expect("valid logs commit record");
+        let data_key = keys::reconstruct_data_key(&commit).expect("data key");
+        publish::put_data_object(store, &data_key, object)
+            .await
+            .expect("put rlog data object");
+        publish::publish(store, &commit, &RetryPolicy::default())
+            .await
+            .expect("publish logs commit record");
+    }
+
+    async fn engine_with_one_log_segment() -> (QueryEngine, TenantHash) {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("tenant-a".to_string()).hash();
+        publish_log_segment(&store, tenant_hash).await;
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let catalog =
+            Catalog::new(Arc::clone(&backend), CatalogConfig::default()).expect("catalog");
+        let config = EngineConfig {
+            deadline: Duration::from_secs(60),
+            ..EngineConfig::default()
+        };
+        (
+            QueryEngine::new(Arc::new(catalog), backend, config),
+            tenant_hash,
+        )
+    }
+
+    async fn prefetch_log_selector(
+        engine: &QueryEngine,
+        tenant_hash: TenantHash,
+        eval_deadline: Instant,
+    ) -> Result<(MergedSource, QueryStats), QueryError> {
+        let t_ms = (BASE_NS + 20 * NS) / 1_000_000;
+        let plans = plan_selectors(QUERY, t_ms, t_ms).expect("plans");
+        engine
+            .prefetch(
+                tenant_hash,
+                &plans,
+                &EvalWindow::Instant {
+                    t_ns: BASE_NS + 20 * NS,
+                },
+                &[],
+                NOW_NS,
+                eval_deadline,
+            )
+            .await
+    }
+
+    /// The query's deadline has already passed when its log selector fetch
+    /// starts, while the fetch's own start plus the engine's 60 s deadline is
+    /// still ahead. The fetch must stop at the query's deadline.
+    #[tokio::test]
+    async fn a_log_fetch_started_late_stops_at_the_query_deadline() {
+        let (engine, tenant_hash) = engine_with_one_log_segment().await;
+        let query_deadline = Instant::now();
+        let Err(err) = prefetch_log_selector(&engine, tenant_hash, query_deadline).await else {
+            panic!("the query's deadline has passed before the log fetch starts");
+        };
+        assert!(
+            matches!(err, QueryError::DeadlineExceeded { .. }),
+            "expected DeadlineExceeded, got {err:?}"
+        );
+    }
+
+    /// Control for the test above: the same fixture and selector with a
+    /// deadline still ahead fetches the segment and returns its series, so
+    /// the refusal above comes from the deadline and nothing else.
+    #[tokio::test]
+    async fn the_same_log_fetch_succeeds_before_the_query_deadline() {
+        let (engine, tenant_hash) = engine_with_one_log_segment().await;
+        let (source, _stats) = prefetch_log_selector(
+            &engine,
+            tenant_hash,
+            Instant::now() + Duration::from_secs(3600),
+        )
+        .await
+        .expect("the log fetch runs inside the query's deadline");
+        assert_eq!(source.log_series.len(), 1, "one stream, one series");
+    }
+}
