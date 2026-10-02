@@ -4339,12 +4339,13 @@ mod tests {
     /// Non-vacuity (prove-the-test), each flip named:
     /// - Drop the cursor deduction (`merge_memory_budget_bytes` returning its
     ///   first argument): the 32 GiB row reads 1572864000 (a 30 GiB budget is
-    ///   lease-bound), the 30 GiB row 939524096... see the rows' own figures.
+    ///   lease-bound), and the 30 GiB row at 2 merges reads 1572864000 as well
+    ///   (28 GiB / 8 / 2 is 1.75 GiB, also lease-bound) instead of 939524096.
     /// - Drop the reserve deduction: the 32 GiB row reads 1500 MiB / 1.5 GiB
     ///   (12 GiB / 8) instead of 1.25 GiB.
     /// - Drop the clamp from `derive_l1_part_memory_target`: the 24 GiB row
-    ///   reads 268435456 either way, the 128 GiB row 17179869184 at the long
-    ///   lease.
+    ///   reads 268435456 either way, the 128 GiB row 14227079168 (its 106 GiB
+    ///   budget / 8) at the long lease instead of the 8 GiB ceiling.
     /// - Ignore `concurrent_merges` there (or pass 1 from
     ///   `build_compactor_config`): the 30 GiB row at 2 merges reads 1 GiB.
     /// - Drop the lease term: the 52 GiB default-lease row reads 4026531840.

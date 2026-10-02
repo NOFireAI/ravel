@@ -318,8 +318,9 @@ pub fn l1_part_memory_target_fallback_note(
     })
 }
 
-/// The claim lease the part-split derivation caps against: the invocation's
-/// `--claim-lease-duration` when given, else the compactor's default.
+/// The claim lease the part-split derivation caps against:
+/// `ClaimOptions::lease_duration` when set (no `ravel-cli` flag sets it today;
+/// tests do), else the compactor's default.
 fn claim_lease_for_derivation(claims: &ClaimOptions) -> Duration {
     claims
         .lease_duration

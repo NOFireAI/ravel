@@ -348,7 +348,7 @@ async fn main() -> anyhow::Result<()> {
     if compactor.claim_lease_below_warn_threshold() {
         tracing::warn!(
             claim_lease_secs = claim_lease_duration.as_secs(),
-            max_l1_part_bytes = compactor.largest_stored_target_bytes(),
+            largest_stored_target_bytes = compactor.largest_stored_target_bytes(),
             "maintenance: --maintain-claim-lease is below ADR-1029 decision 3's startup \
              threshold (2x the estimated encode+PUT time for the largest L1 part); a claim \
              can expire while its run is still encoding its largest part, raise the lease if \
