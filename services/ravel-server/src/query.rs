@@ -351,6 +351,30 @@ pub fn build_catalog_for_server(
 /// Fallible for the same reason [`crate::config::QueryBudgets::apply_to_engine`]
 /// is: a zero `--logs-max-fetch-run-bytes` is refused at startup rather than
 /// at a division inside the fetch layer.
+/// Why `start` refused `query_budgets.fold_lag_interval`. Nothing is spawned.
+#[derive(Debug, thiserror::Error)]
+pub enum FoldLagIntervalError {
+    /// `Some(Duration::ZERO)` names a fold that runs back to back, which no
+    /// maintain tier runs, so the fold-lag threshold it would set is
+    /// meaningless.
+    #[error(
+        "--fold-lag-interval-secs must be non-zero: a zero interval names a fold that runs back to back, which --fold-interval-secs refuses"
+    )]
+    ZeroFoldLagInterval,
+}
+
+/// Refuses a zero `query_budgets.fold_lag_interval`, the library-side match of
+/// the `Cli::validate` refusal of `--fold-lag-interval-secs 0`. `start` runs it
+/// before spawning anything; an unset interval passes.
+pub fn check_fold_lag_interval(
+    budgets: &crate::config::QueryBudgets,
+) -> Result<(), FoldLagIntervalError> {
+    if budgets.fold_lag_interval.is_some_and(|i| i.is_zero()) {
+        return Err(FoldLagIntervalError::ZeroFoldLagInterval);
+    }
+    Ok(())
+}
+
 pub fn build_engine_config(
     config: &ServerConfig,
     catalog_config: &CatalogConfig,
@@ -1628,6 +1652,35 @@ mod catalog_cache_tests {
             engine_unset.fold_interval,
             crate::fold::DEFAULT_FOLD_INTERVAL
         );
+    }
+
+    /// A zero fold-lag interval is refused with the typed error naming the
+    /// flag; a non-zero one and an unset one pass.
+    ///
+    /// Flip to watch it fail: delete the `return
+    /// Err(FoldLagIntervalError::ZeroFoldLagInterval);` line in
+    /// [`check_fold_lag_interval`].
+    #[test]
+    fn a_zero_fold_lag_interval_is_refused() {
+        let mut budgets = crate::config::QueryBudgets {
+            fold_lag_interval: Some(Duration::ZERO),
+            ..crate::config::QueryBudgets::default()
+        };
+        let err = check_fold_lag_interval(&budgets)
+            .expect_err("a zero fold-lag interval must be refused");
+        assert!(
+            matches!(err, FoldLagIntervalError::ZeroFoldLagInterval),
+            "expected ZeroFoldLagInterval, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("--fold-lag-interval-secs"),
+            "the refusal must name the flag, got: {err}"
+        );
+
+        budgets.fold_lag_interval = Some(Duration::from_secs(900));
+        check_fold_lag_interval(&budgets).expect("a non-zero interval passes");
+        budgets.fold_lag_interval = None;
+        check_fold_lag_interval(&budgets).expect("an unset interval passes");
     }
 
     /// The issue #2074 case end to end through the refusal text: a maintain
