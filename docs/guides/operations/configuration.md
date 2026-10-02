@@ -846,11 +846,13 @@ token file's line number, never the pair's text. A tenant with no `;` is
 unchanged and never carries the capability. See [Background](#background)
 for the decision behind this.
 
-`ravel-ingest-router` accepts the same `--tenant-token` spelling but does not
-know the `;ddl` suffix: it reads `acme;ddl` as a tenant named `acme;ddl`, so
-data it ingests for that token lands under a different tenant than the one
-`ravel-server` queries, with no error on either side. Keep `;ddl` pairs out of
-any token list or Secret you also pass to `ravel-ingest-router`.
+`ravel-ingest-router` accepts the same `--tenant-token` spelling and strips the
+`;ddl` suffix, so it routes `acme;ddl` by the tenant `acme`; it never grants
+the capability. Tokens in the durable `sys/auth` map cannot carry `ddl`: the
+map is read without suffix parsing, so an entry written as `acme;ddl` names a
+tenant literally called `acme;ddl`, with no capability and no error. Grant
+`ddl` only through `--tenant-token`, `--tenant-token-file` or
+`--oidc-ddl-claim`.
 
 ### Production authentication
 

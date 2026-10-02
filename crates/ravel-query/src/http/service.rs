@@ -252,16 +252,21 @@ impl QueryControls {
         UsageGuard::new(Arc::clone(&self.usage_sink), tenant_hash, live)
     }
 
-    /// Step 5: submit one evidential audit event for a query that reached
-    /// execution for a resolved tenant and await its durability (ADR-0062
-    /// §2a).
+    /// Step 5: submit one evidential audit event for a resolved tenant and
+    /// await its durability (ADR-0062 §2a). Each call submits one event; a
+    /// caller may submit more than one per request, and may audit a refusal
+    /// that never reached execution. A query submits one event once it
+    /// reached execution. The SQL DDL path submits an `error` event for a
+    /// statement refused for the `ddl` capability, and an `attempted` event
+    /// followed by its outcome for one that runs (ADR-2040's HTTP DDL
+    /// amendment).
     ///
     /// A submission failure (`audit_mode=required` surfacing a flush error, or
-    /// a stopped pipeline) fails the request closed with a retryable 503 rather
-    /// than releasing an unaudited answer. In best-effort mode the pipeline
-    /// resolves the submission to `Ok` and the response is released. A request
-    /// rejected before execution never calls this: there is no executed read to
-    /// attribute.
+    /// a stopped pipeline) is returned to the caller as a retryable 503. A
+    /// query fails closed on it rather than releasing an unaudited answer. In
+    /// best-effort mode the pipeline resolves the submission to `Ok`. A query
+    /// rejected before execution never calls this: there is no executed read
+    /// to attribute.
     pub async fn audit(
         &self,
         tenant_hash: TenantHash,
