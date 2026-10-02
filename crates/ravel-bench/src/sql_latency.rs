@@ -5216,7 +5216,7 @@ mod tests {
     ///
     /// Fails if the `self.wire_bytes.record(phase, ..)` line inside
     /// `whole_object_bytes`'s cache fetch closure is removed (the cold scan
-    /// reads 0), or if its `Source::Cache` arm also charges the served bytes
+    /// reads 0), or if its `ReadOutcome::Hit` arm also charges the served bytes
     /// to the wire counter: the warm run's attributed bytes then exceed its
     /// pooled GET bytes (0) and `reconcile_run_accounting` fails the
     /// measurement before the report is built.

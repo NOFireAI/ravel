@@ -45,7 +45,7 @@ use std::sync::Arc;
 use crate::fetcher::{ReadCache, gate_not_run};
 use crate::reserved_bytes::attach_reservation;
 use bytes::Bytes;
-use ravel_cache::{CacheKey, SingleFlightError, Source};
+use ravel_cache::{CacheKey, ReadOutcome, SingleFlightError};
 use ravel_catalog::SegmentRef;
 use ravel_cpu_gate::{CpuGateError, JobSize, ReadGate, ReadSite};
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
@@ -623,10 +623,12 @@ impl SpanSegmentFetcher {
     /// other disk-entry defect degrades to a miss and is counted by
     /// `ravel-cache`'s own `disk_errors_degraded_to_misses` counter, not a new
     /// span-specific one, and this call falls through to the one store GET a
-    /// miss takes -- it never serves unverified bytes. `source` (from
-    /// [`ReadCache::get_or_fetch`]) decides whether this call records a cache
-    /// hit or a cache miss plus the underlying store GET, so a hit and a miss
-    /// are never double-counted on the tiered tier.
+    /// miss takes -- it never serves unverified bytes. The [`ReadOutcome`] from
+    /// [`ReadCache::get_or_fetch`] decides whether this call records a cache
+    /// hit, a cache miss plus the store GET it ran, or, for a late serve (a
+    /// single-flight follower on either cache kind, or a RAM-only recheck
+    /// serve), a cache miss with no GET, so a hit and a miss are never
+    /// double-counted on the tiered tier.
     async fn whole_object_bytes(
         &self,
         seg_ref: &SegmentRef,
@@ -665,10 +667,10 @@ impl SpanSegmentFetcher {
         };
 
         let cache_key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, 0, seg_ref.object_size);
-        // One read-through call, accounted from the returned `Source`: a
+        // One read-through call, accounted from the returned `ReadOutcome`: a
         // single call avoids the peek-then-`get_or_fetch` double-count on the
         // tiered tier (see `ReadCache::get_or_fetch`).
-        let (bytes, source) = cache
+        let (bytes, outcome) = cache
             .get_or_fetch(cache_key, || async move {
                 let _permit = self.get_limiter.acquire().await.map_err(|_| {
                     StoreError::Transient("GetLimiter semaphore closed unexpectedly".to_string())
@@ -687,8 +689,8 @@ impl SpanSegmentFetcher {
             .map_err(|err| from_cache_error(key, err))?;
 
         let mut reservation = reservation;
-        match source {
-            Source::Cache => {
+        match outcome {
+            ReadOutcome::Hit => {
                 accounting.record_cache_hit();
                 accounting.add_cache_bytes(bytes.len() as u64);
                 // Same two-ledger overlap as the log fetcher's hit path: the
@@ -697,9 +699,10 @@ impl SpanSegmentFetcher {
                 // it (ADR-1170 decision 2).
                 reservation.mark_handed_off();
             }
-            // A miss issues one store GET for the resulting bytes, recorded
-            // by the closure above.
-            Source::Upstream => {
+            // A miss. Only the call that ran the closure above recorded a
+            // store GET; a late serve (another caller's flight, or the RAM
+            // recheck) recorded none and stays this miss alone.
+            ReadOutcome::Fetched | ReadOutcome::LateServe => {
                 accounting.record_cache_miss();
                 // Admitted to the read cache, which has its own byte ledger:
                 // mark the reservation handed off so the transient overlap is
@@ -2313,6 +2316,128 @@ mod tests {
                 ..
             } => assert!(message.contains("panicked"), "{message}"),
             other => panic!("expected the decode error, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod late_serve_accounting_tests {
+    //! Two whole-object span reads of one object through a cache at once, the
+    //! second joining the first's in-flight GET: the follower is charged no
+    //! GET and records a query cache miss, on both cache kinds. A `FaultStore`
+    //! hold gate parks the leader's GET until the follower is in position.
+
+    use super::*;
+    use crate::fetcher::CacheFetchError;
+    use ravel_cache::{Cache, CacheLimits, DiskCache, TieredCache};
+    use ravel_catalog::SegmentLevel;
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
+    use ravel_object_store::memory::MemoryStore;
+    use uuid::Uuid;
+
+    const TENANT: TenantHash = TenantHash([5u8; 16]);
+    const CONTENT_HASH: [u8; 32] = [6u8; 32];
+    const KEY: &str = "t/late-serve.rspan";
+    const SIZE: u64 = 40;
+
+    fn limits() -> CacheLimits {
+        CacheLimits::new(1024 * 1024, 100, 1024 * 1024)
+    }
+
+    fn seg_ref() -> SegmentRef {
+        SegmentRef {
+            data_object_key: KEY.to_string(),
+            object_size: SIZE,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: 0,
+            ingest_hour_bucket: 0,
+            sample_count: 1,
+            series_count: 0,
+            shard: 0,
+            content_hash: CONTENT_HASH,
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_rspan::footer::VERSION),
+            declared_column_stats: Default::default(),
+        }
+    }
+
+    /// FLIP: mapping `ReadOutcome::LateServe` to the `ReadOutcome::Hit` arm in
+    /// `SpanSegmentFetcher::whole_object_bytes` makes the follower a hit with
+    /// cache bytes on both kinds.
+    #[tokio::test]
+    async fn a_whole_object_span_follower_is_a_miss_charged_no_get() {
+        let object = Bytes::from((0..SIZE as u8).collect::<Vec<u8>>());
+        let key = CacheKey::new(TENANT.0, CONTENT_HASH, 0, SIZE);
+        for tiered in [false, true] {
+            let memory = MemoryStore::new();
+            memory
+                .put(KEY, object.clone(), PutOptions::default())
+                .await
+                .expect("put");
+            let fault = Arc::new(FaultStore::new(memory, FaultPlan::default()));
+            let gate = fault.hold(Op::Get, None, Occurrence::Always);
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let (cache, parked): (ReadCache, Box<dyn Fn() -> bool>) = if tiered {
+                let tiered = Arc::new(TieredCache::new(
+                    Cache::new(limits()),
+                    DiskCache::new(tmp.path().to_path_buf(), limits()),
+                ));
+                (
+                    ReadCache::Tiered(tiered.clone()),
+                    Box::new(move || tiered.in_flight_waiters(&key) >= 1),
+                )
+            } else {
+                let ram: Arc<Cache<CacheFetchError>> = Arc::new(Cache::new(limits()));
+                let metrics = ram.metrics();
+                // The follower joins the flight in the same poll that records
+                // its peek's miss.
+                (
+                    ReadCache::Ram(ram),
+                    Box::new(move || metrics.snapshot().misses >= 2),
+                )
+            };
+            let fetcher = SpanSegmentFetcher::new(fault).with_cache(cache);
+            let seg = seg_ref();
+            let leader_acc = QueryAccounting::new();
+            let follower_acc = QueryAccounting::new();
+            let release = async {
+                tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                    gate.wait_until_held(1).await;
+                    while !parked() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the leader's GET is held and the follower parked within 30 s");
+                assert_eq!(gate.held_count(), 1, "exactly one GET reached the store");
+                for id in gate.held() {
+                    assert!(gate.release(id), "held id must release");
+                }
+            };
+            let (leader, follower, ()) = tokio::join!(
+                fetcher.whole_object_bytes(&seg, TENANT, &leader_acc),
+                fetcher.whole_object_bytes(&seg, TENANT, &follower_acc),
+                release,
+            );
+            assert_eq!(leader.expect("leader read").as_ref(), object.as_ref());
+            assert_eq!(follower.expect("follower read").as_ref(), object.as_ref());
+
+            let leader_snap = leader_acc.snapshot();
+            assert_eq!(leader_snap.total_s3_requests(), 1, "tiered={tiered}");
+            assert_eq!(leader_snap.cache_misses, 1, "tiered={tiered}");
+            assert_eq!(leader_snap.cache_hits, 0, "tiered={tiered}");
+            let follower_snap = follower_acc.snapshot();
+            assert_eq!(follower_snap.total_s3_requests(), 0, "tiered={tiered}");
+            assert_eq!(follower_snap.total_s3_bytes(), 0, "tiered={tiered}");
+            assert_eq!(follower_snap.cache_misses, 1, "tiered={tiered}");
+            assert_eq!(follower_snap.cache_hits, 0, "tiered={tiered}");
+            assert_eq!(follower_snap.cache_bytes, 0, "tiered={tiered}");
         }
     }
 }

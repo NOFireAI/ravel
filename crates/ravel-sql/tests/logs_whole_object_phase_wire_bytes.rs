@@ -478,7 +478,7 @@ async fn segmented_covering_read_charges_every_sub_range_to_the_scan_phase() {
 ///
 /// Fails if the `self.wire_bytes.record(phase, ..)` line inside
 /// `whole_object_bytes`'s cache fetch closure is removed (the cold run's scan
-/// reads 0), or if the `Source::Cache` arm charges the served bytes to the
+/// reads 0), or if the `ReadOutcome::Hit` arm charges the served bytes to the
 /// wire counter as well (the warm run's scan reads the object bytes, not 0).
 #[tokio::test]
 async fn cache_miss_is_charged_to_the_scan_phase_and_a_warm_hit_to_nothing() {

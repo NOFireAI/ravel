@@ -281,12 +281,29 @@ below can be computed per cache or summed across both:
   when a disk tier is configured: no hit, no `bytes_served` and no
   `bytes_admitted`. When two such reads arrive together, one leads the RAM
   recheck and the other follows it and records a single-flight collapse. This
-  holds with a RAM tier only as well. One exception on the tier metrics: a
-  log read peeks every block of a coalesced run other than the first a second
-  time just before fetching it, so such a block records a second RAM miss
-  (and disk miss), or, when that second peek finds it, a hit and its
-  `bytes_served`. A Parquet read or a log read counts a late serve in its
-  query accounting as one cache miss with zero GETs and zero fetched bytes.
+  holds with a RAM tier only as well. Such a read, and a read that waited on
+  another read's in-flight GET (a single-flight follower), is a late serve.
+  A Parquet read counts a late serve in its query accounting as one cache
+  miss with zero GETs and zero fetched bytes. So do the four read-through
+  paths of the query fetchers: a single-flight follower is a late serve with
+  or without `--cache-dir`, while a read the RAM recheck serves is one only
+  with a RAM tier alone (with `--cache-dir` those paths have no RAM recheck,
+  so a read arriving after the flight ends leads its own and counts the
+  disk hit). The four paths are a metrics
+  (RSEG) read, ranged or whole-object (only a suffix read bypasses the
+  cache), a log whole-object read, a log extent read (the
+  block-range probe, directory and page-range reads, and the covering read of
+  an oversized object), and a span whole-object read. Their `page_fetch` and
+  `segment_open` spans record no request for it either, and a page-range read
+  counts it in neither `block_range_gets` nor `block_cache_hits`. Only the
+  read that ran the GET is charged it, and only a lookup that found the bytes
+  is a hit. The query's cache hit and miss counts
+  (`ravel_query_cache_hits_total`) do not depend on which caller fetched: a
+  late serve is a miss on these paths and is charged no GET. A log
+  block-range read's second look at a
+  coalesced run's blocks records no hit or miss on either tier, but a block it
+  finds on the disk tier is still re-admitted to RAM, so `bytes_admitted`
+  moves.
 
 With both caches off (`--disable-cache`), none of these samples appear on
 `/metrics` at all: neither `cache="fetch"` nor `cache="catalog"`. A fetcher

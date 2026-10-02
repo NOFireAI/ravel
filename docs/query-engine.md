@@ -2428,13 +2428,17 @@ cache-eligible ranges through the ADR-0046 read cache, and a cache hit
 serves bytes with no store round trip at all (`record_cache_hit`, never an
 `AccountedOp::Get`), so it contributes zero requests and zero bytes to the
 span. Each `guarded_get` call returns its own `{requests, bytes}` cost,
-`{1, len}` for a store GET (the uncached path, a cache miss's leader, or a
-single-flight follower riding another caller's in-flight GET, matching the
-log path's rule below) and `{0, 0}` for a cache hit, and the caller folds
-those in, so the store-vs-cache decision lives once, at the seam that
-already knows it. `segment_open` sums the store-sourced cost of its own one
-or two `guarded_get` calls; which of those can reach zero on a warm cache
-depends on the first GET's shape. A segment at or below
+`{1, len}` for a store GET this call made (the uncached path, or the cache
+miss's single-flight leader that ran the fetch) and `{0, 0}` otherwise: a
+cache hit, or a late serve, which is a single-flight follower riding another
+caller's in-flight GET on either cache kind, or, on the RAM-only cache, a
+read whose leader's RAM recheck found bytes another flight admitted after its
+peek missed. A late serve is a cache miss in `QueryAccounting`, not a hit;
+the log path below and the span whole-object read follow the same rule. The
+caller folds those costs in, so the store-vs-cache decision lives once, at
+the seam that already knows it. `segment_open` sums the store-sourced cost
+of its own one or two `guarded_get` calls; which of those can reach zero on
+a warm cache depends on the first GET's shape. A segment at or below
 `DEFAULT_WHOLE_OBJECT_THRESHOLD` reads its whole object with a
 `GetRange::Full` first GET, which is cache-eligible, so both its GETs (and
 thus the whole `segment_open` cost) are zero on a fully warm cache. A
@@ -2464,10 +2468,10 @@ fields: `s3_requests`/`s3_bytes` on `catalog_resolve`, `segment_open`, and
 `fetch_accounted_with_tenant`) carries the same `page_fetch` and `decode`
 span names. What `page_fetch` records there depends on the object's size
 (ADR-0107): at or below the block-range threshold, its one whole-object GET,
-or zero on a cache hit; above it, the total store GETs the block-range
-sequence issued (probe, directory sections, coalesced candidate-block
-ranges) and the bytes they moved, again zero when every extent was a cache
-hit.
+or zero on a cache hit or a late serve; above it, the total store GETs this
+read's block-range sequence issued itself (probe, directory sections,
+coalesced candidate-block ranges) and the bytes they moved, again zero when
+every extent was a cache hit or a late serve.
 
 On the log-signal path `decompressed_bytes` is the bytes zstd produced on
 the RLOG scan and plan paths, both whole-object and ranged: the directory
