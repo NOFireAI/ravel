@@ -3165,19 +3165,20 @@ mod tests {
     /// (`get_off_worker`) while the leader's GET is in flight, collapse onto
     /// one upstream GET and every caller receives identical bytes.
     ///
-    /// A `FaultStore` gate holds the leader's GET open until every caller has
-    /// peeked and missed. Six of them are then parked on the leader's single
-    /// flight, counted by `TieredCache::in_flight_waiters`. The seventh is
-    /// polled only up to its disk peek and resumed after the leader has
-    /// finished and left the single-flight map: the interleaving a slow
-    /// `spawn_blocking` disk peek produces on a loaded machine, which is how
-    /// this test once saw two GETs.
+    /// A `FaultStore` gate holds the leader's GET open until the leader and
+    /// six parked followers have peeked and missed; those six are counted by
+    /// `TieredCache::in_flight_waiters`. The eighth caller's disk peek is
+    /// held open by `DiskCache::block_peek_for_test` (issue #2347) and
+    /// released only after the leader and the six followers have resolved
+    /// and left the single-flight map, constructing deterministically the
+    /// interleaving a slow `spawn_blocking` disk peek produces on a loaded
+    /// machine -- which is how this test once saw two GETs -- instead of
+    /// sampling it under real scheduling.
     ///
     /// FLIP: removing the leader's `self.ram.get_uncounted(&key)` check in
-    /// `TieredCache::resolve_peeked_miss` lets the seventh caller lead a
+    /// `TieredCache::resolve_peeked_miss` lets the eighth caller lead a
     /// second flight with its own GET, so the GET count reads 2.
     #[tokio::test]
-    #[ignore = "samples a race and fails when the disk peek finishes in its first poll; issue #2347"]
     async fn a_tiered_concurrent_miss_collapses_to_one_get() {
         let dir = tempfile::tempdir().expect("tempdir");
         let memory = Arc::new(ravel_memory::MemoryBudget::unlimited());
@@ -3218,37 +3219,24 @@ mod tests {
         };
         gate.wait_until_held(1).await;
 
-        // Polled before any parked caller exists, so a disk peek fast enough to
-        // finish inside this one poll and join the flight shows as one waiter
-        // here rather than hiding among the parked ones. Such an attempt is a
-        // follower, not the late interleaving under test: it is dropped and the
-        // late caller rebuilt. Every attempt's peek records one disk miss.
-        let mut late_peeks = 0u64;
-        let late = loop {
-            let mut late = Box::pin(reader.read_range(0..4, QueryPhase::Scan));
-            let first = std::future::poll_fn(|cx| {
-                Poll::Ready(std::future::Future::poll(late.as_mut(), cx))
-            })
-            .await;
-            assert!(
-                first.is_pending(),
-                "the late caller waits on its disk peek or the held flight"
-            );
-            late_peeks += 1;
-            if tiered.in_flight_waiters(&key) == 0 {
-                break late;
-            }
-            assert!(
-                late_peeks < 20,
-                "the late caller's disk peek finished inside its first poll every time"
-            );
-            drop(late);
-            assert_eq!(
-                tiered.in_flight_waiters(&key),
-                0,
-                "a dropped follower leaves the leader's flight"
-            );
-        };
+        // Gate the late caller's disk peek itself rather than sampling
+        // whether it is still pending: the next `get`/`get_uncounted` of
+        // `key` parks before touching disk until released below.
+        let mut disk_peek = tiered.disk_for_test().block_peek_for_test(key);
+        let mut late = Box::pin(reader.read_range(0..4, QueryPhase::Scan));
+        let first =
+            std::future::poll_fn(|cx| Poll::Ready(std::future::Future::poll(late.as_mut(), cx)))
+                .await;
+        assert!(
+            first.is_pending(),
+            "the late caller waits on its gated disk peek"
+        );
+        disk_peek.entered().await;
+        assert_eq!(
+            tiered.in_flight_waiters(&key),
+            0,
+            "the late caller is parked on its disk peek, not on any flight yet"
+        );
 
         let parked: Vec<_> = (0..PARKED)
             .map(|_| {
@@ -3258,10 +3246,10 @@ mod tests {
             .collect();
 
         // Each disk miss is recorded inside a caller's `spawn_blocking` peek
-        // once it has missed, so reaching the leader's, the parked callers' and
-        // every late attempt's means every peek missed while the leader's GET
-        // was held. The timeout only turns a hang into a failure.
-        let peeks = (CALLERS - 1) as u64 + late_peeks;
+        // once it has missed. The late caller's peek is still parked on the
+        // gate above, so only the leader's and the six parked callers' misses
+        // are counted here. The timeout only turns a hang into a failure.
+        let peeks = (CALLERS - 1) as u64;
         tokio::time::timeout(std::time::Duration::from_secs(60), async {
             while disk_metrics.snapshot().misses - before_misses < peeks
                 || tiered.in_flight_waiters(&key) < PARKED
@@ -3270,7 +3258,7 @@ mod tests {
             }
         })
         .await
-        .expect("every caller peeks and misses, and six park on the held leader");
+        .expect("the leader and the six parked callers all peek and miss");
         assert_eq!(
             tiered.in_flight_waiters(&key),
             PARKED,
@@ -3299,8 +3287,19 @@ mod tests {
             !tiered.is_in_flight(&key),
             "the leader's flight has finished and left the map before the late caller resumes"
         );
+
+        // Only now release the late caller's disk peek: its miss lands after
+        // the leader's flight has already left the single-flight map, so
+        // `resolve_peeked_miss`'s leader RAM recheck is what decides whether
+        // it reuses the finished flight's bytes or leads a second one.
+        disk_peek.release();
         served.push(late.await.expect("the late caller resolves"));
 
+        assert_eq!(
+            disk_metrics.snapshot().misses - before_misses,
+            CALLERS as u64,
+            "every one of the 8 callers' disk peeks missed"
+        );
         assert_eq!(
             recording.ranges().len(),
             1,
