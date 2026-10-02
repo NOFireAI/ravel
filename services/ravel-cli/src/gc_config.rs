@@ -96,7 +96,9 @@ fn head_cache_ttl_line(format_version: u32, head_cache_ttl_ns: i64) -> String {
 /// `head_cache_ttl` (`--head-cache-ttl`) writes format version 2 recording that
 /// TTL: the ADR-1133 rollout flip, after which a build that reads only version
 /// 1 refuses to start. Without it, the stored format version is kept, and a
-/// stored version 2 keeps its recorded TTL.
+/// stored version 2 keeps its recorded TTL. A TTL below this build's compiled
+/// query head-cache TTL is refused, since every query-mode process would then
+/// refuse to start.
 #[allow(clippy::too_many_arguments)]
 pub async fn set(
     store: Arc<dyn ObjectStoreBackend>,
@@ -121,6 +123,20 @@ pub async fn set(
             .map(|s| parse_duration_ns("--head-cache-ttl", s))
             .transpose()?,
     };
+    // A query-mode process refuses to start when its own TTL exceeds the
+    // recorded one, and no server flag lowers that TTL below this build's
+    // compiled default, so a smaller recorded value would stop every query
+    // process at its next restart.
+    if let Some(ttl_ns) = proposed.head_cache_ttl_ns
+        && ttl_ns < ravel_catalog::DEFAULT_HEAD_CACHE_TTL_NS
+    {
+        anyhow::bail!(
+            "--head-cache-ttl records head_cache_ttl_ns={ttl_ns}, below this build's query \
+             head-cache TTL of {} ns; every query-mode process would refuse to start at its \
+             next restart",
+            ravel_catalog::DEFAULT_HEAD_CACHE_TTL_NS
+        );
+    }
     let (outcome, written) =
         set_gc_config(store.as_ref(), proposed, clock_skew_allowance_ns, now_ns).await?;
     match outcome {
@@ -281,7 +297,7 @@ mod tests {
             "1h",
             "1h",
             None,
-            Some("10s"),
+            Some("45s"),
             2,
         )
         .await
@@ -292,7 +308,7 @@ mod tests {
             .expect("read")
             .expect("present");
         assert_eq!(v.format_version, 2);
-        assert_eq!(v.head_cache_ttl_ns, 10_000_000_000);
+        assert_eq!(v.head_cache_ttl_ns, 45_000_000_000);
     }
 
     /// Without `--head-cache-ttl`, `set` over a stored version 1 keeps
@@ -335,7 +351,7 @@ mod tests {
             "1h",
             "1h",
             None,
-            Some("10s"),
+            Some("45s"),
             1,
         )
         .await
@@ -354,10 +370,49 @@ mod tests {
             .expect("present");
         assert_eq!(v.format_version, 2);
         assert_eq!(
-            v.head_cache_ttl_ns, 10_000_000_000,
+            v.head_cache_ttl_ns, 45_000_000_000,
             "the recorded TTL is kept"
         );
         assert_eq!(v.protection_horizon_ns, 50 * 3_600_000_000_000);
+    }
+
+    /// A `--head-cache-ttl` below this build's compiled query TTL is refused and
+    /// writes nothing: a query-mode process cannot lower its own TTL, so it
+    /// would refuse to start against the recorded value.
+    #[tokio::test]
+    async fn set_refuses_a_head_cache_ttl_below_the_compiled_default() {
+        let store = store();
+        let below = format!("{}ns", ravel_catalog::DEFAULT_HEAD_CACHE_TTL_NS - 1);
+        let err = set(
+            store.clone(),
+            "26h",
+            "24h",
+            "1h",
+            "1h",
+            None,
+            Some(&below),
+            1,
+        )
+        .await
+        .expect_err("a TTL below the compiled default must be refused");
+        assert!(err.to_string().contains("head_cache_ttl_ns"), "got: {err}");
+        let got = store
+            .get(ravel_maintain::GC_CONFIG_KEY, GetRange::Full)
+            .await;
+        assert!(matches!(got, Err(StoreError::NotFound)));
+        let exact = format!("{}ns", ravel_catalog::DEFAULT_HEAD_CACHE_TTL_NS);
+        set(
+            store.clone(),
+            "26h",
+            "24h",
+            "1h",
+            "1h",
+            None,
+            Some(&exact),
+            2,
+        )
+        .await
+        .expect("the compiled default itself is accepted");
     }
 
     /// A zero `--head-cache-ttl` is refused and writes nothing: version 2 must
