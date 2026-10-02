@@ -1,5 +1,10 @@
 # Candidate #1133: sweep delete not gated on pinned queries
 
+Historical record. `candidate-1133.cfg` is now the negative control
+`negative/pinned-query-ungated.cfg` (issue #2339), which the negative lane runs;
+its current trace is in `pinned-query-ungated.md`. The trace below predates the
+split of `PerformRewrite` into `StartRewrite` and `PublishRewrite`.
+
 Verdict: CONFIRMED unsafe.
 
 ## Configuration

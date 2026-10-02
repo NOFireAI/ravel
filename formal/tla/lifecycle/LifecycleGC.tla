@@ -653,16 +653,16 @@ Tick ==
 \* Two ADR-1133 delays widen the pin, both inert at HeadCacheTtl = 0 and
 \* ClockSkew = 0:
 \*  * The cache delay: the resolve may be served a cached HEAD that still names
-\*    an object the current HEAD dropped, while clock < cacheUntil[o]. The pin
-\*    takes the current HEAD's objects plus every such object, which is at least
-\*    as much as any one cached HEAD names. The bound is exclusive; results.md
-\*    (round for issue #2339) records that an inclusive bound fails
-\*    window-gate.cfg at the one tick where the reader's last read and the
-\*    gate's first open coincide.
-\*  * ext, the Flight SQL ticket term (decision 3's third and fourth sigma): a
-\*    ticket minted on one process and redeemed on another can read up to
+\*    an object the current HEAD dropped, through clock = cacheUntil[o]
+\*    inclusive, as the head cache serves an entry while its age is <= the TTL.
+\*    cacheUntil[o] = 0 means never: a real drop sets it to at least
+\*    HeadCacheTtl >= 1, and HeadCacheTtl = 0 leaves it at 0 (no cache). The
+\*    pin takes the current HEAD's objects plus every such object, which is at
+\*    least as much as any one cached HEAD names.
+\*  * ext, the Flight SQL ticket term (decision 3's first two sigma): a ticket
+\*    minted on one process and redeemed on another can read up to
 \*    2 * ClockSkew past the minting process's deadline.
-CachedNames(o) == o \notin head /\ clock < cacheUntil[o]
+CachedNames(o) == o \notin head /\ cacheUntil[o] > 0 /\ clock <= cacheUntil[o]
 
 PinQuery ==
     /\ ~query.active
@@ -1244,20 +1244,28 @@ GatedCandidate(k) ==
     /\ ~NamedByHead(k)
     /\ IF k \in Buckets THEN RetentionCandidate(k) ELSE SupersededCandidate(k)
 
-\* The gate, on the deleting sweeper's clock: observed + window <= now. True time
-\* is `clock`. `lead` is decision 3's deleting-sweeper sigma: that sweeper's clock
-\* may run up to ClockSkew ahead of true time. marker[k].obs already carries the
-\* writer's lag and the ClockSkew shift (WriteMarker), so with the shift moved to
-\* the right-hand side this is (writer reading) + WindowLength <= clock + lead.
+\* The gate, on the deleting sweeper's clock: observed + window < now. True time
+\* is `clock`. `lead` is decision 3's deleting-sweeper sigma (the fourth): that
+\* sweeper's clock may run up to ClockSkew ahead of true time. marker[k].obs
+\* already carries the writer's lag and the ClockSkew shift (FreshMarker), so
+\* with the shift moved to the right-hand side this is
+\* (writer reading) + WindowLength < clock + lead.
+\*
+\* The comparison is strict where decision 3 writes <=. Every other boundary in
+\* the chain is inclusive here as in the code: a pinned query reads through its
+\* deadline tick, and the cache serves through drop + HeadCacheTtl. With <= the
+\* first tick the gate opens is the last tick a covered reader can still read,
+\* and window-gate.cfg fails on exactly that tick (results.md, issue #2339
+\* round). In nanoseconds, < is decision 3's condition plus 1 ns.
 WindowPermits(k) ==
     \/ ~WindowGate
     \/ /\ marker[k].present
        /\ (MarkerIgnoresAnchor \/ marker[k].anchor = AnchorOf(k))
        /\ \E lead \in 0..ClockSkew :
-              marker[k].obs + WindowLength <= clock + ClockSkew + lead
+              marker[k].obs + WindowLength < clock + ClockSkew + lead
 
 \* A marker body the writer's clock produced: `lag` is decision 3's marker-writer
-\* sigma, the writer's clock running up to ClockSkew behind true time.
+\* sigma (the third), the writer's clock running up to ClockSkew behind true time.
 FreshMarker(k, lag) ==
     [present |-> TRUE, obs |-> clock + ClockSkew - lag, anchor |-> AnchorOf(k)]
 
@@ -1306,25 +1314,40 @@ ClearRenamedMarker(k) ==
 \* A marker under k written for some other anchor: decision 2's older sweeper
 \* that deleted a tombstone or record by the old rule, or decision 6's re-rooted
 \* chain group. The model reproduces neither producer. It lets such a marker
-\* appear under any key whose marker is absent, with the oldest reading the
-\* variable can hold (obs 0), which covers both.
+\* appear under any key whose marker is absent and whose candidate still has an
+\* object to delete, with the oldest reading the variable can hold (obs 0), which
+\* covers both.
+CandidateObjectPresent(k) ==
+    IF k \in Buckets THEN \E o \in DataObjects : Bucket(o) = k /\ PresentObj(o)
+                     ELSE PresentObj(k)
+
 StaleMarker(k) ==
     /\ WindowGate
     /\ ~marker[k].present
+    /\ CandidateObjectPresent(k)
     /\ marker' = [marker EXCEPT ![k] = [present |-> TRUE, obs |-> 0,
                                         anchor |-> StaleAnchor]]
     /\ MarkerStepRest
 
-\* State constraint for window-gate.cfg and its negative controls: prunes the
-\* erasure request, the open ingest bucket and legal holds. None of them reaches
-\* the retention or superseded delete gate except to block it (a hold) or to add
-\* a second superseding pass (the erasure rewrite) through the same
-\* SupersededSweep the compaction already drives. It is what lets MaxClock reach
-\* a full window; README.md lists what the reduction leaves out.
+\* State constraint for window-gate.cfg and its negative controls. It prunes:
+\*  * the erasure request, the open ingest bucket and legal holds. None of them
+\*    reaches the retention or superseded delete gate except to block it (a
+\*    hold) or to add a second superseding pass (the erasure rewrite) through
+\*    the same SupersededSweep the compaction already drives;
+\*  * an expired compaction lease: with no rewrite pass the lease orders
+\*    nothing;
+\*  * a tombstone or supersession stamped after clock 0, so both anchors and
+\*    both horizons are fixed. The HEAD drop, the pin, the marker write and the
+\*    delete stay free at every clock.
+\* It is what lets MaxClock reach a full window; README.md lists what the
+\* reduction leaves out.
 WindowGateScope ==
     /\ ~PresentObj("dreqR1")
     /\ ingestPhase = "absent"
     /\ heldBuckets = {}
+    /\ (cmpPhase # "idle" => leaseOwner = "C")
+    /\ tombRetiredAt["b1"] = 0
+    /\ \A o \in SupersededCandidates : supersededAt[o] = 0
 
 RetentionSweep(o) ==
     /\ HeadReadable
@@ -1341,11 +1364,17 @@ RetentionSweep(o) ==
     /\ WindowPermits(Bucket(o))
     /\ S!Delete(o)
     /\ GcWitness("retention", {o})
+    \* A superseded object's own marker goes with it here too. Decision 6's
+    \* orphan rule would reap it later; nothing reads it in between, because the
+    \* gate is read only for a present candidate and no action re-creates a
+    \* marker key's object (raw1 is written only by Init, cmpA only by the one
+    \* PublishCompaction a behaviour can take). Reaping it in this step only
+    \* collapses states that differ in an orphan.
+    /\ marker' = IF o \in MarkerKeys THEN [marker EXCEPT ![o] = NoMarker] ELSE marker
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   maintVars, ingestPhase, ingestAckScope, ingestLate>>
-    /\ UNCHANGED windowVars
+                   maintVars, ingestPhase, ingestAckScope, ingestLate, cacheUntil>>
 
 \* Final tombstone delete (finding 3, round four): physical_sweep deletes the
 \* bucket's data, verifies via bucket_is_empty_but_tombstone that only the

@@ -16,9 +16,12 @@
 #                            and does not fail the lane
 #   exhaustive   [-a AREA]   full safety + liveness (budget 3600s per cfg,
 #                            overridable per cfg via bands.tsv's budget_s)
+#   positive     [-a AREA]   run positive/*.cfg, each must pass (budget 300s;
+#                            bands.tsv row keyed positive/<name>.cfg, if any)
 #   negative     [-a AREA]   run negative/*.cfg, assert the expected violation
 #   traceability [-a AREA]   check every traceability.md source ref resolves
-#   ci           [-a AREA]   smoke + live + negative + traceability under one run id
+#   ci           [-a AREA]   smoke + live + positive + negative + traceability
+#                            under one run id
 #   all          [-a AREA]   ci, then exhaustive, under one run id
 # check-tla usage: end
 #
@@ -439,20 +442,28 @@ cfg_budget() {
     echo "$b"
 }
 
-# check_one_model <area> <module> <kind> <cfg>
+# check_one_model <area> <module> <kind> <cfg> [<cfg-name>]
+# <cfg-name> is the bands.tsv key and last-run.tsv label; it defaults to the
+# cfg's basename. A positive cfg passes positive/<name>.cfg, which also keeps
+# its log apart from every other positive cfg's.
 check_one_model() {
     local area="$1" module="$2" kind="$3" cfg="$4"
     local area_dir="$FORMAL_DIR/$area"
     local cfg_name budget logfile
-    cfg_name="$(basename "$cfg")"
+    cfg_name="${5:-$(basename "$cfg")}"
     if [ "$kind" = exhaustive ]; then
         budget="$(cfg_budget "$area" "$cfg_name" "$EXHAUSTIVE_BUDGET")"
     else
         budget=$SMOKE_BUDGET
     fi
     mkdir -p "$LOG_DIR"
-    logfile="$LOG_DIR/${area}-${module}-${kind}.log"
     local label="$area/$module ${kind}"
+    if [ "$kind" = positive ]; then
+        logfile="$LOG_DIR/${area}-${module}-positive-$(basename "$cfg" .cfg).log"
+        label="$area/$module $cfg_name"
+    else
+        logfile="$LOG_DIR/${area}-${module}-${kind}.log"
+    fi
     note "$label: budget ${budget}s"
 
     local start=$SECONDS code=0
@@ -557,6 +568,32 @@ liveness_single_property_cfg() {
     grep -vE '^[[:space:]]*PROPERTY[[:space:]]' "$src" > "$out"
     printf 'PROPERTY %s\n' "$prop" >> "$out"
     echo "$out"
+}
+
+# check_positive <area>
+# Runs every <area>/positive/*.cfg as a safety check that must pass, for a
+# targeted configuration beside smoke (a switch combination smoke does not set).
+# The module comes from the cfg's first line, as for a negative. Each run goes
+# through check_one_model, so its bands.tsv row, keyed positive/<name>.cfg, is
+# enforced the same way smoke's is; an area with no positive/ directory skips.
+check_positive() {
+    local area="$1"
+    local area_dir="$FORMAL_DIR/$area"
+    local posdir="$area_dir/positive"
+    [ -d "$posdir" ] || return 0
+    local rc=0 cfg found=0
+    for cfg in "$posdir"/*.cfg; do
+        [ -e "$cfg" ] || continue
+        found=1
+        local module name
+        name="$(basename "$cfg" .cfg)"
+        module="$(negative_module "$area_dir" "$cfg")" || { rc=1; continue; }
+        check_one_model "$area" "$module" "positive" "$cfg" "positive/$name.cfg" || rc=1
+    done
+    if [ "$found" = 0 ]; then
+        note "$area: positive/ holds no .cfg"; rc=1
+    fi
+    return $rc
 }
 
 check_negative() {
@@ -734,7 +771,7 @@ main() {
     done
 
     case "$cmd" in
-        smoke|live|exhaustive|negative|traceability|ci|all) : ;;
+        smoke|live|exhaustive|positive|negative|traceability|ci|all) : ;;
         ""|-h|--help) usage 0 ;;
         *) die "unknown subcommand: $cmd" ;;
     esac
@@ -769,7 +806,7 @@ main() {
     RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse 'HEAD^{tree}')"
 
     local records_tsv=0
-    case "$cmd" in smoke|live|exhaustive|negative|ci|all) records_tsv=1 ;; esac
+    case "$cmd" in smoke|live|exhaustive|positive|negative|ci|all) records_tsv=1 ;; esac
     [ "$records_tsv" -eq 1 ] && truncate_tsv
 
     # ci and all record every model under ONE run id, so last-run.tsv is a
@@ -781,17 +818,20 @@ main() {
             smoke)        check_model "$area" smoke || rc=1 ;;
             live)         check_model "$area" live || rc=1 ;;
             exhaustive)   check_model "$area" exhaustive || rc=1 ;;
+            positive)     check_positive "$area" || rc=1 ;;
             negative)     check_negative "$area" || rc=1 ;;
             traceability) check_traceability "$area" || rc=1 ;;
             ci)
                 check_model "$area" smoke || rc=1
                 check_model "$area" live || rc=1
+                check_positive "$area" || rc=1
                 check_negative "$area" || rc=1
                 check_traceability "$area" || rc=1
                 ;;
             all)
                 check_model "$area" smoke || rc=1
                 check_model "$area" live || rc=1
+                check_positive "$area" || rc=1
                 check_negative "$area" || rc=1
                 check_traceability "$area" || rc=1
                 check_model "$area" exhaustive || rc=1

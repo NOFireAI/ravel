@@ -1,7 +1,10 @@
-# Both rows below still pin an exact depth and run under RAVEL_TLA_WORKERS=auto
-# (smoke.cfg in ci.yml's required lane, exhaustive.cfg in tla-nightly.yml), so
-# both can overshoot the way commit/bands.tsv's smoke.cfg did. #1671 tracks
-# measuring and loosening them.
+# The smoke and exhaustive rows still pin an exact depth and run under
+# RAVEL_TLA_WORKERS=auto (smoke.cfg in ci.yml's required lane, exhaustive.cfg in
+# tla-nightly.yml), so both can overshoot the way commit/bands.tsv's smoke.cfg
+# did. #1671 tracks measuring and loosening them. positive/window-gate.cfg
+# (issue #2339) pins its distinct count exactly, which is worker-independent
+# under the VIEW, and waives depth with the '-' sentinel for the same reason.
 cfg	min_distinct	max_distinct	min_depth	max_depth
 smoke.cfg	2832000	2839000	31	31
 exhaustive.cfg	2832000	2839000	31	31
+positive/window-gate.cfg	543543	543543	-	-
