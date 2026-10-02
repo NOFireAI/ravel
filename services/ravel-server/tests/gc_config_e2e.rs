@@ -167,11 +167,12 @@ async fn maintain_starts_after_gc_config_set_and_matching_flags() {
         grace_ns: 40 * NS_PER_HOUR,
         max_query_duration_ns: NS_PER_HOUR,
         max_flush_lifetime_ns: NS_PER_HOUR,
+        ..GcConfigValues::maintain_defaults()
     };
     assert!(set.satisfies_constraint(ravel_maintain::config::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS));
     set_gc_config(
         store.as_ref(),
-        set,
+        set.into(),
         ravel_maintain::config::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
         1_000,
     )
@@ -210,10 +211,11 @@ async fn maintain_still_refuses_on_genuine_mismatch() {
         grace_ns: 40 * NS_PER_HOUR,
         max_query_duration_ns: NS_PER_HOUR,
         max_flush_lifetime_ns: NS_PER_HOUR,
+        ..GcConfigValues::maintain_defaults()
     };
     set_gc_config(
         store.as_ref(),
-        set,
+        set.into(),
         ravel_maintain::config::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
         1_000,
     )
@@ -250,11 +252,12 @@ async fn query_starts_after_gc_config_set_and_matching_deadline_flag() {
         grace_ns: 24 * NS_PER_HOUR,
         max_query_duration_ns: 10 * 1_000_000_000,
         max_flush_lifetime_ns: NS_PER_HOUR,
+        ..GcConfigValues::maintain_defaults()
     };
     assert!(set.satisfies_constraint(ravel_maintain::config::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS));
     set_gc_config(
         store.as_ref(),
-        set,
+        set.into(),
         ravel_maintain::config::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
         1_000,
     )

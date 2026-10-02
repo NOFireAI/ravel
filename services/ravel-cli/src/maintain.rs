@@ -14,9 +14,9 @@ use ravel_commit::keys;
 use ravel_ingest::Clock as _;
 use ravel_maintain::{
     BlockedBucket, BlockedReason, Bucket, ClaimParticipant, ClaimSkip, ClaimedCompaction,
-    CompactionOutcome, CompactorConfig, FamilyMigrateReport, FixedClock, LegalHoldCheck,
-    MergeMemoryTracker, MigrateBudget, PublishOutcome, SweepReport, Verification, census_family,
-    compact_bucket_claimed, migrate_family, sweep_shard,
+    CompactionOutcome, CompactorConfig, FamilyMigrateReport, FixedClock, GcConfigValues,
+    LegalHoldCheck, MergeMemoryTracker, MigrateBudget, PublishOutcome, SweepReport, Verification,
+    census_family, compact_bucket_claimed, migrate_family, sweep_shard,
 };
 use ravel_object_store::conformance::NoncurrentVersionSource;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
@@ -1125,7 +1125,57 @@ where
     Ok(())
 }
 
+/// The [`CompactorConfig`] `maintain sweep` runs with, from the durable
+/// `sys/gc` (ADR-1133 decision 4), validated the way the server's maintain mode
+/// validates its own before it sweeps.
+///
+/// `protection_horizon`, `grace`, `max_query_duration` and `head_cache_ttl`
+/// come from `sys/gc`, which is bootstrapped from the maintain defaults when
+/// absent, as the server's startup does. A dry run writes nothing, so on a
+/// bucket with no `sys/gc` it uses those same defaults without writing them.
+/// [`ravel_maintain::validate_maintain`] and
+/// [`ravel_maintain::validate_maintain_skew`] then run against this sweep's
+/// own `clock_skew_allowance`, and a violation is an error before any delete.
+pub async fn sweep_compactor_config(
+    store: &dyn ObjectStoreBackend,
+    dry_run: bool,
+    force_orphan_gc: bool,
+    now_ns: i64,
+) -> anyhow::Result<CompactorConfig> {
+    let gc = if dry_run {
+        match ravel_maintain::read_gc_config(store).await? {
+            Some((values, _version)) => values,
+            None => GcConfigValues::maintain_defaults(),
+        }
+    } else {
+        ravel_maintain::bootstrap_gc_config(store, GcConfigValues::maintain_defaults(), now_ns)
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!("failed to bootstrap or read the durable GC config (sys/gc): {err}")
+            })?
+    };
+    let config = CompactorConfig {
+        dry_run,
+        force_orphan_gc,
+        protection_horizon_ns: gc.protection_horizon_ns,
+        grace_ns: gc.grace_ns,
+        max_query_duration_ns: gc.max_query_duration_ns,
+        head_cache_ttl_ns: gc.head_cache_ttl_ns,
+        ..CompactorConfig::default()
+    };
+    ravel_maintain::validate_maintain(&gc, config.protection_horizon_ns, config.grace_ns)
+        .and_then(|()| ravel_maintain::validate_maintain_skew(&gc, config.clock_skew_allowance_ns))
+        .map_err(|err| {
+            anyhow::anyhow!("maintain sweep GC-config validation failed against sys/gc: {err}")
+        })?;
+    Ok(config)
+}
+
 /// `maintain sweep`: run one sweep pass (all three GC rules) over a shard.
+///
+/// The pass runs with [`sweep_compactor_config`]'s configuration, so it sweeps
+/// on the same `sys/gc` values, and refuses on the same violations, as the
+/// server's maintain mode.
 ///
 /// Refreshes the tenant's [`LegalHoldCheck`] before the pass, matching the
 /// server driver's semantics (ADR-0048 decision 1): the refresh happens once,
@@ -1133,6 +1183,8 @@ where
 /// pass (`Err`, not a fallback to `NoLeases`), since running the sweep
 /// unprotected would convert a transient store fault into an unprotected
 /// delete pass.
+///
+/// Thin wrapper over [`sweep_at`] at the wall clock.
 pub async fn sweep(
     store: Arc<dyn ObjectStoreBackend>,
     selection: StoreSelection,
@@ -1142,13 +1194,32 @@ pub async fn sweep(
     dry_run: bool,
     override_orphan_breaker: bool,
 ) -> anyhow::Result<()> {
-    let tenant_hash = TenantId::new(tenant).hash();
-    let config = CompactorConfig {
+    sweep_at(
+        store,
+        selection,
+        tenant,
+        signal,
+        shard,
         dry_run,
-        force_orphan_gc: override_orphan_breaker,
-        ..CompactorConfig::default()
-    };
-    let clock = wall_clock()?;
+        override_orphan_breaker,
+        wall_clock()?,
+    )
+    .await
+}
+
+/// [`sweep`] evaluated at `clock`.
+#[allow(clippy::too_many_arguments)]
+pub async fn sweep_at(
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    signal: SignalArg,
+    shard: u32,
+    dry_run: bool,
+    override_orphan_breaker: bool,
+    clock: FixedClock,
+) -> anyhow::Result<()> {
+    let tenant_hash = TenantId::new(tenant).hash();
 
     selection.print_header();
     require_tenant_data_present(
@@ -1157,6 +1228,14 @@ pub async fn sweep(
         "maintain sweep",
         tenant,
         &tenant_hash,
+    )
+    .await?;
+
+    let config = sweep_compactor_config(
+        store.as_ref(),
+        dry_run,
+        override_orphan_breaker,
+        ravel_maintain::Clock::now_ns(&clock),
     )
     .await?;
 

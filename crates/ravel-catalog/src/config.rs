@@ -503,9 +503,14 @@ pub struct CatalogConfig {
     /// sealed, in nanoseconds. Default [`DEFAULT_FOLD_SAFETY_MARGIN_NS`].
     pub fold_safety_margin_ns: i64,
     /// How long a decoded HEAD may be served from cache before `resolve`
-    /// re-reads it, in nanoseconds (a
-    /// stale cache only ever widens the listed suffix by up to this much,
-    /// never a correctness issue). Default [`DEFAULT_HEAD_CACHE_TTL_NS`].
+    /// re-reads it, in nanoseconds. For the resolve itself a stale cache only
+    /// widens the listed suffix by up to this much. It is also a correctness
+    /// input for physical deletes (ADR-1133): a query can be handed a HEAD
+    /// that still names an object for up to this long after the HEAD stops
+    /// naming it, and ADR-1133's sweeper delete gate allows for `sys/gc`'s
+    /// recorded `head_cache_ttl_ns`, not this field. A query process must not run with a
+    /// value above that recorded one, and `ravel-server` query-mode startup
+    /// refuses to start if it does. Default [`DEFAULT_HEAD_CACHE_TTL_NS`].
     pub head_cache_ttl_ns: i64,
     /// Bound on decoded snapshot parts cached per tenant. Default
     /// [`DEFAULT_SNAPSHOT_CACHE_PARTS`].

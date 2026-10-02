@@ -239,7 +239,9 @@ message FormatFloor {
 message GcConfig {
   // Format floor: the minimum reader version that understands this record. A
   // reader that only knows a lower version refuses rather than misreading a
-  // future layout as v1 (matching TenancyMarker/ProvisioningRecord). = 1.
+  // future layout as v1 (matching TenancyMarker/ProvisioningRecord). 1 or 2:
+  // bootstrap writes 1, and only `ravel-cli gc-config set --head-cache-ttl`
+  // writes 2 (ADR-1133 decision 4).
   uint32 format_version = 1;
   // The horizon between a deletion anchor and physical deletion. The invariant
   // this whole object exists to make durable and single-sourced:
@@ -256,6 +258,10 @@ message GcConfig {
   // Informational; when this record was last written (bootstrap or a
   // `gc-config set`).
   sfixed64 created_unix_ns = 6;
+  // The longest a query process may serve a cached HEAD (ADR-1133 decision
+  // 4). Present from format version 2, where it must be positive; absent on
+  // version 1, whose readers use the compiled DEFAULT_HEAD_CACHE_TTL_NS.
+  sfixed64 head_cache_ttl_ns = 7;
 }
 
 // One process's periodic self-owned admission-usage snapshot for fleet-global

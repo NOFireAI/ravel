@@ -1341,6 +1341,10 @@ pub fn spawn(
     // informational, never dedup-priority).
     let mut compactor = config.compactor.clone();
     compactor.compactor_writer_id = rng.new_uuid();
+    // The pinned-query window's terms come from `sys/gc` (ADR-1133 decision
+    // 4), the same values `ravel-cli maintain sweep` reads.
+    compactor.max_query_duration_ns = stored_gc.max_query_duration_ns;
+    compactor.head_cache_ttl_ns = stored_gc.head_cache_ttl_ns;
     let compactor = Arc::new(compactor);
     let retention = Arc::new(config.retention.clone());
     let fallback_allow = if fallback_allow.is_empty() {
