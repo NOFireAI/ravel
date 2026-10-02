@@ -1270,6 +1270,100 @@ async fn exhausted_resolve_to_put_budget_forces_a_second_resolve() {
     );
 }
 
+/// How many LISTs a `CREATE` makes against Ravel's store when the resolve
+/// inside `writer::apply` is made to take `advance_ns` of the executor's clock,
+/// with `grace_ms` installed through `SqlExecutor::with_ddl_min_grace_ms` or
+/// left at its default when `None`.
+async fn creates_lists_with_slow_resolve(grace_ms: Option<u64>, advance_ns: i64) -> usize {
+    let t = tenant("acme");
+    let ravel = Arc::new(MemoryStore::new());
+    grants::add(
+        ravel.as_ref(),
+        &t,
+        PROFILE,
+        GRANT,
+        CREATED_BY,
+        &FixedClock::new(NOW),
+    )
+    .await
+    .expect("grant");
+
+    let apply_clock = FixedClock::new(NOW);
+    let listing = Arc::new(ListAdvancingStore::new(
+        ravel.clone() as Arc<dyn ObjectStoreBackend>,
+        apply_clock.clone(),
+        advance_ns,
+    ));
+    let store = listing.clone() as Arc<dyn ObjectStoreBackend>;
+
+    let lake: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    lake.put(
+        "t/hits/0.parquet",
+        parquet_bytes(&[1], &["a"], &[0.5]),
+        PutOptions::default(),
+    )
+    .await
+    .expect("put");
+
+    let catalog =
+        Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+    let external = Arc::new(ExternalStoreMap::new(HashMap::from([(
+        PROFILE.to_string(),
+        Arc::clone(&lake),
+    )]))) as Arc<dyn ravel_sql::ExternalStores>;
+    let sources = ParquetSources::new(
+        Arc::clone(&store),
+        Some(external),
+        Arc::new(GetLimiter::new(8).expect("limiter")),
+        None,
+        DEFAULT_PARQUET_METADATA_CACHE_BYTES,
+    );
+    let executor = SqlExecutor::new(
+        catalog,
+        SegmentFetcher::new(Arc::clone(&store)),
+        LogSegmentFetcher::new(Arc::clone(&store)),
+        SpanSegmentFetcher::new(Arc::clone(&store)),
+        SqlConfig::default(),
+        1 << 30,
+    )
+    .with_parquet_sources(sources)
+    .with_process_memory_budget(Arc::new(MemoryBudget::unlimited()))
+    .with_clock(Arc::new(apply_clock) as Arc<dyn Clock>);
+    let executor = match grace_ms {
+        Some(grace_ms) => executor.with_ddl_min_grace_ms(grace_ms),
+        None => executor,
+    };
+
+    let sql = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
+    executor
+        .execute_ddl(t, &sql, CREATED_BY, deadline())
+        .await
+        .expect("create succeeds");
+    listing.list_calls()
+}
+
+/// `SqlExecutor::with_ddl_min_grace_ms` reaches `writer::apply`: a resolve
+/// that takes 1 s of clock time is inside the budget under the default grace
+/// (half of `DEFAULT_MIN_GRACE_MS`, 330 s) and costs no extra LIST, but
+/// exhausts the budget of a 1 s grace (half of it, 500 ms) and forces a second
+/// resolve. Without the setter reaching `apply`, both runs would list twice.
+#[tokio::test]
+async fn with_ddl_min_grace_ms_sets_the_grace_writer_apply_budgets_against() {
+    let one_second_ns = 1_000_000_000;
+    assert_eq!(
+        creates_lists_with_slow_resolve(None, one_second_ns).await,
+        2,
+        "under the default grace a 1 s resolve is inside the budget: the \
+         existence check's LIST and apply's one resolve"
+    );
+    assert_eq!(
+        creates_lists_with_slow_resolve(Some(1_000), one_second_ns).await,
+        3,
+        "a 1 s grace budgets 500 ms, so the same 1 s resolve forces a second \
+         resolve"
+    );
+}
+
 /// A store double whose `get` never returns, standing in for a grants read
 /// that stalls. Every other method delegates to `inner` unchanged. None of
 /// `ravel_object_store::fault`'s `ScriptedFault` variants fit this: every one

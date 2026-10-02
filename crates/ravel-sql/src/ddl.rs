@@ -6,8 +6,8 @@
 //! This is a separate entry point from [`SqlExecutor::execute`] and
 //! [`SqlExecutor::execute_accounted`], which stay read-only: nothing on the
 //! read path ever writes a manifest, and nothing here plans or executes a
-//! query. The caller (services/ravel-server, not yet wired -- issue #2054's
-//! sibling task) must already have checked the request's `ddl` capability;
+//! query. The caller (`POST /api/v1/sql` in services/ravel-server) must already
+//! have checked the request's `ddl` capability;
 //! [`SqlExecutor::execute_ddl`] performs no authorization of its own.
 //!
 //! # The CREATE path, in order
@@ -105,9 +105,8 @@ pub enum DdlOutcome {
 /// Every variant short of [`DdlExecuteError::Write`] is a refusal before any
 /// manifest write is attempted; [`DdlExecuteError::Write`] is a refusal or a
 /// failure of the write itself. The HTTP status each should take is noted per
-/// variant below, and [`DdlExecuteError::class`] encodes that mapping (the
-/// `ddl` capability wiring itself, services/ravel-server, is this task's
-/// sibling and not yet in place).
+/// variant below, and [`DdlExecuteError::class`] encodes that mapping, which
+/// `POST /api/v1/sql` in services/ravel-server renders.
 #[derive(Debug, thiserror::Error)]
 pub enum DdlExecuteError {
     /// The statement failed the DDL gate (`crate::validate::validate_ddl`),

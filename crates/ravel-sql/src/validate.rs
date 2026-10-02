@@ -561,7 +561,9 @@ pub fn statement_kind(sql: &str) -> StatementKind {
             | Statement::Drop { .. } => StatementKind::Ddl,
             _ => StatementKind::Query,
         },
-        Some(DFStatement::CopyTo(_)) | Some(DFStatement::Explain(_)) | Some(DFStatement::Reset(_))
+        Some(DFStatement::CopyTo(_))
+        | Some(DFStatement::Explain(_))
+        | Some(DFStatement::Reset(_))
         | None => StatementKind::Query,
     }
 }

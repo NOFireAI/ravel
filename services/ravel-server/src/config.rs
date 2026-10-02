@@ -1043,8 +1043,8 @@ pub struct Cli {
 
     /// Boolean claim that grants the `ddl` capability (ADR-2040 decision 4,
     /// "Who may run DDL"): a verified token carrying this claim as the JSON
-    /// boolean `true` may run tenant-scoped DDL once that capability is
-    /// consumed by a query path (issue #2054; nothing reads it yet). A string,
+    /// boolean `true` may run tenant-scoped DDL through `POST /api/v1/sql`
+    /// (`CREATE EXTERNAL TABLE` and `DROP TABLE`). A string,
     /// a number, an array, or a missing claim never grants it. Unset (the
     /// default), the capability is never granted via OIDC. Setting it without
     /// OIDC enabled fails startup rather than silently doing nothing.
@@ -4325,27 +4325,6 @@ fn parse_bool_field(spec: &str, key: &str, value: &str) -> anyhow::Result<bool> 
     }
 }
 
-/// Splits the tenant side of a `TOKEN=TENANT` pair on its LAST `;`, granting
-/// the `ddl` capability (ADR-2040 decision 4) when the suffix after it is
-/// exactly `ddl` and the text before it is non-empty. A tenant with no `;` is
-/// returned unchanged with `ddl: false`. Any other suffix (wrong case, a
-/// different word, or none at all after a trailing `;`) or an empty tenant
-/// before the `;` is `Err`, so a typo refuses startup instead of silently
-/// granting nothing or naming an empty tenant.
-fn split_tenant_suffix(raw: &str) -> Result<(&str, bool), ()> {
-    match raw.rfind(';') {
-        None => Ok((raw, false)),
-        Some(idx) => {
-            let (tenant, suffix) = (&raw[..idx], &raw[idx + 1..]);
-            if suffix == "ddl" && !tenant.is_empty() {
-                Ok((tenant, true))
-            } else {
-                Err(())
-            }
-        }
-    }
-}
-
 /// The bare token to tenant view of a parsed principal map, dropping the `ddl`
 /// capability. Every consumer that only needs tenants derives its map from the
 /// same [`Cli::parse_tenant_principals`] result through this, so no two views
@@ -4504,8 +4483,11 @@ impl Cli {
             if token.is_empty() || tenant_raw.is_empty() {
                 anyhow::bail!("invalid {ctx}, expected TOKEN=TENANT");
             }
-            let (tenant, ddl) = split_tenant_suffix(tenant_raw)
-                .map_err(|()| anyhow::anyhow!("invalid {ctx}, expected TENANT or TENANT;ddl"))?;
+            let (tenant, ddl) = ravel_tenant_resolve::split_tenant_suffix(tenant_raw).map_err(
+                |_: ravel_tenant_resolve::TenantSuffixError| {
+                    anyhow::anyhow!("invalid {ctx}, expected TENANT or TENANT;ddl")
+                },
+            )?;
             let principal = Principal {
                 tenant: TenantId::new(tenant),
                 ddl,

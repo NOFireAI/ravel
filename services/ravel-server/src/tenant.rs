@@ -121,12 +121,19 @@ pub fn build_auth_resolver(
 /// than a field on [`crate::config::OidcSettings`] so that struct's existing
 /// exhaustive constructors (in and out of this crate) keep compiling
 /// unchanged.
+///
+/// `oidc_ddl_claim` set while `auth.oidc` is `None` is an error: no OIDC
+/// resolver would exist to read the claim, so the operator's `ddl` grant would
+/// silently never apply.
 pub fn build_auth_resolver_with_principals(
     tokens: HashMap<String, Principal>,
     dev_header: bool,
     auth: AuthResolverSettings,
     oidc_ddl_claim: Option<String>,
 ) -> anyhow::Result<ResolverBundle> {
+    if oidc_ddl_claim.is_some() && auth.oidc.is_none() {
+        anyhow::bail!("--oidc-ddl-claim requires OIDC to be configured (--oidc-issuer)");
+    }
     let mut resolvers: Vec<Arc<dyn TenantResolver>> =
         vec![Arc::new(StaticBearerTokenResolver::with_principals(tokens))];
 
@@ -256,6 +263,7 @@ fn jittered(base: Duration, rng: &dyn RngSource) -> Duration {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::config::OidcSettings;
 
     fn params(interval: Duration) -> OidcRefreshParams {
         OidcRefreshParams {
@@ -287,5 +295,57 @@ mod tests {
         let task = spawn_jwks_refresh(params(Duration::from_secs(300)))
             .expect("a non-zero refresh interval spawns");
         task.shutdown().await;
+    }
+
+    fn oidc_settings() -> OidcSettings {
+        OidcSettings {
+            issuer: "https://issuer.example".to_string(),
+            jwks_url: "https://issuer.example/jwks.json".to_string(),
+            audiences: vec!["ravel".to_string()],
+            tenant_claim: "tenant".to_string(),
+            refresh_interval: Duration::from_secs(300),
+        }
+    }
+
+    #[test]
+    fn an_oidc_ddl_claim_without_oidc_is_an_error() {
+        let result = build_auth_resolver_with_principals(
+            HashMap::new(),
+            false,
+            AuthResolverSettings::default(),
+            Some("ravel_ddl".to_string()),
+        );
+        let err = result.err().expect("a ddl claim with no OIDC must fail");
+        assert!(
+            err.to_string().contains("--oidc-ddl-claim"),
+            "the error names the flag: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oidc_ddl_claim_with_oidc_builds() {
+        let bundle = build_auth_resolver_with_principals(
+            HashMap::new(),
+            false,
+            AuthResolverSettings {
+                oidc: Some(oidc_settings()),
+                mtls_header: None,
+            },
+            Some("ravel_ddl".to_string()),
+        )
+        .expect("a ddl claim with OIDC configured builds");
+        assert!(bundle.oidc_refresh.is_some());
+    }
+
+    #[test]
+    fn no_oidc_ddl_claim_without_oidc_still_builds() {
+        let bundle = build_auth_resolver_with_principals(
+            HashMap::new(),
+            false,
+            AuthResolverSettings::default(),
+            None,
+        )
+        .expect("no claim and no OIDC is the default shape");
+        assert!(bundle.oidc_refresh.is_none());
     }
 }
