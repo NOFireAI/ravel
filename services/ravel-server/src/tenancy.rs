@@ -558,6 +558,18 @@ mod tests {
         Arc::new(MemoryStore::new())
     }
 
+    /// deploy/iam/gateway.json's GatewayWrite and every role's
+    /// DenyDeleteProtected `sys/t/*` depend on this key;
+    /// `gateway_template_covers_the_recovery_manifest_write` in
+    /// crates/ravel-commit/tests/iam_templates.rs copies it by hand.
+    #[test]
+    fn recovery_manifest_key_matches_the_iam_template_witness() {
+        assert_eq!(
+            recovery_manifest_key(&TenantHash([0xab; 16])),
+            "sys/t/abababababababababababababababab"
+        );
+    }
+
     #[test]
     fn recovery_manifest_roundtrips_with_the_same_key() {
         let key = [3u8; 32];
