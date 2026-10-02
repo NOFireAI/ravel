@@ -15,8 +15,9 @@ use ravel_ingest::Clock as _;
 use ravel_maintain::{
     BlockedBucket, BlockedReason, Bucket, ClaimParticipant, ClaimSkip, ClaimedCompaction,
     CompactionOutcome, CompactorConfig, FamilyMigrateReport, FixedClock, GcConfigValues,
-    LegalHoldCheck, MergeMemoryTracker, MigrateBudget, PublishOutcome, SweepReport, Verification,
-    census_family, compact_bucket_claimed, migrate_family, sweep_shard,
+    L1PartMemoryTargetSource, LegalHoldCheck, MergeMemoryTracker, MigrateBudget, PublishOutcome,
+    ResolvedL1PartMemoryTarget, SweepReport, Verification, census_family, compact_bucket_claimed,
+    migrate_family, sweep_shard,
 };
 use ravel_object_store::conformance::NoncurrentVersionSource;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
@@ -232,6 +233,14 @@ pub enum CompactorKnobError {
 /// its field doc already states below-1 is treated as 1. `rlog_zstd_level`
 /// replaces [`CompactorConfig::rlog_zstd_level`] and is refused outside the
 /// range [`ravel_maintain::validate_rlog_zstd_level`] accepts.
+///
+/// Without an override the memory split target is derived from
+/// `host_memory_total_bytes` (the host's MemTotal, see
+/// [`ravel_maintain::detect_host_memory_total_bytes`]) over
+/// `concurrent_merges` with [`ResolvedL1PartMemoryTarget::resolve`], and an
+/// unknown host memory falls back to 256 MiB. The resolution is returned
+/// beside the config so the caller can report where the value came from.
+#[allow(clippy::too_many_arguments)]
 pub fn build_compactor_config(
     dry_run: bool,
     max_flush_lifetime_ns: Option<i64>,
@@ -239,7 +248,9 @@ pub fn build_compactor_config(
     max_l1_part_bytes: Option<u64>,
     input_read_concurrency: Option<usize>,
     rlog_zstd_level: Option<i32>,
-) -> Result<CompactorConfig, CompactorKnobError> {
+    host_memory_total_bytes: Option<u64>,
+    concurrent_merges: usize,
+) -> Result<(CompactorConfig, ResolvedL1PartMemoryTarget), CompactorKnobError> {
     let mut config = CompactorConfig {
         dry_run,
         merge_memory_tracker: Some(MergeMemoryTracker::new()),
@@ -248,12 +259,15 @@ pub fn build_compactor_config(
     if let Some(ns) = max_flush_lifetime_ns {
         config.max_flush_lifetime_ns = ns;
     }
-    if let Some(bytes) = l1_part_memory_target_bytes {
-        if bytes == 0 {
-            return Err(CompactorKnobError::ZeroL1PartMemoryTarget);
-        }
-        config.l1_part_memory_target_bytes = bytes;
+    if l1_part_memory_target_bytes == Some(0) {
+        return Err(CompactorKnobError::ZeroL1PartMemoryTarget);
     }
+    let memory_target = ResolvedL1PartMemoryTarget::resolve(
+        l1_part_memory_target_bytes,
+        host_memory_total_bytes,
+        concurrent_merges,
+    );
+    config.l1_part_memory_target_bytes = memory_target.bytes;
     if let Some(bytes) = max_l1_part_bytes {
         if bytes == 0 {
             return Err(CompactorKnobError::ZeroMaxL1PartBytes);
@@ -266,7 +280,20 @@ pub fn build_compactor_config(
     if let Some(level) = rlog_zstd_level {
         config.rlog_zstd_level = ravel_maintain::validate_rlog_zstd_level(level)?;
     }
-    Ok(config)
+    Ok((config, memory_target))
+}
+
+/// The stderr note for a memory split target that fell back to 256 MiB
+/// because the host memory could not be read; `None` for any other source.
+pub fn l1_part_memory_target_fallback_note(
+    memory_target: &ResolvedL1PartMemoryTarget,
+) -> Option<String> {
+    (memory_target.source == L1PartMemoryTargetSource::Fallback).then(|| {
+        format!(
+            "note: host memory could not be read, so l1_part_memory_target_bytes falls back to {}",
+            memory_target.bytes
+        )
+    })
 }
 
 /// `maintain compact-bucket`: run one compaction pass over a single bucket.
@@ -333,14 +360,19 @@ pub async fn compact_to(
 ) -> anyhow::Result<()> {
     let tenant_hash = TenantId::new(tenant).hash();
     let bucket = Bucket::new(tenant_hash, signal.to_signal(), shard, hour);
-    let mut config = build_compactor_config(
+    let (mut config, memory_target) = build_compactor_config(
         dry_run,
         max_flush_lifetime_ns,
         None,
         None,
         None,
         rlog_zstd_level,
+        ravel_maintain::detect_host_memory_total_bytes(),
+        1,
     )?;
+    if let Some(note) = l1_part_memory_target_fallback_note(&memory_target) {
+        eprintln!("{note}");
+    }
     let claims_line = install_claims(&mut config, dry_run, claims);
 
     selection.print_header();
@@ -358,6 +390,7 @@ pub async fn compact_to(
         .map_err(|err| anyhow::anyhow!("compaction failed: {err}"))?;
 
     writeln!(out, "dry_run: {dry_run}")?;
+    writeln!(out, "l1_part_memory_target_bytes: {memory_target}")?;
     writeln!(out, "{claims_line}")?;
     let outcome = match outcome {
         ClaimedCompaction::Ran(outcome) => outcome,
@@ -726,19 +759,24 @@ pub async fn compact_tenant_to(
     // Knob validation runs before any store access: a zero byte target must
     // surface as its CompactorKnobError even on a tenant with no provisioning
     // record, not be masked by NoProvisioningRecord.
-    let mut config = build_compactor_config(
+    let (mut config, memory_target) = build_compactor_config(
         dry_run,
         max_flush_lifetime_ns,
         l1_part_memory_target_bytes,
         max_l1_part_bytes,
         input_read_concurrency,
         rlog_zstd_level,
+        ravel_maintain::detect_host_memory_total_bytes(),
+        bucket_concurrency,
     )?;
     let claims_line = install_claims(&mut config, dry_run, claims);
     // A zero fan-out is refused before any store access, like the byte-target
     // knobs above: it is an operator error, not a walk that compacts nothing.
     if bucket_concurrency == 0 {
         return Err(CompactTenantError::ZeroBucketConcurrency.into());
+    }
+    if let Some(note) = l1_part_memory_target_fallback_note(&memory_target) {
+        eprintln!("{note}");
     }
     selection.print_header();
     require_tenant_data_present(
@@ -768,11 +806,7 @@ pub async fn compact_tenant_to(
         "max_flush_lifetime_ns: {}",
         config.max_flush_lifetime_ns
     )?;
-    writeln!(
-        out,
-        "l1_part_memory_target_bytes: {}",
-        config.l1_part_memory_target_bytes
-    )?;
+    writeln!(out, "l1_part_memory_target_bytes: {memory_target}")?;
     writeln!(out, "max_l1_part_bytes: {}", config.max_l1_part_bytes)?;
     writeln!(
         out,

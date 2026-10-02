@@ -81,8 +81,9 @@ pub use compact::{
 };
 pub use config::{
     AdmissionMode, AuditMode, AuditPipelineConfig, ClaimParticipant, CompactorConfig, Coordination,
-    MergeMemoryTracker, MergePhasePeaks, RetentionConfig, RetentionConfigError, RetentionPolicy,
-    RlogZstdLevelError, validate_rlog_zstd_level,
+    L1PartMemoryTargetSource, MergeMemoryTracker, MergePhasePeaks, ResolvedL1PartMemoryTarget,
+    RetentionConfig, RetentionConfigError, RetentionPolicy, RlogZstdLevelError,
+    derive_l1_part_memory_target_bytes, detect_host_memory_total_bytes, validate_rlog_zstd_level,
 };
 pub use discover::discover_tenants;
 pub use erasure_rewrite::{

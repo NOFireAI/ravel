@@ -336,7 +336,7 @@ async fn main() -> anyhow::Result<()> {
     let gc_runtime = cli
         .resolve_gc_runtime(performance.query_deadline)
         .context("failed to parse the --gc-* GC-config flags")?;
-    let compactor = cli.resolve_compactor_config(&gc_runtime)?;
+    let compactor = cli.resolve_compactor_config(&gc_runtime, &performance)?;
     let claim_lease_duration = compactor.claim_lease_duration;
     // ADR-1029 decision 3: a lease shorter than twice the time to encode and
     // PUT the largest L1 part at a conservative rate can expire, and be

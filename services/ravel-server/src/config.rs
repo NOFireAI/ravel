@@ -848,6 +848,16 @@ pub struct Cli {
     #[arg(long = "maintain-compaction-zstd-level", value_name = "LEVEL")]
     pub maintain_compaction_zstd_level: Option<i32>,
 
+    /// The decoded record-heap size at which an L1 compaction closes an
+    /// in-progress part (the memory split target; a part also closes at the
+    /// 256 MiB stored-size target, whichever comes first). Omitted, it is
+    /// derived from the memory budget as budget / 8 /
+    /// --maintain-unit-concurrency, clamped to [256 MiB, 8 GiB], or 256 MiB
+    /// when the host memory is unknown; the startup log names the value and its
+    /// source. Zero is refused at startup.
+    #[arg(long = "maintain-l1-part-memory-target-bytes", value_name = "BYTES")]
+    pub maintain_l1_part_memory_target_bytes: Option<u64>,
+
     /// Whether this process takes advisory compaction claims at all
     /// (ADR-1029 decision 5's escape hatch). `off` is the fleet-wide
     /// fallback for a store whose qualification record predates the CAS
@@ -5877,15 +5887,65 @@ impl Cli {
         Ok(i64::try_from(dur.as_nanos()).unwrap_or(i64::MAX))
     }
 
+    /// Resolve `--maintain-l1-part-memory-target-bytes` (issue #2351): the
+    /// flag verbatim when set (zero refused), else derived from the derived
+    /// memory budget in `performance` over `--maintain-unit-concurrency`
+    /// concurrent merges, else the 256 MiB fallback when the budget is a
+    /// fallback or not applicable (a `u64::MAX` budget is not a measurement).
+    pub fn resolve_l1_part_memory_target(
+        &self,
+        performance: &ResolvedPerformanceDefaults,
+    ) -> anyhow::Result<ravel_maintain::ResolvedL1PartMemoryTarget> {
+        if self.maintain_l1_part_memory_target_bytes == Some(0) {
+            anyhow::bail!(
+                "--maintain-l1-part-memory-target-bytes must be greater than 0: it is the decoded \
+                 record-heap budget an in-progress L1 part is closed at, and 0 would close a part \
+                 before any record is buffered"
+            );
+        }
+        let budget = (performance.sources.memory_budget_bytes == PERF_SOURCE_DERIVED
+            && !performance.memory_budget_not_applicable)
+            .then_some(performance.memory_budget_bytes);
+        Ok(ravel_maintain::ResolvedL1PartMemoryTarget::resolve(
+            self.maintain_l1_part_memory_target_bytes,
+            budget,
+            self.maintain_unit_concurrency.max(1),
+        ))
+    }
+
     /// Resolve the [`ravel_maintain::CompactorConfig`] the maintenance loop
     /// runs with: the GC durations from `gc_runtime` (the same values the
     /// `sys/gc` validation checks) plus every `--maintain-*` and retention
-    /// window flag, with the compiled-in defaults for the rest.
+    /// window flag, with the compiled-in defaults for the rest. The memory
+    /// split target comes from [`Self::resolve_l1_part_memory_target`] and is
+    /// logged once, as a `performance default resolved` line.
     pub fn resolve_compactor_config(
         &self,
         gc_runtime: &GcRuntimeConfig,
+        performance: &ResolvedPerformanceDefaults,
     ) -> anyhow::Result<ravel_maintain::CompactorConfig> {
         use anyhow::Context;
+
+        let memory_target = self.resolve_l1_part_memory_target(performance)?;
+        tracing::info!(
+            setting = "l1_part_memory_target_bytes",
+            value = memory_target.bytes,
+            source = memory_target.source_name(),
+            resolution = %memory_target,
+            "performance default resolved"
+        );
+        // A gateway runs no compaction, so its not-applicable budget is not
+        // worth a warning.
+        if memory_target.source == ravel_maintain::L1PartMemoryTargetSource::Fallback
+            && !performance.memory_budget_not_applicable
+        {
+            tracing::warn!(
+                value = memory_target.bytes,
+                "l1_part_memory_target_bytes fell back to 256 MiB: the memory budget is unknown, \
+                 so L1 parts on a wide schema stay small; set \
+                 --maintain-l1-part-memory-target-bytes to size them"
+            );
+        }
 
         let interior_reverify_ns = self
             .parse_maintain_interior_reverify()
@@ -5916,6 +5976,7 @@ impl Cli {
             claim_lease_duration,
             claim_min_input_bytes,
             rlog_zstd_level,
+            l1_part_memory_target_bytes: memory_target.bytes,
             ..ravel_maintain::CompactorConfig::default()
         })
     }
@@ -12365,11 +12426,127 @@ mod tests {
     }
 
     /// The `CompactorConfig` the server builds from `args`, with the GC
-    /// durations resolved exactly as `main` resolves them.
+    /// durations and the performance defaults (on the reference host) resolved
+    /// exactly as `main` resolves them.
     fn compactor(args: &[&str]) -> anyhow::Result<ravel_maintain::CompactorConfig> {
         let cli = cli(args);
         let gc_runtime = cli.resolve_gc_runtime(Duration::from_secs(30))?;
-        cli.resolve_compactor_config(&gc_runtime)
+        cli.resolve_compactor_config(&gc_runtime, &resolved_from(&cli))
+    }
+
+    /// The compactor's memory split target with the flag unset is derived
+    /// from the reference host's memory budget (30 GiB less the 2 GiB reserve,
+    /// 30064771072) over `--maintain-unit-concurrency` (issue #2351), and the
+    /// resolved-defaults line names the value and its source.
+    ///
+    /// 28 GiB / 8 / 4 (the default unit concurrency) = 939524096; at
+    /// concurrency 1 it is 3758096384; a 128 GiB host clamps to 8 GiB.
+    ///
+    /// Non-vacuity (prove-the-test), each flip named:
+    /// - Keep the struct default (drop `l1_part_memory_target_bytes:
+    ///   memory_target.bytes`): every derived row reads 268435456.
+    /// - Ignore the unit concurrency: the default row reads 3758096384, not
+    ///   939524096.
+    /// - Drop the clamp: the 128 GiB row reads 16911433728 (126 GiB / 8).
+    /// - Let the derivation win over the flag: the flag row reads 939524096.
+    #[test]
+    fn compactor_memory_target_is_derived_from_the_memory_budget() {
+        let (lines, guard) = capture_events(tracing::Level::INFO);
+        let default = compactor(&[]).expect("default");
+        drop(guard);
+        assert_eq!(default.l1_part_memory_target_bytes, 939_524_096);
+        let lines = lines.lock().clone();
+        let resolved: Vec<&String> = lines
+            .iter()
+            .filter(|l| {
+                l.contains("performance default resolved")
+                    && l.contains("setting=\"l1_part_memory_target_bytes\"")
+            })
+            .collect();
+        assert_eq!(resolved.len(), 1, "exactly one resolved line: {lines:?}");
+        let line = resolved[0];
+        assert!(line.contains(" value=939524096"), "{line}");
+        assert!(line.contains(" source=\"derived\""), "{line}");
+        assert!(
+            line.contains(
+                " resolution=939524096 (resolved from a memory budget of 30064771072 over 4 \
+                 concurrent merges)"
+            ),
+            "{line}"
+        );
+
+        assert_eq!(
+            compactor(&["--maintain-unit-concurrency", "1"])
+                .expect("concurrency 1")
+                .l1_part_memory_target_bytes,
+            3_758_096_384
+        );
+        assert_eq!(
+            compactor(&["--maintain-unit-concurrency", "2"])
+                .expect("concurrency 2")
+                .l1_part_memory_target_bytes,
+            1_879_048_192
+        );
+
+        // A 128 GiB host: budget 126 GiB, / 8 / 1 = 15.75 GiB, clamped to 8 GiB.
+        let big = cli(&["--maintain-unit-concurrency", "1"]);
+        let gc_runtime = big
+            .resolve_gc_runtime(Duration::from_secs(30))
+            .expect("gc runtime");
+        let performance = big
+            .resolve_performance(HostProfile::new(REFERENCE_CORES, Some(128 << 30)))
+            .expect("performance defaults resolve");
+        assert_eq!(
+            big.resolve_compactor_config(&gc_runtime, &performance)
+                .expect("128 GiB host")
+                .l1_part_memory_target_bytes,
+            8_589_934_592
+        );
+
+        // An unknown host memory falls back to 256 MiB.
+        let unknown = cli(&[]);
+        let performance = unknown
+            .resolve_performance(HostProfile::new(REFERENCE_CORES, None))
+            .expect("performance defaults resolve");
+        let target = unknown
+            .resolve_l1_part_memory_target(&performance)
+            .expect("fallback");
+        assert_eq!(target.bytes, 268_435_456);
+        assert_eq!(target.source_name(), "fallback");
+    }
+
+    /// `--maintain-l1-part-memory-target-bytes` wins over the derivation
+    /// verbatim (no clamp either way), the resolved line says the flag set it,
+    /// and zero fails startup naming the flag.
+    ///
+    /// Non-vacuity (prove-the-test): let the derivation win, and the 12345 row
+    /// reads 939524096; clamp the flag, and it reads 268435456; drop the zero
+    /// refusal, and the `expect_err` builds `Ok`.
+    #[test]
+    fn compactor_memory_target_flag_wins_and_zero_is_refused() {
+        for (flag, want) in [("12345", 12_345u64), ("17179869184", 17_179_869_184)] {
+            let (lines, guard) = capture_events(tracing::Level::INFO);
+            let config =
+                compactor(&["--maintain-l1-part-memory-target-bytes", flag]).expect("flag");
+            drop(guard);
+            assert_eq!(config.l1_part_memory_target_bytes, want);
+            let lines = lines.lock().clone();
+            assert!(
+                lines.iter().any(|l| {
+                    l.contains("setting=\"l1_part_memory_target_bytes\"")
+                        && l.contains(" source=\"flag\"")
+                        && l.contains(&format!(" resolution={want} (set by flag)"))
+                }),
+                "{lines:?}"
+            );
+        }
+        let err = compactor(&["--maintain-l1-part-memory-target-bytes", "0"])
+            .expect_err("zero is refused");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("--maintain-l1-part-memory-target-bytes must be greater than 0"),
+            "{text}"
+        );
     }
 
     /// `--audit-retention` unset leaves the compactor on the compiled-in
