@@ -1290,4 +1290,226 @@ mod tests {
             "the injected fault must actually have fired"
         );
     }
+
+    /// FaultStore has no access-denied fault, so the refusal tests script a
+    /// `Permanent` fault whose message starts with this prefix and this
+    /// adapter reports it as `StoreError::AccessDenied`, the class the S3
+    /// backend maps a 403 to. FaultStore's own counters still prove the fault
+    /// fired.
+    const DENIED_PREFIX: &str = "denied by test policy: ";
+
+    struct AccessDeniedStore {
+        inner: FaultStore<MemoryStore>,
+    }
+
+    fn as_access_denied(err: StoreError) -> StoreError {
+        match err {
+            StoreError::Permanent(msg) if msg.starts_with(DENIED_PREFIX) => {
+                StoreError::AccessDenied(msg)
+            }
+            other => other,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for AccessDeniedStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner
+                .put(key, data, opts)
+                .await
+                .map_err(as_access_denied)
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            self.inner.get(key, range).await.map_err(as_access_denied)
+        }
+
+        async fn get_pinned(
+            &self,
+            key: &str,
+            range: GetRange,
+            pin: &ravel_object_store::Pin,
+        ) -> Result<ravel_object_store::PinnedRead, StoreError> {
+            self.inner.get_pinned(key, range, pin).await
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn ravel_object_store::MultipartUpload + 'a>, StoreError> {
+            self.inner.put_multipart(key).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_after(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list_after(prefix, start_after, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// A store that refuses `op` on `sys/gc` the way a per-role credential
+    /// without that grant does.
+    fn refusing(inner: MemoryStore, op: Op) -> AccessDeniedStore {
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                op,
+                ScriptedFault::Permanent(format!("{DENIED_PREFIX}{GC_CONFIG_KEY}")),
+            )
+            .with_key_contains(GC_CONFIG_KEY),
+        );
+        AccessDeniedStore {
+            inner: FaultStore::new(inner, plan),
+        }
+    }
+
+    fn denied_count(store: &AccessDeniedStore, op: Op) -> u64 {
+        store
+            .inner
+            .fault_count(op, ravel_object_store::fault::FaultKind::Permanent)
+    }
+
+    /// A credential that may read but not create `sys/gc` (Gateway or Query
+    /// under per-role IAM) on a fresh bucket: the refused create surfaces as
+    /// `AccessDenied` on the create, not as a generic `Store` error, and
+    /// nothing is written.
+    #[tokio::test]
+    async fn bootstrap_reports_a_refused_create_as_access_denied() {
+        let store = refusing(MemoryStore::new(), Op::Put);
+        let err = bootstrap_gc_config(&store, GcConfigValues::maintain_defaults(), 1)
+            .await
+            .expect_err("a refused create must fail the bootstrap");
+        assert!(
+            matches!(
+                err,
+                GcConfigError::AccessDenied {
+                    op: GcAccessOp::Create,
+                    ..
+                }
+            ),
+            "got: {err:?}"
+        );
+        assert_eq!(
+            denied_count(&store, Op::Put),
+            1,
+            "the refused PUT must actually have fired"
+        );
+        assert!(
+            read_gc_config(&store).await.expect("read").is_none(),
+            "a refused create writes nothing"
+        );
+    }
+
+    /// A credential refused the `sys/gc` GET surfaces `AccessDenied` on the
+    /// read, and the bootstrap never goes on to attempt a create.
+    #[tokio::test]
+    async fn bootstrap_reports_a_refused_read_as_access_denied() {
+        let store = refusing(MemoryStore::new(), Op::Get);
+        let err = bootstrap_gc_config(&store, GcConfigValues::maintain_defaults(), 1)
+            .await
+            .expect_err("a refused read must fail the bootstrap");
+        assert!(
+            matches!(
+                err,
+                GcConfigError::AccessDenied {
+                    op: GcAccessOp::Read,
+                    ..
+                }
+            ),
+            "got: {err:?}"
+        );
+        assert_eq!(
+            denied_count(&store, Op::Get),
+            1,
+            "the refused GET must actually have fired"
+        );
+        let head = store.inner.head(GC_CONFIG_KEY).await;
+        assert!(
+            matches!(head, Err(StoreError::NotFound)),
+            "a refused read must not fall through to a create, got: {head:?}"
+        );
+    }
+
+    /// Through the same adapter with no refusal scripted, an absent object
+    /// with a permitted PUT still bootstraps from the defaults: the shared-
+    /// credential deployment keeps the fresh-bucket property.
+    #[tokio::test]
+    async fn absent_object_with_a_permitted_put_still_bootstraps() {
+        let store = AccessDeniedStore {
+            inner: FaultStore::new(MemoryStore::new(), FaultPlan::empty()),
+        };
+        let values = bootstrap_gc_config(&store, GcConfigValues::maintain_defaults(), 1)
+            .await
+            .expect("a permitted create bootstraps");
+        assert_eq!(values, GcConfigValues::maintain_defaults());
+        let (reread, _version) = read_gc_config(&store)
+            .await
+            .expect("read")
+            .expect("sys/gc exists after bootstrap");
+        assert_eq!(reread, GcConfigValues::maintain_defaults());
+    }
+
+    /// A present object is returned as stored, and a credential with no PUT
+    /// grant still starts because the bootstrap never issues the PUT.
+    #[tokio::test]
+    async fn present_object_returns_its_values_without_a_put() {
+        let inner = MemoryStore::new();
+        let stored = GcConfigValues {
+            protection_horizon_ns: DEFAULT_MAX_QUERY_DURATION_NS + 2 * DEFAULT_GRACE_NS,
+            grace_ns: DEFAULT_GRACE_NS,
+            max_query_duration_ns: DEFAULT_MAX_QUERY_DURATION_NS,
+            max_flush_lifetime_ns: DEFAULT_MAX_FLUSH_LIFETIME_NS,
+        };
+        bootstrap_gc_config(&inner, stored, 1)
+            .await
+            .expect("seed sys/gc");
+        let store = refusing(inner, Op::Put);
+        let values = bootstrap_gc_config(&store, GcConfigValues::maintain_defaults(), 2)
+            .await
+            .expect("a present object needs no PUT");
+        assert_eq!(values, stored);
+        assert_eq!(
+            denied_count(&store, Op::Put),
+            0,
+            "no PUT may be issued against a present sys/gc"
+        );
+    }
 }
