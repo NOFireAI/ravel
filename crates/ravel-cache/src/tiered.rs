@@ -891,9 +891,9 @@ mod tests {
     /// follower of it is [`ReadOutcome::LateServe`], which `get_or_fetch`
     /// still reports as [`Source::Upstream`].
     ///
-    /// FLIP: labelling the result from `from_cache` alone, ignoring the role
-    /// (the `(false, Role::Follower)` arm made `ReadOutcome::Fetched`), reports
-    /// the follower as `ReadOutcome::Fetched`.
+    /// FLIP: labelling the result from the flight value alone, ignoring the
+    /// role (the `(Served::Upstream, Role::Follower)` arm made
+    /// `ReadOutcome::Fetched`), reports the follower as `ReadOutcome::Fetched`.
     #[tokio::test]
     async fn get_or_fetch_outcome_reports_a_follower_of_an_upstream_fetch_as_a_late_serve() {
         let tmp = TempDir::new().unwrap();
@@ -994,6 +994,50 @@ mod tests {
                 assert_eq!(follower.await.unwrap(), (payload, ReadOutcome::Hit));
                 assert_eq!(tiered.disk_metrics().snapshot().hits, 1);
             });
+    }
+
+    /// A `get_or_fetch_outcome` follower of a `resolve_peeked_miss` leader
+    /// whose RAM recheck served the bytes is a [`ReadOutcome::LateServe`], as
+    /// on the RAM-only cache: its own RAM lookup missed and no fetch ran for
+    /// it. The leader is held before its recheck, with its flight registered,
+    /// until the follower has joined and the bytes are in RAM.
+    ///
+    /// FLIP: labelling a `Served::RamRecheck` follower `ReadOutcome::Hit`
+    /// (`(Served::Disk | Served::RamRecheck, _) => ReadOutcome::Hit` in
+    /// `Served::outcome`) reports the follower as a hit.
+    #[tokio::test]
+    async fn get_or_fetch_outcome_reports_a_follower_of_a_ram_recheck_as_a_late_serve() {
+        let tmp = TempDir::new().unwrap();
+        let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        let ram: Cache<&'static str> = Cache::new(generous_limits());
+        let tiered = TieredCache::new(ram, disk);
+        let payload = Bytes::from_static(b"admitted late");
+        let key = test_key(1, payload.len() as u64);
+        let (release_tx, release_rx) = oneshot::channel();
+        *tiered.recheck_hold.lock() = Some(release_rx);
+
+        let never = || async { Err::<Bytes, &'static str>("no upstream fetch runs") };
+        let mut leader = Box::pin(tiered.resolve_peeked_miss(key, never));
+        let first = std::future::poll_fn(|cx| Poll::Ready(leader.as_mut().poll(cx))).await;
+        assert!(
+            first.is_pending(),
+            "the leader parks before its RAM recheck"
+        );
+        let mut follower = Box::pin(tiered.get_or_fetch_outcome(key, never));
+        let first = std::future::poll_fn(|cx| Poll::Ready(follower.as_mut().poll(cx))).await;
+        assert!(first.is_pending(), "the follower missed RAM and joined");
+        assert_eq!(tiered.in_flight_waiters(&key), 1);
+        let before = tiered.ram_metrics().snapshot();
+        assert_eq!(before.misses, 1, "the follower's own RAM lookup missed");
+        tiered.ram.insert(key, payload.clone());
+        release_tx.send(()).expect("the leader is still parked");
+
+        assert_eq!(leader.await.unwrap(), payload);
+        assert_eq!(follower.await.unwrap(), (payload, ReadOutcome::LateServe));
+        let after = tiered.ram_metrics().snapshot();
+        assert_eq!(after.hits, 0, "the recheck records no hit");
+        assert_eq!(after.single_flight_collapses, 1);
+        assert_eq!(tiered.disk_metrics().snapshot().hits, 0);
     }
 
     /// Concurrent RAM+disk misses on one key collapse to a single upstream
