@@ -1533,7 +1533,7 @@ fn map_put_error(e: object_store::Error, mode: &PutMode) -> StoreError {
 /// object's size.
 pub(crate) fn map_get_error(e: object_store::Error) -> StoreError {
     if let object_store::Error::Generic { source, .. } = &e {
-        let msg = source.to_string().to_lowercase();
+        let msg = classified_text(source.as_ref()).to_lowercase();
         if msg.contains("range") && (msg.contains("satisfiable") || msg.contains("too large")) {
             return StoreError::InvalidRange(source.to_string());
         }
@@ -1660,7 +1660,12 @@ fn typed_http_kind(
 ///    prints after a 429 or 503 status ("too many requests", "service
 ///    unavailable"), to [`StoreError::Throttled`]. A bare "429" or "503"
 ///    digit run is not a signal: a port, a key, an elapsed time or a request
-///    id can carry one.
+///    id can carry one. When that text carries an S3 XML error body with a
+///    `Code`, the words are matched over the status line only and the code
+///    stands in for the body: `SlowDown`, `Throttling`, `ThrottlingException`,
+///    `RequestLimitExceeded` and `TooManyRequests` to
+///    [`StoreError::Throttled`], `RequestTimeout` to [`StoreError::Timeout`],
+///    so a body echoing a key spelled with a class word cannot pick the class.
 ///
 /// Anything unmatched is [`StoreError::Transient`], never `Permanent`:
 /// `object_store` already retried its own retryable classes (5xx, connection
@@ -1692,13 +1697,24 @@ fn classify_generic(
     // Tier 2: Display-text heuristic. This is the only floor for 429/503,
     // whose HTTP status is not reachable through any nameable type here.
     let msg = source.to_string();
-    let lower = classified_text(source).to_lowercase();
+    let text = classified_text(source);
+    // With an S3 error code in the body, the code stands in for the rest of
+    // the body, which can echo the request.
+    let (lower, code) = match text.find("<Error>") {
+        Some(start) => match bucket_config::parse_error_code(&text.as_bytes()[start..]) {
+            Some(code) => (text[..start].to_lowercase(), Some(code)),
+            None => (text.to_lowercase(), None),
+        },
+        None => (text.to_lowercase(), None),
+    };
+    let code = code.as_deref();
     // `object_store`'s `RetryError` Display puts ", ..., retry_timeout: {d} "
     // in its prefix on every exhausted-retry message, and the field name
     // contains "timeout". `classified_text` already drops that prefix; the
     // strip below is a fallback for text that reaches here without the
     // `RetryError` shape, so an exhausted 500 still stays Transient.
-    if lower.contains("too many requests")
+    if code.is_some_and(is_throttle_code)
+        || lower.contains("too many requests")
         || lower.contains("slow down")
         || lower.contains("slowdown")
         || lower.contains("throttl")
@@ -1709,7 +1725,8 @@ fn classify_generic(
         };
     }
     let without_retry_field = lower.replace("retry_timeout", " ");
-    if without_retry_field.contains("timed out")
+    if code == Some("RequestTimeout")
+        || without_retry_field.contains("timed out")
         || without_retry_field.contains("timeout")
         || without_retry_field.contains("deadline")
     {
@@ -1718,11 +1735,24 @@ fn classify_generic(
     StoreError::Transient(format!("{store}: {msg}"))
 }
 
+/// S3 error codes that ask the client to slow down.
+fn is_throttle_code(code: &str) -> bool {
+    matches!(
+        code,
+        "SlowDown"
+            | "Throttling"
+            | "ThrottlingException"
+            | "RequestLimitExceeded"
+            | "TooManyRequests"
+    )
+}
+
 /// The part of a `Generic` error's text that carries the failure itself, with
 /// the request URI and any wrapper text naming a path left out, so a bucket,
 /// endpoint or key spelled with a class word in the URI cannot pick the class.
-/// The inner text still includes the response body, so a body that echoes the
-/// request can.
+/// The inner text still includes the response body, which can echo the
+/// request; [`classify_generic`] reads only the S3 error code of a body that
+/// carries one.
 ///
 /// `RetryError` renders `"Error performing {method} {uri} in {elapsed:?}"`,
 /// an optional exhausted-retry suffix, then `" - {inner}"`, where `inner` is
@@ -4315,6 +4345,107 @@ mod tests {
                         "got {mapped:?} for {inner:?}"
                     );
                 }
+            }
+        }
+    }
+
+    /// An exhausted 500 GET whose bucket or key carries both "range" and
+    /// "satisfiable" reads Transient through `map_get_error`, as text and as a
+    /// source chain: only the inner `RequestError` text is a range signal.
+    #[test]
+    fn range_words_in_the_request_uri_are_not_invalid_range() {
+        let retries = ", after 10 retries, max_retries: 10, retry_timeout: 180s ";
+        let inner = "Server returned non-2xx status code: 500 Internal Server Error: ";
+        for uri in [
+            "http://127.0.0.1:9000/range-not-satisfiable/k",
+            "http://127.0.0.1:9000/b/range/not/satisfiable",
+            "http://127.0.0.1:9000/b/range%20too%20large",
+        ] {
+            let as_text = OwnedTextError(format!(
+                "Error performing GET {uri} in 1.2ms{retries} - {inner}"
+            ));
+            let as_chain = Wrapping {
+                prefix: format!("Error performing GET {uri} in 1.2ms{retries} - "),
+                source: Box::new(OwnedTextError(inner.to_string())),
+            };
+            for mapped in [
+                map_get_error(generic(as_text)),
+                map_get_error(generic(as_chain)),
+            ] {
+                assert!(
+                    matches!(mapped, StoreError::Transient(_)),
+                    "range words in the URI must not read InvalidRange, got {mapped:?} \
+                     for {uri:?}"
+                );
+                assert!(mapped.is_retryable(), "{uri:?} must be retryable");
+            }
+        }
+    }
+
+    /// A body that echoes a key carrying class words reads Transient when its
+    /// S3 error code is not a class, while a class code, or a 429/503/504/408
+    /// status line, still classifies whatever the echoed key says.
+    #[test]
+    fn class_words_echoed_in_an_error_body_are_not_a_class() {
+        let prefix = "Error performing GET http://127.0.0.1:9000/b/k in 1.2ms - ";
+        let echo = |status: &str, code: &str| {
+            format!(
+                "Server returned non-2xx status code: {status}: <Error><Code>{code}</Code>\
+                 <Message>m</Message><Key>slowdown/timeout/throttled/deadline</Key>\
+                 <Resource>/b/slow down/timed out</Resource></Error>"
+            )
+        };
+        let cases = [
+            (echo("400 Bad Request", "InvalidArgument"), "transient"),
+            (
+                echo("500 Internal Server Error", "InternalError"),
+                "transient",
+            ),
+            (
+                "Server returned non-2xx status code: 400 Bad Request: <Error>\
+                 <Code>InvalidArgument</Code><Key>timeout/deadline/timed out</Key></Error>"
+                    .to_string(),
+                "transient",
+            ),
+            (echo("503 Service Unavailable", "SlowDown"), "throttled"),
+            (
+                echo("503 Service Unavailable", "ServiceUnavailable"),
+                "throttled",
+            ),
+            (
+                echo("429 Too Many Requests", "InvalidArgument"),
+                "throttled",
+            ),
+            (echo("400 Bad Request", "Throttling"), "throttled"),
+            (echo("400 Bad Request", "ThrottlingException"), "throttled"),
+            (
+                echo("503 Service Unavailable", "RequestLimitExceeded"),
+                "throttled",
+            ),
+            (echo("400 Bad Request", "TooManyRequests"), "throttled"),
+            (echo("400 Bad Request", "RequestTimeout"), "timeout"),
+            (echo("504 Gateway Timeout", "InvalidArgument"), "timeout"),
+            (echo("408 Request Timeout", "InvalidArgument"), "timeout"),
+        ];
+        for (inner, want) in cases {
+            let as_text = OwnedTextError(format!("{prefix}{inner}"));
+            let as_chain = Wrapping {
+                prefix: prefix.to_string(),
+                source: Box::new(OwnedTextError(inner.clone())),
+            };
+            for mapped in [
+                map_error_common(generic(as_text)),
+                map_error_common(generic(as_chain)),
+            ] {
+                let got = match mapped {
+                    StoreError::Transient(_) => "transient",
+                    StoreError::Throttled {
+                        retry_after_ms: 1000,
+                    } => "throttled",
+                    StoreError::Timeout => "timeout",
+                    _ => "other",
+                };
+                assert_eq!(got, want, "got {mapped:?} for {inner:?}");
             }
         }
     }
