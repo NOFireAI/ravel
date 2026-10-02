@@ -194,7 +194,8 @@ the recovery scenario. So no bytes are retained for the exception either.
 If the post-publish HEAD finds an `AlreadyExists` part missing, the run
 fails loud with a typed error whose remedy is a re-run — and the re-run
 converges without needing any retained bytes at all: it rebuilds
-byte-identical parts, and its PUT of the deleted key is a FRESH put (the
+byte-identical parts (provided it runs with the part-split settings the
+first run used; see the #2351 amendment), and its PUT of the deleted key is a FRESH put (the
 key is absent, so `AlreadyExists` cannot recur for it) that restores the
 part and resets its age BEFORE the record resolution runs. Every part the
 winner record references is then either still present or just re-PUT, so
@@ -597,5 +598,31 @@ flowchart TB
     SINK -->|target reached| PUT["Encode + PUT part<br/>(content-addressed key)"]
     PUT --> DROP["Drop part bytes<br/>(BuiltPart.bytes = None)<br/>retained-parts charge: 0"]
 ```
+
+## Amendment (2026-10-02): a rerun converges only with the winning run's part-split settings (issue #2351)
+
+<!-- amendment-applies: sections="D3. `PartSink` releases part bytes at PUT" pointer="#2351 amendment" -->
+
+D3 says a rerun rebuilds byte-identical parts. That holds only when the
+rerun cuts parts where the first run did. Part boundaries depend on the
+memory split target and the stored-size target, and part bytes on the RLOG
+zstd level; none of them is part of the compaction record's identity. Since
+issue #2351 the memory split target of an RLOG merge is derived from the
+memory budget of the process that runs it, so two processes on one host can
+cut the same input set differently: `ravel-server` on a 30 GiB host at its
+default unit concurrency of 4 derives 896 MiB, while `ravel-cli maintain
+compact-bucket` on that host derives 3.75 GiB. A rerun with different
+settings builds parts under different content-addressed keys, finds the
+winner record's missing part absent from its own output, and fails with
+`ConvergedWinnerPartMissing` again.
+
+The compaction record has no field that could carry the settings without a
+schema change, and the RLOG footer does not record them, so the remedy is
+stated rather than automated: the error names
+`--l1-part-memory-target-bytes` (on `ravel-server`,
+`--maintain-l1-part-memory-target-bytes`), `--max-l1-part-bytes` and
+`--compaction-zstd-level`, and says the rerun must pin each to the value the
+winning run used. Each binary reports the memory target it resolved once per
+run, which is where that value is found.
 
 ---
