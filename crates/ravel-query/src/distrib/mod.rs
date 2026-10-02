@@ -419,6 +419,16 @@ impl Distributed {
                         ),
                     });
                 }
+                pb::status::Code::Timeout => {
+                    // The worker stopped the slice at the query's deadline, or
+                    // refused it because the deadline had already passed. The
+                    // query is over, so this is terminal: the slice's fetcher
+                    // neither re-dispatches nor runs it locally, and the spend
+                    // the worker made before it stopped is folded first (issue
+                    // #1723).
+                    fold_slice(accounting, &mut running, &mut stats, &response);
+                    return Err(slice_deadline_exceeded());
+                }
                 other => {
                     fold_slice(accounting, &mut running, &mut stats, &response);
                     return Err(QueryError::Distrib {
@@ -603,6 +613,11 @@ impl Distributed {
                         ),
                     });
                 }
+                pb::status::Code::Timeout => {
+                    // Terminal for the query, as in the metrics loop.
+                    fold_log_slice(accounting, &mut running, &response);
+                    return Err(slice_deadline_exceeded());
+                }
                 other => {
                     fold_log_slice(accounting, &mut running, &response);
                     return Err(QueryError::Distrib {
@@ -779,6 +794,11 @@ impl Distributed {
                         ),
                     });
                 }
+                pb::status::Code::Timeout => {
+                    // Terminal for the query, as in the metrics loop.
+                    fold_span_slice(accounting, &mut running, &response);
+                    return Err(slice_deadline_exceeded());
+                }
                 other => {
                     fold_span_slice(accounting, &mut running, &response);
                     return Err(QueryError::Distrib {
@@ -848,6 +868,16 @@ fn fold_error_spend(live: &QueryAccounting, err: DistribError) -> QueryError {
         live.merge_snapshot(spend);
     }
     distrib_error(err)
+}
+
+/// The error a slice that ended `TIMEOUT` fails its query with. The deadline
+/// it names is a placeholder: every engine entry point runs the fetch inside
+/// its own deadline wrapper, which rewrites a `DeadlineExceeded` to carry the
+/// request's own deadline, the one this stop enforced.
+fn slice_deadline_exceeded() -> QueryError {
+    QueryError::DeadlineExceeded {
+        deadline: std::time::Duration::ZERO,
+    }
 }
 
 /// Folds one RLOG-family slice's accounting into the query's live handle and the
