@@ -164,10 +164,13 @@
 //! what keeps this merge survivable on a small host. On a wide schema it also
 //! decides object geometry: decoded heap runs far ahead of stored bytes, so a
 //! fixed 256 MiB target closed parts at about 32k rows and 2.1 MB stored on a
-//! 104-column schema. The binaries therefore derive it from the memory budget
-//! when the operator leaves it unset, as `budget / 8 / concurrent_merges`
-//! clamped to 256 MiB..=8 GiB (`config::derive_l1_part_memory_target_bytes`),
-//! so part size follows host memory.
+//! 104-column schema. The binaries therefore derive this merge's target from
+//! the memory budget when the operator leaves it unset, as `budget / 8 /
+//! concurrent_merges` clamped to 256 MiB..=8 GiB
+//! (`config::derive_l1_part_memory_target_bytes`), so part size follows host
+//! memory. The derived value reaches this merge only
+//! ([`CompactorConfig::rlog_memory_target_bytes`]); the RSPAN merge, which has
+//! no stored-size target, stays at 256 MiB unless the operator sets the knob.
 //!
 //! The **stored-size target** `max_l1_part_bytes` is the operator's cap on
 //! object size, measured in the bytes its name promises: the part's ACTUAL
@@ -1234,7 +1237,7 @@ impl PartSink<'_> {
             // The memory split target sizes compactor peak memory (issue #711)
             // and is checked cheaply after every record, so it takes priority
             // when both would fire.
-            over_memory = part.estimate >= self.config.l1_part_memory_target_bytes;
+            over_memory = part.estimate >= self.config.rlog_memory_target_bytes();
             if !over_memory
                 && part.stored_estimate >= self.config.max_l1_part_bytes
                 && part.stored_estimate >= part.next_probe_stored
@@ -7131,6 +7134,134 @@ mod tests {
             on, off,
             "overlap-gated admission must produce byte-identical parts to eager all-open admission"
         );
+    }
+
+    /// The RLOG merge closes parts at `rlog_l1_part_memory_target_bytes` when
+    /// it is set, in place of `l1_part_memory_target_bytes` (issue #2351):
+    /// that field is how a derived memory target reaches this merge and not
+    /// the RSPAN one.
+    ///
+    /// Distinguishing:
+    /// - The merge still reading `l1_part_memory_target_bytes`: the
+    ///   `rlog_small` run is one part (its shared field is `u64::MAX`), not the
+    ///   split part set.
+    /// - The merge taking the smaller of the two fields: the `rlog_large` run
+    ///   splits like the 1024-byte run instead of producing one part.
+    #[tokio::test]
+    async fn rlog_merge_reads_the_rlog_only_memory_target() {
+        let inputs = admission_mixed_fixture();
+        let shared = CompactorConfig {
+            l1_part_memory_target_bytes: 1024,
+            ..CompactorConfig::default()
+        };
+        let split = compact_part_hashes(&inputs, &shared).await;
+        assert!(split.len() > 1, "the fixture must split at 1024 bytes");
+
+        let rlog_small = CompactorConfig {
+            l1_part_memory_target_bytes: u64::MAX,
+            rlog_l1_part_memory_target_bytes: Some(1024),
+            ..CompactorConfig::default()
+        };
+        assert_eq!(compact_part_hashes(&inputs, &rlog_small).await, split);
+
+        let rlog_large = CompactorConfig {
+            l1_part_memory_target_bytes: 1024,
+            rlog_l1_part_memory_target_bytes: Some(u64::MAX),
+            ..CompactorConfig::default()
+        };
+        assert_eq!(compact_part_hashes(&inputs, &rlog_large).await.len(), 1);
+    }
+
+    /// Build and publish the bucket's parts once under `config`, against
+    /// whatever compaction record the store already holds.
+    async fn rebuild_and_publish(
+        store: &MemoryStore,
+        config: &CompactorConfig,
+    ) -> Result<crate::publish::PublishOutcome> {
+        let b = bucket();
+        let commit_keys = crate::read::list_bucket(store, &b).await?.commit_keys;
+        let inputs = crate::read::load_inputs(store, &b, &commit_keys, 1).await?;
+        let hash = crate::read::input_set_hash(&inputs);
+        let mut catalogs = Vec::new();
+        for input in &inputs {
+            catalogs.push(RlogCodec::load_input_catalog(store, config, input).await?);
+        }
+        let parts = RlogCodec::build_parts(store, config, &b, &inputs, catalogs, &hash).await?;
+        crate::publish::publish_record(
+            store,
+            config,
+            &FixedClock::new(sealed_now_ns()),
+            &b,
+            &inputs,
+            &hash,
+            &parts,
+            sealed_now_ns(),
+        )
+        .await
+    }
+
+    /// A rerun that cuts parts at a different memory split target than the
+    /// winning run cannot restore a winner part that went missing, and the
+    /// error names the flags to pin to the winner's values (issue #2351). The
+    /// same rerun at the winner's target restores the part and converges.
+    ///
+    /// Distinguishing:
+    /// - The pre-#2351 remedy text ("Re-run the compaction: the rerun rebuilds
+    ///   the byte-identical part", no flag named): the flag assertions fail.
+    /// - A remedy naming only the CLI flag: the `ravel-server` flag assertion
+    ///   fails.
+    /// - Part boundaries that did not depend on the memory target: the
+    ///   mismatched rerun rebuilds the missing key, converges, and the
+    ///   `expect_err` fails.
+    #[tokio::test]
+    async fn rerun_with_another_memory_target_names_the_flags_to_pin() {
+        let store = MemoryStore::new();
+        for (writer_id, seq, recs) in admission_mixed_fixture() {
+            seed(&store, writer_id, seq, &recs).await;
+        }
+        let winner_config = CompactorConfig {
+            rlog_l1_part_memory_target_bytes: Some(1024),
+            ..CompactorConfig::default()
+        };
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(&store, &clock, &winner_config, &bucket())
+            .await
+            .expect("winner");
+        let (winner, _) = read_output(&store).await;
+        assert!(winner.parts.len() > 1, "the winner must split");
+        let victim = keys::reconstruct_l1_part_key(&winner, &winner.parts[0]).expect("part key");
+        store.delete(&victim).await.expect("delete a winner part");
+
+        let other_target = CompactorConfig {
+            rlog_l1_part_memory_target_bytes: Some(u64::MAX),
+            ..CompactorConfig::default()
+        };
+        let err = rebuild_and_publish(&store, &other_target)
+            .await
+            .expect_err("another target cannot rebuild the winner's part");
+        let MaintainError::ConvergedWinnerPartMissing { part_key } = &err else {
+            panic!("expected ConvergedWinnerPartMissing, got {err:?}");
+        };
+        assert_eq!(part_key, &victim);
+        let text = err.to_string();
+        for needle in [
+            "with the part-split settings the winning run used",
+            "--l1-part-memory-target-bytes (ravel-server: --maintain-l1-part-memory-target-bytes)",
+            "--max-l1-part-bytes",
+            "--compaction-zstd-level (ravel-server: --maintain-compaction-zstd-level)",
+        ] {
+            assert!(text.contains(needle), "{needle:?} missing from: {text}");
+        }
+        assert!(store.get(&victim, GetRange::Full).await.is_err());
+
+        let outcome = rebuild_and_publish(&store, &winner_config)
+            .await
+            .expect("the winner's target restores the part");
+        assert_eq!(
+            outcome,
+            crate::publish::PublishOutcome::Converged { parts_repaired: 0 }
+        );
+        assert!(store.get(&victim, GetRange::Full).await.is_ok());
     }
 
     /// ADR-0979 decision 2, the `<=` admission boundary: a queued cursor whose
