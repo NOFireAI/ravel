@@ -1370,6 +1370,9 @@ async fn a_ddl_statement_records_attempted_before_it_runs_and_its_outcome_after(
         Some(sources),
     );
 
+    // The fixture's own grant write and the router's startup calls are
+    // counted too; only calls made after this point belong to the request.
+    let before_request = store_calls(&store);
     let (status, value) = post_json(&app, "ddl-token", CREATE_CLICKS).await;
     assert_eq!(status, StatusCode::OK, "{value}");
 
@@ -1382,9 +1385,9 @@ async fn a_ddl_statement_records_attempted_before_it_runs_and_its_outcome_after(
     assert_eq!(stamps[0].0, "attempted");
     assert_eq!(stamps[1].0, "ok");
     assert_eq!(
-        stamps[0].1, 0,
+        stamps[0].1, before_request,
         "the attempted record is submitted before any store call, grants \
-         read included: {stamps:?}"
+         read included: {stamps:?}, {before_request} calls before the request"
     );
     assert!(
         stamps[1].1 > stamps[0].1,
