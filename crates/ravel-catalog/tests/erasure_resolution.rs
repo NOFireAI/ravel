@@ -12,6 +12,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use prost::Message;
 use ravel_catalog::{
@@ -20,6 +21,7 @@ use ravel_catalog::{
 };
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_commit::{erasure, keys, signal};
+use ravel_cpu_gate::MonotonicClock;
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_proto::commit::v1::{
@@ -33,6 +35,16 @@ use uuid::Uuid;
 
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
 const HOUR: u32 = 500_000;
+
+/// Monotonic clock the catalog's HEAD cache ages on, moved by hand.
+#[derive(Default)]
+struct ManualMonoClock(AtomicU64);
+
+impl MonotonicClock for ManualMonoClock {
+    fn now_nanos(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
 
 fn tenant() -> TenantHash {
     TenantHash([0xab; 16])
@@ -663,7 +675,10 @@ async fn fold_recognizes_rewrite_records_and_matches_resolve() {
 #[tokio::test]
 async fn reconcile_picks_up_a_rewrite_published_into_an_already_folded_bucket() {
     let store = Arc::new(MemoryStore::new());
-    let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+    let clock = Arc::new(ManualMonoClock::default());
+    let catalog = Catalog::new(store.clone(), config(1))
+        .expect("catalog")
+        .with_monotonic_clock(clock.clone());
     let start = i64::from(HOUR) * NS_PER_HOUR;
 
     // Seed and seal HOUR with a plain L0, and HOUR+1 as the tail so the
@@ -742,6 +757,13 @@ async fn reconcile_picks_up_a_rewrite_published_into_an_already_folded_bucket() 
         start_ns: start,
         end_ns: start + 100,
     };
+    // The HEAD cached by the pre-rewrite resolve ages on the monotonic clock,
+    // so move it as far as the wall clock moved; it is then past its TTL and
+    // this resolve reads the second fold's HEAD.
+    clock.0.store(
+        u64::try_from(now_2 - now_1).expect("now_2 is later"),
+        Ordering::SeqCst,
+    );
     let accounting = QueryAccounting::new();
     let post_rewrite = catalog
         .resolve_with_accounting(

@@ -368,7 +368,6 @@ impl Catalog {
         &self,
         tenant: &TenantHash,
         signal: Signal,
-        now_ns: i64,
         want_postings: bool,
         window_start_hour: u32,
         window_end_hour: u32,
@@ -377,15 +376,7 @@ impl Catalog {
     ) -> Result<(Option<SnapshotWindow>, Option<Vec<ShardGeneration>>), CatalogError> {
         let head_key = head_object_key(tenant, signal);
         let Some((head, revalidated)) = self
-            .read_head(
-                tenant,
-                signal,
-                &head_key,
-                now_ns,
-                false,
-                generations,
-                accounting,
-            )
+            .read_head(tenant, signal, &head_key, false, generations, accounting)
             .await?
         else {
             return Ok((None, None));
@@ -424,15 +415,7 @@ impl Catalog {
                 // At most one HEAD re-read: bypass the TTL cache so a part GC'd since the
                 // cached HEAD was read is not raced again.
                 let Some((fresh_head, fresh_revalidated)) = self
-                    .read_head(
-                        tenant,
-                        signal,
-                        &head_key,
-                        now_ns,
-                        true,
-                        generations,
-                        accounting,
-                    )
+                    .read_head(tenant, signal, &head_key, true, generations, accounting)
                     .await?
                 else {
                     return Ok((None, revalidated));
@@ -625,16 +608,20 @@ impl Catalog {
         tenant: &TenantHash,
         signal: Signal,
         head_key: &str,
-        now_ns: i64,
         bypass_cache: bool,
         generations: &[ShardGeneration],
         accounting: &QueryAccounting,
     ) -> Result<Option<(Arc<SnapshotHead>, Option<Vec<ShardGeneration>>)>, CatalogError> {
+        // The cache stamp for a HEAD this call reads, taken before the GET is
+        // issued (ADR-1133, clock-reading amendment): an earlier stamp only
+        // expires the entry sooner. The cache check below reads the clock
+        // again rather than reusing this reading.
+        let stamp_mono_ns = self.monotonic_clock().now_nanos();
         if !bypass_cache
             && let Some(cached) = self.head_cache().get(
                 tenant,
                 signal,
-                now_ns,
+                self.monotonic_clock(),
                 self.config().head_cache_ttl_ns,
                 accounting,
             )
@@ -690,7 +677,7 @@ impl Catalog {
             signal,
             head.clone(),
             bytes,
-            now_ns,
+            stamp_mono_ns,
             self.config().head_cache_capacity,
         );
         Ok(Some((head, revalidated)))

@@ -12,6 +12,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -24,8 +25,9 @@ use ravel_catalog::{
 use ravel_commit::keys;
 use ravel_commit::publish::{self, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
+use ravel_cpu_gate::MonotonicClock;
 use ravel_object_store::fault::{
-    FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault, Sequence,
+    FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault, Sequence,
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
@@ -695,7 +697,10 @@ async fn stale_head_cache_widens_listed_suffix_but_stays_correct() {
     .await;
 
     let (counting, log) = CountingStore::new(inner.clone());
-    let catalog = Catalog::new(counting, config(1)).expect("catalog");
+    let clock = Arc::new(TestMonoClock::default());
+    let catalog = Catalog::new(counting, config(1))
+        .expect("catalog")
+        .with_monotonic_clock(clock.clone());
     catalog
         .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
         .await
@@ -710,7 +715,8 @@ async fn stale_head_cache_widens_listed_suffix_but_stays_correct() {
 
     // A second fold advances the watermark in the store to base_hour + 1,
     // but the cache entry from the resolve above (cached at `now_1`) is
-    // still within its TTL for a resolve shortly after.
+    // still within its TTL for a resolve shortly after. The cache ages on the
+    // injected monotonic clock, so it moves alongside the wall clock below.
     let hour_plus_one_prefix =
         keys::commit_shard_hour_prefix(&tenant(), Signal::Metrics, 0, base_hour + 1).unwrap();
     publish_segment(
@@ -735,6 +741,7 @@ async fn stale_head_cache_widens_listed_suffix_but_stays_correct() {
         .expect("second fold advances the watermark in the store to base_hour + 1");
 
     let now_2 = now_1 + 10_000_000_000;
+    clock.set(10_000_000_000);
     let range_2 = full_window_range(base_hour, now_2);
     let second = catalog
         .resolve(&tenant(), Signal::Metrics, range_2, &[], now_2)
@@ -752,6 +759,7 @@ async fn stale_head_cache_widens_listed_suffix_but_stays_correct() {
 
     let listed_before = log.list_count_for(&hour_plus_one_prefix);
     let now_3 = now_1 + DEFAULT_HEAD_CACHE_TTL_NS + 1;
+    clock.set(TTL_NS + 1);
     let range_3 = full_window_range(base_hour, now_3);
     let third = catalog
         .resolve(&tenant(), Signal::Metrics, range_3, &[], now_3)
@@ -762,5 +770,226 @@ async fn stale_head_cache_widens_listed_suffix_but_stays_correct() {
         log.list_count_for(&hour_plus_one_prefix),
         listed_before,
         "once the head cache refreshes to watermark base_hour + 1, that hour is snapshot-served"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// HEAD cache age is measured on the monotonic clock (ADR-1133, clock-reading
+// amendment)
+// ---------------------------------------------------------------------------
+
+const TTL_NS: u64 = DEFAULT_HEAD_CACHE_TTL_NS as u64;
+
+/// Monotonic clock under test control. `set` moves the current reading;
+/// `script` replaces the queue of readings the next `now_nanos` calls return
+/// in order, each becoming the current reading, before it falls back to the
+/// current one.
+#[derive(Default)]
+struct TestMonoClock {
+    state: Mutex<(u64, VecDeque<u64>)>,
+}
+
+impl TestMonoClock {
+    fn set(&self, ns: u64) {
+        self.state.lock().unwrap().0 = ns;
+    }
+
+    fn script(&self, readings: &[u64]) {
+        self.state.lock().unwrap().1 = readings.iter().copied().collect();
+    }
+
+    fn scripted_left(&self) -> usize {
+        self.state.lock().unwrap().1.len()
+    }
+}
+
+impl MonotonicClock for TestMonoClock {
+    fn now_nanos(&self) -> u64 {
+        let mut state = self.state.lock().unwrap();
+        if let Some(next) = state.1.pop_front() {
+            state.0 = next;
+        }
+        state.0
+    }
+}
+
+/// A catalog over one folded segment at `base_hour`, ageing its HEAD cache on
+/// `clock`, behind a request log and a fault store a test can hold GETs on.
+struct FoldedFixture {
+    catalog: Catalog,
+    log: RequestLog,
+    fault: Arc<FaultStore<Arc<MemoryStore>>>,
+    base_hour: u32,
+    now_ns: i64,
+}
+
+impl FoldedFixture {
+    async fn new(clock: Arc<TestMonoClock>) -> Self {
+        let inner = Arc::new(MemoryStore::new());
+        let base_hour = 12_000u32;
+        let now_ns = now_at_seal(base_hour);
+        publish_segment(
+            inner.as_ref(),
+            0,
+            Uuid::new_v4(),
+            1,
+            base_hour,
+            now_ns - NS_PER_HOUR,
+        )
+        .await;
+        let fault = Arc::new(FaultStore::new(inner, FaultPlan::empty()));
+        let (counting, log) = CountingStore::new(fault.clone());
+        let catalog = Catalog::new(counting, config(1))
+            .expect("catalog")
+            .with_monotonic_clock(clock);
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_ns,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold seals base_hour");
+        FoldedFixture {
+            catalog,
+            log,
+            fault,
+            base_hour,
+            now_ns,
+        }
+    }
+
+    /// Resolve with wall-clock `now_ns`, asserting the folded segment is
+    /// returned.
+    async fn resolve(&self, now_ns: i64) {
+        let snapshot = self
+            .catalog
+            .resolve(
+                &tenant(),
+                Signal::Metrics,
+                full_window_range(self.base_hour, now_ns),
+                &[],
+                now_ns,
+            )
+            .await
+            .expect("resolve");
+        assert_eq!(snapshot.segments.len(), 1);
+    }
+
+    fn head_gets(&self) -> usize {
+        self.log
+            .get_count_for(&head_key(&tenant(), Signal::Metrics))
+    }
+}
+
+/// The wall clock passed to resolve steps backwards while an entry is live.
+/// The entry still expires exactly at `head_cache_ttl` on the monotonic
+/// clock: served at the TTL, refused one nanosecond past it. A cache that
+/// compared wall-clock `now_ns` would read a negative age and keep serving.
+#[tokio::test]
+async fn head_cache_expires_on_the_monotonic_clock_when_the_wall_clock_steps_back() {
+    let clock = Arc::new(TestMonoClock::default());
+    let fx = FoldedFixture::new(clock.clone()).await;
+    let base = fx.head_gets();
+    const MINUTE: i64 = 60_000_000_000;
+
+    clock.set(1_000);
+    fx.resolve(fx.now_ns).await;
+    assert_eq!(fx.head_gets(), base + 1, "the first resolve reads HEAD");
+
+    clock.set(1_000 + TTL_NS);
+    fx.resolve(fx.now_ns - 10 * MINUTE).await;
+    assert_eq!(
+        fx.head_gets(),
+        base + 1,
+        "served at exactly head_cache_ttl on the monotonic clock"
+    );
+
+    clock.set(1_000 + TTL_NS + 1);
+    fx.resolve(fx.now_ns - 20 * MINUTE).await;
+    assert_eq!(
+        fx.head_gets(),
+        base + 2,
+        "refused at head_cache_ttl + 1 ns although the wall clock went backwards"
+    );
+}
+
+/// The resolve's entry reading (the stamp) and the cache check are separate
+/// readings. The check takes its own, later one: with the stamp read at the
+/// TTL and the check read one nanosecond past it, the entry is refused.
+#[tokio::test]
+async fn head_cache_check_takes_its_own_reading_not_the_resolve_entry_reading() {
+    let clock = Arc::new(TestMonoClock::default());
+    let fx = FoldedFixture::new(clock.clone()).await;
+    let base = fx.head_gets();
+
+    clock.set(0);
+    fx.resolve(fx.now_ns).await;
+    assert_eq!(fx.head_gets(), base + 1, "the first resolve reads HEAD");
+
+    // Control: both readings at the TTL, the entry is served.
+    clock.script(&[TTL_NS, TTL_NS]);
+    fx.resolve(fx.now_ns).await;
+    assert_eq!(
+        fx.head_gets(),
+        base + 1,
+        "served when the check reads the TTL"
+    );
+
+    // Entry reading at the TTL, check reading one nanosecond later.
+    clock.script(&[TTL_NS, TTL_NS + 1]);
+    fx.resolve(fx.now_ns).await;
+    assert_eq!(
+        fx.head_gets(),
+        base + 2,
+        "the check's own later reading expires the entry"
+    );
+    assert_eq!(clock.scripted_left(), 0, "the resolve read the clock twice");
+}
+
+/// The cache stamp is read before the HEAD GET is issued. The GET is held
+/// while the monotonic clock advances 5 s; the entry's age still counts from
+/// before the GET, so it expires at the TTL measured from then, not from when
+/// the GET returned.
+#[tokio::test]
+async fn head_cache_stamp_is_taken_before_the_head_get() {
+    let clock = Arc::new(TestMonoClock::default());
+    let fx = FoldedFixture::new(clock.clone()).await;
+    let base = fx.head_gets();
+    const HELD_NS: u64 = 5_000_000_000;
+
+    clock.set(0);
+    let gate = fx.fault.hold(
+        Op::Get,
+        Some(head_key(&tenant(), Signal::Metrics)),
+        Occurrence::Nth(1),
+    );
+    let ((), released) = tokio::join!(fx.resolve(fx.now_ns), async {
+        gate.wait_until_held(1).await;
+        clock.set(HELD_NS);
+        let held = gate.held();
+        assert_eq!(held.len(), 1, "exactly the HEAD GET is held");
+        gate.release(held[0])
+    });
+    assert!(released, "the held HEAD GET was released");
+    assert_eq!(fx.head_gets(), base + 1, "the first resolve reads HEAD");
+
+    clock.set(TTL_NS);
+    fx.resolve(fx.now_ns).await;
+    assert_eq!(
+        fx.head_gets(),
+        base + 1,
+        "served at the TTL from the pre-GET stamp"
+    );
+
+    clock.set(TTL_NS + 1);
+    fx.resolve(fx.now_ns).await;
+    assert_eq!(
+        fx.head_gets(),
+        base + 2,
+        "refused one nanosecond past the TTL counted from before the GET"
     );
 }
