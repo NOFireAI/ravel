@@ -1248,6 +1248,13 @@ async fn ddl_conflict_not_found_and_noop_have_their_own_statuses() {
 #[tokio::test]
 async fn a_ddl_outcome_is_json_even_when_arrow_is_accepted() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let sources = ravel_sql::ParquetSources::new(
+        Arc::clone(&store),
+        None,
+        Arc::new(ravel_query::GetLimiter::new(8).expect("limiter")),
+        None,
+        ravel_sql::DEFAULT_PARQUET_METADATA_CACHE_BYTES,
+    );
     let app = build_router_principals(
         store,
         HashMap::from([(
@@ -1258,20 +1265,35 @@ async fn a_ddl_outcome_is_json_even_when_arrow_is_accepted() {
             },
         )]),
         Arc::new(ravel_maintain::NoopQueryAuditSink),
-        None,
+        Some(sources),
     );
-    let (status, bytes) = post(
-        &app,
-        Some("ddl-token"),
-        Some(ARROW_STREAM_MEDIA_TYPE),
-        body("DROP TABLE IF EXISTS clicks"),
-    )
-    .await;
-    // No Parquet sources are configured, so the statement cannot be served;
-    // the point is the refusal's encoding, which must still be JSON.
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/sql")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, "Bearer ddl-token")
+        .header(header::ACCEPT, ARROW_STREAM_MEDIA_TYPE)
+        .body(Body::from(body("DROP TABLE IF EXISTS clicks")))
+        .expect("build request");
+    let response = app.oneshot(request).await.expect("oneshot is infallible");
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .expect("content type")
+        .to_str()
+        .expect("ascii")
+        .to_string();
+    assert!(
+        content_type.starts_with("application/json"),
+        "{content_type}"
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
     let value: Value = serde_json::from_slice(&bytes).expect("a JSON body");
-    assert_eq!(value["errorType"], "execution", "{value}");
+    assert_eq!(value["data"]["outcome"], "noop", "{value}");
+    assert_eq!(value["data"]["table"], "clicks", "{value}");
 }
 
 /// The capability changes nothing for a query: the same SELECT returns the

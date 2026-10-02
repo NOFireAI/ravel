@@ -242,8 +242,8 @@ impl ServiceError {
     }
 
     /// Classify and redact a [`ravel_sql::DdlExecuteError`], and log the
-    /// unredacted form once, at the level [`ServiceError::from_sql`] uses for
-    /// the same status.
+    /// unredacted form once: at debug for a client-caused status (4xx), so a
+    /// scripted client cannot flood the warn level, and at warn otherwise.
     ///
     /// The body message is `client_message()` only; the full `Display` can
     /// carry an object key or backend text and goes to the log alone.

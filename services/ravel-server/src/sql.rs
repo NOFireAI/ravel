@@ -287,8 +287,8 @@ fn request_deadline(body: &SqlBody, max_deadline: Duration) -> Result<Duration, 
 /// (ADR-2040 decision 4).
 ///
 /// A caller without the `ddl` capability is refused with 403 before anything
-/// else happens: no grants record is read, no store is called and the
-/// statement is not validated. A caller with it takes a fleet-global admission
+/// else happens: no grants record is read, no store is called and
+/// `validate_ddl` is not run. A caller with it takes a fleet-global admission
 /// permit and runs [`SqlExecutor::execute_ddl`] as the principal's own tenant,
 /// which is also what the manifest records as its creator; no header or body
 /// value can name another.
