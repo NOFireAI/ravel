@@ -1583,8 +1583,8 @@ pub async fn sweep_at(
     if let Some(reap) = unnamed_marker_reap {
         println!(
             "unnamed-since markers reaped (orphans): {} of {} listed, {} unparseable keys \
-             skipped, {} unreadable",
-            reap.reaped, reap.listed, reap.unparseable, reap.unreadable
+             skipped, {} unreadable, {} failed",
+            reap.reaped, reap.listed, reap.unparseable, reap.unreadable, reap.failed
         );
     }
     println!("superseded groups held (legal hold): {superseded_groups_held_by_legal_hold}");
