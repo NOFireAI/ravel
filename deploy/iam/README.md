@@ -11,7 +11,8 @@ from the pinned shape fails that suite.
 `DenyDeleteProtected` in `maintain.json` denies delete on `sys/tenancy`,
 `sys/qualification`, `sys/gc`, `t/*/*/prov`, `t/*/catalog/*/HEAD`, the
 legal-hold audit shard (`t/*/u/*/0000/*`), the durable token map `sys/auth`,
-and the write-once recovery manifests `sys/t/*`. Commit records are absent from
+the write-once recovery manifests `sys/t/*`, and the append-only KMS key-epoch
+records `t/*/enc`. Commit records are absent from
 that list on purpose: `MaintainDelete` grants delete on `t/*/*/c/*`
 because the maintenance sweep physically removes a commit record once
 it is superseded, and an IAM deny there would make every sweep pass fail.
@@ -21,10 +22,13 @@ the whole catalog family, `t/*/catalog/*/*`, instead: none of those roles
 deletes a catalog object, so nothing narrower is needed there. Maintain is
 the one role where narrowing to `HEAD` alone is load-bearing.
 
-All four templates also deny delete on `sys/auth` and `sys/t/*`: no role
-deletes either on its normal path, a deleted `sys/auth` reads as absent and
-installs an empty token map that revokes every durable token, and `sys/t/*`
-recovery manifests are write-once (ADR-0050).
+All four templates also deny delete on `sys/auth`, `sys/t/*` and `t/*/enc`: no
+role deletes any of them on its normal path, a deleted `sys/auth` reads as
+absent and installs an empty token map that revokes every durable token,
+`sys/t/*` recovery manifests are write-once (ADR-0050), and a deleted
+`t/<hash>/enc` reads as "no per-tenant key was ever configured", so
+`verify-custody` stops checking the tenant and the next startup rewrites its
+epoch history from scratch.
 
 Catalog snapshot and index objects (`t/*/catalog/*/snap/*`,
 `t/*/catalog/*/idx/*`) used to be caught by the same `t/*/catalog/*/*`
