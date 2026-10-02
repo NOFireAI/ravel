@@ -256,11 +256,13 @@ fn control_plane_witness_keys() -> Vec<String> {
 
 /// One literal key per TENANT-ROUTED keyspace the templates name that
 /// `ravel-commit` has no key constructor for, so `representative_keys` produces
-/// no witness for it: `catalog/`, `prov`, tenant `idem/`, and tenant
-/// `admission/`. Every one is a real `t/<hash>/...` object key the templates
-/// grant an action on, written here as a literal because no crate constructor
-/// builds it (fold writes catalog objects, the log-segment writer writes prov,
-/// ingest writes idem and admission markers).
+/// no witness for it: `catalog/`, `prov`, tenant `idem/`, tenant `admission/`,
+/// and the tenant-scoped `config` record. Every one is a real `t/<hash>/...`
+/// object key the templates grant an action on, written here as a literal
+/// because no crate constructor in `ravel-commit` builds it (fold writes catalog
+/// objects, the log-segment writer writes prov, ingest writes idem and admission
+/// markers, and `config` is built by `config_key` in `ravel-catalog`, which this
+/// crate cannot depend on without a cycle).
 ///
 /// Without these, the two overlap mechanisms
 /// (`delete_deny_and_allow_overlap_exactly_where_expected` and
@@ -297,6 +299,11 @@ fn constructor_free_tenant_witness_keys() -> Vec<String> {
         keys.push(format!("t/{hash}/{prefix}/idem/{hash}"));
         keys.push(format!("t/{hash}/{prefix}/admission/writer-0"));
     }
+    // The tenant config record (`config_key`, `crates/ravel-catalog`) is
+    // tenant-scoped, not per-signal (ADR-0066 decision 6), so it is added once
+    // rather than inside the signal loop. The three server roles read it and
+    // `t/*/config` is the grant that reaches it.
+    keys.push(format!("t/{hash}/config"));
     keys
 }
 
@@ -337,8 +344,18 @@ fn assert_pattern_is_witnessed(role: &str, class: &str, pattern: &str) {
 }
 
 /// Policy prefixes naming keyspaces `ravel-commit` has no key constructor
-/// for. Matched as plain substrings against the raw pattern text.
-const OUT_OF_SCOPE_PATTERNS: &[&str] = &["idem/", "/prov", "catalog/", "admission/", "sys/"];
+/// for. Matched as plain substrings against the raw pattern text. `/config` is
+/// here for the same reason `/prov` and `catalog/` are: `config_key` lives in
+/// `ravel-catalog`, which this crate cannot depend on without a cycle, so the
+/// tenant config record has no `ravel-commit` constructor to produce a witness.
+const OUT_OF_SCOPE_PATTERNS: &[&str] = &[
+    "idem/",
+    "/prov",
+    "catalog/",
+    "admission/",
+    "sys/",
+    "/config",
+];
 
 fn is_out_of_scope(pattern: &str) -> bool {
     OUT_OF_SCOPE_PATTERNS
@@ -1758,7 +1775,11 @@ const TENANT_KMS_KEY_ARN: &str =
 
 /// The `DenyDeleteProtected` resource set shared by gateway, query, and admin:
 /// the three singleton control objects, the per-tenant provenance record, the
-/// whole catalog keyspace, and the legal-hold audit shard (ADR-0055 section 3).
+/// whole catalog keyspace, and the legal-hold audit shard (ADR-0055 section 3),
+/// plus the durable bearer-token map `sys/auth` and the write-once recovery
+/// manifests `sys/t/*` (the control-plane key amendment: a deleted `sys/auth`
+/// reads as absent and installs an empty token map, revoking every durable
+/// token, and `sys/t/*` recovery manifests are write-once, ADR-0050).
 /// Maintain's own `DenyDeleteProtected` differs (see
 /// `MAINTAIN_PROTECTED_DELETE_KEYS`): its catalog entry is narrowed to the
 /// HEAD pointer alone, because `MaintainDelete` grants it delete on the
@@ -1774,6 +1795,8 @@ const PROTECTED_DELETE_KEYS: &[&str] = &[
     "t/*/*/prov",
     "t/*/catalog/*/*",
     "t/*/u/*/0000/*",
+    "sys/auth",
+    "sys/t/*",
 ];
 
 /// Maintain's `DenyDeleteProtected` resource set: same as `PROTECTED_DELETE_KEYS`
@@ -1791,6 +1814,8 @@ const MAINTAIN_PROTECTED_DELETE_KEYS: &[&str] = &[
     "t/*/*/prov",
     "t/*/catalog/*/HEAD",
     "t/*/u/*/0000/*",
+    "sys/auth",
+    "sys/t/*",
 ];
 
 /// The `DenyDeleteProtected` action set, identical in all four templates: both
@@ -1862,6 +1887,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/qualification",
             "sys/gc",
             "sys/auth",
+            "t/*/config",
         ],
         get_actions: &["s3:GetObject"],
         puts: &[
@@ -1911,6 +1937,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/gc",
             "sys/auth",
             "sys/query/workers/*",
+            "t/*/config",
         ],
         get_actions: &["s3:GetObject"],
         puts: &[
@@ -2046,6 +2073,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/qualification",
             "sys/gc",
             "sys/maintain/*",
+            "t/*/config",
         ],
         get_actions: &["s3:GetObject"],
         puts: &[
@@ -2600,6 +2628,8 @@ fn no_delete_allow_reaches_the_disjoint_protected_keyspaces() {
         "sys/gc",
         "t/*/*/prov",
         "t/*/catalog/*/HEAD",
+        "sys/auth",
+        "sys/t/*",
     ];
     // Pin DISJOINT_PROTECTED to its own definition so it cannot drift from the
     // protected list it is carved out of. It must be exactly
@@ -4031,6 +4061,84 @@ fn gateway_template_covers_the_recovery_manifest_write() {
         &manifest,
         MANIFEST_SCOPE,
     );
+}
+
+/// `read_config` / `read_config_values` (`crates/ravel-catalog/src/tenant_config.rs`)
+/// GETs `t/<tenant_hash>/config`, the tenant config record (ADR-0066 decision 6,
+/// `config_key`). It propagates every store error except `NotFound`, so a
+/// refused GET is not read as "no overrides" but fails each reading role in its
+/// own mode:
+///
+/// - Maintain: `resolve_retention_window_ns`
+///   (`crates/ravel-maintain/src/retention.rs`) maps the error to
+///   `MaintainError::Invariant`, failing every retention pass.
+/// - Query: `DeclaredColumnSource::declared_columns`
+///   (`services/ravel-server/src/declared_columns.rs`, reached from
+///   `SqlExecutor::resolve_declared_columns`) never resolves the durable
+///   `typed_attr_columns` override, so queries run on the base schema.
+/// - Gateway: `refresh_tenant_limits_once`
+///   (`services/ravel-server/src/lifecycle_refresh.rs`) fails every cycle, so
+///   per-tenant admission overrides never apply.
+///
+/// The config key is tenant-scoped, not per-signal, so the witness is built from
+/// `hash16()` to match the one `constructor_free_tenant_witness_keys` adds to the
+/// domain. The only production writer is `ravel-cli` under Admin
+/// (`set_tenant_config`); no server role writes it, so no server template gains a
+/// write grant here.
+#[test]
+fn config_reading_roles_read_the_tenant_config_record() {
+    let config = format!("t/{}/config", hash16());
+    for role in ["gateway", "query", "maintain"] {
+        let gets = key_patterns_for(&load_policy(role), &["s3:GetObject"], Some("Allow"));
+        assert!(
+            gets.iter().any(|p| glob_matches(p, &config)),
+            "{role}: no GetObject Allow reaches the tenant config record \
+             {config:?}, which this role's mode reads and propagates on any \
+             store error but NotFound. Grants: {gets:?}"
+        );
+        assert_reaches_nothing_outside(role, "s3:GetObject Allow", &gets, &config, &config);
+    }
+}
+
+/// `sys/auth` (the durable bearer-token map) and `sys/t/*` (the write-once
+/// recovery manifests, ADR-0050) are create-once control-plane keys no role
+/// deletes on its normal path, so every template's `DenyDeleteProtected` must
+/// cover them. A deleted `sys/auth` reads as absent and installs an empty token
+/// map, silently revoking every durable token
+/// (`services/ravel-server/src/lifecycle_refresh.rs`); a `sys/t/*` manifest is
+/// write-once. This fails if either key leaves any role's Deny set, and if any
+/// role grants a delete Allow on either (nothing does, so the Deny is
+/// belt-and-suspenders; `no_delete_allow_reaches_the_disjoint_protected_keyspaces`
+/// asserts the disjointness, this pins the Deny itself).
+#[test]
+fn sys_auth_and_recovery_manifests_are_delete_protected_in_every_role() {
+    const AUTH_KEY: &str = "sys/auth";
+    let manifest = format!("sys/t/{}", test_tenant().to_hex());
+    for role in ALL_ROLES {
+        let policy = load_policy(role);
+        let denies = delete_key_patterns(&policy, "Deny");
+        assert!(
+            denies.iter().any(|p| glob_matches(p, AUTH_KEY)),
+            "{role}: no delete Deny reaches {AUTH_KEY:?}; a deleted token map \
+             reads as absent and revokes every durable token. Deny: {denies:?}"
+        );
+        assert!(
+            denies.iter().any(|p| glob_matches(p, &manifest)),
+            "{role}: no delete Deny reaches the recovery manifest {manifest:?}, \
+             which is write-once (ADR-0050). Deny: {denies:?}"
+        );
+        let allows = delete_key_patterns(&policy, "Allow");
+        assert!(
+            !allows.iter().any(|p| glob_matches(p, AUTH_KEY)),
+            "{role}: a delete Allow reaches {AUTH_KEY:?}; nothing deletes the \
+             token map. Allow: {allows:?}"
+        );
+        assert!(
+            !allows.iter().any(|p| glob_matches(p, &manifest)),
+            "{role}: a delete Allow reaches {manifest:?}; recovery manifests are \
+             write-once. Allow: {allows:?}"
+        );
+    }
 }
 
 /// One statement reduced to what an Allow/Deny overlap check needs: which

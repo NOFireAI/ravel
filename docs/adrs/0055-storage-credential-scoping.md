@@ -176,9 +176,9 @@ the final `sys/qualification` record. All four are corrected in place above
 rather than left wrong with a note, since this ADR had not yet been acted
 on by any deployment at the time of correction.
 
-The table also omits the control-plane keys `sys/auth`, `sys/t/<hash>` and
-the `sys/maintain/memo/` listing; the control-plane key amendment below adds
-them.
+The table also omits the control-plane keys `sys/auth`, `sys/t/<hash>`, the
+`sys/maintain/memo/` listing, and the tenant config record `t/<hash>/config`;
+the control-plane key amendment below adds them.
 
 This is not a literal "ingest, compaction, query, and sweep" four-way split
 — sweep is not split into its own process here. Sweep
@@ -325,6 +325,11 @@ where the backend distinguishes it, `s3:DeleteObjectVersion`) on:
 - `t/<hash>/u/<AUDIT_HOLD_SHARD>/**` (legal-hold records only — the query-audit
   shard was removed from this deny by the query-audit shard amendment below,
   so it can be age-swept; legal-hold shard 0 stays deny-delete-forever)
+- `sys/auth` and `sys/t/<hash>`, added by the control-plane key amendment below:
+  a deleted `sys/auth` reads as absent and installs an empty token map, silently
+  revoking every durable token, and `sys/t/<hash>` recovery manifests are
+  write-once (ADR-0050). No role grants a delete on either, so the deny is
+  belt-and-suspenders like the other create-once keys here.
 
 This closes the brick-the-deployment risk directly: nobody, including a fully compromised Maintain
 process, can delete `sys/tenancy` and brick every process's fail-closed
@@ -968,10 +973,10 @@ amendment's sentence that left this case undecided.
 
 ## Amendment (2026-10-01): the control-plane keys each role reads and writes
 
-<!-- amendment-applies: sections="1. Four roles, mapped to existing process boundaries" pointer="control-plane key amendment" -->
+<!-- amendment-applies: sections="1. Four roles, mapped to existing process boundaries|3. Deny-delete, everywhere, on the four prefixes nothing deletes" pointer="control-plane key amendment" -->
 
 §1's table was derived from the data-path call sites and left
-out three control-plane keys the code reads or writes in a named role's
+out four control-plane keys the code reads or writes in a named role's
 mode. IAM is default-deny, so each omission was a refused request under the
 shipped templates. The grants below are the narrowest that cover each call:
 
@@ -998,6 +1003,23 @@ shipped templates. The grants below are the narrowest that cover each call:
   not, and a refused LIST degrades to a cold start: each maintain cycle logs
   a warning and retries.
   `MaintainList` gains `sys/maintain/memo/*`.
+- **`t/<hash>/config`, the tenant config record (ADR-0066 decision 6).** It is
+  tenant-scoped, not per-signal, and `read_config` GETs it and propagates every
+  store error except `NotFound`, so a refused GET is not read as "no overrides"
+  but fails each reading role in its own mode: Maintain's
+  `resolve_retention_window_ns` maps it to `MaintainError::Invariant` and every
+  retention pass fails; Query's declared-columns source never resolves the
+  durable `typed_attr_columns` override, so queries run on the base schema; and
+  Gateway's lifecycle config-limits refresh fails every cycle, so per-tenant
+  admission overrides never apply. `MaintainRead`, `QueryRead` and `GatewayRead`
+  gain `t/*/config`; Admin already reads it through its blanket `t/*`. The only
+  production writer is `ravel-cli` under Admin (`set_tenant_config`); no server
+  role writes it, so no server template gains a write grant.
+
+`sys/auth` and `sys/t/*` also join the §3 deny-delete set in every template: no
+role deletes either on its normal path, a deleted `sys/auth` reads as absent and
+installs an empty token map that revokes every durable token, and `sys/t/*`
+recovery manifests are write-once (ADR-0050).
 
 Two candidates were examined and are not granted. Query still deletes
 nothing: a draining query worker overwrites its own record and Maintain
@@ -1006,4 +1028,4 @@ still cannot create `sys/gc`: every mode runs the bootstrap at startup, but
 §4 keeps creation with Maintain and Admin, and the deployment guides and
 the operator start Maintain first on a fresh bucket for that reason.
 
-Recorded as an appended amendment, with an inline pointer added to §1.
+Recorded as an appended amendment, with an inline pointer added to §1 and §3.
