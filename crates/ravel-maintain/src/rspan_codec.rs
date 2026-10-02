@@ -97,7 +97,12 @@
 //! [`PartBuilder`] and
 //! [`CompactorConfig::l1_part_memory_target_bytes`] say the same thing.
 //! RSPAN carries only that one target; the stored-size
-//! target the RLOG merge grew (issue #872) has no RSPAN counterpart yet. The
+//! target the RLOG merge grew (issue #872) has no RSPAN counterpart yet. For
+//! that reason the target the binaries derive from the memory budget (issue
+//! #2351) does not reach this merge: it goes to
+//! [`CompactorConfig::rlog_l1_part_memory_target_bytes`], and this merge reads
+//! [`CompactorConfig::l1_part_memory_target_bytes`], which stays at 256 MiB
+//! unless the operator sets the knob. The
 //! [`crate::config::MergeMemoryTracker`]
 //! seam accounts these terms at their real allocation/decode points, the same
 //! seam RLOG's merge feeds.
@@ -1309,6 +1314,65 @@ mod tests {
         let mut expected = a.clone();
         expected.extend(b.clone());
         assert_eq!(canon_multiset(&l1), canon_multiset(&expected));
+    }
+
+    /// The RSPAN merge splits at `l1_part_memory_target_bytes` and ignores the
+    /// RLOG-only `rlog_l1_part_memory_target_bytes`, which is where the
+    /// binaries put a target derived from the memory budget (issue #2351).
+    ///
+    /// Distinguishing:
+    /// - The merge reading `rlog_memory_target_bytes()` (RSPAN taking the
+    ///   derived target): the `rlog_large` run is one part, not the split set,
+    ///   and the `rlog_small` run splits.
+    /// - The merge taking the smaller of the two fields: the `rlog_small` run
+    ///   splits instead of producing one part.
+    #[tokio::test]
+    async fn rspan_merge_ignores_the_rlog_only_memory_target() {
+        let mk = |name_suffix: u8| -> Vec<SpanRecord> {
+            (0..20u8)
+                .map(|t| span(t, name_suffix, i64::from(t), i64::from(t) + 1))
+                .collect()
+        };
+        let part_hashes = |config: CompactorConfig| {
+            let (a, b) = (mk(0), mk(1));
+            async move {
+                let store = MemoryStore::new();
+                seed(&store, Uuid::from_u128(1), 1, &a).await;
+                seed(&store, Uuid::from_u128(2), 2, &b).await;
+                let clock = FixedClock::new(sealed_now_ns());
+                compact_bucket(&store, &clock, &config, &bucket())
+                    .await
+                    .expect("compact");
+                let (rec, _parts) = read_output(&store).await;
+                rec.parts
+                    .iter()
+                    .map(|p| p.content_hash.clone())
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        let split = part_hashes(CompactorConfig {
+            l1_part_memory_target_bytes: 256,
+            ..CompactorConfig::default()
+        })
+        .await;
+        assert!(split.len() >= 2, "a 256-byte target must split");
+
+        let rlog_large = part_hashes(CompactorConfig {
+            l1_part_memory_target_bytes: 256,
+            rlog_l1_part_memory_target_bytes: Some(u64::MAX),
+            ..CompactorConfig::default()
+        })
+        .await;
+        assert_eq!(rlog_large, split);
+
+        let rlog_small = part_hashes(CompactorConfig {
+            l1_part_memory_target_bytes: u64::MAX,
+            rlog_l1_part_memory_target_bytes: Some(256),
+            ..CompactorConfig::default()
+        })
+        .await;
+        assert_eq!(rlog_small.len(), 1);
     }
 
     #[tokio::test]

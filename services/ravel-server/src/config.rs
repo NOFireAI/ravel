@@ -848,13 +848,14 @@ pub struct Cli {
     #[arg(long = "maintain-compaction-zstd-level", value_name = "LEVEL")]
     pub maintain_compaction_zstd_level: Option<i32>,
 
-    /// The decoded record-heap size at which an L1 compaction closes an
-    /// in-progress part (the memory split target; a part also closes at the
-    /// 256 MiB stored-size target, whichever comes first). Omitted, it is
-    /// derived from the memory budget as budget / 8 /
-    /// --maintain-unit-concurrency, clamped to [256 MiB, 8 GiB], or 256 MiB
-    /// when the host memory is unknown; the startup log names the value and its
-    /// source. Zero is refused at startup.
+    /// The decoded record-heap size at which an L1 log or span compaction
+    /// closes an in-progress part (the memory split target; a log part also
+    /// closes at the 256 MiB stored-size target, whichever comes first).
+    /// Omitted, the log target is derived from the memory budget as budget / 8
+    /// / --maintain-unit-concurrency, clamped to [256 MiB, 8 GiB], or 256 MiB
+    /// when the host memory is unknown, and the span target is 256 MiB; the
+    /// startup log names both values and the log target's source. Zero is
+    /// refused at startup.
     #[arg(long = "maintain-l1-part-memory-target-bytes", value_name = "BYTES")]
     pub maintain_l1_part_memory_target_bytes: Option<u64>,
 
@@ -5917,8 +5918,10 @@ impl Cli {
     /// runs with: the GC durations from `gc_runtime` (the same values the
     /// `sys/gc` validation checks) plus every `--maintain-*` and retention
     /// window flag, with the compiled-in defaults for the rest. The memory
-    /// split target comes from [`Self::resolve_l1_part_memory_target`] and is
-    /// logged once, as a `performance default resolved` line.
+    /// split target comes from [`Self::resolve_l1_part_memory_target`], is
+    /// written with [`ravel_maintain::ResolvedL1PartMemoryTarget::apply_to`]
+    /// (a derived value reaches the RLOG merge only), and is logged once, as a
+    /// `performance default resolved` line.
     pub fn resolve_compactor_config(
         &self,
         gc_runtime: &GcRuntimeConfig,
@@ -5927,26 +5930,6 @@ impl Cli {
         use anyhow::Context;
 
         let memory_target = self.resolve_l1_part_memory_target(performance)?;
-        tracing::info!(
-            setting = "l1_part_memory_target_bytes",
-            value = memory_target.bytes,
-            source = memory_target.source_name(),
-            resolution = %memory_target,
-            "performance default resolved"
-        );
-        // A gateway runs no compaction, so its not-applicable budget is not
-        // worth a warning.
-        if memory_target.source == ravel_maintain::L1PartMemoryTargetSource::Fallback
-            && !performance.memory_budget_not_applicable
-        {
-            tracing::warn!(
-                value = memory_target.bytes,
-                "l1_part_memory_target_bytes fell back to 256 MiB: the memory budget is unknown, \
-                 so L1 parts on a wide schema stay small; set \
-                 --maintain-l1-part-memory-target-bytes to size them"
-            );
-        }
-
         let interior_reverify_ns = self
             .parse_maintain_interior_reverify()
             .context("failed to parse --maintain-interior-reverify")?;
@@ -5965,7 +5948,7 @@ impl Cli {
         let rlog_zstd_level = self
             .parse_maintain_compaction_zstd_level()
             .context("failed to parse --maintain-compaction-zstd-level")?;
-        Ok(ravel_maintain::CompactorConfig {
+        let mut config = ravel_maintain::CompactorConfig {
             protection_horizon_ns: gc_runtime.protection_horizon_ns,
             grace_ns: gc_runtime.grace_ns,
             max_flush_lifetime_ns: gc_runtime.max_flush_lifetime_ns,
@@ -5976,9 +5959,30 @@ impl Cli {
             claim_lease_duration,
             claim_min_input_bytes,
             rlog_zstd_level,
-            l1_part_memory_target_bytes: memory_target.bytes,
             ..ravel_maintain::CompactorConfig::default()
-        })
+        };
+        memory_target.apply_to(&mut config);
+        tracing::info!(
+            setting = "l1_part_memory_target_bytes",
+            value = memory_target.bytes,
+            source = memory_target.source_name(),
+            resolution = %memory_target,
+            rspan_value = config.l1_part_memory_target_bytes,
+            "performance default resolved"
+        );
+        // Only a maintain process runs compaction (`MaintenanceTaskConfig::
+        // enabled`), so only there is a fallback target worth a warning.
+        if memory_target.source == ravel_maintain::L1PartMemoryTargetSource::Fallback
+            && matches!(self.mode, Mode::Maintain)
+        {
+            tracing::warn!(
+                value = memory_target.bytes,
+                "l1_part_memory_target_bytes fell back to 256 MiB: the memory budget is unknown, \
+                 so L1 parts on a wide schema stay small; set \
+                 --maintain-l1-part-memory-target-bytes to size them"
+            );
+        }
+        Ok(config)
     }
 
     /// Parse `--idle-tenant-state-ttl` into a duration (ADR-0069 decision 2),
@@ -12443,8 +12447,10 @@ mod tests {
     /// concurrency 1 it is 3758096384; a 128 GiB host clamps to 8 GiB.
     ///
     /// Non-vacuity (prove-the-test), each flip named:
-    /// - Keep the struct default (drop `l1_part_memory_target_bytes:
-    ///   memory_target.bytes`): every derived row reads 268435456.
+    /// - Keep the struct default (drop `memory_target.apply_to(&mut config)`):
+    ///   every derived row reads 268435456.
+    /// - Write the derived value into the field the RSPAN merge reads: the
+    ///   `rspan_value` and RSPAN assertions read 939524096 and 8589934592.
     /// - Ignore the unit concurrency: the default row reads 3758096384, not
     ///   939524096.
     /// - Drop the clamp: the 128 GiB row reads 16911433728 (126 GiB / 8).
@@ -12454,7 +12460,11 @@ mod tests {
         let (lines, guard) = capture_events(tracing::Level::INFO);
         let default = compactor(&[]).expect("default");
         drop(guard);
-        assert_eq!(default.l1_part_memory_target_bytes, 939_524_096);
+        assert_eq!(default.rlog_memory_target_bytes(), 939_524_096);
+        assert_eq!(
+            default.l1_part_memory_target_bytes, 268_435_456,
+            "the RSPAN merge keeps 256 MiB without the flag"
+        );
         let lines = lines.lock().clone();
         let resolved: Vec<&String> = lines
             .iter()
@@ -12466,6 +12476,7 @@ mod tests {
         assert_eq!(resolved.len(), 1, "exactly one resolved line: {lines:?}");
         let line = resolved[0];
         assert!(line.contains(" value=939524096"), "{line}");
+        assert!(line.contains(" rspan_value=268435456"), "{line}");
         assert!(line.contains(" source=\"derived\""), "{line}");
         assert!(
             line.contains(
@@ -12478,13 +12489,13 @@ mod tests {
         assert_eq!(
             compactor(&["--maintain-unit-concurrency", "1"])
                 .expect("concurrency 1")
-                .l1_part_memory_target_bytes,
+                .rlog_memory_target_bytes(),
             3_758_096_384
         );
         assert_eq!(
             compactor(&["--maintain-unit-concurrency", "2"])
                 .expect("concurrency 2")
-                .l1_part_memory_target_bytes,
+                .rlog_memory_target_bytes(),
             1_879_048_192
         );
 
@@ -12496,12 +12507,11 @@ mod tests {
         let performance = big
             .resolve_performance(HostProfile::new(REFERENCE_CORES, Some(128 << 30)))
             .expect("performance defaults resolve");
-        assert_eq!(
-            big.resolve_compactor_config(&gc_runtime, &performance)
-                .expect("128 GiB host")
-                .l1_part_memory_target_bytes,
-            8_589_934_592
-        );
+        let big_config = big
+            .resolve_compactor_config(&gc_runtime, &performance)
+            .expect("128 GiB host");
+        assert_eq!(big_config.rlog_memory_target_bytes(), 8_589_934_592);
+        assert_eq!(big_config.l1_part_memory_target_bytes, 268_435_456);
 
         // An unknown host memory falls back to 256 MiB.
         let unknown = cli(&[]);
@@ -12513,6 +12523,37 @@ mod tests {
             .expect("fallback");
         assert_eq!(target.bytes, 268_435_456);
         assert_eq!(target.source_name(), "fallback");
+    }
+
+    /// The 256 MiB fallback warning is logged by a maintain process only, the
+    /// one mode that runs compaction (`MaintenanceTaskConfig::enabled`).
+    ///
+    /// Distinguishing: the earlier gate (`!memory_budget_not_applicable`) also
+    /// warns in `all` and `query`, whose counts then read 1; no gate at all
+    /// also warns in `gateway`; a dropped warning reads 0 for `maintain`.
+    #[test]
+    fn fallback_memory_target_warning_is_logged_in_maintain_mode_only() {
+        for (mode, want) in [("maintain", 1), ("all", 0), ("query", 0), ("gateway", 0)] {
+            let cli = cli(&["--mode", mode]);
+            let gc_runtime = cli
+                .resolve_gc_runtime(Duration::from_secs(30))
+                .expect("gc runtime");
+            let performance = cli
+                .resolve_performance(HostProfile::new(REFERENCE_CORES, None))
+                .expect("performance defaults resolve");
+            let (lines, guard) = capture_events(tracing::Level::WARN);
+            let config = cli
+                .resolve_compactor_config(&gc_runtime, &performance)
+                .expect("compactor config");
+            drop(guard);
+            assert_eq!(config.rlog_memory_target_bytes(), 268_435_456, "{mode}");
+            let count = lines
+                .lock()
+                .iter()
+                .filter(|l| l.contains("l1_part_memory_target_bytes fell back to 256 MiB"))
+                .count();
+            assert_eq!(count, want, "mode {mode}");
+        }
     }
 
     /// `--maintain-l1-part-memory-target-bytes` wins over the derivation
@@ -12530,6 +12571,7 @@ mod tests {
                 compactor(&["--maintain-l1-part-memory-target-bytes", flag]).expect("flag");
             drop(guard);
             assert_eq!(config.l1_part_memory_target_bytes, want);
+            assert_eq!(config.rlog_memory_target_bytes(), want);
             let lines = lines.lock().clone();
             assert!(
                 lines.iter().any(|l| {

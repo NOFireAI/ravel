@@ -323,7 +323,10 @@ async fn resolve_already_exists(
                 // compaction loser released its bytes at PUT (ADR-0979 decision
                 // 3, `bytes` is `None`), so it takes the cannot-repair arm; the
                 // record is still the truth and re-running the compaction from
-                // scratch rebuilds and re-PUTs the byte-identical part.
+                // scratch rebuilds and re-PUTs the byte-identical part, provided
+                // the rerun uses the winner's part-split settings: part
+                // boundaries depend on them, and they are not part of the
+                // record's identity (issue #2351).
                 match our_parts.iter().find(|p| p.key == part_key) {
                     Some(ours) if ours.bytes.is_some() => {
                         // A repair re-PUT is a part PUT: it is attributed to

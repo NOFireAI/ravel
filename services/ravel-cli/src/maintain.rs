@@ -234,12 +234,14 @@ pub enum CompactorKnobError {
 /// replaces [`CompactorConfig::rlog_zstd_level`] and is refused outside the
 /// range [`ravel_maintain::validate_rlog_zstd_level`] accepts.
 ///
-/// Without an override the memory split target is derived from
-/// `host_memory_total_bytes` (the host's MemTotal, see
+/// Without an override the RLOG merge's memory split target is derived from
+/// `host_memory_total_bytes` (the host's memory capped by a cgroup limit, see
 /// [`ravel_maintain::detect_host_memory_total_bytes`]) over
 /// `concurrent_merges` with [`ResolvedL1PartMemoryTarget::resolve`], and an
-/// unknown host memory falls back to 256 MiB. The resolution is returned
-/// beside the config so the caller can report where the value came from.
+/// unknown host memory falls back to 256 MiB. The RSPAN merge keeps 256 MiB
+/// unless the override is given ([`ResolvedL1PartMemoryTarget::apply_to`]).
+/// The resolution is returned beside the config so the caller can report where
+/// the value came from.
 #[allow(clippy::too_many_arguments)]
 pub fn build_compactor_config(
     dry_run: bool,
@@ -267,7 +269,7 @@ pub fn build_compactor_config(
         host_memory_total_bytes,
         concurrent_merges,
     );
-    config.l1_part_memory_target_bytes = memory_target.bytes;
+    memory_target.apply_to(&mut config);
     if let Some(bytes) = max_l1_part_bytes {
         if bytes == 0 {
             return Err(CompactorKnobError::ZeroMaxL1PartBytes);
@@ -309,7 +311,7 @@ pub fn l1_part_memory_target_fallback_note(
 /// Neither is an error: the command exits zero, as it does for a bucket that is
 /// not sealed yet.
 ///
-/// Thin wrapper over [`compact_to`] that writes the report to stdout.
+/// [`compact_with_part_split_targets`] with neither part-split override.
 #[allow(clippy::too_many_arguments)]
 pub async fn compact(
     store: Arc<dyn ObjectStoreBackend>,
@@ -320,6 +322,43 @@ pub async fn compact(
     hour: u32,
     dry_run: bool,
     max_flush_lifetime_ns: Option<i64>,
+    rlog_zstd_level: Option<i32>,
+    claims: &ClaimOptions,
+) -> anyhow::Result<()> {
+    compact_with_part_split_targets(
+        store,
+        selection,
+        tenant,
+        signal,
+        shard,
+        hour,
+        dry_run,
+        max_flush_lifetime_ns,
+        None,
+        None,
+        rlog_zstd_level,
+        claims,
+    )
+    .await
+}
+
+/// `maintain compact-bucket` with its `--l1-part-memory-target-bytes` and
+/// `--max-l1-part-bytes` overrides, each replacing the derived or default
+/// value when given. Thin wrapper over [`compact_to`] that writes the report
+/// to stdout and derives the memory split target from the detected host
+/// memory.
+#[allow(clippy::too_many_arguments)]
+pub async fn compact_with_part_split_targets(
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    signal: SignalArg,
+    shard: u32,
+    hour: u32,
+    dry_run: bool,
+    max_flush_lifetime_ns: Option<i64>,
+    l1_part_memory_target_bytes: Option<u64>,
+    max_l1_part_bytes: Option<u64>,
     rlog_zstd_level: Option<i32>,
     claims: &ClaimOptions,
 ) -> anyhow::Result<()> {
@@ -334,15 +373,20 @@ pub async fn compact(
         hour,
         dry_run,
         max_flush_lifetime_ns,
+        l1_part_memory_target_bytes,
+        max_l1_part_bytes,
         rlog_zstd_level,
+        ravel_maintain::detect_host_memory_total_bytes(),
         wall_clock()?,
         claims,
     )
     .await
 }
 
-/// [`compact`] with the report written to `out` and the bucket evaluated at
-/// `clock`. The store-selection header still prints to stdout.
+/// [`compact`] with the report written to `out`, the bucket evaluated at
+/// `clock`, and the memory split target derived from
+/// `host_memory_total_bytes` instead of the detected host memory. The
+/// store-selection header still prints to stdout.
 #[allow(clippy::too_many_arguments)]
 pub async fn compact_to(
     out: &mut dyn Write,
@@ -354,7 +398,10 @@ pub async fn compact_to(
     hour: u32,
     dry_run: bool,
     max_flush_lifetime_ns: Option<i64>,
+    l1_part_memory_target_bytes: Option<u64>,
+    max_l1_part_bytes: Option<u64>,
     rlog_zstd_level: Option<i32>,
+    host_memory_total_bytes: Option<u64>,
     clock: FixedClock,
     claims: &ClaimOptions,
 ) -> anyhow::Result<()> {
@@ -363,11 +410,11 @@ pub async fn compact_to(
     let (mut config, memory_target) = build_compactor_config(
         dry_run,
         max_flush_lifetime_ns,
-        None,
-        None,
+        l1_part_memory_target_bytes,
+        max_l1_part_bytes,
         None,
         rlog_zstd_level,
-        ravel_maintain::detect_host_memory_total_bytes(),
+        host_memory_total_bytes,
         1,
     )?;
     if let Some(note) = l1_part_memory_target_fallback_note(&memory_target) {
@@ -391,6 +438,12 @@ pub async fn compact_to(
 
     writeln!(out, "dry_run: {dry_run}")?;
     writeln!(out, "l1_part_memory_target_bytes: {memory_target}")?;
+    writeln!(
+        out,
+        "rspan_l1_part_memory_target_bytes: {}",
+        config.l1_part_memory_target_bytes
+    )?;
+    writeln!(out, "max_l1_part_bytes: {}", config.max_l1_part_bytes)?;
     writeln!(out, "{claims_line}")?;
     let outcome = match outcome {
         ClaimedCompaction::Ran(outcome) => outcome,
@@ -719,6 +772,7 @@ pub async fn compact_tenant(
         input_read_concurrency,
         bucket_concurrency,
         rlog_zstd_level,
+        ravel_maintain::detect_host_memory_total_bytes(),
         now_ns,
         claims,
     )
@@ -730,7 +784,8 @@ pub async fn compact_tenant(
 /// goes through `out`, so the whole output is capturable byte-for-byte; the
 /// store-selection header still prints via [`StoreSelection::print_header`] to
 /// stdout. Per-bucket lines stream in walk order as their contiguous prefix
-/// completes (see [`run_bucket_walk`]).
+/// completes (see [`run_bucket_walk`]). The memory split target is derived from
+/// `host_memory_total_bytes`, which [`compact_tenant`] reads from the host.
 #[allow(clippy::too_many_arguments)]
 pub async fn compact_tenant_to(
     out: &mut dyn Write,
@@ -748,6 +803,7 @@ pub async fn compact_tenant_to(
     input_read_concurrency: Option<usize>,
     bucket_concurrency: usize,
     rlog_zstd_level: Option<i32>,
+    host_memory_total_bytes: Option<u64>,
     now_ns: i64,
     claims: &ClaimOptions,
 ) -> anyhow::Result<CompactTenantReport> {
@@ -766,7 +822,7 @@ pub async fn compact_tenant_to(
         max_l1_part_bytes,
         input_read_concurrency,
         rlog_zstd_level,
-        ravel_maintain::detect_host_memory_total_bytes(),
+        host_memory_total_bytes,
         bucket_concurrency,
     )?;
     let claims_line = install_claims(&mut config, dry_run, claims);
@@ -807,6 +863,11 @@ pub async fn compact_tenant_to(
         config.max_flush_lifetime_ns
     )?;
     writeln!(out, "l1_part_memory_target_bytes: {memory_target}")?;
+    writeln!(
+        out,
+        "rspan_l1_part_memory_target_bytes: {}",
+        config.l1_part_memory_target_bytes
+    )?;
     writeln!(out, "max_l1_part_bytes: {}", config.max_l1_part_bytes)?;
     writeln!(
         out,

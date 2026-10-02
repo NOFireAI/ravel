@@ -1444,6 +1444,23 @@ enum MaintainCommand {
         #[arg(long, value_name = "DURATION",
               value_parser = parse_max_flush_lifetime_ns)]
         max_flush_lifetime: Option<i64>,
+        /// The decoded record-heap size at which a merge closes an in-progress
+        /// L1 segment (a split target, not a peak-memory bound: a span merge
+        /// can overshoot it by a whole trace). Applies to log and span merges.
+        /// Refused at 0. Default for log merges: derived from the host's
+        /// memory (MemTotal capped by a cgroup memory limit) / 8, clamped to
+        /// [256 MiB, 8 GiB]; 256 MiB when the host memory cannot be read.
+        /// Default for span merges: 256 MiB. Part boundaries depend on it, so
+        /// two runs over one bucket cut the same parts only at the same value.
+        #[arg(long, value_name = "BYTES")]
+        l1_part_memory_target_bytes: Option<u64>,
+        /// Bound the encoded/on-object bytes a log or metrics merge writes
+        /// before it closes an L1 segment (the stored-size target). A segment
+        /// closes on whichever of this and --l1-part-memory-target-bytes is
+        /// reached first. Refused at 0. Default 256 MiB (the compactor
+        /// default).
+        #[arg(long, value_name = "BYTES")]
+        max_l1_part_bytes: Option<u64>,
         /// The zstd level an RLOG compaction writes its L1 segments at. Higher
         /// levels store smaller segments for more compaction CPU; reads decode
         /// any level the same way. Refused outside 1..=22. Default 9 (the
@@ -1503,17 +1520,19 @@ enum MaintainCommand {
         /// L1 segment (a split target, not a peak-memory bound: a merge can
         /// overshoot it, e.g. by a whole trace on the RSPAN path, so size the
         /// host for path-specific overshoot). Lower it for smaller segments on a
-        /// small host; raise it for fewer, larger segments. Refused at 0.
-        /// Default: derived from the host's memory as MemTotal / 8 /
+        /// small host; raise it for fewer, larger segments. Applies to log and
+        /// span merges. Refused at 0. Default for log merges: derived from the
+        /// host's memory (MemTotal capped by a cgroup memory limit) / 8 /
         /// --bucket-concurrency, clamped to [256 MiB, 8 GiB]; 256 MiB when the
-        /// host memory cannot be read. The report prints the value and where it
-        /// came from.
+        /// host memory cannot be read. Default for span merges: 256 MiB. The
+        /// report prints the value and where it came from.
         #[arg(long, value_name = "BYTES")]
         l1_part_memory_target_bytes: Option<u64>,
-        /// Bound the encoded/on-object bytes a merge writes before it closes an
-        /// L1 segment (the stored-size target). A segment closes on whichever of this
-        /// and --l1-part-memory-target-bytes is reached first. Refused at 0.
-        /// Default 256 MiB (the compactor default).
+        /// Bound the encoded/on-object bytes a log or metrics merge writes
+        /// before it closes an L1 segment (the stored-size target). A segment
+        /// closes on whichever of this and --l1-part-memory-target-bytes is
+        /// reached first. Refused at 0. Default 256 MiB (the compactor
+        /// default).
         #[arg(long, value_name = "BYTES")]
         max_l1_part_bytes: Option<u64>,
         /// Number of per-input reads a compaction keeps in flight at once (the
@@ -1537,8 +1556,8 @@ enum MaintainCommand {
         /// compact-tenant sets each bucket's budget to 20 GiB / N (integer
         /// division, floor). So each concurrent bucket may hold up to ~20 GiB / N
         /// of cursor budget plus its in-progress writer split target
-        /// (--l1-part-memory-target-bytes, by default MemTotal / 8 / N clamped
-        /// to [256 MiB, 8 GiB]): on a 30 GiB host at N=1 one bucket may hold
+        /// (--l1-part-memory-target-bytes, for a log merge by default the
+        /// host's memory / 8 / N clamped to [256 MiB, 8 GiB]): on a 30 GiB host at N=1 one bucket may hold
         /// ~20 GiB + 3.75 GiB; at N=4 each of the four holds up to ~5 GiB +
         /// 960 MiB, so the aggregate stays ~20 GiB of cursor budget plus
         /// ~3.75 GiB of writer targets. Dividing the budget is
@@ -1909,10 +1928,12 @@ async fn main() -> anyhow::Result<()> {
                     dry_run,
                     no_claim,
                     max_flush_lifetime,
+                    l1_part_memory_target_bytes,
+                    max_l1_part_bytes,
                     compaction_zstd_level,
                 },
         } => {
-            maintain::compact(
+            maintain::compact_with_part_split_targets(
                 store::build_store(&cli.store)?,
                 cli.store.selection(),
                 &tenant,
@@ -1921,6 +1942,8 @@ async fn main() -> anyhow::Result<()> {
                 hour,
                 dry_run,
                 max_flush_lifetime,
+                l1_part_memory_target_bytes,
+                max_l1_part_bytes,
                 compaction_zstd_level,
                 &maintain::ClaimOptions::for_invocation(no_claim),
             )
@@ -4250,6 +4273,11 @@ mod tests {
             "--l1-part-memory-target-bytes must arrive in the config"
         );
         assert_eq!(
+            config.rlog_memory_target_bytes(),
+            12345,
+            "and reach the RLOG merge too"
+        );
+        assert_eq!(
             format!("l1_part_memory_target_bytes: {resolved}"),
             "l1_part_memory_target_bytes: 12345 (set by flag)",
             "the report line names the flag as the source"
@@ -4322,7 +4350,7 @@ mod tests {
                 1,
                 8_589_934_592,
                 "l1_part_memory_target_bytes: 8589934592 (resolved from a memory budget of \
-                 137438953472 over 1 concurrent merges)",
+                 137438953472 over 1 concurrent merge)",
             ),
             (
                 None,
@@ -4343,8 +4371,13 @@ mod tests {
             )
             .expect("no knobs build a config");
             assert_eq!(
-                config.l1_part_memory_target_bytes, want_bytes,
+                config.rlog_memory_target_bytes(),
+                want_bytes,
                 "host {host:?}"
+            );
+            assert_eq!(
+                config.l1_part_memory_target_bytes, 268_435_456,
+                "the RSPAN merge keeps 256 MiB without the flag, host {host:?}"
             );
             assert_eq!(
                 format!("l1_part_memory_target_bytes: {resolved}"),
@@ -4402,6 +4435,60 @@ mod tests {
                 want,
                 "and the ClaimOptions the command is dispatched with",
             );
+        }
+    }
+
+    /// `--l1-part-memory-target-bytes` and `--max-l1-part-bytes` parse on
+    /// `compact-bucket` into their own fields, and are `None` when absent
+    /// (issue #2351). The binary-level test in `tests/compact_tenant.rs` pins
+    /// that the dispatch passes them on.
+    ///
+    /// Distinguishing: without the fields on `CompactBucket` (or with
+    /// `#[arg(skip)]`), clap rejects the argument vector; with the two long
+    /// names swapped, the values arrive crossed (12345 and 67890 differ).
+    #[test]
+    fn compact_bucket_part_split_flags_parse_into_their_fields() {
+        let base = [
+            "ravel",
+            "maintain",
+            "compact-bucket",
+            "--tenant",
+            "acme",
+            "--signal",
+            "logs",
+            "--shard",
+            "0",
+            "--hour",
+            "100",
+        ];
+        for (argv_tail, want_memory, want_stored) in [
+            (Vec::new(), None, None),
+            (
+                vec![
+                    "--l1-part-memory-target-bytes",
+                    "12345",
+                    "--max-l1-part-bytes",
+                    "67890",
+                ],
+                Some(12345),
+                Some(67890),
+            ),
+        ] {
+            let cli = Cli::try_parse_from(base.iter().copied().chain(argv_tail.iter().copied()))
+                .unwrap_or_else(|e| panic!("compact-bucket {argv_tail:?} parses: {e}"));
+            let Command::Maintain {
+                command:
+                    super::MaintainCommand::CompactBucket {
+                        l1_part_memory_target_bytes,
+                        max_l1_part_bytes,
+                        ..
+                    },
+            } = cli.command
+            else {
+                panic!("expected the maintain compact-bucket subcommand");
+            };
+            assert_eq!(l1_part_memory_target_bytes, want_memory, "{argv_tail:?}");
+            assert_eq!(max_l1_part_bytes, want_stored, "{argv_tail:?}");
         }
     }
 

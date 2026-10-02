@@ -1147,6 +1147,7 @@ async fn streaming_preserves_walk_order_across_out_of_order_completion() {
         None,
         2,
         None,
+        None,
         now_ns(),
         &claims,
     );
@@ -1568,6 +1569,7 @@ async fn run_claim_walk(
         None,
         concurrency,
         None,
+        None,
         now_ns(),
         claims,
     )
@@ -1838,6 +1840,7 @@ async fn a_merge_longer_than_a_third_of_the_lease_renews_its_claim() {
         None,
         1,
         None,
+        None,
         now_ns(),
         &claims,
     );
@@ -1919,6 +1922,7 @@ async fn a_bucket_whose_claim_is_taken_over_mid_merge_is_reported_cancelled() {
         None,
         None,
         1,
+        None,
         None,
         now_ns(),
         &claims,
@@ -2011,6 +2015,9 @@ async fn compact_bucket_skips_a_claimed_bucket_and_no_claim_compacts_it() {
                 HOUR_OLD,
                 dry_run,
                 Some(0),
+                None,
+                None,
+                None,
                 None,
                 FixedClock::new(now_ns()),
                 &claims,
@@ -2148,6 +2155,9 @@ async fn compact_bucket_reports_a_claim_lost_mid_merge_and_exits_zero() {
         false,
         Some(0),
         None,
+        None,
+        None,
+        None,
         FixedClock::new(now_ns()),
         &claims,
     );
@@ -2205,71 +2215,190 @@ async fn compact_bucket_reports_a_claim_lost_mid_merge_and_exits_zero() {
     assert_eq!(store.requests_on("put", &key), 2);
 }
 
-/// The `l1_part_memory_target_bytes:` line of the compact-tenant report
-/// (issue #2351): with no flag it names the value derived from this host's
-/// memory over `--bucket-concurrency`, and with the flag it says the flag set
-/// it.
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// A dry-run `compact-tenant` over the seeded tenant at bucket concurrency 2,
+/// with the memory split target resolved from `host_memory` instead of the
+/// host's own memory. Returns the report text.
+async fn compact_tenant_report(flag: Option<u64>, host_memory: Option<u64>) -> String {
+    let store = seed_tenant().await;
+    let mut out: Vec<u8> = Vec::new();
+    compact_tenant_to(
+        &mut out,
+        store,
+        MEMORY,
+        TENANT,
+        SignalArg::Logs,
+        Some(SHARDS),
+        None,
+        None,
+        true,
+        None,
+        flag,
+        None,
+        None,
+        2,
+        None,
+        host_memory,
+        now_ns(),
+        &ClaimOptions::fresh(),
+    )
+    .await
+    .expect("dry-run compact-tenant runs");
+    String::from_utf8(out).expect("utf-8")
+}
+
+/// The memory split target lines of the compact-tenant report (issue #2351),
+/// pinned against a fixed 30 GiB budget rather than this host's memory: with
+/// no flag the RLOG target is 30 GiB / 8 / 2 (`--bucket-concurrency`) and the
+/// RSPAN target stays 256 MiB; with the flag both are the flag's value; with
+/// no readable memory both are the 256 MiB fallback.
 ///
-/// Non-vacuity (prove-the-test), each flip named:
-/// - Pass `1` instead of `bucket_concurrency` to `build_compactor_config` in
-///   `compact_tenant_to`: the "over 2 concurrent merges" line fails.
-/// - Pass `None` instead of the detected host memory: the derived line fails
-///   (it reads the 256 MiB fallback).
-/// - Let the derivation win over an explicit value: the "12345 (set by flag)"
-///   line fails.
+/// Distinguishing:
+/// - `compact_tenant_to` reading the host's memory instead of its
+///   `host_memory_total_bytes` argument: the derived row names the host's
+///   figure, not 32212254720 (unless the host has exactly 30 GiB, which the
+///   fallback row then still catches, since a readable host never prints the
+///   fallback).
+/// - Passing `1` instead of `bucket_concurrency` to `build_compactor_config`:
+///   the derived row reads 4026531840 over 1 concurrent merge.
+/// - RSPAN taking the derived target: the derived row's RSPAN line reads
+///   2013265920, not 268435456.
+/// - The derivation winning over an explicit value: the flag row fails.
 #[tokio::test]
 async fn report_names_the_resolved_l1_part_memory_target() {
-    let host = ravel_maintain::detect_host_memory_total_bytes()
-        .expect("host memory is readable where this suite runs");
-    let expected_derived = ravel_maintain::derive_l1_part_memory_target_bytes(host, 2);
-    // A host large enough that the two-merge division lands inside the clamp,
-    // so a wiring that passed one merge instead of two prints a different
-    // number, not the same floor.
-    assert!(
-        host / 8 / 2 > 256 * 1024 * 1024,
-        "host memory {host} too small to tell concurrency 1 from 2"
-    );
-
-    for (flag, want) in [
+    for (flag, host_memory, want) in [
         (
             None,
-            format!(
-                "\nl1_part_memory_target_bytes: {expected_derived} (resolved from a memory \
-                 budget of {host} over 2 concurrent merges)\n"
-            ),
+            Some(30 * GIB),
+            "\nl1_part_memory_target_bytes: 2013265920 (resolved from a memory budget of \
+             32212254720 over 2 concurrent merges)\nrspan_l1_part_memory_target_bytes: \
+             268435456\nmax_l1_part_bytes: 268435456\n",
         ),
         (
             Some(12345),
-            "\nl1_part_memory_target_bytes: 12345 (set by flag)\n".to_string(),
+            Some(30 * GIB),
+            "\nl1_part_memory_target_bytes: 12345 (set by flag)\n\
+             rspan_l1_part_memory_target_bytes: 12345\n",
+        ),
+        (
+            None,
+            None,
+            "\nl1_part_memory_target_bytes: 268435456 (fallback: the memory budget is \
+             unknown)\nrspan_l1_part_memory_target_bytes: 268435456\n",
+        ),
+    ] {
+        let text = compact_tenant_report(flag, host_memory).await;
+        assert!(
+            text.contains(want),
+            "flag {flag:?}, memory {host_memory:?}: want {want:?} in {text}"
+        );
+    }
+}
+
+/// Smoke test of the production path: `compact_tenant` hands
+/// `compact_tenant_to` this host's detected memory. Whatever the host, the
+/// reported target is inside the clamp, and it is the 256 MiB fallback only
+/// when the host memory cannot be read.
+#[tokio::test]
+async fn report_on_the_detected_host_memory_is_inside_the_clamp() {
+    let detected = ravel_maintain::detect_host_memory_total_bytes();
+    let text = compact_tenant_report(None, detected).await;
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("l1_part_memory_target_bytes: "))
+        .unwrap_or_else(|| panic!("no target line in {text}"));
+    let bytes: u64 = line["l1_part_memory_target_bytes: ".len()..]
+        .split(' ')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("unparsable target line {line:?}"));
+    assert!((256 * 1024 * 1024..=8 * GIB).contains(&bytes), "{line}");
+    assert_eq!(line.contains("(fallback:"), detected.is_none(), "{line}");
+}
+
+/// `compact-bucket` takes `--l1-part-memory-target-bytes` and
+/// `--max-l1-part-bytes` (issue #2351): given, they replace the derived and
+/// default values in the run's config and report; absent, the RLOG target is
+/// derived from the injected memory over one merge.
+///
+/// Distinguishing:
+/// - `compact_to` passing `None` for either flag to `build_compactor_config`
+///   (the pre-#2351 wiring): the flag row reads the derived 4026531840 or the
+///   default 268435456 stored target, not 12345 or 67890.
+/// - `compact_to` deriving over anything but one merge: the derived row is
+///   not 4026531840.
+#[tokio::test]
+async fn compact_bucket_part_split_flags_reach_the_run() {
+    for (memory_flag, stored_flag, want) in [
+        (
+            Some(12345),
+            Some(67890),
+            "\nl1_part_memory_target_bytes: 12345 (set by flag)\n\
+             rspan_l1_part_memory_target_bytes: 12345\nmax_l1_part_bytes: 67890\n",
+        ),
+        (
+            None,
+            None,
+            "\nl1_part_memory_target_bytes: 4026531840 (resolved from a memory budget of \
+             32212254720 over 1 concurrent merge)\nrspan_l1_part_memory_target_bytes: \
+             268435456\nmax_l1_part_bytes: 268435456\n",
         ),
     ] {
         let store = seed_tenant().await;
         let mut out: Vec<u8> = Vec::new();
-        compact_tenant_to(
+        compact_to(
             &mut out,
             store,
             MEMORY,
             TENANT,
             SignalArg::Logs,
-            Some(SHARDS),
-            None,
-            None,
+            0,
+            HOUR_OLD,
             true,
             None,
-            flag,
+            memory_flag,
+            stored_flag,
             None,
-            None,
-            2,
-            None,
-            now_ns(),
+            Some(30 * GIB),
+            FixedClock::new(now_ns()),
             &ClaimOptions::fresh(),
         )
         .await
-        .expect("dry-run compact-tenant runs");
+        .expect("dry-run compact-bucket runs");
         let text = String::from_utf8(out).expect("utf-8");
-        assert!(
-            text.contains(&want),
-            "flag {flag:?}: want {want:?} in {text}"
-        );
+        assert!(text.contains(want), "want {want:?} in {text}");
+    }
+}
+
+/// The `ravel-cli` binary passes `compact-bucket`'s two part-split flags to
+/// the run: a zero value for either is refused with that flag's own error,
+/// which only `build_compactor_config` raises.
+///
+/// Distinguishing: a dispatch in `main.rs` that drops the flag (passes `None`)
+/// runs on and fails later for an unrelated reason (the memory store holds no
+/// tenant data), so the flag-specific message is absent; a binary without the
+/// flag fails in clap with "unexpected argument".
+#[test]
+fn compact_bucket_binary_refuses_zero_part_split_flags() {
+    for (flag, message) in [
+        (
+            "--l1-part-memory-target-bytes",
+            "--l1-part-memory-target-bytes must be greater than 0",
+        ),
+        (
+            "--max-l1-part-bytes",
+            "--max-l1-part-bytes must be greater than 0",
+        ),
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_ravel-cli"))
+            .args(["--store", "memory", "maintain", "compact-bucket"])
+            .args(["--tenant", TENANT, "--signal", "logs"])
+            .args(["--shard", "0", "--hour", "1", "--dry-run", flag, "0"])
+            .output()
+            .expect("ravel-cli runs");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{flag} 0 must fail: {stderr}");
+        assert!(stderr.contains(message), "{flag}: {stderr}");
     }
 }

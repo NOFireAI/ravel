@@ -538,15 +538,21 @@ pub const DEFAULT_MAX_COMPACTION_LIFETIME_NS: i64 = NS_PER_HOUR;
 pub const DEFAULT_MAX_L1_PART_BYTES: u64 = 256 * 1024 * 1024;
 /// `l1_part_memory_target_bytes` in [`CompactorConfig::default`]: 256 MiB. This
 /// is the **memory split target**: the decoded record-heap estimate the
-/// in-progress part is closed at, which issue #711 added to keep compactor peak
-/// memory survivable on an 8 GB host. It is a split target, not a ceiling on
+/// in-progress part is closed at. It is a split target, not a ceiling on
 /// resident bytes; see [`CompactorConfig::l1_part_memory_target_bytes`] for
 /// what each path overshoots it by.
 ///
-/// `ravel-server` and `ravel-cli maintain` do not run with this constant when
-/// the operator leaves the knob unset: they resolve the target from the
-/// process memory budget with [`ResolvedL1PartMemoryTarget::resolve`]. This is
-/// the floor of that derivation and the value used when the budget is unknown.
+/// The RSPAN merge runs at this value unless the operator sets the knob. The
+/// RLOG merge does not when the knob is unset: `ravel-server` and `ravel-cli
+/// maintain` derive its target from the memory budget
+/// ([`derive_l1_part_memory_target_bytes`]), and this is the floor of that
+/// derivation and the value used when the budget is unknown. The floor binds
+/// only while `budget / 8 / concurrent_merges` is at most 256 MiB, that is a
+/// budget of at most `2 GiB * concurrent_merges`: for `compact-bucket` (one
+/// merge) a host of 2 GiB or less, for `compact-tenant` 2 GiB times
+/// `--bucket-concurrency`, and for `ravel-server` (budget = memory less its
+/// 2 GiB overhead reserve, at `--maintain-unit-concurrency` 4) a host of
+/// 10 GiB or less. An 8 GiB host derives 1 GiB per merge on `compact-bucket`.
 pub const DEFAULT_L1_PART_MEMORY_TARGET_BYTES: u64 = 256 * 1024 * 1024;
 /// Floor of the derived memory split target
 /// ([`derive_l1_part_memory_target_bytes`]): the fixed default the target had
@@ -633,6 +639,23 @@ impl ResolvedL1PartMemoryTarget {
         }
     }
 
+    /// Write this resolution into `config`. The RLOG merge gets
+    /// [`Self::bytes`] whatever the source
+    /// ([`CompactorConfig::rlog_l1_part_memory_target_bytes`]). The RSPAN
+    /// merge gets it only when the operator set it: a derived or fallback
+    /// resolution leaves [`CompactorConfig::l1_part_memory_target_bytes`] at
+    /// [`DEFAULT_L1_PART_MEMORY_TARGET_BYTES`], since RSPAN has no stored-size
+    /// target to cap a part that a large derived target would grow.
+    pub fn apply_to(&self, config: &mut CompactorConfig) {
+        config.rlog_l1_part_memory_target_bytes = Some(self.bytes);
+        config.l1_part_memory_target_bytes = match self.source {
+            L1PartMemoryTargetSource::Flag => self.bytes,
+            L1PartMemoryTargetSource::Derived { .. } | L1PartMemoryTargetSource::Fallback => {
+                DEFAULT_L1_PART_MEMORY_TARGET_BYTES
+            }
+        };
+    }
+
     /// `flag`, `derived` or `fallback`, for a structured log field.
     pub fn source_name(&self) -> &'static str {
         match self.source {
@@ -653,8 +676,13 @@ impl std::fmt::Display for ResolvedL1PartMemoryTarget {
             } => write!(
                 f,
                 "{} (resolved from a memory budget of {memory_budget_bytes} \
-                 over {concurrent_merges} concurrent merges)",
-                self.bytes
+                 over {concurrent_merges} concurrent {})",
+                self.bytes,
+                if concurrent_merges == 1 {
+                    "merge"
+                } else {
+                    "merges"
+                }
             ),
             L1PartMemoryTargetSource::Fallback => {
                 write!(f, "{} (fallback: the memory budget is unknown)", self.bytes)
@@ -1196,8 +1224,9 @@ pub struct CompactorConfig {
     /// binding target is usually [`Self::l1_part_memory_target_bytes`], not
     /// this one, so objects come out at the memory target divided by the
     /// schema's heap-to-stored ratio. Lowering this knob therefore does not
-    /// grow objects, it caps them lower; it is the operator's cap on stored
-    /// object size whatever the memory target resolves to.
+    /// grow objects, it caps them lower; on the RLOG and RSEG metrics paths it
+    /// is the operator's cap on stored object size whatever the memory target
+    /// resolves to. The RSPAN merge does not read it.
     pub max_l1_part_bytes: u64,
     /// The **memory split target**: close the in-progress L1 part once its
     /// decoded record-heap estimate reaches this
@@ -1235,14 +1264,30 @@ pub struct CompactorConfig {
     /// [`Self::max_l1_part_bytes`] is reached first.
     ///
     /// [`Self::default`] carries [`DEFAULT_L1_PART_MEMORY_TARGET_BYTES`]
-    /// (256 MiB). `ravel-server` and `ravel-cli maintain` replace it unless the
-    /// operator sets the knob: they resolve it with
-    /// [`ResolvedL1PartMemoryTarget::resolve`] as `memory_budget / 8 /
-    /// concurrent_merges` clamped to 256 MiB..=8 GiB
-    /// ([`derive_l1_part_memory_target_bytes`]), so part size follows host
-    /// memory instead of a fixed number that splits wide-schema parts long
-    /// before [`Self::max_l1_part_bytes`] (issue #2351).
+    /// (256 MiB). This field is what the RSPAN merge reads, and what the RLOG
+    /// merge reads unless [`Self::rlog_l1_part_memory_target_bytes`] is set.
+    /// An operator flag sets this field, so it reaches both codecs. A value the
+    /// binaries derive from the memory budget does not: it goes to
+    /// [`Self::rlog_l1_part_memory_target_bytes`] only
+    /// ([`ResolvedL1PartMemoryTarget::apply_to`]), and RSPAN stays at
+    /// 256 MiB, because RSPAN has no stored-size target to cap object size and
+    /// the claim-lease startup check (ADR-1029 decision 3) sizes the largest
+    /// part as [`Self::max_l1_part_bytes`].
     pub l1_part_memory_target_bytes: u64,
+    /// The memory split target the RLOG merge (`rlog::merge_catalogs`, which
+    /// compaction and the RLOG erasure rewrite share) reads in place of
+    /// [`Self::l1_part_memory_target_bytes`] when set
+    /// ([`Self::rlog_memory_target_bytes`]). The RSPAN merge never reads it.
+    ///
+    /// `ravel-server` and `ravel-cli maintain` set it from
+    /// [`ResolvedL1PartMemoryTarget::apply_to`]: unless the operator sets the
+    /// knob, they derive it as `memory_budget / 8 / concurrent_merges` clamped
+    /// to 256 MiB..=8 GiB ([`derive_l1_part_memory_target_bytes`]), so RLOG
+    /// part size follows host memory instead of a fixed number that splits
+    /// wide-schema parts long before [`Self::max_l1_part_bytes`] (issue
+    /// #2351). RLOG keeps [`Self::max_l1_part_bytes`] as its cap on stored
+    /// object size whatever this resolves to. Default `None`.
+    pub rlog_l1_part_memory_target_bytes: Option<u64>,
     /// Buckets with fewer L0 records than this are left uncompacted; set 1 for
     /// v1-retirement campaigns.
     pub min_compaction_inputs: usize,
@@ -1517,6 +1562,7 @@ impl Default for CompactorConfig {
             max_compaction_lifetime_ns: DEFAULT_MAX_COMPACTION_LIFETIME_NS,
             max_l1_part_bytes: DEFAULT_MAX_L1_PART_BYTES,
             l1_part_memory_target_bytes: DEFAULT_L1_PART_MEMORY_TARGET_BYTES,
+            rlog_l1_part_memory_target_bytes: None,
             min_compaction_inputs: DEFAULT_MIN_COMPACTION_INPUTS,
             footer_probe_bytes: DEFAULT_FOOTER_PROBE_BYTES,
             input_read_concurrency: DEFAULT_INPUT_READ_CONCURRENCY,
@@ -1549,6 +1595,14 @@ impl Default for CompactorConfig {
 }
 
 impl CompactorConfig {
+    /// The memory split target the RLOG merge closes a part at:
+    /// [`Self::rlog_l1_part_memory_target_bytes`] when set, else
+    /// [`Self::l1_part_memory_target_bytes`].
+    pub fn rlog_memory_target_bytes(&self) -> u64 {
+        self.rlog_l1_part_memory_target_bytes
+            .unwrap_or(self.l1_part_memory_target_bytes)
+    }
+
     /// The seal margin: a bucket ending at `bucket_end_ns` is sealed once
     /// `now_ns >= bucket_end_ns + this`. No new commit record can
     /// appear in the bucket after that, so a single strongly consistent LIST
@@ -1785,6 +1839,53 @@ mod tests {
             resolved.to_string(),
             "2013265920 (resolved from a memory budget of 32212254720 over 2 concurrent merges)"
         );
+    }
+
+    /// One merge reads "1 concurrent merge", not "1 concurrent merges".
+    #[test]
+    fn derived_display_uses_the_singular_for_one_merge() {
+        let resolved = ResolvedL1PartMemoryTarget::resolve(None, Some(30 * GIB), 1);
+        assert_eq!(
+            resolved.to_string(),
+            "4026531840 (resolved from a memory budget of 32212254720 over 1 concurrent merge)"
+        );
+    }
+
+    /// The derived target reaches the RLOG merge only; RSPAN, which has no
+    /// stored-size target, stays at the fixed 256 MiB. A flag reaches both.
+    ///
+    /// Distinguishing:
+    /// - `apply_to` writing the derived bytes into `l1_part_memory_target_bytes`
+    ///   (RSPAN taking the derived target): the RSPAN assertion reads
+    ///   4026531840, not 268435456.
+    /// - `apply_to` leaving the RLOG field unset for a derived source: the RLOG
+    ///   assertion reads 268435456, not 4026531840.
+    /// - `apply_to` keeping RSPAN at 256 MiB for a flag too: the flag row's
+    ///   RSPAN assertion reads 268435456, not 12345.
+    #[test]
+    fn derived_target_reaches_rlog_only_and_a_flag_reaches_both() {
+        let mut config = CompactorConfig::default();
+        ResolvedL1PartMemoryTarget::resolve(None, Some(30 * GIB), 1).apply_to(&mut config);
+        assert_eq!(config.rlog_memory_target_bytes(), 4_026_531_840);
+        assert_eq!(config.rlog_memory_target_bytes(), 3 * GIB + 3 * GIB / 4);
+        assert_eq!(config.l1_part_memory_target_bytes, 268_435_456);
+
+        let mut config = CompactorConfig::default();
+        ResolvedL1PartMemoryTarget::resolve(Some(12345), Some(30 * GIB), 1).apply_to(&mut config);
+        assert_eq!(config.rlog_memory_target_bytes(), 12345);
+        assert_eq!(config.l1_part_memory_target_bytes, 12345);
+
+        let mut config = CompactorConfig::default();
+        ResolvedL1PartMemoryTarget::resolve(None, None, 1).apply_to(&mut config);
+        assert_eq!(config.rlog_memory_target_bytes(), 268_435_456);
+        assert_eq!(config.l1_part_memory_target_bytes, 268_435_456);
+
+        // A library caller that never resolves: RLOG reads the shared field.
+        let config = CompactorConfig {
+            l1_part_memory_target_bytes: 4096,
+            ..CompactorConfig::default()
+        };
+        assert_eq!(config.rlog_memory_target_bytes(), 4096);
     }
 
     #[test]
