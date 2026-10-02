@@ -20,8 +20,9 @@ a value, [operations.md](operations.md).
 
 **One of the three Deployments deletes objects, and it is the maintain one.**
 Only a `maintain` mode process runs compaction, retention, the garbage-collection
-sweep and the at-rest scrubber. The gateway and query Deployments never delete
-anything. So a cluster with `maintain.enabled: false`, or one scaled to zero
+sweep and the at-rest scrubber. The gateway and query Deployments delete no
+durable data; the gateway's one delete is the reap of dead ingest processes'
+admission snapshots. So a cluster with `maintain.enabled: false`, or one scaled to zero
 maintain replicas, never compacts and never expires data: its L0 segments
 accumulate unmerged and nothing is ever reclaimed, however the retention fields
 below are set. That is a real operational state, not a degraded one the
@@ -699,9 +700,9 @@ Each of the operator's three Deployments maps to one storage credential role:
 
 | Deployment | `--mode` | Storage credential role | Scope in one line |
 |---|---|---|---|
-| `<name>-gateway` | `gateway` | Gateway | Ingest writes (L0, commit records, idempotency, adopt) plus catalog fold writes, plus fleet-admission reconciliation snapshots. No delete. |
+| `<name>-gateway` | `gateway` | Gateway | Ingest writes (L0, commit records, idempotency, adopt) plus catalog fold writes, plus fleet-admission reconciliation snapshots. Deletes only dead processes' admission snapshots. |
 | `<name>-query` | `query` | Query | Reads commit and catalog objects, runs fold, appends query audit. No delete. |
-| `<name>-maintain` | `maintain` | Maintain | Compaction, retention, sweep. The only one granted any delete, and only over `l0/`, `l1/`, `c/`, `idem/`, and the query-audit shard `t/*/u/*/0001/*`. |
+| `<name>-maintain` | `maintain` | Maintain | Compaction, retention, sweep. The only one granted delete over durable data: `l0/`, `l1/`, `c/`, `idem/`, the query-audit shard `t/*/u/*/0001/*`, `del/*.dreq` erasure requests and superseded Parquet table manifests `t/*/pq/t/*`. |
 
 A fourth role, **Admin**, backs `ravel-cli` and is deliberately not managed by
 the operator: there is no CRD field for it and no pod runs it. It is used only

@@ -495,7 +495,9 @@ The one deletion with no record is orphan collection, which removes data
 objects no commit record ever published; it is gated by age and by a fresh
 re-listing of the commit records instead. Only a `maintain` mode
 process runs compaction, retention, the sweep, and the scrubber; a deployment
-with no `maintain` process never deletes an object.
+with no `maintain` process deletes no durable data. Its one delete is the
+admission reconcile's reap of dead ingest processes' admission snapshots,
+which are mutable per-process state, not published data.
 
 The guarantee this document is normative for: **no object a referenced
 snapshot still names is ever deleted by retention.** The protection-horizon
