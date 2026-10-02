@@ -1176,9 +1176,12 @@ pub async fn sweep_compactor_config(
 
 /// `maintain sweep`: run one sweep pass (all three GC rules) over a shard.
 ///
-/// The pass runs with [`sweep_compactor_config`]'s configuration, so it sweeps
-/// on the same `sys/gc` values, and refuses on the same violations, as the
-/// server's maintain mode.
+/// The pass runs with [`sweep_compactor_config`]'s configuration: protection
+/// horizon, grace, maximum flush lifetime and the two pinned-query terms from
+/// `sys/gc`, refused on the same skew violation as the server's maintain mode.
+/// The server takes its maximum flush lifetime from `--gc-max-flush-lifetime`
+/// instead, so the two orphan gates can differ when that flag and `sys/gc`
+/// disagree.
 ///
 /// Refreshes the tenant's [`LegalHoldCheck`] before the pass, matching the
 /// server driver's semantics (ADR-0048 decision 1): the refresh happens once,
