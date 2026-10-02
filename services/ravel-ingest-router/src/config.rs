@@ -210,6 +210,10 @@ pub struct OidcSettings {
     pub jwks_url: String,
     pub audiences: Vec<String>,
     pub tenant_claim: String,
+    /// JWKS refetch period. A zero interval is refused at startup: by
+    /// [`Cli::into_config`], and by [`crate::run`] with
+    /// [`crate::JwksRefreshSpawnError::ZeroRefreshInterval`] for a config
+    /// built directly.
     pub refresh_interval: Duration,
 }
 
