@@ -281,11 +281,24 @@ below can be computed per cache or summed across both:
   when a disk tier is configured: no hit, no `bytes_served` and no
   `bytes_admitted`. When two such reads arrive together, one leads the RAM
   recheck and the other follows it and records a single-flight collapse. This
-  holds with a RAM tier only as well. A Parquet read or a log block-range
-  read counts a late serve in its query accounting as one cache miss with
-  zero GETs and zero fetched bytes. With a RAM tier only, a metrics read or a
-  log whole-object read counts a late serve, or a read that waited on another
-  read's in-flight GET, as one cache hit with zero GETs.
+  holds with a RAM tier only as well. Such a read, and a read that waited on
+  another read's in-flight GET (a single-flight follower), is a late serve.
+  A Parquet read counts a late serve in its query accounting as one cache
+  miss with zero GETs and zero fetched bytes. So do the four read-through
+  paths of the query fetchers, with or without `--cache-dir`: a metrics
+  (RSEG) range read, a log whole-object read, a log extent read (the
+  block-range probe, directory and page-range reads, and the covering read of
+  an oversized object), and a span whole-object read. Their `page_fetch` and
+  `segment_open` spans record no request for it either, and a page-range read
+  counts it in neither `block_range_gets` nor `block_cache_hits`. Only the
+  read that ran the GET is charged it, and only a lookup that found the bytes
+  is a hit. The query's cache hit and miss counts
+  (`ravel_query_cache_hits_total`) are unchanged by this: a late serve was
+  already a miss on these paths, and what changed is the GET most of them
+  used to charge it (issue #2311). A log block-range read's second look at a
+  coalesced run's blocks records no hit or miss on either tier, but a block it
+  finds on the disk tier is still re-admitted to RAM, so `bytes_admitted`
+  moves.
 
 With both caches off (`--disable-cache`), none of these samples appear on
 `/metrics` at all: neither `cache="fetch"` nor `cache="catalog"`. A fetcher

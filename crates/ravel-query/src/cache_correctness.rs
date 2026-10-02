@@ -1320,9 +1320,9 @@ async fn no_disk_tier_ram_only_matches_uncached_on_both_funnels() {
 /// exactly ONE miss per logical cache miss on the tiered tier's `CacheMetrics`,
 /// not two.
 ///
-/// The RAM-only `Cache` is the oracle: its `get_or_fetch` is miss-only and never
-/// re-peeks, so a cold block-range fetch records exactly one miss per logical
-/// lookup -- the correct count. A `TieredCache` cold fetch of the same object
+/// The RAM-only `Cache` is the oracle: its `get_or_fetch` is miss-only, and its
+/// leader's RAM recheck before fetching is uncounted, so a cold block-range
+/// fetch records exactly one miss per logical lookup -- the correct count. A `TieredCache` cold fetch of the same object
 /// with the same protocol must record the SAME number of misses on its RAM tier.
 /// The fetcher achieves this by resolving a peeked-then-deferred block through
 /// `ReadCache::fetch_peeked` (which `insert`s on the tiered tier rather than

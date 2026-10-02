@@ -58,7 +58,7 @@ use crate::fetcher::{MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT, ReadCache, bound_runs, 
 use crate::phase_accounting::{PhaseAccounting, PhaseWireByteCounter, QueryPhase};
 use crate::reserved_bytes::attach_reservation;
 use bytes::Bytes;
-use ravel_cache::{CacheKey, SingleFlightError, Source};
+use ravel_cache::{CacheKey, ReadOutcome, SingleFlightError};
 use ravel_catalog::{SegmentLevel, SegmentRef};
 use ravel_cpu_gate::{CpuGateError, JobSize, ReadGate, ReadSite};
 use ravel_logseg::block::NumStat;
@@ -2480,8 +2480,8 @@ impl LogSegmentFetcher {
         // `fetch_accounted` because the byte-fetch differs -- this one is
         // cache-aware and may serve a hit with no store GET at all. The
         // recorded `s3_requests`/`s3_bytes` reflect this call's own store GETs:
-        // one on the uncached or cache-miss path, zero on a cache hit (the
-        // served bytes are cache, not S3).
+        // one on the uncached path or when this call ran the cache-miss fetch,
+        // zero on a cache hit or a late serve (no GET by this call).
         let fetch_span = tracing::debug_span!(
             "page_fetch",
             signal = "logs",
@@ -2529,10 +2529,10 @@ impl LogSegmentFetcher {
         };
 
         let cache_key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, 0, seg_ref.object_size);
-        // One read-through call, accounted from the returned [`Source`]: a
-        // single call avoids the peek-then-`get_or_fetch` double-count on the
+        // One read-through call, accounted from the returned [`ReadOutcome`]:
+        // a single call avoids the peek-then-`get_or_fetch` double-count on the
         // tiered tier (see [`ReadCache::get_or_fetch`]).
-        let (bytes, source) = async {
+        let (bytes, outcome) = async {
             cache
                 .get_or_fetch(cache_key, || async move {
                     // Held across the GET only: dropped before this closure
@@ -2559,8 +2559,8 @@ impl LogSegmentFetcher {
         // wrong.
         .map_err(|err| from_cache_error(key, err))?;
         let mut reservation = reservation;
-        match source {
-            Source::Cache => {
+        match outcome {
+            ReadOutcome::Hit => {
                 accounting.record_cache_hit();
                 accounting.add_cache_bytes(bytes.len() as u64);
                 // Served from cache: no S3 GET on this call.
@@ -2575,13 +2575,17 @@ impl LogSegmentFetcher {
                 // cache hit, which is what makes the `unique` term inexact.
                 reservation.mark_handed_off();
             }
-            // A miss issues one store GET for the resulting bytes. A
-            // tiered-cache follower that rode another caller's GET is the rare
-            // exception (the RAM-only cache reports its follower as
-            // `Source::Cache`); recording one GET here still bounds this call's
-            // own attribution and never under-counts the query total, which is
-            // what the span is for.
-            Source::Upstream => {
+            // A late serve (another caller's flight, or the RAM recheck) made
+            // no GET of its own and is not a hit: the miss its lookup counted,
+            // no S3 cost. Its bytes are the cache entry's, as on a hit.
+            ReadOutcome::LateServe => {
+                accounting.record_cache_miss();
+                fetch_span.record("s3_requests", 0u64);
+                fetch_span.record("s3_bytes", 0u64);
+                reservation.mark_handed_off();
+            }
+            // This call's own store GET produced the bytes.
+            ReadOutcome::Fetched => {
                 accounting.record_cache_miss();
                 fetch_span.record("s3_requests", 1u64);
                 fetch_span.record("s3_bytes", bytes.len() as u64);
@@ -3163,11 +3167,13 @@ pub struct BlockRangeStats {
     pub block_range_gets: u64,
     /// Candidate blocks (page ranges, on a page-granular read) served from the
     /// read cache with no store round trip, counted exactly where the query
-    /// accounting records a cache hit for them. A block-range read decides that
-    /// at each block's peek: a block whose peek missed and that was then served
-    /// with no GET of this call's own (another caller's flight, a recheck, or
-    /// `fetch_run`'s re-peek) stays a miss in the accounting and is counted in
-    /// neither this nor [`block_range_gets`](Self::block_range_gets).
+    /// accounting records a cache hit for them: at each block's peek on a
+    /// block-range read, and at each page range's read-through lookup on a
+    /// page-granular one. A block or page range whose lookup missed and that
+    /// was then served with no GET of this call's own (another caller's
+    /// flight, a RAM recheck, or `fetch_run`'s re-peek) stays a miss in the
+    /// accounting and is counted in neither this nor
+    /// [`block_range_gets`](Self::block_range_gets).
     pub block_cache_hits: u64,
     /// Stored bytes of candidate blocks read from the store (cache hits excluded).
     pub block_bytes_fetched: u64,
@@ -4132,14 +4138,14 @@ impl BlockRangeFetcher {
                 if self.cache.is_some() {
                     // Cache miss that just admitted these bytes: `cached_extent`'s
                     // leader-miss insert put them under the cache's own ledger too,
-                    // the same overlap the whole-object funnel's `Source::Upstream`
+                    // the same overlap the whole-object funnel's `ReadOutcome::Fetched`
                     // arm marks. `live` alone cannot distinguish this from an
                     // uncached direct GET (`cached_extent` reports `live = true`
                     // for both), so the cache-configured check decides it here.
                     reservation.mark_handed_off();
                 }
             } else {
-                // Cache hit: `bytes` clones the cache entry's allocation, so
+                // Cache hit or late serve: `bytes` clones the cache entry's allocation, so
                 // the cache cap and this guard both cover it for as long as
                 // the caller holds it (ADR-1170 decision 2), same as the
                 // whole-object funnel's hit arm.
@@ -4340,12 +4346,13 @@ impl BlockRangeFetcher {
     /// (a `Range` GET of the same bytes is a different request to the store)
     /// while still keying as the absolute extent it returns.
     ///
-    /// The returned flag is true when this call crossed the network, so callers
-    /// count only real store GETs. On the tiered cache a single-flight follower
-    /// that rode another caller's in-flight GET reports true as well: the same
-    /// attribution convention `tenant_bytes` documents, which bounds this call's
-    /// own cost and never under-counts the query total. The RAM-only cache tells
-    /// a follower from its leader, so there a follower reports false.
+    /// The returned flag is true only when this call's own GET crossed the
+    /// network, so callers count only real store GETs: a cache hit and a late
+    /// serve (a single-flight follower of another caller's GET on either cache
+    /// kind, or a RAM-only recheck serve) both report false. Only a hit is a
+    /// cache hit in the query accounting; a late serve stays a miss.
+    /// [`cached_extent_outcome`](Self::cached_extent_outcome) returns the
+    /// [`ReadOutcome`] for a caller that must tell those two apart.
     ///
     /// `phase` is the [`QueryPhase`] a LIVE fetch's wire bytes are charged to
     /// (#913). A cache hit crossed no network and is charged nothing: its bytes
@@ -4362,21 +4369,50 @@ impl BlockRangeFetcher {
         pin: &EtagPin,
         accounting: &QueryAccounting,
     ) -> Result<(Bytes, bool), LogFetchError> {
+        let (bytes, outcome) = self
+            .cached_extent_outcome(
+                seg_ref,
+                tenant_hash,
+                start,
+                len,
+                range,
+                phase,
+                pin,
+                accounting,
+            )
+            .await?;
+        Ok((bytes, outcome == ReadOutcome::Fetched))
+    }
+
+    /// [`cached_extent`](Self::cached_extent), returning the [`ReadOutcome`]
+    /// instead of the `live` flag. Without a cache every call is
+    /// [`ReadOutcome::Fetched`]. The query accounting is recorded here either
+    /// way: a hit for [`ReadOutcome::Hit`], a miss otherwise.
+    #[allow(clippy::too_many_arguments)]
+    async fn cached_extent_outcome(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        start: u64,
+        len: u64,
+        range: GetRange,
+        phase: QueryPhase,
+        pin: &EtagPin,
+        accounting: &QueryAccounting,
+    ) -> Result<(Bytes, ReadOutcome), LogFetchError> {
         let key = seg_ref.data_object_key.as_str();
         let Some(cache) = &self.cache else {
             let got = self
                 .store_get_pinned(key, range, phase, pin, accounting)
                 .await?;
             check_extent_len(key, got.data.len(), len)?;
-            return Ok((got.data, true));
+            return Ok((got.data, ReadOutcome::Fetched));
         };
         let cache_key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, start, len);
-        // One read-through call, accounted from the returned [`Source`]: a single
-        // call avoids the peek-then-`get_or_fetch` double-count on the tiered
-        // tier (see [`ReadCache::get_or_fetch`]). The returned flag is `live`,
-        // which is [`Source::Upstream`]: this call ran the fetch, or, on the
-        // tiered cache, it rode another caller's flight.
-        let (bytes, source) = cache
+        // One read-through call, accounted from the returned [`ReadOutcome`]: a
+        // single call avoids the peek-then-`get_or_fetch` double-count on the
+        // tiered tier (see [`ReadCache::get_or_fetch`]).
+        let (bytes, outcome) = cache
             .get_or_fetch(cache_key, || async move {
                 let got = self
                     .store_get_pinned(key, range, phase, pin, accounting)
@@ -4387,17 +4423,14 @@ impl BlockRangeFetcher {
             })
             .await
             .map_err(|err| from_cache_error(key, err))?;
-        match source {
-            Source::Cache => {
+        match outcome {
+            ReadOutcome::Hit => {
                 accounting.record_cache_hit();
                 accounting.add_cache_bytes(bytes.len() as u64);
-                Ok((bytes, false))
             }
-            Source::Upstream => {
-                accounting.record_cache_miss();
-                Ok((bytes, true))
-            }
+            ReadOutcome::Fetched | ReadOutcome::LateServe => accounting.record_cache_miss(),
         }
+        Ok((bytes, outcome))
     }
 
     /// [`cached_extent`](Self::cached_extent) placed into `asm`: reserves `len`
@@ -5842,8 +5875,8 @@ impl BlockRangeFetcher {
         let reserved: u64 = runs.iter().map(|r| r.len).fold(0u64, u64::saturating_add);
         let reservation = self.reserve_fetch(reserved)?;
         let outcomes = futures::future::join_all(runs.iter().map(|run| async move {
-            let (bytes, live) = self
-                .cached_extent(
+            let (bytes, served) = self
+                .cached_extent_outcome(
                     seg_ref,
                     tenant_hash,
                     run.abs_start,
@@ -5854,18 +5887,21 @@ impl BlockRangeFetcher {
                     accounting,
                 )
                 .await?;
-            Ok::<_, LogFetchError>((run.abs_start, bytes, live))
+            Ok::<_, LogFetchError>((run.abs_start, bytes, served))
         }))
         .await;
         self.hold_placement(asm, reservation);
         for outcome in outcomes {
-            let (start, bytes, live) = outcome?;
-            if live {
-                stats.block_range_gets += 1;
-                stats.block_bytes_fetched =
-                    stats.block_bytes_fetched.saturating_add(bytes.len() as u64);
-            } else {
-                stats.block_cache_hits += 1;
+            let (start, bytes, served) = outcome?;
+            match served {
+                ReadOutcome::Fetched => {
+                    stats.block_range_gets += 1;
+                    stats.block_bytes_fetched =
+                        stats.block_bytes_fetched.saturating_add(bytes.len() as u64);
+                }
+                ReadOutcome::Hit => stats.block_cache_hits += 1,
+                // No GET by this call and a query-accounting miss: neither.
+                ReadOutcome::LateServe => {}
             }
             asm.place(key, start, bytes)?;
         }
@@ -6494,15 +6530,11 @@ impl BlockRangeFetcher {
 /// [`BlockRangeStats::block_cache_hits`]: its `fetch_blocks` peek already
 /// decided its one hit-or-miss outcome.
 ///
-/// A single-flight follower that rode another caller's GET reports zero gets and
-/// zero bytes here, unlike [`BlockRangeFetcher::cached_extent`] and the
-/// whole-object funnels on the tiered cache, which attribute one request to a
-/// follower because they cannot tell one from a leader. This path can tell a GET it made from one it
-/// did not: a block counts as fetched only when this call ran the closure, so
-/// a leader served by the RAM recheck, which runs no closure, reports zero gets
-/// like a follower. Reporting what actually crossed the network is strictly
-/// better information, and the block-range GET count is the figure ADR-0107's
-/// acceptance test is written against.
+/// A block counts as fetched only when this call ran the closure, so a
+/// single-flight follower that rode another caller's GET, and a leader served
+/// by the RAM recheck, which runs no closure, both report zero gets and zero
+/// bytes here, the same late-serve figures [`BlockRangeFetcher::cached_extent`]
+/// and the whole-object funnels report on either cache kind.
 #[derive(Default)]
 struct RunOutcome {
     blocks: Vec<(u64, Bytes)>,
@@ -8049,7 +8081,7 @@ mod whole_object_get_limiter_tests {
     /// the same bytes) while the buffer is held, and clears it on drop.
     ///
     /// Non-vacuity: dropping the `reservation.mark_handed_off()` call on the
-    /// `Source::Upstream` arm of `whole_object_bytes` leaves `handoff_overlap()`
+    /// `ReadOutcome::Fetched` arm of `whole_object_bytes` leaves `handoff_overlap()`
     /// at 0 while the buffer is held, so the first assertion fails.
     #[tokio::test]
     async fn cache_insert_marks_the_reservation_handed_off() {
@@ -8104,7 +8136,7 @@ mod whole_object_get_limiter_tests {
     /// derived reserve undersized.
     ///
     /// Non-vacuity: dropping the `reservation.mark_handed_off()` call on the
-    /// `Source::Cache` arm leaves `handoff_overlap()` at 0 on the second fetch
+    /// `ReadOutcome::Hit` arm leaves `handoff_overlap()` at 0 on the second fetch
     /// while its buffer is held, so the hit assertion fails while the insert
     /// assertion above still passes.
     #[tokio::test]
@@ -8283,7 +8315,7 @@ mod whole_object_get_limiter_tests {
     /// on a cache HIT: `cached_extent` returns `(bytes, false)`, a clone of the
     /// resident cache entry, so the cache cap and this fetch guard both cover
     /// the same allocation for the buffer's life. This is the same class the
-    /// whole-object funnel's `Source::Cache` arm handles
+    /// whole-object funnel's `ReadOutcome::Hit` arm handles
     /// (`cache_hit_marks_the_reservation_handed_off` above), left unmarked here
     /// because `covering_read` is a separate call site.
     ///
@@ -11351,10 +11383,12 @@ mod fetch_run_corruption_gate_tests {
 mod late_serve_accounting_tests {
     //! Two callers reading the same bytes through a cache at once, the second
     //! joining the first's in-flight GET, report what each actually did: one
-    //! GET between them, one tier lookup per block each caller peeked, and a
-    //! `block_cache_hits` that agrees with the query accounting. A `FaultStore`
-    //! hold gate parks the leader's GET until the follower is in position;
-    //! `MemoryStore` alone never yields, so it cannot produce the overlap.
+    //! GET between them, one tier lookup per block each caller peeked, a
+    //! follower that is a query cache miss charged no GET on either cache
+    //! kind, and a `block_cache_hits` that agrees with the query accounting. A
+    //! `FaultStore` hold gate parks the leader's GET until the follower is in
+    //! position; `MemoryStore` alone never yields, so it cannot produce the
+    //! overlap.
 
     use super::*;
     use crate::fetcher::CacheFetchError;
@@ -11573,79 +11607,286 @@ mod late_serve_accounting_tests {
         assert_eq!(tiered.ram_len(), 0, "the RAM tier declined every block");
     }
 
-    /// Two `cached_extent` calls for one extent on a RAM-only cache: only the
-    /// call whose GET ran reports `live`.
-    ///
-    /// FLIP: mapping the RAM branch of `ReadCache::get_or_fetch` back to
-    /// `.map(|bytes| (bytes, Source::Upstream))` makes both calls live.
-    #[tokio::test]
-    async fn a_ram_only_cached_extent_follower_is_not_live() {
-        let (store, gate) = held_store().await;
-        let ram: Arc<Cache<CacheFetchError>> = Arc::new(Cache::new(limits()));
-        let ram_metrics = ram.metrics();
-        let fetcher = BlockRangeFetcher::new(store).with_cache(ram);
-        let seg = seg_ref(BLOCK * BLOCKS);
-        let pin = EtagPin::default();
-        let leader_acc = QueryAccounting::new();
-        let follower_acc = QueryAccounting::new();
-        let extent = |acc| {
-            fetcher.cached_extent(
-                &seg,
-                TENANT,
-                0,
-                BLOCK,
-                GetRange::Range(0, BLOCK),
-                QueryPhase::Scan,
-                &pin,
-                acc,
-            )
-        };
-        let (leader, follower, ()) = tokio::join!(
-            extent(&leader_acc),
-            extent(&follower_acc),
-            release_when(&gate, || ram_metrics.snapshot().misses >= 2),
-        );
-        let (leader_bytes, leader_live) = leader.expect("leader extent");
-        let (follower_bytes, follower_live) = follower.expect("follower extent");
-        assert_eq!(leader_bytes, object().slice(0..BLOCK as usize));
-        assert_eq!(follower_bytes, leader_bytes);
-        assert!(leader_live, "the leader's GET crossed the network");
-        assert!(!follower_live, "the follower made no GET of its own");
-        assert_eq!(leader_acc.snapshot().total_s3_requests(), 1);
-        assert_eq!(follower_acc.snapshot().total_s3_requests(), 0);
-        assert_eq!(follower_acc.snapshot().cache_hits, 1);
-        assert_eq!(follower_acc.snapshot().cache_misses, 0);
+    /// The two cache kinds the read-through tests below run against.
+    #[derive(Clone, Copy, Debug)]
+    enum Kind {
+        Ram,
+        Tiered,
     }
 
-    /// Two whole-object reads of one object on a RAM-only cache: one GET, one
-    /// miss and one hit between them in the query accounting.
+    /// Whether a second caller of a key is parked on the first one's flight.
+    type Parked = Box<dyn Fn(&CacheKey) -> bool>;
+
+    /// A fresh cache of `kind` and a check that a second caller of `key` is
+    /// parked on the first one's flight. On the RAM-only cache the follower
+    /// joins the flight in the same poll that records its peek's miss, so two
+    /// RAM misses mean it is parked; the tiered cache counts its waiters.
+    fn cache_of(kind: Kind, tmp: &tempfile::TempDir) -> (ReadCache, Parked) {
+        match kind {
+            Kind::Ram => {
+                let ram: Arc<Cache<CacheFetchError>> = Arc::new(Cache::new(limits()));
+                let metrics = ram.metrics();
+                (
+                    ReadCache::Ram(ram),
+                    Box::new(move |_| metrics.snapshot().misses >= 2),
+                )
+            }
+            Kind::Tiered => {
+                let tiered = Arc::new(TieredCache::new(
+                    Cache::new(limits()),
+                    DiskCache::new(tmp.path().to_path_buf(), limits()),
+                ));
+                (
+                    ReadCache::Tiered(tiered.clone()),
+                    Box::new(move |key| tiered.in_flight_waiters(key) >= 1),
+                )
+            }
+        }
+    }
+
+    /// The leader of a read-through ran the one GET and recorded one miss.
+    fn assert_fetching_leader(snap: &QueryAccountingSnapshot, kind: Kind) {
+        assert_eq!(snap.total_s3_requests(), 1, "{kind:?}: the leader's GET");
+        assert_eq!(snap.cache_misses, 1, "{kind:?}");
+        assert_eq!(snap.cache_hits, 0, "{kind:?}");
+    }
+
+    /// A late serve's query accounting: no GET of its own, and the one cache
+    /// miss its lookup counted, with no hit and no cache bytes.
+    fn assert_late_served(snap: &QueryAccountingSnapshot, kind: Kind) {
+        assert_eq!(snap.total_s3_requests(), 0, "{kind:?}: no GET of its own");
+        assert_eq!(snap.total_s3_bytes(), 0, "{kind:?}");
+        assert_eq!(snap.cache_misses, 1, "{kind:?}: a late serve stays a miss");
+        assert_eq!(snap.cache_hits, 0, "{kind:?}");
+        assert_eq!(snap.cache_bytes, 0, "{kind:?}");
+    }
+
+    /// Two `cached_extent` calls for one extent, the second following the
+    /// first's flight: only the call whose GET ran reports `live`, and the
+    /// follower records a query cache miss, on both cache kinds.
     ///
-    /// FLIP: mapping the RAM branch of `ReadCache::get_or_fetch` back to
-    /// `.map(|bytes| (bytes, Source::Upstream))` makes both reads misses.
+    /// FLIP: mapping `ReadOutcome::LateServe` to the `ReadOutcome::Hit` arm in
+    /// `cached_extent_outcome` makes the follower a hit with cache bytes (both
+    /// kinds); reporting a tiered follower as `ReadOutcome::Fetched` (the
+    /// `(false, Role::Follower)` arm of `TieredCache::get_or_fetch_outcome`)
+    /// makes it live.
     #[tokio::test]
-    async fn a_ram_only_whole_object_follower_is_a_hit_with_no_get() {
-        let (store, gate) = held_store().await;
-        let ram: Arc<Cache<CacheFetchError>> = Arc::new(Cache::new(limits()));
-        let ram_metrics = ram.metrics();
-        let fetcher = LogSegmentFetcher::new(store).with_cache(ram);
-        let seg = seg_ref(BLOCK * BLOCKS);
-        let leader_acc = QueryAccounting::new();
-        let follower_acc = QueryAccounting::new();
-        let (leader, follower, ()) = tokio::join!(
-            fetcher.whole_object_bytes(&seg, TENANT, QueryPhase::Scan, &leader_acc),
-            fetcher.whole_object_bytes(&seg, TENANT, QueryPhase::Scan, &follower_acc),
-            release_when(&gate, || ram_metrics.snapshot().misses >= 2),
-        );
-        leader.expect("leader read");
-        follower.expect("follower read");
-        let leader_snap = leader_acc.snapshot();
-        let follower_snap = follower_acc.snapshot();
-        assert_eq!(leader_snap.total_s3_requests(), 1);
-        assert_eq!(leader_snap.cache_misses, 1);
-        assert_eq!(leader_snap.cache_hits, 0);
-        assert_eq!(follower_snap.total_s3_requests(), 0);
-        assert_eq!(follower_snap.cache_misses, 0);
-        assert_eq!(follower_snap.cache_hits, 1);
-        assert_eq!(follower_snap.cache_bytes, BLOCK * BLOCKS);
+    async fn a_cached_extent_follower_is_a_miss_and_not_live() {
+        for kind in [Kind::Ram, Kind::Tiered] {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let (cache, parked) = cache_of(kind, &tmp);
+            let (store, gate) = held_store().await;
+            let fetcher = BlockRangeFetcher::new(store).with_cache(cache);
+            let seg = seg_ref(BLOCK * BLOCKS);
+            let key = CacheKey::new(TENANT.0, CONTENT_HASH, 0, BLOCK);
+            let pin = EtagPin::default();
+            let leader_acc = QueryAccounting::new();
+            let follower_acc = QueryAccounting::new();
+            let extent = |acc| {
+                fetcher.cached_extent(
+                    &seg,
+                    TENANT,
+                    0,
+                    BLOCK,
+                    GetRange::Range(0, BLOCK),
+                    QueryPhase::Scan,
+                    &pin,
+                    acc,
+                )
+            };
+            let (leader, follower, ()) = tokio::join!(
+                extent(&leader_acc),
+                extent(&follower_acc),
+                release_when(&gate, || parked(&key)),
+            );
+            let (leader_bytes, leader_live) = leader.expect("leader extent");
+            let (follower_bytes, follower_live) = follower.expect("follower extent");
+            assert_eq!(leader_bytes, object().slice(0..BLOCK as usize));
+            assert_eq!(follower_bytes, leader_bytes);
+            assert!(
+                leader_live,
+                "{kind:?}: the leader's GET crossed the network"
+            );
+            assert!(!follower_live, "{kind:?}: the follower made no GET");
+            assert_fetching_leader(&leader_acc.snapshot(), kind);
+            assert_late_served(&follower_acc.snapshot(), kind);
+        }
+    }
+
+    /// Two page-granular reads of one page range, the second following the
+    /// first's flight: the follower counts neither a `block_range_gets` nor a
+    /// `block_cache_hits`, agreeing with its query accounting's one miss, on
+    /// both cache kinds.
+    ///
+    /// FLIP: counting `ReadOutcome::LateServe` in `block_cache_hits` in
+    /// `fetch_chunk_ranges` (the branch's `live == false` arm) makes the
+    /// follower's `block_cache_hits` 1 against its accounting's 0 hits.
+    #[tokio::test]
+    async fn a_page_range_follower_counts_neither_a_get_nor_a_block_hit() {
+        for kind in [Kind::Ram, Kind::Tiered] {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let (cache, parked) = cache_of(kind, &tmp);
+            let (store, gate) = held_store().await;
+            let fetcher = BlockRangeFetcher::new(store).with_cache(cache);
+            let seg = seg_ref(BLOCK * BLOCKS);
+            let size = BLOCK * BLOCKS;
+            let key = CacheKey::new(TENANT.0, CONTENT_HASH, 0, size);
+            let pin = EtagPin::default();
+            let wanted = [ByteExtent {
+                abs_start: 0,
+                len: size,
+            }];
+            let read = |acc: QueryAccounting| {
+                let fetcher = &fetcher;
+                let seg = &seg;
+                let pin = &pin;
+                let wanted = &wanted;
+                async move {
+                    let mut stats = BlockRangeStats::default();
+                    let mut asm = ObjectAssembler::new(&fetcher.assembly_gauge, size);
+                    fetcher
+                        .fetch_chunk_ranges(
+                            seg,
+                            TENANT,
+                            pin,
+                            wanted,
+                            QueryPhase::Scan,
+                            &mut asm,
+                            &acc,
+                            &mut stats,
+                        )
+                        .await
+                        .expect("page range read");
+                    assert_eq!(
+                        asm.slice(KEY, 0, size).expect("range placed").as_ref(),
+                        object().as_ref()
+                    );
+                    (acc.snapshot(), stats)
+                }
+            };
+            let ((leader_snap, leader_stats), (follower_snap, follower_stats), ()) = tokio::join!(
+                read(QueryAccounting::new()),
+                read(QueryAccounting::new()),
+                release_when(&gate, || parked(&key)),
+            );
+            assert_fetching_leader(&leader_snap, kind);
+            assert_eq!(leader_stats.block_range_gets, 1, "{kind:?}");
+            assert_eq!(leader_stats.block_bytes_fetched, size, "{kind:?}");
+            assert_eq!(leader_stats.block_cache_hits, 0, "{kind:?}");
+            assert_late_served(&follower_snap, kind);
+            assert_eq!(follower_stats.block_range_gets, 0, "{kind:?}");
+            assert_eq!(follower_stats.block_bytes_fetched, 0, "{kind:?}");
+            assert_eq!(
+                follower_stats.block_cache_hits, follower_snap.cache_hits,
+                "{kind:?}: block_cache_hits agrees with the query accounting"
+            );
+        }
+    }
+
+    /// `(s3_requests, s3_bytes)` of every `page_fetch` span closed while this
+    /// layer is the thread's subscriber.
+    #[derive(Clone, Default)]
+    struct PageFetchCosts {
+        open: Arc<std::sync::Mutex<std::collections::HashMap<u64, (u64, u64)>>>,
+        closed: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
+    }
+
+    struct CostVisitor<'a>(&'a mut (u64, u64));
+
+    impl tracing::field::Visit for CostVisitor<'_> {
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            match field.name() {
+                "s3_requests" => self.0.0 = value,
+                "s3_bytes" => self.0.1 = value,
+                _ => {}
+            }
+        }
+
+        fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PageFetchCosts {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().name() == "page_fetch" {
+                let mut cost = (u64::MAX, u64::MAX);
+                attrs.record(&mut CostVisitor(&mut cost));
+                self.open.lock().expect("lock").insert(id.into_u64(), cost);
+            }
+        }
+
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if let Some(cost) = self.open.lock().expect("lock").get_mut(&id.into_u64()) {
+                values.record(&mut CostVisitor(cost));
+            }
+        }
+
+        fn on_close(&self, id: tracing::span::Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+            if let Some(cost) = self.open.lock().expect("lock").remove(&id.into_u64()) {
+                self.closed.lock().expect("lock").push(cost);
+            }
+        }
+    }
+
+    /// Two whole-object reads of one object, the second following the first's
+    /// flight: one GET between them, the follower's `page_fetch` span records
+    /// zero requests and zero bytes, and its query accounting records a cache
+    /// miss, not a hit, on both cache kinds.
+    ///
+    /// FLIP: mapping `ReadOutcome::LateServe` to the `ReadOutcome::Hit` arm in
+    /// `LogSegmentFetcher::whole_object_bytes` makes the follower a hit with
+    /// cache bytes (both kinds); mapping it to the `ReadOutcome::Fetched` arm,
+    /// or reporting a tiered follower as `ReadOutcome::Fetched`, makes the
+    /// follower's span record one request, so the spans read `[(1, 48), (1, 48)]`.
+    #[tokio::test]
+    // Holds the test_tracing serialization guard across `.await`; the
+    // current-thread test runtime runs this future to completion with no other
+    // task, so there is no deadlock risk the lint guards against.
+    #[allow(clippy::await_holding_lock)]
+    async fn a_whole_object_follower_is_a_miss_with_no_get_in_its_span() {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        let _serial = crate::test_tracing::guard();
+        for kind in [Kind::Ram, Kind::Tiered] {
+            let costs = PageFetchCosts::default();
+            let _subscriber = tracing_subscriber::registry()
+                .with(costs.clone())
+                .set_default();
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let (cache, parked) = cache_of(kind, &tmp);
+            let (store, gate) = held_store().await;
+            let fetcher = LogSegmentFetcher::new(store).with_cache(cache);
+            let size = BLOCK * BLOCKS;
+            let seg = seg_ref(size);
+            let key = CacheKey::new(TENANT.0, CONTENT_HASH, 0, size);
+            let leader_acc = QueryAccounting::new();
+            let follower_acc = QueryAccounting::new();
+            let (leader, follower, ()) = tokio::join!(
+                fetcher.whole_object_bytes(&seg, TENANT, QueryPhase::Scan, &leader_acc),
+                fetcher.whole_object_bytes(&seg, TENANT, QueryPhase::Scan, &follower_acc),
+                release_when(&gate, || parked(&key)),
+            );
+            leader.expect("leader read");
+            follower.expect("follower read");
+            assert_fetching_leader(&leader_acc.snapshot(), kind);
+            assert_late_served(&follower_acc.snapshot(), kind);
+            let mut spans = costs.closed.lock().expect("lock").clone();
+            spans.sort_unstable();
+            assert_eq!(
+                spans,
+                vec![(0, 0), (1, size)],
+                "{kind:?}: the leader's span records its GET, the follower's none"
+            );
+        }
     }
 }

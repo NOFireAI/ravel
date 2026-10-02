@@ -11,7 +11,7 @@ use crate::limits::CacheLimits;
 use crate::metrics::CacheMetrics;
 use crate::s3fifo::S3Fifo;
 use crate::single_flight::{Role, SingleFlight, SingleFlightError};
-use crate::tiered::Source;
+use crate::tiered::ReadOutcome;
 
 /// XOR mask applied to every byte on a hit in corruption mode. Never
 /// 0x00: XORing with 0x00 would leave a zero-valued byte unchanged, and a
@@ -250,24 +250,25 @@ where
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = Result<Bytes, E>> + Send,
     {
-        self.get_or_fetch_with_source(key, fetch)
+        self.get_or_fetch_outcome(key, fetch)
             .await
             .map(|(bytes, _)| bytes)
     }
 
     /// [`get_or_fetch`](Self::get_or_fetch), also reporting whether this call
-    /// ran `fetch`. [`Source::Upstream`] only when it did: this call led the
-    /// flight and its RAM recheck missed. [`Source::Cache`] when the bytes came
-    /// without this call's own fetch, either from the leader's RAM recheck or,
-    /// for a follower, from another caller's flight, so a caller charges no
-    /// store round trip for them. Corruption is unchanged from `get_or_fetch`:
+    /// ran `fetch`. [`ReadOutcome::Fetched`] only when it did: this call led
+    /// the flight and its RAM recheck missed. [`ReadOutcome::LateServe`]
+    /// otherwise: the leader's RAM recheck served the bytes, or this call
+    /// followed another caller's flight. Never [`ReadOutcome::Hit`]: this is
+    /// the miss-only half, and the caller's own `get` already counted the
+    /// miss a late serve stays. Corruption is unchanged from `get_or_fetch`:
     /// a recheck serve is corrupted in corruption mode, and a follower of a
     /// flight that fetched gets the clean fetched bytes.
-    pub async fn get_or_fetch_with_source<F, Fut>(
+    pub async fn get_or_fetch_outcome<F, Fut>(
         &self,
         key: CacheKey,
         fetch: F,
-    ) -> Result<(Bytes, Source), SingleFlightError<E>>
+    ) -> Result<(Bytes, ReadOutcome), SingleFlightError<E>>
     where
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = Result<Bytes, E>> + Send,
@@ -287,17 +288,17 @@ where
         if role == Role::Follower {
             self.inner.metrics.record_collapse();
         }
-        let source = if role == Role::Leader && !from_cache {
-            Source::Upstream
+        let outcome = if role == Role::Leader && !from_cache {
+            ReadOutcome::Fetched
         } else {
-            Source::Cache
+            ReadOutcome::LateServe
         };
         let bytes = if from_cache {
             self.maybe_corrupt(bytes)
         } else {
             bytes
         };
-        Ok((bytes, source))
+        Ok((bytes, outcome))
     }
 
     /// Runs one age sweep synchronously: every entry older than
@@ -651,14 +652,14 @@ mod tests {
         );
     }
 
-    /// `get_or_fetch_with_source` reports [`Source::Upstream`] only to the call
+    /// `get_or_fetch_outcome` reports [`ReadOutcome::Fetched`] only to the call
     /// that ran its fetch: a follower of that flight and a later caller served
-    /// by the RAM recheck both get [`Source::Cache`].
+    /// by the RAM recheck are both [`ReadOutcome::LateServe`].
     ///
     /// FLIP: labelling the result from `from_cache` alone, ignoring the
-    /// single-flight role, reports the follower as `Source::Upstream`.
+    /// single-flight role, reports the follower as `ReadOutcome::Fetched`.
     #[tokio::test]
-    async fn get_or_fetch_with_source_reports_upstream_only_for_the_fetching_call() {
+    async fn get_or_fetch_outcome_reports_fetched_only_for_the_fetching_call() {
         let cache: Arc<Cache<&'static str>> = Arc::new(Cache::new(generous_limits()));
         let payload = Bytes::from_static(b"fetched once");
         let key = test_key_with_len(1, payload.len() as u64);
@@ -672,7 +673,7 @@ mod tests {
             let fetches = fetches.clone();
             tokio::spawn(async move {
                 cache
-                    .get_or_fetch_with_source(key, move || async move {
+                    .get_or_fetch_outcome(key, move || async move {
                         fetches.fetch_add(1, Ordering::SeqCst);
                         let _ = entered_tx.send(());
                         let _ = release_rx.await;
@@ -687,7 +688,7 @@ mod tests {
             let fetches = fetches.clone();
             tokio::spawn(async move {
                 cache
-                    .get_or_fetch_with_source(key, move || async move {
+                    .get_or_fetch_outcome(key, move || async move {
                         fetches.fetch_add(1, Ordering::SeqCst);
                         Ok::<Bytes, &'static str>(Bytes::from_static(b"follower fetch"))
                     })
@@ -700,16 +701,20 @@ mod tests {
         release_tx.send(()).expect("the leader is still parked");
         let leader_result = leader.await.unwrap().unwrap();
         let follower_result = follower.await.unwrap().unwrap();
-        assert_eq!(leader_result, (payload.clone(), Source::Upstream));
-        assert_eq!(follower_result, (payload.clone(), Source::Cache));
+        assert_eq!(leader_result, (payload.clone(), ReadOutcome::Fetched));
+        assert_eq!(follower_result, (payload.clone(), ReadOutcome::LateServe));
 
         let late = cache
-            .get_or_fetch_with_source(key, || async {
+            .get_or_fetch_outcome(key, || async {
                 Ok::<Bytes, &'static str>(Bytes::from_static(b"second fetch"))
             })
             .await
             .unwrap();
-        assert_eq!(late, (payload, Source::Cache), "the RAM recheck served it");
+        assert_eq!(
+            late,
+            (payload, ReadOutcome::LateServe),
+            "the RAM recheck served it"
+        );
         assert_eq!(fetches.load(Ordering::SeqCst), 1);
         assert_eq!(cache.metrics().snapshot().single_flight_collapses, 1);
     }

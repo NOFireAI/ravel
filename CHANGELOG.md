@@ -499,12 +499,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now counts as one cache miss and nothing else. Before, a non-lead block that
   another flight admitted in the meantime also counted a cache hit and its
   bytes, and one served by the RAM recheck counted a second miss (issue
-  #2293). On the RAM-only cache, a metrics read or a log whole-object or
-  extent read served by the RAM recheck or by another read's in-flight GET now
-  counts no GET in its span, `GetCost`, `live_gets` or peak fetch run, and
-  counts a cache hit; a log read's second look at a coalesced run's blocks
-  records no RAM or disk hit or miss; and `block_cache_hits` counts only the
-  blocks whose first peek hit, as the query accounting does (issue #2311).
+  #2293). On the four read-through paths, a metrics (RSEG) range read, a log
+  whole-object read, a log extent read and a span whole-object read, a late
+  serve (a read served by the RAM recheck, or one that waited on another
+  read's in-flight GET) counts the cache miss it counted before and no GET of
+  its own, with or without `--cache-dir`. The first three no longer charge it
+  one in `GetCost`, the span's `s3_requests`, `probe_gets`, `metadata_gets`,
+  `live_gets` or the peak fetch run; the span read never did. Query cache hit
+  and miss counts are unchanged. A log read's second look at a coalesced run's
+  blocks records no RAM or disk hit or miss, though a block it finds on the
+  disk tier is still re-admitted to RAM. `block_cache_hits` counts only the
+  blocks and page ranges whose own lookup hit, as the query accounting does,
+  on the block-range and the page-range read alike (issue #2311).
 - **Query processes classify fold lag against the maintain processes' fold
   interval** (issue #2074). A request-budget refusal names fold lag once the
   unsealed tail passes `healthy_tail_max + fold_interval + head_cache_ttl`
