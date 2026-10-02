@@ -80,6 +80,12 @@ impl IntoResponse for ApiError {
 pub enum ServiceErrorKind {
     /// No resolvable tenant credential.
     Unauthorized,
+    /// A resolved, authenticated caller that lacks a capability the request
+    /// needs (the `ddl` capability for a `CREATE` or `DROP`, ADR-2040 decision
+    /// 4). Distinct from [`ServiceErrorKind::Unauthorized`]: there the caller
+    /// has no credential at all, here the credential is good but does not
+    /// grant this request.
+    Forbidden,
     /// A malformed or unparseable request parameter.
     InvalidArgument,
     /// A well-formed request whose values are out of contract (a percentile
@@ -139,7 +145,7 @@ impl ServiceError {
     /// message names the capability and nothing about server state.
     pub fn forbidden(message: String) -> Self {
         ServiceError::new(
-            ServiceErrorKind::Unauthorized,
+            ServiceErrorKind::Forbidden,
             ApiError {
                 status: StatusCode::FORBIDDEN,
                 error_type: "forbidden",
@@ -379,6 +385,7 @@ impl From<ApiError> for ServiceError {
         let kind = match api.status {
             StatusCode::BAD_REQUEST => ServiceErrorKind::InvalidArgument,
             StatusCode::UNAUTHORIZED => ServiceErrorKind::Unauthorized,
+            StatusCode::FORBIDDEN => ServiceErrorKind::Forbidden,
             StatusCode::UNPROCESSABLE_ENTITY => ServiceErrorKind::Unsupported,
             StatusCode::SERVICE_UNAVAILABLE => ServiceErrorKind::Unavailable,
             StatusCode::GATEWAY_TIMEOUT => ServiceErrorKind::Deadline,

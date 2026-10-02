@@ -112,6 +112,12 @@ pub enum QueryStatus {
     Ok,
     /// The query failed (any `SqlError`); the record still names the attempt.
     Error,
+    /// A DDL statement is about to run (`services/ravel-server/src/sql.rs`'s
+    /// `run_ddl`): the capability check passed and nothing has been read or
+    /// written yet. Severity `INFO`, the same as `Ok`, since reaching this
+    /// point is not itself a failure; it is a record of what the server is
+    /// about to attempt before attempting it.
+    Attempted,
 }
 
 impl QueryStatus {
@@ -120,16 +126,18 @@ impl QueryStatus {
         match self {
             QueryStatus::Ok => "ok",
             QueryStatus::Error => "error",
+            QueryStatus::Attempted => "attempted",
         }
     }
 
-    /// The record severity for this status: `INFO` for a successful query, and
-    /// `ERROR` for a failed one, so the audit table's `severity_text` column
-    /// reflects the outcome without decoding the `query.status` attr.
+    /// The record severity for this status: `INFO` for a successful or
+    /// attempted query, and `ERROR` for a failed one, so the audit table's
+    /// `severity_text` column reflects the outcome without decoding the
+    /// `query.status` attr.
     fn severity(self) -> (u8, &'static str) {
         match self {
             // OTLP severity numbers: INFO=9, ERROR=17.
-            QueryStatus::Ok => (9, "INFO"),
+            QueryStatus::Ok | QueryStatus::Attempted => (9, "INFO"),
             QueryStatus::Error => (17, "ERROR"),
         }
     }
@@ -496,6 +504,12 @@ mod tests {
         assert_eq!(rows[0].severity_text, "ERROR");
         assert_eq!(str_attr(&rows[0], "query.status"), Some("error"));
         assert_eq!(str_attr(&rows[0], "query.text"), Some("SELECT nope"));
+    }
+
+    #[test]
+    fn attempted_status_is_info() {
+        assert_eq!(QueryStatus::Attempted.as_str(), "attempted");
+        assert_eq!(QueryStatus::Attempted.severity(), (9, "INFO"));
     }
 
     /// A redactor that reports what it was asked to redact and returns a
