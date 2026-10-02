@@ -18,11 +18,14 @@ use common::*;
 use ravel_commit::keys;
 use ravel_maintain::config::DEFAULT_MAX_INGEST_LAG_NS;
 use ravel_maintain::{
-    Bucket, Clock, CompactionOutcome, CompactorConfig, FixedClock, MarkerAnchor, MarkerKind,
-    NoLeases, RetentionConfig, RetentionOutcome, RetentionPolicy, SnapshotBlock, UnnamedMarker,
-    compact_bucket, reap_orphan_unnamed_markers, retention_sweep_bucket, sweep_superseded,
+    Bucket, Clock, CompactionOutcome, CompactorConfig, FixedClock, LeaseCheck, MarkerAnchor,
+    MarkerKind, NoLeases, RetentionConfig, RetentionOutcome, RetentionPolicy, SnapshotBlock,
+    UnnamedMarker, compact_bucket, reap_orphan_unnamed_markers, retention_sweep_bucket,
+    sweep_superseded,
 };
-use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+use ravel_object_store::fault::{
+    FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
@@ -1040,6 +1043,187 @@ async fn superseded_deletes_objects_then_the_marker() {
     assert!(deletes[..4].iter().all(|k| !k.contains("/maint/")));
 }
 
+// --- one marker over several chain groups ------------------------------
+
+/// Seed the two inputs, fold so HEAD names only the first, then compact both:
+/// one compaction record whose entry gathers two chain groups under one marker
+/// key, the first named by HEAD and the second not. Returns the bucket, the
+/// two input commit keys, the marker key and the first instant past the
+/// record's horizon.
+async fn two_groups_first_named(
+    mem: &Arc<MemoryStore>,
+    config: &CompactorConfig,
+) -> (Bucket, [String; 2], String, i64) {
+    let specs = metrics_specs();
+    let created = sealed_now_ns();
+    let first = seed_input(mem.as_ref(), &specs[0]).await;
+    fold_head(mem, created).await;
+    let second = seed_input(mem.as_ref(), &specs[1]).await;
+    let b = bucket();
+    let outcome = compact_bucket(mem.as_ref(), &FixedClock::new(created), config, &b)
+        .await
+        .expect("compact");
+    assert!(matches!(outcome, CompactionOutcome::Compacted { .. }));
+    let records: Vec<String> = bucket_commit_keys(mem.as_ref(), &b)
+        .await
+        .into_iter()
+        .filter(|k| keys::parse_compaction_record_key(k).is_ok())
+        .collect();
+    assert_eq!(records.len(), 1, "one record enters both groups");
+    let marker_key = keys::record_unnamed_marker_key(&records[0]).expect("marker key");
+    (
+        b,
+        [first, second],
+        marker_key,
+        created + config.protection_horizon_ns + 1,
+    )
+}
+
+/// Two chain groups gathered from one record's entry share its marker, and
+/// the marker stands for both: while HEAD names the first group, no marker is
+/// written and the unnamed second group waits with it, even once a window has
+/// passed since it was first seen unnamed.
+///
+/// Mutation: gate each group on its own HEAD answer instead of
+/// `combine_head_gates` over the marker key's groups. The unnamed group then
+/// writes the marker at `t1` (the `written == 0` and marker-absent assertions
+/// fail), and at `t1 + window` its input record and data go (the `(0, 0)`
+/// assertion fails).
+#[tokio::test]
+async fn a_named_group_holds_every_group_under_its_marker() {
+    let mem = Arc::new(MemoryStore::new());
+    let config = cfg();
+    let (b, inputs, marker_key, t1) = two_groups_first_named(&mem, &config).await;
+    for now in [t1, t1 + window_ns(&config)] {
+        let out = superseded_at(mem.as_ref(), &config, &b, now).await;
+        assert_eq!(
+            (out.records_deleted, out.data_deleted),
+            (0, 0),
+            "nothing in either group is deleted"
+        );
+        assert_eq!(out.held_by_snapshot, 2, "the named input's record and data");
+        assert_eq!(
+            out.held_by_pinned_window, 2,
+            "the unnamed input's record and data wait under the shared marker"
+        );
+        assert_eq!(out.unnamed_markers.written, 0);
+        assert_eq!(out.unnamed_markers.put_requests, 0);
+        assert!(read_marker(mem.as_ref(), &marker_key).await.is_none());
+    }
+    for key in &inputs {
+        assert!(mem.head(key).await.is_ok(), "{key} survives");
+    }
+}
+
+/// Protects one key, as a legal hold over it would.
+struct Protects(String);
+
+impl LeaseCheck for Protects {
+    fn is_protected(&self, key: &str) -> bool {
+        key == self.0
+    }
+}
+
+/// A lease-held group's HEAD answer still counts toward its marker: with the
+/// held group named, the marker is not written, so the window cannot start
+/// for the unnamed sibling while the held group is named.
+///
+/// Mutation: leave a lease-held group's HEAD answer out of the combined
+/// answer. The combined answer is then the sibling's alone, Clear, and the
+/// marker is written at `t1` (the `written == 0` and marker-absent assertions
+/// fail), and at `t1 + window` the sibling goes (the `(0, 0)` assertion
+/// fails).
+#[tokio::test]
+async fn a_held_group_still_named_keeps_its_marker_unwritten() {
+    let mem = Arc::new(MemoryStore::new());
+    let config = cfg();
+    let (b, inputs, marker_key, t1) = two_groups_first_named(&mem, &config).await;
+    let lease = Protects(inputs[0].clone());
+    for now in [t1, t1 + window_ns(&config)] {
+        let out = sweep_superseded(
+            mem.as_ref(),
+            &FixedClock::new(now),
+            &config,
+            &lease,
+            &b.tenant_hash,
+            b.signal,
+            b.shard,
+        )
+        .await
+        .expect("rule 2");
+        assert_eq!(
+            out.chain_groups_held_by_legal_hold, 1,
+            "the named group is the held one"
+        );
+        assert_eq!((out.records_deleted, out.data_deleted), (0, 0));
+        assert_eq!(out.held_by_pinned_window, 2, "the unnamed sibling waits");
+        assert_eq!(out.unnamed_markers.written, 0);
+        assert_eq!(out.unnamed_markers.put_requests, 0);
+        assert!(read_marker(mem.as_ref(), &marker_key).await.is_none());
+    }
+}
+
+/// A pass whose window has passed deletes part of the record's groups and has
+/// a later delete refused: the marker stays, aged, and the retry finishes the
+/// rest under it without writing a fresh marker or restarting the window.
+///
+/// Mutation: retire the marker even when a group under it was stopped. The
+/// retry then finds no marker, writes a fresh one and holds the rest for a
+/// new window: the kept-marker, `written == 0` and `(1, 1)` assertions fail.
+#[tokio::test]
+async fn a_retry_after_a_partial_delete_keeps_the_aged_marker() {
+    let mem = Arc::new(MemoryStore::new());
+    let config = cfg();
+    let b = seed_bucket(mem.as_ref()).await;
+    let compacted_at = sealed_now_ns();
+    compact_bucket(mem.as_ref(), &FixedClock::new(compacted_at), &config, &b)
+        .await
+        .expect("compact");
+    let record_key = bucket_commit_keys(mem.as_ref(), &b)
+        .await
+        .into_iter()
+        .find(|k| keys::parse_compaction_record_key(k).is_ok())
+        .expect("compaction record");
+    let marker_key = keys::record_unnamed_marker_key(&record_key).expect("marker key");
+    let t1 = compacted_at + config.protection_horizon_ns + 1;
+    let first = superseded_at(mem.as_ref(), &config, &b, t1).await;
+    assert_eq!(first.unnamed_markers.written, 1);
+
+    // The first input record's delete goes through, the second's is refused:
+    // the first group goes whole and the second stops before its data.
+    let aged = t1 + window_ns(&config);
+    let store = FaultStore::new(
+        mem.clone(),
+        FaultPlan::empty().with_rule(
+            Rule::new(Op::Delete, ScriptedFault::Permanent("denied".into()))
+                .with_key_contains("/c/".to_string())
+                .with_occurrence(Occurrence::Nth(2)),
+        ),
+    );
+    let partial = superseded_at(&store, &config, &b, aged).await;
+    assert_eq!(store.fault_count(Op::Delete, FaultKind::Permanent), 1);
+    assert_eq!(partial.deletes_refused, 1);
+    assert_eq!((partial.records_deleted, partial.data_deleted), (1, 1));
+    assert_eq!(partial.unnamed_markers.retired, 0);
+    let kept = read_marker(mem.as_ref(), &marker_key)
+        .await
+        .expect("the marker outlives a group it still gates");
+    assert_eq!(kept.observed_unix_ns, t1);
+
+    let retry = superseded_at(mem.as_ref(), &config, &b, aged + 1).await;
+    assert_eq!(
+        (retry.records_deleted, retry.data_deleted),
+        (1, 1),
+        "the retry finishes the stopped group under the aged marker"
+    );
+    assert_eq!(retry.held_by_pinned_window, 0);
+    assert_eq!(retry.unnamed_markers.written, 0, "no fresh marker");
+    assert_eq!(retry.unnamed_markers.put_requests, 0);
+    assert_eq!(retry.unnamed_markers.retired, 1);
+    assert!(read_marker(mem.as_ref(), &marker_key).await.is_none());
+    assert!(mem.head(&record_key).await.is_ok());
+}
+
 // --- the orphan reaper ---------------------------------------------------
 
 fn marker_body(key: &str, observed_unix_ns: i64) -> Bytes {
@@ -1126,6 +1310,52 @@ async fn the_orphan_reaper_needs_a_gone_anchor_and_an_old_marker() {
     assert_eq!(out.head_requests, 4, "one anchor HEAD per parsed marker");
     let left: BTreeSet<String> = marker_keys(&store).await.into_iter().collect();
     assert_eq!(left, BTreeSet::from([young, anchored, junk]));
+}
+
+/// A marker whose delete fails is counted and skipped, and the reap goes on:
+/// the failing marker sorts first, and the two after it are still reaped.
+///
+/// Mutation: return from `reap_listed` on the failed DELETE instead of
+/// continuing. The reap then stops at the first key: the `reaped == 2`
+/// assertion and the remaining-keys assertion fail.
+#[tokio::test]
+async fn a_failing_marker_delete_does_not_stop_the_reap() {
+    let config = cfg();
+    let th = tenant_hash();
+    let now = sealed_now_ns() + 10 * config.protection_horizon_ns;
+    let old = now - config.protection_horizon_ns - 1;
+    let markers: Vec<String> = (0..3)
+        .map(|shard| {
+            keys::retention_unnamed_marker_key(&th, Signal::Metrics, shard, HOUR).expect("key")
+        })
+        .collect();
+    let store = faulting_on(
+        Op::Delete,
+        ScriptedFault::Permanent("denied".into()),
+        &markers[0],
+    );
+    for key in &markers {
+        store
+            .put(key, marker_body(key, old), PutOptions::default())
+            .await
+            .expect("seed");
+    }
+    assert_eq!(
+        marker_keys(&store).await,
+        markers,
+        "the failing key lists first"
+    );
+
+    let out =
+        reap_orphan_unnamed_markers(&store, &FixedClock::new(now), &config, &th, Signal::Metrics)
+            .await
+            .expect("a failing key does not fail the reap");
+    assert_eq!(store.fault_count(Op::Delete, FaultKind::Permanent), 1);
+    assert_eq!(out.listed, 3);
+    assert_eq!(out.failed, 1);
+    assert_eq!(out.reaped, 2);
+    assert_eq!(out.delete_requests, 3);
+    assert_eq!(marker_keys(&store).await, vec![markers[0].clone()]);
 }
 
 /// A deleting pass that gates a candidate also runs the reaper: an orphan from
