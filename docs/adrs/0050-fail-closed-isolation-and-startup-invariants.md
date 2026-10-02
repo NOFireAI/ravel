@@ -240,6 +240,9 @@ already satisfy the constraint) and mutated only by `ravel-cli gc-config
 set`, which enforces `protection_horizon >= max_query_duration + grace`
 at write time and swaps with `CasVersion`.
 
+Format version 2 adds `head_cache_ttl_ns` and a query-mode check against
+it; see the sys/gc version 2 amendment below.
+
 Every mode validates itself against `sys/gc` at startup and refuses to
 start on violation:
 
@@ -450,3 +453,34 @@ where nothing consumes readiness.
   per-tenant credentials, and per-tenant KMS. Nothing in this ADR
   forecloses them; the provisioning record
   gives a future epoch map a durable home.
+
+## Amendment (2026-10-02): `sys/gc` format version 2 records `head_cache_ttl_ns`
+
+<!-- amendment-applies: sections="4. The GC constraint is validated once, durably, in `sys/gc`" pointer="sys/gc version 2 amendment" -->
+
+ADR-1133 decision 4 makes the HEAD cache TTL a term of the sweeper's
+pinned-query window, so section 4's field list gains one field under the
+frozen-format procedure. This is the sys/gc version 2 amendment.
+
+- **The field.** `GcConfig` in proto/ravel/sys.proto gains
+  `sfixed64 head_cache_ttl_ns = 7`. Format version 2 records it and
+  requires it to be positive. Format version 1 does not record it: a reader
+  decodes it as the compiled `DEFAULT_HEAD_CACHE_TTL_NS` (30 s) whatever the
+  field holds. A build reads versions 1 and 2 and refuses any other, so a
+  build that reads only version 1 refuses a version 2 object.
+- **Bootstrap stays at version 1.** A fresh bucket is still bootstrapped
+  with version 1, so a new build touching a bucket first does not lock older
+  builds out. Only `ravel-cli gc-config set --head-cache-ttl` writes version
+  2. `set` without the flag keeps the stored version, and on version 2 the
+  recorded TTL, so it never writes version 1 over version 2.
+- **A fourth startup check.** Query modes refuse to start when the HEAD
+  cache TTL their catalog runs on is above the stored `head_cache_ttl_ns`;
+  on a version 1 object the stored value is the compiled default.
+- **The CLI sweep validates too.** `ravel-cli maintain sweep` reads
+  `sys/gc` (bootstrapping it when absent, as maintain mode does), takes the
+  horizon, grace and `max_query_duration` from it, and runs the maintain
+  and clock-skew checks before it sweeps.
+
+docs/guides/operations/maintenance.md gives the upgrade procedure: every
+maintain and query process runs a build that reads version 2 before
+`gc-config set --head-cache-ttl` is run.

@@ -62,7 +62,7 @@ the reservation commit that used to work around it.
 | [0047](0047-exemplars.md) | Exemplars: an RSEG section, a capped admission, and a correlation surface | Accepted |
 | [0048](0048-maintenance-safety-and-coverage.md) | Maintenance safety and coverage: legal hold wired, storage-derived tenant set, mass-orphan circuit breaker, compaction conservation gate | Accepted |
 | [0049](0049-rlog-postings.md) | RLOG POSTINGS: exact block-level attribute pruning, opt-in per field | Accepted |
-| [0050](0050-fail-closed-isolation-and-startup-invariants.md) | Fail-closed isolation and startup invariants: dedicated mTLS listener, hard tenant_hash mismatch errors, keyed tenant hash default, durable GC config and shard_count, store qualification, readiness store probe | Accepted |
+| [0050](0050-fail-closed-isolation-and-startup-invariants.md) | Fail-closed isolation and startup invariants: dedicated mTLS listener, hard tenant_hash mismatch errors, keyed tenant hash default, durable GC config and shard_count, store qualification, readiness store probe | Amended by 1133 |
 | [0051](0051-tenant-admission-control.md) | Tenant admission control and ingest-time correctness | Accepted |
 | [0052](0052-online-resharding.md) | Online resharding: generation-versioned shard_count appended to the provisioning record; no data movement, per-hour scan sets, commit tokens unchanged | Accepted |
 | [0053](0053-ci-latency-and-delivery-process-hardening.md) | CI latency and delivery process hardening | Accepted |

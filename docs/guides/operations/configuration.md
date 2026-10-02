@@ -698,7 +698,13 @@ conditions the operator records while it waits.
   satisfies the inequality but differs from the durable value still refuses to
   start.
 - query-serving modes (`query`, `all`): the engine deadline must be less than or
-  equal to the stored `max_query_duration`.
+  equal to the stored `max_query_duration`, and the HEAD cache TTL the catalog
+  runs on must be less than or equal to the stored `head_cache_ttl`. A
+  format version 1 `sys/gc` records no `head_cache_ttl`, and the compiled
+  default (30 s) applies; `gc-config set --head-cache-ttl` writes format
+  version 2, which records one. The
+  [maintenance guide](maintenance.md#upgrading-sysgc-to-format-version-2) gives
+  the upgrade order.
 - Flight SQL, in a build that has it: the ticket time-to-live ceiling must be
   less than or equal to `protection_horizon - grace`. The server reads that
   ceiling from `sys/gc` rather than a compiled-in default, so it tracks the
