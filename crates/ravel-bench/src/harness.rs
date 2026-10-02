@@ -16,7 +16,8 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::s3::{S3AuthMode, S3Config, S3Store};
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
-    ObjectStoreBackend, PageToken, PutOptions, PutOutcome, StoreError, StoreMetrics,
+    ObjectStoreBackend, PageToken, Pin, PinnedRead, PutOptions, PutOutcome, StoreError,
+    StoreMetrics,
 };
 
 /// A backend wrapper that sleeps a fixed duration before every `get`,
@@ -50,6 +51,25 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for DelayedGetStore<S> {
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
         tokio::time::sleep(self.delay).await;
         self.inner.get(key, range).await
+    }
+
+    async fn get_pinned(
+        &self,
+        key: &str,
+        range: GetRange,
+        pin: &Pin,
+    ) -> Result<PinnedRead, StoreError> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.get_pinned(key, range, pin).await
+    }
+
+    async fn get_with_pin(&self, key: &str, range: GetRange) -> Result<PinnedRead, StoreError> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.get_with_pin(key, range).await
+    }
+
+    async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, Pin), StoreError> {
+        self.inner.pin_of(key).await
     }
 
     async fn put_multipart<'a>(
@@ -86,6 +106,10 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for DelayedGetStore<S> {
 
     fn capabilities(&self) -> Capabilities {
         self.inner.capabilities()
+    }
+
+    fn observed_store_time_ns(&self) -> Option<i64> {
+        self.inner.observed_store_time_ns()
     }
 }
 
@@ -365,6 +389,51 @@ mod tests {
             ),
             None,
             "a memory-backed run never touched an endpoint, so it must never name one"
+        );
+    }
+
+    /// Issue #2391: `DelayedGetStore` must forward the pinned-read methods to
+    /// its inner store rather than falling back to the trait's refusing
+    /// default. Without the `get_pinned`/`get_with_pin`/`pin_of` overrides
+    /// added above, every assertion here fails with `StoreError::Unsupported`
+    /// instead of the outcomes asserted below.
+    #[tokio::test]
+    async fn delayed_get_store_forwards_pinned_reads() {
+        let inner = MemoryStore::new();
+        inner
+            .put(
+                "k",
+                Bytes::from_static(b"hello"),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("seed key");
+        let store = DelayedGetStore::new(inner, Duration::from_millis(0));
+
+        let (meta, pin) = store.pin_of("k").await.expect("pin_of");
+        assert_eq!(meta.key, "k");
+
+        let with_pin = store
+            .get_with_pin("k", GetRange::Full)
+            .await
+            .expect("get_with_pin");
+        assert_eq!(with_pin.outcome.data.as_ref(), b"hello");
+        assert_eq!(with_pin.pin, pin);
+
+        let pinned = store
+            .get_pinned("k", GetRange::Full, &pin)
+            .await
+            .expect("get_pinned with the right pin");
+        assert_eq!(pinned.outcome.data.as_ref(), b"hello");
+
+        let wrong_pin = Pin::etag("not-the-real-etag");
+        let err = store
+            .get_pinned("k", GetRange::Full, &wrong_pin)
+            .await
+            .expect_err("a wrong ETag must be refused, not served");
+        assert!(
+            matches!(err, StoreError::PreconditionFailed),
+            "got {err:?}, want PreconditionFailed (never Unsupported)"
         );
     }
 }

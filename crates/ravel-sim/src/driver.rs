@@ -47,7 +47,7 @@ use ravel_object_store::fault::{FaultKind, FaultStore, GateHandle, Op};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
-    ObjectStoreBackend, PageToken, PutOptions, PutOutcome, StoreError,
+    ObjectStoreBackend, PageToken, Pin as StorePin, PinnedRead, PutOptions, PutOutcome, StoreError,
 };
 use ravel_promql::Value;
 use ravel_query::{EngineConfig, QueryEngine, QueryError};
@@ -108,6 +108,23 @@ impl ObjectStoreBackend for SharedStore {
         self.0.get(key, range).await
     }
 
+    async fn get_pinned(
+        &self,
+        key: &str,
+        range: GetRange,
+        pin: &StorePin,
+    ) -> Result<PinnedRead, StoreError> {
+        self.0.get_pinned(key, range, pin).await
+    }
+
+    async fn get_with_pin(&self, key: &str, range: GetRange) -> Result<PinnedRead, StoreError> {
+        self.0.get_with_pin(key, range).await
+    }
+
+    async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, StorePin), StoreError> {
+        self.0.pin_of(key).await
+    }
+
     async fn put_multipart<'a>(
         &'a self,
         key: &str,
@@ -123,6 +140,15 @@ impl ObjectStoreBackend for SharedStore {
         self.0.list(prefix, page).await
     }
 
+    async fn list_after(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        page: Option<PageToken>,
+    ) -> Result<ListPage, StoreError> {
+        self.0.list_after(prefix, start_after, page).await
+    }
+
     async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
         self.0.list_delimited(prefix).await
     }
@@ -133,6 +159,10 @@ impl ObjectStoreBackend for SharedStore {
 
     fn capabilities(&self) -> Capabilities {
         self.0.capabilities()
+    }
+
+    fn observed_store_time_ns(&self) -> Option<i64> {
+        self.0.observed_store_time_ns()
     }
 }
 
@@ -1815,6 +1845,50 @@ mod tests {
         let after = probe(0xABCD, 100);
         check_compaction_fault_invariant(7, "tenant-a", "after compaction", &before, &after)
             .expect("an equivalent recovered snapshot must satisfy the invariant");
+    }
+
+    /// Issue #2391: `SharedStore` must forward the pinned-read methods
+    /// through its `Arc<dyn ObjectStoreBackend>` indirection, the same way it
+    /// forwards `get`, rather than falling back to the trait's refusing
+    /// default.
+    #[tokio::test]
+    async fn shared_store_forwards_pinned_reads() {
+        let inner: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        inner
+            .put(
+                "k",
+                Bytes::from_static(b"hello"),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("seed key");
+        let store = SharedStore(Arc::clone(&inner));
+
+        let (meta, pin) = store.pin_of("k").await.expect("pin_of");
+        assert_eq!(meta.key, "k");
+
+        let with_pin = store
+            .get_with_pin("k", GetRange::Full)
+            .await
+            .expect("get_with_pin");
+        assert_eq!(with_pin.outcome.data.as_ref(), b"hello");
+        assert_eq!(with_pin.pin, pin);
+
+        let pinned = store
+            .get_pinned("k", GetRange::Full, &pin)
+            .await
+            .expect("get_pinned with the right pin");
+        assert_eq!(pinned.outcome.data.as_ref(), b"hello");
+
+        let wrong_pin = StorePin::etag("not-the-real-etag");
+        let err = store
+            .get_pinned("k", GetRange::Full, &wrong_pin)
+            .await
+            .expect_err("a wrong ETag must be refused, not served");
+        assert!(
+            matches!(err, StoreError::PreconditionFailed),
+            "got {err:?}, want PreconditionFailed (never Unsupported)"
+        );
     }
 
     /// A recoverable store fault (retryable, or a not-found blip) is retried;
