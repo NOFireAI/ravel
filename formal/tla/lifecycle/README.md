@@ -406,6 +406,15 @@ What the window gate as modelled does not cover at all:
   ones with `HeadCacheTtl` and `ClockSkew` nonzero, do not list those two
   invariants and prune the erasure request with `WindowGateScope`, and every
   cfg that lists them sets both constants to 0. Issue #2358 tracks it.
+- Decision 5's reset of a re-named candidate's marker. In this instance a
+  candidate never returns to HEAD once a marker exists: every data object is
+  in the one bucket `b1`, so `DropRetiredBucketFromHead` empties `head` for
+  good, and `HeadAdvanceRewrite` draws from `LiveRecordSets`, which excludes
+  the superseded set, which only grows. So `ClearRenamedMarker` fires only on a
+  marker planted by `StaleMarker`, and the hazard it exists for (a candidate
+  marked, re-named, dropped again, then deleted on the old marker inside a new
+  pin's window) is unreachable. The positive cfg gives no evidence that the
+  reset is load-bearing, and there is no negative control for omitting it.
 
 ## Non-vacuity
 
