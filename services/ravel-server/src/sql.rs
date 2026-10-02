@@ -1,4 +1,5 @@
-//! `POST /api/v1/sql`: the read-only SQL endpoint.
+//! `POST /api/v1/sql`: the SQL endpoint. A query is read-only; the only
+//! statements that write are the Parquet DDL forms below.
 //!
 //! This module is the transport and the error-to-HTTP boundary; every
 //! semantic decision lives in ravel-sql. That split is what keeps ADR-0013's
@@ -48,6 +49,26 @@
 //! `application/vnd.apache.arrow.stream` yields an Arrow IPC stream, which is
 //! bit-exact for every float; anything else yields JSON.
 //!
+//! # DDL
+//!
+//! `ravel_sql::statement_kind` routes a statement whose top level is any
+//! `CREATE` or `DROP` form to the DDL path; everything else, including text
+//! that does not parse, takes the query path unchanged. The DDL path accepts
+//! `CREATE [OR REPLACE] EXTERNAL TABLE ... STORED AS PARQUET LOCATION ...` and
+//! `DROP TABLE` (ADR-2040) and needs the `ddl` capability, which a principal
+//! holds only through a `TOKEN=TENANT;ddl` token or the `--oidc-ddl-claim`
+//! claim. Without it the response is 403 with `errorType` `forbidden`.
+//!
+//! A DDL success is 200 with
+//! `{"status":"success","data":{"outcome":"created"|"dropped"|"noop","table":...}}`,
+//! plus `version` for `created` and `dropped` and `files` for `created`. The
+//! body is JSON even when `Accept` asks for Arrow IPC, since a DDL outcome has
+//! no rows. A failure maps from `DdlExecuteError::class`: 400 `bad_data`, 409
+//! `conflict`, 404 `not_found`, 422 `execution`, 503 `unavailable`, 504
+//! `timeout`, 500 `internal`. The `timeout` request field clamps the DDL
+//! deadline the same way it clamps a query's, and `start`, `end` and
+//! `min_commit_token` do not apply to DDL.
+//!
 //! # Warnings
 //!
 //! A JSON success body carries a top-level `warnings` array of strings when
@@ -73,11 +94,12 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use ravel_ingest::Clock;
-use ravel_maintain::QueryAuditSink;
+use ravel_maintain::{QueryAuditSink, QueryStatus};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_query::QueryAdmissionController;
 use ravel_query::http::TenantResolver;
-use ravel_sql::{SqlExecutor, SqlRequest};
+use ravel_sql::{DdlOutcome, SqlExecutor, SqlRequest};
+use ravel_tenant_resolve::Principal;
 use ravel_types::{CommitToken, TenantHash, TimeRange};
 use serde::Deserialize;
 use serde_json::json;
@@ -187,23 +209,31 @@ async fn handle(State(state): State<SqlState>, req: Request<Body>) -> Response {
     }
 }
 
-/// Parse, authenticate, ask the query service layer, encode. Fleet-global
-/// admission, the usage record on every exit path (the dropped-future exit
-/// included), the audit event and its durability wait, and error redaction all
-/// happen inside [`QueryService::sql_execute`], shared with every other query
-/// surface.
+/// Parse, authenticate, route on the statement's kind, then either ask the
+/// query service layer and encode (a query) or run the DDL path
+/// ([`run_ddl`]). For a query, fleet-global admission, the usage record on
+/// every exit path (the dropped-future exit included), the audit event and its
+/// durability wait, and error redaction all happen inside
+/// [`QueryService::sql_execute`], shared with every other query surface.
 ///
 /// Authentication runs here, before the service takes a permit, so an anonymous
 /// caller no longer consumes one from the fleet-global concurrency ceiling.
 async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ServiceError> {
     let headers = req.headers().clone();
-    let tenant_hash = crate::service::authenticate(state.tenant_resolver.as_ref(), &headers)?;
+    let principal =
+        crate::service::authenticate_principal(state.tenant_resolver.as_ref(), &headers)?;
+    let tenant_hash = principal.tenant.hash();
 
     let body = axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES)
         .await
         .map_err(|e| ApiError::bad_request(format!("could not read request body: {e}")))?;
     let body: SqlBody = serde_json::from_slice(&body)
         .map_err(|e| ApiError::bad_request(format!("invalid JSON request body: {e}")))?;
+
+    match ravel_sql::statement_kind(&body.query) {
+        ravel_sql::StatementKind::Query => {}
+        ravel_sql::StatementKind::Ddl => return run_ddl(state, &principal, &body).await,
+    }
 
     let now_ns = state.clock.now_ns();
     let request = build_request(&body, now_ns, state.max_deadline)?;
@@ -238,6 +268,125 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ServiceEr
     encode(&headers, &outcome, tenant_hash, stats)
 }
 
+/// The request's wall deadline: a client may shorten its own deadline but
+/// never extend it past the server budget. Shared by the query and DDL paths so
+/// both clamp identically.
+fn request_deadline(body: &SqlBody, max_deadline: Duration) -> Result<Duration, ApiError> {
+    match body.timeout {
+        Some(secs) if secs > 0.0 && secs.is_finite() => {
+            Ok(Duration::from_secs_f64(secs).min(max_deadline))
+        }
+        Some(_) => Err(ApiError::bad_request(
+            "\"timeout\" must be a positive, finite number of seconds".to_string(),
+        )),
+        None => Ok(max_deadline),
+    }
+}
+
+/// The DDL path: `CREATE [OR REPLACE] EXTERNAL TABLE` and `DROP TABLE`
+/// (ADR-2040 decision 4).
+///
+/// A caller without the `ddl` capability is refused with 403 before anything
+/// else happens: no grants record is read, no store is called and
+/// `validate_ddl` is not run. A caller with it takes a fleet-global admission
+/// permit and runs [`SqlExecutor::execute_ddl`] as the principal's own tenant,
+/// which is also what the manifest records as its creator; no header or body
+/// value can name another.
+///
+/// Every statement that reaches here submits exactly one audit event, awaited
+/// before the response, with the raw statement text (the sink redacts it).
+async fn run_ddl(
+    state: &SqlState,
+    principal: &Principal,
+    body: &SqlBody,
+) -> Result<Response, ServiceError> {
+    let tenant_hash = principal.tenant.hash();
+    let now_ns = state.clock.now_ns();
+    let service = state.service();
+    let controls = service.controls();
+
+    if !principal.ddl {
+        controls
+            .audit(
+                tenant_hash,
+                now_ns,
+                &body.query,
+                "sql",
+                (now_ns, now_ns),
+                QueryStatus::Error,
+            )
+            .await?;
+        return Err(ServiceError::forbidden(
+            "this credential does not hold the ddl capability".to_string(),
+        ));
+    }
+
+    let result = async {
+        let deadline = request_deadline(body, state.max_deadline)?;
+        let _permit = controls.admit()?;
+        state
+            .executor
+            .execute_ddl(
+                tenant_hash,
+                &body.query,
+                principal.tenant.as_str(),
+                deadline,
+            )
+            .await
+            .map_err(|err| ServiceError::from_ddl(err, tenant_hash))
+    }
+    .await;
+
+    let status = match &result {
+        Ok(_) => QueryStatus::Ok,
+        Err(_) => QueryStatus::Error,
+    };
+    controls
+        .audit(
+            tenant_hash,
+            now_ns,
+            &body.query,
+            "sql",
+            (now_ns, now_ns),
+            status,
+        )
+        .await?;
+
+    let outcome = result?;
+    Ok((StatusCode::OK, axum::Json(ddl_outcome_json(&outcome))).into_response())
+}
+
+/// The JSON success body of a DDL statement, whatever the `Accept` header
+/// says: a DDL outcome has no rows to stream as Arrow IPC.
+fn ddl_outcome_json(outcome: &DdlOutcome) -> serde_json::Value {
+    let data = match outcome {
+        DdlOutcome::Created {
+            table,
+            version,
+            files,
+            skipped_directory_markers,
+            skipped_other_suffixes,
+        } => json!({
+            "outcome": "created",
+            "table": table,
+            "version": version,
+            "files": files,
+            "skipped_directory_markers": skipped_directory_markers,
+            "skipped_other_suffixes": skipped_other_suffixes,
+        }),
+        DdlOutcome::Dropped { table, version } => json!({
+            "outcome": "dropped",
+            "table": table,
+            "version": version,
+        }),
+        DdlOutcome::NoOp { table } => json!({
+            "outcome": "noop",
+            "table": table,
+        }),
+    };
+    json!({ "status": "success", "data": data })
+}
+
 /// Turn the request body into a [`SqlRequest`], resolving the window and
 /// clamping the deadline.
 fn build_request(
@@ -259,19 +408,7 @@ fn build_request(
         ));
     }
 
-    // A client may shorten its own deadline but never extend it past the
-    // server budget.
-    let deadline = match body.timeout {
-        Some(secs) if secs > 0.0 && secs.is_finite() => {
-            Duration::from_secs_f64(secs).min(max_deadline)
-        }
-        Some(_) => {
-            return Err(ApiError::bad_request(
-                "\"timeout\" must be a positive, finite number of seconds".to_string(),
-            ));
-        }
-        None => max_deadline,
-    };
+    let deadline = request_deadline(body, max_deadline)?;
 
     let min_tokens = body
         .min_commit_token
@@ -501,6 +638,115 @@ mod tests {
             assert_eq!(api.status, status);
             assert_eq!(api.error_type, error_type);
         }
+    }
+
+    /// The DDL status mapping is part of the client contract too. The `match`
+    /// below names every `DdlErrorClass` with no wildcard, so a new class
+    /// fails to compile here until it is given a pinned status.
+    #[test]
+    fn ddl_error_classes_map_to_stable_status_codes() {
+        use ravel_sql::DdlErrorClass;
+
+        fn pinned(class: DdlErrorClass) -> (StatusCode, &'static str) {
+            match class {
+                DdlErrorClass::BadRequest => (StatusCode::BAD_REQUEST, "bad_data"),
+                DdlErrorClass::Conflict => (StatusCode::CONFLICT, "conflict"),
+                DdlErrorClass::NotFound => (StatusCode::NOT_FOUND, "not_found"),
+                DdlErrorClass::Unsupported => (StatusCode::UNPROCESSABLE_ENTITY, "execution"),
+                DdlErrorClass::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+                DdlErrorClass::Timeout => (StatusCode::GATEWAY_TIMEOUT, "timeout"),
+                DdlErrorClass::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+            }
+        }
+
+        for class in [
+            DdlErrorClass::BadRequest,
+            DdlErrorClass::Conflict,
+            DdlErrorClass::NotFound,
+            DdlErrorClass::Unsupported,
+            DdlErrorClass::Unavailable,
+            DdlErrorClass::Timeout,
+            DdlErrorClass::Internal,
+        ] {
+            let (_, status, error_type) = crate::service::error::ddl_class_to_http(class);
+            assert_eq!((status, error_type), pinned(class), "{class:?}");
+        }
+    }
+
+    /// A real `DdlExecuteError` takes its class's status and its body is the
+    /// redacted `client_message()`, not the full `Display`.
+    #[test]
+    fn a_ddl_error_takes_its_classs_status_and_client_message() {
+        let tenant = TenantHash([0u8; 16]);
+        let err = ravel_sql::DdlExecuteError::NotConfigured;
+        let message = err.client_message();
+        let api = ServiceError::from_ddl(err, tenant);
+        assert_eq!(api.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(api.error_type, "execution");
+        assert_eq!(api.message, message);
+
+        let api = ServiceError::from_ddl(
+            ravel_sql::DdlExecuteError::Deadline {
+                deadline: Duration::from_secs(1),
+            },
+            tenant,
+        );
+        assert_eq!(api.status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(api.error_type, "timeout");
+    }
+
+    /// The DDL deadline is clamped exactly as a query's is: lowered by the
+    /// request, never raised past the server maximum.
+    #[test]
+    fn the_ddl_deadline_is_clamped_like_a_querys() {
+        assert_eq!(
+            request_deadline(&body(r#"{"query":"DROP TABLE t","timeout":3600}"#), MAX)
+                .expect("deadline"),
+            MAX
+        );
+        assert_eq!(
+            request_deadline(&body(r#"{"query":"DROP TABLE t","timeout":5}"#), MAX)
+                .expect("deadline"),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            request_deadline(&body(r#"{"query":"DROP TABLE t"}"#), MAX).expect("deadline"),
+            MAX
+        );
+        let err = request_deadline(&body(r#"{"query":"DROP TABLE t","timeout":0}"#), MAX)
+            .expect_err("rejected");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn a_ddl_outcome_renders_the_fields_its_variant_has() {
+        let created = ddl_outcome_json(&DdlOutcome::Created {
+            table: "t".to_string(),
+            version: 1,
+            files: 3,
+            skipped_directory_markers: 0,
+            skipped_other_suffixes: 2,
+        });
+        assert_eq!(created["status"], "success");
+        assert_eq!(created["data"]["outcome"], "created");
+        assert_eq!(created["data"]["table"], "t");
+        assert_eq!(created["data"]["version"], 1);
+        assert_eq!(created["data"]["files"], 3);
+        assert_eq!(created["data"]["skipped_other_suffixes"], 2);
+
+        let dropped = ddl_outcome_json(&DdlOutcome::Dropped {
+            table: "t".to_string(),
+            version: 2,
+        });
+        assert_eq!(dropped["data"]["outcome"], "dropped");
+        assert_eq!(dropped["data"]["version"], 2);
+        assert!(dropped["data"].get("files").is_none(), "{dropped}");
+
+        let noop = ddl_outcome_json(&DdlOutcome::NoOp {
+            table: "t".to_string(),
+        });
+        assert_eq!(noop["data"]["outcome"], "noop");
+        assert!(noop["data"].get("version").is_none(), "{noop}");
     }
 
     /// The body cap and the statement gate are one decision, so the two

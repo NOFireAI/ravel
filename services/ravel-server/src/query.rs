@@ -544,7 +544,21 @@ pub fn build_sql_state(
         declared_columns,
         process_memory_budget,
         None,
+        ravel_sql::DEFAULT_MIN_GRACE_MS,
     )
+}
+
+/// The minimum DDL sweep grace, in milliseconds, for a deployment whose
+/// bootstrapped `sys/gc` records `max_query_duration_ns`. A negative value (a
+/// corrupt or hand-edited record) refuses startup naming `sys/gc` instead of
+/// wrapping or rounding to zero, which would let a `DROP` outrun a running
+/// query.
+#[cfg(feature = "sql")]
+pub(crate) fn ddl_min_grace_ms(max_query_duration_ns: i64) -> anyhow::Result<u64> {
+    if max_query_duration_ns < 0 {
+        anyhow::bail!("sys/gc records a negative max_query_duration_ns ({max_query_duration_ns})");
+    }
+    Ok(u64::try_from(max_query_duration_ns / 1_000_000)?)
 }
 
 /// [`build_sql_state`] with Parquet tables queryable (ADR-2040): the executor
@@ -559,6 +573,14 @@ pub fn build_sql_state(
 /// `parquet_profiles` is `None` when no `--parquet-profiles` file is
 /// configured: no Parquet table is then queryable, and a query naming one
 /// fails with `ParquetQueryError::NotConfigured`.
+///
+/// `ddl_min_grace_ms` is installed on the executor via
+/// `SqlExecutor::with_ddl_min_grace_ms` (ADR-2040): the deployment's
+/// `sys/gc` `max_query_duration_ns`, in milliseconds, so a `DROP`/replacing
+/// `CREATE OR REPLACE` cannot delete a version a query started against this
+/// process's own `max_query_duration` could still be reading. The caller
+/// derives it from the already-bootstrapped `GcConfigValues` rather than
+/// this function re-reading `sys/gc`.
 #[cfg(feature = "sql")]
 #[allow(clippy::too_many_arguments)]
 pub fn build_sql_state_with_parquet(
@@ -576,6 +598,7 @@ pub fn build_sql_state_with_parquet(
     declared_columns: Option<Arc<dyn ravel_sql::DeclaredColumnSource>>,
     process_memory_budget: Arc<ravel_memory::MemoryBudget>,
     parquet_profiles: Option<crate::config::ParquetProfiles>,
+    ddl_min_grace_ms: u64,
 ) -> anyhow::Result<crate::sql::SqlState> {
     let external = parquet_profiles.map(|config| {
         let stores = ravel_sql::ProfileStores::new(config.profiles);
@@ -611,6 +634,7 @@ pub fn build_sql_state_with_parquet(
         declared_columns,
         process_memory_budget,
         Some(sources),
+        ddl_min_grace_ms,
     )
 }
 
@@ -631,6 +655,7 @@ fn build_sql_state_inner(
     declared_columns: Option<Arc<dyn ravel_sql::DeclaredColumnSource>>,
     process_memory_budget: Arc<ravel_memory::MemoryBudget>,
     parquet: Option<ravel_sql::ParquetSources>,
+    ddl_min_grace_ms: u64,
 ) -> anyhow::Result<crate::sql::SqlState> {
     use ravel_query::{LogSegmentFetcher, SegmentFetcher};
     use ravel_sql::{SpanSegmentFetcher, SqlConfig, SqlExecutor};
@@ -750,6 +775,11 @@ fn build_sql_state_inner(
         Some(sources) => executor.with_parquet_sources(sources),
         None => executor,
     };
+    // ADR-2040: the deployment's `sys/gc`-derived minimum sweep grace, so a
+    // `DROP`/replacing `CREATE OR REPLACE` cannot delete a manifest version a
+    // query admitted under this process's own `max_query_duration` could
+    // still be reading.
+    let executor = executor.with_ddl_min_grace_ms(ddl_min_grace_ms);
     Ok(crate::sql::SqlState {
         executor: Arc::new(executor),
         tenant_resolver,
@@ -1780,6 +1810,62 @@ mod tests {
         );
     }
 
+    /// The grace `start` hands the builder is the one the executor's DDL path
+    /// uses; a builder that dropped it would leave the 11-minute default.
+    #[test]
+    fn build_sql_state_with_parquet_installs_the_ddl_min_grace() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog = build_catalog(
+            store.clone(),
+            1,
+            false,
+            ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+            None,
+            None,
+            None,
+            Duration::from_secs(2),
+        )
+        .expect("catalog");
+        let state = build_sql_state_with_parquet(
+            catalog,
+            store,
+            Arc::new(StaticBearerTokenResolver::new(HashMap::new())),
+            None,
+            EngineConfig::default(),
+            Arc::new(GetLimiter::new(1).expect("nonzero permits")),
+            ravel_sql::DEFAULT_MAX_QUERY_BYTES,
+            DEFAULT_MAX_TENANT_BYTES,
+            false,
+            Arc::new(crate::metrics::QueryAccountingMetrics::new(
+                std::collections::HashSet::new(),
+            )),
+            QueryAdmissionController::shared(ravel_query::QueryConcurrencyLimit::Unlimited),
+            None,
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
+            None,
+            7_000,
+        )
+        .expect("sql state builds");
+        assert_eq!(state.executor.ddl_min_grace_ms(), 7_000);
+        assert_ne!(7_000, ravel_sql::DEFAULT_MIN_GRACE_MS);
+    }
+
+    #[test]
+    fn the_ddl_min_grace_is_sys_gc_max_query_duration_in_milliseconds() {
+        assert_eq!(ddl_min_grace_ms(600_000_000_000).expect("grace"), 600_000);
+        assert_eq!(ddl_min_grace_ms(0).expect("grace"), 0);
+    }
+
+    /// Any negative value is refused, including one that integer division by a
+    /// million would round to zero.
+    #[test]
+    fn a_negative_sys_gc_max_query_duration_fails_naming_sys_gc() {
+        for ns in [-1, -999_999, -1_000_000, i64::MIN] {
+            let err = ddl_min_grace_ms(ns).expect_err("negative must refuse startup");
+            assert!(err.to_string().contains("sys/gc"), "{ns}: {err}");
+        }
+    }
+
     /// ADR-0061 decision 1: the SQL/HTTP surface must enforce the same
     /// bytes-scanned budget the PromQL surface does, so the value threaded into
     /// `build_sql_state`'s `EngineConfig` must survive into the executor's
@@ -1868,6 +1954,7 @@ mod tests {
                 None,
                 Arc::new(ravel_memory::MemoryBudget::unlimited()),
                 profiles,
+                ravel_sql::DEFAULT_MIN_GRACE_MS,
             )
             .expect("sql state builds")
         };
