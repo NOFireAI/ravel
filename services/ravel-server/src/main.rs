@@ -388,7 +388,10 @@ async fn main() -> anyhow::Result<()> {
     // `ravel_server::start` (it is `flight-sql`-feature-gated).
     let gc = ravel_server::gc_config::bootstrap(store.as_ref(), now_unix_ns())
         .await
-        .context("failed to bootstrap or read the durable GC config (sys/gc)")?;
+        .map_err(|e| {
+            let context = ravel_server::gc_config::bootstrap_failure_context(&e);
+            anyhow::Error::new(e).context(context)
+        })?;
     if matches!(cli.mode, Mode::Maintain) {
         ravel_server::gc_config::validate_maintain(&gc, &compactor).map_err(|e| {
             anyhow::anyhow!("maintain GC-config validation failed against sys/gc: {e}")

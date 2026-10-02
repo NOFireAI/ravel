@@ -37,6 +37,23 @@ pub async fn bootstrap(
     ravel_maintain::bootstrap_gc_config(store, GcConfigValues::maintain_defaults(), now_ns).await
 }
 
+/// The context startup attaches to a failed [`bootstrap`]. A refused access is
+/// a start-order problem under per-role credentials (ADR-0055 section 4: only
+/// the Maintain and Admin roles may create `sys/gc`), so it names the fix rather
+/// than reading like a broken credential; every other failure keeps the generic
+/// context.
+pub fn bootstrap_failure_context(err: &GcConfigError) -> String {
+    match err {
+        GcConfigError::AccessDenied { .. } => "sys/gc could not be read or created with this \
+             process's object-store credential. Under per-role credentials only the Maintain \
+             and Admin roles create sys/gc, so a gateway or query process started on a bucket \
+             where it does not exist yet is refused. Start the maintain process first, or run \
+             `ravel-cli gc-config set` under the Admin credential, then restart this process"
+            .to_string(),
+        _ => "failed to bootstrap or read the durable GC config (sys/gc)".to_string(),
+    }
+}
+
 /// Maintain-mode check: the running compactor's horizon and grace must EQUAL the
 /// stored values (ADR-0050 section 4).
 pub fn validate_maintain(
@@ -68,4 +85,28 @@ pub fn validate_flight(stored: &GcConfigValues, ceiling: Duration) -> Result<(),
 /// that predates `sys/gc`.
 pub fn flight_ceiling(stored: &GcConfigValues) -> Duration {
     Duration::from_nanos(u64::try_from(stored.flight_ceiling_ns()).unwrap_or(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ravel_maintain::gc_config::GcAccessOp;
+
+    #[test]
+    fn refused_bootstrap_names_the_start_order_fix() {
+        let err = GcConfigError::AccessDenied {
+            op: GcAccessOp::Create,
+            detail: "sys/gc: AccessDenied".into(),
+        };
+        let msg = bootstrap_failure_context(&err);
+        assert!(msg.contains("Start the maintain process first"), "{msg}");
+        assert!(msg.contains("`ravel-cli gc-config set` under the Admin credential"), "{msg}");
+        assert!(msg.contains("only the Maintain and Admin roles create sys/gc"), "{msg}");
+    }
+
+    #[test]
+    fn other_bootstrap_failures_keep_the_generic_context() {
+        let msg = bootstrap_failure_context(&GcConfigError::Store("timeout".into()));
+        assert_eq!(msg, "failed to bootstrap or read the durable GC config (sys/gc)");
+    }
 }
