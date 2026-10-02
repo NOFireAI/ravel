@@ -103,6 +103,19 @@ mod tests {
         assert!(key.ends_with(&id.to_string()));
     }
 
+    /// deploy/iam/maintain.json's MaintainList `sys/maintain/memo/*` prefix and
+    /// MaintainRead/MaintainWrite `sys/maintain/*` grants depend on this key;
+    /// `maintain_template_covers_every_memo_snapshot_read_call` in
+    /// crates/ravel-commit/tests/iam_templates.rs copies it by hand.
+    #[test]
+    fn memo_key_matches_the_iam_template_witness() {
+        assert_eq!(MEMO_PREFIX, "sys/maintain/memo/");
+        assert_eq!(
+            memo_key(&Uuid::from_u128(7)),
+            "sys/maintain/memo/00000000-0000-0000-0000-000000000007"
+        );
+    }
+
     /// A written snapshot round-trips its exact bytes back through a list+get.
     #[tokio::test]
     async fn write_then_read_all_returns_the_bytes() {

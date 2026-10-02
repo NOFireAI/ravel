@@ -351,6 +351,18 @@ mod tests {
         }
     }
 
+    /// deploy/iam/query.json's QueryRead/QueryWrite and maintain.json's
+    /// MaintainRead `t/*/a/state/latest` depend on this key;
+    /// `alert_state_memo_key` and `query_template_covers_every_alert_evaluator_call`
+    /// in crates/ravel-commit/tests/iam_templates.rs copy it by hand.
+    #[test]
+    fn alert_state_memo_key_matches_the_iam_template_witness() {
+        assert_eq!(
+            alert_state_memo_key(&TenantHash([0xab; 16])),
+            "t/abababababababababababababababab/a/state/latest"
+        );
+    }
+
     #[test]
     fn round_trip_preserves_every_field() {
         let mut records = HashMap::new();

@@ -4072,6 +4072,19 @@ mod tests {
         TenantHash([0u8; 16])
     }
 
+    /// deploy/iam/maintain.json's `quarantine/t/*/*/l0/*` and
+    /// `quarantine/t/*/a/` grants depend on this key shape;
+    /// `QUARANTINE_PREFIX` and `quarantine_key` in
+    /// crates/ravel-commit/tests/iam_templates.rs copy it by hand.
+    #[test]
+    fn quarantine_key_matches_the_iam_template_witness() {
+        assert_eq!(QUARANTINE_PREFIX, "quarantine/");
+        assert_eq!(
+            quarantine_key("t/abab/a/l0/0/obj", 1),
+            "quarantine/t/abab/a/l0/0/obj/q00000000000000000001"
+        );
+    }
+
     /// A record-less `l0/` data object at a unique identity: no commit record
     /// is ever written for it, so it is an orphan candidate as soon as it
     /// clears the age gate.

@@ -2449,6 +2449,18 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// deploy/iam/query.json's QueryRead/QueryWrite `t/*/a/alert-lease` depend
+    /// on this key; `alert_lease_key` and
+    /// `query_template_covers_every_alert_evaluator_call` in
+    /// crates/ravel-commit/tests/iam_templates.rs copy it by hand.
+    #[test]
+    fn alert_lease_key_matches_the_iam_template_witness() {
+        assert_eq!(
+            alert_lease_key(&TenantHash([0xab; 16])),
+            "t/abababababababababababababababab/a/alert-lease"
+        );
+    }
+
     const PROMQL_RULE: &str = r#"{
       "rules": [
         {
