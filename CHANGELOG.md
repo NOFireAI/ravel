@@ -6,10 +6,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-10-02
+
 ### Changed
 
-- **RLOG compaction keeps clustered inputs clustered and writes L1 segments at zstd level 9** (ADR-2135 decisions 2, 4 and 5, issue #2143). The output takes the sort descriptor, clustering generation and bloom scope of the input with the highest generation (the first such input on a tie), never a union of the inputs' coverages, and reads no tenant config; the scope is applied to the output's own string columns rather than copied by name. The merge orders each stream's records by `(ts.div_euclid(W), input index)`, where W is the widest time bucket among the inputs' descriptors, and the writer re-sorts each part into the output's stored order; unkeyed inputs merge in exactly the order they did before. When the coarse buckets' summed cursor reservations pass `merge_cursor_budget_bytes`, the inputs merge in budget-sized batches, chosen greedily in input order, into the same parts; a single input over the budget still fails with `MergeCursorBudgetExceeded`, and so can a stream that is one batch when admission opens more inputs at once than share a bucket, or a batch under `EagerAll`, which charges every reservation of the batch at once. Choosing the scope costs one ranged GET per merge, attributed to the catalog-read phase, and none when that input holds no string column. The level is `CompactorConfig::rlog_zstd_level`, set by `--compaction-zstd-level` on `ravel-cli compact-bucket` and `compact-tenant` and by `--maintain-compaction-zstd-level` on the server, refused outside 1..=22 by every RLOG-writing entry point before its first store request; the erasure rewrite uses the same level. Compacted segments get smaller for more compaction CPU, and reads are unchanged.
-- **The RLOG writer stores a string column's values on one row-group dictionary when that is strictly smaller, and writes encoding tags 12 (the dictionary page) and 13 (per-block id pages)** (ADR-2135 decision 6, issue #2144). A string column chunk qualifies when its distinct values in the row group are at most half its present values; the dictionary is the chunk's first page, sorted bytewise, and each block's id page packs its ids at the width the dictionary's size implies. The row and columnar write paths stay byte-identical. Every reader verifies a dictionary page's own crc32c before decoding any id page of its chunk, and a projected fetch takes each kept chunk's dictionary page once. PAGE_DIR admits a tag 12 page only as a string chunk's first page. RSEG and RSPAN still refuse both tags. Objects with repeated strings get smaller. Each side of the size rule counts its pages' stored bytes plus their PAGE_DIR entries, and a tie keeps the per-block pages, so a chunk with one block's value page in it keeps that page when neither form is compressed; the version-5 golden fixture keeps its 1,097 bytes. A column whose dictionary would pass 65,536 entries, or whose distinct bytes plus 4 bytes per present value's id would take the row group's string columns past `block_max_bytes`, keeps its per-block pages, which bounds the ids the writer holds before a group flushes.
+- **RLOG compaction keeps clustered inputs clustered and writes L1 segments at zstd level 9** (ADR-2135 decisions 2, 4 and 5, issue #2143). The output takes the sort descriptor, clustering generation and bloom scope of the input with the highest generation (the first such input on a tie), never a union of the inputs' coverages, and reads no tenant config; the scope is applied to the output's own string columns rather than copied by name. The merge orders each stream's records by `(ts.div_euclid(W), input index)`, where W is the widest time bucket among the inputs' descriptors, and the writer re-sorts each part into the output's stored order; unkeyed inputs merge in exactly the order they did before. When the coarse buckets' summed cursor reservations pass `merge_cursor_budget_bytes`, the inputs merge in budget-sized batches, chosen greedily in input order, into the same parts; a single input over the budget still fails with `MergeCursorBudgetExceeded`, and so can a stream that is one batch when admission opens more inputs at once than share a bucket, or a batch under `EagerAll`, which charges every reservation of the batch at once. Choosing the scope costs one ranged GET per merge, attributed to the catalog-read phase, and none when that input holds no string column. The level is `CompactorConfig::rlog_zstd_level`, set by `--compaction-zstd-level` on `ravel-cli compact-bucket` and `compact-tenant` and by `--maintain-compaction-zstd-level` on the server, refused outside 1..=22 by every compaction and erasure-rewrite entry point (`compact-bucket`, `compact-tenant`, the server) before its first store request; the erasure rewrite uses the same level. Compacted segments get smaller for more compaction CPU, and reads are unchanged.
+- **The RLOG writer stores a string column's values on one row-group dictionary when that is strictly smaller, and writes encoding tags 12 (the dictionary page) and 13 (per-block id pages)** (ADR-2135 decision 6, issue #2144). A string column chunk qualifies when its distinct values in the row group are at most half its present values; the dictionary is the chunk's first page, sorted bytewise, and each block's id page packs its ids at the width the dictionary's size implies. The row and columnar write paths stay byte-identical. Every reader verifies a dictionary page's own crc32c before decoding any id page of its chunk, and a projected fetch takes each kept chunk's dictionary page once. A scan, and a ranged decode of a stream span or of a row group, verifies and decodes each dictionary page once and shares it among the chunk's blocks it reads; a corrupt dictionary fails every block of its chunk, and `ScanStats` charge the page to each block that reads it (issue #2145). PAGE_DIR admits a tag 12 page only as a string chunk's first page. RSEG and RSPAN still refuse both tags. Objects with repeated strings get smaller. Each side of the size rule counts its pages' stored bytes plus their PAGE_DIR entries, and a tie keeps the per-block pages, so a chunk with one block's value page in it keeps that page when neither form is compressed; the version-5 golden fixture keeps its 1,097 bytes. A column whose dictionary would pass 65,536 entries, or whose distinct bytes plus 4 bytes per present value's id would take the row group's string columns past `block_max_bytes`, keeps its per-block pages, which bounds the ids the writer holds before a group flushes.
 - **`--require-bucket-protection` reads the S3 bucket's protection
   configuration at startup and refuses on more conditions** (ADR-1727
   decision 5, issues #1727 and #2197). On `--store s3` the gate now reads the
@@ -102,11 +104,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (ADR-2135, issue #2139). The footer gains a sort descriptor and a clustering
   generation, the BLOOM section starts with the list of columns its filters
   cover under its own crc32c, bloom filters are sized to a multiple of 512
-  bits instead of a power of two, and encoding tags 10 to 13 are registered
-  but never written. A covered list that fails its crc is refused as
-  corrupt and the scan falls back to no bloom pruning. The writer still
-  produces version 4's content: no sort descriptor, generation 0, and bloom
-  coverage of body, severity text and every string attribute. Each filter
+  bits instead of a power of two, and encoding tags 10 to 13 are registered;
+  the #2140 and #2144 entries above say when the writer emits each. A
+  covered list that fails its crc is refused as corrupt and the scan falls
+  back to no bloom pruning. With no clustering key or bloom scope
+  configured, the writer records no sort descriptor and generation 0, and
+  bloom covers body, severity text and every string attribute. Each filter
   is now no larger than version 4 made it for the same keys, and it runs at
   the false-positive rate its sizing rule targets rather than the lower rate
   power-of-two rounding could give, so a text predicate may scan more blocks
@@ -163,7 +166,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   those inputs out, since compaction refuses a bucket that already carries a
   compaction record and so never publishes the covering record that would
   otherwise clear it. `buckets_blocked` is the number of those lines, covers
-  both permanent cases, and covers the buckets the invocation examined (a walk
+  every blocked reason, including `losing_record_parts` (next entry), and
+  covers the buckets the invocation examined (a walk
   resumed from a cursor does not re-report loser-only buckets an earlier
   invocation found). A below-target part of an authoritative compaction record
   blocks the floor too and is reported as an `l1_compaction_parts` count with no
@@ -212,12 +216,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bucket. An uncontended claim is taken with no wait: the deterministic
   jitter, by default up to 10% of the lease, is waited out only before
   stealing an expired claim or retrying a create whose claim vanished before
-  it could be read. A supervisor tick's claim decisions read the tick's own clock.
-  Coordination is on by default and claims are taken only at or above 64 MiB
-  of listed input bytes (`claim_min_input_bytes`), so a small bucket is merged
-  exactly as before. The switch that turns claiming off is the
-  `CompactorConfig::coordination` field; no server flag or config file reaches
-  it yet, and its operator flag lands with #1035. Claims
+  it could be read. A claim this process itself left behind, for example
+  after a renewal failed with a store error, is taken back at once by
+  compare-and-swap on the observed version and counted as acquired, not
+  stolen; only another process's claim waits out its lease (ADR-1029
+  2026-09-30 amendment, issue #2156). A supervisor tick's claim decisions
+  read the tick's own clock. Coordination is on by default and claims are
+  taken only at or above 64 MiB of listed input bytes
+  (`claim_min_input_bytes`), so a small bucket is merged exactly as before.
+  The switch that turns claiming off is `CompactorConfig::coordination`,
+  which `ravel-server --maintain-claims
+  on|off` sets (see the #1035 entry under Added). Claims
   stay advisory: the compaction record's `CreateIfAbsent` still decides which
   output is published, so a stale owner that finishes after losing its claim
   converges on the one record rather than publishing a second. For the same
@@ -323,12 +332,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   inline. The new `read_metrics_meta_on_gate` and
   `read_metrics_meta_for_serve_on_gate` run the metrics-meta body decode on
   the gate the same way; only the serve reader moves a memory reservation
-  into the job, since the strict reader takes none. A job the gate cannot complete fails that decode with
-  `SnapshotFormatError::DecodeJob` or `MetricsMetaError::DecodeJob`, and the
-  read handles it like any other decode error. Without a gate every decode
-  runs inline as before. The server does not install the gate on its catalog
-  or the metadata cache yet, so no server read path runs on it in this
-  release.
+  into the job, since the strict reader takes none. A job the gate cannot
+  complete fails that decode with `SnapshotFormatError::DecodeJob` or
+  `MetricsMetaError::DecodeJob`. On the PromQL and SQL surfaces a snapshot
+  decode job that panicked is treated as corrupt (500), and one the gate
+  cancelled or closed before it ran is retryable (503). Without a gate every
+  decode runs inline as before. The server does not install the gate on its
+  catalog or the metadata cache yet, so no server read path runs on it in
+  this release.
 - **A ranged log read's chunk-run GETs against one L0 RLOG object are now
   bounded at `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` (4)** (ADR-2066 decision 1).
   A projection whose coalesced candidate runs exceed the cap bridges the
@@ -346,6 +357,36 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   admits each section under its own cache key, so while those entries stay
   resident the next read of the object serves both from cache. No default or
   config surface changes.
+- **Changelog entries are written as fragments under `changelog.d/`**, one
+  file per change named `NUMBER.SECTION.md`, so pull requests no longer
+  conflict on `CHANGELOG.md` (issue #2323). `scripts/changelog-assemble.sh`
+  folds them into the `[Unreleased]` section before a release is tagged, and
+  its `--check` mode runs in CI on every pull request. The changelog guard
+  accepts a fragment in place of a `CHANGELOG.md` edit.
+- **`sys/gc` format version 2 records the HEAD cache TTL, and `ravel-cli
+  maintain sweep` reads `sys/gc`** (issue #2338, ADR-1133 decision 4).
+  `ravel-cli gc-config set --head-cache-ttl <duration>` writes version 2 and
+  refuses a TTL below the build's compiled 30 s, which no query process can
+  run under; bootstrap still writes version 1, and `set` without the flag keeps the
+  stored version. A query process refuses to start when its HEAD cache TTL is
+  above the recorded one (the compiled 30 s default on version 1), and a build
+  that reads only version 1 refuses a version 2 object. Before the flip,
+  every `ravel-server` process in every mode (`gateway`, `query`, `maintain`
+  and the combined `all`) and every `ravel-cli` binary that reads `sys/gc`
+  (`gc-config show` and `set`, `parquet sweep`, `maintain sweep`) must run a
+  build that reads version 2; the flip is one-way, since nothing writes
+  version 1 back. `maintain sweep` now sweeps on the stored protection
+  horizon, grace and maximum flush lifetime instead of the compiled
+  defaults, and refuses when the stored horizon does not cover its clock-skew allowance. It also carries the
+  stored maximum query duration and HEAD cache TTL for the pinned-query gate
+  (ADR-1133), which is not built yet, so they do not change the sweep.
+  `gc-config show` prints the format version and the TTL.
+- **The catalog's decoded-part and postings caches evict the least recently
+  used entry at their per-tenant entry cap** (ADR-1702 decision 6, issue
+  #2088). The cap used to evict the oldest inserted entry; an entry now
+  survives while fewer than the cap's number of other entries for its
+  tenant are inserted between its reads. This applies to every catalog,
+  including one on the unlimited default memory budget.
 
 ### Security
 
@@ -360,14 +401,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   consulting the tenant resolver (MAC under any configured key, deadline
   against the injected clock, `slice_count > 1`, listener role) and runs the
   slice under the ticket's tenant. Refusals are typed and counted in-process
-  under a closed reason (`missing`, `bad_mac`, `expired`, `wrong_surface`);
-  the counters are not exported at `/metrics` yet. On the combined listener
-  a node without `--fragment-listener` runs, a ticket that fails the slice
-  MAC falls through to the client path, which still requires the client
-  credential, so only `expired` and `wrong_surface` can fire there. Without
-  `--fragment-listener` the slice travels over the public gRPC listener in
-  plaintext; with it, the slice rides the dedicated TLS listener (the entry
-  after next). Both keys derive from the first fragment key unless
+  under a closed reason (`missing`, `bad_mac`, `expired`, `wrong_surface`)
+  and exported as `ravel_sql_slice_rejects_total` (see Added). On the
+  combined listener a node without `--fragment-listener` runs, a ticket
+  that fails the slice MAC falls through to the client path, which still
+  requires the client credential, so only `expired` and `wrong_surface` can
+  fire there. Without `--fragment-listener` the slice travels over the
+  public gRPC listener in plaintext; with it, the slice rides the dedicated
+  TLS listener (the entry after next). Both keys derive from the first
+  fragment key unless
   `--sql-ticket-key-file` is set (next entry). During the rolling upgrade
   onto this release a coordinator drops workers on the other `queryfrag`
   protocol version at routing time, with no round trip, and runs their
@@ -445,34 +487,24 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - **A store error reads as throttled only for a 429 or 503 status** (issue
-  #2307). With no typed transport error in the chain, the S3 and external
-  stores classified an error as `Throttled` whenever its text held the digits
-  429 or 503 anywhere, including in the request URL's port, key or query, the
-  elapsed time, or a request id, so a 400, a list 404, a 500 or a timeout could
-  read `Throttled` depending on incidental digits. The bare digit match is
-  gone: a real 429 or 503 is still caught by the reason phrase that always
-  follows its status ("Too Many Requests", "Service Unavailable"), the other
-  throttle words and the timeout handling are unchanged, and every outcome
-  stays retryable. The missing-bucket error now reads "bucket does not exist
-  (NoSuchBucket)" instead of naming S3, since the GCS path reports it too.
+  #2307). With no typed transport error in the chain, the S3 store classified
+  an error as `Throttled` whenever its text held the digits 429 or 503
+  anywhere, including in the request URL's port, key or query, the elapsed
+  time, or a request id, so a 400, a list 404, a 500 or a timeout could read
+  `Throttled` depending on incidental digits. The bare digit match is gone: a
+  real 429 or 503 is still caught by the reason phrase that always follows its
+  status ("Too Many Requests", "Service Unavailable"), the other throttle
+  words still apply (the #2322 and #2353 entries below cover the timeout and
+  request-URI changes), and every outcome stays retryable.
 - **A delete against a missing S3 bucket fails instead of reporting success**
   (issue #2265). The S3 adapter read every whole-request 404 as a missing key,
   so a `DeleteObjects` answered `NoSuchBucket` returned the idempotent
   missing-key success and the sweep counted the key as deleted. A 404 whose
-  body names `NoSuchBucket` is now `Permanent` on get, list, put, delete and
-  multipart, and on delete a whole-request 404 is `NotFound` only for
-  `NoSuchKey`. A HEAD 404 carries no body, so `head` and `pin_of` against a
-  missing bucket still read `NotFound`.
-- **A read through a missing Azure container fails instead of reading as a
-  missing blob** (issue #2297). The external store's Azure path read a 404
-  answered `ContainerNotFound` as `NotFound` on get and as a retryable error
-  on list. It is now `Permanent` on get, get_pinned, get_with_pin, list,
-  list_after and list_delimited; `BlobNotFound` stays `NotFound`. The store
-  is read-only, so it has no delete to protect. GCS needed no change: its XML
-  API answers a missing bucket with `NoSuchBucket`, which the shared mapping
-  already reads as `Permanent`, and new tests pin that. A HEAD 404 carries no
-  body, so `head` and `pin_of` against a missing container or bucket still
-  read `NotFound`.
+  body names `NoSuchBucket` is now `Permanent` ("bucket does not exist
+  (NoSuchBucket)") on get, list, put, delete and multipart, and on delete a
+  whole-request 404 is `NotFound` only for `NoSuchKey`. A HEAD 404 carries no
+  body, so `head` and `pin_of` against a missing bucket still read
+  `NotFound`.
 - **A tiered-cache miss no longer issues a duplicate GET** on success, when
   the RAM tier admits the bytes (issue #2280).
   A read that peeked both cache tiers while a GET for the same range was in
@@ -512,29 +544,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   disk tier is still re-admitted to RAM. `block_cache_hits` counts only the
   blocks and page ranges whose own lookup hit, as the query accounting does,
   on the block-range and the page-range read alike (issue #2311).
-- **Query processes classify fold lag against the maintain processes' fold
-  interval** (issue #2074). A request-budget refusal names fold lag once the
-  unsealed tail passes `healthy_tail_max + fold_interval + head_cache_ttl`
-  (ADR-1306 decision 6), and a `--mode query` process, which runs no scheduled
-  fold and may not set `--fold-interval-secs`, always used the 300 s default.
-  With the maintain processes folding every 900 s, its refusals blamed a fold
-  that was keeping up for tails between 8,730 s and 9,330 s. The new
-  `--fold-lag-interval-secs` flag, accepted only in `--mode query`, sets the
-  interval that classification uses and configures no fold; `--mode all`,
-  `--mode maintain` and `--mode gateway` refuse it, and so does a zero value.
-  `--mode all` classifies against its own `--fold-interval-secs`; maintain and
-  gateway serve no query. The operator renders it on the query Deployment from
-  `spec.maintain.fold.intervalSecs` only when the maintain Deployment renders
-  (`spec.maintain.enabled` true), its fold runs (`spec.maintain.fold.disabled`
-  false), and that field is set. Upgrade `spec.image` to a `ravel-server`
-  image from this release or newer before or together with the operator: on
-  a cluster where those three conditions hold, the upgraded operator adds the
-  flag to the query Deployment and rolls the query pods, and an older server
-  rejects the unknown flag at startup, so the pods restart-loop. From this
-  release on, editing `spec.maintain.fold.intervalSecs`,
-  `spec.maintain.fold.disabled` or `spec.maintain.enabled` rolls the query
-  pods as well as the maintain pods whenever the change adds, removes or
-  changes the flag.
 - **A zero loop interval is refused at startup** (issue #2256).
   `--maintain-interval-secs 0`, `--fold-interval-secs 0`,
   `--alert-eval-interval-secs 0` and `--oidc-jwks-refresh-interval-secs 0`
@@ -548,7 +557,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--oidc-jwks-refresh-interval-secs 0` with OIDC off) now refuses to start
   until the value is positive. The defaults are unchanged. The query-worker
   heartbeat under `--distributed-query` also refuses a zero period rather than
-  writing heartbeats without pause; no flag sets that period today.
+  writing heartbeats without pause; no flag sets that period today. A server
+  started through the library API refuses the same four zero intervals:
+  `ravel_server::start` returns a typed error naming the flag, and
+  `fold::spawn` and `tenant::spawn_jwks_refresh` now return a `Result`
+  carrying that error rather than the task handle directly (issue #2273).
 
 - **The operator CRD refuses a zero maintain or fold interval at admission**
   (issue #2266). `spec.maintain.intervalSecs` and
@@ -588,58 +601,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   one physical erasure bound, `max(bound + E_v, D)`, where they said
   `max(bound, D)`.
 
-- **The maintenance backlog metrics no longer read healthy in three cases
-  where they were not** (issue #2073). A unit whose retention and compaction
-  scan fails every tick reported no retention lag, so
-  `ravel_maintain_retention_lag_seconds` could read 0 for exactly the signal
-  whose sweep was stuck. The new gauge `ravel_maintain_units_scan_failed`
-  counts, by signal, the units whose scan failed in the same cycle the lag
-  comes from, and the units a failed provisioning check or shard-generation
-  read skipped before scanning, which no counter saw when the read failed
-  with a store error. The lag was measured from the ingest hour's nominal
-  deadline, and an event can sit up to `max_ingest_lag` before its ingest
-  hour, so a bucket read up to one hour plus `max_ingest_lag` (three hours at
-  the defaults) less lag than it had. It is now measured from the bucket's
-  newest event plus the retention window, which the pass that writes the
-  tombstone reads anyway and keeps in memory for the bucket's later passes;
-  after a restart or on another replica's bucket it falls back to the earlier
-  of the nominal deadline and the tombstone's write time, which can still
-  under-read by up to that same bound. A tombstoned bucket that holds a
-  rewrite record with no parts falls back to the tombstone's write time
-  alone: an erasure that dropped every record leaves a rewrite whose publish
-  time stands in for its newest event, and measuring that bucket from the
-  nominal deadline over-read its lag by up to the time between the hour's end
-  and the erasure, enough to fire the lag alert after a restart. That figure
-  under-reads by however late the tombstone was written, with no fixed bound.
-  Telling such a rewrite from one that keeps parts costs one GET per listed
-  rewrite record, up to the first one with no parts, so N GETs when every
-  one keeps parts. They are issued only when the exact expiry is not held in
-  memory, and only until one pass reads them without error: that answer is
-  kept in memory for the bucket's later passes. A failed read falls back to
-  the tombstone's write time and never fails the retention pass. A bucket
-  whose rewrites keep parts keeps the earlier-of-the-two fallback.
-  `ravel_maintain_bytes_reclaimed_total` left out superseded L0 data, most of
-  the bytes freed in steady state. It now charges each object the superseded-input sweep deletes at the
-  `object_size` its commit, compaction or rewrite record carries, with no
-  extra request, a superseded L1 segment on the pass that deletes the record
-  naming it so a refused record delete cannot charge it twice, and its HELP
-  text says it counts object sizes, not wire bytes.
-
-- **The alerts shard sweep skips its six listings for tenants with no alert
-  objects** (issue #2134). It ran six listings per tenant on every tick,
-  including on deployments with no alert rules and under
-  `--alert-retention 0`. It now first lists the tenant's alert keyspace and
-  the quarantine copies taken from it, one bounded listing each, and skips
-  the sweep when both are empty, so such a tenant pays those two listings
-  instead of six under `--alert-retention 0`, and three instead of seven with
-  a nonzero window, whose absent-memo check lists the commit prefix first; a
-  tenant whose alert state memo was just read skips those two listings too.
-  Under `--alert-retention 0`, which reads no memo, a tenant that runs alert
-  rules pays the keyspace listing alone, since its memo sits under that
-  keyspace and ends the gate there. A gate listing that fails runs the
-  sweep. The mass-orphan breaker's runbook log line now comes from one
-  function shared by every shard.
-
 - **A gateway starts under a small memory limit** (issue #2234).
   `ravel-server` refused to start in every mode under a cgroup memory limit of
   2 GiB or less, because the process memory budget (effective memory minus a
@@ -654,21 +615,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--catalog-cache-max-bytes` is set, so its `/metrics` carries no
   `cache="fetch"` series (issue #2241). In every mode a `--cache-max-bytes`
   of `0` now builds no fetcher cache, where it built a zero-capacity one.
-
-- **A compaction claim left in place by a failed renewal is reclaimed by
-  the same process at once, instead of waiting out the full lease**
-  (ADR-1029, 2026-09-30 amendment; issue #2156). When
-  `ClaimGuard::checkpoint` renewal fails with a store error other than a
-  lost race, the claim stays written under that process and `contend`
-  previously could not tell it from a claim held by another process, so
-  the process skipped its own bucket every pass until the lease expired
-  and then stole its own claim back, which the metrics reported as a
-  steal. `ClaimGuard::contend` now checks the observed claim's holder
-  process id first and, when it is its own, takes the claim back at once
-  with a compare-and-swap on the observed version; a claim held by any
-  other process still waits out its lease. `claims_acquired` rises, not
-  `claims_stolen` or `claims_skipped`. The same applies to any claim this
-  process left behind, whatever ended the earlier run.
 
 - **One refused delete no longer stops the superseded-input sweep for every
   chain** (issue #1846). Rule 2 deletes every cleared chain's input commit
@@ -688,19 +634,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   refusal's error, so a credential without delete permission fails the pass
   as it did before. A retryable error, a read-only
   store, or a backend with no delete support still fails the pass.
-- **SQL answers corrupt stored data and a panicked decode as an internal error,
-  not a retryable unavailable** (issues #2097, #2194, #2235).
+- **SQL answers corrupt stored data as an internal error, not a retryable
+  unavailable** (issues #2097, #2194, #2235).
   `SqlError::class()` put every metrics, logs and spans fetcher error,
   `Corrupt` included, in the `Unavailable` class, so HTTP SQL answered 503 and
   Flight SQL `UNAVAILABLE` for a fault that fails the same way on every retry.
   A new `ErrorClass::Internal` now holds every error the redaction reports as
-  "stored data failed integrity validation": a fetcher `Corrupt` error (which
-  is also how a panicked read-gate decode job is reported), a store-side
-  checksum mismatch, a carry or tenant mismatch, a corrupt `stream_attrs`
-  blob, and a corrupt catalog record or column-statistics HEAD. HTTP SQL
-  answers it with 500 `internal` and Flight SQL with `INTERNAL`, the PromQL
-  surface's rule for the same fault. A compaction record, erasure request,
-  rewrite record, or snapshot object whose stored bytes fail to decode at a
+  "stored data failed integrity validation": a fetcher `Corrupt` error, a
+  store-side checksum mismatch, a carry or tenant mismatch, a corrupt
+  `stream_attrs` blob, and a corrupt catalog record or column-statistics
+  HEAD. HTTP SQL answers it with 500 `internal` and Flight SQL with
+  `INTERNAL`, the PromQL surface's rule for the same fault. A compaction
+  record, erasure request, rewrite record, or snapshot object whose stored
+  bytes fail to decode at a
   format version this build covers (`CatalogError::CompactionRecordDecode`,
   `ErasureRequestDecode`, `RewriteRecordDecode`, `SnapshotFormat`) joins that
   class on SQL, and PromQL now answers it with 500 `internal` too, where both
@@ -733,48 +679,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `ProvisioningError::is_retryable` gives it: a version above the read
   ceiling, a lost CAS race, or a store fault other than a checksum mismatch
   stays 503, while an undecodable, misfiled or structurally corrupt record, a
-  version below the floor, or a checksum mismatch answers 500. A catalog
-  decode job the read CPU gate cancelled or closed before it ran stays 503;
-  one that panicked answers 500. A checksum mismatch on any catalog object
-  GET (`CatalogError::Store` with a `StoreError::Corrupted` source, and on SQL
-  the same source under `LoadColumnStatsError::Store`), which answered the
-  retryable 503, answers 500 on both surfaces, as it already did on a data
-  fetch and a provisioning read (issue #2279). On SQL, a checksum mismatch on
-  a Parquet table's manifest, grants record or data file
-  (`ResolveError::Store`, `GrantsError::Store` or `ParquetReadError::Store`
-  with a `StoreError::Corrupted` source), which answered 503, answers 500 too
-  (issue #2291). A Parquet manifest or grants record above the version
-  ceiling this build reads (`ManifestError::UnsupportedVersion` or
-  `GrantsError::UnsupportedVersion`), which answered 500, now answers the
-  retryable 503, since a peer on a newer build can read it (issue #2304).
-  Other store errors, timeouts, cancellation and admission refusals keep
-  their classes.
-- **A catalog decode declared over its ceiling now evicts decoded-cache entries
-  until the budget admits it or the caches are empty** (issue #2132). Such a
-  decode is charged 0 bytes, and a budget pushed over its limit by
-  `reserve_unchecked` refuses even that. The eviction pass
-  `Catalog::reserve_decoded` runs before its one retry used to stop only once
-  the free space covered the charge, which 0 bytes always did, so it evicted
-  nothing and the refusal stood. It now evicts until the budget admits the
-  charge by the same test `try_reserve` applies. When the over-limit bytes are
-  held by cached entries, releasing them lets the retry succeed and the
-  decoder's own refusal decides the outcome; when they are held elsewhere, the
-  pass empties the caches and the retry is refused. The charge rule itself,
-  `decoded_charge`, now lives once in `ravel-memory`, and both the query
-  fetcher and the catalog call it.
-- **`ravel-cli load --signal logs`, `--signal metrics` and `--signal spans`
-  name the unit a negative timestamp was read in** (issues #2133, #2168). For a
-  native Arrow `Timestamp` ts column the loader scales by the column's own
-  unit, but the refusal named the declared `ts_unit` instead; a
-  `Timestamp(Second)` cell of -5 under `ts_unit = "nanos"` reported "read as
-  ts_unit = nanos". It now reports "read in the column's own Timestamp unit,
-  seconds". An integer column still names `ts_unit`. The spans refusal, which
-  named both declared units whatever the columns were, now names the start and
-  the end each by the same rule, against `start_ts_unit` and `end_ts_unit`,
-  and an end substituted from the start for a zero end cell as "taken from
-  start_ts because end_ts is 0" rather than in the end column's unit, and a
-  start substituted from the load time for a zero start cell as "taken from
-  load time because start_ts is 0" rather than in the start column's unit.
+  version below the floor, or a checksum mismatch answers 500. A checksum
+  mismatch on any catalog object GET (`CatalogError::Store` with a
+  `StoreError::Corrupted` source, and on SQL the same source under
+  `LoadColumnStatsError::Store`), which answered the retryable 503, answers
+  500 on both surfaces, as it already did on a data fetch and a provisioning
+  read (issue #2279). Other store errors, timeouts,
+  cancellation and admission refusals keep their classes.
 - **The maintain role reaps dead query-worker records under
   `sys/query/workers/`** (issue #1828). The query coordinator used to delete
   them under a role with no delete grant, so every delete was refused, logged
@@ -783,11 +694,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   its cycle and deletes the keys past the reap horizon; a deployment with no
   `--mode maintain` process, including a single `--mode all` process, reaps
   nothing. `deploy/iam/maintain.json` gains list and delete on
-  `sys/query/workers/*`, and `deploy/iam/query.json` is unchanged. Upgrade
-  note: a deployment still on the previous `maintain.json` logs a query-worker
-  listing warning on every maintain cycle until the template is applied. A
-  draining coordinator overwrites its own record with a stamp no reader
-  accepts as live instead of deleting it. A reap delete refused as access
+  `sys/query/workers/*`; this fix does not change `deploy/iam/query.json`.
+  Upgrade note: a deployment still on the previous `maintain.json` logs a
+  query-worker listing warning on every maintain cycle until the template is
+  applied. A draining coordinator overwrites its own record with a stamp no
+  reader accepts as live instead of deleting it. A reap delete refused as access
   denied is logged once per pass at error and ends that pass.
 - **`ravel-cli load --signal logs` loads a dictionary-encoded hex `trace_id` or
   `span_id` column** (issue #2116). A default Parquet writer dictionary-encodes
@@ -796,17 +707,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now resolves the two id columns once per batch and stores the same ids as a
   plain column; a null cell stores no id in either form.
 - **`ravel-cli load --signal logs` and `--signal metrics` refuse a negative
-  timestamp** (issue #2118), as the spans load already did. A row whose `ts`
-  falls before the Unix epoch is a row rejection on the logs and metrics load
-  paths, naming the unit the value was read in (see the #2133 entry above),
-  where before only the future-skew bound was checked. A negative result always means a negative
-  cell: unit conversion never flips a sign.
-- **The spans load's reserved attribute keys come from ravel-otlp** (issue
-  #2123). `ravel_otlp::traces_normalize` now exports `RESERVED_ATTR_KEYS` and
-  `is_reserved_key`, and the loader's `[spans]` mapping check uses them instead
-  of a private copy, so a key reserved there is refused here too. The unused
-  lever warning names every signal explicitly, so a new signal is a compile
-  error rather than a metrics message.
+  timestamp** (issues #2118, #2133 and #2168). A row whose `ts` falls before
+  the Unix epoch is a row rejection on the logs and metrics load paths,
+  naming the unit the value was read in: the column's own Arrow `Timestamp`
+  unit for a native timestamp column, `ts_unit` for an integer column. Before,
+  only the future-skew bound was checked. A negative result always means a
+  negative cell: unit conversion never flips a sign.
 - **The fold checks a previous postings object's tenant before reusing it**
   (ADR-0050 section 2, ADR-1702, issue #2081). The fold's previous-postings
   reuse path verified the object's blake3 and its binding to the HEAD's part
@@ -817,53 +723,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   being reused or degrading into a quiet rebuild. The check reads the already
   hash-verified header before the decode reservation, so neither the
   part-binding degrade nor a memory refusal can mask it.
-- **A declared length over the decoder's ceiling is charged 0, not the
-  ceiling** (ADR-1702, the decode-refusal amendment, issue #2081). A decoder
-  refuses an oversized unit before it allocates anything, so reserving the
-  ceiling for one charged memory nobody would ask for, and turned that refusal
-  into a budget refusal on any budget with less than the ceiling free: a
-  snapshot part that should fall back to listing failed the query with a
-  memory error instead, and a PromQL catalog chunk frame lost its own typed
-  error the same way (a whole section over the ceiling is refused earlier,
-  when the segment is opened). Every decode reservation (snapshot parts,
-  postings and column statistics, PromQL catalog sections, and per-frame
-  `SERIES_META_CHUNKS`) now charges 0 for a declared length over its decoder's
-  ceiling and lets the decoder's refusal decide the outcome. Only the PromQL
-  fetcher half is visible in the shipped server, whose catalog budget is
-  unlimited.
-- **A refused decode reservation fails the fold instead of rebuilding its
-  postings from scratch** (ADR-1702, the decode-refusal amendment, issue
-  #2081). The fold answered a refused previous-postings reservation by
-  rebuilding the index from every segment's names, which fetches and decodes
-  far more than the one postings object the budget had just refused, so the
-  reaction to memory pressure took the more expensive path. It now fails with
-  the typed budget error, matching what the resolve path already did with the
-  same refusal; the next fold retries. The shipped server cannot reach this,
-  because its catalog budget is unlimited.
-- **The catalog's decoded-part and postings caches give memory back to a
-  refused decode** (ADR-1702 decision 6, issue #2088). Both caches hold each
-  decoded value together with its memory reservation and were bounded only by
-  an entry cap per tenant, so once a finite memory budget is wired into the
-  catalog, other tenants' cached entries could hold the whole budget and every
-  later decode would be refused with nothing able to release the memory. A
-  refused reservation now evicts cached entries least recently used across
-  every tenant of both caches until it would fit or the caches are empty, then
-  retries the reservation a single time. An entry a live resolve still holds
-  keeps its reservation until that resolve drops it, so a pass can empty a
-  cache and free nothing; the pass is bounded by the entries it removes rather
-  than by the bytes it frees. A decode wanting more than the budget's whole
-  limit skips the pass and keeps its first refusal, since no eviction could
-  admit it, so one oversized object does not flush every tenant's decoded
-  entries. A column-statistics load takes the same pass (issue #2107): it
-  reserves its declared body against the same budget these caches hold. The
-  column-statistics CACHE is still unaffected: its entries carry no
-  reservation and it is already bounded in bytes. The server does not yet pass
-  a finite budget to the catalog, so no deployment sees the eviction pass in
-  this release; one deployed change does land with it, on every catalog
-  including one on the unlimited default budget, because the two caches' own
-  per-tenant entry cap now evicts least recently used rather than oldest
-  inserted: an entry survives while fewer than the cap's number of other
-  entries for its tenant are inserted between its reads.
 - **A writer whose clock lags the object store's clock refuses its flush
   instead of publishing into a sealed hour** (issue #1685, ADR-1685). At flush
   open, every metrics, log, and span shard actor compares its raw clock reading
@@ -937,25 +796,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   open identities behind than the cap. A dated amendment to the ADR and the
   alerting guide carry the corrected bound.
 
-- **A query's fold-lag refusal threshold is now sized from the fold and the
-  catalog the process is actually running** (issue #1306). The threshold that
-  decides whether a request-budget refusal names fold lag is the catalog's seal
-  margin plus the scheduled fold's interval plus the HEAD cache TTL, and
-  `EngineConfig` carried all three, but the server set none of them: every
-  deployment was classified against `ravel-query`'s compiled-in reference
-  durations no matter what its own fold and catalog ran on. The server now
-  builds that `EngineConfig` in one place, reading the seal margin and the HEAD
-  cache TTL off the `CatalogConfig` of the catalog it hands to both resolve and
-  the fold, and the fold interval off the `FoldTaskConfig` it spawns the fold
-  with. That fold interval is the real one only in `--mode all` and
-  `--mode maintain`, the processes that run the scheduled fold; a `query` or
-  `gateway` process keeps the 300 s default even when the `maintain` processes fold
-  on a longer interval, so a longer maintain interval can still make a query
-  node blame a fold that is keeping up. The compiled-in values stay what an `EngineConfig` built with no
-  deployment context falls back to, and a test pins `ravel-query`'s hand copy
-  of the fold interval against the server's own default so the two cannot drift
-  apart unnoticed.
-
 - **A Parquet load resolves each dictionary-encoded column once per batch
   instead of once per cell** (issues #1751 and #1712). The per-row readers
   resolved a dictionary cell through `DictionaryArray::normalized_keys`, which
@@ -975,83 +815,88 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dictionary still resolves to an all-null column. The columnar path's
   empty-dictionary handling is unchanged: its per-cell readers answer an empty
   dictionary chunk as they did before.
-- **`snapshot_location` reserves each footer read's bytes before issuing it
-  and trusts a prefix listing for a file's key and pin only, never its
-  size** (ADR-2040, issue #2283). The first footer read is now a suffix
-  read of `FOOTER_PREFETCH` bytes on a store whose capabilities report
-  `suffix_range`, and otherwise an explicit range over the last
-  `min(FOOTER_PREFETCH, size)` bytes of the listed size, self-correcting
-  with one retry at the size its own response reports if that listed
-  size was stale, and refusing `FileChanged` if the two reads still
-  disagree; a store that cannot take a suffix range (Azure) never
-  receives one. A snapshot's footer reads are now one or two GETs per
-  file on a suffix-capable store, up to three on one that is not, plus
-  one HEAD on a store without `suffix_range` when the listed size left
-  no valid range to request at all (a listed size of 0, or one that
-  overshoots the object's real end by more than `FOOTER_PREFETCH`). A
-  listing that under- or over-reports a file's size, in either
-  direction, can no longer misplace the read. On a suffix-capable store,
-  an `InvalidRange` on the first read (an endpoint answering a suffix
-  read against a 0-byte object with 416 instead of an empty body) still
-  reports `EmptyFile` directly, the same as a GET that answers it with an
-  empty body. On a store without `suffix_range`, a listed size of 0 or
-  an `InvalidRange` from the first explicit-range read no longer reports
-  `EmptyFile` outright: one HEAD, charged to the same `Resolve` phase as
-  the snapshot's other HEAD, refuses `FileChanged` if its ETag disagrees
-  with the listing's pin, `EmptyFile` if it reports a real size of 0,
-  and otherwise re-reads once at the size it reports, still refusing
-  `FileChanged` if that read's own size disagrees. Every other
-  `InvalidRange` case still reports as a generic `Store` error. A footer
-  read returning a different number of bytes than
-  requested, or more bytes than the same response's own reported size,
-  now refuses as `Corrupt` naming the key, instead of risking an
-  arithmetic underflow computing where the trailer starts. The zero-size
-  refusal runs on the GET response's reported size, not the listing's.
-  Each footer GET reserves its byte length against the snapshot's
-  `MemoryBudget` before the GET is issued, and the first read's
-  reservation is held until the footer is decoded, including across the
-  second read a long footer needs, not released as soon as its own GET
-  returns; a footer read refuses with `MemoryExhausted` with no GET
-  issued when the budget is exhausted. New tests cover a single-object
-  `LOCATION` whose key the object-store client cannot address exactly,
-  one outside its grant, one whose HEAD reports `NotFound`, two files
-  whose physical footer schema elements agree exactly but whose embedded
-  `ARROW:schema` hint resolves a column to a different Arrow type, a
-  footer read that returns the wrong number of bytes, a long footer's
-  second read sharing the memory budget with the first, the
-  suffix-capable `InvalidRange`-as-`EmptyFile` mapping above, the
-  HEAD-driven recovery on a store without `suffix_range` (a listed size
-  of 0, an over-report past the object's real end, and a genuinely empty
-  object, each asserting the right outcome), and a `NotFound` on the
-  size-mismatch retry reporting `FileChanged` rather than `FileMissing`,
-  each asserting its typed error.
-
-- **An RLOG write refuses a broken clustered row order, and a read decodes
-  each row-group dictionary once per chunk** (ADR-2135 decisions 1 and 6,
-  issue #2145). A clustered write whose computed row order repeats a row,
-  places one out of range, or has the wrong length now fails with
-  `LogSegError::InvalidRowOrder` on both write paths instead of silently
-  dropping the affected rows. A scan, and a ranged decode of a stream span or
-  of a row group, verifies and decodes each dictionary page once and shares
-  it among the chunk's blocks it reads, where it used to repeat the crc check
-  and decode for every block; a corrupt dictionary still fails every block of
-  its chunk, and `ScanStats` still charge the page to each block that reads
-  it. A BLOOM covered-column list cut short in its count, its ids or its crc
-  was already refused as `Corrupted`; tests now pin each message.
+- **The shipped IAM templates grant the control-plane keys each role uses**
+  (issues #1995 and #2340). Gateway and Query gain `s3:GetObject` on
+  `sys/auth`, so the durable bearer-token refresh is no longer refused; Admin
+  gains `s3:PutObject` on `sys/auth`, so `ravel-cli tenant token upsert` and
+  `revoke` can write the token map; Gateway gains `s3:PutObject` on
+  `sys/t/*`, so keyed ingest can create each tenant's recovery manifest;
+  Maintain gains the `sys/maintain/memo/*` list prefix, so a maintain warm
+  start reads its memo snapshots instead of running cold; Maintain, Query
+  and Gateway gain `s3:GetObject` on `t/*/config`, so the tenant config record
+  resolves instead of failing retention passes, typed-column overrides and
+  admission-limit refreshes, and Admin gains `s3:PutObject` on it, so the
+  `ravel-cli` tenant config commands are no longer refused. Gateway, Query and
+  Maintain gain `s3:GetObject` and `s3:PutObject` on `t/*/enc`, so a process
+  started with `--tenant-kms-config` no longer refuses to start on the
+  key-epoch bootstrap. Gateway gains read and write and Query gains read on
+  `t/*/m/meta`, so metric metadata is persisted and served. Query gains read
+  and write on the alert lease `t/*/a/alert-lease` and state memo
+  `t/*/a/state/latest` and write on the alert transitions under `t/*/a/l0/*`
+  and `t/*/a/c/*`, so `--alert-rules-file` rules are evaluated under the
+  Query role. The Maintain grants for alert retention, new in this release,
+  are described in the `--alert-retention` entry under Added. `sys/auth`,
+  `sys/t/*` and `t/*/enc` also join every template's deny-delete set, since
+  no role deletes them, a lost `sys/auth` silently revokes every durable
+  token, and a lost key-epoch record reads as a tenant that never had a key.
+  Re-apply the four documents under `deploy/iam/` to pick these up.
+- **An explicit multipart upload through a scheduled store could write parts
+  past its class's permit budget** (issue #2062). `ClassedStore::put_multipart`
+  took one permit for initiation and then handed back the inner upload
+  unwrapped, so every `put_part`, `complete` and `abort` call on it bypassed
+  the scheduler entirely. Each of those calls now takes one permit of the
+  owning handle's class before reaching the inner upload, and each part call
+  is counted as one `Put` with its byte count. `complete` and `abort` stay
+  uncounted, matching initiation. No production code calls `put_multipart`
+  today. The multipart fan-out inside `put()` for a body above 16 MiB is a
+  separate path and is still unscheduled (issue #2327). Also proved
+  (not changed): with upload integrity on, the explicit `put_multipart` path
+  already sent a server-verified checksum on every part, not only the first,
+  and `CompleteMultipartUpload`'s body carries one too whenever the
+  endpoint's `UploadPart` response echoes it back. Both are now pinned by
+  tests against a fake S3 endpoint instead of resting on the module doc's
+  word alone.
+- **A store error is no longer misclassified by its retry field name or a
+  stray 416** (issue #2322). A server error such as a 500 that exhausted its
+  retries used to read as a timeout because the retry message carries the
+  `retry_timeout` field name; it now reads as transient, while a 504, a 408
+  or S3's `RequestTimeout` still reads as a timeout. A get error is no longer
+  read as a terminal invalid range from the digits 416 in a URL, key or
+  request id; a real "416 Range Not Satisfiable" still is.
+- **The ingest router refuses a zero JWKS refresh interval or a zero
+  round-robin idle-entry TTL at startup** (issue #2330). Started through its
+  library API, the router used to panic the refresh task on a zero interval
+  and tear itself down, and a zero idle-entry TTL killed the idle-eviction
+  sweep task silently, so idle round-robin entries were never evicted. `run`
+  now returns `JwksRefreshSpawnError::ZeroRefreshInterval`, naming
+  `--oidc-jwks-refresh-interval-secs`, or
+  `RoundRobinSweepSpawnError::ZeroIdleTtl`, naming `--round-robin-idle-ttl`,
+  before it builds a Kubernetes client or spawns any task. The CLI already
+  refused both zero values.
+- **A store error is no longer classified as throttled or as a timeout
+  because those words appear in the bucket, endpoint or object key of the
+  request URI** (issue #2353). The S3 adapter, and the external GCS and Azure
+  stores new in this release, now read the throttle and timeout class from
+  the error text after the request URI, so an exhausted 500 or a 400 against
+  such a name stays `Transient` and keeps the caller's ordinary backoff,
+  unless the response body itself echoes the name, while a real 429, 503,
+  `SlowDown`, `RequestTimeout`, 504, 408 or transport timeout keeps its
+  class.
 
 ### Added
 
 - **The per-tenant config record can store a clustering key and a bloom scope behind an operator opt-in** (ADR-2135 decision 7, issue #2146): `TenantConfig::set_clustering_key`, `TenantConfig::clear_clustering_key` and `TenantConfig::set_bloom_scope` take a `StorageLayoutWrite` token and refuse with `WriterCannotEmit` unless it is `ReadersRolledOut`, stating every reader runs a release with the version-3 reader; a config carrying either field is then stamped format version 3, and one carrying neither is still stamped 2 byte for byte. A set or clear stores the stored generation plus one, a clear keeps field 13 with no columns, and clearing a key that was never set or is already cleared is refused. Key columns must be declared in the record's own `typed_attr_columns`, the list the clustering-key accessor validates against. On every write `set_tenant_config` runs the accessor's validation on a carried key and refuses an unknown bloom scope value; against the record it replaces, it refuses a generation below the stored one and a key whose columns, or whose bucket width while set, differ from the stored key's at the stored generation, so the generation never goes down and changes with any such key change (it need not be the stored generation plus one: two setter calls on one config store plus two). It refuses a record above version 3, and refuses a `typed_attr_columns` change that drops or retypes a column the current key names, naming the column and saying to clear the key first. `resolve_declared_columns` now falls back to the base columns when the record's list fails validation. Under the `undeclared` scope, a write that changes the set of declared typed column names also takes the next generation, in the cleared form when there is no key, so a generation names one key, one scope and, under `undeclared`, one set of typed attribute column names; a retype or reorder of the same names does not. `TenantConfig::write_if_unchanged` writes only when the record is still at the version the caller read, or still absent, and otherwise refuses with `CasConflict`, which says to re-read and retry. The log ingest flush reads both fields, L1 compaction and the erasure rewrite carry them into the parts they write, and the `ravel-cli clustering-key` and `bloom-scope` commands set them.
-- **The RLOG writer can sort an object by a clustering key and limit which columns BLOOM covers** (ADR-2135 decisions 1 and 5, issue #2141): `RlogWriter::with_sort_descriptor` orders rows by `(stream_ref, ts.div_euclid(bucket), key_1, ..., key_n, ts)` on resolved per-record values, identically on the row and columnar paths, and records the descriptor and clustering generation in the footer, refusing with `InvalidSortDescriptor` a descriptor the footer decoder would refuse and accepting a key no record has a value for, which orders nothing; `RlogWriter::with_bloom_scope` covers every string column (`All`, the default), `body`, `severity_text` and the string columns not in a declared-column list (`Undeclared`), or only `body` and `severity_text` (`Text`), and an uncovered column gets no bloom keys. With neither set the writer's output is byte-identical to before; the ingest flush sets both (issue #2142) and compaction carries them from its inputs (issue #2143).
-- **The log ingest flush writes each RLOG object with the tenant's clustering key and bloom scope** (ADR-2135 decisions 1 and 5, issue #2142): the key and scope are read from config record fields 13 and 14 with the tenant's indexed fields and declared typed columns and cached beside them, a set key's column types come from those declared typed columns, a cleared key writes no descriptor and its generation, a tenant with neither field writes the same bytes as before, and a key or scope that does not resolve writes no descriptor and full bloom coverage, warns once per refresh, and counts each such flush in `ingest_clustering_key_unresolved_total` per tenant (read through `LogIngestMetrics::clustering_key_unresolved_by_tenant`; not yet exported by `ravel-server`).
-- **`ravel-cli load --zstd-level`, `ravel-cli clustering-key show` and `ravel-cli bloom-scope show`, and the clustering fields in `ravel-cli rlog inspect`** (ADR-2135 decisions 4 and 7, issue #2145): `IngestConfig::rlog_zstd_level` (default 3, refused outside zstd's -131072..=22 with `RlogZstdLevelError::OutOfRange`) sets the zstd level of every page and section a log flush compresses, and `load --zstd-level` sets it for a logs load (compaction re-encodes at its own `rlog_zstd_level`, 9 by default, and `ravel-server` has no flag for the flush level yet); the two read-only show commands print config record fields 13 and 14 (never set, cleared at generation N, or set with its columns, their declared types, bucket width and generation; bloom scope `all`, `undeclared` or `text`), including on a format-version-3 record; and `rlog inspect` prints the sort descriptor, the clustering generation and the column ids BLOOM covers with their names.
+- **The RLOG writer can sort an object by a clustering key and limit which columns BLOOM covers** (ADR-2135 decisions 1 and 5, issue #2141): `RlogWriter::with_sort_descriptor` orders rows by `(stream_ref, ts.div_euclid(bucket), key_1, ..., key_n, ts)` on resolved per-record values, identically on the row and columnar paths, and records the descriptor and clustering generation in the footer, refusing with `InvalidSortDescriptor` a descriptor the footer decoder would refuse and accepting a key no record has a value for, which orders nothing; `RlogWriter::with_bloom_scope` covers every string column (`All`, the default), `body`, `severity_text` and the string columns not in a declared-column list (`Undeclared`), or only `body` and `severity_text` (`Text`), and an uncovered column gets no bloom keys. With neither set the writer adds no sort descriptor and covers every string column in BLOOM, exactly as an unkeyed writer does. A clustered write whose computed row order repeats a row, places one out of range, or has the wrong length fails with `LogSegError::InvalidRowOrder` on both write paths (issue #2145). The ingest flush sets both (issue #2142) and compaction carries them from its inputs (issue #2143).
+- **The log ingest flush writes each RLOG object with the tenant's clustering key and bloom scope** (ADR-2135 decisions 1 and 5, issue #2142): the key and scope are read from config record fields 13 and 14 with the tenant's indexed fields and declared typed columns and cached beside them, a set key's column types come from those declared typed columns, a cleared key writes no descriptor and its generation, a tenant with neither field writes no descriptor and full bloom coverage, as an unkeyed writer does, and a key or scope that does not resolve writes no descriptor and full bloom coverage, warns once per refresh, and counts each such flush in `ingest_clustering_key_unresolved_total` per tenant (read through `LogIngestMetrics::clustering_key_unresolved_by_tenant`; not yet exported by `ravel-server`).
+- **`ravel-cli load --zstd-level`, `ravel-cli clustering-key show` and `ravel-cli bloom-scope show`, and the clustering fields in `ravel-cli rlog inspect`** (ADR-2135 decisions 4 and 7, issue #2145): `IngestConfig::rlog_zstd_level` (default 3, refused outside zstd's -131072..=22 with `RlogZstdLevelError::OutOfRange`) sets the zstd level of every page and section a log flush compresses, and `load --zstd-level` sets it for a logs load (compaction re-encodes at its own `rlog_zstd_level`, 9 by default, and `ravel-server` has no flag for the flush level yet); the two read-only show commands print config record fields 13 and 14 (a key never set, no key at generation N, or a set key with its columns, their declared types, bucket width and generation, where "no key at generation N" covers a cleared key and one given a generation by a bloom scope or typed column change; bloom scope `all`, `undeclared` or `text`), including on a format-version-3 record; and `rlog inspect` prints the sort descriptor, the clustering generation and the column ids BLOOM covers with their names.
 - **`ravel-cli clustering-key set`, `ravel-cli clustering-key clear` and `ravel-cli bloom-scope set` write a tenant's clustering key and bloom scope** (ADR-2135, issue #2146): the first production path that writes a version-3 config record. Each requires `--readers-rolled-out`, the ADR-0066 R1 statement that every reader of the bucket's tenant config runs a release that reads version 3, and without it exits 2 before any store request. `set` takes one to four `--column` names the record's own typed attribute columns declare and a `--bucket-width` of `1h`, `6h` or `1d`; `clear` is refused on a key never set or already cleared; a refused key writes nothing. Each writes the record back with `CasVersion` against the version it read, so a record another writer changed in between refuses the command with a CAS conflict and writes nothing, and each ends with a note naming the 60 s staleness horizon. After a set, the RLOG objects the tenant's log flushes write, from ingest and `ravel-cli load` alike, carry the key and the scope, with three exceptions on a server's flush: for up to its 60 s tenant config staleness horizon it can write the earlier layout; a layout it cannot resolve writes the unkeyed default, counted on `ingest_clustering_key_unresolved_total`; and while its config read fails it serves the layout it last read, or the default when it never read one. Objects already written keep their order and filters until compaction rewrites them. A bloom scope change now takes its own clustering generation, leaving the key as it is (a tenant with no key gets field 13 in its cleared form), and under `undeclared` so does a change to the declared typed column names, so one generation names one key, one scope and, under `undeclared`, one set of typed attribute column names; setting the stored scope writes nothing, and `set_tenant_config` refuses a scope change `set_bloom_scope` did not produce or one at the stored generation.
 
 - **`ravel-cli store verify-protection` checks a bucket's protection
   configuration** (ADR-1727 decision 4, issues #1727, #2197). It reads the
-  bucket's versioning, lifecycle, replication and Object Lock configuration,
-  then prints one line per condition (`pass`, `fail` or `unknown`, with the
-  reason) and a summary. `object-retention` is reported as not checked by
+  bucket's versioning, lifecycle and Object Lock configuration, and its
+  replication configuration under `--expect-replication`, then prints one
+  line per condition (`pass`, `fail` or `unknown`, with the reason) and a
+  summary. `object-retention` is reported as not checked by
   this command and never affects the exit code (issue #2228).
   `--expected-noncurrent-days` is required, and `--expect-replication` adds
   the condition a deployment opts into. It exits `0` only when every expected
@@ -1111,9 +956,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `ravel_store_control_plane_response_bytes_total` count the bucket-protection
   control plane's read-only GETs sent, answered, and their response body bytes.
   All four carry `mode` and no `op` label, and the control-plane GETs stay out
-  of the per-operation `ravel_store_*` families. `ravel-server` itself sends
-  no control-plane GET yet (its startup check probes through the generic
-  store, issue #2197), so the three control-plane counters read 0.
+  of the per-operation `ravel_store_*` families. With
+  `--require-bucket-protection` on `--store s3`, the startup gate's three
+  read-only GETs are counted here; with the flag off, or on a store other
+  than S3, the three control-plane counters read 0.
 - **A read-only bucket-protection control plane in `ravel-object-store`**
   (ADR-1727 follow-up task 1, issue #1727). `S3Store` can now report, per
   condition, whether the bucket's protection configuration is Pass, Fail, or
@@ -1180,29 +1026,29 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `ControlPlaneMetricsSnapshot` of `requests` (sent), `calls` (answered with
   any status) and `response_bytes` (response-body wire bytes as received);
   the block is outside `StoreOp::ALL` and `StoreMetricsSnapshot`, so the
-  data plane's `get` and `list` blocks are unchanged and nothing exports it
-  yet. The lifecycle conditions and `delete-marker-replication` also accept a
-  union of enabled rules on exactly `t/0` through `t/f`, one per lowercase hex
-  digit a tenant hash can start with, each member's values checked as a
-  covering rule's are; any other set of narrower prefixes stays `Unknown`. The
-  signed `host` is the authority the request carries, derived from the parsed
-  URL as `reqwest` derives its `Host` (host lowercased, IDNA hosts in punycode,
+  data plane's `get` and `list` blocks are unchanged, and `ravel-server`
+  exports it at `/metrics` (see the #2172 entry). The lifecycle conditions
+  and `delete-marker-replication` also accept a union of enabled rules on
+  exactly `t/0` through `t/f`, one per lowercase hex digit a tenant hash can
+  start with, each member's values checked as a covering rule's are; any
+  other set of narrower prefixes stays `Unknown`. The signed `host` is the
+  authority the request carries, derived from the parsed URL as `reqwest`
+  derives its `Host` (host lowercased, IDNA hosts in punycode,
   IP literals normalised, the scheme's default port dropped), so an endpoint
   configured as `https://host:443`, with an uppercase or non-ASCII host, or
   with a leading-zero port is not answered 403. An endpoint carrying userinfo
   (`https://user:secret@host`) is refused as `Unknown` rather than sent with
   a second `Authorization` header. The server's `--require-bucket-protection` gate asks both probes through one
-  `BucketProbesSource` call too. Neither `store qualify` nor the server gate
-  is handed an `S3Store` yet: both probe through the `ObjectStoreBackend`
-  contract, so against a real bucket they report every condition `Unknown`
-  (issue #2197). `BucketProtectionParams` gains
-  `expect_replication` (the CLI's `--expect-replication`): when it is off, as
-  on the server, `?replication` is not fetched and `delete-marker-replication`
-  is `Unknown` the way unsampled `object-retention` is, never `Fail`.
-  Nothing in the shipping binaries reads these reports yet, though
-  `S3Store::new` now builds the control-plane client on every construction:
-  `ravel-cli store verify-protection` (task 2) and the server startup gate
-  (task 3) are the callers.
+  `BucketProbesSource` call too. On `--store s3`, `store qualify` and the
+  server gate read the bucket through the concrete `S3Store`; other backends
+  report every condition `Unknown` (issue #2197). `BucketProtectionParams`
+  gains `expect_replication` (the CLI's `--expect-replication`): when it is
+  off, as on the server, `?replication` is not fetched and
+  `delete-marker-replication` is `Unknown` the way unsampled
+  `object-retention` is, never `Fail`. `S3Store::new` builds the
+  control-plane client on every construction; `ravel-cli store
+  verify-protection` and the server's
+  `--require-bucket-protection` gate read the report.
 - **`ravel-cli export --signal metrics` writes a tenant's stored metric
   samples to a Parquet file `load --signal metrics` reads back onto the same
   series** (ADR-1751 decision 4, issue #1712). It resolves the metrics catalog
@@ -1363,7 +1209,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   over after its lease expired; the run cancelled),
   `ravel_maintain_claim_renew_failures_total` (a store error on renewal,
   distinct from a lost claim) and `ravel_maintain_claims_skipped_total` (one
-  per pass while an unexpired claim holds a bucket). A pass that ends in an
+  per pass while another process's unexpired claim holds a bucket, and on a
+  lost steal race or an unreadable claim). A pass that ends in an
   error drops the counts it had gathered, except renewal failures, so the
   others are lower bounds. The operations guide alerts on lost claims. Three
   new flags configure claiming:
@@ -1444,7 +1291,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   A mass-orphan breaker trip on the alerts shard, or on the query-audit shard's
   input-cleanup sweep, is logged at error with the breaker runbook wording and
   counted as `ravel_maintain_orphan_breaker_tripped_total{signal="alerts"}` or
-  `{signal="audit"}`, so the existing alert on that family pages on it.
+  `{signal="audit"}`, so the existing alert on that family pages on it. The
+  alerts shard sweep first lists the tenant's alert keyspace and the
+  quarantine copies taken from it, one bounded listing each, and skips the
+  sweep when both are empty, so a tenant with no alert objects pays those two
+  listings instead of the sweep's own; a tenant whose alert state memo was
+  just read skips them too, and a gate listing that fails runs the sweep
+  (issue #2134). The shipped Maintain IAM template grants read on the alert
+  state memo and on the `t/*/a/` and `quarantine/t/*/a/` list prefixes these
+  passes use; re-apply `deploy/iam/maintain.json` to pick it up.
 - **`ravel-cli load --signal spans` loads the spans signal** (ADR-1751
   decisions 1 and 2, follow-up task 2, issues #1751 and #1712). The load
   provisions or validates the tenant's spans signal, builds a
@@ -1506,9 +1361,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   timestamp is a zero (a zero takes the same fallbacks here) and its absent
   name is the empty string. A negative timestamp is refused: OTLP's two are
   unsigned, and a negative start beside a positive end would store a span whose
-  interval overlaps nearly every query window, so the refusal names both
-  declared units, since a unit that does not match the column is the usual
-  cause. A `parent_span_id` cell that is non-empty and of the wrong width is
+  interval overlaps nearly every query window. The refusal names the unit
+  each of start and end was read in, since a unit that does not match the
+  column is the usual cause: a native Arrow `Timestamp` column's own unit, or
+  `start_ts_unit`/`end_ts_unit` for an integer column; an end taken from the
+  start for a zero end cell reads "taken from start_ts because end_ts is 0",
+  and a start taken from the load time for a zero start cell reads "taken
+  from load time because start_ts is 0" (issues #2133 and #2168). A
+  `parent_span_id` cell that is non-empty and of the wrong width is
   refused rather than dropped, because a mapped column producing unusable ids
   is a mapping mistake the whole file shares. And attribute keys and both
   attribute-count caps are checked against the `--mapping` rather than per
@@ -1521,11 +1381,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Span events and span links are not mappable in this version, and a mapping
   naming them is refused by name rather than as a typo. The same refusal covers
   the reserved `attrs` keys the OTLP path stores span kind, trace state, span
-  flags, events and links under. Two mapped attributes sharing one key are
-  refused at mapping parse, and an id column that cannot carry an id of the
-  right width is refused when the batch's columns are resolved, before any row
-  is built or written. A hex id column loads whether the Parquet writer stored
-  it plain or dictionary-encoded.
+  flags, events and links under; the check uses the list `ravel-otlp` itself
+  exports (`traces_normalize::RESERVED_ATTR_KEYS` and `is_reserved_key`), so
+  a key reserved there is refused here too (issue #2123). Two mapped
+  attributes sharing one key are refused at mapping parse, and an id column
+  that cannot carry an id of the right width is refused when the batch's
+  columns are resolved, before any row is built or written. A hex id column
+  loads whether the Parquet writer stored it plain or dictionary-encoded.
 
   A spans load reads one sequential cursor and has no decode/encode queue, so
   `--read-cursors` and `--decode-queue-batches` are warned about when set to a
@@ -1562,7 +1424,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   metric-name and label length caps kept, the loader per-record cap of 1024
   in place of OTLP's `max_attributes_per_point`, the server's admission
   controller bypassed by construction). The spans half of the same flag
-  shipped in the entry below.
+  shipped in the `load --signal spans` entry above.
 
   The `--mapping` TOML gains per-signal sections: exactly one of `[logs]`,
   `[metrics]` and `[spans]` may be present and it must match `--signal`. A
@@ -1631,10 +1493,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fixed absence markers ("does not exist", "not implemented", "will land", and
   five more) without an entry, or when a contradicted entry names no issue or a
   not-implemented one's symbols have all landed. It runs in `make check-docs`
-  and CI's doc-scripts job. The seed registers two sentences in
-  `docs/query-engine.md` the code contradicts (#2082): the stamp carrier's write
+  and CI's doc-scripts job. The seed found two sentences in
+  `docs/query-engine.md` the code contradicted: the stamp carrier's write
   side, which the logs flush and RLOG compaction paths now call, and per-key
-  `attrs['k']` projection, which ships.
+  `attrs['k']` projection, which ships. Both are corrected in this release
+  (#2082) and registered as verified.
 - **An alert-signal retention sweep that keeps every identity's current-state
   record** (ADR-1688, issue #1688). The alert evaluator writes one object and
   one commit record per transition and nothing ever removed them, so the
@@ -1659,27 +1522,45 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   maintenance loop runs it through the driver described in the
   `--alert-retention` entry above.
 - **Catalog and PromQL decodes reserve their decoded output against the
-  process memory budget before they run** (ADR-1702 decision 6, issue #1702).
-  The catalog resolve reserves each snapshot part's, postings object's and
-  column-statistics object's header-declared uncompressed length, and the
-  reservation stays with the decoded value, in the decoded-part and postings
-  caches included, until it is dropped; the column-statistics reservation is
-  released when `load_column_stats` returns, since the loaded statistics do
-  not carry it. The PromQL fetcher reserves a segment's catalog sections
-  before `decode_selected` or `decode_sparse_catalog` decodes them, and the
-  `/api/v1/metadata` cache reserves a record's declared decompressed size. A
+  process memory budget before they run** (ADR-1702 decision 6, issues #1702,
+  #2081, #2088, #2107 and #2132). The catalog resolve reserves each snapshot
+  part's, postings object's and column-statistics object's header-declared
+  uncompressed length, and the reservation stays with the decoded value, in
+  the decoded-part and postings caches included, until it is dropped; the
+  column-statistics reservation is released when `load_column_stats`
+  returns, since the loaded statistics do not carry it. The PromQL fetcher
+  reserves a segment's catalog sections before `decode_selected` or
+  `decode_sparse_catalog` decodes them, and the `/api/v1/metadata` cache
+  reserves a record's declared decompressed size. A declared length over the
+  decoder's own ceiling is charged 0, not the ceiling, since the decoder
+  refuses such a unit before it allocates anything: that refusal, not the
+  budget, decides the outcome, so a snapshot part over the ceiling still
+  falls back to listing and a PromQL catalog chunk frame keeps its own typed
+  error. The rule, `decoded_charge`, lives once in `ravel-memory`, and the
+  query fetcher and the catalog both call it. A
   reservation that does not fit fails the read with a typed error
   (`CatalogError::MemoryExhausted`, `LoadColumnStatsError::MemoryExhausted`,
   `FetchMemoryExhausted`, `MetricsMetaError::MemoryExhausted`); a catalog
-  refusal never falls back to a listing pass, and a column-statistics refusal
+  budget refusal never falls back to a listing pass, a refused previous-postings
+  reservation fails the fold with the typed budget error rather than
+  rebuilding the postings from every segment's names (the next fold
+  retries), and a column-statistics refusal
   reaches a SQL client as the same transient 503 a store fault does, never as
-  corrupt data. **The segment fetcher's reservations are live in a running
+  corrupt data. Before a catalog decode or column-statistics load is
+  refused, `Catalog::reserve_decoded` evicts entries of the decoded-part and
+  postings caches, least recently used across every tenant, until the budget
+  admits the charge by the test `try_reserve` applies or the caches are
+  empty, then retries the reservation once. An entry a live resolve still
+  holds keeps its reservation until that resolve drops it, so a pass can
+  empty a cache and free nothing; a decode wanting more than the budget's
+  whole limit skips the pass and keeps its first refusal, so one oversized
+  object does not flush every tenant's entries. The column-statistics cache
+  is bounded in bytes, carries no reservations and is not evicted by the
+  pass. **The segment fetcher's reservations are live in a running
   server now** wherever it runs under the process budget: PromQL evaluation,
-  cache warming and distributed query fragments, so a read whose catalog
-  decode does not fit is refused with 503 rather than decoding uncharged. The
-  SQL query path's fetchers still reserve against their own unlimited budget,
-  so a SQL scan's catalog decode is charged but never refused yet. The
-  catalog and the metadata cache take the budget through the new
+  cache warming, distributed query fragments and SQL scans, so a read whose
+  catalog decode does not fit is refused with 503 rather than decoding
+  uncharged. The catalog and the metadata cache take the budget through the new
   `Catalog::with_memory_budget` and `MetadataCache::with_memory_budget`, and
   both still default to an unlimited budget, so the part, postings,
   column-statistics and metadata reservations refuse nothing until the server
@@ -1718,6 +1599,62 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the operator with an error naming both; `/readyz` answers `200` once the
   initial `RavelCluster` list has arrived.
 
+- **A request-budget refusal now names fold lag when fold lag is what the
+  budget was spent on** (ADR-1306 decision 6 and its 2026-09-27
+  refusal-threshold and 2026-10-01 amendments, issues #1306 and #2074). Each
+  resolve records the unsealed tail it listed live above the fold watermark,
+  and a refusal whose tail is longer than the engine's `fold_lag_threshold`
+  appends that tail's length in seconds and names
+  `ravel_catalog_fold_last_success_timestamp_seconds`, the gauge the
+  `RavelCatalogFoldStalled` alert reads, so an operator reading the error
+  goes to the fold rather than to the budget. Every other refusal keeps
+  its previous message to the byte. The threshold is `healthy_tail_max` of the
+  catalog's seal margin plus the fold interval plus the HEAD cache TTL
+  (8,400 + 300 + 30 = 8,730 s at the defaults): a fold leaves at most
+  `healthy_tail_max` unsealed at the instant it runs, then lets the tail grow
+  for one interval, and the HEAD a resolve reads may be one TTL older again,
+  so classifying against `healthy_tail_max` alone would blame a fold that is
+  keeping up for about five minutes of every hour. The tail comes from the
+  origins the resolve already produced, never an extra object-store request,
+  and it is reported only when that resolve read a folded snapshot part: a
+  resolve that found no usable snapshot lists the whole window live, tags
+  every key as recent including hours the fold has already sealed, and so
+  names nothing. A refusal therefore names fold lag only when the resolve
+  behind it read a snapshot part and the tail above that watermark exceeded
+  the threshold; the rule is conservative the other way, so a stall whose
+  window holds no sealed segment goes unnamed. Both forms keep their statuses:
+  HTTP 422 on the PromQL path, and 422 (gRPC `FailedPrecondition` over Flight
+  SQL) on the SQL path. On the SQL path the clause is attached at the
+  resolve-boundary check only; a SQL refusal raised mid-scan, and the
+  exemplars read's own budget check, still read as plain budget refusals.
+
+  `EngineConfig` gains `seal_margin`, `fold_interval` and `head_cache_ttl`.
+  The server builds it in one place, reading the seal margin and the HEAD
+  cache TTL off the `CatalogConfig` of the catalog it hands to both resolve
+  and the fold, and the fold interval off the `FoldTaskConfig` it spawns the
+  fold with. A `--mode query` process runs no scheduled fold and may not set
+  `--fold-interval-secs`, so it classifies against the new
+  `--fold-lag-interval-secs` flag, which names the maintain processes' fold
+  interval, or against the 300 s default without it. The flag sets only that
+  interval and configures no fold; `--mode all`, `--mode maintain` and
+  `--mode gateway` refuse it, and so does a zero value. `--mode all`
+  classifies against its own `--fold-interval-secs`; maintain and gateway
+  serve no query. The compiled-in values stay what an `EngineConfig` built
+  with no deployment context falls back to, and a test pins `ravel-query`'s
+  hand copy of the fold interval against the server's own default.
+
+  The operator renders `--fold-lag-interval-secs` on the query Deployment
+  from `spec.maintain.fold.intervalSecs` only when the maintain Deployment
+  renders (`spec.maintain.enabled` true), its fold runs
+  (`spec.maintain.fold.disabled` false), and that field is set. Upgrade
+  `spec.image` to a `ravel-server` image from this release or newer before or
+  together with the operator: on a cluster where those three conditions hold,
+  the upgraded operator adds the flag to the query Deployment and rolls the
+  query pods, and an older server rejects the unknown flag at startup, so
+  the pods restart-loop. Editing `spec.maintain.fold.intervalSecs`,
+  `spec.maintain.fold.disabled` or `spec.maintain.enabled` rolls the query
+  pods as well as the maintain pods whenever the change adds, removes or
+  changes the flag.
 - **An end-to-end proof that a stalled fold pages before it refuses a query**
   (issue #1306, ADR-1306 follow-up task 3). ADR-1306 decision 2 states the
   ordering as arithmetic over spans;
@@ -1731,24 +1668,46 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ADR-1306 replaced is refused at the first minute, before the fold has stalled
   at all. Time is injected throughout: no step waits on the wall clock.
 
-- **`ravel_maintain_bytes_reclaimed_total` and
-  `ravel_maintain_retention_lag_seconds` render on `/metrics`** (issue #1729).
-  The first is a per-signal counter of bytes freed by the sweep, summed from the
-  listed object size of the two deletions that already carry one, the quarantine
-  reaper and the unreferenced-part delete; superseded and retention deletions
-  are excluded because they delete by key without a size, so the counter
+- **`ravel_maintain_bytes_reclaimed_total`,
+  `ravel_maintain_retention_lag_seconds` and
+  `ravel_maintain_units_scan_failed` render on `/metrics`** (issues #1729 and
+  #2073). The first is a per-signal counter of bytes freed by the sweep,
+  counted as object sizes, not wire bytes: the quarantine reaper and the
+  unreferenced-part delete count each object at its listed size, and the
+  superseded-input sweep counts each object it deletes at the `object_size`
+  its commit, compaction or rewrite record carries, with no extra request,
+  and a superseded L1 segment on the pass that deletes the record naming it,
+  so a refused record delete cannot charge it twice. Retention deletions are
+  excluded because they delete by key without a size, so the counter
   undercounts the bytes freed and its HELP text says so (a unit swept by two
-  replicas during an ownership handoff can count one object twice). The second is a per-signal gauge of how
-  far past its retention deadline the oldest still-present expired bucket is, as
-  observed by this process's most recent completed maintenance cycle, from the
-  injected clock; it is a per-cycle maximum over the process's units and is 0
-  when no expired bucket is still present. Both sit next to the existing
-  `ravel_maintain_*` families under the same maintain-mode gate and carry only
-  the `mode` and `signal` labels. The troubleshooting and observability guides
-  gain alert suggestions for a retention lag that keeps climbing, and the
-  "storage keeps growing" row now names series an alert can read,
-  `absent(ravel_maintain_workers_live)` for a missing maintain process and the
-  pending, lag and deleted-objects series for one falling behind, before the
+  replicas during an ownership handoff can count one object twice). The
+  second is a per-signal gauge of how far past its retention deadline the
+  oldest still-present expired bucket is, as observed by this process's most
+  recent completed maintenance cycle, from the injected clock; it is a
+  per-cycle maximum over the process's units and is 0 when no expired bucket
+  is still present. A bucket's lag is measured from its newest event plus the
+  retention window, which the pass that writes the tombstone reads anyway and
+  keeps in memory for the bucket's later passes; after a restart or on
+  another replica's bucket it falls back to the earlier of the ingest hour's
+  nominal deadline and the tombstone's write time, which can under-read by up
+  to one hour plus `max_ingest_lag`. A tombstoned bucket holding a rewrite
+  record with no parts falls back to the tombstone's write time alone, which
+  under-reads by however late the tombstone was written; telling such a
+  rewrite from one that keeps parts costs one GET per listed rewrite record,
+  up to the first with no parts, issued only when the exact expiry is not
+  held in memory and only until one pass reads them without error, and a
+  failed read falls back to the tombstone's write time without failing the
+  retention pass. A unit whose scan fails reports no lag, so the third, a
+  per-signal gauge, counts the units whose scan failed in the cycle the lag
+  comes from and the units a failed provisioning check or shard-generation
+  read skipped before scanning; read the lag beside it. All three sit next to
+  the existing `ravel_maintain_*` families under the same maintain-mode gate
+  and carry only the `mode` and `signal` labels. The troubleshooting and
+  observability guides gain alert suggestions for a retention lag that keeps
+  climbing, and the "storage keeps growing" row now names series an alert
+  can read, `absent(ravel_maintain_workers_live)` for a missing maintain
+  process and the pending, lag and deleted-objects series for one falling
+  behind, before the
   per-bucket `ravel-cli maintain status` call.
 - **A full-object GET now verifies the body against the checksum the store
   recorded at upload** (ADR-1696, issue #1696). A commit record is a bare
@@ -1768,8 +1727,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and the HTTP connector that reads the response header runs after signing, the
   header rides on the client's default headers, which `object_store` signs onto
   every request but a LIST; a LIST carries no such header.
-  `S3HttpConfig::request_stored_checksum` (default on) stops sending it; no
-  server flag sets it yet. `MemoryStore` keeps a CRC-32C beside each object and
+  `S3HttpConfig::request_stored_checksum` (default on) stops sending it;
+  `ravel-server` and `ravel-cli` set it from `--s3-request-stored-checksum`.
+  `MemoryStore` keeps a CRC-32C beside each object and
   checks it the same way, so the semantics oracle matches;
   `MemoryStore::corrupt_stored_byte`, which makes that testable, sits behind a
   new `test-support` crate feature that production builds leave off. A read
@@ -1777,11 +1737,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   an endpoint that returns no `x-amz-checksum-*` header, a digest this adapter
   cannot recompute (SHA-256, or a composite multipart digest), and an object
   larger than one request body. The count is
-  `StoreMetricsSnapshot::get_unverified` (and `S3Store::get_unverified`); it is
-  not yet exported at `/metrics`. Caller-issued ranged reads are outside the
-  check entirely, since the endpoint returns no checksum on them; they keep the
-  format's own crc32c hierarchy as their check. Write-side upload integrity
-  still defaults to off and is unchanged here.
+  `StoreMetricsSnapshot::get_unverified` (and `S3Store::get_unverified`),
+  exported as `ravel_store_get_unverified_total`. Caller-issued ranged reads
+  are outside the check entirely, since the endpoint returns no checksum on
+  them; they keep the format's own crc32c hierarchy as their check.
+  `S3HttpConfig`'s upload-integrity default stays off; `ravel-server` and
+  `ravel-cli` default to `crc64nvme` (see Changed).
 - **`ravel-ingest` has an opt-in idle flush byte floor, off by default**
   (ADR-1737, issue #1737). `IngestConfig::idle_flush_byte_floor` defaults to
   0, which changes nothing: every buffer flushes on the same clocks as before.
@@ -1795,9 +1756,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `max_flush_lifetime` old when its flush opens, which is the figure
   `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` is derived from. A
   buffer that reaches the floor goes back to the idle clock, and strict-mode
-  writes keep the fast clock. `ravel-server` does not expose the knob yet, so
-  no deployment's flush cadence or buffered-mode loss window changes with this
-  release.
+  writes keep the fast clock. `ravel-server --idle-flush-byte-floor` exposes
+  it (see its entry below).
 - **The S3 adapter observes the store's own clock from response `Date`
   headers** (ADR-1685 decision 1, issue #1685). A writer stamps its
   ingest-hour bucket from its own clock and has had no second time source to
@@ -1818,11 +1778,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and no new object. Every decorator in the crate delegates to the store it
   wraps, as does `ravel-server`'s `--tenant-kms-config` wrapper, and
   `MemoryStore` reports `None` unless a test sets one through the
-  `test-support` setter. Nothing consults the observation yet: the writer's
-  clock-lag refusal (ADR-1685 decision 2) lands separately, so no flush
-  behavior changes with this release.
-  writes keep the fast clock. The `ravel-server` flag that turns it on is the
-  next entry.
+  `test-support` setter. The writer's clock-lag refusal (ADR-1685 decision
+  2), described under Fixed, is what consults it.
 - **`ravel-server --idle-flush-byte-floor` exposes that floor, and
   `/metrics` reports what it holds** (ADR-1737, issue #1737). The flag takes a
   byte count, defaults to 0 (the sub-floor hold disabled), and reaches the
@@ -1850,8 +1807,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     sent as a version selector, so the pinned version keeps being served
     after an overwrite, and a deleted version is `NotFound`. A caller's pin
     rides every request of a split whole-object read, the unranged first
-    one included, and such a read is still verified against the store's
-    upload checksum when the endpoint returns one.
+    one included. A pinned whole-object read that fits in one response is
+    verified against the store's upload checksum when the endpoint returns
+    one; a split one is served unverified and counted, as for any
+    full-object read.
   - `get_pinned` returns a `PinnedRead` carrying the pin of the bytes
     served. `pin_of` and `get_with_pin` report an object's pin, including
     S3's `x-amz-version-id` when the bucket has versioning on. The default
@@ -1861,14 +1820,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     and refuses every write with the new `ReadOnly` error. A profile names
     where its secrets live and never holds their values, and a credential
     failure is reported as `CredentialsRejected` without the path or secret.
+    A missing Azure container (`ContainerNotFound`) or GCS bucket
+    (`NoSuchBucket`) is `Permanent` on get and list, while a missing blob
+    stays `NotFound`; a HEAD 404 has no body, so `head` and `pin_of` against
+    a missing container or bucket read `NotFound` (issue #2297).
   - `external::probe` qualifies a candidate bucket: it must honour
     preconditions, and it must not be Ravel's own bucket, whether under
     another name or as a copy that holds Ravel's `sys/tenancy` marker.
   - `ravel_cache::CacheKey::pinned` keys such an object by profile, bucket,
     key, ETag, version and size.
 
-  No shipping binary reaches any of it yet; the callers are #2052, #2051
-  and #2054.
+  Its callers in this release are `ravel-cli tenant parquet-grant` (#2051),
+  the Parquet reader (#2052) and the server's Parquet queries (#2053).
 - **Parquet table location grants and in-place manifest format** (ADR-2040,
   issue #2050): the new `ravel-pqtable` crate and
   `proto/ravel/parquet_table.proto`. A per-tenant grants record at
@@ -1880,7 +1843,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   key that object_store's `Path` would rewrite is refused. Both records carry
   the tenant hash they were written for, and a grants record or manifest read
   under another tenant's key is refused as `Misfiled` rather than read as that
-  tenant's. No shipping binary calls it yet.
+  tenant's. `ravel-cli` and `ravel-server` call it (entries below).
 - **`ravel-cli tenant parquet-grant add|remove|ls` and `ravel-cli parquet
   ls|sweep`** (ADR-2040, issue #2051): the first shipping caller of the
   Parquet location grants record, of manifest resolution, and of both
@@ -1890,9 +1853,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   store that serves a pinned read carrying an ETag it never issued, and
   refuses a bucket that `probe_not_ravel_bucket` does not clear as external,
   including an inconclusive answer. Only a location that clears all four is
-  written. Credential profiles are read from the JSON file named by the new
-  top-level `--parquet-profiles` flag or `RAVEL_PARQUET_PROFILES`. `parquet
-  sweep` takes its minimum `--grace` from `sys/gc`'s `max_query_duration_ns`,
+  written. The object the `If-Match` probe reads must hold at least one byte
+  and be admitted by the grant segment by segment: a location naming one
+  object is checked with a HEAD, and otherwise the location is listed with a
+  trailing slash for up to 8 pages, preferring a `.parquet` key and falling
+  back to any such object, so a zero-byte folder marker or an object under a
+  sibling prefix (`data/t10/` for `data/t1`) is never probed (issue #2318).
+  Credential profiles are read from the JSON file named by the new top-level
+  `--parquet-profiles` flag or `RAVEL_PARQUET_PROFILES`. `parquet sweep`
+  takes its minimum `--grace` from `sys/gc`'s `max_query_duration_ns`,
   the value ADR-0050 section 4 bounds every engine deadline against, and
   refuses a bucket that has no `sys/gc` rather than assuming a default.
 - **`ravel-parquet`: DataFusion's Parquet scan over a table manifest**
@@ -1942,11 +1911,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `str` cell still reads as absent and falls through to the resource or scope
   value, and a typed `str` column is still `Dictionary(Int32, Utf8)`.
 - Parquet tables answer `POST /api/v1/sql` and Flight SQL (ADR-2040 D3, D4
-  and D6, #2053). `ravel-server --parquet-profiles` (`RAVEL_PARQUET_PROFILES`)
-  loads the credential profile file `ravel-cli` uses, and each profile's
-  read-only store is opened per bucket the first time a query reads it. A
-  (profile, bucket) whose bucket address overlaps that of Ravel's own data
-  bucket (`--s3-bucket` at `--s3-endpoint` in `--s3-region`, path-style) is
+  and D6, #2053, #2188, #2214, #2291, #2304). `ravel-server
+  --parquet-profiles` (`RAVEL_PARQUET_PROFILES`) loads the credential profile
+  file `ravel-cli` uses, and each profile's read-only store is opened per
+  bucket the first time a query reads it. A (profile, bucket) whose bucket
+  address overlaps that of Ravel's own data bucket (`--s3-bucket` at
+  `--s3-endpoint` in `--s3-region`, path-style) is
   refused with a typed error before that store is opened. A bucket address is
   where the S3 client sends the bucket's requests: a virtual-hosted endpoint as
   written, a path-style one with `/<bucket>` appended, AWS's regional endpoint
@@ -1963,8 +1933,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   naming a Parquet table fails with `NotConfigured` (HTTP 422). A Parquet
   table beside a signal table is `CrossSignalQuery`; another tenant's table, a
   dropped table and any other unknown name fail to plan as an unknown table
-  always has. Each such name costs one LIST of its manifest prefix, so a
-  statement naming more than 16 distinct tables besides the five signal tables
+  always has. Each such name costs one LIST of its manifest prefix, and one
+  GET of its newest manifest when it has versions, so a statement naming
+  more than 16 distinct tables besides the five signal tables
   (`MAX_STATEMENT_TABLE_NAMES`) fails with `TooManyTables` (HTTP 400) before
   any manifest is listed. Only a Parquet session's registry resolves a store,
   its own tenant's `ravel-pq://` URL, and a statement naming a table function
@@ -1975,28 +1946,50 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   index: it hands the scan a footer with no column index or offset index, and
   the scan runs with DataFusion's `enable_page_index` off, so every column
   chunk is decoded by page header and a corrupt offset index changes no row,
-  including when a join or TopK pushes a dynamic filter into the scan. A
+  including when a join or TopK pushes a dynamic filter into the scan. It
+  does not prune with bloom filters either (`bloom_filter_on_read` is off),
+  so a corrupt bitset cannot drop a matching row. A
   panic in the Parquet decoder while it decodes a corrupt file is reported as
   `Corrupt`, naming the table and the file, not as an operator panic.
   Row-group statistics pruning and `pushdown_filters` are unchanged; there is
-  no page-level pruning. Decoded footers and refusals are cached per pinned
-  file and footer length the manifest recorded. A refusal is cached: a footer
-  length the file cannot hold, and a trailer or footer that does not decode or
-  disagrees with the manifest. A read that failed is not cached, whatever it
-  failed on: a store error or a read that came back short.
+  no page-level pruning. A checksum mismatch on a Parquet table's manifest,
+  grants record or data file answers 500; a manifest or grants record above
+  the version ceiling this build reads (`ManifestError::UnsupportedVersion`,
+  `GrantsError::UnsupportedVersion`) answers the retryable 503, since a peer
+  on a newer build can read it. Decoded footers and refusals are cached per
+  pinned file and footer length the manifest recorded. A refusal is cached:
+  a footer length the file cannot hold, and a trailer or footer that does
+  not decode or disagrees with the manifest. A read that failed is not
+  cached, whatever it failed on: a store error or a read that came back
+  short.
   `tenant parquet-grant add` lists past a zero-byte directory blob, and says so
   when its search for an object stopped at the listing page bound.
 - **`ravel-parquet`: `snapshot::snapshot_location`, the file list `CREATE
-  EXTERNAL TABLE` will pin** (ADR-2040 decision D2, issue #2052). Not reachable
-  from SQL yet; #2054 wires it into the DDL. A location naming one object is
-  read with one HEAD and no LIST; a prefix ending in `/` is listed once,
-  recursively, and every key ending in exactly `.parquet` becomes a file,
-  Hive-style subdirectories included with no partition columns. Directory
-  markers and other suffixes are skipped and counted separately. Each footer
-  is read with `If-Match` on the ETag the listing reported, under a
-  `GetLimiter` permit and charged to the Probe phase, with up to the
-  limiter's permits in flight, and the file's ETag, version and size are
-  recorded from that read's response, not from the listing. The footer passes
+  EXTERNAL TABLE` will pin** (ADR-2040 decision D2, issues #2052 and #2283).
+  `SqlExecutor::execute_ddl` (#2054) calls it; no HTTP route reaches the DDL
+  yet. A location naming one object is read with one HEAD and no LIST; a
+  prefix ending in `/` is listed once, recursively, and every key ending in
+  exactly `.parquet` becomes a file, Hive-style subdirectories included with
+  no partition columns. Directory markers and other suffixes are skipped and
+  counted separately. Each footer is read with `If-Match` on the ETag the
+  listing reported, under a `GetLimiter` permit and charged to the Probe
+  phase, with up to the limiter's permits in flight, and the file's ETag,
+  version and size are recorded from that read's response: the listing is
+  trusted for a file's key and pin only, never its size. The first footer
+  read is a suffix read of `FOOTER_PREFETCH` bytes on a store whose
+  capabilities report `suffix_range`, and otherwise an explicit range over
+  the last `min(FOOTER_PREFETCH, size)` bytes of the listed size, retried
+  once at the size its own response reports when the listed size was stale;
+  a store that cannot take a suffix range (Azure) never receives one. A
+  file's footer costs one or two GETs on a suffix-capable store and up to
+  three on one that is not, plus one HEAD there when the listed size leaves
+  no valid range to request (a listed size of 0, or one past the object's
+  real end by more than `FOOTER_PREFETCH`). Each footer GET reserves its
+  byte length against the snapshot's `MemoryBudget` before it is issued, the
+  first read's reservation is held until the footer is decoded, and a read
+  the budget cannot admit refuses with `MemoryExhausted` and issues no GET. A
+  footer read that returns a different number of bytes than requested is
+  refused as `Corrupt`. The footer passes
   the same trailer, column chunk and embedded Arrow schema checks the reader
   applies. A typed `SnapshotError` naming the key refuses the whole snapshot
   for a file changed or deleted after the listing, an empty or truncated
@@ -2019,6 +2012,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   different tenant or capability refuses startup
   naming both positions instead of resolving last-wins (identical repeats
   stay accepted); and an empty `--oidc-ddl-claim` refuses startup.
+  `ravel-ingest-router` parses `--tenant-token` with the same
+  `ravel_tenant_resolve::split_tenant_suffix`, so it routes `tok=acme;ddl` by
+  tenant `acme` as the server resolves it, discards the `ddl` flag, and
+  refuses an unknown suffix at startup (issue #2243).
 - **Parquet queries reserve the bytes they fetch against the process memory
   budget and obey the request and byte budgets every other SQL query obeys**
   (issue #2239, ADR-1170 decision 2). Every range the Parquet reader returns
@@ -2029,8 +2026,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reserved whole before any of it is read. A refused reservation fails the
   query with the error the signal fetchers raise for theirs
   (`FetchMemoryExhausted`, the same class, HTTP status and client message)
-  and issues no GET for the refused range. With the default unlimited memory
-  budget nothing is refused. The decoded-footer cache (`metadata_cache_bytes`)
+  and issues no GET for the refused range. An executor built without
+  `with_process_memory_budget` refuses nothing; `ravel-server` installs its
+  process budget, so it can. The decoded-footer cache (`metadata_cache_bytes`)
   is a separate, separately bounded cache and is not charged to that budget:
   only a footer's raw bytes are, while the reader holds them to decode them.
   A Parquet statement is also held to `max_s3_requests` and
@@ -2389,39 +2387,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   whole-object fallback. The per-flush figure holds per selector: each
   selector fetches the segment again, so an N-selector query can spend up to
   `1 + 7N` requests per flush, which the derived budget does not scale for. An
-  explicit `--max-s3-requests` is still used as given.
-- **A request-budget refusal now names fold lag when fold lag is what the
-  budget was spent on** (ADR-1306 decision 6 and its 2026-09-27
-  refusal-threshold amendment, issue #1306). Each resolve records the unsealed
-  tail it listed live above the fold watermark, and a refusal whose tail is
-  longer than the engine's `fold_lag_threshold` appends that tail's length in
-  seconds and names `ravel_catalog_fold_last_success_timestamp_seconds`, the
-  gauge the `RavelCatalogFoldStalled` alert reads, so an operator reading the
-  error goes to the fold rather than to the budget. Every other refusal keeps
-  its previous message to the byte. The threshold is `healthy_tail_max` of the
-  catalog's seal margin plus the fold interval plus the HEAD cache TTL
-  (8,400 + 300 + 30 = 8,730 s at the defaults): a fold leaves at most
-  `healthy_tail_max` unsealed at the instant it runs, then lets the tail grow
-  for one interval, and the HEAD a resolve reads may be one TTL older again,
-  so classifying against `healthy_tail_max` alone would blame a fold that is
-  keeping up for about five minutes of every hour. The tail comes from the
-  origins the resolve already produced, never an extra object-store request,
-  and it is reported only when that resolve read a folded snapshot part: a
-  resolve that found no usable snapshot lists the whole window live, tags
-  every key as recent including hours the fold has already sealed, and so
-  names nothing. A refusal therefore names fold lag only when the resolve
-  behind it read a snapshot part and the tail above that watermark exceeded
-  the threshold; the rule is conservative the other way, so a stall whose
-  window holds no sealed segment goes unnamed. Both forms keep their statuses:
-  HTTP 422 on the PromQL path, and 422 (gRPC `FailedPrecondition` over Flight
-  SQL) on the SQL path. `EngineConfig` gains `seal_margin`, `fold_interval`
-  and `head_cache_ttl`, defaulting to the catalog's and the server's own
-  compiled-in values; passing a running server's `CatalogConfig` and
-  `FoldTaskConfig` through to them is a follow-up, so a deployment that has
-  changed them is classified against the defaults until then. On the SQL path
-  the clause is attached at the resolve-boundary check only; a SQL refusal
-  raised mid-scan, and the exemplars read's own budget check, still read as
-  plain budget refusals.
   explicit `--max-s3-requests` is still used as given. The seal margin the
   span is built from is the one the server's own catalog folds and resolves
   with, read off the `CatalogConfig` its `build_catalog` constructs rather
