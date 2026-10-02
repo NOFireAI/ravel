@@ -331,9 +331,14 @@ and `crates/ravel-maintain/src/unnamed_marker.rs`.
 
 A refused marker delete keeps a retention bucket's tombstone, and blocks a
 candidate whose marker must be replaced, on every pass, so the delete grant is
-load-bearing. `DenyDeleteProtected`'s `t/*/u/*/0000/*` also matches an audit
-shard-0 marker (`t/<hash>/u/maint/unn/0000/...`), so that marker's delete is
-refused; the reaper counts the key as failed and moves on to the next one.
+load-bearing. `DenyDeleteProtected`'s `t/*/u/*/0000/*` also matches every
+key on audit shard 0: the marker (`t/<hash>/u/maint/unn/0000/...`) and both
+anchor classes, the retention tombstone under `t/<hash>/u/c/0000/` and any
+compaction or rewrite record there. Those anchors are never deleted, so the
+reaper never reaches the marker delete: it HEADs a marker's anchor first and
+moves on while the anchor is present (`reap_listed`,
+`crates/ravel-maintain/src/unnamed_marker.rs`). A marker written for an audit
+shard-0 anchor, one per gated hour bucket in the common case, stays for good.
 `maintain_template_covers_every_unnamed_marker_call` in
 `crates/ravel-commit/tests/iam_templates.rs` witnesses all four grants.
 
