@@ -3168,12 +3168,18 @@ mod tests {
     /// A `FaultStore` gate holds the leader's GET open until the leader and
     /// six parked followers have peeked and missed; those six are counted by
     /// `TieredCache::in_flight_waiters`. The eighth caller's disk peek is
-    /// held open by `DiskCache::block_peek_for_test` (issue #2347) and
-    /// released only after the leader and the six followers have resolved
-    /// and left the single-flight map, constructing deterministically the
-    /// interleaving a slow `spawn_blocking` disk peek produces on a loaded
-    /// machine -- which is how this test once saw two GETs -- instead of
-    /// sampling it under real scheduling.
+    /// held open by `DiskCache::block_peek_for_test` (issue #2347) just long
+    /// enough to prove it has parked there rather than already joined the
+    /// flight, then released at once, so its miss is recorded the same as a
+    /// merely slow real disk peek would, well before the leader's GET is
+    /// released and bytes are admitted. Its future is then left unpolled
+    /// until after the leader and the six followers have resolved and left
+    /// the single-flight map, so the continuation past the peek --
+    /// `resolve_peeked_miss`'s leader RAM recheck -- runs only once that
+    /// flight is gone. This constructs deterministically the interleaving a
+    /// slow `spawn_blocking` disk peek produces on a loaded machine -- which
+    /// is how this test once saw two GETs -- instead of sampling it under
+    /// real scheduling.
     ///
     /// FLIP: removing the leader's `self.ram.get_uncounted(&key)` check in
     /// `TieredCache::resolve_peeked_miss` lets the eighth caller lead a
@@ -3238,6 +3244,15 @@ mod tests {
             "the late caller is parked on its disk peek, not on any flight yet"
         );
 
+        // Release the late caller's disk peek now, before the leader's GET
+        // (and so before the leader ever admits bytes to disk): its read
+        // finds nothing on disk and records a genuine miss, same as it would
+        // on a real, merely slow disk. Its future is not polled again until
+        // `late.await` far below, so the continuation past the peek (joining
+        // or leading `resolve_peeked_miss`) waits for that poll regardless of
+        // how fast the peek itself resolves.
+        disk_peek.release();
+
         let parked: Vec<_> = (0..PARKED)
             .map(|_| {
                 let reader = reader.clone();
@@ -3245,11 +3260,10 @@ mod tests {
             })
             .collect();
 
-        // Each disk miss is recorded inside a caller's `spawn_blocking` peek
-        // once it has missed. The late caller's peek is still parked on the
-        // gate above, so only the leader's and the six parked callers' misses
-        // are counted here. The timeout only turns a hang into a failure.
-        let peeks = (CALLERS - 1) as u64;
+        // Every caller's disk peek -- the leader's, the six parked
+        // followers', and the late caller's released above -- misses and is
+        // counted here. The timeout only turns a hang into a failure.
+        let peeks = CALLERS as u64;
         tokio::time::timeout(std::time::Duration::from_secs(60), async {
             while disk_metrics.snapshot().misses - before_misses < peeks
                 || tiered.in_flight_waiters(&key) < PARKED
@@ -3258,7 +3272,7 @@ mod tests {
             }
         })
         .await
-        .expect("the leader and the six parked callers all peek and miss");
+        .expect("the leader, the six parked callers, and the late caller all peek and miss");
         assert_eq!(
             tiered.in_flight_waiters(&key),
             PARKED,
@@ -3288,11 +3302,12 @@ mod tests {
             "the leader's flight has finished and left the map before the late caller resumes"
         );
 
-        // Only now release the late caller's disk peek: its miss lands after
-        // the leader's flight has already left the single-flight map, so
-        // `resolve_peeked_miss`'s leader RAM recheck is what decides whether
-        // it reuses the finished flight's bytes or leads a second one.
-        disk_peek.release();
+        // Only now is the late caller's future polled again: its disk peek
+        // missed and recorded long ago, but the continuation past that peek
+        // -- `resolve_peeked_miss`'s leader RAM recheck -- runs for the first
+        // time here, after the leader's flight has already left the
+        // single-flight map, deciding whether it reuses the finished
+        // flight's bytes or leads a second one.
         served.push(late.await.expect("the late caller resolves"));
 
         assert_eq!(
