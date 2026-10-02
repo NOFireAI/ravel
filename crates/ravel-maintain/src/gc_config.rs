@@ -160,9 +160,9 @@ impl GcConfigValues {
     /// Whether the horizon outlasts every compaction or rewrite run that could
     /// still publish over a record's inputs:
     /// `protection_horizon >= max_compaction_lifetime + 4 * clock_skew_allowance`
-    /// (ADR-1133, gated-set stability amendment). A run that overlaps record R
-    /// listed the bucket before R was visible, so it started before R's
-    /// `created_unix_ns` in true time, and it publishes within
+    /// (ADR-1133, compaction-lifetime amendment). A run that overlaps record R
+    /// listed the bucket before R was visible, so it started before R was
+    /// published, taking R's `created_unix_ns` as the publish, and it publishes within
     /// `max_compaction_lifetime` of its own start on its own clock (`2σ` of true
     /// time on top). The sweeper's horizon check compares its clock against R's
     /// `created_unix_ns` (another `2σ`). Saturating like
@@ -736,7 +736,7 @@ pub fn validate_maintain_skew(
     Ok(())
 }
 
-/// Maintain-mode startup check (ADR-1133, gated-set stability amendment): the
+/// Maintain-mode startup check (ADR-1133, compaction-lifetime amendment): the
 /// stored horizon must satisfy
 /// `protection_horizon >= max_compaction_lifetime + 4 * clock_skew_allowance`
 /// ([`GcConfigValues::satisfies_compaction_lifetime`]) for THIS process's

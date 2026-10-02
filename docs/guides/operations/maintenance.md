@@ -665,7 +665,7 @@ server's.
 `ravel-cli gc-config set` refuses, and writes nothing, a protection horizon
 below either of two bounds: `max_query_duration + grace +
 clock_skew_allowance`, and `max_compaction_lifetime + 4 *
-clock_skew_allowance` (ADR-1133). The second is checked against this build's
+clock_skew_allowance`. The second is checked against this build's
 compiled 1 h maximum compaction lifetime, and both against the 5 min default
 skew allowance unless `--clock-skew-allowance` is given. It only binds a
 deployment that shortens `max_query_duration` and `grace` far below their
