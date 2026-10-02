@@ -16,8 +16,9 @@
 #                            and does not fail the lane
 #   exhaustive   [-a AREA]   full safety + liveness (budget 3600s per cfg,
 #                            overridable per cfg via bands.tsv's budget_s)
-#   positive     [-a AREA]   run positive/*.cfg, each must pass (budget 300s;
-#                            bands.tsv row keyed positive/<name>.cfg, if any)
+#   positive     [-a AREA]   run positive/*.cfg, each must pass (budget 300s)
+#                            inside its required bands.tsv row, keyed
+#                            positive/<name>.cfg; a cfg with no row fails
 #   negative     [-a AREA]   run negative/*.cfg, assert the expected violation
 #   traceability [-a AREA]   check every traceability.md source ref resolves
 #   ci           [-a AREA]   smoke + live + positive + negative + traceability
@@ -573,9 +574,11 @@ liveness_single_property_cfg() {
 # check_positive <area>
 # Runs every <area>/positive/*.cfg as a safety check that must pass, for a
 # targeted configuration beside smoke (a switch combination smoke does not set).
-# The module comes from the cfg's first line, as for a negative. Each run goes
-# through check_one_model, so its bands.tsv row, keyed positive/<name>.cfg, is
-# enforced the same way smoke's is; an area with no positive/ directory skips.
+# The module comes from the cfg's first line, as for a negative. Each cfg must
+# have a bands.tsv row keyed positive/<name>.cfg: one without fails the lane
+# before TLC runs, since a pass with no state count checked could be a model
+# that reaches nothing. The run goes through check_one_model, which enforces
+# the row the same way smoke's is; an area with no positive/ directory skips.
 check_positive() {
     local area="$1"
     local area_dir="$FORMAL_DIR/$area"
@@ -587,6 +590,10 @@ check_positive() {
         found=1
         local module name
         name="$(basename "$cfg" .cfg)"
+        if ! band_row_exists "$area" "positive/$name.cfg"; then
+            note "$area positive/$name.cfg: FAIL (no bands.tsv row keyed positive/$name.cfg)"
+            rc=1; continue
+        fi
         module="$(negative_module "$area_dir" "$cfg")" || { rc=1; continue; }
         check_one_model "$area" "$module" "positive" "$cfg" "positive/$name.cfg" || rc=1
     done
