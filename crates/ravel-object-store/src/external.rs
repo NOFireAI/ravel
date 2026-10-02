@@ -1580,4 +1580,27 @@ mod tests {
         }
         assert_eq!(seen.lock().len(), 2, "one attempt and one retry");
     }
+
+    /// Through the real `object_store` client, an exhausted 500 and a 400 on a
+    /// key spelled with timeout and throttle words read Transient: the key
+    /// appears in the request URI and in the wrapper text, and neither is a
+    /// class signal.
+    #[tokio::test]
+    async fn class_words_in_the_key_are_not_a_class() {
+        let key = "timeout/deadline/throttled/slowdown/slow down";
+        for status in [
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::http::StatusCode::BAD_REQUEST,
+        ] {
+            let (endpoint, _) = fake_status(status, "", Duration::ZERO).await;
+            let store = gcs_fast_at(endpoint, Duration::from_secs(30));
+            match store.get(key, GetRange::Full).await {
+                Err(StoreError::Transient(message)) => assert!(
+                    message.contains("timeout%2Fdeadline%2Fthrottled%2Fslowdown"),
+                    "{status}: the text must carry the key: {message}"
+                ),
+                other => panic!("{status}: must read Transient, got {other:?}"),
+            }
+        }
+    }
 }
