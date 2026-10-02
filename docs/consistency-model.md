@@ -500,13 +500,33 @@ admission reconcile's reap of dead ingest processes' admission snapshots,
 which are mutable per-process state, not published data.
 
 The guarantee this document is normative for: **no object a referenced
-snapshot still names is ever deleted by retention.** The protection-horizon
-interlock (a validated, deployment-wide config fence) and the
-HEAD-referenced-snapshot delete blocker together keep both a pinned in-flight
-reader's snapshot and the current HEAD snapshot safe from the sweeper, while
-retention still completes and is not permanently blocked. That is the
+snapshot still names is ever deleted by retention or by the superseded-input
+sweep.** Three gates hold it together. The protection-horizon interlock (a
+validated, deployment-wide config fence) bounds a reader against the record
+that made an object deletable. The HEAD-referenced-snapshot delete blocker
+keeps the current HEAD snapshot safe. The unnamed-since marker gate (ADR-1133)
+keeps a pinned in-flight reader's snapshot safe: a candidate HEAD no longer
+names is deleted only once `max_query_duration + head_cache_ttl +
+4 * clock_skew_allowance` has passed since a sweep, reading its clock after
+the HEAD GET, first found it unnamed, which outlasts every query with a
+validated deadline that could have pinned an earlier HEAD naming it, including
+one served a cached HEAD and a Flight SQL ticket redeemed on another process.
+Retention still completes and is not permanently blocked: the marker is never
+rewritten, so folds do not restart its window. That is the
 safety-against-liveness pair: safety is that nothing a live snapshot names is
 removed; liveness is that retention nonetheless finishes and reclaims storage.
+
+The marker gate rests on `clock_skew_allowance` bounding every clock involved
+in either direction: the sweeper that writes a marker, the sweeper that
+deletes, every query process, and every process that mints or redeems a Flight
+SQL ticket. It holds in full only once every maintain process runs a build
+with the gate and `sys/gc` is at format version 2, which stops older sweepers
+from starting (docs/guides/operations/maintenance.md). It does not cover
+readers that carry no validated deadline: the fold, the scrubber, compaction,
+an erasure rewrite, `ravel-cli export` (which resolves once and has no
+deadline), and the bench harness. A resolve that falls back to listing because
+the HEAD GET failed pins no HEAD and stays bounded by `protection_horizon`
+alone.
 
 The sweep rules with their preconditions and anchors, the delete-blocker
 behaviour, the timing, and the selective subject erasure staging are in
@@ -531,7 +551,7 @@ window uses the first. The erasure stage bounds are a guarantee, not a target:
 |---|---|---|
 | Query exclusion | No query whose snapshot resolves after the request ack returns matching records, from store or any cache tier | immediate; all in-flight queries drain within the query deadline, the engine's enforced query timeout, 11 min by default, validated at startup against `max_query_duration`, the GC protection budget it fits under, 1 h by default |
 | Rewrite complete (`.done`) | Every record that existed when the request was acknowledged is gone from every live commit-record segment a snapshot resolves, verified through the catalog resolver. A bucket still open at the ack is covered once it seals: completion waits for that seal and the rewrite that follows it rather than excluding the bucket. Records ingested after the ack are outside the request's scope. Snapshot entries, part headers, and name postings hold no label or attribute value, and derived datasets are a query-time stage with nothing durable, so both are free of matching records; the per-part `.cstat` column-statistics objects are the exception the pass does not cover, because for a tenant with a `STR` or `BYTES` typed attribute column they hold that subject's own column value, so a compliance lock on the catalog family costs an erasure obligation there rather than only a reclamation delay (object store contract, "Required bucket configuration", "A lock on the catalog family") | `erasure_rewrite_deadline`, default 72 h; a pending request older than this raises an alarm metric. The wait for a bucket open at the ack is bounded by `max_ingest_lag` + one bucket span + `max_flush_lifetime` + `clock_skew_allowance` (4 h 5 min with defaults), well inside that deadline |
-| Physical bytes gone from the bucket | Superseded inputs swept. A pre-rewrite part's `.cstat` is on a separate path: it stays referenced, and so unsweepable, while the live HEAD still names that part | `.done` + `protection_horizon` (default `max_query_duration` + `grace` + `clock_skew_allowance` = 1 h + 24 h + 5 min) + one sweep interval (default 5 min); with defaults, about four days end to end (72 h + 25 h 5 min + 5 min). A scoped compliance lock on a superseded input's commit record does not stop the sweep's delete, which lands as a delete marker; the locked version stays in storage until both its retain-until `R` (a time) has passed and noncurrent-version expiry has fired, `E_v` after the delete, so that record's physical-removal bound is `max(bound + E_v, R)`. For a tenant with a `STR` or `BYTES` typed attribute column the `.cstat` path is longer still, and open-ended under a Maintain IAM policy predating the catalog deny narrowing, which refuses the sweep's first catalog delete every pass; its exact bound and the IAM ceiling are in the object store contract's "Required bucket configuration", "A lock on the catalog family" |
+| Physical bytes gone from the bucket | Superseded inputs swept. A pre-rewrite part's `.cstat` is on a separate path: it stays referenced, and so unsweepable, while the live HEAD still names that part | `.done` + `protection_horizon` (default `max_query_duration` + `grace` + `clock_skew_allowance` = 1 h + 24 h + 5 min) + the pinned-query window (`max_query_duration` + `head_cache_ttl` + 4 * `clock_skew_allowance` = 1 h + 30 s + 20 min, ADR-1133) + one sweep interval (default 5 min); with defaults, about four days end to end (72 h + 25 h 5 min + 1 h 20 min 30 s + 5 min). A scoped compliance lock on a superseded input's commit record does not stop the sweep's delete, which lands as a delete marker; the locked version stays in storage until both its retain-until `R` (a time) has passed and noncurrent-version expiry has fired, `E_v` after the delete, so that record's physical-removal bound is `max(bound + E_v, R)`. For a tenant with a `STR` or `BYTES` typed attribute column the `.cstat` path is longer still, and open-ended under a Maintain IAM policy predating the catalog deny narrowing, which refuses the sweep's first catalog delete every pass; its exact bound and the IAM ceiling are in the object store contract's "Required bucket configuration", "A lock on the catalog family" |
 | Physical bytes gone from query-node disk caches | Non-durable local copies aged out | sweep + disk-tier entry max-age (24 h); or immediately, by deleting cache directories (ADR-0046: a node with its cache directory deleted mid-flight answers every query correctly) |
 
 The mechanism behind these bounds (the durable predicate record, the

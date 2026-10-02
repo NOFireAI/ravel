@@ -13,6 +13,8 @@ t/<tenant_hash>/m/c/<shard>/<ingest_hour>/l1.<input_set_hash16>.cmt       compac
 t/<tenant_hash>/m/c/<shard>/<ingest_hour>/rw.<input_set_hash16>.cmt       rewrite record (selective erasure; ADR-0064)
 t/<tenant_hash>/m/c/<shard>/<ingest_hour>/retire.tmb                      retention tombstone
 t/<tenant_hash>/m/maint/<shard>/cursor                                    advisory scan cursor
+t/<tenant_hash>/<signal>/maint/unn/<shard>/<ingest_hour>/retire.unn     retention unnamed-since marker (CreateIfAbsent, immutable; ADR-1133)
+t/<tenant_hash>/<signal>/maint/unn/<shard>/<ingest_hour>/<l1|rw>.<input_set_hash16>.unn   superseded-input unnamed-since marker (CreateIfAbsent, immutable; ADR-1133)
 t/<tenant_hash>/a/state/latest                                            derived alert-state memo (per-tenant, Overwrite, versioned body, advisory; ADR-1294)
 t/<tenant_hash>/<signal>/del/<request_id>.dreq                          erasure request (CreateIfAbsent, immutable; ADR-0064)
 t/<tenant_hash>/<signal>/del/<request_id>.done                          erasure completion (CreateIfAbsent, immutable, PII-free; ADR-0064)
@@ -569,6 +571,20 @@ and the CAS read/write helpers.
   updated by CAS, the same exemption from the immutability rule that the
   ADR-0003 HEAD pointer has. Losing or corrupting it costs a rescan, never
   correctness; it carries no durability role and is not a manifest.
+- The unnamed-since markers (`<signal>/maint/unn/...`, ADR-1133) record when
+  a sweep first found a delete candidate past its protection horizon that the
+  live HEAD does not name. The retention marker `retire.unn` is one per
+  tombstoned bucket; the superseded-input marker is one per chain group,
+  named by the file stem of the compaction or rewrite record the group is
+  entered from. Each is written once with `CreateIfAbsent` and never
+  rewritten, and its body (`UnnamedSinceMarker` in proto/ravel/commit.proto)
+  holds the writer's clock reading and the identity of the tombstone or
+  record it was written for, never tenant data. A marker is deleted after
+  the objects it gated (a retention marker before its tombstone); when its
+  candidate is named by HEAD again; when its anchor no longer matches, in
+  which case a fresh one replaces it; or by the orphan-marker rule once its
+  anchor is gone (docs/deletion-and-gc.md). The prefix sits outside every
+  commit prefix, so no bucket listing returns a marker.
 
 - `tenant_hash`: hex, 32 chars (ADR-0009). The derivation is pinned per
   bucket at bucket birth by the `sys/tenancy` marker (ADR-0050 §3), and one

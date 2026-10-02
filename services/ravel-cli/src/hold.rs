@@ -68,9 +68,11 @@ const SHARD_SCOPE_DIRS: [&str; 3] = ["l0", "c", "l1"];
 /// - `t/<hex>/` and `t/<hex>/<signal>/` cover all three prefixes of every shard
 ///   they span. They are strictly broader than the shard form, never narrower,
 ///   so accepting them cannot produce a partial hold.
-/// - a scope under a sibling directory that is none of the three
-///   (`t/<hex>/<signal>/maint/`, `.../del/`) protects nothing a shard sweep
-///   deletes, so it is not a partial shard hold either.
+/// - a scope under a sibling directory that is none of the three is not a
+///   partial shard hold either. `.../del/` protects nothing a shard sweep
+///   deletes. `t/<hex>/<signal>/maint/` holds the scan cursor and the
+///   unnamed-since markers (ADR-1133), which carry no tenant data; the sweeps
+///   delete a marker without consulting holds, so the scope parks no bucket.
 ///
 /// A scope that stops mid-segment is judged by what it can reach: `.../l` is a
 /// prefix of both `l0/` and `l1/` and of neither `c/`, so it is a partial hold
