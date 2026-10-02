@@ -65,7 +65,8 @@
 //!
 //! A DDL success is 200 with
 //! `{"status":"success","data":{"outcome":"created"|"dropped"|"noop","table":...}}`,
-//! plus `version` for `created` and `dropped` and `files` for `created`. The
+//! plus `version` for `created` and `dropped`, and `files`,
+//! `skipped_directory_markers` and `skipped_other_suffixes` for `created`. The
 //! body is JSON even when `Accept` asks for Arrow IPC, since a DDL outcome has
 //! no rows. A failure maps from `DdlExecuteError::class`: 400 `bad_data`, 409
 //! `conflict`, 404 `not_found`, 422 `execution`, 503 `unavailable`, 504
@@ -79,12 +80,16 @@
 //! the statement's answer is non-fatally incomplete, omitted entirely when
 //! there is nothing to say. It is the same field, with the same omit-when-empty
 //! rule, that the PromQL surface renders (`ravel_query::http::json`), so a
-//! client that already reads one reads the other. The strings come from
+//! client that already reads one reads the other. A query's warnings come from
 //! [`ravel_sql::SqlOutcome::warnings`]: the semantic decision is ravel-sql's,
 //! this module only renders it.
 //!
-//! Today's one warning is the `samples` table's native-histogram exclusion
-//! (issue #1738). An Arrow-negotiated response carries no warnings, for the
+//! Two warnings exist today. A query on the `samples` table can carry the
+//! native-histogram exclusion (issue #1738), from ravel-sql. A DDL success can
+//! carry "the audit outcome record for this statement was not made durable;
+//! its attempted record is", which this module adds itself when the outcome
+//! audit submission fails after the statement ran. An Arrow-negotiated
+//! response carries no warnings, for the
 //! same reason it carries no `stats`: an IPC stream is a bare columnar payload
 //! with no envelope to put them in.
 
