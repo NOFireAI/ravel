@@ -252,15 +252,17 @@ cannot make the two exclude each other and only the producer-side guard can
 
 ## Switches and negative controls
 
-Eleven boolean CONSTANTS gate the model's guards; all are at their shipped value
-in `smoke.cfg` and `exhaustive.cfg`. Each `negative/*.cfg` flips exactly one,
-runs with `FullEnv = TRUE` and all eighteen INVARIANT lines (TypeOK plus
-seventeen named) from `smoke.cfg` (finding 5), and names the single invariant
-it must break, so a
+Fifteen boolean CONSTANTS gate the model's guards; all are at their shipped value
+in `smoke.cfg` and `exhaustive.cfg`, where the four added for ADR-1133
+(`WindowGate` and its three switches) are `FALSE`. Each of the nine controls
+that predate ADR-1133 flips exactly one, runs with `FullEnv = TRUE` and all
+eighteen INVARIANT lines (TypeOK plus seventeen named) from `smoke.cfg`
+(finding 5), and names the single invariant it must break, so a
 guard silently deleted from the spec fails a control rather than passing
-unnoticed under a reduction that happened to dodge the other invariants. There
-are nine controls, one per `negative/*.cfg`; each has a note under
-`counterexamples/`.
+unnoticed under a reduction that happened to dodge the other invariants. The
+four ADR-1133 controls run at other bounds, described under "The ADR-1133 window
+gate" below. There are thirteen controls, one per `negative/*.cfg`; each has a
+note under `counterexamples/`.
 
 The controls run at `MaxClock = 2`, one step above the smoke lane's bound. Each
 still fires its own target at `MaxClock = 1`, so the wider bound is a deliberate
@@ -272,8 +274,8 @@ operator names the model carried at the time, so a note from an earlier round
 may name an action this spec has since split or renamed (`PerformRewrite`,
 split into `StartRewrite` and `PublishRewrite` in round eight;
 `RewriteOutputContent`, now `RecordSetContent`). Renaming them in place would
-falsify the record. The notes for the nine live controls, which describe traces
-the current lane still produces, do use the current names.
+falsify the record. The notes for the thirteen live controls, which describe
+traces the current lane still produces, do use the current names.
 
 The two constants added for issues #1289 and #1221 are
 `CompactionIgnoresRewrite` (a negative-control switch like the other seven,
@@ -288,9 +290,115 @@ records what TLC finds with it `FALSE`.
 
 `HorizonGuardsPinnedQueries` is candidate #1133: with it FALSE a sweep delete
 gates on the horizon and an unnamed HEAD but not on an in-window pinned query.
-`candidate-1133.cfg` runs that configuration and it is unsafe;
-`counterexamples/candidate-1133.md` has the trace. The shipped model keeps the
-switch TRUE.
+It is an idealised oracle, and the Rust gates do not implement it (ADR-1133,
+Context). With it FALSE and
+nothing in its place the model is unsafe; `negative/pinned-query-ungated.cfg`
+(formerly `candidate-1133.cfg`) is that control. `smoke.cfg` and
+`exhaustive.cfg` keep the switch TRUE.
+
+## The ADR-1133 window gate (issue #2339)
+
+ADR-1133 replaces the oracle with something a sweeper can check: an
+unnamed-since marker per delete candidate, and a delete that waits until the
+marker is older than the pinned-query window. `positive/window-gate.cfg` checks
+that the gate alone is enough: `HorizonGuardsPinnedQueries = FALSE`,
+`WindowGate = TRUE`, and `NoDeleteInsideProtectionWindow` holds.
+
+What the model adds, all inert at `WindowGate = FALSE` and `HeadCacheTtl = 0`:
+
+- `marker`, one per candidate: the retention marker per bucket, a superseded
+  marker per superseded object (`MarkerKeys`). Each holds a reading and an
+  anchor identity, the anchor's timestamp (`tombRetiredAt` or `supersededAt`).
+- `WriteMarker` (decision 1): a pass that finds the candidate past its horizon
+  and unnamed by HEAD writes the marker if none exists. `RenewMarker`
+  (decision 2): a marker whose anchor does not match is rewritten with a fresh
+  reading. `ClearRenamedMarker` (decision 5): a marker on a candidate HEAD names
+  again is deleted. The sweeps delete the marker with the candidate
+  (decision 6). `StaleMarker` is the environment: a marker written for another
+  anchor can appear under any key with a live candidate, already as old as the
+  model allows. It stands in for both of the ADR's sources of such markers (an
+  older sweeper, a re-rooted chain group) without modelling either.
+- `cacheUntil` and `CachedNames` (the cache delay): after a HEAD drops an
+  object, a pin can still name it through drop + `HeadCacheTtl`, inclusive, as
+  the head cache serves an entry while its age is at most the TTL.
+- The four `ClockSkew` terms of decision 3, each a nondeterministic choice in
+  `0..ClockSkew` where the ADR names it: the Flight ticket's two terms as one
+  choice of up to `2 * ClockSkew` added to the deadline at `PinQuery`, the
+  marker writer's lag in `FreshMarker`, and the deleting sweeper's lead in
+  `WindowPermits`. The resolving process's own offset cancels (decision 3) and
+  has no choice of its own.
+- `WindowPermits`, the gate: a matching marker whose reading plus
+  `MaxQueryDuration + HeadCacheTtl + 4 * ClockSkew` is at most the deleting
+  sweeper's clock, decision 3's `<=`. `RetentionSweep` and `SupersededSweep`
+  require it.
+- Three switches, each a negative control: `WindowThreeSkew`
+  (`3 * ClockSkew`, one sigma short), `WindowNoCacheDelay` (no `HeadCacheTtl`
+  term while the pin keeps its delay) and `MarkerIgnoresAnchor` (any marker
+  counts, and `RenewMarker` is off). Each violates
+  `NoDeleteInsideProtectionWindow`; the notes under `counterexamples/` give the
+  traces.
+
+Reader deadlines are exclusive and the cache bound is inclusive, as in the
+code: a pinned query reads only while `clock < deadline` and `ExpireQuery`
+fires at `clock >= deadline` (`deadline_exceeded` in
+`crates/ravel-query/src/log_series.rs` treats `now >= deadline` as exceeded,
+and the Flight SQL redemption refuses at `now_ns >= deadline_ns`), while the
+head cache serves through drop + `HeadCacheTtl` (`HeadCache::get` serves while
+`age <= ttl`). Under those boundaries decision 3's `<=` is exact: the first
+tick the gate opens is the first tick no covered reader can read.
+`results.md`, "Round fifteen", has the runs showing that the gate with `<=`
+passes and that dropping one skew term or the `HeadCacheTtl` term fails.
+
+`window-gate.cfg` runs with every window term at 1, `ProtectionHorizon = 2`
+(the smallest the startup inequality allows) and `MaxClock = 8`, so a marker
+written at the horizon ages fully whether the writer's clock ran behind or not.
+To reach that clock bound inside the lane's budget it adds the state
+constraint `WindowGateScope` and sets `FullEnv = FALSE`. A scratch run of the
+same cfg with `FullEnv = TRUE` (absent and unreadable HEAD reads, failed hold
+refreshes) also passes, at 3488170 distinct states in 4 min 22 s, over the
+lane's 300 s budget (results.md, "Round fifteen"). The constraint leaves out:
+
+- the erasure request and everything behind it (the rewrites, completion, the
+  `.dreq` sweep), the open ingest bucket, and legal holds;
+- a compaction lease that expires mid-pass;
+- a tombstone or supersession stamped after clock 0: both anchors and both
+  horizons are fixed, while the HEAD drop, the pin, the marker write and the
+  delete are free at every clock.
+
+Two consequences of that scope and of `PinQuery`'s shape:
+
+- Decision 2's anchor mismatch is exercised only through `StaleMarker`, the
+  environment action that leaves a marker for another anchor under a key.
+  `WindowGateScope` prunes the erasure rewrite that would supersede `cmpA` again
+  and change its anchor, and fixes both anchors at clock 0, so no live anchor
+  moves under a marker already written.
+- `PinQuery` pins only objects still present, so the model never pins an
+  object a sweep already deleted, which a cached HEAD could still name in the
+  code. That omission hides nothing only because the gate outlasts the
+  cache: a delete lands at least `MaxQueryDuration + HeadCacheTtl +
+  2 * ClockSkew` of true time after the drop (the window less the writer's
+  and the deleter's clock offsets), which is past drop + `HeadCacheTtl`, the
+  last tick the cache names the object, whenever `MaxQueryDuration` or
+  `ClockSkew` is nonzero.
+
+What the window gate as modelled does not cover at all:
+
+- Readers outside the consistency model. The only reader here is the pinned
+  query, with a deadline. The fold, scrub, compaction, the erasure rewrite,
+  `ravel-cli export` and the bench harness carry no validated deadline, and
+  ADR-1133 does not bound them either.
+- The listing-fallback resolve. A resolve whose HEAD GET fails pins no HEAD and
+  stays bounded by the protection horizon; `PinQuery` always pins a HEAD.
+- Clocks outside their bound. Every offset is drawn from `0..ClockSkew`; a real
+  clock outside `clock_skew_allowance` can open the gate early, and the model
+  says nothing about that case.
+- Marker store errors and undecodable bodies (decision 6 blocks the delete on
+  any), the observing pass's read-only use of markers, the orphan-marker reaper
+  (a superseded object's marker goes in the same step as the object), the
+  per-chain-group marker key (each group here holds one object), the store
+  version in the anchor identity, and the `sys/gc` version ratchet.
+- Liveness: ADR-1133's "cannot stall" argument is not checked; `FairSpec` gives
+  the marker actions no fairness.
 
 ## Non-vacuity
 
@@ -318,6 +426,17 @@ a proper subset, which breaks it (TLC exit 12) until `TargetOf` is widened to
 match; `counterexamples/rewrite-target-matches-resolved-inputs-probe.md` has
 the before/after runs. With that probe, all seventeen named safety invariants
 have a recorded TLC violation.
+
+`positive/window-gate.cfg` is a pass, so it needs the opposite evidence: that
+the deletes it judges safe actually happen. Scratch cover invariants (a delete
+never happens, a pinned object is never deleted, a pin through the cache is
+never enabled, `RenewMarker` is never enabled) each fail under its bounds;
+results.md, "Round fourteen", has the runs, and "Round fifteen" re-runs them
+on the current model. Its three switch controls show that
+the full `4 * ClockSkew` term (`WindowThreeSkew` is one sigma short, and its
+trace spends all four sigma), the `HeadCacheTtl` term and the anchor check are
+each load-bearing: each removal alone violates
+`NoDeleteInsideProtectionWindow`.
 
 ## State-space control
 
@@ -418,6 +537,7 @@ Use the repository harness from the repo root:
 
 ```sh
 scripts/check-tla.sh smoke -a lifecycle          # all invariants hold, seconds
+scripts/check-tla.sh positive -a lifecycle       # positive/window-gate.cfg holds
 scripts/check-tla.sh negative -a lifecycle       # each control breaks its target
 scripts/check-tla.sh traceability -a lifecycle   # every source ref resolves
 ```

@@ -891,6 +891,206 @@ if [ "$zcode" -eq 0 ]; then ok; else bad "z: expected exit 0 on a valid numeric 
 FORMAL_DIR="$orig_formal_dir5"
 rm -rf "$zdir"
 
+# --- (aa)-(ae) issue #2339: the positive lane ------------------------------
+# check_positive runs every <area>/positive/*.cfg, each of which must pass
+# inside a bands.tsv row keyed positive/<name>.cfg. A java shim stands in for
+# TLC: it answers -version, records that it ran, and prints a passing
+# TLC-shaped log, or a safety violation with exit 12 when the cfg it was
+# handed contains the line VIOLATE.
+build_fake_pos_area() {
+    # build_fake_pos_area <bands-row-or-""> <cfg-mode: pass|violate|none>
+    # -> sets FAKE_TMP. A "" row writes no bands.tsv; mode none leaves
+    # positive/ empty.
+    local row="$1" mode="$2"
+    local tmp area_dir shim
+    tmp="$(mktemp -d)"
+    area_dir="$tmp/formal/tla/fakepos"
+    mkdir -p "$area_dir/positive"
+    cat > "$area_dir/MCFake.tla" <<'EOF'
+---- MODULE MCFake ----
+====
+EOF
+    cat > "$area_dir/smoke.cfg" <<'EOF'
+SPECIFICATION Spec
+EOF
+    case "$mode" in
+        pass)    printf '\\* module: MCFake\nSPECIFICATION Spec\n' > "$area_dir/positive/win.cfg" ;;
+        violate) printf '\\* module: MCFake\n\\* VIOLATE\nSPECIFICATION Spec\n' > "$area_dir/positive/win.cfg" ;;
+        none)    : ;;
+    esac
+    if [ -n "$row" ]; then
+        printf 'cfg\tmin_distinct\tmax_distinct\tmin_depth\tmax_depth\n%s\n' "$row" \
+            > "$area_dir/bands.tsv"
+    fi
+    shim="$tmp/java"
+    cat > "$shim" <<EOF
+#!/usr/bin/env bash
+case "\$1" in
+    -version) echo 'openjdk version "21.0.4" 2024-07-16' >&2; exit 0 ;;
+esac
+cfg=""
+while [ \$# -gt 0 ]; do
+    if [ "\$1" = -config ]; then cfg="\$2"; fi
+    shift
+done
+case "\$cfg" in
+    */positive/*) touch "$tmp/java-ran-positive" ;;
+esac
+if grep -qF VIOLATE "\$cfg"; then
+    cat <<'LOG'
+Error: Invariant Safe is violated.
+40 states generated, 20 distinct states found, 3 states left on queue.
+LOG
+    exit 12
+fi
+cat <<'LOG'
+100 states generated, 50 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 5.
+Model checking completed. No error has been found.
+LOG
+exit 0
+EOF
+    chmod +x "$shim"
+    FAKE_TMP="$tmp"
+}
+
+# use_fake_pos_area: point the sourced harness at FAKE_TMP.
+use_fake_pos_area() {
+    FORMAL_DIR="$FAKE_TMP/formal/tla"
+    CACHE_DIR="$FAKE_TMP/cache"
+    LOG_DIR="$CACHE_DIR/logs"
+    LAST_RUN="$CACHE_DIR/last-run.tsv"
+    JAVA="$FAKE_TMP/java"
+    JAR="/dev/null"
+    resolve_timeout
+    resolve_tla_resources
+}
+
+orig_formal_dir6="$FORMAL_DIR"
+orig_cache_dir6="$CACHE_DIR"
+orig_log_dir6="$LOG_DIR"
+orig_last_run6="$LAST_RUN"
+orig_java6="${JAVA:-}"
+orig_jar6="${JAR:-}"
+
+echo "--- (aa) positive: an empty positive/ directory fails the lane"
+build_fake_pos_area "" none
+use_fake_pos_area
+aaout="$(check_positive fakepos 2>&1)"; aacode=$?
+echo "    measured: exit=$aacode"
+if [ "$aacode" -ne 0 ]; then ok; else bad "aa: expected nonzero exit on an empty positive/, got 0; output: $aaout"; fi
+if printf '%s' "$aaout" | grep -qF "fakepos: positive/ holds no .cfg"; then
+    ok
+else
+    bad "aa: expected the empty positive/ message; output: $aaout"
+fi
+rm -rf "$FAKE_TMP"
+
+echo "--- (ab) positive: a cfg with no bands.tsv row fails, TLC never invoked"
+build_fake_pos_area "" pass
+use_fake_pos_area
+about="$(check_positive fakepos 2>&1)"; abcode=$?
+echo "    measured: exit=$abcode"
+if [ "$abcode" -ne 0 ]; then ok; else bad "ab: expected nonzero exit on an unbanded positive cfg, got 0; output: $about"; fi
+if printf '%s' "$about" | grep -qF "fakepos positive/win.cfg: FAIL (no bands.tsv row keyed positive/win.cfg)"; then
+    ok
+else
+    bad "ab: expected the missing-row message; output: $about"
+fi
+if [ -e "$FAKE_TMP/java-ran-positive" ]; then
+    bad "ab: java shim ran for an unbanded positive cfg"
+else
+    ok
+fi
+rm -rf "$FAKE_TMP"
+
+echo "--- (ac) positive: a violating cfg fails the lane"
+build_fake_pos_area "$(printf 'positive/win.cfg\t20\t20\t-\t-')" violate
+use_fake_pos_area
+acout="$(check_positive fakepos 2>&1)"; accode=$?
+echo "    measured: exit=$accode"
+if [ "$accode" -ne 0 ]; then ok; else bad "ac: expected nonzero exit on a violating positive cfg, got 0; output: $acout"; fi
+if [ -e "$FAKE_TMP/java-ran-positive" ]; then ok; else bad "ac: expected the java shim to run the banded cfg; output: $acout"; fi
+if printf '%s' "$acout" | grep -qF "fakepos/MCFake positive/win.cfg: TLC exit 12"; then
+    ok
+else
+    bad "ac: expected a TLC exit 12 line; output: $acout"
+fi
+rm -rf "$FAKE_TMP"
+
+echo "--- (ad) positive: the band key carries its slash (positive/<name>.cfg)"
+build_fake_pos_area "$(printf 'positive/win.cfg\t50\t50\t-\t-')" pass
+use_fake_pos_area
+adout="$(check_positive fakepos 2>&1)"; adcode=$?
+echo "    measured: exit=$adcode"
+if [ "$adcode" -eq 0 ]; then ok; else bad "ad: expected exit 0 for a banded passing cfg, got $adcode; output: $adout"; fi
+if printf '%s' "$adout" | grep -qF "fakepos/MCFake positive/win.cfg: PASS"; then
+    ok
+else
+    bad "ad: expected a PASS line; output: $adout"
+fi
+rm -rf "$FAKE_TMP"
+# The same row keyed by the bare basename is not this cfg's row.
+build_fake_pos_area "$(printf 'win.cfg\t50\t50\t-\t-')" pass
+use_fake_pos_area
+adout2="$(check_positive fakepos 2>&1)"; adcode2=$?
+if [ "$adcode2" -ne 0 ]; then ok; else bad "ad: expected nonzero exit when the row is keyed win.cfg, got 0; output: $adout2"; fi
+if [ -e "$FAKE_TMP/java-ran-positive" ]; then bad "ad: java shim ran under a basename-keyed row"; else ok; fi
+rm -rf "$FAKE_TMP"
+# And a row whose band the run misses fails: the row is enforced, not only
+# required.
+build_fake_pos_area "$(printf 'positive/win.cfg\t60\t60\t-\t-')" pass
+use_fake_pos_area
+adout3="$(check_positive fakepos 2>&1)"; adcode3=$?
+if [ "$adcode3" -ne 0 ]; then ok; else bad "ad: expected nonzero exit on distinct=50 outside [60,60], got 0; output: $adout3"; fi
+rm -rf "$FAKE_TMP"
+
+echo "--- (ae) ci: the positive lane's failure reaches ci's exit code"
+# main runs the whole ci sequence; ensure_jar is stubbed (there is no real
+# jar), and the shim stands in for java through RAVEL_TLA_JAVA. The fake area
+# has no live.cfg, no negative/ and no traceability.md, so smoke and the
+# positive lane are the only lanes that run.
+build_fake_pos_area "$(printf 'positive/win.cfg\t20\t20\t-\t-')" violate
+aeout="$(FAKE_TMP="$FAKE_TMP" RAVEL_TLA_JAVA="$FAKE_TMP/java" bash -c '
+    source "$1"
+    FORMAL_DIR="$FAKE_TMP/formal/tla"
+    CACHE_DIR="$FAKE_TMP/cache"
+    LOG_DIR="$CACHE_DIR/logs"
+    LAST_RUN="$CACHE_DIR/last-run.tsv"
+    ensure_jar() { JAR=/dev/null; }
+    main ci -a fakepos
+' _ "$LIB_SRC" 2>&1)"; aecode=$?
+echo "    measured: exit=$aecode"
+if [ "$aecode" -eq 1 ]; then ok; else bad "ae: expected ci to exit 1 on a violating positive cfg, got $aecode; output: $aeout"; fi
+if printf '%s' "$aeout" | grep -qF "fakepos/MCFake smoke: PASS"; then
+    ok
+else
+    bad "ae: expected smoke to pass so the failure is the positive lane's; output: $aeout"
+fi
+rm -rf "$FAKE_TMP"
+# The same ci run with a passing banded positive cfg exits 0, so the exit 1
+# above came from the positive lane.
+build_fake_pos_area "$(printf 'positive/win.cfg\t50\t50\t-\t-')" pass
+aeout2="$(FAKE_TMP="$FAKE_TMP" RAVEL_TLA_JAVA="$FAKE_TMP/java" bash -c '
+    source "$1"
+    FORMAL_DIR="$FAKE_TMP/formal/tla"
+    CACHE_DIR="$FAKE_TMP/cache"
+    LOG_DIR="$CACHE_DIR/logs"
+    LAST_RUN="$CACHE_DIR/last-run.tsv"
+    ensure_jar() { JAR=/dev/null; }
+    main ci -a fakepos
+' _ "$LIB_SRC" 2>&1)"; aecode2=$?
+if [ "$aecode2" -eq 0 ]; then ok; else bad "ae: expected ci to exit 0 on a passing banded positive cfg, got $aecode2; output: $aeout2"; fi
+rm -rf "$FAKE_TMP"
+
+FORMAL_DIR="$orig_formal_dir6"
+CACHE_DIR="$orig_cache_dir6"
+LOG_DIR="$orig_log_dir6"
+LAST_RUN="$orig_last_run6"
+JAVA="$orig_java6"
+JAR="$orig_jar6"
+
+
 rm -f "$LIB_SRC"
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
