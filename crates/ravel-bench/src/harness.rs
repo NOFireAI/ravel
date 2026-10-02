@@ -393,10 +393,10 @@ mod tests {
     }
 
     /// Issue #2391: `DelayedGetStore` must forward the pinned-read methods to
-    /// its inner store rather than falling back to the trait's refusing
-    /// default. Without the `get_pinned`/`get_with_pin`/`pin_of` overrides
-    /// added above, every assertion here fails with `StoreError::Unsupported`
-    /// instead of the outcomes asserted below.
+    /// its inner store. Without the overrides, `get_pinned` refuses with
+    /// `StoreError::Unsupported`, and `get_with_pin`/`pin_of` fall back to
+    /// defaults that return an ETag-only pin, dropping the version selector
+    /// `MemoryStore` reports; the `version.is_some()` assertions catch that.
     #[tokio::test]
     async fn delayed_get_store_forwards_pinned_reads() {
         let inner = MemoryStore::new();
@@ -412,12 +412,18 @@ mod tests {
 
         let (meta, pin) = store.pin_of("k").await.expect("pin_of");
         assert_eq!(meta.key, "k");
+        assert!(pin.version.is_some(), "pin_of dropped the version: {pin:?}");
 
         let with_pin = store
             .get_with_pin("k", GetRange::Full)
             .await
             .expect("get_with_pin");
         assert_eq!(with_pin.outcome.data.as_ref(), b"hello");
+        assert!(
+            with_pin.pin.version.is_some(),
+            "get_with_pin dropped the version: {:?}",
+            with_pin.pin
+        );
         assert_eq!(with_pin.pin, pin);
 
         let pinned = store
