@@ -621,8 +621,8 @@ part of the compaction record's identity. Since issue #2351 the memory
 split target of an RLOG merge is derived from the memory budget of the
 process that runs it, so two processes on one host can cut the same input
 set differently: `ravel-server` on a 30 GiB host at its default unit
-concurrency of 4 derives 896 MiB, while `ravel-cli maintain compact-bucket`
-on that host derives 3.75 GiB. A build with different settings produces
+concurrency of 4 derives 256 MiB, while `ravel-cli maintain compact-bucket`
+on that host derives 1 GiB. A build with different settings produces
 parts under different content-addressed keys, finds the winner record's
 missing part absent from its own output, and on the library path fails with
 `ConvergedWinnerPartMissing` again.
@@ -647,6 +647,24 @@ reproduce (`--l1-part-memory-target-bytes`, on `ravel-server`
 `--maintain-l1-part-memory-target-bytes`, `--max-l1-part-bytes` and
 `--compaction-zstd-level` for an RLOG winner), and says that no shipped
 command performs the repair today. Each binary reports the memory target it
-resolved once per run, which is where that value is found.
+resolved once per run, which is where that value is found
+(`rlog_l1_part_memory_target_bytes` and `rlog_max_l1_part_bytes`; the span
+and shared values have their own lines).
+
+How the derived target is bounded. The derivation reads the memory budget
+less this ADR's decision 4 merge cursor budget, which the same process is
+allowed to hold in its cursors, so the part's writer buffer is not sized
+from memory the cursors already claim. The derived target is the smallest of
+one eighth of that budget per concurrent merge, the part size the claim
+lease supports and 8 GiB, lifted to 256 MiB last; ADR-2135's #2351
+amendment states the formula and the worked figures. The RLOG merge's
+stored-size cap follows the derived target, and a part's payload proxy never
+exceeds its decoded-heap estimate, so the memory target closes every part
+and the exact-encode probe stays opt-in: `PartSink` encodes a clone of the
+whole in-progress part's records for each probe, which is the second copy of
+the writer term in `peak_total_bytes`, and a stored cap below the memory
+target is what makes it run. Without the cap following the target, raising
+the target above the 256 MiB stored cap made the cap the binding target and
+the probe ran from the first 256 MiB of payload.
 
 ---

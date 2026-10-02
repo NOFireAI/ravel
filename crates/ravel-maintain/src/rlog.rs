@@ -166,14 +166,16 @@
 //! decides object geometry: decoded heap runs far ahead of stored bytes, so a
 //! fixed 256 MiB target closed parts at about 32k rows and 2.1 MB stored on a
 //! 104-column schema. The binaries therefore derive this merge's target from
-//! the memory budget when the operator leaves it unset, as `budget / 8 /
-//! concurrent_merges` clamped to 256 MiB..=8 GiB
-//! (`config::derive_l1_part_memory_target_bytes`), so part size follows host
-//! memory. The derived value reaches this merge only
+//! the memory budget when the operator leaves it unset: the smallest of
+//! `budget / 8 / concurrent_merges`, the claim lease's part cap and 8 GiB,
+//! lifted to 256 MiB (`config::derive_l1_part_memory_target`), where `budget`
+//! is the process budget less the merge cursor budget, so part size follows
+//! host memory. The derived value reaches this merge only
 //! ([`CompactorConfig::rlog_memory_target_bytes`]); the RSPAN merge, which has
 //! no stored-size target, stays at 256 MiB unless the operator sets the knob.
 //!
-//! The **stored-size target** `max_l1_part_bytes` is the operator's cap on
+//! The **stored-size target** (`max_l1_part_bytes`, read by this merge as
+//! [`CompactorConfig::rlog_stored_target_bytes`]) is the operator's cap on
 //! object size, measured in the bytes its name promises: the part's ACTUAL
 //! encoded object size. The RLOG writer holds row-major records and only
 //! encodes at [`RlogWriter::finish_compacted`], so there is no incremental
@@ -185,8 +187,12 @@
 //! object at the target divided by the compression ratio (the proxy is an
 //! upper bound over the zstd-compressed sections). A part closes on whichever
 //! target is reached first: on a wide schema that is usually the memory split
-//! target, and once a derived memory target lets a part's proxy reach the
-//! stored-size target, the probe runs and the stored-size target binds.
+//! target. The binaries set the RLOG stored-size cap
+//! ([`CompactorConfig::rlog_max_l1_part_bytes`]) equal to the derived memory
+//! target, and a part's payload proxy never exceeds its record-heap estimate
+//! (see that field), so at the derived defaults the memory target closes every
+//! part and no probe runs. A probe runs, and the stored-size target binds, only
+//! when the operator sets the cap below the memory target.
 //!
 //! The first RLOG merge held every input object whole (RLOG then had no ranged
 //! section reader); [`ravel_logseg::open_from_suffix`] is now the RLOG analogue
@@ -1165,10 +1171,13 @@ impl RecordCounts {
 ///   produced objects a ratio-times smaller than the target
 ///   (`estimate_stored_record` is documented as an upper bound over the
 ///   zstd-compressed sections), which is the bug issue #872 names. The probe is
-///   gated on the proxy first reaching the target, so at the shipped defaults
-///   (both 256 MiB) it never fires: the memory target closes every part on a
-///   real schema long before the payload proxy reaches 256 MiB, so this crate's
-///   geometry is unchanged until an operator lowers the stored target.
+///   gated on the proxy first reaching the target, and a part's proxy never
+///   exceeds its heap estimate ([`CompactorConfig::rlog_max_l1_part_bytes`]
+///   states why), so whenever the stored-size target is at or above the memory
+///   target the memory target closes every part first and the probe never
+///   fires. The binaries set the stored-size target equal to the derived
+///   memory target, so it fires only when an operator sets the cap below the
+///   memory target (or the memory target above the cap).
 ///
 /// Consecutive parts may therefore carry the same `stream_id` at their shared
 /// boundary. Records enter the sink in the merge's order, `stream_id` then
@@ -1241,8 +1250,9 @@ impl PartSink<'_> {
             // and is checked cheaply after every record, so it takes priority
             // when both would fire.
             over_memory = part.estimate >= self.config.rlog_memory_target_bytes();
+            let stored_target = self.config.rlog_stored_target_bytes();
             if !over_memory
-                && part.stored_estimate >= self.config.max_l1_part_bytes
+                && part.stored_estimate >= stored_target
                 && part.stored_estimate >= part.next_probe_stored
             {
                 // The stored target governs object geometry, so it closes on the
@@ -1268,15 +1278,15 @@ impl PartSink<'_> {
                     t.set_probe_bytes(0);
                     // Counted whether or not it closes the part: this is the
                     // O(part) encode the stored target costs, and "no probe runs
-                    // at the shipped defaults" is a claim a test asserts on.
+                    // at the derived defaults" is a claim a test asserts on.
                     t.note_probe_run();
                 }
                 let (object, stats) = probe?;
                 let encoded = object.len() as u64;
-                if encoded >= self.config.max_l1_part_bytes {
+                if encoded >= stored_target {
                     stored_close = Some((object, stats));
                 } else {
-                    part.schedule_next_probe(encoded, self.config.max_l1_part_bytes);
+                    part.schedule_next_probe(encoded, stored_target);
                 }
             }
         }
@@ -2020,8 +2030,11 @@ impl PartBuilder {
     /// `PROBE_MIN_STEP_BYTES / r`). So probes per part are about
     /// `r * ln(d0 / PROBE_MIN_STEP_BYTES) + r`, and both stored-target geometry
     /// tests pin the exact count their fixture produces against that formula.
-    /// The cost is only paid when an operator lowers `max_l1_part_bytes` below
-    /// the memory split target; at the shipped defaults no probe runs at all.
+    /// The cost is only paid when the RLOG stored-size cap is below the memory
+    /// split target, which an operator opts into by lowering `max_l1_part_bytes`
+    /// or raising the memory target past it. The binaries' derived defaults set
+    /// the cap equal to the derived target, where no probe runs (pinned by
+    /// `derived_defaults_run_zero_probes_and_close_on_the_memory_target`).
     fn schedule_next_probe(&mut self, encoded_now: u64, target: u64) {
         let deficit = target.saturating_sub(encoded_now);
         let step = deficit.max(PROBE_MIN_STEP_BYTES);
@@ -3410,6 +3423,19 @@ pub(crate) fn estimate_stored_record(r: &LogRecord) -> u64 {
 /// deliberately flat figure at the top of the varints' range, in the same spirit
 /// as [`STORED_RECORD_FIXED_BYTES`].
 const STORED_STREAM_DIR_ENTRY_BYTES: u64 = 32;
+
+// A part's payload proxy never exceeds its record-heap estimate, which is what
+// keeps the memory split target firing before a stored-size cap set equal to it
+// (`CompactorConfig::rlog_max_l1_part_bytes`). Every term matches a larger heap
+// term except the three fixed charges, whose headroom these pin: a record's
+// fixed bytes plus its stream's STREAM_DIR entry fit in the record slot, and a
+// scalar attribute (8 bytes) or container element (8 bytes plus a 1-byte tag)
+// fits in the attribute and element slots.
+const _: () = {
+    assert!(RECORD_SLOT_BYTES >= STORED_RECORD_FIXED_BYTES + STORED_STREAM_DIR_ENTRY_BYTES);
+    assert!(ATTR_SLOT_BYTES >= 9);
+    assert!(std::mem::size_of::<AttrValue>() >= 9);
+};
 
 /// The encoded/on-object bytes one distinct stream adds to a part: its
 /// STREAM_DIR entry, which is the resource/scope blob plus
@@ -6068,14 +6094,17 @@ mod tests {
         );
     }
 
-    /// Issue #872: at the shipped defaults NO exact-encode probe runs. The
-    /// "geometry is unchanged" argument for shipping equal targets rests on that
-    /// claim, and the equal-geometry test above cannot see it: a probe that runs
-    /// and finds the part short changes no object byte, it just spends an O(part)
+    /// Issue #872: with the two targets set equal NO exact-encode probe runs.
+    /// The equal-geometry test above cannot see that: a probe that runs and
+    /// finds the part short changes no object byte, it just spends an O(part)
     /// encode. So this asserts the probe counter directly.
     ///
-    /// The relationship under test is the shipped one -- both targets equal --
-    /// scaled to 64 KiB each so a small corpus reaches it. Why it holds is the
+    /// This is the library default of the two fields (both 256 MiB), set
+    /// explicitly and scaled to 64 KiB each so a small corpus reaches it. It does
+    /// NOT stand in for the binaries' derived defaults, where the memory target
+    /// is derived and the RLOG cap is set to follow it: that is
+    /// `derived_defaults_run_zero_probes_and_close_on_the_memory_target`. Why
+    /// the equal-targets case holds is the
     /// two estimators, not this corpus: `estimate_record` charges strictly more
     /// per record than `estimate_stored_record`, term for term (the same payload
     /// lengths plus `ALLOC_OVERHEAD_BYTES` per allocation, `RECORD_SLOT_BYTES` =
@@ -6100,14 +6129,8 @@ mod tests {
     async fn no_probe_runs_when_both_targets_are_equal() {
         const PER_INPUT: i64 = 400;
         const INPUTS: i64 = 2;
-        /// The shipped defaults are equal (256 MiB each); this is that same
-        /// relationship at a size an 800-record corpus reaches.
+        /// Both targets, equal, at a size an 800-record corpus reaches.
         const BOTH: u64 = 64 * 1024;
-        assert_eq!(
-            crate::config::DEFAULT_MAX_L1_PART_BYTES,
-            crate::config::DEFAULT_L1_PART_MEMORY_TARGET_BYTES,
-            "this test stands in for the shipped defaults, which are equal"
-        );
 
         for (name, mk) in [
             ("wide", wide_record as fn(i64) -> LogRecord),
@@ -6169,6 +6192,226 @@ mod tests {
             parts.len(),
             tracker.memory_target_flushes()
         );
+    }
+
+    /// A record of one stream whose bytes are almost all a long compressible
+    /// body: the shape where the heap estimate is closest to the payload proxy
+    /// (about 1.1 times it), so it is the strictest fixture for "the memory
+    /// target fires before the proxy reaches a cap equal to it".
+    fn body_heavy_record(i: i64) -> LogRecord {
+        let body = format!(
+            "{}{}",
+            incompressible_pad(i as u64, 16),
+            "lorem-ipsum-".repeat(170)
+        );
+        record(0, SPLIT_BASE_NS + i, &body, Vec::new())
+    }
+
+    /// Run the compaction merge over 2 inputs of 400 `mk` records each with
+    /// `config` and the tracker installed, returning the tracker and the number
+    /// of parts written.
+    async fn run_probe_fixture(
+        mk: fn(i64) -> LogRecord,
+        mut config: CompactorConfig,
+    ) -> (MergeMemoryTracker, usize) {
+        const PER_INPUT: i64 = 400;
+        const INPUTS: i64 = 2;
+        let store = Arc::new(MemoryStore::new());
+        for j in 0..INPUTS {
+            let recs: Vec<LogRecord> = (0..PER_INPUT).map(|i| mk(i * INPUTS + j)).collect();
+            seed(
+                store.as_ref(),
+                Uuid::from_u128(j as u128 + 1),
+                j as u64 + 1,
+                &recs,
+            )
+            .await;
+        }
+        let tracker = MergeMemoryTracker::new();
+        config.merge_memory_tracker = Some(tracker.clone());
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(store.as_ref(), &clock, &config, &bucket())
+            .await
+            .expect("compact");
+        let (_rec, parts) = read_output(store.as_ref()).await;
+        (tracker, parts.len())
+    }
+
+    /// A derived memory target scaled down to a corpus-sized 96 KiB, applied the
+    /// way the binaries apply it. The scale stands in for the 1 GiB the issue
+    /// measures (the field and wiring under test are the same at any size; the
+    /// 1 GiB resolution itself is pinned in `config.rs`).
+    fn derived_config(target: u64) -> CompactorConfig {
+        use crate::config::{L1PartMemoryTargetBound, L1PartMemoryTargetSource};
+        let mut config = CompactorConfig::default();
+        crate::config::ResolvedL1PartMemoryTarget {
+            bytes: target,
+            source: L1PartMemoryTargetSource::Derived {
+                memory_budget_bytes: target * 8,
+                concurrent_merges: 1,
+                claim_lease_duration: crate::config::DEFAULT_CLAIM_LEASE_DURATION,
+                bound: L1PartMemoryTargetBound::MemoryShare,
+            },
+        }
+        .apply_to(&mut config);
+        config
+    }
+
+    /// Issue #2351 fix round 3: at the derived defaults the memory target is the
+    /// binding target and the exact-encode probe never runs. The derived target
+    /// reaches the RLOG merge and the RLOG stored-size cap follows it
+    /// (`ResolvedL1PartMemoryTarget::apply_to`), so over wide, ratio and
+    /// body-heavy compressible records, every part closes on the memory target,
+    /// none on the stored target, and `probes_run` is exactly 0 with a zero
+    /// probe-memory peak. The part count is arithmetic from the fixture's
+    /// per-record heap charge, not an observation.
+    ///
+    /// Distinguishing (the wrong-cap rows run on the body-heavy fixture, whose
+    /// heap charge is about 1.1 times its proxy):
+    /// - the shared cap left a quarter of the target, the measured regression (a
+    ///   256 MiB cap under a 1 GiB target, scaled): 56 probes, three a part;
+    /// - a cap at half the target: 19 probes, one a part;
+    /// - the same two caps set through the RLOG field, which the merge must read
+    ///   rather than the shared one;
+    /// - a cap at twice the target is as quiet as the cap at it, so the
+    ///   zero-probe claim is about `cap >= target`, not about equality.
+    ///
+    /// Shown red against: `PartSink::push` reading the shared
+    /// `max_l1_part_bytes` (the RLOG-field rows read 0 probes where 56 and 19
+    /// are pinned); `apply_to` not setting `rlog_max_l1_part_bytes` (the derived
+    /// rows' `rlog_stored_target_bytes()` reads 256 MiB where the 96 KiB target
+    /// is pinned).
+    #[tokio::test]
+    async fn derived_defaults_run_zero_probes_and_close_on_the_memory_target() {
+        const TARGET: u64 = 96 * 1024;
+
+        for (name, mk) in [
+            ("wide", wide_record as fn(i64) -> LogRecord),
+            ("ratio", ratio_record as fn(i64) -> LogRecord),
+            ("body_heavy", body_heavy_record as fn(i64) -> LogRecord),
+        ] {
+            let heap = estimate_record(&mk(0));
+            let config = derived_config(TARGET);
+            assert_eq!(config.rlog_memory_target_bytes(), TARGET);
+            assert_eq!(config.rlog_stored_target_bytes(), TARGET, "{name}");
+            let (tracker, parts) = run_probe_fixture(mk, config).await;
+
+            assert_eq!(
+                parts as u64,
+                expected_part_count(heap, TARGET, 800),
+                "{name}: part count is ceil(records / ceil(target / heap))"
+            );
+            assert_eq!(
+                tracker.memory_target_flushes() as usize,
+                parts - 1,
+                "{name}: every part but the trailing one closes on the memory target"
+            );
+            assert_eq!(tracker.stored_target_flushes(), 0, "{name}");
+            assert_eq!(
+                tracker.probes_run(),
+                0,
+                "{name}: no probe at the derived defaults"
+            );
+            assert_eq!(tracker.peak_probe_bytes(), 0, "{name}");
+        }
+
+        // Wrong settings on the strictest fixture. A part closes on memory
+        // after `per_part` records; its proxy at that point is at least
+        // `per_part * stored` bytes, which is past the wrong cap, so each
+        // memory-closed part ran at least one probe.
+        let heap = estimate_record(&body_heavy_record(0));
+        let stored = estimate_stored_record(&body_heavy_record(0));
+        let per_part = TARGET.div_ceil(heap);
+        for (label, cap, via_rlog_field) in [
+            (
+                "shared cap left at a quarter of the target",
+                TARGET / 4,
+                false,
+            ),
+            ("shared cap at half the target", TARGET / 2, false),
+            ("RLOG cap at a quarter of the target", TARGET / 4, true),
+            ("RLOG cap at half the target", TARGET / 2, true),
+        ] {
+            assert!(
+                (per_part - 1) * stored > cap,
+                "{label}: the fixture's proxy must pass the cap before the memory target fires"
+            );
+            let mut config = derived_config(TARGET);
+            if via_rlog_field {
+                config.rlog_max_l1_part_bytes = Some(cap);
+            } else {
+                config.rlog_max_l1_part_bytes = None;
+                config.max_l1_part_bytes = cap;
+            }
+            let (tracker, parts) = run_probe_fixture(body_heavy_record, config).await;
+            assert_eq!(
+                tracker.memory_target_flushes() as usize,
+                parts - 1,
+                "{label}: the compressible object stays under the cap, so memory still closes"
+            );
+            assert_eq!(tracker.stored_target_flushes(), 0, "{label}");
+            // Measured on this fixture: a half-target cap is crossed once per
+            // part (19 parts, 19 probes, the trailing part included, because
+            // the next probe is scheduled past the memory close); a
+            // quarter-target cap is crossed with a larger deficit left to
+            // spend, so about three probes a part (56).
+            let expected = if cap == TARGET / 2 { 19 } else { 56 };
+            assert_eq!(tracker.probes_run(), expected, "{label}");
+            assert!(
+                tracker.peak_probe_bytes() > TARGET / 2,
+                "{label}: the probe's clone of the part's records is charged"
+            );
+        }
+
+        // A cap above the target is as quiet as the cap at it.
+        let mut config = derived_config(TARGET);
+        config.rlog_max_l1_part_bytes = Some(2 * TARGET);
+        let (tracker, _) = run_probe_fixture(body_heavy_record, config).await;
+        assert_eq!(tracker.probes_run(), 0);
+    }
+
+    fn arb_attr_value() -> impl Strategy<Value = AttrValue> {
+        let leaf = prop_oneof![
+            "[a-z]{0,40}".prop_map(AttrValue::Str),
+            proptest::collection::vec(any::<u8>(), 0..40).prop_map(AttrValue::Bytes),
+            any::<i64>().prop_map(AttrValue::I64),
+            any::<f64>().prop_map(AttrValue::F64),
+            any::<bool>().prop_map(AttrValue::Bool),
+        ];
+        leaf.prop_recursive(3, 24, 4, |inner| {
+            prop_oneof![
+                proptest::collection::vec(inner.clone(), 0..4).prop_map(AttrValue::List),
+                proptest::collection::vec(("[a-z]{0,8}", inner), 0..4).prop_map(AttrValue::Map),
+            ]
+        })
+    }
+
+    proptest! {
+        /// The claim `rlog_max_l1_part_bytes` rests on, checked per record on
+        /// shapes that stress each term: a record's heap charge is at least its
+        /// proxy charge plus its stream's STREAM_DIR charge, so a part's proxy
+        /// (the sum of the first, plus the second once per stream) never exceeds
+        /// the part's heap estimate. Random records cover empty and non-empty
+        /// strings, scalar attributes, byte strings and nested lists and maps.
+        ///
+        /// Distinguishing: an `estimate_stored_record` that charged a scalar
+        /// 64 bytes instead of 8 fails on the first record carrying a scalar
+        /// attribute with a short key; a `STORED_STREAM_DIR_ENTRY_BYTES` raised
+        /// past the record slot's headroom fails on an empty record.
+        #[test]
+        fn a_records_heap_charge_covers_its_proxy_charge_and_stream_entry(
+            sev in "[A-Z]{0,8}",
+            body in "[ -~]{0,200}",
+            blob in proptest::collection::vec(any::<u8>(), 0..64),
+            attrs in proptest::collection::vec(("[a-z_]{0,12}", arb_attr_value()), 0..8),
+        ) {
+            let mut r = record(0, 1, &body, attrs);
+            r.severity_text = sev;
+            r.stream_attrs = blob;
+            let heap = estimate_record(&r);
+            let proxy = estimate_stored_record(&r) + estimate_stored_stream(&r.stream_attrs);
+            prop_assert!(heap >= proxy, "heap {heap} < proxy {proxy}");
+        }
     }
 
     /// Issue #872 constraint: raising the stored target far above the memory

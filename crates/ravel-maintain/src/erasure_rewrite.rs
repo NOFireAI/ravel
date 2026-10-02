@@ -52,8 +52,9 @@
 //! That scope reduction no longer covers logs or spans. [`build_rewrite_logs`]
 //! (issue #725) and [`build_rewrite_spans`] (issue #742) run their signal's own
 //! streaming compaction merge and split survivors into parts at the memory
-//! split target `l1_part_memory_target_bytes` (and, for logs, the stored-size
-//! target `max_l1_part_bytes`, issue #872); only metrics still has the
+//! split target (for logs the RLOG target, `CompactorConfig::rlog_memory_target_bytes`,
+//! and the stored-size target, `CompactorConfig::rlog_stored_target_bytes`,
+//! issue #872; for spans `l1_part_memory_target_bytes`); only metrics still has the
 //! whole-object, single-part shape described above.
 //!
 //! ## Exemplars are filtered by the erasure predicate
@@ -1383,13 +1384,17 @@ fn first_dropping_log_request(
 /// inherits every property issue #711 gave compaction: each input is read one
 /// block at a time by range (never whole), `input_read_concurrency` cursor
 /// opens are in flight at once, and survivors land in a `PartSink` that closes
-/// the in-progress part as soon as its decoded-heap estimate reaches the memory
-/// split target `l1_part_memory_target_bytes` (or its encoded estimate reaches
-/// the stored-size target `max_l1_part_bytes`, issue #872), wherever in the
-/// merged record sequence that falls. On this path the check runs after every
-/// record, so the part exceeds the target by at most one record. Resident
-/// memory is therefore one part plus one decoded block per input, never the
-/// bucket.
+/// the in-progress part as soon as its decoded-heap estimate reaches the RLOG
+/// memory split target ([`CompactorConfig::rlog_memory_target_bytes`]: the
+/// derived target when the caller resolved one, else `l1_part_memory_target_bytes`)
+/// or its object reaches the RLOG stored-size target
+/// ([`CompactorConfig::rlog_stored_target_bytes`], issue #872), wherever in the
+/// merged record sequence that falls. `ravel-server` resolves both from the one
+/// `CompactorConfig` it hands this function, so the derived target reaches this
+/// rewrite through the shared config, not through `l1_part_memory_target_bytes`.
+/// On this path the check runs after every record, so the part exceeds the
+/// target by at most one record. Resident memory is therefore one part plus one
+/// decoded block per input, never the bucket.
 ///
 /// It did NOT always work this way: this function used to GET every input whole
 /// and push every survivor into ONE unbounded [`RlogWriter`], so a bucket

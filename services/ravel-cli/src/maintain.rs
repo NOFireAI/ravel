@@ -236,10 +236,21 @@ pub enum CompactorKnobError {
 ///
 /// Without an override the RLOG merge's memory split target is derived from
 /// `host_memory_total_bytes` (the host's memory capped by a cgroup limit, see
-/// [`ravel_maintain::detect_host_memory_total_bytes`]) over
-/// `concurrent_merges` with [`ResolvedL1PartMemoryTarget::resolve`], and an
-/// unknown host memory falls back to 256 MiB. The RSPAN merge keeps 256 MiB
-/// unless the override is given ([`ResolvedL1PartMemoryTarget::apply_to`]).
+/// [`ravel_maintain::detect_host_memory_total_bytes`]) with
+/// [`ResolvedL1PartMemoryTarget::resolve`]. The budget that is divided is the
+/// host memory less [`ravel_maintain::MEMORY_OVERHEAD_RESERVE_BYTES`] less the
+/// merge cursor budget the same invocation runs with
+/// ([`merge_cursor_budget_total_bytes`]: the default 20 GiB for any
+/// `concurrent_merges`, because [`per_bucket_config`] splits it between them),
+/// floored at zero before the division by `concurrent_merges`; the claim lease
+/// caps the result at what the lease supports
+/// ([`ravel_maintain::derive_l1_part_memory_target`]). A 32 GiB host at one
+/// merge divides `32 - 2 - 20 = 10 GiB` and derives 1.25 GiB. An unknown host
+/// memory falls back to 256 MiB. The RSPAN merge keeps 256 MiB unless the
+/// override is given ([`ResolvedL1PartMemoryTarget::apply_to`]).
+///
+/// An explicit `max_l1_part_bytes` sets the shared stored-size cap and the RLOG
+/// cap together; without it the RLOG cap follows the derived target.
 /// The resolution is returned beside the config so the caller can report where
 /// the value came from.
 #[allow(clippy::too_many_arguments)]
@@ -252,6 +263,7 @@ pub fn build_compactor_config(
     rlog_zstd_level: Option<i32>,
     host_memory_total_bytes: Option<u64>,
     concurrent_merges: usize,
+    claim_lease_duration: Duration,
 ) -> Result<(CompactorConfig, ResolvedL1PartMemoryTarget), CompactorKnobError> {
     let mut config = CompactorConfig {
         dry_run,
@@ -264,10 +276,17 @@ pub fn build_compactor_config(
     if l1_part_memory_target_bytes == Some(0) {
         return Err(CompactorKnobError::ZeroL1PartMemoryTarget);
     }
+    let memory_budget = host_memory_total_bytes.map(|total| {
+        ravel_maintain::merge_memory_budget_bytes(
+            ravel_maintain::host_memory_budget_bytes(total),
+            merge_cursor_budget_total_bytes(&config, concurrent_merges),
+        )
+    });
     let memory_target = ResolvedL1PartMemoryTarget::resolve(
         l1_part_memory_target_bytes,
-        host_memory_total_bytes,
+        memory_budget,
         concurrent_merges,
+        claim_lease_duration,
     );
     memory_target.apply_to(&mut config);
     if let Some(bytes) = max_l1_part_bytes {
@@ -275,6 +294,7 @@ pub fn build_compactor_config(
             return Err(CompactorKnobError::ZeroMaxL1PartBytes);
         }
         config.max_l1_part_bytes = bytes;
+        config.rlog_max_l1_part_bytes = Some(bytes);
     }
     if let Some(n) = input_read_concurrency {
         config.input_read_concurrency = n;
@@ -292,10 +312,43 @@ pub fn l1_part_memory_target_fallback_note(
 ) -> Option<String> {
     (memory_target.source == L1PartMemoryTargetSource::Fallback).then(|| {
         format!(
-            "note: host memory could not be read, so l1_part_memory_target_bytes falls back to {}",
+            "note: host memory could not be read, so rlog_l1_part_memory_target_bytes falls back to {}",
             memory_target.bytes
         )
     })
+}
+
+/// The claim lease the part-split derivation caps against: the invocation's
+/// `--claim-lease-duration` when given, else the compactor's default.
+fn claim_lease_for_derivation(claims: &ClaimOptions) -> Duration {
+    claims
+        .lease_duration
+        .unwrap_or(ravel_maintain::config::DEFAULT_CLAIM_LEASE_DURATION)
+}
+
+/// The part-split report lines, one per codec and prefixed by it, so a reader
+/// cannot take the RLOG-derived value for the span value or the other way
+/// round: `rlog_l1_part_memory_target_bytes` (with its provenance),
+/// `rlog_max_l1_part_bytes` (the RLOG stored-size cap),
+/// `rspan_l1_part_memory_target_bytes`, and `max_l1_part_bytes` (the shared
+/// cap RSEG reads).
+fn write_part_split_lines(
+    out: &mut dyn Write,
+    config: &CompactorConfig,
+    memory_target: &ResolvedL1PartMemoryTarget,
+) -> std::io::Result<()> {
+    writeln!(out, "rlog_l1_part_memory_target_bytes: {memory_target}")?;
+    writeln!(
+        out,
+        "rlog_max_l1_part_bytes: {}",
+        config.rlog_stored_target_bytes()
+    )?;
+    writeln!(
+        out,
+        "rspan_l1_part_memory_target_bytes: {}",
+        config.l1_part_memory_target_bytes
+    )?;
+    writeln!(out, "max_l1_part_bytes: {}", config.max_l1_part_bytes)
 }
 
 /// `maintain compact-bucket`: run one compaction pass over a single bucket.
@@ -455,6 +508,7 @@ pub async fn compact_to(
         rlog_zstd_level,
         host_memory_total_bytes,
         1,
+        claim_lease_for_derivation(claims),
     )?;
     if let Some(note) = l1_part_memory_target_fallback_note(&memory_target) {
         eprintln!("{note}");
@@ -476,13 +530,7 @@ pub async fn compact_to(
         .map_err(|err| anyhow::anyhow!("compaction failed: {err}"))?;
 
     writeln!(out, "dry_run: {dry_run}")?;
-    writeln!(out, "l1_part_memory_target_bytes: {memory_target}")?;
-    writeln!(
-        out,
-        "rspan_l1_part_memory_target_bytes: {}",
-        config.l1_part_memory_target_bytes
-    )?;
-    writeln!(out, "max_l1_part_bytes: {}", config.max_l1_part_bytes)?;
+    write_part_split_lines(out, &config, &memory_target)?;
     writeln!(out, "{claims_line}")?;
     let outcome = match outcome {
         ClaimedCompaction::Ran(outcome) => outcome,
@@ -896,6 +944,12 @@ pub async fn compact_tenant_to(
     let sig = signal.to_signal();
     let now_hour = u32::try_from(now_ns / ravel_maintain::config::NS_PER_HOUR)
         .map_err(|_| anyhow::anyhow!("current ingest hour {now_ns} ns does not fit u32"))?;
+    // A zero fan-out is refused before any store access and before the config
+    // is built, because the derivation divides by it: it is an operator error,
+    // not a walk that compacts nothing.
+    if bucket_concurrency == 0 {
+        return Err(CompactTenantError::ZeroBucketConcurrency.into());
+    }
     // Knob validation runs before any store access: a zero byte target must
     // surface as its CompactorKnobError even on a tenant with no provisioning
     // record, not be masked by NoProvisioningRecord.
@@ -908,13 +962,9 @@ pub async fn compact_tenant_to(
         rlog_zstd_level,
         host_memory_total_bytes,
         bucket_concurrency,
+        claim_lease_for_derivation(claims),
     )?;
     let claims_line = install_claims(&mut config, dry_run, claims);
-    // A zero fan-out is refused before any store access, like the byte-target
-    // knobs above: it is an operator error, not a walk that compacts nothing.
-    if bucket_concurrency == 0 {
-        return Err(CompactTenantError::ZeroBucketConcurrency.into());
-    }
     if let Some(note) = l1_part_memory_target_fallback_note(&memory_target) {
         eprintln!("{note}");
     }
@@ -946,13 +996,7 @@ pub async fn compact_tenant_to(
         "max_flush_lifetime_ns: {}",
         config.max_flush_lifetime_ns
     )?;
-    writeln!(out, "l1_part_memory_target_bytes: {memory_target}")?;
-    writeln!(
-        out,
-        "rspan_l1_part_memory_target_bytes: {}",
-        config.l1_part_memory_target_bytes
-    )?;
-    writeln!(out, "max_l1_part_bytes: {}", config.max_l1_part_bytes)?;
+    write_part_split_lines(out, &config, &memory_target)?;
     writeln!(
         out,
         "input_read_concurrency: {}",
@@ -1093,6 +1137,21 @@ pub fn per_bucket_config(base: &CompactorConfig, concurrency: usize) -> Compacto
             base.merge_cursor_budget_bytes / (concurrency.max(1) as u64);
     }
     config
+}
+
+/// The merge cursor budget all `concurrency` buckets of one invocation may hold
+/// together, the quantity [`build_compactor_config`] deducts from the memory it
+/// derives the part-split target from. [`per_bucket_config`] splits the default
+/// budget between the buckets, so their sum is the default (not `concurrency`
+/// times it); a budget the operator configured away from the default is passed
+/// to each bucket undivided, so their sum is `concurrency` times it.
+pub fn merge_cursor_budget_total_bytes(base: &CompactorConfig, concurrency: usize) -> u64 {
+    if base.merge_cursor_budget_bytes == ravel_maintain::config::DEFAULT_MERGE_CURSOR_BUDGET_BYTES {
+        base.merge_cursor_budget_bytes
+    } else {
+        base.merge_cursor_budget_bytes
+            .saturating_mul(concurrency.max(1) as u64)
+    }
 }
 
 /// Fold one bucket's outcome into `report` and emit its report line to `out`.

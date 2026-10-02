@@ -81,9 +81,12 @@ pub use compact::{
 };
 pub use config::{
     AdmissionMode, AuditMode, AuditPipelineConfig, ClaimParticipant, CompactorConfig, Coordination,
-    L1PartMemoryTargetSource, MergeMemoryTracker, MergePhasePeaks, ResolvedL1PartMemoryTarget,
-    RetentionConfig, RetentionConfigError, RetentionPolicy, RlogZstdLevelError,
-    derive_l1_part_memory_target_bytes, detect_host_memory_total_bytes, validate_rlog_zstd_level,
+    L1PartMemoryTargetBound, L1PartMemoryTargetSource, MEMORY_OVERHEAD_RESERVE_BYTES,
+    MergeMemoryTracker, MergePhasePeaks, ResolvedL1PartMemoryTarget, RetentionConfig,
+    RetentionConfigError, RetentionPolicy, RlogZstdLevelError, claim_lease_max_part_bytes,
+    derive_l1_part_memory_target, derive_l1_part_memory_target_bytes,
+    detect_host_memory_total_bytes, host_memory_budget_bytes, merge_memory_budget_bytes,
+    validate_rlog_zstd_level,
 };
 pub use discover::discover_tenants;
 pub use erasure_rewrite::{

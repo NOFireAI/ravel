@@ -75,8 +75,13 @@ use crate::request_ledger::RequestLedger;
 ///   away ([`Self::set_probe_bytes`]), so a probing run's high-water is roughly
 ///   `2 * writer + one part's object bytes` rather than the `writer` a run
 ///   without probes reports. The probe only runs once the payload proxy reaches
-///   the stored target, so this term stays zero at the shipped defaults, where
-///   the memory target binds first.
+///   the stored target. At the derived defaults the RLOG stored-size cap follows
+///   the derived memory target ([`CompactorConfig::rlog_max_l1_part_bytes`]), and
+///   the proxy never exceeds the record-heap estimate that the memory target is
+///   measured in, so the memory target closes every part first and this term
+///   stays zero; the `derived_defaults_run_zero_probes_and_close_on_the_memory_target`
+///   test in `rlog.rs` pins that. An operator who sets the stored-size cap below
+///   the memory target, or the memory target above the cap, opts into probes.
 ///
 /// # Phase-attributed peaks (issue #977)
 ///
@@ -160,7 +165,7 @@ struct MergeMemoryInner {
     /// [`crate::rlog::PartBuilder::encode_clone`] call, whether or not it closed
     /// the part. A probe is an O(part) encode, so this is the cost side of the
     /// stored-size target, and it is zero whenever the payload proxy never
-    /// reaches `max_l1_part_bytes` (the shipped defaults).
+    /// reaches the RLOG stored-size cap ([`CompactorConfig::rlog_stored_target_bytes`]).
     probes_run: AtomicU64,
     /// Live sum of the encoded/on-object bytes of closed parts still retained in
     /// [`crate::rlog::PartSink::parts`] after PUT. Zero on the bounded RLOG
@@ -224,8 +229,7 @@ pub struct MergePhasePeaks {
     pub publish_record_encoded_bytes: u64,
     /// In-progress part measurement: high-water of the exact-encode probe term
     /// (the cloned record heap plus the encoded probe object, mixed decoded
-    /// plus encoded kinds). Zero for a run that never probed, which is the
-    /// case at the shipped defaults where the two split targets coincide.
+    /// plus encoded kinds). Zero for a run that never probed.
     pub probe_bytes: u64,
 }
 
@@ -501,8 +505,8 @@ impl MergeMemoryTracker {
     }
 
     /// How many exact-encode probes the run made. Zero when the payload proxy
-    /// never reached `max_l1_part_bytes`, which is the case at the shipped
-    /// defaults; a test asserts that rather than assuming it.
+    /// never reached the RLOG stored-size cap; a test asserts that rather than
+    /// assuming it.
     pub fn probes_run(&self) -> u64 {
         self.inner.probes_run.load(Ordering::Relaxed)
     }
@@ -533,9 +537,12 @@ pub const DEFAULT_MAX_COMPACTION_LIFETIME_NS: i64 = NS_PER_HOUR;
 /// schema's decoded-heap-to-stored ratio. Lowering this knob does not grow
 /// objects, it caps them lower: once it drops below the size the memory target
 /// already yields it becomes the binding target and every part closes at it.
-/// The binaries derive the memory split target from the memory budget
-/// ([`derive_l1_part_memory_target_bytes`]), so on a host with memory to spare
-/// objects grow toward this cap; see [`CompactorConfig::max_l1_part_bytes`].
+/// The binaries derive the RLOG memory split target from the memory budget
+/// ([`derive_l1_part_memory_target_bytes`]) and the RLOG merge's stored-size cap
+/// follows that derived target ([`CompactorConfig::rlog_max_l1_part_bytes`]), so
+/// on a host with memory to spare RLOG objects grow past this default; RSEG
+/// keeps reading this value and RSPAN reads neither cap. See
+/// [`CompactorConfig::max_l1_part_bytes`].
 pub const DEFAULT_MAX_L1_PART_BYTES: u64 = 256 * 1024 * 1024;
 /// `l1_part_memory_target_bytes` in [`CompactorConfig::default`]: 256 MiB. This
 /// is the **memory split target**: the decoded record-heap estimate the
@@ -548,12 +555,13 @@ pub const DEFAULT_MAX_L1_PART_BYTES: u64 = 256 * 1024 * 1024;
 /// maintain` derive its target from the memory budget
 /// ([`derive_l1_part_memory_target_bytes`]), and this is the floor of that
 /// derivation and the value used when the budget is unknown. The floor binds
-/// only while `budget / 8 / concurrent_merges` is at most 256 MiB, that is a
-/// budget of at most `2 GiB * concurrent_merges`: for `compact-bucket` (one
-/// merge) a host of 2 GiB or less, for `compact-tenant` 2 GiB times
-/// `--bucket-concurrency`, and for `ravel-server` (budget = memory less its
-/// 2 GiB overhead reserve, at `--maintain-unit-concurrency` 4) a host of
-/// 10 GiB or less. An 8 GiB host derives 1 GiB per merge on `compact-bucket`.
+/// only while the budget the derivation divides ([`merge_memory_budget_bytes`])
+/// satisfies `budget / 8 / concurrent_merges <= 256 MiB`. With the default
+/// 20 GiB merge cursor budget and the 2 GiB overhead reserve already deducted
+/// from that budget, that is a host of at most `22 GiB + 2 GiB *
+/// concurrent_merges` for `ravel-cli maintain` (`compact-bucket` is one merge:
+/// 24 GiB or less) and, for `ravel-server` at `--maintain-unit-concurrency` 4,
+/// a host of 30 GiB or less.
 pub const DEFAULT_L1_PART_MEMORY_TARGET_BYTES: u64 = 256 * 1024 * 1024;
 /// Floor of the derived memory split target
 /// ([`derive_l1_part_memory_target_bytes`]): the fixed default the target had
@@ -566,25 +574,157 @@ pub const MAX_DERIVED_L1_PART_MEMORY_TARGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// concurrent merges add up to: one eighth.
 pub const L1_PART_MEMORY_TARGET_BUDGET_DIVISOR: u64 = 8;
 
-/// The derived memory split target for one merge: `memory_budget_bytes / 8 /
-/// concurrent_merges`, clamped to
-/// [`MIN_DERIVED_L1_PART_MEMORY_TARGET_BYTES`]`..=`[`MAX_DERIVED_L1_PART_MEMORY_TARGET_BYTES`]
-/// (256 MiB to 8 GiB).
+/// The overhead reserve both binaries deduct from host memory before deriving
+/// anything from it: 2 GiB, for the binary, thread stacks, the runtime and
+/// tracing buffers. `ravel-server` derives its memory budget as effective memory
+/// less this (`ravel_server::config::MEMORY_OVERHEAD_RESERVE_BYTES` re-exports
+/// it) and `ravel-cli maintain` deducts it in [`host_memory_budget_bytes`], so
+/// the two derive from one definition of "memory the merges may use".
+///
+/// A provisional round figure, not a measurement: well above the few hundred MiB
+/// an idle process costs before its first query, so a flag combination is not
+/// falsely refused for lack of the real number.
+pub const MEMORY_OVERHEAD_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Host memory less [`MEMORY_OVERHEAD_RESERVE_BYTES`], floored at zero: the
+/// budget `ravel-cli maintain` starts its derivation from before
+/// [`merge_memory_budget_bytes`] deducts the merge cursor budget.
+pub fn host_memory_budget_bytes(host_memory_total_bytes: u64) -> u64 {
+    host_memory_total_bytes.saturating_sub(MEMORY_OVERHEAD_RESERVE_BYTES)
+}
+
+/// The memory the RLOG part-split derivation divides among concurrent merges:
+/// `process_budget_bytes` less `merge_cursor_budget_bytes`, floored at zero
+/// BEFORE [`derive_l1_part_memory_target_bytes`] divides it.
+///
+/// The merge cursor budget (ADR-0979 decision 4, [`CompactorConfig::
+/// merge_cursor_budget_bytes`]) is memory a merge is allowed to hold in its
+/// cursors on top of the in-progress part's writer buffer, and by default it is
+/// 20 GiB ([`DEFAULT_MERGE_CURSOR_BUDGET_BYTES`]). A derivation that took one
+/// eighth of the whole budget would hand the writer buffer memory the cursors
+/// already claim. `process_budget_bytes` is host memory already net of
+/// [`MEMORY_OVERHEAD_RESERVE_BYTES`] (`ravel-server`'s `memory_budget_bytes`, or
+/// [`host_memory_budget_bytes`] for `ravel-cli maintain`).
+///
+/// Worked figures at the default 20 GiB cursor budget: a 32 GiB host under
+/// `compact-bucket` is `32 - 2 - 20 = 10 GiB`, so `10 / 8 = 1.25 GiB`;
+/// `ravel-server` on a 30 GiB host is `30 - 2 - 20 = 8 GiB`, so
+/// `8 / 8 / 4 = 256 MiB` at `--maintain-unit-concurrency` 4. A process that runs
+/// several merges at once passes the cursor memory its merges hold TOGETHER:
+/// `ravel-cli maintain compact-tenant` splits the default budget across
+/// `--bucket-concurrency` buckets (`per_bucket_config`) and passes the sum, the
+/// whole budget. `ravel-server` passes the per-merge budget once, which
+/// undercounts its `--maintain-unit-concurrency` concurrent merges.
+pub fn merge_memory_budget_bytes(process_budget_bytes: u64, merge_cursor_budget_bytes: u64) -> u64 {
+    process_budget_bytes.saturating_sub(merge_cursor_budget_bytes)
+}
+
+/// The largest part the claim lease supports without tripping
+/// [`claim_lease_below_warn_threshold`]: the part whose encode and PUT at
+/// [`CLAIM_LEASE_WARN_CONSERVATIVE_ENCODE_BYTES_PER_SEC`] takes half the lease,
+/// `lease * 10 MiB/s / 2` (1,572,864,000 bytes, 1.46 GiB, at the default 300 s
+/// lease). `claim_lease_below_warn_threshold(lease, claim_lease_max_part_bytes(
+/// lease))` is false for every lease, because the cap is rounded down in
+/// milliseconds and the warning threshold is computed from it with the same
+/// rounding.
+pub fn claim_lease_max_part_bytes(claim_lease_duration: Duration) -> u64 {
+    let bytes = claim_lease_duration.as_millis()
+        * u128::from(CLAIM_LEASE_WARN_CONSERVATIVE_ENCODE_BYTES_PER_SEC)
+        / 2000;
+    u64::try_from(bytes).unwrap_or(u64::MAX)
+}
+
+/// Which term of [`derive_l1_part_memory_target`] decided the target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum L1PartMemoryTargetBound {
+    /// `budget / 8 / concurrent_merges`, inside the other terms.
+    MemoryShare,
+    /// The claim lease: [`claim_lease_max_part_bytes`] was below the memory
+    /// share and the ceiling, so a larger part could outlast its own lease.
+    ClaimLease,
+    /// The 256 MiB floor ([`MIN_DERIVED_L1_PART_MEMORY_TARGET_BYTES`]) lifted a
+    /// smaller share or lease cap. A lease too short for a floor-sized part
+    /// then trips [`claim_lease_below_warn_threshold`]; that is the operator's
+    /// explicit choice and the warning is the signal.
+    Floor,
+    /// The 8 GiB ceiling ([`MAX_DERIVED_L1_PART_MEMORY_TARGET_BYTES`]) capped a
+    /// larger share and lease cap.
+    Ceiling,
+}
+
+impl L1PartMemoryTargetBound {
+    /// `memory_share`, `claim_lease`, `floor` or `ceiling`, for a structured
+    /// log field.
+    pub fn name(&self) -> &'static str {
+        match self {
+            L1PartMemoryTargetBound::MemoryShare => "memory_share",
+            L1PartMemoryTargetBound::ClaimLease => "claim_lease",
+            L1PartMemoryTargetBound::Floor => "floor",
+            L1PartMemoryTargetBound::Ceiling => "ceiling",
+        }
+    }
+}
+
+/// The derived memory split target for one merge and the term that decided it.
+///
+/// The target is the smallest of three terms, then lifted to the floor:
+///
+/// - the memory share, `memory_budget_bytes / 8 / concurrent_merges`;
+/// - the lease cap, [`claim_lease_max_part_bytes`]`(claim_lease_duration)`;
+/// - the ceiling, [`MAX_DERIVED_L1_PART_MEMORY_TARGET_BYTES`] (8 GiB);
+///
+/// and finally `max(that, `[`MIN_DERIVED_L1_PART_MEMORY_TARGET_BYTES`]`)` (256 MiB).
+/// The floor is applied LAST: a lease too short for a 256 MiB part still gets
+/// 256 MiB (the geometry before this derivation existed) and the startup
+/// lease check warns, instead of a target below the floor.
+///
+/// The lease term exists because the RLOG stored-size cap follows this target
+/// ([`CompactorConfig::rlog_max_l1_part_bytes`]), and ADR-1029 decision 3 warns
+/// when the lease is under twice the time to encode and PUT one cap-sized part.
+/// A target above the lease cap would make the shipped defaults trip that
+/// warning (a 4 GiB cap needs a lease of about 820 s against the 300 s default).
 ///
 /// Dividing by `concurrent_merges` keeps the sum of the targets of every merge
 /// a process runs at once at one eighth of the budget while the per-merge value
-/// is inside the clamp. Below the floor the sum is `256 MiB *
-/// concurrent_merges`, which can exceed one eighth. `concurrent_merges` below 1
-/// is treated as 1. Integer division, truncating.
+/// is the share. Below the floor the sum is `256 MiB * concurrent_merges`, which
+/// can exceed one eighth. `concurrent_merges` below 1 is treated as 1. Integer
+/// division, truncating. When two terms tie the earlier in the list above is
+/// named.
+pub fn derive_l1_part_memory_target(
+    memory_budget_bytes: u64,
+    concurrent_merges: usize,
+    claim_lease_duration: Duration,
+) -> (u64, L1PartMemoryTargetBound) {
+    let merges = u64::try_from(concurrent_merges.max(1)).unwrap_or(u64::MAX);
+    let share = memory_budget_bytes / L1_PART_MEMORY_TARGET_BUDGET_DIVISOR / merges;
+    let lease = claim_lease_max_part_bytes(claim_lease_duration);
+    let (smallest, term) = if share <= lease && share <= MAX_DERIVED_L1_PART_MEMORY_TARGET_BYTES {
+        (share, L1PartMemoryTargetBound::MemoryShare)
+    } else if lease <= MAX_DERIVED_L1_PART_MEMORY_TARGET_BYTES {
+        (lease, L1PartMemoryTargetBound::ClaimLease)
+    } else {
+        (
+            MAX_DERIVED_L1_PART_MEMORY_TARGET_BYTES,
+            L1PartMemoryTargetBound::Ceiling,
+        )
+    };
+    if smallest < MIN_DERIVED_L1_PART_MEMORY_TARGET_BYTES {
+        (
+            MIN_DERIVED_L1_PART_MEMORY_TARGET_BYTES,
+            L1PartMemoryTargetBound::Floor,
+        )
+    } else {
+        (smallest, term)
+    }
+}
+
+/// [`derive_l1_part_memory_target`] without the bound.
 pub fn derive_l1_part_memory_target_bytes(
     memory_budget_bytes: u64,
     concurrent_merges: usize,
+    claim_lease_duration: Duration,
 ) -> u64 {
-    let merges = u64::try_from(concurrent_merges.max(1)).unwrap_or(u64::MAX);
-    (memory_budget_bytes / L1_PART_MEMORY_TARGET_BUDGET_DIVISOR / merges).clamp(
-        MIN_DERIVED_L1_PART_MEMORY_TARGET_BYTES,
-        MAX_DERIVED_L1_PART_MEMORY_TARGET_BYTES,
-    )
+    derive_l1_part_memory_target(memory_budget_bytes, concurrent_merges, claim_lease_duration).0
 }
 
 /// Where a resolved [`CompactorConfig::l1_part_memory_target_bytes`] came from.
@@ -592,11 +732,14 @@ pub fn derive_l1_part_memory_target_bytes(
 pub enum L1PartMemoryTargetSource {
     /// The operator set it; used verbatim, never clamped.
     Flag,
-    /// Derived by [`derive_l1_part_memory_target_bytes`] from this budget and
-    /// merge count.
+    /// Derived by [`derive_l1_part_memory_target`] from this budget (net of the
+    /// overhead reserve and the merge cursor budget), merge count and claim
+    /// lease.
     Derived {
         memory_budget_bytes: u64,
         concurrent_merges: usize,
+        claim_lease_duration: Duration,
+        bound: L1PartMemoryTargetBound,
     },
     /// No flag and no known memory budget:
     /// [`DEFAULT_L1_PART_MEMORY_TARGET_BYTES`].
@@ -614,25 +757,34 @@ pub struct ResolvedL1PartMemoryTarget {
 impl ResolvedL1PartMemoryTarget {
     /// An explicit value wins verbatim (its zero refusal belongs to the caller
     /// that parsed it). Otherwise a known budget derives the target with
-    /// [`derive_l1_part_memory_target_bytes`], and an unknown one falls back to
+    /// [`derive_l1_part_memory_target`] (`memory_budget_bytes` is the budget
+    /// already net of the overhead reserve and the merge cursor budget, see
+    /// [`merge_memory_budget_bytes`]), and an unknown one falls back to
     /// [`DEFAULT_L1_PART_MEMORY_TARGET_BYTES`].
     pub fn resolve(
         explicit: Option<u64>,
         memory_budget_bytes: Option<u64>,
         concurrent_merges: usize,
+        claim_lease_duration: Duration,
     ) -> Self {
         match (explicit, memory_budget_bytes) {
             (Some(bytes), _) => ResolvedL1PartMemoryTarget {
                 bytes,
                 source: L1PartMemoryTargetSource::Flag,
             },
-            (None, Some(budget)) => ResolvedL1PartMemoryTarget {
-                bytes: derive_l1_part_memory_target_bytes(budget, concurrent_merges),
-                source: L1PartMemoryTargetSource::Derived {
-                    memory_budget_bytes: budget,
-                    concurrent_merges: concurrent_merges.max(1),
-                },
-            },
+            (None, Some(budget)) => {
+                let (bytes, bound) =
+                    derive_l1_part_memory_target(budget, concurrent_merges, claim_lease_duration);
+                ResolvedL1PartMemoryTarget {
+                    bytes,
+                    source: L1PartMemoryTargetSource::Derived {
+                        memory_budget_bytes: budget,
+                        concurrent_merges: concurrent_merges.max(1),
+                        claim_lease_duration,
+                        bound,
+                    },
+                }
+            }
             (None, None) => ResolvedL1PartMemoryTarget {
                 bytes: DEFAULT_L1_PART_MEMORY_TARGET_BYTES,
                 source: L1PartMemoryTargetSource::Fallback,
@@ -642,19 +794,29 @@ impl ResolvedL1PartMemoryTarget {
 
     /// Write this resolution into `config`. The RLOG merge gets
     /// [`Self::bytes`] whatever the source
-    /// ([`CompactorConfig::rlog_l1_part_memory_target_bytes`]). The RSPAN
-    /// merge gets it only when the operator set it: a derived or fallback
-    /// resolution leaves [`CompactorConfig::l1_part_memory_target_bytes`] at
-    /// [`DEFAULT_L1_PART_MEMORY_TARGET_BYTES`], since RSPAN has no stored-size
-    /// target to cap a part that a large derived target would grow.
+    /// ([`CompactorConfig::rlog_l1_part_memory_target_bytes`]).
+    ///
+    /// A derived or fallback resolution also sets the RLOG stored-size cap to
+    /// the same value ([`CompactorConfig::rlog_max_l1_part_bytes`]), so the memory
+    /// target stays the binding target and the exact-encode probe stays opt-in.
+    /// It leaves the shared [`CompactorConfig::l1_part_memory_target_bytes`] and
+    /// [`CompactorConfig::max_l1_part_bytes`] alone, whatever they hold, because
+    /// RSPAN and RSEG read those and the derivation is RLOG's.
+    ///
+    /// A flag resolution is the operator's: it sets the shared memory target
+    /// (so it reaches RSPAN too) and leaves the RLOG cap following
+    /// [`CompactorConfig::max_l1_part_bytes`]. A memory target above that cap
+    /// then runs probes, which is the operator's explicit configuration.
     pub fn apply_to(&self, config: &mut CompactorConfig) {
         config.rlog_l1_part_memory_target_bytes = Some(self.bytes);
-        config.l1_part_memory_target_bytes = match self.source {
-            L1PartMemoryTargetSource::Flag => self.bytes,
-            L1PartMemoryTargetSource::Derived { .. } | L1PartMemoryTargetSource::Fallback => {
-                DEFAULT_L1_PART_MEMORY_TARGET_BYTES
+        match self.source {
+            L1PartMemoryTargetSource::Flag => {
+                config.l1_part_memory_target_bytes = self.bytes;
             }
-        };
+            L1PartMemoryTargetSource::Derived { .. } | L1PartMemoryTargetSource::Fallback => {
+                config.rlog_max_l1_part_bytes = Some(self.bytes);
+            }
+        }
     }
 
     /// `flag`, `derived` or `fallback`, for a structured log field.
@@ -663,6 +825,15 @@ impl ResolvedL1PartMemoryTarget {
             L1PartMemoryTargetSource::Flag => "flag",
             L1PartMemoryTargetSource::Derived { .. } => "derived",
             L1PartMemoryTargetSource::Fallback => "fallback",
+        }
+    }
+
+    /// The derivation term that decided a derived target, for a structured log
+    /// field; `None` for a flag or a fallback, which no term decided.
+    pub fn bound_name(&self) -> Option<&'static str> {
+        match self.source {
+            L1PartMemoryTargetSource::Derived { bound, .. } => Some(bound.name()),
+            L1PartMemoryTargetSource::Flag | L1PartMemoryTargetSource::Fallback => None,
         }
     }
 }
@@ -674,17 +845,40 @@ impl std::fmt::Display for ResolvedL1PartMemoryTarget {
             L1PartMemoryTargetSource::Derived {
                 memory_budget_bytes,
                 concurrent_merges,
-            } => write!(
-                f,
-                "{} (resolved from a memory budget of {memory_budget_bytes} \
-                 over {concurrent_merges} concurrent {})",
-                self.bytes,
-                if concurrent_merges == 1 {
-                    "merge"
-                } else {
-                    "merges"
+                claim_lease_duration,
+                bound,
+            } => {
+                write!(
+                    f,
+                    "{} (resolved from a memory budget of {memory_budget_bytes} \
+                     over {concurrent_merges} concurrent {}; bound by ",
+                    self.bytes,
+                    if concurrent_merges == 1 {
+                        "merge"
+                    } else {
+                        "merges"
+                    }
+                )?;
+                match bound {
+                    L1PartMemoryTargetBound::MemoryShare => {
+                        write!(f, "the memory share, budget / 8 / merges)")
+                    }
+                    L1PartMemoryTargetBound::ClaimLease => write!(
+                        f,
+                        "the claim lease, {} s allows a part of at most {} bytes)",
+                        claim_lease_duration.as_secs(),
+                        claim_lease_max_part_bytes(claim_lease_duration)
+                    ),
+                    L1PartMemoryTargetBound::Floor => write!(
+                        f,
+                        "the {MIN_DERIVED_L1_PART_MEMORY_TARGET_BYTES}-byte floor)"
+                    ),
+                    L1PartMemoryTargetBound::Ceiling => write!(
+                        f,
+                        "the {MAX_DERIVED_L1_PART_MEMORY_TARGET_BYTES}-byte ceiling)"
+                    ),
                 }
-            ),
+            }
             L1PartMemoryTargetSource::Fallback => {
                 write!(f, "{} (fallback: the memory budget is unknown)", self.bytes)
             }
@@ -692,11 +886,12 @@ impl std::fmt::Display for ResolvedL1PartMemoryTarget {
     }
 }
 
-/// This host's usable memory in bytes, for a process that has no memory budget
-/// of its own to derive from (`ravel-cli maintain`). On Linux it is
+/// This host's usable memory in bytes: the one detector `ravel-cli maintain`
+/// and `ravel-server`'s `HostProfile::detect` both call. On Linux it is
 /// `/proc/meminfo`'s `MemTotal` capped by a finite cgroup memory limit (v2
-/// `memory.max`, else v1 `memory.limit_in_bytes`), the rule `ravel-server`'s
-/// host detection applies; on macOS it is `sysctl -n hw.memsize`. `None` when
+/// `memory.max`, else v1 `memory.limit_in_bytes`), because a container reads the
+/// host's `MemTotal` and a share of it alone would size against memory the
+/// container may not use; on macOS it is `sysctl -n hw.memsize`. `None` when
 /// none of these can be read or parsed, and on every other target.
 pub fn detect_host_memory_total_bytes() -> Option<u64> {
     detect_host_memory_total_bytes_impl()
@@ -715,6 +910,15 @@ fn detect_host_memory_total_bytes_impl() -> Option<u64> {
                 .ok()
                 .and_then(|contents| parse_cgroup_memory_limit(&contents))
         });
+    effective_memory_total(mem_total, cgroup_limit)
+}
+
+/// The memory total the derived defaults size against: `MemTotal` capped by a
+/// finite cgroup limit. Either one alone is used when the other is unknown, so
+/// a container whose `/proc/meminfo` is unreadable still derives from its
+/// limit, and a bare host with no cgroup limit derives from `MemTotal`.
+#[cfg(any(target_os = "linux", test))]
+fn effective_memory_total(mem_total: Option<u64>, cgroup_limit: Option<u64>) -> Option<u64> {
     match (mem_total, cgroup_limit) {
         (Some(total), Some(limit)) => Some(total.min(limit)),
         (total, limit) => total.or(limit),
@@ -1225,9 +1429,12 @@ pub struct CompactorConfig {
     /// binding target is usually [`Self::l1_part_memory_target_bytes`], not
     /// this one, so objects come out at the memory target divided by the
     /// schema's heap-to-stored ratio. Lowering this knob therefore does not
-    /// grow objects, it caps them lower; on the RLOG and RSEG metrics paths it
-    /// is the operator's cap on stored object size whatever the memory target
-    /// resolves to. The RSPAN merge does not read it.
+    /// grow objects, it caps them lower; on the RSEG metrics path it is the
+    /// operator's cap on stored object size whatever the memory target resolves
+    /// to. The RLOG merge reads it through [`Self::rlog_stored_target_bytes`],
+    /// which prefers [`Self::rlog_max_l1_part_bytes`] when set (the binaries
+    /// set it to follow the derived memory target). The RSPAN merge does not
+    /// read it.
     pub max_l1_part_bytes: u64,
     /// The **memory split target**: close the in-progress L1 part once its
     /// decoded record-heap estimate reaches this
@@ -1273,7 +1480,8 @@ pub struct CompactorConfig {
     /// ([`ResolvedL1PartMemoryTarget::apply_to`]), and RSPAN stays at
     /// 256 MiB, because RSPAN has no stored-size target to cap object size and
     /// the claim-lease startup check (ADR-1029 decision 3) sizes the largest
-    /// part as [`Self::max_l1_part_bytes`].
+    /// part as the larger of [`Self::max_l1_part_bytes`] and
+    /// [`Self::rlog_max_l1_part_bytes`].
     pub l1_part_memory_target_bytes: u64,
     /// The memory split target the RLOG merge (`rlog::merge_catalogs`, which
     /// compaction and the RLOG erasure rewrite share) reads in place of
@@ -1282,13 +1490,47 @@ pub struct CompactorConfig {
     ///
     /// `ravel-server` and `ravel-cli maintain` set it from
     /// [`ResolvedL1PartMemoryTarget::apply_to`]: unless the operator sets the
-    /// knob, they derive it as `memory_budget / 8 / concurrent_merges` clamped
-    /// to 256 MiB..=8 GiB ([`derive_l1_part_memory_target_bytes`]), so RLOG
-    /// part size follows host memory instead of a fixed number that splits
-    /// wide-schema parts long before [`Self::max_l1_part_bytes`] (issue
-    /// #2351). RLOG keeps [`Self::max_l1_part_bytes`] as its cap on stored
-    /// object size whatever this resolves to. Default `None`.
+    /// knob, they derive it as the smallest of `memory_budget / 8 /
+    /// concurrent_merges`, the claim lease's part cap and 8 GiB, lifted to
+    /// 256 MiB ([`derive_l1_part_memory_target`]), where `memory_budget` is the
+    /// process budget less the merge cursor budget ([`merge_memory_budget_bytes`]).
+    /// RLOG part size then follows host memory instead of a fixed number that
+    /// splits wide-schema parts long before [`Self::max_l1_part_bytes`] (issue
+    /// #2351). A derived or fallback value also sets
+    /// [`Self::rlog_max_l1_part_bytes`] to itself. Default `None`.
     pub rlog_l1_part_memory_target_bytes: Option<u64>,
+    /// The RLOG merge's stored-size cap, read in place of
+    /// [`Self::max_l1_part_bytes`] when set ([`Self::rlog_stored_target_bytes`]).
+    /// RSEG reads [`Self::max_l1_part_bytes`] and RSPAN reads neither cap, so
+    /// this field changes nothing outside `rlog::merge_catalogs` (compaction and
+    /// the RLOG erasure rewrite).
+    ///
+    /// [`ResolvedL1PartMemoryTarget::apply_to`] sets it to the derived (or
+    /// fallback) memory target, which keeps the memory target the binding
+    /// target. The cap only costs anything when the payload proxy reaches it,
+    /// because that schedules an exact-encode probe that clones the part's
+    /// record heap. The proxy ([`crate::rlog::estimate_stored_record`] plus
+    /// `estimate_stored_stream` once per stream in the part)
+    /// counts uncompressed payload bytes; the memory target counts the heap
+    /// ([`crate::rlog::estimate_record`]). Every term of the proxy is at most
+    /// the corresponding heap term: a string, byte string or key of `n` bytes is
+    /// charged `n` by the proxy and `n + 16` by the heap estimate (zero bytes
+    /// charge zero in both); a scalar attribute is charged 8 or 1 by the proxy
+    /// and its attribute or element slot by the heap estimate, which is larger
+    /// (`const` assertions in `rlog.rs` pin both); a record's fixed 16 bytes and
+    /// the 32-byte STREAM_DIR entry of its stream's first record in the part are
+    /// charged against `size_of::<LogRecord>()`; and a list or map element's
+    /// 1-byte tag is charged against its element slot. So a part's proxy never
+    /// exceeds its heap estimate, and with this cap at or above the memory
+    /// target the memory target fires first on every record and no probe runs
+    /// (the `derived_defaults_run_zero_probes_and_close_on_the_memory_target`
+    /// test in `rlog.rs` runs a merge at that setting and asserts zero probes).
+    ///
+    /// An explicit stored-size cap (`--max-l1-part-bytes`) sets this field and
+    /// [`Self::max_l1_part_bytes`] together. An explicit memory target
+    /// (`--l1-part-memory-target-bytes`) does not touch it, so one set above the
+    /// shared cap runs probes: that is the opt-in path. Default `None`.
+    pub rlog_max_l1_part_bytes: Option<u64>,
     /// Buckets with fewer L0 records than this are left uncompacted; set 1 for
     /// v1-retirement campaigns.
     pub min_compaction_inputs: usize,
@@ -1564,6 +1806,7 @@ impl Default for CompactorConfig {
             max_l1_part_bytes: DEFAULT_MAX_L1_PART_BYTES,
             l1_part_memory_target_bytes: DEFAULT_L1_PART_MEMORY_TARGET_BYTES,
             rlog_l1_part_memory_target_bytes: None,
+            rlog_max_l1_part_bytes: None,
             min_compaction_inputs: DEFAULT_MIN_COMPACTION_INPUTS,
             footer_probe_bytes: DEFAULT_FOOTER_PROBE_BYTES,
             input_read_concurrency: DEFAULT_INPUT_READ_CONCURRENCY,
@@ -1602,6 +1845,34 @@ impl CompactorConfig {
     pub fn rlog_memory_target_bytes(&self) -> u64 {
         self.rlog_l1_part_memory_target_bytes
             .unwrap_or(self.l1_part_memory_target_bytes)
+    }
+
+    /// The stored-size cap the RLOG merge closes a part at:
+    /// [`Self::rlog_max_l1_part_bytes`] when set, else
+    /// [`Self::max_l1_part_bytes`].
+    pub fn rlog_stored_target_bytes(&self) -> u64 {
+        self.rlog_max_l1_part_bytes
+            .unwrap_or(self.max_l1_part_bytes)
+    }
+
+    /// The largest stored-size cap any codec reads, which is the part size the
+    /// claim-lease startup check ([`claim_lease_below_warn_threshold`], ADR-1029
+    /// decision 3) must size a lease against: the larger of
+    /// [`Self::max_l1_part_bytes`] (RSEG) and [`Self::rlog_stored_target_bytes`]
+    /// (RLOG).
+    pub fn largest_stored_target_bytes(&self) -> u64 {
+        self.max_l1_part_bytes.max(self.rlog_stored_target_bytes())
+    }
+
+    /// Whether [`Self::claim_lease_duration`] is under ADR-1029 decision 3's
+    /// startup warning threshold for the largest part any codec can write
+    /// ([`Self::largest_stored_target_bytes`]). The one call the binaries' startup
+    /// checks make.
+    pub fn claim_lease_below_warn_threshold(&self) -> bool {
+        claim_lease_below_warn_threshold(
+            self.claim_lease_duration,
+            self.largest_stored_target_bytes(),
+        )
     }
 
     /// The seal margin: a bucket ending at `bucket_end_ns` is sealed once
@@ -1744,54 +2015,263 @@ mod tests {
     const GIB: u64 = 1024 * 1024 * 1024;
     const MIB: u64 = 1024 * 1024;
 
+    /// A lease long enough that its part cap (420 GiB) never binds, so a test of
+    /// the share, floor and ceiling terms is not also a test of the lease term.
+    const LONG_LEASE: Duration = Duration::from_secs(86_400);
+
     /// The issue #2351 acceptance figures, pinned exactly. A derivation without
     /// the clamp gives 16 GiB for the 128 GiB row and 128 MiB for the 1 GiB
     /// row; one that divides by 4 or 16 instead of 8 fails the 30 GiB row.
     #[test]
     fn derived_target_is_one_eighth_of_the_budget_clamped() {
-        assert_eq!(derive_l1_part_memory_target_bytes(2 * GIB, 1), 256 * MIB);
-        assert_eq!(derive_l1_part_memory_target_bytes(2 * GIB, 1), 268_435_456);
-        assert_eq!(
-            derive_l1_part_memory_target_bytes(30 * GIB, 1),
-            4_026_531_840
-        );
+        let derive =
+            |budget, merges| derive_l1_part_memory_target_bytes(budget, merges, LONG_LEASE);
+        assert_eq!(derive(2 * GIB, 1), 256 * MIB);
+        assert_eq!(derive(2 * GIB, 1), 268_435_456);
+        assert_eq!(derive(30 * GIB, 1), 4_026_531_840);
         assert_eq!(4_026_531_840, 3 * GIB + 3 * GIB / 4);
-        assert_eq!(derive_l1_part_memory_target_bytes(128 * GIB, 1), 8 * GIB);
-        assert_eq!(
-            derive_l1_part_memory_target_bytes(128 * GIB, 1),
-            8_589_934_592
-        );
+        assert_eq!(derive(128 * GIB, 1), 8 * GIB);
+        assert_eq!(derive(128 * GIB, 1), 8_589_934_592);
         // Below the floor: 1 GiB / 8 = 128 MiB clamps up to 256 MiB.
-        assert_eq!(derive_l1_part_memory_target_bytes(GIB, 1), 256 * MIB);
-        assert_eq!(derive_l1_part_memory_target_bytes(0, 1), 256 * MIB);
-        assert_eq!(derive_l1_part_memory_target_bytes(u64::MAX, 1), 8 * GIB);
+        assert_eq!(derive(GIB, 1), 256 * MIB);
+        assert_eq!(derive(0, 1), 256 * MIB);
+        assert_eq!(derive(u64::MAX, 1), 8 * GIB);
     }
 
     #[test]
     fn derived_target_divides_by_concurrent_merges() {
-        assert_eq!(
-            derive_l1_part_memory_target_bytes(30 * GIB, 2),
-            2_013_265_920
-        );
-        assert_eq!(
-            derive_l1_part_memory_target_bytes(30 * GIB, 2) * 2,
-            derive_l1_part_memory_target_bytes(30 * GIB, 1)
-        );
+        let derive =
+            |budget, merges| derive_l1_part_memory_target_bytes(budget, merges, LONG_LEASE);
+        assert_eq!(derive(30 * GIB, 2), 2_013_265_920);
+        assert_eq!(derive(30 * GIB, 2) * 2, derive(30 * GIB, 1));
         // 28 GiB (a 30 GiB host less the server's 2 GiB reserve) over 4 units.
-        assert_eq!(derive_l1_part_memory_target_bytes(28 * GIB, 4), 939_524_096);
+        assert_eq!(derive(28 * GIB, 4), 939_524_096);
         // The clamp applies after the division: 128 GiB over 2 merges is 8 GiB
         // each, and over 4 merges 4 GiB each (clamping first would give 4 GiB
         // and 2 GiB).
-        assert_eq!(derive_l1_part_memory_target_bytes(128 * GIB, 2), 8 * GIB);
-        assert_eq!(derive_l1_part_memory_target_bytes(128 * GIB, 4), 4 * GIB);
+        assert_eq!(derive(128 * GIB, 2), 8 * GIB);
+        assert_eq!(derive(128 * GIB, 4), 4 * GIB);
         // The floor holds per merge, so a small budget over many merges stays at
         // 256 MiB each.
-        assert_eq!(derive_l1_part_memory_target_bytes(2 * GIB, 8), 256 * MIB);
+        assert_eq!(derive(2 * GIB, 8), 256 * MIB);
         // Zero merges is one merge, not a division by zero.
+        assert_eq!(derive(30 * GIB, 0), derive(30 * GIB, 1));
+    }
+
+    /// The lease term (issue #2351 fix round 3). At a 30 GiB budget and one
+    /// merge the memory share is 3.75 GiB, but the default 300 s lease only
+    /// supports a 1,500 MiB part (`300 s * 10 MiB/s / 2`), so the target is
+    /// 1,572,864,000 bytes and the Display names the lease. With the lease raised
+    /// to 1200 s the cap is 6,000 MiB and the share (3.75 GiB) binds.
+    ///
+    /// Distinguishing:
+    /// - dropping the lease term: the 300 s row reads 4,026,531,840, not
+    ///   1,572,864,000, and its bound reads `MemoryShare`.
+    /// - applying the lease before the floor (a `min` after the clamp): the
+    ///   30 s row reads 157,286,400 (below the floor), not 268,435,456.
+    /// - a lease cap computed as `lease * 10 MiB/s` without the halving: the
+    ///   300 s row reads 3,145,728,000.
+    #[test]
+    fn lease_term_bounds_the_target_and_the_display_says_so() {
+        let default_lease = DEFAULT_CLAIM_LEASE_DURATION;
+        assert_eq!(default_lease, Duration::from_secs(300));
+
+        let (bytes, bound) = derive_l1_part_memory_target(30 * GIB, 1, default_lease);
+        assert_eq!(bytes, 1_572_864_000);
+        assert_eq!(bytes, 1500 * MIB);
+        assert_eq!(bound, L1PartMemoryTargetBound::ClaimLease);
+        let resolved = ResolvedL1PartMemoryTarget::resolve(None, Some(30 * GIB), 1, default_lease);
+        assert_eq!(resolved.bytes, 1_572_864_000);
+        assert_eq!(resolved.bound_name(), Some("claim_lease"));
         assert_eq!(
-            derive_l1_part_memory_target_bytes(30 * GIB, 0),
-            derive_l1_part_memory_target_bytes(30 * GIB, 1)
+            resolved.to_string(),
+            "1572864000 (resolved from a memory budget of 32212254720 over 1 concurrent \
+             merge; bound by the claim lease, 300 s allows a part of at most 1572864000 bytes)"
         );
+
+        // The lease raised to 1200 s: the share binds.
+        let long = Duration::from_secs(1200);
+        assert_eq!(claim_lease_max_part_bytes(long), 6000 * MIB);
+        let (bytes, bound) = derive_l1_part_memory_target(30 * GIB, 1, long);
+        assert_eq!(bytes, 4_026_531_840);
+        assert_eq!(bytes, 3 * GIB + 3 * GIB / 4);
+        assert_eq!(bound, L1PartMemoryTargetBound::MemoryShare);
+        let resolved = ResolvedL1PartMemoryTarget::resolve(None, Some(30 * GIB), 1, long);
+        assert_eq!(resolved.bound_name(), Some("memory_share"));
+        assert_eq!(
+            resolved.to_string(),
+            "4026531840 (resolved from a memory budget of 32212254720 over 1 concurrent \
+             merge; bound by the memory share, budget / 8 / merges)"
+        );
+
+        // The lease cap is 1500 MiB at 300 s: a 12 GiB budget (1536 MiB share)
+        // is lease-bound just over it, and an exact tie is named as the share.
+        let (bytes, bound) = derive_l1_part_memory_target(12 * GIB, 1, default_lease);
+        assert_eq!(bytes, 1500 * MIB);
+        assert_eq!(bound, L1PartMemoryTargetBound::ClaimLease);
+        let (bytes, bound) = derive_l1_part_memory_target(1500 * MIB * 8, 1, default_lease);
+        assert_eq!(bytes, 1500 * MIB);
+        assert_eq!(bound, L1PartMemoryTargetBound::MemoryShare);
+    }
+
+    /// The floor is applied last. A lease too short for a floor-sized part still
+    /// gets 256 MiB (the floor), the lease check DOES warn at that setting, and
+    /// that warning is the operator's signal, not something the derivation
+    /// hides by going below the floor. A 30 s lease supports 150 MiB; the
+    /// warning threshold for a 256 MiB part is 51.2 s.
+    ///
+    /// Distinguishing: applying the lease after the floor gives 157,286,400 for
+    /// the 30 s row; dropping the floor gives the same.
+    #[test]
+    fn a_lease_too_short_for_the_floor_yields_the_floor_and_the_check_warns() {
+        let short = Duration::from_secs(30);
+        assert_eq!(claim_lease_max_part_bytes(short), 150 * MIB);
+        let (bytes, bound) = derive_l1_part_memory_target(30 * GIB, 1, short);
+        assert_eq!(bytes, 256 * MIB);
+        assert_eq!(bound, L1PartMemoryTargetBound::Floor);
+        let resolved = ResolvedL1PartMemoryTarget::resolve(None, Some(30 * GIB), 1, short);
+        assert_eq!(
+            resolved.to_string(),
+            "268435456 (resolved from a memory budget of 32212254720 over 1 concurrent \
+             merge; bound by the 268435456-byte floor)"
+        );
+        let mut config = CompactorConfig {
+            claim_lease_duration: short,
+            ..CompactorConfig::default()
+        };
+        resolved.apply_to(&mut config);
+        assert!(claim_lease_below_warn_threshold(
+            short,
+            config.largest_stored_target_bytes()
+        ));
+        // At a lease that supports exactly the floor the check does not warn.
+        let enough = Duration::from_secs(52);
+        assert!(!claim_lease_below_warn_threshold(enough, 256 * MIB));
+    }
+
+    /// The lease cap leaves the startup check quiet: for each lease listed, a
+    /// part of exactly the cap does not trip the warning, and one 8 MiB larger
+    /// does, so the cap sits at the threshold rather than somewhere safely
+    /// below it. Over the derivation range at the default lease, a target above
+    /// the floor never warns.
+    ///
+    /// Distinguishing: a cap without the halving (3,145,728,000 bytes at 300 s)
+    /// warns at every row; a cap that is half of the right one fails the
+    /// "8 MiB over warns" half only for leases above 3.2 s, which is every row
+    /// but the millisecond ones.
+    #[test]
+    fn the_derived_default_target_never_trips_the_lease_warning() {
+        for lease in [
+            Duration::from_millis(1),
+            Duration::from_millis(1234),
+            Duration::from_secs(7),
+            Duration::from_secs(30),
+            Duration::from_secs(52),
+            Duration::from_secs(100),
+            DEFAULT_CLAIM_LEASE_DURATION,
+            Duration::from_secs(1200),
+            LONG_LEASE,
+        ] {
+            let cap = claim_lease_max_part_bytes(lease);
+            assert!(
+                !claim_lease_below_warn_threshold(lease, cap),
+                "{lease:?} lease warns at its own {cap}-byte cap"
+            );
+            assert!(
+                claim_lease_below_warn_threshold(lease, cap + 8 * MIB),
+                "{lease:?} lease does not warn 8 MiB over its {cap}-byte cap"
+            );
+        }
+        // At the defaults, over the whole derivation range of budgets and
+        // merge counts, the derived target (and so the RLOG cap that follows
+        // it) never warns once it is above the floor.
+        for budget in [0, 2 * GIB, 8 * GIB, 30 * GIB, 64 * GIB, 512 * GIB] {
+            for merges in [1, 2, 4, 16] {
+                let (bytes, bound) =
+                    derive_l1_part_memory_target(budget, merges, DEFAULT_CLAIM_LEASE_DURATION);
+                if bound != L1PartMemoryTargetBound::Floor {
+                    assert!(
+                        !claim_lease_below_warn_threshold(DEFAULT_CLAIM_LEASE_DURATION, bytes),
+                        "budget {budget} merges {merges}: {bytes} bytes warns at 300 s"
+                    );
+                }
+            }
+        }
+        // The default shared cap (256 MiB, the floor) is clear at the default
+        // lease too, so the default configuration warns nowhere.
+        assert!(!claim_lease_below_warn_threshold(
+            DEFAULT_CLAIM_LEASE_DURATION,
+            DEFAULT_MAX_L1_PART_BYTES
+        ));
+    }
+
+    /// The budget the derivation divides deducts the overhead reserve and the
+    /// merge cursor budget, floored at zero BEFORE the division. The worked
+    /// figures from the maintenance guide: a 32 GiB host under `compact-bucket`
+    /// is `32 - 2 - 20 = 10 GiB`, so 1.25 GiB per merge (the 1.46 GiB lease cap
+    /// does not bind); `ravel-server` on a 30 GiB host is `28 - 20 = 8 GiB`,
+    /// so 256 MiB at 4 unit slots.
+    ///
+    /// Distinguishing:
+    /// - dropping the cursor deduction: the CLI row reads 3.75 GiB capped to
+    ///   the 1.46 GiB lease term (1,572,864,000), not 1,342,177,280, and the
+    ///   server row reads 800 MiB, not 256 MiB.
+    /// - dropping the reserve deduction on the CLI: 12 GiB / 8 is 1.5 GiB, not
+    ///   1.25 GiB.
+    /// - flooring after the division instead of before: a host below the
+    ///   deductions would underflow instead of reaching the floor.
+    #[test]
+    fn the_budget_deducts_the_reserve_and_the_cursor_budget_before_dividing() {
+        assert_eq!(MEMORY_OVERHEAD_RESERVE_BYTES, 2 * GIB);
+        assert_eq!(DEFAULT_MERGE_CURSOR_BUDGET_BYTES, 20 * GIB);
+
+        // 32 GiB host, compact-bucket (one merge), default lease.
+        let budget = merge_memory_budget_bytes(
+            host_memory_budget_bytes(32 * GIB),
+            DEFAULT_MERGE_CURSOR_BUDGET_BYTES,
+        );
+        assert_eq!(budget, 10 * GIB);
+        let (bytes, bound) = derive_l1_part_memory_target(budget, 1, DEFAULT_CLAIM_LEASE_DURATION);
+        assert_eq!(bytes, 1_342_177_280);
+        assert_eq!(bytes, GIB + GIB / 4);
+        assert_eq!(bound, L1PartMemoryTargetBound::MemoryShare);
+
+        // ravel-server on a 30 GiB host: its budget already nets the reserve.
+        let budget = merge_memory_budget_bytes(
+            30 * GIB - MEMORY_OVERHEAD_RESERVE_BYTES,
+            DEFAULT_MERGE_CURSOR_BUDGET_BYTES,
+        );
+        assert_eq!(budget, 8 * GIB);
+        let (bytes, _) = derive_l1_part_memory_target(budget, 4, DEFAULT_CLAIM_LEASE_DURATION);
+        assert_eq!(bytes, 256 * MIB);
+
+        // A host smaller than the deductions floors at zero, then at 256 MiB.
+        assert_eq!(merge_memory_budget_bytes(GIB, 20 * GIB), 0);
+        assert_eq!(host_memory_budget_bytes(GIB), 0);
+        let (bytes, bound) = derive_l1_part_memory_target(0, 1, DEFAULT_CLAIM_LEASE_DURATION);
+        assert_eq!(bytes, 256 * MIB);
+        assert_eq!(bound, L1PartMemoryTargetBound::Floor);
+    }
+
+    /// The ceiling term is named too: a 128 GiB budget with a lease long enough
+    /// to allow more than 8 GiB is ceiling-bound.
+    #[test]
+    fn the_ceiling_is_named_when_it_binds() {
+        let (bytes, bound) = derive_l1_part_memory_target(128 * GIB, 1, LONG_LEASE);
+        assert_eq!(bytes, 8 * GIB);
+        assert_eq!(bound, L1PartMemoryTargetBound::Ceiling);
+        let resolved = ResolvedL1PartMemoryTarget::resolve(None, Some(128 * GIB), 1, LONG_LEASE);
+        assert_eq!(resolved.bound_name(), Some("ceiling"));
+        assert_eq!(
+            resolved.to_string(),
+            "8589934592 (resolved from a memory budget of 137438953472 over 1 concurrent \
+             merge; bound by the 8589934592-byte ceiling)"
+        );
+        // With the default lease the lease cap is the lower term.
+        let (bytes, bound) =
+            derive_l1_part_memory_target(128 * GIB, 1, DEFAULT_CLAIM_LEASE_DURATION);
+        assert_eq!(bytes, 1_572_864_000);
+        assert_eq!(bound, L1PartMemoryTargetBound::ClaimLease);
     }
 
     /// A flag wins over the derivation and is not clamped either way: a
@@ -1801,14 +2281,25 @@ mod tests {
     #[test]
     fn explicit_value_overrides_the_derivation_verbatim() {
         for explicit in [1, 64 * MIB, 16 * GIB] {
-            let resolved = ResolvedL1PartMemoryTarget::resolve(Some(explicit), Some(30 * GIB), 1);
+            let resolved = ResolvedL1PartMemoryTarget::resolve(
+                Some(explicit),
+                Some(30 * GIB),
+                1,
+                DEFAULT_CLAIM_LEASE_DURATION,
+            );
             assert_eq!(resolved.bytes, explicit);
             assert_eq!(resolved.source, L1PartMemoryTargetSource::Flag);
             assert_eq!(resolved.source_name(), "flag");
+            assert_eq!(resolved.bound_name(), None);
             assert_eq!(resolved.to_string(), format!("{explicit} (set by flag)"));
         }
         // An explicit value also wins when the budget is unknown.
-        let resolved = ResolvedL1PartMemoryTarget::resolve(Some(64 * MIB), None, 1);
+        let resolved = ResolvedL1PartMemoryTarget::resolve(
+            Some(64 * MIB),
+            None,
+            1,
+            DEFAULT_CLAIM_LEASE_DURATION,
+        );
         assert_eq!(resolved.bytes, 64 * MIB);
         assert_eq!(resolved.source, L1PartMemoryTargetSource::Flag);
     }
@@ -1819,36 +2310,45 @@ mod tests {
     /// derived or clamped value that would hide the operator error.
     #[test]
     fn explicit_zero_is_passed_through_for_the_caller_to_refuse() {
-        let resolved = ResolvedL1PartMemoryTarget::resolve(Some(0), Some(30 * GIB), 1);
+        let resolved = ResolvedL1PartMemoryTarget::resolve(
+            Some(0),
+            Some(30 * GIB),
+            1,
+            DEFAULT_CLAIM_LEASE_DURATION,
+        );
         assert_eq!(resolved.bytes, 0);
         assert_eq!(resolved.source, L1PartMemoryTargetSource::Flag);
     }
 
     #[test]
     fn unset_flag_derives_from_a_known_budget_and_says_so() {
-        let resolved = ResolvedL1PartMemoryTarget::resolve(None, Some(30 * GIB), 2);
+        let resolved = ResolvedL1PartMemoryTarget::resolve(None, Some(30 * GIB), 2, LONG_LEASE);
         assert_eq!(resolved.bytes, 2_013_265_920);
         assert_eq!(
             resolved.source,
             L1PartMemoryTargetSource::Derived {
                 memory_budget_bytes: 32_212_254_720,
                 concurrent_merges: 2,
+                claim_lease_duration: LONG_LEASE,
+                bound: L1PartMemoryTargetBound::MemoryShare,
             }
         );
         assert_eq!(resolved.source_name(), "derived");
         assert_eq!(
             resolved.to_string(),
-            "2013265920 (resolved from a memory budget of 32212254720 over 2 concurrent merges)"
+            "2013265920 (resolved from a memory budget of 32212254720 over 2 concurrent merges; \
+             bound by the memory share, budget / 8 / merges)"
         );
     }
 
     /// One merge reads "1 concurrent merge", not "1 concurrent merges".
     #[test]
     fn derived_display_uses_the_singular_for_one_merge() {
-        let resolved = ResolvedL1PartMemoryTarget::resolve(None, Some(30 * GIB), 1);
+        let resolved = ResolvedL1PartMemoryTarget::resolve(None, Some(30 * GIB), 1, LONG_LEASE);
         assert_eq!(
             resolved.to_string(),
-            "4026531840 (resolved from a memory budget of 32212254720 over 1 concurrent merge)"
+            "4026531840 (resolved from a memory budget of 32212254720 over 1 concurrent merge; \
+             bound by the memory share, budget / 8 / merges)"
         );
     }
 
@@ -1863,35 +2363,148 @@ mod tests {
     ///   assertion reads 268435456, not 4026531840.
     /// - `apply_to` keeping RSPAN at 256 MiB for a flag too: the flag row's
     ///   RSPAN assertion reads 268435456, not 12345.
+    /// - `apply_to` leaving the RLOG stored-size cap at the 256 MiB shared
+    ///   default on a derived row (the cap left where it was before the
+    ///   derivation): the derived 1 GiB row's RLOG cap reads 268435456, not
+    ///   1073741824, and so does the 3.75 GiB row's.
+    /// - `apply_to` setting the cap to twice the target, or half of it: the cap
+    ///   assertions read 2147483648 or 536870912.
+    /// - `apply_to` writing the derived bytes into the shared
+    ///   `max_l1_part_bytes` (which RSEG reads) instead of the RLOG field: the
+    ///   shared-cap assertion reads the derived value, not 268435456.
+    /// - `apply_to` overwriting a pre-set shared memory target with the 256 MiB
+    ///   constant on a derived or fallback row: the pre-set 4096 reads 268435456.
     #[test]
     fn derived_target_reaches_rlog_only_and_a_flag_reaches_both() {
+        let lease = DEFAULT_CLAIM_LEASE_DURATION;
+        // 8 GiB over 1 merge is a 1 GiB share, below the 1500 MiB lease cap.
         let mut config = CompactorConfig::default();
-        ResolvedL1PartMemoryTarget::resolve(None, Some(30 * GIB), 1).apply_to(&mut config);
+        let resolved = ResolvedL1PartMemoryTarget::resolve(None, Some(8 * GIB), 1, lease);
+        resolved.apply_to(&mut config);
+        assert_eq!(resolved.bytes, GIB);
+        assert_eq!(config.rlog_memory_target_bytes(), GIB);
+        assert_eq!(config.rlog_stored_target_bytes(), GIB);
+        assert_eq!(config.rlog_max_l1_part_bytes, Some(1_073_741_824));
+        assert_eq!(config.l1_part_memory_target_bytes, 268_435_456);
+        assert_eq!(config.max_l1_part_bytes, 268_435_456);
+
+        let mut config = CompactorConfig::default();
+        let resolved = ResolvedL1PartMemoryTarget::resolve(None, Some(30 * GIB), 1, LONG_LEASE);
+        resolved.apply_to(&mut config);
         assert_eq!(config.rlog_memory_target_bytes(), 4_026_531_840);
         assert_eq!(config.rlog_memory_target_bytes(), 3 * GIB + 3 * GIB / 4);
+        assert_eq!(config.rlog_stored_target_bytes(), 4_026_531_840);
         assert_eq!(config.l1_part_memory_target_bytes, 268_435_456);
+        assert_eq!(config.max_l1_part_bytes, 268_435_456);
 
+        // A flag reaches the shared memory target, so RSPAN too; it leaves the
+        // RLOG cap following the shared cap, so a flag above 256 MiB is the
+        // opt-in to probes.
         let mut config = CompactorConfig::default();
-        ResolvedL1PartMemoryTarget::resolve(Some(12345), Some(30 * GIB), 1).apply_to(&mut config);
+        ResolvedL1PartMemoryTarget::resolve(Some(12345), Some(30 * GIB), 1, lease)
+            .apply_to(&mut config);
         assert_eq!(config.rlog_memory_target_bytes(), 12345);
         assert_eq!(config.l1_part_memory_target_bytes, 12345);
+        assert_eq!(config.rlog_max_l1_part_bytes, None);
+        assert_eq!(config.rlog_stored_target_bytes(), 268_435_456);
 
         let mut config = CompactorConfig::default();
-        ResolvedL1PartMemoryTarget::resolve(None, None, 1).apply_to(&mut config);
+        ResolvedL1PartMemoryTarget::resolve(None, None, 1, lease).apply_to(&mut config);
         assert_eq!(config.rlog_memory_target_bytes(), 268_435_456);
         assert_eq!(config.l1_part_memory_target_bytes, 268_435_456);
+        assert_eq!(config.rlog_stored_target_bytes(), 268_435_456);
+        assert_eq!(config.rlog_max_l1_part_bytes, Some(268_435_456));
 
-        // A library caller that never resolves: RLOG reads the shared field.
+        // A library caller that never resolves: RLOG reads the shared fields.
         let config = CompactorConfig {
             l1_part_memory_target_bytes: 4096,
+            max_l1_part_bytes: 8192,
             ..CompactorConfig::default()
         };
         assert_eq!(config.rlog_memory_target_bytes(), 4096);
+        assert_eq!(config.rlog_stored_target_bytes(), 8192);
+
+        // The startup check sizes against the larger of the two caps.
+        let config = CompactorConfig {
+            max_l1_part_bytes: 100,
+            rlog_max_l1_part_bytes: Some(900),
+            ..CompactorConfig::default()
+        };
+        assert_eq!(config.largest_stored_target_bytes(), 900);
+        let config = CompactorConfig {
+            max_l1_part_bytes: 1000,
+            rlog_max_l1_part_bytes: Some(900),
+            ..CompactorConfig::default()
+        };
+        assert_eq!(config.largest_stored_target_bytes(), 1000);
+    }
+
+    /// The startup check takes the larger of the two caps. A 2 GiB RLOG cap
+    /// under the default 300 s lease needs a 410 s lease, so the check warns
+    /// although the shared cap alone (256 MiB, a 51 s threshold) would not.
+    ///
+    /// Distinguishing: a check on `max_l1_part_bytes` alone reads `false` for
+    /// the first row (RLOG cap 2 GiB, shared cap 256 MiB); a check on
+    /// `rlog_stored_target_bytes()` alone reads `false` for the third row
+    /// (shared cap 2 GiB, RLOG cap 256 MiB).
+    #[test]
+    fn the_startup_lease_check_sizes_against_the_larger_cap() {
+        let config = CompactorConfig {
+            rlog_max_l1_part_bytes: Some(2 * GIB),
+            ..CompactorConfig::default()
+        };
+        assert!(config.claim_lease_below_warn_threshold());
+        let config = CompactorConfig {
+            max_l1_part_bytes: 2 * GIB,
+            ..CompactorConfig::default()
+        };
+        assert!(config.claim_lease_below_warn_threshold());
+        let config = CompactorConfig {
+            max_l1_part_bytes: 2 * GIB,
+            rlog_max_l1_part_bytes: Some(256 * MIB),
+            ..CompactorConfig::default()
+        };
+        assert!(config.claim_lease_below_warn_threshold());
+        assert!(!CompactorConfig::default().claim_lease_below_warn_threshold());
+    }
+
+    /// `apply_to` writes a derived or fallback resolution into the RLOG fields
+    /// only and leaves a shared field the caller already set alone; only the
+    /// flag arm writes the shared memory target.
+    ///
+    /// Distinguishing: an `apply_to` that stores the 256 MiB constant on the
+    /// derived and fallback arms reads 268435456 where 4096 / 2048 are pinned.
+    #[test]
+    fn derived_and_fallback_arms_leave_the_preset_shared_fields_alone() {
+        for (budget, merges) in [(Some(30 * GIB), 1), (None, 1)] {
+            let mut config = CompactorConfig {
+                l1_part_memory_target_bytes: 4096,
+                max_l1_part_bytes: 2048,
+                ..CompactorConfig::default()
+            };
+            ResolvedL1PartMemoryTarget::resolve(None, budget, merges, DEFAULT_CLAIM_LEASE_DURATION)
+                .apply_to(&mut config);
+            assert_eq!(config.l1_part_memory_target_bytes, 4096, "{budget:?}");
+            assert_eq!(config.max_l1_part_bytes, 2048, "{budget:?}");
+        }
+        let mut config = CompactorConfig {
+            l1_part_memory_target_bytes: 4096,
+            ..CompactorConfig::default()
+        };
+        ResolvedL1PartMemoryTarget::resolve(
+            Some(777),
+            Some(30 * GIB),
+            1,
+            DEFAULT_CLAIM_LEASE_DURATION,
+        )
+        .apply_to(&mut config);
+        assert_eq!(config.l1_part_memory_target_bytes, 777);
     }
 
     #[test]
     fn unset_flag_without_a_budget_falls_back_to_256_mib() {
-        let resolved = ResolvedL1PartMemoryTarget::resolve(None, None, 4);
+        let resolved =
+            ResolvedL1PartMemoryTarget::resolve(None, None, 4, DEFAULT_CLAIM_LEASE_DURATION);
         assert_eq!(resolved.bytes, 268_435_456);
         assert_eq!(resolved.source, L1PartMemoryTargetSource::Fallback);
         assert_eq!(resolved.source_name(), "fallback");
@@ -1915,16 +2528,55 @@ mod tests {
         assert_eq!(parse_meminfo_total_bytes("MemFree: 1000 kB\n"), None);
         assert_eq!(parse_meminfo_total_bytes("MemTotal: lots kB\n"), None);
         assert_eq!(parse_meminfo_total_bytes("MemTotal: 10 MB\n"), None);
+        assert_eq!(parse_meminfo_total_bytes("MemTotal: 12 furlongs\n"), None);
         assert_eq!(parse_meminfo_total_bytes(""), None);
+        // The real shape, and a key that merely starts similarly is not it.
+        assert_eq!(
+            parse_meminfo_total_bytes("MemTotal:       32137720 kB\nMemFree:         1234567 kB\n"),
+            Some(32_909_025_280)
+        );
+        assert_eq!(
+            parse_meminfo_total_bytes("MemAvailable:    100 kB\nMemTotal:       1024 kB\n"),
+            Some(1024 * 1024)
+        );
     }
 
     #[test]
     fn cgroup_limit_treats_unlimited_as_none() {
         assert_eq!(parse_cgroup_memory_limit("8589934592\n"), Some(8 * GIB));
+        assert_eq!(parse_cgroup_memory_limit("8589934592"), Some(8 * GIB));
         assert_eq!(parse_cgroup_memory_limit("max\n"), None);
         assert_eq!(parse_cgroup_memory_limit("9223372036854771712\n"), None);
         assert_eq!(parse_cgroup_memory_limit("0\n"), None);
+        assert_eq!(parse_cgroup_memory_limit(""), None);
         assert_eq!(parse_cgroup_memory_limit("eight gigs"), None);
+    }
+
+    /// The effective total is `MemTotal` capped by a finite cgroup limit, and
+    /// either one alone when the other is unknown.
+    ///
+    /// Distinguishing: returning `total` instead of `total.min(limit)` reads
+    /// 32,212,254,720 where 17,179,869,184 is pinned.
+    #[test]
+    fn effective_memory_total_is_mem_total_capped_by_the_cgroup_limit() {
+        assert_eq!(
+            effective_memory_total(Some(32_212_254_720), Some(17_179_869_184)),
+            Some(17_179_869_184)
+        );
+        // A limit above MemTotal does not raise the total.
+        assert_eq!(
+            effective_memory_total(Some(32_212_254_720), Some(64_424_509_440)),
+            Some(32_212_254_720)
+        );
+        assert_eq!(
+            effective_memory_total(Some(32_212_254_720), None),
+            Some(32_212_254_720)
+        );
+        assert_eq!(
+            effective_memory_total(None, Some(17_179_869_184)),
+            Some(17_179_869_184)
+        );
+        assert_eq!(effective_memory_total(None, None), None);
     }
 
     #[test]
