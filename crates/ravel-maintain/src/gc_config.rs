@@ -213,6 +213,12 @@ impl GcConfigValues {
 pub enum GcConfigError {
     #[error("object store error accessing sys/gc: {0}")]
     Store(String),
+    /// The store refused this process's credential on the `sys/gc` read or on
+    /// the bootstrap create. Kept apart from [`GcConfigError::Store`] because
+    /// under per-role credentials it means start order (only Maintain and Admin
+    /// may create `sys/gc`, ADR-0055 section 4), not a broken store.
+    #[error("access to sys/gc was refused on {op}: {detail}")]
+    AccessDenied { op: GcAccessOp, detail: String },
     #[error("sys/gc is corrupt and could not be decoded: {0}")]
     Decode(String),
     #[error(
@@ -313,6 +319,22 @@ pub enum GcConfigError {
     },
 }
 
+/// Which `sys/gc` request a [`GcConfigError::AccessDenied`] was refused on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GcAccessOp {
+    Read,
+    Create,
+}
+
+impl std::fmt::Display for GcAccessOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            GcAccessOp::Read => "read",
+            GcAccessOp::Create => "create",
+        })
+    }
+}
+
 /// Read `sys/gc` if it exists, returning the decoded values and the store
 /// version needed for a later `CasVersion` swap. `Ok(None)` is a bucket where
 /// the object has not been bootstrapped yet (legitimate absence, not a fault).
@@ -327,6 +349,10 @@ pub async fn read_gc_config(
             Ok(Some((values, outcome.version)))
         }
         Err(StoreError::NotFound) => Ok(None),
+        Err(StoreError::AccessDenied(detail)) => Err(GcConfigError::AccessDenied {
+            op: GcAccessOp::Read,
+            detail,
+        }),
         Err(err) => Err(GcConfigError::Store(err.to_string())),
     }
 }
@@ -380,6 +406,10 @@ pub async fn bootstrap_gc_config(
                 .ok_or(GcConfigError::ObjectVanished)?;
             Ok(values)
         }
+        Err(StoreError::AccessDenied(detail)) => Err(GcConfigError::AccessDenied {
+            op: GcAccessOp::Create,
+            detail,
+        }),
         Err(err) => Err(GcConfigError::Store(err.to_string())),
     }
 }
