@@ -444,6 +444,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- The ingest router started through its library API now refuses a zero JWKS
+  refresh interval at startup instead of panicking the refresh task (issue
+  #2330). `ravel_ingest_router::run` returns
+  `JwksRefreshSpawnError::ZeroRefreshInterval`, naming
+  `--oidc-jwks-refresh-interval-secs`, before it builds a Kubernetes client or
+  spawns any task; the CLI already refused a zero value.
 - **A store error reads as throttled only for a 429 or 503 status** (issue
   #2307). With no typed transport error in the chain, the S3 and external
   stores classified an error as `Throttled` whenever its text held the digits

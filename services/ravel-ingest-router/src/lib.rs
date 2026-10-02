@@ -63,6 +63,8 @@ use k8s_openapi::api::discovery::v1::EndpointSlice;
 
 use crate::config::{KeyConfig, RouterConfig};
 
+pub use crate::auth::JwksRefreshSpawnError;
+
 /// Wire the watcher, resolver, selector, and HTTP proxy into one running
 /// process and serve until the listener closes, or exit with an error if the
 /// EndpointSlice watcher task returns or panics (deliverable 6).
@@ -72,6 +74,22 @@ use crate::config::{KeyConfig, RouterConfig};
 /// binary and the tests exercise one code path, not two.
 pub async fn run(config: RouterConfig) -> anyhow::Result<()> {
     let idle_ttl_ns = i64::try_from(config.round_robin_idle_ttl.as_nanos()).unwrap_or(i64::MAX);
+
+    // Resolver wiring is built only for the canonical-tenant key source, and
+    // before any task or client: a refresh configuration the loop cannot run
+    // with is refused here as a startup error, not as a panic in its task.
+    let mut jwks_refresh: Option<auth::OidcRefresh> = None;
+    let key_resolver = match config.key {
+        KeyConfig::Header(name) => key::KeyResolver::Header(name),
+        KeyConfig::CanonicalTenant(settings) => {
+            let built = auth::build(&settings)?;
+            if let Some(refresh) = built.oidc_refresh {
+                refresh.check()?;
+                jwks_refresh = Some(refresh);
+            }
+            key::KeyResolver::Canonical(built.resolver)
+        }
+    };
 
     // EndpointSlice watcher: build the shared store and drive it from the kube
     // watch stream on a background task. The store starts not-synced, so the
@@ -85,23 +103,12 @@ pub async fn run(config: RouterConfig) -> anyhow::Result<()> {
     let watch_config = watch::watch_config(&config.gateway_service_name);
     let watch_handle = tokio::spawn(watch::run(api, watch_config, store.clone()));
 
-    // Key resolution (deliverable 3). Resolver wiring is built only for the
-    // canonical-tenant key source. When OIDC is configured the JWKS refresh task
+    // Key resolution (deliverable 3). When OIDC is configured the JWKS refresh task
     // is spawned and its JoinHandle kept (never dropped): a dead refresh task
     // silently stops picking up key rotation, so it joins the watcher race below
     // and tears the process down if it ends or panics. `None` when OIDC is not
     // configured, so its `select!` arm parks forever and never fires.
-    let mut jwks_handle: Option<tokio::task::JoinHandle<()>> = None;
-    let key_resolver = match config.key {
-        KeyConfig::Header(name) => key::KeyResolver::Header(name),
-        KeyConfig::CanonicalTenant(settings) => {
-            let built = auth::build(&settings)?;
-            if let Some(refresh) = built.oidc_refresh {
-                jwks_handle = Some(auth::spawn_jwks_refresh(refresh));
-            }
-            key::KeyResolver::Canonical(built.resolver)
-        }
-    };
+    let jwks_handle = jwks_refresh.map(auth::spawn_jwks_refresh).transpose()?;
 
     // The reverse-proxy client. Redirects are passed back to the client, never
     // followed here: a proxy that chased a redirect would leave the pinned pod.
