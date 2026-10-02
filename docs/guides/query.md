@@ -558,14 +558,29 @@ join with each other but not with any of the five: one of the five beside a
 Parquet table is the same HTTP 400, returned after one listing per other name
 finds that it is a Parquet table.
 
-The same endpoint creates and drops Parquet tables. A caller needs the `ddl`
-capability, which is absent by default: a bearer token whose tenant is written
-`TENANT;ddl` holds it, and so does an OIDC token whose `--oidc-ddl-claim` claim
-is `true`. Without it, `CREATE` and `DROP` are refused with 403 `forbidden`.
-The `LOCATION` must also lie inside a location grant recorded for the tenant. A success
-is a JSON body with `outcome` (`created`, `dropped`, or `noop`) and the table
-name, even when `Accept` asks for Arrow; creating a table that already exists
-is a 409 and dropping one that does not is a 404.
+The same endpoint creates and drops Parquet tables. The server routes a
+statement to the DDL path whenever its first keyword, after whitespace and
+comments, is `CREATE` or `DROP`, whatever follows it (ADR-2040's HTTP DDL
+amendment). A caller needs the `ddl` capability, which is absent by default: a
+bearer token whose tenant is written `TENANT;ddl` holds it
+(`--tenant-token NAME=TENANT;ddl`), and so does an OIDC token whose
+`--oidc-ddl-claim` claim is `true`. Without it, `CREATE` and `DROP` are
+refused with 403 `forbidden`.
+
+The `LOCATION` must also lie inside a location grant recorded for the
+tenant, and the server needs `--parquet-profiles PATH` pointing at the
+credential-profile file that grant resolves against (ADR-2040 decision D1);
+without it, no Parquet table is queryable at all. Grant the location with
+`ravel-cli`, against the same profile file:
+
+```sh
+ravel-cli --parquet-profiles profiles.json tenant parquet-grant add \
+  --tenant acme --location s3://lake/data/clicks/ --profile lake
+```
+
+A success is a JSON body with `outcome` (`created`, `dropped`, or `noop`) and
+the table name, even when `Accept` asks for Arrow; creating a table that
+already exists is a 409 and dropping one that does not is a 404.
 
 ```sh
 curl -X POST http://127.0.0.1:4318/api/v1/sql \
@@ -578,6 +593,12 @@ curl -X POST http://127.0.0.1:4318/api/v1/sql \
   -H "Content-Type: application/json" \
   -d '{"query": "DROP TABLE clicks"}'
 ```
+
+The server was started with `--tenant-token devtoken=acme;ddl
+--parquet-profiles profiles.json`: the `;ddl` suffix is on the tenant half of
+that mapping, not on the bearer value, so `Authorization` still carries only
+the plain token (`devtoken`) the client sends. The grant and the server's
+token mapping must agree on the same tenant (`acme` in both).
 
 The `samples` table columns are `ts` (`Timestamp(ns)`), `value` (`Float64`),
 `series_id` (`FixedSizeBinary(16)`), and `labels` (a dictionary-encoded
