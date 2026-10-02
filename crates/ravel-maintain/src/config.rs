@@ -58,7 +58,8 @@ use crate::request_ledger::RequestLedger;
 /// - [`Self::peak_total_bytes`]: `fetched + decoded + writer + probe`, adding
 ///   the in-progress part's writer buffer and the in-flight exact-encode probe.
 ///   The writer term tracks the memory split
-///   target `l1_part_memory_target_bytes` (a part is flushed once its
+///   target `l1_part_memory_target_bytes` (for RLOG,
+///   [`CompactorConfig::rlog_memory_target_bytes`]; a part is flushed once its
 ///   record-heap estimate reaches that target) and is the unavoidable
 ///   content-addressing cost the ADR calls out: a part's key does not exist
 ///   until the whole part is buffered. It is a target, not a ceiling: the RLOG

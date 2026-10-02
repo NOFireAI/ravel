@@ -134,7 +134,8 @@
 //! independent of stream size) and the raw bytes of the range that block came
 //! from (`O(input_count * group_size)` under version 4, stored bytes rather
 //! than decoded records), plus the in-progress part's writer buffer. The writer
-//! buffer tracks the **memory split target** `l1_part_memory_target_bytes`:
+//! buffer tracks the **memory split target** `l1_part_memory_target_bytes`
+//! (this merge reads it through [`CompactorConfig::rlog_memory_target_bytes`]):
 //! [`PartSink`] closes the in-progress part as soon as its [`estimate_record`]
 //! (decoded-heap) total reaches that target, wherever in the merged record
 //! sequence that falls, so a stream may span consecutive parts. On this path the
@@ -1144,7 +1145,9 @@ impl RecordCounts {
 /// in-progress part as soon as EITHER target is reached (issue #872), whichever
 /// falls first in the record sequence:
 ///
-/// - the **memory split target** `l1_part_memory_target_bytes`, reached when the
+/// - the **memory split target** ([`CompactorConfig::rlog_memory_target_bytes`]:
+///   `rlog_l1_part_memory_target_bytes` when set, else
+///   `l1_part_memory_target_bytes`), reached when the
 ///   part's [`PartBuilder::estimate`] (decoded record heap) does. This is
 ///   checked after every record, so the writer buffer exceeds it by at most one
 ///   record; it is the whole of issue #711 (the check used to run only between
