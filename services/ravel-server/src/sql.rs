@@ -322,7 +322,10 @@ fn request_deadline(body: &SqlBody, max_deadline: Duration) -> Result<Duration, 
 /// before any store call, and `ok` or `error` once it is refused by admission
 /// or finishes in [`SqlExecutor::execute_ddl`], from a task a client
 /// disconnect cannot cancel. A failed outcome submission never changes the
-/// response: the statement is already on record.
+/// response: the statement is already on record. One case leaves the
+/// `attempted` record without an outcome: the task panics after the client
+/// has disconnected, so no handler is left to submit the `error` outcome its
+/// `JoinError` arm writes.
 async fn run_ddl(
     state: &SqlState,
     principal: &Principal,
