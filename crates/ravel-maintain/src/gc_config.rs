@@ -54,8 +54,8 @@ use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions, Stor
 use ravel_proto::sys::v1 as sysproto;
 
 use crate::config::{
-    DEFAULT_GRACE_NS, DEFAULT_MAX_FLUSH_LIFETIME_NS, DEFAULT_MAX_QUERY_DURATION_NS,
-    DEFAULT_PROTECTION_HORIZON_NS,
+    DEFAULT_GRACE_NS, DEFAULT_MAX_COMPACTION_LIFETIME_NS, DEFAULT_MAX_FLUSH_LIFETIME_NS,
+    DEFAULT_MAX_QUERY_DURATION_NS, DEFAULT_PROTECTION_HORIZON_NS,
 };
 
 /// The bucket-root GC-config key (ADR-0050 section 4). Fixed, deployment-wide,
@@ -155,6 +155,25 @@ impl GcConfigValues {
                 .max_query_duration_ns
                 .saturating_add(self.grace_ns)
                 .saturating_add(clock_skew_allowance_ns)
+    }
+
+    /// Whether the horizon outlasts every compaction or rewrite run that could
+    /// still publish over a record's inputs:
+    /// `protection_horizon >= max_compaction_lifetime + 4 * clock_skew_allowance`
+    /// (ADR-1133, gated-set stability amendment). A run that overlaps record R
+    /// listed the bucket before R was visible, so it started before R's
+    /// `created_unix_ns` in true time, and it publishes within
+    /// `max_compaction_lifetime` of its own start on its own clock (`2σ` of true
+    /// time on top). The sweeper's horizon check compares its clock against R's
+    /// `created_unix_ns` (another `2σ`). Saturating like
+    /// [`Self::satisfies_constraint`].
+    pub fn satisfies_compaction_lifetime(
+        &self,
+        max_compaction_lifetime_ns: i64,
+        clock_skew_allowance_ns: i64,
+    ) -> bool {
+        self.protection_horizon_ns
+            >= max_compaction_lifetime_ns.saturating_add(clock_skew_allowance_ns.saturating_mul(4))
     }
 
     /// Reject any non-positive field before a write. Every `sys/gc` value is a
@@ -401,6 +420,35 @@ pub enum GcConfigError {
         clock_skew_allowance_ns: i64,
     },
     #[error(
+        "proposed GC config violates protection_horizon >= max_compaction_lifetime + 4 * \
+         clock_skew_allowance: protection_horizon={protection_horizon_ns} ns, \
+         max_compaction_lifetime={max_compaction_lifetime_ns} ns (this build's compiled value), \
+         clock_skew_allowance={clock_skew_allowance_ns} ns (need protection_horizon >= {}): a \
+         compaction or rewrite run could still publish over a record's inputs after their horizon \
+         passed (ADR-1133); refusing to write sys/gc",
+        .max_compaction_lifetime_ns.saturating_add(.clock_skew_allowance_ns.saturating_mul(4))
+    )]
+    CompactionLifetimeViolation {
+        protection_horizon_ns: i64,
+        max_compaction_lifetime_ns: i64,
+        clock_skew_allowance_ns: i64,
+    },
+    #[error(
+        "sys/gc records protection_horizon={stored_horizon_ns} ns, but THIS maintain process runs \
+         with max_compaction_lifetime={max_compaction_lifetime_ns} ns and \
+         clock_skew_allowance={clock_skew_allowance_ns} ns, and ADR-1133 requires \
+         protection_horizon >= max_compaction_lifetime + 4 * clock_skew_allowance = {} ns: a \
+         compaction or rewrite run could still publish over a record's inputs after their horizon \
+         passed, changing the set a delete marker gates. Raise the durable horizon via `ravel-cli \
+         gc-config set` or lower the skew allowance; refusing to start",
+        .max_compaction_lifetime_ns.saturating_add(.clock_skew_allowance_ns.saturating_mul(4))
+    )]
+    MaintainCompactionLifetimeUncovered {
+        stored_horizon_ns: i64,
+        max_compaction_lifetime_ns: i64,
+        clock_skew_allowance_ns: i64,
+    },
+    #[error(
         "this query engine's deadline is {deadline_ns} ns, but sys/gc records \
          max_query_duration={max_query_duration_ns} ns: a query may not outlive the GC protection \
          horizon's query-duration term; refusing to start"
@@ -567,6 +615,12 @@ pub enum SetOutcome {
 /// each maintain process re-validates against the stored values at startup
 /// ([`validate_maintain_skew`]).
 ///
+/// It also refuses, with [`GcConfigError::CompactionLifetimeViolation`], a
+/// horizon below `max_compaction_lifetime + 4 * clock_skew_allowance` for this
+/// build's compiled [`DEFAULT_MAX_COMPACTION_LIFETIME_NS`]
+/// ([`GcConfigValues::satisfies_compaction_lifetime`]), which every maintain
+/// process re-checks at startup ([`validate_maintain_compaction_lifetime`]).
+///
 /// The format version and HEAD cache TTL come from the proposal and the object
 /// this call read, in the same read its `CasVersion` swap is conditioned on
 /// ([`GcConfigProposal::head_cache_ttl_ns`]): a proposal without a TTL never
@@ -585,6 +639,15 @@ pub async fn set_gc_config(
             protection_horizon_ns: written.protection_horizon_ns,
             max_query_duration_ns: written.max_query_duration_ns,
             grace_ns: written.grace_ns,
+            clock_skew_allowance_ns,
+        });
+    }
+    if !written
+        .satisfies_compaction_lifetime(DEFAULT_MAX_COMPACTION_LIFETIME_NS, clock_skew_allowance_ns)
+    {
+        return Err(GcConfigError::CompactionLifetimeViolation {
+            protection_horizon_ns: written.protection_horizon_ns,
+            max_compaction_lifetime_ns: DEFAULT_MAX_COMPACTION_LIFETIME_NS,
             clock_skew_allowance_ns,
         });
     }
@@ -667,6 +730,29 @@ pub fn validate_maintain_skew(
             stored_horizon_ns: stored.protection_horizon_ns,
             stored_max_query_duration_ns: stored.max_query_duration_ns,
             stored_grace_ns: stored.grace_ns,
+            clock_skew_allowance_ns,
+        });
+    }
+    Ok(())
+}
+
+/// Maintain-mode startup check (ADR-1133, gated-set stability amendment): the
+/// stored horizon must satisfy
+/// `protection_horizon >= max_compaction_lifetime + 4 * clock_skew_allowance`
+/// ([`GcConfigValues::satisfies_compaction_lifetime`]) for THIS process's
+/// compactor lifetime and skew allowance. One marker per record gates a stable
+/// set only if no compaction or rewrite run can publish over the record's
+/// inputs once their horizon has passed. Called fail-closed beside
+/// [`validate_maintain_skew`], before any delete path runs.
+pub fn validate_maintain_compaction_lifetime(
+    stored: &GcConfigValues,
+    max_compaction_lifetime_ns: i64,
+    clock_skew_allowance_ns: i64,
+) -> Result<(), GcConfigError> {
+    if !stored.satisfies_compaction_lifetime(max_compaction_lifetime_ns, clock_skew_allowance_ns) {
+        return Err(GcConfigError::MaintainCompactionLifetimeUncovered {
+            stored_horizon_ns: stored.protection_horizon_ns,
+            max_compaction_lifetime_ns,
             clock_skew_allowance_ns,
         });
     }

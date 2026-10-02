@@ -1633,7 +1633,10 @@ async fn sweep_superseded_impl(
             marker_keys.push(None);
             continue;
         }
-        let marker_key = keys::record_unnamed_marker_key(entry_key).unwrap_or_default();
+        let Ok(marker_key) = keys::record_unnamed_marker_key(entry_key) else {
+            marker_keys.push(None);
+            continue;
+        };
         let slot = combined
             .entry(marker_key.clone())
             .or_insert(SnapshotGate::Clear);
@@ -1653,11 +1656,11 @@ async fn sweep_superseded_impl(
             .copied()
             .unwrap_or(SnapshotGate::Blocked(SnapshotBlock::Unreadable));
         let anchor = superseded_anchor(entry_key, &compactions, &rewrites, &record_versions);
-        let verdict = match (marker_key.is_empty(), anchor) {
-            // A key that does not reconstruct, or an anchor this pass did
-            // not read: the marker cannot be checked, so the group blocks.
-            (true, _) | (_, None) => SnapshotGate::Blocked(SnapshotBlock::Unreadable),
-            (false, Some(anchor)) => {
+        let verdict = match anchor {
+            // An anchor this pass did not read: the marker cannot be checked,
+            // so the group blocks.
+            None => SnapshotGate::Blocked(SnapshotBlock::Unreadable),
+            Some(anchor) => {
                 reach
                     .marker_gate(store, &ctx, tenant, signal, marker_key, &anchor, head_gate)
                     .await
@@ -1684,6 +1687,11 @@ async fn sweep_superseded_impl(
                 Some(blocked) => blocked,
                 None => SnapshotGate::Blocked(SnapshotBlock::Unreadable),
             },
+            // A group with objects but no marker key: its entry key does not
+            // reconstruct one, so the marker cannot be checked.
+            (SnapshotGate::Clear, None) if !group.objects.is_empty() => {
+                SnapshotGate::Blocked(SnapshotBlock::Unreadable)
+            }
             (gate, _) => gate,
         };
         if gate != SnapshotGate::Clear

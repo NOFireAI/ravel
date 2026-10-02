@@ -5,7 +5,9 @@
 //! it at startup). It enforces `protection_horizon >= max_query_duration +
 //! grace + clock_skew_allowance` at write time -- refusing a violating proposal
 //! without writing anything (S1-02: the skew term stops a sweeper whose clock
-//! leads a reader's from deleting a pinned snapshot) -- and swaps the durable
+//! leads a reader's from deleting a pinned snapshot), and `protection_horizon
+//! >= max_compaction_lifetime + 4 * clock_skew_allowance` against this build's
+//! compiled compaction lifetime (ADR-1133) -- and swaps the durable
 //! object with `CasVersion`, so a concurrent `gc-config set` is caught as a
 //! conflict rather than silently overwritten. Both operations delegate to
 //! [`ravel_maintain::gc_config`]; there is no CLI-side reimplementation of the

@@ -1347,6 +1347,13 @@ fn compactor_config_from_gc(
 /// path (`ravel_server::start` -> `spawn` -> `run_loop`), so no sweep loop is
 /// ever entered with a skew-uncovered horizon.
 ///
+/// The same spot refuses a stored horizon below
+/// `max_compaction_lifetime + 4 * clock_skew_allowance` for this process's
+/// compactor config, with
+/// [`GcConfigError::MaintainCompactionLifetimeUncovered`] (ADR-1133): the
+/// delete marker's gated set is stable only if no compaction or rewrite run
+/// can publish over a record's inputs once their horizon has passed.
+///
 /// A zero `heartbeat_interval` (on `config` or on `worker`) is refused the same
 /// way, with [`SpawnError::ZeroHeartbeatInterval`], and a zero `interval` with
 /// [`SpawnError::ZeroMaintainInterval`].
@@ -1381,6 +1388,11 @@ pub fn spawn(
     // `clock_skew_allowance_ns`, not just the write-time skew the horizon was
     // authored against. A violation refuses to spawn the sweep loop at all.
     ravel_maintain::validate_maintain_skew(&stored_gc, config.compactor.clock_skew_allowance_ns)?;
+    ravel_maintain::validate_maintain_compaction_lifetime(
+        &stored_gc,
+        config.compactor.max_compaction_lifetime_ns,
+        config.compactor.clock_skew_allowance_ns,
+    )?;
 
     // Production OS-entropy source (ADR-0068 decision 2) for the compactor
     // writer id and the per-tick loop jitter. The server always uses the
