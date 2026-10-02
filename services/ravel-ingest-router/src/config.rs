@@ -110,7 +110,10 @@ pub struct Cli {
     pub round_robin_idle_ttl: String,
 
     // --- Canonical-tenant resolver chain (only used under that key source) ----
-    /// Repeatable `token=tenant` pair for the static bearer resolver.
+    /// Repeatable `token=tenant` pair for the static bearer resolver. The
+    /// tenant may carry a trailing `;ddl` (ADR-2040 decision 4), accepted for
+    /// parity with `ravel-server`'s `--tenant-token`, but stripped here: this
+    /// router routes by the bare tenant and never grants the DDL capability.
     #[arg(long = "tenant-token", value_name = "TOKEN=TENANT")]
     pub tenant_tokens: Vec<String>,
 
@@ -473,13 +476,26 @@ impl Cli {
         let tokens = self
             .tenant_tokens
             .iter()
-            .map(|pair| {
-                let (token, tenant) = pair
+            .enumerate()
+            .map(|(i, pair)| {
+                let (token, tenant_raw) = pair
                     .split_once('=')
                     .ok_or_else(|| anyhow::anyhow!("--tenant-token must be TOKEN=TENANT"))?;
-                if token.is_empty() || tenant.is_empty() {
+                if token.is_empty() || tenant_raw.is_empty() {
                     anyhow::bail!("--tenant-token TOKEN and TENANT must both be non-empty");
                 }
+                // The server's `;ddl` capability suffix (ADR-2040 decision 4) is
+                // stripped here rather than kept: this router never runs DDL, so
+                // it never needs the capability, only the bare tenant it must
+                // route by.
+                let (tenant, _ddl) = ravel_tenant_resolve::split_tenant_suffix(tenant_raw)
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "--tenant-token (position {}) has an invalid tenant, expected \
+                             TENANT or TENANT;ddl",
+                            i + 1
+                        )
+                    })?;
                 Ok((token.to_string(), tenant.to_string()))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -767,6 +783,44 @@ mod tests {
             }
             other => panic!("expected canonical key config, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_ddl_suffix_routes_by_the_bare_tenant() {
+        let config = cli(&[
+            "--key-source",
+            "canonical-tenant",
+            "--tenant-token",
+            "tok=acme;ddl",
+        ])
+        .into_config()
+        .expect("a ;ddl-suffixed tenant token parses");
+        match config.key {
+            KeyConfig::CanonicalTenant(settings) => {
+                assert_eq!(
+                    settings.tokens,
+                    vec![("tok".to_string(), "acme".to_string())],
+                    "the router routes by the bare tenant, not the ;ddl-suffixed one"
+                );
+            }
+            other => panic!("expected canonical key config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_suffix_is_refused() {
+        let err = cli(&[
+            "--key-source",
+            "canonical-tenant",
+            "--tenant-token",
+            "tok=acme;foo",
+        ])
+        .into_config()
+        .expect_err("an unknown tenant suffix must refuse startup");
+        assert!(
+            err.to_string().contains("--tenant-token"),
+            "error names the flag: {err}"
+        );
     }
 
     #[test]

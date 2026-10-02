@@ -48,9 +48,10 @@ pub struct TenantSuffixError;
 /// before the `;` is [`TenantSuffixError`], so a typo refuses startup instead
 /// of silently granting nothing or naming an empty tenant.
 ///
-/// Shared by `ravel-server` and `ravel-ingest-router` so both parsers accept
-/// and refuse the same spellings; a router caller discards the `ddl` bool, as
-/// it never routes DDL requests differently.
+/// `ravel-ingest-router` uses it so that it accepts and refuses the same
+/// spellings as `ravel-server`, which keeps an identical private copy in its
+/// config until it switches to this one. The router discards the `ddl` bool,
+/// as it never routes DDL requests differently.
 pub fn split_tenant_suffix(raw: &str) -> Result<(&str, bool), TenantSuffixError> {
     match raw.rfind(';') {
         None => Ok((raw, false)),
