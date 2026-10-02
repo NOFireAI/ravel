@@ -195,6 +195,10 @@ pub(crate) fn finish(mut envelope: Envelope, budgets: &McpEffectiveBudgets) -> E
 pub(crate) fn failure(error: &ServiceError) -> Failure {
     let class = match error.kind {
         ServiceErrorKind::Unauthorized => FailureClass::Unauthorized,
+        // D4's FailureClass is verbatim and has no distinct "forbidden"
+        // class; an authenticated-but-not-permitted caller maps to the same
+        // class a credential-less one does.
+        ServiceErrorKind::Forbidden => FailureClass::Unauthorized,
         ServiceErrorKind::InvalidArgument => FailureClass::InvalidArgument,
         ServiceErrorKind::Validation => FailureClass::Validation,
         ServiceErrorKind::Unsupported => FailureClass::Unsupported,
