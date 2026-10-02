@@ -181,6 +181,61 @@ pub(super) async fn load_instrumented_at(
     on_batch_queued: Option<BuildStartHook>,
     zstd_level: RlogZstdLevel,
 ) -> Result<LoadReport, LoadError> {
+    load_with_drain_reflush_period(
+        store,
+        parquet_path,
+        tenant,
+        mapping,
+        shards,
+        batch_rows,
+        skip_rows,
+        read_cursors,
+        pipeline_depth,
+        max_inflight_flushes,
+        decode_queue_batches,
+        target_bytes,
+        max_flush_delay,
+        now_ns,
+        clock,
+        path,
+        on_build_start,
+        on_batch_queued,
+        zstd_level,
+        DRAIN_REFLUSH_PERIOD,
+    )
+    .await
+}
+
+/// Period of the straggler re-flush ticker that runs while the final drain
+/// waits on the in-flight window.
+const DRAIN_REFLUSH_PERIOD: Duration = Duration::from_secs(2);
+
+/// [`load_instrumented_at`] with the drain-time re-flush ticker's period
+/// injected, so a test can push the ticker out of reach and attribute the
+/// tail's publication to the end-of-input `flush_all` alone.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn load_with_drain_reflush_period(
+    store: Arc<dyn ObjectStoreBackend>,
+    parquet_path: &Path,
+    tenant: &str,
+    mapping: &Mapping,
+    shards: u32,
+    batch_rows: usize,
+    skip_rows: u64,
+    read_cursors: Option<usize>,
+    pipeline_depth: usize,
+    max_inflight_flushes: u32,
+    decode_queue_batches: usize,
+    target_bytes: usize,
+    max_flush_delay: Option<Duration>,
+    now_ns: i64,
+    clock: Arc<dyn Clock>,
+    path: LoadPath,
+    on_build_start: Option<BuildStartHook>,
+    on_batch_queued: Option<BuildStartHook>,
+    zstd_level: RlogZstdLevel,
+    drain_reflush_period: Duration,
+) -> Result<LoadReport, LoadError> {
     // Reject a zero batch size with a typed error rather than silently clamping
     // it to 1: `batch_rows` is the operator-facing `--batch-rows` lever, and a
     // silent clamp would hide a misconfigured value that changes object layout.
@@ -596,7 +651,7 @@ pub(super) async fn load_instrumented_at(
             loop {
                 tokio::select! {
                     _ = &mut stop_rx => break,
-                    () = tokio::time::sleep(Duration::from_secs(2)) => {
+                    () = tokio::time::sleep(drain_reflush_period) => {
                         ticker_router.flush_all().await;
                     }
                 }

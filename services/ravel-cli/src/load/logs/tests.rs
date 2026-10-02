@@ -109,8 +109,9 @@ async fn yield_until_router_is_quiet(clock: &TestClock) {
 /// Run one load whose object count is a function of `target_bytes` and the
 /// input geometry alone, with no wall-clock input at all.
 ///
-/// The router gets a frozen [`TestClock`], so neither the age trigger nor
-/// the drain-time re-flush can fire on their own. Two things then have to be
+/// The router gets a frozen [`TestClock`], so the age trigger cannot fire
+/// on its own; the drain-time re-flush runs on wall time and only matters
+/// once the drain begins. Two things then have to be
 /// arranged by hand, and both are what makes the count exact:
 ///
 /// - The end-of-input `flush_all` must not run while a write is still on its
@@ -1947,6 +1948,10 @@ async fn max_flush_delay_decides_whether_two_writes_coalesce() {
     );
 }
 
+/// A drain-time re-flush period no test run reaches: an hour, past the ack
+/// deadline ([`write_ack_deadline`]) of the test that uses it.
+const UNREACHED_REFLUSH_PERIOD: Duration = Duration::from_secs(3600);
+
 /// A load whose last slice stays under `--target-bytes` completes under a
 /// raised `--max-flush-delay`, with that tail published by the loader's
 /// end-of-input flush (issue #801). This is the run-burner the flag shipped
@@ -1966,17 +1971,23 @@ async fn max_flush_delay_decides_whether_two_writes_coalesce() {
 ///
 /// Which flush publishes what also depends on scheduling: a write task that
 /// has not reached its shard channel when the end-of-input `flush_all` runs
-/// lands in a fresh buffer behind it, so writes 1-3 never share a buffer and
-/// the drain-time re-flush ticker publishes the stragglers instead
-/// (`size: 0, final_drain: 2`). The last batch's `on_batch_queued` hook
+/// lands in a fresh buffer behind it, so without the gate below writes 1-3
+/// would never share a buffer and, at the default ticker period, the
+/// drain-time re-flush would publish the stragglers (`size: 0,
+/// final_drain: 2`). The last batch's `on_batch_queued` hook
 /// therefore holds the decoder, so no `Done` reaches the loader, until the
 /// router is quiet: every write routed and the size flush finished.
 ///
-/// What this cannot tell apart: the drain-time re-flush ticker also publishes
-/// with the manual trigger, so if the end-of-input `flush_all` were moved
-/// after `drain_inflight`, the ticker would publish the tail about 2 s later
-/// and the counts asserted here would still hold. The test pins the flush mix
-/// and object count, not which of the two manual flushes ran.
+/// The drain-time re-flush ticker also publishes with the manual trigger, so
+/// its period is pushed to [`UNREACHED_REFLUSH_PERIOD`], past the 120 s ack
+/// deadline the 60 s delay scales to ([`write_ack_deadline`]). The tail can
+/// therefore be published only by the end-of-input `flush_all`.
+///
+/// Prove-the-test: move `router.flush_all()` after `drain_inflight`, or
+/// delete it, and the drain waits on an ack nothing will answer before the
+/// ticker's first tick. The router's ack deadline fires after 120 s, the load
+/// returns a flush failure (`LoadError::Flush`, an ack timeout), and the
+/// `expect` on the report fails.
 #[tokio::test]
 async fn a_tail_below_target_is_published_by_the_end_of_input_flush() {
     use ravel_object_store::memory::MemoryStore;
@@ -2004,7 +2015,7 @@ async fn a_tail_below_target_is_published_by_the_end_of_input_flush() {
         }
     });
 
-    let load_fut = load_instrumented(
+    let load_fut = load_with_drain_reflush_period(
         Arc::clone(&store),
         &pq,
         "acme",
@@ -2017,12 +2028,14 @@ async fn a_tail_below_target_is_published_by_the_end_of_input_flush() {
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         1,
         TARGET,
-        Some(Duration::from_secs(600)),
+        Some(Duration::from_secs(60)),
         NOW_NS,
         Arc::clone(&clock) as Arc<dyn Clock>,
         LoadPath::Columnar,
         None,
         Some(on_batch_queued),
+        RlogZstdLevel::DEFAULT,
+        UNREACHED_REFLUSH_PERIOD,
     );
 
     let driver = async {
