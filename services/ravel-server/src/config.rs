@@ -2805,8 +2805,21 @@ impl HostProfile {
     pub fn detect() -> Self {
         HostProfile {
             cores: std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
-            mem_total_bytes: ravel_maintain::detect_host_memory_total_bytes(),
+            mem_total_bytes: Self::detect_mem_total_bytes(),
         }
+    }
+
+    /// The shared detector also reads `sysctl hw.memsize` on macOS; the server
+    /// keeps memory unknown there (ADR-0088), so every memory-derived default
+    /// stays on its compiled-in fallback outside Linux.
+    #[cfg(target_os = "linux")]
+    fn detect_mem_total_bytes() -> Option<u64> {
+        ravel_maintain::detect_host_memory_total_bytes()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn detect_mem_total_bytes() -> Option<u64> {
+        None
     }
 }
 
@@ -12323,7 +12336,7 @@ mod tests {
     /// - Write the derived value into the field the RSPAN merge reads: the
     ///   `rspan_l1_part_memory_target_bytes` and RSPAN assertions read 1073741824.
     /// - Drop the cursor deduction: the default row reads 939524096, the
-    ///   concurrency 1 row 3758096384.
+    ///   concurrency 1 row 1572864000 (3.5 GiB is above the 300 s lease cap).
     /// - Ignore the unit concurrency: the default row reads 1073741824.
     /// - Drop the lease term: the 128 GiB default-lease row reads 8589934592.
     /// - Leave the RLOG cap at its shared default: the `rlog_max_l1_part_bytes`
