@@ -375,8 +375,7 @@ pub const MAX_PROBE_LIST_PAGES: usize = 8;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeObject {
     /// The key of one object the grant admits and which holds at least one
-    /// byte: the location's own object, whatever its suffix, or a listed
-    /// object whose key ends in `.parquet`.
+    /// byte, whatever its suffix.
     Found(String),
     /// The listing ran to its end without one.
     Empty,
@@ -405,13 +404,16 @@ fn is_probeable(grant: &Grant, key: &str, size: u64) -> bool {
 /// A location that does not name a directory may name one object, so its key
 /// is checked with a HEAD first: `object_store` appends `/` to every
 /// non-empty list prefix, so listing `data/x.parquet` never returns
-/// `data/x.parquet` itself. That object is accepted whatever its suffix, as
-/// ADR-2040 reads a single-object location whatever its suffix. When it is
-/// absent or fails the checks above, the location is listed as a prefix,
-/// which is what finds the files under a zero-byte directory blob; a listed
-/// object must also end in `.parquet`. The listing prefix always carries a
-/// trailing `/` (none for the whole bucket), whatever the store does with a
-/// prefix that lacks one.
+/// `data/x.parquet` itself. When it is absent or fails the checks above, the
+/// location is listed as a prefix, which is what finds the files under a
+/// zero-byte directory blob. The listing prefix always carries a trailing `/`
+/// (none for the whole bucket), whatever the store does with a prefix that
+/// lacks one.
+///
+/// No suffix is required, of the location's own object or of a listed one:
+/// the probe only needs one non-empty object a ranged read can hit, and
+/// ADR-2040 reads a single-object location whatever its suffix, so a
+/// location holding only such objects must still qualify.
 pub async fn one_object_under(
     store: &dyn ObjectStoreBackend,
     grant: &Grant,
@@ -435,9 +437,11 @@ pub async fn one_object_under(
     let mut page: Option<PageToken> = None;
     for _ in 0..MAX_PROBE_LIST_PAGES {
         let listed = store.list(&list_prefix, page).await?;
-        if let Some(meta) = listed.objects.iter().find(|meta| {
-            meta.key.ends_with(".parquet") && is_probeable(grant, &meta.key, meta.size)
-        }) {
+        if let Some(meta) = listed
+            .objects
+            .iter()
+            .find(|meta| is_probeable(grant, &meta.key, meta.size))
+        {
             return Ok(ProbeObject::Found(meta.key.clone()));
         }
         match listed.next {
@@ -1239,17 +1243,21 @@ mod tests {
         }
     }
 
+    /// A directory holding only suffix-less objects (single-object tables,
+    /// which ADR-2040 reads whatever their suffix) still has an object to
+    /// probe.
     #[tokio::test]
-    async fn a_non_parquet_key_is_not_offered() {
+    async fn a_listed_object_is_offered_whatever_its_suffix() {
         let store = MemoryStore::new();
-        put_sized(&store, "data/t1/_SUCCESS", b"ok").await;
-        put_sized(&store, "data/t1/notes.parquet.crc", b"ok").await;
-        assert_eq!(probe(&store, "s3://b/data/t1/").await, ProbeObject::Empty);
-        put_sized(&store, "data/t1/z.parquet", b"PAR1").await;
-        assert_eq!(
-            probe(&store, "s3://b/data/t1/").await,
-            ProbeObject::Found("data/t1/z.parquet".to_string())
-        );
+        put_sized(&store, "exports/", b"").await;
+        put_sized(&store, "exports/2026-09", b"PAR1").await;
+        for url in ["s3://b/exports/", "s3://b/exports"] {
+            assert_eq!(
+                probe(&store, url).await,
+                ProbeObject::Found("exports/2026-09".to_string()),
+                "{url}"
+            );
+        }
     }
 
     #[tokio::test]
