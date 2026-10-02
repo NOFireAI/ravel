@@ -52,6 +52,12 @@
       ]
     },
     {
+      "Sid": "GatewayAdmissionDelete",
+      "Effect": "Allow",
+      "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::my-ravel-bucket/t/????????????????????????????????/?/admission/*"
+    },
+    {
       "Sid": "GatewayTenantKms",
       "Effect": "Allow",
       "Action": ["kms:Encrypt", "kms:GenerateDataKey*", "kms:Decrypt"],
@@ -70,7 +76,8 @@
         "arn:aws:s3:::my-ravel-bucket/t/*/u/*/0000/*",
         "arn:aws:s3:::my-ravel-bucket/sys/auth",
         "arn:aws:s3:::my-ravel-bucket/sys/t/*",
-        "arn:aws:s3:::my-ravel-bucket/t/*/enc"
+        "arn:aws:s3:::my-ravel-bucket/t/*/enc",
+        "arn:aws:s3:::my-ravel-bucket/t/*/pq/grants"
       ]
     }
   ]

@@ -441,7 +441,10 @@ escape in the design fails to bound it:
   ADR-0055 §1's role table gives it `Delete: none` and
   `deploy/iam/gateway.json` carries no `s3:DeleteObject` Allow. Every reap
   delete therefore returns AccessDenied and is logged rather than reaped.
-  That grant gap is reported separately; it is not fixed here.
+  That grant gap is reported separately; it is not fixed here. (ADR-0055's
+  2026-10-02 amendment has since added `GatewayAdmissionDelete` to
+  `gateway.json`, so on the shipped templates the reap now succeeds and this
+  bound applies.)
 
 The tenant map is in-memory, so `T` resets on restart. The degraded state is
 therefore a sawtooth across process lifetimes rather than a permanent

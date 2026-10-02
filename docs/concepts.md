@@ -249,8 +249,9 @@ is [Snapshot isolation](consistency-model.md#snapshot-isolation).
 Three background loops reshape the bucket, and only a `maintain` mode
 process runs them. `all` mode runs ingest, query, the catalog fold, and
 alert evaluation in one process; it does not compact, expire, or sweep
-anything. A deployment with no `maintain` process therefore never deletes an
-object, and its L0 segments accumulate unmerged. The quickstart stack runs
+anything. A deployment with no `maintain` process therefore deletes no
+durable data (its one delete is the reap of dead ingest processes' admission
+snapshots), and its L0 segments accumulate unmerged. The quickstart stack runs
 `all` mode alone, which is fine for an evaluation. Maintenance supervisors
 derive the tenant set from storage by listing tenant prefixes, not from a
 flag, so no configuration can silently exclude a tenant from retention; a
