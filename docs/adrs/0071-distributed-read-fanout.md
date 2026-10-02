@@ -422,6 +422,32 @@ a MAC-authenticated claim set naming exactly what it authorizes.
   durable state: object storage remains the only durable backend and is
   untouched. Expiry reuses the deadline the protocol already enforces
   cluster-wide, so no new clock-synchronization assumption is introduced.
+- Expiry bounds the read, not only the admission (issue #2385). The
+  worker checks expiry again once the request is admitted, since a
+  capability can expire while it queues, and refuses it `expired` before
+  any store request. An admitted slice then runs only until the expiry on
+  the same clock: reaching it drops the run, so the slice issues no store
+  request once the timer fires (which, like the engine's own deadline, can
+  be up to the timer's resolution late). An expired capability, on arrival
+  or after admission, and a slice stopped at the expiry both end in-band
+  with the fetch status `TIMEOUT`, not a gRPC error; a stopped slice's
+  summary carries the accounting it spent before the stop, and a refusal
+  carries zero. The coordinator treats `TIMEOUT` as terminal for the
+  query: it does not quarantine the worker, re-dispatch the slice, or run
+  it locally, since every other attempt would run past the same deadline.
+  It folds the attempt's spend into the query's accounting and fails the
+  query with `DeadlineExceeded`, the error the engine's own timer raises.
+- A federated Resolve request carries no capability, so it carries the
+  query's deadline in `deadline_unix_ns` (issue #2385), and the peer
+  cluster applies the same three bounds: a request past the deadline is
+  refused on arrival and again after admission, and an admitted run stops
+  at it, each ending in-band with `TIMEOUT`. The requesting coordinator
+  fails the query with `DeadlineExceeded` on a `TIMEOUT` whatever the
+  remote's `skip_unavailable` says. The peer compares the coordinator's
+  deadline against its own wall clock: the same skew shape a Flight SQL
+  slice ticket's `deadline_ns` has when a worker redeems it (ADR-1689),
+  here across a cluster boundary. A request with no deadline (`0`, from a
+  coordinator that predates this) runs unbounded on the peer, as before.
 - Rejects are typed and counted (`ravel_distrib_*` gains a
   capability-reject counter with a closed reason label: missing, bad MAC,
   expired, tenant mismatch, query mismatch).

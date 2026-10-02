@@ -730,6 +730,10 @@ pub struct SeriesFetchService<R: SegmentResolver + 'static> {
     /// [`with_local_attempt`](Self::with_local_attempt). It changes exactly one
     /// status: see that builder.
     local_attempt: bool,
+    /// The handle a slice's fetches are charged to, wired via
+    /// [`with_slice_accounting`](Self::with_slice_accounting). `None` (the
+    /// default) charges each slice to a fresh handle of its own.
+    slice_accounting: Option<QueryAccounting>,
 }
 
 impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
@@ -743,7 +747,25 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             resolve_scope: false,
             record_get_observer: None,
             local_attempt: false,
+            slice_accounting: None,
         }
+    }
+
+    /// Charges the slice this service runs to `accounting` instead of a fresh
+    /// handle, so the caller can read what the slice spent even when it drops
+    /// the run before the slice builds its summary (a worker stopping a slice
+    /// at its capability's expiry, see [`expired_slice_summary`]). A service
+    /// wired this way must run one slice only: a second would be charged to
+    /// the same handle.
+    #[must_use]
+    pub fn with_slice_accounting(mut self, accounting: QueryAccounting) -> Self {
+        self.slice_accounting = Some(accounting);
+        self
+    }
+
+    /// The handle this slice's fetches are charged to.
+    fn slice_accounting(&self) -> QueryAccounting {
+        self.slice_accounting.clone().unwrap_or_default()
     }
 
     /// Marks this service as running the coordinator's own slice in process,
@@ -1116,9 +1138,9 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         };
 
         let segments = self.resolve_pinned(&identities).await?;
-        // One fresh accounting handle per slice: the coordinator folds the
-        // returned snapshot into the query's aggregate (ADR-0071).
-        let accounting = QueryAccounting::new();
+        // One accounting handle per slice: the coordinator folds the returned
+        // snapshot into the query's aggregate (ADR-0071).
+        let accounting = self.slice_accounting();
 
         // Per-slice bytes-scanned budget, enforced per completed segment
         // exactly as the local path does (ADR-0061 decision 1).
@@ -1373,7 +1395,7 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         };
 
         let segments = self.resolve_pinned(&identities).await?;
-        let accounting = QueryAccounting::new();
+        let accounting = self.slice_accounting();
 
         let byte_limit = slice_byte_limit(budgets.as_ref(), self.engine.max_bytes_scanned);
 
@@ -1501,7 +1523,7 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         };
 
         let segments = self.resolve_pinned(&identities).await?;
-        let accounting = QueryAccounting::new();
+        let accounting = self.slice_accounting();
 
         let byte_limit = slice_byte_limit(budgets.as_ref(), self.engine.max_bytes_scanned);
 
@@ -1628,6 +1650,28 @@ pub(super) fn slice_byte_limit(budgets: Option<&pb::Budgets>, worker: ByteLimit)
         ByteLimit::Bounded(own) => ByteLimit::Bounded(wire.min(own)),
         ByteLimit::Unlimited => ByteLimit::Bounded(wire),
     }
+}
+
+/// The terminal summary of a slice the worker stopped at the query's deadline:
+/// status `TIMEOUT`, no results, and the accounting `spent` before the stop
+/// (issue #1723). A slice refused before it started passes a zero snapshot.
+/// The coordinator treats `TIMEOUT` as terminal for the query, never as a
+/// worker to route around.
+///
+/// The `FetchStats` page counters read zero: they accumulate inside the run
+/// the worker dropped, and nothing reports them for a query that fails.
+pub fn expired_slice_summary(
+    spent: &QueryAccountingSnapshot,
+    message: String,
+) -> pb::FetchResponse {
+    summary_frame(
+        spent,
+        0,
+        0,
+        pb::status::Code::Timeout,
+        message,
+        &FetchStats::default(),
+    )
 }
 
 fn summary_frame(

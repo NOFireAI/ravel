@@ -776,10 +776,10 @@ impl QueryEngine {
         now_ns: i64,
         deadline: Duration,
     ) -> Result<(Value, Annotations, QueryStats), QueryError> {
-        let eval_deadline = Instant::now() + deadline;
+        let query_deadline = QueryDeadline::from_entry(now_ns, deadline);
         let outcome = tokio::time::timeout(
             deadline,
-            self.instant_inner(tenant_hash, query, t_ms, min_tokens, now_ns, eval_deadline),
+            self.instant_inner(tenant_hash, query, t_ms, min_tokens, now_ns, query_deadline),
         )
         .await;
         unify_deadline(outcome, deadline)
@@ -838,7 +838,7 @@ impl QueryEngine {
         t_ms: i64,
         min_tokens: &[CommitToken],
         now_ns: i64,
-        eval_deadline: Instant,
+        query_deadline: QueryDeadline,
     ) -> Result<(Value, Annotations, QueryStats), QueryError> {
         let t_ns = ms_to_ns(t_ms)?;
         let plans = plan_selectors(query, t_ms, t_ms)?;
@@ -850,12 +850,12 @@ impl QueryEngine {
                 &eval_window,
                 min_tokens,
                 now_ns,
-                eval_deadline,
+                query_deadline,
             )
             .await?;
         let evaluator = Evaluator::new()
             .with_default_step(self.config.default_evaluation_interval)?
-            .with_deadline(eval_deadline);
+            .with_deadline(query_deadline.instant);
         let span = tracing::debug_span!("evaluate", eval_kind = "instant");
         let (value, annotations) = self
             .evaluate(source, query, move |source, query| {
@@ -976,7 +976,7 @@ impl QueryEngine {
         now_ns: i64,
         deadline: Duration,
     ) -> Result<(RangeValue, Annotations, QueryStats), QueryError> {
-        let eval_deadline = Instant::now() + deadline;
+        let query_deadline = QueryDeadline::from_entry(now_ns, deadline);
         let outcome = tokio::time::timeout(
             deadline,
             self.range_inner(
@@ -987,7 +987,7 @@ impl QueryEngine {
                 step_ms,
                 min_tokens,
                 now_ns,
-                eval_deadline,
+                query_deadline,
             ),
         )
         .await;
@@ -1052,7 +1052,7 @@ impl QueryEngine {
         step_ms: i64,
         min_tokens: &[CommitToken],
         now_ns: i64,
-        eval_deadline: Instant,
+        query_deadline: QueryDeadline,
     ) -> Result<(RangeValue, Annotations, QueryStats), QueryError> {
         if step_ms <= 0 {
             return Err(QueryError::NonPositiveStep { step_ms });
@@ -1076,12 +1076,12 @@ impl QueryEngine {
                 &eval_window,
                 min_tokens,
                 now_ns,
-                eval_deadline,
+                query_deadline,
             )
             .await?;
         let evaluator = Evaluator::new()
             .with_default_step(self.config.default_evaluation_interval)?
-            .with_deadline(eval_deadline);
+            .with_deadline(query_deadline.instant);
         let span = tracing::debug_span!("evaluate", eval_kind = "range");
         let (value, annotations) = self
             .evaluate(source, query, move |source, query| {
@@ -1127,12 +1127,20 @@ impl QueryEngine {
         now_ns: i64,
         deadline: Duration,
     ) -> Result<(Vec<(SeriesId, LabelSet)>, QueryStats), QueryError> {
-        tokio::time::timeout(
+        let deadline_unix_ns = QueryDeadline::from_entry(now_ns, deadline).unix_ns;
+        let outcome = tokio::time::timeout(
             deadline,
-            self.resolve_series_inner(tenant_hash, matchers, window, min_tokens, now_ns),
+            self.resolve_series_inner(
+                tenant_hash,
+                matchers,
+                window,
+                min_tokens,
+                now_ns,
+                deadline_unix_ns,
+            ),
         )
-        .await
-        .map_err(|_| QueryError::DeadlineExceeded { deadline })?
+        .await;
+        unify_deadline(outcome, deadline)
     }
 
     /// [`Self::resolve_series_with_stats`] under one request's
@@ -1184,6 +1192,7 @@ impl QueryEngine {
         window: TimeRange,
         min_tokens: &[CommitToken],
         now_ns: i64,
+        deadline_unix_ns: i64,
     ) -> Result<(Vec<(SeriesId, LabelSet)>, QueryStats), QueryError> {
         if let Some(metric) = log_series::log_metric_of(matchers) {
             return self
@@ -1237,6 +1246,7 @@ impl QueryEngine {
                     window,
                     &accounting,
                     fold_lag,
+                    deadline_unix_ns,
                 )
                 .await?;
             // Union local + remote identities and enforce `max_series` ONCE
@@ -1403,6 +1413,7 @@ impl QueryEngine {
         window: TimeRange,
         accounting: &PhaseAccounting,
         fold_lag: FoldLag,
+        deadline_unix_ns: i64,
     ) -> Result<(Vec<(SeriesId, LabelSet)>, Vec<String>, bool), QueryError> {
         let mut series: Vec<(SeriesId, LabelSet)> = Vec::new();
         let Some(federation) = &self.federation else {
@@ -1427,6 +1438,7 @@ impl QueryEngine {
                 Vec::new(),
                 accounting.scan().clone(),
                 self.config,
+                deadline_unix_ns,
             )
             .await?;
         // Re-enforce the coordinator's bytes-scanned budget over the combined
@@ -1475,7 +1487,7 @@ impl QueryEngine {
         eval_window: &EvalWindow,
         min_tokens: &[CommitToken],
         now_ns: i64,
-        eval_deadline: Instant,
+        query_deadline: QueryDeadline,
     ) -> Result<(MergedSource, QueryStats), QueryError> {
         if plans.is_empty() {
             return Ok((
@@ -1501,7 +1513,14 @@ impl QueryEngine {
             .collect();
 
         let (mut source, mut stats) = self
-            .prefetch_metric_plans(tenant_hash, &metric_plans, eval_window, min_tokens, now_ns)
+            .prefetch_metric_plans(
+                tenant_hash,
+                &metric_plans,
+                eval_window,
+                min_tokens,
+                now_ns,
+                query_deadline.unix_ns,
+            )
             .await?;
 
         if log_plans.is_empty() {
@@ -1658,7 +1677,7 @@ impl QueryEngine {
                 // the duration: a log fetch started late in the query must
                 // stop where the query does (ADR-1133, clock-reading
                 // amendment).
-                deadline: Some(eval_deadline),
+                deadline: Some(query_deadline.instant),
             };
             let out = log_series::fetch_log_series(
                 &self.log_fetcher,
@@ -1829,7 +1848,9 @@ impl QueryEngine {
     /// or matchers differ. An empty plan list (no metrics selector in the
     /// query -- a bare scalar/string literal, or a query naming only log
     /// metrics) skips storage entirely and issues zero `Signal::Metrics`
-    /// resolves.
+    /// resolves. `deadline_unix_ns` is the query's [`QueryDeadline::unix_ns`],
+    /// threaded to the distributed fan-out as every fragment capability's
+    /// expiry; the local path does not read it.
     async fn prefetch_metric_plans(
         &self,
         tenant_hash: TenantHash,
@@ -1837,6 +1858,7 @@ impl QueryEngine {
         eval_window: &EvalWindow,
         min_tokens: &[CommitToken],
         now_ns: i64,
+        deadline_unix_ns: i64,
     ) -> Result<(MergedSource, QueryStats), QueryError> {
         if plans.is_empty() {
             return Ok((
@@ -1866,14 +1888,6 @@ impl QueryEngine {
         let max_bytes_scanned = self.config.max_bytes_scanned;
         let max_s3_requests = self.config.max_s3_requests;
         let concurrency = self.config.promql_fetch_fanout().max(1);
-        // The query's absolute deadline in unix nanoseconds, from the injected
-        // `now_ns` and the configured engine deadline. Threaded into the
-        // distributed fan-out (ADR-0071 amendment, decision 2) so the coordinator
-        // mints each fragment capability with this exact expiry: expiry reuses
-        // the deadline the query already enforces, adding no new clock
-        // assumption. Unused by the local path.
-        let deadline_unix_ns = now_ns
-            .saturating_add(i64::try_from(self.config.deadline.as_nanos()).unwrap_or(i64::MAX));
         // One independent fetch per selector against the same snapshot
         // (below): an N-selector query re-opens every snapshot segment up to
         // N times in the worst case (no shared matcher set), so the
@@ -2103,7 +2117,13 @@ impl QueryEngine {
             // phase breakdown of its own), but its budget re-check needs
             // `pooled()` to see the local resolve/plan/probe spend too.
             let (fed_runs, fed_hist_runs, fed_stats, fed_warnings, fed_partial) = self
-                .federate_scalar(tenant_hash, fed_plans, &accounting, fold_lag)
+                .federate_scalar(
+                    tenant_hash,
+                    fed_plans,
+                    &accounting,
+                    fold_lag,
+                    deadline_unix_ns,
+                )
                 .await?;
             all_scalar_runs.extend(fed_runs);
             // Merge every remote's native-histogram runs into the same
@@ -2807,6 +2827,7 @@ impl QueryEngine {
         plan_matchers_windows: Vec<(Vec<LabelMatcher>, i64, i64)>,
         accounting: &PhaseAccounting,
         fold_lag: FoldLag,
+        deadline_unix_ns: i64,
     ) -> Result<
         (
             Vec<Vec<FetchedSeriesSoa>>,
@@ -2849,6 +2870,7 @@ impl QueryEngine {
                     Vec::new(),
                     accounting.scan().clone(),
                     self.config,
+                    deadline_unix_ns,
                 )
                 .await?;
             // Re-enforce the coordinator's bytes-scanned budget over the
@@ -3268,6 +3290,29 @@ fn range_value_into_value(value: RangeValue) -> Value {
                 })
                 .collect(),
         ),
+    }
+}
+
+/// One query's deadline on both clocks it is read on, fixed once at request
+/// entry from that request's own deadline (which a caller may have lowered
+/// below [`EngineConfig::deadline`]).
+#[derive(Debug, Clone, Copy)]
+struct QueryDeadline {
+    /// Monotonic: the engine timeout, the evaluator, and the log fetch.
+    instant: Instant,
+    /// Wall clock, unix nanoseconds: the request's entry `now_ns` plus its
+    /// deadline. The coordinator mints every fragment capability with this
+    /// as its expiry (ADR-0071 amendment, decision 2), so a worker stops
+    /// reading for the query when the query itself stops.
+    unix_ns: i64,
+}
+
+impl QueryDeadline {
+    fn from_entry(now_ns: i64, deadline: Duration) -> Self {
+        QueryDeadline {
+            instant: Instant::now() + deadline,
+            unix_ns: now_ns.saturating_add(i64::try_from(deadline.as_nanos()).unwrap_or(i64::MAX)),
+        }
     }
 }
 
@@ -6847,9 +6892,9 @@ mod prefetch_tests {
     // test window can never drift from what the evaluator selects.
     const DEFAULT_LOOKBACK_NS: i64 = ravel_promql::DEFAULT_LOOKBACK_NS;
 
-    /// An `eval_deadline` no prefetch test reaches.
-    fn far_deadline() -> Instant {
-        Instant::now() + Duration::from_secs(3600)
+    /// A query deadline no prefetch test reaches.
+    fn far_deadline() -> QueryDeadline {
+        QueryDeadline::from_entry(BASE_NS, Duration::from_secs(3600))
     }
 
     fn labels(metric: &str) -> LabelSet {
@@ -7075,6 +7120,306 @@ mod prefetch_tests {
                 status_message: "vanished".to_string(),
             })
         }
+    }
+
+    /// A slice fetcher double that records each dispatched request's
+    /// `deadline_unix_ns` and answers with an empty slice.
+    struct RecordingDeadline {
+        deadlines: Arc<std::sync::Mutex<Vec<i64>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::distrib::client::SliceFetcher for RecordingDeadline {
+        async fn fetch(
+            &self,
+            request: ravel_proto::queryfrag::v1::FetchRequest,
+        ) -> Result<crate::distrib::client::SliceResponse, crate::distrib::client::DistribError>
+        {
+            self.deadlines
+                .lock()
+                .expect("deadlines lock")
+                .push(request.deadline_unix_ns);
+            Ok(crate::distrib::client::SliceResponse {
+                scalar: Vec::new(),
+                histogram: Vec::new(),
+                partials: Vec::new(),
+                accounting: ravel_types::accounting::QueryAccountingSnapshot::default(),
+                stats: crate::fetcher::FetchStats::default(),
+                series_returned: 0,
+                samples_returned: 0,
+                status: ravel_proto::queryfrag::v1::status::Code::Ok,
+                status_message: String::new(),
+            })
+        }
+    }
+
+    /// The deadline every distributed slice carries, and so every fragment
+    /// capability's expiry, is request entry plus the request's own deadline
+    /// when that is below the engine's configured deadline, for both the
+    /// instant and the range entry points.
+    #[tokio::test]
+    async fn distributed_slices_carry_the_request_deadline_not_the_engine_ceiling() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        publish_metric(
+            &store,
+            tenant_hash,
+            1,
+            "metric_a",
+            BASE_NS - NS_PER_MIN,
+            1.0,
+        )
+        .await;
+        let deadlines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let distributed = Arc::new(crate::distrib::Distributed::new(
+            Arc::new(RecordingDeadline {
+                deadlines: Arc::clone(&deadlines),
+            }),
+            crate::distrib::partition::DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 1,
+            },
+        ));
+        let eng = engine_with_config(
+            Arc::clone(&store),
+            EngineConfig {
+                deadline: Duration::from_secs(60),
+                ..EngineConfig::default()
+            },
+        )
+        .with_distributed(distributed);
+        let request_deadline = Duration::from_secs(5);
+
+        eng.instant_with_stats(
+            tenant_hash,
+            "metric_a",
+            BASE_MS,
+            &[],
+            BASE_NS,
+            request_deadline,
+        )
+        .await
+        .expect("instant");
+        eng.range_with_stats(
+            tenant_hash,
+            "metric_a",
+            BASE_MS - 60_000,
+            BASE_MS,
+            15_000,
+            &[],
+            BASE_NS,
+            request_deadline,
+        )
+        .await
+        .expect("range");
+
+        assert_eq!(
+            *deadlines.lock().expect("deadlines lock"),
+            vec![BASE_NS + 5 * NS_PER_SEC, BASE_NS + 5 * NS_PER_SEC],
+            "one slice per query, each carrying entry plus the 5 s request deadline"
+        );
+    }
+
+    /// Issue #2385: every federated Resolve request carries the query's own
+    /// deadline, entry plus the request deadline, on the instant, range, and
+    /// series-discovery paths, so a remote cluster stops reading for the query
+    /// when the query stops.
+    ///
+    /// Mutation proof: putting `deadline_unix_ns: 0` back on the Resolve request
+    /// in `Federation::fetch` records three zeros.
+    #[tokio::test]
+    async fn federated_requests_carry_the_request_deadline() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        publish_metric(
+            &store,
+            tenant_hash,
+            1,
+            "metric_a",
+            BASE_NS - NS_PER_MIN,
+            1.0,
+        )
+        .await;
+        let deadlines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let federation = Arc::new(crate::distrib::Federation::new(vec![
+            crate::distrib::RemoteCluster {
+                name: "eu-west".to_string(),
+                fetcher: Arc::new(RecordingDeadline {
+                    deadlines: Arc::clone(&deadlines),
+                }),
+                tenant: None,
+                skip_unavailable: false,
+                soft_timeout: Duration::from_secs(60),
+            },
+        ]));
+        let eng = engine_with_config(
+            Arc::clone(&store),
+            EngineConfig {
+                deadline: Duration::from_secs(60),
+                ..EngineConfig::default()
+            },
+        )
+        .with_federation(federation);
+        let request_deadline = Duration::from_secs(5);
+
+        eng.instant_with_stats(
+            tenant_hash,
+            "metric_a",
+            BASE_MS,
+            &[],
+            BASE_NS,
+            request_deadline,
+        )
+        .await
+        .expect("instant");
+        eng.range_with_stats(
+            tenant_hash,
+            "metric_a",
+            BASE_MS - 60_000,
+            BASE_MS,
+            15_000,
+            &[],
+            BASE_NS,
+            request_deadline,
+        )
+        .await
+        .expect("range");
+        let _discovered = eng
+            .resolve_series(
+                tenant_hash,
+                &[name_matcher("metric_a")],
+                TimeRange {
+                    start_ns: BASE_NS - 60 * NS_PER_MIN,
+                    end_ns: BASE_NS,
+                },
+                &[],
+                BASE_NS,
+                request_deadline,
+            )
+            .await
+            .expect("series");
+
+        assert_eq!(
+            *deadlines.lock().expect("deadlines lock"),
+            vec![BASE_NS + 5 * NS_PER_SEC; 3],
+            "one Resolve request per query, each carrying entry plus the 5 s request deadline"
+        );
+    }
+
+    /// A slice fetcher double whose every slice ended `TIMEOUT`: a worker or a
+    /// remote cluster stopped it at the query's deadline after spending
+    /// `spend_bytes`.
+    struct StoppedAtDeadline {
+        spend_bytes: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::distrib::client::SliceFetcher for StoppedAtDeadline {
+        async fn fetch(
+            &self,
+            _request: ravel_proto::queryfrag::v1::FetchRequest,
+        ) -> Result<crate::distrib::client::SliceResponse, crate::distrib::client::DistribError>
+        {
+            let spent = QueryAccounting::new();
+            spent.record_s3_request(ravel_types::accounting::AccountedOp::Get);
+            spent.add_s3_bytes(ravel_types::accounting::AccountedOp::Get, self.spend_bytes);
+            Ok(crate::distrib::client::SliceResponse {
+                scalar: Vec::new(),
+                histogram: Vec::new(),
+                partials: Vec::new(),
+                accounting: spent.snapshot(),
+                stats: crate::fetcher::FetchStats::default(),
+                series_returned: 0,
+                samples_returned: 0,
+                status: ravel_proto::queryfrag::v1::status::Code::Timeout,
+                status_message: "stopped at the deadline".to_string(),
+            })
+        }
+    }
+
+    /// Issue #2385: a slice stopped at the query's deadline fails the query
+    /// with `DeadlineExceeded` carrying the request's own deadline, the error
+    /// the engine's own timer raises, on the distributed instant path and the
+    /// federated discovery path.
+    ///
+    /// Mutation proof: deleting the `Timeout` arm from `Distributed::fetch`
+    /// (`distrib/mod.rs`) fails the instant query with `Distrib`; deleting it
+    /// from `Federation::fetch` fails discovery with `Federation`; putting
+    /// discovery's `map_err` back in `resolve_series_with_stats` in place of
+    /// `unify_deadline` reports a zero deadline.
+    #[tokio::test]
+    async fn a_slice_stopped_at_the_deadline_fails_the_query_with_its_deadline() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        publish_metric(
+            &store,
+            tenant_hash,
+            1,
+            "metric_a",
+            BASE_NS - NS_PER_MIN,
+            1.0,
+        )
+        .await;
+        let request_deadline = Duration::from_secs(5);
+
+        let distributed = Arc::new(crate::distrib::Distributed::new(
+            Arc::new(StoppedAtDeadline { spend_bytes: 4_096 }),
+            crate::distrib::partition::DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 1,
+            },
+        ));
+        let eng = engine_with_config(Arc::clone(&store), EngineConfig::default())
+            .with_distributed(distributed);
+        let err = eng
+            .instant_with_stats(
+                tenant_hash,
+                "metric_a",
+                BASE_MS,
+                &[],
+                BASE_NS,
+                request_deadline,
+            )
+            .await
+            .expect_err("a slice stopped at the deadline fails the query");
+        assert!(
+            matches!(err, QueryError::DeadlineExceeded { deadline } if deadline == request_deadline),
+            "distributed: {err:?}"
+        );
+
+        let federation = Arc::new(crate::distrib::Federation::new(vec![
+            crate::distrib::RemoteCluster {
+                name: "eu-west".to_string(),
+                fetcher: Arc::new(StoppedAtDeadline { spend_bytes: 4_096 }),
+                tenant: None,
+                // A remote that stopped at the deadline is not an unavailable
+                // remote to skip: the query is over either way.
+                skip_unavailable: true,
+                soft_timeout: Duration::from_secs(60),
+            },
+        ]));
+        let eng = engine_with_config(Arc::clone(&store), EngineConfig::default())
+            .with_federation(federation);
+        let err = eng
+            .resolve_series(
+                tenant_hash,
+                &[name_matcher("metric_a")],
+                TimeRange {
+                    start_ns: BASE_NS - 60 * NS_PER_MIN,
+                    end_ns: BASE_NS,
+                },
+                &[],
+                BASE_NS,
+                request_deadline,
+            )
+            .await
+            .expect_err("a remote stopped at the deadline fails discovery");
+        assert!(
+            matches!(err, QueryError::DeadlineExceeded { deadline } if deadline == request_deadline),
+            "federated discovery: {err:?}"
+        );
     }
 
     /// ADR-0071 failure semantics: a slice reporting `SNAPSHOT_INVALIDATED`
@@ -10110,7 +10455,10 @@ mod log_prefetch_deadline_tests {
                 },
                 &[],
                 NOW_NS,
-                eval_deadline,
+                QueryDeadline {
+                    instant: eval_deadline,
+                    unix_ns: i64::MAX,
+                },
             )
             .await
     }
