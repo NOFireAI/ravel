@@ -1130,6 +1130,52 @@ async fn run_refuses_a_zero_jwks_refresh_interval_before_spawning_anything() {
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn run_refuses_a_zero_round_robin_idle_ttl_before_spawning_anything() {
+    let mut config = oidc_config_with_refresh_interval(std::time::Duration::from_secs(60));
+    config.key = crate::config::KeyConfig::Header(HeaderName::from_static("x-tenant"));
+    config.round_robin_idle_ttl = std::time::Duration::ZERO;
+    let err = crate::run(config)
+        .await
+        .expect_err("a zero round-robin idle TTL must fail startup");
+    assert_eq!(
+        err.downcast_ref::<crate::RoundRobinSweepSpawnError>(),
+        Some(&crate::RoundRobinSweepSpawnError::ZeroIdleTtl),
+        "startup must fail with the typed error, got: {err:#}"
+    );
+    assert!(
+        err.to_string().contains("--round-robin-idle-ttl"),
+        "the error must name the flag that sets the TTL, got: {err}"
+    );
+    assert_eq!(
+        tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks(),
+        0,
+        "no watcher, refresh, or sweep task may be spawned"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_round_robin_sweep_refuses_a_zero_interval() {
+    let store = Arc::new(EndpointStore::new(None));
+    let state = state(
+        store,
+        KeyResolver::Header(HeaderName::from_static("x-tenant")),
+        2,
+    );
+    let err = crate::spawn_round_robin_sweep(state, std::time::Duration::ZERO)
+        .expect_err("a zero sweep interval must be refused");
+    assert_eq!(err, crate::RoundRobinSweepSpawnError::ZeroIdleTtl);
+    assert_eq!(
+        tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks(),
+        0,
+        "nothing may be spawned for a refused interval"
+    );
+}
+
 // Deliverable 2: a panic inside the round-robin sweep is caught and logged
 // (`tracing::error!`) instead of silently terminating the sweep task. The sweep
 // is memory-bound only, so it is not raced in the fatal `select!`; instead

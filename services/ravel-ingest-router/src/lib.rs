@@ -65,6 +65,26 @@ use crate::config::{KeyConfig, RouterConfig};
 
 pub use crate::auth::JwksRefreshSpawnError;
 
+/// Why the round-robin idle-eviction sweep refused to start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RoundRobinSweepSpawnError {
+    /// A zero round-robin idle-entry TTL, which is also the sweep period.
+    #[error(
+        "the round-robin idle TTL must be non-zero (--round-robin-idle-ttl, \
+         RouterConfig::round_robin_idle_ttl): a zero TTL cannot drive the idle-eviction sweep timer"
+    )]
+    ZeroIdleTtl,
+}
+
+/// [`tokio::time::interval`] panics on a zero period, so the sweep refuses one
+/// before anything is spawned.
+fn check_sweep_interval(interval: std::time::Duration) -> Result<(), RoundRobinSweepSpawnError> {
+    if interval.is_zero() {
+        return Err(RoundRobinSweepSpawnError::ZeroIdleTtl);
+    }
+    Ok(())
+}
+
 /// Wire the watcher, resolver, selector, and HTTP proxy into one running
 /// process and serve until the listener closes, or exit with an error if the
 /// EndpointSlice watcher task returns or panics (deliverable 6).
@@ -73,6 +93,7 @@ pub use crate::auth::JwksRefreshSpawnError;
 /// same boundary a unit test drives directly, so "reachable" here means the real
 /// binary and the tests exercise one code path, not two.
 pub async fn run(config: RouterConfig) -> anyhow::Result<()> {
+    check_sweep_interval(config.round_robin_idle_ttl)?;
     let idle_ttl_ns = i64::try_from(config.round_robin_idle_ttl.as_nanos()).unwrap_or(i64::MAX);
 
     // Resolver wiring is built only for the canonical-tenant key source, and
@@ -139,7 +160,7 @@ pub async fn run(config: RouterConfig) -> anyhow::Result<()> {
 
     // Bound the round-robin map over time: sweep entries idle past the TTL on
     // that same interval (the idle-eviction shape of ADR-0069).
-    spawn_round_robin_sweep(state.clone(), config.round_robin_idle_ttl);
+    spawn_round_robin_sweep(state.clone(), config.round_robin_idle_ttl)?;
 
     let listener = tokio::net::TcpListener::bind(config.listen_http).await?;
     tracing::info!(addr = %config.listen_http, "ravel-ingest-router listening");
@@ -237,8 +258,15 @@ async fn serve_optional_grpc(
 /// Instead each sweep runs under [`run_sweep_guarded`], which catches a panic in
 /// `evict_idle` and logs it loudly so the loop keeps running and the failure is
 /// visible in logs rather than silently terminating the task.
-fn spawn_round_robin_sweep(state: Arc<router::RouterState>, interval: std::time::Duration) {
-    tokio::spawn(async move {
+///
+/// A zero `interval` returns [`RoundRobinSweepSpawnError::ZeroIdleTtl`] and
+/// spawns nothing.
+fn spawn_round_robin_sweep(
+    state: Arc<router::RouterState>,
+    interval: std::time::Duration,
+) -> Result<tokio::task::JoinHandle<()>, RoundRobinSweepSpawnError> {
+    check_sweep_interval(interval)?;
+    Ok(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.tick().await; // consume the immediate first tick
         loop {
@@ -246,7 +274,7 @@ fn spawn_round_robin_sweep(state: Arc<router::RouterState>, interval: std::time:
             let now_ns = state.clock.now_ns();
             run_sweep_guarded(|| state.round_robin.evict_idle(now_ns));
         }
-    });
+    }))
 }
 
 /// Run one round-robin sweep under a panic guard. `evict_idle` is synchronous
