@@ -129,6 +129,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use tokio::runtime::Handle;
+use tokio::sync::oneshot;
 
 use crate::clock::{Clock, SystemClock};
 use crate::key::CacheKey;
@@ -356,6 +357,18 @@ struct Inner {
     /// `limits.max_entry_age_ns` (ADR-0064). Injected so tests
     /// drive ageing deterministically instead of sleeping.
     clock: Arc<dyn Clock>,
+    /// A one-shot block armed by [`DiskCache::block_peek_for_test`], consumed
+    /// by the next `get`/`get_uncounted` of its key. `None` in production and
+    /// in every test that never arms it.
+    peek_gate: Mutex<Option<PeekGate>>,
+}
+
+/// One armed block for [`Inner::peek_gate`]: parks the matching lookup until
+/// released, after first signaling that it has parked.
+struct PeekGate {
+    key: CacheKey,
+    entered_tx: oneshot::Sender<()>,
+    release_rx: oneshot::Receiver<()>,
 }
 
 /// The disk tier of ADR-0046's read cache. See the [module docs](self) for
@@ -486,6 +499,7 @@ impl DiskCache {
             tmp_counter: AtomicU64::new(0),
             instance_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             clock,
+            peek_gate: Mutex::new(None),
         });
         let sweeper = spawn_sweeper(&inner, &handle);
         DiskCache { inner, sweeper }
@@ -583,6 +597,66 @@ impl DiskCache {
         {
             bytes[last] ^= 0xFF;
             let _ = fs::write(&path, &bytes);
+        }
+    }
+
+    /// Arms a one-shot block on the next `get`/`get_uncounted` lookup of
+    /// `key`: that lookup parks before touching disk, signals
+    /// [`DiskPeekGateForTest::entered`], and waits for
+    /// [`DiskPeekGateForTest::release`] before proceeding with its real read.
+    ///
+    /// Exists so a cross-crate test can construct the exact interleaving
+    /// `TieredCache::resolve_peeked_miss`'s leader RAM recheck exists for --
+    /// a late caller's disk peek still pending while a concurrent
+    /// single-flight leader finishes and leaves the map -- instead of
+    /// sampling it under real `spawn_blocking` scheduling (issue #2347).
+    /// Unconditionally `pub`, only doc-hidden, for the same cross-crate
+    /// reason as [`corrupt_entry_for_test`](Self::corrupt_entry_for_test)
+    /// above: `cfg(test)` is per-crate and does not reach another crate's
+    /// tests.
+    ///
+    /// Single-use: the first `get`/`get_uncounted` whose key matches
+    /// consumes the block; any other key, or a second lookup of the same
+    /// key, proceeds normally. Arming a second block before the first is
+    /// consumed replaces it.
+    #[doc(hidden)]
+    pub fn block_peek_for_test(&self, key: CacheKey) -> DiskPeekGateForTest {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        *self.inner.peek_gate.lock() = Some(PeekGate {
+            key,
+            entered_tx,
+            release_rx,
+        });
+        DiskPeekGateForTest {
+            entered_rx,
+            release_tx: Some(release_tx),
+        }
+    }
+}
+
+/// Returned by [`DiskCache::block_peek_for_test`]. Await
+/// [`entered`](Self::entered) to know the gated lookup has reached the gate
+/// and parked, then call [`release`](Self::release) to let it proceed with
+/// its real disk read.
+#[doc(hidden)]
+pub struct DiskPeekGateForTest {
+    entered_rx: oneshot::Receiver<()>,
+    release_tx: Option<oneshot::Sender<()>>,
+}
+
+impl DiskPeekGateForTest {
+    /// Resolves once the gated lookup has reached the gate and parked on it.
+    #[doc(hidden)]
+    pub async fn entered(&mut self) {
+        let _ = (&mut self.entered_rx).await;
+    }
+
+    /// Releases the parked lookup to proceed with its real disk read.
+    #[doc(hidden)]
+    pub fn release(mut self) {
+        if let Some(release_tx) = self.release_tx.take() {
+            let _ = release_tx.send(());
         }
     }
 }
@@ -717,6 +791,7 @@ impl Inner {
     /// Look up `key`, the shared-state half of [`DiskCache::get`]. Every
     /// failure returns `None`; there is no error variant.
     fn get(&self, key: &CacheKey) -> Option<Bytes> {
+        self.wait_for_peek_gate(key);
         let path = path_for(&self.dir, key);
         match self.read_and_verify(key, &path) {
             Some(bytes) => {
@@ -736,10 +811,31 @@ impl Inner {
 
     /// [`get`](Self::get) without the hit or miss record.
     fn get_uncounted(&self, key: &CacheKey) -> Option<Bytes> {
+        self.wait_for_peek_gate(key);
         let path = path_for(&self.dir, key);
         let bytes = self.read_and_verify(key, &path)?;
         self.state.lock().get(key);
         Some(bytes)
+    }
+
+    /// Consumes and parks on a [`PeekGate`] armed for `key` by
+    /// [`DiskCache::block_peek_for_test`], if one is currently armed for it.
+    /// Runs on the calling thread: `get`/`get_uncounted` only reach disk via
+    /// `spawn_blocking` (issue #1702), so blocking here never parks an async
+    /// runtime worker. A no-op in production, where nothing ever arms the
+    /// gate.
+    fn wait_for_peek_gate(&self, key: &CacheKey) {
+        let gate = {
+            let mut slot = self.peek_gate.lock();
+            match slot.as_ref() {
+                Some(gate) if &gate.key == key => slot.take(),
+                _ => None,
+            }
+        };
+        if let Some(gate) = gate {
+            let _ = gate.entered_tx.send(());
+            let _ = gate.release_rx.blocking_recv();
+        }
     }
 
     fn read_and_verify(&self, key: &CacheKey, path: &Path) -> Option<Bytes> {
@@ -2632,6 +2728,7 @@ mod tests {
             tmp_counter: AtomicU64::new(0),
             instance_id: 0,
             clock: TestClock::new(1),
+            peek_gate: Mutex::new(None),
         });
         let handle = spawn_sweeper(&inner, &Handle::current());
 
