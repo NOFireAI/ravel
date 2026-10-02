@@ -51,7 +51,7 @@ use ravel_object_store::external::probe::{
 };
 use ravel_object_store::{ObjectStoreBackend, PageToken, StoreError};
 use ravel_parquet::snapshot::{
-    GrantedLocation, LocationSnapshot, SnapshotError, snapshot_location,
+    GrantedLocation, LocationSnapshot, PARQUET_SUFFIX, SnapshotError, snapshot_location,
 };
 use ravel_pqtable::grants::{self, Grant, GrantsError, KeyPrefix};
 use ravel_pqtable::resolve;
@@ -326,10 +326,19 @@ impl DdlExecuteError {
                     | DdlErrorClass::Conflict
                     | DdlErrorClass::NotFound
                     | DdlErrorClass::Unsupported
-                    | DdlErrorClass::Timeout => format!(
-                        "the bucket behind {location:?} did not qualify as external: it is \
-                         Ravel's own bucket"
-                    ),
+                    | DdlErrorClass::Timeout => match source {
+                        RavelBucketProbeFailure::Inconclusive { .. } => format!(
+                            "the bucket behind {location:?} could not be shown to be separate \
+                             from Ravel's own data bucket: check that its grant's profile \
+                             reaches the account and endpoint it is configured for"
+                        ),
+                        RavelBucketProbeFailure::ProbeWriteFailed { .. }
+                        | RavelBucketProbeFailure::SameBucket { .. }
+                        | RavelBucketProbeFailure::TenancyMarkerPresent { .. } => format!(
+                            "the bucket behind {location:?} did not qualify as external: it is \
+                             Ravel's own bucket"
+                        ),
+                    },
                 }
             }
             DdlExecuteError::ExternalStore { source, .. } => match source {
@@ -419,8 +428,10 @@ fn precondition_probe_class(err: &PreconditionProbeFailure) -> DdlErrorClass {
 /// retryable (503) when the [`StoreError`] is, and otherwise a fault in
 /// Ravel's own storage rather than in the caller's statement (500).
 /// [`RavelBucketProbeFailure::Inconclusive`] (the candidate's read answered
-/// neither a hit nor a clean miss) is retryable (503).
-/// [`RavelBucketProbeFailure::SameBucket`] and
+/// neither a hit nor a clean miss) is 422: its usual cause is a profile that
+/// addresses a different account or endpoint than configured, which no retry
+/// clears, and the variant carries no typed error to tell a transient read
+/// failure apart. [`RavelBucketProbeFailure::SameBucket`] and
 /// [`RavelBucketProbeFailure::TenancyMarkerPresent`] are a qualification
 /// verdict: the probe proves the candidate is Ravel's own bucket (422).
 fn ravel_bucket_probe_class(err: &RavelBucketProbeFailure) -> DdlErrorClass {
@@ -432,8 +443,8 @@ fn ravel_bucket_probe_class(err: &RavelBucketProbeFailure) -> DdlErrorClass {
                 DdlErrorClass::Internal
             }
         }
-        RavelBucketProbeFailure::Inconclusive { .. } => DdlErrorClass::Unavailable,
-        RavelBucketProbeFailure::SameBucket { .. }
+        RavelBucketProbeFailure::Inconclusive { .. }
+        | RavelBucketProbeFailure::SameBucket { .. }
         | RavelBucketProbeFailure::TenancyMarkerPresent { .. } => DdlErrorClass::Unsupported,
     }
 }
@@ -559,10 +570,10 @@ async fn one_object_under(
     key: &KeyPrefix,
 ) -> Result<ProbeObject, DdlExecuteError> {
     if !key.directory {
+        // No suffix test here: ADR-2040 reads a single-object LOCATION
+        // whatever its suffix, and `snapshot_location` accepts it.
         return match store.head(&key.key).await {
-            Ok(meta) if meta.size > 0 && key.key.ends_with(".parquet") => {
-                Ok(ProbeObject::Found(key.key.clone()))
-            }
+            Ok(meta) if meta.size > 0 => Ok(ProbeObject::Found(key.key.clone())),
             Ok(_) | Err(StoreError::NotFound) => Ok(ProbeObject::Empty),
             Err(source) => Err(DdlExecuteError::ProbeList {
                 location: key.key.clone(),
@@ -593,7 +604,7 @@ async fn one_object_under(
                 })?;
         for meta in &listed.objects {
             if meta.size > 0
-                && meta.key.ends_with(".parquet")
+                && meta.key.ends_with(PARQUET_SUFFIX)
                 && grants::contains_key(grant, &grant.profile, &grant.bucket, meta.key.as_bytes())
             {
                 return Ok(ProbeObject::Found(meta.key.clone()));
@@ -635,9 +646,12 @@ impl SqlExecutor {
         created_by: &str,
         deadline: Duration,
     ) -> Result<DdlOutcome, DdlExecuteError> {
+        // Validation is CPU over the statement text and touches no store, so
+        // it runs before the timer: a refusal is never reported as a deadline.
+        let intent = validate_ddl(statement)?;
         match tokio::time::timeout(
             deadline,
-            self.execute_ddl_within_deadline(tenant, statement, created_by, deadline),
+            self.execute_ddl_within_deadline(tenant, intent, statement, created_by, deadline),
         )
         .await
         {
@@ -653,11 +667,11 @@ impl SqlExecutor {
     async fn execute_ddl_within_deadline(
         &self,
         tenant: TenantHash,
+        intent: DdlIntent,
         statement: &str,
         created_by: &str,
         deadline: Duration,
     ) -> Result<DdlOutcome, DdlExecuteError> {
-        let intent = validate_ddl(statement)?;
         let parquet = self
             .parquet_sources()
             .ok_or(DdlExecuteError::NotConfigured)?;
@@ -1073,9 +1087,8 @@ mod tests {
         assert!(!message.contains(SENTINEL), "{message}");
     }
 
-    // A retryable `ProbeWriteFailed` and `Inconclusive` are a failure to ask
-    // (the probe object never reached Ravel's own bucket, or the candidate's
-    // read had no clean answer): `Unavailable`, redacted.
+    // A retryable `ProbeWriteFailed` is a failure to ask (the probe object
+    // never reached Ravel's own bucket): `Unavailable`, redacted.
 
     #[test]
     fn ravel_bucket_probe_write_failed_is_unavailable_and_redacted() {
@@ -1092,8 +1105,11 @@ mod tests {
         assert!(!message.contains(SENTINEL), "{message}");
     }
 
+    // `Inconclusive` usually means a profile addressing another account, which
+    // no retry clears: `Unsupported`, with a message naming only `location`
+    // that does not claim the bucket is Ravel's.
     #[test]
-    fn ravel_bucket_probe_inconclusive_is_unavailable_and_redacted() {
+    fn ravel_bucket_probe_inconclusive_is_unsupported_and_redacted() {
         let err = DdlExecuteError::RavelBucketProbe {
             location: "s3://b/p".to_string(),
             source: RavelBucketProbeFailure::Inconclusive {
@@ -1101,9 +1117,10 @@ mod tests {
                 detail: SENTINEL.to_string(),
             },
         };
-        assert_eq!(err.class(), DdlErrorClass::Unavailable);
+        assert_eq!(err.class(), DdlErrorClass::Unsupported);
         let message = err.client_message();
-        assert_eq!(message, crate::error::MSG_UNAVAILABLE);
+        assert!(message.contains("s3://b/p"), "{message}");
+        assert!(!message.contains("Ravel's own bucket"), "{message}");
         assert!(!message.contains(SENTINEL), "{message}");
     }
 

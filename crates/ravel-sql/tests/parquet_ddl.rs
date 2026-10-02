@@ -295,6 +295,43 @@ async fn create_external_table_over_a_single_object_location_then_read_back() {
 }
 
 #[tokio::test]
+async fn create_external_table_over_a_single_object_without_the_parquet_suffix() {
+    // ADR-2040 reads a single-object LOCATION whatever its suffix; the DDL
+    // probe must not refuse one the snapshot and the query path accept.
+    let lake = Lake::memory_store();
+    let t = tenant("acme");
+    lake.grant(&t).await;
+    lake.put_file(
+        "t/hits/export-2026-09",
+        parquet_bytes(&[1, 2], &["a", "b"], &[0.5, 1.5]),
+    )
+    .await;
+
+    let outcome = lake
+        .executor
+        .execute_ddl(
+            t,
+            &format!(
+                "CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/export-2026-09'"
+            ),
+            CREATED_BY,
+            deadline(),
+        )
+        .await
+        .expect("create over a single object with no .parquet suffix");
+
+    match outcome {
+        DdlOutcome::Created { files, .. } => assert_eq!(files, 1),
+        other => panic!("expected Created, got {other:?}"),
+    }
+
+    let select = lake
+        .query(t, "SELECT id, name, score FROM hits ORDER BY id")
+        .await;
+    assert_eq!(rows(&select), vec!["1|a|0.5", "2|b|1.5"]);
+}
+
+#[tokio::test]
 async fn create_external_table_over_a_zero_byte_single_object_is_refused() {
     // The HEAD path's own emptiness check (`one_object_under`, ddl.rs): a
     // zero-byte object at the named key is not a snapshot-able Parquet file.
