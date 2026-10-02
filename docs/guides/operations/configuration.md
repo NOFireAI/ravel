@@ -281,10 +281,13 @@ choice for a development or single-operator deployment.
 
 | Role | Process | What it does |
 |---|---|---|
-| Gateway | `--mode gateway`, and the ingest half of `--mode all` | Writes L0 segments and their commit records, idempotency markers, a tenant's provisioning record on adopt, and on a keyed bucket each tenant's recovery manifest under `sys/t/`. Runs the catalog fold, so it also writes catalog snapshot parts, `HEAD`, and name-postings objects. On a keyed bucket, reads the durable token map `sys/auth`. Reads each tenant's config record `t/<hash>/config` for its admission-limit overrides. |
-| Query | `--mode query`, and the query half of `--mode all` | Lists and reads commit records, catalog objects and segment data. Runs the catalog fold too, and appends query-audit records. On a keyed bucket, reads the durable token map `sys/auth`. Reads each tenant's config record `t/<hash>/config` for its declared typed-column overrides. |
-| Maintain | `--mode maintain` | Compaction, retention and the sweeper. The only role that may delete anything, and only under the L0, L1, commit and idempotency prefixes plus the query-audit shard. Reads each tenant's config record `t/<hash>/config` to resolve the retention window. |
-| Admin | `ravel-cli` | One-off bootstrap and mutation commands. Invoked by an operator or a CI job, never by a long-running server. The broadest of the four. See [the Admin credential](deployment.md#the-admin-credential). |
+| Gateway | `--mode gateway`, and the ingest half of `--mode all` | Writes L0 segments and their commit records, idempotency markers, a tenant's provisioning record on adopt, and on a keyed bucket each tenant's recovery manifest under `sys/t/`. Runs the catalog fold, so it also writes catalog snapshot parts, `HEAD`, and name-postings objects. On a keyed bucket, reads the durable token map `sys/auth`. Reads each tenant's config record `t/<hash>/config` for its admission-limit overrides, and reads and writes its metric metadata record `t/<hash>/m/meta`. |
+| Query | `--mode query`, and the query half of `--mode all` | Lists and reads commit records, catalog objects and segment data. Runs the catalog fold too, and appends query-audit records. On a keyed bucket, reads the durable token map `sys/auth`. Reads each tenant's config record `t/<hash>/config` for its declared typed-column overrides, and its metric metadata record `t/<hash>/m/meta`. Runs the alert evaluator, so it writes alert transitions under `t/<hash>/a/l0/` and `t/<hash>/a/c/` and reads and writes each tenant's alert lease `t/<hash>/a/alert-lease` and state memo `t/<hash>/a/state/latest`. |
+| Maintain | `--mode maintain` | Compaction, retention and the sweeper. The only role that may delete anything, and only under the L0, L1, commit and idempotency prefixes plus the query-audit shard. Reads each tenant's config record `t/<hash>/config` to resolve the retention window, and the alert state memo `t/<hash>/a/state/latest` for alert retention. |
+| Admin | `ravel-cli` | One-off bootstrap and mutation commands. Invoked by an operator or a CI job, never by a long-running server. The broadest of the four. Writes each tenant's config record `t/<hash>/config` (`typed-attr-column`, `clustering-key` and `bloom-scope` set commands). See [the Admin credential](deployment.md#the-admin-credential). |
+
+Under `--tenant-kms-config`, Gateway, Query and Maintain also read and write each
+configured tenant's key-epoch record `t/<hash>/enc` at startup.
 
 Gateway and Query both run the catalog fold, which is why both hold the same
 catalog write grants. That is not an artifact of the split; it is what the
@@ -524,8 +527,9 @@ through the per-tenant key like any other, but neither role carries
 generate-data-key, so a deployment that relies on them for a routed tenant must
 grant it manually. When Admin hits this on a reconstruct write,
 `ravel-cli commit reconstruct` names this exact condition in its error text.
-Separately, the `t/<hash>/enc` epoch record needs its own read and write grant,
-which the shipped templates do not carry.
+The `t/<hash>/enc` epoch record has its own grant: Gateway, Query and Maintain
+read and write it, because startup bootstraps it in every mode, and Admin reads
+it for `verify-custody`. Every template denies its deletion.
 
 Bytes written to the local read cache are not covered by any of this. See
 [read cache tiers](#read-cache-tiers).

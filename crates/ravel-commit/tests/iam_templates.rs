@@ -245,13 +245,67 @@ const MEMO_PREFIX: &str = "sys/maintain/memo/";
 /// - `sys/maintain/memo/<process_id>`, one maintain process's memo snapshot
 ///   (`memo_key` in `crates/ravel-maintain/src/memo_snapshot.rs`);
 /// - `sys/t/<tenant_hash>`, one tenant's recovery manifest
-///   (`recovery_manifest_key` in `services/ravel-server/src/tenancy.rs`).
+///   (`recovery_manifest_key` in `services/ravel-server/src/tenancy.rs`);
+/// - `t/<tenant_hash>/enc`, one tenant's KMS key-epoch record (`enc_key` in
+///   `crates/ravel-catalog/src/key_epoch.rs`);
+/// - `t/<tenant_hash>/a/alert-lease` and `t/<tenant_hash>/a/state/latest`, the
+///   alert evaluator's lease and state memo (`alert_lease_key` in
+///   `services/ravel-server/src/alerting.rs`, `alert_state_memo_key` in
+///   `services/ravel-server/src/alert_state_memo.rs`);
+/// - `t/<tenant_hash>/m/meta`, the tenant's metric metadata record
+///   (`metrics_meta_key` in `crates/ravel-catalog/src/metrics_meta.rs`);
+/// - the `t/<tenant_hash>/a/` and `quarantine/t/<tenant_hash>/a/` prefixes the
+///   maintain alert retention gate lists (`alert_keyspace_is_empty` in
+///   `services/ravel-server/src/maintain.rs`).
+///
+/// The tenant-scoped ones are built from `test_tenant()` and the signal's
+/// `key_prefix()`, the same inputs the real builders format.
 fn control_plane_witness_keys() -> Vec<String> {
+    let hex = test_tenant().to_hex();
     vec![
         "sys/auth".to_string(),
         format!("{MEMO_PREFIX}{}", Uuid::from_u128(WITNESS_PROCESS_ID)),
-        format!("sys/t/{}", test_tenant().to_hex()),
+        format!("sys/t/{hex}"),
+        key_epoch_key(),
+        metrics_meta_key(),
+        alert_lease_key(),
+        alert_state_memo_key(),
+        alert_keyspace_prefix(),
+        format!("{QUARANTINE_PREFIX}{}", alert_keyspace_prefix()),
     ]
+}
+
+/// `enc_key(&test_tenant())`: `t/<hex>/enc`.
+fn key_epoch_key() -> String {
+    format!("t/{}/enc", test_tenant().to_hex())
+}
+
+/// `metrics_meta_key(&test_tenant())`: `t/<hex>/m/meta`.
+fn metrics_meta_key() -> String {
+    format!(
+        "t/{}/{}/meta",
+        test_tenant().to_hex(),
+        Signal::Metrics.key_prefix()
+    )
+}
+
+/// `t/<hex>/<alerts prefix>/`, the alert keyspace of `test_tenant()`.
+fn alert_keyspace_prefix() -> String {
+    format!(
+        "t/{}/{}/",
+        test_tenant().to_hex(),
+        Signal::Alerts.key_prefix()
+    )
+}
+
+/// `alert_lease_key(&test_tenant())`: `t/<hex>/a/alert-lease`.
+fn alert_lease_key() -> String {
+    format!("{}alert-lease", alert_keyspace_prefix())
+}
+
+/// `alert_state_memo_key(&test_tenant())`: `t/<hex>/a/state/latest`.
+fn alert_state_memo_key() -> String {
+    format!("{}state/latest", alert_keyspace_prefix())
 }
 
 /// One literal key per TENANT-ROUTED keyspace the templates name that
@@ -348,6 +402,8 @@ fn assert_pattern_is_witnessed(role: &str, class: &str, pattern: &str) {
 /// here for the same reason `/prov` and `catalog/` are: `config_key` lives in
 /// `ravel-catalog`, which this crate cannot depend on without a cycle, so the
 /// tenant config record has no `ravel-commit` constructor to produce a witness.
+/// `/enc`, `/m/meta`, `/alert-lease` and `/state/latest` are the same case:
+/// their builders live in `ravel-catalog` and `ravel-server`.
 const OUT_OF_SCOPE_PATTERNS: &[&str] = &[
     "idem/",
     "/prov",
@@ -355,12 +411,22 @@ const OUT_OF_SCOPE_PATTERNS: &[&str] = &[
     "admission/",
     "sys/",
     "/config",
+    "/enc",
+    "/m/meta",
+    "/alert-lease",
+    "/state/latest",
 ];
 
+/// The maintain alert retention gate's list prefixes, matched exactly rather
+/// than as substrings: `t/*/a/` is a substring of the in-scope `t/*/a/l0/*`.
+/// Checked by `maintain_template_covers_the_alert_retention_reads`.
+const ALERT_KEYSPACE_LIST_PREFIXES: &[&str] = &["t/*/a/", "quarantine/t/*/a/"];
+
 fn is_out_of_scope(pattern: &str) -> bool {
-    OUT_OF_SCOPE_PATTERNS
-        .iter()
-        .any(|marker| pattern.contains(marker))
+    ALERT_KEYSPACE_LIST_PREFIXES.contains(&pattern)
+        || OUT_OF_SCOPE_PATTERNS
+            .iter()
+            .any(|marker| pattern.contains(marker))
 }
 
 /// The object-ARN prefix (and bare bucket ARN) the shipped templates use. A
@@ -1779,7 +1845,9 @@ const TENANT_KMS_KEY_ARN: &str =
 /// plus the durable bearer-token map `sys/auth` and the write-once recovery
 /// manifests `sys/t/*` (the control-plane key amendment: a deleted `sys/auth`
 /// reads as absent and installs an empty token map, revoking every durable
-/// token, and `sys/t/*` recovery manifests are write-once, ADR-0050).
+/// token, and `sys/t/*` recovery manifests are write-once, ADR-0050), and the
+/// append-only KMS key-epoch records `t/*/enc` (a deleted record reads as "no
+/// per-tenant key was ever configured", ADR-0062 decision 1b).
 /// Maintain's own `DenyDeleteProtected` differs (see
 /// `MAINTAIN_PROTECTED_DELETE_KEYS`): its catalog entry is narrowed to the
 /// HEAD pointer alone, because `MaintainDelete` grants it delete on the
@@ -1797,6 +1865,7 @@ const PROTECTED_DELETE_KEYS: &[&str] = &[
     "t/*/u/*/0000/*",
     "sys/auth",
     "sys/t/*",
+    "t/*/enc",
 ];
 
 /// Maintain's `DenyDeleteProtected` resource set: same as `PROTECTED_DELETE_KEYS`
@@ -1816,6 +1885,7 @@ const MAINTAIN_PROTECTED_DELETE_KEYS: &[&str] = &[
     "t/*/u/*/0000/*",
     "sys/auth",
     "sys/t/*",
+    "t/*/enc",
 ];
 
 /// The `DenyDeleteProtected` action set, identical in all four templates: both
@@ -1865,7 +1935,11 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // publishes; deletes nothing. sys/auth is the durable token map the auth
     // refresh reads, and sys/t/* the per-tenant recovery manifest every keyed
     // ingest path creates; asserted by tenant_resolving_roles_read_the_auth_map
-    // and gateway_template_covers_the_recovery_manifest_write.
+    // and gateway_template_covers_the_recovery_manifest_write. t/*/enc is the
+    // KMS key-epoch record every server mode bootstraps under
+    // --tenant-kms-config (server_roles_read_and_write_the_key_epoch_record),
+    // and t/*/m/meta the metric metadata record the ingest metadata sink
+    // writes (metric_metadata_record_is_written_by_gateway_and_read_by_query).
     ExpectedRolePatterns {
         role: "gateway",
         list_prefixes: &[
@@ -1888,6 +1962,8 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/gc",
             "sys/auth",
             "t/*/config",
+            "t/*/enc",
+            "t/*/m/meta",
         ],
         get_actions: &["s3:GetObject"],
         puts: &[
@@ -1901,6 +1977,8 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/catalog/*/idx/*",
             "sys/tenancy",
             "sys/t/*",
+            "t/*/enc",
+            "t/*/m/meta",
         ],
         put_actions: &["s3:PutObject"],
         deletes: &[],
@@ -1915,6 +1993,9 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // worker overwrites its own registration rather than deleting it, and the
     // maintain role reaps dead registrations (issue #1828). sys/auth is read
     // by the durable auth refresh (tenant_resolving_roles_read_the_auth_map).
+    // The alert evaluator runs here too: it writes alert transitions under
+    // t/*/a/l0/* and t/*/a/c/*, and reads and writes its per-tenant lease and
+    // state memo (query_template_covers_every_alert_evaluator_call).
     ExpectedRolePatterns {
         role: "query",
         list_prefixes: &[
@@ -1938,6 +2019,10 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/auth",
             "sys/query/workers/*",
             "t/*/config",
+            "t/*/enc",
+            "t/*/a/alert-lease",
+            "t/*/a/state/latest",
+            "t/*/m/meta",
         ],
         get_actions: &["s3:GetObject"],
         puts: &[
@@ -1948,6 +2033,11 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "admission/query/*",
             "sys/tenancy",
             "sys/query/workers/*",
+            "t/*/enc",
+            "t/*/a/l0/*",
+            "t/*/a/c/*",
+            "t/*/a/alert-lease",
+            "t/*/a/state/latest",
         ],
         put_actions: &["s3:PutObject"],
         deletes: &[],
@@ -2041,6 +2131,11 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // LISTs the prefix before it GETs each snapshot (both under the wider
     // sys/maintain/* read). Asserted by
     // maintain_template_covers_every_memo_snapshot_read_call.
+    //
+    // t/*/a/state/latest and the t/*/a/ and quarantine/t/*/a/ list prefixes
+    // are the alert retention gate's reads: the alert state memo it takes the
+    // keep set from, and the two listings alert_keyspace_is_empty issues.
+    // Asserted by maintain_template_covers_the_alert_retention_reads.
     ExpectedRolePatterns {
         role: "maintain",
         list_prefixes: &[
@@ -2056,6 +2151,8 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/maintain/memo/*",
             "sys/query/workers/*",
             "quarantine/t/*/*/l0/*",
+            "t/*/a/",
+            "quarantine/t/*/a/",
         ],
         list_actions: &["s3:ListBucket"],
         gets: &[
@@ -2074,6 +2171,8 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/gc",
             "sys/maintain/*",
             "t/*/config",
+            "t/*/enc",
+            "t/*/a/state/latest",
         ],
         get_actions: &["s3:GetObject"],
         puts: &[
@@ -2085,6 +2184,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/tenancy",
             "sys/maintain/*",
             "quarantine/t/*/*/l0/*",
+            "t/*/enc",
         ],
         put_actions: &["s3:PutObject"],
         deletes: &[
@@ -2114,7 +2214,9 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // Admin: broad read, narrow create-only writes, and the one delete grant
     // ADR-0050's qualification probe needs. Decrypt-only on KMS. The sys/auth
     // write is ravel-cli's tenant token upsert and revoke
-    // (admin_template_covers_every_auth_map_write_call).
+    // (admin_template_covers_every_auth_map_write_call), and the t/*/config
+    // write is ravel-cli's tenant config record writes
+    // (admin_template_covers_every_tenant_config_write_call).
     ExpectedRolePatterns {
         role: "admin",
         list_prefixes: &["t/*", "sys/*"],
@@ -2131,6 +2233,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/*/c/*",
             "t/*/u/*",
             "t/*/*/del/*.dreq",
+            "t/*/config",
         ],
         put_actions: &["s3:PutObject"],
         deletes: &["sys/qualify/*"],
@@ -2630,6 +2733,7 @@ fn no_delete_allow_reaches_the_disjoint_protected_keyspaces() {
         "t/*/catalog/*/HEAD",
         "sys/auth",
         "sys/t/*",
+        "t/*/enc",
     ];
     // Pin DISJOINT_PROTECTED to its own definition so it cannot drift from the
     // protected list it is carved out of. It must be exactly
@@ -4137,6 +4241,313 @@ fn sys_auth_and_recovery_manifests_are_delete_protected_in_every_role() {
             !allows.iter().any(|p| glob_matches(p, &manifest)),
             "{role}: a delete Allow reaches {manifest:?}; recovery manifests are \
              write-once. Allow: {allows:?}"
+        );
+    }
+}
+
+/// Assert every `role` pattern on `axis` that reaches `witness` reaches no key in
+/// `key_domain()` for which `in_scope` is false. The predicate form of
+/// `assert_reaches_nothing_outside`, for a scope that spans tenants.
+fn assert_reaches_only(
+    role: &str,
+    axis: &str,
+    patterns: &[String],
+    witness: &str,
+    scope: &str,
+    in_scope: impl Fn(&str) -> bool,
+) {
+    let outside: Vec<&String> = key_domain().iter().filter(|key| !in_scope(key)).collect();
+    assert!(
+        !outside.is_empty(),
+        "the key domain models no key outside {scope}"
+    );
+    for pattern in patterns {
+        if !glob_matches(pattern, witness) {
+            continue;
+        }
+        for key in &outside {
+            assert!(
+                !glob_matches(pattern, key),
+                "{role}: {axis} pattern {pattern:?} reaches {witness:?} AND \
+                 {key:?}, which lies outside {scope}"
+            );
+        }
+    }
+}
+
+/// Whether `key` is `t/<any tenant>/<alerts prefix>/<sub>/...`.
+fn is_alert_subkey(key: &str, sub: &str) -> bool {
+    let mut parts = key.splitn(5, '/');
+    parts.next() == Some("t")
+        && parts.next().is_some()
+        && parts.next() == Some(Signal::Alerts.key_prefix())
+        && parts.next() == Some(sub)
+}
+
+/// `configure_tenant_kms` (`services/ravel-server/src/tenant_kms.rs`) runs from
+/// `services/ravel-server/src/main.rs` in every `--mode` whenever
+/// `--tenant-kms-config` is set. For each configured tenant
+/// `bootstrap_tenant_epoch` GETs `t/<hash>/enc` through `read_epochs_from_store`
+/// and, when the tenant has no record or its key changed, PUTs it through
+/// `record_key_epoch` (`crates/ravel-catalog/src/key_epoch.rs`):
+/// `CreateIfAbsent` for the bootstrap epoch, `CasVersion` for every appended
+/// one. Only `NotFound` reads as absence, so a refused GET or PUT makes the
+/// process refuse to start. Admin reads the record for `ravel-cli
+/// verify-custody` and writes it nowhere in production code. Nothing lists it.
+#[test]
+fn server_roles_read_and_write_the_key_epoch_record() {
+    let enc = key_epoch_key();
+    for role in ["gateway", "query", "maintain"] {
+        let policy = load_policy(role);
+        let gets = key_patterns_for(&policy, &["s3:GetObject"], Some("Allow"));
+        let puts = key_patterns_for(&policy, &["s3:PutObject"], Some("Allow"));
+        assert!(
+            gets.iter().any(|p| glob_matches(p, &enc)),
+            "{role}: no GetObject Allow reaches the key-epoch record {enc:?}, \
+             which bootstrap_tenant_epoch reads at startup under \
+             --tenant-kms-config. The process refuses to start. Grants: {gets:?}"
+        );
+        assert!(
+            puts.iter().any(|p| glob_matches(p, &enc)),
+            "{role}: no PutObject Allow reaches the key-epoch record {enc:?}, \
+             which record_key_epoch writes for a new tenant or a rotated key. \
+             The process refuses to start. Grants: {puts:?}"
+        );
+        assert_reaches_nothing_outside(role, "s3:GetObject Allow", &gets, &enc, &enc);
+        assert_reaches_nothing_outside(role, "s3:PutObject Allow", &puts, &enc, &enc);
+    }
+
+    let admin = load_policy("admin");
+    let gets = key_patterns_for(&admin, &["s3:GetObject"], Some("Allow"));
+    let puts = key_patterns_for(&admin, &["s3:PutObject"], Some("Allow"));
+    assert!(
+        gets.iter().any(|p| glob_matches(p, &enc)),
+        "admin: no GetObject Allow reaches {enc:?}, which verify-custody reads. \
+         Grants: {gets:?}"
+    );
+    assert!(
+        !puts.iter().any(|p| glob_matches(p, &enc)),
+        "admin: a PutObject Allow reaches {enc:?}; no ravel-cli command writes \
+         the key-epoch record. Grants: {puts:?}"
+    );
+}
+
+/// `t/<hash>/enc` is an append-only history: `record_key_epoch` only ever
+/// appends an epoch, and a deleted record reads as "no per-tenant key was ever
+/// configured", so `verify-custody` stops checking the tenant and the next
+/// bootstrap rewrites epoch 0 over history it never saw. No role deletes it, so
+/// every template's `DenyDeleteProtected` covers it and no delete Allow does.
+#[test]
+fn key_epoch_records_are_delete_protected_in_every_role() {
+    let enc = key_epoch_key();
+    for role in ALL_ROLES {
+        let policy = load_policy(role);
+        let denies = delete_key_patterns(&policy, "Deny");
+        assert!(
+            denies.iter().any(|p| glob_matches(p, &enc)),
+            "{role}: no delete Deny reaches the key-epoch record {enc:?}, an \
+             append-only history whose loss reads as absence. Deny: {denies:?}"
+        );
+        let allows = delete_key_patterns(&policy, "Allow");
+        assert!(
+            !allows.iter().any(|p| glob_matches(p, &enc)),
+            "{role}: a delete Allow reaches {enc:?}; nothing deletes the \
+             key-epoch record. Allow: {allows:?}"
+        );
+    }
+}
+
+/// The ingest metadata sink (`crates/ravel-ingest/src/metrics_meta_sink.rs`),
+/// built with the ingest router in `Mode::Gateway` and `Mode::All`, merges each
+/// window's metric metadata into `t/<hash>/m/meta`: `read_metrics_meta` GETs it
+/// and `write_metrics_meta` (`crates/ravel-catalog/src/metrics_meta.rs`) PUTs it
+/// with `CreateIfAbsent` or `CasVersion`. The query metadata cache
+/// (`crates/ravel-query/src/http/metadata_cache.rs`), built in `Mode::Query` and
+/// `Mode::All`, GETs it to serve `/api/v1/metadata`. Both log and swallow a
+/// refusal, so without these grants metric metadata is never persisted and the
+/// endpoint serves nothing. Nothing deletes or lists the record.
+#[test]
+fn metric_metadata_record_is_written_by_gateway_and_read_by_query() {
+    let meta = metrics_meta_key();
+    let gateway = load_policy("gateway");
+    for (role, policy, operations) in [
+        ("gateway", &gateway, &["s3:GetObject", "s3:PutObject"][..]),
+        ("query", &load_policy("query"), &["s3:GetObject"][..]),
+    ] {
+        for operation in operations {
+            let patterns = key_patterns_for(policy, &[*operation], Some("Allow"));
+            assert!(
+                patterns.iter().any(|p| glob_matches(p, &meta)),
+                "{role}: no {operation} Allow reaches the metric metadata record \
+                 {meta:?}. Grants: {patterns:?}"
+            );
+            assert_reaches_nothing_outside(role, operation, &patterns, &meta, &meta);
+        }
+    }
+    let query_puts = key_patterns_for(&load_policy("query"), &["s3:PutObject"], Some("Allow"));
+    assert!(
+        !query_puts.iter().any(|p| glob_matches(p, &meta)),
+        "query: a PutObject Allow reaches {meta:?}; only the ingest metadata \
+         sink writes it. Grants: {query_puts:?}"
+    );
+}
+
+/// The alert evaluator (`services/ravel-server/src/alerting.rs`) is spawned by
+/// `alerting::spawn` inside the query-serving block of `start`
+/// (`services/ravel-server/src/lib.rs`), so it runs under the Query role in
+/// `Mode::Query` and `Mode::All`. Each tick, per tenant:
+///
+/// - `read_alert_state_memo` GETs `t/<hash>/a/state/latest`
+///   (`services/ravel-server/src/alert_state_memo.rs`), and the lease holder
+///   overwrites it with `write_alert_state_memo` (`PutMode::Overwrite`);
+/// - `acquire_lease` PUTs `t/<hash>/a/alert-lease` with `CreateIfAbsent`, and
+///   on `AlreadyExists` GETs it and PUTs it back with `CasVersion` to renew or
+///   take over. Nothing releases or deletes the lease;
+/// - `publish` writes each transition as an L0 data object
+///   (`put_data_object`) and a commit record (`publish`), both
+///   `CreateIfAbsent`, under the alerts signal. The history fold reads them
+///   back through the existing `t/*/*/c/*` and `t/*/*/l0/*` grants.
+///
+/// A refused lease PUT is `lease_unavailable` and skips rule evaluation, so
+/// without these grants no rule is ever evaluated.
+#[test]
+fn query_template_covers_every_alert_evaluator_call() {
+    let query = load_policy("query");
+    let gets = key_patterns_for(&query, &["s3:GetObject"], Some("Allow"));
+    let puts = key_patterns_for(&query, &["s3:PutObject"], Some("Allow"));
+
+    for key in [alert_lease_key(), alert_state_memo_key()] {
+        assert!(
+            gets.iter().any(|p| glob_matches(p, &key)),
+            "query: no GetObject Allow reaches {key:?}, which the alert \
+             evaluator reads every tick. Grants: {gets:?}"
+        );
+        assert!(
+            puts.iter().any(|p| glob_matches(p, &key)),
+            "query: no PutObject Allow reaches {key:?}, which the alert \
+             evaluator writes every tick. Grants: {puts:?}"
+        );
+        assert_reaches_nothing_outside("query", "s3:GetObject Allow", &gets, &key, &key);
+        assert_reaches_nothing_outside("query", "s3:PutObject Allow", &puts, &key, &key);
+    }
+
+    let tenant = test_tenant();
+    let writer_id = Uuid::from_u128(1);
+    let data = data_key(&tenant, Signal::Alerts, 0, writer_id, 1, 1, &[0u8; 32]).expect("data_key");
+    let commit = commit_key(&tenant, Signal::Alerts, 0, 0, writer_id, 1, 1).expect("commit_key");
+    for (key, sub) in [(&data, "l0"), (&commit, "c")] {
+        assert!(
+            puts.iter().any(|p| glob_matches(p, key)),
+            "query: no PutObject Allow reaches the alert transition {key:?}, \
+             which the alert evaluator publishes on every state change. Every \
+             transition fails. Grants: {puts:?}"
+        );
+        assert_reaches_only(
+            "query",
+            "s3:PutObject Allow",
+            &puts,
+            key,
+            &format!("the alerts signal's {sub}/ keyspace"),
+            |k| is_alert_subkey(k, sub),
+        );
+    }
+
+    let deletes = delete_key_patterns(&query, "Allow");
+    assert!(
+        deletes.is_empty(),
+        "query: the role must grant no delete; the alert evaluator deletes \
+         nothing. Grants: {deletes:?}"
+    );
+}
+
+/// The maintain alert retention pass (`run_alert_retention` in
+/// `services/ravel-server/src/maintain.rs`) reads the evaluator's state memo
+/// through `alert_keep_set`, which propagates every error but `NotFound`, so a
+/// refused GET skips the retention sweep for the tenant every tick. When no
+/// memo or alert record was seen, `alert_keyspace_is_empty` LISTs
+/// `t/<hash>/a/` and `quarantine/t/<hash>/a/`; a refused LIST logs a warning
+/// and runs the orphan sweep anyway, for every such tenant on every tick.
+/// Maintain neither writes the memo nor touches the lease.
+#[test]
+fn maintain_template_covers_the_alert_retention_reads() {
+    let maintain = load_policy("maintain");
+    let gets = key_patterns_for(&maintain, &["s3:GetObject"], Some("Allow"));
+    let puts = key_patterns_for(&maintain, &["s3:PutObject"], Some("Allow"));
+    let list_prefixes = list_prefix_patterns(&maintain, Some("Allow"));
+    let memo = alert_state_memo_key();
+
+    assert!(
+        gets.iter().any(|p| glob_matches(p, &memo)),
+        "maintain: no GetObject Allow reaches the alert state memo {memo:?}, \
+         which alert_keep_set reads. Every alert retention sweep is skipped. \
+         Grants: {gets:?}"
+    );
+    assert_reaches_nothing_outside("maintain", "s3:GetObject Allow", &gets, &memo, &memo);
+    for key in [memo, alert_lease_key()] {
+        assert!(
+            !puts.iter().any(|p| glob_matches(p, &key)),
+            "maintain: a PutObject Allow reaches {key:?}; only the alert \
+             evaluator writes it. Grants: {puts:?}"
+        );
+    }
+
+    let keyspace = alert_keyspace_prefix();
+    for prefix in [keyspace.clone(), format!("{QUARANTINE_PREFIX}{keyspace}")] {
+        assert!(
+            list_prefixes.iter().any(|p| glob_matches(p, &prefix)),
+            "maintain: no ListBucket s3:prefix admits {prefix:?}, which \
+             alert_keyspace_is_empty lists. s3:prefix values: {list_prefixes:?}"
+        );
+        assert_reaches_nothing_outside(
+            "maintain",
+            "s3:prefix Allow",
+            &list_prefixes,
+            &prefix,
+            &prefix,
+        );
+    }
+}
+
+/// `ravel-cli typed-attr-column set` (`services/ravel-cli/src/typed_attr_column.rs`,
+/// `set_tenant_config`) and `ravel-cli clustering-key set|clear` and
+/// `bloom-scope set` (`services/ravel-cli/src/storage_layout.rs`,
+/// `TenantConfig::write_if_unchanged`) write `t/<hash>/config` through
+/// `write_config` in `crates/ravel-catalog/src/tenant_config.rs`: one GET, then a
+/// PUT with `CreateIfAbsent` when the record is absent and `CasVersion` when it
+/// exists. Both are `s3:PutObject`. Nothing deletes the record, and no server
+/// role writes it.
+#[test]
+fn admin_template_covers_every_tenant_config_write_call() {
+    let config = format!("t/{}/config", hash16());
+    let admin = load_policy("admin");
+    let gets = key_patterns_for(&admin, &["s3:GetObject"], Some("Allow"));
+    let puts = key_patterns_for(&admin, &["s3:PutObject"], Some("Allow"));
+    let deletes = delete_key_patterns(&admin, "Allow");
+
+    assert!(
+        gets.iter().any(|p| glob_matches(p, &config)),
+        "admin: no GetObject Allow reaches {config:?}, which write_config reads \
+         before every write. Grants: {gets:?}"
+    );
+    assert!(
+        puts.iter().any(|p| glob_matches(p, &config)),
+        "admin: no PutObject Allow reaches the tenant config record {config:?}, \
+         which every ravel-cli tenant config write PUTs. Every one is refused. \
+         Grants: {puts:?}"
+    );
+    assert!(
+        !deletes.iter().any(|p| glob_matches(p, &config)),
+        "admin: a delete Allow reaches {config:?}; nothing deletes the tenant \
+         config record. Grants: {deletes:?}"
+    );
+    assert_reaches_nothing_outside("admin", "s3:PutObject Allow", &puts, &config, &config);
+
+    for role in ["gateway", "query", "maintain"] {
+        let puts = key_patterns_for(&load_policy(role), &["s3:PutObject"], Some("Allow"));
+        assert!(
+            !puts.iter().any(|p| glob_matches(p, &config)),
+            "{role}: a PutObject Allow reaches {config:?}; no server role writes \
+             the tenant config record. Grants: {puts:?}"
         );
     }
 }

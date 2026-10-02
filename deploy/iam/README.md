@@ -11,7 +11,8 @@ from the pinned shape fails that suite.
 `DenyDeleteProtected` in `maintain.json` denies delete on `sys/tenancy`,
 `sys/qualification`, `sys/gc`, `t/*/*/prov`, `t/*/catalog/*/HEAD`, the
 legal-hold audit shard (`t/*/u/*/0000/*`), the durable token map `sys/auth`,
-and the write-once recovery manifests `sys/t/*`. Commit records are absent from
+the write-once recovery manifests `sys/t/*`, and the append-only KMS key-epoch
+records `t/*/enc`. Commit records are absent from
 that list on purpose: `MaintainDelete` grants delete on `t/*/*/c/*`
 because the maintenance sweep physically removes a commit record once
 it is superseded, and an IAM deny there would make every sweep pass fail.
@@ -21,10 +22,13 @@ the whole catalog family, `t/*/catalog/*/*`, instead: none of those roles
 deletes a catalog object, so nothing narrower is needed there. Maintain is
 the one role where narrowing to `HEAD` alone is load-bearing.
 
-All four templates also deny delete on `sys/auth` and `sys/t/*`: no role
-deletes either on its normal path, a deleted `sys/auth` reads as absent and
-installs an empty token map that revokes every durable token, and `sys/t/*`
-recovery manifests are write-once (ADR-0050).
+All four templates also deny delete on `sys/auth`, `sys/t/*` and `t/*/enc`: no
+role deletes any of them on its normal path, a deleted `sys/auth` reads as
+absent and installs an empty token map that revokes every durable token,
+`sys/t/*` recovery manifests are write-once (ADR-0050), and a deleted
+`t/<hash>/enc` reads as "no per-tenant key was ever configured", so
+`verify-custody` stops checking the tenant and the next startup rewrites its
+epoch history from scratch.
 
 Catalog snapshot and index objects (`t/*/catalog/*/snap/*`,
 `t/*/catalog/*/idx/*`) used to be caught by the same `t/*/catalog/*/*`
@@ -279,8 +283,35 @@ Two known gaps are recorded here and are NOT closed by the grants above.
 
 ## Control-plane keys outside the data path
 
-Four control-plane keys are read or written by a server role or by Admin on
-their normal path. Each grant names the one key or prefix the call uses:
+Sixteen control-plane keys and prefixes are read or written by a server role or
+by Admin on its normal path. Admin reads all of them through its blanket `t/*`
+and `sys/*` reads, so its column below lists writes only. Every grant names the
+one key or prefix the calls use:
+
+| Key | Gateway | Query | Maintain | Admin |
+|---|---|---|---|---|
+| `sys/tenancy` | get, put | get, put | get, put | put |
+| `sys/qualification` | get | get | get | put |
+| `sys/qualify/*` | | | | put, delete |
+| `sys/gc` | get | get | get, put | put |
+| `sys/auth` | get | get | | put |
+| `sys/t/*` | put | | | |
+| `sys/maintain/workers/*` | | | list, get, put, delete | |
+| `sys/maintain/memo/*` | | | list, get, put | |
+| `sys/maintain/claims/compaction/*` | | | get, put | |
+| `sys/query/workers/*` | | list, get, put | list, delete | |
+| `admission/query/*` | | list, get, put | | |
+| `t/*/config` | get | get | get | put |
+| `t/*/enc` | get, put | get, put | get, put | |
+| `t/*/m/meta` | get, put | get | | |
+| `t/*/a/alert-lease` | | get, put | | |
+| `t/*/a/state/latest` | | get, put | get | |
+
+The maintain `get` and `put` on the three `sys/maintain/` prefixes are the one
+`sys/maintain/*` grant in `MaintainRead` and `MaintainWrite`. The other rows
+were derived from the data path or are covered in the sections above, except
+the ten call groups below, which the templates missed until issues #1995 and
+#2340:
 
 | Call | Mode | S3 operation | Grant |
 |---|---|---|---|
@@ -288,7 +319,18 @@ their normal path. Each grant names the one key or prefix the call uses:
 | `ravel-cli tenant token upsert` and `revoke` write `sys/auth` (`CreateIfAbsent`, then `CasVersion`) | Admin | `s3:PutObject` | `AdminWrite` `sys/auth` (the read is `AdminRead` `sys/*`) |
 | `RecoveryManifestWriter::ensure` writes `sys/t/<tenant_hash>` (`CreateIfAbsent`) on a keyed tenant's first ingest request | `gateway`, `all` | `s3:PutObject` | `GatewayWrite` `sys/t/*` |
 | `read_all_memo_snapshots` lists `sys/maintain/memo/` on a maintain warm start | `maintain` | `s3:ListBucket` with `prefix=sys/maintain/memo/` | `MaintainList` `s3:prefix` `sys/maintain/memo/*` (the GETs and the snapshot PUT fall under `MaintainRead` and `MaintainWrite` `sys/maintain/*`) |
-| `read_config` reads `t/<tenant_hash>/config` (the tenant config record, ADR-0066) | `maintain`, `query`, `gateway` | `s3:GetObject` | `MaintainRead`, `QueryRead` and `GatewayRead` `t/*/config` (Admin reads it through its blanket `t/*`) |
+| `read_config` reads `t/<tenant_hash>/config` (the tenant config record, ADR-0066) | `maintain`, `query`, `gateway` | `s3:GetObject` | `MaintainRead`, `QueryRead` and `GatewayRead` `t/*/config` |
+| `ravel-cli typed-attr-column set`, `clustering-key set` and `clear`, and `bloom-scope set` write `t/<tenant_hash>/config` (`CreateIfAbsent`, then `CasVersion`) | Admin | `s3:PutObject` | `AdminWrite` `t/*/config` (the read is `AdminRead` `t/*`) |
+| `bootstrap_tenant_epoch` reads `t/<tenant_hash>/enc`, then `record_key_epoch` writes it (`CreateIfAbsent` for epoch 0, `CasVersion` for each appended epoch), for each tenant in `--tenant-kms-config` at startup | every mode | `s3:GetObject`, `s3:PutObject` | `GatewayRead`, `QueryRead`, `MaintainRead`, `GatewayWrite`, `QueryWrite` and `MaintainWrite` `t/*/enc` (Admin reads it for `verify-custody` through `AdminRead` `t/*`) |
+| The ingest metadata sink reads and writes `t/<tenant_hash>/m/meta` (`CreateIfAbsent`, then `CasVersion`); the query metadata cache reads it for `/api/v1/metadata` | `gateway`, `all` (write); `query`, `all` (read) | `s3:GetObject`, `s3:PutObject` | `GatewayRead`, `GatewayWrite` and `QueryRead` `t/*/m/meta` |
+| The alert evaluator: `acquire_lease` writes `t/<tenant_hash>/a/alert-lease` (`CreateIfAbsent`, or a GET then `CasVersion`), `read_alert_state_memo` reads and `write_alert_state_memo` overwrites `t/<tenant_hash>/a/state/latest`, and each transition is published as an L0 data object and a commit record (`CreateIfAbsent`) | `query`, `all` | `s3:GetObject`, `s3:PutObject` | `QueryRead` `t/*/a/alert-lease` and `t/*/a/state/latest`; `QueryWrite` `t/*/a/alert-lease`, `t/*/a/state/latest`, `t/*/a/l0/*` and `t/*/a/c/*` |
+| Alert retention: `alert_keep_set` reads `t/<tenant_hash>/a/state/latest`, and `alert_keyspace_is_empty` lists `t/<tenant_hash>/a/` and `quarantine/t/<tenant_hash>/a/` | `maintain` | `s3:GetObject`, `s3:ListBucket` | `MaintainRead` `t/*/a/state/latest`; `MaintainList` `s3:prefix` `t/*/a/` and `quarantine/t/*/a/` |
+
+The last row lists only prefixes; nothing below `t/*/a/` but the memo is a
+control-plane key, and the alert data objects and commit records the evaluator
+writes are data-path keys rather than control-plane ones. They are in the
+table because the Query role's write grants were derived from the fold and
+query-audit paths and reached neither.
 
 Without the `sys/auth` read, every durable auth refresh fails, so durable
 bearer tokens never resolve in a process that has not refreshed yet, and stop
@@ -301,20 +343,53 @@ runs cold until the list succeeds. Without the `t/*/config` read, `read_config`
 propagates the refusal (it swallows only `NotFound`), so retention passes fail
 under `maintain`, the durable `typed_attr_columns` override never resolves under
 `query` and statements run on the base schema, and the config-limits refresh
-fails under `gateway` so per-tenant admission overrides never apply.
+fails under `gateway` so per-tenant admission overrides never apply. Without the
+Admin config write, every `ravel-cli` tenant config write is refused. Without
+the `t/*/enc` read or write, a process started with `--tenant-kms-config`
+refuses to start, in whichever mode it runs: `read_record` passes only
+`NotFound` through as absence. Without the `t/*/m/meta` grants, metric metadata
+is never persisted and `/api/v1/metadata` serves nothing; both sides log the
+refusal and carry on. Without the alert lease write, every evaluator tick
+reports the lease unavailable and evaluates no rule, and without the transition
+writes every rule that changes state fails. Without the maintain memo read,
+alert retention is skipped for the tenant every tick, and without the two list
+prefixes the retention gate logs a warning for every tenant with no alert
+history and runs the orphan sweep anyway.
 
 No server role may write `sys/auth`: the only production writers are
 `ravel-cli` under Admin and the operator, which uses the shared credential
 named by `spec.storage.s3.credentials_secret_ref` rather than any of these
 templates. The tenant config record `t/<tenant_hash>/config` is likewise
-written only by `ravel-cli` under Admin (`set_tenant_config`), never by a
-server role; this change grants only the server-role reads, and whether the
-Admin template should carry the config write is tracked separately.
+written only by `ravel-cli` under Admin, never by a server role. The Maintain
+role reads the alert state memo and writes neither it nor the lease, and no role
+deletes either; nothing releases the lease. No `ravel-cli` command writes
+`t/<tenant_hash>/enc`, and nothing lists it.
 
-`sys/auth` and `sys/t/*` are also deny-delete in every template (see the
-delete-grant section above): no role deletes either, a deleted `sys/auth`
-installs an empty token map that revokes every durable token, and recovery
-manifests are write-once.
+`sys/auth`, `sys/t/*` and `t/*/enc` are also deny-delete in every template (see
+the delete-grant section above): no role deletes any of them, a deleted
+`sys/auth` installs an empty token map that revokes every durable token,
+recovery manifests are write-once, and key-epoch records are append-only
+history whose loss reads as "no per-tenant key was ever configured".
+
+Some control-plane keys a role uses are still granted by no template. Each needs
+a decision of its own rather than a one-line grant:
+
+- The Parquet table keys. `ravel-cli parquet grant` writes
+  `t/<tenant_hash>/pq/grants` (`crates/ravel-pqtable/src/grants.rs`) and probes
+  the target with a PUT and DELETE of `sys/pq-probe/<id>`
+  (`crates/ravel-object-store/src/external/probe.rs`), Query lists and reads
+  the grants and the table manifests under `t/<tenant_hash>/pq/t/`
+  (`crates/ravel-sql/src/parquet.rs`), and `ravel-cli parquet sweep` lists and
+  deletes manifests under Admin. No template reaches `t/*/pq/*` or
+  `sys/pq-probe/*`, and the probe and the sweep need an Admin delete beyond the
+  `sys/qualify/*` one.
+- `ravel-cli maintain compact-bucket` and `compact-tenant` take compaction
+  claims under `sys/maintain/claims/compaction/` and write L1 output, and Admin
+  writes neither.
+- Gateway's admission reconcile deletes dead `t/<tenant_hash>/<signal>/admission/<pid>.snapshot`
+  objects (`crates/ravel-ingest/src/reconcile.rs`), and Gateway holds no delete
+  grant, which ADR-0055 section 2 reserves for Maintain. The refusal is logged
+  and the snapshots accumulate.
 
 Gateway and Query carry no write on `sys/gc`, although every mode runs the
 `sys/gc` bootstrap at startup: creating it stays with Maintain and Admin, and a
