@@ -1168,8 +1168,9 @@ async fn a_held_group_still_named_keeps_its_marker_unwritten() {
 /// rest under it without writing a fresh marker or restarting the window.
 ///
 /// Mutation: retire the marker even when a group under it was stopped. The
-/// retry then finds no marker, writes a fresh one and holds the rest for a
-/// new window: the kept-marker, `written == 0` and `(1, 1)` assertions fail.
+/// partial pass then retires it (the `retired == 0` assertion fails), and
+/// past that the retry finds no marker, writes a fresh one and holds the rest
+/// for a new window (the `(1, 1)` assertion fails).
 #[tokio::test]
 async fn a_retry_after_a_partial_delete_keeps_the_aged_marker() {
     let mem = Arc::new(MemoryStore::new());
