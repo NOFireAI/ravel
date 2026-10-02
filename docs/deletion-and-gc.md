@@ -57,9 +57,9 @@ engine's deadline must be `<= max_query_duration`, and the HEAD cache TTL its
 catalog runs on `<= head_cache_ttl`; a Flight SQL ticket-TTL ceiling must be
 `<= protection_horizon - grace`. `ravel-cli maintain sweep` reads `sys/gc` the
 same way and sweeps on its protection horizon, grace and maximum flush
-lifetime, and gates the retention and superseded-input deletes on its
-`max_query_duration` and `head_cache_ttl` through the pinned-query window
-(ADR-1133, below), as the server's maintain mode does. A process that can
+lifetime, and gates its superseded-input deletes on its `max_query_duration`
+and `head_cache_ttl` through the pinned-query window (ADR-1133, below), as the
+server's maintain mode gates both its retention and superseded-input deletes. A process that can
 read a bootstrapped `sys/gc` and finds a real violation does not start; there is
 no "assume defaults" path, because assumed defaults are precisely the
 cross-process drift this object exists to prevent.
@@ -517,9 +517,9 @@ than deletes, so even a forced pass keeps the recovery window.
 
 - Superseded-input and unreferenced-part deletion never depend on reader
   leases or on removing an input before its compaction record is durable;
-  the horizon, the HEAD delete blocker and, for superseded inputs, the
-  pinned-query window bound how long a pinned query can still need an
-  input, and orphan-GC-style convergence handles crash remnants (a
+  the horizon bounds how long a pinned query can still need an input,
+  together with the HEAD delete blocker and the pinned-query window for
+  superseded inputs, and orphan-GC-style convergence handles crash remnants (a
   compactor that died mid-publish leaves record-less parts, which the
   unreferenced-part rule collects once old enough).
 - Superseded-input deletion is gated on HEAD reachability exactly as
@@ -863,9 +863,9 @@ every bound is measured.
 
 - **The pinned-query window lengthens the `.dreq`'s life.** The observing
   pass holds a chain whose unnamed-since marker is missing or younger than
-  the window, so a `.dreq` is deleted only once a deleting pass has reclaimed
-  every chain holding it, which is at the earliest one window after that
-  pass first found the chain unnamed (ADR-1133). The `.dreq` carries the
+  the window, so a `.dreq` is kept until every chain holding it has a marker
+  older than the window or is gone, at the earliest one window after a
+  deleting pass first found the chain unnamed (ADR-1133). The `.dreq` carries the
   subject identifier, so this delays the end of its retention, not only the
   physical delete.
 

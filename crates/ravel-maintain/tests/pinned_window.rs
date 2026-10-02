@@ -3,7 +3,8 @@
 //! `observed_unix_ns + max_query_duration + head_cache_ttl +
 //! 4 * clock_skew_allowance <= now_ns` on the deleting sweeper's clock.
 //!
-//! Every other maintain test runs with the window zeroed; these pin it.
+//! The tests of the other delete rules run with the window zeroed; these pin
+//! it.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -429,8 +430,8 @@ async fn hourly_folds_rewriting_head_and_its_one_part_do_not_stall_the_sweep() {
 
 /// Rejected alternative 1: a fold PUTs its part, dies before the HEAD CAS, and
 /// a later fold adopts those bytes in the first HEAD that drops the bucket.
-/// The adopted part's `last_modified` is from the dead fold, a day before the
-/// drop. The marker is written by the first pass after the drop, so the
+/// The adopted part's `last_modified` is from the dead fold, almost a day
+/// before the drop. The marker is written by the first pass after the drop, so the
 /// bucket stays held for a whole window after it.
 #[tokio::test]
 async fn a_part_adopted_from_a_dead_fold_does_not_open_the_gate_early() {

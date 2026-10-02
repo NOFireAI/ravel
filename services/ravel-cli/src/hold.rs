@@ -70,7 +70,7 @@ const SHARD_SCOPE_DIRS: [&str; 3] = ["l0", "c", "l1"];
 ///   so accepting them cannot produce a partial hold.
 /// - a scope under a sibling directory that is none of the three is not a
 ///   partial shard hold either. `.../del/` protects nothing a shard sweep
-///   deletes. `t/<hex>/<signal>/maint/` holds the scan cursor and the
+///   deletes. `t/<hex>/<signal>/maint/` holds maintenance cursors and the
 ///   unnamed-since markers (ADR-1133), which carry no tenant data; the sweeps
 ///   delete a marker without consulting holds, so the scope parks no bucket.
 ///

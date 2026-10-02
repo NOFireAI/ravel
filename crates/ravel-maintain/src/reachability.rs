@@ -83,8 +83,9 @@ pub enum SnapshotBlock {
     /// non-reachability cannot be proven from data that cannot be read, and a
     /// wrongly-permitted delete is unrecoverable while a delayed one is not.
     /// Also the answer for any doubt about the candidate's unnamed-since
-    /// marker (ADR-1133 decision 6): a marker get, put, delete or LIST error,
-    /// a body that does not decode, or an anchor that cannot be read.
+    /// marker (ADR-1133 decision 6): a marker GET, PUT or DELETE error, or a
+    /// body that does not decode. An anchor that cannot be read fails the
+    /// pass instead, which deletes nothing either.
     Unreadable,
     /// No snapshot entry names the candidate, but its unnamed-since marker is
     /// missing, was written for another anchor, or is younger than the

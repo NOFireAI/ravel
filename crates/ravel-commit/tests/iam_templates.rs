@@ -8916,7 +8916,8 @@ fn every_doc_qualifies_the_catalog_family_sweep_and_erasure_claim() {
 /// prefix. The retention and superseded-input sweeps write one with
 /// `CreateIfAbsent`, delete it after the objects it gated (or on a re-name or
 /// an anchor mismatch), and the orphan reaper lists `maint/unn/` signal-wide.
-/// A refused marker delete blocks its candidate for good (decision 6), so all
+/// A refused marker delete keeps a retention bucket's tombstone, and blocks a
+/// candidate whose marker must be replaced, on every pass (decision 6), so all
 /// three grants are load-bearing.
 #[test]
 fn maintain_template_covers_every_unnamed_marker_call() {

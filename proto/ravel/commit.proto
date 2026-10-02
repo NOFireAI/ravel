@@ -163,8 +163,8 @@ message RetentionTombstone {
 // pass finds a delete candidate past its protection horizon that the live
 // catalog HEAD does not name. It sits beside RetentionTombstone because it is
 // the same kind of object: small, immutable, written by a maintenance sweep
-// to gate that sweep's own physical deletes, and keyed per bucket. It holds
-// no tenant data.
+// to gate that sweep's own physical deletes, and keyed under its bucket's shard
+// and hour. It holds no tenant data.
 message UnnamedSinceMarker {
   uint32 format_version = 1;         // = 1
   // The writing sweeper's clock, read after the HEAD GET that found the

@@ -1407,7 +1407,8 @@ horizon and unnamed writes its unnamed-since marker and holds it, and the
 object goes on the first pass at least `max_query_duration + head_cache_ttl +
 4 * clock_skew_allowance` (1 h 20 min 30 s with defaults) later. Growth that
 never drains means the marker cannot age: check the sweeper's clock and the
-maintain role's delete grant on `t/*/*/maint/*`.
+window terms: `max_query_duration` and `head_cache_ttl` in `sys/gc`, and the
+sweeper's own `clock_skew_allowance`.
 `ravel_maintain_superseded_groups_held_by_legal_hold_total`
 is expected while a legal hold covers the shard and stops growing when the hold
 is lifted; growth with no hold in force points at a hold nobody meant to keep.
