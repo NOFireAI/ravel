@@ -384,11 +384,16 @@ async fn main() -> anyhow::Result<()> {
     // satisfy the constraint) and validated against what was just written, and a
     // concurrent bootstrap loser re-reads the winner's object rather than
     // refusing. Only a *present* object this mode really violates refuses to
-    // start. The Flight SQL ceiling is sourced and validated in
+    // start, or a credential the store refuses (per-role Gateway or Query
+    // before Maintain or Admin created the object), which fails with the
+    // start-order fix. The Flight SQL ceiling is sourced and validated in
     // `ravel_server::start` (it is `flight-sql`-feature-gated).
     let gc = ravel_server::gc_config::bootstrap(store.as_ref(), now_unix_ns())
         .await
-        .context("failed to bootstrap or read the durable GC config (sys/gc)")?;
+        .map_err(|e| {
+            let context = ravel_server::gc_config::bootstrap_failure_context(&e);
+            anyhow::Error::new(e).context(context)
+        })?;
     if matches!(cli.mode, Mode::Maintain) {
         ravel_server::gc_config::validate_maintain(&gc, &compactor).map_err(|e| {
             anyhow::anyhow!("maintain GC-config validation failed against sys/gc: {e}")
