@@ -56,7 +56,8 @@ maintain's configured horizon and grace must equal the stored values; a query
 engine's deadline must be `<= max_query_duration`, and the HEAD cache TTL its
 catalog runs on `<= head_cache_ttl`; a Flight SQL ticket-TTL ceiling must be
 `<= protection_horizon - grace`. `ravel-cli maintain sweep` reads `sys/gc` the
-same way and sweeps on its protection horizon and grace; it carries
+same way and sweeps on its protection horizon, grace and maximum flush
+lifetime; it carries
 `max_query_duration` and `head_cache_ttl` for the pinned-query gate (ADR-1133),
 which is not built yet, so neither changes the sweep. A process that can
 read a bootstrapped `sys/gc` and finds a real violation does not start; there is

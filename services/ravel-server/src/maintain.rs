@@ -4748,12 +4748,6 @@ mod tests {
         }
     }
 
-    /// The retention floor is validated against the catalog's max_ingest_lag,
-    /// which must equal ravel-maintain's own DEFAULT_MAX_INGEST_LAG_NS: the two
-    /// crates duplicate the constant behind a sync-contract comment (no
-    /// ravel-maintain -> ravel-catalog dependency), so if either ever drifts
-    /// this test fails and the retention floor would silently be validated
-    /// against a different lag than the catalog resolves with.
     /// The maintain compactor carries `sys/gc`'s maximum query duration and
     /// HEAD cache TTL, not the compiled defaults.
     #[test]
@@ -4779,6 +4773,12 @@ mod tests {
         assert_eq!(config.grace_ns, base.grace_ns);
     }
 
+    /// The retention floor is validated against the catalog's max_ingest_lag,
+    /// which must equal ravel-maintain's own DEFAULT_MAX_INGEST_LAG_NS: the two
+    /// crates duplicate the constant behind a sync-contract comment (no
+    /// ravel-maintain -> ravel-catalog dependency), so if either ever drifts
+    /// this test fails and the retention floor would silently be validated
+    /// against a different lag than the catalog resolves with.
     #[test]
     fn catalog_and_maintain_ingest_lag_agree() {
         assert_eq!(

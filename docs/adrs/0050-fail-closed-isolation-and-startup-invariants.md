@@ -478,7 +478,7 @@ frozen-format procedure. This is the sys/gc version 2 amendment.
   on a version 1 object the stored value is the compiled default.
 - **The CLI sweep validates too.** `ravel-cli maintain sweep` reads
   `sys/gc` (bootstrapping it when absent, as maintain mode does), sweeps on
-  its protection horizon and grace, and runs the maintain and clock-skew
+  its protection horizon, grace and maximum flush lifetime, and runs the maintain and clock-skew
   checks before it sweeps. It also carries `max_query_duration` and
   `head_cache_ttl` for the pinned-query gate (ADR-1133), which is not built
   yet, so neither changes the sweep.
