@@ -44,6 +44,7 @@ use ravel_segment::{
 use ravel_server::alerting::ALERT_SHARD;
 use ravel_server::sql::{ARROW_STREAM_MEDIA_TYPE, SqlState, router};
 use ravel_sql::{SqlConfig, SqlExecutor};
+use ravel_tenant_resolve::Principal;
 use ravel_types::logstream::log_stream_id;
 use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantId};
 use serde_json::Value;
@@ -598,6 +599,21 @@ fn build_router_full(
     audit_sink: Arc<dyn ravel_maintain::QueryAuditSink>,
     parquet: Option<ravel_sql::ParquetSources>,
 ) -> Router {
+    let principals = tokens
+        .into_iter()
+        .map(|(token, tenant)| (token, Principal { tenant, ddl: false }))
+        .collect();
+    build_router_principals(store, principals, audit_sink, parquet)
+}
+
+/// [`build_router_full`] with each token carrying its own [`Principal`], so a
+/// token can hold the `ddl` capability.
+fn build_router_principals(
+    store: Arc<dyn ObjectStoreBackend>,
+    principals: HashMap<String, Principal>,
+    audit_sink: Arc<dyn ravel_maintain::QueryAuditSink>,
+    parquet: Option<ravel_sql::ParquetSources>,
+) -> Router {
     let catalog =
         Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
     let executor = SqlExecutor::new(
@@ -614,7 +630,7 @@ fn build_router_full(
     };
     router(SqlState {
         executor: Arc::new(executor),
-        tenant_resolver: Arc::new(StaticBearerTokenResolver::new(tokens)),
+        tenant_resolver: Arc::new(StaticBearerTokenResolver::with_principals(principals)),
         store,
         clock: Arc::new(FixedClock),
         max_deadline: Duration::from_secs(30),
@@ -890,6 +906,393 @@ async fn a_parquet_table_without_a_profile_file_is_refused_over_http() {
     assert!(message.contains("Parquet table clicks"), "{value}");
     assert!(message.contains("--parquet-profiles"), "{value}");
     assert_eq!(lake.metrics().snapshot().op(StoreOp::Get).calls, 0);
+}
+
+// ---------------------------------------------------------------------------
+// DDL over HTTP (ADR-2040 decision 4, issue #2054)
+// ---------------------------------------------------------------------------
+
+/// Hands every audit event it receives to the test, so a test can count them
+/// and read what each one recorded.
+#[derive(Default)]
+struct RecordingAuditSink {
+    events: std::sync::Mutex<Vec<ravel_maintain::AuditEvent>>,
+}
+
+#[async_trait::async_trait]
+impl ravel_maintain::QueryAuditSink for RecordingAuditSink {
+    async fn submit(&self, event: ravel_maintain::AuditEvent) -> ravel_maintain::Result<()> {
+        self.events.lock().expect("lock").push(event);
+        Ok(())
+    }
+}
+
+impl RecordingAuditSink {
+    /// The `(query.language, query.status, query.text)` of every event
+    /// received since the last call, in submission order.
+    fn take(&self) -> Vec<(String, String, String)> {
+        let events = std::mem::take(&mut *self.events.lock().expect("lock"));
+        let text = |event: &ravel_maintain::AuditEvent, key: &str| -> String {
+            event
+                .attrs
+                .iter()
+                .find_map(|(k, v)| match v {
+                    AttrValue::Str(s) if k == key => Some(s.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("audit event has no {key} attr"))
+        };
+        events
+            .iter()
+            .map(|event| {
+                (
+                    text(event, "query.language"),
+                    text(event, "query.status"),
+                    text(event, "query.text"),
+                )
+            })
+            .collect()
+    }
+}
+
+/// A Parquet file of one `id: Int64` column holding `ids`.
+fn lake_parquet_file(ids: &[i64]) -> bytes::Bytes {
+    use arrow::array::{ArrayRef, Int64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(ids.to_vec())) as ArrayRef],
+    )
+    .expect("batch");
+    let mut out = Vec::new();
+    let mut writer = parquet::arrow::ArrowWriter::try_new(&mut out, schema, None).expect("writer");
+    writer.write(&batch).expect("write");
+    writer.close().expect("close");
+    bytes::Bytes::from(out)
+}
+
+/// Every store call `store` has served, over all operation kinds.
+fn store_calls(store: &ravel_object_store::instrument::InstrumentedStore<MemoryStore>) -> u64 {
+    let snapshot = store.metrics().snapshot();
+    ravel_object_store::instrument::StoreOp::ALL
+        .iter()
+        .map(|op| snapshot.op(*op).calls)
+        .sum()
+}
+
+const CREATE_CLICKS: &str =
+    "CREATE EXTERNAL TABLE clicks STORED AS PARQUET LOCATION 's3://lake/data/clicks/'";
+const CREATE_OUTSIDE_GRANT: &str =
+    "CREATE EXTERNAL TABLE clicks STORED AS PARQUET LOCATION 's3://lake/other/clicks/'";
+
+/// ADR-2040 decision 4, issue #2054: a `CREATE EXTERNAL TABLE` over
+/// `POST /api/v1/sql` needs the `ddl` capability AND a grant over its
+/// `LOCATION`, and a caller without the capability reaches nothing: no store
+/// call, no manifest, 403 for `DROP` as well as `CREATE`. Every DDL statement
+/// submits exactly one audit event, error for the refusals and ok for the two
+/// that committed.
+#[tokio::test]
+async fn create_external_table_needs_the_ddl_capability_and_a_grant_over_its_location() {
+    use ravel_object_store::instrument::InstrumentedStore;
+
+    let store = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+    let lake: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    let tenant_hash = tenant.hash();
+    ravel_pqtable::grants::add(
+        store.as_ref(),
+        &tenant_hash,
+        "lake",
+        "s3://lake/data",
+        "test",
+        &ravel_pqtable::clock::FixedClock::new(NOW_NS),
+    )
+    .await
+    .expect("grant");
+    lake.put(
+        "data/clicks/part-0.parquet",
+        lake_parquet_file(&[1, 2, 3, 4]),
+        PutOptions::default(),
+    )
+    .await
+    .expect("put the Parquet file");
+
+    let ravel_store: Arc<dyn ObjectStoreBackend> = store.clone();
+    let sources = ravel_sql::ParquetSources::new(
+        Arc::clone(&ravel_store),
+        Some(Arc::new(ravel_sql::ExternalStoreMap::new(HashMap::from([(
+            "lake".to_string(),
+            lake,
+        )]))) as Arc<dyn ravel_sql::ExternalStores>),
+        Arc::new(ravel_query::GetLimiter::new(8).expect("limiter")),
+        None,
+        ravel_sql::DEFAULT_PARQUET_METADATA_CACHE_BYTES,
+    );
+    let sink = Arc::new(RecordingAuditSink::default());
+    let app = build_router_principals(
+        ravel_store,
+        HashMap::from([
+            (
+                "plain-token".to_string(),
+                Principal {
+                    tenant: tenant.clone(),
+                    ddl: false,
+                },
+            ),
+            (
+                "ddl-token".to_string(),
+                Principal {
+                    tenant: tenant.clone(),
+                    ddl: true,
+                },
+            ),
+        ]),
+        sink.clone(),
+        Some(sources),
+    );
+
+    // Everything the tenant has under its Parquet prefix: the grants record
+    // alone, until a CREATE commits.
+    let pq_keys = || async {
+        list_all(
+            store.as_ref(),
+            &ravel_pqtable::keys::tenant_pq_prefix(&tenant_hash),
+        )
+        .await
+        .expect("list the tenant's Parquet keys")
+        .into_iter()
+        .map(|meta| meta.key)
+        .collect::<Vec<_>>()
+    };
+    let grants_only = vec![ravel_pqtable::keys::grants_key(&tenant_hash)];
+    assert_eq!(pq_keys().await, grants_only);
+
+    // (1) Without the capability: 403 for CREATE and for DROP, before any
+    // store is touched, and nothing is written.
+    let calls_before = store_calls(&store);
+    for statement in [CREATE_CLICKS, "DROP TABLE clicks"] {
+        let (status, value) = post_json(&app, "plain-token", statement).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{statement}: {value}");
+        assert_eq!(value["errorType"], "forbidden", "{value}");
+        assert_eq!(
+            sink.take(),
+            vec![(
+                "sql".to_string(),
+                "error".to_string(),
+                statement.to_string()
+            )],
+            "exactly one error audit event for {statement}"
+        );
+    }
+    assert_eq!(
+        store_calls(&store) - calls_before,
+        0,
+        "a refused caller must not cause one store call, grants read included"
+    );
+    assert_eq!(pq_keys().await, grants_only);
+
+    // (2) With the capability but a LOCATION outside the grant: the refusal
+    // `resolve_location` produces, and no manifest.
+    let (status, value) = post_json(&app, "ddl-token", CREATE_OUTSIDE_GRANT).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
+    assert_eq!(value["errorType"], "execution", "{value}");
+    let message = value["error"].as_str().expect("error text");
+    assert!(
+        message.contains("s3://lake/other/clicks/") && message.contains("grant"),
+        "{value}"
+    );
+    assert_eq!(
+        sink.take(),
+        vec![(
+            "sql".to_string(),
+            "error".to_string(),
+            CREATE_OUTSIDE_GRANT.to_string()
+        )]
+    );
+    assert_eq!(pq_keys().await, grants_only);
+
+    // (3) With the capability and a LOCATION inside the grant: created, and
+    // the table answers a SELECT through the same endpoint.
+    let (status, value) = post_json(&app, "ddl-token", CREATE_CLICKS).await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["status"], "success", "{value}");
+    assert_eq!(value["data"]["outcome"], "created", "{value}");
+    assert_eq!(value["data"]["table"], "clicks", "{value}");
+    assert_eq!(value["data"]["version"], 1, "{value}");
+    assert_eq!(value["data"]["files"], 1, "{value}");
+    assert_eq!(
+        sink.take(),
+        vec![(
+            "sql".to_string(),
+            "ok".to_string(),
+            CREATE_CLICKS.to_string()
+        )]
+    );
+    let manifest = ravel_pqtable::resolve::newest(store.as_ref(), &tenant_hash, "clicks")
+        .await
+        .expect("resolve")
+        .expect("the manifest exists");
+    assert_eq!(
+        manifest.created_by, "acme",
+        "the creator is the principal's tenant"
+    );
+    let (status, value) = post_json(&app, "plain-token", "SELECT count(*) FROM clicks").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["data"]["rows"], serde_json::json!([[4]]), "{value}");
+
+    // (4) DROP TABLE: dropped, and the name is then an unknown table.
+    let (status, value) = post_json(&app, "ddl-token", "DROP TABLE clicks").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["data"]["outcome"], "dropped", "{value}");
+    assert_eq!(value["data"]["table"], "clicks", "{value}");
+    assert_eq!(value["data"]["version"], 2, "{value}");
+    assert_eq!(
+        sink.take(),
+        vec![(
+            "sql".to_string(),
+            "ok".to_string(),
+            "DROP TABLE clicks".to_string()
+        )]
+    );
+    let (status, value) = post_json(&app, "plain-token", "SELECT count(*) FROM clicks").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
+    assert!(
+        sink.take().len() == 1,
+        "the SELECT is audited by the query path, once"
+    );
+}
+
+/// A plain `CREATE` on a table that exists is 409, a plain `DROP` of one that
+/// does not is 404, and `IF NOT EXISTS` over an existing table is a 200
+/// `noop`: the three outcomes the DDL core distinguishes reach the client as
+/// distinct statuses with a stable `errorType`.
+#[tokio::test]
+async fn ddl_conflict_not_found_and_noop_have_their_own_statuses() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let lake: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    ravel_pqtable::grants::add(
+        store.as_ref(),
+        &tenant.hash(),
+        "lake",
+        "s3://lake/data",
+        "test",
+        &ravel_pqtable::clock::FixedClock::new(NOW_NS),
+    )
+    .await
+    .expect("grant");
+    lake.put(
+        "data/clicks/part-0.parquet",
+        lake_parquet_file(&[1]),
+        PutOptions::default(),
+    )
+    .await
+    .expect("put the Parquet file");
+    let sources = ravel_sql::ParquetSources::new(
+        Arc::clone(&store),
+        Some(Arc::new(ravel_sql::ExternalStoreMap::new(HashMap::from([(
+            "lake".to_string(),
+            lake,
+        )]))) as Arc<dyn ravel_sql::ExternalStores>),
+        Arc::new(ravel_query::GetLimiter::new(8).expect("limiter")),
+        None,
+        ravel_sql::DEFAULT_PARQUET_METADATA_CACHE_BYTES,
+    );
+    let app = build_router_principals(
+        store,
+        HashMap::from([("ddl-token".to_string(), Principal { tenant, ddl: true })]),
+        Arc::new(ravel_maintain::NoopQueryAuditSink),
+        Some(sources),
+    );
+
+    let (status, value) = post_json(&app, "ddl-token", "DROP TABLE clicks").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{value}");
+    assert_eq!(value["errorType"], "not_found", "{value}");
+
+    let (status, value) = post_json(&app, "ddl-token", CREATE_CLICKS).await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+
+    let (status, value) = post_json(&app, "ddl-token", CREATE_CLICKS).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{value}");
+    assert_eq!(value["errorType"], "conflict", "{value}");
+
+    let (status, value) = post_json(
+        &app,
+        "ddl-token",
+        "CREATE EXTERNAL TABLE IF NOT EXISTS clicks STORED AS PARQUET \
+         LOCATION 's3://lake/data/clicks/'",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["data"]["outcome"], "noop", "{value}");
+    assert_eq!(value["data"]["table"], "clicks", "{value}");
+}
+
+/// A DDL statement answers JSON even when the caller asks for Arrow IPC: its
+/// outcome has no rows to stream.
+#[tokio::test]
+async fn a_ddl_outcome_is_json_even_when_arrow_is_accepted() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let app = build_router_principals(
+        store,
+        HashMap::from([(
+            "ddl-token".to_string(),
+            Principal {
+                tenant: TenantId::new("acme".to_string()),
+                ddl: true,
+            },
+        )]),
+        Arc::new(ravel_maintain::NoopQueryAuditSink),
+        None,
+    );
+    let (status, bytes) = post(
+        &app,
+        Some("ddl-token"),
+        Some(ARROW_STREAM_MEDIA_TYPE),
+        body("DROP TABLE IF EXISTS clicks"),
+    )
+    .await;
+    // No Parquet sources are configured, so the statement cannot be served;
+    // the point is the refusal's encoding, which must still be JSON.
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let value: Value = serde_json::from_slice(&bytes).expect("a JSON body");
+    assert_eq!(value["errorType"], "execution", "{value}");
+}
+
+/// The capability changes nothing for a query: the same SELECT returns the
+/// same rows for a `;ddl` token and for a plain one.
+#[tokio::test]
+async fn a_select_is_the_same_with_and_without_the_ddl_capability() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    publish_segment(store.as_ref(), &tenant, 0, "m", &[(100, 1.0), (200, 2.5)]).await;
+    let app = build_router_principals(
+        store,
+        HashMap::from([
+            (
+                "plain-token".to_string(),
+                Principal {
+                    tenant: tenant.clone(),
+                    ddl: false,
+                },
+            ),
+            ("ddl-token".to_string(), Principal { tenant, ddl: true }),
+        ]),
+        Arc::new(ravel_maintain::NoopQueryAuditSink),
+        None,
+    );
+
+    let mut answers = Vec::new();
+    for token in ["plain-token", "ddl-token"] {
+        let (status, value) =
+            post_json(&app, token, "SELECT ts, value FROM samples ORDER BY ts").await;
+        assert_eq!(status, StatusCode::OK, "{token}: {value}");
+        answers.push(value["data"]["rows"].clone());
+    }
+    assert_eq!(answers[0], serde_json::json!([[100, 1.0], [200, 2.5]]));
+    assert_eq!(answers[0], answers[1]);
 }
 
 // ---------------------------------------------------------------------------

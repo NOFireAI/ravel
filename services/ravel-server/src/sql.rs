@@ -640,6 +640,115 @@ mod tests {
         }
     }
 
+    /// The DDL status mapping is part of the client contract too. The `match`
+    /// below names every `DdlErrorClass` with no wildcard, so a new class
+    /// fails to compile here until it is given a pinned status.
+    #[test]
+    fn ddl_error_classes_map_to_stable_status_codes() {
+        use ravel_sql::DdlErrorClass;
+
+        fn pinned(class: DdlErrorClass) -> (StatusCode, &'static str) {
+            match class {
+                DdlErrorClass::BadRequest => (StatusCode::BAD_REQUEST, "bad_data"),
+                DdlErrorClass::Conflict => (StatusCode::CONFLICT, "conflict"),
+                DdlErrorClass::NotFound => (StatusCode::NOT_FOUND, "not_found"),
+                DdlErrorClass::Unsupported => (StatusCode::UNPROCESSABLE_ENTITY, "execution"),
+                DdlErrorClass::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+                DdlErrorClass::Timeout => (StatusCode::GATEWAY_TIMEOUT, "timeout"),
+                DdlErrorClass::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+            }
+        }
+
+        for class in [
+            DdlErrorClass::BadRequest,
+            DdlErrorClass::Conflict,
+            DdlErrorClass::NotFound,
+            DdlErrorClass::Unsupported,
+            DdlErrorClass::Unavailable,
+            DdlErrorClass::Timeout,
+            DdlErrorClass::Internal,
+        ] {
+            let (_, status, error_type) = crate::service::error::ddl_class_to_http(class);
+            assert_eq!((status, error_type), pinned(class), "{class:?}");
+        }
+    }
+
+    /// A real `DdlExecuteError` takes its class's status and its body is the
+    /// redacted `client_message()`, not the full `Display`.
+    #[test]
+    fn a_ddl_error_takes_its_classs_status_and_client_message() {
+        let tenant = TenantHash([0u8; 16]);
+        let err = ravel_sql::DdlExecuteError::NotConfigured;
+        let message = err.client_message();
+        let api = ServiceError::from_ddl(err, tenant);
+        assert_eq!(api.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(api.error_type, "execution");
+        assert_eq!(api.message, message);
+
+        let api = ServiceError::from_ddl(
+            ravel_sql::DdlExecuteError::Deadline {
+                deadline: Duration::from_secs(1),
+            },
+            tenant,
+        );
+        assert_eq!(api.status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(api.error_type, "timeout");
+    }
+
+    /// The DDL deadline is clamped exactly as a query's is: lowered by the
+    /// request, never raised past the server maximum.
+    #[test]
+    fn the_ddl_deadline_is_clamped_like_a_querys() {
+        assert_eq!(
+            request_deadline(&body(r#"{"query":"DROP TABLE t","timeout":3600}"#), MAX)
+                .expect("deadline"),
+            MAX
+        );
+        assert_eq!(
+            request_deadline(&body(r#"{"query":"DROP TABLE t","timeout":5}"#), MAX)
+                .expect("deadline"),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            request_deadline(&body(r#"{"query":"DROP TABLE t"}"#), MAX).expect("deadline"),
+            MAX
+        );
+        let err = request_deadline(&body(r#"{"query":"DROP TABLE t","timeout":0}"#), MAX)
+            .expect_err("rejected");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn a_ddl_outcome_renders_the_fields_its_variant_has() {
+        let created = ddl_outcome_json(&DdlOutcome::Created {
+            table: "t".to_string(),
+            version: 1,
+            files: 3,
+            skipped_directory_markers: 0,
+            skipped_other_suffixes: 2,
+        });
+        assert_eq!(created["status"], "success");
+        assert_eq!(created["data"]["outcome"], "created");
+        assert_eq!(created["data"]["table"], "t");
+        assert_eq!(created["data"]["version"], 1);
+        assert_eq!(created["data"]["files"], 3);
+        assert_eq!(created["data"]["skipped_other_suffixes"], 2);
+
+        let dropped = ddl_outcome_json(&DdlOutcome::Dropped {
+            table: "t".to_string(),
+            version: 2,
+        });
+        assert_eq!(dropped["data"]["outcome"], "dropped");
+        assert_eq!(dropped["data"]["version"], 2);
+        assert!(dropped["data"].get("files").is_none(), "{dropped}");
+
+        let noop = ddl_outcome_json(&DdlOutcome::NoOp {
+            table: "t".to_string(),
+        });
+        assert_eq!(noop["data"]["outcome"], "noop");
+        assert!(noop["data"].get("version").is_none(), "{noop}");
+    }
+
     /// The body cap and the statement gate are one decision, so the two
     /// numbers are pinned together: a body large enough to hold a statement at
     /// the complexity bound is accepted, and the cap stays far below the 1 MiB
