@@ -1960,23 +1960,51 @@ async fn max_flush_delay_decides_whether_two_writes_coalesce() {
 /// sits above two slices and below three, so writes 1-3 flush as one object
 /// by size and write 4 is left alone under the target. `--pipeline-depth 5`
 /// is above the batch count, so the loader never waits on an ack mid-loop.
-/// The clock is fixed, which makes the assertion sharp: the age trigger
-/// cannot fire at all here, so the tail's object exists only because the
-/// manual flush published it.
+/// The injected [`TestClock`] is never advanced, which makes the assertion
+/// sharp: the age trigger cannot fire at all here, so the tail's object
+/// exists only because the manual flush published it.
 ///
-/// Prove-the-test: move `router.flush_all()` back after `drain_inflight`
-/// and the load never returns a report -- the tail ack is answered by
-/// nothing, and after `write_ack_deadline` (10m + 1m here) it fails with
-/// `LoadError::Flush` carrying `timed out waiting for shard ack`.
+/// Which flush publishes what also depends on scheduling: a write task that
+/// has not reached its shard channel when the end-of-input `flush_all` runs
+/// lands in a fresh buffer behind it, so writes 1-3 never share a buffer and
+/// the drain-time re-flush ticker publishes the stragglers instead
+/// (`size: 0, final_drain: 2`). The last batch's `on_batch_queued` hook
+/// therefore holds the decoder, so no `Done` reaches the loader, until the
+/// router is quiet: every write routed and the size flush finished.
+///
+/// What this cannot tell apart: the drain-time re-flush ticker also publishes
+/// with the manual trigger, so if the end-of-input `flush_all` were moved
+/// after `drain_inflight`, the ticker would publish the tail about 2 s later
+/// and the counts asserted here would still hold. The test pins the flush mix
+/// and object count, not which of the two manual flushes ran.
 #[tokio::test]
 async fn a_tail_below_target_is_published_by_the_end_of_input_flush() {
     use ravel_object_store::memory::MemoryStore;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const TARGET: usize = 10_000;
-    let (_dir, pq, _mapping_path, m) = fat_attr_sorted_by_shard_fixture(1, 4, 4000);
+    const BATCHES: usize = 4;
+    let (_dir, pq, _mapping_path, m) = fat_attr_sorted_by_shard_fixture(1, BATCHES, 4000);
 
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-    let report = load_instrumented(
+    let probe: Arc<dyn ObjectStoreBackend> = Arc::clone(&store);
+    let clock = TestClock::new(NOW_NS);
+
+    let queued = Arc::new(AtomicUsize::new(0));
+    let (gate_tx, mut gate_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let on_batch_queued: BuildStartHook = Arc::new(move || {
+        if queued.fetch_add(1, Ordering::SeqCst) + 1 == BATCHES {
+            let _ = gate_tx.send(());
+            let guard = release_rx
+                .lock()
+                .expect("the release channel is not poisoned");
+            let _ = guard.recv();
+        }
+    });
+
+    let load_fut = load_instrumented(
         Arc::clone(&store),
         &pq,
         "acme",
@@ -1991,13 +2019,38 @@ async fn a_tail_below_target_is_published_by_the_end_of_input_flush() {
         TARGET,
         Some(Duration::from_secs(600)),
         NOW_NS,
-        Arc::new(FixedClock(NOW_NS)),
+        Arc::clone(&clock) as Arc<dyn Clock>,
         LoadPath::Columnar,
         None,
-        None,
-    )
-    .await
-    .expect("a raised delay must not strand the tail buffer's ack");
+        Some(on_batch_queued),
+    );
+
+    let driver = async {
+        let () = gate_rx.recv().await.expect("the last batch is queued");
+        yield_until_router_is_quiet(&clock).await;
+        assert_eq!(
+            list_data_objects(probe.as_ref()).await.len(),
+            1,
+            "before the end-of-input flush, writes 1-3 are one size-flushed object and \
+                 nothing else is published yet"
+        );
+        // Releasing the decoder lets `Done` through, and with it the
+        // end-of-input flush that publishes the tail.
+        drop(release_tx);
+        std::future::pending::<()>().await
+    };
+
+    let report = tokio::select! {
+        report = load_fut => report.expect("a raised delay must not strand the tail buffer's ack"),
+        () = driver => unreachable!("the driver parks once the decoder is released"),
+    };
+
+    assert_eq!(
+        clock.now_ns(),
+        NOW_NS,
+        "test setup: this test never advances the injected clock, so no buffer can \
+         age out"
+    );
 
     assert_eq!(report.rows_processed, 4, "every row is durable");
     assert_eq!(
