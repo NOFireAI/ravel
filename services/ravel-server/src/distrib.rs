@@ -81,9 +81,10 @@ use ravel_query::distrib::proto::series_fetch_client::SeriesFetchClient;
 use ravel_query::distrib::proto::series_fetch_server::{SeriesFetch, SeriesFetchServer};
 use ravel_query::distrib::service::{
     ReconstructingSegmentResolver, SegmentResolver, SeriesFetchService, SnapshotSegmentResolver,
+    expired_slice_summary,
 };
 use ravel_query::http::TenantResolver;
-use ravel_types::accounting::QueryAccountingSnapshot;
+use ravel_types::accounting::{QueryAccounting, QueryAccountingSnapshot};
 use ravel_types::{Signal, TenantHash, TimeRange};
 use tonic::transport::Channel;
 use uuid::Uuid;
@@ -128,6 +129,18 @@ pub enum CapabilityReject {
     /// The request's `query_id` or `signal` did not equal the capability's
     /// claims.
     QueryMismatch,
+}
+
+/// What [`FragmentService::verify_capability`] concluded about a `Pinned`
+/// fetch's capability once every check that refuses with a `tonic::Status`
+/// passed or was never reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapabilityCheck {
+    /// Verified and live until `expires_unix_ns`.
+    Live { expires_unix_ns: i64 },
+    /// MAC-valid but at or past its expiry: the query it was minted for is
+    /// over.
+    Expired,
 }
 
 impl CapabilityReject {
@@ -832,10 +845,21 @@ impl FragmentService {
     /// the claims. No store read, no cache, no coordination, no durable state.
     ///
     /// Every failure is a typed [`CapabilityReject`], counted under its closed
-    /// `reason` label, and mapped to `Unauthenticated`. The checks run in a fixed
-    /// order (present, MAC, expiry, tenant, query) so a capability that fails
-    /// multiple ways is attributed to the first, most-fundamental reason.
-    fn verify_capability(&self, request: &pb::FetchRequest) -> Result<(), tonic::Status> {
+    /// `reason` label. The checks run in a fixed order (present, MAC, expiry,
+    /// tenant, query) so a capability that fails multiple ways is attributed to
+    /// the first, most-fundamental reason. Every failure but expiry is mapped
+    /// to `Unauthenticated`.
+    ///
+    /// Expiry is the one check that does not refuse with a `tonic::Status`: a
+    /// MAC-valid capability past its expiry returns [`CapabilityCheck::Expired`],
+    /// which the handler counts and answers in-band with a `TIMEOUT` summary,
+    /// so the coordinator reads it as the query's deadline rather than as a
+    /// worker to route around. A live capability returns its `expires_unix_ns`, which the
+    /// handler checks again once admitted and bounds the slice's run by.
+    fn verify_capability(
+        &self,
+        request: &pb::FetchRequest,
+    ) -> Result<CapabilityCheck, tonic::Status> {
         let reject = |reason: CapabilityReject, message: &'static str| {
             self.inner.metrics.record_capability_reject(reason);
             Err(tonic::Status::unauthenticated(message))
@@ -870,13 +894,10 @@ impl FragmentService {
                 "fragment request rejected: capability MAC did not verify",
             );
         }
-        // Expiry reuses the deadline the protocol already enforces cluster-wide.
-        // A capability whose expiry is at or before now is dead.
+        // The expiry is the query's own deadline. A capability whose expiry is
+        // at or before now is dead.
         if claims.expires_unix_ns <= self.inner.clock.now_ns() {
-            return reject(
-                CapabilityReject::Expired,
-                "fragment request rejected: capability expired",
-            );
+            return Ok(CapabilityCheck::Expired);
         }
         // The wire tenant must equal the authorized tenant: a capability minted
         // for one tenant cannot authorize a fetch that names another. This is
@@ -898,7 +919,54 @@ impl FragmentService {
                 "fragment request rejected: capability query does not match request",
             );
         }
-        Ok(())
+        Ok(CapabilityCheck::Live {
+            expires_unix_ns: claims.expires_unix_ns,
+        })
+    }
+
+    /// The in-band refusal of a slice whose query deadline has already passed:
+    /// a zero-spend `TIMEOUT` summary. Shared by the checks on arrival and
+    /// after admission, so both read the same on the wire. A `Pinned` refusal
+    /// is a dead capability and counts under the `Expired` reject reason; a
+    /// Resolve refusal carries no capability and counts nowhere.
+    fn refuse_at_deadline(&self, class: AdmissionClass) -> pb::FetchResponse {
+        let message = match class {
+            AdmissionClass::Pinned => {
+                self.inner
+                    .metrics
+                    .record_capability_reject(CapabilityReject::Expired);
+                "fragment request refused: capability expired"
+            }
+            AdmissionClass::Resolve => "federated fetch refused: the query's deadline has passed",
+        };
+        expired_slice_summary(&QueryAccountingSnapshot::default(), message.to_string())
+    }
+
+    /// Run an admitted slice for at most `remaining` of this worker's clock,
+    /// the time left to its query's deadline: a `Pinned` capability's expiry,
+    /// or the deadline a federating coordinator put on a Resolve request.
+    /// Reaching it drops the run, so the slice issues no store request once
+    /// the timer fires (which, like the engine's own deadline, can be up to
+    /// the timer's resolution late) and returns no result. The slice then
+    /// ends in-band with a `TIMEOUT` summary carrying what it spent before the
+    /// stop, which the coordinator treats as terminal for the query: no
+    /// re-dispatch and no local read.
+    async fn run_until_deadline(
+        &self,
+        request: pb::FetchRequest,
+        remaining: Duration,
+    ) -> Vec<pb::FetchResponse> {
+        let spent = QueryAccounting::new();
+        tokio::select! {
+            // Biased so a run that finishes in the same poll as the deadline
+            // still loses: the deadline is exclusive.
+            biased;
+            () = self.inner.clock.sleep(remaining) => vec![expired_slice_summary(
+                &spent.snapshot(),
+                "fragment slice stopped: the query's deadline passed while it ran".to_string(),
+            )],
+            frames = self.resolve_and_run(request, false, spent.clone()) => frames,
+        }
     }
 
     /// Authenticate a cross-cluster federation (resolve-scope) request and
@@ -1044,10 +1112,14 @@ impl FragmentService {
     /// by [`run_local`](Self::run_local), and only changes the status a
     /// retryable record GET fails with (see
     /// [`SeriesFetchService::with_local_attempt`]).
+    ///
+    /// The slice's fetches are charged to `spent`, which a caller that may drop
+    /// the run keeps a clone of (see [`run_until_deadline`](Self::run_until_deadline)).
     async fn resolve_and_run(
         &self,
         request: pb::FetchRequest,
         local_attempt: bool,
+        spent: QueryAccounting,
     ) -> Vec<pb::FetchResponse> {
         // A cross-cluster resolve scope is rewritten to a pinned scope over this
         // cluster's own snapshot, and keeps the snapshot resolver that rewrite
@@ -1057,11 +1129,12 @@ impl FragmentService {
         match &request.scope {
             Some(pb::fetch_request::Scope::Resolve(_)) => {
                 let (request, resolver) = self.resolve_scope(request).await;
-                self.run_slice(request, resolver, true, local_attempt).await
+                self.run_slice(request, resolver, true, local_attempt, spent)
+                    .await
             }
             _ => match self.build_resolver(&request) {
                 Some(resolver) => {
-                    self.run_slice(request, resolver, false, local_attempt)
+                    self.run_slice(request, resolver, false, local_attempt, spent)
                         .await
                 }
                 // The delegate refuses an undecodable tenant hash or a
@@ -1069,7 +1142,7 @@ impl FragmentService {
                 // call, so this stand-in is never consulted.
                 None => {
                     let resolver = Arc::new(SnapshotSegmentResolver::new(std::iter::empty()));
-                    self.run_slice(request, resolver, false, local_attempt)
+                    self.run_slice(request, resolver, false, local_attempt, spent)
                         .await
                 }
             },
@@ -1084,6 +1157,7 @@ impl FragmentService {
         resolver: Arc<R>,
         federated: bool,
         local_attempt: bool,
+        spent: QueryAccounting,
     ) -> Vec<pb::FetchResponse> {
         let mut fetcher = SegmentFetcher::new(self.inner.store.clone())
             .with_get_limiter(self.inner.get_limiter.clone())
@@ -1102,7 +1176,8 @@ impl FragmentService {
         // reported (ADR-0071 record-GET counter amendment).
         let mut service = SeriesFetchService::new(fetcher, resolver)
             .with_engine_config(self.engine)
-            .with_record_get_observer(self.inner.metrics.clone());
+            .with_record_get_observer(self.inner.metrics.clone())
+            .with_slice_accounting(spent);
         if federated {
             service = service.with_resolve_scope();
         }
@@ -1148,7 +1223,9 @@ impl FragmentService {
     /// it: the self-mapped or unroutable slice, and the fallback after the
     /// remote ladder is exhausted.
     async fn run_local(&self, request: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
-        let frames = self.resolve_and_run(request, true).await;
+        let frames = self
+            .resolve_and_run(request, true, QueryAccounting::new())
+            .await;
         decode_slice_frames(frames)
     }
 }
@@ -1162,6 +1239,11 @@ impl SeriesFetch for FragmentService {
         request: tonic::Request<pb::FetchRequest>,
     ) -> Result<tonic::Response<Self::FetchStream>, tonic::Status> {
         let (metadata, _extensions, mut inner) = request.into_parts();
+        // The instant the slice's query stops: a verified `Pinned`
+        // capability's expiry, or the deadline a federating coordinator put on
+        // a Resolve request. `None` only for a Resolve request from a
+        // coordinator that sends none (`0`), which runs unbounded here.
+        let deadline_unix_ns;
         // Two distinct trust models share this surface (ADR-0071 security):
         //  - Pinned scope (intra-cluster fan-out): a per-tenant, per-query
         //    fragment capability carried in the request, with the tenant taken
@@ -1192,6 +1274,15 @@ impl SeriesFetch for FragmentService {
                 }
                 let tenant = self.resolve_federation_tenant(&metadata)?;
                 inner.tenant_hash = tenant.0.to_vec();
+                // The deadline is the coordinator's wall clock read against
+                // this cluster's: the same skew shape a Flight ticket's expiry
+                // has (ADR-0071).
+                deadline_unix_ns = (inner.deadline_unix_ns > 0).then_some(inner.deadline_unix_ns);
+                if deadline_unix_ns.is_some_and(|d| d <= self.inner.clock.now_ns()) {
+                    return Ok(frames_response(vec![
+                        self.refuse_at_deadline(AdmissionClass::Resolve),
+                    ]));
+                }
             }
             _ => {
                 if self.role == FragmentListenerRole::PublicFederation {
@@ -1201,7 +1292,16 @@ impl SeriesFetch for FragmentService {
                          --fragment-listener over TLS (ADR-0071 amendment decision 1).",
                     ));
                 }
-                self.verify_capability(&inner)?;
+                match self.verify_capability(&inner)? {
+                    CapabilityCheck::Live { expires_unix_ns } => {
+                        deadline_unix_ns = Some(expires_unix_ns);
+                    }
+                    CapabilityCheck::Expired => {
+                        return Ok(frames_response(vec![
+                            self.refuse_at_deadline(AdmissionClass::Pinned),
+                        ]));
+                    }
+                }
             }
         }
         // Pinned and Resolve admit against disjoint classes (issue #1722), so a peer cluster's
@@ -1214,18 +1314,42 @@ impl SeriesFetch for FragmentService {
         let Some(_permit) = self.inner.admission.for_class(class).acquire().await else {
             return Err(tonic::Status::unavailable("fragment admission unavailable"));
         };
-        self.inner.metrics.record_fragment_request();
         // An inbound request, not a local attempt: this coordinator can still
         // re-dispatch the slice elsewhere, so a retryable record GET stays
         // `Unavailable`.
-        let frames = self.resolve_and_run(inner, false).await;
+        let frames = match deadline_unix_ns {
+            Some(deadline_unix_ns) => {
+                // A deadline can pass while its request queues for admission.
+                // Refused before any store request, and before the request is
+                // counted, as the check on arrival refuses.
+                let now_ns = self.inner.clock.now_ns();
+                if deadline_unix_ns <= now_ns {
+                    vec![self.refuse_at_deadline(class)]
+                } else {
+                    self.inner.metrics.record_fragment_request();
+                    let remaining = Duration::from_nanos(
+                        u64::try_from(deadline_unix_ns.saturating_sub(now_ns)).unwrap_or(0),
+                    );
+                    self.run_until_deadline(inner, remaining).await
+                }
+            }
+            None => {
+                self.inner.metrics.record_fragment_request();
+                self.resolve_and_run(inner, false, QueryAccounting::new())
+                    .await
+            }
+        };
         // The permit (and its in-flight gauge decrement) is held across the
         // eager fetch above, the whole admission window, then released here
         // before the already-built frames replay as a stream.
         drop(_permit);
-        let stream = futures::stream::iter(frames.into_iter().map(Ok));
-        Ok(tonic::Response::new(Box::pin(stream)))
+        Ok(frames_response(frames))
     }
+}
+
+/// Replay a slice's already-built frames as the handler's response stream.
+fn frames_response(frames: Vec<pb::FetchResponse>) -> tonic::Response<FragmentStream> {
+    tonic::Response::new(Box::pin(futures::stream::iter(frames.into_iter().map(Ok))))
 }
 
 /// One per-slice entry in a distributed query's `stats.fragments[]` (ADR-0071
@@ -1724,8 +1848,9 @@ impl RoutingSliceFetcher {
 
     /// Attempt one remote dispatch and classify the outcome for re-dispatch
     /// (ADR-0071 deliverable 1). Transport loss and an `Unavailable` summary are
-    /// [`Attempt::Retry`] (re-dispatchable); every other outcome, success or a
-    /// hard decode/framing error, is [`Attempt::Keep`] and terminal.
+    /// [`Attempt::Retry`] (re-dispatchable); every other outcome, success, a
+    /// `TIMEOUT` summary, or a hard decode/framing error, is [`Attempt::Keep`]
+    /// and terminal.
     ///
     /// Retrying drops the attempt's RESULT, never its COST (issue #1723): an
     /// `Unavailable` summary carries what that worker spent before it gave up,
@@ -1751,6 +1876,15 @@ impl RoutingSliceFetcher {
                     accounting: response.accounting,
                     stats: response.stats,
                 }))
+            }
+            // The worker stopped the slice at the query's deadline, or refused
+            // it because that deadline had already passed. The worker is
+            // healthy and any other attempt, this coordinator's own included,
+            // would run past the same deadline, so this is terminal: no
+            // quarantine, no re-dispatch, no local read. The spend it made
+            // before the stop rides on the response.
+            Ok(response) if response.status == pb::status::Code::Timeout => {
+                Attempt::Keep(Box::new(Ok(response)))
             }
             Ok(response) => Attempt::Keep(Box::new(Ok(response))),
             Err(DistribError::Transport(message)) => {
@@ -1953,7 +2087,8 @@ impl RoutingSliceFetcher {
     /// * The top owner is this coordinator (or the unit is unroutable / has no
     ///   version-matched worker): run local, no hop, no fallback needed.
     /// * The top owner is remote: dispatch to it. On a terminal outcome
-    ///   (success, or a hard decode/corruption error) return it. On transport
+    ///   (success, a hard decode/corruption error, or a `TIMEOUT` summary from
+    ///   a worker that stopped at the query's deadline) return it. On transport
     ///   loss or an `Unavailable` summary, re-dispatch EXACTLY once to the next
     ///   rendezvous worker (skipping the failed one). If that next worker is
     ///   this coordinator, or is absent, or also fails re-dispatchably, execute
@@ -2586,7 +2721,7 @@ mod tests {
 
         let tenant = [3u8; 16];
         let query = [4u8; 16];
-        let cap = mint(&TEST_KEY, tenant, metrics_signal(), query, now + 1_000);
+        let cap = mint(&TEST_KEY, tenant, metrics_signal(), query, now + HOUR_NS);
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
@@ -2643,7 +2778,7 @@ mod tests {
         let service = capability_service(now, test_keys(), metrics.clone());
         let tenant = [1u8; 16];
         let query = [2u8; 16];
-        let cap = mint(&TEST_KEY, tenant, metrics_signal(), query, now + 1_000);
+        let cap = mint(&TEST_KEY, tenant, metrics_signal(), query, now + HOUR_NS);
 
         pinned_fetch(&service, pinned_with_cap(tenant, query, cap))
             .await
@@ -2663,8 +2798,10 @@ mod tests {
     }
 
     /// Each reject reason fires independently, increments only its own labeled
-    /// counter, refuses the request with `Unauthenticated`, and short-circuits
-    /// before the request is served (so `fragment_requests_total` stays 0).
+    /// counter, refuses the request, and short-circuits before the request is
+    /// served (so `fragment_requests_total` stays 0). Every reason but `Expired`
+    /// refuses with `Unauthenticated`; `Expired` refuses in-band with a
+    /// zero-spend `TIMEOUT` summary.
     #[tokio::test]
     async fn each_capability_reject_reason_is_labeled_and_counted() {
         let now = 1_000;
@@ -2680,7 +2817,7 @@ mod tests {
         // missing: no capability at all.
         let missing = pinned_with_cap(tenant, query, Vec::new());
         // bad MAC: a valid capability with one flipped byte.
-        let mut tampered = mint(&TEST_KEY, tenant, signal, query, now + 1_000);
+        let mut tampered = mint(&TEST_KEY, tenant, signal, query, now + HOUR_NS);
         let last = tampered.len() - 1;
         tampered[last] ^= 0x01;
         let bad_mac = pinned_with_cap(tenant, query, tampered);
@@ -2690,13 +2827,13 @@ mod tests {
         let tenant_mismatch = pinned_with_cap(
             [9u8; 16],
             query,
-            mint(&TEST_KEY, tenant, signal, query, now + 1_000),
+            mint(&TEST_KEY, tenant, signal, query, now + HOUR_NS),
         );
         // query mismatch: capability names a different query id.
         let query_mismatch = pinned_with_cap(
             tenant,
             [8u8; 16],
-            mint(&TEST_KEY, tenant, signal, query, now + 1_000),
+            mint(&TEST_KEY, tenant, signal, query, now + HOUR_NS),
         );
 
         let cases = [
@@ -2725,10 +2862,18 @@ mod tests {
         for case in cases {
             let metrics = Arc::new(FragmentMetrics::new());
             let service = capability_service(now, test_keys(), metrics.clone());
-            let err = pinned_fetch(&service, case.request)
-                .await
-                .expect_err("a mismatched capability is rejected");
-            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            let outcome = pinned_fetch(&service, case.request).await;
+            if case.reason == CapabilityReject::Expired {
+                // The query the capability was minted for is over: refused
+                // in-band as the deadline, with nothing spent, so the
+                // coordinator does not route around a healthy worker.
+                let response = outcome.expect("an expired capability is refused in-band");
+                assert_eq!(response.status, pb::status::Code::Timeout);
+                assert_eq!(response.accounting, QueryAccountingSnapshot::default());
+            } else {
+                let err = outcome.expect_err("a mismatched capability is rejected");
+                assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            }
             assert_eq!(
                 metrics.capability_rejects(case.reason),
                 1,
@@ -2770,7 +2915,7 @@ mod tests {
         let service = capability_service(now, test_keys(), metrics.clone());
 
         // A genuine, MAC-valid, unexpired capability for tenant A.
-        let cap_for_a = mint(&TEST_KEY, tenant_a, metrics_signal(), query, now + 1_000);
+        let cap_for_a = mint(&TEST_KEY, tenant_a, metrics_signal(), query, now + HOUR_NS);
         // Present it on a fetch that names tenant B on the wire.
         let request = pinned_with_cap(tenant_b, query, cap_for_a);
 
@@ -2810,7 +2955,7 @@ mod tests {
             pinned_with_cap(
                 tenant,
                 query,
-                mint(&key_new, tenant, signal, query, now + 1_000),
+                mint(&key_new, tenant, signal, query, now + HOUR_NS),
             ),
         )
         .await
@@ -2826,7 +2971,7 @@ mod tests {
             pinned_with_cap(
                 tenant,
                 query,
-                mint(&key_old, tenant, signal, query, now + 1_000),
+                mint(&key_old, tenant, signal, query, now + HOUR_NS),
             ),
         )
         .await
@@ -4730,8 +4875,12 @@ mod tests {
         let service = pinned_service(fault.clone(), 4 * HOUR_NS);
         let request = pinned_over_window(tenant_hash, &seg, envelope(&seg));
 
-        let inbound = decode_slice_frames(service.resolve_and_run(request.clone(), false).await)
-            .expect("inbound run");
+        let inbound = decode_slice_frames(
+            service
+                .resolve_and_run(request.clone(), false, QueryAccounting::new())
+                .await,
+        )
+        .expect("inbound run");
         assert_eq!(fault.fault_count(Op::Get, FaultKind::Transient), 1);
         assert_eq!(
             inbound.status,
@@ -6851,6 +7000,671 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         assert_eq!(
             entry.bytes_reported, PAID.get_bytes,
             "a failed fragment reports the bytes its error carried"
+        );
+    }
+
+    // --- Fragment reads end at the query's own deadline (issue #2385) -------
+
+    /// Mints each slice's capability exactly as the coordinator's
+    /// [`RoutingSliceFetcher`] does, records the minted expiry, then runs the
+    /// slice through that same fetcher.
+    struct MintRecorder {
+        routing: RoutingSliceFetcher,
+        expiries: Mutex<Vec<i64>>,
+    }
+
+    #[async_trait]
+    impl SliceFetcher for MintRecorder {
+        async fn fetch(&self, request: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+            let minted = self
+                .routing
+                .mint_capability(&request)
+                .expect("the coordinator mints for an engine-built request");
+            let (claims, _mac) = codec::decode_capability(&minted).expect("decode");
+            self.expiries.lock().push(claims.expires_unix_ns);
+            self.routing.fetch(request).await
+        }
+    }
+
+    /// A PromQL query whose request deadline (5 s) is below the engine's
+    /// configured deadline (60 s) mints its fragment capability to expire at
+    /// request entry plus the request deadline, the instant the query itself
+    /// stops, not at entry plus the engine's ceiling.
+    #[tokio::test]
+    async fn a_request_deadline_below_the_engine_deadline_is_the_capability_expiry() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new("short-request-deadline".to_string());
+        publish_metric(store.as_ref(), &tenant, HOUR_NS).await;
+        let now = 4 * HOUR_NS;
+        let engine_deadline = Duration::from_secs(60);
+        let request_deadline = Duration::from_secs(5);
+        let recorder = Arc::new(MintRecorder {
+            routing: RoutingSliceFetcher::new(
+                Arc::new(OnceLock::new()),
+                Arc::new(RwLock::new(Arc::new(Vec::new()))),
+                test_keys(),
+                pinned_service(store.clone(), now),
+                Arc::new(FragmentMetrics::new()),
+            ),
+            expiries: Mutex::new(Vec::new()),
+        });
+        let distributed = Arc::new(ravel_query::distrib::Distributed::new(
+            recorder.clone(),
+            // Zero thresholds put even this one-segment snapshot on the
+            // distributed path.
+            ravel_query::distrib::partition::DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 1,
+            },
+        ));
+        let catalog =
+            Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+        let engine = ravel_query::QueryEngine::new(
+            catalog,
+            store,
+            ravel_query::EngineConfig {
+                deadline: engine_deadline,
+                ..ravel_query::EngineConfig::default()
+            },
+        )
+        .with_distributed(distributed);
+
+        let t_ms = (HOUR_NS + 30_000_000_000) / 1_000_000;
+        let (value, _stats) = engine
+            .instant_with_stats(tenant.hash(), "m", t_ms, &[], now, request_deadline)
+            .await
+            .expect("the distributed query answers");
+
+        assert_eq!(
+            *recorder.expiries.lock(),
+            vec![now + 5_000_000_000],
+            "one slice, its capability expiring at entry plus the request deadline"
+        );
+        match value {
+            ravel_promql::Value::Vector(samples) => {
+                assert_eq!(samples.len(), 1, "the slice ran and read the series")
+            }
+            other => panic!("expected an instant vector, got {other:?}"),
+        }
+    }
+
+    /// A worker clock a test moves by hand. `sleep` completes once the clock
+    /// reaches the end of the requested span, so a slice bounded by it ends
+    /// when the test moves the clock, never because real time passed.
+    struct SteppedClock {
+        now_ns: std::sync::atomic::AtomicI64,
+        moved: tokio::sync::watch::Sender<()>,
+    }
+
+    impl SteppedClock {
+        fn new(now_ns: i64) -> Arc<Self> {
+            let (moved, _) = tokio::sync::watch::channel(());
+            Arc::new(SteppedClock {
+                now_ns: std::sync::atomic::AtomicI64::new(now_ns),
+                moved,
+            })
+        }
+
+        fn set(&self, now_ns: i64) {
+            self.now_ns.store(now_ns, Ordering::SeqCst);
+            self.moved.send_replace(());
+        }
+    }
+
+    impl Clock for SteppedClock {
+        fn now_ns(&self) -> i64 {
+            self.now_ns.load(Ordering::SeqCst)
+        }
+
+        fn sleep(
+            &self,
+            dur: Duration,
+        ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            let until = self
+                .now_ns()
+                .saturating_add(i64::try_from(dur.as_nanos()).unwrap_or(i64::MAX));
+            let mut moved = self.moved.subscribe();
+            Box::pin(async move {
+                while self.now_ns() < until {
+                    if moved.changed().await.is_err() {
+                        return;
+                    }
+                }
+            })
+        }
+    }
+
+    /// Counts every store call as it is issued, before it reaches the wrapped
+    /// backend, so a call held or cancelled inside that backend still counts.
+    struct IssuedCalls {
+        inner: Arc<dyn ObjectStoreBackend>,
+        calls: AtomicU64,
+    }
+
+    impl IssuedCalls {
+        fn issued(&self) -> u64 {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn count(&self) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStoreBackend for IssuedCalls {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: ravel_object_store::PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+            self.count();
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: ravel_object_store::GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+            self.count();
+            self.inner.get(key, range).await
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn ravel_object_store::MultipartUpload + 'a>, ravel_object_store::StoreError>
+        {
+            self.count();
+            self.inner.put_multipart(key).await
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+            self.count();
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+            self.count();
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+            self.count();
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+            self.count();
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    const EXPIRY_NOW_NS: i64 = 4 * HOUR_NS;
+    /// The capability's expiry, a microsecond after the worker's starting clock.
+    const EXPIRES_NS: i64 = EXPIRY_NOW_NS + 1_000;
+
+    /// A worker over one published segment, reading through a hold-capable
+    /// `FaultStore` behind an issued-call counter, with a `Pinned` admission
+    /// class of one and a clock the test moves, plus the `Pinned` request for
+    /// that segment carrying a capability that expires at [`EXPIRES_NS`], and
+    /// a federated Resolve request for the same tenant, authorized by
+    /// [`PEER_TOKEN`] and carrying [`EXPIRES_NS`] as its query deadline.
+    struct ExpiryFixture {
+        service: FragmentService,
+        admission: AdmissionClasses,
+        metrics: Arc<FragmentMetrics>,
+        clock: Arc<SteppedClock>,
+        fault: Arc<ravel_object_store::fault::FaultStore<Arc<MemoryStore>>>,
+        issued: Arc<IssuedCalls>,
+        request: pb::FetchRequest,
+        resolve_request: pb::FetchRequest,
+        data_key: String,
+    }
+
+    /// The tenant credential a federating peer presents to the fixture.
+    const PEER_TOKEN: &str = "peer-token";
+
+    async fn expiry_fixture(name: &str) -> ExpiryFixture {
+        let memory = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new(name.to_string());
+        publish_metric(memory.as_ref(), &tenant, HOUR_NS).await;
+        let backing: Arc<dyn ObjectStoreBackend> = memory.clone();
+        let seg = only_segment(&backing, tenant.hash(), EXPIRY_NOW_NS).await;
+        let fault = Arc::new(ravel_object_store::fault::FaultStore::new(
+            Arc::clone(&memory),
+            ravel_object_store::fault::FaultPlan::empty(),
+        ));
+        let issued = Arc::new(IssuedCalls {
+            inner: fault.clone(),
+            calls: AtomicU64::new(0),
+        });
+        let store: Arc<dyn ObjectStoreBackend> = issued.clone();
+        let metrics = Arc::new(FragmentMetrics::new());
+        let admission = AdmissionClasses::new(1, 1, metrics.clone());
+        let clock = SteppedClock::new(EXPIRY_NOW_NS);
+        let catalog =
+            Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+        let peer: Arc<dyn TenantResolver> =
+            Arc::new(ravel_query::http::StaticBearerTokenResolver::new(
+                std::collections::HashMap::from([(PEER_TOKEN.to_string(), tenant.clone())]),
+            ));
+        let service = FragmentService::new(
+            test_keys(),
+            peer,
+            admission.clone(),
+            catalog,
+            store,
+            None,
+            clock.clone(),
+            metrics.clone(),
+            Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+        );
+        let query = [7u8; 16];
+        let mut request = pinned_over_window(tenant.hash(), &seg, envelope(&seg));
+        request.query_id = query.to_vec();
+        request.fragment_capability = mint(
+            &TEST_KEY,
+            tenant.hash().0,
+            metrics_signal(),
+            query,
+            EXPIRES_NS,
+        );
+        let mut resolve_request = resolve_request(tenant.hash(), 2 * HOUR_NS);
+        resolve_request.deadline_unix_ns = EXPIRES_NS;
+        ExpiryFixture {
+            service,
+            admission,
+            metrics,
+            clock,
+            fault,
+            issued,
+            request,
+            resolve_request,
+            data_key: seg.data_object_key,
+        }
+    }
+
+    /// Control for the two expiry tests below: on the same fixture, a
+    /// capability that stays live serves the slice, and the slice issues
+    /// exactly two store requests (the commit record and the data object), so
+    /// the zero and the one those tests assert are not what any slice issues.
+    #[tokio::test]
+    async fn a_live_capability_serves_the_slice_through_the_expiry_fixture() {
+        let fx = expiry_fixture("expiry-control").await;
+        let response = pinned_fetch(&fx.service, fx.request.clone())
+            .await
+            .expect("a live capability is served");
+        assert_eq!(
+            response.status,
+            pb::status::Code::Ok,
+            "{}",
+            response.status_message
+        );
+        assert_eq!(response.series_returned, 1);
+        assert_eq!(fx.issued.issued(), 2, "one record GET and one data GET");
+        assert_eq!(fx.metrics.fragment_requests_total(), 1);
+    }
+
+    /// A capability valid on arrival that expires while its request waits for
+    /// admission is refused once admitted, in-band with a zero-spend `TIMEOUT`
+    /// summary, counted under verification's own `Expired` reason, and the
+    /// slice issues zero store requests.
+    #[tokio::test]
+    async fn a_capability_that_expires_in_admission_is_refused_before_any_store_request() {
+        let fx = expiry_fixture("expires-in-admission").await;
+        let held = fx
+            .admission
+            .for_class(AdmissionClass::Pinned)
+            .acquire()
+            .await
+            .expect("the only Pinned permit");
+        let service = fx.service.clone();
+        let request = fx.request.clone();
+        let fetch = tokio::spawn(async move { pinned_fetch(&service, request).await });
+        // Verified on arrival, then queued behind the held permit.
+        while fx
+            .metrics
+            .fragment_admission_waits_total(AdmissionClass::Pinned)
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(fx.metrics.capability_rejects(CapabilityReject::Expired), 0);
+
+        fx.clock.set(EXPIRES_NS);
+        drop(held);
+        let outcome = fetch.await.expect("fetch task");
+
+        assert_eq!(
+            fx.issued.issued(),
+            0,
+            "no store request for a dead capability"
+        );
+        let response = outcome.expect("an expired capability is refused in-band");
+        assert_eq!(response.status, pb::status::Code::Timeout);
+        assert_eq!(
+            response.status_message,
+            "fragment request refused: capability expired"
+        );
+        assert_eq!(response.accounting, QueryAccountingSnapshot::default());
+        assert_eq!(
+            fx.metrics.capability_rejects(CapabilityReject::Expired),
+            1,
+            "counted under the same reason verification uses"
+        );
+        assert_eq!(
+            fx.metrics.fragment_requests_total(),
+            0,
+            "a refused request is not served, as at verification"
+        );
+    }
+
+    /// A slice whose capability expires while its first store request is in
+    /// flight issues no further store request, and ends in-band with a
+    /// `TIMEOUT` summary.
+    ///
+    /// Mutation proof: answering a slice `run_until_deadline` stopped with a
+    /// gRPC `deadline_exceeded` status again, as before #2385, fails the
+    /// `expect` on the in-band response.
+    #[tokio::test]
+    async fn a_capability_that_expires_mid_run_stops_the_slice_before_its_next_store_request() {
+        use ravel_object_store::fault::{Occurrence, Op};
+
+        let fx = expiry_fixture("expires-mid-run").await;
+        let gate = fx
+            .fault
+            .hold(Op::Get, Some(".cmt".to_string()), Occurrence::Nth(1));
+        let service = fx.service.clone();
+        let request = fx.request.clone();
+        let fetch = tokio::spawn(async move { pinned_fetch(&service, request).await });
+        gate.wait_until_held(1).await;
+        assert_eq!(
+            fx.issued.issued(),
+            1,
+            "the held record GET is the slice's first store request"
+        );
+
+        fx.clock.set(EXPIRES_NS);
+        for id in gate.held() {
+            gate.release(id);
+        }
+        let outcome = fetch.await.expect("fetch task");
+
+        assert_eq!(
+            fx.issued.issued(),
+            1,
+            "no store request is issued after the expiry"
+        );
+        let response = outcome.expect("a slice past its expiry ends in-band");
+        assert_eq!(response.status, pb::status::Code::Timeout);
+        assert_eq!(
+            response.series_returned, 0,
+            "no result read before the stop"
+        );
+        assert_eq!(
+            fx.metrics.capability_rejects(CapabilityReject::Expired),
+            0,
+            "admitted live, so this is the run's bound, not a capability reject"
+        );
+    }
+
+    /// A slice stopped at its expiry reports what it spent before the stop
+    /// (issue #1723): its data GET was issued, and is counted at issue, before
+    /// the expiry, so the `TIMEOUT` summary carries exactly that one request.
+    ///
+    /// Mutation proof: building the summary from a zero snapshot instead of
+    /// the run's `spent` handle in `run_until_deadline` reads 0 requests.
+    #[tokio::test]
+    async fn a_slice_stopped_at_its_expiry_reports_the_request_it_had_issued() {
+        use ravel_object_store::fault::{Occurrence, Op};
+
+        let fx = expiry_fixture("expires-with-spend").await;
+        let gate = fx
+            .fault
+            .hold(Op::Get, Some(fx.data_key.clone()), Occurrence::Nth(1));
+        let service = fx.service.clone();
+        let request = fx.request.clone();
+        let fetch = tokio::spawn(async move { pinned_fetch(&service, request).await });
+        gate.wait_until_held(1).await;
+        assert_eq!(
+            fx.issued.issued(),
+            2,
+            "the record GET, then the held data GET"
+        );
+
+        fx.clock.set(EXPIRES_NS);
+        for id in gate.held() {
+            gate.release(id);
+        }
+        let response = fetch
+            .await
+            .expect("fetch task")
+            .expect("a slice past its expiry ends in-band");
+
+        assert_eq!(response.status, pb::status::Code::Timeout);
+        assert_eq!(
+            response
+                .accounting
+                .s3_requests(ravel_types::accounting::AccountedOp::Get),
+            1,
+            "the data GET issued before the stop; the record GET is off the slice's budget"
+        );
+        assert_eq!(response.accounting.total_s3_requests(), 1);
+    }
+
+    /// Issue #2385 on the federation path: a Resolve request whose query
+    /// deadline has already passed is refused in-band before any store
+    /// request, and is not a capability reject (it carries no capability).
+    ///
+    /// Mutation proof: ignoring the request's `deadline_unix_ns` on the
+    /// Resolve arm of `FragmentService::fetch` (the pre-#2385 unbounded run)
+    /// serves the slice `Ok`.
+    #[tokio::test]
+    async fn a_federated_fetch_past_its_deadline_is_refused_before_any_store_request() {
+        let fx = expiry_fixture("federated-past-deadline").await;
+        let mut request = fx.resolve_request.clone();
+        request.deadline_unix_ns = EXPIRY_NOW_NS;
+
+        let response = fetch_decoded(&fx.service, request, PEER_TOKEN)
+            .await
+            .expect("refused in-band");
+
+        assert_eq!(response.status, pb::status::Code::Timeout);
+        assert_eq!(
+            response.status_message,
+            "federated fetch refused: the query's deadline has passed"
+        );
+        assert_eq!(fx.issued.issued(), 0, "no store request past the deadline");
+        assert_eq!(fx.metrics.fragment_requests_total(), 0);
+        for reason in CapabilityReject::ALL {
+            assert_eq!(fx.metrics.capability_rejects(reason), 0);
+        }
+    }
+
+    /// Issue #2385 on the federation path: an admitted Resolve slice stops at
+    /// the query deadline the federating coordinator sent, issues no store
+    /// request after it, and ends in-band with `TIMEOUT` carrying the data GET
+    /// it had issued. The control run on a fresh fixture shows the same
+    /// request, with its deadline still ahead, is served `Ok`.
+    ///
+    /// Mutation proof: as for the refusal test above, an unbounded Resolve run
+    /// ends `Ok` with the series instead of `TIMEOUT`.
+    #[tokio::test]
+    async fn a_federated_fetch_stops_at_its_deadline_and_reports_its_spend() {
+        use ravel_object_store::fault::{Occurrence, Op};
+
+        let control = expiry_fixture("federated-control").await;
+        let served = fetch_decoded(
+            &control.service,
+            control.resolve_request.clone(),
+            PEER_TOKEN,
+        )
+        .await
+        .expect("served");
+        assert_eq!(
+            served.status,
+            pb::status::Code::Ok,
+            "{}",
+            served.status_message
+        );
+        assert_eq!(served.series_returned, 1);
+
+        let fx = expiry_fixture("federated-mid-run").await;
+        let gate = fx
+            .fault
+            .hold(Op::Get, Some(fx.data_key.clone()), Occurrence::Nth(1));
+        let service = fx.service.clone();
+        let request = fx.resolve_request.clone();
+        let fetch = tokio::spawn(async move { fetch_decoded(&service, request, PEER_TOKEN).await });
+        gate.wait_until_held(1).await;
+        let issued_before_stop = fx.issued.issued();
+
+        fx.clock.set(EXPIRES_NS);
+        for id in gate.held() {
+            gate.release(id);
+        }
+        let response = fetch
+            .await
+            .expect("fetch task")
+            .expect("a federated slice past its deadline ends in-band");
+
+        assert_eq!(response.status, pb::status::Code::Timeout);
+        assert_eq!(response.series_returned, 0);
+        assert_eq!(
+            fx.issued.issued(),
+            issued_before_stop,
+            "no store request is issued after the deadline"
+        );
+        assert_eq!(
+            response.accounting.total_s3_requests(),
+            1,
+            "the held data GET, counted at issue"
+        );
+    }
+
+    /// Issue #2385, the coordinator half: a remote worker that ends a slice
+    /// `TIMEOUT` (it stopped at the query's deadline) ends the query.
+    ///
+    /// Both live workers answer the same way, so the total attempt count is
+    /// the re-dispatch check whichever of them ranks first. The coordinator's
+    /// local fragment service reads through its own call counter, so zero
+    /// there means no local read of the slice; the quarantine map and the
+    /// re-dispatch and fallback counters say the worker was not treated as
+    /// dead. The fragment stats entry carries the stopped attempt's spend, and
+    /// the query fails `DeadlineExceeded` with its own request deadline.
+    ///
+    /// Mutation proof: classifying a `TIMEOUT` summary as `Attempt::Retry` in
+    /// `try_remote`, which is how a transport loss is handled, sends the slice
+    /// down the re-dispatch ladder to a local read that answers the query, so
+    /// the `expect_err` below fails.
+    #[tokio::test]
+    async fn a_worker_stopped_at_the_deadline_ends_the_query_without_a_retry() {
+        const PAID: Spend = Spend {
+            get_requests: 2,
+            get_bytes: 6_144,
+            raw_f64_pages: 0,
+            raw_f64_bytes: 0,
+        };
+        let memory = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new("stopped-at-deadline".to_string());
+        publish_metric(memory.as_ref(), &tenant, HOUR_NS).await;
+        let now = 4 * HOUR_NS;
+        let backing: Arc<dyn ObjectStoreBackend> = memory.clone();
+        let local_store = Arc::new(IssuedCalls {
+            inner: backing.clone(),
+            calls: AtomicU64::new(0),
+        });
+
+        let (endpoint_a, tries_a, _keep_a) =
+            spawn_scripted(PAID, pb::status::Code::Timeout, Ending::Summary).await;
+        let (endpoint_b, tries_b, _keep_b) =
+            spawn_scripted(PAID, pb::status::Code::Timeout, Ending::Summary).await;
+        let worker = |id: u128, endpoint: &str| QueryWorkerRecord {
+            process_id: uuid::Uuid::from_u128(id).to_string(),
+            fragment_endpoint: endpoint.to_string(),
+            flight_sql_endpoint: endpoint.to_string(),
+            protocol_version: codec::PROTOCOL_VERSION,
+            started_unix_ns: 0,
+        };
+        let metrics = Arc::new(FragmentMetrics::new());
+        let routing = Arc::new(RoutingSliceFetcher::new(
+            Arc::new(OnceLock::new()),
+            Arc::new(RwLock::new(Arc::new(vec![
+                worker(7, &endpoint_a),
+                worker(8, &endpoint_b),
+            ]))),
+            test_keys(),
+            pinned_service(local_store.clone(), now),
+            metrics.clone(),
+        ));
+        let distributed = Arc::new(ravel_query::distrib::Distributed::new(
+            routing.clone(),
+            ravel_query::distrib::partition::DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 1,
+            },
+        ));
+        let catalog =
+            Arc::new(Catalog::new(backing.clone(), CatalogConfig::default()).expect("catalog"));
+        let engine =
+            ravel_query::QueryEngine::new(catalog, backing, ravel_query::EngineConfig::default())
+                .with_distributed(distributed);
+
+        let request_deadline = Duration::from_secs(5);
+        let t_ms = (HOUR_NS + 30_000_000_000) / 1_000_000;
+        let sink = FragmentStatsSink::new();
+        let outcome = with_fragment_stats(
+            sink.clone(),
+            engine.instant_with_stats(tenant.hash(), "m", t_ms, &[], now, request_deadline),
+        )
+        .await;
+
+        let err = outcome.expect_err("a slice stopped at the deadline ends the query");
+        assert!(
+            matches!(err, ravel_query::QueryError::DeadlineExceeded { deadline } if deadline == request_deadline),
+            "{err:?}"
+        );
+        assert_eq!(
+            tries_a.load(Ordering::Relaxed) + tries_b.load(Ordering::Relaxed),
+            1,
+            "dispatched once and never re-dispatched"
+        );
+        assert_eq!(
+            local_store.issued(),
+            0,
+            "the coordinator issued no local read for the slice"
+        );
+        assert!(
+            routing.quarantine.lock().is_empty(),
+            "a worker that stopped at the deadline is healthy, not quarantined"
+        );
+        assert_eq!(metrics.quarantine_current(), 0);
+        assert_eq!(metrics.slices_redispatched_total(), 0);
+        assert_eq!(metrics.slices_fallback_total(), 0);
+        let recorded = sink.take();
+        assert_eq!(recorded.len(), 1, "one slice, one entry: {recorded:?}");
+        assert_eq!(
+            recorded[0].bytes_reported, PAID.get_bytes,
+            "the stopped attempt's spend is reported"
         );
     }
 }
