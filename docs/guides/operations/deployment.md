@@ -248,9 +248,13 @@ per-role tables imply. Know this before your first deployment:
   the first process to reach a fresh bucket, and only the Maintain and Admin
   roles carry a write grant on it. Under per-role credentials, start the
   `maintain` process first on a fresh bucket, or create the object with
-  `ravel-cli gc-config set` under Admin; a gateway or query process that
-  reaches an empty bucket under its scoped credential cannot create the object
-  and does not start. The mutation path that changes an existing `sys/gc` is
+  `ravel-cli gc-config set` under Admin. A gateway or query process that
+  reaches an empty bucket under its scoped credential is refused and exits
+  with an error saying that `sys/gc` could not be created with its
+  credential and naming that fix; it keeps exiting until the object exists,
+  so a restart policy brings it up after maintain has created it. Under one
+  shared credential any server process creates `sys/gc`, so start order does
+  not matter there. The mutation path that changes an existing `sys/gc` is
   Admin-only, matching that it is an explicit operator action rather than
   something a server does on its own.
 
