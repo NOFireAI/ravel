@@ -805,31 +805,42 @@ mod tests {
 
     #[test]
     fn a_ddl_outcome_renders_the_fields_its_variant_has() {
-        let created = ddl_outcome_json(&DdlOutcome::Created {
-            table: "t".to_string(),
-            version: 1,
-            files: 3,
-            skipped_directory_markers: 0,
-            skipped_other_suffixes: 2,
-        });
+        let created = ddl_outcome_json(
+            &DdlOutcome::Created {
+                table: "t".to_string(),
+                version: 1,
+                files: 3,
+                skipped_directory_markers: 0,
+                skipped_other_suffixes: 2,
+            },
+            &[],
+        );
         assert_eq!(created["status"], "success");
+        assert!(created.get("warnings").is_none(), "{created}");
         assert_eq!(created["data"]["outcome"], "created");
         assert_eq!(created["data"]["table"], "t");
         assert_eq!(created["data"]["version"], 1);
         assert_eq!(created["data"]["files"], 3);
         assert_eq!(created["data"]["skipped_other_suffixes"], 2);
 
-        let dropped = ddl_outcome_json(&DdlOutcome::Dropped {
-            table: "t".to_string(),
-            version: 2,
-        });
+        let dropped = ddl_outcome_json(
+            &DdlOutcome::Dropped {
+                table: "t".to_string(),
+                version: 2,
+            },
+            &[],
+        );
         assert_eq!(dropped["data"]["outcome"], "dropped");
         assert_eq!(dropped["data"]["version"], 2);
         assert!(dropped["data"].get("files").is_none(), "{dropped}");
 
-        let noop = ddl_outcome_json(&DdlOutcome::NoOp {
-            table: "t".to_string(),
-        });
+        let noop = ddl_outcome_json(
+            &DdlOutcome::NoOp {
+                table: "t".to_string(),
+            },
+            &["a warning"],
+        );
+        assert_eq!(noop["warnings"][0], "a warning", "{noop}");
         assert_eq!(noop["data"]["outcome"], "noop");
         assert!(noop["data"].get("version").is_none(), "{noop}");
     }
