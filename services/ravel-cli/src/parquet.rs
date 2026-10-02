@@ -229,7 +229,7 @@ mod tests {
             + ravel_maintain::config::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS;
         set_gc_config(
             &store,
-            values,
+            values.into(),
             ravel_maintain::config::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
             NOW_NS,
         )

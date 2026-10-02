@@ -510,6 +510,40 @@ two-step operation rather than a rolling configuration change. See
 [the configuration page](configuration.md#retention-and-garbage-collection-configuration)
 for the order to change them in.
 
+`ravel-cli maintain sweep` reads the same `sys/gc` object. It sweeps on the
+stored protection horizon and grace, and refuses before it sweeps
+when the stored horizon does not cover its own 5 min clock-skew allowance, the
+check the server's maintain mode runs at startup. On a bucket with no `sys/gc`
+it bootstraps the object from the maintain defaults, as the server does; a
+`--dry-run` uses those defaults without writing the object. The stored maximum
+query duration and HEAD cache TTL are carried for the pinned-query gate,
+which is not built yet, so they do not change the sweep.
+
+### Upgrading `sys/gc` to format version 2
+
+`sys/gc` format version 2 records the HEAD cache TTL every query-mode server
+process is held to. A fresh bucket is still bootstrapped at version 1, which
+records none, and against version 1 a query-mode server process is held to the
+compiled default of 30 s. A build that reads only version 1 refuses a version 2
+object, and nothing writes version 1 back, so the flip is a one-way ratchet. In
+order:
+
+1. Upgrade every `ravel-server` process in every mode (`gateway`, `query`,
+   `maintain`, and the combined `all` mode; each reads `sys/gc` at startup
+   and refuses to start on a format version it does not know) and every
+   `ravel-cli` binary that reads `sys/gc`
+   (`gc-config show` and `set`, `parquet sweep`, `maintain sweep`) to a build
+   that reads version 2. `ravel-cli gc-config show` prints the stored
+   `format_version`.
+2. Run `ravel-cli gc-config set` with the current values and
+   `--head-cache-ttl <duration>`, for example `--head-cache-ttl 30s`. This
+   writes version 2.
+
+From then on an older build refuses to start against the bucket. A query
+process whose catalog runs on a HEAD cache TTL above the recorded one refuses to
+start too. A later `gc-config set` without `--head-cache-ttl` keeps version 2
+and the recorded TTL.
+
 ## The at-rest integrity scrubber
 
 The checksum hierarchy, a whole-object hash at write time and per-section
@@ -958,7 +992,7 @@ list is in [the generated CLI reference](../../reference/ravel-cli-flags.md).
 |---|---|
 | `maintain compact-bucket` | One compaction pass over a single sealed bucket, printing the outcome. `--dry-run` computes the same plan and writes nothing. |
 | `maintain compact-tenant` | Compacts every sealed bucket of one tenant and signal across shards. See [compaction](#compaction). |
-| `maintain sweep --tenant <t> --signal <s> --shard <n> [--dry-run]` | One sweep pass (orphan collection, superseded inputs, unreferenced L1) over a shard. It prints the orphans quarantined, the orphan copies to quarantine that were refused, the quarantined objects reaped, the superseded records and data deleted, the superseded deletes refused, the superseded objects held because HEAD names them or cannot be read, the chain groups a legal hold kept, the unreferenced parts deleted, whether the pass covered the whole shard, and a line when the orphan breaker tripped or was overridden. `--dry-run` reports the eligible set and deletes nothing. |
+| `maintain sweep --tenant <t> --signal <s> --shard <n> [--dry-run]` | One sweep pass (orphan collection, superseded inputs, unreferenced L1) over a shard. It prints the orphans quarantined, the orphan copies to quarantine that were refused, the quarantined objects reaped, the superseded records and data deleted, the superseded deletes refused, the superseded objects held because HEAD names them or cannot be read, the chain groups a legal hold kept, the unreferenced parts deleted, whether the pass covered the whole shard, and a line when the orphan breaker tripped or was overridden. It sweeps on the protection horizon and grace stored in `sys/gc` (the stored maximum query duration and HEAD cache TTL are carried for the pinned-query gate, which is not built yet) and refuses when the stored horizon does not cover its clock-skew allowance. `--dry-run` reports the eligible set and deletes nothing. |
 | `maintain status --tenant <t> --signal <s> --shard <n> --hour <n>` | Reports one bucket's state: sealed, tombstoned, compacted, L0 record count, superseded-input count, L1 segments present, unreferenced count. Read-only. |
 | `maintain audit-versions --tenant <t> [--shards <n>]` | Audits live on-object format versions and classifies each format floor. Exits nonzero on any anomaly or contradicted floor. |
 | `maintain migrate` | Raises a format floor. See [format migration](#format-migration). |

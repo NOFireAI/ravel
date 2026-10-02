@@ -885,3 +885,229 @@ fn decode_retention_tombstone_prints_fields() {
     };
     decode_retention_tombstone(&tombstone.encode_to_vec()).expect("decode + print");
 }
+
+/// The injected `now` the `sys/gc` sweep tests run at: far enough past the
+/// MemoryStore's epoch-zero `last_modified` that a seeded orphan is past every
+/// age gate.
+const SWEEP_NOW_NS: i64 = 100 * NS_PER_HOUR;
+
+/// A `sys/gc` proposal whose `max_query_duration` (2h) and HEAD cache TTL
+/// (10s) differ from the compiled defaults, with the horizon raised to cover
+/// them and the default skew allowance.
+fn non_default_gc_proposal() -> ravel_maintain::GcConfigProposal {
+    let defaults = ravel_maintain::GcConfigValues::maintain_defaults();
+    let max_query_duration_ns = 2 * NS_PER_HOUR;
+    ravel_maintain::GcConfigProposal {
+        protection_horizon_ns: max_query_duration_ns
+            + defaults.grace_ns
+            + ravel_maintain::config::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
+        max_query_duration_ns,
+        head_cache_ttl_ns: Some(10_000_000_000),
+        ..defaults.into()
+    }
+}
+
+/// ADR-1133 decision 4: `maintain sweep` takes `protection_horizon`, `grace`,
+/// `max_query_duration` and `head_cache_ttl` from `sys/gc`, not from
+/// `CompactorConfig::default()`.
+#[tokio::test]
+async fn sweep_config_carries_the_stored_sys_gc_values() {
+    let store = store();
+    let proposal = non_default_gc_proposal();
+    ravel_maintain::set_gc_config(
+        store.as_ref(),
+        proposal,
+        ravel_maintain::config::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
+        1,
+    )
+    .await
+    .expect("set sys/gc");
+    let compiled = ravel_maintain::CompactorConfig::default();
+    assert_ne!(
+        compiled.max_query_duration_ns,
+        proposal.max_query_duration_ns
+    );
+
+    let config =
+        ravel_cli::maintain::sweep_compactor_config(store.as_ref(), false, false, SWEEP_NOW_NS)
+            .await
+            .expect("a skew-covering sys/gc passes");
+    assert_eq!(config.max_query_duration_ns, 2 * NS_PER_HOUR);
+    assert_eq!(config.head_cache_ttl_ns, 10_000_000_000);
+    assert_eq!(config.protection_horizon_ns, proposal.protection_horizon_ns);
+    assert_eq!(config.grace_ns, proposal.grace_ns);
+    assert_eq!(
+        config.clock_skew_allowance_ns,
+        ravel_maintain::config::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
+    );
+}
+
+/// On a bucket with no `sys/gc`, a sweep bootstraps it at version 1 from the
+/// maintain defaults, as the server's maintain mode does, and a dry run uses
+/// the same defaults without writing.
+#[tokio::test]
+async fn sweep_config_bootstraps_an_absent_sys_gc_and_a_dry_run_writes_none() {
+    let store = store();
+    let dry = ravel_cli::maintain::sweep_compactor_config(store.as_ref(), true, false, 1)
+        .await
+        .expect("dry run on an absent sys/gc");
+    assert!(
+        store
+            .get(ravel_maintain::GC_CONFIG_KEY, GetRange::Full)
+            .await
+            .is_err(),
+        "a dry run writes no sys/gc"
+    );
+    let real = ravel_cli::maintain::sweep_compactor_config(store.as_ref(), false, false, 1)
+        .await
+        .expect("bootstrap on an absent sys/gc");
+    let (stored, _version) = ravel_maintain::read_gc_config(store.as_ref())
+        .await
+        .expect("read")
+        .expect("bootstrapped");
+    assert_eq!(stored, ravel_maintain::GcConfigValues::maintain_defaults());
+    for config in [dry, real] {
+        assert_eq!(config.protection_horizon_ns, stored.protection_horizon_ns);
+        assert_eq!(config.max_query_duration_ns, stored.max_query_duration_ns);
+        assert_eq!(config.head_cache_ttl_ns, stored.head_cache_ttl_ns);
+    }
+}
+
+/// A stored `sys/gc` whose horizon does not cover the sweep's own clock-skew
+/// allowance (written with `--clock-skew-allowance 0s`) makes `maintain sweep`
+/// refuse before any store write. Every put and delete through the store is
+/// scripted to fault, so the fault counters count every write the sweep
+/// attempts; the control run against a skew-covering `sys/gc` shows the same
+/// store and orphan do draw a write.
+#[tokio::test]
+async fn sweep_refuses_a_skew_uncovered_sys_gc_before_any_store_write() {
+    use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+
+    async fn seeded(horizon_covers_skew: bool) -> MemoryStore {
+        let store = MemoryStore::new();
+        seed_orphan_l0(&store, "acme", 0, 1).await;
+        let defaults = ravel_maintain::GcConfigValues::maintain_defaults();
+        let skew = if horizon_covers_skew {
+            ravel_maintain::config::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
+        } else {
+            0
+        };
+        ravel_maintain::set_gc_config(
+            &store,
+            ravel_maintain::GcConfigProposal {
+                protection_horizon_ns: defaults.max_query_duration_ns + defaults.grace_ns + skew,
+                ..defaults.into()
+            },
+            skew,
+            1,
+        )
+        .await
+        .expect("set sys/gc");
+        store
+    }
+    fn faulting(inner: MemoryStore) -> Arc<FaultStore<MemoryStore>> {
+        let plan = FaultPlan::empty()
+            .with_rule(Rule::new(
+                Op::Put,
+                ScriptedFault::Permanent("no put".into()),
+            ))
+            .with_rule(Rule::new(
+                Op::Delete,
+                ScriptedFault::Permanent("no delete".into()),
+            ));
+        Arc::new(FaultStore::new(inner, plan))
+    }
+    async fn run(store: &Arc<FaultStore<MemoryStore>>) -> anyhow::Result<()> {
+        ravel_cli::maintain::sweep_at(
+            store.clone() as Arc<dyn ObjectStoreBackend>,
+            MEMORY,
+            "acme",
+            SignalArg::Metrics,
+            0,
+            false,
+            false,
+            ravel_maintain::FixedClock::new(SWEEP_NOW_NS),
+        )
+        .await
+    }
+    let writes = |store: &FaultStore<MemoryStore>| {
+        store.fault_count(Op::Put, FaultKind::Permanent)
+            + store.fault_count(Op::Delete, FaultKind::Permanent)
+    };
+
+    let uncovered = faulting(seeded(false).await);
+    let err = run(&uncovered)
+        .await
+        .expect_err("a skew-uncovered sys/gc must refuse the sweep");
+    assert!(
+        err.to_string()
+            .contains("refusing to enter the maintain sweep loop"),
+        "the refusal is the skew validation: {err}"
+    );
+    assert_eq!(writes(&uncovered), 0, "the sweep refused before any write");
+
+    let covered = faulting(seeded(true).await);
+    let _ = run(&covered).await;
+    assert!(
+        writes(&covered) > 0,
+        "control: a skew-covering sys/gc lets the same sweep reach a write"
+    );
+}
+
+/// `maintain sweep` holds a superseded input on the stored `sys/gc` protection
+/// horizon, not the compiled default: with a stored horizon of 200h and the
+/// compaction record 150h old, the input survives, and the control bucket on
+/// the default 25h05m horizon deletes the same input at the same instant.
+#[tokio::test]
+async fn sweep_holds_a_superseded_input_on_the_stored_horizon() {
+    const NOW_NS: i64 = 999 + 150 * NS_PER_HOUR;
+    let default_horizon = ravel_maintain::CompactorConfig::default().protection_horizon_ns;
+    let stored_horizon = 200 * NS_PER_HOUR;
+    assert!(999 + default_horizon < NOW_NS && NOW_NS < 999 + stored_horizon);
+
+    async fn run(stored_horizon_ns: Option<i64>) -> (Arc<MemoryStore>, String) {
+        let store = Arc::new(MemoryStore::new());
+        let identity = (Uuid::new_v4(), 1, 1);
+        let data_key =
+            publish_l0_with_identity(&store, "acme", 0, identity, 100 * NS_PER_HOUR).await;
+        seed_compaction(&store, "acme", &[identity]).await;
+        if let Some(protection_horizon_ns) = stored_horizon_ns {
+            ravel_maintain::set_gc_config(
+                store.as_ref(),
+                ravel_maintain::GcConfigProposal {
+                    protection_horizon_ns,
+                    ..ravel_maintain::GcConfigValues::maintain_defaults().into()
+                },
+                ravel_maintain::config::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
+                1,
+            )
+            .await
+            .expect("set sys/gc");
+        }
+        ravel_cli::maintain::sweep_at(
+            store.clone() as Arc<dyn ObjectStoreBackend>,
+            MEMORY,
+            "acme",
+            SignalArg::Metrics,
+            0,
+            false,
+            false,
+            ravel_maintain::FixedClock::new(NOW_NS),
+        )
+        .await
+        .expect("sweep runs");
+        (store, data_key)
+    }
+
+    let (held, held_key) = run(Some(stored_horizon)).await;
+    assert!(
+        held.get(&held_key, GetRange::Full).await.is_ok(),
+        "an input inside the stored horizon must survive the sweep"
+    );
+
+    let (control, control_key) = run(None).await;
+    assert!(
+        control.get(&control_key, GetRange::Full).await.is_err(),
+        "control: past the default horizon the same input is deleted"
+    );
+}

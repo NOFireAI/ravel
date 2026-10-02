@@ -10,7 +10,7 @@
 //! Before this object the bound lived in three unlinked per-process configs
 //! (the maintain sweep config, the query deadline, the Flight ticket ceiling)
 //! that could be deployed independently, with nothing validating the
-//! constraint anywhere. This module makes the four deployment-wide values a
+//! constraint anywhere. This module makes the deployment-wide values a
 //! single durable truth:
 //!
 //! - **Bootstrap.** On the first touch of a fresh bucket, [`bootstrap_gc_config`]
@@ -30,9 +30,17 @@
 //!   object and validates itself against it, refusing to start on a real
 //!   violation with a typed [`GcConfigError`]: maintain's horizon and grace
 //!   must equal the stored values ([`validate_maintain`]); a query engine's
-//!   deadline must be `<=` `max_query_duration_ns` ([`validate_query_deadline`]);
-//!   a Flight ticket-TTL ceiling must be `<=` `protection_horizon_ns - grace_ns`
-//!   ([`validate_flight_ceiling`]).
+//!   deadline must be `<=` `max_query_duration_ns` ([`validate_query_deadline`])
+//!   and its HEAD cache TTL `<=` `head_cache_ttl_ns`
+//!   ([`validate_query_head_cache_ttl`]); a Flight ticket-TTL ceiling must be
+//!   `<=` `protection_horizon_ns - grace_ns` ([`validate_flight_ceiling`]).
+//! - **Versions.** Format version 1 records no HEAD cache TTL and decodes to
+//!   the compiled [`DEFAULT_HEAD_CACHE_TTL_NS`]; version 2 records one
+//!   (ADR-1133 decision 4). Bootstrap writes version 1, so a new build touching
+//!   a fresh bucket first does not lock older builds out; only
+//!   `ravel-cli gc-config set --head-cache-ttl` flips a version 1 object to
+//!   version 2 (a `set` over a stored version 2 writes version 2 again), after
+//!   which a build that reads only version 1 refuses the object.
 //!
 //! The constraint is thereby enforced at exactly two choke points: the single
 //! mutation path (the CLI, at write time) and each process's startup (against
@@ -41,6 +49,7 @@
 //! path.
 
 use prost::Message;
+use ravel_catalog::DEFAULT_HEAD_CACHE_TTL_NS;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError, Version};
 use ravel_proto::sys::v1 as sysproto;
 
@@ -76,16 +85,23 @@ pub fn ingest_max_flush_lifetime_floor_ns() -> i64 {
     .unwrap_or(i64::MAX)
 }
 
-/// Format version written into every `sys/gc` object this module emits, and the
-/// only version it reads. A future version is refused rather than misread under
-/// the v1 layout.
-pub const GC_FORMAT_VERSION: u32 = 1;
+/// The highest `sys/gc` format version this build reads, and the version a
+/// `gc-config set` that records a HEAD cache TTL writes. A higher version is
+/// refused rather than misread.
+pub const GC_FORMAT_VERSION: u32 = 2;
 
-/// The four deployment-wide GC values recorded in `sys/gc`, decoded into plain
+/// The format version bootstrap writes, and the one that records no HEAD cache
+/// TTL (ADR-1133 decision 4).
+pub const GC_FORMAT_VERSION_V1: u32 = 1;
+
+/// The deployment-wide GC values recorded in `sys/gc`, decoded into plain
 /// integers so callers (server startup, the CLI, tests) never touch the proto
 /// type directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GcConfigValues {
+    /// The format version these values were read at, or are written at: 1 or
+    /// [`GC_FORMAT_VERSION`].
+    pub format_version: u32,
     /// Horizon between a deletion anchor and physical deletion. Must satisfy
     /// `>= max_query_duration_ns + grace_ns + clock_skew_allowance_ns` (the
     /// skew term is not stored here; it is supplied by the writer's config at
@@ -101,6 +117,10 @@ pub struct GcConfigValues {
     pub max_query_duration_ns: i64,
     /// The longest a flush may stay open.
     pub max_flush_lifetime_ns: i64,
+    /// The HEAD cache TTL every query-mode server process is held to
+    /// ([`validate_query_head_cache_ttl`]). Recorded from format version 2; a
+    /// version 1 object decodes it as [`DEFAULT_HEAD_CACHE_TTL_NS`].
+    pub head_cache_ttl_ns: i64,
 }
 
 impl GcConfigValues {
@@ -109,12 +129,15 @@ impl GcConfigValues {
     /// This is what the first process to touch a fresh bucket bootstraps
     /// `sys/gc` from (ADR-0050 section 4), and it matches
     /// [`crate::CompactorConfig::default`]'s horizon, grace, and flush lifetime.
+    /// It is a version 1 object carrying the compiled HEAD cache TTL.
     pub fn maintain_defaults() -> Self {
         GcConfigValues {
+            format_version: GC_FORMAT_VERSION_V1,
             protection_horizon_ns: DEFAULT_PROTECTION_HORIZON_NS,
             grace_ns: DEFAULT_GRACE_NS,
             max_query_duration_ns: DEFAULT_MAX_QUERY_DURATION_NS,
             max_flush_lifetime_ns: DEFAULT_MAX_FLUSH_LIFETIME_NS,
+            head_cache_ttl_ns: DEFAULT_HEAD_CACHE_TTL_NS,
         }
     }
 
@@ -157,6 +180,7 @@ impl GcConfigValues {
             ("grace_ns", self.grace_ns),
             ("max_query_duration_ns", self.max_query_duration_ns),
             ("max_flush_lifetime_ns", self.max_flush_lifetime_ns),
+            ("head_cache_ttl_ns", self.head_cache_ttl_ns),
         ] {
             if got <= 0 {
                 return Err(GcConfigError::NonPositiveValue { field, got });
@@ -180,29 +204,96 @@ impl GcConfigValues {
             .max(0)
     }
 
+    /// The proto these values encode to. Version 1 leaves `head_cache_ttl_ns`
+    /// absent, since a version 1 reader takes the compiled default whatever the
+    /// field holds.
     fn to_proto(self, now_ns: i64) -> sysproto::GcConfig {
+        let head_cache_ttl_ns = if self.format_version == GC_FORMAT_VERSION_V1 {
+            0
+        } else {
+            self.head_cache_ttl_ns
+        };
         sysproto::GcConfig {
-            format_version: GC_FORMAT_VERSION,
+            format_version: self.format_version,
             protection_horizon_ns: self.protection_horizon_ns,
             grace_ns: self.grace_ns,
             max_query_duration_ns: self.max_query_duration_ns,
             max_flush_lifetime_ns: self.max_flush_lifetime_ns,
             created_unix_ns: now_ns,
+            head_cache_ttl_ns,
         }
     }
 
     fn from_proto(proto: sysproto::GcConfig) -> Result<Self, GcConfigError> {
-        if proto.format_version != GC_FORMAT_VERSION {
-            return Err(GcConfigError::UnsupportedVersion {
-                got: proto.format_version,
-            });
-        }
+        let head_cache_ttl_ns = match proto.format_version {
+            GC_FORMAT_VERSION_V1 => DEFAULT_HEAD_CACHE_TTL_NS,
+            GC_FORMAT_VERSION => {
+                if proto.head_cache_ttl_ns <= 0 {
+                    return Err(GcConfigError::StoredHeadCacheTtlNotPositive {
+                        got: proto.head_cache_ttl_ns,
+                    });
+                }
+                proto.head_cache_ttl_ns
+            }
+            got => return Err(GcConfigError::UnsupportedVersion { got }),
+        };
         Ok(GcConfigValues {
+            format_version: proto.format_version,
             protection_horizon_ns: proto.protection_horizon_ns,
             grace_ns: proto.grace_ns,
             max_query_duration_ns: proto.max_query_duration_ns,
             max_flush_lifetime_ns: proto.max_flush_lifetime_ns,
+            head_cache_ttl_ns,
         })
+    }
+}
+
+/// A `gc-config set` proposal: the four durations it always replaces, and the
+/// HEAD cache TTL it records only when given (ADR-1133 decision 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GcConfigProposal {
+    pub protection_horizon_ns: i64,
+    pub grace_ns: i64,
+    pub max_query_duration_ns: i64,
+    pub max_flush_lifetime_ns: i64,
+    /// `Some` writes format version 2 carrying this TTL. `None` keeps the
+    /// stored format version and, on version 2, its recorded TTL; on a bucket
+    /// with no object it writes version 1.
+    pub head_cache_ttl_ns: Option<i64>,
+}
+
+impl GcConfigProposal {
+    /// The values a set of this proposal writes over `current`, the object it
+    /// read (`None` when there is none).
+    fn resolve(self, current: Option<&GcConfigValues>) -> GcConfigValues {
+        let (format_version, head_cache_ttl_ns) = match (self.head_cache_ttl_ns, current) {
+            (Some(ttl), _) => (GC_FORMAT_VERSION, ttl),
+            (None, Some(current)) => (current.format_version, current.head_cache_ttl_ns),
+            (None, None) => (GC_FORMAT_VERSION_V1, DEFAULT_HEAD_CACHE_TTL_NS),
+        };
+        GcConfigValues {
+            format_version,
+            protection_horizon_ns: self.protection_horizon_ns,
+            grace_ns: self.grace_ns,
+            max_query_duration_ns: self.max_query_duration_ns,
+            max_flush_lifetime_ns: self.max_flush_lifetime_ns,
+            head_cache_ttl_ns,
+        }
+    }
+}
+
+impl From<GcConfigValues> for GcConfigProposal {
+    /// Re-propose `values`: a version 2 object's TTL is recorded again, and a
+    /// version 1 object's is left to the stored version.
+    fn from(values: GcConfigValues) -> Self {
+        GcConfigProposal {
+            protection_horizon_ns: values.protection_horizon_ns,
+            grace_ns: values.grace_ns,
+            max_query_duration_ns: values.max_query_duration_ns,
+            max_flush_lifetime_ns: values.max_flush_lifetime_ns,
+            head_cache_ttl_ns: (values.format_version != GC_FORMAT_VERSION_V1)
+                .then_some(values.head_cache_ttl_ns),
+        }
     }
 }
 
@@ -216,10 +307,17 @@ pub enum GcConfigError {
     #[error("sys/gc is corrupt and could not be decoded: {0}")]
     Decode(String),
     #[error(
-        "sys/gc declares format_version {got}, but this build only understands version \
-         {GC_FORMAT_VERSION}: refusing rather than misread a future GC-config format as v1"
+        "sys/gc declares format_version {got}, but this build only understands versions \
+         {GC_FORMAT_VERSION_V1} to {GC_FORMAT_VERSION}: refusing rather than misread an \
+         unknown GC-config format"
     )]
     UnsupportedVersion { got: u32 },
+    #[error(
+        "sys/gc is format_version {GC_FORMAT_VERSION} but records head_cache_ttl_ns={got}: a \
+         version {GC_FORMAT_VERSION} object must record a positive HEAD cache TTL; refusing \
+         rather than hold query processes to a meaningless bound"
+    )]
+    StoredHeadCacheTtlNotPositive { got: i64 },
     #[error(
         "sys/gc was absent then present within one bootstrap, but could not be re-read: a \
          concurrent bootstrap left the object unreadable"
@@ -311,6 +409,17 @@ pub enum GcConfigError {
         protection_horizon_ns: i64,
         grace_ns: i64,
     },
+    #[error(
+        "this query process's HEAD cache TTL is {effective_ttl_ns} ns, but sys/gc (format_version \
+         {format_version}) records head_cache_ttl={recorded_ttl_ns} ns: a query may not be served \
+         a cached HEAD for longer than the recorded TTL, the bound ADR-1133's sweeper delete gate \
+         is specified against; refusing to start"
+    )]
+    QueryHeadCacheTtlExceedsRecorded {
+        effective_ttl_ns: i64,
+        recorded_ttl_ns: i64,
+        format_version: u32,
+    },
 }
 
 /// Read `sys/gc` if it exists, returning the decoded values and the store
@@ -343,6 +452,11 @@ pub async fn read_gc_config(
 /// re-reading and returning the winner's object, so a loser never errors and
 /// never proceeds with its own unwritten values.
 ///
+/// The object is always written at format version 1 with the compiled
+/// [`DEFAULT_HEAD_CACHE_TTL_NS`], whatever version and TTL `defaults` carries,
+/// so a new build bootstrapping a fresh bucket first does not lock out older
+/// builds that read only version 1 (ADR-1133 decision 4).
+///
 /// `defaults` is validated (issue #1744 fix round) before it is ever written:
 /// the production caller passes `GcConfigValues::maintain_defaults()`, a
 /// compiled-in constant, not something a flag or `set_gc_config`'s own
@@ -363,6 +477,11 @@ pub async fn bootstrap_gc_config(
         return Ok(values);
     }
 
+    let defaults = GcConfigValues {
+        format_version: GC_FORMAT_VERSION_V1,
+        head_cache_ttl_ns: DEFAULT_HEAD_CACHE_TTL_NS,
+        ..defaults
+    };
     defaults.validate(ingest_max_flush_lifetime_floor_ns())?;
     let bytes = defaults.to_proto(now_ns).encode_to_vec();
     match store
@@ -408,26 +527,34 @@ pub enum SetOutcome {
 /// reachable `sys/gc` can leave a skewed sweeper free to delete a pinned reader's
 /// snapshot. `clock_skew_allowance_ns` is the writer's configured skew
 /// allowance (the sweeper's [`crate::CompactorConfig::clock_skew_allowance_ns`]),
-/// supplied here rather than stored in `sys/gc` because the persistent format is
-/// frozen; the fence is the validated config, not a stored field.
+/// supplied here rather than stored in `sys/gc`: it is a per-process input that
+/// each maintain process re-validates against the stored values at startup
+/// ([`validate_maintain_skew`]).
+///
+/// The format version and HEAD cache TTL come from the proposal and the object
+/// this call read, in the same read its `CasVersion` swap is conditioned on
+/// ([`GcConfigProposal::head_cache_ttl_ns`]): a proposal without a TTL never
+/// writes version 1 over a stored version 2. Returns the values written.
 pub async fn set_gc_config(
     store: &dyn ObjectStoreBackend,
-    proposed: GcConfigValues,
+    proposed: GcConfigProposal,
     clock_skew_allowance_ns: i64,
     now_ns: i64,
-) -> Result<SetOutcome, GcConfigError> {
-    proposed.validate(ingest_max_flush_lifetime_floor_ns())?;
-    if !proposed.satisfies_constraint(clock_skew_allowance_ns) {
+) -> Result<(SetOutcome, GcConfigValues), GcConfigError> {
+    let current = read_gc_config(store).await?;
+    let written = proposed.resolve(current.as_ref().map(|(values, _version)| values));
+    written.validate(ingest_max_flush_lifetime_floor_ns())?;
+    if !written.satisfies_constraint(clock_skew_allowance_ns) {
         return Err(GcConfigError::ConstraintViolation {
-            protection_horizon_ns: proposed.protection_horizon_ns,
-            max_query_duration_ns: proposed.max_query_duration_ns,
-            grace_ns: proposed.grace_ns,
+            protection_horizon_ns: written.protection_horizon_ns,
+            max_query_duration_ns: written.max_query_duration_ns,
+            grace_ns: written.grace_ns,
             clock_skew_allowance_ns,
         });
     }
 
-    let bytes = proposed.to_proto(now_ns).encode_to_vec();
-    match read_gc_config(store).await? {
+    let bytes = written.to_proto(now_ns).encode_to_vec();
+    let outcome = match current {
         Some((_current, version)) => {
             match store
                 .put(
@@ -440,20 +567,21 @@ pub async fn set_gc_config(
                 )
                 .await
             {
-                Ok(_) => Ok(SetOutcome::Updated),
-                Err(StoreError::PreconditionFailed) => Err(GcConfigError::CasConflict),
-                Err(err) => Err(GcConfigError::Store(err.to_string())),
+                Ok(_) => SetOutcome::Updated,
+                Err(StoreError::PreconditionFailed) => return Err(GcConfigError::CasConflict),
+                Err(err) => return Err(GcConfigError::Store(err.to_string())),
             }
         }
         None => match store
             .put(GC_CONFIG_KEY, bytes.into(), PutOptions::create_if_absent())
             .await
         {
-            Ok(_) => Ok(SetOutcome::Created),
-            Err(StoreError::AlreadyExists) => Err(GcConfigError::CasConflict),
-            Err(err) => Err(GcConfigError::Store(err.to_string())),
+            Ok(_) => SetOutcome::Created,
+            Err(StoreError::AlreadyExists) => return Err(GcConfigError::CasConflict),
+            Err(err) => return Err(GcConfigError::Store(err.to_string())),
         },
-    }
+    };
+    Ok((outcome, written))
 }
 
 /// Maintain-mode startup check (ADR-0050 section 4): the configured horizon and
@@ -520,6 +648,26 @@ pub fn validate_query_deadline(
         return Err(GcConfigError::QueryDeadlineExceedsHorizon {
             deadline_ns,
             max_query_duration_ns: stored.max_query_duration_ns,
+        });
+    }
+    Ok(())
+}
+
+/// Query-mode startup check (ADR-1133 decision 4): the process's effective HEAD
+/// cache TTL must be `<=` the recorded `head_cache_ttl_ns`, the bound
+/// ADR-1133's sweeper delete gate is specified against, so no query is served
+/// a cached HEAD for longer than it. On a version 1 object the recorded value
+/// is the compiled [`DEFAULT_HEAD_CACHE_TTL_NS`], the value ADR-1133 specifies
+/// the gate uses on version 1.
+pub fn validate_query_head_cache_ttl(
+    stored: &GcConfigValues,
+    effective_ttl_ns: i64,
+) -> Result<(), GcConfigError> {
+    if effective_ttl_ns > stored.head_cache_ttl_ns {
+        return Err(GcConfigError::QueryHeadCacheTtlExceedsRecorded {
+            effective_ttl_ns,
+            recorded_ttl_ns: stored.head_cache_ttl_ns,
+            format_version: stored.format_version,
         });
     }
     Ok(())
@@ -670,6 +818,7 @@ mod tests {
             grace_ns: DEFAULT_GRACE_NS,
             max_query_duration_ns: DEFAULT_MAX_QUERY_DURATION_NS,
             max_flush_lifetime_ns: DEFAULT_MAX_FLUSH_LIFETIME_NS,
+            ..GcConfigValues::maintain_defaults()
         };
         assert!(winner.satisfies_constraint(DEFAULT_CLOCK_SKEW_ALLOWANCE_NS));
         bootstrap_gc_config(store.as_ref(), winner, 1)
@@ -700,10 +849,16 @@ mod tests {
             grace_ns: DEFAULT_GRACE_NS,
             max_query_duration_ns: DEFAULT_MAX_QUERY_DURATION_NS,
             max_flush_lifetime_ns: DEFAULT_MAX_FLUSH_LIFETIME_NS,
+            ..GcConfigValues::maintain_defaults()
         };
-        let err = set_gc_config(store.as_ref(), bad, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, 1_000)
-            .await
-            .expect_err("a constraint-violating proposal must be refused");
+        let err = set_gc_config(
+            store.as_ref(),
+            bad.into(),
+            DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
+            1_000,
+        )
+        .await
+        .expect_err("a constraint-violating proposal must be refused");
         assert!(
             matches!(err, GcConfigError::ConstraintViolation { .. }),
             "got: {err}"
@@ -743,6 +898,7 @@ mod tests {
             grace_ns: DEFAULT_GRACE_NS,
             max_query_duration_ns: DEFAULT_MAX_QUERY_DURATION_NS,
             max_flush_lifetime_ns: DEFAULT_MAX_FLUSH_LIFETIME_NS,
+            ..GcConfigValues::maintain_defaults()
         };
         // It DID satisfy the old bound (skew term zero), but does NOT
         // satisfy the skew-covering bound.
@@ -755,7 +911,7 @@ mod tests {
             "the skew-covering bound is NOT met: this is the skew gap"
         );
 
-        let err = set_gc_config(store.as_ref(), just_meets_old_bound, skew, 1_000)
+        let err = set_gc_config(store.as_ref(), just_meets_old_bound.into(), skew, 1_000)
             .await
             .expect_err("a config that omits the clock-skew allowance must be refused");
         assert!(
@@ -784,7 +940,7 @@ mod tests {
             ..just_meets_old_bound
         };
         assert!(covers_skew.satisfies_constraint(skew));
-        let outcome = set_gc_config(store.as_ref(), covers_skew, skew, 2_000)
+        let (outcome, _written) = set_gc_config(store.as_ref(), covers_skew.into(), skew, 2_000)
             .await
             .expect("a skew-covering config is accepted");
         assert_eq!(outcome, SetOutcome::Created);
@@ -808,6 +964,7 @@ mod tests {
             grace_ns: 0,
             max_query_duration_ns: 0,
             max_flush_lifetime_ns: 0,
+            ..GcConfigValues::maintain_defaults()
         };
         // The exact shape of the bug: the constraint check alone accepts this
         // (even with a zero skew allowance the horizon inequality holds).
@@ -817,7 +974,7 @@ mod tests {
         );
         let err = set_gc_config(
             store.as_ref(),
-            all_zero,
+            all_zero.into(),
             DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
             1_000,
         )
@@ -852,9 +1009,14 @@ mod tests {
             grace_ns: -1,
             ..GcConfigValues::maintain_defaults()
         };
-        let err = set_gc_config(store.as_ref(), bad, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, 1_000)
-            .await
-            .expect_err("a negative grace must be refused");
+        let err = set_gc_config(
+            store.as_ref(),
+            bad.into(),
+            DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
+            1_000,
+        )
+        .await
+        .expect_err("a negative grace must be refused");
         assert!(
             matches!(
                 err,
@@ -893,6 +1055,7 @@ mod tests {
             grace_ns: DEFAULT_GRACE_NS,
             max_query_duration_ns: DEFAULT_MAX_QUERY_DURATION_NS,
             max_flush_lifetime_ns: DEFAULT_MAX_FLUSH_LIFETIME_NS,
+            ..GcConfigValues::maintain_defaults()
         };
         let bytes = proposal.to_proto(2).encode_to_vec();
         // First writer wins with version_a.
@@ -1021,6 +1184,7 @@ mod tests {
             grace_ns: DEFAULT_GRACE_NS,
             max_query_duration_ns: DEFAULT_MAX_QUERY_DURATION_NS,
             max_flush_lifetime_ns: DEFAULT_MAX_FLUSH_LIFETIME_NS,
+            ..GcConfigValues::maintain_defaults()
         };
         assert!(
             stored.satisfies_constraint(write_time_skew),
@@ -1102,6 +1266,7 @@ mod tests {
             max_query_duration_ns: DEFAULT_MAX_QUERY_DURATION_NS,
             max_flush_lifetime_ns: DEFAULT_MAX_FLUSH_LIFETIME_NS,
             created_unix_ns: 1,
+            head_cache_ttl_ns: 0,
         };
         store
             .put(
@@ -1117,6 +1282,204 @@ mod tests {
         assert!(
             matches!(err, GcConfigError::UnsupportedVersion { got: 999 }),
             "got: {err}"
+        );
+    }
+
+    /// Seed `sys/gc` with a raw proto at `format_version` carrying
+    /// `head_cache_ttl_ns`, bypassing every write-side check.
+    async fn seed_raw(store: &dyn ObjectStoreBackend, format_version: u32, head_cache_ttl_ns: i64) {
+        let proto = sysproto::GcConfig {
+            format_version,
+            protection_horizon_ns: DEFAULT_PROTECTION_HORIZON_NS,
+            grace_ns: DEFAULT_GRACE_NS,
+            max_query_duration_ns: DEFAULT_MAX_QUERY_DURATION_NS,
+            max_flush_lifetime_ns: DEFAULT_MAX_FLUSH_LIFETIME_NS,
+            created_unix_ns: 1,
+            head_cache_ttl_ns,
+        };
+        store
+            .put(
+                GC_CONFIG_KEY,
+                proto.encode_to_vec().into(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed raw sys/gc");
+    }
+
+    /// The stored proto, decoded without `from_proto`'s version handling.
+    async fn stored_proto(store: &dyn ObjectStoreBackend) -> sysproto::GcConfig {
+        let got = store
+            .get(GC_CONFIG_KEY, GetRange::Full)
+            .await
+            .expect("sys/gc present");
+        sysproto::GcConfig::decode(got.data.as_ref()).expect("decodes")
+    }
+
+    /// A version 1 object decodes its HEAD cache TTL as the compiled default
+    /// even when the field carries another value: version 1 records no TTL, so
+    /// a stray field value must not become the bound query processes are held
+    /// to.
+    #[tokio::test]
+    async fn version_1_decodes_head_cache_ttl_as_the_compiled_default() {
+        let store = store();
+        let stray = 7 * DEFAULT_HEAD_CACHE_TTL_NS;
+        seed_raw(store.as_ref(), GC_FORMAT_VERSION_V1, stray).await;
+        let (values, _version) = read_gc_config(store.as_ref())
+            .await
+            .expect("version 1 is read")
+            .expect("present");
+        assert_eq!(values.format_version, GC_FORMAT_VERSION_V1);
+        assert_eq!(
+            values.head_cache_ttl_ns, DEFAULT_HEAD_CACHE_TTL_NS,
+            "version 1 ignores the stored field and decodes the compiled default"
+        );
+    }
+
+    /// A version 2 object round-trips its recorded TTL and its version.
+    #[tokio::test]
+    async fn version_2_round_trips_its_head_cache_ttl() {
+        let store = store();
+        let ttl = 12_345_000_000;
+        let values = GcConfigValues {
+            format_version: GC_FORMAT_VERSION,
+            head_cache_ttl_ns: ttl,
+            ..GcConfigValues::maintain_defaults()
+        };
+        store
+            .put(
+                GC_CONFIG_KEY,
+                values.to_proto(9).encode_to_vec().into(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("write version 2");
+        let proto = stored_proto(store.as_ref()).await;
+        assert_eq!(proto.format_version, 2);
+        assert_eq!(proto.head_cache_ttl_ns, ttl);
+        let (read, _version) = read_gc_config(store.as_ref())
+            .await
+            .expect("version 2 is read")
+            .expect("present");
+        assert_eq!(read, values);
+    }
+
+    /// A version 2 object must record a positive TTL: zero and negative are
+    /// typed errors naming the stored value.
+    #[tokio::test]
+    async fn version_2_with_a_non_positive_head_cache_ttl_is_refused() {
+        for bad in [0, -1] {
+            let store = store();
+            seed_raw(store.as_ref(), GC_FORMAT_VERSION, bad).await;
+            let err = read_gc_config(store.as_ref())
+                .await
+                .expect_err("a non-positive version 2 TTL must be refused");
+            assert_eq!(
+                err,
+                GcConfigError::StoredHeadCacheTtlNotPositive { got: bad }
+            );
+        }
+    }
+
+    /// Version 3 is above what this build reads and is refused, as every
+    /// unknown version is.
+    #[tokio::test]
+    async fn version_3_is_refused() {
+        let store = store();
+        seed_raw(store.as_ref(), 3, DEFAULT_HEAD_CACHE_TTL_NS).await;
+        let err = read_gc_config(store.as_ref())
+            .await
+            .expect_err("version 3 must be refused");
+        assert_eq!(err, GcConfigError::UnsupportedVersion { got: 3 });
+    }
+
+    /// Bootstrap on an empty bucket writes format version 1 with no TTL field,
+    /// even when the caller's defaults are version 2, so a new build touching
+    /// a fresh bucket first cannot lock out an older build that reads only
+    /// version 1.
+    #[tokio::test]
+    async fn bootstrap_on_an_empty_store_writes_version_1() {
+        let store = store();
+        let values =
+            bootstrap_gc_config(store.as_ref(), GcConfigValues::maintain_defaults(), 1_000)
+                .await
+                .expect("bootstrap");
+        assert_eq!(values.format_version, GC_FORMAT_VERSION_V1);
+        let proto = stored_proto(store.as_ref()).await;
+        assert_eq!(proto.format_version, 1, "bootstrap writes version 1");
+        assert_eq!(
+            proto.head_cache_ttl_ns, 0,
+            "version 1 leaves the TTL absent"
+        );
+
+        let store = self::store();
+        let v2_defaults = GcConfigValues {
+            format_version: GC_FORMAT_VERSION,
+            head_cache_ttl_ns: 5_000_000_000,
+            ..GcConfigValues::maintain_defaults()
+        };
+        let values = bootstrap_gc_config(store.as_ref(), v2_defaults, 1_000)
+            .await
+            .expect("bootstrap");
+        assert_eq!(values, GcConfigValues::maintain_defaults());
+        assert_eq!(
+            stored_proto(store.as_ref()).await.format_version,
+            1,
+            "bootstrap writes version 1 whatever version the caller's defaults carry"
+        );
+    }
+
+    /// The query-side TTL check on a version 2 object: the recorded TTL itself
+    /// passes, one nanosecond above it refuses, naming both values.
+    #[test]
+    fn query_head_cache_ttl_check_is_inclusive_at_the_recorded_value() {
+        let recorded = 10_000_000_000;
+        let stored = GcConfigValues {
+            format_version: GC_FORMAT_VERSION,
+            head_cache_ttl_ns: recorded,
+            ..GcConfigValues::maintain_defaults()
+        };
+        validate_query_head_cache_ttl(&stored, recorded).expect("the recorded TTL itself passes");
+        validate_query_head_cache_ttl(&stored, recorded - 1).expect("a lower TTL passes");
+        let err = validate_query_head_cache_ttl(&stored, recorded + 1)
+            .expect_err("one nanosecond above the recorded TTL must refuse");
+        assert_eq!(
+            err,
+            GcConfigError::QueryHeadCacheTtlExceedsRecorded {
+                effective_ttl_ns: recorded + 1,
+                recorded_ttl_ns: recorded,
+                format_version: GC_FORMAT_VERSION,
+            }
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains(&(recorded + 1).to_string())
+                && message.contains(&recorded.to_string()),
+            "the error names both values: {message}"
+        );
+    }
+
+    /// On a version 1 object the query-side check compares against the
+    /// compiled default: the default passes, one nanosecond above refuses.
+    #[tokio::test]
+    async fn query_head_cache_ttl_check_on_version_1_uses_the_compiled_default() {
+        let store = store();
+        seed_raw(store.as_ref(), GC_FORMAT_VERSION_V1, 0).await;
+        let (stored, _version) = read_gc_config(store.as_ref())
+            .await
+            .expect("read")
+            .expect("present");
+        validate_query_head_cache_ttl(&stored, DEFAULT_HEAD_CACHE_TTL_NS)
+            .expect("the compiled default passes on version 1");
+        let err = validate_query_head_cache_ttl(&stored, DEFAULT_HEAD_CACHE_TTL_NS + 1)
+            .expect_err("one nanosecond above the compiled default must refuse on version 1");
+        assert_eq!(
+            err,
+            GcConfigError::QueryHeadCacheTtlExceedsRecorded {
+                effective_ttl_ns: DEFAULT_HEAD_CACHE_TTL_NS + 1,
+                recorded_ttl_ns: DEFAULT_HEAD_CACHE_TTL_NS,
+                format_version: GC_FORMAT_VERSION_V1,
+            }
         );
     }
 
@@ -1197,7 +1560,7 @@ mod tests {
         };
         let err = set_gc_config(
             store.as_ref(),
-            below_floor,
+            below_floor.into(),
             DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
             1_000,
         )
@@ -1229,7 +1592,7 @@ mod tests {
         };
         set_gc_config(
             store.as_ref(),
-            at_floor,
+            at_floor.into(),
             DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
             2_000,
         )

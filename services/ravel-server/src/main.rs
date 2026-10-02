@@ -398,6 +398,13 @@ async fn main() -> anyhow::Result<()> {
         ravel_server::gc_config::validate_query(&gc, gc_runtime.query_deadline).map_err(|e| {
             anyhow::anyhow!("query GC-config validation failed against sys/gc: {e}")
         })?;
+        // `build_catalog` overrides no HEAD cache TTL, so the base config's
+        // value is the one the query catalog runs on.
+        ravel_server::gc_config::validate_query_head_cache_ttl(
+            &gc,
+            &ravel_server::query::server_catalog_config_base(),
+        )
+        .map_err(|e| anyhow::anyhow!("query GC-config validation failed against sys/gc: {e}"))?;
     }
 
     let alert_sinks = cli

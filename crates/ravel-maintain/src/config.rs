@@ -1138,6 +1138,17 @@ pub struct CompactorConfig {
     /// leads the reader's. Default [`DEFAULT_PROTECTION_HORIZON_NS`]
     /// (25 h 5 min).
     pub protection_horizon_ns: i64,
+    /// The longest a single query may run, set from `sys/gc`'s
+    /// `max_query_duration_ns` by every sweep driver that reads `sys/gc` (the
+    /// server's maintain mode and `ravel-cli maintain sweep`). A term of the
+    /// pinned-query window (ADR-1133 decision 3). Default
+    /// [`DEFAULT_MAX_QUERY_DURATION_NS`] (1 h).
+    pub max_query_duration_ns: i64,
+    /// The HEAD cache TTL query processes are held to, set from `sys/gc`'s
+    /// `head_cache_ttl_ns` by the same drivers. A term of the pinned-query
+    /// window (ADR-1133 decision 3). Default
+    /// [`ravel_catalog::DEFAULT_HEAD_CACHE_TTL_NS`] (30 s).
+    pub head_cache_ttl_ns: i64,
     /// Mass-orphan circuit breaker minimum candidate count (ADR-0048
     /// decision 4). The breaker trips a pass only when it would delete at
     /// least this many orphan candidates AND more than
@@ -1312,6 +1323,8 @@ impl Default for CompactorConfig {
             compactor_writer_id: Uuid::nil(),
             grace_ns: DEFAULT_GRACE_NS,
             protection_horizon_ns: DEFAULT_PROTECTION_HORIZON_NS,
+            max_query_duration_ns: DEFAULT_MAX_QUERY_DURATION_NS,
+            head_cache_ttl_ns: ravel_catalog::DEFAULT_HEAD_CACHE_TTL_NS,
             orphan_breaker_min_count: DEFAULT_ORPHAN_BREAKER_MIN_COUNT,
             orphan_breaker_max_ratio: DEFAULT_ORPHAN_BREAKER_MAX_RATIO,
             quarantine_horizon_ns: DEFAULT_QUARANTINE_HORIZON_NS,

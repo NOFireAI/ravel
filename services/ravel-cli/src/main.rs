@@ -1074,9 +1074,9 @@ enum TypedAttrColumnCommand {
 
 #[derive(Debug, Subcommand)]
 enum GcConfigCommand {
-    /// Print the durable `sys/gc` values (protection horizon, grace, max query
-    /// duration, max flush lifetime), or report that the bucket is not yet
-    /// bootstrapped.
+    /// Print the durable `sys/gc` values (format version, protection horizon,
+    /// grace, max query duration, max flush lifetime, HEAD cache TTL), or
+    /// report that the bucket is not yet bootstrapped.
     Show {},
     /// Write a full new `sys/gc`, enforcing `protection_horizon >=
     /// max_query_duration + grace + clock_skew_allowance` at write time and
@@ -1105,6 +1105,16 @@ enum GcConfigCommand {
         /// omitted.
         #[arg(long, value_name = "DURATION")]
         clock_skew_allowance: Option<String>,
+        /// HEAD cache TTL every query-mode server process is held to (e.g.
+        /// `30s`). Writes `sys/gc` format version 2 recording it (ADR-1133):
+        /// run it only once every `ravel-server` process in every mode
+        /// (gateway, query, maintain, all) and every `ravel-cli` binary that
+        /// reads `sys/gc` runs a build that reads version 2, since an older
+        /// build then refuses the object. The flip is one-way. Omitted, the
+        /// stored format version is kept, and a stored version 2 keeps its
+        /// recorded TTL.
+        #[arg(long, value_name = "DURATION")]
+        head_cache_ttl: Option<String>,
     },
 }
 
@@ -2341,6 +2351,7 @@ async fn main() -> anyhow::Result<()> {
                     max_query_duration,
                     max_flush_lifetime,
                     clock_skew_allowance,
+                    head_cache_ttl,
                 },
         } => {
             ravel_cli::gc_config::set(
@@ -2350,6 +2361,7 @@ async fn main() -> anyhow::Result<()> {
                 &max_query_duration,
                 &max_flush_lifetime,
                 clock_skew_allowance.as_deref(),
+                head_cache_ttl.as_deref(),
                 now_ns()?,
             )
             .await
