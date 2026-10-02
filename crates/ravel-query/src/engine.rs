@@ -844,7 +844,14 @@ impl QueryEngine {
         let plans = plan_selectors(query, t_ms, t_ms)?;
         let eval_window = EvalWindow::Instant { t_ns };
         let (source, stats) = self
-            .prefetch(tenant_hash, &plans, &eval_window, min_tokens, now_ns)
+            .prefetch(
+                tenant_hash,
+                &plans,
+                &eval_window,
+                min_tokens,
+                now_ns,
+                eval_deadline,
+            )
             .await?;
         let evaluator = Evaluator::new()
             .with_default_step(self.config.default_evaluation_interval)?
@@ -1063,7 +1070,14 @@ impl QueryEngine {
             step_ns,
         };
         let (source, stats) = self
-            .prefetch(tenant_hash, &plans, &eval_window, min_tokens, now_ns)
+            .prefetch(
+                tenant_hash,
+                &plans,
+                &eval_window,
+                min_tokens,
+                now_ns,
+                eval_deadline,
+            )
             .await?;
         let evaluator = Evaluator::new()
             .with_default_step(self.config.default_evaluation_interval)?
@@ -1461,6 +1475,7 @@ impl QueryEngine {
         eval_window: &EvalWindow,
         min_tokens: &[CommitToken],
         now_ns: i64,
+        eval_deadline: Instant,
     ) -> Result<(MergedSource, QueryStats), QueryError> {
         if plans.is_empty() {
             return Ok((
@@ -1639,7 +1654,11 @@ impl QueryEngine {
                 max_series: series_remaining,
                 max_bytes_scanned: bytes_remaining,
                 max_s3_requests: requests_remaining,
-                deadline: Some(Instant::now() + self.config.deadline),
+                // The query's own deadline, not a fresh `Instant::now()` plus
+                // the duration: a log fetch started late in the query must
+                // stop where the query does (ADR-1133, clock-reading
+                // amendment).
+                deadline: Some(eval_deadline),
             };
             let out = log_series::fetch_log_series(
                 &self.log_fetcher,
@@ -6828,6 +6847,11 @@ mod prefetch_tests {
     // test window can never drift from what the evaluator selects.
     const DEFAULT_LOOKBACK_NS: i64 = ravel_promql::DEFAULT_LOOKBACK_NS;
 
+    /// An `eval_deadline` no prefetch test reaches.
+    fn far_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(3600)
+    }
+
     fn labels(metric: &str) -> LabelSet {
         LabelSet::new(vec![Label {
             name: METRIC_NAME_LABEL.to_string(),
@@ -7091,7 +7115,14 @@ mod prefetch_tests {
         let plans = vec![window_plan("metric_a")];
         let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
         let err = match eng
-            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .prefetch(
+                tenant_hash,
+                &plans,
+                &eval_window,
+                &[],
+                BASE_NS,
+                far_deadline(),
+            )
             .await
         {
             Ok(_) => panic!("an always-invalidated worker must fail the query"),
@@ -7390,7 +7421,14 @@ mod prefetch_tests {
         );
         let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
         let (source, _stats) = eng
-            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .prefetch(
+                tenant_hash,
+                &plans,
+                &eval_window,
+                &[],
+                BASE_NS,
+                far_deadline(),
+            )
             .await
             .expect("prefetch succeeds");
 
@@ -7504,6 +7542,7 @@ mod prefetch_tests {
                     &EvalWindow::Instant { t_ns: BASE_NS },
                     &[],
                     BASE_NS,
+                    far_deadline(),
                 )
                 .await
                 .expect("prefetch succeeds");
@@ -7590,7 +7629,14 @@ mod prefetch_tests {
         let plans = plan_selectors("count_over_time(m[5m])", BASE_MS, BASE_MS).expect("plans");
         let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
         let (source_a, _stats) = eng_a
-            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .prefetch(
+                tenant_hash,
+                &plans,
+                &eval_window,
+                &[],
+                BASE_NS,
+                far_deadline(),
+            )
             .await
             .expect("eligible prefetch succeeds");
         let count_a = Evaluator::new()
@@ -7677,7 +7723,14 @@ mod prefetch_tests {
                 zero_thresholds(),
             )));
         let (source_b, _stats) = eng_b
-            .prefetch(tenant_hash, &plans, &eval_window, &[], now_ns_b)
+            .prefetch(
+                tenant_hash,
+                &plans,
+                &eval_window,
+                &[],
+                now_ns_b,
+                far_deadline(),
+            )
             .await
             .expect("ineligible prefetch succeeds");
         let count_b = Evaluator::new()
@@ -7758,7 +7811,14 @@ mod prefetch_tests {
         let plans = plan_selectors("count_over_time(m[5m])", BASE_MS, BASE_MS).expect("plans");
         let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
         let (source, _stats) = eng
-            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .prefetch(
+                tenant_hash,
+                &plans,
+                &eval_window,
+                &[],
+                BASE_NS,
+                far_deadline(),
+            )
             .await
             .expect("prefetch succeeds");
         assert!(
@@ -7973,7 +8033,14 @@ mod prefetch_tests {
         let plans = vec![window_plan("metric_a"), window_plan("metric_b")];
         let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
         let (source, _stats) = eng
-            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .prefetch(
+                tenant_hash,
+                &plans,
+                &eval_window,
+                &[],
+                BASE_NS,
+                far_deadline(),
+            )
             .await
             .expect("prefetch must succeed across both selectors");
 
@@ -8022,7 +8089,14 @@ mod prefetch_tests {
         let plans = vec![window_plan("metric_a"), window_plan("metric_b")];
         let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
         let (source, _stats) = eng
-            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .prefetch(
+                tenant_hash,
+                &plans,
+                &eval_window,
+                &[],
+                BASE_NS,
+                far_deadline(),
+            )
             .await
             .expect("prefetch");
 
@@ -8064,11 +8138,25 @@ mod prefetch_tests {
         };
 
         let (source_a, _) = eng
-            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .prefetch(
+                tenant_hash,
+                &plans,
+                &eval_window,
+                &[],
+                BASE_NS,
+                far_deadline(),
+            )
             .await
             .expect("prefetch 1");
         let (source_b, _) = eng
-            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .prefetch(
+                tenant_hash,
+                &plans,
+                &eval_window,
+                &[],
+                BASE_NS,
+                far_deadline(),
+            )
             .await
             .expect("prefetch 2");
 
@@ -8111,7 +8199,7 @@ mod prefetch_tests {
         let eng = engine(store);
         let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
         let (source, _stats) = eng
-            .prefetch(tenant_hash, &[], &eval_window, &[], BASE_NS)
+            .prefetch(tenant_hash, &[], &eval_window, &[], BASE_NS, far_deadline())
             .await
             .expect("empty plan list must not error");
         let window = TimeRange {
@@ -8321,7 +8409,14 @@ mod prefetch_tests {
         let plans = vec![window_plan("point_metric")];
         let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
         let (_source, stats) = eng
-            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .prefetch(
+                tenant_hash,
+                &plans,
+                &eval_window,
+                &[],
+                BASE_NS,
+                far_deadline(),
+            )
             .await
             .expect("prefetch point lookup");
 
@@ -8352,7 +8447,14 @@ mod prefetch_tests {
         ];
         let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
         let (_source, stats) = eng
-            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .prefetch(
+                tenant_hash,
+                &plans,
+                &eval_window,
+                &[],
+                BASE_NS,
+                far_deadline(),
+            )
             .await
             .expect("prefetch wide scan");
 
@@ -8376,7 +8478,14 @@ mod prefetch_tests {
         let plans = vec![window_plan("multi_seg_metric")];
         let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
         let (_source, stats) = eng
-            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .prefetch(
+                tenant_hash,
+                &plans,
+                &eval_window,
+                &[],
+                BASE_NS,
+                far_deadline(),
+            )
             .await
             .expect("prefetch multi-segment");
 
@@ -8417,7 +8526,14 @@ mod prefetch_tests {
         ];
         let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
         let (_source, stats) = eng
-            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .prefetch(
+                tenant_hash,
+                &plans,
+                &eval_window,
+                &[],
+                BASE_NS,
+                far_deadline(),
+            )
             .await
             .expect("prefetch shared-matcher query");
 
@@ -8487,7 +8603,14 @@ mod prefetch_tests {
         ];
         let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
         let (_source, stats) = eng
-            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .prefetch(
+                tenant_hash,
+                &plans,
+                &eval_window,
+                &[],
+                BASE_NS,
+                far_deadline(),
+            )
             .await
             .expect("prefetch two-distinct-matcher-set query");
 
@@ -8559,7 +8682,14 @@ mod prefetch_tests {
         ];
         let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
         let (_source, stats) = eng
-            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .prefetch(
+                tenant_hash,
+                &plans,
+                &eval_window,
+                &[],
+                BASE_NS,
+                far_deadline(),
+            )
             .await
             .expect("prefetch plan-fanout-bound query");
 
@@ -8618,7 +8748,14 @@ mod prefetch_tests {
         ];
         let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
         let (_source, stats) = eng
-            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .prefetch(
+                tenant_hash,
+                &plans,
+                &eval_window,
+                &[],
+                BASE_NS,
+                far_deadline(),
+            )
             .await
             .expect("prefetch limiter-bound query");
 
@@ -8695,7 +8832,14 @@ mod prefetch_tests {
         ];
         let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
         let (_source, stats) = eng
-            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .prefetch(
+                tenant_hash,
+                &plans,
+                &eval_window,
+                &[],
+                BASE_NS,
+                far_deadline(),
+            )
             .await
             .expect("prefetch three-distinct-matcher-set query");
 
@@ -8775,7 +8919,14 @@ mod prefetch_tests {
         ];
         let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
         let (_source, stats) = eng
-            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .prefetch(
+                tenant_hash,
+                &plans,
+                &eval_window,
+                &[],
+                BASE_NS,
+                far_deadline(),
+            )
             .await
             .expect("prefetch three-distinct-matcher-set single-segment query");
 
@@ -8836,7 +8987,14 @@ mod prefetch_tests {
         let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
 
         let (_source, cold_stats) = eng
-            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .prefetch(
+                tenant_hash,
+                &plans,
+                &eval_window,
+                &[],
+                BASE_NS,
+                far_deadline(),
+            )
             .await
             .expect("cold prefetch");
         assert_eq!(
@@ -8846,7 +9004,14 @@ mod prefetch_tests {
         );
 
         let (_source, warm_stats) = eng
-            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .prefetch(
+                tenant_hash,
+                &plans,
+                &eval_window,
+                &[],
+                BASE_NS,
+                far_deadline(),
+            )
             .await
             .expect("warm prefetch");
         assert_eq!(
@@ -8952,7 +9117,14 @@ mod prefetch_tests {
         let eval_window = EvalWindow::Instant { t_ns: now_ns };
 
         let (_source, cold_stats) = eng
-            .prefetch(tenant_hash, &plans, &eval_window, &[], now_ns)
+            .prefetch(
+                tenant_hash,
+                &plans,
+                &eval_window,
+                &[],
+                now_ns,
+                far_deadline(),
+            )
             .await
             .expect("cold prefetch over folded tenant");
         assert_eq!(
@@ -8961,7 +9133,14 @@ mod prefetch_tests {
         );
 
         let (_source, warm_stats) = eng
-            .prefetch(tenant_hash, &plans, &eval_window, &[], now_ns)
+            .prefetch(
+                tenant_hash,
+                &plans,
+                &eval_window,
+                &[],
+                now_ns,
+                far_deadline(),
+            )
             .await
             .expect("warm prefetch over folded tenant");
         assert_eq!(
@@ -8990,7 +9169,14 @@ mod prefetch_tests {
         let plans = vec![window_plan("wide_hist_metric")];
         let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
         let (_source, stats) = eng
-            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .prefetch(
+                tenant_hash,
+                &plans,
+                &eval_window,
+                &[],
+                BASE_NS,
+                far_deadline(),
+            )
             .await
             .expect("prefetch wide histogram");
 
@@ -9034,7 +9220,14 @@ mod prefetch_tests {
         }];
         let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
         let (_source, stats) = eng
-            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .prefetch(
+                tenant_hash,
+                &plans,
+                &eval_window,
+                &[],
+                BASE_NS,
+                far_deadline(),
+            )
             .await
             .expect("prefetch wide window");
 
@@ -9084,7 +9277,14 @@ mod prefetch_tests {
 
         let single_plan = vec![window_plan("metric_a")];
         let (_source, single_stats) = eng
-            .prefetch(tenant_hash, &single_plan, &eval_window, &[], BASE_NS)
+            .prefetch(
+                tenant_hash,
+                &single_plan,
+                &eval_window,
+                &[],
+                BASE_NS,
+                far_deadline(),
+            )
             .await
             .expect("single-plan prefetch");
         assert!(
@@ -9101,7 +9301,14 @@ mod prefetch_tests {
         plan_b.offset_ns = NS_PER_MIN * 5;
         let shared_plans = vec![window_plan("metric_a"), plan_b];
         let (_source, shared_stats) = eng
-            .prefetch(tenant_hash, &shared_plans, &eval_window, &[], BASE_NS)
+            .prefetch(
+                tenant_hash,
+                &shared_plans,
+                &eval_window,
+                &[],
+                BASE_NS,
+                far_deadline(),
+            )
             .await
             .expect("shared-matcher prefetch");
 
@@ -9148,7 +9355,14 @@ mod prefetch_tests {
         let unbounded = engine(Arc::clone(&store));
         let single_plan = vec![window_plan("metric_a")];
         let (_source, single_stats) = unbounded
-            .prefetch(tenant_hash, &single_plan, &eval_window, &[], BASE_NS)
+            .prefetch(
+                tenant_hash,
+                &single_plan,
+                &eval_window,
+                &[],
+                BASE_NS,
+                far_deadline(),
+            )
             .await
             .expect("single-plan prefetch");
         let real_bytes = single_stats.accounting.total_s3_bytes();
@@ -9170,7 +9384,14 @@ mod prefetch_tests {
         plan_b.offset_ns = NS_PER_MIN * 5;
         let shared_plans = vec![window_plan("metric_a"), plan_b];
         let result = bounded
-            .prefetch(tenant_hash, &shared_plans, &eval_window, &[], BASE_NS)
+            .prefetch(
+                tenant_hash,
+                &shared_plans,
+                &eval_window,
+                &[],
+                BASE_NS,
+                far_deadline(),
+            )
             .await;
 
         assert!(
@@ -9262,7 +9483,14 @@ mod prefetch_tests {
         let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
         let plan = vec![window_plan("metric_a")];
         let (_source, stats) = eng
-            .prefetch(tenant_hash, &plan, &eval_window, &[], BASE_NS)
+            .prefetch(
+                tenant_hash,
+                &plan,
+                &eval_window,
+                &[],
+                BASE_NS,
+                far_deadline(),
+            )
             .await
             .expect("prefetch");
         let pa = &stats.phase_accounting;
@@ -9321,7 +9549,14 @@ mod prefetch_tests {
         let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
         let plan = vec![window_plan("metric_a")];
         let (_source, stats) = eng
-            .prefetch(tenant_hash, &plan, &eval_window, &[], BASE_NS)
+            .prefetch(
+                tenant_hash,
+                &plan,
+                &eval_window,
+                &[],
+                BASE_NS,
+                far_deadline(),
+            )
             .await
             .expect("prefetch");
         let pa = &stats.phase_accounting;
