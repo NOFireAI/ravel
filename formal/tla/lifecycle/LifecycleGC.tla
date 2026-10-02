@@ -444,7 +444,7 @@ ServesNow(s) == HeadReadable /\ \E o \in EffectiveHead : PresentObj(o) /\ Serves
 \* erasure filter) must outlive such a query.
 PinnedServes(s) ==
     /\ query.active
-    /\ clock <= query.deadline
+    /\ clock < query.deadline
     /\ \E o \in query.needs : PresentObj(o) /\ ServesSubject(o, s)
 
 ServesAny(s) == ServesNow(s) \/ PinnedServes(s)
@@ -600,7 +600,7 @@ Init ==
 \* (CompleteErasure via CompletionWitness, DreqSweep via GcWitness "dreq");
 \* every other action resets it to FALSE the same way it resets `held`.
 PermittedNeeds ==
-    IF query.active /\ clock <= query.deadline THEN query.needs ELSE {}
+    IF query.active /\ clock < query.deadline THEN query.needs ELSE {}
 
 GcWitness(r, dels) ==
     lastGc' = [rule |-> r, deleted |-> dels, atClock |-> clock,
@@ -649,8 +649,10 @@ Tick ==
     /\ NoGc
 
 \* Pin an in-flight query on a HEAD; its deadline is pin + mqd. It is permitted
-\* (may still read the objects it named) until the clock passes the deadline
-\* (max_query_duration).
+\* (may still read the objects it named) while clock < deadline: the deadline
+\* is exclusive, as in the code (log_series.rs deadline_exceeded treats
+\* now >= deadline as exceeded, the Flight redemption refuses at
+\* now_ns >= deadline_ns), so ExpireQuery fires at clock >= deadline.
 \*
 \* Two ADR-1133 delays widen the pin, both inert at HeadCacheTtl = 0 and
 \* ClockSkew = 0:
@@ -683,7 +685,7 @@ PinQuery ==
 
 ExpireQuery ==
     /\ query.active
-    /\ clock > query.deadline
+    /\ clock >= query.deadline
     /\ query' = [active |-> FALSE, needs |-> {}, deadline |-> 0]
     /\ UNCHANGED storeVars
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
@@ -1211,7 +1213,7 @@ DropRetiredBucketFromHead ==
 \* anchor matches (WindowPermits, below).
 QueryPermits(o) ==
     HorizonGuardsPinnedQueries =>
-        ~(query.active /\ clock <= query.deadline /\ o \in query.needs)
+        ~(query.active /\ clock < query.deadline /\ o \in query.needs)
 
 \* --- ADR-1133 window gate (issue #2339) ---------------------------------------
 \* Decision 3's window, max_query_duration + head_cache_ttl + 4 * sigma, with the
@@ -1246,25 +1248,23 @@ GatedCandidate(k) ==
     /\ ~NamedByHead(k)
     /\ IF k \in Buckets THEN RetentionCandidate(k) ELSE SupersededCandidate(k)
 
-\* The gate, on the deleting sweeper's clock: observed + window < now. True time
-\* is `clock`. `lead` is decision 3's deleting-sweeper sigma (the fourth): that
-\* sweeper's clock may run up to ClockSkew ahead of true time. marker[k].obs
-\* already carries the writer's lag and the ClockSkew shift (FreshMarker), so
-\* with the shift moved to the right-hand side this is
-\* (writer reading) + WindowLength < clock + lead.
+\* The gate, on the deleting sweeper's clock: observed + window <= now, decision
+\* 3's condition exactly. True time is `clock`. `lead` is decision 3's
+\* deleting-sweeper sigma (the fourth): that sweeper's clock may run up to
+\* ClockSkew ahead of true time. marker[k].obs already carries the writer's lag
+\* and the ClockSkew shift (FreshMarker), so with the shift moved to the
+\* right-hand side this is (writer reading) + WindowLength <= clock + lead.
 \*
-\* The comparison is strict where decision 3 writes <=. Every other boundary in
-\* the chain is inclusive here as in the code: a pinned query reads through its
-\* deadline tick, and the cache serves through drop + HeadCacheTtl. With <= the
-\* first tick the gate opens is the last tick a covered reader can still read,
-\* and window-gate.cfg fails on exactly that tick (results.md, issue #2339
-\* round). In nanoseconds, < is decision 3's condition plus 1 ns.
+\* <= is exact because the reader deadlines are exclusive (a pinned query reads
+\* only while clock < deadline) and the cache bound is inclusive (it serves
+\* through drop + HeadCacheTtl), as in the code: the first tick the gate opens
+\* is the first tick no covered reader can still read.
 WindowPermits(k) ==
     \/ ~WindowGate
     \/ /\ marker[k].present
        /\ (MarkerIgnoresAnchor \/ marker[k].anchor = AnchorOf(k))
        /\ \E lead \in 0..ClockSkew :
-              marker[k].obs + WindowLength < clock + ClockSkew + lead
+              marker[k].obs + WindowLength <= clock + ClockSkew + lead
 
 \* A marker body the writer's clock produced: `lag` is decision 3's marker-writer
 \* sigma (the third), the writer's clock running up to ClockSkew behind true time.

@@ -4,7 +4,12 @@
 # did. #1671 tracks measuring and loosening them. positive/window-gate.cfg
 # (issue #2339) pins its distinct count exactly, which is worker-independent
 # under the VIEW, and waives depth with the '-' sentinel for the same reason.
+# exhaustive.cfg's row still carries the figures from before reader deadlines
+# became exclusive: that run was not repeated after the change (results.md,
+# "Round fifteen"). tla-nightly.yml's next exhaustive run is its first
+# measurement; it shares smoke's constants, so expect smoke's new figures and a
+# BAND failure until this row is re-measured.
 cfg	min_distinct	max_distinct	min_depth	max_depth
-smoke.cfg	2832000	2839000	31	31
+smoke.cfg	3725000	3732000	32	32
 exhaustive.cfg	2832000	2839000	31	31
-positive/window-gate.cfg	543543	543543	-	-
+positive/window-gate.cfg	581630	581630	-	-

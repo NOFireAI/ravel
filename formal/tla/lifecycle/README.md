@@ -328,20 +328,24 @@ What the model adds, all inert at `WindowGate = FALSE` and `HeadCacheTtl = 0`:
   `WindowPermits`. The resolving process's own offset cancels (decision 3) and
   has no choice of its own.
 - `WindowPermits`, the gate: a matching marker whose reading plus
-  `MaxQueryDuration + HeadCacheTtl + 4 * ClockSkew` is below the deleting
-  sweeper's clock. `RetentionSweep` and `SupersededSweep` require it.
+  `MaxQueryDuration + HeadCacheTtl + 4 * ClockSkew` is at most the deleting
+  sweeper's clock, decision 3's `<=`. `RetentionSweep` and `SupersededSweep` require it.
 - Three switches, each a negative control: `WindowSingleSkew`
   (`1 * ClockSkew`), `WindowNoCacheDelay` (no `HeadCacheTtl` term while the pin
   keeps its delay) and `MarkerIgnoresAnchor` (any marker counts, and
   `RenewMarker` is off). Each violates `NoDeleteInsideProtectionWindow`; the
   notes under `counterexamples/` give the traces.
 
-The gate compares with `<` where decision 3 writes `<=`. A pinned query reads
-through its deadline tick and the cache serves through drop + `HeadCacheTtl`,
-both inclusive, so with `<=` the first tick the gate opens is the last tick a
-covered reader can read, and `window-gate.cfg` fails on that tick (results.md,
-issue #2339 round, has the run). In nanoseconds `<` is the ADR's condition plus
-1 ns; the ADR has no margin beyond it.
+Reader deadlines are exclusive and the cache bound is inclusive, as in the
+code: a pinned query reads only while `clock < deadline` and `ExpireQuery`
+fires at `clock >= deadline` (`deadline_exceeded` in
+`crates/ravel-query/src/log_series.rs` treats `now >= deadline` as exceeded,
+and the Flight SQL redemption refuses at `now_ns >= deadline_ns`), while the
+head cache serves through drop + `HeadCacheTtl` (`HeadCache::get` serves while
+`age <= ttl`). Under those boundaries decision 3's `<=` is exact: the first
+tick the gate opens is the first tick no covered reader can read.
+`results.md`, "Round fifteen", has the runs showing that the gate with `<=`
+passes and that dropping one skew term or the `HeadCacheTtl` term fails.
 
 `window-gate.cfg` runs with every window term at 1, `ProtectionHorizon = 2`
 (the smallest the startup inequality allows) and `MaxClock = 8`, so a marker

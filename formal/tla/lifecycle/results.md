@@ -1893,7 +1893,8 @@ ADR-1133 window gate", describes what the model gained and what it leaves out.
 
 ### Expected results
 
-Not pre-registered on the issue; the task fixed them: the positive cfg passes
+These were not posted on the issue before the runs; the task specification
+stated them: the positive cfg passes
 `NoDeleteInsideProtectionWindow` with a delete reachable; each of the four
 controls violates it with exit 12; smoke, exhaustive and the nine existing
 controls give exactly their round-thirteen results (smoke and exhaustive
@@ -1954,28 +1955,6 @@ none of it is committed. Each is violated, exit 12:
 - `RenewMarker` never enabled: violated, so some behaviour renews a stale
   marker.
 
-### The gate compares with `<`, not decision 3's `<=`
-
-A scratch copy of the model with `<=` in `WindowPermits` fails
-`window-gate.cfg`:
-
-```text
-Error: Invariant NoDeleteInsideProtectionWindow is violated.
-146172 states generated, 30854 distinct states found, 14165 states left on queue.
-```
-
-Twelve states: the tombstone lands at 0, the fold drops `b1` at clock 2, the
-marker is written at 2 with the writer one behind (reading 1), a query pins
-`raw1` at clock 3 through the cache (`cacheUntil[raw1] = 3`) with a Flight
-ticket term of 2 (deadline 6), and `RetentionSweep(raw1)` runs at clock 6, the
-sweeper one ahead reading 7 = 1 + 6. The query's last tick and the gate's first
-tick are the same tick. Every boundary in that chain is inclusive in the model
-as in the code (the head cache serves while age <= TTL, a query reads through
-its deadline), so decision 3's inequality has no margin. The committed model
-uses `<`; in nanoseconds that is the ADR's condition plus 1 ns. This is
-reported with issue #2339's result for the ADR and the Rust gate to decide; the
-model does not change the ADR.
-
 ### Each control fails for its own reason
 
 - `pinned-query-ungated`: a pin, the tombstone, the fold's drop, one tick, and
@@ -2010,3 +1989,48 @@ The host had no Java runtime. A Temurin JDK 21 for aarch64 was unpacked under
 `.dd-tools/` (gitignored) and passed through `RAVEL_TLA_JAVA`; the TLC jar was
 fetched by `check-tla.sh` into `.cache/tla` and checksum-verified. Nothing from
 either directory is committed.
+
+## Round fifteen: exclusive reader deadlines, decision 3's `<=` (issue #2339)
+
+Round fourteen let a pinned query read through its deadline tick
+(`clock <= query.deadline` in `PinnedServes`, `PermittedNeeds` and
+`QueryPermits`, with `ExpireQuery` at `clock > query.deadline`) and compared
+the window gate with `<`. The code's reader deadlines are exclusive:
+`deadline_exceeded` in `crates/ravel-query/src/log_series.rs` treats
+`Instant::now() >= d` as exceeded, the Flight SQL redemption in
+`crates/ravel-sql/src/flight/stream.rs` refuses at `now_ns >= deadline_ns`, and
+the engine's timeout fires at the deadline. The head cache bound is inclusive:
+`HeadCache::get` in `crates/ravel-catalog/src/cache.rs` serves while
+`age <= ttl`. The model now matches both: a query reads only while
+`clock < query.deadline`, `ExpireQuery` fires at `clock >= query.deadline`, and
+`WindowPermits` compares with `<=`, decision 3's condition exactly.
+
+### Runs
+
+Every run used `scripts/check-tla.sh` with `RAVEL_TLA_WORKERS=2` and
+`RAVEL_TLA_XMX=2g` on a 16-core x86_64 host with 31 GB of memory, Temurin
+17.0.20.1, on the model as committed.
+
+| cfg | result | distinct | depth | exit | wall |
+|---|---|---|---|---|---|
+| smoke.cfg | PASS | 3728440 | 32 | 0 | 157s |
+| positive/window-gate.cfg | PASS | 581630 | 20 | 0 | 29s |
+
+Both counts moved. smoke.cfg went from 2835448 distinct at depth 31 to 3728440
+at depth 32, and `bands.tsv` moves its row to `[3725000, 3732000]`, depth 32.
+At `MaxClock = 1` a query pinned at clock 0 has deadline 1; with an inclusive
+deadline it could only expire at clock 2, past the clock bound, so no
+behaviour reached an expired query or a second pin. With an exclusive deadline
+`ExpireQuery` fires at clock 1 and `PinQuery` can pin again; smoke.cfg sets
+`WindowGate = FALSE`, so that is the only change acting on it.
+positive/window-gate.cfg went from 543543 to 581630. Two changes act on it:
+queries expire one tick earlier, and under `<=` the gate opens one tick
+earlier; these runs do not separate the two. `bands.tsv` pins 581630.
+
+exhaustive.cfg was not rerun: round fourteen's run of the same graph at 2835448
+distinct took 2672s, and at about 1.3 times the states it would exceed this
+task's 30 minute limit. Its band is unchanged. It shares smoke.cfg's
+constants (only `FairSpec` and the two liveness properties differ), so the
+nightly lane's next run should find smoke.cfg's new figures and fail the band
+until the row is re-measured.
+
