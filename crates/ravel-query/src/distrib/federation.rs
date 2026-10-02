@@ -60,6 +60,11 @@
 //! backpressure rather than a verdict on the query, so the same slice can
 //! succeed once the remote has room, exactly as on the intra-cluster path.
 //!
+//! Every request carries the query's own deadline, and a remote stops
+//! reading for the query when it passes. A remote that answers `TIMEOUT`
+//! stopped there: the query is over, so it fails with
+//! [`QueryError::DeadlineExceeded`] whatever `skip_unavailable` says.
+//!
 //! # Merge semantics and the cross-cluster tie-break limitation
 //!
 //! Federated runs join the same k-way merge the local fetch feeds, keyed by
