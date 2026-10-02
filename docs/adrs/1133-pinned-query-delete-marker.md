@@ -1,6 +1,6 @@
 # ADR-1133: an unnamed-since marker gates sweep deletes on the pinned-query window
 
-Status: Accepted (2026-10-01; revised 2026-10-02 after review)
+Status: Accepted (2026-10-01; revised 2026-10-02 after review; amended 2026-10-02)
 
 ## Context
 
@@ -38,7 +38,7 @@ This placement avoids two problems:
 The marker is immutable, small and versioned, and holds no tenant data. Its body carries:
 
 - `format_version`;
-- `observed_unix_ns`: the writing sweeper's own clock reading when it found the candidate unnamed;
+- `observed_unix_ns`: the writing sweeper's own clock reading when it found the candidate unnamed, read after that HEAD GET returned (see the clock-reading amendment below);
 - **anchor identity**: the kind (retention or superseded), the anchor's key (`retire.tmb` or the record), its anchoring timestamp (`retired_at_ns` or `created_unix_ns`) and its store version;
 - for forensics only, the HEAD version observed.
 
@@ -71,7 +71,7 @@ This ADR rests on a stronger deployment assumption than docs/deletion-and-gc.md 
 
 No startup check enforces a clock offset. It is a declared property of the deployment, like `σ` itself today, and the condition below has no margin beyond it: a clock outside its bound can open the gate early.
 
-- **The cache delays the pin.** A resolve can be served a cached HEAD (`head_cache_ttl`, crates/ravel-catalog/src/snapshot_resolve.rs). A query can still be handed a HEAD that names X until `t_drop + head_cache_ttl`, measured on the resolving process's clock. Within one process the TTL check and the query deadline share that clock, so its offset cancels.
+- **The cache delays the pin.** A resolve can be served a cached HEAD (`head_cache_ttl`, crates/ravel-catalog/src/snapshot_resolve.rs). A query can still be handed a HEAD that names X until `t_drop + head_cache_ttl`, measured on the resolving process's clock. The TTL is measured on a monotonic clock, so no wall-clock offset enters this term (see the clock-reading amendment below).
 - **A query ends within `max_query_duration`.** Its engine deadline is validated `<= max_query_duration` at startup (docs/deletion-and-gc.md).
 - **A Flight SQL ticket can extend that by `2σ`.** The ticket is minted on process A with A's deadline and redeemed on process B against B's clock (crates/ravel-sql/src/flight/mod.rs, `clamp_ticket_deadline_ns`). Its reads can end up to `2σ` later in true time than A's own deadline.
 - **So every covered reader of X has ended by** `t_drop + head_cache_ttl + max_query_duration + 2σ`.
@@ -217,3 +217,21 @@ sequenceDiagram
   - a build that understands only version 1 refusing a version 2 `sys/gc`;
   - the IAM witness;
   - the TLA+ checks in decision 7.
+
+## Amendment (2026-10-02): when each clock in the window is read
+
+<!-- amendment-applies: sections="1. The sweep records when it first saw a candidate unnamed|3. A delete waits until the marker is older than the pinned-query window" pointer="clock-reading amendment" -->
+<!-- amendment-supersedes: phrase="share that clock, so its offset cancels" pointer="clock-reading amendment" -->
+
+A review of the lifecycle model (issue #2339) found that decision 3's safety argument rested on three readings the decision did not pin down. The condition itself stands as written, `<=` with `4 * clock_skew_allowance`. What changes is what the implementation must guarantee for that condition to be exact.
+
+**The head cache measures its TTL on a monotonic clock.** Decision 3 said the TTL check and the query deadline share the resolving process's clock, so its offset cancels. They do not. The cache compares wall-clock nanoseconds (crates/ravel-catalog/src/cache.rs, `HeadCache::get`), while the engine deadline is a monotonic `Instant`. If each wall clock is only bounded within `σ` of true time, a cached HEAD can be served for up to `head_cache_ttl + 2σ` of true time, and the gate would be `2σ` short. The cache therefore measures an entry's age on a monotonic clock, injected so tests stay deterministic. The entry's stamp is taken before the HEAD GET is issued, as the resolve path's `now_ns` is today, so a HEAD read before the drop cannot be served past `t_drop + head_cache_ttl`.
+
+**The marker's observation time is read after the HEAD GET returns.** The sweep passes take `now` when the pass starts, before they list or read HEAD (crates/ravel-maintain/src/sweep.rs). A marker stamped with that reading can predate the drop it records, which breaks "the marker cannot be early". `observed_unix_ns` is read from the sweeper's clock after the HEAD GET that found the candidate unnamed has returned, not taken from the pass's start time.
+
+**Reader deadlines are exclusive; the cache bound is inclusive.** A query reads only while its clock is strictly before its deadline: the log fetch treats `now >= deadline` as exceeded (crates/ravel-query/src/log_series.rs), a Flight redemption is refused when `now_ns >= deadline_ns` (crates/ravel-sql/src/flight/stream.rs), and the engine's timeout fires at the deadline. The head cache serves while `age <= head_cache_ttl`. With those bounds the gate's `<=` is exact: the first instant it opens is the first instant no covered reader can still read. A model that let a query read through its deadline tick needed `<` instead, and that model was wrong about the code, not the gate.
+
+Consequences for the implementation:
+- crates/ravel-catalog gains the monotonic TTL clock in `HeadCache` and its callers. This is a change to the resolve path, not to any persistent format.
+- The marker task reads `observed_unix_ns` after the HEAD GET, and a test pins a marker written in a pass whose start time predates the drop.
+- The lifecycle model makes reader deadlines exclusive and keeps the gate at `<=`.
