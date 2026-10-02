@@ -374,8 +374,9 @@ pub const MAX_PROBE_LIST_PAGES: usize = 8;
 /// What [`one_object_under`] found under a location.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeObject {
-    /// The key of one object the grant admits, whose key ends in `.parquet`
-    /// and which holds at least one byte.
+    /// The key of one object the grant admits and which holds at least one
+    /// byte: the location's own object, whatever its suffix, or a listed
+    /// object whose key ends in `.parquet`.
     Found(String),
     /// The listing ran to its end without one.
     Empty,
@@ -384,15 +385,12 @@ pub enum ProbeObject {
     PageCapReached,
 }
 
-/// Is `meta` an object a reader can probe: admitted by `grant`, named
-/// `*.parquet`, and not empty? A zero-byte key is a folder marker (S3
-/// consoles write `data/`; an Azure hierarchical namespace reports a
-/// directory as a zero-byte blob) or an empty file, and a ranged read of
-/// either fails.
+/// Is this object one a reader can probe: admitted by `grant` and not empty?
+/// A zero-byte key is a folder marker (S3 consoles write `data/`; an Azure
+/// hierarchical namespace reports a directory as a zero-byte blob) or an
+/// empty file, and a ranged read of either fails.
 fn is_probeable(grant: &Grant, key: &str, size: u64) -> bool {
-    size > 0
-        && key.ends_with(".parquet")
-        && contains_key(grant, &grant.profile, &grant.bucket, key.as_bytes())
+    size > 0 && contains_key(grant, &grant.profile, &grant.bucket, key.as_bytes())
 }
 
 /// One object a reader can probe under the location `location_key`, looked
@@ -401,15 +399,17 @@ fn is_probeable(grant: &Grant, key: &str, size: u64) -> bool {
 /// the grant that admits it.
 ///
 /// An object is returned only if `grant` admits its key ([`contains_key`], so
-/// the location `data/t1` never offers `data/t10/x.parquet`), the key ends in
-/// `.parquet`, and its size is not zero.
+/// the location `data/t1` never offers `data/t10/x.parquet`) and its size is
+/// not zero.
 ///
 /// A location that does not name a directory may name one object, so its key
 /// is checked with a HEAD first: `object_store` appends `/` to every
 /// non-empty list prefix, so listing `data/x.parquet` never returns
-/// `data/x.parquet` itself. When that object is absent or fails the checks
-/// above, the location is listed as a prefix, which is what finds the files
-/// under a zero-byte directory blob. The listing prefix always carries a
+/// `data/x.parquet` itself. That object is accepted whatever its suffix, as
+/// ADR-2040 reads a single-object location whatever its suffix. When it is
+/// absent or fails the checks above, the location is listed as a prefix,
+/// which is what finds the files under a zero-byte directory blob; a listed
+/// object must also end in `.parquet`. The listing prefix always carries a
 /// trailing `/` (none for the whole bucket), whatever the store does with a
 /// prefix that lacks one.
 pub async fn one_object_under(
@@ -435,11 +435,9 @@ pub async fn one_object_under(
     let mut page: Option<PageToken> = None;
     for _ in 0..MAX_PROBE_LIST_PAGES {
         let listed = store.list(&list_prefix, page).await?;
-        if let Some(meta) = listed
-            .objects
-            .iter()
-            .find(|meta| is_probeable(grant, &meta.key, meta.size))
-        {
+        if let Some(meta) = listed.objects.iter().find(|meta| {
+            meta.key.ends_with(".parquet") && is_probeable(grant, &meta.key, meta.size)
+        }) {
             return Ok(ProbeObject::Found(meta.key.clone()));
         }
         match listed.next {
@@ -1280,19 +1278,22 @@ mod tests {
         );
     }
 
+    /// A single-object location is accepted by HEAD when it is non-empty,
+    /// whatever its suffix: ADR-2040 reads such a location whatever its
+    /// suffix, so the probe must not refuse one the reader would serve.
     #[tokio::test]
-    async fn a_single_object_location_is_checked_by_head_against_all_three_rules() {
+    async fn a_single_object_location_is_checked_by_head_for_size_not_suffix() {
         let store = MemoryStore::new();
         put_sized(&store, "data/zero.parquet", b"").await;
         put_sized(&store, "data/one.parquet", b"PAR1").await;
-        put_sized(&store, "data/one.csv", b"a,b").await;
+        put_sized(&store, "data/export-2026-09", b"PAR1").await;
         assert_eq!(
             probe(&store, "s3://b/data/zero.parquet").await,
             ProbeObject::Empty
         );
         assert_eq!(
-            probe(&store, "s3://b/data/one.csv").await,
-            ProbeObject::Empty
+            probe(&store, "s3://b/data/export-2026-09").await,
+            ProbeObject::Found("data/export-2026-09".to_string())
         );
         assert_eq!(
             probe(&store, "s3://b/data/one.parquet").await,
