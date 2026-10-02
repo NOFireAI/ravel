@@ -105,9 +105,8 @@ pub enum DdlOutcome {
 /// Every variant short of [`DdlExecuteError::Write`] is a refusal before any
 /// manifest write is attempted; [`DdlExecuteError::Write`] is a refusal or a
 /// failure of the write itself. The HTTP status each should take is noted per
-/// variant below, and [`DdlExecuteError::class`] encodes that mapping (the
-/// `ddl` capability wiring itself, services/ravel-server, is this task's
-/// sibling and not yet in place).
+/// variant below, and [`DdlExecuteError::class`] encodes that mapping, which
+/// `POST /api/v1/sql` in services/ravel-server renders.
 #[derive(Debug, thiserror::Error)]
 pub enum DdlExecuteError {
     /// The statement failed the DDL gate (`crate::validate::validate_ddl`),

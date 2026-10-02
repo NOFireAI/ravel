@@ -56,6 +56,7 @@ use axum::http::HeaderMap;
 use ravel_ingest::Clock;
 use ravel_maintain::{QueryAuditSink, QueryStatus};
 use ravel_promql::Value;
+use ravel_tenant_resolve::Principal;
 use ravel_query::http::service as core;
 use ravel_query::http::{
     InstantOutcome, InstantRequest, LabelValuesOutcome, LabelsOutcome, LiveUsage, MetadataOutcome,
@@ -86,6 +87,19 @@ pub fn authenticate(
     resolver
         .resolve(headers)
         .map(|tenant| tenant.hash())
+        .map_err(|_| ServiceError::unauthorized())
+}
+
+/// [`authenticate`] for a transport that also needs the caller's capabilities:
+/// the full [`Principal`] (tenant plus the `ddl` capability). A failed
+/// resolution maps to 401 exactly as [`authenticate`] maps it, and likewise
+/// takes no admission permit.
+pub fn authenticate_principal(
+    resolver: &dyn TenantResolver,
+    headers: &HeaderMap,
+) -> Result<Principal, ServiceError> {
+    resolver
+        .resolve_principal(headers)
         .map_err(|_| ServiceError::unauthorized())
 }
 
