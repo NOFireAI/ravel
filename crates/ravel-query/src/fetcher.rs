@@ -379,7 +379,7 @@ pub enum CacheFetchError {
         message: String,
     },
     /// The closure's own query refused the read against its request or byte
-    /// budget ([`ravel_parquet`]'s `ReadLimits::admit`), before any store GET
+    /// budget (`ravel_parquet`'s `ReadLimits::admit`), before any store GET
     /// ran. Its own variant so a single-flight follower is told this is a
     /// budget refusal from whichever caller computed it, not a store error it
     /// would retry; the follower's own budget was not consulted and must be
