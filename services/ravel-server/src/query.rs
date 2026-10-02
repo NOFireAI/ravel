@@ -544,6 +544,7 @@ pub fn build_sql_state(
         declared_columns,
         process_memory_budget,
         None,
+        ravel_sql::DEFAULT_MIN_GRACE_MS,
     )
 }
 
@@ -559,6 +560,14 @@ pub fn build_sql_state(
 /// `parquet_profiles` is `None` when no `--parquet-profiles` file is
 /// configured: no Parquet table is then queryable, and a query naming one
 /// fails with `ParquetQueryError::NotConfigured`.
+///
+/// `ddl_min_grace_ms` is installed on the executor via
+/// `SqlExecutor::with_ddl_min_grace_ms` (ADR-2040): the deployment's
+/// `sys/gc` `max_query_duration_ns`, in milliseconds, so a `DROP`/replacing
+/// `CREATE OR REPLACE` cannot delete a version a query started against this
+/// process's own `max_query_duration` could still be reading. The caller
+/// derives it from the already-bootstrapped `GcConfigValues` rather than
+/// this function re-reading `sys/gc`.
 #[cfg(feature = "sql")]
 #[allow(clippy::too_many_arguments)]
 pub fn build_sql_state_with_parquet(
@@ -576,6 +585,7 @@ pub fn build_sql_state_with_parquet(
     declared_columns: Option<Arc<dyn ravel_sql::DeclaredColumnSource>>,
     process_memory_budget: Arc<ravel_memory::MemoryBudget>,
     parquet_profiles: Option<crate::config::ParquetProfiles>,
+    ddl_min_grace_ms: u64,
 ) -> anyhow::Result<crate::sql::SqlState> {
     let external = parquet_profiles.map(|config| {
         let stores = ravel_sql::ProfileStores::new(config.profiles);
@@ -611,6 +621,7 @@ pub fn build_sql_state_with_parquet(
         declared_columns,
         process_memory_budget,
         Some(sources),
+        ddl_min_grace_ms,
     )
 }
 
@@ -631,6 +642,7 @@ fn build_sql_state_inner(
     declared_columns: Option<Arc<dyn ravel_sql::DeclaredColumnSource>>,
     process_memory_budget: Arc<ravel_memory::MemoryBudget>,
     parquet: Option<ravel_sql::ParquetSources>,
+    ddl_min_grace_ms: u64,
 ) -> anyhow::Result<crate::sql::SqlState> {
     use ravel_query::{LogSegmentFetcher, SegmentFetcher};
     use ravel_sql::{SpanSegmentFetcher, SqlConfig, SqlExecutor};
@@ -750,6 +762,11 @@ fn build_sql_state_inner(
         Some(sources) => executor.with_parquet_sources(sources),
         None => executor,
     };
+    // ADR-2040: the deployment's `sys/gc`-derived minimum sweep grace, so a
+    // `DROP`/replacing `CREATE OR REPLACE` cannot delete a manifest version a
+    // query admitted under this process's own `max_query_duration` could
+    // still be reading.
+    let executor = executor.with_ddl_min_grace_ms(ddl_min_grace_ms);
     Ok(crate::sql::SqlState {
         executor: Arc::new(executor),
         tenant_resolver,
@@ -1868,6 +1885,7 @@ mod tests {
                 None,
                 Arc::new(ravel_memory::MemoryBudget::unlimited()),
                 profiles,
+                ravel_sql::DEFAULT_MIN_GRACE_MS,
             )
             .expect("sql state builds")
         };
