@@ -34,7 +34,8 @@
 //!   (429, 503, ...) lives, so 429/503/throttle classification has no typed
 //!   floor at this layer and stays a `Display`-text heuristic (the reason
 //!   phrases `"too many requests"` and `"service unavailable"` that always
-//!   follow a 429 or 503 status, `"throttl"`, ...). Timeouts and
+//!   follow a 429 or 503 status, `"throttl"`, ...), read from the inner
+//!   error text with the request URI left out. Timeouts and
 //!   connection failures are different: the `RetryError`'s own `source()`
 //!   chain contains a publicly nameable [`object_store::client::HttpError`]
 //!   whose [`object_store::client::HttpErrorKind`] is a typed
@@ -1652,7 +1653,9 @@ fn typed_http_kind(
 /// 2. **`Display`-text heuristic (fallback).** When no `HttpError` is in the
 ///    chain (notably the 429/503 throttle case, whose status is trapped in
 ///    `object_store`'s crate-private `RetryError`), match the lowercased
-///    message for well-known signals: timeout words to [`StoreError::Timeout`],
+///    [`classified_text`], which leaves out the request URI and any wrapper
+///    text naming a path, for well-known signals: timeout words to
+///    [`StoreError::Timeout`],
 ///    throttle words, including the reason phrases `object_store` always
 ///    prints after a 429 or 503 status ("too many requests", "service
 ///    unavailable"), to [`StoreError::Throttled`]. A bare "429" or "503"
@@ -1689,7 +1692,7 @@ fn classify_generic(
     // Tier 2: Display-text heuristic. This is the only floor for 429/503,
     // whose HTTP status is not reachable through any nameable type here.
     let msg = source.to_string();
-    let lower = msg.to_lowercase();
+    let lower = classified_text(source).to_lowercase();
     // `object_store`'s `RetryError` Display appends ", ..., retry_timeout: {d} "
     // on every exhausted-retry message (whenever retries != 0), and the field
     // name contains "timeout". The timeout check below runs on the text with
@@ -1713,6 +1716,76 @@ fn classify_generic(
         return StoreError::Timeout;
     }
     StoreError::Transient(format!("{store}: {msg}"))
+}
+
+/// The part of a `Generic` error's text that carries the failure itself, with
+/// the request URI and any wrapper text naming a path left out, so a bucket,
+/// endpoint or key spelled with a class word cannot pick the class.
+///
+/// `RetryError` renders `"Error performing {method} {uri} in {elapsed:?}"`,
+/// an optional exhausted-retry suffix, then `" - {inner}"`, where `inner` is
+/// its `RequestError` source (status and body, error response body, or the
+/// transport error, which `object_store` strips of its URL). Neither type is
+/// nameable, so the inner error is found in the source chain by that shape,
+/// and failing that (a chain the source does not expose) parsed out of the
+/// text. A per-key `DeleteObjects` refusal names the key with no reliable end
+/// marker, so only its code is used. Any other text carries no request URI
+/// and is used whole.
+fn classified_text(source: &(dyn std::error::Error + Send + Sync + 'static)) -> String {
+    if let Some(code) = delete_objects_key_code(source) {
+        return code;
+    }
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(source);
+    while let Some(err) = current {
+        if let Some(inner) = err.source() {
+            let outer = err.to_string();
+            let inner_text = inner.to_string();
+            if outer.starts_with("Error performing ")
+                && outer
+                    .strip_suffix(inner_text.as_str())
+                    .is_some_and(|head| head.ends_with(" - "))
+            {
+                return inner_text;
+            }
+        }
+        current = err.source();
+    }
+    let text = source.to_string();
+    match retry_error_inner(&text) {
+        Some(inner) => inner.to_string(),
+        None => text,
+    }
+}
+
+/// The `{inner}` of the first `RetryError`-shaped segment in `text`. The
+/// method is an upper-case token and an `http::Uri` holds no space, so the
+/// first `" - "` after `" in "` ends the prefix: neither the elapsed time nor
+/// the exhausted-retry suffix contains one. Wrapper text such as `"Error
+/// performing list request: "` does not match the shape and is skipped.
+fn retry_error_inner(text: &str) -> Option<&str> {
+    const MARKER: &str = "Error performing ";
+    let mut from = 0;
+    while let Some(found) = text[from..].find(MARKER) {
+        let start = from + found + MARKER.len();
+        from = start;
+        let rest = &text[start..];
+        let Some((method, rest)) = rest.split_once(' ') else {
+            continue;
+        };
+        if method.is_empty() || !method.bytes().all(|b| b.is_ascii_uppercase()) {
+            continue;
+        }
+        let Some((uri, rest)) = rest.split_once(' ') else {
+            continue;
+        };
+        if uri.is_empty() || !rest.starts_with("in ") {
+            continue;
+        }
+        if let Some((_, inner)) = rest.split_once(" - ") {
+            return Some(inner);
+        }
+    }
+    None
 }
 
 /// Local CRC32C pre-flight, shared by [`S3Store::put`] and
@@ -4028,6 +4101,203 @@ mod tests {
                 ),
                 "got {mapped:?} for {text:?}"
             );
+        }
+    }
+
+    #[derive(Debug)]
+    struct OwnedTextError(String);
+
+    impl std::fmt::Display for OwnedTextError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.0)
+        }
+    }
+
+    impl std::error::Error for OwnedTextError {}
+
+    /// An error that renders `"{prefix}{source}"` and exposes `source`, the
+    /// shape of both `RetryError` (prefix ending `" - "`) and the wrappers
+    /// `object_store` puts around it (`"Error performing get request {path}: "`).
+    #[derive(Debug)]
+    struct Wrapping {
+        prefix: String,
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    }
+
+    impl std::fmt::Display for Wrapping {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}{}", self.prefix, self.source)
+        }
+    }
+
+    impl std::error::Error for Wrapping {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(self.source.as_ref())
+        }
+    }
+
+    const CLASS_WORDS: [&str; 4] = ["timeout", "deadline", "throttled", "slowdown"];
+
+    /// An exhausted 500 and a 400 whose bucket, endpoint host or key carries a
+    /// timeout or throttle word read Transient: only the inner `RequestError`
+    /// text is a class signal, never the request URI. Covers the plain text,
+    /// the text behind a wrapper that names the raw key (which can hold a
+    /// space, so "slow down" too), the same pair as a source chain, and a
+    /// per-key `DeleteObjects` refusal naming the key.
+    #[test]
+    fn class_words_in_the_request_uri_are_not_a_class() {
+        let inners = [
+            ", after 10 retries, max_retries: 10, retry_timeout: 180s  - Server returned \
+             non-2xx status code: 500 Internal Server Error: "
+                .to_string(),
+            " - Server returned non-2xx status code: 400 Bad Request: \
+             <Error><Code>InvalidArgument</Code></Error>"
+                .to_string(),
+        ];
+        let mut texts = Vec::new();
+        for word in CLASS_WORDS {
+            for uri in [
+                format!("http://127.0.0.1:9000/{word}-bucket/k"),
+                format!("http://{word}.s3.example.com/b/k"),
+                format!("http://127.0.0.1:9000/b/{word}/k"),
+            ] {
+                for inner in &inners {
+                    texts.push(format!("Error performing GET {uri} in 1.2ms{inner}"));
+                }
+            }
+        }
+        for word in CLASS_WORDS.iter().chain(&["slow down"]) {
+            for inner in &inners {
+                texts.push(format!(
+                    "Error performing get request {word}/k: Error performing GET \
+                     http://127.0.0.1:9000/b/k in 1.2ms{inner}"
+                ));
+            }
+        }
+        for word in CLASS_WORDS.iter().chain(&["slow down"]) {
+            texts.push(format!(
+                "DeleteObjects request failed for key {word}/k: We encountered an \
+                 internal error. (code: InternalError)"
+            ));
+        }
+        for text in texts {
+            let mapped = map_error_common(generic(OwnedTextError(text.clone())));
+            assert!(
+                matches!(mapped, StoreError::Transient(_)),
+                "a class word in the URI or key must not pick the class, got \
+                 {mapped:?} for {text:?}"
+            );
+        }
+
+        for word in CLASS_WORDS.iter().chain(&["slow down"]) {
+            for (status, retries) in [
+                (
+                    "500 Internal Server Error",
+                    ", after 10 retries, max_retries: 10, retry_timeout: 180s ",
+                ),
+                ("400 Bad Request", ""),
+            ] {
+                let retry = Wrapping {
+                    prefix: format!(
+                        "Error performing GET http://{word}.example.com/{word}/{word} \
+                         in 1.2ms{retries} - "
+                    ),
+                    source: Box::new(OwnedTextError(format!(
+                        "Server returned non-2xx status code: {status}: "
+                    ))),
+                };
+                let wrapped = Wrapping {
+                    prefix: format!("Error performing get request {word}/k: "),
+                    source: Box::new(retry),
+                };
+                let mapped = map_error_common(generic(wrapped));
+                assert!(
+                    matches!(mapped, StoreError::Transient(_)),
+                    "a class word in the chain's URI or key must not pick the class, \
+                     got {mapped:?} for {word:?} {status}"
+                );
+            }
+        }
+    }
+
+    /// A raw key in a wrapper's text that itself looks like a `RetryError`
+    /// prefix is not mistaken for one when the source chain is reachable: the
+    /// inner text comes from the chain, not from the first matching segment.
+    #[test]
+    fn a_key_shaped_like_a_retry_prefix_is_not_the_inner_text() {
+        let wrapped = Wrapping {
+            prefix: "Error performing get request Error performing GET x in 1ms - timeout/k: "
+                .to_string(),
+            source: Box::new(Wrapping {
+                prefix: "Error performing GET http://127.0.0.1:9000/b/k in 1.2ms - ".to_string(),
+                source: Box::new(OwnedTextError(
+                    "Server returned non-2xx status code: 400 Bad Request: ".to_string(),
+                )),
+            }),
+        };
+        let mapped = map_error_common(generic(wrapped));
+        assert!(matches!(mapped, StoreError::Transient(_)), "got {mapped:?}");
+    }
+
+    /// The genuine signals still classify through the URI split: the 429 and
+    /// 503 reason phrases, S3 `SlowDown` and `RequestTimeout` codes in the body,
+    /// a 504 or 408 status, a transport "operation timed out" or "deadline has
+    /// elapsed", and a 2xx error response body (`RequestError::Response`), each
+    /// behind a URI that carries no class word, as text and as a chain.
+    #[test]
+    fn genuine_signals_behind_the_request_uri_keep_their_class() {
+        let throttled = [
+            "Server returned non-2xx status code: 429 Too Many Requests: ",
+            "Server returned non-2xx status code: 503 Service Unavailable: ",
+            "Server returned non-2xx status code: 500 Internal Server Error: \
+             <Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>",
+            "Server returned error response: <Error><Code>SlowDown</Code></Error>",
+        ];
+        let timeout = [
+            "Server returned non-2xx status code: 400 Bad Request: \
+             <Error><Code>RequestTimeout</Code></Error>",
+            "Server returned non-2xx status code: 504 Gateway Timeout: ",
+            "Server returned non-2xx status code: 408 Request Timeout: ",
+            "HTTP error: error sending request: operation timed out",
+            "HTTP error: deadline has elapsed",
+            "Server returned error response: <Error><Code>RequestTimeout</Code></Error>",
+        ];
+        let prefix = "Error performing PUT http://127.0.0.1:9000/b/k in 30.1s, after 10 \
+                      retries, max_retries: 10, retry_timeout: 180s  - ";
+        for (inner, want_throttled) in throttled
+            .iter()
+            .map(|t| (*t, true))
+            .chain(timeout.iter().map(|t| (*t, false)))
+        {
+            let as_text = OwnedTextError(format!("{prefix}{inner}"));
+            let as_chain = Wrapping {
+                prefix: "Error performing list request: ".to_string(),
+                source: Box::new(Wrapping {
+                    prefix: prefix.to_string(),
+                    source: Box::new(OwnedTextError(inner.to_string())),
+                }),
+            };
+            for mapped in [
+                map_error_common(generic(as_text)),
+                map_error_common(generic(as_chain)),
+            ] {
+                if want_throttled {
+                    assert!(
+                        matches!(
+                            mapped,
+                            StoreError::Throttled {
+                                retry_after_ms: 1000
+                            }
+                        ),
+                        "got {mapped:?} for {inner:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(mapped, StoreError::Timeout),
+                        "got {mapped:?} for {inner:?}"
+                    );
+                }
+            }
         }
     }
 
