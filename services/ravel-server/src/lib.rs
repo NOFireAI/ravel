@@ -2857,13 +2857,7 @@ pub async fn start_with_heartbeat(
             // already-bootstrapped `sys/gc` (`config.gc`, read once at
             // startup in `main`) rather than a second read of the durable
             // object here.
-            let ddl_min_grace_ms = u64::try_from(config.gc.max_query_duration_ns / 1_000_000)
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "sys/gc records a negative max_query_duration_ns ({})",
-                        config.gc.max_query_duration_ns
-                    )
-                })?;
+            let ddl_min_grace_ms = query::ddl_min_grace_ms(config.gc.max_query_duration_ns)?;
             let state = query::build_sql_state_with_parquet(
                 catalog.clone(),
                 store.clone(),
