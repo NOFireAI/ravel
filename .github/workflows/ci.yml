@@ -1001,13 +1001,12 @@ jobs:
           # charging the budget that holds the main-scoped entries every run
           # restores from (#1643).
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Check ravel-bench --features parquet-baseline
-        run: cargo check --locked -p ravel-bench --features parquet-baseline
-        # The read-accounting module and its integration tests exist only
-        # under this feature, so their tests run here or nowhere. No test
-        # filter: a filter that matches nothing still exits 0.
       - name: Test ravel-bench --features parquet-baseline
         run: cargo test --locked -p ravel-bench --features parquet-baseline
+        # The read-accounting module and its integration tests exist only
+        # under this feature, so their tests run here or nowhere. No test
+        # filter: a filter that matches nothing still exits 0. This also
+        # builds everything a `cargo check` of the feature would.
       - name: Check ravel-bench --features flight-egress
         run: cargo check --locked -p ravel-bench --features flight-egress
       - name: Check ravel-bench --features profiling

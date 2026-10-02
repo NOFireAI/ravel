@@ -1161,9 +1161,9 @@ mod tests {
         (store, metrics, mock)
     }
 
-    /// Under `--tenant-kms-config` a Parquet grant read goes through
-    /// `SharedKmsStore`, so it must forward the pinned reads to
-    /// `KmsRoutingStore`. Without the overrides `get_pinned` refuses with
+    /// `SharedKmsStore` owes the full trait surface of the `KmsRoutingStore`
+    /// it wraps, pinned reads included, before any caller reads it by pin.
+    /// Without the overrides `get_pinned` refuses with
     /// `Unsupported`, and `get_with_pin`/`pin_of` return an ETag-only pin
     /// that drops the version selector the default store (here `MemoryStore`)
     /// reports.
