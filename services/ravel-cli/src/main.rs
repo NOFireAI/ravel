@@ -1105,10 +1105,12 @@ enum GcConfigCommand {
         /// omitted.
         #[arg(long, value_name = "DURATION")]
         clock_skew_allowance: Option<String>,
-        /// HEAD cache TTL every query process is held to (e.g. `30s`).
-        /// Writes `sys/gc` format version 2 recording it (ADR-1133): run it
-        /// only once every maintain and query process runs a build that reads
-        /// version 2, since an older build then refuses to start. Omitted, the
+        /// HEAD cache TTL every query-mode server process is held to (e.g.
+        /// `30s`). Writes `sys/gc` format version 2 recording it (ADR-1133):
+        /// run it only once every `ravel-server` process in every mode
+        /// (gateway, query, maintain, all) and every `ravel-cli` binary that
+        /// reads `sys/gc` runs a build that reads version 2, since an older
+        /// build then refuses the object. The flip is one-way. Omitted, the
         /// stored format version is kept, and a stored version 2 keeps its
         /// recorded TTL.
         #[arg(long, value_name = "DURATION")]

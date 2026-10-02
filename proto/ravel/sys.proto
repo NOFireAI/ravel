@@ -240,8 +240,9 @@ message GcConfig {
   // Format floor: the minimum reader version that understands this record. A
   // reader that only knows a lower version refuses rather than misreading a
   // future layout as v1 (matching TenancyMarker/ProvisioningRecord). 1 or 2:
-  // bootstrap writes 1, and only `ravel-cli gc-config set --head-cache-ttl`
-  // writes 2 (ADR-1133 decision 4).
+  // bootstrap writes 1, only `ravel-cli gc-config set --head-cache-ttl` flips
+  // a version 1 object to 2, and a `set` over a stored 2 keeps writing 2
+  // (ADR-1133 decision 4).
   uint32 format_version = 1;
   // The horizon between a deletion anchor and physical deletion. The invariant
   // this whole object exists to make durable and single-sourced:

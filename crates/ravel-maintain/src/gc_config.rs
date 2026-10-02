@@ -38,8 +38,9 @@
 //!   the compiled [`DEFAULT_HEAD_CACHE_TTL_NS`]; version 2 records one
 //!   (ADR-1133 decision 4). Bootstrap writes version 1, so a new build touching
 //!   a fresh bucket first does not lock older builds out; only
-//!   `ravel-cli gc-config set --head-cache-ttl` writes version 2, after which a
-//!   build that reads only version 1 refuses the object.
+//!   `ravel-cli gc-config set --head-cache-ttl` flips a version 1 object to
+//!   version 2 (a `set` over a stored version 2 writes version 2 again), after
+//!   which a build that reads only version 1 refuses the object.
 //!
 //! The constraint is thereby enforced at exactly two choke points: the single
 //! mutation path (the CLI, at write time) and each process's startup (against
@@ -116,7 +117,7 @@ pub struct GcConfigValues {
     pub max_query_duration_ns: i64,
     /// The longest a flush may stay open.
     pub max_flush_lifetime_ns: i64,
-    /// The HEAD cache TTL every query process is held to
+    /// The HEAD cache TTL every query-mode server process is held to
     /// ([`validate_query_head_cache_ttl`]). Recorded from format version 2; a
     /// version 1 object decodes it as [`DEFAULT_HEAD_CACHE_TTL_NS`].
     pub head_cache_ttl_ns: i64,

@@ -16,8 +16,9 @@
 //! sweeper's `CompactorConfig::clock_skew_allowance_ns`.
 //!
 //! `set --head-cache-ttl` writes format version 2, which records the HEAD cache
-//! TTL every query process is held to (ADR-1133 decision 4). Without the flag,
-//! `set` keeps the stored format version and, on version 2, the recorded TTL.
+//! TTL every query-mode server process is held to (ADR-1133 decision 4).
+//! Without the flag, `set` keeps the stored format version and, on version 2,
+//! the recorded TTL.
 
 use std::sync::Arc;
 

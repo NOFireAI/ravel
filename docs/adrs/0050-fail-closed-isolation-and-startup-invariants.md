@@ -477,10 +477,14 @@ frozen-format procedure. This is the sys/gc version 2 amendment.
   cache TTL their catalog runs on is above the stored `head_cache_ttl_ns`;
   on a version 1 object the stored value is the compiled default.
 - **The CLI sweep validates too.** `ravel-cli maintain sweep` reads
-  `sys/gc` (bootstrapping it when absent, as maintain mode does), takes the
-  horizon, grace and `max_query_duration` from it, and runs the maintain
-  and clock-skew checks before it sweeps.
+  `sys/gc` (bootstrapping it when absent, as maintain mode does), sweeps on
+  its protection horizon and grace, and runs the maintain and clock-skew
+  checks before it sweeps. It also carries `max_query_duration` and
+  `head_cache_ttl` for the pinned-query gate (ADR-1133), which is not built
+  yet, so neither changes the sweep.
 
 docs/guides/operations/maintenance.md gives the upgrade procedure: every
-maintain and query process runs a build that reads version 2 before
-`gc-config set --head-cache-ttl` is run.
+`ravel-server` process in every mode (gateway, query, maintain, and the
+combined `all` mode; each reads and validates `sys/gc` at startup) and every
+`ravel-cli` binary that reads `sys/gc` runs a build that reads version 2
+before `gc-config set --head-cache-ttl` is run. The flip is one-way.
