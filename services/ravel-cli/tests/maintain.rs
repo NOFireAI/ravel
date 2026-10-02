@@ -1053,3 +1053,61 @@ async fn sweep_refuses_a_skew_uncovered_sys_gc_before_any_store_write() {
         "control: a skew-covering sys/gc lets the same sweep reach a write"
     );
 }
+
+/// `maintain sweep` holds a superseded input on the stored `sys/gc` protection
+/// horizon, not the compiled default: with a stored horizon of 200h and the
+/// compaction record 150h old, the input survives, and the control bucket on
+/// the default 25h05m horizon deletes the same input at the same instant.
+#[tokio::test]
+async fn sweep_holds_a_superseded_input_on_the_stored_horizon() {
+    const NOW_NS: i64 = 999 + 150 * NS_PER_HOUR;
+    let default_horizon = ravel_maintain::CompactorConfig::default().protection_horizon_ns;
+    let stored_horizon = 200 * NS_PER_HOUR;
+    assert!(999 + default_horizon < NOW_NS && NOW_NS < 999 + stored_horizon);
+
+    async fn run(stored_horizon_ns: Option<i64>) -> (Arc<MemoryStore>, String) {
+        let store = Arc::new(MemoryStore::new());
+        let identity = (Uuid::new_v4(), 1, 1);
+        let data_key =
+            publish_l0_with_identity(&store, "acme", 0, identity, 100 * NS_PER_HOUR).await;
+        seed_compaction(&store, "acme", &[identity]).await;
+        if let Some(protection_horizon_ns) = stored_horizon_ns {
+            ravel_maintain::set_gc_config(
+                store.as_ref(),
+                ravel_maintain::GcConfigProposal {
+                    protection_horizon_ns,
+                    ..ravel_maintain::GcConfigValues::maintain_defaults().into()
+                },
+                ravel_maintain::config::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
+                1,
+            )
+            .await
+            .expect("set sys/gc");
+        }
+        ravel_cli::maintain::sweep_at(
+            store.clone() as Arc<dyn ObjectStoreBackend>,
+            MEMORY,
+            "acme",
+            SignalArg::Metrics,
+            0,
+            false,
+            false,
+            ravel_maintain::FixedClock::new(NOW_NS),
+        )
+        .await
+        .expect("sweep runs");
+        (store, data_key)
+    }
+
+    let (held, held_key) = run(Some(stored_horizon)).await;
+    assert!(
+        held.get(&held_key, GetRange::Full).await.is_ok(),
+        "an input inside the stored horizon must survive the sweep"
+    );
+
+    let (control, control_key) = run(None).await;
+    assert!(
+        control.get(&control_key, GetRange::Full).await.is_err(),
+        "control: past the default horizon the same input is deleted"
+    );
+}
