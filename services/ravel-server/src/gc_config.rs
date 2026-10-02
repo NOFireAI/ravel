@@ -12,8 +12,10 @@
 //! [`bootstrap`] writes `sys/gc` from the maintain defaults on a fresh
 //! bucket rather than refusing because the object is absent, and a racing loser
 //! re-reads the winner's object. So a fresh, never-bootstrapped bucket never
-//! fails startup for any process; only a *present* object that a mode really
-//! violates refuses.
+//! fails startup for any process whose credential may create `sys/gc`; only a
+//! *present* object that a mode really violates refuses. Under per-role
+//! credentials Gateway and Query may not create it, and their refused bootstrap
+//! fails with [`bootstrap_failure_context`]'s start-order fix.
 
 use std::time::Duration;
 
@@ -100,13 +102,22 @@ mod tests {
         };
         let msg = bootstrap_failure_context(&err);
         assert!(msg.contains("Start the maintain process first"), "{msg}");
-        assert!(msg.contains("`ravel-cli gc-config set` under the Admin credential"), "{msg}");
-        assert!(msg.contains("only the Maintain and Admin roles create sys/gc"), "{msg}");
+        assert!(
+            msg.contains("`ravel-cli gc-config set` under the Admin credential"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("only the Maintain and Admin roles create sys/gc"),
+            "{msg}"
+        );
     }
 
     #[test]
     fn other_bootstrap_failures_keep_the_generic_context() {
         let msg = bootstrap_failure_context(&GcConfigError::Store("timeout".into()));
-        assert_eq!(msg, "failed to bootstrap or read the durable GC config (sys/gc)");
+        assert_eq!(
+            msg,
+            "failed to bootstrap or read the durable GC config (sys/gc)"
+        );
     }
 }

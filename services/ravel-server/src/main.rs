@@ -384,7 +384,9 @@ async fn main() -> anyhow::Result<()> {
     // satisfy the constraint) and validated against what was just written, and a
     // concurrent bootstrap loser re-reads the winner's object rather than
     // refusing. Only a *present* object this mode really violates refuses to
-    // start. The Flight SQL ceiling is sourced and validated in
+    // start, or a credential the store refuses (per-role Gateway or Query
+    // before Maintain or Admin created the object), which fails with the
+    // start-order fix. The Flight SQL ceiling is sourced and validated in
     // `ravel_server::start` (it is `flight-sql`-feature-gated).
     let gc = ravel_server::gc_config::bootstrap(store.as_ref(), now_unix_ns())
         .await
