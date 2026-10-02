@@ -344,6 +344,7 @@ impl SnapshotReachability {
         if signal == Signal::Alerts {
             return head_gate;
         }
+        self.scope_markers(tenant, signal);
         match head_gate {
             SnapshotGate::Blocked(SnapshotBlock::Named) => {
                 if ctx.policy == MarkerPolicy::Write
@@ -478,6 +479,19 @@ impl SnapshotReachability {
         }
     }
 
+    /// Point the marker cache at `(tenant, signal)`, dropping what it held for
+    /// any other scope. Called before anything is recorded for a candidate, so
+    /// the reset never discards this scope's own state.
+    fn scope_markers(&mut self, tenant: &TenantHash, signal: Signal) {
+        if self.markers.scope != Some((*tenant, signal)) {
+            self.markers = MarkerCache {
+                stats: std::mem::take(&mut self.markers.stats),
+                scope: Some((*tenant, signal)),
+                ..MarkerCache::default()
+            };
+        }
+    }
+
     /// Load the pass's signal-wide marker LIST once. A failed LIST is
     /// remembered, and every marker is then read by GET instead.
     async fn ensure_marker_listing(
@@ -486,13 +500,7 @@ impl SnapshotReachability {
         tenant: &TenantHash,
         signal: Signal,
     ) -> bool {
-        if self.markers.scope != Some((*tenant, signal)) {
-            self.markers = MarkerCache {
-                stats: std::mem::take(&mut self.markers.stats),
-                scope: Some((*tenant, signal)),
-                ..MarkerCache::default()
-            };
-        }
+        self.scope_markers(tenant, signal);
         if self.markers.listing.is_none() {
             self.markers.stats.listings += 1;
             let listed = list_all(store, &keys::unnamed_marker_prefix(tenant, signal)).await;
