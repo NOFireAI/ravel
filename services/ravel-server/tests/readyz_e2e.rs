@@ -415,7 +415,8 @@ async fn store_probe_spawn_stamps_the_liveness_gauge_before_any_cycle_runs() {
         store,
         Duration::from_secs(86_400),
         Arc::new(clock.clone()) as Arc<dyn Clock>,
-    );
+    )
+    .expect("a non-zero probe interval spawns");
 
     assert_eq!(
         store_probe::probe_last_run_unix_ns(),

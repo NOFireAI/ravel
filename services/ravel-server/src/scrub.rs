@@ -429,6 +429,26 @@ impl ScrubTask {
     }
 }
 
+/// Why [`spawn`] refused to start the scrub loop. Nothing is spawned.
+#[derive(Debug, thiserror::Error)]
+pub enum SpawnError {
+    /// A zero `period` would shrink the tick to its 1 ms floor and scrub the
+    /// corpus in a near-hot loop.
+    #[error(
+        "--scrub-period must be non-zero: a zero scrub period ticks the scrubber about every millisecond"
+    )]
+    ZeroScrubPeriod,
+}
+
+/// The refusal [`spawn`] applies before starting the loop. `start` applies it
+/// earlier, before spawning anything, in every mode.
+pub fn check_spawnable(period: Duration) -> Result<(), SpawnError> {
+    if period.is_zero() {
+        return Err(SpawnError::ZeroScrubPeriod);
+    }
+    Ok(())
+}
+
 /// Spawn the scrub loop over `store`, sizing each tick's byte budget so a full
 /// rotation over the corpus completes in about `period`. `restrict` is the
 /// merged `--tenant-token`/`--maintain-tenant` set (empty means unconfigured:
@@ -437,7 +457,8 @@ impl ScrubTask {
 /// [`ScrubTask::shutdown`]. The first cycle sleeps a full (jittered) interval
 /// before its first read, so co-started replicas do not scrub in lockstep.
 /// Every timestamp the loop reads (the live-set read, cursor stamps and rotation
-/// planning) comes from `clock`.
+/// planning) comes from `clock`. A zero `period` is refused with
+/// [`SpawnError::ZeroScrubPeriod`].
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     store: Arc<dyn ObjectStoreBackend>,
@@ -448,7 +469,8 @@ pub fn spawn(
     worker: Arc<WorkerSet>,
     retention: Arc<RetentionConfig>,
     clock: Arc<dyn Clock>,
-) -> ScrubTask {
+) -> Result<ScrubTask, SpawnError> {
+    check_spawnable(period)?;
     let restrict = if restrict.is_empty() {
         None
     } else {
@@ -505,10 +527,10 @@ pub fn spawn(
             .await;
         }
     });
-    ScrubTask {
+    Ok(ScrubTask {
         shutdown: Some(tx),
         handle: Some(handle),
-    }
+    })
 }
 
 /// One discovery cycle: re-enumerate tenants from storage, narrow to `restrict`
@@ -2065,6 +2087,51 @@ mod tests {
     }
 
     const NS_PER_HOUR: i64 = 3_600_000_000_000;
+
+    struct FixedClock(i64);
+
+    impl Clock for FixedClock {
+        fn now_ns(&self) -> i64 {
+            self.0
+        }
+    }
+
+    /// A zero scrub period is refused with the typed error naming the flag,
+    /// and no task is spawned.
+    ///
+    /// Flip to watch it fail: delete `check_spawnable(period)?;` in [`spawn`],
+    /// and the refusal expectation fails.
+    #[tokio::test]
+    async fn spawn_refuses_a_zero_scrub_period() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let alive_before = metrics.num_alive_tasks();
+        let err = spawn(
+            store,
+            Vec::new(),
+            Duration::ZERO,
+            1,
+            Arc::new(ScrubMetrics::default()),
+            Arc::new(solo_worker()),
+            Arc::new(RetentionConfig::default()),
+            Arc::new(FixedClock(NS_PER_HOUR)),
+        )
+        .err()
+        .expect("a zero scrub period must be refused at spawn");
+        assert!(
+            matches!(err, SpawnError::ZeroScrubPeriod),
+            "expected ZeroScrubPeriod, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("--scrub-period"),
+            "the refusal must name the flag, got: {err}"
+        );
+        assert_eq!(
+            metrics.num_alive_tasks(),
+            alive_before,
+            "a refused spawn must leave no task running"
+        );
+    }
 
     fn tenant() -> TenantId {
         TenantId::new("scrub-server-test")
