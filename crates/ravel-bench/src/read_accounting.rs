@@ -224,11 +224,11 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for CountingBackend<S> {
     }
 
     /// Counted via [`Counters::record_pin_of`]: a `pin_of` is still one HEAD
-    /// on the wire, so it also bumps the plain HEAD total.
+    /// on the wire, so it also bumps the plain HEAD total. Counted before the
+    /// call, as `head` is, so a refused probe still counts.
     async fn pin_of(&self, key: &str) -> Result<(RavelObjectMeta, Pin), StoreError> {
-        let result = self.inner.pin_of(key).await?;
         self.counters.record_pin_of();
-        Ok(result)
+        self.inner.pin_of(key).await
     }
 
     async fn head(&self, key: &str) -> Result<RavelObjectMeta, StoreError> {
