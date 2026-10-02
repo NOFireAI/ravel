@@ -6906,4 +6906,401 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
             "a failed fragment reports the bytes its error carried"
         );
     }
+
+    // --- Fragment reads end at the query's own deadline (issue #2385) -------
+
+    /// Mints each slice's capability exactly as the coordinator's
+    /// [`RoutingSliceFetcher`] does, records the minted expiry, then runs the
+    /// slice through that same fetcher.
+    struct MintRecorder {
+        routing: RoutingSliceFetcher,
+        expiries: Mutex<Vec<i64>>,
+    }
+
+    #[async_trait]
+    impl SliceFetcher for MintRecorder {
+        async fn fetch(&self, request: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+            let minted = self
+                .routing
+                .mint_capability(&request)
+                .expect("the coordinator mints for an engine-built request");
+            let (claims, _mac) = codec::decode_capability(&minted).expect("decode");
+            self.expiries.lock().push(claims.expires_unix_ns);
+            self.routing.fetch(request).await
+        }
+    }
+
+    /// A PromQL query whose request deadline (5 s) is below the engine's
+    /// configured deadline (60 s) mints its fragment capability to expire at
+    /// request entry plus the request deadline, the instant the query itself
+    /// stops, not at entry plus the engine's ceiling.
+    #[tokio::test]
+    async fn a_request_deadline_below_the_engine_deadline_is_the_capability_expiry() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new("short-request-deadline".to_string());
+        publish_metric(store.as_ref(), &tenant, HOUR_NS).await;
+        let now = 4 * HOUR_NS;
+        let engine_deadline = Duration::from_secs(60);
+        let request_deadline = Duration::from_secs(5);
+        let recorder = Arc::new(MintRecorder {
+            routing: RoutingSliceFetcher::new(
+                Arc::new(OnceLock::new()),
+                Arc::new(RwLock::new(Arc::new(Vec::new()))),
+                test_keys(),
+                pinned_service(store.clone(), now),
+                Arc::new(FragmentMetrics::new()),
+            ),
+            expiries: Mutex::new(Vec::new()),
+        });
+        let distributed = Arc::new(ravel_query::distrib::Distributed::new(
+            recorder.clone(),
+            // Zero thresholds put even this one-segment snapshot on the
+            // distributed path.
+            ravel_query::distrib::partition::DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 1,
+            },
+        ));
+        let catalog =
+            Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+        let engine = ravel_query::QueryEngine::new(
+            catalog,
+            store,
+            ravel_query::EngineConfig {
+                deadline: engine_deadline,
+                ..ravel_query::EngineConfig::default()
+            },
+        )
+        .with_distributed(distributed);
+
+        let t_ms = (HOUR_NS + 30_000_000_000) / 1_000_000;
+        let (value, _stats) = engine
+            .instant_with_stats(tenant.hash(), "m", t_ms, &[], now, request_deadline)
+            .await
+            .expect("the distributed query answers");
+
+        assert_eq!(
+            *recorder.expiries.lock(),
+            vec![now + 5_000_000_000],
+            "one slice, its capability expiring at entry plus the request deadline"
+        );
+        match value {
+            ravel_promql::Value::Vector(samples) => {
+                assert_eq!(samples.len(), 1, "the slice ran and read the series")
+            }
+            other => panic!("expected an instant vector, got {other:?}"),
+        }
+    }
+
+    /// A worker clock a test moves by hand. `sleep` completes once the clock
+    /// reaches the end of the requested span, so a slice bounded by it ends
+    /// when the test moves the clock, never because real time passed.
+    struct SteppedClock {
+        now_ns: std::sync::atomic::AtomicI64,
+        moved: tokio::sync::watch::Sender<()>,
+    }
+
+    impl SteppedClock {
+        fn new(now_ns: i64) -> Arc<Self> {
+            let (moved, _) = tokio::sync::watch::channel(());
+            Arc::new(SteppedClock {
+                now_ns: std::sync::atomic::AtomicI64::new(now_ns),
+                moved,
+            })
+        }
+
+        fn set(&self, now_ns: i64) {
+            self.now_ns.store(now_ns, Ordering::SeqCst);
+            self.moved.send_replace(());
+        }
+    }
+
+    impl Clock for SteppedClock {
+        fn now_ns(&self) -> i64 {
+            self.now_ns.load(Ordering::SeqCst)
+        }
+
+        fn sleep(
+            &self,
+            dur: Duration,
+        ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            let until = self
+                .now_ns()
+                .saturating_add(i64::try_from(dur.as_nanos()).unwrap_or(i64::MAX));
+            let mut moved = self.moved.subscribe();
+            Box::pin(async move {
+                while self.now_ns() < until {
+                    if moved.changed().await.is_err() {
+                        return;
+                    }
+                }
+            })
+        }
+    }
+
+    /// Counts every store call as it is issued, before it reaches the wrapped
+    /// backend, so a call held or cancelled inside that backend still counts.
+    struct IssuedCalls {
+        inner: Arc<dyn ObjectStoreBackend>,
+        calls: AtomicU64,
+    }
+
+    impl IssuedCalls {
+        fn issued(&self) -> u64 {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn count(&self) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStoreBackend for IssuedCalls {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: ravel_object_store::PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+            self.count();
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: ravel_object_store::GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+            self.count();
+            self.inner.get(key, range).await
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn ravel_object_store::MultipartUpload + 'a>, ravel_object_store::StoreError>
+        {
+            self.count();
+            self.inner.put_multipart(key).await
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+            self.count();
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+            self.count();
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+            self.count();
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+            self.count();
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    const EXPIRY_NOW_NS: i64 = 4 * HOUR_NS;
+    /// The capability's expiry, a microsecond after the worker's starting clock.
+    const EXPIRES_NS: i64 = EXPIRY_NOW_NS + 1_000;
+
+    /// A worker over one published segment, reading through a hold-capable
+    /// `FaultStore` behind an issued-call counter, with a `Pinned` admission
+    /// class of one and a clock the test moves, plus the `Pinned` request for
+    /// that segment carrying a capability that expires at [`EXPIRES_NS`].
+    struct ExpiryFixture {
+        service: FragmentService,
+        admission: AdmissionClasses,
+        metrics: Arc<FragmentMetrics>,
+        clock: Arc<SteppedClock>,
+        fault: Arc<ravel_object_store::fault::FaultStore<Arc<MemoryStore>>>,
+        issued: Arc<IssuedCalls>,
+        request: pb::FetchRequest,
+    }
+
+    async fn expiry_fixture(name: &str) -> ExpiryFixture {
+        let memory = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new(name.to_string());
+        publish_metric(memory.as_ref(), &tenant, HOUR_NS).await;
+        let backing: Arc<dyn ObjectStoreBackend> = memory.clone();
+        let seg = only_segment(&backing, tenant.hash(), EXPIRY_NOW_NS).await;
+        let fault = Arc::new(ravel_object_store::fault::FaultStore::new(
+            Arc::clone(&memory),
+            ravel_object_store::fault::FaultPlan::empty(),
+        ));
+        let issued = Arc::new(IssuedCalls {
+            inner: fault.clone(),
+            calls: AtomicU64::new(0),
+        });
+        let store: Arc<dyn ObjectStoreBackend> = issued.clone();
+        let metrics = Arc::new(FragmentMetrics::new());
+        let admission = AdmissionClasses::new(1, 1, metrics.clone());
+        let clock = SteppedClock::new(EXPIRY_NOW_NS);
+        let catalog =
+            Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+        let service = FragmentService::new(
+            test_keys(),
+            empty_resolver(),
+            admission.clone(),
+            catalog,
+            store,
+            None,
+            clock.clone(),
+            metrics.clone(),
+            Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+        );
+        let query = [7u8; 16];
+        let mut request = pinned_over_window(tenant.hash(), &seg, envelope(&seg));
+        request.query_id = query.to_vec();
+        request.fragment_capability = mint(
+            &TEST_KEY,
+            tenant.hash().0,
+            metrics_signal(),
+            query,
+            EXPIRES_NS,
+        );
+        ExpiryFixture {
+            service,
+            admission,
+            metrics,
+            clock,
+            fault,
+            issued,
+            request,
+        }
+    }
+
+    /// Control for the two expiry tests below: on the same fixture, a
+    /// capability that stays live serves the slice, and the slice issues
+    /// exactly two store requests (the commit record and the data object), so
+    /// the zero and the one those tests assert are not what any slice issues.
+    #[tokio::test]
+    async fn a_live_capability_serves_the_slice_through_the_expiry_fixture() {
+        let fx = expiry_fixture("expiry-control").await;
+        let response = pinned_fetch(&fx.service, fx.request.clone())
+            .await
+            .expect("a live capability is served");
+        assert_eq!(
+            response.status,
+            pb::status::Code::Ok,
+            "{}",
+            response.status_message
+        );
+        assert_eq!(response.series_returned, 1);
+        assert_eq!(fx.issued.issued(), 2, "one record GET and one data GET");
+        assert_eq!(fx.metrics.fragment_requests_total(), 1);
+    }
+
+    /// A capability valid on arrival that expires while its request waits for
+    /// admission is refused once admitted, with verification's own `Expired`
+    /// reject and status, and the slice issues zero store requests.
+    #[tokio::test]
+    async fn a_capability_that_expires_in_admission_is_refused_before_any_store_request() {
+        let fx = expiry_fixture("expires-in-admission").await;
+        let held = fx
+            .admission
+            .for_class(AdmissionClass::Pinned)
+            .acquire()
+            .await
+            .expect("the only Pinned permit");
+        let service = fx.service.clone();
+        let request = fx.request.clone();
+        let fetch = tokio::spawn(async move { pinned_fetch(&service, request).await });
+        // Verified on arrival, then queued behind the held permit.
+        while fx
+            .metrics
+            .fragment_admission_waits_total(AdmissionClass::Pinned)
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(fx.metrics.capability_rejects(CapabilityReject::Expired), 0);
+
+        fx.clock.set(EXPIRES_NS);
+        drop(held);
+        let outcome = fetch.await.expect("fetch task");
+
+        assert_eq!(
+            fx.issued.issued(),
+            0,
+            "no store request for a dead capability"
+        );
+        let status = outcome.expect_err("an expired capability is refused");
+        assert_eq!(status.code(), tonic::Code::Unauthenticated, "{status}");
+        assert_eq!(
+            status.message(),
+            "fragment request rejected: capability expired"
+        );
+        assert_eq!(
+            fx.metrics.capability_rejects(CapabilityReject::Expired),
+            1,
+            "counted under the same reason verification uses"
+        );
+        assert_eq!(
+            fx.metrics.fragment_requests_total(),
+            0,
+            "a refused request is not served, as at verification"
+        );
+    }
+
+    /// A slice whose capability expires while its first store request is in
+    /// flight issues no further store request, and ends `DeadlineExceeded`.
+    #[tokio::test]
+    async fn a_capability_that_expires_mid_run_stops_the_slice_before_its_next_store_request() {
+        use ravel_object_store::fault::{Occurrence, Op};
+
+        let fx = expiry_fixture("expires-mid-run").await;
+        let gate = fx
+            .fault
+            .hold(Op::Get, Some(".cmt".to_string()), Occurrence::Nth(1));
+        let service = fx.service.clone();
+        let request = fx.request.clone();
+        let fetch = tokio::spawn(async move { pinned_fetch(&service, request).await });
+        gate.wait_until_held(1).await;
+        assert_eq!(
+            fx.issued.issued(),
+            1,
+            "the held record GET is the slice's first store request"
+        );
+
+        fx.clock.set(EXPIRES_NS);
+        for id in gate.held() {
+            gate.release(id);
+        }
+        let outcome = fetch.await.expect("fetch task");
+
+        assert_eq!(
+            fx.issued.issued(),
+            1,
+            "no store request is issued after the expiry"
+        );
+        let status = outcome.expect_err("a slice past its expiry ends with a status");
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded, "{status}");
+        assert_eq!(
+            fx.metrics.capability_rejects(CapabilityReject::Expired),
+            0,
+            "admitted live, so this is the run's bound, not a capability reject"
+        );
+    }
 }

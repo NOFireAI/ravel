@@ -7102,6 +7102,105 @@ mod prefetch_tests {
         }
     }
 
+    /// A slice fetcher double that records each dispatched request's
+    /// `deadline_unix_ns` and answers with an empty slice.
+    struct RecordingDeadline {
+        deadlines: Arc<std::sync::Mutex<Vec<i64>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::distrib::client::SliceFetcher for RecordingDeadline {
+        async fn fetch(
+            &self,
+            request: ravel_proto::queryfrag::v1::FetchRequest,
+        ) -> Result<crate::distrib::client::SliceResponse, crate::distrib::client::DistribError>
+        {
+            self.deadlines
+                .lock()
+                .expect("deadlines lock")
+                .push(request.deadline_unix_ns);
+            Ok(crate::distrib::client::SliceResponse {
+                scalar: Vec::new(),
+                histogram: Vec::new(),
+                partials: Vec::new(),
+                accounting: ravel_types::accounting::QueryAccountingSnapshot::default(),
+                stats: crate::fetcher::FetchStats::default(),
+                series_returned: 0,
+                samples_returned: 0,
+                status: ravel_proto::queryfrag::v1::status::Code::Ok,
+                status_message: String::new(),
+            })
+        }
+    }
+
+    /// The deadline every distributed slice carries, and so every fragment
+    /// capability's expiry, is request entry plus the request's own deadline
+    /// when that is below the engine's configured deadline, for both the
+    /// instant and the range entry points.
+    #[tokio::test]
+    async fn distributed_slices_carry_the_request_deadline_not_the_engine_ceiling() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        publish_metric(
+            &store,
+            tenant_hash,
+            1,
+            "metric_a",
+            BASE_NS - NS_PER_MIN,
+            1.0,
+        )
+        .await;
+        let deadlines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let distributed = Arc::new(crate::distrib::Distributed::new(
+            Arc::new(RecordingDeadline {
+                deadlines: Arc::clone(&deadlines),
+            }),
+            crate::distrib::partition::DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 1,
+            },
+        ));
+        let eng = engine_with_config(
+            Arc::clone(&store),
+            EngineConfig {
+                deadline: Duration::from_secs(60),
+                ..EngineConfig::default()
+            },
+        )
+        .with_distributed(distributed);
+        let request_deadline = Duration::from_secs(5);
+
+        eng.instant_with_stats(
+            tenant_hash,
+            "metric_a",
+            BASE_MS,
+            &[],
+            BASE_NS,
+            request_deadline,
+        )
+        .await
+        .expect("instant");
+        eng.range_with_stats(
+            tenant_hash,
+            "metric_a",
+            BASE_MS - 60_000,
+            BASE_MS,
+            15_000,
+            &[],
+            BASE_NS,
+            request_deadline,
+        )
+        .await
+        .expect("range");
+
+        assert_eq!(
+            *deadlines.lock().expect("deadlines lock"),
+            vec![BASE_NS + 5 * NS_PER_SEC, BASE_NS + 5 * NS_PER_SEC],
+            "one slice per query, each carrying entry plus the 5 s request deadline"
+        );
+    }
+
     /// ADR-0071 failure semantics: a slice reporting `SNAPSHOT_INVALIDATED`
     /// makes the coordinator re-resolve and re-dispatch the *whole* query
     /// exactly once, then give up with `SnapshotInvalidated` -- it does not
