@@ -33,6 +33,38 @@ fn bearer_token(headers: &HeaderMap) -> Result<&str, AuthError> {
     raw.strip_prefix("Bearer ").ok_or(AuthError)
 }
 
+/// The tenant side of a `TOKEN=TENANT` pair carried a `;`-suffix
+/// [`split_tenant_suffix`] does not grant: anything other than exactly
+/// `;ddl` after a non-empty tenant.
+#[derive(Debug, thiserror::Error)]
+#[error("expected TENANT or TENANT;ddl")]
+pub struct TenantSuffixError;
+
+/// Splits the tenant side of a `TOKEN=TENANT` pair on its LAST `;`, granting
+/// the `ddl` capability (ADR-2040 decision 4) when the suffix after it is
+/// exactly `ddl` and the text before it is non-empty. A tenant with no `;` is
+/// returned unchanged with `ddl: false`. Any other suffix (wrong case, a
+/// different word, or none at all after a trailing `;`) or an empty tenant
+/// before the `;` is [`TenantSuffixError`], so a typo refuses startup instead
+/// of silently granting nothing or naming an empty tenant.
+///
+/// Shared by `ravel-server` and `ravel-ingest-router` so both parsers accept
+/// and refuse the same spellings; a router caller discards the `ddl` bool, as
+/// it never routes DDL requests differently.
+pub fn split_tenant_suffix(raw: &str) -> Result<(&str, bool), TenantSuffixError> {
+    match raw.rfind(';') {
+        None => Ok((raw, false)),
+        Some(idx) => {
+            let (tenant, suffix) = (&raw[..idx], &raw[idx + 1..]);
+            if suffix == "ddl" && !tenant.is_empty() {
+                Ok((tenant, true))
+            } else {
+                Err(TenantSuffixError)
+            }
+        }
+    }
+}
+
 /// A resolved caller identity: the tenant a request is attributed to, and
 /// whether it may run tenant-scoped DDL (ADR-2040 decision 4, "Who may run
 /// DDL"). `ddl` is absent unless a resolver's configuration explicitly grants
@@ -631,6 +663,36 @@ impl TenantResolver for MtlsResolver {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_tenant_suffix_no_semicolon_is_unchanged_no_ddl() {
+        assert_eq!(split_tenant_suffix("acme").unwrap(), ("acme", false));
+    }
+
+    #[test]
+    fn split_tenant_suffix_ddl_grants_capability() {
+        assert_eq!(split_tenant_suffix("acme;ddl").unwrap(), ("acme", true));
+    }
+
+    #[test]
+    fn split_tenant_suffix_wrong_case_is_refused() {
+        assert!(split_tenant_suffix("acme;DDL").is_err());
+    }
+
+    #[test]
+    fn split_tenant_suffix_different_word_is_refused() {
+        assert!(split_tenant_suffix("acme;admin").is_err());
+    }
+
+    #[test]
+    fn split_tenant_suffix_trailing_semicolon_is_refused() {
+        assert!(split_tenant_suffix("acme;").is_err());
+    }
+
+    #[test]
+    fn split_tenant_suffix_empty_tenant_before_ddl_is_refused() {
+        assert!(split_tenant_suffix(";ddl").is_err());
+    }
 
     use jsonwebtoken::{EncodingKey, Header, encode, get_current_timestamp};
 
