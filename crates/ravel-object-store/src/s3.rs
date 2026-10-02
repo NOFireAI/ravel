@@ -3133,6 +3133,18 @@ mod tests {
                 "part {index} (0-based) must carry x-amz-checksum-crc64nvme, not only part 0"
             );
         }
+        // Two parts carry the same bytes and the third different bytes, so
+        // exactly two distinct digests arrive whatever order the parts landed
+        // in. One digest resent on every part (a stale request builder) gives
+        // one.
+        let distinct: std::collections::BTreeSet<&Option<String>> =
+            captured.part_checksums.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            2,
+            "each part's checksum must be computed over that part's own bytes: {:?}",
+            captured.part_checksums
+        );
         assert!(
             captured
                 .complete_body
