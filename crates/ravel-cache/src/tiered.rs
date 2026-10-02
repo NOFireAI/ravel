@@ -77,21 +77,57 @@ use crate::key::CacheKey;
 use crate::metrics::CacheMetrics;
 use crate::single_flight::{Role, SingleFlight, SingleFlightError};
 
-/// Where the bytes a [`TieredCache::get_or_fetch`] call returned came from,
-/// so the caller can account for it (ADR-0044): a cache hit crossed no
-/// network, an upstream fetch did.
+/// Where the bytes a [`TieredCache::get_or_fetch`] call returned came from: a
+/// cache tier, or an upstream fetch. It does not say whether THIS call issued
+/// that fetch; a caller that charges store requests per call uses
+/// [`ReadOutcome`] instead, which does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
-    /// A tier already populated before this call served the bytes: the RAM
-    /// tier (the fast path), or the disk tier consulted on a RAM miss. No
-    /// upstream round trip happened on this call's behalf. In corruption mode
-    /// these bytes are corrupted.
+    /// A cache tier served the bytes and no upstream fetch ran for them: the
+    /// RAM tier (the fast path), or the disk tier the single-flight leader
+    /// consulted on a RAM miss, whether this call led that consult or followed
+    /// it. In corruption mode these bytes are corrupted.
     Cache,
-    /// The single-flight leader ran the caller's upstream `fetch` to satisfy a
-    /// miss in both tiers; this call was that leader, or a follower that rode
-    /// its one fetch. A store round trip happened, so the bytes are the fresh
-    /// upstream bytes and are never corrupted.
+    /// The bytes are the fresh result of an upstream fetch: this call led the
+    /// single flight and ran the caller's `fetch`, or it followed the leader
+    /// that did. Never corrupted.
     Upstream,
+}
+
+/// What one read-through call did, for a caller that counts cache hits and
+/// charges store requests from it (ADR-0044). Unlike [`Source`], it says
+/// whether THIS call issued the upstream fetch, so a call that issued none and
+/// was not a cache hit either is told apart from both. Returned by
+/// [`TieredCache::get_or_fetch_outcome`] and [`Cache::get_or_fetch_outcome`],
+/// which label a leader and a follower of an upstream fetch the same way.
+///
+/// One known exception: [`TieredCache::resolve_peeked_miss`] shares this
+/// cache's single flight, and its leader stores bytes its RAM recheck found
+/// as a cache-served value, so a [`TieredCache::get_or_fetch_outcome`] call
+/// that follows such a leader is labelled `Hit` where the RAM-only cache
+/// would say `LateServe`, and so records a query cache hit and cache bytes
+/// although its own RAM lookup recorded a miss. It needs the follower to join
+/// during that leader's one poll on the same key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadOutcome {
+    /// A cache hit: a tier served the bytes and no upstream fetch ran for them.
+    /// The RAM tier on this call's own lookup, or, on the tiered cache, the
+    /// disk tier the single-flight leader consulted, whether this call led
+    /// that consult or followed it. In corruption mode these bytes are
+    /// corrupted.
+    Hit,
+    /// This call led the single flight and ran the caller's `fetch`: one
+    /// upstream request by this call, and a cache miss. Never corrupted.
+    Fetched,
+    /// A late serve: this call ran no `fetch` and is not a cache hit. It
+    /// followed another caller's flight whose leader fetched upstream (either
+    /// cache kind), or, on the RAM-only cache, it led or followed a flight
+    /// whose leader's uncounted RAM recheck found bytes another flight
+    /// admitted after this call's own lookup missed. The caller charges it no
+    /// upstream request and counts it the cache miss its lookup already
+    /// recorded. In corruption mode the bytes are corrupted when the RAM
+    /// recheck served them and clean when they are another caller's fetch.
+    LateServe,
 }
 
 /// A RAM [`Cache`] over a local-disk [`DiskCache`], composed as one
@@ -180,15 +216,18 @@ where
     ///    (read-through) and yields [`Source::Cache`]. On a disk miss the
     ///    leader runs `fetch`, admits the result to *both* tiers, and yields
     ///    [`Source::Upstream`]. Followers ride the leader's single disk
-    ///    consult / upstream fetch.
+    ///    consult / upstream fetch and get the leader's `Source`, so a
+    ///    follower of an upstream fetch is [`Source::Upstream`] although it
+    ///    issued no request; [`get_or_fetch_outcome`](Self::get_or_fetch_outcome)
+    ///    tells it apart from the leader.
     ///
     /// In corruption mode a [`Source::Cache`] result (RAM or disk) is
     /// corrupted; a [`Source::Upstream`] result is the clean fetched bytes.
     ///
     /// **Error-path accounting (issue #656).** When `fetch` fails this method
-    /// records neither a hit nor a miss: it threads the error straight out
-    /// (the follower's single-flight collapse is still counted, because a
-    /// collapse happened regardless of the leader's outcome). Hit/miss
+    /// records neither a hit nor a miss: it threads the error straight out,
+    /// before the follower's single-flight collapse is recorded, so a follower
+    /// of a failed fetch counts no collapse either. Hit/miss
     /// accounting is the caller's, keyed off the returned [`Source`] on the
     /// success path -- this handle has no `QueryAccounting` and takes no
     /// opinion on whether a faulted upstream GET should count as a miss. A
@@ -213,11 +252,36 @@ where
         F: FnOnce() -> Fut + Send,
         Fut: std::future::Future<Output = Result<Bytes, E>> + Send,
     {
+        let (bytes, outcome) = self.get_or_fetch_outcome(key, fetch).await?;
+        let source = match outcome {
+            ReadOutcome::Hit => Source::Cache,
+            // This handle's leader has no RAM recheck, so a late serve here is
+            // always a follower of an upstream fetch.
+            ReadOutcome::Fetched | ReadOutcome::LateServe => Source::Upstream,
+        };
+        Ok((bytes, source))
+    }
+
+    /// [`get_or_fetch`](Self::get_or_fetch), reporting a [`ReadOutcome`]
+    /// instead of a [`Source`]: [`ReadOutcome::Fetched`] only to the leader that
+    /// ran `fetch`, and [`ReadOutcome::LateServe`] to a follower of that fetch,
+    /// which issued no request of its own. A RAM hit, and the leader's disk hit
+    /// together with every follower of it, is [`ReadOutcome::Hit`]. The tier
+    /// lookups, collapses, admissions and corruption are `get_or_fetch`'s.
+    pub async fn get_or_fetch_outcome<F, Fut>(
+        &self,
+        key: CacheKey,
+        fetch: F,
+    ) -> Result<(Bytes, ReadOutcome), SingleFlightError<E>>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: std::future::Future<Output = Result<Bytes, E>> + Send,
+    {
         // Fast path: a RAM hit needs no cross-tier coordination and never
         // touches disk. `Cache::get` records the hit and, in corruption mode,
         // corrupts the served bytes.
         if let Some(bytes) = self.ram.get(&key) {
-            return Ok((bytes, Source::Cache));
+            return Ok((bytes, ReadOutcome::Hit));
         }
 
         // RAM miss: collapse concurrent callers for this key onto one leader
@@ -273,12 +337,12 @@ where
             // feeding ADR-0046's single-flight-collapse SLI.
             self.ram.metrics().record_collapse();
         }
-        let source = if from_cache {
-            Source::Cache
-        } else {
-            Source::Upstream
+        let outcome = match (from_cache, role) {
+            (true, _) => ReadOutcome::Hit,
+            (false, Role::Leader) => ReadOutcome::Fetched,
+            (false, Role::Follower) => ReadOutcome::LateServe,
         };
-        Ok((self.maybe_corrupt(bytes, from_cache), source))
+        Ok((self.maybe_corrupt(bytes, from_cache), outcome))
     }
 
     /// Resolve a miss the caller ALREADY confirmed with [`get`](Self::get):
@@ -494,6 +558,23 @@ where
         }
         let disk = self.disk.clone();
         let bytes = tokio::task::spawn_blocking(move || disk.get(&key))
+            .await
+            .unwrap_or(None)?;
+        Some(self.admit_disk_hit(key, bytes))
+    }
+
+    /// [`get_off_worker`](Self::get_off_worker) recording neither a hit nor a
+    /// miss on either tier, for a caller whose earlier `get` already accounted
+    /// this request and that looks again because the entry may have been
+    /// admitted since (`BlockRangeFetcher`'s re-peek of a coalesced run's
+    /// non-lead blocks). The same RAM-then-disk order, the same read-through
+    /// RAM admission on a disk hit, and the same serve-time corruption.
+    pub async fn peek_uncounted_off_worker(&self, key: CacheKey) -> Option<Bytes> {
+        if let Some(bytes) = self.ram.peek_uncounted(&key) {
+            return Some(bytes);
+        }
+        let disk = self.disk.clone();
+        let bytes = tokio::task::spawn_blocking(move || disk.get_uncounted(&key))
             .await
             .unwrap_or(None)?;
         Some(self.admit_disk_hit(key, bytes))
@@ -771,6 +852,116 @@ mod tests {
             after.misses, before.misses,
             "a RAM hit does not consult the disk tier at all"
         );
+    }
+
+    /// `get_or_fetch_outcome` labels a call by its single-flight role: the
+    /// leader that ran the upstream fetch is [`ReadOutcome::Fetched`] and a
+    /// follower of it is [`ReadOutcome::LateServe`], which `get_or_fetch`
+    /// still reports as [`Source::Upstream`].
+    ///
+    /// FLIP: labelling the result from `from_cache` alone, ignoring the role
+    /// (the `(false, Role::Follower)` arm made `ReadOutcome::Fetched`), reports
+    /// the follower as `ReadOutcome::Fetched`.
+    #[tokio::test]
+    async fn get_or_fetch_outcome_reports_a_follower_of_an_upstream_fetch_as_a_late_serve() {
+        let tmp = TempDir::new().unwrap();
+        let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        let ram: Cache<&'static str> = Cache::new(generous_limits());
+        let tiered = Arc::new(TieredCache::new(ram, disk));
+        let payload = Bytes::from_static(b"fetched once");
+        let key = test_key(1, payload.len() as u64);
+        let fetches = Arc::new(AtomicUsize::new(0));
+
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let leader = {
+            let tiered = tiered.clone();
+            let fetches = fetches.clone();
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                tiered
+                    .get_or_fetch_outcome(key, move || async move {
+                        fetches.fetch_add(1, Ordering::SeqCst);
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.await;
+                        Ok::<Bytes, &'static str>(payload)
+                    })
+                    .await
+            })
+        };
+        entered_rx.await.expect("the leader reaches its fetch");
+        let follower_fetches = fetches.clone();
+        let mut follower = Box::pin(tiered.get_or_fetch_outcome(key, move || async move {
+            follower_fetches.fetch_add(1, Ordering::SeqCst);
+            Ok::<Bytes, &'static str>(Bytes::from_static(b"never"))
+        }));
+        let sourced_fetches = fetches.clone();
+        let mut sourced = Box::pin(tiered.get_or_fetch(key, move || async move {
+            sourced_fetches.fetch_add(1, Ordering::SeqCst);
+            Ok::<Bytes, &'static str>(Bytes::from_static(b"never"))
+        }));
+        let first = std::future::poll_fn(|cx| Poll::Ready(follower.as_mut().poll(cx))).await;
+        assert!(first.is_pending(), "the follower parks on the held leader");
+        let first = std::future::poll_fn(|cx| Poll::Ready(sourced.as_mut().poll(cx))).await;
+        assert!(first.is_pending(), "the second follower parks too");
+        assert_eq!(tiered.in_flight_waiters(&key), 2);
+        release_tx.send(()).expect("the leader is still parked");
+
+        assert_eq!(
+            leader.await.unwrap().unwrap(),
+            (payload.clone(), ReadOutcome::Fetched)
+        );
+        assert_eq!(
+            follower.await.unwrap(),
+            (payload.clone(), ReadOutcome::LateServe)
+        );
+        assert_eq!(sourced.await.unwrap(), (payload, Source::Upstream));
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(tiered.ram_metrics().snapshot().single_flight_collapses, 2);
+    }
+
+    /// A follower of a leader whose disk consult hit is a [`ReadOutcome::Hit`]
+    /// like that leader: a cache tier served both and no upstream fetch ran.
+    /// The runtime's one blocking thread is held so the leader parks in its
+    /// disk consult until the follower has joined.
+    ///
+    /// FLIP: labelling every follower `ReadOutcome::LateServe` makes the
+    /// follower here a late serve.
+    #[test]
+    fn get_or_fetch_outcome_reports_a_follower_of_a_disk_hit_as_a_hit() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let tmp = TempDir::new().unwrap();
+                let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+                let ram: Cache<&'static str> = Cache::new(generous_limits());
+                let tiered = TieredCache::new(ram, disk);
+                let payload = Bytes::from_static(b"resident on disk");
+                let key = test_key(1, payload.len() as u64);
+                tiered.disk.insert(key, &payload);
+
+                let (release_pool, held) = std::sync::mpsc::channel::<()>();
+                drop(tokio::task::spawn_blocking(move || {
+                    let _ = held.recv();
+                }));
+                let never = || async { Err::<Bytes, &'static str>("no upstream fetch runs") };
+                let mut leader = Box::pin(tiered.get_or_fetch_outcome(key, never));
+                let mut follower = Box::pin(tiered.get_or_fetch_outcome(key, never));
+                let first = std::future::poll_fn(|cx| Poll::Ready(leader.as_mut().poll(cx))).await;
+                assert!(first.is_pending(), "the leader parks in its disk consult");
+                let first =
+                    std::future::poll_fn(|cx| Poll::Ready(follower.as_mut().poll(cx))).await;
+                assert!(first.is_pending(), "the follower parks on the leader");
+                assert_eq!(tiered.in_flight_waiters(&key), 1);
+                drop(release_pool);
+
+                assert_eq!(leader.await.unwrap(), (payload.clone(), ReadOutcome::Hit));
+                assert_eq!(follower.await.unwrap(), (payload, ReadOutcome::Hit));
+                assert_eq!(tiered.disk_metrics().snapshot().hits, 1);
+            });
     }
 
     /// Concurrent RAM+disk misses on one key collapse to a single upstream

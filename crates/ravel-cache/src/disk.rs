@@ -521,6 +521,13 @@ impl DiskCache {
         self.inner.get(key)
     }
 
+    /// [`get`](Self::get) recording neither a hit nor a miss, for a caller
+    /// whose earlier `get` already accounted this request. An entry found
+    /// corrupt or over-age still counts on its disk-error or expiry counter.
+    pub(crate) fn get_uncounted(&self, key: &CacheKey) -> Option<Bytes> {
+        self.inner.get_uncounted(key)
+    }
+
     /// Admit `value` under `key`. Never an error and never partially visible;
     /// see [`Inner::insert`] and the [module docs](self) for the crash-safety
     /// and rejection rules.
@@ -725,6 +732,14 @@ impl Inner {
                 None
             }
         }
+    }
+
+    /// [`get`](Self::get) without the hit or miss record.
+    fn get_uncounted(&self, key: &CacheKey) -> Option<Bytes> {
+        let path = path_for(&self.dir, key);
+        let bytes = self.read_and_verify(key, &path)?;
+        self.state.lock().get(key);
+        Some(bytes)
     }
 
     fn read_and_verify(&self, key: &CacheKey, path: &Path) -> Option<Bytes> {

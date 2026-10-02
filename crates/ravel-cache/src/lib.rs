@@ -110,7 +110,7 @@ pub use key::{CacheKey, PinnedIdentity};
 pub use limits::{CacheLimits, DEFAULT_MAX_ENTRY_AGE_NS, DEFAULT_SWEEP_INTERVAL_NS};
 pub use metrics::{CacheMetrics, CacheMetricsSnapshot};
 pub use single_flight::{Role, SingleFlight, SingleFlightError};
-pub use tiered::{Source, TieredCache};
+pub use tiered::{ReadOutcome, Source, TieredCache};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

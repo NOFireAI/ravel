@@ -11,6 +11,7 @@ use crate::limits::CacheLimits;
 use crate::metrics::CacheMetrics;
 use crate::s3fifo::S3Fifo;
 use crate::single_flight::{Role, SingleFlight, SingleFlightError};
+use crate::tiered::ReadOutcome;
 
 /// XOR mask applied to every byte on a hit in corruption mode. Never
 /// 0x00: XORing with 0x00 would leave a zero-valued byte unchanged, and a
@@ -180,9 +181,21 @@ where
 
     /// The resident bytes for `key`, exactly as inserted, recording neither a
     /// hit nor a miss and applying no corruption: for a caller whose earlier
-    /// [`get`](Self::get) already accounted this request.
+    /// [`get`](Self::get) already accounted this request. Unlike
+    /// [`peek_uncounted`](Self::peek_uncounted) it skips the corruption gate.
     pub(crate) fn get_uncounted(&self, key: &CacheKey) -> Option<Bytes> {
         self.inner.lookup(key)
+    }
+
+    /// Look up `key` without fetching and without recording a hit or a miss,
+    /// for a caller whose earlier [`get`](Self::get) already accounted this
+    /// request and that looks again because the entry may have been admitted
+    /// since. Ages entries out like `get` and, in corruption mode, serves a hit
+    /// corrupted like any other hit.
+    pub fn peek_uncounted(&self, key: &CacheKey) -> Option<Bytes> {
+        self.inner
+            .lookup(key)
+            .map(|bytes| self.maybe_corrupt(bytes))
     }
 
     /// Admit `value` under `key`. Not an error, and a no-op on the
@@ -238,6 +251,29 @@ where
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = Result<Bytes, E>> + Send,
     {
+        self.get_or_fetch_outcome(key, fetch)
+            .await
+            .map(|(bytes, _)| bytes)
+    }
+
+    /// [`get_or_fetch`](Self::get_or_fetch), also reporting whether this call
+    /// ran `fetch`. [`ReadOutcome::Fetched`] only when it did: this call led
+    /// the flight and its RAM recheck missed. [`ReadOutcome::LateServe`]
+    /// otherwise: the leader's RAM recheck served the bytes, or this call
+    /// followed another caller's flight. Never [`ReadOutcome::Hit`]: this is
+    /// the miss-only half, and the caller's own `get` already counted the
+    /// miss a late serve stays. Corruption is unchanged from `get_or_fetch`:
+    /// a recheck serve is corrupted in corruption mode, and a follower of a
+    /// flight that fetched gets the clean fetched bytes.
+    pub async fn get_or_fetch_outcome<F, Fut>(
+        &self,
+        key: CacheKey,
+        fetch: F,
+    ) -> Result<(Bytes, ReadOutcome), SingleFlightError<E>>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: Future<Output = Result<Bytes, E>> + Send,
+    {
         let (result, role) = self
             .single_flight
             .run(key, move || async move {
@@ -253,11 +289,17 @@ where
         if role == Role::Follower {
             self.inner.metrics.record_collapse();
         }
-        Ok(if from_cache {
+        let outcome = if role == Role::Leader && !from_cache {
+            ReadOutcome::Fetched
+        } else {
+            ReadOutcome::LateServe
+        };
+        let bytes = if from_cache {
             self.maybe_corrupt(bytes)
         } else {
             bytes
-        })
+        };
+        Ok((bytes, outcome))
     }
 
     /// Runs one age sweep synchronously: every entry older than
@@ -609,6 +651,93 @@ mod tests {
             0,
             "the sweep must drop a one-ns-old entry when max-age is 0"
         );
+    }
+
+    /// `get_or_fetch_outcome` reports [`ReadOutcome::Fetched`] only to the call
+    /// that ran its fetch: a follower of that flight and a later caller served
+    /// by the RAM recheck are both [`ReadOutcome::LateServe`].
+    ///
+    /// FLIP: labelling the result from `from_cache` alone, ignoring the
+    /// single-flight role, reports the follower as `ReadOutcome::Fetched`.
+    #[tokio::test]
+    async fn get_or_fetch_outcome_reports_fetched_only_for_the_fetching_call() {
+        let cache: Arc<Cache<&'static str>> = Arc::new(Cache::new(generous_limits()));
+        let payload = Bytes::from_static(b"fetched once");
+        let key = test_key_with_len(1, payload.len() as u64);
+        let fetches = Arc::new(AtomicUsize::new(0));
+
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let leader = {
+            let cache = cache.clone();
+            let payload = payload.clone();
+            let fetches = fetches.clone();
+            tokio::spawn(async move {
+                cache
+                    .get_or_fetch_outcome(key, move || async move {
+                        fetches.fetch_add(1, Ordering::SeqCst);
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.await;
+                        Ok::<Bytes, &'static str>(payload)
+                    })
+                    .await
+            })
+        };
+        entered_rx.await.expect("the leader reaches its fetch");
+        let follower = {
+            let cache = cache.clone();
+            let fetches = fetches.clone();
+            tokio::spawn(async move {
+                cache
+                    .get_or_fetch_outcome(key, move || async move {
+                        fetches.fetch_add(1, Ordering::SeqCst);
+                        Ok::<Bytes, &'static str>(Bytes::from_static(b"follower fetch"))
+                    })
+                    .await
+            })
+        };
+        while cache.single_flight.waiters(&key) < 1 {
+            tokio::task::yield_now().await;
+        }
+        release_tx.send(()).expect("the leader is still parked");
+        let leader_result = leader.await.unwrap().unwrap();
+        let follower_result = follower.await.unwrap().unwrap();
+        assert_eq!(leader_result, (payload.clone(), ReadOutcome::Fetched));
+        assert_eq!(follower_result, (payload.clone(), ReadOutcome::LateServe));
+
+        let late = cache
+            .get_or_fetch_outcome(key, || async {
+                Ok::<Bytes, &'static str>(Bytes::from_static(b"second fetch"))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            late,
+            (payload, ReadOutcome::LateServe),
+            "the RAM recheck served it"
+        );
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.metrics().snapshot().single_flight_collapses, 1);
+    }
+
+    /// `peek_uncounted` serves a resident entry, corrupted in corruption mode
+    /// like a `get` hit, and records neither a hit nor a miss.
+    #[test]
+    fn peek_uncounted_records_no_lookup_and_corrupts_like_get() {
+        let cache: Cache<&'static str> = Cache::with_corruption(generous_limits());
+        let payload = Bytes::from_static(b"resident");
+        let key = test_key_with_len(1, payload.len() as u64);
+        let absent = test_key_with_len(2, payload.len() as u64);
+        cache.insert(key, payload.clone());
+        let before = cache.metrics().snapshot();
+
+        assert_eq!(cache.peek_uncounted(&key), Some(corrupt_bytes(&payload)));
+        assert_eq!(cache.peek_uncounted(&absent), None);
+
+        let after = cache.metrics().snapshot();
+        assert_eq!(after.hits, before.hits);
+        assert_eq!(after.misses, before.misses);
+        assert_eq!(after.bytes_served, before.bytes_served);
     }
 
     /// A caller whose `get` missed while a fetch for the key was in flight, and
