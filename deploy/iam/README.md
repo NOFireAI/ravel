@@ -101,13 +101,16 @@ grants below are what remains deletable after that deny applies.
   scratch: the qualification run's objects, and the one object the Parquet
   bucket probe writes and deletes before it returns.
 - **Maintain** (`maintain.json`): `MaintainDelete` grants delete on
-  `t/*/*/l0/*`, `t/*/*/c/*`, `t/*/*/l1/*`, `t/*/*/idem/*`, `t/*/u/*/0001/*`,
-  `t/*/*/del/*.dreq`, `t/*/catalog/*/snap/*`, `t/*/catalog/*/idx/*`,
-  `sys/maintain/workers/*`, `sys/query/workers/*`,
+  `t/*/*/l0/*`, `t/*/*/c/*`, `t/*/*/l1/*`, `t/*/*/idem/*`, `t/*/*/maint/*`,
+  `t/*/u/*/0001/*`, `t/*/*/del/*.dreq`, `t/*/catalog/*/snap/*`,
+  `t/*/catalog/*/idx/*`, `sys/maintain/workers/*`, `sys/query/workers/*`,
   `quarantine/t/*/*/l0/*`, and `t/*/pq/t/*`. These are the objects the
   compaction, supersession, retention, erasure-request, unreferenced-catalog,
   dead-worker reap, quarantine-reaper and Parquet manifest sweeps physically
-  remove. The Parquet manifest sweep is `ravel-cli parquet sweep`, run under
+  remove, plus the unnamed-since markers (ADR-1133) under `maint/unn/` that
+  the retention and superseded-input sweeps and the orphan-marker reaper
+  delete. The scan cursor, the other occupant of `maint/`, is overwritten and
+  never deleted. The Parquet manifest sweep is `ravel-cli parquet sweep`, run under
   this credential. The query-worker reap
   runs on the maintain process that owns a fixed rendezvous unit (one per view
   of the maintain membership) and judges each key by its LIST
@@ -122,7 +125,9 @@ grants below are what remains deletable after that deny applies.
   postings read, which returns "no postings" on a denial and so disables
   the postings scrub tier without an error). `MaintainList` carries the
   two catalog prefixes, without which the sweep is refused at its first
-  `ListBucket`.
+  `ListBucket`, and `t/*/*/maint/*` for the signal-wide LIST of
+  `t/<tenant_hash>/<signal>/maint/unn/` that the marker gate and the
+  orphan-marker reaper share.
 
 ### Erasure-request objects: the three grants the `.dreq` sweep needs
 
@@ -307,6 +312,30 @@ Two known gaps are recorded here and are NOT closed by the grants above.
   than in this template, but this template's write grant is what lets the
   write happen on a shipped deployment, so it is recorded here. Tracked in
   issue #1979.
+
+### Unnamed-since markers: the four calls the marker gate makes
+
+ADR-1133 has the retention and superseded-input sweeps write an unnamed-since
+marker the first time a pass finds a delete candidate the live HEAD no longer
+names, at `t/<tenant_hash>/<signal>/maint/unn/<shard>/<ingest_hour>/<stem>.unn`,
+and an orphan-marker reaper clean up the ones whose anchor is gone. All of it
+runs under the Maintain role, in `crates/ravel-maintain/src/reachability.rs`
+and `crates/ravel-maintain/src/unnamed_marker.rs`.
+
+| Call | S3 operation | Grant |
+|---|---|---|
+| `put_marker` `store.put(key, ...)` (`CreateIfAbsent`) | `s3:PutObject` | `MaintainWrite` `t/*/*/maint/*` |
+| `get_marker` `store.get(key, GetRange::Full)`, and the reaper's body GET in `reap_listed` | `s3:GetObject` | `MaintainRead` `t/*/*/maint/*` |
+| `ensure_marker_listing` and `reap_after_pass` `list_all(store, &unnamed_marker_prefix(tenant, signal))`, also `reap_orphan_unnamed_markers` | `s3:ListBucket` with `prefix=t/<tenant_hash>/<signal>/maint/unn/` | `MaintainList` `s3:prefix` `t/*/*/maint/*` |
+| `delete_marker` (retirement, a re-named candidate, an anchor mismatch) and the reaper's `store.delete` in `reap_listed` | `s3:DeleteObject` | `MaintainDelete` `t/*/*/maint/*` |
+
+A refused marker delete keeps a retention bucket's tombstone, and blocks a
+candidate whose marker must be replaced, on every pass, so the delete grant is
+load-bearing. `DenyDeleteProtected`'s `t/*/u/*/0000/*` also matches an audit
+shard-0 marker (`t/<hash>/u/maint/unn/0000/...`), so that marker's delete is
+refused; the reaper counts the key as failed and moves on to the next one.
+`maintain_template_covers_every_unnamed_marker_call` in
+`crates/ravel-commit/tests/iam_templates.rs` witnesses all four grants.
 
 ## Catalog objects: the scheduled fold runs under Maintain
 

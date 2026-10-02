@@ -143,7 +143,7 @@ own parameters, not gaps a correctly declared config leaves open.
 | superseded input (ADR-0018, HEAD-reachability gate ADR-0020) | L0 commit records + data objects named in a compaction or rewrite record's input list; a whole superseded predecessor record together with the parts it names, whether a rewrite record or a version 2 compaction record supersedes it; an erasure-dominated version 2 compaction record with its parts, in the chain group of the rewrite that dominates it | now >= record.created_unix_ns + protection_horizon, for the rewrite or version 2 record the chain group is entered from; the live catalog HEAD snapshot names none of the objects the delete would remove (delete blocker, see below); the unnamed-since marker keyed by that record matches it and `observed_unix_ns + max_query_duration + head_cache_ttl + 4 * clock_skew_allowance <= now` (pinned-query window, see below); no legal hold on any key of the chain group. The group's objects are deleted, then its marker; the record the group is entered from is not in the group | compaction, rewrite or version 2 record created_unix_ns; for the window, the marker's observed_unix_ns |
 | unreferenced part | `l1/` object referenced by no compaction record in its bucket | a compaction record OR a retention tombstone exists for the bucket (a tombstone makes future compaction impossible, so a record-less part can never be re-referenced); age > grace + max_compaction_lifetime; the branch condition (non-reference, or record-absent-and-tombstoned) re-verified immediately before delete | part last_modified |
 | retention (ADR-0019, HEAD-reachability gate ADR-0020) | everything in a tombstoned bucket, tombstone deleted last | now >= tombstone.retired_at_ns + protection_horizon; the live catalog HEAD snapshot names no object inside the bucket (delete blocker, see below); the bucket's unnamed-since marker matches the tombstone and `observed_unix_ns + max_query_duration + head_cache_ttl + 4 * clock_skew_allowance <= now` (pinned-query window, see below); bucket LIST-verified empty, then the marker deleted, before the tombstone itself is deleted | tombstone retired_at_ns; for the window, the marker's observed_unix_ns |
-| orphan unnamed-since marker (ADR-1133 decision 6) | `t/<tenant_hash>/<signal>/maint/unn/<shard>/<ingest_hour>/<stem>.unn` whose tombstone or record is gone | run by every deleting pass that gated a retention or superseded candidate, and by every full sweep pass (`sweep_shard`), as one signal-wide LIST of `maint/unn/` spanning every shard; the anchor the key names is absent; `observed_unix_ns` older than `protection_horizon` on the sweeper's clock; a key that does not parse as a marker key is counted and skipped, never deleted, and a body that does not decode is counted and left | the marker's observed_unix_ns |
+| orphan unnamed-since marker (ADR-1133 decision 6) | `t/<tenant_hash>/<signal>/maint/unn/<shard>/<ingest_hour>/<stem>.unn` whose tombstone or record is gone | run by every deleting pass that gated a retention or superseded candidate, and by every full sweep pass (`sweep_shard`), per shard, as one signal-wide LIST of `maint/unn/` spanning every shard (the gate's LIST when that pass already ran one) plus one anchor HEAD for each listed marker the pass did not gate, write or delete; the anchor the key names is absent; `observed_unix_ns` older than `protection_horizon` on the sweeper's clock; a key that does not parse as a marker key is counted and skipped, never deleted, and a body that does not decode is counted and left; an anchor HEAD, marker GET or marker DELETE that fails is counted and the reap moves on to the next key | the marker's observed_unix_ns |
 | idempotency marker (ADR-0051 §5; logs and spans only, run once per signal rather than per shard) | `t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm` marker object | marker's `<ingest_hour>` older than `now_hour - idem_dedup_window_hours - IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS`; a key that fails to parse as `<keyhash32>.<ingest_hour>.idm` is skipped, never deleted | marker key's own `<ingest_hour>` |
 | alert retention (ADR-1688; tombstone-free, alerts shard only, see "Alert signal retention" below) | an L0 commit record under the tenant's alerts commit prefix, then the data object it names | `alert_retention_window_ns` nonzero; the tenant's alert state memo readable and its watermark hour (clamped to the sweeper's own hour) at or above the expiry floor's hour; the record's ingest hour strictly below that watermark; max_event_ts older than now - window and now >= created_unix_ns + protection_horizon; its max_event_ts not the `ts_ns` of any record the memo holds; the legal-hold lease check clear | record max_event_ts and created_unix_ns |
 
@@ -313,8 +313,10 @@ every hour do not stall the sweep.
 - **A re-named candidate restarts its window.** A pass that finds HEAD naming
   the candidate again deletes its marker.
 - **Any doubt blocks.** A marker GET, PUT or DELETE error, a body that does
-  not decode, or an anchor that cannot be read blocks the delete as
-  `SnapshotBlock::Unreadable`. An absent or unreadable HEAD keeps the answer
+  not decode, or a superseded group whose anchor record the pass did not read
+  blocks the delete as `SnapshotBlock::Unreadable`. A retention tombstone that
+  cannot be read fails the retention pass for that bucket instead, before any
+  marker is read or written. An absent or unreadable HEAD keeps the answer
   above, except that a clear answer still needs an aged, matching marker.
 - **Order.** Retention deletes the bucket's objects, verifies the bucket
   empty, deletes the marker, then the tombstone. The superseded sweep deletes
@@ -327,9 +329,14 @@ every hour do not stall the sweep.
   deletes one: a chain with no marker, or one inside its window, holds the
   `.dreq`.
 - **Cost.** One PUT per candidate lifetime, one GET of the body per pass while
-  the window runs (cached for the pass), one DELETE when it goes, and one LIST
-  of `maint/unn/` per pass that reaches the marker step. A marker carries no
-  tenant data and the sweeps do not consult legal holds before deleting one.
+  the window runs (cached for the pass), and one DELETE when it goes. The
+  gate's signal-wide LIST of `maint/unn/` runs once per shard pass that gates
+  an unnamed candidate, and once per deleting shard pass that finds a named
+  one (to delete a re-named candidate's marker): once per shard pass, not
+  once per `(tenant, signal)`. The orphan reaper reuses that LIST, and adds
+  one anchor HEAD for each listed marker the pass did not gate, write or
+  delete. A marker carries no tenant data and the sweeps do not consult legal
+  holds before deleting one.
 
 The idempotency-marker rule's age gate subtracts
 `IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS` (1 h) from its lower bound, the
@@ -865,9 +872,12 @@ every bound is measured.
   pass holds a chain whose unnamed-since marker is missing or younger than
   the window, so a `.dreq` is kept until every chain holding it has a marker
   older than the window or is gone, at the earliest one window after a
-  deleting pass first found the chain unnamed (ADR-1133). The `.dreq` carries the
-  subject identifier, so this delays the end of its retention, not only the
-  physical delete.
+  deleting pass first found the chain unnamed (ADR-1133). For a chain in an
+  interior hour, which the superseded-input sweep reaches only on the full
+  sweep (`interior_reverify_ns`, default 6 h), that takes up to two full-sweep
+  intervals past the chain's horizon: one to write the marker and one to
+  delete once it has aged. The `.dreq` carries the subject identifier, so this
+  delays the end of its retention, not only the physical delete.
 
 - **Why the hold terminates.** Apart from a refused chain, the cut-chain hold
   counts only objects the superseded-input sweep actually held on this pass,

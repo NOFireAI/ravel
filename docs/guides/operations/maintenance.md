@@ -532,8 +532,13 @@ unnamed-since marker under `t/<tenant_hash>/<signal>/maint/unn/` and holds it;
 a later pass deletes it once `max_query_duration + head_cache_ttl + 4 *
 clock_skew_allowance` (1 h 20 min 30 s with defaults) has passed on the
 sweeper's clock. Expect every expired bucket and superseded object
-to report `pinned_window` for at least one pass, and physical deletion to land
-that much later than before. An erasure request's `.dreq`, which carries the
+to report `pinned_window` for at least one pass. Retention re-evaluates a
+tombstoned bucket on every maintain tick, so its physical deletion lands about
+one window later than before. The superseded-input sweep reaches an interior
+hour only on the full sweep (`maintain_interior_reverify`, default 6 h): one
+full sweep writes the marker and a later one deletes once it has aged, so an
+interior superseded input goes up to two full-sweep intervals after its
+horizon, one more than before. An erasure request's `.dreq`, which carries the
 subject identifier, is kept until every chain it holds has a marker older than
 the window, so it too lives that much longer. A one-shot `ravel-cli maintain sweep` writes the
 marker and holds on its first run; a second run once the window has passed
