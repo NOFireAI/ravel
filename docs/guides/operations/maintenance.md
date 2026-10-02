@@ -296,15 +296,20 @@ one whose bulk load has finished.
 Two targets decide where the compactor closes one L1 segment and starts the
 next, and a segment closes on whichever it reaches first:
 
-- The **memory split target**, `l1_part_memory_target_bytes`, bounds the
-  decoded record heap one segment may hold while it is merged. Set it with
+- The **memory split target**, `l1_part_memory_target_bytes`, sizes the
+  decoded record heap one segment holds while it is merged. It is a split
+  point, not a ceiling: a span merge checks it only between traces, so a
+  segment can run past it by a whole trace. Set it with
   `--maintain-l1-part-memory-target-bytes` on the server and
-  `--l1-part-memory-target-bytes` on `compact-tenant`.
+  `--l1-part-memory-target-bytes` on `compact-bucket` and `compact-tenant`.
 - The **stored-size target**, `max_l1_part_bytes` (default 256 MiB), is the
-  cap on the encoded object size, measured by encoding the segment. Set it with
-  `--max-l1-part-bytes` on `compact-tenant`.
+  cap on the encoded object size of a log or metrics segment, measured by
+  encoding the segment. Span merges do not read it. Set it with
+  `--max-l1-part-bytes` on `compact-bucket` and `compact-tenant`.
 
-When the memory split target is not set, it is derived from the memory budget:
+When the memory split target is not set, the log merge's target is derived
+from the memory budget, and the span merge's target stays 256 MiB because span
+segments have no stored-size target to cap them:
 
 ```text
 l1_part_memory_target_bytes = memory_budget / 8 / concurrent_merges
@@ -316,9 +321,27 @@ concurrent merges are `--maintain-unit-concurrency`. For `ravel-cli` the budget
 is the host's total memory (`MemTotal` from `/proc/meminfo`, lowered to a
 cgroup memory limit when one is set; `sysctl hw.memsize` on macOS), and the
 concurrent merges are `--bucket-concurrency` (1 for `compact-bucket`). When the
-budget cannot be read, the target falls back to 256 MiB and `ravel-cli` prints a
-note on stderr saying so. An explicit flag always wins and is used as given;
-0 is refused.
+budget cannot be read, the target falls back to 256 MiB, `ravel-cli` prints a
+note on stderr saying so, and a `--mode maintain` server logs a warning. An
+explicit flag wins over the derivation, is used as given for both log and span
+merges, and is refused at 0.
+
+The 256 MiB floor binds only while the budget is at most 2 GiB per concurrent
+merge. `compact-bucket` therefore derives 1 GiB on an 8 GiB host and keeps
+256 MiB only at 2 GiB or less; a server at the default
+`--maintain-unit-concurrency` of 4 keeps 256 MiB up to 10 GiB of memory (its
+budget is memory less a 2 GiB reserve).
+
+Segment boundaries depend on both targets and, for logs, on the compaction zstd
+level, and none of them is part of a compaction record's identity. Two
+processes that resolve different targets cut the same bucket into different
+segments: on a 30 GiB host the server derives 896 MiB per merge and
+`compact-bucket` 3.75 GiB. When a run fails with "compaction converged on a
+prior record that references part ... which is absent", rebuilding that part
+reproduces its key only with the values the run that wrote the record used:
+`--l1-part-memory-target-bytes`, `--max-l1-part-bytes` and
+`--compaction-zstd-level`. The record writer's report or startup log names the
+memory target it resolved.
 
 Decoded heap runs far ahead of stored bytes on a wide schema, which is why the
 derivation matters. On a 104-column schema a decoded record is about 8 KiB, so
@@ -328,14 +351,16 @@ the rows per segment. The stored-size target stays the operator's cap: once
 segments grow toward it, lower `--max-l1-part-bytes` to bound object size
 regardless of how much memory the host has.
 
-Each run says which value it used and why. `compact-bucket` and
-`compact-tenant` print it in their report, for example
+Each run says which values it used and why. `compact-bucket` and
+`compact-tenant` print them in their report, for example
 `l1_part_memory_target_bytes: 4294967296 (resolved from a memory budget of
-34359738368 over 1 concurrent merges)` on a 32 GiB host, or
-`l1_part_memory_target_bytes: 1073741824 (set by flag)`. The server logs it
-once at startup as a `performance default resolved` line with
-`setting=l1_part_memory_target_bytes` and `source` set to `derived`, `flag` or
-`fallback`.
+34359738368 over 1 concurrent merge)` from `compact-bucket` on a 32 GiB host, or
+`l1_part_memory_target_bytes: 1073741824 (set by flag)`, followed by
+`rspan_l1_part_memory_target_bytes:` (the span merge's target) and
+`max_l1_part_bytes:`. The server logs them once at startup as a
+`performance default resolved` line with
+`setting=l1_part_memory_target_bytes`, `source` set to `derived`, `flag` or
+`fallback`, and `rspan_value` for the span merge's target.
 
 ### Running compact-tenant beside a live cluster
 

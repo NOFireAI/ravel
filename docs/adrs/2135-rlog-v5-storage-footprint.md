@@ -597,7 +597,7 @@ and the status moved from Proposed to Accepted.
 <!-- amendment-applies: sections="Consequences" pointer="#2351 amendment" -->
 
 The compactor closes an L1 part on whichever of two targets it reaches
-first: the memory split target `l1_part_memory_target_bytes`, which bounds
+first: the memory split target `l1_part_memory_target_bytes`, which sizes
 the decoded record heap of one merge, and the stored-size target
 `max_l1_part_bytes`, which bounds the encoded object. The memory split
 target had a fixed default of 256 MiB. A decoded record on the 104-column
@@ -607,22 +607,32 @@ Compacting that corpus produced 3,461 L1 parts from 2,617 L0 inputs: under
 the old default the part count could exceed the L0 count, and compaction
 added objects instead of removing them.
 
-When the operator does not set it, the memory split target is now derived
-from the memory budget the process runs under:
+When the operator does not set it, the RLOG merge's memory split target is
+now derived from the memory budget the process runs under:
 
 ```text
 l1_part_memory_target_bytes = memory_budget / 8 / concurrent_merges
                               clamped to [256 MiB, 8 GiB]
 ```
 
-`ravel-server` uses its resolved `memory_budget_bytes` and its maintenance
-unit concurrency; `ravel-cli maintain` uses the host's total memory and its
-bucket concurrency. An unknown budget falls back to 256 MiB, and an explicit
-flag wins and is used as given. Part size therefore follows host memory: on
-the same corpus a 4 GiB target holds about 500k rows, about 34 MB stored.
-The 8 GiB ceiling keeps a large host from building one part whose decoded
-heap dominates the process, and the 256 MiB floor keeps the old behaviour on
-a small host.
+`ravel-server` uses its resolved `memory_budget_bytes` (memory less its
+2 GiB overhead reserve) and its maintenance unit concurrency; `ravel-cli
+maintain` uses the host's total memory, capped by a cgroup memory limit on
+Linux, and its bucket concurrency (1 for `compact-bucket`). An unknown
+budget falls back to 256 MiB, and an explicit flag wins and is used as
+given. Part size therefore follows host memory: on the same corpus a 4 GiB
+target holds about 500k rows, about 34 MB stored. The 8 GiB ceiling keeps a
+large host from building one part whose decoded heap dominates the process.
+The 256 MiB floor binds only while `memory_budget / 8 / concurrent_merges`
+is at most 256 MiB, that is a budget of at most 2 GiB per concurrent merge:
+`compact-bucket` keeps the old 256 MiB only on a host of 2 GiB or less, and
+derives 1 GiB on an 8 GiB host; `ravel-server` at its default unit
+concurrency of 4 keeps it up to 10 GiB of memory.
+
+The derived value reaches the RLOG merge only. The RSPAN merge has no
+stored-size target, and the claim lease check of ADR-1029 decision 3 sizes
+the largest part as `max_l1_part_bytes`, so span compaction stays at the
+fixed 256 MiB unless the operator sets the flag, which reaches both merges.
 
 The stored-size target remains the operator's cap on object size. The
 derivation never raises `max_l1_part_bytes`, so an operator who wants
