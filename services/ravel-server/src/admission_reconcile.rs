@@ -155,6 +155,16 @@ mod tests {
 
     use super::*;
 
+    /// Only zero is refused: the smallest non-zero interval passes, since the
+    /// command line accepts sub-millisecond values such as `500us`.
+    ///
+    /// Flip to watch it fail: change `interval.is_zero()` in [`check_spawnable`] to
+    /// `interval < Duration::from_millis(1)`.
+    #[test]
+    fn check_spawnable_accepts_the_smallest_nonzero_interval() {
+        check_spawnable(Duration::from_nanos(1)).expect("a 1 ns interval passes");
+    }
+
     /// A zero interval is refused with the typed error naming the flag, and no
     /// task is spawned.
     ///

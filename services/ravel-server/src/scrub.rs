@@ -2096,6 +2096,16 @@ mod tests {
         }
     }
 
+    /// Only zero is refused: the smallest non-zero period passes, since the
+    /// command line accepts sub-millisecond values such as `500us`.
+    ///
+    /// Flip to watch it fail: change `period.is_zero()` in [`check_spawnable`] to
+    /// `period < Duration::from_millis(1)`.
+    #[test]
+    fn check_spawnable_accepts_the_smallest_nonzero_period() {
+        check_spawnable(Duration::from_nanos(1)).expect("a 1 ns period passes");
+    }
+
     /// A zero scrub period is refused with the typed error naming the flag,
     /// and no task is spawned.
     ///
