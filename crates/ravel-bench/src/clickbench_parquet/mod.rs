@@ -4,4 +4,5 @@
 //! its own; nothing in this module wires an engine to a live object store.
 
 pub mod comparator;
+pub mod fixture;
 pub mod suite;

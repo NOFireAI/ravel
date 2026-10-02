@@ -1,0 +1,744 @@
+//! Deterministic synthetic ClickBench fixture (ADR-2040, issue #2055 task
+//! T5b). [`write_hits`] plants a 25-column, 10,000-row corpus across four
+//! 2,500-row parts (`hits_0.parquet`..`hits_3.parquet`) plus one combined
+//! file (`hits.parquet`), so a later task's engines can mount either shape
+//! under `suite.toml`'s table template. Every row is derived only from a
+//! seed and its own index, so two runs with the same seed produce
+//! byte-identical Parquet files.
+//!
+//! The column list is exactly the 25 distinct quoted identifiers referenced
+//! across `benchmarks/clickbench/parquet/queries.sql` (verified by
+//! `fn queries_sql_references_every_column` below): 4 as `Int64`, 3 as
+//! `Int32`, 11 as `Int16`, `EventTime` as `Int64` (seconds, matching
+//! upstream's `to_timestamp_seconds("EventTime")` queries), `EventDate` as
+//! `UInt16` (days since the Unix epoch, matching `suite.toml`'s
+//! `ravel.cast.EventDate = date-from-days` table option), and the 5
+//! string-shaped columns as `Binary` with no UTF-8 annotation (matching
+//! `suite.toml`'s `binary_as_string` table option).
+
+use std::fs::File;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use datafusion::arrow::array::{
+    ArrayRef, BinaryArray, Int16Array, Int32Array, Int64Array, UInt16Array,
+};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::error::ArrowError;
+use datafusion::arrow::record_batch::RecordBatch;
+use parquet58::arrow::ArrowWriter;
+use parquet58::errors::ParquetError;
+use rand::rngs::StdRng;
+use rand::{RngExt, SeedableRng};
+
+/// Total row count across the fixture's four parts.
+pub const TOTAL_ROWS: usize = 10_000;
+/// Row count of each `hits_<n>.parquet` part.
+pub const ROWS_PER_PART: usize = 2_500;
+/// Number of equal-sized parts `hits.parquet` is split across.
+pub const PART_COUNT: usize = 4;
+
+/// `UserID` literal Q20 filters on (`"UserID" = 435090932899640449`),
+/// planted on row 0.
+const Q20_USER_ID: i64 = 435_090_932_899_640_449;
+/// `URLHash` literal Q42 filters on, planted (with Q42's other conditions)
+/// on row 1.
+const Q42_URL_HASH: i64 = 2_868_770_270_353_813_622;
+/// `RefererHash` literal Q41 filters on, planted (with Q41's other
+/// conditions) on row 2.
+const Q41_REFERER_HASH: i64 = 3_594_120_000_172_545_465;
+
+/// `EventDate` span (days since the Unix epoch) covering upstream's
+/// `"EventDate" >= '2013-07-01' AND "EventDate" <= '2013-07-31'` range
+/// (Q37-42).
+const EVENT_DATE_MIN: u16 = 15_887;
+/// See [`EVENT_DATE_MIN`].
+const EVENT_DATE_MAX: u16 = 15_917;
+/// `EventDate` within Q43's narrower `'2013-07-14'..'2013-07-15'` range,
+/// planted (with Q43's other conditions) on row 3.
+const Q43_EVENT_DATE: u16 = 15_900;
+
+/// 12 distinct, non-empty search phrases planted in as-equal-as-possible
+/// counts among the rows with a non-empty `SearchPhrase`.
+const SEARCH_PHRASES: [&str; 12] = [
+    "rust programming",
+    "object storage",
+    "parquet format",
+    "telemetry database",
+    "query engine",
+    "arrow columnar",
+    "clickbench results",
+    "multi tenant",
+    "sql pushdown",
+    "time series",
+    "log segment",
+    "flight protocol",
+];
+
+/// Distinct `MobilePhoneModel` values planted on the rows with a non-empty
+/// model.
+const MOBILE_MODELS: [&str; 6] = [
+    "Model-0", "Model-1", "Model-2", "Model-3", "Model-4", "Model-5",
+];
+
+/// Everything [`write_hits`] can fail on.
+#[derive(Debug, thiserror::Error)]
+pub enum FixtureError {
+    /// Creating or writing one of the output files failed.
+    #[error("{path}: {source}")]
+    Io {
+        /// The file that failed.
+        path: PathBuf,
+        /// The underlying I/O error.
+        #[source]
+        source: io::Error,
+    },
+    /// The Parquet writer itself refused a file.
+    #[error("{path}: {source}")]
+    Parquet {
+        /// The file that failed.
+        path: PathBuf,
+        /// The underlying Parquet error.
+        #[source]
+        source: ParquetError,
+    },
+    /// Assembling a `RecordBatch` from the generated columns failed.
+    #[error("building record batch: {0}")]
+    Batch(#[from] ArrowError),
+}
+
+/// The fixture's Arrow schema, shared by every part and the combined file.
+fn schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("WatchID", DataType::Int64, false),
+        Field::new("UserID", DataType::Int64, false),
+        Field::new("URLHash", DataType::Int64, false),
+        Field::new("RefererHash", DataType::Int64, false),
+        Field::new("CounterID", DataType::Int32, false),
+        Field::new("RegionID", DataType::Int32, false),
+        Field::new("ClientIP", DataType::Int32, false),
+        Field::new("AdvEngineID", DataType::Int16, false),
+        Field::new("ResolutionWidth", DataType::Int16, false),
+        Field::new("MobilePhone", DataType::Int16, false),
+        Field::new("SearchEngineID", DataType::Int16, false),
+        Field::new("TraficSourceID", DataType::Int16, false),
+        Field::new("IsRefresh", DataType::Int16, false),
+        Field::new("IsLink", DataType::Int16, false),
+        Field::new("IsDownload", DataType::Int16, false),
+        Field::new("DontCountHits", DataType::Int16, false),
+        Field::new("WindowClientWidth", DataType::Int16, false),
+        Field::new("WindowClientHeight", DataType::Int16, false),
+        Field::new("EventTime", DataType::Int64, false),
+        Field::new("EventDate", DataType::UInt16, false),
+        Field::new("URL", DataType::Binary, false),
+        Field::new("Title", DataType::Binary, false),
+        Field::new("Referer", DataType::Binary, false),
+        Field::new("SearchPhrase", DataType::Binary, false),
+        Field::new("MobilePhoneModel", DataType::Binary, false),
+    ]))
+}
+
+/// The 25 generated columns, each [`TOTAL_ROWS`] long, before being sliced
+/// into parts.
+struct Columns {
+    watch_id: Vec<i64>,
+    user_id: Vec<i64>,
+    url_hash: Vec<i64>,
+    referer_hash: Vec<i64>,
+    counter_id: Vec<i32>,
+    region_id: Vec<i32>,
+    client_ip: Vec<i32>,
+    adv_engine_id: Vec<i16>,
+    resolution_width: Vec<i16>,
+    mobile_phone: Vec<i16>,
+    search_engine_id: Vec<i16>,
+    trafic_source_id: Vec<i16>,
+    is_refresh: Vec<i16>,
+    is_link: Vec<i16>,
+    is_download: Vec<i16>,
+    dont_count_hits: Vec<i16>,
+    window_client_width: Vec<i16>,
+    window_client_height: Vec<i16>,
+    event_time: Vec<i64>,
+    event_date: Vec<u16>,
+    url: Vec<Vec<u8>>,
+    title: Vec<Vec<u8>>,
+    referer: Vec<Vec<u8>>,
+    search_phrase: Vec<Vec<u8>>,
+    mobile_phone_model: Vec<Vec<u8>>,
+}
+
+impl Columns {
+    fn with_capacity(n: usize) -> Self {
+        Columns {
+            watch_id: Vec::with_capacity(n),
+            user_id: Vec::with_capacity(n),
+            url_hash: Vec::with_capacity(n),
+            referer_hash: Vec::with_capacity(n),
+            counter_id: Vec::with_capacity(n),
+            region_id: Vec::with_capacity(n),
+            client_ip: Vec::with_capacity(n),
+            adv_engine_id: Vec::with_capacity(n),
+            resolution_width: Vec::with_capacity(n),
+            mobile_phone: Vec::with_capacity(n),
+            search_engine_id: Vec::with_capacity(n),
+            trafic_source_id: Vec::with_capacity(n),
+            is_refresh: Vec::with_capacity(n),
+            is_link: Vec::with_capacity(n),
+            is_download: Vec::with_capacity(n),
+            dont_count_hits: Vec::with_capacity(n),
+            window_client_width: Vec::with_capacity(n),
+            window_client_height: Vec::with_capacity(n),
+            event_time: Vec::with_capacity(n),
+            event_date: Vec::with_capacity(n),
+            url: Vec::with_capacity(n),
+            title: Vec::with_capacity(n),
+            referer: Vec::with_capacity(n),
+            search_phrase: Vec::with_capacity(n),
+            mobile_phone_model: Vec::with_capacity(n),
+        }
+    }
+
+    /// Builds the `RecordBatch` for rows `start..end`.
+    fn batch(&self, schema: &SchemaRef, start: usize, end: usize) -> Result<RecordBatch, FixtureError> {
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(self.watch_id[start..end].to_vec())),
+            Arc::new(Int64Array::from(self.user_id[start..end].to_vec())),
+            Arc::new(Int64Array::from(self.url_hash[start..end].to_vec())),
+            Arc::new(Int64Array::from(self.referer_hash[start..end].to_vec())),
+            Arc::new(Int32Array::from(self.counter_id[start..end].to_vec())),
+            Arc::new(Int32Array::from(self.region_id[start..end].to_vec())),
+            Arc::new(Int32Array::from(self.client_ip[start..end].to_vec())),
+            Arc::new(Int16Array::from(self.adv_engine_id[start..end].to_vec())),
+            Arc::new(Int16Array::from(self.resolution_width[start..end].to_vec())),
+            Arc::new(Int16Array::from(self.mobile_phone[start..end].to_vec())),
+            Arc::new(Int16Array::from(self.search_engine_id[start..end].to_vec())),
+            Arc::new(Int16Array::from(self.trafic_source_id[start..end].to_vec())),
+            Arc::new(Int16Array::from(self.is_refresh[start..end].to_vec())),
+            Arc::new(Int16Array::from(self.is_link[start..end].to_vec())),
+            Arc::new(Int16Array::from(self.is_download[start..end].to_vec())),
+            Arc::new(Int16Array::from(self.dont_count_hits[start..end].to_vec())),
+            Arc::new(Int16Array::from(self.window_client_width[start..end].to_vec())),
+            Arc::new(Int16Array::from(self.window_client_height[start..end].to_vec())),
+            Arc::new(Int64Array::from(self.event_time[start..end].to_vec())),
+            Arc::new(UInt16Array::from(self.event_date[start..end].to_vec())),
+            Arc::new(BinaryArray::from_iter_values(self.url[start..end].iter())),
+            Arc::new(BinaryArray::from_iter_values(self.title[start..end].iter())),
+            Arc::new(BinaryArray::from_iter_values(self.referer[start..end].iter())),
+            Arc::new(BinaryArray::from_iter_values(
+                self.search_phrase[start..end].iter(),
+            )),
+            Arc::new(BinaryArray::from_iter_values(
+                self.mobile_phone_model[start..end].iter(),
+            )),
+        ];
+        Ok(RecordBatch::try_new(schema.clone(), arrays)?)
+    }
+}
+
+/// A pool of `size` distinct `i64` values for a hash/id-shaped column, with
+/// `literal` forced into slot 0 so a caller can plant it on a chosen row.
+fn pool_with_literal(rng: &mut StdRng, size: usize, literal: i64) -> Vec<i64> {
+    let mut pool = Vec::with_capacity(size);
+    pool.push(literal);
+    for _ in 1..size {
+        pool.push(rng.random::<i64>());
+    }
+    pool
+}
+
+/// Generates all [`TOTAL_ROWS`] rows deterministically from `seed`.
+fn generate(seed: u64) -> Columns {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut cols = Columns::with_capacity(TOTAL_ROWS);
+
+    let user_id_pool = pool_with_literal(&mut rng, 40, Q20_USER_ID);
+    let url_hash_pool = pool_with_literal(&mut rng, 40, Q42_URL_HASH);
+    let referer_hash_pool = pool_with_literal(&mut rng, 40, Q41_REFERER_HASH);
+
+    let mut nonempty_phrase_count: usize = 0;
+
+    for i in 0..TOTAL_ROWS {
+        cols.watch_id
+            .push((seed ^ 0x9E37_79B9_7F4A_7C15_u64).wrapping_add(i as u64) as i64);
+
+        let mut user_id = user_id_pool[rng.random_range(0..user_id_pool.len())];
+        let mut url_hash = url_hash_pool[rng.random_range(0..url_hash_pool.len())];
+        let mut referer_hash = referer_hash_pool[rng.random_range(0..referer_hash_pool.len())];
+        let mut counter_id: i32 = if rng.random_bool(0.30) {
+            62
+        } else {
+            1 + rng.random_range(0..200)
+        };
+        let mut event_date: u16 =
+            EVENT_DATE_MIN + rng.random_range(0..=(EVENT_DATE_MAX - EVENT_DATE_MIN));
+        let mut is_refresh: i16 = i16::from(rng.random_bool(0.2));
+        let mut dont_count_hits: i16 = i16::from(rng.random_bool(0.1));
+        let mut trafic_source_id: i16 = rng.random_range(-1..=9);
+
+        // Q20/Q41/Q42/Q43 each need a literal and a handful of co-occurring
+        // filters; rows 0-3 plant them deterministically rather than relying
+        // on chance over a 10,000-row, non-exhaustive sample.
+        match i {
+            0 => user_id = Q20_USER_ID,
+            1 => {
+                url_hash = Q42_URL_HASH;
+                counter_id = 62;
+                event_date = EVENT_DATE_MIN;
+                is_refresh = 0;
+                dont_count_hits = 0;
+            }
+            2 => {
+                referer_hash = Q41_REFERER_HASH;
+                counter_id = 62;
+                event_date = Q43_EVENT_DATE;
+                is_refresh = 0;
+                trafic_source_id = -1;
+            }
+            3 => {
+                counter_id = 62;
+                event_date = Q43_EVENT_DATE;
+                is_refresh = 0;
+                dont_count_hits = 0;
+            }
+            _ => {}
+        }
+
+        cols.user_id.push(user_id);
+        cols.url_hash.push(url_hash);
+        cols.referer_hash.push(referer_hash);
+        cols.counter_id.push(counter_id);
+        cols.region_id.push(1 + rng.random_range(0..300));
+        cols.client_ip.push(rng.random_range(0..(i32::MAX / 2)));
+        cols.adv_engine_id.push(if rng.random_bool(0.1) {
+            rng.random_range(1..20)
+        } else {
+            0
+        });
+        cols.resolution_width.push(rng.random_range(800..=2560));
+        cols.mobile_phone.push(rng.random_range(0..=10));
+        cols.search_engine_id.push(rng.random_range(0..=5));
+        cols.trafic_source_id.push(trafic_source_id);
+        cols.is_refresh.push(is_refresh);
+        cols.is_link.push(i16::from(rng.random_bool(0.05)));
+        cols.is_download.push(i16::from(rng.random_bool(0.05)));
+        cols.dont_count_hits.push(dont_count_hits);
+        cols.window_client_width.push(rng.random_range(0..=2000));
+        cols.window_client_height.push(rng.random_range(0..=2000));
+
+        let day_start = i64::from(event_date) * 86_400;
+        cols.event_time.push(day_start + rng.random_range(0..86_400i64));
+        cols.event_date.push(event_date);
+
+        let url = if i % 20 == 0 {
+            format!("http://www.google.com/search?q=rust&p={i}")
+        } else {
+            format!("http://example.com/page/{}", i % 500)
+        };
+        cols.url.push(url.into_bytes());
+
+        let title = if i % 20 == 7 {
+            format!("Google Result {i}")
+        } else {
+            format!("Example Page {}", i % 500)
+        };
+        cols.title.push(title.into_bytes());
+
+        let referer = if i % 5 == 0 {
+            Vec::new()
+        } else {
+            format!("https://host-{}.example/path/{i}", i % 8).into_bytes()
+        };
+        cols.referer.push(referer);
+
+        let search_phrase = if i % 3 == 0 {
+            Vec::new()
+        } else {
+            let phrase = SEARCH_PHRASES[nonempty_phrase_count % SEARCH_PHRASES.len()];
+            nonempty_phrase_count += 1;
+            phrase.as_bytes().to_vec()
+        };
+        cols.search_phrase.push(search_phrase);
+
+        let mobile_phone_model = if i % 7 == 0 {
+            MOBILE_MODELS[(i / 7) % MOBILE_MODELS.len()]
+                .as_bytes()
+                .to_vec()
+        } else {
+            Vec::new()
+        };
+        cols.mobile_phone_model.push(mobile_phone_model);
+    }
+
+    cols
+}
+
+fn write_batch(path: &Path, schema: &SchemaRef, batch: &RecordBatch) -> Result<(), FixtureError> {
+    let file = File::create(path).map_err(|source| FixtureError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut writer =
+        ArrowWriter::try_new(file, schema.clone(), None).map_err(|source| FixtureError::Parquet {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    writer.write(batch).map_err(|source| FixtureError::Parquet {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    writer.close().map_err(|source| FixtureError::Parquet {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(())
+}
+
+/// Writes `hits_0.parquet`..`hits_3.parquet` ([`ROWS_PER_PART`] rows each)
+/// and `hits.parquet` (the same [`TOTAL_ROWS`] rows combined) into `dir`,
+/// generated deterministically from `seed`: the same `(dir, seed)` always
+/// produces byte-identical files.
+pub fn write_hits(dir: &Path, seed: u64) -> Result<(), FixtureError> {
+    let cols = generate(seed);
+    let schema = schema();
+
+    for part in 0..PART_COUNT {
+        let start = part * ROWS_PER_PART;
+        let end = start + ROWS_PER_PART;
+        let batch = cols.batch(&schema, start, end)?;
+        write_batch(&dir.join(format!("hits_{part}.parquet")), &schema, &batch)?;
+    }
+
+    let combined = cols.batch(&schema, 0, TOTAL_ROWS)?;
+    write_batch(&dir.join("hits.parquet"), &schema, &combined)?;
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use parquet58::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::collections::HashSet;
+
+    fn read_all(path: &Path) -> Vec<RecordBatch> {
+        let file = File::open(path).expect("open parquet file");
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .expect("build reader")
+            .build()
+            .expect("construct reader");
+        reader
+            .map(|b| b.expect("read batch"))
+            .collect::<Vec<_>>()
+    }
+
+    fn row_count(batches: &[RecordBatch]) -> usize {
+        batches.iter().map(RecordBatch::num_rows).sum()
+    }
+
+    /// Every column `write_hits` plants is one of the 25 distinct quoted
+    /// identifiers upstream's `queries.sql` actually references, and every
+    /// such identifier is planted: neither side carries a column the other
+    /// doesn't name.
+    #[test]
+    fn queries_sql_references_every_column() {
+        let queries_sql = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../benchmarks/clickbench/parquet/queries.sql"
+        ));
+        let referenced: HashSet<String> = queries_sql
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect();
+        let planted: HashSet<String> = schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(referenced, planted);
+        assert_eq!(planted.len(), 25);
+    }
+
+    #[test]
+    fn write_hits_creates_all_five_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_hits(dir.path(), 7).expect("write_hits");
+        for part in 0..PART_COUNT {
+            assert!(dir.path().join(format!("hits_{part}.parquet")).is_file());
+        }
+        assert!(dir.path().join("hits.parquet").is_file());
+    }
+
+    #[test]
+    fn row_counts_match_spec() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_hits(dir.path(), 7).expect("write_hits");
+        for part in 0..PART_COUNT {
+            let batches = read_all(&dir.path().join(format!("hits_{part}.parquet")));
+            assert_eq!(row_count(&batches), ROWS_PER_PART);
+        }
+        let combined = read_all(&dir.path().join("hits.parquet"));
+        assert_eq!(row_count(&combined), TOTAL_ROWS);
+    }
+
+    /// The 5 string-shaped columns round-trip as `Binary`, never `Utf8`: the
+    /// fixture carries no string annotation, matching `suite.toml`'s
+    /// `binary_as_string` table option, which only has an effect when the
+    /// Parquet column itself is unannotated binary.
+    #[test]
+    fn string_columns_carry_no_utf8_annotation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_hits(dir.path(), 7).expect("write_hits");
+        let combined = read_all(&dir.path().join("hits.parquet"));
+        let schema = combined[0].schema();
+        for name in ["URL", "Title", "Referer", "SearchPhrase", "MobilePhoneModel"] {
+            let field = schema.field_with_name(name).expect("field present");
+            assert_eq!(field.data_type(), &DataType::Binary, "{name} must be Binary");
+        }
+    }
+
+    /// `hits.parquet` holds exactly the same rows as the four parts
+    /// concatenated, column by column: a caller that mounts either shape
+    /// under `suite.toml`'s table template reads the same data.
+    #[test]
+    fn combined_file_equals_concatenated_parts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_hits(dir.path(), 11).expect("write_hits");
+
+        let combined = read_all(&dir.path().join("hits.parquet"));
+        let combined_watch_id: Vec<i64> = combined
+            .iter()
+            .flat_map(|b| {
+                b.column_by_name("WatchID")
+                    .expect("WatchID column")
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64Array")
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+
+        let mut parts_watch_id: Vec<i64> = Vec::new();
+        for part in 0..PART_COUNT {
+            let batches = read_all(&dir.path().join(format!("hits_{part}.parquet")));
+            for batch in &batches {
+                parts_watch_id.extend(
+                    batch
+                        .column_by_name("WatchID")
+                        .expect("WatchID column")
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("Int64Array")
+                        .values(),
+                );
+            }
+        }
+
+        assert_eq!(combined_watch_id, parts_watch_id);
+        assert_eq!(combined_watch_id.len(), TOTAL_ROWS);
+    }
+
+    /// Two runs with the same seed produce byte-identical files: nothing in
+    /// generation reads wall-clock time, ambient randomness, or iteration
+    /// order over an unordered collection.
+    #[test]
+    fn same_seed_is_byte_identical() {
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+        write_hits(dir_a.path(), 42).expect("write_hits a");
+        write_hits(dir_b.path(), 42).expect("write_hits b");
+
+        for name in [
+            "hits_0.parquet",
+            "hits_1.parquet",
+            "hits_2.parquet",
+            "hits_3.parquet",
+            "hits.parquet",
+        ] {
+            let bytes_a = std::fs::read(dir_a.path().join(name)).expect("read a");
+            let bytes_b = std::fs::read(dir_b.path().join(name)).expect("read b");
+            assert_eq!(bytes_a, bytes_b, "{name} differs between same-seed runs");
+        }
+    }
+
+    /// A different seed changes the output: the generator is seed-sensitive,
+    /// not merely index-sensitive.
+    #[test]
+    fn different_seed_changes_output() {
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+        write_hits(dir_a.path(), 1).expect("write_hits a");
+        write_hits(dir_b.path(), 2).expect("write_hits b");
+
+        let bytes_a = std::fs::read(dir_a.path().join("hits.parquet")).expect("read a");
+        let bytes_b = std::fs::read(dir_b.path().join("hits.parquet")).expect("read b");
+        assert_ne!(bytes_a, bytes_b);
+    }
+
+    /// Q20's literal (`"UserID" = 435090932899640449`) is present, on row 0
+    /// as planted.
+    #[test]
+    fn q20_user_id_literal_is_planted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_hits(dir.path(), 7).expect("write_hits");
+        let combined = read_all(&dir.path().join("hits.parquet"));
+        let user_id = combined[0]
+            .column_by_name("UserID")
+            .expect("UserID column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64Array");
+        assert_eq!(user_id.value(0), Q20_USER_ID);
+    }
+
+    /// Q41's literal (`"RefererHash" = 3594120000172545465`) and its
+    /// co-occurring filters (`"CounterID" = 62`, `"EventDate"` in range,
+    /// `"IsRefresh" = 0`, `"TraficSourceID" IN (-1, 6)`) are all planted
+    /// together on row 2, so Q41 is non-empty against this fixture.
+    #[test]
+    fn q41_referer_hash_literal_is_planted_with_its_filters() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_hits(dir.path(), 7).expect("write_hits");
+        let combined = read_all(&dir.path().join("hits.parquet"));
+        let batch = &combined[0];
+        let col = |name: &str| {
+            batch
+                .column_by_name(name)
+                .unwrap_or_else(|| panic!("{name} column"))
+        };
+        assert_eq!(
+            col("RefererHash")
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64Array")
+                .value(2),
+            Q41_REFERER_HASH
+        );
+        assert_eq!(
+            col("CounterID")
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("Int32Array")
+                .value(2),
+            62
+        );
+        let event_date = col("EventDate")
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .expect("UInt16Array")
+            .value(2);
+        assert!((EVENT_DATE_MIN..=EVENT_DATE_MAX).contains(&event_date));
+        assert_eq!(
+            col("IsRefresh")
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .expect("Int16Array")
+                .value(2),
+            0
+        );
+        let trafic_source_id = col("TraficSourceID")
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .expect("Int16Array")
+            .value(2);
+        assert!(trafic_source_id == -1 || trafic_source_id == 6);
+    }
+
+    /// `EventDate` spans the full upstream range (`'2013-07-01'..'2013-07-31'`,
+    /// days 15887..15917): both endpoints occur somewhere in the fixture.
+    #[test]
+    fn event_date_spans_the_full_upstream_range() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_hits(dir.path(), 7).expect("write_hits");
+        let combined = read_all(&dir.path().join("hits.parquet"));
+        let values: HashSet<u16> = combined
+            .iter()
+            .flat_map(|b| {
+                b.column_by_name("EventDate")
+                    .expect("EventDate column")
+                    .as_any()
+                    .downcast_ref::<UInt16Array>()
+                    .expect("UInt16Array")
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert!(values.contains(&EVENT_DATE_MIN));
+        assert!(values.contains(&EVENT_DATE_MAX));
+        for v in &values {
+            assert!((EVENT_DATE_MIN..=EVENT_DATE_MAX).contains(v));
+        }
+    }
+
+    /// `SearchPhrase` carries exactly [`SEARCH_PHRASES`]`.len()` distinct
+    /// non-empty values, in as-equal-as-possible counts (every count within
+    /// 1 of every other), so Q6's `COUNT(DISTINCT "SearchPhrase")` and
+    /// Q13-19's grouping have a known, reproducible shape.
+    #[test]
+    fn search_phrase_pool_is_equal_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_hits(dir.path(), 7).expect("write_hits");
+        let combined = read_all(&dir.path().join("hits.parquet"));
+
+        let mut counts: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
+        for batch in &combined {
+            let col = batch
+                .column_by_name("SearchPhrase")
+                .expect("SearchPhrase column")
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .expect("BinaryArray");
+            for i in 0..col.len() {
+                let value = col.value(i).to_vec();
+                if !value.is_empty() {
+                    *counts.entry(value).or_insert(0) += 1;
+                }
+            }
+        }
+
+        assert_eq!(counts.len(), SEARCH_PHRASES.len());
+        let min = *counts.values().min().expect("at least one phrase");
+        let max = *counts.values().max().expect("at least one phrase");
+        assert!(max - min <= 1, "counts must be within 1 of each other: {counts:?}");
+    }
+
+    /// Q21-24's `"URL" LIKE '%google%'` and Q23's `"Title" LIKE '%Google%'`
+    /// each match at least one planted row.
+    #[test]
+    fn google_substrings_are_planted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_hits(dir.path(), 7).expect("write_hits");
+        let combined = read_all(&dir.path().join("hits.parquet"));
+
+        let mut url_has_google = false;
+        let mut title_has_google = false;
+        for batch in &combined {
+            let url = batch
+                .column_by_name("URL")
+                .expect("URL column")
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .expect("BinaryArray");
+            let title = batch
+                .column_by_name("Title")
+                .expect("Title column")
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .expect("BinaryArray");
+            for i in 0..url.len() {
+                if String::from_utf8_lossy(url.value(i)).contains("google") {
+                    url_has_google = true;
+                }
+                if String::from_utf8_lossy(title.value(i)).contains("Google") {
+                    title_has_google = true;
+                }
+            }
+        }
+        assert!(url_has_google, "no URL contains \"google\"");
+        assert!(title_has_google, "no Title contains \"Google\"");
+    }
+}
