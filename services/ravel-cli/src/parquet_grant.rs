@@ -14,8 +14,8 @@
 //!    kind. `s3://` needs an `s3` profile, `gs://` a `gcs` one, `az://` an
 //!    `azure` one. A profile of the wrong kind would reach a different service
 //!    with the same bucket name.
-//! 2. The granted location holds at least one non-empty `.parquet` object
-//!    inside it (the object itself, for a location naming one), found by
+//! 2. The granted location holds at least one non-empty object inside it,
+//!    whatever its suffix (the object itself, for a location naming one), found by
 //!    [`grants::one_object_under`], and [`probe_preconditions`] qualifies the
 //!    store on it. A store that serves a
 //!    read carrying an ETag it never issued cannot pin a Parquet file, so a
@@ -152,7 +152,7 @@ pub async fn add_grant(
         ProbeObject::Empty => anyhow::bail!(
             "the location {url:?} holds no object, so the store's preconditions could not be \
              probed on it: grant a location that already holds at least one non-empty \
-             .parquet object"
+             object"
         ),
         ProbeObject::PageCapReached => anyhow::bail!(
             "no object under the location {url:?} was found within the first \
