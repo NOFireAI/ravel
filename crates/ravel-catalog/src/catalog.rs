@@ -602,6 +602,11 @@ pub struct Catalog {
     /// inline on the calling task until a caller installs one with
     /// [`Catalog::with_read_gate`].
     read_gate: Option<Arc<ravel_cpu_gate::ReadGate>>,
+    /// The monotonic clock [`HeadCache`] measures entry ages on (ADR-1133,
+    /// clock-reading amendment). [`ravel_cpu_gate::InstantClock`] from
+    /// [`Catalog::new`]; tests inject their own with
+    /// [`Catalog::with_monotonic_clock`].
+    monotonic_clock: Arc<dyn ravel_cpu_gate::MonotonicClock>,
 }
 
 /// Adapts [`Catalog::guarded_get`] to the provisioning module's
@@ -780,7 +785,17 @@ impl Catalog {
             memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
             decode_reserve_retries: AtomicU64::new(0),
             read_gate: None,
+            monotonic_clock: Arc::new(ravel_cpu_gate::InstantClock::new()),
         })
+    }
+
+    /// Measure decoded-HEAD cache ages on `clock` instead of the default
+    /// [`ravel_cpu_gate::InstantClock`]. Install it before the catalog serves
+    /// a read: entries cached earlier carry stamps from the previous clock.
+    #[must_use]
+    pub fn with_monotonic_clock(mut self, clock: Arc<dyn ravel_cpu_gate::MonotonicClock>) -> Self {
+        self.monotonic_clock = clock;
+        self
     }
 
     /// Charge this catalog's decoded snapshot parts, postings and
@@ -1465,6 +1480,11 @@ impl Catalog {
     /// share the decoded-HEAD cache from its own `impl Catalog` block.
     pub(crate) fn head_cache(&self) -> &HeadCache {
         &self.head_cache
+    }
+
+    /// The clock [`HeadCache`] ages are measured on.
+    pub(crate) fn monotonic_clock(&self) -> &dyn ravel_cpu_gate::MonotonicClock {
+        self.monotonic_clock.as_ref()
     }
 
     /// `pub(crate)`: lets `snapshot_resolve` share the decoded-part cache.
@@ -2284,7 +2304,6 @@ impl Catalog {
                 .resolve_snapshot_window(
                     tenant,
                     signal,
-                    now_ns,
                     name_filter.is_some(),
                     // Range-scoped part fetch (ADR-0063): only parts whose hour
                     // range intersects this query window are fetched.
@@ -5916,7 +5935,7 @@ mod tests {
             Signal::Metrics,
             Arc::new(synthetic_head(idle)),
             1,
-            t0,
+            catalog.monotonic_clock().now_nanos(),
             8,
         );
         catalog.head_cache().insert(
@@ -5924,7 +5943,7 @@ mod tests {
             Signal::Metrics,
             Arc::new(synthetic_head(active)),
             1,
-            t0,
+            catalog.monotonic_clock().now_nanos(),
             8,
         );
 
@@ -5945,14 +5964,26 @@ mod tests {
         assert!(
             catalog
                 .head_cache()
-                .get(&active, Signal::Metrics, sweep_ns, i64::MAX, &acc)
+                .get(
+                    &active,
+                    Signal::Metrics,
+                    catalog.monotonic_clock(),
+                    i64::MAX,
+                    &acc
+                )
                 .is_some(),
             "the active tenant's cache entry survives the sweep"
         );
         assert!(
             catalog
                 .head_cache()
-                .get(&idle, Signal::Metrics, sweep_ns, i64::MAX, &acc)
+                .get(
+                    &idle,
+                    Signal::Metrics,
+                    catalog.monotonic_clock(),
+                    i64::MAX,
+                    &acc
+                )
                 .is_none(),
             "the idle tenant's cache entry is evicted"
         );

@@ -45,6 +45,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
+use ravel_cpu_gate::MonotonicClock;
 use ravel_proto::catalog::v1::SnapshotHead;
 use ravel_proto::commit::v1::{CommitRecord, CompactionRecord};
 use ravel_types::accounting::QueryAccounting;
@@ -526,7 +527,8 @@ impl CompactionRecordCache {
 struct HeadCacheEntry {
     head: Arc<SnapshotHead>,
     bytes: u64,
-    cached_at_ns: i64,
+    /// Monotonic reading taken at or before the GET that read `head`.
+    cached_at_mono_ns: u64,
 }
 
 /// State behind [`HeadCache`]'s single lock: the entry map plus its
@@ -538,27 +540,35 @@ struct HeadCacheState {
     order: std::collections::VecDeque<(TenantHash, Signal)>,
 }
 
-/// Decoded-HEAD cache, one entry per (tenant, signal), with a caller-checked
-/// TTL (`head_cache_ttl`, default 30s) and a
-/// capacity-cap bound on the number of (tenant, signal) pairs held at once. `now_ns` is always caller-supplied: this cache never reads
-/// a clock.
+/// Decoded-HEAD cache, one entry per (tenant, signal), with a TTL
+/// (`head_cache_ttl`, default 30s) and a capacity-cap bound on the number of
+/// (tenant, signal) pairs held at once.
+///
+/// An entry's age is measured on a monotonic clock, never the wall clock
+/// (ADR-1133, clock-reading amendment). The caller supplies the insert stamp,
+/// read at or before the HEAD GET was issued; [`HeadCache::get`] reads the
+/// clock it is handed at the comparison itself, so no earlier reading can
+/// under-measure an entry's age.
 #[derive(Default)]
 pub(crate) struct HeadCache {
     state: Mutex<HeadCacheState>,
 }
 
 impl HeadCache {
+    /// The entry for (tenant, signal) if its age on `clock`, read here, is at
+    /// most `ttl_ns` (inclusive).
     pub(crate) fn get(
         &self,
         tenant: &TenantHash,
         signal: Signal,
-        now_ns: i64,
+        clock: &dyn MonotonicClock,
         ttl_ns: i64,
         accounting: &QueryAccounting,
     ) -> Option<Arc<SnapshotHead>> {
         let state = self.state.lock();
         let fresh = state.entries.get(&(*tenant, signal)).and_then(|entry| {
-            if now_ns.saturating_sub(entry.cached_at_ns) <= ttl_ns {
+            let age_ns = clock.now_nanos().saturating_sub(entry.cached_at_mono_ns);
+            if i64::try_from(age_ns).is_ok_and(|age_ns| age_ns <= ttl_ns) {
                 Some((entry.head.clone(), entry.bytes))
             } else {
                 None
@@ -578,13 +588,16 @@ impl HeadCache {
         }
     }
 
+    /// Cache `head` for (tenant, signal). `stamp_mono_ns` is a reading of the
+    /// same monotonic clock later passed to [`HeadCache::get`], taken at or
+    /// before the GET that read `head` was issued.
     pub(crate) fn insert(
         &self,
         tenant: TenantHash,
         signal: Signal,
         head: Arc<SnapshotHead>,
         bytes: u64,
-        now_ns: i64,
+        stamp_mono_ns: u64,
         capacity: usize,
     ) {
         let mut state = self.state.lock();
@@ -597,7 +610,7 @@ impl HeadCache {
             HeadCacheEntry {
                 head,
                 bytes,
-                cached_at_ns: now_ns,
+                cached_at_mono_ns: stamp_mono_ns,
             },
         );
         while state.order.len() > capacity.max(1) {
@@ -1719,6 +1732,15 @@ mod tests {
         assert_eq!(at_floor.compaction_cache_max_bytes_per_tenant(), 9_000_000);
     }
 
+    /// A monotonic clock stopped at one reading.
+    struct MonoAt(u64);
+
+    impl MonotonicClock for MonoAt {
+        fn now_nanos(&self) -> u64 {
+            self.0
+        }
+    }
+
     fn head(tenant_hash: [u8; 16], watermark_hour: u32) -> SnapshotHead {
         SnapshotHead {
             format_version: 1,
@@ -1741,7 +1763,7 @@ mod tests {
         let accounting = QueryAccounting::new();
         assert!(
             cache
-                .get(&tenant, Signal::Metrics, 1_000, 500, &accounting)
+                .get(&tenant, Signal::Metrics, &MonoAt(1_000), 500, &accounting)
                 .is_none()
         );
         cache.insert(
@@ -1753,7 +1775,7 @@ mod tests {
             10,
         );
         let cached = cache
-            .get(&tenant, Signal::Metrics, 1_000, 500, &accounting)
+            .get(&tenant, Signal::Metrics, &MonoAt(1_000), 500, &accounting)
             .expect("hit");
         assert_eq!(cached.watermark_hour, 10);
 
@@ -1778,12 +1800,12 @@ mod tests {
         );
         assert!(
             cache
-                .get(&tenant, Signal::Metrics, 500, 500, &accounting)
+                .get(&tenant, Signal::Metrics, &MonoAt(500), 500, &accounting)
                 .is_some()
         );
         assert!(
             cache
-                .get(&tenant, Signal::Metrics, 501, 500, &accounting)
+                .get(&tenant, Signal::Metrics, &MonoAt(501), 500, &accounting)
                 .is_none()
         );
     }
@@ -1803,7 +1825,7 @@ mod tests {
         );
         assert!(
             cache
-                .get(&tenant, Signal::Logs, 0, 500, &accounting)
+                .get(&tenant, Signal::Logs, &MonoAt(0), 500, &accounting)
                 .is_none()
         );
     }
@@ -1831,7 +1853,7 @@ mod tests {
             let tenant = TenantHash([i; 16]);
             assert!(
                 cache
-                    .get(&tenant, Signal::Metrics, 0, 500, &accounting)
+                    .get(&tenant, Signal::Metrics, &MonoAt(0), 500, &accounting)
                     .is_none(),
                 "tenant {i} should have been evicted"
             );
@@ -1840,7 +1862,7 @@ mod tests {
             let tenant = TenantHash([i; 16]);
             assert!(
                 cache
-                    .get(&tenant, Signal::Metrics, 0, 500, &accounting)
+                    .get(&tenant, Signal::Metrics, &MonoAt(0), 500, &accounting)
                     .is_some(),
                 "tenant {i} should still be cached"
             );
