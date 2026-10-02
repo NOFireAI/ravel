@@ -1836,8 +1836,11 @@ fn validated_ingest_config(config: IngestConfig, signal: Signal) -> anyhow::Resu
 /// [`start_with_heartbeat`] spawns anything or makes a store request, each with
 /// its own typed error, so a refused start leaves no loop task running. The
 /// store-probe, admission-reconcile and scrub intervals and the fold-lag
-/// interval are refused in every mode, as `Cli::validate` refuses their flags
-/// in every mode. The fold, maintain, and
+/// interval are refused in every mode, as the command line refuses their flags
+/// in every mode: `Cli::validate` refuses `--fold-lag-interval-secs 0`, and
+/// `main` refuses the other three through `parse_store_probe_interval`,
+/// `parse_admission_reconcile_interval` and `parse_scrub_period`, which it
+/// calls whatever the mode. The fold, maintain, and
 /// alert-evaluation intervals are refused whether or not their loop is enabled,
 /// matching `Cli::validate`, which refuses the flags in every mode and enabled
 /// state: a disabled fold's interval still feeds the on-demand fold rate gate
@@ -5606,9 +5609,15 @@ mod loop_interval_startup_tests {
     /// The store-probe, admission-reconcile, scrub and fold-lag refusals
     /// come before [`start`] makes any store request. Every operation on the
     /// store fires a `Timeout` rule without reaching the backend, so an empty
-    /// counter snapshot means the store saw no request at all.
+    /// counter snapshot means the store saw no request at all. The `Mode::All`
+    /// and `Mode::Query` cases carry a deployment key, so a `start` that
+    /// validated after its initial durable-auth refresh would read `sys/auth`
+    /// first and leave a `Get` in the counters.
     ///
-    /// Flip to watch it fail: delete
+    /// Flip to watch it fail: move `validate_loop_intervals(&config)?;` in
+    /// `start_with_heartbeat` below the initial durable-auth refresh, and the
+    /// store-probe, admission-reconcile and fold-lag cases fail the counter
+    /// assertion. Or delete
     /// `query::check_fold_lag_interval(&config.query_budgets)?;` in
     /// `validate_loop_intervals`, the only place a zero fold-lag interval is
     /// refused, and the fold-lag case starts. The task-count test above is
@@ -5633,8 +5642,12 @@ mod loop_interval_startup_tests {
                 plan,
             ));
             let store: Arc<dyn ObjectStoreBackend> = faults.clone();
+            let mut config = zero_interval_config(which);
+            if matches!(config.mode, Mode::All | Mode::Query) {
+                config.deployment_key = Some(Box::new([7u8; 32]));
+            }
             let result = start(
-                zero_interval_config(which),
+                config,
                 store.clone(),
                 store,
                 Arc::new(StoreMetrics::default()),

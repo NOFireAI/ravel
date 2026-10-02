@@ -302,6 +302,30 @@ pub fn build_catalog_for_server(
     )
 }
 
+/// Why `start` refused `query_budgets.fold_lag_interval`. Nothing is spawned.
+#[derive(Debug, thiserror::Error)]
+pub enum FoldLagIntervalError {
+    /// `Some(Duration::ZERO)` names a fold that runs back to back, which no
+    /// maintain tier runs, so the fold-lag threshold it would set is
+    /// meaningless.
+    #[error(
+        "--fold-lag-interval-secs must be non-zero: a zero interval names a fold that runs back to back, which --fold-interval-secs refuses"
+    )]
+    ZeroFoldLagInterval,
+}
+
+/// Refuses a zero `query_budgets.fold_lag_interval`, the library-side match of
+/// the `Cli::validate` refusal of `--fold-lag-interval-secs 0`. `start` runs it
+/// before spawning anything; an unset interval passes.
+pub fn check_fold_lag_interval(
+    budgets: &crate::config::QueryBudgets,
+) -> Result<(), FoldLagIntervalError> {
+    if budgets.fold_lag_interval.is_some_and(|i| i.is_zero()) {
+        return Err(FoldLagIntervalError::ZeroFoldLagInterval);
+    }
+    Ok(())
+}
+
 /// The one place a `ServerConfig` and the catalog it built become the
 /// `EngineConfig` both query surfaces enforce (ADR-1306 follow-up task 5, and
 /// the `fold_interval` half the 2026-09-27 refusal-threshold amendment left
@@ -351,30 +375,6 @@ pub fn build_catalog_for_server(
 /// Fallible for the same reason [`crate::config::QueryBudgets::apply_to_engine`]
 /// is: a zero `--logs-max-fetch-run-bytes` is refused at startup rather than
 /// at a division inside the fetch layer.
-/// Why `start` refused `query_budgets.fold_lag_interval`. Nothing is spawned.
-#[derive(Debug, thiserror::Error)]
-pub enum FoldLagIntervalError {
-    /// `Some(Duration::ZERO)` names a fold that runs back to back, which no
-    /// maintain tier runs, so the fold-lag threshold it would set is
-    /// meaningless.
-    #[error(
-        "--fold-lag-interval-secs must be non-zero: a zero interval names a fold that runs back to back, which --fold-interval-secs refuses"
-    )]
-    ZeroFoldLagInterval,
-}
-
-/// Refuses a zero `query_budgets.fold_lag_interval`, the library-side match of
-/// the `Cli::validate` refusal of `--fold-lag-interval-secs 0`. `start` runs it
-/// before spawning anything; an unset interval passes.
-pub fn check_fold_lag_interval(
-    budgets: &crate::config::QueryBudgets,
-) -> Result<(), FoldLagIntervalError> {
-    if budgets.fold_lag_interval.is_some_and(|i| i.is_zero()) {
-        return Err(FoldLagIntervalError::ZeroFoldLagInterval);
-    }
-    Ok(())
-}
-
 pub fn build_engine_config(
     config: &ServerConfig,
     catalog_config: &CatalogConfig,
@@ -1652,6 +1652,20 @@ mod catalog_cache_tests {
             engine_unset.fold_interval,
             crate::fold::DEFAULT_FOLD_INTERVAL
         );
+    }
+
+    /// Only zero is refused: the smallest non-zero interval passes, since the
+    /// command line accepts sub-millisecond values such as `500us`.
+    ///
+    /// Flip to watch it fail: change `i.is_zero()` in [`check_fold_lag_interval`] to
+    /// `i < Duration::from_millis(1)`.
+    #[test]
+    fn check_fold_lag_interval_accepts_the_smallest_nonzero_interval() {
+        let budgets = crate::config::QueryBudgets {
+            fold_lag_interval: Some(Duration::from_nanos(1)),
+            ..crate::config::QueryBudgets::default()
+        };
+        check_fold_lag_interval(&budgets).expect("a 1 ns interval passes");
     }
 
     /// A zero fold-lag interval is refused with the typed error naming the
