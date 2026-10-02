@@ -363,7 +363,7 @@ pub async fn compact_with_part_split_targets(
     claims: &ClaimOptions,
 ) -> anyhow::Result<()> {
     let mut out = std::io::stdout();
-    compact_to(
+    compact_with_part_split_targets_to(
         &mut out,
         store,
         selection,
@@ -376,8 +376,47 @@ pub async fn compact_with_part_split_targets(
         l1_part_memory_target_bytes,
         max_l1_part_bytes,
         rlog_zstd_level,
-        ravel_maintain::detect_host_memory_total_bytes(),
         wall_clock()?,
+        claims,
+    )
+    .await
+}
+
+/// [`compact_with_part_split_targets`] with the report written to `out` and
+/// the bucket evaluated at `clock`. This is where the host's memory is
+/// detected and handed to [`compact_to`], so a test reaches that hand-off.
+#[allow(clippy::too_many_arguments)]
+pub async fn compact_with_part_split_targets_to(
+    out: &mut dyn Write,
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    signal: SignalArg,
+    shard: u32,
+    hour: u32,
+    dry_run: bool,
+    max_flush_lifetime_ns: Option<i64>,
+    l1_part_memory_target_bytes: Option<u64>,
+    max_l1_part_bytes: Option<u64>,
+    rlog_zstd_level: Option<i32>,
+    clock: FixedClock,
+    claims: &ClaimOptions,
+) -> anyhow::Result<()> {
+    compact_to(
+        out,
+        store,
+        selection,
+        tenant,
+        signal,
+        shard,
+        hour,
+        dry_run,
+        max_flush_lifetime_ns,
+        l1_part_memory_target_bytes,
+        max_l1_part_bytes,
+        rlog_zstd_level,
+        ravel_maintain::detect_host_memory_total_bytes(),
+        clock,
         claims,
     )
     .await
@@ -756,8 +795,53 @@ pub async fn compact_tenant(
     claims: &ClaimOptions,
 ) -> anyhow::Result<CompactTenantReport> {
     let mut out = std::io::stdout();
-    compact_tenant_to(
+    compact_tenant_on_detected_memory(
         &mut out,
+        store,
+        selection,
+        tenant,
+        signal,
+        shards,
+        from_hour,
+        to_hour,
+        dry_run,
+        max_flush_lifetime_ns,
+        l1_part_memory_target_bytes,
+        max_l1_part_bytes,
+        input_read_concurrency,
+        bucket_concurrency,
+        rlog_zstd_level,
+        now_ns,
+        claims,
+    )
+    .await
+}
+
+/// [`compact_tenant`] with the report written to `out`. This is where the
+/// host's memory is detected and handed to [`compact_tenant_to`], so a test
+/// reaches that hand-off.
+#[allow(clippy::too_many_arguments)]
+pub async fn compact_tenant_on_detected_memory(
+    out: &mut dyn Write,
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    signal: SignalArg,
+    shards: Option<u32>,
+    from_hour: Option<u32>,
+    to_hour: Option<u32>,
+    dry_run: bool,
+    max_flush_lifetime_ns: Option<i64>,
+    l1_part_memory_target_bytes: Option<u64>,
+    max_l1_part_bytes: Option<u64>,
+    input_read_concurrency: Option<usize>,
+    bucket_concurrency: usize,
+    rlog_zstd_level: Option<i32>,
+    now_ns: i64,
+    claims: &ClaimOptions,
+) -> anyhow::Result<CompactTenantReport> {
+    compact_tenant_to(
+        out,
         store,
         selection,
         tenant,

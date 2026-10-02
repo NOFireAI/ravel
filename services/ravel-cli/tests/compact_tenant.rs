@@ -19,7 +19,8 @@ use bytes::Bytes;
 use prost::Message;
 use ravel_cli::maintain::{
     ClaimOptions, CompactTenantError, CompactTenantReport, SignalArg, compact_tenant,
-    compact_tenant_to, compact_to, per_bucket_config,
+    compact_tenant_on_detected_memory, compact_tenant_to, compact_to,
+    compact_with_part_split_targets_to, per_bucket_config,
 };
 use ravel_cli::store::{DefaultedMemoryEmptyWalk, StoreKind, StoreSelection};
 use ravel_commit::keys;
@@ -2296,25 +2297,114 @@ async fn report_names_the_resolved_l1_part_memory_target() {
     }
 }
 
-/// Smoke test of the production path: `compact_tenant` hands
-/// `compact_tenant_to` this host's detected memory. Whatever the host, the
-/// reported target is inside the clamp, and it is the 256 MiB fallback only
-/// when the host memory cannot be read.
-#[tokio::test]
-async fn report_on_the_detected_host_memory_is_inside_the_clamp() {
-    let detected = ravel_maintain::detect_host_memory_total_bytes();
-    let text = compact_tenant_report(None, detected).await;
+/// The `l1_part_memory_target_bytes:` line of a report produced by the
+/// functions that detect the host's memory themselves, checked against what
+/// `detect_host_memory_total_bytes` returns on this host over `merges`
+/// concurrent merges: the derived value inside the 256 MiB to 8 GiB clamp,
+/// naming the detected memory as its budget, with no fallback note; or, when
+/// the host memory cannot be read, exactly the fallback line.
+fn assert_target_line_follows_detected_memory(text: &str, merges: u64) {
     let line = text
         .lines()
         .find(|l| l.starts_with("l1_part_memory_target_bytes: "))
         .unwrap_or_else(|| panic!("no target line in {text}"));
-    let bytes: u64 = line["l1_part_memory_target_bytes: ".len()..]
-        .split(' ')
-        .next()
-        .and_then(|n| n.parse().ok())
-        .unwrap_or_else(|| panic!("unparsable target line {line:?}"));
-    assert!((256 * 1024 * 1024..=8 * GIB).contains(&bytes), "{line}");
-    assert_eq!(line.contains("(fallback:"), detected.is_none(), "{line}");
+    match ravel_maintain::detect_host_memory_total_bytes() {
+        Some(detected) => {
+            let bytes: u64 = line["l1_part_memory_target_bytes: ".len()..]
+                .split(' ')
+                .next()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("unparsable target line {line:?}"));
+            assert!((256 * 1024 * 1024..=8 * GIB).contains(&bytes), "{line}");
+            assert!(!line.contains("(fallback:"), "{line}");
+            let plural = if merges == 1 { "" } else { "s" };
+            let want = format!(
+                "l1_part_memory_target_bytes: {} (resolved from a memory budget of {detected} \
+                 over {merges} concurrent merge{plural})",
+                ravel_maintain::derive_l1_part_memory_target_bytes(
+                    detected,
+                    usize::try_from(merges).expect("merges fits usize"),
+                ),
+            );
+            assert_eq!(line, want);
+        }
+        None => assert_eq!(
+            line,
+            "l1_part_memory_target_bytes: 268435456 (fallback: the memory budget is unknown)"
+        ),
+    }
+}
+
+/// `compact_tenant` hands the detected host memory to the walk (issue #2351).
+/// The test drives `compact_tenant_on_detected_memory`, the function
+/// `compact_tenant` delegates to, against a tenant in a memory store, and
+/// reads the report it writes. The executor host has readable memory, so the
+/// `Some` branch is the one a run here exercises; the `None` branch asserts
+/// the fallback line.
+///
+/// Distinguishing:
+/// - The hand-off passing `None` instead of the detected memory: the report
+///   carries the fallback note and the 256 MiB fallback, not the derived line.
+/// - The hand-off passing a fixed 256 MiB instead of the detected memory: the
+///   report's budget is 268435456, not the detected figure.
+#[tokio::test]
+async fn compact_tenant_hands_the_detected_host_memory_to_the_walk() {
+    let store = seed_tenant().await;
+    let mut out: Vec<u8> = Vec::new();
+    compact_tenant_on_detected_memory(
+        &mut out,
+        store,
+        MEMORY,
+        TENANT,
+        SignalArg::Logs,
+        Some(SHARDS),
+        None,
+        None,
+        true,
+        None,
+        None,
+        None,
+        None,
+        2,
+        None,
+        now_ns(),
+        &ClaimOptions::fresh(),
+    )
+    .await
+    .expect("dry-run compact-tenant runs");
+    let text = String::from_utf8(out).expect("utf-8");
+    assert_target_line_follows_detected_memory(&text, 2);
+}
+
+/// The same hand-off for `compact-bucket`: `compact_with_part_split_targets_to`,
+/// which `compact_with_part_split_targets` delegates to, derives over one
+/// merge from the detected host memory.
+///
+/// Distinguishing: as for `compact_tenant_hands_the_detected_host_memory_to_the_walk`.
+#[tokio::test]
+async fn compact_bucket_hands_the_detected_host_memory_to_the_run() {
+    let store = seed_tenant().await;
+    let mut out: Vec<u8> = Vec::new();
+    compact_with_part_split_targets_to(
+        &mut out,
+        store,
+        MEMORY,
+        TENANT,
+        SignalArg::Logs,
+        0,
+        HOUR_OLD,
+        true,
+        None,
+        None,
+        None,
+        None,
+        FixedClock::new(now_ns()),
+        &ClaimOptions::fresh(),
+    )
+    .await
+    .expect("dry-run compact-bucket runs");
+    let text = String::from_utf8(out).expect("utf-8");
+    assert_target_line_follows_detected_memory(&text, 1);
 }
 
 /// `compact-bucket` takes `--l1-part-memory-target-bytes` and
