@@ -49,7 +49,10 @@
         "arn:aws:s3:::my-ravel-bucket/sys/tenancy",
         "arn:aws:s3:::my-ravel-bucket/sys/maintain/*",
         "arn:aws:s3:::my-ravel-bucket/quarantine/t/*/*/l0/*",
-        "arn:aws:s3:::my-ravel-bucket/t/*/enc"
+        "arn:aws:s3:::my-ravel-bucket/t/*/enc",
+        "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/snap/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/idx/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/HEAD"
       ]
     },
     {
