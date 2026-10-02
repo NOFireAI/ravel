@@ -197,39 +197,38 @@ impl PinnedParquetReader {
         // this reservation, the overlap ADR-1170 decision 2 marks.
         let cached = self.services.cache.is_some();
 
-        let hit = match &self.services.cache {
-            Some(ReadCache::Ram(cache)) => cache.get(&key),
-            Some(ReadCache::Tiered(cache)) => cache.get_off_worker(key).await,
-            None => None,
-        };
-        if let Some(bytes) = hit {
-            accounting.record_cache_hit();
-            accounting.add_cache_bytes(bytes.len() as u64);
-            reservation.mark_handed_off();
-            return Ok(attach(bytes, reservation));
-        }
-
-        self.limits.precheck(&self.accounting, len)?;
-        // A follower whose own budget was never consulted (the leader's
-        // closure never ran for it) gets one retry, under its own budget,
-        // before it gives up; a leader's own refusal (its `refused` slot
-        // populated) never retries. Bounded at exactly one extra attempt.
-        let mut attempts_left = 2u8;
+        // A caller whose own closure never ran, because it followed a flight
+        // whose leader was refused by ITS budget, tries again under its own.
+        // Each attempt peeks the cache first, so a range another query cached
+        // meanwhile is served from cache and the tiered cache's "the caller
+        // already saw a miss" precondition holds. The cap is 3 because the
+        // refused flight stays joinable briefly after its leader publishes the
+        // refusal, so a first retry can follow the same flight; once the
+        // leader clears its slot the next attempt leads or follows a newer one.
+        const MAX_ATTEMPTS: usize = 3;
+        let mut attempt = 1;
         let (fetched, refused) = loop {
+            if let Some(bytes) = self.peek(key).await {
+                accounting.record_cache_hit();
+                accounting.add_cache_bytes(bytes.len() as u64);
+                reservation.mark_handed_off();
+                return Ok(attach(bytes, reservation));
+            }
+            if attempt == 1 {
+                self.limits.precheck(&self.accounting, len)?;
+            }
             let (fetched, refused) = self.fetch_once(key, phase, range.start, range.end).await;
-            attempts_left -= 1;
-            let is_unconsulted_follower = attempts_left > 0
-                && matches!(
-                    fetched,
-                    Err(SingleFlightError::Upstream(
-                        CacheFetchError::BudgetRefused { .. }
-                    ))
-                )
-                && refused
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .is_none();
-            if is_unconsulted_follower {
+            let followed_a_refusal = matches!(
+                fetched,
+                Err(SingleFlightError::Upstream(
+                    CacheFetchError::BudgetRefused { .. }
+                ))
+            ) && refused
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_none();
+            if followed_a_refusal && attempt < MAX_ATTEMPTS {
+                attempt += 1;
                 continue;
             }
             break (fetched, refused);
@@ -259,15 +258,25 @@ impl PinnedParquetReader {
         Ok(attach(bytes, reservation))
     }
 
+    /// Consult the read cache for `key` without fetching: both tiers of a
+    /// tiered cache, the RAM cache otherwise, nothing without a cache.
+    async fn peek(&self, key: CacheKey) -> Option<Bytes> {
+        match &self.services.cache {
+            Some(ReadCache::Ram(cache)) => cache.get(&key),
+            Some(ReadCache::Tiered(cache)) => cache.get_off_worker(key).await,
+            None => None,
+        }
+    }
+
     /// One attempt at resolving `key` through the read cache's single flight:
     /// a cache miss runs the fetch closure (if this caller becomes the
     /// flight's leader) or waits on whoever is already running it (if this
     /// caller joins as a follower). The returned `Arc` holds this attempt's
     /// own [`ParquetReadError`] if THIS caller's closure invocation refused
-    /// the read against its budget -- never set for a follower, whose closure
-    /// never ran. [`Self::read_reserved`] uses that distinction to retry a
-    /// follower exactly once under its own budget rather than return it
-    /// another caller's refusal.
+    /// the read against its budget; it stays empty for a follower, whose
+    /// closure never ran. [`Self::read_reserved`] uses that distinction to
+    /// retry a follower under its own budget rather than return it another
+    /// caller's refusal.
     async fn fetch_once(
         &self,
         key: CacheKey,
@@ -353,10 +362,10 @@ impl PinnedParquetReader {
             SingleFlightError::Upstream(CacheFetchError::Corrupt { message, .. }) => {
                 ParquetReadError::Corrupt { key, message }
             }
-            // Reached only when a follower's own retry (`read_reserved`) was
-            // also refused as a follower: the retry is bounded at exactly
-            // one, so a second unconsulted refusal is reported the same shape
-            // a store error would be, rather than retried again.
+            // Reached only when every attempt `read_reserved` makes followed
+            // a refused flight: the attempts are capped, so the last
+            // unconsulted refusal is reported the same shape a store error
+            // would be, rather than retried again.
             SingleFlightError::Upstream(CacheFetchError::BudgetRefused { message, .. }) => {
                 ParquetReadError::Store {
                     key,
@@ -2478,26 +2487,26 @@ mod tests {
         );
     }
 
-    /// A follower's retry is bounded at exactly one: if that retry also
-    /// joins another refused leader's flight (still a follower, its own
-    /// budget never consulted either time), it reports the shape a store
-    /// error takes rather than retrying forever.
+    /// A follower's attempts are capped at `MAX_ATTEMPTS` (3): if every
+    /// attempt joins a refused leader's flight (its own budget never
+    /// consulted), it reports the shape a store error takes rather than
+    /// retrying forever.
     ///
-    /// Three readers share one key: A leads the first flight and is refused
-    /// on its own admit (as above); B is the follower under test; C leads a
-    /// second flight that B's retry joins, refused on ITS OWN admit the same
-    /// way. B's own budget is left untouched throughout, so a correctly
-    /// bounded retry ends in an error with no GET ever issued; an unbounded
-    /// retry would instead find no third flight to join, lead one itself,
-    /// admit clean against its own untouched budget, and actually complete
-    /// the read.
+    /// Four readers share one key: A, C and D each lead one flight in turn
+    /// and are refused on their own admit (as above); B is the follower under
+    /// test, and each of its three attempts joins one of those flights. B's
+    /// own budget is left untouched throughout, so the capped read ends in an
+    /// error with no GET ever issued and B's budget never consulted; a cap of
+    /// 4 or more would instead make B lead a fourth attempt, admit clean
+    /// against its own untouched budget, and complete the read.
     ///
-    /// FLIP: dropping the `attempts_left > 0` bound (retrying on every
-    /// unconsulted-follower refusal, however many) makes B's `read_range`
-    /// resolve `Ok` with one real GET recorded, instead of the bounded
-    /// implementation's single error with none.
+    /// FLIP: raising `MAX_ATTEMPTS` to 4 (or removing the `attempt <
+    /// MAX_ATTEMPTS` bound) makes B's `read_range` resolve `Ok` with one real
+    /// GET recorded and one request on B's accounting, instead of the single
+    /// `Store` error with none. A cap of 2 fails
+    /// `a_follower_whose_retry_follows_a_refused_flight_is_attempted_again`.
     #[tokio::test]
-    async fn a_follower_retries_once_and_then_reports_its_refusal() {
+    async fn a_follower_reports_its_refusal_once_every_attempt_follows_a_refused_flight() {
         let store = Arc::new(MemoryStore::new());
         let recording = Arc::new(RecordingStore::new(Arc::clone(&store), false));
         let fixture = Fixture::new(Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>);
@@ -2535,11 +2544,12 @@ mod tests {
             a_limits.clone(),
         );
 
+        let b_accounting = PhaseAccounting::new();
         let b = PinnedParquetReader::new(
             TENANT,
             Arc::clone(&pinned),
             services.clone(),
-            PhaseAccounting::new(),
+            b_accounting.clone(),
             ReadLimits::unlimited(),
         );
 
@@ -2555,6 +2565,20 @@ mod tests {
             services.clone(),
             c_accounting.clone(),
             c_limits.clone(),
+        );
+
+        let d_limits = ReadLimits::new(
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
+            ByteLimit::Unlimited,
+            RequestLimit::Bounded(1),
+        );
+        let d_accounting = PhaseAccounting::new();
+        let d = PinnedParquetReader::new(
+            TENANT,
+            Arc::clone(&pinned),
+            services.clone(),
+            d_accounting.clone(),
+            d_limits.clone(),
         );
 
         // Flight 1: A leads, parked on the held permit.
@@ -2630,16 +2654,333 @@ mod tests {
             "{c_err:?}"
         );
 
+        // Flight 3: D leads before B is polled again, so B's second retry
+        // (its third and last attempt) joins D's flight.
+        let permit = limiter.acquire().await.expect("semaphore is never closed");
+        let mut d_fut = Box::pin(d.read_range(0..4, QueryPhase::Scan));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(std::future::Future::poll(d_fut.as_mut(), cx)))
+                .await
+                .is_pending(),
+            "D parks on the held permit, leading the third flight"
+        );
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(std::future::Future::poll(b_fut.as_mut(), cx)))
+                .await
+                .is_pending(),
+            "B's second retry joins D's flight as a follower once more"
+        );
+        d_limits
+            .admit(&d_accounting, QueryPhase::Scan, 1)
+            .expect("D's first admission fits its bounded-1 budget")
+            .complete(&d_accounting, QueryPhase::Scan, 1);
+        drop(permit);
+        let d_err = d_fut.await.expect_err("D's own admit is now refused");
+        assert!(
+            matches!(
+                d_err,
+                ParquetReadError::RequestBudgetExceeded {
+                    requests: 2,
+                    max: 1
+                }
+            ),
+            "{d_err:?}"
+        );
+
         let b_err = b_fut.await.expect_err(
-            "B's retry is bounded at one: a second unconsulted refusal is \
+            "B's third attempt is its last: the unconsulted refusal is \
              reported, not retried again",
         );
         assert!(matches!(b_err, ParquetReadError::Store { .. }), "{b_err:?}");
         assert!(
             recording.ranges().is_empty(),
-            "neither flight, nor an unbounded third attempt under B's own \
-             untouched budget, ever issued a GET"
+            "no flight, nor a fourth attempt under B's own untouched budget, \
+             ever issued a GET"
         );
+        assert_eq!(
+            b_accounting
+                .snapshot()
+                .phase(QueryPhase::Scan)
+                .s3_requests(AccountedOp::Get),
+            0,
+            "B's own budget was never consulted: it never led an attempt"
+        );
+    }
+
+    /// Readers over one file, one cache and one one-permit `GetLimiter`, so a
+    /// test holds the permit to park a leader's closure and drives the
+    /// single-flight interleavings by hand.
+    struct RefusalRig {
+        recording: Arc<RecordingStore>,
+        pinned: Arc<PinnedFile>,
+        services: ReadServices,
+    }
+
+    /// A leader whose budget allows one request, parked in its closure.
+    struct Leader {
+        fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<Bytes, ParquetReadError>>>>,
+        limits: ReadLimits,
+        accounting: PhaseAccounting,
+    }
+
+    impl RefusalRig {
+        async fn build(
+            fixture: Fixture,
+            store: &Arc<MemoryStore>,
+            recording: Arc<RecordingStore>,
+        ) -> Self {
+            let file = fixture
+                .put_file(
+                    store,
+                    "lake/t/a.parquet",
+                    parquet_bytes(&[1, 2, 3], &["one", "two", "tre"]),
+                    false,
+                )
+                .await;
+            let pinned = Arc::new(PinnedFile {
+                file,
+                store: Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>,
+            });
+            let base = fixture.services();
+            let services = ReadServices {
+                limiter: Arc::new(GetLimiter::new(1).expect("1 permit is valid")),
+                cache: base.cache.clone(),
+                metadata: Arc::clone(&base.metadata),
+            };
+            RefusalRig {
+                recording,
+                pinned,
+                services,
+            }
+        }
+
+        async fn ram() -> Self {
+            let store = Arc::new(MemoryStore::new());
+            let recording = Arc::new(RecordingStore::new(Arc::clone(&store), false));
+            let fixture = Fixture::new(Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>);
+            Self::build(fixture, &store, recording).await
+        }
+
+        async fn tiered(dir: &std::path::Path) -> Self {
+            let store = Arc::new(MemoryStore::new());
+            let recording = Arc::new(RecordingStore::new(Arc::clone(&store), false));
+            let fixture =
+                Fixture::new_tiered(Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>, dir);
+            Self::build(fixture, &store, recording).await
+        }
+
+        fn reader(&self, limits: ReadLimits, accounting: &PhaseAccounting) -> PinnedParquetReader {
+            PinnedParquetReader::new(
+                TENANT,
+                Arc::clone(&self.pinned),
+                self.services.clone(),
+                accounting.clone(),
+                limits,
+            )
+        }
+
+        fn bounded_one() -> ReadLimits {
+            ReadLimits::new(
+                Arc::new(ravel_memory::MemoryBudget::unlimited()),
+                ByteLimit::Unlimited,
+                RequestLimit::Bounded(1),
+            )
+        }
+
+        fn tiered_cache(&self) -> &ravel_cache::TieredCache<CacheFetchError> {
+            let Some(ReadCache::Tiered(tiered)) = &self.services.cache else {
+                panic!("rig built with a Tiered cache");
+            };
+            tiered
+        }
+
+        /// Start a leader for bytes 0..4 and drive it until `parked` holds.
+        async fn leader_until(&self, parked: impl Fn() -> bool) -> Leader {
+            let limits = Self::bounded_one();
+            let accounting = PhaseAccounting::new();
+            let reader = self.reader(limits.clone(), &accounting);
+            let mut fut: std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<Bytes, ParquetReadError>>>,
+            > = Box::pin(async move { reader.read_range(0..4, QueryPhase::Scan).await });
+            drive_until(&mut fut, parked).await;
+            Leader {
+                fut,
+                limits,
+                accounting,
+            }
+        }
+    }
+
+    impl Leader {
+        /// Spend the leader's one request elsewhere, release the permit it is
+        /// parked on, and check its closure's own admit refused it.
+        async fn refuse<P>(self, permit: P) {
+            self.limits
+                .admit(&self.accounting, QueryPhase::Scan, 1)
+                .expect("the first admission fits the bounded-1 budget")
+                .complete(&self.accounting, QueryPhase::Scan, 1);
+            drop(permit);
+            let err = self.fut.await.expect_err("the leader's own admit refuses");
+            assert!(
+                matches!(
+                    err,
+                    ParquetReadError::RequestBudgetExceeded {
+                        requests: 2,
+                        max: 1
+                    }
+                ),
+                "{err:?}"
+            );
+        }
+    }
+
+    /// Poll `fut` until it has been pending and `parked` holds. A disk peek
+    /// finishes on another thread, so a Tiered caller may need several polls
+    /// to reach the flight; the timeout only turns a hang into a failure.
+    async fn drive_until<F>(fut: &mut std::pin::Pin<Box<F>>, parked: impl Fn() -> bool)
+    where
+        F: std::future::Future + ?Sized,
+    {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                let polled = std::future::poll_fn(|cx| {
+                    Poll::Ready(std::future::Future::poll(fut.as_mut(), cx))
+                })
+                .await;
+                assert!(polled.is_pending(), "the caller parks, it does not finish");
+                if parked() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the caller reaches the state the test parks it in");
+    }
+
+    /// A retry can join the very flight that just refused (the leader
+    /// publishes its result before it clears its slot), and that flight's
+    /// stored refusal must not use up the follower's last attempt. The single
+    /// flight is private to the cache and cannot be held between publishing
+    /// and clearing from here, so this drives the state the reader sees: B's
+    /// first retry follows a second refused flight, and B must still get a
+    /// further attempt under its own budget.
+    ///
+    /// A leads flight 1 and is refused; B follows it, retries, and follows
+    /// C's flight 2, which is refused too; B's third attempt leads, admits
+    /// under B's own unlimited budget, and issues the one GET. B's accounting
+    /// holds one cache miss for the one logical read, not one per attempt.
+    ///
+    /// FLIP: capping the attempts at 2 (`MAX_ATTEMPTS = 2`, the earlier
+    /// one-retry shape) ends B in `ParquetReadError::Store` with no GET.
+    /// Counting a cache miss per attempt reads 3 misses instead of 1.
+    #[tokio::test]
+    async fn a_follower_whose_retry_follows_a_refused_flight_is_attempted_again() {
+        let rig = RefusalRig::ram().await;
+        let b_accounting = PhaseAccounting::new();
+        let b = rig.reader(ReadLimits::unlimited(), &b_accounting);
+
+        let permit = rig.services.limiter.acquire().await.expect("open");
+        let a = rig.leader_until(|| true).await;
+        let mut b_fut = Box::pin(b.read_range(0..4, QueryPhase::Scan));
+        drive_until(&mut b_fut, || true).await;
+        a.refuse(permit).await;
+
+        let permit = rig.services.limiter.acquire().await.expect("open");
+        let c = rig.leader_until(|| true).await;
+        drive_until(&mut b_fut, || true).await;
+        c.refuse(permit).await;
+
+        let bytes = b_fut
+            .await
+            .expect("B's third attempt leads under its own budget");
+        assert_eq!(&bytes[..], b"PAR1", "the file's first 4 bytes");
+        assert_eq!(rig.recording.ranges().len(), 1, "one GET: B's own");
+        let scan = b_accounting.snapshot();
+        let scan = scan.phase(QueryPhase::Scan);
+        assert_eq!(scan.cache_misses, 1, "one miss per read, not per attempt");
+        assert_eq!(scan.cache_hits, 0);
+    }
+
+    /// A follower whose retry leads and is refused by its OWN budget returns
+    /// that typed budget error, not the store-shaped follower error.
+    ///
+    /// A leads and is refused; B follows with a one-request budget. B's retry
+    /// leads and parks on the permit; B's budget is then spent elsewhere, so
+    /// its own closure's admit refuses it.
+    ///
+    /// FLIP: removing the `refused.take()` early return in `read_reserved`, so
+    /// the mapped fetch error is reported instead of the retry's own typed
+    /// error, yields `ParquetReadError::Store` instead of
+    /// `RequestBudgetExceeded { requests: 2, max: 1 }`.
+    #[tokio::test]
+    async fn a_follower_that_leads_its_retry_returns_its_own_budget_error() {
+        let rig = RefusalRig::ram().await;
+        let b_limits = RefusalRig::bounded_one();
+        let b_accounting = PhaseAccounting::new();
+        let b = rig.reader(b_limits.clone(), &b_accounting);
+
+        let permit = rig.services.limiter.acquire().await.expect("open");
+        let a = rig.leader_until(|| true).await;
+        let mut b_fut = Box::pin(b.read_range(0..4, QueryPhase::Scan));
+        drive_until(&mut b_fut, || true).await;
+        a.refuse(permit).await;
+
+        let permit = rig.services.limiter.acquire().await.expect("open");
+        drive_until(&mut b_fut, || true).await;
+        b_limits
+            .admit(&b_accounting, QueryPhase::Scan, 1)
+            .expect("the first admission fits the bounded-1 budget")
+            .complete(&b_accounting, QueryPhase::Scan, 1);
+        drop(permit);
+
+        let err = b_fut.await.expect_err("B's own admit refuses its retry");
+        assert!(
+            matches!(
+                err,
+                ParquetReadError::RequestBudgetExceeded {
+                    requests: 2,
+                    max: 1
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(rig.recording.ranges().is_empty());
+    }
+
+    /// Each retry peeks the cache again: a range another query put in the
+    /// disk tier while the follower waited is served from cache, with no GET.
+    ///
+    /// A leads and parks; B peeks, misses and follows. The bytes land in the
+    /// disk tier only, then A is refused. `resolve_peeked_miss` never
+    /// consults the disk tier, so only a re-peek can find them.
+    ///
+    /// FLIP: retrying straight into `fetch_once` without the peek makes B
+    /// lead, find nothing in the RAM recheck and issue a GET: the bytes read
+    /// are `PAR1` and the recording holds one range.
+    #[tokio::test]
+    async fn a_retry_re_peeks_the_cache_and_is_served_without_a_get() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rig = RefusalRig::tiered(dir.path()).await;
+        let tiered = rig.tiered_cache();
+        let b_accounting = PhaseAccounting::new();
+        let b = rig.reader(ReadLimits::unlimited(), &b_accounting);
+        let key = b.cache_key(0, 4);
+
+        let permit = rig.services.limiter.acquire().await.expect("open");
+        let a = rig.leader_until(|| tiered.is_in_flight(&key)).await;
+        let mut b_fut = Box::pin(b.read_range(0..4, QueryPhase::Scan));
+        drive_until(&mut b_fut, || tiered.in_flight_waiters(&key) == 1).await;
+
+        tiered.disk_for_test().insert(key, b"efgh");
+        a.refuse(permit).await;
+
+        let bytes = b_fut.await.expect("B's retry is served from the disk tier");
+        assert_eq!(&bytes[..], b"efgh", "the bytes another query cached");
+        assert!(rig.recording.ranges().is_empty(), "no GET for the retry");
+        let scan = b_accounting.snapshot();
+        let scan = scan.phase(QueryPhase::Scan);
+        assert_eq!((scan.cache_hits, scan.cache_misses), (1, 0));
     }
 
     /// A range whose body would take the wire bytes past `max_bytes_scanned`
