@@ -24,6 +24,7 @@ use ravel_query::{QueryAdmissionController, reconcile_query_admission_once};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+use crate::admission_reconcile::{SpawnError, check_spawnable};
 use crate::fold::jittered;
 
 /// Handle to the spawned reconciliation task, so shutdown can stop it cleanly
@@ -56,12 +57,15 @@ impl QueryAdmissionReconcileTask {
 /// `R`. Returns immediately; the task runs until
 /// [`QueryAdmissionReconcileTask::shutdown`]. The first cycle sleeps a full
 /// (jittered) interval before its first write/read, so a fleet of replicas
-/// started together do not reconcile in lockstep.
+/// started together do not reconcile in lockstep. A zero `interval` is refused
+/// with [`SpawnError::ZeroReconcileInterval`], the same refusal the ingest
+/// reconciliation applies to the same `--admission-reconcile-interval`.
 pub fn spawn(
     controller: Arc<QueryAdmissionController>,
     store: Arc<dyn ObjectStoreBackend>,
     interval: Duration,
-) -> QueryAdmissionReconcileTask {
+) -> Result<QueryAdmissionReconcileTask, SpawnError> {
+    check_spawnable(interval)?;
     let (tx, mut rx) = oneshot::channel();
     // Production OS-entropy jitter (ADR-0068 decision 2), the same default the
     // fold and maintenance loops use; the harness does not drive this loop.
@@ -77,8 +81,46 @@ pub fn spawn(
                 .await;
         }
     });
-    QueryAdmissionReconcileTask {
+    Ok(QueryAdmissionReconcileTask {
         shutdown: Some(tx),
         handle: Some(handle),
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_query::QueryConcurrencyLimit;
+
+    use super::*;
+
+    /// A zero interval is refused with the shared typed error naming the flag,
+    /// and no task is spawned.
+    ///
+    /// Flip to watch it fail: delete `check_spawnable(interval)?;` in
+    /// [`spawn`], and the refusal expectation fails.
+    #[tokio::test]
+    async fn spawn_refuses_a_zero_reconcile_interval() {
+        let controller = QueryAdmissionController::shared(QueryConcurrencyLimit::Unlimited);
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let alive_before = metrics.num_alive_tasks();
+        let err = spawn(controller, store, Duration::ZERO)
+            .err()
+            .expect("a zero reconcile interval must be refused at spawn");
+        assert!(
+            matches!(err, SpawnError::ZeroReconcileInterval),
+            "expected ZeroReconcileInterval, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("--admission-reconcile-interval"),
+            "the refusal must name the flag, got: {err}"
+        );
+        assert_eq!(
+            metrics.num_alive_tasks(),
+            alive_before,
+            "a refused spawn must leave no task running"
+        );
     }
 }
