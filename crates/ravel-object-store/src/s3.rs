@@ -1689,7 +1689,7 @@ fn classify_generic(
     // Tier 2: Display-text heuristic. This is the only floor for 429/503,
     // whose HTTP status is not reachable through any nameable type here.
     let msg = source.to_string();
-    let lower = msg.to_lowercase();
+    let lower = classified_text(source).to_lowercase();
     // `object_store`'s `RetryError` Display appends ", ..., retry_timeout: {d} "
     // on every exhausted-retry message (whenever retries != 0), and the field
     // name contains "timeout". The timeout check below runs on the text with
@@ -1713,6 +1713,76 @@ fn classify_generic(
         return StoreError::Timeout;
     }
     StoreError::Transient(format!("{store}: {msg}"))
+}
+
+/// The part of a `Generic` error's text that carries the failure itself, with
+/// the request URI and any wrapper text naming a path left out, so a bucket,
+/// endpoint or key spelled with a class word cannot pick the class.
+///
+/// `RetryError` renders `"Error performing {method} {uri} in {elapsed:?}"`,
+/// an optional exhausted-retry suffix, then `" - {inner}"`, where `inner` is
+/// its `RequestError` source (status and body, error response body, or the
+/// transport error, which `object_store` strips of its URL). Neither type is
+/// nameable, so the inner error is found in the source chain by that shape,
+/// and failing that (a chain the source does not expose) parsed out of the
+/// text. A per-key `DeleteObjects` refusal names the key with no reliable end
+/// marker, so only its code is used. Any other text carries no request URI
+/// and is used whole.
+fn classified_text(source: &(dyn std::error::Error + Send + Sync + 'static)) -> String {
+    if let Some(code) = delete_objects_key_code(source) {
+        return code;
+    }
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(source);
+    while let Some(err) = current {
+        if let Some(inner) = err.source() {
+            let outer = err.to_string();
+            let inner_text = inner.to_string();
+            if outer.starts_with("Error performing ")
+                && outer
+                    .strip_suffix(inner_text.as_str())
+                    .is_some_and(|head| head.ends_with(" - "))
+            {
+                return inner_text;
+            }
+        }
+        current = err.source();
+    }
+    let text = source.to_string();
+    match retry_error_inner(&text) {
+        Some(inner) => inner.to_string(),
+        None => text,
+    }
+}
+
+/// The `{inner}` of the first `RetryError`-shaped segment in `text`. The
+/// method is an upper-case token and an `http::Uri` holds no space, so the
+/// first `" - "` after `" in "` ends the prefix: neither the elapsed time nor
+/// the exhausted-retry suffix contains one. Wrapper text such as `"Error
+/// performing list request: "` does not match the shape and is skipped.
+fn retry_error_inner(text: &str) -> Option<&str> {
+    const MARKER: &str = "Error performing ";
+    let mut from = 0;
+    while let Some(found) = text[from..].find(MARKER) {
+        let start = from + found + MARKER.len();
+        from = start;
+        let rest = &text[start..];
+        let Some((method, rest)) = rest.split_once(' ') else {
+            continue;
+        };
+        if method.is_empty() || !method.bytes().all(|b| b.is_ascii_uppercase()) {
+            continue;
+        }
+        let Some((uri, rest)) = rest.split_once(' ') else {
+            continue;
+        };
+        if uri.is_empty() || !rest.starts_with("in ") {
+            continue;
+        }
+        if let Some((_, inner)) = rest.split_once(" - ") {
+            return Some(inner);
+        }
+    }
+    None
 }
 
 /// Local CRC32C pre-flight, shared by [`S3Store::put`] and
