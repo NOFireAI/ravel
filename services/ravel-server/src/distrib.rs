@@ -835,7 +835,10 @@ impl FragmentService {
     /// `reason` label, and mapped to `Unauthenticated`. The checks run in a fixed
     /// order (present, MAC, expiry, tenant, query) so a capability that fails
     /// multiple ways is attributed to the first, most-fundamental reason.
-    fn verify_capability(&self, request: &pb::FetchRequest) -> Result<(), tonic::Status> {
+    ///
+    /// Returns the verified `expires_unix_ns`, which the handler checks again
+    /// once admitted and bounds the slice's run by.
+    fn verify_capability(&self, request: &pb::FetchRequest) -> Result<i64, tonic::Status> {
         let reject = |reason: CapabilityReject, message: &'static str| {
             self.inner.metrics.record_capability_reject(reason);
             Err(tonic::Status::unauthenticated(message))
@@ -870,13 +873,10 @@ impl FragmentService {
                 "fragment request rejected: capability MAC did not verify",
             );
         }
-        // Expiry reuses the deadline the protocol already enforces cluster-wide.
-        // A capability whose expiry is at or before now is dead.
+        // The expiry is the query's own deadline. A capability whose expiry is
+        // at or before now is dead.
         if claims.expires_unix_ns <= self.inner.clock.now_ns() {
-            return reject(
-                CapabilityReject::Expired,
-                "fragment request rejected: capability expired",
-            );
+            return Err(self.reject_expired());
         }
         // The wire tenant must equal the authorized tenant: a capability minted
         // for one tenant cannot authorize a fetch that names another. This is
@@ -898,7 +898,39 @@ impl FragmentService {
                 "fragment request rejected: capability query does not match request",
             );
         }
-        Ok(())
+        Ok(claims.expires_unix_ns)
+    }
+
+    /// The `Expired` refusal, counted, shared by verification and the
+    /// post-admission re-check so both read the same on the wire and in
+    /// `/metrics`.
+    fn reject_expired(&self) -> tonic::Status {
+        self.inner
+            .metrics
+            .record_capability_reject(CapabilityReject::Expired);
+        tonic::Status::unauthenticated("fragment request rejected: capability expired")
+    }
+
+    /// Run an admitted `Pinned` slice for at most `remaining` of this worker's
+    /// clock, the time left to its capability's expiry. Reaching it drops the
+    /// run, so no store request is issued after the expiry and no result read
+    /// before it is returned after it. The slice then ends `DeadlineExceeded`,
+    /// which the coordinator treats like any other refused fetch: re-dispatch
+    /// once, then run the slice itself under its own engine deadline.
+    async fn run_pinned_until_expiry(
+        &self,
+        request: pb::FetchRequest,
+        remaining: Duration,
+    ) -> Result<Vec<pb::FetchResponse>, tonic::Status> {
+        tokio::select! {
+            // Biased so a run that finishes in the same poll as the expiry
+            // still loses: the expiry is exclusive.
+            biased;
+            () = self.inner.clock.sleep(remaining) => Err(tonic::Status::deadline_exceeded(
+                "fragment slice stopped: capability expired while it ran",
+            )),
+            frames = self.resolve_and_run(request, false) => Ok(frames),
+        }
     }
 
     /// Authenticate a cross-cluster federation (resolve-scope) request and
@@ -1162,6 +1194,9 @@ impl SeriesFetch for FragmentService {
         request: tonic::Request<pb::FetchRequest>,
     ) -> Result<tonic::Response<Self::FetchStream>, tonic::Status> {
         let (metadata, _extensions, mut inner) = request.into_parts();
+        // `Some` only for a verified `Pinned` capability. A Resolve request
+        // carries no capability and no deadline on the wire.
+        let mut expires_unix_ns = None;
         // Two distinct trust models share this surface (ADR-0071 security):
         //  - Pinned scope (intra-cluster fan-out): a per-tenant, per-query
         //    fragment capability carried in the request, with the tenant taken
@@ -1201,7 +1236,7 @@ impl SeriesFetch for FragmentService {
                          --fragment-listener over TLS (ADR-0071 amendment decision 1).",
                     ));
                 }
-                self.verify_capability(&inner)?;
+                expires_unix_ns = Some(self.verify_capability(&inner)?);
             }
         }
         // Pinned and Resolve admit against disjoint classes (issue #1722), so a peer cluster's
@@ -1214,11 +1249,29 @@ impl SeriesFetch for FragmentService {
         let Some(_permit) = self.inner.admission.for_class(class).acquire().await else {
             return Err(tonic::Status::unavailable("fragment admission unavailable"));
         };
-        self.inner.metrics.record_fragment_request();
         // An inbound request, not a local attempt: this coordinator can still
         // re-dispatch the slice elsewhere, so a retryable record GET stays
         // `Unavailable`.
-        let frames = self.resolve_and_run(inner, false).await;
+        let frames = match expires_unix_ns {
+            Some(expires_unix_ns) => {
+                // A capability can expire while its request queues for
+                // admission. Refused before any store request, and before the
+                // request is counted, as verification's own refusal is.
+                let now_ns = self.inner.clock.now_ns();
+                if expires_unix_ns <= now_ns {
+                    return Err(self.reject_expired());
+                }
+                self.inner.metrics.record_fragment_request();
+                let remaining = Duration::from_nanos(
+                    u64::try_from(expires_unix_ns.saturating_sub(now_ns)).unwrap_or(0),
+                );
+                self.run_pinned_until_expiry(inner, remaining).await?
+            }
+            None => {
+                self.inner.metrics.record_fragment_request();
+                self.resolve_and_run(inner, false).await
+            }
+        };
         // The permit (and its in-flight gauge decrement) is held across the
         // eager fetch above, the whole admission window, then released here
         // before the already-built frames replay as a stream.

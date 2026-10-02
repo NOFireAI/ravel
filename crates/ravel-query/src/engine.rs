@@ -776,10 +776,10 @@ impl QueryEngine {
         now_ns: i64,
         deadline: Duration,
     ) -> Result<(Value, Annotations, QueryStats), QueryError> {
-        let eval_deadline = Instant::now() + deadline;
+        let query_deadline = QueryDeadline::from_entry(now_ns, deadline);
         let outcome = tokio::time::timeout(
             deadline,
-            self.instant_inner(tenant_hash, query, t_ms, min_tokens, now_ns, eval_deadline),
+            self.instant_inner(tenant_hash, query, t_ms, min_tokens, now_ns, query_deadline),
         )
         .await;
         unify_deadline(outcome, deadline)
@@ -838,7 +838,7 @@ impl QueryEngine {
         t_ms: i64,
         min_tokens: &[CommitToken],
         now_ns: i64,
-        eval_deadline: Instant,
+        query_deadline: QueryDeadline,
     ) -> Result<(Value, Annotations, QueryStats), QueryError> {
         let t_ns = ms_to_ns(t_ms)?;
         let plans = plan_selectors(query, t_ms, t_ms)?;
@@ -850,12 +850,12 @@ impl QueryEngine {
                 &eval_window,
                 min_tokens,
                 now_ns,
-                eval_deadline,
+                query_deadline,
             )
             .await?;
         let evaluator = Evaluator::new()
             .with_default_step(self.config.default_evaluation_interval)?
-            .with_deadline(eval_deadline);
+            .with_deadline(query_deadline.instant);
         let span = tracing::debug_span!("evaluate", eval_kind = "instant");
         let (value, annotations) = self
             .evaluate(source, query, move |source, query| {
@@ -976,7 +976,7 @@ impl QueryEngine {
         now_ns: i64,
         deadline: Duration,
     ) -> Result<(RangeValue, Annotations, QueryStats), QueryError> {
-        let eval_deadline = Instant::now() + deadline;
+        let query_deadline = QueryDeadline::from_entry(now_ns, deadline);
         let outcome = tokio::time::timeout(
             deadline,
             self.range_inner(
@@ -987,7 +987,7 @@ impl QueryEngine {
                 step_ms,
                 min_tokens,
                 now_ns,
-                eval_deadline,
+                query_deadline,
             ),
         )
         .await;
@@ -1052,7 +1052,7 @@ impl QueryEngine {
         step_ms: i64,
         min_tokens: &[CommitToken],
         now_ns: i64,
-        eval_deadline: Instant,
+        query_deadline: QueryDeadline,
     ) -> Result<(RangeValue, Annotations, QueryStats), QueryError> {
         if step_ms <= 0 {
             return Err(QueryError::NonPositiveStep { step_ms });
@@ -1076,12 +1076,12 @@ impl QueryEngine {
                 &eval_window,
                 min_tokens,
                 now_ns,
-                eval_deadline,
+                query_deadline,
             )
             .await?;
         let evaluator = Evaluator::new()
             .with_default_step(self.config.default_evaluation_interval)?
-            .with_deadline(eval_deadline);
+            .with_deadline(query_deadline.instant);
         let span = tracing::debug_span!("evaluate", eval_kind = "range");
         let (value, annotations) = self
             .evaluate(source, query, move |source, query| {
@@ -1475,7 +1475,7 @@ impl QueryEngine {
         eval_window: &EvalWindow,
         min_tokens: &[CommitToken],
         now_ns: i64,
-        eval_deadline: Instant,
+        query_deadline: QueryDeadline,
     ) -> Result<(MergedSource, QueryStats), QueryError> {
         if plans.is_empty() {
             return Ok((
@@ -1501,7 +1501,14 @@ impl QueryEngine {
             .collect();
 
         let (mut source, mut stats) = self
-            .prefetch_metric_plans(tenant_hash, &metric_plans, eval_window, min_tokens, now_ns)
+            .prefetch_metric_plans(
+                tenant_hash,
+                &metric_plans,
+                eval_window,
+                min_tokens,
+                now_ns,
+                query_deadline.unix_ns,
+            )
             .await?;
 
         if log_plans.is_empty() {
@@ -1658,7 +1665,7 @@ impl QueryEngine {
                 // the duration: a log fetch started late in the query must
                 // stop where the query does (ADR-1133, clock-reading
                 // amendment).
-                deadline: Some(eval_deadline),
+                deadline: Some(query_deadline.instant),
             };
             let out = log_series::fetch_log_series(
                 &self.log_fetcher,
@@ -1829,7 +1836,9 @@ impl QueryEngine {
     /// or matchers differ. An empty plan list (no metrics selector in the
     /// query -- a bare scalar/string literal, or a query naming only log
     /// metrics) skips storage entirely and issues zero `Signal::Metrics`
-    /// resolves.
+    /// resolves. `deadline_unix_ns` is the query's [`QueryDeadline::unix_ns`],
+    /// threaded to the distributed fan-out as every fragment capability's
+    /// expiry; the local path does not read it.
     async fn prefetch_metric_plans(
         &self,
         tenant_hash: TenantHash,
@@ -1837,6 +1846,7 @@ impl QueryEngine {
         eval_window: &EvalWindow,
         min_tokens: &[CommitToken],
         now_ns: i64,
+        deadline_unix_ns: i64,
     ) -> Result<(MergedSource, QueryStats), QueryError> {
         if plans.is_empty() {
             return Ok((
@@ -1866,14 +1876,6 @@ impl QueryEngine {
         let max_bytes_scanned = self.config.max_bytes_scanned;
         let max_s3_requests = self.config.max_s3_requests;
         let concurrency = self.config.promql_fetch_fanout().max(1);
-        // The query's absolute deadline in unix nanoseconds, from the injected
-        // `now_ns` and the configured engine deadline. Threaded into the
-        // distributed fan-out (ADR-0071 amendment, decision 2) so the coordinator
-        // mints each fragment capability with this exact expiry: expiry reuses
-        // the deadline the query already enforces, adding no new clock
-        // assumption. Unused by the local path.
-        let deadline_unix_ns = now_ns
-            .saturating_add(i64::try_from(self.config.deadline.as_nanos()).unwrap_or(i64::MAX));
         // One independent fetch per selector against the same snapshot
         // (below): an N-selector query re-opens every snapshot segment up to
         // N times in the worst case (no shared matcher set), so the
@@ -3268,6 +3270,29 @@ fn range_value_into_value(value: RangeValue) -> Value {
                 })
                 .collect(),
         ),
+    }
+}
+
+/// One query's deadline on both clocks it is read on, fixed once at request
+/// entry from that request's own deadline (which a caller may have lowered
+/// below [`EngineConfig::deadline`]).
+#[derive(Debug, Clone, Copy)]
+struct QueryDeadline {
+    /// Monotonic: the engine timeout, the evaluator, and the log fetch.
+    instant: Instant,
+    /// Wall clock, unix nanoseconds: the request's entry `now_ns` plus its
+    /// deadline. The coordinator mints every fragment capability with this
+    /// as its expiry (ADR-0071 amendment, decision 2), so a worker stops
+    /// reading for the query when the query itself stops.
+    unix_ns: i64,
+}
+
+impl QueryDeadline {
+    fn from_entry(now_ns: i64, deadline: Duration) -> Self {
+        QueryDeadline {
+            instant: Instant::now() + deadline,
+            unix_ns: now_ns.saturating_add(i64::try_from(deadline.as_nanos()).unwrap_or(i64::MAX)),
+        }
     }
 }
 
@@ -6847,9 +6872,9 @@ mod prefetch_tests {
     // test window can never drift from what the evaluator selects.
     const DEFAULT_LOOKBACK_NS: i64 = ravel_promql::DEFAULT_LOOKBACK_NS;
 
-    /// An `eval_deadline` no prefetch test reaches.
-    fn far_deadline() -> Instant {
-        Instant::now() + Duration::from_secs(3600)
+    /// A query deadline no prefetch test reaches.
+    fn far_deadline() -> QueryDeadline {
+        QueryDeadline::from_entry(BASE_NS, Duration::from_secs(3600))
     }
 
     fn labels(metric: &str) -> LabelSet {
@@ -10110,7 +10135,10 @@ mod log_prefetch_deadline_tests {
                 },
                 &[],
                 NOW_NS,
-                eval_deadline,
+                QueryDeadline {
+                    instant: eval_deadline,
+                    unix_ns: i64::MAX,
+                },
             )
             .await
     }
