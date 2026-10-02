@@ -1141,6 +1141,7 @@ async fn create_external_table_needs_the_ddl_capability_and_a_grant_over_its_loc
     let (status, value) = post_json(&app, "plain-token", "SELECT count(*) FROM clicks").await;
     assert_eq!(status, StatusCode::OK, "{value}");
     assert_eq!(value["data"]["rows"], serde_json::json!([[4]]), "{value}");
+    assert_eq!(sink.take().len(), 1, "the SELECT is audited by the query path");
 
     // (4) DROP TABLE: dropped, and the name is then an unknown table.
     let (status, value) = post_json(&app, "ddl-token", "DROP TABLE clicks").await;
@@ -1158,10 +1159,7 @@ async fn create_external_table_needs_the_ddl_capability_and_a_grant_over_its_loc
     );
     let (status, value) = post_json(&app, "plain-token", "SELECT count(*) FROM clicks").await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
-    assert!(
-        sink.take().len() == 1,
-        "the SELECT is audited by the query path, once"
-    );
+    assert_eq!(sink.take().len(), 1, "the SELECT is audited by the query path");
 }
 
 /// A plain `CREATE` on a table that exists is 409, a plain `DROP` of one that
