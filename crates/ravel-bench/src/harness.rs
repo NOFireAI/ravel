@@ -21,7 +21,8 @@ use ravel_object_store::{
 };
 
 /// A backend wrapper that sleeps a fixed duration before every `get`,
-/// delegating everything else unchanged. It exists to give an in-process
+/// `get_pinned` and `get_with_pin`, delegating everything else unchanged
+/// (`head` and `pin_of` are not delayed). It exists to give an in-process
 /// store a controllable per-request stall so a scan's exposed open time can
 /// be measured against a known injected figure. It is a measurement device:
 /// a number produced through it describes the scan's structure under that
