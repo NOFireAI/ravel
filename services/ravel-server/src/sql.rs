@@ -326,7 +326,12 @@ async fn run_ddl(
         let _permit = controls.admit()?;
         state
             .executor
-            .execute_ddl(tenant_hash, &body.query, principal.tenant.as_str(), deadline)
+            .execute_ddl(
+                tenant_hash,
+                &body.query,
+                principal.tenant.as_str(),
+                deadline,
+            )
             .await
             .map_err(|err| ServiceError::from_ddl(err, tenant_hash))
     }

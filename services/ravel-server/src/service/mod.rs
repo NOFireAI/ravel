@@ -56,7 +56,6 @@ use axum::http::HeaderMap;
 use ravel_ingest::Clock;
 use ravel_maintain::{QueryAuditSink, QueryStatus};
 use ravel_promql::Value;
-use ravel_tenant_resolve::Principal;
 use ravel_query::http::service as core;
 use ravel_query::http::{
     InstantOutcome, InstantRequest, LabelValuesOutcome, LabelsOutcome, LiveUsage, MetadataOutcome,
@@ -64,6 +63,7 @@ use ravel_query::http::{
     UsageStatus,
 };
 use ravel_query::{Coverage, QueryAdmissionController, QueryEngine, QueryStats};
+use ravel_tenant_resolve::Principal;
 use ravel_types::accounting::{
     CostEstimate, QueryAccounting, QueryAccountingSnapshot, QueryCostRecorder,
 };
