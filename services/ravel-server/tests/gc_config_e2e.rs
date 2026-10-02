@@ -13,7 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use ravel_maintain::{CompactorConfig, GcConfigError, GcConfigValues, set_gc_config};
+use ravel_maintain::{
+    CompactorConfig, GcConfigError, GcConfigProposal, GcConfigValues, set_gc_config,
+};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_server::{Cli, gc_config};
@@ -280,4 +282,60 @@ async fn query_starts_after_gc_config_set_and_matching_deadline_flag() {
     let matched = query_deadline(&cli(&["--mode", "query", "--gc-max-query-duration", "10s"]));
     gc_config::validate_query(&gc, matched)
         .expect("query starts: --gc-max-query-duration matches the durable max_query_duration");
+}
+
+/// ADR-1133 decision 4: once `sys/gc` records a HEAD cache TTL (format
+/// version 2), a query process whose catalog runs on a longer one refuses to
+/// start. The catalog config is the one `main` passes,
+/// `server_catalog_config_base()`, whose default TTL (30s) is above the 10s
+/// recorded here; a catalog at the recorded TTL starts.
+#[tokio::test]
+async fn query_startup_refuses_a_head_cache_ttl_above_the_recorded_value() {
+    let store = store();
+    let base = ravel_server::query::server_catalog_config_base();
+
+    // A fresh bucket bootstraps version 1, which holds query processes to the
+    // compiled default: the server's own catalog starts.
+    let gc = gc_config::bootstrap(store.as_ref(), 1_000)
+        .await
+        .expect("a fresh bucket bootstraps sys/gc");
+    assert_eq!(gc.format_version, 1);
+    gc_config::validate_query_head_cache_ttl(&gc, &base)
+        .expect("the compiled default TTL starts against a version 1 sys/gc");
+
+    let recorded = 10_000_000_000;
+    assert!(base.head_cache_ttl_ns > recorded);
+    set_gc_config(
+        store.as_ref(),
+        GcConfigProposal {
+            head_cache_ttl_ns: Some(recorded),
+            ..GcConfigValues::maintain_defaults().into()
+        },
+        ravel_maintain::config::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
+        2_000,
+    )
+    .await
+    .expect("set records a version 2 TTL");
+    let gc = gc_config::bootstrap(store.as_ref(), 3_000)
+        .await
+        .expect("reads the durable object");
+    assert_eq!(gc.format_version, 2);
+
+    let err = gc_config::validate_query_head_cache_ttl(&gc, &base)
+        .expect_err("a catalog TTL above the recorded one must refuse startup");
+    assert_eq!(
+        err,
+        GcConfigError::QueryHeadCacheTtlExceedsRecorded {
+            effective_ttl_ns: base.head_cache_ttl_ns,
+            recorded_ttl_ns: recorded,
+            format_version: 2,
+        }
+    );
+
+    let matched = ravel_catalog::CatalogConfig {
+        head_cache_ttl_ns: recorded,
+        ..base
+    };
+    gc_config::validate_query_head_cache_ttl(&gc, &matched)
+        .expect("a catalog at the recorded TTL starts");
 }

@@ -251,6 +251,129 @@ mod tests {
         assert_eq!(v.protection_horizon_ns, 25 * 3_600_000_000_000);
     }
 
+    /// The stored proto's `format_version`, read without the decoder's
+    /// version handling.
+    async fn stored_format_version(store: &Arc<dyn ObjectStoreBackend>) -> u32 {
+        use prost::Message;
+        let got = store
+            .get(ravel_maintain::GC_CONFIG_KEY, GetRange::Full)
+            .await
+            .expect("sys/gc present");
+        ravel_proto::sys::v1::GcConfig::decode(got.data.as_ref())
+            .expect("decodes")
+            .format_version
+    }
+
+    /// `--head-cache-ttl` is the rollout flip: `set` writes format version 2
+    /// recording that TTL, over a stored version 1.
+    #[tokio::test]
+    async fn set_with_head_cache_ttl_writes_version_2() {
+        let store = store();
+        set(store.clone(), "26h", "24h", "1h", "1h", None, None, 1)
+            .await
+            .expect("first set");
+        assert_eq!(stored_format_version(&store).await, 1);
+        set(
+            store.clone(),
+            "26h",
+            "24h",
+            "1h",
+            "1h",
+            None,
+            Some("10s"),
+            2,
+        )
+        .await
+        .expect("set with --head-cache-ttl");
+        assert_eq!(stored_format_version(&store).await, 2);
+        let (v, _) = read_gc_config(store.as_ref())
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(v.format_version, 2);
+        assert_eq!(v.head_cache_ttl_ns, 10_000_000_000);
+    }
+
+    /// Without `--head-cache-ttl`, `set` over a stored version 1 keeps
+    /// version 1: no TTL is recorded, so older builds keep starting.
+    #[tokio::test]
+    async fn set_without_head_cache_ttl_over_version_1_stays_version_1() {
+        let store = store();
+        ravel_maintain::bootstrap_gc_config(
+            store.as_ref(),
+            ravel_maintain::GcConfigValues::maintain_defaults(),
+            1,
+        )
+        .await
+        .expect("bootstrap writes version 1");
+        set(store.clone(), "50h", "24h", "1h", "1h", None, None, 2)
+            .await
+            .expect("set without the flag");
+        assert_eq!(stored_format_version(&store).await, 1);
+        let (v, _) = read_gc_config(store.as_ref())
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(v.protection_horizon_ns, 50 * 3_600_000_000_000);
+        assert_eq!(
+            v.head_cache_ttl_ns,
+            ravel_catalog::DEFAULT_HEAD_CACHE_TTL_NS
+        );
+    }
+
+    /// Without `--head-cache-ttl`, `set` over a stored version 2 keeps
+    /// version 2 and its recorded TTL: it never writes version 1 over version
+    /// 2, which would let older builds start again.
+    #[tokio::test]
+    async fn set_without_head_cache_ttl_over_version_2_keeps_version_2_and_its_ttl() {
+        let store = store();
+        set(
+            store.clone(),
+            "26h",
+            "24h",
+            "1h",
+            "1h",
+            None,
+            Some("10s"),
+            1,
+        )
+        .await
+        .expect("flip to version 2");
+        set(store.clone(), "50h", "24h", "1h", "1h", None, None, 2)
+            .await
+            .expect("set without the flag");
+        assert_eq!(
+            stored_format_version(&store).await,
+            2,
+            "set without the flag never writes version 1 over version 2"
+        );
+        let (v, _) = read_gc_config(store.as_ref())
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(v.format_version, 2);
+        assert_eq!(
+            v.head_cache_ttl_ns, 10_000_000_000,
+            "the recorded TTL is kept"
+        );
+        assert_eq!(v.protection_horizon_ns, 50 * 3_600_000_000_000);
+    }
+
+    /// A zero `--head-cache-ttl` is refused and writes nothing: version 2 must
+    /// record a positive TTL.
+    #[tokio::test]
+    async fn set_refuses_a_zero_head_cache_ttl() {
+        let store = store();
+        let err = set(store.clone(), "26h", "24h", "1h", "1h", None, Some("0s"), 1)
+            .await
+            .expect_err("a zero TTL must be refused");
+        assert!(err.to_string().contains("head_cache_ttl_ns"), "got: {err}");
+        let got = store
+            .get(ravel_maintain::GC_CONFIG_KEY, GetRange::Full)
+            .await;
+        assert!(matches!(got, Err(StoreError::NotFound)));
+    }
+
     /// `show` on a fresh bucket reports "not present" rather than erroring.
     #[tokio::test]
     async fn show_on_unbootstrapped_bucket_reports_absence() {

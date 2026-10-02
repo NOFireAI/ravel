@@ -1284,6 +1284,204 @@ mod tests {
         );
     }
 
+    /// Seed `sys/gc` with a raw proto at `format_version` carrying
+    /// `head_cache_ttl_ns`, bypassing every write-side check.
+    async fn seed_raw(store: &dyn ObjectStoreBackend, format_version: u32, head_cache_ttl_ns: i64) {
+        let proto = sysproto::GcConfig {
+            format_version,
+            protection_horizon_ns: DEFAULT_PROTECTION_HORIZON_NS,
+            grace_ns: DEFAULT_GRACE_NS,
+            max_query_duration_ns: DEFAULT_MAX_QUERY_DURATION_NS,
+            max_flush_lifetime_ns: DEFAULT_MAX_FLUSH_LIFETIME_NS,
+            created_unix_ns: 1,
+            head_cache_ttl_ns,
+        };
+        store
+            .put(
+                GC_CONFIG_KEY,
+                proto.encode_to_vec().into(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed raw sys/gc");
+    }
+
+    /// The stored proto, decoded without `from_proto`'s version handling.
+    async fn stored_proto(store: &dyn ObjectStoreBackend) -> sysproto::GcConfig {
+        let got = store
+            .get(GC_CONFIG_KEY, GetRange::Full)
+            .await
+            .expect("sys/gc present");
+        sysproto::GcConfig::decode(got.data.as_ref()).expect("decodes")
+    }
+
+    /// A version 1 object decodes its HEAD cache TTL as the compiled default
+    /// even when the field carries another value: version 1 records no TTL, so
+    /// a stray field value must not become the bound query processes are held
+    /// to.
+    #[tokio::test]
+    async fn version_1_decodes_head_cache_ttl_as_the_compiled_default() {
+        let store = store();
+        let stray = 7 * DEFAULT_HEAD_CACHE_TTL_NS;
+        seed_raw(store.as_ref(), GC_FORMAT_VERSION_V1, stray).await;
+        let (values, _version) = read_gc_config(store.as_ref())
+            .await
+            .expect("version 1 is read")
+            .expect("present");
+        assert_eq!(values.format_version, GC_FORMAT_VERSION_V1);
+        assert_eq!(
+            values.head_cache_ttl_ns, DEFAULT_HEAD_CACHE_TTL_NS,
+            "version 1 ignores the stored field and decodes the compiled default"
+        );
+    }
+
+    /// A version 2 object round-trips its recorded TTL and its version.
+    #[tokio::test]
+    async fn version_2_round_trips_its_head_cache_ttl() {
+        let store = store();
+        let ttl = 12_345_000_000;
+        let values = GcConfigValues {
+            format_version: GC_FORMAT_VERSION,
+            head_cache_ttl_ns: ttl,
+            ..GcConfigValues::maintain_defaults()
+        };
+        store
+            .put(
+                GC_CONFIG_KEY,
+                values.to_proto(9).encode_to_vec().into(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("write version 2");
+        let proto = stored_proto(store.as_ref()).await;
+        assert_eq!(proto.format_version, 2);
+        assert_eq!(proto.head_cache_ttl_ns, ttl);
+        let (read, _version) = read_gc_config(store.as_ref())
+            .await
+            .expect("version 2 is read")
+            .expect("present");
+        assert_eq!(read, values);
+    }
+
+    /// A version 2 object must record a positive TTL: zero and negative are
+    /// typed errors naming the stored value.
+    #[tokio::test]
+    async fn version_2_with_a_non_positive_head_cache_ttl_is_refused() {
+        for bad in [0, -1] {
+            let store = store();
+            seed_raw(store.as_ref(), GC_FORMAT_VERSION, bad).await;
+            let err = read_gc_config(store.as_ref())
+                .await
+                .expect_err("a non-positive version 2 TTL must be refused");
+            assert_eq!(
+                err,
+                GcConfigError::StoredHeadCacheTtlNotPositive { got: bad }
+            );
+        }
+    }
+
+    /// Version 3 is above what this build reads and is refused, as every
+    /// unknown version is.
+    #[tokio::test]
+    async fn version_3_is_refused() {
+        let store = store();
+        seed_raw(store.as_ref(), 3, DEFAULT_HEAD_CACHE_TTL_NS).await;
+        let err = read_gc_config(store.as_ref())
+            .await
+            .expect_err("version 3 must be refused");
+        assert_eq!(err, GcConfigError::UnsupportedVersion { got: 3 });
+    }
+
+    /// Bootstrap on an empty bucket writes format version 1 with no TTL field,
+    /// even when the caller's defaults are version 2, so a new build touching
+    /// a fresh bucket first cannot lock out an older build that reads only
+    /// version 1.
+    #[tokio::test]
+    async fn bootstrap_on_an_empty_store_writes_version_1() {
+        let store = store();
+        let values =
+            bootstrap_gc_config(store.as_ref(), GcConfigValues::maintain_defaults(), 1_000)
+                .await
+                .expect("bootstrap");
+        assert_eq!(values.format_version, GC_FORMAT_VERSION_V1);
+        let proto = stored_proto(store.as_ref()).await;
+        assert_eq!(proto.format_version, 1, "bootstrap writes version 1");
+        assert_eq!(
+            proto.head_cache_ttl_ns, 0,
+            "version 1 leaves the TTL absent"
+        );
+
+        let store = self::store();
+        let v2_defaults = GcConfigValues {
+            format_version: GC_FORMAT_VERSION,
+            head_cache_ttl_ns: 5_000_000_000,
+            ..GcConfigValues::maintain_defaults()
+        };
+        let values = bootstrap_gc_config(store.as_ref(), v2_defaults, 1_000)
+            .await
+            .expect("bootstrap");
+        assert_eq!(values, GcConfigValues::maintain_defaults());
+        assert_eq!(
+            stored_proto(store.as_ref()).await.format_version,
+            1,
+            "bootstrap writes version 1 whatever version the caller's defaults carry"
+        );
+    }
+
+    /// The query-side TTL check on a version 2 object: the recorded TTL itself
+    /// passes, one nanosecond above it refuses, naming both values.
+    #[test]
+    fn query_head_cache_ttl_check_is_inclusive_at_the_recorded_value() {
+        let recorded = 10_000_000_000;
+        let stored = GcConfigValues {
+            format_version: GC_FORMAT_VERSION,
+            head_cache_ttl_ns: recorded,
+            ..GcConfigValues::maintain_defaults()
+        };
+        validate_query_head_cache_ttl(&stored, recorded).expect("the recorded TTL itself passes");
+        validate_query_head_cache_ttl(&stored, recorded - 1).expect("a lower TTL passes");
+        let err = validate_query_head_cache_ttl(&stored, recorded + 1)
+            .expect_err("one nanosecond above the recorded TTL must refuse");
+        assert_eq!(
+            err,
+            GcConfigError::QueryHeadCacheTtlExceedsRecorded {
+                effective_ttl_ns: recorded + 1,
+                recorded_ttl_ns: recorded,
+                format_version: GC_FORMAT_VERSION,
+            }
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains(&(recorded + 1).to_string())
+                && message.contains(&recorded.to_string()),
+            "the error names both values: {message}"
+        );
+    }
+
+    /// On a version 1 object the query-side check compares against the
+    /// compiled default: the default passes, one nanosecond above refuses.
+    #[tokio::test]
+    async fn query_head_cache_ttl_check_on_version_1_uses_the_compiled_default() {
+        let store = store();
+        seed_raw(store.as_ref(), GC_FORMAT_VERSION_V1, 0).await;
+        let (stored, _version) = read_gc_config(store.as_ref())
+            .await
+            .expect("read")
+            .expect("present");
+        validate_query_head_cache_ttl(&stored, DEFAULT_HEAD_CACHE_TTL_NS)
+            .expect("the compiled default passes on version 1");
+        let err = validate_query_head_cache_ttl(&stored, DEFAULT_HEAD_CACHE_TTL_NS + 1)
+            .expect_err("one nanosecond above the compiled default must refuse on version 1");
+        assert_eq!(
+            err,
+            GcConfigError::QueryHeadCacheTtlExceedsRecorded {
+                effective_ttl_ns: DEFAULT_HEAD_CACHE_TTL_NS + 1,
+                recorded_ttl_ns: DEFAULT_HEAD_CACHE_TTL_NS,
+                format_version: GC_FORMAT_VERSION_V1,
+            }
+        );
+    }
+
     /// A corrupt (undecodable) `sys/gc` is a typed `Decode` error, never a panic.
     #[tokio::test]
     async fn corrupt_object_is_a_typed_decode_error() {
