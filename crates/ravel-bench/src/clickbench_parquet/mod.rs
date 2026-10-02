@@ -3,4 +3,5 @@
 //! engines and acceptance test consume. Each module here is unit-tested on
 //! its own; nothing in this module wires an engine to a live object store.
 
+pub mod comparator;
 pub mod suite;
