@@ -1531,14 +1531,45 @@ fn map_put_error(e: object_store::Error, mode: &PutMode) -> StoreError {
 /// rejected as unsatisfiable (`start >= object length`), which
 /// `object_store` cannot validate client-side without already knowing the
 /// object's size.
+///
+/// When the [`classified_text`] carries an S3 XML error body with a `Code`,
+/// the body can echo the key in `Key` and `Resource`, so the range is read
+/// from the code (`InvalidRange`) or the status line (a 416, or "range" with
+/// "satisfiable" or "too large") only. Without a code, the range words are
+/// matched over the whole classified text.
 pub(crate) fn map_get_error(e: object_store::Error) -> StoreError {
     if let object_store::Error::Generic { source, .. } = &e {
-        let msg = classified_text(source.as_ref()).to_lowercase();
-        if msg.contains("range") && (msg.contains("satisfiable") || msg.contains("too large")) {
+        let text = classified_text(source.as_ref());
+        let invalid_range = match status_line_and_code(&text) {
+            (status_line, Some(code)) => {
+                code == "InvalidRange"
+                    || status_line.contains(" 416 ")
+                    || has_range_words(&status_line)
+            }
+            (_, None) => has_range_words(&text.to_lowercase()),
+        };
+        if invalid_range {
             return StoreError::InvalidRange(source.to_string());
         }
     }
     map_error_common(e)
+}
+
+fn has_range_words(lower: &str) -> bool {
+    lower.contains("range") && (lower.contains("satisfiable") || lower.contains("too large"))
+}
+
+/// Split [`classified_text`] output carrying an S3 XML error body into the
+/// lowercased text before its `<Error>` element (the status line) and the
+/// body's `Code`. Text with no body, or a body with no parseable `Code`, comes
+/// back lowercased whole with no code.
+fn status_line_and_code(text: &str) -> (String, Option<String>) {
+    if let Some(start) = text.find("<Error>")
+        && let Some(code) = bucket_config::parse_error_code(&text.as_bytes()[start..])
+    {
+        return (text[..start].to_lowercase(), Some(code));
+    }
+    (text.to_lowercase(), None)
 }
 
 /// `delete`-specific mapping. `object_store` sends every delete as a
@@ -1662,10 +1693,13 @@ fn typed_http_kind(
 ///    digit run is not a signal: a port, a key, an elapsed time or a request
 ///    id can carry one. When that text carries an S3 XML error body with a
 ///    `Code`, the words are matched over the status line only and the code
-///    stands in for the body: `SlowDown`, `Throttling`, `ThrottlingException`,
-///    `RequestLimitExceeded` and `TooManyRequests` to
-///    [`StoreError::Throttled`], `RequestTimeout` to [`StoreError::Timeout`],
-///    so a body echoing a key spelled with a class word cannot pick the class.
+///    stands in for the body: any code starting with `SlowDown`, and
+///    `Throttling`, `ThrottlingException`, `RequestLimitExceeded` and
+///    `TooManyRequests`, to [`StoreError::Throttled`], `RequestTimeout` to
+///    [`StoreError::Timeout`], so a body echoing a key spelled with a class
+///    word cannot pick the class. The throttle check runs before the timeout
+///    check, and each reads the status line before the code, so a 503 whose
+///    code is `RequestTimeout` reads [`StoreError::Throttled`].
 ///
 /// Anything unmatched is [`StoreError::Transient`], never `Permanent`:
 /// `object_store` already retried its own retryable classes (5xx, connection
@@ -1700,51 +1734,43 @@ fn classify_generic(
     let text = classified_text(source);
     // With an S3 error code in the body, the code stands in for the rest of
     // the body, which can echo the request.
-    let (lower, code) = match text.find("<Error>") {
-        Some(start) => match bucket_config::parse_error_code(&text.as_bytes()[start..]) {
-            Some(code) => (text[..start].to_lowercase(), Some(code)),
-            None => (text.to_lowercase(), None),
-        },
-        None => (text.to_lowercase(), None),
-    };
+    let (lower, code) = status_line_and_code(&text);
     let code = code.as_deref();
     // `object_store`'s `RetryError` Display puts ", ..., retry_timeout: {d} "
     // in its prefix on every exhausted-retry message, and the field name
     // contains "timeout". `classified_text` already drops that prefix; the
     // strip below is a fallback for text that reaches here without the
     // `RetryError` shape, so an exhausted 500 still stays Transient.
-    if code.is_some_and(is_throttle_code)
-        || lower.contains("too many requests")
+    if lower.contains("too many requests")
         || lower.contains("slow down")
         || lower.contains("slowdown")
         || lower.contains("throttl")
         || lower.contains("service unavailable")
+        || code.is_some_and(is_throttle_code)
     {
         return StoreError::Throttled {
             retry_after_ms: 1000,
         };
     }
     let without_retry_field = lower.replace("retry_timeout", " ");
-    if code == Some("RequestTimeout")
-        || without_retry_field.contains("timed out")
+    if without_retry_field.contains("timed out")
         || without_retry_field.contains("timeout")
         || without_retry_field.contains("deadline")
+        || code == Some("RequestTimeout")
     {
         return StoreError::Timeout;
     }
     StoreError::Transient(format!("{store}: {msg}"))
 }
 
-/// S3 error codes that ask the client to slow down.
+/// S3 error codes that ask the client to slow down. Any code starting with
+/// `SlowDown` counts, which covers MinIO's `SlowDownRead` and `SlowDownWrite`.
 fn is_throttle_code(code: &str) -> bool {
-    matches!(
-        code,
-        "SlowDown"
-            | "Throttling"
-            | "ThrottlingException"
-            | "RequestLimitExceeded"
-            | "TooManyRequests"
-    )
+    code.starts_with("SlowDown")
+        || matches!(
+            code,
+            "Throttling" | "ThrottlingException" | "RequestLimitExceeded" | "TooManyRequests"
+        )
 }
 
 /// The part of a `Generic` error's text that carries the failure itself, with
@@ -4359,7 +4385,6 @@ mod tests {
         for uri in [
             "http://127.0.0.1:9000/range-not-satisfiable/k",
             "http://127.0.0.1:9000/b/range/not/satisfiable",
-            "http://127.0.0.1:9000/b/range%20too%20large",
         ] {
             let as_text = OwnedTextError(format!(
                 "Error performing GET {uri} in 1.2ms{retries} - {inner}"
@@ -4448,6 +4473,136 @@ mod tests {
                 assert_eq!(got, want, "got {mapped:?} for {inner:?}");
             }
         }
+    }
+
+    /// An S3 error body echoes the key in `Key` and `Resource`, so with a
+    /// `Code` present a range class comes only from the code or the status
+    /// line: an exhausted 500 or 503 `InternalError` on a key spelled with the
+    /// range words reads Transient or Throttled by its status, while a 416 or
+    /// an `InvalidRange` code still reads `InvalidRange`.
+    #[test]
+    fn range_words_echoed_in_an_error_body_are_not_invalid_range() {
+        let prefix = "Error performing GET http://127.0.0.1:9000/b/k in 1.2ms, after 10 \
+                      retries, max_retries: 10, retry_timeout: 180s  - ";
+        let echo = |status: &str, code: &str| {
+            format!(
+                "Server returned non-2xx status code: {status}: <Error><Code>{code}</Code>\
+                 <Message>m</Message><Key>range/not/satisfiable/too large</Key>\
+                 <BucketName>b</BucketName>\
+                 <Resource>/b/range/not/satisfiable/too large</Resource></Error>"
+            )
+        };
+        let cases = [
+            (
+                echo("500 Internal Server Error", "InternalError"),
+                "transient",
+            ),
+            (
+                echo("503 Service Unavailable", "InternalError"),
+                "throttled",
+            ),
+            (echo("416 Range Not Satisfiable", "InvalidRange"), "range"),
+            (echo("416 Range Not Satisfiable", "InternalError"), "range"),
+            (echo("400 Bad Request", "InvalidRange"), "range"),
+        ];
+        for (inner, want) in cases {
+            let as_text = OwnedTextError(format!("{prefix}{inner}"));
+            let as_chain = Wrapping {
+                prefix: prefix.to_string(),
+                source: Box::new(OwnedTextError(inner.clone())),
+            };
+            for mapped in [
+                map_get_error(generic(as_text)),
+                map_get_error(generic(as_chain)),
+            ] {
+                let got = match mapped {
+                    StoreError::InvalidRange(_) => "range",
+                    StoreError::Transient(_) => "transient",
+                    StoreError::Throttled {
+                        retry_after_ms: 1000,
+                    } => "throttled",
+                    _ => "other",
+                };
+                assert_eq!(got, want, "got {mapped:?} for {inner:?}");
+            }
+        }
+    }
+
+    /// MinIO's `SlowDownRead` and `SlowDownWrite` arrive on the error-response
+    /// path, whose text has no status line, so only the code can read
+    /// Throttled.
+    #[test]
+    fn slowdown_variants_on_the_error_response_path_are_throttled() {
+        let prefix = "Error performing PUT http://127.0.0.1:9000/b/k in 1.2ms - ";
+        for code in ["SlowDownWrite", "SlowDownRead"] {
+            let inner = format!(
+                "Server returned error response: <Error><Code>{code}</Code>\
+                 <Message>Resource requested is unwritable, please reduce your request rate\
+                 </Message><Key>k</Key></Error>"
+            );
+            let mapped = map_error_common(generic(OwnedTextError(format!("{prefix}{inner}"))));
+            assert!(
+                matches!(
+                    mapped,
+                    StoreError::Throttled {
+                        retry_after_ms: 1000
+                    }
+                ),
+                "got {mapped:?} for {code}"
+            );
+        }
+    }
+
+    /// Every class code, at a status line that carries no class signal of its
+    /// own (a 400, and the error-response path with no status at all), so the
+    /// code alone decides and dropping one from the list fails here.
+    #[test]
+    fn every_class_code_classifies_without_a_status_signal() {
+        let prefix = "Error performing GET http://127.0.0.1:9000/b/k in 1.2ms - ";
+        let cases = [
+            ("SlowDown", "throttled"),
+            ("Throttling", "throttled"),
+            ("ThrottlingException", "throttled"),
+            ("RequestLimitExceeded", "throttled"),
+            ("TooManyRequests", "throttled"),
+            ("RequestTimeout", "timeout"),
+        ];
+        for (code, want) in cases {
+            for status_line in [
+                "Server returned non-2xx status code: 400 Bad Request: ",
+                "Server returned error response: ",
+            ] {
+                let inner = format!("{status_line}<Error><Code>{code}</Code><Key>k</Key></Error>");
+                let mapped = map_error_common(generic(OwnedTextError(format!("{prefix}{inner}"))));
+                let got = match mapped {
+                    StoreError::Throttled {
+                        retry_after_ms: 1000,
+                    } => "throttled",
+                    StoreError::Timeout => "timeout",
+                    _ => "other",
+                };
+                assert_eq!(got, want, "got {mapped:?} for {inner:?}");
+            }
+        }
+    }
+
+    /// The throttle check runs before the timeout check: a 503 whose code is
+    /// `RequestTimeout` reads Throttled.
+    #[test]
+    fn a_throttle_status_line_wins_over_a_timeout_code() {
+        let text = "Error performing GET http://127.0.0.1:9000/b/k in 1.2ms - Server returned \
+                    non-2xx status code: 503 Service Unavailable: \
+                    <Error><Code>RequestTimeout</Code></Error>";
+        let mapped = map_error_common(generic(OwnedTextError(text.to_string())));
+        assert!(
+            matches!(
+                mapped,
+                StoreError::Throttled {
+                    retry_after_ms: 1000
+                }
+            ),
+            "{mapped:?}"
+        );
     }
 
     /// The typed variants object_store already surfaces are mapped by variant,
