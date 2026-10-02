@@ -1544,9 +1544,21 @@ impl AlertEvaluator {
     /// transition record is written, and the next tick retries. A per-rule
     /// opt-in to evaluate on partial coverage is deliberately not offered here;
     /// the amendment leaves that to the alerting surface's own work.
+    ///
+    /// Two instants reach the engine. `now_ns` is the tick's reading: the
+    /// instant the rule is evaluated at, shared with the transition decision
+    /// [`Self::evaluate_rule`] makes from the result. The engine's entry
+    /// reading is taken here instead, immediately before the engine call: the
+    /// engine adds this rule's `query_deadline` to it for the query's
+    /// wall-clock deadline, which every fragment capability expires at and
+    /// every federated request carries. Rules run one after another, so a
+    /// tick-start reading would hand each later rule a wall-clock deadline
+    /// earlier than its own timer's, short by however long the earlier rules
+    /// took.
     async fn run_query(&self, rule: &Rule, now_ns: i64) -> anyhow::Result<QueryResultSummary> {
         match &rule.query {
             RuleQuery::Promql(text) => {
+                let entry_ns = self.clock.now_ns();
                 let (value, coverage) = self
                     .engines
                     .promql
@@ -1555,7 +1567,7 @@ impl AlertEvaluator {
                         text,
                         now_ns.div_euclid(NS_PER_MS),
                         &[],
-                        now_ns,
+                        entry_ns,
                         self.query_deadline,
                     )
                     .await?;
@@ -1588,7 +1600,9 @@ impl AlertEvaluator {
             // read-your-write token to honour, because nothing wrote on this
             // rule's behalf.
             min_tokens: Vec::new(),
-            now_ns,
+            // The engine's entry reading, as for a PromQL rule (see
+            // `run_query`); the window above stays at the tick's instant.
+            now_ns: self.clock.now_ns(),
             deadline: self.query_deadline,
             row_window: false,
             max_rows: None,

@@ -2121,6 +2121,7 @@ async fn federation_fetch(fed: &Federation, config: EngineConfig) -> crate::erro
         Vec::new(),
         QueryAccounting::new(),
         config,
+        i64::MAX,
     )
     .await
     .expect_err("a remote refusal must fail the query")

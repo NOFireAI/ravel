@@ -240,6 +240,12 @@ impl Federation {
     ///   (`TooManyBytesScanned`/`TooManySeries`/`TooManySamples`/
     ///   `TooManySegments`) when it refused under this coordinator's budget,
     ///   so a remote-side refusal renders 422 rather than a retryable 503.
+    /// - [`QueryError::DeadlineExceeded`] when a remote stopped at
+    ///   `deadline_unix_ns`, regardless of `skip_unavailable`.
+    ///
+    /// `deadline_unix_ns` is the query's absolute deadline, carried on every
+    /// Resolve request so a remote stops reading for the query when the query
+    /// itself stops.
     ///
     /// The `accounting` handle is folded with every remote's reported cost
     /// (saturating), so the query's reported total reflects federated fetches
@@ -264,6 +270,7 @@ impl Federation {
         min_commit_tokens: Vec<String>,
         accounting: QueryAccounting,
         config: EngineConfig,
+        deadline_unix_ns: i64,
     ) -> Result<FederationOutcome, QueryError> {
         let mut outcome = FederationOutcome::default();
         // Only the remotes mapped to THIS local tenant. A remote's fetcher
@@ -327,7 +334,9 @@ impl Federation {
                 window_start_ns,
                 window_end_ns,
                 budgets: Some(budgets),
-                deadline_unix_ns: 0,
+                // The query's own deadline, so the remote stops reading for
+                // it when the query stops (ADR-1133 bounded readers).
+                deadline_unix_ns,
                 erasure: encoded_erasure.clone(),
                 trace_context: String::new(),
                 // A Resolve (federation) request carries no fragment capability
@@ -531,6 +540,14 @@ impl Federation {
                         &mut outcome,
                     )?;
                 }
+                pb::status::Code::Timeout => {
+                    // The remote stopped at this query's own deadline, so the
+                    // query is over whatever `skip_unavailable` says: skipping
+                    // the remote would answer past the deadline. Its spend
+                    // before the stop is folded first.
+                    fold_remote(&accounting, &mut running, &mut outcome.stats, &response);
+                    return Err(super::slice_deadline_exceeded());
+                }
                 other => {
                     // SnapshotInvalidated/Corrupt/etc. A remote resolves its own
                     // snapshot, so none of these is an availability signal: they
@@ -701,6 +718,7 @@ mod tests {
             Vec::new(),
             QueryAccounting::new(),
             EngineConfig::default(),
+            i64::MAX,
         )
         .await
     }
@@ -1254,6 +1272,7 @@ mod tests {
                 Vec::new(),
                 QueryAccounting::new(),
                 EngineConfig::default(),
+                i64::MAX,
             )
             .await
             .expect("an unmapped tenant is answered locally, not failed");

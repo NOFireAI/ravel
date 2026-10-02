@@ -1274,7 +1274,15 @@ impl SeriesFetch for FragmentService {
                 }
                 let tenant = self.resolve_federation_tenant(&metadata)?;
                 inner.tenant_hash = tenant.0.to_vec();
-                deadline_unix_ns = None;
+                // The deadline is the coordinator's wall clock read against
+                // this cluster's: the same skew shape a Flight ticket's expiry
+                // has (ADR-0071).
+                deadline_unix_ns = (inner.deadline_unix_ns > 0).then_some(inner.deadline_unix_ns);
+                if deadline_unix_ns.is_some_and(|d| d <= self.inner.clock.now_ns()) {
+                    return Ok(frames_response(vec![
+                        self.refuse_at_deadline(AdmissionClass::Resolve),
+                    ]));
+                }
             }
             _ => {
                 if self.role == FragmentListenerRole::PublicFederation {
@@ -2713,7 +2721,7 @@ mod tests {
 
         let tenant = [3u8; 16];
         let query = [4u8; 16];
-        let cap = mint(&TEST_KEY, tenant, metrics_signal(), query, now + 1_000);
+        let cap = mint(&TEST_KEY, tenant, metrics_signal(), query, now + HOUR_NS);
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
@@ -2770,7 +2778,7 @@ mod tests {
         let service = capability_service(now, test_keys(), metrics.clone());
         let tenant = [1u8; 16];
         let query = [2u8; 16];
-        let cap = mint(&TEST_KEY, tenant, metrics_signal(), query, now + 1_000);
+        let cap = mint(&TEST_KEY, tenant, metrics_signal(), query, now + HOUR_NS);
 
         pinned_fetch(&service, pinned_with_cap(tenant, query, cap))
             .await
@@ -2807,7 +2815,7 @@ mod tests {
         // missing: no capability at all.
         let missing = pinned_with_cap(tenant, query, Vec::new());
         // bad MAC: a valid capability with one flipped byte.
-        let mut tampered = mint(&TEST_KEY, tenant, signal, query, now + 1_000);
+        let mut tampered = mint(&TEST_KEY, tenant, signal, query, now + HOUR_NS);
         let last = tampered.len() - 1;
         tampered[last] ^= 0x01;
         let bad_mac = pinned_with_cap(tenant, query, tampered);
@@ -2817,13 +2825,13 @@ mod tests {
         let tenant_mismatch = pinned_with_cap(
             [9u8; 16],
             query,
-            mint(&TEST_KEY, tenant, signal, query, now + 1_000),
+            mint(&TEST_KEY, tenant, signal, query, now + HOUR_NS),
         );
         // query mismatch: capability names a different query id.
         let query_mismatch = pinned_with_cap(
             tenant,
             [8u8; 16],
-            mint(&TEST_KEY, tenant, signal, query, now + 1_000),
+            mint(&TEST_KEY, tenant, signal, query, now + HOUR_NS),
         );
 
         let cases = [
@@ -2897,7 +2905,7 @@ mod tests {
         let service = capability_service(now, test_keys(), metrics.clone());
 
         // A genuine, MAC-valid, unexpired capability for tenant A.
-        let cap_for_a = mint(&TEST_KEY, tenant_a, metrics_signal(), query, now + 1_000);
+        let cap_for_a = mint(&TEST_KEY, tenant_a, metrics_signal(), query, now + HOUR_NS);
         // Present it on a fetch that names tenant B on the wire.
         let request = pinned_with_cap(tenant_b, query, cap_for_a);
 
@@ -2937,7 +2945,7 @@ mod tests {
             pinned_with_cap(
                 tenant,
                 query,
-                mint(&key_new, tenant, signal, query, now + 1_000),
+                mint(&key_new, tenant, signal, query, now + HOUR_NS),
             ),
         )
         .await
@@ -2953,7 +2961,7 @@ mod tests {
             pinned_with_cap(
                 tenant,
                 query,
-                mint(&key_old, tenant, signal, query, now + 1_000),
+                mint(&key_old, tenant, signal, query, now + HOUR_NS),
             ),
         )
         .await

@@ -1127,12 +1127,20 @@ impl QueryEngine {
         now_ns: i64,
         deadline: Duration,
     ) -> Result<(Vec<(SeriesId, LabelSet)>, QueryStats), QueryError> {
-        tokio::time::timeout(
+        let deadline_unix_ns = QueryDeadline::from_entry(now_ns, deadline).unix_ns;
+        let outcome = tokio::time::timeout(
             deadline,
-            self.resolve_series_inner(tenant_hash, matchers, window, min_tokens, now_ns),
+            self.resolve_series_inner(
+                tenant_hash,
+                matchers,
+                window,
+                min_tokens,
+                now_ns,
+                deadline_unix_ns,
+            ),
         )
-        .await
-        .map_err(|_| QueryError::DeadlineExceeded { deadline })?
+        .await;
+        unify_deadline(outcome, deadline)
     }
 
     /// [`Self::resolve_series_with_stats`] under one request's
@@ -1184,6 +1192,7 @@ impl QueryEngine {
         window: TimeRange,
         min_tokens: &[CommitToken],
         now_ns: i64,
+        deadline_unix_ns: i64,
     ) -> Result<(Vec<(SeriesId, LabelSet)>, QueryStats), QueryError> {
         if let Some(metric) = log_series::log_metric_of(matchers) {
             return self
@@ -1237,6 +1246,7 @@ impl QueryEngine {
                     window,
                     &accounting,
                     fold_lag,
+                    deadline_unix_ns,
                 )
                 .await?;
             // Union local + remote identities and enforce `max_series` ONCE
@@ -1403,6 +1413,7 @@ impl QueryEngine {
         window: TimeRange,
         accounting: &PhaseAccounting,
         fold_lag: FoldLag,
+        deadline_unix_ns: i64,
     ) -> Result<(Vec<(SeriesId, LabelSet)>, Vec<String>, bool), QueryError> {
         let mut series: Vec<(SeriesId, LabelSet)> = Vec::new();
         let Some(federation) = &self.federation else {
@@ -1427,6 +1438,7 @@ impl QueryEngine {
                 Vec::new(),
                 accounting.scan().clone(),
                 self.config,
+                deadline_unix_ns,
             )
             .await?;
         // Re-enforce the coordinator's bytes-scanned budget over the combined
@@ -2105,7 +2117,13 @@ impl QueryEngine {
             // phase breakdown of its own), but its budget re-check needs
             // `pooled()` to see the local resolve/plan/probe spend too.
             let (fed_runs, fed_hist_runs, fed_stats, fed_warnings, fed_partial) = self
-                .federate_scalar(tenant_hash, fed_plans, &accounting, fold_lag)
+                .federate_scalar(
+                    tenant_hash,
+                    fed_plans,
+                    &accounting,
+                    fold_lag,
+                    deadline_unix_ns,
+                )
                 .await?;
             all_scalar_runs.extend(fed_runs);
             // Merge every remote's native-histogram runs into the same
@@ -2809,6 +2827,7 @@ impl QueryEngine {
         plan_matchers_windows: Vec<(Vec<LabelMatcher>, i64, i64)>,
         accounting: &PhaseAccounting,
         fold_lag: FoldLag,
+        deadline_unix_ns: i64,
     ) -> Result<
         (
             Vec<Vec<FetchedSeriesSoa>>,
@@ -2851,6 +2870,7 @@ impl QueryEngine {
                     Vec::new(),
                     accounting.scan().clone(),
                     self.config,
+                    deadline_unix_ns,
                 )
                 .await?;
             // Re-enforce the coordinator's bytes-scanned budget over the
