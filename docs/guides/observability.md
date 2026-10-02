@@ -412,8 +412,9 @@ The `ravel_catalog_fold_stamped_*` pair shares this prefix and is not part of
 this family. It is stamp coverage, documented under declared-column
 statistics below, and it follows a different rule: it is omitted rather than
 rendered as zeros on any process that can fold by neither route -- a
-`maintain` or `all` process run with `--disable-fold`, and a `gateway`
-process (which mounts no on-demand route either).
+`maintain` process run with `--disable-fold`, and a `gateway` process (which
+mounts no on-demand route either). An `all` process mounts the on-demand
+route, so it renders the pair even under `--disable-fold`.
 
 The `signal` label is the family's per-signal keying, not a convenience. The
 fold runs as one independent task per signal, each with its own loop, so one
@@ -807,13 +808,13 @@ state the two rise together, one entry per stamped carrier.
 
 Unlike the drop tally, the coverage pair renders only when a fold can run in
 this process at all, by either route. Two routes fold, and both accumulate
-these totals: the background fold task, which `maintain` never spawns and
-which `--disable-fold` disables in every other mode, and the on-demand
+these totals: the scheduled fold task, which runs in `maintain` and `all`
+and which `--disable-fold` disables there, and the on-demand
 `POST /api/v1/admin/fold` route, mounted in `all` and `query` whatever
 `--disable-fold` says. So a `--mode all --disable-fold` process DOES render
 the pair: an operator can still fold it by hand, and that fold moves these
 counters. Both series are absent, not zero, exactly where neither route
-exists: every `maintain` process, and a `gateway` process run with
+exists: every `gateway` process, and a `maintain` process run with
 `--disable-fold`. An operator scraping one of those sees
 `ravel_declared_stats_drops_observed_total` present as usual and both
 `ravel_catalog_fold_stamped_*` series missing from the exposition.
