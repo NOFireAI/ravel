@@ -2240,6 +2240,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/*/l1/*",
             "t/*/*/idem/*",
             "t/*/*/del/*",
+            "t/*/*/maint/*",
             "t/*/catalog/*/snap/*",
             "t/*/catalog/*/idx/*",
             "sys/maintain/workers/*",
@@ -2291,6 +2292,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/*/c/*",
             "t/*/*/l1/*",
             "t/*/*/idem/*",
+            "t/*/*/maint/*",
             "t/*/u/*/0001/*",
             "t/*/*/del/*.dreq",
             "t/*/catalog/*/snap/*",
@@ -2599,7 +2601,10 @@ fn every_shipped_deny_is_a_delete_only_prohibition() {
 /// `t/<hash>/u/{l0,c,l1}/0000/...`, so `t/*/*/l0/*` and `t/*/u/*/0000/*` both
 /// match it. That is ADR-0055 section 3 protection working, not a template bug.
 /// What is wrong is reading the `Allow` set alone as the delete capability the
-/// role HOLDS -- for these three pattern pairs it overstates.
+/// role HOLDS -- for these four pattern pairs it overstates. The fourth is the
+/// `maint/*` grant for the unnamed-since markers (ADR-1133): `*` spans `/`, so
+/// `t/<hash>/u/maint/unn/0000/...`, an audit shard-0 marker, matches the Deny
+/// too, and its delete is refused like every other key of that shard.
 ///
 /// Pinning the overlap rather than asserting it away fails in both directions: a
 /// new overlap (a widened delete grant reaching a protected keyspace) and a
@@ -2609,13 +2614,15 @@ const EXPECTED_DELETE_OVERLAPS: &[(&str, &[(&str, &str)])] = &[
     ("gateway", &[]),
     ("query", &[]),
     // The ADR-0055 section 3 legal-hold shard, protected out of the three
-    // level-based grants compaction otherwise deletes.
+    // level-based grants compaction otherwise deletes, and out of the
+    // unnamed-since marker grant.
     (
         "maintain",
         &[
             ("t/*/u/*/0000/*", "t/*/*/c/*"),
             ("t/*/u/*/0000/*", "t/*/*/l0/*"),
             ("t/*/u/*/0000/*", "t/*/*/l1/*"),
+            ("t/*/u/*/0000/*", "t/*/*/maint/*"),
         ],
     ),
     ("admin", &[]),
@@ -8900,6 +8907,67 @@ fn every_doc_qualifies_the_catalog_family_sweep_and_erasure_claim() {
                  sweep_unreferenced_catalog_objects deletes catalog snapshot \
                  and index objects, and a .cstat among them can hold an erased \
                  subject's own column value verbatim"
+            );
+        }
+    }
+}
+
+/// The unnamed-since markers (ADR-1133) live under the per-signal `maint/`
+/// prefix. The retention and superseded-input sweeps write one with
+/// `CreateIfAbsent`, delete it after the objects it gated (or on a re-name or
+/// an anchor mismatch), and the orphan reaper lists `maint/unn/` signal-wide.
+/// A refused marker delete keeps a retention bucket's tombstone, and blocks a
+/// candidate whose marker must be replaced, on every pass (decision 6), so all
+/// three grants are load-bearing.
+#[test]
+fn maintain_template_covers_every_unnamed_marker_call() {
+    use ravel_commit::keys::{
+        record_unnamed_marker_key, retention_unnamed_marker_key, unnamed_marker_prefix,
+    };
+    let tenant = test_tenant();
+    let maintain = load_policy("maintain");
+    let list_prefixes = list_prefix_patterns(&maintain, Some("Allow"));
+    let gets = key_patterns_for(&maintain, &["s3:GetObject"], Some("Allow"));
+    let puts = key_patterns_for(&maintain, &["s3:PutObject"], Some("Allow"));
+    let deletes = delete_key_patterns(&maintain, "Allow");
+    let denied = delete_key_patterns(&maintain, "Deny");
+
+    for signal in ALL_SIGNALS {
+        let prefix = unnamed_marker_prefix(&tenant, signal);
+        let record = compaction_record_key(&tenant, signal, 3, 480_000, hash16())
+            .expect("compaction_record_key");
+        let markers = [
+            retention_unnamed_marker_key(&tenant, signal, 3, 480_000)
+                .expect("retention_unnamed_marker_key"),
+            record_unnamed_marker_key(&record).expect("record_unnamed_marker_key"),
+        ];
+        assert!(
+            list_prefixes.iter().any(|p| glob_matches(p, &prefix)),
+            "maintain: no ListBucket s3:prefix admits {prefix:?}, the orphan \
+             marker reaper's LIST. s3:prefix values: {list_prefixes:?}"
+        );
+        for marker in &markers {
+            assert!(marker.starts_with(&prefix), "{marker:?} under {prefix:?}");
+            assert!(
+                puts.iter().any(|p| glob_matches(p, marker)),
+                "maintain: no PutObject Allow reaches the marker {marker:?}. \
+                 Grants: {puts:?}"
+            );
+            assert!(
+                gets.iter().any(|p| glob_matches(p, marker)),
+                "maintain: no GetObject Allow reaches the marker {marker:?}. \
+                 Grants: {gets:?}"
+            );
+            assert!(
+                deletes.iter().any(|p| glob_matches(p, marker)),
+                "maintain: no delete Allow reaches the marker {marker:?}, so \
+                 every marker delete is refused and its candidate blocks for \
+                 good. Grants: {deletes:?}"
+            );
+            assert!(
+                !denied.iter().any(|p| glob_matches(p, marker)),
+                "maintain: a delete Deny reaches the marker {marker:?}. \
+                 Denies: {denied:?}"
             );
         }
     }

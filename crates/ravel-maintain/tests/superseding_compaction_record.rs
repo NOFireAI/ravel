@@ -49,8 +49,16 @@ fn hour_ns() -> i64 {
     i64::from(HOUR) * NS_PER_HOUR
 }
 
+/// The pinned-query window (ADR-1133) zeroed, so a candidate's unnamed-since
+/// marker is written and clears in the same pass and these tests see the
+/// other delete rules alone. tests/pinned_window.rs pins the window.
 fn cfg() -> CompactorConfig {
-    CompactorConfig::default()
+    CompactorConfig {
+        max_query_duration_ns: 0,
+        head_cache_ttl_ns: 0,
+        clock_skew_allowance_ns: 0,
+        ..CompactorConfig::default()
+    }
 }
 
 /// Past every record's protection horizon, so a deleting sweep pass is not
@@ -59,12 +67,15 @@ fn past_horizon_ns() -> i64 {
     hour_ns() + cfg().protection_horizon_ns + 10 * NS_PER_HOUR
 }
 
+/// Unnamed-since markers (ADR-1133) are left out: a pass writes one for a
+/// candidate HEAD does not name before any hold or refusal is consulted.
 async fn all_keys(store: &dyn ObjectStoreBackend) -> BTreeSet<String> {
     list_all(store, "t/")
         .await
         .expect("list")
         .into_iter()
         .map(|m| m.key)
+        .filter(|key| !key.contains("/maint/unn/"))
         .collect()
 }
 
@@ -281,14 +292,16 @@ fn part_key(record: &CompactionRecord) -> String {
     keys::reconstruct_l1_part_key(record, &record.parts[0]).unwrap()
 }
 
-/// Rule 2 alone at `now_ns` under `lease`.
+/// Rule 2 alone at `now_ns` under `lease`, with the unnamed-since marker
+/// accounting (ADR-1133) cleared: tests/pinned_window.rs pins it, and these
+/// tests compare the delete and hold counts alone.
 async fn sweep_at(
     store: &dyn ObjectStoreBackend,
     b: &Bucket,
     now_ns: i64,
     lease: &dyn LeaseCheck,
 ) -> SupersededSweepOutcome {
-    sweep_superseded(
+    let mut outcome = sweep_superseded(
         store,
         &FixedClock::new(now_ns),
         &cfg(),
@@ -298,7 +311,10 @@ async fn sweep_at(
         b.shard,
     )
     .await
-    .expect("rule 2")
+    .expect("rule 2");
+    outcome.unnamed_markers = Default::default();
+    outcome.unnamed_marker_reap = None;
+    outcome
 }
 
 /// Every key present, less the catalog objects a test put there itself.

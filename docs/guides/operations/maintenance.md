@@ -674,8 +674,38 @@ when the stored horizon does not cover its own 5 min clock-skew allowance, the
 check the server's maintain mode runs at startup. On a bucket with no `sys/gc`
 it bootstraps the object from the maintain defaults, as the server does; a
 `--dry-run` uses those defaults without writing the object. The stored maximum
-query duration and HEAD cache TTL are carried for the pinned-query gate,
-which is not built yet, so they do not change the sweep.
+query duration and HEAD cache TTL set its pinned-query window, as they do the
+server's.
+
+### The pinned-query window
+
+The retention and superseded-input sweeps do not delete an object the moment
+the live HEAD stops naming it. The first pass that finds it unnamed writes an
+unnamed-since marker under `t/<tenant_hash>/<signal>/maint/unn/` and holds it;
+a later pass deletes it once `max_query_duration + head_cache_ttl + 4 *
+clock_skew_allowance` (1 h 20 min 30 s with defaults) has passed on the
+sweeper's clock. Expect every expired bucket and superseded object
+to report `pinned_window` for at least one pass. Retention re-evaluates a
+tombstoned bucket on every maintain tick, so its physical deletion lands about
+one window later than before. The superseded-input sweep reaches an interior
+hour only on the full sweep (`maintain_interior_reverify`, default 6 h): one
+full sweep writes the marker and a later one deletes once it has aged, so an
+interior superseded input goes up to two full-sweep intervals after its
+horizon, one more than before. An erasure request's `.dreq`, which carries the
+subject identifier, is kept until every chain it holds has a marker older than
+the window, so it too lives that much longer. A one-shot `ravel-cli maintain sweep` writes the
+marker and holds on its first run; a second run once the window has passed
+deletes. `--dry-run` writes no marker.
+
+The maintain role needs delete and list on `t/*/*/maint/*`
+(deploy/iam/maintain.json): a refused marker delete keeps a retention
+bucket's tombstone, and blocks a candidate whose marker must be replaced, on
+every pass.
+
+The guarantee is complete only once every maintain process runs a build with
+the gate and `sys/gc` has been moved to format version 2 (below). Until then an
+older maintain process can still delete by the old rule, with no window, beside
+a newer one.
 
 ### Upgrading `sys/gc` to format version 2
 
@@ -1152,7 +1182,7 @@ list is in [the generated CLI reference](../../reference/ravel-cli-flags.md).
 |---|---|
 | `maintain compact-bucket` | One compaction pass over a single sealed bucket, printing the outcome. `--dry-run` computes the same plan and writes nothing. |
 | `maintain compact-tenant` | Compacts every sealed bucket of one tenant and signal across shards. See [compaction](#compaction). |
-| `maintain sweep --tenant <t> --signal <s> --shard <n> [--dry-run]` | One sweep pass (orphan collection, superseded inputs, unreferenced L1) over a shard. It prints the orphans quarantined, the orphan copies to quarantine that were refused, the quarantined objects reaped, the superseded records and data deleted, the superseded deletes refused, the superseded objects held because HEAD names them or cannot be read, the chain groups a legal hold kept, the unreferenced parts deleted, whether the pass covered the whole shard, and a line when the orphan breaker tripped or was overridden. It sweeps on the protection horizon, grace and maximum flush lifetime stored in `sys/gc` (the stored maximum query duration and HEAD cache TTL are carried for the pinned-query gate, which is not built yet) and refuses when the stored horizon does not cover its clock-skew allowance. `--dry-run` reports the eligible set and deletes nothing. |
+| `maintain sweep --tenant <t> --signal <s> --shard <n> [--dry-run]` | One sweep pass (orphan collection, superseded inputs, unreferenced L1) over a shard. It prints the orphans quarantined, the orphan copies to quarantine that were refused, the quarantined objects reaped, the superseded records and data deleted, the superseded deletes refused, the superseded objects held because HEAD names them or cannot be read, the chain groups a legal hold kept, the unreferenced parts deleted, whether the pass covered the whole shard, and a line when the orphan breaker tripped or was overridden. It also prints the superseded objects held on the pinned-query window, the unnamed-since markers written, reset and retired, and what the orphan-marker reap did. It sweeps on the protection horizon, grace and maximum flush lifetime stored in `sys/gc`, holds a candidate HEAD no longer names until its unnamed-since marker is older than the stored maximum query duration plus HEAD cache TTL plus four times its clock-skew allowance, and refuses when the stored horizon does not cover its clock-skew allowance. `--dry-run` reports the eligible set and deletes nothing, and writes no marker. |
 | `maintain status --tenant <t> --signal <s> --shard <n> --hour <n>` | Reports one bucket's state: sealed, tombstoned, compacted, L0 record count, superseded-input count, L1 segments present, unreferenced count. Read-only. |
 | `maintain audit-versions --tenant <t> [--shards <n>]` | Audits live on-object format versions and classifies each format floor. Exits nonzero on any anomaly or contradicted floor. |
 | `maintain migrate` | Raises a format floor. See [format migration](#format-migration). |

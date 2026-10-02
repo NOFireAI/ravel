@@ -17,12 +17,14 @@ use crate::clock::Clock;
 use crate::compact::{ClaimedCompaction, CompactionOutcome, compact_bucket};
 use crate::config::{CompactorConfig, NS_PER_HOUR, RetentionConfig};
 use crate::error::{MaintainError, Result};
+use crate::reachability::MarkerStats;
 use crate::retention::{
     ObservedExpiry, RetentionOutcome, RewriteBound, RewriteBoundRead, SnapshotBlock,
     SnapshotReachability, maintain_bucket_observed, resolve_retention_window_ns,
     retention_sweep_bucket_observed,
 };
 use crate::sweep::LeaseCheck;
+use crate::unnamed_marker::MarkerReapOutcome;
 
 /// One-byte version tag on the advisory cursor payload. The cursor is not a
 /// frozen format; the tag only lets a future encoding change be detected and
@@ -135,6 +137,19 @@ pub struct MaintainReport {
     /// refused. A persistent nonzero value is an operator signal that a HEAD or
     /// part object is corrupt or missing, not the ordinary lagging-fold case.
     pub blocked_by_unreadable_head: usize,
+    /// Expired buckets HEAD no longer names whose physical sweep waits for
+    /// their unnamed-since marker to age past the pinned-query window
+    /// ([`RetentionOutcome::BlockedBySnapshot`] with
+    /// [`crate::retention::SnapshotBlock::PinnedWindow`], ADR-1133). Nothing
+    /// was deleted; the bucket is swept once `observed_unix_ns +
+    /// max_query_duration + head_cache_ttl + 4 * clock_skew_allowance` has
+    /// passed. Every expired bucket reports here for at least one pass.
+    pub blocked_by_pinned_window: usize,
+    /// The unnamed-since marker requests and transitions of this pass.
+    pub unnamed_markers: MarkerStats,
+    /// What this pass's orphan-marker reap did, when it ran (any pass that
+    /// gated a candidate).
+    pub unnamed_marker_reap: Option<MarkerReapOutcome>,
     /// Buckets skipped this pass because the [`MaintainMemo`] already knows them
     /// terminal, so no per-bucket LIST/GET was issued for them.
     /// Always zero on a cold pass and for the non-memoized
@@ -1591,6 +1606,7 @@ pub async fn scan_and_maintain_with_memo(
                 match reason {
                     SnapshotBlock::Named => report.blocked_by_snapshot += 1,
                     SnapshotBlock::Unreadable => report.blocked_by_unreadable_head += 1,
+                    SnapshotBlock::PinnedWindow => report.blocked_by_pinned_window += 1,
                 }
                 report.retention_lag_ns = report.retention_lag_ns.max(
                     expired_bucket_retention_lag_ns(hour, now, retention_window_ns, expiry),
@@ -1659,6 +1675,13 @@ pub async fn scan_and_maintain_with_memo(
             None => memo.forget(&key),
         }
     }
+
+    // The orphan-marker rule (ADR-1133 decision 6) runs on a pass that gated a
+    // candidate, reusing that pass's marker LIST.
+    report.unnamed_marker_reap = reach
+        .reap_after_pass(store, clock, config, &tenant_hash, signal, false)
+        .await;
+    report.unnamed_markers = reach.marker_stats().clone();
 
     // Bound memory to buckets that still exist: a swept-empty bucket disappears
     // from the shard listing entirely, and its stale memo entry can be dropped.

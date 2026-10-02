@@ -1085,7 +1085,10 @@ async fn sweep_refuses_a_skew_uncovered_sys_gc_before_any_store_write() {
 /// `maintain sweep` holds a superseded input on the stored `sys/gc` protection
 /// horizon, not the compiled default: with a stored horizon of 200h and the
 /// compaction record 150h old, the input survives, and the control bucket on
-/// the default 25h05m horizon deletes the same input at the same instant.
+/// the default 25h05m horizon is past its horizon at the same instant. The
+/// control's first run writes the input's unnamed-since marker and holds it
+/// (ADR-1133), and a second run once the pinned-query window has passed
+/// deletes it.
 #[tokio::test]
 async fn sweep_holds_a_superseded_input_on_the_stored_horizon() {
     const NOW_NS: i64 = 999 + 150 * NS_PER_HOUR;
@@ -1135,7 +1138,27 @@ async fn sweep_holds_a_superseded_input_on_the_stored_horizon() {
 
     let (control, control_key) = run(None).await;
     assert!(
+        control.get(&control_key, GetRange::Full).await.is_ok(),
+        "control: the first run past the default horizon writes the marker and holds"
+    );
+    let defaults = ravel_maintain::CompactorConfig::default();
+    let window_ns = defaults.max_query_duration_ns
+        + defaults.head_cache_ttl_ns
+        + 4 * defaults.clock_skew_allowance_ns;
+    ravel_cli::maintain::sweep_at(
+        control.clone() as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
+        "acme",
+        SignalArg::Metrics,
+        0,
+        false,
+        false,
+        ravel_maintain::FixedClock::new(NOW_NS + window_ns),
+    )
+    .await
+    .expect("second sweep runs");
+    assert!(
         control.get(&control_key, GetRange::Full).await.is_err(),
-        "control: past the default horizon the same input is deleted"
+        "control: once the marker has aged past the window the same input is deleted"
     );
 }

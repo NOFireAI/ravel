@@ -42,31 +42,7 @@ row.
 | PinQuery (CachedNames) | A resolve may be served a cached HEAD that still names an object the current HEAD dropped, through drop + HeadCacheTtl inclusive: the head cache serves an entry while its age is at most the TTL, so a pin can name an object for that long after the drop (ADR-1133 decision 3's head_cache_ttl term) | crates/ravel-catalog/src/cache.rs::HeadCache::get | crates/ravel-catalog/src/cache.rs::head_cache_expires_after_ttl (served at age equal to the TTL, refused one nanosecond later) | none |
 | PinQuery (Flight ticket term) | A Flight SQL ticket minted on one process and redeemed on another reads under the lesser of the ticket's embedded deadline and the redeeming process's own clock plus its budget, so with both clocks inside clock_skew_allowance the effective deadline is at most 2 * ClockSkew past the minting process's deadline in true time (ADR-1133 decision 3's first two sigma); the model adds that term as a choice in 0..2 * ClockSkew at PinQuery | crates/ravel-sql/src/flight/mod.rs::clamp_ticket_deadline_ns | crates/ravel-sql/src/flight/mod.rs::redemption_clamps_a_ticket_deadline_that_outlives_the_gc_horizon::redemption_honors_a_ticket_deadline_tighter_than_the_gc_horizon | none |
 | PinnedServes / PermittedNeeds / QueryPermits / ExpireQuery (exclusive deadline) | A pinned query reads only while the clock is before its deadline, and is expired at the deadline itself: the log-series fetch treats now at or past the deadline as exceeded, and Flight SQL redemption refuses at now_ns >= deadline_ns | crates/ravel-query/src/log_series.rs::deadline_exceeded crates/ravel-sql/src/flight/stream.rs::statement_stream::fragment_stream::SnapshotInvalidated | crates/ravel-query/tests/log_series.rs::log_series_deadline_exceeded_before_any_fetch crates/ravel-sql/tests/flight.rs::an_expired_ticket_is_rejected | A redemption at exactly now_ns == deadline_ns: an_expired_ticket_is_rejected advances one second past the deadline, so it does not pin the boundary; log_series_deadline_exceeded_before_any_fetch sets the deadline to Instant::now() before the check, which pins at-or-past but not the exact tick |
-
-## Pending: ADR-1133 actions with no Rust symbol yet
-
-These model actions and guards have no implementation yet. Each lands with the
-ADR-1133 marker task, and its row moves into the table above, citing the
-symbol, in the same change. They sit outside the table because
-`scripts/check-tla.sh traceability` requires every table row to resolve to an
-existing Rust symbol.
-
-- `WriteMarker`: no Rust symbol yet: lands with the ADR-1133 marker task. The
-  first pass that finds a candidate past its horizon and unnamed writes its
-  unnamed-since marker CreateIfAbsent, carrying the writer's clock reading as
-  `observed_unix_ns` (decision 1). The model's single WriteMarker step takes
-  that reading in the same step as the HEAD read that found the candidate
-  unnamed, the order the open ADR-1133 amendment (PR #2354) requires: the
-  reading is taken after that HEAD GET returns.
-- `RenewMarker`: no Rust symbol yet: lands with the ADR-1133 marker task. A
-  marker whose anchor does not match the candidate's current anchor counts as
-  absent; it is deleted and a fresh one written, restarting the window
-  (decision 2).
-- `ClearRenamedMarker`: no Rust symbol yet: lands with the ADR-1133 marker
-  task. A pass that finds the candidate named by HEAD again deletes its
-  marker (decision 5).
-- `WindowPermits` (the WindowGate delete guard on `RetentionSweep` and
-  `SupersededSweep`): no Rust symbol yet: lands with the ADR-1133 marker task.
-  A retention or superseded delete also needs a matching marker with
-  `observed + max_query_duration + head_cache_ttl + 4 * clock_skew_allowance
-  <= now` on the deleting sweeper's clock (decision 3).
+| WriteMarker | The first pass that finds a candidate past its horizon and unnamed writes its unnamed-since marker CreateIfAbsent, carrying the writer's clock reading as `observed_unix_ns` (decision 1). The reading is taken after the HEAD GET that found the candidate unnamed has returned (the clock-reading amendment), which the model's single WriteMarker step expresses by taking it in the same step as that HEAD read; an `AlreadyExists` reads the existing marker back | crates/ravel-maintain/src/reachability.rs::marker_gate::write_fresh_marker::put_marker::AlreadyExists | crates/ravel-maintain/tests/pinned_window.rs::the_marker_is_stamped_after_the_head_get_not_at_the_pass_start::superseded_group_is_held_until_its_marker_ages | none |
+| RenewMarker | A marker whose anchor identity does not match the candidate's current tombstone or record counts as absent: it is deleted and a fresh one written, restarting the window (decision 2) | crates/ravel-maintain/src/reachability.rs::marker_gate::reset_mismatched::write_fresh_marker | crates/ravel-maintain/tests/pinned_window.rs::a_stale_marker_does_not_count_for_a_replacement_tombstone::a_marker_for_another_record_is_replaced_and_restarts_the_window | none |
+| ClearRenamedMarker | A pass that finds the candidate named by HEAD again deletes its marker, so a later unnamed observation writes a fresh one (decision 5) | crates/ravel-maintain/src/reachability.rs::marker_gate::reset_renamed::delete_marker | crates/ravel-maintain/tests/pinned_window.rs::a_renamed_candidate_restarts_its_window | none |
+| WindowPermits (the WindowGate delete guard on RetentionSweep and SupersededSweep) | A retention or superseded delete also needs a matching marker with `observed + max_query_duration + head_cache_ttl + 4 * clock_skew_allowance <= now` on the deleting sweeper's clock; until then the gate answers `SnapshotBlock::PinnedWindow` (decision 3) | crates/ravel-maintain/src/unnamed_marker.rs::PinnedQueryWindow::has_elapsed crates/ravel-maintain/src/reachability.rs::window_verdict::PinnedWindow | crates/ravel-maintain/tests/pinned_window.rs::each_window_term_is_pinned_one_nanosecond_each_side::hourly_folds_rewriting_head_and_its_one_part_do_not_stall_the_sweep | none |

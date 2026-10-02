@@ -42,8 +42,16 @@ use uuid::Uuid;
 /// `retention_version_window.rs` follows for its own counter).
 static COUNTER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// The pinned-query window (ADR-1133) zeroed, so a candidate's unnamed-since
+/// marker is written and clears in the same pass and these tests see the
+/// other delete rules alone. tests/pinned_window.rs pins the window.
 fn cfg() -> CompactorConfig {
-    CompactorConfig::default()
+    CompactorConfig {
+        max_query_duration_ns: 0,
+        head_cache_ttl_ns: 0,
+        clock_skew_allowance_ns: 0,
+        ..CompactorConfig::default()
+    }
 }
 
 /// A retention config whose window for the test tenant is exactly the floor, so
@@ -137,12 +145,15 @@ async fn seed_compacted_bucket(
     (bucket, commit_keys)
 }
 
+/// Unnamed-since markers (ADR-1133) are left out: a pass writes one for a
+/// candidate HEAD does not name before any hold or refusal is consulted.
 async fn all_keys(store: &dyn ObjectStoreBackend) -> BTreeSet<String> {
     list_all(store, "")
         .await
         .expect("list")
         .into_iter()
         .map(|meta| meta.key)
+        .filter(|key| !key.contains("/maint/unn/"))
         .collect()
 }
 

@@ -42,8 +42,16 @@ enum Sig {
     Logs,
 }
 
+/// The pinned-query window (ADR-1133) zeroed, so a candidate's unnamed-since
+/// marker is written and clears in the same pass and these tests see the
+/// other delete rules alone. tests/pinned_window.rs pins the window.
 fn cfg() -> CompactorConfig {
-    CompactorConfig::default()
+    CompactorConfig {
+        max_query_duration_ns: 0,
+        head_cache_ttl_ns: 0,
+        clock_skew_allowance_ns: 0,
+        ..CompactorConfig::default()
+    }
 }
 
 fn metrics_specs() -> Vec<InputSpec> {
