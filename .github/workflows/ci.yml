@@ -1003,6 +1003,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check ravel-bench --features parquet-baseline
         run: cargo check --locked -p ravel-bench --features parquet-baseline
+        # read_accounting.rs exists only under this feature, so its counter
+        # tests run here or nowhere.
+      - name: Test ravel-bench --features parquet-baseline read_accounting
+        run: cargo test --locked -p ravel-bench --features parquet-baseline --lib read_accounting::
       - name: Check ravel-bench --features flight-egress
         run: cargo check --locked -p ravel-bench --features flight-egress
       - name: Check ravel-bench --features profiling

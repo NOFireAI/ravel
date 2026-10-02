@@ -388,7 +388,9 @@ mod tests {
     use super::*;
 
     /// Issue #2391: `CountingBackend` must forward the pinned-read methods to
-    /// its inner store, never falling back to the trait's refusing default.
+    /// its inner store. Without the overrides, `get_pinned` refuses with
+    /// `StoreError::Unsupported`, and `get_with_pin`/`pin_of` return an
+    /// ETag-only pin that drops the version selector `MemoryStore` reports.
     #[tokio::test]
     async fn counting_backend_forwards_pinned_reads() {
         let inner = MemoryStore::new();
@@ -402,14 +404,21 @@ mod tests {
             .expect("seed key");
         let store = CountingBackend::new(inner);
 
-        let (meta, pin) = store.inner().pin_of("k").await.expect("pin_of on inner");
-        let _ = meta;
+        let (meta, pin) = store.pin_of("k").await.expect("pin_of");
+        assert_eq!(meta.key, "k");
+        assert!(pin.version.is_some(), "pin_of dropped the version: {pin:?}");
 
         let with_pin = store
             .get_with_pin("k", GetRange::Full)
             .await
             .expect("get_with_pin");
         assert_eq!(with_pin.outcome.data.as_ref(), b"hello");
+        assert!(
+            with_pin.pin.version.is_some(),
+            "get_with_pin dropped the version: {:?}",
+            with_pin.pin
+        );
+        assert_eq!(with_pin.pin, pin);
 
         let pinned = store
             .get_pinned("k", GetRange::Full, &pin)
