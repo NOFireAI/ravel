@@ -88,9 +88,13 @@ Attributes:
 - `query.status`: `ok` or `error`, the request's outcome, or `attempted`.
   A SQL `CREATE` or `DROP` statement that passes the `ddl` capability check
   writes two records: `attempted` before it touches storage, then `ok` or
-  `error` with its outcome. Every other request, including a DDL statement
-  refused for the capability, writes one. To count statements rather than
-  records, leave out `attempted` rows.
+  `error` with its outcome. A DDL statement refused for the capability, and
+  a query that reaches execution, write one. A request refused before that
+  writes none: one that fails authentication, a body that is not valid JSON,
+  a malformed `timeout`, `start` or `end`, and a query the fleet-wide
+  admission limit refuses. An absent record therefore does not mean an
+  absent request. To count statements rather than records, leave out
+  `attempted` rows.
 - `query.text`: the query text as that surface understands it, in the posture
   `--audit-text` selected: the SQL statement for `sql`, the PromQL expression
   for `promql` and `analytics`, the joined selector list for `labels`,
