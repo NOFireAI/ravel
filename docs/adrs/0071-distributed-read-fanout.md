@@ -422,6 +422,13 @@ a MAC-authenticated claim set naming exactly what it authorizes.
   durable state: object storage remains the only durable backend and is
   untouched. Expiry reuses the deadline the protocol already enforces
   cluster-wide, so no new clock-synchronization assumption is introduced.
+- Expiry bounds the read, not only the admission (issue #2385). The
+  worker checks expiry again once the request is admitted, since a
+  capability can expire while it queues, and refuses it `expired` before
+  any store request. An admitted slice then runs only until the expiry on
+  the same clock: reaching it drops the run, so no store request is issued
+  after it, and the slice ends `DeadlineExceeded`, which the coordinator
+  handles as any refused fetch (re-dispatch once, then run locally).
 - Rejects are typed and counted (`ravel_distrib_*` gains a
   capability-reject counter with a closed reason label: missing, bad MAC,
   expired, tenant mismatch, query mismatch).
