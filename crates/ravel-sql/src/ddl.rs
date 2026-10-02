@@ -65,9 +65,10 @@ use crate::validate::{DdlIntent, DdlValidationError, validate_ddl};
 
 /// The grace a manifest write holds before another apply may supersede it
 /// (`ravel_pqtable::writer::apply`'s `min_grace_ms`), sourced from ADR-2040's
-/// own Lifecycle text: 11 minutes. This is the default used until a caller
-/// passes the deployment's own sweep grace (`sys/gc`'s
-/// `max_query_duration`), which the HTTP wiring of issue #2054 does.
+/// own Lifecycle text: 11 minutes. [`SqlExecutor::execute_ddl`] uses this
+/// value only when the executor has no [`SqlExecutor::with_ddl_min_grace_ms`]
+/// value installed; the HTTP wiring of issue #2054 installs the deployment's
+/// own sweep grace (`sys/gc`'s `max_query_duration`) there instead.
 pub const DEFAULT_MIN_GRACE_MS: u64 = 660_000;
 
 /// How many listing pages [`one_object_under`] reads while looking for one
@@ -814,7 +815,7 @@ impl SqlExecutor {
                     &name,
                     write_intent,
                     clock,
-                    DEFAULT_MIN_GRACE_MS,
+                    self.ddl_min_grace_ms(),
                 )
                 .await?;
 
@@ -841,7 +842,7 @@ impl SqlExecutor {
                     &name,
                     write_intent,
                     clock,
-                    DEFAULT_MIN_GRACE_MS,
+                    self.ddl_min_grace_ms(),
                 )
                 .await?;
                 Ok(match outcome {
