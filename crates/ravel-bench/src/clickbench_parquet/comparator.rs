@@ -487,26 +487,26 @@ fn identifier_tail(expr: &Expr) -> Option<&str> {
 fn resolve_projection_index(expr: &Expr, projection: &[SelectItem]) -> Option<usize> {
     if let Some(order_name) = identifier_tail(expr) {
         for (i, item) in projection.iter().enumerate() {
-            if let SelectItem::ExprWithAlias { alias, .. } = item {
-                if alias.value.eq_ignore_ascii_case(order_name) {
-                    return Some(i);
-                }
+            if let SelectItem::ExprWithAlias { alias, .. } = item
+                && alias.value.eq_ignore_ascii_case(order_name)
+            {
+                return Some(i);
             }
         }
         for (i, item) in projection.iter().enumerate() {
-            if let SelectItem::UnnamedExpr(pexpr) = item {
-                if identifier_tail(pexpr) == Some(order_name) {
-                    return Some(i);
-                }
+            if let SelectItem::UnnamedExpr(pexpr) = item
+                && identifier_tail(pexpr) == Some(order_name)
+            {
+                return Some(i);
             }
         }
     }
     let order_text = expr.to_string();
     for (i, item) in projection.iter().enumerate() {
-        if let SelectItem::UnnamedExpr(pexpr) = item {
-            if pexpr.to_string() == order_text {
-                return Some(i);
-            }
+        if let SelectItem::UnnamedExpr(pexpr) = item
+            && pexpr.to_string() == order_text
+        {
+            return Some(i);
         }
     }
     None
@@ -735,17 +735,17 @@ pub fn compare(
                 used_extra[i] = true;
                 matched = true;
                 for (col, (mc, ec)) in m.iter().zip(e.iter()).enumerate() {
-                    if let (Cell::Float(mb), Cell::Float(eb)) = (mc, ec) {
-                        if mb != eb {
-                            float_mismatches.push(FloatMismatch {
-                                column: col,
-                                row_key: m.clone(),
-                                reference_bits: *mb,
-                                subject_bits: *eb,
-                                reference_f64: f64::from_bits(*mb),
-                                subject_f64: f64::from_bits(*eb),
-                            });
-                        }
+                    if let (Cell::Float(mb), Cell::Float(eb)) = (mc, ec)
+                        && mb != eb
+                    {
+                        float_mismatches.push(FloatMismatch {
+                            column: col,
+                            row_key: m.clone(),
+                            reference_bits: *mb,
+                            subject_bits: *eb,
+                            reference_f64: f64::from_bits(*mb),
+                            subject_f64: f64::from_bits(*eb),
+                        });
                     }
                 }
                 break;
