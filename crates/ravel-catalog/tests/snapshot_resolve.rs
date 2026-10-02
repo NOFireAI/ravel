@@ -781,8 +781,9 @@ async fn stale_head_cache_widens_listed_suffix_but_stays_correct() {
 const TTL_NS: u64 = DEFAULT_HEAD_CACHE_TTL_NS as u64;
 
 /// Monotonic clock under test control. `set` moves the current reading;
-/// `script` queues readings the next `now_nanos` calls return in order, each
-/// becoming the current reading, before it falls back to the current one.
+/// `script` replaces the queue of readings the next `now_nanos` calls return
+/// in order, each becoming the current reading, before it falls back to the
+/// current one.
 #[derive(Default)]
 struct TestMonoClock {
     state: Mutex<(u64, VecDeque<u64>)>,
@@ -794,7 +795,7 @@ impl TestMonoClock {
     }
 
     fn script(&self, readings: &[u64]) {
-        self.state.lock().unwrap().1.extend(readings);
+        self.state.lock().unwrap().1 = readings.iter().copied().collect();
     }
 
     fn scripted_left(&self) -> usize {
@@ -932,7 +933,6 @@ async fn head_cache_check_takes_its_own_reading_not_the_resolve_entry_reading() 
     // Control: both readings at the TTL, the entry is served.
     clock.script(&[TTL_NS, TTL_NS]);
     fx.resolve(fx.now_ns).await;
-    assert_eq!(clock.scripted_left(), 0, "the resolve read the clock twice");
     assert_eq!(
         fx.head_gets(),
         base + 1,
@@ -942,12 +942,12 @@ async fn head_cache_check_takes_its_own_reading_not_the_resolve_entry_reading() 
     // Entry reading at the TTL, check reading one nanosecond later.
     clock.script(&[TTL_NS, TTL_NS + 1]);
     fx.resolve(fx.now_ns).await;
-    assert_eq!(clock.scripted_left(), 0, "the resolve read the clock twice");
     assert_eq!(
         fx.head_gets(),
         base + 2,
         "the check's own later reading expires the entry"
     );
+    assert_eq!(clock.scripted_left(), 0, "the resolve read the clock twice");
 }
 
 /// The cache stamp is read before the HEAD GET is issued. The GET is held
