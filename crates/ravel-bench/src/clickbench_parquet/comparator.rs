@@ -262,6 +262,19 @@ pub fn rows_from_arrow(batches: &[RecordBatch]) -> Result<Vec<Vec<Cell>>, Compar
     Ok(rows)
 }
 
+/// The [`ColumnKind`] of every column in `batch`'s schema, in order. Used to
+/// type a JSON reference's cells against the subject batch they are compared
+/// to (see [`rows_from_json`]).
+pub fn schema_kinds(batch: &RecordBatch) -> Result<Vec<ColumnKind>, ComparatorError> {
+    batch
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(index, field)| column_kind(field.data_type(), index))
+        .collect()
+}
+
 /// Howard Hinnant's `days_from_civil`: days since the Unix epoch for a
 /// proleptic-Gregorian calendar date. No dependency on a calendar crate
 /// (`chrono` is not a workspace dependency); this is the standard
@@ -771,44 +784,60 @@ mod tests {
     /// Required test: tie cut by LIMIT passes when subject picked different
     /// tied rows at the boundary (a GROUP BY ... ORDER BY c DESC LIMIT N
     /// shape, where several groups share the smallest included count).
+    ///
+    /// key = column 0, rows ordered descending by it. Both the top row
+    /// (key=10) and the bottom row (key=1) are boundary key tuples (D7:
+    /// both ends are exempt, since OFFSET truncates the top edge the same
+    /// way LIMIT truncates the bottom), so rows at either end may legally
+    /// differ in content between reference and subject; the two interior
+    /// rows (key=8, key=5) are NOT boundary and must still match exactly.
     #[test]
     fn boundary_tie_with_different_rows_passes() {
-        // key = column 0 (the count), rows ordered descending by it.
-        // reference's last row (count=1, id="a") ties with other id="b"/"c"
-        // rows a real engine could have picked instead (not present in
-        // either truncated result, since this reference/subject pair only
-        // show what each engine actually returned).
         let reference = vec![
-            vec![Cell::Int(5), Cell::Str("x".into())],
+            vec![Cell::Int(10), Cell::Str("u".into())],
+            vec![Cell::Int(8), Cell::Str("v".into())],
+            vec![Cell::Int(5), Cell::Str("w".into())],
             vec![Cell::Int(1), Cell::Str("a".into())],
         ];
         let subject = vec![
-            vec![Cell::Int(5), Cell::Str("x".into())],
+            // top row: different id, but key=10 is a boundary tuple.
+            vec![Cell::Int(10), Cell::Str("u2".into())],
+            vec![Cell::Int(8), Cell::Str("v".into())],
+            vec![Cell::Int(5), Cell::Str("w".into())],
+            // bottom row: different id, but key=1 is a boundary tuple.
             vec![Cell::Int(1), Cell::Str("b".into())],
         ];
-        let report = compare(&reference, &subject, &tie(vec![0], Some(2), 0)).expect("compare");
+        let report = compare(&reference, &subject, &tie(vec![0], Some(4), 0)).expect("compare");
         assert_eq!(report.verdict, Verdict::Pass);
-        assert_eq!(report.tie_rows_reduced, 2);
+        // Both boundary rows on both sides: 2 (reference) + 2 (subject).
+        assert_eq!(report.tie_rows_reduced, 4);
     }
 
     /// Required test: fails when subject picked a row outside the tie (its
-    /// replacement row's key does not match the boundary key at all, so it
-    /// cannot be a legitimate tie-break variation).
+    /// replacement row's key does not match either boundary key tuple at
+    /// all, so it cannot be a legitimate tie-break variation of the bottom
+    /// edge).
     #[test]
     fn boundary_tie_with_row_outside_tie_fails() {
         let reference = vec![
-            vec![Cell::Int(5), Cell::Str("x".into())],
+            vec![Cell::Int(10), Cell::Str("u".into())],
+            vec![Cell::Int(8), Cell::Str("v".into())],
+            vec![Cell::Int(5), Cell::Str("w".into())],
             vec![Cell::Int(1), Cell::Str("a".into())],
         ];
         let subject = vec![
-            vec![Cell::Int(5), Cell::Str("x".into())],
-            // key (count) is 9, not 1: not a member of the boundary tie.
+            vec![Cell::Int(10), Cell::Str("u2".into())],
+            vec![Cell::Int(8), Cell::Str("v".into())],
+            vec![Cell::Int(5), Cell::Str("w".into())],
+            // key=9 matches neither boundary tuple (10 or 1): not a
+            // legitimate tie-break variation, an interior row instead.
             vec![Cell::Int(9), Cell::Str("z".into())],
         ];
-        let report = compare(&reference, &subject, &tie(vec![0], Some(2), 0)).expect("compare");
+        let report = compare(&reference, &subject, &tie(vec![0], Some(4), 0)).expect("compare");
         assert_eq!(report.verdict, Verdict::Fail);
-        assert_eq!(report.row_mismatch.missing.len(), 1);
+        assert_eq!(report.row_mismatch.missing.len(), 0);
         assert_eq!(report.row_mismatch.extra.len(), 1);
+        assert_eq!(report.row_mismatch.extra[0][1], Cell::Str("z".into()));
     }
 
     /// Distinguishing test for wrong implementation (a): reducing EVERY row
@@ -972,15 +1001,19 @@ mod tests {
         .expect("build batch");
 
         let arrow_rows = rows_from_arrow(std::slice::from_ref(&batch)).expect("normalize arrow");
-        let kinds = [
-            ColumnKind::Bool,
-            ColumnKind::Int,
-            ColumnKind::Float,
-            ColumnKind::Str,
-            ColumnKind::Bytes,
-            ColumnKind::Date,
-            ColumnKind::Ts,
-        ];
+        let kinds = schema_kinds(&batch).expect("derive kinds from schema");
+        assert_eq!(
+            kinds,
+            vec![
+                ColumnKind::Bool,
+                ColumnKind::Int,
+                ColumnKind::Float,
+                ColumnKind::Str,
+                ColumnKind::Bytes,
+                ColumnKind::Date,
+                ColumnKind::Ts,
+            ]
+        );
         let json_rows: Vec<serde_json::Value> = vec![serde_json::json!([
             true, 42, 1.5, "hi", "hi", "2013-07-15", "2013-07-15T01:02:03Z"
         ])];
