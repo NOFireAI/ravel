@@ -23,7 +23,9 @@
 
 use bytes::Bytes;
 use prost::Message;
-use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError, Version};
+use ravel_object_store::{
+    GetRange, ObjectStoreBackend, PageToken, PutMode, PutOptions, StoreError, Version,
+};
 use ravel_proto::parquet_table::v1 as pb;
 use ravel_types::TenantHash;
 
@@ -363,6 +365,91 @@ pub fn resolve_location(grants: &[Grant], url: &str) -> Result<(Grant, KeyPrefix
     }
 }
 
+/// How many listing pages [`one_object_under`] reads before it stops looking.
+/// A location whose first admitted object is further into the listing than
+/// this reports [`ProbeObject::PageCapReached`], which bounds the search on a
+/// bucket whose listing is dominated by keys the location does not admit.
+pub const MAX_PROBE_LIST_PAGES: usize = 8;
+
+/// What [`one_object_under`] found under a location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeObject {
+    /// The key of one object the grant admits, whose key ends in `.parquet`
+    /// and which holds at least one byte.
+    Found(String),
+    /// The listing ran to its end without one.
+    Empty,
+    /// [`MAX_PROBE_LIST_PAGES`] pages were read without one, and the listing
+    /// had more.
+    PageCapReached,
+}
+
+/// Is `meta` an object a reader can probe: admitted by `grant`, named
+/// `*.parquet`, and not empty? A zero-byte key is a folder marker (S3
+/// consoles write `data/`; an Azure hierarchical namespace reports a
+/// directory as a zero-byte blob) or an empty file, and a ranged read of
+/// either fails.
+fn is_probeable(grant: &Grant, key: &str, size: u64) -> bool {
+    size > 0
+        && key.ends_with(".parquet")
+        && contains_key(grant, &grant.profile, &grant.bucket, key.as_bytes())
+}
+
+/// One object a reader can probe under the location `location_key`, looked
+/// for within [`MAX_PROBE_LIST_PAGES`] listing pages. `location_key` is the
+/// key [`resolve_location`] returned and `directory` its flag, with `grant`
+/// the grant that admits it.
+///
+/// An object is returned only if `grant` admits its key ([`contains_key`], so
+/// the location `data/t1` never offers `data/t10/x.parquet`), the key ends in
+/// `.parquet`, and its size is not zero.
+///
+/// A location that does not name a directory may name one object, so its key
+/// is checked with a HEAD first: `object_store` appends `/` to every
+/// non-empty list prefix, so listing `data/x.parquet` never returns
+/// `data/x.parquet` itself. When that object is absent or fails the checks
+/// above, the location is listed as a prefix, which is what finds the files
+/// under a zero-byte directory blob. The listing prefix always carries a
+/// trailing `/` (none for the whole bucket), whatever the store does with a
+/// prefix that lacks one.
+pub async fn one_object_under(
+    store: &dyn ObjectStoreBackend,
+    grant: &Grant,
+    location_key: &str,
+    directory: bool,
+) -> Result<ProbeObject, StoreError> {
+    if !directory && !location_key.is_empty() {
+        match store.head(location_key).await {
+            Ok(meta) if is_probeable(grant, location_key, meta.size) => {
+                return Ok(ProbeObject::Found(location_key.to_string()));
+            }
+            Ok(_) | Err(StoreError::NotFound) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    let list_prefix = if location_key.is_empty() {
+        String::new()
+    } else {
+        format!("{location_key}/")
+    };
+    let mut page: Option<PageToken> = None;
+    for _ in 0..MAX_PROBE_LIST_PAGES {
+        let listed = store.list(&list_prefix, page).await?;
+        if let Some(meta) = listed
+            .objects
+            .iter()
+            .find(|meta| is_probeable(grant, &meta.key, meta.size))
+        {
+            return Ok(ProbeObject::Found(meta.key.clone()));
+        }
+        match listed.next {
+            Some(next) => page = Some(next),
+            None => return Ok(ProbeObject::Empty),
+        }
+    }
+    Ok(ProbeObject::PageCapReached)
+}
+
 /// Check that `grant` may join `grants`: no overlap with another profile, and
 /// not a location already granted.
 fn check_addable(grants: &[Grant], grant: &Grant) -> Result<(), GrantsError> {
@@ -607,7 +694,9 @@ pub async fn remove(
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+    };
     use ravel_object_store::memory::MemoryStore;
 
     use super::*;
@@ -1119,5 +1208,186 @@ mod tests {
             .map(|g| g.prefix)
             .collect();
         assert_eq!(prefixes, vec!["one".to_string(), "two".to_string()]);
+    }
+
+    async fn put_sized(store: &MemoryStore, key: &str, bytes: &'static [u8]) {
+        store
+            .put(key, Bytes::from_static(bytes), PutOptions::default())
+            .await
+            .expect("put");
+    }
+
+    /// Probe the location `url` against a grant of the same URL.
+    async fn probe(store: &MemoryStore, url: &str) -> ProbeObject {
+        let admitting = grant("prod", url);
+        let parsed = parse_location(url).expect("location");
+        one_object_under(store, &admitting, &parsed.key.key, parsed.key.directory)
+            .await
+            .expect("probe")
+    }
+
+    #[tokio::test]
+    async fn a_folder_marker_and_an_empty_parquet_are_skipped() {
+        let store = MemoryStore::new();
+        put_sized(&store, "data/t1/", b"").await;
+        put_sized(&store, "data/t1/empty.parquet", b"").await;
+        put_sized(&store, "data/t1/full.parquet", b"PAR1").await;
+        for url in ["s3://b/data/t1", "s3://b/data/t1/"] {
+            assert_eq!(
+                probe(&store, url).await,
+                ProbeObject::Found("data/t1/full.parquet".to_string()),
+                "{url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_non_parquet_key_is_not_offered() {
+        let store = MemoryStore::new();
+        put_sized(&store, "data/t1/_SUCCESS", b"ok").await;
+        put_sized(&store, "data/t1/notes.parquet.crc", b"ok").await;
+        assert_eq!(probe(&store, "s3://b/data/t1/").await, ProbeObject::Empty);
+        put_sized(&store, "data/t1/z.parquet", b"PAR1").await;
+        assert_eq!(
+            probe(&store, "s3://b/data/t1/").await,
+            ProbeObject::Found("data/t1/z.parquet".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sibling_prefix_is_not_offered() {
+        let store = MemoryStore::new();
+        put_sized(&store, "data/t10/x.parquet", b"PAR1").await;
+        for url in ["s3://b/data/t1", "s3://b/data/t1/"] {
+            assert_eq!(probe(&store, url).await, ProbeObject::Empty, "{url}");
+        }
+    }
+
+    /// Keys such as `data/t1-a.parquet` sort before everything under `data/t1/`
+    /// and `contains_key` refuses them, so a listing prefix without the
+    /// trailing slash spends its page budget on them and never reaches the
+    /// admitted file.
+    #[tokio::test]
+    async fn the_listing_prefix_carries_a_trailing_slash() {
+        let store = MemoryStore::with_page_size(1);
+        for index in 0..=MAX_PROBE_LIST_PAGES {
+            put_sized(&store, &format!("data/t1-{index}.parquet"), b"PAR1").await;
+        }
+        put_sized(&store, "data/t1/real.parquet", b"PAR1").await;
+        assert_eq!(
+            probe(&store, "s3://b/data/t1").await,
+            ProbeObject::Found("data/t1/real.parquet".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_object_location_is_checked_by_head_against_all_three_rules() {
+        let store = MemoryStore::new();
+        put_sized(&store, "data/zero.parquet", b"").await;
+        put_sized(&store, "data/one.parquet", b"PAR1").await;
+        put_sized(&store, "data/one.csv", b"a,b").await;
+        assert_eq!(
+            probe(&store, "s3://b/data/zero.parquet").await,
+            ProbeObject::Empty
+        );
+        assert_eq!(
+            probe(&store, "s3://b/data/one.csv").await,
+            ProbeObject::Empty
+        );
+        assert_eq!(
+            probe(&store, "s3://b/data/one.parquet").await,
+            ProbeObject::Found("data/one.parquet".to_string())
+        );
+    }
+
+    /// A grant that does not admit the object's key refuses it even when the
+    /// location key names it, so the helper never hands back a key the read
+    /// path would refuse.
+    #[tokio::test]
+    async fn a_single_object_outside_the_grant_is_not_offered() {
+        let store = MemoryStore::new();
+        put_sized(&store, "data2/one.parquet", b"PAR1").await;
+        let narrow = grant("prod", "s3://b/data");
+        assert_eq!(
+            one_object_under(&store, &narrow, "data2/one.parquet", false)
+                .await
+                .expect("probe"),
+            ProbeObject::Empty
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zero_byte_directory_blob_is_listed_through() {
+        let store = MemoryStore::new();
+        put_sized(&store, "data", b"").await;
+        put_sized(&store, "data/part-0.parquet", b"PAR1").await;
+        assert_eq!(
+            probe(&store, "s3://b/data").await,
+            ProbeObject::Found("data/part-0.parquet".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_whole_bucket_grant_lists_from_the_root() {
+        let store = MemoryStore::new();
+        put_sized(&store, "root.parquet", b"PAR1").await;
+        assert_eq!(
+            probe(&store, "s3://b").await,
+            ProbeObject::Found("root.parquet".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_admitted_object_on_the_third_page_is_found() {
+        let store = MemoryStore::with_page_size(2);
+        put_sized(&store, "data/t1/", b"").await;
+        put_sized(&store, "data/t1/a.parquet", b"").await;
+        put_sized(&store, "data/t1/b.txt", b"x").await;
+        put_sized(&store, "data/t1/c.parquet", b"").await;
+        put_sized(&store, "data/t1/d.txt", b"x").await;
+        put_sized(&store, "data/t1/e.parquet", b"PAR1").await;
+        assert_eq!(
+            probe(&store, "s3://b/data/t1/").await,
+            ProbeObject::Found("data/t1/e.parquet".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_listing_stopped_at_the_page_cap_is_not_reported_empty() {
+        let store = MemoryStore::with_page_size(1);
+        for index in 0..=MAX_PROBE_LIST_PAGES {
+            put_sized(&store, &format!("data/{index}.txt"), b"x").await;
+        }
+        assert_eq!(
+            probe(&store, "s3://b/data/").await,
+            ProbeObject::PageCapReached
+        );
+        let exact = MemoryStore::with_page_size(1);
+        for index in 0..MAX_PROBE_LIST_PAGES {
+            put_sized(&exact, &format!("data/{index}.txt"), b"x").await;
+        }
+        // The last page is full, so its token still points at a next page that
+        // turns out to be empty: the cap is reached, not the end.
+        assert_eq!(
+            probe(&exact, "s3://b/data/").await,
+            ProbeObject::PageCapReached
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_head_is_an_error_not_an_empty_location() {
+        let store = FaultStore::new(
+            MemoryStore::new(),
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::Head, ScriptedFault::Permanent("denied".into()))
+                    .with_key_contains("data/one.parquet"),
+            ),
+        );
+        let admitting = grant("prod", "s3://b/data/one.parquet");
+        let err = one_object_under(&store, &admitting, "data/one.parquet", false)
+            .await
+            .expect_err("a failed HEAD");
+        assert!(matches!(err, StoreError::Permanent(_)), "{err:?}");
+        assert_eq!(store.fault_count(Op::Head, FaultKind::Permanent), 1);
     }
 }
