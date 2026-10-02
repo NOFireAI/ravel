@@ -1947,6 +1947,10 @@ async fn max_flush_delay_decides_whether_two_writes_coalesce() {
     );
 }
 
+/// A drain-time re-flush period no test run reaches: an hour, past the ack
+/// deadline ([`write_ack_deadline`]) of the test that uses it.
+const UNREACHED_REFLUSH_PERIOD: Duration = Duration::from_secs(3600);
+
 /// A load whose last slice stays under `--target-bytes` completes under a
 /// raised `--max-flush-delay`, with that tail published by the loader's
 /// end-of-input flush (issue #801). This is the run-burner the flag shipped
@@ -1972,11 +1976,15 @@ async fn max_flush_delay_decides_whether_two_writes_coalesce() {
 /// therefore holds the decoder, so no `Done` reaches the loader, until the
 /// router is quiet: every write routed and the size flush finished.
 ///
-/// What this cannot tell apart: the drain-time re-flush ticker also publishes
-/// with the manual trigger, so if the end-of-input `flush_all` were moved
-/// after `drain_inflight`, the ticker would publish the tail about 2 s later
-/// and the counts asserted here would still hold. The test pins the flush mix
-/// and object count, not which of the two manual flushes ran.
+/// The drain-time re-flush ticker also publishes with the manual trigger, so
+/// its period is pushed to [`UNREACHED_REFLUSH_PERIOD`], past the 120 s ack
+/// deadline the 60 s delay scales to ([`write_ack_deadline`]). The tail can
+/// therefore be published only by the end-of-input `flush_all`.
+///
+/// Prove-the-test: move `router.flush_all()` after `drain_inflight`, or
+/// delete it, and the drain waits on an ack nothing will answer before the
+/// ticker's first tick. The router's ack deadline fires after 120 s, the load
+/// returns a batch failure, and the `expect` on the report fails.
 #[tokio::test]
 async fn a_tail_below_target_is_published_by_the_end_of_input_flush() {
     use ravel_object_store::memory::MemoryStore;
@@ -2004,7 +2012,7 @@ async fn a_tail_below_target_is_published_by_the_end_of_input_flush() {
         }
     });
 
-    let load_fut = load_instrumented(
+    let load_fut = load_with_drain_reflush_period(
         Arc::clone(&store),
         &pq,
         "acme",
@@ -2017,12 +2025,14 @@ async fn a_tail_below_target_is_published_by_the_end_of_input_flush() {
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         1,
         TARGET,
-        Some(Duration::from_secs(600)),
+        Some(Duration::from_secs(60)),
         NOW_NS,
         Arc::clone(&clock) as Arc<dyn Clock>,
         LoadPath::Columnar,
         None,
         Some(on_batch_queued),
+        RlogZstdLevel::DEFAULT,
+        UNREACHED_REFLUSH_PERIOD,
     );
 
     let driver = async {
