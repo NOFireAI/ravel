@@ -8,7 +8,7 @@
       "Resource": "arn:aws:s3:::my-ravel-bucket",
       "Condition": {
         "StringLike": {
-          "s3:prefix": ["t/", "t/*/*/l0/*", "t/*/*/c/*", "t/*/*/l1/*", "t/*/*/idem/*", "t/*/*/del/*", "t/*/catalog/*/snap/*", "t/*/catalog/*/idx/*", "sys/maintain/workers/*", "sys/maintain/memo/*", "sys/query/workers/*", "quarantine/t/*/*/l0/*", "t/*/a/", "quarantine/t/*/a/", "t/*/pq/t/*"]
+          "s3:prefix": ["t/", "t/*/*/l0/*", "t/*/*/c/*", "t/*/*/l1/*", "t/*/*/idem/*", "t/*/*/del/*", "t/*/*/maint/*", "t/*/catalog/*/snap/*", "t/*/catalog/*/idx/*", "sys/maintain/workers/*", "sys/maintain/memo/*", "sys/query/workers/*", "quarantine/t/*/*/l0/*", "t/*/a/", "quarantine/t/*/a/", "t/*/pq/t/*"]
         }
       }
     },
@@ -64,6 +64,7 @@
         "arn:aws:s3:::my-ravel-bucket/t/*/*/c/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/l1/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/idem/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/maint/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/u/*/0001/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/del/*.dreq",
         "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/snap/*",

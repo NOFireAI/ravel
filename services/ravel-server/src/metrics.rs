@@ -297,7 +297,8 @@ pub enum Label {
     /// or `store_error`. Shares the `reason` key with `RejectReason`,
     /// `ScrubReason`, `ScrubUnreadableReason` and `SupersededHeldReason`.
     AlertRetentionSkipReason(crate::maintain::AlertRetentionSkipReason),
-    /// Why rule 2 held a superseded input: `named` or `unreadable_head`.
+    /// Why rule 2 held a superseded input: `named`, `unreadable_head` or
+    /// `pinned_window`.
     /// Shares the `reason` key with the other reason variants.
     SupersededHeldReason(crate::maintain::SupersededHeldReason),
     Cache(CacheFamily),
@@ -3569,6 +3570,11 @@ pub struct MaintenanceSafetySignalSnapshot {
     /// could not be read, summed per pass since process start. Backs
     /// `ravel_maintain_superseded_inputs_held_total{reason="unreadable_head"}`.
     pub superseded_inputs_held_unreadable_head: u64,
+    /// Superseded objects rule 2 held because HEAD no longer names them but
+    /// their unnamed-since marker has not yet aged past the pinned-query
+    /// window (ADR-1133), summed per pass since process start. Backs
+    /// `ravel_maintain_superseded_inputs_held_total{reason="pinned_window"}`.
+    pub superseded_inputs_held_pinned_window: u64,
     /// Supersession chain groups rule 2 skipped whole because a legal hold
     /// protects a key in them, summed per pass since process start. Backs
     /// `ravel_maintain_superseded_groups_held_by_legal_hold_total`.
@@ -3728,6 +3734,10 @@ impl MaintenanceSafetySnapshot {
                     superseded_inputs_held_unreadable_head: metrics.superseded_inputs_held(
                         signal,
                         crate::maintain::SupersededHeldReason::UnreadableHead,
+                    ),
+                    superseded_inputs_held_pinned_window: metrics.superseded_inputs_held(
+                        signal,
+                        crate::maintain::SupersededHeldReason::PinnedWindow,
                     ),
                     superseded_groups_held_by_legal_hold: metrics
                         .superseded_groups_held_by_legal_hold(signal),
@@ -3961,7 +3971,11 @@ fn render_maintain_safety_family(
          HEAD snapshot still names the object, which clears once the fold reconciles its hour \
          or HEAD is rebuilt. reason=unreadable_head: HEAD or a covering snapshot part is \
          present and cannot be read, so the sweep holds fail-closed; any sustained growth there \
-         needs an operator.",
+         needs an operator. reason=pinned_window: HEAD no longer names the object, but the \
+         sweep first saw it unnamed less than max_query_duration + head_cache_ttl + 4 * \
+         clock_skew_allowance ago, so a query that pinned an earlier HEAD could still be reading \
+         it; this clears on its own once that window passes and needs no operator action unless \
+         it never clears.",
         "counter",
     );
     for signal in &snapshot.signals {
@@ -3973,6 +3987,10 @@ fn render_maintain_safety_family(
             (
                 crate::maintain::SupersededHeldReason::UnreadableHead,
                 signal.superseded_inputs_held_unreadable_head,
+            ),
+            (
+                crate::maintain::SupersededHeldReason::PinnedWindow,
+                signal.superseded_inputs_held_pinned_window,
             ),
         ] {
             write_sample(
@@ -3996,6 +4014,10 @@ fn render_maintain_safety_family(
             (
                 crate::maintain::SupersededHeldReason::UnreadableHead,
                 counts.held_unreadable_head,
+            ),
+            (
+                crate::maintain::SupersededHeldReason::PinnedWindow,
+                counts.held_pinned_window,
             ),
         ] {
             write_sample(
@@ -10280,6 +10302,7 @@ mod tests {
                     superseded_deletes_refused: 20,
                     superseded_inputs_held_named: 21,
                     superseded_inputs_held_unreadable_head: 22,
+                    superseded_inputs_held_pinned_window: 25,
                     superseded_groups_held_by_legal_hold: 23,
                     dreq_held_by_superseded_inputs: 24,
                     quarantine_reaped: 6,
@@ -10304,6 +10327,7 @@ mod tests {
                     superseded_deletes_refused: 0,
                     superseded_inputs_held_named: 0,
                     superseded_inputs_held_unreadable_head: 0,
+                    superseded_inputs_held_pinned_window: 0,
                     superseded_groups_held_by_legal_hold: 0,
                     dreq_held_by_superseded_inputs: 0,
                     quarantine_reaped: 0,
@@ -11260,6 +11284,7 @@ mod tests {
                 superseded_deletes_refused: 4,
                 superseded_held_by_snapshot: 7,
                 superseded_held_by_unreadable_head: 8,
+                superseded_held_by_pinned_window: 25,
                 superseded_groups_held_by_legal_hold: 9,
                 ..Default::default()
             },
@@ -11278,6 +11303,7 @@ mod tests {
                 superseded_deletes_refused: 13,
                 superseded_held_by_snapshot: 14,
                 superseded_held_by_unreadable_head: 15,
+                superseded_held_by_pinned_window: 26,
                 superseded_groups_held_by_legal_hold: 16,
                 ..Default::default()
             },
@@ -11344,6 +11370,11 @@ mod tests {
                  signal=\"metrics\",reason=\"unreadable_head\"} 8",
             ),
             (
+                "# TYPE ravel_maintain_superseded_inputs_held_total counter",
+                "ravel_maintain_superseded_inputs_held_total{mode=\"maintain\",\
+                 signal=\"metrics\",reason=\"pinned_window\"} 25",
+            ),
+            (
                 "# TYPE ravel_maintain_superseded_groups_held_by_legal_hold_total counter",
                 "ravel_maintain_superseded_groups_held_by_legal_hold_total{mode=\"maintain\",\
                  signal=\"metrics\"} 9",
@@ -11367,6 +11398,11 @@ mod tests {
                 "# TYPE ravel_maintain_superseded_inputs_held_total counter",
                 "ravel_maintain_superseded_inputs_held_total{mode=\"maintain\",\
                  signal=\"audit\",reason=\"unreadable_head\"} 15",
+            ),
+            (
+                "# TYPE ravel_maintain_superseded_inputs_held_total counter",
+                "ravel_maintain_superseded_inputs_held_total{mode=\"maintain\",\
+                 signal=\"audit\",reason=\"pinned_window\"} 26",
             ),
             (
                 "# TYPE ravel_maintain_superseded_groups_held_by_legal_hold_total counter",
@@ -11430,6 +11466,7 @@ mod tests {
                             deletes_refused: 1,
                             held_named: 1,
                             held_unreadable_head: 1,
+                            held_pinned_window: 1,
                             groups_held_by_legal_hold: 1,
                         },
                     )
@@ -11446,6 +11483,7 @@ mod tests {
                 superseded_deletes_refused: 1,
                 superseded_inputs_held_named: 1,
                 superseded_inputs_held_unreadable_head: 1,
+                superseded_inputs_held_pinned_window: 1,
                 superseded_groups_held_by_legal_hold: 1,
                 dreq_held_by_superseded_inputs: 1,
                 quarantine_reaped: 1,

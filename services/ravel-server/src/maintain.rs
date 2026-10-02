@@ -308,18 +308,24 @@ pub enum SupersededHeldReason {
     /// HEAD or a covering snapshot part was present and could not be read
     /// ([`ravel_maintain::SweepReport::superseded_held_by_unreadable_head`]).
     UnreadableHead,
+    /// HEAD names no object of the group, but its unnamed-since marker is
+    /// missing, mismatched or younger than the pinned-query window (ADR-1133;
+    /// [`ravel_maintain::SweepReport::superseded_held_by_pinned_window`]).
+    PinnedWindow,
 }
 
 impl SupersededHeldReason {
-    pub const ALL: [SupersededHeldReason; 2] = [
+    pub const ALL: [SupersededHeldReason; 3] = [
         SupersededHeldReason::Named,
         SupersededHeldReason::UnreadableHead,
+        SupersededHeldReason::PinnedWindow,
     ];
 
     fn index(self) -> usize {
         match self {
             SupersededHeldReason::Named => 0,
             SupersededHeldReason::UnreadableHead => 1,
+            SupersededHeldReason::PinnedWindow => 2,
         }
     }
 
@@ -328,6 +334,7 @@ impl SupersededHeldReason {
         match self {
             SupersededHeldReason::Named => "named",
             SupersededHeldReason::UnreadableHead => "unreadable_head",
+            SupersededHeldReason::PinnedWindow => "pinned_window",
         }
     }
 
@@ -335,6 +342,7 @@ impl SupersededHeldReason {
         match self {
             SupersededHeldReason::Named => report.superseded_held_by_snapshot,
             SupersededHeldReason::UnreadableHead => report.superseded_held_by_unreadable_head,
+            SupersededHeldReason::PinnedWindow => report.superseded_held_by_pinned_window,
         }
     }
 }
@@ -346,6 +354,7 @@ pub struct UnmaintainedSupersededCounts {
     pub deletes_refused: u64,
     pub held_named: u64,
     pub held_unreadable_head: u64,
+    pub held_pinned_window: u64,
     pub groups_held_by_legal_hold: u64,
 }
 
@@ -458,6 +467,8 @@ impl MaintenanceSafetyMetrics {
                     .load(Ordering::Relaxed),
                 held_named: held[SupersededHeldReason::Named.index()].load(Ordering::Relaxed),
                 held_unreadable_head: held[SupersededHeldReason::UnreadableHead.index()]
+                    .load(Ordering::Relaxed),
+                held_pinned_window: held[SupersededHeldReason::PinnedWindow.index()]
                     .load(Ordering::Relaxed),
                 groups_held_by_legal_hold: self.unmaintained_superseded_groups_held_by_legal_hold
                     [i]
@@ -2488,6 +2499,10 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
                         claims_acquired = report.claims_acquired,
                         claims_stolen = report.claims_stolen,
                         lag_bound_gets = report.lag_bound_gets,
+                        // Expired buckets waiting on their unnamed-since
+                        // marker (ADR-1133), and this pass's marker writes.
+                        blocked_by_pinned_window = report.blocked_by_pinned_window,
+                        unnamed_markers_written = report.unnamed_markers.written,
                         "maintenance: retention + compaction pass complete"
                     );
                     safety.record_scan(signal, &report);
@@ -2557,6 +2572,10 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
                         superseded_records = report.superseded_records_deleted,
                         superseded_data = report.superseded_data_deleted,
                         unreferenced_parts = report.unreferenced_parts_deleted,
+                        superseded_held_pinned_window = report.superseded_held_by_pinned_window,
+                        unnamed_markers_written = report.unnamed_markers.written,
+                        unnamed_markers_reaped =
+                            report.unnamed_marker_reap.as_ref().map_or(0, |r| r.reaped),
                         "maintenance: sweep pass complete"
                     );
                     if report.orphan_breaker_tripped {
@@ -6070,7 +6089,15 @@ mod tests {
         let done_key =
             keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
 
-        let compactor = CompactorConfig::default();
+        // The pinned-query window (ADR-1133) zeroed: tick 2's deleting rule 2
+        // pass writes the chain's marker and reclaims it at once, so the
+        // erasure-request sweep sees nothing held.
+        let compactor = CompactorConfig {
+            max_query_duration_ns: 0,
+            head_cache_ttl_ns: 0,
+            clock_skew_allowance_ns: 0,
+            ..CompactorConfig::default()
+        };
         let retention = RetentionConfig::default();
         let mut memo = MaintainMemo::with_default_interval();
         let safety = MaintenanceSafetyMetrics::default();
@@ -8252,7 +8279,9 @@ mod tests {
     /// Issue #2073 item 3: a superseded-input sweep adds the exact recorded
     /// size of every L0 data object it deletes to `bytes_reclaimed`. Tick 1
     /// compacts two inputs; tick 2, past the compaction record's protection
-    /// horizon, deletes both inputs and nothing else that carries a size.
+    /// horizon, holds them on the pinned-query window (ADR-1133), and tick 3,
+    /// once the window has passed, deletes both inputs and nothing else that
+    /// carries a size.
     /// Watch it fail: drop `.saturating_add(report.superseded_data_bytes)` from
     /// `record_sweep`; "every superseded input" reads left 0, right the two
     /// sizes' sum.
@@ -8271,7 +8300,12 @@ mod tests {
         }
         assert_ne!(input_sizes[0], input_sizes[1], "the inputs' sizes differ");
         let sizes: u64 = input_sizes.iter().sum();
-        let compactor = CompactorConfig::default();
+        // A full sweep on every tick: tick 3 falls inside the default full-sweep
+        // cadence, and its zone-scoped sweep does not reach the compacted hour.
+        let compactor = CompactorConfig {
+            interior_reverify_ns: 0,
+            ..CompactorConfig::default()
+        };
         let retention = RetentionConfig::default();
         let worker = solo_worker();
         let live = worker.solo_live_set();
@@ -8289,6 +8323,9 @@ mod tests {
         assert_eq!(safety.objects_deleted_superseded_data_deleted(), 0);
         assert_eq!(safety.bytes_reclaimed(Signal::Metrics), 0);
 
+        // Tick 2, past the horizon: HEAD names neither input, so the tick
+        // writes the group's unnamed-since marker and holds both inputs for
+        // the pinned-query window (ADR-1133).
         let past_horizon = written_ns + compactor.protection_horizon_ns + 1_000_000_000;
         clock.set(past_horizon);
         store.set_clock_ms((past_horizon / 1_000_000) as u64);
@@ -8297,10 +8334,28 @@ mod tests {
             &worker, &live,
         )
         .await;
+        assert_eq!(safety.objects_deleted_superseded_data_deleted(), 0);
+        assert_eq!(
+            safety.superseded_inputs_held(Signal::Metrics, SupersededHeldReason::PinnedWindow),
+            4,
+            "tick 2 holds both inputs and their commit records on the pinned-query window"
+        );
+
+        // Tick 3, once the marker is exactly as old as the window.
+        let window_ns = compactor.max_query_duration_ns
+            + compactor.head_cache_ttl_ns
+            + 4 * compactor.clock_skew_allowance_ns;
+        clock.set(past_horizon + window_ns);
+        store.set_clock_ms(((past_horizon + window_ns) / 1_000_000) as u64);
+        run_tick_with_clock(
+            &clock, &store, &tenant, &compactor, &retention, 1, &mut memo, &safety, &ownership,
+            &worker, &live,
+        )
+        .await;
         assert_eq!(
             safety.objects_deleted_superseded_data_deleted(),
             2,
-            "tick 2 deletes both superseded inputs"
+            "tick 3 deletes both superseded inputs"
         );
         assert_eq!(
             safety.bytes_reclaimed(Signal::Metrics),

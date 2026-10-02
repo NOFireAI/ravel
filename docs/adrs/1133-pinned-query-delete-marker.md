@@ -1,6 +1,6 @@
 # ADR-1133: an unnamed-since marker gates sweep deletes on the pinned-query window
 
-Status: Accepted (2026-10-01; revised 2026-10-02 after review; amended 2026-10-02)
+Status: Accepted (2026-10-01; revised 2026-10-02 after review; amended 2026-10-02, twice)
 
 ## Context
 
@@ -29,7 +29,7 @@ The first time a sweep pass finds a delete candidate past its horizon and not na
 The markers live under the per-signal maintenance prefix:
 
 - **Retention:** one marker per tombstoned bucket, `t/<tenant_hash>/<signal>/maint/unn/<shard>/<ingest_hour>/retire.unn`.
-- **Superseded inputs:** one marker per chain group, keyed by the record the group is entered from (the record whose `created_unix_ns` anchors the horizon), `t/<tenant_hash>/<signal>/maint/unn/<shard>/<ingest_hour>/<record file stem>.unn`.
+- **Superseded inputs:** one marker per chain group, keyed by the record the group is entered from (the record whose `created_unix_ns` anchors the horizon), `t/<tenant_hash>/<signal>/maint/unn/<shard>/<ingest_hour>/<record file stem>.unn`. See the marker-scope amendment below: the marker is one per entering record, shared by every group that record's entry gathers.
 
 This placement avoids two problems:
 - **Commit-path classification.** The commit prefix `c/<shard>/<ingest_hour>/` holds only shapes that `partition_bucket_entry` (crates/ravel-commit/src/keys.rs) classifies. Any other key there is a fail-loud error, in this build and in older ones.
@@ -105,12 +105,12 @@ This is defence in depth. A dropped object is not expected to be named again: to
 
 ### 6. Fail-closed, ordering, scope and cleanup
 
-- **Any doubt blocks.** A `get`, `put` or `delete` error on a marker, a body that does not decode, or an anchor that cannot be read blocks the delete (`Unreadable`) and never permits it. A HEAD that is absent or unreadable keeps its existing ADR-0020 answer, except that a Clear verdict still requires an aged, matching marker: no Clear path skips decision 3.
+- **Any doubt blocks.** A `get`, `put` or `delete` error on a marker, a body that does not decode, or an anchor that cannot be read blocks the delete (`Unreadable`) and never permits it. A HEAD that is absent or unreadable keeps its existing ADR-0020 answer, except that a Clear verdict still requires an aged, matching marker: no Clear path skips decision 3. The marker-scope amendment below makes two corrections here: a retention tombstone that cannot be read fails the pass, and the alerts signal keeps its HEAD answer.
 - **Retention:** the bucket's objects are deleted, then the marker, then `retire.tmb` last, after the existing LIST-verified-empty check. The marker sits outside the bucket's commit prefix, so that check is unaffected.
-- **Superseded:** the group's objects are deleted, then the marker, then the record it is keyed by.
+- **Superseded:** the group's objects are deleted, then the marker, then the record it is keyed by (corrected by the marker-scope amendment below: the keying record is not deleted by this rule).
 - **Scope.** Markers are written only by the retention and superseded-input sweeps, never for the alerts signal: its tombstone-free retention rule is separate (crates/ravel-maintain/src/alert_retention.rs). An observing pass writes none (decision 3), and neither does a dry run.
 - **Orphan markers.** A chain group can be re-rooted when a later rewrite record pulls the group's entering record into its own group (crates/ravel-maintain/src/sweep.rs), so the key a marker was named by is not stable for the candidate's lifetime. That is the main source of orphans, with crashes between the deletes and the mixed-version case from decision 2. A new rule in docs/deletion-and-gc.md's rule table reaps them:
-  - once per `protection_horizon` per `(tenant, signal)`, or on any pass that gated a candidate, one signal-wide LIST of `maint/unn/`, which spans every shard, including after a reshard;
+  - once per `protection_horizon` per `(tenant, signal)`, or on any pass that gated a candidate, one signal-wide LIST of `maint/unn/`, which spans every shard, including after a reshard (the marker-scope amendment below gives the cadence as built);
   - it deletes each marker whose anchor no longer exists and whose `observed_unix_ns` is older than `protection_horizon` on the sweeper's clock;
   - a key under `maint/unn/` that does not parse is counted and skipped, never deleted and never fatal.
 
@@ -138,7 +138,7 @@ Per candidate:
 - one `get` of the small body per pass while its window runs, cached per pass in `SnapshotReachability`;
 - one `delete` when it goes.
 
-Per tenant and signal, one LIST of `maint/unn/` per `protection_horizon` or gating pass. The superseded sweep's markers are per chain group, not per object. All of it is counted under the sweep's existing request accounting.
+Per tenant and signal, one LIST of `maint/unn/` per `protection_horizon` or gating pass. The superseded sweep's markers are per chain group, not per object. All of it is counted under the sweep's existing request accounting. The marker-scope amendment below corrects both: the LIST runs per shard pass, and a superseded marker is per entering record.
 
 ```mermaid
 sequenceDiagram
@@ -197,7 +197,7 @@ sequenceDiagram
     - the physical-erasure bound `.done + protection_horizon + one sweep interval`, which grows by the window;
     - the list of readers the guarantee does not cover.
   - **Code comments:** the `LeaseCheck` doc comment in crates/ravel-maintain/src/sweep.rs, and `head_cache_ttl`'s doc comment in crates/ravel-catalog/src/config.rs.
-- **Latency.** A delete candidate's physical delete moves later by at most `max_query_duration + head_cache_ttl + 4 * clock_skew_allowance` after a sweep first sees it unnamed, plus one pass interval. An erasure request's `.dreq` lives longer by the same amount: it is deleted only once the observing pass holds nothing the request's rewrites superseded, and every `PinnedWindow` block is a hold. The `.dreq` carries the subject identifier, so this delays the end of its retention, not only the physical delete.
+- **Latency.** A delete candidate's physical delete moves later by at most `max_query_duration + head_cache_ttl + 4 * clock_skew_allowance` after a sweep first sees it unnamed, plus one pass interval (for a superseded input in an interior hour the pass interval is the full-sweep interval, see the marker-scope amendment below). An erasure request's `.dreq` lives longer by the same amount: it is deleted only once the observing pass holds nothing the request's rewrites superseded, and every `PinnedWindow` block is a hold. The `.dreq` carries the subject identifier, so this delays the end of its retention, not only the physical delete.
 - **Reuse.** From the preserved branch `task/1adcccde-8eaa-42d2-ab7d-a45949fdbbc6/result`, these carry over: the `PinnedWindow` block reason, its `/metrics` label and CLI line, the repaired negative control and its `.expect`, and the pinned-reader and stall-test scaffolding. Its anchor code does not carry over.
 - **Tests the implementation owes:**
   - each term of the condition pinned one nanosecond each side: `max_query_duration`, `head_cache_ttl` and `4 * clock_skew_allowance`;
@@ -238,3 +238,25 @@ Consequences for the implementation:
 - crates/ravel-query's `prefetch` derives the log selector's deadline from the query's `eval_deadline`, with a test that a log fetch started late in a query stops at the query's deadline, not at its own start plus the deadline duration.
 - The marker task reads `observed_unix_ns` after the HEAD GET, and a test pins a marker written in a pass whose start time predates the drop.
 - The lifecycle model makes reader deadlines exclusive and keeps the gate at `<=`.
+
+## Amendment (2026-10-02): marker scope, order, cadence and the exceptions as built
+
+<!-- amendment-applies: sections="1. The sweep records when it first saw a candidate unnamed|6. Fail-closed, ordering, scope and cleanup|8. Cost|Consequences" pointer="marker-scope amendment" -->
+
+A checkpoint review of the implementation (issue #1133) found that decisions 1, 6 and 8 describe the superseded marker's scope, the delete order, the reaper cadence and two exceptions differently from the code. The code is the intended design; this records it.
+
+**(a) A superseded marker is keyed by the entering record and gates every group that record's entry gathers.** One compaction or rewrite record's entry gathers one chain group per input it names (crates/ravel-maintain/src/sweep.rs, `gather_l0_inputs`), and all of them share the one marker keyed by that record (`sweep_superseded_impl`, phase B). The marker gate runs once per marker key on one combined HEAD answer (`combine_head_gates`): unreadable if any group under the key is unreadable, else named if any is named, else clear. A lease-held group's HEAD answer counts too, so a held group the HEAD still names keeps the marker unwritten for its siblings. The marker is kept while any group under it is held, blocked or stopped by a refused delete, so a retry finishes under the aged marker rather than restarting the window. Tests: crates/ravel-maintain/tests/pinned_window.rs, `a_named_group_holds_every_group_under_its_marker`, `a_held_group_still_named_keeps_its_marker_unwritten` and `a_retry_after_a_partial_delete_keeps_the_aged_marker`.
+
+**(b) Superseded delete order.** Every object of every group under the marker goes first, chain records included, and then the marker, only once every one of those groups was deleted whole (`sweep_superseded_impl`, phase C). The keying record is never a member of its own group, so this rule does not delete it: it goes later, by retention of its bucket or as a superseded predecessor in a later record's group. Decision 6's "then the record it is keyed by" does not happen in the same pass.
+
+**(c) Why one marker per record is sound: the gated set is stable.** Every input the superseded sweep attributes to a record lies in the inputs of its overlap component's single authoritative winner (`AuthoritativeInputs::superseded_view` over `select_authoritative_compaction_records`), and the winner set is fixed once the record's horizon has passed. A late overlapping or dominating record could change it only by publishing after that, and a compaction or rewrite run that has outlived `max_compaction_lifetime` abandons without publishing (crates/ravel-maintain/src/publish.rs, `publish_record_with_conservation`, and crates/ravel-maintain/src/erasure_rewrite.rs, `publish_rewrite_record`). This rests on `max_compaction_lifetime` (1 h, compiled, with no server flag) being below `protection_horizon` (25 h 5 min by default). That holds for the defaults, but no startup check enforces it: a deployment that sets `max_query_duration` and `grace` small enough to put `protection_horizon` under 1 h breaks the premise.
+
+**(d) Reaper cadence as built.** The orphan-marker reaper runs per shard, at the end of every deleting pass that gated a candidate and of every full `sweep_shard` pass (crates/ravel-maintain/src/reachability.rs, `reap_after_pass`), not once per `protection_horizon` per `(tenant, signal)`. Each run is one signal-wide LIST of `maint/unn/`, reused from the gate when that pass already listed, plus one anchor HEAD for each listed marker the pass did not gate, write or delete (crates/ravel-maintain/src/unnamed_marker.rs, `reap_listed`). A failed anchor HEAD, marker GET or marker DELETE is counted (`MarkerReapOutcome::failed`) and the reap continues with the next key. The gate's own LIST runs once per shard pass that gates an unnamed candidate, and once per deleting shard pass that finds a named one, so decision 8's "one LIST per `protection_horizon` or gating pass" per tenant and signal is per shard pass instead.
+
+**(e) A dry run and the observing pass.** A dry run writes and deletes no marker, and answers a missing or mismatched marker as the deleting pass would after writing one at that instant: held for a nonzero window (`MarkerPolicy::DryRun`, `read_only_verdict`). The erasure-request sweep's observing pass holds such a candidate (`MarkerPolicy::Observe`).
+
+**(f) The alerts signal keeps its HEAD answer.** No catalog HEAD names alert records, so `SnapshotReachability::marker_gate` returns the HEAD answer for `Signal::Alerts` without reading or writing a marker. This is the one exception to decision 6's "no Clear path skips decision 3".
+
+**(g) A retention tombstone that cannot be read fails the pass.** The retention sweep reads the tombstone before the gate (crates/ravel-maintain/src/retention.rs, `get_tombstone_versioned`), and a read error returns the error rather than answering `Unreadable`: nothing is deleted and no marker is read or written (test `an_unreadable_anchor_blocks`). A superseded group whose anchor record the pass did not read still answers `Unreadable` (`superseded_anchor` returning `None`).
+
+**(h) Latency for an interior hour.** The superseded-input sweep reaches an interior hour only on the full sweep (`interior_reverify_ns`, default 6 h; per-tick passes list only the head and tail hours, `sweep_shard_zoned`). The first full sweep past the horizon writes the marker and the first full sweep at which it has aged deletes, so such an input goes up to two full-sweep intervals after its horizon, and the Consequences' "plus one pass interval" is a full-sweep interval there. An erasure request's `.dreq` lives longer by the same amount. Retention is not on this cadence: a tombstoned bucket awaiting its sweep is never memoized terminal, so the unit scan re-evaluates it every maintain tick (crates/ravel-maintain/src/scan.rs).

@@ -398,6 +398,59 @@ async fn two_maintain_workers_reach_and_report_full_ownership_on_real_metrics() 
     b.shutdown().await.expect("graceful shutdown b");
 }
 
+/// Seed an unnamed-since marker (ADR-1133) for every compaction record in
+/// `bucket`, as a deleting sweep would have written it at `observed_unix_ns`.
+/// A running server reads the window terms from `sys/gc` and the wall clock,
+/// so a test that needs the first tick to reclaim a chain starts it with an
+/// already-aged marker.
+async fn seed_aged_unnamed_markers(
+    store: &dyn ObjectStoreBackend,
+    bucket: &ravel_maintain::Bucket,
+    observed_unix_ns: i64,
+) -> usize {
+    let prefix = keys::commit_shard_hour_prefix(
+        &bucket.tenant_hash,
+        bucket.signal,
+        bucket.shard,
+        bucket.ingest_hour_bucket,
+    )
+    .expect("bucket prefix");
+    let mut seeded = 0;
+    for meta in ravel_object_store::list_all(store, &prefix)
+        .await
+        .expect("list bucket")
+    {
+        if keys::parse_compaction_record_key(&meta.key).is_err() {
+            continue;
+        }
+        let got = store
+            .get(&meta.key, ravel_object_store::GetRange::Full)
+            .await
+            .expect("get record");
+        let compaction = record::decode_compaction(got.data.as_ref()).expect("decode record");
+        let marker = ravel_maintain::UnnamedMarker {
+            observed_unix_ns,
+            anchor: ravel_maintain::MarkerAnchor {
+                kind: ravel_maintain::MarkerKind::Superseded,
+                key: meta.key.clone(),
+                anchor_unix_ns: compaction.created_unix_ns,
+                version: got.version.0.clone(),
+            },
+            head_version: String::new(),
+        };
+        store
+            .put(
+                &keys::record_unnamed_marker_key(&meta.key).expect("marker key"),
+                marker.encode().into(),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("seed marker");
+        seeded += 1;
+    }
+    seeded
+}
+
 /// Build a single-worker `Mode::Maintain` config over `store`, `shard_count`
 /// shards, a 1-second maintenance interval, and `compactor` in place of
 /// `CompactorConfig::default()`. Used by the L0-pending/deleted-objects
@@ -591,6 +644,16 @@ async fn one_tick_drops_pending_by_compacted_count_and_raises_deleted_by_swept_c
             ravel_maintain::CompactionOutcome::Compacted { .. }
         ),
         "bucket B must actually compact its two L0 inputs before the server ever starts: {pre_compact_outcome:?}"
+    );
+    assert_eq!(
+        seed_aged_unnamed_markers(
+            store.as_ref(),
+            &bucket_b,
+            ravel_maintain::Clock::now_ns(&pre_compact_clock),
+        )
+        .await,
+        1,
+        "bucket B's one compaction record gets an aged marker"
     );
 
     let store_dyn: Arc<dyn ObjectStoreBackend> = store.clone();
@@ -1116,9 +1179,14 @@ async fn one_clocked_tick_moves_every_backlog_and_throughput_figure_by_the_exact
         .await
         .expect("put quarantined object");
 
+    // The pinned-query window (ADR-1133) zeroed, so tick 2 reclaims bucket B
+    // and sweeps bucket R in the tick that first finds them unnamed.
     let tick_config = |min_compaction_inputs: usize| CompactorConfig {
         min_compaction_inputs,
         interior_reverify_ns: 0,
+        max_query_duration_ns: 0,
+        head_cache_ttl_ns: 0,
+        clock_skew_allowance_ns: 0,
         ..CompactorConfig::default()
     };
     let retention = RetentionConfig::from_policy(

@@ -157,6 +157,30 @@ message RetentionTombstone {
   uint64 record_count_observed = 8;
 }
 
+// Unnamed-since marker (ADR-1133 decision 1). Additive. Written once,
+// CreateIfAbsent, by the retention or superseded-input sweep under
+// t/<tenant_hash>/<signal>/maint/unn/<shard>/<ingest_hour>/, the first time a
+// pass finds a delete candidate past its protection horizon that the live
+// catalog HEAD does not name. It sits beside RetentionTombstone because it is
+// the same kind of object: small, immutable, written by a maintenance sweep
+// to gate that sweep's own physical deletes, and keyed under its bucket's shard
+// and hour. It holds no tenant data.
+message UnnamedSinceMarker {
+  uint32 format_version = 1;         // = 1
+  // The writing sweeper's clock, read after the HEAD GET that found the
+  // candidate unnamed had returned.
+  sfixed64 observed_unix_ns = 2;
+  // Anchor identity: the marker counts only while the tombstone or record it
+  // was written for is the one present (ADR-1133 decision 2).
+  uint32 anchor_kind = 3;            // 1 = retention tombstone, 2 = superseded-input record
+  string anchor_key = 4;             // the retire.tmb or record key
+  sfixed64 anchor_unix_ns = 5;       // retired_at_ns or created_unix_ns
+  string anchor_version = 6;         // the anchor's store version
+  // The catalog HEAD version the observation read; forensics only, empty
+  // when HEAD was absent.
+  string head_version = 7;
+}
+
 // --- Selective subject erasure (ADR-0064). All additive: new messages and a
 // new enum only; no existing message or field number is touched. Three
 // durable record types plus their helper messages. The `.dreq` request

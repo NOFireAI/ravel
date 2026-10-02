@@ -1506,6 +1506,9 @@ pub async fn sweep_at(
         superseded_deletes_refused,
         superseded_held_by_snapshot,
         superseded_held_by_unreadable_head,
+        superseded_held_by_pinned_window,
+        unnamed_markers,
+        unnamed_marker_reap,
         superseded_groups_held_by_legal_hold,
         unreferenced_parts_deleted,
         // Byte totals for the reclaimed-bytes metric (issues #1729, #2073);
@@ -1558,6 +1561,22 @@ pub async fn sweep_at(
     println!("superseded deletes refused (kept for a later pass): {superseded_deletes_refused}");
     println!("superseded held (HEAD still names them): {superseded_held_by_snapshot}");
     println!("superseded held (HEAD unreadable): {superseded_held_by_unreadable_head}");
+    println!("superseded held (pinned-query window): {superseded_held_by_pinned_window}");
+    println!(
+        "unnamed-since markers: {} written, {} reset (named again), {} reset (anchor \
+         mismatch), {} retired",
+        unnamed_markers.written,
+        unnamed_markers.reset_renamed,
+        unnamed_markers.reset_mismatched,
+        unnamed_markers.retired
+    );
+    if let Some(reap) = unnamed_marker_reap {
+        println!(
+            "unnamed-since markers reaped (orphans): {} of {} listed, {} unparseable keys \
+             skipped, {} unreadable",
+            reap.reaped, reap.listed, reap.unparseable, reap.unreadable
+        );
+    }
     println!("superseded groups held (legal hold): {superseded_groups_held_by_legal_hold}");
     println!("unreferenced_parts ({verb}): {unreferenced_parts_deleted}");
     println!("full_pass: {full_pass}");

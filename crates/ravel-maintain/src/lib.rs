@@ -64,6 +64,7 @@ pub mod rspan_codec;
 pub mod scan;
 pub mod scrub;
 pub mod sweep;
+pub mod unnamed_marker;
 /// Worker membership and rendezvous-hash work partitioning (ADR-0065 decisions
 /// 1 and 2). Relocated to the `ravel-fleet` crate (ADR-0071) and re-exported
 /// here at its original path, so maintain's callers compile unchanged.
@@ -121,6 +122,7 @@ pub use query_audit::{
     query_audit_event, write_query_audit,
 };
 pub use ravel_fleet::worker_set::{WorkerSet, owner, owns, run_bounded, unit_key};
+pub use reachability::MarkerStats;
 pub use request_ledger::{PhaseRequests, RequestLedger, RequestPhase, RunRequestReport};
 pub use retention::{
     RetentionOutcome, SnapshotBlock, SnapshotReachability, maintain_bucket,
@@ -145,6 +147,10 @@ pub use sweep::{
     sweep_orphans, sweep_quarantine, sweep_shard, sweep_shard_with_holds, sweep_shard_zoned,
     sweep_shard_zoned_with_holds, sweep_superseded, sweep_unreferenced_catalog_objects,
     sweep_unreferenced_parts,
+};
+pub use unnamed_marker::{
+    MarkerAnchor, MarkerDecodeError, MarkerKind, MarkerReapOutcome, PinnedQueryWindow,
+    UNNAMED_MARKER_FORMAT_VERSION, UnnamedMarker, reap_orphan_unnamed_markers,
 };
 
 #[cfg(test)]
