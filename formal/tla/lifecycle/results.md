@@ -1883,3 +1883,258 @@ was added to `LifecycleGC.tla`: at `SealBound > MaxClock` the `SealBucket` guard
 vacuously; the ASSUME fails TLC closed on such a config. Every shipped cfg sets
 `SealBound = 1` with `MaxClock` at 1 or 2, so the ASSUME holds and the `ci` lane
 figures are unchanged.
+
+## Round fourteen: the ADR-1133 window gate is sufficient (issue #2339)
+
+Candidate #1133 above showed some guard on pinned queries is needed. ADR-1133
+decision 7 asks for more: that its unnamed-since marker and window gate are
+that guard, with the oracle `HorizonGuardsPinnedQueries` off. `README.md`, "The
+ADR-1133 window gate", describes what the model gained and what it leaves out.
+
+### Expected results
+
+These were not posted on the issue before the runs; the task specification
+stated them. The positive cfg passes `NoDeleteInsideProtectionWindow` with a
+delete reachable; each of the four controls violates it with exit 12; smoke, exhaustive and the nine existing
+controls give exactly their round-thirteen results (smoke and exhaustive
+2835448 distinct, depth 31, inside `bands.tsv`'s `[2832000, 2839000]`; each
+control its own target).
+
+### Results
+
+Every run in the table used `scripts/check-tla.sh` with `-workers 2` and
+`-Xmx2g` on a four-core aarch64 host with 8 GB of memory, Temurin 21, on the
+model as committed.
+
+| cfg | result | distinct | depth | exit | wall |
+|---|---|---|---|---|---|
+| smoke.cfg | PASS | 2835448 | 31 | 0 | 185s |
+| exhaustive.cfg | PASS, FairSpec with EventuallySwept and EventuallyCompleted | 2835448 | 31 | 0 | 2672s |
+| positive/window-gate.cfg | PASS | 543543 | 20 | 0 | 49s |
+| negative/pinned-query-ungated.cfg | VIOLATED NoDeleteInsideProtectionWindow | 2408 at the violation | - | 12 | 2s |
+| negative/window-single-skew.cfg (replaced in round fifteen) | VIOLATED NoDeleteInsideProtectionWindow | 12325 at the violation | - | 12 | 3s |
+| negative/window-no-cache-delay.cfg | VIOLATED NoDeleteInsideProtectionWindow | 45086 at the violation | - | 12 | 5s |
+| negative/marker-ignores-anchor.cfg | VIOLATED NoDeleteInsideProtectionWindow | 23290 at the violation | - | 12 | 4s |
+
+The nine existing controls each gave `VIOLATED as expected` with their own
+target, exit 12, in the same `negative -a lifecycle` run. smoke.cfg's figures
+equal round thirteen's to the state (`states=19107333 distinct=2835448
+depth=31`), so the 185s against round thirteen's 54s measures this host.
+exhaustive.cfg's equal them too, with both liveness properties holding.
+A distinct count "at the violation" is where TLC stopped with two workers, and
+moves slightly between runs.
+
+`window-gate.cfg` sets `MaxQueryDuration`, `HeadCacheTtl` and `ClockSkew` to 1,
+`ProtectionHorizon = 2`, `MaxClock = 8`, `FullEnv = FALSE` and
+`CONSTRAINT WindowGateScope`. Without the constraint's last three clauses (an
+expired compaction lease, anchors after clock 0) and without the orphan-marker
+collapse in `RetentionSweep`, `MaxClock = 8` was still growing past 5M distinct
+at the 300s budget. With the collapse but not those clauses, `MaxClock = 7` was
+past 5.6M at 400s. With both, `MaxClock = 7` completes at 317114 distinct and
+`MaxClock = 8` at 543543. `bands.tsv` pins 543543 with the depth sentinel.
+
+### Non-vacuity of the positive cfg
+
+A pass needs evidence that the deletes it judges happen. A scratch module
+extending `MCLifecycleGC` ran `window-gate.cfg` with one invariant at a time;
+none of it is committed. Each is violated, exit 12:
+
+- `lastGc.rule # "retention"`: twelve states, `RetentionSweep(raw1)` at clock 7
+  under a marker with `obs = 2`.
+- `lastGc.rule # "superseded"`: thirteen states, `StartCompaction`,
+  `PublishCompaction`, `HeadAdvanceRewrite`, `WriteMarker`, then
+  `SupersededSweep(raw1)` at clock 7.
+- no delete of an object an active query pinned: thirteen states, a query pins
+  `raw1` at clock 0, the fold drops it at 2, and `RetentionSweep(raw1)` runs at
+  clock 7, after the query's deadline 1.
+- no idle-query state where `CachedNames` holds for a present object: violated,
+  so a pin through the cache is enabled, and the step it enables is in the
+  graph (`counterexamples/window-no-cache-delay.md` state 8 takes it under a
+  switch that does not touch `PinQuery`).
+- `RenewMarker` never enabled: violated, so some behaviour renews a stale
+  marker.
+
+### Each control fails for its own reason
+
+Round fifteen below replaced `window-single-skew` with `window-three-skew` and
+re-recorded every window control's trace under exclusive deadlines; the notes
+under `counterexamples/` carry the current traces. In round fourteen:
+
+- `pinned-query-ungated`: a pin, the tombstone, the fold's drop, one tick, and
+  the retention delete while the query is in window.
+- `window-single-skew` (gate `1 * ClockSkew`): the delete at clock 4 inside a
+  deadline of 4, spending the writer's lag, the sweeper's lead and one Flight
+  ticket term.
+- `window-no-cache-delay`: the query pins through the cache after HEAD has
+  dropped the object, and the shortened gate opens on its deadline tick.
+- `marker-ignores-anchor`: a stale marker lets the delete land in the drop's own
+  tick.
+
+### Other changes
+
+`candidate-1133.cfg` moved to `negative/pinned-query-ungated.cfg` rather than
+staying beside it: two cfgs for one configuration drift, and the negative lane
+now runs it. It did not parse before the move: it lacked `SealBound` and
+`CompletionIgnoresOpenBucket`, added in round thirteen, and TLC requires every
+declared constant in every cfg. Its `counterexamples/candidate-1133.md` stays as
+the historical record with a pointer to the new note.
+
+`scripts/check-tla.sh` gains a `positive` lane: every `<area>/positive/*.cfg`
+must pass, its `bands.tsv` row keyed `positive/<name>.cfg`. `ci` and `all` run
+it. No other area has a `positive/` directory, so no other area's lanes change.
+`scripts/check-tla.test.sh` passes, 73 cases.
+
+### Execution note
+
+The host had no Java runtime. A Temurin JDK 21 for aarch64 was unpacked under
+`.dd-tools/` (gitignored) and passed through `RAVEL_TLA_JAVA`; the TLC jar was
+fetched by `check-tla.sh` into `.cache/tla` and checksum-verified. Nothing from
+either directory is committed.
+
+## Round fifteen: exclusive reader deadlines, decision 3's `<=` (issue #2339)
+
+Round fourteen let a pinned query read through its deadline tick
+(`clock <= query.deadline` in `PinnedServes`, `PermittedNeeds` and
+`QueryPermits`, with `ExpireQuery` at `clock > query.deadline`) and compared
+the window gate with `<`. The code's reader deadlines are exclusive:
+`deadline_exceeded` in `crates/ravel-query/src/log_series.rs` treats
+`Instant::now() >= d` as exceeded, the Flight SQL redemption in
+`crates/ravel-sql/src/flight/stream.rs` refuses at `now_ns >= deadline_ns`, and
+the engine's `tokio::time::timeout` (`crates/ravel-query/src/engine.rs`) fires
+at the deadline. The head cache bound is inclusive:
+`HeadCache::get` in `crates/ravel-catalog/src/cache.rs` serves while
+`age <= ttl`. The model now matches both: a query reads only while
+`clock < query.deadline`, `ExpireQuery` fires at `clock >= query.deadline`, and
+`WindowPermits` compares with `<=`, decision 3's condition exactly.
+
+### Runs
+
+Every run used `scripts/check-tla.sh` with `RAVEL_TLA_WORKERS=2` and
+`RAVEL_TLA_XMX=2g` on a 16-core x86_64 host with 31 GB of memory, Temurin
+17.0.20.1, on the model as committed.
+
+| cfg | result | distinct | depth | exit | wall |
+|---|---|---|---|---|---|
+| smoke.cfg | PASS | 3728440 | 32 | 0 | 157s |
+| positive/window-gate.cfg | PASS | 581630 | 20 | 0 | 29s |
+
+Both counts moved. smoke.cfg went from 2835448 distinct at depth 31 to 3728440
+at depth 32, and `bands.tsv` moves its row to `[3725000, 3732000]`, depth 32.
+At `MaxClock = 1` a query pinned at clock 0 has deadline 1; with an inclusive
+deadline it could only expire at clock 2, past the clock bound, so no
+behaviour reached an expired query or a second pin. With an exclusive deadline
+`ExpireQuery` fires at clock 1 and `PinQuery` can pin again; smoke.cfg sets
+`WindowGate = FALSE`, so that is the only change acting on it.
+positive/window-gate.cfg went from 543543 to 581630. Two changes act on it:
+queries expire one tick earlier, and under `<=` the gate opens one tick
+earlier; these runs do not separate the two. `bands.tsv` pins 581630.
+
+exhaustive.cfg was re-measured on the final model in a separate run
+(`scripts/check-tla.sh exhaustive -a lifecycle`, `RAVEL_TLA_WORKERS=4`,
+`RAVEL_TLA_XMX=6g`, 16-core x86_64 host): PASS, 3728440 distinct at depth 32,
+`FairSpec` with `EventuallySwept` and `EventuallyCompleted` both holding, TLC
+finished in 22min 34s (1356s for the lane). It shares smoke.cfg's constants, so
+it lands on smoke.cfg's figures. `bands.tsv` moves its row to
+`[3725000, 3732000]`, depth 32.
+
+
+### The gate is exact
+
+Four scratch copies of the model, none committed, each with one edit to
+`WindowLength` or `WindowPermits`, ran `positive/window-gate.cfg` through TLC
+directly (`-workers 2`, `-Xmx2g`):
+
+| gate | result | distinct | exit |
+|---|---|---|---|
+| decision 3: `4 * ClockSkew`, `HeadCacheTtl`, `<=` (the committed model) | PASS | 581630 | 0 |
+| `3 * ClockSkew` | VIOLATED NoDeleteInsideProtectionWindow | 24017 at the violation | 12 |
+| no `HeadCacheTtl` term | VIOLATED NoDeleteInsideProtectionWindow | 23975 at the violation | 12 |
+| `<` in place of `<=` | PASS | 543547 | 0 |
+
+The first row is the positive run in the table above. One sigma less or no
+cache term opens the gate while a covered query can still read, so neither
+can be dropped; `<` passes because it is strictly stronger than `<=`. Under
+exclusive reader deadlines and the inclusive cache bound, decision 3's `<=` is
+the weakest of these comparisons that holds.
+
+### The three-skew control
+
+`negative/window-single-skew.cfg` cut the gate's skew term to `1 * ClockSkew`,
+which removes three of the four sigma at once and so does not show the fourth
+is needed. It is replaced by `negative/window-three-skew.cfg`
+(`WindowThreeSkew = TRUE`, gate `3 * ClockSkew`), one sigma short of decision
+3. It violates `NoDeleteInsideProtectionWindow`, exit 12: a query pins through
+the cache at clock 3 with both Flight ticket terms (deadline 6), and the
+retention delete runs at clock 5 with the writer's lag and the sweeper's lead,
+spending all four sigma. `counterexamples/window-three-skew.md` has the trace.
+
+### Negative controls
+
+One `scripts/check-tla.sh negative -a lifecycle` run, same host and settings:
+all thirteen gave `VIOLATED as expected` with their own target, exit 12.
+
+| cfg | target | distinct at the violation | wall |
+|---|---|---|---|
+| compaction-ignores-rewrite | AtMostOneLiveRecordSetServed | 10519 | 2s |
+| complete-ignores-served-set | CompletionImpliesNoPreRewriteExposure | 129 | 1s |
+| completion-ignores-open-bucket | CompletionCoversEveryBucketOpenAtRequest | 12390 | 2s |
+| delete-before-horizon | NoDeleteInsideProtectionWindow | 447 | 1s |
+| dreq-ignores-held-inputs | DreqSweepRespectsLegalHold | 26408 | 3s |
+| marker-ignores-anchor | NoDeleteInsideProtectionWindow | 12040 | 2s |
+| pinned-query-ungated | NoDeleteInsideProtectionWindow | 4245 | 2s |
+| refresh-failure-is-no-hold | RefreshFailureNeverSweeps | 3499 | 1s |
+| rewrite-identity-omits-requests | IdenticalInputSetsDoNotCollide | 321 | 1s |
+| rewrite-keeps-erased-records | RewriteOutputsAreInputsMinusErased | 327 | 1s |
+| superseded-sweep-ungated | HeadNamedObjectNeverDeletedBySupersededSweep | 1357 | 1s |
+| window-no-cache-delay | NoDeleteInsideProtectionWindow | 24014 | 3s |
+| window-three-skew | NoDeleteInsideProtectionWindow | 24055 | 3s |
+
+The traces of `pinned-query-ungated`, `window-no-cache-delay` and
+`marker-ignores-anchor` changed with the deadline boundary, and their notes
+under `counterexamples/` are re-recorded from this run. A distinct count at
+the violation is where TLC stopped with two workers and moves slightly between
+runs.
+
+### FullEnv
+
+A scratch copy of `positive/window-gate.cfg` with `FullEnv = TRUE`, not
+committed, run through TLC directly with the same settings, passes: 31925761
+states generated, 3488170 distinct, depth 21, exit 0, 4 min 22 s. That is over
+the positive lane's 300 s budget, so the committed cfg keeps `FullEnv = FALSE`,
+and README.md no longer lists the absent or unreadable HEAD and the failed
+hold refresh among what the window gate check leaves out.
+
+### Harness
+
+The positive lane now requires a `bands.tsv` row keyed `positive/<name>.cfg`
+for every positive cfg and fails before TLC runs when one is missing.
+`scripts/check-tla.test.sh` gains cases for the lane and passes, 89 cases.
+
+### The ci lane
+
+One `scripts/check-tla.sh ci -a lifecycle` run on the final model, same host
+and settings, exit 0: smoke.cfg PASS at 3728440 distinct, depth 32, 195s;
+positive/window-gate.cfg PASS at 581630 distinct, depth 20, 33s; all thirteen
+negative controls VIOLATED as expected; traceability PASS, 25 rows. smoke.cfg's
+195s here (157s in the first run above) is about two thirds of the 300s smoke
+budget with two workers on this host; the required CI lane runs it with
+`RAVEL_TLA_WORKERS=auto` on a four-core runner, where it has not been timed.
+
+### Non-vacuity, re-run
+
+Round fourteen's five scratch cover invariants were re-run on the final model,
+each alone on `positive/window-gate.cfg` from a scratch module extending
+`MCLifecycleGC`; none of it is committed. Each is violated, exit 12:
+
+- `lastGc.rule # "retention"`: eleven states, `RetentionSweep(raw1)` at clock 6
+  under a marker with `obs = 2`, one tick earlier than in round fourteen
+  because the gate now compares with `<=`.
+- `lastGc.rule # "superseded"`: twelve states, `StartCompaction`,
+  `PublishCompaction`, `HeadAdvanceRewrite`, `WriteMarker`, then
+  `SupersededSweep(raw1)` at clock 6.
+- no delete of an object an active query pinned: twelve states, a query pins
+  `raw1` at clock 0 with deadline 1, the fold drops it at 2, and
+  `RetentionSweep(raw1)` runs at clock 6, after the deadline.
+- no idle-query state where `CachedNames` holds for a present object: three
+  states.
+- `RenewMarker` never enabled: six states.
