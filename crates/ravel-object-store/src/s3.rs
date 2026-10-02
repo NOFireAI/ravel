@@ -1533,9 +1533,7 @@ fn map_put_error(e: object_store::Error, mode: &PutMode) -> StoreError {
 pub(crate) fn map_get_error(e: object_store::Error) -> StoreError {
     if let object_store::Error::Generic { source, .. } = &e {
         let msg = source.to_string().to_lowercase();
-        if msg.contains("range")
-            && (msg.contains("satisfiable") || msg.contains("416") || msg.contains("too large"))
-        {
+        if msg.contains("range") && (msg.contains("satisfiable") || msg.contains("too large")) {
             return StoreError::InvalidRange(source.to_string());
         }
     }
@@ -1692,14 +1690,11 @@ fn classify_generic(
     // whose HTTP status is not reachable through any nameable type here.
     let msg = source.to_string();
     let lower = msg.to_lowercase();
-    // Throttle takes precedence over the timeout heuristic. `object_store`'s
-    // `RetryError` Display appends ", ..., retry_timeout: {d} " on every
-    // exhausted-retry message (whenever retries != 0), and the literal
-    // substring "retry_timeout" contains "timeout": checking the bare
-    // "timeout" substring first would misclassify every exhausted-retry
-    // throttle (429/503/SlowDown) as Timeout. Genuine timeouts are matched by
-    // "timed out"/"deadline", which that wrapper text does not carry, so the
-    // real timeout case is preserved while the throttle case wins.
+    // `object_store`'s `RetryError` Display appends ", ..., retry_timeout: {d} "
+    // on every exhausted-retry message (whenever retries != 0), and the field
+    // name contains "timeout". The timeout check below runs on the text with
+    // that field name removed, so an exhausted 500 stays Transient; the
+    // throttle check still runs first.
     if lower.contains("too many requests")
         || lower.contains("slow down")
         || lower.contains("slowdown")
@@ -1710,7 +1705,11 @@ fn classify_generic(
             retry_after_ms: 1000,
         };
     }
-    if lower.contains("timed out") || lower.contains("timeout") || lower.contains("deadline") {
+    let without_retry_field = lower.replace("retry_timeout", " ");
+    if without_retry_field.contains("timed out")
+        || without_retry_field.contains("timeout")
+        || without_retry_field.contains("deadline")
+    {
         return StoreError::Timeout;
     }
     StoreError::Transient(format!("{store}: {msg}"))
@@ -3935,17 +3934,24 @@ mod tests {
     /// A genuine timeout message that carries no throttle token still
     /// classifies as `Timeout`, even wrapped in the same exhausted-retry
     /// suffix: the throttle branch does not fire, so the timeout heuristic
-    /// (`timed out`/`deadline`/bare `timeout`) still wins.
+    /// (`timed out`/`deadline`/`timeout` outside the `retry_timeout` field)
+    /// still wins.
     #[test]
     fn genuine_timeout_still_classifies_as_timeout() {
-        let text = "request timed out, after 10 retries, max_retries: 10, \
-                    retry_timeout: 180000ms ";
-        let mapped = map_error_common(generic(TextError(text)));
-        assert!(
-            matches!(mapped, StoreError::Timeout),
-            "a genuine timeout without throttle language must stay Timeout, \
-             got {mapped:?}"
-        );
+        for text in [
+            "request timed out, after 10 retries, max_retries: 10, \
+             retry_timeout: 180000ms ",
+            "Error performing GET http://h/b/k in 1s, after 1 retries, max_retries: 1, \
+             retry_timeout: 30s  - Server returned non-2xx status code: 400 Bad Request: \
+             <Error><Code>RequestTimeout</Code></Error>",
+        ] {
+            let mapped = map_error_common(generic(TextError(text)));
+            assert!(
+                matches!(mapped, StoreError::Timeout),
+                "a genuine timeout without throttle language must stay Timeout, \
+                 got {mapped:?} for {text:?}"
+            );
+        }
     }
 
     /// A 429 or 503 elsewhere in `object_store`'s `RetryError` text (a port, a
@@ -3974,17 +3980,17 @@ mod tests {
             );
         }
 
-        // The exhausted-retry suffix's `retry_timeout` matches the timeout
-        // heuristic, so this reads Timeout; what it must not read is Throttled.
+        // An exhausted 500 is Transient: neither the 503/429 digits nor the
+        // suffix's `retry_timeout` field name is a class signal.
         let exhausted = "Error performing GET http://127.0.0.1:5030/b/k in 180.0503s, \
                          after 10 retries, max_retries: 10, retry_timeout: 180s  - Server \
                          returned non-2xx status code: 500 Internal Server Error: \
                          request id 503429";
         let mapped = map_error_common(generic(TextError(exhausted)));
         assert!(
-            !matches!(mapped, StoreError::Throttled { .. }) && mapped.is_retryable(),
-            "an exhausted 500 must not read Throttled from incidental digits, \
-             got {mapped:?}"
+            matches!(mapped, StoreError::Transient(_)),
+            "an exhausted 500 must read Transient, not Throttled from incidental \
+             digits or Timeout from `retry_timeout`, got {mapped:?}"
         );
 
         // No typed HttpError in the chain, so this is the text heuristic's
@@ -4145,6 +4151,33 @@ mod tests {
         let mapped = map_get_error(err);
         assert!(matches!(mapped, StoreError::InvalidRange(_)), "{mapped:?}");
         assert!(!mapped.is_retryable());
+
+        // A 416 elsewhere in the text (the port, the key, the request id) of a
+        // response that also says "range" is not a range error: it stays
+        // retryable instead of reading the terminal InvalidRange.
+        for text in [
+            "Error performing GET http://127.0.0.1:41600/b/range/k in 1.2ms - Server \
+             returned non-2xx status code: 500 Internal Server Error: ",
+            "Error performing GET http://127.0.0.1:9000/b/range/k416 in 1.2ms - Server \
+             returned non-2xx status code: 500 Internal Server Error: ",
+            "Error performing GET http://127.0.0.1:9000/b/k in 1.2ms - Server returned \
+             non-2xx status code: 400 Bad Request: <Error><Code>InvalidArgument</Code>\
+             <ArgumentName>Range</ArgumentName><RequestId>41641600</RequestId></Error>",
+        ] {
+            let mapped = map_get_error(generic(TextError(text)));
+            assert!(
+                matches!(mapped, StoreError::Transient(_)),
+                "stray 416 digits must not read InvalidRange, got {mapped:?} for {text:?}"
+            );
+            assert!(mapped.is_retryable(), "{text:?} must be retryable");
+        }
+
+        // The text object_store renders for a real 416 still reads InvalidRange.
+        let real = "Error performing GET http://127.0.0.1:9000/b/k in 1.2ms - Server \
+                    returned non-2xx status code: 416 Range Not Satisfiable: \
+                    <Error><Code>InvalidRange</Code></Error>";
+        let mapped = map_get_error(generic(TextError(real)));
+        assert!(matches!(mapped, StoreError::InvalidRange(_)), "{mapped:?}");
 
         // A get Generic with no range signal still flows through classify_generic.
         let timeout = map_get_error(generic(http_error(HttpErrorKind::Timeout)));

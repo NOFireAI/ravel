@@ -1557,4 +1557,27 @@ mod tests {
             "a stalled request must read Timeout, got {result:?}"
         );
     }
+
+    /// Through the real `object_store` client, a 500 that exhausted its retry
+    /// reads Transient: the exhausted-retry suffix's `retry_timeout` field name
+    /// is not a timeout.
+    #[tokio::test]
+    async fn an_exhausted_server_error_reads_transient_not_timeout() {
+        let (endpoint, seen) = fake_status(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "",
+            Duration::ZERO,
+        )
+        .await;
+        let store = gcs_fast_at(endpoint, Duration::from_secs(30));
+        let result = store.get("k", GetRange::Full).await;
+        match &result {
+            Err(StoreError::Transient(message)) => assert!(
+                message.contains("retry_timeout"),
+                "the text must carry the exhausted-retry suffix: {message}"
+            ),
+            other => panic!("an exhausted 500 must read Transient, got {other:?}"),
+        }
+        assert_eq!(seen.lock().len(), 2, "one attempt and one retry");
+    }
 }
