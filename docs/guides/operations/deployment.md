@@ -302,12 +302,22 @@ operator credential rather than a service credential:
   `gc-config set`, `provision adopt`, legal holds, `tenant parquet-grant add`
   and `remove`, and the read-only inspection subcommands. No continuously
   running process should hold it.
-- Three `ravel-cli` commands take the Maintain credential instead:
-  `parquet sweep`, which deletes superseded Parquet table manifests, and
+- Five `ravel-cli` commands take the Maintain credential instead:
+  `parquet sweep`, which deletes superseded Parquet table manifests;
   `maintain compact-bucket` and `maintain compact-tenant`, which take
   compaction claims under `sys/maintain/claims/compaction/` and write L1
-  segments and compaction records. Admin holds none of those grants, so run
-  these three with the `RAVEL_S3_*` values of the Maintain role.
+  segments and compaction records; `maintain sweep`, which deletes superseded
+  and expired segments and commit records and quarantines orphans; and
+  `catalog fold`, which writes the catalog objects the scheduled fold writes
+  (the Query credential also works for it). Admin holds none of those
+  grants, so run these five with the `RAVEL_S3_*` values of the Maintain
+  role.
+- `maintain migrate` runs under none of the shipped templates: the Maintain
+  role lacks the delete of the migrate cursor and the `prov` write that
+  raises the format floor, which end a walk that finishes within its
+  budget. See
+  [the IAM templates](../../../deploy/iam/README.md#which-credential-each-ravel-cli-command-takes)
+  for the two grants it needs.
 - Even Admin cannot delete any of the protected prefixes. Its two delete
   grants cover only scratch: `AdminQualifyDelete` the `sys/qualify/*` objects
   `store qualify` writes, and `AdminProbeDelete` the `sys/pq-probe/*` object

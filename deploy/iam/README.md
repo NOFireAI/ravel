@@ -473,20 +473,36 @@ bucket").
 
 ### Which credential each `ravel-cli` command takes
 
-`ravel-cli` takes the Admin credential by default. Three commands take the
-Maintain credential instead: `parquet sweep`, `maintain compact-bucket` and
-`maintain compact-tenant`. The sweep deletes Parquet table manifests, and the
-two compaction commands take claims under `sys/maintain/claims/compaction/`
-and write L1 segments and compaction records, all of which `maintain.json`
-grants and `admin.json` does not. Admin gains nothing for them. `ravel-cli`
-builds no per-tenant KMS routing store, so these writes, like every other
-`ravel-cli` write, land under the bucket's default encryption rather than a
-routed tenant's key.
+`ravel-cli` takes the Admin credential by default. Five commands take the
+Maintain credential instead, because `maintain.json` grants everything they
+issue and `admin.json` does not:
 
-Three more mutating commands need grants `admin.json` does not carry and are
-not assigned a credential here: `maintain sweep` deletes segment and commit
-objects, `maintain migrate` rewrites them, and `catalog fold` writes catalog
-objects. Under these templates each is refused under Admin.
+- `parquet sweep` deletes superseded Parquet table manifests.
+- `maintain compact-bucket` and `maintain compact-tenant` take claims under
+  `sys/maintain/claims/compaction/` and write L1 segments and compaction
+  records.
+- `maintain sweep` reads legal holds, commit records and the catalog, deletes
+  superseded and expired L0, L1 and commit objects, copies orphans to
+  `quarantine/` and deletes them there, and creates `sys/gc` on a fresh
+  bucket.
+- `catalog fold` lists and reads commit records and segment data and writes
+  catalog snapshot parts, `HEAD` and index objects, the same keys the
+  scheduled fold in maintain mode writes. `query.json` also grants all of it.
+
+Admin gains nothing for them. `ravel-cli` builds no per-tenant KMS routing
+store, so these writes, like every other `ravel-cli` write, land under the
+bucket's default encryption rather than a routed tenant's key.
+
+`maintain migrate` runs under none of the shipped templates. `maintain.json`
+grants its reads, its L1 part and compaction-record writes and its cursor
+write, but not the two calls that end a walk: the delete of its
+`t/<tenant_hash>/<signal>/maint/migrate/<family>/cursor` object, which runs
+after every completed walk and stops the run on a refusal, and the
+`CasVersion` write of `t/<tenant_hash>/<signal>/prov` that raises the
+format floor after a clean re-audit. `admin.json` and `gateway.json` grant
+the `prov` write but not the L1 part writes or the cursor. Until a role is
+given both calls, run `maintain migrate` under a credential that holds the
+`maintain.json` grants plus those two.
 
 ### Parquet table DDL
 
