@@ -1883,3 +1883,130 @@ was added to `LifecycleGC.tla`: at `SealBound > MaxClock` the `SealBucket` guard
 vacuously; the ASSUME fails TLC closed on such a config. Every shipped cfg sets
 `SealBound = 1` with `MaxClock` at 1 or 2, so the ASSUME holds and the `ci` lane
 figures are unchanged.
+
+## Round fourteen: the ADR-1133 window gate is sufficient (issue #2339)
+
+Candidate #1133 above showed some guard on pinned queries is needed. ADR-1133
+decision 7 asks for more: that its unnamed-since marker and window gate are
+that guard, with the oracle `HorizonGuardsPinnedQueries` off. `README.md`, "The
+ADR-1133 window gate", describes what the model gained and what it leaves out.
+
+### Expected results
+
+Not pre-registered on the issue; the task fixed them: the positive cfg passes
+`NoDeleteInsideProtectionWindow` with a delete reachable; each of the four
+controls violates it with exit 12; smoke, exhaustive and the nine existing
+controls give exactly their round-thirteen results (smoke and exhaustive
+2835448 distinct, depth 31, inside `bands.tsv`'s `[2832000, 2839000]`; each
+control its own target).
+
+### Results
+
+Every run in the table used `scripts/check-tla.sh` with `-workers 2` and
+`-Xmx2g` on a four-core aarch64 host with 8 GB of memory, Temurin 21, on the
+model as committed.
+
+| cfg | result | distinct | depth | exit | wall |
+|---|---|---|---|---|---|
+| smoke.cfg | PASS | 2835448 | 31 | 0 | 185s |
+| exhaustive.cfg | PASS, FairSpec with EventuallySwept and EventuallyCompleted | 2835448 | 31 | 0 | 2672s |
+| positive/window-gate.cfg | PASS | 543543 | 20 | 0 | 49s |
+| negative/pinned-query-ungated.cfg | VIOLATED NoDeleteInsideProtectionWindow | 2408 at the violation | - | 12 | 2s |
+| negative/window-single-skew.cfg | VIOLATED NoDeleteInsideProtectionWindow | 12325 at the violation | - | 12 | 3s |
+| negative/window-no-cache-delay.cfg | VIOLATED NoDeleteInsideProtectionWindow | 45086 at the violation | - | 12 | 5s |
+| negative/marker-ignores-anchor.cfg | VIOLATED NoDeleteInsideProtectionWindow | 23290 at the violation | - | 12 | 4s |
+
+The nine existing controls each gave `VIOLATED as expected` with their own
+target, exit 12, in the same `negative -a lifecycle` run. smoke.cfg's figures
+equal round thirteen's to the state (`states=19107333 distinct=2835448
+depth=31`), so the 185s against round thirteen's 54s measures this host.
+exhaustive.cfg's equal them too, with both liveness properties holding.
+A distinct count "at the violation" is where TLC stopped with two workers, and
+moves slightly between runs.
+
+`window-gate.cfg` sets `MaxQueryDuration`, `HeadCacheTtl` and `ClockSkew` to 1,
+`ProtectionHorizon = 2`, `MaxClock = 8`, `FullEnv = FALSE` and
+`CONSTRAINT WindowGateScope`. Without the constraint's last three clauses (an
+expired compaction lease, anchors after clock 0) and without the orphan-marker
+collapse in `RetentionSweep`, `MaxClock = 8` was still growing past 5M distinct
+at the 300s budget. With the collapse but not those clauses, `MaxClock = 7` was
+past 5.6M at 400s. With both, `MaxClock = 7` completes at 317114 distinct and
+`MaxClock = 8` at 543543. `bands.tsv` pins 543543 with the depth sentinel.
+
+### Non-vacuity of the positive cfg
+
+A pass needs evidence that the deletes it judges happen. A scratch module
+extending `MCLifecycleGC` ran `window-gate.cfg` with one invariant at a time;
+none of it is committed. Each is violated, exit 12:
+
+- `lastGc.rule # "retention"`: twelve states, `RetentionSweep(raw1)` at clock 7
+  under a marker with `obs = 2`.
+- `lastGc.rule # "superseded"`: thirteen states, `StartCompaction`,
+  `PublishCompaction`, `HeadAdvanceRewrite`, `WriteMarker`, then
+  `SupersededSweep(raw1)` at clock 7.
+- no delete of an object an active query pinned: thirteen states, a query pins
+  `raw1` at clock 0, the fold drops it at 2, and `RetentionSweep(raw1)` runs at
+  clock 7, after the query's deadline 1.
+- no idle-query state where `CachedNames` holds for a present object: violated,
+  so a pin through the cache is enabled, and the step it enables is in the
+  graph (`counterexamples/window-no-cache-delay.md` state 8 takes it under a
+  switch that does not touch `PinQuery`).
+- `RenewMarker` never enabled: violated, so some behaviour renews a stale
+  marker.
+
+### The gate compares with `<`, not decision 3's `<=`
+
+A scratch copy of the model with `<=` in `WindowPermits` fails
+`window-gate.cfg`:
+
+```text
+Error: Invariant NoDeleteInsideProtectionWindow is violated.
+146172 states generated, 30854 distinct states found, 14165 states left on queue.
+```
+
+Twelve states: the tombstone lands at 0, the fold drops `b1` at clock 2, the
+marker is written at 2 with the writer one behind (reading 1), a query pins
+`raw1` at clock 3 through the cache (`cacheUntil[raw1] = 3`) with a Flight
+ticket term of 2 (deadline 6), and `RetentionSweep(raw1)` runs at clock 6, the
+sweeper one ahead reading 7 = 1 + 6. The query's last tick and the gate's first
+tick are the same tick. Every boundary in that chain is inclusive in the model
+as in the code (the head cache serves while age <= TTL, a query reads through
+its deadline), so decision 3's inequality has no margin. The committed model
+uses `<`; in nanoseconds that is the ADR's condition plus 1 ns. This is
+reported with issue #2339's result for the ADR and the Rust gate to decide; the
+model does not change the ADR.
+
+### Each control fails for its own reason
+
+- `pinned-query-ungated`: a pin, the tombstone, the fold's drop, one tick, and
+  the retention delete while the query is in window.
+  `counterexamples/pinned-query-ungated.md`.
+- `window-single-skew`: the delete at clock 4 inside a deadline of 4, spending
+  the writer's lag, the sweeper's lead and one Flight ticket term.
+  `counterexamples/window-single-skew.md`.
+- `window-no-cache-delay`: the query pins through the cache after HEAD has
+  dropped the object, and the shortened gate opens on its deadline tick.
+  `counterexamples/window-no-cache-delay.md`.
+- `marker-ignores-anchor`: a stale marker lets the delete land in the drop's own
+  tick. `counterexamples/marker-ignores-anchor.md`.
+
+### Other changes
+
+`candidate-1133.cfg` moved to `negative/pinned-query-ungated.cfg` rather than
+staying beside it: two cfgs for one configuration drift, and the negative lane
+now runs it. It did not parse before the move: it lacked `SealBound` and
+`CompletionIgnoresOpenBucket`, added in round thirteen, and TLC requires every
+declared constant in every cfg. Its `counterexamples/candidate-1133.md` stays as
+the historical record with a pointer to the new note.
+
+`scripts/check-tla.sh` gains a `positive` lane: every `<area>/positive/*.cfg`
+must pass, its `bands.tsv` row keyed `positive/<name>.cfg`. `ci` and `all` run
+it. No other area has a `positive/` directory, so no other area's lanes change.
+`scripts/check-tla.test.sh` passes, 73 cases.
+
+### Execution note
+
+The host had no Java runtime. A Temurin JDK 21 for aarch64 was unpacked under
+`.dd-tools/` (gitignored) and passed through `RAVEL_TLA_JAVA`; the TLC jar was
+fetched by `check-tla.sh` into `.cache/tla` and checksum-verified. Nothing from
+either directory is committed.

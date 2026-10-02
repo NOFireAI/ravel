@@ -111,8 +111,9 @@ CONSTANTS
                                 \* unsealed or still serves a pre-ack record (#1290).
     (* ADR-1133's unnamed-since marker and pinned-query window gate (issue #2339).
        WindowGate FALSE and HeadCacheTtl = 0 leave every marker and cache variable
-       at its Init value, so a cfg with those values explores the graph it did
-       before the gate existed. *)
+       at its Init value, and ClockSkew = 0 leaves PinQuery's Flight ticket term
+       at 0, so a cfg with all three explores the graph it did before the gate
+       existed. *)
     WindowGate,                 \* the retention and superseded deletes require an
                                 \* aged marker whose anchor matches (decision 3)
     HeadCacheTtl,               \* head_cache_ttl: a pin may still be handed a cached
@@ -257,8 +258,9 @@ HorizonGatedRules == {"retention", "dreq", "superseded"}
 \* --- ADR-1133 marker keys -----------------------------------------------------
 \* One marker per delete candidate: the retention marker is per tombstoned bucket
 \* (retire.unn), a superseded marker per superseded object. The shipped key is per
-\* chain group, keyed by the record the group is entered from; in this instance
-\* each group holds one superseded object, so per object is the same set of keys.
+\* chain group, keyed by the record the group is entered from. Keying each object
+\* on its own gives every object its own window; a group re-rooted under another
+\* key (decision 6) appears here only as the markers StaleMarker writes.
 MarkerKeys == Buckets \cup SupersededCandidates
 
 \* The anchor identity a marker records is the anchor's anchoring timestamp
@@ -1027,8 +1029,8 @@ CancelCompaction ==
 \* Switch the HEAD onto the live record sets, dropping the superseded objects (a
 \* fold advancing). It may lag arbitrarily behind the publish that superseded them.
 \* Both HEAD-publishing actions start the cache delay for every object the new
-\* HEAD drops (head_cache_ttl). The update is skipped at HeadCacheTtl = 0, where
-\* it could never enable a cached pin, so cacheUntil stays at Init.
+\* HEAD drops (head_cache_ttl). At HeadCacheTtl = 0 the update is skipped, so
+\* cacheUntil stays 0 and HeadCacheTtl = 0 means no cache.
 CacheDropped(newHead) ==
     cacheUntil' = IF HeadCacheTtl = 0
                       THEN cacheUntil
