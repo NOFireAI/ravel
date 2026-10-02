@@ -558,6 +558,27 @@ join with each other but not with any of the five: one of the five beside a
 Parquet table is the same HTTP 400, returned after one listing per other name
 finds that it is a Parquet table.
 
+The same endpoint creates and drops Parquet tables. A caller needs the `ddl`
+capability, which is absent by default: a bearer token whose tenant is written
+`TENANT;ddl` holds it, and so does an OIDC token whose `--oidc-ddl-claim` claim
+is `true`. Without it, `CREATE` and `DROP` are refused with 403 `forbidden`.
+The `LOCATION` must also lie inside a location grant recorded for the tenant. A success
+is a JSON body with `outcome` (`created`, `dropped`, or `noop`) and the table
+name, even when `Accept` asks for Arrow; creating a table that already exists
+is a 409 and dropping one that does not is a 404.
+
+```sh
+curl -X POST http://127.0.0.1:4318/api/v1/sql \
+  -H "Authorization: Bearer devtoken" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "CREATE EXTERNAL TABLE clicks STORED AS PARQUET LOCATION '\''s3://lake/data/clicks/'\''"}'
+
+curl -X POST http://127.0.0.1:4318/api/v1/sql \
+  -H "Authorization: Bearer devtoken" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "DROP TABLE clicks"}'
+```
+
 The `samples` table columns are `ts` (`Timestamp(ns)`), `value` (`Float64`),
 `series_id` (`FixedSizeBinary(16)`), and `labels` (a dictionary-encoded
 `Map(Utf8, Utf8)`). There is no column that can hold a native histogram, so

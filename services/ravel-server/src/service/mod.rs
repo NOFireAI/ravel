@@ -63,6 +63,7 @@ use ravel_query::http::{
     UsageStatus,
 };
 use ravel_query::{Coverage, QueryAdmissionController, QueryEngine, QueryStats};
+use ravel_tenant_resolve::Principal;
 use ravel_types::accounting::{
     CostEstimate, QueryAccounting, QueryAccountingSnapshot, QueryCostRecorder,
 };
@@ -86,6 +87,19 @@ pub fn authenticate(
     resolver
         .resolve(headers)
         .map(|tenant| tenant.hash())
+        .map_err(|_| ServiceError::unauthorized())
+}
+
+/// [`authenticate`] for a transport that also needs the caller's capabilities:
+/// the full [`Principal`] (tenant plus the `ddl` capability). A failed
+/// resolution maps to 401 exactly as [`authenticate`] maps it, and likewise
+/// takes no admission permit.
+pub fn authenticate_principal(
+    resolver: &dyn TenantResolver,
+    headers: &HeaderMap,
+) -> Result<Principal, ServiceError> {
+    resolver
+        .resolve_principal(headers)
         .map_err(|_| ServiceError::unauthorized())
 }
 

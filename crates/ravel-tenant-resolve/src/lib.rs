@@ -48,10 +48,9 @@ pub struct TenantSuffixError;
 /// before the `;` is [`TenantSuffixError`], so a typo refuses startup instead
 /// of silently granting nothing or naming an empty tenant.
 ///
-/// `ravel-ingest-router` uses it so that it accepts and refuses the same
-/// spellings as `ravel-server`, which keeps an identical private copy in its
-/// config until it switches to this one. The router discards the `ddl` bool,
-/// as it never routes DDL requests differently.
+/// `ravel-server` and `ravel-ingest-router` both call it, so the two accept
+/// and refuse the same spellings. The router discards the `ddl` bool, as it
+/// never routes DDL requests differently.
 pub fn split_tenant_suffix(raw: &str) -> Result<(&str, bool), TenantSuffixError> {
     match raw.rfind(';') {
         None => Ok((raw, false)),
@@ -69,7 +68,9 @@ pub fn split_tenant_suffix(raw: &str) -> Result<(&str, bool), TenantSuffixError>
 /// A resolved caller identity: the tenant a request is attributed to, and
 /// whether it may run tenant-scoped DDL (ADR-2040 decision 4, "Who may run
 /// DDL"). `ddl` is absent unless a resolver's configuration explicitly grants
-/// it; nothing consumes it yet (issue #2054 is the first reader).
+/// it. The consumer is `POST /api/v1/sql` in `ravel-server`
+/// (`services/ravel-server/src/sql.rs`), which refuses a `CREATE` or `DROP`
+/// statement with 403 unless `ddl` is set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
     pub tenant: TenantId,

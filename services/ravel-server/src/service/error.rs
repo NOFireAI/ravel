@@ -134,6 +134,20 @@ impl ServiceError {
         )
     }
 
+    /// An authenticated caller that lacks a capability the request needs (the
+    /// `ddl` capability for a `CREATE` or `DROP`, ADR-2040 decision 4). The
+    /// message names the capability and nothing about server state.
+    pub fn forbidden(message: String) -> Self {
+        ServiceError::new(
+            ServiceErrorKind::Unauthorized,
+            ApiError {
+                status: StatusCode::FORBIDDEN,
+                error_type: "forbidden",
+                message,
+            },
+        )
+    }
+
     pub fn invalid_argument(message: String) -> Self {
         ServiceError::new(
             ServiceErrorKind::InvalidArgument,
@@ -227,6 +241,41 @@ impl ServiceError {
         }
     }
 
+    /// Classify and redact a [`ravel_sql::DdlExecuteError`], and log the
+    /// unredacted form once: at debug for a client-caused status (4xx), so a
+    /// scripted client cannot flood the warn level, and at warn otherwise.
+    ///
+    /// The body message is `client_message()` only; the full `Display` can
+    /// carry an object key or backend text and goes to the log alone.
+    #[cfg(feature = "sql")]
+    pub fn from_ddl(err: ravel_sql::DdlExecuteError, tenant_hash: ravel_types::TenantHash) -> Self {
+        let message = err.client_message();
+        let (kind, status, error_type) = ddl_class_to_http(err.class());
+
+        if status.is_client_error() {
+            tracing::debug!(
+                tenant = %tenant_hash.to_hex(),
+                error = %err,
+                client_message = %message,
+                "ddl request rejected",
+            );
+        } else {
+            tracing::warn!(
+                tenant = %tenant_hash.to_hex(),
+                error = %err,
+                client_message = %message,
+                "ddl error redacted from client response",
+            );
+        }
+
+        ServiceError {
+            kind,
+            message,
+            status,
+            error_type,
+        }
+    }
+
     /// Classify a `QueryError` before it is redacted, then take the status,
     /// tag, and message from the same redaction every HTTP surface uses. The
     /// class comes from the typed error and the body from the redacted
@@ -260,6 +309,58 @@ impl ServiceError {
             kind
         };
         ServiceError::new(kind, api)
+    }
+}
+
+/// The failure class, HTTP status and `errorType` tag a DDL failure class
+/// takes. The match has no wildcard, so a new [`ravel_sql::DdlErrorClass`]
+/// does not compile until it is given a status here.
+///
+/// A plain `CREATE` on an existing table (409) and a plain `DROP` of an absent
+/// one (404) are well-formed requests refused on the table's current state, so
+/// both classify as [`ServiceErrorKind::Validation`].
+#[cfg(feature = "sql")]
+pub(crate) fn ddl_class_to_http(
+    class: ravel_sql::DdlErrorClass,
+) -> (ServiceErrorKind, StatusCode, &'static str) {
+    use ravel_sql::DdlErrorClass;
+
+    match class {
+        DdlErrorClass::BadRequest => (
+            ServiceErrorKind::InvalidArgument,
+            StatusCode::BAD_REQUEST,
+            "bad_data",
+        ),
+        DdlErrorClass::Conflict => (
+            ServiceErrorKind::Validation,
+            StatusCode::CONFLICT,
+            "conflict",
+        ),
+        DdlErrorClass::NotFound => (
+            ServiceErrorKind::Validation,
+            StatusCode::NOT_FOUND,
+            "not_found",
+        ),
+        DdlErrorClass::Unsupported => (
+            ServiceErrorKind::Unsupported,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "execution",
+        ),
+        DdlErrorClass::Unavailable => (
+            ServiceErrorKind::Unavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+        ),
+        DdlErrorClass::Timeout => (
+            ServiceErrorKind::Deadline,
+            StatusCode::GATEWAY_TIMEOUT,
+            "timeout",
+        ),
+        DdlErrorClass::Internal => (
+            ServiceErrorKind::Internal,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+        ),
     }
 }
 
