@@ -210,6 +210,10 @@ pub struct OidcSettings {
     pub jwks_url: String,
     pub audiences: Vec<String>,
     pub tenant_claim: String,
+    /// JWKS refetch period. A zero interval is refused at startup: by
+    /// [`Cli::into_config`], and by [`crate::run`] with
+    /// [`crate::JwksRefreshSpawnError::ZeroRefreshInterval`] for a config
+    /// built directly.
     pub refresh_interval: Duration,
 }
 
@@ -275,6 +279,11 @@ pub struct RouterConfig {
     pub listen_http: SocketAddr,
     pub listen_grpc: Option<SocketAddr>,
     pub round_robin_max_entries: usize,
+    /// How long a round-robin entry may sit idle before the sweep evicts it,
+    /// and the sweep's period. A zero value is refused at startup: by
+    /// [`Cli::into_config`], and by [`crate::run`] with
+    /// [`crate::RoundRobinSweepSpawnError::ZeroIdleTtl`] for a config built
+    /// directly.
     pub round_robin_idle_ttl: Duration,
 }
 
