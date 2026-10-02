@@ -2601,7 +2601,10 @@ fn every_shipped_deny_is_a_delete_only_prohibition() {
 /// `t/<hash>/u/{l0,c,l1}/0000/...`, so `t/*/*/l0/*` and `t/*/u/*/0000/*` both
 /// match it. That is ADR-0055 section 3 protection working, not a template bug.
 /// What is wrong is reading the `Allow` set alone as the delete capability the
-/// role HOLDS -- for these three pattern pairs it overstates.
+/// role HOLDS -- for these four pattern pairs it overstates. The fourth is the
+/// `maint/*` grant for the unnamed-since markers (ADR-1133): `*` spans `/`, so
+/// `t/<hash>/u/maint/unn/0000/...`, an audit shard-0 marker, matches the Deny
+/// too, and its delete is refused like every other key of that shard.
 ///
 /// Pinning the overlap rather than asserting it away fails in both directions: a
 /// new overlap (a widened delete grant reaching a protected keyspace) and a
@@ -2611,13 +2614,15 @@ const EXPECTED_DELETE_OVERLAPS: &[(&str, &[(&str, &str)])] = &[
     ("gateway", &[]),
     ("query", &[]),
     // The ADR-0055 section 3 legal-hold shard, protected out of the three
-    // level-based grants compaction otherwise deletes.
+    // level-based grants compaction otherwise deletes, and out of the
+    // unnamed-since marker grant.
     (
         "maintain",
         &[
             ("t/*/u/*/0000/*", "t/*/*/c/*"),
             ("t/*/u/*/0000/*", "t/*/*/l0/*"),
             ("t/*/u/*/0000/*", "t/*/*/l1/*"),
+            ("t/*/u/*/0000/*", "t/*/*/maint/*"),
         ],
     ),
     ("admin", &[]),

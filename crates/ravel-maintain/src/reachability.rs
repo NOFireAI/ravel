@@ -53,6 +53,18 @@ fn window_verdict(ctx: &MarkerContext<'_>, observed_unix_ns: i64) -> SnapshotGat
     }
 }
 
+/// The answer a pass that may not write markers gives a candidate whose
+/// marker is missing or mismatched, or `None` for a deleting pass, which
+/// writes one. A dry run reports what the deleting pass would decide after
+/// writing a marker at this instant; the observing pass holds the candidate.
+fn read_only_verdict(ctx: &MarkerContext<'_>) -> Option<SnapshotGate> {
+    match ctx.policy {
+        MarkerPolicy::Write => None,
+        MarkerPolicy::DryRun => Some(window_verdict(ctx, ctx.clock.now_ns())),
+        MarkerPolicy::Observe => Some(SnapshotGate::Blocked(SnapshotBlock::PinnedWindow)),
+    }
+}
+
 /// Why a physical delete was blocked by HEAD reachability (ADR-0020
 /// delete-blocker). Both variants delete nothing; they are distinguished so
 /// each is separately observable in the maintain counters (a persistent
@@ -188,8 +200,15 @@ pub struct SnapshotReachability {
 /// none).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MarkerPolicy {
+    /// A deleting pass: writes a missing marker, replaces a mismatched one and
+    /// deletes the marker of a re-named candidate.
     Write,
-    ReadOnly,
+    /// A dry run: writes and deletes nothing, and answers a missing or
+    /// mismatched marker as the deleting pass would after writing one now.
+    DryRun,
+    /// The erasure-request sweep's observing pass: writes and deletes
+    /// nothing, and holds a candidate with a missing or mismatched marker.
+    Observe,
 }
 
 /// What the pass needs to evaluate the pinned-query window.
@@ -352,8 +371,8 @@ impl SnapshotReachability {
                 window_verdict(ctx, marker.observed_unix_ns)
             }
             MarkerLoad::Present(marker) => {
-                if ctx.policy == MarkerPolicy::ReadOnly {
-                    return SnapshotGate::Blocked(SnapshotBlock::PinnedWindow);
+                if let Some(verdict) = read_only_verdict(ctx) {
+                    return verdict;
                 }
                 tracing::warn!(
                     key = %marker_key,
@@ -371,8 +390,8 @@ impl SnapshotReachability {
                     .await
             }
             MarkerLoad::Absent => {
-                if ctx.policy == MarkerPolicy::ReadOnly {
-                    return SnapshotGate::Blocked(SnapshotBlock::PinnedWindow);
+                if let Some(verdict) = read_only_verdict(ctx) {
+                    return verdict;
                 }
                 self.write_fresh_marker(store, ctx, marker_key, anchor)
                     .await

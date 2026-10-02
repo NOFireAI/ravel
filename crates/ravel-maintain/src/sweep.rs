@@ -1606,10 +1606,12 @@ async fn sweep_superseded_impl(
     // them. A lease-held group's HEAD answer counts too, so the marker covers
     // it once the hold lifts, and the marker is kept while it is held. An
     // observing pass and a dry run only read markers.
-    let policy = if deleting && !config.dry_run {
-        MarkerPolicy::Write
+    let policy = if !deleting {
+        MarkerPolicy::Observe
+    } else if config.dry_run {
+        MarkerPolicy::DryRun
     } else {
-        MarkerPolicy::ReadOnly
+        MarkerPolicy::Write
     };
     let ctx = MarkerContext::new(clock, config, policy);
     let mut head_gates: Vec<SnapshotGate> = Vec::with_capacity(groups.len());
@@ -1789,41 +1791,6 @@ async fn sweep_superseded_impl(
         DeleteLoop::Data,
         DeleteLoop::ChainRecords,
     ] {
-        // Each marker goes after the objects it gated and before any record
-        // (ADR-1133 decision 6), and only once every group under it has been
-        // deleted whole. A failed marker delete keeps the records of every
-        // group under it for the next pass.
-        if delete_loop == DeleteLoop::ChainRecords && policy == MarkerPolicy::Write {
-            let mut retired: HashMap<&str, bool> = HashMap::new();
-            for (index, marker_key) in cleared_marker_keys.iter().enumerate() {
-                let Some(marker_key) = *marker_key else {
-                    continue;
-                };
-                if stopped[index] {
-                    marker_still_gating.insert(marker_key);
-                }
-            }
-            for (index, marker_key) in cleared_marker_keys.iter().enumerate() {
-                let Some(marker_key) = *marker_key else {
-                    continue;
-                };
-                if marker_still_gating.contains(marker_key) {
-                    continue;
-                }
-                let ok = match retired.get(marker_key) {
-                    Some(&ok) => ok,
-                    None => {
-                        let ok = reach.retire_marker(store, marker_key).await.is_ok();
-                        retired.insert(marker_key, ok);
-                        ok
-                    }
-                };
-                if !ok {
-                    stopped[index] = true;
-                }
-            }
-            outcome.unnamed_markers = reach.marker_stats().clone();
-        }
         for (index, group) in cleared.iter().enumerate() {
             for k in group.loop_keys(delete_loop) {
                 if stopped[index] || refused.contains(k.as_str()) {
@@ -1877,6 +1844,33 @@ async fn sweep_superseded_impl(
     }
     for (group, _) in cleared.iter().zip(&stopped).filter(|(_, s)| **s) {
         outcome.note_hold(group, shard);
+    }
+    // Each marker goes after every object of every group under it, chain
+    // records included (ADR-1133 decision 6), and only once all of those
+    // groups were deleted whole. The record a marker is keyed by is never in
+    // its own group, so it outlives the marker. A marker a stopped group
+    // still needs stays, and a failed marker delete leaves an orphan for the
+    // reaper: the objects it gated are already gone.
+    if policy == MarkerPolicy::Write {
+        for (index, marker_key) in cleared_marker_keys.iter().enumerate() {
+            if let Some(marker_key) = *marker_key
+                && stopped[index]
+            {
+                marker_still_gating.insert(marker_key);
+            }
+        }
+        let mut to_retire: Vec<String> = Vec::new();
+        for marker_key in cleared_marker_keys.iter().copied().flatten() {
+            if !marker_still_gating.contains(marker_key)
+                && !to_retire.iter().any(|k| k == marker_key)
+            {
+                to_retire.push(marker_key.to_string());
+            }
+        }
+        for marker_key in &to_retire {
+            // A failure is logged by the delete itself.
+            let _ = reach.retire_marker(store, marker_key).await;
+        }
     }
     outcome.unnamed_marker_reap = reach
         .reap_after_pass(store, clock, config, tenant, signal, false)
@@ -6924,7 +6918,14 @@ mod tests {
     async fn sized_chain_pass(
         store: &dyn ObjectStoreBackend,
     ) -> Result<(SupersededSweepOutcome, u64)> {
-        let config = CompactorConfig::default();
+        // The pinned-query window (ADR-1133) zeroed, so the chain's marker is
+        // written and clears in this one pass.
+        let config = CompactorConfig {
+            max_query_duration_ns: 0,
+            head_cache_ttl_ns: 0,
+            clock_skew_allowance_ns: 0,
+            ..CompactorConfig::default()
+        };
         let clock = FixedClock::new(config.protection_horizon_ns + 1);
         sweep_superseded_impl(
             &mut SnapshotReachability::new(),

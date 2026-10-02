@@ -43,8 +43,16 @@ enum Sig {
     Spans,
 }
 
+/// The pinned-query window (ADR-1133) zeroed, so a candidate's unnamed-since
+/// marker is written and clears in the same pass and these tests see the
+/// other delete rules alone. tests/pinned_window.rs pins the window.
 fn cfg() -> CompactorConfig {
-    CompactorConfig::default()
+    CompactorConfig {
+        max_query_duration_ns: 0,
+        head_cache_ttl_ns: 0,
+        clock_skew_allowance_ns: 0,
+        ..CompactorConfig::default()
+    }
 }
 
 /// Two compactable metrics L0 inputs (the shape crash_matrix.rs uses).
@@ -224,6 +232,13 @@ async fn row7_partial_input_records_deleted_reswept_converges() {
             again,
             ravel_maintain::SweepReport {
                 full_pass: true,
+                // A full pass runs the orphan-marker reap (ADR-1133): one
+                // LIST of maint/unn/, which finds nothing here.
+                unnamed_markers: ravel_maintain::MarkerStats {
+                    listings: 1,
+                    ..Default::default()
+                },
+                unnamed_marker_reap: Some(ravel_maintain::MarkerReapOutcome::default()),
                 ..ravel_maintain::SweepReport::default()
             },
             "converged: nothing left to delete, but sweep_shard always ran a full pass"

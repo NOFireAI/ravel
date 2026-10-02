@@ -703,7 +703,7 @@ async fn physical_sweep(
         bucket.ingest_hour_bucket,
     )?;
     let policy = if dry_run {
-        MarkerPolicy::ReadOnly
+        MarkerPolicy::DryRun
     } else {
         MarkerPolicy::Write
     };
@@ -1491,7 +1491,14 @@ mod tests {
             &mut SnapshotReachability::new(),
             store,
             &crate::clock::FixedClock::new(now_ns),
-            &CompactorConfig::default(),
+            // The pinned-query window (ADR-1133) zeroed, so a swept bucket's
+            // marker is written and clears in the same evaluation.
+            &CompactorConfig {
+                max_query_duration_ns: 0,
+                head_cache_ttl_ns: 0,
+                clock_skew_allowance_ns: 0,
+                ..CompactorConfig::default()
+            },
             Some(WINDOW_NS),
             &crate::sweep::NoLeases,
             bucket,

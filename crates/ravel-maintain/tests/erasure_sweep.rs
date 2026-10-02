@@ -46,6 +46,19 @@ fn cfg() -> CompactorConfig {
     CompactorConfig::default()
 }
 
+/// [`cfg`] with the pinned-query window (ADR-1133) zeroed, for the sweeps: a
+/// candidate's unnamed-since marker is written and clears in the same pass,
+/// so these tests see the other delete rules alone. tests/pinned_window.rs
+/// pins the window.
+fn gate_cfg() -> CompactorConfig {
+    CompactorConfig {
+        max_query_duration_ns: 0,
+        head_cache_ttl_ns: 0,
+        clock_skew_allowance_ns: 0,
+        ..CompactorConfig::default()
+    }
+}
+
 /// A `now_ns` comfortably past a record's supersession horizon.
 fn past_horizon(created_ns: i64) -> i64 {
     created_ns
@@ -153,7 +166,7 @@ async fn sweep_full(
     sweep_superseded(
         store,
         clock,
-        &cfg(),
+        &gate_cfg(),
         lease,
         &b.tenant_hash,
         b.signal,
@@ -477,7 +490,7 @@ async fn sweep_dreq(
     sweep_erasure_requests(
         store,
         &FixedClock::new(now),
-        &cfg(),
+        &gate_cfg(),
         lease,
         &tenant_hash(),
         Signal::Metrics,
@@ -585,7 +598,10 @@ async fn dreq_sweep_keeps_request_markers_whose_chain_is_legally_held() {
     let b = bucket();
 
     // Control: no hold anywhere. The rewrite's superseded chain is freely
-    // clearable, so rule 6 deletes the completed, past-horizon `.dreq`.
+    // clearable, so the deleting rule 2 pass reclaims it and rule 6 then
+    // deletes the completed, past-horizon `.dreq`. The observing pass holds
+    // a chain whose unnamed-since marker has not cleared a deleting pass
+    // (ADR-1133), so the deleting pass runs first, as it does in a sweep.
     let control = MemoryStore::new();
     let clock = FixedClock::new(created);
     for spec in metrics_specs() {
@@ -593,6 +609,11 @@ async fn dreq_sweep_keeps_request_markers_whose_chain_is_legally_held() {
     }
     run_rewrite(&control, &clock).await;
     let (control_dreq_key, _) = seed_dreq_done(&control, 42, Some(created)).await;
+    let reclaimed = sweep_full(&control, &FixedClock::new(past_horizon(created)), &NoLeases).await;
+    assert!(
+        reclaimed.data_deleted > 0,
+        "control: rule 2 reclaims the chain"
+    );
     let control_out = sweep_dreq(&control, past_horizon(created), &NoLeases).await;
     assert_eq!(
         control_out.deleted, 1,

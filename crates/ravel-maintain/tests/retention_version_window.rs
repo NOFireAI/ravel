@@ -47,8 +47,16 @@ const TRAILER_LEN_USIZE: usize = TRAILER_LEN as usize;
 /// (footer_len 4 + footer_crc32c 4), docs/segment-format.md.
 const VERSION_OFFSET_IN_TRAILER: usize = 8;
 
+/// The pinned-query window (ADR-1133) zeroed, so a candidate's unnamed-since
+/// marker is written and clears in the same pass and these tests see the
+/// other delete rules alone. tests/pinned_window.rs pins the window.
 fn cfg() -> CompactorConfig {
-    CompactorConfig::default()
+    CompactorConfig {
+        max_query_duration_ns: 0,
+        head_cache_ttl_ns: 0,
+        clock_skew_allowance_ns: 0,
+        ..CompactorConfig::default()
+    }
 }
 
 /// A retention config whose window for the test tenant is exactly the floor, so
@@ -137,12 +145,15 @@ async fn smash_magic(store: &dyn ObjectStoreBackend, key: &str) {
         .expect("overwrite");
 }
 
+/// Unnamed-since markers (ADR-1133) are left out: a pass writes one for a
+/// candidate HEAD does not name before any hold or refusal is consulted.
 async fn all_keys(store: &dyn ObjectStoreBackend) -> BTreeSet<String> {
     list_all(store, "")
         .await
         .expect("list")
         .into_iter()
         .map(|meta| meta.key)
+        .filter(|key| !key.contains("/maint/unn/"))
         .collect()
 }
 
