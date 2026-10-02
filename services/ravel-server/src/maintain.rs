@@ -308,18 +308,24 @@ pub enum SupersededHeldReason {
     /// HEAD or a covering snapshot part was present and could not be read
     /// ([`ravel_maintain::SweepReport::superseded_held_by_unreadable_head`]).
     UnreadableHead,
+    /// HEAD names no object of the group, but its unnamed-since marker is
+    /// missing, mismatched or younger than the pinned-query window (ADR-1133;
+    /// [`ravel_maintain::SweepReport::superseded_held_by_pinned_window`]).
+    PinnedWindow,
 }
 
 impl SupersededHeldReason {
-    pub const ALL: [SupersededHeldReason; 2] = [
+    pub const ALL: [SupersededHeldReason; 3] = [
         SupersededHeldReason::Named,
         SupersededHeldReason::UnreadableHead,
+        SupersededHeldReason::PinnedWindow,
     ];
 
     fn index(self) -> usize {
         match self {
             SupersededHeldReason::Named => 0,
             SupersededHeldReason::UnreadableHead => 1,
+            SupersededHeldReason::PinnedWindow => 2,
         }
     }
 
@@ -328,6 +334,7 @@ impl SupersededHeldReason {
         match self {
             SupersededHeldReason::Named => "named",
             SupersededHeldReason::UnreadableHead => "unreadable_head",
+            SupersededHeldReason::PinnedWindow => "pinned_window",
         }
     }
 
@@ -335,6 +342,7 @@ impl SupersededHeldReason {
         match self {
             SupersededHeldReason::Named => report.superseded_held_by_snapshot,
             SupersededHeldReason::UnreadableHead => report.superseded_held_by_unreadable_head,
+            SupersededHeldReason::PinnedWindow => report.superseded_held_by_pinned_window,
         }
     }
 }
@@ -346,6 +354,7 @@ pub struct UnmaintainedSupersededCounts {
     pub deletes_refused: u64,
     pub held_named: u64,
     pub held_unreadable_head: u64,
+    pub held_pinned_window: u64,
     pub groups_held_by_legal_hold: u64,
 }
 
@@ -458,6 +467,8 @@ impl MaintenanceSafetyMetrics {
                     .load(Ordering::Relaxed),
                 held_named: held[SupersededHeldReason::Named.index()].load(Ordering::Relaxed),
                 held_unreadable_head: held[SupersededHeldReason::UnreadableHead.index()]
+                    .load(Ordering::Relaxed),
+                held_pinned_window: held[SupersededHeldReason::PinnedWindow.index()]
                     .load(Ordering::Relaxed),
                 groups_held_by_legal_hold: self.unmaintained_superseded_groups_held_by_legal_hold
                     [i]
@@ -2488,6 +2499,10 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
                         claims_acquired = report.claims_acquired,
                         claims_stolen = report.claims_stolen,
                         lag_bound_gets = report.lag_bound_gets,
+                        // Expired buckets waiting on their unnamed-since
+                        // marker (ADR-1133), and this pass's marker writes.
+                        blocked_by_pinned_window = report.blocked_by_pinned_window,
+                        unnamed_markers_written = report.unnamed_markers.written,
                         "maintenance: retention + compaction pass complete"
                     );
                     safety.record_scan(signal, &report);
@@ -2557,6 +2572,10 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
                         superseded_records = report.superseded_records_deleted,
                         superseded_data = report.superseded_data_deleted,
                         unreferenced_parts = report.unreferenced_parts_deleted,
+                        superseded_held_pinned_window = report.superseded_held_by_pinned_window,
+                        unnamed_markers_written = report.unnamed_markers.written,
+                        unnamed_markers_reaped =
+                            report.unnamed_marker_reap.as_ref().map_or(0, |r| r.reaped),
                         "maintenance: sweep pass complete"
                     );
                     if report.orphan_breaker_tripped {
