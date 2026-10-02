@@ -581,7 +581,7 @@ pub struct ServerConfig {
     /// probe task per process at this cadence; it GETs the fixed `sys/tenancy`
     /// object, and after `store_probe::K` consecutive failures flips the
     /// reachability flag `/readyz` reads. Not mode-scoped: every mode builds a
-    /// store handle and runs the probe.
+    /// store handle and runs the probe. Zero is refused at startup.
     pub store_probe_interval: Duration,
     /// The fleet-global admission reconciliation interval `R` (ADR-0057 section
     /// 4), from `--admission-reconcile-interval` (default 10s). [`start`] spawns
@@ -589,7 +589,7 @@ pub struct ServerConfig {
     /// modes ([`Mode::All`]/[`Mode::Gateway`]); it writes this process's
     /// admission usage to a self-owned key and reads every sibling's to make the
     /// configured caps fleet-wide. Not spawned in query/maintain modes, which
-    /// serve no ingest admission.
+    /// serve no ingest admission. Zero is refused at startup in every mode.
     pub admission_reconcile_interval: Duration,
     /// The fleet-global query concurrency ceiling (ADR-0061 decision 2), from
     /// `--max-concurrent-queries` (default
@@ -634,7 +634,8 @@ pub struct ServerConfig {
     /// runs background housekeeping over durable objects); it rotates the
     /// content-tier integrity check through the whole object corpus once per
     /// `P`, so sustained scrub read bandwidth is bounded at `corpus_bytes / P`.
-    /// Not spawned in ingest/query modes, whose job is the hot path.
+    /// Not spawned in ingest/query modes, whose job is the hot path. Zero is
+    /// refused at startup in every mode.
     pub scrub_period: Duration,
     /// Per-tenant POSTINGS indexed-field configuration (ADR-0049 decision 3), resolved from `--indexed-field` / `--indexed-field-tenant`.
     /// [`start`] wraps it in an `Arc` and hands it to the log ingest router,
@@ -1830,9 +1831,16 @@ fn validated_ingest_config(config: IngestConfig, signal: Signal) -> anyhow::Resu
     Ok(config)
 }
 
-/// Refuses a zero fold, maintain, alert-evaluation, or JWKS-refresh interval
-/// before [`start_with_heartbeat`] spawns anything, each with that loop's
-/// typed error, so a refused start leaves no loop task running. The fold, maintain, and
+/// Refuses a zero fold, maintain, alert-evaluation, JWKS-refresh, store-probe,
+/// admission-reconcile, or scrub interval, and a zero fold-lag interval, before
+/// [`start_with_heartbeat`] spawns anything or makes a store request, each with
+/// its own typed error, so a refused start leaves no loop task running. The
+/// store-probe, admission-reconcile and scrub intervals and the fold-lag
+/// interval are refused in every mode, as the command line refuses their flags
+/// in every mode: `Cli::validate` refuses `--fold-lag-interval-secs 0`, and
+/// `main` refuses the other three through `parse_store_probe_interval`,
+/// `parse_admission_reconcile_interval` and `parse_scrub_period`, which it
+/// calls whatever the mode. The fold, maintain, and
 /// alert-evaluation intervals are refused whether or not their loop is enabled,
 /// matching `Cli::validate`, which refuses the flags in every mode and enabled
 /// state: a disabled fold's interval still feeds the on-demand fold rate gate
@@ -1857,6 +1865,10 @@ fn validate_loop_intervals(config: &ServerConfig) -> anyhow::Result<()> {
     if let Some(params) = &config.oidc_refresh {
         params.check_spawnable()?;
     }
+    store_probe::check_spawnable(config.store_probe_interval)?;
+    admission_reconcile::check_spawnable(config.admission_reconcile_interval)?;
+    scrub::check_spawnable(config.scrub_period)?;
+    query::check_fold_lag_interval(&config.query_budgets)?;
     Ok(())
 }
 
@@ -3858,7 +3870,7 @@ pub async fn start_with_heartbeat(
     // obvious. Its first cycle sleeps a full (jittered) interval before the
     // first GET, so `/readyz` is 200 immediately on startup and only reflects a
     // real outage once the probe has observed one.
-    let store_probe_task = store_probe::spawn(store.clone(), config.store_probe_interval);
+    let store_probe_task = store_probe::spawn(store.clone(), config.store_probe_interval)?;
 
     // Fleet-global admission reconciliation (ADR-0057): one task per process,
     // only in the ingest-serving modes (a query/maintain process runs no
@@ -3873,7 +3885,7 @@ pub async fn start_with_heartbeat(
             store.clone(),
             config.admission_reconcile_interval,
             reconcile_cycle_metrics.clone(),
-        )
+        )?
     } else {
         admission_reconcile::AdmissionReconcileTask::none()
     };
@@ -3890,7 +3902,7 @@ pub async fn start_with_heartbeat(
             query_admission.clone(),
             store.clone(),
             config.admission_reconcile_interval,
-        )
+        )?
     } else {
         query_admission_reconcile::QueryAdmissionReconcileTask::none()
     };
@@ -3920,7 +3932,7 @@ pub async fn start_with_heartbeat(
             Arc::new(config.maintain.retention.clone()),
             // The same wall clock the maintenance and fold loops read.
             maintain_clock.clone(),
-        ),
+        )?,
         _ => scrub::ScrubTask::none(),
     };
 
@@ -5390,13 +5402,21 @@ mod loop_interval_startup_tests {
         Maintain,
         AlertEval,
         JwksRefresh,
+        StoreProbe,
+        AdmissionReconcile,
+        Scrub,
+        FoldLag,
     }
 
-    const LOOPS: [Loop; 4] = [
+    const LOOPS: [Loop; 8] = [
         Loop::Fold,
         Loop::Maintain,
         Loop::AlertEval,
         Loop::JwksRefresh,
+        Loop::StoreProbe,
+        Loop::AdmissionReconcile,
+        Loop::Scrub,
+        Loop::FoldLag,
     ];
 
     /// A config in the mode that spawns `which`, with that loop enabled on a
@@ -5410,8 +5430,13 @@ mod loop_interval_startup_tests {
     fn zero_interval_config(which: Loop) -> ServerConfig {
         let interval = Duration::ZERO;
         let mode = match which {
-            Loop::Maintain => Mode::Maintain,
-            Loop::Fold | Loop::AlertEval | Loop::JwksRefresh => Mode::All,
+            Loop::Maintain | Loop::Scrub => Mode::Maintain,
+            Loop::FoldLag => Mode::Query,
+            Loop::Fold
+            | Loop::AlertEval
+            | Loop::JwksRefresh
+            | Loop::StoreProbe
+            | Loop::AdmissionReconcile => Mode::All,
         };
         let mut config = release_b_warning_tests::server_config(
             mode,
@@ -5448,6 +5473,10 @@ mod loop_interval_startup_tests {
                     interval,
                 });
             }
+            Loop::StoreProbe => config.store_probe_interval = interval,
+            Loop::AdmissionReconcile => config.admission_reconcile_interval = interval,
+            Loop::Scrub => config.scrub_period = interval,
+            Loop::FoldLag => config.query_budgets.fold_lag_interval = Some(interval),
         }
         config
     }
@@ -5470,6 +5499,22 @@ mod loop_interval_startup_tests {
             Loop::JwksRefresh => matches!(
                 err.downcast_ref::<tenant::JwksRefreshSpawnError>(),
                 Some(tenant::JwksRefreshSpawnError::ZeroRefreshInterval)
+            ),
+            Loop::StoreProbe => matches!(
+                err.downcast_ref::<store_probe::SpawnError>(),
+                Some(store_probe::SpawnError::ZeroProbeInterval)
+            ),
+            Loop::AdmissionReconcile => matches!(
+                err.downcast_ref::<admission_reconcile::SpawnError>(),
+                Some(admission_reconcile::SpawnError::ZeroReconcileInterval)
+            ),
+            Loop::Scrub => matches!(
+                err.downcast_ref::<scrub::SpawnError>(),
+                Some(scrub::SpawnError::ZeroScrubPeriod)
+            ),
+            Loop::FoldLag => matches!(
+                err.downcast_ref::<query::FoldLagIntervalError>(),
+                Some(query::FoldLagIntervalError::ZeroFoldLagInterval)
             ),
         }
     }
@@ -5494,7 +5539,8 @@ mod loop_interval_startup_tests {
     /// before `spawn_jwks_refresh` runs, with no typed error. Not every loop
     /// fails through the task count, so each loop's own spawn-site guard is
     /// pinned separately by the `spawn_refuses_a_zero_*_interval` test in that
-    /// loop's module.
+    /// loop's module. The fold-lag interval has no spawn site:
+    /// `validate_loop_intervals` is the only place that refuses it.
     ///
     /// The config is built before `alive_before` is read, so a config builder
     /// that ever spawned a task could not inflate the baseline and pass this
@@ -5561,6 +5607,73 @@ mod loop_interval_startup_tests {
         }
     }
 
+    /// The store-probe, admission-reconcile, scrub and fold-lag refusals
+    /// come before [`start`] makes any store request. Every operation on the
+    /// store fires a `Timeout` rule without reaching the backend, so an empty
+    /// counter snapshot means the store saw no request at all. The `Mode::All`
+    /// and `Mode::Query` cases carry a deployment key, so a `start` that
+    /// validated after its initial durable-auth refresh would read `sys/auth`
+    /// first and leave a `Get` in the counters.
+    ///
+    /// Flip to watch it fail: move `validate_loop_intervals(&config)?;` in
+    /// `start_with_heartbeat` below the initial durable-auth refresh, and the
+    /// store-probe case, the first keyed one, fails the counter assertion with
+    /// a `Get`. Or delete
+    /// `query::check_fold_lag_interval(&config.query_budgets)?;` in
+    /// `validate_loop_intervals`, the only place a zero fold-lag interval is
+    /// refused, and the fold-lag case starts. The task-count test above is
+    /// the one that pins the other three checks ahead of their spawn sites.
+    #[tokio::test]
+    async fn start_refuses_a_zero_interval_before_any_store_request() {
+        use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+
+        for which in [
+            Loop::StoreProbe,
+            Loop::AdmissionReconcile,
+            Loop::Scrub,
+            Loop::FoldLag,
+        ] {
+            let plan = [Op::Put, Op::Get, Op::Head, Op::List, Op::Delete]
+                .into_iter()
+                .fold(FaultPlan::empty(), |plan, op| {
+                    plan.with_rule(Rule::new(op, ScriptedFault::Timeout))
+                });
+            let faults = Arc::new(FaultStore::new(
+                ravel_object_store::memory::MemoryStore::new(),
+                plan,
+            ));
+            let store: Arc<dyn ObjectStoreBackend> = faults.clone();
+            let mut config = zero_interval_config(which);
+            if matches!(config.mode, Mode::All | Mode::Query) {
+                config.deployment_key = Some(Box::new([7u8; 32]));
+            }
+            let result = start(
+                config,
+                store.clone(),
+                store,
+                Arc::new(StoreMetrics::default()),
+                None,
+            )
+            .await;
+            let err = match result {
+                Err(err) => err,
+                Ok(running) => {
+                    running.shutdown().await.expect("server shuts down");
+                    panic!("{which:?}: a zero interval must refuse startup");
+                }
+            };
+            assert!(
+                is_zero_interval_refusal(which, &err),
+                "{which:?}: expected the typed zero-interval refusal, got: {err:#}"
+            );
+            assert!(
+                faults.counters_snapshot().is_empty(),
+                "{which:?}: a refused start must make no store request, saw: {:?}",
+                faults.counters_snapshot()
+            );
+        }
+    }
+
     /// A fold, maintain or alert-evaluation loop that is DISABLED but carries
     /// a zero interval is still refused by [`start`] with that loop's variant,
     /// exactly as `Cli::validate` refuses the flag whatever the enabled state.
@@ -5579,7 +5692,11 @@ mod loop_interval_startup_tests {
                 Loop::Fold => config.fold.enabled = false,
                 Loop::Maintain => config.maintain.enabled = false,
                 Loop::AlertEval => config.alerting.enabled = false,
-                Loop::JwksRefresh => continue,
+                Loop::JwksRefresh
+                | Loop::StoreProbe
+                | Loop::AdmissionReconcile
+                | Loop::Scrub
+                | Loop::FoldLag => continue,
             }
             let store = memory_store();
             let result = start(
