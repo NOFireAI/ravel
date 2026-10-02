@@ -139,7 +139,7 @@ enum Served {
 }
 
 impl Served {
-    fn from_cache(self) -> bool {
+    fn is_cache_served(self) -> bool {
         matches!(self, Served::Disk | Served::RamRecheck)
     }
 
@@ -366,7 +366,7 @@ where
             self.ram.metrics().record_collapse();
         }
         Ok((
-            self.maybe_corrupt(bytes, served.from_cache()),
+            self.maybe_corrupt(bytes, served.is_cache_served()),
             served.outcome(role),
         ))
     }
@@ -493,7 +493,7 @@ where
         // A result served by the RAM check, or by a concurrent `get_or_fetch`
         // leader's disk hit, is corruption-gated exactly as `get_or_fetch`'s
         // is; this method's own fetch is not.
-        Ok(self.maybe_corrupt(bytes, served.from_cache()))
+        Ok(self.maybe_corrupt(bytes, served.is_cache_served()))
     }
 
     /// Read `key` through both tiers with **no** upstream fetch and **no**
