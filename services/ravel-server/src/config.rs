@@ -1026,8 +1026,8 @@ pub struct Cli {
 
     /// Boolean claim that grants the `ddl` capability (ADR-2040 decision 4,
     /// "Who may run DDL"): a verified token carrying this claim as the JSON
-    /// boolean `true` may run tenant-scoped DDL once that capability is
-    /// consumed by a query path (issue #2054; nothing reads it yet). A string,
+    /// boolean `true` may run tenant-scoped DDL through `POST /api/v1/sql`
+    /// (`CREATE EXTERNAL TABLE` and `DROP TABLE`). A string,
     /// a number, an array, or a missing claim never grants it. Unset (the
     /// default), the capability is never granted via OIDC. Setting it without
     /// OIDC enabled fails startup rather than silently doing nothing.

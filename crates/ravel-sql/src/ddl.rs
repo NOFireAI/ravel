@@ -6,8 +6,8 @@
 //! This is a separate entry point from [`SqlExecutor::execute`] and
 //! [`SqlExecutor::execute_accounted`], which stay read-only: nothing on the
 //! read path ever writes a manifest, and nothing here plans or executes a
-//! query. The caller (services/ravel-server, not yet wired -- issue #2054's
-//! sibling task) must already have checked the request's `ddl` capability;
+//! query. The caller (`POST /api/v1/sql` in services/ravel-server) must already
+//! have checked the request's `ddl` capability;
 //! [`SqlExecutor::execute_ddl`] performs no authorization of its own.
 //!
 //! # The CREATE path, in order

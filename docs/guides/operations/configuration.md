@@ -816,8 +816,9 @@ Tenant identity affects only key prefixing and authorization. It carries no
 other per-tenant configuration.
 
 A `TENANT` ending in `;ddl` (the tenant is the text before the LAST `;`)
-grants that token the `ddl` capability: absent by default, and nothing yet
-consumes it until `CREATE EXTERNAL TABLE` ships. Any other suffix, or an
+grants that token the `ddl` capability: absent by default, and the only thing
+that reads it is `CREATE EXTERNAL TABLE` and `DROP TABLE` over
+`POST /api/v1/sql`. Any other suffix, or an
 empty tenant before the `;`, refuses startup naming the flag position or the
 token file's line number, never the pair's text. A tenant with no `;` is
 unchanged and never carries the capability. See [Background](#background)
