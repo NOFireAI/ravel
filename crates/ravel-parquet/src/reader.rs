@@ -201,14 +201,20 @@ impl PinnedParquetReader {
         // whose leader was refused by ITS budget, tries again under its own.
         // Each attempt peeks the cache first, so a range another query cached
         // meanwhile is served from cache and the tiered cache's "the caller
-        // already saw a miss" precondition holds. The cap is 3 because the
-        // refused flight stays joinable briefly after its leader publishes the
-        // refusal, so a first retry can follow the same flight; once the
-        // leader clears its slot the next attempt leads or follows a newer one.
+        // already saw a miss" precondition holds. Only the first peek is
+        // counted on the cache's tier metrics; a retry looks again uncounted,
+        // so one logical read records one hit or miss there. The cap is 3
+        // because the refused flight stays joinable briefly after its leader
+        // publishes the refusal, so a first retry can follow the same flight.
+        // Attempts can also be spent following distinct flights that are each
+        // refused by their own leader's budget; a caller that follows refused
+        // flights on every attempt gets a store-shaped error, never wrong
+        // bytes. The cap trades that residual case against retrying without
+        // bound.
         const MAX_ATTEMPTS: usize = 3;
         let mut attempt = 1;
         let (fetched, refused) = loop {
-            if let Some(bytes) = self.peek(key).await {
+            if let Some(bytes) = self.peek(key, attempt == 1).await {
                 accounting.record_cache_hit();
                 accounting.add_cache_bytes(bytes.len() as u64);
                 reservation.mark_handed_off();
@@ -259,12 +265,16 @@ impl PinnedParquetReader {
     }
 
     /// Consult the read cache for `key` without fetching: both tiers of a
-    /// tiered cache, the RAM cache otherwise, nothing without a cache.
-    async fn peek(&self, key: CacheKey) -> Option<Bytes> {
-        match &self.services.cache {
-            Some(ReadCache::Ram(cache)) => cache.get(&key),
-            Some(ReadCache::Tiered(cache)) => cache.get_off_worker(key).await,
-            None => None,
+    /// tiered cache, the RAM cache otherwise, nothing without a cache. With
+    /// `counted` false the lookup records no hit or miss on the cache's own
+    /// metrics, for a retry whose first peek already recorded one.
+    async fn peek(&self, key: CacheKey, counted: bool) -> Option<Bytes> {
+        match (&self.services.cache, counted) {
+            (Some(ReadCache::Ram(cache)), true) => cache.get(&key),
+            (Some(ReadCache::Ram(cache)), false) => cache.peek_uncounted(&key),
+            (Some(ReadCache::Tiered(cache)), true) => cache.get_off_worker(key).await,
+            (Some(ReadCache::Tiered(cache)), false) => cache.peek_uncounted_off_worker(key).await,
+            (None, _) => None,
         }
     }
 
@@ -2971,6 +2981,10 @@ mod tests {
         let a = rig.leader_until(|| tiered.is_in_flight(&key)).await;
         let mut b_fut = Box::pin(b.read_range(0..4, QueryPhase::Scan));
         drive_until(&mut b_fut, || tiered.in_flight_waiters(&key) == 1).await;
+        // Both first peeks (A's and B's) are counted by now; the retry's
+        // re-peek must add nothing to either tier's own metrics.
+        let ram_before = tiered.ram_metrics().snapshot();
+        let disk_before = tiered.disk_metrics().snapshot();
 
         tiered.disk_for_test().insert(key, b"efgh");
         a.refuse(permit).await;
@@ -2981,6 +2995,18 @@ mod tests {
         let scan = b_accounting.snapshot();
         let scan = scan.phase(QueryPhase::Scan);
         assert_eq!((scan.cache_hits, scan.cache_misses), (1, 0));
+        let ram_after = tiered.ram_metrics().snapshot();
+        let disk_after = tiered.disk_metrics().snapshot();
+        assert_eq!(
+            (ram_after.hits, ram_after.misses),
+            (ram_before.hits, ram_before.misses),
+            "the retry's re-peek records nothing on the RAM tier"
+        );
+        assert_eq!(
+            (disk_after.hits, disk_after.misses),
+            (disk_before.hits, disk_before.misses),
+            "the retry's re-peek records nothing on the disk tier"
+        );
     }
 
     /// A range whose body would take the wire bytes past `max_bytes_scanned`
