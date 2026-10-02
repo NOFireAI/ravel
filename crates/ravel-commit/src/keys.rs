@@ -596,6 +596,214 @@ pub fn maint_cursor_key(
     ))
 }
 
+// --- Unnamed-since markers (ADR-1133 decision 1). Additive: a second level
+// under the per-signal `maint/` prefix, outside every commit prefix, so no
+// bucket listing ever sees one.
+
+/// Unnamed-since marker directory segment, below [`MAINT_DIR`].
+pub const UNNAMED_MARKER_DIR: &str = "unn";
+/// Unnamed-since marker object suffix.
+pub const UNNAMED_MARKER_SUFFIX: &str = "unn";
+/// The retention marker's filename stem, fixed per bucket: `retire.unn`, the
+/// marker of the bucket's `retire.tmb`.
+pub const RETENTION_MARKER_STEM: &str = "retire";
+
+/// The object an unnamed-since marker is keyed by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnnamedMarkerAnchor {
+    /// The bucket's retention tombstone (`retire.tmb`).
+    RetentionTombstone,
+    /// A compaction record (`l1.<input_set_hash16>.cmt`).
+    CompactionRecord { input_set_hash16: String },
+    /// A rewrite record (`rw.<input_set_hash16>.cmt`).
+    RewriteRecord { input_set_hash16: String },
+}
+
+/// Prefix covering every unnamed-since marker of one (tenant, signal), across
+/// every shard: the orphan reaper's one signal-wide LIST.
+///
+/// `t/<tenant_hash_hex>/<signal>/maint/unn/`
+pub fn unnamed_marker_prefix(tenant_hash: &TenantHash, signal: Signal) -> String {
+    format!(
+        "t/{}/{}/{MAINT_DIR}/{UNNAMED_MARKER_DIR}/",
+        tenant_hash.to_hex(),
+        signal.key_prefix()
+    )
+}
+
+fn unnamed_marker_key(
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    ingest_hour_bucket: u32,
+    stem: &str,
+) -> Result<String, KeyError> {
+    Ok(format!(
+        "{}{}/{}/{stem}.{UNNAMED_MARKER_SUFFIX}",
+        unnamed_marker_prefix(tenant_hash, signal),
+        format_shard(shard)?,
+        ingest_hour_string(ingest_hour_bucket)
+    ))
+}
+
+/// Build the retention sweep's unnamed-since marker key for one tombstoned
+/// bucket (ADR-1133 decision 1).
+///
+/// `t/<tenant_hash_hex>/<signal>/maint/unn/<shard>/<ingest_hour>/retire.unn`
+pub fn retention_unnamed_marker_key(
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    ingest_hour_bucket: u32,
+) -> Result<String, KeyError> {
+    unnamed_marker_key(
+        tenant_hash,
+        signal,
+        shard,
+        ingest_hour_bucket,
+        RETENTION_MARKER_STEM,
+    )
+}
+
+/// Build the superseded-input sweep's unnamed-since marker key for the chain
+/// group entered from `record_key`, a compaction or rewrite record key
+/// (ADR-1133 decision 1). The marker's stem is the record's file stem.
+///
+/// `t/<tenant_hash_hex>/<signal>/maint/unn/<shard>/<ingest_hour>/<l1|rw>.<input_set_hash16>.unn`
+pub fn record_unnamed_marker_key(record_key: &str) -> Result<String, KeyError> {
+    let (tenant_hash, signal, shard, hour, tag, hash16) =
+        if let Ok(p) = parse_compaction_record_key(record_key) {
+            (
+                p.tenant_hash,
+                p.signal,
+                p.shard,
+                p.ingest_hour_bucket,
+                COMPACTION_RECORD_TAG,
+                p.input_set_hash16,
+            )
+        } else {
+            let p = parse_rewrite_record_key(record_key)?;
+            (
+                p.tenant_hash,
+                p.signal,
+                p.shard,
+                p.ingest_hour_bucket,
+                REWRITE_RECORD_TAG,
+                p.input_set_hash16,
+            )
+        };
+    unnamed_marker_key(
+        &tenant_hash,
+        signal,
+        shard,
+        hour,
+        &format!("{tag}.{hash16}"),
+    )
+}
+
+/// Parsed form of an unnamed-since marker key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedUnnamedMarkerKey {
+    pub tenant_hash: TenantHash,
+    pub signal: Signal,
+    pub shard: u32,
+    pub ingest_hour_bucket: u32,
+    pub anchor: UnnamedMarkerAnchor,
+}
+
+impl ParsedUnnamedMarkerKey {
+    /// The key of the tombstone or record this marker is keyed by.
+    pub fn anchor_key(&self) -> Result<String, KeyError> {
+        match &self.anchor {
+            UnnamedMarkerAnchor::RetentionTombstone => retention_tombstone_key(
+                &self.tenant_hash,
+                self.signal,
+                self.shard,
+                self.ingest_hour_bucket,
+            ),
+            UnnamedMarkerAnchor::CompactionRecord { input_set_hash16 } => compaction_record_key(
+                &self.tenant_hash,
+                self.signal,
+                self.shard,
+                self.ingest_hour_bucket,
+                input_set_hash16,
+            ),
+            UnnamedMarkerAnchor::RewriteRecord { input_set_hash16 } => rewrite_record_key(
+                &self.tenant_hash,
+                self.signal,
+                self.shard,
+                self.ingest_hour_bucket,
+                input_set_hash16,
+            ),
+        }
+    }
+}
+
+/// Parse an unnamed-since marker key produced by
+/// [`retention_unnamed_marker_key`] or [`record_unnamed_marker_key`],
+/// validating every component.
+pub fn parse_unnamed_marker_key(key: &str) -> Result<ParsedUnnamedMarkerKey, KeyError> {
+    let parts: Vec<&str> = key.split('/').collect();
+    let [root, tenant_hex, signal_s, maint, unn, shard_s, hour_s, filename] = parts.as_slice()
+    else {
+        return Err(malformed(key, "expected 8 path segments"));
+    };
+    if *root != "t" {
+        return Err(malformed(key, "expected key to start with \"t/\""));
+    }
+    if *maint != MAINT_DIR {
+        return Err(malformed(key, format!("expected {MAINT_DIR:?} segment")));
+    }
+    if *unn != UNNAMED_MARKER_DIR {
+        return Err(malformed(
+            key,
+            format!("expected {UNNAMED_MARKER_DIR:?} segment"),
+        ));
+    }
+    let tenant_hash = TenantHash::from_hex(tenant_hex)
+        .map_err(|_| KeyError::InvalidTenantHash(tenant_hex.to_string()))?;
+    let signal =
+        signal::from_prefix(signal_s).map_err(|_| KeyError::UnknownSignal(signal_s.to_string()))?;
+    let shard = parse_shard_component(key, shard_s)?;
+    let ingest_hour_bucket = parse_ingest_hour_string(hour_s)?;
+
+    let file_parts: Vec<&str> = filename.split('.').collect();
+    let anchor = match file_parts.as_slice() {
+        [stem, suffix] if *stem == RETENTION_MARKER_STEM && *suffix == UNNAMED_MARKER_SUFFIX => {
+            UnnamedMarkerAnchor::RetentionTombstone
+        }
+        [tag, hash16, suffix] if *suffix == UNNAMED_MARKER_SUFFIX => {
+            let input_set_hash16 = parse_hash16_component(key, hash16)?;
+            match *tag {
+                COMPACTION_RECORD_TAG => UnnamedMarkerAnchor::CompactionRecord { input_set_hash16 },
+                REWRITE_RECORD_TAG => UnnamedMarkerAnchor::RewriteRecord { input_set_hash16 },
+                _ => {
+                    return Err(malformed(
+                        key,
+                        format!(
+                            "expected tag {COMPACTION_RECORD_TAG:?} or {REWRITE_RECORD_TAG:?}"
+                        ),
+                    ));
+                }
+            }
+        }
+        _ => {
+            return Err(malformed(
+                key,
+                "expected \"retire.unn\" or \"<l1|rw>.hash16.unn\" filename",
+            ));
+        }
+    };
+
+    Ok(ParsedUnnamedMarkerKey {
+        tenant_hash,
+        signal,
+        shard,
+        ingest_hour_bucket,
+        anchor,
+    })
+}
+
 // --- Selective-erasure key shapes (ADR-0064 decision 1 and 3). All additive:
 // new `del/` prefix plus a new `rw.` tag in the existing `c/` prefix; every
 // key shape above is untouched. ---
@@ -1769,6 +1977,94 @@ mod tests {
         assert!(parse_maint_cursor_key(&bad_dir).is_err());
         let bad_filename = good.replacen("cursor", "cursors", 1);
         assert!(parse_maint_cursor_key(&bad_filename).is_err());
+    }
+
+    #[test]
+    fn retention_unnamed_marker_key_round_trips() {
+        let th = tenant_hash();
+        let hour = parse_ingest_hour_string("20260101T05").expect("hour");
+        let key = retention_unnamed_marker_key(&th, Signal::Logs, 3, hour).expect("build");
+        assert_eq!(
+            key,
+            format!("t/{}/l/maint/unn/0003/20260101T05/retire.unn", th.to_hex())
+        );
+        assert!(key.starts_with(&unnamed_marker_prefix(&th, Signal::Logs)));
+        let parsed = parse_unnamed_marker_key(&key).expect("parse");
+        assert_eq!(parsed.tenant_hash, th);
+        assert_eq!(parsed.signal, Signal::Logs);
+        assert_eq!(parsed.shard, 3);
+        assert_eq!(parsed.ingest_hour_bucket, hour);
+        assert_eq!(parsed.anchor, UnnamedMarkerAnchor::RetentionTombstone);
+        assert_eq!(
+            parsed.anchor_key().expect("anchor"),
+            retention_tombstone_key(&th, Signal::Logs, 3, hour).expect("tombstone")
+        );
+    }
+
+    #[test]
+    fn record_unnamed_marker_key_takes_the_record_file_stem() {
+        let th = tenant_hash();
+        let hour = parse_ingest_hour_string("20260101T05").expect("hour");
+        let cmp = compaction_record_key(&th, Signal::Metrics, 1, hour, "0011223344556677")
+            .expect("compaction key");
+        let key = record_unnamed_marker_key(&cmp).expect("build");
+        assert_eq!(
+            key,
+            format!(
+                "t/{}/m/maint/unn/0001/20260101T05/l1.0011223344556677.unn",
+                th.to_hex()
+            )
+        );
+        let parsed = parse_unnamed_marker_key(&key).expect("parse");
+        assert_eq!(
+            parsed.anchor,
+            UnnamedMarkerAnchor::CompactionRecord {
+                input_set_hash16: "0011223344556677".to_string()
+            }
+        );
+        assert_eq!(parsed.anchor_key().expect("anchor"), cmp);
+
+        let rw = rewrite_record_key(&th, Signal::Spans, 9, hour, "8899aabbccddeeff")
+            .expect("rewrite key");
+        let key = record_unnamed_marker_key(&rw).expect("build");
+        assert_eq!(
+            key,
+            format!(
+                "t/{}/s/maint/unn/0009/20260101T05/rw.8899aabbccddeeff.unn",
+                th.to_hex()
+            )
+        );
+        let parsed = parse_unnamed_marker_key(&key).expect("parse");
+        assert_eq!(parsed.anchor_key().expect("anchor"), rw);
+    }
+
+    #[test]
+    fn record_unnamed_marker_key_refuses_a_non_record_key() {
+        let th = tenant_hash();
+        let tmb = retention_tombstone_key(&th, Signal::Metrics, 1, 10).expect("tombstone");
+        assert!(record_unnamed_marker_key(&tmb).is_err());
+        let cursor = maint_cursor_key(&th, Signal::Metrics, 1).expect("cursor");
+        assert!(record_unnamed_marker_key(&cursor).is_err());
+    }
+
+    #[test]
+    fn parse_unnamed_marker_key_rejects_malformed_input() {
+        let th = tenant_hash();
+        let good = retention_unnamed_marker_key(&th, Signal::Metrics, 2, 500_000).expect("build");
+        assert!(parse_unnamed_marker_key(&good).is_ok());
+        for bad in [
+            good.replacen("/unn/", "/unm/", 1),
+            good.replacen("/maint/", "/c/", 1),
+            good.replacen("retire.unn", "retire.tmb", 1),
+            good.replacen("retire.unn", "xx.0011223344556677.unn", 1),
+            good.replacen("retire.unn", "l1.0011.unn", 1),
+            good.replacen("retire.unn", "l1.0011223344556677.cmt", 1),
+            good.replacen("/0002/", "/2/", 1),
+            format!("{}0002/cursor", unnamed_marker_prefix(&th, Signal::Metrics)),
+            maint_cursor_key(&th, Signal::Metrics, 2).expect("cursor"),
+        ] {
+            assert!(parse_unnamed_marker_key(&bad).is_err(), "{bad}");
+        }
     }
 
     fn sample_compaction_record(

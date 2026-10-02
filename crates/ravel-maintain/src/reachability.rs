@@ -30,12 +30,28 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ravel_catalog::{DecodedPart, PartLimits, decode_head, decode_part};
-use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
+use ravel_commit::keys;
+use ravel_object_store::{GetRange, ObjectMeta, ObjectStoreBackend, StoreError, list_all};
 use ravel_proto::catalog::v1::{SnapshotEntry, SnapshotHead, SnapshotPartRef};
 use ravel_types::{Signal, TenantHash};
 
 use crate::bucket::Bucket;
+use crate::clock::Clock;
+use crate::config::CompactorConfig;
 use crate::error::{MaintainError, Result};
+use crate::unnamed_marker::{
+    MarkerAnchor, MarkerReapOutcome, PinnedQueryWindow, UnnamedMarker, put_marker, reap_listed,
+};
+
+/// [`SnapshotGate::Clear`] once `observed_unix_ns` is past the pinned-query
+/// window on the deleting sweeper's clock, read now.
+fn window_verdict(ctx: &MarkerContext<'_>, observed_unix_ns: i64) -> SnapshotGate {
+    if ctx.window.has_elapsed(observed_unix_ns, ctx.clock.now_ns()) {
+        SnapshotGate::Clear
+    } else {
+        SnapshotGate::Blocked(SnapshotBlock::PinnedWindow)
+    }
+}
 
 /// Why a physical delete was blocked by HEAD reachability (ADR-0020
 /// delete-blocker). Both variants delete nothing; they are distinguished so
@@ -54,7 +70,16 @@ pub enum SnapshotBlock {
     /// writes, or a HEAD-named part that is missing). Blocked fail-closed:
     /// non-reachability cannot be proven from data that cannot be read, and a
     /// wrongly-permitted delete is unrecoverable while a delayed one is not.
+    /// Also the answer for any doubt about the candidate's unnamed-since
+    /// marker (ADR-1133 decision 6): a marker get, put, delete or LIST error,
+    /// a body that does not decode, or an anchor that cannot be read.
     Unreadable,
+    /// No snapshot entry names the candidate, but its unnamed-since marker is
+    /// missing, was written for another anchor, or is younger than the
+    /// pinned-query window (ADR-1133 decision 3): a query that resolved a HEAD
+    /// from before the drop may still be reading it. Clears on its own once
+    /// the marker ages.
+    PinnedWindow,
 }
 
 /// The result of gating one delete candidate on HEAD reachability.
@@ -143,12 +168,96 @@ fn snapshot_object(entry: &SnapshotEntry) -> Option<SnapshotObject> {
 /// naming an input a published compaction or rewrite record already
 /// superseded. In both directions a HEAD read that DOES name the candidate
 /// only ever delays a delete by one pass, the fail-safe direction.
+///
+/// It also caches the unnamed-since markers (ADR-1133) the pass reads: one
+/// signal-wide LIST of `maint/unn/` the first time a candidate reaches the
+/// marker step, and each marker body at most once.
 #[derive(Default)]
 pub struct SnapshotReachability {
     head: Option<HeadLoad>,
+    /// The store version of the HEAD read, for the marker's forensic field.
+    head_version: String,
     /// Decoded snapshot parts by object key. `None` = present but unreadable
     /// (fail-closed); `Some` = decoded and usable.
     parts: HashMap<String, Option<Arc<DecodedPart>>>,
+    markers: MarkerCache,
+}
+
+/// Whether a pass may write and delete unnamed-since markers, or only read
+/// them (ADR-1133 decisions 3 and 6: an observing pass and a dry run write
+/// none).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MarkerPolicy {
+    Write,
+    ReadOnly,
+}
+
+/// What the pass needs to evaluate the pinned-query window.
+#[derive(Clone, Copy)]
+pub(crate) struct MarkerContext<'a> {
+    pub(crate) clock: &'a dyn Clock,
+    pub(crate) window: PinnedQueryWindow,
+    pub(crate) policy: MarkerPolicy,
+}
+
+impl<'a> MarkerContext<'a> {
+    pub(crate) fn new(clock: &'a dyn Clock, config: &CompactorConfig, policy: MarkerPolicy) -> Self {
+        Self {
+            clock,
+            window: PinnedQueryWindow::from_config(config),
+            policy,
+        }
+    }
+}
+
+/// Unnamed-since marker requests and transitions of one pass. Every request is
+/// issued through the pass's own store handle, so it is also counted wherever
+/// that handle's requests are.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MarkerStats {
+    /// Signal-wide `maint/unn/` LISTs (each drained across all its pages).
+    pub listings: usize,
+    pub get_requests: usize,
+    pub put_requests: usize,
+    pub delete_requests: usize,
+    /// Fresh markers this pass wrote (its first unnamed observation of a
+    /// candidate, or a restart after a mismatch or a re-name).
+    pub written: usize,
+    /// Markers deleted because HEAD names their candidate again (ADR-1133
+    /// decision 5).
+    pub reset_renamed: usize,
+    /// Markers deleted because their anchor is not the tombstone or record
+    /// present now (ADR-1133 decision 2).
+    pub reset_mismatched: usize,
+    /// Markers deleted after the objects they gated.
+    pub retired: usize,
+}
+
+#[derive(Default)]
+struct MarkerCache {
+    /// The pass's one signal-wide marker LIST: `None` until needed, then
+    /// `Some(Ok(listing))` or `Some(Err(()))` when it failed (every marker is
+    /// then read by GET).
+    listing: Option<std::result::Result<Vec<ObjectMeta>, ()>>,
+    listed: HashSet<String>,
+    scope: Option<(TenantHash, Signal)>,
+    bodies: HashMap<String, MarkerLoad>,
+    /// Anchors this pass read and gated, so the reaper need not re-check them.
+    gated_anchors: HashSet<String>,
+    /// Marker keys this pass wrote or deleted.
+    touched: HashSet<String>,
+    /// Whether this pass gated a candidate under [`MarkerPolicy::Write`].
+    gated_writable: bool,
+    /// Whether this pass already ran the orphan reaper.
+    reaped: bool,
+    stats: MarkerStats,
+}
+
+#[derive(Clone)]
+enum MarkerLoad {
+    Absent,
+    Present(UnnamedMarker),
+    Unreadable,
 }
 
 /// The catalog HEAD as read once for a sweep pass.
@@ -171,6 +280,363 @@ impl SnapshotReachability {
     /// A fresh, empty cache for one sweep pass.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The unnamed-since marker requests and transitions of this pass so far.
+    pub fn marker_stats(&self) -> &MarkerStats {
+        &self.markers.stats
+    }
+
+    /// The pinned-query window gate (ADR-1133 decisions 2, 3, 5 and 6) over a
+    /// candidate whose HEAD-reachability answer is `head_gate`, keyed by
+    /// `marker_key` and written for `anchor`.
+    ///
+    /// - HEAD names the candidate: its marker, if any, is deleted (a re-named
+    ///   candidate restarts its window) and the answer stays
+    ///   [`SnapshotBlock::Named`].
+    /// - HEAD unreadable: unchanged, no marker is touched.
+    /// - HEAD clear: [`SnapshotGate::Clear`] only for a marker written for
+    ///   this anchor whose `observed_unix_ns` is past the window on this
+    ///   sweeper's clock. A missing marker is written and a mismatched one is
+    ///   deleted and rewritten (under [`MarkerPolicy::Write`]); both answer
+    ///   [`SnapshotBlock::PinnedWindow`], as does an unaged one.
+    ///
+    /// Any marker request error, an undecodable body, or a LIST failure on the
+    /// re-name path answers [`SnapshotBlock::Unreadable`]: nothing here ever
+    /// turns a doubt into a delete. The alerts signal gets no marker and every
+    /// clear candidate there holds.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn marker_gate(
+        &mut self,
+        store: &dyn ObjectStoreBackend,
+        ctx: &MarkerContext<'_>,
+        tenant: &TenantHash,
+        signal: Signal,
+        marker_key: &str,
+        anchor: &MarkerAnchor,
+        head_gate: SnapshotGate,
+    ) -> SnapshotGate {
+        if signal == Signal::Alerts {
+            return match head_gate {
+                SnapshotGate::Clear => SnapshotGate::Blocked(SnapshotBlock::PinnedWindow),
+                blocked => blocked,
+            };
+        }
+        match head_gate {
+            SnapshotGate::Blocked(SnapshotBlock::Named) => {
+                if ctx.policy == MarkerPolicy::Write
+                    && self.marker_may_exist(store, tenant, signal, marker_key).await
+                {
+                    if self.delete_marker(store, marker_key).await.is_err() {
+                        return SnapshotGate::Blocked(SnapshotBlock::Unreadable);
+                    }
+                    self.markers.stats.reset_renamed += 1;
+                }
+                return head_gate;
+            }
+            SnapshotGate::Blocked(_) => return head_gate,
+            SnapshotGate::Clear => {}
+        }
+        if ctx.policy == MarkerPolicy::Write {
+            self.markers.gated_writable = true;
+        }
+        self.markers.gated_anchors.insert(anchor.key.clone());
+        match self.load_marker(store, tenant, signal, marker_key).await {
+            MarkerLoad::Unreadable => SnapshotGate::Blocked(SnapshotBlock::Unreadable),
+            MarkerLoad::Present(marker) if marker.anchor == *anchor => {
+                window_verdict(ctx, marker.observed_unix_ns)
+            }
+            MarkerLoad::Present(marker) => {
+                if ctx.policy == MarkerPolicy::ReadOnly {
+                    return SnapshotGate::Blocked(SnapshotBlock::PinnedWindow);
+                }
+                tracing::warn!(
+                    key = %marker_key,
+                    marker_anchor = %marker.anchor.key,
+                    marker_anchor_unix_ns = marker.anchor.anchor_unix_ns,
+                    anchor_unix_ns = anchor.anchor_unix_ns,
+                    "unnamed-since marker was written for another anchor; deleting it and \
+                     restarting the pinned-query window"
+                );
+                if self.delete_marker(store, marker_key).await.is_err() {
+                    return SnapshotGate::Blocked(SnapshotBlock::Unreadable);
+                }
+                self.markers.stats.reset_mismatched += 1;
+                self.write_fresh_marker(store, ctx, marker_key, anchor)
+                    .await
+            }
+            MarkerLoad::Absent => {
+                if ctx.policy == MarkerPolicy::ReadOnly {
+                    return SnapshotGate::Blocked(SnapshotBlock::PinnedWindow);
+                }
+                self.write_fresh_marker(store, ctx, marker_key, anchor)
+                    .await
+            }
+        }
+    }
+
+    /// Delete a marker after the objects it gated are gone (ADR-1133 decision
+    /// 6 ordering: objects, then the marker, then the tombstone or record).
+    pub(crate) async fn retire_marker(
+        &mut self,
+        store: &dyn ObjectStoreBackend,
+        marker_key: &str,
+    ) -> std::result::Result<(), StoreError> {
+        self.delete_marker(store, marker_key).await?;
+        self.markers.stats.retired += 1;
+        Ok(())
+    }
+
+    /// The orphan-marker rule at the end of a deleting pass: reaps when this
+    /// pass gated a candidate, or when `full_pass` (the full-keyspace sweep,
+    /// which the server runs on its `interior_reverify_ns` safety-net cadence
+    /// and the CLI on every run). Reuses the pass's LIST when it has one. A
+    /// failure is logged and never fails the pass: a leftover marker only
+    /// costs a later reap.
+    pub(crate) async fn reap_after_pass(
+        &mut self,
+        store: &dyn ObjectStoreBackend,
+        clock: &dyn Clock,
+        config: &CompactorConfig,
+        tenant: &TenantHash,
+        signal: Signal,
+        full_pass: bool,
+    ) -> Option<MarkerReapOutcome> {
+        if config.dry_run || signal == Signal::Alerts || self.markers.reaped {
+            return None;
+        }
+        if !self.markers.gated_writable && !full_pass {
+            return None;
+        }
+        self.markers.reaped = true;
+        let same_scope = self.markers.scope == Some((*tenant, signal));
+        let listing = match (&self.markers.listing, same_scope) {
+            (Some(Ok(listing)), true) => listing.clone(),
+            _ => {
+                self.markers.stats.listings += 1;
+                match list_all(store, &keys::unnamed_marker_prefix(tenant, signal)).await {
+                    Ok(listing) => listing,
+                    Err(error) => {
+                        tracing::warn!(
+                            tenant_hash = %tenant.to_hex(),
+                            signal = signal.key_prefix(),
+                            %error,
+                            "unnamed-marker reaper: LIST failed; leftover markers wait for a \
+                             later pass"
+                        );
+                        return None;
+                    }
+                }
+            }
+        };
+        match reap_listed(
+            store,
+            clock,
+            config,
+            tenant,
+            signal,
+            &listing,
+            &self.markers.gated_anchors,
+            &self.markers.touched,
+        )
+        .await
+        {
+            Ok(outcome) => Some(outcome),
+            Err(error) => {
+                tracing::warn!(
+                    tenant_hash = %tenant.to_hex(),
+                    signal = signal.key_prefix(),
+                    %error,
+                    "unnamed-marker reaper failed; leftover markers wait for a later pass"
+                );
+                None
+            }
+        }
+    }
+
+    /// Load the pass's signal-wide marker LIST once. A failed LIST is
+    /// remembered, and every marker is then read by GET instead.
+    async fn ensure_marker_listing(
+        &mut self,
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        signal: Signal,
+    ) -> bool {
+        if self.markers.scope != Some((*tenant, signal)) {
+            self.markers = MarkerCache {
+                stats: std::mem::take(&mut self.markers.stats),
+                scope: Some((*tenant, signal)),
+                ..MarkerCache::default()
+            };
+        }
+        if self.markers.listing.is_none() {
+            self.markers.stats.listings += 1;
+            let listed = list_all(store, &keys::unnamed_marker_prefix(tenant, signal)).await;
+            self.markers.listing = Some(match listed {
+                Ok(listing) => {
+                    self.markers.listed = listing.iter().map(|m| m.key.clone()).collect();
+                    Ok(listing)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        tenant_hash = %tenant.to_hex(),
+                        signal = signal.key_prefix(),
+                        %error,
+                        "unnamed-since marker LIST failed; reading each marker by GET this pass"
+                    );
+                    Err(())
+                }
+            });
+        }
+        matches!(self.markers.listing, Some(Ok(_)))
+    }
+
+    /// Whether a marker may exist at `marker_key`: listed, cached present, or
+    /// unknown because the LIST failed.
+    async fn marker_may_exist(
+        &mut self,
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        signal: Signal,
+        marker_key: &str,
+    ) -> bool {
+        let listed = self.ensure_marker_listing(store, tenant, signal).await;
+        match self.markers.bodies.get(marker_key) {
+            Some(MarkerLoad::Absent) => false,
+            Some(_) => true,
+            None => !listed || self.markers.listed.contains(marker_key),
+        }
+    }
+
+    async fn load_marker(
+        &mut self,
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        signal: Signal,
+        marker_key: &str,
+    ) -> MarkerLoad {
+        let listed = self.ensure_marker_listing(store, tenant, signal).await;
+        if let Some(cached) = self.markers.bodies.get(marker_key) {
+            return cached.clone();
+        }
+        let load = if listed && !self.markers.listed.contains(marker_key) {
+            MarkerLoad::Absent
+        } else {
+            self.get_marker(store, marker_key).await
+        };
+        self.markers
+            .bodies
+            .insert(marker_key.to_string(), load.clone());
+        load
+    }
+
+    async fn get_marker(&mut self, store: &dyn ObjectStoreBackend, marker_key: &str) -> MarkerLoad {
+        self.markers.stats.get_requests += 1;
+        match store.get(marker_key, GetRange::Full).await {
+            Ok(got) => match UnnamedMarker::decode(got.data.as_ref()) {
+                Ok(marker) => MarkerLoad::Present(marker),
+                Err(error) => {
+                    tracing::warn!(
+                        key = %marker_key,
+                        %error,
+                        "unnamed-since marker cannot be decoded; blocking its candidate's delete \
+                         fail-closed"
+                    );
+                    MarkerLoad::Unreadable
+                }
+            },
+            Err(StoreError::NotFound) => MarkerLoad::Absent,
+            Err(error) => {
+                tracing::warn!(
+                    key = %marker_key,
+                    %error,
+                    "unnamed-since marker GET failed; blocking its candidate's delete fail-closed"
+                );
+                MarkerLoad::Unreadable
+            }
+        }
+    }
+
+    async fn write_fresh_marker(
+        &mut self,
+        store: &dyn ObjectStoreBackend,
+        ctx: &MarkerContext<'_>,
+        marker_key: &str,
+        anchor: &MarkerAnchor,
+    ) -> SnapshotGate {
+        // Read here, after the HEAD GET this candidate was gated on has
+        // returned, never at the pass's start: a reading taken before that GET
+        // can predate the drop it records.
+        let marker = UnnamedMarker {
+            observed_unix_ns: ctx.clock.now_ns(),
+            anchor: anchor.clone(),
+            head_version: self.head_version.clone(),
+        };
+        self.markers.stats.put_requests += 1;
+        match put_marker(store, marker_key, &marker).await {
+            Ok(()) => {
+                self.markers.stats.written += 1;
+                self.markers.touched.insert(marker_key.to_string());
+                self.markers.listed.insert(marker_key.to_string());
+                let observed = marker.observed_unix_ns;
+                self.markers
+                    .bodies
+                    .insert(marker_key.to_string(), MarkerLoad::Present(marker));
+                window_verdict(ctx, observed)
+            }
+            Err(StoreError::AlreadyExists) => {
+                // Another sweeper wrote it first: its marker stands if it was
+                // written for the same anchor.
+                let load = self.get_marker(store, marker_key).await;
+                self.markers
+                    .bodies
+                    .insert(marker_key.to_string(), load.clone());
+                match load {
+                    MarkerLoad::Present(existing) if existing.anchor == *anchor => {
+                        window_verdict(ctx, existing.observed_unix_ns)
+                    }
+                    MarkerLoad::Present(_) | MarkerLoad::Absent => {
+                        SnapshotGate::Blocked(SnapshotBlock::PinnedWindow)
+                    }
+                    MarkerLoad::Unreadable => SnapshotGate::Blocked(SnapshotBlock::Unreadable),
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    key = %marker_key,
+                    %error,
+                    "unnamed-since marker PUT failed; blocking its candidate's delete fail-closed"
+                );
+                SnapshotGate::Blocked(SnapshotBlock::Unreadable)
+            }
+        }
+    }
+
+    async fn delete_marker(
+        &mut self,
+        store: &dyn ObjectStoreBackend,
+        marker_key: &str,
+    ) -> std::result::Result<(), StoreError> {
+        self.markers.stats.delete_requests += 1;
+        match store.delete(marker_key).await {
+            Ok(()) => {
+                self.markers.touched.insert(marker_key.to_string());
+                self.markers.listed.remove(marker_key);
+                self.markers
+                    .bodies
+                    .insert(marker_key.to_string(), MarkerLoad::Absent);
+                Ok(())
+            }
+            Err(error) => {
+                tracing::warn!(
+                    key = %marker_key,
+                    %error,
+                    "unnamed-since marker DELETE failed; blocking its candidate's delete \
+                     fail-closed"
+                );
+                Err(error)
+            }
+        }
     }
 
     /// Whether the live HEAD snapshot still reaches an object inside `bucket`
@@ -343,7 +809,10 @@ impl SnapshotReachability {
             let head_key = catalog_head_key(tenant, signal);
             let load = match store.get(&head_key, GetRange::Full).await {
                 Ok(got) => match decode_head(got.data.as_ref()) {
-                    Ok(head) => HeadLoad::Present(Box::new(head)),
+                    Ok(head) => {
+                        self.head_version = got.version.0.clone();
+                        HeadLoad::Present(Box::new(head))
+                    }
                     Err(err) => {
                         // Present but undecodable/newer: fail-closed. Cannot
                         // prove non-reachability from a HEAD we cannot read.

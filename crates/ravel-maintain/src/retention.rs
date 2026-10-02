@@ -87,7 +87,8 @@ use crate::compact::{
 };
 use crate::config::{CompactorConfig, RetentionConfig};
 use crate::error::{MaintainError, Result};
-use crate::reachability::SnapshotGate;
+use crate::reachability::{MarkerContext, MarkerPolicy, SnapshotGate};
+use crate::unnamed_marker::{MarkerAnchor, MarkerKind};
 use crate::read::{BucketListing, list_bucket, verify_commit_key};
 use crate::sweep::LeaseCheck;
 
@@ -236,8 +237,20 @@ pub async fn retention_sweep_bucket(
 ) -> Result<RetentionOutcome> {
     let window_ns = resolve_retention_window_ns(store, retention, &bucket.tenant_hash).await?;
     let mut reach = SnapshotReachability::new();
-    retention_sweep_bucket_with_reach(&mut reach, store, clock, config, window_ns, lease, bucket)
-        .await
+    let outcome =
+        retention_sweep_bucket_with_reach(&mut reach, store, clock, config, window_ns, lease, bucket)
+            .await?;
+    reach
+        .reap_after_pass(
+            store,
+            clock,
+            config,
+            &bucket.tenant_hash,
+            bucket.signal,
+            false,
+        )
+        .await;
+    Ok(outcome)
 }
 
 /// [`retention_sweep_bucket`] with a caller-owned [`SnapshotReachability`]
@@ -366,7 +379,7 @@ pub(crate) async fn retention_sweep_bucket_observed(
     // sweep. Anchored on the durable retired_at_ns, exactly as supersession
     // anchors on the compaction record's created_unix_ns.
     if let Some(tombstone_key) = &listing.tombstone_key {
-        let tombstone = get_tombstone(store, tombstone_key).await?;
+        let (tombstone, tombstone_version) = get_tombstone_versioned(store, tombstone_key).await?;
         let nominal_bounds =
             rewrites_keep_nominal_bound(store, bucket, &listing.rewrite_record_keys, rewrite_bound)
                 .await;
@@ -380,14 +393,14 @@ pub(crate) async fn retention_sweep_bucket_observed(
                 .retired_at_ns
                 .saturating_add(config.protection_horizon_ns)
         {
+            let anchor = MarkerAnchor {
+                kind: MarkerKind::Retention,
+                key: tombstone_key.clone(),
+                anchor_unix_ns: tombstone.retired_at_ns,
+                version: tombstone_version,
+            };
             let outcome = physical_sweep(
-                reach,
-                store,
-                lease,
-                bucket,
-                &listing,
-                tombstone_key,
-                config.dry_run,
+                reach, store, clock, config, lease, bucket, &listing, &anchor,
             )
             .await?;
             return Ok((outcome, expiry));
@@ -446,6 +459,16 @@ pub async fn maintain_bucket(
     let (outcome, compaction, _acquisition) =
         maintain_bucket_with_reach(&mut reach, store, clock, config, window_ns, lease, bucket)
             .await?;
+    reach
+        .reap_after_pass(
+            store,
+            clock,
+            config,
+            &bucket.tenant_hash,
+            bucket.signal,
+            false,
+        )
+        .await;
     Ok((outcome, compaction))
 }
 
@@ -639,15 +662,23 @@ async fn write_tombstone(
 /// `keys::partition_bucket_entry` classifies in the commit prefix, which is
 /// the same set [`bucket_is_empty_but_tombstone`] refuses to call empty: a
 /// shape deleted by neither is residue forever (issue #1321).
+///
+/// The bucket's unnamed-since marker (ADR-1133) is deleted after the bucket
+/// is verified empty and before the tombstone, so a crash in between leaves
+/// a tombstone whose next pass starts a fresh window over nothing.
+#[allow(clippy::too_many_arguments)]
 async fn physical_sweep(
     reach: &mut SnapshotReachability,
     store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
     lease: &dyn LeaseCheck,
     bucket: &Bucket,
     listing: &BucketListing,
-    tombstone_key: &str,
-    dry_run: bool,
+    anchor: &MarkerAnchor,
 ) -> Result<RetentionOutcome> {
+    let tombstone_key = anchor.key.as_str();
+    let dry_run = config.dry_run;
     // HEAD-reachability gate (ADR-0020 delete-blocker): before deleting
     // anything, refuse if the live catalog HEAD snapshot still names an object
     // inside this bucket, or if HEAD/a covering part cannot be read (fail
@@ -658,7 +689,36 @@ async fn physical_sweep(
     // proceeds (ADR-0020: the index is a pure optimization). The tombstone is
     // left in place on a block, so bucket-wide exclusion holds and a later
     // pass finishes once the fold has caught up.
-    match reach.bucket_gate(store, bucket).await? {
+    //
+    // A clear HEAD answer then waits for the bucket's unnamed-since marker to
+    // age past the pinned-query window (ADR-1133): a query that resolved a
+    // HEAD from before the fold dropped this bucket may still be reading it.
+    // A dry run reads the marker and writes none.
+    let head_gate = reach.bucket_gate(store, bucket).await?;
+    let marker_key = keys::retention_unnamed_marker_key(
+        &bucket.tenant_hash,
+        bucket.signal,
+        bucket.shard,
+        bucket.ingest_hour_bucket,
+    )?;
+    let policy = if dry_run {
+        MarkerPolicy::ReadOnly
+    } else {
+        MarkerPolicy::Write
+    };
+    let ctx = MarkerContext::new(clock, config, policy);
+    match reach
+        .marker_gate(
+            store,
+            &ctx,
+            &bucket.tenant_hash,
+            bucket.signal,
+            &marker_key,
+            anchor,
+            head_gate,
+        )
+        .await
+    {
         SnapshotGate::Clear => {}
         SnapshotGate::Blocked(reason) => {
             return Ok(RetentionOutcome::BlockedBySnapshot(reason));
@@ -778,6 +838,15 @@ async fn physical_sweep(
     // always runs with dry_run == false); this guard exists so config.dry_run
     // is honored everywhere it is threaded.
     if !bucket_is_empty_but_tombstone(store, bucket).await? {
+        return Ok(RetentionOutcome::SweptPartial);
+    }
+    if lease.is_protected(tombstone_key) {
+        return Ok(RetentionOutcome::SweptPartial);
+    }
+    // The marker goes before the tombstone (ADR-1133 decision 6). A marker
+    // delete that fails keeps the tombstone, so the bucket stays excluded and a
+    // later pass retries both.
+    if !dry_run && reach.retire_marker(store, &marker_key).await.is_err() {
         return Ok(RetentionOutcome::SweptPartial);
     }
     if !lease.is_protected(tombstone_key) {
@@ -1121,12 +1190,18 @@ async fn rewrites_keep_nominal_bound(
 }
 
 /// GET, decode, and key-verify one retention tombstone (ADR-0010 §7 discipline).
-async fn get_tombstone(store: &dyn ObjectStoreBackend, key: &str) -> Result<RetentionTombstone> {
+/// Read and verify a tombstone, with the store version of the bytes read: the
+/// tombstone is the retention marker's anchor, and its version is part of the
+/// anchor identity (ADR-1133 decision 2).
+async fn get_tombstone_versioned(
+    store: &dyn ObjectStoreBackend,
+    key: &str,
+) -> Result<(RetentionTombstone, String)> {
     let got = store.get(key, GetRange::Full).await?;
     let tombstone = record::decode_tombstone(got.data.as_ref())
         .map_err(|e| MaintainError::Invariant(format!("tombstone decode failed: {e}")))?;
     keys::verify_retention_tombstone_key(&tombstone, key)?;
-    Ok(tombstone)
+    Ok((tombstone, got.version.0))
 }
 
 #[cfg(test)]
@@ -1292,7 +1367,7 @@ mod tests {
             .await
             .expect("seed put");
 
-        let err = get_tombstone(&store, &key)
+        let err = get_tombstone_versioned(&store, &key)
             .await
             .expect_err("a version-2 tombstone must be refused, not read as v1");
         match &err {

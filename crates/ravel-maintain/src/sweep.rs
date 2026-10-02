@@ -131,17 +131,25 @@ use crate::clock::Clock;
 use crate::config::{CompactorConfig, NS_PER_HOUR};
 use crate::error::{MaintainError, Result};
 use crate::reachability::{
-    SnapshotBlock, SnapshotGate, SnapshotObject, SnapshotReachability, catalog_head_key,
+    MarkerContext, MarkerPolicy, MarkerStats, SnapshotBlock, SnapshotGate, SnapshotObject,
+    SnapshotReachability, catalog_head_key,
 };
 use crate::read::verify_commit_key;
+use crate::unnamed_marker::{MarkerAnchor, MarkerKind, MarkerReapOutcome};
 
 use ravel_ingest::{IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS, MARKER_SUFFIX};
 
 /// A hook the sweeper consults before every delete, in all five rules. The
 /// only implementation today is [`NoLeases`] (nothing is ever protected); this
 /// is a seam for future reader-lease / slow-consumer work, never
-/// a correctness dependency of the current design (the protection horizon and
-/// the age gates are what protect in-flight readers).
+/// a correctness dependency of the current design. In-flight readers are
+/// protected by the protection horizon, the age gates, the ADR-0020 HEAD
+/// delete blocker and, for the retention and superseded-input rules, the
+/// unnamed-since marker gate (ADR-1133): a candidate HEAD no longer names is
+/// deleted only once its marker is older than `max_query_duration +
+/// head_cache_ttl + 4 * clock_skew_allowance`. That window covers a query
+/// with a validated deadline; a reader with none (the fold, scrub,
+/// compaction, an erasure rewrite, `ravel-cli export`) is not covered by it.
 pub trait LeaseCheck: Send + Sync {
     /// Return `true` if `key` is protected by an active reader lease and must
     /// not be deleted this pass.
@@ -219,6 +227,17 @@ pub struct SweepReport {
     /// ([`SupersededSweepOutcome::held_by_unreadable_head`]); feeds
     /// `ravel_maintain_superseded_inputs_held_total{reason="unreadable_head"}`.
     pub superseded_held_by_unreadable_head: usize,
+    /// Rule 2: objects held this pass because their unnamed-since marker has
+    /// not yet aged past the pinned-query window
+    /// ([`SupersededSweepOutcome::held_by_pinned_window`], ADR-1133); feeds
+    /// `ravel_maintain_superseded_inputs_held_total{reason="pinned_window"}`.
+    pub superseded_held_by_pinned_window: usize,
+    /// Rule 2: the unnamed-since marker requests and transitions of this pass
+    /// ([`SupersededSweepOutcome::unnamed_markers`]).
+    pub unnamed_markers: MarkerStats,
+    /// The orphan-marker reap this pass ran, if any: on a pass whose rule 2
+    /// gated a candidate, and on every full pass ([`sweep_shard`]).
+    pub unnamed_marker_reap: Option<MarkerReapOutcome>,
     /// Rule 2: chain groups skipped whole this pass because a legal hold
     /// protects a key in them
     /// ([`SupersededSweepOutcome::chain_groups_held_by_legal_hold`]); feeds
@@ -336,6 +355,13 @@ pub async fn sweep_shard_with_holds(
     )
     .await?;
     log_superseded_holds(tenant, signal, shard, &superseded);
+    // A full pass reaps orphan markers even when rule 2 gated nothing, so a
+    // tenant left with only orphans still has them reaped (ADR-1133 decision
+    // 6). A pass that already reaped does not reap again.
+    let full_pass_reap = reach
+        .reap_after_pass(store, clock, config, tenant, signal, true)
+        .await;
+    let unnamed_marker_reap = superseded.unnamed_marker_reap.clone().or(full_pass_reap);
     let mut superseded_holds = SupersededHolds::default();
     superseded_holds.absorb(&superseded);
     let (unreferenced_parts_deleted, unreferenced_parts_bytes) =
@@ -384,6 +410,9 @@ pub async fn sweep_shard_with_holds(
             superseded_deletes_refused: superseded.deletes_refused,
             superseded_held_by_snapshot: superseded.held_by_snapshot,
             superseded_held_by_unreadable_head: superseded.held_by_unreadable_head,
+            superseded_held_by_pinned_window: superseded.held_by_pinned_window,
+            unnamed_markers: reach.marker_stats().clone(),
+            unnamed_marker_reap,
             superseded_groups_held_by_legal_hold: superseded.chain_groups_held_by_legal_hold,
             unreferenced_parts_deleted,
             quarantine_reaped_bytes: quarantine.reaped_bytes,
@@ -586,6 +615,9 @@ pub async fn sweep_shard_zoned_with_holds(
             superseded_deletes_refused: superseded.deletes_refused,
             superseded_held_by_snapshot: superseded.held_by_snapshot,
             superseded_held_by_unreadable_head: superseded.held_by_unreadable_head,
+            superseded_held_by_pinned_window: superseded.held_by_pinned_window,
+            unnamed_markers: superseded.unnamed_markers.clone(),
+            unnamed_marker_reap: superseded.unnamed_marker_reap.clone(),
             superseded_groups_held_by_legal_hold: superseded.chain_groups_held_by_legal_hold,
             unreferenced_parts_deleted,
             quarantine_reaped_bytes: quarantine.reaped_bytes,
@@ -1081,6 +1113,18 @@ pub struct SupersededSweepOutcome {
     /// [`SweepReport::superseded_held_by_unreadable_head`], which feeds
     /// `ravel_maintain_superseded_inputs_held_total{reason="unreadable_head"}`.
     pub held_by_unreadable_head: usize,
+    /// Objects held this pass because HEAD names none of them but their
+    /// unnamed-since marker is missing, was written for another record, or
+    /// has not yet aged past the pinned-query window (ADR-1133): a query that
+    /// resolved a HEAD from before the drop may still be reading them. Every
+    /// collectable group reports here for at least one pass. The combined pass
+    /// copies it into [`SweepReport::superseded_held_by_pinned_window`], which
+    /// feeds `ravel_maintain_superseded_inputs_held_total{reason="pinned_window"}`.
+    pub held_by_pinned_window: usize,
+    /// The unnamed-since marker requests and transitions of this pass.
+    pub unnamed_markers: MarkerStats,
+    /// What this pass's orphan-marker reap did, when one ran.
+    pub unnamed_marker_reap: Option<MarkerReapOutcome>,
     /// Chain groups skipped whole this pass because the [`LeaseCheck`] protects
     /// at least one key in them. The unit is the group, not the object: a
     /// group is one indivisible deletion unit, so a hold over any single key in
@@ -1121,7 +1165,7 @@ pub struct SupersededSweepOutcome {
 impl SupersededSweepOutcome {
     /// Objects held this pass for any reason.
     pub fn held(&self) -> usize {
-        self.held_by_snapshot + self.held_by_unreadable_head
+        self.held_by_snapshot + self.held_by_unreadable_head + self.held_by_pinned_window
     }
 
     /// Record what a held group means for rule 6: every request the group's
@@ -1287,7 +1331,8 @@ async fn sweep_superseded_impl(
     // entry (where the group holds only that predecessor's outputs) while the
     // same predecessor's raw inputs are held from another entry, which is
     // exactly how a record could vanish ahead of the inputs it superseded.
-    let rewrites = load_rewrite_records(store, &entries).await?;
+    let mut record_versions: HashMap<String, String> = HashMap::new();
+    let rewrites = load_rewrite_records(store, &entries, &mut record_versions).await?;
     let superseded_by_present: HashSet<&str> = rewrites
         .values()
         .map(|r| r.superseded_record_key.as_str())
@@ -1298,7 +1343,7 @@ async fn sweep_superseded_impl(
     // inputs overlap another's may be the loser of its overlap component, and
     // the resolver serves an input only the loser names as a raw L0 segment
     // rather than from any part: see [`AuthoritativeInputs`].
-    let compactions = load_compaction_records(store, &entries).await?;
+    let compactions = load_compaction_records(store, &entries, &mut record_versions).await?;
     let authoritative = AuthoritativeInputs::from_records(&compactions);
     // What version 2 records add: a chain group entered from each one at the
     // head of its chain, and each erasure-dominated one joining its rewrite's
@@ -1318,6 +1363,9 @@ async fn sweep_superseded_impl(
     // `records_deleted` / `data_deleted` exceed the number of distinct objects
     // the pass removed.
     let mut groups: Vec<SupersededGroup> = Vec::new();
+    // The record each group was first gathered from, by index into `groups`:
+    // the key of the group's unnamed-since marker (ADR-1133 decision 1).
+    let mut entered_from: Vec<String> = Vec::new();
     let mut by_identity: HashMap<String, usize> = HashMap::new();
     // Buckets holding a rewrite this deleting pass left for its horizon, and
     // the buckets and applied requests of the chains a walk refused.
@@ -1507,6 +1555,7 @@ async fn sweep_superseded_impl(
                 None => {
                     by_identity.insert(group.identity.clone(), groups.len());
                     groups.push(group);
+                    entered_from.push(key.clone());
                 }
             }
         }
@@ -1550,9 +1599,104 @@ async fn sweep_superseded_impl(
                     ingest_hour_bucket,
                 }),
         );
+    // The pinned-query window (ADR-1133). Every group a record's entry
+    // gathered shares that record's one unnamed-since marker, so the marker
+    // stands for all of them: it is written only when HEAD names none of
+    // them, and a group whose siblings are named, unreadable or lease-held
+    // waits with them. An observing pass and a dry run only read markers.
+    let policy = if deleting && !config.dry_run {
+        MarkerPolicy::Write
+    } else {
+        MarkerPolicy::ReadOnly
+    };
+    let ctx = MarkerContext::new(clock, config, policy);
+    let mut head_gates: Vec<SnapshotGate> = Vec::with_capacity(groups.len());
+    let mut marker_keys: Vec<Option<String>> = Vec::with_capacity(groups.len());
+    // Per marker key: the combined HEAD answer of its groups, and whether a
+    // lease-held group shares it.
+    let mut combined: HashMap<String, (SnapshotGate, bool)> = HashMap::new();
+    for (group, entry_key) in groups.iter().zip(&entered_from) {
+        let head_gate = reach
+            .object_gate(
+                store,
+                tenant,
+                signal,
+                group.ingest_hour_bucket,
+                &group.objects,
+            )
+            .await?;
+        head_gates.push(head_gate);
+        if group.objects.is_empty() {
+            marker_keys.push(None);
+            continue;
+        }
+        let marker_key = keys::record_unnamed_marker_key(entry_key).unwrap_or_default();
+        let held = group.protected_key(lease).is_some();
+        let slot = combined
+            .entry(marker_key.clone())
+            .or_insert((SnapshotGate::Clear, false));
+        slot.0 = combine_head_gates(slot.0, head_gate);
+        slot.1 |= held;
+        marker_keys.push(Some(marker_key));
+    }
+    let mut verdicts: HashMap<String, SnapshotGate> = HashMap::new();
+    for (index, entry_key) in entered_from.iter().enumerate() {
+        let Some(marker_key) = &marker_keys[index] else {
+            continue;
+        };
+        if verdicts.contains_key(marker_key) {
+            continue;
+        }
+        let (head_gate, lease_held) = combined
+            .get(marker_key)
+            .copied()
+            .unwrap_or((SnapshotGate::Blocked(SnapshotBlock::Unreadable), false));
+        let anchor = superseded_anchor(entry_key, &compactions, &rewrites, &record_versions);
+        let verdict = match (marker_key.is_empty(), anchor) {
+            // A key that does not reconstruct, or an anchor this pass did
+            // not read: the marker cannot be checked, so the group blocks.
+            (true, _) | (_, None) => SnapshotGate::Blocked(SnapshotBlock::Unreadable),
+            // A lease-held sibling's HEAD answer is not acted on: it neither
+            // starts the window nor resets it.
+            (false, Some(_)) if lease_held => SnapshotGate::Blocked(SnapshotBlock::PinnedWindow),
+            (false, Some(anchor)) => {
+                reach
+                    .marker_gate(store, &ctx, tenant, signal, marker_key, &anchor, head_gate)
+                    .await
+            }
+        };
+        verdicts.insert(marker_key.clone(), verdict);
+    }
+
     let mut cleared: Vec<&SupersededGroup> = Vec::with_capacity(groups.len());
-    for group in &groups {
+    let mut cleared_marker_keys: Vec<Option<&str>> = Vec::with_capacity(groups.len());
+    // Marker keys with at least one group not cleared this pass: their marker
+    // still gates something and is not retired.
+    let mut marker_still_gating: HashSet<&str> = HashSet::new();
+    for (index, group) in groups.iter().enumerate() {
+        let marker_key = marker_keys[index].as_deref();
+        let gate = match (head_gates[index], marker_key) {
+            (SnapshotGate::Clear, Some(k)) => match verdicts.get(k).copied() {
+                Some(SnapshotGate::Clear) => SnapshotGate::Clear,
+                // This group is unnamed, but a sibling under the same marker
+                // is named: the window has not started for the marker.
+                Some(SnapshotGate::Blocked(SnapshotBlock::Named)) => {
+                    SnapshotGate::Blocked(SnapshotBlock::PinnedWindow)
+                }
+                Some(blocked) => blocked,
+                None => SnapshotGate::Blocked(SnapshotBlock::Unreadable),
+            },
+            (gate, _) => gate,
+        };
+        if gate != SnapshotGate::Clear
+            && let Some(k) = marker_key
+        {
+            marker_still_gating.insert(k);
+        }
         if let Some(protected) = group.protected_key(lease) {
+            if let Some(k) = marker_key {
+                marker_still_gating.insert(k);
+            }
             tracing::warn!(
                 tenant_hash = %tenant.to_hex(),
                 signal = signal.key_prefix(),
@@ -1569,17 +1713,11 @@ async fn sweep_superseded_impl(
             outcome.note_hold(group, shard);
             continue;
         }
-        match reach
-            .object_gate(
-                store,
-                tenant,
-                signal,
-                group.ingest_hour_bucket,
-                &group.objects,
-            )
-            .await?
-        {
-            SnapshotGate::Clear => cleared.push(group),
+        match gate {
+            SnapshotGate::Clear => {
+                cleared.push(group);
+                cleared_marker_keys.push(marker_key);
+            }
             SnapshotGate::Blocked(SnapshotBlock::Named) => {
                 outcome.held_by_snapshot += group.object_count();
                 outcome.note_hold(group, shard);
@@ -1588,8 +1726,13 @@ async fn sweep_superseded_impl(
                 outcome.held_by_unreadable_head += group.object_count();
                 outcome.note_hold(group, shard);
             }
+            SnapshotGate::Blocked(SnapshotBlock::PinnedWindow) => {
+                outcome.held_by_pinned_window += group.object_count();
+                outcome.note_hold(group, shard);
+            }
         }
     }
+    outcome.unnamed_markers = reach.marker_stats().clone();
 
     if !deleting {
         // Nothing is deleted, and nothing in the outcome says which of these
@@ -1650,6 +1793,41 @@ async fn sweep_superseded_impl(
         DeleteLoop::Data,
         DeleteLoop::ChainRecords,
     ] {
+        // Each marker goes after the objects it gated and before any record
+        // (ADR-1133 decision 6), and only once every group under it has been
+        // deleted whole. A failed marker delete keeps the records of every
+        // group under it for the next pass.
+        if delete_loop == DeleteLoop::ChainRecords && policy == MarkerPolicy::Write {
+            let mut retired: HashMap<&str, bool> = HashMap::new();
+            for (index, marker_key) in cleared_marker_keys.iter().enumerate() {
+                let Some(marker_key) = *marker_key else {
+                    continue;
+                };
+                if stopped[index] {
+                    marker_still_gating.insert(marker_key);
+                }
+            }
+            for (index, marker_key) in cleared_marker_keys.iter().enumerate() {
+                let Some(marker_key) = *marker_key else {
+                    continue;
+                };
+                if marker_still_gating.contains(marker_key) {
+                    continue;
+                }
+                let ok = match retired.get(marker_key) {
+                    Some(&ok) => ok,
+                    None => {
+                        let ok = reach.retire_marker(store, marker_key).await.is_ok();
+                        retired.insert(marker_key, ok);
+                        ok
+                    }
+                };
+                if !ok {
+                    stopped[index] = true;
+                }
+            }
+            outcome.unnamed_markers = reach.marker_stats().clone();
+        }
         for (index, group) in cleared.iter().enumerate() {
             for k in group.loop_keys(delete_loop) {
                 if stopped[index] || refused.contains(k.as_str()) {
@@ -1704,7 +1882,50 @@ async fn sweep_superseded_impl(
     for (group, _) in cleared.iter().zip(&stopped).filter(|(_, s)| **s) {
         outcome.note_hold(group, shard);
     }
+    outcome.unnamed_marker_reap = reach
+        .reap_after_pass(store, clock, config, tenant, signal, false)
+        .await;
+    outcome.unnamed_markers = reach.marker_stats().clone();
     Ok((outcome, data_bytes))
+}
+
+/// The HEAD answer for a set of groups sharing one marker: unreadable if any
+/// is, else named if any is, else clear.
+fn combine_head_gates(a: SnapshotGate, b: SnapshotGate) -> SnapshotGate {
+    use SnapshotBlock::{Named, Unreadable};
+    match (a, b) {
+        (SnapshotGate::Blocked(Unreadable), _) | (_, SnapshotGate::Blocked(Unreadable)) => {
+            SnapshotGate::Blocked(Unreadable)
+        }
+        (SnapshotGate::Blocked(Named), _) | (_, SnapshotGate::Blocked(Named)) => {
+            SnapshotGate::Blocked(Named)
+        }
+        (SnapshotGate::Blocked(other), _) | (_, SnapshotGate::Blocked(other)) => {
+            SnapshotGate::Blocked(other)
+        }
+        (SnapshotGate::Clear, SnapshotGate::Clear) => SnapshotGate::Clear,
+    }
+}
+
+/// The anchor identity of the record a chain group was entered from, from
+/// the copies of the records this pass already read, or `None` when the pass
+/// did not read it (the marker then cannot be checked, and blocks).
+fn superseded_anchor(
+    entry_key: &str,
+    compactions: &HashMap<String, CompactionRecord>,
+    rewrites: &HashMap<String, RewriteRecord>,
+    versions: &HashMap<String, String>,
+) -> Option<MarkerAnchor> {
+    let anchor_unix_ns = compactions
+        .get(entry_key)
+        .map(|r| r.created_unix_ns)
+        .or_else(|| rewrites.get(entry_key).map(|r| r.created_unix_ns))?;
+    Some(MarkerAnchor {
+        kind: MarkerKind::Superseded,
+        key: entry_key.to_string(),
+        anchor_unix_ns,
+        version: versions.get(entry_key)?.clone(),
+    })
 }
 
 /// Whether a failed delete is a refusal of that one object, which rule 2's
@@ -1724,17 +1945,22 @@ fn delete_refused(e: &StoreError) -> bool {
 
 /// GET every rewrite record among `entries`, keyed by its commit key, tolerant
 /// of a key that vanished between the pass's LIST and now.
+///
+/// `versions` receives each record's store version, the anchor identity of
+/// an unnamed-since marker keyed by it (ADR-1133 decision 2).
 async fn load_rewrite_records(
     store: &dyn ObjectStoreBackend,
     entries: &[(String, BucketEntry)],
+    versions: &mut HashMap<String, String>,
 ) -> Result<HashMap<String, RewriteRecord>> {
     let mut out: HashMap<String, RewriteRecord> = HashMap::new();
     for (key, entry) in entries {
         if !matches!(entry, BucketEntry::RewriteRecord(_)) {
             continue;
         }
-        if let Some(record) = get_rewrite_record_opt(store, key).await? {
+        if let Some((record, version)) = get_rewrite_record_versioned(store, key).await? {
             out.insert(key.clone(), record);
+            versions.insert(key.clone(), version);
         }
     }
     Ok(out)
@@ -1742,17 +1968,21 @@ async fn load_rewrite_records(
 
 /// GET every compaction record among `entries`, keyed by its commit key,
 /// tolerant of a key that vanished between the pass's LIST and now.
+/// `versions` receives each record's store version, as for
+/// [`load_rewrite_records`].
 async fn load_compaction_records(
     store: &dyn ObjectStoreBackend,
     entries: &[(String, BucketEntry)],
+    versions: &mut HashMap<String, String>,
 ) -> Result<HashMap<String, CompactionRecord>> {
     let mut out: HashMap<String, CompactionRecord> = HashMap::new();
     for (key, entry) in entries {
         if !matches!(entry, BucketEntry::CompactionRecord(_)) {
             continue;
         }
-        if let Some(record) = get_compaction_record_opt(store, key).await? {
+        if let Some((record, version)) = get_compaction_record_versioned(store, key).await? {
             out.insert(key.clone(), record);
+            versions.insert(key.clone(), version);
         }
     }
     Ok(out)
@@ -2963,13 +3193,23 @@ async fn get_compaction_record_opt(
     store: &dyn ObjectStoreBackend,
     key: &str,
 ) -> Result<Option<CompactionRecord>> {
+    Ok(get_compaction_record_versioned(store, key)
+        .await?
+        .map(|(record, _)| record))
+}
+
+/// [`get_compaction_record_opt`] plus the store version of the bytes read.
+async fn get_compaction_record_versioned(
+    store: &dyn ObjectStoreBackend,
+    key: &str,
+) -> Result<Option<(CompactionRecord, String)>> {
     match store.get(key, GetRange::Full).await {
         Ok(got) => {
             let record = record::decode_compaction(got.data.as_ref()).map_err(|e| {
                 MaintainError::Invariant(format!("compaction record decode failed: {e}"))
             })?;
             keys::verify_compaction_record_key(&record, key)?;
-            Ok(Some(record))
+            Ok(Some((record, got.version.0)))
         }
         Err(StoreError::NotFound) => Ok(None),
         Err(e) => Err(MaintainError::Store(e)),
@@ -2982,13 +3222,23 @@ async fn get_rewrite_record_opt(
     store: &dyn ObjectStoreBackend,
     key: &str,
 ) -> Result<Option<RewriteRecord>> {
+    Ok(get_rewrite_record_versioned(store, key)
+        .await?
+        .map(|(record, _)| record))
+}
+
+/// [`get_rewrite_record_opt`] plus the store version of the bytes read.
+async fn get_rewrite_record_versioned(
+    store: &dyn ObjectStoreBackend,
+    key: &str,
+) -> Result<Option<(RewriteRecord, String)>> {
     match store.get(key, GetRange::Full).await {
         Ok(got) => {
             let record = ravel_commit::erasure::decode_rewrite(got.data.as_ref()).map_err(|e| {
                 MaintainError::Invariant(format!("rewrite record decode failed: {e}"))
             })?;
             keys::verify_rewrite_record_key(&record, key)?;
-            Ok(Some(record))
+            Ok(Some((record, got.version.0)))
         }
         Err(StoreError::NotFound) => Ok(None),
         Err(e) => Err(MaintainError::Store(e)),
