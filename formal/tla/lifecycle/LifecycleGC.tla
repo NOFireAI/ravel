@@ -1528,14 +1528,16 @@ Terminal ==
 \*     in the shipped model; a scratch removal of the gate from DreqSweep is
 \*     what proves this clause can fire (results.md).
 \*  4. No horizon-gated delete removed an object a permitted in-flight query still
-\*     needs (a query is permitted while within max_query_duration of its pin).
+\*     needs (a query is permitted while its clock is before its deadline: its
+\*     pin plus max_query_duration plus the Flight ticket extension ext).
 \*     Candidate #1133 (HorizonGuardsPinnedQueries FALSE, the shipped delete that
 \*     gates on horizon AND head-empty but not on pinned queries) makes a query
 \*     pinned on a stale HEAD that a late fold then drops fire this clause. This
 \*     clause is structurally unable to fire for lastGc.rule = "dreq": .dreq is
 \*     a control object, lastGc.permittedNeeds is always a subset of
-\*     DataObjects (PermittedNeeds reads query.needs, which PinQuery draws only
-\*     from head \subseteq DataObjects), so the intersection is empty in every
+\*     DataObjects (PermittedNeeds reads query.needs, which PinQuery draws from
+\*     a set comprehension over DataObjects, whether through head or through
+\*     CachedNames), so the intersection is empty in every
 \*     state regardless of any guard. That is why clause 3 above, not this one,
 \*     is the .dreq horizon check.
 NoDeleteInsideProtectionWindow ==
