@@ -1074,6 +1074,46 @@ async fn zero_bucket_concurrency_is_refused_typed() {
     assert_eq!(*typed, CompactTenantError::ZeroBucketConcurrency);
 }
 
+/// The zero fan-out is refused before the compactor config is built, because
+/// the derivation divides by it. With a zero byte target ALSO given, the error
+/// is the fan-out's: a walk that builds the config first reports the byte
+/// target and never reaches the fan-out check.
+///
+/// Distinguishing: calling `build_compactor_config` before the
+/// `bucket_concurrency == 0` check (the order before this change) returns
+/// `CompactorKnobError::ZeroL1PartMemoryTarget`, so the downcast to
+/// `CompactTenantError` fails.
+#[tokio::test]
+async fn zero_bucket_concurrency_is_refused_before_the_config_is_built() {
+    let store = seed_tenant().await;
+
+    let err = compact_tenant(
+        store,
+        MEMORY,
+        TENANT,
+        SignalArg::Logs,
+        Some(SHARDS),
+        None,
+        None,
+        true,
+        None,
+        Some(0),
+        None,
+        None,
+        0,
+        None,
+        now_ns(),
+        &ClaimOptions::fresh(),
+    )
+    .await
+    .expect_err("--bucket-concurrency 0 must be refused");
+
+    let typed = err
+        .downcast_ref::<CompactTenantError>()
+        .expect("the typed fan-out error, not the byte-target one");
+    assert_eq!(*typed, CompactTenantError::ZeroBucketConcurrency);
+}
+
 /// One fixture closing three spec properties at once, over the 4-bucket corpus
 /// (both hours sealed via `--max-flush-lifetime 0s`) at `--bucket-concurrency 2`:
 ///
@@ -2222,6 +2262,16 @@ const GIB: u64 = 1024 * 1024 * 1024;
 /// with the memory split target resolved from `host_memory` instead of the
 /// host's own memory. Returns the report text.
 async fn compact_tenant_report(flag: Option<u64>, host_memory: Option<u64>) -> String {
+    compact_tenant_report_with_claims(flag, host_memory, &ClaimOptions::fresh()).await
+}
+
+/// [`compact_tenant_report`] with the claim options (so a test can set the
+/// lease the derivation caps against).
+async fn compact_tenant_report_with_claims(
+    flag: Option<u64>,
+    host_memory: Option<u64>,
+    claims: &ClaimOptions,
+) -> String {
     let store = seed_tenant().await;
     let mut out: Vec<u8> = Vec::new();
     compact_tenant_to(
@@ -2242,51 +2292,64 @@ async fn compact_tenant_report(flag: Option<u64>, host_memory: Option<u64>) -> S
         None,
         host_memory,
         now_ns(),
-        &ClaimOptions::fresh(),
+        claims,
     )
     .await
     .expect("dry-run compact-tenant runs");
     String::from_utf8(out).expect("utf-8")
 }
 
-/// The memory split target lines of the compact-tenant report (issue #2351),
-/// pinned against a fixed 30 GiB budget rather than this host's memory: with
-/// no flag the RLOG target is 30 GiB / 8 / 2 (`--bucket-concurrency`) and the
-/// RSPAN target stays 256 MiB; with the flag both are the flag's value; with
-/// no readable memory both are the 256 MiB fallback.
+/// The part-split lines of the compact-tenant report (issue #2351), pinned
+/// against a fixed 32 GiB host rather than this host's memory. The budget the
+/// derivation divides is `32 - 2 - 20 = 10 GiB` (the 2 GiB overhead reserve and
+/// the 20 GiB merge cursor budget, shared by the concurrent buckets), so with no
+/// flag the RLOG target is 10 GiB / 8 / 2 (`--bucket-concurrency`) = 640 MiB, the
+/// RLOG stored-size cap follows it, and the RSPAN target and the shared cap stay
+/// 256 MiB; with the flag the RLOG target is the flag's value (and RSPAN's
+/// too), the RLOG cap stays at the shared 256 MiB; with no readable memory both
+/// targets are the 256 MiB fallback. Every line carries its codec prefix.
 ///
 /// Distinguishing:
 /// - `compact_tenant_to` reading the host's memory instead of its
 ///   `host_memory_total_bytes` argument: the derived row names the host's
-///   figure, not 32212254720 (unless the host has exactly 30 GiB, which the
+///   figure, not 10737418240 (unless the host has exactly 32 GiB, which the
 ///   fallback row then still catches, since a readable host never prints the
 ///   fallback).
 /// - Passing `1` instead of `bucket_concurrency` to `build_compactor_config`:
-///   the derived row reads 4026531840 over 1 concurrent merge.
+///   the derived row reads 1342177280 over 1 concurrent merge.
+/// - Dropping the cursor deduction: the derived row reads a budget of
+///   32212254720 and, lease-bound, a target of 1572864000 over 2 merges, not
+///   671088640 over a budget of 10737418240.
 /// - RSPAN taking the derived target: the derived row's RSPAN line reads
-///   2013265920, not 268435456.
+///   671088640, not 268435456.
+/// - Printing the RLOG value under the unprefixed `l1_part_memory_target_bytes:`
+///   name, or the cap under `max_l1_part_bytes:` alone: the want strings and
+///   the absence assertion fail.
 /// - The derivation winning over an explicit value: the flag row fails.
 #[tokio::test]
 async fn report_names_the_resolved_l1_part_memory_target() {
     for (flag, host_memory, want) in [
         (
             None,
-            Some(30 * GIB),
-            "\nl1_part_memory_target_bytes: 2013265920 (resolved from a memory budget of \
-             32212254720 over 2 concurrent merges)\nrspan_l1_part_memory_target_bytes: \
+            Some(32 * GIB),
+            "\nrlog_l1_part_memory_target_bytes: 671088640 (resolved from a memory budget of \
+             10737418240 over 2 concurrent merges; bound by the memory share, budget / 8 / \
+             merges)\nrlog_max_l1_part_bytes: 671088640\nrspan_l1_part_memory_target_bytes: \
              268435456\nmax_l1_part_bytes: 268435456\n",
         ),
         (
             Some(12345),
-            Some(30 * GIB),
-            "\nl1_part_memory_target_bytes: 12345 (set by flag)\n\
-             rspan_l1_part_memory_target_bytes: 12345\n",
+            Some(32 * GIB),
+            "\nrlog_l1_part_memory_target_bytes: 12345 (set by flag)\n\
+             rlog_max_l1_part_bytes: 268435456\n\
+             rspan_l1_part_memory_target_bytes: 12345\nmax_l1_part_bytes: 268435456\n",
         ),
         (
             None,
             None,
-            "\nl1_part_memory_target_bytes: 268435456 (fallback: the memory budget is \
-             unknown)\nrspan_l1_part_memory_target_bytes: 268435456\n",
+            "\nrlog_l1_part_memory_target_bytes: 268435456 (fallback: the memory budget is \
+             unknown)\nrlog_max_l1_part_bytes: 268435456\n\
+             rspan_l1_part_memory_target_bytes: 268435456\nmax_l1_part_bytes: 268435456\n",
         ),
     ] {
         let text = compact_tenant_report(flag, host_memory).await;
@@ -2294,43 +2357,87 @@ async fn report_names_the_resolved_l1_part_memory_target() {
             text.contains(want),
             "flag {flag:?}, memory {host_memory:?}: want {want:?} in {text}"
         );
+        assert!(
+            !text.contains("\nl1_part_memory_target_bytes:"),
+            "the unprefixed name is gone: {text}"
+        );
     }
 }
 
-/// The `l1_part_memory_target_bytes:` line of a report produced by the
+/// The claim lease caps the CLI derivation, and the report says which term
+/// bound it. A 64 GiB host at 2 merges has `64 - 22 = 42 GiB`, a share of
+/// 2.625 GiB each; the default 300 s lease supports 1500 MiB, so the lease
+/// binds (1572864000); with the lease raised to 1200 s through the claim
+/// options the share binds (2818572288).
+///
+/// Distinguishing: no lease term reads 2818572288 on the first row; the lease
+/// read from the compactor default instead of `ClaimOptions::lease_duration`
+/// reads 1572864000 on the second.
+#[tokio::test]
+async fn report_names_the_term_that_bound_the_derived_target() {
+    let default_lease = compact_tenant_report(None, Some(64 * GIB)).await;
+    let want = "\nrlog_l1_part_memory_target_bytes: 1572864000 (resolved from a memory budget of \
+                45097156608 over 2 concurrent merges; bound by the claim lease, 300 s allows a \
+                part of at most 1572864000 bytes)\nrlog_max_l1_part_bytes: 1572864000\n";
+    assert!(
+        default_lease.contains(want),
+        "want {want:?} in {default_lease}"
+    );
+
+    let mut claims = ClaimOptions::fresh();
+    claims.lease_duration = Some(std::time::Duration::from_secs(1200));
+    let long_lease = compact_tenant_report_with_claims(None, Some(64 * GIB), &claims).await;
+    let want = "\nrlog_l1_part_memory_target_bytes: 2818572288 (resolved from a memory budget of \
+                45097156608 over 2 concurrent merges; bound by the memory share, budget / 8 / \
+                merges)\nrlog_max_l1_part_bytes: 2818572288\n";
+    assert!(long_lease.contains(want), "want {want:?} in {long_lease}");
+}
+
+/// The `rlog_l1_part_memory_target_bytes:` line of a report produced by the
 /// functions that detect the host's memory themselves, checked against what
 /// `detect_host_memory_total_bytes` returns on this host over `merges`
-/// concurrent merges: the derived value inside the 256 MiB to 8 GiB clamp,
-/// naming the detected memory as its budget, with no fallback note; or, when
-/// the host memory cannot be read, exactly the fallback line.
+/// concurrent merges: the value `ResolvedL1PartMemoryTarget::resolve` gives for
+/// the detected memory less the overhead reserve and the default merge cursor
+/// budget, inside the 256 MiB to 8 GiB clamp, naming that budget, with no
+/// fallback note; or, when the host memory cannot be read, exactly the fallback
+/// line.
 fn assert_target_line_follows_detected_memory(text: &str, merges: u64) {
+    const PREFIX: &str = "rlog_l1_part_memory_target_bytes: ";
     let line = text
         .lines()
-        .find(|l| l.starts_with("l1_part_memory_target_bytes: "))
+        .find(|l| l.starts_with(PREFIX))
         .unwrap_or_else(|| panic!("no target line in {text}"));
     match ravel_maintain::detect_host_memory_total_bytes() {
         Some(detected) => {
-            let bytes: u64 = line["l1_part_memory_target_bytes: ".len()..]
+            let bytes: u64 = line[PREFIX.len()..]
                 .split(' ')
                 .next()
                 .and_then(|n| n.parse().ok())
                 .unwrap_or_else(|| panic!("unparsable target line {line:?}"));
             assert!((256 * 1024 * 1024..=8 * GIB).contains(&bytes), "{line}");
             assert!(!line.contains("(fallback:"), "{line}");
-            let plural = if merges == 1 { "" } else { "s" };
-            let want = format!(
-                "l1_part_memory_target_bytes: {} (resolved from a memory budget of {detected} \
-                 over {merges} concurrent merge{plural})",
-                ravel_maintain::derive_l1_part_memory_target_bytes(
-                    detected,
-                    usize::try_from(merges).expect("merges fits usize"),
-                ),
+            let budget = ravel_maintain::merge_memory_budget_bytes(
+                ravel_maintain::host_memory_budget_bytes(detected),
+                DEFAULT_MERGE_CURSOR_BUDGET_BYTES,
             );
-            assert_eq!(line, want);
+            assert!(
+                line.contains(&format!(
+                    "a memory budget of {budget} over {merges} concurrent"
+                )),
+                "{line}"
+            );
+            let want = ravel_maintain::config::ResolvedL1PartMemoryTarget::resolve(
+                None,
+                Some(budget),
+                usize::try_from(merges).expect("merges fits usize"),
+                ravel_maintain::config::DEFAULT_CLAIM_LEASE_DURATION,
+            );
+            assert_eq!(bytes, want.bytes, "{line}");
+            assert_eq!(line, format!("{PREFIX}{want}"));
         }
         None => assert_eq!(
             line,
-            "l1_part_memory_target_bytes: 268435456 (fallback: the memory budget is unknown)"
+            "rlog_l1_part_memory_target_bytes: 268435456 (fallback: the memory budget is unknown)"
         ),
     }
 }
@@ -2410,29 +2517,46 @@ async fn compact_bucket_hands_the_detected_host_memory_to_the_run() {
 /// `compact-bucket` takes `--l1-part-memory-target-bytes` and
 /// `--max-l1-part-bytes` (issue #2351): given, they replace the derived and
 /// default values in the run's config and report; absent, the RLOG target is
-/// derived from the injected memory over one merge.
+/// derived from the injected memory over one merge: a 32 GiB host is
+/// `32 - 2 - 20 = 10 GiB`, so 1.25 GiB (1342177280), and the RLOG stored-size
+/// cap follows it. An explicit `--max-l1-part-bytes` sets the shared and the
+/// RLOG cap together and wins over the follow.
 ///
 /// Distinguishing:
 /// - `compact_to` passing `None` for either flag to `build_compactor_config`
-///   (the pre-#2351 wiring): the flag row reads the derived 4026531840 or the
+///   (the pre-#2351 wiring): the flag row reads the derived 1342177280 or the
 ///   default 268435456 stored target, not 12345 or 67890.
 /// - `compact_to` deriving over anything but one merge: the derived row is
-///   not 4026531840.
+///   not 1342177280 over one concurrent merge.
+/// - Dropping the cursor deduction: the derived row reads a budget of
+///   32212254720 and, lease-bound, 1572864000.
+/// - An explicit stored cap that sets only the shared field: the third row's
+///   `rlog_max_l1_part_bytes` line reads 1342177280, not 67890.
 #[tokio::test]
 async fn compact_bucket_part_split_flags_reach_the_run() {
     for (memory_flag, stored_flag, want) in [
         (
             Some(12345),
             Some(67890),
-            "\nl1_part_memory_target_bytes: 12345 (set by flag)\n\
+            "\nrlog_l1_part_memory_target_bytes: 12345 (set by flag)\n\
+             rlog_max_l1_part_bytes: 67890\n\
              rspan_l1_part_memory_target_bytes: 12345\nmax_l1_part_bytes: 67890\n",
         ),
         (
             None,
             None,
-            "\nl1_part_memory_target_bytes: 4026531840 (resolved from a memory budget of \
-             32212254720 over 1 concurrent merge)\nrspan_l1_part_memory_target_bytes: \
+            "\nrlog_l1_part_memory_target_bytes: 1342177280 (resolved from a memory budget of \
+             10737418240 over 1 concurrent merge; bound by the memory share, budget / 8 / \
+             merges)\nrlog_max_l1_part_bytes: 1342177280\nrspan_l1_part_memory_target_bytes: \
              268435456\nmax_l1_part_bytes: 268435456\n",
+        ),
+        (
+            None,
+            Some(67890),
+            "\nrlog_l1_part_memory_target_bytes: 1342177280 (resolved from a memory budget of \
+             10737418240 over 1 concurrent merge; bound by the memory share, budget / 8 / \
+             merges)\nrlog_max_l1_part_bytes: 67890\nrspan_l1_part_memory_target_bytes: \
+             268435456\nmax_l1_part_bytes: 67890\n",
         ),
     ] {
         let store = seed_tenant().await;
@@ -2450,7 +2574,7 @@ async fn compact_bucket_part_split_flags_reach_the_run() {
             memory_flag,
             stored_flag,
             None,
-            Some(30 * GIB),
+            Some(32 * GIB),
             FixedClock::new(now_ns()),
             &ClaimOptions::fresh(),
         )

@@ -1448,18 +1448,27 @@ enum MaintainCommand {
         /// L1 segment (a split target, not a peak-memory bound: a span merge
         /// can overshoot it by a whole trace). Applies to log and span merges.
         /// Refused at 0. Default for log merges: derived from the host's
-        /// memory (MemTotal capped by a cgroup memory limit) / 8, clamped to
-        /// [256 MiB, 8 GiB]; 256 MiB when the host memory cannot be read.
-        /// Default for span merges: 256 MiB. Part boundaries depend on it, so
-        /// two runs over one bucket cut the same parts only at the same value.
+        /// memory (MemTotal capped by a cgroup memory limit) less a 2 GiB
+        /// overhead reserve and the 20 GiB merge cursor budget, divided by 8,
+        /// capped at the part size the claim lease supports (1500 MiB at the
+        /// default 300 s lease) and at 8 GiB, with a 256 MiB floor applied
+        /// last; 256 MiB when the host memory cannot be read. A derived value
+        /// also becomes the log stored-size cap unless --max-l1-part-bytes is
+        /// given, so log parts close on this target. Default for span merges:
+        /// 256 MiB. Part boundaries depend on it, so two runs over one bucket
+        /// cut the same parts only at the same value.
         #[arg(long, value_name = "BYTES")]
         l1_part_memory_target_bytes: Option<u64>,
         /// Bound the encoded/on-object bytes a log or metrics merge writes
         /// before it closes an L1 segment (the stored-size target). A log
-        /// segment closes on whichever of this and --l1-part-memory-target-bytes
-        /// is reached first; a metrics segment closes on this alone and never
+        /// segment closes on whichever of this and the log memory target is
+        /// reached first; a metrics segment closes on this alone and never
         /// reads the memory target; span merges do not read this. Refused at 0.
-        /// Default 256 MiB (the compactor default).
+        /// Setting it sets the log and metrics caps together. Unset, the
+        /// metrics cap is 256 MiB and the log cap follows the derived log
+        /// memory target; an explicit --l1-part-memory-target-bytes above
+        /// 256 MiB leaves the log cap at 256 MiB, so the log merge then runs
+        /// exact-encode probes and can close a part on stored size.
         #[arg(long, value_name = "BYTES")]
         max_l1_part_bytes: Option<u64>,
         /// The zstd level an RLOG compaction writes its L1 segments at. Higher
@@ -1523,18 +1532,27 @@ enum MaintainCommand {
         /// host for path-specific overshoot). Lower it for smaller segments on a
         /// small host; raise it for fewer, larger segments. Applies to log and
         /// span merges. Refused at 0. Default for log merges: derived from the
-        /// host's memory (MemTotal capped by a cgroup memory limit) / 8 /
-        /// --bucket-concurrency, clamped to [256 MiB, 8 GiB]; 256 MiB when the
-        /// host memory cannot be read. Default for span merges: 256 MiB. The
-        /// report prints the value and where it came from.
+        /// host's memory (MemTotal capped by a cgroup memory limit) less a
+        /// 2 GiB overhead reserve and the 20 GiB merge cursor budget (shared
+        /// by the concurrent buckets), divided by 8 and by --bucket-concurrency,
+        /// capped at the part size the claim lease supports (1500 MiB at the
+        /// default 300 s lease) and at 8 GiB, with a 256 MiB floor applied
+        /// last; 256 MiB when the host memory cannot be read. A derived value
+        /// also becomes the log stored-size cap unless --max-l1-part-bytes is
+        /// given. Default for span merges: 256 MiB. The report prints each
+        /// value, where it came from and which term bound it.
         #[arg(long, value_name = "BYTES")]
         l1_part_memory_target_bytes: Option<u64>,
         /// Bound the encoded/on-object bytes a log or metrics merge writes
         /// before it closes an L1 segment (the stored-size target). A log
-        /// segment closes on whichever of this and --l1-part-memory-target-bytes
-        /// is reached first; a metrics segment closes on this alone and never
+        /// segment closes on whichever of this and the log memory target is
+        /// reached first; a metrics segment closes on this alone and never
         /// reads the memory target; span merges do not read this. Refused at 0.
-        /// Default 256 MiB (the compactor default).
+        /// Setting it sets the log and metrics caps together. Unset, the
+        /// metrics cap is 256 MiB and the log cap follows the derived log
+        /// memory target; an explicit --l1-part-memory-target-bytes above
+        /// 256 MiB leaves the log cap at 256 MiB, so the log merge then runs
+        /// exact-encode probes and can close a part on stored size.
         #[arg(long, value_name = "BYTES")]
         max_l1_part_bytes: Option<u64>,
         /// Number of per-input reads a compaction keeps in flight at once (the
@@ -1559,10 +1577,11 @@ enum MaintainCommand {
         /// division, floor). So each concurrent bucket may hold up to ~20 GiB / N
         /// of cursor budget plus its in-progress writer split target
         /// (--l1-part-memory-target-bytes, for a log merge by default the
-        /// host's memory / 8 / N clamped to [256 MiB, 8 GiB]): on a 30 GiB host at N=1 one bucket may hold
-        /// ~20 GiB + 3.75 GiB; at N=4 each of the four holds up to ~5 GiB +
-        /// 960 MiB, so the aggregate stays ~20 GiB of cursor budget plus
-        /// ~3.75 GiB of writer targets. Dividing the budget is
+        /// host's memory less 2 GiB and less the 20 GiB cursor budget, / 8 / N,
+        /// within [256 MiB, 8 GiB]): on a 30 GiB host at N=1 one bucket may hold
+        /// ~20 GiB + 1 GiB; at N=4 each of the four holds up to ~5 GiB +
+        /// 256 MiB, so the aggregate stays ~20 GiB of cursor budget plus
+        /// ~1 GiB of writer targets. Dividing the budget is
         /// what keeps N times the envelope inside one box instead of needing N
         /// boxes. A bucket whose merge no longer fits its 20 GiB / N share fails
         /// closed with the typed MergeCursorBudgetExceeded naming the figure to
@@ -4190,6 +4209,10 @@ mod tests {
     use ravel_cli::maintain::{self, CompactorKnobError};
 
     const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+    /// The compactor's default claim lease (300 s), what the CLI derives
+    /// against when no claim-lease override is given.
+    const DEFAULT_LEASE: std::time::Duration = ravel_maintain::config::DEFAULT_CLAIM_LEASE_DURATION;
 
     /// Destructure a parsed `maintain compact-tenant` invocation into the three
     /// new memory knobs plus dry-run/flush overrides, panicking on any other
@@ -4267,6 +4290,7 @@ mod tests {
             None,
             Some(30 * GIB),
             2,
+            DEFAULT_LEASE,
         )
         .expect("nonzero knobs build a config");
 
@@ -4280,14 +4304,20 @@ mod tests {
             "and reach the RLOG merge too"
         );
         assert_eq!(
-            format!("l1_part_memory_target_bytes: {resolved}"),
-            "l1_part_memory_target_bytes: 12345 (set by flag)",
+            format!("rlog_l1_part_memory_target_bytes: {resolved}"),
+            "rlog_l1_part_memory_target_bytes: 12345 (set by flag)",
             "the report line names the flag as the source"
         );
         assert_eq!(
             config.max_l1_part_bytes, 67890,
             "--max-l1-part-bytes must arrive in the config"
         );
+        assert_eq!(
+            config.rlog_max_l1_part_bytes,
+            Some(67890),
+            "and reach the RLOG merge's stored-size cap too"
+        );
+        assert_eq!(config.rlog_stored_target_bytes(), 67890);
         assert_eq!(
             config.input_read_concurrency, 7,
             "--input-read-concurrency must arrive in the config"
@@ -4299,18 +4329,27 @@ mod tests {
     }
 
     /// Without `--l1-part-memory-target-bytes` the memory split target is
-    /// derived from the host memory over `--bucket-concurrency` (issue #2351):
-    /// 30 GiB / 8 / 2 = 2013265920, 128 GiB / 8 / 1 clamps to 8 GiB, and an
-    /// unreadable host memory falls back to 256 MiB. Each figure is pinned in
-    /// the config and in the report line.
+    /// derived from the host memory less the 2 GiB overhead reserve and the
+    /// 20 GiB merge cursor budget, over `--bucket-concurrency`, capped by the
+    /// claim lease (issue #2351). The worked figure is a 32 GiB host at one
+    /// merge: `32 - 2 - 20 = 10 GiB`, `/ 8 = 1.25 GiB` (1342177280), where the
+    /// 1.46 GiB lease cap does not bind. Each figure is pinned in the config and
+    /// in the report line, including the term that bound it.
     ///
     /// Non-vacuity (prove-the-test), each flip named:
-    /// - Drop the clamp from `derive_l1_part_memory_target_bytes`: the 128 GiB
-    ///   row reads 17179869184.
+    /// - Drop the cursor deduction (`merge_memory_budget_bytes` returning its
+    ///   first argument): the 32 GiB row reads 1572864000 (a 30 GiB budget is
+    ///   lease-bound), the 30 GiB row 939524096... see the rows' own figures.
+    /// - Drop the reserve deduction: the 32 GiB row reads 1500 MiB / 1.5 GiB
+    ///   (12 GiB / 8) instead of 1.25 GiB.
+    /// - Drop the clamp from `derive_l1_part_memory_target`: the 24 GiB row
+    ///   reads 268435456 either way, the 128 GiB row 17179869184 at the long
+    ///   lease.
     /// - Ignore `concurrent_merges` there (or pass 1 from
-    ///   `build_compactor_config`): the 30 GiB row reads 4026531840.
-    /// - Keep the 256 MiB struct default instead of resolving: both derived
-    ///   rows read 268435456.
+    ///   `build_compactor_config`): the 30 GiB row at 2 merges reads 1 GiB.
+    /// - Drop the lease term: the 52 GiB default-lease row reads 4026531840.
+    /// - Keep the 256 MiB struct default instead of resolving: every derived
+    ///   row reads 268435456.
     #[test]
     fn compact_tenant_memory_target_defaults_to_the_derived_value() {
         let cli = Cli::try_parse_from([
@@ -4339,26 +4378,87 @@ mod tests {
         assert_eq!(l1_part_memory_target_bytes, None);
         assert_eq!(bucket_concurrency, 2);
 
-        for (host, merges, want_bytes, want_line) in [
+        let lease_1200s = std::time::Duration::from_secs(1200);
+        let lease_1h = std::time::Duration::from_secs(3600);
+        for (host, merges, lease, want_bytes, want_line) in [
+            // The worked figure: 32 - 2 - 20 = 10 GiB, / 8 = 1.25 GiB.
+            (
+                Some(32 * GIB),
+                1,
+                DEFAULT_LEASE,
+                1_342_177_280,
+                "rlog_l1_part_memory_target_bytes: 1342177280 (resolved from a memory budget of \
+                 10737418240 over 1 concurrent merge; bound by the memory share, budget / 8 / \
+                 merges)",
+            ),
+            // 30 - 2 - 20 = 8 GiB over 2 merges, / 8 = 512 MiB each.
             (
                 Some(30 * GIB),
                 bucket_concurrency,
-                2_013_265_920,
-                "l1_part_memory_target_bytes: 2013265920 (resolved from a memory budget of \
-                 32212254720 over 2 concurrent merges)",
+                DEFAULT_LEASE,
+                536_870_912,
+                "rlog_l1_part_memory_target_bytes: 536870912 (resolved from a memory budget of \
+                 8589934592 over 2 concurrent merges; bound by the memory share, budget / 8 / \
+                 merges)",
             ),
+            // 24 - 2 - 20 = 2 GiB, / 8 = 256 MiB: the share equals the floor.
+            (
+                Some(24 * GIB),
+                1,
+                DEFAULT_LEASE,
+                268_435_456,
+                "rlog_l1_part_memory_target_bytes: 268435456 (resolved from a memory budget of \
+                 2147483648 over 1 concurrent merge; bound by the memory share, budget / 8 / \
+                 merges)",
+            ),
+            // The deductions leave nothing: the budget floors at zero, then the
+            // target at 256 MiB.
+            (
+                Some(20 * GIB),
+                1,
+                DEFAULT_LEASE,
+                268_435_456,
+                "rlog_l1_part_memory_target_bytes: 268435456 (resolved from a memory budget of \
+                 0 over 1 concurrent merge; bound by the 268435456-byte floor)",
+            ),
+            // 52 - 2 - 20 = 30 GiB: the share is 3.75 GiB but the 300 s lease
+            // supports 1500 MiB.
+            (
+                Some(52 * GIB),
+                1,
+                DEFAULT_LEASE,
+                1_572_864_000,
+                "rlog_l1_part_memory_target_bytes: 1572864000 (resolved from a memory budget of \
+                 32212254720 over 1 concurrent merge; bound by the claim lease, 300 s allows a \
+                 part of at most 1572864000 bytes)",
+            ),
+            // The same host with the lease raised to 1200 s: the share binds.
+            (
+                Some(52 * GIB),
+                1,
+                lease_1200s,
+                4_026_531_840,
+                "rlog_l1_part_memory_target_bytes: 4026531840 (resolved from a memory budget of \
+                 32212254720 over 1 concurrent merge; bound by the memory share, budget / 8 / \
+                 merges)",
+            ),
+            // 128 - 2 - 20 = 106 GiB: a one-hour lease and a 13.25 GiB share
+            // both pass the 8 GiB ceiling.
             (
                 Some(128 * GIB),
                 1,
+                lease_1h,
                 8_589_934_592,
-                "l1_part_memory_target_bytes: 8589934592 (resolved from a memory budget of \
-                 137438953472 over 1 concurrent merge)",
+                "rlog_l1_part_memory_target_bytes: 8589934592 (resolved from a memory budget of \
+                 113816633344 over 1 concurrent merge; bound by the 8589934592-byte ceiling)",
             ),
             (
                 None,
                 bucket_concurrency,
+                DEFAULT_LEASE,
                 268_435_456,
-                "l1_part_memory_target_bytes: 268435456 (fallback: the memory budget is unknown)",
+                "rlog_l1_part_memory_target_bytes: 268435456 (fallback: the memory budget is \
+                 unknown)",
             ),
         ] {
             let (config, resolved) = maintain::build_compactor_config(
@@ -4370,6 +4470,7 @@ mod tests {
                 None,
                 host,
                 merges,
+                lease,
             )
             .expect("no knobs build a config");
             assert_eq!(
@@ -4378,11 +4479,21 @@ mod tests {
                 "host {host:?}"
             );
             assert_eq!(
+                config.rlog_stored_target_bytes(),
+                want_bytes,
+                "the RLOG stored-size cap follows the derived target, host {host:?}"
+            );
+            assert_eq!(
+                config.max_l1_part_bytes,
+                256 * MIB,
+                "the shared cap RSEG reads is untouched, host {host:?}"
+            );
+            assert_eq!(
                 config.l1_part_memory_target_bytes, 268_435_456,
                 "the RSPAN merge keeps 256 MiB without the flag, host {host:?}"
             );
             assert_eq!(
-                format!("l1_part_memory_target_bytes: {resolved}"),
+                format!("rlog_l1_part_memory_target_bytes: {resolved}"),
                 want_line
             );
             assert_eq!(
@@ -4547,14 +4658,34 @@ mod tests {
     fn compact_tenant_zero_byte_targets_are_refused() {
         for host in [None, Some(30 * GIB)] {
             assert_eq!(
-                maintain::build_compactor_config(false, None, Some(0), None, None, None, host, 1)
-                    .expect_err("--l1-part-memory-target-bytes 0 must be refused"),
+                maintain::build_compactor_config(
+                    false,
+                    None,
+                    Some(0),
+                    None,
+                    None,
+                    None,
+                    host,
+                    1,
+                    DEFAULT_LEASE
+                )
+                .expect_err("--l1-part-memory-target-bytes 0 must be refused"),
                 CompactorKnobError::ZeroL1PartMemoryTarget,
             );
         }
         assert_eq!(
-            maintain::build_compactor_config(false, None, None, Some(0), None, None, None, 1)
-                .expect_err("--max-l1-part-bytes 0 must be refused"),
+            maintain::build_compactor_config(
+                false,
+                None,
+                None,
+                Some(0),
+                None,
+                None,
+                None,
+                1,
+                DEFAULT_LEASE
+            )
+            .expect_err("--max-l1-part-bytes 0 must be refused"),
             CompactorKnobError::ZeroMaxL1PartBytes,
         );
     }
@@ -4636,15 +4767,25 @@ mod tests {
             compaction_zstd_level,
             None,
             1,
+            DEFAULT_LEASE,
         )
         .expect("level 4 builds a config");
         assert_eq!(
             config.rlog_zstd_level, 4,
             "the flag must arrive in the config"
         );
-        let (default, _) =
-            maintain::build_compactor_config(false, None, None, None, None, None, None, 1)
-                .expect("no flag builds a config");
+        let (default, _) = maintain::build_compactor_config(
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            1,
+            DEFAULT_LEASE,
+        )
+        .expect("no flag builds a config");
         assert_eq!(
             default.rlog_zstd_level, 9,
             "no flag keeps the compactor default"
@@ -4659,7 +4800,8 @@ mod tests {
                     None,
                     Some(level),
                     None,
-                    1
+                    1,
+                    DEFAULT_LEASE
                 )
                 .expect_err("an out-of-range level must be refused"),
                 CompactorKnobError::InvalidRlogZstdLevel(ravel_maintain::RlogZstdLevelError {
@@ -4679,9 +4821,18 @@ mod tests {
     /// fails.
     #[test]
     fn compact_tenant_zero_input_read_concurrency_is_allowed() {
-        let (config, _) =
-            maintain::build_compactor_config(false, None, None, None, Some(0), None, None, 1)
-                .expect("zero input-read-concurrency is tolerated, not refused");
+        let (config, _) = maintain::build_compactor_config(
+            false,
+            None,
+            None,
+            None,
+            Some(0),
+            None,
+            None,
+            1,
+            DEFAULT_LEASE,
+        )
+        .expect("zero input-read-concurrency is tolerated, not refused");
         assert_eq!(
             config.input_read_concurrency, 0,
             "zero passes through unchanged; the merge clamps below-1 to 1 itself"

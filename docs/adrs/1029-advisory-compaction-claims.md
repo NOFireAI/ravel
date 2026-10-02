@@ -195,7 +195,8 @@ The lease duration must exceed the longest non-cancellable stage (one
 stream's cursor drain or one part encode+PUT), not the whole job.
 Default 300 s, config `claim_lease_duration`; a warning at startup if
 configured below 2x the largest of `max_l1_part_bytes` at a conservative
-encode rate.
+encode rate (the largest part is the larger of the two stored-size caps, see
+the 2026-10-02 amendment).
 
 ### 4. Cost gating: claims only where duplication is expensive
 
@@ -596,3 +597,28 @@ branch. `services/ravel-server/src/maintain.rs`'s extended
 `claim_renewal_store_error_counts_as_a_renew_failure_not_a_loss` pins the
 supervisor's next tick compacting the bucket, with `claims_acquired` rising
 by one and `claims_skipped`/`claims_stolen` staying at zero.
+
+## Amendment (2026-10-02): the startup check sizes the largest part as the larger of two caps (issue #2351)
+
+<!-- amendment-applies: sections="3. Cancellation checkpoints in the merge pipeline" pointer="2026-10-02 amendment" -->
+
+Decision 3 warns at startup when the lease is under twice the time to encode
+and upload "the largest of `max_l1_part_bytes`". RLOG compaction now has a
+stored-size cap of its own, `rlog_max_l1_part_bytes`, which the binaries set
+equal to the derived memory split target (ADR-2135, #2351 amendment), and
+that can be larger than the shared cap RSEG reads. The check therefore sizes
+the largest part as the larger of the two (`CompactorConfig::
+largest_stored_target_bytes`, called through `claim_lease_below_warn_threshold`
+on the config), and `ravel-server` logs the larger figure.
+
+The derived target is also capped at the part the lease supports,
+`lease * 10 MiB/s / 2`, so the check is quiet at the defaults (1500 MiB at the
+300 s default). The 256 MiB floor wins over that cap: a lease under about 51 s
+cannot carry a floor-sized part, and the check warns, as decision 3 intends.
+
+Tests: `lease_term_bounds_the_target_and_the_display_says_so`,
+`a_lease_too_short_for_the_floor_yields_the_floor_and_the_check_warns` and
+`the_startup_lease_check_sizes_against_the_larger_cap` in
+`crates/ravel-maintain/src/config.rs`, and
+`the_lease_check_is_quiet_at_the_derived_defaults_and_warns_at_the_floor` in
+`services/ravel-server/src/config.rs`.

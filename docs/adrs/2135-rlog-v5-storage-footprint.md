@@ -608,33 +608,68 @@ the old default the part count could exceed the L0 count, and compaction
 added objects instead of removing them.
 
 When the operator does not set it, the RLOG merge's memory split target is
-now derived from the memory budget the process runs under:
+now derived from the memory budget the process runs under. Three terms
+decide it, and the floor is applied last:
 
 ```text
-l1_part_memory_target_bytes = memory_budget / 8 / concurrent_merges
-                              clamped to [256 MiB, 8 GiB]
+budget = memory - 2 GiB overhead reserve - merge cursor budget   (at least 0)
+target = max( min( budget / 8 / concurrent_merges,
+                   claim lease * 10 MiB/s / 2,
+                   8 GiB ),
+              256 MiB )
 ```
 
 `ravel-server` uses its resolved `memory_budget_bytes` (memory less its
 2 GiB overhead reserve) and its maintenance unit concurrency; `ravel-cli
 maintain` uses the host's total memory, capped by a cgroup memory limit on
-Linux, and its bucket concurrency (1 for `compact-bucket`). An unknown
-budget falls back to 256 MiB, and an explicit flag wins and is used as
-given. Part size therefore follows host memory: on the same corpus a 4 GiB
-target holds about 500k rows, about 34 MB stored. The 8 GiB ceiling keeps a
-large host from building one part whose decoded heap dominates the process.
-The 256 MiB floor binds only while `memory_budget / 8 / concurrent_merges`
-is at most 256 MiB, that is a budget of at most 2 GiB per concurrent merge:
-`compact-bucket` keeps the old 256 MiB only on a host of 2 GiB or less, and
-derives 1 GiB on an 8 GiB host; `ravel-server` at its default unit
-concurrency of 4 keeps it up to 10 GiB of memory.
+Linux, less the same reserve, and its bucket concurrency (1 for
+`compact-bucket`). Both then deduct the merge cursor budget (ADR-0979
+decision 4, 20 GiB by default), which the merge is allowed to hold on top of
+the part it is building: a 32 GiB host under `compact-bucket` divides
+`32 - 2 - 20 = 10 GiB` and derives 1.25 GiB; `ravel-server` on a 30 GiB host
+divides `30 - 2 - 20 = 8 GiB` and derives 256 MiB at its default unit
+concurrency of 4. `compact-tenant` deducts the whole 20 GiB whatever its
+bucket concurrency, because it splits that budget between its buckets;
+`ravel-server` deducts the per-merge figure once. An unknown budget falls
+back to 256 MiB, and an explicit flag wins and is used as given. Part size
+therefore follows host memory: on the same corpus a 4 GiB target holds
+about 500k rows, about 34 MB stored. The 8 GiB ceiling keeps a large host
+from building one part whose decoded heap dominates the process. The 256 MiB
+floor binds while `budget / 8 / concurrent_merges` is at most 256 MiB.
 
-The derived value reaches the RLOG merge only. The RSPAN merge has no
-stored-size target, and the claim lease check of ADR-1029 decision 3 sizes
-the largest part as `max_l1_part_bytes`, so span compaction stays at the
-fixed 256 MiB unless the operator sets the flag, which reaches both merges.
+The lease term is the third. The RLOG stored-size cap follows the derived
+target (below), and ADR-1029 decision 3 warns when the claim lease is under
+twice the time to encode and upload one cap-sized part at 10 MiB/s. A 4 GiB
+cap needs a lease of about 820 s against the 300 s default, so without the
+term the defaults would warn at startup. The lease term caps the target at
+`lease * 10 MiB/s / 2`, 1500 MiB at 300 s, so the check is quiet at the
+defaults. The floor wins over it: a lease under about 51 s still gets 256 MiB
+and the check does warn, which is the operator's explicit choice. Both
+binaries report which term bound the target.
 
-The stored-size target remains the operator's cap on object size. The
-derivation never raises `max_l1_part_bytes`, so an operator who wants
-smaller objects on a large host lowers it, and the exact-encode probe closes
-the part there regardless of the memory split target.
+The derived value reaches the RLOG merge only, together with a stored-size
+cap for that merge. The RSPAN merge has no stored-size target and stays at
+the fixed 256 MiB unless the operator sets the flag, which reaches both
+merges. The startup lease check sizes the largest part as the larger of the
+shared `max_l1_part_bytes` and the RLOG cap.
+
+The stored-size target remains the operator's cap on object size, with one
+addition: the RLOG merge reads `rlog_max_l1_part_bytes` when set, and the
+binaries set it equal to the derived memory target. An explicit
+`--max-l1-part-bytes` sets the RLOG and the shared cap together. The
+derivation never raises the shared `max_l1_part_bytes` (RSEG still reads
+it), so an operator who wants smaller objects on a large host lowers it, and
+the exact-encode probe closes the part there regardless of the memory split
+target.
+
+The cap follows the target so the probe stays opt-in. Raising the memory
+target above a 256 MiB stored cap made the stored cap the binding target on
+compressible data: the uncompressed payload proxy that schedules the probe
+reaches the cap long before the encoded object does, and each probe clones the
+whole in-progress part. A part's proxy never exceeds its decoded-heap
+estimate (every proxy term is at most the matching heap term; the three fixed
+charges are pinned by compile-time assertions in `rlog.rs`), so with the cap
+at or above the memory target the memory target fires first and no probe
+runs. The `derived_defaults_run_zero_probes_and_close_on_the_memory_target`
+test pins zero probes at a derived target and shows probes at a cap of half
+the target and at a quarter of it.

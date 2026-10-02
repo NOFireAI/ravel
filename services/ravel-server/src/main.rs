@@ -341,15 +341,14 @@ async fn main() -> anyhow::Result<()> {
     // ADR-1029 decision 3: a lease shorter than twice the time to encode and
     // PUT the largest L1 part at a conservative rate can expire, and be
     // stolen, before a run still encoding its largest part reaches its own
-    // next renewal checkpoint. Logged, not refused: a deployment with
-    // deliberately small parts and a short lease is a valid shape.
-    if ravel_maintain::config::claim_lease_below_warn_threshold(
-        claim_lease_duration,
-        compactor.max_l1_part_bytes,
-    ) {
+    // next renewal checkpoint. The largest part is the larger of the shared
+    // stored-size cap and the RLOG cap that follows the derived memory target.
+    // Logged, not refused: a deployment with deliberately small parts and a
+    // short lease is a valid shape.
+    if compactor.claim_lease_below_warn_threshold() {
         tracing::warn!(
             claim_lease_secs = claim_lease_duration.as_secs(),
-            max_l1_part_bytes = compactor.max_l1_part_bytes,
+            max_l1_part_bytes = compactor.largest_stored_target_bytes(),
             "maintenance: --maintain-claim-lease is below ADR-1029 decision 3's startup \
              threshold (2x the estimated encode+PUT time for the largest L1 part); a claim \
              can expire while its run is still encoding its largest part, raise the lease if \

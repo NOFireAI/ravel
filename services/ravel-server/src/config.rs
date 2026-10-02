@@ -850,12 +850,18 @@ pub struct Cli {
 
     /// The decoded record-heap size at which an L1 log or span compaction
     /// closes an in-progress part (the memory split target; a log part also
-    /// closes at the 256 MiB stored-size target, whichever comes first).
-    /// Omitted, the log target is derived from the memory budget as budget / 8
-    /// / --maintain-unit-concurrency, clamped to [256 MiB, 8 GiB], or 256 MiB
-    /// when the host memory is unknown, and the span target is 256 MiB; the
-    /// startup log names both values and the log target's source. Zero is
-    /// refused at startup.
+    /// closes at the stored-size target, whichever comes first). Omitted, the
+    /// log target is derived from the memory budget less the 20 GiB merge
+    /// cursor budget, divided by 8 and by --maintain-unit-concurrency, capped
+    /// at what --maintain-claim-lease supports (1500 MiB at 300 s) and at
+    /// 8 GiB, with a 256 MiB floor applied last, or 256 MiB when the host
+    /// memory is unknown; the log stored-size cap then equals that target, and
+    /// the span target is 256 MiB. Set explicitly, the value applies to log
+    /// and span merges and the log stored-size cap stays 256 MiB (there is no
+    /// flag for it), so a value above 256 MiB makes the log merge run
+    /// exact-encode probes. The startup log names the values, the log target's
+    /// source and the derivation term that bound it. Zero is refused at
+    /// startup.
     #[arg(long = "maintain-l1-part-memory-target-bytes", value_name = "BYTES")]
     pub maintain_l1_part_memory_target_bytes: Option<u64>,
 
@@ -2799,94 +2805,8 @@ impl HostProfile {
     pub fn detect() -> Self {
         HostProfile {
             cores: std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
-            mem_total_bytes: detect_mem_total_bytes(),
+            mem_total_bytes: ravel_maintain::detect_host_memory_total_bytes(),
         }
-    }
-}
-
-/// This host's usable memory total in bytes, or `None` when it is not
-/// knowable: `/proc/meminfo`'s `MemTotal`, capped by the cgroup memory limit
-/// when the process runs under one (cgroup v2 `memory.max`, else cgroup v1
-/// `memory.limit_in_bytes`). A container reads the host's `MemTotal`, so a
-/// share of it alone would size the caches and pools against memory the
-/// container is not allowed to use and the derived defaults would OOM-kill the
-/// process they were meant to size.
-#[cfg(target_os = "linux")]
-fn detect_mem_total_bytes() -> Option<u64> {
-    let mem_total = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|contents| parse_mem_total_bytes(&contents));
-    let cgroup_limit = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
-        .ok()
-        .and_then(|contents| parse_cgroup_memory_limit(&contents))
-        .or_else(|| {
-            std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
-                .ok()
-                .and_then(|contents| parse_cgroup_memory_limit(&contents))
-        });
-    effective_memory_total(mem_total, cgroup_limit)
-}
-
-/// Parse a cgroup memory limit file into a finite byte limit: `memory.max` on
-/// cgroup v2, `memory.limit_in_bytes` on v1. `max` (v2's "no limit"), the v1
-/// no-limit sentinel (the page-rounded `i64::MAX`, recognised as any value at
-/// or above 2^60), `0`, and anything malformed are `None`: an absent or
-/// unlimited cgroup must not cap anything, and a wrong cap would resize every
-/// memory-derived default.
-#[cfg(any(target_os = "linux", test))]
-fn parse_cgroup_memory_limit(contents: &str) -> Option<u64> {
-    let raw = contents.trim();
-    if raw == "max" {
-        return None;
-    }
-    let bytes: u64 = raw.parse().ok()?;
-    if bytes == 0 || bytes >= 1 << 60 {
-        return None;
-    }
-    Some(bytes)
-}
-
-/// The memory total the derived defaults size against: `MemTotal` capped by a
-/// finite cgroup limit. Either one alone is used when the other is unknown, so
-/// a container whose `/proc/meminfo` is unreadable still derives from its
-/// limit, and a bare host with no cgroup limit derives from `MemTotal`.
-#[cfg(any(target_os = "linux", test))]
-fn effective_memory_total(mem_total: Option<u64>, cgroup_limit: Option<u64>) -> Option<u64> {
-    match (mem_total, cgroup_limit) {
-        (Some(total), Some(limit)) => Some(total.min(limit)),
-        (Some(total), None) => Some(total),
-        (None, Some(limit)) => Some(limit),
-        (None, None) => None,
-    }
-}
-
-/// Non-Linux targets expose no `/proc/meminfo`; every memory-derived default
-/// falls back to its compiled-in constant there rather than guessing.
-#[cfg(not(target_os = "linux"))]
-fn detect_mem_total_bytes() -> Option<u64> {
-    None
-}
-
-/// Parse `MemTotal` out of `/proc/meminfo` contents, in bytes.
-///
-/// The line is `MemTotal:       32137720 kB`: a fixed key, a decimal count, and
-/// a unit the kernel always writes as `kB` (kibibytes, despite the spelling).
-/// Anything else -- a missing line, a non-numeric count, an unrecognised unit --
-/// is `None` rather than a guess, because a wrong total silently resizes every
-/// memory-derived default.
-///
-/// Only the Linux detector calls this; on other targets it exists for the
-/// tests alone, so it is compiled out of the library there rather than left
-/// as dead code.
-#[cfg(any(target_os = "linux", test))]
-fn parse_mem_total_bytes(meminfo: &str) -> Option<u64> {
-    let line = meminfo.lines().find(|line| line.starts_with("MemTotal:"))?;
-    let mut fields = line.split_whitespace().skip(1);
-    let value: u64 = fields.next()?.parse().ok()?;
-    match fields.next() {
-        Some("kB") | Some("KB") => value.checked_mul(1024),
-        None => Some(value),
-        Some(_) => None,
     }
 }
 
@@ -2975,7 +2895,9 @@ impl Default for CpuGatePermits {
     }
 }
 
-/// Provisional placeholder for the overhead reserve subtracted from
+/// Defined in `ravel_maintain::config` so `ravel-cli maintain` deducts the same
+/// figure when it derives a part-split target. Provisional placeholder for the
+/// overhead reserve subtracted from
 /// cgroup-capped effective memory to derive `memory_budget_bytes`. NOT the
 /// measured figure the calibration run below produces; that run is future
 /// work, gated on parts 1, 2, and 4 of the memory-budget project all having
@@ -2996,7 +2918,7 @@ impl Default for CpuGatePermits {
 /// above the few hundred MiB an idle process (binary text/data, thread
 /// stacks, the tokio runtime, tracing buffers) costs before its first query,
 /// so a flag combination is not falsely refused for lack of the real number.
-pub const MEMORY_OVERHEAD_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub use ravel_maintain::config::MEMORY_OVERHEAD_RESERVE_BYTES;
 
 /// Share of `memory_budget_bytes` (cgroup-capped effective memory minus
 /// [`MEMORY_OVERHEAD_RESERVE_BYTES`]) the derived `--cache-max-bytes` takes.
@@ -5890,12 +5812,23 @@ impl Cli {
 
     /// Resolve `--maintain-l1-part-memory-target-bytes` (issue #2351): the
     /// flag verbatim when set (zero refused), else derived from the derived
-    /// memory budget in `performance` over `--maintain-unit-concurrency`
-    /// concurrent merges, else the 256 MiB fallback when the budget is a
-    /// fallback or not applicable (a `u64::MAX` budget is not a measurement).
+    /// memory budget in `performance` (host memory less the overhead reserve)
+    /// less `merge_cursor_budget_bytes` (floored at zero, see
+    /// [`ravel_maintain::merge_memory_budget_bytes`]) over
+    /// `--maintain-unit-concurrency` concurrent merges and capped by what
+    /// `claim_lease_duration` supports, else the 256 MiB fallback when the
+    /// budget is a fallback or not applicable (a `u64::MAX` budget is not a
+    /// measurement).
+    ///
+    /// `merge_cursor_budget_bytes` is the per-merge figure each concurrent
+    /// maintenance merge may hold in its cursors; it is deducted once, so at
+    /// `--maintain-unit-concurrency` above 1 the derivation undercounts the
+    /// cursor memory that many concurrent merges can hold together.
     pub fn resolve_l1_part_memory_target(
         &self,
         performance: &ResolvedPerformanceDefaults,
+        claim_lease_duration: Duration,
+        merge_cursor_budget_bytes: u64,
     ) -> anyhow::Result<ravel_maintain::ResolvedL1PartMemoryTarget> {
         if self.maintain_l1_part_memory_target_bytes == Some(0) {
             anyhow::bail!(
@@ -5906,11 +5839,15 @@ impl Cli {
         }
         let budget = (performance.sources.memory_budget_bytes == PERF_SOURCE_DERIVED
             && !performance.memory_budget_not_applicable)
-            .then_some(performance.memory_budget_bytes);
+            .then_some(ravel_maintain::merge_memory_budget_bytes(
+                performance.memory_budget_bytes,
+                merge_cursor_budget_bytes,
+            ));
         Ok(ravel_maintain::ResolvedL1PartMemoryTarget::resolve(
             self.maintain_l1_part_memory_target_bytes,
             budget,
             self.maintain_unit_concurrency.max(1),
+            claim_lease_duration,
         ))
     }
 
@@ -5929,7 +5866,6 @@ impl Cli {
     ) -> anyhow::Result<ravel_maintain::CompactorConfig> {
         use anyhow::Context;
 
-        let memory_target = self.resolve_l1_part_memory_target(performance)?;
         let interior_reverify_ns = self
             .parse_maintain_interior_reverify()
             .context("failed to parse --maintain-interior-reverify")?;
@@ -5961,13 +5897,21 @@ impl Cli {
             rlog_zstd_level,
             ..ravel_maintain::CompactorConfig::default()
         };
+        let memory_target = self.resolve_l1_part_memory_target(
+            performance,
+            config.claim_lease_duration,
+            config.merge_cursor_budget_bytes,
+        )?;
         memory_target.apply_to(&mut config);
         tracing::info!(
-            setting = "l1_part_memory_target_bytes",
+            setting = "rlog_l1_part_memory_target_bytes",
             value = memory_target.bytes,
             source = memory_target.source_name(),
+            bound = memory_target.bound_name().unwrap_or("none"),
             resolution = %memory_target,
-            rspan_value = config.l1_part_memory_target_bytes,
+            rlog_max_l1_part_bytes = config.rlog_stored_target_bytes(),
+            rspan_l1_part_memory_target_bytes = config.l1_part_memory_target_bytes,
+            max_l1_part_bytes = config.max_l1_part_bytes,
             "performance default resolved"
         );
         // Only a maintain process runs compaction (`MaintenanceTaskConfig::
@@ -5977,7 +5921,7 @@ impl Cli {
         {
             tracing::warn!(
                 value = memory_target.bytes,
-                "l1_part_memory_target_bytes fell back to 256 MiB: the memory budget is unknown, \
+                "rlog_l1_part_memory_target_bytes fell back to 256 MiB: the memory budget is unknown, \
                  so L1 parts on a wide schema stay small; set \
                  --maintain-l1-part-memory-target-bytes to size them"
             );
@@ -10287,84 +10231,6 @@ mod tests {
         );
     }
 
-    /// `/proc/meminfo` parsing: the real shape, and every malformed shape
-    /// yielding `None` rather than a wrong total. A wrong total silently
-    /// resizes three of the six settings.
-    ///
-    /// Prove-the-test: drop the `checked_mul(1024)` (return `Some(value)` for
-    /// the `kB` arm) and the first assertion reads 32,137,720 against the
-    /// expected 32,909,025,280.
-    #[test]
-    fn mem_total_is_parsed_from_proc_meminfo() {
-        let real = "MemTotal:       32137720 kB\nMemFree:         1234567 kB\n";
-        assert_eq!(parse_mem_total_bytes(real), Some(32_909_025_280));
-
-        // MemTotal not first, and a key that merely starts similarly must not
-        // be mistaken for it.
-        let shuffled = "MemAvailable:    100 kB\nMemTotal:       1024 kB\n";
-        assert_eq!(parse_mem_total_bytes(shuffled), Some(1024 * 1024));
-
-        // Malformed inputs: no guess.
-        assert_eq!(parse_mem_total_bytes(""), None);
-        assert_eq!(parse_mem_total_bytes("MemFree: 100 kB\n"), None);
-        assert_eq!(parse_mem_total_bytes("MemTotal:       lots kB\n"), None);
-        assert_eq!(parse_mem_total_bytes("MemTotal:       12 furlongs\n"), None);
-    }
-
-    /// cgroup limit parsing: a finite v2 or v1 limit is a cap; "max", the v1
-    /// no-limit sentinel, zero, and anything malformed are `None`, so an
-    /// unlimited or absent cgroup never caps a derivation.
-    ///
-    /// Prove-the-test: drop the `bytes >= 1 << 60` arm and the v1 sentinel
-    /// assertion reads `Some(9_223_372_036_854_771_712)` against `None`.
-    #[test]
-    fn cgroup_memory_limit_is_parsed_and_unlimited_is_none() {
-        // cgroup v2 memory.max with a finite limit, with and without the newline.
-        assert_eq!(
-            parse_cgroup_memory_limit("17179869184\n"),
-            Some(17_179_869_184)
-        );
-        assert_eq!(
-            parse_cgroup_memory_limit("17179869184"),
-            Some(17_179_869_184)
-        );
-        // cgroup v2 unlimited.
-        assert_eq!(parse_cgroup_memory_limit("max\n"), None);
-        // cgroup v1 unlimited: the page-rounded i64::MAX the kernel writes.
-        assert_eq!(parse_cgroup_memory_limit("9223372036854771712\n"), None);
-        // A zero limit is not a cap either, and malformed content is not a guess.
-        assert_eq!(parse_cgroup_memory_limit("0\n"), None);
-        assert_eq!(parse_cgroup_memory_limit(""), None);
-        assert_eq!(parse_cgroup_memory_limit("lots\n"), None);
-    }
-
-    /// The effective total is `MemTotal` capped by a finite cgroup limit, and
-    /// either one alone when the other is unknown.
-    ///
-    /// Prove-the-test: replace `total.min(limit)` with `total` and the first
-    /// assertion reads 32,212,254,720 against the expected 17,179,869,184.
-    #[test]
-    fn effective_memory_total_is_mem_total_capped_by_the_cgroup_limit() {
-        assert_eq!(
-            effective_memory_total(Some(32_212_254_720), Some(17_179_869_184)),
-            Some(17_179_869_184)
-        );
-        // A limit above MemTotal does not raise the total.
-        assert_eq!(
-            effective_memory_total(Some(32_212_254_720), Some(64_424_509_440)),
-            Some(32_212_254_720)
-        );
-        assert_eq!(
-            effective_memory_total(Some(32_212_254_720), None),
-            Some(32_212_254_720)
-        );
-        assert_eq!(
-            effective_memory_total(None, Some(17_179_869_184)),
-            Some(17_179_869_184)
-        );
-        assert_eq!(effective_memory_total(None, None), None);
-    }
-
     /// `--cache-max-bytes` reachability (issue #1141): the resolved value is
     /// what `main` hands `store::build_store` and `ServerConfig`, whether it was
     /// derived or typed. Both directions asserted, because a resolution that
@@ -12440,27 +12306,35 @@ mod tests {
 
     /// The compactor's memory split target with the flag unset is derived
     /// from the reference host's memory budget (30 GiB less the 2 GiB reserve,
-    /// 30064771072) over `--maintain-unit-concurrency` (issue #2351), and the
-    /// resolved-defaults line names the value and its source.
+    /// 30064771072, less the 20 GiB merge cursor budget, 8589934592) over
+    /// `--maintain-unit-concurrency` (issue #2351), and the resolved-defaults
+    /// line names the value, its source and the term that bound it. The RLOG
+    /// stored-size cap follows the derived target.
     ///
-    /// 28 GiB / 8 / 4 (the default unit concurrency) = 939524096; at
-    /// concurrency 1 it is 3758096384; a 128 GiB host clamps to 8 GiB.
+    /// (28 - 20) GiB / 8 / 4 (the default unit concurrency) = 268435456, the
+    /// share tying the floor; at concurrency 1 it is 1073741824; at 2 it is
+    /// 536870912. A 128 GiB host at the default lease is lease-bound at
+    /// 1572864000, and with `--maintain-claim-lease 1h` the 8 GiB ceiling binds.
     ///
     /// Non-vacuity (prove-the-test), each flip named:
     /// - Keep the struct default (drop `memory_target.apply_to(&mut config)`):
-    ///   every derived row reads 268435456.
+    ///   every derived row reads 268435456 for the RLOG target and the concurrency
+    ///   rows read the same.
     /// - Write the derived value into the field the RSPAN merge reads: the
-    ///   `rspan_value` and RSPAN assertions read 939524096 and 8589934592.
-    /// - Ignore the unit concurrency: the default row reads 3758096384, not
-    ///   939524096.
-    /// - Drop the clamp: the 128 GiB row reads 16911433728 (126 GiB / 8).
-    /// - Let the derivation win over the flag: the flag row reads 939524096.
+    ///   `rspan_l1_part_memory_target_bytes` and RSPAN assertions read 1073741824.
+    /// - Drop the cursor deduction: the default row reads 939524096, the
+    ///   concurrency 1 row 3758096384.
+    /// - Ignore the unit concurrency: the default row reads 1073741824.
+    /// - Drop the lease term: the 128 GiB default-lease row reads 8589934592.
+    /// - Leave the RLOG cap at its shared default: the `rlog_max_l1_part_bytes`
+    ///   field reads 268435456 on the concurrency 1 row.
+    /// - Let the derivation win over the flag: the flag row reads 268435456.
     #[test]
     fn compactor_memory_target_is_derived_from_the_memory_budget() {
         let (lines, guard) = capture_events(tracing::Level::INFO);
         let default = compactor(&[]).expect("default");
         drop(guard);
-        assert_eq!(default.rlog_memory_target_bytes(), 939_524_096);
+        assert_eq!(default.rlog_memory_target_bytes(), 268_435_456);
         assert_eq!(
             default.l1_part_memory_target_bytes, 268_435_456,
             "the RSPAN merge keeps 256 MiB without the flag"
@@ -12470,48 +12344,63 @@ mod tests {
             .iter()
             .filter(|l| {
                 l.contains("performance default resolved")
-                    && l.contains("setting=\"l1_part_memory_target_bytes\"")
+                    && l.contains("setting=\"rlog_l1_part_memory_target_bytes\"")
             })
             .collect();
         assert_eq!(resolved.len(), 1, "exactly one resolved line: {lines:?}");
         let line = resolved[0];
-        assert!(line.contains(" value=939524096"), "{line}");
-        assert!(line.contains(" rspan_value=268435456"), "{line}");
+        assert!(line.contains(" value=268435456"), "{line}");
+        assert!(
+            line.contains(" rspan_l1_part_memory_target_bytes=268435456"),
+            "{line}"
+        );
+        assert!(line.contains(" rlog_max_l1_part_bytes=268435456"), "{line}");
+        assert!(line.contains(" max_l1_part_bytes=268435456"), "{line}");
         assert!(line.contains(" source=\"derived\""), "{line}");
+        assert!(line.contains(" bound=\"memory_share\""), "{line}");
         assert!(
             line.contains(
-                " resolution=939524096 (resolved from a memory budget of 30064771072 over 4 \
-                 concurrent merges)"
+                " resolution=268435456 (resolved from a memory budget of 8589934592 over 4 \
+                 concurrent merges; bound by the memory share, budget / 8 / merges)"
             ),
             "{line}"
         );
 
-        assert_eq!(
-            compactor(&["--maintain-unit-concurrency", "1"])
-                .expect("concurrency 1")
-                .rlog_memory_target_bytes(),
-            3_758_096_384
-        );
+        let one = compactor(&["--maintain-unit-concurrency", "1"]).expect("concurrency 1");
+        assert_eq!(one.rlog_memory_target_bytes(), 1_073_741_824);
+        assert_eq!(one.rlog_stored_target_bytes(), 1_073_741_824);
+        assert_eq!(one.max_l1_part_bytes, 268_435_456);
+        assert_eq!(one.l1_part_memory_target_bytes, 268_435_456);
         assert_eq!(
             compactor(&["--maintain-unit-concurrency", "2"])
                 .expect("concurrency 2")
                 .rlog_memory_target_bytes(),
-            1_879_048_192
+            536_870_912
         );
 
-        // A 128 GiB host: budget 126 GiB, / 8 / 1 = 15.75 GiB, clamped to 8 GiB.
-        let big = cli(&["--maintain-unit-concurrency", "1"]);
-        let gc_runtime = big
-            .resolve_gc_runtime(Duration::from_secs(30))
-            .expect("gc runtime");
-        let performance = big
-            .resolve_performance(HostProfile::new(REFERENCE_CORES, Some(128 << 30)))
-            .expect("performance defaults resolve");
-        let big_config = big
-            .resolve_compactor_config(&gc_runtime, &performance)
-            .expect("128 GiB host");
-        assert_eq!(big_config.rlog_memory_target_bytes(), 8_589_934_592);
+        // A 128 GiB host: budget 126 GiB less 20 GiB, / 8 / 1 = 13.25 GiB. The
+        // default 300 s lease supports a 1500 MiB part, so the lease binds; a
+        // one-hour lease supports 18000 MiB and the 8 GiB ceiling binds.
+        let big_host = |extra: &[&str]| {
+            let mut args = vec!["--maintain-unit-concurrency", "1"];
+            args.extend_from_slice(extra);
+            let big = cli(&args);
+            let gc_runtime = big
+                .resolve_gc_runtime(Duration::from_secs(30))
+                .expect("gc runtime");
+            let performance = big
+                .resolve_performance(HostProfile::new(REFERENCE_CORES, Some(128 << 30)))
+                .expect("performance defaults resolve");
+            big.resolve_compactor_config(&gc_runtime, &performance)
+                .expect("128 GiB host")
+        };
+        let big_config = big_host(&[]);
+        assert_eq!(big_config.rlog_memory_target_bytes(), 1_572_864_000);
+        assert_eq!(big_config.rlog_stored_target_bytes(), 1_572_864_000);
         assert_eq!(big_config.l1_part_memory_target_bytes, 268_435_456);
+        let long_lease = big_host(&["--maintain-claim-lease", "1h"]);
+        assert_eq!(long_lease.rlog_memory_target_bytes(), 8_589_934_592);
+        assert_eq!(long_lease.rlog_stored_target_bytes(), 8_589_934_592);
 
         // An unknown host memory falls back to 256 MiB.
         let unknown = cli(&[]);
@@ -12519,10 +12408,67 @@ mod tests {
             .resolve_performance(HostProfile::new(REFERENCE_CORES, None))
             .expect("performance defaults resolve");
         let target = unknown
-            .resolve_l1_part_memory_target(&performance)
+            .resolve_l1_part_memory_target(
+                &performance,
+                ravel_maintain::config::DEFAULT_CLAIM_LEASE_DURATION,
+                ravel_maintain::config::DEFAULT_MERGE_CURSOR_BUDGET_BYTES,
+            )
             .expect("fallback");
         assert_eq!(target.bytes, 268_435_456);
         assert_eq!(target.source_name(), "fallback");
+    }
+
+    /// The startup lease check must not warn at the derived defaults: with the
+    /// RLOG cap following the derived target, the target is lease-bound, and
+    /// `largest_stored_target_bytes` is the figure `main` hands the check. A
+    /// 128 GiB host at the default lease derives 1,572,864,000 bytes, the exact
+    /// cap at which the check stays quiet; the same host with a 100 s lease
+    /// derives the 500 MiB the lease allows and is also quiet; a 30 s lease
+    /// cannot carry the 256 MiB floor and DOES warn, which is the operator's
+    /// explicit choice and the signal.
+    ///
+    /// Distinguishing: dropping the lease term from the derivation warns at
+    /// the default-lease row (the 8 GiB ceiling needs a lease of about 1,638 s
+    /// and the 13.25 GiB share is capped at it), and reads 8589934592 for the
+    /// 100 s row's target. A lease cap applied after the floor reads 157286400
+    /// for the 30 s row, which pins 268435456.
+    #[test]
+    fn the_lease_check_is_quiet_at_the_derived_defaults_and_warns_at_the_floor() {
+        let compactor_on_big_host = |extra: &[&str]| {
+            let mut args = vec!["--maintain-unit-concurrency", "1"];
+            args.extend_from_slice(extra);
+            let big = cli(&args);
+            let gc_runtime = big
+                .resolve_gc_runtime(Duration::from_secs(30))
+                .expect("gc runtime");
+            let performance = big
+                .resolve_performance(HostProfile::new(REFERENCE_CORES, Some(128 << 30)))
+                .expect("performance defaults resolve");
+            big.resolve_compactor_config(&gc_runtime, &performance)
+                .expect("compactor")
+        };
+        for (extra, warns) in [
+            (&[][..], false),
+            (&["--maintain-claim-lease", "100s"][..], false),
+            (&["--maintain-claim-lease", "30s"][..], true),
+        ] {
+            let config = compactor_on_big_host(extra);
+            assert_eq!(
+                config.claim_lease_below_warn_threshold(),
+                warns,
+                "{extra:?}: target {} lease {:?}",
+                config.rlog_memory_target_bytes(),
+                config.claim_lease_duration
+            );
+        }
+        assert_eq!(
+            compactor_on_big_host(&["--maintain-claim-lease", "100s"]).rlog_memory_target_bytes(),
+            524_288_000
+        );
+        assert_eq!(
+            compactor_on_big_host(&["--maintain-claim-lease", "30s"]).rlog_memory_target_bytes(),
+            268_435_456
+        );
     }
 
     /// The 256 MiB fallback warning is logged by a maintain process only, the
@@ -12550,7 +12496,7 @@ mod tests {
             let count = lines
                 .lock()
                 .iter()
-                .filter(|l| l.contains("l1_part_memory_target_bytes fell back to 256 MiB"))
+                .filter(|l| l.contains("rlog_l1_part_memory_target_bytes fell back to 256 MiB"))
                 .count();
             assert_eq!(count, want, "mode {mode}");
         }
@@ -12575,7 +12521,7 @@ mod tests {
             let lines = lines.lock().clone();
             assert!(
                 lines.iter().any(|l| {
-                    l.contains("setting=\"l1_part_memory_target_bytes\"")
+                    l.contains("setting=\"rlog_l1_part_memory_target_bytes\"")
                         && l.contains(" source=\"flag\"")
                         && l.contains(&format!(" resolution={want} (set by flag)"))
                 }),
