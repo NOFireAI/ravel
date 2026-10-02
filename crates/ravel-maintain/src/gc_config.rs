@@ -1344,6 +1344,126 @@ mod tests {
             .expect("a smaller running skew is covered too");
     }
 
+    /// A stored horizon with small query and grace terms, which satisfies the
+    /// skew-covering bound for the default skew.
+    fn short_horizon(protection_horizon_ns: i64) -> GcConfigValues {
+        GcConfigValues {
+            protection_horizon_ns,
+            grace_ns: 60_000_000_000,
+            max_query_duration_ns: 60_000_000_000,
+            ..GcConfigValues::maintain_defaults()
+        }
+    }
+
+    /// `protection_horizon >= max_compaction_lifetime + 4 * clock_skew_allowance`
+    /// at maintain startup (ADR-1133): passes at the bound, refuses one
+    /// nanosecond of horizon below it, on a config the skew-covering bound
+    /// alone accepts.
+    ///
+    /// Flip to watch it fail: make `validate_maintain_compaction_lifetime`
+    /// return `Ok(())` without the check; the `expect_err` panics.
+    #[test]
+    fn maintain_compaction_lifetime_check_is_inclusive_at_the_bound() {
+        let lifetime = DEFAULT_MAX_COMPACTION_LIFETIME_NS;
+        let skew = DEFAULT_CLOCK_SKEW_ALLOWANCE_NS;
+        let bound = lifetime + 4 * skew;
+
+        let at_bound = short_horizon(bound);
+        validate_maintain_compaction_lifetime(&at_bound, lifetime, skew)
+            .expect("a horizon exactly at the bound starts");
+
+        let below = short_horizon(bound - 1);
+        validate_maintain_skew(&below, skew)
+            .expect("the skew-covering bound alone accepts this horizon");
+        let err = validate_maintain_compaction_lifetime(&below, lifetime, skew)
+            .expect_err("a horizon one nanosecond below the bound must refuse");
+        assert!(
+            matches!(
+                err,
+                GcConfigError::MaintainCompactionLifetimeUncovered {
+                    stored_horizon_ns,
+                    max_compaction_lifetime_ns,
+                    clock_skew_allowance_ns,
+                } if stored_horizon_ns == bound - 1
+                    && max_compaction_lifetime_ns == lifetime
+                    && clock_skew_allowance_ns == skew
+            ),
+            "got: {err}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("max_compaction_lifetime={lifetime} ns"))
+                && message.contains(&format!("= {bound} ns")),
+            "the error names both values and the bound: {message}"
+        );
+    }
+
+    /// The bootstrap defaults (25 h 5 min horizon) outlast this build's
+    /// compiled compaction lifetime with the default skew.
+    #[test]
+    fn maintain_defaults_satisfy_the_compaction_lifetime_bound() {
+        let defaults = GcConfigValues::maintain_defaults();
+        assert!(defaults.satisfies_compaction_lifetime(
+            DEFAULT_MAX_COMPACTION_LIFETIME_NS,
+            DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
+        ));
+        let config = CompactorConfig::default();
+        validate_maintain_compaction_lifetime(
+            &defaults,
+            config.max_compaction_lifetime_ns,
+            config.clock_skew_allowance_ns,
+        )
+        .expect("the bootstrap defaults pass the startup check");
+    }
+
+    /// `set_gc_config` refuses a horizon below
+    /// `DEFAULT_MAX_COMPACTION_LIFETIME_NS + 4 * clock_skew_allowance` and
+    /// writes nothing; the bound itself is written.
+    ///
+    /// Flip to watch it fail: remove the `satisfies_compaction_lifetime` check
+    /// in `set_gc_config`; the `expect_err` panics.
+    #[tokio::test]
+    async fn set_refuses_a_horizon_a_compaction_run_can_outlive() {
+        let store = store();
+        let skew = DEFAULT_CLOCK_SKEW_ALLOWANCE_NS;
+        let bound = DEFAULT_MAX_COMPACTION_LIFETIME_NS + 4 * skew;
+        let below = short_horizon(bound - 1);
+        assert!(below.satisfies_constraint(skew));
+        let err = set_gc_config(store.as_ref(), below.into(), skew, 1_000)
+            .await
+            .expect_err("a horizon below the compaction-lifetime bound must be refused");
+        assert!(
+            matches!(
+                err,
+                GcConfigError::CompactionLifetimeViolation {
+                    protection_horizon_ns,
+                    max_compaction_lifetime_ns,
+                    clock_skew_allowance_ns,
+                } if protection_horizon_ns == bound - 1
+                    && max_compaction_lifetime_ns == DEFAULT_MAX_COMPACTION_LIFETIME_NS
+                    && clock_skew_allowance_ns == skew
+            ),
+            "got: {err}"
+        );
+        assert!(
+            read_gc_config(store.as_ref())
+                .await
+                .expect("read")
+                .is_none(),
+            "a refused set writes no object"
+        );
+
+        let at_bound = short_horizon(bound);
+        set_gc_config(store.as_ref(), at_bound.into(), skew, 2_000)
+            .await
+            .expect("a horizon at the bound is accepted");
+        let (stored, _v) = read_gc_config(store.as_ref())
+            .await
+            .expect("read")
+            .expect("the accepted config was written");
+        assert_eq!(stored.protection_horizon_ns, bound);
+    }
+
     /// Query deadline validation: a deadline over the stored max_query_duration
     /// refuses; one at or under it passes.
     #[test]
