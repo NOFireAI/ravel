@@ -157,30 +157,32 @@
 //! asserts that mark stays proportional to the memory split target while a hot
 //! stream grows.
 //!
-//! # Memory split target and stored-size target are two separate knobs (issue #872)
+//! # Memory split target and stored-size target are two separate knobs
 //!
-//! `l1_part_memory_target_bytes` above sizes the decoded record heap and is what
-//! keeps this merge survivable on a small host. It does NOT govern object
-//! geometry: on a wide schema it reaches 256 MiB of heap after only a few MB of
-//! stored bytes, so every L1 object was tiny (~3.5 MB on ClickBench, a 74x gap
-//! below the 256 MiB the knob's old name implied). Object geometry is a second,
-//! independent knob, the **stored-size target** `max_l1_part_bytes`, and it is
-//! measured in the bytes its name promises: the part's ACTUAL encoded object
-//! size (issue #872). The RLOG writer holds row-major records and only encodes
-//! at [`RlogWriter::finish_compacted`], so there is no incremental encoded size
-//! to read; instead [`PartBuilder`] keeps a cheap pre-compression payload proxy
-//! ([`estimate_stored_record`] per record plus [`estimate_stored_stream`] once
-//! per distinct stream) that SCHEDULES an exact-encode probe once it reaches the
-//! target, and the part closes on the probe's real byte count. Closing on the
-//! proxy directly would have sized every object at the target divided by the
-//! compression ratio (the proxy is an upper bound over the zstd-compressed
-//! sections), the same ratio-times-smaller objects issue #872 names. A part
-//! closes on whichever target is reached first. With the shipped defaults (both
-//! 256 MiB) the memory split target still fires first on every real schema and
-//! the payload proxy never reaches 256 MiB, so no probe runs and this split is
-//! behaviour-neutral until an operator lowers the stored target below the size
-//! the memory split target already yields. Lowering it caps objects lower;
-//! growing them means raising `l1_part_memory_target_bytes`.
+//! Issue #872 split the one part-size knob into these two. The
+//! `l1_part_memory_target_bytes` above sizes the decoded record heap and is
+//! what keeps this merge survivable on a small host. On a wide schema it also
+//! decides object geometry: decoded heap runs far ahead of stored bytes, so a
+//! fixed 256 MiB target closed parts at about 32k rows and 2.1 MB stored on a
+//! 104-column schema. The binaries therefore derive it from the memory budget
+//! when the operator leaves it unset, as `budget / 8 / concurrent_merges`
+//! clamped to 256 MiB..=8 GiB (`config::derive_l1_part_memory_target_bytes`),
+//! so part size follows host memory.
+//!
+//! The **stored-size target** `max_l1_part_bytes` is the operator's cap on
+//! object size, measured in the bytes its name promises: the part's ACTUAL
+//! encoded object size. The RLOG writer holds row-major records and only
+//! encodes at [`RlogWriter::finish_compacted`], so there is no incremental
+//! encoded size to read; instead [`PartBuilder`] keeps a cheap pre-compression
+//! payload proxy ([`estimate_stored_record`] per record plus
+//! [`estimate_stored_stream`] once per distinct stream) that SCHEDULES an
+//! exact-encode probe once it reaches the target, and the part closes on the
+//! probe's real byte count. Closing on the proxy directly would size every
+//! object at the target divided by the compression ratio (the proxy is an
+//! upper bound over the zstd-compressed sections). A part closes on whichever
+//! target is reached first: on a wide schema that is usually the memory split
+//! target, and once a derived memory target lets a part's proxy reach the
+//! stored-size target, the probe runs and the stored-size target binds.
 //!
 //! The first RLOG merge held every input object whole (RLOG then had no ranged
 //! section reader); [`ravel_logseg::open_from_suffix`] is now the RLOG analogue

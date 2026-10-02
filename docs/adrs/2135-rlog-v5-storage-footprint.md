@@ -411,6 +411,9 @@ the per-object record it would read.
 - Keyed compaction may merge a stream in reservation-sized batches. The
   batches share one part sink, so batching adds no part boundary of its own
   (see the #2143 amendment).
+- L1 part size on a wide tenant is set by the memory split target, which is
+  now derived from the host's memory budget rather than fixed at 256 MiB
+  (see the #2351 amendment).
 - Every RLOG object written before this change becomes unreadable by a build
   that includes it, per ADR-0531. Development stores are wiped or re-ingested.
 - Golden fixtures, `ravel-cli` inspector fixtures, version assertions in
@@ -588,3 +591,40 @@ The decisions landed in these pull requests:
 
 With that last pull request every decision has an implementation on main,
 and the status moved from Proposed to Accepted.
+
+## Amendment (2026-10-02): L1 part size follows host memory (issue #2351)
+
+<!-- amendment-applies: sections="Consequences" pointer="#2351 amendment" -->
+
+The compactor closes an L1 part on whichever of two targets it reaches
+first: the memory split target `l1_part_memory_target_bytes`, which bounds
+the decoded record heap of one merge, and the stored-size target
+`max_l1_part_bytes`, which bounds the encoded object. The memory split
+target had a fixed default of 256 MiB. A decoded record on the 104-column
+measurement corpus is about 8 KiB, so that default closed every part at
+about 32k rows and 2.1 MB stored, far below the 256 MiB stored-size target.
+Compacting that corpus produced 3,461 L1 parts from 2,617 L0 inputs: under
+the old default the part count could exceed the L0 count, and compaction
+added objects instead of removing them.
+
+When the operator does not set it, the memory split target is now derived
+from the memory budget the process runs under:
+
+```text
+l1_part_memory_target_bytes = memory_budget / 8 / concurrent_merges
+                              clamped to [256 MiB, 8 GiB]
+```
+
+`ravel-server` uses its resolved `memory_budget_bytes` and its maintenance
+unit concurrency; `ravel-cli maintain` uses the host's total memory and its
+bucket concurrency. An unknown budget falls back to 256 MiB, and an explicit
+flag wins and is used as given. Part size therefore follows host memory: on
+the same corpus a 4 GiB target holds about 500k rows, about 34 MB stored.
+The 8 GiB ceiling keeps a large host from building one part whose decoded
+heap dominates the process, and the 256 MiB floor keeps the old behaviour on
+a small host.
+
+The stored-size target remains the operator's cap on object size. The
+derivation never raises `max_l1_part_bytes`, so an operator who wants
+smaller objects on a large host lowers it, and the exact-encode probe closes
+the part there regardless of the memory split target.
