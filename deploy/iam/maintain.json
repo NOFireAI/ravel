@@ -33,8 +33,7 @@
         "arn:aws:s3:::my-ravel-bucket/sys/maintain/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/config",
         "arn:aws:s3:::my-ravel-bucket/t/*/enc",
-        "arn:aws:s3:::my-ravel-bucket/t/*/a/state/latest",
-        "arn:aws:s3:::my-ravel-bucket/t/*/pq/t/*"
+        "arn:aws:s3:::my-ravel-bucket/t/*/a/state/latest"
       ]
     },
     {

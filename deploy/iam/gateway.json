@@ -55,7 +55,7 @@
       "Sid": "GatewayAdmissionDelete",
       "Effect": "Allow",
       "Action": "s3:DeleteObject",
-      "Resource": "arn:aws:s3:::my-ravel-bucket/t/*/*/admission/*"
+      "Resource": "arn:aws:s3:::my-ravel-bucket/t/????????????????????????????????/?/admission/*"
     },
     {
       "Sid": "GatewayTenantKms",

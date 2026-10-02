@@ -511,9 +511,11 @@ const BUCKET_KEY_PREFIX: &str = "arn:aws:s3:::my-ravel-bucket/";
 /// every other character is literal. This handles both, so a `?` smuggled into
 /// any of those fields is resolved as the wildcard IAM treats it as instead of
 /// being escaped to a literal `\?` that quietly matches nothing. The shipped
-/// templates carry no `?` in any of the three fields, asserted (not assumed) by
-/// `every_shipped_template_passes_the_choke_point`, which scans Action, Resource,
-/// and the `s3:prefix` values it reads through `list_prefix_patterns`.
+/// templates carry a `?` in exactly one place, gateway's
+/// `GatewayAdmissionDelete` Resource, and in no Action and no `s3:prefix`;
+/// `every_shipped_template_passes_the_choke_point` asserts that (not assumes
+/// it) over Action, Resource, and the `s3:prefix` values it reads through
+/// `list_prefix_patterns`.
 fn glob_to_regex(pattern: &str) -> regex::Regex {
     let mut regex_src = String::from("^");
     for ch in pattern.chars() {
@@ -2004,7 +2006,9 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // admission records, provenance, and the catalog objects a commit
     // publishes. Its one delete is the admission reconcile's reap of dead
     // processes' mutable admission snapshots, and reaches no durable object
-    // (gateway_template_covers_the_admission_snapshot_reap). sys/auth is the
+    // (gateway_template_covers_the_admission_snapshot_reap): its tenant hash
+    // and signal segments are single-character wildcards, so it cannot cross
+    // a slash into a Parquet manifest. sys/auth is the
     // durable token map the auth
     // refresh reads, and sys/t/* the per-tenant recovery manifest every keyed
     // ingest path creates; asserted by tenant_resolving_roles_read_the_auth_map
@@ -2054,7 +2058,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/m/meta",
         ],
         put_actions: &["s3:PutObject"],
-        deletes: &["t/*/*/admission/*"],
+        deletes: &["t/????????????????????????????????/?/admission/*"],
         delete_actions: &["s3:DeleteObject"],
         protected_deletes: PROTECTED_DELETE_KEYS,
         protected_delete_actions: PROTECTED_DELETE_ACTIONS,
@@ -2216,10 +2220,10 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // keep set from, and the two listings alert_keyspace_is_empty issues.
     // Asserted by maintain_template_covers_the_alert_retention_reads.
     //
-    // t/*/pq/t/* appears on the list, get and delete axes for `ravel-cli
-    // parquet sweep`, which runs under this credential: it lists a tenant's
-    // Parquet table manifests and deletes the superseded ones. Asserted by
-    // maintain_template_covers_every_parquet_sweep_call.
+    // t/*/pq/t/* appears on the list and delete axes for `ravel-cli parquet
+    // sweep`, which runs under this credential: it lists a tenant's Parquet
+    // table manifests and deletes the superseded ones, and reads none of them.
+    // Asserted by maintain_template_covers_every_parquet_sweep_call.
     ExpectedRolePatterns {
         role: "maintain",
         list_prefixes: &[
@@ -2258,7 +2262,6 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/config",
             "t/*/enc",
             "t/*/a/state/latest",
-            "t/*/pq/t/*",
         ],
         get_actions: &["s3:GetObject"],
         puts: &[
@@ -4792,7 +4795,7 @@ fn query_template_covers_every_parquet_table_read() {
 /// the Maintain credential. `sweep::plan` (`crates/ravel-pqtable/src/sweep.rs`)
 /// LISTs `t/<hash>/pq/t/` once, reads `sys/gc` for the deployment's grace floor,
 /// and `sweep::execute` DELETEs each superseded manifest past the grace. The
-/// sweep never touches the grants record.
+/// sweep reads no manifest and never touches the grants record.
 #[test]
 fn maintain_template_covers_every_parquet_sweep_call() {
     let maintain = load_policy("maintain");
@@ -4815,9 +4818,9 @@ fn maintain_template_covers_every_parquet_sweep_call() {
          sweep::execute deletes once superseded. Grants: {deletes:?}"
     );
     assert!(
-        gets.iter().any(|p| glob_matches(p, &manifest)),
-        "maintain: no GetObject Allow reaches the manifest {manifest:?}. \
-         Grants: {gets:?}"
+        !gets.iter().any(|p| glob_matches(p, &manifest)),
+        "maintain: a GetObject Allow reaches the manifest {manifest:?}, but the \
+         sweep lists and deletes manifests and never reads one. Grants: {gets:?}"
     );
     assert!(
         gets.iter().any(|p| glob_matches(p, "sys/gc")),
@@ -4826,7 +4829,6 @@ fn maintain_template_covers_every_parquet_sweep_call() {
     );
     for (axis, patterns) in [
         ("s3:prefix Allow", &list_prefixes),
-        ("s3:GetObject Allow", &gets),
         ("delete Allow", &deletes),
     ] {
         let witness = if axis == "s3:prefix Allow" {
@@ -4919,6 +4921,23 @@ fn gateway_template_covers_the_admission_snapshot_reap() {
             is_admission_key,
         );
     }
+
+    // IAM's `*` crosses `/`, so `t/*/*/admission/*` also matches the
+    // manifests of a Parquet table named `admission`. This witness stays out
+    // of key_domain(): the gateway's read and write grants still reach it.
+    let admission_table_manifest = format!(
+        "{}admission/v/{:020}.pqm",
+        parquet_tenant_manifest_prefix(),
+        1
+    );
+    assert!(
+        !deletes
+            .iter()
+            .any(|p| glob_matches(p, &admission_table_manifest)),
+        "gateway: a delete Allow reaches {admission_table_manifest:?}, a manifest \
+         of a Parquet table named admission. The gateway deletes no durable \
+         object. Grants: {deletes:?}"
+    );
 
     // Every gateway delete pattern is the admission reap's: the role deletes
     // nothing else, immutable data included.
@@ -8414,6 +8433,7 @@ fn every_shipped_template_passes_the_choke_point() {
         "expected 4 shipped templates: {on_disk:?}"
     );
 
+    let mut question_mark_resources: Vec<String> = Vec::new();
     for role in ALL_ROLES {
         // load_policy panics on any rejection, naming role, index, Sid and field.
         let policy = load_policy(role);
@@ -8423,10 +8443,10 @@ fn every_shipped_template_passes_the_choke_point() {
         );
 
         // `glob_to_regex` resolves `?` as IAM's single-character wildcard and
-        // documents that widening it changed no existing match because no
-        // shipped Action or Resource carries a `?`. That is a property of the
-        // four JSON files, so it is asserted here rather than assumed: a `?`
-        // added to a template silently changes what every pattern axis reads.
+        // documents the one shipped field that carries one. That is a property
+        // of the four JSON files, so it is asserted here rather than assumed: a
+        // `?` added to a template silently changes what every pattern axis
+        // reads.
         for stmt in policy_statements(&policy) {
             let sid = statement_sid(stmt);
             for action in statement_actions(stmt) {
@@ -8434,14 +8454,24 @@ fn every_shipped_template_passes_the_choke_point() {
                     !action.contains('?'),
                     "{role}/{sid}: Action {action:?} carries a `?`. glob_to_regex \
                      resolves it as IAM's single-character wildcard; the doc claim \
-                     that no shipped pattern uses one is now false and every \
+                     that no shipped Action uses one is now false and every \
                      pattern-set expectation in this file must be re-read"
                 );
             }
             for resource in statement_resources(stmt) {
-                assert!(
-                    !resource.contains('?'),
-                    "{role}/{sid}: Resource {resource:?} carries a `?`. Same \
+                if !resource.contains('?') {
+                    continue;
+                }
+                // The admission reap spells the tenant hash and signal segments
+                // with single-character wildcards so the delete cannot cross a
+                // slash into a Parquet manifest.
+                if (role, sid) == ("gateway", "GatewayAdmissionDelete") {
+                    question_mark_resources.push(format!("{role}/{sid}"));
+                    continue;
+                }
+                panic!(
+                    "{role}/{sid}: Resource {resource:?} carries a `?`, and only \
+                     gateway/GatewayAdmissionDelete is allowed one. Same \
                      consequence as for Action above"
                 );
             }
@@ -8457,11 +8487,17 @@ fn every_shipped_template_passes_the_choke_point() {
                 !prefix.contains('?'),
                 "{role}: s3:prefix {prefix:?} carries a `?`. glob_to_regex resolves \
                  it as IAM's single-character wildcard; the doc claim that no \
-                 shipped pattern uses one is now false and every prefix axis in \
+                 shipped s3:prefix uses one is now false and every prefix axis in \
                  this file must be re-read"
             );
         }
     }
+    assert_eq!(
+        question_mark_resources,
+        ["gateway/GatewayAdmissionDelete"],
+        "the one allowlisted `?` Resource must still be the only one, and must \
+         still carry its `?`"
+    );
 }
 
 /// The object-store contract's compliance-mode paragraph must state the true
