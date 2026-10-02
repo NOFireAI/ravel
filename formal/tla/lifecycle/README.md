@@ -259,9 +259,11 @@ that predate ADR-1133 flips exactly one, runs with `FullEnv = TRUE` and all
 eighteen INVARIANT lines (TypeOK plus seventeen named) from `smoke.cfg`
 (finding 5), and names the single invariant it must break, so a
 guard silently deleted from the spec fails a control rather than passing
-unnoticed under a reduction that happened to dodge the other invariants. The
-four ADR-1133 controls run at other bounds, described under "The ADR-1133 window
-gate" below. There are thirteen controls, one per `negative/*.cfg`; each has a
+unnoticed under a reduction that happened to dodge the other invariants.
+`pinned-query-ungated` runs at those same bounds and is described below. The
+other three ADR-1133 controls (`window-three-skew`, `window-no-cache-delay`,
+`marker-ignores-anchor`) run at the window gate's bounds, described under "The
+ADR-1133 window gate" below. There are thirteen controls, one per `negative/*.cfg`; each has a
 note under `counterexamples/`.
 
 The controls run at `MaxClock = 2`, one step above the smoke lane's bound. Each
