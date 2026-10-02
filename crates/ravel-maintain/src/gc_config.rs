@@ -10,7 +10,7 @@
 //! Before this object the bound lived in three unlinked per-process configs
 //! (the maintain sweep config, the query deadline, the Flight ticket ceiling)
 //! that could be deployed independently, with nothing validating the
-//! constraint anywhere. This module makes the four deployment-wide values a
+//! constraint anywhere. This module makes the deployment-wide values a
 //! single durable truth:
 //!
 //! - **Bootstrap.** On the first touch of a fresh bucket, [`bootstrap_gc_config`]
@@ -411,8 +411,8 @@ pub enum GcConfigError {
     #[error(
         "this query process's HEAD cache TTL is {effective_ttl_ns} ns, but sys/gc (format_version \
          {format_version}) records head_cache_ttl={recorded_ttl_ns} ns: a query may not be served \
-         a cached HEAD for longer than ADR-1133's sweeper delete gate allows for; refusing to \
-         start"
+         a cached HEAD for longer than the recorded TTL, the bound ADR-1133's sweeper delete gate \
+         is specified against; refusing to start"
     )]
     QueryHeadCacheTtlExceedsRecorded {
         effective_ttl_ns: i64,
@@ -653,11 +653,11 @@ pub fn validate_query_deadline(
 }
 
 /// Query-mode startup check (ADR-1133 decision 4): the process's effective HEAD
-/// cache TTL must be `<=` the recorded `head_cache_ttl_ns`, so no query is
-/// served a cached HEAD for longer than ADR-1133's sweeper delete gate allows
-/// for.
-/// On a version 1 object the recorded value is the compiled
-/// [`DEFAULT_HEAD_CACHE_TTL_NS`], the same value the gate uses.
+/// cache TTL must be `<=` the recorded `head_cache_ttl_ns`, the bound
+/// ADR-1133's sweeper delete gate is specified against, so no query is served
+/// a cached HEAD for longer than it. On a version 1 object the recorded value
+/// is the compiled [`DEFAULT_HEAD_CACHE_TTL_NS`], the value ADR-1133 specifies
+/// the gate uses on version 1.
 pub fn validate_query_head_cache_ttl(
     stored: &GcConfigValues,
     effective_ttl_ns: i64,
