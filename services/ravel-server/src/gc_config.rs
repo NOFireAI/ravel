@@ -52,6 +52,16 @@ pub fn validate_query(stored: &GcConfigValues, deadline: Duration) -> Result<(),
     ravel_maintain::validate_query_deadline(stored, duration_to_ns(deadline))
 }
 
+/// Query-mode check: the HEAD cache TTL the query process's catalog runs on
+/// must be `<=` the stored `head_cache_ttl_ns` (ADR-1133 decision 4). On a
+/// version 1 `sys/gc` the stored value is the compiled default.
+pub fn validate_query_head_cache_ttl(
+    stored: &GcConfigValues,
+    catalog_config: &ravel_catalog::CatalogConfig,
+) -> Result<(), GcConfigError> {
+    ravel_maintain::validate_query_head_cache_ttl(stored, catalog_config.head_cache_ttl_ns)
+}
+
 /// Flight SQL check: the ticket-TTL ceiling must be `<=` the stored
 /// `protection_horizon_ns` minus `grace_ns` (ADR-0050 section 4). The server
 /// sources the ceiling from `sys/gc` (see [`flight_ceiling`]), so this passes by

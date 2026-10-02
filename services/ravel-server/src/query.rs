@@ -1449,6 +1449,12 @@ mod catalog_cache_tests {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let catalog =
             build_catalog_for_server(store, &config, 7_200_000_000_000).expect("catalog builds");
+        assert_eq!(
+            catalog.config().head_cache_ttl_ns,
+            server_catalog_config_base().head_cache_ttl_ns,
+            "the startup sys/gc HEAD cache TTL check reads `server_catalog_config_base`, so the \
+             catalog `build_catalog_for_server` returns must run on that same TTL"
+        );
         let engine =
             build_engine_config(&config, catalog.config()).expect("server defaults are valid");
         assert_eq!(

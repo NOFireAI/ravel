@@ -1294,6 +1294,19 @@ impl MaintenanceTasks {
     }
 }
 
+/// The maintain compactor configuration with the pinned-query window's terms
+/// taken from `sys/gc` (ADR-1133 decision 4), the same values `ravel-cli
+/// maintain sweep` reads.
+fn compactor_config_from_gc(
+    base: &CompactorConfig,
+    stored_gc: &ravel_maintain::GcConfigValues,
+) -> CompactorConfig {
+    let mut compactor = base.clone();
+    compactor.max_query_duration_ns = stored_gc.max_query_duration_ns;
+    compactor.head_cache_ttl_ns = stored_gc.head_cache_ttl_ns;
+    compactor
+}
+
 /// Spawn one supervisor task that re-discovers the tenant set from storage
 /// every tick (ADR-0048 decision 3, ADR-0066 decision 6). `fallback_allow` is
 /// the merged `--tenant-token`/`--maintain-tenant` set: empty means unconfigured
@@ -1365,7 +1378,7 @@ pub fn spawn(
     // One compactor writer_id per process start, shared across every tenant
     // this supervisor maintains (recorded in each L1 part's footer;
     // informational, never dedup-priority).
-    let mut compactor = config.compactor.clone();
+    let mut compactor = compactor_config_from_gc(&config.compactor, &stored_gc);
     compactor.compactor_writer_id = rng.new_uuid();
     let compactor = Arc::new(compactor);
     let retention = Arc::new(config.retention.clone());
@@ -4741,6 +4754,31 @@ mod tests {
     /// ravel-maintain -> ravel-catalog dependency), so if either ever drifts
     /// this test fails and the retention floor would silently be validated
     /// against a different lag than the catalog resolves with.
+    /// The maintain compactor carries `sys/gc`'s maximum query duration and
+    /// HEAD cache TTL, not the compiled defaults.
+    #[test]
+    fn compactor_config_carries_sys_gc_query_terms() {
+        let base = CompactorConfig::default();
+        let defaults = ravel_maintain::GcConfigValues::maintain_defaults();
+        let stored = ravel_maintain::GcConfigValues {
+            max_query_duration_ns: 7_777_000_000_001,
+            head_cache_ttl_ns: 13_000_000_007,
+            ..defaults
+        };
+        for value in [stored.max_query_duration_ns, stored.head_cache_ttl_ns] {
+            assert_ne!(value, base.max_query_duration_ns);
+            assert_ne!(value, base.head_cache_ttl_ns);
+            assert_ne!(value, defaults.max_query_duration_ns);
+            assert_ne!(value, defaults.head_cache_ttl_ns);
+        }
+
+        let config = compactor_config_from_gc(&base, &stored);
+        assert_eq!(config.max_query_duration_ns, 7_777_000_000_001);
+        assert_eq!(config.head_cache_ttl_ns, 13_000_000_007);
+        assert_eq!(config.protection_horizon_ns, base.protection_horizon_ns);
+        assert_eq!(config.grace_ns, base.grace_ns);
+    }
+
     #[test]
     fn catalog_and_maintain_ingest_lag_agree() {
         assert_eq!(

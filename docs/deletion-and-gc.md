@@ -36,19 +36,29 @@ marker) anchors on the marker's own `<ingest_hour>` instead, and its own age
 gate carries a forward-skew tolerance the other four don't need (see below the
 table).
 
-`protection_horizon`, `grace`, `max_query_duration`, and `max_flush_lifetime`
-are not per-process knobs each component sets independently. They are recorded
-once, deployment-wide, in the durable object `sys/gc` at the bucket root
-(ADR-0050 section 4). The first process to touch a fresh bucket bootstraps
+`protection_horizon`, `grace`, `max_query_duration`, `max_flush_lifetime`, and
+`head_cache_ttl` are not per-process knobs each component sets independently.
+They are recorded once, deployment-wide, in the durable object `sys/gc` at the
+bucket root (ADR-0050 section 4 and its sys/gc version 2 amendment). Format
+version 1 records no `head_cache_ttl`, and readers take the compiled default
+(30 s); format version 2 records it (ADR-1133 decision 4). A build reads both
+and refuses any other version. The first process to touch a fresh bucket bootstraps
 `sys/gc` from the maintain defaults via `CreateIfAbsent` (the defaults satisfy
 `protection_horizon >= max_query_duration + grace + clock_skew_allowance` by
 construction; a racing loser re-reads the winner's object, so a fresh bucket
-never fails startup), and only `ravel-cli gc-config set` mutates it, enforcing
-the constraint at write time and swapping with `CasVersion`. Every mode then
-validates itself against `sys/gc` at startup and refuses to start on a real
-violation: maintain's configured horizon and grace must equal the stored
-values; a query engine's deadline must be `<= max_query_duration`; a Flight SQL
-ticket-TTL ceiling must be `<= protection_horizon - grace`. A process that can
+never fails startup). Bootstrap always writes version 1, so a new build does
+not lock older ones out of a fresh bucket. Only `ravel-cli gc-config set`
+mutates it, enforcing the constraint at write time and swapping with
+`CasVersion`; `set --head-cache-ttl` writes version 2, and `set` without the
+flag keeps the stored version and its recorded TTL. Every mode then validates
+itself against `sys/gc` at startup and refuses to start on a real violation:
+maintain's configured horizon and grace must equal the stored values; a query
+engine's deadline must be `<= max_query_duration`, and the HEAD cache TTL its
+catalog runs on `<= head_cache_ttl`; a Flight SQL ticket-TTL ceiling must be
+`<= protection_horizon - grace`. `ravel-cli maintain sweep` reads `sys/gc` the
+same way and sweeps on its protection horizon and grace; it carries
+`max_query_duration` and `head_cache_ttl` for the pinned-query gate (ADR-1133),
+which is not built yet, so neither changes the sweep. A process that can
 read a bootstrapped `sys/gc` and finds a real violation does not start; there is
 no "assume defaults" path, because assumed defaults are precisely the
 cross-process drift this object exists to prevent.
@@ -72,10 +82,11 @@ absorbing any residual. The bound
 protection_horizon >= max_query_duration + grace + clock_skew_allowance
 ```
 
-is exactly that budget. The `clock_skew_allowance` is not stored in `sys/gc`
-(the object's format is a frozen contract); it is a config input to the
-constraint, supplied from the sweeper's
-`CompactorConfig::clock_skew_allowance_ns` (default 5 min). The fence is
+is exactly that budget. The `clock_skew_allowance` is not stored in `sys/gc`:
+it is a per-process input to the constraint, supplied from the sweeper's
+`CompactorConfig::clock_skew_allowance_ns` (default 5 min), and each process
+that deletes validates its own value against the stored ones (point 2 below).
+A stored copy would not bind a sweeper configured with another value. The fence is
 enforced at two choke points, and needs both to be sound against the sweeper
 that actually deletes:
 
@@ -98,7 +109,9 @@ that actually deletes:
    startup fails before any listener binds rather than let the sweeper delete a
    pinned snapshot. (The must-match check `validate_maintain` cannot catch this
    on its own; it only requires the configured horizon and grace to EQUAL the
-   stored values, and the skew term is in neither field.)
+   stored values, and the skew term is in neither field.) `ravel-cli maintain
+   sweep` runs `validate_maintain` and `validate_maintain_skew` against its own
+   `clock_skew_allowance` the same way, and refuses before it sweeps.
 
 Because both fences hold, **no reachable sweeper config can delete an object a
 pinned reader still holds**: a skew-uncovered horizon can neither be written nor

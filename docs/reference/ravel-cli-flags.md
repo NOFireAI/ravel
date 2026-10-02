@@ -433,7 +433,7 @@ _No flags._
 
 ### gc-config show
 
-Print the durable `sys/gc` values (protection horizon, grace, max query duration, max flush lifetime), or report that the bucket is not yet bootstrapped
+Print the durable `sys/gc` values (format version, protection horizon, grace, max query duration, max flush lifetime, HEAD cache TTL), or report that the bucket is not yet bootstrapped
 
 _No flags._
 
@@ -445,6 +445,7 @@ Write a full new `sys/gc`, enforcing `protection_horizon >= max_query_duration +
 | --- | --- | --- | --- |
 | `--clock-skew-allowance` |  |  | Cross-host clock-skew allowance the horizon must cover (e.g. `5m`). The constraint input that closes S1-02; must match the sweepers' `clock_skew_allowance`. Not stored in `sys/gc`. Defaults to 5m when omitted |
 | `--grace` |  |  | Shared grace period for the GC age gates (e.g. `24h`) |
+| `--head-cache-ttl` |  |  | HEAD cache TTL every query-mode server process is held to (e.g. `30s`). Writes `sys/gc` format version 2 recording it (ADR-1133): run it only once every `ravel-server` process in every mode (gateway, query, maintain, all) and every `ravel-cli` binary that reads `sys/gc` runs a build that reads version 2, since an older build then refuses the object. The flip is one-way. Omitted, the stored format version is kept, and a stored version 2 keeps its recorded TTL |
 | `--max-flush-lifetime` |  |  | Longest a flush may stay open (e.g. `1h`). Refused below the ingest pipeline's own default `max_flush_lifetime` (currently `1h`): a lower value here lets GC seal a bucket before an in-flight flush's writer interlock expires |
 | `--max-query-duration` |  |  | Longest a single query may run (e.g. `1h`) |
 | `--protection-horizon` |  |  | Horizon between a deletion anchor and physical deletion (e.g. `25h5m`) |
