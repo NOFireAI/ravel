@@ -798,6 +798,13 @@ mod tests {
             request_deadline(&body(r#"{"query":"DROP TABLE t"}"#), MAX).expect("deadline"),
             MAX
         );
+        // Finite but far beyond what a `Duration` holds: clamped to the
+        // server maximum rather than converted, so it cannot panic.
+        assert_eq!(
+            request_deadline(&body(r#"{"query":"DROP TABLE t","timeout":1e300}"#), MAX)
+                .expect("deadline"),
+            MAX
+        );
         let err = request_deadline(&body(r#"{"query":"DROP TABLE t","timeout":0}"#), MAX)
             .expect_err("rejected");
         assert_eq!(err.status, StatusCode::BAD_REQUEST);

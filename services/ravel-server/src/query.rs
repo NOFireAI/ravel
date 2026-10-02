@@ -793,10 +793,9 @@ fn build_sql_state_inner(
         Some(sources) => executor.with_parquet_sources(sources),
         None => executor,
     };
-    // ADR-2040: the deployment's `sys/gc`-derived minimum sweep grace, so a
-    // `DROP`/replacing `CREATE OR REPLACE` cannot delete a manifest version a
-    // query admitted under this process's own `max_query_duration` could
-    // still be reading.
+    // The deployment's `sys/gc`-derived minimum grace, which the manifest
+    // writer spends as its resolve-to-put budget; see
+    // `WRITER_MIN_USABLE_GRACE_MS` for why it is not query protection.
     let executor = executor.with_ddl_min_grace_ms(ddl_min_grace_ms);
     Ok(crate::sql::SqlState {
         executor: Arc::new(executor),
