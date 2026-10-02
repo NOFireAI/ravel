@@ -455,29 +455,19 @@ impl SnapshotReachability {
                 }
             }
         };
-        match reap_listed(
-            store,
-            clock,
-            config,
-            tenant,
-            signal,
-            &listing,
-            &self.markers.gated_anchors,
-            &self.markers.touched,
+        Some(
+            reap_listed(
+                store,
+                clock,
+                config,
+                tenant,
+                signal,
+                &listing,
+                &self.markers.gated_anchors,
+                &self.markers.touched,
+            )
+            .await,
         )
-        .await
-        {
-            Ok(outcome) => Some(outcome),
-            Err(error) => {
-                tracing::warn!(
-                    tenant_hash = %tenant.to_hex(),
-                    signal = signal.key_prefix(),
-                    %error,
-                    "unnamed-marker reaper failed; leftover markers wait for a later pass"
-                );
-                None
-            }
-        }
     }
 
     /// Point the marker cache at `(tenant, signal)`, dropping what it held for

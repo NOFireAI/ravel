@@ -2551,9 +2551,11 @@ impl SupersededGroup {
 /// gone (a crash-interrupted prior pass) yields no group and its data object,
 /// if any, is collected by orphan GC (row 8).
 ///
-/// One group per input, not one for the whole record: an input the live HEAD
-/// no longer names is still collectable in a pass where a sibling input is
-/// held.
+/// One group per input, not one for the whole record: a lease or legal hold,
+/// or a refused delete, on one input's group holds only that group. The HEAD
+/// gate does not split them: every group a record's entry gathers shares that
+/// record's unnamed-since marker (ADR-1133), so a sibling HEAD still names, or
+/// cannot read, holds every input of the record.
 async fn gather_l0_inputs(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,

@@ -30,7 +30,7 @@ use ravel_types::{Signal, TenantHash};
 
 use crate::clock::Clock;
 use crate::config::CompactorConfig;
-use crate::error::{MaintainError, Result};
+use crate::error::Result;
 
 /// The only marker body version this build writes and reads.
 pub const UNNAMED_MARKER_FORMAT_VERSION: u32 = 1;
@@ -195,6 +195,9 @@ pub struct MarkerReapOutcome {
     /// Markers whose anchor is gone but whose body could not be read or
     /// decoded: left in place.
     pub unreadable: usize,
+    /// Markers whose anchor HEAD, body GET or DELETE failed: counted, left in
+    /// place, and the reap moves on to the next key.
+    pub failed: usize,
     /// Anchor HEADs, marker body GETs and marker DELETEs the reap issued, on
     /// top of the LIST.
     pub head_requests: usize,
@@ -205,8 +208,9 @@ pub struct MarkerReapOutcome {
 /// The orphan-marker rule: LIST every marker of one `(tenant, signal)`, across
 /// every shard, and delete each whose anchor no longer exists and whose
 /// `observed_unix_ns` is older than `protection_horizon_ns` on this sweeper's
-/// clock. A key that does not parse is counted and skipped. A dry run counts
-/// what it would reap and deletes nothing.
+/// clock. A key that does not parse, or whose HEAD, GET or DELETE fails, is
+/// counted and skipped. A dry run counts what it would reap and deletes
+/// nothing.
 pub async fn reap_orphan_unnamed_markers(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -215,7 +219,7 @@ pub async fn reap_orphan_unnamed_markers(
     signal: Signal,
 ) -> Result<MarkerReapOutcome> {
     let listed = list_all(store, &keys::unnamed_marker_prefix(tenant, signal)).await?;
-    reap_listed(
+    Ok(reap_listed(
         store,
         clock,
         config,
@@ -225,7 +229,7 @@ pub async fn reap_orphan_unnamed_markers(
         &HashSet::new(),
         &HashSet::new(),
     )
-    .await
+    .await)
 }
 
 /// [`reap_orphan_unnamed_markers`] over a listing the caller already holds.
@@ -242,7 +246,7 @@ pub(crate) async fn reap_listed(
     listed: &[ObjectMeta],
     known_present: &HashSet<String>,
     skip: &HashSet<String>,
-) -> Result<MarkerReapOutcome> {
+) -> MarkerReapOutcome {
     let mut outcome = MarkerReapOutcome {
         listed: listed.len(),
         ..MarkerReapOutcome::default()
@@ -281,7 +285,10 @@ pub(crate) async fn reap_listed(
         match store.head(&anchor_key).await {
             Ok(_) => continue,
             Err(StoreError::NotFound) => {}
-            Err(e) => return Err(MaintainError::Store(e)),
+            Err(error) => {
+                reap_failed(&mut outcome, &meta.key, "anchor HEAD", &error);
+                continue;
+            }
         }
         outcome.get_requests += 1;
         let body = match store
@@ -290,7 +297,10 @@ pub(crate) async fn reap_listed(
         {
             Ok(got) => got.data,
             Err(StoreError::NotFound) => continue,
-            Err(e) => return Err(MaintainError::Store(e)),
+            Err(error) => {
+                reap_failed(&mut outcome, &meta.key, "marker GET", &error);
+                continue;
+            }
         };
         let marker = match UnnamedMarker::decode(body.as_ref()) {
             Ok(m) => m,
@@ -314,11 +324,24 @@ pub(crate) async fn reap_listed(
         }
         if !config.dry_run {
             outcome.delete_requests += 1;
-            store.delete(&meta.key).await?;
+            if let Err(error) = store.delete(&meta.key).await {
+                reap_failed(&mut outcome, &meta.key, "marker DELETE", &error);
+                continue;
+            }
         }
         outcome.reaped += 1;
     }
-    Ok(outcome)
+    outcome
+}
+
+fn reap_failed(outcome: &mut MarkerReapOutcome, key: &str, op: &str, error: &StoreError) {
+    outcome.failed += 1;
+    tracing::warn!(
+        key = %key,
+        op,
+        %error,
+        "unnamed-marker reaper: a request failed; marker left in place for a later pass"
+    );
 }
 
 #[cfg(test)]
