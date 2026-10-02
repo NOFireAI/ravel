@@ -132,6 +132,7 @@ a missing table and an empty vector.
 | PromQL HTTP API | metrics, logs as `ravel_log_lines` and `ravel_log_bytes` | `none` | yes |
 | SQL over `POST /api/v1/sql` | metrics as `samples` (scalar samples only, never native histograms), logs as `logs`, traces as `spans`, alert history as `alerts`, audit records as `audit` | `sql` | yes |
 | Flight SQL | the same five tables, with the same `samples` limit | `flight-sql` | yes |
+| Parquet tables over both SQL surfaces | Parquet files read in place from an S3, GCS or Azure location granted to the tenant (`ravel-cli tenant parquet-grant add`, `ravel-server --parquet-profiles`); described below the matrix | `sql` | yes |
 
 <!-- END SUPPORT MATRIX -->
 
