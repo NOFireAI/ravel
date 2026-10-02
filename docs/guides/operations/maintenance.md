@@ -516,8 +516,8 @@ when the stored horizon does not cover its own 5 min clock-skew allowance, the
 check the server's maintain mode runs at startup. On a bucket with no `sys/gc`
 it bootstraps the object from the maintain defaults, as the server does; a
 `--dry-run` uses those defaults without writing the object. The stored maximum
-query duration and HEAD cache TTL are carried for the pinned-query gate
-(ADR-1133), which is not built yet, so they do not change the sweep.
+query duration and HEAD cache TTL are carried for the pinned-query gate,
+which is not built yet, so they do not change the sweep.
 
 ### Upgrading `sys/gc` to format version 2
 
@@ -529,8 +529,9 @@ object, and nothing writes version 1 back, so the flip is a one-way ratchet. In
 order:
 
 1. Upgrade every `ravel-server` process in every mode (`gateway`, `query`,
-   `maintain`, and the combined `all` mode; each reads and validates `sys/gc`
-   at startup) and every `ravel-cli` binary that reads `sys/gc`
+   `maintain`, and the combined `all` mode; each reads `sys/gc` at startup
+   and refuses to start on a format version it does not know) and every
+   `ravel-cli` binary that reads `sys/gc`
    (`gc-config show` and `set`, `parquet sweep`, `maintain sweep`) to a build
    that reads version 2. `ravel-cli gc-config show` prints the stored
    `format_version`.
@@ -991,7 +992,7 @@ list is in [the generated CLI reference](../../reference/ravel-cli-flags.md).
 |---|---|
 | `maintain compact-bucket` | One compaction pass over a single sealed bucket, printing the outcome. `--dry-run` computes the same plan and writes nothing. |
 | `maintain compact-tenant` | Compacts every sealed bucket of one tenant and signal across shards. See [compaction](#compaction). |
-| `maintain sweep --tenant <t> --signal <s> --shard <n> [--dry-run]` | One sweep pass (orphan collection, superseded inputs, unreferenced L1) over a shard. It prints the orphans quarantined, the orphan copies to quarantine that were refused, the quarantined objects reaped, the superseded records and data deleted, the superseded deletes refused, the superseded objects held because HEAD names them or cannot be read, the chain groups a legal hold kept, the unreferenced parts deleted, whether the pass covered the whole shard, and a line when the orphan breaker tripped or was overridden. It sweeps on the protection horizon and grace stored in `sys/gc` (the stored maximum query duration and HEAD cache TTL are carried for the pinned-query gate of ADR-1133, which is not built yet) and refuses when the stored horizon does not cover its clock-skew allowance. `--dry-run` reports the eligible set and deletes nothing. |
+| `maintain sweep --tenant <t> --signal <s> --shard <n> [--dry-run]` | One sweep pass (orphan collection, superseded inputs, unreferenced L1) over a shard. It prints the orphans quarantined, the orphan copies to quarantine that were refused, the quarantined objects reaped, the superseded records and data deleted, the superseded deletes refused, the superseded objects held because HEAD names them or cannot be read, the chain groups a legal hold kept, the unreferenced parts deleted, whether the pass covered the whole shard, and a line when the orphan breaker tripped or was overridden. It sweeps on the protection horizon and grace stored in `sys/gc` (the stored maximum query duration and HEAD cache TTL are carried for the pinned-query gate, which is not built yet) and refuses when the stored horizon does not cover its clock-skew allowance. `--dry-run` reports the eligible set and deletes nothing. |
 | `maintain status --tenant <t> --signal <s> --shard <n> --hour <n>` | Reports one bucket's state: sealed, tombstoned, compacted, L0 record count, superseded-input count, L1 segments present, unreferenced count. Read-only. |
 | `maintain audit-versions --tenant <t> [--shards <n>]` | Audits live on-object format versions and classifies each format floor. Exits nonzero on any anomaly or contradicted floor. |
 | `maintain migrate` | Raises a format floor. See [format migration](#format-migration). |

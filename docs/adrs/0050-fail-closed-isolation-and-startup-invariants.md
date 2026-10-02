@@ -485,6 +485,7 @@ frozen-format procedure. This is the sys/gc version 2 amendment.
 
 docs/guides/operations/maintenance.md gives the upgrade procedure: every
 `ravel-server` process in every mode (gateway, query, maintain, and the
-combined `all` mode; each reads and validates `sys/gc` at startup) and every
-`ravel-cli` binary that reads `sys/gc` runs a build that reads version 2
-before `gc-config set --head-cache-ttl` is run. The flip is one-way.
+combined `all` mode; each reads `sys/gc` at startup and refuses to start on
+a format version it does not know) and every `ravel-cli` binary that reads
+`sys/gc` runs a build that reads version 2 before `gc-config set
+--head-cache-ttl` is run. The flip is one-way.
