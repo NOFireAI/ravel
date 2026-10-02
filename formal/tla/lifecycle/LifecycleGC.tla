@@ -105,12 +105,29 @@ CONSTANTS
                                 \* hold vacuously and the invariant would pass by
                                 \* absence. The ASSUME makes TLC fail closed on such
                                 \* a configuration instead.
-    CompletionIgnoresOpenBucket \* negative control (base FALSE): completion drops
+    CompletionIgnoresOpenBucket, \* negative control (base FALSE): completion drops
                                 \* the ack-open-bucket guard, so a .done can land
                                 \* while a bucket open at the acknowledgement is still
                                 \* unsealed or still serves a pre-ack record (#1290).
+    (* ADR-1133's unnamed-since marker and pinned-query window gate (issue #2339).
+       WindowGate FALSE and HeadCacheTtl = 0 leave every marker and cache variable
+       at its Init value, so a cfg with those values explores the graph it did
+       before the gate existed. *)
+    WindowGate,                 \* the retention and superseded deletes require an
+                                \* aged marker whose anchor matches (decision 3)
+    HeadCacheTtl,               \* head_cache_ttl: a pin may still be handed a cached
+                                \* HEAD naming an object for this long after the HEAD
+                                \* that drops it is published
+    WindowSingleSkew,           \* negative control: the gate uses 1 * ClockSkew
+    WindowNoCacheDelay,         \* negative control: the gate omits HeadCacheTtl
+                                \* while the pin keeps its cache delay
+    MarkerIgnoresAnchor         \* negative control: a marker counts whatever anchor
+                                \* it was written for (drops decision 2)
 
 ASSUME ProtectionHorizon \in Nat /\ Grace \in Nat
+ASSUME HeadCacheTtl \in Nat
+ASSUME WindowGate \in BOOLEAN /\ WindowSingleSkew \in BOOLEAN
+ASSUME WindowNoCacheDelay \in BOOLEAN /\ MarkerIgnoresAnchor \in BOOLEAN
 ASSUME SealBound \in Nat
 ASSUME MaxQueryDuration \in Nat /\ ClockSkew \in Nat
 ASSUME MaxClock \in Nat
@@ -237,6 +254,20 @@ HeldObject(o, heldB) == (o \in DataObjects) /\ (Bucket(o) \in heldB)
 \* NoDeleteInsideProtectionWindow covers it (finding 6).
 HorizonGatedRules == {"retention", "dreq", "superseded"}
 
+\* --- ADR-1133 marker keys -----------------------------------------------------
+\* One marker per delete candidate: the retention marker is per tombstoned bucket
+\* (retire.unn), a superseded marker per superseded object. The shipped key is per
+\* chain group, keyed by the record the group is entered from; in this instance
+\* each group holds one superseded object, so per object is the same set of keys.
+MarkerKeys == Buckets \cup SupersededCandidates
+
+\* The anchor identity a marker records is the anchor's anchoring timestamp
+\* (retired_at_ns or the superseding record's time, decision 1). StaleAnchor is
+\* an identity no live anchor in this instance can have (every real one is a
+\* clock value), for a marker written for some other anchor.
+StaleAnchor == MaxClock + 1
+NoMarker == [present |-> FALSE, obs |-> 0, anchor |-> 0]
+
 \* --- Store instance ----------------------------------------------------------
 VARIABLES
     store, lastModified, versionCounter, uploads, listState,  \* RavelObjectStore
@@ -286,23 +317,39 @@ VARIABLES
                       \* RequestErasure and never cleared, so once an acknowledgement
                       \* has taken the obligation on, only sealing the bucket and
                       \* rewriting its pre-ack record discharge it.
-    ingestLate        \* "none" | "serving" | "cleared": the single late-landing
+    ingestLate,       \* "none" | "serving" | "cleared": the single late-landing
                       \* pre-ack record. "serving" once it lands (visible after the
                       \* pass listed), "cleared" once a rewrite over the sealed bucket
                       \* drops it. One late write per behaviour.
+    \* --- ADR-1133 window gate (issue #2339) -------------------------------------
+    marker,           \* [MarkerKeys -> [present, obs, anchor]]: the unnamed-since
+                      \* marker. A protocol variable, not a store key: the store
+                      \* instance carries no object body and the gate reads the body.
+                      \* `obs` is the writer's clock reading shifted up by ClockSkew,
+                      \* so a reading that lags true time stays a Nat.
+    cacheUntil        \* [DataObjects -> Nat]: a pin may still be handed a cached
+                      \* HEAD naming o while clock < cacheUntil[o]. Set to
+                      \* drop clock + HeadCacheTtl when a HEAD that drops o is
+                      \* published; 0 (never) at Init.
 
 storeVars == <<store, lastModified, versionCounter, uploads, listState>>
 protoVars == <<head, headState, clock, superseded, heldBuckets,
                refreshFailed, query, erasureRequested, tombRetiredAt,
                dreqHorizon, doneAt, supersededAt, objContent, variantKey,
                leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs,
-               sysgc, lastGc, ingestPhase, ingestAckScope, ingestLate>>
+               sysgc, lastGc, ingestPhase, ingestAckScope, ingestLate,
+               marker, cacheUntil>>
 vars == <<store, lastModified, versionCounter, uploads, listState,
           head, headState, clock, superseded, heldBuckets,
           refreshFailed, query, erasureRequested, tombRetiredAt,
           dreqHorizon, doneAt, supersededAt, objContent, variantKey,
           leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs,
-          sysgc, lastGc, ingestPhase, ingestAckScope, ingestLate>>
+          sysgc, lastGc, ingestPhase, ingestAckScope, ingestLate,
+          marker, cacheUntil>>
+
+\* The window gate's two variables. Every action that does not touch them names
+\* this tuple in its UNCHANGED list, for the same reason maintVars exists.
+windowVars == <<marker, cacheUntil>>
 
 \* The maintenance-pass bookkeeping (who holds the lease, how far each pass got,
 \* and the input sets each pass resolved). Every action that is not a maintenance
@@ -366,7 +413,7 @@ View ==
     <<StoreView, head, headState, clock, superseded, heldBuckets, refreshFailed,
       query, erasureRequested, tombRetiredAt, dreqHorizon, doneAt, supersededAt,
       objContent, variantKey, leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs,
-      sysgc, lastGc, ingestPhase, ingestAckScope, ingestLate>>
+      sysgc, lastGc, ingestPhase, ingestAckScope, ingestLate, marker, cacheUntil>>
 
 \* A delete decision needs a readable HEAD, present or absent: an absent HEAD
 \* names nothing, so the delete may proceed exactly as if EffectiveHead were
@@ -461,7 +508,8 @@ TypeOK ==
     /\ superseded \subseteq SupersededCandidates
     /\ heldBuckets \subseteq Buckets
     /\ refreshFailed \in BOOLEAN
-    /\ query \in [active: BOOLEAN, needs: SUBSET DataObjects, deadline: 0..(MaxClock + MaxQueryDuration)]
+    /\ query \in [active: BOOLEAN, needs: SUBSET DataObjects,
+                  deadline: 0..(MaxClock + MaxQueryDuration + 2 * ClockSkew)]
     /\ erasureRequested \subseteq Subjects
     /\ tombRetiredAt \in [Buckets -> 0..MaxClock]
     /\ dreqHorizon \in Nat
@@ -487,6 +535,10 @@ TypeOK ==
     /\ ingestPhase \in {"absent","open","sealed"}
     /\ ingestAckScope \in BOOLEAN
     /\ ingestLate \in {"none","serving","cleared"}
+    /\ marker \in [MarkerKeys -> [present: BOOLEAN,
+                                  obs: 0..(MaxClock + ClockSkew),
+                                  anchor: 0..StaleAnchor]]
+    /\ cacheUntil \in [DataObjects -> 0..(MaxClock + HeadCacheTtl)]
 
 --------------------------------------------------------------------------------
 \* Init: a populated store (raw1, raw2, d2, sysgc present), HEAD naming the data,
@@ -530,6 +582,8 @@ Init ==
     /\ ingestPhase = "absent"
     /\ ingestAckScope = FALSE
     /\ ingestLate = "none"
+    /\ marker = [k \in MarkerKeys |-> NoMarker]
+    /\ cacheUntil = [o \in DataObjects |-> 0]
 
 \* A GC witness records what the deleting store operation OBSERVED at its own
 \* step: the TRUE legal-hold state (over heldBuckets, not the sweep's known set),
@@ -589,21 +643,40 @@ Tick ==
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
                    maintVars, ingestPhase, ingestAckScope, ingestLate>>
+    /\ UNCHANGED windowVars
     /\ NoGc
 
-\* Pin an in-flight query at the current HEAD; its deadline is pin + mqd. It is
-\* permitted (may still read the objects it named) until the clock passes the
-\* deadline (max_query_duration).
+\* Pin an in-flight query on a HEAD; its deadline is pin + mqd. It is permitted
+\* (may still read the objects it named) until the clock passes the deadline
+\* (max_query_duration).
+\*
+\* Two ADR-1133 delays widen the pin, both inert at HeadCacheTtl = 0 and
+\* ClockSkew = 0:
+\*  * The cache delay: the resolve may be served a cached HEAD that still names
+\*    an object the current HEAD dropped, while clock < cacheUntil[o]. The pin
+\*    takes the current HEAD's objects plus every such object, which is at least
+\*    as much as any one cached HEAD names. The bound is exclusive; results.md
+\*    (round for issue #2339) records that an inclusive bound fails
+\*    window-gate.cfg at the one tick where the reader's last read and the
+\*    gate's first open coincide.
+\*  * ext, the Flight SQL ticket term (decision 3's third and fourth sigma): a
+\*    ticket minted on one process and redeemed on another can read up to
+\*    2 * ClockSkew past the minting process's deadline.
+CachedNames(o) == o \notin head /\ clock < cacheUntil[o]
+
 PinQuery ==
     /\ ~query.active
-    /\ query' = [active |-> TRUE,
-                 needs |-> {o \in head : PresentObj(o)},
-                 deadline |-> clock + MaxQueryDuration]
+    /\ \E ext \in 0..(2 * ClockSkew) :
+         query' = [active |-> TRUE,
+                   needs |-> {o \in DataObjects :
+                                PresentObj(o) /\ (o \in head \/ CachedNames(o))},
+                   deadline |-> clock + MaxQueryDuration + ext]
     /\ UNCHANGED storeVars
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
                    maintVars, ingestPhase, ingestAckScope, ingestLate>>
+    /\ UNCHANGED windowVars
     /\ NoGc
 
 ExpireQuery ==
@@ -615,6 +688,7 @@ ExpireQuery ==
                    refreshFailed, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
                    maintVars, ingestPhase, ingestAckScope, ingestLate>>
+    /\ UNCHANGED windowVars
     /\ NoGc
 
 \* Place / release a legal hold on bucket b (its data prefixes).
@@ -626,6 +700,7 @@ PlaceHold(b) ==
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
                    maintVars, ingestPhase, ingestAckScope, ingestLate>>
+    /\ UNCHANGED windowVars
     /\ NoGc
 
 ReleaseHold(b) ==
@@ -636,6 +711,7 @@ ReleaseHold(b) ==
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
                    maintVars, ingestPhase, ingestAckScope, ingestLate>>
+    /\ UNCHANGED windowVars
     /\ NoGc
 
 \* The HEAD object read can fail (unreadable) or find the HEAD gone (absent).
@@ -657,6 +733,7 @@ SetHeadState(s) ==
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
                    maintVars, ingestPhase, ingestAckScope, ingestLate>>
+    /\ UNCHANGED windowVars
     /\ NoGc
 
 \* Toggle this tick's legal-hold refresh outcome.
@@ -669,6 +746,7 @@ SetRefresh(f) ==
                    query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
                    maintVars, ingestPhase, ingestAckScope, ingestLate>>
+    /\ UNCHANGED windowVars
     /\ NoGc
 
 --------------------------------------------------------------------------------
@@ -697,6 +775,7 @@ RequestErasure ==
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, tombRetiredAt, doneAt, sysgc, supersededAt, objContent, variantKey,
                    maintVars, ingestPhase, ingestLate>>
+    /\ UNCHANGED windowVars
     /\ NoGc
 
 \* --- Live input resolution (resolve_live_inputs) ------------------------------
@@ -762,6 +841,7 @@ StartRewrite(id) ==
                    query, erasureRequested, tombRetiredAt, dreqHorizon, doneAt,
                    sysgc, supersededAt, objContent, variantKey, cmpPhase, cmpInputs>>
     /\ UNCHANGED ingestVars
+    /\ UNCHANGED windowVars
     /\ NoGc
 
 \* The publish. Deliberately unguarded by the lease: nothing between the listing
@@ -807,6 +887,7 @@ PublishRewrite(id) ==
                    erasureRequested, tombRetiredAt, dreqHorizon, doneAt, sysgc,
                    leaseOwner, rwInputs, cmpPhase, cmpInputs>>
     /\ UNCHANGED ingestVars
+    /\ UNCHANGED windowVars
     /\ NoGc
 
 \* The lease expires under a pass that has already listed. ADR-0065 decision 2:
@@ -823,6 +904,7 @@ ExpireLease ==
                    sysgc, supersededAt, objContent, variantKey, rwPhase, rwInputs,
                    cmpPhase, cmpInputs>>
     /\ UNCHANGED ingestVars
+    /\ UNCHANGED windowVars
     /\ NoGc
 
 \* --- Compaction actor (maintainer) --------------------------------------------
@@ -883,6 +965,7 @@ StartCompaction ==
                    query, erasureRequested, tombRetiredAt, dreqHorizon, doneAt,
                    sysgc, supersededAt, objContent, variantKey, rwPhase, rwInputs>>
     /\ UNCHANGED ingestVars
+    /\ UNCHANGED windowVars
     /\ NoGc
 
 \* The compaction publish, unguarded for the same reason PublishRewrite is: the
@@ -915,6 +998,7 @@ PublishCompaction ==
                    erasureRequested, tombRetiredAt, dreqHorizon, doneAt, sysgc,
                    variantKey, leaseOwner, rwPhase, rwInputs, cmpInputs>>
     /\ UNCHANGED ingestVars
+    /\ UNCHANGED windowVars
     /\ NoGc
 
 \* A listed compaction whose recorded input vanished between listing and publish
@@ -937,19 +1021,32 @@ CancelCompaction ==
                    sysgc, supersededAt, objContent, variantKey, leaseOwner,
                    rwPhase, rwInputs>>
     /\ UNCHANGED ingestVars
+    /\ UNCHANGED windowVars
     /\ NoGc
 
 \* Switch the HEAD onto the live record sets, dropping the superseded objects (a
 \* fold advancing). It may lag arbitrarily behind the publish that superseded them.
+\* Both HEAD-publishing actions start the cache delay for every object the new
+\* HEAD drops (head_cache_ttl). The update is skipped at HeadCacheTtl = 0, where
+\* it could never enable a cached pin, so cacheUntil stays at Init.
+CacheDropped(newHead) ==
+    cacheUntil' = IF HeadCacheTtl = 0
+                      THEN cacheUntil
+                      ELSE [o \in DataObjects |->
+                              IF o \in head /\ o \notin newHead
+                                  THEN clock + HeadCacheTtl
+                                  ELSE cacheUntil[o]]
+
 HeadAdvanceRewrite ==
     /\ LiveRecordSets # {}
     /\ head \cap superseded # {}
     /\ head' = (head \ superseded) \cup LiveRecordSets
+    /\ CacheDropped((head \ superseded) \cup LiveRecordSets)
     /\ UNCHANGED storeVars
     /\ UNCHANGED <<headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   maintVars, ingestPhase, ingestAckScope, ingestLate>>
+                   maintVars, ingestPhase, ingestAckScope, ingestLate, marker>>
     /\ NoGc
 
 \* Complete the erasure: write .done only when the served set no longer serves the
@@ -994,6 +1091,7 @@ CompleteErasure ==
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, sysgc, supersededAt, objContent, variantKey,
                    maintVars, ingestPhase, ingestAckScope, ingestLate>>
+    /\ UNCHANGED windowVars
     /\ CompletionWitness
 
 --------------------------------------------------------------------------------
@@ -1013,6 +1111,7 @@ OpenBucket ==
                    query, erasureRequested, tombRetiredAt, dreqHorizon, doneAt,
                    sysgc, supersededAt, objContent, variantKey, maintVars,
                    ingestAckScope, ingestLate>>
+    /\ UNCHANGED windowVars
     /\ NoGc
 
 \* The bucket seals once its seal bound has elapsed (erasure_seal_wait_bound_ns).
@@ -1026,6 +1125,7 @@ SealBucket ==
                    query, erasureRequested, tombRetiredAt, dreqHorizon, doneAt,
                    sysgc, supersededAt, objContent, variantKey, maintVars,
                    ingestAckScope, ingestLate>>
+    /\ UNCHANGED windowVars
     /\ NoGc
 
 \* A subject's pre-acknowledgement record lands in the still-open bucket and
@@ -1043,6 +1143,7 @@ IngestLateWrite ==
                    query, erasureRequested, tombRetiredAt, dreqHorizon, doneAt,
                    sysgc, supersededAt, objContent, variantKey, maintVars,
                    ingestPhase, ingestAckScope>>
+    /\ UNCHANGED windowVars
     /\ NoGc
 
 \* A later pass rewrites the now-sealed bucket, dropping the erased subject's
@@ -1058,6 +1159,7 @@ RewriteOpenBucket ==
                    query, erasureRequested, tombRetiredAt, dreqHorizon, doneAt,
                    sysgc, supersededAt, objContent, variantKey, maintVars,
                    ingestPhase, ingestAckScope>>
+    /\ UNCHANGED windowVars
     /\ NoGc
 
 --------------------------------------------------------------------------------
@@ -1073,6 +1175,7 @@ RetireBucket ==
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
                    maintVars, ingestPhase, ingestAckScope, ingestLate>>
+    /\ UNCHANGED windowVars
     /\ NoGc
 
 \* Fold reconciles a retired bucket out of the HEAD; it may lag (a late fold) and
@@ -1084,11 +1187,12 @@ DropRetiredBucketFromHead ==
     /\ clock >= tombRetiredAt["b1"] + FoldRetentionWindow
     /\ \E o \in head : Bucket(o) = "b1"
     /\ head' = {o \in head : Bucket(o) # "b1"}
+    /\ CacheDropped({o \in head : Bucket(o) # "b1"})
     /\ UNCHANGED storeVars
     /\ UNCHANGED <<headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   maintVars, ingestPhase, ingestAckScope, ingestLate>>
+                   maintVars, ingestPhase, ingestAckScope, ingestLate, marker>>
     /\ NoGc
 
 \* Retention physical sweep of one b1 data object. Gates on now >= retired_at +
@@ -1101,10 +1205,126 @@ DropRetiredBucketFromHead ==
 \* block here too, stricter than the shipped gate). A failed hold refresh skips
 \* the whole tick. A held object is never swept. Base additionally respects an
 \* in-window pinned query (HorizonGuardsPinnedQueries); candidate #1133 sets
-\* that FALSE.
+\* that FALSE. Under WindowGate the delete also needs an aged marker whose
+\* anchor matches (WindowPermits, below).
 QueryPermits(o) ==
     HorizonGuardsPinnedQueries =>
         ~(query.active /\ clock <= query.deadline /\ o \in query.needs)
+
+\* --- ADR-1133 window gate (issue #2339) ---------------------------------------
+\* Decision 3's window, max_query_duration + head_cache_ttl + 4 * sigma, with the
+\* two negative controls that each drop part of it.
+WindowLength ==
+    MaxQueryDuration
+      + (IF WindowNoCacheDelay THEN 0 ELSE HeadCacheTtl)
+      + (IF WindowSingleSkew THEN 1 ELSE 4) * ClockSkew
+
+AnchorOf(k) == IF k \in Buckets THEN tombRetiredAt[k] ELSE supersededAt[k]
+
+NamedByHead(k) ==
+    IF k \in Buckets THEN \E x \in EffectiveHead : Bucket(x) = k
+                     ELSE k \in EffectiveHead
+
+RetentionCandidate(b) ==
+    /\ PresentObj("tombB1")
+    /\ clock >= tombRetiredAt[b] + sysgc.ph
+    /\ clock >= tombRetiredAt[b] + SweepRetentionWindow
+    /\ \E o \in DataObjects : Bucket(o) = b /\ PresentObj(o)
+
+SupersededCandidate(o) ==
+    /\ o \in superseded
+    /\ PresentObj(o)
+    /\ clock >= supersededAt[o] + sysgc.ph
+
+\* Decision 1's trigger: a pass that would run (readable HEAD, refresh not
+\* failed) finds k past its horizon and not named by the live HEAD.
+GatedCandidate(k) ==
+    /\ HeadReadable
+    /\ ~refreshFailed
+    /\ ~NamedByHead(k)
+    /\ IF k \in Buckets THEN RetentionCandidate(k) ELSE SupersededCandidate(k)
+
+\* The gate, on the deleting sweeper's clock: observed + window <= now. True time
+\* is `clock`. `lead` is decision 3's deleting-sweeper sigma: that sweeper's clock
+\* may run up to ClockSkew ahead of true time. marker[k].obs already carries the
+\* writer's lag and the ClockSkew shift (WriteMarker), so with the shift moved to
+\* the right-hand side this is (writer reading) + WindowLength <= clock + lead.
+WindowPermits(k) ==
+    \/ ~WindowGate
+    \/ /\ marker[k].present
+       /\ (MarkerIgnoresAnchor \/ marker[k].anchor = AnchorOf(k))
+       /\ \E lead \in 0..ClockSkew :
+              marker[k].obs + WindowLength <= clock + ClockSkew + lead
+
+\* A marker body the writer's clock produced: `lag` is decision 3's marker-writer
+\* sigma, the writer's clock running up to ClockSkew behind true time.
+FreshMarker(k, lag) ==
+    [present |-> TRUE, obs |-> clock + ClockSkew - lag, anchor |-> AnchorOf(k)]
+
+\* Every marker action changes the marker alone.
+MarkerStepRest ==
+    /\ UNCHANGED storeVars
+    /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
+                   refreshFailed, query, erasureRequested, tombRetiredAt,
+                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
+                   maintVars, ingestPhase, ingestAckScope, ingestLate, cacheUntil>>
+    /\ NoGc
+
+\* Decision 1: the first pass that finds k a candidate writes its marker
+\* (CreateIfAbsent; AlreadyExists keeps the existing one, so this needs none).
+WriteMarker(k) ==
+    /\ WindowGate
+    /\ ~marker[k].present
+    /\ GatedCandidate(k)
+    /\ \E lag \in 0..ClockSkew : marker' = [marker EXCEPT ![k] = FreshMarker(k, lag)]
+    /\ MarkerStepRest
+
+\* Decision 2: a marker written for another anchor counts as absent; it is
+\* deleted and a fresh one written, restarting the window. One step here: split,
+\* the intermediate state has no marker and WriteMarker writes the same body.
+\* MarkerIgnoresAnchor drops this and accepts the marker as it stands.
+RenewMarker(k) ==
+    /\ WindowGate
+    /\ ~MarkerIgnoresAnchor
+    /\ marker[k].present
+    /\ marker[k].anchor # AnchorOf(k)
+    /\ GatedCandidate(k)
+    /\ \E lag \in 0..ClockSkew : marker' = [marker EXCEPT ![k] = FreshMarker(k, lag)]
+    /\ MarkerStepRest
+
+\* Decision 5: a pass that finds k named by HEAD again deletes its marker; a later
+\* unnamed observation writes a fresh one through WriteMarker.
+ClearRenamedMarker(k) ==
+    /\ WindowGate
+    /\ marker[k].present
+    /\ HeadReadable
+    /\ ~refreshFailed
+    /\ NamedByHead(k)
+    /\ marker' = [marker EXCEPT ![k] = NoMarker]
+    /\ MarkerStepRest
+
+\* A marker under k written for some other anchor: decision 2's older sweeper
+\* that deleted a tombstone or record by the old rule, or decision 6's re-rooted
+\* chain group. The model reproduces neither producer. It lets such a marker
+\* appear under any key whose marker is absent, with the oldest reading the
+\* variable can hold (obs 0), which covers both.
+StaleMarker(k) ==
+    /\ WindowGate
+    /\ ~marker[k].present
+    /\ marker' = [marker EXCEPT ![k] = [present |-> TRUE, obs |-> 0,
+                                        anchor |-> StaleAnchor]]
+    /\ MarkerStepRest
+
+\* State constraint for window-gate.cfg and its negative controls: prunes the
+\* erasure request, the open ingest bucket and legal holds. None of them reaches
+\* the retention or superseded delete gate except to block it (a hold) or to add
+\* a second superseding pass (the erasure rewrite) through the same
+\* SupersededSweep the compaction already drives. It is what lets MaxClock reach
+\* a full window; README.md lists what the reduction leaves out.
+WindowGateScope ==
+    /\ ~PresentObj("dreqR1")
+    /\ ingestPhase = "absent"
+    /\ heldBuckets = {}
 
 RetentionSweep(o) ==
     /\ HeadReadable
@@ -1118,12 +1338,14 @@ RetentionSweep(o) ==
     /\ \A x \in EffectiveHead : Bucket(x) # "b1"
     /\ ~HeldObject(o, heldBuckets)
     /\ QueryPermits(o)
+    /\ WindowPermits(Bucket(o))
     /\ S!Delete(o)
     /\ GcWitness("retention", {o})
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
                    maintVars, ingestPhase, ingestAckScope, ingestLate>>
+    /\ UNCHANGED windowVars
 
 \* Final tombstone delete (finding 3, round four): physical_sweep deletes the
 \* bucket's data, verifies via bucket_is_empty_but_tombstone that only the
@@ -1133,7 +1355,9 @@ RetentionSweep(o) ==
 \* RetentionSweep uses (HeadReadable, EffectiveHead not naming the bucket),
 \* the same LeaseCheck instance the data deletes used (is_protected on the
 \* tombstone key, so a failed refresh fails closed here too), and the bucket
-\* holding nothing but the tombstone.
+\* holding nothing but the tombstone. The bucket's marker goes in the same step
+\* (decision 6 deletes it just before retire.tmb); without WindowGate it is
+\* already NoMarker and the assignment changes nothing.
 SweepTombstone ==
     /\ HeadReadable
     /\ (RefreshFailureSweepsAnyway \/ ~refreshFailed)
@@ -1142,10 +1366,11 @@ SweepTombstone ==
     /\ \A o \in DataObjects : Bucket(o) = "b1" => ~PresentObj(o)
     /\ S!Delete("tombB1")
     /\ GcWitness("tombstone", {"tombB1"})
+    /\ marker' = [marker EXCEPT !["b1"] = NoMarker]
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   maintVars, ingestPhase, ingestAckScope, ingestLate>>
+                   maintVars, ingestPhase, ingestAckScope, ingestLate, cacheUntil>>
 
 --------------------------------------------------------------------------------
 \* Physical GC actor (maintainer): superseded-input sweep and .dreq sweep
@@ -1158,7 +1383,9 @@ SweepTombstone ==
 \* 1, round four -- an absent HEAD used to block here too, stricter than the
 \* shipped gate). The delete is horizon-gated (sweep.rs skips a record younger
 \* than the protection horizon) and respects an in-window pinned query.
-\* SupersededSweepUngated drops the head-membership check.
+\* SupersededSweepUngated drops the head-membership check. Under WindowGate the
+\* delete also needs WindowPermits(o), and the object's marker goes with it
+\* (decision 6); without WindowGate the marker is already NoMarker.
 SupersededGatePasses(o) ==
     IF SupersededSweepUngated THEN TRUE ELSE o \notin EffectiveHead
 
@@ -1171,12 +1398,14 @@ SupersededSweep(o) ==
     /\ (DeleteBeforeHorizon \/ clock >= supersededAt[o] + sysgc.ph)
     /\ QueryPermits(o)
     /\ SupersededGatePasses(o)
+    /\ WindowPermits(o)
     /\ S!Delete(o)
     /\ GcWitness("superseded", {o})
+    /\ marker' = [marker EXCEPT ![o] = NoMarker]
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   maintVars, ingestPhase, ingestAckScope, ingestLate>>
+                   maintVars, ingestPhase, ingestAckScope, ingestLate, cacheUntil>>
 
 \* .dreq sweep: delete the .dreq when a matching .done exists, its completed
 \* timestamp is non-zero, the horizon has passed, no reader (the current HEAD or
@@ -1203,6 +1432,7 @@ DreqSweep ==
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
                    maintVars, ingestPhase, ingestAckScope, ingestLate>>
+    /\ UNCHANGED windowVars
 
 --------------------------------------------------------------------------------
 Next ==
@@ -1231,6 +1461,10 @@ Next ==
     \/ SweepTombstone
     \/ \E o \in SupersededCandidates : SupersededSweep(o)
     \/ DreqSweep
+    \/ \E k \in MarkerKeys : WriteMarker(k)
+    \/ \E k \in MarkerKeys : RenewMarker(k)
+    \/ \E k \in MarkerKeys : ClearRenamedMarker(k)
+    \/ \E k \in MarkerKeys : StaleMarker(k)
 
 Spec == Init /\ [][Next]_vars
 
@@ -1542,7 +1776,8 @@ EventuallySwept ==
     \A o \in SupersededCandidates :
         <>[](o \in superseded /\ ~HeldObject(o, heldBuckets)
              /\ (DeleteBeforeHorizon \/ clock >= supersededAt[o] + sysgc.ph)
-             /\ QueryPermits(o) /\ SupersededGatePasses(o) /\ HeadReadable
+             /\ QueryPermits(o) /\ SupersededGatePasses(o) /\ WindowPermits(o)
+             /\ HeadReadable
              /\ (RefreshFailureSweepsAnyway \/ ~refreshFailed)) ~>
             ~PresentObj(o)
 
