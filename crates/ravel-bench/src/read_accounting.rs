@@ -36,7 +36,7 @@ use futures::stream::BoxStream;
 
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta as RavelObjectMeta,
-    ObjectStoreBackend, PageToken, PutOptions, PutOutcome, StoreError,
+    ObjectStoreBackend, PageToken, Pin, PinnedRead, PutOptions, PutOutcome, StoreError,
 };
 
 use object_store::path::Path as OsPath;
@@ -52,11 +52,22 @@ use object_store::{
 /// head-flavored `get_opts` calls) separately: these move no bytes and are
 /// not GETs, but a reader that pays a HEAD round trip per object should not
 /// hide it.
+///
+/// `pinned_get_count`/`pinned_get_bytes` track `get_pinned`/`get_with_pin`
+/// calls (the Parquet reader's conditional read path, issue #2391)
+/// separately from an unconditional `get`, but a pinned read is still one GET
+/// on the wire: it also bumps `get_count`/`get_bytes`, so those stay totals
+/// across every read path rather than undercounting whichever path a caller
+/// used. `pin_of_count` tracks `pin_of` calls and, for the same reason,
+/// bumps `head_count` too: a `pin_of` is one HEAD on the wire.
 #[derive(Debug, Default)]
 pub struct Counters {
     get_count: AtomicU64,
     get_bytes: AtomicU64,
     head_count: AtomicU64,
+    pinned_get_count: AtomicU64,
+    pinned_get_bytes: AtomicU64,
+    pin_of_count: AtomicU64,
 }
 
 impl Counters {
@@ -69,23 +80,57 @@ impl Counters {
         self.head_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A `get_pinned`/`get_with_pin` call: one GET on the wire, so this also
+    /// bumps `get_count`/`get_bytes` via [`Self::record_get`].
+    fn record_pinned_get(&self, bytes: u64) {
+        self.pinned_get_count.fetch_add(1, Ordering::Relaxed);
+        self.pinned_get_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.record_get(bytes);
+    }
+
+    /// A `pin_of` call: one HEAD on the wire, so this also bumps `head_count`
+    /// via [`Self::record_head`].
+    fn record_pin_of(&self) {
+        self.pin_of_count.fetch_add(1, Ordering::Relaxed);
+        self.record_head();
+    }
+
     /// Number of GET requests issued to the inner store since the last
-    /// [`reset`](Self::reset).
+    /// [`reset`](Self::reset). Includes pinned reads
+    /// ([`Self::pinned_get_count`]): this is the total GET count regardless
+    /// of which read path a caller used.
     pub fn get_count(&self) -> u64 {
         self.get_count.load(Ordering::Relaxed)
     }
 
-    /// Total bytes returned across all GET requests.
+    /// Total bytes returned across all GET requests, pinned reads included.
     pub fn get_bytes(&self) -> u64 {
         self.get_bytes.load(Ordering::Relaxed)
     }
 
     /// Number of HEAD (size-probe) requests issued to the inner store.
+    /// Includes `pin_of` calls ([`Self::pin_of_count`]): this is the total
+    /// HEAD count regardless of which call made it.
     pub fn head_count(&self) -> u64 {
         self.head_count.load(Ordering::Relaxed)
     }
 
-    /// A snapshot of the three counters as `(gets, bytes, heads)`.
+    /// Number of `get_pinned`/`get_with_pin` calls issued to the inner store.
+    pub fn pinned_get_count(&self) -> u64 {
+        self.pinned_get_count.load(Ordering::Relaxed)
+    }
+
+    /// Total bytes returned across all `get_pinned`/`get_with_pin` calls.
+    pub fn pinned_get_bytes(&self) -> u64 {
+        self.pinned_get_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Number of `pin_of` calls issued to the inner store.
+    pub fn pin_of_count(&self) -> u64 {
+        self.pin_of_count.load(Ordering::Relaxed)
+    }
+
+    /// A snapshot of the three original counters as `(gets, bytes, heads)`.
     pub fn snapshot(&self) -> (u64, u64, u64) {
         (self.get_count(), self.get_bytes(), self.head_count())
     }
@@ -96,6 +141,9 @@ impl Counters {
         self.get_count.store(0, Ordering::Relaxed);
         self.get_bytes.store(0, Ordering::Relaxed);
         self.head_count.store(0, Ordering::Relaxed);
+        self.pinned_get_count.store(0, Ordering::Relaxed);
+        self.pinned_get_bytes.store(0, Ordering::Relaxed);
+        self.pin_of_count.store(0, Ordering::Relaxed);
     }
 }
 
@@ -152,6 +200,37 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for CountingBackend<S> {
         Ok(outcome)
     }
 
+    /// Counted via [`Counters::record_pinned_get`]: a pinned read is still
+    /// one GET on the wire, so it also bumps the plain GET totals.
+    async fn get_pinned(
+        &self,
+        key: &str,
+        range: GetRange,
+        pin: &Pin,
+    ) -> Result<PinnedRead, StoreError> {
+        let read = self.inner.get_pinned(key, range, pin).await?;
+        self.counters
+            .record_pinned_get(read.outcome.data.len() as u64);
+        Ok(read)
+    }
+
+    /// Counted via [`Counters::record_pinned_get`], for the same reason as
+    /// [`Self::get_pinned`].
+    async fn get_with_pin(&self, key: &str, range: GetRange) -> Result<PinnedRead, StoreError> {
+        let read = self.inner.get_with_pin(key, range).await?;
+        self.counters
+            .record_pinned_get(read.outcome.data.len() as u64);
+        Ok(read)
+    }
+
+    /// Counted via [`Counters::record_pin_of`]: a `pin_of` is still one HEAD
+    /// on the wire, so it also bumps the plain HEAD total.
+    async fn pin_of(&self, key: &str) -> Result<(RavelObjectMeta, Pin), StoreError> {
+        let result = self.inner.pin_of(key).await?;
+        self.counters.record_pin_of();
+        Ok(result)
+    }
+
     async fn head(&self, key: &str) -> Result<RavelObjectMeta, StoreError> {
         self.counters.record_head();
         self.inner.head(key).await
@@ -159,6 +238,15 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for CountingBackend<S> {
 
     async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
         self.inner.list(prefix, page).await
+    }
+
+    async fn list_after(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        page: Option<PageToken>,
+    ) -> Result<ListPage, StoreError> {
+        self.inner.list_after(prefix, start_after, page).await
     }
 
     async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
@@ -176,6 +264,10 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for CountingBackend<S> {
             multipart: false,
             ..self.inner.capabilities()
         }
+    }
+
+    fn observed_store_time_ns(&self) -> Option<i64> {
+        self.inner.observed_store_time_ns()
     }
 }
 
@@ -286,4 +378,91 @@ impl ObjectStore for CountingObjectStore {
     // after coalescing adjacent ranges; `head` as a head-flavored get_opts),
     // so counting in `get_opts` captures every GET (and every HEAD) exactly
     // once at the granularity the inner backend actually sees.
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use ravel_object_store::memory::MemoryStore;
+
+    use super::*;
+
+    /// Issue #2391: `CountingBackend` must forward the pinned-read methods to
+    /// its inner store, never falling back to the trait's refusing default.
+    #[tokio::test]
+    async fn counting_backend_forwards_pinned_reads() {
+        let inner = MemoryStore::new();
+        inner
+            .put(
+                "k",
+                Bytes::from_static(b"hello"),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("seed key");
+        let store = CountingBackend::new(inner);
+
+        let (meta, pin) = store.inner().pin_of("k").await.expect("pin_of on inner");
+        let _ = meta;
+
+        let with_pin = store
+            .get_with_pin("k", GetRange::Full)
+            .await
+            .expect("get_with_pin");
+        assert_eq!(with_pin.outcome.data.as_ref(), b"hello");
+
+        let pinned = store
+            .get_pinned("k", GetRange::Full, &pin)
+            .await
+            .expect("get_pinned with the right pin");
+        assert_eq!(pinned.outcome.data.as_ref(), b"hello");
+
+        let wrong_pin = Pin::etag("not-the-real-etag");
+        let err = store
+            .get_pinned("k", GetRange::Full, &wrong_pin)
+            .await
+            .expect_err("a wrong ETag must be refused, not served");
+        assert!(
+            matches!(err, StoreError::PreconditionFailed),
+            "got {err:?}, want PreconditionFailed (never Unsupported)"
+        );
+    }
+
+    /// Two pinned gets (`get_with_pin` then `get_pinned`) plus one `pin_of`
+    /// must land in both the new, specific counters and the existing totals:
+    /// a pinned get is still a GET, and `pin_of` is still a HEAD.
+    #[tokio::test]
+    async fn counting_backend_counts_pinned_gets_and_pin_of_into_totals() {
+        let inner = MemoryStore::new();
+        inner
+            .put(
+                "k",
+                Bytes::from_static(b"hello"),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("seed key");
+        let store = CountingBackend::new(inner);
+
+        let with_pin = store
+            .get_with_pin("k", GetRange::Full)
+            .await
+            .expect("get_with_pin");
+        store
+            .get_pinned("k", GetRange::Full, &with_pin.pin)
+            .await
+            .expect("get_pinned with the pin get_with_pin reported");
+        store.pin_of("k").await.expect("pin_of");
+
+        let counters = store.counters();
+        assert_eq!(counters.pinned_get_count(), 2);
+        assert_eq!(counters.pin_of_count(), 1);
+        assert_eq!(counters.get_count(), 2, "a pinned get is still a GET");
+        assert_eq!(counters.head_count(), 1, "pin_of is still a HEAD");
+        assert_eq!(
+            counters.pinned_get_bytes(),
+            2 * "hello".len() as u64,
+            "two reads of a 5-byte object"
+        );
+    }
 }
