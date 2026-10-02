@@ -401,16 +401,33 @@ async fn run_ddl(
         (ddl_result, audit_result)
     });
 
-    let (ddl_result, audit_result) = handle.await.map_err(|_join_err| {
-        ServiceError::new(
-            ServiceErrorKind::Internal,
-            ApiError {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                error_type: "internal",
-                message: "ddl execution task failed unexpectedly".to_string(),
-            },
-        )
-    })?;
+    let (ddl_result, audit_result) = match handle.await {
+        Ok(results) => results,
+        Err(_join_err) => {
+            // The task panicked before its own outcome record, so the
+            // `attempted` record would otherwise stand alone. The response is
+            // a 500 either way; a failed submission here changes nothing.
+            let failed_now_ns = state.clock.now_ns();
+            let _ = controls
+                .audit(
+                    tenant_hash,
+                    failed_now_ns,
+                    &body.query,
+                    "sql",
+                    (failed_now_ns, failed_now_ns),
+                    QueryStatus::Error,
+                )
+                .await;
+            return Err(ServiceError::new(
+                ServiceErrorKind::Internal,
+                ApiError {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    error_type: "internal",
+                    message: "ddl execution task failed unexpectedly".to_string(),
+                },
+            ));
+        }
+    };
 
     match ddl_result {
         Ok(outcome) => {
