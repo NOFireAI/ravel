@@ -721,7 +721,6 @@ async fn the_observing_pass_writes_no_marker_and_holds_until_the_window_passes()
     let delete_pass = |now: i64| {
         let store = &store;
         let config = config.clone();
-        let b = b.clone();
         async move {
             sweep_superseded(
                 store,

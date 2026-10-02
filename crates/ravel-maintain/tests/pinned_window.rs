@@ -341,24 +341,7 @@ async fn superseded_group_is_held_until_its_marker_ages() {
     let marker_key = keys::record_unnamed_marker_key(&record_key).expect("marker key");
 
     let t1 = compacted_at + config.protection_horizon_ns + 1;
-    let sweep = |now: i64| {
-        let store = &store;
-        let config = config.clone();
-        let b = b.clone();
-        async move {
-            sweep_superseded(
-                store,
-                &FixedClock::new(now),
-                &config,
-                &NoLeases,
-                &b.tenant_hash,
-                b.signal,
-                b.shard,
-            )
-            .await
-            .expect("rule 2")
-        }
-    };
+    let sweep = |now: i64| superseded_at(&store, &config, &b, now);
 
     let first = sweep(t1).await;
     assert_eq!((first.records_deleted, first.data_deleted), (0, 0));
