@@ -1022,6 +1022,11 @@ pub struct SqlExecutor {
     /// installs a `ravel_pqtable::clock::FixedClock` with
     /// [`Self::with_clock`] to drive that elapsed time deterministically.
     clock: Arc<dyn Clock>,
+    /// The `min_grace_ms` `execute_ddl` passes to `ravel_pqtable::writer::apply`,
+    /// replacing [`crate::ddl::DEFAULT_MIN_GRACE_MS`] when set. `None` (the
+    /// [`SqlExecutor::new`] default) keeps that constant; the server installs
+    /// the deployment's own sweep grace with [`Self::with_ddl_min_grace_ms`].
+    ddl_min_grace_ms: Option<u64>,
 }
 
 /// One tenant's memory accountant plus the last-touch stamp idle-tenant
@@ -1056,6 +1061,7 @@ impl SqlExecutor {
             declared_source: default_declared_source(),
             parquet: None,
             clock: Arc::new(SystemClock),
+            ddl_min_grace_ms: None,
         }
     }
 
@@ -1109,6 +1115,25 @@ impl SqlExecutor {
     /// default.
     pub fn clock(&self) -> &Arc<dyn Clock> {
         &self.clock
+    }
+
+    /// Install the `min_grace_ms` `execute_ddl` passes to
+    /// `ravel_pqtable::writer::apply`, replacing
+    /// [`crate::ddl::DEFAULT_MIN_GRACE_MS`]. This is the seam the server
+    /// threads the deployment's own sweep grace (`sys/gc`'s
+    /// `max_query_duration`, in milliseconds) through, without changing
+    /// [`Self::new`]'s signature or any existing call site.
+    pub fn with_ddl_min_grace_ms(mut self, min_grace_ms: u64) -> Self {
+        self.ddl_min_grace_ms = Some(min_grace_ms);
+        self
+    }
+
+    /// The `min_grace_ms` `execute_ddl` passes to
+    /// `ravel_pqtable::writer::apply`: [`Self::with_ddl_min_grace_ms`]'s
+    /// value, or [`crate::ddl::DEFAULT_MIN_GRACE_MS`] when none was set.
+    pub fn ddl_min_grace_ms(&self) -> u64 {
+        self.ddl_min_grace_ms
+            .unwrap_or(crate::ddl::DEFAULT_MIN_GRACE_MS)
     }
 
     /// Install the source of per-tenant declared typed attribute columns for the

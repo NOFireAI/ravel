@@ -217,7 +217,10 @@ pub use spans_schema::{
 };
 pub use spill::{OperatorSpill, SpillCounts, SpillScratch};
 pub use udf::{label_match_udf, label_udf};
-pub use validate::{DdlIntent, DdlValidationError, ValidationError, validate_ddl, validate_query};
+pub use validate::{
+    DdlIntent, DdlValidationError, StatementKind, ValidationError, statement_kind, validate_ddl,
+    validate_query,
+};
 
 /// The internal provenance column names, in scan-output order after the
 /// four public columns. Consumed by [`dedup::RsegDedupExec`] and dropped
