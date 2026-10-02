@@ -7219,4 +7219,107 @@ mod tick_tests {
             "expected ZeroEvalInterval, got: {err:#}"
         );
     }
+
+    /// A distributed-fetch double for the per-rule entry-clock test: records
+    /// the query deadline each slice carries (what the coordinator mints every
+    /// fragment capability's expiry from), then moves the evaluator's clock
+    /// forward by `takes_ns`, as a slow rule query does, and answers with an
+    /// empty slice.
+    struct SlowSliceRecorder {
+        clock: Arc<TestClock>,
+        takes_ns: i64,
+        deadlines: parking_lot::Mutex<Vec<i64>>,
+    }
+
+    #[async_trait]
+    impl ravel_query::distrib::client::SliceFetcher for SlowSliceRecorder {
+        async fn fetch(
+            &self,
+            request: ravel_proto::queryfrag::v1::FetchRequest,
+        ) -> Result<
+            ravel_query::distrib::client::SliceResponse,
+            ravel_query::distrib::client::DistribError,
+        > {
+            self.deadlines.lock().push(request.deadline_unix_ns);
+            self.clock.advance(self.takes_ns);
+            Ok(ravel_query::distrib::client::SliceResponse {
+                scalar: Vec::new(),
+                histogram: Vec::new(),
+                partials: Vec::new(),
+                accounting: ravel_types::accounting::QueryAccountingSnapshot::default(),
+                stats: ravel_query::FetchStats::default(),
+                series_returned: 0,
+                samples_returned: 0,
+                status: ravel_proto::queryfrag::v1::status::Code::Ok,
+                status_message: String::new(),
+            })
+        }
+    }
+
+    /// Issue #2385: rules run one after another in a tick, so each rule's
+    /// query deadline, and every fragment capability minted from it, counts
+    /// from that rule's own engine entry, not from the tick's start. The first
+    /// rule's query takes 7 s of the injected clock; the second rule's slice
+    /// carries its own entry (tick start plus 7 s) plus the query deadline.
+    ///
+    /// Mutation proof: passing the tick's `now_ns` to the engine again in
+    /// `run_query` records the tick start plus the deadline for both rules.
+    #[tokio::test]
+    async fn each_rules_query_deadline_counts_from_its_own_engine_entry() {
+        const TAKES_NS: i64 = 7 * NS_PER_SEC;
+        let store = seeded_store().await;
+        let clock = TestClock::at(NOW_NS);
+        let recorder = Arc::new(SlowSliceRecorder {
+            clock: clock.clone(),
+            takes_ns: TAKES_NS,
+            deadlines: parking_lot::Mutex::new(Vec::new()),
+        });
+        let distributed = Arc::new(ravel_query::distrib::Distributed::new(
+            recorder.clone(),
+            // Zero thresholds put the one-segment snapshot on the distributed
+            // path for every rule.
+            ravel_query::distrib::partition::DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 1,
+            },
+        ));
+        let catalog =
+            Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+        let engine = QueryEngine::new(catalog, Arc::clone(&store), EngineConfig::default())
+            .with_distributed(distributed);
+        let config = AlertEvalConfig {
+            enabled: true,
+            ..AlertEvalConfig::default()
+        };
+        let second = Rule {
+            rule_id: "high-cpu-second".to_string(),
+            ..threshold_rule()
+        };
+        let mut evaluator = AlertEvaluator::new(
+            store,
+            AlertQueryEngines {
+                promql: Arc::new(engine),
+                #[cfg(feature = "sql")]
+                sql: None,
+            },
+            clock.clone(),
+            TenantId::new(TENANT).hash(),
+            vec![threshold_rule(), second],
+            &config,
+        )
+        .expect("build evaluator")
+        .with_metrics(Arc::new(AlertMetrics::default()));
+
+        let report = evaluator.run_tick().await;
+
+        assert_eq!(report.rules_evaluated, 2, "{report:?}");
+        let deadline_ns =
+            i64::try_from(DEFAULT_QUERY_DEADLINE.as_nanos()).expect("deadline fits in i64");
+        assert_eq!(
+            *recorder.deadlines.lock(),
+            vec![NOW_NS + deadline_ns, NOW_NS + TAKES_NS + deadline_ns],
+            "each rule's slice carries its own entry plus the query deadline"
+        );
+    }
 }

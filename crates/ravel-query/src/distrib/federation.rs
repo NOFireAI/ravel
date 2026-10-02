@@ -1327,4 +1327,84 @@ mod tests {
             "a tenant no remote names federates nothing"
         );
     }
+
+    /// A remote that stopped the request at the query's deadline after
+    /// spending `spend_bytes`, recording the deadline each request carried.
+    struct StoppedAtDeadlineFetcher {
+        spend_bytes: u64,
+        deadlines: Arc<std::sync::Mutex<Vec<i64>>>,
+    }
+
+    #[async_trait]
+    impl SliceFetcher for StoppedAtDeadlineFetcher {
+        async fn fetch(&self, r: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+            self.deadlines
+                .lock()
+                .expect("deadlines lock")
+                .push(r.deadline_unix_ns);
+            let spent = QueryAccounting::new();
+            spent.record_s3_request(ravel_types::accounting::AccountedOp::Get);
+            spent.add_s3_bytes(ravel_types::accounting::AccountedOp::Get, self.spend_bytes);
+            Ok(SliceResponse {
+                scalar: Vec::new(),
+                histogram: Vec::new(),
+                partials: Vec::new(),
+                accounting: spent.snapshot(),
+                stats: FetchStats::default(),
+                series_returned: 0,
+                samples_returned: 0,
+                status: pb::status::Code::Timeout,
+                status_message: "stopped at the deadline".to_string(),
+            })
+        }
+    }
+
+    /// Issue #2385: the Resolve request carries the deadline the caller
+    /// passed, and a remote that stopped at it fails the query with
+    /// `DeadlineExceeded` even under `skip_unavailable`, after its spend is
+    /// folded into the query's handle.
+    ///
+    /// Mutation proof: `deadline_unix_ns: 0` on the request records 0;
+    /// deleting the `Timeout` arm fails the query with `Federation` instead.
+    #[tokio::test]
+    async fn a_remote_stopped_at_the_deadline_fails_the_query_and_reports_its_spend() {
+        const DEADLINE_NS: i64 = 1_700_000_005_000_000_000;
+        let deadlines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fed = one_remote(
+            Arc::new(StoppedAtDeadlineFetcher {
+                spend_bytes: 8_192,
+                deadlines: Arc::clone(&deadlines),
+            }),
+            true,
+            Duration::from_secs(5),
+        );
+        let accounting = QueryAccounting::new();
+        let err = fed
+            .fetch(
+                TenantHash([1u8; 16]),
+                Signal::Metrics,
+                Vec::new(),
+                Vec::new(),
+                0,
+                1_000,
+                Vec::new(),
+                accounting.clone(),
+                EngineConfig::default(),
+                DEADLINE_NS,
+            )
+            .await
+            .expect_err("a remote stopped at the deadline is never skipped");
+
+        assert!(
+            matches!(err, QueryError::DeadlineExceeded { .. }),
+            "{err:?}"
+        );
+        assert_eq!(
+            *deadlines.lock().expect("deadlines lock"),
+            vec![DEADLINE_NS]
+        );
+        let folded = accounting.snapshot();
+        assert_eq!(folded.total_s3_requests(), 1);
+        assert_eq!(folded.total_s3_bytes(), 8_192);
+    }
 }

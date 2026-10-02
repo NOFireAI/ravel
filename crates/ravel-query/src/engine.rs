@@ -7221,6 +7221,207 @@ mod prefetch_tests {
         );
     }
 
+    /// Issue #2385: every federated Resolve request carries the query's own
+    /// deadline, entry plus the request deadline, on the instant, range, and
+    /// series-discovery paths, so a remote cluster stops reading for the query
+    /// when the query stops.
+    ///
+    /// Mutation proof: putting `deadline_unix_ns: 0` back on the Resolve request
+    /// in `Federation::fetch` records three zeros.
+    #[tokio::test]
+    async fn federated_requests_carry_the_request_deadline() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        publish_metric(
+            &store,
+            tenant_hash,
+            1,
+            "metric_a",
+            BASE_NS - NS_PER_MIN,
+            1.0,
+        )
+        .await;
+        let deadlines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let federation = Arc::new(crate::distrib::Federation::new(vec![
+            crate::distrib::RemoteCluster {
+                name: "eu-west".to_string(),
+                fetcher: Arc::new(RecordingDeadline {
+                    deadlines: Arc::clone(&deadlines),
+                }),
+                tenant: None,
+                skip_unavailable: false,
+                soft_timeout: Duration::from_secs(60),
+            },
+        ]));
+        let eng = engine_with_config(
+            Arc::clone(&store),
+            EngineConfig {
+                deadline: Duration::from_secs(60),
+                ..EngineConfig::default()
+            },
+        )
+        .with_federation(federation);
+        let request_deadline = Duration::from_secs(5);
+
+        eng.instant_with_stats(
+            tenant_hash,
+            "metric_a",
+            BASE_MS,
+            &[],
+            BASE_NS,
+            request_deadline,
+        )
+        .await
+        .expect("instant");
+        eng.range_with_stats(
+            tenant_hash,
+            "metric_a",
+            BASE_MS - 60_000,
+            BASE_MS,
+            15_000,
+            &[],
+            BASE_NS,
+            request_deadline,
+        )
+        .await
+        .expect("range");
+        let _discovered = eng
+            .resolve_series(
+                tenant_hash,
+                &[name_matcher("metric_a")],
+                TimeRange {
+                    start_ns: BASE_NS - 60 * NS_PER_MIN,
+                    end_ns: BASE_NS,
+                },
+                &[],
+                BASE_NS,
+                request_deadline,
+            )
+            .await
+            .expect("series");
+
+        assert_eq!(
+            *deadlines.lock().expect("deadlines lock"),
+            vec![BASE_NS + 5 * NS_PER_SEC; 3],
+            "one Resolve request per query, each carrying entry plus the 5 s request deadline"
+        );
+    }
+
+    /// A slice fetcher double whose every slice ended `TIMEOUT`: a worker or a
+    /// remote cluster stopped it at the query's deadline after spending
+    /// `spend_bytes`.
+    struct StoppedAtDeadline {
+        spend_bytes: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::distrib::client::SliceFetcher for StoppedAtDeadline {
+        async fn fetch(
+            &self,
+            _request: ravel_proto::queryfrag::v1::FetchRequest,
+        ) -> Result<crate::distrib::client::SliceResponse, crate::distrib::client::DistribError>
+        {
+            let spent = QueryAccounting::new();
+            spent.record_s3_request(ravel_types::accounting::AccountedOp::Get);
+            spent.add_s3_bytes(ravel_types::accounting::AccountedOp::Get, self.spend_bytes);
+            Ok(crate::distrib::client::SliceResponse {
+                scalar: Vec::new(),
+                histogram: Vec::new(),
+                partials: Vec::new(),
+                accounting: spent.snapshot(),
+                stats: crate::fetcher::FetchStats::default(),
+                series_returned: 0,
+                samples_returned: 0,
+                status: ravel_proto::queryfrag::v1::status::Code::Timeout,
+                status_message: "stopped at the deadline".to_string(),
+            })
+        }
+    }
+
+    /// Issue #2385: a slice stopped at the query's deadline fails the query
+    /// with `DeadlineExceeded` carrying the request's own deadline, the error
+    /// the engine's own timer raises, on the distributed instant path and the
+    /// federated discovery path.
+    ///
+    /// Mutation proof: deleting the `Timeout` arm from `Distributed::fetch`
+    /// (`distrib/mod.rs`) fails the instant query with `Distrib`; deleting it
+    /// from `Federation::fetch` fails discovery with `Federation`; putting
+    /// discovery's `map_err` back in `resolve_series_with_stats` in place of
+    /// `unify_deadline` reports a zero deadline.
+    #[tokio::test]
+    async fn a_slice_stopped_at_the_deadline_fails_the_query_with_its_deadline() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        publish_metric(
+            &store,
+            tenant_hash,
+            1,
+            "metric_a",
+            BASE_NS - NS_PER_MIN,
+            1.0,
+        )
+        .await;
+        let request_deadline = Duration::from_secs(5);
+
+        let distributed = Arc::new(crate::distrib::Distributed::new(
+            Arc::new(StoppedAtDeadline { spend_bytes: 4_096 }),
+            crate::distrib::partition::DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 1,
+            },
+        ));
+        let eng = engine_with_config(Arc::clone(&store), EngineConfig::default())
+            .with_distributed(distributed);
+        let err = eng
+            .instant_with_stats(
+                tenant_hash,
+                "metric_a",
+                BASE_MS,
+                &[],
+                BASE_NS,
+                request_deadline,
+            )
+            .await
+            .expect_err("a slice stopped at the deadline fails the query");
+        assert!(
+            matches!(err, QueryError::DeadlineExceeded { deadline } if deadline == request_deadline),
+            "distributed: {err:?}"
+        );
+
+        let federation = Arc::new(crate::distrib::Federation::new(vec![
+            crate::distrib::RemoteCluster {
+                name: "eu-west".to_string(),
+                fetcher: Arc::new(StoppedAtDeadline { spend_bytes: 4_096 }),
+                tenant: None,
+                // A remote that stopped at the deadline is not an unavailable
+                // remote to skip: the query is over either way.
+                skip_unavailable: true,
+                soft_timeout: Duration::from_secs(60),
+            },
+        ]));
+        let eng = engine_with_config(Arc::clone(&store), EngineConfig::default())
+            .with_federation(federation);
+        let err = eng
+            .resolve_series(
+                tenant_hash,
+                &[name_matcher("metric_a")],
+                TimeRange {
+                    start_ns: BASE_NS - 60 * NS_PER_MIN,
+                    end_ns: BASE_NS,
+                },
+                &[],
+                BASE_NS,
+                request_deadline,
+            )
+            .await
+            .expect_err("a remote stopped at the deadline fails discovery");
+        assert!(
+            matches!(err, QueryError::DeadlineExceeded { deadline } if deadline == request_deadline),
+            "federated discovery: {err:?}"
+        );
+    }
+
     /// ADR-0071 failure semantics: a slice reporting `SNAPSHOT_INVALIDATED`
     /// makes the coordinator re-resolve and re-dispatch the *whole* query
     /// exactly once, then give up with `SnapshotInvalidated` -- it does not

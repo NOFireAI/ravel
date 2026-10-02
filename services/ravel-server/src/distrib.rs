@@ -2798,8 +2798,10 @@ mod tests {
     }
 
     /// Each reject reason fires independently, increments only its own labeled
-    /// counter, refuses the request with `Unauthenticated`, and short-circuits
-    /// before the request is served (so `fragment_requests_total` stays 0).
+    /// counter, refuses the request, and short-circuits before the request is
+    /// served (so `fragment_requests_total` stays 0). Every reason but `Expired`
+    /// refuses with `Unauthenticated`; `Expired` refuses in-band with a
+    /// zero-spend `TIMEOUT` summary.
     #[tokio::test]
     async fn each_capability_reject_reason_is_labeled_and_counted() {
         let now = 1_000;
@@ -2860,10 +2862,18 @@ mod tests {
         for case in cases {
             let metrics = Arc::new(FragmentMetrics::new());
             let service = capability_service(now, test_keys(), metrics.clone());
-            let err = pinned_fetch(&service, case.request)
-                .await
-                .expect_err("a mismatched capability is rejected");
-            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            let outcome = pinned_fetch(&service, case.request).await;
+            if case.reason == CapabilityReject::Expired {
+                // The query the capability was minted for is over: refused
+                // in-band as the deadline, with nothing spent, so the
+                // coordinator does not route around a healthy worker.
+                let response = outcome.expect("an expired capability is refused in-band");
+                assert_eq!(response.status, pb::status::Code::Timeout);
+                assert_eq!(response.accounting, QueryAccountingSnapshot::default());
+            } else {
+                let err = outcome.expect_err("a mismatched capability is rejected");
+                assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            }
             assert_eq!(
                 metrics.capability_rejects(case.reason),
                 1,
@@ -7214,7 +7224,9 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
     /// A worker over one published segment, reading through a hold-capable
     /// `FaultStore` behind an issued-call counter, with a `Pinned` admission
     /// class of one and a clock the test moves, plus the `Pinned` request for
-    /// that segment carrying a capability that expires at [`EXPIRES_NS`].
+    /// that segment carrying a capability that expires at [`EXPIRES_NS`], and
+    /// a federated Resolve request for the same tenant, authorized by
+    /// [`PEER_TOKEN`] and carrying [`EXPIRES_NS`] as its query deadline.
     struct ExpiryFixture {
         service: FragmentService,
         admission: AdmissionClasses,
@@ -7223,7 +7235,12 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         fault: Arc<ravel_object_store::fault::FaultStore<Arc<MemoryStore>>>,
         issued: Arc<IssuedCalls>,
         request: pb::FetchRequest,
+        resolve_request: pb::FetchRequest,
+        data_key: String,
     }
+
+    /// The tenant credential a federating peer presents to the fixture.
+    const PEER_TOKEN: &str = "peer-token";
 
     async fn expiry_fixture(name: &str) -> ExpiryFixture {
         let memory = Arc::new(MemoryStore::new());
@@ -7245,9 +7262,13 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         let clock = SteppedClock::new(EXPIRY_NOW_NS);
         let catalog =
             Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+        let peer: Arc<dyn TenantResolver> =
+            Arc::new(ravel_query::http::StaticBearerTokenResolver::new(
+                std::collections::HashMap::from([(PEER_TOKEN.to_string(), tenant.clone())]),
+            ));
         let service = FragmentService::new(
             test_keys(),
-            empty_resolver(),
+            peer,
             admission.clone(),
             catalog,
             store,
@@ -7266,6 +7287,8 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
             query,
             EXPIRES_NS,
         );
+        let mut resolve_request = resolve_request(tenant.hash(), 2 * HOUR_NS);
+        resolve_request.deadline_unix_ns = EXPIRES_NS;
         ExpiryFixture {
             service,
             admission,
@@ -7274,6 +7297,8 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
             fault,
             issued,
             request,
+            resolve_request,
+            data_key: seg.data_object_key,
         }
     }
 
@@ -7299,8 +7324,9 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
     }
 
     /// A capability valid on arrival that expires while its request waits for
-    /// admission is refused once admitted, with verification's own `Expired`
-    /// reject and status, and the slice issues zero store requests.
+    /// admission is refused once admitted, in-band with a zero-spend `TIMEOUT`
+    /// summary, counted under verification's own `Expired` reason, and the
+    /// slice issues zero store requests.
     #[tokio::test]
     async fn a_capability_that_expires_in_admission_is_refused_before_any_store_request() {
         let fx = expiry_fixture("expires-in-admission").await;
@@ -7332,12 +7358,13 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
             0,
             "no store request for a dead capability"
         );
-        let status = outcome.expect_err("an expired capability is refused");
-        assert_eq!(status.code(), tonic::Code::Unauthenticated, "{status}");
+        let response = outcome.expect("an expired capability is refused in-band");
+        assert_eq!(response.status, pb::status::Code::Timeout);
         assert_eq!(
-            status.message(),
-            "fragment request rejected: capability expired"
+            response.status_message,
+            "fragment request refused: capability expired"
         );
+        assert_eq!(response.accounting, QueryAccountingSnapshot::default());
         assert_eq!(
             fx.metrics.capability_rejects(CapabilityReject::Expired),
             1,
@@ -7351,7 +7378,12 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
     }
 
     /// A slice whose capability expires while its first store request is in
-    /// flight issues no further store request, and ends `DeadlineExceeded`.
+    /// flight issues no further store request, and ends in-band with a
+    /// `TIMEOUT` summary.
+    ///
+    /// Mutation proof: answering a slice `run_until_deadline` stopped with a
+    /// gRPC `deadline_exceeded` status again, as before #2385, fails the
+    /// `expect` on the in-band response.
     #[tokio::test]
     async fn a_capability_that_expires_mid_run_stops_the_slice_before_its_next_store_request() {
         use ravel_object_store::fault::{Occurrence, Op};
@@ -7381,12 +7413,258 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
             1,
             "no store request is issued after the expiry"
         );
-        let status = outcome.expect_err("a slice past its expiry ends with a status");
-        assert_eq!(status.code(), tonic::Code::DeadlineExceeded, "{status}");
+        let response = outcome.expect("a slice past its expiry ends in-band");
+        assert_eq!(response.status, pb::status::Code::Timeout);
+        assert_eq!(
+            response.series_returned, 0,
+            "no result read before the stop"
+        );
         assert_eq!(
             fx.metrics.capability_rejects(CapabilityReject::Expired),
             0,
             "admitted live, so this is the run's bound, not a capability reject"
+        );
+    }
+
+    /// A slice stopped at its expiry reports what it spent before the stop
+    /// (issue #1723): its data GET was issued, and is counted at issue, before
+    /// the expiry, so the `TIMEOUT` summary carries exactly that one request.
+    ///
+    /// Mutation proof: building the summary from a zero snapshot instead of
+    /// the run's `spent` handle in `run_until_deadline` reads 0 requests.
+    #[tokio::test]
+    async fn a_slice_stopped_at_its_expiry_reports_the_request_it_had_issued() {
+        use ravel_object_store::fault::{Occurrence, Op};
+
+        let fx = expiry_fixture("expires-with-spend").await;
+        let gate = fx
+            .fault
+            .hold(Op::Get, Some(fx.data_key.clone()), Occurrence::Nth(1));
+        let service = fx.service.clone();
+        let request = fx.request.clone();
+        let fetch = tokio::spawn(async move { pinned_fetch(&service, request).await });
+        gate.wait_until_held(1).await;
+        assert_eq!(
+            fx.issued.issued(),
+            2,
+            "the record GET, then the held data GET"
+        );
+
+        fx.clock.set(EXPIRES_NS);
+        for id in gate.held() {
+            gate.release(id);
+        }
+        let response = fetch
+            .await
+            .expect("fetch task")
+            .expect("a slice past its expiry ends in-band");
+
+        assert_eq!(response.status, pb::status::Code::Timeout);
+        assert_eq!(
+            response
+                .accounting
+                .s3_requests(ravel_types::accounting::AccountedOp::Get),
+            1,
+            "the data GET issued before the stop; the record GET is off the slice's budget"
+        );
+        assert_eq!(response.accounting.total_s3_requests(), 1);
+    }
+
+    /// Issue #2385 on the federation path: a Resolve request whose query
+    /// deadline has already passed is refused in-band before any store
+    /// request, and is not a capability reject (it carries no capability).
+    ///
+    /// Mutation proof: ignoring the request's `deadline_unix_ns` on the
+    /// Resolve arm of `FragmentService::fetch` (the pre-#2385 unbounded run)
+    /// serves the slice `Ok`.
+    #[tokio::test]
+    async fn a_federated_fetch_past_its_deadline_is_refused_before_any_store_request() {
+        let fx = expiry_fixture("federated-past-deadline").await;
+        let mut request = fx.resolve_request.clone();
+        request.deadline_unix_ns = EXPIRY_NOW_NS;
+
+        let response = fetch_decoded(&fx.service, request, PEER_TOKEN)
+            .await
+            .expect("refused in-band");
+
+        assert_eq!(response.status, pb::status::Code::Timeout);
+        assert_eq!(
+            response.status_message,
+            "federated fetch refused: the query's deadline has passed"
+        );
+        assert_eq!(fx.issued.issued(), 0, "no store request past the deadline");
+        assert_eq!(fx.metrics.fragment_requests_total(), 0);
+        for reason in CapabilityReject::ALL {
+            assert_eq!(fx.metrics.capability_rejects(reason), 0);
+        }
+    }
+
+    /// Issue #2385 on the federation path: an admitted Resolve slice stops at
+    /// the query deadline the federating coordinator sent, issues no store
+    /// request after it, and ends in-band with `TIMEOUT` carrying the data GET
+    /// it had issued. The control run on a fresh fixture shows the same
+    /// request, with its deadline still ahead, is served `Ok`.
+    ///
+    /// Mutation proof: as for the refusal test above, an unbounded Resolve run
+    /// ends `Ok` with the series instead of `TIMEOUT`.
+    #[tokio::test]
+    async fn a_federated_fetch_stops_at_its_deadline_and_reports_its_spend() {
+        use ravel_object_store::fault::{Occurrence, Op};
+
+        let control = expiry_fixture("federated-control").await;
+        let served = fetch_decoded(
+            &control.service,
+            control.resolve_request.clone(),
+            PEER_TOKEN,
+        )
+        .await
+        .expect("served");
+        assert_eq!(
+            served.status,
+            pb::status::Code::Ok,
+            "{}",
+            served.status_message
+        );
+        assert_eq!(served.series_returned, 1);
+
+        let fx = expiry_fixture("federated-mid-run").await;
+        let gate = fx
+            .fault
+            .hold(Op::Get, Some(fx.data_key.clone()), Occurrence::Nth(1));
+        let service = fx.service.clone();
+        let request = fx.resolve_request.clone();
+        let fetch = tokio::spawn(async move { fetch_decoded(&service, request, PEER_TOKEN).await });
+        gate.wait_until_held(1).await;
+        let issued_before_stop = fx.issued.issued();
+
+        fx.clock.set(EXPIRES_NS);
+        for id in gate.held() {
+            gate.release(id);
+        }
+        let response = fetch
+            .await
+            .expect("fetch task")
+            .expect("a federated slice past its deadline ends in-band");
+
+        assert_eq!(response.status, pb::status::Code::Timeout);
+        assert_eq!(response.series_returned, 0);
+        assert_eq!(
+            fx.issued.issued(),
+            issued_before_stop,
+            "no store request is issued after the deadline"
+        );
+        assert_eq!(
+            response.accounting.total_s3_requests(),
+            1,
+            "the held data GET, counted at issue"
+        );
+    }
+
+    /// Issue #2385, the coordinator half: a remote worker that ends a slice
+    /// `TIMEOUT` (it stopped at the query's deadline) ends the query.
+    ///
+    /// Both live workers answer the same way, so the total attempt count is
+    /// the re-dispatch check whichever of them ranks first. The coordinator's
+    /// local fragment service reads through its own call counter, so zero
+    /// there means no local read of the slice; the quarantine map and the
+    /// re-dispatch and fallback counters say the worker was not treated as
+    /// dead. The fragment stats entry carries the stopped attempt's spend, and
+    /// the query fails `DeadlineExceeded` with its own request deadline.
+    ///
+    /// Mutation proof: classifying a `TIMEOUT` summary as `Attempt::Retry` in
+    /// `try_remote`, which is how a transport loss is handled, sends the slice
+    /// down the re-dispatch ladder to a local read that answers the query, so
+    /// the `expect_err` below fails.
+    #[tokio::test]
+    async fn a_worker_stopped_at_the_deadline_ends_the_query_without_a_retry() {
+        const PAID: Spend = Spend {
+            get_requests: 2,
+            get_bytes: 6_144,
+            raw_f64_pages: 0,
+            raw_f64_bytes: 0,
+        };
+        let memory = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new("stopped-at-deadline".to_string());
+        publish_metric(memory.as_ref(), &tenant, HOUR_NS).await;
+        let now = 4 * HOUR_NS;
+        let backing: Arc<dyn ObjectStoreBackend> = memory.clone();
+        let local_store = Arc::new(IssuedCalls {
+            inner: backing.clone(),
+            calls: AtomicU64::new(0),
+        });
+
+        let (endpoint_a, tries_a, _keep_a) =
+            spawn_scripted(PAID, pb::status::Code::Timeout, Ending::Summary).await;
+        let (endpoint_b, tries_b, _keep_b) =
+            spawn_scripted(PAID, pb::status::Code::Timeout, Ending::Summary).await;
+        let worker = |id: u128, endpoint: &str| QueryWorkerRecord {
+            process_id: uuid::Uuid::from_u128(id).to_string(),
+            fragment_endpoint: endpoint.to_string(),
+            flight_sql_endpoint: endpoint.to_string(),
+            protocol_version: codec::PROTOCOL_VERSION,
+            started_unix_ns: 0,
+        };
+        let metrics = Arc::new(FragmentMetrics::new());
+        let routing = Arc::new(RoutingSliceFetcher::new(
+            Arc::new(OnceLock::new()),
+            Arc::new(RwLock::new(Arc::new(vec![
+                worker(7, &endpoint_a),
+                worker(8, &endpoint_b),
+            ]))),
+            test_keys(),
+            pinned_service(local_store.clone(), now),
+            metrics.clone(),
+        ));
+        let distributed = Arc::new(ravel_query::distrib::Distributed::new(
+            routing.clone(),
+            ravel_query::distrib::partition::DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 1,
+            },
+        ));
+        let catalog =
+            Arc::new(Catalog::new(backing.clone(), CatalogConfig::default()).expect("catalog"));
+        let engine =
+            ravel_query::QueryEngine::new(catalog, backing, ravel_query::EngineConfig::default())
+                .with_distributed(distributed);
+
+        let request_deadline = Duration::from_secs(5);
+        let t_ms = (HOUR_NS + 30_000_000_000) / 1_000_000;
+        let sink = FragmentStatsSink::new();
+        let outcome = with_fragment_stats(
+            sink.clone(),
+            engine.instant_with_stats(tenant.hash(), "m", t_ms, &[], now, request_deadline),
+        )
+        .await;
+
+        let err = outcome.expect_err("a slice stopped at the deadline ends the query");
+        assert!(
+            matches!(err, ravel_query::QueryError::DeadlineExceeded { deadline } if deadline == request_deadline),
+            "{err:?}"
+        );
+        assert_eq!(
+            tries_a.load(Ordering::Relaxed) + tries_b.load(Ordering::Relaxed),
+            1,
+            "dispatched once and never re-dispatched"
+        );
+        assert_eq!(
+            local_store.issued(),
+            0,
+            "the coordinator issued no local read for the slice"
+        );
+        assert!(
+            routing.quarantine.lock().is_empty(),
+            "a worker that stopped at the deadline is healthy, not quarantined"
+        );
+        assert_eq!(metrics.quarantine_current(), 0);
+        assert_eq!(metrics.slices_redispatched_total(), 0);
+        assert_eq!(metrics.slices_fallback_total(), 0);
+        let recorded = sink.take();
+        assert_eq!(recorded.len(), 1, "one slice, one entry: {recorded:?}");
+        assert_eq!(
+            recorded[0].bytes_reported, PAID.get_bytes,
+            "the stopped attempt's spend is reported"
         );
     }
 }

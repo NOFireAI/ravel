@@ -5058,6 +5058,7 @@ fn every_terminal_slice_status_folds_its_spend_on_every_signal() {
             pb::status::Code::BudgetExceeded,
             pb::status::Code::Corrupt,
             pb::status::Code::Unavailable,
+            pb::status::Code::Timeout,
             // The catch-all arm: a status none of the arms above name.
             pb::status::Code::BadData,
         ];
@@ -5100,6 +5101,56 @@ fn every_terminal_slice_status_folds_its_spend_on_every_signal() {
             "these arms did not fold the spend their slice reported:\n{}",
             wrong.join("\n")
         );
+    });
+}
+
+/// Issue #2385: a slice a worker stopped at the query's deadline (`TIMEOUT`)
+/// fails the query with `DeadlineExceeded`, the error the engine's own timer
+/// raises, on every signal, never with a `Distrib` error, and the spend the
+/// worker made before the stop is folded first.
+///
+/// Mutation proof: deleting the `Timeout` arm from `Distributed::fetch`,
+/// `fetch_logs` or `fetch_spans` (`mod.rs`) sends that signal's slice to the
+/// catch-all arm, which fails the query with `Distrib`, and the list below
+/// names exactly that signal.
+#[test]
+fn a_timeout_slice_fails_the_query_with_deadline_exceeded_on_every_signal() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = MemoryStore::new();
+        let snapshot = one_slice_snapshot(&store).await;
+        let config = EngineConfig::default();
+
+        let mut wrong: Vec<String> = Vec::new();
+        for (case, signal) in [Signal::Metrics, Signal::Logs, Signal::Spans]
+            .into_iter()
+            .enumerate()
+        {
+            let case = case as u64 + 1;
+            let (outcome, folded) = folded_spend_of(
+                Arc::new(StatusSpendWorker {
+                    status: pb::status::Code::Timeout,
+                    spend: scripted_spend(case, case * 2_048),
+                }),
+                signal,
+                &snapshot,
+                &config,
+            )
+            .await;
+            if !matches!(outcome, Some(QueryError::DeadlineExceeded { .. })) {
+                wrong.push(format!("{signal:?}: failed with {outcome:?}"));
+            }
+            if folded.total_s3_bytes() != case * 2_048 || folded.total_s3_requests() != case {
+                wrong.push(format!(
+                    "{signal:?}: folded {} bytes in {} requests, the slice reported {} in {}",
+                    folded.total_s3_bytes(),
+                    folded.total_s3_requests(),
+                    case * 2_048,
+                    case
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     });
 }
 
