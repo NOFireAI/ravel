@@ -291,6 +291,52 @@ sealed and compacted, and that writer's later-published object is missed by the
 compaction. Use the override only for a tenant known to be quiescent, such as
 one whose bulk load has finished.
 
+### L1 segment size
+
+Two targets decide where the compactor closes one L1 segment and starts the
+next, and a segment closes on whichever it reaches first:
+
+- The **memory split target**, `l1_part_memory_target_bytes`, bounds the
+  decoded record heap one segment may hold while it is merged. Set it with
+  `--maintain-l1-part-memory-target-bytes` on the server and
+  `--l1-part-memory-target-bytes` on `compact-tenant`.
+- The **stored-size target**, `max_l1_part_bytes` (default 256 MiB), is the
+  cap on the encoded object size, measured by encoding the segment. Set it with
+  `--max-l1-part-bytes` on `compact-tenant`.
+
+When the memory split target is not set, it is derived from the memory budget:
+
+```text
+l1_part_memory_target_bytes = memory_budget / 8 / concurrent_merges
+                              clamped to [256 MiB, 8 GiB]
+```
+
+The server's memory budget is its resolved `memory_budget_bytes`, and its
+concurrent merges are `--maintain-unit-concurrency`. For `ravel-cli` the budget
+is the host's total memory (`MemTotal` from `/proc/meminfo`, lowered to a
+cgroup memory limit when one is set; `sysctl hw.memsize` on macOS), and the
+concurrent merges are `--bucket-concurrency` (1 for `compact-bucket`). When the
+budget cannot be read, the target falls back to 256 MiB and `ravel-cli` prints a
+note on stderr saying so. An explicit flag always wins and is used as given;
+0 is refused.
+
+Decoded heap runs far ahead of stored bytes on a wide schema, which is why the
+derivation matters. On a 104-column schema a decoded record is about 8 KiB, so
+the old fixed 256 MiB target closed segments at about 32k rows and 2.1 MB
+stored. A 4 GiB target holds about 500k rows, about 34 MB stored, sixteen times
+the rows per segment. The stored-size target stays the operator's cap: once
+segments grow toward it, lower `--max-l1-part-bytes` to bound object size
+regardless of how much memory the host has.
+
+Each run says which value it used and why. `compact-bucket` and
+`compact-tenant` print it in their report, for example
+`l1_part_memory_target_bytes: 4294967296 (resolved from a memory budget of
+34359738368 over 1 concurrent merges)` on a 32 GiB host, or
+`l1_part_memory_target_bytes: 1073741824 (set by flag)`. The server logs it
+once at startup as a `performance default resolved` line with
+`setting=l1_part_memory_target_bytes` and `source` set to `derived`, `flag` or
+`fallback`.
+
 ### Running compact-tenant beside a live cluster
 
 The background supervisor and a `compact-bucket` or `compact-tenant` run can
