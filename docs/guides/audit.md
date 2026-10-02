@@ -85,7 +85,12 @@ Attributes:
 - `query.tenant`: the hex hash of the resolved tenant, so the record is
   attributed to the tenant Ravel authenticated rather than to any identity the
   client claimed.
-- `query.status`: `ok` or `error`, the request's outcome.
+- `query.status`: `ok` or `error`, the request's outcome, or `attempted`.
+  A SQL `CREATE` or `DROP` statement that passes the `ddl` capability check
+  writes two records: `attempted` before it touches storage, then `ok` or
+  `error` with its outcome. Every other request, including a DDL statement
+  refused for the capability, writes one. To count statements rather than
+  records, leave out `attempted` rows.
 - `query.text`: the query text as that surface understands it, in the posture
   `--audit-text` selected: the SQL statement for `sql`, the PromQL expression
   for `promql` and `analytics`, the joined selector list for `labels`,
@@ -207,7 +212,9 @@ The first two read `kind = query` records, written by every query surface.
 The legal-hold query below reads records the maintenance process writes
 directly.
 
-Every statement your tenant ran in one hour, newest first:
+Every statement your tenant ran in one hour, newest first (a DDL statement's
+`attempted` record is left out, so each statement appears once, with its
+outcome):
 
 ```sql
 SELECT ts_ns,
@@ -215,6 +222,7 @@ SELECT ts_ns,
        attrs['query.text'] AS statement
 FROM audit
 WHERE attrs['kind'] = 'query'
+  AND attrs['query.status'] <> 'attempted'
   AND ts_ns >= TIMESTAMP '2026-08-19T09:00:00'
   AND ts_ns <  TIMESTAMP '2026-08-19T10:00:00'
 ORDER BY ts_ns DESC;
