@@ -2663,8 +2663,7 @@ pub async fn start_with_heartbeat(
 
     // Mounted unconditionally: the store and catalog above are built in every
     // mode, so `/metrics` is too (ADR-0044 section 4), including maintain,
-    // where today only /healthz and /readyz exist. Cloned here, before
-    // `catalog` is moved into `fold::spawn` below in every non-maintain mode.
+    // where today only /healthz and /readyz exist.
     let mut metrics_state = metrics::MetricsState {
         mode: config.mode,
         store_metrics,
@@ -2728,9 +2727,8 @@ pub async fn start_with_heartbeat(
     let mut sql_state: Option<sql::SqlState> = None;
 
     // The catalog handle the idle-tenant sweep evicts per-tenant caches from
-    // (ADR-0069 decision 2). Cloned here because `catalog` is moved into
-    // `fold::spawn` below in every non-maintain mode; the sweep is spawned
-    // afterwards and needs its own `Arc`.
+    // (ADR-0069 decision 2). The sweep runs as its own task, so it takes its
+    // own `Arc`.
     let sweep_catalog = catalog.clone();
     // One `folder_id` for every on-demand fold this process serves
     // (`/api/v1/admin/fold`, issue #785), matching `fold::spawn`'s
@@ -3210,8 +3208,7 @@ pub async fn start_with_heartbeat(
         // `None`); every internal failure degrades to "warmed less than
         // planned," never to a startup failure (see `cache_warm`'s module
         // doc). Uses the same `catalog`/`store`/`cache` handles just
-        // attached to the query paths above, cloned before `catalog` is
-        // moved into `fold::spawn` below.
+        // attached to the query paths above.
         if let Some(cache) = &cache {
             cache_warm::warm_cache(
                 store.clone(),
