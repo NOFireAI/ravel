@@ -444,6 +444,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`tenant parquet-grant add` probes a non-empty `.parquet` object inside the
+  granted location** (issue #2318). The object for the `If-Match` precondition
+  probe was the first key listed under the location, so a zero-byte folder
+  marker such as `data/` or `data/t1/` could be chosen and the probe's ranged
+  read of an empty object refused a valid location. Listing `data/t1` without a
+  trailing slash could also offer an object under `data/t10/`, outside the
+  location. The probe object now has to be admitted by the grant segment by
+  segment, end in `.parquet` and hold at least one byte; a location naming one
+  object is checked with a HEAD against the same rules, and a prefix is listed
+  with a trailing slash for up to 8 pages. The selection is
+  `ravel_pqtable::grants::one_object_under`. A location whose only keys are
+  markers, empty files or non-Parquet files is refused as holding no object.
 - **A delete against a missing S3 bucket fails instead of reporting success**
   (issue #2265). The S3 adapter read every whole-request 404 as a missing key,
   so a `DeleteObjects` answered `NoSuchBucket` returned the idempotent

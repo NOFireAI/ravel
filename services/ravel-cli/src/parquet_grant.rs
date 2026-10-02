@@ -14,13 +14,14 @@
 //!    kind. `s3://` needs an `s3` profile, `gs://` a `gcs` one, `az://` an
 //!    `azure` one. A profile of the wrong kind would reach a different service
 //!    with the same bucket name.
-//! 2. The granted location holds at least one object (the object itself, for
-//!    a location naming one), and [`probe_preconditions`] qualifies the store
-//!    on it. A store that serves a
+//! 2. The granted location holds at least one non-empty `.parquet` object
+//!    inside it (the object itself, for a location naming one), found by
+//!    [`grants::one_object_under`], and [`probe_preconditions`] qualifies the
+//!    store on it. A store that serves a
 //!    read carrying an ETag it never issued cannot pin a Parquet file, so a
 //!    manifest over it would name bytes that can change underneath a query. A
-//!    prefix with no object is refused too: there is nothing to probe, so the
-//!    grant would be admitted unqualified.
+//!    prefix with no such object is refused too: there is nothing to probe, so
+//!    the grant would be admitted unqualified.
 //! 3. [`probe_not_ravel_bucket`] qualifies the bucket itself. Anything but a
 //!    clean pass is a refusal, including an inconclusive answer: a grant on
 //!    Ravel's own bucket under another handle would let an external table read
@@ -50,19 +51,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context as _;
+use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::external::probe::{probe_not_ravel_bucket, probe_preconditions};
 use ravel_object_store::external::{ExternalKind, ExternalProfile, ExternalStore, load_profiles};
-use ravel_object_store::{ObjectStoreBackend, PageToken, StoreError};
 use ravel_pqtable::clock::Clock;
-use ravel_pqtable::grants::{self, Grant};
+use ravel_pqtable::grants::{self, Grant, MAX_PROBE_LIST_PAGES, ProbeObject};
 use ravel_types::{TenantHash, TenantId};
-
-/// How many listing pages `add` reads while looking for one object under the
-/// granted prefix. A prefix whose first objects are this far into a listing is
-/// refused rather than probed, with a refusal that says the search stopped at
-/// this bound, so the search is bounded on a bucket whose listing is dominated
-/// by keys outside the grant.
-const MAX_PROBE_LIST_PAGES: usize = 8;
 
 /// Opens the store a profile names for one bucket. [`ExternalStore::open`] in
 /// the shipping paths; a closure over an in-memory store in tests.
@@ -108,70 +102,6 @@ fn kind_admits_scheme(kind: &ExternalKind, scheme: &str) -> bool {
     )
 }
 
-/// What [`one_object_under`] found under a candidate grant.
-#[derive(Debug, PartialEq, Eq)]
-enum ProbeObject {
-    /// The key of one object the grant admits.
-    Found(String),
-    /// The listing ran to its end without one.
-    Empty,
-    /// [`MAX_PROBE_LIST_PAGES`] pages were read without one, and the listing
-    /// had more.
-    PageCapReached,
-}
-
-/// One object the candidate grant admits, looked for within
-/// [`MAX_PROBE_LIST_PAGES`] listing pages.
-///
-/// A location that did not end in `/` (`directory` false) may name one object,
-/// so its key is probed with a HEAD first: `object_store` appends `/` to every
-/// non-empty list prefix, so a listing of `data/x.parquet` never returns
-/// `data/x.parquet` itself. Without an object at that key the location is
-/// listed as a prefix. A zero-byte object at that key is listed through too:
-/// on an Azure account with a hierarchical namespace a directory is a
-/// zero-byte blob, so its HEAD succeeds, and it is not a file to probe.
-///
-/// Admission is decided by [`grants::contains_key`], the same segment-wise
-/// rule the read path applies, so a listing prefix of `data` cannot offer
-/// `data2/x.parquet` as the object to probe.
-async fn one_object_under(
-    store: &dyn ObjectStoreBackend,
-    candidate: &Grant,
-    directory: bool,
-) -> anyhow::Result<ProbeObject> {
-    if !directory && !candidate.prefix.is_empty() {
-        match store.head(&candidate.prefix).await {
-            Ok(meta) if meta.size > 0 => return Ok(ProbeObject::Found(candidate.prefix.clone())),
-            Ok(_) | Err(StoreError::NotFound) => {}
-            Err(err) => {
-                return Err(err).with_context(|| format!("reading {}", candidate.url()));
-            }
-        }
-    }
-    let mut page: Option<PageToken> = None;
-    for _ in 0..MAX_PROBE_LIST_PAGES {
-        let listed = store
-            .list(&candidate.prefix, page)
-            .await
-            .with_context(|| format!("listing {}", candidate.url()))?;
-        for meta in &listed.objects {
-            if grants::contains_key(
-                candidate,
-                &candidate.profile,
-                &candidate.bucket,
-                meta.key.as_bytes(),
-            ) {
-                return Ok(ProbeObject::Found(meta.key.clone()));
-            }
-        }
-        match listed.next {
-            Some(next) => page = Some(next),
-            None => return Ok(ProbeObject::Empty),
-        }
-    }
-    Ok(ProbeObject::PageCapReached)
-}
-
 /// Grant `url` to `profile` for `tenant`, after the checks this module's
 /// header lists. Returns the grant that was written.
 ///
@@ -209,19 +139,27 @@ pub async fn add_grant(
         created_by: created_by.to_string(),
     };
 
-    let probe_key =
-        match one_object_under(external.as_ref(), &candidate, parsed.key.directory).await? {
-            ProbeObject::Found(key) => key,
-            ProbeObject::Empty => anyhow::bail!(
-                "the location {url:?} holds no object, so the store's preconditions could not be \
-             probed on it: grant a location that already holds at least one object"
-            ),
-            ProbeObject::PageCapReached => anyhow::bail!(
-                "no object under the location {url:?} was found within the first \
+    let probe_key = match grants::one_object_under(
+        external.as_ref(),
+        &candidate,
+        &parsed.key.key,
+        parsed.key.directory,
+    )
+    .await
+    .with_context(|| format!("looking for an object to probe under {url:?}"))?
+    {
+        ProbeObject::Found(key) => key,
+        ProbeObject::Empty => anyhow::bail!(
+            "the location {url:?} holds no object, so the store's preconditions could not be \
+             probed on it: grant a location that already holds at least one non-empty \
+             .parquet object"
+        ),
+        ProbeObject::PageCapReached => anyhow::bail!(
+            "no object under the location {url:?} was found within the first \
              {MAX_PROBE_LIST_PAGES} listing pages, so the store's preconditions could not be \
              probed on it: grant a narrower location, one whose first objects are listed sooner"
-            ),
-        };
+        ),
+    };
     probe_preconditions(external.as_ref(), &probe_key)
         .await
         .with_context(|| {
@@ -344,7 +282,7 @@ mod tests {
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{
         Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
-        Pin, PinnedRead, PutOptions, PutOutcome, StoreError,
+        PageToken, Pin, PinnedRead, PutOptions, PutOutcome, StoreError,
     };
 
     use super::*;
@@ -810,7 +748,7 @@ mod tests {
             created_by: "ravel-cli".to_string(),
         };
         assert_eq!(
-            one_object_under(&external, &candidate, false)
+            grants::one_object_under(&external, &candidate, "data", false)
                 .await
                 .expect("probe"),
             ProbeObject::Found("data/part-0.parquet".to_string())
@@ -827,7 +765,7 @@ mod tests {
         for index in 0..=MAX_PROBE_LIST_PAGES {
             store
                 .put(
-                    &format!("data2/{index}.parquet"),
+                    &format!("data/{index}.txt"),
                     Bytes::from_static(b"x"),
                     PutOptions::default(),
                 )
@@ -872,7 +810,8 @@ mod tests {
 
     /// The object probed is one the grant admits: a sibling prefix sharing the
     /// grant's first characters is not offered to the probe, so an empty grant
-    /// beside a populated `data2/` is still refused as empty.
+    /// beside a populated `data2/` is still refused as empty, with or without
+    /// the trailing `/` on the location.
     #[tokio::test]
     async fn a_sibling_prefix_does_not_supply_the_probe_object() {
         let store = MemoryStore::new();
@@ -884,20 +823,87 @@ mod tests {
             )
             .await
             .expect("put");
-        let candidate = Grant {
-            profile: "prod".into(),
-            scheme: "s3".into(),
-            bucket: "customer".into(),
-            prefix: "data".into(),
-            created_unix_ns: NOW,
-            created_by: "ravel-cli".into(),
-        };
-        assert_eq!(
-            one_object_under(&store, &candidate, true)
+        let external: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        for url in ["s3://customer/data", "s3://customer/data/"] {
+            let err = add_grant(
+                &MemoryStore::new(),
+                &TenantId::new("acme").hash(),
+                &s3_profile("prod"),
+                url,
+                "ravel-cli",
+                &AtNs(NOW),
+                &opener(Arc::clone(&external)),
+            )
+            .await
+            .expect_err("must refuse");
+            assert!(
+                format!("{err:#}").contains("holds no object"),
+                "{url}: {err:#}"
+            );
+        }
+    }
+
+    /// A zero-byte folder marker listed ahead of the data, as an S3 console
+    /// writes one for `data/` and `data/t1/`, does not refuse a location that
+    /// holds a real file: the probe runs on the file, and the grant is
+    /// written. A location holding only the marker is refused as empty.
+    #[tokio::test]
+    async fn a_leading_folder_marker_does_not_refuse_a_valid_location() {
+        let external_store = MemoryStore::new();
+        for key in ["data/", "data/t1/"] {
+            external_store
+                .put(key, Bytes::new(), PutOptions::default())
                 .await
-                .expect("list"),
-            ProbeObject::Empty
-        );
+                .expect("put marker");
+        }
+        external_store
+            .put(
+                "data/t1/part-0.parquet",
+                Bytes::from_static(b"parquet bytes"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put");
+        let external: Arc<dyn ObjectStoreBackend> = Arc::new(external_store);
+        for url in ["s3://customer/data", "s3://customer/data/t1/"] {
+            let ravel = MemoryStore::new();
+            let tenant = TenantId::new("acme").hash();
+            let grant = add_grant(
+                &ravel,
+                &tenant,
+                &s3_profile("prod"),
+                url,
+                "ravel-cli",
+                &AtNs(NOW),
+                &opener(Arc::clone(&external)),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{url}: {err:#}"));
+            assert_eq!(
+                grants::list(&ravel, &tenant).await.expect("list"),
+                vec![grant],
+                "{url}"
+            );
+        }
+
+        let markers_only = MemoryStore::new();
+        markers_only
+            .put("empty/", Bytes::new(), PutOptions::default())
+            .await
+            .expect("put marker");
+        let markers_only: Arc<dyn ObjectStoreBackend> = Arc::new(markers_only);
+        let err = add_grant(
+            &MemoryStore::new(),
+            &TenantId::new("acme").hash(),
+            &s3_profile("prod"),
+            "s3://customer/empty/",
+            "ravel-cli",
+            &AtNs(NOW),
+            &opener(markers_only),
+        )
+        .await
+        .expect_err("must refuse");
+        assert!(format!("{err:#}").contains("holds no object"), "{err:#}");
     }
 
     /// Every field of a grant reaches the output `ls` prints. The exhaustive
