@@ -1830,15 +1830,31 @@ fn validated_ingest_config(config: IngestConfig, signal: Signal) -> anyhow::Resu
     Ok(config)
 }
 
-/// Runs each loop's own spawn-site interval refusal before [`start`] spawns
-/// anything, so a zero fold, maintain, alert-evaluation, or JWKS-refresh
-/// interval fails startup with that loop's typed error instead of leaving the
-/// tasks spawned ahead of it running. Mode is not consulted: the refusal holds
-/// wherever the config enables the loop, as `Cli::validate` refuses the flags.
+/// Refuses a zero fold, maintain, alert-evaluation, or JWKS-refresh interval
+/// before [`start`] spawns anything, each with that loop's typed error, so a
+/// refused start leaves no task running. The fold, maintain, and
+/// alert-evaluation intervals are refused whether or not their loop is enabled,
+/// matching `Cli::validate`, which refuses the flags in every mode and enabled
+/// state: a disabled fold's interval still feeds the on-demand fold rate gate
+/// and the fold-lag threshold, so a zero there is a misconfiguration even with
+/// the periodic loop off, and the parity keeps the library and CLI refusing the
+/// same configs. The JWKS interval is refused whenever OIDC refresh is
+/// configured. Mode is not consulted.
+///
+/// The spawn-site `check_spawnable` guards on each config skip a disabled loop
+/// (a spawn function only runs for an enabled loop); the interval checks here
+/// do not consult the enabled flag, so a disabled loop's zero interval is
+/// caught here rather than at its spawn site.
 fn validate_loop_intervals(config: &ServerConfig) -> anyhow::Result<()> {
-    config.fold.check_spawnable()?;
-    config.maintain.check_spawnable()?;
-    config.alerting.check_spawnable()?;
+    if config.fold.fold_interval.is_zero() {
+        return Err(fold::SpawnError::ZeroFoldInterval.into());
+    }
+    if config.maintain.interval.is_zero() {
+        return Err(maintain::SpawnError::ZeroMaintainInterval.into());
+    }
+    if config.alerting.interval.is_zero() {
+        return Err(alerting::SpawnError::ZeroEvalInterval.into());
+    }
     if let Some(params) = &config.oidc_refresh {
         params.check_spawnable()?;
     }
@@ -5466,19 +5482,30 @@ mod loop_interval_startup_tests {
     /// heartbeat is built but never spawned so the count measures `start`
     /// alone.
     ///
-    /// Flip to watch it fail: delete the `is_zero()` arm of a loop's
-    /// `check_spawnable`. Fold, maintain, and alert evaluation then start and
-    /// hit the `Ok` arm; JWKS refresh fails on the initial fetch with no typed
-    /// error. Deleting only the `validate_loop_intervals` call in
-    /// `start_with_heartbeat` keeps the variant but fails the task count.
+    /// The one call this test pins against is `validate_loop_intervals` in
+    /// `start_with_heartbeat`: it refuses every zero interval before anything is
+    /// spawned. Flip to watch it fail: delete that call. The fold and
+    /// alert-evaluation cases then fail the task-count assertion, because
+    /// `Mode::All` spawns the audit pipeline before their own spawn site reaches
+    /// its `check_spawnable` refusal; the JWKS case fails the variant assertion,
+    /// because the initial JWKS fetch against the closed loopback port errors
+    /// before `spawn_jwks_refresh` runs, with no typed error. Not every loop
+    /// fails through the task count, so each loop's own spawn-site guard is
+    /// pinned separately by the `spawn_refuses_a_zero_*_interval` test in that
+    /// loop's module.
+    ///
+    /// The config is built before `alive_before` is read, so a config builder
+    /// that ever spawned a task could not inflate the baseline and pass this
+    /// test falsely.
     #[tokio::test]
     async fn start_with_heartbeat_refuses_each_zero_interval_before_spawning() {
         for which in LOOPS {
             let store = memory_store();
+            let config = zero_interval_config(which);
             let metrics = tokio::runtime::Handle::current().metrics();
             let alive_before = metrics.num_alive_tasks();
             let result = start_with_heartbeat(
-                zero_interval_config(which),
+                config,
                 store.clone(),
                 store,
                 Arc::new(StoreMetrics::default()),
@@ -5530,5 +5557,45 @@ mod loop_interval_startup_tests {
                 "{which:?}: expected the typed zero-interval refusal, got: {err:#}"
             );
         }
+    }
+
+    /// A fold loop that is DISABLED but carries a zero `fold_interval` is still
+    /// refused by [`start`] with the fold variant: the interval feeds the
+    /// on-demand fold rate gate and the fold-lag threshold even when the
+    /// periodic loop never runs, so `validate_loop_intervals` refuses it
+    /// regardless of the enabled flag, exactly as `Cli::validate` refuses the
+    /// flag. The spawn-site `check_spawnable` would skip a disabled loop, so
+    /// only the mode-independent check catches this.
+    ///
+    /// Flip to watch it fail: on the pre-fix branch `validate_loop_intervals`
+    /// called `config.fold.check_spawnable()`, which returned `Ok` for a
+    /// disabled loop, so this config started.
+    #[tokio::test]
+    async fn start_refuses_a_zero_fold_interval_even_when_fold_is_disabled() {
+        let mut config = zero_interval_config(Loop::Fold);
+        config.fold = FoldTaskConfig {
+            enabled: false,
+            fold_interval: Duration::ZERO,
+        };
+        let store = memory_store();
+        let result = start(
+            config,
+            store.clone(),
+            store,
+            Arc::new(StoreMetrics::default()),
+            None,
+        )
+        .await;
+        let err = match result {
+            Err(err) => err,
+            Ok(running) => {
+                running.shutdown().await.expect("server shuts down");
+                panic!("a disabled fold with a zero interval must refuse startup");
+            }
+        };
+        assert!(
+            is_zero_interval_refusal(Loop::Fold, &err),
+            "expected the typed fold refusal, got: {err:#}"
+        );
     }
 }

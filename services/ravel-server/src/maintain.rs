@@ -1187,7 +1187,11 @@ impl MaintenanceOwnershipMetrics {
 pub struct MaintenanceTaskConfig {
     pub enabled: bool,
     /// Pause between maintenance passes (`--maintain-interval-secs`). A zero
-    /// interval is refused at startup with [`SpawnError::ZeroMaintainInterval`].
+    /// interval is refused at startup with [`SpawnError::ZeroMaintainInterval`],
+    /// whether or not the loop is enabled: `validate_loop_intervals` checks it
+    /// regardless of `enabled`, matching `Cli::validate`.
+    /// [`check_spawnable`](Self::check_spawnable) re-refuses it at the enabled
+    /// loop's spawn site.
     pub interval: Duration,
     pub shard_count: u32,
     /// Compactor knobs (seal margin, part cap, grace, protection horizon).
@@ -9947,6 +9951,49 @@ mod tests {
                     tasks.shutdown().await;
                     panic!("{case} must be refused at spawn, not handed to the heartbeat task");
                 }
+            }
+        }
+    }
+
+    /// [`spawn`] refuses an enabled config with a zero `interval` directly at
+    /// its spawn site with [`SpawnError::ZeroMaintainInterval`], before any task
+    /// is spawned, with the default (non-zero) heartbeat so the refusal is the
+    /// interval and not the heartbeat. `maintain` is a `pub` module, so an
+    /// outside caller reaches this function without passing through
+    /// `validate_loop_intervals`.
+    ///
+    /// Flip to watch it fail: delete the `config.check_spawnable()?` call in
+    /// [`spawn`]. The function then proceeds past the interval on a zero and
+    /// spawns the maintenance supervisor.
+    #[tokio::test]
+    async fn spawn_refuses_a_zero_maintain_interval() {
+        let stored_gc = ravel_maintain::GcConfigValues::maintain_defaults();
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let worker = Arc::new(WorkerSet::with_defaults(0));
+        let config = MaintenanceTaskConfig {
+            enabled: true,
+            interval: Duration::ZERO,
+            ..MaintenanceTaskConfig::default()
+        };
+        match spawn(
+            Arc::clone(&store),
+            Vec::new(),
+            config,
+            stored_gc,
+            Arc::new(TenantDiscoveryMetrics::default()),
+            Arc::new(MaintenanceSafetyMetrics::default()),
+            Arc::new(MaintenanceOwnershipMetrics::new(
+                DEFAULT_STALLED_AFTER_INTERVALS,
+            )),
+            Arc::clone(&worker),
+            Arc::new(watch::channel(worker.solo_live_set()).0),
+            Arc::new(WallClock),
+        ) {
+            Err(SpawnError::ZeroMaintainInterval) => {}
+            Err(other) => panic!("expected ZeroMaintainInterval, got: {other}"),
+            Ok(tasks) => {
+                tasks.shutdown().await;
+                panic!("a zero maintain interval must be refused at spawn");
             }
         }
     }
