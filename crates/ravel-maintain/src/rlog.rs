@@ -7203,21 +7203,28 @@ mod tests {
         .await
     }
 
-    /// A rerun that cuts parts at a different memory split target than the
-    /// winning run cannot restore a winner part that went missing, and the
-    /// error names the flags to pin to the winner's values (issue #2351). The
-    /// same rerun at the winner's target restores the part and converges.
+    /// Drives the library build-and-publish path (`build_parts` then
+    /// `publish_record`, through `rebuild_and_publish`) over a bucket whose
+    /// winner record already exists, as a future repair would. No shipped
+    /// command reaches this path: `compact_bucket` returns `AlreadyCompacted`
+    /// once the bucket listing carries a compaction record (issue #2370).
+    ///
+    /// On that path a rebuild that cuts parts at a different memory split
+    /// target than the winning run cannot restore a winner part that went
+    /// missing, and the error names the settings a repair must reproduce and
+    /// says no shipped command performs it (issue #2351). The same rebuild at
+    /// the winner's target restores the part and converges.
     ///
     /// Distinguishing:
-    /// - The pre-#2351 remedy text ("Re-run the compaction: the rerun rebuilds
-    ///   the byte-identical part", no flag named): the flag assertions fail.
+    /// - A remedy text that tells the operator to re-run the compaction, or
+    ///   names no setting: the needle assertions fail.
     /// - A remedy naming only the CLI flag: the `ravel-server` flag assertion
     ///   fails.
     /// - Part boundaries that did not depend on the memory target: the
-    ///   mismatched rerun rebuilds the missing key, converges, and the
+    ///   mismatched rebuild restores the missing key, converges, and the
     ///   `expect_err` fails.
     #[tokio::test]
-    async fn rerun_with_another_memory_target_names_the_flags_to_pin() {
+    async fn library_rebuild_with_another_memory_target_names_the_settings_to_reproduce() {
         let store = MemoryStore::new();
         for (writer_id, seq, recs) in admission_mixed_fixture() {
             seed(&store, writer_id, seq, &recs).await;
@@ -7248,10 +7255,13 @@ mod tests {
         assert_eq!(part_key, &victim);
         let text = err.to_string();
         for needle in [
-            "with the part-split settings the winning run used",
-            "--l1-part-memory-target-bytes (ravel-server: --maintain-l1-part-memory-target-bytes)",
+            "No shipped command repairs this today",
+            "return AlreadyCompacted as soon as the bucket listing carries a compaction record",
+            "issue #2370",
+            "ravel-cli hold set --tenant <tenant> --signal <signal> --shard <shard>",
+            "--l1-part-memory-target-bytes, ravel-server: --maintain-l1-part-memory-target-bytes",
             "--max-l1-part-bytes",
-            "--compaction-zstd-level (ravel-server: --maintain-compaction-zstd-level)",
+            "--compaction-zstd-level, ravel-server: --maintain-compaction-zstd-level",
         ] {
             assert!(text.contains(needle), "{needle:?} missing from: {text}");
         }

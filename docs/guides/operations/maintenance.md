@@ -294,12 +294,14 @@ one whose bulk load has finished.
 ### L1 segment size
 
 Two targets decide where the compactor closes one L1 segment and starts the
-next, and a segment closes on whichever it reaches first:
+next. A log segment closes on whichever it reaches first; a span merge reads
+only the memory split target and a metrics merge only the stored-size target:
 
 - The **memory split target**, `l1_part_memory_target_bytes`, sizes the
   decoded record heap one segment holds while it is merged. It is a split
   point, not a ceiling: a span merge checks it only between traces, so a
-  segment can run past it by a whole trace. Set it with
+  segment can run past it by a whole trace. A metrics merge does not read it.
+  Set it with
   `--maintain-l1-part-memory-target-bytes` on the server and
   `--l1-part-memory-target-bytes` on `compact-bucket` and `compact-tenant`.
 - The **stored-size target**, `max_l1_part_bytes` (default 256 MiB), is the
@@ -332,16 +334,32 @@ merge. `compact-bucket` therefore derives 1 GiB on an 8 GiB host and keeps
 `--maintain-unit-concurrency` of 4 keeps 256 MiB up to 10 GiB of memory (its
 budget is memory less a 2 GiB reserve).
 
-Segment boundaries depend on both targets and, for logs, on the compaction zstd
-level, and none of them is part of a compaction record's identity. Two
-processes that resolve different targets cut the same bucket into different
-segments: on a 30 GiB host the server derives 896 MiB per merge and
-`compact-bucket` 3.75 GiB. When a run fails with "compaction converged on a
-prior record that references part ... which is absent", rebuilding that part
-reproduces its key only with the values the run that wrote the record used:
-`--l1-part-memory-target-bytes`, `--max-l1-part-bytes` and
-`--compaction-zstd-level`. The record writer's report or startup log names the
-memory target it resolved.
+Which setting decides segment boundaries depends on the codec. Logs (RLOG) read
+the RLOG memory split target and the stored-size cap, and their segment bytes
+also depend on the compaction zstd level. Spans (RSPAN) read the span merge's
+memory split target only: 256 MiB unless `--l1-part-memory-target-bytes` was
+set explicitly, and the `rspan_l1_part_memory_target_bytes` line names it.
+Metrics (RSEG) read the stored-size cap only and never read a memory target.
+None of them is part of a compaction record's identity. Two processes that
+resolve different log targets cut the same bucket into different segments: on
+a 30 GiB host at the default unit concurrency of 4 the server derives 896 MiB
+per merge and `compact-bucket` 3.75 GiB.
+
+When a run fails with "compaction converged on a prior record that references
+part ... which is absent" (or with the `AlreadyExists` variant that says the
+part was gone when HEAD-verified), the message names the settings that decide
+part boundaries: rebuilding that part reproduces its key only with the values
+the run that wrote the record used. The record writer's report or startup log
+names the memory target it resolved. No shipped command rebuilds the part
+today: once a bucket's listing carries a compaction record,
+`compact-bucket`, `compact-tenant` and the server's maintenance loop return
+`AlreadyCompacted` and build nothing, so re-running them with other flags
+changes nothing. The record keeps pointing at the absent part, and the
+superseded-input sweep deletes the bucket's L0 inputs once the record is older
+than the protection horizon, which turns the gap into data loss. Meanwhile,
+hold the inputs with a [legal hold](#legal-hold) on that shard
+(`ravel-cli hold set --tenant <id> --signal <signal> --shard <n>`) until a
+repair command ships.
 
 Decoded heap runs far ahead of stored bytes on a wide schema, which is why the
 derivation matters. On a 104-column schema a decoded record is about 8 KiB, so

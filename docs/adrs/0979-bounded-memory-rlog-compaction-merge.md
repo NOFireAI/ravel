@@ -192,16 +192,21 @@ gets `AlreadyExists` for all of them, and retaining all their bytes would
 recreate the full-output term this decision exists to kill, in exactly
 the recovery scenario. So no bytes are retained for the exception either.
 If the post-publish HEAD finds an `AlreadyExists` part missing, the run
-fails loud with a typed error whose remedy is a re-run — and the re-run
-converges without needing any retained bytes at all: it rebuilds
-byte-identical parts (provided it runs with the part-split settings the
-first run used; see the #2351 amendment), and its PUT of the deleted key is a FRESH put (the
-key is absent, so `AlreadyExists` cannot recur for it) that restores the
-part and resets its age BEFORE the record resolution runs. Every part the
-winner record references is then either still present or just re-PUT, so
-`resolve_already_exists` finds nothing to repair; the repair-from-bytes
-arm is never the rerun's convergence mechanism, and its no-bytes warn arm
-is unreachable on this path. The steady-state
+fails loud with a typed error. The repair this design relies on needs no
+retained bytes at all: a build-and-publish pass over the same inputs
+rebuilds byte-identical parts (provided it runs with the part-split
+settings the first run used; see the #2351 amendment), and its PUT of the
+deleted key is a FRESH put (the key is absent, so `AlreadyExists` cannot
+recur for it) that restores the part and resets its age BEFORE the record
+resolution runs. Every part the winner record references is then either
+still present or just re-PUT, so `resolve_already_exists` finds nothing to
+repair; the repair-from-bytes arm is never that pass's convergence
+mechanism, and its no-bytes warn arm is unreachable on this path. That
+pass is reachable only through the library's build-and-publish path and
+from no shipped command: `compact-bucket`, `compact-tenant` and the
+server's maintenance loop return `AlreadyCompacted` as soon as the bucket
+listing carries a compaction record, so a rerun of any of them builds
+nothing and raises no error (issue #2370; see the #2351 amendment). The steady-state
 memory bound is therefore unchanged in every path, the tombstone race is
 closed by verification rather than retention, and the two owed tests are
 the `FaultStore` tombstone interleaving and the all-parts-`AlreadyExists`
@@ -407,8 +412,11 @@ key. `CreateIfAbsent` picks one winner:
   compaction-path loser that already released bytes (D3) logs the existing
   "cannot repair" warning. Correctness is unaffected either way — the record
   is the truth and the resolver reconstructs part keys from it; a missing
-  part surfaces as `SnapshotInvalidated` → re-resolve, and re-running the
-  compactor rebuilds and re-PUTs the identical object.
+  part surfaces as `SnapshotInvalidated` → re-resolve. The identical object
+  can be rebuilt and re-PUT only by the library's build-and-publish path
+  and with the winning run's part-split settings; no shipped command does
+  it, since a rerun returns `AlreadyCompacted` (#2351 amendment, issue
+  #2370).
 - *Fail-closed arm unchanged:* two records with different `input_set_hash`
   in one bucket remain `InputSetHashDivergence` (alarm and stop), and the
   resolver's include-both-and-alarm behavior is untouched.
@@ -599,30 +607,46 @@ flowchart TB
     PUT --> DROP["Drop part bytes<br/>(BuiltPart.bytes = None)<br/>retained-parts charge: 0"]
 ```
 
-## Amendment (2026-10-02): a rerun converges only with the winning run's part-split settings (issue #2351)
+## Amendment (2026-10-02): the repair needs the winning run's part-split settings and no shipped command runs it (issues #2351, #2370)
 
 <!-- amendment-applies: sections="D3. `PartSink` releases part bytes at PUT" pointer="#2351 amendment" -->
 
-D3 says a rerun rebuilds byte-identical parts. That holds only when the
-rerun cuts parts where the first run did. Part boundaries depend on the
-memory split target and the stored-size target, and part bytes on the RLOG
-zstd level; none of them is part of the compaction record's identity. Since
-issue #2351 the memory split target of an RLOG merge is derived from the
-memory budget of the process that runs it, so two processes on one host can
-cut the same input set differently: `ravel-server` on a 30 GiB host at its
-default unit concurrency of 4 derives 896 MiB, while `ravel-cli maintain
-compact-bucket` on that host derives 3.75 GiB. A rerun with different
-settings builds parts under different content-addressed keys, finds the
-winner record's missing part absent from its own output, and fails with
+D3 describes a repair that rebuilds byte-identical parts. That holds only
+when the build cuts parts where the first run did, and it is reachable only
+through the library's build-and-publish path, not from any shipped command.
+
+Settings. Part boundaries depend on the memory split target and the
+stored-size target, and part bytes on the RLOG zstd level; none of them is
+part of the compaction record's identity. Since issue #2351 the memory
+split target of an RLOG merge is derived from the memory budget of the
+process that runs it, so two processes on one host can cut the same input
+set differently: `ravel-server` on a 30 GiB host at its default unit
+concurrency of 4 derives 896 MiB, while `ravel-cli maintain compact-bucket`
+on that host derives 3.75 GiB. A build with different settings produces
+parts under different content-addressed keys, finds the winner record's
+missing part absent from its own output, and on the library path fails with
 `ConvergedWinnerPartMissing` again.
 
+Reachability. `compact_bucket_scoped` returns `AlreadyCompacted` as soon as
+the bucket listing carries a compaction record, and the winner's record is
+always present when `ConvergedWinnerPartMissing` or
+`AlreadyExistsPartVanished` fires. Every production caller of
+`publish_record` sits behind that gate, so `ravel-cli maintain
+compact-bucket`, `compact-tenant` and the server's maintenance loop never
+reach `resolve_already_exists` once a record exists. A rerun of any of them
+returns `AlreadyCompacted`, builds nothing and raises no error. The record
+keeps pointing at the absent part, and the superseded-input sweep deletes the
+L0 inputs once the record is older than the protection horizon, so the gap
+becomes loss unless an operator holds the inputs with a legal hold. Wiring
+the repair into a shipped command is issue #2370.
+
 The compaction record has no field that could carry the settings without a
-schema change, and the RLOG footer does not record them, so the remedy is
-stated rather than automated: the error names
-`--l1-part-memory-target-bytes` (on `ravel-server`,
-`--maintain-l1-part-memory-target-bytes`), `--max-l1-part-bytes` and
-`--compaction-zstd-level`, and says the rerun must pin each to the value the
-winning run used. Each binary reports the memory target it resolved once per
-run, which is where that value is found.
+schema change, and the RLOG footer does not record them, so the settings
+are stated rather than automated: the error names what a repair must
+reproduce (`--l1-part-memory-target-bytes`, on `ravel-server`
+`--maintain-l1-part-memory-target-bytes`, `--max-l1-part-bytes` and
+`--compaction-zstd-level` for an RLOG winner), and says that no shipped
+command performs the repair today. Each binary reports the memory target it
+resolved once per run, which is where that value is found.
 
 ---

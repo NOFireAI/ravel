@@ -1455,10 +1455,11 @@ enum MaintainCommand {
         #[arg(long, value_name = "BYTES")]
         l1_part_memory_target_bytes: Option<u64>,
         /// Bound the encoded/on-object bytes a log or metrics merge writes
-        /// before it closes an L1 segment (the stored-size target). A segment
-        /// closes on whichever of this and --l1-part-memory-target-bytes is
-        /// reached first. Refused at 0. Default 256 MiB (the compactor
-        /// default).
+        /// before it closes an L1 segment (the stored-size target). A log
+        /// segment closes on whichever of this and --l1-part-memory-target-bytes
+        /// is reached first; a metrics segment closes on this alone and never
+        /// reads the memory target; span merges do not read this. Refused at 0.
+        /// Default 256 MiB (the compactor default).
         #[arg(long, value_name = "BYTES")]
         max_l1_part_bytes: Option<u64>,
         /// The zstd level an RLOG compaction writes its L1 segments at. Higher
@@ -1529,10 +1530,11 @@ enum MaintainCommand {
         #[arg(long, value_name = "BYTES")]
         l1_part_memory_target_bytes: Option<u64>,
         /// Bound the encoded/on-object bytes a log or metrics merge writes
-        /// before it closes an L1 segment (the stored-size target). A segment
-        /// closes on whichever of this and --l1-part-memory-target-bytes is
-        /// reached first. Refused at 0. Default 256 MiB (the compactor
-        /// default).
+        /// before it closes an L1 segment (the stored-size target). A log
+        /// segment closes on whichever of this and --l1-part-memory-target-bytes
+        /// is reached first; a metrics segment closes on this alone and never
+        /// reads the memory target; span merges do not read this. Refused at 0.
+        /// Default 256 MiB (the compactor default).
         #[arg(long, value_name = "BYTES")]
         max_l1_part_bytes: Option<u64>,
         /// Number of per-input reads a compaction keeps in flight at once (the
