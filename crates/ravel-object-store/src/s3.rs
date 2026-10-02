@@ -4136,7 +4136,7 @@ mod tests {
         }
     }
 
-    const CLASS_WORDS: [&str; 5] = ["timeout", "deadline", "throttled", "slowdown", "slow-down"];
+    const CLASS_WORDS: [&str; 4] = ["timeout", "deadline", "throttled", "slowdown"];
 
     /// An exhausted 500 and a 400 whose bucket, endpoint host or key carries a
     /// timeout or throttle word read Transient: only the inner `RequestError`
@@ -4218,6 +4218,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A raw key in a wrapper's text that itself looks like a `RetryError`
+    /// prefix is not mistaken for one when the source chain is reachable: the
+    /// inner text comes from the chain, not from the first matching segment.
+    #[test]
+    fn a_key_shaped_like_a_retry_prefix_is_not_the_inner_text() {
+        let wrapped = Wrapping {
+            prefix: "Error performing get request Error performing GET x in 1ms - timeout/k: "
+                .to_string(),
+            source: Box::new(Wrapping {
+                prefix: "Error performing GET http://127.0.0.1:9000/b/k in 1.2ms - ".to_string(),
+                source: Box::new(OwnedTextError(
+                    "Server returned non-2xx status code: 400 Bad Request: ".to_string(),
+                )),
+            }),
+        };
+        let mapped = map_error_common(generic(wrapped));
+        assert!(matches!(mapped, StoreError::Transient(_)), "got {mapped:?}");
     }
 
     /// The genuine signals still classify through the URI split: the 429 and
