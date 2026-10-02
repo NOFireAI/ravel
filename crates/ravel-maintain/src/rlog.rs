@@ -6395,8 +6395,11 @@ mod tests {
         /// strings, scalar attributes, byte strings and nested lists and maps.
         ///
         /// Distinguishing: an `estimate_stored_record` that charged a scalar
-        /// 64 bytes instead of 8 fails on the first record carrying a scalar
-        /// attribute with a short key; a `STORED_STREAM_DIR_ENTRY_BYTES` raised
+        /// 64 bytes instead of 8 fails once a record carries enough scalar
+        /// attributes or list elements of scalars for the extra 56 bytes each
+        /// to outrun the heap's per-slot headroom (one scalar with a short key
+        /// still fits: about 232 bytes of heap against 112 of proxy), a shape
+        /// the random cases produce; a `STORED_STREAM_DIR_ENTRY_BYTES` raised
         /// past the record slot's headroom fails on an empty record.
         #[test]
         fn a_records_heap_charge_covers_its_proxy_charge_and_stream_entry(

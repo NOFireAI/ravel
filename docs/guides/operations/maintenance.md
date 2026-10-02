@@ -353,7 +353,7 @@ stored on the 104-column schema below and scaled linearly from there:
 | Server, 30 GiB, 4 units | 30 - 2 - 20 = 8 GiB | 256 MiB | share (equal to the floor) | 32k | 2.1 MB |
 | `compact-bucket`, 32 GiB | 32 - 2 - 20 = 10 GiB | 1.25 GiB | share | 160k | 10.5 MB |
 | `compact-bucket`, 64 GiB | 42 GiB | 1.46 GiB | claim lease | 188k | 12.3 MB |
-| `compact-bucket`, 64 GiB, lease 1200 s | 42 GiB | 5.25 GiB | share | 672k | 44 MB |
+| Server, 64 GiB, 1 unit, `--maintain-claim-lease 1200s` | 64 - 2 - 20 = 42 GiB | 5.25 GiB | share | 672k | 44 MB |
 
 The 256 MiB floor binds while the budget is at most 2 GiB per concurrent
 merge: `compact-bucket` keeps 256 MiB up to a 24 GiB host, `compact-tenant`
