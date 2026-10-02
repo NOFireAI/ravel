@@ -254,6 +254,11 @@ ravel-cli maintain compact-tenant --tenant <t> --signal <metrics|logs|spans> \
   [--dry-run] [--no-claim]
 ```
 
+Under per-role storage credentials, run both with the Maintain credential, not
+Admin: they take compaction claims and write L1 segments and compaction
+records, which only the Maintain policy grants (see
+[the Admin credential](deployment.md#the-admin-credential)).
+
 `compact-tenant` discovers the hours itself, walking each shard's ingest hours
 ascending and stopping at the first unsealed one, because every later hour is
 unsealed too. It streams one line per bucket as each completes, then a summary

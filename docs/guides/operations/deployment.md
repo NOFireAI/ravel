@@ -53,8 +53,8 @@ guarantees Ravel's durability depends on. `--store memory` is exempt and never
 needs qualification.
 
 `store qualify` writes transient scratch objects under `sys/qualify/<run-id>/`
-while it runs its suite, not only the final record. The Admin policy's one
-delete grant, `AdminQualifyDelete`, covers `sys/qualify/*` only, so the
+while it runs its suite, not only the final record. The Admin policy's
+delete grant for it, `AdminQualifyDelete`, covers `sys/qualify/*` only, so the
 checksum echo probe below can remove its own object; the suite itself leaves
 its scratch in place. It is bounded per run, but not small: the two listing probes write two keys
 more than the declared page size each, so a run at the default page size
@@ -278,12 +278,21 @@ operator credential rather than a service credential:
   session. Never in a long-running Deployment, and never in a Secret mounted
   into a server pod.
 - It is used only by out-of-band operator and CI invocations: `store qualify`,
-  `gc-config set`, `provision adopt`, legal holds, and the read-only inspection
-  subcommands. No continuously running process should hold it.
-- Even Admin cannot delete any of the protected prefixes, and its one delete
-  grant, `AdminQualifyDelete`, covers only the `sys/qualify/*` scratch that
-  `store qualify` writes. A leaked Admin key can forge or overwrite control
-  objects within its write grant, but it cannot make existing data disappear.
+  `gc-config set`, `provision adopt`, legal holds, `tenant parquet-grant add`
+  and `remove`, and the read-only inspection subcommands. No continuously
+  running process should hold it.
+- Three `ravel-cli` commands take the Maintain credential instead:
+  `parquet sweep`, which deletes superseded Parquet table manifests, and
+  `maintain compact-bucket` and `maintain compact-tenant`, which take
+  compaction claims under `sys/maintain/claims/compaction/` and write L1
+  segments and compaction records. Admin holds none of those grants, so run
+  these three with the `RAVEL_S3_*` values of the Maintain role.
+- Even Admin cannot delete any of the protected prefixes. Its two delete
+  grants cover only scratch: `AdminQualifyDelete` the `sys/qualify/*` objects
+  `store qualify` writes, and `AdminProbeDelete` the `sys/pq-probe/*` object
+  the bucket probe of `tenant parquet-grant add` writes and removes. A leaked
+  Admin key can forge or overwrite control objects within its write grant, but
+  it cannot make existing data disappear.
 
 ## Readiness and the store reachability probe
 

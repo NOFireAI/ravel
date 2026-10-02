@@ -281,10 +281,10 @@ choice for a development or single-operator deployment.
 
 | Role | Process | What it does |
 |---|---|---|
-| Gateway | `--mode gateway`, and the ingest half of `--mode all` | Writes L0 segments and their commit records, idempotency markers, a tenant's provisioning record on adopt, and on a keyed bucket each tenant's recovery manifest under `sys/t/`. Runs the catalog fold, so it also writes catalog snapshot parts, `HEAD`, and name-postings objects. On a keyed bucket, reads the durable token map `sys/auth`. Reads each tenant's config record `t/<hash>/config` for its admission-limit overrides, and reads and writes its metric metadata record `t/<hash>/m/meta`. |
-| Query | `--mode query`, and the query half of `--mode all` | Lists and reads commit records, catalog objects and segment data. Runs the catalog fold too, and appends query-audit records. On a keyed bucket, reads the durable token map `sys/auth`. Reads each tenant's config record `t/<hash>/config` for its declared typed-column overrides, and its metric metadata record `t/<hash>/m/meta`. Runs the alert evaluator, so it writes alert transitions under `t/<hash>/a/l0/` and `t/<hash>/a/c/` and reads and writes each tenant's alert lease `t/<hash>/a/alert-lease` and state memo `t/<hash>/a/state/latest`. |
-| Maintain | `--mode maintain` | Compaction, retention and the sweeper. The only role that may delete anything, and only under the L0, L1, commit and idempotency prefixes plus the query-audit shard. Reads each tenant's config record `t/<hash>/config` to resolve the retention window, and the alert state memo `t/<hash>/a/state/latest` for alert retention. |
-| Admin | `ravel-cli` | One-off bootstrap and mutation commands. Invoked by an operator or a CI job, never by a long-running server. The broadest of the four. Writes each tenant's config record `t/<hash>/config` (`typed-attr-column`, `clustering-key` and `bloom-scope` set commands). See [the Admin credential](deployment.md#the-admin-credential). |
+| Gateway | `--mode gateway`, and the ingest half of `--mode all` | Writes L0 segments and their commit records, idempotency markers, a tenant's provisioning record on adopt, and on a keyed bucket each tenant's recovery manifest under `sys/t/`. Runs the catalog fold, so it also writes catalog snapshot parts, `HEAD`, and name-postings objects. On a keyed bucket, reads the durable token map `sys/auth`. Reads each tenant's config record `t/<hash>/config` for its admission-limit overrides, and reads and writes its metric metadata record `t/<hash>/m/meta`. Deletes the admission snapshots of dead ingest processes under `t/<hash>/<signal>/admission/`, its one delete grant; it deletes no durable object. |
+| Query | `--mode query`, and the query half of `--mode all` | Lists and reads commit records, catalog objects and segment data. Runs the catalog fold too, and appends query-audit records. On a keyed bucket, reads the durable token map `sys/auth`. Reads each tenant's config record `t/<hash>/config` for its declared typed-column overrides, and its metric metadata record `t/<hash>/m/meta`. Runs the alert evaluator, so it writes alert transitions under `t/<hash>/a/l0/` and `t/<hash>/a/c/` and reads and writes each tenant's alert lease `t/<hash>/a/alert-lease` and state memo `t/<hash>/a/state/latest`. For Parquet table queries, lists and reads the table manifests under `t/<hash>/pq/t/` and reads the location grants record `t/<hash>/pq/grants`. Deletes nothing. |
+| Maintain | `--mode maintain` | Compaction, retention and the sweeper. The only role that deletes durable data, and only under the L0, L1, commit and idempotency prefixes, the query-audit shard and the Parquet table manifests under `t/<hash>/pq/t/`. `ravel-cli parquet sweep`, `ravel-cli maintain compact-bucket` and `ravel-cli maintain compact-tenant` run under this credential. Reads each tenant's config record `t/<hash>/config` to resolve the retention window, and the alert state memo `t/<hash>/a/state/latest` for alert retention. |
+| Admin | `ravel-cli` | One-off bootstrap and mutation commands. Invoked by an operator or a CI job, never by a long-running server. The broadest of the four. Writes each tenant's config record `t/<hash>/config` (`typed-attr-column`, `clustering-key` and `bloom-scope` set commands) and Parquet location grants record `t/<hash>/pq/grants` (`tenant parquet-grant add` and `remove`, which also write and delete a probe object under `sys/pq-probe/`). See [the Admin credential](deployment.md#the-admin-credential). |
 
 Under `--tenant-kms-config`, Gateway, Query and Maintain also read and write each
 configured tenant's key-epoch record `t/<hash>/enc` at startup.
@@ -324,8 +324,10 @@ runtime rather than at deploy time.
 
 Three facts about those documents are worth knowing before you edit them.
 
-**Every role denies delete on the protected prefixes.** Gateway, Query and Admin
-have no delete grant at all, and they still carry the same explicit `Deny` on
+**Every role denies delete on the protected prefixes.** Query has no delete
+grant at all, Gateway's one delete grant covers only its dead processes'
+admission snapshots, and Admin's two cover only the scratch prefixes
+`sys/qualify/*` and `sys/pq-probe/*`. All three still carry the same explicit `Deny` on
 `s3:DeleteObject` and `s3:DeleteObjectVersion` over the protected control
 prefixes. An explicit `Deny` overrides any `Allow`, so those prefixes are
 undeletable even by Maintain.
@@ -515,18 +517,23 @@ objects written under it, with `AccessDenied`. With the keys in place:
 
 - Gateway and Maintain write tenant data through the routing store and read some
   of what they write, so they hold encrypt, generate-data-key and decrypt.
-- Query reads tenant data, so it holds decrypt.
+- Query reads tenant data and writes routed objects under `t/<hash>/`: the
+  catalog snapshot, `HEAD` and index objects its fold publishes, query-audit
+  records under `u/`, the `enc` key-epoch record, and the alert evaluator's
+  lease, state memo and transition objects. It holds encrypt,
+  generate-data-key and decrypt.
 - Admin holds decrypt only, deliberately without generate-data-key: granting it
   would let a leaked Admin credential mint ciphertext under tenant keys it has
   no write role for.
 
-Two gaps to plan around rather than assume covered. Query and Admin hold narrow
-write grants under the tenant keyspace (catalog objects and the query-audit
-shard for Query, reconstructed commit records for Admin). Those writes route
-through the per-tenant key like any other, but neither role carries
-generate-data-key, so a deployment that relies on them for a routed tenant must
-grant it manually. When Admin hits this on a reconstruct write,
-`ravel-cli commit reconstruct` names this exact condition in its error text.
+One gap to plan around rather than assume covered. Admin holds narrow write
+grants under the tenant keyspace: provenance records, legal holds,
+reconstructed commit records, erasure requests, the tenant config record and
+the Parquet location grants record. Those writes route through the per-tenant
+key like any other, but Admin carries no generate-data-key, so a deployment
+that relies on them for a routed tenant must grant it manually. When Admin hits
+this on a reconstruct write, `ravel-cli commit reconstruct` names this exact
+condition in its error text.
 The `t/<hash>/enc` epoch record has its own grant: Gateway, Query and Maintain
 read and write it, because startup bootstraps it in every mode, and Admin reads
 it for `verify-custody`. Every template denies its deletion.

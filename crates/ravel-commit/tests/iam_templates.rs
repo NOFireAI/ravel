@@ -24,6 +24,7 @@ use ravel_commit::keys::{
 };
 use ravel_fleet::query_workers::{QUERY_WORKERS_PREFIX, query_worker_key};
 use ravel_fleet::worker_set::heartbeat_key;
+use ravel_object_store::external::probe::PROBE_PREFIX;
 use ravel_types::{Signal, TenantHash};
 use uuid::Uuid;
 
@@ -361,6 +362,70 @@ fn constructor_free_tenant_witness_keys() -> Vec<String> {
     keys
 }
 
+/// The Parquet table name every manifest witness below is built for.
+const PARQUET_WITNESS_TABLE: &str = "hits";
+
+/// `grants_key(&test_tenant())`: `t/<hex>/pq/grants`, the location grants
+/// record (`crates/ravel-pqtable/src/keys.rs`).
+fn parquet_grants_key() -> String {
+    format!("t/{}/pq/grants", test_tenant().to_hex())
+}
+
+/// `tenant_manifest_prefix(&test_tenant())`: `t/<hex>/pq/t/`, the prefix
+/// `resolve::tables` and the Parquet sweep list.
+fn parquet_tenant_manifest_prefix() -> String {
+    format!("t/{}/pq/t/", test_tenant().to_hex())
+}
+
+/// `manifest_prefix(&test_tenant(), table)`: `t/<hex>/pq/t/<table>/v/`, the
+/// prefix `resolve::versions` and `resolve::newest` list.
+fn parquet_manifest_prefix() -> String {
+    format!(
+        "{}{PARQUET_WITNESS_TABLE}/v/",
+        parquet_tenant_manifest_prefix()
+    )
+}
+
+/// `manifest_key(&test_tenant(), table, 1)`:
+/// `t/<hex>/pq/t/<table>/v/<version:020>.pqm`.
+fn parquet_manifest_key() -> String {
+    format!("{}{:020}.pqm", parquet_manifest_prefix(), 1)
+}
+
+/// `probe_key()` in `crates/ravel-object-store/src/external/probe.rs`:
+/// `PROBE_PREFIX` followed by 32 random hex characters.
+fn parquet_probe_key() -> String {
+    format!("{PROBE_PREFIX}{:032x}", WITNESS_PROCESS_ID)
+}
+
+/// `snapshot_key(tenant, signal, process_id)` in
+/// `crates/ravel-ingest/src/reconcile.rs`:
+/// `t/<hex>/<signal>/admission/<process_id>.snapshot`.
+fn admission_snapshot_key(signal: Signal) -> String {
+    format!(
+        "t/{}/{}/admission/{}.snapshot",
+        test_tenant().to_hex(),
+        signal.key_prefix(),
+        Uuid::from_u128(WITNESS_PROCESS_ID)
+    )
+}
+
+/// The Parquet table keys and the admission snapshots, written in the shape
+/// each constructor produces. The Parquet key builders live in `ravel-pqtable`
+/// and the snapshot builder in `ravel-ingest`, which this crate does not depend
+/// on; the probe prefix is imported from `ravel-object-store` itself.
+fn parquet_and_admission_witness_keys() -> Vec<String> {
+    let mut keys = vec![
+        parquet_grants_key(),
+        parquet_tenant_manifest_prefix(),
+        parquet_manifest_prefix(),
+        parquet_manifest_key(),
+        parquet_probe_key(),
+    ];
+    keys.extend(ALL_SIGNALS.iter().map(|s| admission_snapshot_key(*s)));
+    keys
+}
+
 /// The key domain the value-level checks in this file evaluate a pattern
 /// against: every key `ravel-commit`'s constructors can produce, plus one
 /// witness per non-tenant keyspace the templates name, plus one per
@@ -375,6 +440,7 @@ fn key_domain() -> &'static [String] {
         keys.extend(control_plane_witness_keys());
         keys.extend(constructor_free_tenant_witness_keys());
         keys.extend(quarantine_witness_keys());
+        keys.extend(parquet_and_admission_witness_keys());
         keys
     })
 }
@@ -403,7 +469,8 @@ fn assert_pattern_is_witnessed(role: &str, class: &str, pattern: &str) {
 /// `ravel-catalog`, which this crate cannot depend on without a cycle, so the
 /// tenant config record has no `ravel-commit` constructor to produce a witness.
 /// `/enc`, `/m/meta`, `/alert-lease` and `/state/latest` are the same case:
-/// their builders live in `ravel-catalog` and `ravel-server`.
+/// their builders live in `ravel-catalog` and `ravel-server`, and `/pq/` too,
+/// whose builders live in `ravel-pqtable`.
 const OUT_OF_SCOPE_PATTERNS: &[&str] = &[
     "idem/",
     "/prov",
@@ -415,6 +482,7 @@ const OUT_OF_SCOPE_PATTERNS: &[&str] = &[
     "/m/meta",
     "/alert-lease",
     "/state/latest",
+    "/pq/",
 ];
 
 /// The maintain alert retention gate's list prefixes, matched exactly rather
@@ -1866,6 +1934,7 @@ const PROTECTED_DELETE_KEYS: &[&str] = &[
     "sys/auth",
     "sys/t/*",
     "t/*/enc",
+    "t/*/pq/grants",
 ];
 
 /// Maintain's `DenyDeleteProtected` resource set: same as `PROTECTED_DELETE_KEYS`
@@ -1886,6 +1955,7 @@ const MAINTAIN_PROTECTED_DELETE_KEYS: &[&str] = &[
     "sys/auth",
     "sys/t/*",
     "t/*/enc",
+    "t/*/pq/grants",
 ];
 
 /// The `DenyDeleteProtected` action set, identical in all four templates: both
@@ -1932,7 +2002,10 @@ struct ExpectedRolePatterns {
 const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // Gateway: ingest. Writes L0 data, commit records, idempotency and
     // admission records, provenance, and the catalog objects a commit
-    // publishes; deletes nothing. sys/auth is the durable token map the auth
+    // publishes. Its one delete is the admission reconcile's reap of dead
+    // processes' mutable admission snapshots, and reaches no durable object
+    // (gateway_template_covers_the_admission_snapshot_reap). sys/auth is the
+    // durable token map the auth
     // refresh reads, and sys/t/* the per-tenant recovery manifest every keyed
     // ingest path creates; asserted by tenant_resolving_roles_read_the_auth_map
     // and gateway_template_covers_the_recovery_manifest_write. t/*/enc is the
@@ -1981,8 +2054,8 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/m/meta",
         ],
         put_actions: &["s3:PutObject"],
-        deletes: &[],
-        delete_actions: &[],
+        deletes: &["t/*/*/admission/*"],
+        delete_actions: &["s3:DeleteObject"],
         protected_deletes: PROTECTED_DELETE_KEYS,
         protected_delete_actions: PROTECTED_DELETE_ACTIONS,
         kms_actions: &["kms:Encrypt", "kms:GenerateDataKey*", "kms:Decrypt"],
@@ -1995,7 +2068,10 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // by the durable auth refresh (tenant_resolving_roles_read_the_auth_map).
     // The alert evaluator runs here too: it writes alert transitions under
     // t/*/a/l0/* and t/*/a/c/*, and reads and writes its per-tenant lease and
-    // state memo (query_template_covers_every_alert_evaluator_call).
+    // state memo (query_template_covers_every_alert_evaluator_call). The
+    // Parquet table reads list and get the table manifests under t/*/pq/t/*
+    // and get the location grants record t/*/pq/grants
+    // (query_template_covers_every_parquet_table_read).
     ExpectedRolePatterns {
         role: "query",
         list_prefixes: &[
@@ -2004,6 +2080,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/catalog/*/*",
             "admission/query/*",
             "sys/query/workers/*",
+            "t/*/pq/t/*",
         ],
         list_actions: &["s3:ListBucket"],
         gets: &[
@@ -2023,6 +2100,8 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/a/alert-lease",
             "t/*/a/state/latest",
             "t/*/m/meta",
+            "t/*/pq/grants",
+            "t/*/pq/t/*",
         ],
         get_actions: &["s3:GetObject"],
         puts: &[
@@ -2136,6 +2215,11 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // are the alert retention gate's reads: the alert state memo it takes the
     // keep set from, and the two listings alert_keyspace_is_empty issues.
     // Asserted by maintain_template_covers_the_alert_retention_reads.
+    //
+    // t/*/pq/t/* appears on the list, get and delete axes for `ravel-cli
+    // parquet sweep`, which runs under this credential: it lists a tenant's
+    // Parquet table manifests and deletes the superseded ones. Asserted by
+    // maintain_template_covers_every_parquet_sweep_call.
     ExpectedRolePatterns {
         role: "maintain",
         list_prefixes: &[
@@ -2153,6 +2237,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "quarantine/t/*/*/l0/*",
             "t/*/a/",
             "quarantine/t/*/a/",
+            "t/*/pq/t/*",
         ],
         list_actions: &["s3:ListBucket"],
         gets: &[
@@ -2173,6 +2258,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/config",
             "t/*/enc",
             "t/*/a/state/latest",
+            "t/*/pq/t/*",
         ],
         get_actions: &["s3:GetObject"],
         puts: &[
@@ -2199,6 +2285,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/maintain/workers/*",
             "sys/query/workers/*",
             "quarantine/t/*/*/l0/*",
+            "t/*/pq/t/*",
         ],
         // Both delete operations, and the same two the Deny names. Maintain is
         // the only role where that identity is load-bearing rather than
@@ -2211,12 +2298,15 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
         kms_actions: &["kms:Encrypt", "kms:GenerateDataKey*", "kms:Decrypt"],
         kms_resources: &[("MaintainTenantKms", &[TENANT_KMS_KEY_ARN])],
     },
-    // Admin: broad read, narrow create-only writes, and the one delete grant
-    // ADR-0050's qualification probe needs. Decrypt-only on KMS. The sys/auth
-    // write is ravel-cli's tenant token upsert and revoke
-    // (admin_template_covers_every_auth_map_write_call), and the t/*/config
+    // Admin: broad read, narrow create-only writes, and the delete grants on
+    // the two scratch prefixes ADMIN_SCRATCH_DELETES names. Decrypt-only on
+    // KMS. The sys/auth write is ravel-cli's tenant token upsert and revoke
+    // (admin_template_covers_every_auth_map_write_call), the t/*/config
     // write is ravel-cli's tenant config record writes
-    // (admin_template_covers_every_tenant_config_write_call).
+    // (admin_template_covers_every_tenant_config_write_call), and the
+    // t/*/pq/grants and sys/pq-probe/* writes are ravel-cli tenant
+    // parquet-grant's record write and bucket probe
+    // (admin_template_covers_every_parquet_grant_call).
     ExpectedRolePatterns {
         role: "admin",
         list_prefixes: &["t/*", "sys/*"],
@@ -2234,14 +2324,17 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/u/*",
             "t/*/*/del/*.dreq",
             "t/*/config",
+            "t/*/pq/grants",
+            "sys/pq-probe/*",
         ],
         put_actions: &["s3:PutObject"],
-        deletes: &["sys/qualify/*"],
+        deletes: ADMIN_SCRATCH_DELETES,
         // Narrower than the Deny, which names both operations. Legitimate, and
         // the reason the overlap property is asserted as containment rather than
         // equality: admin's delete grant and its Deny cover no key in common, and
         // where they did, a Deny naming MORE than the Allow grants is safe.
-        delete_actions: &["s3:DeleteObject"],
+        // One entry per statement: AdminQualifyDelete, then AdminProbeDelete.
+        delete_actions: &["s3:DeleteObject", "s3:DeleteObject"],
         protected_deletes: PROTECTED_DELETE_KEYS,
         protected_delete_actions: PROTECTED_DELETE_ACTIONS,
         kms_actions: &["kms:Decrypt"],
@@ -2734,6 +2827,7 @@ fn no_delete_allow_reaches_the_disjoint_protected_keyspaces() {
         "sys/auth",
         "sys/t/*",
         "t/*/enc",
+        "t/*/pq/grants",
     ];
     // Pin DISJOINT_PROTECTED to its own definition so it cannot drift from the
     // protected list it is carved out of. It must be exactly
@@ -4552,6 +4646,295 @@ fn admin_template_covers_every_tenant_config_write_call() {
     }
 }
 
+/// Whether `key` is `t/<any tenant>/pq/<sub>` or lies under it.
+fn is_parquet_subkey(key: &str, sub: &str) -> bool {
+    let mut parts = key.splitn(4, '/');
+    parts.next() == Some("t")
+        && parts.next().is_some()
+        && parts.next() == Some("pq")
+        && parts
+            .next()
+            .is_some_and(|rest| rest == sub || rest.starts_with(&format!("{sub}/")))
+}
+
+/// `ravel-cli tenant parquet-grant add` and `remove`
+/// (`services/ravel-cli/src/parquet_grant.rs`) write the location grants record
+/// `t/<hash>/pq/grants` through `replace_whole` in
+/// `crates/ravel-pqtable/src/grants.rs`: one GET, then a PUT with
+/// `CreateIfAbsent` when the record is absent and `CasVersion` when it exists.
+/// Before the write, `add` qualifies the target bucket with
+/// `probe_not_ravel_bucket` (`crates/ravel-object-store/src/external/probe.rs`),
+/// which PUTs `sys/pq-probe/<random>` to the Ravel bucket and DELETEs it on every
+/// path it returns through. Nothing deletes the grants record: a deleted record
+/// reads as a tenant with no grants.
+#[test]
+fn admin_template_covers_every_parquet_grant_call() {
+    let grants = parquet_grants_key();
+    let probe = parquet_probe_key();
+    let admin = load_policy("admin");
+    let gets = key_patterns_for(&admin, &["s3:GetObject"], Some("Allow"));
+    let puts = key_patterns_for(&admin, &["s3:PutObject"], Some("Allow"));
+    let deletes = delete_key_patterns(&admin, "Allow");
+
+    assert!(
+        gets.iter().any(|p| glob_matches(p, &grants)),
+        "admin: no GetObject Allow reaches {grants:?}, which replace_whole reads \
+         before every write. Grants: {gets:?}"
+    );
+    assert!(
+        puts.iter().any(|p| glob_matches(p, &grants)),
+        "admin: no PutObject Allow reaches the location grants record \
+         {grants:?}, which every parquet-grant add and remove PUTs. Every one \
+         is refused. Grants: {puts:?}"
+    );
+    assert!(
+        !deletes.iter().any(|p| glob_matches(p, &grants)),
+        "admin: a delete Allow reaches {grants:?}; nothing deletes the grants \
+         record. Grants: {deletes:?}"
+    );
+    assert_reaches_nothing_outside("admin", "s3:PutObject Allow", &puts, &grants, &grants);
+
+    assert!(
+        puts.iter().any(|p| glob_matches(p, &probe)),
+        "admin: no PutObject Allow reaches the bucket probe object {probe:?}, \
+         which probe_not_ravel_bucket writes before every parquet-grant add. \
+         Every add is refused. Grants: {puts:?}"
+    );
+    assert!(
+        deletes.iter().any(|p| glob_matches(p, &probe)),
+        "admin: no delete Allow reaches the bucket probe object {probe:?}, \
+         which probe_not_ravel_bucket deletes before it returns. Every probe \
+         leaves its object behind. Grants: {deletes:?}"
+    );
+    assert_reaches_nothing_outside("admin", "s3:PutObject Allow", &puts, &probe, PROBE_PREFIX);
+    assert_reaches_nothing_outside("admin", "delete Allow", &deletes, &probe, PROBE_PREFIX);
+
+    for role in ["gateway", "query", "maintain"] {
+        let policy = load_policy(role);
+        let puts = key_patterns_for(&policy, &["s3:PutObject"], Some("Allow"));
+        let deletes = delete_key_patterns(&policy, "Allow");
+        for key in [&grants, &probe] {
+            assert!(
+                !puts.iter().any(|p| glob_matches(p, key))
+                    && !deletes.iter().any(|p| glob_matches(p, key)),
+                "{role}: a PutObject or delete Allow reaches {key:?}; only \
+                 ravel-cli under Admin writes the grants record and runs the \
+                 bucket probe. Put: {puts:?}; delete: {deletes:?}"
+            );
+        }
+    }
+}
+
+/// The SQL engine's Parquet table provider (`crates/ravel-sql/src/parquet.rs`,
+/// built in the query-serving block from `services/ravel-server/src/query.rs`)
+/// resolves a table through `crates/ravel-pqtable/src/resolve.rs`:
+/// `resolve::newest` LISTs `t/<hash>/pq/t/<table>/v/` and `read_version` GETs
+/// the manifest it picks, `resolve::tables` LISTs `t/<hash>/pq/t/` for the whole
+/// tenant, and `grants::list` GETs `t/<hash>/pq/grants` to check every file the
+/// manifest names against the tenant's grants. The query path writes and deletes
+/// nothing under `pq/`.
+#[test]
+fn query_template_covers_every_parquet_table_read() {
+    let query = load_policy("query");
+    let list_prefixes = list_prefix_patterns(&query, Some("Allow"));
+    let gets = key_patterns_for(&query, &["s3:GetObject"], Some("Allow"));
+    let puts = key_patterns_for(&query, &["s3:PutObject"], Some("Allow"));
+    let deletes = delete_key_patterns(&query, "Allow");
+    let manifest = parquet_manifest_key();
+    let grants = parquet_grants_key();
+
+    for prefix in [parquet_tenant_manifest_prefix(), parquet_manifest_prefix()] {
+        assert!(
+            list_prefixes.iter().any(|p| glob_matches(p, &prefix)),
+            "query: no ListBucket s3:prefix admits {prefix:?}, which the Parquet \
+             table resolver lists. Every Parquet table query is refused. \
+             s3:prefix values: {list_prefixes:?}"
+        );
+        assert_reaches_only(
+            "query",
+            "s3:prefix Allow",
+            &list_prefixes,
+            &prefix,
+            "the Parquet manifest keyspace",
+            |k| is_parquet_subkey(k, "t"),
+        );
+    }
+    for key in [&manifest, &grants] {
+        assert!(
+            gets.iter().any(|p| glob_matches(p, key)),
+            "query: no GetObject Allow reaches {key:?}, which a Parquet table \
+             query reads. Grants: {gets:?}"
+        );
+    }
+    assert_reaches_only(
+        "query",
+        "s3:GetObject Allow",
+        &gets,
+        &manifest,
+        "the Parquet manifest keyspace",
+        |k| is_parquet_subkey(k, "t"),
+    );
+    assert_reaches_nothing_outside("query", "s3:GetObject Allow", &gets, &grants, &grants);
+
+    for key in [&manifest, &grants] {
+        assert!(
+            !puts.iter().any(|p| glob_matches(p, key)),
+            "query: a PutObject Allow reaches {key:?}; the server writes no \
+             Parquet table key until DDL is wired into it. Grants: {puts:?}"
+        );
+    }
+    assert!(
+        deletes.is_empty(),
+        "query: the role must grant no delete. Grants: {deletes:?}"
+    );
+}
+
+/// `ravel-cli parquet sweep` (`services/ravel-cli/src/parquet.rs`) runs under
+/// the Maintain credential. `sweep::plan` (`crates/ravel-pqtable/src/sweep.rs`)
+/// LISTs `t/<hash>/pq/t/` once, reads `sys/gc` for the deployment's grace floor,
+/// and `sweep::execute` DELETEs each superseded manifest past the grace. The
+/// sweep never touches the grants record.
+#[test]
+fn maintain_template_covers_every_parquet_sweep_call() {
+    let maintain = load_policy("maintain");
+    let list_prefixes = list_prefix_patterns(&maintain, Some("Allow"));
+    let gets = key_patterns_for(&maintain, &["s3:GetObject"], Some("Allow"));
+    let deletes = delete_key_patterns(&maintain, "Allow");
+    let prefix = parquet_tenant_manifest_prefix();
+    let manifest = parquet_manifest_key();
+    let grants = parquet_grants_key();
+
+    assert!(
+        list_prefixes.iter().any(|p| glob_matches(p, &prefix)),
+        "maintain: no ListBucket s3:prefix admits {prefix:?}, the one prefix \
+         the Parquet sweep lists. The sweep is refused before it sees a \
+         manifest. s3:prefix values: {list_prefixes:?}"
+    );
+    assert!(
+        deletes.iter().any(|p| glob_matches(p, &manifest)),
+        "maintain: no delete Allow reaches the manifest {manifest:?}, which \
+         sweep::execute deletes once superseded. Grants: {deletes:?}"
+    );
+    assert!(
+        gets.iter().any(|p| glob_matches(p, &manifest)),
+        "maintain: no GetObject Allow reaches the manifest {manifest:?}. \
+         Grants: {gets:?}"
+    );
+    assert!(
+        gets.iter().any(|p| glob_matches(p, "sys/gc")),
+        "maintain: no GetObject Allow reaches sys/gc, which the Parquet sweep \
+         reads for its grace floor. Grants: {gets:?}"
+    );
+    for (axis, patterns) in [
+        ("s3:prefix Allow", &list_prefixes),
+        ("s3:GetObject Allow", &gets),
+        ("delete Allow", &deletes),
+    ] {
+        let witness = if axis == "s3:prefix Allow" {
+            &prefix
+        } else {
+            &manifest
+        };
+        assert_reaches_only(
+            "maintain",
+            axis,
+            patterns,
+            witness,
+            "the Parquet manifest keyspace",
+            |k| is_parquet_subkey(k, "t"),
+        );
+    }
+    assert!(
+        !deletes.iter().any(|p| glob_matches(p, &grants)),
+        "maintain: a delete Allow reaches the grants record {grants:?}; the \
+         sweep deletes manifests only. Grants: {deletes:?}"
+    );
+}
+
+/// `t/<hash>/pq/grants` is deleted by nothing, and a deleted record reads as a
+/// tenant with no grants (`grants::read` maps `NotFound` to an empty list), so
+/// every query over that tenant's Parquet tables is refused until an operator
+/// re-grants every location. Every template's `DenyDeleteProtected` covers it,
+/// and no delete Allow does.
+#[test]
+fn parquet_grants_record_is_delete_protected_in_every_role() {
+    let grants = parquet_grants_key();
+    for role in ALL_ROLES {
+        let policy = load_policy(role);
+        let denies = delete_key_patterns(&policy, "Deny");
+        assert!(
+            denies.iter().any(|p| glob_matches(p, &grants)),
+            "{role}: no delete Deny reaches the location grants record \
+             {grants:?}, whose loss reads as a tenant with no grants. Deny: \
+             {denies:?}"
+        );
+        let allows = delete_key_patterns(&policy, "Allow");
+        assert!(
+            !allows.iter().any(|p| glob_matches(p, &grants)),
+            "{role}: a delete Allow reaches {grants:?}; nothing deletes the \
+             grants record. Allow: {allows:?}"
+        );
+    }
+}
+
+/// The gateway's admission reconcile (`crates/ravel-ingest/src/reconcile.rs`)
+/// writes this process's per-signal snapshot at
+/// `t/<hash>/<signal>/admission/<process_id>.snapshot` with
+/// `PutMode::Overwrite`, lists the prefix, and `reap_keys` DELETEs every sibling
+/// snapshot past the reap horizon. The snapshot is mutable per-process state,
+/// not durable data, so the delete grant covers it and nothing else: no
+/// gateway delete Allow reaches a key outside the admission snapshots, and no
+/// gateway Deny refuses the reap.
+#[test]
+fn gateway_template_covers_the_admission_snapshot_reap() {
+    let gateway = load_policy("gateway");
+    let deletes = delete_key_patterns(&gateway, "Allow");
+    let denies = delete_key_patterns(&gateway, "Deny");
+    let is_admission_key = |k: &str| {
+        let mut parts = k.splitn(5, '/');
+        parts.next() == Some("t")
+            && parts.next().is_some()
+            && parts.next().is_some()
+            && parts.next() == Some("admission")
+    };
+
+    for signal in ALL_SIGNALS {
+        let snapshot = admission_snapshot_key(signal);
+        assert!(
+            deletes.iter().any(|p| glob_matches(p, &snapshot)),
+            "gateway: no delete Allow reaches the dead admission snapshot \
+             {snapshot:?}, which reap_keys deletes. Every reap is refused and \
+             the snapshots accumulate. Grants: {deletes:?}"
+        );
+        assert!(
+            !denies.iter().any(|p| glob_matches(p, &snapshot)),
+            "gateway: a delete Deny reaches {snapshot:?}, which refuses the \
+             reap the Allow grants. Deny: {denies:?}"
+        );
+        assert_reaches_only(
+            "gateway",
+            "delete Allow",
+            &deletes,
+            &snapshot,
+            "the admission snapshot keyspace",
+            is_admission_key,
+        );
+    }
+
+    // Every gateway delete pattern is the admission reap's: the role deletes
+    // nothing else, immutable data included.
+    for pattern in &deletes {
+        assert!(
+            ALL_SIGNALS
+                .iter()
+                .any(|s| glob_matches(pattern, &admission_snapshot_key(*s))),
+            "gateway: delete Allow {pattern:?} reaches no admission snapshot; \
+             the gateway's only delete is the admission reap. Grants: \
+             {deletes:?}"
+        );
+    }
+}
+
 /// One statement reduced to what an Allow/Deny overlap check needs: which
 /// operations ON ONE AXIS it names, and which object keys it names them over.
 ///
@@ -4873,18 +5256,23 @@ fn admin_has_no_kms_generate_data_key() {
 /// wildcard-actioned fails inside `delete_key_patterns` before any
 /// protected-block check.
 ///
-/// A synthetic fixture still has to carry the whole shape --- the scratch Allow
+/// A synthetic fixture still has to carry the whole shape --- the scratch Allows
 /// and a Deny block as well as the statement under test --- or it fails the
 /// first `assert_eq` for an unrelated reason and cannot tell a guard that
 /// rejects from one that does not.
+///
+/// Scratch means a prefix whose objects are transient, hold no tenant data and
+/// anchor nothing: the qualification run's `sys/qualify/<run-id>/` and the
+/// Parquet bucket probe's `sys/pq-probe/<random>`, which the probe deletes
+/// before it returns. Both are in `ADMIN_SCRATCH_DELETES`.
 fn assert_admin_delete_grant_is_scratch_only(policy: &Policy) {
     let deletes = delete_key_patterns(policy, "Allow");
     assert_eq!(
-        deletes,
-        vec!["sys/qualify/*".to_string()],
-        "{}: the only delete-capable Allow must be the qualification scratch \
-         prefix sys/qualify/* (so `store qualify` can exercise the delete probe); \
-         found {deletes:?}",
+        deletes, ADMIN_SCRATCH_DELETES,
+        "{}: the delete-capable Allows must be exactly the scratch prefixes \
+         {ADMIN_SCRATCH_DELETES:?} (so `store qualify` can exercise the delete \
+         probe and the Parquet bucket probe can remove its object); found \
+         {deletes:?}",
         policy.role
     );
 
@@ -4925,16 +5313,22 @@ fn assert_admin_delete_grant_is_scratch_only(policy: &Policy) {
     }
 }
 
-/// Admin's only `s3:DeleteObject` grant is the transient conformance scratch
-/// prefix `sys/qualify/*`, so `ravel-cli store qualify` can run ADR-0050's
+/// Admin's delete grants, in template order: the scratch prefixes
+/// `assert_admin_delete_grant_is_scratch_only` accepts and nothing else.
+const ADMIN_SCRATCH_DELETES: &[&str] = &["sys/qualify/*", "sys/pq-probe/*"];
+
+/// Admin's only `s3:DeleteObject` grants are two transient scratch prefixes:
+/// `sys/qualify/*`, so `ravel-cli store qualify` can run ADR-0050's
 /// delete-visibility probe (which deletes a key under `sys/qualify/<run-id>/`)
-/// on a fresh bucket without failing closed. Admin holds no delete on tenant
-/// data (`t/**`) or on any key the same policy's `DenyDeleteProtected` block
-/// covers, so ADR-0055's property "Admin never deletes tenant data or a
-/// protected key" still holds. Widen the grant beyond that one prefix, or drop
-/// it so qualification fails the delete probe, and this test fails.
+/// on a fresh bucket without failing closed, and `sys/pq-probe/*`, so the
+/// Parquet bucket probe `ravel-cli tenant parquet-grant add` runs can delete
+/// the object it wrote. Admin holds no delete on tenant data (`t/**`) or on any
+/// key the same policy's `DenyDeleteProtected` block covers, so ADR-0055's
+/// property "Admin never deletes tenant data or a protected key" still holds.
+/// Widen the grant beyond those two prefixes, or drop either, and this test
+/// fails.
 #[test]
-fn admin_delete_grant_is_qualify_scratch_only() {
+fn admin_delete_grant_is_scratch_only() {
     let policy = load_policy("admin");
     assert_admin_delete_grant_is_scratch_only(&policy);
 }
@@ -4999,8 +5393,9 @@ fn pre_fix_allow_delete_key_patterns(policy: &Policy) -> Vec<String> {
 /// (correct) admin policy passes whichever way the matcher behaves.
 ///
 /// Each fixture carries the WHOLE bypass shape, not just the permissive
-/// statement: admin's shipped `s3:DeleteObject` Allow on `sys/qualify/*` (which
-/// the exact match sees), the permissive statement (which it does not), and a
+/// statement: admin's shipped `s3:DeleteObject` Allows on `sys/qualify/*` and
+/// `sys/pq-probe/*` (which the exact match sees), the permissive statement
+/// (which it does not), and a
 /// `DenyDeleteProtected` block. That combination makes the fixture reach the same
 /// PASSING state under the historical derivation that admin's real policy
 /// reaches, so only the post-fix derivation rejects. A fixture holding the
@@ -5017,8 +5412,7 @@ fn wildcard_or_out_of_bucket_delete_grant_is_not_a_bypass() {
     // Deny block, would otherwise read as a pass for the wrong reason.
     const UNCLASSIFIED_RESOURCE: &str =
         "reaching here means a guard ran on an unvalidated statement";
-    const NOT_SCRATCH_ONLY: &str =
-        "the only delete-capable Allow must be the qualification scratch";
+    const NOT_SCRATCH_ONLY: &str = "the delete-capable Allows must be exactly the scratch prefixes";
 
     // (Sid, Action, Resource, does the pre-fix EXACT action match recognize it,
     //  which post-fix rejection the case must produce)
@@ -5076,8 +5470,8 @@ fn wildcard_or_out_of_bucket_delete_grant_is_not_a_bypass() {
         let policy = Policy {
             role: "fixture",
             statements: serde_json::json!([
-                // The shipped scratch delete. The pre-fix exact action match
-                // sees this one, so the pre-fix delete set is non-empty and
+                // The shipped scratch deletes. The pre-fix exact action match
+                // sees these two, so the pre-fix delete set is non-empty and
                 // equal to what the guard demands.
                 {
                     "Sid": "AdminQualifyScratchDelete",
@@ -5091,6 +5485,12 @@ fn wildcard_or_out_of_bucket_delete_grant_is_not_a_bypass() {
                     "Effect": "Allow",
                     "Action": action,
                     "Resource": resource,
+                },
+                {
+                    "Sid": "AdminProbeDelete",
+                    "Effect": "Allow",
+                    "Action": "s3:DeleteObject",
+                    "Resource": format!("{BUCKET_KEY_PREFIX}sys/pq-probe/*"),
                 },
                 // ...and the protected block, so the guard's "DenyDeleteProtected
                 // names no keys" check cannot be what rejects and mask which
@@ -5114,10 +5514,9 @@ fn wildcard_or_out_of_bucket_delete_grant_is_not_a_bypass() {
         // real policy reaches and must be rewritten, not deleted.
         let pre_fix = pre_fix_allow_delete_key_patterns(&policy);
         assert_eq!(
-            pre_fix,
-            vec!["sys/qualify/*".to_string()],
+            pre_fix, ADMIN_SCRATCH_DELETES,
             "fixture {sid} invalid: the pre-fix derivation must return exactly \
-             the shipped scratch prefix, hiding the permissive grant so the \
+             the shipped scratch prefixes, hiding the permissive grant so the \
              scratch-only assertion passes over it; returned {pre_fix:?}"
         );
 
