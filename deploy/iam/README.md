@@ -11,8 +11,9 @@ from the pinned shape fails that suite.
 `DenyDeleteProtected` in `maintain.json` denies delete on `sys/tenancy`,
 `sys/qualification`, `sys/gc`, `t/*/*/prov`, `t/*/catalog/*/HEAD`, the
 legal-hold audit shard (`t/*/u/*/0000/*`), the durable token map `sys/auth`,
-the write-once recovery manifests `sys/t/*`, and the append-only KMS key-epoch
-records `t/*/enc`. Commit records are absent from
+the write-once recovery manifests `sys/t/*`, the append-only KMS key-epoch
+records `t/*/enc`, and the Parquet location grants records `t/*/pq/grants`.
+Commit records are absent from
 that list on purpose: `MaintainDelete` grants delete on `t/*/*/c/*`
 because the maintenance sweep physically removes a commit record once
 it is superseded, and an IAM deny there would make every sweep pass fail.
@@ -28,7 +29,10 @@ absent and installs an empty token map that revokes every durable token,
 `sys/t/*` recovery manifests are write-once (ADR-0050), and a deleted
 `t/<hash>/enc` reads as "no per-tenant key was ever configured", so
 `verify-custody` stops checking the tenant and the next startup rewrites its
-epoch history from scratch.
+epoch history from scratch. They deny delete on `t/*/pq/grants` too: nothing
+deletes a Parquet location grants record, and a deleted one reads as a tenant
+with no grants, so every query over that tenant's Parquet tables is refused
+until each location is granted again.
 
 Catalog snapshot and index objects (`t/*/catalog/*/snap/*`,
 `t/*/catalog/*/idx/*`) used to be caught by the same `t/*/catalog/*/*`
@@ -67,21 +71,44 @@ Each template's delete authority, read from its `Allow` statements. Every
 template also carries the shared `DenyDeleteProtected` deny listed above; the
 grants below are what remains deletable after that deny applies.
 
-- **Gateway** (`gateway.json`): no delete grant at all. The ingest path writes
-  and reads objects; it deletes nothing.
+- **Gateway** (`gateway.json`): `GatewayAdmissionDelete` grants
+  `s3:DeleteObject` on `t/????????????????????????????????/?/admission/*`
+  only, and the gateway deletes no durable object. Each ingest process
+  overwrites its own per-signal admission snapshot
+  `t/<tenant_hash>/<signal>/admission/<process_id>.snapshot`, and the
+  admission reconcile (`reap_keys`, `crates/ravel-ingest/src/reconcile.rs`)
+  deletes the snapshots of processes past the reap horizon. A snapshot is
+  mutable per-process state, rewritten every reconcile interval, not data.
+  No `Deny` in `gateway.json` covers the prefix. The pattern uses IAM's
+  single-character `?` because `*` matches across `/`: `t/*/*/admission/*`
+  would also match `t/<tenant_hash>/pq/t/admission/v/<version>.pqm`, the
+  manifests of a Parquet table named `admission`. A tenant hash is 32 hex
+  characters and a signal prefix one, so the `?` form matches every snapshot
+  and no manifest. This rests on the policy layer treating `?` as exactly
+  one character, as AWS IAM does; a layer that ignores `?` or reads it as
+  `*` turns the statement into a delete over `t/*/*/admission/*`, so check
+  that before applying these templates to another S3-compatible store. The
+  read, write and list grants on `t/*/*/admission/*`
+  and on other key segments (including `c`, `l0`, `l1`, `idem`, `maint`,
+  `u`, `catalog`, `del` and `a`) keep the cross-`/` match and still reach a
+  Parquet table with that name, until those table names are reserved.
 - **Query** (`query.json`): no delete grant at all, and nothing on the query
   path deletes. A draining query worker overwrites its own
   `sys/query/workers/` record with a stamp no reader accepts as live, and the
   maintain role reaps dead records (issue #1828).
 - **Admin** (`admin.json`): `AdminQualifyDelete` grants delete on
-  `sys/qualify/*` only.
+  `sys/qualify/*`, and `AdminProbeDelete` on `sys/pq-probe/*`. Both are
+  scratch: the qualification run's objects, and the one object the Parquet
+  bucket probe writes and deletes before it returns.
 - **Maintain** (`maintain.json`): `MaintainDelete` grants delete on
   `t/*/*/l0/*`, `t/*/*/c/*`, `t/*/*/l1/*`, `t/*/*/idem/*`, `t/*/u/*/0001/*`,
   `t/*/*/del/*.dreq`, `t/*/catalog/*/snap/*`, `t/*/catalog/*/idx/*`,
-  `sys/maintain/workers/*`, `sys/query/workers/*`, and
-  `quarantine/t/*/*/l0/*`. These are the objects the compaction,
-  supersession, retention, erasure-request, unreferenced-catalog, dead-worker
-  reap, and quarantine-reaper sweeps physically remove. The query-worker reap
+  `sys/maintain/workers/*`, `sys/query/workers/*`,
+  `quarantine/t/*/*/l0/*`, and `t/*/pq/t/*`. These are the objects the
+  compaction, supersession, retention, erasure-request, unreferenced-catalog,
+  dead-worker reap, quarantine-reaper and Parquet manifest sweeps physically
+  remove. The Parquet manifest sweep is `ravel-cli parquet sweep`, run under
+  this credential. The query-worker reap
   runs on the maintain process that owns a fixed rendezvous unit (one per view
   of the maintain membership) and judges each key by its LIST
   metadata, so `MaintainList` also carries `sys/query/workers/*` and
@@ -283,16 +310,17 @@ Two known gaps are recorded here and are NOT closed by the grants above.
 
 ## Control-plane keys outside the data path
 
-Sixteen control-plane keys and prefixes are read or written by a server role or
+Twenty control-plane keys and prefixes are read or written by a server role or
 by Admin on its normal path. Admin reads all of them through its blanket `t/*`
-and `sys/*` reads, so its column below lists writes only. Every grant names the
-one key or prefix the calls use:
+and `sys/*` reads, so its column below lists writes and deletes only. Every
+grant names the one key or prefix the calls use:
 
 | Key | Gateway | Query | Maintain | Admin |
 |---|---|---|---|---|
 | `sys/tenancy` | get, put | get, put | get, put | put |
 | `sys/qualification` | get | get | get | put |
 | `sys/qualify/*` | | | | put, delete |
+| `sys/pq-probe/*` | | | | put, delete |
 | `sys/gc` | get | get | get, put | put |
 | `sys/auth` | get | get | | put |
 | `sys/t/*` | put | | | |
@@ -306,12 +334,16 @@ one key or prefix the calls use:
 | `t/*/m/meta` | get, put | get | | |
 | `t/*/a/alert-lease` | | get, put | | |
 | `t/*/a/state/latest` | | get, put | get | |
+| `t/*/*/admission/*` | list, get, put | | | |
+| `t/????????????????????????????????/?/admission/*` | delete | | | |
+| `t/*/pq/grants` | | get | | put |
+| `t/*/pq/t/*` | | list, get | list, delete | |
 
 The maintain `get` and `put` on the three `sys/maintain/` prefixes are the one
 `sys/maintain/*` grant in `MaintainRead` and `MaintainWrite`. The other rows
 were derived from the data path or are covered in the sections above, except
-the ten call groups below, which the templates missed until issues #1995 and
-#2340:
+the call groups below, which the templates missed until issues #1995, #2340
+and #2350:
 
 | Call | Mode | S3 operation | Grant |
 |---|---|---|---|
@@ -325,6 +357,11 @@ the ten call groups below, which the templates missed until issues #1995 and
 | The ingest metadata sink reads and writes `t/<tenant_hash>/m/meta` (`CreateIfAbsent`, then `CasVersion`); the query metadata cache reads it for `/api/v1/metadata` | `gateway`, `all` (write); `query`, `all` (read) | `s3:GetObject`, `s3:PutObject` | `GatewayRead`, `GatewayWrite` and `QueryRead` `t/*/m/meta` |
 | The alert evaluator: `acquire_lease` writes `t/<tenant_hash>/a/alert-lease` (`CreateIfAbsent`, or a GET then `CasVersion`), `read_alert_state_memo` reads and `write_alert_state_memo` overwrites `t/<tenant_hash>/a/state/latest`, and each transition is published as an L0 data object and a commit record (`CreateIfAbsent`) | `query`, `all` | `s3:GetObject`, `s3:PutObject` | `QueryRead` `t/*/a/alert-lease` and `t/*/a/state/latest`; `QueryWrite` `t/*/a/alert-lease`, `t/*/a/state/latest`, `t/*/a/l0/*` and `t/*/a/c/*` |
 | Alert retention: `alert_keep_set` reads `t/<tenant_hash>/a/state/latest`, and `alert_keyspace_is_empty` lists `t/<tenant_hash>/a/` and `quarantine/t/<tenant_hash>/a/` | `maintain` | `s3:GetObject`, `s3:ListBucket` | `MaintainRead` `t/*/a/state/latest`; `MaintainList` `s3:prefix` `t/*/a/` and `quarantine/t/*/a/` |
+| `ravel-cli tenant parquet-grant add` and `remove` write `t/<tenant_hash>/pq/grants` through `replace_whole` (`crates/ravel-pqtable/src/grants.rs`: a GET, then a PUT with `CreateIfAbsent` or `CasVersion`) | Admin | `s3:PutObject` | `AdminWrite` `t/*/pq/grants` (the read is `AdminRead` `t/*`) |
+| `parquet-grant add` qualifies the target bucket with `probe_not_ravel_bucket` (`crates/ravel-object-store/src/external/probe.rs`), which PUTs `sys/pq-probe/<32 hex chars>` and DELETEs it before returning | Admin | `s3:PutObject`, `s3:DeleteObject` | `AdminWrite` and `AdminProbeDelete` `sys/pq-probe/*` |
+| The Parquet table provider (`crates/ravel-sql/src/parquet.rs`, built from `services/ravel-server/src/query.rs`) resolves a table through `crates/ravel-pqtable/src/resolve.rs`: `newest` (through `versions`) lists `t/<tenant_hash>/pq/t/<table>/v/`, `read_version` GETs the manifest, and `grants::list` GETs `t/<tenant_hash>/pq/grants` | `query`, `all` | `s3:ListBucket`, `s3:GetObject` | `QueryList` `s3:prefix` `t/*/pq/t/*`; `QueryRead` `t/*/pq/t/*` and `t/*/pq/grants` |
+| `ravel-cli parquet sweep` (`crates/ravel-pqtable/src/sweep.rs`): `plan` lists `t/<tenant_hash>/pq/t/`, the CLI wrapper reads `sys/gc` for the deployment's grace floor, and `execute` deletes each superseded manifest | Maintain credential | `s3:ListBucket`, `s3:GetObject`, `s3:DeleteObject` | `MaintainList` `s3:prefix` `t/*/pq/t/*`; `MaintainDelete` `t/*/pq/t/*`; `sys/gc` is already in `MaintainRead` |
+| The admission reconcile's `reap_keys` (`crates/ravel-ingest/src/reconcile.rs`) deletes the snapshots `t/<tenant_hash>/<signal>/admission/<process_id>.snapshot` of processes past the reap horizon | `gateway`, `all` | `s3:DeleteObject` | `GatewayAdmissionDelete` `t/????????????????????????????????/?/admission/*` |
 
 The last row lists only prefixes; nothing below `t/*/a/` but the memo is a
 control-plane key, and the alert data objects and commit records the evaluator
@@ -354,7 +391,14 @@ reports the lease unavailable and evaluates no rule, and without the transition
 writes every rule that changes state fails. Without the maintain memo read,
 alert retention is skipped for the tenant every tick, and without the two list
 prefixes the retention gate logs a warning for every tenant with no alert
-history and runs the orphan sweep anyway.
+history and runs the orphan sweep anyway. Without the grants record write,
+every `parquet-grant add` and `remove` is refused, and without the probe PUT
+every `add` is refused before it writes; without the probe delete, each probe
+leaves its object behind. Without the Query list and reads, every Parquet table
+query is refused. Without the Maintain list, `parquet sweep` is refused before
+it sees a manifest, and without the delete every superseded manifest stays.
+Without the gateway's admission delete, each reap is refused and logged, and
+dead processes' snapshots accumulate under the prefix every reconcile lists.
 
 No server role may write `sys/auth`: the only production writers are
 `ravel-cli` under Admin and the operator, which uses the shared credential
@@ -371,25 +415,10 @@ the delete-grant section above): no role deletes any of them, a deleted
 recovery manifests are write-once, and key-epoch records are append-only
 history whose loss reads as "no per-tenant key was ever configured".
 
-Some control-plane keys a role uses are still granted by no template. Each needs
-a decision of its own rather than a one-line grant:
-
-- The Parquet table keys. `ravel-cli parquet grant` writes
-  `t/<tenant_hash>/pq/grants` (`crates/ravel-pqtable/src/grants.rs`) and probes
-  the target with a PUT and DELETE of `sys/pq-probe/<id>`
-  (`crates/ravel-object-store/src/external/probe.rs`), Query lists and reads
-  the grants and the table manifests under `t/<tenant_hash>/pq/t/`
-  (`crates/ravel-sql/src/parquet.rs`), and `ravel-cli parquet sweep` lists and
-  deletes manifests under Admin. No template reaches `t/*/pq/*` or
-  `sys/pq-probe/*`, and the probe and the sweep need an Admin delete beyond the
-  `sys/qualify/*` one.
-- `ravel-cli maintain compact-bucket` and `compact-tenant` take compaction
-  claims under `sys/maintain/claims/compaction/` and write L1 output, and Admin
-  writes neither.
-- Gateway's admission reconcile deletes dead `t/<tenant_hash>/<signal>/admission/<pid>.snapshot`
-  objects (`crates/ravel-ingest/src/reconcile.rs`), and Gateway holds no delete
-  grant, which ADR-0055 section 2 reserves for Maintain. The refusal is logged
-  and the snapshots accumulate.
+`t/*/pq/grants` is deny-delete in every template, and `t/*/pq/t/*` is
+deletable by Maintain alone. The Parquet manifest delete sits with Maintain
+rather than Admin because the only command that issues it, `ravel-cli parquet
+sweep`, runs under the Maintain credential.
 
 Gateway and Query carry no write on `sys/gc`, although every mode runs the
 `sys/gc` bootstrap at startup: creating it stays with Maintain and Admin, and a
@@ -397,6 +426,32 @@ fresh bucket needs the `maintain` process started first, or the object created
 with `ravel-cli gc-config set` under Admin (see
 `docs/guides/operations/deployment.md`, "The first deployment against a fresh
 bucket").
+
+### Which credential each `ravel-cli` command takes
+
+`ravel-cli` takes the Admin credential by default. Three commands take the
+Maintain credential instead: `parquet sweep`, `maintain compact-bucket` and
+`maintain compact-tenant`. The sweep deletes Parquet table manifests, and the
+two compaction commands take claims under `sys/maintain/claims/compaction/`
+and write L1 segments and compaction records, all of which `maintain.json`
+grants and `admin.json` does not. Admin gains nothing for them. `ravel-cli`
+builds no per-tenant KMS routing store, so these writes, like every other
+`ravel-cli` write, land under the bucket's default encryption rather than a
+routed tenant's key.
+
+Three more mutating commands need grants `admin.json` does not carry and are
+not assigned a credential here: `maintain sweep` deletes segment and commit
+objects, `maintain migrate` rewrites them, and `catalog fold` writes catalog
+objects. Under these templates each is refused under Admin.
+
+### Parquet table DDL
+
+The server does not run Parquet table DDL yet: `crates/ravel-sql/src/ddl.rs`
+writes manifests and runs the same bucket probe, but nothing in
+`ravel-server` calls it. When DDL is wired into the server, the Query role will
+also need `s3:PutObject` on `t/*/pq/t/*` for the manifest writes, and
+`s3:PutObject` and `s3:DeleteObject` on `sys/pq-probe/*` for the probe. No
+template grants those today.
 
 ## Bucket-configuration reads: granted by no template
 

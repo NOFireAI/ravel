@@ -600,7 +600,8 @@ Stated explicitly, per ADR-0055's own consequence:
   predicted this placement; this ADR confirms it.
 - **New prefix grants (ADR-0055 §1 table amendment, landed with this
   epic's first implementing commit):** Admin gains `CreateIfAbsent` write
-  on `t/*/*/del/**` (submit) — Admin still deletes nothing, anywhere.
+  on `t/*/*/del/**` (submit) — Admin still deletes no tenant data; its only
+  delete grants are the `sys/qualify/*` and `sys/pq-probe/*` scratch prefixes.
   Query and Maintain gain read on `del/**` (resolve-time listing; pass
   scoping). Maintain gains delete on `del/*.dreq` **only** (§5).
   `del/*.done` joins the deny-delete set for every role including
