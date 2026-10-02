@@ -109,7 +109,15 @@ struct TickHarness {
 impl TickHarness {
     fn new() -> Self {
         Self {
-            compactor: ravel_maintain::CompactorConfig::default(),
+            // The pinned-query window (ADR-1133) zeroed, so a tick's deleting
+            // rule 2 pass reclaims a chain in the tick that first finds it
+            // unnamed and these tests see the erasure lifecycle alone.
+            compactor: ravel_maintain::CompactorConfig {
+                max_query_duration_ns: 0,
+                head_cache_ttl_ns: 0,
+                clock_skew_allowance_ns: 0,
+                ..ravel_maintain::CompactorConfig::default()
+            },
             retention: ravel_maintain::RetentionConfig::default(),
             memo: ravel_maintain::scan::MaintainMemo::with_default_interval(),
             safety: MaintenanceSafetyMetrics::default(),

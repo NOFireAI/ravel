@@ -6089,7 +6089,15 @@ mod tests {
         let done_key =
             keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
 
-        let compactor = CompactorConfig::default();
+        // The pinned-query window (ADR-1133) zeroed: tick 2's deleting rule 2
+        // pass writes the chain's marker and reclaims it at once, so the
+        // erasure-request sweep sees nothing held.
+        let compactor = CompactorConfig {
+            max_query_duration_ns: 0,
+            head_cache_ttl_ns: 0,
+            clock_skew_allowance_ns: 0,
+            ..CompactorConfig::default()
+        };
         let retention = RetentionConfig::default();
         let mut memo = MaintainMemo::with_default_interval();
         let safety = MaintenanceSafetyMetrics::default();
@@ -8271,7 +8279,9 @@ mod tests {
     /// Issue #2073 item 3: a superseded-input sweep adds the exact recorded
     /// size of every L0 data object it deletes to `bytes_reclaimed`. Tick 1
     /// compacts two inputs; tick 2, past the compaction record's protection
-    /// horizon, deletes both inputs and nothing else that carries a size.
+    /// horizon, holds them on the pinned-query window (ADR-1133), and tick 3,
+    /// once the window has passed, deletes both inputs and nothing else that
+    /// carries a size.
     /// Watch it fail: drop `.saturating_add(report.superseded_data_bytes)` from
     /// `record_sweep`; "every superseded input" reads left 0, right the two
     /// sizes' sum.
@@ -8290,7 +8300,12 @@ mod tests {
         }
         assert_ne!(input_sizes[0], input_sizes[1], "the inputs' sizes differ");
         let sizes: u64 = input_sizes.iter().sum();
-        let compactor = CompactorConfig::default();
+        // A full sweep on every tick: tick 3 falls inside the default full-sweep
+        // cadence, and its zone-scoped sweep does not reach the compacted hour.
+        let compactor = CompactorConfig {
+            interior_reverify_ns: 0,
+            ..CompactorConfig::default()
+        };
         let retention = RetentionConfig::default();
         let worker = solo_worker();
         let live = worker.solo_live_set();
@@ -8308,6 +8323,9 @@ mod tests {
         assert_eq!(safety.objects_deleted_superseded_data_deleted(), 0);
         assert_eq!(safety.bytes_reclaimed(Signal::Metrics), 0);
 
+        // Tick 2, past the horizon: HEAD names neither input, so the tick
+        // writes the group's unnamed-since marker and holds both inputs for
+        // the pinned-query window (ADR-1133).
         let past_horizon = written_ns + compactor.protection_horizon_ns + 1_000_000_000;
         clock.set(past_horizon);
         store.set_clock_ms((past_horizon / 1_000_000) as u64);
@@ -8316,10 +8334,28 @@ mod tests {
             &worker, &live,
         )
         .await;
+        assert_eq!(safety.objects_deleted_superseded_data_deleted(), 0);
+        assert_eq!(
+            safety.superseded_inputs_held(Signal::Metrics, SupersededHeldReason::PinnedWindow),
+            4,
+            "tick 2 holds both inputs and their commit records on the pinned-query window"
+        );
+
+        // Tick 3, once the marker is exactly as old as the window.
+        let window_ns = compactor.max_query_duration_ns
+            + compactor.head_cache_ttl_ns
+            + 4 * compactor.clock_skew_allowance_ns;
+        clock.set(past_horizon + window_ns);
+        store.set_clock_ms(((past_horizon + window_ns) / 1_000_000) as u64);
+        run_tick_with_clock(
+            &clock, &store, &tenant, &compactor, &retention, 1, &mut memo, &safety, &ownership,
+            &worker, &live,
+        )
+        .await;
         assert_eq!(
             safety.objects_deleted_superseded_data_deleted(),
             2,
-            "tick 2 deletes both superseded inputs"
+            "tick 3 deletes both superseded inputs"
         );
         assert_eq!(
             safety.bytes_reclaimed(Signal::Metrics),
