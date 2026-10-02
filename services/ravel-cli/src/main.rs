@@ -1504,7 +1504,10 @@ enum MaintainCommand {
         /// overshoot it, e.g. by a whole trace on the RSPAN path, so size the
         /// host for path-specific overshoot). Lower it for smaller segments on a
         /// small host; raise it for fewer, larger segments. Refused at 0.
-        /// Default 256 MiB (the compactor default).
+        /// Default: derived from the host's memory as MemTotal / 8 /
+        /// --bucket-concurrency, clamped to [256 MiB, 8 GiB]; 256 MiB when the
+        /// host memory cannot be read. The report prints the value and where it
+        /// came from.
         #[arg(long, value_name = "BYTES")]
         l1_part_memory_target_bytes: Option<u64>,
         /// Bound the encoded/on-object bytes a merge writes before it closes an
@@ -1533,11 +1536,12 @@ enum MaintainCommand {
         /// single 30 GB reference box; when you have not configured a budget,
         /// compact-tenant sets each bucket's budget to 20 GiB / N (integer
         /// division, floor). So each concurrent bucket may hold up to ~20 GiB / N
-        /// of cursor budget plus its in-progress writer split target (256 MiB by
-        /// default): at N=1 one bucket may hold ~20 GiB + 256 MiB; at N=4 each of
-        /// the four holds up to ~5 GiB + 256 MiB, so the aggregate stays ~20 GiB
-        /// of cursor budget plus ~1 GiB of writer targets, still inside the one
-        /// reference box. Dividing the budget is
+        /// of cursor budget plus its in-progress writer split target
+        /// (--l1-part-memory-target-bytes, by default MemTotal / 8 / N clamped
+        /// to [256 MiB, 8 GiB]): on a 30 GiB host at N=1 one bucket may hold
+        /// ~20 GiB + 3.75 GiB; at N=4 each of the four holds up to ~5 GiB +
+        /// 960 MiB, so the aggregate stays ~20 GiB of cursor budget plus
+        /// ~3.75 GiB of writer targets. Dividing the budget is
         /// what keeps N times the envelope inside one box instead of needing N
         /// boxes. A bucket whose merge no longer fits its 20 GiB / N share fails
         /// closed with the typed MergeCursorBudgetExceeded naming the figure to
@@ -4160,6 +4164,8 @@ mod tests {
 
     use ravel_cli::maintain::{self, CompactorKnobError};
 
+    const GIB: u64 = 1024 * 1024 * 1024;
+
     /// Destructure a parsed `maintain compact-tenant` invocation into the three
     /// new memory knobs plus dry-run/flush overrides, panicking on any other
     /// subcommand. Keeps each reachability test to the assertion it is about.
@@ -4225,19 +4231,28 @@ mod tests {
 
         let (dry_run, max_flush, mem_target, max_bytes, concurrency) = compact_tenant_knobs(cli);
 
-        let config = maintain::build_compactor_config(
+        // A 30 GiB host at bucket concurrency 2 would derive 2013265920; the
+        // flag must win over that verbatim, unclamped.
+        let (config, resolved) = maintain::build_compactor_config(
             dry_run,
             max_flush,
             mem_target,
             max_bytes,
             concurrency,
             None,
+            Some(30 * GIB),
+            2,
         )
         .expect("nonzero knobs build a config");
 
         assert_eq!(
             config.l1_part_memory_target_bytes, 12345,
             "--l1-part-memory-target-bytes must arrive in the config"
+        );
+        assert_eq!(
+            format!("l1_part_memory_target_bytes: {resolved}"),
+            "l1_part_memory_target_bytes: 12345 (set by flag)",
+            "the report line names the flag as the source"
         );
         assert_eq!(
             config.max_l1_part_bytes, 67890,
@@ -4251,6 +4266,96 @@ mod tests {
             config.merge_memory_tracker.is_some(),
             "a fresh MergeMemoryTracker must be installed so the phase-split event fires"
         );
+    }
+
+    /// Without `--l1-part-memory-target-bytes` the memory split target is
+    /// derived from the host memory over `--bucket-concurrency` (issue #2351):
+    /// 30 GiB / 8 / 2 = 2013265920, 128 GiB / 8 / 1 clamps to 8 GiB, and an
+    /// unreadable host memory falls back to 256 MiB. Each figure is pinned in
+    /// the config and in the report line.
+    ///
+    /// Non-vacuity (prove-the-test), each flip named:
+    /// - Drop the clamp from `derive_l1_part_memory_target_bytes`: the 128 GiB
+    ///   row reads 17179869184.
+    /// - Ignore `concurrent_merges` there (or pass 1 from
+    ///   `build_compactor_config`): the 30 GiB row reads 4026531840.
+    /// - Keep the 256 MiB struct default instead of resolving: both derived
+    ///   rows read 268435456.
+    #[test]
+    fn compact_tenant_memory_target_defaults_to_the_derived_value() {
+        let cli = Cli::try_parse_from([
+            "ravel",
+            "maintain",
+            "compact-tenant",
+            "--tenant",
+            "acme",
+            "--signal",
+            "logs",
+            "--bucket-concurrency",
+            "2",
+        ])
+        .expect("a compact-tenant invocation without the memory knob parses");
+        let Command::Maintain {
+            command:
+                super::MaintainCommand::CompactTenant {
+                    l1_part_memory_target_bytes,
+                    bucket_concurrency,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected the maintain compact-tenant subcommand");
+        };
+        assert_eq!(l1_part_memory_target_bytes, None);
+        assert_eq!(bucket_concurrency, 2);
+
+        for (host, merges, want_bytes, want_line) in [
+            (
+                Some(30 * GIB),
+                bucket_concurrency,
+                2_013_265_920,
+                "l1_part_memory_target_bytes: 2013265920 (resolved from a memory budget of \
+                 32212254720 over 2 concurrent merges)",
+            ),
+            (
+                Some(128 * GIB),
+                1,
+                8_589_934_592,
+                "l1_part_memory_target_bytes: 8589934592 (resolved from a memory budget of \
+                 137438953472 over 1 concurrent merges)",
+            ),
+            (
+                None,
+                bucket_concurrency,
+                268_435_456,
+                "l1_part_memory_target_bytes: 268435456 (fallback: the memory budget is unknown)",
+            ),
+        ] {
+            let (config, resolved) = maintain::build_compactor_config(
+                false,
+                None,
+                l1_part_memory_target_bytes,
+                None,
+                None,
+                None,
+                host,
+                merges,
+            )
+            .expect("no knobs build a config");
+            assert_eq!(
+                config.l1_part_memory_target_bytes, want_bytes,
+                "host {host:?}"
+            );
+            assert_eq!(
+                format!("l1_part_memory_target_bytes: {resolved}"),
+                want_line
+            );
+            assert_eq!(
+                maintain::l1_part_memory_target_fallback_note(&resolved).is_some(),
+                host.is_none(),
+                "the stderr note is printed for the fallback only"
+            );
+        }
     }
 
     /// `--no-claim` on `compact-bucket`, and its absence, reach the
@@ -4344,20 +4449,22 @@ mod tests {
     /// before anything accumulates).
     ///
     /// Non-vacuity (prove-the-test), each flip named:
-    /// - Remove the `if bytes == 0 { return Err(...) }` guard for
-    ///   `l1_part_memory_target_bytes` in `build_compactor_config`: this
-    ///   `ZeroL1PartMemoryTarget` assertion fails (it builds `Ok`).
+    /// - Remove the `== Some(0)` guard for `l1_part_memory_target_bytes` in
+    ///   `build_compactor_config`: this `ZeroL1PartMemoryTarget` assertion fails
+    ///   (it builds `Ok`), with or without a known host memory to derive from.
     /// - Remove the matching guard for `max_l1_part_bytes`: the
     ///   `ZeroMaxL1PartBytes` assertion fails.
     #[test]
     fn compact_tenant_zero_byte_targets_are_refused() {
+        for host in [None, Some(30 * GIB)] {
+            assert_eq!(
+                maintain::build_compactor_config(false, None, Some(0), None, None, None, host, 1)
+                    .expect_err("--l1-part-memory-target-bytes 0 must be refused"),
+                CompactorKnobError::ZeroL1PartMemoryTarget,
+            );
+        }
         assert_eq!(
-            maintain::build_compactor_config(false, None, Some(0), None, None, None)
-                .expect_err("--l1-part-memory-target-bytes 0 must be refused"),
-            CompactorKnobError::ZeroL1PartMemoryTarget,
-        );
-        assert_eq!(
-            maintain::build_compactor_config(false, None, None, Some(0), None, None)
+            maintain::build_compactor_config(false, None, None, Some(0), None, None, None, 1)
                 .expect_err("--max-l1-part-bytes 0 must be refused"),
             CompactorKnobError::ZeroMaxL1PartBytes,
         );
@@ -4431,23 +4538,41 @@ mod tests {
         };
         assert_eq!(tenant_level, Some(4));
 
-        let config =
-            maintain::build_compactor_config(false, None, None, None, None, compaction_zstd_level)
-                .expect("level 4 builds a config");
+        let (config, _) = maintain::build_compactor_config(
+            false,
+            None,
+            None,
+            None,
+            None,
+            compaction_zstd_level,
+            None,
+            1,
+        )
+        .expect("level 4 builds a config");
         assert_eq!(
             config.rlog_zstd_level, 4,
             "the flag must arrive in the config"
         );
-        let default = maintain::build_compactor_config(false, None, None, None, None, None)
-            .expect("no flag builds a config");
+        let (default, _) =
+            maintain::build_compactor_config(false, None, None, None, None, None, None, 1)
+                .expect("no flag builds a config");
         assert_eq!(
             default.rlog_zstd_level, 9,
             "no flag keeps the compactor default"
         );
         for level in [0, 23] {
             assert_eq!(
-                maintain::build_compactor_config(false, None, None, None, None, Some(level))
-                    .expect_err("an out-of-range level must be refused"),
+                maintain::build_compactor_config(
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(level),
+                    None,
+                    1
+                )
+                .expect_err("an out-of-range level must be refused"),
                 CompactorKnobError::InvalidRlogZstdLevel(ravel_maintain::RlogZstdLevelError {
                     level
                 }),
@@ -4465,8 +4590,9 @@ mod tests {
     /// fails.
     #[test]
     fn compact_tenant_zero_input_read_concurrency_is_allowed() {
-        let config = maintain::build_compactor_config(false, None, None, None, Some(0), None)
-            .expect("zero input-read-concurrency is tolerated, not refused");
+        let (config, _) =
+            maintain::build_compactor_config(false, None, None, None, Some(0), None, None, 1)
+                .expect("zero input-read-concurrency is tolerated, not refused");
         assert_eq!(
             config.input_read_concurrency, 0,
             "zero passes through unchanged; the merge clamps below-1 to 1 itself"

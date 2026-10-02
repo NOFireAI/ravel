@@ -527,27 +527,223 @@ pub const DEFAULT_MAX_COMPACTION_LIFETIME_NS: i64 = NS_PER_HOUR;
 /// bytes reach 256 MiB, so the memory target stays binding, the RLOG payload
 /// proxy never reaches 256 MiB, and no probe runs.
 ///
-/// Which target binds at these defaults therefore decides object size: it is
-/// [`DEFAULT_L1_PART_MEMORY_TARGET_BYTES`], and objects come out at 256 MiB
-/// divided by the schema's decoded-heap-to-stored ratio, well under this knob.
-/// Lowering this one does not grow objects, it caps them lower: once it drops
-/// below the size the memory target already yields it becomes the binding
-/// target and every part closes at it. Growing objects means raising
-/// `l1_part_memory_target_bytes` (with this knob at or above the object size
-/// wanted), which is the issue #872 follow-up; see
-/// [`CompactorConfig::max_l1_part_bytes`].
+/// Which target binds therefore decides object size: on a wide schema it is
+/// the memory split target, and objects come out at that target divided by the
+/// schema's decoded-heap-to-stored ratio. Lowering this knob does not grow
+/// objects, it caps them lower: once it drops below the size the memory target
+/// already yields it becomes the binding target and every part closes at it.
+/// The binaries derive the memory split target from the memory budget
+/// ([`derive_l1_part_memory_target_bytes`]), so on a host with memory to spare
+/// objects grow toward this cap; see [`CompactorConfig::max_l1_part_bytes`].
 pub const DEFAULT_MAX_L1_PART_BYTES: u64 = 256 * 1024 * 1024;
-/// Default `l1_part_memory_target_bytes`: 256 MiB. This is the **memory split
-/// target**: the decoded record-heap estimate the in-progress part is closed
-/// at, which issue #711 added to keep compactor peak memory survivable on an
-/// 8 GB host (a bucket carrying one wide stream once held 45.7 GB resident
-/// under a nominal 256 MiB cap that was measured in stored, not heap, bytes).
-/// It is a split target, not a ceiling on resident bytes; see
-/// [`CompactorConfig::l1_part_memory_target_bytes`] for what each path
-/// overshoots it by. Equal to [`DEFAULT_MAX_L1_PART_BYTES`] on purpose: the two
-/// jobs were one knob before this split and their shared default reproduces the
-/// old behaviour exactly.
+/// `l1_part_memory_target_bytes` in [`CompactorConfig::default`]: 256 MiB. This
+/// is the **memory split target**: the decoded record-heap estimate the
+/// in-progress part is closed at, which issue #711 added to keep compactor peak
+/// memory survivable on an 8 GB host. It is a split target, not a ceiling on
+/// resident bytes; see [`CompactorConfig::l1_part_memory_target_bytes`] for
+/// what each path overshoots it by.
+///
+/// `ravel-server` and `ravel-cli maintain` do not run with this constant when
+/// the operator leaves the knob unset: they resolve the target from the
+/// process memory budget with [`ResolvedL1PartMemoryTarget::resolve`]. This is
+/// the floor of that derivation and the value used when the budget is unknown.
 pub const DEFAULT_L1_PART_MEMORY_TARGET_BYTES: u64 = 256 * 1024 * 1024;
+/// Floor of the derived memory split target
+/// ([`derive_l1_part_memory_target_bytes`]): the fixed default the target had
+/// before it was derived, so no host gets smaller parts than it did then.
+pub const MIN_DERIVED_L1_PART_MEMORY_TARGET_BYTES: u64 = DEFAULT_L1_PART_MEMORY_TARGET_BYTES;
+/// Ceiling of the derived memory split target
+/// ([`derive_l1_part_memory_target_bytes`]): 8 GiB.
+pub const MAX_DERIVED_L1_PART_MEMORY_TARGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Share of the memory budget the derived memory split targets of all
+/// concurrent merges add up to: one eighth.
+pub const L1_PART_MEMORY_TARGET_BUDGET_DIVISOR: u64 = 8;
+
+/// The derived memory split target for one merge: `memory_budget_bytes / 8 /
+/// concurrent_merges`, clamped to
+/// [`MIN_DERIVED_L1_PART_MEMORY_TARGET_BYTES`]`..=`[`MAX_DERIVED_L1_PART_MEMORY_TARGET_BYTES`]
+/// (256 MiB to 8 GiB).
+///
+/// Dividing by `concurrent_merges` keeps the sum of the targets of every merge
+/// a process runs at once at one eighth of the budget while the per-merge value
+/// is inside the clamp. Below the floor the sum is `256 MiB *
+/// concurrent_merges`, which can exceed one eighth. `concurrent_merges` below 1
+/// is treated as 1. Integer division, truncating.
+pub fn derive_l1_part_memory_target_bytes(
+    memory_budget_bytes: u64,
+    concurrent_merges: usize,
+) -> u64 {
+    let merges = u64::try_from(concurrent_merges.max(1)).unwrap_or(u64::MAX);
+    (memory_budget_bytes / L1_PART_MEMORY_TARGET_BUDGET_DIVISOR / merges).clamp(
+        MIN_DERIVED_L1_PART_MEMORY_TARGET_BYTES,
+        MAX_DERIVED_L1_PART_MEMORY_TARGET_BYTES,
+    )
+}
+
+/// Where a resolved [`CompactorConfig::l1_part_memory_target_bytes`] came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum L1PartMemoryTargetSource {
+    /// The operator set it; used verbatim, never clamped.
+    Flag,
+    /// Derived by [`derive_l1_part_memory_target_bytes`] from this budget and
+    /// merge count.
+    Derived {
+        memory_budget_bytes: u64,
+        concurrent_merges: usize,
+    },
+    /// No flag and no known memory budget:
+    /// [`DEFAULT_L1_PART_MEMORY_TARGET_BYTES`].
+    Fallback,
+}
+
+/// A resolved memory split target and its provenance, which both binaries
+/// print once per run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedL1PartMemoryTarget {
+    pub bytes: u64,
+    pub source: L1PartMemoryTargetSource,
+}
+
+impl ResolvedL1PartMemoryTarget {
+    /// An explicit value wins verbatim (its zero refusal belongs to the caller
+    /// that parsed it). Otherwise a known budget derives the target with
+    /// [`derive_l1_part_memory_target_bytes`], and an unknown one falls back to
+    /// [`DEFAULT_L1_PART_MEMORY_TARGET_BYTES`].
+    pub fn resolve(
+        explicit: Option<u64>,
+        memory_budget_bytes: Option<u64>,
+        concurrent_merges: usize,
+    ) -> Self {
+        match (explicit, memory_budget_bytes) {
+            (Some(bytes), _) => ResolvedL1PartMemoryTarget {
+                bytes,
+                source: L1PartMemoryTargetSource::Flag,
+            },
+            (None, Some(budget)) => ResolvedL1PartMemoryTarget {
+                bytes: derive_l1_part_memory_target_bytes(budget, concurrent_merges),
+                source: L1PartMemoryTargetSource::Derived {
+                    memory_budget_bytes: budget,
+                    concurrent_merges: concurrent_merges.max(1),
+                },
+            },
+            (None, None) => ResolvedL1PartMemoryTarget {
+                bytes: DEFAULT_L1_PART_MEMORY_TARGET_BYTES,
+                source: L1PartMemoryTargetSource::Fallback,
+            },
+        }
+    }
+
+    /// `flag`, `derived` or `fallback`, for a structured log field.
+    pub fn source_name(&self) -> &'static str {
+        match self.source {
+            L1PartMemoryTargetSource::Flag => "flag",
+            L1PartMemoryTargetSource::Derived { .. } => "derived",
+            L1PartMemoryTargetSource::Fallback => "fallback",
+        }
+    }
+}
+
+impl std::fmt::Display for ResolvedL1PartMemoryTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.source {
+            L1PartMemoryTargetSource::Flag => write!(f, "{} (set by flag)", self.bytes),
+            L1PartMemoryTargetSource::Derived {
+                memory_budget_bytes,
+                concurrent_merges,
+            } => write!(
+                f,
+                "{} (resolved from a memory budget of {memory_budget_bytes} \
+                 over {concurrent_merges} concurrent merges)",
+                self.bytes
+            ),
+            L1PartMemoryTargetSource::Fallback => {
+                write!(f, "{} (fallback: the memory budget is unknown)", self.bytes)
+            }
+        }
+    }
+}
+
+/// This host's usable memory in bytes, for a process that has no memory budget
+/// of its own to derive from (`ravel-cli maintain`). On Linux it is
+/// `/proc/meminfo`'s `MemTotal` capped by a finite cgroup memory limit (v2
+/// `memory.max`, else v1 `memory.limit_in_bytes`), the rule `ravel-server`'s
+/// host detection applies; on macOS it is `sysctl -n hw.memsize`. `None` when
+/// none of these can be read or parsed, and on every other target.
+pub fn detect_host_memory_total_bytes() -> Option<u64> {
+    detect_host_memory_total_bytes_impl()
+}
+
+#[cfg(target_os = "linux")]
+fn detect_host_memory_total_bytes_impl() -> Option<u64> {
+    let mem_total = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|contents| parse_meminfo_total_bytes(&contents));
+    let cgroup_limit = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+        .ok()
+        .and_then(|contents| parse_cgroup_memory_limit(&contents))
+        .or_else(|| {
+            std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+                .ok()
+                .and_then(|contents| parse_cgroup_memory_limit(&contents))
+        });
+    match (mem_total, cgroup_limit) {
+        (Some(total), Some(limit)) => Some(total.min(limit)),
+        (total, limit) => total.or(limit),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn detect_host_memory_total_bytes_impl() -> Option<u64> {
+    let output = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_sysctl_memsize(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn detect_host_memory_total_bytes_impl() -> Option<u64> {
+    None
+}
+
+/// `MemTotal:       32137720 kB` in bytes. A missing line, a non-numeric
+/// count or an unknown unit is `None`.
+#[cfg(any(target_os = "linux", test))]
+fn parse_meminfo_total_bytes(meminfo: &str) -> Option<u64> {
+    let line = meminfo.lines().find(|line| line.starts_with("MemTotal:"))?;
+    let mut fields = line.split_whitespace().skip(1);
+    let value: u64 = fields.next()?.parse().ok()?;
+    match fields.next() {
+        Some("kB") | Some("KB") => value.checked_mul(1024),
+        None => Some(value),
+        Some(_) => None,
+    }
+}
+
+/// A cgroup memory limit file as a finite byte limit. `max`, the v1 no-limit
+/// sentinel (any value at or above 2^60), `0` and anything malformed are
+/// `None`, so an unlimited cgroup caps nothing.
+#[cfg(any(target_os = "linux", test))]
+fn parse_cgroup_memory_limit(contents: &str) -> Option<u64> {
+    let raw = contents.trim();
+    if raw == "max" {
+        return None;
+    }
+    let bytes: u64 = raw.parse().ok()?;
+    if bytes == 0 || bytes >= 1 << 60 {
+        return None;
+    }
+    Some(bytes)
+}
+
+/// `sysctl -n hw.memsize` output (a decimal byte count) in bytes.
+#[cfg(any(target_os = "macos", test))]
+fn parse_sysctl_memsize(output: &str) -> Option<u64> {
+    output.trim().parse().ok().filter(|bytes| *bytes > 0)
+}
 /// Default minimum L0 records for a bucket to be worth compacting.
 pub const DEFAULT_MIN_COMPACTION_INPUTS: usize = 2;
 /// Default `claim_min_input_bytes`: 64 MiB of listed input bytes (ADR-1029
@@ -996,13 +1192,12 @@ pub struct CompactorConfig {
     /// `max_l1_part_bytes` name always implied. It does NOT bound memory; neither
     /// does [`Self::l1_part_memory_target_bytes`], which is a split target in
     /// decoded heap. A part closes on whichever of the two is reached first.
-    /// Default [`DEFAULT_MAX_L1_PART_BYTES`] (256 MiB), chosen so today's geometry
-    /// is unchanged (issue #872): at the defaults the binding target is
-    /// [`Self::l1_part_memory_target_bytes`], not this one, so objects come out
-    /// at the memory target divided by the schema's heap-to-stored ratio.
-    /// Lowering this knob therefore does not grow objects, it caps them lower;
-    /// growing objects means raising [`Self::l1_part_memory_target_bytes`] and
-    /// keeping this one at or above the object size wanted.
+    /// Default [`DEFAULT_MAX_L1_PART_BYTES`] (256 MiB). On a wide schema the
+    /// binding target is usually [`Self::l1_part_memory_target_bytes`], not
+    /// this one, so objects come out at the memory target divided by the
+    /// schema's heap-to-stored ratio. Lowering this knob therefore does not
+    /// grow objects, it caps them lower; it is the operator's cap on stored
+    /// object size whatever the memory target resolves to.
     pub max_l1_part_bytes: u64,
     /// The **memory split target**: close the in-progress L1 part once its
     /// decoded record-heap estimate reaches this
@@ -1037,8 +1232,16 @@ pub struct CompactorConfig {
     /// heap. It was `max_l1_part_memory_bytes`, which reads as a resident-bytes
     /// ceiling an operator can size a host from, and none of the three paths
     /// enforces one. A part closes on whichever of this and
-    /// [`Self::max_l1_part_bytes`] is reached first. Default
-    /// [`DEFAULT_L1_PART_MEMORY_TARGET_BYTES`] (256 MiB).
+    /// [`Self::max_l1_part_bytes`] is reached first.
+    ///
+    /// [`Self::default`] carries [`DEFAULT_L1_PART_MEMORY_TARGET_BYTES`]
+    /// (256 MiB). `ravel-server` and `ravel-cli maintain` replace it unless the
+    /// operator sets the knob: they resolve it with
+    /// [`ResolvedL1PartMemoryTarget::resolve`] as `memory_budget / 8 /
+    /// concurrent_merges` clamped to 256 MiB..=8 GiB
+    /// ([`derive_l1_part_memory_target_bytes`]), so part size follows host
+    /// memory instead of a fixed number that splits wide-schema parts long
+    /// before [`Self::max_l1_part_bytes`] (issue #2351).
     pub l1_part_memory_target_bytes: u64,
     /// Buckets with fewer L0 records than this are left uncompacted; set 1 for
     /// v1-retirement campaigns.
@@ -1475,5 +1678,166 @@ impl RetentionConfig {
     /// and tests).
     pub fn floor_ns(&self) -> i64 {
         self.floor_ns
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+
+    /// The issue #2351 acceptance figures, pinned exactly. A derivation without
+    /// the clamp gives 16 GiB for the 128 GiB row and 128 MiB for the 1 GiB
+    /// row; one that divides by 4 or 16 instead of 8 fails the 30 GiB row.
+    #[test]
+    fn derived_target_is_one_eighth_of_the_budget_clamped() {
+        assert_eq!(derive_l1_part_memory_target_bytes(2 * GIB, 1), 256 * MIB);
+        assert_eq!(derive_l1_part_memory_target_bytes(2 * GIB, 1), 268_435_456);
+        assert_eq!(
+            derive_l1_part_memory_target_bytes(30 * GIB, 1),
+            4_026_531_840
+        );
+        assert_eq!(4_026_531_840, 3 * GIB + 3 * GIB / 4);
+        assert_eq!(derive_l1_part_memory_target_bytes(128 * GIB, 1), 8 * GIB);
+        assert_eq!(
+            derive_l1_part_memory_target_bytes(128 * GIB, 1),
+            8_589_934_592
+        );
+        // Below the floor: 1 GiB / 8 = 128 MiB clamps up to 256 MiB.
+        assert_eq!(derive_l1_part_memory_target_bytes(GIB, 1), 256 * MIB);
+        assert_eq!(derive_l1_part_memory_target_bytes(0, 1), 256 * MIB);
+        assert_eq!(derive_l1_part_memory_target_bytes(u64::MAX, 1), 8 * GIB);
+    }
+
+    #[test]
+    fn derived_target_divides_by_concurrent_merges() {
+        assert_eq!(
+            derive_l1_part_memory_target_bytes(30 * GIB, 2),
+            2_013_265_920
+        );
+        assert_eq!(
+            derive_l1_part_memory_target_bytes(30 * GIB, 2) * 2,
+            derive_l1_part_memory_target_bytes(30 * GIB, 1)
+        );
+        // 28 GiB (a 30 GiB host less the server's 2 GiB reserve) over 4 units.
+        assert_eq!(derive_l1_part_memory_target_bytes(28 * GIB, 4), 939_524_096);
+        // The clamp applies after the division: 128 GiB over 2 merges is 8 GiB
+        // each, and over 4 merges 4 GiB each (clamping first would give 4 GiB
+        // and 2 GiB).
+        assert_eq!(derive_l1_part_memory_target_bytes(128 * GIB, 2), 8 * GIB);
+        assert_eq!(derive_l1_part_memory_target_bytes(128 * GIB, 4), 4 * GIB);
+        // The floor holds per merge, so a small budget over many merges stays at
+        // 256 MiB each.
+        assert_eq!(derive_l1_part_memory_target_bytes(2 * GIB, 8), 256 * MIB);
+        // Zero merges is one merge, not a division by zero.
+        assert_eq!(
+            derive_l1_part_memory_target_bytes(30 * GIB, 0),
+            derive_l1_part_memory_target_bytes(30 * GIB, 1)
+        );
+    }
+
+    /// A flag wins over the derivation and is not clamped either way: a
+    /// resolution that let the budget win would print 4026531840 here, and one
+    /// that clamped the flag would turn 64 MiB into 256 MiB and 16 GiB into
+    /// 8 GiB.
+    #[test]
+    fn explicit_value_overrides_the_derivation_verbatim() {
+        for explicit in [1, 64 * MIB, 16 * GIB] {
+            let resolved = ResolvedL1PartMemoryTarget::resolve(Some(explicit), Some(30 * GIB), 1);
+            assert_eq!(resolved.bytes, explicit);
+            assert_eq!(resolved.source, L1PartMemoryTargetSource::Flag);
+            assert_eq!(resolved.source_name(), "flag");
+            assert_eq!(resolved.to_string(), format!("{explicit} (set by flag)"));
+        }
+        // An explicit value also wins when the budget is unknown.
+        let resolved = ResolvedL1PartMemoryTarget::resolve(Some(64 * MIB), None, 1);
+        assert_eq!(resolved.bytes, 64 * MIB);
+        assert_eq!(resolved.source, L1PartMemoryTargetSource::Flag);
+    }
+
+    /// Validation is the caller's and is unchanged: a zero flag reaches the
+    /// caller as zero (so `ravel-cli`'s `ZeroL1PartMemoryTarget` refusal and
+    /// the server's flag refusal still see it) rather than being replaced by a
+    /// derived or clamped value that would hide the operator error.
+    #[test]
+    fn explicit_zero_is_passed_through_for_the_caller_to_refuse() {
+        let resolved = ResolvedL1PartMemoryTarget::resolve(Some(0), Some(30 * GIB), 1);
+        assert_eq!(resolved.bytes, 0);
+        assert_eq!(resolved.source, L1PartMemoryTargetSource::Flag);
+    }
+
+    #[test]
+    fn unset_flag_derives_from_a_known_budget_and_says_so() {
+        let resolved = ResolvedL1PartMemoryTarget::resolve(None, Some(30 * GIB), 2);
+        assert_eq!(resolved.bytes, 2_013_265_920);
+        assert_eq!(
+            resolved.source,
+            L1PartMemoryTargetSource::Derived {
+                memory_budget_bytes: 32_212_254_720,
+                concurrent_merges: 2,
+            }
+        );
+        assert_eq!(resolved.source_name(), "derived");
+        assert_eq!(
+            resolved.to_string(),
+            "2013265920 (resolved from a memory budget of 32212254720 over 2 concurrent merges)"
+        );
+    }
+
+    #[test]
+    fn unset_flag_without_a_budget_falls_back_to_256_mib() {
+        let resolved = ResolvedL1PartMemoryTarget::resolve(None, None, 4);
+        assert_eq!(resolved.bytes, 268_435_456);
+        assert_eq!(resolved.source, L1PartMemoryTargetSource::Fallback);
+        assert_eq!(resolved.source_name(), "fallback");
+        assert_eq!(
+            resolved.to_string(),
+            "268435456 (fallback: the memory budget is unknown)"
+        );
+        // The fallback is the struct default, so a library caller that never
+        // resolves keeps the same geometry as before.
+        assert_eq!(
+            CompactorConfig::default().l1_part_memory_target_bytes,
+            resolved.bytes
+        );
+    }
+
+    #[test]
+    fn meminfo_total_parses_kib_and_rejects_garbage() {
+        let meminfo = "MemFree:         1000 kB\nMemTotal:       32137720 kB\nBuffers: 1 kB\n";
+        assert_eq!(parse_meminfo_total_bytes(meminfo), Some(32_137_720 * 1024));
+        assert_eq!(parse_meminfo_total_bytes("MemTotal: 4096\n"), Some(4096));
+        assert_eq!(parse_meminfo_total_bytes("MemFree: 1000 kB\n"), None);
+        assert_eq!(parse_meminfo_total_bytes("MemTotal: lots kB\n"), None);
+        assert_eq!(parse_meminfo_total_bytes("MemTotal: 10 MB\n"), None);
+        assert_eq!(parse_meminfo_total_bytes(""), None);
+    }
+
+    #[test]
+    fn cgroup_limit_treats_unlimited_as_none() {
+        assert_eq!(parse_cgroup_memory_limit("8589934592\n"), Some(8 * GIB));
+        assert_eq!(parse_cgroup_memory_limit("max\n"), None);
+        assert_eq!(parse_cgroup_memory_limit("9223372036854771712\n"), None);
+        assert_eq!(parse_cgroup_memory_limit("0\n"), None);
+        assert_eq!(parse_cgroup_memory_limit("eight gigs"), None);
+    }
+
+    #[test]
+    fn sysctl_memsize_parses_a_byte_count() {
+        assert_eq!(parse_sysctl_memsize("17179869184\n"), Some(16 * GIB));
+        assert_eq!(parse_sysctl_memsize("0\n"), None);
+        assert_eq!(parse_sysctl_memsize(""), None);
+    }
+
+    /// Every executor and CI host this runs on is Linux with a readable
+    /// `/proc/meminfo`, so detection returns a plausible non-zero figure.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn host_memory_is_detected_on_linux() {
+        let bytes = detect_host_memory_total_bytes().expect("MemTotal readable on Linux");
+        assert!(bytes >= 256 * MIB, "detected {bytes} bytes");
     }
 }

@@ -2204,3 +2204,72 @@ async fn compact_bucket_reports_a_claim_lost_mid_merge_and_exits_zero() {
     // Create, then the renewal that lost its CAS; no completion.
     assert_eq!(store.requests_on("put", &key), 2);
 }
+
+/// The `l1_part_memory_target_bytes:` line of the compact-tenant report
+/// (issue #2351): with no flag it names the value derived from this host's
+/// memory over `--bucket-concurrency`, and with the flag it says the flag set
+/// it.
+///
+/// Non-vacuity (prove-the-test), each flip named:
+/// - Pass `1` instead of `bucket_concurrency` to `build_compactor_config` in
+///   `compact_tenant_to`: the "over 2 concurrent merges" line fails.
+/// - Pass `None` instead of the detected host memory: the derived line fails
+///   (it reads the 256 MiB fallback).
+/// - Let the derivation win over an explicit value: the "12345 (set by flag)"
+///   line fails.
+#[tokio::test]
+async fn report_names_the_resolved_l1_part_memory_target() {
+    let host = ravel_maintain::detect_host_memory_total_bytes()
+        .expect("host memory is readable where this suite runs");
+    let expected_derived = ravel_maintain::derive_l1_part_memory_target_bytes(host, 2);
+    // A host large enough that the two-merge division lands inside the clamp,
+    // so a wiring that passed one merge instead of two prints a different
+    // number, not the same floor.
+    assert!(
+        host / 8 / 2 > 256 * 1024 * 1024,
+        "host memory {host} too small to tell concurrency 1 from 2"
+    );
+
+    for (flag, want) in [
+        (
+            None,
+            format!(
+                "\nl1_part_memory_target_bytes: {expected_derived} (resolved from a memory \
+                 budget of {host} over 2 concurrent merges)\n"
+            ),
+        ),
+        (
+            Some(12345),
+            "\nl1_part_memory_target_bytes: 12345 (set by flag)\n".to_string(),
+        ),
+    ] {
+        let store = seed_tenant().await;
+        let mut out: Vec<u8> = Vec::new();
+        compact_tenant_to(
+            &mut out,
+            store,
+            MEMORY,
+            TENANT,
+            SignalArg::Logs,
+            Some(SHARDS),
+            None,
+            None,
+            true,
+            None,
+            flag,
+            None,
+            None,
+            2,
+            None,
+            now_ns(),
+            &ClaimOptions::fresh(),
+        )
+        .await
+        .expect("dry-run compact-tenant runs");
+        let text = String::from_utf8(out).expect("utf-8");
+        assert!(
+            text.contains(&want),
+            "flag {flag:?}: want {want:?} in {text}"
+        );
+    }
+}
