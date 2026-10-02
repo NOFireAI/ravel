@@ -77,9 +77,12 @@ use crate::key::CacheKey;
 use crate::metrics::CacheMetrics;
 use crate::single_flight::{Role, SingleFlight, SingleFlightError};
 
-/// Where the bytes a [`TieredCache::get_or_fetch`] call returned came from,
-/// so the caller can account for it (ADR-0044): a cache hit crossed no
-/// network, an upstream fetch did.
+/// Where the bytes a [`TieredCache::get_or_fetch`] or
+/// [`Cache::get_or_fetch_with_source`] call returned came from, so the caller
+/// can account for it (ADR-0044): a cache hit crossed no network, an upstream
+/// fetch did. The variant docs below describe the tiered handle; see
+/// `get_or_fetch_with_source` for the RAM tier's labelling, which reports a
+/// follower as [`Source::Cache`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
     /// A tier already populated before this call served the bytes: the RAM
@@ -186,9 +189,9 @@ where
     /// corrupted; a [`Source::Upstream`] result is the clean fetched bytes.
     ///
     /// **Error-path accounting (issue #656).** When `fetch` fails this method
-    /// records neither a hit nor a miss: it threads the error straight out
-    /// (the follower's single-flight collapse is still counted, because a
-    /// collapse happened regardless of the leader's outcome). Hit/miss
+    /// records neither a hit nor a miss: it threads the error straight out,
+    /// before the follower's single-flight collapse is recorded, so a follower
+    /// of a failed fetch counts no collapse either. Hit/miss
     /// accounting is the caller's, keyed off the returned [`Source`] on the
     /// success path -- this handle has no `QueryAccounting` and takes no
     /// opinion on whether a faulted upstream GET should count as a miss. A
@@ -494,6 +497,23 @@ where
         }
         let disk = self.disk.clone();
         let bytes = tokio::task::spawn_blocking(move || disk.get(&key))
+            .await
+            .unwrap_or(None)?;
+        Some(self.admit_disk_hit(key, bytes))
+    }
+
+    /// [`get_off_worker`](Self::get_off_worker) recording neither a hit nor a
+    /// miss on either tier, for a caller whose earlier `get` already accounted
+    /// this request and that looks again because the entry may have been
+    /// admitted since (`BlockRangeFetcher`'s re-peek of a coalesced run's
+    /// non-lead blocks). The same RAM-then-disk order, the same read-through
+    /// RAM admission on a disk hit, and the same serve-time corruption.
+    pub async fn peek_uncounted_off_worker(&self, key: CacheKey) -> Option<Bytes> {
+        if let Some(bytes) = self.ram.peek_uncounted(&key) {
+            return Some(bytes);
+        }
+        let disk = self.disk.clone();
+        let bytes = tokio::task::spawn_blocking(move || disk.get_uncounted(&key))
             .await
             .unwrap_or(None)?;
         Some(self.admit_disk_hit(key, bytes))

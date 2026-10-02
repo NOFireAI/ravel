@@ -499,7 +499,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now counts as one cache miss and nothing else. Before, a non-lead block that
   another flight admitted in the meantime also counted a cache hit and its
   bytes, and one served by the RAM recheck counted a second miss (issue
-  #2293).
+  #2293). On the RAM-only cache, a metrics read or a log whole-object or
+  extent read served by the RAM recheck or by another read's in-flight GET now
+  counts no GET in its span, `GetCost`, `live_gets` or peak fetch run, and
+  counts a cache hit; a log read's second look at a coalesced run's blocks
+  records no RAM or disk hit or miss; and `block_cache_hits` counts only the
+  blocks whose first peek hit, as the query accounting does (issue #2311).
 - **Query processes classify fold lag against the maintain processes' fold
   interval** (issue #2074). A request-budget refusal names fold lag once the
   unsealed tail passes `healthy_tail_max + fold_interval + head_cache_ttl`
