@@ -549,16 +549,33 @@ pub fn build_sql_state(
 }
 
 /// The minimum DDL sweep grace, in milliseconds, for a deployment whose
-/// bootstrapped `sys/gc` records `max_query_duration_ns`. A negative value (a
-/// corrupt or hand-edited record) refuses startup naming `sys/gc` instead of
-/// wrapping or rounding to zero, which would let a `DROP` outrun a running
-/// query.
+/// bootstrapped `sys/gc` records `max_query_duration_ns`. This is the floor
+/// `ravel_pqtable::sweep::plan` enforces for `ravel-cli parquet sweep`
+/// (ADR-2040), not protection for a running query: DDL itself never deletes a
+/// manifest version, only a sweep does, run out-of-band by an operator. The
+/// floor instead bounds a writer's own resolve-to-put window --
+/// `ravel_pqtable::writer::apply` finishes its put within half of it. A
+/// negative record (a corrupt or hand-edited `sys/gc`), and a value that
+/// converts to less than [`WRITER_MIN_USABLE_GRACE_MS`] -- 0 included --
+/// refuse startup naming `sys/gc`, rather than letting every future
+/// `CREATE`/`CREATE OR REPLACE` fail with `NoPutBudget` instead.
+#[cfg(feature = "sql")]
+pub(crate) const WRITER_MIN_USABLE_GRACE_MS: u64 = 2;
+
 #[cfg(feature = "sql")]
 pub(crate) fn ddl_min_grace_ms(max_query_duration_ns: i64) -> anyhow::Result<u64> {
     if max_query_duration_ns < 0 {
         anyhow::bail!("sys/gc records a negative max_query_duration_ns ({max_query_duration_ns})");
     }
-    Ok(u64::try_from(max_query_duration_ns / 1_000_000)?)
+    let grace_ms = u64::try_from(max_query_duration_ns / 1_000_000)?;
+    if grace_ms < WRITER_MIN_USABLE_GRACE_MS {
+        anyhow::bail!(
+            "sys/gc's max_query_duration_ns ({max_query_duration_ns}) converts to a DDL sweep \
+             grace of {grace_ms} ms, below the {WRITER_MIN_USABLE_GRACE_MS} ms \
+             ravel_pqtable::writer::apply needs to leave any resolve-to-put budget"
+        );
+    }
+    Ok(grace_ms)
 }
 
 /// [`build_sql_state`] with Parquet tables queryable (ADR-2040): the executor
@@ -576,11 +593,12 @@ pub(crate) fn ddl_min_grace_ms(max_query_duration_ns: i64) -> anyhow::Result<u64
 ///
 /// `ddl_min_grace_ms` is installed on the executor via
 /// `SqlExecutor::with_ddl_min_grace_ms` (ADR-2040): the deployment's
-/// `sys/gc` `max_query_duration_ns`, in milliseconds, so a `DROP`/replacing
-/// `CREATE OR REPLACE` cannot delete a version a query started against this
-/// process's own `max_query_duration` could still be reading. The caller
-/// derives it from the already-bootstrapped `GcConfigValues` rather than
-/// this function re-reading `sys/gc`.
+/// `sys/gc` `max_query_duration_ns`, in milliseconds, passed down to
+/// `ravel_pqtable::writer::apply` for every `CREATE`/`CREATE OR REPLACE` this
+/// executor runs. It bounds the writer's own resolve-to-put window, not a
+/// running query: DDL never deletes a manifest version, only `ravel-cli
+/// parquet sweep` does. The caller derives it from the already-bootstrapped
+/// `GcConfigValues` rather than this function re-reading `sys/gc`.
 #[cfg(feature = "sql")]
 #[allow(clippy::too_many_arguments)]
 pub fn build_sql_state_with_parquet(
@@ -1856,10 +1874,65 @@ mod tests {
         assert_ne!(7_000, ravel_sql::DEFAULT_MIN_GRACE_MS);
     }
 
+    /// `main`/`lib.rs`'s startup path is `ddl_min_grace_ms(config.gc.
+    /// max_query_duration_ns)` fed straight into `build_sql_state_with_parquet`.
+    /// This chains the two the same way, from a `max_query_duration_ns` that
+    /// converts to a value other than `DEFAULT_MIN_GRACE_MS`, so a regression
+    /// at that call site back to the literal default fails here rather than
+    /// only at the first `CREATE` a real deployment runs.
+    #[test]
+    fn the_startup_computed_grace_reaches_the_executor() {
+        let max_query_duration_ns: i64 = 3 * 60 * 1_000_000_000; // 3 minutes
+        let expected_ms = ddl_min_grace_ms(max_query_duration_ns).expect("grace");
+        assert_ne!(
+            expected_ms,
+            ravel_sql::DEFAULT_MIN_GRACE_MS,
+            "sanity: the test value must actually differ from the default"
+        );
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog = build_catalog(
+            store.clone(),
+            1,
+            false,
+            ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+            None,
+            None,
+            None,
+            Duration::from_secs(2),
+        )
+        .expect("catalog");
+        let state = build_sql_state_with_parquet(
+            catalog,
+            store,
+            Arc::new(StaticBearerTokenResolver::new(HashMap::new())),
+            None,
+            EngineConfig::default(),
+            Arc::new(GetLimiter::new(1).expect("nonzero permits")),
+            ravel_sql::DEFAULT_MAX_QUERY_BYTES,
+            DEFAULT_MAX_TENANT_BYTES,
+            false,
+            Arc::new(crate::metrics::QueryAccountingMetrics::new(
+                std::collections::HashSet::new(),
+            )),
+            QueryAdmissionController::shared(ravel_query::QueryConcurrencyLimit::Unlimited),
+            None,
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
+            None,
+            expected_ms,
+        )
+        .expect("sql state builds");
+        assert_eq!(state.executor.ddl_min_grace_ms(), expected_ms);
+    }
+
     #[test]
     fn the_ddl_min_grace_is_sys_gc_max_query_duration_in_milliseconds() {
         assert_eq!(ddl_min_grace_ms(600_000_000_000).expect("grace"), 600_000);
-        assert_eq!(ddl_min_grace_ms(0).expect("grace"), 0);
+        assert_eq!(
+            ddl_min_grace_ms(2_000_000).expect("grace"),
+            2,
+            "the writer's usable-grace boundary itself must still be accepted"
+        );
     }
 
     /// Any negative value is refused, including one that integer division by a
@@ -1868,6 +1941,19 @@ mod tests {
     fn a_negative_sys_gc_max_query_duration_fails_naming_sys_gc() {
         for ns in [-1, -999_999, -1_000_000, i64::MIN] {
             let err = ddl_min_grace_ms(ns).expect_err("negative must refuse startup");
+            assert!(err.to_string().contains("sys/gc"), "{ns}: {err}");
+        }
+    }
+
+    /// `ravel_pqtable::writer::apply` refuses a grace whose half rounds down to
+    /// zero with `NoPutBudget`: a value that would convert to such a grace,
+    /// 0 included, must refuse startup instead of deferring the failure to the
+    /// first `CREATE` the deployment ever runs.
+    #[test]
+    fn a_grace_below_the_writers_usable_minimum_fails_naming_sys_gc() {
+        for ns in [0, 1, 999_999, 1_000_000, 1_999_999] {
+            let err =
+                ddl_min_grace_ms(ns).expect_err("below the writer's usable minimum must refuse");
             assert!(err.to_string().contains("sys/gc"), "{ns}: {err}");
         }
     }

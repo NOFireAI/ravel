@@ -528,43 +528,30 @@ pub enum StatementKind {
     Ddl,
 }
 
-/// Classify `sql`'s statement kind by parsing it through
-/// [`complexity_guard::parse_guarded`] (never a second parser front end) and
-/// inspecting the top-level statement. [`StatementKind::Ddl`] is any CREATE or
-/// DROP form -- `CREATE TABLE`, `CREATE VIEW`, `CREATE EXTERNAL TABLE`, `DROP
-/// TABLE`, `DROP VIEW`, and so on -- so that a statement like `CREATE TABLE`
-/// or `DROP VIEW` routes to [`validate_ddl`] and is refused there with its own
-/// typed error, rather than falling into [`validate_query`]'s generic
-/// `NotReadOnly` message.
+/// Classify `sql`'s statement kind on its leading keyword alone, without
+/// parsing. [`StatementKind::Ddl`] is a statement whose first real token --
+/// skipping whitespace, `--` comments, and nested plain `/* */` comments the
+/// same way [`complexity_guard::check`] does -- `eq_ignore_ascii_case`s
+/// `CREATE` or `DROP`, whatever a parse of the rest would find: `CREATE
+/// TABLE`, `CREATE ROLE`, a syntax error after `DROP`, and `DROP TABLE a;
+/// DROP TABLE b` all route here alike, and [`validate_ddl`] is what actually
+/// accepts or refuses the three admitted forms.
 ///
-/// Every other case -- text that does not parse, is too complex, holds more
-/// than one statement, or whose top-level statement is neither a CREATE nor a
-/// DROP form -- returns [`StatementKind::Query`], unchanged from today: those
-/// cases keep producing [`validate_query`]'s existing error, since this
-/// function never itself raises one.
+/// Every other case -- an empty statement, one that starts with anything
+/// else, or one whose first token is a quote or a `/*!` hint rather than an
+/// identifier -- returns [`StatementKind::Query`], unchanged from today:
+/// those cases keep producing [`validate_query`]'s existing error, since this
+/// function never itself raises one. This is deliberately not "parse, then
+/// look at the top-level statement": a statement that routes to `Query` has
+/// paid no parse at all, which is every `SELECT`.
 pub fn statement_kind(sql: &str) -> StatementKind {
-    let Ok(statements) = complexity_guard::parse_guarded(sql) else {
-        return StatementKind::Query;
-    };
-    if statements.len() != 1 {
-        return StatementKind::Query;
-    }
-    match statements.front() {
-        Some(DFStatement::CreateExternalTable(_)) => StatementKind::Ddl,
-        Some(DFStatement::Statement(inner)) => match inner.as_ref() {
-            Statement::CreateTable(_)
-            | Statement::CreateView { .. }
-            | Statement::CreateSchema { .. }
-            | Statement::CreateDatabase { .. }
-            | Statement::CreateIndex(_)
-            | Statement::CreateFunction(_)
-            | Statement::Drop { .. } => StatementKind::Ddl,
-            _ => StatementKind::Query,
-        },
-        Some(DFStatement::CopyTo(_))
-        | Some(DFStatement::Explain(_))
-        | Some(DFStatement::Reset(_))
-        | None => StatementKind::Query,
+    match complexity_guard::leading_keyword(sql) {
+        Some(keyword)
+            if keyword.eq_ignore_ascii_case("CREATE") || keyword.eq_ignore_ascii_case("DROP") =>
+        {
+            StatementKind::Ddl
+        }
+        _ => StatementKind::Query,
     }
 }
 
@@ -1223,62 +1210,38 @@ mod tests {
         );
     }
 
+    /// `statement_kind` routes on the leading keyword alone: a parse never
+    /// runs, so a statement that is syntactically invalid, over-complex, or
+    /// holds several statements routes exactly like a valid one with the same
+    /// first keyword.
     #[test]
-    fn statement_kind_routes_select_to_query() {
+    fn statement_kind_routes_on_the_first_keyword() {
         for sql in [
-            "SELECT 1",
-            "SELECT * FROM samples",
-            "WITH c AS (SELECT 1) SELECT * FROM c",
-        ] {
-            assert_eq!(statement_kind(sql), StatementKind::Query, "{sql}");
-        }
-    }
-
-    #[test]
-    fn statement_kind_routes_create_and_drop_forms_to_ddl() {
-        for sql in [
-            "CREATE EXTERNAL TABLE t STORED AS PARQUET LOCATION 's3://b/p/'",
-            "CREATE OR REPLACE EXTERNAL TABLE t STORED AS PARQUET LOCATION 's3://b/p/'",
-            "CREATE TABLE t (a INT)",
-            "CREATE VIEW v AS SELECT 1",
-            "CREATE SCHEMA s",
-            "CREATE DATABASE d",
-            "DROP TABLE t",
-            "DROP VIEW v",
-            "DROP TABLE IF EXISTS t",
+            "create table t (a int)",
+            "DROP FUNCTION f",
+            "CREATE ROLE r",
+            "CREATE (",
+            "DROP",
+            "DROP TABLE a; DROP TABLE b",
+            "-- note\nCREATE TABLE t (a INT)",
+            "/* c */ DROP TABLE t",
+            "  \n\tCrEaTe TABLE t (a INT)",
         ] {
             assert_eq!(statement_kind(sql), StatementKind::Ddl, "{sql}");
         }
-    }
-
-    /// Everything else outside the CREATE/DROP forms -- including the rest of
-    /// the DDL/DML/transaction-control surface `validate_query` already
-    /// refuses -- keeps routing to `Query`, so those statements keep
-    /// producing `validate_query`'s existing error unchanged.
-    #[test]
-    fn statement_kind_routes_other_statements_to_query() {
         for sql in [
-            "INSERT INTO samples VALUES (1, 2.0)",
-            "UPDATE samples SET value = 1",
-            "DELETE FROM samples",
-            "COPY (SELECT 1) TO 's3://evil/out.parquet'",
-            "EXPLAIN SELECT 1",
-            "SET datafusion.execution.batch_size = 1",
+            "CREATED",
+            "DROPX",
+            "'CREATE'",
+            "\"CREATE\"",
+            "-- CREATE\nSELECT 1",
+            "SELECT 1; DROP TABLE t",
             "ALTER TABLE t ADD COLUMN c INT",
-            "BEGIN TRANSACTION",
+            "TRUNCATE TABLE t",
+            "",
         ] {
             assert_eq!(statement_kind(sql), StatementKind::Query, "{sql}");
         }
-    }
-
-    /// Text that fails to parse, is too complex, or holds several statements
-    /// is not itself refused here: it routes to `Query` and keeps producing
-    /// `validate_query`'s own error for each of those cases.
-    #[test]
-    fn statement_kind_routes_unparseable_too_complex_and_multi_statement_to_query() {
-        assert_eq!(statement_kind("SELECT ("), StatementKind::Query);
-        assert_eq!(statement_kind(""), StatementKind::Query);
-        assert_eq!(statement_kind("SELECT 1; SELECT 2"), StatementKind::Query);
 
         let too_complex = format!(
             "SELECT 1{}",

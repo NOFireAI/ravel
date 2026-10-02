@@ -417,8 +417,9 @@ existing caller keeps the old gate by construction: the alerting rules
 engine and the MCP server (ADR-1374, whose default profile is read-only)
 never reach DDL. `validate` splits into `validate_query` (the existing rule,
 exactly one read-only `SELECT`) and `validate_ddl`, which returns the typed
-intent. HTTP `POST /api/v1/sql` routes by statement kind. Flight SQL's
-`CommandStatementUpdate` is a later change.
+intent. HTTP `POST /api/v1/sql` routes by statement kind, on the exact rule
+the HTTP DDL amendment below states. Flight SQL's `CommandStatementUpdate`
+is a later change.
 
 **Who may run DDL.** A token resolves to a bare `TenantId` today
 (`services/ravel-server/src/tenant.rs`). The resolver output gains a `ddl`
@@ -426,8 +427,9 @@ capability: a suffix in the static token map, or a claim for OIDC. It is
 absent by default, and a DDL statement without it is refused with 403.
 
 **Audit.** Every DDL statement, admitted or refused, writes an
-`AuditRecord`. `redact` learns to render the three admitted statements
-instead of rejecting them.
+`AuditRecord`; the exact per-path event count is in the HTTP DDL amendment
+below. `redact` learns to render the three admitted statements instead of
+rejecting them.
 
 **Tests that pin the invariant:**
 
@@ -452,7 +454,8 @@ instead of rejecting them.
   without `ddl` learns nothing about validation. Its existing `s3://evil/x`
   case, sent with a token that has no `ddl`, moves to 403. New cases:
   - the same statement from a token holding `ddl` but no grant over
-    `s3://evil/` returns 400;
+    `s3://evil/` returns 400 (superseded by the HTTP DDL amendment below:
+    the status is 422, the same class as a `SELECT` on an unknown table);
   - with the capability and a granted location, 200 and a manifest under
     the caller's prefix;
   - tenant A cannot create a table over a location granted only to
@@ -964,3 +967,37 @@ statistics and float NaN ordering make a wrong refusal of a valid file
 likely. Bloom filters are off because each probe is one budgeted GET per
 candidate row group per column and no measurement shows a gain; turning
 them on needs a measured amendment.
+
+## Amendment (2026-10-02): DDL over HTTP
+
+<!-- amendment-applies: sections="D4. ADR-0013's first invariant, replaced for Parquet tables" pointer="HTTP DDL amendment" -->
+<!-- amendment-supersedes: phrase="returns 400" pointer="HTTP DDL amendment" -->
+
+D4 said every DDL statement writes one `AuditRecord` and that HTTP routes
+by statement kind, without stating the routing rule or the per-path event
+count. Both are narrower, and one test case was wrong about the status it
+named.
+
+**Audit.** A statement refused for the `ddl` capability submits one audit
+event (`error`). A statement handed to `execute_ddl` submits two:
+`attempted` before it runs, awaited so a failed submission refuses it
+before any store call, and `ok` or `error` after it finishes, from a task
+a client disconnect cannot cancel. A failed outcome submission never
+changes the response: the statement is already on record.
+
+**Routing.** A statement routes to the DDL path iff its first real token --
+skipping whitespace, `--` comments, and nested plain `/* */` comments --
+case-insensitively matches `CREATE` or `DROP`. No parse runs before this
+decision: a syntactically invalid statement, an over-complex one, and one
+holding several statements all route on the same leading keyword as a
+valid one would.
+
+**A location outside the caller's grants is 422, not 400.** A `ddl` caller
+naming a location outside its grants has sent a well-formed statement the
+tenant cannot serve, the same class as a `SELECT` on an unknown table, not
+a malformed request. D4's test list named 400 for this case; the status is
+422, pinned by
+`create_external_table_needs_the_ddl_capability_and_a_grant_over_its_location`.
+
+**Cost.** DDL appears in no `ravel_query_*` usage or cost family (follow-up
+issue #2374).

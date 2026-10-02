@@ -955,6 +955,68 @@ impl RecordingAuditSink {
     }
 }
 
+/// A [`ravel_maintain::QueryAuditSink`] whose `fail_nth` submission (1-indexed)
+/// fails with [`ravel_maintain::MaintainError::Write`]; every other
+/// submission is accepted and recorded, like [`RecordingAuditSink`]. Used to
+/// pin where a failed audit submission lands in the DDL path: the
+/// `attempted` record (1st) or the outcome record (2nd).
+struct FailingAuditSink {
+    fail_nth: usize,
+    calls: AtomicU64,
+    events: std::sync::Mutex<Vec<ravel_maintain::AuditEvent>>,
+}
+
+impl FailingAuditSink {
+    fn new(fail_nth: usize) -> Self {
+        Self {
+            fail_nth,
+            calls: AtomicU64::new(0),
+            events: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The `(query.language, query.status, query.text)` of every event this
+    /// sink accepted, in submission order. The failed submission leaves no
+    /// entry here: this is what the sink actually durably holds.
+    fn take(&self) -> Vec<(String, String, String)> {
+        let events = std::mem::take(&mut *self.events.lock().expect("lock"));
+        let text = |event: &ravel_maintain::AuditEvent, key: &str| -> String {
+            event
+                .attrs
+                .iter()
+                .find_map(|(k, v)| match v {
+                    AttrValue::Str(s) if k == key => Some(s.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("audit event has no {key} attr"))
+        };
+        events
+            .iter()
+            .map(|event| {
+                (
+                    text(event, "query.language"),
+                    text(event, "query.status"),
+                    text(event, "query.text"),
+                )
+            })
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl ravel_maintain::QueryAuditSink for FailingAuditSink {
+    async fn submit(&self, event: ravel_maintain::AuditEvent) -> ravel_maintain::Result<()> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if n as usize == self.fail_nth {
+            return Err(ravel_maintain::MaintainError::Write(
+                "audit pipeline stopped".to_string(),
+            ));
+        }
+        self.events.lock().expect("lock").push(event);
+        Ok(())
+    }
+}
+
 /// A Parquet file of one `id: Int64` column holding `ids`.
 fn lake_parquet_file(ids: &[i64]) -> bytes::Bytes {
     use arrow::array::{ArrayRef, Int64Array, RecordBatch};
@@ -990,9 +1052,10 @@ const CREATE_OUTSIDE_GRANT: &str =
 /// ADR-2040 decision 4, issue #2054: a `CREATE EXTERNAL TABLE` over
 /// `POST /api/v1/sql` needs the `ddl` capability AND a grant over its
 /// `LOCATION`, and a caller without the capability reaches nothing: no store
-/// call, no manifest, 403 for `DROP` as well as `CREATE`. Every DDL statement
-/// submits exactly one audit event, error for the refusals and ok for the two
-/// that committed.
+/// call, no manifest, 403 for `DROP` as well as `CREATE`. A statement refused
+/// for the capability submits one audit event (`error`); a statement handed
+/// to the executor submits two, `attempted` before it runs and `ok` or
+/// `error` after (the HTTP DDL amendment to ADR-2040).
 #[tokio::test]
 async fn create_external_table_needs_the_ddl_capability_and_a_grant_over_its_location() {
     use ravel_object_store::instrument::InstrumentedStore;
@@ -1105,11 +1168,20 @@ async fn create_external_table_needs_the_ddl_capability_and_a_grant_over_its_loc
     );
     assert_eq!(
         sink.take(),
-        vec![(
-            "sql".to_string(),
-            "error".to_string(),
-            CREATE_OUTSIDE_GRANT.to_string()
-        )]
+        vec![
+            (
+                "sql".to_string(),
+                "attempted".to_string(),
+                CREATE_OUTSIDE_GRANT.to_string()
+            ),
+            (
+                "sql".to_string(),
+                "error".to_string(),
+                CREATE_OUTSIDE_GRANT.to_string()
+            )
+        ],
+        "a capability-eligible statement that fails inside the executor \
+         records attempted, then error"
     );
     assert_eq!(pq_keys().await, grants_only);
 
@@ -1124,11 +1196,19 @@ async fn create_external_table_needs_the_ddl_capability_and_a_grant_over_its_loc
     assert_eq!(value["data"]["files"], 1, "{value}");
     assert_eq!(
         sink.take(),
-        vec![(
-            "sql".to_string(),
-            "ok".to_string(),
-            CREATE_CLICKS.to_string()
-        )]
+        vec![
+            (
+                "sql".to_string(),
+                "attempted".to_string(),
+                CREATE_CLICKS.to_string()
+            ),
+            (
+                "sql".to_string(),
+                "ok".to_string(),
+                CREATE_CLICKS.to_string()
+            )
+        ],
+        "a statement that commits records attempted, then ok"
     );
     let manifest = ravel_pqtable::resolve::newest(store.as_ref(), &tenant_hash, "clicks")
         .await
@@ -1155,11 +1235,19 @@ async fn create_external_table_needs_the_ddl_capability_and_a_grant_over_its_loc
     assert_eq!(value["data"]["version"], 2, "{value}");
     assert_eq!(
         sink.take(),
-        vec![(
-            "sql".to_string(),
-            "ok".to_string(),
-            "DROP TABLE clicks".to_string()
-        )]
+        vec![
+            (
+                "sql".to_string(),
+                "attempted".to_string(),
+                "DROP TABLE clicks".to_string()
+            ),
+            (
+                "sql".to_string(),
+                "ok".to_string(),
+                "DROP TABLE clicks".to_string()
+            )
+        ],
+        "a statement that commits records attempted, then ok"
     );
     let (status, value) = post_json(&app, "plain-token", "SELECT count(*) FROM clicks").await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
@@ -1174,6 +1262,351 @@ async fn create_external_table_needs_the_ddl_capability_and_a_grant_over_its_loc
         sink.take().len(),
         2,
         "both SELECTs are audited by the query path"
+    );
+}
+
+/// Fixture shared by the attempted/outcome audit-ordering tests below: a
+/// grant over `s3://lake/data/clicks/` and the Parquet file it admits, so
+/// `CREATE_CLICKS` reaches the executor and commits.
+async fn ddl_grant_and_lake_fixture(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: &ravel_types::TenantHash,
+) -> Arc<dyn ObjectStoreBackend> {
+    ravel_pqtable::grants::add(
+        store,
+        tenant_hash,
+        "lake",
+        "s3://lake/data",
+        "test",
+        &ravel_pqtable::clock::FixedClock::new(NOW_NS),
+    )
+    .await
+    .expect("grant");
+    let lake: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    lake.put(
+        "data/clicks/part-0.parquet",
+        lake_parquet_file(&[1, 2, 3, 4]),
+        PutOptions::default(),
+    )
+    .await
+    .expect("put the Parquet file");
+    lake
+}
+
+/// A sink that stamps every submission with the issuing store's own call
+/// count at that instant, to pin ordering: the `attempted` record must be
+/// submitted before the statement's own store calls, and the outcome record
+/// after them (ADR-2040's HTTP DDL amendment).
+struct OrderingAuditSink {
+    store: Arc<ravel_object_store::instrument::InstrumentedStore<MemoryStore>>,
+    stamps: std::sync::Mutex<Vec<(String, u64)>>,
+}
+
+impl OrderingAuditSink {
+    fn new(store: Arc<ravel_object_store::instrument::InstrumentedStore<MemoryStore>>) -> Self {
+        Self {
+            store,
+            stamps: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// `(query.status, store calls served so far)` for every submission, in
+    /// submission order.
+    fn take(&self) -> Vec<(String, u64)> {
+        std::mem::take(&mut *self.stamps.lock().expect("lock"))
+    }
+}
+
+#[async_trait::async_trait]
+impl ravel_maintain::QueryAuditSink for OrderingAuditSink {
+    async fn submit(&self, event: ravel_maintain::AuditEvent) -> ravel_maintain::Result<()> {
+        let status = event
+            .attrs
+            .iter()
+            .find_map(|(k, v)| match v {
+                AttrValue::Str(s) if k == "query.status" => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("audit event has no query.status attr"));
+        self.stamps
+            .lock()
+            .expect("lock")
+            .push((status, store_calls(&self.store)));
+        Ok(())
+    }
+}
+
+/// ADR-2040's HTTP DDL amendment: the `attempted` record is submitted and
+/// awaited before anything is read or written, and the outcome record after
+/// the statement's own store calls. Pinned by the store's own call counter at
+/// the instant each record is submitted, not merely by the two records'
+/// relative order (which a sink that buffers out of order could satisfy
+/// without the underlying guarantee holding).
+#[tokio::test]
+async fn a_ddl_statement_records_attempted_before_it_runs_and_its_outcome_after() {
+    use ravel_object_store::instrument::InstrumentedStore;
+
+    let store = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+    let tenant = TenantId::new("acme".to_string());
+    let tenant_hash = tenant.hash();
+    let lake = ddl_grant_and_lake_fixture(store.as_ref(), &tenant_hash).await;
+
+    let ravel_store: Arc<dyn ObjectStoreBackend> = store.clone();
+    let sources = ravel_sql::ParquetSources::new(
+        Arc::clone(&ravel_store),
+        Some(Arc::new(ravel_sql::ExternalStoreMap::new(HashMap::from([(
+            "lake".to_string(),
+            lake,
+        )]))) as Arc<dyn ravel_sql::ExternalStores>),
+        Arc::new(ravel_query::GetLimiter::new(8).expect("limiter")),
+        None,
+        ravel_sql::DEFAULT_PARQUET_METADATA_CACHE_BYTES,
+    );
+    let sink = Arc::new(OrderingAuditSink::new(store.clone()));
+    let app = build_router_principals(
+        ravel_store,
+        HashMap::from([("ddl-token".to_string(), Principal { tenant, ddl: true })]),
+        sink.clone(),
+        Some(sources),
+    );
+
+    let (status, value) = post_json(&app, "ddl-token", CREATE_CLICKS).await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+
+    let stamps = sink.take();
+    assert_eq!(
+        stamps.len(),
+        2,
+        "attempted and outcome, nothing else: {stamps:?}"
+    );
+    assert_eq!(stamps[0].0, "attempted");
+    assert_eq!(stamps[1].0, "ok");
+    assert_eq!(
+        stamps[0].1, 0,
+        "the attempted record is submitted before any store call, grants \
+         read included: {stamps:?}"
+    );
+    assert!(
+        stamps[1].1 > stamps[0].1,
+        "the outcome record is submitted after the statement's own store \
+         calls: {stamps:?}"
+    );
+}
+
+/// A submission failure on the `attempted` record (today's 503
+/// `unavailable`) refuses the statement before it touches the store: no
+/// grants read, no manifest.
+#[tokio::test]
+async fn a_failed_attempted_record_refuses_before_any_store_call() {
+    use ravel_object_store::instrument::InstrumentedStore;
+
+    let store = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+    let tenant = TenantId::new("acme".to_string());
+    let tenant_hash = tenant.hash();
+    let lake = ddl_grant_and_lake_fixture(store.as_ref(), &tenant_hash).await;
+
+    let ravel_store: Arc<dyn ObjectStoreBackend> = store.clone();
+    let sources = ravel_sql::ParquetSources::new(
+        Arc::clone(&ravel_store),
+        Some(Arc::new(ravel_sql::ExternalStoreMap::new(HashMap::from([(
+            "lake".to_string(),
+            lake,
+        )]))) as Arc<dyn ravel_sql::ExternalStores>),
+        Arc::new(ravel_query::GetLimiter::new(8).expect("limiter")),
+        None,
+        ravel_sql::DEFAULT_PARQUET_METADATA_CACHE_BYTES,
+    );
+    let sink = Arc::new(FailingAuditSink::new(1));
+    let app = build_router_principals(
+        ravel_store,
+        HashMap::from([("ddl-token".to_string(), Principal { tenant, ddl: true })]),
+        sink.clone(),
+        Some(sources),
+    );
+
+    let calls_before = store_calls(&store);
+    let (status, value) = post_json(&app, "ddl-token", CREATE_CLICKS).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{value}");
+    assert_eq!(value["errorType"], "unavailable", "{value}");
+    assert_eq!(
+        store_calls(&store) - calls_before,
+        0,
+        "a failed attempted submission must refuse before any store call, \
+         grants read included"
+    );
+    assert_eq!(
+        sink.take(),
+        Vec::<(String, String, String)>::new(),
+        "the failed submission leaves nothing durable"
+    );
+}
+
+/// A submission failure on the outcome record, after the statement already
+/// committed, never fails the response: the statement is already on record.
+/// The client instead sees a `warnings` entry naming the gap.
+#[tokio::test]
+async fn a_failed_outcome_record_does_not_fail_an_applied_statement() {
+    use ravel_object_store::instrument::InstrumentedStore;
+
+    let store = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+    let tenant = TenantId::new("acme".to_string());
+    let tenant_hash = tenant.hash();
+    let lake = ddl_grant_and_lake_fixture(store.as_ref(), &tenant_hash).await;
+
+    let ravel_store: Arc<dyn ObjectStoreBackend> = store.clone();
+    let sources = ravel_sql::ParquetSources::new(
+        Arc::clone(&ravel_store),
+        Some(Arc::new(ravel_sql::ExternalStoreMap::new(HashMap::from([(
+            "lake".to_string(),
+            lake,
+        )]))) as Arc<dyn ravel_sql::ExternalStores>),
+        Arc::new(ravel_query::GetLimiter::new(8).expect("limiter")),
+        None,
+        ravel_sql::DEFAULT_PARQUET_METADATA_CACHE_BYTES,
+    );
+    let sink = Arc::new(FailingAuditSink::new(2));
+    let app = build_router_principals(
+        ravel_store,
+        HashMap::from([(
+            "ddl-token".to_string(),
+            Principal {
+                tenant: tenant.clone(),
+                ddl: true,
+            },
+        )]),
+        sink.clone(),
+        Some(sources),
+    );
+
+    let (status, value) = post_json(&app, "ddl-token", CREATE_CLICKS).await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["data"]["outcome"], "created", "{value}");
+    let warnings = value["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a failed outcome submission must warn: {value}"));
+    assert_eq!(warnings.len(), 1, "{value}");
+    assert!(
+        warnings[0]
+            .as_str()
+            .expect("warning is a string")
+            .contains("not made durable"),
+        "{value}"
+    );
+    // The statement itself is on record despite the outcome submission's
+    // failure: the manifest exists.
+    let manifest = ravel_pqtable::resolve::newest(store.as_ref(), &tenant_hash, "clicks")
+        .await
+        .expect("resolve")
+        .expect("the manifest exists even though the outcome audit failed");
+    assert_eq!(manifest.created_by, "acme");
+    assert_eq!(
+        sink.take(),
+        vec![(
+            "sql".to_string(),
+            "attempted".to_string(),
+            CREATE_CLICKS.to_string()
+        )],
+        "only the attempted record is durable; the outcome submission failed"
+    );
+}
+
+/// A client disconnect (the request future dropped mid-flight) never cancels
+/// a DDL already handed to the executor: the outcome-audit-and-execute work
+/// runs in a `tokio::spawn`'d task the dropped future cannot reach. A
+/// `FaultStore` gate holds the manifest PUT open; the test aborts the request
+/// task while it is held, releases the gate, and confirms the manifest and
+/// its outcome audit still land.
+#[tokio::test]
+async fn a_client_disconnect_does_not_cancel_a_ddl_in_flight() {
+    let fault = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::default()));
+    let tenant = TenantId::new("acme".to_string());
+    let tenant_hash = tenant.hash();
+    let lake = ddl_grant_and_lake_fixture(fault.as_ref(), &tenant_hash).await;
+
+    let gate = fault.hold(Op::Put, Some(".pqm".to_string()), Occurrence::Always);
+    let store: Arc<dyn ObjectStoreBackend> = fault;
+
+    let sources = ravel_sql::ParquetSources::new(
+        Arc::clone(&store),
+        Some(Arc::new(ravel_sql::ExternalStoreMap::new(HashMap::from([(
+            "lake".to_string(),
+            lake,
+        )]))) as Arc<dyn ravel_sql::ExternalStores>),
+        Arc::new(ravel_query::GetLimiter::new(8).expect("limiter")),
+        None,
+        ravel_sql::DEFAULT_PARQUET_METADATA_CACHE_BYTES,
+    );
+    let sink = Arc::new(RecordingAuditSink::default());
+    let app = build_router_principals(
+        store.clone(),
+        HashMap::from([("ddl-token".to_string(), Principal { tenant, ddl: true })]),
+        sink.clone(),
+        Some(sources),
+    );
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/sql")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, "Bearer ddl-token")
+        .body(Body::from(body(CREATE_CLICKS)))
+        .expect("build request");
+
+    let task = tokio::spawn(async move { app.oneshot(request).await });
+
+    tokio::time::timeout(Duration::from_secs(30), gate.wait_until_held(1))
+        .await
+        .expect(
+            "CREATE must reach a held manifest PUT; if it no longer issues \
+             one, this test's premise is stale",
+        );
+
+    // Abort: drops the whole request future, including its wait on the
+    // spawned DDL task's JoinHandle, exactly as a client disconnect would.
+    task.abort();
+    let joined = task.await;
+    assert!(
+        joined.is_err() && joined.unwrap_err().is_cancelled(),
+        "the request future must have been aborted, not completed"
+    );
+
+    // Let the manifest PUT proceed. The DDL task is independent of the
+    // aborted request future and keeps running to completion.
+    for id in gate.held() {
+        gate.release(id);
+    }
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if ravel_pqtable::resolve::newest(store.as_ref(), &tenant_hash, "clicks")
+                .await
+                .expect("resolve")
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the manifest must appear even though the client disconnected");
+
+    assert_eq!(
+        sink.take(),
+        vec![
+            (
+                "sql".to_string(),
+                "attempted".to_string(),
+                CREATE_CLICKS.to_string()
+            ),
+            (
+                "sql".to_string(),
+                "ok".to_string(),
+                CREATE_CLICKS.to_string()
+            )
+        ],
+        "the spawned task finishes and audits its outcome even though the \
+         client that issued it disconnected"
     );
 }
 
@@ -1534,6 +1967,22 @@ async fn rejected_statement_kinds_return_400_over_http() {
     );
     assert_eq!(value["errorType"], "forbidden", "{value}");
 
+    // Every statement whose first keyword is CREATE or DROP routes to the
+    // DDL path on that keyword alone (statement_kind never parses), so each
+    // of these is also a 403 for a token without the capability, whatever
+    // validate_ddl would eventually make of the rest.
+    for (name, sql) in [
+        ("drop function", "DROP FUNCTION f"),
+        ("create role", "CREATE ROLE r"),
+        ("create table (", "CREATE TABLE t (a INT)"),
+        ("multi drop", "DROP TABLE a; DROP TABLE b"),
+        ("drop view", "DROP VIEW v"),
+    ] {
+        let (status, value) = post_json(&app, "acme-token", sql).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{name}: {value}");
+        assert_eq!(value["errorType"], "forbidden", "{name}: {value}");
+    }
+
     for (name, sql) in [
         ("copy to", "COPY (SELECT * FROM samples) TO 's3://evil/out'"),
         ("insert", "INSERT INTO samples VALUES (1, 2.0)"),
@@ -1546,6 +1995,48 @@ async fn rejected_statement_kinds_return_400_over_http() {
         assert_eq!(value["status"], "error", "{name}");
         assert_eq!(value["errorType"], "bad_data", "{name}");
     }
+}
+
+/// A token that DOES hold the `ddl` capability still gets routed to the DDL
+/// path on the leading keyword alone, and only there does `validate_ddl`
+/// discover that `CREATE ROLE` is not one of the three admitted forms: 400
+/// `bad_data`, not 403, with the two-event attempted/error audit trail a
+/// statement that reaches the executor always leaves (the HTTP DDL
+/// amendment to ADR-2040).
+#[tokio::test]
+async fn a_ddl_token_still_gets_400_for_an_unsupported_ddl_form() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    publish_segment(store.as_ref(), &tenant, 0, "m", &[(1, 1.0)]).await;
+    let sink = Arc::new(RecordingAuditSink::default());
+    let app = build_router_principals(
+        store,
+        HashMap::from([("ddl-token".to_string(), Principal { tenant, ddl: true })]),
+        sink.clone(),
+        None,
+    );
+
+    let (status, value) = post_json(&app, "ddl-token", "CREATE ROLE r").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+    assert_eq!(value["status"], "error", "{value}");
+    assert_eq!(value["errorType"], "bad_data", "{value}");
+    assert_eq!(
+        sink.take(),
+        vec![
+            (
+                "sql".to_string(),
+                "attempted".to_string(),
+                "CREATE ROLE r".to_string()
+            ),
+            (
+                "sql".to_string(),
+                "error".to_string(),
+                "CREATE ROLE r".to_string()
+            )
+        ],
+        "a statement that reaches the executor records attempted, then error, \
+         even when validate_ddl rejects it as the wrong DDL form"
+    );
 }
 
 /// `avg`/`mean` are admitted (ADR-0022 decisions 3, 4): the
