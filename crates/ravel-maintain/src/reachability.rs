@@ -979,3 +979,59 @@ enum HeadStatus {
 pub(crate) fn catalog_head_key(tenant: &TenantHash, signal: Signal) -> String {
     format!("t/{}/catalog/{}/HEAD", tenant.to_hex(), signal.key_prefix())
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::clock::FixedClock;
+    use crate::unnamed_marker::MarkerKind;
+    use ravel_object_store::memory::MemoryStore;
+
+    /// No marker for the alerts signal (ADR-1133 decision 6): a clear HEAD
+    /// answer stays clear and the gate issues no marker request, while the same
+    /// call for metrics writes one and holds.
+    #[tokio::test]
+    async fn the_alerts_signal_gets_no_marker() {
+        let tenant = TenantHash([7; 16]);
+        let clock = FixedClock::new(1_000);
+        let config = CompactorConfig::default();
+        let ctx = MarkerContext::new(&clock, &config, MarkerPolicy::Write);
+        for (signal, expected, markers) in [
+            (Signal::Alerts, SnapshotGate::Clear, 0),
+            (
+                Signal::Metrics,
+                SnapshotGate::Blocked(SnapshotBlock::PinnedWindow),
+                1,
+            ),
+        ] {
+            let store = MemoryStore::new();
+            let key = keys::retention_unnamed_marker_key(&tenant, signal, 0, 10).expect("key");
+            let anchor = MarkerAnchor {
+                kind: MarkerKind::Retention,
+                key: keys::retention_tombstone_key(&tenant, signal, 0, 10).expect("tmb"),
+                anchor_unix_ns: 1,
+                version: "1".to_string(),
+            };
+            let mut reach = SnapshotReachability::new();
+            let gate = reach
+                .marker_gate(
+                    &store,
+                    &ctx,
+                    &tenant,
+                    signal,
+                    &key,
+                    &anchor,
+                    SnapshotGate::Clear,
+                )
+                .await;
+            assert_eq!(gate, expected, "{signal:?}");
+            let listed = list_all(&store, &keys::unnamed_marker_prefix(&tenant, signal))
+                .await
+                .expect("list");
+            assert_eq!(listed.len(), markers, "{signal:?}");
+            assert_eq!(reach.marker_stats().put_requests, markers, "{signal:?}");
+            assert_eq!(reach.marker_stats().listings, markers, "{signal:?}");
+        }
+    }
+}

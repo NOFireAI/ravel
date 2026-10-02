@@ -670,6 +670,101 @@ async fn dreq_sweep_keeps_request_markers_whose_chain_is_legally_held() {
     assert!(present(&held, &held_dreq_key).await, ".dreq survives");
 }
 
+async fn unnamed_marker_keys(store: &dyn ObjectStoreBackend) -> Vec<String> {
+    list_all(
+        store,
+        &keys::unnamed_marker_prefix(&tenant_hash(), Signal::Metrics),
+    )
+    .await
+    .expect("list markers")
+    .into_iter()
+    .map(|m| m.key)
+    .collect()
+}
+
+/// The pinned-query window (ADR-1133) on the `.dreq` lifetime. The observing
+/// pass reads markers and never writes or deletes one, so a chain HEAD does not
+/// name and no deleting pass has marked yet holds the `.dreq`; so does a chain
+/// whose marker is younger than the window. Once a deleting pass has reclaimed
+/// the chain past the window, the `.dreq` goes.
+#[tokio::test]
+async fn the_observing_pass_writes_no_marker_and_holds_until_the_window_passes() {
+    let created = sealed_now_ns();
+    let b = bucket();
+    let store = MemoryStore::new();
+    for spec in metrics_specs() {
+        seed_input(&store, &spec).await;
+    }
+    run_rewrite(&store, &FixedClock::new(created)).await;
+    let (dreq_key, _) = seed_dreq_done(&store, 42, Some(created)).await;
+    let config = cfg();
+    let window = config.max_query_duration_ns
+        + config.head_cache_ttl_ns
+        + 4 * config.clock_skew_allowance_ns;
+    let t1 = past_horizon(created);
+    let observe = |now: i64| {
+        let store = &store;
+        let config = config.clone();
+        async move {
+            sweep_erasure_requests(
+                store,
+                &FixedClock::new(now),
+                &config,
+                &NoLeases,
+                &tenant_hash(),
+                Signal::Metrics,
+            )
+            .await
+            .expect("sweep_erasure_requests")
+        }
+    };
+    let delete_pass = |now: i64| {
+        let store = &store;
+        let config = config.clone();
+        let b = b.clone();
+        async move {
+            sweep_superseded(
+                store,
+                &FixedClock::new(now),
+                &config,
+                &NoLeases,
+                &b.tenant_hash,
+                b.signal,
+                b.shard,
+            )
+            .await
+            .expect("sweep_superseded")
+        }
+    };
+
+    // No marker yet: held, and the observing pass writes none.
+    let out = observe(t1).await;
+    assert_eq!((out.deleted, out.held_by_superseded_inputs), (0, 1));
+    assert!(
+        unnamed_marker_keys(&store).await.is_empty(),
+        "the observing pass writes no marker"
+    );
+
+    // The deleting pass marks the chain and holds it; the observing pass
+    // holds the .dreq on the unaged marker.
+    let marked = delete_pass(t1).await;
+    assert_eq!(marked.unnamed_markers.written, 1);
+    assert_eq!(marked.data_deleted, 0);
+    let markers = unnamed_marker_keys(&store).await;
+    assert_eq!(markers.len(), 1);
+    let out = observe(t1 + window - 1).await;
+    assert_eq!((out.deleted, out.held_by_superseded_inputs), (0, 1));
+    assert_eq!(unnamed_marker_keys(&store).await, markers, "untouched");
+    assert!(present(&store, &dreq_key).await);
+
+    // Past the window the deleting pass reclaims the chain and the .dreq goes.
+    let reclaimed = delete_pass(t1 + window).await;
+    assert!(reclaimed.data_deleted > 0);
+    let out = observe(t1 + window).await;
+    assert_eq!((out.deleted, out.held_by_superseded_inputs), (1, 0));
+    assert!(!present(&store, &dreq_key).await);
+}
+
 /// A completion with a zero `completed_unix_ns` is a fail-safe keep: a zero
 /// anchor would collapse the horizon gate to always-past.
 ///

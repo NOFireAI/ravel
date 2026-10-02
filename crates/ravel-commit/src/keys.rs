@@ -2074,6 +2074,39 @@ mod tests {
         }
     }
 
+    /// Key-layout contract for the unnamed-since markers (ADR-1133): both
+    /// shapes sit under the per-signal `maint/unn/` prefix, outside every
+    /// commit prefix, so no bucket listing returns one and
+    /// `partition_bucket_entry` never classifies one; and neither shape
+    /// collides with the scan cursor that shares `maint/`.
+    #[test]
+    fn unnamed_marker_keys_sit_outside_every_commit_prefix() {
+        let th = tenant_hash();
+        for signal in [Signal::Metrics, Signal::Logs, Signal::Spans, Signal::Audit] {
+            let record = rewrite_record_key(&th, signal, 2, 500_000, "0011223344556677")
+                .expect("record key");
+            for key in [
+                retention_unnamed_marker_key(&th, signal, 2, 500_000).expect("retention"),
+                record_unnamed_marker_key(&record).expect("record marker"),
+            ] {
+                assert!(key.starts_with(&format!(
+                    "t/{}/{}/maint/unn/",
+                    th.to_hex(),
+                    signal.key_prefix()
+                )));
+                assert!(
+                    !key.starts_with(&commit_shard_prefix(&th, signal, 2).expect("prefix")),
+                    "{key}"
+                );
+                assert!(!key.contains("/c/"), "{key}");
+                assert!(parse_maint_cursor_key(&key).is_err(), "{key}");
+            }
+            let cursor = maint_cursor_key(&th, signal, 2).expect("cursor");
+            assert!(parse_unnamed_marker_key(&cursor).is_err());
+            assert!(!cursor.starts_with(&unnamed_marker_prefix(&th, signal)));
+        }
+    }
+
     fn sample_compaction_record(
         th: &TenantHash,
         signal: Signal,
