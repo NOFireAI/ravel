@@ -10100,7 +10100,7 @@ mod log_prefetch_deadline_tests {
             .await
     }
 
-    /// The query's deadline has already passed when its log selector fetch
+    /// The query's deadline is already reached when its log selector fetch
     /// starts, while the fetch's own start plus the engine's 60 s deadline is
     /// still ahead. The fetch must stop at the query's deadline.
     #[tokio::test]
@@ -10108,7 +10108,7 @@ mod log_prefetch_deadline_tests {
         let (engine, tenant_hash) = engine_with_one_log_segment().await;
         let query_deadline = Instant::now();
         let Err(err) = prefetch_log_selector(&engine, tenant_hash, query_deadline).await else {
-            panic!("the query's deadline has passed before the log fetch starts");
+            panic!("the query's deadline is reached before the log fetch starts");
         };
         assert!(
             matches!(err, QueryError::DeadlineExceeded { .. }),
