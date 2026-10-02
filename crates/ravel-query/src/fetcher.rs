@@ -498,9 +498,10 @@ impl ReadCache {
     /// cache hit (no GET). [`ReadOutcome::Fetched`] is the leader that ran
     /// `fetch` (one GET, a miss). [`ReadOutcome::LateServe`] is a call that
     /// made no GET and was not a hit: a follower of another caller's fetch on
-    /// either kind, or, on the RAM-only cache, a call its leader's uncounted
-    /// RAM recheck served. A caller charges a late serve no GET and records
-    /// the cache miss its lookup already counted. The tiered tier's
+    /// either kind, a follower of a leader whose uncounted RAM recheck served
+    /// the bytes on either kind, or, on the RAM-only cache, that leader
+    /// itself. A caller charges a late serve no GET and records the cache miss
+    /// its lookup already counted. The tiered tier's
     /// [`TieredCache::get_or_fetch_outcome`] peeks both tiers internally. The
     /// RAM tier's [`Cache::get_or_fetch_outcome`] is miss-only, so the RAM
     /// branch peeks once here (a hit is [`ReadOutcome::Hit`]) and runs the
@@ -4188,7 +4189,7 @@ mod tests {
     /// the RAM-only one: no GET, a query cache miss.
     ///
     /// FLIP: reporting a tiered follower as `ReadOutcome::Fetched` (the
-    /// `(false, Role::Follower)` arm of `TieredCache::get_or_fetch_outcome`)
+    /// `(Served::Upstream, Role::Follower)` arm of `Served::outcome`)
     /// makes its `GetCost::requests` 1.
     #[tokio::test]
     async fn a_tiered_follower_is_a_miss_charged_no_get() {

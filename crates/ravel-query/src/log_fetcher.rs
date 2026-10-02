@@ -11684,7 +11684,7 @@ mod late_serve_accounting_tests {
     /// FLIP: mapping `ReadOutcome::LateServe` to the `ReadOutcome::Hit` arm in
     /// `cached_extent_outcome` makes the follower a hit with cache bytes (both
     /// kinds); reporting a tiered follower as `ReadOutcome::Fetched` (the
-    /// `(false, Role::Follower)` arm of `TieredCache::get_or_fetch_outcome`)
+    /// `(Served::Upstream, Role::Follower)` arm of `Served::outcome`)
     /// makes it live.
     #[tokio::test]
     async fn a_cached_extent_follower_is_a_miss_and_not_live() {

@@ -2431,10 +2431,12 @@ span. Each `guarded_get` call returns its own `{requests, bytes}` cost,
 `{1, len}` for a store GET this call made (the uncached path, or the cache
 miss's single-flight leader that ran the fetch) and `{0, 0}` otherwise: a
 cache hit, or a late serve, which is a single-flight follower riding another
-caller's in-flight GET on either cache kind, or, on the RAM-only cache, a
-read whose leader's RAM recheck found bytes another flight admitted after its
-peek missed. A late serve is a cache miss in `QueryAccounting`, not a hit;
-the log path below and the span whole-object read follow the same rule. The
+caller's in-flight GET on either cache kind, or a read whose flight's RAM
+recheck found bytes another flight admitted after its peek missed (a
+follower of that recheck on either cache kind, and on the RAM-only cache the
+leader that ran it too). A late serve is a cache miss in `QueryAccounting`,
+not a hit; the log path below and the span whole-object read follow the same
+rule. The
 caller folds those costs in, so the store-vs-cache decision lives once, at
 the seam that already knows it. `segment_open` sums the store-sourced cost
 of its own one or two `guarded_get` calls; which of those can reach zero on
