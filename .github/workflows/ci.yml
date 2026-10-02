@@ -1003,10 +1003,11 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check ravel-bench --features parquet-baseline
         run: cargo check --locked -p ravel-bench --features parquet-baseline
-        # read_accounting.rs exists only under this feature, so its counter
-        # tests run here or nowhere.
-      - name: Test ravel-bench --features parquet-baseline read_accounting
-        run: cargo test --locked -p ravel-bench --features parquet-baseline --lib read_accounting::
+        # The read-accounting module and its integration tests exist only
+        # under this feature, so their tests run here or nowhere. No test
+        # filter: a filter that matches nothing still exits 0.
+      - name: Test ravel-bench --features parquet-baseline
+        run: cargo test --locked -p ravel-bench --features parquet-baseline
       - name: Check ravel-bench --features flight-egress
         run: cargo check --locked -p ravel-bench --features flight-egress
       - name: Check ravel-bench --features profiling

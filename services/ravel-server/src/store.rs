@@ -10,8 +10,8 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::s3::{S3AuthMode, S3Config, S3Store};
 use ravel_object_store::{
     Capabilities, ClassedStore, DelimitedList, GetOutcome, GetRange, InstrumentedStore,
-    KmsRoutingStore, ListPage, MultipartUpload, ObjectMeta, ObjectStoreBackend, PageToken,
-    PutOptions, PutOutcome, SchedulerConfig, StoreError, StoreMetrics,
+    KmsRoutingStore, ListPage, MultipartUpload, ObjectMeta, ObjectStoreBackend, PageToken, Pin,
+    PinnedRead, PutOptions, PutOutcome, SchedulerConfig, StoreError, StoreMetrics,
 };
 
 /// RAM cache single-entry cap (ADR-0046): comfortably larger than any one
@@ -287,6 +287,23 @@ impl ObjectStoreBackend for SharedKmsStore {
         self.0.get(key, range).await
     }
 
+    async fn get_pinned(
+        &self,
+        key: &str,
+        range: GetRange,
+        pin: &Pin,
+    ) -> Result<PinnedRead, StoreError> {
+        self.0.get_pinned(key, range, pin).await
+    }
+
+    async fn get_with_pin(&self, key: &str, range: GetRange) -> Result<PinnedRead, StoreError> {
+        self.0.get_with_pin(key, range).await
+    }
+
+    async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, Pin), StoreError> {
+        self.0.pin_of(key).await
+    }
+
     async fn put_multipart<'a>(
         &'a self,
         key: &str,
@@ -300,6 +317,15 @@ impl ObjectStoreBackend for SharedKmsStore {
 
     async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
         self.0.list(prefix, page).await
+    }
+
+    async fn list_after(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        page: Option<PageToken>,
+    ) -> Result<ListPage, StoreError> {
+        self.0.list_after(prefix, start_after, page).await
     }
 
     async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
@@ -1133,6 +1159,71 @@ mod tests {
         );
 
         (store, metrics, mock)
+    }
+
+    /// Under `--tenant-kms-config` a Parquet grant read goes through
+    /// `SharedKmsStore`, so it must forward the pinned reads to
+    /// `KmsRoutingStore`. Without the overrides `get_pinned` refuses with
+    /// `Unsupported`, and `get_with_pin`/`pin_of` return an ETag-only pin
+    /// that drops the version selector the default store (here `MemoryStore`)
+    /// reports.
+    #[tokio::test]
+    async fn shared_kms_store_forwards_pinned_reads() {
+        let default: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        default
+            .put(
+                "k",
+                Bytes::from_static(b"hello"),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("seed key");
+        let config = S3Config {
+            bucket: "ravel-test".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: Some("http://localhost:0".to_string()),
+            access_key_id: "test".to_string(),
+            secret_access_key: "test".to_string(),
+            allow_http: true,
+            force_path_style: true,
+            kms_key_id: None,
+            session_token: None,
+            credentials_file: None,
+            auth: Default::default(),
+            instance_metadata_endpoint: None,
+        };
+        let kms = KmsRoutingStore::new(
+            default,
+            config,
+            ravel_object_store::s3::S3HttpConfig::default(),
+            Arc::new(StoreMetrics::default()),
+        );
+        let store = SharedKmsStore(Arc::new(kms));
+
+        let (_, pin) = store.pin_of("k").await.expect("pin_of");
+        assert!(pin.version.is_some(), "pin_of dropped the version: {pin:?}");
+
+        let with_pin = store
+            .get_with_pin("k", GetRange::Full)
+            .await
+            .expect("get_with_pin");
+        assert_eq!(with_pin.outcome.data.as_ref(), b"hello");
+        assert_eq!(with_pin.pin, pin);
+
+        let pinned = store
+            .get_pinned("k", GetRange::Full, &pin)
+            .await
+            .expect("get_pinned with the right pin");
+        assert_eq!(pinned.outcome.data.as_ref(), b"hello");
+
+        let err = store
+            .get_pinned("k", GetRange::Full, &Pin::etag("not-the-real-etag"))
+            .await
+            .expect_err("a wrong ETag must be refused, not served");
+        assert!(
+            matches!(err, StoreError::PreconditionFailed),
+            "got {err:?}, want PreconditionFailed (never Unsupported)"
+        );
     }
 
     /// Under `--tenant-kms-config` the writer's store is
