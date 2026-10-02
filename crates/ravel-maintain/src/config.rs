@@ -624,9 +624,11 @@ pub fn merge_memory_budget_bytes(process_budget_bytes: u64, merge_cursor_budget_
 /// [`CLAIM_LEASE_WARN_CONSERVATIVE_ENCODE_BYTES_PER_SEC`] takes half the lease,
 /// `lease * 10 MiB/s / 2` (1,572,864,000 bytes, 1.46 GiB, at the default 300 s
 /// lease). `claim_lease_below_warn_threshold(lease, claim_lease_max_part_bytes(
-/// lease))` is false for every lease, because the cap is rounded down in
-/// milliseconds and the warning threshold is computed from it with the same
-/// rounding.
+/// lease))` is false for each lease in
+/// `the_derived_default_target_never_trips_the_lease_warning` (1 ms to 24 h),
+/// because the cap is rounded down in milliseconds and the warning threshold is
+/// computed from it with the same rounding; a lease so long that the cap
+/// saturates `u64` is not covered.
 pub fn claim_lease_max_part_bytes(claim_lease_duration: Duration) -> u64 {
     let bytes = claim_lease_duration.as_millis()
         * u128::from(CLAIM_LEASE_WARN_CONSERVATIVE_ENCODE_BYTES_PER_SEC)
