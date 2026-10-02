@@ -88,9 +88,12 @@ pub enum Source {
     /// consulted on a RAM miss, whether this call led that consult or followed
     /// it. In corruption mode these bytes are corrupted.
     Cache,
-    /// The bytes are the fresh result of an upstream fetch: this call led the
-    /// single flight and ran the caller's `fetch`, or it followed the leader
-    /// that did. Never corrupted.
+    /// No cache tier served the bytes on this call's behalf: it led the
+    /// single flight and ran the caller's `fetch`, or it followed a leader
+    /// that did, and the bytes are that fetch's, never corrupted. It is also
+    /// the answer for a follower of a [`TieredCache::resolve_peeked_miss`]
+    /// leader whose RAM recheck served bytes another flight admitted after
+    /// this call's own lookup missed; in corruption mode those are corrupted.
     Upstream,
 }
 
@@ -100,14 +103,6 @@ pub enum Source {
 /// was not a cache hit either is told apart from both. Returned by
 /// [`TieredCache::get_or_fetch_outcome`] and [`Cache::get_or_fetch_outcome`],
 /// which label a leader and a follower of an upstream fetch the same way.
-///
-/// One known exception: [`TieredCache::resolve_peeked_miss`] shares this
-/// cache's single flight, and its leader stores bytes its RAM recheck found
-/// as a cache-served value, so a [`TieredCache::get_or_fetch_outcome`] call
-/// that follows such a leader is labelled `Hit` where the RAM-only cache
-/// would say `LateServe`, and so records a query cache hit and cache bytes
-/// although its own RAM lookup recorded a miss. It needs the follower to join
-/// during that leader's one poll on the same key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadOutcome {
     /// A cache hit: a tier served the bytes and no upstream fetch ran for them.
@@ -121,13 +116,40 @@ pub enum ReadOutcome {
     Fetched,
     /// A late serve: this call ran no `fetch` and is not a cache hit. It
     /// followed another caller's flight whose leader fetched upstream (either
-    /// cache kind), or, on the RAM-only cache, it led or followed a flight
-    /// whose leader's uncounted RAM recheck found bytes another flight
+    /// cache kind), or it led (RAM-only cache) or followed (either kind) a
+    /// flight whose leader's uncounted RAM recheck found bytes another flight
     /// admitted after this call's own lookup missed. The caller charges it no
     /// upstream request and counts it the cache miss its lookup already
     /// recorded. In corruption mode the bytes are corrupted when the RAM
     /// recheck served them and clean when they are another caller's fetch.
     LateServe,
+}
+
+/// What produced the bytes a [`TieredCache`] single-flight leader shared, so
+/// each caller, leader or follower, labels its own [`ReadOutcome`] from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Served {
+    /// The `get_or_fetch` leader's disk consult hit. Corruptible.
+    Disk,
+    /// The `resolve_peeked_miss` leader's uncounted RAM recheck found bytes
+    /// another flight admitted. Corruptible.
+    RamRecheck,
+    /// The leader ran the caller's `fetch`. Never corrupted.
+    Upstream,
+}
+
+impl Served {
+    fn from_cache(self) -> bool {
+        matches!(self, Served::Disk | Served::RamRecheck)
+    }
+
+    fn outcome(self, role: Role) -> ReadOutcome {
+        match (self, role) {
+            (Served::Disk, _) => ReadOutcome::Hit,
+            (Served::Upstream, Role::Leader) => ReadOutcome::Fetched,
+            (Served::RamRecheck, _) | (Served::Upstream, Role::Follower) => ReadOutcome::LateServe,
+        }
+    }
 }
 
 /// A RAM [`Cache`] over a local-disk [`DiskCache`], composed as one
@@ -142,11 +164,15 @@ pub struct TieredCache<E> {
     ram: Cache<E>,
     disk: Arc<DiskCache>,
     /// Coalesces concurrent RAM misses on one key across *both* tiers. Its
-    /// value is `(clean_bytes, from_cache)`: `from_cache` records whether the
-    /// leader satisfied the miss from the disk tier (`true`, corruptible) or
-    /// from the upstream fetch (`false`, never corrupted). Bytes on the wire
-    /// are always clean; corruption is applied per-caller at serve time.
-    single_flight: SingleFlight<CacheKey, (Bytes, bool), E>,
+    /// value is `(clean_bytes, served)`: [`Served`] records whether the leader
+    /// satisfied the miss from the disk tier, from its RAM recheck, or from the
+    /// upstream fetch. Bytes on the wire are always clean; corruption is
+    /// applied per-caller at serve time.
+    single_flight: SingleFlight<CacheKey, (Bytes, Served), E>,
+    /// Parks the next `resolve_peeked_miss` leader just before its RAM
+    /// recheck, with its flight registered, until the sender fires or drops.
+    #[cfg(test)]
+    recheck_hold: parking_lot::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
 impl<E> TieredCache<E>
@@ -162,6 +188,8 @@ where
             ram,
             disk: Arc::new(disk),
             single_flight: SingleFlight::new(),
+            #[cfg(test)]
+            recheck_hold: parking_lot::Mutex::new(None),
         }
     }
 
@@ -255,8 +283,6 @@ where
         let (bytes, outcome) = self.get_or_fetch_outcome(key, fetch).await?;
         let source = match outcome {
             ReadOutcome::Hit => Source::Cache,
-            // This handle's leader has no RAM recheck, so a late serve here is
-            // always a follower of an upstream fetch.
             ReadOutcome::Fetched | ReadOutcome::LateServe => Source::Upstream,
         };
         Ok((bytes, source))
@@ -266,7 +292,9 @@ where
     /// instead of a [`Source`]: [`ReadOutcome::Fetched`] only to the leader that
     /// ran `fetch`, and [`ReadOutcome::LateServe`] to a follower of that fetch,
     /// which issued no request of its own. A RAM hit, and the leader's disk hit
-    /// together with every follower of it, is [`ReadOutcome::Hit`]. The tier
+    /// together with every follower of it, is [`ReadOutcome::Hit`]. A follower
+    /// of a [`resolve_peeked_miss`](Self::resolve_peeked_miss) leader whose RAM
+    /// recheck served the bytes is a [`ReadOutcome::LateServe`]. The tier
     /// lookups, collapses, admissions and corruption are `get_or_fetch`'s.
     pub async fn get_or_fetch_outcome<F, Fut>(
         &self,
@@ -307,7 +335,7 @@ where
                     // hit, not another disk consult. Clean bytes are admitted;
                     // corruption, if on, is a serve-time transform below.
                     self.ram.insert(key, bytes.clone());
-                    return Ok((bytes, true));
+                    return Ok((bytes, Served::Disk));
                 }
                 // Both tiers missed: the caller owns the upstream fetch. On
                 // success admit to BOTH tiers (decision 3), not RAM alone, so
@@ -323,11 +351,11 @@ where
                 let disk = self.disk.clone();
                 let insert_bytes = bytes.clone();
                 let _ = tokio::task::spawn_blocking(move || disk.insert(key, &insert_bytes)).await;
-                Ok((bytes, false))
+                Ok((bytes, Served::Upstream))
             })
             .await;
 
-        let (bytes, from_cache) = match outcome {
+        let (bytes, served) = match outcome {
             Ok(value) => value,
             Err(err) => return Err(err),
         };
@@ -337,12 +365,10 @@ where
             // feeding ADR-0046's single-flight-collapse SLI.
             self.ram.metrics().record_collapse();
         }
-        let outcome = match (from_cache, role) {
-            (true, _) => ReadOutcome::Hit,
-            (false, Role::Leader) => ReadOutcome::Fetched,
-            (false, Role::Follower) => ReadOutcome::LateServe,
-        };
-        Ok((self.maybe_corrupt(bytes, from_cache), outcome))
+        Ok((
+            self.maybe_corrupt(bytes, served.from_cache()),
+            served.outcome(role),
+        ))
     }
 
     /// Resolve a miss the caller ALREADY confirmed with [`get`](Self::get):
@@ -377,12 +403,13 @@ where
     /// `get_or_fetch` uses, not a second coordinator, so a concurrent
     /// `get_or_fetch` and a `resolve_peeked_miss` on the same key still coalesce
     /// onto each other correctly. The stored single-flight value is
-    /// `(clean_bytes, false)` for a fetch (`false` = "not from cache", so the
-    /// bytes are the fresh upstream fetch and are never corrupted), and
-    /// `(clean_bytes, true)` when the leader's RAM check above served them. A
-    /// follower may instead ride a concurrent `get_or_fetch` leader that served
-    /// from disk (`true`); that flag is honored on the way out so a cache-served
-    /// result is corruption-gated identically to `get_or_fetch`.
+    /// `(clean_bytes, Served::Upstream)` for a fetch (never corrupted), and
+    /// `(clean_bytes, Served::RamRecheck)` when the leader's RAM check above
+    /// served them. A follower may instead ride a concurrent `get_or_fetch`
+    /// leader that served from disk (`Served::Disk`); a cache-served result is
+    /// corruption-gated on the way out identically to `get_or_fetch`. A
+    /// `get_or_fetch_outcome` follower of this method's RAM-check leader is a
+    /// [`ReadOutcome::LateServe`], as it is on the RAM-only cache.
     ///
     /// Accounting discipline (the invariant this method depends on): it records
     /// **no miss** on either tier -- the caller's earlier `get` already recorded
@@ -413,9 +440,9 @@ where
         // No counted tier consultation: the caller peeked both tiers with `get`
         // and got a confirmed miss, so a counted re-read here would record a
         // second miss. The leader runs the upstream fetch once and, on success,
-        // admits to BOTH tiers (decision 3). `false` records that these bytes
-        // are the fresh upstream fetch, never a cache serve, so they are never
-        // corrupted.
+        // admits to BOTH tiers (decision 3). `Served::Upstream` records that
+        // these bytes are the fresh upstream fetch, never a cache serve, so
+        // they are never corrupted.
         let (outcome, role) = self
             .single_flight
             .run(key, move || async move {
@@ -426,8 +453,15 @@ where
                 // are served instead of a second fetch; otherwise this misses
                 // and the fetch below runs. Uncounted: the peek already
                 // recorded this request's miss.
+                #[cfg(test)]
+                {
+                    let hold = self.recheck_hold.lock().take();
+                    if let Some(hold) = hold {
+                        let _ = hold.await;
+                    }
+                }
                 if let Some(bytes) = self.ram.get_uncounted(&key) {
-                    return Ok((bytes, true));
+                    return Ok((bytes, Served::RamRecheck));
                 }
                 let bytes = fetch().await?;
                 self.ram.insert(key, bytes.clone());
@@ -439,11 +473,11 @@ where
                 let disk = self.disk.clone();
                 let insert_bytes = bytes.clone();
                 let _ = tokio::task::spawn_blocking(move || disk.insert(key, &insert_bytes)).await;
-                Ok((bytes, false))
+                Ok((bytes, Served::Upstream))
             })
             .await;
 
-        let (bytes, from_cache) = match outcome {
+        let (bytes, served) = match outcome {
             Ok(value) => value,
             Err(err) => return Err(err),
         };
@@ -456,12 +490,10 @@ where
             // accounted miss for this logical request.
             self.ram.metrics().record_collapse();
         }
-        // `from_cache` is `false` for this method's own fetching leader, but
-        // `true` for one served by its RAM check or a follower that rode a
-        // concurrent `get_or_fetch` leader that served from disk; honor it so
-        // a cache-served result is corruption-gated exactly as
-        // `get_or_fetch`'s is.
-        Ok(self.maybe_corrupt(bytes, from_cache))
+        // A result served by the RAM check, or by a concurrent `get_or_fetch`
+        // leader's disk hit, is corruption-gated exactly as `get_or_fetch`'s
+        // is; this method's own fetch is not.
+        Ok(self.maybe_corrupt(bytes, served.from_cache()))
     }
 
     /// Read `key` through both tiers with **no** upstream fetch and **no**
