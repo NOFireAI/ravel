@@ -2029,12 +2029,13 @@ positive/window-gate.cfg went from 543543 to 581630. Two changes act on it:
 queries expire one tick earlier, and under `<=` the gate opens one tick
 earlier; these runs do not separate the two. `bands.tsv` pins 581630.
 
-exhaustive.cfg was not rerun: round fourteen's run of the same graph at 2835448
-distinct took 2672s, and at about 1.3 times the states it would exceed this
-task's 30 minute limit. Its band is unchanged. It shares smoke.cfg's
-constants (only `FairSpec` and the two liveness properties differ), so the
-nightly lane's next run should find smoke.cfg's new figures and fail the band
-until the row is re-measured.
+exhaustive.cfg was re-measured on the final model in a separate run
+(`scripts/check-tla.sh exhaustive -a lifecycle`, `RAVEL_TLA_WORKERS=4`,
+`RAVEL_TLA_XMX=6g`, 16-core x86_64 host): PASS, 3728440 distinct at depth 32,
+`FairSpec` with `EventuallySwept` and `EventuallyCompleted` both holding, TLC
+finished in 22min 34s (1356s for the lane). It shares smoke.cfg's constants, so
+it lands on smoke.cfg's figures. `bands.tsv` moves its row to
+`[3725000, 3732000]`, depth 32.
 
 
 ### The gate is exact
