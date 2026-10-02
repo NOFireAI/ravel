@@ -118,17 +118,13 @@ pub use query_audit::{
     query_audit_event, write_query_audit,
 };
 pub use ravel_fleet::worker_set::{WorkerSet, owner, owns, run_bounded, unit_key};
+pub use reachability::MarkerStats;
 pub use request_ledger::{PhaseRequests, RequestLedger, RequestPhase, RunRequestReport};
 pub use retention::{
     RetentionOutcome, SnapshotBlock, SnapshotReachability, maintain_bucket,
     maintain_bucket_with_reach, retention_sweep_bucket, retention_sweep_bucket_with_reach,
 };
-pub use reachability::MarkerStats;
 pub use rewrite::{MigrateOutcome, RewriteOutcome, migrate_bucket_format, rewrite_and_publish};
-pub use unnamed_marker::{
-    MarkerAnchor, MarkerDecodeError, MarkerKind, MarkerReapOutcome, PinnedQueryWindow,
-    UNNAMED_MARKER_FORMAT_VERSION, UnnamedMarker, reap_orphan_unnamed_markers,
-};
 pub use rlog::RlogCodec;
 pub use rspan_codec::SpanCodec;
 pub use scan::{
@@ -147,6 +143,10 @@ pub use sweep::{
     sweep_orphans, sweep_quarantine, sweep_shard, sweep_shard_with_holds, sweep_shard_zoned,
     sweep_shard_zoned_with_holds, sweep_superseded, sweep_unreferenced_catalog_objects,
     sweep_unreferenced_parts,
+};
+pub use unnamed_marker::{
+    MarkerAnchor, MarkerDecodeError, MarkerKind, MarkerReapOutcome, PinnedQueryWindow,
+    UNNAMED_MARKER_FORMAT_VERSION, UnnamedMarker, reap_orphan_unnamed_markers,
 };
 
 #[cfg(test)]

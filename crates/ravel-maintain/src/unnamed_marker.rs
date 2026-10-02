@@ -277,7 +277,10 @@ pub(crate) async fn reap_listed(
             Err(StoreError::NotFound) => {}
             Err(e) => return Err(MaintainError::Store(e)),
         }
-        let body = match store.get(&meta.key, ravel_object_store::GetRange::Full).await {
+        let body = match store
+            .get(&meta.key, ravel_object_store::GetRange::Full)
+            .await
+        {
             Ok(got) => got.data,
             Err(StoreError::NotFound) => continue,
             Err(e) => return Err(MaintainError::Store(e)),

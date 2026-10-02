@@ -744,7 +744,16 @@ impl ParsedUnnamedMarkerKey {
 /// validating every component.
 pub fn parse_unnamed_marker_key(key: &str) -> Result<ParsedUnnamedMarkerKey, KeyError> {
     let parts: Vec<&str> = key.split('/').collect();
-    let [root, tenant_hex, signal_s, maint, unn, shard_s, hour_s, filename] = parts.as_slice()
+    let [
+        root,
+        tenant_hex,
+        signal_s,
+        maint,
+        unn,
+        shard_s,
+        hour_s,
+        filename,
+    ] = parts.as_slice()
     else {
         return Err(malformed(key, "expected 8 path segments"));
     };
@@ -780,9 +789,7 @@ pub fn parse_unnamed_marker_key(key: &str) -> Result<ParsedUnnamedMarkerKey, Key
                 _ => {
                     return Err(malformed(
                         key,
-                        format!(
-                            "expected tag {COMPACTION_RECORD_TAG:?} or {REWRITE_RECORD_TAG:?}"
-                        ),
+                        format!("expected tag {COMPACTION_RECORD_TAG:?} or {REWRITE_RECORD_TAG:?}"),
                     ));
                 }
             }

@@ -88,9 +88,9 @@ use crate::compact::{
 use crate::config::{CompactorConfig, RetentionConfig};
 use crate::error::{MaintainError, Result};
 use crate::reachability::{MarkerContext, MarkerPolicy, SnapshotGate};
-use crate::unnamed_marker::{MarkerAnchor, MarkerKind};
 use crate::read::{BucketListing, list_bucket, verify_commit_key};
 use crate::sweep::LeaseCheck;
+use crate::unnamed_marker::{MarkerAnchor, MarkerKind};
 
 /// The HEAD-reachability delete blocker, shared with the superseded-input
 /// sweep (see [`crate::reachability`]). Re-exported at this path because
@@ -237,9 +237,10 @@ pub async fn retention_sweep_bucket(
 ) -> Result<RetentionOutcome> {
     let window_ns = resolve_retention_window_ns(store, retention, &bucket.tenant_hash).await?;
     let mut reach = SnapshotReachability::new();
-    let outcome =
-        retention_sweep_bucket_with_reach(&mut reach, store, clock, config, window_ns, lease, bucket)
-            .await?;
+    let outcome = retention_sweep_bucket_with_reach(
+        &mut reach, store, clock, config, window_ns, lease, bucket,
+    )
+    .await?;
     reach
         .reap_after_pass(
             store,

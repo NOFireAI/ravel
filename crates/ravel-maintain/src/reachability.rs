@@ -201,7 +201,11 @@ pub(crate) struct MarkerContext<'a> {
 }
 
 impl<'a> MarkerContext<'a> {
-    pub(crate) fn new(clock: &'a dyn Clock, config: &CompactorConfig, policy: MarkerPolicy) -> Self {
+    pub(crate) fn new(
+        clock: &'a dyn Clock,
+        config: &CompactorConfig,
+        policy: MarkerPolicy,
+    ) -> Self {
         Self {
             clock,
             window: PinnedQueryWindow::from_config(config),
@@ -325,7 +329,9 @@ impl SnapshotReachability {
         match head_gate {
             SnapshotGate::Blocked(SnapshotBlock::Named) => {
                 if ctx.policy == MarkerPolicy::Write
-                    && self.marker_may_exist(store, tenant, signal, marker_key).await
+                    && self
+                        .marker_may_exist(store, tenant, signal, marker_key)
+                        .await
                 {
                     if self.delete_marker(store, marker_key).await.is_err() {
                         return SnapshotGate::Blocked(SnapshotBlock::Unreadable);

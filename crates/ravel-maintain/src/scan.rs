@@ -18,13 +18,13 @@ use crate::compact::{ClaimedCompaction, CompactionOutcome, compact_bucket};
 use crate::config::{CompactorConfig, NS_PER_HOUR, RetentionConfig};
 use crate::error::{MaintainError, Result};
 use crate::reachability::MarkerStats;
-use crate::unnamed_marker::MarkerReapOutcome;
 use crate::retention::{
     ObservedExpiry, RetentionOutcome, RewriteBound, RewriteBoundRead, SnapshotBlock,
     SnapshotReachability, maintain_bucket_observed, resolve_retention_window_ns,
     retention_sweep_bucket_observed,
 };
 use crate::sweep::LeaseCheck;
+use crate::unnamed_marker::MarkerReapOutcome;
 
 /// One-byte version tag on the advisory cursor payload. The cursor is not a
 /// frozen format; the tag only lets a future encoding change be detected and
