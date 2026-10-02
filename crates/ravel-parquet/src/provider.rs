@@ -217,6 +217,10 @@ impl ParquetTableProvider {
         // Without it the opener never builds a page pruning predicate, so it
         // never asks the reader for a page index to prune with.
         parquet_options.global.enable_page_index = false;
+        // A corrupt bloom filter bitset can drop rows a scan should return,
+        // and no measurement shows a pruning gain to weigh against that risk:
+        // see the amendment to docs/adrs/2040-parquet-tables-queried-in-place.md.
+        parquet_options.global.bloom_filter_on_read = false;
         // DataFusion's own schema inference applies these two rewrites in this
         // order, after clearing the metadata `file_schema` clears.
         if parquet_options.global.binary_as_string {
@@ -751,7 +755,8 @@ mod tests {
     }
 
     /// ADR-2040 D6: the scan evaluates pushed-down filters inside the reader,
-    /// and does not prune pages with a page index.
+    /// and does not prune pages with a page index or rows with a bloom
+    /// filter.
     #[tokio::test]
     async fn the_scan_evaluates_filters_inside_the_reader_without_a_page_index() {
         let store = Arc::new(MemoryStore::new());
@@ -777,6 +782,7 @@ mod tests {
             .expect("a Parquet file source");
         assert!(source.table_parquet_options().global.pushdown_filters);
         assert!(!source.table_parquet_options().global.enable_page_index);
+        assert!(!source.table_parquet_options().global.bloom_filter_on_read);
         assert!(datafusion::datasource::physical_plan::FileSource::filter(source).is_some());
     }
 
