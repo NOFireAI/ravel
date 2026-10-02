@@ -51,9 +51,13 @@
 //!
 //! # DDL
 //!
-//! `ravel_sql::statement_kind` routes a statement whose top level is any
-//! `CREATE` or `DROP` form to the DDL path; everything else, including text
-//! that does not parse, takes the query path unchanged. The DDL path accepts
+//! `ravel_sql::statement_kind` routes a statement on its leading keyword
+//! alone, without parsing: a first real token (skipping whitespace, `--`
+//! comments, and nested plain `/* */` comments) that case-insensitively
+//! matches `CREATE` or `DROP` takes the DDL path, whatever follows it,
+//! including a syntax error or several statements; everything else,
+//! including text that does not parse at all, takes the query path
+//! unchanged. The DDL path accepts
 //! `CREATE [OR REPLACE] EXTERNAL TABLE ... STORED AS PARQUET LOCATION ...` and
 //! `DROP TABLE` (ADR-2040) and needs the `ddl` capability, which a principal
 //! holds only through a `TOKEN=TENANT;ddl` token or the `--oidc-ddl-claim`
@@ -104,7 +108,7 @@ use ravel_types::{CommitToken, TenantHash, TimeRange};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::service::{ApiError, QueryService, ServiceError};
+use crate::service::{ApiError, QueryService, ServiceError, ServiceErrorKind};
 
 /// The Arrow IPC stream media type, as registered by the Arrow project.
 pub const ARROW_STREAM_MEDIA_TYPE: &str = "application/vnd.apache.arrow.stream";
@@ -132,11 +136,17 @@ pub struct SqlState {
     /// decision 4). The audit record is written by the server itself, never
     /// derived from a client body, so a tenant cannot forge or suppress it.
     pub store: Arc<dyn ObjectStoreBackend>,
-    /// The evidential audit sink this endpoint submits one
-    /// [`AuditEvent`](ravel_maintain::AuditEvent) through per executed query,
-    /// awaiting its durability before releasing the response (ADR-0062 §2a).
-    /// Every query surface audits through this one seam rather than a direct
-    /// `write_query_audit` call. Defaults to
+    /// The evidential audit sink this endpoint submits every
+    /// [`AuditEvent`](ravel_maintain::AuditEvent) through, awaiting each
+    /// submission's durability before releasing the response or (for DDL)
+    /// before running the statement (ADR-0062 §2a). Every query surface
+    /// audits through this one seam rather than a direct `write_query_audit`
+    /// call. A query submits one event per request. A statement refused for
+    /// the `ddl` capability submits one event (`error`). A statement handed
+    /// to [`SqlExecutor::execute_ddl`] submits two: `attempted` before it
+    /// runs, awaited so a failed submission refuses it before any store call,
+    /// and `ok` or `error` after it finishes, from a task a client disconnect
+    /// cannot cancel (see [`run_ddl`]). Defaults to
     /// [`NoopQueryAuditSink`](ravel_maintain::NoopQueryAuditSink); a deployment
     /// attaches the one shared pipeline.
     pub audit_sink: Arc<dyn QueryAuditSink>,
@@ -274,7 +284,13 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ServiceEr
 fn request_deadline(body: &SqlBody, max_deadline: Duration) -> Result<Duration, ApiError> {
     match body.timeout {
         Some(secs) if secs > 0.0 && secs.is_finite() => {
-            Ok(Duration::from_secs_f64(secs).min(max_deadline))
+            // `Duration::from_secs_f64` panics when `secs` is finite but too
+            // large to represent as a `Duration` (an `f64` as small as 1e300
+            // triggers it). Capping to `max_deadline`'s own seconds first
+            // keeps the value handed to it always representable, since
+            // `max_deadline` itself already came from a `Duration`.
+            let capped_secs = secs.min(max_deadline.as_secs_f64());
+            Ok(Duration::from_secs_f64(capped_secs).min(max_deadline))
         }
         Some(_) => Err(ApiError::bad_request(
             "\"timeout\" must be a positive, finite number of seconds".to_string(),
@@ -293,8 +309,12 @@ fn request_deadline(body: &SqlBody, max_deadline: Duration) -> Result<Duration, 
 /// which is also what the manifest records as its creator; no header or body
 /// value can name another.
 ///
-/// Every statement that reaches here submits exactly one audit event, awaited
-/// before the response, with the raw statement text (the sink redacts it).
+/// A statement refused for the `ddl` capability submits one audit event
+/// (`error`). A statement handed to [`SqlExecutor::execute_ddl`] submits two:
+/// `attempted` before it runs, awaited so a failed submission refuses it
+/// before any store call, and `ok` or `error` after it finishes, from a task
+/// a client disconnect cannot cancel. A failed outcome submission never
+/// changes the response: the statement is already on record.
 async fn run_ddl(
     state: &SqlState,
     principal: &Principal,
@@ -321,26 +341,11 @@ async fn run_ddl(
         ));
     }
 
-    let result = async {
-        let deadline = request_deadline(body, state.max_deadline)?;
-        let _permit = controls.admit()?;
-        state
-            .executor
-            .execute_ddl(
-                tenant_hash,
-                &body.query,
-                principal.tenant.as_str(),
-                deadline,
-            )
-            .await
-            .map_err(|err| ServiceError::from_ddl(err, tenant_hash))
-    }
-    .await;
+    let deadline = request_deadline(body, state.max_deadline)?;
 
-    let status = match &result {
-        Ok(_) => QueryStatus::Ok,
-        Err(_) => QueryStatus::Error,
-    };
+    // The `attempted` record: submitted and awaited before anything is read
+    // or written, so a failed submission (today's 503 `unavailable`) refuses
+    // the statement before it touches the store.
     controls
         .audit(
             tenant_hash,
@@ -348,17 +353,85 @@ async fn run_ddl(
             &body.query,
             "sql",
             (now_ns, now_ns),
-            status,
+            QueryStatus::Attempted,
         )
         .await?;
 
-    let outcome = result?;
-    Ok((StatusCode::OK, axum::Json(ddl_outcome_json(&outcome))).into_response())
+    // From here the statement runs, and its outcome is recorded, in a task a
+    // client disconnect cannot cancel: dropping this function's future (the
+    // client going away) never drops the spawned one.
+    let executor = Arc::clone(&state.executor);
+    let clock = Arc::clone(&state.clock);
+    let task_controls = controls.clone();
+    let sql = body.query.clone();
+    let tenant_str = principal.tenant.as_str().to_string();
+
+    let handle = tokio::spawn(async move {
+        let ddl_result: Result<DdlOutcome, ServiceError> = async {
+            let _permit = task_controls.admit()?;
+            executor
+                .execute_ddl(tenant_hash, &sql, &tenant_str, deadline)
+                .await
+                .map_err(|err| ServiceError::from_ddl(err, tenant_hash))
+        }
+        .await;
+
+        let outcome_now_ns = clock.now_ns();
+        let status = match &ddl_result {
+            Ok(_) => QueryStatus::Ok,
+            Err(_) => QueryStatus::Error,
+        };
+        let audit_result = task_controls
+            .audit(
+                tenant_hash,
+                outcome_now_ns,
+                &sql,
+                "sql",
+                (outcome_now_ns, outcome_now_ns),
+                status,
+            )
+            .await;
+        (ddl_result, audit_result)
+    });
+
+    let (ddl_result, audit_result) = handle.await.map_err(|_join_err| {
+        ServiceError::new(
+            ServiceErrorKind::Internal,
+            ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                error_type: "internal",
+                message: "ddl execution task failed unexpectedly".to_string(),
+            },
+        )
+    })?;
+
+    match ddl_result {
+        Ok(outcome) => {
+            let warnings: &[&str] = if audit_result.is_err() {
+                &["the audit outcome record for this statement was not made durable; its attempted record is"]
+            } else {
+                &[]
+            };
+            Ok((StatusCode::OK, axum::Json(ddl_outcome_json(&outcome, warnings))).into_response())
+        }
+        Err(err) => {
+            if let Err(audit_err) = &audit_result {
+                tracing::error!(
+                    tenant = %tenant_hash.to_hex(),
+                    error = ?audit_err,
+                    "ddl outcome audit submission failed after a failed statement",
+                );
+            }
+            Err(err)
+        }
+    }
 }
 
 /// The JSON success body of a DDL statement, whatever the `Accept` header
-/// says: a DDL outcome has no rows to stream as Arrow IPC.
-fn ddl_outcome_json(outcome: &DdlOutcome) -> serde_json::Value {
+/// says: a DDL outcome has no rows to stream as Arrow IPC. `warnings` is
+/// rendered only when non-empty, the same omit-when-empty rule the query
+/// path's `warnings` array follows.
+fn ddl_outcome_json(outcome: &DdlOutcome, warnings: &[&str]) -> serde_json::Value {
     let data = match outcome {
         DdlOutcome::Created {
             table,
@@ -384,7 +457,13 @@ fn ddl_outcome_json(outcome: &DdlOutcome) -> serde_json::Value {
             "table": table,
         }),
     };
-    json!({ "status": "success", "data": data })
+    let mut body = json!({ "status": "success", "data": data });
+    if !warnings.is_empty()
+        && let serde_json::Value::Object(ref mut map) = body
+    {
+        map.insert("warnings".to_string(), json!(warnings));
+    }
+    body
 }
 
 /// Turn the request body into a [`SqlRequest`], resolving the window and
