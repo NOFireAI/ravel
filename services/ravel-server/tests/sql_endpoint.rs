@@ -990,9 +990,10 @@ const CREATE_OUTSIDE_GRANT: &str =
 /// ADR-2040 decision 4, issue #2054: a `CREATE EXTERNAL TABLE` over
 /// `POST /api/v1/sql` needs the `ddl` capability AND a grant over its
 /// `LOCATION`, and a caller without the capability reaches nothing: no store
-/// call, no manifest, 403 for `DROP` as well as `CREATE`. Every DDL statement
-/// submits exactly one audit event, error for the refusals and ok for the two
-/// that committed.
+/// call, no manifest, 403 for `DROP` as well as `CREATE`. A statement refused
+/// for the capability submits one audit event (`error`); a statement handed
+/// to the executor submits two, `attempted` before it runs and `ok` or
+/// `error` after (the HTTP DDL amendment to ADR-2040).
 #[tokio::test]
 async fn create_external_table_needs_the_ddl_capability_and_a_grant_over_its_location() {
     use ravel_object_store::instrument::InstrumentedStore;
@@ -1105,11 +1106,20 @@ async fn create_external_table_needs_the_ddl_capability_and_a_grant_over_its_loc
     );
     assert_eq!(
         sink.take(),
-        vec![(
-            "sql".to_string(),
-            "error".to_string(),
-            CREATE_OUTSIDE_GRANT.to_string()
-        )]
+        vec![
+            (
+                "sql".to_string(),
+                "attempted".to_string(),
+                CREATE_OUTSIDE_GRANT.to_string()
+            ),
+            (
+                "sql".to_string(),
+                "error".to_string(),
+                CREATE_OUTSIDE_GRANT.to_string()
+            )
+        ],
+        "a capability-eligible statement that fails inside the executor \
+         records attempted, then error"
     );
     assert_eq!(pq_keys().await, grants_only);
 
@@ -1124,11 +1134,19 @@ async fn create_external_table_needs_the_ddl_capability_and_a_grant_over_its_loc
     assert_eq!(value["data"]["files"], 1, "{value}");
     assert_eq!(
         sink.take(),
-        vec![(
-            "sql".to_string(),
-            "ok".to_string(),
-            CREATE_CLICKS.to_string()
-        )]
+        vec![
+            (
+                "sql".to_string(),
+                "attempted".to_string(),
+                CREATE_CLICKS.to_string()
+            ),
+            (
+                "sql".to_string(),
+                "ok".to_string(),
+                CREATE_CLICKS.to_string()
+            )
+        ],
+        "a statement that commits records attempted, then ok"
     );
     let manifest = ravel_pqtable::resolve::newest(store.as_ref(), &tenant_hash, "clicks")
         .await
@@ -1155,11 +1173,19 @@ async fn create_external_table_needs_the_ddl_capability_and_a_grant_over_its_loc
     assert_eq!(value["data"]["version"], 2, "{value}");
     assert_eq!(
         sink.take(),
-        vec![(
-            "sql".to_string(),
-            "ok".to_string(),
-            "DROP TABLE clicks".to_string()
-        )]
+        vec![
+            (
+                "sql".to_string(),
+                "attempted".to_string(),
+                "DROP TABLE clicks".to_string()
+            ),
+            (
+                "sql".to_string(),
+                "ok".to_string(),
+                "DROP TABLE clicks".to_string()
+            )
+        ],
+        "a statement that commits records attempted, then ok"
     );
     let (status, value) = post_json(&app, "plain-token", "SELECT count(*) FROM clicks").await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
@@ -1534,6 +1560,22 @@ async fn rejected_statement_kinds_return_400_over_http() {
     );
     assert_eq!(value["errorType"], "forbidden", "{value}");
 
+    // Every statement whose first keyword is CREATE or DROP routes to the
+    // DDL path on that keyword alone (statement_kind never parses), so each
+    // of these is also a 403 for a token without the capability, whatever
+    // validate_ddl would eventually make of the rest.
+    for (name, sql) in [
+        ("drop function", "DROP FUNCTION f"),
+        ("create role", "CREATE ROLE r"),
+        ("create table (", "CREATE TABLE t (a INT)"),
+        ("multi drop", "DROP TABLE a; DROP TABLE b"),
+        ("drop view", "DROP VIEW v"),
+    ] {
+        let (status, value) = post_json(&app, "acme-token", sql).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{name}: {value}");
+        assert_eq!(value["errorType"], "forbidden", "{name}: {value}");
+    }
+
     for (name, sql) in [
         ("copy to", "COPY (SELECT * FROM samples) TO 's3://evil/out'"),
         ("insert", "INSERT INTO samples VALUES (1, 2.0)"),
@@ -1546,6 +1588,54 @@ async fn rejected_statement_kinds_return_400_over_http() {
         assert_eq!(value["status"], "error", "{name}");
         assert_eq!(value["errorType"], "bad_data", "{name}");
     }
+}
+
+/// A token that DOES hold the `ddl` capability still gets routed to the DDL
+/// path on the leading keyword alone, and only there does `validate_ddl`
+/// discover that `CREATE ROLE` is not one of the three admitted forms: 400
+/// `bad_data`, not 403, with the two-event attempted/error audit trail a
+/// statement that reaches the executor always leaves (the HTTP DDL
+/// amendment to ADR-2040).
+#[tokio::test]
+async fn a_ddl_token_still_gets_400_for_an_unsupported_ddl_form() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    publish_segment(store.as_ref(), &tenant, 0, "m", &[(1, 1.0)]).await;
+    let sink = Arc::new(RecordingAuditSink::default());
+    let app = build_router_principals(
+        store,
+        HashMap::from([(
+            "ddl-token".to_string(),
+            Principal {
+                tenant,
+                ddl: true,
+            },
+        )]),
+        sink.clone(),
+        None,
+    );
+
+    let (status, value) = post_json(&app, "ddl-token", "CREATE ROLE r").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+    assert_eq!(value["status"], "error", "{value}");
+    assert_eq!(value["errorType"], "bad_data", "{value}");
+    assert_eq!(
+        sink.take(),
+        vec![
+            (
+                "sql".to_string(),
+                "attempted".to_string(),
+                "CREATE ROLE r".to_string()
+            ),
+            (
+                "sql".to_string(),
+                "error".to_string(),
+                "CREATE ROLE r".to_string()
+            )
+        ],
+        "a statement that reaches the executor records attempted, then error, \
+         even when validate_ddl rejects it as the wrong DDL form"
+    );
 }
 
 /// `avg`/`mean` are admitted (ADR-0022 decisions 3, 4): the
