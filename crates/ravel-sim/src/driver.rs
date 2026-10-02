@@ -1040,12 +1040,18 @@ async fn run_cycle_async(
         EngineConfig::default(),
     );
 
-    // Compaction/sweep config: the compactor identity is seeded, everything
-    // else is the shipped default. `dry_run` stays false: the sweep must
-    // really delete the superseded L0 inputs so invariant (c) verifies
-    // physical convergence, not a plan.
+    // Compaction/sweep config: the compactor identity is seeded and the
+    // pinned-query window (ADR-1133) is zeroed, so the one sweep pass writes
+    // its unnamed-since marker and deletes in the same pass and the scripted
+    // sweep faults land on the deletes they target; everything else is the
+    // shipped default. `dry_run` stays false: the sweep must really delete
+    // the superseded L0 inputs so invariant (c) verifies physical
+    // convergence, not a plan.
     let compactor_config = CompactorConfig {
         compactor_writer_id: compactor_rng.new_uuid(),
+        max_query_duration_ns: 0,
+        head_cache_ttl_ns: 0,
+        clock_skew_allowance_ns: 0,
         ..CompactorConfig::default()
     };
 

@@ -670,13 +670,18 @@ separately. With no `--cache-dir` no tier label appears at all. See
 
 ## Retention and garbage-collection configuration
 
-Four values govern when a deleted object's bytes actually go away, and they must
+These values govern when a deleted object's bytes actually go away, and they must
 agree with each other or a reader can lose a segment out from under it. The
-governing inequality is:
+governing inequalities are:
 
 ```
 protection_horizon >= max_query_duration + grace + clock_skew_allowance
+protection_horizon >= max_compaction_lifetime + 4 * clock_skew_allowance
 ```
+
+`max_compaction_lifetime` is compiled in (1h). The second bound keeps a late
+compaction or erasure-rewrite run from changing which inputs a sweep may delete
+after their horizon has passed.
 
 The first three values are recorded once, deployment-wide, in a durable
 `sys/gc` object at the bucket root, and every mode validates itself against it

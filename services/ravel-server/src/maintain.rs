@@ -1347,6 +1347,13 @@ fn compactor_config_from_gc(
 /// path (`ravel_server::start` -> `spawn` -> `run_loop`), so no sweep loop is
 /// ever entered with a skew-uncovered horizon.
 ///
+/// The same spot refuses a stored horizon below
+/// `max_compaction_lifetime + 4 * clock_skew_allowance` for this process's
+/// compactor config, with
+/// [`GcConfigError::MaintainCompactionLifetimeUncovered`] (ADR-1133): the
+/// delete marker's gated set is stable only if no compaction or rewrite run
+/// can publish over a record's inputs once their horizon has passed.
+///
 /// A zero `heartbeat_interval` (on `config` or on `worker`) is refused the same
 /// way, with [`SpawnError::ZeroHeartbeatInterval`], and a zero `interval` with
 /// [`SpawnError::ZeroMaintainInterval`].
@@ -1381,6 +1388,11 @@ pub fn spawn(
     // `clock_skew_allowance_ns`, not just the write-time skew the horizon was
     // authored against. A violation refuses to spawn the sweep loop at all.
     ravel_maintain::validate_maintain_skew(&stored_gc, config.compactor.clock_skew_allowance_ns)?;
+    ravel_maintain::validate_maintain_compaction_lifetime(
+        &stored_gc,
+        config.compactor.max_compaction_lifetime_ns,
+        config.compactor.clock_skew_allowance_ns,
+    )?;
 
     // Production OS-entropy source (ADR-0068 decision 2) for the compactor
     // writer id and the per-tick loop jitter. The server always uses the
@@ -9983,6 +9995,71 @@ mod tests {
             Arc::new(WallClock),
         )
         .expect("a horizon that covers the running sweeper's skew spawns normally");
+        tasks.shutdown().await;
+    }
+
+    /// ADR-1133's gated-set stability premise is a spawn refusal: a stored
+    /// horizon below `max_compaction_lifetime + 4 * clock_skew_allowance` for
+    /// the running compactor config returns
+    /// [`ravel_maintain::GcConfigError::MaintainCompactionLifetimeUncovered`]
+    /// and spawns nothing. One nanosecond less lifetime, at the bound, spawns.
+    ///
+    /// Flip to watch it fail: remove the
+    /// `validate_maintain_compaction_lifetime` call in `spawn`; the first case
+    /// then spawns and the `Ok` arm panics.
+    #[tokio::test]
+    async fn spawn_fails_closed_when_compaction_lifetime_outlasts_stored_horizon() {
+        let stored_gc = ravel_maintain::GcConfigValues::maintain_defaults();
+        let skew = CompactorConfig::default().clock_skew_allowance_ns;
+        let at_bound = stored_gc.protection_horizon_ns - 4 * skew;
+        let config_with = |max_compaction_lifetime_ns: i64| MaintenanceTaskConfig {
+            enabled: true,
+            compactor: CompactorConfig {
+                max_compaction_lifetime_ns,
+                ..CompactorConfig::default()
+            },
+            ..MaintenanceTaskConfig::default()
+        };
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let spawn_with = |config: MaintenanceTaskConfig| {
+            let worker = Arc::new(solo_worker());
+            spawn(
+                store.clone(),
+                Vec::new(),
+                config,
+                stored_gc,
+                Arc::new(TenantDiscoveryMetrics::default()),
+                Arc::new(MaintenanceSafetyMetrics::default()),
+                Arc::new(MaintenanceOwnershipMetrics::new(
+                    DEFAULT_STALLED_AFTER_INTERVALS,
+                )),
+                Arc::clone(&worker),
+                Arc::new(watch::channel(worker.solo_live_set()).0),
+                Arc::new(WallClock),
+            )
+        };
+
+        match spawn_with(config_with(at_bound + 1)) {
+            Err(SpawnError::GcConfig(
+                ravel_maintain::GcConfigError::MaintainCompactionLifetimeUncovered {
+                    stored_horizon_ns,
+                    max_compaction_lifetime_ns,
+                    clock_skew_allowance_ns,
+                },
+            )) => {
+                assert_eq!(stored_horizon_ns, stored_gc.protection_horizon_ns);
+                assert_eq!(max_compaction_lifetime_ns, at_bound + 1);
+                assert_eq!(clock_skew_allowance_ns, skew);
+            }
+            Err(other) => panic!("expected MaintainCompactionLifetimeUncovered, got: {other}"),
+            Ok(_) => panic!(
+                "a compaction lifetime the stored horizon does not outlast must fail spawn, \
+                 not enter the sweep loop"
+            ),
+        }
+
+        let tasks = spawn_with(config_with(at_bound))
+            .expect("a compaction lifetime exactly at the bound spawns normally");
         tasks.shutdown().await;
     }
 
