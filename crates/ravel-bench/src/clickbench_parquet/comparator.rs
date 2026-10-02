@@ -341,7 +341,10 @@ fn parse_rfc3339_to_ns(index: usize, value: &str) -> Result<i64, ComparatorError
         Some((hms, frac)) => {
             let digits = &frac[..frac.len().min(9)];
             let padded = format!("{digits:0<9}");
-            (hms, padded.parse::<i64>().map_err(|_| fail("bad fraction"))?)
+            (
+                hms,
+                padded.parse::<i64>().map_err(|_| fail("bad fraction"))?,
+            )
         }
         None => (time_part, 0),
     };
@@ -409,9 +412,10 @@ pub fn json_cell(
             .ok_or_else(invalid)
             .and_then(|s| parse_rfc3339_to_ns(index, s))
             .map(Cell::Ts),
-        ColumnKind::Decimal(scale) => value.as_f64().ok_or_else(invalid).map(|f| {
-            Cell::Decimal((f * 10f64.powi(scale as i32)).round() as i128, scale)
-        }),
+        ColumnKind::Decimal(scale) => value
+            .as_f64()
+            .ok_or_else(invalid)
+            .map(|f| Cell::Decimal((f * 10f64.powi(scale as i32)).round() as i128, scale)),
     }
 }
 
@@ -424,11 +428,13 @@ pub fn rows_from_json(
     reference
         .iter()
         .map(|row| {
-            let cells = row.as_array().ok_or_else(|| ComparatorError::InvalidJsonCell {
-                index: 0,
-                value: row.to_string(),
-                kind: subject_kinds.first().copied().unwrap_or(ColumnKind::Str),
-            })?;
+            let cells = row
+                .as_array()
+                .ok_or_else(|| ComparatorError::InvalidJsonCell {
+                    index: 0,
+                    value: row.to_string(),
+                    kind: subject_kinds.first().copied().unwrap_or(ColumnKind::Str),
+                })?;
             if cells.len() != subject_kinds.len() {
                 return Err(ComparatorError::ColumnCountMismatch {
                     reference: cells.len(),
@@ -512,7 +518,9 @@ fn parse_u64_expr(expr: &Expr) -> Result<u64, ComparatorError> {
         .map_err(|_| ComparatorError::SqlParse(format!("not a plain integer literal: {expr}")))
 }
 
-fn parse_limit_clause(limit_clause: Option<&LimitClause>) -> Result<(Option<u64>, u64), ComparatorError> {
+fn parse_limit_clause(
+    limit_clause: Option<&LimitClause>,
+) -> Result<(Option<u64>, u64), ComparatorError> {
     match limit_clause {
         None => Ok((None, 0)),
         Some(LimitClause::LimitOffset { limit, offset, .. }) => {
@@ -599,9 +607,9 @@ fn project(row: &[Cell], key: &[usize]) -> Vec<Cell> {
 
 fn rows_match_except_float(a: &[Cell], b: &[Cell]) -> bool {
     a.len() == b.len()
-        && a.iter().zip(b).all(|(x, y)| {
-            matches!((x, y), (Cell::Float(_), Cell::Float(_))) || x == y
-        })
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| matches!((x, y), (Cell::Float(_), Cell::Float(_))) || x == y)
 }
 
 fn count_float_cells(row: &[Cell]) -> u64 {
@@ -616,10 +624,7 @@ pub fn compare(
     subject: &[Vec<Cell>],
     tie: &TieSpec,
 ) -> Result<ComparisonReport, ComparatorError> {
-    let width = reference
-        .first()
-        .or_else(|| subject.first())
-        .map(Vec::len);
+    let width = reference.first().or_else(|| subject.first()).map(Vec::len);
     if let Some(width) = width {
         for row in reference.iter().chain(subject.iter()) {
             if row.len() != width {
@@ -668,7 +673,9 @@ pub fn compare(
         HashSet::new()
     };
 
-    let is_boundary = |row: &[Cell]| -> bool { !boundary.is_empty() && boundary.contains(&project(row, &tie.key)) };
+    let is_boundary = |row: &[Cell]| -> bool {
+        !boundary.is_empty() && boundary.contains(&project(row, &tie.key))
+    };
 
     let mut tie_rows_reduced = 0u64;
     let mut interior_ref = Vec::new();
@@ -765,8 +772,14 @@ pub fn compare(
         verdict,
         float_mismatches,
         row_mismatch: RowMismatch {
-            missing: remaining_missing.into_iter().take(MAX_MISMATCH_ROWS).collect(),
-            extra: remaining_extra.into_iter().take(MAX_MISMATCH_ROWS).collect(),
+            missing: remaining_missing
+                .into_iter()
+                .take(MAX_MISMATCH_ROWS)
+                .collect(),
+            extra: remaining_extra
+                .into_iter()
+                .take(MAX_MISMATCH_ROWS)
+                .collect(),
         },
         tie_rows_reduced,
         float_cells_compared,
@@ -869,8 +882,15 @@ mod tests {
             vec![Cell::Int(1), Cell::Str("r".into())],
         ];
         let report = compare(&reference, &subject, &tie(vec![0], None, 0)).expect("compare");
-        assert_eq!(report.verdict, Verdict::Fail, "an interior content bug away from any LIMIT boundary must still be caught");
-        assert_eq!(report.tie_rows_reduced, 0, "no LIMIT means no boundary rows are ever exempted");
+        assert_eq!(
+            report.verdict,
+            Verdict::Fail,
+            "an interior content bug away from any LIMIT boundary must still be caught"
+        );
+        assert_eq!(
+            report.tie_rows_reduced, 0,
+            "no LIMIT means no boundary rows are ever exempted"
+        );
     }
 
     /// Required test: a float differing in its last bit is listed with
@@ -882,7 +902,11 @@ mod tests {
         let reference = vec![vec![Cell::Int(1), Cell::Float(a.to_bits())]];
         let subject = vec![vec![Cell::Int(1), Cell::Float(b.to_bits())]];
         let report = compare(&reference, &subject, &tie(vec![], None, 0)).expect("compare");
-        assert_eq!(report.verdict, Verdict::Pass, "a float mismatch alone is informational, not fatal");
+        assert_eq!(
+            report.verdict,
+            Verdict::Pass,
+            "a float mismatch alone is informational, not fatal"
+        );
         assert_eq!(report.float_mismatches.len(), 1);
         let fm = &report.float_mismatches[0];
         assert_eq!(fm.reference_bits, a.to_bits());
@@ -926,7 +950,10 @@ mod tests {
 
         let without_override = resolve_tie_spec(43, &statement.sql, None);
         assert!(
-            matches!(without_override, Err(ComparatorError::UnresolvedOrderKey { .. })),
+            matches!(
+                without_override,
+                Err(ComparatorError::UnresolvedOrderKey { .. })
+            ),
             "Q43 must not resolve without the override: {without_override:?}"
         );
 
@@ -960,7 +987,11 @@ mod tests {
         let reference = vec![vec![Cell::Str("x".to_string())]];
         let subject = vec![vec![Cell::Bytes(b"x".to_vec())]];
         let report = compare(&reference, &subject, &tie(vec![], None, 0)).expect("compare");
-        assert_eq!(report.verdict, Verdict::Fail, "Utf8 and Binary must not compare equal");
+        assert_eq!(
+            report.verdict,
+            Verdict::Fail,
+            "Utf8 and Binary must not compare equal"
+        );
     }
 
     /// Required test: a JSON reference row parses to the same cells as the
@@ -969,8 +1000,7 @@ mod tests {
     #[test]
     fn json_reference_matches_equivalent_batch() {
         use datafusion::arrow::array::{
-            BinaryArray, BooleanArray, Date32Array, Float64Array, Int64Array,
-            TimestampSecondArray,
+            BinaryArray, BooleanArray, Date32Array, Float64Array, Int64Array, TimestampSecondArray,
         };
         use datafusion::arrow::datatypes::{Field, Schema};
         use std::sync::Arc;
@@ -1015,7 +1045,13 @@ mod tests {
             ]
         );
         let json_rows: Vec<serde_json::Value> = vec![serde_json::json!([
-            true, 42, 1.5, "hi", "hi", "2013-07-15", "2013-07-15T01:02:03Z"
+            true,
+            42,
+            1.5,
+            "hi",
+            "hi",
+            "2013-07-15",
+            "2013-07-15T01:02:03Z"
         ])];
         let json_normalized = rows_from_json(&json_rows, &kinds).expect("normalize json");
         assert_eq!(arrow_rows, json_normalized);

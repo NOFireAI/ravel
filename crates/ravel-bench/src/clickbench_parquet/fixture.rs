@@ -201,7 +201,12 @@ impl Columns {
     }
 
     /// Builds the `RecordBatch` for rows `start..end`.
-    fn batch(&self, schema: &SchemaRef, start: usize, end: usize) -> Result<RecordBatch, FixtureError> {
+    fn batch(
+        &self,
+        schema: &SchemaRef,
+        start: usize,
+        end: usize,
+    ) -> Result<RecordBatch, FixtureError> {
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(Int64Array::from(self.watch_id[start..end].to_vec())),
             Arc::new(Int64Array::from(self.user_id[start..end].to_vec())),
@@ -219,13 +224,19 @@ impl Columns {
             Arc::new(Int16Array::from(self.is_link[start..end].to_vec())),
             Arc::new(Int16Array::from(self.is_download[start..end].to_vec())),
             Arc::new(Int16Array::from(self.dont_count_hits[start..end].to_vec())),
-            Arc::new(Int16Array::from(self.window_client_width[start..end].to_vec())),
-            Arc::new(Int16Array::from(self.window_client_height[start..end].to_vec())),
+            Arc::new(Int16Array::from(
+                self.window_client_width[start..end].to_vec(),
+            )),
+            Arc::new(Int16Array::from(
+                self.window_client_height[start..end].to_vec(),
+            )),
             Arc::new(Int64Array::from(self.event_time[start..end].to_vec())),
             Arc::new(UInt16Array::from(self.event_date[start..end].to_vec())),
             Arc::new(BinaryArray::from_iter_values(self.url[start..end].iter())),
             Arc::new(BinaryArray::from_iter_values(self.title[start..end].iter())),
-            Arc::new(BinaryArray::from_iter_values(self.referer[start..end].iter())),
+            Arc::new(BinaryArray::from_iter_values(
+                self.referer[start..end].iter(),
+            )),
             Arc::new(BinaryArray::from_iter_values(
                 self.search_phrase[start..end].iter(),
             )),
@@ -328,7 +339,8 @@ fn generate(seed: u64) -> Columns {
         cols.window_client_height.push(rng.random_range(0..=2000));
 
         let day_start = i64::from(event_date) * 86_400;
-        cols.event_time.push(day_start + rng.random_range(0..86_400i64));
+        cols.event_time
+            .push(day_start + rng.random_range(0..86_400i64));
         cols.event_date.push(event_date);
 
         let url = if i % 20 == 0 {
@@ -379,15 +391,18 @@ fn write_batch(path: &Path, schema: &SchemaRef, batch: &RecordBatch) -> Result<(
         path: path.to_path_buf(),
         source,
     })?;
-    let mut writer =
-        ArrowWriter::try_new(file, schema.clone(), None).map_err(|source| FixtureError::Parquet {
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).map_err(|source| {
+        FixtureError::Parquet {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    writer
+        .write(batch)
+        .map_err(|source| FixtureError::Parquet {
             path: path.to_path_buf(),
             source,
         })?;
-    writer.write(batch).map_err(|source| FixtureError::Parquet {
-        path: path.to_path_buf(),
-        source,
-    })?;
     writer.close().map_err(|source| FixtureError::Parquet {
         path: path.to_path_buf(),
         source,
@@ -429,9 +444,7 @@ mod tests {
             .expect("build reader")
             .build()
             .expect("construct reader");
-        reader
-            .map(|b| b.expect("read batch"))
-            .collect::<Vec<_>>()
+        reader.map(|b| b.expect("read batch")).collect::<Vec<_>>()
     }
 
     fn row_count(batches: &[RecordBatch]) -> usize {
@@ -454,11 +467,7 @@ mod tests {
             .step_by(2)
             .map(str::to_string)
             .collect();
-        let planted: HashSet<String> = schema()
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect();
+        let planted: HashSet<String> = schema().fields().iter().map(|f| f.name().clone()).collect();
         assert_eq!(referenced, planted);
         assert_eq!(planted.len(), 25);
     }
@@ -495,9 +504,19 @@ mod tests {
         write_hits(dir.path(), 7).expect("write_hits");
         let combined = read_all(&dir.path().join("hits.parquet"));
         let schema = combined[0].schema();
-        for name in ["URL", "Title", "Referer", "SearchPhrase", "MobilePhoneModel"] {
+        for name in [
+            "URL",
+            "Title",
+            "Referer",
+            "SearchPhrase",
+            "MobilePhoneModel",
+        ] {
             let field = schema.field_with_name(name).expect("field present");
-            assert_eq!(field.data_type(), &DataType::Binary, "{name} must be Binary");
+            assert_eq!(
+                field.data_type(),
+                &DataType::Binary,
+                "{name} must be Binary"
+            );
         }
     }
 
@@ -685,7 +704,8 @@ mod tests {
         write_hits(dir.path(), 7).expect("write_hits");
         let combined = read_all(&dir.path().join("hits.parquet"));
 
-        let mut counts: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
+        let mut counts: std::collections::HashMap<Vec<u8>, usize> =
+            std::collections::HashMap::new();
         for batch in &combined {
             let col = batch
                 .column_by_name("SearchPhrase")
@@ -704,7 +724,10 @@ mod tests {
         assert_eq!(counts.len(), SEARCH_PHRASES.len());
         let min = *counts.values().min().expect("at least one phrase");
         let max = *counts.values().max().expect("at least one phrase");
-        assert!(max - min <= 1, "counts must be within 1 of each other: {counts:?}");
+        assert!(
+            max - min <= 1,
+            "counts must be within 1 of each other: {counts:?}"
+        );
     }
 
     /// Q21-24's `"URL" LIKE '%google%'` and Q23's `"Title" LIKE '%Google%'`
