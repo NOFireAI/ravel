@@ -39,7 +39,32 @@ pub(crate) struct CanonicalResolver {
 pub(crate) struct OidcRefresh {
     pub cache: Arc<OidcJwksCache>,
     pub jwks_url: String,
+    /// Refetch period. Zero is refused by [`OidcRefresh::check`] before
+    /// anything is spawned.
     pub interval: Duration,
+}
+
+impl OidcRefresh {
+    /// Refuse parameters the refresh loop cannot run with.
+    /// [`tokio::time::interval`] panics on a zero period, which would kill the
+    /// spawned task after its initial refresh.
+    pub(crate) fn check(&self) -> Result<(), JwksRefreshSpawnError> {
+        if self.interval.is_zero() {
+            return Err(JwksRefreshSpawnError::ZeroRefreshInterval);
+        }
+        Ok(())
+    }
+}
+
+/// Why the JWKS refresh loop refused to start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum JwksRefreshSpawnError {
+    /// A zero OIDC JWKS refresh interval.
+    #[error(
+        "the OIDC JWKS refresh interval must be non-zero (--oidc-jwks-refresh-interval-secs, \
+         OidcSettings::refresh_interval): a zero interval cannot drive the JWKS refresh timer"
+    )]
+    ZeroRefreshInterval,
 }
 
 /// Build the canonical-tenant resolver chain.
@@ -86,8 +111,14 @@ pub(crate) fn build(settings: &CanonicalAuthSettings) -> anyhow::Result<Canonica
 /// so an OIDC router does not reject every request for a full interval at
 /// startup, then refetches on `interval`. A failed refresh keeps the previously
 /// cached keys (a transient JWKS outage does not start rejecting every token).
-pub(crate) fn spawn_jwks_refresh(params: OidcRefresh) -> JoinHandle<()> {
-    tokio::spawn(async move {
+///
+/// A zero `interval` returns [`JwksRefreshSpawnError::ZeroRefreshInterval`]
+/// and spawns nothing.
+pub(crate) fn spawn_jwks_refresh(
+    params: OidcRefresh,
+) -> Result<JoinHandle<()>, JwksRefreshSpawnError> {
+    params.check()?;
+    Ok(tokio::spawn(async move {
         if let Err(err) = params.cache.refresh(&params.jwks_url).await {
             tracing::warn!(error = %err, "initial JWKS refresh failed; will retry on interval");
         }
@@ -103,7 +134,7 @@ pub(crate) fn spawn_jwks_refresh(params: OidcRefresh) -> JoinHandle<()> {
                 }
             }
         }
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -111,6 +142,24 @@ pub(crate) fn spawn_jwks_refresh(params: OidcRefresh) -> JoinHandle<()> {
 mod tests {
     use super::*;
     use axum::http::HeaderMap;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_refuses_a_zero_refresh_interval() {
+        let params = OidcRefresh {
+            cache: Arc::new(OidcJwksCache::new().expect("cache builds")),
+            jwks_url: "https://issuer.example.com/jwks".to_string(),
+            interval: Duration::ZERO,
+        };
+        let err = spawn_jwks_refresh(params).expect_err("a zero interval must be refused");
+        assert_eq!(err, JwksRefreshSpawnError::ZeroRefreshInterval);
+        assert_eq!(
+            tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks(),
+            0,
+            "nothing may be spawned for a refused interval"
+        );
+    }
 
     #[test]
     fn built_chain_rejects_a_client_cert_header_only_request() {
