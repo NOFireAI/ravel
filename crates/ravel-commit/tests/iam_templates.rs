@@ -2165,11 +2165,16 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // reading as "no postings ref yet". Before that it returned Ok(None) on
     // ANY error, which is why this grant had to be DERIVED rather than
     // observed: at the time nothing in a running system would have reported
-    // it. (fold_inner also GETs idx/ objects for
-    // its .cstat and .npost reuse baseline, but the fold never runs under
-    // Mode::Maintain -- folds_in_process excludes it and the maintain arm
-    // returns FoldTasks::none -- so those reads are why gateway.json and
-    // query.json carry catalog reads, not why maintain.json does.)
+    // it. fold_inner also GETs idx/ objects for its .cstat and .npost reuse
+    // baseline, and since ADR-1693 the scheduled fold runs under
+    // Mode::Maintain (Mode::runs_scheduled_fold), so those reads land on this
+    // role too.
+    //
+    // The scheduled fold is also why the put axis carries the three catalog
+    // patterns: fold_inner PUTs snap/*.csnap, idx/*.cstat and idx/*.npost
+    // with CreateIfAbsent and the HEAD with CasVersion or CreateIfAbsent.
+    // The Deny below names only deletes, so it does not cancel the HEAD put.
+    // Asserted by maintain_template_covers_every_scheduled_fold_call.
     //
     // Each is exactly the defect this role's del/* grants were added to fix,
     // and the shape that shipped again here three times (issue #1847, rounds
@@ -2276,6 +2281,9 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/maintain/*",
             "quarantine/t/*/*/l0/*",
             "t/*/enc",
+            "t/*/catalog/*/snap/*",
+            "t/*/catalog/*/idx/*",
+            "t/*/catalog/*/HEAD",
         ],
         put_actions: &["s3:PutObject"],
         deletes: &[
@@ -3197,9 +3205,10 @@ fn maintain_template_covers_every_catalog_sweep_call() {
     //   (crates/ravel-catalog/src/covering_postings.rs). Since #1964 a
     //   non-`NotFound` failure there returns `Err` and disables the postings
     //   tier for the tick loudly; `NotFound` still degrades to `Ok(None)`.
-    //   `fold_inner`'s `.cstat`/`.npost` reuse GETs read the same keyspace
-    //   but never under this credential: the fold does not run in
-    //   `Mode::Maintain`.
+    //   `fold_inner`'s `.cstat`/`.npost` reuse GETs read the same keyspace,
+    //   and since ADR-1693 they run under this credential too: the scheduled
+    //   fold runs in `Mode::Maintain`
+    //   (`maintain_template_covers_every_scheduled_fold_call`).
     //
     // The third shape is why this assertion had to exist BEFORE that fix, and
     // why the grant was derived rather than observed: until #1964 a missing
@@ -3299,6 +3308,164 @@ fn maintain_template_covers_every_catalog_sweep_call() {
                  reads. The pass GETs HEAD and the snapshot parts HEAD names, \
                  and nothing else -- not idx/, not anything outside the \
                  catalog keyspace (#1847)"
+            );
+        }
+    }
+}
+
+/// Every object-store call the scheduled catalog fold makes must be reachable
+/// under the shipped Maintain template. Since ADR-1693 the scheduled fold runs
+/// on the maintain tier (`Mode::runs_scheduled_fold` in
+/// `services/ravel-server/src/config.rs` is true for `Maintain` and `All`
+/// only), so a per-role deployment runs `fold_inner`
+/// (`crates/ravel-catalog/src/fold.rs`) under this credential. Before issue
+/// #2382 `MaintainWrite` granted no catalog key, so every fold that advanced
+/// was refused at its first snapshot write and the catalog stopped moving.
+///
+/// The fold's calls, by `fold.rs` call site:
+///
+/// - `discover_bucket_listings`: `list_all` on `commit_shard_hour_prefix` for
+///   each (shard, hour) bucket, then GETs of the commit records it lists;
+/// - the HEAD read at the top of `fold_inner` (`head_object_key`) and the
+///   reuse-baseline GETs of the parts, `.cstat` and `.npost` objects the
+///   current HEAD names;
+/// - `part_object_key`: PUT `snap/<hour>.<hash16>.csnap`, `CreateIfAbsent`,
+///   any refusal other than `AlreadyExists` aborts the fold;
+/// - `column_stats_object_key`: PUT `idx/<hour>.<hash16>.cstat`,
+///   `CreateIfAbsent`, issued when typed columns are declared, a refusal
+///   aborts the fold;
+/// - `postings_object_key`: PUT `idx/<hour>.<hash16>.npost`,
+///   `CreateIfAbsent`, a refusal is tolerated (the HEAD omits the postings);
+/// - `head_object_key`: PUT `HEAD` with `CasVersion` or `CreateIfAbsent`.
+///
+/// The catalog keys are taken from `key_domain()`'s catalog witnesses
+/// (`constructor_free_tenant_witness_keys`), so a witness change moves this
+/// test with it. The witness filenames are not the fold's
+/// `<hour>.<hash16>.<ext>` shape; see
+/// `maintain_deletes_catalog_snap_and_idx_but_not_head` for why that is
+/// immaterial to patterns ending in `snap/*` and `idx/*`.
+#[test]
+fn maintain_template_covers_every_scheduled_fold_call() {
+    let tenant = test_tenant();
+    let maintain = load_policy("maintain");
+
+    let list_prefixes = list_prefix_patterns(&maintain, Some("Allow"));
+    let gets = key_patterns_for(&maintain, &["s3:GetObject"], Some("Allow"));
+    let puts = key_patterns_for(&maintain, &["s3:PutObject"], Some("Allow"));
+    let deny_puts = key_patterns_for(&maintain, &["s3:PutObject"], Some("Deny"));
+    let deny_deletes = delete_key_patterns(&maintain, "Deny");
+
+    let catalog_witnesses: Vec<&String> = key_domain()
+        .iter()
+        .filter(|k| k.contains("/catalog/"))
+        .collect();
+
+    for signal in ALL_SIGNALS {
+        let prefix = signal.key_prefix();
+        let scope = format!("/catalog/{prefix}/");
+        let of_signal: Vec<&String> = catalog_witnesses
+            .iter()
+            .copied()
+            .filter(|k| k.contains(&scope))
+            .collect();
+        let head: Vec<&String> = of_signal
+            .iter()
+            .copied()
+            .filter(|k| k.ends_with("/HEAD"))
+            .collect();
+        let snap: Vec<&String> = of_signal
+            .iter()
+            .copied()
+            .filter(|k| k.contains("/snap/"))
+            .collect();
+        let idx: Vec<&String> = of_signal
+            .iter()
+            .copied()
+            .filter(|k| k.contains("/idx/"))
+            .collect();
+        for (shape, found) in [("HEAD", &head), ("snap/", &snap), ("idx/", &idx)] {
+            assert!(
+                !found.is_empty(),
+                "{signal:?}: key_domain() carries no catalog {shape} witness, \
+                 so the fold coverage below would examine nothing for it"
+            );
+        }
+
+        // discover_bucket_listings: list_all on each commit bucket prefix,
+        // then a GET per commit record.
+        let bucket_prefix = ravel_commit::keys::commit_shard_hour_prefix(&tenant, signal, 0, 0)
+            .expect("commit_shard_hour_prefix");
+        assert!(
+            list_prefixes
+                .iter()
+                .any(|p| glob_matches(p, &bucket_prefix)),
+            "maintain: no ListBucket s3:prefix admits {bucket_prefix:?}, the \
+             commit bucket prefix the scheduled fold lists. s3:prefix values: \
+             {list_prefixes:?}"
+        );
+        let record =
+            commit_key(&tenant, signal, 0, 0, Uuid::from_u128(1), 1, 1).expect("commit_key");
+        assert!(
+            gets.iter().any(|p| glob_matches(p, &record)),
+            "maintain: no GetObject Allow reaches the commit record {record:?} \
+             the scheduled fold reads. Grants: {gets:?}"
+        );
+
+        // HEAD read, reuse-baseline reads, and the four PUTs.
+        for witness in head.iter().chain(snap.iter()).chain(idx.iter()) {
+            assert!(
+                gets.iter().any(|p| glob_matches(p, witness)),
+                "maintain: no GetObject Allow reaches {witness:?}, which the \
+                 scheduled fold reads (HEAD, or a part, .cstat or .npost the \
+                 HEAD names). Grants: {gets:?}"
+            );
+            assert!(
+                puts.iter().any(|p| glob_matches(p, witness)),
+                "maintain: no PutObject Allow reaches {witness:?}, which the \
+                 scheduled fold PUTs on the maintain tier (ADR-1693). Without \
+                 it the fold is refused at its first snapshot write and the \
+                 catalog stops advancing (issue #2382). Grants: {puts:?}"
+            );
+            assert!(
+                !deny_puts.iter().any(|p| glob_matches(p, witness)),
+                "maintain: a PutObject Deny reaches {witness:?} and cancels the \
+                 fold's write grant. Deny patterns: {deny_puts:?}"
+            );
+        }
+
+        // The HEAD stays protected against deletion: the new put grant must
+        // not have been paid for by narrowing DenyDeleteProtected.
+        for witness in &head {
+            assert!(
+                deny_deletes.iter().any(|p| glob_matches(p, witness)),
+                "maintain: DenyDeleteProtected no longer denies {witness:?}, \
+                 the catalog HEAD pointer the fold CAS-writes"
+            );
+        }
+    }
+
+    // Tightness: a put pattern naming the catalog keyspace reaches HEAD,
+    // snap/ and idx/ and nothing else in the domain.
+    let outside: Vec<&String> = key_domain()
+        .iter()
+        .filter(|k| !catalog_witnesses.contains(k))
+        .collect();
+    assert!(
+        !outside.is_empty(),
+        "the key domain models no key outside the catalog keyspace, so the \
+         tightness assertion below examines nothing"
+    );
+    let catalog_puts: Vec<&String> = puts.iter().filter(|p| p.contains("catalog/")).collect();
+    assert!(
+        !catalog_puts.is_empty(),
+        "maintain: no PutObject Allow names the catalog keyspace. Grants: {puts:?}"
+    );
+    for pattern in catalog_puts {
+        for key in &outside {
+            assert!(
+                !glob_matches(pattern, key),
+                "maintain: catalog PutObject pattern {pattern:?} also reaches \
+                 {key:?}, which the fold never writes"
             );
         }
     }

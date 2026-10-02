@@ -49,11 +49,14 @@ per-role grants below. Two facts from that inventory drive this ADR's shape:
 
 1. **The catalog fold task runs in Gateway and Query mode, not only Query.**
    `services/ravel-server/src/lib.rs:715-736` spawns `fold::spawn` in every
-   mode except `Mode::Maintain`. A `Mode::Gateway` process therefore writes
+   mode except `Mode::Maintain` (reversed by ADR-1693; see the maintain-tier
+   fold amendment below). A `Mode::Gateway` process therefore writes
    `catalog/<sig>/snap/…`, `catalog/<sig>/HEAD` (`CasVersion`), and
    `catalog/<sig>/idx/…` alongside its ingest writes — fold is not a
    query-only responsibility, and any role split that gave Gateway an
-   ingest-only grant would break it in the shipped topology.
+   ingest-only grant would break it in the shipped topology. (No longer
+   true since ADR-1693: the scheduled fold runs in `Mode::Maintain` and
+   `Mode::All` only, and Gateway folds by no route.)
 2. **Nothing in the current codebase ever deletes `sys/*`, `prov`,
    `catalog/*`, or the audit prefix `t/<hash>/u/*`.** Deletion is confined
    to `l0/`, `l1/`, `c/` (records and tombstones), and `idem/`, all from
@@ -159,7 +162,7 @@ to reject an in-process authorization side channel.
 |---|---|---|---|---|
 | **Gateway** | `Mode::Gateway`, or the gateway half of `Mode::All` | `prov`, `idem/<key>` (dedup lookup), `sys/tenancy`, `sys/qualification`, `sys/gc` (bootstrap reads); `l0/`, `c/` (fold's own read-back of what it just built on); `catalog/<sig>/**` (HEAD, snap parts, name postings — fold reads its own prior output to fold incrementally, `fold.rs` `get_head`/part/postings reads) | `l0/**` (CreateIfAbsent), `c/**cmt` (CreateIfAbsent, L0 commit records only), `idem/**` (Put), `prov` (CreateIfAbsent, adopt path only), `catalog/<sig>/snap/**` (CreateIfAbsent), `catalog/<sig>/HEAD` (CasVersion), `catalog/<sig>/idx/**` (CreateIfAbsent); `sys/tenancy` (CreateIfAbsent, first-boot race, see §4) | no durable object; only the mutable per-process admission snapshots `t/<hash>/<sig>/admission/*` of dead processes (see the 2026-10-02 amendment below) |
 | **Query** | `Mode::Query`, or the query half of `Mode::All` | `c/**` (Phase 1 listing), `l0/**`, `l1/**` (the query fetchers GET segment data directly — footer-first ranged reads — not just commit-record metadata; `ravel-query`'s fetcher, `ravel-server`'s exemplar/log/span fetchers), `catalog/<sig>/**` (snap/HEAD/idx), `prov`, `admission/query/**` (fleet-global query concurrency reconciliation, ADR-0061 decision 2: LIST the bucket-root `admission/query/` prefix and GET each sibling process's snapshot), `sys/tenancy`, `sys/qualification`, `sys/gc` | `catalog/<sig>/snap/**`, `catalog/<sig>/HEAD` (CasVersion), `catalog/<sig>/idx/**` — same fold grants as Gateway, per the code fact above; `t/<hash>/u/<QUERY_AUDIT_SHARD>/**` (Put, append-only query audit); `admission/query/<process_id>.snapshot` (Overwrite, this process's own fleet-concurrency snapshot, ADR-0061 decision 2 — a bucket-root key, deliberately **not** under a `t/<hash>/` prefix since the ceiling is fleet-global, not per-tenant); `sys/tenancy` (CreateIfAbsent, first-boot race) | none (a draining query worker overwrites its own `sys/query/workers/<process_id>` record instead of deleting it; see the query-worker reap amendment below) |
-| **Maintain** | `Mode::Maintain` | `l0/**`, `c/**` (compaction input read, footer-first ranged reads); `l1/**` (HEAD, the lost-CAS-race convergence path re-verifies a part's existence before retrying publish); `maint/<shard>/cursor` (read before its own CAS mutation); `t/<hash>/u/<AUDIT>/**` (legal-hold refresh); `sys/tenancy`, `sys/qualification`, `sys/gc`, `prov` | `l1/**` (CreateIfAbsent); `c/**l1.cmt` (CreateIfAbsent, compaction records); `c/**retire.tmb` (Put, tombstones); `maint/<shard>/cursor` (mutable CAS); `sys/gc` (CreateIfAbsent bootstrap only — see §4 for the CasVersion mutation, which stays Admin); `sys/tenancy` (CreateIfAbsent, first-boot race) | `l0/**`, `c/**` (records and tombstones, superseded/retention/orphan sweep), `l1/**` (unreferenced-part sweep), `idem/**` (marker sweep), `t/<hash>/u/<QUERY_AUDIT_SHARD>/**` (query-audit compaction + 90-day retention sweep — see the query-audit shard amendment below), `sys/maintain/workers/*` (dead-worker heartbeat reap, see the worker-heartbeat amendment below), `sys/query/workers/*` (dead query-worker record reap, see the query-worker reap amendment below), `t/<hash>/<sig>/del/*.dreq` (see the selective-erasure `del/` amendment below), `t/<hash>/pq/t/**` (superseded Parquet table manifests, `ravel-cli parquet sweep`, see the 2026-10-02 amendment below) — **the only role with durable-data deletion** |
+| **Maintain** | `Mode::Maintain` | `l0/**`, `c/**` (compaction input read, footer-first ranged reads); `l1/**` (HEAD, the lost-CAS-race convergence path re-verifies a part's existence before retrying publish); `maint/<shard>/cursor` (read before its own CAS mutation); `t/<hash>/u/<AUDIT>/**` (legal-hold refresh); `sys/tenancy`, `sys/qualification`, `sys/gc`, `prov` | `l1/**` (CreateIfAbsent); `c/**l1.cmt` (CreateIfAbsent, compaction records); `c/**retire.tmb` (Put, tombstones); `maint/<shard>/cursor` (mutable CAS); `sys/gc` (CreateIfAbsent bootstrap only — see §4 for the CasVersion mutation, which stays Admin); `sys/tenancy` (CreateIfAbsent, first-boot race); `catalog/<sig>/snap/**` (CreateIfAbsent), `catalog/<sig>/HEAD` (CasVersion, or CreateIfAbsent on the first fold), `catalog/<sig>/idx/**` (CreateIfAbsent) — the scheduled fold, see the maintain-tier fold amendment below | `l0/**`, `c/**` (records and tombstones, superseded/retention/orphan sweep), `l1/**` (unreferenced-part sweep), `idem/**` (marker sweep), `t/<hash>/u/<QUERY_AUDIT_SHARD>/**` (query-audit compaction + 90-day retention sweep — see the query-audit shard amendment below), `sys/maintain/workers/*` (dead-worker heartbeat reap, see the worker-heartbeat amendment below), `sys/query/workers/*` (dead query-worker record reap, see the query-worker reap amendment below), `t/<hash>/<sig>/del/*.dreq` (see the selective-erasure `del/` amendment below), `t/<hash>/pq/t/**` (superseded Parquet table manifests, `ravel-cli parquet sweep`, see the 2026-10-02 amendment below) — **the only role with durable-data deletion** |
 | **Admin** (`ravel-cli`, operator/CI use only, never a long-running server) | n/a — invoked out of band | everything the roles above read, plus `idem/<key>` single-key inspect | `sys/tenancy` (CreateIfAbsent bootstrap), `sys/qualification` (CreateIfAbsent, `store qualify`), `sys/qualify/<run-id>/**` (CreateIfAbsent, the same command's transient scratch prefix — `store qualify` exercises PUT/GET/LIST/CAS under this prefix as part of running the conformance suite, not just the final record write), `sys/gc` (CasVersion, `gc-config set`), `prov` (CasVersion, `provision reshard` / `provision adopt`), `t/<hash>/u/<AUDIT>/**` (legal hold set/clear, append-only), `c/**cmt` (CreateIfAbsent, reconstructed L0 commit records only, `commit reconstruct`, ADR-0058 — see the `c/**cmt` write amendment below) | the qualification scratch prefix `sys/qualify/*`, so `store qualify` can exercise the delete probe (see the qualification scratch delete amendment below), and the Parquet bucket probe prefix `sys/pq-probe/*` (see the 2026-10-02 amendment below); Admin still never deletes tenant data or any protected key |
 
 **Correction:**
@@ -197,7 +200,7 @@ See Rejected Alternatives.
 flowchart TB
     GW["Gateway credential\n(ingest + fold)"]
     QY["Query credential\n(reads + fold + audit)"]
-    MT["Maintain credential\n(compact, retain, sweep)"]
+    MT["Maintain credential\n(compact, retain, sweep, fold)"]
     AD["Admin credential\nravel-cli, out of band"]
 
     GW -->|"CreateIfAbsent"| L0["l0/**"]
@@ -214,6 +217,7 @@ flowchart TB
     MT -->|"Get (read inputs)"| L0R["l0/**, c/** (read)"]
     MT -->|"CreateIfAbsent"| L1["l1/**"]
     MT -->|"CreateIfAbsent / Put"| C2["c/**l1.cmt, retire.tmb"]
+    MT -->|"CreateIfAbsent + CasVersion"| CAT3["catalog/** (scheduled fold,\nmaintain-tier fold amendment)"]
     MT ==>|"Delete — only role that can"| DEL["l0/** · l1/** · c/** · idem/**\nu/&lt;query-audit shard&gt;/** · del/*.dreq · pq/t/**"]
 
     AD -->|"CasVersion"| PROVA["prov (reshard)"]
@@ -889,7 +893,8 @@ Before/after, expressed as the operations.md IAM wildcards:
   surfaced error tells an operator the grant is missing and does not grant
   it. (The fold reads the same keyspace for
   its `.cstat` and `.npost` reuse baseline, but never under this
-  credential: the fold does not run in `Mode::Maintain`. Those reads are
+  credential: the fold does not run in `Mode::Maintain` (no longer true
+  since ADR-1693; see the maintain-tier fold amendment below). Those reads are
   why `gateway.json` and `query.json` carry catalog reads.)
 
 Net effect on §1's role table (Maintain row): the Read column gains
@@ -1251,3 +1256,55 @@ None of `sys/tenancy`, `sys/qualification`, `sys/gc`, `prov` or
 brick-the-deployment protection of §2 and §3 is unchanged. Recorded as an
 appended amendment, with an inline pointer added to §1, §2, §3, the
 Consequences and the control-plane key amendment.
+
+## Amendment (2026-10-02): the maintain-tier fold grants
+
+<!-- amendment-applies: sections="What each role actually does, read from the code|1. Four roles, mapped to existing process boundaries|Amendment (2026-09-23): the catalog delete-deny narrows to `catalog/*/HEAD`" pointer="maintain-tier fold amendment" -->
+<!-- amendment-supersedes: phrase="the fold does not run in `Mode::Maintain`" pointer="maintain-tier fold amendment" -->
+<!-- amendment-supersedes: phrase="spawns `fold::spawn` in every mode except `Mode::Maintain`" pointer="maintain-tier fold amendment" -->
+
+Issue #2382. Since ADR-1693 the scheduled catalog fold runs on the maintain
+tier: `Mode::runs_scheduled_fold` (`services/ravel-server/src/config.rs`) is
+true for `Mode::Maintain` and `Mode::All` only. The context's first code fact
+and the 2026-09-23 amendment's note on the fold's reuse reads both say the
+fold does not run in `Mode::Maintain`; both are qualified in place with a
+pointer here.
+
+`fold_inner` (`crates/ravel-catalog/src/fold.rs`) writes four catalog
+objects per signal it advances:
+
+- `t/<hash>/catalog/<sig>/snap/<hour>.<hash16>.csnap` with `CreateIfAbsent`.
+  Any refusal other than `AlreadyExists` aborts the fold.
+- `t/<hash>/catalog/<sig>/idx/<hour>.<hash16>.cstat` with `CreateIfAbsent`,
+  when typed columns are declared. A refusal aborts the fold.
+- `t/<hash>/catalog/<sig>/idx/<hour>.<hash16>.npost` with `CreateIfAbsent`.
+  A refusal is tolerated and the HEAD is published without postings.
+- `t/<hash>/catalog/<sig>/HEAD` with `CasVersion`, or `CreateIfAbsent` when no
+  HEAD exists yet.
+
+`MaintainWrite` granted none of them, so on a per-role deployment every
+scheduled fold that had something to publish failed at its first snapshot
+write and the catalog stopped advancing. `MaintainWrite` gains
+`t/*/catalog/*/snap/*`, `t/*/catalog/*/idx/*` and `t/*/catalog/*/HEAD`. The
+fold's reads were already granted: `MaintainRead` covers the HEAD, `snap/*`
+and `idx/*` (2026-09-23 amendment), and the commit bucket listing and record
+reads fall under `t/*/*/c/*`. Maintain already holds `kms:Encrypt` and
+`kms:GenerateDataKey*` on the tenant key, so routed catalog writes need no
+new KMS grant.
+
+`t/*/catalog/*/HEAD` stays in `maintain.json`'s `DenyDeleteProtected`. That
+statement denies `s3:DeleteObject` and `s3:DeleteObjectVersion` only, so it
+does not cancel the HEAD write, and no Maintain delete grant reaches the HEAD.
+A compromised Maintain credential can now overwrite a catalog HEAD or publish
+a part, as a compromised Gateway or Query credential already could. The
+catalog is derived state: a fold rebuilds it from the commit records, which
+this grant does not reach.
+
+Net effect on §1: the Maintain row's write column gains the three catalog
+writes, and the diagram gains the Maintain fold edge. `gateway.json` and
+`query.json` are unchanged. Gateway no longer folds by any route, and
+removing its catalog grants is a separate least-privilege decision recorded
+on issue #2382.
+
+Recorded as an appended amendment, with an inline pointer added to the
+context's first code fact, §1 and the 2026-09-23 amendment.

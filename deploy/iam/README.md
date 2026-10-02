@@ -308,6 +308,47 @@ Two known gaps are recorded here and are NOT closed by the grants above.
   write happen on a shipped deployment, so it is recorded here. Tracked in
   issue #1979.
 
+## Catalog objects: the scheduled fold runs under Maintain
+
+Since ADR-1693 the scheduled catalog fold runs on the maintain tier:
+`Mode::runs_scheduled_fold` (`services/ravel-server/src/config.rs`) is true
+for `maintain` and `all` only. `fold_inner` (`crates/ravel-catalog/src/fold.rs`)
+reads the current HEAD and the objects it names, lists and reads the commit
+buckets, and publishes per signal:
+
+| Call | Mode | S3 operation | Grant |
+|---|---|---|---|
+| `discover_bucket_listings` lists `commit_shard_hour_prefix` for each (shard, hour) bucket and reads the commit records it finds | `maintain`, `all` | `s3:ListBucket`, `s3:GetObject` | `MaintainList` `s3:prefix` and `MaintainRead` `t/*/*/c/*` |
+| The HEAD read, and the reuse-baseline reads of the parts, `.cstat` and `.npost` objects the HEAD names | `maintain`, `all` | `s3:GetObject` | `MaintainRead` `t/*/catalog/*/HEAD`, `t/*/catalog/*/snap/*` and `t/*/catalog/*/idx/*` |
+| `part_object_key`: PUT `t/<tenant_hash>/catalog/<signal>/snap/<hour>.<hash16>.csnap` (`CreateIfAbsent`; any refusal but `AlreadyExists` aborts the fold) | `maintain`, `all` | `s3:PutObject` | `MaintainWrite` `t/*/catalog/*/snap/*` |
+| `column_stats_object_key`: PUT `t/<tenant_hash>/catalog/<signal>/idx/<hour>.<hash16>.cstat` (`CreateIfAbsent`, when typed columns are declared; a refusal aborts the fold) | `maintain`, `all` | `s3:PutObject` | `MaintainWrite` `t/*/catalog/*/idx/*` |
+| `postings_object_key`: PUT `t/<tenant_hash>/catalog/<signal>/idx/<hour>.<hash16>.npost` (`CreateIfAbsent`; a refusal is logged and the HEAD is published without postings) | `maintain`, `all` | `s3:PutObject` | `MaintainWrite` `t/*/catalog/*/idx/*` |
+| `head_object_key`: PUT `t/<tenant_hash>/catalog/<signal>/HEAD` (`CasVersion`, or `CreateIfAbsent` when no HEAD exists) | `maintain`, `all` | `s3:PutObject` | `MaintainWrite` `t/*/catalog/*/HEAD` |
+
+Until issue #2382 `MaintainWrite` named none of the three catalog patterns,
+so on a per-role deployment every scheduled fold with something to publish
+was refused at its first snapshot write and the catalog stopped advancing.
+`t/*/catalog/*/HEAD` stays in `maintain.json`'s `DenyDeleteProtected`; that
+statement denies deletes only, so it does not cancel the HEAD write.
+`maintain_template_covers_every_scheduled_fold_call` in
+`crates/ravel-commit/tests/iam_templates.rs` pins every row above.
+
+The catalog grants per role:
+
+| Key | Gateway | Query | Maintain | Admin |
+|---|---|---|---|---|
+| `t/*/catalog/*/HEAD` | list, get, put | list, get, put | get, put | list, get |
+| `t/*/catalog/*/snap/*` | list, get, put | list, get, put | list, get, put, delete | list, get |
+| `t/*/catalog/*/idx/*` | list, get, put | list, get, put | list, get, put, delete | list, get |
+
+Gateway's and Query's grants are the whole-family `t/*/catalog/*/*` list and
+read plus the three puts, carried over from when both modes ran the
+scheduled fold. Query still mounts the on-demand `POST /api/v1/admin/fold`
+route. Gateway folds by no route; removing its catalog grants is a separate
+least-privilege decision recorded on issue #2382. Admin lists and reads the
+catalog through `t/*`. Maintain's two deletes are the unreferenced-catalog sweep
+(see "Delete grants per role" above).
+
 ## Control-plane keys outside the data path
 
 Twenty control-plane keys and prefixes are read or written by a server role or
