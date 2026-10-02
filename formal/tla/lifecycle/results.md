@@ -1894,9 +1894,8 @@ ADR-1133 window gate", describes what the model gained and what it leaves out.
 ### Expected results
 
 These were not posted on the issue before the runs; the task specification
-stated them: the positive cfg passes
-`NoDeleteInsideProtectionWindow` with a delete reachable; each of the four
-controls violates it with exit 12; smoke, exhaustive and the nine existing
+stated them. The positive cfg passes `NoDeleteInsideProtectionWindow` with a
+delete reachable; each of the four controls violates it with exit 12; smoke, exhaustive and the nine existing
 controls give exactly their round-thirteen results (smoke and exhaustive
 2835448 distinct, depth 31, inside `bands.tsv`'s `[2832000, 2839000]`; each
 control its own target).
@@ -2001,7 +2000,8 @@ the window gate with `<`. The code's reader deadlines are exclusive:
 `deadline_exceeded` in `crates/ravel-query/src/log_series.rs` treats
 `Instant::now() >= d` as exceeded, the Flight SQL redemption in
 `crates/ravel-sql/src/flight/stream.rs` refuses at `now_ns >= deadline_ns`, and
-the engine's timeout fires at the deadline. The head cache bound is inclusive:
+the engine's `tokio::time::timeout` (`crates/ravel-query/src/engine.rs`) fires
+at the deadline. The head cache bound is inclusive:
 `HeadCache::get` in `crates/ravel-catalog/src/cache.rs` serves while
 `age <= ttl`. The model now matches both: a query reads only while
 `clock < query.deadline`, `ExpireQuery` fires at `clock >= query.deadline`, and
@@ -2093,3 +2093,47 @@ The traces of `pinned-query-ungated`, `window-no-cache-delay` and
 under `counterexamples/` are re-recorded from this run. A distinct count at
 the violation is where TLC stopped with two workers and moves slightly between
 runs.
+
+### FullEnv
+
+A scratch copy of `positive/window-gate.cfg` with `FullEnv = TRUE`, not
+committed, run through TLC directly with the same settings, passes: 31925761
+states generated, 3488170 distinct, depth 21, exit 0, 4 min 22 s. That is over
+the positive lane's 300 s budget, so the committed cfg keeps `FullEnv = FALSE`,
+and README.md no longer lists the absent or unreadable HEAD and the failed
+hold refresh among what the window gate check leaves out.
+
+### Harness
+
+The positive lane now requires a `bands.tsv` row keyed `positive/<name>.cfg`
+for every positive cfg and fails before TLC runs when one is missing.
+`scripts/check-tla.test.sh` gains cases for the lane and passes, 89 cases.
+
+### The ci lane
+
+One `scripts/check-tla.sh ci -a lifecycle` run on the final model, same host
+and settings, exit 0: smoke.cfg PASS at 3728440 distinct, depth 32, 195s;
+positive/window-gate.cfg PASS at 581630 distinct, depth 20, 33s; all thirteen
+negative controls VIOLATED as expected; traceability PASS, 25 rows. smoke.cfg's
+195s here (157s in the first run above) is about two thirds of the 300s smoke
+budget with two workers on this host; the required CI lane runs it with
+`RAVEL_TLA_WORKERS=auto` on a four-core runner, where it has not been timed.
+
+### Non-vacuity, re-run
+
+Round fourteen's five scratch cover invariants were re-run on the final model,
+each alone on `positive/window-gate.cfg` from a scratch module extending
+`MCLifecycleGC`; none of it is committed. Each is violated, exit 12:
+
+- `lastGc.rule # "retention"`: eleven states, `RetentionSweep(raw1)` at clock 6
+  under a marker with `obs = 2`, one tick earlier than in round fourteen
+  because the gate now compares with `<=`.
+- `lastGc.rule # "superseded"`: twelve states, `StartCompaction`,
+  `PublishCompaction`, `HeadAdvanceRewrite`, `WriteMarker`, then
+  `SupersededSweep(raw1)` at clock 6.
+- no delete of an object an active query pinned: twelve states, a query pins
+  `raw1` at clock 0 with deadline 1, the fold drops it at 2, and
+  `RetentionSweep(raw1)` runs at clock 6, after the deadline.
+- no idle-query state where `CachedNames` holds for a present object: three
+  states.
+- `RenewMarker` never enabled: six states.

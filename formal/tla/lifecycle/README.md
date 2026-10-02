@@ -332,10 +332,11 @@ What the model adds, all inert at `WindowGate = FALSE` and `HeadCacheTtl = 0`:
   sweeper's clock, decision 3's `<=`. `RetentionSweep` and `SupersededSweep`
   require it.
 - Three switches, each a negative control: `WindowThreeSkew`
-  (`3 * ClockSkew`, one sigma short), `WindowNoCacheDelay` (no `HeadCacheTtl` term while the pin
-  keeps its delay) and `MarkerIgnoresAnchor` (any marker counts, and
-  `RenewMarker` is off). Each violates `NoDeleteInsideProtectionWindow`; the
-  notes under `counterexamples/` give the traces.
+  (`3 * ClockSkew`, one sigma short), `WindowNoCacheDelay` (no `HeadCacheTtl`
+  term while the pin keeps its delay) and `MarkerIgnoresAnchor` (any marker
+  counts, and `RenewMarker` is off). Each violates
+  `NoDeleteInsideProtectionWindow`; the notes under `counterexamples/` give the
+  traces.
 
 Reader deadlines are exclusive and the cache bound is inclusive, as in the
 code: a pinned query reads only while `clock < deadline` and `ExpireQuery`
@@ -351,16 +352,34 @@ passes and that dropping one skew term or the `HeadCacheTtl` term fails.
 `window-gate.cfg` runs with every window term at 1, `ProtectionHorizon = 2`
 (the smallest the startup inequality allows) and `MaxClock = 8`, so a marker
 written at the horizon ages fully whether the writer's clock ran behind or not.
-To reach that clock bound it adds the state constraint `WindowGateScope` and
-`FullEnv = FALSE`, and so it does not cover:
+To reach that clock bound inside the lane's budget it adds the state
+constraint `WindowGateScope` and sets `FullEnv = FALSE`. A scratch run of the
+same cfg with `FullEnv = TRUE` (absent and unreadable HEAD reads, failed hold
+refreshes) also passes, at 3488170 distinct states in 4 min 22 s, over the
+lane's 300 s budget (results.md, "Round fifteen"). The constraint leaves out:
 
 - the erasure request and everything behind it (the rewrites, completion, the
   `.dreq` sweep), the open ingest bucket, and legal holds;
 - a compaction lease that expires mid-pass;
 - a tombstone or supersession stamped after clock 0: both anchors and both
   horizons are fixed, while the HEAD drop, the pin, the marker write and the
-  delete are free at every clock;
-- an absent or unreadable HEAD and a failed hold refresh.
+  delete are free at every clock.
+
+Two consequences of that scope and of `PinQuery`'s shape:
+
+- Decision 2's anchor mismatch is exercised only through `StaleMarker`, the
+  environment action that leaves a marker for another anchor under a key.
+  `WindowGateScope` prunes the erasure rewrite that would supersede `cmpA` again
+  and change its anchor, and fixes both anchors at clock 0, so no live anchor
+  moves under a marker already written.
+- `PinQuery` pins only objects still present, so the model never pins an
+  object a sweep already deleted, which a cached HEAD could still name in the
+  code. That omission hides nothing only because the gate outlasts the
+  cache: a delete lands at least `MaxQueryDuration + HeadCacheTtl +
+  2 * ClockSkew` of true time after the drop (the window less the writer's
+  and the deleter's clock offsets), which is past drop + `HeadCacheTtl`, the
+  last tick the cache names the object, whenever `MaxQueryDuration` or
+  `ClockSkew` is nonzero.
 
 What the window gate as modelled does not cover at all:
 
@@ -412,7 +431,8 @@ have a recorded TLC violation.
 the deletes it judges safe actually happen. Scratch cover invariants (a delete
 never happens, a pinned object is never deleted, a pin through the cache is
 never enabled, `RenewMarker` is never enabled) each fail under its bounds;
-results.md, "Round fourteen", has the runs. Its three switch controls show that
+results.md, "Round fourteen", has the runs, and "Round fifteen" re-runs them
+on the current model. Its three switch controls show that
 the full `4 * ClockSkew` term (`WindowThreeSkew` is one sigma short, and its
 trace spends all four sigma), the `HeadCacheTtl` term and the anchor check are
 each load-bearing: each removal alone violates
