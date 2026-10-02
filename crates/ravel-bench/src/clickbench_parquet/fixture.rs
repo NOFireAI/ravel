@@ -419,6 +419,7 @@ pub fn write_hits(dir: &Path, seed: u64) -> Result<(), FixtureError> {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use datafusion::arrow::array::Array;
     use parquet58::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::collections::HashSet;
 
