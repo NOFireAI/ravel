@@ -163,6 +163,7 @@ pub fn load(queries_sql: &str, suite_toml: &str) -> Result<Suite, SuiteError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
