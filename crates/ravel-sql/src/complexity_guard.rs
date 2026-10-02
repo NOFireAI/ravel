@@ -439,10 +439,7 @@ pub(crate) fn leading_keyword(sql: &str) -> Option<&str> {
             continue;
         }
         if rest.starts_with("--") {
-            match rest.find('\n') {
-                Some(pos) => i += pos + 1,
-                None => return None,
-            }
+            i += rest.find('\n')? + 1;
             continue;
         }
         if rest.starts_with("/*!") {
