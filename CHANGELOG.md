@@ -486,6 +486,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A server process refused access to `sys/gc` at startup now fails with an
+  error naming the fix** (issue #2332), rather than the generic "failed to
+  bootstrap or read the durable GC config (sys/gc)". A gateway or query process
+  refused the create is told that under per-role credentials only the Maintain
+  and Admin roles may create `sys/gc`, and to start the maintain process first
+  or run `ravel-cli gc-config set` under the Admin credential. A maintain
+  process refused the create is told which PutObject and `kms:GenerateDataKey`
+  grants its role needs, and an all-in-one process that its one credential
+  lacks them. A process refused the read is told that on S3 this can mean the
+  object does not exist yet, because a GET of an absent key is refused without
+  a covering `s3:ListBucket`, and that `ravel-cli gc-config set` under the Admin
+  credential then fixes it; otherwise it lacks GetObject (and `kms:Decrypt`
+  under SSE-KMS). Every other bootstrap failure keeps its existing message.
 - **A store error reads as throttled only for a 429 or 503 status** (issue
   #2307). With no typed transport error in the chain, the S3 store classified
   an error as `Throttled` whenever its text held the digits 429 or 503
@@ -538,7 +551,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before and no GET of its own. The first three no longer charge it one in
   `GetCost`, the span's `s3_requests`, `probe_gets`, `metadata_gets`,
   `live_gets`, the peak fetch run, or a page-range read's `block_range_gets`
-  and `block_bytes_fetched`; the span read never did. Query cache hit
+  and `block_bytes_fetched`; the span read never did. A tiered-cache read
+  that joins a lookup the RAM recheck served counts the same way, as a cache
+  miss with no cache bytes (issue #2337). Query cache hit
   and miss counts are unchanged. A log read's second look at a coalesced run's
   blocks records no RAM or disk hit or miss, though a block it finds on the
   disk tier is still re-admitted to RAM. `block_cache_hits` counts only the
@@ -1881,7 +1896,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that tenant's URL. `ParquetTableProvider` applies the D5 coercions
   (`binary_as_string` and the `ravel.cast.<column>` integer casts) and the D6
   file groups: up to `target_partitions` groups for a parallel scan, and one
-  group in manifest order, never re-split, otherwise.
+  group in manifest order, never re-split, otherwise. Concurrent reads of one
+  range share one fetch; when the leading query's own request or byte budget
+  refuses it (`CacheFetchError::BudgetRefused`), a follower checks the cache
+  again and retries under its own budget, making at most three attempts in
+  all, before reporting a refusal of its own (issue #2248).
 - **The logs SQL scan skips segments whose declared-column statistics exclude
   the predicate** (ADR-2121 D1, issue #2151). A declared `i64`/`bool`
   comparison or `BETWEEN`, or a declared `i64` `IN`, now also drops every
