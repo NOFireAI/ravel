@@ -3238,20 +3238,6 @@ pub(crate) fn bytes_scanned_exceeded(
     }
 }
 
-/// Collapses the two ways a deadline can surface into the one
-/// `QueryError::DeadlineExceeded` callers already match on.
-///
-/// Before the evaluator itself checked a deadline, the only source of
-/// `DeadlineExceeded` was `tokio::time::timeout` elapsing (`Err(_)` here,
-/// the `Elapsed` case): the query kept running synchronously inside the
-/// evaluator with no yield point, so the outer timeout could only ever fire
-/// *after* the call returned control to the runtime. The evaluator now
-/// checks its own deadline between subquery grid steps and can return
-/// `QueryError::Eval(ravel_promql::Error::DeadlineExceeded)` while still
-/// well inside the outer timeout's budget (`Ok(Err(..))` here) -- that is
-/// the case that actually demonstrates early interruption. Both are the
-/// same condition from a caller's perspective, so both collapse to the one
-/// variant already documented and tested against.
 /// Project a histogram-aware [`RangeValue`] down to the float-only [`Value`]
 /// the non-histogram range callers (`range`, `range_with_stats`) consume:
 /// histogram elements are dropped rather than rendered as a `0.0` float
@@ -3285,6 +3271,17 @@ fn range_value_into_value(value: RangeValue) -> Value {
     }
 }
 
+/// Collapses the three ways a deadline can surface into the one
+/// `QueryError::DeadlineExceeded { deadline }` callers already match on,
+/// always carrying this request's `deadline`.
+///
+/// - `tokio::time::timeout` elapsing (`Err(_)`, the `Elapsed` case).
+/// - The evaluator's own check between subquery grid steps, which returns
+///   `QueryError::Eval(ravel_promql::Error::DeadlineExceeded)` while still
+///   inside the outer timeout's budget.
+/// - A reader that checks the exact query deadline (the log selector fetch)
+///   and trips before the timer fires; it reports the engine's configured
+///   ceiling, not this request's deadline, so it is rewritten here.
 fn unify_deadline<T>(
     outcome: Result<Result<T, QueryError>, tokio::time::error::Elapsed>,
     deadline: Duration,
@@ -3294,9 +3291,6 @@ fn unify_deadline<T>(
         Ok(Err(QueryError::Eval(ravel_promql::Error::DeadlineExceeded))) => {
             Err(QueryError::DeadlineExceeded { deadline })
         }
-        // A reader checking the exact query deadline can trip before the
-        // timer fires; it reports the engine's configured ceiling, not this
-        // request's deadline.
         Ok(Err(QueryError::DeadlineExceeded { .. })) => {
             Err(QueryError::DeadlineExceeded { deadline })
         }
