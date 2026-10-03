@@ -57,6 +57,7 @@ Aggregate	var_samp	SELECT var_samp(value) FROM samples
 Aggregate	var_sample	SELECT var_sample(value) FROM samples
 Clause / operator	CASE	SELECT CASE WHEN value > 0 THEN 1 ELSE 0 END FROM samples
 Clause / operator	DATE_TRUNC	SELECT date_trunc('hour', ts) FROM samples
+Clause / operator	EXTRACT(minute FROM ...)	SELECT EXTRACT(minute FROM ts) FROM samples
 Clause / operator	Filter (WHERE)	SELECT ts, value FROM samples WHERE value > 0 ORDER BY series_id, ts
 Clause / operator	GROUP BY	SELECT series_id, count(value) FROM samples GROUP BY series_id ORDER BY series_id
 Clause / operator	GROUP BY ordinal	SELECT series_id, count(value) FROM samples GROUP BY 1 ORDER BY series_id
