@@ -722,26 +722,21 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
     /// reports), not ordinal positions into the survivor list.
     ///
     /// A caller dealing whole row groups to partitions (ADR-2414 decision A1,
-    /// `ravel_sql::logs_scan::owned_work`) groups a PRIOR scan's own,
-    /// already-pruned survivor list (`plan_segment`'s `indices`, which IS
-    /// pruning's output, not its input) by PAGE_DIR row-group boundaries, then
-    /// deals each group's raw block indices to a partition. Naming a
-    /// partition's share as ordinal positions into THIS call's own survivor
-    /// list would require this scan to reproduce that prior scan's survivor
-    /// order before the deal could even be addressed; a raw block index has no
-    /// such ordering dependency; it either belongs to the partition's row
-    /// groups or it does not, whatever ordinal this scan's own pruning later
-    /// gives it.
+    /// `ravel_sql::logs_scan::owned_work`) groups the plan phase's survivor
+    /// list, which is already the result of pruning, by PAGE_DIR row-group
+    /// boundaries and deals each group's whole-object block indices to a
+    /// partition. Those indices are therefore a subset of the plan's survivor
+    /// list, and this call names them by value instead of by their ordinal
+    /// position in the survivor list this call computes for itself.
     ///
-    /// `expected_survivors` is that prior scan's survivor list, in the same
+    /// `expected_survivors` is the plan's survivor list, in the same
     /// whole-object-index space [`BlockScan::survivor_block_indices`] reports.
-    /// Both scans run the same skip/POSTINGS/bloom proofs over the same
-    /// immutable object against the same predicate and prune arms, so they are
-    /// expected to agree exactly. If they do not, `wanted` was computed
-    /// against a different survivor list than this scan actually has, and a
-    /// row-ref stamped from it would address the wrong block: this refuses
-    /// with a typed `Corrupted` error rather than silently keeping whatever
-    /// intersection of `wanted` happens to still be present.
+    /// This call runs the same skip, POSTINGS, and bloom pruning over the same
+    /// immutable object with the same predicate and prune arms, so the two
+    /// lists are expected to be equal. When they are not, `wanted` was dealt
+    /// from a list this scan does not have, and a row-ref position derived from
+    /// it would address the wrong block, so the call refuses with a typed
+    /// [`LogSegError::Corrupted`] instead of keeping the intersection.
     pub fn scan_blocks_raw_subset(
         &self,
         content: &Predicate,
@@ -5512,5 +5507,39 @@ mod tests {
             Err(other) => panic!("expected a typed Corrupted error, got {other:?}"),
             Ok(_) => panic!("mismatched survivor list must refuse, not silently subset"),
         }
+    }
+    /// Readers built from one decoded [`SegmentDirectories`] share its STREAM_DIR,
+    /// FIELD_DIR and SKIP_IDX by reference rather than copying them, and report
+    /// the decoded length of all four sections.
+    ///
+    /// Fails against a `from_decoded` that clones the three sections (each
+    /// reader's `directories()` then points at a different allocation), and
+    /// against one that drops `decoded_bytes` when it rebuilds the directories
+    /// (the later copies report zero).
+    #[test]
+    fn readers_share_the_decoded_directories_and_report_their_decoded_length() {
+        let (_records, object) = dict_fixture::two_group_object();
+        let cfg = RlogConfig::default();
+        let dirs = RlogReader::decode_directories(&object[..], &cfg).expect("directories");
+        let first = RlogReader::from_decoded(&object[..], &dirs).directories();
+        let second = RlogReader::from_decoded(&object[..], &first).directories();
+        for later in [&first, &second] {
+            assert!(std::ptr::eq(dirs.stream_dir(), later.stream_dir()));
+            assert!(std::ptr::eq(dirs.field_dir(), later.field_dir()));
+            assert!(std::ptr::eq(dirs.skip_index(), later.skip_index()));
+            assert!(Arc::ptr_eq(dirs.page_dir(), later.page_dir()));
+            assert_eq!(later.decoded_bytes(), dirs.decoded_bytes());
+        }
+        let footer = crate::footer::open(&object).expect("footer");
+        let want: u64 = [
+            kind::STREAM_DIR,
+            kind::FIELD_DIR,
+            kind::SKIP_IDX,
+            kind::PAGE_DIR,
+        ]
+        .iter()
+        .map(|k| footer.section(*k).expect("section").uncomp_len)
+        .sum();
+        assert_eq!(dirs.decoded_bytes(), want);
     }
 }
