@@ -676,7 +676,8 @@ In a build with SQL, a query whose memory pool fills can spill its working
 state to local disk and finish, instead of failing with a resources-exhausted
 error, when its plan qualifies: an aggregation built only from `COUNT`, `SUM`
 over integers and `AVG` over integers, with no float `GROUP BY` key, optionally
-under an `ORDER BY`. Any other aggregate (`MIN`, `MAX`, or `SUM` or `AVG` over
+under an `ORDER BY` placed directly over it (see the end of this section). Any
+other aggregate (`MIN`, `MAX`, or `SUM` or `AVG` over
 floats) keeps the query on the existing refusal. Spilled files belong to one
 query and are removed when it ends. Nothing reads them afterwards.
 
@@ -756,9 +757,16 @@ Unlike the read cache, the spill directory is checked at startup: with
 cannot create `<cache-dir>/sql-spill`, measure its free space, or take its own
 directory's lock. `--sql-spill off` starts without touching it.
 
-With spill on, a qualifying query with an `ORDER BY` also breaks ties on its
-`GROUP BY` columns (ascending, nulls last), so it returns rows in the same
-order whether or not it spills.
+An `ORDER BY` placed directly over a qualifying aggregation (or over the
+select list directly above it) gets the aggregation's `GROUP BY` columns
+appended as trailing tiebreak terms, ascending with nulls last, whatever the
+spill setting. The order is then total, so the statement returns the same
+rows in the same order with spill forced, with spill off, and in memory. A
+`GROUP BY` column the select list renames is matched under its new name, one
+it leaves out is carried to the sort and dropped again, and an alias that
+only shares a `GROUP BY` column's name is not taken for it. An `ORDER BY`
+over grouping sets, over a `HAVING` filter, or over a nested subquery is left
+as written, and the query does not spill.
 
 ## Retention and garbage-collection configuration
 

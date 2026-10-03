@@ -789,12 +789,27 @@ mod tests {
         assert_eq!(config.spill, None);
     }
 
-    /// `measure_free_bytes` never reports more than the volume's size.
+    /// The free figure is `f_bavail` fragments of `f_frsize` bytes. Every
+    /// field below differs, so reading the volume size (`f_blocks`), the
+    /// root-inclusive free count (`f_bfree`) or the preferred I/O size
+    /// (`f_bsize`) gives a different number.
     #[test]
     fn measure_free_bytes_is_available_not_total() {
-        let available = measure_free_bytes(Path::new(".")).expect("the current directory exists");
-        let stat = rustix::fs::statvfs(".").expect("the current directory exists");
-        assert!(available <= stat.f_blocks.saturating_mul(stat.f_frsize));
+        let stat = rustix::fs::StatVfs {
+            f_bsize: 1 << 20,
+            f_frsize: 4096,
+            f_blocks: 1_000_000,
+            f_bfree: 600_000,
+            f_bavail: 550_000,
+            f_files: 0,
+            f_ffree: 0,
+            f_favail: 0,
+            f_fsid: 0,
+            f_flag: rustix::fs::StatVfsMountFlags::empty(),
+            f_namemax: 255,
+        };
+        assert_eq!(available_bytes(&stat), 550_000 * 4096);
+        assert!(measure_free_bytes(Path::new(".")).is_ok());
     }
 
     /// `with_spill_resolved` with `sql_spill_off` false and an already-set

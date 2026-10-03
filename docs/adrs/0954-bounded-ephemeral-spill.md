@@ -605,10 +605,27 @@ aggregate's group-by expressions that are not already sort terms, in group
 order, ascending with nulls last, as trailing sort terms; `fetch` is
 unchanged. Group keys are unique per aggregate output row, so the sort key
 becomes total and a run that spills and a run that stays in memory order
-tied rows identically. The rewrite is applied to the executed plan only when
-the query's spill decision is enabled. A `Sort` the rewrite cannot resolve
-this way (a grouping set, or a group key a projection renamed) is left
-unchanged and stays ineligible.
+tied rows identically. Each group key is the aggregate's own qualified
+output column: a projected expression counts as that key only when it is
+that column, bare or under one alias, and a sort term covers it only when it
+is exactly the column the projection exposes it as. A key the projection
+drops is projected through it under a reserved tiebreak name, sorted on, and
+removed again by a projection back to the statement's schema.
+
+The rewrite is applied to the plan a statement executes whenever that plan
+is spill-eligible apart from its sort order, whatever the spill setting (on,
+off, or disabled by `--sql-spill off`): the trailing group-key terms are
+appended whenever the plan has this shape, so the order is total and the
+same in every configuration. For a statement that does not spill, the cost
+is comparing the extra terms on rows whose earlier terms tie, plus carrying
+a projected-through key column to the sort.
+The spill decision is taken on the separately planned classification plan;
+a statement granted spill re-checks eligibility on its executed plan after
+the rewrite and, when that fails, runs with the disk manager disabled. A
+rewrite that cannot be applied (a reserved name already in use) leaves the
+plan as it was, which keeps it ineligible rather than failing the statement.
+A `Sort` the rewrite does not reach (over grouping sets, over a `HAVING`
+filter, or over nested projections) is left unchanged and stays ineligible.
 
 **Requirement 7: the ownership mechanism.** A process whose spill resolved
 under `--cache-dir` creates `<cache-dir>/sql-spill/<instance-id>` and takes

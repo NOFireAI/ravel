@@ -6184,6 +6184,22 @@ mod tests {
         assert!(!plan_is_spill_eligible(&rewritten));
     }
 
+    /// An `ORDER BY` over a subquery puts a second projection (and the
+    /// subquery's alias) between the Sort and the aggregate, which
+    /// [`tie_order_edit`] does not reach: the plan is unchanged and stays
+    /// ineligible.
+    #[tokio::test]
+    async fn a_sort_over_nested_projections_stays_ineligible() {
+        let plan = q33_plan(
+            "SELECT * FROM (SELECT a, b, count(*) AS c FROM q33 GROUP BY a, b) s \
+             ORDER BY c DESC LIMIT 10",
+        )
+        .await;
+        let rewritten = rewrite_sort_group_key_tie_order(plan.clone()).expect("nothing to do");
+        assert_eq!(rewritten, plan);
+        assert!(!plan_is_spill_eligible(&rewritten));
+    }
+
     /// A user column already named like the tiebreak column makes the rebuilt
     /// projection invalid. The rewrite reports that as an error, which every
     /// caller treats as "keep the plan, not eligible", rather than panicking.
