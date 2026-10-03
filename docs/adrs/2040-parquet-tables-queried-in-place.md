@@ -1054,7 +1054,7 @@ Equality also fails when a template stops granting a segment; un-reserving
 that name is then a deliberate review decision, since an operator-written
 policy may still grant it. The `deploy/iam/README.md` sentence that still
 calls these names unreserved, and per-name manifest witnesses in
-`crates/ravel-commit/tests/iam_templates.rs`, follow in issue #2405.
+`crates/ravel-commit/tests/iam_templates.rs`, landed with issue #2405.
 Patterns that reach every table, such as `t/*/pq/t/*`, grant the tenant's
 whole table space on purpose and are skipped; segments that follow a
 wildcard but cannot reach a manifest (`prov`, `config`, `snap` under

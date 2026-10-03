@@ -379,7 +379,8 @@ and records carry no MAC, so any principal holding that role can write a
 self-consistent record at a fresh UUID key and join the live set.
 
 A query node never deletes a record: the query role (`deploy/iam/query.json`)
-holds no `s3:DeleteObject` at all. A node that drains gracefully overwrites its
+holds `s3:DeleteObject` only on its own bucket-probe scratch objects under
+`sys/pq-probe/`, nothing under `sys/query/workers/`. A node that drains gracefully overwrites its
 own record on the way out with a stamp no reader accepts as live, so every
 sibling drops it from its live set on its next listing, at most one heartbeat
 interval later, and stops dialing it. The record itself stays behind, like the
@@ -409,7 +410,7 @@ query on: `--mode all` runs no maintenance loop.
 
 The admission family still carries the gap this reap closes for query workers:
 its reconciler deletes stale snapshots under a role the shipped templates give
-no delete, so its prefix is not reaped either.
+no delete on that prefix, so its prefix is not reaped either.
 
 If the reaping credential lacks the delete, the pass logs one error naming the
 prefix and the number of keys left, and stops deleting until the next cycle,

@@ -511,8 +511,9 @@ const BUCKET_KEY_PREFIX: &str = "arn:aws:s3:::my-ravel-bucket/";
 /// every other character is literal. This handles both, so a `?` smuggled into
 /// any of those fields is resolved as the wildcard IAM treats it as instead of
 /// being escaped to a literal `\?` that quietly matches nothing. The shipped
-/// templates carry a `?` in exactly one place, gateway's
-/// `GatewayAdmissionDelete` Resource, and in no Action and no `s3:prefix`;
+/// templates carry a `?` in exactly two places, gateway's
+/// `GatewayAdmissionDelete` Resource and query's `QueryManifestCreate`
+/// Resource, and in no Action and no `s3:prefix`;
 /// `every_shipped_template_passes_the_choke_point` asserts that (not assumes
 /// it) over Action, Resource, and the `s3:prefix` values it reads through
 /// `list_prefix_patterns`.
@@ -730,20 +731,22 @@ struct Policy {
 /// Effect, Action, and Resource are read directly (see `statement_actions`,
 /// `statement_resources`, `key_patterns_for`, `kms_statement_resources`, ...);
 /// Condition is read for the `s3:prefix` ListBucket block
-/// (`list_prefix_patterns`). Nothing else is examined by any guard.
+/// (`list_prefix_patterns`) and for the create-only PutObject block
+/// (`create_only_put_patterns`). Nothing else is examined by any guard.
 ///
 /// This list is the guard's contract: a statement carrying any key outside it
 /// is one no guard reasons about, so it must fail closed at `load_policy`
 /// rather than be silently skipped.
 const HANDLED_STATEMENT_KEYS: &[&str] = &["Sid", "Effect", "Action", "Resource", "Condition"];
 
-/// The complete set of `Condition` operators any guard in this file reads.
-/// Only `list_prefix_patterns` reads a Condition at all, and only its
-/// `StringLike` block. A statement whose Condition names any other operator --
-/// a different comparison such as `StringNotLike`, or a set-qualified form such
-/// as `ForAnyValue:StringLike` -- carries a constraint no guard reasons about,
-/// so it must fail closed at `validate_statement` rather than pass with its
-/// Condition unexamined.
+/// The complete set of `Condition` operators any guard in this file reads on a
+/// list statement: `list_prefix_patterns` reads only its `StringLike` block.
+/// (The create-only PutObject Condition has its own one-shape check,
+/// `validate_create_only_put_condition`.) A list statement whose Condition
+/// names any other operator -- a different comparison such as `StringNotLike`,
+/// or a set-qualified form such as `ForAnyValue:StringLike` -- carries a
+/// constraint no guard reasons about, so it must fail closed at
+/// `validate_statement` rather than pass with its Condition unexamined.
 const HANDLED_CONDITION_OPERATORS: &[&str] = &["StringLike"];
 
 /// The complete set of `Condition` keys any guard in this file reads, under a
@@ -751,6 +754,17 @@ const HANDLED_CONDITION_OPERATORS: &[&str] = &["StringLike"];
 /// any other condition key (`s3:delimiter`, `aws:SourceIp`, ...) is a constraint
 /// no guard reads and must fail closed rather than sit unexamined.
 const HANDLED_CONDITION_KEYS: &[&str] = &["s3:prefix"];
+
+/// The one Condition shape a non-list statement may carry: an `Allow` whose
+/// every Action is exactly `s3:PutObject`, conditioned on the request's
+/// `If-None-Match: *` header. S3 evaluates `s3:if-none-match` on PutObject, and
+/// a PUT without the header has no value for the key, so `StringEquals` fails
+/// and the PUT is refused: the statement grants create and never overwrite.
+/// `create_only_put_patterns` reads it; any other operator, key, value, Effect
+/// or Action set fails closed in `validate_create_only_put_condition`.
+const CREATE_ONLY_CONDITION_OPERATOR: &str = "StringEquals";
+const CREATE_ONLY_CONDITION_KEY: &str = "s3:if-none-match";
+const CREATE_ONLY_CONDITION_VALUE: &str = "*";
 
 /// Keys that describe a statement shape these guards deliberately cannot
 /// reason about: `NotAction`/`NotResource` invert the set the Action/Resource
@@ -790,9 +804,11 @@ const NEGATED_OR_PRINCIPAL_KEYS: &[&str] =
 ///   carries the bare bucket ARN, a KMS grant carries only `arn:aws:kms:` ARNs,
 ///   and the normal mixed idiom (ListBucket + GetObject over the bucket ARN plus
 ///   an object prefix) is accepted because both classes are granted;
-/// - a `Condition` exactly when the Action grants a list operation, whose
-///   sub-shape is the one `StringLike`/`s3:prefix` block
-///   `list_prefix_patterns` reads.
+/// - a `Condition` on a list statement, whose sub-shape is the one
+///   `StringLike`/`s3:prefix` block `list_prefix_patterns` reads; on any other
+///   statement, no `Condition` unless it is the create-only PutObject shape
+///   `create_only_put_patterns` reads (an `Allow` granting exactly
+///   `s3:PutObject`, conditioned on `StringEquals` `s3:if-none-match` `*`).
 ///
 /// A helper downstream therefore cannot meet a shape it does not understand.
 /// `object_key_patterns` matches all four `ResourceShape` variants:
@@ -884,7 +900,8 @@ const NEGATED_OR_PRINCIPAL_KEYS: &[&str] =
 ///   accepted;
 /// - a Condition whose presence does not track the ListBucket action: a
 ///   ListBucket statement with no Condition (an unconstrained bucket-wide list),
-///   or a Condition on any non-ListBucket statement (read by no guard);
+///   or a Condition on any non-ListBucket statement (read by no guard) other
+///   than the exact create-only PutObject shape;
 /// - a `Condition` whose sub-shape is anything other than the one block a guard
 ///   reads: it must be a non-empty JSON object of handled operators
 ///   (`HANDLED_CONDITION_OPERATORS`, today `StringLike`), each a non-empty map of
@@ -984,12 +1001,14 @@ fn validate_statement(role: &str, index: usize, stmt: &serde_json::Value) -> Res
     let resources = statement_resources(stmt);
     validate_actions_and_resources(role, sid, index, effect, &actions, &resources)?;
 
-    // Condition presence must track the list action. `list_prefix_patterns`
-    // is the only Condition reader and only reads one when the Action grants
-    // s3:ListBucket, so:
+    // Two guards read a Condition: `list_prefix_patterns`, on a statement
+    // whose Action grants s3:ListBucket, and `create_only_put_patterns`, on an
+    // Allow whose every Action is exactly s3:PutObject. So:
     //  - a list statement MUST carry a Condition (an unconstrained bucket-wide
-    //    list is rejected, exactly like a missing Resource), and
-    //  - a non-list statement must carry NONE (a Condition there is read by no
+    //    list is rejected, exactly like a missing Resource);
+    //  - a PutObject-only statement may carry one, and only the create-only
+    //    shape `validate_create_only_put_condition` accepts; and
+    //  - any other statement must carry NONE (a Condition there is read by no
     //    guard: a StringLike/s3:prefix on the protected-delete Deny would pass
     //    validation while, in AWS, a DeleteObject request carries no s3:prefix
     //    context key, so the Deny never fires and protects nothing).
@@ -1000,15 +1019,19 @@ fn validate_statement(role: &str, index: usize, stmt: &serde_json::Value) -> Res
     let grants_list = any_action_grants_any(&actions, &S3_BUCKET_OPERATIONS);
     match obj.get("Condition") {
         Some(condition) => {
-            if !grants_list {
+            if grants_list {
+                validate_condition(role, sid, index, effect, condition)?;
+            } else if is_put_object_only(&actions) {
+                validate_create_only_put_condition(role, sid, index, effect, condition)?;
+            } else {
                 return Err(format!(
                     "{role}/{sid} (statement #{index}): statement carries a Condition but \
                      its Action does not include s3:ListBucket -- only the ListBucket \
-                     s3:prefix Condition is read by any guard, so a Condition on any other \
-                     statement sits unexamined and must fail closed"
+                     s3:prefix Condition and the create-only s3:PutObject Condition are \
+                     read by any guard, so a Condition on any other statement sits \
+                     unexamined and must fail closed"
                 ));
             }
-            validate_condition(role, sid, index, effect, condition)?;
         }
         None => {
             if grants_list {
@@ -1276,6 +1299,89 @@ fn validate_condition(
         }
     }
     Ok(())
+}
+
+/// True when every action names exactly `s3:PutObject`. A wildcard that also
+/// grants it (`s3:Put*`, `s3:*`) is not this shape: the create-only Condition
+/// would then also gate operations no guard here reads it for.
+fn is_put_object_only(actions: &[String]) -> bool {
+    actions
+        .iter()
+        .all(|a| a.eq_ignore_ascii_case("s3:PutObject"))
+}
+
+/// Validate the create-only PutObject Condition: an `Allow` whose Condition is
+/// exactly `{"StringEquals": {"s3:if-none-match": "*"}}` (the value as a bare
+/// string or a one-element array). On a `Deny` the same Condition would
+/// withdraw only the creates and leave overwrites standing, which no guard
+/// reads, so it is refused; so is every other operator, key, or value.
+fn validate_create_only_put_condition(
+    role: &str,
+    sid: &str,
+    index: usize,
+    effect: &str,
+    condition: &serde_json::Value,
+) -> Result<(), String> {
+    let refuse = |why: &str| {
+        Err(format!(
+            "{role}/{sid} (statement #{index}): s3:PutObject Condition {condition} is not \
+             the create-only shape {{\"{CREATE_ONLY_CONDITION_OPERATOR}\": \
+             {{\"{CREATE_ONLY_CONDITION_KEY}\": \"{CREATE_ONLY_CONDITION_VALUE}\"}}}} on an \
+             Allow: {why}"
+        ))
+    };
+    if !effect.eq_ignore_ascii_case("Allow") {
+        return refuse("it is on a Deny");
+    }
+    let Some(cond_obj) = condition.as_object() else {
+        return refuse("it is not a JSON object");
+    };
+    if cond_obj.len() != 1 {
+        return refuse("it must name exactly one operator");
+    }
+    let Some(keys) = cond_obj
+        .get(CREATE_ONLY_CONDITION_OPERATOR)
+        .and_then(|k| k.as_object())
+    else {
+        return refuse("its operator is not StringEquals over a JSON object");
+    };
+    if keys.len() != 1 {
+        return refuse("it must name exactly one condition key");
+    }
+    let Some(value) = keys.get(CREATE_ONLY_CONDITION_KEY) else {
+        return refuse("its condition key is not s3:if-none-match");
+    };
+    if !is_string_or_string_array(Some(value))
+        || condition_value_strings(value) != [CREATE_ONLY_CONDITION_VALUE]
+    {
+        return refuse("its value is not exactly \"*\"");
+    }
+    Ok(())
+}
+
+/// Bucket-relative key patterns from every `Allow` PutObject statement carrying
+/// the create-only Condition. The choke point admits a Condition on a
+/// PutObject-only statement in that one shape alone, so a Condition's presence
+/// on such a statement is what selects it.
+fn create_only_put_patterns(policy: &Policy) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in policy_statements(policy) {
+        let allow = stmt["Effect"]
+            .as_str()
+            .is_some_and(|e| e.eq_ignore_ascii_case("Allow"));
+        if !allow
+            || stmt.get("Condition").is_none()
+            || !is_put_object_only(&statement_actions(stmt))
+        {
+            continue;
+        }
+        out.extend(object_key_patterns(
+            policy.role,
+            statement_sid(stmt),
+            &statement_resources(stmt),
+        ));
+    }
+    out
 }
 
 /// The string values in a Condition-key value that is a string or an array of
@@ -2068,7 +2174,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
         kms_resources: &[("GatewayTenantKms", &[TENANT_KMS_KEY_ARN])],
     },
     // Query: reads every level, writes catalog-fold output, the query-audit
-    // prefix and its worker registration; deletes nothing. A drained query
+    // prefix and its worker registration; deletes no durable object. A drained query
     // worker overwrites its own registration rather than deleting it, and the
     // maintain role reaps dead registrations (issue #1828). sys/auth is read
     // by the durable auth refresh (tenant_resolving_roles_read_the_auth_map).
@@ -2077,7 +2183,10 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // state memo (query_template_covers_every_alert_evaluator_call). The
     // Parquet table reads list and get the table manifests under t/*/pq/t/*
     // and get the location grants record t/*/pq/grants
-    // (query_template_covers_every_parquet_table_read).
+    // (query_template_covers_every_parquet_table_read). HTTP Parquet DDL
+    // creates manifests under a create-only grant and runs the bucket probe,
+    // which puts and deletes sys/pq-probe/<random>
+    // (query_template_covers_every_parquet_ddl_call).
     ExpectedRolePatterns {
         role: "query",
         list_prefixes: &[
@@ -2123,10 +2232,12 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/a/c/*",
             "t/*/a/alert-lease",
             "t/*/a/state/latest",
+            "sys/pq-probe/*",
+            "t/????????????????????????????????/pq/t/*/v/????????????????????.pqm",
         ],
-        put_actions: &["s3:PutObject"],
-        deletes: &[],
-        delete_actions: &[],
+        put_actions: &["s3:PutObject", "s3:PutObject"],
+        deletes: &["sys/pq-probe/*"],
+        delete_actions: &["s3:DeleteObject"],
         protected_deletes: PROTECTED_DELETE_KEYS,
         protected_delete_actions: PROTECTED_DELETE_ACTIONS,
         kms_actions: &["kms:Encrypt", "kms:GenerateDataKey*", "kms:Decrypt"],
@@ -4269,12 +4380,15 @@ fn maintain_template_covers_every_query_worker_reap_call() {
         }
     }
 
-    // The query role still deletes nothing, this record included.
+    // The query role deletes only the Parquet bucket probe's scratch object,
+    // never this record.
     let query_deletes = delete_key_patterns(&load_policy("query"), "Allow");
     assert!(
-        query_deletes.is_empty(),
-        "query: the role must grant no delete at all (ADR-0055 section 1); the \
-         maintain role reaps its dead registrations. Grants: {query_deletes:?}"
+        query_deletes.iter().all(|p| p.starts_with(PROBE_PREFIX))
+            && !query_deletes.iter().any(|p| glob_matches(p, &record)),
+        "query: the role must grant no delete outside {PROBE_PREFIX:?} (ADR-0055 \
+         section 1, HTTP DDL amendment); the maintain role reaps its dead \
+         registrations. Grants: {query_deletes:?}"
     );
 }
 
@@ -4726,11 +4840,12 @@ fn query_template_covers_every_alert_evaluator_call() {
         );
     }
 
+    // Query's only delete is the Parquet bucket probe's scratch object.
     let deletes = delete_key_patterns(&query, "Allow");
     assert!(
-        deletes.is_empty(),
-        "query: the role must grant no delete; the alert evaluator deletes \
-         nothing. Grants: {deletes:?}"
+        deletes.iter().all(|p| p.starts_with(PROBE_PREFIX)),
+        "query: the role must grant no delete outside {PROBE_PREFIX:?}; the \
+         alert evaluator deletes nothing. Grants: {deletes:?}"
     );
 }
 
@@ -4889,17 +5004,25 @@ fn admin_template_covers_every_parquet_grant_call() {
     assert_reaches_nothing_outside("admin", "s3:PutObject Allow", &puts, &probe, PROBE_PREFIX);
     assert_reaches_nothing_outside("admin", "delete Allow", &deletes, &probe, PROBE_PREFIX);
 
+    // Query runs the same bucket probe for HTTP Parquet DDL
+    // (query_template_covers_every_parquet_ddl_call), so it is checked for the
+    // grants record only.
     for role in ["gateway", "query", "maintain"] {
         let policy = load_policy(role);
         let puts = key_patterns_for(&policy, &["s3:PutObject"], Some("Allow"));
         let deletes = delete_key_patterns(&policy, "Allow");
-        for key in [&grants, &probe] {
+        let keys: &[&String] = if role == "query" {
+            &[&grants]
+        } else {
+            &[&grants, &probe]
+        };
+        for key in keys {
             assert!(
                 !puts.iter().any(|p| glob_matches(p, key))
                     && !deletes.iter().any(|p| glob_matches(p, key)),
                 "{role}: a PutObject or delete Allow reaches {key:?}; only \
-                 ravel-cli under Admin writes the grants record and runs the \
-                 bucket probe. Put: {puts:?}; delete: {deletes:?}"
+                 ravel-cli under Admin writes the grants record, and only Admin \
+                 and Query run the bucket probe. Put: {puts:?}; delete: {deletes:?}"
             );
         }
     }
@@ -4955,17 +5078,328 @@ fn query_template_covers_every_parquet_table_read() {
     );
     assert_reaches_nothing_outside("query", "s3:GetObject Allow", &gets, &grants, &grants);
 
+    assert!(
+        !puts.iter().any(|p| glob_matches(p, &grants)),
+        "query: a PutObject Allow reaches {grants:?}; only ravel-cli under Admin \
+         writes the grants record. Grants: {puts:?}"
+    );
     for key in [&manifest, &grants] {
         assert!(
-            !puts.iter().any(|p| glob_matches(p, key)),
-            "query: a PutObject Allow reaches {key:?}; the server writes no \
-             Parquet table key until DDL is wired into it. Grants: {puts:?}"
+            !deletes.iter().any(|p| glob_matches(p, key)),
+            "query: a delete Allow reaches {key:?}; the query path deletes \
+             nothing under pq/. Grants: {deletes:?}"
         );
     }
+}
+
+/// `POST /api/v1/sql` runs `CREATE [OR REPLACE] EXTERNAL TABLE` and `DROP
+/// TABLE` through `SqlExecutor::execute_ddl` (`crates/ravel-sql/src/ddl.rs`) in
+/// `Mode::Query` and `Mode::All`, against Ravel's own store under the Query
+/// credential. Its calls on that store:
+///
+/// - `resolve::newest` LISTs `t/<hash>/pq/t/<table>/v/` and GETs the newest
+///   manifest, before a plain `CREATE` and on every `writer::apply` attempt;
+///   `writer::apply`'s own-write check GETs a manifest it put.
+/// - `grants::list` GETs `t/<hash>/pq/grants` (`CREATE` only).
+/// - `probe_not_ravel_bucket` PUTs `sys/pq-probe/<32 hex>` with
+///   `PutMode::Overwrite` and DELETEs it on every path it returns through
+///   (`CREATE` only).
+/// - `writer::apply` PUTs `t/<hash>/pq/t/<table>/v/<version:020>.pqm` with
+///   `PutMode::CreateIfAbsent`, its only put (`crates/ravel-pqtable/src/writer.rs`).
+///   A `DROP` writes a dropped manifest version through the same put and
+///   deletes nothing. On an `AlreadyExists` the S3 backend HEADs the key, which
+///   IAM authorizes as `s3:GetObject`.
+///
+/// The `LOCATION` listing, HEAD and footer reads and both qualification reads
+/// go to the external store under its own profile, not this credential.
+#[test]
+fn query_template_covers_every_parquet_ddl_call() {
+    let query = load_policy("query");
+    let list_prefixes = list_prefix_patterns(&query, Some("Allow"));
+    let gets = key_patterns_for(&query, &["s3:GetObject"], Some("Allow"));
+    let puts = put_resource_key_patterns(&query);
+    let deletes = delete_key_patterns(&query, "Allow");
+    let manifest = parquet_manifest_key();
+    let grants = parquet_grants_key();
+    let probe = parquet_probe_key();
+
     assert!(
-        deletes.is_empty(),
-        "query: the role must grant no delete. Grants: {deletes:?}"
+        list_prefixes
+            .iter()
+            .any(|p| glob_matches(p, &parquet_manifest_prefix())),
+        "query: no ListBucket s3:prefix admits the manifest prefix every DDL \
+         statement resolves. s3:prefix values: {list_prefixes:?}"
     );
+    for key in [&manifest, &grants] {
+        assert!(
+            gets.iter().any(|p| glob_matches(p, key)),
+            "query: no GetObject Allow reaches {key:?}, which execute_ddl reads. \
+             Grants: {gets:?}"
+        );
+    }
+
+    assert!(
+        puts.iter().any(|p| glob_matches(p, &manifest)),
+        "query: no PutObject Allow reaches the manifest {manifest:?}, which every \
+         committed CREATE and DROP writes. Every DDL statement is refused. \
+         Grants: {puts:?}"
+    );
+    assert_reaches_only(
+        "query",
+        "s3:PutObject Allow",
+        &puts,
+        &manifest,
+        "the Parquet manifest keyspace",
+        |k| is_parquet_subkey(k, "t"),
+    );
+
+    assert!(
+        puts.iter().any(|p| glob_matches(p, &probe)),
+        "query: no PutObject Allow reaches the bucket probe object {probe:?}, \
+         which probe_not_ravel_bucket writes before every CREATE. Every CREATE \
+         is refused. Grants: {puts:?}"
+    );
+    assert!(
+        deletes.iter().any(|p| glob_matches(p, &probe)),
+        "query: no delete Allow reaches the bucket probe object {probe:?}, \
+         which probe_not_ravel_bucket deletes before it returns. Every CREATE \
+         leaves its probe object behind. Grants: {deletes:?}"
+    );
+    assert_reaches_nothing_outside("query", "s3:PutObject Allow", &puts, &probe, PROBE_PREFIX);
+    assert_reaches_nothing_outside("query", "delete Allow", &deletes, &probe, PROBE_PREFIX);
+    for pattern in &deletes {
+        assert!(
+            pattern.starts_with(PROBE_PREFIX),
+            "query: delete Allow {pattern:?} lies outside the probe prefix \
+             {PROBE_PREFIX:?}; the bucket probe is the only thing the Query role \
+             deletes"
+        );
+    }
+}
+
+/// `writer::apply` puts every manifest with `PutMode::CreateIfAbsent`, which the
+/// S3 backend sends as `If-None-Match: *`, so the Query role needs to create
+/// manifests and never to overwrite one. Every Query PutObject pattern that
+/// reaches a manifest must come from the create-only statement: an
+/// unconditioned grant would let a compromised Query credential rewrite any
+/// table version in place.
+#[test]
+fn query_manifest_write_is_create_only() {
+    let query = load_policy("query");
+    let manifest = parquet_manifest_key();
+    let create_only = create_only_put_patterns(&query);
+    let reaching: Vec<String> = put_resource_key_patterns(&query)
+        .into_iter()
+        .filter(|p| glob_matches(p, &manifest))
+        .collect();
+    assert!(
+        !reaching.is_empty(),
+        "query: no PutObject Allow reaches {manifest:?}"
+    );
+    for pattern in &reaching {
+        assert!(
+            create_only.contains(pattern),
+            "query: PutObject Allow {pattern:?} reaches the manifest {manifest:?} \
+             without the create-only Condition {{\"StringEquals\": \
+             {{\"s3:if-none-match\": \"*\"}}}}, so it can overwrite an existing \
+             manifest. Create-only patterns: {create_only:?}"
+        );
+    }
+}
+
+/// The create-only manifest grant reaches manifest keys and nothing else under
+/// `t/<hash>/pq/t/`: `t/<32 x ?>/pq/t/*/v/<20 x ?>.pqm`. The table segment is
+/// `*` because names run 1 to 63 bytes; the version is exactly 20 characters
+/// (`VERSION_WIDTH` in `crates/ravel-pqtable/src/keys.rs`) with the `.pqm`
+/// suffix. A key that is not a manifest version, or one under another tenant
+/// prefix shape, must not match.
+#[test]
+fn query_manifest_create_grant_reaches_only_manifest_keys() {
+    let query = load_policy("query");
+    let create_only = create_only_put_patterns(&query);
+    assert_eq!(
+        create_only,
+        ["t/????????????????????????????????/pq/t/*/v/????????????????????.pqm"],
+        "query: the create-only grant must be exactly the manifest key pattern"
+    );
+    let tenant = parquet_tenant_manifest_prefix();
+    let reached = [
+        parquet_manifest_key(),
+        format!("{tenant}hits/v/18446744073709551615.pqm"),
+        format!("{tenant}{}/v/{:020}.pqm", "a".repeat(63), 1),
+    ];
+    let not_reached = [
+        format!("{tenant}hits"),
+        format!("{tenant}hits/v/"),
+        format!("{tenant}hits/data.parquet"),
+        format!("{tenant}hits/v/{:019}.pqm", 1),
+        format!("{tenant}hits/v/{:021}.pqm", 1),
+        format!("{tenant}hits/v/{:020}.parquet", 1),
+        format!("{tenant}hits/v/{:020}.pqm.tmp", 1),
+        format!("{tenant}hits/x/{:020}.pqm", 1),
+        parquet_grants_key(),
+        format!("t/{}/pq/t/hits/v/{:020}.pqm", "ab".repeat(17), 1),
+    ];
+    for pattern in &create_only {
+        for key in &reached {
+            assert!(
+                glob_matches(pattern, key),
+                "{pattern:?} must reach the manifest key {key:?}"
+            );
+        }
+        for key in &not_reached {
+            assert!(
+                !glob_matches(pattern, key),
+                "{pattern:?} reaches {key:?}, which is not a manifest version key"
+            );
+        }
+    }
+}
+
+/// The create-only Condition passes the choke point in its one exact shape and
+/// every variant fails closed: a different value, operator, or key; a second
+/// operator; a Deny; or an Action set that is not exactly `s3:PutObject`.
+#[test]
+fn create_only_put_condition_shape_fails_closed_on_every_variant() {
+    let stmt = |effect: &str, action: serde_json::Value, condition: serde_json::Value| {
+        serde_json::json!({
+            "Sid": "CreateOnly",
+            "Effect": effect,
+            "Action": action,
+            "Resource": "arn:aws:s3:::my-ravel-bucket/t/*/pq/t/*",
+            "Condition": condition,
+        })
+    };
+    let good = serde_json::json!({"StringEquals": {"s3:if-none-match": "*"}});
+    let put = serde_json::json!("s3:PutObject");
+    for ok in [
+        stmt("Allow", put.clone(), good.clone()),
+        stmt(
+            "Allow",
+            serde_json::json!(["s3:PutObject"]),
+            serde_json::json!({"StringEquals": {"s3:if-none-match": ["*"]}}),
+        ),
+    ] {
+        assert!(
+            validate_statement("fixture", 0, &ok).is_ok(),
+            "the create-only shape must pass: {ok}"
+        );
+    }
+
+    let cases = [
+        (
+            "wrong value",
+            stmt(
+                "Allow",
+                put.clone(),
+                serde_json::json!({"StringEquals": {"s3:if-none-match": "abc"}}),
+            ),
+        ),
+        (
+            "two values",
+            stmt(
+                "Allow",
+                put.clone(),
+                serde_json::json!({"StringEquals": {"s3:if-none-match": ["*", "abc"]}}),
+            ),
+        ),
+        (
+            "StringLike operator",
+            stmt(
+                "Allow",
+                put.clone(),
+                serde_json::json!({"StringLike": {"s3:if-none-match": "*"}}),
+            ),
+        ),
+        (
+            "StringEqualsIfExists operator",
+            stmt(
+                "Allow",
+                put.clone(),
+                serde_json::json!({"StringEqualsIfExists": {"s3:if-none-match": "*"}}),
+            ),
+        ),
+        (
+            "ForAnyValue:StringEquals operator",
+            stmt(
+                "Allow",
+                put.clone(),
+                serde_json::json!({"ForAnyValue:StringEquals": {"s3:if-none-match": "*"}}),
+            ),
+        ),
+        (
+            "if-match key",
+            stmt(
+                "Allow",
+                put.clone(),
+                serde_json::json!({"StringEquals": {"s3:if-match": "*"}}),
+            ),
+        ),
+        (
+            "extra key",
+            stmt(
+                "Allow",
+                put.clone(),
+                serde_json::json!({"StringEquals": {"s3:if-none-match": "*", "aws:SourceIp": "10.0.0.1"}}),
+            ),
+        ),
+        (
+            "extra operator",
+            stmt(
+                "Allow",
+                put.clone(),
+                serde_json::json!({
+                    "StringEquals": {"s3:if-none-match": "*"},
+                    "Null": {"s3:if-none-match": "false"}
+                }),
+            ),
+        ),
+        ("on a Deny", stmt("Deny", put.clone(), good.clone())),
+        (
+            "wildcard action",
+            stmt("Allow", serde_json::json!("s3:Put*"), good.clone()),
+        ),
+        (
+            "mixed actions",
+            stmt(
+                "Allow",
+                serde_json::json!(["s3:PutObject", "s3:GetObject"]),
+                good.clone(),
+            ),
+        ),
+    ];
+    for (name, case) in &cases {
+        let err = validate_statement("fixture", 0, case)
+            .expect_err(&format!("validate_statement must reject the {name} case"));
+        assert!(
+            err.contains("CreateOnly"),
+            "{name}: rejection must name the Sid; got {err:?}"
+        );
+    }
+
+    // `StringEqualsIfExists` is the dangerous one: a PUT that sends no
+    // If-None-Match header has no value for the key, so the operator passes it
+    // and the statement grants an unconditional overwrite. Both spellings embed
+    // the exact operator name, so they must be refused by an exact operator
+    // lookup and not by some later check a looser lookup would also reach.
+    for (operator, name) in [
+        ("StringEqualsIfExists", "StringEqualsIfExists operator"),
+        (
+            "ForAnyValue:StringEquals",
+            "ForAnyValue:StringEquals operator",
+        ),
+    ] {
+        assert!(operator.contains(CREATE_ONLY_CONDITION_OPERATOR));
+        let (_, case) = cases
+            .iter()
+            .find(|(n, _)| *n == name)
+            .expect("operator case present");
+        let err = validate_statement("fixture", 0, case).expect_err(name);
+        assert!(
+            err.contains("its operator is not StringEquals"),
+            "{name}: must be refused by the operator check; got {err:?}"
+        );
+    }
 }
 
 /// `ravel-cli parquet sweep` (`services/ravel-cli/src/parquet.rs`) runs under
@@ -5027,6 +5461,129 @@ fn maintain_template_covers_every_parquet_sweep_call() {
         "maintain: a delete Allow reaches the grants record {grants:?}; the \
          sweep deletes manifests only. Grants: {deletes:?}"
     );
+}
+
+/// The table names `crates/ravel-pqtable/src/names.rs` refuses because a
+/// shipped template grants that key segment after a wildcard (ADR-2040's
+/// 2026-10-03 IAM segment amendment).
+const RESERVED_IAM_TABLE_NAMES: [&str; 10] = [
+    "l0",
+    "c",
+    "l1",
+    "idem",
+    "maint",
+    "admission",
+    "u",
+    "catalog",
+    "del",
+    "a",
+];
+
+/// The string literals of `IAM_GRANT_SEGMENTS` as written in
+/// `crates/ravel-pqtable/src/names.rs`. This crate does not depend on
+/// `ravel-pqtable`, so the list is read from the source; that crate's own
+/// `every_refused_table_form_has_its_typed_defect` asserts `validate_table`
+/// refuses each one.
+fn iam_grant_segments_in_names_rs() -> Vec<String> {
+    let path = format!(
+        "{}/../ravel-pqtable/src/names.rs",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let source = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let start = source
+        .find("pub const IAM_GRANT_SEGMENTS")
+        .unwrap_or_else(|| panic!("{path} declares no IAM_GRANT_SEGMENTS"));
+    let body = &source[start..];
+    let body = &body[body
+        .find('=')
+        .expect("IAM_GRANT_SEGMENTS has an initializer")..];
+    let body = &body[..body.find("];").expect("IAM_GRANT_SEGMENTS array closes")];
+    body.split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect()
+}
+
+/// `manifest_key(&test_tenant(), table, 1)` for an arbitrary table name.
+fn parquet_manifest_key_for(table: &str) -> String {
+    format!(
+        "{}{table}/v/{:020}.pqm",
+        parquet_tenant_manifest_prefix(),
+        1
+    )
+}
+
+/// True if `pattern` matches `table`'s manifest key, or (for an `s3:prefix`) a
+/// listing prefix of that key no shorter than `t/<hash>/pq/t/<table>/`, which
+/// selects only that table's manifests.
+fn pattern_reaches_table(pattern: &str, table: &str, is_list_prefix: bool) -> bool {
+    let key = parquet_manifest_key_for(table);
+    if !is_list_prefix {
+        return glob_matches(pattern, &key);
+    }
+    let table_prefix_len = parquet_tenant_manifest_prefix().len() + table.len() + 1;
+    (table_prefix_len..=key.len()).any(|end| glob_matches(pattern, &key[..end]))
+}
+
+/// Per-name manifest witness for every reserved table name: the manifest key
+/// `t/<hash>/pq/t/<word>/v/<version>.pqm` is reached by at least one shipped
+/// template grant that does not reach an ordinary table's manifests (a grant
+/// over the whole table space, such as Admin's `t/*`, reaches every name and
+/// is not why any one is reserved). That grant is the reason the word is
+/// refused as a table name. The list is pinned to `IAM_GRANT_SEGMENTS` in
+/// `names.rs`, whose own test pins `validate_table` refusing each word.
+#[test]
+fn every_reserved_table_name_has_a_manifest_witness_a_template_grant_reaches() {
+    let mut in_names_rs = iam_grant_segments_in_names_rs();
+    in_names_rs.sort();
+    let mut here: Vec<String> = RESERVED_IAM_TABLE_NAMES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    here.sort();
+    assert_eq!(
+        here, in_names_rs,
+        "RESERVED_IAM_TABLE_NAMES must equal IAM_GRANT_SEGMENTS in \
+         crates/ravel-pqtable/src/names.rs"
+    );
+
+    let mut grants: Vec<(&str, &str, String, bool)> = Vec::new();
+    for role in ALL_ROLES {
+        let policy = load_policy(role);
+        for pattern in key_patterns_for(&policy, &S3_OBJECT_OPERATIONS, Some("Allow")) {
+            grants.push((role, "object", pattern, false));
+        }
+        for pattern in list_prefix_patterns(&policy, Some("Allow")) {
+            grants.push((role, "s3:prefix", pattern, true));
+        }
+    }
+    let named: Vec<&(&str, &str, String, bool)> = grants
+        .iter()
+        .filter(|(_, _, pattern, list)| {
+            !pattern_reaches_table(pattern, PARQUET_WITNESS_TABLE, *list)
+        })
+        .collect();
+    assert!(
+        named.len() < grants.len(),
+        "fixture invalid: no grant reaches the ordinary table \
+         {PARQUET_WITNESS_TABLE:?}, so the whole-table-space filter excluded nothing"
+    );
+
+    for word in RESERVED_IAM_TABLE_NAMES {
+        let manifest = parquet_manifest_key_for(word);
+        let reaching: Vec<String> = named
+            .iter()
+            .filter(|(_, _, pattern, list)| pattern_reaches_table(pattern, word, *list))
+            .map(|(role, axis, pattern, _)| format!("{role} {axis} {pattern}"))
+            .collect();
+        assert!(
+            !reaching.is_empty(),
+            "no shipped template grant names a segment that reaches {manifest:?}, \
+             so {word:?} has no reason to be a reserved table name: un-reserve it \
+             in names.rs deliberately, or restore the grant"
+        );
+    }
 }
 
 /// `t/<hash>/pq/grants` is deleted by nothing, and a deleted record reads as a
@@ -8620,7 +9177,7 @@ fn every_shipped_template_passes_the_choke_point() {
         );
 
         // `glob_to_regex` resolves `?` as IAM's single-character wildcard and
-        // documents the one shipped field that carries one. That is a property
+        // documents the two shipped fields that carry one. That is a property
         // of the four JSON files, so it is asserted here rather than assumed: a
         // `?` added to a template silently changes what every pattern axis
         // reads.
@@ -8643,14 +9200,19 @@ fn every_shipped_template_passes_the_choke_point() {
                 // as a fixed count of single-character wildcards between
                 // literal slashes, so the delete cannot reach a Parquet
                 // manifest, whose key has `/pq/t/` at those positions.
-                if (role, sid) == ("gateway", "GatewayAdmissionDelete") {
+                // The Query manifest create spells the tenant hash the same
+                // way, so the write reaches `t/<32 characters>/pq/t/` and no
+                // deeper `pq/t/` segment of another keyspace.
+                if (role, sid) == ("gateway", "GatewayAdmissionDelete")
+                    || (role, sid) == ("query", "QueryManifestCreate")
+                {
                     question_mark_resources.push(format!("{role}/{sid}"));
                     continue;
                 }
                 panic!(
                     "{role}/{sid}: Resource {resource:?} carries a `?`, and only \
-                     gateway/GatewayAdmissionDelete is allowed one. Same \
-                     consequence as for Action above"
+                     gateway/GatewayAdmissionDelete and query/QueryManifestCreate \
+                     are allowed one. Same consequence as for Action above"
                 );
             }
         }
@@ -8672,9 +9234,12 @@ fn every_shipped_template_passes_the_choke_point() {
     }
     assert_eq!(
         question_mark_resources,
-        ["gateway/GatewayAdmissionDelete"],
-        "the one allowlisted `?` Resource must still be the only one, and must \
-         still carry its `?`"
+        [
+            "gateway/GatewayAdmissionDelete",
+            "query/QueryManifestCreate"
+        ],
+        "the two allowlisted `?` Resources must still be the only ones, and must \
+         still carry their `?`"
     );
 }
 
