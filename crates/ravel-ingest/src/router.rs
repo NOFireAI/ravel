@@ -540,7 +540,17 @@ impl IngestRouter {
         // The flush deferral cap (ADR-1642 deferral cap amendment): refuse the
         // whole write before any shard is sent anything if one of its shards
         // has a flush deferred for the whole cap. This is the only refusal a
-        // buffered-mode write can get, since it is acknowledged at enqueue.
+        // buffered-mode write can get, since it is acknowledged at enqueue. A
+        // dead shard is checked first: its actor no longer clears its at-cap
+        // flag, and only an observed death respawns it.
+        for &shard in &shard_ids {
+            let handle = &set[shard as usize];
+            let (shard_tx, incarnation) = handle.send_target();
+            if shard_tx.is_closed() {
+                self.observe_shard_death(shard, handle, incarnation);
+                return Err(WriteError::ShardUnavailable);
+            }
+        }
         let now_ns = self.clock.now_ns();
         if let Some(&capped) = shard_ids
             .iter()

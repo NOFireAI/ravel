@@ -1587,15 +1587,18 @@ pub struct Cli {
     /// `/metrics` carries that counter and the depth it bounds,
     /// `ravel_ingest_queued_flushes`, both by `{mode, signal}`.
     /// Nothing is acked and nothing is dropped, so a refusal is a deferral,
-    /// not a shed. A deferral is bounded by the flush deferral cap, the 2 h
-    /// read-side scan slack less `max_flush_lifetime`, `--max-flush-delay`
-    /// (the adaptive corridor's widest ceiling under `--adaptive-flush-delay`)
-    /// and one flush tick (3597.8 s at the defaults): once a shard's oldest
-    /// deferred flush reaches it, the shard refuses every new write, in both
-    /// write modes, with a retryable 429 / `RESOURCE_EXHAUSTED` counted on
-    /// `ravel_ingest_deferral_cap_refused_total`, and a strict write already
-    /// waiting on that flush is answered 503 with its rows still buffered,
-    /// until the deferred flushes open. Drains (`FlushNow`, shutdown) are never refused, and
+    /// not a shed. A deferral is backed by the flush deferral cap, the 2 h
+    /// read-side scan slack less `max_flush_lifetime`, the slowest flush
+    /// trigger (the largest of `--max-flush-delay`, `--max-flush-delay-idle`
+    /// and, under `--adaptive-flush-delay`, the adaptive corridor's widest
+    /// ceiling) and one flush tick (3559.8 s at the defaults): once a shard's
+    /// oldest deferred flush reaches it, the shard refuses every new write, in
+    /// both write modes, until the deferred flushes open, with a retryable
+    /// 429 / `RESOURCE_EXHAUSTED` counted on
+    /// `ravel_ingest_deferral_cap_refused_total`. A strict write already
+    /// waiting on that flush is answered 503, and its rows are still written
+    /// by the flush that opens past the cap. The deferred flush itself still
+    /// waits for a slot as long as the stall lasts. Drains (`FlushNow`, shutdown) are never refused, and
     /// neither is a tenant buffer that has crossed its per-(shard, tenant)
     /// memory backstop, so THE QUEUE CAN EXCEED THIS CAP under memory
     /// pressure: the backstop is the only bound on one buffer's resident
@@ -6174,9 +6177,9 @@ impl Cli {
         // ingest-hour bucket is pinned after the refusal. Ingest bounds that
         // term itself, with the flush deferral cap
         // (ravel_ingest::IngestConfig::flush_deferral_cap_ns, the ADR-1642
-        // deferral cap amendment): it is what the slack leaves an acknowledged
-        // strict-mode row, and a shard at the cap refuses new writes in both
-        // modes. ravel-ingest's
+        // deferral cap amendment): it is what the slack leaves a row once the
+        // slowest flush trigger outside the sub-floor hold is paid for, and a
+        // shard at the cap refuses new writes in both modes. ravel-ingest's
         // a_deferred_flush_is_never_acked_past_the_flush_bound_slack holds it.
         // Pinning the bucket before the cap check instead does not resolve it:
         // that spends the deferral out of the catalog's sealed-hour margin,

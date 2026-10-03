@@ -396,7 +396,7 @@ impl LogIngestRouter {
 
         let mut shard_ids: Vec<u32> = by_shard.keys().copied().collect();
         shard_ids.sort_unstable();
-        self.refuse_at_deferral_cap(&set, shard_ids.iter().copied())?;
+        self.refuse_dead_or_capped(&set, &shard_ids)?;
 
         // Parallel to `ack_rxs`: the shard each receiver belongs to, so a
         // closed ack channel is attributed to the right shard and counted as
@@ -565,7 +565,8 @@ impl LogIngestRouter {
         if by_shard.is_empty() {
             return Ok(LogWriteReceipt::default());
         }
-        self.refuse_at_deferral_cap(&set, by_shard.iter().map(|(shard, _)| *shard))?;
+        let shard_ids: Vec<u32> = by_shard.iter().map(|(shard, _)| *shard).collect();
+        self.refuse_dead_or_capped(&set, &shard_ids)?;
 
         let mut ack_shards = Vec::with_capacity(by_shard.len());
         let mut ack_rxs = Vec::with_capacity(by_shard.len());
@@ -607,17 +608,29 @@ impl LogIngestRouter {
     }
 
     /// Refuses the whole write, before any shard is sent anything, when one of
-    /// `shards` has a flush deferred for the whole flush deferral cap (ADR-1642
-    /// deferral cap amendment). This is the only refusal a buffered-mode write
-    /// can get, since it is acknowledged at enqueue.
-    fn refuse_at_deferral_cap(
+    /// `shards` is dead or has a flush deferred for the whole flush deferral
+    /// cap (ADR-1642 deferral cap amendment). The cap check is the only refusal
+    /// a buffered-mode write can get, since it is acknowledged at enqueue. A
+    /// dead shard is checked first: its actor no longer clears its at-cap
+    /// flag, and a cap refusal would hide the death from `ready`.
+    fn refuse_dead_or_capped(
         &self,
         set: &[LogShardHandle],
-        mut shards: impl Iterator<Item = u32>,
+        shards: &[u32],
     ) -> Result<(), LogWriteError> {
+        for &shard in shards {
+            let handle = &set[shard as usize];
+            if handle.dead.load(Ordering::Relaxed) || handle.tx.is_closed() {
+                self.mark_shard_dead(handle);
+                return Err(LogWriteError::ShardUnavailable);
+            }
+        }
         let now_ns = self.clock.now_ns();
-        match shards.find(|&shard| set[shard as usize].cap_flag.reached(now_ns)) {
-            Some(capped) => {
+        match shards
+            .iter()
+            .find(|&&shard| set[shard as usize].cap_flag.reached(now_ns))
+        {
+            Some(&capped) => {
                 self.metrics.record_deferral_cap_refused();
                 set[capped as usize]
                     .cap_flag

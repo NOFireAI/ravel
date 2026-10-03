@@ -1060,6 +1060,7 @@ impl ShardActor {
         // the cadence fixed under a burst of writes: a busy shard cannot
         // starve the age check of a quiet tenant sharing the actor, matching
         // the old `tokio::time::interval` with `MissedTickBehavior::Delay`.
+        let _clear_cap_on_exit = self.cap_flag.clear_on_exit();
         let clock = Arc::clone(&self.clock);
         let flush_tick_ns = i64::try_from(self.config.flush_tick.as_nanos()).unwrap_or(i64::MAX);
         let mut next_tick_ns = clock.now_ns().saturating_add(flush_tick_ns);
@@ -1659,9 +1660,9 @@ impl ShardActor {
             // This buffer has been deferred for the whole deferral cap, so a
             // flush opening from here on pins an ingest hour past what the
             // read-side slack covers for its strict rows. Do not acknowledge
-            // them from that flush. The rows stay buffered and a later flush
-            // writes them, so the answer is the outcome-unknown `Abandoned`
-            // (503), not a refusal: a client retry stores a second copy, which
+            // them from that flush. The rows are still written, by the flush
+            // that opens past the cap, so the answer is the outcome-unknown
+            // `Abandoned` (503), not a refusal: a client retry stores a second copy, which
             // query-time dedup by `(series_id, ts)` collapses.
             let waiters = std::mem::take(&mut buf.waiters);
             self.ctx.ack_waiters(
@@ -2655,10 +2656,10 @@ mod tests {
         let lifetime_ns = 90 * 60 * 1_000_000_000_i64;
         let lifetime = Duration::from_nanos(u64::try_from(lifetime_ns).expect("positive"));
         let config = one_permit_one_queue(lifetime);
-        // 7200 s less the 5400 s lifetime less the 50 ms strict delay and one
+        // 7200 s less the 5400 s lifetime less the 40 s idle delay and one
         // 10 ms tick.
         let cap_ns = config.flush_deferral_cap_ns();
-        assert_eq!(cap_ns, 1_799_940_000_000);
+        assert_eq!(cap_ns, 1_759_990_000_000);
 
         // One hour of deferral: past the cap, inside the parked flush's own
         // lifetime, and with the lifetime the deferred flush then gets, past
@@ -2702,23 +2703,24 @@ mod tests {
              FLUSH_BOUND_SLACK_HOURS ({slack_ns}ns)"
         );
 
-        // The derivation at the shipped defaults: a strict row's
-        // routing-to-pin bound is `max_flush_delay` plus one tick, and the
+        // The derivation at the shipped defaults: a row's routing-to-pin bound
+        // outside the sub-floor hold is the idle clock plus one tick, and the
         // deferral cap is exactly what the slack leaves after that and the
         // lifetime it reserves.
         let shipped = IngestConfig::default();
         let shipped_lifetime_ns = shipped.max_flush_lifetime.as_nanos() as i64;
         let tick_ns = shipped.flush_tick.as_nanos() as i64;
-        let bound_ns = shipped.strict_ack_age_bound_ns();
+        let bound_ns = shipped.flush_trigger_age_bound_ns();
         assert_eq!(
             bound_ns,
-            shipped.max_flush_delay.as_nanos() as i64 + tick_ns,
-            "a strict waiter keeps its buffer on the fast clock"
+            shipped.max_flush_delay_idle.as_nanos() as i64 + tick_ns,
+            "an idle buffered row waits out the idle clock, the slowest trigger \
+             outside the sub-floor hold"
         );
         assert_eq!(
             bound_ns + shipped.flush_deferral_cap_ns() + shipped_lifetime_ns,
             slack_ns,
-            "the deferral cap is exactly what the slack leaves after the strict \
+            "the deferral cap is exactly what the slack leaves after the \
              routing-to-pin bound ({bound_ns}ns) and the lifetime it reserves"
         );
         // A buffered row with no deferral is the case the constant itself was
@@ -2744,7 +2746,7 @@ mod tests {
     /// tenant and in both write modes, answers the strict waiter already on the
     /// capped buffer with the outcome-unknown `Abandoned`, and accepts again
     /// once its queue drains and the deferred flush opens. The cap here is the
-    /// one a 4000 s lifetime leaves (7200 s less 4000 s less the 50 ms strict
+    /// one a 4000 s lifetime leaves (7200 s less 4000 s less the 40 s idle
     /// delay and one 10 ms tick), reached by a single clock jump that stays
     /// inside the parked flush's own 4000 s lifetime, so the abandonment path
     /// never frees the slot.
@@ -2755,7 +2757,7 @@ mod tests {
         let clock = TestClock::new(BASE_NS);
         let config = one_permit_one_queue(Duration::from_secs(4000));
         let cap_ns = config.flush_deferral_cap_ns();
-        assert_eq!(cap_ns, 3_199_940_000_000);
+        assert_eq!(cap_ns, 3_159_990_000_000);
         let router = Arc::new(
             IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone())
                 .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),

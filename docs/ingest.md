@@ -203,22 +203,30 @@ scan set no longer covers.
 
 The flush deferral cap bounds it for every acknowledged strict-mode write
 (ADR-1642 deferral cap amendment). `IngestConfig::flush_deferral_cap_ns` is
-`S`'s flush term less `max_flush_lifetime` less the worst age a buffer holding
-a strict waiter reaches before its flush opens, `max_flush_delay` (or the
+`S`'s flush term less `max_flush_lifetime` less
+`IngestConfig::flush_trigger_age_bound_ns`, the largest age any buffer reaches
+before its flush trigger fires leaving out the sub-floor hold: the largest of
+`max_flush_delay`, `max_flush_delay_idle` and (when adaptive delay is on) the
 adaptive corridor's widest ceiling, `strict_visibility_budget_ns` less one
-`put_retry_base_delay`, when adaptive delay is on) plus one `flush_tick`:
-`7200s - 3600s - (2s + 0.2s) = 3597.8s` at the defaults, whatever
-`idle_flush_byte_floor` holds, since a strict waiter never waits out the
-sub-floor hold. Each tenant buffer records when its trigger was first refused,
+`put_retry_base_delay`, plus one `flush_tick`:
+`7200s - 3600s - (40s + 0.2s) = 3559.8s` at the defaults, whatever
+`idle_flush_byte_floor` holds, since the sub-floor hold is not a term. For a
+buffered row outside that hold the cap bounds when the refusal starts: before
+the row could open its flush too late for `S`. Buffered rows held under a
+non-zero `idle_flush_byte_floor`, and rows of a strict write that already
+timed out (`AckTimeout`), are not bounded by the cap. Each tenant buffer records when its trigger was first refused,
 and each shard publishes its oldest such deferral to the router. A strict
 waiter on a buffer whose deferral has reached the cap is answered with the
-outcome-unknown `Abandoned` (503) instead of an ack, and its rows stay buffered
-for a later flush. While the shard's oldest deferral is at the cap the router
+outcome-unknown `Abandoned` (503) instead of an ack, and its rows are still
+written by the flush that opens past the cap. While the shard's oldest deferral is at the cap the router
 refuses every write routed to it before enqueue, in both write modes, with the
 retryable `DeferralCapReached` (429 / `RESOURCE_EXHAUSTED`, counted on
 `ravel_ingest_deferral_cap_refused_total`), and the shard refuses a strict
 append that was enqueued just before. It accepts again once its deferred
-flushes have opened. Deferred buffers are always due and retry oldest deferral
+flushes have opened. A shard whose actor has died is checked before the cap,
+so it answers `ShardUnavailable` (and a metrics shard is respawned) rather
+than refusing at the cap, and each actor clears its deferral start when it
+exits. Deferred buffers are always due and retry oldest deferral
 first. `ravel_ingest::shard::tests::a_deferred_flush_is_never_acked_past_the_flush_bound_slack`
 holds the bound on a live shard actor. What the cap does not bound is a
 buffered-mode row acknowledged before its shard reached the cap: that buffer

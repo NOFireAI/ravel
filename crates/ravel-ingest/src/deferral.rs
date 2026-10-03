@@ -20,10 +20,11 @@ pub(crate) fn deferral_cap_reached(since_ns: i64, now_ns: i64, cap_ns: i64) -> b
 }
 
 /// The `Abandoned` message a strict waiter gets when its buffer's deferral
-/// reached the cap before the flush opened. The rows stay buffered, so the
-/// message says the outcome is unknown rather than that nothing was stored.
+/// reached the cap before the flush opened. The rows are still written, by the
+/// flush that opens past the cap, so the message says the outcome is unknown
+/// rather than that nothing was stored.
 pub(crate) const DEFERRAL_CAP_ABANDONED: &str = "strict ack withheld: the flush stayed deferred \
-     past the flush deferral cap; the rows remain buffered and may still be stored";
+     past the flush deferral cap; the rows are still written by the flush that opens after it";
 
 /// Stored in place of a deferral start while no buffer on the shard is
 /// deferred.
@@ -74,6 +75,13 @@ impl DeferralCapFlag {
         }
     }
 
+    /// A guard that clears the flag when dropped. The actor holds one for its
+    /// whole run, so a return or a panic that ends it cannot leave its last
+    /// deferral keeping the shard at the cap.
+    pub(crate) fn clear_on_exit(&self) -> ClearOnExit {
+        ClearOnExit(self.clone())
+    }
+
     /// Whether the shard's oldest deferral has reached the cap at `now_ns`.
     pub(crate) fn reached(&self, now_ns: i64) -> bool {
         let since = self.inner.oldest_deferral_ns.load(Ordering::Acquire);
@@ -95,6 +103,15 @@ impl DeferralCapFlag {
     }
 }
 
+/// See [`DeferralCapFlag::clear_on_exit`].
+pub(crate) struct ClearOnExit(DeferralCapFlag);
+
+impl Drop for ClearOnExit {
+    fn drop(&mut self) {
+        self.0.publish(None, i64::MIN);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,6 +127,17 @@ mod tests {
         assert!(flag.reached(6_000));
         flag.publish(None, 6_000);
         assert!(!flag.reached(6_000));
+    }
+
+    /// Dropping the exit guard clears a deferral at the cap.
+    #[test]
+    fn the_exit_guard_clears_the_flag() {
+        let flag = DeferralCapFlag::new(1_000);
+        let guard = flag.clear_on_exit();
+        flag.publish(Some(0), 0);
+        assert!(flag.reached(1_000));
+        drop(guard);
+        assert!(!flag.reached(1_000));
     }
 
     /// One log line per episode: a second refusal while still at the cap is
