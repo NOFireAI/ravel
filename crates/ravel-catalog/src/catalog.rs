@@ -1549,7 +1549,8 @@ impl Catalog {
     /// them (the fields are `reserved`). Every failure degrades silently
     /// EXCEPT a decode refusal, which emits one `tracing::warn!` per object
     /// key and increments [`Catalog::column_stats_decode_refusals`] before
-    /// degrading (issue #1400).
+    /// degrading (issue #1400), and a read CPU gate decode job that panicked or
+    /// was cancelled, which warns every time and is not a refusal.
     pub async fn load_column_stats(
         &self,
         tenant: &TenantHash,
@@ -1646,11 +1647,9 @@ impl Catalog {
                     // Store read or stale binding: this part is simply
                     // left uncovered, silently.
                     column_stats_resolve::FetchOutcome::Absent => {}
-                    // The part's own ref points at an object the reader
-                    // refused to decode: log once per key, count, and
-                    // leave the part uncovered (issue #1400).
+                    // The decode failed: leave the part uncovered.
                     column_stats_resolve::FetchOutcome::DecodeRefused(err) => {
-                        self.note_column_stats_decode_refusal(tenant, signal, &resolved.key, &err);
+                        self.note_column_stats_decode_failure(tenant, signal, &resolved.key, &err);
                     }
                 }
             }
@@ -1685,6 +1684,34 @@ impl Catalog {
             }
         }
         *blake3::hash(&buf).as_bytes()
+    }
+
+    /// Route a failed column-stats decode for `(tenant, signal)` at `key`. A
+    /// read CPU gate job that panicked or was cancelled says nothing about the
+    /// object, so it is no refusal: the gate's column-stats site already
+    /// counted the job, and it logs on every occurrence without spending the
+    /// key's warn-once latch. Anything else is a refusal of the object itself
+    /// ([`Catalog::note_column_stats_decode_refusal`], issue #1400).
+    fn note_column_stats_decode_failure(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        key: &str,
+        err: &crate::snapshot_format::SnapshotFormatError,
+    ) {
+        match err {
+            crate::snapshot_format::SnapshotFormatError::DecodeJob(gate_err) => {
+                tracing::warn!(
+                    tenant = %tenant.to_hex(),
+                    signal = ?signal,
+                    key = %key,
+                    error = %gate_err,
+                    "column-statistics decode job on the read CPU gate failed. The query \
+                     proceeds without column statistics and scans."
+                );
+            }
+            other => self.note_column_stats_decode_refusal(tenant, signal, key, other),
+        }
     }
 
     /// Record a decode refusal on the column-stats object HEAD references for
@@ -13000,5 +13027,67 @@ mod tests {
             (1, 0),
             "the refused decode ran as one gate job"
         );
+    }
+
+    /// Issue #2402: a column-stats decode job the read CPU gate reports as
+    /// panicked or cancelled is not a refusal of the object. It warns on every
+    /// occurrence, leaves `column_stats_decode_refusals()` flat, and does not
+    /// spend the key's warn-once latch, so a later genuine refusal of the same
+    /// key still counts and still warns.
+    #[test]
+    fn a_failed_column_stats_gate_job_is_not_a_decode_refusal() {
+        const GATE_JOB_WARN: &str = "decode job on the read CPU gate failed";
+        let catalog = Catalog::new(Arc::new(MemoryStore::new()), config(8)).expect("catalog");
+        let capture = WarnCapture::default();
+        let subscriber = {
+            use tracing_subscriber::layer::SubscriberExt;
+            tracing_subscriber::registry().with(capture.clone())
+        };
+        let _default = tracing::subscriber::set_default(subscriber);
+        let key = oversized_stats_key("gate");
+
+        for gate_err in [
+            ravel_cpu_gate::CpuGateError::Panicked,
+            ravel_cpu_gate::CpuGateError::Cancelled,
+            ravel_cpu_gate::CpuGateError::Panicked,
+        ] {
+            catalog.note_column_stats_decode_failure(
+                &tenant(),
+                Signal::Logs,
+                &key,
+                &crate::snapshot_format::SnapshotFormatError::DecodeJob(gate_err),
+            );
+        }
+        assert_eq!(
+            capture.count_containing(GATE_JOB_WARN),
+            3,
+            "one WARN per gate failure"
+        );
+        assert_eq!(capture.count_containing(DECODE_REFUSAL_WARN), 0);
+        assert_eq!(catalog.column_stats_decode_refusals(), 0);
+        assert!(
+            !catalog
+                .warned_decode_failures
+                .lock()
+                .contains(&(tenant(), Signal::Logs, key.clone())),
+            "a gate failure does not spend the refusal latch"
+        );
+
+        catalog.note_column_stats_decode_failure(
+            &tenant(),
+            Signal::Logs,
+            &key,
+            &crate::snapshot_format::SnapshotFormatError::ColumnStatsDecompressedTooLarge {
+                declared: 2_000_102_795,
+                cap: 1,
+            },
+        );
+        assert_eq!(catalog.column_stats_decode_refusals(), 1);
+        assert_eq!(
+            capture.count_containing(DECODE_REFUSAL_WARN),
+            1,
+            "the first genuine refusal of the key still warns"
+        );
+        assert_eq!(capture.count_containing(GATE_JOB_WARN), 3);
     }
 }
