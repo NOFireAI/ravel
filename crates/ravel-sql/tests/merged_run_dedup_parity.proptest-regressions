@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 39f2070f1ad191be52f28a581c24e6b21e0cb68c07a15624b4aada9b359fb01b # shrinks to merged = [(33483660000000000, -1.5, SampleProvenance { created_unix_ns: 33483600000000100, writer_epoch: 1, writer_seq: 11, in_page_index: 0 }), (33483660000000000, 1.0, SampleProvenance { created_unix_ns: 33483600000000100, writer_epoch: 1, writer_seq: 11, in_page_index: 0 })], merged_prefix = (50, 10), plain = [], plain_created = 100
+cc 384183ff5bf1e2623c8834172440cdeebe34fa05cae44b3a5aa80691855be9ec # shrinks to merged = [(33483840000000000, 1.0, SampleProvenance { created_unix_ns: 33483600000000100, writer_epoch: 1, writer_seq: 11, in_page_index: 0 })], merged_prefix = (50, 1, 10), plain = [(33483840000000000, 2.0)], plain_writer = (100, 1, 2)
