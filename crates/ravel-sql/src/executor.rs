@@ -1867,7 +1867,7 @@ impl SqlExecutor {
         // changes no `Aggregate` or `Distinct` node).
         let analyzed = match analyzed {
             Some(plan) if wants_spill_gate && plan_is_spill_eligible_ignoring_sort_order(&plan) => {
-                Some(rewrite_sort_group_key_tie_order(plan).map_err(plan_error)?)
+                Some(tie_ordered_or_unchanged(plan))
             }
             other => other,
         };
@@ -4289,6 +4289,23 @@ fn rewrite_sort_group_key_tie_order(plan: LogicalPlan) -> Result<LogicalPlan, Da
             other => Ok(Transformed::no(other)),
         })?
         .data)
+}
+
+/// [`rewrite_sort_group_key_tie_order`], or `plan` as it was when the rewrite
+/// fails. A `Sort` the rewrite could not make total stays spill-ineligible, so
+/// the failure costs the statement its spill permission, never its answer.
+fn tie_ordered_or_unchanged(plan: LogicalPlan) -> LogicalPlan {
+    match rewrite_sort_group_key_tie_order(plan.clone()) {
+        Ok(rewritten) => rewritten,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "SQL Sort tie-order rewrite failed; planning the statement without it, \
+                 which leaves its Sort spill-ineligible"
+            );
+            plan
+        }
+    }
 }
 
 /// Classify one [`Aggregate`] node for spill (ADR-0954): every GROUP BY key
