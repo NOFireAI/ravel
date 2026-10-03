@@ -94,11 +94,13 @@ use ravel_types::{LabelSet, Sample, Signal, TenantHash};
 
 use crate::bucket::Bucket;
 use crate::build::{BuiltPart, OUTPUT_FORMAT_VERSION};
+use crate::claim_guard::{BucketClaim, claim_bucket};
 use crate::clock::Clock;
 use crate::config::{CompactorConfig, NS_PER_HOUR};
 use crate::error::{MaintainError, Result};
 use crate::publish::PublishOutcome;
 use crate::read::{BucketListing, InputCatalog, RunPlan, SeriesPlan};
+use crate::rewrite::relist_changed;
 use crate::scan::MaintainMemo;
 use crate::sweep::LeaseCheck;
 use crate::{rlog, rspan_codec};
@@ -1939,6 +1941,12 @@ pub enum ErasureRewriteOutcome {
     AlreadyApplied,
     /// Built and published (or converged / abandoned): `parts` output parts
     /// written, `publish` records how the `RewriteRecord` PUT resolved.
+    ///
+    /// `parts: 0` with [`PublishOutcome::Abandoned`] is also how a pass that
+    /// published nothing under the bucket claim reports (ADR-1029, the
+    /// 2026-10-03 amendment): refused the claim, cancelled at a claim
+    /// checkpoint, or stopped by the pre-publish re-list. Every applicable
+    /// `.dreq` stays pending and a later pass retries.
     Rewritten {
         parts: usize,
         publish: PublishOutcome,
@@ -2002,6 +2010,13 @@ fn invalidate_after_publish(memo: &mut MaintainMemo, bucket: &Bucket, publish: &
 /// for any other signal: this dispatch scopes erasure
 /// rewrite to metrics/logs/spans only, and profiles/alerts/audit have no
 /// driver here to dispatch to.
+///
+/// When `config` carries a claim participant with coordination on, the pass
+/// takes the bucket's claim before it builds, the same claim a compaction
+/// takes, and holds it through the record PUT; it re-lists the bucket before
+/// that PUT either way (ADR-1029, the 2026-10-03 amendment). A pass that
+/// cannot take the claim, or whose re-list finds the record set changed,
+/// publishes nothing and reports `Rewritten { parts: 0, publish: Abandoned }`.
 pub async fn erasure_rewrite_bucket(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -2073,7 +2088,96 @@ pub async fn erasure_rewrite_bucket(
         return Ok(ErasureRewriteOutcome::AlreadyApplied);
     }
 
-    let (parts, publish) = match bucket.signal {
+    // The bucket claim (ADR-1029, the 2026-10-03 amendment), the same one a
+    // compaction of this bucket takes, held from before the build through the
+    // record PUT. A compaction record and a rewrite record have different keys,
+    // so neither's `CreateIfAbsent` refuses the other; without the claim a
+    // compaction planned from the unerased inputs could publish after this
+    // rewrite and serve the erased rows again. A pass refused the claim backs
+    // off and publishes nothing; the `.dreq` stays pending and a later pass
+    // retries.
+    let guard = match claim_bucket(store, config, bucket, "erasure_rewrite").await? {
+        BucketClaim::Held { guard, .. } => Some(guard),
+        BucketClaim::NotParticipating => None,
+        BucketClaim::Skipped(_) => {
+            return Ok(ErasureRewriteOutcome::Rewritten {
+                parts: 0,
+                publish: PublishOutcome::Abandoned,
+            });
+        }
+    };
+    // The guard rides on this run's own config clone, as compaction's does, so
+    // the merge checkpoints inside the logs and spans builds renew it.
+    let run_config = match guard.as_ref() {
+        Some(guard) => CompactorConfig {
+            claim_guard: Some(guard.clone()),
+            ..config.clone()
+        },
+        None => config.clone(),
+    };
+    let built = build_and_publish_rewrite(
+        store,
+        clock,
+        &run_config,
+        bucket,
+        &listing,
+        live,
+        &overlapping,
+        start_ns,
+    )
+    .await;
+    let (parts, publish) = match built {
+        Err(MaintainError::ClaimLost { at }) => {
+            tracing::info!(
+                signal = ?bucket.signal,
+                shard = bucket.shard,
+                ingest_hour_bucket = bucket.ingest_hour_bucket,
+                checkpoint = at,
+                "erasure rewrite cancelled at a claim checkpoint; nothing published (ADR-1029)"
+            );
+            (0, PublishOutcome::Abandoned)
+        }
+        other => other?,
+    };
+    if let Some(guard) = guard
+        && guard.cancelled_at().await.is_none()
+        && let Err(err) = guard.complete(store).await
+    {
+        tracing::warn!(
+            signal = ?bucket.signal,
+            shard = bucket.shard,
+            ingest_hour_bucket = bucket.ingest_hour_bucket,
+            work_id = %guard.work_id_hex(),
+            error = %err,
+            "erasure rewrite finished, but marking its claim completed failed; \
+             the claim ages out under its lease (ADR-1029)"
+        );
+    }
+
+    invalidate_after_publish(memo, bucket, &publish);
+    Ok(ErasureRewriteOutcome::Rewritten { parts, publish })
+}
+
+/// The signal-specific build and the shared publish tail of
+/// [`erasure_rewrite_bucket`], run under the bucket claim when one is held.
+///
+/// After the build, the last claim checkpoint, and then the pre-publish
+/// re-list: a record set that moved since `planned` (a compaction record that
+/// landed meanwhile above all) means the build no longer covers the bucket's
+/// live records, so nothing is published and the outcome is
+/// [`PublishOutcome::Abandoned`] with zero parts.
+#[allow(clippy::too_many_arguments)]
+async fn build_and_publish_rewrite(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    bucket: &Bucket,
+    planned: &BucketListing,
+    live: LiveInputs,
+    overlapping: &[&PendingErasureRequest],
+    start_ns: i64,
+) -> Result<(usize, PublishOutcome)> {
+    let (supersession, build) = match bucket.signal {
         Signal::Metrics => {
             let applicable: Vec<ApplicableRequest> = overlapping
                 .iter()
@@ -2109,11 +2213,7 @@ pub async fn erasure_rewrite_bucket(
                 &input_set_hash,
             )
             .await?;
-            let parts = build.parts.len();
-            let publish =
-                publish_rewrite_record(store, config, clock, bucket, supersession, build, start_ns)
-                    .await?;
-            (parts, publish)
+            (supersession, build)
         }
         Signal::Logs => {
             let applicable: Vec<ApplicableLogRequest> = overlapping
@@ -2149,11 +2249,7 @@ pub async fn erasure_rewrite_bucket(
                 &input_set_hash,
             )
             .await?;
-            let parts = build.parts.len();
-            let publish =
-                publish_rewrite_record(store, config, clock, bucket, supersession, build, start_ns)
-                    .await?;
-            (parts, publish)
+            (supersession, build)
         }
         Signal::Spans => {
             let applicable: Vec<ApplicableSpanRequest> = overlapping
@@ -2189,11 +2285,7 @@ pub async fn erasure_rewrite_bucket(
                 &input_set_hash,
             )
             .await?;
-            let parts = build.parts.len();
-            let publish =
-                publish_rewrite_record(store, config, clock, bucket, supersession, build, start_ns)
-                    .await?;
-            (parts, publish)
+            (supersession, build)
         }
         other => {
             return Err(MaintainError::Invariant(format!(
@@ -2202,8 +2294,17 @@ pub async fn erasure_rewrite_bucket(
         }
     };
 
-    invalidate_after_publish(memo, bucket, &publish);
-    Ok(ErasureRewriteOutcome::Rewritten { parts, publish })
+    crate::claim_guard::checkpoint(config, store, crate::claim_guard::Checkpoint::Publish).await?;
+    if relist_changed(store, bucket, planned, config.request_ledger.as_ref())
+        .await?
+        .is_some()
+    {
+        return Ok((0, PublishOutcome::Abandoned));
+    }
+    let parts = build.parts.len();
+    let publish =
+        publish_rewrite_record(store, config, clock, bucket, supersession, build, start_ns).await?;
+    Ok((parts, publish))
 }
 
 /// The catalog-resolver completion verdict for one bucket (ADR-0064 §4 F1).

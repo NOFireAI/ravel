@@ -66,7 +66,10 @@ use crate::error::{MaintainError, Result};
 use crate::publish::{
     ConservationPredicate, PublishOutcome, conserve_exact, publish_record_with_conservation,
 };
-use crate::read::{input_set_hash, list_bucket_with_ledger, load_inputs_with_ledger};
+use crate::read::{
+    BucketListing, input_set_hash, list_bucket_with_ledger, load_inputs_with_ledger,
+};
+use crate::request_ledger::RequestLedger;
 use crate::rlog::RlogCodec;
 use crate::rspan_codec::SpanCodec;
 
@@ -202,21 +205,103 @@ async fn load_then_rewrite<C: SegmentCodec>(
         config.request_ledger.as_ref(),
     )
     .await?;
-    rewrite_and_publish_loaded::<C>(store, clock, config, bucket, inputs, conservation, start_ns)
-        .await
+    match rewrite_and_publish_loaded::<C>(
+        store,
+        clock,
+        config,
+        bucket,
+        inputs,
+        conservation,
+        start_ns,
+        None,
+    )
+    .await?
+    {
+        FencedRewrite::Ran(outcome) => Ok(outcome),
+        // Unreachable by construction: with no planned listing there is no
+        // re-list to differ. Typed rather than panicked, per this crate's
+        // no-panic rule.
+        FencedRewrite::RecordSetChanged(_) => Err(MaintainError::Invariant(
+            "a rewrite given no planned listing reported a changed record set".to_string(),
+        )),
+    }
+}
+
+/// What [`rewrite_and_publish_loaded`] did.
+#[derive(Debug)]
+pub(crate) enum FencedRewrite {
+    /// The run published, converged, or abandoned at a claim checkpoint.
+    Ran(RewriteOutcome),
+    /// The pre-publish re-list found a record set other than the one the run
+    /// planned from, so the run published nothing (ADR-1029, the 2026-10-03
+    /// amendment). Carries the new listing, so the caller can report why.
+    RecordSetChanged(BucketListing),
+}
+
+/// Whether two listings of one bucket name the same record set: the same L0
+/// commit records, compaction records, rewrite records and tombstone,
+/// whatever order the store listed them in.
+fn same_record_set(a: &BucketListing, b: &BucketListing) -> bool {
+    fn sorted(keys: &[String]) -> Vec<&str> {
+        let mut v: Vec<&str> = keys.iter().map(String::as_str).collect();
+        v.sort_unstable();
+        v
+    }
+    sorted(&a.commit_keys) == sorted(&b.commit_keys)
+        && sorted(&a.compaction_record_keys) == sorted(&b.compaction_record_keys)
+        && sorted(&a.rewrite_record_keys) == sorted(&b.rewrite_record_keys)
+        && a.tombstone_key == b.tombstone_key
+}
+
+/// The pre-publish re-list (ADR-1029, the 2026-10-03 amendment): list `bucket`
+/// again and return the new listing when its record set differs from
+/// `planned`, the listing the pass planned from, or `None` when it is the same.
+///
+/// Compaction and the erasure rewrite both call this after their last claim
+/// checkpoint and before their record PUT. A compaction record and a rewrite
+/// record have different keys, so neither's `CreateIfAbsent` refuses the other;
+/// a pass that publishes over a record set it did not plan from is what would
+/// serve erased rows again (issue #2199). The LIST is counted under the
+/// ledger's list phase, like the planning listing.
+pub(crate) async fn relist_changed(
+    store: &dyn ObjectStoreBackend,
+    bucket: &Bucket,
+    planned: &BucketListing,
+    ledger: Option<&RequestLedger>,
+) -> Result<Option<BucketListing>> {
+    let now = list_bucket_with_ledger(store, bucket, ledger).await?;
+    if same_record_set(planned, &now) {
+        return Ok(None);
+    }
+    tracing::warn!(
+        signal = ?bucket.signal,
+        shard = bucket.shard,
+        ingest_hour_bucket = bucket.ingest_hour_bucket,
+        planned_commit_records = planned.commit_keys.len(),
+        planned_compaction_records = planned.compaction_record_keys.len(),
+        planned_rewrite_records = planned.rewrite_record_keys.len(),
+        commit_records = now.commit_keys.len(),
+        compaction_records = now.compaction_record_keys.len(),
+        rewrite_records = now.rewrite_record_keys.len(),
+        tombstoned = now.tombstone_key.is_some(),
+        "bucket record set changed since this pass planned; publishing nothing (ADR-1029)"
+    );
+    Ok(Some(now))
 }
 
 /// [`rewrite_and_publish`] over inputs the caller already read.
 ///
-/// Compaction's coordinated driver ([`crate::compact::compact_bucket_claimed`])
-/// enters here: it needs the decoded input records before the primitive runs,
-/// because the advisory claim's cost gate is priced on their stored bytes
-/// (ADR-1029 decision 4) and the claim is taken before the first catalog read.
-/// Loading them there and handing them over keeps the input GETs at exactly one
-/// set per run.
+/// Compaction's driver ([`crate::compact::compact_bucket_claimed`]) enters
+/// here: it reads the input records before it takes the bucket claim, and the
+/// claim is taken before the first catalog read. Loading them there and handing
+/// them over keeps the input GETs at exactly one set per run.
 ///
 /// The caller owns the request ledger's run scope, as it does for
 /// [`rewrite_and_publish`] when an outer driver opened one.
+///
+/// `planned` is the bucket listing the caller planned from. When it is given,
+/// the run re-lists the bucket after its last claim checkpoint and publishes
+/// nothing if the record set changed ([`relist_changed`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn rewrite_and_publish_loaded<C: SegmentCodec>(
     store: &dyn ObjectStoreBackend,
@@ -226,7 +311,8 @@ pub(crate) async fn rewrite_and_publish_loaded<C: SegmentCodec>(
     inputs: Vec<crate::read::InputRecord>,
     conservation: impl ConservationPredicate,
     start_ns: i64,
-) -> Result<RewriteOutcome> {
+    planned: Option<&BucketListing>,
+) -> Result<FencedRewrite> {
     // A cancellation checkpoint anywhere below unwinds to here as the typed
     // `ClaimLost` signal (ADR-1029 decision 3): the run stops and publishes
     // nothing, which is exactly `PublishOutcome::Abandoned`'s shape and
@@ -242,6 +328,7 @@ pub(crate) async fn rewrite_and_publish_loaded<C: SegmentCodec>(
         inputs,
         conservation,
         start_ns,
+        planned,
     )
     .await
     {
@@ -253,10 +340,10 @@ pub(crate) async fn rewrite_and_publish_loaded<C: SegmentCodec>(
                 checkpoint = at,
                 "compaction run cancelled at a claim checkpoint; nothing published (ADR-1029)"
             );
-            Ok(RewriteOutcome {
+            Ok(FencedRewrite::Ran(RewriteOutcome {
                 parts: 0,
                 publish: PublishOutcome::Abandoned,
-            })
+            }))
         }
         other => other,
     }
@@ -273,7 +360,8 @@ async fn rewrite_and_publish_guarded<C: SegmentCodec>(
     inputs: Vec<crate::read::InputRecord>,
     conservation: impl ConservationPredicate,
     start_ns: i64,
-) -> Result<RewriteOutcome> {
+    planned: Option<&BucketListing>,
+) -> Result<FencedRewrite> {
     // A new run's accounting starts from zero: a tracker left installed in a
     // long-lived config would otherwise carry the previous bucket's peaks
     // into this bucket's emission (serial reuse; concurrent sharing is the
@@ -318,6 +406,17 @@ async fn rewrite_and_publish_guarded<C: SegmentCodec>(
     // `PublishOutcome::Abandoned` is for.
     crate::claim_guard::checkpoint(config, store, crate::claim_guard::Checkpoint::Publish).await?;
 
+    // The second check of the fence (ADR-1029, the 2026-10-03 amendment): a
+    // record set that moved since planning, an erasure rewrite record above all,
+    // means this run's inputs are no longer the bucket's, so it publishes
+    // nothing. The parts already PUT are left as an abandoned run leaves them.
+    if let Some(planned) = planned
+        && let Some(now) =
+            relist_changed(store, bucket, planned, config.request_ledger.as_ref()).await?
+    {
+        return Ok(FencedRewrite::RecordSetChanged(now));
+    }
+
     let publish = publish_record_with_conservation(
         store,
         config,
@@ -356,10 +455,10 @@ async fn rewrite_and_publish_guarded<C: SegmentCodec>(
         );
     }
 
-    Ok(RewriteOutcome {
+    Ok(FencedRewrite::Ran(RewriteOutcome {
         parts: parts.len(),
         publish,
-    })
+    }))
 }
 
 /// The result of a [`migrate_bucket_format`] call. Every variant except

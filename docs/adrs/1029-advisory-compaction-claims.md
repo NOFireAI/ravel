@@ -64,7 +64,9 @@ A lease is logically a lock. After this ADR, Ravel's architectural
 statement is: no coordinator, no leader election, and no
 correctness-critical distributed locks. Claims suppress redundant
 maintenance work; immutable content-addressed parts and CAS record
-publication remain the sole correctness mechanism.
+publication remain the sole correctness mechanism. (Between a compaction and
+an erasure rewrite of one bucket the claim is now also a fence; see the
+2026-10-03 amendment.)
 
 ## Decision
 
@@ -149,11 +151,14 @@ ordering commits by it.
 
 The primitive is generic over the key prefix and payload so retention,
 sweep, folds, and erasure can adopt it later as an optimization; only
-compaction adopts it in this ADR.
+compaction adopts it in this ADR (the erasure rewrite adopts it too, as a
+fence, since the 2026-10-03 amendment).
 
 ### 2. Claims are advisory: the correctness layer is untouched
 
-A claim confers zero publication rights and its absence removes none.
+A claim confers zero publication rights and its absence removes none
+(between two compactions; the 2026-10-03 amendment makes holding it a
+condition of a participating compaction or erasure rewrite publish).
 The publish path (`publish.rs`) does not read claims. A paused owner
 that loses its claim, wakes, and finishes anyway still collides at
 content-addressed part keys and at the record's `CreateIfAbsent`, and
@@ -210,7 +215,8 @@ claim when  P(duplicate) x expected merge cost  >  claim PUT + renewals
 Mechanically: a bucket is claimed only when its listed input bytes are
 at or above `claim_min_input_bytes` (default 64 MiB stored). Below it,
 duplicated work is cheaper than coordination and the bucket runs
-unclaimed, exactly as today. Deterministic jitter (derived from
+unclaimed, exactly as today (retired by the 2026-10-03 amendment: a
+participating run now claims every bucket). Deterministic jitter (derived from
 `blake3(work_id || process_id)`, so it is stable per contender and free
 of a shared clock) precedes every acquisition attempt, spreading
 simultaneous starts (see the amendment on jitter on the contended path:
@@ -240,7 +246,8 @@ Both callers of `compact_bucket` participate:
 as: safe for correctness, may duplicate work). `coordination = off` in
 the compactor config disables claims fleet-wide as the fallback for a
 store whose qualification record predates the CAS probes or an
-emergency; the code path is the same as the tiny-bucket skip, so it is
+emergency; the code path is the same as the tiny-bucket skip (which the
+2026-10-03 amendment removed; the unclaimed path stays), so it is
 exercised by default tests, not a dead branch.
 
 ### 6. Discovery deduplication stays on rendezvous ownership
@@ -311,7 +318,9 @@ sequenceDiagram
 6. **Making the claim a publication precondition.** A lease bug would
    become a data-corruption bug. The claim stays invisible to
    `publish.rs` by construction, and the crash-kill test battery pins
-   that.
+   that. The 2026-10-03 amendment adopts it for the compaction and erasure
+   rewrite publishes of one bucket, and says why the objection no longer
+   holds there.
 
 ## Consequences
 
@@ -361,7 +370,8 @@ sequenceDiagram
   participation (ravel-maintain, serialized behind the in-flight #872
   chain on rlog.rs); W3 CLI participation + flags (ravel-cli, behind
   #1028 stage 1); W4 metrics + operations guide. Reuse for
-  retention/sweep/fold/erasure is explicitly follow-up work.
+  retention/sweep/fold/erasure is explicitly follow-up work (erasure
+  adopted it with the 2026-10-03 amendment).
 
 ## Amendment (2026-09-28): status, and four facts that moved
 
@@ -622,3 +632,115 @@ Tests: `lease_term_bounds_the_target_and_the_display_says_so`,
 `crates/ravel-maintain/src/config.rs`, and
 `the_lease_check_is_quiet_at_the_derived_defaults_and_warns_at_the_floor` in
 `services/ravel-server/src/config.rs`.
+
+## Amendment (2026-10-03): the claim fences the compaction and erasure rewrite publishes (issue #2199)
+
+<!-- amendment-applies: sections="Context|1. A reusable claim primitive in ravel-fleet|2. Claims are advisory: the correctness layer is untouched|4. Cost gating: claims only where duplication is expensive|5. Participation and the escape hatch|Rejected alternatives|Consequences" pointer="2026-10-03 amendment" -->
+<!-- amendment-supersedes: phrase="its absence removes none" pointer="2026-10-03 amendment" -->
+<!-- amendment-supersedes: phrase="unclaimed, exactly as today" pointer="2026-10-03 amendment" -->
+<!-- amendment-supersedes: phrase="the same as the tiny-bucket skip" pointer="2026-10-03 amendment" -->
+<!-- amendment-supersedes: phrase="compaction adopts it in this ADR" pointer="2026-10-03 amendment" -->
+
+**The race.** A compaction record (`l1.<hash>.cmt`) and an erasure rewrite
+record (`rw.<hash>.cmt`, ADR-0064 decision 3) have different keys, so neither's
+`CreateIfAbsent` refuses the other. The compactor's refusal of a bucket that
+holds a rewrite record (`RewritePresent`) was a listing-time check only; its
+publish checkpoint consulted the claim and did not re-list; the claim was
+skipped below the cost gate; and the erasure rewrite took no claim at all. A
+compaction that listed a bucket before an erasure rewrite of it published could
+therefore publish afterwards, from inputs that still held the erased rows, and
+once the request's `.dreq` was retired those rows were served again. The
+mirror order (an erasure rewrite planned from raw L0 inputs, publishing after a
+compaction of them) leaves the same two record sets. Issue #1420 is the same
+race class, found by the TLA+ lifecycle model.
+
+**Decision (owner decision on #2199).** One per-bucket claim fences both
+publishes, and neither pass may skip it. Concretely:
+
+1. **The claim is mandatory for both publishes.** `compact_bucket_claimed` and
+   `erasure_rewrite_bucket` (`crates/ravel-maintain/src/compact.rs`,
+   `crates/ravel-maintain/src/erasure_rewrite.rs`) take the bucket's claim
+   through one function, `claim_guard::claim_bucket`, under the same work id,
+   so they contend for one claim object. Compaction takes it where it did,
+   after the input commit-record reads and before any catalog read; the
+   erasure rewrite takes it after its live-record resolution and before it
+   builds. Both hold it through their record PUT: the claim rides on the
+   run's config, so the logs and spans erasure builds renew it at the same
+   merge checkpoints compaction does, and both consult it at the publish
+   checkpoint.
+2. **The paths that skipped it, and why they are no longer allowed.** The
+   cost gate (decision 4) let a bucket below `claim_min_input_bytes` run
+   unclaimed. It priced duplicate work against claim traffic, which is the
+   right trade for a cost measure and the wrong one for a fence: a small
+   bucket's erased rows are served exactly like a large one's. It is removed
+   from `claims_bucket`, so a participating run claims every bucket. It was
+   never separable into a decision about whether to compact at all (that is
+   `min_compaction_inputs`), so nothing of it remains; the field and the
+   `--maintain-claim-min-input-bytes` flag still parse and decide nothing. The
+   erasure rewrite, which took no claim, now takes it. A stale unreadable
+   claim, which `Acquire::Unclaimed` let the compaction run past, now holds
+   the bucket for both passes (`ClaimSkipReason::UnreadableClaim`, retried one
+   lease later) until an operator removes the object: running past it would
+   publish unfenced.
+3. **A pass that cannot take the claim backs off.** It builds nothing,
+   publishes nothing, and a later pass retries; it never publishes unfenced. A
+   compaction reports `ClaimedCompaction::SkippedClaimed` as before. An
+   erasure rewrite reports `Rewritten { parts: 0, publish: Abandoned }`, which
+   the supervisor already treats as deferred (the `.dreq` stays pending and no
+   `.done` is written); its outcome enum gained no variant because
+   `ravel-server` matches it exhaustively. A claim lost mid-run cancels at the
+   next checkpoint as decision 3 describes (`Cancelled` for a compaction,
+   `Abandoned` for an erasure rewrite).
+4. **The pre-publish re-list is a second check.** After its last claim
+   checkpoint and immediately before its record PUT, each pass lists the
+   bucket again (`rewrite::relist_changed`) and compares its record set (L0
+   commit records, compaction records, rewrite records, tombstone) with the
+   listing it planned from. Any difference publishes nothing: a compaction
+   reports the gate the new listing fails (`RewritePresent`,
+   `AlreadyCompacted`, `Tombstoned`) or an abandoned publish, an erasure
+   rewrite reports `Abandoned`. This covers what the claim cannot: an owner
+   paused past its lease whose renewal cadence had not come due on its own
+   clock when it resumed, and a caller that takes no claim. It costs one LIST
+   per run that reaches its publish, counted under the request ledger's list
+   phase.
+5. **Callers that take no claim keep only the re-list.** The unclaimed
+   `compact_bucket` entry point, any caller without a `ClaimParticipant`
+   (`ravel-cli`'s `--no-claim` and `--dry-run`), and `coordination = off` take
+   no claim, so the window between their re-list and their PUT stays open
+   against an erasure rewrite. `coordination = off` is decision 5's escape
+   hatch for a store without the CAS probes and stays one, with this cost now
+   stated.
+6. **Why no key-layout or proto change was needed.** The claim object already
+   lives at `sys/maintain/claims/compaction/<work_id_hex>`, keyed by the
+   bucket's four fields, which identify the erasure rewrite's bucket exactly as
+   they identify the compaction's; "compaction" in the prefix names the key
+   space and constrains nothing. The payload, the CAS protocol and the maintain
+   role's grant on `sys/maintain/` are unchanged, and the re-list reads the
+   existing commit prefix. The alternative, making the two record kinds collide
+   at one `CreateIfAbsent`, would have changed the frozen record key layout.
+7. **Decision 2 and rejected alternative 6.** Between two compactions decision
+   2 stands: they still converge at the record's `CreateIfAbsent`, and
+   `publish.rs` still does not read claims (the checks run before it is
+   called). Between a compaction and an erasure rewrite, holding the claim is
+   now a condition of a participating pass's publish, which is the
+   publication precondition alternative 6 rejected. Its objection, that a
+   lease bug would become a data-corruption bug, does not hold for this pair:
+   without the fence the race already served erased rows. A claim held too
+   long delays the other pass, which the erasure deadline surfaces; a claim
+   stolen from a live owner is caught by its renewal at the next checkpoint or
+   by its re-list. The Context's statement that claims are not
+   correctness-critical is narrowed accordingly: for this one pair of passes
+   the claim is part of the correctness argument, with the re-list behind it.
+
+Tests, each shown failing against the pre-fix code, in
+`crates/ravel-maintain/tests/erasure_compaction_fence.rs`:
+`an_erasure_rewrite_that_publishes_mid_compaction_cancels_the_compaction` and
+`a_compaction_that_publishes_mid_erasure_cancels_the_erasure_rewrite` (the two
+interleavings, driven by `FaultStore` hold gates and test clocks),
+`a_claim_held_by_one_pass_makes_the_other_back_off`,
+`the_pre_publish_relist_aborts_when_the_record_set_changed` and
+`a_stale_unreadable_claim_holds_the_bucket_against_both_passes`. In
+`crates/ravel-maintain/tests/compaction_claims.rs`,
+`a_bucket_below_the_retired_cost_gate_is_claimed` replaces the cost-gate test
+and `a_stale_unreadable_claim_holds_the_bucket` replaces the test that ran such
+a bucket unclaimed.
