@@ -1470,8 +1470,8 @@ async fn plan_carry_peak_bytes_bounded_by_plan_concurrency() {
     // already happened before the budget decides whether to keep it), so
     // `plan_phase_gets` is `2 * SEGMENTS` unconditionally. The scan phase
     // then re-fetches the `SEGMENTS - BUDGET` segments the budget dropped,
-    // each with its own whole-object GET, and reuses the other `BUDGET`
-    // segments' carried bytes for free.
+    // each with its own ranged read of its projected chunk runs, and reuses
+    // the other `BUDGET` segments' carried bytes for free.
     assert_eq!(
         s.plan_phase_gets,
         2 * SEGMENTS as u64,
@@ -1483,8 +1483,9 @@ async fn plan_carry_peak_bytes_bounded_by_plan_concurrency() {
     // (the suffix probe, `QueryPhase::Probe`) precedes its block-data range
     // read (`QueryPhase::Scan`). The front directories are not fetched again:
     // the plan phase decoded them and the open takes them from the carried
-    // directories (ADR-2414 decision A1). 1 probe GET and 1 scan GET per
-    // dropped segment (measured directly, not derived).
+    // directories (ADR-2414 decision A1). 1 probe GET and
+    // `RUNS_PER_REOPENED_SEGMENT` scan GETs per dropped segment (measured
+    // directly, not derived).
     assert_eq!(
         s.probe_phase_gets,
         (SEGMENTS - BUDGET) as u64,
@@ -1601,8 +1602,9 @@ async fn plan_carry_skips_zero_survivor_segment_budget() {
     // are carried and reused for free. The remaining SEGMENTS - 1 - BUDGET
     // (5) segments (3..SEGMENTS) have a surviving block but no carry left,
     // so each pays a real re-fetch: 1 probe GET (the suffix probe; the front
-    // directories come from the carried directories) and 1 scan GET (block
-    // data), the same per-dropped-segment shape
+    // directories come from the carried directories) and
+    // `RUNS_PER_REOPENED_SEGMENT` scan GETs (block-data chunk runs), the same
+    // per-dropped-segment shape
     // `plan_carry_peak_bytes_bounded_by_plan_concurrency` measures.
     assert_eq!(
         s.probe_phase_gets,
