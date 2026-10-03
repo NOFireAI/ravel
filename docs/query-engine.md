@@ -869,10 +869,13 @@ same RAII `reserve` API, so they read under `component="fetch"`.
   or format-floor history, or carries a format version below the lowest this
   build supports, a supersession chain of compaction or rewrite records that
   is cyclic, deeper than the resolver's fixed bound, or names a predecessor
-  with a different input set, and a catalog decode job that panicked, 503
+  with a different input set, and a segment decode job that panicked, 503
   unavailable for transient store failures other than a checksum mismatch,
-  which answers 500 on a catalog read as on a segment fetch, for a catalog
-  decode job the read CPU gate cancelled at shutdown, and for a catalog
+  which answers 500 on a catalog read as on a segment fetch, for a segment
+  decode job the read CPU gate cancelled at shutdown (a decode job for a
+  catalog snapshot part, postings or column-statistics object that panics
+  or is cancelled answers no error: the resolve falls back and the query
+  still answers exactly), and for a catalog
   object (commit, compaction or rewrite record, erasure request, HEAD,
   snapshot part or
   postings) written in a format version above the highest this build reads
