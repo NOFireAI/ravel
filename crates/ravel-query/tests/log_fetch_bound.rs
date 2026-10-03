@@ -303,9 +303,10 @@ async fn counted_store(
 }
 
 /// Builds a fetcher the way `ravel-server`'s `build_sql_state` does: the
-/// resolved routing threshold and request cost are handed to the fetcher
-/// unconditionally, so `with_block_range_threshold` pins the inner crossover to
-/// whatever `resolve_logs_fetch` produced.
+/// resolved routing threshold, request cost and projection break-even are
+/// handed to the fetcher unconditionally, so `with_block_range_threshold` pins
+/// the inner crossover to whatever `resolve_logs_fetch` produced unless a
+/// break-even replaces it.
 fn fetcher_from(
     resolved: &ResolvedLogsFetch,
     store: Arc<dyn ObjectStoreBackend>,
@@ -313,6 +314,7 @@ fn fetcher_from(
     LogSegmentFetcher::new(store)
         .with_block_range_threshold(resolved.block_range_threshold)
         .with_request_cost_bytes(resolved.request_cost_bytes)
+        .with_projection_break_even_bytes(resolved.projection_break_even_bytes)
 }
 
 /// The resolution the shipped default produces: `cost-based` at the reference
@@ -941,9 +943,13 @@ async fn a_block_decoding_fallback_plan_records_exactly_one_touch() {
     );
 }
 
-/// ADR-0996 decision 2, the outcome the whole ADR is for: at the shipped default
-/// (`cost-based` + the reference profile) a narrow projection of an object above
-/// 512 KiB must route WHOLE-OBJECT, so ravel-sql records zero ranged opens.
+/// ADR-0996 decision 2, the outcome the whole ADR is for: where `cost-based`
+/// saturates, a narrow projection of an object above 512 KiB must route
+/// WHOLE-OBJECT, so ravel-sql records zero ranged opens. Since ADR-2414
+/// decision A3 the rate saturates only on a profile with neither byte prices
+/// nor timings, so this runs on the reference prices without the reference
+/// timings; at the reference profile itself the same object still routes
+/// whole, through the projection break-even rather than a saturated threshold.
 ///
 /// The routing predicate is `ranged_projection_pays`, which compares the
 /// projection's saved bytes against `BlockRangeFetcher::effective_whole_object_threshold`.
@@ -961,8 +967,25 @@ async fn a_block_decoding_fallback_plan_records_exactly_one_touch() {
 /// single covering GET asserted here.
 #[tokio::test]
 async fn cost_based_at_the_reference_profile_routes_whole_object() {
-    let resolved = cost_based_at_reference();
-    assert_eq!(resolved.request_cost_bytes, u64::MAX, "free bytes saturate");
+    let untimed = StoreCostProfile {
+        request_latency_micros: None,
+        per_connection_throughput_bytes_per_s: None,
+        timings_measured: None,
+        ..StoreCostProfile::reference()
+    };
+    let resolved = resolve_logs_fetch(
+        LogsFetchPolicy::CostBased,
+        &untimed,
+        None,
+        DEFAULT_LOG_REQUEST_COST_BYTES,
+        DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+        None,
+    );
+    assert_eq!(
+        resolved.request_cost_bytes,
+        u64::MAX,
+        "free bytes and no timings saturate"
+    );
 
     let (records, bytes) = above_threshold_object();
     let object_size = bytes.len() as u64;
@@ -973,7 +996,13 @@ async fn cost_based_at_the_reference_profile_routes_whole_object() {
     // one-column-out-of-many projection of this object must not pay to range.
     assert!(
         !fetcher.ranged_projection_pays(object_size, 0.1),
-        "cost-based at the reference profile must never choose the ranged path"
+        "a saturated cost-based resolution must never choose the ranged path"
+    );
+    let timed = fetcher_from(&cost_based_at_reference(), Arc::new(MemoryStore::new()));
+    assert!(
+        object_size <= 31_500_000 && !timed.ranged_projection_pays(object_size, 0.1),
+        "at the reference profile an object under the 31,500,000-byte break-even \
+         routes whole too"
     );
 
     // ... and the read that follows is one covering GET with no probe, which is
@@ -1015,20 +1044,33 @@ async fn cost_based_at_the_reference_profile_routes_whole_object() {
 ///
 /// The byte-minimal arm is the flip: same object, same query, and the probe
 /// count is nonzero there, so the two zero assertions are not vacuous.
+///
+/// `cost-based` saturates only on a profile with neither byte prices nor
+/// timings (ADR-2414 decision A3), so its arm runs on the reference prices
+/// without the timings. At the reference profile itself the rate is the
+/// finite time term, the routing threshold stays at 512 KiB, and the plan
+/// phase probes the above-threshold object like byte-minimal does.
 #[tokio::test]
 async fn a_saturated_resolution_issues_no_plan_footer_probe() {
     let (records, bytes) = above_threshold_object();
     let reference = StoreCostProfile::reference();
+    let untimed = StoreCostProfile {
+        request_latency_micros: None,
+        per_connection_throughput_bytes_per_s: None,
+        timings_measured: None,
+        ..StoreCostProfile::reference()
+    };
     let query = coded_query(0, 1_000);
 
     let policies = [
-        (LogsFetchPolicy::RequestMinimal, 0u64),
-        (LogsFetchPolicy::CostBased, 0),
+        (LogsFetchPolicy::RequestMinimal, &reference),
+        (LogsFetchPolicy::CostBased, &untimed),
     ];
-    for (policy, expected_probes) in policies {
+    for (policy, profile) in policies {
+        let expected_probes = 0u64;
         let resolved = resolve_logs_fetch(
             policy,
-            &reference,
+            profile,
             None,
             DEFAULT_LOG_REQUEST_COST_BYTES,
             DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
@@ -1072,5 +1114,18 @@ async fn a_saturated_resolution_issues_no_plan_footer_probe() {
         counting.probe_count() > 0,
         "byte-minimal probes an above-threshold object, so the zeros above are \
          not vacuous"
+    );
+
+    let (seg, counting, store) = counted_store("logs/probe-cb-ref.rlog", &bytes, &records).await;
+    let fetcher = fetcher_from(&cost_based_at_reference(), store);
+    fetcher
+        .plan_segment(&seg, TENANT, &query, &QueryAccounting::new())
+        .await
+        .expect("plan")
+        .expect("relevant");
+    assert!(
+        counting.probe_count() > 0,
+        "cost-based at the reference profile keeps the 512 KiB routing threshold, \
+         so the plan phase probes an above-threshold object"
     );
 }
