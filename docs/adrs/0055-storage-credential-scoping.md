@@ -215,8 +215,8 @@ flowchart TB
     QY -->|"Get + List"| C1R["c/** (read)"]
     QY -->|"CreateIfAbsent + CasVersion"| CAT2["catalog/** (fold)"]
     QY -->|"Put, append-only"| AUDQ["u/** (query audit)"]
-    QY -->|"CreateIfAbsent only"| PQM["pq/t/** (HTTP DDL amendment)"]
-    QY -->|"Delete (probe scratch only)"| QSCR
+    QY -->|"CreateIfAbsent only"| PQM["pq/t/&lt;table&gt;/v/*.pqm (HTTP DDL amendment)"]
+    QY -->|"Put + Delete (probe scratch only)"| QPRB["sys/pq-probe/*\n(bucket probe scratch)"]
 
     MT -->|"Get (read inputs)"| L0R["l0/**, c/** (read)"]
     MT -->|"CreateIfAbsent"| L1["l1/**"]
@@ -240,6 +240,7 @@ flowchart TB
     style MT fill:#fc9,stroke:#960,stroke-width:2px
     style DEL fill:#fc9,stroke:#960,stroke-width:2px
     style QSCR fill:#fed,stroke:#960
+    style QPRB fill:#fed,stroke:#960
     style deny fill:#efe,stroke:#3a3,stroke-width:2px
     style SYS fill:#dfd,stroke:#3a3
     style PROVD fill:#dfd,stroke:#3a3
@@ -1383,14 +1384,29 @@ The listing and the three reads were already granted (`QueryList`
 gains the rest and nothing more:
 
 - `QueryManifestCreate`: `s3:PutObject` on
-  `t/????????????????????????????????/pq/t/*`, conditioned on
-  `StringEquals` `s3:if-none-match` `*`. Every manifest write is
-  `CreateIfAbsent`, which the S3 backend sends as `If-None-Match: *`, so the
-  role needs to create a version and never to overwrite one. S3 evaluates
-  `s3:if-none-match` on `PutObject` (checked against AWS on 2026-10-03), and
-  a PUT without the header has no value for the key, so the statement
-  refuses it. A compromised Query credential therefore cannot rewrite an
-  existing manifest version. The tenant hash is spelled as 32 single-character
+  `t/????????????????????????????????/pq/t/*/v/????????????????????.pqm`,
+  conditioned on `StringEquals` `s3:if-none-match` `*`. Every manifest write
+  is `CreateIfAbsent`, which the S3 backend sends as `If-None-Match: *`, so
+  the role needs to create a version and never to overwrite one. S3
+  evaluates `s3:if-none-match` on `PutObject` (checked against AWS on
+  2026-10-03), and a PUT without the header has no value for the key, so the
+  statement refuses it. The condition holds across every API that
+  `s3:PutObject` authorizes, as AWS documents for `s3:if-none-match`: a
+  multipart upload cannot be started without the header, and a CopyObject
+  onto the key is refused. A compromised Query credential therefore cannot
+  rewrite an existing manifest version. The version segment is 20 `?` and
+  the `.pqm` suffix, the exact width of `manifest_key`
+  (`VERSION_WIDTH` in `crates/ravel-pqtable/src/keys.rs`), so only a key
+  shaped like a manifest version is writable. The table segment has to be
+  `*`, since table names run from 1 to 63 bytes, and IAM's `*` matches `/`:
+  the grant also reaches keys such as `t/<hash>/pq/t/a/b/v/<20 chars>.pqm`
+  and 20-character versions that are not 20 digits. All of them sit inside
+  the tenant's own manifest keyspace and `parse_manifest_key` refuses each
+  one; such a key makes the tenant's manifest sweep fail with a foreign-key
+  error, and one under a real table's `v/` prefix makes resolving that table
+  fail too, until Maintain deletes it. That is the same class of harm as the
+  maximal-version wedge below, confined to the manifest keyspace, so it is
+  accepted. The tenant hash is spelled as 32 single-character
   `?` wildcards, the form `GatewayAdmissionDelete` uses: no other keyspace
   carries a `pq/t/` segment today, so a `*` there would reach nothing more,
   but the `?` form keeps the write at `t/<hash>/pq/t/` if one ever does.
@@ -1415,9 +1431,18 @@ definition is still checked against the tenant's grants record at every
 resolve, and Query cannot write that record, so a forged definition reaches
 only locations the tenant has granted. It can also create a version number
 far above the newest, which then resolves as the newest; at `u64::MAX` it
-makes every later DDL on that table fail with a version overflow until
-Maintain deletes it. Both are the forge-within-the-write-grant risk §2
-already accepts. The maintain manifest sweep is unchanged, and a manifest a
+makes every later DDL on that table fail with a version overflow. No Ravel
+path deletes the newest version: the manifest sweep
+(`crates/ravel-pqtable/src/sweep.rs`) deletes a version only once its
+successor is past grace, so a forged newest version is never swept, and the
+next `ravel-cli parquet sweep` after the forged version passes grace deletes
+the legitimate versions beneath it. Recovery is to delete the forged version
+out of band with the Maintain credential before that sweep runs, or to
+restore the noncurrent object versions if the bucket keeps them. Issue #2430
+tracks hardening. The server's DDL authorization does not bind the IAM
+credential: anything holding it can put a manifest directly. The forged
+definition and the forged version are both the forge-within-the-write-grant
+risk §2 already accepts. The maintain manifest sweep is unchanged, and a manifest a
 compromised Maintain credential deletes can now be recreated by a `CREATE`
 over HTTP.
 
