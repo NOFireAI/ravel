@@ -661,9 +661,13 @@ writer switch that is off: `ReencodeBlockedReason::MultipleRecords`, alongside
 this run published its version 2 record. The predecessor's parts keep counting
 toward the below-target figure until `sweep` reclaims it (item 6), so the floor
 is raised by the first `migrate` run after that sweep, through the existing
-fresh re-audit. The switch is still off by default and no operator flag turns it
-on yet; the `ravel-cli maintain migrate` flag and the report lines for the new
-reasons follow in a later task.
+fresh re-audit. The switch is still off by default. The operator turns it on per
+run with `ravel-cli maintain migrate --reencode-compaction-parts`, whose help
+states item 8's rollout rule, and the command prints one `reencode_blocked`
+line per bucket with its reason and one `not_migrated` line per bucket whose
+rewrite published nothing, and exits nonzero when either is present.
+`migrate --dry-run` runs only the read-only re-audit, because the walk writes
+its cursor and the floor whatever `CompactorConfig::dry_run` says.
 
 ## Amendment (2026-10-03, #2271): a below-floor HEAD is rebuilt, not refused as newer
 

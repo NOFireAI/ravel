@@ -242,8 +242,9 @@ fn command_is_write(command: &Command) -> bool {
             // what it would delete.
             MaintainCommand::Sweep { dry_run, .. } => !dry_run,
             // Rewrites objects to the target format version and raises the
-            // recorded format floor under `t/<tenant_hash>/...`.
-            MaintainCommand::Migrate { .. } => true,
+            // recorded format floor under `t/<tenant_hash>/...`; `--dry-run`
+            // only runs the read-only re-audit.
+            MaintainCommand::Migrate { dry_run, .. } => !dry_run,
             // Read-only inspection/reporting: `status` reports maintenance
             // state, `audit-versions` audits live format versions, and
             // `verify-custody` re-verifies the content-addressed chain; none
@@ -1684,6 +1685,21 @@ enum MaintainCommand {
         /// the record PUT.
         #[arg(long)]
         no_claim: bool,
+        /// Report what is below the target now, from a read-only re-audit, and
+        /// write nothing: no migration, no re-encode, no claim, no cursor and
+        /// no floor.
+        #[arg(long)]
+        dry_run: bool,
+        /// Re-encode a bucket whose one compaction record holds parts below
+        /// the target: write the parts again at the current version and a
+        /// version 2 compaction record that supersedes the old one. Every
+        /// reader and maintainer in the fleet must already run a build that
+        /// reads version 2 compaction records; once one is written there is no
+        /// rollback past a build that reads them. The format floor rises on
+        /// the first migrate run after sweep has deleted the superseded record.
+        /// Off by default: such a bucket is then reported as reencode_blocked.
+        #[arg(long)]
+        reencode_compaction_parts: bool,
     },
     /// Re-verify the content-addressed chain for a tenant at rest (both
     /// signals): every live data object's content still hashes to the hash16
@@ -2100,6 +2116,8 @@ async fn main() -> anyhow::Result<()> {
                     family,
                     budget_records,
                     no_claim,
+                    dry_run,
+                    reencode_compaction_parts,
                 },
         } => {
             maintain::migrate(
@@ -2111,6 +2129,10 @@ async fn main() -> anyhow::Result<()> {
                 target_version,
                 family,
                 budget_records,
+                maintain::MigrateSwitches {
+                    dry_run,
+                    reencode_compaction_parts,
+                },
                 &maintain::ClaimOptions::for_invocation(no_claim),
             )
             .await
@@ -4690,6 +4712,45 @@ mod tests {
                 maintain::ClaimOptions::for_invocation(no_claim).no_claim,
                 want,
                 "and the ClaimOptions the walk is dispatched with",
+            );
+        }
+    }
+
+    /// `--dry-run` and `--reencode-compaction-parts` on `migrate` are off by
+    /// default and each reaches its own field of the switches the walk runs
+    /// with.
+    ///
+    /// Non-vacuity: change `MaintainCommand::Migrate::reencode_compaction_parts`'s
+    /// `#[arg(long)]` to `#[arg(skip)]` and the `try_parse_from` carrying
+    /// `--reencode-compaction-parts` fails with "unexpected argument".
+    #[test]
+    fn migrate_dry_run_and_reencode_flags_reach_the_switches() {
+        let base = [
+            "ravel", "maintain", "migrate", "--tenant", "acme", "--signal", "logs",
+        ];
+        for (argv_tail, want_dry, want_reencode) in [
+            (Vec::new(), false, false),
+            (vec!["--dry-run"], true, false),
+            (vec!["--reencode-compaction-parts"], false, true),
+            (vec!["--dry-run", "--reencode-compaction-parts"], true, true),
+        ] {
+            let cli = Cli::try_parse_from(base.iter().copied().chain(argv_tail.iter().copied()))
+                .unwrap_or_else(|e| panic!("migrate {argv_tail:?} parses: {e}"));
+            let Command::Maintain {
+                command:
+                    super::MaintainCommand::Migrate {
+                        dry_run,
+                        reencode_compaction_parts,
+                        ..
+                    },
+            } = cli.command
+            else {
+                panic!("expected the maintain migrate subcommand");
+            };
+            assert_eq!(
+                (dry_run, reencode_compaction_parts),
+                (want_dry, want_reencode),
+                "{argv_tail:?}"
             );
         }
     }

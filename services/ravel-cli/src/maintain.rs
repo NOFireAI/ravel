@@ -12,12 +12,16 @@ use std::time::Duration;
 use clap::ValueEnum;
 use ravel_commit::keys;
 use ravel_ingest::Clock as _;
+use ravel_maintain::migrate::{
+    MigrationPath, NotMigratedBucket, NotMigratedReason, ReencodeBlockedBucket,
+    ReencodeBlockedReason,
+};
 use ravel_maintain::{
     BlockedBucket, BlockedReason, Bucket, ClaimParticipant, ClaimSkip, ClaimedCompaction,
     CompactionOutcome, CompactorConfig, FamilyMigrateReport, FixedClock, GcConfigValues,
     L1PartMemoryTargetSource, LegalHoldCheck, MergeMemoryTracker, MigrateBudget, PublishOutcome,
     ResolvedL1PartMemoryTarget, SweepReport, Verification, census_family, compact_bucket_claimed,
-    migrate_family, sweep_shard,
+    count_below_target, migrate_family, sweep_shard,
 };
 use ravel_object_store::conformance::NoncurrentVersionSource;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
@@ -2130,6 +2134,88 @@ fn blocked_bucket_report(blocked: &[BlockedBucket]) -> String {
     out
 }
 
+/// One line per bucket the walk found held below the target by its compaction
+/// records' parts and did not re-encode, followed by what clears each reason
+/// present. Returns the empty string for an empty list.
+fn reencode_blocked_report(blocked: &[ReencodeBlockedBucket]) -> String {
+    if blocked.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for bucket in blocked {
+        let reason = match &bucket.reason {
+            ReencodeBlockedReason::WriterDisabled { below_target } => {
+                format!("writer_disabled below_target={below_target}")
+            }
+            ReencodeBlockedReason::ContestedOverlap { largest_component } => {
+                format!("contested_overlap largest_component={largest_component}")
+            }
+            ReencodeBlockedReason::MultipleRecords { records } => {
+                format!("multiple_records records={records}")
+            }
+        };
+        out.push_str(&format!(
+            "reencode_blocked: shard={} hour={} reason={reason}\n",
+            bucket.shard, bucket.ingest_hour
+        ));
+    }
+    let has_disabled = blocked
+        .iter()
+        .any(|b| matches!(b.reason, ReencodeBlockedReason::WriterDisabled { .. }));
+    let has_permanent = blocked
+        .iter()
+        .any(|b| !matches!(b.reason, ReencodeBlockedReason::WriterDisabled { .. }));
+    if has_disabled {
+        out.push_str(
+            "# A writer_disabled bucket's one compaction record holds below_target parts under \
+             the target. A run with --reencode-compaction-parts re-encodes it, once every \
+             reader and maintainer runs a build that reads version 2 compaction records.\n",
+        );
+    }
+    if has_permanent {
+        out.push_str(
+            "# A contested_overlap or multiple_records bucket is not re-encoded by any run, with \
+             or without --reencode-compaction-parts. It clears when retention ages the bucket \
+             out (subject to the format-version hold, which keeps an object this build cannot \
+             read). That is not a command you run.\n",
+        );
+    }
+    out
+}
+
+/// One line per bucket the walk dispatched a rewrite for that published
+/// nothing, with the path and the reason, followed by the sentence that says a
+/// later run retries them. Returns the empty string for an empty list.
+fn not_migrated_report(buckets: &[NotMigratedBucket]) -> String {
+    if buckets.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for bucket in buckets {
+        let path = match bucket.path {
+            MigrationPath::L0Migration => "l0_migration",
+            MigrationPath::Reencode => "reencode",
+        };
+        let reason = match &bucket.reason {
+            NotMigratedReason::ClaimSkipped { reason } => {
+                format!("claim_skipped claim_reason={}", reason.name())
+            }
+            NotMigratedReason::Cancelled { at } => format!("cancelled checkpoint={}", at.name()),
+            NotMigratedReason::RecordSetChanged => "record_set_changed".to_string(),
+            NotMigratedReason::PublishAbandoned => "publish_abandoned".to_string(),
+        };
+        out.push_str(&format!(
+            "not_migrated: shard={} hour={} path={path} reason={reason}\n",
+            bucket.shard, bucket.ingest_hour
+        ));
+    }
+    out.push_str(
+        "# Each not_migrated bucket published nothing this run. A later migrate run retries \
+         every one of them.\n",
+    );
+    out
+}
+
 /// Everything `migrate` prints to stdout before the verification verdict, as
 /// one string: the `key: value` block, the blocked-bucket lines and the prose
 /// that explains them, in the order an operator reads them.
@@ -2164,6 +2250,16 @@ fn migrate_report_text(
         out.push('\n');
     }
     out.push_str(&format!("records_migrated: {}\n", report.records_migrated));
+    out.push_str(&format!(
+        "buckets_reencode_blocked: {}\n",
+        report.reencode_blocked.len()
+    ));
+    out.push_str(&reencode_blocked_report(&report.reencode_blocked));
+    out.push_str(&format!(
+        "buckets_not_migrated: {}\n",
+        report.not_migrated.len()
+    ));
+    out.push_str(&not_migrated_report(&report.not_migrated));
     if let Some((shard, hour)) = report.cursor_advanced_to {
         out.push_str(&format!("cursor_advanced_to: shard={shard} hour={hour}\n"));
     }
@@ -2196,11 +2292,18 @@ fn migrate_report_text(
 /// rewrites them (ADR-1331). Each such bucket this invocation examined is
 /// printed on its own `blocked_bucket` line with its reason, and
 /// `buckets_blocked` is how many there are. A below-target compaction part
-/// blocks the floor too, because nothing migrates one either (issue #2093); it
-/// shows up in `l1_compaction_parts`, and its bucket gets a
-/// `losing_record_parts` line only when the parts belong to compaction records
-/// that lost their overlap while the bucket's authoritative records are at the
-/// target.
+/// blocks the floor too; it shows up in `l1_compaction_parts`, and its bucket
+/// gets a `losing_record_parts` line when the parts belong to compaction
+/// records that lost their overlap while the bucket's authoritative records
+/// are at the target.
+///
+/// A bucket whose one authoritative compaction record holds below-target parts
+/// is re-encoded only when [`MigrateSwitches::reencode_compaction_parts`] sets
+/// [`CompactorConfig::reencode_writer_enabled`]; with it off, or when the
+/// bucket's records are contested or more than one, it gets a
+/// `reencode_blocked` line with its reason. A bucket whose rewrite published
+/// nothing (claim skipped, cancelled, record set changed, publish abandoned)
+/// gets a `not_migrated` line. Either kind of line makes the run exit nonzero.
 ///
 /// `target_version` defaults to the signal's current supported version
 /// ([`signal_current_version`]); `family` defaults to the signal's canonical
@@ -2212,6 +2315,10 @@ fn migrate_report_text(
 /// unraised until a later run migrates it. `--no-claim` takes none, which
 /// leaves only the pre-publish re-list between a migration and an erasure
 /// rewrite of the same bucket.
+///
+/// [`MigrateSwitches::dry_run`] does not run the walk, because the walk writes
+/// its cursor and the floor whatever the compactor's own dry-run switch says.
+/// It runs the read-only re-audit instead and prints what is below the target.
 #[allow(clippy::too_many_arguments)]
 pub async fn migrate(
     store: Arc<dyn ObjectStoreBackend>,
@@ -2222,6 +2329,51 @@ pub async fn migrate(
     target_version: Option<u32>,
     family: Option<String>,
     budget_records: u64,
+    switches: MigrateSwitches,
+    claims: &ClaimOptions,
+) -> anyhow::Result<()> {
+    let mut out = std::io::stdout();
+    migrate_to(
+        &mut out,
+        store,
+        selection,
+        tenant,
+        signal,
+        shards,
+        target_version,
+        family,
+        budget_records,
+        switches,
+        claims,
+    )
+    .await
+}
+
+/// The operator switches of `maintain migrate`, both off by default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MigrateSwitches {
+    /// Run the read-only re-audit instead of the walk; write nothing.
+    pub dry_run: bool,
+    /// Set [`CompactorConfig::reencode_writer_enabled`], so the walk writes a
+    /// version 2 compaction record over a bucket whose one compaction record
+    /// holds parts below the target.
+    pub reencode_compaction_parts: bool,
+}
+
+/// [`migrate`], with the report written to `out` instead of stdout. The
+/// store-selection header still prints to stdout.
+#[allow(clippy::too_many_arguments)]
+pub async fn migrate_to(
+    out: &mut dyn Write,
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    signal: SignalArg,
+    shards: u32,
+    target_version: Option<u32>,
+    family: Option<String>,
+    budget_records: u64,
+    switches: MigrateSwitches,
     claims: &ClaimOptions,
 ) -> anyhow::Result<()> {
     let tenant_hash = TenantId::new(tenant).hash();
@@ -2241,8 +2393,34 @@ pub async fn migrate(
     };
     let family = family.unwrap_or_else(|| signal_family(sig).to_string());
     let clock = wall_clock()?;
-    let mut config = CompactorConfig::default();
-    println!("{}", install_claims(&mut config, false, claims));
+    let mut config = CompactorConfig {
+        reencode_writer_enabled: switches.reencode_compaction_parts,
+        ..CompactorConfig::default()
+    };
+    writeln!(
+        out,
+        "{}",
+        install_claims(&mut config, switches.dry_run, claims)
+    )?;
+    writeln!(out, "dry_run: {}", switches.dry_run)?;
+    writeln!(
+        out,
+        "reencode_compaction_parts: {}",
+        switches.reencode_compaction_parts
+    )?;
+    if switches.dry_run {
+        return migrate_dry_run(
+            out,
+            store.as_ref(),
+            tenant,
+            &tenant_hash,
+            sig,
+            &family,
+            target,
+            shards,
+        )
+        .await;
+    }
     let budget = MigrateBudget {
         max_records: budget_records,
     };
@@ -2262,25 +2440,27 @@ pub async fn migrate(
     .await
     .map_err(|err| anyhow::anyhow!("migrate failed: {err}"))?;
 
-    print!(
+    write!(
+        out,
         "{}",
         migrate_report_text(tenant, sig, &family, target, budget_records, &report)
-    );
+    )?;
 
     if !report.walk_complete {
-        println!(
+        writeln!(
+            out,
             "budget exhausted; the walk did not finish. Re-run migrate to resume from the \
              persisted cursor (the floor is not raised until the walk drains and the re-audit is \
              clean)."
-        );
-        return Ok(());
+        )?;
+        return unmigrated_buckets_verdict(&report, tenant, sig, &family);
     }
 
     match report.verification {
         Some(Verification::FloorRaised { floor_version }) => {
-            println!("verification: clean (no records below target)");
-            println!("floor_raised_to: {floor_version}");
-            Ok(())
+            writeln!(out, "verification: clean (no records below target)")?;
+            writeln!(out, "floor_raised_to: {floor_version}")?;
+            unmigrated_buckets_verdict(&report, tenant, sig, &family)
         }
         Some(Verification::Stragglers {
             l0,
@@ -2288,10 +2468,11 @@ pub async fn migrate(
             rewrite_parts,
             blocked,
         }) => {
-            println!(
+            writeln!(
+                out,
                 "verification: FOUND STRAGGLERS l0_commit_records={l0} l1_compaction_parts={l1} \
                  rewrite_record_parts={rewrite_parts}"
-            );
+            )?;
             anyhow::bail!(
                 "migrate refused to raise the {family} floor for tenant {tenant} signal {sig:?}: \
                  the fresh re-audit found {l0} commit record(s), {l1} compaction part(s) and \
@@ -2308,22 +2489,28 @@ pub async fn migrate(
                  rewrite superseded. Both stay listed until `ravel-cli maintain sweep` for this \
                  tenant, signal and shard deletes them, which it does once the superseding \
                  rewrite is past the protection horizon. The floor was NOT raised.\n\n\
-                 Whether re-running helps depends on why they are below target. Only \
-                 l0_commit_records can move: a below-target L0 record that is merely not yet \
-                 sealed migrates on a later run. Nothing else does. A below-target L0 that only \
+                 Whether re-running helps depends on why they are below target. A below-target \
+                 L0 record that is merely not yet sealed migrates on a later run. A below-target \
+                 L0 that only \
                  a LOSING compaction record names is served raw by the resolver and is not \
                  migratable by the walk; a live erasure rewrite record's parts are never \
-                 migrated by this job at all; and no code path migrates a below-target \
-                 compaction part either, so no re-run lowers l1_compaction_parts (issue #2093) -- \
-                 only retention, or a `sweep` of a compaction record a later rewrite superseded, \
-                 does. The {} blocked_bucket line(s) above name every such \
-                 bucket THIS INVOCATION EXAMINED with its reason -- a walk that resumed from a \
-                 cursor does not re-report the loser-only buckets an earlier invocation found, \
-                 and a below-target compaction part gets a line only when it belongs to a \
-                 compaction record that lost its overlap in a bucket whose authoritative \
-                 records are at the target (losing_record_parts). If there are any, \
-                 re-running is not the remedy.",
-                blocked.len()
+                 migrated by this job at all. A below-target compaction part is re-encoded only \
+                 by a run with --reencode-compaction-parts, and only in a bucket whose one \
+                 compaction record survives supersession; the record it supersedes keeps \
+                 counting in l1_compaction_parts until `sweep` deletes it, so the floor is raised \
+                 by the first migrate run after that sweep. The {} blocked_bucket line(s) above \
+                 name every bucket THIS INVOCATION EXAMINED that no re-run clears, with its \
+                 reason -- a walk that resumed from a cursor does not re-report the loser-only \
+                 buckets an earlier invocation found, and a below-target compaction part gets a \
+                 blocked_bucket line only when it belongs to a compaction record that lost its \
+                 overlap in a bucket whose authoritative records are at the target \
+                 (losing_record_parts). If there are any, re-running is not the remedy. The {} \
+                 reencode_blocked line(s) name the buckets whose compaction parts this run did \
+                 not re-encode, and the {} not_migrated line(s) the buckets a later run \
+                 retries.",
+                blocked.len(),
+                report.reencode_blocked.len(),
+                report.not_migrated.len(),
             )
         }
         None => {
@@ -2332,6 +2519,66 @@ pub async fn migrate(
             anyhow::bail!("migrate completed the walk but produced no verification result")
         }
     }
+}
+
+/// The exit verdict of a run that did not refuse on stragglers: an error when
+/// it left any bucket on [`FamilyMigrateReport::reencode_blocked`] or
+/// [`FamilyMigrateReport::not_migrated`], as a blocked bucket does.
+fn unmigrated_buckets_verdict(
+    report: &FamilyMigrateReport,
+    tenant: &str,
+    signal: Signal,
+    family: &str,
+) -> anyhow::Result<()> {
+    let reencode_blocked = report.reencode_blocked.len();
+    let not_migrated = report.not_migrated.len();
+    if reencode_blocked == 0 && not_migrated == 0 {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "migrate left {reencode_blocked} bucket(s) reencode_blocked and {not_migrated} \
+         bucket(s) not_migrated in the {family} family for tenant {tenant} signal {signal:?}. \
+         A later migrate run retries every not_migrated bucket; the reencode_blocked lines say \
+         what clears each of the others."
+    )
+}
+
+/// `migrate --dry-run`: the read-only re-audit a real run ends with, run before
+/// any bucket is migrated. It writes nothing, takes no claim, and does not
+/// touch the cursor or the floor.
+#[allow(clippy::too_many_arguments)]
+async fn migrate_dry_run(
+    out: &mut dyn Write,
+    store: &dyn ObjectStoreBackend,
+    tenant: &str,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    family: &str,
+    target_version: u32,
+    shards: u32,
+) -> anyhow::Result<()> {
+    let scan_shards = generation_scan_shards(store, tenant_hash, signal, shards).await?;
+    let below = count_below_target(store, tenant_hash, signal, scan_shards, target_version)
+        .await
+        .map_err(|err| anyhow::anyhow!("migrate --dry-run re-audit failed: {err}"))?;
+    writeln!(out, "tenant: {tenant}")?;
+    writeln!(out, "signal: {signal:?}")?;
+    writeln!(out, "family: {family}")?;
+    writeln!(out, "target_version: {target_version}")?;
+    writeln!(out, "l0_commit_records: {}", below.l0)?;
+    writeln!(out, "l1_compaction_parts: {}", below.l1)?;
+    writeln!(out, "rewrite_record_parts: {}", below.rewrite_parts)?;
+    writeln!(out, "buckets_blocked: {}", below.blocked.len())?;
+    write!(out, "{}", blocked_bucket_report(&below.blocked))?;
+    if !below.blocked.is_empty() {
+        writeln!(out)?;
+    }
+    writeln!(
+        out,
+        "# Dry run: the walk did not run and nothing was written. The figures above are what is \
+         below the target now; a run without --dry-run migrates what it can and re-audits."
+    )?;
+    Ok(())
 }
 
 /// The outcome of independently re-hashing one content-addressed object at
@@ -3053,6 +3300,8 @@ mod tests {
                     reason: BlockedReason::LoserOnlyInputs,
                 },
             ],
+            reencode_blocked: Vec::new(),
+            not_migrated: Vec::new(),
             cursor_advanced_to: None,
             walk_complete: true,
             budget_exhausted: false,
@@ -3205,6 +3454,133 @@ mod tests {
             blocked_bucket_report(&[]),
             "",
             "nothing blocked prints nothing, not a blank line"
+        );
+    }
+
+    /// Every reencode_blocked and not_migrated reason prints its own line, with
+    /// its count, checkpoint or claim reason, and each comment prints only when
+    /// a bucket it explains is listed.
+    ///
+    /// Non-vacuity: delete the `if has_permanent` block in
+    /// `reencode_blocked_report` and the first `assert_eq!` fails with the
+    /// contested_overlap comment missing; swap the `Cancelled` arm's
+    /// `at.name()` for a constant and the second fails on
+    /// `checkpoint=part_boundary`.
+    #[test]
+    fn migrate_prints_every_reencode_blocked_and_not_migrated_reason() {
+        let blocked = |shard, reason| ReencodeBlockedBucket {
+            shard,
+            ingest_hour: 9,
+            reason,
+        };
+        assert_eq!(
+            reencode_blocked_report(&[
+                blocked(1, ReencodeBlockedReason::WriterDisabled { below_target: 3 }),
+                blocked(
+                    2,
+                    ReencodeBlockedReason::ContestedOverlap {
+                        largest_component: 2
+                    }
+                ),
+                blocked(3, ReencodeBlockedReason::MultipleRecords { records: 4 }),
+            ]),
+            "reencode_blocked: shard=1 hour=9 reason=writer_disabled below_target=3\n\
+             reencode_blocked: shard=2 hour=9 reason=contested_overlap largest_component=2\n\
+             reencode_blocked: shard=3 hour=9 reason=multiple_records records=4\n\
+             # A writer_disabled bucket's one compaction record holds below_target parts under \
+             the target. A run with --reencode-compaction-parts re-encodes it, once every \
+             reader and maintainer runs a build that reads version 2 compaction records.\n\
+             # A contested_overlap or multiple_records bucket is not re-encoded by any run, with \
+             or without --reencode-compaction-parts. It clears when retention ages the bucket \
+             out (subject to the format-version hold, which keeps an object this build cannot \
+             read). That is not a command you run.\n"
+        );
+        assert!(
+            !reencode_blocked_report(&[blocked(
+                1,
+                ReencodeBlockedReason::WriterDisabled { below_target: 1 }
+            )])
+            .contains("contested_overlap"),
+            "the permanent comment prints only beside a permanent reason"
+        );
+        assert_eq!(reencode_blocked_report(&[]), "");
+
+        let not_migrated = |path, reason| NotMigratedBucket {
+            shard: 0,
+            ingest_hour: 5,
+            path,
+            reason,
+        };
+        assert_eq!(
+            not_migrated_report(&[
+                not_migrated(
+                    MigrationPath::L0Migration,
+                    NotMigratedReason::ClaimSkipped {
+                        reason: ravel_maintain::ClaimSkipReason::StealLost
+                    }
+                ),
+                not_migrated(
+                    MigrationPath::Reencode,
+                    NotMigratedReason::Cancelled {
+                        at: ravel_maintain::Checkpoint::PartBoundary
+                    }
+                ),
+                not_migrated(
+                    MigrationPath::L0Migration,
+                    NotMigratedReason::RecordSetChanged
+                ),
+                not_migrated(MigrationPath::Reencode, NotMigratedReason::PublishAbandoned),
+            ]),
+            "not_migrated: shard=0 hour=5 path=l0_migration reason=claim_skipped \
+             claim_reason=steal_lost\n\
+             not_migrated: shard=0 hour=5 path=reencode reason=cancelled \
+             checkpoint=part_boundary\n\
+             not_migrated: shard=0 hour=5 path=l0_migration reason=record_set_changed\n\
+             not_migrated: shard=0 hour=5 path=reencode reason=publish_abandoned\n\
+             # Each not_migrated bucket published nothing this run. A later migrate run \
+             retries every one of them.\n"
+        );
+        assert_eq!(not_migrated_report(&[]), "");
+    }
+
+    /// A run that did not refuse on stragglers (a budget stop, or a raised
+    /// floor) still exits nonzero when it left a reencode_blocked or a
+    /// not_migrated bucket, and zero when it left neither.
+    ///
+    /// Non-vacuity: replace the body of `unmigrated_buckets_verdict` with
+    /// `Ok(())` and both `is_err` assertions fail.
+    #[test]
+    fn a_run_leaving_unmigrated_buckets_exits_nonzero() {
+        let clean = FamilyMigrateReport::default();
+        assert!(unmigrated_buckets_verdict(&clean, "acme", Signal::Logs, "rlog").is_ok());
+
+        let reencode_blocked = FamilyMigrateReport {
+            reencode_blocked: vec![ReencodeBlockedBucket {
+                shard: 0,
+                ingest_hour: 1,
+                reason: ReencodeBlockedReason::WriterDisabled { below_target: 1 },
+            }],
+            ..FamilyMigrateReport::default()
+        };
+        assert!(
+            unmigrated_buckets_verdict(&reencode_blocked, "acme", Signal::Logs, "rlog").is_err()
+        );
+
+        let not_migrated = FamilyMigrateReport {
+            not_migrated: vec![NotMigratedBucket {
+                shard: 0,
+                ingest_hour: 1,
+                path: MigrationPath::Reencode,
+                reason: NotMigratedReason::PublishAbandoned,
+            }],
+            ..FamilyMigrateReport::default()
+        };
+        let err = unmigrated_buckets_verdict(&not_migrated, "acme", Signal::Logs, "rlog")
+            .expect_err("a not_migrated bucket exits nonzero")
+            .to_string();
+        assert!(
+            err.contains("A later migrate run retries every not_migrated bucket"),
+            "{err}"
         );
     }
 
