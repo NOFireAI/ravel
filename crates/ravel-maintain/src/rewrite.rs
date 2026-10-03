@@ -59,6 +59,7 @@ use ravel_object_store::ObjectStoreBackend;
 use ravel_types::Signal;
 
 use crate::bucket::Bucket;
+use crate::claim_guard::{BucketClaim, Checkpoint, ClaimSkipReason, claim_bucket};
 use crate::clock::Clock;
 use crate::codec::{RsegCodec, SegmentCodec};
 use crate::config::CompactorConfig;
@@ -66,7 +67,10 @@ use crate::error::{MaintainError, Result};
 use crate::publish::{
     ConservationPredicate, PublishOutcome, conserve_exact, publish_record_with_conservation,
 };
-use crate::read::{input_set_hash, list_bucket_with_ledger, load_inputs_with_ledger};
+use crate::read::{
+    BucketListing, input_set_hash, list_bucket_with_ledger, load_inputs_with_ledger,
+};
+use crate::request_ledger::RequestLedger;
 use crate::rlog::RlogCodec;
 use crate::rspan_codec::SpanCodec;
 
@@ -123,8 +127,18 @@ pub async fn rewrite_and_publish<C: SegmentCodec>(
         commit_keys,
         conservation,
         start_ns,
+        None,
     )
-    .await;
+    .await
+    .and_then(|fenced| match fenced {
+        FencedRewrite::Ran(outcome) => Ok(outcome),
+        // Unreachable by construction: with no planned listing there is no
+        // re-list to differ. Typed rather than panicked, per this crate's
+        // no-panic rule.
+        FencedRewrite::RecordSetChanged(_) => Err(MaintainError::Invariant(
+            "a rewrite given no planned listing reported a changed record set".to_string(),
+        )),
+    });
     // The frame that OPENED the scope emits the run's report, exactly once
     // (ADR-0996 task 996-8): a directly-driven rewrite reports here; a rewrite
     // dispatched by `compact_bucket` or `migrate_bucket_format` stays silent
@@ -182,7 +196,8 @@ pub(crate) fn emit_request_report(config: &CompactorConfig, bucket: &Bucket, ok:
 
 /// [`rewrite_and_publish`]'s body, with the request ledger's run scope already
 /// opened and guaranteed to be closed by its caller: read the input commit
-/// records, then run the primitive over them.
+/// records, then run the primitive over them. `planned` is passed through to
+/// [`rewrite_and_publish_loaded`], whose pre-publish re-list it enables.
 #[allow(clippy::too_many_arguments)]
 async fn load_then_rewrite<C: SegmentCodec>(
     store: &dyn ObjectStoreBackend,
@@ -192,7 +207,8 @@ async fn load_then_rewrite<C: SegmentCodec>(
     commit_keys: &[String],
     conservation: impl ConservationPredicate,
     start_ns: i64,
-) -> Result<RewriteOutcome> {
+    planned: Option<&BucketListing>,
+) -> Result<FencedRewrite> {
     crate::rlog::check_rlog_zstd_level(config, bucket)?;
     let inputs = load_inputs_with_ledger(
         store,
@@ -202,21 +218,94 @@ async fn load_then_rewrite<C: SegmentCodec>(
         config.request_ledger.as_ref(),
     )
     .await?;
-    rewrite_and_publish_loaded::<C>(store, clock, config, bucket, inputs, conservation, start_ns)
-        .await
+    rewrite_and_publish_loaded::<C>(
+        store,
+        clock,
+        config,
+        bucket,
+        inputs,
+        conservation,
+        start_ns,
+        planned,
+    )
+    .await
+}
+
+/// What [`rewrite_and_publish_loaded`] did.
+#[derive(Debug)]
+pub(crate) enum FencedRewrite {
+    /// The run published, converged, or abandoned at a claim checkpoint.
+    Ran(RewriteOutcome),
+    /// The pre-publish re-list found a record set other than the one the run
+    /// planned from, so the run published nothing (ADR-1029, the 2026-10-03
+    /// amendment). Carries the new listing, so the caller can report why.
+    RecordSetChanged(BucketListing),
+}
+
+/// Whether two listings of one bucket name the same record set: the same L0
+/// commit records, compaction records, rewrite records and tombstone,
+/// whatever order the store listed them in.
+fn same_record_set(a: &BucketListing, b: &BucketListing) -> bool {
+    fn sorted(keys: &[String]) -> Vec<&str> {
+        let mut v: Vec<&str> = keys.iter().map(String::as_str).collect();
+        v.sort_unstable();
+        v
+    }
+    sorted(&a.commit_keys) == sorted(&b.commit_keys)
+        && sorted(&a.compaction_record_keys) == sorted(&b.compaction_record_keys)
+        && sorted(&a.rewrite_record_keys) == sorted(&b.rewrite_record_keys)
+        && a.tombstone_key == b.tombstone_key
+}
+
+/// The pre-publish re-list (ADR-1029, the 2026-10-03 amendment): list `bucket`
+/// again and return the new listing when its record set differs from
+/// `planned`, the listing the pass planned from, or `None` when it is the same.
+///
+/// Compaction and the erasure rewrite both call this after their last claim
+/// checkpoint and before their record PUT. A compaction record and a rewrite
+/// record have different keys, so neither's `CreateIfAbsent` refuses the other;
+/// a pass that publishes over a record set it did not plan from is what would
+/// serve erased rows again (issue #2199). The LIST is counted under the
+/// ledger's list phase, like the planning listing.
+pub(crate) async fn relist_changed(
+    store: &dyn ObjectStoreBackend,
+    bucket: &Bucket,
+    planned: &BucketListing,
+    ledger: Option<&RequestLedger>,
+) -> Result<Option<BucketListing>> {
+    let now = list_bucket_with_ledger(store, bucket, ledger).await?;
+    if same_record_set(planned, &now) {
+        return Ok(None);
+    }
+    tracing::warn!(
+        signal = ?bucket.signal,
+        shard = bucket.shard,
+        ingest_hour_bucket = bucket.ingest_hour_bucket,
+        planned_commit_records = planned.commit_keys.len(),
+        planned_compaction_records = planned.compaction_record_keys.len(),
+        planned_rewrite_records = planned.rewrite_record_keys.len(),
+        commit_records = now.commit_keys.len(),
+        compaction_records = now.compaction_record_keys.len(),
+        rewrite_records = now.rewrite_record_keys.len(),
+        tombstoned = now.tombstone_key.is_some(),
+        "bucket record set changed since this pass planned; publishing nothing (ADR-1029)"
+    );
+    Ok(Some(now))
 }
 
 /// [`rewrite_and_publish`] over inputs the caller already read.
 ///
-/// Compaction's coordinated driver ([`crate::compact::compact_bucket_claimed`])
-/// enters here: it needs the decoded input records before the primitive runs,
-/// because the advisory claim's cost gate is priced on their stored bytes
-/// (ADR-1029 decision 4) and the claim is taken before the first catalog read.
-/// Loading them there and handing them over keeps the input GETs at exactly one
-/// set per run.
+/// Compaction's driver ([`crate::compact::compact_bucket_claimed`]) enters
+/// here: it reads the input records before it takes the bucket claim, and the
+/// claim is taken before the first catalog read. Loading them there and handing
+/// them over keeps the input GETs at exactly one set per run.
 ///
 /// The caller owns the request ledger's run scope, as it does for
 /// [`rewrite_and_publish`] when an outer driver opened one.
+///
+/// `planned` is the bucket listing the caller planned from. When it is given,
+/// the run re-lists the bucket after its last claim checkpoint and publishes
+/// nothing if the record set changed ([`relist_changed`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn rewrite_and_publish_loaded<C: SegmentCodec>(
     store: &dyn ObjectStoreBackend,
@@ -226,7 +315,8 @@ pub(crate) async fn rewrite_and_publish_loaded<C: SegmentCodec>(
     inputs: Vec<crate::read::InputRecord>,
     conservation: impl ConservationPredicate,
     start_ns: i64,
-) -> Result<RewriteOutcome> {
+    planned: Option<&BucketListing>,
+) -> Result<FencedRewrite> {
     // A cancellation checkpoint anywhere below unwinds to here as the typed
     // `ClaimLost` signal (ADR-1029 decision 3): the run stops and publishes
     // nothing, which is exactly `PublishOutcome::Abandoned`'s shape and
@@ -242,6 +332,7 @@ pub(crate) async fn rewrite_and_publish_loaded<C: SegmentCodec>(
         inputs,
         conservation,
         start_ns,
+        planned,
     )
     .await
     {
@@ -253,10 +344,10 @@ pub(crate) async fn rewrite_and_publish_loaded<C: SegmentCodec>(
                 checkpoint = at,
                 "compaction run cancelled at a claim checkpoint; nothing published (ADR-1029)"
             );
-            Ok(RewriteOutcome {
+            Ok(FencedRewrite::Ran(RewriteOutcome {
                 parts: 0,
                 publish: PublishOutcome::Abandoned,
-            })
+            }))
         }
         other => other,
     }
@@ -273,7 +364,8 @@ async fn rewrite_and_publish_guarded<C: SegmentCodec>(
     inputs: Vec<crate::read::InputRecord>,
     conservation: impl ConservationPredicate,
     start_ns: i64,
-) -> Result<RewriteOutcome> {
+    planned: Option<&BucketListing>,
+) -> Result<FencedRewrite> {
     // A new run's accounting starts from zero: a tracker left installed in a
     // long-lived config would otherwise carry the previous bucket's peaks
     // into this bucket's emission (serial reuse; concurrent sharing is the
@@ -318,6 +410,17 @@ async fn rewrite_and_publish_guarded<C: SegmentCodec>(
     // `PublishOutcome::Abandoned` is for.
     crate::claim_guard::checkpoint(config, store, crate::claim_guard::Checkpoint::Publish).await?;
 
+    // The second check of the fence (ADR-1029, the 2026-10-03 amendment): a
+    // record set that moved since planning, an erasure rewrite record above all,
+    // means this run's inputs are no longer the bucket's, so it publishes
+    // nothing. The parts already PUT are left as an abandoned run leaves them.
+    if let Some(planned) = planned
+        && let Some(now) =
+            relist_changed(store, bucket, planned, config.request_ledger.as_ref()).await?
+    {
+        return Ok(FencedRewrite::RecordSetChanged(now));
+    }
+
     let publish = publish_record_with_conservation(
         store,
         config,
@@ -356,10 +459,10 @@ async fn rewrite_and_publish_guarded<C: SegmentCodec>(
         );
     }
 
-    Ok(RewriteOutcome {
+    Ok(FencedRewrite::Ran(RewriteOutcome {
         parts: parts.len(),
         publish,
-    })
+    }))
 }
 
 /// The result of a [`migrate_bucket_format`] call. Every variant except
@@ -392,6 +495,13 @@ pub enum MigrateOutcome {
         parts: usize,
         publish: PublishOutcome,
     },
+    /// The bucket's claim was not available (another process holds it, or
+    /// `reason` names the other refusal), so the migration built and published
+    /// nothing (ADR-1029, the 2026-10-03 amendment). A later run retries.
+    SkippedClaimed { reason: ClaimSkipReason },
+    /// The migration took the bucket's claim and lost it before its record PUT,
+    /// and cancelled at `at` with nothing published.
+    Cancelled { at: Checkpoint },
 }
 
 /// EM's compaction-variant caller of the shared primitive: migrate a sealed
@@ -403,7 +513,7 @@ pub enum MigrateOutcome {
 /// [`crate::compact::compact_bucket`] does (seal, tombstone, already-compacted),
 /// reads the L0 commit records, and -- if any records the current writer would
 /// supersede was written below the target format version -- rewrites the whole
-/// live L0 set through [`rewrite_and_publish`] with [`conserve_exact`],
+/// live L0 set through the rewrite primitive with [`conserve_exact`],
 /// producing current-format L1 parts and a superseding record. The old objects
 /// become sweepable exactly like any superseded compaction input.
 ///
@@ -416,6 +526,14 @@ pub enum MigrateOutcome {
 /// The `maintain migrate` driver (resumable cursor, budget, verify-and-
 /// raise-floor) and rewrite-on-touch build on this entry point; the
 /// server/CLI wiring is their scope, not this task's.
+///
+/// A migration publishes a compaction record, so it is fenced against an
+/// erasure rewrite of the same bucket exactly as a compaction is (ADR-1029,
+/// the 2026-10-03 amendment): with a claim participant installed and
+/// coordination on it takes the bucket's claim before it rewrites and holds it
+/// through the record PUT, backing off ([`MigrateOutcome::SkippedClaimed`])
+/// when it cannot, and it re-lists the bucket before that PUT either way,
+/// publishing nothing when the record set changed since its listing.
 pub async fn migrate_bucket_format(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -457,20 +575,8 @@ async fn migrate_bucket_format_scoped(
     }
 
     let listing = list_bucket_with_ledger(store, bucket, config.request_ledger.as_ref()).await?;
-    if listing.tombstone_key.is_some() {
-        return Ok(MigrateOutcome::Tombstoned);
-    }
-    if !listing.compaction_record_keys.is_empty() {
-        return Ok(MigrateOutcome::AlreadyCompacted);
-    }
-    // One bucket serves one record set. A live rewrite record already covers
-    // these inputs with records deliberately removed from its outputs, and a
-    // migration record over the same inputs is not overlap-harmless against
-    // it: a snapshot including both resurrects the erased records
-    // (ADR-0064 decision 3 point 5). The format floor stays unraised for this
-    // bucket until the erasure rewrite's own output is what gets migrated.
-    if !listing.rewrite_record_keys.is_empty() {
-        return Ok(MigrateOutcome::RewritePresent);
+    if let Some(refused) = migrate_listing_gate(&listing) {
+        return Ok(refused);
     }
     if listing.commit_keys.is_empty() {
         return Ok(MigrateOutcome::UpToDate);
@@ -496,39 +602,116 @@ async fn migrate_bucket_format_scoped(
         return Ok(MigrateOutcome::UpToDate);
     }
 
-    let outcome = dispatch_rewrite(
+    // The bucket claim, the same one a compaction or an erasure rewrite of this
+    // bucket takes, held from here through the record PUT. A pass refused it
+    // backs off without building anything.
+    let guard = match claim_bucket(store, config, bucket, "migrate").await? {
+        BucketClaim::Held { guard, .. } => Some(guard),
+        BucketClaim::NotParticipating => None,
+        BucketClaim::Skipped(skip) => {
+            return Ok(MigrateOutcome::SkippedClaimed {
+                reason: skip.reason,
+            });
+        }
+    };
+    let run_config = match guard.as_ref() {
+        Some(guard) => CompactorConfig {
+            claim_guard: Some(guard.clone()),
+            ..config.clone()
+        },
+        None => config.clone(),
+    };
+
+    let fenced = dispatch_rewrite(
         bucket.signal,
         store,
         clock,
-        config,
+        &run_config,
         bucket,
-        &listing.commit_keys,
+        &listing,
         start_ns,
     )
     .await?;
 
-    Ok(MigrateOutcome::Rewritten {
-        parts: outcome.parts,
-        publish: outcome.publish,
+    // As in compaction: a run that lost its claim cancelled and published
+    // nothing; one that still holds it marks it completed, and a failure to
+    // write that forensic marker leaves the claim to age out under its lease.
+    if let Some(guard) = guard {
+        if let Some(at) = guard.cancelled_at().await {
+            return Ok(MigrateOutcome::Cancelled { at });
+        }
+        if let Err(err) = guard.complete(store).await {
+            tracing::warn!(
+                signal = ?bucket.signal,
+                shard = bucket.shard,
+                ingest_hour_bucket = bucket.ingest_hour_bucket,
+                work_id = %guard.work_id_hex(),
+                error = %err,
+                "migration finished, but marking its claim completed failed; \
+                 the claim ages out under its lease (ADR-1029)"
+            );
+        }
+    }
+
+    Ok(match fenced {
+        FencedRewrite::Ran(outcome) => MigrateOutcome::Rewritten {
+            parts: outcome.parts,
+            publish: outcome.publish,
+        },
+        // The pre-publish re-list found a record set this run did not plan
+        // from, so it published nothing: report the gate the new listing
+        // fails, an erasure rewrite record above all.
+        FencedRewrite::RecordSetChanged(now) => {
+            migrate_listing_gate(&now).unwrap_or(MigrateOutcome::Rewritten {
+                parts: 0,
+                publish: PublishOutcome::Abandoned,
+            })
+        }
     })
 }
 
-/// Dispatch [`rewrite_and_publish`] on the bucket's signal to the matching
-/// codec, with the exact-conservation predicate. Mirrors
-/// [`crate::compact::compact_bucket`]'s signal dispatch so the rewrite path
-/// covers the same three signals with the same codecs.
+/// The listing gates a migration applies to the listing it plans from, and
+/// again to its pre-publish re-list: `Some` is the reason the bucket is not
+/// migrated.
+fn migrate_listing_gate(listing: &BucketListing) -> Option<MigrateOutcome> {
+    if listing.tombstone_key.is_some() {
+        return Some(MigrateOutcome::Tombstoned);
+    }
+    if !listing.compaction_record_keys.is_empty() {
+        return Some(MigrateOutcome::AlreadyCompacted);
+    }
+    // One bucket serves one record set. A live rewrite record already covers
+    // these inputs with records deliberately removed from its outputs, and a
+    // migration record over the same inputs is not overlap-harmless against
+    // it: a snapshot including both resurrects the erased records
+    // (ADR-0064 decision 3 point 5). The format floor stays unraised for this
+    // bucket until the erasure rewrite's own output is what gets migrated.
+    if !listing.rewrite_record_keys.is_empty() {
+        return Some(MigrateOutcome::RewritePresent);
+    }
+    None
+}
+
+/// Dispatch the rewrite primitive on the bucket's signal to the matching
+/// codec, with the exact-conservation predicate, over `planned`'s commit
+/// records and with `planned` as the listing its pre-publish re-list compares
+/// against. Mirrors [`crate::compact::compact_bucket`]'s signal dispatch so the
+/// rewrite path covers the same three signals with the same codecs.
+///
+/// The caller owns the request ledger's run scope.
 async fn dispatch_rewrite(
     signal: Signal,
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
     config: &CompactorConfig,
     bucket: &Bucket,
-    commit_keys: &[String],
+    planned: &BucketListing,
     start_ns: i64,
-) -> Result<RewriteOutcome> {
+) -> Result<FencedRewrite> {
+    let commit_keys = &planned.commit_keys;
     match signal {
         Signal::Metrics => {
-            rewrite_and_publish::<RsegCodec>(
+            load_then_rewrite::<RsegCodec>(
                 store,
                 clock,
                 config,
@@ -536,11 +719,12 @@ async fn dispatch_rewrite(
                 commit_keys,
                 conserve_exact(),
                 start_ns,
+                Some(planned),
             )
             .await
         }
         Signal::Logs => {
-            rewrite_and_publish::<RlogCodec>(
+            load_then_rewrite::<RlogCodec>(
                 store,
                 clock,
                 config,
@@ -548,11 +732,12 @@ async fn dispatch_rewrite(
                 commit_keys,
                 conserve_exact(),
                 start_ns,
+                Some(planned),
             )
             .await
         }
         Signal::Spans => {
-            rewrite_and_publish::<SpanCodec>(
+            load_then_rewrite::<SpanCodec>(
                 store,
                 clock,
                 config,
@@ -560,6 +745,7 @@ async fn dispatch_rewrite(
                 commit_keys,
                 conserve_exact(),
                 start_ns,
+                Some(planned),
             )
             .await
         }

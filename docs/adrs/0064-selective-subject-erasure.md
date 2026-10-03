@@ -266,7 +266,8 @@ and sweep in `crates/ravel-maintain`), driven per tenant by the same loop:
    later rewrite pass over that bucket then fails on multiple live records
    and the pending request's marker is never removed. That window is closed
    only by a compare-and-swap or an explicit claim on the bucket, and this
-   change does not close it.
+   change does not close it (closed since: see the compaction-fence
+   amendment below).
 6. **Physical removal**: the rewrite's inputs become superseded inputs to
    the existing sweep (`sweep_superseded`), deleted after
    `protection_horizon`, under the same `LegalHoldCheck` gate as every
@@ -872,3 +873,23 @@ behaviour, including the same correction for a scoped per-object retention
 on commit records and the catalog keyspace, whose locked version's
 retain-until they write `R`.
 
+## Amendment (2026-10-03, #2199): the compaction-fence amendment
+
+<!-- amendment-applies: sections="3. The rewrite pass: physical erasure by rewrite-and-supersede" pointer="compaction-fence amendment" -->
+
+Decision 3 point 5 left one window open: a compaction that lists a bucket
+before an erasure rewrite of it publishes can still publish afterwards,
+because the two records have different keys and neither pass sees the
+other's record before it commits. ADR-1029's 2026-10-03 amendment closes it
+with an explicit claim, the remedy point 5 names. Every pass that publishes
+a compaction record or an erasure rewrite record of a bucket (the
+supervisor's compaction and erasure passes, `ravel-cli maintain
+compact-bucket`, `compact-tenant` and `migrate`) takes that bucket's
+compaction claim before it builds and holds it through its record PUT, and
+re-lists the bucket's records just before publishing, publishing nothing if
+the set it planned from changed. A pass refused the claim backs off; an
+erasure rewrite that backs off is deferred, so its request's `.done` is not
+written and the query-time filter keeps applying. Callers that take no claim
+(`--no-claim`, `coordination = off`) keep only the re-list, and a claimed
+owner that stalls past its lease between its re-list and its PUT is caught by
+neither; ADR-1029's amendment states both windows.

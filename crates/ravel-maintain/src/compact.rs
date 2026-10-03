@@ -4,12 +4,11 @@
 //! content-addressed part keys and converges at the record's
 //! `CreateIfAbsent`.
 
-use ravel_fleet::claim::ClaimConfig;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::Signal;
 
 use crate::bucket::Bucket;
-use crate::claim_guard::{Acquire, Checkpoint, ClaimGuard, ClaimSkip};
+use crate::claim_guard::{BucketClaim, Checkpoint, ClaimSkip, claim_bucket};
 use crate::clock::Clock;
 use crate::codec::{RsegCodec, SegmentCodec};
 use crate::config::CompactorConfig;
@@ -17,6 +16,7 @@ use crate::error::{MaintainError, Result};
 use crate::publish::{PublishOutcome, conserve_exact};
 use crate::read;
 use crate::read::list_bucket_with_ledger;
+use crate::rewrite::FencedRewrite;
 use crate::rlog::RlogCodec;
 use crate::rspan_codec::SpanCodec;
 
@@ -60,14 +60,14 @@ pub enum CompactionOutcome {
 /// must not count either.
 #[derive(Debug)]
 pub enum ClaimedCompaction {
-    /// The pipeline ran: claimed, or unclaimed because coordination is off,
-    /// the bucket is below the cost gate, or no [`ClaimParticipant`] is
-    /// installed. Identical in every respect to what [`compact_bucket`]
-    /// returns.
+    /// The pipeline ran: claimed, or unclaimed because coordination is off or
+    /// no [`ClaimParticipant`] is installed. Identical in every respect to what
+    /// [`compact_bucket`] returns.
     ///
     /// [`ClaimParticipant`]: crate::config::ClaimParticipant
     Ran(CompactionOutcome),
-    /// Another attempt holds a live claim on this bucket. Nothing was read
+    /// Another attempt holds a live claim on this bucket (a compaction or an
+    /// erasure rewrite), or the claim object is unreadable. Nothing was read
     /// beyond the bucket listing and the input commit records, nothing was
     /// merged, and nothing was published. [`ClaimSkip::reschedule_after_unix_ms`]
     /// is the earliest this bucket should be tried again; polling before it is
@@ -95,9 +95,11 @@ impl ClaimedCompaction {
     }
 }
 
-/// Compact one sealed bucket end to end, taking no advisory claim. Safe to call
+/// Compact one sealed bucket end to end, taking no claim. Safe to call
 /// concurrently with other compactors over the same bucket: the record's
-/// `CreateIfAbsent` picks a single winner and losers converge.
+/// `CreateIfAbsent` picks a single winner and losers converge. Against an
+/// erasure rewrite of the same bucket its only fence is the pre-publish
+/// re-list, since it takes no claim (ADR-1029, the 2026-10-03 amendment).
 ///
 /// This entry point never claims, whatever [`CompactorConfig::coordination`]
 /// says: the coordinated entry point is [`compact_bucket_claimed`], which the
@@ -125,17 +127,18 @@ pub async fn compact_bucket(
 /// [`compact_bucket`] with the advisory claim protocol engaged (ADR-1029
 /// decisions 3 to 5).
 ///
-/// The claim is taken once the bucket has passed every gate and its input set
-/// is known to be worth claiming, and released (marked completed) when the run
+/// The claim is taken once the bucket has passed every gate, whatever its
+/// size, and released (marked completed) when the run
 /// finishes. Between those points the merge consults it at the five
 /// cancellation checkpoints, so a claim lost to a steal stops the run at the
 /// next quiescent point instead of paying out the whole merge.
 ///
-/// A bucket runs UNCLAIMED, through this same pipeline, when any of three
-/// things holds: no [`crate::config::ClaimParticipant`] is installed,
-/// [`CompactorConfig::coordination`] is off, or the input set is below
-/// [`CompactorConfig::claim_min_input_bytes`]. That is what keeps the unclaimed
-/// path exercised by ordinary tests rather than left as a dead branch.
+/// A bucket runs UNCLAIMED, through this same pipeline, only when no
+/// [`crate::config::ClaimParticipant`] is installed or
+/// [`CompactorConfig::coordination`] is off. A participating run claims every
+/// bucket whatever its size: the claim fences this publish against an erasure
+/// rewrite of the same bucket (ADR-1029, the 2026-10-03 amendment), and a run
+/// refused it, including by an unreadable claim object, backs off.
 pub async fn compact_bucket_claimed(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -162,9 +165,9 @@ pub(crate) async fn compact_bucket_claimed_with_acquisition(
     drive(store, clock, config, bucket, Coordinate::Yes).await
 }
 
-/// Whether this run may take an advisory claim at all. `No` is the legacy
-/// [`compact_bucket`] entry point; `Yes` still claims only when the
-/// participant, the coordination setting and the cost gate all allow it.
+/// Whether this run may take a claim at all. `No` is the legacy
+/// [`compact_bucket`] entry point; `Yes` still claims only when a participant
+/// is installed and coordination is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Coordinate {
     Yes,
@@ -218,25 +221,8 @@ async fn compact_bucket_scoped(
     }
 
     let listing = list_bucket_with_ledger(store, bucket, config.request_ledger.as_ref()).await?;
-    if listing.tombstone_key.is_some() {
-        return Ok((ClaimedCompaction::Ran(CompactionOutcome::Tombstoned), None));
-    }
-    if !listing.compaction_record_keys.is_empty() {
-        return Ok((
-            ClaimedCompaction::Ran(CompactionOutcome::AlreadyCompacted),
-            None,
-        ));
-    }
-    // One bucket serves one record set. A live rewrite record already covers
-    // these inputs with records deliberately removed from its outputs, and a
-    // compaction record over the same inputs is not overlap-harmless against
-    // it: a snapshot including both resurrects the erased records
-    // (ADR-0064 decision 3 point 5). Refuse rather than publish the second set.
-    if !listing.rewrite_record_keys.is_empty() {
-        return Ok((
-            ClaimedCompaction::Ran(CompactionOutcome::RewritePresent),
-            None,
-        ));
+    if let Some(refused) = listing_gate(&listing) {
+        return Ok((ClaimedCompaction::Ran(refused), None));
     }
     if listing.commit_keys.len() < config.min_compaction_inputs {
         return Ok((
@@ -247,13 +233,9 @@ async fn compact_bucket_scoped(
         ));
     }
 
-    // The input set, read once for the whole run: the merge needs it, and so
-    // does the claim's cost gate, which is priced on the inputs' stored bytes.
-    // Those bytes live in the commit records, not in the bucket listing (which
-    // lists the records themselves, not the `l0/` objects they name), so the
-    // claim is taken here rather than before this read: after every gate and
-    // before every read whose cost scales with the bucket (catalogs, blocks)
-    // and before every PUT.
+    // The input set, read once for the whole run. The claim is taken after
+    // this read and before every read whose cost scales with the bucket
+    // (catalogs, blocks) and every PUT.
     let inputs = crate::read::load_inputs_with_ledger(
         store,
         bucket,
@@ -264,14 +246,15 @@ async fn compact_bucket_scoped(
     .await?;
 
     // Cancellation checkpoint 1 (ADR-1029 decision 3), which is also where the
-    // claim is acquired: a bucket that is not worth claiming runs on through
-    // the identical pipeline with no guard installed.
-    let (guard, acquisition) =
-        match acquire_claim(store, config, bucket, &inputs, coordinate).await? {
-            Claimed::Skipped(skip) => return Ok((ClaimedCompaction::SkippedClaimed(skip), None)),
-            Claimed::Unclaimed => (None, None),
-            Claimed::Held { guard, stolen } => (Some(guard), Some(ClaimAcquisition { stolen })),
-        };
+    // claim is acquired. A participating run claims every bucket whatever its
+    // size, because the claim fences this publish against an erasure rewrite of
+    // the same bucket (the 2026-10-03 amendment); one refused the claim backs
+    // off without building anything.
+    let (guard, acquisition) = match acquire_claim(store, config, bucket, coordinate).await? {
+        BucketClaim::Skipped(skip) => return Ok((ClaimedCompaction::SkippedClaimed(skip), None)),
+        BucketClaim::NotParticipating => (None, None),
+        BucketClaim::Held { guard, stolen } => (Some(guard), Some(ClaimAcquisition { stolen })),
+    };
     // The guard rides on this run's OWN config clone, never on the caller's:
     // two buckets compacted concurrently under one base config each get their
     // own, so a checkpoint can only ever renew its own bucket's claim.
@@ -288,15 +271,19 @@ async fn compact_bucket_scoped(
     // only signal-specific part: dispatch it to the codec for this bucket's
     // signal and run the identical shared pipeline (canonical ordering,
     // input_set_hash, publish) around it (ADR-0032).
+    let planned = &listing;
     let outcome = match bucket.signal {
         Signal::Metrics => {
-            run_pipeline::<RsegCodec>(store, clock, &run_config, bucket, inputs, start_ns).await
+            run_pipeline::<RsegCodec>(store, clock, &run_config, bucket, inputs, start_ns, planned)
+                .await
         }
         Signal::Logs => {
-            run_pipeline::<RlogCodec>(store, clock, &run_config, bucket, inputs, start_ns).await
+            run_pipeline::<RlogCodec>(store, clock, &run_config, bucket, inputs, start_ns, planned)
+                .await
         }
         Signal::Spans => {
-            run_pipeline::<SpanCodec>(store, clock, &run_config, bucket, inputs, start_ns).await
+            run_pipeline::<SpanCodec>(store, clock, &run_config, bucket, inputs, start_ns, planned)
+                .await
         }
         // Query-audit records ride RLOG (see `query_audit`), so they compact
         // through the same RLOG codec as logs -- the machinery is reused, only
@@ -308,7 +295,8 @@ async fn compact_bucket_scoped(
         // silently drop every hold from the fold. Only the query-audit shard
         // gains compaction here.
         Signal::Audit if bucket.shard == crate::query_audit::QUERY_AUDIT_SHARD => {
-            run_pipeline::<RlogCodec>(store, clock, &run_config, bucket, inputs, start_ns).await
+            run_pipeline::<RlogCodec>(store, clock, &run_config, bucket, inputs, start_ns, planned)
+                .await
         }
         Signal::Audit => Err(MaintainError::Invariant(format!(
             "audit compaction is only implemented for the query-audit shard \
@@ -323,10 +311,11 @@ async fn compact_bucket_scoped(
 
     // A run that lost its claim cancelled at a checkpoint and published
     // nothing; only a run that still holds its claim marks it completed
-    // (ADR-1029 decision 1 step 6). The marker is forensic: the published
-    // compaction record is the only completion marker that decides anything,
-    // so a failure to write the marker is logged and the pipeline's outcome
-    // stands. The claim then ages out under its lease.
+    // (ADR-1029 decision 1 step 6), including one the pre-publish re-list
+    // stopped. The marker is forensic: the published record is the only
+    // completion marker that decides anything, so a failure to write the
+    // marker is logged and the pipeline's outcome stands. The claim then ages
+    // out under its lease.
     if let Some(guard) = guard {
         if let Some(at) = guard.cancelled_at().await {
             return Ok((ClaimedCompaction::Cancelled { at, outcome }, acquisition));
@@ -357,89 +346,44 @@ pub struct ClaimAcquisition {
     pub stolen: bool,
 }
 
-/// What the claim decision at checkpoint 1 produced.
-enum Claimed {
-    /// This run holds the bucket's claim for its duration.
-    Held {
-        guard: ClaimGuard,
-        /// Whether this claim was taken over from an expired holder rather
-        /// than created fresh.
-        stolen: bool,
-    },
-    /// No claim was taken: coordination is off, no participant is installed,
-    /// the caller is the unclaimed [`compact_bucket`] entry point, the bucket
-    /// is below the cost gate, or the bucket's claim object is unreadable and
-    /// older than one lease plus jitter ([`Acquire::Unclaimed`]). The run
-    /// proceeds exactly as it did before claims existed.
-    Unclaimed,
-    /// Another attempt holds the claim; this run does nothing at all.
-    Skipped(ClaimSkip),
-}
-
-/// Take this bucket's advisory claim, if this run should take one at all
-/// (ADR-1029 decisions 4 and 5).
+/// Take this bucket's claim, if this run takes claims at all (ADR-1029
+/// decision 5 and the 2026-10-03 amendment).
 ///
-/// The cost gate is the inputs' summed stored bytes (`object_size` on each
-/// commit record: the `l0/` object it names, not the record itself). Below
-/// `claim_min_input_bytes` a duplicated merge is cheaper than the PUT-class
-/// claim traffic that would prevent it, so the bucket runs unclaimed.
+/// The legacy [`compact_bucket`] entry point takes none, and neither does a
+/// caller with no participant installed or coordination off; those runs are
+/// fenced against an erasure rewrite by the pre-publish re-list alone. Every
+/// other run claims, whatever the bucket's size.
 async fn acquire_claim(
     store: &dyn ObjectStoreBackend,
     config: &CompactorConfig,
     bucket: &Bucket,
-    inputs: &[crate::read::InputRecord],
     coordinate: Coordinate,
-) -> Result<Claimed> {
+) -> Result<BucketClaim> {
     if coordinate == Coordinate::No {
-        return Ok(Claimed::Unclaimed);
+        return Ok(BucketClaim::NotParticipating);
     }
-    let input_bytes = inputs
-        .iter()
-        .fold(0u64, |acc, i| acc.saturating_add(i.record.object_size));
-    if !crate::claim_guard::claims_bucket(config, input_bytes) {
-        return Ok(Claimed::Unclaimed);
-    }
-    let Some(participant) = config.claim_participant.as_ref() else {
-        return Ok(Claimed::Unclaimed);
-    };
-    // Claim writes ignore `dry_run`. Both callers that install a participant,
-    // the supervisor tick and ravel-cli's compact-bucket/compact-tenant, keep
-    // `claim_participant` unset on a dry run, so the two never meet; on the CLI
-    // side that is `install_claims`'s own `dry_run` check. The claim's
-    // `input_set_hash` forensics field stays empty: the hash is computed
-    // later, inside the rewrite, and the claim identity deliberately excludes
-    // it (ADR-1029 rejected alternative 3).
+    claim_bucket(store, config, bucket, "compaction").await
+}
 
-    let guard = ClaimGuard::new(
-        bucket,
-        participant,
-        ClaimConfig {
-            lease_duration: config.claim_lease_duration,
-            ..ClaimConfig::default()
-        },
-        config.request_ledger.clone(),
-    );
-    match guard.acquire(store).await? {
-        Acquire::Acquired => {
-            let stolen = guard.stolen().await;
-            Ok(Claimed::Held { guard, stolen })
-        }
-        // A stale unreadable claim: the guard already warned with its key.
-        Acquire::Unclaimed { .. } => Ok(Claimed::Unclaimed),
-        Acquire::Skipped(skip) => {
-            tracing::info!(
-                signal = ?bucket.signal,
-                shard = bucket.shard,
-                ingest_hour_bucket = bucket.ingest_hour_bucket,
-                work_id = %skip.work_id_hex,
-                reason = skip.reason.name(),
-                holder = ?skip.holder_process_id,
-                reschedule_after_unix_ms = skip.reschedule_after_unix_ms,
-                "compaction skipped: another attempt holds this bucket's claim (ADR-1029)"
-            );
-            Ok(Claimed::Skipped(skip))
-        }
+/// The listing gates a compaction applies to the listing it plans from, and
+/// again to its pre-publish re-list: `Some` is the reason the bucket is not
+/// compacted.
+fn listing_gate(listing: &BucketListing) -> Option<CompactionOutcome> {
+    if listing.tombstone_key.is_some() {
+        return Some(CompactionOutcome::Tombstoned);
     }
+    if !listing.compaction_record_keys.is_empty() {
+        return Some(CompactionOutcome::AlreadyCompacted);
+    }
+    // One bucket serves one record set. A live rewrite record already covers
+    // these inputs with records deliberately removed from its outputs, and a
+    // compaction record over the same inputs is not overlap-harmless against
+    // it: a snapshot including both resurrects the erased records
+    // (ADR-0064 decision 3 point 5). Refuse rather than publish the second set.
+    if !listing.rewrite_record_keys.is_empty() {
+        return Some(CompactionOutcome::RewritePresent);
+    }
+    None
 }
 
 /// The signal-generic plan-build-publish pipeline, parameterized over the
@@ -450,6 +394,12 @@ async fn acquire_claim(
 /// codec, streams the merge into size-capped parts through the codec, and
 /// publishes the record with [`conserve_exact`]. Only the two `C::` calls know
 /// the on-object format; everything else is identical for every signal.
+///
+/// `planned` is the listing the run planned from. When the pre-publish re-list
+/// finds a different record set, the run publishes nothing and reports the
+/// gate the new listing fails (an erasure rewrite record that landed meanwhile
+/// is [`CompactionOutcome::RewritePresent`]), or an abandoned publish when it
+/// fails none.
 async fn run_pipeline<C: SegmentCodec>(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -457,8 +407,9 @@ async fn run_pipeline<C: SegmentCodec>(
     bucket: &Bucket,
     inputs: Vec<crate::read::InputRecord>,
     start_ns: i64,
+    planned: &BucketListing,
 ) -> Result<CompactionOutcome> {
-    let outcome = crate::rewrite::rewrite_and_publish_loaded::<C>(
+    let fenced = crate::rewrite::rewrite_and_publish_loaded::<C>(
         store,
         clock,
         config,
@@ -466,12 +417,21 @@ async fn run_pipeline<C: SegmentCodec>(
         inputs,
         conserve_exact(),
         start_ns,
+        Some(planned),
     )
     .await?;
 
-    Ok(CompactionOutcome::Compacted {
-        parts: outcome.parts,
-        publish: outcome.publish,
+    Ok(match fenced {
+        FencedRewrite::Ran(outcome) => CompactionOutcome::Compacted {
+            parts: outcome.parts,
+            publish: outcome.publish,
+        },
+        FencedRewrite::RecordSetChanged(now) => {
+            listing_gate(&now).unwrap_or(CompactionOutcome::Compacted {
+                parts: 0,
+                publish: PublishOutcome::Abandoned,
+            })
+        }
     })
 }
 

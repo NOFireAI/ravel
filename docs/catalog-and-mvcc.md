@@ -130,11 +130,17 @@ drivers call it: the background maintenance supervisor's compaction tick, and
 `ravel-cli maintain compact-bucket` / `compact-tenant`. Both reach it through
 `ravel_maintain::compact_bucket_claimed`, so an operator's run and a supervisor
 no longer both pay for merging the same sealed bucket. One small mutable object
-per unit of expensive merge work is what stops that double payment. Claiming is
-skipped, and the bucket merged unclaimed, when the input set is below
-`claim_min_input_bytes` (64 MiB by default), when coordination is switched off,
-or when the driver installs no participant at all, which is what
-`ravel-cli`'s `--dry-run` and `--no-claim` do. `work_id` is
+per unit of expensive merge work is what stops that double payment. The erasure
+rewrite of a bucket (`ravel_maintain::erasure_rewrite_bucket`) and a format
+migration of it (`ravel_maintain::migrate_bucket_format`, which `ravel-cli
+maintain migrate` drives and which publishes a compaction record) take the same
+claim under the same `work_id`, and every one of these passes holds it through
+its record PUT and re-lists the bucket just before that PUT, publishing nothing
+if its record set changed, so none publishes over another (ADR-1029's
+2026-10-03 amendment). Claiming is skipped, and the bucket processed unclaimed, only when
+coordination is switched off or when the driver installs no participant at all,
+which is what `ravel-cli`'s `--dry-run` and `--no-claim` do; the re-list still
+runs, and `claim_min_input_bytes` no longer decides anything. `work_id` is
 `blake3::derive_key("ravel-compaction-claim-v1", tenant_hash || signal ||
 shard || ingest_hour_bucket)`, hex-encoded, where `tenant_hash` is the raw 16
 bytes, `signal` is the one-byte signal key prefix (`l`, `m`, `s`, ...), and
@@ -165,18 +171,25 @@ objects PROGRAMMATICALLY: an unconditional DELETE by a worker whose claim was
 already stolen would destroy the newer owner's claim, so completion is a CAS
 state flip and reclamation is lifecycle aging. A claim whose payload no longer
 decodes is observed with the fallback lease and never stolen (never overwrite
-what you cannot read); if one ever wedges a bucket past its expiry, the
-OPERATOR repair is a plain manual delete of that one key, which is safe here
-precisely because the claim is advisory: the worst possible cost of deleting
-any claim is one duplicated merge. Like the heartbeat and the memo it must sit
+what you cannot read), and it holds its bucket against both the compaction and
+the erasure rewrite until an OPERATOR deletes that one key by hand: a pass that
+ran past it would publish unfenced. Delete it only once no compaction, migration
+or erasure rewrite of that bucket is running. Like the heartbeat and the memo it must sit
 outside any WORM-protected prefix, since it is mutated in place.
 
-The claim is **advisory and reconstructible**: it confers zero publication
-rights and its absence removes none, the publish path never reads it, and losing
-or corrupting one costs at most a duplicated merge -- work, never correctness.
-Racing compactions still serialize at the compaction record's `CreateIfAbsent`
-and at content-addressed part keys exactly as they did before this prefix
-existed, which is what keeps "no correctness-critical distributed locks" true.
+Between two compactions the claim is **advisory and reconstructible**: it
+gives neither publication rights over the other, the record publish
+(`publish.rs`) never reads it, and losing or corrupting one costs at most a
+duplicated merge. Racing compactions still serialize at the compaction record's
+`CreateIfAbsent` and at content-addressed part keys exactly as they did before
+this prefix existed. Between a compaction (or a migration) and an erasure
+rewrite of the same bucket it is a fence, as the paragraph above describes:
+their records have different keys, so no `CreateIfAbsent` serializes them, and
+a participating pass publishes only while it holds the claim, with the
+pre-publish re-list behind it. Each pass checks that before its own PUT; the
+store enforces no lock, and a pass that takes no claim (coordination off, or
+`--no-claim`) is fenced by the re-list alone, which leaves a short window
+between that re-list and its PUT.
 This is a claim, deliberately **not** a lease (`LeaseCheck` is the unrelated GC
 reader-protection gate) and **not** membership (that is the
 `sys/maintain/workers/` prefix above).

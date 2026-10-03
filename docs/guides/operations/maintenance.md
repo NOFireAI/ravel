@@ -431,14 +431,12 @@ a `performance default resolved` line with
 ### Running compact-tenant beside a live cluster
 
 The background supervisor and a `compact-bucket` or `compact-tenant` run can
-reach the same sealed bucket at the same time. Both ask for an advisory
-compaction claim first, and the one refused the claim does not merge. The CLI
-asks for a claim on every bucket with at least 64 MiB of input before merging
-it, one claim per bucket at any `--bucket-concurrency`, all under one process
-id per invocation. The report header prints that id on its `claims:` line, and
-it is the holder a supervisor names when it skips a bucket the CLI holds. A
-smaller bucket is merged unclaimed, because duplicating a small merge costs
-less than the claim requests that would prevent it.
+reach the same sealed bucket at the same time. Both ask for the bucket's claim
+first, and the one refused the claim does not merge. The CLI asks for a claim
+on every bucket before merging it, whatever its size, one claim per bucket at
+any `--bucket-concurrency`, all under one process id per invocation. The report
+header prints that id on its `claims:` line, and it is the holder a supervisor
+names when it skips a bucket the CLI holds.
 
 A bucket refused its claim is not merged. It prints `outcome=ClaimSkipped`
 with the reason, the claim's `work_id` (the last segment of its key,
@@ -468,29 +466,43 @@ reports the bucket as already compacted. The four reasons are:
   lease, so the retry point is a full lease from the moment of the loss.
 - `unreadable_claim`: the claim object does not decode, so it is never stolen
   (never overwrite what you cannot read) and never deleted programmatically.
-  The retry point is one lease plus this run's own deterministic jitter past
-  the claim's `last_modified`, which is the instant a run is allowed to proceed
-  unclaimed. The lease used is the observer's configured one, since an
-  unreadable payload declares none.
-  If a bucket stays wedged past that, the operator repair is a plain
-  manual delete of that one key; it is safe because the claim is advisory and
-  the worst cost of deleting any claim is one duplicated merge.
+  The bucket stays held, for compaction and for erasure alike, until an
+  operator removes the claim object: a run that went ahead without the claim
+  could publish a compaction built from data an erasure of the same bucket has
+  already removed. Retrying does not clear it: every retry reports the same
+  reason. You can tell it from a live holder because the holder prints as
+  `unknown` and the reason stays `unreadable_claim` on every retry, and once
+  the object is older than one lease the run logs a warning naming the claim's
+  key. Remove that one key by hand, and only once no compaction, migration or
+  erasure of that bucket is running. A claim written by a newer release in a
+  format this release cannot read looks the same, so rolling back across such
+  a release leaves every bucket the newer release claimed held this way.
 - `vanished_twice`: the claim key disappeared between the create and the read
   that followed it, twice in a row. Nothing is held, so the printed expiry is
   `0` and the retry point is immediate.
 
 `--dry-run` takes no claims. `--no-claim` takes none either, for repair work
-when a claim is in the way. It is safe for correctness, because the compaction
-record's create-if-absent still decides which output is published, but the
-merge may duplicate one another maintainer is running.
+when a claim is in the way. Between two compactions that is safe, because the
+compaction record's create-if-absent still decides which output is published,
+though the merge may duplicate one another maintainer is running. Against an
+erasure of the same bucket the only check left is the re-list each run makes
+just before it publishes, which leaves a short window, so avoid `--no-claim`
+while an erasure request for the tenant is pending. `maintain migrate` takes
+the same claims, prints the same `claims:` line, and accepts the same
+`--no-claim`.
 
 ### Compaction claim metrics
 
-Claims are advisory only: correctness rests entirely on content-addressed
-parts and the compaction record's `CreateIfAbsent`, and a claim bug can only
-waste work, never corrupt data. Both the background
-supervisor's per-unit tick and `ravel-cli maintain compact-bucket` /
-`compact-tenant` take claims; `--no-claim` on the CLI and
+Between two compactions a claim only saves work: they still converge on one
+compaction record through its `CreateIfAbsent` and content-addressed parts, so
+there a claim bug can only waste work. Between a compaction and an erasure of
+the same bucket the claim is also what keeps them apart: their records have
+different keys, so the create-if-absent does not, and a compaction that
+published after the erasure would serve the erased data again. The claim and
+the re-list before each publish are what stop that, so a claim bug there can
+delay an erasure, and with the re-list's short window it is no longer only a
+matter of wasted work. Both the background supervisor's per-unit tick and
+`ravel-cli maintain compact-bucket` / `compact-tenant` / `migrate` take claims; `--no-claim` on the CLI and
 `--maintain-claims off` on the server (below) are the two ways to opt a run
 out.
 
@@ -518,7 +530,8 @@ in its walk summary, and never moves these counters.
   leaves its claim in place. The same process takes it back on its next pass
   and compacts the bucket; any other process waits for the claim to expire.
 - `ravel_maintain_claims_skipped_total` -- bucket evaluations that did not
-  compact because of a claim: most often an unexpired claim held the bucket,
+  compact, or erasure rewrites that published nothing, because they could not
+  take the bucket's claim: most often an unexpired claim held the bucket,
   but also a lost steal race, a claim that could not be read, or one that
   vanished twice (something outside the protocol is deleting claims). A held
   bucket adds one per maintenance pass until the claim expires. The pass
@@ -538,21 +551,24 @@ deployment's merges: raise `--maintain-claim-lease`. A steal is the other
 side of that event, but it also follows every crash and restart, so a steal
 rate alone over-alerts.
 
-Three flags configure claiming:
+Two flags configure claiming, and a third no longer has any effect:
 
 - `--maintain-claim-lease <DURATION>` (default `300s`): how long a claim stays
   live without a renewal. A lease below twice the time to encode and PUT the
   largest L1 segment at a conservative rate logs a startup warning, not a
   refusal; zero is refused outright.
-- `--maintain-claim-min-input-bytes <BYTES>` (default 64 MiB): the cost gate.
-  A bucket below this many listed L0 input bytes runs unclaimed, because a
-  duplicated small merge costs less than the claim traffic that would prevent
-  it. Zero is refused: it would claim every bucket regardless of size.
+- `--maintain-claim-min-input-bytes <BYTES>` (default 64 MiB): has no effect
+  and will be removed. With claims on, every bucket is claimed whatever its
+  size, because the claim also keeps a compaction and an erasure rewrite of
+  the same bucket from publishing over each other. The flag is still accepted
+  so existing deployments start unchanged; zero is still refused.
 - `--maintain-claims on|off` (default `on`): the fleet-wide escape hatch.
   `off` disables claiming everywhere on that process, for a store whose
-  qualification record predates the CAS probes, or for an emergency; claims
-  stay advisory either way, so racing runs still converge at the compaction
-  record and the loser just pays its merge first.
+  qualification record predates the CAS probes, or for an emergency. Two
+  racing compactions still converge at the compaction record and the loser
+  just pays its merge first, but with claims off a compaction and an erasure
+  rewrite of the same bucket are kept apart only by the re-list each runs
+  just before it publishes, which leaves a short window.
 
 ## Garbage collection and retention
 

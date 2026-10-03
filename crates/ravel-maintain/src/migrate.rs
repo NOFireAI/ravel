@@ -1390,9 +1390,13 @@ pub async fn migrate_family(
                         // bucket, so it refuses a bucket that already carries
                         // compaction or rewrite records. Two different things
                         // reach this arm and only one of them is permanent:
-                        // a concurrent compaction or erasure landed between our
-                        // listing and the call, which is harmless and converges
-                        // on a later run; or the bucket holds overlapping
+                        // a concurrent compaction or erasure rewrite published
+                        // between our listing and the call's own listing or its
+                        // pre-publish re-list, and the migration published
+                        // nothing (the bucket claim and that re-list are what
+                        // stop a compaction record built from unerased inputs
+                        // landing beside an erasure rewrite record, which would
+                        // serve the erased rows again); or the bucket holds overlapping
                         // compaction records whose loser-only inputs are still
                         // served raw and below the target, which no rewrite can
                         // migrate, because a new record over those inputs joins
@@ -1421,6 +1425,13 @@ pub async fn migrate_family(
                         MigrateOutcome::NotSealed
                         | MigrateOutcome::Tombstoned
                         | MigrateOutcome::UpToDate => {}
+                        // Another pass held the bucket's claim, or this one lost
+                        // it: nothing was published and the bucket is not
+                        // migrated. The fresh re-audit still counts its
+                        // below-target records, so the floor stays unraised
+                        // until a later invocation migrates it.
+                        MigrateOutcome::SkippedClaimed { .. }
+                        | MigrateOutcome::Cancelled { .. } => {}
                     }
                 }
             }
