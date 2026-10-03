@@ -19,8 +19,8 @@
 
 use ravel_commit::keys::{
     commit_key, commit_shard_hour_prefix, commit_shard_prefix, compaction_record_key, data_key,
-    del_prefix, erasure_completion_key, erasure_request_key, l1_part_key, maint_cursor_key,
-    retention_tombstone_key, rewrite_record_key,
+    del_prefix, erasure_completion_key, erasure_request_key, ingest_hour_string, l1_part_key,
+    maint_cursor_key, retention_tombstone_key, rewrite_record_key,
 };
 use ravel_fleet::claim::COMPACTION_CLAIMS_PREFIX;
 use ravel_fleet::query_workers::{QUERY_WORKERS_PREFIX, query_worker_key};
@@ -2252,7 +2252,9 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/*/admission/*",
             "t/*/catalog/*/*",
             // GatewayListBootstrapKeys and GatewayListTenantBootstrapKeys
-            // (bootstrap_list_grants_carry_exactly_the_expected_conditions).
+            // (bootstrap_list_grants_carry_exactly_the_expected_conditions);
+            // the last two are the keyed-ingest marker probe
+            // (gateway_template_reads_the_idempotency_marker_by_exact_key).
             "sys/tenancy",
             "sys/qualification",
             "sys/gc",
@@ -2263,6 +2265,8 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             PROV_M_PATTERN,
             PROV_L_PATTERN,
             PROV_S_PATTERN,
+            IDEM_MARKER_L_PATTERN,
+            IDEM_MARKER_S_PATTERN,
         ],
         list_actions: &["s3:ListBucket", "s3:ListBucket", "s3:ListBucket"],
         gets: &[
@@ -5984,6 +5988,219 @@ fn a_prov_grant_widened_to_any_signal_reaches_the_lookalikes() {
         })
         .collect();
     assert_eq!(reached, prov_lookalike_keys());
+}
+
+/// The signals whose ingest path looks up an idempotency marker:
+/// `services/ravel-server/src/logs_ingest.rs` (logs) and `traces_ingest.rs`
+/// (spans). Metrics ingest has no marker; it dedups by `(series_id, ts)`.
+const IDEM_SIGNALS: [Signal; 2] = [Signal::Logs, Signal::Spans];
+
+/// Mirrored from `crates/ravel-ingest/src/idempotency.rs` (`KEYHASH_DOMAIN`,
+/// `IDEM_DIR`, `MARKER_SUFFIX`), which this crate cannot depend on:
+/// `ravel-ingest` depends on `ravel-commit`.
+const IDEM_KEYHASH_DOMAIN: &[u8] = b"ravel-idem-v1";
+const IDEM_DIR: &str = "idem";
+const IDEM_MARKER_SUFFIX: &str = "idm";
+
+/// The `s3:prefix` patterns `GatewayListTenantBootstrapKeys` carries for the
+/// marker probe, one per signal in `IDEM_SIGNALS`: the tenant hash and the
+/// keyhash each spelled as 32 single-character wildcards and the ingest hour
+/// as eight and two around its literal `T`, so each admits one marker key
+/// shape and no listing of the `idem/` directory or of one key's markers
+/// across hours. On AWS S3 this grant is what turns the probe of an absent
+/// marker into a 404, which `read_marker` reads as a miss, instead of a 403.
+const IDEM_MARKER_L_PATTERN: &str = "t/????????????????????????????????/l/idem/\
+                                     ????????????????????????????????.????????T??.idm";
+const IDEM_MARKER_S_PATTERN: &str = "t/????????????????????????????????/s/idem/\
+                                     ????????????????????????????????.????????T??.idm";
+
+/// `keyhash32` in `idempotency.rs`:
+/// `hex(blake3("ravel-idem-v1" || tenant_id || client_key)[0..16])`.
+fn idem_keyhash32(tenant_id: &str, client_key: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(IDEM_KEYHASH_DOMAIN);
+    hasher.update(tenant_id.as_bytes());
+    hasher.update(client_key);
+    hex::encode(&hasher.finalize().as_bytes()[..16])
+}
+
+/// `marker_key` in `idempotency.rs` with the tenant segment given as hex:
+/// `t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm`.
+fn idem_marker_key_under(
+    tenant_hex: &str,
+    signal: Signal,
+    keyhash: &str,
+    ingest_hour_bucket: u32,
+) -> String {
+    format!(
+        "t/{tenant_hex}/{}/{IDEM_DIR}/{keyhash}.{}.{IDEM_MARKER_SUFFIX}",
+        signal.key_prefix(),
+        ingest_hour_string(ingest_hour_bucket),
+    )
+}
+
+/// `marker_key` in `idempotency.rs`, the key `read_marker` GETs once per hour
+/// of the dedup window.
+fn idem_marker_key(
+    tenant_id: &str,
+    signal: Signal,
+    client_key: &[u8],
+    ingest_hour_bucket: u32,
+) -> String {
+    idem_marker_key_under(
+        &ravel_types::TenantId::new(tenant_id).hash().to_hex(),
+        signal,
+        &idem_keyhash32(tenant_id, client_key),
+        ingest_hour_bucket,
+    )
+}
+
+/// Listing prefixes beside the marker probe that no gateway list grant may
+/// admit: the `idem/` directory, one key's markers across hours (the
+/// `<keyhash32>.` prefix the lookup listed before issue #2462), a marker key
+/// cut inside its hour or extended past `.idm`, a tenant segment 31 or 33
+/// characters wide, a keyhash one character short or long, and the marker key
+/// under every signal letter that writes no markers and under one that is no
+/// signal at all.
+fn idem_list_lookalikes() -> Vec<String> {
+    let tenant = "acme";
+    let hour_bucket = 495_972;
+    let hash = ravel_types::TenantId::new(tenant).hash().to_hex();
+    let keyhash = idem_keyhash32(tenant, b"client-key-1");
+    let hour = ingest_hour_string(hour_bucket);
+    let narrow = &hash[..hash.len() - 1];
+    let wide = format!("{hash}0");
+    assert_eq!(
+        (narrow.len(), wide.len(), keyhash.len(), hour.len()),
+        (31, 33, 32, 11)
+    );
+
+    let mut out = Vec::new();
+    for signal in ALL_SIGNALS {
+        if !IDEM_SIGNALS.contains(&signal) {
+            out.push(idem_marker_key_under(&hash, signal, &keyhash, hour_bucket));
+        }
+    }
+    out.push(format!("t/{hash}/x/idem/{keyhash}.{hour}.idm"));
+    for sig in IDEM_SIGNALS.map(Signal::key_prefix) {
+        out.push(format!("t/{hash}/{sig}/idem/"));
+        out.push(format!("t/{hash}/{sig}/idem/{keyhash}."));
+        out.push(format!("t/{hash}/{sig}/idem/{keyhash}.{}", &hour[..8]));
+        out.push(format!("t/{hash}/{sig}/idem/{keyhash}.{hour}.idm/"));
+        out.push(format!("t/{hash}/{sig}/idem/{keyhash}.{hour}.idmx"));
+        out.push(format!("t/{narrow}/{sig}/idem/{keyhash}.{hour}.idm"));
+        out.push(format!("t/{wide}/{sig}/idem/{keyhash}.{hour}.idm"));
+        out.push(format!("t/{hash}/{sig}/idem/{}.{hour}.idm", &keyhash[1..]));
+        out.push(format!("t/{hash}/{sig}/idem/{keyhash}0.{hour}.idm"));
+    }
+    out
+}
+
+/// The lookalike prefixes an `Allow` list grant of `policy` admits.
+fn idem_list_overreach(policy: &Policy) -> Vec<String> {
+    let allowed = list_prefix_patterns(policy, Some("Allow"));
+    idem_list_lookalikes()
+        .into_iter()
+        .filter(|p| allowed.iter().any(|a| glob_matches(a, p)))
+        .collect()
+}
+
+/// A keyed log or span write looks up its marker by GETting the exact
+/// `marker_key` for each hour of the dedup window, newest first (`read_marker`
+/// in `crates/ravel-ingest/src/idempotency.rs`), and lists nothing.
+/// `GatewayRead` admits the GET of every marker key for both marker signals,
+/// `GatewayListTenantBootstrapKeys` admits a list of exactly that key so an
+/// absent marker answers 404 rather than 403, no `Deny` withdraws either, and
+/// no gateway list grant admits the `idem/` directory or any other prefix
+/// beside a marker key.
+#[test]
+fn gateway_template_reads_the_idempotency_marker_by_exact_key() {
+    // The same literal `marker_key_is_the_shape_the_gateway_template_reads`
+    // in idempotency.rs pins for `marker_key` itself, so the mirror above
+    // cannot drift from the code without one of the two failing.
+    assert_eq!(
+        idem_marker_key("acme", Signal::Logs, b"client-key-1", 495_972),
+        "t/86bc967f6b7c19288226b362b9a7b013/l/idem/\
+         2fc38ed8fb3f5e9c1ed3eb38b4e0d1bc.20260731T12.idm"
+    );
+
+    let gateway = load_policy("gateway");
+    let gets = key_patterns_for(&gateway, &["s3:GetObject"], Some("Allow"));
+    let get_denies = key_patterns_for(&gateway, &["s3:GetObject"], Some("Deny"));
+    let lists = list_prefix_patterns(&gateway, Some("Allow"));
+    let list_denies = list_prefix_patterns(&gateway, Some("Deny"));
+    let bootstrap = policy_statements(&gateway)
+        .iter()
+        .find(|s| statement_sid(s) == "GatewayListTenantBootstrapKeys")
+        .expect("gateway.json carries a GatewayListTenantBootstrapKeys statement");
+    let bootstrap_prefixes: Vec<&str> =
+        condition_value_strings(&bootstrap["Condition"]["StringLike"]["s3:prefix"]);
+    for (signal, pattern) in IDEM_SIGNALS
+        .into_iter()
+        .zip([IDEM_MARKER_L_PATTERN, IDEM_MARKER_S_PATTERN])
+    {
+        assert!(
+            bootstrap_prefixes.contains(&pattern),
+            "GatewayListTenantBootstrapKeys does not carry {pattern:?}: {bootstrap_prefixes:?}"
+        );
+        for (tenant, key, hour) in [
+            ("acme", &b"client-key-1"[..], 495_972),
+            ("other", &b""[..], 400_001),
+        ] {
+            let marker = idem_marker_key(tenant, signal, key, hour);
+            assert!(
+                glob_matches(pattern, &marker),
+                "{pattern:?} does not admit the marker key {marker:?}"
+            );
+            assert!(
+                gets.iter().any(|p| glob_matches(p, &marker)),
+                "gateway: no GetObject Allow reaches {marker:?}, which a keyed {signal:?} \
+                 write probes. Grants: {gets:?}"
+            );
+            assert!(
+                !get_denies.iter().any(|p| glob_matches(p, &marker)),
+                "gateway: a GetObject Deny withdraws {marker:?}"
+            );
+            assert!(
+                lists.iter().any(|p| glob_matches(p, &marker)),
+                "gateway: no ListBucket s3:prefix covers {marker:?}, so on AWS S3 the probe \
+                 of an absent marker answers 403 and fails every keyed {signal:?} write. \
+                 s3:prefix values: {lists:?}"
+            );
+            assert!(
+                !list_denies.iter().any(|p| glob_matches(p, &marker)),
+                "gateway: a ListBucket Deny withdraws {marker:?}"
+            );
+        }
+    }
+    let overreach = idem_list_overreach(&gateway);
+    assert!(
+        overreach.is_empty(),
+        "gateway: a list grant admits prefixes beside the marker keys: {overreach:?}"
+    );
+}
+
+/// The negative witnesses are live: a GatewayList prefix widened to
+/// `t/*/*/idem/*` admits every lookalike. In-memory; the file on disk is
+/// untouched.
+#[test]
+fn an_idempotency_list_grant_widened_to_any_idem_prefix_reaches_the_lookalikes() {
+    let path = policy_json_path("gateway");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let mut json: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {path}: {e}"));
+    let target = json["Statement"]
+        .as_array_mut()
+        .expect("gateway.json Statement is an array")
+        .iter_mut()
+        .find(|stmt| stmt["Sid"] == serde_json::json!("GatewayList"))
+        .expect("gateway.json carries a GatewayList statement");
+    target["Condition"]["StringLike"]["s3:prefix"]
+        .as_array_mut()
+        .expect("GatewayList s3:prefix is an array")
+        .push(serde_json::json!("t/*/*/idem/*"));
+    let widened = build_policy("gateway", &path, &json);
+    assert_eq!(idem_list_overreach(&widened), idem_list_lookalikes());
 }
 
 /// The startup check of a `query` process over a tenant with no provisioning
@@ -10050,6 +10267,8 @@ fn every_shipped_template_passes_the_choke_point() {
         // glob_to_regex doc's citation of this test would overstate its scope.
         // The bootstrap-key statements spell the tenant hash as 32 `?`, so the
         // listing they admit reaches one key shape and no deeper segment.
+        // Gateway's marker-key patterns spell the keyhash and the ingest hour
+        // the same way, so they admit exactly a marker key.
         for stmt in policy_statements(&policy) {
             let sid = statement_sid(stmt);
             let single = Policy {
@@ -10430,6 +10649,8 @@ const EXPECTED_BOOTSTRAP_GRANTS: [ExpectedBootstrapGrants; 3] = [
             PROV_M_PATTERN,
             PROV_L_PATTERN,
             PROV_S_PATTERN,
+            IDEM_MARKER_L_PATTERN,
+            IDEM_MARKER_S_PATTERN,
         ],
     },
     ExpectedBootstrapGrants {
@@ -10593,6 +10814,27 @@ fn bootstrap_reads() -> Vec<BootstrapRead> {
             format!("t/{hex}/catalog/{}/HEAD", signal.key_prefix()),
             "get_head in the scheduled fold (crates/ravel-catalog/src/fold.rs)",
             "MaintainListTenantBootstrapKeys",
+        );
+    }
+    // `read_marker` GETs the exact marker key for each hour of the dedup
+    // window on every keyed log or span write; absent is a miss.
+    for signal in IDEM_SIGNALS {
+        add(
+            "gateway",
+            idem_marker_key_under(
+                &hex,
+                signal,
+                &idem_keyhash32("acme", b"client-key-1"),
+                495_972,
+            ),
+            if signal == Signal::Logs {
+                "read_marker in handle_export_logs (services/ravel-server/src/logs_ingest.rs), \
+                 every keyed log write"
+            } else {
+                "read_marker in handle_export_traces (services/ravel-server/src/traces_ingest.rs), \
+                 every keyed span write"
+            },
+            "GatewayListTenantBootstrapKeys",
         );
     }
     // The query catalog enforces provisioning, so every resolve reads the
@@ -10801,7 +11043,20 @@ fn bootstrap_list_grants_carry_exactly_the_expected_conditions() {
                 "{role}: {pattern:?} must spell the tenant hash as one `?` per character"
             );
             assert!(!pattern.contains('*'), "{role}: {pattern:?} carries a `*`");
-            for segment in &segments[2..] {
+            // A marker key's last segment spells the keyhash and the ingest hour
+            // as one `?` per character around the literal `.`, `T` and `.idm`;
+            // no other pattern carries a `?` past the tenant segment.
+            let marker = [IDEM_MARKER_L_PATTERN, IDEM_MARKER_S_PATTERN].contains(pattern);
+            let last = segments.len() - 1;
+            for (index, segment) in segments.iter().enumerate().skip(2) {
+                if marker && index == last {
+                    assert_eq!(
+                        *segment,
+                        format!("{}.????????T??.{IDEM_MARKER_SUFFIX}", "?".repeat(32)),
+                        "{role}: {pattern:?} must spell a marker key's last segment exactly"
+                    );
+                    continue;
+                }
                 assert!(
                     !segment.contains('?'),
                     "{role}: {pattern:?} has a `?` outside the tenant segment"

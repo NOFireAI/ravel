@@ -269,7 +269,8 @@ Two-part decision:
    data PUT → commit PUT → marker PUT (CreateIfAbsent) → ack
    ```
 
-   A retry of a keyed request first consults the marker (one prefix LIST)
+   A retry of a keyed request first consults the marker (one prefix LIST;
+   the marker probe amendment below replaces it with one GET per hour)
    and, on a hit inside the dedup window, replays the stored receipt
    without re-ingesting. The OTLP protobuf schemas are untouched: the key
    travels as transport metadata, never in a proto field.
@@ -316,7 +317,8 @@ Two-part decision:
    retry; two concurrent requests with the same key can both ingest
    (the window targets sequential retry, the actual failure mode); and
    unkeyed requests get plain at-least-once. Keyed requests pay one LIST
-   plus one PUT.
+   plus one PUT (the GETs of the marker probe amendment below, in place of
+   the LIST).
 
 ### 6. Per-tenant usage export
 
@@ -762,3 +764,67 @@ lateness, equals `max_flush_lifetime` and stays inside the figure
 `FLUSH_BOUND_SLACK_HOURS` is derived from. The default of 0 still leaves the
 tier off.
 
+## Amendment (2026-10-03, #2462): the marker lookup probes exact keys
+
+<!-- amendment-applies: sections="5. Idempotency for logs and spans" pointer="marker probe amendment" -->
+<!-- amendment-supersedes: phrase="one prefix LIST" pointer="marker probe amendment" -->
+
+Section 5 has a keyed retry consult its marker with one prefix LIST, of
+`t/<tenant_hash>/<signal>/idem/<keyhash32>.`. That listing never found a
+marker on S3. The S3 adapter lists through the `object_store` crate, which
+appends the path delimiter to every non-empty prefix, so S3 received the
+prefix `.../idem/<keyhash32>./`, and no marker key sits under it;
+`crates/ravel-object-store/src/s3.rs` documents that callers must use
+segment-aligned prefixes. `MemoryStore` matches a raw string prefix, which is
+why every test passed. Keyed dedup on S3 has never deduplicated.
+
+The lookup now lists nothing. `read_marker`
+(`crates/ravel-ingest/src/idempotency.rs`) GETs the exact marker key for each
+ingest hour from `now + IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS` down to
+`now - dedup_window`, in two batches. The first batch is the forward
+tolerance hours, `now` and `now - 1`, GET together, where a retry's marker
+almost always sits; only if none of them holds an object does the second
+batch GET every remaining hour of the window, at most
+`IDEM_MARKER_PROBE_CONCURRENCY` (8) in flight. Within a batch the newest
+object found wins, so the outcome for a given store state is the one a
+sequential newest-first scan stopping at the first object would return. A
+`NotFound` means no marker at that hour. Any other store error on any probe
+of a batch fails the lookup, even when another probe of that batch found a
+marker, and the keyed write is not acknowledged: it fails with a retryable
+503 / gRPC `UNAVAILABLE` before the request's own data is written, so the
+retry is safe. At the default 24-hour window and one hour of forward
+tolerance a hit at `now + 1`, `now` or `now - 1` costs 3 GETs and one round
+trip; any other hit, or a miss, costs 26 GETs in about four round trips.
+
+The lookup is bounded by the same `ack_deadline` the router write gets: the
+gateway wraps it in a timeout of that length (`lookup_marker_within` in
+`services/ravel-server/src/logs_ingest.rs`), so under S3 throttling a lookup
+cannot run past the budget of the write it gates. A lookup still running at
+the deadline is refused exactly like a failed probe (the same retryable
+error, client message and `ravel_ingest_idempotency_lookup_failures_total`
+count), with a WARN line that names the deadline rather than a key.
+
+Why exact-key GETs and not a segment-aligned listing:
+
+- The marker key layout is frozen. Putting a `/` between the keyhash and the
+  hour would make the per-key prefix list correctly, but it is a new key
+  layout and needs the format-change procedure and a version bump.
+- The only segment-aligned prefix above today's marker keys is the tenant's
+  whole `idem/` directory. Listing it reads every key's markers on each keyed
+  write, and the list grant it needs reaches all of them.
+- The GET itself is already granted: the gateway template grants
+  `s3:GetObject` on `t/*/*/idem/*`. On AWS S3 a GET of an absent key answers
+  403 unless a list grant covers that exact key, so the gateway template names
+  the marker key shape in its per-tenant bootstrap-key list statement; ADR-0055's
+  marker lookup amendment records that grant, which admits a list of one
+  marker key and adds no listing of the directory beyond the gateway's
+  pre-existing `t/` list prefix.
+
+Section 5's honest residuals are unchanged.
+
+Net effect on section 5: "one prefix LIST" becomes one GET per hour of the
+window, the hours nearest `now` first, bounded by the write's `ack_deadline`,
+and "one LIST plus one PUT" becomes up to
+`dedup_window + IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS + 1` GETs plus one
+PUT. Recorded as an appended amendment, with an inline pointer added to
+section 5.
