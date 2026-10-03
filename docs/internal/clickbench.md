@@ -498,8 +498,10 @@ cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
   over a high-cardinality key is where it shows. With the flag off, nine such
   statements failed with a pool-exhausted error; with it on, **five of those
   nine** (`COUNT(DISTINCT UserID)` and four more) moved to 44-50 s, while the
-  other **four (q29, q33, q34, q35) still exhaust the pool** for a separate
-  reason (see the ADR-0094 2026-08-26 amendment and its "still excluded" note).
+  other **four (q29, q33, q34, q35) still exhausted the pool** at that time
+  for a separate reason (see the ADR-0094 2026-08-26 amendment and its "still
+  excluded" note); since the per-query pool derives at the tenant's share
+  (ADR-2414 B1) all four run in the stock configuration on the reference box.
   Pass `--sql-parallel-final-aggregation=false` to measure the pre-amendment
   single-partition final; the bare flag stays accepted and still means on. This
   local value is recorded in the report's provenance as

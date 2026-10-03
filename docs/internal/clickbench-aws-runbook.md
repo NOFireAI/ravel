@@ -422,7 +422,7 @@ LD_PRELOAD="$TCMALLOC" "$PINNED" \
   --tenant clickbench-v4 --store s3 --compaction post --window-hours 200000 \
   --sql-max-segments 1000000 --deadline-secs 900 --continue-on-error \
   --cache-bytes "$CACHE_BYTES" \
-  --sql-tenant-max-bytes 17179869184 \
+  --sql-tenant-max-bytes 16451897344 \
   --sql-max-query-bytes 16451897344 \
   --fetch-concurrency 128 \
   --explain --explain-dir /root/explain \
@@ -506,13 +506,14 @@ S_GROUP_BYTES_MAX   = 33.2e9       # q20..q24 GROUP TOTAL; target: 5% each
 # against the corpus-wide number would fail on the baseline it came from.
 CORPUS_AMPLIFICATION_MAX = 6.1     # all measured rows; measured 5.794 (+5%)
 F_AMPLIFICATION_MAX      = 7.7     # Class F rows only; measured 7.302 (+5%)
+                                   # target for both: 1.25, provisional
 # Both bands were registered over the 42 statements that measured on the
 # #913 baseline, before q33 fit the per-query pool. q33 is measured (the
 # integrity check above demands it) but kept OUT of both amplification
 # populations until the bands are re-registered with it (#2421); a band
-# applied to a population it was not measured on is not a band.
+# applied to a population it was not measured on is not a band. Its own
+# ratio is still printed, unbanded, so a regression stays visible.
 AMPLIFICATION_EXCLUDED   = {"q33"}
-                                   # target for both: 1.25, provisional
 
 # Operator pre-registration for THIS run's wall clock (a property of the run,
 # not of #913). Fill as (LO, HI) before the pass, or leave None for a loud SKIP.
@@ -852,13 +853,22 @@ def amplification(qs, label, band):
         fails.append(f"{label} amplification {amp:.3f} > {band} "
                      f"(target 1.25, provisional)")
 
-f_qs = sorted(q for q in by_q if cls.get(q) == "full_value")
-f_qs = [q for q in f_qs if q not in AMPLIFICATION_EXCLUDED]
-if not f_qs:
+f_all = sorted(q for q in by_q if cls.get(q) == "full_value")
+f_qs = [q for q in f_all if q not in AMPLIFICATION_EXCLUDED]
+if not f_all:
     fails.append("no Class-F statements found in the corpus; the Class-F band "
                  "cannot be evaluated and must not silently pass")
+elif not f_qs:
+    fails.append(f"every Class-F statement is in AMPLIFICATION_EXCLUDED "
+                 f"({sorted(AMPLIFICATION_EXCLUDED)}); the Class-F band cannot "
+                 f"be evaluated and must not silently pass")
 amplification(sorted(q for q in by_q if q not in AMPLIFICATION_EXCLUDED), "corpus-wide", CORPUS_AMPLIFICATION_MAX)
 amplification(f_qs,         "class F",     F_AMPLIFICATION_MAX)
+# The excluded statements' own ratios, printed and never banded: a figure
+# that is not printed cannot be seen to regress before the re-registration.
+for q in sorted(AMPLIFICATION_EXCLUDED):
+    if q in by_q:
+        amplification([q], f"{q} (unbanded)", float("inf"))
 
 # --- Operator wall-clock bands: assert if pre-registered, else SKIP loudly -
 if HOT_S_BAND is None:
