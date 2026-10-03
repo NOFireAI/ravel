@@ -28,8 +28,9 @@
 #   * `float_reason` with `float_max_ulps`: an AVG column whose value differs
 #     from the reference only in its last bits (Q4).
 #   * `ci_expected_error` with a required `reason`: Ravel fails the statement;
-#     the acceptance test asserts each Ravel arm's error starts with this
-#     prefix instead of comparing results (Q19).
+#     the acceptance test asserts each Ravel arm's error contains this text
+#     instead of comparing results (Q19). It is matched as a substring because
+#     each engine wraps the same failure in its own prefix.
 #
 # One statement's columns come back in a different order on each engine:
 #
@@ -100,5 +101,5 @@ float_max_ulps = 2
 # registered for EXTRACT.
 [[statement]]
 number = 19
-ci_expected_error = "query failed: SQL planning failed: This feature is not implemented: Extract not supported by ExprPlanner"
+ci_expected_error = "This feature is not implemented: Extract not supported by ExprPlanner"
 reason = "EXTRACT has no ExprPlanner: datafusion is built without its datetime expressions (issue #2458)"

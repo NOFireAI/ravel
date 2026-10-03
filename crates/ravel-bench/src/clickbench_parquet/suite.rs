@@ -173,10 +173,12 @@ pub struct StatementOverride {
     /// otherwise.
     #[serde(default)]
     pub reason: Option<String>,
-    /// A stable prefix of the error Ravel returns for this statement. When
-    /// set, the statement is not compared: the acceptance test asserts that
-    /// each Ravel arm fails with an error starting with this text, so the
-    /// statement starting to answer (or failing differently) turns it red.
+    /// A stable part of the error Ravel returns for this statement, matched
+    /// as a substring because each engine wraps the same failure in its own
+    /// prefix (an HTTP status line, `query failed:`). When set, the statement
+    /// is not compared: the acceptance test asserts that each Ravel arm fails
+    /// with an error containing this text, so the statement starting to
+    /// answer (or failing differently) turns it red.
     #[serde(default)]
     pub ci_expected_error: Option<String>,
     /// Why this statement's float cells are allowed to differ by up to
@@ -424,18 +426,15 @@ mod tests {
         assert_eq!(tolerance.max_ulps, 2);
     }
 
-    /// The checked-in statement 19 override declares its expected error
-    /// prefix together with a reason.
+    /// The checked-in statement 19 override declares its expected error text
+    /// together with a reason.
     #[test]
     fn statement_19_expected_error_loads() {
         let suite = load_default().expect("pinned corpus loads");
         let over = suite.override_for(19).expect("Q19 override present");
         assert_eq!(
             over.ci_expected_error.as_deref(),
-            Some(
-                "query failed: SQL planning failed: This feature is not implemented: \
-                 Extract not supported by ExprPlanner"
-            )
+            Some("This feature is not implemented: Extract not supported by ExprPlanner")
         );
         assert_eq!(
             over.reason.as_deref(),

@@ -366,27 +366,27 @@ fn check_statement(
 ) -> (String, Option<String>) {
     let number = statement.number;
     let over = suite.override_for(number);
-    if let Some(prefix) = over.and_then(|o| o.ci_expected_error.as_deref()) {
+    if let Some(expected) = over.and_then(|o| o.ci_expected_error.as_deref()) {
         let reference = reference
             .as_ref()
             .map_or_else(ToString::to_string, |_| "ok".to_string());
         return match subject {
-            Err(e) if e.to_string().starts_with(prefix) => (
+            Err(e) if e.to_string().contains(expected) => (
                 format!("Q{number} arm {arm}: expected error (reference: {reference})"),
                 None,
             ),
             Err(e) => (
                 format!("Q{number} arm {arm}: ERROR"),
                 Some(format!(
-                    "Q{number} arm {arm}: ravel error {e} does not start with the declared \
-                     ci_expected_error {prefix:?}; reference: {reference}"
+                    "Q{number} arm {arm}: ravel error {e} does not contain the declared \
+                     ci_expected_error {expected:?}; reference: {reference}"
                 )),
             ),
             Ok(_) => (
                 format!("Q{number} arm {arm}: ok"),
                 Some(format!(
                     "Q{number} arm {arm}: ravel answered, but suite.toml declares \
-                     ci_expected_error {prefix:?}; reference: {reference}"
+                     ci_expected_error {expected:?}; reference: {reference}"
                 )),
             ),
         };
@@ -509,9 +509,14 @@ async fn parquet_lane_runs_the_upstream_suite_verbatim() {
         failures.len(),
         failures.join("\n")
     );
-    assert!(
-        totals.0 > 0,
-        "no statement exercised boundary-tie reduction"
+    // The fixture seed is fixed, so these are exact: a comparator that stops
+    // reducing ties or comparing floats on any statement-arm changes them.
+    assert_eq!(
+        totals.0, 588,
+        "summed tie_rows_reduced across both arms changed"
     );
-    assert!(totals.1 > 0, "no statement compared a float cell");
+    assert_eq!(
+        totals.1, 44,
+        "summed float_cells_compared across both arms changed"
+    );
 }
