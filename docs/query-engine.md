@@ -584,22 +584,26 @@ is resolved against the object's own FIELD_DIR
   per-block bounds are conservative (ADR-0013), so a block dropped at fetch is
   one the decode-side prune would drop anyway, and the reader still runs the
   full skip/POSTINGS/bloom prune over the fetched buffer.
-- **Plan side.** `plan_segment` counts survivors from the skip index alone
-  (footer + SKIP_IDX via the 256 KiB suffix probe, plus the object's FIELD_DIR
-  to resolve the arms) and fetches no block, carrying the footer forward so
-  each per-partition subset open skips its own probe. This is
-  sound because for a query the skip index can decide (ts bounds and NumRange
-  arms only) the reader's full prune reduces to its skip step, so the count
-  equals the survivor list the scan stripes. It takes at least one NumRange arm
-  to qualify: a query with no prune arm is skip-decidable too, but its plan read
-  already fetches only the ts-candidate blocks and warms exactly the extents the
-  subset opens stripe, so planning it this way would trade one shared read for
-  N per-partition ones over the same bytes. This branch's `fetch_plan_sections`
-  read is wrapped in its own `page_fetch` span, recording the probe and
-  section GET count and `BlockRangeStats::block_bytes_fetched` on it, the same
-  way `plan_segment_fast` and `plan_segment_block_stats` do, so no plan-phase
-  GET on the query path is invisible to a trace over the statement that took
-  it.
+- **Plan side.** `plan_segment` counts survivors from the skip index alone and
+  fetches no block. Its `fetch_plan_directories` read takes the footer from the
+  suffix probe, brings whichever of SKIP_IDX, PAGE_DIR, STREAM_DIR and FIELD_DIR
+  the probe missed as coalesced range GETs, and decodes all four sections once;
+  the plan phase charges what decompressing them produced to
+  `decompressed_bytes`. FIELD_DIR resolves the NumRange arms, SKIP_IDX yields
+  the candidate blocks, and the footer and the decoded directories are carried
+  forward, so each per-partition subset open skips its own probe and decodes no
+  directory (ADR-2414 decision A1). This is sound because for a query the skip
+  index can decide (ts bounds and NumRange arms only) the reader's full prune
+  reduces to its skip step, so the count equals the survivor list the scan
+  stripes. It takes at least one NumRange arm to qualify: a query with no prune
+  arm is skip-decidable too, but its plan read already fetches only the
+  ts-candidate blocks and warms exactly the extents the subset opens stripe, so
+  planning it this way would trade one shared read for N per-partition ones over
+  the same bytes. The `fetch_plan_directories` read is wrapped in its own
+  `page_fetch` span, recording the probe and section GET count and
+  `BlockRangeStats::block_bytes_fetched` on it, the same way `plan_segment_fast`
+  and `plan_segment_block_stats` do, so no plan-phase GET on the query path is
+  invisible to a trace over the statement that took it.
 
 A predicate the skip index cannot decide (a `has_word`/text arm, which bloom
 prunes only at decode; an `attrs['k']='v'` POSTINGS equality; a stream filter)
