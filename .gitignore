@@ -1,0 +1,43 @@
+/target
+# Bench output stays ignored (reports, criterion dirs), but the committed
+# ADR-0070 tier B baseline under bench/baselines/ is tracked. Re-including a
+# path requires not excluding its parent directory itself, so exclude the
+# contents of bench/ (bench/*) rather than the directory, then re-include the
+# baselines subtree. See issue #533.
+/bench/*
+!/bench/baselines/
+**/*.rs.bk
+*.profraw
+.DS_Store
+/rustfs-data
+/examples/otlp_metrics_fixture.pb
+__pycache__/
+/.superpowers/
+/.cache/
+node_modules/
+
+# Per-developer Claude Code config and its helper scripts. .claude/settings.json
+# is the team's; anything machine-specific belongs in these instead.
+.claude/settings.local.json
+.claude/helpers/
+
+# graft's local graph cache - regenerable, not committed (run `graft build`).
+graft/
+
+# Local, per-checkout state for .claude/guards/epic-status-nudge.mjs.
+.claude/.epic-status-nudge-state.json
+
+# scripts/epic-orchestrator.sh's per-epic index. The epic issue body is the
+# durable ledger; this is a local cache of it plus the CI signatures seen on
+# a head, so it is per-machine and never committed.
+.claude/epic-state/
+
+# The disk watchdog drops this in the scope directory when it fires; the
+# harness commit-on-death sweeps an unignored file into a wip commit.
+.disk-watchdog-fired
+# Fleet executors write gate logs and any cargo-install tree inside the
+# checkout, because $HOME on the amd64 executor class is a 1 GB tmpfs and
+# /tmp is the harness capture filesystem. Ignored for the same reason as
+# the watchdog marker above: commit-on-death must not sweep them in.
+.gate-logs/
+.dd-tools/

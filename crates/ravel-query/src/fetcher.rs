@@ -1,0 +1,7372 @@
+//! SegmentFetcher: footer-first suffix reads, identity verification, matcher
+//! pruning, and coalesced byte-range page fetches over one segment
+//! (docs/query-engine.md "Flow", docs/segment-format.md reader protocol).
+
+use bytes::Bytes;
+use futures::future::join_all;
+use ravel_cache::{Cache, CacheKey, ReadOutcome, SingleFlightError, TieredCache};
+use ravel_catalog::{SegmentLevel, SegmentRef};
+use ravel_object_store::{Etag, GetOutcome, GetRange, ObjectStoreBackend, StoreError, Version};
+use ravel_promql::{LabelMatcher, MatchOp, matches_series};
+use ravel_segment::{
+    ExpectedIdentity, Footer, FooterOutcome, HistogramValue, ReaderLimits, RunEntry,
+    SampleProvenance, SeriesEntry, SeriesEntryV4, ValPageKind, ValueKind, check_identity,
+    decode_catalog_matching_v4, decode_catalog_v4, decode_catalog_v5, decode_catalog_v5_chunked,
+    decode_run_histogram_pages, decode_run_pages_soa, open_from_suffix, plan_ranges_v4,
+};
+use ravel_types::accounting::{AccountedOp, QueryAccounting};
+
+use crate::phase_accounting::PhaseAccounting;
+use ravel_cpu_gate::{CpuGateError, JobSize, ReadGate, ReadSite};
+use ravel_types::{LabelSet, Sample, SeriesId, TenantHash};
+use tracing::Instrument;
+
+/// Section kinds from docs/segment-format.md (not exported by
+/// `ravel-segment`). LABEL_DICT + SERIES_IDS + SERIES_META are the catalog
+/// sections a below-threshold v5 object carries; SERIES_META's absence (it is
+/// replaced by SERIES_IDX + SERIES_META_CHUNKS) marks a sparse object at or
+/// above the 4096-series threshold.
+const SECTION_LABEL_DICT: u32 = 1;
+const SECTION_SERIES_IDS: u32 = 5;
+const SECTION_SERIES_META: u32 = 6;
+const SECTION_SERIES_IDX: u32 = 8;
+const SECTION_SERIES_META_CHUNKS: u32 = 9;
+
+/// `Compression.COMPRESSION_NONE` from proto/ravel/segment.proto, the same way
+/// the section kinds above are spelled here: `ravel-segment` keeps its own
+/// copy private.
+const COMPRESSION_NONE: i32 = 0;
+
+/// Store-sourced GET cost, either of a single `guarded_get` call or accumulated
+/// across the coalesced GETs of one `ensure_ranges` call. It scopes ADR-0044
+/// decision 5's per-span `s3_requests`/`s3_bytes` to bytes that actually
+/// crossed the network, so the `segment_open`/`page_fetch` spans never count
+/// cache-served bytes as S3 traffic.
+///
+/// `guarded_get` routes cache-eligible ranges through `cached_get`, which on a
+/// hit returns bytes with no store round trip at all
+/// (`accounting.record_cache_hit`, never an `AccountedOp::Get`). A cache hit
+/// therefore contributes `{0, 0}` here, and so does a late serve: a
+/// single-flight follower riding another caller's in-flight GET on either cache
+/// kind, or a RAM-only cache's recheck serve. A late serve stays a cache miss
+/// in the query accounting; it only made no GET. A store GET -- the uncached
+/// path, or the cache-miss leader that ran the fetch -- contributes
+/// `{1, bytes_len}`.
+///
+/// A local per-call value is used rather than a before/after `QueryAccounting`
+/// delta because `engine.rs` runs one segment future per `buffer_unordered`
+/// slot against the same accounting handle, so between one phase's before- and
+/// after-snapshot a sibling segment's GETs would bump the shared counters and
+/// the delta would capture their bytes too. `requests` is the number of
+/// store-sourced GETs (cache hits excluded); `bytes` is the sum of the bytes
+/// those store GETs returned.
+#[derive(Default, Clone, Copy)]
+struct GetCost {
+    requests: u64,
+    bytes: u64,
+}
+
+/// What a catalog decode is charged before it runs (ADR-1702 decision 6): the
+/// footer-declared `uncompressed_len` of every catalog section the object
+/// carries, each through [`ravel_memory::decoded_charge`] against the reader's
+/// section ceiling.
+///
+/// SERIES_META_CHUNKS is the exception, and `meta_chunks_inflated` is what
+/// replaces its footer figure when the chunk directory is readable. That
+/// section carries no section-level compression, so its `uncompressed_len` is
+/// the STORED (zstd) frames' length, while `decode_catalog_v5_chunked`
+/// inflates every frame and keeps an entry for every series in it. Charging
+/// the footer figure there charges the compressed size for an output several
+/// times larger.
+fn catalog_decode_len(
+    footer: &Footer,
+    limits: ReaderLimits,
+    meta_chunks_inflated: Option<u64>,
+) -> u64 {
+    footer
+        .sections
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.kind,
+                SECTION_LABEL_DICT
+                    | SECTION_SERIES_IDS
+                    | SECTION_SERIES_META
+                    | SECTION_SERIES_IDX
+                    | SECTION_SERIES_META_CHUNKS
+            )
+        })
+        .map(|s| match (s.kind, meta_chunks_inflated) {
+            (SECTION_SERIES_META_CHUNKS, Some(inflated)) => inflated,
+            _ => ravel_memory::decoded_charge(
+                s.uncompressed_len,
+                limits.max_section_uncompressed_bytes,
+            ),
+        })
+        .fold(0, u64::saturating_add)
+}
+
+/// The bytes SERIES_META_CHUNKS inflates to: the sum of its chunk directory's
+/// `frame_uncompressed_len` (docs/segment-format.md "SERIES_IDX"), each
+/// through [`ravel_memory::decoded_charge`] against the reader's section
+/// ceiling, since `decode_catalog_v5_chunked` refuses a larger frame before
+/// allocating it.
+/// The directory lives in SERIES_IDX, which every chunked path has already
+/// fetched into `regions` before the decode.
+///
+/// The sum walks the chunk directory itself, so its cost is bounded by the
+/// directory's own bytes. A per-series walk would instead be bounded by the
+/// declared `series_count`, which a crc-consistent directory can set to
+/// `u32::MAX` while carrying one chunk (issue #2081).
+///
+/// `None` means the footer figure is the only reading available: the object
+/// carries no SERIES_IDX (it is not chunked), its bytes are not in `regions`,
+/// the section is stored compressed (this parse reads stored bytes, and the
+/// writer always stores it uncompressed), its stored bytes fail the section
+/// crc32c, or the directory does not parse. In the last two cases the decode
+/// that follows fails on the same bytes. The crc is checked before the parse
+/// so a corrupt directory cannot set the charge and turn a corrupt-data error
+/// into a budget refusal.
+fn meta_chunks_inflated_len(
+    footer: &Footer,
+    regions: &FetchedRegions,
+    limits: ReaderLimits,
+) -> Option<u64> {
+    let idx = footer
+        .sections
+        .iter()
+        .find(|s| s.kind == SECTION_SERIES_IDX)
+        .filter(|s| s.comp == COMPRESSION_NONE)?;
+    let bytes = regions.slice(idx.offset, idx.len)?;
+    if crc32c::crc32c(&bytes) != idx.crc32c {
+        return None;
+    }
+    let index = ravel_segment::parse_series_idx(&bytes).ok()?;
+    Some(
+        index
+            .chunk_frame_uncompressed_lens()
+            .map(|len| ravel_memory::decoded_charge(len, limits.max_section_uncompressed_bytes))
+            .fold(0u64, u64::saturating_add),
+    )
+}
+
+/// Heap bytes one decoded catalog entry holds once the fetched section bytes
+/// are gone: the entry itself, its label set's `Label` vector with every name
+/// and value string's bytes, its run vector, and its per-sample provenance.
+fn catalog_entry_len(entry: &SeriesEntryV4) -> u64 {
+    let labels = entry.entry.labels.iter().fold(0u64, |acc, label| {
+        acc.saturating_add(std::mem::size_of::<ravel_types::Label>() as u64)
+            .saturating_add(label.name.len() as u64)
+            .saturating_add(label.value.len() as u64)
+    });
+    let runs = (entry.runs.len() as u64).saturating_mul(std::mem::size_of::<RunEntry>() as u64);
+    let provenance = entry.per_sample_provenance.iter().fold(0u64, |acc, slot| {
+        acc.saturating_add(std::mem::size_of::<Option<Vec<SampleProvenance>>>() as u64)
+            .saturating_add(slot.as_ref().map_or(0, |v| {
+                (v.len() as u64).saturating_mul(std::mem::size_of::<SampleProvenance>() as u64)
+            }))
+    });
+    (std::mem::size_of::<SeriesEntryV4>() as u64)
+        .saturating_add(labels)
+        .saturating_add(runs)
+        .saturating_add(provenance)
+}
+
+/// [`catalog_entry_len`] summed over the entries a decode retained.
+fn retained_catalog_len(entries: &[SeriesEntryV4]) -> u64 {
+    entries
+        .iter()
+        .map(catalog_entry_len)
+        .fold(0, u64::saturating_add)
+}
+
+/// The series a catalog decode selected, and the reservation charging the
+/// decoded catalog to the memory budget (ADR-1702 decision 6) for as long as
+/// they are held. Derefs to the entries. `None` holds nothing: a decode that
+/// retained no entries has nothing left to charge.
+struct DecodedCatalog {
+    entries: Vec<SeriesEntryV4>,
+    reservation: Option<ravel_memory::Reservation>,
+}
+
+impl DecodedCatalog {
+    fn into_parts(self) -> (Vec<SeriesEntryV4>, Option<ravel_memory::Reservation>) {
+        (self.entries, self.reservation)
+    }
+}
+
+impl std::ops::Deref for DecodedCatalog {
+    type Target = [SeriesEntryV4];
+
+    fn deref(&self) -> &[SeriesEntryV4] {
+        &self.entries
+    }
+}
+
+/// Absolute `(offset, len)` of a section by kind, from the footer.
+fn section_range(footer: &Footer, kind: u32) -> Option<(u64, u64)> {
+    footer
+        .sections
+        .iter()
+        .find(|s| s.kind == kind)
+        .map(|s| (s.offset, s.len))
+}
+
+/// If every matcher is a non-empty positive equality (`label = "value"`),
+/// returns the `(name, value)` pairs for the dictionary-ordinal catalog decode
+/// ([`decode_catalog_matching_v4`]); otherwise `None`, and the caller keeps the
+/// materialize-then-filter path (issue #1076).
+///
+/// Excluded shapes, each of which must materialize:
+/// - A regex or negated matcher (`=~`, `!~`, `!=`). The ordinal decoder only
+///   resolves positive equality by dictionary ordinal, so any other operator in
+///   the set falls back.
+/// - An empty-value equality (`label = ""`). Prometheus reads this as "the
+///   label is absent or empty", which `matches_series` honors by treating a
+///   missing label as `""`. The ordinal decoder resolves the operand against
+///   the LABEL_DICT, where the empty string is not an entry, so it would return
+///   zero series where the materializing path returns every series lacking the
+///   label. Falling back keeps the two paths identical.
+///
+/// A non-empty value simply absent from the dictionary needs no special case:
+/// `decode_catalog_matching_v4` cannot resolve it and returns zero series,
+/// which is exactly what an equality on a value no series carries must yield.
+/// An empty matcher set also returns `None`: it matches every series, so there
+/// is nothing to prune and the ordinal path would materialize all of them
+/// anyway.
+fn ordinal_equals(matchers: &[LabelMatcher]) -> Option<Vec<(&str, &str)>> {
+    if matchers.is_empty() {
+        return None;
+    }
+    let mut equals = Vec::with_capacity(matchers.len());
+    for m in matchers {
+        match m.op {
+            MatchOp::Eq if !m.value.is_empty() => equals.push((m.name.as_str(), m.value.as_str())),
+            _ => return None,
+        }
+    }
+    Some(equals)
+}
+
+/// The decoded catalog entries whose label set satisfies `matchers`.
+fn filter_matching(entries: Vec<SeriesEntryV4>, matchers: &[LabelMatcher]) -> Vec<SeriesEntryV4> {
+    entries
+        .into_iter()
+        .filter(|e| matches_series(matchers, &e.entry.labels))
+        .collect()
+}
+
+/// Default suffix length fetched on the first GET of a segment object.
+pub const DEFAULT_SUFFIX_LEN: u64 = 64 * 1024;
+/// Default maximum gap between two planned byte ranges that still get
+/// coalesced into a single GET.
+pub const DEFAULT_COALESCE_GAP: u64 = 64 * 1024;
+/// Default size at or below which the first GET fetches the whole object in
+/// one request instead of a footer suffix. The commit record
+/// carries the exact object size, so a small object is read whole up front:
+/// its footer, catalog sections, and page bytes then all resolve from that
+/// one buffer with no second probe. Above the threshold the footer-suffix
+/// path is kept, which reads only the tail and coalesces the page GETs it
+/// actually needs. 512 KiB comfortably covers a typical ~30 KiB L0 flush and
+/// the small end of the L1 part distribution while never whole-object-reading
+/// a large compacted part just to reach its footer.
+pub const DEFAULT_WHOLE_OBJECT_THRESHOLD: u64 = 512 * 1024;
+/// Default bound on the number of byte-range GETs a single segment fetch
+/// keeps in flight at once. The fetcher clones share one
+/// semaphore, so this also bounds the total in-flight GETs across every
+/// concurrent segment fetch in a query, not just within one segment.
+pub const DEFAULT_MAX_CONCURRENT_GETS: usize = 16;
+/// Most page-range GETs one fetch of an L0 segment issues, and since ADR-2066
+/// the most chunk-run GETs one ranged read of an L0 RLOG object issues
+/// (`log_fetcher.rs`, `chunk_run_cap`): changing it changes both request laws.
+/// When the coalesced runs a query selects outnumber it, the smallest gaps
+/// between runs are bridged until this many remain, trading gap bytes for
+/// requests. It gives an unsealed flush's request cost a ceiling above the
+/// whole-object threshold ([`MAX_GETS_PER_L0_SEGMENT_FETCH`], ADR-1306). L1
+/// segments are left unbounded on both paths: they can be far larger than a
+/// flush, so bridging would move far more bytes.
+pub const MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT: usize = 4;
+/// Most GETs one fetch of an L0 segment issues: the first GET (whole object,
+/// footer tail, or suffix), at most one footer chase (a second `NeedRange` is
+/// `Truncated`), one catalog GET (the catalog sections are fetched as one
+/// run), and [`MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`] page-range GETs. Retries
+/// are not counted here. This is the RSEG shape only: an L0 RLOG read can
+/// exceed it, since it may add front-section and BLOOM/POSTINGS GETs.
+pub const MAX_GETS_PER_L0_SEGMENT_FETCH: u64 =
+    1 + 1 + 1 + MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT as u64;
+
+/// Object-size floor for taking the sparse catalog-probe path in
+/// [`SegmentFetcher::decode_selected`] instead of the whole-object fallback.
+/// A sparse (>=4096-series) v5 object lays its catalog sections
+/// (LABEL_DICT, SERIES_IDS, SERIES_META_CHUNKS, SERIES_IDX) contiguously at the
+/// front, ahead of the TS/VAL/HIST page sections. Fetching only that catalog
+/// prefix -- one contiguous range GET -- skips the page bytes a whole-object
+/// GET pulls in, then the matched series' pages are fetched selectively
+/// afterward, exactly as the below-threshold path already does.
+///
+/// The crossover this constant guards is a round-trip-vs-bytes tradeoff, not a
+/// pure win: below the floor the whole object is small enough that a single GET
+/// beats one catalog GET plus the extra selective page-range GETs (each a fresh
+/// round trip: ~15-80 ms on S3, ~1-5 ms on loopback RustFS). Those
+/// measurements are per-request latency and do NOT meter this specific
+/// within-segment crossover, so this floor is
+/// set conservatively rather than fit to a measured point (see
+/// docs/query-engine.md). 256 KiB is above the four fixed 64 KiB suffix/gap
+/// probes yet far below any real compacted sparse L1 part, so production sparse
+/// objects take the probe path while a degenerate tiny sparse object keeps the
+/// cheaper single GET.
+pub const SPARSE_PROBE_MIN_OBJECT_SIZE: u64 = 256 * 1024;
+
+/// Errors fetching and decoding one segment. Every variant is a hard error:
+/// the caller never receives partial or silently-wrong data for a segment
+/// that failed to fetch or decode.
+#[derive(Debug, thiserror::Error)]
+pub enum FetchError {
+    #[error("object store error reading segment {key}: {source}")]
+    Store {
+        key: String,
+        #[source]
+        source: StoreError,
+    },
+    #[error("corrupt segment {key}: {source}")]
+    Corrupt {
+        key: String,
+        #[source]
+        source: ravel_segment::SegmentError,
+    },
+    #[error("etag changed between reads of segment {key}: store returned inconsistent data")]
+    EtagChanged { key: String },
+    /// The fetch-layer memory budget (ADR-1170 decision 2) refused the
+    /// reservation for the bytes this GET would materialize, or for the bytes
+    /// a catalog decode would produce (ADR-1702 decision 6). Carries only the
+    /// three accounting figures, never an object key or tenant value: the
+    /// refusal is a resource condition, not data corruption, and its message
+    /// must not leak which object or tenant provoked it.
+    #[error(
+        "fetch memory exhausted: requested {requested} bytes, {reserved} of {limit} byte budget already reserved"
+    )]
+    FetchMemoryExhausted {
+        requested: u64,
+        reserved: u64,
+        limit: u64,
+    },
+}
+
+/// The error channel for a cache-routed GET's `get_or_fetch` closure
+/// (`cached_get`, below). A store failure and an etag change on a cache
+/// miss are both real failures but mean different things downstream: a
+/// store error is opaque backend trouble, while an etag change means the
+/// live GET caught the object being replaced mid-open, which is a
+/// snapshot-invalidation signal (ADR-0046 decision 4's amendment) and must
+/// surface as `FetchError::EtagChanged`, not get folded into `Store`.
+/// `Cache<E>`/`SingleFlightError<E>` require `E: Clone`, hence the `Arc`
+/// around `StoreError`, same as the pre-existing single-variant channel.
+#[derive(Debug, Clone)]
+pub enum CacheFetchError {
+    Store(std::sync::Arc<StoreError>),
+    EtagChanged {
+        key: String,
+    },
+    /// The bytes a live GET inside the closure returned failed the checksum the
+    /// admitting funnel verifies before admitting them: RLOG's per-block
+    /// `block_crc32c` (`log_fetcher.rs`'s block-range funnel, ADR-0107 decision
+    /// 3). Its own variant so a single-flight follower sees the same hard
+    /// corruption error the leader did, rather than a transient store error it
+    /// would retry. The RSEG closure below verifies nothing inside
+    /// `get_or_fetch` and never produces this.
+    Corrupt {
+        key: String,
+        message: String,
+    },
+    /// The closure's own query refused the read against its request or byte
+    /// budget (`ravel_parquet`'s `ReadLimits::admit`), before any store GET
+    /// ran. Its own variant so a single-flight follower is told this is a
+    /// budget refusal from whichever caller computed it, not a store error it
+    /// would retry; the follower's own budget was not consulted and must be
+    /// checked separately. Neither the RSEG closure below nor the RLOG/RSPAN
+    /// ones (`log_fetcher.rs`, `span_fetcher.rs`) hold a `ReadLimits` and
+    /// never produce this.
+    BudgetRefused {
+        key: String,
+        message: String,
+    },
+}
+
+/// Lets a `get_or_fetch` closure use `?` directly on a `store.get(..)` call
+/// (as `log_fetcher.rs`'s does) without an explicit `.map_err`, the same way
+/// the blanket `From<T> for Arc<T>` let the pre-existing `Cache<Arc<StoreError>>`
+/// channel do.
+impl From<StoreError> for CacheFetchError {
+    fn from(err: StoreError) -> Self {
+        CacheFetchError::Store(std::sync::Arc::new(err))
+    }
+}
+
+/// The read-cache handle a fetcher holds (ADR-0046 decision 1), either the RAM
+/// tier alone or the RAM-over-disk [`TieredCache`], behind one interface the
+/// RSEG and RLOG read funnels consult without committing to a concrete tier.
+///
+/// - [`ReadCache::Ram`] is the RAM tier alone: the bare RAM [`Cache`]. It is
+///   what production builds with no `--cache-dir` (#97), byte-for-byte the
+///   pre-disk-tier behavior; it writes no local files and needs no Tokio runtime
+///   to construct. Its [`Cache::get_or_fetch`] is miss-only: its leader rechecks
+///   RAM uncounted before fetching and it records no lookup of its own, so a
+///   caller may peek with [`ReadCache::get`] and then resolve a miss through
+///   [`ReadCache::fetch_peeked`] with the peek as the one accounted miss.
+/// - [`ReadCache::Tiered`] is the RAM-over-disk handle: a disk-served hit is
+///   single-flighted and corruption-gated per ADR-0046 decisions 3-5. Production
+///   builds it when `--cache-dir` is set (#97); the funnels route through it
+///   wherever it is present.
+///
+/// This mirrors the precedent issue #96 set for `ravel-catalog`'s byte cache
+/// (`ByteCache`): a small tier-dispatching wrapper rather than committing each
+/// fetcher field to one concrete type, so a RAM-only caller never has to invent
+/// a disabled `DiskCache`. Both variants carry the same [`CacheFetchError`]
+/// upstream-fetch error (the tiered single-flight already requires a `Clone`
+/// error and `CacheFetchError` is), so unlike `ByteCache` the two share one
+/// error type.
+#[derive(Clone)]
+pub enum ReadCache {
+    /// RAM tier only (no disk configured): today's exact behavior.
+    Ram(std::sync::Arc<Cache<CacheFetchError>>),
+    /// RAM over local disk (ADR-0046 decision 3): disk-served hits are
+    /// single-flighted and corruption-gated.
+    Tiered(std::sync::Arc<TieredCache<CacheFetchError>>),
+}
+
+impl From<std::sync::Arc<Cache<CacheFetchError>>> for ReadCache {
+    fn from(ram: std::sync::Arc<Cache<CacheFetchError>>) -> Self {
+        ReadCache::Ram(ram)
+    }
+}
+
+impl From<std::sync::Arc<TieredCache<CacheFetchError>>> for ReadCache {
+    fn from(tiered: std::sync::Arc<TieredCache<CacheFetchError>>) -> Self {
+        ReadCache::Tiered(tiered)
+    }
+}
+
+impl ReadCache {
+    /// Peek every tier with no upstream fetch, serving a hit and returning
+    /// `None` on a genuine miss (recording its own hit/miss on the cache's
+    /// `CacheMetrics`). The fetch-free half a caller uses when its miss handling
+    /// cannot be expressed as one upstream-fetch closure: `BlockRangeFetcher`'s
+    /// per-block peek, which defers a miss to a later coalesced GET.
+    ///
+    /// Async because the tiered variant's disk consult must not run on the
+    /// runtime worker that polls this call (issue #1891): it reads a file, once
+    /// per peeked extent, and every caller of this method is an async funnel.
+    /// [`TieredCache::get_off_worker`] dispatches that read to the blocking pool
+    /// and is otherwise byte-for-byte [`TieredCache::get`]. The RAM variant has
+    /// no disk tier and no I/O to move, so it is served inline and pays nothing
+    /// for the `async`.
+    pub(crate) async fn get(&self, key: &CacheKey) -> Option<Bytes> {
+        match self {
+            ReadCache::Ram(ram) => ram.get(key),
+            ReadCache::Tiered(tiered) => tiered.get_off_worker(*key).await,
+        }
+    }
+
+    /// Admit already-fetched, already-verified bytes into every tier with no
+    /// upstream fetch and no single-flight (`BlockRangeFetcher`'s per-block
+    /// admission, ADR-0107 decision 3). Records no miss, so it never layers a
+    /// second miss on top of one a prior [`get`](Self::get) peek already
+    /// recorded for the same key.
+    ///
+    /// Async for the same reason [`get`](Self::get) is: the tiered variant's
+    /// disk write goes to the blocking pool through
+    /// [`TieredCache::insert_off_worker`], while the RAM variant is served
+    /// inline.
+    pub(crate) async fn insert(&self, key: CacheKey, value: Bytes) {
+        match self {
+            ReadCache::Ram(ram) => ram.insert(key, value),
+            ReadCache::Tiered(tiered) => tiered.insert_off_worker(key, value).await,
+        }
+    }
+
+    /// Read `key` through the cache, running `fetch` only on a genuine miss in
+    /// every tier, and reporting a [`ReadOutcome`] so the caller accounts for
+    /// the hit/miss exactly once and charges a GET only to the call that made
+    /// one. This is the single-call read-through the RSEG funnel
+    /// ([`SegmentFetcher::cached_get`]), the log and span whole-object funnels
+    /// and the block-range extent/probe funnel
+    /// ([`BlockRangeFetcher::cached_extent`]) use; the caller must NOT also
+    /// peek with [`get`](Self::get) first (that would record the miss twice on
+    /// the tiered tier).
+    ///
+    /// Both cache kinds label by single-flight role. [`ReadOutcome::Hit`] is a
+    /// cache hit (no GET). [`ReadOutcome::Fetched`] is the leader that ran
+    /// `fetch` (one GET, a miss). [`ReadOutcome::LateServe`] is a call that
+    /// made no GET and was not a hit: a follower of another caller's fetch on
+    /// either kind, a follower of a leader whose uncounted RAM recheck served
+    /// the bytes on either kind, or, on the RAM-only cache, that leader
+    /// itself. A caller charges a late serve no GET and records the cache miss
+    /// its lookup already counted. The tiered tier's
+    /// [`TieredCache::get_or_fetch_outcome`] peeks both tiers internally. The
+    /// RAM tier's [`Cache::get_or_fetch_outcome`] is miss-only, so the RAM
+    /// branch peeks once here (a hit is [`ReadOutcome::Hit`]) and runs the
+    /// miss-only fetch on a miss. Neither branch counts the miss twice.
+    pub(crate) async fn get_or_fetch<F, Fut>(
+        &self,
+        key: CacheKey,
+        fetch: F,
+    ) -> Result<(Bytes, ReadOutcome), SingleFlightError<CacheFetchError>>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: std::future::Future<Output = Result<Bytes, CacheFetchError>> + Send,
+    {
+        match self {
+            ReadCache::Tiered(tiered) => tiered.get_or_fetch_outcome(key, fetch).await,
+            ReadCache::Ram(ram) => {
+                if let Some(bytes) = ram.get(&key) {
+                    return Ok((bytes, ReadOutcome::Hit));
+                }
+                #[cfg(test)]
+                ram_recheck_seam::after_peek_miss(ram, &key);
+                ram.get_or_fetch_outcome(key, fetch).await
+            }
+        }
+    }
+
+    /// Look `key` up again, in every tier, recording no hit or miss: for a
+    /// caller whose earlier [`get`](Self::get) already accounted this request
+    /// and that re-checks because the entry may have been admitted since
+    /// (`BlockRangeFetcher::fetch_run`'s re-peek of a run's non-lead blocks). A
+    /// hit is served exactly as `get` serves one, corruption mode included.
+    pub(crate) async fn peek_uncounted(&self, key: &CacheKey) -> Option<Bytes> {
+        match self {
+            ReadCache::Ram(ram) => ram.peek_uncounted(key),
+            ReadCache::Tiered(tiered) => tiered.peek_uncounted_off_worker(*key).await,
+        }
+    }
+
+    /// Resolve a key the caller ALREADY peeked-and-missed with
+    /// [`get`](Self::get) (`BlockRangeFetcher`'s peek-then-defer coalesced
+    /// fetch): run `fetch` and admit the result, WITHOUT recording a second miss
+    /// on top of the peek's.
+    ///
+    /// Both tiers single-flight concurrent callers onto one `fetch` while
+    /// keeping the caller's earlier `get` as the one accounted miss, so
+    /// `BlockRangeFetcher`'s peek-then-defer pattern collapses concurrent
+    /// cross-partition misses of one extent onto a single upstream GET on either
+    /// variant (ADR-0102 decision 1, ADR-0046 decision 5).
+    ///
+    /// The RAM tier uses its miss-only [`Cache::get_or_fetch`], which
+    /// single-flights concurrent callers onto one `fetch` and rechecks RAM only
+    /// uncounted, so the caller's earlier `get` stays the one accounted miss. The tiered tier
+    /// cannot reuse its own [`TieredCache::get_or_fetch`] here: that re-peeks
+    /// both tiers, recording a SECOND miss for a key the caller already peeked
+    /// ([`TieredCache::get`]'s documented double-count pitfall). It instead uses
+    /// [`TieredCache::resolve_peeked_miss`], which joins the same single-flight
+    /// as `get_or_fetch` (so concurrent callers coalesce onto one leader) but
+    /// skips the counted tier consultation (its leader only rechecks RAM,
+    /// uncounted, to reuse a flight that finished after the peek) and records
+    /// no miss of its own, admitting the fetched bytes to both tiers -- the
+    /// fetch-free-on-peek discipline ADR-0046 prescribes for a
+    /// peeked-then-deferred key. `fetch`'s own coalescing --
+    /// `BlockRangeFetcher` splits one range GET into per-block entries inside the
+    /// closure -- is unaffected either way.
+    pub(crate) async fn fetch_peeked<F, Fut>(
+        &self,
+        key: CacheKey,
+        fetch: F,
+    ) -> Result<Bytes, SingleFlightError<CacheFetchError>>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: std::future::Future<Output = Result<Bytes, CacheFetchError>> + Send,
+    {
+        match self {
+            ReadCache::Ram(ram) => ram.get_or_fetch(key, fetch).await,
+            ReadCache::Tiered(tiered) => tiered.resolve_peeked_miss(key, fetch).await,
+        }
+    }
+
+    /// The RAM tier's counters handle, whichever variant this is. The bare
+    /// [`Cache`]'s own [`Cache::metrics`] for [`ReadCache::Ram`], and the RAM
+    /// half of the [`TieredCache`] ([`TieredCache::ram_metrics`]) for
+    /// [`ReadCache::Tiered`]. `ravel-server`'s `/metrics` renderer reads this
+    /// for the `cache=fetch` family instead of matching the enum inline.
+    pub fn ram_metrics(&self) -> std::sync::Arc<ravel_cache::CacheMetrics> {
+        match self {
+            ReadCache::Ram(ram) => ram.metrics(),
+            ReadCache::Tiered(tiered) => tiered.ram_metrics(),
+        }
+    }
+
+    /// The disk tier's counters handle, or `None` for a RAM-only cache. `None`
+    /// for [`ReadCache::Ram`] (no disk tier exists), and
+    /// `Some(`[`TieredCache::disk_metrics`]`)` for [`ReadCache::Tiered`].
+    /// `ravel-server`'s `/metrics` renderer reads this for the disk-tier
+    /// (`tier=disk`) sample, which it emits only when this is `Some`.
+    pub fn disk_metrics(&self) -> Option<std::sync::Arc<ravel_cache::CacheMetrics>> {
+        match self {
+            ReadCache::Ram(_) => None,
+            ReadCache::Tiered(tiered) => Some(tiered.disk_metrics()),
+        }
+    }
+}
+
+/// Admits armed bytes to the RAM tier between [`ReadCache::get_or_fetch`]'s
+/// peek miss and its flight's recheck, as another flight finishing in that gap
+/// would. The two run in one poll, so a test cannot interleave them any other
+/// way.
+#[cfg(test)]
+pub(crate) mod ram_recheck_seam {
+    use std::cell::RefCell;
+
+    use bytes::Bytes;
+    use ravel_cache::{Cache, CacheKey};
+
+    use super::CacheFetchError;
+
+    thread_local! {
+        static ARMED: RefCell<Option<(CacheKey, Bytes)>> = const { RefCell::new(None) };
+    }
+
+    /// Admit `bytes` under `key` after the next peek miss of `key` on this
+    /// thread.
+    pub(crate) fn arm(key: CacheKey, bytes: Bytes) {
+        ARMED.with(|slot| *slot.borrow_mut() = Some((key, bytes)));
+    }
+
+    pub(super) fn after_peek_miss(ram: &Cache<CacheFetchError>, key: &CacheKey) {
+        let armed = ARMED.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.as_ref().is_some_and(|(armed, _)| armed == key) {
+                slot.take()
+            } else {
+                None
+            }
+        });
+        if let Some((key, bytes)) = armed {
+            ram.insert(key, bytes);
+        }
+    }
+}
+
+/// The full four-element dedup key of ONE sample (docs/catalog-and-mvcc.md,
+/// ADR-0010 §5): `(created_unix_ns, writer_epoch, writer_seq, in_page_index)`,
+/// greatest wins.
+///
+/// A run whose samples all came from the same write shares the first three
+/// elements and derives the fourth from array position, which is what every
+/// object in existence carries and what the run-wide provenance fields on
+/// [`FetchedSeries`]/[`FetchedSeriesSoa`]/[`FetchedHistogramSeries`] express.
+/// This type exists for the shape those fields cannot express: a run that
+/// merged several inputs' samples, where each sample keeps the provenance of
+/// the write it came from and array position no longer reconstructs the fourth
+/// element (ADR-0092 "Why 11.46 is not the target", decision 1). Issue #315
+/// makes L1 compaction emit it. The scan-time erasure mask also gives a
+/// run-wide run this shape when it drops samples, so every survivor keeps the
+/// key its original position implied (`erasure::compact_parallel`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SamplePriority {
+    pub created_unix_ns: i64,
+    pub writer_epoch: u64,
+    pub writer_seq: u64,
+    pub in_page_index: u32,
+}
+
+impl SamplePriority {
+    /// The key as the plain tuple the merge's comparison uses. Field order
+    /// here IS the comparison order, so the tuple is a reordering-free
+    /// projection.
+    pub fn as_tuple(&self) -> (i64, u64, u64, u32) {
+        (
+            self.created_unix_ns,
+            self.writer_epoch,
+            self.writer_seq,
+            self.in_page_index,
+        )
+    }
+}
+
+/// One matched series' decoded samples plus the provenance fields needed for
+/// cross-segment duplicate-sample resolution (docs/catalog-and-mvcc.md).
+#[derive(Debug, Clone)]
+pub struct FetchedSeries {
+    pub series_id: SeriesId,
+    pub labels: LabelSet,
+    /// On-disk order, including any duplicate timestamps within this
+    /// segment; index in this vec is the "in-page index" tiebreak unless
+    /// `per_sample_priorities` is `Some`.
+    pub samples: Vec<Sample>,
+    pub created_unix_ns: i64,
+    pub writer_epoch: u64,
+    pub writer_seq: u64,
+    /// Per-sample dedup keys, parallel to `samples`, for a run that merged
+    /// several writes' samples, or that a pending erasure mask dropped
+    /// samples from. `None` means the run-wide fields above plus array
+    /// position give every sample's key. When `Some`, its length must equal
+    /// `samples.len()`; the merge rejects a disagreement as
+    /// `QueryError::PrioritySampleCountMismatch` rather than truncating.
+    pub per_sample_priorities: Option<Vec<SamplePriority>>,
+}
+
+/// SoA counterpart to `FetchedSeries`: timestamps and values as separate
+/// vecs, ready for zero-copy Arrow
+/// buffer adoption in `ravel-sql`. Same provenance fields, same
+/// per-segment on-disk order and in-page-index tiebreak (index into
+/// `timestamps`/`values`) as `FetchedSeries`.
+#[derive(Debug, Clone)]
+pub struct FetchedSeriesSoa {
+    pub series_id: SeriesId,
+    pub labels: LabelSet,
+    pub timestamps: Vec<i64>,
+    pub values: Vec<f64>,
+    pub created_unix_ns: i64,
+    pub writer_epoch: u64,
+    pub writer_seq: u64,
+    /// Per-sample dedup keys, parallel to `timestamps`/`values`; see
+    /// [`FetchedSeries::per_sample_priorities`].
+    pub per_sample_priorities: Option<Vec<SamplePriority>>,
+}
+
+/// Histogram counterpart to `FetchedSeriesSoa`: the decoded
+/// native-histogram samples of one matched histogram-kind series, as parallel
+/// timestamp/value vecs, with the same provenance fields and per-segment
+/// on-disk order (index into `timestamps`/`values` is the in-page-index
+/// tiebreak) the scalar SoA carries. `values` holds `ravel_segment`'s storage
+/// histogram model; the read path converts each to the evaluator's float model
+/// downstream (docs/query-engine.md, `merge_histogram_soa_runs`).
+#[derive(Debug, Clone)]
+pub struct FetchedHistogramSeries {
+    pub series_id: SeriesId,
+    pub labels: LabelSet,
+    pub timestamps: Vec<i64>,
+    pub values: Vec<HistogramValue>,
+    pub created_unix_ns: i64,
+    pub writer_epoch: u64,
+    pub writer_seq: u64,
+    /// Per-sample dedup keys, parallel to `timestamps`/`values`; see
+    /// [`FetchedSeries::per_sample_priorities`].
+    pub per_sample_priorities: Option<Vec<SamplePriority>>,
+}
+
+/// Page-kind counters accumulated over one `fetch_soa` call, for downstream
+/// consumers to read. Tracks VAL_RAW_F64 pages plus the histogram-kind series
+/// a scalar-only fetch dropped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FetchStats {
+    pub raw_f64_pages: u64,
+    pub raw_f64_bytes: u64,
+    /// Histogram-kind series this segment's catalog matched and a scalar-only
+    /// fetch ([`SegmentFetcher::fetch_soa_phase_accounted`] and its siblings)
+    /// did not return, because they carry no scalar float value. Nonzero means
+    /// the returned scalar series are not the whole of what the matchers
+    /// selected, which is what lets a caller with no histogram model of its own
+    /// (ravel-sql's `samples` table) say so instead of answering short in
+    /// silence (issue #1738).
+    ///
+    /// Counted per segment, so a series present in several segments counts once
+    /// per segment: this is a presence signal, not a distinct-series count.
+    /// Zero from the combined scalar-and-histogram fetch, which drops nothing.
+    pub histogram_series_skipped: u64,
+}
+
+impl FetchStats {
+    fn record_val_page(&mut self, kind: ValPageKind, bytes: usize) {
+        if kind == ValPageKind::RawF64 {
+            self.raw_f64_pages += 1;
+            self.raw_f64_bytes += bytes as u64;
+        }
+    }
+}
+
+/// Byte ranges already fetched from a segment object, keyed by absolute
+/// offset, so later planned ranges that fall inside an already-fetched
+/// buffer (typically the initial suffix, for small segments) need no
+/// additional GET.
+#[derive(Default)]
+struct FetchedRegions {
+    buffers: Vec<(u64, Bytes)>,
+    /// Fetch-layer byte reservations (ADR-1170 decision 2) covering the GETs
+    /// that filled `buffers`. Owned here so a reservation lives exactly as long
+    /// as the fetched regions it accounts for: dropping this `FetchedRegions`
+    /// releases them. The reservation guards the coalesced run lengths reserved
+    /// once before the `join_all` in `ensure_ranges`, never a per-GET or
+    /// request-scoped claim.
+    reservations: Vec<ravel_memory::Reservation>,
+}
+
+impl FetchedRegions {
+    fn insert(&mut self, start: u64, bytes: Bytes) {
+        self.buffers.push((start, bytes));
+    }
+
+    /// Takes ownership of a reservation so it lives as long as these regions.
+    fn hold_reservation(&mut self, reservation: ravel_memory::Reservation) {
+        self.reservations.push(reservation);
+    }
+
+    fn covers(&self, start: u64, end: u64) -> bool {
+        self.buffers
+            .iter()
+            .any(|(s, b)| *s <= start && end <= s.saturating_add(b.len() as u64))
+    }
+
+    fn slice(&self, offset: u64, len: u64) -> Option<Bytes> {
+        let end = offset.checked_add(len)?;
+        self.buffers.iter().find_map(|(s, b)| {
+            if *s <= offset && end <= s.saturating_add(b.len() as u64) {
+                let start_rel = usize::try_from(offset - s).ok()?;
+                let end_rel = usize::try_from(end - s).ok()?;
+                // Refcounted slice of the already-fetched buffer, not a
+                // copy:
+                // `b` is `Bytes`, so `slice` shares the backing allocation.
+                // `end_rel <= b.len()` holds by the range check above.
+                Some(b.slice(start_rel..end_rel))
+            } else {
+                None
+            }
+        })
+    }
+}
+
+/// The four sparse-catalog section ranges (`(offset, len)` each) the
+/// catalog-probe path fetches instead of the whole object: LABEL_DICT,
+/// SERIES_IDS, SERIES_IDX, and SERIES_META_CHUNKS. They lie contiguously at the
+/// object front (ahead of the TS/VAL/HIST page sections), so `ensure_ranges`
+/// coalesces them into as few GETs as their layout allows.
+struct SparseCatalogRanges {
+    label_dict: (u64, u64),
+    series_ids: (u64, u64),
+    series_idx: (u64, u64),
+    meta_chunks: (u64, u64),
+}
+
+/// Merges (start, end) ranges into ordered, non-overlapping groups, joining
+/// consecutive ranges whose gap is at most `max_gap` into a single group
+/// (docs/query-engine.md "coalesce adjacent byte ranges").
+fn coalesce_ranges(mut ranges: Vec<(u64, u64)>, max_gap: u64) -> Vec<(u64, u64)> {
+    ranges.sort_by_key(|r| r.0);
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for (start, end) in ranges {
+        if let Some(last) = out.last_mut()
+            && start <= last.1.saturating_add(max_gap)
+        {
+            last.1 = last.1.max(end);
+            continue;
+        }
+        out.push((start, end));
+    }
+    out
+}
+
+/// Bridges the smallest gaps between `runs` (sorted, non-overlapping, as
+/// [`coalesce_ranges`] returns them) until at most `max_runs` remain. Ties
+/// bridge the earlier gap first. A `max_runs` of zero is read as one.
+///
+/// `pub(crate)` so `log_fetcher.rs` can reuse it for the RLOG chunk-run cap
+/// (ADR-2066 decision 1) instead of a second copy of the same bridging rule.
+pub(crate) fn bound_runs(runs: Vec<(u64, u64)>, max_runs: usize) -> Vec<(u64, u64)> {
+    let max_runs = max_runs.max(1);
+    if runs.len() <= max_runs {
+        return runs;
+    }
+    let mut gaps: Vec<(u64, usize)> = runs
+        .windows(2)
+        .enumerate()
+        .map(|(i, pair)| (pair[1].0.saturating_sub(pair[0].1), i))
+        .collect();
+    gaps.sort_unstable();
+    let mut bridged = vec![false; gaps.len()];
+    for (_, i) in gaps.into_iter().take(runs.len() - max_runs) {
+        bridged[i] = true;
+    }
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(max_runs);
+    let mut bridge_previous = false;
+    for (run, bridge_next) in runs.into_iter().zip(bridged.into_iter().chain([false])) {
+        match out.last_mut() {
+            Some(last) if bridge_previous => last.1 = last.1.max(run.1),
+            _ => out.push(run),
+        }
+        bridge_previous = bridge_next;
+    }
+    out
+}
+
+/// Fetches and decodes one segment at a time: suffix-GET the footer, verify
+/// identity, prune series by matchers, plan and coalesce page ranges, decode
+/// selected pages. See docs/query-engine.md "Flow" for the full contract.
+#[derive(Clone)]
+pub struct SegmentFetcher {
+    store: std::sync::Arc<dyn ObjectStoreBackend>,
+    suffix_len: u64,
+    coalesce_gap: u64,
+    /// Object size at or below which the first GET reads the whole object
+    /// instead of a footer suffix.
+    whole_object_threshold: u64,
+    limits: ReaderLimits,
+    /// Bounds the byte-range GETs kept in flight. Shared across `clone`s and,
+    /// via [`Self::with_get_limiter`], across every other fetcher and engine
+    /// holding the same `Arc` (ADR-1195): every concurrent segment fetch in
+    /// the process draws from the same permit pool rather than each fetcher
+    /// opening its own unbounded fan-out. It is only ever held around a
+    /// single leaf `store.get`, never across a scope that acquires another
+    /// permit, so no fetch can deadlock waiting on permits it already holds.
+    get_limiter: std::sync::Arc<crate::GetLimiter>,
+    /// ADR-0046's read cache, consulted by `guarded_get` for every
+    /// byte-range (and whole-object) GET. `None` -- the default from
+    /// `new` -- reproduces exactly the pre-cache behavior: every GET goes
+    /// to the store. Either tier configuration (RAM-only or RAM-over-disk,
+    /// see [`ReadCache`]); every production caller builds the RAM variant.
+    /// Shared across clones, and safe to share across tenants: the cache key
+    /// is derived per call from the caller-supplied `tenant_hash`, never
+    /// fixed on the fetcher itself.
+    cache: Option<ReadCache>,
+    /// Counts first-GET footer reads that fell back to an uncacheable
+    /// `GetRange::Suffix` because the segment ref carried no `object_size`
+    /// (issue #811). A known object size is read as an absolute tail range the
+    /// ADR-0046 read cache can serve (keyed by content hash plus absolute
+    /// range), so a second query over the same segment issues zero footer
+    /// GETs; an absent size cannot be keyed that way (a suffix hit has no
+    /// object total size to fabricate), so the footer is re-fetched per query.
+    /// Making that fallback observable is the point: a silent one hides the
+    /// missed optimization in exactly the case it did not apply. Shared across
+    /// clones (an `Arc`), never reset. No production RSEG ref reaches this
+    /// path -- the commit record always records the object size (the writer at
+    /// `crates/ravel-ingest/src/shard.rs` and every compaction part), so a
+    /// nonzero count flags a ref built without one.
+    suffix_fallbacks: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Count of catalog label sets materialized during `decode_selected`
+    /// (issue #1076). The materializing path builds one `LabelSet` per
+    /// candidate series before `matches_series` filters, so it adds the whole
+    /// decoded series count; the dictionary-ordinal path
+    /// (`decode_catalog_matching_v4`) builds one only for a series that already
+    /// matched, so it adds just the selected count. This is the counter that
+    /// makes the ordinal path's saving observable: same fetched bytes, fewer
+    /// materializations. Shared across clones (an `Arc`), never reset, read the
+    /// same way as [`suffix_fallbacks`](Self::suffix_fallbacks).
+    label_sets_materialized: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The process-wide fetch memory budget (ADR-1170 decision 2). Every GET
+    /// this fetcher issues reserves the bytes it will materialize against this
+    /// budget before the GET, and the reservation is owned for the fetched
+    /// buffer's lifetime. Shared across clones and, via
+    /// [`Self::with_memory_budget`], across every other fetcher and engine
+    /// holding the same `Arc`, exactly like [`get_limiter`](Self::get_limiter).
+    /// The default is [`MemoryBudget::unlimited`], which never refuses, so a
+    /// fetcher built with plain `new` behaves as it did before this budget
+    /// existed.
+    memory_budget: std::sync::Arc<ravel_memory::MemoryBudget>,
+    /// The read CPU gate the catalog decodes run on (ADR-1702 decisions 2 and
+    /// 4). `None`, the default, decodes inline on the calling task exactly as
+    /// before the gate existed.
+    read_gate: Option<std::sync::Arc<ReadGate>>,
+}
+
+impl SegmentFetcher {
+    pub fn new(store: std::sync::Arc<dyn ObjectStoreBackend>) -> Self {
+        SegmentFetcher {
+            store,
+            suffix_len: DEFAULT_SUFFIX_LEN,
+            coalesce_gap: DEFAULT_COALESCE_GAP,
+            whole_object_threshold: DEFAULT_WHOLE_OBJECT_THRESHOLD,
+            limits: ReaderLimits::default(),
+            get_limiter: std::sync::Arc::new(crate::GetLimiter::new_unchecked(
+                DEFAULT_MAX_CONCURRENT_GETS,
+            )),
+            cache: None,
+            suffix_fallbacks: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            label_sets_materialized: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            memory_budget: std::sync::Arc::new(ravel_memory::MemoryBudget::unlimited()),
+            read_gate: None,
+        }
+    }
+
+    /// Runs this fetcher's catalog decodes on `gate` (ADR-1702 decision 4):
+    /// each one is a job of its decoded catalog's size, which the gate runs
+    /// inline below its byte floor and on its blocking pool otherwise.
+    #[must_use]
+    pub fn with_read_gate(mut self, gate: std::sync::Arc<ReadGate>) -> Self {
+        self.read_gate = Some(gate);
+        self
+    }
+
+    /// Number of catalog label sets materialized across every
+    /// `decode_selected` this fetcher (or a clone) has run (issue #1076).
+    /// A materializing decode adds its whole candidate-series count; a
+    /// dictionary-ordinal decode adds only the matched count. Exposed so a
+    /// test can pin the ordinal path's materialization saving exactly, and so
+    /// the saving is observable rather than silent.
+    #[must_use]
+    pub fn label_sets_materialized(&self) -> u64 {
+        self.label_sets_materialized
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Adds `n` to the running materialization count (issue #1076).
+    fn record_materialized(&self, n: usize) {
+        self.label_sets_materialized
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Number of first-GET footer reads that took the uncacheable suffix
+    /// fallback because the segment ref carried no `object_size` (issue #811).
+    /// Zero on every production RSEG query: the commit record always records
+    /// the object size, so the footer is read as a cacheable absolute range. A
+    /// nonzero value means a ref reached the fetcher without a size and its
+    /// footer was re-fetched from the store rather than served from ADR-0046's
+    /// read cache. Exposed so the fallback is observable, never silent.
+    #[must_use]
+    pub fn suffix_fallbacks(&self) -> u64 {
+        self.suffix_fallbacks
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Wires ADR-0046's read cache into every GET `guarded_get` issues
+    /// (decision 1). A `SegmentFetcher` built with plain `new` and never
+    /// given a cache behaves exactly as it did before this cache existed.
+    ///
+    /// Accepts either tier configuration through [`ReadCache`]: an
+    /// `Arc<Cache<CacheFetchError>>` (RAM-only, what every production caller
+    /// passes) or an `Arc<TieredCache<CacheFetchError>>` (RAM over disk) both
+    /// convert via [`From`], so existing call sites are unchanged.
+    #[must_use]
+    pub fn with_cache(mut self, cache: impl Into<ReadCache>) -> Self {
+        self.cache = Some(cache.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_suffix_len(mut self, n: u64) -> Self {
+        self.suffix_len = n.max(1);
+        self
+    }
+
+    #[must_use]
+    pub fn with_coalesce_gap(mut self, n: u64) -> Self {
+        self.coalesce_gap = n;
+        self
+    }
+
+    /// Sets the whole-object fetch threshold. An object whose
+    /// commit-record size is at or below `n` is read whole on its first GET;
+    /// a larger one reads only the footer tail. `0` disables the
+    /// whole-object path entirely, so every object with a known size takes the
+    /// footer tail read (an absolute range, cache-eligible per issue #811),
+    /// which is what the multi-GET tests use to exercise the footer
+    /// `NeedRange` chase on a small object.
+    #[must_use]
+    pub fn with_whole_object_threshold(mut self, n: u64) -> Self {
+        self.whole_object_threshold = n;
+        self
+    }
+
+    /// The whole-object threshold this fetcher opens segments with (see
+    /// [`Self::with_whole_object_threshold`]). Read-only counterpart used by
+    /// `io_shape`'s structural `dependency_depth` classification, which needs
+    /// the same size cutoff `open_segment` branches on without duplicating or
+    /// re-deriving it.
+    pub fn whole_object_threshold(&self) -> u64 {
+        self.whole_object_threshold
+    }
+
+    /// Sets the in-flight byte-range GET bound by building a new private
+    /// limiter. Shared across this fetcher's clones; not shared with any
+    /// other fetcher unless [`Self::with_get_limiter`] is used instead.
+    #[must_use]
+    pub fn with_max_concurrent_gets(mut self, n: usize) -> Self {
+        self.get_limiter = std::sync::Arc::new(crate::GetLimiter::new_unchecked(n.max(1)));
+        self
+    }
+
+    /// Wires this fetcher to a caller-owned [`crate::GetLimiter`] (ADR-1195),
+    /// so it draws GET permits from the same pool as every other fetcher (and,
+    /// via [`crate::QueryEngine::with_get_limiter`], every other engine)
+    /// holding the same `Arc`.
+    #[must_use]
+    pub fn with_get_limiter(mut self, limiter: std::sync::Arc<crate::GetLimiter>) -> Self {
+        self.get_limiter = limiter;
+        self
+    }
+
+    /// This fetcher's current limiter, for a test to `Arc::ptr_eq` against
+    /// another fetcher's or an engine's, proving two fetchers actually share
+    /// one `GetLimiter` rather than each holding an equal-but-distinct one.
+    #[cfg(test)]
+    pub(crate) fn get_limiter_for_test(&self) -> &std::sync::Arc<crate::GetLimiter> {
+        &self.get_limiter
+    }
+
+    /// This fetcher's `GetLimiter` permit count (ADR-1195): the process-wide
+    /// GET concurrency bound, shared with every other fetcher and engine that
+    /// took the same `Arc` via [`Self::with_get_limiter`]. `io_shape`'s
+    /// `service_batches` needs this the same way
+    /// `ravel_query::engine::io_shape_for_resolve` reads its own
+    /// `QueryEngine::get_limiter`: a caller who set `--store-get-concurrency`
+    /// below its own fan-out makes the limiter, not the fan-out, the real
+    /// binding bound.
+    #[must_use]
+    pub fn get_limiter_permits(&self) -> usize {
+        self.get_limiter.permits()
+    }
+
+    /// Wires this fetcher to a caller-owned [`ravel_memory::MemoryBudget`]
+    /// (ADR-1170 decision 2), so the bytes it reserves before each GET draw
+    /// from the same budget as every other fetcher (and, via
+    /// [`crate::QueryEngine::with_memory_budget`], every other engine) holding
+    /// the same `Arc`. Mirrors [`Self::with_get_limiter`].
+    #[must_use]
+    pub fn with_memory_budget(
+        mut self,
+        budget: std::sync::Arc<ravel_memory::MemoryBudget>,
+    ) -> Self {
+        self.memory_budget = budget;
+        self
+    }
+
+    /// This fetcher's current memory budget, for a test to `Arc::ptr_eq`
+    /// against another fetcher's or an engine's, proving they share one budget
+    /// rather than each holding an equal-but-distinct one.
+    #[cfg(test)]
+    pub(crate) fn memory_budget_for_test(&self) -> &std::sync::Arc<ravel_memory::MemoryBudget> {
+        &self.memory_budget
+    }
+
+    /// Reserves `n` bytes against this fetcher's budget before a GET, mapping a
+    /// refusal to the typed [`FetchError::FetchMemoryExhausted`]. The returned
+    /// guard is owned for the fetched buffer's lifetime; it is never released
+    /// because a GET completed (ADR-1170 decision 2).
+    fn reserve_fetch(&self, n: u64) -> Result<ravel_memory::Reservation, FetchError> {
+        self.memory_budget
+            .reserve(n)
+            .map_err(|e| FetchError::FetchMemoryExhausted {
+                requested: e.requested,
+                reserved: e.reserved,
+                limit: e.limit,
+            })
+    }
+
+    /// Reserves [`catalog_decode_len`] for `footer` before a catalog decode
+    /// (ADR-1702 decision 6), refusing with the same typed
+    /// [`FetchError::FetchMemoryExhausted`] a fetch reservation does. The guard
+    /// travels with the decoded entries in a [`DecodedCatalog`].
+    ///
+    /// `regions` supplies the already-fetched SERIES_IDX bytes a chunked
+    /// object's real decode size is read from ([`meta_chunks_inflated_len`]).
+    fn reserve_catalog_decode(
+        &self,
+        footer: &Footer,
+        regions: &FetchedRegions,
+    ) -> Result<ravel_memory::Reservation, FetchError> {
+        let inflated = meta_chunks_inflated_len(footer, regions, self.limits);
+        self.reserve_fetch(catalog_decode_len(footer, self.limits, inflated))
+    }
+
+    /// Exchanges a decode's whole-catalog reservation for one sized to the
+    /// entries the matchers retained (ADR-1702 decision 6). The pre-decode
+    /// reservation covers every catalog section the object carries; after a
+    /// selective matcher the caller holds a handful of entries through the
+    /// page fetches that follow, and charging the whole catalog for all of
+    /// them overstates the query's memory for the rest of its life.
+    ///
+    /// This never fails: the decode it follows already succeeded, and a shrink
+    /// only gives memory back. The retained reservation is taken before the
+    /// held one is released, so a refusal (a concurrent reserver, or a
+    /// `reserve_unchecked` caller that pushed the budget over its limit) keeps
+    /// the held reservation and skips the shrink. A decode that retained no
+    /// entries releases what it holds and reserves nothing, since even a
+    /// zero-byte reservation is refused once the budget is over its limit.
+    ///
+    /// A retained figure at or above what is held keeps the existing
+    /// reservation untouched, so this only ever shrinks: the pre-decode figure
+    /// is an estimate over section bytes and the retained figure measures
+    /// structs, and exchanging upward would turn a filter that retained
+    /// everything into a new refusal point.
+    fn shrink_to_retained(&self, decoded: DecodedCatalog) -> DecodedCatalog {
+        let held = decoded.reservation.as_ref().map_or(0, |r| r.size());
+        if decoded.entries.is_empty() {
+            return DecodedCatalog {
+                entries: decoded.entries,
+                reservation: None,
+            };
+        }
+        let retained = retained_catalog_len(&decoded.entries);
+        if retained >= held {
+            return decoded;
+        }
+        match self.memory_budget.reserve(retained) {
+            Ok(reservation) => DecodedCatalog {
+                entries: decoded.entries,
+                reservation: Some(reservation),
+            },
+            Err(_) => decoded,
+        }
+    }
+
+    /// One store GET, bounded by the shared in-flight limiter. The permit
+    /// is released the moment the GET resolves; callers must
+    /// never hold the returned future's permit across another
+    /// `guarded_get`/`ensure_ranges` call, or a query whose in-flight GETs
+    /// already fill the pool could wait on itself.
+    ///
+    /// The request is counted at ISSUE time, once the in-flight permit is held
+    /// and immediately before the backend `get` is awaited, so a future dropped
+    /// or timed out while that `get` is still pending still shows the request it
+    /// started; the transferred bytes are added only at completion, when their
+    /// length is known. Counting on issue rather than completion means a failed
+    /// GET is now counted too (one issued request), which is the honest figure
+    /// for a query that spent a round trip only to error.
+    async fn store_get(
+        &self,
+        key: &str,
+        range: GetRange,
+        accounting: &QueryAccounting,
+    ) -> Result<GetOutcome, StoreError> {
+        let _permit = self.get_limiter.acquire().await.map_err(|_| {
+            StoreError::Transient("GetLimiter semaphore closed unexpectedly".into())
+        })?;
+        accounting.record_s3_request(AccountedOp::Get);
+        let got = self.store.get(key, range).await?;
+        accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
+        Ok(got)
+    }
+
+    /// This is the funnel every ranged GET in this file passes through
+    /// (ADR-0044 "2. Accounting is recorded at existing funnels only", and
+    /// ADR-0046 decision 1). A GET that goes to the store records one
+    /// `AccountedOp::Get` request and its transferred bytes (via
+    /// `store_get`); a cache hit records a cache hit and its served bytes
+    /// instead (ADR-0046 decision 4's test needs the two distinguishable),
+    /// and never also records an `AccountedOp::Get`, since no store round
+    /// trip happened.
+    ///
+    /// A `GetRange::Range` or `GetRange::Full` request is cache-eligible
+    /// when a cache is configured: the cache key is built here, from the
+    /// same `seg_ref`/`tenant_hash`/`range` values driving this call and
+    /// nowhere else, so a payload can never be admitted under a key that
+    /// does not describe it (ADR-0046 decision 4's amendment). `Full` maps
+    /// to the range `(0, seg_ref.object_size)`; the whole object is a valid
+    /// sub-range of itself, and its `total_size` is trivially its own
+    /// length, unlike `GetRange::Suffix`. A suffix GET always bypasses the
+    /// cache: `Cache`'s value is bare `Bytes`, with nowhere to carry the
+    /// object's total size a suffix hit would need to fabricate, and total
+    /// size is not otherwise recoverable from a suffix's own byte length.
+    ///
+    /// A cache-routed GET's `expected_etag` check runs, or does not, by
+    /// whether the call is a hit or a miss -- these are not the same case.
+    /// On a **hit**, no check runs: the check exists to catch two live store
+    /// reads of a supposedly immutable object returning different bytes, a
+    /// cache entry is addressed by content hash rather than by a live read,
+    /// and there is nothing to compare it against. On a **miss**,
+    /// `cached_get` performs a real live store GET exactly like the
+    /// uncached path, and that GET's etag is checked against
+    /// `expected_etag` exactly as it would be uncached: skipping it there
+    /// would silently disable the check for bytes that came straight from
+    /// the store in this same call, purely because a cache happened to be
+    /// attached. See `cached_get` for where that check runs.
+    ///
+    /// Returns the `GetOutcome` alongside the [`GetCost`] this single call
+    /// contributes to its caller's per-span S3 counts: `{1, bytes_len}` when
+    /// this call's own store GET produced the bytes (this uncached path, or the
+    /// leader that ran the fetch inside `cached_get`), `{0, 0}` when
+    /// `cached_get` got a [`ReadOutcome::Hit`] or a
+    /// [`ReadOutcome::LateServe`]. The caller
+    /// folds that cost in rather than re-deriving hit-vs-miss, so the
+    /// store-vs-cache branch lives once, at the seam that already knows the
+    /// answer (`store_get` for the store round trip, `cached_get`'s explicit
+    /// `cache.get` for the hit check).
+    async fn guarded_get(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        range: GetRange,
+        expected_etag: Option<&Etag>,
+        accounting: &QueryAccounting,
+    ) -> Result<(GetOutcome, GetCost), FetchError> {
+        let key = seg_ref.data_object_key.as_str();
+
+        let cacheable_range = match range {
+            GetRange::Range(start, end) => Some((start, end)),
+            GetRange::Full => Some((0, seg_ref.object_size)),
+            GetRange::Suffix(_) => None,
+        };
+        if let (Some((start, end)), Some(cache)) = (cacheable_range, &self.cache) {
+            return self
+                .cached_get(
+                    cache,
+                    seg_ref,
+                    tenant_hash,
+                    range,
+                    start,
+                    end,
+                    expected_etag,
+                    accounting,
+                )
+                .await;
+        }
+
+        // No cache, or a suffix GET that always bypasses it: this is an
+        // unconditional store round trip, so it always contributes one GET.
+        let got = self
+            .store_get(key, range, accounting)
+            .await
+            .map_err(|source| FetchError::Store {
+                key: key.to_string(),
+                source,
+            })?;
+        // An empty expected etag is not a real S3 etag; it is the "no live pin
+        // available" sentinel a cache-served footer read produces (see
+        // `cached_get` and `open_segment`, issue #811), so it never gates a
+        // store read. A real etag still pins, catching a mutated object
+        // mid-read.
+        if let Some(expected) = expected_etag
+            && !expected.0.is_empty()
+            && &got.etag != expected
+        {
+            return Err(FetchError::EtagChanged {
+                key: key.to_string(),
+            });
+        }
+        let cost = GetCost {
+            requests: 1,
+            bytes: got.data.len() as u64,
+        };
+        Ok((got, cost))
+    }
+
+    /// The cache-routed half of `guarded_get`. `range` is the exact
+    /// `GetRange` the store call uses on a miss (so a `Full` request still
+    /// issues one whole-object GET rather than a synthesized
+    /// `Range(0, object_size)`); `(start, end)` is `range` restated as the
+    /// absolute byte bounds the `CacheKey` and the fabricated hit
+    /// `GetOutcome` use.
+    ///
+    /// Hit/miss and the GET charge follow the [`ReadOutcome`]
+    /// [`ReadCache::get_or_fetch`] returns: only a [`ReadOutcome::Hit`] is a
+    /// cache hit, and only a [`ReadOutcome::Fetched`] is charged a GET. A late
+    /// serve (a single-flight follower on either cache kind, or a RAM-only
+    /// recheck serve) is a miss with no GET.
+    ///
+    /// On a miss, the store GET inside the `get_or_fetch` closure is
+    /// checked against `expected_etag` exactly like the uncached path in
+    /// `guarded_get` does -- see that function's doc comment for why a hit
+    /// skips this and a miss must not. `CacheFetchError` carries the two
+    /// outcomes (`Store` vs `EtagChanged`) separately through
+    /// `get_or_fetch`'s single error channel so this can still report
+    /// `FetchError::EtagChanged` distinctly rather than folding it into a
+    /// generic store error.
+    #[allow(clippy::too_many_arguments)]
+    async fn cached_get(
+        &self,
+        cache: &ReadCache,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        range: GetRange,
+        start: u64,
+        end: u64,
+        expected_etag: Option<&Etag>,
+        accounting: &QueryAccounting,
+    ) -> Result<(GetOutcome, GetCost), FetchError> {
+        let key = seg_ref.data_object_key.as_str();
+        let cache_key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, start, end - start);
+
+        // One read-through call, then account for it from the returned
+        // [`ReadOutcome`]. A single call avoids the peek-then-`get_or_fetch`
+        // double-count on the tiered tier (see [`ReadCache::get_or_fetch`] and
+        // [`TieredCache::get`]). Only [`ReadOutcome::Fetched`] means the store
+        // GET inside the closure ran, so only it adds to this span's S3 counts.
+        // A leader miss runs the closure and learns the store's real etag; a
+        // hit, a RAM recheck serve or a single-flight follower does not, and
+        // no etag is knowable
+        // from this call. `open_segment` pins later range reads to the footer
+        // GET's etag, and the footer is read through this cache now (issue
+        // #811), so the real etag must survive a leader miss -- otherwise every
+        // later ranged store GET on a cold large-object query would mismatch an
+        // empty pin. On a hit or follower the cache's content-hash key is what
+        // guarantees immutability instead (ADR-0046 decision 4); the empty etag
+        // then flows out as the "no live pin available" sentinel the range-read
+        // etag check skips.
+        let leader_etag: std::sync::Arc<std::sync::Mutex<Option<Etag>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let etag_capture = leader_etag.clone();
+        let (bytes, outcome) = cache
+            .get_or_fetch(cache_key, || async move {
+                let got = self
+                    .store_get(key, range, accounting)
+                    .await
+                    .map_err(|source| CacheFetchError::Store(std::sync::Arc::new(source)))?;
+                if let Some(expected) = expected_etag
+                    && !expected.0.is_empty()
+                    && &got.etag != expected
+                {
+                    return Err(CacheFetchError::EtagChanged {
+                        key: key.to_string(),
+                    });
+                }
+                if let Ok(mut slot) = etag_capture.lock() {
+                    *slot = Some(got.etag.clone());
+                }
+                Ok(got.data)
+            })
+            .await
+            .map_err(|err| match err {
+                SingleFlightError::Upstream(CacheFetchError::Store(source)) => FetchError::Store {
+                    key: key.to_string(),
+                    source: clone_store_error(&source),
+                },
+                SingleFlightError::Upstream(CacheFetchError::EtagChanged { key }) => {
+                    FetchError::EtagChanged { key }
+                }
+                // Unreachable from this closure: the RSEG path verifies page
+                // checksums when it decodes, not inside `get_or_fetch`, so it
+                // never constructs `Corrupt`. Handled explicitly rather than
+                // through a wildcard so adding an in-closure integrity check
+                // here cannot silently fall through as a store error.
+                // `FetchError::Corrupt` carries a `ravel_segment::SegmentError`,
+                // which this channel's string message cannot reconstruct.
+                SingleFlightError::Upstream(CacheFetchError::Corrupt { key, message }) => {
+                    FetchError::Store {
+                        key,
+                        source: StoreError::Transient(format!(
+                            "cache single-flight closure reported corrupt bytes, which the RSEG \
+                             funnel never produces: {message}"
+                        )),
+                    }
+                }
+                // Unreachable from this closure: it holds no `ReadLimits` and
+                // never admits against a request or byte budget, so it never
+                // constructs `BudgetRefused`. Handled explicitly rather than
+                // through a wildcard so a future budget check added here
+                // cannot silently fall through as a store error.
+                SingleFlightError::Upstream(CacheFetchError::BudgetRefused { key, message }) => {
+                    FetchError::Store {
+                        key,
+                        source: StoreError::Transient(format!(
+                            "cache single-flight closure reported a budget refusal, which the \
+                             RSEG funnel never produces: {message}"
+                        )),
+                    }
+                }
+                SingleFlightError::LeaderLost => FetchError::Store {
+                    key: key.to_string(),
+                    source: StoreError::Transient(
+                        "cache single-flight leader lost before producing a result".to_string(),
+                    ),
+                },
+            })?;
+        match outcome {
+            ReadOutcome::Hit => {
+                accounting.record_cache_hit();
+                accounting.add_cache_bytes(bytes.len() as u64);
+                Ok((
+                    placeholder_outcome(bytes, seg_ref.object_size),
+                    GetCost::default(),
+                ))
+            }
+            // A late serve made no GET of its own and is not a hit: it stays
+            // the miss its lookup counted, with no store cost and no etag.
+            ReadOutcome::LateServe => {
+                accounting.record_cache_miss();
+                Ok((
+                    placeholder_outcome(bytes, seg_ref.object_size),
+                    GetCost::default(),
+                ))
+            }
+            ReadOutcome::Fetched => {
+                accounting.record_cache_miss();
+                let cost = GetCost {
+                    requests: 1,
+                    bytes: bytes.len() as u64,
+                };
+                // The real etag of this call's own store GET.
+                let etag = leader_etag
+                    .lock()
+                    .ok()
+                    .and_then(|mut slot| slot.take())
+                    .unwrap_or_else(|| Etag(String::new()));
+                Ok((
+                    GetOutcome {
+                        data: bytes,
+                        etag,
+                        version: Version(String::new()),
+                        total_size: seg_ref.object_size,
+                    },
+                    cost,
+                ))
+            }
+        }
+    }
+
+    /// Fetches the parts of `needed` that `regions` does not already hold, in
+    /// at most `max_runs` GETs: the ranges are coalesced within the coalesce
+    /// gap, then [`bound_runs`] bridges the smallest remaining gaps.
+    #[allow(clippy::too_many_arguments)]
+    async fn ensure_ranges(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        suffix_etag: &Etag,
+        needed: &[(u64, u64)],
+        max_runs: usize,
+        regions: &mut FetchedRegions,
+        accounting: &QueryAccounting,
+    ) -> Result<GetCost, FetchError> {
+        let mut reused_bytes: u64 = 0;
+        let missing: Vec<(u64, u64)> = needed
+            .iter()
+            .copied()
+            .filter(|(start, end)| {
+                if regions.covers(*start, *end) {
+                    reused_bytes = reused_bytes.saturating_add(end - start);
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+        if reused_bytes > 0 {
+            accounting.add_bytes_reused(reused_bytes);
+        }
+        if missing.is_empty() {
+            return Ok(GetCost::default());
+        }
+        // Fetch the coalesced ranges concurrently rather than one await at a
+        // time: a multi-page selection over a large segment
+        // used to pay one round trip per coalesced range in series. The
+        // shared semaphore inside `guarded_get` bounds the actual in-flight
+        // GETs; `join_all` preserves input order, so the resulting
+        // `regions` insert order is identical to the old sequential loop.
+        let runs = bound_runs(coalesce_ranges(missing, self.coalesce_gap), max_runs);
+        // Reserve the memory the coalesced runs will materialize before the
+        // `join_all` issues a single GET (ADR-1170 decision 2): a refusal
+        // fails the whole fetch typed, with zero GETs issued, never a smaller
+        // fetch. The guard is owned by `regions`, so it lives exactly as long
+        // as the bytes it accounts for and releases on their drop, never
+        // because the GETs completed.
+        let reserved: u64 = runs
+            .iter()
+            .map(|(start, end)| end.saturating_sub(*start))
+            .fold(0u64, u64::saturating_add);
+        let mut reservation = self.reserve_fetch(reserved)?;
+        if self.cache.is_some() {
+            // Every run below is a `GetRange::Range`, so `guarded_get` routes
+            // all of them through `cached_get` when a cache is configured: the
+            // bytes this reservation covers land in the cache's own ledger too,
+            // on a hit, a late serve or a fetch alike (every `ReadOutcome` arm of
+            // `cached_get`), the same overlap `whole_object_bytes`'s arms
+            // mark, decided once here for the whole coalesced batch
+            // rather than per source.
+            reservation.mark_handed_off();
+        }
+        regions.hold_reservation(reservation);
+        let gets = join_all(runs.into_iter().map(|(start, end)| async move {
+            let (got, got_cost) = self
+                .guarded_get(
+                    seg_ref,
+                    tenant_hash,
+                    GetRange::Range(start, end),
+                    Some(suffix_etag),
+                    accounting,
+                )
+                .await?;
+            Ok::<(u64, Bytes, GetCost), FetchError>((start, got.data, got_cost))
+        }))
+        .await;
+        // Each coalesced GET reports its own store-vs-cache cost, so a range
+        // served from a warm cache adds nothing here while a store GET adds one
+        // request and its bytes (ADR-0044 decision 5). Summing the per-call
+        // costs never sweeps in a cache hit's served bytes.
+        let mut cost = GetCost::default();
+        for got in gets {
+            let (start, data, got_cost) = got?;
+            cost.requests = cost.requests.saturating_add(got_cost.requests);
+            cost.bytes = cost.bytes.saturating_add(got_cost.bytes);
+            regions.insert(start, data);
+        }
+        Ok(cost)
+    }
+
+    /// Opens a segment: suffix-GET, chase `NeedRange` for the footer if
+    /// necessary, and verify identity. Returns the object's `total_size`
+    /// alongside the footer; ADR-0027 leaves v5 the only version, so
+    /// `open_from_suffix` has already rejected anything else and there is no
+    /// per-version dispatch left for callers to do.
+    ///
+    /// Identity verification is level-aware.
+    /// An L0 ref verifies the
+    /// footer's writer identity against the commit record (ADR-0010 §7). An
+    /// L1 part ref has no writer identity of its own, so the footer's
+    /// tenant/shard/ingest_hour/input_set_hash/part_index (and `level == 1`)
+    /// are verified against the compaction record's fields the ref carries.
+    async fn open_segment(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        accounting: &QueryAccounting,
+    ) -> Result<(Footer, u64, Etag, FetchedRegions), FetchError> {
+        // Created and recorded on directly, never through
+        // `tracing::Span::current()` (ADR-0044 decision 5): this span is
+        // debug-level, so at an INFO production level it is disabled, and
+        // `current()` would resolve to the nearest *enabled* ancestor -- the
+        // request-level span, which declares the same `s3_requests`/
+        // `s3_bytes` field names -- silently overwriting that span's
+        // whole-request total with just this segment's own cost. Recording on
+        // a disabled span handle is a no-op, which is correct.
+        let span = tracing::debug_span!(
+            "segment_open",
+            tenant_hash = %tenant_hash.to_hex(),
+            object_size = seg_ref.object_size,
+            s3_requests = tracing::field::Empty,
+            s3_bytes = tracing::field::Empty,
+        );
+        async {
+            // This segment's own GET cost, accumulated from the `guarded_get`
+            // calls this invocation makes itself rather than diffed from the
+            // shared `QueryAccounting`: concurrent sibling segments share that
+            // handle, so a delta would fold their GETs into this span (ADR-0044
+            // decision 5).
+            let mut span_requests: u64 = 0;
+            let mut span_bytes: u64 = 0;
+            let key = &seg_ref.data_object_key;
+            // Size-aware first GET: the commit record already carries the exact
+            // object size, so a small object is read whole in one request (its
+            // footer, catalog, and pages then all come from that buffer, never a
+            // second probe), while a large one reads only the footer tail.
+            //
+            // When the size is known that tail is issued as an absolute range
+            // (`Range(object_size - footer_len, object_size)`), not a suffix, so
+            // ADR-0046's read cache -- keyed by content hash plus absolute range
+            // -- can serve it and a second query over the same segment issues
+            // zero footer GETs (issue #811). A suffix GET is not cache-eligible
+            // (a hit would have no object total size to fabricate) and would
+            // re-fetch the footer every query. The suffix path is kept only for
+            // the case where the size is genuinely absent, and that fallback is
+            // counted (`suffix_fallbacks`) rather than taken silently.
+            // `whole_object_threshold == 0` disables the whole-object path; the
+            // first GET is then the footer tail read (an absolute range when the
+            // size is known, a suffix only when it is absent).
+            let first_range = if seg_ref.object_size == 0 {
+                self.suffix_fallbacks
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::debug!(
+                    object_key = %seg_ref.data_object_key,
+                    "footer read falls back to an uncacheable suffix GET: the segment ref \
+                     carried no object_size, so the read cache cannot serve it"
+                );
+                GetRange::Suffix(self.suffix_len)
+            } else if seg_ref.object_size <= self.whole_object_threshold {
+                GetRange::Full
+            } else {
+                // Clamp the footer length to the object so a `suffix_len` wider
+                // than the object reads the whole object (a valid tail) rather
+                // than underflowing the start offset.
+                let footer_len = self.suffix_len.min(seg_ref.object_size);
+                GetRange::Range(seg_ref.object_size - footer_len, seg_ref.object_size)
+            };
+            let (first, first_cost) = self
+                .guarded_get(seg_ref, tenant_hash, first_range, None, accounting)
+                .await?;
+            // Only this GET's store-sourced cost: zero on a warm cache hit (the
+            // whole-object `Full` first GET is cache-eligible), one GET otherwise.
+            span_requests = span_requests.saturating_add(first_cost.requests);
+            span_bytes = span_bytes.saturating_add(first_cost.bytes);
+            let total_size = first.total_size;
+            let suffix_etag = first.etag.clone();
+            let mut regions = FetchedRegions::default();
+            let first_start = total_size.saturating_sub(first.data.len() as u64);
+            regions.insert(first_start, first.data.clone());
+
+            let footer = match open_from_suffix(&first.data, total_size, self.limits)
+                .map_err(|source| corrupt(key, source))?
+            {
+                FooterOutcome::Ready(loc) => loc.footer,
+                FooterOutcome::NeedRange { offset, len } => {
+                    let (got, got_cost) = self
+                        .guarded_get(
+                            seg_ref,
+                            tenant_hash,
+                            GetRange::Range(offset, offset + len),
+                            Some(&suffix_etag),
+                            accounting,
+                        )
+                        .await?;
+                    // Same store-vs-cache scoping as the first GET: a warm cache
+                    // serves this footer-chase range for zero S3 cost.
+                    span_requests = span_requests.saturating_add(got_cost.requests);
+                    span_bytes = span_bytes.saturating_add(got_cost.bytes);
+                    regions.insert(offset, got.data.clone());
+                    match open_from_suffix(&got.data, total_size, self.limits)
+                        .map_err(|source| corrupt(key, source))?
+                    {
+                        FooterOutcome::Ready(loc) => loc.footer,
+                        FooterOutcome::NeedRange { .. } => {
+                            return Err(corrupt(key, ravel_segment::SegmentError::Truncated));
+                        }
+                    }
+                }
+            };
+
+            match &seg_ref.level {
+                SegmentLevel::L0 => {
+                    let expected = expected_identity(tenant_hash, seg_ref);
+                    check_identity(&footer, &expected).map_err(|source| corrupt(key, source))?;
+                }
+                SegmentLevel::L1 {
+                    input_set_hash,
+                    part_index,
+                } => {
+                    verify_l1_identity(&footer, tenant_hash, seg_ref, input_set_hash, *part_index)
+                        .map_err(|source| corrupt(key, source))?;
+                }
+            }
+            accounting.add_segments_opened(1);
+            // This segment's own GET cost (suffix read plus any footer-chase or
+            // whole-object read above), scoped to the span, not the query total.
+            span.record("s3_requests", span_requests);
+            span.record("s3_bytes", span_bytes);
+            Ok((footer, total_size, suffix_etag, regions))
+        }
+        .instrument(span.clone())
+        .await
+    }
+
+    /// Decodes the catalog and returns the run-major series matching
+    /// `matchers`, fetching only the catalog sections when it can.
+    ///
+    /// - **Below the sparse threshold** a v5 object carries the whole
+    ///   SERIES_META (kind 6): fetch LABEL_DICT + SERIES_IDS + SERIES_META and
+    ///   decode the run-major catalog, so a label-pruned read fetches no page
+    ///   bytes it will not return.
+    /// - **At or above the threshold** (SERIES_META absent) the catalog is the
+    ///   chunked SERIES_META_CHUNKS plus the SERIES_IDX directory. When the
+    ///   object qualifies for the sparse catalog-probe path, fetch
+    ///   just its four catalog sections (LABEL_DICT, SERIES_IDS, SERIES_IDX, and
+    ///   SERIES_META_CHUNKS, contiguous at the object front) and decode via
+    ///   [`decode_catalog_v5_chunked`], skipping the TS/VAL/HIST page bytes the
+    ///   whole-object GET would pull in.
+    ///   [`Self::sparse_probe_qualifies`] gives the crossover.
+    /// - **Otherwise** (a non-qualifying sparse object) fall back to the
+    ///   whole-object decode, unchanged.
+    ///
+    /// Page bytes are fetched afterwards by the caller from `regions`; the run
+    /// page ranges are absolute-in-object on every path, so that step is
+    /// identical regardless of which catalog path ran here.
+    #[allow(clippy::too_many_arguments)]
+    async fn decode_selected(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        footer: &Footer,
+        total_size: u64,
+        suffix_etag: &Etag,
+        regions: &mut FetchedRegions,
+        matchers: &[LabelMatcher],
+        accounting: &QueryAccounting,
+    ) -> Result<DecodedCatalog, FetchError> {
+        // See `open_segment`'s comment: recorded on this handle directly,
+        // never through `tracing::Span::current()`.
+        let span = tracing::debug_span!(
+            "catalog_decode",
+            matcher_count = matchers.len(),
+            total_size,
+            series_matched = tracing::field::Empty,
+        );
+        async {
+            let key = seg_ref.data_object_key.as_str();
+            let matched: DecodedCatalog = if let Some((sm_off, sm_len)) =
+                section_range(footer, SECTION_SERIES_META)
+            {
+                let (ld_off, ld_len) =
+                    section_range(footer, SECTION_LABEL_DICT).ok_or_else(|| {
+                        corrupt(
+                            key,
+                            ravel_segment::SegmentError::MissingSection("LABEL_DICT"),
+                        )
+                    })?;
+                let (si_off, si_len) =
+                    section_range(footer, SECTION_SERIES_IDS).ok_or_else(|| {
+                        corrupt(
+                            key,
+                            ravel_segment::SegmentError::MissingSection("SERIES_IDS"),
+                        )
+                    })?;
+                self.ensure_ranges(
+                    seg_ref,
+                    tenant_hash,
+                    suffix_etag,
+                    &[
+                        (ld_off, ld_off + ld_len),
+                        (si_off, si_off + si_len),
+                        (sm_off, sm_off + sm_len),
+                    ],
+                    1,
+                    regions,
+                    accounting,
+                )
+                .await?;
+                let dict = regions
+                    .slice(ld_off, ld_len)
+                    .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+                let ids = regions
+                    .slice(si_off, si_len)
+                    .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+                let meta = regions
+                    .slice(sm_off, sm_len)
+                    .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+                // Whole SERIES_META present (below the sparse threshold). When
+                // every matcher is a non-empty positive equality, resolve them
+                // to dictionary ordinals and let the catalog decoder skip the
+                // label-set materialization of every non-matching series
+                // (issue #1076); otherwise materialize the whole catalog and
+                // filter it.
+                let reservation = self.reserve_catalog_decode(footer, regions)?;
+                let limits = self.limits;
+                let (decoded, reservation) = match &self.read_gate {
+                    None => (
+                        decode_series_meta_catalog(footer, &dict, &ids, &meta, matchers, limits),
+                        reservation,
+                    ),
+                    Some(gate) => {
+                        let size = JobSize::Bytes(reservation.size());
+                        let footer = footer.clone();
+                        let matchers = matchers.to_vec();
+                        gate.run(ReadSite::SegmentSection, size, move || {
+                            let decoded = decode_series_meta_catalog(
+                                &footer, &dict, &ids, &meta, &matchers, limits,
+                            );
+                            (decoded, reservation)
+                        })
+                        .await
+                        .map_err(|err| gate_failed(key, err))?
+                    }
+                };
+                let (entries, materialized) = decoded.map_err(|source| corrupt(key, source))?;
+                self.record_materialized(materialized);
+                DecodedCatalog {
+                    entries,
+                    reservation: Some(reservation),
+                }
+            } else if let Some(sparse) = self.sparse_probe_qualifies(footer, total_size, matchers) {
+                let (entries, reservation) = self
+                    .decode_sparse_catalog(
+                        seg_ref,
+                        tenant_hash,
+                        footer,
+                        suffix_etag,
+                        regions,
+                        &sparse,
+                        accounting,
+                    )
+                    .await?
+                    .into_parts();
+                self.record_materialized(entries.len());
+                DecodedCatalog {
+                    entries: filter_matching(entries, matchers),
+                    reservation,
+                }
+            } else {
+                self.ensure_ranges(
+                    seg_ref,
+                    tenant_hash,
+                    suffix_etag,
+                    &[(0, total_size)],
+                    1,
+                    regions,
+                    accounting,
+                )
+                .await?;
+                let object = regions
+                    .slice(0, total_size)
+                    .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+                let reservation = self.reserve_catalog_decode(footer, regions)?;
+                let limits = self.limits;
+                let (decoded, reservation) = match &self.read_gate {
+                    None => (
+                        decode_whole_object_catalog(footer, &object, matchers, limits),
+                        reservation,
+                    ),
+                    Some(gate) => {
+                        let size = JobSize::Bytes(reservation.size());
+                        let footer = footer.clone();
+                        let matchers = matchers.to_vec();
+                        gate.run(ReadSite::SegmentSection, size, move || {
+                            let decoded =
+                                decode_whole_object_catalog(&footer, &object, &matchers, limits);
+                            (decoded, reservation)
+                        })
+                        .await
+                        .map_err(|err| gate_failed(key, err))?
+                    }
+                };
+                let (entries, materialized) = decoded.map_err(|source| corrupt(key, source))?;
+                self.record_materialized(materialized);
+                DecodedCatalog {
+                    entries,
+                    reservation: Some(reservation),
+                }
+            };
+            accounting.add_series_matched(matched.len() as u64);
+            // The catalog decode fetches only catalog sections, not page bytes, so
+            // series matched is the meaningful count here rather than decompressed
+            // page bytes (ADR-0044 decision 5: "record decompressed_bytes if
+            // applicable, or series_matched"). Recorded from this call's own count.
+            span.record("series_matched", matched.len() as u64);
+            // The decode was charged for the whole catalog; from here only the
+            // matched entries are held, through the page fetches the caller
+            // runs next.
+            Ok(self.shrink_to_retained(matched))
+        }
+        .instrument(span.clone())
+        .await
+    }
+
+    /// Decides whether a sparse (SERIES_META-absent) v5 object takes the
+    /// catalog-probe path, returning the four catalog section ranges to fetch
+    /// when it does. `None` means fall back to the whole-object decode.
+    ///
+    /// Qualifies when all hold:
+    /// - the object carries both sparse sections (SERIES_IDX +
+    ///   SERIES_META_CHUNKS); a malformed footer missing either falls back,
+    ///   where `decode_catalog_v5` surfaces the same typed error it always did;
+    /// - `matchers` is non-empty. An empty matcher matches every series, so the
+    ///   query wants all pages anyway; a single whole-object GET beats one
+    ///   catalog GET plus a page GET spanning the whole object;
+    /// - the object is at least [`SPARSE_PROBE_MIN_OBJECT_SIZE`], so the page
+    ///   bytes skipped outweigh the extra selective page-range round trips.
+    fn sparse_probe_qualifies(
+        &self,
+        footer: &Footer,
+        total_size: u64,
+        matchers: &[LabelMatcher],
+    ) -> Option<SparseCatalogRanges> {
+        if matchers.is_empty() || total_size < SPARSE_PROBE_MIN_OBJECT_SIZE {
+            return None;
+        }
+        let (ld_off, ld_len) = section_range(footer, SECTION_LABEL_DICT)?;
+        let (si_off, si_len) = section_range(footer, SECTION_SERIES_IDS)?;
+        let (idx_off, idx_len) = section_range(footer, SECTION_SERIES_IDX)?;
+        let (ch_off, ch_len) = section_range(footer, SECTION_SERIES_META_CHUNKS)?;
+        Some(SparseCatalogRanges {
+            label_dict: (ld_off, ld_len),
+            series_ids: (si_off, si_len),
+            series_idx: (idx_off, idx_len),
+            meta_chunks: (ch_off, ch_len),
+        })
+    }
+
+    /// Fetches the four sparse catalog sections named by `ranges` in one GET
+    /// (bridging the gaps between them, and skipping what `regions` already
+    /// holds, so none when it holds them all) and decodes the chunked catalog
+    /// from them, without the page sections. Each section is crc-verified by
+    /// [`decode_catalog_v5_chunked`], so a mis-ranged or corrupt fetch is a
+    /// typed error, never wrong data.
+    #[allow(clippy::too_many_arguments)]
+    async fn decode_sparse_catalog(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        footer: &Footer,
+        suffix_etag: &Etag,
+        regions: &mut FetchedRegions,
+        ranges: &SparseCatalogRanges,
+        accounting: &QueryAccounting,
+    ) -> Result<DecodedCatalog, FetchError> {
+        let key = seg_ref.data_object_key.as_str();
+        let needed = [
+            (
+                ranges.label_dict.0,
+                ranges.label_dict.0 + ranges.label_dict.1,
+            ),
+            (
+                ranges.series_ids.0,
+                ranges.series_ids.0 + ranges.series_ids.1,
+            ),
+            (
+                ranges.series_idx.0,
+                ranges.series_idx.0 + ranges.series_idx.1,
+            ),
+            (
+                ranges.meta_chunks.0,
+                ranges.meta_chunks.0 + ranges.meta_chunks.1,
+            ),
+        ];
+        self.ensure_ranges(
+            seg_ref,
+            tenant_hash,
+            suffix_etag,
+            &needed,
+            1,
+            regions,
+            accounting,
+        )
+        .await?;
+        let dict = regions
+            .slice(ranges.label_dict.0, ranges.label_dict.1)
+            .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+        let ids = regions
+            .slice(ranges.series_ids.0, ranges.series_ids.1)
+            .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+        let idx = regions
+            .slice(ranges.series_idx.0, ranges.series_idx.1)
+            .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+        let chunks = regions
+            .slice(ranges.meta_chunks.0, ranges.meta_chunks.1)
+            .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+        let reservation = self.reserve_catalog_decode(footer, regions)?;
+        let limits = self.limits;
+        let (decoded, reservation) = match &self.read_gate {
+            None => (
+                decode_catalog_v5_chunked(footer, &dict, &ids, &idx, &chunks, limits),
+                reservation,
+            ),
+            Some(gate) => {
+                let size = JobSize::Bytes(reservation.size());
+                let footer = footer.clone();
+                gate.run(ReadSite::SegmentSparseCatalog, size, move || {
+                    let decoded =
+                        decode_catalog_v5_chunked(&footer, &dict, &ids, &idx, &chunks, limits);
+                    (decoded, reservation)
+                })
+                .await
+                .map_err(|err| gate_failed(key, err))?
+            }
+        };
+        let entries = decoded.map_err(|source| corrupt(key, source))?;
+        Ok(DecodedCatalog {
+            entries,
+            reservation: Some(reservation),
+        })
+    }
+
+    /// Coalesced page ranges for the scalar runs of `scalar` (TS/VAL) and the
+    /// histogram runs of `histogram` (TS/HIST), fetched into `regions` in one
+    /// batch, so an L0 segment's page-range GETs stay within
+    /// [`MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`] whichever kinds a query selects.
+    /// `plan_ranges_v4` fills each histogram run's `hist_range` (and leaves
+    /// `val_range` a `(0, 0)` sentinel). Returns the scalar and the histogram
+    /// plans, one entry per run.
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_pages(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        footer: &Footer,
+        scalar: &[&SeriesEntryV4],
+        histogram: &[&SeriesEntryV4],
+        suffix_etag: &Etag,
+        regions: &mut FetchedRegions,
+        accounting: &QueryAccounting,
+    ) -> Result<
+        (
+            Vec<ravel_segment::PlannedRunRange>,
+            Vec<ravel_segment::PlannedRunRange>,
+        ),
+        FetchError,
+    > {
+        let page_kind = match (scalar.is_empty(), histogram.is_empty()) {
+            (false, true) => "scalar",
+            (true, false) => "histogram",
+            _ => "mixed",
+        };
+        // See `open_segment`'s comment: recorded on this handle directly,
+        // never through `tracing::Span::current()`.
+        let span = tracing::debug_span!(
+            "page_fetch",
+            page_kind,
+            series_count = scalar.len() + histogram.len(),
+            s3_requests = tracing::field::Empty,
+            s3_bytes = tracing::field::Empty,
+        );
+        async {
+            let key = seg_ref.data_object_key.as_str();
+            let plan = |series: &[&SeriesEntryV4]| {
+                if series.is_empty() {
+                    return Ok(Vec::new());
+                }
+                plan_ranges_v4(footer, series).map_err(|source| corrupt(key, source))
+            };
+            let scalar_planned = plan(scalar)?;
+            let histogram_planned = plan(histogram)?;
+            let page_ranges: Vec<(u64, u64)> = scalar_planned
+                .iter()
+                .flat_map(|p| {
+                    [
+                        (p.ts_range.0, p.ts_range.0 + p.ts_range.1),
+                        (p.val_range.0, p.val_range.0 + p.val_range.1),
+                    ]
+                })
+                .chain(histogram_planned.iter().flat_map(|p| {
+                    [
+                        (p.ts_range.0, p.ts_range.0 + p.ts_range.1),
+                        (p.hist_range.0, p.hist_range.0 + p.hist_range.1),
+                    ]
+                }))
+                .collect();
+            let max_runs = match seg_ref.level {
+                SegmentLevel::L0 => MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT,
+                SegmentLevel::L1 { .. } => usize::MAX,
+            };
+            let cost = self
+                .ensure_ranges(
+                    seg_ref,
+                    tenant_hash,
+                    suffix_etag,
+                    &page_ranges,
+                    max_runs,
+                    regions,
+                    accounting,
+                )
+                .await?;
+            // This call's own coalesced page-range GET cost, from the GETs
+            // `ensure_ranges` issued for this invocation, scoped to the span.
+            span.record("s3_requests", cost.requests);
+            span.record("s3_bytes", cost.bytes);
+            Ok((scalar_planned, histogram_planned))
+        }
+        .instrument(span.clone())
+        .await
+    }
+
+    /// Decodes one scalar run's TS/VAL pages into `timestamps`/`values`
+    /// (appending), returning the VAL page kind for stats. Shared by the L0
+    /// and L1 sample paths; reuses the caller's decompression `scratch`.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_run(
+        &self,
+        key: &str,
+        series_id: &SeriesId,
+        run: &RunEntry,
+        plan: &ravel_segment::PlannedRunRange,
+        regions: &FetchedRegions,
+        scratch: &mut Vec<u8>,
+        timestamps: &mut Vec<i64>,
+        values: &mut Vec<f64>,
+        accounting: &QueryAccounting,
+    ) -> Result<(ValPageKind, u64), FetchError> {
+        let ts_bytes = regions
+            .slice(plan.ts_range.0, plan.ts_range.1)
+            .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+        let val_bytes = regions
+            .slice(plan.val_range.0, plan.val_range.1)
+            .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+        let before = timestamps.len();
+        let kind = decode_run_pages_soa(
+            series_id,
+            run,
+            &ts_bytes,
+            &val_bytes,
+            self.limits,
+            scratch,
+            timestamps,
+            values,
+        )
+        .map_err(|source| corrupt(key, source))?;
+        // Typed-output footprint (i64 ts + f64 value per sample), not the
+        // intermediate decompression buffer size: `ravel-segment` does not
+        // expose the latter without an out-of-scope change (docs/query-engine.md
+        // "Cost accounting").
+        let added = (timestamps.len() - before) as u64;
+        // Query-level accounting still needs this increment to the shared
+        // handle; the decode span's own count is summed locally by the caller
+        // from the returned value, not diffed off this shared handle (ADR-0044
+        // decision 5).
+        let decompressed = added * 16;
+        accounting.add_decompressed_bytes(decompressed);
+        Ok((kind, decompressed))
+    }
+
+    /// Histogram counterpart to [`decode_run`](Self::decode_run):
+    /// decodes one histogram run's TS/HIST pages into `timestamps`/`values`
+    /// (appending). `decode_run_histogram_pages` yields combined
+    /// [`ravel_segment::HistogramSample`]s (ts + value), which this splits into
+    /// the parallel vecs the SoA shape carries, preserving on-disk order.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_histogram_run(
+        &self,
+        key: &str,
+        series_id: &SeriesId,
+        run: &RunEntry,
+        plan: &ravel_segment::PlannedRunRange,
+        regions: &FetchedRegions,
+        timestamps: &mut Vec<i64>,
+        values: &mut Vec<HistogramValue>,
+        accounting: &QueryAccounting,
+    ) -> Result<u64, FetchError> {
+        let ts_bytes = regions
+            .slice(plan.ts_range.0, plan.ts_range.1)
+            .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+        let hist_bytes = regions
+            .slice(plan.hist_range.0, plan.hist_range.1)
+            .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+        let samples =
+            decode_run_histogram_pages(series_id, run, &ts_bytes, &hist_bytes, self.limits)
+                .map_err(|source| corrupt(key, source))?;
+        let mut added_bytes: u64 = 0;
+        for sample in samples {
+            added_bytes = added_bytes.saturating_add(8 + histogram_value_footprint(&sample.value));
+            timestamps.push(sample.ts_ns);
+            values.push(sample.value);
+        }
+        accounting.add_decompressed_bytes(added_bytes);
+        Ok(added_bytes)
+    }
+
+    /// Core of `fetch`/`fetch_soa`: decodes every matched scalar series into
+    /// one [`RunDecode`] per emitted unit, with resolved provenance keyed on
+    /// the segment level:
+    ///
+    /// - **L0**: one unit per series, all runs concatenated in on-disk order,
+    ///   stamped with the segment's commit-record provenance
+    ///   (`seg_ref.created_unix_ns`/`writer_epoch`/`writer_seq`). An L0 flush
+    ///   frames exactly one run per series, so this is one unit per series.
+    /// - **L1**: one unit per (series, run), each stamped with that run's own
+    ///   provenance copied from the input's commit record at compaction
+    ///   (`RunEntry::created_unix_ns`/`writer_epoch`/`writer_seq`). This makes
+    ///   a query over the L1 part see the same `(series, ts, provenance)`
+    ///   tuples, in the same dedup total order, as a query over the L0 inputs
+    ///   it was built from.
+    ///
+    /// Histogram-valued series are skipped here: a scalar SoA cannot hold
+    /// them. They are fetched by the mirror-image
+    /// [`fetch_histogram_runs`](Self::fetch_histogram_runs) instead. How many
+    /// were skipped is reported on [`FetchStats::histogram_series_skipped`],
+    /// independently of `count_stats` (which gates the page-kind counters
+    /// only): the skip is a completeness fact about the result, not an
+    /// optional statistic.
+    async fn fetch_runs(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+        count_stats: bool,
+        accounting: &PhaseAccounting,
+    ) -> Result<(Vec<RunDecode>, FetchStats), FetchError> {
+        let key = &seg_ref.data_object_key;
+        let (footer, total_size, suffix_etag, mut regions) = self
+            .open_segment(tenant_hash, seg_ref, accounting.plan())
+            .await?;
+        let selected = self
+            .decode_selected(
+                seg_ref,
+                tenant_hash,
+                &footer,
+                total_size,
+                &suffix_etag,
+                &mut regions,
+                matchers,
+                accounting.probe(),
+            )
+            .await?;
+        let scalar: Vec<&SeriesEntryV4> = selected
+            .iter()
+            .filter(|e| e.entry.value_kind == ValueKind::Scalar)
+            .collect();
+        // The catalog is already decoded and its value kinds already read, so
+        // the count of what this filter drops is free here and nowhere else:
+        // a caller that only ever sees the scalar result cannot reconstruct it
+        // (`FetchStats::histogram_series_skipped`).
+        let skipped = (selected.len() - scalar.len()) as u64;
+        if scalar.is_empty() {
+            return Ok((
+                Vec::new(),
+                FetchStats {
+                    histogram_series_skipped: skipped,
+                    ..FetchStats::default()
+                },
+            ));
+        }
+        let (planned, _) = self
+            .fetch_pages(
+                seg_ref,
+                tenant_hash,
+                &footer,
+                &scalar,
+                &[],
+                &suffix_etag,
+                &mut regions,
+                accounting.scan(),
+            )
+            .await?;
+        let (runs, mut stats) = self.build_scalar_decodes(
+            key,
+            seg_ref,
+            &scalar,
+            &planned,
+            &regions,
+            count_stats,
+            accounting.scan(),
+        )?;
+        stats.histogram_series_skipped = skipped;
+        Ok((runs, stats))
+    }
+
+    /// Decodes the already-fetched scalar page bytes of `scalar` into one
+    /// [`RunDecode`] per emitted unit (see [`fetch_runs`](Self::fetch_runs)
+    /// for the per-level emission contract). Split out so the scalar-only
+    /// [`fetch_runs`](Self::fetch_runs) and the combined
+    /// [`fetch_runs_and_histograms`](Self::fetch_runs_and_histograms) share
+    /// one decode body rather than drifting apart.
+    #[allow(clippy::too_many_arguments)]
+    fn build_scalar_decodes(
+        &self,
+        key: &str,
+        seg_ref: &SegmentRef,
+        scalar: &[&SeriesEntryV4],
+        planned: &[ravel_segment::PlannedRunRange],
+        regions: &FetchedRegions,
+        count_stats: bool,
+        accounting: &QueryAccounting,
+    ) -> Result<(Vec<RunDecode>, FetchStats), FetchError> {
+        // See `open_segment`'s comment: recorded on this handle directly,
+        // never through `tracing::Span::current()`. Synchronous function, so
+        // an entered guard (not `.instrument()`) covers the whole body; no
+        // `.await` point can invalidate it.
+        let span = tracing::debug_span!(
+            "decode",
+            page_kind = "scalar",
+            series_count = scalar.len(),
+            decompressed_bytes = tracing::field::Empty,
+        );
+        let _guard = span.enter();
+        // Summed locally from each `decode_run`'s own output rather than
+        // diffed off the shared `QueryAccounting`: sibling segments decode
+        // concurrently on other threads against the same handle, so a delta
+        // would fold their decompressed bytes into this span (ADR-0044
+        // decision 5).
+        let mut span_decompressed: u64 = 0;
+        let mut stats = FetchStats::default();
+        let mut scratch = Vec::new();
+        let mut out = Vec::with_capacity(scalar.len());
+        // `scalar` is the exact slice `fetch_pages` planned from, in the same
+        // order, so a cursor that walks forward in lockstep lands on the
+        // right entry without scanning the rest of the plan.
+        let mut cursor = RunPlanCursor::new(planned);
+        for entry in scalar {
+            match &seg_ref.level {
+                SegmentLevel::L0 => {
+                    // One unit per series: concatenate every run's samples in
+                    // on-disk order, segment-level provenance. `decode_run`
+                    // appends (its page decoders append), so the shared
+                    // `timestamps`/`values` accumulate across runs rather than
+                    // each run clobbering the last. An L0 flush frames exactly
+                    // one run per series today, so this is normally a single
+                    // pass; the concatenation is what keeps a multi-run L0
+                    // (were one ever produced) correct instead of silently
+                    // dropping all but the final run.
+                    let mut timestamps = Vec::new();
+                    let mut values = Vec::new();
+                    for (run_index, run) in entry.runs.iter().enumerate() {
+                        let plan =
+                            cursor
+                                .next(&entry.entry.series_id, run_index)
+                                .ok_or_else(|| {
+                                    corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds)
+                                })?;
+                        let (kind, decoded) = self.decode_run(
+                            key,
+                            &entry.entry.series_id,
+                            run,
+                            plan,
+                            regions,
+                            &mut scratch,
+                            &mut timestamps,
+                            &mut values,
+                            accounting,
+                        )?;
+                        span_decompressed = span_decompressed.saturating_add(decoded);
+                        if count_stats {
+                            stats.record_val_page(kind, plan.val_range.1 as usize);
+                        }
+                    }
+                    out.push(RunDecode {
+                        series_id: entry.entry.series_id,
+                        labels: entry.entry.labels.clone(),
+                        timestamps,
+                        values,
+                        created_unix_ns: seg_ref.created_unix_ns,
+                        writer_epoch: seg_ref.writer_epoch,
+                        writer_seq: seg_ref.writer_seq,
+                        per_sample_priorities: concat_priority_column(&entry.per_sample_provenance),
+                    });
+                }
+                SegmentLevel::L1 { .. } => {
+                    // One unit per (series, run): each run keeps its own
+                    // provenance so cross-input duplicate samples resolve
+                    // under the same total order as the pre-compaction L0s.
+                    for (run_index, run) in entry.runs.iter().enumerate() {
+                        let plan =
+                            cursor
+                                .next(&entry.entry.series_id, run_index)
+                                .ok_or_else(|| {
+                                    corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds)
+                                })?;
+                        let mut timestamps = Vec::new();
+                        let mut values = Vec::new();
+                        let (kind, decoded) = self.decode_run(
+                            key,
+                            &entry.entry.series_id,
+                            run,
+                            plan,
+                            regions,
+                            &mut scratch,
+                            &mut timestamps,
+                            &mut values,
+                            accounting,
+                        )?;
+                        span_decompressed = span_decompressed.saturating_add(decoded);
+                        if count_stats {
+                            stats.record_val_page(kind, plan.val_range.1 as usize);
+                        }
+                        out.push(RunDecode {
+                            series_id: entry.entry.series_id,
+                            labels: entry.entry.labels.clone(),
+                            timestamps,
+                            values,
+                            created_unix_ns: run.created_unix_ns,
+                            writer_epoch: run.writer_epoch,
+                            writer_seq: run.writer_seq,
+                            per_sample_priorities: run_priority_column(
+                                &entry.per_sample_provenance,
+                                run_index,
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        // This decode pass's own decompressed-byte output, scoped to the span.
+        span.record("decompressed_bytes", span_decompressed);
+        Ok((out, stats))
+    }
+
+    /// Histogram counterpart to [`fetch_runs`](Self::fetch_runs):
+    /// decodes every matched histogram-kind series into one
+    /// [`RunHistogramDecode`] per emitted unit, with the same per-level
+    /// provenance resolution as the scalar path (L0: one unit per series, runs
+    /// concatenated, segment provenance; L1: one unit per (series, run), each
+    /// run's own provenance). These are the histogram-kind entries the scalar
+    /// path's `ValueKind::Scalar` filter drops.
+    async fn fetch_histogram_runs(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+        accounting: &PhaseAccounting,
+    ) -> Result<Vec<RunHistogramDecode>, FetchError> {
+        let key = &seg_ref.data_object_key;
+        let (footer, total_size, suffix_etag, mut regions) = self
+            .open_segment(tenant_hash, seg_ref, accounting.plan())
+            .await?;
+        let selected = self
+            .decode_selected(
+                seg_ref,
+                tenant_hash,
+                &footer,
+                total_size,
+                &suffix_etag,
+                &mut regions,
+                matchers,
+                accounting.probe(),
+            )
+            .await?;
+        let histogram: Vec<&SeriesEntryV4> = selected
+            .iter()
+            .filter(|e| e.entry.value_kind == ValueKind::Histogram)
+            .collect();
+        if histogram.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (_, planned) = self
+            .fetch_pages(
+                seg_ref,
+                tenant_hash,
+                &footer,
+                &[],
+                &histogram,
+                &suffix_etag,
+                &mut regions,
+                accounting.scan(),
+            )
+            .await?;
+        self.build_histogram_decodes(
+            key,
+            seg_ref,
+            &histogram,
+            &planned,
+            &regions,
+            accounting.scan(),
+        )
+    }
+
+    /// Histogram counterpart to
+    /// [`build_scalar_decodes`](Self::build_scalar_decodes): decodes the
+    /// already-fetched histogram page bytes of `histogram` into one
+    /// [`RunHistogramDecode`] per emitted unit. Shared by the histogram-only
+    /// [`fetch_histogram_runs`](Self::fetch_histogram_runs) and the combined
+    /// [`fetch_runs_and_histograms`](Self::fetch_runs_and_histograms).
+    fn build_histogram_decodes(
+        &self,
+        key: &str,
+        seg_ref: &SegmentRef,
+        histogram: &[&SeriesEntryV4],
+        planned: &[ravel_segment::PlannedRunRange],
+        regions: &FetchedRegions,
+        accounting: &QueryAccounting,
+    ) -> Result<Vec<RunHistogramDecode>, FetchError> {
+        // See `open_segment`'s comment: recorded on this handle directly,
+        // never through `tracing::Span::current()`. Synchronous function, so
+        // an entered guard (not `.instrument()`) covers the whole body; no
+        // `.await` point can invalidate it.
+        let span = tracing::debug_span!(
+            "decode",
+            page_kind = "histogram",
+            series_count = histogram.len(),
+            decompressed_bytes = tracing::field::Empty,
+        );
+        let _guard = span.enter();
+        // Summed locally from each `decode_histogram_run`'s own output rather
+        // than diffed off the shared `QueryAccounting`, for the same
+        // cross-thread reason as the scalar path (ADR-0044 decision 5).
+        let mut span_decompressed: u64 = 0;
+        let mut out = Vec::with_capacity(histogram.len());
+        // See `build_scalar_decodes`: `histogram` is the exact slice
+        // `fetch_pages` planned from, in the same order.
+        let mut cursor = RunPlanCursor::new(planned);
+        for entry in histogram {
+            match &seg_ref.level {
+                SegmentLevel::L0 => {
+                    // One unit per series: concatenate every run's samples in
+                    // on-disk order, segment-level provenance.
+                    let mut timestamps = Vec::new();
+                    let mut values = Vec::new();
+                    for (run_index, run) in entry.runs.iter().enumerate() {
+                        let plan =
+                            cursor
+                                .next(&entry.entry.series_id, run_index)
+                                .ok_or_else(|| {
+                                    corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds)
+                                })?;
+                        let decoded = self.decode_histogram_run(
+                            key,
+                            &entry.entry.series_id,
+                            run,
+                            plan,
+                            regions,
+                            &mut timestamps,
+                            &mut values,
+                            accounting,
+                        )?;
+                        span_decompressed = span_decompressed.saturating_add(decoded);
+                    }
+                    out.push(RunHistogramDecode {
+                        series_id: entry.entry.series_id,
+                        labels: entry.entry.labels.clone(),
+                        timestamps,
+                        values,
+                        created_unix_ns: seg_ref.created_unix_ns,
+                        writer_epoch: seg_ref.writer_epoch,
+                        writer_seq: seg_ref.writer_seq,
+                        per_sample_priorities: concat_priority_column(&entry.per_sample_provenance),
+                    });
+                }
+                SegmentLevel::L1 { .. } => {
+                    // One unit per (series, run): each run keeps its own
+                    // provenance so cross-input duplicate samples resolve under
+                    // the same total order as the pre-compaction L0s.
+                    for (run_index, run) in entry.runs.iter().enumerate() {
+                        let plan =
+                            cursor
+                                .next(&entry.entry.series_id, run_index)
+                                .ok_or_else(|| {
+                                    corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds)
+                                })?;
+                        let mut timestamps = Vec::new();
+                        let mut values = Vec::new();
+                        let decoded = self.decode_histogram_run(
+                            key,
+                            &entry.entry.series_id,
+                            run,
+                            plan,
+                            regions,
+                            &mut timestamps,
+                            &mut values,
+                            accounting,
+                        )?;
+                        span_decompressed = span_decompressed.saturating_add(decoded);
+                        out.push(RunHistogramDecode {
+                            series_id: entry.entry.series_id,
+                            labels: entry.entry.labels.clone(),
+                            timestamps,
+                            values,
+                            created_unix_ns: run.created_unix_ns,
+                            writer_epoch: run.writer_epoch,
+                            writer_seq: run.writer_seq,
+                            per_sample_priorities: run_priority_column(
+                                &entry.per_sample_provenance,
+                                run_index,
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        // This decode pass's own decompressed-byte output, scoped to the span.
+        span.record("decompressed_bytes", span_decompressed);
+        Ok(out)
+    }
+
+    /// Opens the segment once and decodes both its matched scalar and matched
+    /// histogram series in a single pass. The scalar-only
+    /// [`fetch_runs`](Self::fetch_runs) and histogram-only
+    /// [`fetch_histogram_runs`](Self::fetch_histogram_runs) each re-run
+    /// `open_segment` (a footer GET) and `decode_selected` (catalog decode)
+    /// from scratch; a PromQL/SQL prefetch needs both kinds off every segment,
+    /// so calling the two in sequence opened and decoded each segment twice.
+    /// This shares the one `open_segment` + `decode_selected`, then fetches
+    /// and decodes the scalar and histogram pages off the same `regions`,
+    /// returning byte-for-byte the same units the two separate calls did.
+    async fn fetch_runs_and_histograms(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+        count_stats: bool,
+        accounting: &PhaseAccounting,
+    ) -> Result<(Vec<RunDecode>, FetchStats, Vec<RunHistogramDecode>), FetchError> {
+        let key = &seg_ref.data_object_key;
+        let (footer, total_size, suffix_etag, mut regions) = self
+            .open_segment(tenant_hash, seg_ref, accounting.plan())
+            .await?;
+        let selected = self
+            .decode_selected(
+                seg_ref,
+                tenant_hash,
+                &footer,
+                total_size,
+                &suffix_etag,
+                &mut regions,
+                matchers,
+                accounting.probe(),
+            )
+            .await?;
+        let scalar: Vec<&SeriesEntryV4> = selected
+            .iter()
+            .filter(|e| e.entry.value_kind == ValueKind::Scalar)
+            .collect();
+        let histogram: Vec<&SeriesEntryV4> = selected
+            .iter()
+            .filter(|e| e.entry.value_kind == ValueKind::Histogram)
+            .collect();
+
+        let (scalar_planned, histogram_planned) = if scalar.is_empty() && histogram.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            self.fetch_pages(
+                seg_ref,
+                tenant_hash,
+                &footer,
+                &scalar,
+                &histogram,
+                &suffix_etag,
+                &mut regions,
+                accounting.scan(),
+            )
+            .await?
+        };
+
+        let (scalar_out, stats) = if scalar.is_empty() {
+            (Vec::new(), FetchStats::default())
+        } else {
+            self.build_scalar_decodes(
+                key,
+                seg_ref,
+                &scalar,
+                &scalar_planned,
+                &regions,
+                count_stats,
+                accounting.scan(),
+            )?
+        };
+        let histogram_out = if histogram.is_empty() {
+            Vec::new()
+        } else {
+            self.build_histogram_decodes(
+                key,
+                seg_ref,
+                &histogram,
+                &histogram_planned,
+                &regions,
+                accounting.scan(),
+            )?
+        };
+        Ok((scalar_out, stats, histogram_out))
+    }
+
+    /// Returns the series (labels only, no samples) in this segment matching
+    /// `matchers`. Used by the labels/label-values/series HTTP endpoints,
+    /// which never need page data. Returns the folded per-series
+    /// [`SeriesEntry`] view (labels + identity); an L1 part's multi-run
+    /// series fold to the same per-series shape.
+    pub async fn fetch_series(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+    ) -> Result<Vec<SeriesEntry>, FetchError> {
+        self.fetch_series_accounted(tenant_hash, seg_ref, matchers, &QueryAccounting::new())
+            .await
+    }
+
+    /// Accounted counterpart of [`fetch_series`](Self::fetch_series): same
+    /// behavior, plus every store GET and matched series is recorded against
+    /// `accounting` (ADR-0044). `engine.rs` calls this; `fetch_series` stays
+    /// the unaccounted entry point so `ravel-sql`'s direct calls need no
+    /// signature change.
+    pub async fn fetch_series_accounted(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+        accounting: &QueryAccounting,
+    ) -> Result<Vec<SeriesEntry>, FetchError> {
+        let phase = PhaseAccounting::pooled_over(accounting);
+
+        self.fetch_series_phase_accounted(tenant_hash, seg_ref, matchers, &phase)
+            .await
+    }
+
+    /// Phase-split counterpart of
+    /// [`fetch_series_accounted`](Self::fetch_series_accounted) (issue #796):
+    /// same behavior, but every GET is recorded against the phase that
+    /// issued it (plan for [`open_segment`](Self::open_segment), probe for
+    /// [`decode_selected`](Self::decode_selected)) rather than pooled onto
+    /// one handle. `fetch_series_accounted` is a thin wrapper over this that
+    /// runs it against a [`PhaseAccounting::pooled_over`] its single
+    /// `QueryAccounting` handle, so every GET records straight onto that one
+    /// handle (live, as it is issued) and its callers (`ravel-sql`'s direct
+    /// calls included) see unchanged pooled numbers.
+    pub(crate) async fn fetch_series_phase_accounted(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+        accounting: &PhaseAccounting,
+    ) -> Result<Vec<SeriesEntry>, FetchError> {
+        let (footer, total_size, suffix_etag, mut regions) = self
+            .open_segment(tenant_hash, seg_ref, accounting.plan())
+            .await?;
+        let selected = self
+            .decode_selected(
+                seg_ref,
+                tenant_hash,
+                &footer,
+                total_size,
+                &suffix_etag,
+                &mut regions,
+                matchers,
+                accounting.probe(),
+            )
+            .await?;
+        // The reservation is held until the conversion below finishes; the
+        // returned `Vec<SeriesEntry>` has no slot to carry it further.
+        let (entries, _reservation) = selected.into_parts();
+        Ok(entries.into_iter().map(|e| e.entry).collect())
+    }
+
+    /// Fetches and decodes the scalar samples of every series in this segment
+    /// matching `matchers`. Histogram-kind series carry no scalar samples and
+    /// are skipped: the scalar query path (PromQL/SQL) does not consume them.
+    /// For an L1 part this emits one [`FetchedSeries`] per (series, run) with
+    /// the run's provenance; for an L0 segment one per series with the
+    /// segment's provenance (see [`fetch_runs`](Self::fetch_runs)).
+    pub async fn fetch(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+    ) -> Result<Vec<FetchedSeries>, FetchError> {
+        self.fetch_accounted(tenant_hash, seg_ref, matchers, &QueryAccounting::new())
+            .await
+    }
+
+    /// Accounted counterpart of [`fetch`](Self::fetch); see
+    /// [`fetch_series_accounted`](Self::fetch_series_accounted) for why both
+    /// forms exist.
+    pub async fn fetch_accounted(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+        accounting: &QueryAccounting,
+    ) -> Result<Vec<FetchedSeries>, FetchError> {
+        let phase = PhaseAccounting::pooled_over(accounting);
+        let result = self
+            .fetch_runs(tenant_hash, seg_ref, matchers, false, &phase)
+            .await;
+        let (runs, _stats) = result?;
+        Ok(runs.into_iter().map(RunDecode::into_aos).collect())
+    }
+
+    /// SoA counterpart to `fetch`: decodes the same selected scalar series but returns timestamps
+    /// and values as separate vecs per emitted unit, plus page-kind stats.
+    /// Same per-level emission shape and provenance as `fetch`
+    /// (see [`fetch_runs`](Self::fetch_runs)). Reuses one decompression
+    /// scratch buffer across every run in the segment.
+    pub async fn fetch_soa(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+    ) -> Result<(Vec<FetchedSeriesSoa>, FetchStats), FetchError> {
+        self.fetch_soa_accounted(tenant_hash, seg_ref, matchers, &QueryAccounting::new())
+            .await
+    }
+
+    /// Accounted counterpart of [`fetch_soa`](Self::fetch_soa); see
+    /// [`fetch_series_accounted`](Self::fetch_series_accounted) for why both
+    /// forms exist.
+    pub async fn fetch_soa_accounted(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+        accounting: &QueryAccounting,
+    ) -> Result<(Vec<FetchedSeriesSoa>, FetchStats), FetchError> {
+        let phase = PhaseAccounting::pooled_over(accounting);
+        let result = self
+            .fetch_runs(tenant_hash, seg_ref, matchers, true, &phase)
+            .await;
+        let (runs, stats) = result?;
+        Ok((runs.into_iter().map(RunDecode::into_soa).collect(), stats))
+    }
+
+    /// Phase-split counterpart of [`fetch_soa_accounted`](Self::fetch_soa_accounted)
+    /// (issue #1367): the scalar-only sibling of
+    /// [`fetch_soa_and_histograms_phase_accounted`](Self::fetch_soa_and_histograms_phase_accounted),
+    /// for a caller (`ravel-sql`'s metrics table scan) with no use for
+    /// histogram series that would otherwise pay their decode for nothing.
+    /// `pub`, unlike its histogram-carrying sibling, because `ravel-sql` calls
+    /// it directly with a real, persistent `PhaseAccounting` for per-phase
+    /// visibility, the same way `engine.rs` calls the sibling.
+    pub async fn fetch_soa_phase_accounted(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+        accounting: &PhaseAccounting,
+    ) -> Result<(Vec<FetchedSeriesSoa>, FetchStats), FetchError> {
+        let (runs, stats) = self
+            .fetch_runs(tenant_hash, seg_ref, matchers, true, accounting)
+            .await?;
+        Ok((runs.into_iter().map(RunDecode::into_soa).collect(), stats))
+    }
+
+    /// Histogram counterpart to [`fetch_soa`](Self::fetch_soa): fetches
+    /// and decodes the native-histogram samples of every histogram-kind series
+    /// in this segment matching `matchers`, as SoA
+    /// [`FetchedHistogramSeries`]. Scalar-kind series carry no histogram
+    /// samples and are skipped (the mirror image of `fetch_soa` skipping
+    /// histogram-kind series). Same per-level emission shape and provenance as
+    /// `fetch_soa` (see [`fetch_histogram_runs`](Self::fetch_histogram_runs)).
+    pub async fn fetch_histograms(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+    ) -> Result<Vec<FetchedHistogramSeries>, FetchError> {
+        self.fetch_histograms_accounted(tenant_hash, seg_ref, matchers, &QueryAccounting::new())
+            .await
+    }
+
+    /// Accounted counterpart of [`fetch_histograms`](Self::fetch_histograms);
+    /// see [`fetch_series_accounted`](Self::fetch_series_accounted) for why
+    /// both forms exist.
+    pub async fn fetch_histograms_accounted(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+        accounting: &QueryAccounting,
+    ) -> Result<Vec<FetchedHistogramSeries>, FetchError> {
+        let phase = PhaseAccounting::pooled_over(accounting);
+        let result = self
+            .fetch_histogram_runs(tenant_hash, seg_ref, matchers, &phase)
+            .await;
+        let runs = result?;
+        Ok(runs
+            .into_iter()
+            .map(RunHistogramDecode::into_fetched)
+            .collect())
+    }
+
+    /// Single-open counterpart to calling [`fetch_soa`](Self::fetch_soa) and
+    /// [`fetch_histograms`](Self::fetch_histograms) back to back on the same
+    /// segment: opens the segment once, decodes its catalog
+    /// once, and returns both the scalar SoA series (with page-kind stats) and
+    /// the native-histogram series. The scalar and histogram results are
+    /// identical to the two separate calls; only the segment open and catalog
+    /// decode are shared instead of paid twice.
+    pub async fn fetch_soa_and_histograms(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+    ) -> Result<
+        (
+            Vec<FetchedSeriesSoa>,
+            FetchStats,
+            Vec<FetchedHistogramSeries>,
+        ),
+        FetchError,
+    > {
+        self.fetch_soa_and_histograms_accounted(
+            tenant_hash,
+            seg_ref,
+            matchers,
+            &QueryAccounting::new(),
+        )
+        .await
+    }
+
+    /// Accounted counterpart of
+    /// [`fetch_soa_and_histograms`](Self::fetch_soa_and_histograms); see
+    /// [`fetch_series_accounted`](Self::fetch_series_accounted) for why both
+    /// forms exist.
+    pub async fn fetch_soa_and_histograms_accounted(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+        accounting: &QueryAccounting,
+    ) -> Result<
+        (
+            Vec<FetchedSeriesSoa>,
+            FetchStats,
+            Vec<FetchedHistogramSeries>,
+        ),
+        FetchError,
+    > {
+        let phase = PhaseAccounting::pooled_over(accounting);
+
+        self.fetch_soa_and_histograms_phase_accounted(tenant_hash, seg_ref, matchers, &phase)
+            .await
+    }
+
+    /// Phase-split counterpart of
+    /// [`fetch_soa_and_histograms_accounted`](Self::fetch_soa_and_histograms_accounted)
+    /// (issue #796); see [`fetch_series_phase_accounted`](Self::fetch_series_phase_accounted)
+    /// for why both forms exist. `engine.rs` calls this directly with a real,
+    /// persistent `PhaseAccounting` for end-to-end phase visibility;
+    /// `fetch_soa_and_histograms_accounted` is a thin wrapper over this that
+    /// runs it against a [`PhaseAccounting::pooled_over`] its single
+    /// `QueryAccounting` handle, so every GET records straight onto that one
+    /// handle (live, as it is issued) and its callers (`ravel-sql`'s direct
+    /// calls included) see unchanged pooled numbers.
+    pub(crate) async fn fetch_soa_and_histograms_phase_accounted(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+        accounting: &PhaseAccounting,
+    ) -> Result<
+        (
+            Vec<FetchedSeriesSoa>,
+            FetchStats,
+            Vec<FetchedHistogramSeries>,
+        ),
+        FetchError,
+    > {
+        let (runs, stats, hist_runs) = self
+            .fetch_runs_and_histograms(tenant_hash, seg_ref, matchers, true, accounting)
+            .await?;
+        Ok((
+            runs.into_iter().map(RunDecode::into_soa).collect(),
+            stats,
+            hist_runs
+                .into_iter()
+                .map(RunHistogramDecode::into_fetched)
+                .collect(),
+        ))
+    }
+}
+
+/// Maps one segment [`SampleProvenance`] to the query merge's
+/// [`SamplePriority`]; the four fields are the same comparison tuple.
+fn to_sample_priority(p: &SampleProvenance) -> SamplePriority {
+    SamplePriority {
+        created_unix_ns: p.created_unix_ns,
+        writer_epoch: p.writer_epoch,
+        writer_seq: p.writer_seq,
+        in_page_index: p.in_page_index,
+    }
+}
+
+/// The per-sample priority column for one L1 run (one emission unit per run):
+/// `Some` when the catalog carried the optional provenance columns for that
+/// run, `None` (the common shape) when the run keeps its run-wide provenance.
+/// `provenance` is `SeriesEntryV4::per_sample_provenance`, empty when the object
+/// has no columns at all.
+fn run_priority_column(
+    provenance: &[Option<Vec<SampleProvenance>>],
+    run_index: usize,
+) -> Option<Vec<SamplePriority>> {
+    provenance
+        .get(run_index)
+        .and_then(|opt| opt.as_ref())
+        .map(|col| col.iter().map(to_sample_priority).collect())
+}
+
+/// The per-sample priority column for an L0 emission unit (one series, runs
+/// concatenated). `None` when the object carries no columns (every real L0
+/// object) or when the runs disagree on whether they carry them, which cannot
+/// be expressed as a single column; `Some` concatenates the runs' columns in
+/// run order when every run carries one. No production writer emits L0
+/// provenance, so this is defensive rather than a live path.
+fn concat_priority_column(
+    provenance: &[Option<Vec<SampleProvenance>>],
+) -> Option<Vec<SamplePriority>> {
+    if provenance.is_empty() || provenance.iter().any(|p| p.is_none()) {
+        return None;
+    }
+    let mut out = Vec::new();
+    for col in provenance.iter().flatten() {
+        out.extend(col.iter().map(to_sample_priority));
+    }
+    Some(out)
+}
+
+/// One decoded, provenance-resolved emission unit, convertible to either the
+/// AoS or SoA fetched shape. For L0 this is one series (runs concatenated);
+/// for L1 this is one (series, run).
+struct RunDecode {
+    series_id: SeriesId,
+    labels: LabelSet,
+    timestamps: Vec<i64>,
+    values: Vec<f64>,
+    created_unix_ns: i64,
+    writer_epoch: u64,
+    writer_seq: u64,
+    /// The run's per-sample dedup provenance (ADR-0092 decision 1), parallel to
+    /// `timestamps`/`values`, or `None` when the run keeps its run-wide
+    /// provenance (every object an L0 flush or a v6 verbatim compaction
+    /// produces). Populated from the catalog's optional provenance columns; the
+    /// producer that writes them is issue #315.
+    per_sample_priorities: Option<Vec<SamplePriority>>,
+}
+
+impl RunDecode {
+    // `per_sample_priorities` carries the run's optional provenance column
+    // straight through to the fetched shape: `None` is the level-keyed emission
+    // contract above (an emission unit whose samples share one run-wide
+    // provenance), `Some` a run-merged run whose samples each keep their own key
+    // (ADR-0092 decision 1).
+    fn into_soa(self) -> FetchedSeriesSoa {
+        FetchedSeriesSoa {
+            series_id: self.series_id,
+            labels: self.labels,
+            timestamps: self.timestamps,
+            values: self.values,
+            created_unix_ns: self.created_unix_ns,
+            writer_epoch: self.writer_epoch,
+            writer_seq: self.writer_seq,
+            per_sample_priorities: self.per_sample_priorities,
+        }
+    }
+
+    fn into_aos(self) -> FetchedSeries {
+        let samples = self
+            .timestamps
+            .into_iter()
+            .zip(self.values)
+            .map(|(ts_ns, value)| Sample { ts_ns, value })
+            .collect();
+        FetchedSeries {
+            series_id: self.series_id,
+            labels: self.labels,
+            samples,
+            created_unix_ns: self.created_unix_ns,
+            writer_epoch: self.writer_epoch,
+            writer_seq: self.writer_seq,
+            per_sample_priorities: self.per_sample_priorities,
+        }
+    }
+}
+
+/// Histogram counterpart to [`RunDecode`]: one decoded,
+/// provenance-resolved histogram emission unit. For L0 this is one series
+/// (runs concatenated); for L1 this is one (series, run).
+struct RunHistogramDecode {
+    series_id: SeriesId,
+    labels: LabelSet,
+    timestamps: Vec<i64>,
+    values: Vec<HistogramValue>,
+    created_unix_ns: i64,
+    writer_epoch: u64,
+    writer_seq: u64,
+    /// The run's per-sample dedup provenance (ADR-0092 decision 1), parallel to
+    /// `timestamps`/`values`, or `None` for a run-wide-provenance run; see
+    /// [`RunDecode::per_sample_priorities`].
+    per_sample_priorities: Option<Vec<SamplePriority>>,
+}
+
+impl RunHistogramDecode {
+    fn into_fetched(self) -> FetchedHistogramSeries {
+        FetchedHistogramSeries {
+            series_id: self.series_id,
+            labels: self.labels,
+            timestamps: self.timestamps,
+            values: self.values,
+            created_unix_ns: self.created_unix_ns,
+            writer_epoch: self.writer_epoch,
+            writer_seq: self.writer_seq,
+            per_sample_priorities: self.per_sample_priorities,
+        }
+    }
+}
+
+/// Verify an L1 part's v5 footer against the compaction record's identity
+/// fields the [`SegmentRef`] carries (readers verify
+/// tenant/shard/ingest_hour/input_set_hash/part_index against the record,
+/// the L1 analog of ADR-0010 §7). A part has no writer
+/// identity, so these five fields plus `level == 1` are the identity.
+/// ADR-0027 leaves v5 the only version, so there is no format-version field
+/// to check here beyond what `open_from_suffix` already enforced.
+fn verify_l1_identity(
+    footer: &Footer,
+    tenant_hash: TenantHash,
+    seg_ref: &SegmentRef,
+    input_set_hash: &[u8; 32],
+    part_index: u32,
+) -> Result<(), ravel_segment::SegmentError> {
+    if footer.tenant_hash.as_slice() != tenant_hash.0.as_slice() {
+        return Err(ravel_segment::SegmentError::IdentityMismatch("tenant_hash"));
+    }
+    if footer.shard != seg_ref.shard {
+        return Err(ravel_segment::SegmentError::IdentityMismatch("shard"));
+    }
+    if footer.ingest_hour_bucket != seg_ref.ingest_hour_bucket {
+        return Err(ravel_segment::SegmentError::IdentityMismatch(
+            "ingest_hour_bucket",
+        ));
+    }
+    if footer.input_set_hash.as_slice() != input_set_hash.as_slice() {
+        return Err(ravel_segment::SegmentError::IdentityMismatch(
+            "input_set_hash",
+        ));
+    }
+    if footer.part_index != part_index {
+        return Err(ravel_segment::SegmentError::IdentityMismatch("part_index"));
+    }
+    if footer.level != 1 {
+        return Err(ravel_segment::SegmentError::IdentityMismatch("level"));
+    }
+    Ok(())
+}
+
+/// Sequential lookup of the planned byte ranges for one run of one series,
+/// for a caller that walks `planned` in exactly the order
+/// [`plan_ranges_v4`](ravel_segment::plan_ranges_v4) built it: the same
+/// series slice, in the same order, each series' runs in run order
+/// (`build_scalar_decodes` and `build_histogram_decodes` both do, over the
+/// identical `scalar`/`histogram` slice `fetch_pages` planned from). Each
+/// call advances past the entry it matches, so resolving every run of an
+/// N-entry plan costs O(N) total instead of the O(N^2) a fresh scan per run
+/// costs. A call whose expected entry does not match (a caller order
+/// mismatch, a skipped run) returns `None` rather than the wrong range,
+/// the same miss a scan reports when `series_id`/`run_index` is absent.
+struct RunPlanCursor<'a> {
+    planned: &'a [ravel_segment::PlannedRunRange],
+    pos: usize,
+    /// Entries examined so far; compiled only for the step-count test.
+    #[cfg(test)]
+    steps: usize,
+}
+
+impl<'a> RunPlanCursor<'a> {
+    fn new(planned: &'a [ravel_segment::PlannedRunRange]) -> Self {
+        Self {
+            planned,
+            pos: 0,
+            #[cfg(test)]
+            steps: 0,
+        }
+    }
+
+    fn next(
+        &mut self,
+        series_id: &SeriesId,
+        run_index: usize,
+    ) -> Option<&'a ravel_segment::PlannedRunRange> {
+        let candidate = self.planned.get(self.pos)?;
+        #[cfg(test)]
+        {
+            self.steps += 1;
+        }
+        if &candidate.series_id == series_id && candidate.run_index == run_index {
+            self.pos += 1;
+            Some(candidate)
+        } else {
+            None
+        }
+    }
+}
+
+fn expected_identity(tenant_hash: TenantHash, seg_ref: &SegmentRef) -> ExpectedIdentity {
+    ExpectedIdentity {
+        tenant_hash: tenant_hash.0,
+        shard: seg_ref.shard,
+        writer_id: seg_ref.writer_id.to_string(),
+        writer_epoch: seg_ref.writer_epoch,
+        writer_seq: seg_ref.writer_seq,
+    }
+}
+
+/// The SERIES_META branch's catalog decode: resolve positive equalities to
+/// dictionary ordinals when every matcher is one (issue #1076), otherwise
+/// materialize the whole catalog and filter it. Returns the matched entries
+/// and how many were materialized.
+fn decode_series_meta_catalog(
+    footer: &Footer,
+    dict: &[u8],
+    ids: &[u8],
+    meta: &[u8],
+    matchers: &[LabelMatcher],
+    limits: ReaderLimits,
+) -> Result<(Vec<SeriesEntryV4>, usize), ravel_segment::SegmentError> {
+    if let Some(equals) = ordinal_equals(matchers) {
+        decode_catalog_matching_v4(footer, dict, ids, meta, &equals, limits).map(|matched| {
+            let materialized = matched.len();
+            (matched, materialized)
+        })
+    } else {
+        decode_catalog_v4(footer, dict, ids, meta, limits).map(|entries| {
+            let materialized = entries.len();
+            (filter_matching(entries, matchers), materialized)
+        })
+    }
+}
+
+/// The whole-object branch's catalog decode, filtered to `matchers`. Returns
+/// the matched entries and how many were materialized.
+fn decode_whole_object_catalog(
+    footer: &Footer,
+    object: &[u8],
+    matchers: &[LabelMatcher],
+    limits: ReaderLimits,
+) -> Result<(Vec<SeriesEntryV4>, usize), ravel_segment::SegmentError> {
+    decode_catalog_v5(footer, object, limits).map(|entries| {
+        let materialized = entries.len();
+        (filter_matching(entries, matchers), materialized)
+    })
+}
+
+/// The store error a gate job that never ran reports: the runtime dropped it
+/// at shutdown, or the gate was closed. Either is transient.
+pub(crate) fn gate_not_run(err: CpuGateError) -> StoreError {
+    StoreError::Transient(format!("read CPU gate: {err}"))
+}
+
+/// A failed catalog decode job (ADR-1702 decision 2). A panic is the decode's
+/// own failure, so it is the decode error a corrupt catalog reports, and it
+/// fails the same way on every retry; a job that never ran is transient.
+pub(crate) fn gate_failed(key: &str, err: CpuGateError) -> FetchError {
+    match err {
+        CpuGateError::Panicked => FetchError::Corrupt {
+            key: key.to_string(),
+            source: ravel_segment::SegmentError::Decompress(format!("read CPU gate: {err}")),
+        },
+        CpuGateError::Cancelled | CpuGateError::Closed => FetchError::Store {
+            key: key.to_string(),
+            source: gate_not_run(err),
+        },
+    }
+}
+
+fn corrupt(key: &str, source: ravel_segment::SegmentError) -> FetchError {
+    FetchError::Corrupt {
+        key: key.to_string(),
+        source,
+    }
+}
+
+/// Builds the `GetOutcome` a cache-routed `guarded_get` returns, whether the
+/// bytes came from a cache hit or from the store call inside
+/// `Cache::get_or_fetch`. `etag`/`version` are placeholders: nothing
+/// downstream of a cache-routed get compares them (see `guarded_get`'s doc
+/// comment on why the etag check is skipped for that path), so there is no
+/// live value to put there.
+fn placeholder_outcome(data: Bytes, total_size: u64) -> GetOutcome {
+    GetOutcome {
+        data,
+        etag: Etag(String::new()),
+        version: Version(String::new()),
+        total_size,
+    }
+}
+
+/// Reconstructs an owned `StoreError` from a shared `&StoreError` after a
+/// cache single-flight resolves (`Cache<E>` requires `E: Clone`, which
+/// `StoreError` itself is not; the cache is built over `Arc<StoreError>`
+/// instead, and this un-shares it for the one caller that needs a plain
+/// `StoreError` to build a `FetchError::Store`). Exhaustive over every
+/// `StoreError` variant on purpose: a new variant must fail to compile here
+/// rather than silently falling back to a generic one.
+pub(crate) fn clone_store_error(err: &StoreError) -> StoreError {
+    match err {
+        StoreError::NotFound => StoreError::NotFound,
+        StoreError::AlreadyExists => StoreError::AlreadyExists,
+        StoreError::PreconditionFailed => StoreError::PreconditionFailed,
+        StoreError::AccessDenied(msg) => StoreError::AccessDenied(msg.clone()),
+        StoreError::Throttled { retry_after_ms } => StoreError::Throttled {
+            retry_after_ms: *retry_after_ms,
+        },
+        StoreError::Timeout => StoreError::Timeout,
+        StoreError::Corrupted(msg) => StoreError::Corrupted(msg.clone()),
+        StoreError::InvalidRange(msg) => StoreError::InvalidRange(msg.clone()),
+        StoreError::Transient(msg) => StoreError::Transient(msg.clone()),
+        StoreError::Permanent(msg) => StoreError::Permanent(msg.clone()),
+        StoreError::Unsupported { operation } => StoreError::Unsupported {
+            operation: operation.clone(),
+        },
+        StoreError::ReadOnly { operation, store } => StoreError::ReadOnly {
+            operation: operation.clone(),
+            store: store.clone(),
+        },
+        StoreError::ListRepeatedToken { prefix } => StoreError::ListRepeatedToken {
+            prefix: prefix.clone(),
+        },
+        StoreError::ListPageCeiling { prefix, ceiling } => StoreError::ListPageCeiling {
+            prefix: prefix.clone(),
+            ceiling: *ceiling,
+        },
+        StoreError::ListOrderViolation {
+            prefix,
+            previous,
+            offending,
+        } => StoreError::ListOrderViolation {
+            prefix: prefix.clone(),
+            previous: previous.clone(),
+            offending: offending.clone(),
+        },
+    }
+}
+
+/// Exact typed-output byte footprint of one decoded `HistogramValue`, for
+/// `decompressed_bytes` accounting (docs/query-engine.md "Cost accounting").
+/// Mirrors the struct's own field layout rather than `size_of`, since
+/// `size_of` would not count the heap bytes of its `Vec`/`Option<Vec>` fields.
+fn histogram_value_footprint(v: &HistogramValue) -> u64 {
+    let spans_bytes = |spans: &[ravel_segment::HistogramSpan]| (spans.len() as u64) * 8;
+    let counts_bytes = match &v.counts {
+        ravel_segment::HistogramCounts::Int {
+            positive, negative, ..
+        } => 16 + (positive.len() as u64) * 8 + (negative.len() as u64) * 8,
+        ravel_segment::HistogramCounts::Float {
+            positive, negative, ..
+        } => 16 + (positive.len() as u64) * 8 + (negative.len() as u64) * 8,
+    };
+    4 // scale: i32
+        + 8 // zero_threshold: f64
+        + 8 // sum: Option<f64>, upper bound on the discriminant + payload
+        + v.custom_values.as_ref().map_or(0, |c| (c.len() as u64) * 8)
+        + spans_bytes(&v.positive_spans)
+        + spans_bytes(&v.negative_spans)
+        + counts_bytes
+        + 1 // reset_hint: fieldless enum
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use std::sync::Arc;
+
+    use ravel_catalog::SegmentRef;
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Sequence};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_segment::{
+        CompactionMetaV4, HistogramCounts, HistogramSample, HistogramSpan, HistogramValue,
+        IngestBounds, ResetHint, RunInputV7, SampleProvenance, SegmentIdentity, SegmentWriter,
+        SeriesInput, SeriesInputV3, SeriesInputV7, SeriesValues, encode_run_v4,
+    };
+    use ravel_types::{Label, LabelSet, TenantId};
+    use uuid::Uuid;
+
+    use crate::engine::merge_soa_runs;
+
+    use super::*;
+
+    fn labels(metric: &str) -> LabelSet {
+        LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: metric.to_string(),
+        }])
+        .expect("valid labels")
+    }
+
+    fn series(metric: &str, samples: &[(i64, f64)]) -> SeriesInput {
+        let label_set = labels(metric);
+        let tenant_id = ravel_types::TenantId::new("t".to_string());
+        let series_id =
+            ravel_types::SeriesId::compute(&tenant_id, metric, &label_set).expect("series id");
+        SeriesInput {
+            series_id,
+            labels: label_set,
+            samples: samples
+                .iter()
+                .map(|(ts_ns, value)| ravel_types::Sample {
+                    ts_ns: *ts_ns,
+                    value: *value,
+                })
+                .collect(),
+        }
+    }
+
+    /// Reference implementation `RunPlanCursor` replaces: a full scan of
+    /// `planned` per call, O(N) per lookup and O(N^2) total over a plan with
+    /// N entries. Kept test-only so the acceptance test below has an
+    /// independent oracle.
+    fn find_run_plan_linear_scan<'a>(
+        planned: &'a [ravel_segment::PlannedRunRange],
+        series_id: &SeriesId,
+        run_index: usize,
+    ) -> Option<&'a ravel_segment::PlannedRunRange> {
+        planned
+            .iter()
+            .find(|p| &p.series_id == series_id && p.run_index == run_index)
+    }
+
+    /// Deterministic series id that is NOT in ascending order as `i`
+    /// increases (the high bytes count down while the low bytes count up),
+    /// so a plan built from these ids cannot be walked correctly by
+    /// anything that assumes sorted series ids.
+    fn synthetic_series_id(i: usize) -> SeriesId {
+        let i = i as u64;
+        let mut bytes = [0u8; 16];
+        bytes[0..8].copy_from_slice(&(!i).to_be_bytes());
+        bytes[8..16].copy_from_slice(&i.to_be_bytes());
+        SeriesId(bytes)
+    }
+
+    /// Builds a synthetic `PlannedRunRange` plan for `n_series` series, in
+    /// the same shape `plan_ranges_v4` produces: one entry per run, series in
+    /// the given order, each series' runs in run order. Run counts cycle
+    /// 1, 2, 3 so the plan mixes single- and multi-run series. Returns the
+    /// plan plus, for each series, its id and run count (in plan order), for
+    /// a test to walk in lockstep.
+    fn build_planned(
+        n_series: usize,
+    ) -> (Vec<ravel_segment::PlannedRunRange>, Vec<(SeriesId, usize)>) {
+        let mut planned = Vec::new();
+        let mut series = Vec::new();
+        for i in 0..n_series {
+            let id = synthetic_series_id(i);
+            let run_count = match i % 3 {
+                0 => 1,
+                1 => 2,
+                _ => 3,
+            };
+            series.push((id, run_count));
+            for run_index in 0..run_count {
+                planned.push(ravel_segment::PlannedRunRange {
+                    series_id: id,
+                    run_index,
+                    ts_range: (i as u64, run_index as u64),
+                    val_range: (0, 0),
+                    hist_range: (0, 0),
+                });
+            }
+        }
+        (planned, series)
+    }
+
+    /// `RunPlanCursor` must return exactly what the old linear scan returned
+    /// for every (series, run) a plan actually has, for a run index one past
+    /// a series' last run, and for a series id absent from the plan; none of
+    /// those depend on wall-clock time or on scanning the plan more than
+    /// once, which is what distinguishes this from a mutation that ignores
+    /// `run_index` (it would return the series' first entry for the
+    /// one-past-last-run probe instead of `None`).
+    #[test]
+    fn run_plan_lookup_matches_linear_scan_for_every_series_run() {
+        let (planned, series) = build_planned(300);
+        assert!(series.len() >= 300);
+        let mut cursor = RunPlanCursor::new(&planned);
+        for (id, run_count) in &series {
+            for run_index in 0..*run_count {
+                let scanned = find_run_plan_linear_scan(&planned, id, run_index);
+                let via_cursor = cursor.next(id, run_index);
+                assert!(scanned.is_some(), "scan missed a real plan entry");
+                assert_eq!(
+                    scanned.map(|p| (p.series_id, p.run_index)),
+                    via_cursor.map(|p| (p.series_id, p.run_index)),
+                    "cursor diverged from scan at series {id:?} run {run_index}"
+                );
+            }
+        }
+
+        // One past a series' last run: the scan finds nothing (no entry with
+        // that run_index), and the cursor must agree rather than hand back
+        // the series' first (or any) entry under the wrong run_index.
+        let (first_id, first_run_count) = series[0];
+        assert!(find_run_plan_linear_scan(&planned, &first_id, first_run_count).is_none());
+        let mut probe = RunPlanCursor::new(&planned);
+        assert!(probe.next(&first_id, first_run_count).is_none());
+
+        // A series id absent from the plan: both report no match.
+        let absent_id = synthetic_series_id(n_series_sentinel(&series));
+        assert!(find_run_plan_linear_scan(&planned, &absent_id, 0).is_none());
+        let mut probe = RunPlanCursor::new(&planned);
+        assert!(probe.next(&absent_id, 0).is_none());
+    }
+
+    /// An id guaranteed absent from a plan built by `build_planned`: one past
+    /// the highest index `build_planned` used.
+    fn n_series_sentinel(series: &[(SeriesId, usize)]) -> usize {
+        series.len() + 1
+    }
+
+    /// A caller that asks out of the plan's order must miss rather than
+    /// receive the wrong run's range: skipping a run, and visiting two series
+    /// swapped. A cursor that advances without checking the entry it lands
+    /// on would return the entry at its position under the wrong identity.
+    #[test]
+    fn run_plan_lookup_detects_out_of_order_caller() {
+        let (planned, series) = build_planned(5);
+        let (id0, runs0) = series[0];
+        let (id1, runs1) = series[1];
+        assert!(runs1 >= 2, "need a multi-run second series for this probe");
+
+        // Skipping a run: after series 0, ask for (id1, 1) while the plan's
+        // next entry is (id1, 0).
+        let mut cursor = RunPlanCursor::new(&planned);
+        for run_index in 0..runs0 {
+            assert!(cursor.next(&id0, run_index).is_some());
+        }
+        assert!(cursor.next(&id1, 1).is_none());
+
+        // Two series swapped: the plan holds series 0 then series 1, the
+        // caller visits series 1 first.
+        let mut swapped = RunPlanCursor::new(&planned);
+        assert!(swapped.next(&id1, 0).is_none());
+        let mut swapped = RunPlanCursor::new(&planned);
+        assert!(swapped.next(&id0, 0).is_some());
+        assert!(swapped.next(&id1, 0).is_some());
+        assert!(swapped.next(&id1, 1).is_some());
+        let (id2, _) = series[2];
+        assert!(swapped.next(&id2, 0).is_some());
+        // Going back to an already-consumed series misses.
+        assert!(swapped.next(&id1, 0).is_none());
+    }
+
+    /// Resolving every entry of an N-entry plan costs exactly one examined
+    /// entry per call, at 1,000 and 8,000 plan entries, so a lookup that
+    /// scans the plan per call (quadratic) fails the bound at both sizes. No
+    /// wall-clock assertions.
+    #[test]
+    fn run_plan_lookup_step_count_is_linear_in_plan_size() {
+        // Run counts cycle 1, 2, 3: a series count divisible by 3 gives
+        // exactly 2 entries per series on average.
+        for &(n_series, entries) in &[(501usize, 1_002usize), (4_002usize, 8_004usize)] {
+            let (planned, series) = build_planned(n_series);
+            assert_eq!(planned.len(), entries);
+            let mut cursor = RunPlanCursor::new(&planned);
+            for (id, run_count) in &series {
+                for run_index in 0..*run_count {
+                    assert!(cursor.next(id, run_index).is_some());
+                }
+            }
+            assert_eq!(
+                cursor.steps, entries,
+                "an in-order walk examines exactly one entry per call"
+            );
+            assert!(cursor.steps <= 2 * entries);
+        }
+    }
+
+    /// Writes a real RSEG segment with two series: one whose values compress
+    /// trivially (identical 1.0 values) and one whose values are two samples
+    /// with disjoint bit patterns (a 0.0 and an all-ones NaN payload). Before
+    /// ADR-0092 the latter forced VAL_RAW_F64; under v7's per-page codec
+    /// selection both now land on the smaller ALP / GCD-delta-FOR integer-model
+    /// page. Puts the bytes directly on a `MemoryStore` and returns a matching
+    /// `SegmentRef`.
+    async fn write_test_segment() -> (Arc<MemoryStore>, TenantHash, SegmentRef) {
+        let tenant_hash = TenantHash([7u8; 16]);
+        let writer_id = Uuid::from_u128(1);
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        };
+        const NS: i64 = 1_000_000_000;
+        let smooth = series(
+            "smooth_metric",
+            &[(1_000 * NS, 1.0), (1_001 * NS, 1.0), (1_002 * NS, 1.0)],
+        );
+        let chaotic = series(
+            "chaotic_metric",
+            &[(1_000 * NS, 0.0), (1_001 * NS, f64::from_bits(u64::MAX))],
+        );
+        let written =
+            SegmentWriter::write(vec![smooth, chaotic], identity, bounds).expect("write segment");
+
+        let store = Arc::new(MemoryStore::new());
+        let key = "test/segment.rseg";
+        store
+            .put(key, written.bytes.clone(), PutOptions::default())
+            .await
+            .expect("put segment object");
+
+        let seg_ref = SegmentRef {
+            data_object_key: key.to_string(),
+            object_size: written.bytes.len() as u64,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            ingest_hour_bucket: 0,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            shard: 0,
+            content_hash: written.summary.blake3,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 42,
+            level: ravel_catalog::SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+            declared_column_stats: Default::default(),
+        };
+        (store, tenant_hash, seg_ref)
+    }
+
+    #[tokio::test]
+    async fn fetch_soa_matches_fetch_and_counts_raw_f64_pages() {
+        let (store, tenant_hash, seg_ref) = write_test_segment().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+        let fetcher = SegmentFetcher::new(backend);
+
+        let mut aos = fetcher
+            .fetch(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("fetch");
+        let (mut soa, stats) = fetcher
+            .fetch_soa(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("fetch_soa");
+
+        aos.sort_by_key(|s| s.series_id.0);
+        soa.sort_by_key(|s| s.series_id.0);
+
+        assert_eq!(aos.len(), 2);
+        assert_eq!(soa.len(), 2);
+        for (a, s) in aos.iter().zip(soa.iter()) {
+            assert_eq!(a.series_id, s.series_id);
+            assert_eq!(a.labels, s.labels);
+            assert_eq!(a.created_unix_ns, s.created_unix_ns);
+            assert_eq!(a.writer_epoch, s.writer_epoch);
+            assert_eq!(a.writer_seq, s.writer_seq);
+            assert_eq!(a.samples.len(), s.timestamps.len());
+            assert_eq!(s.timestamps.len(), s.values.len());
+            for (sample, (ts, val)) in a
+                .samples
+                .iter()
+                .zip(s.timestamps.iter().zip(s.values.iter()))
+            {
+                assert_eq!(sample.ts_ns, *ts);
+                assert_eq!(sample.value.to_bits(), val.to_bits());
+            }
+        }
+
+        // "smooth_metric" (identical values) stays VAL_GORILLA. "chaotic_metric"
+        // (a 0.0 and an all-ones NaN payload) no longer falls back to
+        // VAL_RAW_F64: ADR-0092 decision 6 added the ALP and GCD-delta-FOR value
+        // pages, selected per page whenever smaller, and the chaotic fixture now
+        // encodes as one of those. So the raw-f64 counter must report zero
+        // pages. To prove that is a real fixture change rather than a broken
+        // counter, the object must genuinely carry one enc-18/19 (non-raw,
+        // non-Gorilla) page alongside the smooth series' Gorilla page.
+        assert_eq!(
+            stats.raw_f64_pages, 0,
+            "no series falls back to raw f64 under v7's per-page codec selection"
+        );
+        assert_eq!(stats.raw_f64_bytes, 0);
+
+        // Decode each series' actual VAL page kind straight from the stored
+        // object, so the page-kind accounting is asserted end to end.
+        let object = store
+            .get(&seg_ref.data_object_key, GetRange::Full)
+            .await
+            .expect("get object")
+            .data;
+        let loc = ravel_segment::open_from_full(&object, ReaderLimits::default()).expect("open");
+        let entries = decode_catalog_v5(&loc.footer, &object, ReaderLimits::default())
+            .expect("decode catalog");
+        let selected: Vec<&SeriesEntryV4> = entries.iter().collect();
+        let ranges = plan_ranges_v4(&loc.footer, &selected).expect("plan ranges");
+        let mut kinds = Vec::new();
+        for entry in &entries {
+            for (run_index, run) in entry.runs.iter().enumerate() {
+                let range = ranges
+                    .iter()
+                    .find(|r| r.series_id == entry.entry.series_id && r.run_index == run_index)
+                    .expect("range for run");
+                let ts = &object
+                    [range.ts_range.0 as usize..(range.ts_range.0 + range.ts_range.1) as usize];
+                let val = &object
+                    [range.val_range.0 as usize..(range.val_range.0 + range.val_range.1) as usize];
+                let mut scratch = Vec::new();
+                let mut tss = Vec::new();
+                let mut vals = Vec::new();
+                let kind = decode_run_pages_soa(
+                    &entry.entry.series_id,
+                    run,
+                    ts,
+                    val,
+                    ReaderLimits::default(),
+                    &mut scratch,
+                    &mut tss,
+                    &mut vals,
+                )
+                .expect("decode run");
+                kinds.push(kind);
+            }
+        }
+        assert_eq!(
+            kinds.len(),
+            2,
+            "two series, one val page each, got {kinds:?}"
+        );
+        // Under v7's per-page selection both fixtures land on an ALP / GCD-delta-FOR
+        // integer-model page (enc 18/19): the smooth series' constant 1.0 and the
+        // chaotic series' 0.0-plus-NaN both encode smaller that way than as raw
+        // f64 or Gorilla. The property under test survives: no page falls back to
+        // raw f64, and the object genuinely carries the new enc-18/19 pages, so a
+        // regression that reintroduced a raw page (or broke codec selection back
+        // to Gorilla) still fails here.
+        assert!(
+            kinds
+                .iter()
+                .all(|k| matches!(k, ValPageKind::Alp | ValPageKind::GcdDeltaFor)),
+            "both series must select an enc-18/19 page under v7, got {kinds:?}"
+        );
+        assert!(
+            !kinds.contains(&ValPageKind::RawF64),
+            "no raw f64 page under v7, got {kinds:?}"
+        );
+    }
+
+    /// Writes a single-series RSEG object whose lone sample is an incompressible
+    /// double (`0x4008_9abc_def0_1234`, a normal value with a random mantissa).
+    /// Gorilla and both integer-model codecs (ALP, GCD-delta-FOR) lose to a raw
+    /// copy on it, so the writer selects VAL_RAW_F64 -- the positive case the
+    /// `raw_f64_pages` counter must count.
+    async fn write_incompressible_segment() -> (Arc<MemoryStore>, TenantHash, SegmentRef) {
+        let tenant_hash = TenantHash([11u8; 16]);
+        let writer_id = Uuid::from_u128(2);
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        };
+        const NS: i64 = 1_000_000_000;
+        let incompressible = f64::from_bits(0x4008_9abc_def0_1234);
+        let only = series("incompressible_metric", &[(1_000 * NS, incompressible)]);
+        let written = SegmentWriter::write(vec![only], identity, bounds).expect("write segment");
+
+        let store = Arc::new(MemoryStore::new());
+        let key = "test/incompressible.rseg";
+        store
+            .put(key, written.bytes.clone(), PutOptions::default())
+            .await
+            .expect("put segment object");
+
+        let seg_ref = SegmentRef {
+            data_object_key: key.to_string(),
+            object_size: written.bytes.len() as u64,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            ingest_hour_bucket: 0,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            shard: 0,
+            content_hash: written.summary.blake3,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 42,
+            level: ravel_catalog::SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+            declared_column_stats: Default::default(),
+        };
+        (store, tenant_hash, seg_ref)
+    }
+
+    /// Positive case for the `raw_f64_pages` counter. Its predecessor,
+    /// `fetch_soa_matches_fetch_and_counts_raw_f64_pages`, only asserts the
+    /// counter stays zero now that every fixture selects ALP / GCD-delta-FOR;
+    /// nothing there proves the counter increments when a raw page IS present.
+    /// This publishes an incompressible value that genuinely stores as
+    /// VAL_RAW_F64 and asserts both the counter and the decoded page kind.
+    #[tokio::test]
+    async fn fetch_soa_counts_raw_f64_page_for_incompressible_value() {
+        let (store, tenant_hash, seg_ref) = write_incompressible_segment().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+        let fetcher = SegmentFetcher::new(backend);
+
+        let (soa, stats) = fetcher
+            .fetch_soa(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("fetch_soa");
+
+        assert_eq!(soa.len(), 1);
+        assert_eq!(
+            stats.raw_f64_pages, 1,
+            "the incompressible value must select and count one raw f64 page"
+        );
+        assert!(
+            stats.raw_f64_bytes > 0,
+            "a counted raw f64 page must contribute nonzero bytes"
+        );
+
+        // Prove the page really is raw f64, not merely that the counter moved.
+        let object = store
+            .get(&seg_ref.data_object_key, GetRange::Full)
+            .await
+            .expect("get object")
+            .data;
+        let loc = ravel_segment::open_from_full(&object, ReaderLimits::default()).expect("open");
+        let entries = decode_catalog_v5(&loc.footer, &object, ReaderLimits::default())
+            .expect("decode catalog");
+        let selected: Vec<&SeriesEntryV4> = entries.iter().collect();
+        let ranges = plan_ranges_v4(&loc.footer, &selected).expect("plan ranges");
+        let mut kinds = Vec::new();
+        for entry in &entries {
+            for (run_index, run) in entry.runs.iter().enumerate() {
+                let range = ranges
+                    .iter()
+                    .find(|r| r.series_id == entry.entry.series_id && r.run_index == run_index)
+                    .expect("range for run");
+                let ts = &object
+                    [range.ts_range.0 as usize..(range.ts_range.0 + range.ts_range.1) as usize];
+                let val = &object
+                    [range.val_range.0 as usize..(range.val_range.0 + range.val_range.1) as usize];
+                let mut scratch = Vec::new();
+                let mut tss = Vec::new();
+                let mut vals = Vec::new();
+                let kind = decode_run_pages_soa(
+                    &entry.entry.series_id,
+                    run,
+                    ts,
+                    val,
+                    ReaderLimits::default(),
+                    &mut scratch,
+                    &mut tss,
+                    &mut vals,
+                )
+                .expect("decode run");
+                kinds.push(kind);
+            }
+        }
+        assert_eq!(kinds, vec![ValPageKind::RawF64]);
+    }
+
+    fn e2e_series_id() -> SeriesId {
+        SeriesId::compute(&TenantId::new("t".to_string()), "m", &labels("m")).expect("series id")
+    }
+
+    fn e2e_tenant() -> TenantHash {
+        TenantHash([9u8; 16])
+    }
+
+    /// Writes an L1 object whose single merged run carries per-sample
+    /// provenance, and returns a matching L1 `SegmentRef`. The merged sample
+    /// order is deliberately the OPPOSITE of the per-sample created order at the
+    /// duplicate timestamp, so a reader that fell back to run-wide position for
+    /// the fourth dedup element would pick a different winner than the columns
+    /// dictate.
+    async fn write_l1_with_provenance() -> (Arc<MemoryStore>, SegmentRef) {
+        let id = e2e_series_id();
+        let identity = SegmentIdentity {
+            tenant_hash: e2e_tenant().0,
+            shard: 0,
+            writer_id: Uuid::nil().to_string(),
+            writer_epoch: 0,
+            writer_seq: 0,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        };
+        let input_set_hash = [0x33u8; 32];
+        let meta = CompactionMetaV4 {
+            ingest_hour_bucket: 0,
+            input_set_hash,
+            part_index: 0,
+            level: 1,
+        };
+
+        // Merged run, samples in on-disk order (ascending ts, dup ts kept):
+        //   idx0: ts=10 val=1.0  from write A (created 200)
+        //   idx1: ts=10 val=9.0  from write B (created 100)
+        //   idx2: ts=20 val=2.0  from write A (created 200)
+        let samples = SeriesValues::Scalar(vec![
+            Sample {
+                ts_ns: 10,
+                value: 1.0,
+            },
+            Sample {
+                ts_ns: 10,
+                value: 9.0,
+            },
+            Sample {
+                ts_ns: 20,
+                value: 2.0,
+            },
+        ]);
+        // Run-wide created deliberately 100 (the base): if the reader ignored
+        // the columns, run-wide position order would make idx1 (9.0) win ts=10.
+        let run = encode_run_v4(&id, 100, 0, 0, &samples).expect("frame merged run");
+        let provenance = Some(vec![
+            SampleProvenance {
+                created_unix_ns: 200,
+                writer_epoch: 1,
+                writer_seq: 1,
+                in_page_index: 0,
+            },
+            SampleProvenance {
+                created_unix_ns: 100,
+                writer_epoch: 1,
+                writer_seq: 1,
+                in_page_index: 0,
+            },
+            SampleProvenance {
+                created_unix_ns: 200,
+                writer_epoch: 1,
+                writer_seq: 1,
+                in_page_index: 1,
+            },
+        ]);
+        let series = vec![SeriesInputV7 {
+            series_id: id,
+            labels: labels("m"),
+            runs: vec![RunInputV7 { run, provenance }],
+        }];
+        let written =
+            SegmentWriter::write_v7_with_provenance(series, identity, bounds, meta, Vec::new())
+                .expect("write L1 with provenance");
+
+        let store = Arc::new(MemoryStore::new());
+        let key = "test/l1-provenance.rseg";
+        store
+            .put(key, written.bytes.clone(), PutOptions::default())
+            .await
+            .expect("put L1 object");
+        let seg_ref = SegmentRef {
+            data_object_key: key.to_string(),
+            object_size: written.bytes.len() as u64,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            ingest_hour_bucket: 0,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            shard: 0,
+            content_hash: written.summary.blake3,
+            writer_id: Uuid::nil(),
+            writer_epoch: 0,
+            writer_seq: 0,
+            created_unix_ns: 100,
+            level: SegmentLevel::L1 {
+                input_set_hash,
+                part_index: 0,
+            },
+            segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+            declared_column_stats: Default::default(),
+        };
+        (store, seg_ref)
+    }
+
+    /// Writes one L0 object for series `m` with run-wide provenance carried by
+    /// its `SegmentRef` (`created_unix_ns`), the shape a pre-merge flush has.
+    async fn write_l0_run_wide(
+        key: &str,
+        created_unix_ns: i64,
+        samples: &[(i64, f64)],
+    ) -> (Arc<MemoryStore>, SegmentRef) {
+        let identity = SegmentIdentity {
+            tenant_hash: e2e_tenant().0,
+            shard: 0,
+            writer_id: Uuid::from_u128(created_unix_ns as u128).to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: created_unix_ns,
+        };
+        let written = SegmentWriter::write(vec![series_named("m", samples)], identity, bounds)
+            .expect("write L0");
+        let store = Arc::new(MemoryStore::new());
+        store
+            .put(key, written.bytes.clone(), PutOptions::default())
+            .await
+            .expect("put L0 object");
+        let seg_ref = SegmentRef {
+            data_object_key: key.to_string(),
+            object_size: written.bytes.len() as u64,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            ingest_hour_bucket: 0,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            shard: 0,
+            content_hash: written.summary.blake3,
+            writer_id: Uuid::from_u128(created_unix_ns as u128),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+            declared_column_stats: Default::default(),
+        };
+        (store, seg_ref)
+    }
+
+    fn series_named(metric: &str, samples: &[(i64, f64)]) -> SeriesInput {
+        let label_set = labels(metric);
+        let series_id =
+            SeriesId::compute(&TenantId::new("t".to_string()), metric, &label_set).expect("id");
+        SeriesInput {
+            series_id,
+            labels: label_set,
+            samples: samples
+                .iter()
+                .map(|(ts_ns, value)| Sample {
+                    ts_ns: *ts_ns,
+                    value: *value,
+                })
+                .collect(),
+        }
+    }
+
+    /// End-to-end: an L1 run written with per-sample provenance decodes back
+    /// through the real fetch path with `per_sample_priorities` populated, and
+    /// the merge over it picks the same winners as the merge over the
+    /// equivalent run-wide L0 runs. The scenario is constructed so the columns
+    /// override run-wide position at a duplicate timestamp.
+    #[tokio::test]
+    async fn l1_per_sample_provenance_reproduces_run_wide_merge() {
+        let (l1_store, l1_ref) = write_l1_with_provenance().await;
+        let backend: Arc<dyn ObjectStoreBackend> = l1_store;
+        let fetcher = SegmentFetcher::new(backend);
+        let (l1_soa, _stats) = fetcher
+            .fetch_soa(e2e_tenant(), &l1_ref, &[])
+            .await
+            .expect("fetch L1");
+
+        // The read path populated the column, bit-for-bit as written.
+        assert_eq!(l1_soa.len(), 1);
+        let column = l1_soa[0]
+            .per_sample_priorities
+            .as_ref()
+            .expect("per-sample priorities populated for the merged run");
+        assert_eq!(
+            column,
+            &vec![
+                SamplePriority {
+                    created_unix_ns: 200,
+                    writer_epoch: 1,
+                    writer_seq: 1,
+                    in_page_index: 0,
+                },
+                SamplePriority {
+                    created_unix_ns: 100,
+                    writer_epoch: 1,
+                    writer_seq: 1,
+                    in_page_index: 0,
+                },
+                SamplePriority {
+                    created_unix_ns: 200,
+                    writer_epoch: 1,
+                    writer_seq: 1,
+                    in_page_index: 1,
+                },
+            ]
+        );
+
+        let l1_merged = merge_soa_runs(vec![l1_soa], 100, 100).expect("merge L1");
+
+        // The equivalent run-wide runs: write A (created 200) holds ts10=1.0 and
+        // ts20=2.0, write B (created 100) holds ts10=9.0.
+        let (a_store, a_ref) = write_l0_run_wide("test/a.rseg", 200, &[(10, 1.0), (20, 2.0)]).await;
+        let (b_store, b_ref) = write_l0_run_wide("test/b.rseg", 100, &[(10, 9.0)]).await;
+        let a_fetcher = SegmentFetcher::new(a_store as Arc<dyn ObjectStoreBackend>);
+        let (a_soa, _) = a_fetcher
+            .fetch_soa(e2e_tenant(), &a_ref, &[])
+            .await
+            .expect("fetch A");
+        let b_fetcher = SegmentFetcher::new(b_store as Arc<dyn ObjectStoreBackend>);
+        let (b_soa, _) = b_fetcher
+            .fetch_soa(e2e_tenant(), &b_ref, &[])
+            .await
+            .expect("fetch B");
+        let run_wide_merged = merge_soa_runs(vec![a_soa, b_soa], 100, 100).expect("merge run-wide");
+
+        // Same winners: ts10 -> 1.0 (write A, created 200, beats B's 9.0), ts20
+        // -> 2.0. This is the winner the columns dictate; run-wide position over
+        // the merged run alone would instead pick 9.0 at ts10.
+        assert_eq!(l1_merged.len(), 1);
+        assert_eq!(run_wide_merged.len(), 1);
+        let l1_samples = &l1_merged[0].samples;
+        let rw_samples = &run_wide_merged[0].samples;
+        assert_eq!(l1_samples.len(), rw_samples.len());
+        for (a, b) in l1_samples.iter().zip(rw_samples.iter()) {
+            assert_eq!(a.ts_ns, b.ts_ns);
+            assert_eq!(a.value.to_bits(), b.value.to_bits());
+        }
+        // Pin the actual winners so the test is not merely "two equal things".
+        assert_eq!(l1_samples.len(), 2);
+        assert_eq!(l1_samples[0].ts_ns, 10);
+        assert_eq!(l1_samples[0].value.to_bits(), 1.0f64.to_bits());
+        assert_eq!(l1_samples[1].ts_ns, 20);
+        assert_eq!(l1_samples[1].value.to_bits(), 2.0f64.to_bits());
+    }
+
+    /// ADR-0044: `guarded_get`'s counters must match what the store itself
+    /// recorded (cross-checked against `InstrumentedStore`, the object-store
+    /// metrics oracle), and `bytes_reused` must be non-zero for a segment
+    /// with more than one page served from an already-fetched region.
+    #[tokio::test]
+    async fn guarded_get_records_requests_bytes_and_reuse() {
+        let (store, tenant_hash, seg_ref) = write_test_segment().await;
+        let bytes = store
+            .get(&seg_ref.data_object_key, GetRange::Full)
+            .await
+            .expect("read back test segment")
+            .data;
+        let (fetcher, metrics) = metered_fetcher(&seg_ref.data_object_key, bytes).await;
+
+        let accounting = QueryAccounting::new();
+        let (soa, _stats) = fetcher
+            .fetch_soa_accounted(tenant_hash, &seg_ref, &[], &accounting)
+            .await
+            .expect("fetch_soa_accounted");
+        assert_eq!(soa.len(), 2);
+
+        let snapshot = accounting.snapshot();
+        let store_get = metrics.snapshot().get;
+
+        assert_eq!(
+            snapshot.s3_requests(AccountedOp::Get),
+            store_get.calls,
+            "guarded_get's request count must match the store's own call count"
+        );
+        assert_eq!(
+            snapshot.s3_bytes(AccountedOp::Get),
+            store_get.bytes,
+            "guarded_get's byte count must match the store's own bytes-returned count"
+        );
+        assert!(store_get.calls >= 1, "fetch must issue at least one GET");
+        assert!(
+            snapshot.bytes_reused > 0,
+            "two series sharing one small whole-object fetch must reuse bytes \
+             across pages instead of re-fetching them"
+        );
+        assert_eq!(snapshot.segments_opened, 1);
+        assert_eq!(snapshot.series_matched, 2);
+    }
+
+    /// A GET is accounted at issue time: while it is held open inside the
+    /// backend and has not yet returned, it already counts as exactly one
+    /// issued request with zero bytes (the length is unknown until it
+    /// resolves). This is what makes a future dropped or timed out mid-GET
+    /// record the request it started. `FaultStore`'s hold gate parks the GET
+    /// inside the store, so the count is asserted while the call is provably
+    /// pending, not after it completed.
+    #[tokio::test]
+    async fn a_held_get_counts_as_one_issued_request_while_pending() {
+        use ravel_object_store::fault::{GateHandle, Occurrence};
+
+        // Same fixture object, re-homed into a FaultStore so a hold gate can
+        // park its GET. `write_test_segment`'s object is well under the
+        // whole-object threshold, so the fetch issues a single whole-object
+        // GET -- the one call the gate holds.
+        let (source, tenant_hash, seg_ref) = write_test_segment().await;
+        let object_bytes = source
+            .get(&seg_ref.data_object_key, GetRange::Full)
+            .await
+            .expect("read back test segment")
+            .data;
+        let memory = MemoryStore::new();
+        memory
+            .put(
+                &seg_ref.data_object_key,
+                object_bytes.clone(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put segment object");
+        let fault = Arc::new(FaultStore::new(memory, FaultPlan::default()));
+        let gate: GateHandle = fault.hold(Op::Get, None, Occurrence::Always);
+        let backend: Arc<dyn ObjectStoreBackend> = fault;
+        let fetcher = SegmentFetcher::new(backend);
+
+        let accounting = QueryAccounting::new();
+        let fetch_accounting = accounting.clone();
+        let seg = seg_ref.clone();
+        let handle = tokio::spawn(async move {
+            fetcher
+                .fetch_soa_accounted(tenant_hash, &seg, &[], &fetch_accounting)
+                .await
+        });
+
+        // Block until the GET is genuinely parked inside the store. Bounded so
+        // a fetch that stops issuing exactly one GET fails instead of hanging.
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+            .await
+            .expect("the fetch issues its GET within 30 s");
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "exactly one GET is held; the fault fired"
+        );
+
+        let pending = accounting.snapshot();
+        assert_eq!(
+            pending.s3_requests(AccountedOp::Get),
+            1,
+            "the in-flight GET is counted as one issued request while still pending"
+        );
+        assert_eq!(
+            pending.s3_bytes(AccountedOp::Get),
+            0,
+            "no bytes are charged until the GET returns and its length is known"
+        );
+
+        // Release the held GET and let the fetch finish: the bytes are now
+        // charged, and the request count does not double.
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+        let (soa, _stats) = tokio::time::timeout(std::time::Duration::from_secs(30), handle)
+            .await
+            .expect("the released fetch completes within 30 s")
+            .expect("join fetch task")
+            .expect("fetch");
+        assert_eq!(soa.len(), 2);
+
+        let done = accounting.snapshot();
+        assert_eq!(
+            done.s3_requests(AccountedOp::Get),
+            1,
+            "the same GET stays one request after it completes"
+        );
+        assert_eq!(
+            done.s3_bytes(AccountedOp::Get),
+            object_bytes.len() as u64,
+            "the whole-object GET charges exactly the object's byte length at completion"
+        );
+    }
+
+    /// The test segment's bytes behind a `FaultStore` whose gate holds every
+    /// GET, plus the bytes themselves.
+    async fn held_segment_store() -> (
+        Arc<dyn ObjectStoreBackend>,
+        ravel_object_store::fault::GateHandle,
+        TenantHash,
+        SegmentRef,
+        Bytes,
+    ) {
+        use ravel_object_store::fault::Occurrence;
+
+        let (source, tenant_hash, seg_ref) = write_test_segment().await;
+        let object_bytes = source
+            .get(&seg_ref.data_object_key, GetRange::Full)
+            .await
+            .expect("read back test segment")
+            .data;
+        let memory = MemoryStore::new();
+        memory
+            .put(
+                &seg_ref.data_object_key,
+                object_bytes.clone(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put segment object");
+        let fault = Arc::new(FaultStore::new(memory, FaultPlan::default()));
+        let gate = fault.hold(Op::Get, None, Occurrence::Always);
+        (fault, gate, tenant_hash, seg_ref, object_bytes)
+    }
+
+    fn generous_read_cache_limits() -> ravel_cache::CacheLimits {
+        ravel_cache::CacheLimits::new(64 * 1024 * 1024, 1024, 64 * 1024 * 1024)
+    }
+
+    /// Two `cached_get` calls for the whole test segment through `cache`, the
+    /// second joining the first's in-flight GET as a single-flight follower.
+    /// The hold gate keeps the leader's GET parked until `parked` says the
+    /// follower is waiting on the flight, which `MemoryStore` alone cannot do.
+    /// Asserts both read the object and the leader paid the one GET; returns
+    /// the follower's cost and query accounting.
+    async fn race_two_cached_gets(
+        cache: ReadCache,
+        parked: impl Fn(&CacheKey) -> bool,
+    ) -> (GetCost, ravel_types::accounting::QueryAccountingSnapshot) {
+        let (backend, gate, tenant_hash, seg_ref, object_bytes) = held_segment_store().await;
+        let fetcher = SegmentFetcher::new(backend).with_cache(cache);
+        let len = object_bytes.len() as u64;
+        let key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, 0, len);
+        let leader_acc = QueryAccounting::new();
+        let follower_acc = QueryAccounting::new();
+        let release = async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                gate.wait_until_held(1).await;
+                while !parked(&key) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the leader's GET is held and the follower parked within 30 s");
+            assert_eq!(gate.held_count(), 1, "one GET reached the store");
+            for id in gate.held() {
+                assert!(gate.release(id), "held id must release");
+            }
+        };
+        let (leader, follower, ()) = tokio::join!(
+            fetcher.guarded_get(
+                &seg_ref,
+                tenant_hash,
+                GetRange::Range(0, len),
+                None,
+                &leader_acc
+            ),
+            fetcher.guarded_get(
+                &seg_ref,
+                tenant_hash,
+                GetRange::Range(0, len),
+                None,
+                &follower_acc
+            ),
+            release,
+        );
+        let (leader_got, leader_cost) = leader.expect("leader read");
+        let (follower_got, follower_cost) = follower.expect("follower read");
+        assert_eq!(leader_got.data, object_bytes);
+        assert_eq!(follower_got.data, object_bytes);
+        assert_eq!((leader_cost.requests, leader_cost.bytes), (1, len));
+        let leader_snap = leader_acc.snapshot();
+        assert_eq!(leader_snap.s3_requests(AccountedOp::Get), 1);
+        assert_eq!(leader_snap.cache_misses, 1);
+        assert_eq!(leader_snap.cache_hits, 0);
+        (follower_cost, follower_acc.snapshot())
+    }
+
+    /// A late serve's figures: no GET of its own in its `GetCost` or its query
+    /// accounting, and the one cache miss its lookup counted, with no hit and
+    /// no cache bytes.
+    fn assert_late_serve(cost: GetCost, snap: &ravel_types::accounting::QueryAccountingSnapshot) {
+        assert_eq!((cost.requests, cost.bytes), (0, 0), "no GET of its own");
+        assert_eq!(snap.s3_requests(AccountedOp::Get), 0);
+        assert_eq!(snap.cache_misses, 1, "a late serve stays a miss");
+        assert_eq!(snap.cache_hits, 0);
+        assert_eq!(snap.cache_bytes, 0);
+    }
+
+    /// A RAM-only cache's single-flight follower of another `cached_get`'s GET
+    /// is charged no GET and records a query cache miss.
+    ///
+    /// FLIP: mapping `ReadOutcome::LateServe` in `cached_get` to the
+    /// `ReadOutcome::Hit` arm makes the follower a hit with cache bytes; mapping
+    /// it to the `ReadOutcome::Fetched` arm makes its `GetCost::requests` 1.
+    #[tokio::test]
+    async fn a_ram_only_follower_is_a_miss_charged_no_get() {
+        let ram: Arc<Cache<CacheFetchError>> = Arc::new(Cache::new(generous_read_cache_limits()));
+        let ram_metrics = ram.metrics();
+        // The follower joins the flight in the same poll that records its
+        // peek's miss, so two misses mean it is parked on the flight.
+        let parked_metrics = ram_metrics.clone();
+        let (cost, snap) = race_two_cached_gets(ReadCache::Ram(ram), move |_| {
+            parked_metrics.snapshot().misses >= 2
+        })
+        .await;
+        assert_late_serve(cost, &snap);
+        let tier = ram_metrics.snapshot();
+        assert_eq!(tier.misses, 2, "one peek miss per caller");
+        assert_eq!(tier.hits, 0);
+        assert_eq!(tier.single_flight_collapses, 1);
+    }
+
+    /// The tiered cache's single-flight follower is labelled the same way as
+    /// the RAM-only one: no GET, a query cache miss.
+    ///
+    /// FLIP: reporting a tiered follower as `ReadOutcome::Fetched` (the
+    /// `(Served::Upstream, Role::Follower)` arm of `Served::outcome`)
+    /// makes its `GetCost::requests` 1.
+    #[tokio::test]
+    async fn a_tiered_follower_is_a_miss_charged_no_get() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let tiered = Arc::new(TieredCache::new(
+            Cache::new(generous_read_cache_limits()),
+            ravel_cache::DiskCache::new(tmp.path().to_path_buf(), generous_read_cache_limits()),
+        ));
+        let parked = tiered.clone();
+        let (cost, snap) = race_two_cached_gets(ReadCache::Tiered(tiered.clone()), move |key| {
+            parked.in_flight_waiters(key) >= 1
+        })
+        .await;
+        assert_late_serve(cost, &snap);
+        assert_eq!(tiered.ram_metrics().snapshot().single_flight_collapses, 1);
+    }
+
+    /// A `cached_get` whose peek missed and whose leader's RAM recheck then
+    /// found the bytes (admitted in between, as by another flight finishing)
+    /// is charged no GET and records a query cache miss. No GET reaches the
+    /// store at all.
+    ///
+    /// FLIP: mapping `ReadOutcome::LateServe` in `cached_get` to the
+    /// `ReadOutcome::Hit` arm makes this read a hit with cache bytes; making
+    /// `Cache::get_or_fetch_outcome` report every leader as
+    /// `ReadOutcome::Fetched` makes its `GetCost::requests` 1.
+    #[tokio::test]
+    async fn a_ram_only_recheck_serve_is_a_miss_charged_no_get() {
+        let (backend, gate, tenant_hash, seg_ref, object_bytes) = held_segment_store().await;
+        let ram: Arc<Cache<CacheFetchError>> = Arc::new(Cache::new(generous_read_cache_limits()));
+        let ram_metrics = ram.metrics();
+        let fetcher = SegmentFetcher::new(backend).with_cache(ram);
+        let len = object_bytes.len() as u64;
+        let key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, 0, len);
+        ram_recheck_seam::arm(key, object_bytes.clone());
+
+        let acc = QueryAccounting::new();
+        let (got, cost) = fetcher
+            .guarded_get(&seg_ref, tenant_hash, GetRange::Range(0, len), None, &acc)
+            .await
+            .expect("recheck-served read");
+        assert_eq!(got.data, object_bytes);
+        assert_late_serve(cost, &acc.snapshot());
+        assert_eq!(gate.held_count(), 0, "no GET reached the store");
+        let tier = ram_metrics.snapshot();
+        assert_eq!(tier.misses, 1, "the peek's miss");
+        assert_eq!(tier.hits, 0, "the recheck records nothing");
+    }
+
+    /// ADR-1195: two `SegmentFetcher`s sharing one `GetLimiter::new(1)` must
+    /// never let both their GETs reach the store concurrently. The gate
+    /// observes the store's own in-flight GET count directly, so this pins
+    /// the process-wide bound rather than trusting the fetchers' bookkeeping.
+    #[tokio::test]
+    async fn shared_get_limiter_bounds_peak_concurrent_gets_to_one() {
+        use ravel_object_store::fault::{GateHandle, Occurrence};
+
+        let (source, tenant_hash, seg_ref) = write_test_segment().await;
+        let object_bytes = source
+            .get(&seg_ref.data_object_key, GetRange::Full)
+            .await
+            .expect("read back test segment")
+            .data;
+        let memory = MemoryStore::new();
+        memory
+            .put(
+                &seg_ref.data_object_key,
+                object_bytes.clone(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put segment object");
+        let fault = Arc::new(FaultStore::new(memory, FaultPlan::default()));
+        let gate: GateHandle = fault.hold(Op::Get, None, Occurrence::Always);
+        let backend: Arc<dyn ObjectStoreBackend> = fault;
+
+        let shared = Arc::new(crate::GetLimiter::new(1).expect("1 permit is valid"));
+        let fetcher_a = SegmentFetcher::new(backend.clone()).with_get_limiter(shared.clone());
+        let fetcher_b = SegmentFetcher::new(backend).with_get_limiter(shared);
+
+        let seg_a = seg_ref.clone();
+        let handle_a = tokio::spawn(async move { fetcher_a.fetch(tenant_hash, &seg_a, &[]).await });
+        let seg_b = seg_ref.clone();
+        let handle_b = tokio::spawn(async move { fetcher_b.fetch(tenant_hash, &seg_b, &[]).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+            .await
+            .expect("one of the two fetches issues its GET within 30 s");
+
+        // The other fetch's GET must never become in-flight while the shared
+        // permit is held: if the shared limiter did not actually bound
+        // concurrency, `wait_until_held(2)` would resolve well within this
+        // window instead of timing out.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                gate.wait_until_held(2)
+            )
+            .await
+            .is_err(),
+            "one shared permit must cap in-flight GETs at exactly 1, \
+             not merely at more than 0"
+        );
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "one shared permit must cap in-flight GETs at exactly 1"
+        );
+
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+            .await
+            .expect("releasing the first permit lets the second GET proceed within 30 s");
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "the second GET must be the only one held once the first releases"
+        );
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+
+        let a = tokio::time::timeout(std::time::Duration::from_secs(30), handle_a)
+            .await
+            .expect("fetch a completes within 30 s")
+            .expect("join fetch a")
+            .expect("fetch a");
+        let b = tokio::time::timeout(std::time::Duration::from_secs(30), handle_b)
+            .await
+            .expect("fetch b completes within 30 s")
+            .expect("join fetch b")
+            .expect("fetch b");
+        assert_eq!(a.len(), 2);
+        assert_eq!(b.len(), 2);
+    }
+
+    /// Control for [`shared_get_limiter_bounds_peak_concurrent_gets_to_one`]:
+    /// the same two fetchers, but each with its OWN private limiter of 1
+    /// permit rather than a shared one. Private pools do not add, so both
+    /// GETs reach the store at once and peak in-flight is exactly 2 --
+    /// proving the shared test's bound of 1 comes from sharing, not from some
+    /// other serialization (object identity, a single-flight cache, tokio
+    /// scheduling).
+    #[tokio::test]
+    async fn private_get_limiters_do_not_share_a_bound() {
+        use ravel_object_store::fault::{GateHandle, Occurrence};
+
+        let (source, tenant_hash, seg_ref) = write_test_segment().await;
+        let object_bytes = source
+            .get(&seg_ref.data_object_key, GetRange::Full)
+            .await
+            .expect("read back test segment")
+            .data;
+        let memory = MemoryStore::new();
+        memory
+            .put(
+                &seg_ref.data_object_key,
+                object_bytes.clone(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put segment object");
+        let fault = Arc::new(FaultStore::new(memory, FaultPlan::default()));
+        let gate: GateHandle = fault.hold(Op::Get, None, Occurrence::Always);
+        let backend: Arc<dyn ObjectStoreBackend> = fault;
+
+        let fetcher_a = SegmentFetcher::new(backend.clone()).with_max_concurrent_gets(1);
+        let fetcher_b = SegmentFetcher::new(backend).with_max_concurrent_gets(1);
+
+        let seg_a = seg_ref.clone();
+        let handle_a = tokio::spawn(async move { fetcher_a.fetch(tenant_hash, &seg_a, &[]).await });
+        let seg_b = seg_ref.clone();
+        let handle_b = tokio::spawn(async move { fetcher_b.fetch(tenant_hash, &seg_b, &[]).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(2))
+            .await
+            .expect("two independently-limited fetchers both reach the store within 30 s");
+        assert_eq!(
+            gate.held_count(),
+            2,
+            "two private 1-permit limiters admit exactly 2 concurrent GETs, not 1"
+        );
+
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+        let a = tokio::time::timeout(std::time::Duration::from_secs(30), handle_a)
+            .await
+            .expect("fetch a completes within 30 s")
+            .expect("join fetch a")
+            .expect("fetch a");
+        let b = tokio::time::timeout(std::time::Duration::from_secs(30), handle_b)
+            .await
+            .expect("fetch b completes within 30 s")
+            .expect("join fetch b")
+            .expect("fetch b");
+        assert_eq!(a.len(), 2);
+        assert_eq!(b.len(), 2);
+    }
+
+    /// ADR-0044: accounting must be pure observation. The accounted and
+    /// unaccounted entry points must fetch identical bytes and decode
+    /// identical samples -- including the NaN bit pattern in
+    /// "chaotic_metric" -- with counting the only added work.
+    #[tokio::test]
+    async fn fetch_soa_accounted_matches_unaccounted_fetch_bit_for_bit() {
+        let (store, tenant_hash, seg_ref) = write_test_segment().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let fetcher = SegmentFetcher::new(backend);
+
+        let (mut plain, plain_stats) = fetcher
+            .fetch_soa(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("fetch_soa");
+        let accounting = QueryAccounting::new();
+        let (mut accounted, accounted_stats) = fetcher
+            .fetch_soa_accounted(tenant_hash, &seg_ref, &[], &accounting)
+            .await
+            .expect("fetch_soa_accounted");
+
+        plain.sort_by_key(|s| s.series_id.0);
+        accounted.sort_by_key(|s| s.series_id.0);
+
+        assert_eq!(plain_stats, accounted_stats);
+        assert_eq!(plain.len(), accounted.len());
+        for (p, a) in plain.iter().zip(accounted.iter()) {
+            assert_eq!(p.series_id, a.series_id);
+            assert_eq!(p.labels, a.labels);
+            assert_eq!(p.timestamps, a.timestamps);
+            assert_eq!(p.values.len(), a.values.len());
+            for (pv, av) in p.values.iter().zip(a.values.iter()) {
+                assert_eq!(
+                    pv.to_bits(),
+                    av.to_bits(),
+                    "sample bit patterns must match exactly, NaN included"
+                );
+            }
+        }
+
+        let snapshot = accounting.snapshot();
+        assert!(
+            snapshot.segments_opened > 0,
+            "the accounted path must have actually recorded counters"
+        );
+    }
+
+    /// A simple int-counts native histogram varying only by `count`/`sum`, so
+    /// two samples in one series are structurally distinct and their round-trip
+    /// is unambiguous.
+    fn hist_value(count: u64, sum: f64) -> HistogramValue {
+        HistogramValue {
+            scale: 2,
+            zero_threshold: 1e-9,
+            sum: Some(sum),
+            custom_values: None,
+            positive_spans: vec![HistogramSpan {
+                offset: 0,
+                length: 1,
+            }],
+            negative_spans: vec![],
+            counts: HistogramCounts::Int {
+                zero_count: 0,
+                count,
+                positive: vec![count],
+                negative: vec![],
+            },
+            reset_hint: ResetHint::Unknown,
+        }
+    }
+
+    fn hist_series(metric: &str, samples: Vec<HistogramSample>) -> SeriesInputV3 {
+        let label_set = labels(metric);
+        let tenant_id = ravel_types::TenantId::new("t".to_string());
+        let series_id =
+            ravel_types::SeriesId::compute(&tenant_id, metric, &label_set).expect("series id");
+        SeriesInputV3 {
+            series_id,
+            labels: label_set,
+            values: SeriesValues::Histogram(samples),
+        }
+    }
+
+    fn scalar_series_v3(metric: &str, samples: &[(i64, f64)]) -> SeriesInputV3 {
+        let label_set = labels(metric);
+        let tenant_id = ravel_types::TenantId::new("t".to_string());
+        let series_id =
+            ravel_types::SeriesId::compute(&tenant_id, metric, &label_set).expect("series id");
+        SeriesInputV3 {
+            series_id,
+            labels: label_set,
+            values: SeriesValues::Scalar(
+                samples
+                    .iter()
+                    .map(|(ts_ns, value)| ravel_types::Sample {
+                        ts_ns: *ts_ns,
+                        value: *value,
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Writes a real HIST_PAGES segment (via `write_histograms`) carrying one
+    /// histogram-kind series and one scalar-kind series, puts it on a
+    /// `MemoryStore`, and returns a matching L0 `SegmentRef`.
+    async fn write_histogram_test_segment() -> (Arc<MemoryStore>, TenantHash, SegmentRef) {
+        let tenant_hash = TenantHash([9u8; 16]);
+        let writer_id = Uuid::from_u128(2);
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        };
+        const NS: i64 = 1_000_000_000;
+        let hist = hist_series(
+            "hist_metric",
+            vec![
+                HistogramSample {
+                    ts_ns: 1_000 * NS,
+                    value: hist_value(3, 6.0),
+                },
+                HistogramSample {
+                    ts_ns: 1_001 * NS,
+                    value: hist_value(5, 11.0),
+                },
+            ],
+        );
+        let scalar = scalar_series_v3("scalar_metric", &[(1_000 * NS, 1.0), (1_001 * NS, 2.0)]);
+        let written = SegmentWriter::write_histograms(vec![hist, scalar], identity, bounds)
+            .expect("write histogram segment");
+
+        let store = Arc::new(MemoryStore::new());
+        let key = "test/hist-segment.rseg";
+        store
+            .put(key, written.bytes.clone(), PutOptions::default())
+            .await
+            .expect("put segment object");
+
+        let seg_ref = SegmentRef {
+            data_object_key: key.to_string(),
+            object_size: written.bytes.len() as u64,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            ingest_hour_bucket: 0,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            shard: 0,
+            content_hash: written.summary.blake3,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 77,
+            level: ravel_catalog::SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+            declared_column_stats: Default::default(),
+        };
+        (store, tenant_hash, seg_ref)
+    }
+
+    #[tokio::test]
+    async fn fetch_histograms_round_trips_hist_pages_and_skips_scalar() {
+        let (store, tenant_hash, seg_ref) = write_histogram_test_segment().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let fetcher = SegmentFetcher::new(backend);
+
+        // The histogram path returns only the histogram-kind series, with its
+        // samples decoded from HIST_PAGES back to the exact input values.
+        let hist = fetcher
+            .fetch_histograms(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("fetch_histograms");
+        assert_eq!(hist.len(), 1, "only the histogram-kind series is returned");
+        let series = &hist[0];
+        assert_eq!(series.labels, labels("hist_metric"));
+        assert_eq!(series.created_unix_ns, seg_ref.created_unix_ns);
+        const NS: i64 = 1_000_000_000;
+        assert_eq!(series.timestamps, vec![1_000 * NS, 1_001 * NS]);
+        assert_eq!(series.values, vec![hist_value(3, 6.0), hist_value(5, 11.0)]);
+
+        // The scalar path is the mirror image: it returns only the scalar-kind
+        // series and never the histogram one.
+        let (scalar, _stats) = fetcher
+            .fetch_soa(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("fetch_soa");
+        assert_eq!(scalar.len(), 1, "only the scalar-kind series is returned");
+        assert_eq!(scalar[0].labels, labels("scalar_metric"));
+    }
+
+    /// Writes a real sparse (>= 4096-series) v5 RSEG object. Above the
+    /// threshold `SegmentWriter::write` emits the SERIES_IDX + chunked
+    /// SERIES_META sections (ADR-0026), so `SERIES_META` (kind 6) is absent and
+    /// the fetcher sees a sparse object. `samples_per` scalar samples per series
+    /// keep the TS/VAL page sections large relative to the catalog, so the
+    /// catalog-probe path's byte win is unambiguous. Returns the object bytes
+    /// and a matching L0 `SegmentRef`.
+    async fn write_sparse_test_segment(
+        n_series: usize,
+        samples_per: usize,
+    ) -> (Bytes, TenantHash, SegmentRef) {
+        let tenant_hash = TenantHash([5u8; 16]);
+        let writer_id = Uuid::from_u128(3);
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        };
+        const NS: i64 = 1_000_000_000;
+        let mut inputs = Vec::with_capacity(n_series);
+        for i in 0..n_series {
+            let metric = format!("sparse_metric_{i}");
+            let samples: Vec<(i64, f64)> = (0..samples_per)
+                .map(|j| {
+                    // Incompressible values: a bit-mixed pattern per (series,
+                    // sample) so every VAL page falls back to raw f64 rather than
+                    // an ALP / GCD-delta-FOR / Gorilla page. Under v7's per-page
+                    // codec selection a smoothly-varying value stream compresses
+                    // to almost nothing, which would shrink the object below the
+                    // sparse-probe floor and, worse, leave the fixed-size catalog
+                    // dominating the object so the catalog-probe read (which
+                    // fetches the whole catalog) would no longer be a fraction of
+                    // it. Keeping the pages genuinely large is what makes "probe
+                    // reads far less than the whole object" a real property.
+                    let bits = (i as u64)
+                        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                        .wrapping_add((j as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F));
+                    ((1_000 + j as i64) * NS, f64::from_bits(bits))
+                })
+                .collect();
+            inputs.push(series(&metric, &samples));
+        }
+        let written = SegmentWriter::write(inputs, identity, bounds).expect("write sparse segment");
+
+        let seg_ref = SegmentRef {
+            data_object_key: "test/sparse-segment.rseg".to_string(),
+            object_size: written.bytes.len() as u64,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            ingest_hour_bucket: 0,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            shard: 0,
+            content_hash: written.summary.blake3,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 99,
+            level: ravel_catalog::SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+            declared_column_stats: Default::default(),
+        };
+        (written.bytes, tenant_hash, seg_ref)
+    }
+
+    /// Puts `bytes` on a fresh `MemoryStore` wrapped in an `InstrumentedStore`,
+    /// returning a fetcher over it plus the shared metrics handle. The metrics
+    /// count exactly the GET calls and bytes the fetcher issued.
+    async fn metered_fetcher(
+        key: &str,
+        bytes: Bytes,
+    ) -> (SegmentFetcher, Arc<ravel_object_store::StoreMetrics>) {
+        let memory = MemoryStore::new();
+        memory
+            .put(key, bytes, PutOptions::default())
+            .await
+            .expect("put sparse object");
+        let instrumented = Arc::new(ravel_object_store::InstrumentedStore::new(memory));
+        let metrics = instrumented.metrics();
+        let backend: Arc<dyn ObjectStoreBackend> = instrumented;
+        (SegmentFetcher::new(backend), metrics)
+    }
+
+    /// A matcher-pruned read of a sparse (>= 4096-series) v5 segment
+    /// fetches only the catalog sections (LABEL_DICT + SERIES_IDS + SERIES_IDX +
+    /// SERIES_META_CHUNKS) plus the matched series' pages, instead of a
+    /// whole-object GET. The probe read moves far fewer bytes than the object
+    /// size, and returns exactly the matched series' samples.
+    #[tokio::test]
+    async fn sparse_segment_uses_catalog_probe_path_not_whole_object() {
+        // 4096 series (the sparse-emission threshold) each with 32 raw-f64
+        // samples: enough page bytes that the object clears the probe floor and
+        // the whole-catalog probe stays a small fraction of it under v7's
+        // codecs.
+        let (bytes, tenant_hash, seg_ref) = write_sparse_test_segment(4096, 32).await;
+        let object_size = seg_ref.object_size;
+        assert!(
+            object_size > SPARSE_PROBE_MIN_OBJECT_SIZE,
+            "sparse test object ({object_size} B) must exceed the probe-path floor"
+        );
+
+        // Matcher pins one metric, so only its series' pages should be fetched.
+        let matchers = [LabelMatcher::equal("__name__", "sparse_metric_2000")];
+        let (fetcher, metrics) = metered_fetcher(&seg_ref.data_object_key, bytes.clone()).await;
+        // The whole-object path reads an object whole on its first GET when its size is at
+        // or below `whole_object_threshold` (default 512 KiB); this test's
+        // sparse object is smaller than that, so without disabling it here the
+        // first GET alone would already cover the whole object and the
+        // catalog-probe path below would correctly find nothing left to fetch
+        // -- exercising the whole-object optimization instead of the one this test is
+        // for. Disable it so the first GET stays a footer tail read and this
+        // test isolates the catalog-probe path on its own.
+        let fetcher = fetcher.with_whole_object_threshold(0);
+        let (soa, _stats) = fetcher
+            .fetch_soa(tenant_hash, &seg_ref, &matchers)
+            .await
+            .expect("fetch_soa probe path");
+
+        assert_eq!(soa.len(), 1, "exactly the matched series is returned");
+        assert_eq!(soa[0].labels, labels("sparse_metric_2000"));
+        assert_eq!(soa[0].timestamps.len(), 32);
+        assert_eq!(soa[0].values.len(), 32);
+
+        let probe = metrics.snapshot().get;
+        // The probe path never GETs the whole object: its total bytes stay well
+        // under the object size (catalog sections + one series' pages + the
+        // 64 KiB footer suffix), where the whole-object fallback would move at
+        // least `object_size` bytes in one GET.
+        assert!(
+            probe.bytes < object_size,
+            "probe path moved {} B, must be under the {object_size} B object",
+            probe.bytes
+        );
+        assert!(
+            probe.bytes < object_size / 2,
+            "probe path ({} B) should be far under half the object ({object_size} B)",
+            probe.bytes
+        );
+    }
+
+    /// `decode_sparse_catalog` charges the bytes the chunked catalog actually
+    /// inflates to, not the stored frames' length its footer descriptor
+    /// records, and that reservation rides with the decoded entries after the
+    /// fetched regions are gone.
+    ///
+    /// SERIES_META_CHUNKS carries no section-level compression, so its footer
+    /// `uncompressed_len` IS the stored (zstd) frame bytes, while the decoder
+    /// inflates every frame and materializes all 4096 entries. The exact
+    /// figures below are the fixture's, and they are what makes the
+    /// distinction visible: the compressed-size reservation is a small
+    /// fraction of the real one. `frame_uncompressed_len` comes from the
+    /// writer's chunk-frame encoding, not from zstd, so it does not move with
+    /// the compressor.
+    ///
+    /// FLIP: ignore `meta_chunks_inflated` in `catalog_decode_len` (take the
+    /// `_ =>` arm for SERIES_META_CHUNKS too, which is the pre-fix code) and
+    /// the reserved figure drops to `SPARSE_STORED_CATALOG_LEN`, failing the
+    /// first assertion with `left: 151466, right: 233223`.
+    #[tokio::test]
+    async fn sparse_catalog_decode_reserves_its_output() {
+        let (bytes, tenant_hash, seg_ref) = write_sparse_test_segment(4096, 32).await;
+        let (fetcher, _metrics) = metered_fetcher(&seg_ref.data_object_key, bytes).await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 30));
+        let fetcher = fetcher
+            .with_whole_object_threshold(0)
+            .with_memory_budget(budget.clone());
+        let accounting = QueryAccounting::new();
+        let matchers = [LabelMatcher::equal("__name__", "sparse_metric_2000")];
+
+        let (footer, total, etag, mut regions) = fetcher
+            .open_segment(tenant_hash, &seg_ref, &accounting)
+            .await
+            .expect("open segment");
+        let sparse = fetcher
+            .sparse_probe_qualifies(&footer, total, &matchers)
+            .expect("the fixture takes the sparse catalog-probe path");
+
+        // `decode_sparse_catalog` rather than `decode_selected`: this is the
+        // reservation as taken, before the matcher filter shrinks it
+        // (`shrink_to_retained`, pinned by
+        // `sparse_catalog_reservation_shrinks_to_the_retained_entries`).
+        let decoded = fetcher
+            .decode_sparse_catalog(
+                &seg_ref,
+                tenant_hash,
+                &footer,
+                &etag,
+                &mut regions,
+                &sparse,
+                &accounting,
+            )
+            .await
+            .expect("decode sparse catalog");
+        assert_eq!(decoded.len(), 4096, "every series in the chunked catalog");
+        assert_eq!(
+            declared_catalog_len(&footer),
+            SPARSE_STORED_CATALOG_LEN,
+            "the footer figure the pre-fix reservation used"
+        );
+
+        drop(regions);
+        assert_eq!(
+            budget.reserved(),
+            SPARSE_INFLATED_CATALOG_LEN,
+            "the inflated chunk frames stay charged with the entries"
+        );
+        // The other three catalog sections are stored uncompressed, so the
+        // whole gap between the two totals is SERIES_META_CHUNKS alone.
+        let chunks_stored = footer
+            .sections
+            .iter()
+            .find(|s| s.kind == SECTION_SERIES_META_CHUNKS)
+            .expect("the fixture is chunked")
+            .uncompressed_len;
+        assert_eq!(chunks_stored, SPARSE_STORED_META_CHUNKS_LEN);
+        let chunks_inflated =
+            SPARSE_INFLATED_CATALOG_LEN - (SPARSE_STORED_CATALOG_LEN - chunks_stored);
+        assert_eq!(
+            chunks_inflated, SPARSE_INFLATED_META_CHUNKS_LEN,
+            "the whole difference is the chunk frames"
+        );
+        assert!(
+            chunks_inflated > chunks_stored * 10,
+            "the stored frames understate what they inflate to ten times over: \
+             {chunks_inflated} against {chunks_stored}"
+        );
+        drop(decoded);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// A SERIES_IDX whose bytes fail their section crc32c does not set the
+    /// catalog charge: the reservation falls back to the footer figure and the
+    /// decode reports the corruption, rather than an inflated charge read from
+    /// the corrupt directory refusing the read as a retryable budget error.
+    ///
+    /// The flipped byte is the high byte of chunk 0's `frame_uncompressed_len`,
+    /// so the corrupt directory still parses and claims a frame at the section
+    /// ceiling, far over the 1 MiB budget that fits the honest charge.
+    ///
+    /// FLIP: drop the crc32c check in `meta_chunks_inflated_len` and the read
+    /// fails with `FetchMemoryExhausted { requested: 1073963752, .. }` instead.
+    #[tokio::test]
+    async fn corrupt_series_idx_is_corrupt_data_not_a_budget_refusal() {
+        let (bytes, tenant_hash, seg_ref) = write_sparse_test_segment(4096, 32).await;
+        let (clean, _metrics) = metered_fetcher(&seg_ref.data_object_key, bytes.clone()).await;
+        let (footer, _total, _etag, _regions) = clean
+            .open_segment(tenant_hash, &seg_ref, &QueryAccounting::new())
+            .await
+            .expect("open the clean segment");
+        let idx = footer
+            .sections
+            .iter()
+            .find(|s| s.kind == SECTION_SERIES_IDX)
+            .expect("the fixture is chunked");
+        assert_eq!(idx.comp, COMPRESSION_NONE);
+        let idx_start = usize::try_from(idx.offset).expect("offset fits");
+        let at = |pos: usize| idx_start + pos;
+        let sparse_count =
+            u32::from_le_bytes(bytes[at(12)..at(16)].try_into().expect("four bytes")) as usize;
+        // version, flags and reserved (4), stride, series_count and
+        // sparse_count (12), 36 bytes per sparse entry, chunk_stride and
+        // chunk_count (8), then chunk 0's frame_offset and frame_stored_len
+        // (16) before its frame_uncompressed_len.
+        let high_byte = at(16 + sparse_count * 36 + 8 + 16 + 7);
+        let mut corrupted = bytes.to_vec();
+        corrupted[high_byte] ^= 0x01;
+
+        let (fetcher, _metrics) =
+            metered_fetcher(&seg_ref.data_object_key, Bytes::from(corrupted)).await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 20));
+        assert!(SPARSE_INFLATED_CATALOG_LEN < budget.limit());
+        let fetcher = fetcher
+            .with_whole_object_threshold(0)
+            .with_memory_budget(budget.clone());
+        let accounting = QueryAccounting::new();
+        let matchers = [LabelMatcher::equal("__name__", "sparse_metric_2000")];
+        let (footer, total, etag, mut regions) = fetcher
+            .open_segment(tenant_hash, &seg_ref, &accounting)
+            .await
+            .expect("the footer is intact");
+        let err = fetcher
+            .decode_selected(
+                &seg_ref,
+                tenant_hash,
+                &footer,
+                total,
+                &etag,
+                &mut regions,
+                &matchers,
+                &accounting,
+            )
+            .await
+            .err()
+            .expect("a corrupt SERIES_IDX fails the decode");
+        match err {
+            FetchError::Corrupt {
+                source: ravel_segment::SegmentError::SectionCrcMismatch,
+                ..
+            } => {}
+            other => panic!("expected FetchError::Corrupt(SectionCrcMismatch), got {other:?}"),
+        }
+        drop(regions);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// Sum of the fixture's catalog-section `uncompressed_len` as the footer
+    /// records them, with SERIES_META_CHUNKS counted at its STORED frame
+    /// length. This is what the pre-fix `catalog_decode_len` reserved.
+    const SPARSE_STORED_CATALOG_LEN: u64 = 151_466;
+
+    /// The same sum with SERIES_META_CHUNKS counted at the chunk directory's
+    /// summed `frame_uncompressed_len`: what `decode_catalog_v5_chunked`
+    /// really inflates and materializes.
+    const SPARSE_INFLATED_CATALOG_LEN: u64 = 233_223;
+
+    /// SERIES_META_CHUNKS alone, as its footer descriptor records it: the
+    /// stored zstd frames.
+    const SPARSE_STORED_META_CHUNKS_LEN: u64 = 8_599;
+
+    /// SERIES_META_CHUNKS alone, inflated: the chunk directory's summed
+    /// `frame_uncompressed_len`.
+    const SPARSE_INFLATED_META_CHUNKS_LEN: u64 = 90_356;
+
+    /// After the matchers have run, the catalog reservation is exchanged for
+    /// one sized to the entries that survived, so a single-series query does
+    /// not hold the whole 4096-series catalog's charge through its page
+    /// fetches.
+    ///
+    /// The retained figure is spelled out from the fixture rather than read
+    /// back from `retained_catalog_len`: one entry, one `__name__` label whose
+    /// name is 8 bytes and whose value `sparse_metric_2000` is 18, and one run
+    /// (an L0 write).
+    ///
+    /// FLIP: drop the `shrink_to_retained` call at the end of
+    /// `decode_selected` and the reserved figure stays at
+    /// `SPARSE_INFLATED_CATALOG_LEN`, failing the assertion below with
+    /// `left: 233223, right: 330`.
+    #[tokio::test]
+    async fn sparse_catalog_reservation_shrinks_to_the_retained_entries() {
+        let (bytes, tenant_hash, seg_ref) = write_sparse_test_segment(4096, 32).await;
+        let (fetcher, _metrics) = metered_fetcher(&seg_ref.data_object_key, bytes).await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 30));
+        let fetcher = fetcher
+            .with_whole_object_threshold(0)
+            .with_memory_budget(budget.clone());
+        let accounting = QueryAccounting::new();
+        let matchers = [LabelMatcher::equal("__name__", "sparse_metric_2000")];
+
+        let (footer, total, etag, mut regions) = fetcher
+            .open_segment(tenant_hash, &seg_ref, &accounting)
+            .await
+            .expect("open segment");
+        let decoded = fetcher
+            .decode_selected(
+                &seg_ref,
+                tenant_hash,
+                &footer,
+                total,
+                &etag,
+                &mut regions,
+                &matchers,
+                &accounting,
+            )
+            .await
+            .expect("decode sparse catalog");
+        assert_eq!(decoded.len(), 1, "exactly the matched series");
+
+        let one_entry = std::mem::size_of::<SeriesEntryV4>() as u64
+            + std::mem::size_of::<ravel_types::Label>() as u64
+            + "__name__".len() as u64
+            + "sparse_metric_2000".len() as u64
+            + std::mem::size_of::<RunEntry>() as u64;
+        drop(regions);
+        assert_eq!(
+            budget.reserved(),
+            one_entry,
+            "only the retained entry stays charged once the filter has run"
+        );
+        assert!(
+            one_entry < SPARSE_INFLATED_CATALOG_LEN / 100,
+            "the shrink is the point: {one_entry} against {SPARSE_INFLATED_CATALOG_LEN}"
+        );
+        drop(decoded);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// The two fixture series, decoded, with the decode's reservation dropped:
+    /// entries to hand `shrink_to_retained` under a budget the test controls.
+    async fn fixture_catalog_entries() -> (Arc<MemoryStore>, Vec<SeriesEntryV4>) {
+        let (store, tenant_hash, seg_ref) = write_test_segment().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+        let fetcher = SegmentFetcher::new(backend);
+        let accounting = QueryAccounting::new();
+        let (footer, total, etag, mut regions) = fetcher
+            .open_segment(tenant_hash, &seg_ref, &accounting)
+            .await
+            .expect("open segment");
+        let decoded = fetcher
+            .decode_selected(
+                &seg_ref,
+                tenant_hash,
+                &footer,
+                total,
+                &etag,
+                &mut regions,
+                &[],
+                &accounting,
+            )
+            .await
+            .expect("decode catalog");
+        let (entries, _reservation) = decoded.into_parts();
+        assert_eq!(entries.len(), 2, "both fixture series decode");
+        (store, entries)
+    }
+
+    /// A decode whose matchers retained nothing gives its whole reservation
+    /// back, even when a `reserve_unchecked` caller has pushed the budget past
+    /// its limit on its own, where a zero-byte reservation is itself refused.
+    ///
+    /// FLIP: restore the release-then-`reserve_fetch(retained)?` body and the
+    /// zero-byte reserve is refused (`requested: 0, reserved: 4097, limit:
+    /// 4096`), so the shrink fails a decode that had already succeeded.
+    #[tokio::test]
+    async fn shrink_of_an_empty_decode_over_the_limit_releases_everything() {
+        let (store, _entries) = fixture_catalog_entries().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(4096));
+        let fetcher = SegmentFetcher::new(backend).with_memory_budget(budget.clone());
+        let decoded = DecodedCatalog {
+            entries: Vec::new(),
+            reservation: Some(budget.reserve(4096).expect("the held figure fits")),
+        };
+        budget.reserve_unchecked(4097);
+        assert_eq!(budget.reserved(), 8193);
+
+        let shrunk = fetcher.shrink_to_retained(decoded);
+        assert!(shrunk.is_empty());
+        assert_eq!(
+            budget.reserved(),
+            4097,
+            "only the unchecked bytes stay charged once the empty decode shrinks"
+        );
+        drop(shrunk);
+        assert_eq!(budget.reserved(), 4097);
+        budget.release(4097);
+    }
+
+    /// A shrink the budget refuses keeps the held reservation and the entries,
+    /// rather than failing: the retained figure is reserved before the held
+    /// one is released, and a refusal leaves both where they were.
+    ///
+    /// FLIP: restore the release-then-reserve body and the held reservation
+    /// is gone before the retained one is taken, so the budget reads
+    /// `retained + 1` rather than `held + 1`.
+    #[tokio::test]
+    async fn refused_shrink_keeps_the_held_reservation() {
+        let (store, entries) = fixture_catalog_entries().await;
+        let retained = retained_catalog_len(&entries);
+        let held = 2 * retained;
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(held));
+        let fetcher = SegmentFetcher::new(backend).with_memory_budget(budget.clone());
+        let decoded = DecodedCatalog {
+            entries,
+            reservation: Some(budget.reserve(held).expect("the held figure fits")),
+        };
+        budget.reserve_unchecked(1);
+
+        let shrunk = fetcher.shrink_to_retained(decoded);
+        assert_eq!(shrunk.len(), 2, "the entries survive a refused shrink");
+        assert_eq!(
+            budget.reserved(),
+            held + 1,
+            "a refused shrink keeps the held reservation"
+        );
+        drop(shrunk);
+        assert_eq!(budget.reserved(), 1);
+        budget.release(1);
+    }
+
+    /// An object that does not qualify for the probe path keeps the
+    /// unchanged whole-object fallback. An empty matcher matches every series,
+    /// so the fetcher takes the whole-object GET (one GET covering the object)
+    /// rather than the catalog-probe path. Proven by the metered GET bytes
+    /// reaching at least the object size.
+    #[tokio::test]
+    async fn sparse_segment_empty_matcher_keeps_whole_object_fallback() {
+        let (bytes, tenant_hash, seg_ref) = write_sparse_test_segment(4096, 8).await;
+        let object_size = seg_ref.object_size;
+
+        let (fetcher, metrics) = metered_fetcher(&seg_ref.data_object_key, bytes.clone()).await;
+        let (soa, _stats) = fetcher
+            .fetch_soa(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("fetch_soa whole-object fallback");
+
+        assert_eq!(soa.len(), 4096, "an empty matcher returns every series");
+
+        let get = metrics.snapshot().get;
+        // The whole-object fallback fetches the entire object in one GET, so the
+        // metered bytes include at least `object_size` (plus the earlier 64 KiB
+        // footer suffix). The probe path would have stayed strictly under it.
+        assert!(
+            get.bytes >= object_size,
+            "whole-object fallback moved {} B, must be at least the {object_size} B object",
+            get.bytes
+        );
+    }
+
+    // --- coalesce_ranges / FetchedRegions unit coverage.
+    // docs/query-engine.md "coalesce adjacent byte ranges": merge within the
+    // gap, split beyond it, never join unrelated regions, never overflow. The
+    // fetcher's whole multi-GET plan reduces to these two helpers, so they are
+    // pinned directly here (the end-to-end path is exercised in
+    // tests/fetch_multi_get.rs).
+
+    /// Deliverable 2 (RSEG): the byte reservation `ensure_ranges` takes for its
+    /// coalesced runs is owned by the `FetchedRegions` it fills, so the budget
+    /// stays reserved for exactly the run-length sum while those regions are
+    /// held and returns to zero the moment they drop, never released because the
+    /// GET completed.
+    ///
+    /// Non-vacuity: dropping the
+    /// `regions.hold_reservation(self.reserve_fetch(reserved)?)` line in
+    /// `ensure_ranges` releases the guard at the end of the call, so `reserved()`
+    /// reads 0 while the regions are still held and the first assertion fails.
+    #[tokio::test]
+    async fn rseg_range_reservation_is_owned_by_the_filled_regions() {
+        let (store, tenant_hash, seg_ref) = write_test_segment().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 20));
+        // whole_object_threshold(0) plus a short suffix keep the first GET a
+        // footer tail read, so the front byte range below is genuinely missing
+        // and reaches the `ensure_ranges` reservation site rather than being
+        // served from an already-whole-object buffer.
+        let fetcher = SegmentFetcher::new(backend)
+            .with_whole_object_threshold(0)
+            .with_suffix_len(16)
+            .with_memory_budget(budget.clone());
+        let accounting = QueryAccounting::new();
+        let (_footer, _total, suffix_etag, mut regions) = fetcher
+            .open_segment(tenant_hash, &seg_ref, &accounting)
+            .await
+            .expect("open segment");
+
+        const RUN: u64 = 64;
+        assert!(
+            !regions.covers(0, RUN),
+            "the front of the object must not be covered by the footer tail read"
+        );
+        assert_eq!(budget.reserved(), 0, "open_segment reserves nothing");
+        fetcher
+            .ensure_ranges(
+                &seg_ref,
+                tenant_hash,
+                &suffix_etag,
+                &[(0, RUN)],
+                usize::MAX,
+                &mut regions,
+                &accounting,
+            )
+            .await
+            .expect("ensure_ranges");
+        assert_eq!(
+            budget.reserved(),
+            RUN,
+            "the reservation equals the coalesced run-length sum while the regions are held"
+        );
+        drop(regions);
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "the reservation releases when the FetchedRegions buffer drops"
+        );
+    }
+
+    /// The footer-declared uncompressed length of the catalog sections the
+    /// fixture segment carries, summed here independently of
+    /// `catalog_decode_len`.
+    fn declared_catalog_len(footer: &Footer) -> u64 {
+        let kinds = [
+            SECTION_LABEL_DICT,
+            SECTION_SERIES_IDS,
+            SECTION_SERIES_META,
+            SECTION_SERIES_IDX,
+            SECTION_SERIES_META_CHUNKS,
+        ];
+        footer
+            .sections
+            .iter()
+            .filter(|s| kinds.contains(&s.kind))
+            .map(|s| s.uncompressed_len)
+            .sum()
+    }
+
+    /// Reserved bytes after `open_segment` alone, and the catalog's declared
+    /// uncompressed length, on a fresh fetcher over the fixture segment.
+    async fn open_segment_figures(
+        backend: Arc<dyn ObjectStoreBackend>,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+    ) -> (u64, u64) {
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 20));
+        let fetcher = SegmentFetcher::new(backend).with_memory_budget(budget.clone());
+        let (footer, _total, _etag, regions) = fetcher
+            .open_segment(tenant_hash, seg_ref, &QueryAccounting::new())
+            .await
+            .expect("open segment");
+        let opened = budget.reserved();
+        drop(regions);
+        (opened, declared_catalog_len(&footer))
+    }
+
+    /// ADR-1702 follow-up task 5, PromQL fetch path: with a budget one byte
+    /// short of what `open_segment` holds plus the catalog's declared
+    /// uncompressed length, the fetch fails with the typed budget error for
+    /// exactly the catalog decode, and nothing stays charged.
+    ///
+    /// FLIP: drop the `reserve_catalog_decode` call in `decode_selected`'s
+    /// SERIES_META branch and the fetch succeeds, so `expect_err` fails.
+    #[tokio::test]
+    async fn promql_catalog_decode_reserves_its_output() {
+        let (store, tenant_hash, seg_ref) = write_test_segment().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+        let (opened, catalog_len) =
+            open_segment_figures(backend.clone(), tenant_hash, &seg_ref).await;
+        assert!(catalog_len > 0, "the fixture carries catalog sections");
+
+        let limit = opened + catalog_len - 1;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+        let fetcher = SegmentFetcher::new(backend).with_memory_budget(budget.clone());
+        let err = fetcher
+            .fetch(tenant_hash, &seg_ref, &[])
+            .await
+            .expect_err("a catalog decode that does not fit the budget must fail the fetch");
+        match err {
+            FetchError::FetchMemoryExhausted {
+                requested,
+                reserved,
+                limit: refused_limit,
+            } => {
+                assert_eq!(requested, catalog_len, "the catalog's declared length");
+                assert_eq!(reserved, opened, "only the open segment's bytes are held");
+                assert_eq!(refused_limit, limit);
+            }
+            other => panic!("expected FetchError::FetchMemoryExhausted, got {other:?}"),
+        }
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "a failed fetch leaves nothing charged"
+        );
+    }
+
+    /// Issue #2081 item 2, PromQL side: a catalog section or chunk frame
+    /// declaring more than the reader's ceiling allocates nothing, because the
+    /// decoder refuses it before allocating. It is therefore charged 0, and the
+    /// decoder's own error is what the caller sees. Charging the ceiling
+    /// instead replaces that error with a retryable budget refusal on every
+    /// budget with less than the ceiling free.
+    ///
+    /// The chunk frame is the reachable half of this. A whole SECTION over the
+    /// ceiling never reaches a reservation on the fetch path at all:
+    /// `validate_sections` (`ravel-segment/src/reader.rs`, called from
+    /// `open_from_suffix`) rejects the object inside `open_segment`, before
+    /// the catalog decode exists. Nothing checks a chunk
+    /// frame's declared length before `decode_catalog_v5_chunked` does, so a
+    /// directory carrying one is exactly what `meta_chunks_inflated_len` reads.
+    /// Both are asserted here, on the charge each reader computes, rather than
+    /// end to end through a fetch that cannot reach one of them.
+    ///
+    /// FLIP: make `ravel_memory::decoded_charge` return
+    /// `declared.min(ceiling)` and the frame assertion fails first, with
+    /// `left: Some(12288), right: Some(4096)`: the oversized frame charges the
+    /// ceiling instead of nothing.
+    #[test]
+    fn a_declared_length_over_the_ceiling_is_charged_nothing() {
+        const CEILING: u64 = 8_192;
+        const SMALL_FRAME: u64 = 4_096;
+        let limits = ReaderLimits {
+            max_section_uncompressed_bytes: CEILING,
+            ..ReaderLimits::default()
+        };
+
+        let idx = two_chunk_series_idx(SMALL_FRAME, CEILING + 1);
+        let footer = series_idx_footer(&idx);
+        let mut regions = FetchedRegions::default();
+        regions.insert(0, Bytes::from(idx));
+        assert_eq!(
+            meta_chunks_inflated_len(&footer, &regions, limits),
+            Some(SMALL_FRAME),
+            "the frame over the ceiling adds nothing; only the frame that fits is charged"
+        );
+
+        let over_ceiling = Footer {
+            sections: vec![ravel_proto::segment::v1::Section {
+                kind: SECTION_SERIES_IDS,
+                offset: 0,
+                len: 1,
+                uncompressed_len: CEILING + 1,
+                comp: COMPRESSION_NONE,
+                crc32c: 0,
+            }],
+            ..Footer::default()
+        };
+        assert_eq!(
+            catalog_decode_len(&over_ceiling, limits, None),
+            0,
+            "a section the decoder will refuse is charged nothing"
+        );
+    }
+
+    /// A SERIES_IDX section body over two series and two chunks, one frame
+    /// each, declaring the given uncompressed frame lengths. Layout per
+    /// docs/segment-format.md "SERIES_IDX".
+    fn two_chunk_series_idx(first_frame_len: u64, second_frame_len: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(1u8); // version
+        buf.push(0); // flags
+        buf.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        buf.extend_from_slice(&1u32.to_le_bytes()); // stride
+        buf.extend_from_slice(&2u32.to_le_bytes()); // series_count
+        buf.extend_from_slice(&2u32.to_le_bytes()); // sparse_count
+        for (p, id) in [0u8, 1].iter().enumerate() {
+            buf.extend_from_slice(&[*id; 16]);
+            buf.extend_from_slice(&(4u64 + p as u64 * 16).to_le_bytes()); // ids_offset
+            buf.extend_from_slice(&16u64.to_le_bytes()); // window_len
+            buf.extend_from_slice(&0u32.to_le_bytes()); // window_crc32c
+        }
+        buf.extend_from_slice(&1u32.to_le_bytes()); // chunk_stride
+        buf.extend_from_slice(&2u32.to_le_bytes()); // chunk_count
+        for (k, frame_len) in [first_frame_len, second_frame_len].iter().enumerate() {
+            buf.extend_from_slice(&(k as u64).to_le_bytes()); // frame_offset
+            buf.extend_from_slice(&1u64.to_le_bytes()); // frame_stored_len
+            buf.extend_from_slice(&frame_len.to_le_bytes());
+            buf.extend_from_slice(&(k as u32).to_le_bytes()); // first_index
+            buf.extend_from_slice(&1u32.to_le_bytes()); // n
+            buf.extend_from_slice(&0u32.to_le_bytes()); // frame_crc32c
+        }
+        buf
+    }
+
+    /// A footer carrying `idx` as an uncompressed SERIES_IDX at offset 0, plus
+    /// the SERIES_META_CHUNKS descriptor that makes the object chunked.
+    fn series_idx_footer(idx: &[u8]) -> Footer {
+        Footer {
+            sections: vec![
+                ravel_proto::segment::v1::Section {
+                    kind: SECTION_SERIES_IDX,
+                    offset: 0,
+                    len: idx.len() as u64,
+                    uncompressed_len: idx.len() as u64,
+                    comp: COMPRESSION_NONE,
+                    crc32c: crc32c::crc32c(idx),
+                },
+                ravel_proto::segment::v1::Section {
+                    kind: SECTION_SERIES_META_CHUNKS,
+                    offset: idx.len() as u64,
+                    len: 1,
+                    uncompressed_len: 1,
+                    comp: COMPRESSION_NONE,
+                    crc32c: 0,
+                },
+            ],
+            ..Footer::default()
+        }
+    }
+
+    /// Issue #2081 item 3: `meta_chunks_inflated_len` walks the chunk directory
+    /// itself, so its cost is bounded by the directory's entry count and not by
+    /// the declared `series_count`. `parse_series_idx` accepts a directory
+    /// declaring `u32::MAX` series over a single chunk (the stride chain is
+    /// consistent and the section crc is this test's own), and a per-series
+    /// walk over it would call `chunk_for` 4_294_967_295 times to find the one
+    /// frame this asserts on.
+    ///
+    /// This pins the input shape, not a failure of the old code: the
+    /// per-series loop returns the same value here, only after about 4.3e9
+    /// iterations, so no assertion below fails against it.
+    #[test]
+    fn a_huge_series_count_costs_one_iteration_per_chunk_directory_entry() {
+        const FRAME_LEN: u64 = 4_096;
+        let idx = huge_series_count_series_idx(FRAME_LEN);
+        let index = ravel_segment::parse_series_idx(&idx).expect("the crafted directory parses");
+        assert_eq!(index.series_count(), u32::MAX, "the declared series count");
+        assert_eq!(
+            index.chunk_frame_uncompressed_lens().len(),
+            1,
+            "the whole directory is one chunk, and that is the loop bound"
+        );
+
+        let footer = series_idx_footer(&idx);
+        let mut regions = FetchedRegions::default();
+        regions.insert(0, Bytes::from(idx));
+
+        assert_eq!(
+            meta_chunks_inflated_len(&footer, &regions, ReaderLimits::default()),
+            Some(FRAME_LEN),
+            "the one chunk frame's declared uncompressed length"
+        );
+    }
+
+    /// A SERIES_IDX section body declaring `u32::MAX` series over one sparse
+    /// entry and one chunk directory entry: the largest `series_count` the
+    /// format admits in the smallest directory that can carry it. Layout per
+    /// docs/segment-format.md "SERIES_IDX".
+    fn huge_series_count_series_idx(frame_uncompressed_len: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(1u8); // version
+        buf.push(0); // flags
+        buf.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // stride
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // series_count
+        buf.extend_from_slice(&1u32.to_le_bytes()); // sparse_count
+        buf.extend_from_slice(&[0u8; 16]); // entry 0: id
+        buf.extend_from_slice(&4u64.to_le_bytes()); // ids_offset: 4 + 0 * 16
+        buf.extend_from_slice(&(u64::from(u32::MAX) * 16).to_le_bytes()); // window_len
+        buf.extend_from_slice(&0u32.to_le_bytes()); // window_crc32c
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // chunk_stride
+        buf.extend_from_slice(&1u32.to_le_bytes()); // chunk_count
+        buf.extend_from_slice(&0u64.to_le_bytes()); // chunk 0: frame_offset
+        buf.extend_from_slice(&1u64.to_le_bytes()); // frame_stored_len
+        buf.extend_from_slice(&frame_uncompressed_len.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // first_index
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // n
+        buf.extend_from_slice(&0u32.to_le_bytes()); // frame_crc32c
+        buf
+    }
+
+    /// The catalog decode's reservation is charged exactly while the decoded
+    /// entries are held, independently of the fetched regions, and the budget
+    /// returns to exactly its starting figure once both drop.
+    #[tokio::test]
+    async fn promql_catalog_decode_returns_the_budget_to_its_starting_figure() {
+        let (store, tenant_hash, seg_ref) = write_test_segment().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 20));
+        let starting = budget.reserve(7).expect("the starting figure fits");
+        let fetcher = SegmentFetcher::new(backend).with_memory_budget(budget.clone());
+        let accounting = QueryAccounting::new();
+
+        let (footer, total, etag, mut regions) = fetcher
+            .open_segment(tenant_hash, &seg_ref, &accounting)
+            .await
+            .expect("open segment");
+        let opened = budget.reserved() - 7;
+        let decoded = fetcher
+            .decode_selected(
+                &seg_ref,
+                tenant_hash,
+                &footer,
+                total,
+                &etag,
+                &mut regions,
+                &[],
+                &accounting,
+            )
+            .await
+            .expect("decode catalog");
+        assert_eq!(decoded.len(), 2, "both fixture series decode");
+        // An empty matcher retains both series, and on a fixture this small
+        // the two `SeriesEntryV4` structs measure MORE than the catalog
+        // sections they decoded from, so `shrink_to_retained` keeps the
+        // reservation it was given rather than exchanging it upward: the
+        // exchange only ever shrinks.
+        let retained = 2
+            * (std::mem::size_of::<SeriesEntryV4>() as u64
+                + std::mem::size_of::<ravel_types::Label>() as u64
+                + "__name__".len() as u64
+                + std::mem::size_of::<RunEntry>() as u64)
+            + "smooth_metric".len() as u64
+            + "chaotic_metric".len() as u64;
+        assert!(
+            retained > declared_catalog_len(&footer),
+            "the two entries measure more than the sections they decoded from: \
+             {retained} against {}",
+            declared_catalog_len(&footer)
+        );
+        // The fixture is small enough that `open_segment` reads it whole, so
+        // the catalog sections need no further GET and the only new charge is
+        // the decode's.
+        assert_eq!(
+            budget.reserved(),
+            7 + opened + declared_catalog_len(&footer),
+            "the decoded catalog is charged its declared length on top of the open segment"
+        );
+
+        drop(regions);
+        assert_eq!(
+            budget.reserved(),
+            7 + declared_catalog_len(&footer),
+            "the decode reservation rides with the entries, not the regions"
+        );
+        drop(decoded);
+        assert_eq!(budget.reserved(), 7, "back to exactly the starting figure");
+        drop(starting);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// ADR-1702 follow-up task 7, RSEG sites: with the byte floor at 0, each
+    /// of `decode_selected`'s three catalog decodes is exactly one read gate
+    /// job under its site, nothing runs inline, and every fetch returns what
+    /// the ungated fetcher returns.
+    ///
+    /// FLIP, one site at a time (take the `None` arm of that site's `match
+    /// &self.read_gate` whatever the gate, so the decode runs inline as the
+    /// pre-change code did):
+    /// - the SERIES_META branch of `decode_selected`: the first
+    ///   `SegmentSection` assertion reads `left: (0, 0), right: (1, 0)`;
+    /// - the whole-object branch of `decode_selected`: the second
+    ///   `SegmentSection` assertion reads `left: (1, 0), right: (2, 0)`;
+    /// - `decode_sparse_catalog`: the `SegmentSparseCatalog` assertion reads
+    ///   `left: (0, 0), right: (1, 0)`.
+    #[tokio::test]
+    async fn segment_catalog_decodes_run_through_the_read_gate() {
+        use crate::read_gate_test_support::{floor_zero_gate, site_counts, total_inline};
+        let gate = floor_zero_gate();
+
+        // Below the sparse threshold: the whole SERIES_META branch.
+        let (store, tenant_hash, seg_ref) = write_test_segment().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let inline = SegmentFetcher::new(backend.clone())
+            .fetch(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("ungated fetch");
+        let gated = SegmentFetcher::new(backend)
+            .with_read_gate(gate.clone())
+            .fetch(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("gated fetch");
+        assert_eq!(format!("{gated:?}"), format!("{inline:?}"));
+        assert_eq!(site_counts(&gate, ReadSite::SegmentSection), (1, 0));
+
+        // A sparse object with no matcher does not qualify for the catalog
+        // probe, so it takes the whole-object branch.
+        let (bytes, tenant_hash, seg_ref) = write_sparse_test_segment(4096, 32).await;
+        let (fetcher, _metrics) = metered_fetcher(&seg_ref.data_object_key, bytes).await;
+        let fetcher = fetcher.with_whole_object_threshold(0);
+        let gated_fetcher = fetcher.clone().with_read_gate(gate.clone());
+        let (inline, _) = fetcher
+            .fetch_soa(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("ungated whole-object fetch");
+        let (gated, _) = gated_fetcher
+            .fetch_soa(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("gated whole-object fetch");
+        assert_eq!(gated.len(), 4096);
+        assert_eq!(format!("{gated:?}"), format!("{inline:?}"));
+        assert_eq!(site_counts(&gate, ReadSite::SegmentSection), (2, 0));
+
+        // The same object under a matcher takes the sparse catalog probe.
+        let matchers = [LabelMatcher::equal("__name__", "sparse_metric_2000")];
+        let (inline, _) = fetcher
+            .fetch_soa(tenant_hash, &seg_ref, &matchers)
+            .await
+            .expect("ungated probe fetch");
+        let (gated, _) = gated_fetcher
+            .fetch_soa(tenant_hash, &seg_ref, &matchers)
+            .await
+            .expect("gated probe fetch");
+        assert_eq!(gated.len(), 1);
+        assert_eq!(format!("{gated:?}"), format!("{inline:?}"));
+        assert_eq!(site_counts(&gate, ReadSite::SegmentSparseCatalog), (1, 0));
+        assert_eq!(site_counts(&gate, ReadSite::SegmentSection), (2, 0));
+        assert_eq!(total_inline(&gate), 0);
+    }
+
+    /// A gated catalog decode that produces no result fails the fetch with the
+    /// typed `FetchError::Store`, never a panic and never an inline retry. The
+    /// fetch is polled inside a runtime that has already shut down, whose
+    /// blocking pool cancels the decode job the moment the gate dispatches it.
+    ///
+    /// FLIP: move `CpuGateError::Cancelled` into the `Panicked` arm of
+    /// `gate_failed` and the match below panics with the `Corrupt` error.
+    #[test]
+    fn a_cancelled_gate_job_fails_the_fetch_typed() {
+        use crate::read_gate_test_support::{floor_zero_gate, site_counts};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let (store, tenant_hash, seg_ref) = rt.block_on(write_test_segment());
+        let handle = rt.handle().clone();
+        rt.shutdown_background();
+        let gate = floor_zero_gate();
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let fetcher = SegmentFetcher::new(backend).with_read_gate(gate.clone());
+        let result = {
+            let _entered = handle.enter();
+            futures::executor::block_on(fetcher.fetch(tenant_hash, &seg_ref, &[]))
+        };
+        assert_eq!(
+            site_counts(&gate, ReadSite::SegmentSection),
+            (1, 0),
+            "the decode reached the gate as a job and nothing ran inline"
+        );
+        let err = match result {
+            Err(
+                err @ FetchError::Store {
+                    source: StoreError::Transient(_),
+                    ..
+                },
+            ) => err,
+            other => panic!("expected a transient FetchError::Store, got {other:?}"),
+        };
+        assert!(err.to_string().contains("cancelled"), "{err}");
+        let response = crate::http::ApiError::from(crate::QueryError::Fetch(err)).into_parts();
+        assert_eq!(
+            response.status.as_u16(),
+            503,
+            "a job that never ran is retryable"
+        );
+    }
+
+    /// `ensure_ranges`'s reservation covers a coalesced-run batch, not one
+    /// GET, so it cannot branch on a per-range `ReadOutcome` the way
+    /// `LogSegmentFetcher::whole_object_bytes`'s arms do: every run it
+    /// fetched routes through `cached_get` when a cache is configured
+    /// (`guarded_get`'s cache-eligible branch), so the whole reservation is
+    /// handed off once, decided from `self.cache.is_some()` rather than from
+    /// any one run's hit/miss outcome.
+    ///
+    /// Non-vacuity: dropping the `reservation.mark_handed_off()` call added
+    /// in `ensure_ranges` leaves `handoff_overlap()` at 0 while the regions
+    /// are held, so the first assertion below fails with: assertion
+    /// `left == right` failed: ensure_ranges's reservation is marked handed
+    /// off while a cache is configured, since every coalesced run it fetched
+    /// is now cache-resident too -- left: 0, right: 64 (confirmed by making
+    /// exactly that edit, observing the failure, and reverting it by hand).
+    #[tokio::test]
+    async fn rseg_ensure_ranges_cache_marks_the_reservation_handed_off() {
+        let (store, tenant_hash, seg_ref) = write_test_segment().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 20));
+        let fetcher = SegmentFetcher::new(backend)
+            .with_whole_object_threshold(0)
+            .with_suffix_len(16)
+            .with_cache(ram_cache())
+            .with_memory_budget(budget.clone());
+        let accounting = QueryAccounting::new();
+        let (_footer, _total, suffix_etag, mut regions) = fetcher
+            .open_segment(tenant_hash, &seg_ref, &accounting)
+            .await
+            .expect("open segment");
+
+        const RUN: u64 = 64;
+        assert_eq!(budget.reserved(), 0, "open_segment reserves nothing");
+        fetcher
+            .ensure_ranges(
+                &seg_ref,
+                tenant_hash,
+                &suffix_etag,
+                &[(0, RUN)],
+                usize::MAX,
+                &mut regions,
+                &accounting,
+            )
+            .await
+            .expect("ensure_ranges");
+        assert_eq!(
+            budget.handoff_overlap(),
+            RUN,
+            "ensure_ranges's reservation is marked handed off while a cache is \
+             configured, since every coalesced run it fetched is now \
+             cache-resident too"
+        );
+        drop(regions);
+        assert_eq!(
+            budget.handoff_overlap(),
+            0,
+            "the overlap clears when the regions drop"
+        );
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "the reservation releases with the regions"
+        );
+    }
+
+    #[test]
+    fn coalesce_merges_within_gap_and_splits_beyond() {
+        // Unsorted input: (12,20) is within gap 5 of (0,10) -> one group
+        // spanning (0,20); (1000,1010) is far beyond the gap -> its own group.
+        // Proves both the merge and the "no unrelated join" direction.
+        let out = coalesce_ranges(vec![(1000, 1010), (0, 10), (12, 20)], 5);
+        assert_eq!(out, vec![(0, 20), (1000, 1010)]);
+    }
+
+    #[test]
+    fn coalesce_merges_overlapping_and_keeps_max_end() {
+        // Overlap (5 <= 10) merges; the wider range's end wins even when the
+        // ranges are supplied shorter-last.
+        let out = coalesce_ranges(vec![(0, 10), (5, 8), (8, 30)], 0);
+        assert_eq!(out, vec![(0, 30)]);
+    }
+
+    #[test]
+    fn coalesce_zero_gap_only_joins_touching_ranges() {
+        // gap 0: exactly-adjacent ranges (end == next start) join; a 1-byte
+        // hole splits them. This is the with_coalesce_gap(0) GET set: two GETs.
+        let ranges = vec![(0, 10), (10, 20), (21, 30)];
+        assert_eq!(coalesce_ranges(ranges.clone(), 0), vec![(0, 20), (21, 30)]);
+        // Widening the gap to bridge the 1-byte hole collapses the same three
+        // ranges to a single GET: coalescing reduces the GET set, never grows
+        // it, and never joins ranges further apart than the gap.
+        assert_eq!(coalesce_ranges(ranges, 1), vec![(0, 30)]);
+    }
+
+    #[test]
+    fn coalesce_is_overflow_safe_near_u64_max() {
+        // saturating_add on the gap must not panic (debug) or wrap (release)
+        // when last.end + max_gap would exceed u64::MAX.
+        let out = coalesce_ranges(vec![(0, 5), (u64::MAX - 2, u64::MAX)], u64::MAX);
+        assert_eq!(out, vec![(0, u64::MAX)]);
+        let out = coalesce_ranges(vec![(u64::MAX - 3, u64::MAX)], u64::MAX);
+        assert_eq!(out, vec![(u64::MAX - 3, u64::MAX)]);
+    }
+
+    #[test]
+    fn bound_runs_bridges_the_smallest_gaps_first() {
+        // Gaps 5, 80, 2 and 380.
+        let runs = vec![(0, 10), (15, 20), (100, 110), (112, 120), (500, 510)];
+        assert_eq!(bound_runs(runs.clone(), 9), runs);
+        assert_eq!(bound_runs(runs.clone(), 5), runs);
+        assert_eq!(
+            bound_runs(runs.clone(), 4),
+            vec![(0, 10), (15, 20), (100, 120), (500, 510)]
+        );
+        assert_eq!(
+            bound_runs(runs.clone(), 3),
+            vec![(0, 20), (100, 120), (500, 510)]
+        );
+        assert_eq!(bound_runs(runs.clone(), 2), vec![(0, 120), (500, 510)]);
+        assert_eq!(bound_runs(runs.clone(), 1), vec![(0, 510)]);
+        assert_eq!(bound_runs(runs, 0), vec![(0, 510)]);
+        // Equal gaps bridge the earlier one first.
+        assert_eq!(
+            bound_runs(vec![(0, 1), (3, 4), (6, 7)], 2),
+            vec![(0, 4), (6, 7)]
+        );
+        assert_eq!(bound_runs(Vec::new(), 4), Vec::<(u64, u64)>::new());
+    }
+
+    /// An L0 segment of 16 scalar series `s00`..`s15` and 16 histogram series
+    /// `h00`..`h15`, two samples each, with the metric names in page order
+    /// (ascending series id). Selecting every other name leaves an unselected
+    /// page between any two selected ones in the TS, VAL and HIST sections, so
+    /// at a zero coalesce gap each selected page is its own run.
+    fn many_run_segment() -> (Bytes, TenantHash, SegmentRef, Vec<String>) {
+        let tenant_hash = TenantHash([13u8; 16]);
+        let writer_id = Uuid::from_u128(3);
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        };
+        const NS: i64 = 1_000_000_000;
+        let mut inputs = Vec::new();
+        for i in 0..16 {
+            let v = f64::from(i);
+            inputs.push(scalar_series_v3(
+                &format!("s{i:02}"),
+                &[(1_000 * NS, v), (1_001 * NS, v + 0.5)],
+            ));
+            inputs.push(hist_series(
+                &format!("h{i:02}"),
+                vec![
+                    HistogramSample {
+                        ts_ns: 1_000 * NS,
+                        value: hist_value(3 + i as u64, v),
+                    },
+                    HistogramSample {
+                        ts_ns: 1_001 * NS,
+                        value: hist_value(5 + i as u64, v + 1.0),
+                    },
+                ],
+            ));
+        }
+        let mut order: Vec<([u8; 16], String)> = inputs
+            .iter()
+            .map(|s| {
+                let name = s.labels.get("__name__").expect("metric name").to_string();
+                (s.series_id.0, name)
+            })
+            .collect();
+        order.sort();
+        let written =
+            SegmentWriter::write_histograms(inputs, identity, bounds).expect("write segment");
+        let seg_ref = SegmentRef {
+            data_object_key: "test/many-runs.rseg".to_string(),
+            object_size: written.bytes.len() as u64,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            ingest_hour_bucket: 0,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            shard: 0,
+            content_hash: written.summary.blake3,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 5,
+            level: ravel_catalog::SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+            declared_column_stats: Default::default(),
+        };
+        let order = order.into_iter().map(|(_, name)| name).collect();
+        (written.bytes, tenant_hash, seg_ref, order)
+    }
+
+    /// Fetches `names` from the many-run segment on the ranged path (16-byte
+    /// footer tail, so the footer is chased; zero coalesce gap) and returns the
+    /// GETs issued with the scalar and histogram results. With `whole`, reads
+    /// the object in one GET instead, as the reference result.
+    async fn many_run_fetch(
+        bytes: &Bytes,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        names: &[&String],
+        whole: bool,
+    ) -> (u64, String) {
+        let store = counting_store(bytes.clone(), &seg_ref.data_object_key).await;
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+        let threshold = if whole { u64::MAX } else { 0 };
+        let pattern = names
+            .iter()
+            .map(|n| n.as_str())
+            .collect::<Vec<_>>()
+            .join("|");
+        let matchers = [LabelMatcher::regex("__name__", pattern).expect("regex")];
+        let (mut scalar, _, mut histogram) = SegmentFetcher::new(backend)
+            .with_whole_object_threshold(threshold)
+            .with_suffix_len(16)
+            .with_coalesce_gap(0)
+            .fetch_soa_and_histograms(tenant_hash, seg_ref, &matchers)
+            .await
+            .expect("fetch");
+        scalar.sort_by_key(|s| s.series_id.0);
+        histogram.sort_by_key(|s| s.series_id.0);
+        let scalar: Vec<_> = scalar
+            .iter()
+            .map(|s| {
+                let bits: Vec<u64> = s.values.iter().map(|v| v.to_bits()).collect();
+                (s.series_id, s.timestamps.clone(), bits)
+            })
+            .collect();
+        let histogram: Vec<_> = histogram
+            .iter()
+            .map(|s| (s.series_id, s.timestamps.clone(), format!("{:?}", s.values)))
+            .collect();
+        (
+            store.sequence_progress(0),
+            format!("{scalar:?} {histogram:?}"),
+        )
+    }
+
+    /// An L0 fetch issues at most `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`
+    /// page-range GETs whatever it selects, scalar and histogram pages
+    /// together, so the whole fetch stays within
+    /// `MAX_GETS_PER_L0_SEGMENT_FETCH`, and the bridged reads decode the same
+    /// data as a whole-object read.
+    #[tokio::test]
+    async fn l0_fetch_bounds_page_range_gets_per_segment() {
+        let (bytes, tenant_hash, seg_ref, order) = many_run_segment();
+        assert_eq!(order.len(), 32);
+        // The first GET (16-byte tail), the footer chase and one catalog GET.
+        const OPEN_AND_CATALOG: u64 = 3;
+        let alternate: Vec<&String> = order.iter().step_by(2).collect();
+        let scalar_alternate: Vec<&String> = alternate
+            .iter()
+            .copied()
+            .filter(|n| n.starts_with('s'))
+            .collect();
+        let histogram_alternate: Vec<&String> = alternate
+            .iter()
+            .copied()
+            .filter(|n| n.starts_with('h'))
+            .collect();
+        let one_scalar: Vec<&String> = scalar_alternate.iter().copied().take(1).collect();
+        let two_scalar: Vec<&String> = scalar_alternate.iter().copied().take(2).collect();
+        assert!(scalar_alternate.len() >= 3 && histogram_alternate.len() >= 3);
+
+        // Each selection with the page-range GETs it issues: its runs when
+        // they fit the bound, the bound when they do not.
+        let cases: [(&str, &[&String], u64); 5] = [
+            ("one scalar series: a TS and a VAL run", &one_scalar, 2),
+            ("two scalar series: four runs, at the bound", &two_scalar, 4),
+            ("every other scalar series", &scalar_alternate, 4),
+            ("every other histogram series", &histogram_alternate, 4),
+            ("every other series of both kinds", &alternate, 4),
+        ];
+        for (label, names, page_gets) in cases {
+            let (gets, got) = many_run_fetch(&bytes, tenant_hash, &seg_ref, names, false).await;
+            let (whole_gets, truth) =
+                many_run_fetch(&bytes, tenant_hash, &seg_ref, names, true).await;
+            assert_eq!(whole_gets, 1, "{label}: reference read");
+            assert_eq!(got, truth, "{label}: bridged reads decode the same data");
+            assert_eq!(gets, OPEN_AND_CATALOG + page_gets, "{label}: GETs");
+            assert!(
+                gets <= MAX_GETS_PER_L0_SEGMENT_FETCH,
+                "{label}: {gets} GETs"
+            );
+        }
+        assert_eq!(MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT, 4);
+        assert_eq!(MAX_GETS_PER_L0_SEGMENT_FETCH, 7);
+        assert_eq!(
+            OPEN_AND_CATALOG + MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT as u64,
+            MAX_GETS_PER_L0_SEGMENT_FETCH
+        );
+    }
+
+    /// A 16-series L1 object, one scalar run per series, with an L1
+    /// `SegmentRef`, and the series names in on-disk (series id) order.
+    fn many_run_l1_segment() -> (Bytes, TenantHash, SegmentRef, Vec<String>) {
+        let tenant_hash = TenantHash([14u8; 16]);
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: Uuid::nil().to_string(),
+            writer_epoch: 0,
+            writer_seq: 0,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        };
+        let input_set_hash = [0x44u8; 32];
+        let meta = CompactionMetaV4 {
+            ingest_hour_bucket: 0,
+            input_set_hash,
+            part_index: 0,
+            level: 1,
+        };
+        const NS: i64 = 1_000_000_000;
+        let tenant_id = TenantId::new("t".to_string());
+        let mut series: Vec<SeriesInputV7> = (0..16)
+            .map(|i| {
+                let name = format!("s{i:02}");
+                let label_set = labels(&name);
+                let id = SeriesId::compute(&tenant_id, &name, &label_set).expect("series id");
+                let v = f64::from(i);
+                let samples = SeriesValues::Scalar(vec![
+                    Sample {
+                        ts_ns: 1_000 * NS,
+                        value: v,
+                    },
+                    Sample {
+                        ts_ns: 1_001 * NS,
+                        value: v + 0.5,
+                    },
+                ]);
+                let run = encode_run_v4(&id, 100, 0, 0, &samples).expect("frame run");
+                SeriesInputV7 {
+                    series_id: id,
+                    labels: label_set,
+                    runs: vec![RunInputV7 {
+                        run,
+                        provenance: None,
+                    }],
+                }
+            })
+            .collect();
+        series.sort_by_key(|s| s.series_id.0);
+        let order = series
+            .iter()
+            .map(|s| s.labels.get("__name__").expect("metric name").to_string())
+            .collect();
+        let written =
+            SegmentWriter::write_v7_with_provenance(series, identity, bounds, meta, Vec::new())
+                .expect("write L1");
+        let seg_ref = SegmentRef {
+            data_object_key: "test/many-runs-l1.rseg".to_string(),
+            object_size: written.bytes.len() as u64,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            ingest_hour_bucket: 0,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            shard: 0,
+            content_hash: written.summary.blake3,
+            writer_id: Uuid::nil(),
+            writer_epoch: 0,
+            writer_seq: 0,
+            created_unix_ns: 100,
+            level: SegmentLevel::L1 {
+                input_set_hash,
+                part_index: 0,
+            },
+            segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+            declared_column_stats: Default::default(),
+        };
+        (written.bytes, tenant_hash, seg_ref, order)
+    }
+
+    /// An L1 fetch is exempt from `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`: it
+    /// issues one page-range GET per coalesced run however many there are,
+    /// and bridges no gap.
+    #[tokio::test]
+    async fn l1_fetch_issues_one_page_range_get_per_run() {
+        let (bytes, tenant_hash, seg_ref, order) = many_run_l1_segment();
+        assert_eq!(order.len(), 16);
+        // The first GET (16-byte tail), the footer chase and one catalog GET.
+        const OPEN_AND_CATALOG: u64 = 3;
+        let alternate: Vec<&String> = order.iter().step_by(2).collect();
+        assert_eq!(alternate.len(), 8);
+        let one: Vec<&String> = alternate.iter().copied().take(1).collect();
+        // A selected series' TS and VAL pages are separate runs, and an
+        // unselected series sits between consecutive selected ones, so every
+        // other series is 16 runs, four times the L0 bound.
+        let cases: [(&str, &[&String], u64); 2] = [
+            ("one series: a TS and a VAL run", &one, 2),
+            ("every other series: 16 runs", &alternate, 16),
+        ];
+        for (label, names, page_gets) in cases {
+            let (gets, got) = many_run_fetch(&bytes, tenant_hash, &seg_ref, names, false).await;
+            let (whole_gets, truth) =
+                many_run_fetch(&bytes, tenant_hash, &seg_ref, names, true).await;
+            assert_eq!(whole_gets, 1, "{label}: reference read");
+            assert_eq!(got, truth, "{label}: ranged reads decode the same data");
+            assert_eq!(gets, OPEN_AND_CATALOG + page_gets, "{label}: GETs");
+        }
+        let (gets, _) = many_run_fetch(&bytes, tenant_hash, &seg_ref, &alternate, false).await;
+        assert_eq!(gets, 19);
+        assert!(gets > MAX_GETS_PER_L0_SEGMENT_FETCH);
+    }
+
+    #[test]
+    fn fetched_regions_slice_is_zero_copy_within_one_buffer() {
+        let mut regions = FetchedRegions::default();
+        let buf = Bytes::from(vec![0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        let base = buf.as_ptr() as usize;
+        // Buffer lives at absolute offset 100, spanning [100, 110).
+        regions.insert(100, buf);
+
+        assert!(regions.covers(102, 108));
+        assert!(
+            !regions.covers(95, 105),
+            "must not claim to cover a left overhang"
+        );
+        assert!(
+            !regions.covers(105, 115),
+            "must not claim to cover a right overhang"
+        );
+
+        let s = regions.slice(103, 4).expect("sub-range is covered");
+        assert_eq!(&s[..], &[3u8, 4, 5, 6]);
+        // Zero-copy (ADR-0013, fetcher.rs FetchedRegions::slice comment): the
+        // returned Bytes points into the original allocation at base + 3, not
+        // a fresh copy. Compared as integers to avoid `unsafe` pointer math
+        // (unsafe is denied workspace-wide).
+        assert_eq!(s.as_ptr() as usize, base + 3);
+        // Out-of-range slice is rejected, never a copy of the wrong bytes.
+        assert!(regions.slice(108, 4).is_none());
+    }
+
+    /// A `FaultStore` whose only rule is a long run of pass-throughs on the
+    /// object key, so `sequence_progress(0)` faithfully counts the GETs a
+    /// fetch issued (the same GET-counting trick as tests/fetch_multi_get.rs).
+    async fn counting_store(bytes: Bytes, key: &str) -> Arc<FaultStore<MemoryStore>> {
+        let inner = MemoryStore::new();
+        inner
+            .put(key, bytes, PutOptions::default())
+            .await
+            .expect("put segment object");
+        let mut seq = Sequence::new(Op::Get).with_key_contains(key);
+        for _ in 0..64 {
+            seq = seq.then_passthrough();
+        }
+        Arc::new(FaultStore::new(
+            inner,
+            FaultPlan::empty().with_sequence(seq),
+        ))
+    }
+
+    /// Opening a segment once with `fetch_soa_and_histograms`
+    /// returns byte-for-byte the same scalar and histogram series the two
+    /// separate `fetch_soa` + `fetch_histograms` passes did, while issuing
+    /// strictly fewer GETs (one segment open instead of two).
+    #[tokio::test]
+    async fn fetch_soa_and_histograms_matches_separate_passes_in_one_open() {
+        let (mem, tenant_hash, seg_ref) = write_histogram_test_segment().await;
+        let bytes = mem
+            .get(&seg_ref.data_object_key, GetRange::Full)
+            .await
+            .expect("get bytes")
+            .data;
+
+        let ref_store = counting_store(bytes.clone(), &seg_ref.data_object_key).await;
+        let ref_backend: Arc<dyn ObjectStoreBackend> = ref_store.clone();
+        let ref_fetcher = SegmentFetcher::new(ref_backend);
+        let (soa_ref, _s) = ref_fetcher
+            .fetch_soa(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("fetch_soa");
+        let hist_ref = ref_fetcher
+            .fetch_histograms(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("fetch_histograms");
+        let two_pass_gets = ref_store.sequence_progress(0);
+
+        let comb_store = counting_store(bytes, &seg_ref.data_object_key).await;
+        let comb_backend: Arc<dyn ObjectStoreBackend> = comb_store.clone();
+        let (mut soa, _s2, mut hist) = SegmentFetcher::new(comb_backend)
+            .fetch_soa_and_histograms(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("combined fetch");
+        let combined_gets = comb_store.sequence_progress(0);
+
+        let mut soa_ref = soa_ref;
+        soa.sort_by_key(|s| s.series_id.0);
+        soa_ref.sort_by_key(|s| s.series_id.0);
+        assert_eq!(soa.len(), soa_ref.len());
+        for (x, y) in soa.iter().zip(soa_ref.iter()) {
+            assert_eq!(x.series_id, y.series_id);
+            assert_eq!(x.labels, y.labels);
+            assert_eq!(x.timestamps, y.timestamps);
+            let xv: Vec<u64> = x.values.iter().map(|v| v.to_bits()).collect();
+            let yv: Vec<u64> = y.values.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(xv, yv);
+        }
+
+        let mut hist_ref = hist_ref;
+        hist.sort_by_key(|s| s.series_id.0);
+        hist_ref.sort_by_key(|s| s.series_id.0);
+        assert_eq!(hist.len(), hist_ref.len());
+        for (x, y) in hist.iter().zip(hist_ref.iter()) {
+            assert_eq!(x.series_id, y.series_id);
+            assert_eq!(x.labels, y.labels);
+            assert_eq!(x.timestamps, y.timestamps);
+            assert_eq!(x.values, y.values);
+        }
+
+        assert_eq!(
+            two_pass_gets, 2,
+            "the two separate passes open the segment twice"
+        );
+        assert_eq!(
+            combined_gets, 1,
+            "the merged pass opens the small segment exactly once"
+        );
+    }
+
+    /// Below the whole-object threshold the first GET reads the
+    /// entire object (one request, no footer probe) regardless of `suffix_len`;
+    /// above it the footer tail read runs and a tiny footer length forces the
+    /// `NeedRange` chase into more than one GET. Both decode identical data.
+    #[tokio::test]
+    async fn size_aware_first_get_reads_whole_small_object_else_footer_tail() {
+        let (mem, tenant_hash, seg_ref) = write_test_segment().await;
+        let bytes = mem
+            .get(&seg_ref.data_object_key, GetRange::Full)
+            .await
+            .expect("get bytes")
+            .data;
+        let size = seg_ref.object_size;
+
+        // Below threshold: one whole-object GET even with a 16-byte suffix.
+        let whole_store = counting_store(bytes.clone(), &seg_ref.data_object_key).await;
+        let whole_backend: Arc<dyn ObjectStoreBackend> = whole_store.clone();
+        let whole = SegmentFetcher::new(whole_backend)
+            .with_whole_object_threshold(size + 1)
+            .with_suffix_len(16)
+            .fetch(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("whole-object fetch");
+        assert_eq!(
+            whole_store.sequence_progress(0),
+            1,
+            "below threshold the fetch reads the whole object in one GET"
+        );
+
+        // Above threshold (whole-object disabled) with a tiny footer length:
+        // the footer NeedRange chase issues at least a second GET.
+        let tail_store = counting_store(bytes, &seg_ref.data_object_key).await;
+        let tail_backend: Arc<dyn ObjectStoreBackend> = tail_store.clone();
+        let tailed = SegmentFetcher::new(tail_backend)
+            .with_whole_object_threshold(0)
+            .with_suffix_len(16)
+            .fetch(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("footer tail fetch");
+        assert!(
+            tail_store.sequence_progress(0) >= 2,
+            "above threshold the footer tail read issues a second probe, got {}",
+            tail_store.sequence_progress(0)
+        );
+
+        let mut a = whole;
+        let mut b = tailed;
+        a.sort_by_key(|s| s.series_id.0);
+        b.sort_by_key(|s| s.series_id.0);
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(x.series_id, y.series_id);
+            assert_eq!(x.samples.len(), y.samples.len());
+            for (sx, sy) in x.samples.iter().zip(y.samples.iter()) {
+                assert_eq!(sx.ts_ns, sy.ts_ns);
+                assert_eq!(sx.value.to_bits(), sy.value.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn fetched_regions_does_not_cover_a_range_straddling_two_buffers() {
+        // A sub-range that spans a buffer boundary is reported uncovered, so
+        // the fetcher refetches it rather than stitching bytes from two GETs.
+        let mut regions = FetchedRegions::default();
+        regions.insert(0, Bytes::from(vec![0u8; 10]));
+        regions.insert(10, Bytes::from(vec![1u8; 10]));
+        assert!(regions.covers(2, 8));
+        assert!(regions.covers(12, 18));
+        assert!(!regions.covers(8, 12), "a straddling range is not covered");
+        assert!(regions.slice(8, 4).is_none());
+    }
+
+    /// A `Layer` that records every `record()` call's field names, keyed by
+    /// which span it landed on (by name), so a test can assert a field never
+    /// lands on the wrong span.
+    #[derive(Clone, Default)]
+    struct RecordCollector {
+        hits: std::sync::Arc<std::sync::Mutex<Vec<(String, &'static str)>>>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for RecordCollector
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct FieldNames(Vec<&'static str>);
+            impl tracing::field::Visit for FieldNames {
+                fn record_u64(&mut self, field: &tracing::field::Field, _value: u64) {
+                    self.0.push(field.name());
+                }
+                fn record_debug(
+                    &mut self,
+                    _field: &tracing::field::Field,
+                    _value: &dyn std::fmt::Debug,
+                ) {
+                }
+            }
+            let mut names = FieldNames(Vec::new());
+            values.record(&mut names);
+            let span_name = ctx
+                .span(id)
+                .map(|s| s.name().to_string())
+                .unwrap_or_default();
+            if let Ok(mut hits) = self.hits.lock() {
+                for name in names.0 {
+                    hits.push((span_name.clone(), name));
+                }
+            }
+        }
+    }
+
+    /// Discriminating regression test for the checkpoint-review bug: the
+    /// phase functions (`open_segment`, `decode_selected`,
+    /// `fetch_pages`, `build_scalar_decodes`, ...) used to record their
+    /// per-phase `s3_requests`/`s3_bytes`/`series_matched`/
+    /// `decompressed_bytes` fields via `tracing::Span::current()`. Every phase
+    /// span is `debug`-level; at INFO (the production default) they are
+    /// disabled, and entering a disabled span is a no-op that never changes
+    /// what `Span::current()` returns. `Span::current()` would then resolve to
+    /// the nearest *enabled* ancestor -- in production, the `sql_query`/
+    /// `analytics_query` request-level span, which declares the identical
+    /// field names -- and a phase's `record()` call would land there instead,
+    /// visible to any subscriber that observes intermediate `on_record`
+    /// events (a live/streaming trace exporter, not just a backend that reads
+    /// the span once it closes).
+    ///
+    /// This installs an INFO-only filter (so every phase span here is
+    /// disabled, matching production) with a "request_span" standing in for
+    /// `sql_query`/`analytics_query`, entered around the fetch exactly as
+    /// `services/ravel-server/src/sql.rs` enters its own request span. It
+    /// asserts no `s3_requests`/`s3_bytes` field is ever recorded onto
+    /// anything: the fix's `debug_span!`/`.instrument()` (or, for the sync
+    /// decode functions, `span.enter()`) handles mean every phase's `record()`
+    /// call targets its own (disabled, so silently dropped) span, never the
+    /// ambient one. Before the fix, this test fails: the collector observes
+    /// `s3_requests`/`s3_bytes` recorded on `"request_span"`.
+    #[tokio::test]
+    // Holds the test_tracing serialization guard across `.await`; the
+    // current-thread test runtime runs this future to completion with no other
+    // task, so there is no deadlock risk the lint guards against.
+    #[allow(clippy::await_holding_lock)]
+    async fn phase_spans_never_record_onto_the_ambient_span_when_disabled() {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        // This installs an INFO-only subscriber, whose max-level hint is
+        // process-global: while it is the default it disables every
+        // `debug_span!` on every thread. A concurrent test that counts such
+        // spans would silently miss them. Hold the shared guard so this test
+        // never overlaps those (see `crate::test_tracing`).
+        let _serial = crate::test_tracing::guard();
+
+        let collector = RecordCollector::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::INFO)
+            .with(collector.clone());
+        let _guard = subscriber.set_default();
+
+        let (store, tenant_hash, seg_ref) = write_test_segment().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let fetcher = SegmentFetcher::new(backend);
+
+        // Stands in for `sql_query`/`analytics_query`: INFO level, so
+        // enabled, declaring the same field names the phase spans do.
+        let request_span = tracing::info_span!(
+            "request_span",
+            s3_requests = tracing::field::Empty,
+            s3_bytes = tracing::field::Empty,
+        );
+        async {
+            fetcher
+                .fetch_soa(tenant_hash, &seg_ref, &[])
+                .await
+                .expect("fetch_soa succeeds")
+        }
+        .instrument(request_span.clone())
+        .await;
+
+        let hits = collector.hits.lock().expect("lock").clone();
+        let leaked: Vec<_> = hits
+            .iter()
+            .filter(|(_, field)| *field == "s3_requests" || *field == "s3_bytes")
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "a disabled phase span's s3_requests/s3_bytes record() call must \
+             never land on any other span (production's request-level span \
+             declares the same field names): got {leaked:?}"
+        );
+    }
+
+    /// A fresh RAM-only ADR-0046 read cache, sized well above any test object
+    /// so nothing evicts mid-test.
+    fn ram_cache() -> Arc<ravel_cache::Cache<CacheFetchError>> {
+        let limits = ravel_cache::CacheLimits::new(64 * 1024 * 1024, 1024, 64 * 1024 * 1024);
+        Arc::new(ravel_cache::Cache::new(limits))
+    }
+
+    /// Puts `bytes` on a fresh `MemoryStore` under `key`. `MemoryStore` is the
+    /// object-store semantics oracle and returns the object's whole
+    /// `total_size` on a `Range` GET exactly as S3 does, so an absolute footer
+    /// tail range resolves the same `total_size` a suffix would have.
+    async fn store_from_bytes(key: &str, bytes: Bytes) -> Arc<MemoryStore> {
+        let store = Arc::new(MemoryStore::new());
+        store
+            .put(key, bytes, PutOptions::default())
+            .await
+            .expect("put segment object");
+        store
+    }
+
+    fn assert_fetched_eq(got: &[FetchedSeries], truth: &[FetchedSeries]) {
+        assert_eq!(got.len(), truth.len(), "series count differs");
+        for (x, y) in got.iter().zip(truth.iter()) {
+            assert_eq!(x.series_id, y.series_id);
+            assert_eq!(x.labels, y.labels);
+            assert_eq!(x.samples.len(), y.samples.len());
+            for (sx, sy) in x.samples.iter().zip(y.samples.iter()) {
+                assert_eq!(sx.ts_ns, sy.ts_ns);
+                // Bit-pattern equality: NaN payloads and -0.0 are significant
+                // (CLAUDE.md testing patterns).
+                assert_eq!(sx.value.to_bits(), sy.value.to_bits());
+            }
+        }
+    }
+
+    /// Issue #811: with the object size known, the footer is read as an
+    /// absolute tail range that ADR-0046's read cache serves, so a second open
+    /// of the same large segment issues EXACTLY ZERO footer GETs.
+    ///
+    /// Per-phase, not pooled: `open_segment` reads only the footer (no catalog
+    /// or page GETs), so the `QueryAccounting` handle passed to it counts the
+    /// footer-open phase alone. A pooled query-wide counter would fold the
+    /// catalog and page GETs in and could hide an extra footer round trip.
+    ///
+    /// This is the test the deliverable says must fail against the pre-fix
+    /// code: flip the sized-ref branch in `open_segment` back to
+    /// `GetRange::Suffix(self.suffix_len)` and the second open's
+    /// `s3_requests(Get)` becomes 1 (a suffix GET bypasses the cache), so the
+    /// `== 0` assertion fails. Verified failing during development.
+    #[tokio::test]
+    async fn second_open_of_large_segment_issues_exactly_zero_footer_gets() {
+        let (bytes, tenant_hash, seg_ref) = write_sparse_test_segment(4096, 32).await;
+        assert!(
+            seg_ref.object_size > DEFAULT_SUFFIX_LEN,
+            "the segment must exceed the {DEFAULT_SUFFIX_LEN} B footer tail so the \
+             footer read is a genuine absolute tail range, got {} B",
+            seg_ref.object_size
+        );
+
+        let store = store_from_bytes(&seg_ref.data_object_key, bytes).await;
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        // whole_object_threshold below the object size forces the footer tail
+        // path (not the whole-object read); the cache makes the tail reusable.
+        let fetcher = SegmentFetcher::new(backend)
+            .with_whole_object_threshold(1024)
+            .with_cache(ram_cache());
+
+        // First open: a genuine miss. Exactly one footer GET (the absolute tail
+        // range; the 64 KiB default tail covers this object's footer, so no
+        // NeedRange chase), which populates the cache.
+        let acct1 = QueryAccounting::new();
+        fetcher
+            .open_segment(tenant_hash, &seg_ref, &acct1)
+            .await
+            .expect("first open");
+        let s1 = acct1.snapshot();
+        assert_eq!(
+            s1.s3_requests(AccountedOp::Get),
+            1,
+            "first open reads the footer tail with exactly one store GET"
+        );
+        // The single-GET assertion above only holds while the footer plus
+        // trailer fit inside the tail range. If a format change grew the footer
+        // past DEFAULT_SUFFIX_LEN the read would take a NeedRange chase and a
+        // second GET, and the assertion above would fail without saying why.
+        // Pin the precondition against the observable so drift names itself.
+        assert!(
+            s1.s3_bytes(AccountedOp::Get) <= DEFAULT_SUFFIX_LEN,
+            "the footer plus trailer must fit inside the {DEFAULT_SUFFIX_LEN} B              tail for this to be a single-GET open; read {} B, which means the              footer outgrew the tail and the read took a NeedRange chase",
+            s1.s3_bytes(AccountedOp::Get)
+        );
+        assert_eq!(s1.cache_hits, 0, "first open is a genuine cache miss");
+
+        // Second open of the same segment: the footer tail range is served from
+        // the read cache. Zero footer GETs, zero footer bytes off the store.
+        let acct2 = QueryAccounting::new();
+        fetcher
+            .open_segment(tenant_hash, &seg_ref, &acct2)
+            .await
+            .expect("second open");
+        let s2 = acct2.snapshot();
+        assert_eq!(
+            s2.s3_requests(AccountedOp::Get),
+            0,
+            "the second open must issue zero footer GETs: the absolute tail range \
+             is served from the read cache (issue #811)"
+        );
+        assert_eq!(
+            s2.s3_bytes(AccountedOp::Get),
+            0,
+            "a cache-served footer transfers zero store bytes"
+        );
+        assert_eq!(s2.cache_hits, 1, "the footer read is exactly one cache hit");
+        assert!(
+            s2.cache_bytes > 0,
+            "the cache hit served the footer bytes, got {} B",
+            s2.cache_bytes
+        );
+        assert_eq!(
+            fetcher.suffix_fallbacks(),
+            0,
+            "a sized ref never takes the uncacheable suffix fallback"
+        );
+    }
+
+    /// The footer `NeedRange` chase reads correct data on both the sized
+    /// (absolute-range) path and the sizeless (suffix-fallback) path, and the
+    /// fallback is observable (issue #811). A 16-byte footer length forces the
+    /// first read to miss the footer so the chase runs in both cases.
+    #[tokio::test]
+    async fn footer_needrange_chase_reads_correct_data_for_known_and_absent_size() {
+        let (mem, tenant_hash, seg_ref) = write_test_segment().await;
+        let bytes = mem
+            .get(&seg_ref.data_object_key, GetRange::Full)
+            .await
+            .expect("get bytes")
+            .data;
+
+        // Reference: a plain uncached whole-object read.
+        let truth = {
+            let store = store_from_bytes(&seg_ref.data_object_key, bytes.clone()).await;
+            let backend: Arc<dyn ObjectStoreBackend> = store;
+            let mut r = SegmentFetcher::new(backend)
+                .fetch(tenant_hash, &seg_ref, &[])
+                .await
+                .expect("uncached truth fetch");
+            r.sort_by_key(|s| s.series_id.0);
+            r
+        };
+
+        // (a) Known size: whole-object path disabled and a 16-byte tail, so the
+        // first GET is an absolute Range that misses the footer and the
+        // NeedRange chase re-reads it as another absolute range. Decodes the
+        // reference data, and no suffix fallback is taken.
+        {
+            let store = store_from_bytes(&seg_ref.data_object_key, bytes.clone()).await;
+            let backend: Arc<dyn ObjectStoreBackend> = store;
+            let fetcher = SegmentFetcher::new(backend)
+                .with_whole_object_threshold(0)
+                .with_suffix_len(16);
+            let mut got = fetcher
+                .fetch(tenant_hash, &seg_ref, &[])
+                .await
+                .expect("sized-ref NeedRange chase");
+            got.sort_by_key(|s| s.series_id.0);
+            assert_fetched_eq(&got, &truth);
+            assert_eq!(
+                fetcher.suffix_fallbacks(),
+                0,
+                "a sized ref takes the absolute-range path, never the suffix fallback"
+            );
+        }
+
+        // (b) Absent size (`object_size == 0`): the suffix fallback is taken,
+        // the NeedRange chase still decodes the reference data, and the
+        // fallback is observable exactly once rather than silent.
+        {
+            let mut sizeless = seg_ref.clone();
+            sizeless.object_size = 0;
+            let store = store_from_bytes(&seg_ref.data_object_key, bytes.clone()).await;
+            let backend: Arc<dyn ObjectStoreBackend> = store;
+            let fetcher = SegmentFetcher::new(backend).with_suffix_len(16);
+            let mut got = fetcher
+                .fetch(tenant_hash, &sizeless, &[])
+                .await
+                .expect("sizeless-ref suffix NeedRange chase");
+            got.sort_by_key(|s| s.series_id.0);
+            assert_fetched_eq(&got, &truth);
+            assert_eq!(
+                fetcher.suffix_fallbacks(),
+                1,
+                "an unsized ref must take the observable suffix fallback exactly once"
+            );
+        }
+    }
+
+    /// `crate::io_shape::depth_for_object` (issue #1214) mirrors the real
+    /// branches `open_segment` -> `decode_selected` -> `fetch_pages`
+    /// takes, not just the footer stage. A small object (`object_size` in
+    /// `(0, threshold]`) resolves footer, catalog, and pages from one GET:
+    /// zero dependent stages, depth 1. Every other case takes the
+    /// footer-tail path, whose footer stage is either 1 GET (the tail guess
+    /// covers the real footer) or 2 (a `FooterOutcome::NeedRange` chase),
+    /// followed by a dependent catalog `ensure_ranges` GET (LABEL_DICT /
+    /// SERIES_IDS / SERIES_META, at the object front, never inside the
+    /// footer-tail bytes) and a dependent page `ensure_ranges` GET (the run
+    /// ranges the catalog just named): up to 4 stages total. The pre-fix
+    /// `depth_for_object` tested only `object_size <= whole_object_threshold`,
+    /// which is vacuously true for `object_size == 0` against any
+    /// non-negative threshold, and so wrongly reported depth 1 -- the
+    /// whole-object depth -- for a segment that `open_segment` actually
+    /// routes down the footer-tail path.
+    ///
+    /// Every case below drives the real GET count through a full `.fetch()`
+    /// call against a counting store (`FaultStore`'s `sequence_progress`),
+    /// not a recomputation from a partial call (`open_segment` alone) that
+    /// cannot see the catalog or page stages. Flip the `object_size != 0 &&`
+    /// guard back off in `depth_for_object` to watch the `object_size == 0`
+    /// assertion in (c) fail: it would then predict 1, not 4.
+    #[tokio::test]
+    async fn depth_for_object_upper_bounds_the_real_footer_and_page_chain() {
+        use crate::io_shape::depth_for_object;
+
+        // (a) Whole-object path: resolves everything from the single first
+        // GET, zero dependent stages.
+        {
+            let (mem, tenant_hash, seg_ref) = write_test_segment().await;
+            let bytes = mem
+                .get(&seg_ref.data_object_key, GetRange::Full)
+                .await
+                .expect("get bytes")
+                .data;
+            let size = seg_ref.object_size;
+            let store = counting_store(bytes, &seg_ref.data_object_key).await;
+            let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+            SegmentFetcher::new(backend)
+                .with_whole_object_threshold(size + 1)
+                .fetch(tenant_hash, &seg_ref, &[])
+                .await
+                .expect("whole-object fetch");
+            let real_chain = store.sequence_progress(0);
+            assert_eq!(
+                real_chain, 1,
+                "whole-object path resolves footer, catalog, and pages from one GET"
+            );
+            assert_eq!(
+                depth_for_object(size, size + 1),
+                1,
+                "predicted depth must match the real single-GET chain exactly"
+            );
+        }
+
+        // (b) Forced footer-tail path with a `NeedRange` chase (`suffix_len`
+        // too small to cover the footer): the real chain runs the whole
+        // pipeline (footer tail, NeedRange chase, catalog fetch, page
+        // fetch), counted from a full `.fetch()` against a counting store,
+        // not recomputed from `open_segment` alone.
+        {
+            let (mem, tenant_hash, seg_ref) = write_test_segment().await;
+            let bytes = mem
+                .get(&seg_ref.data_object_key, GetRange::Full)
+                .await
+                .expect("get bytes")
+                .data;
+            let store = counting_store(bytes, &seg_ref.data_object_key).await;
+            let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+            SegmentFetcher::new(backend)
+                .with_whole_object_threshold(0)
+                .with_suffix_len(16)
+                .fetch(tenant_hash, &seg_ref, &[])
+                .await
+                .expect("forced NeedRange chase fetch");
+            let real_chain = store.sequence_progress(0);
+            assert_eq!(
+                real_chain, 4,
+                "a 16-byte suffix_len is too small to cover the footer, forcing a \
+                 NeedRange chase, and this segment's catalog and page sections sit \
+                 outside the footer-tail bytes: footer tail + NeedRange chase + \
+                 catalog fetch + page fetch is a 4-GET chain"
+            );
+            assert_eq!(
+                depth_for_object(seg_ref.object_size, 0),
+                4,
+                "predicted upper bound must equal the real chain exactly in the \
+                 worst case"
+            );
+        }
+
+        // (c) `object_size == 0` (unknown size): takes the SAME footer-tail
+        // path as (b), not the whole-object path, even though the pre-fix
+        // code's `object_size <= whole_object_threshold` test was vacuously
+        // true for 0 against any non-negative threshold. A 250-byte
+        // `suffix_len` covers this segment's footer in a single GET (no
+        // `NeedRange` chase) without reaching far enough back to also cover
+        // the catalog or page sections, so the real chain is 3 (footer +
+        // catalog + page), safely within the upper bound of 4.
+        {
+            let (mem, tenant_hash, seg_ref) = write_test_segment().await;
+            let bytes = mem
+                .get(&seg_ref.data_object_key, GetRange::Full)
+                .await
+                .expect("get bytes")
+                .data;
+            let mut sizeless = seg_ref.clone();
+            sizeless.object_size = 0;
+            let store = counting_store(bytes, &seg_ref.data_object_key).await;
+            let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+            SegmentFetcher::new(backend)
+                .with_whole_object_threshold(1_000_000)
+                .with_suffix_len(250)
+                .fetch(tenant_hash, &sizeless, &[])
+                .await
+                .expect("sizeless fetch");
+            let real_chain = store.sequence_progress(0);
+            assert_eq!(
+                real_chain, 3,
+                "a 250-byte suffix_len covers the footer without a NeedRange chase \
+                 and without reaching the catalog or page sections: footer + \
+                 catalog + page is a 3-GET chain"
+            );
+            assert_eq!(
+                depth_for_object(0, 1_000_000),
+                4,
+                "object_size == 0 must take the footer-tail upper bound, not the \
+                 whole-object depth of 1, even though 0 <= any non-negative \
+                 threshold"
+            );
+        }
+    }
+
+    /// End-to-end guard for issue #811 over a full `fetch_soa` (footer +
+    /// catalog + pages), not just `open_segment`: a cold query with a cache
+    /// attached must succeed, and a second identical query must issue zero
+    /// store GETs and zero store bytes because every read -- footer absolute
+    /// tail range, catalog ranges, page ranges -- is cache-eligible.
+    ///
+    /// This also pins the etag regression the footer-through-cache change
+    /// introduced and fixed: routing the footer GET through the cache made its
+    /// `GetOutcome` etag empty, so the cold query's later ranged store GETs
+    /// mismatched the empty pin and failed with `EtagChanged`. A leader miss
+    /// now carries the real store etag out of `cached_get`, and an empty pin is
+    /// treated as "no pin". Before that fix this test's first query errors.
+    #[tokio::test]
+    async fn full_query_over_large_segment_is_cache_served_on_second_pass() {
+        let (bytes, tenant_hash, seg_ref) = write_sparse_test_segment(4096, 32).await;
+        assert!(
+            seg_ref.object_size > DEFAULT_SUFFIX_LEN,
+            "segment must exceed the footer tail, got {} B",
+            seg_ref.object_size
+        );
+        let store = store_from_bytes(&seg_ref.data_object_key, bytes).await;
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let fetcher = SegmentFetcher::new(backend)
+            .with_whole_object_threshold(1024)
+            .with_cache(ram_cache());
+        let matchers = [LabelMatcher::equal("__name__", "sparse_metric_100")];
+
+        // Cold query: succeeds (no EtagChanged) and reads from the store.
+        let acct1 = QueryAccounting::new();
+        let (mut soa1, _s1) = fetcher
+            .fetch_soa_accounted(tenant_hash, &seg_ref, &matchers, &acct1)
+            .await
+            .expect("cold cached query must not fail with EtagChanged");
+        soa1.sort_by_key(|s| s.series_id.0);
+        assert_eq!(soa1.len(), 1, "the matcher pins exactly one series");
+        assert!(
+            acct1.snapshot().total_s3_requests() > 0,
+            "the cold query reads from the store"
+        );
+
+        // Second identical query: every extent is cache-resident, so zero store
+        // GETs and zero store bytes, and the result is bit-identical.
+        let acct2 = QueryAccounting::new();
+        let (mut soa2, _s2) = fetcher
+            .fetch_soa_accounted(tenant_hash, &seg_ref, &matchers, &acct2)
+            .await
+            .expect("warm cached query");
+        soa2.sort_by_key(|s| s.series_id.0);
+        let s2 = acct2.snapshot();
+        assert_eq!(
+            s2.total_s3_requests(),
+            0,
+            "the second query must issue zero store GETs (footer, catalog and \
+             pages are all cache-served; issue #811)"
+        );
+        assert_eq!(
+            s2.total_s3_bytes(),
+            0,
+            "a fully cache-served query transfers zero store bytes"
+        );
+        assert!(
+            s2.cache_hits > 0,
+            "the second query is served from the cache"
+        );
+        assert_eq!(
+            fetcher.suffix_fallbacks(),
+            0,
+            "a sized ref never falls back"
+        );
+
+        assert_eq!(soa1.len(), soa2.len());
+        for (a, b) in soa1.iter().zip(soa2.iter()) {
+            assert_eq!(a.series_id, b.series_id);
+            assert_eq!(a.timestamps, b.timestamps);
+            let av: Vec<u64> = a.values.iter().map(|v| v.to_bits()).collect();
+            let bv: Vec<u64> = b.values.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(av, bv);
+        }
+    }
+
+    // ------------------------------------------------ issue #1076: ordinal path
+
+    /// Builds an 8-label below-threshold RSEG object (whole SERIES_META present,
+    /// so `decode_selected` takes its branch-1). `l0` is `"hot"` on every
+    /// `sel_mod`-th series and a per-series unique value otherwise, so an
+    /// equality on `l0="hot"` selects exactly `n / sel_mod` series. The other
+    /// seven labels give every series a realistic multi-label set. `samples_per`
+    /// incompressible samples per series keep the page sections large so the
+    /// catalog is a small fraction of the object.
+    fn write_ordinal_fixture(
+        n: usize,
+        samples_per: usize,
+        sel_mod: usize,
+    ) -> (Bytes, TenantHash, SegmentRef) {
+        let tenant_hash = TenantHash([6u8; 16]);
+        let writer_id = Uuid::from_u128(1076);
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        };
+        let tenant_id = TenantId::new("t".to_string());
+        const NS: i64 = 1_000_000_000;
+        let mut inputs = Vec::with_capacity(n);
+        for i in 0..n {
+            let name = format!("m{i}");
+            let l0 = if i % sel_mod == 0 {
+                "hot".to_string()
+            } else {
+                format!("c{i}")
+            };
+            let pairs = [
+                ("__name__", name.clone()),
+                ("l0", l0),
+                ("l1", format!("a{}", i % 8)),
+                ("l2", format!("b{}", i % 16)),
+                ("l3", "const".to_string()),
+                ("l4", format!("d{}", i % 4)),
+                ("l5", format!("e{}", i % 32)),
+                ("l6", format!("f{}", i % 3)),
+            ];
+            let label_set = LabelSet::new(
+                pairs
+                    .iter()
+                    .map(|(k, v)| Label {
+                        name: (*k).to_string(),
+                        value: v.clone(),
+                    })
+                    .collect(),
+            )
+            .expect("valid labels");
+            let series_id =
+                ravel_types::SeriesId::compute(&tenant_id, &name, &label_set).expect("series id");
+            let samples: Vec<ravel_types::Sample> = (0..samples_per)
+                .map(|j| {
+                    let bits = (i as u64)
+                        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                        .wrapping_add((j as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F));
+                    ravel_types::Sample {
+                        ts_ns: (1_000 + j as i64) * NS,
+                        value: f64::from_bits(bits),
+                    }
+                })
+                .collect();
+            inputs.push(SeriesInput {
+                series_id,
+                labels: label_set,
+                samples,
+            });
+        }
+        let written = SegmentWriter::write(inputs, identity, bounds).expect("write fixture");
+        let seg_ref = SegmentRef {
+            data_object_key: "test/ordinal-fixture.rseg".to_string(),
+            object_size: written.bytes.len() as u64,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            ingest_hour_bucket: 0,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            shard: 0,
+            content_hash: written.summary.blake3,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 99,
+            level: ravel_catalog::SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+            declared_column_stats: Default::default(),
+        };
+        (written.bytes, tenant_hash, seg_ref)
+    }
+
+    /// `ordinal_equals` accepts exactly the shape the ordinal decoder can
+    /// answer: a non-empty set of non-empty positive equalities. Every other
+    /// shape falls back.
+    #[test]
+    fn ordinal_equals_admits_only_nonempty_positive_equality() {
+        assert_eq!(
+            ordinal_equals(&[]),
+            None,
+            "empty set matches all -> fallback"
+        );
+        assert_eq!(
+            ordinal_equals(&[LabelMatcher::equal("a", "b")]),
+            Some(vec![("a", "b")])
+        );
+        assert_eq!(
+            ordinal_equals(&[LabelMatcher::equal("a", "b"), LabelMatcher::equal("c", "d")]),
+            Some(vec![("a", "b"), ("c", "d")])
+        );
+        assert_eq!(
+            ordinal_equals(&[LabelMatcher::equal("a", "")]),
+            None,
+            "empty-value equality means 'absent or empty' -> fallback"
+        );
+        assert_eq!(
+            ordinal_equals(&[
+                LabelMatcher::equal("a", "b"),
+                LabelMatcher::not_equal("c", "d")
+            ]),
+            None,
+            "a negated matcher in the set -> fallback"
+        );
+        assert_eq!(
+            ordinal_equals(&[LabelMatcher::regex("a", "b").expect("regex")]),
+            None,
+            "a regex matcher -> fallback"
+        );
+    }
+
+    /// An equality-only matcher set takes the ordinal path and materializes
+    /// exactly the selected series; a same-result regex or negated set takes
+    /// the materializing path and materializes the whole catalog. Both return
+    /// the identical series set and move the identical fetched bytes: the
+    /// ordinal path's only difference is the materialization count.
+    #[tokio::test]
+    async fn ordinal_and_materializing_agree_on_series_and_bytes() {
+        const N: usize = 1000;
+        const SEL_MOD: usize = 50; // 20 series carry l0="hot"
+        const MATCHED: usize = N / SEL_MOD;
+        let (bytes, tenant_hash, seg_ref) = write_ordinal_fixture(N, 8, SEL_MOD);
+
+        // Ordinal path: equality on l0.
+        let (fetcher_ord, metrics_ord) =
+            metered_fetcher(&seg_ref.data_object_key, bytes.clone()).await;
+        let fetcher_ord = fetcher_ord.with_whole_object_threshold(0);
+        let eq = [LabelMatcher::equal("l0", "hot")];
+        let (soa_ord, _) = fetcher_ord
+            .fetch_soa(tenant_hash, &seg_ref, &eq)
+            .await
+            .expect("ordinal fetch");
+
+        // Materializing path: an anchored regex selecting exactly l0="hot".
+        let (fetcher_mat, metrics_mat) =
+            metered_fetcher(&seg_ref.data_object_key, bytes.clone()).await;
+        let fetcher_mat = fetcher_mat.with_whole_object_threshold(0);
+        let re = [LabelMatcher::regex("l0", "hot").expect("regex")];
+        let (soa_mat, _) = fetcher_mat
+            .fetch_soa(tenant_hash, &seg_ref, &re)
+            .await
+            .expect("materializing fetch");
+
+        // Identical series set (exact count and identities).
+        assert_eq!(soa_ord.len(), MATCHED);
+        assert_eq!(soa_mat.len(), MATCHED);
+        let ids_ord: std::collections::BTreeSet<_> = soa_ord.iter().map(|s| s.series_id).collect();
+        let ids_mat: std::collections::BTreeSet<_> = soa_mat.iter().map(|s| s.series_id).collect();
+        assert_eq!(ids_ord, ids_mat, "both paths select the identical series");
+
+        // Materialization counts, exact: ordinal builds only the matched label
+        // sets, the materializing path builds one per candidate series.
+        assert_eq!(
+            fetcher_ord.label_sets_materialized(),
+            MATCHED as u64,
+            "ordinal path materializes only the matched series"
+        );
+        assert_eq!(
+            fetcher_mat.label_sets_materialized(),
+            N as u64,
+            "materializing path materializes every candidate series"
+        );
+
+        // Fetched bytes are identical: same catalog sections, same matched
+        // pages. The saving is materializations, not bytes.
+        assert_eq!(
+            metrics_ord.snapshot().get.bytes,
+            metrics_mat.snapshot().get.bytes,
+            "both paths move the identical fetched bytes"
+        );
+    }
+
+    /// An equality on a value no series carries (absent from the LABEL_DICT)
+    /// selects zero series on the ordinal path, matching the materializing
+    /// path, and materializes nothing.
+    #[tokio::test]
+    async fn ordinal_equality_on_absent_value_selects_zero() {
+        let (bytes, tenant_hash, seg_ref) = write_ordinal_fixture(500, 4, 50);
+        let (fetcher, _metrics) = metered_fetcher(&seg_ref.data_object_key, bytes).await;
+        let fetcher = fetcher.with_whole_object_threshold(0);
+        let eq = [LabelMatcher::equal("l0", "ghost")];
+        let (soa, _) = fetcher
+            .fetch_soa(tenant_hash, &seg_ref, &eq)
+            .await
+            .expect("fetch");
+        assert_eq!(soa.len(), 0, "absent equality value selects zero series");
+        assert_eq!(
+            fetcher.label_sets_materialized(),
+            0,
+            "no series matched, so none is materialized"
+        );
+    }
+
+    /// `__name__` is an ordinary dictionary label on the ordinal path (the
+    /// writer stores it at ordinal 0), so an equality on it selects exactly the
+    /// one series carrying that metric name, the same series the materializing
+    /// path selects for the anchored regex `__name__=~"m7"`, and materializes
+    /// exactly one label set where the materializing path builds all 500.
+    #[tokio::test]
+    async fn ordinal_equality_on_metric_name_selects_one_series() {
+        const N: usize = 500;
+        let (bytes, tenant_hash, seg_ref) = write_ordinal_fixture(N, 4, 50);
+
+        let (fetcher_ord, _m1) = metered_fetcher(&seg_ref.data_object_key, bytes.clone()).await;
+        let fetcher_ord = fetcher_ord.with_whole_object_threshold(0);
+        let eq = [LabelMatcher::equal("__name__", "m7")];
+        let (soa_ord, _) = fetcher_ord
+            .fetch_soa(tenant_hash, &seg_ref, &eq)
+            .await
+            .expect("ordinal fetch");
+
+        let (fetcher_mat, _m2) = metered_fetcher(&seg_ref.data_object_key, bytes).await;
+        let fetcher_mat = fetcher_mat.with_whole_object_threshold(0);
+        let re = [LabelMatcher::regex("__name__", "m7").expect("regex")];
+        let (soa_mat, _) = fetcher_mat
+            .fetch_soa(tenant_hash, &seg_ref, &re)
+            .await
+            .expect("materializing fetch");
+
+        assert_eq!(soa_ord.len(), 1, "one series carries __name__=m7");
+        assert_eq!(soa_mat.len(), 1, "the anchored regex selects the same one");
+        assert_eq!(
+            soa_ord[0].series_id, soa_mat[0].series_id,
+            "the ordinal path selects the series the materializing path selects"
+        );
+        assert_eq!(
+            fetcher_ord.label_sets_materialized(),
+            1,
+            "the ordinal path materializes only the matched series"
+        );
+        assert_eq!(
+            fetcher_mat.label_sets_materialized(),
+            N as u64,
+            "the materializing path materializes every candidate series"
+        );
+    }
+
+    /// A negated equality falls back to the materializing path (it materializes
+    /// the whole catalog) and returns the correct complement; an equality on the
+    /// same label takes the ordinal path over the same fixture.
+    #[tokio::test]
+    async fn negated_equality_falls_back_and_stays_correct() {
+        const N: usize = 400;
+        const SEL_MOD: usize = 40; // 10 series carry l0="hot"
+        let (bytes, tenant_hash, seg_ref) = write_ordinal_fixture(N, 4, SEL_MOD);
+
+        let (fetcher_ne, _m1) = metered_fetcher(&seg_ref.data_object_key, bytes.clone()).await;
+        let fetcher_ne = fetcher_ne.with_whole_object_threshold(0);
+        let ne = [LabelMatcher::not_equal("l0", "hot")];
+        let (soa_ne, _) = fetcher_ne
+            .fetch_soa(tenant_hash, &seg_ref, &ne)
+            .await
+            .expect("ne fetch");
+        assert_eq!(
+            soa_ne.len(),
+            N - N / SEL_MOD,
+            "negated equality returns the complement"
+        );
+        assert_eq!(
+            fetcher_ne.label_sets_materialized(),
+            N as u64,
+            "negated equality materializes the whole catalog (fallback)"
+        );
+
+        let (fetcher_eq, _m2) = metered_fetcher(&seg_ref.data_object_key, bytes).await;
+        let fetcher_eq = fetcher_eq.with_whole_object_threshold(0);
+        let eq = [LabelMatcher::equal("l0", "hot")];
+        let (soa_eq, _) = fetcher_eq
+            .fetch_soa(tenant_hash, &seg_ref, &eq)
+            .await
+            .expect("eq fetch");
+        assert_eq!(soa_eq.len(), N / SEL_MOD);
+        assert_eq!(
+            fetcher_eq.label_sets_materialized(),
+            (N / SEL_MOD) as u64,
+            "equality takes the ordinal path (materializes only matches)"
+        );
+    }
+
+    /// Differential property test: over random label sets and random
+    /// equality-only matcher sets, the ordinal decoder
+    /// (`decode_catalog_matching_v4`) and the materialize-then-filter path
+    /// (`decode_catalog_v4` + `matches_series`) return the identical series set.
+    mod ordinal_differential {
+        use super::{Label, SegmentWriter, SeriesInput};
+        use proptest::prelude::*;
+        use ravel_promql::{LabelMatcher, matches_series};
+        use ravel_segment::{
+            ReaderLimits, decode_catalog_matching_v4, decode_catalog_v4, open_from_full,
+        };
+        use ravel_types::{LabelSet, TenantId};
+
+        const LABEL_DICT: u32 = 1;
+        const SERIES_IDS: u32 = 5;
+        const SERIES_META: u32 = 6;
+        const NAMES: [&str; 3] = ["l0", "l1", "l2"];
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(128))]
+
+            #[test]
+            fn ordinal_equals_materializing(
+                // Per series: for each of l0/l1/l2, 0 => omit, else value index.
+                series in prop::collection::vec((0u8..4, 0u8..4, 0u8..4), 1..15usize),
+                // Matchers: (name index 0..4, value index 0..3), all positive
+                // equality with a non-empty value. Name index 3 is a label no
+                // series carries.
+                matchers in prop::collection::vec((0u8..4, 0u8..3), 1..4usize),
+            ) {
+                let tenant_id = TenantId::new("t".to_string());
+                let mut inputs = Vec::with_capacity(series.len());
+                for (i, (c0, c1, c2)) in series.iter().enumerate() {
+                    let name = format!("m{i}");
+                    let mut pairs = vec![Label { name: "__name__".to_string(), value: name.clone() }];
+                    for (choice, lname) in [(*c0, NAMES[0]), (*c1, NAMES[1]), (*c2, NAMES[2])] {
+                        if choice % 4 != 0 {
+                            pairs.push(Label {
+                                name: lname.to_string(),
+                                value: format!("v{}", choice % 3),
+                            });
+                        }
+                    }
+                    let label_set = LabelSet::new(pairs).expect("labels");
+                    let series_id =
+                        ravel_types::SeriesId::compute(&tenant_id, &name, &label_set).expect("id");
+                    inputs.push(SeriesInput {
+                        series_id,
+                        labels: label_set,
+                        samples: vec![ravel_types::Sample { ts_ns: 1_000_000_000, value: i as f64 }],
+                    });
+                }
+                let identity = ravel_segment::SegmentIdentity {
+                    tenant_hash: [3u8; 16],
+                    shard: 0,
+                    writer_id: "p".to_string(),
+                    writer_epoch: 1,
+                    writer_seq: 1,
+                };
+                let bounds = ravel_segment::IngestBounds { min_ingest_ts_ns: 0, max_ingest_ts_ns: 0 };
+                let written = SegmentWriter::write(inputs, identity, bounds).expect("write");
+                let bytes = written.bytes;
+
+                let limits = ReaderLimits::default();
+                let loc = open_from_full(&bytes, limits).expect("open");
+                let footer = &loc.footer;
+                let slice = |kind: u32| -> Vec<u8> {
+                    let s = footer.sections.iter().find(|s| s.kind == kind).expect("section");
+                    bytes[s.offset as usize..(s.offset + s.len) as usize].to_vec()
+                };
+                let dict = slice(LABEL_DICT);
+                let ids = slice(SERIES_IDS);
+                let meta = slice(SERIES_META);
+
+                let owned: Vec<(String, String)> = matchers
+                    .iter()
+                    .map(|(ni, vi)| {
+                        let name = if *ni == 3 { "absent".to_string() } else { NAMES[*ni as usize].to_string() };
+                        (name, format!("v{vi}"))
+                    })
+                    .collect();
+                let equals: Vec<(&str, &str)> =
+                    owned.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+                let label_matchers: Vec<LabelMatcher> =
+                    owned.iter().map(|(n, v)| LabelMatcher::equal(n, v)).collect();
+
+                let ord = decode_catalog_matching_v4(footer, &dict, &ids, &meta, &equals, limits)
+                    .expect("ordinal");
+                let ord_ids: std::collections::BTreeSet<[u8; 16]> =
+                    ord.iter().map(|e| e.entry.series_id.0).collect();
+
+                let all = decode_catalog_v4(footer, &dict, &ids, &meta, limits).expect("v4");
+                let mat_ids: std::collections::BTreeSet<[u8; 16]> = all
+                    .iter()
+                    .filter(|e| matches_series(&label_matchers, &e.entry.labels))
+                    .map(|e| e.entry.series_id.0)
+                    .collect();
+
+                prop_assert_eq!(ord_ids, mat_ids);
+            }
+        }
+    }
+}

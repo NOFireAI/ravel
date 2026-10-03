@@ -1,0 +1,36 @@
+[package]
+name = "ravel-commit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ravel-types = { workspace = true }
+ravel-proto = { workspace = true }
+ravel-object-store = { workspace = true }
+prost = { workspace = true }
+bytes = { workspace = true }
+uuid = { workspace = true }
+hex = { workspace = true }
+crc32c = { workspace = true }
+blake3 = { workspace = true }
+rand = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# MemoryStore::corrupt_stored_byte for the ADR-1696 acceptance tests in
+# src/publish.rs.
+ravel-object-store = { workspace = true, features = ["test-support"] }
+proptest = { workspace = true }
+serde_json = { workspace = true }
+regex = { workspace = true }
+# For the IAM-template reachability tests only: the fleet heartbeat key
+# constructors are the ground truth those tests build witnesses from, and
+# ravel-fleet does not depend on ravel-commit, so this direction is acyclic.
+ravel-fleet = { workspace = true }
+
+[lints]
+workspace = true

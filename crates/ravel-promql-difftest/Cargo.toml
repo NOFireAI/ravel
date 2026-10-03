@@ -1,0 +1,44 @@
+[package]
+name = "ravel-promql-difftest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Differential test harness: pinned Prometheus vs. Ravel's PromQL evaluator (ADR-0021). Dev-only; never a dependency of any production crate."
+
+[dependencies]
+ravel-types = { workspace = true }
+ravel-otlp = { workspace = true }
+ravel-object-store = { workspace = true }
+ravel-catalog = { workspace = true }
+ravel-ingest = { workspace = true }
+ravel-segment = { workspace = true }
+ravel-query = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+tokio = { workspace = true }
+bytes = { workspace = true }
+prost = { workspace = true }
+snap = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tempfile = { workspace = true }
+# New dev-only external dependency (not previously in the workspace), added
+# here per the plan's section 5.1/5.5 HTTP-client requirement for talking to
+# the pinned Prometheus binary's remote-write and query APIs. Flagged in the
+# phase report per CLAUDE.md's dependency rule.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[build-dependencies]
+prost-build = { workspace = true }
+protox = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,2236 @@
+//! The tiered read-through handle of ADR-0046's read cache
+//! (docs/adrs/0046-read-cache-tier.md, decision 3's two-tier composition,
+//! decision 4's acceptance gate, and decision 5's single-flight). It holds a
+//! RAM [`Cache`] over a local-disk [`DiskCache`] and presents one interface
+//! the three ADR-0046 read funnels can hold, so no funnel has to know there
+//! are two tiers or in what order they are consulted.
+//!
+//! **Read-through, and admission populates both tiers.** A lookup checks RAM
+//! first. On a RAM miss it consults the disk tier before signalling an
+//! upstream miss to the caller, and a disk hit repopulates RAM so the next
+//! read of that key is a RAM hit rather than a second disk consult. The
+//! caller still owns the upstream fetch -- it is passed in as a closure, the
+//! same division of responsibility [`Cache::get_or_fetch`] already uses,
+//! because only the funnel holds the `SegmentRef` a range came from and must
+//! be the one that never admits a payload under a key that does not describe
+//! it (decision 4's amendment). A successful upstream fetch populates *both*
+//! tiers (decision 3), not RAM alone, so a later RAM eviction is served from
+//! disk instead of re-paying the S3 round trip the disk tier exists to remove.
+//!
+//! **Single-flight spans both tiers** (decision 5). A RAM hit is the fast
+//! path and needs no coordination. Every RAM miss for one key collapses onto
+//! a single leader that consults disk once and, only on a disk miss, runs the
+//! caller's upstream fetch once; concurrent callers for that key are followers
+//! that neither consult disk nor fetch. Two callers therefore never both read
+//! disk, and never both fall through to a separate upstream fetch.
+//!
+//! **The corruption gate reaches the disk tier.** When the RAM tier is built
+//! with [`Cache::with_corruption`] (ADR-0046 decision 4's acceptance-gate
+//! mode), a disk-served hit is corrupted by the identical byte transform a
+//! RAM hit uses (see [`crate::cache::corrupt_bytes`]), applied at serve time
+//! only -- the bytes admitted to either tier stay clean, so corruption is a
+//! read-time view, never stored. Without this, ADR-0046's "correctness never
+//! depends on cached state" gate would silently stop covering the disk tier
+//! the moment the funnels started serving hits from it. Clean bytes freshly
+//! returned by an upstream fetch are never corrupted: they did not come from a
+//! cache tier, exactly as a store read is never corrupted.
+//!
+//! **A second, fetch-free access path exists for a caller that cannot
+//! express its miss handling as one upstream-fetch closure.**
+//! [`TieredCache::get`] and [`TieredCache::insert`] give the same RAM-then-
+//! disk read-through and dual-tier admission as `get_or_fetch`, but neither
+//! runs a fetch or joins single-flight -- `get` returns `None` on a genuine
+//! both-tier miss rather than fetching, and `insert` admits bytes the caller
+//! already holds. A caller mixing this path with `get_or_fetch` on the same
+//! key must still account for exactly one miss per logical request; see
+//! [`TieredCache::get`]'s own docstring for the double-counting pitfall this
+//! crate has already shipped and fixed once on the closure-based path.
+//!
+//! **No disk operation runs on a runtime worker thread** (issue #1891). Every
+//! `std::fs` call this handle makes -- `get_or_fetch`'s and
+//! `resolve_peeked_miss`'s disk consult and admission, and the fetch-free path's
+//! [`TieredCache::get_off_worker`] / [`TieredCache::insert_off_worker`] -- runs
+//! under `spawn_blocking`. `get` and `insert` remain synchronous for a caller
+//! that is not on a runtime worker; an async caller uses the `_off_worker`
+//! pair, which is the same read-through and the same dual-tier admission with
+//! only the file operation dispatched. The RAM tier is always consulted inline:
+//! it is not I/O, and a RAM hit is the fast path.
+//!
+//! **A third path resolves a peek-then-defer miss under single-flight.**
+//! [`TieredCache::resolve_peeked_miss`] is for a caller that already peeked
+//! both tiers with `get`, saw a confirmed miss, and now wants to resolve it --
+//! but coalesced, so concurrent callers for one key collapse onto a single
+//! upstream fetch. Unlike `get`/`insert` it joins the single-flight (the same
+//! field `get_or_fetch` uses), and unlike `get_or_fetch` it consults neither
+//! tier before fetching and records no miss of its own, because the caller's
+//! `get` already accounted the one miss. `BlockRangeFetcher`'s per-extent
+//! peek-then-defer uses it so N cross-partition callers striping one segment
+//! issue one GET, not N.
+
+use std::sync::Arc;
+
+use bytes::Bytes;
+
+use crate::cache::Cache;
+use crate::disk::DiskCache;
+use crate::key::CacheKey;
+use crate::metrics::CacheMetrics;
+use crate::single_flight::{Role, SingleFlight, SingleFlightError};
+
+/// Whether a [`TieredCache::get_or_fetch`] call counts as a cache hit
+/// ([`Source::Cache`]) or not ([`Source::Upstream`]). It does not say whether
+/// THIS call issued an upstream fetch; a caller that charges store requests per
+/// call uses [`ReadOutcome`] instead, which does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// A cache tier served the bytes and no upstream fetch ran for them: the
+    /// RAM tier (the fast path), or the disk tier the single-flight leader
+    /// consulted on a RAM miss, whether this call led that consult or followed
+    /// it. In corruption mode these bytes are corrupted.
+    Cache,
+    /// Not a cache hit, for one of two reasons. This call led the single
+    /// flight and ran the caller's `fetch`, or followed a leader that did; the
+    /// bytes are that fetch's and are never corrupted. Or it followed a
+    /// [`TieredCache::resolve_peeked_miss`] leader whose RAM recheck found
+    /// bytes another flight admitted after this call's own lookup missed; those
+    /// bytes came from the RAM tier and are corrupted in corruption mode.
+    Upstream,
+}
+
+/// What one read-through call did, for a caller that counts cache hits and
+/// charges store requests from it (ADR-0044). Unlike [`Source`], it says
+/// whether THIS call issued the upstream fetch, so a call that issued none and
+/// was not a cache hit either is told apart from both. Returned by
+/// [`TieredCache::get_or_fetch_outcome`] and [`Cache::get_or_fetch_outcome`],
+/// which label a leader and a follower of an upstream fetch the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadOutcome {
+    /// A cache hit: a tier served the bytes and no upstream fetch ran for them.
+    /// The RAM tier on this call's own lookup, or, on the tiered cache, the
+    /// disk tier the single-flight leader consulted, whether this call led
+    /// that consult or followed it. In corruption mode these bytes are
+    /// corrupted.
+    Hit,
+    /// This call led the single flight and ran the caller's `fetch`: one
+    /// upstream request by this call, and a cache miss. Never corrupted.
+    Fetched,
+    /// A late serve: this call ran no `fetch` and is not a cache hit. It
+    /// followed another caller's flight whose leader fetched upstream (either
+    /// cache kind), or it led (RAM-only cache) or followed (either kind) a
+    /// flight whose leader's uncounted RAM recheck found bytes another flight
+    /// admitted after this call's own lookup missed. The caller charges it no
+    /// upstream request and counts it the cache miss its lookup already
+    /// recorded. In corruption mode the bytes are corrupted when the RAM
+    /// recheck served them and clean when they are another caller's fetch.
+    LateServe,
+}
+
+/// What produced the bytes a [`TieredCache`] single-flight leader shared, so
+/// each caller, leader or follower, labels its own [`ReadOutcome`] from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Served {
+    /// The `get_or_fetch` leader's disk consult hit. Corruptible.
+    Disk,
+    /// The `resolve_peeked_miss` leader's uncounted RAM recheck found bytes
+    /// another flight admitted. Corruptible.
+    RamRecheck,
+    /// The leader ran the caller's `fetch`. Never corrupted.
+    Upstream,
+}
+
+impl Served {
+    fn is_cache_served(self) -> bool {
+        matches!(self, Served::Disk | Served::RamRecheck)
+    }
+
+    fn outcome(self, role: Role) -> ReadOutcome {
+        match (self, role) {
+            (Served::Disk, _) => ReadOutcome::Hit,
+            (Served::Upstream, Role::Leader) => ReadOutcome::Fetched,
+            (Served::RamRecheck, _) | (Served::Upstream, Role::Follower) => ReadOutcome::LateServe,
+        }
+    }
+}
+
+/// A RAM [`Cache`] over a local-disk [`DiskCache`], composed as one
+/// read-through handle (ADR-0046 decision 3). `E` is the caller's upstream
+/// fetch error type, threaded through the single-flight exactly as
+/// [`Cache`] threads it, so this crate still defines no error type of its own
+/// and has no opinion on what a miss's upstream call looks like.
+///
+/// See the [module docs](self) for the read-through, dual-tier admission,
+/// cross-tier single-flight, and corruption-gate behavior.
+pub struct TieredCache<E> {
+    ram: Cache<E>,
+    disk: Arc<DiskCache>,
+    /// Coalesces concurrent RAM misses on one key across *both* tiers. Its
+    /// value is `(clean_bytes, served)`: [`Served`] records whether the leader
+    /// satisfied the miss from the disk tier, from its RAM recheck, or from the
+    /// upstream fetch. Bytes on the wire are always clean; corruption is
+    /// applied per-caller at serve time.
+    single_flight: SingleFlight<CacheKey, (Bytes, Served), E>,
+    /// Parks the next `resolve_peeked_miss` leader just before its RAM
+    /// recheck, with its flight registered, until the sender fires or drops.
+    #[cfg(test)]
+    recheck_hold: parking_lot::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+impl<E> TieredCache<E>
+where
+    E: Clone + Send + Sync + 'static,
+{
+    /// Composes an existing RAM `ram` tier over a disk `disk` tier. The
+    /// corruption mode is inherited from `ram`: build `ram` with
+    /// [`Cache::with_corruption`] to put the whole handle -- disk-served hits
+    /// included -- into ADR-0046 decision 4's acceptance-gate mode.
+    pub fn new(ram: Cache<E>, disk: DiskCache) -> Self {
+        TieredCache {
+            ram,
+            disk: Arc::new(disk),
+            single_flight: SingleFlight::new(),
+            #[cfg(test)]
+            recheck_hold: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// A cloneable handle to the RAM tier's counters, independent of this
+    /// handle's lifetime. Single-flight collapses (across both tiers) are
+    /// recorded here.
+    pub fn ram_metrics(&self) -> Arc<CacheMetrics> {
+        self.ram.metrics()
+    }
+
+    /// A cloneable handle to the disk tier's counters, independent of this
+    /// handle's lifetime.
+    pub fn disk_metrics(&self) -> Arc<CacheMetrics> {
+        self.disk.metrics()
+    }
+
+    /// The disk tier itself, for a cross-crate test that needs to corrupt an
+    /// admitted entry's real on-disk bytes via
+    /// [`DiskCache::corrupt_entry_for_test`] rather than only read its
+    /// counters through [`disk_metrics`](Self::disk_metrics). `TieredCache`
+    /// keeps its disk tier behind an internal `Arc` (so the async
+    /// single-flight closures below can hand a cheap clone to
+    /// `spawn_blocking`), but exposes no public way to clone it out, so a
+    /// caller holding only an `Arc<TieredCache<_>>` (as `ravel-query`'s
+    /// `ReadCache` does) has no other way to reach it.
+    #[doc(hidden)]
+    pub fn disk_for_test(&self) -> &DiskCache {
+        self.disk.as_ref()
+    }
+
+    /// How many callers are parked as followers on the in-flight fetch for
+    /// `key`; 0 when none is in flight.
+    pub fn in_flight_waiters(&self, key: &CacheKey) -> usize {
+        self.single_flight.waiters(key)
+    }
+
+    /// Whether a fetch for `key` is in flight, with or without followers.
+    pub fn is_in_flight(&self, key: &CacheKey) -> bool {
+        self.single_flight.is_in_flight(key)
+    }
+
+    /// Read `key` through both tiers, fetching upstream only if both miss.
+    ///
+    /// Returns the served bytes and the [`Source`] they came from. Order:
+    ///
+    /// 1. **RAM hit** -- returned immediately, [`Source::Cache`], without
+    ///    touching disk or the single-flight. [`Cache::get`] applies
+    ///    corruption and records the hit, so a RAM hit here is byte-for-byte
+    ///    what the RAM tier alone would return.
+    /// 2. **RAM miss** -- the call joins the single-flight for `key`. The
+    ///    leader consults the disk tier; a disk hit repopulates RAM
+    ///    (read-through) and yields [`Source::Cache`]. On a disk miss the
+    ///    leader runs `fetch`, admits the result to *both* tiers, and yields
+    ///    [`Source::Upstream`]. Followers ride the leader's single disk
+    ///    consult / upstream fetch and get the same `Source` as that leader,
+    ///    so a follower of an upstream fetch is [`Source::Upstream`] although
+    ///    it issued no request; [`get_or_fetch_outcome`](Self::get_or_fetch_outcome)
+    ///    tells it apart from the leader. A follower of a
+    ///    [`resolve_peeked_miss`](Self::resolve_peeked_miss) leader whose RAM
+    ///    recheck served the bytes is also [`Source::Upstream`].
+    ///
+    /// In corruption mode a [`Source::Cache`] result (RAM or disk) is
+    /// corrupted, and so is a recheck-served [`Source::Upstream`] follower's;
+    /// a fetched [`Source::Upstream`] result is the clean fetched bytes.
+    ///
+    /// **Error-path accounting (issue #656).** When `fetch` fails this method
+    /// records neither a hit nor a miss: it threads the error straight out,
+    /// before the follower's single-flight collapse is recorded, so a follower
+    /// of a failed fetch counts no collapse either. Hit/miss
+    /// accounting is the caller's, keyed off the returned [`Source`] on the
+    /// success path -- this handle has no `QueryAccounting` and takes no
+    /// opinion on whether a faulted upstream GET should count as a miss. A
+    /// caller that records a miss on the success `Source::Upstream` branch must
+    /// therefore decide explicitly whether the *error* branch records one too;
+    /// a caller whose success and error paths disagree (one counts the miss,
+    /// the other returns before any accounting) makes a faulted GET count
+    /// differently than a served miss, the exact divergence #656 tracks.
+    ///
+    /// The tier metrics are a separate question from that query-level choice.
+    /// A RAM miss and a disk miss are recorded BEFORE the upstream fetch is
+    /// attempted, so on a faulted fetch both are already counted and
+    /// `ram_metrics`/`disk_metrics` include them. A consumer reading those
+    /// counters is seeing tier lookups, not served requests, and must not read
+    /// a faulted GET as a zero-miss cache operation.
+    pub async fn get_or_fetch<F, Fut>(
+        &self,
+        key: CacheKey,
+        fetch: F,
+    ) -> Result<(Bytes, Source), SingleFlightError<E>>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: std::future::Future<Output = Result<Bytes, E>> + Send,
+    {
+        let (bytes, outcome) = self.get_or_fetch_outcome(key, fetch).await?;
+        let source = match outcome {
+            ReadOutcome::Hit => Source::Cache,
+            ReadOutcome::Fetched | ReadOutcome::LateServe => Source::Upstream,
+        };
+        Ok((bytes, source))
+    }
+
+    /// [`get_or_fetch`](Self::get_or_fetch), reporting a [`ReadOutcome`]
+    /// instead of a [`Source`]: [`ReadOutcome::Fetched`] only to the leader that
+    /// ran `fetch`, and [`ReadOutcome::LateServe`] to a follower of that fetch,
+    /// which issued no request of its own. A RAM hit, and the leader's disk hit
+    /// together with every follower of it, is [`ReadOutcome::Hit`]. A follower
+    /// of a [`resolve_peeked_miss`](Self::resolve_peeked_miss) leader whose RAM
+    /// recheck served the bytes is a [`ReadOutcome::LateServe`]. The tier
+    /// lookups, collapses, admissions and corruption are `get_or_fetch`'s.
+    pub async fn get_or_fetch_outcome<F, Fut>(
+        &self,
+        key: CacheKey,
+        fetch: F,
+    ) -> Result<(Bytes, ReadOutcome), SingleFlightError<E>>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: std::future::Future<Output = Result<Bytes, E>> + Send,
+    {
+        // Fast path: a RAM hit needs no cross-tier coordination and never
+        // touches disk. `Cache::get` records the hit and, in corruption mode,
+        // corrupts the served bytes.
+        if let Some(bytes) = self.ram.get(&key) {
+            return Ok((bytes, ReadOutcome::Hit));
+        }
+
+        // RAM miss: collapse concurrent callers for this key onto one leader
+        // that consults disk and, only on a disk miss, runs the upstream
+        // fetch. Followers neither consult disk nor fetch (decision 5,
+        // extended across both tiers).
+        let (outcome, role) = self
+            .single_flight
+            .run(key, move || async move {
+                // `DiskCache::get` is std::fs I/O; run it on the blocking
+                // pool rather than the async worker thread (issue #1702). A
+                // `JoinError` (the blocking task panicked or was cancelled)
+                // is treated as a plain disk miss: `disk.get` never returns
+                // an error to begin with, so this preserves its existing
+                // total-miss-tolerance contract instead of adding a new
+                // failure mode.
+                let disk = self.disk.clone();
+                let disk_get = tokio::task::spawn_blocking(move || disk.get(&key))
+                    .await
+                    .unwrap_or(None);
+                if let Some(bytes) = disk_get {
+                    // Read-through: repopulate RAM so the next read is a RAM
+                    // hit, not another disk consult. Clean bytes are admitted;
+                    // corruption, if on, is a serve-time transform below.
+                    self.ram.insert(key, bytes.clone());
+                    return Ok((bytes, Served::Disk));
+                }
+                // Both tiers missed: the caller owns the upstream fetch. On
+                // success admit to BOTH tiers (decision 3), not RAM alone, so
+                // a later RAM eviction is served from disk. `DiskCache::insert`
+                // silently declines bytes whose length disagrees with
+                // `key.len`, so a well-formed funnel key admits cleanly.
+                let bytes = fetch().await?;
+                self.ram.insert(key, bytes.clone());
+                // Same spawn_blocking treatment for the disk write. A
+                // `JoinError` here drops the disk admission silently: the RAM
+                // tier is already populated, so a lost disk write only costs
+                // a future disk miss, never a wrong result.
+                let disk = self.disk.clone();
+                let insert_bytes = bytes.clone();
+                let _ = tokio::task::spawn_blocking(move || disk.insert(key, &insert_bytes)).await;
+                Ok((bytes, Served::Upstream))
+            })
+            .await;
+
+        let (bytes, served) = match outcome {
+            Ok(value) => value,
+            Err(err) => return Err(err),
+        };
+        if role == Role::Follower {
+            // A follower rode the leader's single disk consult / upstream
+            // fetch: count the collapse on the same counter the RAM tier uses,
+            // feeding ADR-0046's single-flight-collapse SLI.
+            self.ram.metrics().record_collapse();
+        }
+        Ok((
+            self.maybe_corrupt(bytes, served.is_cache_served()),
+            served.outcome(role),
+        ))
+    }
+
+    /// Resolve a miss the caller ALREADY confirmed with [`get`](Self::get):
+    /// run `fetch` once behind single-flight and admit its result to **both**
+    /// tiers, **without** re-consulting the disk tier and **without** recording
+    /// a miss of this method's own.
+    ///
+    /// A caller can peek while another flight for `key` is running and arrive
+    /// here after that flight has finished and left the single-flight map. Its
+    /// leader therefore checks the RAM tier once, uncounted, before fetching:
+    /// on success, when the RAM tier admits the bytes, a leader admits them
+    /// before it leaves the map, so such a caller is served the finished
+    /// flight's bytes rather than issuing a second fetch. After an upstream
+    /// error or a lost leader, an entry over the RAM tier's size limit, or an
+    /// eviction in the meantime, the RAM check misses and the caller fetches
+    /// again.
+    ///
+    /// This is the coalesced companion to [`get`](Self::get)'s peek-then-defer
+    /// discipline (ADR-0046 decision 5), and it exists apart from
+    /// [`get_or_fetch`](Self::get_or_fetch) for one reason: the caller has
+    /// already peeked both tiers with `get` and seen a confirmed both-tier miss,
+    /// so `get_or_fetch`'s internal tier consultation would be redundant work
+    /// here and, worse, would count a SECOND miss on a key `get` already
+    /// accounted for -- exactly the double-count [`get`](Self::get)'s docstring
+    /// warns a peek-then-defer caller against. `BlockRangeFetcher` is that
+    /// caller: it peeks each candidate block with `get`, defers the miss, and
+    /// then resolves the deferred run through this method so N concurrent
+    /// cross-partition callers striping one RSEG/RLOG extent collapse onto one
+    /// upstream fetch instead of each issuing its own.
+    ///
+    /// It joins the **same** [`single_flight`](Self::single_flight) field
+    /// `get_or_fetch` uses, not a second coordinator, so a concurrent
+    /// `get_or_fetch` and a `resolve_peeked_miss` on the same key still coalesce
+    /// onto each other correctly. The stored single-flight value is
+    /// `(clean_bytes, Served::Upstream)` for a fetch (never corrupted), and
+    /// `(clean_bytes, Served::RamRecheck)` when the leader's RAM check above
+    /// served them. A follower may instead ride a concurrent `get_or_fetch`
+    /// leader that served from disk (`Served::Disk`); a cache-served result is
+    /// corruption-gated on the way out identically to `get_or_fetch`. A
+    /// `get_or_fetch_outcome` follower of this method's RAM-check leader is a
+    /// [`ReadOutcome::LateServe`], as it is on the RAM-only cache.
+    ///
+    /// Accounting discipline (the invariant this method depends on): it records
+    /// **no miss** on either tier -- the caller's earlier `get` already recorded
+    /// the one accounted miss for this logical request, and layering a second
+    /// here would corrupt the request-hit-rate SLI, the bug this crate shipped
+    /// and fixed once already (see [`get`](Self::get)'s docstring). It **does**
+    /// record a single-flight collapse when a caller rides another caller's
+    /// leader (`self.ram.metrics().record_collapse()`, the same counter
+    /// `get_or_fetch`'s follower branch feeds), since that is real coalescing
+    /// worth surfacing on the SLI. On a `fetch` error it records neither a hit
+    /// nor a miss and threads the error out unchanged, exactly as
+    /// [`get_or_fetch`](Self::get_or_fetch) does: the caller's earlier `get`
+    /// already accounted the one miss for this logical request, so the error
+    /// path adds nothing here regardless (issue #656).
+    ///
+    /// On a fetch success the leader admits to **both** tiers (decision 3) via
+    /// the same dual-tier admission [`insert`](Self::insert) uses, so a later RAM
+    /// eviction is served from disk rather than re-paying the S3 round trip.
+    pub async fn resolve_peeked_miss<F, Fut>(
+        &self,
+        key: CacheKey,
+        fetch: F,
+    ) -> Result<Bytes, SingleFlightError<E>>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: std::future::Future<Output = Result<Bytes, E>> + Send,
+    {
+        // No counted tier consultation: the caller peeked both tiers with `get`
+        // and got a confirmed miss, so a counted re-read here would record a
+        // second miss. The leader runs the upstream fetch once and, on success,
+        // admits to BOTH tiers (decision 3). `Served::Upstream` records that
+        // these bytes are the fresh upstream fetch, never a cache serve, so
+        // they are never corrupted.
+        let (outcome, role) = self
+            .single_flight
+            .run(key, move || async move {
+                // The caller's peek may have missed while an earlier flight
+                // for `key` was running and reached here after that flight
+                // left the map. On success, when the RAM tier admits the
+                // bytes, a leader admits them before it leaves, so those bytes
+                // are served instead of a second fetch; otherwise this misses
+                // and the fetch below runs. Uncounted: the peek already
+                // recorded this request's miss.
+                #[cfg(test)]
+                {
+                    let hold = self.recheck_hold.lock().take();
+                    if let Some(hold) = hold {
+                        let _ = hold.await;
+                    }
+                }
+                if let Some(bytes) = self.ram.get_uncounted(&key) {
+                    return Ok((bytes, Served::RamRecheck));
+                }
+                let bytes = fetch().await?;
+                self.ram.insert(key, bytes.clone());
+                // `DiskCache::insert` is std::fs I/O; run it on the blocking
+                // pool rather than the async worker thread (issue #1702). A
+                // `JoinError` drops the disk admission silently: the RAM
+                // tier is already populated, so a lost disk write only costs
+                // a future disk miss, never a wrong result.
+                let disk = self.disk.clone();
+                let insert_bytes = bytes.clone();
+                let _ = tokio::task::spawn_blocking(move || disk.insert(key, &insert_bytes)).await;
+                Ok((bytes, Served::Upstream))
+            })
+            .await;
+
+        let (bytes, served) = match outcome {
+            Ok(value) => value,
+            Err(err) => return Err(err),
+        };
+        if role == Role::Follower {
+            // A follower rode another caller's leader (this method's or a
+            // concurrent `get_or_fetch`'s -- both share `single_flight`): count
+            // the collapse on the same SLI `get_or_fetch` feeds. This is the
+            // ONLY `metrics()` call this method makes; it records no miss of its
+            // own, because the caller's earlier `get` already recorded the one
+            // accounted miss for this logical request.
+            self.ram.metrics().record_collapse();
+        }
+        // A result served by the RAM check, or by a concurrent `get_or_fetch`
+        // leader's disk hit, is corruption-gated exactly as `get_or_fetch`'s
+        // is; this method's own fetch is not.
+        Ok(self.maybe_corrupt(bytes, served.is_cache_served()))
+    }
+
+    /// Read `key` through both tiers with **no** upstream fetch and **no**
+    /// single-flight: a plain hit-or-miss peek the caller owns entirely.
+    ///
+    /// RAM-first, falling through to disk on a RAM miss, in the exact
+    /// tier-consulting order [`TieredCache::get_or_fetch`] uses: the RAM tier's
+    /// [`Cache::get`] first and, only on its `None`, the disk tier's
+    /// [`DiskCache::get`]. A disk hit repopulates RAM read-through, identical to
+    /// `get_or_fetch`'s disk-hit branch, so the next read of `key` is a RAM hit
+    /// and this method leaves both tiers in the same state that path would.
+    ///
+    /// This is the behavioral difference from [`TieredCache::get_or_fetch`] a
+    /// future reader must not miss: `get_or_fetch` collapses a both-tier miss
+    /// onto a single-flight leader that runs the caller's upstream fetch, while
+    /// `get` runs no fetch and joins no single-flight. A `None` return is a
+    /// genuine miss in both tiers, and the caller owns all of its miss handling
+    /// (`BlockRangeFetcher` admits already-verified bytes via
+    /// [`TieredCache::insert`] with no fetch at all, and peeks a key with this
+    /// method to defer a miss to a later coalesced GET rather than fetch here).
+    /// Concurrent `get` calls for one key each consult disk independently
+    /// rather than riding one leader: single-flight exists only to protect the
+    /// upstream fetch this method never performs.
+    ///
+    /// **A `None` from this method still records a real miss on both tiers'
+    /// [`CacheMetrics`]** ([`Cache::get`] and [`DiskCache::get`] each count
+    /// their own call). A caller using the peek-then-defer pattern above must
+    /// not also call `get_or_fetch` (or `get` again) for the same logical
+    /// miss expecting only one miss to be counted: that double-counts one
+    /// request as two misses, corrupting the request-hit-rate SLI ADR-0046
+    /// depends on -- this crate has shipped and fixed exactly this bug once
+    /// already (see [`TieredCache::get_or_fetch`]'s own docstring). A caller
+    /// that peeks with `get` and, on a miss, later resolves the value some
+    /// other way (a coalesced fetch elsewhere, as `BlockRangeFetcher` does)
+    /// should treat this method's miss as the query's ONLY accounted miss for
+    /// that key, not layer a second accounted miss on top when the deferred
+    /// fetch later runs.
+    ///
+    /// In corruption mode (`ram` built with [`Cache::with_corruption`]) a hit
+    /// from either tier is corrupted at serve time exactly as a
+    /// [`Source::Cache`] `get_or_fetch` result is: a RAM hit through
+    /// [`Cache::get`]'s own transform, and a disk hit through the identical
+    /// [`maybe_corrupt`](Self::maybe_corrupt) call `get_or_fetch` applies. The
+    /// bytes admitted to either tier stay clean; corruption is a read-time
+    /// view. Without this, ADR-0046 decision 4's "correctness never depends on
+    /// cached state" gate would stop covering a disk-served hit read through
+    /// this new access path.
+    /// # Blocking
+    ///
+    /// This is synchronous: a RAM miss reads the disk tier on the calling
+    /// thread, so an async caller would park a runtime worker for the length of
+    /// a file read. It stays synchronous for a caller that is already on a
+    /// blocking thread or has no runtime at all; an async caller uses
+    /// [`get_off_worker`](Self::get_off_worker), which is this same read-through
+    /// with the disk consult dispatched to the blocking pool (issue #1891).
+    pub fn get(&self, key: &CacheKey) -> Option<Bytes> {
+        // Fast path: a RAM hit is served verbatim (already corrupted, in
+        // corruption mode, by `Cache::get`) and never consults disk, exactly
+        // like `get_or_fetch`'s RAM fast path.
+        if let Some(bytes) = self.ram.get(key) {
+            return Some(bytes);
+        }
+        // RAM miss: consult disk. A disk hit repopulates RAM read-through with
+        // the clean bytes, then is corrupted per-caller at serve time -- the
+        // same order `get_or_fetch`'s disk-hit branch uses, so the gate reaches
+        // a disk-served hit here identically.
+        let bytes = self.disk.get(key)?;
+        Some(self.admit_disk_hit(*key, bytes))
+    }
+
+    /// [`get`](Self::get) for an async caller: the identical RAM-then-disk
+    /// read-through, with the disk consult run under `spawn_blocking` instead of
+    /// on the calling runtime worker (issue #1891, the pattern
+    /// [`get_or_fetch`](Self::get_or_fetch) already uses for its own disk
+    /// calls).
+    ///
+    /// The RAM tier is still consulted inline: it is a lock and a refcount bump,
+    /// not I/O, and a RAM hit is the fast path this handle exists to keep fast.
+    /// Only a RAM miss -- the case that actually opens a file -- pays a
+    /// blocking-pool dispatch. Hit/miss accounting is therefore identical to
+    /// `get`'s: exactly one RAM lookup, and at most one disk lookup, each
+    /// recorded once on its own tier's [`CacheMetrics`]. Every caveat in
+    /// [`get`](Self::get)'s docstring -- the peek-then-defer double-count
+    /// pitfall above all -- applies here unchanged.
+    ///
+    /// A `JoinError` (the blocking task panicked or was cancelled) is reported
+    /// as a plain disk miss, the same total-miss tolerance
+    /// [`get_or_fetch`](Self::get_or_fetch) gives its own `spawn_blocking` disk
+    /// read: `DiskCache::get` has no error variant to begin with, so this adds
+    /// no new failure mode the caller must handle.
+    pub async fn get_off_worker(&self, key: CacheKey) -> Option<Bytes> {
+        if let Some(bytes) = self.ram.get(&key) {
+            return Some(bytes);
+        }
+        let disk = self.disk.clone();
+        let bytes = tokio::task::spawn_blocking(move || disk.get(&key))
+            .await
+            .unwrap_or(None)?;
+        Some(self.admit_disk_hit(key, bytes))
+    }
+
+    /// [`get_off_worker`](Self::get_off_worker) recording neither a hit nor a
+    /// miss on either tier, for a caller whose earlier `get` already accounted
+    /// this request and that looks again because the entry may have been
+    /// admitted since (`BlockRangeFetcher`'s re-peek of a coalesced run's
+    /// non-lead blocks). The same RAM-then-disk order, the same read-through
+    /// RAM admission on a disk hit, and the same serve-time corruption.
+    pub async fn peek_uncounted_off_worker(&self, key: CacheKey) -> Option<Bytes> {
+        if let Some(bytes) = self.ram.peek_uncounted(&key) {
+            return Some(bytes);
+        }
+        let disk = self.disk.clone();
+        let bytes = tokio::task::spawn_blocking(move || disk.get_uncounted(&key))
+            .await
+            .unwrap_or(None)?;
+        Some(self.admit_disk_hit(key, bytes))
+    }
+
+    /// Admit `value` under `key` into **both** tiers with no upstream fetch,
+    /// matching `get_or_fetch`'s dual-tier admission policy on a fetch success
+    /// (ADR-0046 decision 3): the RAM tier via [`Cache::insert`] (which takes
+    /// [`Bytes`]) and the disk tier via [`DiskCache::insert`] (which takes a
+    /// borrowed slice). This is the plain-admission half a caller uses to cache
+    /// bytes it already fetched and verified elsewhere (`BlockRangeFetcher`),
+    /// so a later RAM eviction is served from disk rather than re-paying the S3
+    /// round trip the disk tier exists to remove. Like [`TieredCache::get`], it
+    /// touches no single-flight. `DiskCache::insert` silently declines bytes
+    /// whose length disagrees with `key.len`, so a well-formed funnel key
+    /// admits to both tiers cleanly.
+    /// # Blocking
+    ///
+    /// Synchronous, like [`TieredCache::get`]: the disk admission runs on the
+    /// calling thread rather than under `spawn_blocking`, so an async caller
+    /// would park a runtime worker for the length of a file write. An async
+    /// caller uses [`insert_off_worker`](Self::insert_off_worker) instead
+    /// (issue #1891).
+    pub fn insert(&self, key: CacheKey, value: Bytes) {
+        self.ram.insert(key, value.clone());
+        self.disk.insert(key, &value);
+    }
+
+    /// [`insert`](Self::insert) for an async caller: the identical dual-tier
+    /// admission, with the disk write run under `spawn_blocking` instead of on
+    /// the calling runtime worker (issue #1891).
+    ///
+    /// The RAM admission stays inline, for the reason
+    /// [`get_off_worker`](Self::get_off_worker) keeps the RAM lookup inline: it
+    /// is not I/O. It also keeps the RAM tier populated the moment this call is
+    /// made rather than one blocking-pool round trip later, so a concurrent
+    /// reader sees the entry exactly as early as it did before.
+    ///
+    /// A `JoinError` drops the disk admission silently, the same tolerance
+    /// [`get_or_fetch`](Self::get_or_fetch) gives its own disk write: the RAM
+    /// tier is already populated, so a lost disk write costs a future disk miss,
+    /// never a wrong result.
+    pub async fn insert_off_worker(&self, key: CacheKey, value: Bytes) {
+        self.ram.insert(key, value.clone());
+        // The blocking closure must own its bytes: `DiskCache::insert` borrows a
+        // slice, and a `spawn_blocking` closure has to be `'static`. `Bytes` is
+        // refcounted, so this clone copies no payload.
+        let disk = self.disk.clone();
+        let _ = tokio::task::spawn_blocking(move || disk.insert(key, &value)).await;
+    }
+
+    /// Current number of resident entries in the **RAM tier**.
+    ///
+    /// Live, not cumulative: this is [`Cache::len`], which tracks the S3-FIFO
+    /// queues' actual occupancy and falls when an entry is evicted. It answers
+    /// "how many entries does this tier hold right now," a question
+    /// [`ram_metrics`](Self::ram_metrics)'s counters cannot answer -- they only
+    /// ever grow, so nothing nets an eviction against an earlier admission.
+    pub fn ram_len(&self) -> usize {
+        self.ram.len()
+    }
+
+    /// Current total payload bytes resident in the **RAM tier**, by the same
+    /// live-vs-cumulative distinction [`ram_len`](Self::ram_len) documents.
+    pub fn ram_total_bytes(&self) -> u64 {
+        self.ram.total_bytes()
+    }
+
+    /// Current number of resident entries in the **disk tier**, live rather
+    /// than cumulative -- see [`ram_len`](Self::ram_len).
+    pub fn disk_len(&self) -> usize {
+        self.disk.len()
+    }
+
+    /// Current total payload bytes resident in the **disk tier**, live rather
+    /// than cumulative -- see [`ram_len`](Self::ram_len).
+    pub fn disk_total_bytes(&self) -> u64 {
+        self.disk.total_bytes()
+    }
+
+    /// Whether the **RAM tier** holds no resident entry.
+    ///
+    /// "Empty" is defined as the RAM tier alone, not both tiers, because every
+    /// pre-existing caller of an `is_empty` on this cache (`cache_warm.rs`)
+    /// asks one question: did cache warming populate the in-RAM working set?
+    /// A warm goes through [`TieredCache::get_or_fetch`], which admits to both
+    /// tiers, so before any warm both tiers are empty and after one both are
+    /// populated -- the RAM-tier answer and the both-tier answer agree in that
+    /// caller's case. They diverge only when RAM is empty over a non-empty disk
+    /// tier (a fresh process reopening a populated cache directory, or a RAM
+    /// eviction), and there the caller's actual concern -- whether *this
+    /// process's* RAM warming did anything -- is answered by the RAM tier, not
+    /// by disk residue a prior process left. See [`Cache::is_empty`] and
+    /// [`DiskCache::is_empty`] for a single-tier check when a caller needs one.
+    pub fn is_empty(&self) -> bool {
+        self.ram.is_empty()
+    }
+
+    /// Completes a disk-served hit: repopulate RAM read-through with the clean
+    /// bytes, then corrupt per-caller at serve time. Shared by [`get`](Self::get)
+    /// and [`get_off_worker`](Self::get_off_worker) so the two cannot drift in
+    /// admission order or corruption gating; the only difference between them is
+    /// which thread ran `DiskCache::get`.
+    fn admit_disk_hit(&self, key: CacheKey, bytes: Bytes) -> Bytes {
+        self.ram.insert(key, bytes.clone());
+        self.maybe_corrupt(bytes, true)
+    }
+
+    /// Corrupts `bytes` iff they came from a cache tier and the RAM tier is in
+    /// corruption mode, using the exact transform a RAM hit uses so the gate
+    /// covers disk-served hits identically. Upstream (`from_cache == false`)
+    /// bytes are the fresh fetch and are never corrupted.
+    fn maybe_corrupt(&self, bytes: Bytes, from_cache: bool) -> Bytes {
+        if from_cache && self.ram.corrupts_hits() {
+            crate::cache::corrupt_bytes(&bytes)
+        } else {
+            bytes
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod fixtures {
+    use super::*;
+
+    pub(super) fn test_key(n: u64, len: u64) -> CacheKey {
+        let mut content_hash = [0u8; 32];
+        content_hash[..8].copy_from_slice(&n.to_le_bytes());
+        CacheKey::new([7u8; 16], content_hash, 0, len)
+    }
+
+    pub(super) fn generous_limits() -> crate::CacheLimits {
+        crate::CacheLimits::new(64 * 1024 * 1024, 10_000, 16 * 1024 * 1024)
+    }
+}
+
+/// The named acceptance test, at the exact required path
+/// (`ravel_cache::tiered::corrupted_disk_hit_is_corrupted_through_ram_readthrough`):
+/// a key resident only on disk, RAM empty, corruption mode on. The bytes it
+/// serves must arrive corrupted -- not the clean disk bytes -- proving
+/// ADR-0046 decision 4's gate reaches a disk-served hit read through this
+/// handle and not just a RAM hit. Placed at module scope (not under a `tests`
+/// child) so its path is exactly the one the acceptance gate cites.
+#[cfg(test)]
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+async fn corrupted_disk_hit_is_corrupted_through_ram_readthrough() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tempfile::TempDir;
+
+    use fixtures::{generous_limits, test_key};
+
+    let tmp = TempDir::new().unwrap();
+    let clean = Bytes::from_static(b"disk-resident payload; trust no cached byte");
+    let key = test_key(1, clean.len() as u64);
+
+    // Disk tier populated, RAM tier empty: exactly the state a read-through
+    // must fall through RAM into disk to serve.
+    let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+    disk.insert(key, &clean);
+    assert!(
+        disk.get(&key).is_some(),
+        "precondition: entry lives on disk"
+    );
+
+    let ram: Cache<&'static str> = Cache::with_corruption(generous_limits());
+    let tiered = TieredCache::new(ram, disk);
+
+    // The upstream fetch must never run: the bytes are on disk already.
+    let upstream_calls = Arc::new(AtomicUsize::new(0));
+    let calls = upstream_calls.clone();
+    let (served, source) = tiered
+        .get_or_fetch(key, move || {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<Bytes, &'static str>(Bytes::from_static(b"UPSTREAM MUST NOT RUN"))
+            }
+        })
+        .await
+        .expect("a disk-resident key resolves without error");
+
+    assert_eq!(
+        source,
+        Source::Cache,
+        "a disk hit is a cache hit, not an upstream fetch"
+    );
+    assert_eq!(
+        upstream_calls.load(Ordering::SeqCst),
+        0,
+        "a disk hit must not trigger an upstream fetch"
+    );
+    assert_eq!(served.len(), clean.len(), "corruption preserves length");
+    assert_ne!(
+        served.as_ref(),
+        clean.as_ref(),
+        "a disk-served hit in corruption mode must arrive corrupted, proving \
+         ADR-0046 decision 4's gate reaches the disk tier"
+    );
+
+    // The corruption a RAM hit would apply to the same bytes, computed by an
+    // independent RAM tier in the same mode: proves the disk-served hit is
+    // corrupted by the identical transform, not merely "some" mutation.
+    let ram_probe: Cache<&'static str> = Cache::with_corruption(generous_limits());
+    ram_probe.insert(key, clean.clone());
+    let ram_corrupted = ram_probe.get(&key).expect("probe RAM hit");
+    assert_eq!(
+        served, ram_corrupted,
+        "a disk-served hit must be corrupted exactly like a RAM hit"
+    );
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Poll;
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use parking_lot::Mutex;
+    use ravel_test_support::{ParkOnFirstArmedCall, run_with_watchdog};
+    use tempfile::TempDir;
+    use tokio::sync::oneshot;
+
+    use super::fixtures::{generous_limits, test_key};
+    use super::*;
+    use crate::{CacheLimits, Clock};
+
+    /// A RAM hit is the fast path: it returns the RAM bytes and never consults
+    /// the disk tier at all. Proven via the disk tier's own counters -- a
+    /// consulted disk records a hit or a miss, and both must stay unchanged.
+    #[tokio::test]
+    async fn ram_hit_short_circuits_without_touching_disk() {
+        let tmp = TempDir::new().unwrap();
+        let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        let disk_metrics = disk.metrics();
+        let ram: Cache<&'static str> = Cache::new(generous_limits());
+        let tiered = TieredCache::new(ram, disk);
+
+        let clean = Bytes::from_static(b"resident in RAM");
+        let key = test_key(1, clean.len() as u64);
+        // Prime the RAM tier directly (a module-child test may reach the
+        // private field), leaving disk untouched.
+        tiered.ram.insert(key, clean.clone());
+
+        let before = disk_metrics.snapshot();
+        let upstream_calls = Arc::new(AtomicUsize::new(0));
+        let calls = upstream_calls.clone();
+        let (served, source) = tiered
+            .get_or_fetch(key, move || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok::<Bytes, &'static str>(Bytes::from_static(b"upstream"))
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(source, Source::Cache);
+        assert_eq!(served, clean, "the RAM bytes are served verbatim");
+        assert_eq!(
+            upstream_calls.load(Ordering::SeqCst),
+            0,
+            "no upstream on a RAM hit"
+        );
+        let after = disk_metrics.snapshot();
+        assert_eq!(after.hits, before.hits, "a RAM hit reads no disk hit");
+        assert_eq!(
+            after.misses, before.misses,
+            "a RAM hit does not consult the disk tier at all"
+        );
+    }
+
+    /// `get_or_fetch_outcome` labels a call by its single-flight role: the
+    /// leader that ran the upstream fetch is [`ReadOutcome::Fetched`] and a
+    /// follower of it is [`ReadOutcome::LateServe`], which `get_or_fetch`
+    /// still reports as [`Source::Upstream`].
+    ///
+    /// FLIP: labelling the result from the flight value alone, ignoring the
+    /// role (the `(Served::Upstream, Role::Follower)` arm made
+    /// `ReadOutcome::Fetched`), reports the follower as `ReadOutcome::Fetched`.
+    #[tokio::test]
+    async fn get_or_fetch_outcome_reports_a_follower_of_an_upstream_fetch_as_a_late_serve() {
+        let tmp = TempDir::new().unwrap();
+        let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        let ram: Cache<&'static str> = Cache::new(generous_limits());
+        let tiered = Arc::new(TieredCache::new(ram, disk));
+        let payload = Bytes::from_static(b"fetched once");
+        let key = test_key(1, payload.len() as u64);
+        let fetches = Arc::new(AtomicUsize::new(0));
+
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let leader = {
+            let tiered = tiered.clone();
+            let fetches = fetches.clone();
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                tiered
+                    .get_or_fetch_outcome(key, move || async move {
+                        fetches.fetch_add(1, Ordering::SeqCst);
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.await;
+                        Ok::<Bytes, &'static str>(payload)
+                    })
+                    .await
+            })
+        };
+        entered_rx.await.expect("the leader reaches its fetch");
+        let follower_fetches = fetches.clone();
+        let mut follower = Box::pin(tiered.get_or_fetch_outcome(key, move || async move {
+            follower_fetches.fetch_add(1, Ordering::SeqCst);
+            Ok::<Bytes, &'static str>(Bytes::from_static(b"never"))
+        }));
+        let sourced_fetches = fetches.clone();
+        let mut sourced = Box::pin(tiered.get_or_fetch(key, move || async move {
+            sourced_fetches.fetch_add(1, Ordering::SeqCst);
+            Ok::<Bytes, &'static str>(Bytes::from_static(b"never"))
+        }));
+        let first = std::future::poll_fn(|cx| Poll::Ready(follower.as_mut().poll(cx))).await;
+        assert!(first.is_pending(), "the follower parks on the held leader");
+        let first = std::future::poll_fn(|cx| Poll::Ready(sourced.as_mut().poll(cx))).await;
+        assert!(first.is_pending(), "the second follower parks too");
+        assert_eq!(tiered.in_flight_waiters(&key), 2);
+        release_tx.send(()).expect("the leader is still parked");
+
+        assert_eq!(
+            leader.await.unwrap().unwrap(),
+            (payload.clone(), ReadOutcome::Fetched)
+        );
+        assert_eq!(
+            follower.await.unwrap(),
+            (payload.clone(), ReadOutcome::LateServe)
+        );
+        assert_eq!(sourced.await.unwrap(), (payload, Source::Upstream));
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(tiered.ram_metrics().snapshot().single_flight_collapses, 2);
+    }
+
+    /// A follower of a leader whose disk consult hit is a [`ReadOutcome::Hit`]
+    /// like that leader: a cache tier served both and no upstream fetch ran.
+    /// The runtime's one blocking thread is held so the leader parks in its
+    /// disk consult until the follower has joined.
+    ///
+    /// FLIP: labelling every follower `ReadOutcome::LateServe` makes the
+    /// follower here a late serve.
+    #[test]
+    fn get_or_fetch_outcome_reports_a_follower_of_a_disk_hit_as_a_hit() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let tmp = TempDir::new().unwrap();
+                let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+                let ram: Cache<&'static str> = Cache::new(generous_limits());
+                let tiered = TieredCache::new(ram, disk);
+                let payload = Bytes::from_static(b"resident on disk");
+                let key = test_key(1, payload.len() as u64);
+                tiered.disk.insert(key, &payload);
+
+                let (release_pool, held) = std::sync::mpsc::channel::<()>();
+                drop(tokio::task::spawn_blocking(move || {
+                    let _ = held.recv();
+                }));
+                let never = || async { Err::<Bytes, &'static str>("no upstream fetch runs") };
+                let mut leader = Box::pin(tiered.get_or_fetch_outcome(key, never));
+                let mut follower = Box::pin(tiered.get_or_fetch_outcome(key, never));
+                let first = std::future::poll_fn(|cx| Poll::Ready(leader.as_mut().poll(cx))).await;
+                assert!(first.is_pending(), "the leader parks in its disk consult");
+                let first =
+                    std::future::poll_fn(|cx| Poll::Ready(follower.as_mut().poll(cx))).await;
+                assert!(first.is_pending(), "the follower parks on the leader");
+                assert_eq!(tiered.in_flight_waiters(&key), 1);
+                drop(release_pool);
+
+                assert_eq!(leader.await.unwrap(), (payload.clone(), ReadOutcome::Hit));
+                assert_eq!(follower.await.unwrap(), (payload, ReadOutcome::Hit));
+                assert_eq!(tiered.disk_metrics().snapshot().hits, 1);
+            });
+    }
+
+    /// A `get_or_fetch_outcome` follower of a `resolve_peeked_miss` leader
+    /// whose RAM recheck served the bytes is a [`ReadOutcome::LateServe`], as
+    /// on the RAM-only cache: its own RAM lookup missed and no fetch ran for
+    /// it. The leader is held before its recheck, with its flight registered,
+    /// until the follower has joined and the bytes are in RAM.
+    ///
+    /// FLIP: labelling a `Served::RamRecheck` follower `ReadOutcome::Hit`
+    /// (`(Served::Disk | Served::RamRecheck, _) => ReadOutcome::Hit` in
+    /// `Served::outcome`) reports the follower as a hit.
+    #[tokio::test]
+    async fn get_or_fetch_outcome_reports_a_follower_of_a_ram_recheck_as_a_late_serve() {
+        let tmp = TempDir::new().unwrap();
+        let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        let ram: Cache<&'static str> = Cache::new(generous_limits());
+        let tiered = TieredCache::new(ram, disk);
+        let payload = Bytes::from_static(b"admitted late");
+        let key = test_key(1, payload.len() as u64);
+        let (release_tx, release_rx) = oneshot::channel();
+        *tiered.recheck_hold.lock() = Some(release_rx);
+
+        let never = || async { Err::<Bytes, &'static str>("no upstream fetch runs") };
+        let mut leader = Box::pin(tiered.resolve_peeked_miss(key, never));
+        let first = std::future::poll_fn(|cx| Poll::Ready(leader.as_mut().poll(cx))).await;
+        assert!(
+            first.is_pending(),
+            "the leader parks before its RAM recheck"
+        );
+        let mut follower = Box::pin(tiered.get_or_fetch_outcome(key, never));
+        let first = std::future::poll_fn(|cx| Poll::Ready(follower.as_mut().poll(cx))).await;
+        assert!(first.is_pending(), "the follower missed RAM and joined");
+        assert_eq!(tiered.in_flight_waiters(&key), 1);
+        let before = tiered.ram_metrics().snapshot();
+        assert_eq!(before.misses, 1, "the follower's own RAM lookup missed");
+        tiered.ram.insert(key, payload.clone());
+        release_tx.send(()).expect("the leader is still parked");
+
+        assert_eq!(leader.await.unwrap(), payload);
+        assert_eq!(follower.await.unwrap(), (payload, ReadOutcome::LateServe));
+        let after = tiered.ram_metrics().snapshot();
+        assert_eq!(after.hits, 0, "the recheck records no hit");
+        assert_eq!(after.single_flight_collapses, 1);
+        assert_eq!(tiered.disk_metrics().snapshot().hits, 0);
+    }
+
+    /// In corruption mode a RAM-recheck serve is corrupted like any other
+    /// cache-served result, for the `resolve_peeked_miss` leader and for its
+    /// `get_or_fetch_outcome` follower, with the same transform a RAM hit
+    /// uses, applied once.
+    ///
+    /// FLIP: treating `Served::RamRecheck` as not cache-served
+    /// (`matches!(self, Served::Disk)` in `Served::is_cache_served`) returns
+    /// the clean bytes to both callers.
+    #[tokio::test]
+    async fn a_ram_recheck_serve_is_corrupted_in_corruption_mode() {
+        let tmp = TempDir::new().unwrap();
+        let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        let ram: Cache<&'static str> = Cache::with_corruption(generous_limits());
+        let tiered = TieredCache::new(ram, disk);
+        let payload = Bytes::from_static(b"admitted late");
+        let corrupted = crate::cache::corrupt_bytes(&payload);
+        assert_ne!(corrupted, payload);
+        let key = test_key(1, payload.len() as u64);
+        let (release_tx, release_rx) = oneshot::channel();
+        *tiered.recheck_hold.lock() = Some(release_rx);
+
+        let never = || async { Err::<Bytes, &'static str>("no upstream fetch runs") };
+        let mut leader = Box::pin(tiered.resolve_peeked_miss(key, never));
+        let first = std::future::poll_fn(|cx| Poll::Ready(leader.as_mut().poll(cx))).await;
+        assert!(
+            first.is_pending(),
+            "the leader parks before its RAM recheck"
+        );
+        let mut follower = Box::pin(tiered.get_or_fetch_outcome(key, never));
+        let first = std::future::poll_fn(|cx| Poll::Ready(follower.as_mut().poll(cx))).await;
+        assert!(first.is_pending(), "the follower missed RAM and joined");
+        assert_eq!(tiered.in_flight_waiters(&key), 1);
+        tiered.ram.insert(key, payload.clone());
+        release_tx.send(()).expect("the leader is still parked");
+
+        assert_eq!(leader.await.unwrap(), corrupted);
+        assert_eq!(follower.await.unwrap(), (corrupted, ReadOutcome::LateServe));
+    }
+
+    /// Concurrent RAM+disk misses on one key collapse to a single upstream
+    /// fetch (ADR-0046 decision 5, spanning both tiers): every waiter gets the
+    /// same bytes, and the fetch closure runs exactly once.
+    ///
+    /// The leader is held in its fetch by a `oneshot` this test releases, and
+    /// each follower's future is polled once before that release. That first
+    /// poll is where `SingleFlight::run` takes the in-flight map lock, so
+    /// "the followers joined while the leader was still in flight" is an
+    /// ordering this test enforces rather than a wall-clock race it can lose.
+    #[tokio::test]
+    async fn single_flight_collapses_concurrent_misses_to_one_upstream() {
+        let tmp = TempDir::new().unwrap();
+        let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        let ram: Cache<&'static str> = Cache::new(generous_limits());
+        let tiered = Arc::new(TieredCache::new(ram, disk));
+
+        let payload = Bytes::from_static(b"fetched once");
+        let key = test_key(1, payload.len() as u64);
+        let upstream_calls = Arc::new(AtomicUsize::new(0));
+        let follower_fetches = Arc::new(AtomicUsize::new(0));
+
+        const CALLERS: usize = 8;
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let leader = {
+            let tiered = tiered.clone();
+            let calls = upstream_calls.clone();
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                tiered
+                    .get_or_fetch(key, move || async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.await;
+                        Ok::<Bytes, &'static str>(payload)
+                    })
+                    .await
+            })
+        };
+        entered_rx.await.expect("the leader reaches its fetch");
+
+        let mut followers = Vec::new();
+        for _ in 1..CALLERS {
+            let ran = follower_fetches.clone();
+            followers.push(Box::pin(tiered.get_or_fetch(key, move || async move {
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok::<Bytes, &'static str>(Bytes::from_static(b"never"))
+            })));
+        }
+        for follower in &mut followers {
+            let first = std::future::poll_fn(|cx| Poll::Ready(follower.as_mut().poll(cx))).await;
+            assert!(
+                first.is_pending(),
+                "a follower parks on the held leader instead of completing on its own"
+            );
+        }
+        release_tx.send(()).expect("the leader is still parked");
+
+        for follower in followers {
+            let (bytes, _source) = follower.await.unwrap();
+            assert_eq!(
+                bytes, payload,
+                "every waiter receives the one fetched value"
+            );
+        }
+        let (bytes, _source) = leader.await.unwrap().unwrap();
+        assert_eq!(bytes, payload, "the leader receives its own fetched value");
+
+        assert_eq!(
+            upstream_calls.load(Ordering::SeqCst),
+            1,
+            "8 concurrent misses on one key must produce exactly one upstream fetch"
+        );
+        assert_eq!(
+            follower_fetches.load(Ordering::SeqCst),
+            0,
+            "a follower never runs its own fetch"
+        );
+        assert_eq!(
+            tiered.ram_metrics().snapshot().single_flight_collapses,
+            (CALLERS - 1) as u64,
+            "the 7 followers each record one collapse"
+        );
+    }
+
+    /// Eight callers that each already peeked-and-missed the same key (via
+    /// `get`, the one accounted miss per caller) then resolve that miss through
+    /// [`TieredCache::resolve_peeked_miss`]: the upstream `fetch` runs exactly
+    /// once (they collapse onto one leader), every caller receives identical
+    /// bytes, the seven followers each record one collapse, and -- critically --
+    /// the method records NO miss of its own on either tier, so the peek stays
+    /// the single accounted miss. A successful resolve admits to both tiers.
+    ///
+    /// This is the crate-level proof of #662's contract. To watch single-flight
+    /// bite, revert `resolve_peeked_miss` to run `fetch().await` directly
+    /// without the `self.single_flight.run(...)` wrapper (the pre-fix
+    /// `ReadCache::fetch_peeked` Tiered behavior): `upstream_calls` then reads 8,
+    /// not 1, and the exactly-one-fetch assertion fails.
+    ///
+    /// The leader is held in its fetch by a `oneshot` this test releases, and
+    /// each follower's future is polled once (the poll that takes the
+    /// in-flight map lock) before that release, so no wall-clock hold decides
+    /// whether a caller lands as a follower or as a second leader.
+    #[tokio::test]
+    async fn resolve_peeked_miss_collapses_concurrent_callers_to_one_fetch() {
+        let tmp = TempDir::new().unwrap();
+        let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        let ram: Cache<&'static str> = Cache::new(generous_limits());
+        let ram_metrics = ram.metrics();
+        let tiered = Arc::new(TieredCache::new(ram, disk));
+
+        let payload = Bytes::from_static(b"resolved once");
+        let key = test_key(1, payload.len() as u64);
+
+        // Every caller peeks first and genuinely misses both tiers -- exactly
+        // the BlockRangeFetcher peek-then-defer entry condition. These `get`
+        // calls are the one accounted miss per caller.
+        const CALLERS: usize = 8;
+        for _ in 0..CALLERS {
+            assert!(
+                tiered.get(&key).is_none(),
+                "precondition: a caller peeks and misses both tiers"
+            );
+        }
+        let misses_after_peeks = ram_metrics.snapshot().misses;
+
+        let upstream_calls = Arc::new(AtomicUsize::new(0));
+        let follower_fetches = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let leader = {
+            let tiered = tiered.clone();
+            let calls = upstream_calls.clone();
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                tiered
+                    .resolve_peeked_miss(key, move || async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.await;
+                        Ok::<Bytes, &'static str>(payload)
+                    })
+                    .await
+            })
+        };
+        entered_rx.await.expect("the leader reaches its fetch");
+
+        let mut followers = Vec::new();
+        for _ in 1..CALLERS {
+            let ran = follower_fetches.clone();
+            followers.push(Box::pin(tiered.resolve_peeked_miss(
+                key,
+                move || async move {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    Ok::<Bytes, &'static str>(Bytes::from_static(b"never"))
+                },
+            )));
+        }
+        for follower in &mut followers {
+            let first = std::future::poll_fn(|cx| Poll::Ready(follower.as_mut().poll(cx))).await;
+            assert!(
+                first.is_pending(),
+                "a follower parks on the held leader instead of completing on its own"
+            );
+        }
+        assert_eq!(
+            tiered.in_flight_waiters(&key),
+            CALLERS - 1,
+            "every follower is parked on the held leader"
+        );
+        release_tx.send(()).expect("the leader is still parked");
+
+        for follower in followers {
+            let bytes = follower.await.unwrap();
+            assert_eq!(
+                bytes, payload,
+                "every caller receives the one fetched value"
+            );
+        }
+        let bytes = leader.await.unwrap().unwrap();
+        assert_eq!(bytes, payload, "the leader receives its own fetched value");
+
+        assert_eq!(
+            upstream_calls.load(Ordering::SeqCst),
+            1,
+            "8 concurrent resolve_peeked_miss callers on one key must produce exactly one fetch"
+        );
+        assert_eq!(
+            follower_fetches.load(Ordering::SeqCst),
+            0,
+            "a follower never runs its own fetch"
+        );
+        assert_eq!(
+            ram_metrics.snapshot().single_flight_collapses,
+            (CALLERS - 1) as u64,
+            "the 7 followers each record one collapse"
+        );
+        assert_eq!(
+            ram_metrics.snapshot().misses,
+            misses_after_peeks,
+            "resolve_peeked_miss records NO miss of its own: the peek was the one accounted miss"
+        );
+        assert!(
+            tiered.disk.get(&key).is_some(),
+            "a successful resolve admits to the disk tier, not RAM alone"
+        );
+    }
+
+    /// A caller that peeks while a fetch for the key is in flight, and reaches
+    /// `resolve_peeked_miss` only after that fetch has finished and left the
+    /// single-flight map, is served the finished fetch's bytes: no second
+    /// fetch, and no miss recorded beyond its own peek. In `read_range` the gap
+    /// between peek and resolve is the disk consult's `spawn_blocking` round
+    /// trip, which a loaded machine can stretch past a whole upstream GET.
+    ///
+    /// FLIP: removing the leader's `self.ram.get_uncounted(&key)` check in
+    /// `resolve_peeked_miss` runs the late caller's fetch, so `late_fetches`
+    /// reads 1; replacing it with the counted `self.ram.get(&key)` records a
+    /// RAM hit, so the hit count moves.
+    #[tokio::test]
+    async fn resolve_peeked_miss_after_the_flight_finished_reuses_its_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        let ram: Cache<&'static str> = Cache::new(generous_limits());
+        let ram_metrics = ram.metrics();
+        let tiered = Arc::new(TieredCache::new(ram, disk));
+
+        let payload = Bytes::from_static(b"fetched once");
+        let key = test_key(1, payload.len() as u64);
+
+        assert!(tiered.get(&key).is_none(), "the leader's own peek misses");
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let leader = {
+            let tiered = tiered.clone();
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                tiered
+                    .resolve_peeked_miss(key, move || async move {
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.await;
+                        Ok::<Bytes, &'static str>(payload)
+                    })
+                    .await
+            })
+        };
+        entered_rx.await.expect("the leader reaches its fetch");
+
+        assert!(
+            tiered.get(&key).is_none(),
+            "the late caller peeks while the leader's fetch is in flight"
+        );
+        let misses_after_peeks = ram_metrics.snapshot().misses;
+        let hits_after_peeks = ram_metrics.snapshot().hits;
+        release_tx.send(()).expect("the leader is still parked");
+        let leader_bytes = leader.await.unwrap().unwrap();
+        assert!(
+            !tiered.is_in_flight(&key),
+            "the flight has finished and left the map"
+        );
+
+        let late_fetches = Arc::new(AtomicUsize::new(0));
+        let ran = late_fetches.clone();
+        let late_bytes = tiered
+            .resolve_peeked_miss(key, move || async move {
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok::<Bytes, &'static str>(Bytes::from_static(b"second fetch"))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            late_fetches.load(Ordering::SeqCst),
+            0,
+            "a miss peeked during the flight must not fetch again"
+        );
+        assert_eq!(late_bytes, payload);
+        assert_eq!(leader_bytes, late_bytes);
+        assert_eq!(
+            ram_metrics.snapshot().misses,
+            misses_after_peeks,
+            "the RAM check records no miss of its own"
+        );
+        assert_eq!(
+            ram_metrics.snapshot().hits,
+            hits_after_peeks,
+            "the RAM check records no hit of its own"
+        );
+    }
+
+    /// #653: the single-caller resolve path -- no concurrency -- runs the fetch
+    /// once, admits to BOTH tiers, and records NO miss of its own; the caller's
+    /// prior `get` peek is the one accounted miss. The cheap companion to the
+    /// concurrent-collapse proof above, on the same `resolve_peeked_miss`
+    /// surface.
+    #[tokio::test]
+    async fn resolve_peeked_miss_single_caller_admits_both_tiers_and_records_no_miss() {
+        let tmp = TempDir::new().unwrap();
+        let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        let ram: Cache<&'static str> = Cache::new(generous_limits());
+        let ram_metrics = ram.metrics();
+        let tiered = TieredCache::new(ram, disk);
+
+        let payload = Bytes::from_static(b"resolved once");
+        let key = test_key(1, payload.len() as u64);
+
+        // Peek both tiers and miss: the one accounted miss for this request.
+        assert!(tiered.get(&key).is_none());
+        let misses_after_peek = ram_metrics.snapshot().misses;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        let payload2 = payload.clone();
+        let got = tiered
+            .resolve_peeked_miss(key, move || {
+                let calls2 = calls2.clone();
+                let payload2 = payload2.clone();
+                async move {
+                    calls2.fetch_add(1, Ordering::SeqCst);
+                    Ok::<Bytes, &'static str>(payload2)
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(got, payload);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the fetch runs exactly once"
+        );
+
+        // Admitted to BOTH tiers.
+        assert_eq!(tiered.ram.get(&key).as_deref(), Some(payload.as_ref()));
+        assert!(
+            tiered.disk.get(&key).is_some(),
+            "resolve admits to the disk tier, not RAM alone"
+        );
+
+        // No miss recorded by resolve itself: the peek was the one accounted
+        // miss for this logical request.
+        assert_eq!(
+            ram_metrics.snapshot().misses,
+            misses_after_peek,
+            "resolve_peeked_miss records no miss of its own"
+        );
+    }
+
+    /// A successful upstream fetch populates BOTH tiers (ADR-0046 decision 3),
+    /// not RAM alone. Proven by evicting the RAM entry and reading again: the
+    /// key is served from disk with no second upstream fetch, the exact cold
+    /// -path round trip the disk tier removes.
+    #[tokio::test]
+    async fn upstream_fetch_populates_both_tiers_and_disk_serves_after_ram_eviction() {
+        let tmp = TempDir::new().unwrap();
+        // A one-slot RAM tier so a second distinct key deterministically
+        // evicts the first; the disk tier stays generous and keeps both.
+        let ram: Cache<&'static str> = Cache::new(CacheLimits::new(64 * 1024, 1, 64 * 1024));
+        let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        let tiered = TieredCache::new(ram, disk);
+
+        let a = test_key(1, 4);
+        let b = test_key(2, 4);
+        let a_bytes = Bytes::from_static(b"aaaa");
+        let b_bytes = Bytes::from_static(b"bbbb");
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        // First read of A: both tiers miss, the upstream fetch runs once, and
+        // both tiers are populated.
+        let calls_a = calls.clone();
+        let bytes_a = a_bytes.clone();
+        let (got, source) = tiered
+            .get_or_fetch(a, move || {
+                let calls_a = calls_a.clone();
+                async move {
+                    calls_a.fetch_add(1, Ordering::SeqCst);
+                    Ok::<Bytes, &'static str>(bytes_a)
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(source, Source::Upstream);
+        assert_eq!(got, a_bytes);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            tiered.disk.get(&a).is_some(),
+            "the upstream fetch must have populated the disk tier, not RAM alone"
+        );
+
+        // Read B: the one-slot RAM tier evicts A while B is fetched upstream.
+        let calls_b = calls.clone();
+        let bytes_b = b_bytes.clone();
+        let _ = tiered
+            .get_or_fetch(b, move || {
+                let calls_b = calls_b.clone();
+                async move {
+                    calls_b.fetch_add(1, Ordering::SeqCst);
+                    Ok::<Bytes, &'static str>(bytes_b)
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            tiered.ram.get(&a).is_none(),
+            "A must have been evicted from the one-slot RAM tier"
+        );
+
+        // Read A again: RAM misses, disk hits, so A is served from disk with
+        // no upstream re-fetch.
+        let before_disk = tiered.disk.metrics().snapshot();
+        let calls_a2 = calls.clone();
+        let (got2, source2) = tiered
+            .get_or_fetch(a, move || {
+                let calls_a2 = calls_a2.clone();
+                async move {
+                    calls_a2.fetch_add(1, Ordering::SeqCst);
+                    Ok::<Bytes, &'static str>(Bytes::from_static(b"XXXX"))
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            source2,
+            Source::Cache,
+            "a RAM-evicted key is served from the disk tier, not re-fetched"
+        );
+        assert_eq!(
+            got2, a_bytes,
+            "the disk tier serves the originally-cached bytes"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "no upstream re-fetch: the disk tier absorbed the RAM eviction"
+        );
+        let after_disk = tiered.disk.metrics().snapshot();
+        assert_eq!(
+            after_disk.hits,
+            before_disk.hits + 1,
+            "the second read of A was a disk hit"
+        );
+    }
+
+    /// The plain `get` returns `None` on a genuine miss in BOTH tiers, and
+    /// runs no upstream fetch (it takes no fetch closure: a miss is the
+    /// caller's to handle). The disk tier is consulted, proven by its miss
+    /// counter, so the fall-through order matches `get_or_fetch`.
+    #[tokio::test]
+    async fn plain_get_double_miss_returns_none_without_fetching() {
+        let tmp = TempDir::new().unwrap();
+        let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        let disk_metrics = disk.metrics();
+        let ram: Cache<&'static str> = Cache::new(generous_limits());
+        let tiered = TieredCache::new(ram, disk);
+
+        let key = test_key(1, 5);
+        let before = disk_metrics.snapshot();
+        assert!(
+            tiered.get(&key).is_none(),
+            "a key resident in neither tier is a plain miss"
+        );
+        let after = disk_metrics.snapshot();
+        assert_eq!(
+            after.misses,
+            before.misses + 1,
+            "a RAM miss must fall through and consult the disk tier"
+        );
+        assert_eq!(after.hits, before.hits, "a double miss records no disk hit");
+    }
+
+    /// The plain `get` fast path: a RAM hit is served without consulting the
+    /// disk tier at all, mirroring `ram_hit_short_circuits_without_touching_disk`
+    /// but for the fetch-free `get`. Proven via the disk tier's own counters.
+    #[tokio::test]
+    async fn plain_get_ram_hit_short_circuits_without_touching_disk() {
+        let tmp = TempDir::new().unwrap();
+        let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        let disk_metrics = disk.metrics();
+        let ram: Cache<&'static str> = Cache::new(generous_limits());
+        let tiered = TieredCache::new(ram, disk);
+
+        let clean = Bytes::from_static(b"resident in RAM");
+        let key = test_key(1, clean.len() as u64);
+        tiered.ram.insert(key, clean.clone());
+
+        let before = disk_metrics.snapshot();
+        let served = tiered.get(&key);
+        assert_eq!(
+            served.as_deref(),
+            Some(clean.as_ref()),
+            "the RAM bytes are served verbatim"
+        );
+        let after = disk_metrics.snapshot();
+        assert_eq!(after.hits, before.hits, "a RAM hit reads no disk hit");
+        assert_eq!(
+            after.misses, before.misses,
+            "a RAM hit does not consult the disk tier at all"
+        );
+    }
+
+    /// The plain `get` on a disk-only key repopulates RAM read-through, exactly
+    /// as `get_or_fetch`'s disk-hit branch does: the next read of the key is a
+    /// RAM hit. Mirrors the `get_or_fetch` disk-repopulation proof.
+    #[tokio::test]
+    async fn plain_get_disk_only_key_repopulates_ram() {
+        let tmp = TempDir::new().unwrap();
+        let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        let ram: Cache<&'static str> = Cache::new(generous_limits());
+        let tiered = TieredCache::new(ram, disk);
+
+        let clean = Bytes::from_static(b"disk resident");
+        let key = test_key(1, clean.len() as u64);
+        // Populate disk only; RAM stays empty.
+        tiered.disk.insert(key, &clean);
+        assert!(
+            tiered.ram.get(&key).is_none(),
+            "precondition: the key is not in RAM"
+        );
+
+        let served = tiered.get(&key);
+        assert_eq!(
+            served.as_deref(),
+            Some(clean.as_ref()),
+            "a disk-only key is served from disk"
+        );
+        // Read-through: the disk hit repopulated RAM, so a direct RAM read now
+        // hits without any further disk consult.
+        assert_eq!(
+            tiered.ram.get(&key).as_deref(),
+            Some(clean.as_ref()),
+            "a disk hit must repopulate RAM so the next read is a RAM hit"
+        );
+    }
+
+    /// The plain `insert` admits to BOTH tiers (ADR-0046 decision 3's admission
+    /// policy, no upstream fetch involved). Proven by reading the disk tier
+    /// directly after the insert: the bytes are present there, not RAM alone.
+    #[tokio::test]
+    async fn plain_insert_populates_both_tiers() {
+        let tmp = TempDir::new().unwrap();
+        let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        let ram: Cache<&'static str> = Cache::new(generous_limits());
+        let tiered = TieredCache::new(ram, disk);
+
+        let value = Bytes::from_static(b"admitted to both");
+        let key = test_key(1, value.len() as u64);
+        tiered.insert(key, value.clone());
+
+        assert_eq!(
+            tiered.ram.get(&key).as_deref(),
+            Some(value.as_ref()),
+            "insert must admit to the RAM tier"
+        );
+        // Read the disk tier directly (RAM bypassed): the bytes must be there
+        // too, so a later RAM eviction is served from disk.
+        assert_eq!(
+            tiered.disk.get(&key).as_deref(),
+            Some(value.as_ref()),
+            "insert must admit to the disk tier, not RAM alone"
+        );
+    }
+
+    /// #656: the disk tier's own metrics accessor surfaces a disk-served hit.
+    /// A key resident only on disk is read through the tiered handle; the hit
+    /// registers on [`TieredCache::disk_metrics`], while the RAM-tier view
+    /// ([`TieredCache::ram_metrics`]) records the same read as a *miss* -- which
+    /// is exactly why a RAM-only accessor under-reports disk-served hits and the
+    /// disk accessor is needed. This is the crate-level primitive behind
+    /// `ravel_catalog::Catalog::byte_cache_disk_metrics`.
+    ///
+    /// To watch it bite, read only `ram_metrics()`: `disk_after.hits` would be
+    /// invisible there and the disk-served hit would read as a pure miss.
+    #[tokio::test]
+    async fn disk_served_hit_is_visible_on_disk_metrics() {
+        let tmp = TempDir::new().unwrap();
+        let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        let ram: Cache<&'static str> = Cache::new(generous_limits());
+        let tiered = TieredCache::new(ram, disk);
+
+        let clean = Bytes::from_static(b"disk resident");
+        let key = test_key(1, clean.len() as u64);
+        // Populate disk only; RAM stays empty so the read falls through to disk.
+        tiered.disk.insert(key, &clean);
+
+        let disk_before = tiered.disk_metrics().snapshot();
+        let ram_before = tiered.ram_metrics().snapshot();
+
+        let served = tiered.get(&key).expect("a disk-resident key resolves");
+        assert_eq!(served, clean);
+
+        let disk_after = tiered.disk_metrics().snapshot();
+        let ram_after = tiered.ram_metrics().snapshot();
+        assert_eq!(
+            disk_after.hits,
+            disk_before.hits + 1,
+            "a disk-served hit must read as a hit on the disk-tier metrics"
+        );
+        assert_eq!(
+            ram_after.misses,
+            ram_before.misses + 1,
+            "the same read is a miss on the RAM-tier metrics: a RAM-only \
+             accessor would report the disk-served hit as a miss (#656)"
+        );
+    }
+
+    /// The corruption gate (ADR-0046 decision 4) reaches a disk-served hit read
+    /// through the fetch-free `get`, identically to the `get_or_fetch` proof at
+    /// module scope. A key resident only on disk, RAM in corruption mode: the
+    /// plain `get` must return corrupted bytes, not the clean disk bytes.
+    ///
+    /// To watch it bite, in `TieredCache::get`'s disk-hit branch replace
+    /// `Some(self.maybe_corrupt(bytes, true))` with `Some(bytes)`: the
+    /// `assert_ne!` below then fails because the clean disk bytes are served
+    /// through a path the acceptance gate must corrupt.
+    #[tokio::test]
+    async fn plain_get_disk_hit_is_corrupted_in_corruption_mode() {
+        let tmp = TempDir::new().unwrap();
+        let clean = Bytes::from_static(b"disk-resident payload; trust no cached byte");
+        let key = test_key(1, clean.len() as u64);
+
+        let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        disk.insert(key, &clean);
+        assert!(
+            disk.get(&key).is_some(),
+            "precondition: entry lives on disk"
+        );
+
+        let ram: Cache<&'static str> = Cache::with_corruption(generous_limits());
+        let tiered = TieredCache::new(ram, disk);
+
+        let served = tiered.get(&key).expect("a disk-resident key resolves");
+        assert_eq!(served.len(), clean.len(), "corruption preserves length");
+        assert_ne!(
+            served.as_ref(),
+            clean.as_ref(),
+            "a disk-served hit through the plain get must arrive corrupted, \
+             proving ADR-0046 decision 4's gate reaches this access path"
+        );
+
+        // The corruption an independent RAM tier in the same mode applies to
+        // the same bytes: proves the identical transform, not merely "some"
+        // mutation.
+        let ram_probe: Cache<&'static str> = Cache::with_corruption(generous_limits());
+        ram_probe.insert(key, clean.clone());
+        let ram_corrupted = ram_probe.get(&key).expect("probe RAM hit");
+        assert_eq!(
+            served, ram_corrupted,
+            "a disk-served hit must be corrupted exactly like a RAM hit"
+        );
+    }
+
+    /// Live residency accounting for [`TieredCache::ram_len`],
+    /// [`TieredCache::ram_total_bytes`], [`TieredCache::disk_len`], and
+    /// [`TieredCache::disk_total_bytes`] (#1170): each answers "how many
+    /// bytes/entries are resident right now," which a cumulative
+    /// [`CacheMetrics`] counter (`bytes_admitted`, `evictions`) cannot --
+    /// those only ever grow, with no per-eviction byte accounting to net
+    /// against admissions. This test insists on exact counts and bytes at
+    /// every step, never `> 0`: four sequential inserts with no `get` in
+    /// between all land in the small (probation) queue with `freq == 0`, so
+    /// eviction is deterministic FIFO (oldest-admitted first) once the byte
+    /// bound is exceeded.
+    ///
+    /// FLIP (magnitude, non-vacuity): in `TieredCache::ram_total_bytes`,
+    /// change `self.ram.total_bytes()` to `self.ram.total_bytes() / 2`. The
+    /// `assert_eq!(tiered.ram_total_bytes(), 300)` below then reads 150 and
+    /// fails.
+    #[tokio::test]
+    async fn tiered_cache_residency_tracks_exact_bytes_and_entries_across_eviction() {
+        let tmp = TempDir::new().unwrap();
+        let limits = CacheLimits::new(300, 10_000, 1_000);
+        let disk = DiskCache::new(tmp.path().to_path_buf(), limits);
+        let ram: Cache<&'static str> = Cache::new(limits);
+        let tiered = TieredCache::new(ram, disk);
+
+        let payload = |n: u8| Bytes::from(vec![n; 100]);
+
+        tiered.insert(test_key(1, 100), payload(1));
+        tiered.insert(test_key(2, 100), payload(2));
+        tiered.insert(test_key(3, 100), payload(3));
+
+        assert_eq!(
+            tiered.ram_len(),
+            3,
+            "three 100-byte entries, no eviction yet"
+        );
+        assert_eq!(tiered.ram_total_bytes(), 300);
+        assert_eq!(tiered.disk_len(), 3);
+        assert_eq!(tiered.disk_total_bytes(), 300);
+
+        // A fourth 100-byte entry pushes total resident bytes to 400, over
+        // the 300-byte limit: the oldest entry (key 1) is evicted from both
+        // tiers' independent S3-FIFO instances, deterministically, since
+        // none of the four keys was ever `get`-touched (freq stays 0, so
+        // eviction is FIFO from the front of the small queue).
+        tiered.insert(test_key(4, 100), payload(4));
+
+        assert_eq!(
+            tiered.ram_len(),
+            3,
+            "the byte bound evicted exactly one entry to make room"
+        );
+        assert_eq!(
+            tiered.ram_total_bytes(),
+            300,
+            "resident bytes fall by exactly the evicted entry's size (100), \
+             not merely 'less than before'"
+        );
+        assert_eq!(tiered.disk_len(), 3);
+        assert_eq!(tiered.disk_total_bytes(), 300);
+    }
+
+    /// #1702: proves the disk calls made by `get_or_fetch`'s async
+    /// single-flight closure actually run on tokio's blocking pool, not the
+    /// runtime's async thread. A [`Clock`] (the crate's existing
+    /// time-injection seam -- see the [module docs](crate) note on
+    /// `DiskCache`) records the OS thread it is called from; a disk hit
+    /// reaches the age check (`read_and_verify`), and a fresh-key admission
+    /// stamps `written_at_ns`, so both fire the clock exactly once each.
+    ///
+    /// The runtime is `current_thread`: there is no separate "worker"
+    /// thread at all, only the thread that calls `block_on`, so any thread
+    /// ID recorded for the disk work that differs from that thread is
+    /// necessarily a blocking-pool thread, never a misidentified worker.
+    #[test]
+    fn disk_get_and_insert_run_on_a_blocking_thread_not_the_worker() {
+        struct ThreadProbeClock {
+            last_thread: Mutex<Option<std::thread::ThreadId>>,
+        }
+        impl Clock for ThreadProbeClock {
+            fn now_ns(&self) -> u64 {
+                *self.last_thread.lock() = Some(std::thread::current().id());
+                0
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let async_thread_id = std::thread::current().id();
+
+            let tmp = TempDir::new().unwrap();
+            let probe = Arc::new(ThreadProbeClock {
+                last_thread: Mutex::new(None),
+            });
+            let disk = DiskCache::new_with_clock(
+                tmp.path().to_path_buf(),
+                generous_limits(),
+                probe.clone(),
+            );
+
+            // Pre-populate a disk-only entry directly (setup for the case
+            // under test below, not itself under test): the age check that
+            // fires the clock only runs on a hit.
+            let hit_key = test_key(1, 4);
+            disk.insert(hit_key, b"aaaa");
+
+            let ram: Cache<&'static str> = Cache::new(generous_limits());
+            let tiered = TieredCache::new(ram, disk);
+
+            probe.last_thread.lock().take();
+            let (_bytes, source) = tiered
+                .get_or_fetch(hit_key, || async {
+                    Ok::<Bytes, &'static str>(Bytes::from_static(b"never"))
+                })
+                .await
+                .unwrap();
+            assert_eq!(source, Source::Cache, "the pre-populated key is a disk hit");
+            let get_thread = probe
+                .last_thread
+                .lock()
+                .take()
+                .expect("a disk hit's age check must call the clock");
+            assert_ne!(
+                get_thread, async_thread_id,
+                "DiskCache::get must run on a blocking-pool thread, not the \
+                 current_thread runtime's sole async thread"
+            );
+
+            let miss_key = test_key(2, 4);
+            let (_bytes, source) = tiered
+                .get_or_fetch(miss_key, || async {
+                    Ok::<Bytes, &'static str>(Bytes::from_static(b"bbbb"))
+                })
+                .await
+                .unwrap();
+            assert_eq!(source, Source::Upstream, "a fresh key is an upstream fetch");
+            let insert_thread = probe
+                .last_thread
+                .lock()
+                .take()
+                .expect("a fresh-key admission must call the clock to stamp written_at_ns");
+            assert_ne!(
+                insert_thread, async_thread_id,
+                "DiskCache::insert must run on a blocking-pool thread, not the \
+                 current_thread runtime's sole async thread"
+            );
+        });
+    }
+
+    /// #1702 acceptance test. On a `current_thread` runtime (a single async
+    /// thread and nothing else), a concurrent `get_or_fetch` for an
+    /// unrelated, RAM-resident key must not be delayed by another call's
+    /// slow disk insert, because that insert now runs on tokio's blocking
+    /// pool instead of the async thread.
+    ///
+    /// The leader uses [`resolve_peeked_miss`](TieredCache::resolve_peeked_miss),
+    /// not `get_or_fetch`: its closure goes straight from `fetch` to the disk
+    /// insert with no `disk.get` in between, so the leader's first (and only,
+    /// pre-fix) suspension point is unambiguously the insert -- there is no
+    /// earlier blocking-pool dispatch (`get_or_fetch`'s own `disk.get` miss
+    /// check) that could let the probe below run concurrently for a reason
+    /// unrelated to the insert.
+    ///
+    /// This proves the claim by ordering, not by duration. The disk tier's
+    /// injected [`Clock`] -- called once, for `DiskCache::insert`'s
+    /// `written_at_ns` stamp -- signals `began_tx` and then parks on
+    /// `release_rx` instead of sleeping. If that call runs on a genuine
+    /// blocking-pool thread (the fix), parking it does not stop the async
+    /// thread from running the concurrent RAM-hit probe to completion; the
+    /// test then releases the park and joins the leader. If that call
+    /// instead runs on the runtime's sole async thread (the bug), parking it
+    /// wedges the only thread able to ever unpark it -- there is no
+    /// duration at which the probe "would" run, it structurally cannot, and
+    /// the test hangs rather than racing a clock. An outer watchdog thread
+    /// turns that hang into a deterministic failure instead of an
+    /// indefinitely stuck test binary; it bounds wall time but asserts
+    /// nothing about it.
+    ///
+    /// FLIP (demonstrate failing on the unmodified tree): in
+    /// `TieredCache::resolve_peeked_miss`, replace the line
+    /// `let _ = tokio::task::spawn_blocking(move || disk.insert(key, &insert_bytes)).await;`
+    /// with the direct, pre-#1702 call `self.disk.insert(key, &bytes);`. On a
+    /// `current_thread` runtime, the leader's first poll then runs `fetch`
+    /// (ready immediately, no `.await` inside it), the RAM insert, and the
+    /// direct disk insert -- including the clock's `began_tx` send and its
+    /// park on `release_rx` -- all in that single, uninterrupted poll. That
+    /// poll never returns, so nothing else on this single-threaded runtime
+    /// can ever be scheduled: not the task waiting on `fetch_entered_rx`,
+    /// not the probe, and not the code that would send on `release_tx`.
+    /// Confirmed: reverting that line makes this test hang until the
+    /// watchdog's bound elapses and it panics with the "test hung" message
+    /// below, instead of passing; reverted back to the `spawn_blocking`
+    /// version afterward.
+    #[test]
+    fn disk_tier_get_and_insert_run_on_the_blocking_pool() {
+        // Generous bound for the watchdog only: how long the whole handshake
+        // (leader starts, insert begins, probe runs, insert releases, leader
+        // finishes) may take before the test declares a hang rather than
+        // waiting on it forever. Nothing here is compared against a
+        // *measured* duration -- this only bounds how long `recv_timeout`
+        // blocks the outer thread.
+        const WATCHDOG_BOUND: Duration = Duration::from_secs(10);
+
+        let (began_tx, began_rx) = std::sync::mpsc::sync_channel::<()>(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(0);
+
+        run_with_watchdog(
+            WATCHDOG_BOUND,
+            || {
+                format!(
+                    "test hung for {WATCHDOG_BOUND:?}: the leader's disk insert \
+                     likely ran on the runtime's async thread and wedged it \
+                     parked, instead of running on the blocking pool (see #1702)"
+                )
+            },
+            move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+
+                rt.block_on(async {
+                    let tmp = TempDir::new().unwrap();
+                    // `DiskCache::new_with_clock` itself calls `clock.now_ns()`
+                    // once, from `scan_existing`, to timestamp the startup scan --
+                    // before this test's own handshake begins. `arm()` is called
+                    // only after construction returns, so that startup call is a
+                    // no-op and the park lands on the first call after that:
+                    // `resolve_peeked_miss`'s `written_at_ns` stamp.
+                    let clock = Arc::new(ParkOnFirstArmedCall::new(
+                        move || began_tx.send(()).unwrap(),
+                        release_rx,
+                    ));
+                    let disk = DiskCache::new_with_clock(
+                        tmp.path().to_path_buf(),
+                        generous_limits(),
+                        clock.clone(),
+                    );
+                    let ram: Cache<&'static str> = Cache::new(generous_limits());
+                    let tiered = Arc::new(TieredCache::new(ram, disk));
+                    clock.arm();
+
+                    let leader_key = test_key(1, 4);
+                    let tiered_leader = tiered.clone();
+                    let (fetch_entered_tx, fetch_entered_rx) = oneshot::channel::<()>();
+                    let leader = tokio::spawn(async move {
+                        tiered_leader
+                            .resolve_peeked_miss(leader_key, move || async move {
+                                let _ = fetch_entered_tx.send(());
+                                Ok::<Bytes, &'static str>(Bytes::from_static(b"aaaa"))
+                            })
+                            .await
+                    });
+
+                    // Wait for confirmation that the leader's fetch ran, which
+                    // requires the leader's first poll to have returned control
+                    // to the executor (a single-threaded runtime cannot
+                    // reschedule this task while the leader's poll is still on
+                    // the stack). On the reverted (pre-#1702) tree, that first
+                    // poll runs fetch, the RAM insert, AND the synchronous,
+                    // un-instrumented disk insert (including the clock's park)
+                    // before returning, so this wait never resolves and the test
+                    // hangs here. On the fixed tree the poll returns as soon as
+                    // the disk insert is dispatched to the blocking pool, before
+                    // the clock is ever called, so this wait is near-instant. A
+                    // plain `tokio::task::yield_now().await` was tried first and
+                    // does not give this guarantee: it only requires the leader
+                    // to be *scheduled* by the time this task resumes, not to
+                    // have been *polled*, so it let the probe below run before
+                    // the leader's synchronous insert ever started and passed
+                    // even on the reverted tree.
+                    fetch_entered_rx.await.unwrap();
+
+                    // Wait for the disk tier's clock to signal that the insert
+                    // has begun. On the fixed tree this call runs on a tokio
+                    // blocking-pool thread, a real second OS thread, so blocking
+                    // this async thread on `recv()` here does not depend on
+                    // anything this thread itself would otherwise need to do.
+                    began_rx.recv().unwrap();
+
+                    let probe_key = test_key(2, 4);
+                    tiered.ram.insert(probe_key, Bytes::from_static(b"bbbb"));
+                    let (served, source) = tiered
+                        .get_or_fetch(probe_key, || async {
+                            unreachable!("a RAM-resident key must never fetch")
+                        })
+                        .await
+                        .unwrap();
+
+                    assert_eq!(source, Source::Cache, "the probe key is a RAM hit");
+                    assert_eq!(served, Bytes::from_static(b"bbbb"));
+
+                    // The probe above only completed because the parked insert
+                    // is not holding this thread. Release it now, which is the
+                    // deterministic version of "the sleep finishes": the
+                    // leader's disk insert can only observe the probe's result
+                    // as already asserted, never race it.
+                    release_tx.send(()).unwrap();
+
+                    let leader_bytes = leader.await.unwrap().unwrap();
+                    assert_eq!(leader_bytes, Bytes::from_static(b"aaaa"));
+                });
+            },
+        );
+    }
+
+    /// Bounds how long the watchdog waits before calling a hang a hang. Nothing
+    /// is asserted about elapsed time; this only stops a wedged runtime from
+    /// hanging the test binary forever.
+    const OFF_WORKER_WATCHDOG: Duration = Duration::from_secs(10);
+
+    /// #1891: the peek-then-defer READ path runs its disk consult on the
+    /// blocking pool, not on the runtime worker.
+    ///
+    /// `BlockRangeFetcher::fetch_blocks` peeks every candidate extent through
+    /// `ReadCache::get`, which is [`TieredCache::get_off_worker`] on the tiered
+    /// tier. This proves the claim by ordering, not by duration, exactly as the
+    /// #1702 test above does: the disk tier's injected [`Clock`] -- called on a
+    /// disk hit for the age check -- announces that the read has begun and then
+    /// parks. On a `current_thread` runtime there is one async thread and
+    /// nothing else, so if that read runs on the blocking pool the parked call
+    /// cannot stop the async thread from serving a concurrent RAM-resident peek
+    /// to completion; if it runs on the async thread it wedges the only thread
+    /// that could ever unpark it, and no duration exists at which the concurrent
+    /// peek "would" have run.
+    ///
+    /// FLIP (demonstrate failing): in [`TieredCache::get_off_worker`], replace
+    /// the `spawn_blocking` dispatch with the direct `self.disk.get(&key)` call
+    /// `get` makes. The reader task's first poll then parks inside the disk read
+    /// and never returns, so the `began_rx.recv().await` below resolves onto a
+    /// thread that can never run again, the concurrent peek is never reached,
+    /// and the watchdog fires with the message below instead of the test
+    /// passing.
+    #[test]
+    fn peeked_get_runs_the_disk_read_off_the_worker() {
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(0);
+
+        run_with_watchdog(
+            OFF_WORKER_WATCHDOG,
+            || {
+                format!(
+                    "test hung for {OFF_WORKER_WATCHDOG:?}: the peeked disk read \
+                     likely ran on the runtime's async thread and wedged it \
+                     parked, instead of running on the blocking pool (see #1891)"
+                )
+            },
+            move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+
+                rt.block_on(async {
+                    let (began_tx, mut began_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+                    let tmp = TempDir::new().unwrap();
+                    let clock = Arc::new(ParkOnFirstArmedCall::new(
+                        move || began_tx.send(()).unwrap(),
+                        release_rx,
+                    ));
+                    let disk = DiskCache::new_with_clock(
+                        tmp.path().to_path_buf(),
+                        generous_limits(),
+                        clock.clone(),
+                    );
+
+                    // Disk-resident, RAM-empty: the state a peek must fall through
+                    // RAM into disk to serve. Inserted before arming, so the stamp
+                    // this setup write takes is not the call that parks.
+                    let disk_key = test_key(1, 4);
+                    disk.insert(disk_key, b"aaaa");
+
+                    let ram: Cache<&'static str> = Cache::new(generous_limits());
+                    let tiered = Arc::new(TieredCache::new(ram, disk));
+
+                    // The concurrent probe's key, resident in RAM only: it is served
+                    // without consulting disk at all, so its completion says the
+                    // async thread is free rather than that a second disk read got
+                    // through.
+                    let probe_key = test_key(2, 4);
+                    tiered.ram.insert(probe_key, Bytes::from_static(b"bbbb"));
+
+                    clock.arm();
+
+                    let tiered_reader = tiered.clone();
+                    let reader =
+                        tokio::spawn(async move { tiered_reader.get_off_worker(disk_key).await });
+
+                    // Awaiting (not blocking on) the announcement is what lets the
+                    // reader task be polled on this single-threaded runtime, and it
+                    // resolves only once the disk read has actually begun.
+                    began_rx.recv().await.unwrap();
+
+                    let served = tiered.get_off_worker(probe_key).await;
+                    assert_eq!(
+                        served,
+                        Some(Bytes::from_static(b"bbbb")),
+                        "a RAM-resident peek must complete while a disk read is parked"
+                    );
+
+                    // The peek above completed only because the parked disk read is
+                    // not holding this thread. Releasing it here is the
+                    // deterministic stand-in for "the wait ends": the reader can
+                    // only observe the assertion above as already made.
+                    release_tx.send(()).unwrap();
+
+                    let read = reader.await.unwrap();
+                    assert_eq!(
+                        read,
+                        Some(Bytes::from_static(b"aaaa")),
+                        "the parked read still serves the disk-resident bytes"
+                    );
+                });
+            },
+        );
+    }
+
+    /// #1891: the peek-then-defer ADMISSION path runs its disk write on the
+    /// blocking pool, not on the runtime worker. The companion to
+    /// `peeked_get_runs_the_disk_read_off_the_worker` above, with the same
+    /// ordering argument and the same clock: here the parked call is
+    /// `DiskCache::insert`'s `written_at_ns` stamp, reached through
+    /// [`TieredCache::insert_off_worker`] -- what `ReadCache::insert`, and so
+    /// `BlockRangeFetcher`'s per-block admission, calls on the tiered tier.
+    ///
+    /// FLIP (demonstrate failing): in [`TieredCache::insert_off_worker`],
+    /// replace the `spawn_blocking` dispatch with the direct
+    /// `self.disk.insert(key, &value)` call `insert` makes. The admitting task's
+    /// first poll then parks inside the disk write and never returns, the
+    /// concurrent peek below is never reached, and the watchdog fires.
+    #[test]
+    fn peeked_insert_runs_the_disk_write_off_the_worker() {
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(0);
+
+        run_with_watchdog(
+            OFF_WORKER_WATCHDOG,
+            || {
+                format!(
+                    "test hung for {OFF_WORKER_WATCHDOG:?}: the peeked disk write \
+                     likely ran on the runtime's async thread and wedged it \
+                     parked, instead of running on the blocking pool (see #1891)"
+                )
+            },
+            move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+
+                rt.block_on(async {
+                    let (began_tx, mut began_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+                    let tmp = TempDir::new().unwrap();
+                    let clock = Arc::new(ParkOnFirstArmedCall::new(
+                        move || began_tx.send(()).unwrap(),
+                        release_rx,
+                    ));
+                    let disk = DiskCache::new_with_clock(
+                        tmp.path().to_path_buf(),
+                        generous_limits(),
+                        clock.clone(),
+                    );
+                    let ram: Cache<&'static str> = Cache::new(generous_limits());
+                    let tiered = Arc::new(TieredCache::new(ram, disk));
+
+                    let probe_key = test_key(2, 4);
+                    tiered.ram.insert(probe_key, Bytes::from_static(b"bbbb"));
+
+                    clock.arm();
+
+                    let admit_key = test_key(1, 4);
+                    let tiered_admit = tiered.clone();
+                    let admitter = tokio::spawn(async move {
+                        tiered_admit
+                            .insert_off_worker(admit_key, Bytes::from_static(b"aaaa"))
+                            .await;
+                    });
+
+                    began_rx.recv().await.unwrap();
+
+                    let served = tiered.get_off_worker(probe_key).await;
+                    assert_eq!(
+                        served,
+                        Some(Bytes::from_static(b"bbbb")),
+                        "a RAM-resident peek must complete while a disk write is parked"
+                    );
+
+                    release_tx.send(()).unwrap();
+                    admitter.await.unwrap();
+
+                    assert_eq!(
+                        tiered.disk.get(&admit_key).as_deref(),
+                        Some(b"aaaa".as_slice()),
+                        "the released write still admits the bytes to the disk tier"
+                    );
+                });
+            },
+        );
+    }
+}

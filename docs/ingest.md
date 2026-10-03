@@ -1,0 +1,1757 @@
+# Ingest Pipeline Design
+
+Implementer contract for `ravel-ingest` and the ingest side of
+`ravel-server`. See ADR-0001/0002 and docs/consistency-model.md for the
+semantics this design must deliver.
+
+## Structure
+
+```
+gateway handler (axum / tonic)
+  -> auth + tenant resolve + admission limits (ravel-otlp::limits)
+  -> normalize (ravel-otlp) -> Vec<NormalizedPoint> + rejects
+  -> IngestRouter::write(tenant, points, mode) -> WriteReceipt
+```
+
+Remote Write (`POST /api/v1/write`, ADR-0015) is a second gateway handler
+in front of the same router, decode/normalize swapped for the RW-specific
+crate:
+
+```
+POST /api/v1/write (axum)
+  -> auth + tenant resolve (shared TenantResolver)
+  -> negotiate RW1 vs RW2 (Content-Type, then X-Prometheus-Remote-Write-Version; else 415)
+  -> snappy-decompress (capped) + protobuf decode (ravel-remote-write) -> ResolvedRequest
+  -> normalize_resolved (ravel-remote-write) -> Vec<NormalizedPoint> + rejects
+  -> IngestRouter::write(tenant, points, mode=Strict) -> WriteReceipt
+```
+
+This surface always passes `mode=Strict`: it never reads
+`x-ravel-ingest-mode`, since a Remote Write sender treats any 2xx as
+durable and drops its WAL entry on that basis. A commit token still comes
+back in `x-ravel-commit-token`; RW2 responses additionally carry
+`X-Prometheus-Remote-Write-Samples-Written` (and the histogram- and
+exemplar-written counterparts, currently always 0). Malformed input is
+400; shard backpressure and retryable store failures are mapped to a
+retryable 5xx with `Retry-After`.
+
+IngestRouter owns `shard_count` shard handles. It groups points by
+`shard_for(series_id, shard_count)` and sends one message per shard:
+
+```
+ShardMsg::Write { tenant, points: Vec<NormalizedPoint>, ack: Option<oneshot::Sender<Result<CommitToken, WriteError>>> }
+```
+
+Channel: `tokio::sync::mpsc` bounded (default 256 messages per shard).
+`send` awaiting on a full channel IS a backpressure mechanism; the gateway
+holds the request open while it awaits. A stalled flush no longer fills this
+channel, though: in all three pipelines the actor never parks on the flush
+permit (ADR-1642, see "Shard actor"), so the channel fills only when the actor
+is busy in work it does itself. That is merge and pin, plus the drains that
+have to await in-flight flushes before they can answer: an explicit flush-all,
+shutdown, and channel close. Backpressure from a shard wedged on a throttled
+key prefix instead propagates through the ADR-0069 byte budget, which sheds at
+its ceiling.
+
+What actually bounds gateway memory is a process-wide in-flight
+ingest-request ceiling, `--max-inflight-ingest-requests`
+(default 1024, 0 disables it). One `tokio::sync::Semaphore`, shared across
+every OTLP metrics/logs/traces and Remote Write handler, on both the public
+and mTLS listeners and both the HTTP and gRPC transports. A request that does
+not get a permit is shed immediately, never queued: HTTP 429 with
+`Retry-After`, gRPC `RESOURCE_EXHAUSTED`. Query, health, and `/metrics` are
+not covered.
+
+For OTLP metrics, logs and traces on both transports and for Remote Write,
+the permit is taken from the request head, before the request body is read or
+decoded, and the tenant credential is checked right after it in the same
+place: on the HTTP surfaces by a middleware layer that runs ahead of the body
+extractor, and on the gRPC OTLP services by a tower layer on the listener that
+runs before tonic reads a body frame. So a shed request costs this process the
+bytes of one request head, an unauthenticated caller cannot make it buffer a
+body or inflate a compressed one, and the ceiling bounds concurrent decode
+rather than following it. A refusal keeps its status and message:
+`RESOURCE_EXHAUSTED` for a shed, and `UNAUTHENTICATED` with "invalid or
+missing tenant credentials" for bad credentials on gRPC.
+
+Because the permit is taken before the body arrives, the ceiling counts
+concurrent uploads plus concurrent decodes and writes: a request holds its
+slot while its body is still being received. That wait is bounded by
+`INGEST_BODY_READ_TIMEOUT`, 30 seconds from admission (a fixed constant in
+`ingest_admission.rs`, not a flag). A body that has not fully arrived by then
+is refused with HTTP 503 and `Retry-After` (a status Prometheus remote write
+and the OTLP/HTTP exporter both retry), or gRPC `DEADLINE_EXCEEDED` for a
+unary OTLP export,
+the handler never runs, and the slot returns to the ceiling, so a client that
+sends request heads and trickles the bodies can hold a slot for at most 30
+seconds each. That caps one hold, not occupancy: a credentialed client that
+reopens each slot as it is refused can keep the ceiling full at a trickle. 30 seconds is Prometheus' default `remote_timeout`, the most
+generous default deadline among the senders Ravel ingests from, so a sender
+inside its own deadline is not cut off; a 16 MiB body fits in it at about
+4.5 Mbit/s. The OTAP stream is not bounded this way: it holds no permit while
+it waits for a frame.
+
+The OTAP `ArrowMetricsService` stream differs. The same tower layer checks its
+tenant credential on the stream's request head, before any frame is read, but
+takes no permit there: OTAP takes one permit per `BatchArrowRecords`, after
+tonic has read and decoded that batch's protobuf frame (up to the 16 MiB
+message cap) and before its Arrow payloads are decompressed or decoded. An
+authenticated OTAP client over the ceiling therefore still costs one decoded
+frame per shed batch, which is answered with a `RESOURCE_EXHAUSTED` batch
+status and ends the stream.
+
+No HTTP/2 stream cap is derived from this ceiling:
+`SETTINGS_MAX_CONCURRENT_STREAMS` applies to a whole connection, and the gRPC
+listener also serves Flight SQL and fragment fetches, which keep their
+previous stream limits.
+
+Worst-case memory bound at the default: each in-flight request holds at most
+one decoded request body. The largest such body on any covered route is not
+Remote Write's 64 MiB post-decompression cap (`MAX_DECOMPRESSED_PAYLOAD_BYTES`)
+but the resolved label bytes the RW2 decoder retains after expanding symbol
+references, bounded at `RESOLVED_LABEL_BUDGET_MULTIPLIER` (16) times that cap,
+so as much as 1 GiB per request (see "Worst-case resident memory" below for the
+resolve expansion); OTLP's per-request body is smaller
+(`MAX_DECODED_MESSAGE_BYTES`/`MAX_REQUEST_BODY_BYTES`, 16 MiB). So the
+process-wide worst case is on the order of 1024 * 1 GiB = 1 TiB if every
+in-flight slot happens to be a max-size Remote Write RW2 request, or
+1024 * 16 MiB = 16 GiB if all are OTLP. This is a coarse ceiling, not a
+target: it bounds the worst case the operator is exposed to, not typical
+usage, which is why the default is sized for concurrency headroom rather than
+to fit a specific memory
+budget. Operators tune `--max-inflight-ingest-requests` down to bring the
+worst case in line with available memory.
+
+### Generation live switch (ADR-0052)
+
+`shard_count` is no longer fixed for a router's whole life: it is
+generation-versioned per (tenant, signal) in the provisioning record
+(`crates/ravel-catalog/src/provisioning.rs`). Each router holds a
+`GenerationSwitch` that keeps one shard-actor set per distinct active
+`shard_count` and routes a write with the count of the latest generation whose
+`activation_hour` is at or before the write's wall-clock hour
+(`ravel_catalog::active_shard_count`). A reshard's activation spawns the new
+generation's set and routes subsequent writes to it while the old set keeps
+draining and flushing under its original shard indices; no data is moved or
+re-keyed. A router routes on its cached generation view while it is younger than
+the refresh interval `C` (default 60s); once older, it re-reads the provisioning
+record before routing and fails the flush closed (typed error, the
+`ravel_ingest_stale_provisioning_flushes_total` counter) if that re-read cannot
+complete, so it never routes on a stale view. Operators append a generation with
+`ravel-cli provision reshard`; the record enforces the append-only,
+future-activation mutation model. See ADR-0052 for the full design.
+
+#### Bounded grace window on a stuck re-read
+
+Fail-closed staleness has an availability failure mode: if the store is slow
+or unreachable for longer than `C`, every re-read attempt fails and the router
+fails every subsequent flush closed for as long as that lasts -- under
+sustained store latency, a total ingest outage rather than a degraded one.
+`GenerationSwitch::try_grace_extend` bounds that cost. When a re-read cannot
+complete, the router does not immediately fail the flush; it asks the switch
+whether continuing to route on the last-known-good cached view is still
+provably correct. Continue-on-stale is safe only when the cached generation's
+validity horizon has not been crossed AND no pending generation change is
+knowable: concretely, `hour_of(now_ns) < hour_of(view.refreshed_at_ns) +
+min_lead_hours(C)`, where `min_lead_hours(C) = ceil(C) + 1` reuses the ADR's
+own reshard lead-time floor in reverse -- a generation appended after the
+router's last successful refresh cannot activate before that horizon, so a
+cached view is provably still exactly what a fresh read would return for any
+hour strictly before it. Once the horizon is crossed, an unseen append becomes
+possible and the switch returns no set, so the flush fails closed exactly as
+it did before this fallback existed: the grace window degrades cost under
+store latency, it never converts a genuine shard-count change into silent
+wrong-routing. A router routing through this window increments
+`ravel_ingest_grace_extended_stale_flushes_total`, distinct from
+`ravel_ingest_stale_provisioning_flushes_total` (which counts a flush that
+still failed closed), so sustained store degradation is visible as "degraded
+but available" rather than indistinguishable from an outage.
+
+#### Decrease and the straggler slack window `S`
+
+On a decrease (say 8 shards down to 4), a write routed under the retiring,
+larger generation lands in a shard index the successor's range does not cover
+(e.g. shard 6). Such a straggler stays findable: a flush pins its ingest-hour
+bucket at flush-open, but its records were routed up to `max_flush_delay`
+earlier and the flush lives at most `max_flush_lifetime`, plus inter-writer
+clock skew, so a write routed just before the activation can land in an
+ingest-hour bucket just after it. The read side keeps the retiring generation's
+count in the scan set for `S = ceil(max_flush_delay + max_flush_lifetime + max
+clock skew)` hours past the successor's activation
+(`ravel_catalog::DEFAULT_SCAN_SLACK_HOURS`, `S = 3` with today's defaults:
+`ravel_catalog::FLUSH_BOUND_SLACK_HOURS` = 2 from flush timing plus
+`ravel_catalog::TOLERATED_CLOCK_SKEW_HOURS` = 1 of tolerated inter-writer clock
+skew), so a straggler that lands within `S` hours of the activation is
+still scanned and returned, for any writer whose clock skew stays within
+`TOLERATED_CLOCK_SKEW_HOURS`. A writer skewed beyond that bound has no
+read-side fix -- no finite slack covers unbounded skew -- and is a distinct,
+open hazard: routing itself has no local signal to detect its own clock's
+disagreement with the fleet's shared notion of "now", so it cannot clamp or
+reject on skew it cannot observe. On an increase no slack is needed: the old,
+smaller range is a subset of the new one.
+
+The queued-flush cap adds a term `S` does not include. A shard at
+`max_queued_flushes` refuses its size and age triggers and leaves the rows
+buffered, while the ingest-hour bucket is pinned from the clock reading taken
+when the flush finally opens, so a deferred flush's records land in a later
+ingest hour than their routing by the length of the deferral as well. One
+deferral round waits for a queued flush to leave the shard's `JoinSet`, which
+under a stalled store takes up to `max_flush_lifetime`, and a deferral can take
+any number of rounds. Left unbounded, a straggler deferred at the cap during a
+shard-count decrease could land in an ingest hour the retiring generation's
+scan set no longer covers.
+
+The flush deferral cap bounds it for every acknowledged strict-mode write
+(ADR-1642 deferral cap amendment). `IngestConfig::flush_deferral_cap_ns` is
+`S`'s flush term less `max_flush_lifetime` less
+`IngestConfig::flush_trigger_age_bound_ns`, the largest age any buffer reaches
+before its flush trigger fires leaving out the sub-floor hold: the largest of
+`max_flush_delay`, `max_flush_delay_idle` and (when adaptive delay is on) the
+adaptive corridor's widest ceiling, `strict_visibility_budget_ns` less one
+`put_retry_base_delay`, plus one `flush_tick`:
+`7200s - 3600s - (40s + 0.2s) = 3559.8s` at the defaults, whatever
+`idle_flush_byte_floor` holds, since the sub-floor hold is not a term. For a
+buffered row outside that hold the cap bounds when the refusal starts: before
+the row could open its flush too late for `S`. Buffered rows held under a
+non-zero `idle_flush_byte_floor`, and rows of a strict write that already
+timed out (`AckTimeout`), are not bounded by the cap. Each tenant buffer
+records when its trigger was first refused, and each shard publishes its oldest such deferral to the router. A strict
+waiter on a buffer whose deferral has reached the cap is answered with the
+outcome-unknown `Abandoned` (503) instead of an ack, and its rows are still
+written by the flush that opens past the cap. While the shard's oldest
+deferral is at the cap the router refuses every write routed to it before enqueue, in both write modes, with the
+retryable `DeferralCapReached` (429 / `RESOURCE_EXHAUSTED`, counted on
+`ravel_ingest_deferral_cap_refused_total`), and the shard refuses a strict
+append that was enqueued just before. It accepts again once its deferred
+flushes have opened. A shard whose actor has died is checked before the cap,
+so it answers `ShardUnavailable` (and a metrics shard is respawned) rather
+than refusing at the cap, and each actor clears its deferral start when it
+exits. Deferred buffers are always due and retry oldest deferral first.
+`ravel_ingest::shard::tests::a_deferred_flush_is_never_acked_past_the_flush_bound_slack`
+holds the bound on a live shard actor. What the cap does not bound is a
+buffered-mode row acknowledged before its shard reached the cap: that buffer
+still waits for a queue slot for as long as the stall lasts.
+
+Those rows, the sub-floor-held ones and the rows of a timed-out strict write
+stay visible anyway, because the writer keeps every flush inside the scan set
+of the hour it pins (ADR-1642 scan-set amendment). At flush open, after the
+queued-flush refusal and the flush-clock checks and before a `seq` is taken,
+each shard actor (metrics, logs, spans) asks its router's `GenerationSwitch`
+whether its index is below `ravel_catalog::scan_count(generations, h,
+DEFAULT_SCAN_SLACK_HOURS)` for the hour `h` it is about to pin, on the
+tenant's cached generation history. That view is trusted for `h` only before
+`hour(refreshed_at) + ceil(C) + 1`, the grace-window horizon routing uses.
+
+- Inside the scan set, the flush writes in place, however long it was
+  deferred.
+- Outside it, nothing is written under that index. The actor routes the
+  buffer's rows with the pipeline's own routing function under the count of
+  the tenant's current generation and sends each target shard one hand-back
+  message, after checking that every target's actor is live (a dead or closed
+  target keeps the whole buffer where it is). A target whose mailbox closes
+  between that check and the send returns its message, and its rows and
+  charges go back into the source buffer for the next flush attempt to retry;
+  the strict waiters were already answered, so nothing is acknowledged twice.
+  The target merges the rows
+  without admission or the deferral-cap refusal, keeping their original
+  arrival times, and flushes them on its own triggers. Each target carries a
+  clone of every ADR-0069 charge the buffer held, so the bytes stay charged
+  once until the last of those flushes ends. A strict waiter on the buffer is
+  answered with the outcome-unknown `Abandoned` (503). The current generation
+  is in the scan set of every hour its shards pin, so rows are handed back
+  again only if another decrease activates first.
+- With no view, or one past its horizon, the flush does not open and the
+  buffer stays as it was. The episode counts once per buffer on
+  `ravel_ingest_stale_provisioning_flushes_total`, however many triggers
+  retry it, and the switch starts one background re-read of the tenant's
+  provisioning record; the next trigger retries on the refreshed view. A
+  drain (`flush_all`, `FlushNow`, shutdown, channel close) does not leave it
+  to the next trigger: it waits for that re-read, joining one already in
+  flight, for at most `max_flush_lifetime`, and then applies the check, so one
+  drain flushes every buffer the re-read confirms. Only a re-read that fails
+  keeps the buffer.
+
+Each pipeline counts hand-backs as `rerouted_flushes`, exported as
+`ravel_ingest_rerouted_flushes_total` by signal, and the first hand-back of an
+episode on a shard logs once at WARN. A hand-back that finds a target not
+live, or whose send fails, counts once per buffer on
+`ravel_ingest_hand_back_failures_total` and logs once (WARN for metrics, whose
+dead shard the next write respawns; ERROR for logs and spans, whose dead shard
+is condemned and whose rows then wait for the teardown drain). `flush_all`
+repeats while a pass handed rows back, and `shutdown` drains shard sets
+largest first, listing them again after each one because a hand-back can
+construct the current generation's set during the drain, so handed-back rows
+reach a set that has not drained yet. A shutdown or channel-close drain whose
+own re-read failed writes the rows in place on its teardown bypass passes
+rather than drop them, with a WARN. One whose target is not live writes rows
+known to be outside the scan set: that write logs at ERROR with the tenant,
+shard and hour and counts on `ravel_ingest_teardown_unscanned_writes_total`.
+`crates/ravel-ingest/tests/scan_set_handback.rs` holds this for all three
+pipelines.
+
+Neither obvious fix is available, and the reason is worth stating so it is not
+re-tried. Raising `FLUSH_BOUND_SLACK_HOURS` does not work: it is a frozen
+read-side contract, and no fixed value bounds an unbounded number of rounds.
+Pinning the ingest-hour bucket *before* the cap check and carrying it across
+the deferral does not work either, and is the worse of the two, because it
+moves the same overrun onto the other side of the flush. The catalog seals an
+ingest hour `H` once `max_flush_lifetime + clock_skew_allowance +
+fold_safety_margin` have passed since `H` ended (4800s at the shipped catalog
+defaults). That margin is the budget for the span between a flush pinning `H`
+and its commit record landing, and it is sized for one flush lifetime precisely
+because the pin is taken when the flush opens. A carried pin spends the
+deferral out of it instead: a trigger firing at the end of `H` leaves the whole
+4800s and no more, while one deferral round costs up to `max_flush_lifetime`
+(3600s) and the flush it then opens gets its own 3600s before abandonment, so
+7200s against 4800s with a single round. The two outcomes are not comparable in
+severity. A record past `S` is invisible to the retiring generation of a
+shard-count decrease, for the width of that window; a record in a sealed hour
+is never read again at all, because resolution starts its listing at
+`watermark_hour + 1` and the folded snapshot that represents `H` from then on
+was written without it, and the fold watermark only moves forward. The
+seal-divergence check classifies it `missing`, and that check detects and
+reports, never repairs.
+`ravel_ingest::shard::tests::carrying_a_pre_deferral_pin_would_write_into_a_sealed_hour`
+holds that arithmetic against the catalog's own margin constants, which is why
+the deferral is bounded instead.
+
+Operationally: do **not** decrease `shard_count` and immediately assume every
+prior write is now under the new, narrower range. For `S` hours past the
+activation, queries still fan out over the wider retiring range for the affected
+hours (a bounded number of extra, mostly-empty LISTs). A commit token minted
+before the decrease resolves regardless of `S` -- it names its exact object -- so
+read-your-write never depends on the window. Reshard with:
+
+```
+ravel-cli provision reshard --tenant <t> --signal <s> --shard-count <n> [--lead-hours <L>]
+```
+
+`--lead-hours L` places the activation `L` hours out and must satisfy `L >=
+ceil(C) + 1` (the CLI refuses less), so every live writer refreshes its record
+view within `C` and observes the new generation before it activates -- or
+fail-stops. `C` bounds when writers pick up the change; `S` bounds how long
+readers keep scanning the old range after it. See docs/consistency-model.md,
+"Online resharding", for the reader/writer transition contract.
+
+## Shard actor
+
+Single task per shard. No locks on the hot path; all state actor-local:
+
+- `buf: HashMap<SeriesId, SeriesBuf { labels: LabelSet, samples: Vec<Sample> }>`
+- `exemplars: Vec<IngestExemplar>` in arrival order, one per exemplar the wire
+  admitted for a series routed to this shard (ADR-0047)
+- `est_bytes`: running estimate of what the BUFFER holds (samples * 16 + label
+  bytes on first sight, plus the `IngestExemplar` struct width and its
+  attribute bytes per buffered exemplar). "Label bytes" means what the buffer
+  holds, not what the object will hold: each label costs `size_of::<Label>()`
+  (two `String` headers, 48 bytes) plus its name and value bytes. Leaving the
+  header term out understates a ten-label series by roughly 480 bytes against
+  the 200 it counts, so the process-wide memory budget below would fire late
+  on exactly the label-heavy workloads it exists to bound.
+- `flush_est_bytes`: running estimate of what the OBJECT will hold, the figure
+  the size trigger reads. Same points, different model: label and attribute
+  text once per series, no struct headers, 16 bytes per scalar sample, and a
+  per-series and per-record fixed term for the columns a writer always
+  emits. The two estimates are not interchangeable. On a ten-label series the
+  buffered figure is roughly 750 bytes per sample against the object figure's
+  16 to 210, so a size trigger reading `est_bytes` fires at a few percent of
+  `target_bytes` and writes objects that multiply the request cost of every
+  stored terabyte. The same split applies on all three signals
+  (`est_record_bytes`/`est_record_object_bytes` for logs,
+  `est_span_bytes`/`est_span_object_bytes` for spans).
+- `oldest_ns`: ingest-arrival time of the oldest buffered point
+- `waiters: Vec<oneshot::Sender<...>>` for strict-mode acks in this flush window
+- writer identity: (writer_id uuid, epoch, next_seq) owned by the process
+
+Loop over `select!`:
+- message received: merge points, push `ack` to waiters (strict) or reply
+  immediately (buffered), flush if `flush_est_bytes >= target_bytes` (default
+  8 MiB), which is an estimate of the object this flush would write, not of
+  the memory the buffer holds. A memory backstop fires the same flush when
+  `est_bytes` reaches `max(target_bytes, min(64 MiB, ceiling / 8))`, where
+  `ceiling` is the configured `--max-ingest-buffer-bytes`, so a tenant whose
+  struct headers dwarf its payload still flushes before one buffer can hold an
+  unbounded amount of resident memory; the process-wide ceiling below is the
+  admission-side bound and sheds rather than flushes, so it cannot stand in
+  for this one. The backstop is a share of the ceiling rather than a constant
+  because a constant calibrated against the default ceiling inverts on a
+  replica sized below it: one buffer would fill past the whole budget and shed
+  every other tenant's write, and shedding is what the backstop exists to
+  avoid. `--max-ingest-buffer-bytes 0` (unlimited) has no ceiling to take a
+  share of, so the 64 MiB cap applies alone. A ceiling under `8 *
+  target_bytes` leaves `target_bytes` as the backstop, because a backstop
+  under the target would become the effective size trigger. A flush the
+  backstop fires is the one trigger the queued-flush cap never refuses
+  ("Pipelined flushes (ADR-0067)" below): the backstop is the
+  only bound on one buffer's resident memory, so it spawns even at the cap.
+  Before merging, each point's series_id is checked against the
+  canonical label set that id already claims in the buffer; a mismatch
+  (hash collision) rejects the point with a typed error and increments
+  the series_id_collisions counter instead of silently merging
+  (ADR-0005 fail-loud rule).
+- flush tick (interval default 200 ms): flush if `oldest_ns` older than an
+  age threshold, and buffer non-empty. The threshold is `max_flush_delay`
+  (default 2 s) when the buffer has a strict-mode waiter or already holds
+  at least `min_flush_bytes` (default 256 KiB) of object bytes, on the same
+  `flush_est_bytes` estimate the size trigger reads; otherwise the buffer is idle
+  and the threshold is `max_flush_delay_idle` (default 40 s) instead
+  (ADR-0051 section 7). Strict-mode ack latency is unaffected, since a
+  strict write always leaves a waiter in the buffer for its whole flush
+  window; only a low-volume buffered-mode tenant's PUT cadence changes.
+  ADR-0076 decision 4 sized this tier against a buffer fill rate stated in
+  buffered-memory units, so its worked example reaches `min_flush_bytes`
+  sooner than a buffer does today: the knob is unchanged, the unit it counts
+  is not. Reasoning about how long a tenant takes to reach either threshold
+  starts from the object-bytes model above.
+  A third tier sits under the idle one and is off unless an operator asks for
+  it (ADR-1737). With `--idle-flush-byte-floor` set to a non-zero byte count,
+  an idle buffer holding fewer than that many object bytes waits for the
+  sub-floor hold, `max_flush_lifetime` less one `flush_tick`, instead of
+  `max_flush_delay_idle`, and the flush that opens is recorded as
+  `FlushTrigger::AgeFloor` and counted in `flushes_by_age_floor` rather than
+  in `flushes_by_age`. The tick is held back so that the age check's own tick
+  of lateness fits inside the hour: the worst buffer age when the flush opens
+  is then exactly `max_flush_lifetime`, which is the figure
+  `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` is derived from. The floor is read
+  against `flush_est_bytes`, the same object-bytes estimate `min_flush_bytes`
+  uses, and a buffer crosses tiers upward as rows arrive, so a trickle that
+  reaches the floor flushes on the idle clock measured from its oldest row
+  rather than on the hold. A buffer that crosses the floor later than
+  `max_flush_delay_idle` after its oldest row is already past that clock, so
+  it flushes on the next tick once it crosses. The default is 0, which
+  disables the tier and leaves every buffer on the two clocks above. A non-zero floor widens the buffered-mode loss
+  window for a buffer below it from `max_flush_delay_idle` to
+  `max_flush_lifetime` (docs/consistency-model.md), and the floor must be
+  below `min_flush_bytes`: `IngestConfig::validate` refuses anything else and
+  `ravel-server` refuses to start on it.
+- channel closed (router dropped): flush the remaining buffer before
+  exiting rather than discarding it; points that still fail to flush are
+  counted, never silently lost. The drain (`flush_all`, shared with
+  `FlushNow` and `Shutdown`) retries over fresh tenant snapshots until the
+  map empties, bounded by a small pass cap: a clock-refused flush re-buffers
+  its tenant (ADR-1307), so a single snapshot would strand it on this
+  graceful path. How residue left after the cap is reported depends on the
+  caller: on `Shutdown` and channel close the actor stops next, so nothing can
+  retry it and it is logged at ERROR and counted
+  (`flush_all_residue_tenants`, a durability defect). On `FlushNow` the actor
+  keeps running and the residue stays buffered with its arrival timestamp, so
+  the age tick retries it; that case is logged at WARN and not counted.
+  A drain flushes every buffer regardless of size or age, so the sub-floor
+  hold does not change how many PUTs a drain writes: each buffer with data is
+  one flush whether it is 40 seconds or an hour old. What it changes is what
+  the residue holds when the drain runs out of its bound. With
+  `--idle-flush-byte-floor` set, a near-empty tenant's residual buffer can
+  carry up to an hour of its rows instead of 40 seconds' worth, and on
+  `Shutdown` those rows were already acknowledged, so
+  `flush_all_residue_tenants` is counting a proportionally larger loss.
+
+Shard-actor death is observable and recoverable. A shard
+actor dies when its flush task panics (a split-brain commit is one such
+case): the task ends, its channel closes, and the next write to that
+shard sees the closed channel or a failed ack receiver. The router
+counts that death a single time, using the incarnation the write
+captured, so concurrent writers racing on the same dead channel do not
+double-count it, and:
+
+1. It increments `shard_deaths` and respawns the actor with a fresh
+   `writer_id`, up to `MAX_SHARD_RESPAWNS` (3) respawns per shard. The
+   respawn restores write capacity for the shard; it does NOT restore the
+   dead actor's buffered points, which are lost (documented at-least-once:
+   nothing buffered was acknowledged). The write that observed the death
+   still returns the typed shard-unavailable error; the client retries and
+   the retry lands on the fresh actor. The replacement continues the same
+   monotonic flush-open floor (ADR-1307): the floor belongs to the shard, not
+   to one actor, so a respawn cannot stamp a `created_unix_ns` behind what
+   the dead incarnation already committed for that shard.
+2. The budget is spent within a window, not over the process lifetime. A
+   shard that runs a whole `max_flush_lifetime` (1 hour by default) without
+   dying has its spent respawns decay to zero, so three unrelated transients
+   hours apart never accumulate into a condemnation while a crash loop still
+   exhausts the budget in seconds. The decay does not un-condemn a shard.
+3. Once a shard has spent its respawn budget, the next death condemns it:
+   the router stops respawning, increments `shards_condemned` once for that
+   shard, and `IngestRouter::ready()` turns false. `services/ravel-server`
+   ANDs that into `/readyz`, so a condemned shard makes the process report
+   not-ready. That sheds traffic (Kubernetes removes the pod from its Service
+   endpoints) but does not restart or reschedule it: `/healthz` is
+   deliberately independent of ingest health, so an operator has to roll the
+   pod. A condemned shard cannot recover in-process. Surviving shards keep
+   serving until then.
+
+Surviving shards keep working throughout.
+
+Operationally (see docs/guides/operations/troubleshooting.md,
+"Readiness, storage and authentication"): on this pipeline `shard_deaths`
+counts every death including respawned incarnations, so it can exceed
+`shard_count` (the log and span pipelines never respawn and count once
+per shard of each live shard-actor set, see their sections below); a low
+steady rate is transient recovery, a sustained climb on one shard is a poison-pill
+input. `shards_condemned` counts each condemned shard at most once per live
+shard-actor set (one set per distinct active `shard_count`), so under
+resharding it is bounded by the sum of those sets' shard counts rather than
+`shard_count`; any nonzero value means the process is
+not-ready and will stay that way until someone rolls it, so alert on
+`shards_condemned > 0`.
+
+Flush (still inside the actor; ingest-ordering per shard is the point):
+1. Build RSEG via `ravel-segment::SegmentWriter` (one segment per tenant in
+   the buffer; actors buffer per tenant already, key the buf map by
+   (tenant, series_id)).
+2. blake3 -> data key -> data PUT (Overwrite) with bounded retries on
+   retryable errors.
+3. Build CommitRecord, `ravel-commit::publish` (CreateIfAbsent + idempotency
+   check) -> CommitToken.
+4. Send token to all waiters; clear buffer; seq += 1.
+5. On permanent failure: error to all waiters (client retries; nothing was
+   acknowledged), drop the buffer (documented at-least-once), count it.
+
+Step 1 also decides which buffered exemplars the object carries (ADR-0047
+decisions 1 and 2). An exemplar whose parent sample is not in this flush is
+dropped first, before the cap, since the object carries no measurement for it
+and the writer treats such a record as an error rather than a silent drop.
+What survives is offered to an `ExemplarCap` built for this flush and dropped
+with it (a shard-lived cap would hold an unbounded per-series map), newest
+-first with a stable sort, because `ExemplarCap::admit` is first-wins and
+never retracts. A flush with nothing admitted emits no EXEMPLARS section at
+all. Both outcomes are counted (`exemplars_written_total`,
+`exemplars_dropped_total`) so the drop stays visible.
+
+The commit record's `ingest_hour_bucket` is derived from the flush-open
+clock reading at step 1, before the segment is built. A non-positive or
+non-representable reading fails the flush the same way a segment-build
+error does (typed `SegmentBuild` error, every waiter acked with it, no
+object written) rather than defaulting to bucket 0 (ADR-0051 section 7):
+a fallback bucket would make the data undiscoverable by hour
+with no trace of the failure.
+
+After that plausibility check, and before the ADR-1307 monotonic floor is
+consulted, the actor compares the raw reading with the object store's
+observed clock, the latest response `Date` the store adapter saw
+(ADR-1685). If the reading lags that observation by more than
+`DEFAULT_CLOCK_SKEW_ALLOWANCE_NS` (five minutes), the flush is refused the
+same way an over-bound clock regression is: every strict waiter gets the
+retryable `Abandoned` (503), the buffer goes back into the tenant map for
+the next trigger, nothing is written, and `clock_lag_refused` counts it. A
+writer that far behind would otherwise stamp an ingest hour the fold,
+running on its own clock, may already have sealed. The check is one-sided:
+the observation is a lower bound on the store's clock, so a reading ahead of
+it is normal and is not checked here. It compares the raw reading, never the
+floor-raised stamp, since the floor can only hide lag. When the store has
+not been observed yet (no response so far, or `MemoryStore`), the flush
+proceeds unchecked and `clock_lag_unchecked` counts it; refusing there
+would deadlock, because the flush is itself a source of responses.
+
+A graceful shutdown is the one place the check is bypassed. Unlike an
+over-bound clock regression, a lag refusal re-anchors nothing, so every pass
+of a drain reads the same lag and refuses again (the ADR-1685 teardown
+amendment carries that argument). On the `Shutdown` and channel-close drains
+there is no later tick, so enforcing it to the pass cap would report the
+buffered rows as residue and lose them, and in buffered mode those rows were
+already acknowledged. Durability wins there: once the bounded enforced passes
+leave a tenant refused, a teardown drain keeps making passes with the lag
+check bypassed while tenants remain, under the same pass cap, publishing with
+the stamp the floor rules give (the raw reading, or the floor itself when it
+absorbs a backwards step within the hold bound) and counting each bypassed
+flush-open attempt as `clock_lag_bypassed_at_shutdown`, logged at WARN with
+the measured lag. Those rows can land in an ingest hour the fold has already
+sealed, so a token-less read sees them only after a HEAD rebuild -- the same
+recoverable outcome the writer had before this check existed, rather than a
+drop. `FlushNow` and every size or age trigger keep refusing, since their
+actor keeps running to retry. All three counters here (`clock_lag_refused`,
+`clock_lag_unchecked`, and `clock_lag_bypassed_at_shutdown`) live on the
+`ravel-ingest` metrics snapshots, and `/metrics` renders them as
+`ravel_ingest_clock_lag_refused_total`,
+`ravel_ingest_clock_lag_unchecked_total`, and
+`ravel_ingest_clock_lag_bypassed_at_shutdown_total` for every signal.
+
+The bypass passes are a bounded loop rather than one pass because the ADR-1307
+floor still applies on them, which is also what decides how many over-bound
+backwards steps teardown residue now takes; the ADR-1685 teardown amendment
+carries that argument. Either way: fix
+the host clock before restarting a writer that is refusing flushes.
+
+### Pipelined flushes (ADR-0067)
+
+The PUTs no longer run inline in the actor. At flush-open the actor pins
+the flush's identity synchronously (seq, waiters, ingest-hour bucket) in
+its own message-processing order, then moves the buffer out and hands
+steps 1-5 above to a spawned task by ownership transfer -- no shared
+mutable state, per ADR-0067 decision 1. The actor returns immediately to
+`select!` and keeps draining its mailbox, merging new points and opening
+further flushes, while any number of earlier flushes are still stuck in
+their PUTs.
+
+Because identity is pinned before the spawned task ever issues a PUT,
+submission order still determines `seq` order even when two flushes'
+PUTs resolve out of order (the slower one first): ack isolation keys off
+pinned identity, not completion order, so a caller's `write()` always
+resolves to its own token regardless of which flush's PUT the store lets
+through first.
+
+`max_inflight_flushes` (`IngestConfig::max_inflight_flushes`) bounds how
+many spawned flush tasks may hold a permit at once on one shard, via a
+per-shard `tokio::sync::Semaphore`. The permit is acquired INSIDE the
+spawned flush task, not on the actor: a flush that stalls in its PUT retry
+loop -- a tenant whose S3 key prefix is being throttled with `503 SlowDown`,
+which S3 applies per prefix -- parks only its own task on the permit. The
+actor never parks on it. It keeps draining its mailbox and firing its age
+tick for every co-resident tenant on the shard for the whole duration of the
+stall.
+
+That makes `max_inflight_flushes` the per-shard flush **isolation** control,
+not only a memory/latency knob. At the default **1** on `ravel-server`, one
+tenant's stalled flush holds the shard's only permit, so every co-resident
+tenant's flush queues behind it until the stall clears or its
+`max_flush_lifetime` abandons it. What queues is a spawned task, not the
+actor: the co-resident tenants' writes are still accepted, their age triggers
+still fire, and each trigger hands its buffer off and spawns another waiting
+flush. So the queue grows with the stall, and every flush in it holds a whole
+flush window and its ADR-0069 byte charge from the moment it left the actor,
+which is what the budget sheds against. Two things bound that queue. The byte
+budget bounds it only when it is configured: under the default `Bounded(512
+MiB)` a sustained stall stops admitting new bytes before the queue grows
+without limit, while under `--max-ingest-buffer-bytes 0` (`Unlimited`)
+`try_charge` never sheds (ADR-1642). `max_queued_flushes`
+(`IngestConfig::max_queued_flushes`, `--max-queued-flushes`, default 8 per
+shard) bounds it under
+either setting: once a shard holds that many spawned-but-unreaped flushes it
+refuses its own size and age triggers rather than spawning another, and the
+refused tenant's rows stay buffered with their `oldest_arrival_ns` unreset, so
+the next tick re-fires the same trigger as soon as a flush has been reaped.
+Nothing is acked and nothing is dropped by a refusal, which is why it is
+available under `Unlimited` where a shed is not (see the ADR-1642 amendment).
+The cost is deadline, not durability: a deferred age trigger misses
+`max_flush_delay` by however long the shard stays at its cap, and
+`flush_trigger_deferred` counts every refusal so that slippage is visible.
+Strict-mode writers behind those
+queued flushes stay unacked for the duration; buffered-mode writers were acked
+at enqueue and their data stays invisible to queries until the flush commits.
+The duration is bounded by the flush deferral cap (see "Generation live
+switch" above): once a shard's oldest deferral reaches it, its waiting strict
+writers are answered `Abandoned` with their rows still buffered, and new
+writes to the shard are refused with `DeferralCapReached` until the deferred
+flushes open, counted on `ravel_ingest_deferral_cap_refused_total` by
+`{mode, signal}`.
+
+One trigger is exempt, and the queue can exceed `max_queued_flushes` because
+of it: a tenant buffer that has crossed its per-(shard, tenant) memory
+backstop (`buffer_memory_backstop_bytes`, described under "Shard actor"
+above) spawns whatever the trigger and whatever the queue depth. That backstop
+is the only bound on one buffer's resident memory, and under `Unlimited`
+nothing sheds behind it, so refusing a crossing would hold the queue at its
+cap and let the buffer grow for as long as the stall lasts: a bounded queue of
+flush tasks traded for an unbounded buffer, which is the worse of the two
+failures. The trade is a bounded buffer for an overshoot on the queue that no
+count bounds: an exempt spawn drains the buffer it fires on, so the tenant
+crosses again only after buffering another backstop's worth, and each adds a
+window rather than replacing one. Under `Bounded` the byte budget still bounds
+the total, because a queued flush stays charged until its PUTs complete and
+admission sheds once the charges reach the ceiling, which stops the refill;
+under `Unlimited` only the length of the stall does. Size the steady state
+from `max_queued_flushes`, and size the overshoot from the byte ceiling rather
+than from a count of buffers.
+`flushes_queued` reading above the cap while `flush_trigger_deferred` stays
+flat is this exemption, not a queue that lost its bound. Both are exported:
+`/metrics` renders them as `ravel_ingest_queued_flushes` (gauge) and
+`ravel_ingest_flush_trigger_deferred_total` (counter), by `{mode, signal}`.
+
+Raising the bound gives healthy tenants a permit to flush on while one prefix
+is throttled, at the cost of more concurrent PUTs and more encode memory in
+flight. This is the lever for cross-tenant flush isolation on a shard;
+raising `--shards` is not (a strict write fans out to every shard its series
+hash to, so a wider shard set only raises the chance a write touches the
+throttled shard), and per-replica ingest affinity is not
+(docs/guides/ingest-affinity.md: within a replica every tenant still hashes
+across all that replica's shards). The two defaults differ because the two
+callers have different memory owners: **1** on `ravel-server`
+(`--max-inflight-flushes`, ADR-0067 decision 2 as superseded by ADR-1642),
+where nothing upstream caps the work a shard is offered; and **4** on
+`ravel-cli load` (`--max-inflight-flushes`, ADR-0807 as amended), where
+`--pipeline-depth` already caps the outstanding batches, so the flush window
+costs no further memory and only decides whether that bounded set of objects
+is written concurrently. `0` is rejected at the CLI edge (`Cli::validate` on
+the server, a typed `LoadError::Setup` on the loader): it would deadlock every
+flush, since a shard could never acquire a permit to run one.
+
+Backpressure at the bound now propagates through the ADR-0069 global byte
+budget rather than by parking the actor and filling the bounded channel: each
+in-flight flush holds its byte charge until it completes, so a shard wedged on
+a throttled prefix drains the budget and admission sheds at the ceiling. That
+path exists only when the budget is configured; with `--max-ingest-buffer-bytes
+0` the ceiling is off, admission never sheds, and a stall is bounded only by
+host memory (ADR-1642).
+Whether the permit is the constraint is observable rather than inferred:
+`flush_permit_wait_ns` in the per-shard skew stats below accrues, in the flush
+task, whenever a task waits for a permit, so a rising value while the actor
+keeps draining means flushes are backed up on the bound.
+
+Out-of-seq publication does not change what the catalog already tolerates: a
+flush's seq is allocated at pin time, not at commit time, so two
+flushes for the same shard can publish their commit records out of seq order.
+Two causes now exist. Under `max_inflight_flushes > 1` overlapped flushes
+publish out of order when the store resolves their PUTs out of order. Since
+ADR-1642 it also happens at `max_inflight_flushes = 1`: the permit is acquired
+inside the spawned tasks, which race to reach the acquire, so the task that
+acquires first publishes first even though its seq may be the later one. The
+on-actor acquire published strictly in seq order at one permit; that ordering
+is gone. Either way this is the same seq-gap tolerance the
+per-(writer,shard) commit protocol already provides (docs/catalog-and-mvcc.md)
+for a writer restart or a retried, abandoned flush: seq is monotonic with gaps
+permitted and completeness is never inferred from it, so a reordered
+publication is a reordering of independently visible commits, not a gap.
+Nothing about resolution or read-your-write changes: a commit token still
+names its exact object directly.
+
+This applies to all three ingest pipelines. The log and span shard
+actors (below) pipeline their flushes on the same terms (ADR-0076
+decision 3): the same `max_inflight_flushes` bound, the same spawned
+flush task, and the same shutdown join. Only the adaptive flush delay
+(decision 3 of ADR-0067, next section) stayed metrics-only.
+
+### Adaptive flush delay (ADR-0067 decision 3)
+
+`adaptive_flush_delay` (`IngestConfig::adaptive_flush_delay`, CLI
+`--adaptive-flush-delay`, default **false**) replaces the fixed
+`max_flush_delay` age threshold, for a buffer with a strict-mode waiter
+or already past `min_flush_bytes`, with a per-(shard, tenant) threshold
+clamped into a corridor `[max_flush_delay, ceiling]`:
+
+- **Floor**: `max_flush_delay` (2 s default), unchanged from today.
+- **Ceiling**: the strict-mode visibility budget (`IngestConfig::strict_visibility_budget_ns`,
+  2.5 s default -- `max_flush_delay` plus `STRICT_VISIBILITY_RESERVE_NS` (500 ms),
+  following `max_flush_delay` -- ADR-0076 decision 4; the same budget
+  docs/consistency-model.md's strict-mode ack contract names) minus two
+  PUT round trips at their observed p99 (data object, then commit
+  record) minus one retry's base backoff as headroom, floored at
+  `max_flush_delay` so the corridor never inverts. The reserve keeps the
+  corridor's width non-zero: a budget set exactly equal to `max_flush_delay`
+  would leave the subtraction nothing to work with, collapsing the ceiling to
+  the floor unconditionally. With no PUT RTT observed yet, the ceiling still
+  collapses to the floor: adapting upward would be a guess the budget cannot
+  back, so a tenant sees the fixed `max_flush_delay` from its very first
+  flush, not just after warm-up. RTT is sampled from both PUTs of every flush
+  (from spawned tasks, concurrently with the actor and with each other), kept
+  as a bounded p99 estimate (last 64 samples) per shard.
+- **Threshold**: the tenant's own observed inter-arrival gap, clamped
+  into `[floor, ceiling]`. A bursty tenant (small gap) clamps up to the
+  floor -- today's behavior, unchanged. A trickle tenant (large gap)
+  clamps down to the ceiling instead of a fixed-delay actor waiting on it
+  indefinitely for a full `target_bytes` batch.
+
+Off by default, which keeps today's fixed-delay behavior so an operator
+opts in deliberately; A/B'd against the fixed corridor in the ingest
+bench. A flush the corridor actually stretched past the floor is counted
+separately from one that used the fixed value or the idle threshold
+(`flushes_by_age_adaptive` vs `flushes_by_age`, "Metrics" below). Strict
+write ack latency for a buffer that already has a waiter is bounded by
+whichever threshold applies the same way it always was; adaptive delay
+changes only where in `[floor, ceiling]` that threshold sits, never
+whether a strict waiter's flush eventually fires. Applies to the metrics
+ingest pipeline only. Unlike `max_inflight_flushes` above, which bounds
+in-flight flushes on all three pipelines, the adaptive delay was
+deliberately not extended to logs and spans: those actors keep the fixed
+`max_flush_delay` / `max_flush_delay_idle` age trigger.
+
+## Log pipeline
+
+Logs run a parallel pipeline, not a mode of the metrics one (ADR-0029):
+
+```
+POST /v1/logs (axum) | logs.v1.LogsService/Export (tonic)
+  -> auth + tenant resolve (the same TenantResolver both metrics surfaces use)
+  -> normalize_logs (ravel-otlp::logs_normalize) -> Vec<NormalizedLogRecord> + rejects
+  -> LogIngestRouter::write(tenant, records, mode) -> LogWriteReceipt
+```
+
+`LogIngestRouter` and `LogShardActor` mirror `IngestRouter`/`ShardActor`
+structurally (one bounded mpsc channel and one actor task per shard, the
+same `IngestConfig` knobs, the same flush triggers, the same pinned
+writer identity, the same commit sequence, and the same pipelined flush:
+ADR-0067 decisions 1 and 2 apply here too, so a flush runs in a spawned
+task bounded by `max_inflight_flushes` and shutdown joins every in-flight
+flush before the actor completes; the permit is acquired inside that task
+under ADR-1642, so this actor does not park on it either) and diverge in
+exactly five places:
+
+- Objects are RLOG, built with `ravel_logseg::RlogWriter`, not RSEG built
+  with `SegmentWriter`. They land under the `l` keyspace
+  (`t/<tenant>/l/l0/...`); commit records under `t/<tenant>/l/c/...`.
+  `keys::data_key` and the commit protocol are already
+  `Signal`-parameterized, so nothing in `ravel-commit` changed for logs.
+- Routing is by log stream, `shard_for_log(stream_id, shard_count)`, with
+  the identical leading-8-bytes-mod-shard_count math `shard_for` uses on a
+  `SeriesId`. Unlike a `SeriesId`, a `LogStreamId` does not itself carry
+  the tenant: routing is tenant-scoped because each shard's buffer is keyed
+  by tenant, not because the id is.
+- There is no series-value-kind concept, so no per-series kind check on
+  merge. A log record's unit of identity is its `stream_id` plus the
+  canonical `stream_attrs` bytes that id was hashed from.
+- The fail-loud identity check does not live in the shard buffer. Where
+  `TenantBuf::merge` checks an incoming point's `series_id` against the
+  label set that id already claims (ADR-0005), `LogTenantBuf::merge` checks
+  nothing: `RlogWriter::finish()` already compares every buffered record's
+  `stream_attrs` for a shared `stream_id` and rejects the whole object with
+  `LogSegError::InconsistentStreamAttrs`. The flush step maps
+  that one variant to `LogWriteError::StreamIdCollision` and counts it in
+  `stream_id_collisions`; every other `LogSegError` becomes
+  `LogWriteError::SegmentBuild`. Duplicating the check in the buffer would
+  be dead code with a second chance to drift.
+- A dead shard actor is never respawned, so it is condemned on its first
+  death. Where the metrics router respawns up to `MAX_SHARD_RESPAWNS` and
+  condemns only on the death that exhausts that budget (the fourth death),
+  `LogIngestRouter` has no respawn path at all: the first shard-actor death
+  increments both `shard_deaths` and `shards_condemned` and turns
+  `LogIngestRouter::ready()` false. `services/ravel-server` ANDs that into
+  `/readyz` exactly as it does for metrics, so the pod is shed from its
+  Service. Surviving shards keep serving; the condemned shard cannot recover
+  in-process, so an operator has to roll the pod.
+
+Commit-record fields the log flush fills differently: `sample_count` is the
+log record count (a record is the RLOG analogue of a sample), `series_count`
+is the number of distinct `stream_id`s in the batch (tracked in the actor,
+since `finish()` does not report it back), and `segment_format_version` is
+`LOG_SEGMENT_FORMAT_VERSION`, RLOG's own trailer version, not
+`SEGMENT_FORMAT_VERSION`.
+
+The log flush writes each object with the tenant's clustering key and bloom
+scope (ADR-2135 decisions 1 and 5). Both come from config record fields 13
+and 14, read by the same single GET that supplies the tenant's indexed fields
+and declared typed columns, and are cached beside them: they refresh when that
+entry passes its 60 s horizon, a failed re-read keeps serving the last values
+read, and idle eviction drops them with the entry. The flush resolves them at
+its pinned `flush_open_ns`, before the `Encode` timing window opens. A tenant
+with no record, or a record without either field, gets no sort descriptor,
+clustering generation 0 and full bloom coverage, which leaves the object's
+bytes as they were before this change. A set key writes a sort descriptor with
+the key's bucket width, key column types taken from the declared typed columns
+the flush stamps statistics from, and the key's generation; a cleared key
+writes no descriptor and the generation it was cleared at. The `undeclared`
+scope leaves exactly those declared typed columns out of bloom coverage.
+
+Those declared typed columns are the config record's own `typed_attr_columns`
+list, not the server-resolved effective list: ingest carries no deployment
+default for typed columns, so a column declared only through the server's
+`--typed-attr-column` flags is invisible to the flush, for the key and for
+the `undeclared` scope alike (the same limit the declared statistics stamps
+already have). The key setter therefore accepts only columns present in the
+record's own list, which keeps a stored key resolvable here by construction;
+a column declared only by server flag stays covered by bloom under
+`undeclared`, which costs pruning precision, never rows.
+
+The layout is unresolved when the key names a column that is not a declared
+typed column, when the key is one the RLOG writer refuses to record (an empty
+or repeated column name, a column count outside 1 to 4, or generation 0), or
+when the stored scope is a value this build does not know. Scope resolution
+never depends on the declared typed columns; it fails only on an unknown
+value. Either failure leaves the whole layout unresolved: the flush still
+writes, with no descriptor, generation 0 and full bloom coverage; the overlay
+logs one warning each time it refreshes that tenant's entry, and each flush
+that resolves the layout to that unkeyed default adds one to the tenant's
+`ingest_clustering_key_unresolved_total` count (counted at resolution, before
+the object is encoded, so a flush that later fails still counts),
+read through `LogIngestMetrics::clustering_key_unresolved_by_tenant`. That
+count is bounded the same way as the per-tenant PUT attribution (ADR-0076
+decision 2): at most `MAX_TRACKED_TENANTS` (1024) tenants carry a count, a
+new tenant past that replaces the one with the smallest count and inherits
+it, and each `TenantCount` carries that inherited part as its `error` bound,
+so the counts still sum to the total. `ravel-server` does not export that
+counter at `/metrics` yet.
+
+`LogIngestMetrics` mirrors `IngestMetrics` counter for counter under two
+renames that follow the unit change: `buffered_records_total` for
+`buffered_points_total`, `stream_id_collisions` for `series_id_collisions`.
+
+Snapshot resolution for logs is wired: `services/ravel-server/src/fold.rs`
+folds `Signal::Logs` alongside metrics, so `catalog/l/HEAD` and its snapshot
+parts are produced the same way they are for metrics, and a catalog-based
+read over log objects works from them. Ingest durability never depended on
+it either way (a commit token resolves to its commit record directly).
+
+## Span pipeline
+
+Spans run a third parallel pipeline on the same terms (ADR-0041):
+
+```
+POST /v1/traces (axum) | trace.v1.TraceService/Export (tonic)
+  -> auth + tenant resolve (the same TenantResolver every ingest surface uses)
+  -> normalize_traces (ravel-otlp::traces_normalize) -> Vec<NormalizedSpan> + rejects
+  -> SpanIngestRouter::write(tenant, spans, mode) -> SpanWriteReceipt
+```
+
+`SpanIngestRouter` and `SpanShardActor` mirror `LogIngestRouter`/
+`LogShardActor` structurally (one bounded mpsc channel and one actor task
+per shard, the same `IngestConfig` knobs, the same flush triggers, the same
+pinned writer identity, the same commit sequence, and the same pipelined
+flush under `max_inflight_flushes` with a shutdown join, with the permit
+acquired inside the flush task under ADR-1642) and diverge in these places:
+
+- Objects are RSPAN, built with `ravel_rspan::RspanWriter`. They land under
+  the `s` keyspace (`t/<tenant>/s/l0/...`); commit records under
+  `t/<tenant>/s/c/...`.
+- Routing is by trace, `shard_for_span(trace_id, shard_count)`, with the
+  identical leading-8-bytes-mod-shard_count math `shard_for` uses on a
+  `SeriesId`. Keying on `trace_id` rather than on a resource-derived
+  identity is ADR-0041 decision 2: it keeps one trace's spans confined to
+  one shard, so trace-by-id assembly is a bounded scan instead of a
+  fan-out across every shard. The tradeoff ADR-0041 accepts is that
+  service-scoped span search is cross-shard.
+  `shard_for_span` currently lives in `crates/ravel-ingest/src/span_router.rs`
+  rather than beside `shard_for`/`shard_for_log` in `ravel-types`, because
+  `ravel-types` was outside the scope of the change that added it. The
+  placement is provisional; the routing rule itself is frozen, since it
+  determines which shard's object keys a trace's spans land under.
+- There is no derived identity, so no identity-collision check anywhere in
+  the path: `trace_id` and `span_id` come from the sender verbatim, unlike
+  a metric's `series_id` or a log's `stream_id`. `SpanWriteError`
+  accordingly has no collision variant and `SpanIngestMetrics` no
+  collision counter.
+- Resource and scope attributes are merged into each span's single `attrs`
+  map at normalization time (`ravel_rspan::merge_attrs`, resource beats
+  scope beats span), not carried as a separate identity blob. Because they
+  feed no identity, a resource attribute that cannot be converted is
+  dropped and reported on its own rather than rejecting every span under
+  the resource the way the log path must. Span kind, trace state, flags,
+  events, and links have no RSPAN column and are stored under reserved
+  underscore-prefixed `attrs` keys (`_kind`, `_trace_state`, `_flags`,
+  `_events_raw`, `_links_raw`); events and links are opaque hex blobs in
+  v1 (ADR-0041 decision 4).
+- A dead shard actor is never respawned, exactly as in the log pipeline:
+  the first shard-actor death increments both `shard_deaths` and
+  `shards_condemned` and turns `SpanIngestRouter::ready()` false, which
+  `services/ravel-server` ANDs into `/readyz`. The metrics router's
+  respawn-then-condemn budget has no span analogue.
+
+Commit-record fields the span flush fills differently: `sample_count` is the
+span count, `series_count` is the number of distinct `trace_id`s in the batch
+(tracked in the actor), `segment_format_version` is
+`SPAN_SEGMENT_FORMAT_VERSION`, and the event-time bounds are the batch's
+interval (the minimum `start_ts_ns` and the maximum `end_ts_ns`), so a
+commit record advertises the same interval RSPAN's skip index prunes with.
+
+`SpanIngestMetrics` mirrors `LogIngestMetrics` counter for counter, minus
+`stream_id_collisions` and with `buffered_spans_total` in place of
+`buffered_records_total`.
+
+Spans fold and are queryable the same way logs are:
+`services/ravel-server/src/fold.rs` folds metrics, logs, and spans, and the
+`spans` SQL table on `POST /api/v1/sql` reads them back. Ingest durability
+never depended on this fold either way.
+
+## Admission control (ADR-0051)
+
+`ravel-server` builds one `AdmissionController` (`crates/ravel-ingest/src/
+admission.rs`) at startup from `--limits-file` (validated at parse time
+regardless of mode; an unparseable file or unknown key fails startup) and
+threads the same `Arc` into every ingest path: OTLP HTTP and gRPC
+(metrics/logs/traces), OTAP, and Remote Write. `--limits-file` now has a
+runtime effect, not just a startup validation pass.
+
+Four layers, each enforced before the allocation it bounds, in this order:
+
+1. **Body size.** `DefaultBodyLimit` 16 MiB on `/v1/metrics`, `/v1/logs`,
+   `/v1/traces`, and `/api/v1/write`; `max_decoding_message_size` 16 MiB on
+   every tonic *ingest* service, OTAP's `ArrowMetricsServiceServer` included.
+   The Flight SQL query service (`services/ravel-server/src/flight.rs`) is
+   not an ingest path and is out of scope here; it still runs on tonic's
+   4 MiB default. Remote
+   Write additionally caps the *compressed* body at 16 MiB ahead of its
+   existing 64 MiB decompressed cap (`MAX_DECOMPRESSED_PAYLOAD_BYTES`).
+   OTAP's Arrow-stream decompression cap
+   (`StreamConfig::default().max_decompressed_payload_bytes == 16 MiB`) does
+   *not* bound the whole wire message: it is checked per
+   `ArrowPayload.record`, and a `BatchArrowRecords` message carries a vector
+   of payloads, so the decompressed bound it provides is 16 MiB times the
+   payload count, not a flat 16 MiB. The `max_decoding_message_size` cap on
+   the tonic service is therefore the explicit per-message bound for OTAP
+   too; tonic's own 4 MiB default is stricter than our 16 MiB cap today, but
+   the cap is set explicitly rather than left to that upstream default.
+2. **Byte rate.** `check_byte_rate`, on wire body bytes, after tenant
+   resolution and before decode. HTTP and gRPC each decode independently
+   before calling into the shared normalize/write path, so this check has
+   no single shared insertion point: it runs once per transport handler
+   (all three OTLP HTTP handlers, all three OTLP gRPC services, OTAP's
+   per-batch handler, and Remote Write), eight call sites in total. A gRPC
+   handler reads wire bytes from a `WireByteCountLayer`
+   (`services/ravel-server/src/wire_byte_count.rs`), a `tower::Layer`
+   installed on the gRPC listener that parses gRPC's length-delimited
+   message framing off the transport bytes as tonic's decoder reads them,
+   rather than measuring `request.get_ref().encoded_len()` (a walk of the
+   already-decoded protobuf tree) after the fact.
+3. **Event-time skew.** Out of scope for this change; unchanged.
+4. **Series/stream admission**, metrics and logs only (spans excluded).
+   `check_series_creation_rate`/`check_stream_creation_rate` first (a
+   breach rejects the whole request); then `admit_series`/`admit_streams`,
+   which partially admits: rejected series/streams are dropped from the
+   write and folded into the signal's existing partial-success reporting
+   (`ExportMetricsPartialSuccess`/`ExportLogsPartialSuccess`).
+
+Rejection is per signal and per layer:
+
+| layer | HTTP | gRPC | Remote Write |
+|---|---|---|---|
+| body size | 413 | RESOURCE_EXHAUSTED | 413 |
+| byte rate | 429 + `Retry-After` | RESOURCE_EXHAUSTED | 429 + `Retry-After` |
+| series/stream creation rate | 429 + `Retry-After` | RESOURCE_EXHAUSTED | 429 + `Retry-After` |
+| active series/stream cap | 200 + partial success | OK + partial success | 200, no partial-success message, reduced `X-Prometheus-Remote-Write-Samples-Written` |
+
+Remote Write's partial-admission semantics are pinned and do not follow
+the other two signals' shape: it never emits a partial-success message,
+always answers 2xx with the true written count once body-size and rate
+checks pass, and reserves 429 for the rate-limit rows only, never for an
+active-series-cap breach.
+
+## Process-wide ingest buffer byte budget (ADR-0069)
+
+The per-(tenant, shard, signal) memory backstop described under "Shard actor"
+(`max(target_bytes, min(64 MiB, ceiling / 8))`) bounds each buffer, but not
+their *sum*: a burst of active tenants can grow resident memory without any
+per-tenant limit tripping (ADR-0069). One process-wide atomic gauge
+(`ravel_ingest::IngestByteBudget`) bounds that sum. It is shared by `Arc`
+across the metrics, log, and span routers, so a single ceiling covers every
+signal.
+
+The two are coupled in one direction: the backstop is derived from this
+ceiling, so lowering `--max-ingest-buffer-bytes` lowers the per-buffer bound
+with it and no single buffer can hold a large share of the budget. Sizing a
+replica therefore starts from the ceiling; the per-buffer bound follows. Note
+the worst case is stated over the backstop, not over `target_bytes`: the two
+differ by up to eightfold at the default sizing, so a formula using
+`target_bytes` under-provisions.
+
+Each ingest write charges its estimated buffered bytes into the gauge in the
+router's write path, after decode/normalize/admission and before any shard
+buffer is touched (`IngestPoint::est_charge_bytes`: 16 bytes per sample plus,
+per label, the `Label` struct header and the name/value bytes, plus each
+exemplar's buffered width). This ceiling is charged separately from the size
+trigger, which reads the object-bytes estimate described under "Shard actor";
+the two figures answer different questions (how much memory is held, versus
+how large an object a flush would write) and neither substitutes for the
+other. The charge here stays deliberately conservative: undercharging a
+memory ceiling is the unsafe direction. The log and span routers charge the same gauge with
+`est_record_bytes`/`est_span_bytes`, and those apply the identical per-attribute
+rule: each attribute costs its pair struct header (`(String, AttrValue)` for a
+log attribute, `(String, String)` for a span attribute, the latter byte-for-byte
+the same as a `Label`) plus its key/value bytes. Counting only the string bytes
+on any one signal would undercharge this shared ceiling on that signal while the
+others charge honestly. If the charge would push the gauge past the ceiling
+(`--max-ingest-buffer-bytes`, default 512 MiB, `0` = unlimited) the request
+is shed *before* buffering: no shard is touched, no commit token is minted,
+the shed counter increments, and the caller gets HTTP 429 with `Retry-After`
+(gRPC `RESOURCE_EXHAUSTED`), exactly like the layer-2 byte-rate rejection and
+the in-flight shed. The flush deferral cap's refusal (`DeferralCapReached`,
+see "Generation live switch" above) gets the same 429 but is a
+different error with its own counter, `ravel_ingest_deferral_cap_refused_total`;
+this shed is the byte budget alone. The charge is an RAII guard cloned into every shard
+message the request fans out to; each shard buffer holds its clones and moves
+them into the flush, and the guard refunds the exact charged amount when the
+last buffer holding any of the request's bytes flushes (or its flush fails or
+is abandoned). In-flight pipelined flushes (ADR-0067) therefore stay charged
+until their PUTs complete, so pipelining depth is automatically accounted
+for. The gauge, its configured ceiling, and the shed counter render on
+`/metrics` as `ravel_ingest_buffer_bytes`, `ravel_ingest_buffer_bytes_limit`,
+and `ravel_ingest_buffer_shed_total`.
+
+The router charge above happens after decode/normalize, so on its own it left
+the transient decompression buffers outside the ceiling: the OTLP HTTP gzip
+buffer, which inflates ahead of decode and can reach
+`MAX_DECOMPRESSED_OTLP_BODY_BYTES` (64 MiB), and the Remote Write snappy buffer,
+which inflates ahead of decode and can reach `MAX_DECOMPRESSED_PAYLOAD_BYTES`
+(also 64 MiB). The gateway now charges both against that gauge before the bytes
+are retained (the ADR-0069 amendments). On
+the gzip path `services/ravel-server/src/otlp_http.rs` charges the decompressed
+bytes into the same `IngestByteBudget` *as they are produced*, chunk by chunk, so
+a decompression whose running total would cross the ceiling is shed mid-inflate
+(HTTP 429, the same `ravel_ingest_buffer_shed_total`) instead of allocating the
+full expansion first. Charging the produced bytes, not the 64 MiB cap and not a
+compressed-size estimate, keeps the charge equal to the actual inflated length
+(no over-charge of a well-compressing request).
+
+Per read the order is cap, then budget, then retain: the projected size (bytes
+produced so far plus the bytes just read) is checked against
+`MAX_DECOMPRESSED_OTLP_BODY_BYTES` before that chunk is charged or kept, so a
+body inflating past the cap is answered with 413 at the first byte past it and
+is never charged for that byte. A tight budget therefore cannot turn an over-cap
+body into a 429: the charge for such a body peaks at the cap exactly, and the
+413 is what the client sees regardless of how much headroom the gauge has.
+
+The decompressed body is kept as the list of exactly-sized chunks it was charged
+for, never appended into one growing `Vec<u8>`, and prost decodes it through
+that chunk list as a non-contiguous `Buf`. That is what makes the charge equal
+the retained bytes at every instant: an amortized-growth buffer keeps spare
+capacity past its length, and while reallocating it holds the old and the new
+allocation at once, so a charge taken on the appended length would undercount
+the buffer the ceiling claims to bound (and `reserve_exact` does not fix it,
+since an allocator may return more than was asked for). What stays outside the
+charge is a fixed staging-and-decoder cost plus per-chunk bookkeeping that
+scales with chunk count: one 64 KiB staging buffer that the decoder reads into,
+which between the read and the retained copy transiently holds one chunk of
+decompressed bytes; a `Bytes` handle and a charge guard per chunk (about 48
+bytes per 64 KiB chunk, held in two vectors that grow by doubling); plus
+flate2's own decoder state (tens of KiB). The compressed request body itself
+also stays resident for the whole inflate, but it is bounded by the request
+cap (`MAX_REQUEST_BODY_BYTES`, 16 MiB) and already counted against
+`--max-inflight-ingest-requests`, not left uncharged here. No uncharged
+allocation on this path holds a copy of the full decompressed body; the staging
+buffer holds only one chunk at a time, and it and the decoder state are a flat
+cost that alone can exceed the charge itself on a small decompressed body.
+
+The gateway holds that charge through protobuf decode and releases it once decode
+has consumed and freed the chunks -- prost copies them into owned structs -- before
+the router takes its own buffered charge, so a single request's inflate charge and
+buffered charge never coexist (the gauge counts concurrent inflate buffers, not one
+request's bytes twice). The identity (uncompressed) path allocates
+no transient inflate buffer
+and takes no gateway charge; its decoded body is bounded by the 16 MiB body
+limit and `--max-inflight-ingest-requests` (term 2 below).
+
+Remote Write (`services/ravel-server/src/remote_write.rs`) charges its snappy
+expansion in one step rather than chunk by chunk, and takes that charge before
+anything is allocated. The snappy block format declares its decompressed length
+in a varint header, so `snap::raw::decompress_len` reads the exact inflated size
+off the header without allocating, and `ravel-remote-write` then allocates
+exactly that many bytes. The handler checks the 64 MiB post-decompression cap
+first, charges the declared length second, and only then decodes: a body whose
+declared inflate exceeds the cap takes no charge and is rejected by the decoder
+with 400 as before, so a tight budget cannot turn an over-cap body into a 429,
+and a body the budget cannot admit is shed with HTTP 429 and `Retry-After`
+before its output buffer exists. The charge equals the actual inflated length,
+not the cap and not the compressed length. It is held through protobuf decode
+and normalization and released just before the router takes its own buffered
+charge, so a request's inflate charge and buffered charge never coexist. Holding
+it past decode over-holds deliberately: the inflate buffer itself is freed when
+decode returns, and the charge stays as the admission cost of the decoded
+request until its points reach the router.
+
+The OTLP gRPC decode path is deliberately not charged and remains term 2, by
+the decision recorded in ADR-0069's 2026-09-12 amendment: tonic inflates inside
+its own codec before any Ravel handler runs, so no charge of the true inflated
+size can be held across the allocation, and the path is instead bounded per
+request to 16 MiB by tonic's `max_decoding_message_size` (verified against tonic
+0.14.6 and pinned by an end-to-end test). The OTAP decode path is likewise
+uncharged and remains term 2, but its per-request bound is larger than one
+16 MiB message and is not yet quantified (a `BatchArrowRecords` carries an
+uncapped vector of payloads, each capped at 16 MiB); that is a separate
+follow-up, not this decision.
+
+### Worst-case resident memory
+
+Worst-case ingest resident memory is the sum of three named, config-bounded
+terms:
+
+1. **Buffered ingest state**: `--max-ingest-buffer-bytes` (default 512 MiB).
+   This ceiling covers the estimated bytes of every shard buffer *and* every
+   in-flight pipelined flush across all tenants and signals at once, since a
+   flush's buffer stays charged until its PUTs complete. The charge is an
+   estimate. For metrics (`est_charge_bytes`) it counts a series' label bytes
+   on every point rather than only on first sight, which over-counts, and it
+   counts neither `HashMap` overhead nor allocator slack, which under-counts
+   by more. The second effect dominates: measured on a 50k-series, 11-label
+   buffered workload, the charged figure was 38.4 MB against a 69.3 MB
+   resident delta. Size a metrics host for roughly twice this ceiling, not
+   for the ceiling itself.
+
+   That two-times figure is a metrics measurement and does not transfer to
+   logs. The nesting-accounting gap it once warned about is closed:
+   `attr_value_len` now charges the per-element struct header at every nesting
+   level (a `(String, AttrValue)` per `Map` entry and a `size_of::<AttrValue>()`
+   per `List` item), not only for a record's own top-level attributes, so a
+   record whose attributes nest is charged for the structs the buffer actually
+   holds rather than for leaf bytes alone. What is still unestablished is the
+   ratio itself: no one has measured the charged-to-resident ratio on a log
+   workload the way the 38.4 MB / 69.3 MB metrics figure above was measured, and
+   closing the accounting gap does not by itself make the metrics "roughly twice"
+   ratio hold for logs. Until a log workload is measured, size a log-heavy host
+   from measurement rather than from this multiplier.
+
+   The in-flight flush half of this term has a second, count-based bound on the
+   flushes its ordinary triggers open, and that one holds even when the byte
+   ceiling is disabled. Under ADR-1642 a flush task is spawned at every trigger
+   and acquires its `max_inflight_flushes` permit itself, so a stalled object
+   store queues spawned flushes that each hold a whole flush window; the
+   ADR-1642 amendment caps that queue per shard at `max_queued_flushes`
+   (default 8). At the cap a shard refuses its size and age triggers, leaving
+   the rows buffered for the next tick, so the windows those two triggers
+   produce are bounded by `shard_count x max_queued_flushes x` the largest
+   flush window regardless of `--max-ingest-buffer-bytes`.
+
+   The exempt path has no such product, and writing one would read as an upper
+   bound that does not hold. A tenant buffer past its memory backstop spawns
+   whatever the queue depth, because the backstop is the only bound on that
+   buffer's own resident memory and refusing there would make the buffer
+   unbounded instead. An exempt spawn consumes the whole buffer it fires on,
+   and the only path that re-inserts a buffer is the ordinary one, so the same
+   tenant crosses its backstop again only after buffering another backstop's
+   worth, and the windows it produces accumulate. Counting the buffers
+   currently sitting over their backstop therefore describes one instant, not
+   the queue that instant is a sample of. What bounds the exempt windows is the
+   byte budget rather than any count: a queued flush stays charged against
+   `--max-ingest-buffer-bytes` until its PUTs complete, so under the default
+   `Bounded` budget those charges reach the ceiling and admission sheds, which
+   is what stops the refill that would spawn the next exempt window, and the
+   byte ceiling is what an operator sizes to. Under `0` (`Unlimited`) nothing
+   sheds behind the backstop, so nothing bounds how many exempt windows a stall
+   accumulates except how long it lasts. One buffer's own resident memory is
+   still bounded by its backstop, and buffered rows are then bounded per tenant
+   by the per-tenant buffer caps but not in sum, which is the exposure `0`
+   accepts.
+2. **In-flight decode overhead**: each admitted in-flight request transiently
+   holds one decoded/normalized request body during normalization, before its
+   points reach a buffer. This is bounded by
+   `--max-inflight-ingest-requests` (default 1024) times the largest
+   per-request decoded body, which on the Remote Write RW2 path is the resolved
+   label bytes the decoder owns after it expands symbol references (up to 16
+   times the 64 MiB decompression cap, detailed below), not the 64 MiB cap
+   itself, and on the OTLP paths is the 16 MiB per-request cap. That is a larger
+   worst case than the coarse decode-cap ceiling the concurrency limit documents
+   above, which counts the 64 MiB decompressed input, not the resolved body.
+   Two slices of this overhead were moved under term 1 by the
+   two ADR-0069 amendments: the OTLP HTTP gzip
+   decompression buffer and the Remote Write snappy decompression buffer,
+   each of which used to inflate up to 64 MiB per request entirely outside any
+   byte ceiling, are now charged against `--max-ingest-buffer-bytes` (the gzip
+   one as it inflates, the snappy one from its declared length before it is
+   allocated), so `--max-inflight-ingest-requests` copies of either can no
+   longer sum past that ceiling. Only the decompressed output moved under term
+   1; the compressed request body that produces it stays in term 2, on both
+   paths. What remains in term 2 is the *uncharged* transient decode memory:
+   the identity-path OTLP HTTP body (bounded by the 16 MiB body limit), the
+   compressed OTLP HTTP gzip and Remote Write request bodies themselves
+   (resident for the whole inflate, bounded by the 16 MiB
+   `MAX_REQUEST_BODY_BYTES` cap), the decoded and normalized structs every
+   path holds after decompression, the OTLP gRPC gzip decode buffer (bounded
+   per request by tonic's `max_decoding_message_size`, 16 MiB here), and the
+   OTAP zstd payload buffers (bounded per payload by `StreamConfig`'s
+   `max_decompressed_payload_bytes`, 16 MiB, with one such buffer per payload
+   in a batch), none of which the buffer budget charges. So
+   the worst-case transient decode memory bounded only by
+   `--max-inflight-ingest-requests` is still that ceiling times the largest
+   *uncharged* decoded body. On the Remote Write RW2 path that body is not the
+   64 MiB post-decompression cap but the resolved label bytes the decoder owns
+   once it expands `labels_refs` symbol references into per-series `Label` bytes:
+   `ravel-remote-write` bounds cumulative resolved label bytes at
+   `RESOLVED_LABEL_BUDGET_MULTIPLIER` (16) times `max_decompressed_bytes`, so a
+   single request can retain up to 16 times 64 MiB, about 1 GiB, of owned label
+   bytes in its `ResolvedRequest`. That resolve step is a decode expansion, not
+   a decompression surface, and this ceiling does not charge it: term 1 charges
+   only the snappy inflate that produces the 64 MiB decompressed input. The wire
+   body that produces all of it is separately capped at 16 MiB
+   (`MAX_REQUEST_BODY_BYTES`), so the RW2 amplification to size for is 16 MiB on
+   the wire to as much as 1 GiB retained. The other uncharged decoded bodies
+   stay at their 16 MiB caps (OTLP gRPC / OTAP / identity HTTP); what changed is
+   that neither inflate buffer is part of that product any more, since both are
+   bounded by `--max-ingest-buffer-bytes` instead.
+3. **Fixed overhead**: shard-actor and router state, the admission
+   controller's per-tenant maps, and the read caches (`--cache-max-bytes`),
+   all bounded independently of ingest volume. Independent of ingest volume is
+   not the same as bounded by a knob: the admission controller's maps are
+   excluded from idle-tenant eviction and grow with the number of tenants that
+   have ever written (see below), so this term is sized from measurement on the
+   deployment's tenant count, not from configuration.
+
+So an operator sizes ingest RSS as
+`max_ingest_buffer_bytes + (max_inflight_ingest_requests x largest_uncharged_decoded_body)
++ fixed_overhead`, the first two terms knobs and the third measured, where
+`largest_uncharged_decoded_body` is
+now the largest body term 2 still owns: the Remote Write RW2 resolved-label
+bound (up to 16 times the 64 MiB decompression cap, so as much as 1 GiB per
+request, bounded by `RESOLVED_LABEL_BUDGET_MULTIPLIER` times
+`max_decompressed_bytes` and not charged by this ceiling), or OTLP gRPC / OTAP /
+identity OTLP HTTP's 16 MiB, rather than either inflate buffer or the 64 MiB
+decompression cap. Lowering
+`--max-ingest-buffer-bytes` tightens term 1 directly, trading a lower memory
+ceiling for earlier shedding under a many-tenant burst.
+
+Boundedness of the OTLP HTTP gzip and Remote Write snappy inflates (the two
+ADR-0069 amendments): before them,
+`--max-inflight-ingest-requests` copies of each 64 MiB inflate buffer could
+exist at once outside every byte ceiling -- 64 GiB per path at the default
+1024, on hosts whose whole RAM is a fraction of that. Both transients are now
+charged against `--max-ingest-buffer-bytes` (gzip as it inflates, snappy from
+its declared length before it is allocated), so the sum of all concurrent OTLP
+HTTP gzip and Remote Write snappy inflate buffers is bounded by that one
+ceiling, the same gauge that bounds buffered state. Two ingest paths are still
+outside it: the OTLP gRPC gzip inflate, which tonic performs inside its codec
+where no charge of the true inflated size can be held across the allocation
+(the only quantity a layer in front of tonic can read pre-inflate is the
+compressed frame length, which gzip does not tie to the output size), and the
+OTAP zstd payload inflate. The gRPC path is bounded per request to 16 MiB by
+tonic 0.14.6's `max_decoding_message_size`, which caps both the compressed frame
+length and the decompression output at that value (ADR-0084; the 2026-09-12
+amendment to ADR-0069 records why bounding-and-documenting this path is the
+complete fix rather than a charge, and an end-to-end test pins the 16 MiB
+ceiling). OTAP's per-request bound is larger, because a `BatchArrowRecords`
+carries an uncapped vector of payloads each capped at 16 MiB; that figure is
+not yet quantified and is a separate follow-up. Both remain term 2, the gRPC
+path bounded by `--max-inflight-ingest-requests` times its 16 MiB per-message
+cap. That bound is about these transients only,
+not about total process RSS: the admission controller's per-tenant maps are
+deliberately excluded from idle-tenant eviction and still grow with tenant count
+(see below), so the inflate buffers' contribution to peak RSS is a
+config-bounded term while process RSS as a whole is not a sum of named knobs.
+
+### Idle-tenant state eviction (ADR-0069 decision 2)
+
+The buffer budget above bounds *buffered* bytes, but several per-tenant maps
+grew monotonically over process lifetime regardless of buffering: the
+generation-switch views (one per tenant that ever wrote), the catalog's
+per-tenant decoded caches, and the SQL per-tenant memory accountants. A single
+background sweep bounds all three. Every `--idle-tenant-state-ttl` (default
+`1h`; `0` disables the sweep) it evicts per-tenant state last touched more than
+that long ago, on a jittered cadence, from the same worker-loop shape every
+other background task uses:
+
+- **Generation views**: re-read from the provisioning record on the tenant's
+  next write (the evicted view reports stale exactly as a first-touch tenant
+  does), so the cost is one provisioning-record GET on the next write.
+- **Catalog per-tenant caches**: the decoded commit-record, compaction-record,
+  HEAD, part, and postings caches; all immutable, content-addressed, or
+  TTL-revalidated, so an evicted entry is re-read on the next resolve.
+- **SQL memory accountants**: only those with zero outstanding reservations
+  (an accountant backing a live query is never evicted); a re-created one is a
+  byte-for-byte-equivalent counter.
+
+"Last touched" is stamped from an injected clock at each tenant's write
+(generation views), resolve (catalog caches), or query resolve (SQL
+accountants), so eviction is deterministic and reads no clock in the library
+layers: only the sweep loop reads the wall clock.
+
+**Admission-controller state is explicitly excluded.** Its active-series and
+active-stream counts are correctness-bearing caps; silently resetting a
+tenant's cap consumption on a memory-pressure sweep is never a valid trade-off
+(ADR-0069 decision 2). That map therefore still grows with tenant count, a
+documented gap with a named follow-up, not an unsafe eviction.
+
+## Modes
+
+`mode=strict` (default): ack after step 3 for every flush the request's
+points landed in (a request spanning shards awaits all of them; the receipt
+carries max token per shard).
+`mode=buffered`: ack at enqueue. Config per tenant; header override
+`x-ravel-ingest-mode: buffered` allowed only when tenant config permits.
+
+## Sizing defaults (config, all overridable)
+
+| knob | default |
+|---|---|
+| shard_count | 4 (dev), scale with cores |
+| channel depth | 256 msgs |
+| target_bytes (object bytes, not buffered memory) | 8 MiB |
+| per-buffer memory backstop (buffered memory, not object bytes) | `max(target_bytes, min(64 MiB, max ingest buffer bytes / 8))`, so 64 MiB at these defaults |
+| max_flush_delay | 2 s (`--max-flush-delay`) |
+| max_flush_delay_idle | 40 s (`--max-flush-delay-idle`) |
+| min_flush_bytes (object bytes, not buffered memory) | 256 KiB (`--min-flush-bytes`) |
+| idle_flush_byte_floor (object bytes, all three pipelines) | 0 = disabled (`--idle-flush-byte-floor`, must be below `min_flush_bytes`; a non-zero floor makes a buffer under it wait `max_flush_lifetime` less one `flush_tick` and widens the buffered-mode loss window to match) |
+| put retry budget | 4 attempts, 100ms..2s jittered backoff |
+| max in-flight ingest requests (process-wide) | 1024 (`--max-inflight-ingest-requests`, 0 = unlimited) |
+| max ingest buffer bytes (process-wide, all signals) | 512 MiB (`--max-ingest-buffer-bytes`, 0 = unlimited) |
+| max_inflight_flushes (per shard, all three pipelines) | 1 on `ravel-server`, 4 on `ravel-cli load` (`--max-inflight-flushes`, rejects 0) |
+| max_queued_flushes (per shard, all three pipelines) | 8 (`--max-queued-flushes`, `RAVEL_MAX_QUEUED_FLUSHES`, rejects 0; a `max_inflight_flushes` above it raises the effective cap to match, with a warning; floored at 1 in `IngestConfig`; a buffer over its memory backstop spawns past the cap) |
+| adaptive_flush_delay (metrics pipeline only) | off (`--adaptive-flush-delay`) |
+| idle-tenant state TTL (process-wide) | 1 h (`--idle-tenant-state-ttl`, 0 = disabled) |
+
+## CPU cost of the write path (measured)
+
+A CPU flamegraph of the write path, from `ravel-bench`'s `ingest_bench` bin
+built `--release --features profiling`. A `pprof` sampler at 997 Hz brackets
+only the measured region (fixture generation and report assembly excluded).
+While a profile is active the harness disables its own visibility poller,
+per-batch catalog resolves, and depth sampler, so samples attribute to the
+ingest path and not the benchmark measuring itself; such a run reports no
+visibility-lag figures and in-flight depth `n=0`.
+
+- Host: aarch64, 4 cores, ~8 GiB RAM, single-board class. Build profile:
+  `release`. The ranking below is bounded to this host: its memory bandwidth
+  is far below a server-class machine's, and the dominant cost here is memory
+  movement, so the shares are the ones most likely to shift on other
+  hardware. Re-measure before sizing or optimising against a different host.
+- Workload: `--store memory --shards 4 --target-series 2000
+  --points-per-sec 4000000 --duration-secs 1 --batch-size 5000
+  --ack-timeout-secs 120`; 4,000,000 points, all accepted, no errors.
+- Sampler collected 648 on-CPU samples.
+
+What this profile supports and what it does not:
+
+- It is a composition of on-CPU time, not of wall time. `pprof` uses
+  `ITIMER_PROF`, which samples only running threads, so parked tokio workers
+  never appear. 0% of the profile is idle/park frames by construction, and
+  the write path spends most of its wall time off-CPU awaiting flushes,
+  where this profile is blind.
+- At 648 samples the 95% binomial interval on a 50%-of-samples group is
+  about +/-4%, so only the broad grouping below is supportable, not
+  per-function figures to better than a few percent. Across three
+  independent runs (251, 648, 932 on-CPU samples) the two dominant costs,
+  memory movement and the series-id hash map, are stable in rank; the finer
+  splits below them shift with sample count and label cardinality.
+
+Essentially all on-CPU time is the ingest write path: 99.4% of samples fall
+in `ravel_ingest`/`ravel_segment`/`ravel_codec`/`ravel_commit` frames, the
+remaining 0.6% in tokio worker scheduling. Grouped by self time:
+
+| group | share of on-CPU samples |
+|---|---|
+| point/buffer memory traffic (moves, copies, `Vec<u8>`/`Vec<i64>` growth including segment byte-buffer construction, `String` drops) | ~56% |
+| router per-point conversion loop (`IngestRouter::write_points`) | ~16% |
+| series-id hash map (`hashbrown` probe + SipHash) | ~15% |
+| CRC32C checksum on the object-store PUT | ~6% |
+| segment codec encode (`encode_i64`, varint) | ~5% |
+| sample sort + tokio scheduling | ~2% |
+
+The dominant cost is memory movement, not compression, hashing, or I/O:
+building `IngestPoint`s, growing the per-shard byte buffers, and dropping
+label `String`s. Byte-slice label comparison during series accumulation is
+also visible and grows with shared-label cardinality. The only object-store
+work is the CRC32C over the in-memory PUT; a real S3 backend adds network
+I/O this in-memory profile omits.
+
+## CPU cost of the columnar load path vs the row path (measured)
+
+ADR-0109 replaced the bulk loader's per-row write path
+(`LogIngestRouter::write`, which pivots each row into columns inside the RLOG
+writer) with a columnar fast path (`LogIngestRouter::write_columnar`, which
+stages contiguous per-column arrays and skips the `write_block` gather and the
+per-attribute `column_of` probe). Decision 8 of that ADR *argued from a
+microbench ratio* that removing the pivot addresses roughly 78 points of load
+CPU; no end-to-end number had ever been measured. This is the first one
+(`ravel-bench`'s `columnar_load_compare` bin).
+
+- Host: x86_64, AMD EPYC-Rome, 8 logical cores, ~15 GiB RAM. Build profile:
+  `release`.
+- Workload: a synthetic ClickBench-shaped Parquet sample (integer-heavy with a
+  string minority, values derived from row/column indices) decoded once and
+  loaded through both paths on a fresh in-process router and `MemoryStore`
+  each. `--shards 1` (whole corpus on one shard, so the differential is the
+  write-path pivot alone and not shard fan-out), `--batch-rows 10000`
+  (one RLOG object per batch, Strict acks).
+- CPU is process user+system time from `/proc/self/stat` across the write loop
+  only; the Parquet decode and the columnar-batch build both happen before the
+  timed region, exactly as the shipping loader builds its columnar batch in the
+  decode task off the flush critical path.
+
+Measured, at two column widths (three runs each at 100 columns, two at 300):
+
+| corpus | rows | row-path write CPU | columnar-path write CPU | pivot share of row write CPU |
+|---|---|---|---|---|
+| 100 attribute columns (ClickBench width) | 50,000 | ~7.0-7.5 s | ~7.3-7.5 s | **-4% to +1% (no measurable reduction)** |
+| 300 attribute columns (exaggerated width) | 20,000 | ~13.7-14.0 s | ~11.8-12.1 s | ~14-16% |
+
+At the ClickBench-representative ~100-column shape the columnar path is within
+run-to-run noise of the row path (if anything marginally slower); a reduction
+only becomes visible (~15%) at 300 columns, three times wider than ClickBench's
+~105. The saving scales super-linearly with column count, consistent with the
+removed cost being the quadratic gather, but that quadratic term is not yet a
+large share of the full object build at ClickBench width: the columnar path
+still pays the per-row merged-view/`attrs_raw` derivation `build_object_columnar`
+retains, plus block framing, compression, indexing, and the object PUT, none of
+which the pivot removal touches.
+
+What this measurement supports and what it does not:
+
+- **It is a local differential on a bounded synthetic sample, not the
+  ClickBench reference figure.** The reference-box run (c6a.4xlarge, full
+  `hits.parquet`, S3) is deliberately out of scope. Nothing here should be read
+  as the reference result.
+- **It measures the epic WITHOUT ADR-0109 decision 3 contributing.** The
+  columnar batch is built through `ColumnarLogBatch::from_records`, which
+  attaches no dictionaries, so the dictionary-preserving column and
+  dictionary-aware bloom path never engages -- exactly as it fails to engage on
+  ClickBench-shaped plain-`BYTE_ARRAY` Parquet (arrow-rs fuses the
+  column's dictionary away on decode). Decision 8's arithmetic counted those
+  savings; this number does not include them.
+- **The store is in-memory.** S3 latency, multi-shard fan-out scaling, and real
+  PUT round trips are invisible to this harness; the CRC32C over the in-memory
+  PUT is the only object-store work timed. The differential also excludes the
+  Parquet decode (shared by both paths), so it reports the pivot's share of the
+  *write* CPU, not of end-to-end load CPU, which is lower again.
+- The isolated microbench decision 8 rests on is
+  `crates/ravel-logseg/benches/wide_gather.rs`: on this host (`--quick`) the
+  gather is ~23% of `write_block` at 10 columns and ~99% of it at 105
+  (gather 413 ms vs `write_block` 419 ms). The gather dominating the isolated
+  block encode does **not** translate into a proportional end-to-end write-path
+  saving at that width, which is the gap this measurement exposes.
+
+### Bulk-load write concurrency (ADR-0807)
+
+The CPU numbers above measure one write path against another; they do not
+measure how much of the object-storage round trip is hidden behind other work.
+On the reference box a 100M-row ClickBench load ran at 2.33 of 16 cores busy
+with 0.06% iowait, because the bulk loader serialized its batches at the
+then-current defaults (within one batch the involved shards still wrote
+concurrently; it was the cross-batch barrier that cost the cores). Two nested concurrency windows bound the bulk write path:
+`--pipeline-depth` (batches the loader keeps outstanding) and
+`max_inflight_flushes` (flushes per shard, the per-shard semaphore above). The
+concurrent-write ceiling is
+`shards * min(pipeline_depth, max_inflight_flushes, max_queued_flushes)`,
+reached only when a batch
+routes rows to every configured shard; with narrower fan-out the active shard
+count replaces `shards` and the real ceiling is lower. The third term is the
+queued-flush cap (the ADR-1642 amendment): a shard stops spawning flush tasks
+at that count, so permits above it are unreachable. The loader takes the
+`IngestConfig` default of 8, above both other windows at their defaults of 4,
+so it does not bind there; `ravel-server` raises the effective
+`--max-queued-flushes` to match a larger `--max-inflight-flushes`, with a
+warning naming both numbers, rather than let the difference read as
+backpressure.
+
+Because that term is a `min`, neither window alone changes anything, which is
+measured rather than argued: on a 16-batch single-shard fixture with a 40ms
+injected data-object PUT, depth 1 / flushes 1 took 673.9 ms, depth 4
+/ flushes 1 took 671.9 ms, depth 1 / flushes 4 took 673.3 ms, and depth 4 /
+flushes 4 took 169.3 ms. At depth 1 the loader never asks a shard for a second
+concurrent flush, so `flush_permit_wait_ns` is exactly 0 and the per-shard window
+is not the thing the load is waiting on.
+
+ADR-0807 audits every write-path bound and exposes `--max-inflight-flushes` on
+the loader; its amendment moves both loader defaults to 4, having
+first closed the durable-token report gap that made the speed-up opt-in (the
+loader now resolves every outstanding write on a failure instead of abandoning
+it, so the report equals what landed at any depth). `ravel-server`'s own default
+is unchanged. Every published ClickBench load figure predates both changes and
+needs re-measuring.
+
+## Metrics (self-observability)
+
+`IngestMetrics` (crates/ravel-ingest/src/metrics.rs) exposes process-global
+`u64` counters through `IngestMetricsSnapshot`. They carry no per-shard and no
+per-tenant dimension: one `IngestMetrics` is built by the router and shared by
+every shard actor via `Arc`, so each value is the sum across all shards and all
+tenants of the process.
+
+Counters recorded today:
+
+- `flushes_by_size`, `flushes_by_age`, `flushes_by_age_adaptive`,
+  `flushes_by_age_floor`, `flushes_manual`: flush count by trigger.
+  `flushes_by_age_adaptive` is the
+  subset of age-triggered flushes where `adaptive_flush_delay` actually
+  stretched the threshold past `max_flush_delay`; it is zero unless that knob
+  is enabled, and is disjoint from `flushes_by_age` (a flush counts in exactly
+  one of the two). `flushes_by_age_floor` is the age-triggered subset that
+  waited for the sub-floor hold instead of `max_flush_delay_idle`, disjoint
+  from the other two the same way, and zero unless `idle_flush_byte_floor` is
+  set. `flushes_manual` covers explicit `FlushNow`, the `Shutdown`
+  drain, and the channel-close drop-path drain. These are **attempt-time**:
+  incremented when a flush is opened, before the segment build or any PUT, so
+  a later-abandoned flush is counted here as well as in an `abandoned_*`
+  counter. Successful flushes = the five trigger counters minus the three
+  `abandoned_*` counters.
+- `abandoned_retry_exhausted`: flush abandoned because a PUT exhausted its retry
+  budget or `max_flush_lifetime` elapsed while the flush's own store calls were
+  in flight (`WriteError::Abandoned`). Object-store durability signal;
+  retryable.
+- `abandoned_queue_deadline`: flush abandoned because its flush-open deadline
+  elapsed while it was queued for a `max_inflight_flushes` permit, before any
+  store call (`WriteError::Abandoned`). Contention signal, not an
+  object-store one; retryable. The abandonment deadline is re-derived from
+  permit grant, so this fires only when a flush task is scheduled after its
+  flush-open deadline already passed, never for a mere queue wait.
+- `abandoned_input_rejected`: flush abandoned because the input could not be
+  built into a durable object (`WriteError::SegmentBuild`). Client signal; not
+  retryable. The three-way split keeps a store problem, permit contention, and
+  a bad-input problem distinguishable by counter alone.
+- `put_retries`: retried PUT attempts across the data-object and commit-record
+  paths (first attempt of each excluded).
+- `buffered_bytes_total`, `buffered_points_total`: cumulative volume admitted
+  into shard buffers at enqueue time.
+- `acks_ok`, `acks_err`: strict-mode waiters acked (**success-time**, at the
+  flush's terminal outcome). Zero for buffered-mode and for flushes with no
+  strict waiter, so this is an ack-outcome counter, not a flush-outcome one.
+- `series_id_collisions`: batches rejected fail-loud on an ADR-0005 series-id
+  collision.
+- `shard_deaths`: shard-actor deaths observed by the router. What a death means
+  differs by signal. The metrics router respawns, so `IngestMetrics` counts
+  every death including each respawned incarnation and the figure can exceed
+  `shard_count`; a low steady rate there is transient recovery. The log and
+  span routers never respawn, so on `LogIngestMetrics` and `SpanIngestMetrics`
+  a death is already a condemnation: it is counted once per shard of each live
+  shard-actor set, never more, and `shards_condemned` below moves on the same
+  death (see the Log and Span pipeline sections).
+- `shards_condemned`: shards condemned and no longer accepting writes, counted
+  at most once per shard of each live shard-actor set (one set per distinct
+  active `shard_count`) and bounded by the sum of those sets' shard counts, not
+  `shard_count`: under resharding each set's handle for a shard index can
+  condemn independently. On the
+  metrics pipeline a shard is condemned only after it exhausts its respawn
+  budget within one decay window; `LogIngestMetrics` and `SpanIngestMetrics`
+  carry the same counter but their routers never respawn, so the first
+  shard-actor death condemns (see the Log and Span pipeline sections).
+  Nonzero turns the router's `ready()` false and, through
+  `services/ravel-server`, `/readyz` to 503, and nothing recovers it in
+  process.
+- `in_flight_flushes_total`: gauge, sum across shards of flush tasks spawned
+  but not yet acked (ADR-0067 decision 2 consequence of pipelining). It counts
+  a flush from the moment its buffer leaves the actor, so a task still waiting
+  for its `max_inflight_flushes` permit is included: it holds a flush window
+  and an ADR-0069 byte charge exactly as an executing flush does. A shard's
+  reading can therefore exceed `max_inflight_flushes` (ADR-1642), and the
+  excess over it, floored at zero, is the shard's queue of flushes waiting on
+  the bound. At `max_queued_flushes` the shard refuses further size and age
+  triggers (the ADR-1642 amendment), so in steady state the sum is bounded by
+  `shard_count x max_queued_flushes`. A shard's reading can sit above that
+  cap while one of its tenant buffers is past its memory backstop: such a
+  buffer spawns whatever the queue depth, since the backstop is the only bound
+  on its resident memory. The overshoot is one window per backstop CROSSING,
+  not one per buffer currently over its backstop: an exempt spawn drains the
+  buffer it fires on, so the windows accumulate as the tenant crosses again.
+  Each costs a backstop's worth of buffered memory, so the overshoot tracks
+  memory pressure rather than the flush cadence, and under `Bounded` the byte
+  ceiling bounds it; under `Unlimited` only the length of the stall does.
+  Unlike every other counter here it is per-shard underneath
+  (`IngestMetrics::in_flight_flushes_by_shard`) before being summed into this
+  flat total; a shard with no flush in flight contributes 0.
+
+### Per-shard skew
+
+To make per-shard ingest skew measurable -- so an argument about shard-actor
+throughput rests on data, not assertion -- `IngestMetrics` also carries a
+per-shard dimension, read via `IngestMetrics::shard_skew_by_shard()` (and
+reachable from a benchmark through `IngestRouter::metrics()`, the same handle
+`in_flight_flushes_by_shard` is read through).
+
+`LogIngestMetrics` carries the same dimension, with the same
+`shard_skew_by_shard()` reader and the same three spans. The two
+share one accumulator (`metrics::ShardSkew`), so a figure means the same thing on
+either pipeline. This matters because `ravel-cli load` drives the logs pipeline
+and not the metrics one: while the accounting existed only on the metrics side,
+every skew figure for the bulk-load path read as absent, and ADR-0807's audit of
+that path had to reason from the code instead of from a measurement. The span
+path (`span_router.rs`, `span_shard.rs`) now records all three spans:
+`on_actor_ns` and `off_actor_ns` alongside the `flush_permit_wait_ns` it already
+had, at the same actor and off-actor acquire sites as the metrics and log
+pipelines. The span router also counts `messages_enqueued` after each
+successful send into a shard channel, as the other two routers do, so
+`queue_depth` is live on all three signals. It also records `flushes_queued` and `flush_trigger_deferred`, which
+the queued-flush cap wires up identically on all three pipelines.
+
+The per-shard dimension is not part of the flat `IngestMetricsSnapshot` or its
+log and span counterparts, whose `Copy` shape holds no per-shard field. The
+flat totals `in_flight_flushes_total`, `flush_permit_wait_ns_total`,
+`flushes_queued_total`, and `flush_trigger_deferred_total` are on every
+snapshot, and the process `/metrics` surface renders
+`ravel_ingest_in_flight_flushes`,
+`ravel_ingest_flush_permit_wait_seconds_total`,
+`ravel_ingest_queued_flushes`, and
+`ravel_ingest_flush_trigger_deferred_total` for every signal
+(`services/ravel-server/src/metrics.rs`). Since ADR-1692 the per-shard
+breakdown is also rendered directly, as the `ravel_ingest_shard_*` family
+labelled `shard` (see the observability guide); `shard_skew_by_shard()` remains
+the read path that family and any in-process caller both use. The renderer
+zero-fills shards 0 to `shard_count - 1` of the configured default
+(`IngestConfig::shard_count`, each router's `shard_count()`), not any tenant's
+live shard count: a tenant resharded above the default renders its extra
+shards only once they have recorded something, and the family is exactly
+`6 * signals * shards` series only when no tenant's shard count differs from
+the configured one. The accumulator is keyed by shard index alone, so during a
+reshard, or when tenants run different shard counts, one index sums every
+generation's actor at that index. Per shard
+(`ShardSkewStats`):
+
+- `messages_enqueued`: write messages (`Write` on every signal, plus
+  `WriteColumnar` on logs) the router sent into the shard's channel, counted
+  after the router's `send` succeeds.
+- `messages_processed`: those write messages the shard actor pulled and
+  handled.
+  `FlushNow`/`Shutdown` are excluded from both counts: they are control
+  messages, not ingest load.
+- `queue_depth`: `messages_enqueued - messages_processed` at read time
+  (saturating), the messages still in the channel.
+- `on_actor_ns`, `flush_permit_wait_ns`, `off_actor_ns`: injected-`Clock`
+  nanoseconds, split three ways. See "The three time spans" below; reading any
+  two of them as if they were the whole split misattributes backpressure.
+- `flushes_queued`: gauge, the shard's spawned-but-unreaped flush tasks as of
+  the last time that set changed length. This is the quantity
+  `max_queued_flushes` caps (the ADR-1642 amendment), and it is the per-shard
+  version of what `in_flight_flushes_total` sums: waiting and executing flushes
+  both count, since both hold a flush window. It can read above the cap: a
+  tenant buffer past its memory backstop spawns whatever the queue depth, and
+  no count bounds how many such windows a stall accumulates. See "One trigger
+  is exempt" under "Pipelined flushes (ADR-0067)" above for what does bound
+  them; a reading above the cap while `flush_trigger_deferred` stays flat is
+  that exemption rather than a lost bound.
+- `flush_trigger_deferred`: counter, size or age triggers the shard refused
+  because it was already at `max_queued_flushes` and the tenant's buffer was
+  still under its memory backstop. A refused trigger leaves its
+  rows buffered with their age clock unreset, so the next tick retries it; the
+  counter rising means flush windows, not buffer space, are the binding
+  constraint on this shard, and its tenants' `max_flush_delay` deadlines are
+  slipping by however long the shard stays at the cap. `FlushTrigger::Manual`
+  is exempt from the cap and never counted here, and so is any trigger on a
+  buffer past its memory backstop: that one spawns instead of deferring, so
+  `flushes_queued` can rise while this counter does not.
+
+#### Which shards are covered
+
+Every shard index the write path can route to, not only the `shard_count` the
+process was configured with. The shard set is not fixed for the lifetime of the
+process: `GenerationSwitch` (ADR-0052 section 2) keeps one shard-actor set per
+distinct `shard_count` seen and takes the live count from the tenant's
+generation history via `active_shard_count`, so a tenant that activates a larger
+generation routes to indices above the configured count. The accumulators are
+therefore preallocated to `MAX_SHARD_COUNT` (10 000, the ceiling
+`provisioning.rs` validates every generation's `shard_count` against), so no
+generation the catalog accepts can route to an index the metric drops. Sizing to
+the configured count instead would omit exactly the shards a reshard adds, and
+omitting shards biases this measurement toward reporting *less* skew than there
+is -- the direction that would manufacture agreement with the claim the metric
+exists to test.
+
+#### What a single read does and does not guarantee
+
+`shard_skew_by_shard()` reads seven independent atomics per shard, so under
+concurrent recording it is not an instantaneous snapshot of all seven. One
+direction is guaranteed and one is not:
+
+- `messages_processed` never runs ahead of the `on_actor_ns` it belongs to: the
+  actor adds the time with `Relaxed` and then bumps the count with `Release`,
+  and the reader loads the count with `Acquire` before the time. A counted
+  message therefore always has its time addend included, so the derived mean
+  `on_actor_ns / messages_processed` can never read low because of a torn pair.
+- The reverse tear is observable: a time addend whose message has not yet been
+  counted, so the mean can read high by at most one in-flight message per
+  concurrent actor. Both counters are cumulative, so a later read self-heals.
+
+`queue_depth` is derived at read time from two counters updated on different
+tasks and is saturating for the same reason; it can read 0 when a processed
+increment is visible before its enqueue.
+
+#### The three time spans
+
+The split is the point of the whole measurement: without it, a figure cannot
+tell an actor-thread bottleneck from a flush bottleneck, and a two-way split
+cannot tell either of those from flush backpressure. Each span is bracketed on
+the injected `Clock` at a distinct boundary in the metrics shard actor, and
+within one flush's life the three boundaries are consecutive, so no nanosecond
+of any sampled interval is charged to more than one counter.
+
+| Counter | Starts | Stops | What it means |
+|---|---|---|---|
+| `on_actor_ns` | the actor pulls a `Write` off its channel | `handle_write` returns | merge-and-pin work the single-threaded actor genuinely serialises |
+| `flush_permit_wait_ns` | the spawned flush task reaches the `max_inflight_flushes` acquire | that acquire grants a permit | this shard's flush backpressure: flushes are queued behind earlier flushes of the same shard |
+| `off_actor_ns` | the spawned flush task enters `run_flush`, permit already held | `run_flush` returns (success or abandonment) | encode and both PUTs on every signal, plus exemplar admission on the metrics pipeline only |
+
+Read them as: a rising `on_actor_ns` means the actor is the bottleneck; a rising
+`flush_permit_wait_ns` means flushing is, and flushes are queueing behind the
+bound; a rising `off_actor_ns` with a flat permit wait means flushes are slow
+but not yet backed up.
+
+Only `on_actor_ns` accrues on the actor task. Since ADR-1642 the permit is
+acquired inside the spawned flush task, so `flush_permit_wait_ns` no longer
+measures time the actor spent and is no longer subtracted from `on_actor_ns`:
+`on_actor_ns` is merge-and-pin work, whole. That also makes permit wait a sum
+over concurrently waiting tasks rather than a series of intervals on one task.
+At one permit with three flushes queued it accrues all three waits, so like
+`off_actor_ns` it can exceed wall time and it overlaps the other two spans in
+wall time. That overlap is not double-counting: no sampled interval lands in two
+counters, because the three brackets are still consecutive within one flush's
+life (the actor's handling of the write, then that flush task's wait, then that
+flush task's execution).
+
+Folding the permit wait into `on_actor_ns` instead (as the first cut of this
+metric did) inverts the reading: the actor reports busy precisely when the truth
+is that flushes are backed up and the actor is free. It would now also be false
+outright, since the wait is not on the actor at all. The skew tests in
+`ravel-ingest` pin both the split and the overlap on fixed input.
+
+Still tracked future work (not yet implemented): a per-tenant dimensioned
+model and per-shard latency histograms -- per-shard buffered bytes/points,
+flush build/put/commit and ack latency distributions; per-tenant
+accepted/rejected points and bytes. Those require a metrics backend that these
+flat atomics and the per-shard maps above do not provide.

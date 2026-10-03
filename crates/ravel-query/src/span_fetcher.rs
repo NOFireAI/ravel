@@ -1,0 +1,2458 @@
+//! `SpanSegmentFetcher`: a fetch-and-scan abstraction over one RSPAN span
+//! segment (crate `ravel-rspan`, docs/span-segment-format.md; ADR-0041 phase 5,
+//! ADR-0054 bloom pruning).
+//!
+//! This is the span-signal sibling of [`crate::log_fetcher::LogSegmentFetcher`].
+//! It was promoted here from `ravel-sql` (`spans_fetcher.rs`) for the
+//! distributed Spans fan-out (#285, ADR-0071 "log and span distributed fan-out"
+//! amendment): the fragment worker lives in `ravel-query`, and `ravel-sql`
+//! depends on `ravel-query`, so the worker could not use a fetcher that lived
+//! in `ravel-sql`. The move preserves the fetcher's behavior byte-for-byte; the
+//! `spans` SQL table (`ravel-sql`) now reaches it through a re-export
+//! (`ravel_query::SpanSegmentFetcher`), so its scan path is unchanged.
+//!
+//! # Why this drives the block scan itself (ADR-0054)
+//!
+//! v1 delegated the whole per-object scan to [`RspanReader::scan`], which prunes
+//! blocks by trace_id range and time interval and re-evaluates survivors
+//! exactly. v3 adds a per-block BLOOM over `service.name`/`name` tokens
+//! ([`SkipIndex::candidate_blocks_with_bloom`]), but the reader's
+//! `scan` still only takes a [`SpanQuery`] (ts window + trace_id) and cannot
+//! carry a bloom predicate. `ravel-rspan` deliberately exposes the primitives
+//! for a caller to assemble a bloom-backed scan itself -- [`RspanReader::bloom`]
+//! and [`RspanReader::skip_index`], `candidate_blocks_with_bloom`,
+//! [`ravel_rspan::block::read_block`], and
+//! [`ravel_rspan::block::DecodedBlock::service_name`] -- so this fetcher
+//! assembles that scan here on top of the public format surface rather than
+//! adding a bloom-aware `scan` to the reader.
+//! The block-slicing bounds check mirrors the reader's own: a
+//! `(block_offset, block_len)` decoded from SKIP_IDX is checked against the
+//! BLOCKS section's own length, never merely the whole object, so a corrupt
+//! offset can never return foreign bytes.
+//!
+//! Pruning stays widen-only (ADR-0013): the bloom's negative probe is a proof
+//! the token is absent, so a skipped block truly held no matching row; a bloom
+//! false positive only costs a wasted block decode, never a wrong or missing
+//! row. The `spans` SQL provider's `supports_filters_pushdown` is `Inexact`, so
+//! DataFusion re-applies the original `service_name`/`name` predicate above the
+//! scan regardless.
+//!
+//! Object-level relevance (does the segment's ts span overlap the window?) is
+//! still decided from the catalog summary before any GET.
+
+use std::sync::Arc;
+
+use crate::fetcher::{ReadCache, gate_not_run};
+use crate::reserved_bytes::attach_reservation;
+use bytes::Bytes;
+use ravel_cache::{CacheKey, ReadOutcome, SingleFlightError};
+use ravel_catalog::SegmentRef;
+use ravel_cpu_gate::{CpuGateError, JobSize, ReadGate, ReadSite};
+use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
+use ravel_rspan::block::{DEFAULT_MAX_UNCOMP, DecodedBlock, read_block, read_block_projected};
+use ravel_rspan::footer::kind;
+use ravel_rspan::record::{
+    COL_END_TS, COL_EVENT_ATTRS_BLOB, COL_EVENT_COUNT, COL_EVENT_NAME, COL_EVENT_TS, COL_START_TS,
+    COL_TRACE_ID,
+};
+use ravel_rspan::skip_index::BlockEntry;
+use ravel_rspan::varint::get_uvarint;
+use ravel_rspan::{
+    BloomPredicate, RspanConfig, RspanReader, ScanStats, SpanQuery, SpanRecord, SpanSegError, open,
+};
+use ravel_types::TenantHash;
+use ravel_types::accounting::{AccountedOp, QueryAccounting};
+
+/// One scanned span: the rebuilt record plus its `service_name` read straight
+/// from the v3 dictionary-encoded `COL_SERVICE_NAME` column (ADR-0054), rather
+/// than looked up by linear scan of the record's merged `attrs` map at build
+/// time. `None` when the span carried no `service.name`. The record's `attrs`
+/// still carry `service.name` (the reader re-inserts it), so the public
+/// `spans.attrs` column is unchanged; this field is the direct read that backs
+/// the dedicated `service_name` column.
+///
+/// `PartialEq`/`Eq` are derived (all fields are `Eq`: `SpanRecord` is, and
+/// `service_name` is `Option<String>`), so the distributed fan-out's
+/// differential tests can compare a decoded span multiset for exact equality.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpanRow {
+    pub record: SpanRecord,
+    pub service_name: Option<String>,
+}
+
+/// The rows matching one fetch, plus the reader's own scan pruning counters.
+/// [`ScanStats`] is what proves a prune fired: a bloom-backed or trace-keyed
+/// scan reports strictly fewer `blocks_scanned` than a bare window scan over the
+/// same object.
+#[derive(Clone, Debug)]
+pub struct SpanFetchOutput {
+    pub records: Vec<SpanRow>,
+    pub stats: ScanStats,
+    /// Column pages this fetch's decode decompressed, summed over the blocks it
+    /// scanned. The row exit decodes every page of every block it scans, so this
+    /// is the whole page count of the scanned blocks and
+    /// [`pages_skipped`](Self::pages_skipped) is 0. `ScanStats` carries no page
+    /// counters (only block ones), so these two ride here, from the same
+    /// per-block decode counts the page-byte accounting folds.
+    pub pages_decoded: usize,
+    /// Column pages this fetch's decode walked past because the projection
+    /// excluded them. Always 0 for the row exit, which requests every column;
+    /// it is a measured 0, not an absent counter, so a caller publishing it can
+    /// state the row path skipped nothing rather than leaving a metric unwritten
+    /// (#669).
+    pub pages_skipped: usize,
+}
+
+/// One candidate block resolved to its absolute, bounds-checked
+/// `(start, end, crc32c)` byte range within the whole object, ready for the
+/// cursor to re-slice without holding a borrow of the reader.
+type CandidateBlock = (usize, usize, u32);
+
+/// One decoded block handed out by the columnar exit
+/// ([`SpanSegmentFetcher::fetch_accounted_columnar`], ADR-0110 decision 2),
+/// plus the indices of its rows that survived the query's ts window and
+/// optional `trace_id` equality.
+///
+/// The block was decoded under the caller's projection (unioned with the
+/// predicate columns [`COL_TRACE_ID`]/[`COL_START_TS`]/[`COL_END_TS`] so the
+/// surviving rows can be evaluated), so pages outside that set were never
+/// decompressed. Read its columns through [`DecodedBlock::view`] and gather them
+/// over `rows`; a column the projection excluded answers
+/// [`ravel_rspan::SpanSegError::ColumnNotRequested`] rather than a silent column
+/// of nulls.
+///
+/// `rows` is ascending and is exactly the set the row exit's `SpanRow` results
+/// cover for the same block, computed by the one shared predicate
+/// ([`surviving_rows`]).
+pub struct ColumnarBlock {
+    pub block: DecodedBlock,
+    pub rows: Vec<usize>,
+}
+
+/// Shape only: [`DecodedBlock`] is not `Debug` (its columns are deliberately not
+/// formattable), and formatting the surviving rows' cells would defeat a view
+/// that exists to avoid materializing them.
+impl std::fmt::Debug for ColumnarBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ColumnarBlock")
+            .field("record_count", &self.block.record_count())
+            .field("pages_decoded", &self.block.pages_decoded())
+            .field("pages_skipped", &self.block.pages_skipped())
+            .field("surviving_rows", &self.rows.len())
+            .finish()
+    }
+}
+
+/// Errors fetching and decoding one RSPAN segment. Every variant is a hard
+/// error: the caller never receives partial or silently-wrong data. Mirrors
+/// [`crate::LogFetchError`] so `ravel-sql`'s `SqlError` can redact it the same
+/// way (the `Display` embeds the object key, logged server-side only).
+#[derive(Debug, thiserror::Error)]
+pub enum SpanFetchError {
+    #[error("object store error reading span segment {key}: {source}")]
+    Store {
+        key: String,
+        #[source]
+        source: StoreError,
+    },
+    #[error("corrupt span segment {key}: {source}")]
+    Corrupt {
+        key: String,
+        #[source]
+        source: SpanSegError,
+    },
+    #[error("span segment {key} belongs to a different tenant than the query")]
+    TenantMismatch { key: String },
+    /// The fetch-layer memory budget (ADR-1170 decision 2) refused the
+    /// reservation for the bytes this GET would materialize. Carries only the
+    /// three accounting figures, never a key or tenant value. Mirrors
+    /// [`crate::FetchError::FetchMemoryExhausted`].
+    #[error(
+        "fetch memory exhausted: requested {requested} bytes, {reserved} of {limit} byte budget already reserved"
+    )]
+    FetchMemoryExhausted {
+        requested: u64,
+        reserved: u64,
+        limit: u64,
+    },
+}
+
+/// Fetches and scans one RSPAN span segment at a time. Constructed with the
+/// same [`ObjectStoreBackend`] trait object the log/metric fetchers take.
+#[derive(Clone)]
+pub struct SpanSegmentFetcher {
+    store: Arc<dyn ObjectStoreBackend>,
+    cfg: RspanConfig,
+    /// ADR-0046's read cache, consulted by
+    /// [`whole_object_bytes`](Self::whole_object_bytes) on behalf of
+    /// [`fetch_accounted`](Self::fetch_accounted) and
+    /// [`fetch_accounted_columnar`](Self::fetch_accounted_columnar) -- the only
+    /// funnels here that carry the `tenant_hash` a cache key needs.
+    /// [`fetch`](Self::fetch) is unaccounted and tenant-blind (test/block-stat
+    /// spy only) and never consults it, unchanged by its presence. Mirrors
+    /// [`LogSegmentFetcher::cache`](crate::log_fetcher::LogSegmentFetcher);
+    /// either tier configuration (see [`ReadCache`]) works, and production
+    /// builds the RAM or RAM-over-disk variant the same way the metric and log
+    /// fetchers do.
+    cache: Option<ReadCache>,
+    /// Bounds in-flight object-store GETs (ADR-1195). This is this fetcher's
+    /// FIRST-EVER concurrency bound: before ADR-1195, `SpanSegmentFetcher` held
+    /// no semaphore at all and its GET concurrency was limited only by its
+    /// caller. `new` gives it a private limiter at
+    /// [`crate::fetcher::DEFAULT_MAX_CONCURRENT_GETS`]; [`Self::with_get_limiter`]
+    /// wires it to the one process-shared limiter every query-side fetcher can
+    /// hold instead.
+    get_limiter: Arc<crate::GetLimiter>,
+    /// The process-wide fetch memory budget (ADR-1170 decision 2). Each
+    /// whole-object GET reserves the object's size against it before the GET,
+    /// and the reservation travels with the returned bytes. Default unlimited
+    /// (never refuses); [`Self::with_memory_budget`] wires the shared one,
+    /// mirroring [`Self::with_get_limiter`].
+    memory_budget: Arc<ravel_memory::MemoryBudget>,
+    /// The read CPU gate the row exits' block decodes run on (ADR-1702
+    /// decision 4). `None`, the default, decodes inline.
+    read_gate: Option<Arc<ReadGate>>,
+}
+
+impl SpanSegmentFetcher {
+    pub fn new(store: Arc<dyn ObjectStoreBackend>) -> Self {
+        SpanSegmentFetcher {
+            store,
+            cfg: RspanConfig::default(),
+            cache: None,
+            get_limiter: Arc::new(crate::GetLimiter::new_unchecked(
+                crate::fetcher::DEFAULT_MAX_CONCURRENT_GETS,
+            )),
+            memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
+            read_gate: None,
+        }
+    }
+
+    /// Runs the block decodes of [`fetch`](Self::fetch) and
+    /// [`fetch_accounted`](Self::fetch_accounted), and of a columnar scan
+    /// drained through [`SpanColumnarScan::next_block_on_gate`], on `gate`
+    /// (ADR-1702 decision 4). Each block, with all its pages, is one job.
+    #[must_use]
+    pub fn with_read_gate(mut self, gate: Arc<ReadGate>) -> Self {
+        self.read_gate = Some(gate);
+        self
+    }
+
+    /// Wires this fetcher to a caller-owned [`ravel_memory::MemoryBudget`]
+    /// (ADR-1170 decision 2), so its whole-object GETs reserve against the same
+    /// budget as every other fetcher (and, via
+    /// [`crate::QueryEngine::with_memory_budget`], every other engine) holding
+    /// the same `Arc`. Mirrors [`Self::with_get_limiter`].
+    #[must_use]
+    pub fn with_memory_budget(mut self, budget: Arc<ravel_memory::MemoryBudget>) -> Self {
+        self.memory_budget = budget;
+        self
+    }
+
+    /// This fetcher's current memory budget, for a test to `Arc::ptr_eq`.
+    #[cfg(test)]
+    pub(crate) fn memory_budget_for_test(&self) -> &Arc<ravel_memory::MemoryBudget> {
+        &self.memory_budget
+    }
+
+    /// Reserves `n` bytes against this fetcher's budget before a whole-object
+    /// GET, mapping a refusal to [`SpanFetchError::FetchMemoryExhausted`]. The
+    /// guard is owned for the fetched buffer's lifetime (ADR-1170 decision 2).
+    fn reserve_fetch(&self, n: u64) -> Result<ravel_memory::Reservation, SpanFetchError> {
+        self.memory_budget
+            .reserve(n)
+            .map_err(|e| SpanFetchError::FetchMemoryExhausted {
+                requested: e.requested,
+                reserved: e.reserved,
+                limit: e.limit,
+            })
+    }
+
+    /// Sets the in-flight GET bound by building a new private limiter. Shared
+    /// across this fetcher's clones; not shared with any other fetcher unless
+    /// [`Self::with_get_limiter`] is used instead.
+    #[must_use]
+    pub fn with_max_concurrent_gets(mut self, n: usize) -> Self {
+        self.get_limiter = Arc::new(crate::GetLimiter::new_unchecked(n.max(1)));
+        self
+    }
+
+    /// Wires this fetcher to a caller-owned [`crate::GetLimiter`] (ADR-1195),
+    /// so it draws GET permits from the same pool as every other fetcher (and,
+    /// via [`crate::QueryEngine::with_get_limiter`], every other engine)
+    /// holding the same `Arc`.
+    #[must_use]
+    pub fn with_get_limiter(mut self, limiter: Arc<crate::GetLimiter>) -> Self {
+        self.get_limiter = limiter;
+        self
+    }
+
+    /// This fetcher's `GetLimiter` permit count (ADR-1195): the process-wide
+    /// GET concurrency bound, shared with every other fetcher and engine that
+    /// took the same `Arc` via [`Self::with_get_limiter`]. Mirrors
+    /// [`SegmentFetcher::get_limiter_permits`](crate::fetcher::SegmentFetcher::get_limiter_permits).
+    #[must_use]
+    pub fn get_limiter_permits(&self) -> usize {
+        self.get_limiter.permits()
+    }
+
+    /// Overrides the [`RspanConfig`] used for section-size caps when decoding.
+    #[must_use]
+    pub fn with_config(mut self, cfg: RspanConfig) -> Self {
+        self.cfg = cfg;
+        self
+    }
+
+    /// Wires ADR-0046's read cache into
+    /// [`fetch_accounted`](Self::fetch_accounted) and
+    /// [`fetch_accounted_columnar`](Self::fetch_accounted_columnar), mirroring
+    /// [`LogSegmentFetcher::with_cache`](crate::log_fetcher::LogSegmentFetcher::with_cache).
+    /// Accepts either tier configuration through [`ReadCache`] (an
+    /// `Arc<Cache<..>>` or an `Arc<TieredCache<..>>`, both convert via
+    /// [`From`]).
+    #[must_use]
+    pub fn with_cache(mut self, cache: impl Into<ReadCache>) -> Self {
+        self.cache = Some(cache.into());
+        self
+    }
+
+    /// Whether this fetcher was built with [`with_cache`](Self::with_cache).
+    /// Exposed for tests and callers that need to know without a probe read
+    /// (mirrors [`LogSegmentFetcher::has_cache`](crate::log_fetcher::LogSegmentFetcher::has_cache)).
+    #[must_use]
+    pub fn has_cache(&self) -> bool {
+        self.cache.is_some()
+    }
+
+    /// Per-object relevance from the catalog summary alone, with no object
+    /// read: true iff the segment's event-ts span
+    /// (`min_event_ts_ns..=max_event_ts_ns`) overlaps the inclusive query
+    /// window. A `false` return lets [`fetch`] skip the object without a GET.
+    ///
+    /// A span object's summary ts span is `[min_start_ts, max_end_ts]` (the
+    /// footer's whole-object interval), so this is the same interval-overlap
+    /// test the block-level skip index applies, just at object granularity.
+    ///
+    /// [`fetch`]: Self::fetch
+    #[must_use]
+    pub fn ts_range_relevant(seg_ref: &SegmentRef, ts_min_ns: i64, ts_max_ns: i64) -> bool {
+        seg_ref.min_event_ts_ns <= ts_max_ns && ts_min_ns <= seg_ref.max_event_ts_ns
+    }
+
+    /// Fetches, prunes, and scans one segment for spans matching `query` and
+    /// `predicates`.
+    ///
+    /// The ts-range relevance pre-check runs first, from the catalog summary
+    /// only: an object whose span cannot overlap the window returns `Ok(None)`
+    /// with no GET. Otherwise the whole object is fetched once
+    /// ([`GetRange::Full`]) and scanned block by block:
+    ///
+    /// - candidate blocks are chosen by the skip index's trace_id/ts prune,
+    ///   the `duration_ns`/`status_mask` skip-index prune when a duration or
+    ///   status filter was pushed, and, when `predicates` is
+    ///   non-empty, the bloom-backed
+    ///   [`SkipIndex::candidate_blocks_with_bloom`] prune (a block whose bloom
+    ///   proves a predicate's token absent is dropped before decode);
+    /// - each surviving block is crc-verified and decoded, its rows
+    ///   re-evaluated exactly against the ts window and (when set) trace_id, and
+    ///   its `service_name` read straight from the v3 dictionary column.
+    ///
+    /// `duration_ns` and `status_mask` are the widen-only skip-index prune
+    /// shapes the `spans` SQL pushdown extracts (`SpansPushdown::duration_window`
+    /// and `status_mask`): `duration_ns` is an inclusive `[min, max]` window a
+    /// block's `[min_duration_ns, max_duration_ns]` must overlap, `status_mask`
+    /// a bitmask a block's `status_mask` must share a bit with. Both `None`
+    /// means unconstrained on that axis. They can only skip blocks that cannot
+    /// hold a matching row, so results are unchanged; only the read set shrinks.
+    ///
+    /// Every returned row satisfies `query` exactly. The bloom prune is
+    /// widen-only (ADR-0013): a bloom false positive costs one wasted block
+    /// decode, never a wrong or missing row, and DataFusion re-applies the
+    /// `service_name`/`name` predicate above the scan. `stats` reports how much
+    /// the skip index and bloom pruned.
+    ///
+    /// [`SkipIndex::candidate_blocks_with_bloom`]:
+    /// ravel_rspan::SkipIndex::candidate_blocks_with_bloom
+    pub async fn fetch(
+        &self,
+        seg_ref: &SegmentRef,
+        query: &SpanQuery,
+        duration_ns: Option<(i64, i64)>,
+        status_mask: Option<u8>,
+        predicates: &[BloomPredicate<'_>],
+    ) -> Result<Option<SpanFetchOutput>, SpanFetchError> {
+        if !Self::ts_range_relevant(seg_ref, query.ts_min, query.ts_max) {
+            return Ok(None);
+        }
+
+        let key = &seg_ref.data_object_key;
+        // Reserve the whole object's bytes before the GET (ADR-1170 decision 2):
+        // a refusal fails typed with zero GETs. Held to the end of this call,
+        // covering the decode below; released when the fully-decoded rows are
+        // returned.
+        let _reservation = self.reserve_fetch(seg_ref.object_size)?;
+        // The permit covers the GET only; decode below runs without it, as on
+        // every other funnel.
+        let got = async {
+            let _permit = self
+                .get_limiter
+                .acquire()
+                .await
+                .map_err(|_| SpanFetchError::Store {
+                    key: key.to_string(),
+                    source: StoreError::Transient(
+                        "GetLimiter semaphore closed unexpectedly".to_string(),
+                    ),
+                })?;
+            self.store
+                .get(key, GetRange::Full)
+                .await
+                .map_err(|source| SpanFetchError::Store {
+                    key: key.to_string(),
+                    source,
+                })
+        }
+        .await?;
+
+        // Unaccounted entry point: the page-byte fold lands in a throwaway
+        // handle, exactly as the logs side routes `fetch` through
+        // `fetch_accounted(&QueryAccounting::new())`. The row output is
+        // unchanged.
+        let scan = self.open_scan(
+            got.data,
+            key.to_string(),
+            *query,
+            duration_ns,
+            status_mask,
+            predicates,
+            BlockProjection::All,
+            QueryAccounting::new(),
+        )?;
+        Ok(Some(drain_rows(scan).await?))
+    }
+
+    /// Accounted, tenant-checked counterpart of [`fetch`](Self::fetch):
+    /// identical prune-and-scan behavior, plus two things (ADR-0044). The
+    /// object read is recorded against `accounting` at this funnel -- the
+    /// funnel the span scan did not account before -- exactly as
+    /// `LogSegmentFetcher::fetch_accounted` records the log read (cache hit or
+    /// store GET, via [`whole_object_bytes`](Self::whole_object_bytes)); and
+    /// the fetched object's footer `tenant_hash` is verified against
+    /// `tenant_hash` before it is decoded, failing closed with
+    /// [`SpanFetchError::TenantMismatch`].
+    ///
+    /// `tenant_hash` mirrors the logs scan chain, which threads a
+    /// `TenantHash` from `LogsTableProvider` through `LogsScanExec` into
+    /// `LogSegmentFetcher::fetch_accounted_with_tenant`. Here it does double
+    /// duty: it keys the ADR-0046 read cache (when [`with_cache`](Self::with_cache)
+    /// configured one), exactly as the logs/metrics funnels key theirs, and it
+    /// guards against decoding an object that belongs to another tenant. The
+    /// read is recorded before the guard runs: the request was really issued
+    /// regardless of whose object came back.
+    ///
+    /// This is the funnel a production `spans` query takes once a caller is
+    /// wired in (ADR-0045 decision 5, phase 2); the unaccounted, tenant-blind
+    /// [`fetch`](Self::fetch) stays for unit tests and block-stat spies.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fetch_accounted(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &SpanQuery,
+        duration_ns: Option<(i64, i64)>,
+        status_mask: Option<u8>,
+        predicates: &[BloomPredicate<'_>],
+        accounting: &QueryAccounting,
+    ) -> Result<Option<SpanFetchOutput>, SpanFetchError> {
+        if !Self::ts_range_relevant(seg_ref, query.ts_min, query.ts_max) {
+            return Ok(None);
+        }
+
+        let key = &seg_ref.data_object_key;
+        let bytes = self
+            .whole_object_bytes(seg_ref, tenant_hash, accounting)
+            .await?;
+
+        // Tenant identity guard: an object whose footer names a different
+        // tenant is never decoded. The footer trailer is parsed here (cheap);
+        // `open_scan` re-opens it for the BLOCKS section descriptor.
+        let footer = open(&bytes).map_err(|source| corrupt(key, source))?;
+        if footer.tenant_hash != tenant_hash.0 {
+            return Err(SpanFetchError::TenantMismatch {
+                key: key.to_string(),
+            });
+        }
+
+        let scan = self.open_scan(
+            bytes,
+            key.to_string(),
+            *query,
+            duration_ns,
+            status_mask,
+            predicates,
+            BlockProjection::All,
+            accounting.clone(),
+        )?;
+        Ok(Some(drain_rows(scan).await?))
+    }
+
+    /// Columnar sibling of [`fetch_accounted`](Self::fetch_accounted) (ADR-0110
+    /// decision 2): identical fetch, tenant guard, candidate selection, bloom
+    /// probe, and ts/`trace_id` filtering, but instead of a `Vec<SpanRow>` it
+    /// returns a [`SpanColumnarScan`] the caller drains one [`ColumnarBlock`] at
+    /// a time. Each block is decoded under `projected_columns` (unioned with the
+    /// predicate columns [`COL_TRACE_ID`]/[`COL_START_TS`]/[`COL_END_TS`] so the
+    /// surviving rows can be evaluated), so pages for columns outside that set
+    /// are never decompressed.
+    ///
+    /// The row and columnar exits run over the same primitive
+    /// ([`open_scan`](Self::open_scan)), so a block's surviving rows are
+    /// identical across the two; the only difference a caller observes is the
+    /// decoded shape and, in `accounting`, `page_bytes_decoded`.
+    ///
+    /// Accounting (ADR-0107 decision 4, contract unchanged): the whole-object
+    /// GET is recorded here exactly as the row exit records it, so
+    /// `page_bytes_fetched` is identical to the row exit's for the same query;
+    /// `page_bytes_decoded` is lower whenever `projected_columns` excludes a
+    /// page the block carries (an attribute or event page). The fold is done by
+    /// [`SpanColumnarScan`], once, on exhaustion or drop, so a scan abandoned
+    /// after a satisfied `LIMIT` still accounts the blocks it decoded.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fetch_accounted_columnar(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &SpanQuery,
+        duration_ns: Option<(i64, i64)>,
+        status_mask: Option<u8>,
+        predicates: &[BloomPredicate<'_>],
+        projected_columns: &[u32],
+        accounting: &QueryAccounting,
+    ) -> Result<Option<SpanColumnarScan>, SpanFetchError> {
+        if !Self::ts_range_relevant(seg_ref, query.ts_min, query.ts_max) {
+            return Ok(None);
+        }
+
+        let key = &seg_ref.data_object_key;
+        // Same one whole-object read the row exit records (cache hit or store
+        // GET): this exit skips decode, not fetch, so `page_bytes_fetched`
+        // cannot diverge here.
+        let bytes = self
+            .whole_object_bytes(seg_ref, tenant_hash, accounting)
+            .await?;
+
+        let footer = open(&bytes).map_err(|source| corrupt(key, source))?;
+        if footer.tenant_hash != tenant_hash.0 {
+            return Err(SpanFetchError::TenantMismatch {
+                key: key.to_string(),
+            });
+        }
+
+        let scan = self.open_scan(
+            bytes,
+            key.to_string(),
+            *query,
+            duration_ns,
+            status_mask,
+            predicates,
+            BlockProjection::columnar(projected_columns),
+            accounting.clone(),
+        )?;
+        Ok(Some(scan))
+    }
+
+    /// The one primitive behind both exits (ADR-0110 decision 2): resolve
+    /// candidate blocks once (the skip-index trace_id/ts and duration/status
+    /// prune, plus the bloom-backed prune when `predicates` are pushed), then
+    /// hand a [`SpanColumnarScan`] cursor that decodes one candidate block at a
+    /// time. `fetch`/`fetch_accounted` drive it with [`BlockProjection::All`]
+    /// and rebuild `SpanRow`s ([`drain_rows`]); `fetch_accounted_columnar`
+    /// returns the cursor for the caller to stream. Sharing this is what keeps
+    /// candidate selection, bloom probing, and the ts/`trace_id` predicate
+    /// byte-identical across the two exits.
+    #[allow(clippy::too_many_arguments)]
+    fn open_scan(
+        &self,
+        bytes: Bytes,
+        key: String,
+        query: SpanQuery,
+        duration_ns: Option<(i64, i64)>,
+        status_mask: Option<u8>,
+        predicates: &[BloomPredicate<'_>],
+        projection: BlockProjection,
+        accounting: QueryAccounting,
+    ) -> Result<SpanColumnarScan, SpanFetchError> {
+        let (candidates, stats) = self
+            .plan_candidates(&bytes, &query, duration_ns, status_mask, predicates)
+            .map_err(|source| corrupt(&key, source))?;
+        Ok(SpanColumnarScan {
+            bytes,
+            key,
+            query,
+            projection,
+            candidates,
+            cursor: 0,
+            stats,
+            accounting,
+            page_bytes_fetched: 0,
+            page_bytes_decoded: 0,
+            pages_decoded: 0,
+            pages_skipped: 0,
+            finished: false,
+            read_gate: self.read_gate.clone(),
+            lost: false,
+            lost_to: None,
+        })
+    }
+
+    /// Fetches one segment's whole-object bytes, consulting the ADR-0046 read
+    /// cache when [`with_cache`](Self::with_cache) configured one -- mirrors
+    /// [`LogSegmentFetcher::whole_object_bytes`](crate::log_fetcher::LogSegmentFetcher::whole_object_bytes)
+    /// byte-for-byte in shape. With no cache configured this issues exactly
+    /// the one store GET `fetch_accounted`/`fetch_accounted_columnar` recorded
+    /// before this existed, so an uncached caller's behavior and accounting
+    /// are unchanged.
+    ///
+    /// With a cache configured, the key is `(tenant_hash, content_hash, 0,
+    /// object_size)` (ADR-0046 decision 2): tenant is part of the key, so two
+    /// tenants whose objects are byte-identical never share an entry, even
+    /// though the content hash alone would already be unique -- defence in
+    /// depth against a hash collision or a programming error serving one
+    /// tenant's bytes to another. A cache hit re-runs the disk tier's crc32c
+    /// check on every access (ADR-0046 decision 4); a checksum failure or any
+    /// other disk-entry defect degrades to a miss and is counted by
+    /// `ravel-cache`'s own `disk_errors_degraded_to_misses` counter, not a new
+    /// span-specific one, and this call falls through to the one store GET a
+    /// miss takes -- it never serves unverified bytes. The [`ReadOutcome`] from
+    /// [`ReadCache::get_or_fetch`] decides whether this call records a cache
+    /// hit, a cache miss plus the store GET it ran, or, for a late serve (a
+    /// single-flight follower on either cache kind, or a RAM-only recheck
+    /// serve), a cache miss with no GET, so a hit and a miss are never
+    /// double-counted on the tiered tier.
+    async fn whole_object_bytes(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        accounting: &QueryAccounting,
+    ) -> Result<Bytes, SpanFetchError> {
+        let key = &seg_ref.data_object_key;
+        // Reserve the whole object's bytes before the direct whole-object GET
+        // (ADR-1170 decision 2): a refusal fails typed with zero GETs. The guard
+        // travels with the returned bytes, owned for the fetched buffer's
+        // lifetime rather than released when the GET completes.
+        let reservation = self.reserve_fetch(seg_ref.object_size)?;
+
+        let Some(cache) = &self.cache else {
+            let _permit = self
+                .get_limiter
+                .acquire()
+                .await
+                .map_err(|_| SpanFetchError::Store {
+                    key: key.to_string(),
+                    source: StoreError::Transient(
+                        "GetLimiter semaphore closed unexpectedly".to_string(),
+                    ),
+                })?;
+            let got = self
+                .store
+                .get(key, GetRange::Full)
+                .await
+                .map_err(|source| SpanFetchError::Store {
+                    key: key.to_string(),
+                    source,
+                })?;
+            accounting.record_s3_request(AccountedOp::Get);
+            accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
+            return Ok(attach_reservation(got.data, reservation));
+        };
+
+        let cache_key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, 0, seg_ref.object_size);
+        // One read-through call, accounted from the returned `ReadOutcome`: a
+        // single call avoids the peek-then-`get_or_fetch` double-count on the
+        // tiered tier (see `ReadCache::get_or_fetch`).
+        let (bytes, outcome) = cache
+            .get_or_fetch(cache_key, || async move {
+                let _permit = self.get_limiter.acquire().await.map_err(|_| {
+                    StoreError::Transient("GetLimiter semaphore closed unexpectedly".to_string())
+                })?;
+                let got = self.store.get(key, GetRange::Full).await?;
+                accounting.record_s3_request(AccountedOp::Get);
+                accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
+                Ok(got.data)
+            })
+            .await
+            // This funnel's closure is one unconditional whole-object GET
+            // that verifies nothing itself, so the `EtagChanged`/`Corrupt`
+            // classes below are unreachable here rather than wrong; they are
+            // still mapped so the match is exhaustive against the shared
+            // error type.
+            .map_err(|err| from_cache_error(key, err))?;
+
+        let mut reservation = reservation;
+        match outcome {
+            ReadOutcome::Hit => {
+                accounting.record_cache_hit();
+                accounting.add_cache_bytes(bytes.len() as u64);
+                // Same two-ledger overlap as the log fetcher's hit path: the
+                // returned `Bytes` clones the cache entry's allocation, so the
+                // cache cap and this guard both cover it until the caller drops
+                // it (ADR-1170 decision 2).
+                reservation.mark_handed_off();
+            }
+            // A miss. Only the call that ran the closure above recorded a
+            // store GET; a late serve (another caller's flight, or the RAM
+            // recheck) recorded none and stays this miss alone.
+            ReadOutcome::Fetched | ReadOutcome::LateServe => {
+                accounting.record_cache_miss();
+                // Admitted to the read cache, which has its own byte ledger:
+                // mark the reservation handed off so the transient overlap is
+                // visible while both this buffer and the cache entry hold the
+                // same bytes (ADR-1170 decision 2). Cleared when this guard
+                // drops.
+                reservation.mark_handed_off();
+            }
+        }
+        Ok(attach_reservation(bytes, reservation))
+    }
+
+    /// Candidate selection over one whole-object's bytes, with no block decoded:
+    /// resolves each surviving block to an absolute, bounds-checked
+    /// `(start, end, crc32c)` byte range so the cursor can re-slice `bytes`
+    /// without holding a borrow of the reader or skip index. Kept store-free so
+    /// the block-level logic is unit-testable without an object store.
+    fn plan_candidates(
+        &self,
+        bytes: &[u8],
+        query: &SpanQuery,
+        duration_ns: Option<(i64, i64)>,
+        status_mask: Option<u8>,
+        predicates: &[BloomPredicate<'_>],
+    ) -> Result<(Vec<CandidateBlock>, ScanStats), SpanSegError> {
+        let reader = RspanReader::new(bytes, &self.cfg)?;
+        let skip = reader.skip_index();
+        let blocks_total = skip.blocks.len() as u32;
+
+        // ts_min > ts_max is an empty window: no candidate, exactly the
+        // short-circuit the row scan applied before.
+        let candidate_idx = if query.ts_min > query.ts_max {
+            Vec::new()
+        } else if predicates.is_empty() {
+            skip.candidate_blocks(
+                query.trace_id.as_ref(),
+                query.ts_min,
+                query.ts_max,
+                duration_ns,
+                status_mask,
+            )
+        } else {
+            let bloom = reader.bloom()?;
+            skip.candidate_blocks_with_bloom(
+                query.trace_id.as_ref(),
+                query.ts_min,
+                query.ts_max,
+                duration_ns,
+                status_mask,
+                &bloom,
+                predicates,
+            )?
+        };
+
+        // The BLOCKS section's absolute offset and length, for bounds-checked
+        // per-block slicing (mirrors RspanReader's own block_bytes).
+        let footer = open(bytes)?;
+        let blocks = footer
+            .section(kind::BLOCKS)
+            .ok_or_else(|| SpanSegError::Corrupted("missing BLOCKS section".into()))?;
+        let (blocks_offset, blocks_len) = (blocks.offset, blocks.len);
+
+        let mut candidates = Vec::with_capacity(candidate_idx.len());
+        for &b in &candidate_idx {
+            let entry = &skip.blocks[b];
+            let (start, end) = abs_block_range(blocks_offset, blocks_len, entry)?;
+            candidates.push((start, end, entry.block_crc32c));
+        }
+
+        let stats = ScanStats {
+            blocks_total,
+            blocks_after_skip: candidate_idx.len() as u32,
+            blocks_scanned: 0,
+        };
+        Ok((candidates, stats))
+    }
+}
+
+/// A fetched, candidate-pruned, not-yet-decoded columnar scan over one RSPAN
+/// object (ADR-0110 decision 2), the streaming counterpart of a `Vec<SpanRow>`.
+/// The object's bytes are resident and its candidate blocks are chosen, but no
+/// block is decoded until [`next_block`](Self::next_block); the caller pulls one
+/// [`ColumnarBlock`] at a time so peak decoded memory is one block.
+///
+/// # Accounting is folded once, even on early abandonment
+///
+/// `page_bytes_fetched`/`page_bytes_decoded` accumulate per decoded block and
+/// are folded into the query's [`QueryAccounting`] exactly once, by
+/// [`finish`](Self::finish), when the scan is drained to exhaustion or dropped
+/// (the `Drop` impl below). A scan a caller abandons after an upstream `LIMIT`
+/// is satisfied never reaches the exhaustion arm, so without the drop-time fold
+/// the partial decode it already did would be missing from the query's
+/// accounting; `finish` is idempotent, so the two paths never double-count. This
+/// mirrors `LogSegmentScan` (crate `log_fetcher`, PR #642).
+pub struct SpanColumnarScan {
+    /// The whole object. Candidate byte ranges are absolute offsets into it.
+    bytes: Bytes,
+    /// The object key, for error attribution.
+    key: String,
+    query: SpanQuery,
+    projection: BlockProjection,
+    /// Absolute, bounds-checked `(start, end, crc32c)` byte ranges of the
+    /// candidate blocks, in scan order.
+    candidates: Vec<CandidateBlock>,
+    cursor: usize,
+    stats: ScanStats,
+    /// This query's accounting handle, folded once at exhaustion or drop with
+    /// the scan's decode-time `page_bytes_fetched`/`page_bytes_decoded` totals
+    /// (ADR-0107 decision 4). A separate, additive axis from the wire bytes the
+    /// fetch funnel records through `add_s3_bytes`.
+    accounting: QueryAccounting,
+    page_bytes_fetched: u64,
+    page_bytes_decoded: u64,
+    /// Column pages decoded and skipped across the blocks drained so far: the
+    /// count-side siblings of the `page_bytes_*` totals above, taken from the
+    /// same per-block decode. Exposed rather than folded into `accounting`
+    /// because a scan's caller publishes them as PARTITION metrics
+    /// (`SpansScanExec`'s `pages_decoded`/`pages_skipped`), which the
+    /// query-global accounting handle cannot express.
+    pages_decoded: usize,
+    pages_skipped: usize,
+    /// Set once the accounting fold has run, so it runs exactly once.
+    finished: bool,
+    /// The read CPU gate [`next_block_on_gate`](Self::next_block_on_gate)
+    /// decodes on; `None` decodes inline.
+    read_gate: Option<Arc<ReadGate>>,
+    /// Set once a gated block decode failed or was abandoned. The cursor had
+    /// already moved past that block, so every later call fails rather than
+    /// hand out the next block of a partial segment.
+    lost: bool,
+    /// The gate failure that lost the block, so a later call reports the same
+    /// class the losing call reported (a panicked decode stays a `Corrupt`,
+    /// not a redacted permanent store error). `None` when the block was
+    /// abandoned instead: a caller dropped the future while the job was queued
+    /// or running, and no classified failure exists to repeat.
+    lost_to: Option<CpuGateError>,
+}
+
+impl SpanColumnarScan {
+    /// The scan's pruning counters. `blocks_scanned` grows as blocks are
+    /// consumed; read it after the last [`next_block`](Self::next_block).
+    pub fn stats(&self) -> ScanStats {
+        self.stats
+    }
+
+    /// Candidate blocks not yet decoded.
+    pub fn remaining_blocks(&self) -> usize {
+        self.candidates.len() - self.cursor
+    }
+
+    /// Column pages the blocks drained so far decompressed. Read after the last
+    /// [`next_block`](Self::next_block), or at any point for the partial total.
+    pub fn pages_decoded(&self) -> usize {
+        self.pages_decoded
+    }
+
+    /// Column pages the blocks drained so far walked past because this scan's
+    /// projection excluded them. Always 0 when the scan requests every column
+    /// (the row exit).
+    pub fn pages_skipped(&self) -> usize {
+        self.pages_skipped
+    }
+
+    /// Decode the next candidate block and return it with its surviving row
+    /// indices, or `None` once every candidate has been decoded.
+    ///
+    /// `Some(block)` with an empty `rows` is normal and distinct from `None`: a
+    /// candidate block can survive pruning yet hold no row inside the ts window.
+    /// Only `None` ends the scan and triggers the accounting fold.
+    pub fn next_block(&mut self) -> Result<Option<ColumnarBlock>, SpanFetchError> {
+        let Some((block_bytes, crc)) = self.next_candidate()? else {
+            return Ok(None);
+        };
+        let decoded = decode_block_rows(&block_bytes, crc, &self.projection, &self.query);
+        self.record_block(decoded).map(Some)
+    }
+
+    /// [`next_block`](Self::next_block) with the block decode run on the
+    /// fetcher's read gate (ADR-1702 decision 4): the whole block, all its
+    /// pages, is one job sized by the uncompressed lengths its header lists.
+    /// Without a gate this is `next_block`. Reaching exhaustion submits no
+    /// job.
+    pub async fn next_block_on_gate(&mut self) -> Result<Option<ColumnarBlock>, SpanFetchError> {
+        let Some(gate) = self.read_gate.clone() else {
+            return self.next_block();
+        };
+        let Some((block_bytes, crc)) = self.next_candidate()? else {
+            return Ok(None);
+        };
+        let size = JobSize::Bytes(block_uncompressed_len(&block_bytes));
+        let projection = self.projection.clone();
+        let query = self.query;
+        // Cleared only once the job returns: a failed job, or this future
+        // dropped while the job is queued or running, leaves the scan lost.
+        self.lost = true;
+        let decoded = match gate
+            .run(ReadSite::SpanBlock, size, move || {
+                decode_block_rows(&block_bytes, crc, &projection, &query)
+            })
+            .await
+        {
+            Ok(decoded) => decoded,
+            Err(err) => {
+                // Keep the failure so a later call repeats its class rather
+                // than degrading to a permanent store error.
+                self.lost_to = Some(err);
+                return Err(span_gate_failed(&self.key, err));
+            }
+        };
+        self.lost = false;
+        self.record_block(decoded).map(Some)
+    }
+
+    /// Advances to the next candidate block and returns its bytes, or `None`
+    /// (after the accounting fold) once every candidate has been taken.
+    fn next_candidate(&mut self) -> Result<Option<(Bytes, u32)>, SpanFetchError> {
+        if self.lost {
+            return Err(match self.lost_to {
+                Some(err) => span_gate_failed(&self.key, err),
+                None => span_scan_lost(&self.key),
+            });
+        }
+        let Some(&(start, end, crc)) = self.candidates.get(self.cursor) else {
+            self.finish();
+            return Ok(None);
+        };
+        self.cursor += 1;
+        if self.bytes.get(start..end).is_none() {
+            return Err(corrupt(
+                &self.key,
+                SpanSegError::Corrupted("block out of bounds".into()),
+            ));
+        }
+        Ok(Some((self.bytes.slice(start..end), crc)))
+    }
+
+    /// Folds one decoded block into the scan's counters and hands it out.
+    fn record_block(&mut self, decoded: DecodedRows) -> Result<ColumnarBlock, SpanFetchError> {
+        let (decoded, rows) = decoded.map_err(|source| corrupt(&self.key, source))?;
+        self.page_bytes_fetched += decoded.page_bytes_fetched;
+        self.page_bytes_decoded += decoded.page_bytes_decoded;
+        self.pages_decoded += decoded.block.pages_decoded();
+        self.pages_skipped += decoded.block.pages_skipped();
+        self.stats.blocks_scanned += 1;
+        let rows = rows.map_err(|source| corrupt(&self.key, source))?;
+        Ok(ColumnarBlock {
+            block: decoded.block,
+            rows,
+        })
+    }
+
+    /// Folds this scan's accumulated page-byte counters into the query's
+    /// accounting, exactly once (ADR-0107 decision 4).
+    fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.accounting
+            .add_page_bytes_fetched(self.page_bytes_fetched);
+        self.accounting
+            .add_page_bytes_decoded(self.page_bytes_decoded);
+    }
+}
+
+impl Drop for SpanColumnarScan {
+    /// A scan abandoned before exhaustion (an upstream `LIMIT` dropping the
+    /// stream is the reachable case) never hits `next_block`'s exhaustion arm,
+    /// so without this the partial decode it already did would be missing from
+    /// the query's accounting. `finish` is idempotent, so this is a no-op on the
+    /// already-exhausted path.
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+/// Which columns a block decode materializes, and thus which pages count as
+/// decoded for accounting. Mirrors `rspan`'s own projection: [`All`] is the row
+/// exit (every page), [`Only`] is the columnar exit's requested set unioned with
+/// the predicate columns.
+///
+/// [`All`]: BlockProjection::All
+/// [`Only`]: BlockProjection::Only
+#[derive(Clone)]
+enum BlockProjection {
+    All,
+    Only(Vec<u32>),
+}
+
+impl BlockProjection {
+    /// The columnar exit's effective decode set: the caller's `projected`
+    /// columns plus the predicate/ordering columns
+    /// ([`COL_TRACE_ID`]/[`COL_START_TS`]/[`COL_END_TS`]), deduplicated. Adding
+    /// the predicate columns is required, not optional: [`surviving_rows`] reads
+    /// them through the block view, which returns
+    /// [`ravel_rspan::SpanSegError::ColumnNotRequested`] if the decode did not
+    /// request them. ADR-0110 decision 4 names the same union.
+    fn columnar(projected: &[u32]) -> Self {
+        let mut cols: Vec<u32> = projected.to_vec();
+        for c in [COL_TRACE_ID, COL_START_TS, COL_END_TS] {
+            if !cols.contains(&c) {
+                cols.push(c);
+            }
+        }
+        BlockProjection::Only(cols)
+    }
+}
+
+/// A decoded block plus the stored page bytes its decode fetched and actually
+/// decoded (ADR-0107 decision 4).
+struct DecodedAccounted {
+    block: DecodedBlock,
+    page_bytes_fetched: u64,
+    page_bytes_decoded: u64,
+}
+
+/// Decode one block under `projection` and measure its stored page bytes
+/// (ADR-0107 decision 4). `page_bytes_fetched` is every page present in the
+/// block (the object was fetched whole regardless of projection);
+/// `page_bytes_decoded` is the pages this projection actually decoded. The two
+/// are equal for [`BlockProjection::All`] and diverge once the projection
+/// excludes a page the block carries.
+///
+/// The per-page byte split is read from the block header
+/// ([`parse_page_descs`]): `rspan`'s `read_block` surfaces page *counts*
+/// ([`DecodedBlock::pages_decoded`]/[`DecodedBlock::pages_skipped`]) but not
+/// their stored bytes, which is what this accounting needs. The decoded/skipped
+/// page counts this projection implies are cross-checked against the decode's
+/// own counts: a mismatch means the header walk and the decoder disagree about
+/// which pages ran, which would make the byte split a fiction, so it fails
+/// closed with a typed `Corrupted` error rather than reporting a plausible wrong
+/// number.
+fn decode_block_accounted(
+    block_bytes: &[u8],
+    crc: u32,
+    projection: &BlockProjection,
+) -> Result<DecodedAccounted, SpanSegError> {
+    let block = match projection {
+        BlockProjection::All => read_block(block_bytes, crc, DEFAULT_MAX_UNCOMP)?,
+        BlockProjection::Only(cols) => {
+            read_block_projected(block_bytes, crc, DEFAULT_MAX_UNCOMP, cols)?
+        }
+    };
+    // The decode validated the block's crc and structure, so this walk is over
+    // known-good bytes.
+    let descs = parse_page_descs(block_bytes)?;
+    let page_bytes_fetched: u64 = descs.iter().map(|(_, len)| *len).sum();
+
+    let (page_bytes_decoded, decoded_pages, skipped_pages) = match projection {
+        BlockProjection::All => (page_bytes_fetched, descs.len(), 0usize),
+        BlockProjection::Only(cols) => {
+            let mut decoded = 0u64;
+            let mut dcount = 0usize;
+            let mut scount = 0usize;
+            for (col, len) in &descs {
+                if page_needed(cols, *col) {
+                    decoded += *len;
+                    dcount += 1;
+                } else {
+                    scount += 1;
+                }
+            }
+            (decoded, dcount, scount)
+        }
+    };
+    if block.pages_decoded() != decoded_pages || block.pages_skipped() != skipped_pages {
+        return Err(SpanSegError::Corrupted(
+            "page-byte accounting disagreed with block decode".into(),
+        ));
+    }
+    Ok(DecodedAccounted {
+        block,
+        page_bytes_fetched,
+        page_bytes_decoded,
+    })
+}
+
+/// Whether column `col`'s page(s) are decoded under the columnar projection
+/// `cols`. Mirrors `rspan`'s `ColumnProjection::page_needed`: the four event
+/// columns decode as a group (all or none) whenever any event column is
+/// requested; every other column decodes iff it was requested. The runtime
+/// cross-check in [`decode_block_accounted`] guards this against drift from the
+/// decoder's own rule.
+fn page_needed(cols: &[u32], col: u32) -> bool {
+    const EVENT_COLS: [u32; 4] = [
+        COL_EVENT_COUNT,
+        COL_EVENT_TS,
+        COL_EVENT_NAME,
+        COL_EVENT_ATTRS_BLOB,
+    ];
+    if EVENT_COLS.contains(&col) {
+        cols.iter().any(|c| EVENT_COLS.contains(c))
+    } else {
+        cols.contains(&col)
+    }
+}
+
+/// A block decode's outcome: the decoded block and, separately, its surviving
+/// rows, so the scan counts a decoded block even when its row filter fails.
+type DecodedRows = Result<(DecodedAccounted, Result<Vec<usize>, SpanSegError>), SpanSegError>;
+
+/// Decodes one candidate block under `projection` and computes its surviving
+/// rows: the unit a gated decode runs as one job.
+fn decode_block_rows(
+    block_bytes: &[u8],
+    crc: u32,
+    projection: &BlockProjection,
+    query: &SpanQuery,
+) -> DecodedRows {
+    let decoded = decode_block_accounted(block_bytes, crc, projection)?;
+    let rows = surviving_rows(&decoded.block, query);
+    Ok((decoded, rows))
+}
+
+/// The sum of the uncompressed page lengths a block's header lists, which is
+/// what its decode inflates to. The header is not yet crc-checked here, so the
+/// walk allocates nothing, and a header it cannot read sizes the block at
+/// `u64::MAX`: the decode that follows reports the same bytes as corrupt.
+fn block_uncompressed_len(block_bytes: &[u8]) -> u64 {
+    let walk = || -> Result<u64, SpanSegError> {
+        let mut pos = 0usize;
+        let _record_count = get_uvarint(block_bytes, &mut pos)?;
+        let page_count = get_uvarint(block_bytes, &mut pos)?;
+        let mut total = 0u64;
+        for _ in 0..page_count {
+            let _column_id = get_uvarint(block_bytes, &mut pos)?;
+            pos = pos
+                .checked_add(2)
+                .filter(|p| *p <= block_bytes.len())
+                .ok_or_else(|| {
+                    SpanSegError::Corrupted("block truncated at page enc/comp".into())
+                })?;
+            let _len = get_uvarint(block_bytes, &mut pos)?;
+            total = total.saturating_add(get_uvarint(block_bytes, &mut pos)?);
+        }
+        Ok(total)
+    };
+    walk().unwrap_or(u64::MAX)
+}
+
+/// The `(column_id, stored_len)` of every page in a block, read from the block
+/// header's page-descriptor table (docs/segment-format.md). `rspan` decodes this
+/// table internally but exposes only page *counts*
+/// ([`DecodedBlock::pages_decoded`]/[`DecodedBlock::pages_skipped`]), not the
+/// stored bytes ADR-0107 decision 4's `page_bytes_fetched`/`page_bytes_decoded`
+/// account, so the byte split is read here from the frozen header layout. Called
+/// only after `read_block` has validated the block's crc and structure, so the
+/// walk is over known-good bytes; any inconsistency is still returned as a typed
+/// `Corrupted` error rather than a panic.
+fn parse_page_descs(block_bytes: &[u8]) -> Result<Vec<(u32, u64)>, SpanSegError> {
+    let mut pos = 0usize;
+    let _record_count = get_uvarint(block_bytes, &mut pos)?;
+    let page_count = usize::try_from(get_uvarint(block_bytes, &mut pos)?)
+        .map_err(|_| SpanSegError::Corrupted("page count range".into()))?;
+    let mut out = Vec::with_capacity(page_count);
+    for _ in 0..page_count {
+        let column_id = u32::try_from(get_uvarint(block_bytes, &mut pos)?)
+            .map_err(|_| SpanSegError::Corrupted("column id range".into()))?;
+        // The enc (1 byte) and comp (1 byte) tags do not affect the stored byte
+        // count, only `pos`; skip past them, bounds-checked.
+        pos = pos
+            .checked_add(2)
+            .filter(|p| *p <= block_bytes.len())
+            .ok_or_else(|| SpanSegError::Corrupted("block truncated at page enc/comp".into()))?;
+        let len = get_uvarint(block_bytes, &mut pos)?;
+        let _uncomp_len = get_uvarint(block_bytes, &mut pos)?;
+        out.push((column_id, len));
+    }
+    Ok(out)
+}
+
+/// The rows of `block` that survive `query` — the ts window overlap and, when
+/// set, the `trace_id` equality — evaluated over the [`COL_START_TS`],
+/// [`COL_END_TS`], and [`COL_TRACE_ID`] columns through the block view, in
+/// ascending row order. This is the columnar form of the old per-record
+/// `matches`: `start_ts <= ts_max && end_ts >= ts_min`, plus `trace_id == tid`
+/// when a trace filter is set. Both exits compute survivors here, so a block's
+/// surviving set is identical whether the caller wants rows or columns.
+fn surviving_rows(block: &DecodedBlock, query: &SpanQuery) -> Result<Vec<usize>, SpanSegError> {
+    let view = block.view();
+    let start = view.i64_column(COL_START_TS)?;
+    let end = view.i64_column(COL_END_TS)?;
+    let trace = match query.trace_id {
+        Some(_) => Some(view.fixed_column(COL_TRACE_ID)?),
+        None => None,
+    };
+    let mut rows = Vec::new();
+    for row in 0..block.record_count() {
+        if let (Some(want), Some(col)) = (query.trace_id.as_ref(), trace.as_ref())
+            && col.value_at(row) != Some(want.as_slice())
+        {
+            continue;
+        }
+        // start_ts/end_ts are always-present columns (the writer stages them for
+        // every row); a missing value is a corrupt block, the same input the row
+        // path's `record` errors on, so it fails closed rather than silently
+        // dropping the row.
+        let s = start
+            .value_at(row)
+            .ok_or_else(|| SpanSegError::Corrupted("missing start_ts".into()))?;
+        let e = end
+            .value_at(row)
+            .ok_or_else(|| SpanSegError::Corrupted("missing end_ts".into()))?;
+        if s <= query.ts_max && e >= query.ts_min {
+            rows.push(row);
+        }
+    }
+    Ok(rows)
+}
+
+/// Rebuild one [`SpanRow`] from a fully-decoded block (the row exit's
+/// [`BlockProjection::All`]), identically to the pre-columnar scan: the whole
+/// record plus `service_name` read straight from the v3 dictionary column
+/// (ADR-0054), not by scanning the merged attrs map.
+fn build_span_row(block: &DecodedBlock, row: usize) -> Result<SpanRow, SpanSegError> {
+    let record = block.record(row)?;
+    let service_name = match block.service_name(row) {
+        Some(v) => Some(
+            String::from_utf8(v)
+                .map_err(|_| SpanSegError::Corrupted("service_name not utf-8".into()))?,
+        ),
+        None => None,
+    };
+    Ok(SpanRow {
+        record,
+        service_name,
+    })
+}
+
+/// Drain a full [`BlockProjection::All`] scan into the row exit's
+/// [`SpanFetchOutput`]: every candidate block's surviving rows rebuilt as
+/// `SpanRow`s, in scan order. This is the row exit expressed over the columnar
+/// primitive, so `fetch`/`fetch_accounted` share candidate selection, bloom
+/// probing, ts/`trace_id` filtering, and the page-byte fold with the columnar
+/// exit. Dropping the scan folds its accounting (`finish`).
+///
+/// The scan's page counts ride out on the output next to `stats`, so the row
+/// exit's caller can publish the same `pages_decoded`/`pages_skipped` figures
+/// the columnar exit's caller reads off each [`ColumnarBlock`] (#669).
+async fn drain_rows(mut scan: SpanColumnarScan) -> Result<SpanFetchOutput, SpanFetchError> {
+    let mut records = Vec::new();
+    while let Some(block) = scan.next_block_on_gate().await? {
+        for &row in &block.rows {
+            records.push(
+                build_span_row(&block.block, row).map_err(|source| corrupt(&scan.key, source))?,
+            );
+        }
+    }
+    let stats = scan.stats();
+    Ok(SpanFetchOutput {
+        records,
+        stats,
+        pages_decoded: scan.pages_decoded(),
+        pages_skipped: scan.pages_skipped(),
+    })
+}
+
+/// The absolute, bounds-checked `[start, end)` byte range of one block within
+/// the whole object. `block_offset`/`block_len` (from the block's SKIP_IDX
+/// entry) are relative to the BLOCKS section; the range is checked against the
+/// section's own length (`blocks_len`), not merely the whole object, so a
+/// corrupt `(offset, len)` decoded from SKIP_IDX can never land past the section
+/// end and slice foreign SKIP_IDX/footer bytes. Every violation is a typed
+/// `Corrupted` error, never a panic. Mirrors `RspanReader::block_bytes`, which
+/// is private to `ravel-rspan`.
+fn abs_block_range(
+    blocks_offset: u64,
+    blocks_len: u64,
+    entry: &BlockEntry,
+) -> Result<(usize, usize), SpanSegError> {
+    let rel_end = entry
+        .block_offset
+        .checked_add(entry.block_len)
+        .ok_or_else(|| SpanSegError::Corrupted("block range overflow".into()))?;
+    if rel_end > blocks_len {
+        return Err(SpanSegError::Corrupted(
+            "block range exceeds BLOCKS section".into(),
+        ));
+    }
+    let abs = blocks_offset
+        .checked_add(entry.block_offset)
+        .ok_or_else(|| SpanSegError::Corrupted("block offset overflow".into()))?;
+    let start =
+        usize::try_from(abs).map_err(|_| SpanSegError::Corrupted("block offset range".into()))?;
+    let len = usize::try_from(entry.block_len)
+        .map_err(|_| SpanSegError::Corrupted("block len range".into()))?;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| SpanSegError::Corrupted("block range overflow".into()))?;
+    Ok((start, end))
+}
+
+fn corrupt(key: &str, source: SpanSegError) -> SpanFetchError {
+    SpanFetchError::Corrupt {
+        key: key.to_string(),
+        source,
+    }
+}
+
+/// A failed block decode job (ADR-1702 decision 2): a panic is the decode's
+/// own error, a job that never ran is transient.
+fn span_gate_failed(key: &str, err: CpuGateError) -> SpanFetchError {
+    match err {
+        CpuGateError::Panicked => corrupt(
+            key,
+            SpanSegError::Corrupted(format!("read CPU gate: {err}")),
+        ),
+        CpuGateError::Cancelled | CpuGateError::Closed => SpanFetchError::Store {
+            key: key.to_string(),
+            source: gate_not_run(err),
+        },
+    }
+}
+
+/// A [`SpanColumnarScan`] read again after a gated block decode was abandoned:
+/// the caller dropped the future while the job was queued or running, so no
+/// classified failure exists to repeat. Permanent: that block cannot be read
+/// through this scan, and moving on to the next one would return a partial
+/// segment. A block lost to a gate failure reports that failure's own class
+/// instead, so a panicked decode does not turn into a permanent store error the
+/// HTTP layer redacts.
+fn span_scan_lost(key: &str) -> SpanFetchError {
+    SpanFetchError::Store {
+        key: key.to_string(),
+        source: StoreError::Permanent(
+            "read CPU gate: the scan lost a block with a failed block decode".to_string(),
+        ),
+    }
+}
+
+/// Maps a read-cache single-flight error onto [`SpanFetchError`], mirroring
+/// `log_fetcher::from_cache_error`. `SpanFetchError` carries no `EtagChanged`
+/// variant (RSPAN's cache closure never checks an etag, unlike the block-range
+/// funnel this mapping shape was copied from), so that arm folds into
+/// `Corrupt` rather than being silently dropped from the match.
+fn from_cache_error(
+    key: &str,
+    err: SingleFlightError<crate::fetcher::CacheFetchError>,
+) -> SpanFetchError {
+    match err {
+        SingleFlightError::Upstream(crate::fetcher::CacheFetchError::Store(source)) => {
+            SpanFetchError::Store {
+                key: key.to_string(),
+                source: crate::fetcher::clone_store_error(&source),
+            }
+        }
+        SingleFlightError::Upstream(crate::fetcher::CacheFetchError::EtagChanged { .. }) => {
+            SpanFetchError::Corrupt {
+                key: key.to_string(),
+                source: SpanSegError::Corrupted(
+                    "read cache reported a changed etag, which this funnel never checks".into(),
+                ),
+            }
+        }
+        SingleFlightError::Upstream(crate::fetcher::CacheFetchError::Corrupt {
+            message, ..
+        }) => SpanFetchError::Corrupt {
+            key: key.to_string(),
+            source: SpanSegError::Corrupted(message),
+        },
+        // Unreachable from this closure: it holds no `ReadLimits` and never
+        // admits against a request or byte budget, so it never constructs
+        // `BudgetRefused`. Handled explicitly rather than through a wildcard
+        // so a future budget check added here cannot silently fall through
+        // as a store error.
+        SingleFlightError::Upstream(crate::fetcher::CacheFetchError::BudgetRefused {
+            message,
+            ..
+        }) => SpanFetchError::Store {
+            key: key.to_string(),
+            source: StoreError::Transient(format!(
+                "cache single-flight closure reported a budget refusal, which the RSPAN funnel \
+                 never produces: {message}"
+            )),
+        },
+        SingleFlightError::LeaderLost => SpanFetchError::Store {
+            key: key.to_string(),
+            source: StoreError::Transient(
+                "cache single-flight leader lost before producing a result".to_string(),
+            ),
+        },
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    use ravel_catalog::SegmentLevel;
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_rspan::record::{
+        COL_PARENT_SPAN_ID, COL_SPAN_ID, COL_STATUS_CODE, COL_STATUS_MESSAGE, EVENTS_RAW_KEY,
+        reconstruct_events_raw,
+    };
+    use ravel_rspan::{
+        COL_NAME, COL_SERVICE_NAME, ObjectIdentity, RspanWriter, SpanEvent, StatusCode,
+    };
+    use uuid::Uuid;
+
+    const TENANT: TenantHash = TenantHash([9u8; 16]);
+
+    /// Deliverable 1: `SpanSegmentFetcher::new` defaults to an unlimited budget
+    /// (inert accounting) and `with_memory_budget` installs the shared one the
+    /// engine hands every fetcher.
+    #[test]
+    fn with_memory_budget_installs_the_shared_budget() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let fetcher = SpanSegmentFetcher::new(store);
+        assert_eq!(
+            fetcher.memory_budget_for_test().limit(),
+            u64::MAX,
+            "the default budget is unlimited, so the accounting is inert"
+        );
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 20));
+        let fetcher = fetcher.with_memory_budget(budget.clone());
+        assert!(Arc::ptr_eq(fetcher.memory_budget_for_test(), &budget));
+    }
+
+    /// The columnar exit's projection for these tests: every FIXED column, and
+    /// nothing dynamic. It decodes `trace_id`, `span_id`, `parent_span_id`,
+    /// `name`, `start_ts`, `end_ts`, `status_code`, `status_message`, and
+    /// `service_name`, and excludes ONLY the attribute pages (`attrs_raw` and the
+    /// dynamic per-key columns) and the four event pages. That exclusion set is
+    /// exactly the ADR-0110 win, so the divergence a test sees is attributable to
+    /// attribute and event pages alone -- see the vacuity note on the acceptance
+    /// test.
+    const FIXED_PROJECTION: [u32; 9] = [
+        COL_TRACE_ID,
+        COL_SPAN_ID,
+        COL_PARENT_SPAN_ID,
+        COL_NAME,
+        COL_START_TS,
+        COL_END_TS,
+        COL_STATUS_CODE,
+        COL_STATUS_MESSAGE,
+        COL_SERVICE_NAME,
+    ];
+
+    /// A span carrying both attribute pages (a lifted `service.name` plus two
+    /// dynamic per-key attributes) and an event page (one `_events_raw` event),
+    /// so every block a corpus of these produces has attribute and event pages
+    /// the fixed-column projection excludes.
+    fn span_with_attrs_and_events(
+        trace_id: [u8; 16],
+        span_id: [u8; 8],
+        start: i64,
+        end: i64,
+    ) -> SpanRecord {
+        let event = SpanEvent {
+            ts_ns: start + 1,
+            name: "boom".to_string(),
+            attrs_blob: vec![0x0a, 0x03, b'a', b'b', b'c'],
+        };
+        SpanRecord {
+            trace_id,
+            span_id,
+            parent_span_id: None,
+            name: "op".to_string(),
+            start_ts_ns: start,
+            end_ts_ns: end,
+            status_code: StatusCode::Unset,
+            status_message: None,
+            attrs: vec![
+                ("service.name".to_string(), "api".to_string()),
+                ("http.method".to_string(), "GET".to_string()),
+                ("http.route".to_string(), "/v1/spans".to_string()),
+                (EVENTS_RAW_KEY.to_string(), reconstruct_events_raw(&[event])),
+            ],
+        }
+    }
+
+    /// An attribute-free, event-free span: only fixed columns, so a block of
+    /// these carries no attribute or event page at all.
+    fn bare_span(trace_id: [u8; 16], span_id: [u8; 8], start: i64, end: i64) -> SpanRecord {
+        SpanRecord {
+            trace_id,
+            span_id,
+            parent_span_id: None,
+            name: "op".to_string(),
+            start_ts_ns: start,
+            end_ts_ns: end,
+            status_code: StatusCode::Unset,
+            status_message: None,
+            attrs: Vec::new(),
+        }
+    }
+
+    /// Write one RSPAN object holding `records` with small blocks
+    /// (`block_target_records = 2`, so several records make several blocks) and
+    /// return its `SegmentRef`. The footer carries [`TENANT`], so the
+    /// tenant-checked funnels accept it.
+    async fn write_object(store: &MemoryStore, key: u64, records: &[SpanRecord]) -> SegmentRef {
+        let cfg = RspanConfig {
+            block_target_records: 2,
+            ..RspanConfig::default()
+        };
+        let identity = ObjectIdentity {
+            tenant_hash: TENANT.0,
+            shard: 0,
+            writer_id: [4u8; 16],
+            writer_epoch: 1,
+            writer_seq: key,
+        };
+        let mut writer = RspanWriter::new(cfg, identity);
+        for r in records {
+            writer.push(r.clone());
+        }
+        let bytes = writer.finish().expect("finish rspan object");
+        let size = bytes.len() as u64;
+        let object_key = format!("spans/{key}.rspan");
+        store
+            .put(&object_key, Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put span object");
+        let min = records
+            .iter()
+            .map(|r| r.start_ts_ns)
+            .min()
+            .expect("nonempty");
+        let max = records.iter().map(|r| r.end_ts_ns).max().expect("nonempty");
+        SegmentRef {
+            data_object_key: object_key,
+            object_size: size,
+            min_event_ts_ns: min,
+            max_event_ts_ns: max,
+            ingest_hour_bucket: 0,
+            sample_count: records.len() as u64,
+            series_count: 0,
+            shard: 0,
+            content_hash: [key as u8; 32],
+            writer_id: Uuid::from_u128(u128::from(key) + 1),
+            writer_epoch: 1,
+            writer_seq: key,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_rspan::footer::VERSION),
+            declared_column_stats: Default::default(),
+        }
+    }
+
+    fn trace(n: u8) -> [u8; 16] {
+        [n; 16]
+    }
+    fn span(n: u8) -> [u8; 8] {
+        [n; 8]
+    }
+
+    /// The full-window query that prunes nothing, so both exits scan every block.
+    fn all_query() -> SpanQuery {
+        SpanQuery::ts_range(i64::MIN, i64::MAX)
+    }
+
+    /// Acceptance test (ADR-0110 decision 7): over a corpus whose blocks carry
+    /// attribute and event pages, the row and columnar exits fetch the SAME page
+    /// bytes but the columnar exit DECODES strictly fewer, because its
+    /// fixed-column projection skips the attribute and event pages.
+    ///
+    /// The corpus MUST carry attribute and event pages. Over an attribute-free,
+    /// event-free corpus the fixed-column projection excludes no page the block
+    /// actually holds (every fixed column is projected), both exits decode the
+    /// same bytes, and `page_bytes_decoded` is EQUAL -- so the strict-lower
+    /// assertion would pass vacuously for even a broken implementation that never
+    /// skipped a page. `attrs_free_corpus_makes_the_divergence_vacuous` below
+    /// pins that boundary. Here every span carries two dynamic attributes and an
+    /// event, so every block carries the pages the projection skips.
+    #[tokio::test]
+    async fn columnar_and_row_exits_agree_on_page_bytes_fetched_and_diverge_on_decoded() {
+        let store = Arc::new(MemoryStore::new());
+        let records: Vec<SpanRecord> = (0..6)
+            .map(|i| {
+                span_with_attrs_and_events(
+                    trace(i + 1),
+                    span(i + 1),
+                    100 + i64::from(i),
+                    200 + i64::from(i),
+                )
+            })
+            .collect();
+        let seg = write_object(&store, 0, &records).await;
+        let fetcher = SpanSegmentFetcher::new(store);
+        let query = all_query();
+
+        let row_acct = QueryAccounting::new();
+        let row_out = fetcher
+            .fetch_accounted(&seg, TENANT, &query, None, None, &[], &row_acct)
+            .await
+            .expect("row fetch")
+            .expect("row output");
+
+        let col_acct = QueryAccounting::new();
+        let mut scan = fetcher
+            .fetch_accounted_columnar(
+                &seg,
+                TENANT,
+                &query,
+                None,
+                None,
+                &[],
+                &FIXED_PROJECTION,
+                &col_acct,
+            )
+            .await
+            .expect("columnar fetch")
+            .expect("columnar scan");
+        let mut col_rows = 0usize;
+        while let Some(block) = scan.next_block().expect("next block") {
+            col_rows += block.rows.len();
+        }
+        drop(scan);
+
+        let row = row_acct.snapshot();
+        let col = col_acct.snapshot();
+
+        assert!(row.page_bytes_fetched > 0, "fixture blocks carry pages");
+        assert_eq!(
+            row.page_bytes_decoded, row.page_bytes_fetched,
+            "the row exit decodes every page (BlockProjection::All)"
+        );
+        assert_eq!(
+            col.page_bytes_fetched, row.page_bytes_fetched,
+            "the object is fetched whole either way: page_bytes_fetched is identical"
+        );
+        assert!(
+            col.page_bytes_decoded < row.page_bytes_decoded,
+            "the columnar exit skips attribute and event page decode: col decoded {} vs row decoded {}",
+            col.page_bytes_decoded,
+            row.page_bytes_decoded,
+        );
+        assert_eq!(
+            col_rows,
+            row_out.records.len(),
+            "both exits select the identical surviving-row multiset"
+        );
+    }
+
+    /// Issue #669: the row exit reports the page COUNTS its decode performed, so
+    /// its caller can publish the same `pages_decoded`/`pages_skipped` metrics
+    /// the columnar exit's caller publishes. Exact figures, from the fixture's
+    /// geometry: 6 spans cut every 2 records is 3 blocks, and each block stages
+    /// 13 pages (`trace_id`, `span_id`, `name`, `start_ts`, `end_ts`,
+    /// `status_code`, `service_name`, the two dynamic attribute columns, and the
+    /// four event columns; `parent_span_id`, `status_message`, and `attrs_raw`
+    /// have no value on any fixture span, and a column with no present value
+    /// stages no page). The row exit decodes all 39 and skips none; the
+    /// fixed-column projection splits those same 39 into 21 decoded and 18
+    /// skipped.
+    #[tokio::test]
+    async fn row_exit_reports_the_page_counts_the_columnar_exit_splits() {
+        let store = Arc::new(MemoryStore::new());
+        let records: Vec<SpanRecord> = (0..6)
+            .map(|i| {
+                span_with_attrs_and_events(
+                    trace(i + 1),
+                    span(i + 1),
+                    100 + i64::from(i),
+                    200 + i64::from(i),
+                )
+            })
+            .collect();
+        let seg = write_object(&store, 0, &records).await;
+        let fetcher = SpanSegmentFetcher::new(store);
+        let query = all_query();
+
+        let acct = QueryAccounting::new();
+        let row_out = fetcher
+            .fetch_accounted(&seg, TENANT, &query, None, None, &[], &acct)
+            .await
+            .expect("row fetch")
+            .expect("row output");
+        assert_eq!(row_out.stats.blocks_scanned, 3, "three blocks scanned");
+        assert_eq!(
+            (row_out.pages_decoded, row_out.pages_skipped),
+            (39, 0),
+            "the row exit decodes every page of every block it scans"
+        );
+
+        let mut scan = fetcher
+            .fetch_accounted_columnar(
+                &seg,
+                TENANT,
+                &query,
+                None,
+                None,
+                &[],
+                &FIXED_PROJECTION,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("columnar fetch")
+            .expect("columnar scan");
+        while scan.next_block().expect("next block").is_some() {}
+        assert_eq!(
+            (scan.pages_decoded(), scan.pages_skipped()),
+            (21, 18),
+            "the fixed-column projection's split of those same pages"
+        );
+        assert_eq!(
+            scan.pages_decoded() + scan.pages_skipped(),
+            row_out.pages_decoded,
+            "both exits walk the same pages; only the split differs"
+        );
+    }
+
+    /// The boundary the acceptance test's comment names: with an attribute-free,
+    /// event-free corpus the fixed-column projection excludes no page the block
+    /// carries, so both exits decode identical bytes and the strict-lower
+    /// assertion would be vacuous. This test asserts the EQUALITY, so it stands
+    /// guard: if a future change makes the fixed projection skip an
+    /// always-present page, this breaks and forces the vacuity note to be
+    /// revisited.
+    #[tokio::test]
+    async fn attrs_free_corpus_makes_the_divergence_vacuous() {
+        let store = Arc::new(MemoryStore::new());
+        let records: Vec<SpanRecord> = (0..6)
+            .map(|i| {
+                bare_span(
+                    trace(i + 1),
+                    span(i + 1),
+                    100 + i64::from(i),
+                    200 + i64::from(i),
+                )
+            })
+            .collect();
+        let seg = write_object(&store, 1, &records).await;
+        let fetcher = SpanSegmentFetcher::new(store);
+        let query = all_query();
+
+        let acct = QueryAccounting::new();
+        let mut scan = fetcher
+            .fetch_accounted_columnar(
+                &seg,
+                TENANT,
+                &query,
+                None,
+                None,
+                &[],
+                &FIXED_PROJECTION,
+                &acct,
+            )
+            .await
+            .expect("columnar fetch")
+            .expect("columnar scan");
+        while scan.next_block().expect("next block").is_some() {}
+        drop(scan);
+
+        let snap = acct.snapshot();
+        assert!(
+            snap.page_bytes_fetched > 0,
+            "bare spans still have fixed-column pages"
+        );
+        assert_eq!(
+            snap.page_bytes_decoded, snap.page_bytes_fetched,
+            "with no attribute or event page, the projection skips nothing"
+        );
+    }
+
+    /// Abandonment test (ADR-0107 decision 4): a columnar scan dropped after one
+    /// consumed block still folds that block's page bytes into accounting, and
+    /// the folded magnitude is EXACTLY the consumed block's decoded/fetched
+    /// sizes, not merely non-zero. A non-zero assertion would pass just as well
+    /// on a fraction-of-the-truth undercount, which is how an accounting bug
+    /// survives a green suite; pinning the magnitude catches it.
+    #[tokio::test]
+    async fn columnar_scan_folds_exactly_one_consumed_blocks_bytes_on_early_drop() {
+        let store = Arc::new(MemoryStore::new());
+        let records: Vec<SpanRecord> = (0..6)
+            .map(|i| {
+                span_with_attrs_and_events(
+                    trace(i + 1),
+                    span(i + 1),
+                    100 + i64::from(i),
+                    200 + i64::from(i),
+                )
+            })
+            .collect();
+        let seg = write_object(&store, 2, &records).await;
+        let store_dyn: Arc<dyn ObjectStoreBackend> = store.clone();
+        let fetcher = SpanSegmentFetcher::new(store_dyn);
+        let query = all_query();
+
+        // The first block's own fetched/decoded page bytes, computed directly
+        // from that block under the same projection. This is the magnitude the
+        // fold must land on exactly after one consumed block.
+        let bytes = store
+            .get(&seg.data_object_key, GetRange::Full)
+            .await
+            .expect("get object")
+            .data;
+        let (candidates, _stats) = fetcher
+            .plan_candidates(&bytes, &query, None, None, &[])
+            .expect("plan candidates");
+        assert!(
+            candidates.len() >= 2,
+            "multi-block corpus for an abandonment test"
+        );
+        let (start, end, crc) = candidates[0];
+        let projection = BlockProjection::columnar(&FIXED_PROJECTION);
+        let block0 =
+            decode_block_accounted(&bytes[start..end], crc, &projection).expect("decode block 0");
+        let (exp_fetched, exp_decoded) = (block0.page_bytes_fetched, block0.page_bytes_decoded);
+        assert!(
+            exp_decoded < exp_fetched,
+            "block 0 carries attribute/event pages the projection skips"
+        );
+
+        let acct = QueryAccounting::new();
+        let mut scan = fetcher
+            .fetch_accounted_columnar(
+                &seg,
+                TENANT,
+                &query,
+                None,
+                None,
+                &[],
+                &FIXED_PROJECTION,
+                &acct,
+            )
+            .await
+            .expect("columnar fetch")
+            .expect("columnar scan");
+        let _first = scan.next_block().expect("first block").expect("some block");
+        // The fold is deferred to exhaustion or drop: nothing is accounted yet.
+        assert_eq!(
+            acct.snapshot().page_bytes_fetched,
+            0,
+            "page-byte fold is deferred to finish(), not done per block"
+        );
+        drop(scan);
+
+        let snap = acct.snapshot();
+        assert_eq!(
+            snap.page_bytes_fetched, exp_fetched,
+            "one consumed block's fetched page bytes are folded on drop"
+        );
+        assert_eq!(
+            snap.page_bytes_decoded, exp_decoded,
+            "one consumed block's decoded page bytes are folded on drop"
+        );
+    }
+
+    /// The row and columnar exits return the identical surviving-row set for a
+    /// `trace_id`-filtered query too, proving the shared predicate
+    /// ([`surviving_rows`]) matches the old per-record `matches` on both axes
+    /// (ts window and trace_id equality).
+    #[tokio::test]
+    async fn both_exits_agree_on_surviving_rows_under_a_trace_filter() {
+        let store = Arc::new(MemoryStore::new());
+        let records = vec![
+            span_with_attrs_and_events(trace(1), span(1), 100, 200),
+            span_with_attrs_and_events(trace(2), span(2), 100, 200),
+            span_with_attrs_and_events(trace(3), span(3), 100, 200),
+            // Same trace as the query, but its ts window is disjoint, so the ts
+            // half of the predicate must exclude it.
+            span_with_attrs_and_events(trace(2), span(4), 400, 500),
+        ];
+        let seg = write_object(&store, 3, &records).await;
+        let fetcher = SpanSegmentFetcher::new(store);
+
+        // With `block_target_records = 2`, trace 1 and trace 2 land in one block
+        // whose trace range `[1, 2]` brackets the queried trace 2: block-level
+        // pruning keeps the block, so it is the per-row predicate that must drop
+        // the trace-1 row. Exactly the in-window trace-2 span survives.
+        let query = SpanQuery {
+            trace_id: Some(trace(2)),
+            ts_min: 50,
+            ts_max: 300,
+        };
+
+        let row_acct = QueryAccounting::new();
+        let row_out = fetcher
+            .fetch_accounted(&seg, TENANT, &query, None, None, &[], &row_acct)
+            .await
+            .expect("row fetch")
+            .expect("row output");
+        assert_eq!(
+            row_out.records.len(),
+            1,
+            "exactly one span matches trace and ts"
+        );
+        assert_eq!(
+            row_out.records[0].record.trace_id,
+            trace(2),
+            "the surviving row is trace 2"
+        );
+        assert_eq!(
+            row_out.records[0].record.start_ts_ns, 100,
+            "and it is the in-window trace-2 span, not the ts-excluded one"
+        );
+
+        let col_acct = QueryAccounting::new();
+        let mut scan = fetcher
+            .fetch_accounted_columnar(
+                &seg,
+                TENANT,
+                &query,
+                None,
+                None,
+                &[],
+                &FIXED_PROJECTION,
+                &col_acct,
+            )
+            .await
+            .expect("columnar fetch")
+            .expect("columnar scan");
+        let mut col_rows = 0usize;
+        while let Some(block) = scan.next_block().expect("next block") {
+            col_rows += block.rows.len();
+        }
+        drop(scan);
+
+        assert_eq!(
+            col_rows,
+            row_out.records.len(),
+            "both exits select the identical surviving-row multiset under a trace filter"
+        );
+    }
+
+    /// ADR-1195: `SpanSegmentFetcher` had no GET concurrency bound at all
+    /// before this change. `with_max_concurrent_gets(1)` must cap in-flight
+    /// GETs at exactly 1 -- proven the same way as the RSEG/RLOG shared-bound
+    /// tests (`crate::fetcher`'s `shared_get_limiter_bounds_peak_concurrent_gets_to_one`):
+    /// a `FaultStore` hold gate observes the store's own in-flight GET count
+    /// directly, so this pins the fetcher's own bookkeeping against the
+    /// store's view, not just against itself.
+    #[tokio::test]
+    async fn get_limiter_bounds_peak_concurrent_gets_to_permit_count() {
+        use ravel_object_store::fault::{FaultPlan, FaultStore, GateHandle, Occurrence};
+
+        let memory = MemoryStore::new();
+        let records = vec![span_with_attrs_and_events(trace(1), span(1), 100, 200)];
+        let seg = write_object(&memory, 0, &records).await;
+        let fault = Arc::new(FaultStore::new(memory, FaultPlan::default()));
+        let gate: GateHandle =
+            fault.hold(ravel_object_store::fault::Op::Get, None, Occurrence::Always);
+        let backend: Arc<dyn ObjectStoreBackend> = fault;
+
+        let fetcher = SpanSegmentFetcher::new(backend).with_max_concurrent_gets(1);
+        let query = all_query();
+
+        let fetcher_a = fetcher.clone();
+        let seg_a = seg.clone();
+        let query_a = query;
+        let handle_a =
+            tokio::spawn(async move { fetcher_a.fetch(&seg_a, &query_a, None, None, &[]).await });
+        let fetcher_b = fetcher.clone();
+        let seg_b = seg.clone();
+        let query_b = query;
+        let handle_b =
+            tokio::spawn(async move { fetcher_b.fetch(&seg_b, &query_b, None, None, &[]).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+            .await
+            .expect("one of the two fetches issues its GET within 30 s");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                gate.wait_until_held(2)
+            )
+            .await
+            .is_err(),
+            "the second GET must never become in-flight while the one permit is held"
+        );
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "one permit must cap in-flight GETs at exactly 1"
+        );
+
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+            .await
+            .expect("releasing the first permit lets the second GET proceed within 30 s");
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "the second GET must be the only one held once the first releases"
+        );
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+
+        let a = tokio::time::timeout(std::time::Duration::from_secs(30), handle_a)
+            .await
+            .expect("fetch a completes within 30 s")
+            .expect("join fetch a")
+            .expect("fetch a")
+            .expect("fetch a found the segment relevant");
+        let b = tokio::time::timeout(std::time::Duration::from_secs(30), handle_b)
+            .await
+            .expect("fetch b completes within 30 s")
+            .expect("join fetch b")
+            .expect("fetch b")
+            .expect("fetch b found the segment relevant");
+        assert_eq!(a.records.len(), 1);
+        assert_eq!(b.records.len(), 1);
+    }
+
+    /// The permits=1 test above cannot distinguish "at most 1", "exactly 1",
+    /// and "exactly the permit count": all three coincide at 1. This pins the
+    /// count itself: three concurrent fetches from two INDEPENDENTLY
+    /// constructed `SpanSegmentFetcher`s sharing one `GetLimiter::new(2)`
+    /// (ADR-1195) must peak at EXACTLY 2 in-flight GETs, never all 3.
+    #[tokio::test]
+    async fn shared_get_limiter_bounds_three_fetches_to_permit_count_two() {
+        use ravel_object_store::fault::{FaultPlan, FaultStore, GateHandle, Occurrence};
+
+        let memory = MemoryStore::new();
+        let records = vec![span_with_attrs_and_events(trace(1), span(1), 100, 200)];
+        let seg = write_object(&memory, 0, &records).await;
+        let fault = Arc::new(FaultStore::new(memory, FaultPlan::default()));
+        let gate: GateHandle =
+            fault.hold(ravel_object_store::fault::Op::Get, None, Occurrence::Always);
+        let backend: Arc<dyn ObjectStoreBackend> = fault;
+
+        let shared = Arc::new(crate::GetLimiter::new(2).expect("2 permits is valid"));
+        let fetcher_a = SpanSegmentFetcher::new(backend.clone()).with_get_limiter(shared.clone());
+        let fetcher_b = SpanSegmentFetcher::new(backend).with_get_limiter(shared);
+        let query = all_query();
+
+        let seg_a = seg.clone();
+        let query_a = query;
+        let fa1 = fetcher_a.clone();
+        let handle_a1 =
+            tokio::spawn(async move { fa1.fetch(&seg_a, &query_a, None, None, &[]).await });
+        let seg_a2 = seg.clone();
+        let query_a2 = query;
+        let fa2 = fetcher_a.clone();
+        let handle_a2 =
+            tokio::spawn(async move { fa2.fetch(&seg_a2, &query_a2, None, None, &[]).await });
+        let seg_b = seg.clone();
+        let query_b = query;
+        let handle_b =
+            tokio::spawn(async move { fetcher_b.fetch(&seg_b, &query_b, None, None, &[]).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(2))
+            .await
+            .expect("two of the three fetches issue their GET within 30 s");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                gate.wait_until_held(3)
+            )
+            .await
+            .is_err(),
+            "two permits must cap in-flight GETs at exactly 2, never all 3"
+        );
+        assert_eq!(
+            gate.held_count(),
+            2,
+            "peak in-flight GETs must be exactly 2, not 1 and not 3"
+        );
+
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+            .await
+            .expect("releasing two permits lets the third GET proceed within 30 s");
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "the third GET must be the only one held once the first two release"
+        );
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+
+        let a1 = tokio::time::timeout(std::time::Duration::from_secs(30), handle_a1)
+            .await
+            .expect("fetch a1 completes within 30 s")
+            .expect("join fetch a1")
+            .expect("fetch a1")
+            .expect("fetch a1 found the segment relevant");
+        let a2 = tokio::time::timeout(std::time::Duration::from_secs(30), handle_a2)
+            .await
+            .expect("fetch a2 completes within 30 s")
+            .expect("join fetch a2")
+            .expect("fetch a2")
+            .expect("fetch a2 found the segment relevant");
+        let b = tokio::time::timeout(std::time::Duration::from_secs(30), handle_b)
+            .await
+            .expect("fetch b completes within 30 s")
+            .expect("join fetch b")
+            .expect("fetch b")
+            .expect("fetch b found the segment relevant");
+        assert_eq!(a1.records.len(), 1);
+        assert_eq!(a2.records.len(), 1);
+        assert_eq!(b.records.len(), 1);
+    }
+
+    /// ADR-1702 follow-up task 7, RSPAN site: with the byte floor at 0, the
+    /// accounted row exit decodes each candidate block as exactly one
+    /// `SpanBlock` job, reaching exhaustion submits none, nothing runs inline,
+    /// and the rows equal the ungated fetch's. Six records at two per block
+    /// make three blocks.
+    ///
+    /// FLIP: in `next_block_on_gate`, read the gate as `None` so every block
+    /// takes the inline `next_block`; the `SpanBlock` assertion then reads
+    /// `left: (0, 0), right: (3, 0)`.
+    #[tokio::test]
+    async fn span_block_decodes_run_through_the_read_gate() {
+        use crate::read_gate_test_support::{floor_zero_gate, site_counts, total_inline};
+        let store = Arc::new(MemoryStore::new());
+        let records: Vec<SpanRecord> = (0..6)
+            .map(|i| {
+                span_with_attrs_and_events(
+                    trace(i + 1),
+                    span(i + 1),
+                    100 + i64::from(i),
+                    200 + i64::from(i),
+                )
+            })
+            .collect();
+        let seg = write_object(&store, 0, &records).await;
+        let query = all_query();
+
+        let inline = SpanSegmentFetcher::new(store.clone())
+            .fetch_accounted(
+                &seg,
+                TENANT,
+                &query,
+                None,
+                None,
+                &[],
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("ungated fetch")
+            .expect("relevant");
+        let gate = floor_zero_gate();
+        let gated = SpanSegmentFetcher::new(store)
+            .with_read_gate(gate.clone())
+            .fetch_accounted(
+                &seg,
+                TENANT,
+                &query,
+                None,
+                None,
+                &[],
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("gated fetch")
+            .expect("relevant");
+        assert_eq!(inline.stats.blocks_scanned, 3);
+        assert_eq!(gated.records, inline.records);
+        assert_eq!(gated.stats, inline.stats);
+        assert_eq!(site_counts(&gate, ReadSite::SpanBlock), (3, 0));
+        assert_eq!(total_inline(&gate), 0);
+    }
+
+    /// A block's job size is the sum of its pages' uncompressed lengths, and a
+    /// header that does not parse sizes the block as unbounded. The expected
+    /// sum is measured independently: each page's stored bytes are
+    /// decompressed here and their lengths added, which is what `read_block`
+    /// checks every page's `uncomp_len` against. Long, repetitive span names
+    /// make the name page compress, so summing stored lengths would not pass.
+    ///
+    /// FLIP: summing each page's stored `len` instead of its `uncomp_len` in
+    /// `block_uncompressed_len` reads `left: 323, right: 11321`.
+    #[test]
+    fn span_block_job_size_reads_the_header() {
+        let records: Vec<SpanRecord> = (0..64)
+            .map(|i| SpanRecord {
+                name: format!("operation-{i}-{}", "abcdefgh".repeat(20)),
+                ..bare_span(trace(1), span(1), 100 + i, 200 + i)
+            })
+            .collect();
+        let mut writer = RspanWriter::new(
+            RspanConfig::default(),
+            ObjectIdentity {
+                tenant_hash: TENANT.0,
+                shard: 0,
+                writer_id: [4u8; 16],
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+        );
+        for r in &records {
+            writer.push(r.clone());
+        }
+        let bytes = writer.finish().expect("finish");
+        let reader = RspanReader::new(&bytes, &RspanConfig::default()).expect("reader");
+        let entry = reader.skip_index().blocks[0].clone();
+        let footer = open(&bytes).expect("footer");
+        let blocks = footer.section(kind::BLOCKS).expect("BLOCKS");
+        let (start, end) = abs_block_range(blocks.offset, blocks.len, &entry).expect("range");
+        let block_bytes = &bytes[start..end];
+        let block =
+            read_block(block_bytes, entry.block_crc32c, DEFAULT_MAX_UNCOMP).expect("decode");
+        assert_eq!(block.record_count(), 64);
+
+        let mut pos = 0usize;
+        let _records = get_uvarint(block_bytes, &mut pos).expect("record count");
+        let page_count = get_uvarint(block_bytes, &mut pos).expect("page count");
+        let mut pages = Vec::new();
+        for _ in 0..page_count {
+            let _column = get_uvarint(block_bytes, &mut pos).expect("column id");
+            let comp = block_bytes[pos + 1];
+            pos += 2;
+            let len = get_uvarint(block_bytes, &mut pos).expect("len");
+            let _uncomp = get_uvarint(block_bytes, &mut pos).expect("uncomp_len");
+            pages.push((comp, len as usize));
+        }
+        let dynamic = get_uvarint(block_bytes, &mut pos).expect("dynamic columns");
+        for _ in 0..dynamic {
+            let _column = get_uvarint(block_bytes, &mut pos).expect("column id");
+            let name_len = get_uvarint(block_bytes, &mut pos).expect("name len");
+            pos += name_len as usize;
+        }
+        let (mut stored, mut decoded) = (0u64, 0u64);
+        for (comp, len) in pages {
+            let page = &block_bytes[pos..pos + len];
+            pos += len;
+            stored += len as u64;
+            decoded += match comp {
+                0 => len as u64,
+                _ => zstd::bulk::decompress(page, 1 << 26)
+                    .expect("zstd page")
+                    .len() as u64,
+            };
+        }
+        assert_eq!(pos, block_bytes.len(), "every payload byte is a page");
+        assert!(decoded > stored, "a page compressed: {decoded} vs {stored}");
+        assert_eq!(block_uncompressed_len(block_bytes), decoded);
+        assert_eq!(block_uncompressed_len(&[0x80]), u64::MAX);
+    }
+
+    /// A gated block decode that never ran leaves the scan lost: the call that
+    /// submitted it fails transient, and every later call, gated or inline,
+    /// fails with that same class instead of handing out the next block of a
+    /// partial segment. The scan is opened on a live runtime and drained on one
+    /// that has shut down, whose blocking pool cancels each job the gate
+    /// dispatches.
+    ///
+    /// FLIP: drop the `lost` check from `next_candidate` and the second call
+    /// takes the next block and submits its own job, so the submitted-job
+    /// assertion reads `left: (2, 0), right: (1, 0)`.
+    #[test]
+    fn a_scan_fails_after_a_cancelled_block_decode_rather_than_skip_it() {
+        use crate::read_gate_test_support::{floor_zero_gate, site_counts};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store = Arc::new(MemoryStore::new());
+        let records: Vec<SpanRecord> = (0..6)
+            .map(|i| bare_span(trace(i + 1), span(i + 1), 100, 200))
+            .collect();
+        let gate = floor_zero_gate();
+        let fetcher = SpanSegmentFetcher::new(store.clone()).with_read_gate(gate.clone());
+        let mut scan = rt.block_on(async {
+            let seg = write_object(&store, 0, &records).await;
+            fetcher
+                .fetch_accounted_columnar(
+                    &seg,
+                    TENANT,
+                    &all_query(),
+                    None,
+                    None,
+                    &[],
+                    &[],
+                    &QueryAccounting::new(),
+                )
+                .await
+                .expect("open")
+                .expect("relevant")
+        });
+        assert_eq!(scan.remaining_blocks(), 3);
+        let handle = rt.handle().clone();
+        rt.shutdown_background();
+        let _entered = handle.enter();
+
+        match futures::executor::block_on(scan.next_block_on_gate()) {
+            Err(SpanFetchError::Store {
+                source: StoreError::Transient(message),
+                ..
+            }) => assert!(message.contains("cancelled"), "{message}"),
+            other => panic!("expected the cancelled job's transient error, got {other:?}"),
+        }
+        assert_eq!(site_counts(&gate, ReadSite::SpanBlock), (1, 0));
+        // The lost scan keeps the class of the failure that lost it, so a
+        // later call repeats the transient error rather than reporting a
+        // permanent one the HTTP layer redacts to a 503.
+        match futures::executor::block_on(scan.next_block_on_gate()) {
+            Err(SpanFetchError::Store {
+                source: StoreError::Transient(message),
+                ..
+            }) => assert!(message.contains("cancelled"), "{message}"),
+            other => panic!("expected the same transient class, got {other:?}"),
+        }
+        assert_eq!(
+            site_counts(&gate, ReadSite::SpanBlock),
+            (1, 0),
+            "no later block was submitted"
+        );
+        match scan.next_block() {
+            Err(SpanFetchError::Store {
+                source: StoreError::Transient(message),
+                ..
+            }) => assert!(message.contains("cancelled"), "{message}"),
+            other => panic!("the inline exit reports that class too, got {other:?}"),
+        }
+    }
+
+    /// A gated block decode that panicked surfaces as the span fetcher's decode
+    /// error, the `Corrupt` class a corrupt block reports.
+    ///
+    /// FLIP: move `CpuGateError::Panicked` into the other arm of
+    /// `span_gate_failed` and the match panics with a transient `Store` error.
+    #[tokio::test]
+    async fn a_panicked_span_block_job_is_the_decode_error() {
+        let gate = crate::read_gate_test_support::floor_zero_gate();
+        let err = gate
+            .run(ReadSite::SpanBlock, JobSize::Bytes(1), || -> u8 {
+                panic!("block decode panicked")
+            })
+            .await
+            .expect_err("a panicking job fails");
+        match span_gate_failed("spans/0.rspan", err) {
+            SpanFetchError::Corrupt {
+                source: SpanSegError::Corrupted(message),
+                ..
+            } => assert!(message.contains("panicked"), "{message}"),
+            other => panic!("expected the decode error, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod late_serve_accounting_tests {
+    //! Two whole-object span reads of one object through a cache at once, the
+    //! second joining the first's in-flight GET: the follower is charged no
+    //! GET and records a query cache miss, on both cache kinds. A `FaultStore`
+    //! hold gate parks the leader's GET until the follower is in position.
+
+    use super::*;
+    use crate::fetcher::CacheFetchError;
+    use ravel_cache::{Cache, CacheLimits, DiskCache, TieredCache};
+    use ravel_catalog::SegmentLevel;
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
+    use ravel_object_store::memory::MemoryStore;
+    use uuid::Uuid;
+
+    const TENANT: TenantHash = TenantHash([5u8; 16]);
+    const CONTENT_HASH: [u8; 32] = [6u8; 32];
+    const KEY: &str = "t/late-serve.rspan";
+    const SIZE: u64 = 40;
+
+    fn limits() -> CacheLimits {
+        CacheLimits::new(1024 * 1024, 100, 1024 * 1024)
+    }
+
+    fn seg_ref() -> SegmentRef {
+        SegmentRef {
+            data_object_key: KEY.to_string(),
+            object_size: SIZE,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: 0,
+            ingest_hour_bucket: 0,
+            sample_count: 1,
+            series_count: 0,
+            shard: 0,
+            content_hash: CONTENT_HASH,
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_rspan::footer::VERSION),
+            declared_column_stats: Default::default(),
+        }
+    }
+
+    /// FLIP: mapping `ReadOutcome::LateServe` to the `ReadOutcome::Hit` arm in
+    /// `SpanSegmentFetcher::whole_object_bytes` makes the follower a hit with
+    /// cache bytes on both kinds.
+    #[tokio::test]
+    async fn a_whole_object_span_follower_is_a_miss_charged_no_get() {
+        let object = Bytes::from((0..SIZE as u8).collect::<Vec<u8>>());
+        let key = CacheKey::new(TENANT.0, CONTENT_HASH, 0, SIZE);
+        for tiered in [false, true] {
+            let memory = MemoryStore::new();
+            memory
+                .put(KEY, object.clone(), PutOptions::default())
+                .await
+                .expect("put");
+            let fault = Arc::new(FaultStore::new(memory, FaultPlan::default()));
+            let gate = fault.hold(Op::Get, None, Occurrence::Always);
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let (cache, parked): (ReadCache, Box<dyn Fn() -> bool>) = if tiered {
+                let tiered = Arc::new(TieredCache::new(
+                    Cache::new(limits()),
+                    DiskCache::new(tmp.path().to_path_buf(), limits()),
+                ));
+                (
+                    ReadCache::Tiered(tiered.clone()),
+                    Box::new(move || tiered.in_flight_waiters(&key) >= 1),
+                )
+            } else {
+                let ram: Arc<Cache<CacheFetchError>> = Arc::new(Cache::new(limits()));
+                let metrics = ram.metrics();
+                // The follower joins the flight in the same poll that records
+                // its peek's miss.
+                (
+                    ReadCache::Ram(ram),
+                    Box::new(move || metrics.snapshot().misses >= 2),
+                )
+            };
+            let fetcher = SpanSegmentFetcher::new(fault).with_cache(cache);
+            let seg = seg_ref();
+            let leader_acc = QueryAccounting::new();
+            let follower_acc = QueryAccounting::new();
+            let release = async {
+                tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                    gate.wait_until_held(1).await;
+                    while !parked() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the leader's GET is held and the follower parked within 30 s");
+                assert_eq!(gate.held_count(), 1, "exactly one GET reached the store");
+                for id in gate.held() {
+                    assert!(gate.release(id), "held id must release");
+                }
+            };
+            let (leader, follower, ()) = tokio::join!(
+                fetcher.whole_object_bytes(&seg, TENANT, &leader_acc),
+                fetcher.whole_object_bytes(&seg, TENANT, &follower_acc),
+                release,
+            );
+            assert_eq!(leader.expect("leader read").as_ref(), object.as_ref());
+            assert_eq!(follower.expect("follower read").as_ref(), object.as_ref());
+
+            let leader_snap = leader_acc.snapshot();
+            assert_eq!(leader_snap.total_s3_requests(), 1, "tiered={tiered}");
+            assert_eq!(leader_snap.cache_misses, 1, "tiered={tiered}");
+            assert_eq!(leader_snap.cache_hits, 0, "tiered={tiered}");
+            let follower_snap = follower_acc.snapshot();
+            assert_eq!(follower_snap.total_s3_requests(), 0, "tiered={tiered}");
+            assert_eq!(follower_snap.total_s3_bytes(), 0, "tiered={tiered}");
+            assert_eq!(follower_snap.cache_misses, 1, "tiered={tiered}");
+            assert_eq!(follower_snap.cache_hits, 0, "tiered={tiered}");
+            assert_eq!(follower_snap.cache_bytes, 0, "tiered={tiered}");
+        }
+    }
+}

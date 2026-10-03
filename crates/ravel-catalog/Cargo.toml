@@ -1,0 +1,44 @@
+[package]
+name = "ravel-catalog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ravel-types = { workspace = true }
+ravel-proto = { workspace = true }
+ravel-commit = { workspace = true }
+ravel-object-store = { workspace = true }
+ravel-segment = { workspace = true }
+ravel-logseg = { workspace = true }
+ravel-cache = { workspace = true }
+# Process-wide byte accountant (ADR-1170, ADR-1702 decision 6). The resolve
+# path reserves each part, postings and column-stats object's declared
+# uncompressed length before decoding it. `MemoryBudget::unlimited()` is the
+# default, so the edge is inert until the server installs a finite budget.
+ravel-memory = { workspace = true }
+# The read CPU gate (ADR-1702 decision 4). Optional per Catalog: with none
+# set, every resolve-path decode runs inline exactly as before.
+ravel-cpu-gate = { workspace = true }
+prost = { workspace = true }
+uuid = { workspace = true }
+parking_lot = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+zstd = { workspace = true }
+crc32c = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+async-trait = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

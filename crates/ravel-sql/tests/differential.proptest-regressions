@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9da043054151f1aea47e495fd8c92bc0a05ece3b99d065a703f504dffbb38aab # shrinks to specs = [SegSpec { created_unix_ns: 0, writer_epoch: 1, writer_seq: 1, series: [SeriesSpec { metric: "a", samples: [(1, NaN), (0, NaN)] }] }], pred = And(True, Or(True, True))

@@ -1,0 +1,830 @@
+//! ravel-server: gateway + ingest + query in one binary for development
+//! (`--mode all|gateway|query`). Crate boundaries keep the split honest.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Context;
+use ravel_maintain::RetentionConfig;
+use ravel_server::alert_sink::DEFAULT_SINK_TIMEOUT;
+use ravel_server::alerting::{DEFAULT_QUERY_DEADLINE, load_rules_file};
+use ravel_server::{
+    AlertEvalConfig, Cli, FoldTaskConfig, MaintenanceTaskConfig, Mode, ServerConfig,
+};
+use tracing_subscriber::EnvFilter;
+
+// jemalloc is compiled into this binary so the allocator is part of the
+// binary's identity rather than an environment accident (#972); library crates
+// must never do this (their test binaries install their own global allocator).
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// Wall-clock unix nanoseconds for stamping the `sys/tenancy` marker's
+/// informational `created_unix_ns` at bootstrap. This is the binary entry
+/// point, not library logic, so a direct clock read here does not violate the
+/// injected-time rule the library crates follow.
+fn now_unix_ns() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Not `Cli::parse()`: this also refuses the fold flags in the modes that
+    // never schedule a fold (ADR-1693), which needs the `ArgMatches` to tell a
+    // passed `--fold-interval-secs` from its generated default. `exit` gives a
+    // refusal the same shape as clap's own, and keeps `--help` on stdout.
+    let cli = Cli::parse_validated_from(std::env::args_os()).unwrap_or_else(|err| err.exit());
+
+    // Trace subscriber (ADR-0060). The filter is exactly today's:
+    // RUST_LOG when set, else `info`. With --otlp-trace-endpoint absent,
+    // `init` installs the same bare `fmt` subscriber this called inline
+    // before, byte-for-byte (decision 1); with it set, the same subscriber
+    // gains an OTLP/gRPC export layer sharing that one filter (decision 2).
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let trace_guard = ravel_tracing_export::init(filter, cli.otlp_export_config());
+
+    // Cross-flag startup invariants (ADR-0050 section 1): the dev-header
+    // loopback rule plus every --mtls-listener misconfiguration. Every case
+    // refuses startup outright; see `Cli::validate`.
+    cli.validate()?;
+
+    ravel_server::warn_dev_insecure_tenant_header(cli.dev_insecure_tenant_header);
+
+    // Host-derived performance defaults (ADR-0088 as amended by issue #1141).
+    // The host is read exactly once, here, and the six settings are resolved
+    // from it once; every consumer below takes the resolved value, so no later
+    // code re-reads the host and nothing can enforce a number the startup log
+    // did not name. An explicit flag wins over every derived value, unchanged
+    // in meaning.
+    let host = ravel_server::config::HostProfile::detect();
+    let performance = cli
+        .resolve_performance(host)
+        .context("failed to resolve the host-derived performance defaults")?;
+    performance.emit(host);
+    // ADR-1702 decision 3: the read and write CPU gates' permits, derived from
+    // the same host profile unless a flag sets them.
+    let cpu_gate_permits = cli.resolve_cpu_gate_permits(host);
+    tracing::info!(
+        read_permits = cpu_gate_permits.read,
+        write_permits = cpu_gate_permits.write,
+        "CPU gate permits resolved"
+    );
+
+    // OTAP (ADR-0011) is opt-in even in a build with the `otap` feature: the
+    // feature links the arrow decode stack, `--otap` decides whether this
+    // process registers the ArrowMetricsService (ServerConfig::otap, read by
+    // `start`). `cli.otap` only exists in an `otap`-featured build; a build
+    // without the feature never registers the service regardless.
+    #[cfg(feature = "otap")]
+    let otap = cli.otap;
+    #[cfg(not(feature = "otap"))]
+    let otap = false;
+
+    // Every object-store call this process makes is counted by the decorator
+    // `build_store` wraps the backend in, and the same handle is
+    // served at `GET /metrics` and attached to the query fetchers below. Built
+    // here, before any tenant is hashed, because the tenancy scheme is resolved
+    // from `sys/tenancy` on this store and must be installed before the first
+    // `TenantId::hash()` (which `merge_fold_tenants` below performs).
+    // `store` is the foreground handle; the startup gates below (qualification,
+    // bucket protection, tenancy pinning, provisioning validation, GC bootstrap,
+    // tenant-KMS configuration) all run once before any listener binds and use
+    // it. `store_background` is the maintenance-class handle threaded into
+    // `start` alongside it. In the default passthrough construction the two are
+    // the same `Arc`, so this is a no-op split until `--store-scheduling` is set
+    // (ADR-0070).
+    let ravel_server::store::BuiltStore {
+        foreground: store,
+        background: store_background,
+        metrics: store_metrics,
+        cache,
+        kms: tenant_kms,
+        s3: store_s3,
+        classed: _classed,
+    } = ravel_server::store::build_store(&cli, performance.cache_max_bytes)
+        .context("failed to build object store backend")?;
+
+    // Store-backend qualification gate (ADR-0050 section 6, EC7). On any
+    // production store kind, refuse to start unless a `sys/qualification` record
+    // written by `ravel-cli store qualify` is present and at least this binary's
+    // suite-version floor. Read-only, runs once before any listener binds, in
+    // every mode; `StoreKind::Memory` (the semantics oracle) is exempt. Unlike
+    // the tenancy marker and GC config, an absent record is NOT a
+    // bootstrap-and-continue case: a fresh production deployment must run `store
+    // qualify` first, by design (see `qualification` and the operations guide).
+    ravel_server::qualification::enforce(
+        store.as_ref(),
+        cli.store,
+        cli.backend_identity().as_deref(),
+    )
+    .await
+    .context("store backend is not qualified (sys/qualification); refusing to start")?;
+
+    // Bucket-protection contract gate (ADR-0072 decision 3, ADR-1727 decision
+    // 5), off by default: see docs/object-store-contract.md's "Required bucket
+    // configuration" section. `--require-bucket-protection` unset leaves this
+    // call a no-op that sends no request. When set, on `--store s3` it reads
+    // the bucket's protection report through the concrete base `S3Store`
+    // (three read-only GETs) and refuses to start on a fatal failed condition;
+    // an unknown condition, which is every condition on a backend other than
+    // S3, logs one warning and raises `ravel_bucket_protection_unknown`
+    // instead of blocking.
+    ravel_server::bucket_protection::enforce_at_startup_on(
+        cli.require_bucket_protection,
+        store_s3.as_deref(),
+        store.as_ref(),
+    )
+    .await?;
+
+    // Tenant-hash scheme pinning (ADR-0050 section 3). Resolve the bucket's
+    // scheme from `sys/tenancy` (writing the marker for a fresh or pre-ADR
+    // bucket) and install it process-wide. A configured scheme or key that
+    // disagrees with an existing marker is a startup refusal here, before any
+    // listener binds, so a wrong key is a failed deploy rather than a silent
+    // parallel namespace.
+    let tenancy_config = cli.resolve_tenancy_config()?;
+    let resolved_tenancy =
+        ravel_server::tenancy::resolve_and_pin(store.as_ref(), tenancy_config, now_unix_ns())
+            .await
+            .context("failed to resolve the bucket's tenant-hash scheme (sys/tenancy)")?;
+    ravel_types::install_tenant_hash_scheme(resolved_tenancy.scheme.clone())
+        .map_err(|_| anyhow::anyhow!("tenant-hash scheme was already installed"))?;
+    // Retained for the recovery-manifest writer (ADR-0050 section 3): `Some`
+    // only on a keyed bucket. `start` builds the writer from it and wires it
+    // into every ingest path.
+    let deployment_key = resolved_tenancy.deployment_key;
+
+    // ADR-0062 decision 2e: how a query-audit record carries `query.text`.
+    // Resolved here, beside the deployment key its token key can be derived
+    // from. Under `redacted` with no key available, this refuses to start
+    // only in the modes that install the query-audit pipeline (`all` and
+    // `query`; `Mode::installs_query_audit_pipeline`): a process that will
+    // actually write audit records and cannot tokenize them must not start,
+    // but `gateway` and `maintain` write none and so read no key.
+    let audit_text = cli
+        .resolve_audit_text_policy(deployment_key.as_deref())
+        .context("failed to resolve --audit-text")?;
+
+    // Per-tenant SSE-KMS routing (ADR-0062 decision 1,
+    // ADR-0072 decision 2). Deferred to here, not folded into `build_store`
+    // above: registering a tenant's key needs `TenantId::hash()`, which is
+    // not valid to call until the tenant-hash scheme installed just above is
+    // in place. `tenant_kms` is `None` unless `--tenant-kms-config` was set
+    // (and `Cli::validate` already refused that combined with `--store
+    // memory`), so this is a no-op on every deployment that has not opted in.
+    let tenant_kms_config = cli.parse_tenant_kms_config()?;
+    if let Some(kms) = tenant_kms.as_deref() {
+        ravel_server::tenant_kms::configure_tenant_kms(
+            kms,
+            store.as_ref(),
+            &tenant_kms_config,
+            now_unix_ns(),
+        )
+        .await
+        .context("failed to configure per-tenant SSE-KMS routing (--tenant-kms-config)")?;
+    }
+
+    let parquet_profiles = cli.parse_parquet_profiles()?;
+    if let Some(profiles) = &parquet_profiles {
+        let names: Vec<&str> = profiles
+            .profiles
+            .iter()
+            .map(|profile| profile.name.as_str())
+            .collect();
+        tracing::info!(profiles = ?names, "Parquet table credential profiles loaded");
+    }
+
+    // Parsed once: the fold tenants, the federation mapping check, shard-count
+    // validation and the resolver all read this one result, so a token file
+    // rotated during startup cannot make the resolver serve a tenant the
+    // other checks never saw.
+    let tenant_principals = cli.parse_tenant_principals()?;
+    let tenant_tokens = ravel_server::config::tenant_map(&tenant_principals);
+    // Fold and maintenance derive their tenant set from storage each cycle
+    // (ADR-0048 decision 3), not from these flags. This is now
+    // only an optional restriction: the union of the statically mapped bearer
+    // tenants and whatever `--maintain-tenant` names. Empty (the default, and
+    // the common case for a deployment authenticating tenants through OIDC or
+    // mTLS, which has no `--tenant-token` entries) means no restriction is
+    // configured, so every tenant storage discovers data for is maintained --
+    // not, as an empty discovered set could be misread, that nothing is.
+    let maintain_tenants = cli.parse_maintain_tenants()?;
+    let fold_tenants =
+        ravel_server::config::merge_fold_tenants(tenant_tokens.values(), &maintain_tenants);
+
+    // Durable shard_count validation for statically-known tenants (ADR-0050
+    // section 5, EC5). The static set is exactly `fold_tenants`, the union of
+    // `--tenant-token` and `--maintain-tenant` (already hashed under the pinned
+    // scheme). An unreadable provisioning record, or pre-ADR data the
+    // configured `--shards` would hide, refuses startup here, before any
+    // listener binds; a recorded shard_count that merely differs from
+    // `--shards` is tolerated (ADR-0082). A brand-new tenant with no prior
+    // writes and no record passes through cleanly (nothing to validate yet), so
+    // a fresh, operator-managed cluster with configured tenants and zero data
+    // starts normally. `query` mode never adopts and lists committed data only
+    // (`static_absent_policy`): it validates a present record and, for an
+    // absent one, still refuses when `--shards` would hide committed data.
+    // Every other mode adopts pre-ADR data. An
+    // OIDC/mTLS deployment with no static tenants validates nothing here and
+    // checks each tenant at first touch.
+    ravel_server::provisioning::validate_static_provisioning(
+        store.as_ref(),
+        &fold_tenants,
+        cli.shards,
+        cli.mode,
+        now_unix_ns(),
+    )
+    .await
+    .context("shard_count provisioning validation failed for a statically-known tenant")?;
+    // Real authn (ADR-0042 decision 6): the OIDC and mTLS resolvers join the
+    // FallbackResolver chain alongside the static bearer resolver when their
+    // flags are set. Validation of dependent-flag misuse happens in
+    // `parse_auth_resolvers`, fail-fast at startup.
+    let auth = cli.parse_auth_resolvers()?;
+    // The JWKS fetch is the entire root of trust for JWT verification: an
+    // on-path attacker who can substitute the JWKS response controls which
+    // keys every OIDC request is verified against. Refuse a non-loopback
+    // plaintext URL outright, mirroring the loopback guard already applied to
+    // `--dev-insecure-tenant-header` above, rather than silently trusting it.
+    if let Some(oidc) = &auth.oidc
+        && oidc.jwks_url.starts_with("http://")
+    {
+        let jwks_host = oidc
+            .jwks_url
+            .strip_prefix("http://")
+            .and_then(|rest| rest.split(['/', ':']).next())
+            .unwrap_or("");
+        let is_loopback = jwks_host == "localhost"
+            || jwks_host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback());
+        anyhow::ensure!(
+            is_loopback,
+            "--oidc-jwks-url '{}' uses plaintext http:// to a non-loopback host: the JWKS \
+             response is the entire trust root for JWT verification, and fetching it in \
+             plaintext lets an on-path attacker substitute their own keys and forge tokens for \
+             any tenant. Use https://, or point at a loopback address for local development \
+             only.",
+            oidc.jwks_url
+        );
+    }
+    ravel_server::warn_mtls_trusted_header(auth.mtls_header.as_deref());
+
+    // Federation TLS is on by default (ADR-0071 amendment), so a remote with
+    // `tls` off is a deliberate operator choice; log it by name once here,
+    // where the resolved remote-cluster config first exists. Parsed before
+    // `build_auth_resolver_with_principals` consumes `tenant_principals` and `auth`, so the
+    // tenant-mapping check can read every resolver input.
+    let remote_clusters = cli
+        .parse_remote_clusters()
+        .context("failed to resolve --remote-cluster settings")?;
+    // Alert rules are static per-tenant config loaded once at startup
+    // (ADR-0043 decision 2), and every validation the rules can fail happens
+    // here rather than once per evaluation tick. Alerting stays off unless a
+    // rules file was named and it holds at least one rule.
+    //
+    // Parsed here, above the tenant-mapping check below, because that check
+    // needs its tenant set: `alerting::spawn` starts one evaluator
+    // per tenant in this document against the same engine federation is
+    // installed on, so a tenant named only here still federates and is a local
+    // tenant for that check's purposes. The two real constraints on where this
+    // sits: after `install_tenant_hash_scheme`, so `TenantId::hash()` inside
+    // resolves under the scheme the request path uses, and before
+    // `ensure_federation_tenant_mapping` and any listener bind.
+    let alert_rules = match cli.alert_rules_file.as_deref() {
+        Some(path) => load_rules_file(path)?,
+        None => HashMap::new(),
+    };
+    let alert_rule_tenants: Vec<ravel_types::TenantHash> = alert_rules.keys().copied().collect();
+    // A remote cluster's credential belongs to one local tenant. Refuse a spec
+    // that names none on a coordinator that runs queries for more than one,
+    // before any listener binds, rather than silently fanning every tenant's
+    // queries out under the same credential.
+    ravel_server::ensure_federation_tenant_mapping(
+        &remote_clusters,
+        &tenant_tokens,
+        &alert_rule_tenants,
+        cli.dev_insecure_tenant_header,
+        &auth,
+    )?;
+    ravel_server::warn_plaintext_federation(&remote_clusters);
+
+    let resolver_bundle = ravel_server::tenant::build_auth_resolver_with_principals(
+        tenant_principals,
+        cli.dev_insecure_tenant_header,
+        auth,
+        cli.oidc_ddl_claim.clone(),
+    )?;
+    // Retention windows are validated at startup against the ADR-0019 floor
+    // (with the ingest lag resolved below, see resolve_ingest_lag); a window
+    // below the floor fails startup here rather than being silently clamped.
+    // The GC knobs (ADR-0050 section 4, EC4) resolved from the `--gc-*` flags,
+    // each defaulting to its compiled-in value when unset (byte-identical to a
+    // process that predates the flags). This is the single resolution point:
+    // the SAME values feed the `sys/gc` validation below AND the real compactor
+    // and query engine `start` builds, so a flag that satisfies validation is
+    // the flag that is actually enforced. Without these flags there was no way
+    // to bring maintain/query into line after a `ravel-cli gc-config set`, so
+    // any set to non-default values permanently bricked those modes; these are
+    // the documented remediation (docs/guides/operations.md).
+    let gc_runtime = cli
+        .resolve_gc_runtime(performance.query_deadline)
+        .context("failed to parse the --gc-* GC-config flags")?;
+    let compactor = cli.resolve_compactor_config(&gc_runtime, &performance)?;
+    let claim_lease_duration = compactor.claim_lease_duration;
+    // ADR-1029 decision 3: a lease shorter than twice the time to encode and
+    // PUT the largest L1 part at a conservative rate can expire, and be
+    // stolen, before a run still encoding its largest part reaches its own
+    // next renewal checkpoint. The largest part is the larger of the shared
+    // stored-size cap and the RLOG cap that follows the derived memory target.
+    // Logged, not refused: a deployment with deliberately small parts and a
+    // short lease is a valid shape.
+    if compactor.claim_lease_below_warn_threshold() {
+        tracing::warn!(
+            claim_lease_secs = claim_lease_duration.as_secs(),
+            largest_stored_target_bytes = compactor.largest_stored_target_bytes(),
+            "maintenance: --maintain-claim-lease is below ADR-1029 decision 3's startup \
+             threshold (2x the estimated encode+PUT time for the largest L1 part); a claim \
+             can expire while its run is still encoding its largest part, raise the lease if \
+             ravel_maintain_claims_lost_total climbs"
+        );
+    }
+    // Resolved here so the retention floor below is validated against the
+    // catalog window the flag sets; see `ravel_server::resolve_ingest_lag`.
+    let max_ingest_lag = cli
+        .parse_max_ingest_lag()
+        .context("failed to parse --max-ingest-lag")?;
+    let ingest_lag =
+        ravel_server::resolve_ingest_lag(max_ingest_lag).context("invalid --max-ingest-lag")?;
+    let catalog_max_ingest_lag_ns = ingest_lag.catalog_window_ns;
+    let retention_policy = cli
+        .parse_retention_policy()
+        .context("failed to parse retention flags")?;
+    let retention =
+        RetentionConfig::from_policy(retention_policy, &compactor, catalog_max_ingest_lag_ns)
+            .map_err(|e| anyhow::anyhow!("invalid retention configuration: {e}"))?;
+
+    // Durable GC configuration (ADR-0050 section 4, EC4). Bootstrap `sys/gc`
+    // from this process's maintain defaults on a fresh bucket, or read the
+    // durable object on a bootstrapped one, then validate this mode against it,
+    // before any listener binds. A fresh, never-bootstrapped bucket never fails
+    // startup here: the object is written from the maintain defaults (which
+    // satisfy the constraint) and validated against what was just written, and a
+    // concurrent bootstrap loser re-reads the winner's object rather than
+    // refusing. Only a *present* object this mode really violates refuses to
+    // start, or a credential the store refuses, which fails naming the fix
+    // that fits this mode and the refused request. The Flight SQL ceiling is
+    // sourced and validated in `ravel_server::start` (it is
+    // `flight-sql`-feature-gated).
+    let gc = ravel_server::gc_config::bootstrap(store.as_ref(), now_unix_ns())
+        .await
+        .map_err(|e| {
+            let context = ravel_server::gc_config::bootstrap_failure_context(&e, cli.mode);
+            anyhow::Error::new(e).context(context)
+        })?;
+    if matches!(cli.mode, Mode::Maintain) {
+        ravel_server::gc_config::validate_maintain(&gc, &compactor).map_err(|e| {
+            anyhow::anyhow!("maintain GC-config validation failed against sys/gc: {e}")
+        })?;
+    }
+    if matches!(cli.mode, Mode::All | Mode::Query) {
+        ravel_server::gc_config::validate_query(&gc, gc_runtime.query_deadline).map_err(|e| {
+            anyhow::anyhow!("query GC-config validation failed against sys/gc: {e}")
+        })?;
+        // `build_catalog` overrides no HEAD cache TTL, so the base config's
+        // value is the one the query catalog runs on.
+        ravel_server::gc_config::validate_query_head_cache_ttl(
+            &gc,
+            &ravel_server::query::server_catalog_config_base(),
+        )
+        .map_err(|e| anyhow::anyhow!("query GC-config validation failed against sys/gc: {e}"))?;
+    }
+
+    let alert_sinks = cli
+        .parse_alert_sinks()
+        .context("failed to parse alert sink flags")?;
+    // Admission limits (ADR-0051 section 3): --limits-file is parsed and
+    // validated at startup regardless of mode, so an unparseable file, an
+    // unknown key, or a nonsensical limit fails startup rather than silently
+    // keeping the shipped defaults. `ravel_server::start` builds one
+    // `AdmissionController` from this and threads it into every ingest path.
+    let limits = cli
+        .parse_limits_file()
+        .context("failed to parse --limits-file")?;
+    tracing::info!(
+        tenant_overrides = limits.tenants.len(),
+        max_active_series = ?limits.defaults.max_active_series,
+        max_active_streams = ?limits.defaults.max_active_streams,
+        max_bytes_scanned = ?limits.query_defaults.max_bytes_scanned,
+        "admission limits resolved from {}",
+        cli.limits_file
+            .as_deref()
+            .map_or_else(|| "shipped defaults".to_string(), |p| p.display().to_string())
+    );
+    // ADR-0061 decision 1: per-tenant query bytes-scanned overrides are parsed
+    // and validated from the same file, but the process-wide `QueryEngine`
+    // holds a single `EngineConfig` and is not tenant-parameterized, so it
+    // enforces the resolved default budget for every tenant. Warn (not silently
+    // ignore, per this repo's "looks configured, is actually inert" rule) when
+    // a tenant's override differs from the default it will actually run under,
+    // naming each affected tenant. Enforcing a per-tenant query byte budget
+    // needs a tenant-aware `EngineConfig` lookup inside `ravel-query`, out of
+    // scope for the server-side config wiring.
+    let ineffective_query_overrides: Vec<&str> = limits
+        .query_tenants
+        .iter()
+        .filter(|(_, q)| q.max_bytes_scanned != limits.query_defaults.max_bytes_scanned)
+        .map(|(tenant, _)| tenant.as_str())
+        .collect();
+    if !ineffective_query_overrides.is_empty() {
+        tracing::warn!(
+            tenants = ?ineffective_query_overrides,
+            default_budget = ?limits.query_defaults.max_bytes_scanned,
+            "per-tenant [tenants.<id>] max_bytes_scanned overrides are parsed but not yet \
+             enforced per tenant: the query engine applies one process-wide budget (the \
+             [defaults] value) to every tenant. These tenants will run under the default \
+             budget, not their override. Set the intended budget in [defaults] until \
+             tenant-aware query budgets land."
+        );
+    }
+    // Per-tenant POSTINGS indexed-field configuration (ADR-0049 decision 3). An empty or duplicate field name fails startup here rather
+    // than silently indexing the wrong set. `ravel_server::start` hands this to
+    // the log ingest router, the one production call site that reads it.
+    let indexed_fields = ravel_server::postings_config::IndexedFieldConfig::from_policy(
+        cli.parse_indexed_field_policy()?,
+    )
+    .context("failed to parse --indexed-field / --indexed-field-tenant")?;
+    tracing::info!(
+        default_fields = ?indexed_fields.default_fields(),
+        "POSTINGS indexed-field defaults resolved"
+    );
+    // Per-tenant declared typed attribute columns for the logs SQL table
+    // (ADR-0090 decision 1). Validated here, on the same rules a durable write
+    // is held to (ravel_catalog::validate_typed_attr_columns), so an empty key,
+    // a duplicate, a conflicting type, or a collision with a fixed logs column
+    // fails startup rather than silently declaring a schema the operator did
+    // not ask for. `ravel_server::start` wraps this in the cache-aside overlay
+    // that resolves each query's declaration.
+    let typed_attr_columns = ravel_server::typed_attr_config::TypedAttrColumnConfig::from_policy(
+        cli.parse_typed_attr_column_policy()?,
+    )
+    .context("failed to parse --typed-attr-column / --typed-attr-column-tenant")?;
+    if !alert_rules.is_empty() && alert_sinks.is_empty() {
+        tracing::info!(
+            "alert rules are configured but no sink is: transitions will be written as durable \
+             Signal::Alerts records and nothing will be notified"
+        );
+    }
+    // the alert evaluator only spawns in the modes that build a query
+    // engine (Mode::All and Mode::Query; see `ravel_server::start`), because a
+    // rule is a query. In any other mode a rules file is still parsed and
+    // validated above, but no evaluator ever runs it, so the whole alerting
+    // feature silently does nothing. Warn loudly, naming the mode. This is
+    // warn! rather than the info! above because that path only means "no
+    // notification channel" (records are still written), whereas this means the
+    // rules are never evaluated at all.
+    if rules_ignored_by_mode(cli.mode, !alert_rules.is_empty()) {
+        tracing::warn!(
+            mode = ?cli.mode,
+            rule_count = alert_rules.values().map(Vec::len).sum::<usize>(),
+            "alert rules are configured but --mode {:?} does not run the alert evaluator (only \
+             --mode all and --mode query do): these rules will not be evaluated and no alert will \
+             ever fire. Run this process in --mode all or --mode query to evaluate them.",
+            cli.mode
+        );
+    }
+
+    // `cli.validate()` above refused startup unless --mtls-listener and
+    // --mtls-enabled are set together, and `build_auth_resolver_with_principals` fills
+    // `mtls_resolver` from that same --mtls-enabled flag, so this zip is
+    // Some exactly when both were configured, and never partially.
+    let mtls_listener = cli
+        .mtls_listener
+        .zip(resolver_bundle.mtls_resolver)
+        .map(|(addr, resolver)| ravel_server::MtlsListenerConfig { addr, resolver });
+
+    let flush_cadence = cli
+        .resolve_flush_cadence()
+        .context("failed to resolve flush-cadence flags")?;
+    let flush_concurrency = cli.resolve_flush_concurrency();
+
+    // The per-query S3 request budget (ADR-1306 decisions 3 and 5), resolved
+    // with the seal margin of the catalog this process folds and resolves
+    // with, so the span the budget covers is the span this catalog's fold
+    // really leaves unsealed. Logged with that span in seconds: an explicit
+    // --max-s3-requests is used verbatim, and this is the only place that
+    // tells the operator which span their value is measured against.
+    let seal_margin = ravel_server::query::server_seal_margin();
+    let max_s3_requests = cli
+        .resolve_max_s3_requests_with(seal_margin)
+        .context("failed to resolve --max-s3-requests")?;
+    ravel_server::log_resolved_request_budget(
+        max_s3_requests,
+        seal_margin,
+        cli.max_s3_requests.is_some(),
+    );
+
+    let config = ServerConfig {
+        mode: cli.mode,
+        listen_http: cli.listen_http,
+        listen_grpc: cli.listen_grpc,
+        shard_count: cli.shards,
+        max_inflight_flushes: flush_concurrency.max_inflight_flushes,
+        max_queued_flushes: flush_concurrency.max_queued_flushes,
+        adaptive_flush_delay: cli.adaptive_flush_delay,
+        max_flush_delay: flush_cadence.max_flush_delay,
+        max_flush_delay_idle: flush_cadence.max_flush_delay_idle,
+        min_flush_bytes: flush_cadence.min_flush_bytes,
+        // Not part of the ADR-0076 cadence trio `resolve_flush_cadence`
+        // reconciles: the floor moves on its own. `cli.validate()` already
+        // refused a floor at or above the resolved `min_flush_bytes`, before
+        // the store was built.
+        idle_flush_byte_floor: cli
+            .resolve_idle_flush_byte_floor()
+            .context("failed to resolve --idle-flush-byte-floor")?,
+        tenant_resolver: resolver_bundle.resolver,
+        mtls_listener,
+        fold_tenants,
+        fold: FoldTaskConfig {
+            enabled: !cli.disable_fold,
+            fold_interval: Duration::from_secs(cli.fold_interval_secs),
+        },
+        maintain: MaintenanceTaskConfig {
+            enabled: matches!(cli.mode, Mode::Maintain),
+            interval: Duration::from_secs(cli.maintain_interval_secs),
+            shard_count: cli.shards,
+            compactor,
+            retention,
+            unit_concurrency: cli.maintain_unit_concurrency,
+            stalled_after_intervals: cli.maintain_stalled_after_intervals,
+            heartbeat_interval: ravel_maintain::worker_set::DEFAULT_HEARTBEAT_INTERVAL,
+        },
+        alerting: AlertEvalConfig {
+            enabled: !alert_rules.is_empty(),
+            interval: Duration::from_secs(cli.alert_eval_interval_secs),
+            rules: Arc::new(alert_rules),
+            sinks: Arc::new(alert_sinks),
+            query_deadline: DEFAULT_QUERY_DEADLINE,
+            sink_timeout: DEFAULT_SINK_TIMEOUT,
+            sql_lookback: cli.parse_alert_sql_lookback()?,
+        },
+        oidc_refresh: resolver_bundle.oidc_refresh,
+        otap,
+        limits,
+        metrics_tenant_labels: cli.metrics_tenant_labels,
+        deployment_key,
+        gc,
+        query_deadline: gc_runtime.query_deadline,
+        store_probe_interval: cli
+            .parse_store_probe_interval()
+            .context("failed to parse --store-probe-interval")?,
+        admission_reconcile_interval: cli
+            .parse_admission_reconcile_interval()
+            .context("failed to parse --admission-reconcile-interval")?,
+        query_concurrency_limit: cli
+            .parse_query_concurrency_limit()
+            .context("failed to parse --max-concurrent-queries")?,
+        max_s3_requests,
+        query_budgets: cli
+            .query_budgets(&performance)
+            .context("failed to resolve the query budgets and logs fetch policy")?,
+        scrub_period: cli
+            .parse_scrub_period()
+            .context("failed to parse --scrub-period")?,
+        indexed_fields,
+        typed_attr_columns,
+        parquet_profiles,
+        disable_cache: cli.disable_cache,
+        cache_max_bytes: performance.cache_max_bytes,
+        catalog_cache_max_bytes: performance.catalog_cache_max_bytes,
+        process_memory_budget_bytes: performance.memory_remainder_bytes,
+        process_memory_budget_is_fallback: performance.sources.memory_budget_bytes
+            == ravel_server::config::PERF_SOURCE_FALLBACK,
+        cache_dir: cli.cache_dir.clone(),
+        catalog_resolve_concurrency: Some(performance.catalog_resolve_concurrency),
+        cpu_gate_permits,
+        ingest_concurrency_limit: cli
+            .parse_ingest_concurrency_limit()
+            .context("failed to parse --max-inflight-ingest-requests")?,
+        ingest_buffer_budget_limit: cli
+            .parse_ingest_buffer_budget()
+            .context("failed to parse --max-ingest-buffer-bytes")?,
+        idle_tenant_state_ttl: cli
+            .parse_idle_tenant_state_ttl()
+            .context("failed to parse --idle-tenant-state-ttl")?,
+        distrib: cli
+            .parse_distrib_settings()
+            .context("failed to resolve --distributed-query settings")?,
+        remote_clusters,
+        audit_pipeline: cli
+            .resolve_audit_pipeline_config()
+            .context("failed to resolve --audit-mode/--audit-max-batch/--audit-max-age")?,
+        audit_text,
+        shutdown_timeout: cli
+            .parse_shutdown_timeout()
+            .context("failed to parse --shutdown-timeout")?,
+        drain_settle_interval: ravel_server::DEFAULT_DRAIN_SETTLE_INTERVAL,
+        max_ingest_lag,
+    };
+
+    // The runtime heartbeat (ADR-1702 decision 9) exists in every mode, so
+    // `/metrics` renders its age whether or not --listen-health is set. It is
+    // stamped when constructed and its task ticks on this (the main) runtime.
+    // The --listen-health listener (decision 8) reads the same heartbeat and
+    // binds before `start` so the kubelet can probe liveness during a long
+    // startup; its `/readyz` stays 503 until the readiness handle is attached
+    // below.
+    let heartbeat =
+        ravel_server::health_listener::Heartbeat::new(Arc::new(ravel_ingest::SystemClock));
+    let heartbeat_task = heartbeat.spawn();
+    let health_listener = match cli.listen_health {
+        Some(addr) => {
+            let listener =
+                ravel_server::health_listener::HealthListener::bind(addr, heartbeat.clone())?;
+            tracing::info!(health = %listener.local_addr(), "health listener bound");
+            Some(listener)
+        }
+        None => None,
+    };
+
+    let running = ravel_server::start_with_heartbeat(
+        config,
+        store,
+        store_background,
+        store_metrics,
+        cache,
+        heartbeat,
+    )
+    .await?;
+    tracing::info!(http = %running.http_addr, grpc = ?running.grpc_addr, "ravel-server listening");
+    if let Some(listener) = &health_listener {
+        listener.attach_readiness(running.readiness());
+    }
+
+    wait_for_shutdown_signal().await;
+    tracing::info!("shutdown signal received, draining");
+    // A drain that overran `--shutdown-timeout`, a listener error, or a failed
+    // query-audit drain each return `Err`: log it at error level and propagate
+    // so the process exits non-zero, rather than falling through to the
+    // "shutdown complete" line and a clean exit it did not earn.
+    if let Err(err) = running.shutdown().await {
+        tracing::error!(error = %err, "graceful shutdown did not complete cleanly");
+        return Err(err);
+    }
+    heartbeat_task.abort();
+    // Stopped after the drain so its `/readyz` reports 503 throughout it.
+    if let Some(listener) = health_listener {
+        tokio::task::spawn_blocking(move || listener.shutdown())
+            .await
+            .context("health listener shutdown task failed")??;
+    }
+    tracing::info!("shutdown complete");
+    // Flush the OTLP trace exporter AFTER draining (ADR-0060 decision 7): a
+    // span for the last request the server handled closes as that request
+    // drains, so flushing once the drain has completed gives it the best
+    // chance of having been recorded and enqueued before the exporter shuts
+    // down. A no-op when --otlp-trace-endpoint was absent. `ExportGuard`'s
+    // `Drop` is the backstop if an earlier `?` returns before this line.
+    // `flush` is a blocking call (both test files wrap it in `spawn_blocking`
+    // for the same reason); running it directly on this async task would
+    // hold a runtime worker for up to the exporter's own shutdown timeout,
+    // risking an otherwise-graceful shutdown overrunning its termination
+    // grace period against a slow collector. The discarded `Result` is a
+    // `JoinError` should `flush()` itself ever panic, not an export error --
+    // `flush()` already swallows those by design (decision 6) -- so this
+    // deliberately does not propagate a panic into shutdown either; the
+    // process still exits cleanly either way.
+    let _ = tokio::task::spawn_blocking(move || trace_guard.flush()).await;
+    Ok(())
+}
+
+/// Whether a loaded rules file will never be evaluated because the process mode
+/// does not run the alert evaluator. The evaluator spawns only in the
+/// modes that build a query engine ([`Mode::All`] and [`Mode::Query`]; see
+/// `ravel_server::start`). Factored out of `main` so the gate that drives the
+/// startup warning is unit-testable without standing up a whole process.
+fn rules_ignored_by_mode(mode: Mode, has_rules: bool) -> bool {
+    has_rules && !matches!(mode, Mode::All | Mode::Query)
+}
+
+async fn wait_for_shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// This unit test binary is built from this binary root, so it links the
+    /// `#[global_allocator]` above; an integration test in `tests/` links the
+    /// library instead and would not. Read jemalloc's own allocated-bytes stat
+    /// and prove it accounts for a fresh large allocation: under glibc malloc
+    /// that allocation never touches jemalloc's arenas, so its counter does not
+    /// move and this assertion fails. That flip is what makes this a real
+    /// runtime check of the installed allocator, not a `cfg` echo.
+    #[cfg(not(target_env = "msvc"))]
+    #[test]
+    fn binary_runs_under_jemalloc() {
+        use tikv_jemalloc_ctl::{epoch, stats};
+
+        epoch::advance().expect("jemalloc epoch mallctl must succeed under jemalloc");
+        let before = stats::allocated::read().expect("jemalloc stats.allocated read must succeed");
+
+        let big: Vec<u8> = vec![7u8; 64 * 1024 * 1024];
+        std::hint::black_box(big.as_ptr());
+
+        epoch::advance().expect("jemalloc epoch mallctl must succeed under jemalloc");
+        let after = stats::allocated::read().expect("jemalloc stats.allocated read must succeed");
+
+        assert!(
+            after > before,
+            "jemalloc allocated bytes did not grow ({before} -> {after}) across a 64 MiB \
+             allocation: the process is not running under the jemalloc global allocator"
+        );
+        std::hint::black_box(big);
+    }
+
+    /// ADR-1733 decision 2 reachability: the one production `ServerConfig`
+    /// (the literal above, which `start` hands to `query::build_catalog`) must
+    /// take the catalog resolve ceiling from the RESOLVED performance
+    /// defaults, not from the raw flag. The two differ exactly where it
+    /// matters: unset, the raw flag is `None`, which leaves
+    /// `CatalogConfig`'s compiled-in per-prefix constant as the process
+    /// ceiling and is the behaviour this ADR replaces.
+    ///
+    /// Asserted over this file's own source. The value is assembled inside
+    /// `main`'s single 90-line struct literal, which cannot be called from a
+    /// test, and the field's type (`Option<usize>`) accepts the reverted
+    /// spelling just as well, so no type or runtime check can tell the two
+    /// apart. What the claim is about is which expression that field is
+    /// assigned, and that is exact. The needles are assembled with `concat!`
+    /// so this test's own source cannot match itself.
+    #[test]
+    fn server_config_takes_the_resolved_catalog_resolve_ceiling() {
+        const SRC: &str = include_str!("main.rs");
+        let resolved = concat!(
+            "catalog_resolve_concurrency: ",
+            "Some(performance.catalog_resolve_concurrency),"
+        );
+        let raw_flag = concat!(
+            "catalog_resolve_concurrency: ",
+            "cli.catalog_resolve_concurrency"
+        );
+        assert_eq!(
+            SRC.matches(resolved).count(),
+            1,
+            "the ServerConfig literal must assign the resolved ceiling exactly once"
+        );
+        assert_eq!(
+            SRC.matches(raw_flag).count(),
+            0,
+            "the raw --catalog-resolve-concurrency flag must not reach ServerConfig: unset it \
+             is None, which leaves the catalog's own per-prefix constant as the process ceiling"
+        );
+    }
+
+    /// the modes that build a query engine (and therefore spawn the alert
+    /// evaluator) must not warn; the modes that do not, must warn when rules are
+    /// present. With no rules there is nothing to warn about in any mode.
+    #[test]
+    fn only_non_evaluating_modes_warn_about_loaded_rules() {
+        // Modes that run the evaluator: never warn, rules or not.
+        assert!(!rules_ignored_by_mode(Mode::All, true));
+        assert!(!rules_ignored_by_mode(Mode::Query, true));
+        assert!(!rules_ignored_by_mode(Mode::All, false));
+        assert!(!rules_ignored_by_mode(Mode::Query, false));
+
+        // Modes that do not run the evaluator: warn only when rules are loaded.
+        assert!(rules_ignored_by_mode(Mode::Gateway, true));
+        assert!(rules_ignored_by_mode(Mode::Maintain, true));
+        assert!(!rules_ignored_by_mode(Mode::Gateway, false));
+        assert!(!rules_ignored_by_mode(Mode::Maintain, false));
+    }
+}

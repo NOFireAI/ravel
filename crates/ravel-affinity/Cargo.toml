@@ -1,0 +1,12 @@
+[package]
+name = "ravel-affinity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+blake3 = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,610 @@
+//! End-to-end ingest-then-query benchmark core: drives `IngestRouter` and
+//! `QueryEngine` directly (no HTTP)
+//! against a real or in-memory object store. Lives in the lib (not the
+//! `s3_e2e_bench` bin) so `tests/s3_e2e_smoke.rs` can exercise the same path
+//! the bin runs, matching how `ravel_bench::codecs` and
+//! `ravel_bench::read_accounting` are tested directly rather than through a
+//! bin. Report-only: never changes ravel-ingest/ravel-catalog/ravel-query
+//! behavior, only measures it.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use ravel_catalog::{Catalog, CatalogConfig};
+use ravel_ingest::{Clock, IngestConfig, IngestRouter, SystemClock, WriteMode};
+use ravel_object_store::{InstrumentedStore, ObjectStoreBackend, list_all};
+use ravel_promql::Value;
+use ravel_query::{EngineConfig, QueryEngine};
+use ravel_types::{Signal, TenantId, TimeRange};
+use serde::Serialize;
+
+use crate::generator::{BatchSizeDistribution, WorkloadConfig, generate_batches};
+
+/// Bytes on the wire per logical sample: `ts_ns: i64` + `value: f64`. Used as
+/// the denominator of write amplification (bytes stored / bytes ingested
+/// logical). Same constant `ingest_bench` uses.
+const LOGICAL_BYTES_PER_SAMPLE: u64 = 16;
+const VISIBILITY_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const VISIBILITY_POLL_MAX_ROUNDS: u32 = 30;
+
+/// Inputs for one end-to-end run. `store_label` is display-only (the
+/// `--store` flag's name); the actual backend is `store`.
+pub struct E2eConfig {
+    pub store: Arc<dyn ObjectStoreBackend>,
+    pub store_label: String,
+    pub shards: u32,
+    pub target_series: usize,
+    pub points_per_sec: u64,
+    pub duration_secs: u64,
+    pub batch_size: usize,
+    pub ack_timeout_secs: u64,
+    /// PromQL instant-selector query run repeatedly after ingest to build
+    /// query-latency percentiles.
+    pub query: String,
+    /// Number of repeated instant queries run for the latency percentiles.
+    pub query_count: usize,
+    /// Passed straight through to `IngestConfig::max_flush_lifetime`.
+    /// `s3_e2e_bench` fills it with `IngestConfig::default()`'s value: exists
+    /// so a test can force the pre-acquire abandon guard deterministically,
+    /// without a real wait for the production 3600s default.
+    pub max_flush_lifetime: Duration,
+}
+
+fn percentile(sorted_ns: &[u64], pct: f64) -> u64 {
+    if sorted_ns.is_empty() {
+        return 0;
+    }
+    let rank = ((sorted_ns.len() - 1) as f64 * pct).round() as usize;
+    sorted_ns[rank.min(sorted_ns.len() - 1)]
+}
+
+struct LatencyStats {
+    p50_ns: u64,
+    p95_ns: u64,
+    p99_ns: u64,
+    max_ns: u64,
+    count: usize,
+}
+
+fn latency_stats(mut samples_ns: Vec<u64>) -> LatencyStats {
+    samples_ns.sort_unstable();
+    LatencyStats {
+        p50_ns: percentile(&samples_ns, 0.50),
+        p95_ns: percentile(&samples_ns, 0.95),
+        p99_ns: percentile(&samples_ns, 0.99),
+        max_ns: samples_ns.last().copied().unwrap_or(0),
+        count: samples_ns.len(),
+    }
+}
+
+/// A run's flush count by trigger: the five counters `estimated_put_count`
+/// sums, and [`FlushCounts::breakdown_line`] prints every one of them, so the
+/// printed breakdown sums to the estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlushCounts {
+    pub by_size: u64,
+    pub by_age: u64,
+    pub by_age_adaptive: u64,
+    pub by_age_floor: u64,
+    pub manual: u64,
+}
+
+impl FlushCounts {
+    pub fn from_snapshot(metrics: &ravel_ingest::IngestMetricsSnapshot) -> Self {
+        Self {
+            by_size: metrics.flushes_by_size,
+            by_age: metrics.flushes_by_age,
+            by_age_adaptive: metrics.flushes_by_age_adaptive,
+            by_age_floor: metrics.flushes_by_age_floor,
+            manual: metrics.flushes_manual,
+        }
+    }
+
+    /// One data-object PUT and one commit-record PUT per flush, excluding
+    /// retries.
+    pub fn estimated_put_count(&self) -> u64 {
+        2 * (self.by_size + self.by_age + self.by_age_adaptive + self.by_age_floor + self.manual)
+    }
+
+    /// The human-table flush-cause line `s3_e2e_bench` prints.
+    pub fn breakdown_line(&self) -> String {
+        format!(
+            "  flushes           : size={} age={} age_adaptive={} age_floor={} manual={}",
+            self.by_size, self.by_age, self.by_age_adaptive, self.by_age_floor, self.manual
+        )
+    }
+}
+
+impl Report {
+    pub fn flush_counts(&self) -> FlushCounts {
+        FlushCounts {
+            by_size: self.flushes_by_size,
+            by_age: self.flushes_by_age,
+            by_age_adaptive: self.flushes_by_age_adaptive,
+            by_age_floor: self.flushes_by_age_floor,
+            manual: self.flushes_manual,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct Report {
+    pub config: ReportConfig,
+    pub accepted_points_per_sec: f64,
+    pub accepted_points: u64,
+    pub ack_latency_ms: LatencyReport,
+    pub flushes_by_size: u64,
+    pub flushes_by_age: u64,
+    /// Flushes opened by the adaptive age corridor (ADR-0067 decision 3).
+    /// Zero while this run leaves `adaptive_flush_delay` at its default of
+    /// off, and carried so the estimate stays correct if it is turned on.
+    pub flushes_by_age_adaptive: u64,
+    /// Flushes the sub-floor hold opened (ADR-1737). Zero unless the router's
+    /// `idle_flush_byte_floor` is non-zero, and disjoint from `flushes_by_age`.
+    pub flushes_by_age_floor: u64,
+    pub flushes_manual: u64,
+    pub put_retries: u64,
+    pub abandoned_retry_exhausted: u64,
+    pub abandoned_queue_deadline: u64,
+    pub abandoned_input_rejected: u64,
+    pub acks_ok: u64,
+    pub acks_err: u64,
+    /// Derived: one data-object PUT and one commit-record PUT per flush
+    /// (`ravel_commit::publish::publish`), excluding retries. Computed by
+    /// [`FlushCounts::estimated_put_count`] over the same counters this report
+    /// carries, `flushes_by_age_adaptive` and `flushes_by_age_floor` included,
+    /// so twice the printed breakdown ([`FlushCounts::breakdown_line`]) is
+    /// exactly this figure.
+    pub estimated_put_count: u64,
+    pub bytes_written: u64,
+    pub logical_bytes: u64,
+    pub write_amplification: f64,
+    pub visibility_lag_ms: VisibilityReport,
+    /// Matched series in the query phase's PromQL instant vector. Zero
+    /// (rather than the query phase being skipped) if the selector matched
+    /// nothing; a non-zero `accepted_points` with a zero match count is
+    /// itself the signal something is wrong, so this is left visible rather
+    /// than folded away.
+    pub query_matched_series: usize,
+    pub query_latency_ms: LatencyReport,
+    pub query_get_count: u64,
+    pub query_list_count: u64,
+    pub query_bytes_read: u64,
+}
+
+#[derive(Serialize)]
+pub struct ReportConfig {
+    pub store: String,
+    pub shards: u32,
+    pub target_series: usize,
+    pub points_per_sec: u64,
+    pub duration_secs: u64,
+    pub batch_size: usize,
+    pub query: String,
+    pub query_count: usize,
+    /// Seconds of `IngestConfig::max_flush_lifetime` the run applied. It
+    /// changes what the run measures -- it is the deadline whose expiry
+    /// produces `abandoned_queue_deadline` -- so a report that omits it cannot
+    /// explain its own abandonment counts.
+    pub max_flush_lifetime_secs: f64,
+}
+
+#[derive(Serialize)]
+pub struct LatencyReport {
+    pub p50: f64,
+    pub p95: f64,
+    pub p99: f64,
+    pub max: f64,
+    pub count: usize,
+}
+
+impl From<LatencyStats> for LatencyReport {
+    fn from(s: LatencyStats) -> Self {
+        LatencyReport {
+            p50: s.p50_ns as f64 / 1e6,
+            p95: s.p95_ns as f64 / 1e6,
+            p99: s.p99_ns as f64 / 1e6,
+            max: s.max_ns as f64 / 1e6,
+            count: s.count,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct VisibilityReport {
+    pub resolved_count: usize,
+    pub unresolved_count: usize,
+    pub avg: f64,
+    pub max: f64,
+}
+
+pub async fn run(config: &E2eConfig) -> Report {
+    let store = Arc::clone(&config.store);
+    // Unique per run, not a fixed literal: `bytes_written`/`write_amplification`
+    // below list by tenant prefix, so a fixed tenant would let consecutive
+    // local runs against the same bucket inflate each other's byte counts.
+    let tenant = TenantId::new(format!("bench-tenant-{}", uuid::Uuid::new_v4()));
+    let tenant_hash = tenant.hash();
+    let signal = Signal::Metrics;
+
+    let ingest_config = IngestConfig {
+        shard_count: config.shards,
+        max_flush_lifetime: config.max_flush_lifetime,
+        ..IngestConfig::default()
+    };
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let router = Arc::new(IngestRouter::new(
+        ingest_config,
+        Arc::clone(&store),
+        signal,
+        Arc::clone(&clock),
+    ));
+    let catalog = Arc::new(
+        Catalog::new(
+            Arc::clone(&store),
+            CatalogConfig {
+                shard_count: config.shards,
+                ..CatalogConfig::default()
+            },
+        )
+        .expect("catalog config"),
+    );
+
+    let total_points = config.points_per_sec * config.duration_secs;
+    let samples_per_series = (total_points as usize / config.target_series.max(1)).max(1);
+    let run_start_ns = clock.now_ns();
+    // Event timestamps must land within the real wall-clock span of the run:
+    // the catalog's listing-based visibility poll below filters by event-time
+    // overlap against a range anchored on `run_start_ns` (mirrors
+    // `ingest_bench`'s identical constraint).
+    let duration_ns = Duration::from_secs(config.duration_secs.max(1)).as_nanos() as i64;
+    let interval_ns = (duration_ns / samples_per_series as i64).max(1);
+    let workload = WorkloadConfig {
+        tenant: tenant.as_str().to_string(),
+        series_count: config.target_series,
+        samples_per_series,
+        start_ts_ns: run_start_ns,
+        interval_ns,
+        batch_size: BatchSizeDistribution::fixed(config.batch_size),
+        ..WorkloadConfig::default()
+    };
+    // The generator stamps every series with a __name__ label, so the query
+    // phase's PromQL selector matches by name directly.
+    let batches: Vec<Vec<_>> = generate_batches(&workload).expect("generate workload");
+
+    let ack_deadline = Duration::from_secs(config.ack_timeout_secs);
+    let pacing_interval = if config.points_per_sec == 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_secs_f64(config.batch_size as f64 / config.points_per_sec as f64)
+    };
+
+    // Visibility lag is tracked concurrently with the write phase below, not
+    // as a separate pass afterward (mirrors `ingest_bench`): acks span the
+    // whole run, so measuring them only once every write has landed would
+    // charge early acks for the rest of the run's wall time instead of their
+    // real ack-to-queryable gap.
+    let pending: Arc<Mutex<HashMap<String, i64>>> = Arc::new(Mutex::new(HashMap::new()));
+    let lags_ns: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let writes_done = Arc::new(AtomicBool::new(false));
+
+    let poller = tokio::spawn({
+        let catalog = Arc::clone(&catalog);
+        let clock = Arc::clone(&clock);
+        let pending = Arc::clone(&pending);
+        let lags_ns = Arc::clone(&lags_ns);
+        let writes_done = Arc::clone(&writes_done);
+        async move {
+            for _ in 0..VISIBILITY_POLL_MAX_ROUNDS {
+                tokio::time::sleep(VISIBILITY_POLL_INTERVAL).await;
+                let now_ns = clock.now_ns();
+                let listing_range = TimeRange {
+                    start_ns: run_start_ns,
+                    end_ns: now_ns,
+                };
+                match catalog
+                    .resolve(&tenant_hash, signal, listing_range, &[], now_ns)
+                    .await
+                {
+                    Ok(snapshot) => {
+                        let mut pending = pending.lock().expect("pending lock");
+                        let mut lags_ns = lags_ns.lock().expect("lags lock");
+                        for seg in snapshot.segments {
+                            if let Some(ack_wall_ns) = pending.remove(&seg.data_object_key) {
+                                lags_ns.push((now_ns - ack_wall_ns).max(0) as u64);
+                            }
+                        }
+                        if writes_done.load(Ordering::Acquire) && pending.is_empty() {
+                            break;
+                        }
+                    }
+                    Err(err) => eprintln!("visibility: listing resolve failed: {err}"),
+                }
+            }
+        }
+    });
+
+    let wall_start = std::time::Instant::now();
+    let mut handles = Vec::with_capacity(batches.len());
+    let mut next_dispatch = tokio::time::Instant::now();
+    for batch in batches {
+        if pacing_interval > Duration::ZERO {
+            tokio::time::sleep_until(next_dispatch).await;
+            next_dispatch += pacing_interval;
+        }
+        let router = Arc::clone(&router);
+        let clock = Arc::clone(&clock);
+        let catalog = Arc::clone(&catalog);
+        let pending = Arc::clone(&pending);
+        let tenant = tenant.clone();
+        let batch_len = batch.len() as u64;
+        handles.push(tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            let result = router
+                .write(tenant, batch, WriteMode::Strict, ack_deadline)
+                .await;
+            let latency_ns = start.elapsed().as_nanos() as u64;
+            let ack_wall_ns = clock.now_ns();
+            if let Ok(receipt) = &result {
+                // Resolve this ack's exact segment (read-your-write min-token
+                // GET) right away, concurrently with every other in-flight
+                // batch, so the poller above can see it on its very next
+                // tick rather than only after the whole write phase ends.
+                for token in &receipt.tokens {
+                    let exact_range = TimeRange {
+                        start_ns: ack_wall_ns,
+                        end_ns: ack_wall_ns,
+                    };
+                    match catalog
+                        .resolve(
+                            &tenant_hash,
+                            signal,
+                            exact_range,
+                            std::slice::from_ref(token),
+                            ack_wall_ns,
+                        )
+                        .await
+                    {
+                        Ok(snapshot) => {
+                            let mut pending = pending.lock().expect("pending lock");
+                            for seg in snapshot.segments {
+                                pending.entry(seg.data_object_key).or_insert(ack_wall_ns);
+                            }
+                        }
+                        Err(err) => eprintln!("visibility: min-token resolve failed: {err}"),
+                    }
+                }
+            }
+            (batch_len, latency_ns, result)
+        }));
+    }
+
+    let mut latencies_ns = Vec::with_capacity(handles.len());
+    let mut accepted_points: u64 = 0;
+    for handle in handles {
+        let (batch_len, latency_ns, result) = handle.await.expect("join write task");
+        latencies_ns.push(latency_ns);
+        match result {
+            Ok(_) => accepted_points += batch_len,
+            Err(err) => eprintln!("write error: {err}"),
+        }
+    }
+    let elapsed_secs = wall_start.elapsed().as_secs_f64().max(1e-9);
+
+    router.flush_all().await;
+    writes_done.store(true, Ordering::Release);
+    poller.await.expect("join visibility poller");
+
+    let visibility = {
+        let pending = pending.lock().expect("pending lock");
+        let lags_ns = lags_ns.lock().expect("lags lock");
+        let unresolved_count = pending.len();
+        let resolved_count = lags_ns.len();
+        let avg = if lags_ns.is_empty() {
+            0.0
+        } else {
+            lags_ns.iter().sum::<u64>() as f64 / lags_ns.len() as f64 / 1e6
+        };
+        let max = lags_ns.iter().max().copied().unwrap_or(0) as f64 / 1e6;
+        VisibilityReport {
+            resolved_count,
+            unresolved_count,
+            avg,
+            max,
+        }
+    };
+
+    let metrics = router.metrics().snapshot();
+    // Scoped to this run's own tenant prefix (t/<tenant_hash_hex>/, see
+    // ravel_commit::keys::data_key), not the whole bucket -- otherwise
+    // pre-existing objects from other tenants/benches sharing the same
+    // bucket would silently inflate bytes_written/write_amplification.
+    let tenant_prefix = format!("t/{}/", tenant_hash.to_hex());
+    let objects = list_all(store.as_ref(), &tenant_prefix)
+        .await
+        .expect("list tenant objects");
+    let bytes_written: u64 = objects.iter().map(|o| o.size).sum();
+    let logical_bytes = accepted_points * LOGICAL_BYTES_PER_SAMPLE;
+    let write_amplification = if logical_bytes == 0 {
+        0.0
+    } else {
+        bytes_written as f64 / logical_bytes as f64
+    };
+    let estimated_put_count = FlushCounts::from_snapshot(&metrics).estimated_put_count();
+
+    // Query phase: wraps the same (now-populated) store in a fresh
+    // `InstrumentedStore` (the one object-store counter this crate uses, shared
+    // with the server per ADR-0104 decision 5) and a fresh Catalog/QueryEngine,
+    // then runs the configured instant selector repeatedly for latency
+    // percentiles. Always "hot" -- there is no segment-footer cache in
+    // `ravel-query` yet (a cold-state variant is future work). Only the query
+    // phase is counted, so ingest PUTs never enter these GET/LIST totals.
+    let query_instrumented = Arc::new(InstrumentedStore::new(Arc::clone(&store)));
+    let query_metrics = query_instrumented.metrics();
+    let query_store: Arc<dyn ObjectStoreBackend> = query_instrumented;
+    let query_catalog = Arc::new(
+        Catalog::new(
+            Arc::clone(&query_store),
+            CatalogConfig {
+                shard_count: config.shards,
+                ..CatalogConfig::default()
+            },
+        )
+        .expect("query catalog config"),
+    );
+    let engine = QueryEngine::new(query_catalog, query_store, EngineConfig::default());
+    let query_t_ms = (run_start_ns + duration_ns) / 1_000_000;
+    let query_now_ns = clock.now_ns();
+    let query_deadline = Duration::from_secs(30);
+
+    let mut query_latencies_ns = Vec::with_capacity(config.query_count);
+    let mut query_matched_series = 0usize;
+    for i in 0..config.query_count {
+        let start = std::time::Instant::now();
+        let (value, _coverage) = engine
+            .instant(
+                tenant_hash,
+                &config.query,
+                query_t_ms,
+                &[],
+                query_now_ns,
+                query_deadline,
+            )
+            .await
+            .expect("instant query");
+        query_latencies_ns.push(start.elapsed().as_nanos() as u64);
+        if i == 0 {
+            query_matched_series = match value {
+                Value::Vector(v) => v.len(),
+                _ => 0,
+            };
+        }
+    }
+    let query_snapshot = query_metrics.snapshot();
+    let (query_get_count, query_list_count, query_bytes_read) = (
+        query_snapshot.get.calls,
+        query_snapshot.list_calls(),
+        query_snapshot.get.bytes,
+    );
+
+    Report {
+        config: ReportConfig {
+            store: config.store_label.clone(),
+            shards: config.shards,
+            target_series: config.target_series,
+            points_per_sec: config.points_per_sec,
+            duration_secs: config.duration_secs,
+            batch_size: config.batch_size,
+            query: config.query.clone(),
+            query_count: config.query_count,
+            max_flush_lifetime_secs: config.max_flush_lifetime.as_secs_f64(),
+        },
+        accepted_points_per_sec: accepted_points as f64 / elapsed_secs,
+        accepted_points,
+        ack_latency_ms: latency_stats(latencies_ns).into(),
+        flushes_by_size: metrics.flushes_by_size,
+        flushes_by_age: metrics.flushes_by_age,
+        flushes_by_age_adaptive: metrics.flushes_by_age_adaptive,
+        flushes_by_age_floor: metrics.flushes_by_age_floor,
+        flushes_manual: metrics.flushes_manual,
+        put_retries: metrics.put_retries,
+        abandoned_retry_exhausted: metrics.abandoned_retry_exhausted,
+        abandoned_queue_deadline: metrics.abandoned_queue_deadline,
+        abandoned_input_rejected: metrics.abandoned_input_rejected,
+        acks_ok: metrics.acks_ok,
+        acks_err: metrics.acks_err,
+        estimated_put_count,
+        bytes_written,
+        logical_bytes,
+        write_amplification,
+        visibility_lag_ms: visibility,
+        query_matched_series,
+        query_latency_ms: latency_stats(query_latencies_ns).into(),
+        query_get_count,
+        query_list_count,
+        query_bytes_read,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Same check as `ravel_bench::ingest`'s test of the same name, over the
+    /// five counters this report carries.
+    #[test]
+    fn printed_flush_breakdown_sums_to_the_estimate_with_a_floor_set() {
+        let snapshot = ravel_ingest::IngestMetricsSnapshot {
+            flushes_by_size: 1,
+            flushes_by_age: 2,
+            flushes_by_age_floor: 4,
+            flushes_manual: 8,
+            flushes_by_age_adaptive: 16,
+            ..Default::default()
+        };
+        let counts = FlushCounts::from_snapshot(&snapshot);
+        let line = counts.breakdown_line();
+        let printed: u64 = line
+            .split_whitespace()
+            .filter_map(|field| field.split_once('='))
+            .map(|(_, value)| value.parse::<u64>().expect("numeric flush count"))
+            .sum();
+        assert_eq!(counts.estimated_put_count(), 62);
+        assert!(
+            line.contains("age_adaptive=16"),
+            "the printed breakdown must carry the adaptive-age count: {line}"
+        );
+        assert_eq!(
+            2 * printed,
+            counts.estimated_put_count(),
+            "the printed breakdown must sum to the estimate: {line}"
+        );
+    }
+
+    /// Same guard as `ravel_bench::ingest`'s test of the same name:
+    /// `max_flush_lifetime: Duration::ZERO` makes the sole flush's deadline
+    /// equal to its own open reading, so it is abandoned in the queue
+    /// deterministically, with no real wait for the production 3600s
+    /// lifetime and no store call. `query_count: 0` skips the query phase
+    /// entirely, since nothing was ever written for it to match.
+    #[tokio::test]
+    async fn queue_deadline_abandonment_is_reported_under_its_own_reason() {
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::new(ravel_object_store::memory::MemoryStore::new());
+        let config = E2eConfig {
+            store,
+            store_label: "memory".to_string(),
+            shards: 1,
+            target_series: 1,
+            points_per_sec: 1,
+            duration_secs: 1,
+            batch_size: 1,
+            ack_timeout_secs: 5,
+            query: "bench_gauge".to_string(),
+            query_count: 0,
+            max_flush_lifetime: Duration::ZERO,
+        };
+
+        let report = run(&config).await;
+
+        assert_eq!(
+            report.abandoned_queue_deadline, 1,
+            "the sole flush opened already past its zeroed lifetime deadline"
+        );
+        assert_eq!(
+            report.abandoned_retry_exhausted, 0,
+            "the guard fires before any store call, so no retry budget is spent"
+        );
+        assert_eq!(
+            report.abandoned_input_rejected, 0,
+            "the point was well-formed; nothing was rejected at admission"
+        );
+        assert_eq!(
+            report.accepted_points, 0,
+            "the sole write's flush was abandoned, never acked as accepted"
+        );
+    }
+}

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1c4d7867e17675f43eba2b2419df714cf3fcf67a9cea69b5d4d762169be2a9c3 # shrinks to segments = [(0, 100, [SeriesDesc { metric: "m0", samples: [(0, 460072)] }])], cap = 4

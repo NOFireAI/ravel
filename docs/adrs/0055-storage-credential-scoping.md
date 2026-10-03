@@ -1,0 +1,1683 @@
+# ADR-0055: per-role storage credential scoping
+
+Status: Accepted
+
+This is one of the highest-leverage structural fixes in the isolation
+posture, with a wide blast radius: the control-plane objects ADR-0050
+and ADR-0052 added (`sys/tenancy`, `sys/qualification`, the
+per-(tenant,signal) `prov` provisioning/generation record) all live
+under the same single credential this ADR splits.
+
+## Context
+
+`S3Config` (`crates/ravel-object-store/src/s3.rs:123-149`) is a flat struct:
+bucket, region, endpoint, one `access_key_id`/`secret_access_key` pair, an
+optional `kms_key_id`. `services/ravel-server/src/store.rs` and
+`services/ravel-cli/src/store.rs` each build exactly one `S3Store` from one
+`RAVEL_S3_*` env-var set at process startup, wrap it once in
+`InstrumentedStore`, and hand the resulting `Arc<dyn ObjectStoreBackend>` to
+every route, background task, and CLI command that process runs. This is
+deliberate, documented design, not oversight: "Ravel does not use the AWS
+credential chain (profiles, instance roles, `AWS_ACCESS_KEY_ID`). It reads
+only the `RAVEL_S3_*` flags/env" (`docs/guides/operations.md:372-373`).
+
+`ObjectStoreBackend` (`crates/ravel-object-store/src/lib.rs:406-441`) has no
+caller-identity, tenant, or role parameter on any method. Every holder of the
+trait object is fully trusted for every operation on every key in the
+bucket. `StoreError::AccessDenied` exists in the error enum only to surface
+an *upstream* S3-level denial; Ravel's own code never raises it. There is no
+interceptor or middleware layer, and ADR-0042's own rejected alternatives
+already ruled one out: "a second, parallel write path outside the
+`ObjectStoreBackend` trait's contract-tested abstraction would violate 'no
+durability may depend on' an unaudited side channel" — an in-process
+authorization layer is the same category of side channel.
+
+The Kubernetes operator (`services/ravel-operator/src/reconcile.rs`) already
+builds three separate `Deployment`s per `RavelCluster` — gateway, query,
+maintain (`desired_gateway_deployment`, `desired_query_deployment`, and the
+maintain deployment) — but all three source AWS credentials from **one**
+`credentialsSecretRef` via the identical `s3_credential_env(spec)` helper
+(reconcile.rs:98-112). No pod sets `serviceAccountName`; every pod runs under
+the namespace's `default` ServiceAccount, so there is no IRSA/Workload
+Identity hook today either.
+
+### What each role actually does, read from the code
+
+The full call-site inventory (every PUT/GET/LIST/DELETE and the prefix it
+touches) is recorded in this epic's design research and summarized in the
+per-role grants below. Two facts from that inventory drive this ADR's shape:
+
+1. **The catalog fold task runs in Gateway and Query mode, not only Query.**
+   `services/ravel-server/src/lib.rs:715-736` spawns `fold::spawn` in every
+   mode except `Mode::Maintain` (reversed by ADR-1693; see the maintain-tier
+   fold amendment below). A `Mode::Gateway` process therefore writes
+   `catalog/<sig>/snap/…`, `catalog/<sig>/HEAD` (`CasVersion`), and
+   `catalog/<sig>/idx/…` alongside its ingest writes — fold is not a
+   query-only responsibility, and any role split that gave Gateway an
+   ingest-only grant would break it in the shipped topology. (No longer
+   true since ADR-1693: the scheduled fold runs in `Mode::Maintain` and
+   `Mode::All` only, and Gateway folds by no route.)
+2. **Nothing in the current codebase ever deletes `sys/*`, `prov`,
+   `catalog/*`, or the audit prefix `t/<hash>/u/*`.** Deletion is confined
+   to `l0/`, `l1/`, `c/` (records and tombstones), and `idem/`, all from
+   `crates/ravel-maintain/src/{sweep,retention}.rs`. (No longer true of
+   `catalog/*`: the unreferenced-catalog sweep deletes `snap/` and `idx/`
+   objects; see the 2026-09-23 amendment below. Nor of `sys/*`: the
+   dead-worker reaper deletes `sys/maintain/workers/*`; see the
+   worker-heartbeat amendment below. The maintain role also deletes dead
+   query-worker records under `sys/query/workers/*`; see the query-worker
+   reap amendment below. The Parquet bucket probe deletes its own
+   `sys/pq-probe/*` scratch object, under Admin and, for HTTP Parquet DDL,
+   under Query; see the HTTP DDL amendment below.) This means a
+   deny-delete policy on the first four prefixes costs no legitimate
+   operation anything today — it is a precise fit to what the code already
+   guarantees it never needs, not a speculative restriction.
+
+### The WORM pairing question this ADR must answer
+
+One proposal pairs the credential split with putting "`sys/`, `c/` (commit
+records), and `prov` objects under WORM / object-lock." Read literally for
+`c/`, that is wrong: `crates/ravel-maintain/src/sweep.rs` (`sweep_superseded`,
+`sweep_unreferenced_parts`) and `retention.rs` (`physical_sweep`) legitimately
+and routinely delete commit records — after compaction supersedes them, or
+after a tombstone's grace period expires. A blanket "no delete on `c/`" would
+break already-shipped, correct maintenance. A separate commit-record
+*reconstruction tool* (ADR-0058) only makes sense if commit records can
+legitimately go missing and need rebuilding — further confirming they
+are not meant to be permanently undeletable.
+
+The actual threat — "a compromised process or a mistaken lifecycle rule
+deletes commit records it should not have" — is a
+question of *who* can delete `c/`, not *whether* `c/` is ever deleted. That
+is a role-scoping question, which this ADR answers directly (§2, sweep
+grants), not a WORM question. WORM applies to the four prefixes nothing
+legitimately deletes at all: `sys/tenancy`, `sys/qualification`, `sys/gc`,
+`prov`, `catalog/*` (except the `snap/` and `idx/` objects the
+unreferenced-catalog sweep deletes; see the 2026-09-23 amendment below), and the audit prefix.
+See §3.
+
+ADR-0042 decision 3 already evaluated true per-object S3 Object Lock and
+rejected implementing it now: `object_store` 0.14.1 has no per-PUT
+retain-until-date/legal-hold header, so "real WORM requires the operator to
+additionally enable S3 Object Lock at the bucket level... as an out-of-band,
+documented deployment step," reserved as "its own ADR extending the
+`ObjectStoreBackend` trait itself (a capability-gated new method, following
+the existing `Capabilities` pattern), not a workaround." This ADR is that
+reserved follow-up for the delete-deny half of the problem; it does not
+reopen the in-process-Object-Lock question ADR-0042 already closed.
+
+### Today: one credential, everything trusted
+
+```mermaid
+%%{init: {"theme": "neutral", "look": "handDrawn"}}%%
+flowchart TB
+    subgraph procs["Every process, every mode"]
+        GW["Gateway\n(Mode::Gateway / All)"]
+        QY["Query\n(Mode::Query / All)"]
+        MT["Maintain\n(Mode::Maintain)"]
+        CLI["ravel-cli\n(any subcommand)"]
+    end
+
+    CRED[("RAVEL_S3_ACCESS_KEY\nRAVEL_S3_SECRET_KEY\none shared credential")]
+
+    GW --> CRED
+    QY --> CRED
+    MT --> CRED
+    CLI --> CRED
+
+    CRED -->|"GET / PUT / LIST / DELETE\non every prefix"| BUCKET[("S3 bucket\nl0/  l1/  c/  idem/\nsys/tenancy  sys/qualification  sys/gc\nprov  catalog/*  u/* (audit)")]
+
+    style CRED fill:#f66,stroke:#900,stroke-width:2px
+    style BUCKET fill:#eee,stroke:#333
+```
+
+A single leaked or compromised credential — from any of the four boxes on
+the left — reads, overwrites, or deletes anything in the bucket. This is
+the single-credential exposure this ADR closes.
+
+## Decision
+
+Scope storage credentials to the process roles the codebase already has —
+Gateway, Query, Maintain (the existing `Mode` enum,
+`services/ravel-server/src/config.rs:15-23`, and the operator's existing
+three `Deployment`s) — plus a new Admin role for `ravel-cli`'s one-off
+bootstrap and mutation commands. Enforcement is entirely at the storage
+backend's native IAM/bucket-policy layer, not in Ravel's own code: no
+`ObjectStoreBackend` trait change, no new runtime service, no caller-identity
+parameter threaded through call sites. `S3Config` and the `RAVEL_S3_*`
+env-var contract are unchanged; what changes is that operators provision a
+distinct, narrower credential per role instead of one bucket-wide credential,
+the same way they already provision the bucket itself.
+
+This works because S3 (and S3-compatible backends: MinIO, used in
+`kind-up.sh` and CI) already has a native, load-bearing, cloud-audited
+mechanism for exactly this — bucket policies or IAM policies scoped by
+principal, prefix, and action. Building an in-process equivalent inside
+Ravel would duplicate a control the backend already provides for free and
+more robustly (a Rust bug cannot bypass an IAM deny; it can bypass
+Ravel's own check), which is precisely the reasoning ADR-0042 already used
+to reject an in-process authorization side channel.
+
+### 1. Four roles, mapped to existing process boundaries
+
+| Role | Process | Read | Write (create/mutate) | Delete |
+|---|---|---|---|---|
+| **Gateway** | `Mode::Gateway`, or the gateway half of `Mode::All` | `prov`, `idem/<key>` (dedup lookup), `sys/tenancy`, `sys/qualification`, `sys/gc` (bootstrap reads); `l0/`, `c/` (fold's own read-back of what it just built on); `catalog/<sig>/**` (HEAD, snap parts, name postings — fold reads its own prior output to fold incrementally, `fold.rs` `get_head`/part/postings reads) | `l0/**` (CreateIfAbsent), `c/**cmt` (CreateIfAbsent, L0 commit records only), `idem/**` (Put), `prov` (CreateIfAbsent, adopt path only; create-only per the prov write conditions amendment below), `catalog/<sig>/snap/**` (CreateIfAbsent), `catalog/<sig>/HEAD` (CasVersion), `catalog/<sig>/idx/**` (CreateIfAbsent); `sys/tenancy` (CreateIfAbsent, first-boot race, see §4) | no durable object; only the mutable per-process admission snapshots `t/<hash>/<sig>/admission/*` of dead processes (see the 2026-10-02 amendment below) |
+| **Query** | `Mode::Query`, or the query half of `Mode::All` | `c/**` (Phase 1 listing), `l0/**`, `l1/**` (the query fetchers GET segment data directly — footer-first ranged reads — not just commit-record metadata; `ravel-query`'s fetcher, `ravel-server`'s exemplar/log/span fetchers), `catalog/<sig>/**` (snap/HEAD/idx), `prov`, `admission/query/**` (fleet-global query concurrency reconciliation, ADR-0061 decision 2: LIST the bucket-root `admission/query/` prefix and GET each sibling process's snapshot), `sys/tenancy`, `sys/qualification`, `sys/gc` | `catalog/<sig>/snap/**`, `catalog/<sig>/HEAD` (CasVersion), `catalog/<sig>/idx/**` — same fold grants as Gateway, per the code fact above; `t/<hash>/u/<QUERY_AUDIT_SHARD>/**` (Put, append-only query audit); `admission/query/<process_id>.snapshot` (Overwrite, this process's own fleet-concurrency snapshot, ADR-0061 decision 2 — a bucket-root key, deliberately **not** under a `t/<hash>/` prefix since the ceiling is fleet-global, not per-tenant); `sys/tenancy` (CreateIfAbsent, first-boot race); `t/<hash>/pq/t/**` (CreateIfAbsent only, HTTP Parquet DDL manifests) and `sys/pq-probe/*` (Overwrite, the bucket probe), see the HTTP DDL amendment below | no durable object; only the bucket probe's scratch object `sys/pq-probe/*` (see the HTTP DDL amendment below). A draining query worker overwrites its own `sys/query/workers/<process_id>` record instead of deleting it; see the query-worker reap amendment below |
+| **Maintain** | `Mode::Maintain` | `l0/**`, `c/**` (compaction input read, footer-first ranged reads); `l1/**` (HEAD, the lost-CAS-race convergence path re-verifies a part's existence before retrying publish); `maint/<shard>/cursor` (read before its own CAS mutation); `t/<hash>/u/<AUDIT>/**` (legal-hold refresh); `sys/tenancy`, `sys/qualification`, `sys/gc`, `prov` | `l1/**` (CreateIfAbsent); `c/**l1.cmt` (CreateIfAbsent, compaction records); `c/**retire.tmb` (Put, tombstones); `maint/<shard>/cursor` (mutable CAS); `sys/gc` (CreateIfAbsent bootstrap only — see §4 for the CasVersion mutation, which stays Admin); `sys/tenancy` (CreateIfAbsent, first-boot race); `catalog/<sig>/snap/**` (CreateIfAbsent), `catalog/<sig>/HEAD` (CasVersion, or CreateIfAbsent on the first fold), `catalog/<sig>/idx/**` (CreateIfAbsent) — the scheduled fold, see the maintain-tier fold amendment below | `l0/**`, `c/**` (records and tombstones, superseded/retention/orphan sweep), `l1/**` (unreferenced-part sweep), `idem/**` (marker sweep), `t/<hash>/u/<QUERY_AUDIT_SHARD>/**` (query-audit compaction + 90-day retention sweep — see the query-audit shard amendment below), `sys/maintain/workers/*` (dead-worker heartbeat reap, see the worker-heartbeat amendment below), `sys/query/workers/*` (dead query-worker record reap, see the query-worker reap amendment below), `t/<hash>/<sig>/del/*.dreq` (see the selective-erasure `del/` amendment below), `t/<hash>/pq/t/**` (superseded Parquet table manifests, `ravel-cli parquet sweep`, see the 2026-10-02 amendment below) — **the only role with durable-data deletion** |
+| **Admin** (`ravel-cli`, operator/CI use only, never a long-running server) | n/a — invoked out of band | everything the roles above read, plus `idem/<key>` single-key inspect | `sys/tenancy` (CreateIfAbsent bootstrap), `sys/qualification` (CreateIfAbsent, `store qualify`), `sys/qualify/<run-id>/**` (CreateIfAbsent, the same command's transient scratch prefix — `store qualify` exercises PUT/GET/LIST/CAS under this prefix as part of running the conformance suite, not just the final record write), `sys/gc` (CasVersion, `gc-config set`), `prov` (CasVersion, `provision reshard` / `provision adopt`; CAS-only and create-only grants per the prov write conditions amendment below), `t/<hash>/u/<AUDIT>/**` (legal hold set/clear, append-only), `c/**cmt` (CreateIfAbsent, reconstructed L0 commit records only, `commit reconstruct`, ADR-0058 — see the `c/**cmt` write amendment below) | the qualification scratch prefix `sys/qualify/*`, so `store qualify` can exercise the delete probe (see the qualification scratch delete amendment below), and the Parquet bucket probe prefix `sys/pq-probe/*` (see the 2026-10-02 amendment below); Admin still never deletes tenant data or any protected key |
+
+**Correction:**
+the table above was missing four read/write grants in its first accepted
+version, each a genuine gap that would have made the role split unshippable
+(the affected role's process would hard-fail on its own normal operation
+under the originally-published policy): Gateway's fold needs to read its own
+prior `catalog/**` output, not just write new output; Query's fetchers GET
+segment data (`l0/`, `l1/`) directly, not only commit-record metadata under
+`c/`; Maintain's lost-CAS convergence path HEADs `l1/**` and its cursor
+logic reads `maint/<shard>/cursor` before mutating it; and Admin's `store
+qualify` writes to the `sys/qualify/<run-id>/**` scratch prefix, not only
+the final `sys/qualification` record. All four are corrected in place above
+rather than left wrong with a note, since this ADR had not yet been acted
+on by any deployment at the time of correction.
+
+The table also omits the control-plane keys `sys/auth`, `sys/t/<hash>`, the
+`sys/maintain/memo/` listing, the tenant config record `t/<hash>/config`, the
+key-epoch record `t/<hash>/enc`, the metric metadata record `t/<hash>/m/meta`,
+and the alert evaluator's lease and state memo under `t/<hash>/a/`, along with
+the alert transition writes the Query role makes; the control-plane key
+amendment below adds them and lists every control-plane key each role uses.
+
+The table's `prov` entries are incomplete too: Maintain creates the record
+on the startup and maintain-tick adopt paths and raises format floors under
+`CasVersion`, and Admin's `provision adopt` is `CreateIfAbsent`. Query never
+writes the record, because its startup check does not adopt. The prov write
+conditions amendment below grants each writer and conditions every `prov`
+write on the put mode its callers send.
+
+The table's Read column says nothing about listing, and on AWS S3 a read of an
+absent key is refused unless a `ListBucket` grant covers the key. Each server
+role's reads of `sys/tenancy`, `sys/qualification`, `sys/gc` and the other keys
+whose absence is a normal state therefore also need a list grant on exactly
+those keys; the bootstrap-key list amendment below adds it.
+
+This is not a literal "ingest, compaction, query, and sweep" four-way split
+— sweep is not split into its own process here. Sweep
+runs inside the same `Mode::Maintain` process as compaction and retention
+today (`crates/ravel-maintain/src/sweep.rs` is invoked from the same tick
+loop as `build.rs`/`retention.rs`), and splitting it into a fifth process
+would be a larger, separate change to the maintenance architecture
+(ADR-0065 tracks maintenance-process restructuring).
+See Rejected Alternatives.
+
+```mermaid
+%%{init: {"theme": "neutral", "look": "handDrawn"}}%%
+flowchart TB
+    GW["Gateway credential\n(ingest + fold)"]
+    QY["Query credential\n(reads + fold + audit)"]
+    MT["Maintain credential\n(compact, retain, sweep, fold)"]
+    AD["Admin credential\nravel-cli, out of band"]
+
+    GW -->|"CreateIfAbsent"| L0["l0/**"]
+    GW -->|"CreateIfAbsent"| C1["c/**cmt"]
+    GW -->|"Put"| IDEM["idem/**"]
+    GW -->|"CreateIfAbsent"| PROVW["prov (adopt)"]
+    GW -->|"CreateIfAbsent + CasVersion"| CAT1["catalog/** (fold)"]
+    GW -->|"Delete (dead processes only)"| ADMS["*/admission/* (snapshots)"]
+
+    QY -->|"Get + List"| C1R["c/** (read)"]
+    QY -->|"CreateIfAbsent + CasVersion"| CAT2["catalog/** (fold)"]
+    QY -->|"Put, append-only"| AUDQ["u/** (query audit)"]
+    QY -->|"CreateIfAbsent only"| PQM["pq/t/&lt;table&gt;/v/*.pqm (HTTP DDL amendment)"]
+    QY -->|"Put + Delete (probe scratch only)"| QPRB["sys/pq-probe/*\n(bucket probe scratch)"]
+
+    MT -->|"Get (read inputs)"| L0R["l0/**, c/** (read)"]
+    MT -->|"CreateIfAbsent"| L1["l1/**"]
+    MT -->|"CreateIfAbsent / Put"| C2["c/**l1.cmt, retire.tmb"]
+    MT -->|"CreateIfAbsent + CasVersion"| CAT3["catalog/** (scheduled fold,\nmaintain-tier fold amendment)"]
+    MT ==>|"Delete — only role that can"| DEL["l0/** · l1/** · c/** · idem/**\nu/&lt;query-audit shard&gt;/** · del/*.dreq · pq/t/**"]
+
+    AD -->|"CasVersion"| PROVA["prov (reshard)"]
+    AD -->|"CasVersion"| GC["sys/gc (set)"]
+    AD -->|"CreateIfAbsent"| SYSW["sys/tenancy · sys/qualification (bootstrap)"]
+    AD -->|"Put, append-only"| HOLD["u/** (legal hold)"]
+    AD -->|"Delete (scratch only)"| QSCR["sys/qualify/* · sys/pq-probe/*\n(qualification and probe scratch)"]
+
+    subgraph deny["Deny s3:DeleteObject for every role"]
+        SYS["sys/tenancy\nsys/qualification\nsys/gc"]
+        PROVD["prov"]
+        CATD["catalog/*\n(maintain.json: catalog/*/HEAD only,\n2026-09-23 amendment)"]
+        AUDD["u/&lt;legal-hold shard 0&gt;/* (holds only)"]
+    end
+
+    style MT fill:#fc9,stroke:#960,stroke-width:2px
+    style DEL fill:#fc9,stroke:#960,stroke-width:2px
+    style QSCR fill:#fed,stroke:#960
+    style QPRB fill:#fed,stroke:#960
+    style deny fill:#efe,stroke:#3a3,stroke-width:2px
+    style SYS fill:#dfd,stroke:#3a3
+    style PROVD fill:#dfd,stroke:#3a3
+    style CATD fill:#dfd,stroke:#3a3
+    style AUDD fill:#dfd,stroke:#3a3
+```
+
+Four distinct credentials, each scoped to one process's actual call sites.
+Maintain is the only role with durable-data deletion, and only over `l0/`,
+`l1/`, `c/`, `idem/` — the same four prefixes Ravel's own sweep and retention
+code already deletes from today — plus the query-audit shard
+`t/<hash>/u/0001/**` added by the query-audit shard amendment below, and
+`t/*/*/del/*.dreq` added by the selective-erasure `del/` amendment below,
+and the Parquet table manifests `t/*/pq/t/*` added by the 2026-10-02
+amendment below. Admin's delete grants are the qualification scratch prefix
+`sys/qualify/*` (qualification scratch delete amendment below) and the
+Parquet bucket probe prefix `sys/pq-probe/*` (2026-10-02 amendment below),
+neither of which is tenant data or a durability anchor. Gateway's one delete
+grant, the dead admission-snapshot reap of the same amendment, reaches no
+durable object. Query's one delete grant is the same bucket probe prefix
+`sys/pq-probe/*`, for HTTP Parquet DDL (HTTP DDL amendment below). The green box is denied to every
+role,
+including Maintain: nothing currently deletes there, so nothing legitimate
+loses capability, and deleting `sys/tenancy` to brick every
+process's fail-closed startup becomes unreachable regardless of which
+credential is compromised.
+
+### 2. Durable-data delete stays exclusively with Maintain
+
+No role other than Maintain's IAM policy grants `s3:DeleteObject` on tenant
+data or any protected key. Admin gains one narrow delete on the transient
+conformance scratch prefix `sys/qualify/<run-id>/**` (see the qualification
+scratch delete amendment below), which holds no tenant data and no durability
+anchor, and a second on the Parquet bucket probe prefix `sys/pq-probe/*`, and
+Gateway deletes no durable object: its one delete grant reaches only the
+mutable per-process admission snapshots of dead processes (both in the
+2026-10-02 amendment below). Query gains the same `sys/pq-probe/*` scratch
+delete for HTTP Parquet DDL (HTTP DDL amendment below). This is the
+concrete answer to the single-credential exposure: a compromised Query
+credential cannot delete a single object, anywhere, ever (narrowed by the
+HTTP DDL amendment below: it can delete bucket probe scratch objects under
+`sys/pq-probe/*` and nothing else), a compromised
+Gateway credential can delete only admission snapshots, which the live
+processes rewrite every reconcile interval, and a
+compromised Admin credential — including a leaked `ravel-cli` credential run
+from a CI job or an operator's laptop — can delete only the qualification
+scratch prefix and the probe prefix, never a tenant object or a protected
+key. Any of these
+credentials can corrupt or forge new data within its write grant
+(a real residual risk, unchanged by this ADR, and the reason the
+reconstruction tool and legal-hold's fail-closed posture matter
+independently), but it cannot make any durable object disappear. Only a
+compromised Maintain credential retains delete capability over durable data,
+and only over
+`l0/`, `l1/`, `c/`, `idem/`, the query-audit shard `u/0001/**`
+(query-audit shard amendment below), `del/*.dreq` (selective-erasure
+`del/` amendment below), and the Parquet table manifests `t/<hash>/pq/t/**`
+(2026-10-02 amendment below) — never `sys/` (other than the heartbeat keys of the
+worker-heartbeat amendment below and the query-worker records of the
+query-worker reap amendment below), `prov`, `catalog/` (narrowed to
+`catalog/*/HEAD` for `maintain.json` by the 2026-09-23 amendment below), or
+the legal-hold shard `u/0000/**` of the audit prefix. The last of those holds for a
+different reason than the other three. Take the delete `Allow` patterns of
+all four templates together: they match no key of the form `sys/tenancy`,
+`sys/qualification`, `sys/gc`, `t/<hash>/<signal>/prov`, or
+`t/<hash>/catalog/<signal>/...`, for any `<signal>` the object layout
+defines. So the `Deny` covering those five keyspaces withholds nothing that
+an `Allow` grants, and it is belt-and-suspenders. The 2026-09-23 amendment
+below ends that disjointness for one template: `MaintainDelete` now reaches
+`t/*/catalog/*/snap/*` and `t/*/catalog/*/idx/*`, and `maintain.json`'s deny
+is narrowed to `catalog/*/HEAD` so it does not withhold them. The other
+three templates are unchanged and the paragraph above still holds for them. That disjointness is about
+the delete axis and only the delete axis: `get` and `put` grants do reach
+`prov` and `catalog/` (fold reads and writes catalog objects, the
+log-segment writer writes `prov`), and the same claim over all axes would be
+false.
+`no_delete_allow_reaches_the_disjoint_protected_keyspaces` in
+`crates/ravel-commit/tests/iam_templates.rs` enforces this: it asserts that
+no delete `Allow` pattern in any template matches a witness key of those
+five protected patterns, with the catalog entry narrowed to
+`t/*/catalog/*/HEAD` by the 2026-09-23 amendment below, since Maintain is
+now granted delete on the `snap/` and `idx/` objects beneath it. The set is those three named `sys/` control
+objects, not the whole `sys/` prefix, because Admin's `sys/qualify/*`
+scratch-delete grant does reach a key under `sys/` (a
+`sys/qualify/<run-id>/…` object) and is deliberately excluded, as is its
+`sys/pq-probe/*` probe-delete grant (2026-10-02 amendment below). An audit
+object is keyed
+`t/<hash>/u/<l0|c|l1>/<shard>/…`, so Maintain's level-based delete grants
+(`t/*/*/l0/*` and its `c`/`l1` siblings) do match legal-hold keys, and the
+`Allow` set alone overstates the capability by exactly that much. What
+withholds it is the explicit `Deny` of §3 over the same keys, which names
+the same two delete actions: a `Deny` overrides an `Allow` only for the
+actions it names, so the deny's action coverage — not a gap in the `Allow`
+patterns — is what makes the shard undeletable. Which brings us to §3.
+Admin's
+`sys/qualify/*` delete (qualification scratch delete amendment below) reaches
+only the qualification scratch prefix, which is neither tenant data nor a
+durability anchor.
+
+### 3. Deny-delete, everywhere, on the four prefixes nothing deletes
+
+Every role's policy — including Maintain's — denies `s3:DeleteObject` (and,
+where the backend distinguishes it, `s3:DeleteObjectVersion`) on:
+
+- `sys/tenancy`, `sys/qualification`, `sys/gc`
+- `t/<hash>/<sig>/prov`
+- `t/<hash>/catalog/<sig>/**` (snap parts, HEAD, name postings). For
+  `maintain.json` the 2026-09-23 amendment below narrows this to
+  `t/<hash>/catalog/<sig>/HEAD`; the other three templates deny the whole
+  family.
+- `t/<hash>/u/<AUDIT_HOLD_SHARD>/**` (legal-hold records only — the query-audit
+  shard was removed from this deny by the query-audit shard amendment below,
+  so it can be age-swept; legal-hold shard 0 stays deny-delete-forever)
+- `sys/auth` and `sys/t/<hash>`, added by the control-plane key amendment below:
+  a deleted `sys/auth` reads as absent and installs an empty token map, silently
+  revoking every durable token, and `sys/t/<hash>` recovery manifests are
+  write-once (ADR-0050). No role grants a delete on either, so the deny is
+  belt-and-suspenders like the other create-once keys here.
+- `t/<hash>/enc`, also added by the control-plane key amendment below, as the
+  `t/<hash>/enc` key-epoch amendment asked: the record is append-only history,
+  and a deleted one reads as "no per-tenant key was ever configured".
+- `t/<hash>/pq/grants`, added by the 2026-10-02 amendment below: nothing
+  deletes the Parquet location grants record, and a deleted one reads as a
+  tenant with no grants.
+
+This closes the brick-the-deployment risk directly: nobody, including a fully compromised Maintain
+process, can delete `sys/tenancy` and brick every process's fail-closed
+startup (ADR-0050 §7's `/readyz` probe target). It closes the "roll back the
+qualification marker" and "delete a competitor's `prov` record to force a
+mismatch refusal" scenarios, by the same mechanism.
+
+This is a **delete-deny**, not full Object Lock: `CasVersion`-mutated
+objects on this list (`prov`, `sys/gc`, `HEAD`) can still be *overwritten*
+by whichever role's policy grants them a `PutObject` with the right
+precondition (see the write columns in §1's table) — a compromised writer
+with legitimate write access to `prov` can still corrupt it going forward,
+it just cannot destroy the object outright or roll back to a stale prior
+state via delete-then-recreate. For the `prov` records of the provisioned
+signals (metrics, logs, spans), only Maintain and Admin hold a grant that can
+overwrite; Gateway can only create a missing record, and Query cannot write
+one (prov write conditions amendment below). `t/<hash>/u/prov` is a known gap:
+the unconditioned `t/*/u/*` write Query and Admin hold for audit records
+reaches it. No provisioning record exists for the audit signal; a planted one
+could widen an audit scan or make audit reads fail, and cannot hide records.
+Full immutability-against-overwrite is the
+gap ADR-0042 already named and reserved: `object_store` 0.14.1 has no
+per-PUT retention API, so true Object Lock enforcement stays bucket-level
+and out-of-band for this ADR too, exactly as ADR-0042 decided for `c/`. This
+ADR adds one thing beyond ADR-0042's existing gap statement: `ravel-cli
+store qualify`'s conformance suite (`crates/ravel-object-store/src/
+conformance.rs`) gains an **informational** probe that reports whether
+Object Lock/versioning appears enabled on the bucket, alongside the
+existing `sys/qualification` record, so operators get a startup-adjacent
+signal instead of discovering the gap during an incident. It is
+informational only — `object_store` still cannot act on Object Lock even if
+present, so this cannot become a startup-blocking check without contradicting
+ADR-0042's already-accepted honest-gap framing.
+
+### 4. The two remaining bootstrap-write exceptions
+
+Two objects need a write grant broader than the strict per-role table above,
+because ADR-0050 designed them to be written by whichever process happens to
+boot first against a fresh bucket:
+
+- **`sys/tenancy`** (`CreateIfAbsent`, ADR-0050 §3): every server role
+  (Gateway, Query, Maintain) keeps a `CreateIfAbsent`-only grant on this one
+  object, in addition to Admin's. `CreateIfAbsent` cannot overwrite or
+  delete an existing object, so this does not weaken §3's deny-delete
+  boundary — it only lets the race ADR-0050 already designed keep working
+  without requiring an operator to run `ravel-cli tenancy bootstrap` as a
+  manual pre-step before every fresh deployment.
+- **`sys/gc`**: Maintain keeps its existing `CreateIfAbsent` bootstrap grant
+  (unchanged from today); the `CasVersion` *mutation* path (`gc-config set`)
+  is Admin-only, matching that it is already an explicit CLI-operator action
+  today, not something any server process does autonomously.
+
+`sys/qualification` gets no such exception: it is written exactly once, by
+Admin's `store qualify` run, which is already an explicit out-of-band
+operator step per its own documented contract ("never reads, lists, or
+writes any tenant-prefixed key... safe to run against a bucket that already
+holds production data," `docs/object-store-contract.md:332-334`). No server
+role needs to write it.
+
+The bootstrap race above only runs on AWS S3 if each process sees an absent
+`sys/tenancy` or `sys/gc` as absent rather than refused, which needs a
+`ListBucket` grant on the key; see the bootstrap-key list amendment below.
+
+### 5. Operator change
+
+`services/ravel-operator`'s `RavelClusterSpec.storage.s3` gains an optional
+per-role credential-secret map alongside the existing single
+`credentialsSecretRef`:
+
+```rust
+pub struct S3StorageSpec {
+    // existing field, unchanged, used when role_credentials is empty
+    pub credentials_secret_ref: SecretRef,
+    // additive; when a role is present, its Deployment uses this secret
+    // instead of credentials_secret_ref for that role only
+    pub role_credentials: Option<RoleCredentials>, // { gateway, query, maintain: Option<SecretRef> }
+}
+```
+
+`s3_credential_env(spec)` (reconcile.rs:98-112) becomes
+`s3_credential_env(spec, role)`, resolving `role_credentials.<role>` first
+and falling back to `credentials_secret_ref`. Every existing `RavelCluster`
+with no `role_credentials` set behaves exactly as today — one shared
+credential across all three Deployments — so this is additive and requires
+no migration to keep working. `ravel-cli` gets no operator-managed
+credential at all; it is invoked out of band and takes `RAVEL_S3_*` from
+whatever environment the operator or CI job that runs it provides, using
+the Admin-scoped credential documented in a new "Storage credential roles"
+section in `docs/guides/kubernetes.md` and `docs/guides/operations.md`,
+alongside the four roles' exact IAM policy templates (the allow-lists in
+§1's table, expressed as bucket-prefix-scoped policy JSON for AWS and the
+MinIO policy-language equivalent for dev/CI).
+
+## Rejected alternatives
+
+**A new runtime "storage-access broker" issuing short-lived per-request
+tokens.** Rejected. Building it means a new stateful, network-reachable
+service: a new trust
+root (what authenticates *to* the broker?), a new durability dependency
+(CLAUDE.md: "no durability may depend on local disk, and no recovery path
+may read state another process wrote locally" — a broker that must be up
+for any process to acquire credentials is exactly this kind of dependency
+if it is anything more than a thin wrapper around the cloud's own STS), and
+a second thing to operate, monitor, and secure. S3-compatible backends
+already have a native mechanism that does this — IAM/bucket policies scoped
+by principal, prefix, and action, resolved by the backend itself on every
+request with no Ravel-side moving part. Using it is strictly less
+architecture for the same isolation guarantee.
+
+**Cloud-native workload identity (IRSA / Workload Identity), dropping
+explicit key/secret config.** Rejected for this ADR. `docs/guides/
+operations.md:372-373` documents the current explicit-credential model as a
+deliberate choice, not an oversight, and reversing it without a stated
+reason is a bigger and different change than this ADR's scope. More
+concretely: IRSA is AWS-specific and would not carry over to MinIO, which
+`kind-up.sh` and CI use as the dev/test backend — adopting it here would
+either fork the credential-acquisition path by backend or drop MinIO
+support, neither of which the single bucket-wide credential problem
+requires. Nothing in this ADR forecloses IRSA as a later,
+AWS-specific *addition* layered on top of `S3Config` (a credential-provider
+enum instead of only explicit keys); it is simply not required to close
+the single-credential exposure, and is out of scope here.
+
+**In-process authorization inside `ObjectStoreBackend`.** Rejected, per
+ADR-0042 decision 1's already-established precedent against a side channel
+outside the trait's contract-tested abstraction. Concretely: every current
+caller holds a bare `Arc<dyn ObjectStoreBackend>` with no identity or role
+parameter; retrofitting one would mean threading a caller-identity value
+through every call site across `ravel-ingest`, `ravel-maintain`,
+`ravel-catalog`, and both service binaries, for a control the storage
+backend's own IAM already provides for free — and provides more robustly,
+since a bug in Ravel's own check can be a Rust bug, while a cloud IAM deny
+cannot be bypassed by application code at all.
+
+**Full literal ingest/compaction/query/sweep four-way process split.**
+Rejected for this epic, not forever. Sweep runs inside the same
+`Mode::Maintain` process as compaction and retention today; giving it a
+genuinely separate credential would require first giving it a genuinely
+separate process, which is maintenance-architecture restructuring already
+tracked under ADR-0065 (leased distributed maintenance) rather than a
+credentials change. This ADR's four-role model (Gateway/Query/Maintain/
+Admin) still moves every process from "one bucket-wide credential" to "a
+credential scoped to what that process actually does," including denying
+delete to every role except Maintain — the core ask — without
+requiring leased maintenance to land first. If it later splits sweep into its own process,
+narrowing Maintain's delete grant to a fifth, sweep-only role is a natural,
+independent follow-up to this ADR, not a redesign of it.
+
+**Real per-object S3 Object Lock enforced in-process for this epic.**
+Rejected, reaffirming ADR-0042 decision 3's already-accepted reasoning:
+`object_store` 0.14.1 exposes no per-PUT retention/legal-hold header, so
+enforcing real Object Lock from inside `ObjectStoreBackend` is not possible
+without either a fork of the `object_store` dependency or a parallel
+direct-SDK write path — the latter explicitly rejected by ADR-0042 decision
+1 for the same side-channel reason as above. This ADR's deny-delete policy
+(§3) is the achievable subset for now; true immutability-against-overwrite
+stays the documented, informationally-probed gap ADR-0042 already named.
+
+## Consequences
+
+- **No `ObjectStoreBackend` trait change, no new persistent format, no new
+  service.** This is a deployment/config/IAM-policy change plus one small,
+  additive operator struct field and one CLI/docs addition (the Object-Lock
+  informational probe in `store qualify`). Risk tier: low for durability and
+  commit-protocol correctness, despite being the highest-priority item in
+  the program by leverage.
+- **A compromised Query credential can no longer delete anything, anywhere,
+  a compromised Gateway credential can delete no durable object, and a
+  compromised Admin credential can delete only the qualification scratch
+  prefix `sys/qualify/*` (qualification scratch delete amendment below) and
+  the Parquet bucket probe prefix `sys/pq-probe/*`, never a tenant object or
+  a protected key.** (Gateway's admission-snapshot reap and Admin's probe
+  delete are the 2026-10-02 amendment below. Query can delete bucket probe
+  scratch objects under `sys/pq-probe/*` and nothing else, per the HTTP DDL
+  amendment below.) A compromised Maintain credential can
+  still delete
+  within `l0/`, `l1/`, `c/`, `idem/`, the query-audit shard `u/0001/**`
+  (query-audit shard amendment below), `del/*.dreq` (selective-erasure
+  `del/` amendment below) and the Parquet table manifests `t/<hash>/pq/t/**`
+  `ravel-cli parquet sweep` retires (2026-10-02 amendment below) — the same
+  set Ravel's own maintenance code deletes from today — plus superseded
+  catalog snapshot parts and index objects (`catalog/*/snap/*`,
+  `catalog/*/idx/*`), the dead worker records under `sys/maintain/workers/*`
+  and `sys/query/workers/*`, and the `quarantine/` copies the reaper retires,
+  and nothing else.
+- **`sys/tenancy`, `sys/qualification`, `sys/gc`, `prov`, `catalog/*`, and
+  the legal-hold shard of the audit prefix (`u/0000/**`) are undeletable by
+  any role's policy.** (`catalog/*` is narrowed to `catalog/*/HEAD` by the
+  2026-09-23 amendment below.) This closes the brick-the-deployment risk
+  outright and removes the "roll back a control object via delete-then-
+  recreate" class of attack against the new resharding
+  and readiness machinery, without weakening anything sweep or retention
+  already legitimately does.
+- **Existing single-credential deployments are unaffected until an operator
+  opts in.** `role_credentials` is additive on the operator CRD; a cluster
+  that never sets it keeps today's one-secret behavior exactly, so there is
+  no forced migration and no correctness risk from rolling this out
+  incrementally, cluster by cluster.
+- **True Object-Lock immutability against overwrite remains an explicit,
+  documented gap**, informationally probed but not enforced, exactly as
+  ADR-0042 already stated for `c/` — this ADR extends that same honest
+  framing to `prov`, `sys/gc`, and `HEAD` rather than silently implying a
+  stronger guarantee than the code delivers.
+- **Interacts with selective deletion (ADR-0064).** Selective/subject-level
+  deletion, when designed, will need to delete or rewrite data under `l0/`,
+  `l1/`, `c/` — squarely inside Maintain's existing delete grant, not the
+  newly deny-deleted prefixes — so this ADR does not block it. That ADR
+  should state explicitly which role performs selective deletion (most
+  naturally an extension of Maintain's existing delete-capable role) rather
+  than inventing a fifth role for it.
+- **Does not close per-tenant KMS** or any other finding.
+  This ADR is scoped to who can reach which storage operations, not to
+  encryption-at-rest posture, which stays ADR-0062's scope.
+
+## Amendment: Admin gains `c/**cmt` write for commit reconstruction
+
+<!-- amendment-applies: sections="1. Four roles, mapped to existing process boundaries" pointer="`c/**cmt` write amendment" -->
+
+ADR-0058 ships
+`ravel-cli commit reconstruct`, which rebuilds lost L0 commit records for a
+shard from the record-less data objects' own footers and writes each rebuilt
+record `CreateIfAbsent`. That write lands under the `c/` prefix
+(`t/<hash>/<sig>/c/…`), which §1's original table did not grant Admin any
+write on at all: without this amendment the tool would fail its own PUT with
+an access-denied error the moment it tried to publish a rebuilt record. This
+gap was called out in ADR-0058's own "The ADR-0055 gap" section as something
+to decide here rather than discover at decompose time.
+
+Admin's write column in §1's role table therefore gains `s3:PutObject` on
+`t/*/*/c/*` — the same prefix Gateway already writes L0 commit records to
+(§1, Gateway row), scoped the same way. This is additive and narrow:
+
+- It is a create-only write in practice (the tool only ever writes
+  `CreateIfAbsent` and reports a conflict rather than overwriting an existing
+  record), though at the IAM layer `CreateIfAbsent` is a plain `s3:PutObject`
+  exactly as §1 already notes for every other create-only grant.
+- It grants **no delete**. Admin's only delete grant remains the qualification
+  scratch prefix (§2 amendment); this write adds none, and the
+  `DenyDeleteProtected` boundary
+  (§3) is unchanged — `c/` was never one of the deny-delete prefixes, since
+  Maintain legitimately deletes superseded and retention-swept records there.
+- No other role's grants change, and no server role gains this: reconstruction
+  is an out-of-band operator action, like every other Admin-only write.
+
+This is amended in place rather than left wrong with a note, following the
+same rationale as the Correction above: this ADR's role split had
+not yet been deployed against a narrower Admin credential, so nothing had
+provisioned an Admin policy without this grant yet. The matching IAM policy JSON in
+`docs/guides/operations.md` (`AdminWrite`) is updated in the same change.
+
+## Amendment: the audit deny-delete narrows to the legal-hold shard; Maintain gains query-audit delete
+
+<!-- amendment-applies: sections="1. Four roles, mapped to existing process boundaries|2. Durable-data delete stays exclusively with Maintain|3. Deny-delete, everywhere, on the four prefixes nothing deletes|Consequences" pointer="query-audit shard amendment" -->
+
+ADR-0062 brings the query-audit shard
+(`Signal::Audit` / `QUERY_AUDIT_SHARD` = 1) into the maintained set:
+`ravel-maintain` now compacts it and age-sweeps it on a dedicated 90-day
+retention window (`sweep_audit_retention`), horizon-gated and legal-hold-gated
+exactly as the superseded-input sweep is. That sweep needs a delete grant on the
+query-audit shard, which §3's original blanket deny on the whole audit prefix
+(`t/<hash>/u/**`) forbade for every role, Maintain included.
+
+The audit prefix holds two fixed control-plane shards on disjoint key paths
+(the shard is a four-digit key segment, `t/<hash>/u/<l0|c|l1>/<shard>/…`), so
+the two can be scoped independently:
+
+- **Legal-hold shard 0** (`t/*/u/*/0000/*`) stays deny-delete-forever for every
+  role, Maintain included. A legal hold must never be destroyable, and the hold
+  fold reads L0 records directly, so these are never compacted either
+  (`compact_bucket` refuses the legal-hold shard). This is the sole audit path
+  left in `DenyDeleteProtected`.
+- **Query-audit shard 1** (`t/*/u/*/0001/*`) is removed from every role's
+  `DenyDeleteProtected` and added to **Maintain's `MaintainDelete` alone**. No
+  other role gains any audit delete: Gateway/Query/Admin still have no delete
+  grant on `u/**` at all, so narrowing the deny grants them nothing. Only
+  Maintain's explicit `Allow` reaches the query-audit shard, and it cannot reach
+  shard 0 because `…/0000/*` and `…/0001/*` are separate paths.
+
+Before/after, expressed as the operations.md IAM wildcards:
+
+- Deny-delete (all four roles): `t/*/u/*` → `t/*/u/*/0000/*`.
+- Maintain delete grant (`MaintainDelete` only): add `t/*/u/*/0001/*`.
+
+This does not weaken the brick-the-deployment protection or the delete-deny asks: `sys/*` (less the heartbeat keys of the worker-heartbeat amendment below and the query-worker records of the query-worker reap amendment below), `prov`,
+`catalog/*` (narrowed to `catalog/*/HEAD` by the 2026-09-23 amendment below),
+and the legal-hold shard remain undeletable by any role. It only
+lets the one role that already owns every delete (Maintain) reclaim the
+query-audit activity log, which — unlike a legal hold or a control object — is
+append-only telemetry with a bounded lifetime, not a durability anchor. Amended
+in place (§1 table Maintain row, §2, §3 deny list, the diagram, and
+Consequences) for the same reason as the amendments above: the role split had
+not yet been provisioned against a narrower credential, so no deployed policy
+predates this change. The matching IAM policy JSON in
+`docs/guides/operations.md` (`MaintainDelete` and all four `DenyDeleteProtected`
+blocks) is updated in the same change.
+
+## Amendment: the `t/<hash>/enc` key-epoch record needs a read/write grant
+
+<!-- amendment-applies: none reason="documentation only, and it says so: the key `t/<hash>/enc` did not exist when section 1 was written, so no earlier wording covered it and none is retired; the policy files and the role table are deliberately left unchanged, and the required follow-up is recorded here instead" -->
+
+The per-tenant KMS work (ADR-0062 decision 1, ADR-0072 decision 2) wires
+`KmsRoutingStore` into `ravel-server`'s single store-construction site behind
+`--tenant-kms-config`. On first configuration of a tenant's key (and on every
+later rotation), the same process bootstraps that tenant's key-epoch history
+by reading, then `CreateIfAbsent`/`CasVersion`-appending, the object
+`t/<hash>/enc` (`crates/ravel-catalog/src/key_epoch.rs`) — a per-tenant,
+bucket-root-relative key with no `<sig>` segment, so none of §1's existing
+`t/<hash>/<sig>/…` wildcards cover it. §1's original table grants no role any
+access to this prefix at all, because it did not exist when this ADR was
+written.
+
+This bootstrap runs from whichever `--mode` a deployment happens to set
+`--tenant-kms-config` on — the flag is process-wide, not mode-scoped, and
+`ravel-server`'s startup sequence calls it unconditionally whenever the flag
+is present, the same "first process up wins the `CreateIfAbsent`, everyone
+else safely appends or no-ops" race §1 already documents for
+`sys/tenancy` (§4). Gateway and Query are the roles that write tenant data
+under a routed key today (Gateway's L0/idempotency/commit writes, Query's
+fold and query-audit writes), so both need the grant on the same
+"first-boot race" basis as `sys/tenancy`. Maintain writes L1 parts and
+compaction/tombstone records under the same tenant prefix, so a deployment
+that also enables per-tenant KMS on Maintain needs it there too, for the
+same reason. Admin needs at least read: `ravel-cli`'s `verify-custody`
+(already shipped, extended by ADR-0062's epoch-consistency check) reads the
+epoch history to validate it.
+
+The needed grant, once provisioned:
+
+- **Gateway, Query, Maintain**: `GetObject` + `PutObject` on `t/*/enc`
+  (`CreateIfAbsent` for the bootstrap epoch 0, `CasVersion` for every
+  later rotation — both are plain `s3:PutObject` at the IAM layer per §1's
+  existing note on `CreateIfAbsent`/`CasVersion`/`Put`). Add `t/*/enc` to
+  each role's `ListBucket` `s3:prefix` condition alongside the existing
+  per-key wildcards, the same way the bare `t/` discovery entry is added
+  (ADR-0072 decision 5).
+- **Admin**: `GetObject` on `t/*/enc` only, alongside its existing broad
+  read grant.
+- **No role gains delete.** `t/<hash>/enc` is an append-only CAS history,
+  the same durability class as `sys/tenancy`/`prov`/`catalog/*` (narrowed to
+  `catalog/*/HEAD` by the 2026-09-23 amendment below): it belongs
+  in `DenyDeleteProtected` for every role, including Maintain, not left
+  outside it by omission.
+
+**This amendment is documentation only.** The task scope was
+`services/ravel-server/` and `docs/`; the actual policy files
+(`deploy/iam/gateway.json`, `query.json`, `maintain.json`, `admin.json`) and
+`crates/ravel-commit`'s `tests/iam_templates.rs` CI check that verifies them
+against the object-key layout both live outside that scope and are **not**
+updated by this change, unlike every prior amendment's practice of updating
+the JSON in the same commit. A deployment that turns on
+`--tenant-kms-config` against a bucket already provisioned with the ADR-0055
+per-role credentials, without the follow-up above, will see the epoch
+bootstrap fail closed with an access-denied error on every affected role's
+first `--tenant-kms-config` startup — this is flagged as a required
+follow-up, not fixed here.
+
+The control-plane key amendment below provisions it: the read, write and
+deny-delete above are in the templates. The `ListBucket` prefix is not, because
+no code lists `t/<hash>/enc` (the bootstrap-key list amendment below adds a list
+grant on the exact key, for the 404 an absent record needs on AWS S3).
+
+## Amendment: the selective-erasure `del/` paths
+
+<!-- amendment-applies: sections="1. Four roles, mapped to existing process boundaries|2. Durable-data delete stays exclusively with Maintain|Consequences" pointer="selective-erasure `del/` amendment" -->
+
+ADR-0064 ships selective subject erasure: a durable
+erasure request under `t/<hash>/<sig>/del/<request_id>.dreq`, an asynchronous
+rewrite-and-supersede pass in Maintain, and a completion record under
+`t/<hash>/<sig>/del/<request_id>.done`. ADR-0064 decision 6 is the
+"landed-second obligation" binding on whichever of this ADR
+and ADR-0064 landed last; ADR-0064 landed second, so it states the interaction and this
+amendment records the resulting grants against §1's role table. The rewrite
+itself needs no new grant — it writes `l1/**` parts and `c/**` records and
+its inputs are swept from `l0/`, `l1/`, `c/`, all inside Maintain's existing
+`MaintainDelete`/write grants, exactly as ADR-0055's original Consequences
+("Interacts with selective deletion") predicted. **No fifth role.** Only the `del/` prefix
+itself is new, and it is scoped by these four narrow grants:
+
+- **Admin** gains `s3:PutObject` (create-only, `CreateIfAbsent`) on
+  `t/*/*/del/*` — `ravel-cli erase submit` writes the `.dreq`. Admin's only
+  delete grant remains the qualification scratch prefix: submitting an erasure
+  request does not delete anything, it creates a durable predicate the Maintain
+  pass acts on.
+  This is the same shape as Admin's other create-only tenant-prefix write
+  (`c/**cmt` for `commit reconstruct`, amendment above): a `PutObject`
+  allow, no delete.
+- **Query and Maintain** gain read (`s3:GetObject` plus `t/*/*/del/*` in the
+  `ListBucket` `s3:prefix` condition) on `del/**`. Query lists and reads
+  pending `.dreq` predicates at snapshot-resolve time to attach them to the
+  resolved snapshot (ADR-0064 decision 2); Maintain lists and reads them to
+  scope the rewrite pass (decision 3) and to check whether a `.done` already
+  exists (decisions 4-5).
+- **Maintain** gains `s3:DeleteObject` on `t/*/*/del/*.dreq` **only** — and
+  no other role gains any delete on `del/`. The `.dreq` contains the subject
+  identifier and must not outlive its purpose, so ADR-0064 decision 5 has
+  Maintain's sweep delete it once its `.done` exists and
+  `now >= done.created_unix_ns + protection_horizon` (legal-hold-gated like
+  every other delete). This grant is scoped to the `.dreq` suffix so it can
+  never reach a `.done`.
+- **`del/*.done` joins `DenyDeleteProtected` for every role, Maintain
+  included.** A completion record is permanent erasure evidence, and it can
+  be permanent precisely because it carries no subject identifier (only a
+  hash of the canonical predicate, per-bucket dropped counts, and
+  timestamps). This is the same "append-only durability anchor, undeletable
+  by anyone" class as the legal-hold shard `u/0000/**`. The `.dreq` and
+  `.done` are separate key suffixes under the same `del/` prefix, so
+  Maintain's `.dreq` delete grant and the blanket `.done` deny do not
+  overlap — exactly the disjoint-path scoping the audit-shard amendment already
+  uses to split the audit shards `u/0000/*` and `u/0001/*`.
+
+Net effect on §1's role table: Admin's write column gains `t/*/*/del/*`
+(create-only); Query's and Maintain's read columns gain `t/*/*/del/*`;
+Maintain's delete column (`MaintainDelete`) gains `t/*/*/del/*.dreq`; and §3's
+`DenyDeleteProtected` deny list gains `t/*/*/del/*.done` for every role. This
+does not weaken the brick-the-deployment protection or any prior delete-deny ask: `sys/*` (less the heartbeat keys of the worker-heartbeat amendment below and the query-worker records of the query-worker reap amendment below), `prov`,
+`catalog/*` (narrowed to `catalog/*/HEAD` by the 2026-09-23 amendment below),
+the legal-hold shard, and now `.done` completion markers remain
+undeletable by any role, and the one new deletable object (`.dreq`) is deleted
+only by the one role that already owns every delete, only after its own
+completion record and the protection horizon guarantee it is safe. The
+matching IAM policy JSON is added to `docs/guides/operations.md` in the same
+change. Amended here in ADR-0055 (rather than as a standalone note) so the
+per-role model stays legible end to end, following this ADR's own in-place
+amendment precedent.
+
+## Amendment (2026-09-07): Admin gains `sys/qualify/*` delete for the qualification delete probe
+
+<!-- amendment-applies: sections="1. Four roles, mapped to existing process boundaries|2. Durable-data delete stays exclusively with Maintain|Consequences" pointer="qualification scratch delete amendment" -->
+
+The object-store conformance suite
+(`crates/ravel-object-store/src/conformance.rs`, run by `ravel-cli store
+qualify`) gained a `DeleteVisibility` probe: it deletes a key under the run's
+scratch prefix `sys/qualify/<run-id>/` and asserts the delete is
+acknowledged (a subsequent `get` returns `NotFound`, a listing omits it while
+still holding a sibling, and a second delete of the now-absent key succeeds).
+The suite runs the whole probe under that scratch prefix, so it now issues a
+`DELETE` there.
+
+§1's original table granted Admin `s3:PutObject` on `sys/qualify/*` (the
+`AdminWrite` statement) but no `s3:DeleteObject` anywhere, so under the
+shipped Admin credential the delete probe fails with `AccessDenied` on any
+fresh bucket: a correct backend and the shipped policy together refuse
+qualification. `store qualify` is an Admin-only, out-of-band command, so no
+other role runs it and no other template is affected.
+
+Admin's delete column in §1's role table therefore gains `s3:DeleteObject` on
+`arn:aws:s3:::my-ravel-bucket/sys/qualify/*` and nowhere else. This is safe
+and does not reopen the exposure §2 closes:
+
+- `sys/qualify/` holds no tenant data and no durability anchor. Its objects
+  are a single `store qualify` run's throwaway scratch (each run's key carries
+  a unique `<run-id>`, so runs never collide), not a control object whose
+  deletion could brick startup or roll back state. Deleting the whole prefix
+  loses nothing a running deployment depends on.
+- The grant is one prefix. It reaches no `t/**` tenant object and no key in
+  `DenyDeleteProtected` (§3), which does not list `sys/qualify/*`, so no
+  explicit `Deny` fights this `Allow` and this `Allow` widens nothing the deny
+  protects. `sys/qualification` (the final marker) and `sys/qualify/*` (the
+  scratch) are separate keys: the marker stays deny-delete-protected, the
+  scratch does not.
+- No other role gains anything: Gateway, Query, and Maintain do not run
+  qualification and their templates are unchanged.
+
+The property §2 states is preserved exactly in its load-bearing form: a
+compromised Admin credential still cannot make any tenant object or protected
+key disappear. It can delete only the qualification scratch prefix.
+
+Amended in place (§1 table Admin delete column, §2's two absolute-no-delete
+claims about Admin, and the matching Consequences bullet) for the same reason
+as the amendments above: the role
+split had not yet been provisioned against a narrower Admin credential, so no
+deployed policy predates this change. The shipped `deploy/iam/admin.json`
+(`AdminQualifyDelete` statement) and `crates/ravel-commit`'s
+`tests/iam_templates.rs` guard are updated in the same change, and
+`docs/object-store-contract.md`'s qualification section now records that the
+shipped Admin template satisfies the delete-probe requirement.
+
+## Amendment (2026-09-23): the catalog delete-deny narrows to `catalog/*/HEAD`
+
+<!-- amendment-applies: sections="What each role actually does, read from the code|The WORM pairing question this ADR must answer|1. Four roles, mapped to existing process boundaries|2. Durable-data delete stays exclusively with Maintain|3. Deny-delete, everywhere, on the four prefixes nothing deletes|Consequences|Amendment: the audit deny-delete narrows to the legal-hold shard; Maintain gains query-audit delete|Amendment: the `t/<hash>/enc` key-epoch record needs a read/write grant|Amendment: the selective-erasure `del/` paths" pointer="2026-09-23 amendment" -->
+
+§3's `DenyDeleteProtected` denied every role delete under `t/*/catalog/*/*`,
+and the decision text above states `catalog/*` as undeletable by any role.
+That is narrowed here to `t/*/catalog/*/HEAD`, with `MaintainDelete` gaining
+`t/*/catalog/*/snap/*` and `t/*/catalog/*/idx/*`.
+
+The original ask was about bricking a deployment: a deleted control object
+that cannot be recreated, or a roll-back-by-delete-then-recreate attack on a
+durability anchor. `catalog/<signal>/HEAD` is that anchor, and it stays
+undeletable by every role including Maintain. The objects being opened up are
+not anchors: `snap/` and `idx/` are fold outputs that a HEAD reference either
+names or does not, and `sweep_unreferenced_catalog_objects`
+(`crates/ravel-maintain/src/sweep.rs`) exists precisely to delete the ones no
+HEAD names. Deleting an object HEAD does not reference changes no query
+result; deleting HEAD itself is what the deny still prevents.
+
+Two things forced the narrowing rather than merely permitting it:
+
+- **The sweep was unreachable.** IAM is default-deny and the deny beat the
+  grant, so every catalog pass was refused at its first delete. The garbage
+  the sweep exists to reclaim accumulated without bound.
+- **ADR-0064 erasure could not complete.** An unreferenced per-part
+  column-statistics object (`.cstat`) can hold a declared `Str` or `Bytes`
+  column's exact min, max and distinct-value dictionary, which for an erased
+  subject is that subject's own value held verbatim. While that object was
+  undeletable, selective subject erasure left the value in place, so the
+  deny defeated a guarantee this ADR's sibling makes.
+
+Residual risk, stated rather than elided: a compromised Maintain credential
+can now delete every `snap/` and `idx/` object under every tenant. HEAD
+survives, pointing at objects that are gone, so queries for the affected
+`(tenant, signal)` fail rather than return wrong answers. Recovery is a
+fold: rebuilding from no HEAD recomputes and re-PUTs every part, and a
+non-tail span keys on its stable `watermark_hour`, so the recomputed key is
+byte-identical to the object that was deleted (`docs/catalog-and-mvcc.md`).
+That recovery reads the commit records, which the same credential can
+already delete today under `t/*/*/c/*`. The blast radius is therefore
+bounded by a delete grant the role already had, not widened by this change.
+That is the trade accepted here, and it is the reason the narrowing stops at
+HEAD instead of covering the whole family. (The maintain-tier fold amendment
+below gives Maintain PutObject on HEAD, `snap/` and `idx/`, so a compromised
+Maintain credential can now also publish a forged HEAD and make queries
+return wrong answers rather than fail. Its existing put and delete on the
+commit records under `t/*/*/c/*` already allowed that, so the bound on what
+the credential can corrupt does not move.)
+
+Before/after, expressed as the operations.md IAM wildcards:
+
+- Deny-delete, **`maintain.json` only**: `t/*/catalog/*/*` →
+  `t/*/catalog/*/HEAD`. The other three templates keep the whole-family
+  deny. None of them grants a catalog delete, so their deny costs nothing
+  and is left standing as defence in depth; narrowing it everywhere would
+  widen the blast radius of a credential this change has no reason to
+  touch.
+- Maintain delete grant (`MaintainDelete` only): add `t/*/catalog/*/snap/*`
+  and `t/*/catalog/*/idx/*`.
+- `MaintainList` gains the two catalog prefixes as `s3:prefix` values;
+  `MaintainRead` gains `t/*/catalog/*/HEAD`, `t/*/catalog/*/snap/*` and
+  `t/*/catalog/*/idx/*`.
+  Without the list prefixes the sweep is refused at its `ListBucket`
+  before it reaches a delete at all, and without the snapshot-part read
+  the reachability pass that decides which objects are unreferenced
+  aborts on its first part GET: `SnapshotReachability::ensure_part`
+  returns `MaintainError::Store` on anything that is not `NotFound`, so
+  an AccessDenied there fails the whole pass for that signal rather than
+  one object. The `idx/` read is for the scrub tick's
+  `load_covering_postings`. When this ADR was written that function
+  swallowed its error, returning `Ok(None)` on any failure, which the tick
+  could not distinguish from "no postings ref yet", so the postings scrub
+  tier silently never ran. That was not an outage, which is precisely why
+  the grant had to be derived rather than observed. Issue #1964 changed the
+  behaviour: a non-`NotFound` failure now returns `Err` and disables the
+  postings tier loudly. The derivation argument stands unchanged, because a
+  surfaced error tells an operator the grant is missing and does not grant
+  it. (The fold reads the same keyspace for
+  its `.cstat` and `.npost` reuse baseline, but never under this
+  credential: the fold does not run in `Mode::Maintain` (no longer true
+  since ADR-1693; see the maintain-tier fold amendment below). Those reads are
+  why `gateway.json` and `query.json` carry catalog reads.)
+
+Net effect on §1's role table (Maintain row): the Read column gains
+`catalog/<sig>/HEAD`, `catalog/<sig>/snap/**` and `catalog/<sig>/idx/**`;
+the Delete column gains `catalog/<sig>/snap/**` and `catalog/<sig>/idx/**`;
+and the List column gains the `catalog/<sig>/snap/` and `catalog/<sig>/idx/`
+prefixes. That sentence is here rather than in the table for the same reason
+the selective-erasure `del/` paths amendment states its own net effect: §1
+stays derivable without the table having to carry every amendment's wording.
+
+Recorded as an appended amendment rather than rewritten into §2 and §3, into
+which only an inline pointer was added. What carries that pointer to this
+section is each of the places that asserts, in one phrasing or another,
+that `catalog/*` is undeletable:
+
+1. the Consequences bullet;
+2. the context's "nothing in the current codebase ever deletes ...
+   `catalog/*`" (under "What each role actually does, read from the code");
+3. the context's WORM list of prefixes nothing legitimately deletes (under
+   "The WORM pairing question this ADR must answer");
+4. §2's "never ... `catalog/`" clause;
+5. §2's disjointness paragraph;
+6. §2's description of what
+   `no_delete_allow_reaches_the_disjoint_protected_keyspaces` asserts;
+7. §3's deny list;
+8. the deny subgraph in the §1 diagram, which a reader deriving a deny list
+   from a picture is the most likely to re-widen;
+9. the recaps in the audit-deny-delete and selective-erasure `del/` paths
+   amendments that repeat the claim;
+10. the `t/<hash>/enc` amendment's durability-class comparison, which puts
+    `catalog/*` in the same undeletable class as `sys/tenancy` and `prov`.
+
+The places are written as a list rather than a count because the count was
+wrong three times while it was a number: the claim is phrased as a property, a
+disjointness argument, a deny list and a diagram node, so a search for the
+wording just corrected finds none of the others. A reader meets the qualification
+where the claim is made, and the decision text keeps its original wording.
+ADR-0064's statements that catalog objects are deny-deleted carry the same
+pointer, since its erasure argument depends on `.cstat` objects being
+reachable for deletion, which this narrowing is what provides.
+
+## Amendment (2026-09-24): Maintain deletes dead-worker heartbeat keys under `sys/maintain/workers/`
+
+<!-- amendment-applies: sections="What each role actually does, read from the code|1. Four roles, mapped to existing process boundaries|2. Durable-data delete stays exclusively with Maintain|Amendment: the audit deny-delete narrows to the legal-hold shard; Maintain gains query-audit delete|Amendment: the selective-erasure `del/` paths" pointer="worker-heartbeat amendment" -->
+
+Issue #1975. Each maintain process writes a liveness heartbeat at
+`sys/maintain/workers/<process_id>`, and `WorkerSet::reap_keys`
+(`crates/ravel-fleet/src/worker_set.rs`, driven from
+`services/ravel-server/src/maintain.rs`) deletes the keys of workers past the
+reap horizon. `MaintainDelete` named nothing under `sys/`, so every one of
+those deletes was refused under the shipped template and the prefix the
+per-tick live-set LIST reads grew with every maintain process that ever ran.
+
+`MaintainDelete` gains `sys/maintain/workers/*`, and nothing wider. The memo
+snapshots and compaction claims that share `sys/maintain/` are not the
+reaper's to delete, and none of `sys/tenancy`, `sys/qualification`, `sys/gc`
+or `prov` is reachable by the new pattern, so the brick-the-deployment
+protection of §2 and §3 is unchanged.
+
+The Query role has the same shape at `sys/query/workers/` and no delete
+grant at all; that is tracked in issue #1995 and not decided here. The
+query-worker reap amendment below decides it. (Query's only delete grant
+since the HTTP DDL amendment below is the bucket probe's `sys/pq-probe/*`.)
+
+Recorded as an appended amendment, with an inline pointer added to each
+place that states Maintain, or every role, deletes nothing under `sys/`:
+the context's list of what the code deletes, §1's Maintain delete column,
+§2's list of what a compromised Maintain credential can delete, and the
+recaps in the query-audit and `del/` amendments.
+
+## Amendment (2026-09-29): Maintain deletes dead query-worker records under `sys/query/workers/`
+
+<!-- amendment-applies: sections="What each role actually does, read from the code|1. Four roles, mapped to existing process boundaries|2. Durable-data delete stays exclusively with Maintain|Amendment: the audit deny-delete narrows to the legal-hold shard; Maintain gains query-audit delete|Amendment: the selective-erasure `del/` paths|Amendment (2026-09-24): Maintain deletes dead-worker heartbeat keys under `sys/maintain/workers/`" pointer="query-worker reap amendment" -->
+
+Issues #1828 and #1995 (item 1). Each query process that takes part in
+distributed fan-out writes its membership record at
+`sys/query/workers/<process_id>`. The query coordinator's heartbeat loop
+used to delete every record past the reap horizon, and a draining
+coordinator deleted its own record. `deploy/iam/query.json` grants no
+delete, so under the shipped template every one of those deletes was
+refused and the prefix grew with every query worker that ever ran.
+
+Owner decision (2026-09-28, on #1828): the reap moves to the maintain role,
+which already holds `s3:DeleteObject`, and the Query role keeps deleting
+nothing. (Query later gains a delete on the bucket probe's `sys/pq-probe/*`
+scratch objects only; see the HTTP DDL amendment below.) Concretely:
+
+- The maintain process that owns a fixed rendezvous unit over the maintain
+  live set lists `sys/query/workers/` on its tick and deletes the keys past
+  the reap horizon, judged from LIST metadata alone. That is one process per
+  view of the maintain membership, briefly two while views disagree, which is
+  harmless because the delete is idempotent. A deployment with no
+  `Mode::Maintain` process, including one that runs a single `Mode::All`
+  process, reaps nothing.
+  `MaintainList` and `MaintainDelete` gain `sys/query/workers/*`, and
+  nothing wider. The reap reads and writes no record, so `MaintainRead` and
+  `MaintainWrite` are unchanged.
+- A draining query coordinator overwrites its own record with a heartbeat
+  stamp no reader accepts as live, using the `PutObject` it already holds,
+  so it leaves every sibling's live set on that sibling's next read without
+  a delete. The record format is unchanged.
+- A reap delete refused as access denied is logged once per pass at error,
+  and the pass issues no further delete, rather than one warning per key.
+
+`deploy/iam/query.json` is unchanged: the Query role still has no delete
+grant, and §2's statement that a Query credential cannot delete an object
+holds as written. (The HTTP DDL amendment below later grants Query delete on
+the bucket probe's `sys/pq-probe/*` scratch objects only; no query-worker
+record is reachable by it.) None of `sys/tenancy`, `sys/qualification`, `sys/gc` or
+`prov` is reachable by the new pattern, so the brick-the-deployment
+protection of §2 and §3 is unchanged.
+
+Recorded as an appended amendment, with an inline pointer added to the
+context's list of what the code deletes, §1's Query and Maintain delete
+columns, §2's list of what a compromised Maintain credential can delete, the
+recaps in the query-audit and `del/` amendments, and the worker-heartbeat
+amendment's sentence that left this case undecided.
+
+## Amendment (2026-10-01): the control-plane keys each role reads and writes
+
+<!-- amendment-applies: sections="1. Four roles, mapped to existing process boundaries|3. Deny-delete, everywhere, on the four prefixes nothing deletes|Amendment: the `t/<hash>/enc` key-epoch record needs a read/write grant" pointer="control-plane key amendment" -->
+
+§1's table was derived from the data-path call sites and left
+out eight control-plane keys the code reads or writes in a named role's
+mode, and the alert evaluator's transition writes. IAM is default-deny, so
+each omission was a refused request under the shipped templates. The grants
+below are the narrowest that cover each call:
+
+- **`sys/auth`, the durable bearer-token map (ADR-0066 decision 6).** Gateway
+  and Query read it: on a keyed bucket `Mode::Gateway`, `Mode::Query` and
+  `Mode::All` refresh it at startup, on a horizon and on a token miss, and a
+  process that cannot refresh fails durable-token auth closed: its tokens
+  never resolve before a first refresh, and stop resolving past the
+  hard-stale bound. `GatewayRead` and `QueryRead` gain `sys/auth`. Admin
+  writes it: `ravel-cli tenant token upsert` and `revoke` read the map and
+  PUT it back with `CreateIfAbsent` or `CasVersion`, so `AdminWrite` gains
+  `sys/auth`. No server role writes it; the only production writers are
+  `ravel-cli` under Admin and the operator, which uses the shared storage
+  credential its CRD names rather than one of these templates. Nothing
+  deletes it.
+- **`sys/t/<hash>`, the per-tenant recovery manifest (ADR-0050 section 3).**
+  Every ingest handler writes it with `CreateIfAbsent` on a keyed tenant's
+  first request in a process, so it is a Gateway write. `GatewayWrite`
+  gains `sys/t/*`. A refused write does not fail ingest, but the tenant gets
+  no manifest and the writer retries on every later request.
+- **`sys/maintain/memo/`, the maintain memo snapshots (ADR-0065 decision 3).**
+  The warm start LISTs the prefix and then GETs each snapshot. The GET and
+  the snapshot PUT were already covered by `sys/maintain/*`; the LIST was
+  not, and a refused LIST degrades to a cold start: each maintain cycle logs
+  a warning and retries.
+  `MaintainList` gains `sys/maintain/memo/*`.
+- **`t/<hash>/config`, the tenant config record (ADR-0066 decision 6).** It is
+  tenant-scoped, not per-signal, and `read_config` GETs it and propagates every
+  store error except `NotFound`, so a refused GET is not read as "no overrides"
+  but fails each reading role in its own mode: Maintain's
+  `resolve_retention_window_ns` maps it to `MaintainError::Invariant` and every
+  retention pass fails; Query's declared-columns source never resolves the
+  durable `typed_attr_columns` override, so queries run on the base schema; and
+  Gateway's lifecycle config-limits refresh fails every cycle, so per-tenant
+  admission overrides never apply. `MaintainRead`, `QueryRead` and `GatewayRead`
+  gain `t/*/config`; Admin already reads it through its blanket `t/*`. The only
+  production writers are `ravel-cli typed-attr-column set`, `clustering-key set`
+  and `clear`, and `bloom-scope set` under Admin, which GET the record and PUT
+  it back with `CreateIfAbsent` or `CasVersion`, so `AdminWrite` gains
+  `t/*/config` (issue #2340). No server role writes it, so no server template
+  gains a write grant.
+- **`t/<hash>/enc`, the per-tenant KMS key-epoch record (ADR-0062 decision
+  1b).** With `--tenant-kms-config` set, startup runs `configure_tenant_kms` in
+  every mode: for each configured tenant it GETs the record and, for a tenant
+  with no record or a changed key, PUTs it with `CreateIfAbsent` for epoch 0
+  and `CasVersion` for each appended epoch. Only `NotFound` reads as absence,
+  so a refused GET or PUT stops the process from starting. `GatewayRead`,
+  `QueryRead`, `MaintainRead`, `GatewayWrite`, `QueryWrite` and
+  `MaintainWrite` gain `t/*/enc`. Admin reads it for `ravel-cli
+  verify-custody` through its blanket `t/*` and writes it nowhere. Nothing
+  lists it, so no `ListBucket` prefix is added, unlike the follow-up the
+  `t/<hash>/enc` amendment above proposed (the bootstrap-key list amendment
+  below adds one on the exact key, so an absent record reads as 404 on AWS S3).
+- **`t/<hash>/m/meta`, the metric metadata record (ADR-0085 decision 1).** The
+  ingest metadata sink in `Mode::Gateway` and `Mode::All` GETs it and PUTs it
+  with `CreateIfAbsent` or `CasVersion`; the query metadata cache in
+  `Mode::Query` and `Mode::All` GETs it to serve `/api/v1/metadata`. Both log
+  and swallow a refusal, so metric metadata was never persisted or served.
+  `GatewayRead`, `GatewayWrite` and `QueryRead` gain `t/*/m/meta`.
+- **`t/<hash>/a/alert-lease` and `t/<hash>/a/state/latest`, the alert
+  evaluator's lease and state memo (ADR-0043).** The evaluator runs inside the
+  query-serving block, so under the Query role. Each tick it GETs the memo,
+  PUTs the lease with `CreateIfAbsent` or, when one exists, GETs it and PUTs
+  it back with `CasVersion`, and the lease holder overwrites the memo. A
+  refused lease PUT reports the lease unavailable and evaluates no rule.
+  `QueryRead` and `QueryWrite` gain both keys. Nothing releases or deletes
+  either. The evaluator also publishes each transition as an L0 data object
+  and a commit record with `CreateIfAbsent`; the Query role could read those
+  but not write them, so `QueryWrite` gains `t/*/a/l0/*` and `t/*/a/c/*`,
+  scoped to the alerts signal.
+- **The maintain alert retention reads.** `alert_keep_set` GETs the state memo
+  and propagates every error but `NotFound`, so a refused GET skipped alert
+  retention for the tenant every tick: `MaintainRead` gains
+  `t/*/a/state/latest`. `alert_keyspace_is_empty` LISTs `t/<hash>/a/` and
+  `quarantine/t/<hash>/a/` for a tenant with no alert history, and a refused
+  LIST logged a warning and ran the orphan sweep anyway: `MaintainList` gains
+  both as `s3:prefix` values `t/*/a/` and `quarantine/t/*/a/`.
+
+`sys/auth`, `sys/t/*` and `t/*/enc` also join the §3 deny-delete set in every
+template: no role deletes any of them on its normal path, a deleted `sys/auth`
+reads as absent and installs an empty token map that revokes every durable
+token, `sys/t/*` recovery manifests are write-once (ADR-0050), and a deleted
+key-epoch record reads as "no per-tenant key was ever configured", so
+`verify-custody` stops checking the tenant and the next startup rewrites its
+history from epoch 0.
+
+With these grants and those of the 2026-10-02 amendment below, twenty
+control-plane keys and prefixes are read or written on a role's normal path,
+and every one is granted to the roles that use it. Admin reads all of them
+through `t/*` and `sys/*`; the operations below are the others:
+
+- `sys/tenancy`: Gateway, Query and Maintain get and put; Admin puts.
+- `sys/qualification`: Gateway, Query and Maintain get; Admin puts.
+- `sys/qualify/*`: Admin puts and deletes.
+- `sys/pq-probe/*`: Admin puts and deletes.
+- `sys/gc`: Gateway and Query get; Maintain gets and puts; Admin puts.
+- `sys/auth`: Gateway and Query get; Admin puts.
+- `sys/t/*`: Gateway puts.
+- `sys/maintain/workers/*`: Maintain lists, gets, puts and deletes.
+- `sys/maintain/memo/*`: Maintain lists, gets and puts.
+- `sys/maintain/claims/compaction/*`: Maintain gets and puts.
+- `sys/query/workers/*`: Query lists, gets and puts; Maintain lists and
+  deletes.
+- `admission/query/*`: Query lists, gets and puts.
+- `t/*/config`: Gateway, Query and Maintain get; Admin puts.
+- `t/*/enc`: Gateway, Query and Maintain get and put.
+- `t/*/m/meta`: Gateway gets and puts; Query gets.
+- `t/*/a/alert-lease`: Query gets and puts.
+- `t/*/a/state/latest`: Query gets and puts; Maintain gets.
+- `t/*/*/admission/*`: Gateway lists, gets and puts; it deletes under
+  `t/????????????????????????????????/?/admission/*` (see the 2026-10-02
+  amendment).
+- `t/*/pq/grants`: Query gets; Admin puts.
+- `t/*/pq/t/*`: Query lists and gets; Maintain lists and deletes. Query also
+  creates manifests and runs the bucket probe for HTTP Parquet DDL (HTTP DDL
+  amendment below).
+
+Three groups of control-plane calls were left ungranted here, because each
+needed a decision rather than a narrow grant: the Parquet table keys under
+`t/<hash>/pq/` and the `sys/pq-probe/` probe object; the compaction claims and
+L1 output `ravel-cli maintain compact-bucket` and `compact-tenant` write; and
+the dead admission-snapshot deletes Gateway's reconcile issues. The 2026-10-02
+amendment below decides all three, and none is ungranted any more.
+`deploy/iam/README.md` lists their call sites.
+
+Two candidates were examined and are not granted. Query still deletes
+nothing (apart from the bucket probe's scratch object, per the HTTP DDL
+amendment below): a draining query worker overwrites its own record and Maintain
+reaps it, as the query-worker reap amendment records. Gateway and Query
+still cannot create `sys/gc`: every mode runs the bootstrap at startup, but
+§4 keeps creation with Maintain and Admin, and the deployment guides and
+the operator start Maintain first on a fresh bucket for that reason.
+
+Recorded as an appended amendment, with an inline pointer added to §1, §3 and
+the `t/<hash>/enc` amendment.
+
+## Amendment (2026-10-02): the Parquet table keys, the bucket probe, the admission-snapshot reap and `ravel-cli` compaction
+
+<!-- amendment-applies: sections="1. Four roles, mapped to existing process boundaries|2. Durable-data delete stays exclusively with Maintain|3. Deny-delete, everywhere, on the four prefixes nothing deletes|Consequences|Amendment (2026-10-01): the control-plane keys each role reads and writes" pointer="2026-10-02 amendment" -->
+
+The control-plane key amendment above left three groups of calls ungranted
+because each needed a decision. They are decided here.
+
+**The Parquet table keys (ADR-2040).**
+
+- `t/<hash>/pq/grants`, the location grants record. `ravel-cli tenant
+  parquet-grant add` and `remove` GET it and PUT it back with `CreateIfAbsent`
+  or `CasVersion` (`crates/ravel-pqtable/src/grants.rs`), so `AdminWrite`
+  gains `t/*/pq/grants`; Admin reads it through `t/*`. A Parquet table query
+  GETs it to check every file a manifest names against the tenant's grants
+  (`crates/ravel-sql/src/parquet.rs`), so `QueryRead` gains `t/*/pq/grants`.
+  Nothing deletes it, and a deleted record reads as a tenant with no grants,
+  so it joins `DenyDeleteProtected` in every template.
+- `t/<hash>/pq/t/<table>/v/<version>.pqm`, the table manifests. A Parquet
+  table query lists `t/<hash>/pq/t/<table>/v/` and GETs the manifest it
+  resolves (`newest` and `read_version`, `crates/ravel-pqtable/src/resolve.rs`),
+  so
+  `QueryList` gains the `s3:prefix` `t/*/pq/t/*` and `QueryRead` gains
+  `t/*/pq/t/*`. `ravel-cli parquet sweep` lists `t/<hash>/pq/t/` and deletes
+  each superseded manifest (`crates/ravel-pqtable/src/sweep.rs`). It runs
+  under the Maintain credential, so `MaintainList` and `MaintainDelete` gain
+  `t/*/pq/t/*`, and Admin gains no delete on manifests. The sweep reads no
+  manifest, so `MaintainRead` gains nothing for it.
+  A manifest is durable data, and its delete stays with Maintain as §2
+  requires. `MaintainDelete` is one statement granting `s3:DeleteObject` and
+  `s3:DeleteObjectVersion`, so the manifests get both, though the sweep
+  issues only `DeleteObject`. The sweep deletes a version only when the
+  listing holds a newer version of the same table that has been in place
+  longer than the grace window plus the clock skew allowance, and a query
+  resolves the newest version, so no reader loses a manifest it still
+  resolves; a Flight `DoGet` pinned to an older version fails closed. A
+  compromised Maintain credential is wider than the sweep: it can delete a
+  table's newest version, including a `dropped` marker, which brings back
+  the previous definition while an older version still exists and otherwise
+  removes the table, or every version, which removes the table. Bucket
+  versioning does not undo either, because the grant includes
+  `DeleteObjectVersion`, and no server path recreates a manifest while DDL is
+  not wired into the server (it now is: a `CREATE OR REPLACE` over HTTP writes
+  a fresh version under the Query credential, per the HTTP DDL amendment
+  below). A definition brought back this way is still
+  checked against the grants record at every resolve, and Maintain holds no
+  credential for an external bucket.
+- `sys/pq-probe/<random>`, the bucket probe object. Before `parquet-grant
+  add` writes a grant, `probe_not_ravel_bucket`
+  (`crates/ravel-object-store/src/external/probe.rs`) PUTs a random key under
+  `sys/pq-probe/` to the Ravel bucket and DELETEs it on every path it returns
+  through. `AdminWrite` gains `sys/pq-probe/*`, and a new `AdminProbeDelete`
+  statement grants `s3:DeleteObject` on exactly `sys/pq-probe/*`. Like
+  `sys/qualify/*`, it is scratch: a transient object that holds no tenant data
+  and anchors nothing.
+
+(Superseded: what follows is granted, in a narrower form, by the
+HTTP DDL amendment below.)
+The server does not run Parquet table DDL yet: `crates/ravel-sql/src/ddl.rs`
+writes manifests and runs the same probe, but no server mode calls it. When
+DDL is wired into the server, Query will also need `s3:PutObject` on
+`t/*/pq/t/*` and `s3:PutObject` and `s3:DeleteObject` on `sys/pq-probe/*`.
+Neither is granted here.
+
+**`ravel-cli maintain compact-bucket` and `compact-tenant` run under the
+Maintain credential.** They take compaction claims under
+`sys/maintain/claims/compaction/` and write L1 segments and compaction
+records, all of which `maintain.json` already grants. Admin gains nothing for
+them. `ravel-cli` builds no per-tenant KMS routing store, so these writes, like
+every `ravel-cli` write, are encrypted under the bucket default rather than a
+routed tenant's key.
+`ravel-cli parquet sweep`, `maintain compact-bucket` and `maintain
+compact-tenant` are the `ravel-cli` commands that take the Maintain credential.
+
+**The gateway reaps dead admission snapshots.** Each ingest process
+overwrites its own snapshot
+`t/<hash>/<signal>/admission/<process_id>.snapshot`, and the admission
+reconcile (`reap_keys`, `crates/ravel-ingest/src/reconcile.rs`) deletes the
+snapshots of processes past the reap horizon. A new `GatewayAdmissionDelete`
+statement grants `s3:DeleteObject` on
+`t/????????????????????????????????/?/admission/*` and nothing else. The
+pattern is spelled with IAM's single-character `?` wildcard, not
+`t/*/*/admission/*`, because IAM's `*` matches across `/`: the `*` form
+would also match `t/<hash>/pq/t/admission/v/<version>.pqm`, the manifests of
+a Parquet table named `admission`, which ADR-2040's table-name validation
+did not reserve when this amendment was written (its 2026-10-03 IAM
+segment amendment now does). A tenant hash is always 32 hex characters (both the
+unkeyed and the keyed derivation yield a 16-byte `TenantHash`) and every
+signal prefix is one character, so the `?` form matches every snapshot the
+reap deletes and fails at `/pq/` on every manifest. No `Deny` in
+`gateway.json` covers that prefix, and the pattern reaches no immutable key:
+no data object, commit record, manifest, catalog object or `prov` record
+lies under a `t/<32 characters>/<1 character>/admission/` prefix.
+
+The read, write and list grants that name a key segment after a `*` keep the
+cross-`/` match: Gateway's `t/*/*/admission/*`, and grants in every role on
+segments including `c`, `l0`, `l1`, `idem`, `maint`, `u`, `catalog`, `del`
+and `a`, also reach the manifests of a Parquet table with that name. For
+Gateway, Query and Admin that is a write and read exposure, not a delete
+one. Maintain's delete grants on `l0`, `c`, `l1` and `idem` also match those
+tables' manifests, which adds nothing to its `t/*/pq/t/*` delete above.
+ADR-2040's 2026-10-03 IAM segment amendment closes all of it by reserving
+those table names.
+
+This changes the wording of §2. An admission snapshot is mutable per-process
+state that the live processes rewrite every reconcile interval, not durable
+data, so the property §2 rests on holds in the form it is now stated: Gateway
+deletes no durable object, and Query deletes nothing at all (since the HTTP
+DDL amendment below, nothing but bucket probe scratch objects). §1's Gateway
+delete column, §2 and the Consequences bullet carry an inline pointer here.
+
+None of `sys/tenancy`, `sys/qualification`, `sys/gc`, `prov` or
+`catalog/*/HEAD` is reachable by any new delete pattern, so the
+brick-the-deployment protection of §2 and §3 is unchanged. Recorded as an
+appended amendment, with an inline pointer added to §1, §2, §3, the
+Consequences and the control-plane key amendment.
+
+## Amendment (2026-10-02): the maintain-tier fold grants
+
+<!-- amendment-applies: sections="What each role actually does, read from the code|1. Four roles, mapped to existing process boundaries|Amendment (2026-09-23): the catalog delete-deny narrows to `catalog/*/HEAD`" pointer="maintain-tier fold amendment" -->
+<!-- amendment-supersedes: phrase="the fold does not run in `Mode::Maintain`" pointer="maintain-tier fold amendment" -->
+<!-- amendment-supersedes: phrase="spawns `fold::spawn` in every mode except `Mode::Maintain`" pointer="maintain-tier fold amendment" -->
+
+Issue #2382. Since ADR-1693 the scheduled catalog fold runs on the maintain
+tier: `Mode::runs_scheduled_fold` (`services/ravel-server/src/config.rs`) is
+true for `Mode::Maintain` and `Mode::All` only. The context's first code fact
+and the 2026-09-23 amendment's note on the fold's reuse reads both say the
+fold does not run in `Mode::Maintain`; both are qualified in place with a
+pointer here.
+
+`fold_inner` (`crates/ravel-catalog/src/fold.rs`) writes four catalog
+objects per signal it advances:
+
+- `t/<hash>/catalog/<sig>/snap/<hour>.<hash16>.csnap` with `CreateIfAbsent`.
+  Any refusal other than `AlreadyExists` aborts the fold.
+- `t/<hash>/catalog/<sig>/idx/<hour>.<hash16>.cstat` with `CreateIfAbsent`,
+  when typed columns are declared. A refusal aborts the fold.
+- `t/<hash>/catalog/<sig>/idx/<hour>.<hash16>.npost` with `CreateIfAbsent`.
+  A refusal is tolerated and the HEAD is published without postings.
+- `t/<hash>/catalog/<sig>/HEAD` with `CasVersion`, or `CreateIfAbsent` when no
+  HEAD exists yet.
+
+`MaintainWrite` granted none of them, so on a per-role deployment every
+scheduled fold that had something to publish failed at its first snapshot
+write and the catalog stopped advancing. `MaintainWrite` gains
+`t/*/catalog/*/snap/*`, `t/*/catalog/*/idx/*` and `t/*/catalog/*/HEAD`. The
+fold's reads were already granted: `MaintainRead` covers the HEAD, `snap/*`
+and `idx/*` (2026-09-23 amendment), and the commit bucket listing and record
+reads fall under `t/*/*/c/*`. Maintain already holds `kms:Encrypt` and
+`kms:GenerateDataKey*` on the tenant key, so routed catalog writes need no
+new KMS grant.
+
+`t/*/catalog/*/HEAD` stays in `maintain.json`'s `DenyDeleteProtected`. That
+statement denies `s3:DeleteObject` and `s3:DeleteObjectVersion` only, so it
+does not cancel the HEAD write, and no Maintain delete grant reaches the HEAD.
+A compromised Maintain credential can now overwrite a catalog HEAD or publish
+a part, as a compromised Gateway or Query credential already could. The
+catalog is derived state: a fold rebuilds it from the commit records, which
+this grant does not reach.
+
+Net effect on §1: the Maintain row's write column gains the three catalog
+writes, and the diagram gains the Maintain fold edge. `gateway.json` and
+`query.json` are unchanged. Gateway no longer folds by any route, and
+removing its catalog grants is a separate least-privilege decision recorded
+on issue #2382.
+
+Recorded as an appended amendment, with an inline pointer added to the
+context's first code fact, §1 and the 2026-09-23 amendment.
+
+## Amendment (2026-10-03): the Query role's grants for HTTP Parquet DDL
+
+<!-- amendment-applies: sections="What each role actually does, read from the code|1. Four roles, mapped to existing process boundaries|2. Durable-data delete stays exclusively with Maintain|Consequences|Amendment (2026-09-24): Maintain deletes dead-worker heartbeat keys under `sys/maintain/workers/`|Amendment (2026-09-29): Maintain deletes dead query-worker records under `sys/query/workers/`|Amendment (2026-10-01): the control-plane keys each role reads and writes|Amendment (2026-10-02): the Parquet table keys, the bucket probe, the admission-snapshot reap and `ravel-cli` compaction" pointer="HTTP DDL amendment" -->
+<!-- amendment-supersedes: phrase="cannot delete a single object, anywhere, ever" pointer="HTTP DDL amendment" -->
+<!-- amendment-supersedes: phrase="the Query role still has no delete grant" pointer="HTTP DDL amendment" -->
+<!-- amendment-supersedes: phrase="the Query role keeps deleting nothing" pointer="HTTP DDL amendment" -->
+<!-- amendment-supersedes: phrase="Query still deletes nothing" pointer="HTTP DDL amendment" -->
+<!-- amendment-supersedes: phrase="Query deletes nothing at all" pointer="HTTP DDL amendment" -->
+<!-- amendment-supersedes: phrase="no server path recreates a manifest while DDL is not wired into the server" pointer="HTTP DDL amendment" -->
+<!-- amendment-supersedes: phrase="The server does not run Parquet table DDL yet" pointer="HTTP DDL amendment" -->
+
+Issues #2395 and #2405. `POST /api/v1/sql` now runs `CREATE [OR REPLACE]
+EXTERNAL TABLE` and `DROP TABLE` through `SqlExecutor::execute_ddl`
+(`crates/ravel-sql/src/ddl.rs`) in `Mode::Query` and `Mode::All`, under the
+Query credential. The 2026-10-02 amendment recorded what DDL would need and
+granted none of it, so on a per-role deployment every DDL statement was
+refused under the shipped `query.json`.
+
+`execute_ddl` issues these calls against the Ravel bucket:
+
+- `resolve::newest` LISTs `t/<hash>/pq/t/<table>/v/` and GETs the newest
+  manifest, before a plain `CREATE` and on every attempt of
+  `writer::apply`'s retry loop. `writer::apply` also GETs a manifest it put,
+  to recognise its own write after a timeout or a conflict.
+- `CREATE` GETs the grants record `t/<hash>/pq/grants` (`grants::list`).
+- `CREATE` runs `probe_not_ravel_bucket`
+  (`crates/ravel-object-store/src/external/probe.rs`), which PUTs
+  `sys/pq-probe/<32 hex characters>` with `PutMode::Overwrite` and DELETEs it
+  on every path it returns through.
+- `writer::apply` (`crates/ravel-pqtable/src/writer.rs`) PUTs
+  `t/<hash>/pq/t/<table>/v/<version:020>.pqm` with `PutMode::CreateIfAbsent`.
+  It is the writer's only put, and `DROP` goes through it too: a drop writes
+  a `dropped` manifest version and deletes nothing. When the PUT reports
+  `AlreadyExists`, the S3 backend HEADs the key, which IAM authorizes as
+  `s3:GetObject`.
+
+The `LOCATION` listing, HEAD and footer reads and both qualification probes'
+reads go to the external bucket under its own credential profile, which no
+template here governs.
+
+The listing and the three reads were already granted (`QueryList`
+`t/*/pq/t/*`, `QueryRead` `t/*/pq/t/*` and `t/*/pq/grants`). `query.json`
+gains the rest and nothing more:
+
+- `QueryManifestCreate`: `s3:PutObject` on
+  `t/????????????????????????????????/pq/t/*/v/????????????????????.pqm`,
+  conditioned on `StringEquals` `s3:if-none-match` `*`. Every manifest write
+  is `CreateIfAbsent`, which the S3 backend sends as `If-None-Match: *`, so
+  the role needs to create a version and never to overwrite one. S3
+  evaluates `s3:if-none-match` on `PutObject` (checked against AWS on
+  2026-10-03), and a PUT without the header has no value for the key, so the
+  statement refuses it. The condition holds across every API that
+  `s3:PutObject` authorizes, as AWS documents for `s3:if-none-match`: a
+  multipart upload cannot be started without the header, and a CopyObject
+  onto the key is refused. A compromised Query credential therefore cannot
+  rewrite an existing manifest version. The version segment is 20 `?` and
+  the `.pqm` suffix, the exact width of `manifest_key`
+  (`VERSION_WIDTH` in `crates/ravel-pqtable/src/keys.rs`), so only a key
+  shaped like a manifest version is writable. The table segment has to be
+  `*`, since table names run from 1 to 63 bytes, and IAM's `*` matches `/`:
+  the grant also reaches keys such as `t/<hash>/pq/t/a/b/v/<20 chars>.pqm`
+  and 20-character versions that are not 20 digits. All of them sit inside
+  the tenant's own manifest keyspace and `parse_manifest_key` refuses each
+  one; such a key makes the tenant's manifest sweep fail with a foreign-key
+  error, and one under a real table's `v/` prefix makes resolving that table
+  fail too, until Maintain deletes it. That is the same class of harm as the
+  maximal-version wedge below, confined to the manifest keyspace, so it is
+  accepted. The tenant hash is spelled as 32 single-character
+  `?` wildcards, the form `GatewayAdmissionDelete` uses: no other keyspace
+  carries a `pq/t/` segment today, so a `*` there would reach nothing more,
+  but the `?` form keeps the write at `t/<hash>/pq/t/` if one ever does.
+  Like the gateway's grant, it rests on the policy layer reading `?` as one
+  character and, here, on it evaluating `s3:if-none-match`; check both before
+  applying the template to another S3-compatible store.
+- `QueryWrite` gains `sys/pq-probe/*`, and a new `QueryProbeDelete` statement
+  grants `s3:DeleteObject` on exactly `sys/pq-probe/*`. This is the scratch
+  grant the 2026-10-02 amendment gave Admin, for the same probe.
+
+The property §2 rests on holds in a narrower form: Query deletes no durable
+object, and its one delete grant reaches only the probe's transient scratch
+objects, which hold no tenant data and anchor nothing. §1's Query row, §2, the
+Consequences bullet, the context's list of what the code deletes, and each
+earlier amendment that said Query deletes nothing carry an inline pointer
+here. None of `sys/tenancy`, `sys/qualification`, `sys/gc`, `prov`,
+`catalog/*` or `t/*/pq/grants` is reachable by the new delete pattern.
+
+A compromised Query credential can now create a manifest version for any
+table of any tenant: define a table, redefine one, or drop one. Every
+definition is still checked against the tenant's grants record at every
+resolve, and Query cannot write that record, so a forged definition reaches
+only locations the tenant has granted. It can also create a version number
+far above the newest, which then resolves as the newest; at `u64::MAX` it
+makes every later DDL on that table fail with a version overflow. No Ravel
+path deletes the newest version: the manifest sweep
+(`crates/ravel-pqtable/src/sweep.rs`) deletes a version only once its
+successor is past grace, so a forged newest version is never swept, and the
+next `ravel-cli parquet sweep` after the forged version passes grace deletes
+the legitimate versions beneath it. Recovery is to delete the forged version
+out of band with the Maintain credential before that sweep runs, or to
+restore the noncurrent object versions if the bucket keeps them. Issue #2430
+tracks hardening. The server's DDL authorization does not bind the IAM
+credential: anything holding it can put a manifest directly. The forged
+definition and the forged version are both the forge-within-the-write-grant
+risk §2 already accepts. The maintain manifest sweep is unchanged, and a manifest a
+compromised Maintain credential deletes can now be recreated by a `CREATE`
+over HTTP.
+
+Issue #2405: ADR-2040's 2026-10-03 IAM segment amendment reserves the table
+names `l0`, `c`, `l1`, `idem`, `maint`, `admission`, `u`, `catalog`, `del` and
+`a`, so the cross-`/` exposure the 2026-10-02 amendment described can no longer
+be reached through a table name. `deploy/iam/README.md` now says so, and
+`crates/ravel-commit/tests/iam_templates.rs` carries a per-name witness: for
+each reserved word, a shipped grant that names that segment after a wildcard
+reaches `t/<hash>/pq/t/<word>/v/<version>.pqm` or a listing prefix of it.
+The list is pinned to `IAM_GRANT_SEGMENTS` in
+`crates/ravel-pqtable/src/names.rs`, whose own test pins `validate_table`
+refusing each word.
+
+Recorded as an appended amendment, with an inline pointer added to the
+context's list of what the code deletes, §1, §2, the Consequences, and the
+worker-heartbeat, query-worker reap, control-plane key and 2026-10-02
+amendments.
+
+## Amendment (2026-10-03): prov write conditions per role
+
+<!-- amendment-applies: sections="1. Four roles, mapped to existing process boundaries|3. Deny-delete, everywhere, on the four prefixes nothing deletes" pointer="prov write conditions amendment" -->
+
+Issue #2396. Every write of the provisioning record
+`t/<hash>/<sig>/prov` goes through one of three functions in
+`crates/ravel-catalog/src/provisioning.rs`: `write_record_race_safe` with
+`PutMode::CreateIfAbsent`, reached from `validate_or_adopt` under
+`AbsentPolicy::CreateFromConfig` or `AbsentPolicy::AdoptIfData`, and
+`append_generation` and `raise_format_floor` with `PutMode::CasVersion`. No
+production path writes the record unconditionally. The callers, by the role
+whose credential issues them:
+
+- Gateway: `ProvisioningRecordWriter::ensure` on a tenant's first ingest
+  write (`CreateFromConfig`, so `CreateIfAbsent`).
+- Gateway and Maintain: `validate_static_provisioning`
+  (`services/ravel-server/src/provisioning.rs`), which `main.rs` runs at
+  startup for each statically known tenant (`AdoptIfData`, so
+  `CreateIfAbsent` when the tenant's data predates its record) in
+  `gateway`, `maintain` and `all` mode.
+- Maintain: the maintain tick's per-tenant, per-signal `validate_or_adopt`
+  (`services/ravel-server/src/maintain.rs`, `AdoptIfData`), and
+  `ravel-cli maintain migrate`'s floor raise, `raise_format_floor` after a
+  clean re-audit (`CasVersion`, ADR-0066 decisions 3 and 5).
+- Admin: `ravel-cli provision adopt` (`AdoptIfData`, so `CreateIfAbsent`) and
+  `ravel-cli provision reshard` (`append_generation`, `CasVersion`).
+
+Query is not a caller. A `query` process runs the startup check with
+`AbsentPolicy::RefuseIfCommittedDataHidden` (`static_absent_policy` in
+`services/ravel-server/src/provisioning.rs`) and never adopts: a present
+record is validated as in every other mode, and one it cannot read refuses
+startup. For an absent record it lists only the commit prefix
+`t/<hash>/<sig>/c/`, which `QueryList` already admits through `t/*/*/c/*`,
+and refuses with `AdoptionWouldHideData` when a committed shard index is at
+or above its configured shard count, since it would read that tenant through
+the implicit generation 0 of that count and leave those shards out. Otherwise
+it passes with no write. It never lists `l0/`: Query serves committed data
+only. ADR-0050 section 5 therefore holds in every mode, and the read role
+holds no provisioning write and no `l0/` listing. Before this, Query ran the
+adopt path, whose first call lists `t/<hash>/<sig>/l0/`, a prefix
+`QueryList` does not admit, so a Query process with a statically known
+tenant that had data and no record was refused at startup with
+`AccessDenied` before it reached any write. ADR-0050 section 5 already
+assigns adoption to ingest, maintenance and the CLI and keeps the read path
+write-free.
+
+`maintain.json` granted no `prov` write, so on a per-role deployment a
+Maintain process with a statically known tenant whose data predated its
+record failed at startup with `AccessDenied`, the maintain tick skipped that
+tenant's signal on every tick, and `maintain migrate` could not raise a
+floor. `gateway.json` and `admin.json` granted an unconditioned `PutObject`
+on the record.
+
+The S3 backend sends `CreateIfAbsent` as `If-None-Match: *` and
+`CasVersion` as `If-Match: <etag>`. AWS documents both `s3:if-none-match`
+and `s3:if-match` as condition keys IAM evaluates on `PutObject`: a statement conditioned on
+`StringEquals` `s3:if-none-match` `*` admits a PUT that sends
+`If-None-Match: *`, and a statement conditioned on `Null` `s3:if-match`
+`false` admits a PUT that sends `If-Match`. Neither admits an unconditional
+PUT, nor a PUT that sends only the other statement's header. A PUT that sends
+both headers satisfies either statement's condition; S3 then enforces both
+preconditions. Every `prov` write grant is now one of those two shapes.
+
+Each names exactly three resources, one per provisioned signal (the
+`PROVISIONED_SIGNALS` of `services/ravel-server/src/provisioning.rs`):
+`t/????????????????????????????????/m/prov`, `.../l/prov` and
+`.../s/prov`, the tenant hash spelled as 32 single-character wildcards. IAM's
+`*` matches `/`, so `t/*/*/prov` would also reach nested keys ending in
+`/prov` under `c/`, `del/` or `l0/`, and the `prov` key of the alerts, audit
+and profiles signals, which have no provisioning record.
+
+- `gateway.json`: `GatewayWrite` loses `t/*/*/prov`, and `GatewayProvCreate`
+  grants the three records create-only. No Gateway path appends a generation
+  or raises a floor.
+- `query.json`: no `prov` write.
+- `maintain.json`: `MaintainProvCreate`, create-only, and `MaintainProvCas`,
+  CAS-only. The migrate cursor change of issue #2359 is separate and does not
+  touch these grants.
+- `admin.json`: `AdminWrite` loses `t/*/*/prov`, and `AdminProvCreate` and
+  `AdminProvCas` grant the three records create-only and CAS-only.
+
+`DenyDeleteProtected` keeps the broader `t/*/*/prov` in all four templates,
+since a broad deny is the safe direction. For the three provisioned signals'
+records, a compromised Gateway credential can now create a missing record and
+cannot replace an existing one, where before this amendment it could
+overwrite any tenant's record outright, and a compromised Query credential
+cannot write one at all. A compromised Maintain or Admin credential can still
+rewrite a record through a CAS PUT after reading its ETag, which is the
+overwrite gap §3 already names. `t/<hash>/u/prov` stays writable under the
+unconditioned `t/*/u/*` audit write Query and Admin hold; §3 records that
+gap. The operator's `append_generation` runs under the shared credential,
+not a template. `crates/ravel-commit/tests/iam_templates.rs` pins the
+condition and the three resources of every `prov` statement per role,
+refuses an unconditioned `PutObject` reaching the record, refuses a `prov`
+grant reaching a nested `/prov` key, an unprovisioned signal's key, or a key
+whose tenant segment is 31 or 33 characters wide, asserts `query.json`
+reaches no record and admits the commit-prefix listing of the Query startup
+check but not an `l0/` one, and matches each caller above to a grant of its
+own kind.
+
+Net effect on §1: the Maintain write column gains the `prov` writes above,
+the Gateway and Admin entries are conditioned and narrowed to the three
+records, and Query gains nothing. Net effect on §3: for the provisioned
+signals' records, only Maintain and Admin can overwrite one.
+
+Recorded as an appended amendment, with an inline pointer added to §1 and
+§3.
+
+## Amendment (2026-10-03): bootstrap-key list grants per role
+
+<!-- amendment-applies: sections="1. Four roles, mapped to existing process boundaries|4. The two remaining bootstrap-write exceptions|Amendment: the `t/<hash>/enc` key-epoch record needs a read/write grant|Amendment (2026-10-01): the control-plane keys each role reads and writes" pointer="bootstrap-key list amendment" -->
+<!-- amendment-supersedes: phrase="so no `ListBucket` prefix is added" pointer="bootstrap-key list amendment" -->
+
+Issue #2332. On AWS S3, a GET or HEAD of a key that does not exist is answered
+with 403, not 404, unless the caller holds an `s3:ListBucket` grant covering
+that key. A live check against AWS on 2026-10-03, recorded on issue #2332,
+confirmed it, and confirmed that a `ListBucket` statement whose `s3:prefix`
+condition is a `StringEquals` on exactly the key makes S3 report the missing
+key as 404, while a key the condition does not name keeps answering 403.
+
+The templates granted the reads of §1 and of the control-plane key amendment
+and no list covering `sys/tenancy`, `sys/qualification` or `sys/gc`. Every
+server process reads all three at startup, and each read passes only
+`NotFound` through as absence, so on a fresh AWS bucket every server role was
+refused the read of each object before it could create it, and no start order
+helped. The same held for the per-tenant keys a role reads where absence is a
+normal state: a tenant with no config record, no key-epoch record, no
+provisioning record, no metric metadata, no alert state memo, no Parquet grants
+record, or, for Maintain, no catalog `HEAD`.
+
+Decision, made by the owner: each server role gets an `s3:ListBucket` grant
+whose `s3:prefix` condition names exactly the control-plane keys that role
+reads where absence is an expected state. Not `sys/*`, and not an
+unconditioned `ListBucket`. Fixed keys are named with `StringEquals` on the
+exact key. Per-tenant keys are named with `StringLike`, the tenant hash
+written as 32 single-character wildcards and no `*`, the form the `prov` write
+grants use. IAM requires every operator in one `Condition` block to match, so
+each template carries two new statements, `<Role>ListBootstrapKeys`
+(`StringEquals`) and `<Role>ListTenantBootstrapKeys` (`StringLike`). The
+existing list statements and every `Deny` are unchanged.
+
+The key set, derived from the call sites (the code's handling of
+`AccessDenied` is unchanged; a key is included only where the code already
+treats a real 404 as a normal state, and only for the role that reads it):
+
+| Key | Gateway | Query | Maintain | Call site |
+|---|---|---|---|---|
+| `sys/qualification` | yes | yes | yes | `qualification::enforce`, startup; absent refuses naming `store qualify` |
+| `sys/tenancy` | yes | yes | yes | `read_marker` in `resolve_and_pin`, startup; absent writes the marker |
+| `sys/gc` | yes | yes | yes | `read_gc_config` in `bootstrap_gc_config`, startup; absent tries the create |
+| `sys/auth` | yes | yes | | `DurableAuthState::refresh`, keyed bucket; absent is an empty map |
+| `t/<hash>/config` | yes | yes | yes | `read_config`; absent is the deployment defaults |
+| `t/<hash>/enc` | yes | yes | yes | `bootstrap_tenant_epoch`, startup under `--tenant-kms-config`; absent records the first epochs |
+| `t/<hash>/m/meta` | yes | yes | | the metadata sink (creates it) and the metadata cache |
+| `t/<hash>/<sig>/prov` | `m`, `l`, `s` | `m`, `l`, `s`, `p`, `a`, `u` | `m`, `l`, `s` | `validate_or_adopt` and the generation reads; the query catalog's enforcement reads it for every signal it resolves, so Query names one pattern per signal letter, not a `?` signal segment |
+| `t/<hash>/catalog/<sig>/HEAD` | | | `m`, `l`, `s` | the scheduled fold's `get_head`; absent is the first fold |
+| `t/<hash>/a/state/latest` | | yes | yes | `read_alert_state_memo` in the evaluator and in `alert_keep_set` |
+| `t/<hash>/pq/grants` | | yes | | `grants::list`; absent is no grants |
+
+Gateway's and Query's catalog `HEAD` reads were already admitted by their
+`t/*/catalog/*/*` list prefix, and Maintain's scrub cursor and the other keys
+under `t/*/*/maint/*` by `MaintainList`, so they gain nothing. Left out:
+`sys/t/<hash>`, the alert lease and the compaction claims are written with
+`CreateIfAbsent` first and read only after that write reports the object
+exists; the idempotency markers are found by a prefix listing, not a
+single-key read; and a data object a concurrent compaction deleted is a race,
+not a bootstrap state, whose key cannot be named without a `*`.
+
+A list request whose prefix is one of these keys can return only that key,
+since no key the system writes begins with one and continues, so the grants
+enumerate nothing else. `crates/ravel-commit/tests/iam_templates.rs` pins the
+exact condition values per role, checks each call site's key against its
+role's list statement, and checks that the new statements admit no other key:
+not a sibling a role does not read (`sys/auth` for Maintain), not a key one
+segment deeper, not a listing prefix such as `sys/` or `t/<hash>/`, not a tenant
+segment 31 or 33 characters wide, and not `t/<hash>/x/prov`, a letter no
+signal uses.
+
+On a fresh AWS bucket under per-role credentials, every server role now
+creates `sys/tenancy`, Maintain creates `sys/gc` as §4 describes, and the
+per-tenant records are created as before. `sys/qualification` still needs
+Admin's `store qualify`. A bucket whose policies predate this amendment still
+needs its first startup under one shared credential, since no `ravel-cli`
+command creates `sys/tenancy`.
+
+Net effect on §1: each server role's reads gain a list grant on exactly the
+keys above. Net effect on §4: the bootstrap race now runs on AWS S3 under the
+per-role templates. The `t/<hash>/enc` key-epoch amendment's proposed list
+prefix is added on the exact key, and the control-plane key amendment's "so no
+`ListBucket` prefix is added" no longer holds.
+
+Recorded as an appended amendment, with an inline pointer added to §1, §4, the
+`t/<hash>/enc` key-epoch amendment and the control-plane key amendment.

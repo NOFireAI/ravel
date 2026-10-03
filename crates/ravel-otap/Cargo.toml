@@ -1,0 +1,44 @@
+[package]
+name = "ravel-otap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "OTAP (OpenTelemetry Arrow) ingest: gRPC stream state, Arrow IPC decode, columnar normalization (ADR-0011)."
+
+[dependencies]
+ravel-types = { workspace = true }
+ravel-otlp = { workspace = true }
+arrow = { workspace = true }
+arrow-ipc = { workspace = true }
+prost = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+bytes = { workspace = true }
+zstd = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }
+tonic-prost-build = { workspace = true }
+protox = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tokio = { workspace = true }
+opentelemetry-proto = { workspace = true }
+ravel-remote-write = { workspace = true }
+criterion = { workspace = true }
+stats_alloc = "0.1.10"
+
+[[bench]]
+name = "decode"
+harness = false
+
+[[bench]]
+name = "ingest_panel"
+harness = false
+
+[lints]
+workspace = true

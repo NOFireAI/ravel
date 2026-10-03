@@ -1,0 +1,248 @@
+# Catalog byte-gate golden (issue #370). Committed, exact, deterministic.
+#
+# Regenerate after any INTENDED codec or format change:
+#   REGEN_CATALOG_BYTE_GATES=1 cargo test -p ravel-bench --test catalog_byte_gates
+#
+# Fixture: 500 series x 240 samples, 15s/60s spacing, ms resolution, 200ms
+# jitter, seed 0. Only the value column changes across shapes; timestamps are
+# identical, so a shape moves VAL_PAGES (and its codec choice) and nothing else
+# on the value side. bytes are exact and deterministic; timing is not, so only
+# bytes are asserted (see the file header).
+#
+# Each line is fully qualified: <interval> <shape> <layout> <metric...>.
+# 'section <NAME> <bytes> <B/sample>' lines plus the 'residual' line sum
+# exactly to 'object_bytes' (residual = footer + 16-byte trailer + inter-section
+# alignment padding). 'valenc <ENC> <count>' is the value-page encoding tag over
+# every run's VAL page (one per run): it shows which codec actually fired.
+15s counter_int_resets fragmented object_bytes 2920046
+15s counter_int_resets fragmented total_per_sample 24.3337
+15s counter_int_resets fragmented section LABEL_DICT 2209 0.0184
+15s counter_int_resets fragmented section TS_PAGES 840000 7.0000
+15s counter_int_resets fragmented section VAL_PAGES 1409387 11.7449
+15s counter_int_resets fragmented section SERIES_IDS 8004 0.0667
+15s counter_int_resets fragmented section SERIES_META 660226 5.5019
+15s counter_int_resets fragmented residual 220 0.0018
+15s counter_int_resets fragmented valenc VAL_ALP 120000
+15s counter_int_resets merged_no_prov object_bytes 360140
+15s counter_int_resets merged_no_prov total_per_sample 3.0012
+15s counter_int_resets merged_no_prov section LABEL_DICT 2209 0.0184
+15s counter_int_resets merged_no_prov section TS_PAGES 212719 1.7727
+15s counter_int_resets merged_no_prov section VAL_PAGES 126659 1.0555
+15s counter_int_resets merged_no_prov section SERIES_IDS 8004 0.0667
+15s counter_int_resets merged_no_prov section SERIES_META 10328 0.0861
+15s counter_int_resets merged_no_prov residual 221 0.0018
+15s counter_int_resets merged_no_prov valenc VAL_ALP 478
+15s counter_int_resets merged_no_prov valenc VAL_GCD_DELTA_FOR 22
+15s counter_int_resets merged_with_prov object_bytes 360460
+15s counter_int_resets merged_with_prov total_per_sample 3.0038
+15s counter_int_resets merged_with_prov section LABEL_DICT 2209 0.0184
+15s counter_int_resets merged_with_prov section TS_PAGES 212719 1.7727
+15s counter_int_resets merged_with_prov section VAL_PAGES 126659 1.0555
+15s counter_int_resets merged_with_prov section SERIES_IDS 8004 0.0667
+15s counter_int_resets merged_with_prov section SERIES_META 10648 0.0887
+15s counter_int_resets merged_with_prov residual 221 0.0018
+15s counter_int_resets merged_with_prov valenc VAL_ALP 478
+15s counter_int_resets merged_with_prov valenc VAL_GCD_DELTA_FOR 22
+15s gauge_int fragmented object_bytes 2935566
+15s gauge_int fragmented total_per_sample 24.4630
+15s gauge_int fragmented section LABEL_DICT 2209 0.0184
+15s gauge_int fragmented section TS_PAGES 840000 7.0000
+15s gauge_int fragmented section VAL_PAGES 1432779 11.9398
+15s gauge_int fragmented section SERIES_IDS 8004 0.0667
+15s gauge_int fragmented section SERIES_META 652348 5.4362
+15s gauge_int fragmented residual 226 0.0019
+15s gauge_int fragmented valenc VAL_ALP 120000
+15s gauge_int merged_no_prov object_bytes 299663
+15s gauge_int merged_no_prov total_per_sample 2.4972
+15s gauge_int merged_no_prov section LABEL_DICT 2209 0.0184
+15s gauge_int merged_no_prov section TS_PAGES 212719 1.7727
+15s gauge_int merged_no_prov section VAL_PAGES 66470 0.5539
+15s gauge_int merged_no_prov section SERIES_IDS 8004 0.0667
+15s gauge_int merged_no_prov section SERIES_META 10043 0.0837
+15s gauge_int merged_no_prov residual 218 0.0018
+15s gauge_int merged_no_prov valenc VAL_GCD_DELTA_FOR 500
+15s gauge_int merged_with_prov object_bytes 299983
+15s gauge_int merged_with_prov total_per_sample 2.4999
+15s gauge_int merged_with_prov section LABEL_DICT 2209 0.0184
+15s gauge_int merged_with_prov section TS_PAGES 212719 1.7727
+15s gauge_int merged_with_prov section VAL_PAGES 66470 0.5539
+15s gauge_int merged_with_prov section SERIES_IDS 8004 0.0667
+15s gauge_int merged_with_prov section SERIES_META 10363 0.0864
+15s gauge_int merged_with_prov residual 218 0.0018
+15s gauge_int merged_with_prov valenc VAL_GCD_DELTA_FOR 500
+15s gauge_dec2 fragmented object_bytes 3053748
+15s gauge_dec2 fragmented total_per_sample 25.4479
+15s gauge_dec2 fragmented section LABEL_DICT 2209 0.0184
+15s gauge_dec2 fragmented section TS_PAGES 840000 7.0000
+15s gauge_dec2 fragmented section VAL_PAGES 1539609 12.8301
+15s gauge_dec2 fragmented section SERIES_IDS 8004 0.0667
+15s gauge_dec2 fragmented section SERIES_META 663704 5.5309
+15s gauge_dec2 fragmented residual 222 0.0019
+15s gauge_dec2 fragmented valenc VAL_ALP 120000
+15s gauge_dec2 merged_no_prov object_bytes 360185
+15s gauge_dec2 merged_no_prov total_per_sample 3.0015
+15s gauge_dec2 merged_no_prov section LABEL_DICT 2209 0.0184
+15s gauge_dec2 merged_no_prov section TS_PAGES 212719 1.7727
+15s gauge_dec2 merged_no_prov section VAL_PAGES 126952 1.0579
+15s gauge_dec2 merged_no_prov section SERIES_IDS 8004 0.0667
+15s gauge_dec2 merged_no_prov section SERIES_META 10084 0.0840
+15s gauge_dec2 merged_no_prov residual 217 0.0018
+15s gauge_dec2 merged_no_prov valenc VAL_GCD_DELTA_FOR 500
+15s gauge_dec2 merged_with_prov object_bytes 360513
+15s gauge_dec2 merged_with_prov total_per_sample 3.0043
+15s gauge_dec2 merged_with_prov section LABEL_DICT 2209 0.0184
+15s gauge_dec2 merged_with_prov section TS_PAGES 212719 1.7727
+15s gauge_dec2 merged_with_prov section VAL_PAGES 126952 1.0579
+15s gauge_dec2 merged_with_prov section SERIES_IDS 8004 0.0667
+15s gauge_dec2 merged_with_prov section SERIES_META 10406 0.0867
+15s gauge_dec2 merged_with_prov residual 223 0.0019
+15s gauge_dec2 merged_with_prov valenc VAL_GCD_DELTA_FOR 500
+15s random_float(ctrl) fragmented object_bytes 3182003
+15s random_float(ctrl) fragmented total_per_sample 26.5167
+15s random_float(ctrl) fragmented section LABEL_DICT 2209 0.0184
+15s random_float(ctrl) fragmented section TS_PAGES 840000 7.0000
+15s random_float(ctrl) fragmented section VAL_PAGES 1680000 14.0000
+15s random_float(ctrl) fragmented section SERIES_IDS 8004 0.0667
+15s random_float(ctrl) fragmented section SERIES_META 651569 5.4297
+15s random_float(ctrl) fragmented residual 221 0.0018
+15s random_float(ctrl) fragmented valenc VAL_RAW_F64 120000
+15s random_float(ctrl) merged_no_prov object_bytes 1065208
+15s random_float(ctrl) merged_no_prov total_per_sample 8.8767
+15s random_float(ctrl) merged_no_prov section LABEL_DICT 2209 0.0184
+15s random_float(ctrl) merged_no_prov section TS_PAGES 212719 1.7727
+15s random_float(ctrl) merged_no_prov section VAL_PAGES 831175 6.9265
+15s random_float(ctrl) merged_no_prov section SERIES_IDS 8004 0.0667
+15s random_float(ctrl) merged_no_prov section SERIES_META 10880 0.0907
+15s random_float(ctrl) merged_no_prov residual 221 0.0018
+15s random_float(ctrl) merged_no_prov valenc VAL_GORILLA 362
+15s random_float(ctrl) merged_no_prov valenc VAL_RAW_F64 35
+15s random_float(ctrl) merged_no_prov valenc VAL_ALP 3
+15s random_float(ctrl) merged_no_prov valenc VAL_GCD_DELTA_FOR 100
+15s random_float(ctrl) merged_with_prov object_bytes 1065528
+15s random_float(ctrl) merged_with_prov total_per_sample 8.8794
+15s random_float(ctrl) merged_with_prov section LABEL_DICT 2209 0.0184
+15s random_float(ctrl) merged_with_prov section TS_PAGES 212719 1.7727
+15s random_float(ctrl) merged_with_prov section VAL_PAGES 831175 6.9265
+15s random_float(ctrl) merged_with_prov section SERIES_IDS 8004 0.0667
+15s random_float(ctrl) merged_with_prov section SERIES_META 11199 0.0933
+15s random_float(ctrl) merged_with_prov residual 222 0.0019
+15s random_float(ctrl) merged_with_prov valenc VAL_GORILLA 362
+15s random_float(ctrl) merged_with_prov valenc VAL_RAW_F64 35
+15s random_float(ctrl) merged_with_prov valenc VAL_ALP 3
+15s random_float(ctrl) merged_with_prov valenc VAL_GCD_DELTA_FOR 100
+60s counter_int_resets fragmented object_bytes 2940838
+60s counter_int_resets fragmented total_per_sample 24.5070
+60s counter_int_resets fragmented section LABEL_DICT 2209 0.0184
+60s counter_int_resets fragmented section TS_PAGES 840000 7.0000
+60s counter_int_resets fragmented section VAL_PAGES 1409387 11.7449
+60s counter_int_resets fragmented section SERIES_IDS 8004 0.0667
+60s counter_int_resets fragmented section SERIES_META 681019 5.6752
+60s counter_int_resets fragmented residual 219 0.0018
+60s counter_int_resets fragmented valenc VAL_ALP 120000
+60s counter_int_resets merged_no_prov object_bytes 360284
+60s counter_int_resets merged_no_prov total_per_sample 3.0024
+60s counter_int_resets merged_no_prov section LABEL_DICT 2209 0.0184
+60s counter_int_resets merged_no_prov section TS_PAGES 212719 1.7727
+60s counter_int_resets merged_no_prov section VAL_PAGES 126659 1.0555
+60s counter_int_resets merged_no_prov section SERIES_IDS 8004 0.0667
+60s counter_int_resets merged_no_prov section SERIES_META 10474 0.0873
+60s counter_int_resets merged_no_prov residual 219 0.0018
+60s counter_int_resets merged_no_prov valenc VAL_ALP 478
+60s counter_int_resets merged_no_prov valenc VAL_GCD_DELTA_FOR 22
+60s counter_int_resets merged_with_prov object_bytes 360604
+60s counter_int_resets merged_with_prov total_per_sample 3.0050
+60s counter_int_resets merged_with_prov section LABEL_DICT 2209 0.0184
+60s counter_int_resets merged_with_prov section TS_PAGES 212719 1.7727
+60s counter_int_resets merged_with_prov section VAL_PAGES 126659 1.0555
+60s counter_int_resets merged_with_prov section SERIES_IDS 8004 0.0667
+60s counter_int_resets merged_with_prov section SERIES_META 10795 0.0900
+60s counter_int_resets merged_with_prov residual 218 0.0018
+60s counter_int_resets merged_with_prov valenc VAL_ALP 478
+60s counter_int_resets merged_with_prov valenc VAL_GCD_DELTA_FOR 22
+60s gauge_int fragmented object_bytes 2956606
+60s gauge_int fragmented total_per_sample 24.6384
+60s gauge_int fragmented section LABEL_DICT 2209 0.0184
+60s gauge_int fragmented section TS_PAGES 840000 7.0000
+60s gauge_int fragmented section VAL_PAGES 1432779 11.9398
+60s gauge_int fragmented section SERIES_IDS 8004 0.0667
+60s gauge_int fragmented section SERIES_META 673394 5.6116
+60s gauge_int fragmented residual 220 0.0018
+60s gauge_int fragmented valenc VAL_ALP 120000
+60s gauge_int merged_no_prov object_bytes 299807
+60s gauge_int merged_no_prov total_per_sample 2.4984
+60s gauge_int merged_no_prov section LABEL_DICT 2209 0.0184
+60s gauge_int merged_no_prov section TS_PAGES 212719 1.7727
+60s gauge_int merged_no_prov section VAL_PAGES 66470 0.5539
+60s gauge_int merged_no_prov section SERIES_IDS 8004 0.0667
+60s gauge_int merged_no_prov section SERIES_META 10186 0.0849
+60s gauge_int merged_no_prov residual 219 0.0018
+60s gauge_int merged_no_prov valenc VAL_GCD_DELTA_FOR 500
+60s gauge_int merged_with_prov object_bytes 300127
+60s gauge_int merged_with_prov total_per_sample 2.5011
+60s gauge_int merged_with_prov section LABEL_DICT 2209 0.0184
+60s gauge_int merged_with_prov section TS_PAGES 212719 1.7727
+60s gauge_int merged_with_prov section VAL_PAGES 66470 0.5539
+60s gauge_int merged_with_prov section SERIES_IDS 8004 0.0667
+60s gauge_int merged_with_prov section SERIES_META 10505 0.0875
+60s gauge_int merged_with_prov residual 220 0.0018
+60s gauge_int merged_with_prov valenc VAL_GCD_DELTA_FOR 500
+60s gauge_dec2 fragmented object_bytes 3074740
+60s gauge_dec2 fragmented total_per_sample 25.6228
+60s gauge_dec2 fragmented section LABEL_DICT 2209 0.0184
+60s gauge_dec2 fragmented section TS_PAGES 840000 7.0000
+60s gauge_dec2 fragmented section VAL_PAGES 1539609 12.8301
+60s gauge_dec2 fragmented section SERIES_IDS 8004 0.0667
+60s gauge_dec2 fragmented section SERIES_META 684695 5.7058
+60s gauge_dec2 fragmented residual 223 0.0019
+60s gauge_dec2 fragmented valenc VAL_ALP 120000
+60s gauge_dec2 merged_no_prov object_bytes 360329
+60s gauge_dec2 merged_no_prov total_per_sample 3.0027
+60s gauge_dec2 merged_no_prov section LABEL_DICT 2209 0.0184
+60s gauge_dec2 merged_no_prov section TS_PAGES 212719 1.7727
+60s gauge_dec2 merged_no_prov section VAL_PAGES 126952 1.0579
+60s gauge_dec2 merged_no_prov section SERIES_IDS 8004 0.0667
+60s gauge_dec2 merged_no_prov section SERIES_META 10225 0.0852
+60s gauge_dec2 merged_no_prov residual 220 0.0018
+60s gauge_dec2 merged_no_prov valenc VAL_GCD_DELTA_FOR 500
+60s gauge_dec2 merged_with_prov object_bytes 360649
+60s gauge_dec2 merged_with_prov total_per_sample 3.0054
+60s gauge_dec2 merged_with_prov section LABEL_DICT 2209 0.0184
+60s gauge_dec2 merged_with_prov section TS_PAGES 212719 1.7727
+60s gauge_dec2 merged_with_prov section VAL_PAGES 126952 1.0579
+60s gauge_dec2 merged_with_prov section SERIES_IDS 8004 0.0667
+60s gauge_dec2 merged_with_prov section SERIES_META 10545 0.0879
+60s gauge_dec2 merged_with_prov residual 220 0.0018
+60s gauge_dec2 merged_with_prov valenc VAL_GCD_DELTA_FOR 500
+60s random_float(ctrl) fragmented object_bytes 3203059
+60s random_float(ctrl) fragmented total_per_sample 26.6922
+60s random_float(ctrl) fragmented section LABEL_DICT 2209 0.0184
+60s random_float(ctrl) fragmented section TS_PAGES 840000 7.0000
+60s random_float(ctrl) fragmented section VAL_PAGES 1680000 14.0000
+60s random_float(ctrl) fragmented section SERIES_IDS 8004 0.0667
+60s random_float(ctrl) fragmented section SERIES_META 672621 5.6052
+60s random_float(ctrl) fragmented residual 225 0.0019
+60s random_float(ctrl) fragmented valenc VAL_RAW_F64 120000
+60s random_float(ctrl) merged_no_prov object_bytes 1065360
+60s random_float(ctrl) merged_no_prov total_per_sample 8.8780
+60s random_float(ctrl) merged_no_prov section LABEL_DICT 2209 0.0184
+60s random_float(ctrl) merged_no_prov section TS_PAGES 212719 1.7727
+60s random_float(ctrl) merged_no_prov section VAL_PAGES 831175 6.9265
+60s random_float(ctrl) merged_no_prov section SERIES_IDS 8004 0.0667
+60s random_float(ctrl) merged_no_prov section SERIES_META 11034 0.0920
+60s random_float(ctrl) merged_no_prov residual 219 0.0018
+60s random_float(ctrl) merged_no_prov valenc VAL_GORILLA 362
+60s random_float(ctrl) merged_no_prov valenc VAL_RAW_F64 35
+60s random_float(ctrl) merged_no_prov valenc VAL_ALP 3
+60s random_float(ctrl) merged_no_prov valenc VAL_GCD_DELTA_FOR 100
+60s random_float(ctrl) merged_with_prov object_bytes 1065680
+60s random_float(ctrl) merged_with_prov total_per_sample 8.8807
+60s random_float(ctrl) merged_with_prov section LABEL_DICT 2209 0.0184
+60s random_float(ctrl) merged_with_prov section TS_PAGES 212719 1.7727
+60s random_float(ctrl) merged_with_prov section VAL_PAGES 831175 6.9265
+60s random_float(ctrl) merged_with_prov section SERIES_IDS 8004 0.0667
+60s random_float(ctrl) merged_with_prov section SERIES_META 11356 0.0946
+60s random_float(ctrl) merged_with_prov residual 217 0.0018
+60s random_float(ctrl) merged_with_prov valenc VAL_GORILLA 362
+60s random_float(ctrl) merged_with_prov valenc VAL_RAW_F64 35
+60s random_float(ctrl) merged_with_prov valenc VAL_ALP 3
+60s random_float(ctrl) merged_with_prov valenc VAL_GCD_DELTA_FOR 100

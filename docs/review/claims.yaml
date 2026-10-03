@@ -1,0 +1,221 @@
+# Documentation claims registry (ADR-1658). Checked by
+# scripts/check-doc-claims.py; the format and the four rules are in that
+# script's docstring.
+#
+# kind: positive | negative | not-a-claim
+# status: verified | contradicted | not-implemented
+# A contradicted entry carries issue. A not-implemented entry may bind the
+# symbol whose arrival would make the sentence false, so the gate fails when it
+# lands; one with binds: [] (no symbol to name yet) never trips STATUS.
+# binds: path.rs::Symbol[::Symbol], resolved against definitions only.
+#
+# Seeded from the ADR-1658 Context contradictions and from every normative-doc
+# line the NEGATIVE marker list matched when the registry landed; the
+# 2026-09-12 review's claim matrix is not in the repository.
+
+# --- The three contradictions ADR-1658's Context names ---------------------
+
+- id: readme-mcp-ships
+  doc: README.md
+  quote: "It ships behind the `mcp` cargo feature (`cargo build -p ravel-server --features mcp`) and the runtime `--mcp` flag, both off by default"
+  kind: positive
+  binds:
+    - services/ravel-server/src/mcp/adapter.rs::MCP_PATH
+    - crates/ravel-mcp/src/tools/mod.rs::dispatch
+  status: verified
+  note: "Replaced the sentence saying neither the feature nor the flag exists in a build. The mcp feature is defined in services/ravel-server/Cargo.toml, which a bind cannot name; the adapter's route constant and the tool dispatch are the code it gates."
+
+- id: readme-mcp-one-tool-served
+  doc: README.md
+  quote: "One tool is served today, `ravel_capabilities`; the other eight are catalogued and refuse calls until their bodies land."
+  kind: positive
+  binds:
+    - crates/ravel-mcp/src/tools/mod.rs::SERVED_TOOLS
+    - crates/ravel-mcp/src/tools/mod.rs::tests::dispatch_routes_every_catalog_name_and_refuses_unknown_names
+  status: verified
+  note: "SERVED_TOOLS holds ravel_capabilities alone; dispatch answers the other eight catalog names with ToolError::NotShipped, and the bound test pins the list against dispatch."
+
+- id: agents-mcp-ships
+  doc: docs/guides/agents.md
+  quote: "The tools ship behind the `mcp` cargo feature and the `--mcp` flag, both off by default."
+  kind: positive
+  binds:
+    - services/ravel-server/src/mcp/adapter.rs::MCP_PATH
+    - crates/ravel-mcp/src/tools/mod.rs::dispatch
+  status: verified
+  note: "Replaced the banner saying the POST /mcp route does not exist until the feature ships."
+
+- id: agents-mcp-one-tool-served
+  doc: docs/guides/agents.md
+  quote: "One tool is served today, `ravel_capabilities`."
+  kind: positive
+  binds:
+    - crates/ravel-mcp/src/tools/mod.rs::SERVED_TOOLS
+    - crates/ravel-mcp/src/tools/mod.rs::ToolError
+    - crates/ravel-mcp/src/tools/mod.rs::tests::dispatch_routes_every_catalog_name_and_refuses_unknown_names
+  status: verified
+  note: "The other eight catalog names answer ToolError::NotShipped, which the adapter renders as the method_not_found protocol error the banner names."
+
+- id: progress-audit-pipeline-installed
+  doc: PROGRESS.md
+  quote: "now spawns a real `ravel_maintain::AuditPipeline` and wires every query surface's audit sink to it under `--mode all` and `--mode query`"
+  kind: positive
+  binds:
+    - crates/ravel-maintain/src/audit_pipeline.rs::AuditPipeline
+    - services/ravel-server/src/config.rs::Mode::installs_query_audit_pipeline
+  status: verified
+  note: "Replaced the paragraph saying nothing constructs the real pipeline. services/ravel-server/src/lib.rs start spawns the pipeline when Mode::installs_query_audit_pipeline holds."
+
+- id: progress-audit-required-fails-closed
+  doc: PROGRESS.md
+  quote: "`audit_mode=required` (the default) does fail closed"
+  kind: positive
+  binds:
+    - crates/ravel-maintain/src/audit_pipeline.rs::tests::every_submit_in_a_failed_batch_errors_in_required_mode
+  status: verified
+  note: "The bound test fails every submit of a batch whose flush failed under AuditMode::Required."
+
+- id: query-engine-stamp-write-side
+  doc: docs/query-engine.md
+  quote: "The logs flush stamps each commit record"
+  kind: positive
+  binds:
+    - crates/ravel-ingest/src/log_shard.rs::run_flush
+    - crates/ravel-ingest/src/log_declared_stats.rs::build_stamps
+    - crates/ravel-maintain/src/rlog.rs::finalize_part
+    - crates/ravel-commit/src/declared_stats.rs::stamp_commit_record
+    - crates/ravel-commit/src/declared_stats.rs::stamp_compaction_part
+  status: verified
+  note: "run_flush calls stamp_commit_record with the stamps build_stamps returns when the tenant declares columns; finalize_part calls stamp_compaction_part with real stamps. The span compaction codec, the RSEG part builder and the logs erasure rewrite (erasure_rewrite.rs) stamp an empty list, compaction stamps only the columns its inputs carry stamps for, and the metrics and span flushes call neither. Corrected by #2082."
+
+# --- NEGATIVE marker lines -------------------------------------------------
+
+- id: architecture-ravelql-sigma-absent
+  doc: docs/architecture.md
+  quote: "Two capabilities that the decision records discuss do not exist in the shipped system: RavelQL, and Sigma or OCSF rule ingestion."
+  kind: negative
+  binds: []
+  status: not-implemented
+  note: "No crate or source file names RavelQL, Sigma rules or OCSF (the only 'sigma' hit is a MAD-to-sigma constant in ravel-analytics). No would-be symbol to bind."
+
+- id: logseg-gram-idx-reserved
+  doc: docs/log-segment-format.md
+  quote: "reserved (ADR-0105, not implemented)"
+  kind: negative
+  binds:
+    - crates/ravel-logseg/src/footer.rs::kind::GRAM_IDX
+  status: not-implemented
+  note: "footer.rs kind reserves 7 in a comment only; a GRAM_IDX constant arriving there fails this entry."
+
+- id: object-store-multipart-visibility-probe
+  doc: docs/object-store-contract.md
+  quote: "multipart-complete visibility is still not implemented."
+  kind: negative
+  binds: []
+  status: not-implemented
+  note: "conformance.rs Property has no multipart-complete visibility variant. Enum variants are not definitions under the BIND resolver, so there is no symbol this entry could bind to trip STATUS when one lands."
+
+- id: otap-flag-absent-without-feature
+  doc: docs/otap-ingest.md
+  quote: "the flag does not exist in a build without the feature"
+  kind: negative
+  binds:
+    - services/ravel-server/src/config.rs::Cli
+    - services/ravel-server/src/config.rs::otap_flag_defaults_off_and_parses_when_present
+  status: verified
+  note: "Cli's otap field sits under cfg(feature = \"otap\"), as does the bound flag test."
+
+- id: ingest-per-tenant-metrics-future
+  doc: docs/ingest.md
+  quote: "Still tracked future work (not yet implemented): a per-tenant dimensioned model and per-shard latency histograms"
+  kind: negative
+  binds: []
+  status: not-implemented
+  note: "Ingest metrics are flat atomics and per-shard maps; no dimensioned per-tenant model exists to bind."
+
+- id: guide-query-limitk-not-implemented
+  doc: docs/guides/query.md
+  quote: "they are outside the stable language and out of the scored surface, and not implemented"
+  kind: negative
+  binds:
+    - crates/ravel-promql/src/aggregate.rs::limitk_and_limit_ratio_reject_without_panicking
+  status: verified
+  note: "limitk and limit_ratio are rejected with a typed error naming the operator; the bound test pins the rejection."
+
+- id: kubernetes-deployments-not-yet-created
+  doc: docs/guides/kubernetes.md
+  quote: "so there is no crash-loop to observe: the Deployments do not exist yet."
+  kind: not-a-claim
+  binds: []
+  status: verified
+  note: "Describes cluster state while the qualification Job runs, not an absent capability."
+
+- id: ingest-affinity-mtls-not-available
+  doc: docs/guides/ingest-affinity.md
+  quote: "mTLS resolution is not available at any layer"
+  kind: negative
+  binds:
+    - services/ravel-ingest-router/src/config.rs::into_config
+    - services/ravel-ingest-router/src/config.rs::mtls_enabled_is_refused_on_the_ingest_router
+  status: verified
+  note: "into_config refuses --mtls-enabled outright; the bound test pins the refusal."
+
+- id: caching-root-created-owner-only
+  doc: docs/guides/caching.md
+  quote: "a root that does not exist yet is created owner-only along with any missing ancestor of it."
+  kind: positive
+  binds:
+    - crates/ravel-cache/src/disk.rs::create_entry_dir
+  status: verified
+  note: "The marker phrase is about a directory, but the sentence is a positive claim: create_entry_dir uses a recursive DirBuilder with mode 0o700."
+
+- id: query-engine-provider-budgets-follow-up
+  doc: docs/query-engine.md
+  quote: "is tracked as follow-up work and is not implemented yet"
+  kind: negative
+  binds: []
+  status: not-implemented
+  note: "None of logs_provider, spans_provider, alerts_provider or audit_provider consults max_bytes_scanned; the distributed RLOG slice exec carries one defaulting to Unlimited because those providers have no per-query byte budget."
+
+- id: query-engine-limitk-not-implemented
+  doc: docs/query-engine.md
+  quote: "They stay out of the scored surface (they are not part of the stable language), and are not implemented;"
+  kind: negative
+  binds:
+    - crates/ravel-promql/src/aggregate.rs::limitk_and_limit_ratio_reject_without_panicking
+  status: verified
+  note: "Same rejection as guide-query-limitk-not-implemented."
+
+- id: query-engine-histogram-stddev-rejected
+  doc: docs/query-engine.md
+  quote: "`histogram_stddev` | function | intentionally rejected"
+  kind: negative
+  binds: []
+  status: not-implemented
+  note: "No histogram_stddev in ravel-promql's sources; the difftest conformance table declares the typed rejection."
+
+- id: query-engine-histogram-stdvar-rejected
+  doc: docs/query-engine.md
+  quote: "`histogram_stdvar` | function | intentionally rejected"
+  kind: negative
+  binds: []
+  status: not-implemented
+  note: "No histogram_stdvar in ravel-promql's sources."
+
+- id: query-engine-attrs-per-key-projection
+  doc: docs/query-engine.md
+  quote: "when the `AttrsPerKeyProjection` rule applies"
+  kind: positive
+  binds:
+    - crates/ravel-sql/src/attrs_per_key.rs::AttrsPerKeyProjection
+    - crates/ravel-sql/src/logs_scan.rs::reproject_attr_keys
+  status: verified
+  note: "Issue #1768 shipped AttrsPerKeyProjection, a physical optimizer rule session.rs installs on every session: a query that reads attrs only through literal subscripts, in a single-scan plan with no pending erasure, decodes only those keys' FIELD_DIR columns plus attrs_raw via LogsScanExec::reproject_attr_keys. Corrected by #2082."
+
+- id: troubleshooting-breaker-guarantee
+  doc: docs/guides/operations/troubleshooting.md
+  quote: "Relying on the breaker to hold a shard open until every record is back is relying on a guarantee that does not exist."
+  kind: not-a-claim
+  binds: []
+  status: verified
+  note: "Summarises the worked partial-restoration example above it; no capability is claimed absent."

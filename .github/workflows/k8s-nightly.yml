@@ -1,0 +1,279 @@
+name: k8s-nightly
+
+# The kind lane (k8s-build + k8s-integration) is expensive real CI minutes
+# (k8s-build alone budgets 55m) for a class of regression most PRs don't
+# touch, so ci.yml no longer runs it by default -- only on a PR carrying the
+# `run-k8s` label (see ci.yml's k8s-build/k8s-integration `if:` comments).
+# This workflow is the backstop: it runs the identical two-job pipeline
+# nightly against main, so a k8s-affecting regression that lands via an
+# unlabeled PR is still caught within a day, not only when someone happens to
+# add the label.
+#
+# The job bodies here are a deliberate copy of ci.yml's k8s-build and
+# k8s-integration, not a shared/reusable-workflow indirection: a reusable
+# workflow call changes the check name GitHub reports for the job (from
+# `k8s-build` to `<caller-job>/k8s-build`), which risks silently breaking
+# branch-protection required-status-check names configured against the
+# existing bare names. Copying avoids that risk at the cost of needing the
+# two files kept in sync by hand. If you change the steps in one, mirror the
+# change in the other; a diff between this file's two jobs and ci.yml's is
+# the way to check they haven't drifted.
+on:
+  schedule:
+    # 03:00 UTC daily -- outside the working hours these jobs' authors keep,
+    # so a nightly failure is triaged fresh rather than mid-review-cycle.
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: k8s-nightly
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Workflow-level permissions floor (issue #1717). Every job here checks out the
+# tree and then runs cargo, which runs a dependency build script for each
+# crate in the graph with this token in the environment. `contents: read` is
+# all any of them needs; none files an issue, pushes a package or writes a
+# release. Every checkout carries `persist-credentials: false` for the same
+# reason from the other side: no job here runs git against the remote after
+# checking out, so the token must not sit in .git/config where that
+# build-script code could read it.
+permissions:
+  contents: read
+
+jobs:
+  # Mirrors ci.yml's k8s-build. See that job's own comments for the full
+  # rationale (ADR-0034 decision 7, ADR-0053 D5); this copy omits
+  # only the `needs: changes` / `if:` gating, since this workflow always runs
+  # the full pipeline against main rather than diffing a PR's changed paths.
+  k8s-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      RAVEL_SERVER_IMAGE: ravel-server:kind-ci
+      RAVEL_OPERATOR_IMAGE: ravel-operator:kind-ci
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Build the release binaries on the host
+        run: |
+          cargo build --release --locked -p ravel-server --features sql,flight-sql,otap
+          cargo build --release --locked -p ravel-cli
+          cargo build --release --locked -p ravel-operator
+      - name: Assemble both images from the prebuilt binaries
+        run: |
+          ctx=$(mktemp -d)
+          cp target/release/ravel-server target/release/ravel-cli target/release/ravel-operator "$ctx/"
+          docker build --file Dockerfile.prebuilt --target server \
+            --tag "$RAVEL_SERVER_IMAGE" "$ctx"
+          docker build --file Dockerfile.prebuilt --target operator \
+            --tag "$RAVEL_OPERATOR_IMAGE" "$ctx"
+          rm -rf "$ctx"
+      - name: Smoke-run both assembled images
+        run: |
+          docker run --rm "$RAVEL_SERVER_IMAGE" --help >/dev/null
+          docker run --rm "$RAVEL_OPERATOR_IMAGE" --help >/dev/null
+      - name: Save the assembled images
+        run: docker save -o k8s-images.tar "$RAVEL_SERVER_IMAGE" "$RAVEL_OPERATOR_IMAGE"
+      - name: Upload the assembled images
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: k8s-images-nightly
+          path: k8s-images.tar
+          retention-days: 1
+
+  # Mirrors ci.yml's k8s-integration. See that job's own comments for the full
+  # rationale; this copy needs only k8s-build (no `lint` fail-fast gate --
+  # this workflow runs no lint job of its own -- and no `changes` gate, since
+  # there is no PR diff to narrow against).
+  k8s-integration:
+    needs: k8s-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RAVEL_SERVER_IMAGE: ravel-server:kind-ci
+      RAVEL_OPERATOR_IMAGE: ravel-operator:kind-ci
+      RAVEL_KIND_CLUSTER: ravel-ci
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/free-disk-space
+      - name: Download the assembled images
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: k8s-images-nightly
+      - name: Load the assembled images into the docker daemon
+        run: docker load -i k8s-images.tar
+      - name: Install kubectl (pinned, retried)
+        run: |
+          version=v1.32.2
+          bin_dir="${RUNNER_TEMP}/kubectl-bin"
+          mkdir -p "$bin_dir"
+          for attempt in 1 2 3 4 5; do
+            if curl -fsSL --retry 3 -o /tmp/kubectl \
+                "https://dl.k8s.io/release/${version}/bin/linux/amd64/kubectl"; then
+              break
+            fi
+            echo "kubectl download attempt ${attempt} failed; retrying" >&2
+            sleep $((attempt * 5))
+            [ "$attempt" = 5 ] && { echo "::error::kubectl download failed after 5 attempts"; exit 1; }
+          done
+          chmod +x /tmp/kubectl
+          mv /tmp/kubectl "$bin_dir/kubectl"
+          "$bin_dir/kubectl" version --client
+      - name: Resolve the pinned kind node image
+        id: node-image
+        run: |
+          # shellcheck disable=SC2016  # the ${...} below is sed's pattern, not
+          # a shell expansion: it matches the script's default-value syntax.
+          image=$(sed -n 's/^NODE_IMAGE="\${RAVEL_KIND_NODE_IMAGE:-\(.*\)}"$/\1/p' \
+            scripts/kind-up.sh)
+          if [ -z "$image" ]; then
+            echo "::error::could not read the pinned node image from scripts/kind-up.sh"
+            exit 1
+          fi
+          echo "node image: $image"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+      - name: Create the kind cluster
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc
+        with:
+          version: v0.32.0
+          node_image: ${{ steps.node-image.outputs.image }}
+          cluster_name: ravel-ci
+          kubectl_version: v1.32.2
+          wait: 300s
+      - name: Prefer the retried kubectl over the action's own install
+        run: echo "${RUNNER_TEMP}/kubectl-bin" >> "$GITHUB_PATH"
+      - name: Bring up the kind environment
+        env:
+          RAVEL_SKIP_IMAGE_BUILD: "1"
+        run: |
+          if ! kind get clusters | grep -qx "$RAVEL_KIND_CLUSTER"; then
+            echo "::error::helm/kind-action did not create cluster $RAVEL_KIND_CLUSTER"
+            kind get clusters
+            exit 1
+          fi
+          scripts/kind-up.sh
+      - name: OTLP round trip through the gateway and query Services
+        run: scripts/kind-demo.sh
+      - name: Dump cluster diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide || true
+          kubectl describe pods -n ravel-system || true
+          kubectl get events -A --sort-by=.lastTimestamp || true
+          kubectl logs -n ravel-system -l app.kubernetes.io/name=ravel-operator \
+            --all-containers --tail=500 || true
+      - name: Delete the kind cluster
+        if: always()
+        run: scripts/kind-down.sh
+
+  # ADR-0077 section 4's process-kill chaos-evidence lane. Deliberately not part
+  # of ravel-sim and not run in PR CI (it needs a real object store, real
+  # binaries, a real multi-threaded runtime, a real clock, and a real
+  # `kill -9`); this nightly workflow is its home. Both scenarios carry the
+  # exit-code contract they declare themselves: scenario 1 exits 1 on a
+  # pinned-oracle failure, scenario 2 exits 2 on any pinned-oracle failure (a
+  # release-blocking bug, not a flaky test), and both exit 3 or more on a
+  # setup or usage error, with no oracle verdict. Each step names which of those it got in
+  # an error annotation, and a nonzero exit from either script fails this job.
+  # The helpers both scripts rest on are covered on every pull request by
+  # ci.yml's doc-scripts job (scripts/chaos/lib.test.sh).
+  chaos:
+    runs-on: ubuntu-latest
+    # Two release builds cold, then scenario 2's takeover budget (3 * H plus
+    # one maintenance tick, 8 minutes at the defaults) on top of scenario 1.
+    timeout-minutes: 60
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Build the real binaries the chaos scripts drive and put them on PATH, so
+      # `ravel_server_cmd`/`ravel_cli`/`chaos_gen_fixture` use the prebuilt
+      # binaries rather than a per-invocation `cargo run`, which would compile
+      # a second, debug-profile copy of the server.
+      - name: Build the release binaries the chaos lane drives
+        run: |
+          cargo build --release --locked -p ravel-server -p ravel-cli
+          cargo build --release --locked -p ravel-server --example gen_otlp_fixture
+      - name: Put the release binaries on PATH
+        run: |
+          echo "${GITHUB_WORKSPACE}/target/release" >> "$GITHUB_PATH"
+          echo "${GITHUB_WORKSPACE}/target/release/examples" >> "$GITHUB_PATH"
+      - name: Chaos-lane structure check
+        id: chaos-check
+        # Strict: on this runner every real-run tool must be present, so a
+        # missing one fails here rather than minutes into scenario 1.
+        env:
+          CHAOS_CHECK_STRICT: "1"
+        run: |
+          scripts/chaos/kill-ingest-flush.sh --check
+          scripts/chaos/kill-maintain-worker.sh --check
+      # Scenario 1: kill ingest mid-flush. The script brings up RustFS itself via
+      # docker compose, qualifies the store, drives strict-ack load, SIGKILLs the
+      # server mid-flush, restarts, and asserts the pinned oracle.
+      # Each scenario gets its own tenant, so its custody and catalog
+      # assertions are attributable to it. The store is also emptied per
+      # scenario, which is a separate requirement: see
+      # `assert_single_tenant_universe` in scripts/chaos/lib.sh.
+      - name: Chaos scenario 1 -- kill ingest mid-flush
+        env:
+          CHAOS_TENANT_NAME: chaos-ingest-flush
+          CHAOS_TENANT_TOKEN: chaos-token-ingest-flush
+        run: |
+          code=0
+          scripts/chaos/kill-ingest-flush.sh || code=$?
+          case "$code" in
+            0) ;;
+            1) echo "::error::chaos scenario 1 (kill ingest mid-flush) pinned-oracle failure (exit 1); see the ORACLE SUMMARY block" ;;
+            *) echo "::error::chaos scenario 1 setup or usage error (exit ${code}); no oracle verdict" ;;
+          esac
+          exit "$code"
+      # Scenario 2: kill a maintain worker mid-compaction, sibling running.
+      # RELEASE-BLOCKING (ADR-0077 section 4): exit 2 on any oracle failure.
+      # It runs even when scenario 1 failed, since the two share no state (the
+      # store is emptied per scenario) and a release-blocking result must not
+      # hide behind an unrelated earlier failure. It still needs the build and
+      # the structure check to have passed.
+      - name: Chaos scenario 2 -- kill maintain worker mid-compaction
+        if: (success() || failure()) && steps.chaos-check.outcome == 'success'
+        env:
+          CHAOS_TENANT_NAME: chaos-maintain-worker
+          CHAOS_TENANT_TOKEN: chaos-token-maintain-worker
+        run: |
+          code=0
+          scripts/chaos/kill-maintain-worker.sh || code=$?
+          case "$code" in
+            0) ;;
+            1) echo "::error::chaos scenario 2 unexpected exit 1 (a setup failure outside the ERR trap); no oracle verdict" ;;
+            2) echo "::error::RELEASE-BLOCKING: chaos scenario 2 pinned-oracle failure (exit 2, ADR-0077 section 4)" ;;
+            *) echo "::error::chaos scenario 2 setup or usage error (exit ${code}); no oracle verdict" ;;
+          esac
+          exit "$code"
+      - name: Dump RustFS logs on failure
+        if: failure()
+        run: docker compose -f deploy/docker-compose/rustfs.yml logs --no-color || true
+      - name: Tear down RustFS
+        if: always()
+        run: docker compose -f deploy/docker-compose/rustfs.yml down -v || true

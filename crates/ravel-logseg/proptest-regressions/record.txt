@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 411d7589a9f216206267a84d3df4c6e07d09be1d1ba10dbb799ef2a966404510 # shrinks to resource = [], scope_name = "", scope_version = "", scope_attrs = [("a", Map([("o", Str("")), ("a", Str(""))]))]
