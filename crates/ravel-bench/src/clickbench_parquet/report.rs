@@ -1126,6 +1126,7 @@ mod tests {
             concurrency: Some(ConcurrencyFigures {
                 tasks: 10,
                 duration_s: 600.0,
+                elapsed_s: 600.0,
                 queries_completed: 600,
                 errors: 6,
                 qps: 1.0,

@@ -304,11 +304,13 @@ async fn measure(
         {
             Ok(figures) => {
                 eprintln!(
-                    "concurrency: {} tasks, {} completed, {} errors, qps={}, error_ratio={}, \
-                     unregistered_error_ratio={}",
+                    "concurrency: {} tasks, {} completed, {} errors in {} s (configured {} s), \
+                     qps={}, error_ratio={}, unregistered_error_ratio={}",
                     figures.tasks,
                     figures.queries_completed,
                     figures.errors,
+                    figures.elapsed_s,
+                    figures.duration_s,
                     figures.qps,
                     figures.error_ratio,
                     figures.unregistered_error_ratio
