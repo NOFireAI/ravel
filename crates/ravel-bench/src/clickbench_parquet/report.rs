@@ -652,8 +652,15 @@ pub enum Violation {
     ColdOverArmB { cold_sum_s: f64, limit_s: f64 },
     #[error("concurrency phase ran {qps} queries per second, under the floor {floor}")]
     ConcurrencyQpsBelowFloor { qps: f64, floor: f64 },
-    #[error("concurrency phase error ratio {error_ratio} is over the ceiling {ceiling}")]
-    ConcurrencyErrorRatioOverCeiling { error_ratio: f64, ceiling: f64 },
+    #[error(
+        "concurrency phase error ratio outside the registered failures \
+         {unregistered_error_ratio} is over the ceiling {ceiling} (all errors: {error_ratio})"
+    )]
+    ConcurrencyErrorRatioOverCeiling {
+        unregistered_error_ratio: f64,
+        error_ratio: f64,
+        ceiling: f64,
+    },
     #[error("q{number} errored {errors} times in the concurrency phase and is not pre-registered")]
     ConcurrencyUnregisteredError { number: u32, errors: u64 },
     #[error("the declared verdicts could not be derived from suite.toml: {error}")]
@@ -819,8 +826,14 @@ fn check_against(
                 floor: prereg.concurrency_qps_floor,
             });
         }
-        if concurrency.error_ratio > prereg.concurrency_error_ratio_ceiling {
+        // Judged on the per-statement counts, not the stored figure, and
+        // without the registered failures: the phase cycles every statement,
+        // so five registered failures failing as predicted alone make the raw
+        // ratio 5/43, over the ceiling (issue #2055).
+        let unregistered_error_ratio = concurrency.error_ratio_outside(&prereg.failures);
+        if unregistered_error_ratio > prereg.concurrency_error_ratio_ceiling {
             violations.push(Violation::ConcurrencyErrorRatioOverCeiling {
+                unregistered_error_ratio,
                 error_ratio: concurrency.error_ratio,
                 ceiling: prereg.concurrency_error_ratio_ceiling,
             });
@@ -1106,6 +1119,7 @@ mod tests {
                 errors: 6,
                 qps: 1.0,
                 error_ratio: 0.01,
+                unregistered_error_ratio: 0.0,
                 statements: (1..=STATEMENT_COUNT as u32)
                     .map(|number| ConcurrencyStatement {
                         number,
@@ -1371,16 +1385,84 @@ mod tests {
         );
     }
 
-    #[test]
-    fn concurrency_over_the_error_ratio_ceiling_is_named() {
-        let mut report = clean_report();
-        report.concurrency.as_mut().expect("ran").error_ratio = 0.102;
-        assert_eq!(
-            only_violation(&report),
-            Violation::ConcurrencyErrorRatioOverCeiling {
-                error_ratio: 0.102,
-                ceiling: 0.101
+    /// A phase in which every statement ran 14 times and the five
+    /// pre-registered failures errored on every run, so the raw error ratio
+    /// is exactly 5/43.
+    fn registered_failures_always_error(report: &mut ClickBenchParquetReport) {
+        let failures = prereg().failures;
+        let concurrency = report.concurrency.as_mut().expect("ran");
+        for statement in &mut concurrency.statements {
+            if failures.contains(&statement.number) {
+                statement.completed = 0;
+                statement.errors = 14;
+                statement.p50_s = None;
+                statement.p95_s = None;
+                statement.first_error = Some("budget".to_string());
+            } else {
+                statement.completed = 14;
+                statement.errors = 0;
+                statement.first_error = None;
             }
+        }
+        concurrency.queries_completed = 38 * 14;
+        concurrency.errors = 5 * 14;
+        concurrency.error_ratio = 70.0 / 602.0;
+        concurrency.errored_statements = failures.iter().copied().collect();
+    }
+
+    #[test]
+    fn registered_failures_erroring_at_five_in_forty_three_pass() {
+        let mut report = clean_report();
+        registered_failures_always_error(&mut report);
+        let concurrency = report.concurrency.as_ref().expect("ran");
+        assert_eq!(
+            concurrency.error_ratio.to_bits(),
+            (5.0f64 / 43.0).to_bits(),
+            "the raw ratio is 5/43"
+        );
+        assert!(concurrency.error_ratio > prereg().concurrency_error_ratio_ceiling);
+        assert_eq!(check(&report, &prereg()), Ok(()));
+    }
+
+    #[test]
+    fn an_unregistered_error_ratio_over_the_ceiling_is_named() {
+        // On top of the registered failures, q8 errors on all 60 of its
+        // runs: 60 errors over 37 * 14 + 60 = 578 unregistered runs, about
+        // 0.104, while the raw ratio is 130 over 648.
+        let mut report = clean_report();
+        registered_failures_always_error(&mut report);
+        let concurrency = report.concurrency.as_mut().expect("ran");
+        let q8 = concurrency
+            .statements
+            .iter_mut()
+            .find(|s| s.number == 8)
+            .expect("q8");
+        q8.completed = 0;
+        q8.errors = 60;
+        concurrency.queries_completed = 37 * 14;
+        concurrency.errors = 130;
+        concurrency.error_ratio = 130.0 / 648.0;
+        concurrency.unregistered_error_ratio = 60.0 / 578.0;
+        concurrency.errored_statements = vec![8, 19, 29, 33, 34, 35];
+        let violations = check(&report, &prereg()).expect_err("over the ceiling");
+        assert_eq!(
+            violations,
+            vec![
+                Violation::ConcurrencyErrorRatioOverCeiling {
+                    unregistered_error_ratio: 60.0 / 578.0,
+                    error_ratio: 130.0 / 648.0,
+                    ceiling: 0.101
+                },
+                Violation::ConcurrencyUnregisteredError {
+                    number: 8,
+                    errors: 60
+                },
+            ]
+        );
+        let message = violations[0].to_string();
+        assert!(
+            message.contains(&(130.0f64 / 648.0).to_string()),
+            "the raw ratio is reported: {message}"
         );
     }
 
