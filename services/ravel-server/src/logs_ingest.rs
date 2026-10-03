@@ -3,19 +3,19 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse,
 };
-use ravel_commit::keys::ingest_hour_string;
 use ravel_ingest::{
     AdmissionController, IdempotencyReceipt, LogIngestRouter, LogWriteError, LookupOutcome,
-    MARKER_SUFFIX, RequestRejection, WriteMode, marker_key, plausible_ingest_clock, read_marker,
+    MarkerLookupError, RequestRejection, WriteMode, plausible_ingest_clock, read_marker,
     write_marker,
 };
 use ravel_maintain::config::DEFAULT_IDEM_DEDUP_WINDOW_HOURS;
-use ravel_object_store::{ObjectStoreBackend, StoreError};
+use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::{LogIngestLimits, LogRejection, NormalizeRejectCounts, normalize_logs};
 use ravel_types::logstream::LogStreamId;
 use ravel_types::{CommitToken, Signal, TenantId};
@@ -132,24 +132,48 @@ impl LogIngestRequestError {
     }
 }
 
-/// The message a keyed write fails with when its marker lookup hits a store
-/// error (`read_marker` maps `NotFound` to a miss, so this is never absence).
-/// Names the refused request: the LIST of the key's marker prefix, the
-/// prefix being the marker key without its `<ingest_hour>.idm` tail.
-pub(crate) fn marker_lookup_failure(
-    tenant: &TenantId,
-    signal: Signal,
-    key: &[u8],
-    bucket: u32,
-    err: &StoreError,
-) -> String {
-    let marker = marker_key(tenant, signal, key, bucket);
-    let tail = format!("{}.{MARKER_SUFFIX}", ingest_hour_string(bucket));
-    let prefix = marker.strip_suffix(&tail).unwrap_or(&marker);
-    format!(
-        "idempotency marker lookup (LIST {prefix}) failed: {err}; nothing was written, \
-         the request is safe to retry"
-    )
+/// The client-facing message of a keyed write refused because its marker
+/// lookup failed. It carries no key, tenant hash or store error text; those
+/// go to the server-side log [`marker_lookup_failure`] writes.
+pub(crate) const MARKER_LOOKUP_FAILED_MESSAGE: &str = "idempotency marker lookup failed; the \
+     write was not accepted and is safe to retry";
+
+/// Keyed writes refused because a marker lookup probe failed with a store
+/// error, logs then spans, rendered as
+/// `ravel_ingest_idempotency_lookup_failures_total`. Process-global with a
+/// single source per signal, like [`crate::provisioning::shard_count_mismatch_count`].
+static IDEMPOTENCY_LOOKUP_FAILURES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+fn idempotency_lookup_failure_slot(signal: Signal) -> Option<&'static AtomicU64> {
+    match signal {
+        Signal::Logs => Some(&IDEMPOTENCY_LOOKUP_FAILURES[0]),
+        Signal::Spans => Some(&IDEMPOTENCY_LOOKUP_FAILURES[1]),
+        _ => None,
+    }
+}
+
+/// The lookup-failure count for `signal`, for the `/metrics` renderer. Zero
+/// for a signal that writes no markers.
+pub(crate) fn idempotency_lookup_failures(signal: Signal) -> u64 {
+    idempotency_lookup_failure_slot(signal).map_or(0, |slot| slot.load(Ordering::Relaxed))
+}
+
+/// Record a keyed write refused because its marker lookup failed
+/// (`read_marker` maps `NotFound` to a miss, so this is never absence): log
+/// the failed GET, its key and the store error at WARN, count it, and return
+/// the client-facing message, which names none of them.
+pub(crate) fn marker_lookup_failure(signal: Signal, err: &MarkerLookupError) -> String {
+    tracing::warn!(
+        signal = signal.key_prefix(),
+        request = "GET",
+        key = %err.key,
+        error = %err.source,
+        "idempotency marker lookup failed; refusing the keyed write"
+    );
+    if let Some(slot) = idempotency_lookup_failure_slot(signal) {
+        slot.fetch_add(1, Ordering::Relaxed);
+    }
+    MARKER_LOOKUP_FAILED_MESSAGE.to_string()
 }
 
 /// Upper bound on the assembled `error_message` byte length, the same cap and
@@ -241,11 +265,12 @@ pub async fn handle_export_logs(
             }
             // A store error on the lookup fails the write closed: writing
             // anyway would store a duplicate whenever the marker exists and
-            // the lookup could not see it. Nothing is written yet, so the
-            // retryable error is safe for the client to retry.
+            // the lookup could not see it. The request's own data is not
+            // written yet, so the retryable error is safe for the client to
+            // retry.
             Err(err) => {
                 return Err(LogIngestRequestError::Write(LogWriteError::Abandoned(
-                    marker_lookup_failure(&tenant, Signal::Logs, key, bucket, &err),
+                    marker_lookup_failure(Signal::Logs, &err),
                 )));
             }
         }
@@ -463,6 +488,10 @@ mod tests {
     use ravel_object_store::ObjectStoreBackend;
     use ravel_object_store::memory::MemoryStore;
 
+    use crate::logs_ingest::marker_lookup_test_support::{
+        LookupFailureWarning, LookupFailureWarnings, STORE_ERROR_TEXT, marker_get_refusals,
+        marker_probe_store, put_count,
+    };
     use crate::normalize_reject_metrics::NormalizeRejectMetrics;
 
     /// Fixed post-floor fixture base, 2026-01-01T00:00:00Z in nanoseconds
@@ -1211,60 +1240,30 @@ mod tests {
         );
     }
 
-    /// More passthrough steps than any one test's PUTs, so the `Op::Put`
-    /// sequence's progress is the exact PUT count.
-    const PUT_COUNTER_STEPS: usize = 256;
-
-    /// A store that counts every PUT (sequence 0) and, when
-    /// `refuse_marker_list` is set, refuses every LIST under an `idem/`
-    /// prefix the way S3 refuses a ListBucket the policy does not grant.
-    fn marker_list_store(
-        refuse_marker_list: bool,
-    ) -> Arc<ravel_object_store::fault::FaultStore<MemoryStore>> {
-        use ravel_object_store::fault::{
-            FaultPlan, FaultStore, Op, Rule, ScriptedFault, Sequence, SequenceStep,
-        };
-        let mut plan = FaultPlan::empty().with_sequence(
-            Sequence::new(Op::Put).with_steps(vec![SequenceStep::Passthrough; PUT_COUNTER_STEPS]),
-        );
-        if refuse_marker_list {
-            plan = plan.with_rule(
-                Rule::new(
-                    Op::List,
-                    ScriptedFault::Permanent("AccessDenied: s3:ListBucket".into()),
-                )
-                .with_key_contains("/idem/"),
-            );
-        }
-        Arc::new(FaultStore::new(MemoryStore::new(), plan))
-    }
-
-    fn put_count(store: &ravel_object_store::fault::FaultStore<MemoryStore>) -> u64 {
-        let puts = store.sequence_progress(0);
-        assert!(
-            (puts as usize) < PUT_COUNTER_STEPS,
-            "the PUT counter saturated at {puts}"
-        );
-        puts
-    }
-
-    fn marker_list_refusals(store: &ravel_object_store::fault::FaultStore<MemoryStore>) -> u64 {
-        use ravel_object_store::fault::{FaultKind, Op};
-        store.fault_count(Op::List, FaultKind::Permanent)
-    }
-
-    /// Issue #2462: a keyed write whose marker lookup the store refuses fails
-    /// with the retryable `Abandoned` error, names the refused LIST, and
-    /// writes nothing.
+    /// Issue #2462: a keyed write whose marker probe the store refuses fails
+    /// with the retryable `Abandoned` error before any of its data is written.
+    /// The client-facing message names no key, tenant hash, LIST or store
+    /// error; the failed GET, its key and the store error go to one WARN line
+    /// and one count of `ravel_ingest_idempotency_lookup_failures_total`.
     ///
-    /// Non-vacuity: restoring the old `Err(err) => { tracing::warn!(..) }` arm
-    /// in `handle_export_logs` makes the write succeed, so `expect_err` fails.
+    /// Non-vacuity: restoring a log-and-write arm for `Err(err)` in
+    /// `handle_export_logs` makes the write succeed, so `expect_err` fails;
+    /// passing the store error into the message fails the
+    /// `STORE_ERROR_TEXT` check; dropping the `tracing::warn!` or the
+    /// `fetch_add` in `marker_lookup_failure` fails the capture or the counter
+    /// check.
     #[tokio::test]
     async fn keyed_write_whose_marker_lookup_is_refused_fails_retryable_and_writes_nothing() {
-        let store = marker_list_store(true);
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let store = marker_probe_store(true);
         let state = state_with_store(1, store.clone());
         let tenant = TenantId::new("acme");
         let key = b"idem-2462".to_vec();
+        let warnings = LookupFailureWarnings::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(warnings.clone()));
+        let failures_before = idempotency_lookup_failures(Signal::Logs);
 
         let err = handle_export_logs(
             &state,
@@ -1281,24 +1280,52 @@ mod tests {
             panic!("expected the retryable Abandoned write error, got {err:?}");
         };
         assert!(err.is_retryable(), "{err:?} must be retryable");
-        let prefix = format!(
-            "t/{}/l/idem/{}.",
-            tenant.hash().to_hex(),
-            ravel_ingest::keyhash32(&tenant, &key)
+        assert_eq!(message, MARKER_LOOKUP_FAILED_MESSAGE);
+        let bucket = request_ingest_hour_bucket(BASE_TS_NS).expect("valid ingest ts");
+        let first_probe = ravel_ingest::marker_key(
+            &tenant,
+            Signal::Logs,
+            &key,
+            bucket + ravel_ingest::IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS,
         );
-        assert!(
-            message.contains(&format!("LIST {prefix})")) && message.contains("AccessDenied"),
-            "the error must name the refused LIST of {prefix:?} and the store error: {message}"
-        );
-        assert_eq!(marker_list_refusals(&store), 1, "the LIST fault must fire");
+        let client_text = err.to_string();
+        for forbidden in [
+            first_probe.as_str(),
+            &tenant.hash().to_hex(),
+            &ravel_ingest::keyhash32(&tenant, &key),
+            "LIST",
+            STORE_ERROR_TEXT,
+        ] {
+            assert!(
+                !client_text.contains(forbidden),
+                "the client-facing message must not carry {forbidden:?}: {client_text}"
+            );
+        }
+
+        assert_eq!(marker_get_refusals(&store), 1, "the GET fault must fire");
         assert_eq!(put_count(&store), 0, "a refused lookup must write nothing");
+        assert_eq!(
+            warnings.0.lock().as_slice(),
+            &[LookupFailureWarning {
+                signal: "l".to_string(),
+                request: "GET".to_string(),
+                key: first_probe,
+                error: format!("permanent error: {STORE_ERROR_TEXT}"),
+            }],
+            "exactly one WARN line, naming the GET, its key and the store error"
+        );
+        assert_eq!(
+            idempotency_lookup_failures(Signal::Logs) - failures_before,
+            1,
+            "the lookup failure must be counted exactly once"
+        );
     }
 
     /// The same refusal does not touch a request without a key: it never
     /// looks a marker up, so it writes as before.
     #[tokio::test]
-    async fn unkeyed_write_is_unaffected_by_a_refused_marker_listing() {
-        let store = marker_list_store(true);
+    async fn unkeyed_write_is_unaffected_by_a_refused_marker_probe() {
+        let store = marker_probe_store(true);
         let state = state_with_store(1, store.clone());
 
         let outcome = handle_export_logs(
@@ -1310,10 +1337,10 @@ mod tests {
             None,
         )
         .await
-        .expect("an unkeyed write never lists a marker prefix");
+        .expect("an unkeyed write never probes a marker");
 
         assert_eq!(outcome.tokens.len(), 1);
-        assert_eq!(marker_list_refusals(&store), 0);
+        assert_eq!(marker_get_refusals(&store), 0);
         assert!(
             put_count(&store) > 0,
             "the unkeyed write must store its data"
@@ -1324,7 +1351,7 @@ mod tests {
     /// and then its marker: absence is a miss, not a store error.
     #[tokio::test]
     async fn keyed_write_whose_marker_lookup_finds_nothing_still_writes() {
-        let store = marker_list_store(false);
+        let store = marker_probe_store(false);
         let state = state_with_store(1, store.clone());
         let tenant = TenantId::new("acme");
         let key = b"idem-2462".to_vec();
@@ -1358,5 +1385,115 @@ mod tests {
             matches!(lookup, LookupOutcome::Hit(_)),
             "the write must leave its marker, got {lookup:?}"
         );
+    }
+}
+
+/// Fixtures the logs and traces ingest tests share for a keyed write whose
+/// marker lookup fails.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(crate) mod marker_lookup_test_support {
+    use std::sync::Arc;
+
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault, Sequence, SequenceStep,
+    };
+    use ravel_object_store::memory::MemoryStore;
+
+    /// The store error a refused marker GET carries. The client-facing message
+    /// must not repeat it.
+    pub(crate) const STORE_ERROR_TEXT: &str = "AccessDenied: injected refusal of the marker GET";
+
+    /// More passthrough steps than any one test's PUTs, so the `Op::Put`
+    /// sequence's progress is the exact PUT count.
+    const PUT_COUNTER_STEPS: usize = 256;
+
+    /// A store that counts every PUT (sequence 0) and, when
+    /// `refuse_marker_get` is set, refuses every GET of a key under an `idem/`
+    /// directory the way S3 refuses a GetObject the policy does not grant.
+    pub(crate) fn marker_probe_store(refuse_marker_get: bool) -> Arc<FaultStore<MemoryStore>> {
+        let mut plan = FaultPlan::empty().with_sequence(
+            Sequence::new(Op::Put).with_steps(vec![SequenceStep::Passthrough; PUT_COUNTER_STEPS]),
+        );
+        if refuse_marker_get {
+            plan = plan.with_rule(
+                Rule::new(Op::Get, ScriptedFault::Permanent(STORE_ERROR_TEXT.into()))
+                    .with_key_contains("/idem/"),
+            );
+        }
+        Arc::new(FaultStore::new(MemoryStore::new(), plan))
+    }
+
+    pub(crate) fn put_count(store: &FaultStore<MemoryStore>) -> u64 {
+        let puts = store.sequence_progress(0);
+        assert!(
+            (puts as usize) < PUT_COUNTER_STEPS,
+            "the PUT counter saturated at {puts}"
+        );
+        puts
+    }
+
+    pub(crate) fn marker_get_refusals(store: &FaultStore<MemoryStore>) -> u64 {
+        store.fault_count(Op::Get, FaultKind::Permanent)
+    }
+
+    /// The fields of one WARN event that `marker_lookup_failure` writes.
+    #[derive(Debug, Default, Clone, PartialEq, Eq)]
+    pub(crate) struct LookupFailureWarning {
+        pub(crate) signal: String,
+        pub(crate) request: String,
+        pub(crate) key: String,
+        pub(crate) error: String,
+    }
+
+    /// Records every WARN event whose message is the marker lookup failure.
+    #[derive(Default, Clone)]
+    pub(crate) struct LookupFailureWarnings(
+        pub(crate) Arc<parking_lot::Mutex<Vec<LookupFailureWarning>>>,
+    );
+
+    impl<S> tracing_subscriber::Layer<S> for LookupFailureWarnings
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            #[derive(Default)]
+            struct Visitor {
+                message: String,
+                fields: LookupFailureWarning,
+            }
+            impl tracing::field::Visit for Visitor {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.record_debug(field, &value);
+                }
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    let text = format!("{value:?}").trim_matches('"').to_string();
+                    match field.name() {
+                        "message" => self.message = text,
+                        "signal" => self.fields.signal = text,
+                        "request" => self.fields.request = text,
+                        "key" => self.fields.key = text,
+                        "error" => self.fields.error = text,
+                        _ => {}
+                    }
+                }
+            }
+            let mut visitor = Visitor::default();
+            event.record(&mut visitor);
+            if visitor.message == "idempotency marker lookup failed; refusing the keyed write" {
+                self.0.lock().push(visitor.fields);
+            }
+        }
     }
 }
