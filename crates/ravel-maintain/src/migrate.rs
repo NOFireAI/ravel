@@ -86,11 +86,16 @@ use ravel_proto::commit::v1::{CompactionRecord, RewriteRecord};
 use ravel_types::{Signal, TenantHash};
 
 use crate::bucket::Bucket;
+use crate::claim_guard::{Checkpoint, ClaimSkipReason};
 use crate::clock::Clock;
 use crate::config::CompactorConfig;
 use crate::error::{MaintainError, Result};
+use crate::publish::PublishOutcome;
 use crate::read::{BucketListing, list_bucket, load_inputs};
-use crate::rewrite::{MigrateOutcome, migrate_bucket_format};
+use crate::rewrite::{
+    MigrateOutcome, ReencodeOutcome, current_part_version, migrate_bucket_format,
+    reencode_compaction_parts,
+};
 use crate::sweep::superseded_input_commit_keys;
 
 /// One-byte version tag on the advisory migrate-cursor payload. As with
@@ -102,10 +107,16 @@ const MIGRATE_CURSOR_TAG: u8 = 1;
 /// Length of a well-formed cursor payload: tag + shard (u32 LE) + hour (u32 LE).
 const MIGRATE_CURSOR_LEN: usize = 9;
 
-/// The per-invocation work budget for [`migrate_family`], counted in L0 records
-/// migrated. A budget bounds how much one invocation does before persisting its
-/// cursor and returning control, so a large migration runs across many
-/// invocations without a lock or a long-lived process.
+/// The per-invocation work budget for [`migrate_family`], counted in L0 records:
+/// those an L0 migration rewrote, and the inputs a re-encoded compaction record
+/// names, for every rewrite that built its parts and then published, converged,
+/// abandoned at its deadline, or stopped at a changed record set. A budget bounds how much one invocation does before
+/// persisting its cursor and returning control, so a large migration runs
+/// across many invocations without a lock or a long-lived process. It does not
+/// bound request cost: the walk reads the compaction and rewrite records of
+/// every sealed, untombstoned bucket it passes, one with no L0 commit record
+/// included, and a
+/// [`FamilyMigrateReport::reencode_blocked`] bucket spends no budget.
 ///
 /// Because the underlying rewrite is bucket-atomic, the budget is a soft cap: an
 /// invocation always finishes the bucket it is in the middle of (it never
@@ -222,19 +233,91 @@ pub struct BlockedBucket {
     pub reason: BlockedReason,
 }
 
+/// Why the walk did not re-encode a bucket whose authoritative compaction
+/// records hold parts below the target (ADR-0066 force 2). Re-running `migrate`
+/// reports the same bucket again; what clears each one is on the variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReencodeBlockedReason {
+    /// The bucket is the case force 2 exists for: one compaction record
+    /// survives supersession and `below_target` of its parts are below the
+    /// target. The re-encode is available but
+    /// [`CompactorConfig::reencode_writer_enabled`] is off, so nothing was
+    /// written. Turning the switch on clears it, subject to the force 2
+    /// amendment's rollout rule (item 8).
+    WriterDisabled { below_target: usize },
+    /// An overlap component of the bucket holds `largest_component` compaction
+    /// records once the records a version 2 record supersedes are set aside, so
+    /// the bucket is not re-encoded (force 2 amendment, item 4). Only retention
+    /// clears it, subject to the ADR-0066 #530 version hold.
+    ContestedOverlap { largest_component: usize },
+    /// `records` compaction records survive supersession, each alone in its own
+    /// overlap component, and the re-encode rewrites a bucket's one record
+    /// only. Only retention clears it, subject to the ADR-0066 #530 version
+    /// hold.
+    MultipleRecords { records: usize },
+}
+
+/// One bucket the walk found below the target in its compaction parts and did
+/// not re-encode, named with its reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReencodeBlockedBucket {
+    pub shard: u32,
+    pub ingest_hour: u32,
+    pub reason: ReencodeBlockedReason,
+}
+
+/// Which of the walk's two rewrites a [`NotMigratedBucket`] was dispatched to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationPath {
+    /// The L0 migration ([`migrate_bucket_format`]).
+    L0Migration,
+    /// The force 2 re-encode of a compaction record's parts
+    /// ([`reencode_compaction_parts`]).
+    Reencode,
+}
+
+/// Why a rewrite the walk dispatched published nothing. The bucket is retried,
+/// planned again from scratch, by the next walk that reaches it: the next run
+/// when this one drained the walk (a drained walk clears the cursor), and after
+/// a budget stop the first run after the walk drains, since the persisted
+/// cursor is past it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotMigratedReason {
+    /// The bucket's claim was not available, so the rewrite built nothing
+    /// (ADR-1029, the 2026-10-03 amendment).
+    ClaimSkipped { reason: ClaimSkipReason },
+    /// The rewrite took the bucket's claim, lost it, and cancelled at `at`
+    /// before its record PUT.
+    Cancelled { at: Checkpoint },
+    /// The pre-publish re-list found a record set other than the one the
+    /// rewrite planned from.
+    RecordSetChanged,
+    /// The rewrite passed its `max_compaction_lifetime_ns` deadline before its
+    /// record PUT and abandoned the publish.
+    PublishAbandoned,
+}
+
+/// One bucket the walk dispatched a rewrite for that published nothing, named
+/// with the path and the reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotMigratedBucket {
+    pub shard: u32,
+    pub ingest_hour: u32,
+    pub path: MigrationPath,
+    pub reason: NotMigratedReason,
+}
+
 /// What one [`count_below_target`] pass found below the target, with the three
 /// sources kept apart (ADR-1331 decision 1).
 ///
 /// The split is load-bearing rather than cosmetic: the three sources reach the
-/// target by different routes, and in this build only `l0` has one. The walk
-/// rewrites below-target L0 records. Nothing rewrites a below-target compaction
-/// part: [`crate::compact::compact_bucket`] and
-/// [`crate::rewrite::migrate_bucket_format`] both refuse a bucket that already
-/// carries a compaction record, so ADR-0066 decision 4 force 2's
-/// rewrite-on-touch over "live L1 part below the current version" is
-/// unimplemented (issue #2093). Nothing rewrites a rewrite record's parts
-/// either, by decision (ADR-1331 decision 1). Summing the three into one figure
-/// would hide which part of it a re-run could move, which today is only `l0`.
+/// target by different routes. The walk rewrites below-target L0 records. A
+/// below-target compaction part is re-encoded only through ADR-0066 force 2
+/// ([`reencode_compaction_parts`]), only when its record is the one compaction
+/// record of its bucket and the writer switch is on, and its predecessor's
+/// parts leave this figure only when `sweep` deletes them. Nothing rewrites a
+/// rewrite record's parts, by decision (ADR-1331 decision 1). Summing the three
+/// into one figure would hide which part of it a re-run could move.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BelowTargetReport {
     /// Below-target L0 commit records still live. A bucket's pre-rewrite commit
@@ -242,19 +325,20 @@ pub struct BelowTargetReport {
     /// names them as inputs, are excluded rather than counted here.
     pub l0: usize,
     /// Below-target parts of compaction records only, authoritative or not.
-    /// They refuse the floor raise, and no code path migrates them (issue
-    /// #2093), so re-running `migrate` reports the same figure. A bucket whose
-    /// authoritative records are all at the target and whose overlap losers
-    /// carry below-target parts is named in [`Self::blocked`] as
-    /// [`BlockedReason::LosingRecordParts`], with the losers' share of this
-    /// figure; a bucket whose authoritative records are themselves below the
-    /// target is not named.
+    /// They refuse the floor raise. A bucket whose authoritative records are
+    /// all at the target and whose overlap losers carry below-target parts is
+    /// named in [`Self::blocked`] as [`BlockedReason::LosingRecordParts`], with
+    /// the losers' share of this figure; a bucket whose authoritative records
+    /// are themselves below the target is not named here. The walk re-encodes
+    /// such a bucket when force 2 applies, or names it in
+    /// [`FamilyMigrateReport::reencode_blocked`] when it does not.
     ///
     /// Like [`Self::rewrite_parts`], this is a count over LISTED records: a
-    /// compaction record that a later rewrite record superseded stays listed
-    /// until `sweep` deletes it and its parts, so its parts are in this figure
-    /// while it is there, and a `sweep` lowers the figure even though no
-    /// `migrate` run can.
+    /// compaction record that a later rewrite record or a version 2 compaction
+    /// record superseded stays listed until `sweep` deletes it and its parts,
+    /// so its parts are in this figure while it is there. A bucket the walk
+    /// re-encoded therefore keeps its predecessor's parts in this figure until
+    /// that sweep, and the floor is raised by the first `migrate` run after it.
     pub l1: usize,
     /// Below-target parts of the rewrite records a bucket LISTS, which this job
     /// never migrates. A superseded predecessor stays listed until `sweep`
@@ -300,13 +384,17 @@ pub enum Verification {
     /// still live (a bucket's pre-rewrite commit records already superseded by
     /// an authoritative compaction record, or by a rewrite record, are
     /// excluded, not counted here: [`count_below_target`]), `l1` counts
-    /// below-target compaction parts, which no code path migrates either
-    /// (issue #2093), and `rewrite_parts` counts below-target parts of the
+    /// below-target compaction parts of every listed compaction record,
+    /// including a predecessor a version 2 record re-encoded until `sweep`
+    /// deletes it, and `rewrite_parts` counts below-target parts of the
     /// rewrite records each bucket lists, which this job never migrates.
     /// `blocked` names, with its reason, each bucket whose refusal no re-run
     /// clears THAT THIS INVOCATION EXAMINED (ADR-1331 decision 2); it is the
     /// same list [`FamilyMigrateReport::blocked_buckets`] carries, and carries
-    /// that list's resume-window caveat too.
+    /// that list's resume-window caveat too. The buckets the walk did not
+    /// re-encode, and those whose rewrite published nothing, are on
+    /// [`FamilyMigrateReport::reencode_blocked`] and
+    /// [`FamilyMigrateReport::not_migrated`].
     Stragglers {
         l0: usize,
         l1: usize,
@@ -327,9 +415,18 @@ impl Verification {
 pub struct FamilyMigrateReport {
     /// Buckets examined this invocation (past the cursor, in the walk range).
     pub buckets_examined: usize,
-    /// Buckets whose live L0 set was rewritten to the target this invocation.
+    /// Buckets this invocation published a migration for: a live L0 set
+    /// rewritten to the target whose record was published or converged, or a
+    /// compaction record's parts re-encoded whose version 2 record this run
+    /// published. A rewrite whose publish was abandoned is not counted; it is
+    /// on [`Self::not_migrated`].
     pub buckets_migrated: usize,
-    /// L0 records migrated this invocation (the budget spend).
+    /// L0 records whose data the buckets in [`Self::buckets_migrated`] carried
+    /// to the target, counted differently on each path. An L0 migration counts
+    /// the bucket's raw-served L0 records that were below the target, not the
+    /// at-target records its rewrite also carried into the new record. A
+    /// re-encode counts every input the re-encoded compaction record names,
+    /// whatever version each was written at.
     pub records_migrated: u64,
     /// Every bucket this invocation found permanently blocked, each named with
     /// its `(shard, ingest_hour)` and the reason no re-run clears it
@@ -364,6 +461,25 @@ pub struct FamilyMigrateReport {
     /// passes name the same bucket the re-audit's entry is the one kept, since
     /// the re-audit's reasons carry a count and the walk's does not.
     pub blocked_buckets: Vec<BlockedBucket>,
+    /// Every bucket the walk found held below the target by its authoritative
+    /// compaction records' parts and did not re-encode (ADR-0066 force 2), in
+    /// walk order, with the reason. The re-audit counts those parts in `l1`.
+    /// Like the walk's [`BlockedReason::LoserOnlyInputs`] entries, it covers
+    /// only the buckets this invocation examined.
+    pub reencode_blocked: Vec<ReencodeBlockedBucket>,
+    /// Every bucket the walk dispatched a rewrite for that published nothing,
+    /// in walk order, with the path and the reason: a claim another process
+    /// held, a claim this run lost, a record set that changed before the
+    /// publish, or a publish abandoned at the deadline. None of these counts in
+    /// [`Self::buckets_migrated`], and the fresh re-audit still counts what each
+    /// left below the target unless another writer carried it there first.
+    ///
+    /// The cursor advances past these buckets like any other examined one, so
+    /// a held claim never stalls the walk. When the walk drains it clears the
+    /// cursor and the next run retries every one; after a budget stop the next
+    /// run resumes past them, and they are retried by the first run after the
+    /// walk drains.
+    pub not_migrated: Vec<NotMigratedBucket>,
     /// The `(shard, ingest_hour)` the cursor was persisted at, when this
     /// invocation stopped on its budget. `None` once the walk completes: a
     /// drained walk clears the cursor rather than leaving a position behind.
@@ -810,9 +926,9 @@ async fn read_named_record(
 /// Which kind of record contributed parts. The re-audit keeps them apart rather
 /// than summing them because they are blocked for different reasons and clear
 /// differently (ADR-1331 decision 1): a below-target rewrite part is never
-/// migrated by decision, while a below-target compaction part is one ADR-0066
-/// decision 4 force 2 intends to converge through rewrite-on-touch and no code
-/// path implements yet (issue #2093).
+/// migrated by decision, while a below-target compaction part converges through
+/// ADR-0066 decision 4 force 2's re-encode when its record is its bucket's one
+/// compaction record and the writer switch is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecordKind {
     Compaction,
@@ -1186,6 +1302,8 @@ async fn refusal_is_permanent(
 struct RawServed {
     keys: Vec<String>,
     records_read: usize,
+    /// The compaction records read, by key, for the walk's force 2 question.
+    compaction_records: Vec<(String, CompactionRecord)>,
 }
 
 async fn raw_served_commit_keys(
@@ -1199,6 +1317,7 @@ async fn raw_served_commit_keys(
         return Ok(RawServed {
             keys: listing.commit_keys.clone(),
             records_read: 0,
+            compaction_records: Vec::new(),
         });
     }
     let mut records_read = 0usize;
@@ -1277,7 +1396,170 @@ async fn raw_served_commit_keys(
             .cloned()
             .collect(),
         records_read,
+        compaction_records,
     })
+}
+
+/// The walk's answer for a bucket that serves no below-target L0 record raw
+/// and holds no rewrite record (ADR-0066 force 2).
+#[derive(Debug)]
+enum Force2 {
+    /// The bucket is not re-encoded, for this reason.
+    Blocked(ReencodeBlockedReason),
+    /// One compaction record survives supersession and `below_target` of its
+    /// parts are below the target; it names `inputs` L0 records.
+    Reencode { below_target: usize, inputs: u64 },
+}
+
+/// Whether `records`, a bucket's compaction records, hold the bucket below
+/// `target_version` through the parts of its authoritative records, and if so
+/// whether force 2 can re-encode it, asked with the shared selector exactly as
+/// [`reencode_compaction_parts`] asks it. `None` when no authoritative part is
+/// below the target: a bucket whose overlap losers alone are below it is the
+/// re-audit's [`BlockedReason::LosingRecordParts`].
+///
+/// A part counts as below the target only when it is also below the version
+/// the current writer emits for the signal, since a re-encode can carry it no
+/// further.
+fn force2_case(
+    signal: Signal,
+    records: &[(String, CompactionRecord)],
+    target_version: u32,
+) -> Result<Option<Force2>> {
+    let Ok(current) = current_part_version(signal) else {
+        return Ok(None);
+    };
+    let threshold = target_version.min(current);
+    let below = |rec: &CompactionRecord| {
+        rec.parts
+            .iter()
+            .filter(|p| p.segment_format_version < threshold)
+            .count()
+    };
+    let selection = select_authoritative_compaction_records(records).map_err(|err| {
+        MaintainError::Invariant(format!(
+            "compaction records have an unresolvable supersession chain: {err}"
+        ))
+    })?;
+    let live: Vec<&CompactionRecord> = records
+        .iter()
+        .filter(|(key, _)| !selection.is_excluded(key))
+        .map(|(_, rec)| rec)
+        .collect();
+    if live.iter().all(|rec| below(rec) == 0) {
+        return Ok(None);
+    }
+    if selection.largest_component() > 1 {
+        return Ok(Some(Force2::Blocked(
+            ReencodeBlockedReason::ContestedOverlap {
+                largest_component: selection.largest_component(),
+            },
+        )));
+    }
+    if live.len() > 1 {
+        return Ok(Some(Force2::Blocked(
+            ReencodeBlockedReason::MultipleRecords {
+                records: live.len(),
+            },
+        )));
+    }
+    let [only] = live.as_slice() else {
+        return Ok(None);
+    };
+    Ok(Some(Force2::Reencode {
+        below_target: below(only),
+        inputs: only.inputs.len() as u64,
+    }))
+}
+
+/// Record what [`reencode_compaction_parts`] did to the bucket at
+/// `(shard, ingest_hour)` on `report`, and return the budget it spent. Only a
+/// version 2 record this run published counts as migrated; the format floor
+/// moves only through the fresh re-audit.
+fn record_reencode(
+    report: &mut FamilyMigrateReport,
+    shard: u32,
+    ingest_hour: u32,
+    below_target: usize,
+    inputs: u64,
+    outcome: ReencodeOutcome,
+) -> u64 {
+    let blocked = |report: &mut FamilyMigrateReport, reason: ReencodeBlockedReason| {
+        report.reencode_blocked.push(ReencodeBlockedBucket {
+            shard,
+            ingest_hour,
+            reason,
+        });
+    };
+    let not_migrated = |report: &mut FamilyMigrateReport, reason: NotMigratedReason| {
+        report.not_migrated.push(NotMigratedBucket {
+            shard,
+            ingest_hour,
+            path: MigrationPath::Reencode,
+            reason,
+        });
+    };
+    match outcome {
+        ReencodeOutcome::Reencoded {
+            publish: PublishOutcome::Published,
+            ..
+        } => {
+            report.buckets_migrated += 1;
+            report.records_migrated += inputs;
+            inputs
+        }
+        // A racing run published the same version 2 record: the bucket
+        // converged, but not by this run.
+        ReencodeOutcome::Reencoded {
+            publish: PublishOutcome::Converged { .. },
+            ..
+        } => inputs,
+        ReencodeOutcome::Reencoded {
+            publish: PublishOutcome::Abandoned,
+            ..
+        } => {
+            not_migrated(report, NotMigratedReason::PublishAbandoned);
+            inputs
+        }
+        ReencodeOutcome::RecordSetChanged => {
+            not_migrated(report, NotMigratedReason::RecordSetChanged);
+            inputs
+        }
+        ReencodeOutcome::SkippedClaimed { reason } => {
+            not_migrated(report, NotMigratedReason::ClaimSkipped { reason });
+            0
+        }
+        ReencodeOutcome::Cancelled { at } => {
+            not_migrated(report, NotMigratedReason::Cancelled { at });
+            0
+        }
+        ReencodeOutcome::WriterDisabled => {
+            blocked(
+                report,
+                ReencodeBlockedReason::WriterDisabled { below_target },
+            );
+            0
+        }
+        ReencodeOutcome::ContestedOverlap { largest_component } => {
+            blocked(
+                report,
+                ReencodeBlockedReason::ContestedOverlap { largest_component },
+            );
+            0
+        }
+        ReencodeOutcome::MultipleRecords { records } => {
+            blocked(report, ReencodeBlockedReason::MultipleRecords { records });
+            0
+        }
+        // A rewrite record landed after the walk read the bucket: the re-audit
+        // names it as `RewriteParts` when its parts are below the target
+        // (ADR-1331). The rest changed under the walk and leave nothing to
+        // re-encode; the re-audit counts whatever remains.
+        ReencodeOutcome::RewritePresent
+        | ReencodeOutcome::Tombstoned
+        | ReencodeOutcome::NoCompactionRecord
+        | ReencodeOutcome::UpToDate => 0,
+    }
 }
 
 /// Migrate one `(tenant, signal, family)` toward `target_version`, resuming from
@@ -1295,7 +1577,15 @@ async fn raw_served_commit_keys(
 ///    target via [`migrate_bucket_format`] (the rewrite primitive), advancing
 ///    the cursor past every examined bucket. A bucket the primitive refuses
 ///    because it already carries a record set, and whose refusal cause survives
-///    a re-read, is named in [`FamilyMigrateReport::blocked_buckets`];
+///    a re-read, is named in [`FamilyMigrateReport::blocked_buckets`]. A sealed,
+///    un-tombstoned bucket that serves nothing below the target raw, holds no
+///    rewrite record, and whose authoritative compaction records carry parts
+///    below it is ADR-0066 force 2's: when exactly one compaction record
+///    survives supersession it is re-encoded through
+///    [`reencode_compaction_parts`] (a no-op reported as blocked while
+///    [`CompactorConfig::reencode_writer_enabled`] is off), and otherwise it is
+///    named in [`FamilyMigrateReport::reencode_blocked`]. A dispatched rewrite
+///    that published nothing is named in [`FamilyMigrateReport::not_migrated`];
 /// 3. stops early once `budget` is spent (persisting the cursor and returning
 ///    with `walk_complete == false` so the caller re-invokes), or runs the
 ///    verify-and-raise step once the walk reaches its end within budget;
@@ -1365,22 +1655,44 @@ pub async fn migrate_family(
             // served as a raw L0 segment, so record presence would skip a live
             // below-target record that the re-audit rightly counts.
             let listing = list_bucket(store, &bucket).await?;
-            if bucket.is_sealed(now, config)
-                && listing.tombstone_key.is_none()
-                && !listing.commit_keys.is_empty()
-            {
+            if bucket.is_sealed(now, config) && listing.tombstone_key.is_none() {
                 let served = raw_served_commit_keys(store, &bucket, &listing).await?;
-                let inputs =
+                let l0_below = if served.keys.is_empty() {
+                    0
+                } else {
                     load_inputs(store, &bucket, &served.keys, config.input_read_concurrency)
-                        .await?;
-                let l0_below = inputs
-                    .iter()
-                    .filter(|i| i.record.segment_format_version < target_version)
-                    .count() as u64;
+                        .await?
+                        .iter()
+                        .filter(|i| i.record.segment_format_version < target_version)
+                        .count() as u64
+                };
+                let not_migrated = |report: &mut FamilyMigrateReport, reason| {
+                    report.not_migrated.push(NotMigratedBucket {
+                        shard,
+                        ingest_hour: hour,
+                        path: MigrationPath::L0Migration,
+                        reason,
+                    });
+                };
                 if l0_below > 0 {
                     match migrate_bucket_format(store, clock, config, &bucket, target_version)
                         .await?
                     {
+                        // The run built its parts and published nothing: the
+                        // pre-publish re-list found the record set changed, or
+                        // the deadline passed. The re-audit still counts the
+                        // bucket's records and a later run retries it.
+                        MigrateOutcome::Rewritten {
+                            publish: PublishOutcome::Abandoned,
+                            ..
+                        } => {
+                            not_migrated(&mut report, NotMigratedReason::PublishAbandoned);
+                            spent += l0_below;
+                        }
+                        MigrateOutcome::RecordSetChanged => {
+                            not_migrated(&mut report, NotMigratedReason::RecordSetChanged);
+                            spent += l0_below;
+                        }
                         MigrateOutcome::Rewritten { .. } => {
                             report.buckets_migrated += 1;
                             report.records_migrated += l0_below;
@@ -1430,8 +1742,42 @@ pub async fn migrate_family(
                         // migrated. The fresh re-audit still counts its
                         // below-target records, so the floor stays unraised
                         // until a later invocation migrates it.
-                        MigrateOutcome::SkippedClaimed { .. }
-                        | MigrateOutcome::Cancelled { .. } => {}
+                        MigrateOutcome::SkippedClaimed { reason } => {
+                            not_migrated(&mut report, NotMigratedReason::ClaimSkipped { reason });
+                        }
+                        MigrateOutcome::Cancelled { at } => {
+                            not_migrated(&mut report, NotMigratedReason::Cancelled { at });
+                        }
+                    }
+                } else if listing.rewrite_record_keys.is_empty() {
+                    // ADR-0066 force 2: the bucket serves nothing below the
+                    // target raw, so what can hold it there is the parts of
+                    // its compaction records. A bucket with a rewrite record
+                    // is the re-audit's `RewriteParts` (ADR-1331).
+                    match force2_case(bucket.signal, &served.compaction_records, target_version)? {
+                        None => {}
+                        Some(Force2::Blocked(reason)) => {
+                            report.reencode_blocked.push(ReencodeBlockedBucket {
+                                shard,
+                                ingest_hour: hour,
+                                reason,
+                            });
+                        }
+                        Some(Force2::Reencode {
+                            below_target,
+                            inputs,
+                        }) => {
+                            let outcome =
+                                reencode_compaction_parts(store, clock, config, &bucket).await?;
+                            spent += record_reencode(
+                                &mut report,
+                                shard,
+                                hour,
+                                below_target,
+                                inputs,
+                                outcome,
+                            );
+                        }
                     }
                 }
             }
@@ -3270,11 +3616,11 @@ mod tests {
     /// `rewrite_parts`.
     ///
     /// It blocks the floor exactly as a rewrite part does, and re-running
-    /// `migrate` does not change the figure: no code path migrates a
-    /// below-target compaction part, because `compact_bucket` and
-    /// `migrate_bucket_format` both refuse a bucket that already carries a
-    /// compaction record, and the walk never reaches such a bucket's parts
-    /// (issue #2093 -- ADR-0066 decision 4 force 2 is unimplemented). What this
+    /// `migrate` does not change the figure: the part is already at the current
+    /// writer's version, below only a target above it, so the force 2
+    /// re-encode cannot carry it further and the walk does not try, while
+    /// `compact_bucket` and `migrate_bucket_format` both refuse a bucket that
+    /// already carries a compaction record. What this
     /// test pins is only that the two SOURCES are counted apart, and that a
     /// bucket whose AUTHORITATIVE record is below the target is not named in
     /// `blocked_buckets`: only a bucket held below by overlap losers' parts is
@@ -3346,8 +3692,9 @@ mod tests {
         .expect("second migrate");
         assert_eq!(
             again.verification, report.verification,
-            "re-running reports the identical l1 count: no path migrates a below-target \
-             compaction part (issue #2093), so the floor stays refused on the same figure"
+            "re-running reports the identical l1 count: no path migrates a compaction part \
+             already at the current writer's version, so the floor stays refused on the same \
+             figure"
         );
     }
 
