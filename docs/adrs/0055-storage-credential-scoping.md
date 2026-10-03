@@ -188,11 +188,12 @@ and the alert evaluator's lease and state memo under `t/<hash>/a/`, along with
 the alert transition writes the Query role makes; the control-plane key
 amendment below adds them and lists every control-plane key each role uses.
 
-The table's `prov` entries are incomplete too: Query and Maintain create the
-record on the startup and maintain-tick adopt paths, Maintain raises format
-floors under `CasVersion`, and Admin's `provision adopt` is `CreateIfAbsent`.
-The prov write conditions amendment below grants each of them and conditions
-every `prov` write on the put mode its callers send.
+The table's `prov` entries are incomplete too: Maintain creates the record
+on the startup and maintain-tick adopt paths and raises format floors under
+`CasVersion`, and Admin's `provision adopt` is `CreateIfAbsent`. Query never
+writes the record, because its startup check does not adopt. The prov write
+conditions amendment below grants each writer and conditions every `prov`
+write on the put mode its callers send.
 
 This is not a literal "ingest, compaction, query, and sweep" four-way split
 — sweep is not split into its own process here. Sweep
@@ -384,9 +385,14 @@ by whichever role's policy grants them a `PutObject` with the right
 precondition (see the write columns in §1's table) — a compromised writer
 with legitimate write access to `prov` can still corrupt it going forward,
 it just cannot destroy the object outright or roll back to a stale prior
-state via delete-then-recreate. For `prov`, only Maintain and Admin hold a
-grant that can overwrite; Gateway and Query can only create a missing record
-(prov write conditions amendment below). Full immutability-against-overwrite is the
+state via delete-then-recreate. For the `prov` records of the provisioned
+signals (metrics, logs, spans), only Maintain and Admin hold a grant that can
+overwrite; Gateway can only create a missing record, and Query cannot write
+one (prov write conditions amendment below). `t/<hash>/u/prov` is a known gap:
+the unconditioned `t/*/u/*` write Query and Admin hold for audit records
+reaches it. No provisioning record exists for the audit signal; a planted one
+could widen an audit scan or make audit reads fail, and cannot hide records.
+Full immutability-against-overwrite is the
 gap ADR-0042 already named and reserved: `object_store` 0.14.1 has no
 per-PUT retention API, so true Object Lock enforcement stays bucket-level
 and out-of-band for this ADR too, exactly as ADR-0042 decided for `c/`. This
@@ -1485,10 +1491,11 @@ whose credential issues them:
 
 - Gateway: `ProvisioningRecordWriter::ensure` on a tenant's first ingest
   write (`CreateFromConfig`, so `CreateIfAbsent`).
-- Gateway, Query and Maintain: `validate_static_provisioning`
+- Gateway and Maintain: `validate_static_provisioning`
   (`services/ravel-server/src/provisioning.rs`), which `main.rs` runs at
-  startup in every mode for each statically known tenant (`AdoptIfData`, so
-  `CreateIfAbsent` when the tenant's data predates its record).
+  startup for each statically known tenant (`AdoptIfData`, so
+  `CreateIfAbsent` when the tenant's data predates its record) in
+  `gateway`, `maintain` and `all` mode.
 - Maintain: the maintain tick's per-tenant, per-signal `validate_or_adopt`
   (`services/ravel-server/src/maintain.rs`, `AdoptIfData`), and
   `ravel-cli maintain migrate`'s floor raise, `raise_format_floor` after a
@@ -1496,47 +1503,75 @@ whose credential issues them:
 - Admin: `ravel-cli provision adopt` (`AdoptIfData`, so `CreateIfAbsent`) and
   `ravel-cli provision reshard` (`append_generation`, `CasVersion`).
 
-`query.json` and `maintain.json` granted no `prov` write, so on a per-role
-deployment a Query or Maintain process with a statically known tenant whose
-data predated its record failed at startup with `AccessDenied`, the maintain
-tick skipped that tenant's signal on every tick, and `maintain migrate`
-could not raise a floor. `gateway.json` and `admin.json` granted an
-unconditioned `PutObject` on the record.
+Query is not a caller. A `query` process runs the startup check with
+`AbsentPolicy::CheckOnly` (`static_absent_policy` in
+`services/ravel-server/src/provisioning.rs`): a present record is validated
+as in every other mode, and one it cannot read refuses startup, while an
+absent record passes with no listing and no write. This is least privilege:
+the read role holds no provisioning write, and needs no `l0/` listing for
+the check. Before this, Query ran the adopt path, whose first call lists
+`t/<hash>/<sig>/l0/`, a prefix `QueryList` does not admit, so a Query
+process with a statically known tenant that had data and no record was
+refused at startup before it reached any write. ADR-0050 section 5 already
+assigns adoption to ingest, maintenance and the CLI and keeps the read path
+write-free.
+
+`maintain.json` granted no `prov` write, so on a per-role deployment a
+Maintain process with a statically known tenant whose data predated its
+record failed at startup with `AccessDenied`, the maintain tick skipped that
+tenant's signal on every tick, and `maintain migrate` could not raise a
+floor. `gateway.json` and `admin.json` granted an unconditioned `PutObject`
+on the record.
 
 The S3 backend sends `CreateIfAbsent` as `If-None-Match: *` and
 `CasVersion` as `If-Match: <etag>`. Checked against AWS on 2026-10-03, IAM
 evaluates both keys on `PutObject`: a statement conditioned on
-`StringEquals` `s3:if-none-match` `*` allows only a create-if-absent PUT,
-and a statement conditioned on `Null` `s3:if-match` `false` allows only a
-compare-and-swap PUT. Each refuses an unconditional PUT and the other
-conditional kind. Every `prov` write grant is now one of those two shapes, on
-the resource `t/*/*/prov`:
+`StringEquals` `s3:if-none-match` `*` admits a PUT that sends
+`If-None-Match: *`, and a statement conditioned on `Null` `s3:if-match`
+`false` admits a PUT that sends `If-Match`. Neither admits an unconditional
+PUT, nor a PUT that sends only the other statement's header. A PUT that sends
+both headers satisfies either statement's condition; S3 then enforces both
+preconditions. Every `prov` write grant is now one of those two shapes.
+
+Each names exactly three resources, one per provisioned signal (the
+`PROVISIONED_SIGNALS` of `services/ravel-server/src/provisioning.rs`):
+`t/????????????????????????????????/m/prov`, `.../l/prov` and
+`.../s/prov`, the tenant hash spelled as 32 single-character wildcards. IAM's
+`*` matches `/`, so `t/*/*/prov` would also reach nested keys ending in
+`/prov` under `c/`, `del/` or `l0/`, and the `prov` key of the alerts, audit
+and profiles signals, which have no provisioning record.
 
 - `gateway.json`: `GatewayWrite` loses `t/*/*/prov`, and `GatewayProvCreate`
-  grants it create-only. No Gateway path appends a generation or raises a
-  floor.
-- `query.json`: `QueryProvCreate`, create-only.
+  grants the three records create-only. No Gateway path appends a generation
+  or raises a floor.
+- `query.json`: no `prov` write.
 - `maintain.json`: `MaintainProvCreate`, create-only, and `MaintainProvCas`,
   CAS-only. The migrate cursor change of issue #2359 is separate and does not
   touch these grants.
 - `admin.json`: `AdminWrite` loses `t/*/*/prov`, and `AdminProvCreate` and
-  `AdminProvCas` grant it create-only and CAS-only.
+  `AdminProvCas` grant the three records create-only and CAS-only.
 
-`DenyDeleteProtected` keeps `t/*/*/prov` in all four templates. A
-compromised Gateway or Query credential can now create a missing record and
-cannot replace an existing one: before this amendment Gateway could
-overwrite any tenant's record outright. A compromised Maintain or Admin
-credential can still rewrite a record through a CAS PUT after reading its
-ETag, which is the overwrite gap §3 already names. The operator's
-`append_generation` runs under the shared credential, not a template.
-`crates/ravel-commit/tests/iam_templates.rs` pins the condition on every
-`prov` statement per role, refuses an unconditioned `PutObject` reaching the
-record, and matches each caller above to a grant of its own kind.
+`DenyDeleteProtected` keeps the broader `t/*/*/prov` in all four templates,
+since a broad deny is the safe direction. For the three provisioned signals'
+records, a compromised Gateway credential can now create a missing record and
+cannot replace an existing one, where before this amendment it could
+overwrite any tenant's record outright, and a compromised Query credential
+cannot write one at all. A compromised Maintain or Admin credential can still
+rewrite a record through a CAS PUT after reading its ETag, which is the
+overwrite gap §3 already names. `t/<hash>/u/prov` stays writable under the
+unconditioned `t/*/u/*` audit write Query and Admin hold; §3 records that
+gap. The operator's `append_generation` runs under the shared credential,
+not a template. `crates/ravel-commit/tests/iam_templates.rs` pins the
+condition and the three resources of every `prov` statement per role,
+refuses an unconditioned `PutObject` reaching the record, refuses a `prov`
+grant reaching a nested `/prov` key or an unprovisioned signal's key,
+asserts `query.json` reaches no record, and matches each caller above to a
+grant of its own kind.
 
-Net effect on §1: the Query and Maintain write columns gain the `prov`
-writes above, and the Gateway and Admin entries are conditioned. Net effect
-on §3: of the roles that write `prov`, only Maintain and Admin can overwrite
-it.
+Net effect on §1: the Maintain write column gains the `prov` writes above,
+the Gateway and Admin entries are conditioned and narrowed to the three
+records, and Query gains nothing. Net effect on §3: for the provisioned
+signals' records, only Maintain and Admin can overwrite one.
 
 Recorded as an appended amendment, with an inline pointer added to §1 and
 §3.

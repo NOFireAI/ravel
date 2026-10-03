@@ -18,10 +18,11 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use ravel_commit::keys::{
-    commit_key, compaction_record_key, data_key, del_prefix, erasure_completion_key,
-    erasure_request_key, l1_part_key, maint_cursor_key, retention_tombstone_key,
-    rewrite_record_key,
+    commit_key, commit_shard_hour_prefix, commit_shard_prefix, compaction_record_key, data_key,
+    del_prefix, erasure_completion_key, erasure_request_key, l1_part_key, maint_cursor_key,
+    retention_tombstone_key, rewrite_record_key,
 };
+use ravel_fleet::claim::COMPACTION_CLAIMS_PREFIX;
 use ravel_fleet::query_workers::{QUERY_WORKERS_PREFIX, query_worker_key};
 use ravel_fleet::worker_set::heartbeat_key;
 use ravel_object_store::external::probe::PROBE_PREFIX;
@@ -350,7 +351,9 @@ fn constructor_free_tenant_witness_keys() -> Vec<String> {
             "t/{hash}/catalog/{prefix}/snap/0000000000000000.csnap"
         ));
         keys.push(format!("t/{hash}/catalog/{prefix}/idx/name-postings"));
-        keys.push(format!("t/{hash}/{prefix}/prov"));
+        // A full-width tenant hash: the provisioning-record write grants spell
+        // the tenant segment as exactly 32 single-character wildcards.
+        keys.push(format!("t/{}/{prefix}/prov", test_tenant().to_hex()));
         keys.push(format!("t/{hash}/{prefix}/idem/{hash}"));
         keys.push(format!("t/{hash}/{prefix}/admission/writer-0"));
     }
@@ -511,9 +514,9 @@ const BUCKET_KEY_PREFIX: &str = "arn:aws:s3:::my-ravel-bucket/";
 /// every other character is literal. This handles both, so a `?` smuggled into
 /// any of those fields is resolved as the wildcard IAM treats it as instead of
 /// being escaped to a literal `\?` that quietly matches nothing. The shipped
-/// templates carry a `?` in exactly two places, gateway's
-/// `GatewayAdmissionDelete` Resource and query's `QueryManifestCreate`
-/// Resource, and in no Action and no `s3:prefix`;
+/// templates carry a `?` only in the Resources of gateway's
+/// `GatewayAdmissionDelete`, query's `QueryManifestCreate` and the five
+/// provisioning-record write statements, and in no Action and no `s3:prefix`;
 /// `every_shipped_template_passes_the_choke_point` asserts that (not assumes
 /// it) over Action, Resource, and the `s3:prefix` values it reads through
 /// `list_prefix_patterns`.
@@ -776,7 +779,7 @@ const CAS_ONLY_CONDITION_KEY: &str = "s3:if-match";
 const CAS_ONLY_CONDITION_VALUE: &str = "false";
 
 /// The conditional write a PutObject-only `Allow` statement's Condition admits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum PutCondition {
     /// `{"StringEquals": {"s3:if-none-match": "*"}}`: `PutMode::CreateIfAbsent`.
     CreateOnly,
@@ -2241,7 +2244,9 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/t/*",
             "t/*/enc",
             "t/*/m/meta",
-            "t/*/*/prov",
+            PROV_M_PATTERN,
+            PROV_L_PATTERN,
+            PROV_S_PATTERN,
         ],
         // One entry per statement: GatewayWrite, then the create-only
         // GatewayProvCreate (prov_put_grants_carry_exactly_the_expected_conditions).
@@ -2314,12 +2319,11 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/a/state/latest",
             "sys/pq-probe/*",
             "t/????????????????????????????????/pq/t/*/v/????????????????????.pqm",
-            "t/*/*/prov",
         ],
-        // QueryWrite, QueryManifestCreate, then the create-only QueryProvCreate
-        // the startup provisioning adopt path needs
-        // (every_prov_write_call_site_has_a_grant_of_its_kind).
-        put_actions: &["s3:PutObject", "s3:PutObject", "s3:PutObject"],
+        // QueryWrite, then QueryManifestCreate. No provisioning write: a query
+        // process checks a present record at startup and never adopts
+        // (query_template_writes_no_provisioning_record).
+        put_actions: &["s3:PutObject", "s3:PutObject"],
         deletes: &["sys/pq-probe/*"],
         delete_actions: &["s3:DeleteObject"],
         protected_deletes: PROTECTED_DELETE_KEYS,
@@ -2480,8 +2484,12 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/catalog/*/snap/*",
             "t/*/catalog/*/idx/*",
             "t/*/catalog/*/HEAD",
-            "t/*/*/prov",
-            "t/*/*/prov",
+            PROV_M_PATTERN,
+            PROV_L_PATTERN,
+            PROV_S_PATTERN,
+            PROV_M_PATTERN,
+            PROV_L_PATTERN,
+            PROV_S_PATTERN,
         ],
         // MaintainWrite, then MaintainProvCreate (create-only, the maintain
         // tick's adopt) and MaintainProvCas (CAS-only, the maintain migrate
@@ -2540,8 +2548,12 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/config",
             "t/*/pq/grants",
             "sys/pq-probe/*",
-            "t/*/*/prov",
-            "t/*/*/prov",
+            PROV_M_PATTERN,
+            PROV_L_PATTERN,
+            PROV_S_PATTERN,
+            PROV_M_PATTERN,
+            PROV_L_PATTERN,
+            PROV_S_PATTERN,
         ],
         // AdminWrite, then AdminProvCreate (create-only, provision adopt) and
         // AdminProvCas (CAS-only, provision reshard).
@@ -2993,7 +3005,7 @@ fn all_signals_is_exhaustive_and_witnessed() {
         let prefix = signal.key_prefix();
         for shape in [
             format!("t/{hash}/catalog/{prefix}/HEAD"),
-            format!("t/{hash}/{prefix}/prov"),
+            format!("t/{}/{prefix}/prov", test_tenant().to_hex()),
             format!("t/{hash}/{prefix}/idem/{hash}"),
             format!("t/{hash}/{prefix}/admission/writer-0"),
         ] {
@@ -5308,15 +5320,11 @@ fn query_manifest_write_is_create_only() {
 #[test]
 fn query_manifest_create_grant_reaches_only_manifest_keys() {
     let query = load_policy("query");
-    let create_only: Vec<String> = create_only_put_patterns(&query)
-        .into_iter()
-        .filter(|p| p != PROV_PATTERN)
-        .collect();
+    let create_only: Vec<String> = create_only_put_patterns(&query);
     assert_eq!(
         create_only,
         ["t/????????????????????????????????/pq/t/*/v/????????????????????.pqm"],
-        "query: besides the provisioning record, the create-only grant must be \
-         exactly the manifest key pattern"
+        "query: the create-only grant must be exactly the manifest key pattern"
     );
     let tenant = parquet_tenant_manifest_prefix();
     let reached = [
@@ -5593,21 +5601,69 @@ fn cas_only_put_condition_shape_fails_closed_on_every_variant() {
     }
 }
 
+/// The signals with a provisioning record: `PROVISIONED_SIGNALS` in
+/// `services/ravel-server/src/provisioning.rs`, which the `ravel-cli` provision
+/// and migrate signal arguments match.
+const PROVISIONED_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Signal::Spans];
+
 /// The provisioning record's key, `t/<hash>/<signal>/prov`
 /// (`provisioning_key` in `crates/ravel-catalog/src/provisioning.rs`, which
-/// this crate cannot depend on), for each signal that has one: the server's
-/// `PROVISIONED_SIGNALS` and the `ravel-cli` provision and migrate signal
-/// arguments are all metrics, logs and spans.
+/// this crate cannot depend on), for each provisioned signal.
 fn prov_witness_keys() -> Vec<String> {
     let hash = test_tenant().to_hex();
-    [Signal::Metrics, Signal::Logs, Signal::Spans]
+    PROVISIONED_SIGNALS
         .iter()
         .map(|signal| format!("t/{hash}/{}/prov", signal.key_prefix()))
         .collect()
 }
 
-/// The one resource every template's provisioning-record statements name.
-const PROV_PATTERN: &str = "t/*/*/prov";
+/// The resources every provisioning-record write statement names, one per
+/// provisioned signal. The tenant hash is 32 single-character wildcards because
+/// IAM's `*` crosses `/`: `t/*/*/prov` would also reach a nested key ending in
+/// `/prov` and the `prov` key of a signal that has no record.
+const PROV_M_PATTERN: &str = "t/????????????????????????????????/m/prov";
+const PROV_L_PATTERN: &str = "t/????????????????????????????????/l/prov";
+const PROV_S_PATTERN: &str = "t/????????????????????????????????/s/prov";
+const PROV_PATTERNS: [&str; 3] = [PROV_M_PATTERN, PROV_L_PATTERN, PROV_S_PATTERN];
+
+/// Keys ending in `/prov` that are not a provisioning record: nested keys under
+/// `c/`, `del/` and `l0/` of a provisioned signal, and the `prov` key of every
+/// signal that has no record. No provisioning-record grant may reach one.
+fn prov_lookalike_keys() -> Vec<String> {
+    let hash = test_tenant().to_hex();
+    let mut keys = Vec::new();
+    for signal in PROVISIONED_SIGNALS {
+        let sig = signal.key_prefix();
+        keys.push(format!("t/{hash}/{sig}/c/0000/20260101T00/prov"));
+        keys.push(format!("t/{hash}/{sig}/del/prov"));
+        keys.push(format!("t/{hash}/{sig}/l0/0000/prov"));
+    }
+    for signal in ALL_SIGNALS {
+        if !PROVISIONED_SIGNALS.contains(&signal) {
+            keys.push(format!("t/{hash}/{}/prov", signal.key_prefix()));
+        }
+    }
+    keys
+}
+
+/// The three record patterns are the provisioned signals' key prefixes under a
+/// tenant segment exactly as wide as a tenant hash, and the lookalikes name
+/// every signal without a record.
+#[test]
+fn prov_patterns_follow_the_provisioned_signals() {
+    let width = test_tenant().to_hex().len();
+    let expected: Vec<String> = PROVISIONED_SIGNALS
+        .iter()
+        .map(|signal| format!("t/{}/{}/prov", "?".repeat(width), signal.key_prefix()))
+        .collect();
+    assert_eq!(PROV_PATTERNS.to_vec(), expected);
+    let unprovisioned: Vec<&str> = ALL_SIGNALS
+        .iter()
+        .filter(|s| !PROVISIONED_SIGNALS.contains(s))
+        .map(|s| s.key_prefix())
+        .collect();
+    assert_eq!(unprovisioned, ["p", "a", "u"]);
+}
 
 /// Every production write of the provisioning record, the role whose
 /// credential issues it, and the conditional write it sends. Writes go through
@@ -5615,7 +5671,9 @@ const PROV_PATTERN: &str = "t/*/*/prov";
 /// `write_record_race_safe` (`PutMode::CreateIfAbsent`, reached from
 /// `validate_or_adopt` under `CreateFromConfig` or `AdoptIfData`),
 /// `append_generation` and `raise_format_floor` (both `PutMode::CasVersion`).
-/// No production path writes the record unconditionally.
+/// No production path writes the record unconditionally. A `query` process
+/// runs the startup check under `CheckOnly` (`static_absent_policy`) and is
+/// not a caller.
 const PROV_WRITE_CALL_SITES: &[(&str, &str, PutCondition)] = &[
     (
         "ProvisioningRecordWriter::ensure (services/ravel-server/src/provisioning.rs), \
@@ -5625,17 +5683,13 @@ const PROV_WRITE_CALL_SITES: &[(&str, &str, PutCondition)] = &[
     ),
     (
         "validate_static_provisioning (services/ravel-server/src/provisioning.rs, \
-         called from main.rs at startup in every mode), validate_or_adopt AdoptIfData",
+         called from main.rs at startup), validate_or_adopt AdoptIfData in gateway \
+         and all mode",
         "gateway",
         PutCondition::CreateOnly,
     ),
     (
-        "validate_static_provisioning at startup in every mode",
-        "query",
-        PutCondition::CreateOnly,
-    ),
-    (
-        "validate_static_provisioning at startup in every mode",
+        "validate_static_provisioning at startup, AdoptIfData in maintain mode",
         "maintain",
         PutCondition::CreateOnly,
     ),
@@ -5664,10 +5718,10 @@ const PROV_WRITE_CALL_SITES: &[(&str, &str, PutCondition)] = &[
 ];
 
 /// Per role, the conditions of the statements that write the provisioning
-/// record, in template order.
+/// record, as a multiset: template order is not asserted.
 const EXPECTED_PROV_PUT_CONDITIONS: &[(&str, &[PutCondition])] = &[
     ("gateway", &[PutCondition::CreateOnly]),
-    ("query", &[PutCondition::CreateOnly]),
+    ("query", &[]),
     (
         "maintain",
         &[PutCondition::CreateOnly, PutCondition::CasOnly],
@@ -5675,12 +5729,49 @@ const EXPECTED_PROV_PUT_CONDITIONS: &[(&str, &[PutCondition])] = &[
     ("admin", &[PutCondition::CreateOnly, PutCondition::CasOnly]),
 ];
 
+/// Every conditioned PutObject statement in `policy` that reaches a
+/// provisioning record: its Sid, its condition and its key patterns.
+fn prov_put_statements(policy: &Policy) -> Vec<(String, PutCondition, Vec<String>)> {
+    let keys = prov_witness_keys();
+    let mut out = Vec::new();
+    for stmt in policy_statements(policy) {
+        let Some(kind) = put_condition_of(stmt) else {
+            continue;
+        };
+        let patterns =
+            object_key_patterns(policy.role, statement_sid(stmt), &statement_resources(stmt));
+        if keys
+            .iter()
+            .any(|k| patterns.iter().any(|p| glob_matches(p, k)))
+        {
+            out.push((statement_sid(stmt).to_string(), kind, patterns));
+        }
+    }
+    out
+}
+
+/// Each `(Sid, key)` where a provisioning-record write statement in `policy`
+/// reaches a key in `prov_lookalike_keys()`.
+fn prov_grant_overreach(policy: &Policy) -> Vec<(String, String)> {
+    let lookalikes = prov_lookalike_keys();
+    let mut out = Vec::new();
+    for (sid, _, patterns) in prov_put_statements(policy) {
+        for key in &lookalikes {
+            if patterns.iter().any(|p| glob_matches(p, key)) {
+                out.push((sid.clone(), key.clone()));
+            }
+        }
+    }
+    out
+}
+
 /// Every role writes the provisioning record only through conditioned
-/// statements naming exactly `t/*/*/prov`, carrying exactly the conditions
-/// `EXPECTED_PROV_PUT_CONDITIONS` lists, and keeps its deny-delete on it. An
-/// unconditioned PutObject reaching the record would let a compromised
-/// credential overwrite or replace any tenant's shard generations and format
-/// floors outright, where CAS-only still has to name the current version.
+/// statements naming exactly `PROV_PATTERNS`, carrying exactly the conditions
+/// `EXPECTED_PROV_PUT_CONDITIONS` lists in any statement order, and keeps its
+/// deny-delete on it. An unconditioned PutObject reaching the record would let
+/// a compromised credential overwrite or replace any tenant's shard generations
+/// and format floors outright, where CAS-only still has to name the current
+/// version.
 #[test]
 fn prov_put_grants_carry_exactly_the_expected_conditions() {
     let mut roles: Vec<&str> = EXPECTED_PROV_PUT_CONDITIONS
@@ -5696,6 +5787,8 @@ fn prov_put_grants_carry_exactly_the_expected_conditions() {
     );
 
     let keys = prov_witness_keys();
+    let mut expected_patterns: Vec<&str> = PROV_PATTERNS.to_vec();
+    expected_patterns.sort_unstable();
     for (role, expected) in EXPECTED_PROV_PUT_CONDITIONS {
         let policy = load_policy(role);
         let unconditioned = unconditioned_put_patterns(&policy);
@@ -5709,30 +5802,20 @@ fn prov_put_grants_carry_exactly_the_expected_conditions() {
         }
 
         let mut conditions = Vec::new();
-        for stmt in policy_statements(&policy) {
-            let patterns =
-                object_key_patterns(policy.role, statement_sid(stmt), &statement_resources(stmt));
-            let Some(kind) = put_condition_of(stmt) else {
-                continue;
-            };
-            if !keys
-                .iter()
-                .any(|k| patterns.iter().any(|p| glob_matches(p, k)))
-            {
-                continue;
-            }
+        for (sid, kind, mut patterns) in prov_put_statements(&policy) {
+            patterns.sort_unstable();
             assert_eq!(
-                patterns,
-                [PROV_PATTERN],
-                "{role}/{}: a conditioned prov statement must name the provisioning \
-                 record and nothing else",
-                statement_sid(stmt)
+                patterns, expected_patterns,
+                "{role}/{sid}: a conditioned prov statement must name the three \
+                 provisioning record patterns and nothing else"
             );
             conditions.push(kind);
         }
+        conditions.sort_unstable();
+        let mut expected = expected.to_vec();
+        expected.sort_unstable();
         assert_eq!(
-            conditions.as_slice(),
-            *expected,
+            conditions, expected,
             "{role}: the conditioned PutObject statements reaching the provisioning \
              record are not the expected set"
         );
@@ -5747,11 +5830,87 @@ fn prov_put_grants_carry_exactly_the_expected_conditions() {
     }
 }
 
+/// The provisioning-record grants reach the metrics, logs and spans records
+/// and no other key ending in `/prov`: not a nested key under `c/`, `del/` or
+/// `l0/`, and not the `prov` key of alerts, audit or profiles. Fails when any
+/// prov statement is widened back to `t/*/*/prov`
+/// (`a_prov_grant_widened_to_any_signal_reaches_the_lookalikes`).
+#[test]
+fn prov_grants_reach_only_the_provisioned_signals_records() {
+    for role in ALL_ROLES {
+        let policy = load_policy(role);
+        let statements = prov_put_statements(&policy);
+        for (sid, _, patterns) in &statements {
+            for key in prov_witness_keys() {
+                assert!(
+                    patterns.iter().any(|p| glob_matches(p, &key)),
+                    "{role}/{sid}: does not reach the provisioning record {key:?}"
+                );
+            }
+        }
+        let overreach = prov_grant_overreach(&policy);
+        assert!(
+            overreach.is_empty(),
+            "{role}: a provisioning-record grant reaches keys that are not a \
+             provisioning record: {overreach:?}"
+        );
+    }
+}
+
+/// The negative witnesses are live: widening one shipped prov statement to
+/// `t/*/*/prov` makes every lookalike reachable. In-memory; the file on disk
+/// is untouched.
+#[test]
+fn a_prov_grant_widened_to_any_signal_reaches_the_lookalikes() {
+    let path = policy_json_path("maintain");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let mut json: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {path}: {e}"));
+    let target = json["Statement"]
+        .as_array_mut()
+        .expect("maintain.json Statement is an array")
+        .iter_mut()
+        .find(|stmt| stmt["Sid"] == serde_json::json!("MaintainProvCas"))
+        .expect("maintain.json carries a MaintainProvCas statement");
+    target["Resource"] = serde_json::json!("arn:aws:s3:::my-ravel-bucket/t/*/*/prov");
+    let widened = build_policy("maintain", &path, &json);
+    let reached: Vec<String> = prov_grant_overreach(&widened)
+        .into_iter()
+        .map(|(sid, key)| {
+            assert_eq!(sid, "MaintainProvCas");
+            key
+        })
+        .collect();
+    assert_eq!(reached, prov_lookalike_keys());
+}
+
+/// A `query` process checks a present provisioning record at startup and never
+/// adopts (`static_absent_policy` in `services/ravel-server/src/provisioning.rs`),
+/// so `query.json` holds no PutObject statement of any kind that reaches a
+/// provisioned signal's record.
+#[test]
+fn query_template_writes_no_provisioning_record() {
+    let query = load_policy("query");
+    let puts = put_resource_key_patterns(&query);
+    for key in prov_witness_keys() {
+        assert!(
+            !puts.iter().any(|p| glob_matches(p, &key)),
+            "query: a PutObject Allow reaches the provisioning record {key:?}. \
+             PutObject patterns: {puts:?}"
+        );
+    }
+    assert!(
+        !PROV_WRITE_CALL_SITES
+            .iter()
+            .any(|(_, role, _)| *role == "query"),
+        "query is not a provisioning-record writer"
+    );
+}
+
 /// Each production write of the provisioning record in `PROV_WRITE_CALL_SITES`
 /// is matched by a grant of its own kind on the role that issues it, for every
-/// signal. A create-only grant does not cover a `CasVersion` write, and a
-/// CAS-only grant does not cover a `CreateIfAbsent` one: IAM refuses each
-/// conditional kind under the other's Condition.
+/// provisioned signal. A create-only grant does not cover a `CasVersion` write,
+/// and a CAS-only grant does not cover a `CreateIfAbsent` one.
 #[test]
 fn every_prov_write_call_site_has_a_grant_of_its_kind() {
     for (call, role, kind) in PROV_WRITE_CALL_SITES {
@@ -5764,6 +5923,122 @@ fn every_prov_write_call_site_has_a_grant_of_its_kind() {
                  writes. {kind:?} patterns: {granted:?}"
             );
         }
+    }
+}
+
+/// `ravel-cli maintain migrate` runs under the Maintain credential (ADR-0066
+/// decision 5). Every object-store call it issues, traced from
+/// `migrate_family` (`crates/ravel-maintain/src/migrate.rs`) through the
+/// rewrite, claim and publish helpers, is reached by a `maintain.json` grant of
+/// the right kind, and no Deny cancels one. The two calls that end a walk are
+/// the cursor delete and the `CasVersion` floor raise on the provisioning
+/// record.
+#[test]
+fn maintain_template_covers_every_maintain_migrate_call() {
+    let maintain = load_policy("maintain");
+    let list_prefixes = list_prefix_patterns(&maintain, Some("Allow"));
+    let gets = key_patterns_for(&maintain, &["s3:GetObject"], Some("Allow"));
+    let unconditioned_puts = unconditioned_put_patterns(&maintain);
+    let deletes = delete_key_patterns(&maintain, "Allow");
+    let denied_deletes = delete_key_patterns(&maintain, "Deny");
+    let put_allowed = |key: &str, kind: PutCondition| {
+        unconditioned_puts.iter().any(|p| glob_matches(p, key))
+            || conditioned_put_patterns(&maintain, kind)
+                .iter()
+                .any(|p| glob_matches(p, key))
+    };
+
+    let tenant = test_tenant();
+    let hash = tenant.to_hex();
+    let writer_id = Uuid::from_u128(1);
+    let hour = 0;
+    for signal in PROVISIONED_SIGNALS {
+        let sig = signal.key_prefix();
+        let prov = format!("t/{hash}/{sig}/prov");
+        // migrate_cursor_key in crates/ravel-maintain/src/migrate.rs.
+        let cursor = format!("t/{hash}/{sig}/maint/migrate/rseg/cursor");
+        let shard_prefix = commit_shard_prefix(&tenant, signal, 0).expect("shard prefix");
+        let hour_prefix = commit_shard_hour_prefix(&tenant, signal, 0, hour).expect("hour prefix");
+        let l0_commit = commit_key(&tenant, signal, 0, hour, writer_id, 1, 1).expect("commit_key");
+        let compaction = compaction_record_key(&tenant, signal, 0, hour, hash16())
+            .expect("compaction_record_key");
+        let rewrite =
+            rewrite_record_key(&tenant, signal, 0, hour, hash16()).expect("rewrite_record_key");
+        let l0_data = data_key(&tenant, signal, 0, writer_id, 1, 1, &[0u8; 32]).expect("data_key");
+        let l1_part =
+            l1_part_key(&tenant, signal, 0, hour, hash16(), 0, hash16()).expect("l1_part_key");
+
+        // Reads: the record (scan range, floor, raise), the cursor, every
+        // commit, compaction and rewrite record, the L0 inputs, and the L1
+        // parts a converged publish HEADs.
+        for key in [
+            &prov,
+            &cursor,
+            &l0_commit,
+            &compaction,
+            &rewrite,
+            &l0_data,
+            &l1_part,
+        ] {
+            assert!(
+                gets.iter().any(|p| glob_matches(p, key)),
+                "maintain: no GetObject Allow reaches {key:?}, which maintain \
+                 migrate reads. Grants: {gets:?}"
+            );
+        }
+        // Listings: the shard's hours and each hour bucket.
+        for prefix in [&shard_prefix, &hour_prefix] {
+            assert!(
+                list_prefixes.iter().any(|p| glob_matches(p, prefix)),
+                "maintain: no ListBucket s3:prefix admits {prefix:?}, which \
+                 maintain migrate lists. s3:prefix values: {list_prefixes:?}"
+            );
+        }
+        // Writes: the cursor (create, then CAS), the L1 parts and the
+        // compaction record (create), and the floor raise (CAS on the record).
+        for (key, kind) in [
+            (&cursor, PutCondition::CreateOnly),
+            (&cursor, PutCondition::CasOnly),
+            (&l1_part, PutCondition::CreateOnly),
+            (&compaction, PutCondition::CreateOnly),
+            (&prov, PutCondition::CasOnly),
+        ] {
+            assert!(
+                put_allowed(key, kind),
+                "maintain: no PutObject Allow admits a {kind:?} write of {key:?}, \
+                 which maintain migrate issues"
+            );
+        }
+        assert!(
+            !unconditioned_puts.iter().any(|p| glob_matches(p, &prov)),
+            "maintain: the floor raise must be the only kind of record write"
+        );
+        // The cursor delete after every completed walk, which stops the run on
+        // a refusal.
+        assert!(
+            deletes.iter().any(|p| glob_matches(p, &cursor)),
+            "maintain: no delete Allow reaches the migrate cursor {cursor:?}. \
+             Grants: {deletes:?}"
+        );
+        assert!(
+            !denied_deletes.iter().any(|p| glob_matches(p, &cursor)),
+            "maintain: a delete Deny reaches the migrate cursor {cursor:?}"
+        );
+    }
+
+    // Startup and the bucket claim, signal-independent.
+    assert!(gets.iter().any(|p| glob_matches(p, "sys/tenancy")));
+    let claim = format!("{COMPACTION_CLAIMS_PREFIX}{}", "0".repeat(64));
+    assert!(
+        gets.iter().any(|p| glob_matches(p, &claim)),
+        "maintain: no GetObject Allow reaches the compaction claim {claim:?}"
+    );
+    for kind in [PutCondition::CreateOnly, PutCondition::CasOnly] {
+        assert!(
+            put_allowed(&claim, kind),
+            "maintain: no PutObject Allow admits a {kind:?} write of the \
+             compaction claim {claim:?}"
+        );
     }
 }
 
@@ -9513,6 +9788,18 @@ fn operation_vocabulary_is_consistent() {
     }
 }
 
+/// The `role/Sid` of every statement whose Resource carries IAM's
+/// single-character `?` wildcard.
+const QUESTION_MARK_RESOURCE_STATEMENTS: [&str; 7] = [
+    "gateway/GatewayAdmissionDelete",
+    "gateway/GatewayProvCreate",
+    "query/QueryManifestCreate",
+    "maintain/MaintainProvCreate",
+    "maintain/MaintainProvCas",
+    "admin/AdminProvCreate",
+    "admin/AdminProvCas",
+];
+
 /// Every shipped template under `deploy/iam` passes the choke point, and the set
 /// this file guards is exactly the set on disk. `ALL_ROLES` is hand-written, so
 /// without this a new template would ship unguarded.
@@ -9567,6 +9854,7 @@ fn every_shipped_template_passes_the_choke_point() {
                      pattern-set expectation in this file must be re-read"
                 );
             }
+            let mut carries_question_mark = false;
             for resource in statement_resources(stmt) {
                 if !resource.contains('?') {
                     continue;
@@ -9577,18 +9865,21 @@ fn every_shipped_template_passes_the_choke_point() {
                 // manifest, whose key has `/pq/t/` at those positions.
                 // The Query manifest create spells the tenant hash the same
                 // way, so the write reaches `t/<32 characters>/pq/t/` and no
-                // deeper `pq/t/` segment of another keyspace.
-                if (role, sid) == ("gateway", "GatewayAdmissionDelete")
-                    || (role, sid) == ("query", "QueryManifestCreate")
-                {
-                    question_mark_resources.push(format!("{role}/{sid}"));
+                // deeper `pq/t/` segment of another keyspace. The
+                // provisioning-record writes do too, so they reach only
+                // `t/<32 characters>/<signal>/prov`.
+                if QUESTION_MARK_RESOURCE_STATEMENTS.contains(&format!("{role}/{sid}").as_str()) {
+                    carries_question_mark = true;
                     continue;
                 }
                 panic!(
                     "{role}/{sid}: Resource {resource:?} carries a `?`, and only \
-                     gateway/GatewayAdmissionDelete and query/QueryManifestCreate \
-                     are allowed one. Same consequence as for Action above"
+                     {QUESTION_MARK_RESOURCE_STATEMENTS:?} are allowed one. Same \
+                     consequence as for Action above"
                 );
+            }
+            if carries_question_mark {
+                question_mark_resources.push(format!("{role}/{sid}"));
             }
         }
 
@@ -9607,13 +9898,12 @@ fn every_shipped_template_passes_the_choke_point() {
             );
         }
     }
+    question_mark_resources.sort();
+    let mut allowlisted: Vec<&str> = QUESTION_MARK_RESOURCE_STATEMENTS.to_vec();
+    allowlisted.sort_unstable();
     assert_eq!(
-        question_mark_resources,
-        [
-            "gateway/GatewayAdmissionDelete",
-            "query/QueryManifestCreate"
-        ],
-        "the two allowlisted `?` Resources must still be the only ones, and must \
+        question_mark_resources, allowlisted,
+        "the allowlisted `?` Resources must still be the only ones, and must \
          still carry their `?`"
     );
 }
