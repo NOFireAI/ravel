@@ -647,6 +647,24 @@ provenance and per-sample provenance column kept); RLOG and RSPAN parts go
 through their codec's compaction merge, so their part split can differ from the
 predecessor's.
 
+Note (2026-10-03, T6): the `migrate` walk calls the T5 writer for a sealed,
+untombstoned bucket that serves no below-target L0 record raw, holds no rewrite
+record, and whose authoritative compaction records carry parts below the target.
+Item 4 refuses only a contested component, but T5 also refuses a bucket where
+more than one compaction record survives supersession, each in its own
+component, because it re-encodes a bucket's one record only. Without a reason of
+its own that bucket would hold the floor down with nothing in the report, so
+`migrate` names it with a third blocked reason beside item 4's and the one for a
+writer switch that is off: `ReencodeBlockedReason::MultipleRecords`, alongside
+`ContestedOverlap` and `WriterDisabled`, on
+`FamilyMigrateReport::reencode_blocked`. A bucket counts as migrated only when
+this run published its version 2 record. The predecessor's parts keep counting
+toward the below-target figure until `sweep` reclaims it (item 6), so the floor
+is raised by the first `migrate` run after that sweep, through the existing
+fresh re-audit. The switch is still off by default and no operator flag turns it
+on yet; the `ravel-cli maintain migrate` flag and the report lines for the new
+reasons follow in a later task.
+
 ## Amendment (2026-10-03, #2271): a below-floor HEAD is rebuilt, not refused as newer
 
 <!-- amendment-applies: sections="2. Fail-closed-on-newer, everywhere, typed" pointer="below-floor HEAD amendment" -->
