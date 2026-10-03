@@ -1018,19 +1018,33 @@ error until `sys/gc` exists; the Deployment's restart policy brings it up on
 the first restart after maintain (or `gc-config set`) has created the object,
 with no other action needed.
 
-On AWS S3, a GET of an absent key is refused rather than reported missing when
-the credential holds no `s3:ListBucket` covering that key, and the gateway,
-query and maintain templates grant none covering `sys/tenancy` or `sys/gc`.
-Every server process reads `sys/qualification` and `sys/tenancy` before
-`sys/gc`, and these templates list none of the three. `ravel-cli store
-qualify` under Admin writes `sys/qualification`, but on a fresh
-AWS bucket under those templates any of the three, maintain included, can be
-refused the read of `sys/tenancy` before it gets to `sys/gc`, and no
-`ravel-cli` command creates `sys/tenancy`. A first startup there is not solved
-by start order yet: run the first startup against a fresh AWS bucket under a
-single credential that can create both objects (the shared
-`spec.storage.s3.credentialsSecretRef` form above), then move to per-role
-Secrets.
+On AWS S3, a GET of an absent key is refused rather than reported
+missing unless the credential holds an `s3:ListBucket` grant covering that key.
+The gateway, query and maintain templates in `deploy/iam/` grant one on exactly
+the keys each process reads where absence is normal, `sys/qualification`,
+`sys/tenancy` and `sys/gc` among them, and on nothing else. Per-role Secrets
+built from those templates therefore start a fresh AWS bucket in the order
+above with no manual step: the qualify Job writes `sys/qualification`, the
+maintain pod creates `sys/tenancy` and `sys/gc`, and the gateway and query
+Deployments follow. The per-tenant records (key epochs, provisioning records,
+metric metadata) are created by the server processes, at startup or on a
+tenant's first write.
+
+One case still needs a grant the templates leave to you: on a bucket whose
+default encryption is a customer-managed KMS key, creating `sys/tenancy` and
+`sys/gc` also needs `kms:GenerateDataKey` on that key. Add it to the roles
+that create those objects, or create them once under a credential that holds
+it.
+
+Policies copied from templates that predate those list grants cover none of
+these keys, so on a fresh AWS bucket every server process, maintain included,
+is refused the read of `sys/tenancy` before it gets to `sys/gc`, and no
+`ravel-cli` command creates `sys/tenancy`. Creating `sys/gc` with
+`ravel-cli gc-config set` under the Admin credential still works there but
+does not get past that refusal. Update the policies from `deploy/iam/`, or run
+the first startup against a fresh AWS bucket under a single credential that can
+create both objects (the shared `spec.storage.s3.credentialsSecretRef` form
+above), then move to per-role Secrets.
 
 ## Background
 

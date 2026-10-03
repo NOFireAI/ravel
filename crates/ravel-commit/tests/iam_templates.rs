@@ -516,7 +516,8 @@ const BUCKET_KEY_PREFIX: &str = "arn:aws:s3:::my-ravel-bucket/";
 /// being escaped to a literal `\?` that quietly matches nothing. The shipped
 /// templates carry a `?` only in the Resources of gateway's
 /// `GatewayAdmissionDelete`, query's `QueryManifestCreate` and the five
-/// provisioning-record write statements, and in no Action and no `s3:prefix`;
+/// provisioning-record write statements, in the `s3:prefix` values of the three
+/// `*ListTenantBootstrapKeys` statements, and in no Action;
 /// `every_shipped_template_passes_the_choke_point` asserts that (not assumes
 /// it) over Action, Resource, and the `s3:prefix` values it reads through
 /// `list_prefix_patterns`.
@@ -743,14 +744,19 @@ struct Policy {
 const HANDLED_STATEMENT_KEYS: &[&str] = &["Sid", "Effect", "Action", "Resource", "Condition"];
 
 /// The complete set of `Condition` operators any guard in this file reads on a
-/// list statement: `list_prefix_patterns` reads only its `StringLike` block.
-/// (The conditioned PutObject Conditions have their own exact-shape check,
-/// `validate_put_condition`.) A list statement whose Condition
-/// names any other operator -- a different comparison such as `StringNotLike`,
-/// or a set-qualified form such as `ForAnyValue:StringLike` -- carries a
-/// constraint no guard reasons about, so it must fail closed at
+/// list statement: `list_prefix_patterns` reads its one `StringLike` or
+/// `StringEquals` block. (The conditioned PutObject Conditions have their own
+/// exact-shape check, `validate_put_condition`.) A list statement whose
+/// Condition names any other operator -- a different comparison such as
+/// `StringNotLike`, or a set-qualified form such as `ForAnyValue:StringLike` --
+/// carries a constraint no guard reasons about, so it must fail closed at
 /// `validate_statement` rather than pass with its Condition unexamined.
-const HANDLED_CONDITION_OPERATORS: &[&str] = &["StringLike"];
+///
+/// IAM ANDs the operators of one Condition block, while `list_prefix_patterns`
+/// returns the union of their values, so `validate_condition` admits exactly
+/// one operator per list statement. A `StringEquals` value compares literally,
+/// so it may carry no `*` or `?`; that makes it read correctly as a glob.
+const HANDLED_CONDITION_OPERATORS: &[&str] = &["StringLike", "StringEquals"];
 
 /// The complete set of `Condition` keys any guard in this file reads, under a
 /// handled operator. Only `s3:prefix` is inspected (by `list_prefix_patterns`);
@@ -826,7 +832,8 @@ const NEGATED_OR_PRINCIPAL_KEYS: &[&str] =
 ///   and the normal mixed idiom (ListBucket + GetObject over the bucket ARN plus
 ///   an object prefix) is accepted because both classes are granted;
 /// - a `Condition` on a list statement, whose sub-shape is the one
-///   `StringLike`/`s3:prefix` block `list_prefix_patterns` reads; on any other
+///   `StringLike` or `StringEquals` `s3:prefix` block `list_prefix_patterns`
+///   reads; on any other
 ///   statement, no `Condition` unless it is one of the two PutObject shapes
 ///   `conditioned_put_patterns` reads (an `Allow` granting exactly
 ///   `s3:PutObject`, conditioned on `StringEquals` `s3:if-none-match` `*` or
@@ -925,13 +932,14 @@ const NEGATED_OR_PRINCIPAL_KEYS: &[&str] =
 ///   or a Condition on any non-ListBucket statement (read by no guard) other
 ///   than the exact create-only or CAS-only PutObject shape;
 /// - a `Condition` whose sub-shape is anything other than the one block a guard
-///   reads: it must be a non-empty JSON object of handled operators
-///   (`HANDLED_CONDITION_OPERATORS`, today `StringLike`), each a non-empty map of
-///   handled condition keys (`HANDLED_CONDITION_KEYS`, today `s3:prefix`) to a
-///   string or non-empty array of strings. A different operator, a set-qualified
-///   operator, an unhandled key, or an empty `{}`/`{"StringLike":{}}` is a shape
-///   `list_prefix_patterns` cannot read, so it fails closed here rather than
-///   contributing nothing silently;
+///   reads: it must be a JSON object of exactly one handled operator
+///   (`HANDLED_CONDITION_OPERATORS`, today `StringLike` and `StringEquals`),
+///   mapping a non-empty set of handled condition keys (`HANDLED_CONDITION_KEYS`,
+///   today `s3:prefix`) to a string or non-empty array of strings, with no `*`
+///   or `?` in a `StringEquals` value. A different operator, a set-qualified
+///   operator, two operators, an unhandled key, or an empty
+///   `{}`/`{"StringLike":{}}` is a shape `list_prefix_patterns` cannot read, so
+///   it fails closed here rather than contributing nothing silently;
 /// - on an `Allow` only, an `s3:prefix` VALUE that admits every key in
 ///   `key_domain()` (a bare `"*"`, any all-`"*"` run, `"?*"`, `"*/*"`):
 ///   shape-valid but vacuous, letting a caller list the whole bucket exactly as
@@ -1259,6 +1267,14 @@ fn validate_condition(
              block (issue #1346, F2)"
         ));
     }
+    if cond_obj.len() > 1 {
+        let operators: Vec<&String> = cond_obj.keys().collect();
+        return Err(format!(
+            "{role}/{sid} (statement #{index}): Condition names more than one operator \
+             {operators:?}. IAM ANDs them, while list_prefix_patterns reads the union of \
+             their values, so a list statement carries exactly one operator"
+        ));
+    }
     for (operator, keys) in cond_obj {
         if !HANDLED_CONDITION_OPERATORS.contains(&operator.as_str()) {
             return Err(format!(
@@ -1296,6 +1312,18 @@ fn validate_condition(
                     "{role}/{sid} (statement #{index}): Condition {operator:?}.{cond_key:?} is \
                      neither a string nor a non-empty array of strings: {value:?}"
                 ));
+            }
+            if operator == "StringEquals" {
+                for prefix in condition_value_strings(value) {
+                    if prefix.contains(['*', '?']) {
+                        return Err(format!(
+                            "{role}/{sid} (statement #{index}): StringEquals {cond_key:?} value \
+                             {prefix:?} carries a wildcard character. StringEquals compares it \
+                             literally, while every guard here reads it as a glob, so a \
+                             wildcard prefix belongs under StringLike"
+                        ));
+                    }
+                }
             }
             // Shape is not enough: the VALUE must constrain -- but only on an
             // `Allow`, for the same reason the object-key vacuity check is gated
@@ -1587,9 +1615,11 @@ fn statement_sid(stmt: &serde_json::Value) -> &str {
     )
 }
 
-/// `s3:prefix` patterns from the `Condition.StringLike` block of every statement
-/// whose `Effect` matches `effect` (`None` matches any) and whose `Action` grants
-/// a list operation.
+/// `s3:prefix` patterns from the `Condition.StringLike` or
+/// `Condition.StringEquals` block of every statement whose `Effect` matches
+/// `effect` (`None` matches any) and whose `Action` grants a list operation. A
+/// `StringEquals` value carries no wildcard (`validate_condition`), so it reads
+/// as a glob matching only itself.
 ///
 /// The `effect` argument is the same one `key_patterns_for` takes, and it exists
 /// for the same reason: a prefix is read as a permission or a prohibition
@@ -1623,10 +1653,17 @@ fn list_prefix_patterns(policy: &Policy, effect: Option<&str>) -> Vec<String> {
         // IAM allows a single `s3:prefix` value as a bare string or an array;
         // read both so a bare-string prefix is not silently skipped. Any other
         // shape is unreachable: the choke point requires a list statement to
-        // carry a non-empty StringLike/s3:prefix Condition whose value is a
-        // string or non-empty array of strings, so the panic arm fires only for
-        // a statement that never passed validation.
-        match &stmt["Condition"]["StringLike"]["s3:prefix"] {
+        // carry exactly one StringLike or StringEquals s3:prefix block whose
+        // value is a string or non-empty array of strings, with no wildcard in
+        // a StringEquals value, so the panic arm fires only for a statement
+        // that never passed validation.
+        let condition = &stmt["Condition"];
+        let block = if condition.get("StringEquals").is_some() {
+            &condition["StringEquals"]
+        } else {
+            &condition["StringLike"]
+        };
+        match &block["s3:prefix"] {
             serde_json::Value::String(s) => out.push(s.clone()),
             serde_json::Value::Array(patterns) => {
                 for p in patterns {
@@ -1634,7 +1671,7 @@ fn list_prefix_patterns(policy: &Policy, effect: Option<&str>) -> Vec<String> {
                 }
             }
             other => panic!(
-                "{}/{}: list statement's Condition.StringLike.s3:prefix is {other:?} -- the \
+                "{}/{}: list statement's Condition s3:prefix is {other:?} -- the \
                  choke point requires a string or non-empty array of strings here, so \
                  reaching this means a guard ran on an unvalidated statement",
                 policy.role,
@@ -2214,8 +2251,20 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/*/c/*",
             "t/*/*/admission/*",
             "t/*/catalog/*/*",
+            // GatewayListBootstrapKeys and GatewayListTenantBootstrapKeys
+            // (bootstrap_list_grants_carry_exactly_the_expected_conditions).
+            "sys/tenancy",
+            "sys/qualification",
+            "sys/gc",
+            "sys/auth",
+            BOOTSTRAP_CONFIG_PATTERN,
+            BOOTSTRAP_ENC_PATTERN,
+            BOOTSTRAP_META_PATTERN,
+            PROV_M_PATTERN,
+            PROV_L_PATTERN,
+            PROV_S_PATTERN,
         ],
-        list_actions: &["s3:ListBucket"],
+        list_actions: &["s3:ListBucket", "s3:ListBucket", "s3:ListBucket"],
         gets: &[
             "t/*/*/l0/*",
             "t/*/*/c/*",
@@ -2281,8 +2330,20 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "admission/query/*",
             "sys/query/workers/*",
             "t/*/pq/t/*",
+            // QueryListBootstrapKeys and QueryListTenantBootstrapKeys
+            // (bootstrap_list_grants_carry_exactly_the_expected_conditions).
+            "sys/tenancy",
+            "sys/qualification",
+            "sys/gc",
+            "sys/auth",
+            BOOTSTRAP_CONFIG_PATTERN,
+            BOOTSTRAP_ENC_PATTERN,
+            BOOTSTRAP_META_PATTERN,
+            BOOTSTRAP_ANY_SIGNAL_PROV_PATTERN,
+            BOOTSTRAP_ALERT_STATE_PATTERN,
+            BOOTSTRAP_PQ_GRANTS_PATTERN,
         ],
-        list_actions: &["s3:ListBucket"],
+        list_actions: &["s3:ListBucket", "s3:ListBucket", "s3:ListBucket"],
         gets: &[
             "t/*/*/c/*",
             "t/*/*/l0/*",
@@ -2449,8 +2510,22 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/a/",
             "quarantine/t/*/a/",
             "t/*/pq/t/*",
+            // MaintainListBootstrapKeys and MaintainListTenantBootstrapKeys
+            // (bootstrap_list_grants_carry_exactly_the_expected_conditions).
+            "sys/tenancy",
+            "sys/qualification",
+            "sys/gc",
+            BOOTSTRAP_CONFIG_PATTERN,
+            BOOTSTRAP_ENC_PATTERN,
+            PROV_M_PATTERN,
+            PROV_L_PATTERN,
+            PROV_S_PATTERN,
+            BOOTSTRAP_HEAD_M_PATTERN,
+            BOOTSTRAP_HEAD_L_PATTERN,
+            BOOTSTRAP_HEAD_S_PATTERN,
+            BOOTSTRAP_ALERT_STATE_PATTERN,
         ],
-        list_actions: &["s3:ListBucket"],
+        list_actions: &["s3:ListBucket", "s3:ListBucket", "s3:ListBucket"],
         gets: &[
             "t/*/*/l0/*",
             "t/*/*/c/*",
@@ -7744,8 +7819,8 @@ fn empty_action_or_resource_array_fails_closed() {
 /// such as `s3:delimiter`, or a non-object Condition passed validation and
 /// `list_prefix_patterns` then found no `["StringLike"]["s3:prefix"]` array and
 /// silently contributed nothing -- the skip class moved one level down into a
-/// handled key. Synthetic, not `deploy/iam/*.json`: every shipped Condition is
-/// exactly `StringLike`/`s3:prefix`.
+/// handled key. Synthetic, not `deploy/iam/*.json`: every shipped list Condition
+/// is exactly one `StringLike` or `StringEquals` `s3:prefix` block.
 #[test]
 fn unhandled_condition_shape_fails_closed() {
     let cases = [
@@ -8213,7 +8288,7 @@ fn pre_fix_validate_condition(condition: &serde_json::Value) -> Result<(), Strin
 /// {}}` must fail closed. Pre-fix, a `for` over an empty map iterated zero times,
 /// so both returned Ok -- the vacuous-set bug round two fixed for arrays,
 /// re-created in the code that fixed it. Synthetic, not `deploy/iam/*.json`: the
-/// shipped Conditions are all non-empty StringLike/s3:prefix blocks.
+/// shipped list Conditions are all non-empty `s3:prefix` blocks.
 #[test]
 fn empty_condition_or_stringlike_map_fails_closed() {
     let cases = [
@@ -9871,6 +9946,14 @@ const QUESTION_MARK_RESOURCE_STATEMENTS: [&str; 7] = [
     "admin/AdminProvCas",
 ];
 
+/// The `role/Sid` of every list statement whose `s3:prefix` carries IAM's
+/// single-character `?` wildcard.
+const QUESTION_MARK_PREFIX_STATEMENTS: [&str; 3] = [
+    "gateway/GatewayListTenantBootstrapKeys",
+    "query/QueryListTenantBootstrapKeys",
+    "maintain/MaintainListTenantBootstrapKeys",
+];
+
 /// Every shipped template under `deploy/iam` passes the choke point, and the set
 /// this file guards is exactly the set on disk. `ALL_ROLES` is hand-written, so
 /// without this a new template would ship unguarded.
@@ -9901,6 +9984,7 @@ fn every_shipped_template_passes_the_choke_point() {
     );
 
     let mut question_mark_resources: Vec<String> = Vec::new();
+    let mut question_mark_prefixes: Vec<String> = Vec::new();
     for role in ALL_ROLES {
         // load_policy panics on any rejection, naming role, index, Sid and field.
         let policy = load_policy(role);
@@ -9957,16 +10041,28 @@ fn every_shipped_template_passes_the_choke_point() {
         // `s3:prefix` Condition values are the third field fed through
         // `glob_to_regex` (via `glob_admits_everything` in `validate_condition`
         // and `glob_matches` in `discovery_prefix_admitted_for_every_discovering_role`),
-        // so the no-`?` property must be asserted over them too or the
+        // so the `?` allowlist must be asserted over them too or the
         // glob_to_regex doc's citation of this test would overstate its scope.
-        for prefix in list_prefix_patterns(&policy, None) {
+        // The bootstrap-key statements spell the tenant hash as 32 `?`, so the
+        // listing they admit reaches one key shape and no deeper segment.
+        for stmt in policy_statements(&policy) {
+            let sid = statement_sid(stmt);
+            let single = Policy {
+                role,
+                statements: serde_json::json!([stmt.clone()]),
+            };
+            let prefixes = list_prefix_patterns(&single, None);
+            if !prefixes.iter().any(|p| p.contains('?')) {
+                continue;
+            }
             assert!(
-                !prefix.contains('?'),
-                "{role}: s3:prefix {prefix:?} carries a `?`. glob_to_regex resolves \
-                 it as IAM's single-character wildcard; the doc claim that no \
-                 shipped s3:prefix uses one is now false and every prefix axis in \
-                 this file must be re-read"
+                QUESTION_MARK_PREFIX_STATEMENTS.contains(&format!("{role}/{sid}").as_str()),
+                "{role}/{sid}: s3:prefix {prefixes:?} carries a `?`, and only \
+                 {QUESTION_MARK_PREFIX_STATEMENTS:?} are allowed one. glob_to_regex \
+                 resolves it as IAM's single-character wildcard, so every prefix \
+                 axis in this file must be re-read"
             );
+            question_mark_prefixes.push(format!("{role}/{sid}"));
         }
     }
     question_mark_resources.sort();
@@ -9976,6 +10072,14 @@ fn every_shipped_template_passes_the_choke_point() {
         question_mark_resources, allowlisted,
         "the allowlisted `?` Resources must still be the only ones, and must \
          still carry their `?`"
+    );
+    question_mark_prefixes.sort();
+    let mut allowlisted: Vec<&str> = QUESTION_MARK_PREFIX_STATEMENTS.to_vec();
+    allowlisted.sort_unstable();
+    assert_eq!(
+        question_mark_prefixes, allowlisted,
+        "the allowlisted `?` s3:prefix statements must still be the only ones, \
+         and must still carry their `?`"
     );
 }
 
@@ -10271,5 +10375,615 @@ fn maintain_template_covers_every_unnamed_marker_call() {
                  Denies: {denied:?}"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bootstrap-key ListBucket grants (issue #2332). On AWS S3 a GET or HEAD of an
+// absent key answers 403 unless the caller holds an `s3:ListBucket` whose
+// `s3:prefix` condition covers that key, and 404 when it does. Each server role
+// lists exactly the single keys it reads where the code treats absence as a
+// normal state, so the read sees `NotFound` instead of `AccessDenied`.
+// ---------------------------------------------------------------------------
+
+/// The per-tenant bootstrap keys. The tenant hash is 32 single-character
+/// wildcards and no pattern carries a `*`, so each admits one key shape and no
+/// listing of anything below or beside it.
+const BOOTSTRAP_CONFIG_PATTERN: &str = "t/????????????????????????????????/config";
+const BOOTSTRAP_ENC_PATTERN: &str = "t/????????????????????????????????/enc";
+const BOOTSTRAP_META_PATTERN: &str = "t/????????????????????????????????/m/meta";
+const BOOTSTRAP_ANY_SIGNAL_PROV_PATTERN: &str = "t/????????????????????????????????/?/prov";
+const BOOTSTRAP_ALERT_STATE_PATTERN: &str = "t/????????????????????????????????/a/state/latest";
+const BOOTSTRAP_PQ_GRANTS_PATTERN: &str = "t/????????????????????????????????/pq/grants";
+const BOOTSTRAP_HEAD_M_PATTERN: &str = "t/????????????????????????????????/catalog/m/HEAD";
+const BOOTSTRAP_HEAD_L_PATTERN: &str = "t/????????????????????????????????/catalog/l/HEAD";
+const BOOTSTRAP_HEAD_S_PATTERN: &str = "t/????????????????????????????????/catalog/s/HEAD";
+
+/// One server role's two bootstrap-key list statements. IAM ANDs the operators
+/// of one Condition block, so the fixed keys (`StringEquals`) and the
+/// per-tenant keys (`StringLike`) need a statement each.
+struct ExpectedBootstrapGrants {
+    role: &'static str,
+    fixed_sid: &'static str,
+    fixed_keys: &'static [&'static str],
+    tenant_sid: &'static str,
+    tenant_patterns: &'static [&'static str],
+}
+
+const EXPECTED_BOOTSTRAP_GRANTS: [ExpectedBootstrapGrants; 3] = [
+    ExpectedBootstrapGrants {
+        role: "gateway",
+        fixed_sid: "GatewayListBootstrapKeys",
+        fixed_keys: &["sys/tenancy", "sys/qualification", "sys/gc", "sys/auth"],
+        tenant_sid: "GatewayListTenantBootstrapKeys",
+        tenant_patterns: &[
+            BOOTSTRAP_CONFIG_PATTERN,
+            BOOTSTRAP_ENC_PATTERN,
+            BOOTSTRAP_META_PATTERN,
+            PROV_M_PATTERN,
+            PROV_L_PATTERN,
+            PROV_S_PATTERN,
+        ],
+    },
+    ExpectedBootstrapGrants {
+        role: "query",
+        fixed_sid: "QueryListBootstrapKeys",
+        fixed_keys: &["sys/tenancy", "sys/qualification", "sys/gc", "sys/auth"],
+        tenant_sid: "QueryListTenantBootstrapKeys",
+        tenant_patterns: &[
+            BOOTSTRAP_CONFIG_PATTERN,
+            BOOTSTRAP_ENC_PATTERN,
+            BOOTSTRAP_META_PATTERN,
+            BOOTSTRAP_ANY_SIGNAL_PROV_PATTERN,
+            BOOTSTRAP_ALERT_STATE_PATTERN,
+            BOOTSTRAP_PQ_GRANTS_PATTERN,
+        ],
+    },
+    ExpectedBootstrapGrants {
+        role: "maintain",
+        fixed_sid: "MaintainListBootstrapKeys",
+        fixed_keys: &["sys/tenancy", "sys/qualification", "sys/gc"],
+        tenant_sid: "MaintainListTenantBootstrapKeys",
+        tenant_patterns: &[
+            BOOTSTRAP_CONFIG_PATTERN,
+            BOOTSTRAP_ENC_PATTERN,
+            PROV_M_PATTERN,
+            PROV_L_PATTERN,
+            PROV_S_PATTERN,
+            BOOTSTRAP_HEAD_M_PATTERN,
+            BOOTSTRAP_HEAD_L_PATTERN,
+            BOOTSTRAP_HEAD_S_PATTERN,
+            BOOTSTRAP_ALERT_STATE_PATTERN,
+        ],
+    },
+];
+
+/// One single-key read whose `NotFound` the code handles as a normal state.
+struct BootstrapRead {
+    role: &'static str,
+    key: String,
+    call_site: &'static str,
+    /// The list statement whose `s3:prefix` admits `key`: one of the role's
+    /// two bootstrap statements, or an existing statement that already did.
+    admitted_by: &'static str,
+}
+
+/// Every single-key read, per server role, on a startup or first-request path,
+/// whose absence the code treats as a normal state, written in the shape each
+/// key builder produces for `test_tenant()`. `all` mode is the union.
+fn bootstrap_reads() -> Vec<BootstrapRead> {
+    let hex = test_tenant().to_hex();
+    let mut reads = Vec::new();
+    let mut add = |role, key: String, call_site, admitted_by| {
+        reads.push(BootstrapRead {
+            role,
+            key,
+            call_site,
+            admitted_by,
+        });
+    };
+    for (role, fixed_sid, tenant_sid) in [
+        (
+            "gateway",
+            "GatewayListBootstrapKeys",
+            "GatewayListTenantBootstrapKeys",
+        ),
+        (
+            "query",
+            "QueryListBootstrapKeys",
+            "QueryListTenantBootstrapKeys",
+        ),
+        (
+            "maintain",
+            "MaintainListBootstrapKeys",
+            "MaintainListTenantBootstrapKeys",
+        ),
+    ] {
+        add(
+            role,
+            "sys/qualification".to_string(),
+            "qualification::enforce (services/ravel-server/src/qualification.rs), startup",
+            fixed_sid,
+        );
+        add(
+            role,
+            "sys/tenancy".to_string(),
+            "read_marker in tenancy::resolve_and_pin (services/ravel-server/src/tenancy.rs), \
+             startup; store_probe::run_probe_cycle",
+            fixed_sid,
+        );
+        add(
+            role,
+            "sys/gc".to_string(),
+            "read_gc_config in bootstrap_gc_config (crates/ravel-maintain/src/gc_config.rs), \
+             startup",
+            fixed_sid,
+        );
+        add(
+            role,
+            format!("t/{hex}/config"),
+            "read_config (crates/ravel-catalog/src/tenant_config.rs): the gateway limits and \
+             indexed-field refreshes, the query declared-column refresh, the maintain \
+             lifecycle discovery, retention window and fold",
+            tenant_sid,
+        );
+        add(
+            role,
+            format!("t/{hex}/enc"),
+            "read_epochs_from_store in bootstrap_tenant_epoch \
+             (services/ravel-server/src/tenant_kms.rs), startup under --tenant-kms-config",
+            tenant_sid,
+        );
+    }
+    for role in ["gateway", "query"] {
+        let fixed_sid = if role == "gateway" {
+            "GatewayListBootstrapKeys"
+        } else {
+            "QueryListBootstrapKeys"
+        };
+        let tenant_sid = if role == "gateway" {
+            "GatewayListTenantBootstrapKeys"
+        } else {
+            "QueryListTenantBootstrapKeys"
+        };
+        add(
+            role,
+            "sys/auth".to_string(),
+            "read_auth_map in DurableAuthState::refresh \
+             (services/ravel-server/src/lifecycle_refresh.rs), startup and refresh, keyed bucket",
+            fixed_sid,
+        );
+        add(
+            role,
+            metrics_meta_key(),
+            "read_metrics_meta: the gateway metadata sink flush, the query metadata cache",
+            tenant_sid,
+        );
+    }
+    for signal in PROVISIONED_SIGNALS {
+        let key = format!("t/{hex}/{}/prov", signal.key_prefix());
+        add(
+            "gateway",
+            key.clone(),
+            "validate_or_adopt via ProvisioningRecordWriter::ensure and \
+             validate_static_provisioning (services/ravel-server/src/provisioning.rs)",
+            "GatewayListTenantBootstrapKeys",
+        );
+        add(
+            "maintain",
+            key,
+            "validate_or_adopt and read_generations_from_store in the maintain tick \
+             (services/ravel-server/src/maintain.rs); validate_static_provisioning",
+            "MaintainListTenantBootstrapKeys",
+        );
+        add(
+            "maintain",
+            format!("t/{hex}/catalog/{}/HEAD", signal.key_prefix()),
+            "get_head in the scheduled fold (crates/ravel-catalog/src/fold.rs)",
+            "MaintainListTenantBootstrapKeys",
+        );
+    }
+    // The query catalog enforces provisioning, so every resolve reads the
+    // queried signal's record, including the signals that never get one.
+    for signal in ALL_SIGNALS {
+        add(
+            "query",
+            format!("t/{hex}/{}/prov", signal.key_prefix()),
+            "enforce_provisioning_once and read_scan_generations \
+             (crates/ravel-catalog/src/catalog.rs) on each resolve; \
+             validate_static_provisioning",
+            "QueryListTenantBootstrapKeys",
+        );
+        add(
+            "query",
+            format!("t/{hex}/catalog/{}/HEAD", signal.key_prefix()),
+            "read_head (crates/ravel-catalog/src/snapshot_resolve.rs) and the on-demand fold",
+            "QueryList",
+        );
+    }
+    add(
+        "query",
+        alert_state_memo_key(),
+        "read_alert_state_memo in the alert evaluator tick (services/ravel-server/src/alerting.rs)",
+        "QueryListTenantBootstrapKeys",
+    );
+    add(
+        "query",
+        parquet_grants_key(),
+        "grants::list (crates/ravel-pqtable/src/grants.rs), Parquet table resolve and DDL",
+        "QueryListTenantBootstrapKeys",
+    );
+    add(
+        "maintain",
+        alert_state_memo_key(),
+        "read_alert_state_memo in alert_keep_set (services/ravel-server/src/maintain.rs)",
+        "MaintainListTenantBootstrapKeys",
+    );
+    // `cursor_key` in services/ravel-server/src/scrub.rs.
+    add(
+        "maintain",
+        format!("t/{hex}/m/maint/scrub/0000.cursor"),
+        "load_cursor (services/ravel-server/src/scrub.rs)",
+        "MaintainList",
+    );
+    reads
+}
+
+/// Keys and listing prefixes no bootstrap statement may admit beyond the ones a
+/// role's own reads name: listing prefixes above a bootstrap key, a key one
+/// segment deeper, and every per-tenant read's key under a tenant segment one
+/// character narrower (31) or wider (33) than a tenant hash.
+fn bootstrap_negative_witnesses() -> Vec<String> {
+    let hex = test_tenant().to_hex();
+    let narrow = &hex[..hex.len() - 1];
+    let wide = format!("{hex}0");
+    assert_eq!((narrow.len(), wide.len()), (31, 33));
+    let mut keys: Vec<String> = [
+        "sys/",
+        "sys/t/",
+        "t/",
+        "sys/gc/x",
+        "sys/tenancy/x",
+        "sys/qualification/x",
+        "sys/auth/x",
+    ]
+    .iter()
+    .map(|k| (*k).to_string())
+    .collect();
+    for suffix in [
+        "",
+        "m/",
+        "a/",
+        "catalog/",
+        "catalog/m/",
+        "config/x",
+        "enc/x",
+        "m/meta/x",
+        "m/prov/x",
+        "a/state/latest/x",
+        "pq/grants/x",
+        "catalog/m/HEAD/x",
+        "catalog/m/snap/0000000000000000.csnap",
+    ] {
+        keys.push(format!("t/{hex}/{suffix}"));
+    }
+    for read in bootstrap_reads() {
+        if let Some(rest) = read.key.strip_prefix(&format!("t/{hex}/")) {
+            keys.push(format!("t/{narrow}/{rest}"));
+            keys.push(format!("t/{wide}/{rest}"));
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// The candidates out of `key_domain()`, the bootstrap reads and the negative
+/// witnesses that `expected`'s two statements in `policy` admit.
+fn bootstrap_admitted(
+    policy: &Policy,
+    expected: &ExpectedBootstrapGrants,
+) -> std::collections::BTreeSet<String> {
+    let statements: Vec<serde_json::Value> = policy_statements(policy)
+        .iter()
+        .filter(|s| {
+            let sid = statement_sid(s);
+            sid == expected.fixed_sid || sid == expected.tenant_sid
+        })
+        .cloned()
+        .collect();
+    let bootstrap_only = Policy {
+        role: policy.role,
+        statements: serde_json::Value::Array(statements),
+    };
+    let prefixes = list_prefix_patterns(&bootstrap_only, Some("Allow"));
+    let mut candidates: Vec<String> = key_domain().to_vec();
+    candidates.extend(bootstrap_reads().into_iter().map(|r| r.key));
+    candidates.extend(bootstrap_negative_witnesses());
+    candidates
+        .into_iter()
+        .filter(|key| prefixes.iter().any(|p| glob_matches(p, key)))
+        .collect()
+}
+
+/// `Ok` when `expected`'s two statements in `policy` admit exactly the keys of
+/// the role's own bootstrap reads, out of every candidate `bootstrap_admitted`
+/// tries; otherwise the extra and missing keys.
+fn check_bootstrap_grants_admit_only(
+    policy: &Policy,
+    expected: &ExpectedBootstrapGrants,
+) -> Result<(), String> {
+    let wanted: std::collections::BTreeSet<String> = bootstrap_reads()
+        .into_iter()
+        .filter(|r| {
+            r.role == expected.role
+                && (r.admitted_by == expected.fixed_sid || r.admitted_by == expected.tenant_sid)
+        })
+        .map(|r| r.key)
+        .collect();
+    let admitted = bootstrap_admitted(policy, expected);
+    let extra: Vec<&String> = admitted.difference(&wanted).collect();
+    let missing: Vec<&String> = wanted.difference(&admitted).collect();
+    if extra.is_empty() && missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{}: the bootstrap list statements admit {extra:?}, which no bootstrap read \
+             of this role names, and miss {missing:?}",
+            expected.role
+        ))
+    }
+}
+
+/// Each server role's two bootstrap statements carry exactly the expected
+/// Condition: the fixed keys under `StringEquals`, the per-tenant keys under
+/// `StringLike` with a 32-wildcard tenant segment and no `*`. The template
+/// holds no other statement named for bootstrap keys.
+#[test]
+fn bootstrap_list_grants_carry_exactly_the_expected_conditions() {
+    for expected in &EXPECTED_BOOTSTRAP_GRANTS {
+        let role = expected.role;
+        let policy = load_policy(role);
+        let mut bootstrap_sids: Vec<&str> = policy_statements(&policy)
+            .iter()
+            .map(statement_sid)
+            .filter(|sid| sid.contains("Bootstrap"))
+            .collect();
+        bootstrap_sids.sort_unstable();
+        let mut want = vec![expected.fixed_sid, expected.tenant_sid];
+        want.sort_unstable();
+        assert_eq!(bootstrap_sids, want, "{role}: bootstrap list statements");
+
+        for (sid, operator, values) in [
+            (expected.fixed_sid, "StringEquals", expected.fixed_keys),
+            (expected.tenant_sid, "StringLike", expected.tenant_patterns),
+        ] {
+            let stmt = policy_statements(&policy)
+                .iter()
+                .find(|s| statement_sid(s) == sid)
+                .unwrap_or_else(|| panic!("{role}: no statement {sid}"));
+            assert_eq!(
+                stmt,
+                &serde_json::json!({
+                    "Sid": sid,
+                    "Effect": "Allow",
+                    "Action": "s3:ListBucket",
+                    "Resource": BUCKET_ARN,
+                    "Condition": {operator: {"s3:prefix": values}},
+                }),
+                "{role}/{sid}: the statement is not exactly the expected list grant"
+            );
+        }
+        for key in expected.fixed_keys {
+            assert!(
+                key.starts_with("sys/") && !key.contains(['*', '?']),
+                "{role}: fixed bootstrap key {key:?}"
+            );
+        }
+        for pattern in expected.tenant_patterns {
+            let segments: Vec<&str> = pattern.split('/').collect();
+            assert_eq!(
+                (segments[0], segments[1]),
+                ("t", "?".repeat(test_tenant().to_hex().len()).as_str()),
+                "{role}: {pattern:?} must spell the tenant hash as one `?` per character"
+            );
+            assert!(!pattern.contains('*'), "{role}: {pattern:?} carries a `*`");
+            for segment in &segments[2..] {
+                assert!(
+                    *segment == "?" || !segment.contains('?'),
+                    "{role}: {pattern:?} has a `?` outside the tenant and signal segments"
+                );
+            }
+        }
+    }
+}
+
+/// Every bootstrap read in `bootstrap_reads` is admitted by the list statement
+/// it names, which belongs to that role, and its GET is granted. A read the
+/// discovery statement already covered names that statement.
+#[test]
+fn every_bootstrap_read_is_admitted_by_its_roles_list_grant() {
+    let reads = bootstrap_reads();
+    for role in ROLES_WITH_DISCOVERY {
+        assert!(
+            reads.iter().any(|r| r.role == role),
+            "{role}: no bootstrap read listed"
+        );
+    }
+    for read in &reads {
+        let policy = load_policy(read.role);
+        let stmt = policy_statements(&policy)
+            .iter()
+            .find(|s| statement_sid(s) == read.admitted_by)
+            .unwrap_or_else(|| panic!("{}: no statement {}", read.role, read.admitted_by));
+        let single = Policy {
+            role: read.role,
+            statements: serde_json::json!([stmt.clone()]),
+        };
+        let prefixes = list_prefix_patterns(&single, Some("Allow"));
+        assert!(
+            prefixes.iter().any(|p| glob_matches(p, &read.key)),
+            "{}/{}: s3:prefix {prefixes:?} does not admit {:?}, read by {}. Without it \
+             S3 answers the read of an absent key with 403, not 404",
+            read.role,
+            read.admitted_by,
+            read.key,
+            read.call_site
+        );
+        let gets = key_patterns_for(&policy, &["s3:GetObject"], Some("Allow"));
+        assert!(
+            gets.iter().any(|p| glob_matches(p, &read.key)),
+            "{}: no GetObject Allow reaches {:?}, read by {}",
+            read.role,
+            read.key,
+            read.call_site
+        );
+    }
+}
+
+/// The bootstrap statements admit no key beyond their role's own bootstrap
+/// reads: not a sibling key another role reads, not a key one segment deeper,
+/// not a listing prefix such as `sys/` or `t/<hash>/`, and not a tenant
+/// segment one character narrower or wider than a tenant hash.
+#[test]
+fn bootstrap_list_grants_admit_no_other_key() {
+    let hex = test_tenant().to_hex();
+    for expected in &EXPECTED_BOOTSTRAP_GRANTS {
+        let policy = load_policy(expected.role);
+        check_bootstrap_grants_admit_only(&policy, expected).unwrap_or_else(|e| panic!("{e}"));
+
+        // The witnesses are live: each is in the candidate set and refused.
+        let admitted = bootstrap_admitted(&policy, expected);
+        let mut refused = vec![
+            "sys/".to_string(),
+            "t/".to_string(),
+            format!("t/{hex}/"),
+            "sys/gc/x".to_string(),
+            format!("t/{hex}/enc/x"),
+            format!("t/{}/enc", &hex[..hex.len() - 1]),
+            format!("t/{hex}0/enc"),
+            alert_lease_key(),
+            format!("sys/t/{hex}"),
+        ];
+        if expected.role == "maintain" {
+            refused.push("sys/auth".to_string());
+            refused.push(metrics_meta_key());
+            refused.push(format!("t/{hex}/a/prov"));
+        }
+        if expected.role == "gateway" {
+            refused.push(alert_state_memo_key());
+            refused.push(format!("t/{hex}/catalog/m/HEAD"));
+        }
+        for key in &refused {
+            assert!(
+                !admitted.contains(key),
+                "{}: the bootstrap list statements admit {key:?}",
+                expected.role
+            );
+        }
+    }
+}
+
+/// A list Condition carries exactly one operator, and a `StringEquals` value no
+/// wildcard; `list_prefix_patterns` reads a `StringEquals` block.
+#[test]
+fn list_condition_operator_rules_fail_closed() {
+    let stmt = |condition: serde_json::Value| {
+        serde_json::json!({
+            "Sid": "Fixture",
+            "Effect": "Allow",
+            "Action": "s3:ListBucket",
+            "Resource": BUCKET_ARN,
+            "Condition": condition,
+        })
+    };
+    let exact = stmt(serde_json::json!({"StringEquals": {"s3:prefix": ["sys/gc", "sys/tenancy"]}}));
+    validate_statement("fixture", 0, &exact).expect("an exact-key StringEquals list Condition");
+    let policy = Policy {
+        role: "fixture",
+        statements: serde_json::json!([exact]),
+    };
+    assert_eq!(
+        list_prefix_patterns(&policy, Some("Allow")),
+        ["sys/gc", "sys/tenancy"]
+    );
+
+    let both = stmt(serde_json::json!({
+        "StringEquals": {"s3:prefix": "sys/gc"},
+        "StringLike": {"s3:prefix": BOOTSTRAP_ENC_PATTERN},
+    }));
+    let err = validate_statement("fixture", 0, &both).expect_err("two operators");
+    assert!(err.contains("more than one operator"), "{err}");
+
+    for value in ["sys/*", "sys/g?"] {
+        let wild = stmt(serde_json::json!({"StringEquals": {"s3:prefix": [value]}}));
+        let err = validate_statement("fixture", 0, &wild).expect_err(value);
+        assert!(err.contains("carries a wildcard character"), "{err}");
+    }
+}
+
+/// Widening one bootstrap condition fails the negative witnesses: Maintain's
+/// `sys/gc` widened to `sys/*` admits `sys/auth`, which Maintain never reads,
+/// and Gateway's key-epoch pattern widened to `t/*/enc` admits the 31- and
+/// 33-character tenant segments. `sys/*` under `StringEquals` is a literal,
+/// which the choke point refuses.
+#[test]
+fn a_widened_bootstrap_condition_fails_the_negative_witnesses() {
+    let hex = test_tenant().to_hex();
+    let cases: [(&str, bool, &str, &str, String); 2] = [
+        (
+            "maintain",
+            true,
+            "sys/gc",
+            "sys/*",
+            "\"sys/auth\"".to_string(),
+        ),
+        (
+            "gateway",
+            false,
+            BOOTSTRAP_ENC_PATTERN,
+            "t/*/enc",
+            format!("\"t/{hex}0/enc\""),
+        ),
+    ];
+    for (role, fixed, narrow, widened, witness) in cases {
+        let expected = EXPECTED_BOOTSTRAP_GRANTS
+            .iter()
+            .find(|e| e.role == role)
+            .expect("expected row");
+        let (sid, values) = if fixed {
+            (expected.fixed_sid, expected.fixed_keys)
+        } else {
+            (expected.tenant_sid, expected.tenant_patterns)
+        };
+        let path = policy_json_path(role);
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read template"))
+                .expect("parse template");
+        let stmt = json["Statement"]
+            .as_array_mut()
+            .expect("Statement array")
+            .iter_mut()
+            .find(|s| s["Sid"] == serde_json::json!(sid))
+            .expect("bootstrap statement");
+        let wider: Vec<&str> = values
+            .iter()
+            .map(|v| if *v == narrow { widened } else { *v })
+            .collect();
+        assert_ne!(wider, values, "{role}: the fixture widened nothing");
+
+        if fixed {
+            stmt["Condition"] = serde_json::json!({"StringEquals": {"s3:prefix": wider}});
+            let err = validate_statement(role, 0, stmt).expect_err("wildcard under StringEquals");
+            assert!(err.contains("carries a wildcard character"), "{err}");
+        }
+        stmt["Condition"] = serde_json::json!({"StringLike": {"s3:prefix": wider}});
+        let policy = build_policy(role, "widened fixture", &json);
+        let err = check_bootstrap_grants_admit_only(&policy, expected)
+            .expect_err("a widened condition must fail the negative witnesses");
+        assert!(err.contains(&witness), "{role}: {err}");
+
+        check_bootstrap_grants_admit_only(&load_policy(role), expected)
+            .expect("the shipped template passes the same check");
     }
 }
