@@ -52,9 +52,9 @@
 //! One permit stands for one store request in flight. [`S3Store::put`] above
 //! [`MULTIPART_THRESHOLD`](crate::s3::MULTIPART_THRESHOLD) is one op but
 //! several requests, because its parts go out concurrently. The handle's `put`
-//! therefore takes its first permit as usual, then up to the store's fan-out
-//! for that payload (`put_permits_wanted`) in extra permits, taking only
-//! the ones admission would grant right now and never waiting for one. The
+//! therefore takes its first permit as usual, then extra permits up to the
+//! store's fan-out for that payload (`put_permits_wanted`) in total, taking
+//! only the ones admission would grant right now and never waiting for one. The
 //! fan-out is read from the inner store's [`Capabilities::upload_checksum`]:
 //! [`S3Store`] declares it exactly when upload integrity is on, which keeps
 //! every put on the single-PUT path, and [`MemoryStore`](crate::memory::MemoryStore)
