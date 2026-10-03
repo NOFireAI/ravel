@@ -734,7 +734,7 @@ so they land within 2.3% of the published figures rather than on them. The
 two caches carve the memory budget, `MemTotal` less the 2 GiB overhead
 reserve (30,761,541,632 here against the published 30,064,771,072): a 25%
 read cache of 7,690,385,408 bytes against the published 7,516,192,768 and a
-5% catalog byte cache of 1,538,077,082 against 1,503,238,553 (#1141). The
+5% catalog byte cache of 1,538,077,081 against 1,503,238,553 (#1141). The
 50% per-query and per-tenant SQL pools carve `MemTotal` itself:
 16,454,512,640 each against 16,106,127,360. Do not assume the resolved values: record the
 server's own startup log lines (below) with the entry. Both of the two settings
