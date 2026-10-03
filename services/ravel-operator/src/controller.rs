@@ -1143,6 +1143,45 @@ where
     Ok(())
 }
 
+/// Converge the fragment-port NetworkPolicy around the Deployment applies.
+///
+/// A rendered `policy` is applied before `apply_deployments` runs, so a query
+/// pod never opens the fragment port without the policy covering it. Every
+/// other name in `possible_names` is deleted only after `apply_deployments`
+/// reports that it applied the query Deployment: until then the live query
+/// pods may still open the port, so a pass that holds the query apply back (a
+/// missing audit-token key, or the bootstrap order waiting on maintain) keeps
+/// the policy. The callbacks are injected so tests can record the order.
+async fn converge_query_network_policy<A, AF, D, DF>(
+    policy: Option<NetworkPolicy>,
+    possible_names: Vec<String>,
+    apply_policy: A,
+    mut delete_policy: D,
+    apply_deployments: impl Future<Output = Result<bool, Error>>,
+) -> Result<(), Error>
+where
+    A: FnOnce(String, NetworkPolicy) -> AF,
+    AF: Future<Output = Result<(), Error>>,
+    D: FnMut(String) -> DF,
+    DF: Future<Output = Result<(), Error>>,
+{
+    let desired_name = policy.as_ref().map(ResourceExt::name_any);
+    if let (Some(name), Some(policy)) = (desired_name.clone(), policy) {
+        apply_policy(name, policy).await?;
+    }
+    let query_applied = apply_deployments.await?;
+    if !query_applied {
+        return Ok(());
+    }
+    for name in possible_names {
+        if desired_name.as_deref() == Some(name.as_str()) {
+            continue;
+        }
+        delete_policy(name).await?;
+    }
+    Ok(())
+}
+
 /// [`DeleteParams`] for the stale qualify Job (finding 2): foreground
 /// propagation, so Kubernetes keeps the Job object (blocked by the
 /// `foregroundDeletion` finalizer) until its owned Pod has been deleted, rather
@@ -1863,25 +1902,6 @@ async fn reconcile_inner(
     query_svc.metadata.owner_references = owner.clone();
     apply(&services, &child(instance, "query"), &query_svc).await?;
 
-    // The fragment-port NetworkPolicy (ADR-1689 decision 4): applied before
-    // the query Deployment that opens the port, and swept whenever distributed
-    // query is off or incomplete.
-    let network_policies: Api<NetworkPolicy> = Api::namespaced(client.clone(), namespace);
-    let mut desired_policy_names: BTreeSet<String> = BTreeSet::new();
-    if let Some(mut policy) = desired.query_network_policy {
-        let name = policy.name_any();
-        policy.metadata.namespace = Some(namespace.to_string());
-        policy.metadata.owner_references = owner.clone();
-        apply(&network_policies, &name, &policy).await?;
-        desired_policy_names.insert(name);
-    }
-    for name in possible_network_policy_names(instance) {
-        if desired_policy_names.contains(&name) {
-            continue;
-        }
-        delete_if_present(&network_policies, &name).await?;
-    }
-
     // Pod disruption budgets (issue #126, deliverable 4): apply one per rendered
     // tier, then delete every possible PDB name the render did not produce, so
     // disabling `maintain` removes its PDB instead of orphaning one that guards a
@@ -1945,11 +1965,33 @@ async fn reconcile_inner(
     if tiers.maintain.is_none() {
         delete_if_present(&deployments, &maintain_name).await?;
     }
-    for tier in plan.apply_sequence(maintain_ready_before, request_serving_exists) {
-        tiers
-            .apply_tier(&deployments, namespace, instance, owner.as_ref(), tier)
-            .await?;
-    }
+    // The fragment-port NetworkPolicy (ADR-1689 decision 4) converges around
+    // the Deployment applies: see `converge_query_network_policy` for the order.
+    let network_policies: Api<NetworkPolicy> = Api::namespaced(client.clone(), namespace);
+    let query_policy = desired.query_network_policy.map(|mut policy| {
+        policy.metadata.namespace = Some(namespace.to_string());
+        policy.metadata.owner_references = owner.clone();
+        policy
+    });
+    let network_policies = &network_policies;
+    converge_query_network_policy(
+        query_policy,
+        possible_network_policy_names(instance),
+        |name, policy| async move {
+            apply(network_policies, &name, &policy).await?;
+            Ok(())
+        },
+        |name| async move { delete_if_present(network_policies, &name).await },
+        async {
+            for tier in plan.apply_sequence(maintain_ready_before, request_serving_exists) {
+                tiers
+                    .apply_tier(&deployments, namespace, instance, owner.as_ref(), tier)
+                    .await?;
+            }
+            Ok(tiers.applied(DeploymentTier::Query).is_some())
+        },
+    )
+    .await?;
 
     // Report the readiness the maintain apply just observed, but decide the
     // `Available` condition from the count the ORDERING used: that is the one
@@ -4170,6 +4212,70 @@ mod tests {
         assert_eq!(degraded[0].status, "False");
         assert_eq!(degraded[0].reason, STORE_QUALIFIED_FAILED_REASON);
         assert_eq!(degraded[0].message, message);
+    }
+
+    fn fragment_policy(name: &str) -> NetworkPolicy {
+        NetworkPolicy {
+            metadata: kube::api::ObjectMeta {
+                name: Some(name.to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Run `converge_query_network_policy` with recording callbacks and return
+    /// the calls in the order they ran. `query_applied` is what the Deployment
+    /// step reports: whether it applied the query Deployment this pass.
+    async fn converge_events(policy: Option<NetworkPolicy>, query_applied: bool) -> Vec<String> {
+        let events = std::cell::RefCell::new(Vec::new());
+        let log = &events;
+        converge_query_network_policy(
+            policy,
+            vec!["rc-query-fragment".to_string()],
+            |name, _policy| async move {
+                log.borrow_mut().push(format!("apply {name}"));
+                Ok(())
+            },
+            |name| async move {
+                log.borrow_mut().push(format!("delete {name}"));
+                Ok(())
+            },
+            async move {
+                log.borrow_mut().push("deployments".to_string());
+                Ok(query_applied)
+            },
+        )
+        .await
+        .expect("recording callbacks never fail");
+        events.into_inner()
+    }
+
+    /// Enabling: the policy is applied, before the Deployment that opens the
+    /// fragment port, and never deleted.
+    #[tokio::test]
+    async fn fragment_policy_is_applied_before_the_query_deployment() {
+        assert_eq!(
+            converge_events(Some(fragment_policy("rc-query-fragment")), true).await,
+            vec!["apply rc-query-fragment", "deployments"]
+        );
+    }
+
+    /// Disabling: the policy is deleted, and only after the Deployment step
+    /// applied the query Deployment that no longer opens the port.
+    #[tokio::test]
+    async fn fragment_policy_is_deleted_after_the_query_deployment_is_applied() {
+        assert_eq!(
+            converge_events(None, true).await,
+            vec!["deployments", "delete rc-query-fragment"]
+        );
+    }
+
+    /// Disabling while the query apply is held back: the live pods may still
+    /// open the fragment port, so the policy stays.
+    #[tokio::test]
+    async fn fragment_policy_is_kept_while_the_query_apply_is_held_back() {
+        assert_eq!(converge_events(None, false).await, vec!["deployments"]);
     }
 
     /// Finding 3: credential resourceVersions are resolved before the gate and

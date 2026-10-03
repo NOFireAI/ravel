@@ -56,9 +56,10 @@ the ticket's tenant instead of a forwarded credential.
 
 Two pieces of #1690 are already dispatched and are not decided again here.
 Task T8a requires client certificates on the dedicated listener and makes
-the coordinator present its own identity. Task T10c renders the
-NetworkPolicy that restricts the fragment port to cluster pods. This ADR
-builds on both.
+the coordinator present its own identity.
+Task T10c renders the NetworkPolicy that restricts the fragment port to
+cluster pods (see the operator-rendering amendment below: follow-up task 3
+renders it instead). This ADR builds on both.
 
 ## Decision
 
@@ -125,8 +126,10 @@ builds on both.
    warning naming release B and the flags it will require. In the same
    release the operator renders, for every `RavelCluster` with distributed
    query on, the dedicated listener, the certificate Secret mounts, the SQL
-   ticket key mount, and the T10c NetworkPolicy (the CRD block that turns
-   this on is in the operator-rendering amendment below). Release B, the
+   ticket key mount, and the T10c NetworkPolicy
+   (see the operator-rendering amendment below: follow-up task 3 renders
+   that policy itself rather than T10c, from the CRD block that turns this
+   on). Release B, the
    next release after that operator rendering ships, deletes `Combined`:
    `Cli::validate` refuses `--distributed-query` without `--fragment-listener` and
    `--sql-ticket-key-file`, beside the existing pairing checks
@@ -228,7 +231,8 @@ flowchart LR
      the operator-rendering amendment below).
   3. ravel-operator: render the dedicated listener, its Secret mounts, and
      the SQL ticket key for every distributed-query `RavelCluster`, after
-     T10c lands. The task renders the NetworkPolicy itself, from the CRD
+     T10c lands (it no longer waits on T10c; see the operator-rendering
+     amendment below). The task renders the NetworkPolicy itself, from the CRD
      block in the operator-rendering amendment below.
   4. Release B: delete `Combined`, add the `Cli::validate` refusals, and
      delete the plaintext dial path, with the guide's "without the flag"
@@ -261,7 +265,10 @@ one), uncounted. It reads nothing either way.
 
 ## Amendment (2026-10-03): the operator-rendering amendment
 
-<!-- amendment-applies: sections="Decision|Consequences" pointer="operator-rendering amendment" -->
+<!-- amendment-applies: sections="Context|Decision|Consequences" pointer="operator-rendering amendment" -->
+<!-- amendment-supersedes: phrase="T10c renders the" pointer="operator-rendering amendment" -->
+<!-- amendment-supersedes: phrase="the T10c NetworkPolicy" pointer="operator-rendering amendment" -->
+<!-- amendment-supersedes: phrase="T10c lands" pointer="operator-rendering amendment" -->
 
 Two owner decisions recorded on #1690 change this ADR.
 

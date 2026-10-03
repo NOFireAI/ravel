@@ -9157,6 +9157,54 @@ mod tests {
         assert!(ingress[1].from.is_none(), "the open rule admits any source");
     }
 
+    /// Distributed query beside `deploymentKeySecretRef`: the query pod carries
+    /// the deployment key volume first and the four fragment Secret volumes
+    /// after it, each with its own read-only mount, and nothing else.
+    #[test]
+    fn distributed_query_with_deployment_key_merges_volumes_and_mounts() {
+        let mut spec = distributed_query_spec(true);
+        spec.deployment_key_secret_ref = secret("ravel-deployment-key");
+        let desired = render(&spec);
+        assert_eq!(desired.distributed_query_render_error, None);
+        let dep = &desired.query_deployment;
+        assert_eq!(
+            arg_value(&args_of(dep), "--tenant-hash-key-file").as_deref(),
+            Some("/etc/ravel/deployment-key/key")
+        );
+
+        let volumes = serde_json::to_value(&pod_spec_of(dep).volumes).expect("volumes json");
+        assert_eq!(
+            volumes,
+            serde_json::json!([
+                {"name": "deployment-key", "secret": {"secretName": "ravel-deployment-key",
+                    "optional": false, "items": [{"key": "key", "path": "key"}]}},
+                {"name": "fragment-tls", "secret": {"secretName": "frag-tls", "optional": false,
+                    "items": [{"key": "tls.crt", "path": "tls.crt"},
+                              {"key": "tls.key", "path": "tls.key"}]}},
+                {"name": "fragment-ca", "secret": {"secretName": "frag-ca", "optional": false,
+                    "items": [{"key": "ca.crt", "path": "ca.crt"}]}},
+                {"name": "fragment-key", "secret": {"secretName": "frag-keys", "optional": false,
+                    "items": [{"key": "keys", "path": "keys"}]}},
+                {"name": "sql-ticket-key", "secret": {"secretName": "sql-keys", "optional": false,
+                    "items": [{"key": "keys", "path": "keys"}]}},
+            ])
+        );
+        let mounts =
+            serde_json::to_value(&container_of(dep).volume_mounts).expect("volume mounts json");
+        assert_eq!(
+            mounts,
+            serde_json::json!([
+                {"name": "deployment-key", "mountPath": "/etc/ravel/deployment-key",
+                    "readOnly": true},
+                {"name": "fragment-tls", "mountPath": "/etc/ravel/fragment-tls", "readOnly": true},
+                {"name": "fragment-ca", "mountPath": "/etc/ravel/fragment-ca", "readOnly": true},
+                {"name": "fragment-key", "mountPath": "/etc/ravel/fragment-key", "readOnly": true},
+                {"name": "sql-ticket-key", "mountPath": "/etc/ravel/sql-ticket-key",
+                    "readOnly": true},
+            ])
+        );
+    }
+
     /// Absent, or present with `enabled: false` and every reference set: the
     /// render is byte-identical to a spec that never mentions the block, with no
     /// NetworkPolicy and no error.
