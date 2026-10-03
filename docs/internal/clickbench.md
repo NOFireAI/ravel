@@ -727,15 +727,16 @@ No performance flags. Since #1141 the server derives all six of them from the
 host at startup. Two are host-independent and match a published entry exactly:
 a 1,000,000 sealed-segment cap and an 11-minute engine deadline. Fetch
 concurrency is CPU-derived and also matches on this box: 32, two per core on
-16 cores. The three memory-derived settings are computed from this box's own
-`MemTotal` (capped by the cgroup limit when the server runs in a container,
-which the reference box does not), which Linux reports as
-32,909,025,280 bytes here, so they land within 2.2% of the published figures
-rather than on them: a 25% read cache of 8,227,256,320 bytes here against
-the published 8,053,063,680, and 50% per-query and per-tenant SQL pools of
-16,454,512,640 each against 16,106,127,360. The catalog byte
-cache derives to a separate 5% ceiling,
-1,645,451,264 bytes (#1141). Do not assume the resolved values: record the
+16 cores. The memory-derived settings are computed from this box's own `MemTotal`
+(capped by the cgroup limit when the server runs in a container, which the
+reference box does not), which Linux reports as 32,909,025,280 bytes here,
+so they land within 2.3% of the published figures rather than on them. The
+two caches carve the memory budget, `MemTotal` less the 2 GiB overhead
+reserve (30,761,541,632 here against the published 30,064,771,072): a 25%
+read cache of 7,690,385,408 bytes against the published 7,516,192,768 and a
+5% catalog byte cache of 1,538,077,082 against 1,503,238,553 (#1141). The
+50% per-query and per-tenant SQL pools carve `MemTotal` itself:
+16,454,512,640 each against 16,106,127,360. Do not assume the resolved values: record the
 server's own startup log lines (below) with the entry. Both of the two settings
 that used to be mandatory here are among the derived six: a folded ClickBench
 tenant sits far above the old 1024 sealed-segment ceiling, so an un-derived
