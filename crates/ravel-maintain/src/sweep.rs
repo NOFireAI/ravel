@@ -5141,6 +5141,107 @@ mod tests {
         );
     }
 
+    /// A `force_orphan_gc` pass over the same would-trip fixture as
+    /// `a_tripped_breaker_holds_the_quarantine_reaper` still reaps the expired
+    /// copy, because an override is not a trip (ADR-0058 decision 6). It also
+    /// still quarantines the 60 candidates rather than deleting them outright.
+    /// No server path sets `force_orphan_gc`; `ravel-cli maintain sweep`
+    /// sets it through its override flag, so this pins the claim that flag
+    /// rests on.
+    ///
+    /// The `FaultStore` sequences count deletes by key shape: the first matches
+    /// only `quarantine/` keys (the reaper), the second every other delete (the
+    /// live L0 key removed after each quarantine copy). A sequence that matches
+    /// returns without consulting the next, so the two counts are disjoint.
+    ///
+    /// Flip to watch it fail: make `sweep_orphans` ignore the override
+    /// (`if would_trip && !config.force_orphan_gc` to `if would_trip`) and the
+    /// first assertion fails: the pass reports a trip, not an override, and
+    /// reaps 0.
+    #[tokio::test]
+    async fn a_forced_orphan_pass_still_reaps_quarantine() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 11;
+        let mem = MemoryStore::new();
+        let config = CompactorConfig {
+            force_orphan_gc: true,
+            ..CompactorConfig::default()
+        };
+
+        // One object quarantined at t1, well below the breaker's thresholds.
+        put_orphan(&mem, &tenant, signal, shard, 0).await;
+        let t1 = config.orphan_age_gate_ns() + 1;
+        let clock = FixedClock::new(t1);
+        let out = sweep_orphans(&mem, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("one candidate does not trip the breaker");
+        assert_eq!(out.deleted, 1);
+        assert!(!out.breaker_overridden, "one candidate would not trip");
+
+        // A whole horizon later that copy is reapable, and 60 record-less
+        // objects would trip the breaker on this pass.
+        let t2 = t1 + config.quarantine_horizon_ns + 1;
+        clock.set(t2);
+        for seq in 1..61u64 {
+            put_orphan(&mem, &tenant, signal, shard, seq).await;
+        }
+
+        const BUDGET: usize = 200;
+        let plan = FaultPlan::empty()
+            .with_sequence(
+                Sequence::new(Op::Delete)
+                    .with_key_contains(QUARANTINE_PREFIX)
+                    .with_steps(vec![SequenceStep::Passthrough; BUDGET]),
+            )
+            .with_sequence(
+                Sequence::new(Op::Delete).with_steps(vec![SequenceStep::Passthrough; BUDGET]),
+            );
+        let store = FaultStore::new(mem, plan);
+
+        let report = sweep_shard(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("a forced pass over a would-trip shard succeeds");
+        assert!(report.orphan_breaker_overridden, "60 of 60 would trip");
+        assert!(!report.orphan_breaker_tripped, "an override is not a trip");
+        assert_eq!(report.orphans_withheld, 0);
+        assert_eq!(report.orphans_quarantined, 60);
+        assert_eq!(
+            report.quarantine_reaped, 1,
+            "the expired copy from t1 is the only one past the horizon"
+        );
+        assert_eq!(
+            store.sequence_progress(0),
+            1,
+            "exactly one quarantine delete, the reap"
+        );
+        assert_eq!(
+            store.sequence_progress(1),
+            60,
+            "exactly one live delete per quarantined candidate"
+        );
+
+        let quarantined = keys_under(
+            &store,
+            &quarantine_l0_data_prefix(&tenant, signal, shard).unwrap(),
+        )
+        .await;
+        let originals: BTreeSet<String> = quarantined.iter().map(|k| recover_original(k)).collect();
+        let expected: BTreeSet<String> = (1..61u64)
+            .map(|seq| orphan_data_key(&tenant, signal, shard, seq))
+            .collect();
+        assert_eq!(
+            originals, expected,
+            "the reaped copy is gone and the 60 forced candidates are quarantined"
+        );
+        assert!(
+            keys_under(&store, &l0_data_prefix(&tenant, signal, shard).unwrap())
+                .await
+                .is_empty(),
+            "every live candidate was moved"
+        );
+    }
+
     /// A pass that did not run candidate selection never reaps quarantine,
     /// however expired the copies are. The breaker's hold on the reaper is the
     /// caller's condition alone, and a `Skip` pass reports not-tripped because
