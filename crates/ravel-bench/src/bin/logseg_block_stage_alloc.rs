@@ -71,6 +71,15 @@ fn live_bytes(s: &Stats) -> i64 {
     s.bytes_allocated as i64 - s.bytes_deallocated as i64 + s.bytes_reallocated as i64
 }
 
+/// Installed into `stage0::STATS_SAMPLER` so the library's block/section
+/// sampling call sites (gated on `stage0::BLOCK_SAMPLE`) can take a real
+/// `(live_bytes, alloc_count)` reading without the library depending on
+/// `stats_alloc` itself.
+fn stats_sampler() -> (i64, u64) {
+    let s = GLOBAL.stats();
+    (live_bytes(&s), s.allocations as u64)
+}
+
 fn fail(msg: String) -> ! {
     eprintln!("ASSERTION FAILED: {msg}");
     std::process::exit(1);
@@ -341,7 +350,8 @@ struct ShapeResult {
     block_buckets: Vec<Bucket>,
     section_buckets: Vec<Bucket>,
     block_transient_high_water: i64,
-    capacity: HashMap<&'static str, (usize, usize)>,
+    block_capacity: HashMap<&'static str, (usize, usize)>,
+    section_capacity: HashMap<&'static str, (usize, usize)>,
     block_count: u64,
     encoded_len: usize,
     section_lens: Vec<(u32, u64)>,
@@ -380,10 +390,25 @@ fn measure_shape(name: &'static str, streams: usize, records_per_stream: usize) 
     let block_buckets = block_buckets();
     let section_buckets = section_buckets();
     let block_transient_high_water = stage0::BLOCK_TRANSIENT_HIGH_WATER.load(Relaxed);
+    const BLOCK_CAPACITY_NAMES: [&str; 8] = [
+        "blocks.pending",
+        "bloom_entries",
+        "bloom_covered",
+        "postings_terms",
+        "col_present",
+        "col_blocks",
+        "first_blk",
+        "last_blk",
+    ];
     let capacity_notes = stage0::take_capacity_notes();
-    let mut capacity = HashMap::new();
+    let mut block_capacity = HashMap::new();
+    let mut section_capacity = HashMap::new();
     for (n, len, cap) in capacity_notes {
-        capacity.insert(n, (len, cap));
+        if BLOCK_CAPACITY_NAMES.contains(&n) {
+            block_capacity.insert(n, (len, cap));
+        } else {
+            section_capacity.insert(n, (len, cap));
+        }
     }
 
     let footer = ravel_logseg::footer::open(&bytes_on).expect("footer::open");
@@ -398,7 +423,8 @@ fn measure_shape(name: &'static str, streams: usize, records_per_stream: usize) 
         block_buckets,
         section_buckets,
         block_transient_high_water,
-        capacity,
+        block_capacity,
+        section_capacity,
         block_count: footer.block_count,
         encoded_len: bytes_on.len(),
         section_lens,
@@ -459,7 +485,7 @@ fn render_shape(md: &mut String, r: &ShapeResult) {
         "Block stage",
         r.off_block_delta,
         &r.block_buckets,
-        &r.capacity,
+        &r.block_capacity,
         &[
             ("bloom inputs", 35.0, 65.0),
             ("postings accumulators", 5.0, 25.0),
@@ -483,7 +509,7 @@ fn render_shape(md: &mut String, r: &ShapeResult) {
         "Trailing sections",
         r.off_sections_delta,
         &r.section_buckets,
-        &r.capacity,
+        &r.section_capacity,
         &[],
         &[],
     );
@@ -616,6 +642,9 @@ fn main() {
     stage0::HOOK
         .set(stage0_hook)
         .unwrap_or_else(|_| fail("stage0 hook already set".to_string()));
+    stage0::STATS_SAMPLER
+        .set(stats_sampler)
+        .unwrap_or_else(|_| fail("stage0 stats sampler already set".to_string()));
 
     let host = uname_a();
     let uptime_before = uptime();
