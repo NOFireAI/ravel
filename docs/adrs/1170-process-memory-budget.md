@@ -893,13 +893,30 @@ server were alone on the host, and on that host it was not.
 
 1. On a host with no cgroup memory limit, `memory_budget_bytes` is derived
    from what is free when the server starts:
-   `MemTotal - MEMORY_OVERHEAD_RESERVE_BYTES - (MemTotal - MemAvailable - own_rss)`.
-   That is `MemAvailable` plus the server's own resident set at the moment of
-   derivation, less the reserve, and never more than the old figure. Under a
-   cgroup limit nothing changes: the limit is already the server's share, and
-   memory outside the cgroup does not count against it. `MemAvailable` counts
-   reclaimable page cache as available, so a host whose page cache is merely
-   warm does not shrink the budget.
+   `max(floor, min(MemTotal - RESERVE, MemAvailable + own_rss - RESERVE))`,
+   every subtraction saturating, where `RESERVE` is
+   `MEMORY_OVERHEAD_RESERVE_BYTES` and `own_rss` is the server's resident set
+   at the moment of derivation. The `min` is a stated rule, not a consequence
+   of the arithmetic. `MemAvailable` is a kernel estimate that counts
+   reclaimable page cache, and `own_rss` includes file-backed pages that the
+   page cache already counts, so `MemAvailable + own_rss` can exceed
+   `MemTotal`; the `min` keeps the budget at or below the old figure.
+   `MemAvailable` counting page cache also means a host whose page cache is
+   merely warm does not shrink the budget. Under a cgroup limit nothing
+   changes: the limit is already the server's share, and memory outside the
+   cgroup does not count against it.
+
+   The floor is 25% of `MemTotal - RESERVE` (7,689,077,760 bytes on the
+   reference host). Without one, a server that starts while a co-resident
+   process holds most of the host, or that restarts while the memory of the
+   process it replaces is still being reclaimed, reads a small `MemAvailable`
+   and derives a budget near zero. The 2026-09-07 amendment's startup check
+   then refuses to start the process at all. Before this amendment the same
+   host always started. A server that cannot start serves nothing, while a
+   small budget still serves every statement that fits it, so the floor
+   trades some overcommit risk in that case for availability. When the floor
+   binds, the derivation logs a warning naming the `MemAvailable` reading,
+   the floor, and `--memory-budget-bytes` as the remedy.
 2. `--memory-budget-bytes` sets the budget explicitly and wins over both
    derivations. It is the escape hatch for a co-resident process that starts
    after the server, which a startup reading cannot see. Its resolved value is
@@ -909,18 +926,30 @@ server were alone on the host, and on that host it was not.
    shared remainder after the cache carve. An explicit flag is not capped.
    The derivation logs whether the cap applied, as `clamped` does today.
 
-On the reference host this gives, with `MemAvailable` at 29,922,488,320 bytes
-read with no Ravel process running:
-- a budget of about 27,775,004,672 bytes;
-- a fetcher cache of about 6.94 GB and a catalog cache of about 1.39 GB;
-- a shared remainder of about 19.44 GB.
+On the reference host, with `MemAvailable` at 29,922,488,320 bytes read with no
+Ravel process running, the budget is about 27,775,004,672 bytes. How it carves
+depends on the store, because ADR-2023 gives a loopback store a larger fetcher
+cache:
 
-The derived SQL pools stay at 16,451,897,344 bytes, above q33's measured peak
-reservation of 10,855,811,936 bytes. The ClickBench claim of 43 of 43 statements
-in the stock configuration therefore still holds by derivation. It is re-measured
-stock on that host before this lands, and the derived figures in
+| store | fetcher cache | catalog cache | shared remainder | derived SQL pools |
+|---|---|---|---|---|
+| real S3 (the #1248 reference passes) | 25%, about 6.94 GB | about 1.39 GB | about 19.44 GB | 16,451,897,344, not capped |
+| loopback (the ClickBench entry's local RustFS) | 40%, 11,110,001,868 | 1,388,750,233 | 15,276,252,571 | **15,276,252,571, capped by item 3** |
+
+The loopback row is the case item 3 exists for: the remainder after the larger
+cache carve is below 50% of `MemTotal`. Both pool values are above q33's
+measured peak reservation of 10,855,811,936 bytes, so the claim of 43 of 43
+statements in the stock configuration still holds by derivation on both stores.
+It is re-measured stock on that host before this lands. The derived figures in
 `docs/internal/clickbench.md`, the configuration guide and the reference runbook
 move with it.
+
+The derived figures now depend on a `MemAvailable` reading, so two stock passes
+on the same host can resolve different ceilings. A published stock result
+records the `MemAvailable` reading next to the resolved `performance default
+resolved` lines. Two passes compared against each other (an A/B, a regression
+check) pin `--memory-budget-bytes` to one value, so the budget is not the
+variable that differs between them.
 
 **What this does not fix.** The same run measured live jemalloc allocations
 at least 9.25 GB above everything the ledgers reserved, even with both cache
