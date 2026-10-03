@@ -79,9 +79,9 @@ across all five iterations.
 The largest sample is a lower bound on the true peak, so each share is an
 upper bound.
 
-The peaks and shares in this table, and the "at most 1.55%" below, were
-measured with a formula that miscounts reallocations; see the correction below
-for the figures that replace them. The map bytes stand.
+The peaks and shares in this table were measured with a formula that
+miscounts reallocations; see the correction below for the figures that replace
+them. The map bytes stand.
 
 Both sets of figures were pre-registered on #2425 before their runs. Every
 median landed inside its band. The 1-stream time share was marginal: its band
@@ -90,8 +90,9 @@ memory figures were inside their bands with margin.
 
 The map is therefore neither a time nor a memory bottleneck of RLOG encode. A
 table that cost nothing would move row-path encode time by about 1% and encode
-memory by at most 1.55%. A binary search already reaches the memory floor (no
-index at all) and is indistinguishable from the map in time on this corpus.
+memory by at most 1.55% (withdrawn: see the correction below). A binary search
+already reaches the memory floor (no index at all) and is indistinguishable
+from the map in time on this corpus.
 
 ## Decision
 
@@ -213,6 +214,7 @@ flowchart LR
 ## Correction (2026-10-04): the memory peaks were measured with a formula that counts reallocations twice
 
 <!-- amendment-applies: sections="Stage 0b: what the map costs in memory" pointer="correction below" -->
+<!-- amendment-supersedes: phrase="memory by at most 1.55%" pointer="correction below" -->
 
 The Stage 0b peaks came from `stats_alloc`, with live bytes computed as bytes
 allocated, minus bytes deallocated, plus bytes reallocated. That crate's
@@ -237,7 +239,17 @@ reading of the heap at its global maximum (issue #2485, result branch
 The profiler's per-site figures sum exactly to its own total in every run, and
 the peak is identical across four runs of the same arm.
 
-The sentence "encode memory by at most 1.55%" should read 1.66%, and it is a
+The two peak columns are not the same quantity, so this table replaces the
+earlier one and is not a delta against it. The earlier column was the largest
+of a handful of samples taken at fixed points inside `build_object`, computed
+with the double-counting formula, from a baseline taken after the input
+records were built. This column is the heap's global maximum over the whole
+encode, input records included. A row can therefore move either way: the
+1,000-stream peak here is larger than the figure it replaces, and the other
+two are smaller.
+
+In the Context, the sentence on what a table that cost nothing would move
+gives the memory figure as a bound of 1.55%. The figure is 1.66%, and it is a
 measured share, not an upper bound. The pre-registered bar for this figure was
 10% at 20,000 streams, so the conclusion drawn from it, that the map is not a
 memory bottleneck, is unchanged, and so is every decision above. The time
