@@ -100,9 +100,9 @@ pub struct ScanStats {
 /// read placed, opened with [`RlogReader::from_source`].
 pub struct RlogReader<'a, S: ByteSource + ?Sized = [u8]> {
     source: &'a S,
-    stream_dir: StreamDir,
-    field_dir: FieldDir,
-    skip: SkipIndex,
+    stream_dir: Arc<StreamDir>,
+    field_dir: Arc<FieldDir>,
+    skip: Arc<SkipIndex>,
     blocks_offset: u64,
     /// The object's decoded PAGE_DIR (ADR-0699 decision 2), through which
     /// every block's pages are located.
@@ -124,6 +124,9 @@ pub struct RlogReader<'a, S: ByteSource + ?Sized = [u8]> {
     /// Each scan seeds its [`ScanStats::decompressed_bytes`] with this so the
     /// figure counts opening the object as well as decoding its blocks.
     open_decompressed_bytes: u64,
+    /// [`SegmentDirectories::decoded_bytes`] of the directories this reader
+    /// was built over, so [`RlogReader::directories`] reports it.
+    directories_decoded_bytes: u64,
 }
 
 /// The decoded footer directories for one segment (STREAM_DIR, FIELD_DIR,
@@ -142,9 +145,9 @@ pub struct RlogReader<'a, S: ByteSource + ?Sized = [u8]> {
 /// decompression and validation this struct represents on every open.
 #[derive(Clone)]
 pub struct SegmentDirectories {
-    stream_dir: StreamDir,
-    field_dir: FieldDir,
-    skip: SkipIndex,
+    stream_dir: Arc<StreamDir>,
+    field_dir: Arc<FieldDir>,
+    skip: Arc<SkipIndex>,
     blocks_offset: u64,
     page_dir: Arc<PageDir>,
     bloom: SectionDesc,
@@ -154,6 +157,10 @@ pub struct SegmentDirectories {
     /// seeds [`ScanStats::decompressed_bytes`] with the same open-time total
     /// without re-decompressing anything to get it.
     open_decompressed_bytes: u64,
+    /// Decoded length of STREAM_DIR, FIELD_DIR, SKIP_IDX and PAGE_DIR
+    /// together (each section's `uncomp_len`), counted for a section stored
+    /// raw as well, unlike [`Self::open_decompressed_bytes`].
+    decoded_bytes: u64,
 }
 
 impl SegmentDirectories {
@@ -194,6 +201,15 @@ impl SegmentDirectories {
     pub fn open_decompressed_bytes(&self) -> u64 {
         self.open_decompressed_bytes
     }
+
+    /// Decoded length of STREAM_DIR, FIELD_DIR, SKIP_IDX and PAGE_DIR
+    /// together: what a holder of these directories keeps resident, and so the
+    /// figure to reserve against a memory budget while it holds them.
+    /// [`Self::open_decompressed_bytes`] differs for a section stored raw,
+    /// which it does not count because nothing was decompressed.
+    pub fn decoded_bytes(&self) -> u64 {
+        self.decoded_bytes
+    }
 }
 
 impl<'a> RlogReader<'a> {
@@ -219,17 +235,21 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
     ) -> Result<SegmentDirectories, LogSegError> {
         let footer = open_source(source)?;
         let mut open_decompressed_bytes = 0u64;
+        let mut decoded_bytes = 0u64;
         let stream_desc = *section(&footer, kind::STREAM_DIR)?;
         let stream_raw = read_section_from(source, &stream_desc, cfg)?;
         open_decompressed_bytes += section_decompressed_len(&stream_desc, &stream_raw);
+        decoded_bytes += stream_raw.len() as u64;
         let stream_dir = StreamDir::decode(&stream_raw, MAX_STREAMS)?;
         let field_desc = *section(&footer, kind::FIELD_DIR)?;
         let field_raw = read_section_from(source, &field_desc, cfg)?;
         open_decompressed_bytes += section_decompressed_len(&field_desc, &field_raw);
+        decoded_bytes += field_raw.len() as u64;
         let field_dir = FieldDir::decode(&field_raw, MAX_FIELDS)?;
         let skip_desc = *section(&footer, kind::SKIP_IDX)?;
         let skip_raw = read_section_from(source, &skip_desc, cfg)?;
         open_decompressed_bytes += section_decompressed_len(&skip_desc, &skip_raw);
+        decoded_bytes += skip_raw.len() as u64;
         let skip = SkipIndex::decode(&skip_raw, MAX_BLOCKS)?;
         let blocks = *section(&footer, kind::BLOCKS)?;
         let bloom = *section(&footer, kind::BLOOM)?;
@@ -245,6 +265,7 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
                 .ok_or_else(|| LogSegError::Corrupted("missing PAGE_DIR section".into()))?;
             let raw = read_section_from(source, &desc, cfg)?;
             open_decompressed_bytes += section_decompressed_len(&desc, &raw);
+            decoded_bytes += raw.len() as u64;
             Arc::new(PageDir::decode_validated(
                 &raw,
                 blocks.len,
@@ -253,20 +274,21 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
             )?)
         };
         Ok(SegmentDirectories {
-            stream_dir,
-            field_dir,
-            skip,
+            stream_dir: Arc::new(stream_dir),
+            field_dir: Arc::new(field_dir),
+            skip: Arc::new(skip),
             blocks_offset: blocks.offset,
             page_dir,
             bloom,
             postings,
             open_decompressed_bytes,
+            decoded_bytes,
         })
     }
 
     /// Builds a reader over `source` from an already-decoded
-    /// [`SegmentDirectories`], cloning its fields rather than decoding
-    /// anything. `source` may hold a different placement than whatever
+    /// [`SegmentDirectories`], sharing its four directory sections by [`Arc`]
+    /// rather than decoding or copying anything. `source` may hold a different placement than whatever
     /// source `dirs` was originally decoded from (a different partition's
     /// [`crate::SparseObject`] over the same segment, holding only that
     /// partition's own ranged extents) -- only the directory CONTENT is
@@ -280,14 +302,15 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
     pub fn from_decoded(source: &'a S, dirs: &SegmentDirectories) -> Self {
         RlogReader {
             source,
-            stream_dir: dirs.stream_dir.clone(),
-            field_dir: dirs.field_dir.clone(),
-            skip: dirs.skip.clone(),
+            stream_dir: Arc::clone(&dirs.stream_dir),
+            field_dir: Arc::clone(&dirs.field_dir),
+            skip: Arc::clone(&dirs.skip),
             blocks_offset: dirs.blocks_offset,
             page_dir: Arc::clone(&dirs.page_dir),
             bloom: dirs.bloom,
             postings: dirs.postings,
             open_decompressed_bytes: 0,
+            directories_decoded_bytes: dirs.decoded_bytes,
         }
     }
 
@@ -311,22 +334,23 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
 
     /// This reader's already-decoded directories, as a [`SegmentDirectories`]
     /// a later open of the same (immutable) object can reuse via
-    /// [`RlogReader::from_decoded`] (ADR-2414 decision A1). A clone of fields
-    /// decoded once at construction, never a re-decode. The returned
+    /// [`RlogReader::from_decoded`] (ADR-2414 decision A1). Shares the sections
+    /// decoded once at construction by [`Arc`], never a re-decode or a copy. The returned
     /// [`SegmentDirectories::open_decompressed_bytes`] is the figure this
     /// reader was seeded with: the decode's total for a reader built by
     /// [`RlogReader::from_source`], zero for one built by
     /// [`RlogReader::from_decoded`].
     pub fn directories(&self) -> SegmentDirectories {
         SegmentDirectories {
-            stream_dir: self.stream_dir.clone(),
-            field_dir: self.field_dir.clone(),
-            skip: self.skip.clone(),
+            stream_dir: Arc::clone(&self.stream_dir),
+            field_dir: Arc::clone(&self.field_dir),
+            skip: Arc::clone(&self.skip),
             blocks_offset: self.blocks_offset,
             page_dir: Arc::clone(&self.page_dir),
             bloom: self.bloom,
             postings: self.postings,
             open_decompressed_bytes: self.open_decompressed_bytes,
+            decoded_bytes: self.directories_decoded_bytes,
         }
     }
 
@@ -1008,13 +1032,13 @@ struct BlockLoc {
 /// block's records before asking for the next, which is what bounds the SQL
 /// logs scan's peak memory to one block rather than one partition (ADR-0087).
 ///
-/// It owns everything it needs (the two directories are cloned out of the
-/// reader), so it does not borrow the object bytes. The bytes are supplied per
+/// It owns everything it needs (the two directories are shared out of the
+/// reader by `Arc`), so it does not borrow the object bytes. The bytes are supplied per
 /// call instead, which lets the caller hold them however it likes -- an owned
 /// `Bytes` from a cache hit, say -- without a self-referential struct.
 pub struct BlockScan {
-    stream_dir: StreamDir,
-    field_dir: FieldDir,
+    stream_dir: Arc<StreamDir>,
+    field_dir: Arc<FieldDir>,
     plans: Vec<ColumnPlan>,
     /// `None` decodes every column (see [`ColumnSelection::resolve`]). Column
     /// ids are self-generated and dense (docs on [`ColumnIdSet`]), so this

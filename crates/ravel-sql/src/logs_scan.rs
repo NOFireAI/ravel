@@ -2829,18 +2829,32 @@ struct PlanCounts {
     full_reads: usize,
 }
 
-/// One relevant segment's contribution to [`PlanCounts`].
-struct SegPlan {
-    /// Whole-object block indices surviving this query's pruning, ascending
-    /// (ADR-2414 decision A1): the set [`owned_work`] deals, whole row group
-    /// by whole row group, into each partition's share.
+/// What the plan phase learned about a segment with at least one surviving
+/// block (ADR-2414 decision A1).
+struct PlannedBlocks {
+    /// Whole-object block indices surviving this query's pruning, ascending:
+    /// the set [`owned_work`] deals, whole row group by whole row group, into
+    /// each partition's share, and the list every per-partition open's own
+    /// pruning must reproduce.
     indices: Arc<Vec<usize>>,
     /// This segment's directories, decoded once by the plan phase
     /// ([`LogSegmentFetcher::plan_segment`]) and carried to every
     /// per-partition subset open through [`OwnedSeg`] so the open reuses them
-    /// via `RlogReader::from_decoded` instead of decoding them again
-    /// (ADR-2414 decision A1).
+    /// via `RlogReader::from_decoded` instead of decoding them again.
     dirs: Arc<SegmentDirectories>,
+    /// The fetch memory budget's reservation for `dirs`
+    /// ([`LogSegmentFetcher::reserve_carried_directories`]), the budget a
+    /// carried whole object is reserved against. Held until the plan counts
+    /// drop at the end of the query.
+    _dirs_reservation: ravel_memory::Reservation,
+}
+
+/// One relevant segment's contribution to [`PlanCounts`].
+struct SegPlan {
+    /// The surviving blocks and carried directories, or `None` when no block
+    /// of this segment survives: no partition opens such a segment, so it
+    /// keeps no directories resident and reserves nothing.
+    planned: Option<PlannedBlocks>,
     /// The whole-segment prune stats ([`BlockMetrics::record_segment_totals`]
     /// consumes `blocks_total` and the postings drop). `blocks_scanned`/`pages`
     /// are zero here -- planning decodes nothing.
@@ -3010,9 +3024,25 @@ async fn compute_plan_counts(
                 // reused.
                 _ => None,
             };
+            // Only a segment some partition will open keeps its directories,
+            // and only then are they reserved: `owned_work` skips a
+            // zero-survivor segment, so carrying them would hold decoded
+            // bytes nothing reuses.
+            let planned = if survivors > 0 {
+                let reservation = ctx
+                    .fetcher
+                    .reserve_carried_directories(&dirs)
+                    .map_err(SqlError::from)?;
+                Some(PlannedBlocks {
+                    indices: Arc::new(indices),
+                    dirs,
+                    _dirs_reservation: reservation,
+                })
+            } else {
+                None
+            };
             segs[idx] = Some(SegPlan {
-                indices: Arc::new(indices),
-                dirs,
+                planned,
                 stats,
                 footer,
                 whole_object,
@@ -3127,11 +3157,11 @@ fn owned_work(
         let mut global_group = 0usize;
         for (seg_idx, plan) in counts.segs.iter().enumerate() {
             let Some(plan) = plan else { continue };
-            if plan.indices.is_empty() {
+            let Some(planned) = &plan.planned else {
                 continue;
-            }
+            };
             let mut indices = Vec::new();
-            for group in row_groups(&plan.indices, plan.dirs.page_dir()) {
+            for group in row_groups(&planned.indices, planned.dirs.page_dir()) {
                 if global_group % n == partition {
                     indices.extend(group);
                 }
@@ -3142,10 +3172,10 @@ fn owned_work(
                     seg: segments[seg_idx].clone(),
                     ordinal: seg_idx,
                     indices,
-                    survivors: Some(Arc::clone(&plan.indices)),
+                    survivors: Some(Arc::clone(&planned.indices)),
                     footer: plan.footer.clone(),
                     whole_object: plan.whole_object.clone(),
-                    dirs: Some(Arc::clone(&plan.dirs)),
+                    dirs: Some(Arc::clone(&planned.dirs)),
                 });
             }
         }
@@ -3153,18 +3183,18 @@ fn owned_work(
         let mut seg_ordinal = 0usize;
         for (seg_idx, plan) in counts.segs.iter().enumerate() {
             let Some(plan) = plan else { continue };
-            if plan.indices.is_empty() {
+            let Some(planned) = &plan.planned else {
                 continue;
-            }
+            };
             if seg_ordinal % n == partition {
                 work.push_back(OwnedSeg {
                     seg: segments[seg_idx].clone(),
                     ordinal: seg_idx,
-                    indices: plan.indices.to_vec(),
-                    survivors: Some(Arc::clone(&plan.indices)),
+                    indices: planned.indices.to_vec(),
+                    survivors: Some(Arc::clone(&planned.indices)),
                     footer: plan.footer.clone(),
                     whole_object: plan.whole_object.clone(),
-                    dirs: Some(Arc::clone(&plan.dirs)),
+                    dirs: Some(Arc::clone(&planned.dirs)),
                 });
             }
             seg_ordinal += 1;
@@ -7850,11 +7880,15 @@ mod owned_work_tests {
     /// `segments` identical objects, each with every block surviving.
     fn plan(segments: usize) -> (PlanCounts, Vec<SegmentRef>) {
         let dirs = dirs();
+        let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
         let segs = (0..segments)
             .map(|_| {
                 Some(SegPlan {
-                    indices: Arc::new((0..BLOCKS).collect()),
-                    dirs: Arc::clone(&dirs),
+                    planned: Some(PlannedBlocks {
+                        indices: Arc::new((0..BLOCKS).collect()),
+                        dirs: Arc::clone(&dirs),
+                        _dirs_reservation: budget.reserve(0).expect("reserve"),
+                    }),
                     stats: ScanStats::default(),
                     footer: None,
                     whole_object: None,
