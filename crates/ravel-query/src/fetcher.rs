@@ -2329,6 +2329,10 @@ impl SegmentFetcher {
         let mut stats = FetchStats::default();
         let mut scratch = Vec::new();
         let mut out = Vec::with_capacity(scalar.len());
+        // `scalar` is the exact slice `fetch_pages` planned from, in the same
+        // order, so a cursor that walks forward in lockstep lands on the
+        // right entry without scanning the rest of the plan.
+        let mut cursor = RunPlanCursor::new(planned);
         for entry in scalar {
             match &seg_ref.level {
                 SegmentLevel::L0 => {
@@ -2344,10 +2348,12 @@ impl SegmentFetcher {
                     let mut timestamps = Vec::new();
                     let mut values = Vec::new();
                     for (run_index, run) in entry.runs.iter().enumerate() {
-                        let plan = find_run_plan(planned, &entry.entry.series_id, run_index)
-                            .ok_or_else(|| {
-                                corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds)
-                            })?;
+                        let plan =
+                            cursor
+                                .next(&entry.entry.series_id, run_index)
+                                .ok_or_else(|| {
+                                    corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds)
+                                })?;
                         let (kind, decoded) = self.decode_run(
                             key,
                             &entry.entry.series_id,
@@ -2380,10 +2386,12 @@ impl SegmentFetcher {
                     // provenance so cross-input duplicate samples resolve
                     // under the same total order as the pre-compaction L0s.
                     for (run_index, run) in entry.runs.iter().enumerate() {
-                        let plan = find_run_plan(planned, &entry.entry.series_id, run_index)
-                            .ok_or_else(|| {
-                                corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds)
-                            })?;
+                        let plan =
+                            cursor
+                                .next(&entry.entry.series_id, run_index)
+                                .ok_or_else(|| {
+                                    corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds)
+                                })?;
                         let mut timestamps = Vec::new();
                         let mut values = Vec::new();
                         let (kind, decoded) = self.decode_run(
@@ -2513,6 +2521,9 @@ impl SegmentFetcher {
         // cross-thread reason as the scalar path (ADR-0044 decision 5).
         let mut span_decompressed: u64 = 0;
         let mut out = Vec::with_capacity(histogram.len());
+        // See `build_scalar_decodes`: `histogram` is the exact slice
+        // `fetch_pages` planned from, in the same order.
+        let mut cursor = RunPlanCursor::new(planned);
         for entry in histogram {
             match &seg_ref.level {
                 SegmentLevel::L0 => {
@@ -2521,10 +2532,12 @@ impl SegmentFetcher {
                     let mut timestamps = Vec::new();
                     let mut values = Vec::new();
                     for (run_index, run) in entry.runs.iter().enumerate() {
-                        let plan = find_run_plan(planned, &entry.entry.series_id, run_index)
-                            .ok_or_else(|| {
-                                corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds)
-                            })?;
+                        let plan =
+                            cursor
+                                .next(&entry.entry.series_id, run_index)
+                                .ok_or_else(|| {
+                                    corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds)
+                                })?;
                         let decoded = self.decode_histogram_run(
                             key,
                             &entry.entry.series_id,
@@ -2553,10 +2566,12 @@ impl SegmentFetcher {
                     // provenance so cross-input duplicate samples resolve under
                     // the same total order as the pre-compaction L0s.
                     for (run_index, run) in entry.runs.iter().enumerate() {
-                        let plan = find_run_plan(planned, &entry.entry.series_id, run_index)
-                            .ok_or_else(|| {
-                                corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds)
-                            })?;
+                        let plan =
+                            cursor
+                                .next(&entry.entry.series_id, run_index)
+                                .ok_or_else(|| {
+                                    corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds)
+                                })?;
                         let mut timestamps = Vec::new();
                         let mut values = Vec::new();
                         let decoded = self.decode_histogram_run(
@@ -3140,15 +3155,52 @@ fn verify_l1_identity(
     Ok(())
 }
 
-/// Looks up the planned byte ranges for one run of one series.
-fn find_run_plan<'a>(
+/// Sequential lookup of the planned byte ranges for one run of one series,
+/// for a caller that walks `planned` in exactly the order
+/// [`plan_ranges_v4`](ravel_segment::plan_ranges_v4) built it: the same
+/// series slice, in the same order, each series' runs in run order
+/// (`build_scalar_decodes` and `build_histogram_decodes` both do, over the
+/// identical `scalar`/`histogram` slice `fetch_pages` planned from). Each
+/// call advances past the entry it matches, so resolving every run of an
+/// N-entry plan costs O(N) total instead of the O(N^2) a fresh scan per run
+/// costs. A call whose expected entry does not match (a caller order
+/// mismatch, a skipped run) returns `None` rather than the wrong range,
+/// the same miss a scan reports when `series_id`/`run_index` is absent.
+struct RunPlanCursor<'a> {
     planned: &'a [ravel_segment::PlannedRunRange],
-    series_id: &SeriesId,
-    run_index: usize,
-) -> Option<&'a ravel_segment::PlannedRunRange> {
-    planned
-        .iter()
-        .find(|p| &p.series_id == series_id && p.run_index == run_index)
+    pos: usize,
+    /// Entries examined so far; compiled only for the step-count test.
+    #[cfg(test)]
+    steps: usize,
+}
+
+impl<'a> RunPlanCursor<'a> {
+    fn new(planned: &'a [ravel_segment::PlannedRunRange]) -> Self {
+        Self {
+            planned,
+            pos: 0,
+            #[cfg(test)]
+            steps: 0,
+        }
+    }
+
+    fn next(
+        &mut self,
+        series_id: &SeriesId,
+        run_index: usize,
+    ) -> Option<&'a ravel_segment::PlannedRunRange> {
+        let candidate = self.planned.get(self.pos)?;
+        #[cfg(test)]
+        {
+            self.steps += 1;
+        }
+        if &candidate.series_id == series_id && candidate.run_index == run_index {
+            self.pos += 1;
+            Some(candidate)
+        } else {
+            None
+        }
+    }
 }
 
 fn expected_identity(tenant_hash: TenantHash, seg_ref: &SegmentRef) -> ExpectedIdentity {
@@ -3359,6 +3411,168 @@ mod tests {
                     value: *value,
                 })
                 .collect(),
+        }
+    }
+
+    /// Reference implementation `RunPlanCursor` replaces: a full scan of
+    /// `planned` per call, O(N) per lookup and O(N^2) total over a plan with
+    /// N entries. Kept test-only so the acceptance test below has an
+    /// independent oracle.
+    fn find_run_plan_linear_scan<'a>(
+        planned: &'a [ravel_segment::PlannedRunRange],
+        series_id: &SeriesId,
+        run_index: usize,
+    ) -> Option<&'a ravel_segment::PlannedRunRange> {
+        planned
+            .iter()
+            .find(|p| &p.series_id == series_id && p.run_index == run_index)
+    }
+
+    /// Deterministic series id that is NOT in ascending order as `i`
+    /// increases (the high bytes count down while the low bytes count up),
+    /// so a plan built from these ids cannot be walked correctly by
+    /// anything that assumes sorted series ids.
+    fn synthetic_series_id(i: usize) -> SeriesId {
+        let i = i as u64;
+        let mut bytes = [0u8; 16];
+        bytes[0..8].copy_from_slice(&(!i).to_be_bytes());
+        bytes[8..16].copy_from_slice(&i.to_be_bytes());
+        SeriesId(bytes)
+    }
+
+    /// Builds a synthetic `PlannedRunRange` plan for `n_series` series, in
+    /// the same shape `plan_ranges_v4` produces: one entry per run, series in
+    /// the given order, each series' runs in run order. Run counts cycle
+    /// 1, 2, 3 so the plan mixes single- and multi-run series. Returns the
+    /// plan plus, for each series, its id and run count (in plan order), for
+    /// a test to walk in lockstep.
+    fn build_planned(
+        n_series: usize,
+    ) -> (Vec<ravel_segment::PlannedRunRange>, Vec<(SeriesId, usize)>) {
+        let mut planned = Vec::new();
+        let mut series = Vec::new();
+        for i in 0..n_series {
+            let id = synthetic_series_id(i);
+            let run_count = match i % 3 {
+                0 => 1,
+                1 => 2,
+                _ => 3,
+            };
+            series.push((id, run_count));
+            for run_index in 0..run_count {
+                planned.push(ravel_segment::PlannedRunRange {
+                    series_id: id,
+                    run_index,
+                    ts_range: (i as u64, run_index as u64),
+                    val_range: (0, 0),
+                    hist_range: (0, 0),
+                });
+            }
+        }
+        (planned, series)
+    }
+
+    /// `RunPlanCursor` must return exactly what the old linear scan returned
+    /// for every (series, run) a plan actually has, for a run index one past
+    /// a series' last run, and for a series id absent from the plan; none of
+    /// those depend on wall-clock time or on scanning the plan more than
+    /// once, which is what distinguishes this from a mutation that ignores
+    /// `run_index` (it would return the series' first entry for the
+    /// one-past-last-run probe instead of `None`).
+    #[test]
+    fn run_plan_lookup_matches_linear_scan_for_every_series_run() {
+        let (planned, series) = build_planned(300);
+        assert!(series.len() >= 300);
+        let mut cursor = RunPlanCursor::new(&planned);
+        for (id, run_count) in &series {
+            for run_index in 0..*run_count {
+                let scanned = find_run_plan_linear_scan(&planned, id, run_index);
+                let via_cursor = cursor.next(id, run_index);
+                assert!(scanned.is_some(), "scan missed a real plan entry");
+                assert_eq!(
+                    scanned.map(|p| (p.series_id, p.run_index)),
+                    via_cursor.map(|p| (p.series_id, p.run_index)),
+                    "cursor diverged from scan at series {id:?} run {run_index}"
+                );
+            }
+        }
+
+        // One past a series' last run: the scan finds nothing (no entry with
+        // that run_index), and the cursor must agree rather than hand back
+        // the series' first (or any) entry under the wrong run_index.
+        let (first_id, first_run_count) = series[0];
+        assert!(find_run_plan_linear_scan(&planned, &first_id, first_run_count).is_none());
+        let mut probe = RunPlanCursor::new(&planned);
+        assert!(probe.next(&first_id, first_run_count).is_none());
+
+        // A series id absent from the plan: both report no match.
+        let absent_id = synthetic_series_id(n_series_sentinel(&series));
+        assert!(find_run_plan_linear_scan(&planned, &absent_id, 0).is_none());
+        let mut probe = RunPlanCursor::new(&planned);
+        assert!(probe.next(&absent_id, 0).is_none());
+    }
+
+    /// An id guaranteed absent from a plan built by `build_planned`: one past
+    /// the highest index `build_planned` used.
+    fn n_series_sentinel(series: &[(SeriesId, usize)]) -> usize {
+        series.len() + 1
+    }
+
+    /// A caller that asks out of the plan's order must miss rather than
+    /// receive the wrong run's range: skipping a run, and visiting two series
+    /// swapped. A cursor that advances without checking the entry it lands
+    /// on would return the entry at its position under the wrong identity.
+    #[test]
+    fn run_plan_lookup_detects_out_of_order_caller() {
+        let (planned, series) = build_planned(5);
+        let (id0, runs0) = series[0];
+        let (id1, runs1) = series[1];
+        assert!(runs1 >= 2, "need a multi-run second series for this probe");
+
+        // Skipping a run: after series 0, ask for (id1, 1) while the plan's
+        // next entry is (id1, 0).
+        let mut cursor = RunPlanCursor::new(&planned);
+        for run_index in 0..runs0 {
+            assert!(cursor.next(&id0, run_index).is_some());
+        }
+        assert!(cursor.next(&id1, 1).is_none());
+
+        // Two series swapped: the plan holds series 0 then series 1, the
+        // caller visits series 1 first.
+        let mut swapped = RunPlanCursor::new(&planned);
+        assert!(swapped.next(&id1, 0).is_none());
+        let mut swapped = RunPlanCursor::new(&planned);
+        assert!(swapped.next(&id0, 0).is_some());
+        assert!(swapped.next(&id1, 0).is_some());
+        assert!(swapped.next(&id1, 1).is_some());
+        let (id2, _) = series[2];
+        assert!(swapped.next(&id2, 0).is_some());
+        // Going back to an already-consumed series misses.
+        assert!(swapped.next(&id1, 0).is_none());
+    }
+
+    /// Resolving every entry of an N-entry plan costs exactly one examined
+    /// entry per call, at 1,000 and 8,000 plan entries, so a lookup that
+    /// scans the plan per call (quadratic) fails the bound at both sizes. No
+    /// wall-clock assertions.
+    #[test]
+    fn run_plan_lookup_step_count_is_linear_in_plan_size() {
+        // Run counts cycle 1, 2, 3: a series count divisible by 3 gives
+        // exactly 2 entries per series on average.
+        for &(n_series, entries) in &[(501usize, 1_002usize), (4_002usize, 8_004usize)] {
+            let (planned, series) = build_planned(n_series);
+            assert_eq!(planned.len(), entries);
+            let mut cursor = RunPlanCursor::new(&planned);
+            for (id, run_count) in &series {
+                for run_index in 0..*run_count {
+                    assert!(cursor.next(id, run_index).is_some());
+                }
+            }
+            assert_eq!(
+                cursor.steps, entries,
+                "an in-order walk examines exactly one entry per call"
+            );
+            assert!(cursor.steps <= 2 * entries);
         }
     }
 
