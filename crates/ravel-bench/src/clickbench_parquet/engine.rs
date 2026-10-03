@@ -102,10 +102,11 @@ mod in_process {
     }
 
     impl InProcessEngine {
-        /// Uploads every file directly under `fixture_dir` to the lake store
-        /// (`clickbench/hits.parquet` for the combined file,
-        /// `clickbench/hits/<name>` for each part), grants the tenant the
-        /// whole `clickbench` bucket on profile `lake`, and builds a
+        /// Uploads every file directly under `fixture_dir` to the lake store,
+        /// which stands for the `clickbench` bucket
+        /// (`s3://clickbench/hits.parquet` for the combined file,
+        /// `s3://clickbench/hits/<name>` for each part), grants the tenant
+        /// the whole bucket on profile `lake`, and builds a
         /// `SqlExecutor` whose Parquet sources reach it through that profile.
         pub async fn new(fixture_dir: &Path) -> Result<Self, EngineError> {
             let ravel_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -176,10 +177,12 @@ mod in_process {
             let name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
                 EngineError::Unreachable(format!("non-utf8 fixture name: {path:?}"))
             })?;
+            // The lake store is the `clickbench` bucket itself, so keys carry
+            // no bucket segment: `s3://clickbench/hits/` names `hits/...`.
             let key = if name == "hits.parquet" {
-                "clickbench/hits.parquet".to_string()
+                name.to_string()
             } else {
-                format!("clickbench/hits/{name}")
+                format!("hits/{name}")
             };
             let bytes = std::fs::read(&path).map_err(|e| {
                 EngineError::Unreachable(format!("read fixture file {path:?}: {e}"))
