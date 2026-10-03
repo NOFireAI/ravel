@@ -507,10 +507,11 @@ turning `spec.probes.dedicatedHealthPort` off, waits for the same rollout
 condition. While query pods of an older spec may still be running, the
 policy's second rule also admits every port those pods can listen on (4318
 and 4316), and the operator narrows it to the new spec's ports once the
-rollout completes. Disabling the block while the rollout is incomplete is
-the same: the operator holds that wider policy (so a port the new pods open,
-such as a dedicated health port turned on in the same change, is not blocked
-under the old policy) and deletes it only once the rollout completes.
+rollout completes. Disabling the block holds that wider policy too, from the
+first disabling pass, whenever the live query Deployment's pod template still
+opens port 4319 (so a port the new pods open, such as a dedicated health port
+turned on in the same change, is not blocked under the old policy), and the
+operator deletes the policy only once the rollout completes.
 
 "Rollout completes" means the query Deployment has no pod left on an older
 spec, including terminating ones: the operator also waits for
@@ -538,10 +539,28 @@ the Secret, while the gateway and maintain Deployments still reconcile.
 `ravel-server` reads all four files once at startup, so the four Secrets'
 `resourceVersion`s feed the query pod template's secrets checksum, the same
 way the deployment key Secret's does: editing any one of them rolls the
-query pods, and leaves the gateway and maintain pods alone. Follow the key
-rotation order in the deployment guide: each edit in that sequence is one
-roll, so wait for `kubectl rollout status deployment/<cluster>-query` to
-finish before making the next.
+query pods, and leaves the gateway and maintain pods alone. The operator
+does not watch Secrets: it notices an edited Secret at its next reconcile of
+the `RavelCluster`, which can be up to 5 minutes (its resync interval) after
+the edit. A missing Secret that is created later is picked up within the same
+interval.
+
+Follow the key rotation order in the deployment guide: each edit in that
+sequence must be its own roll. Running `kubectl rollout status` right after an
+edit can report the previous, finished rollout, and an edit made then can
+coalesce into the same roll, which breaks the add, roll, remove order. After
+each edit, wait until the query Deployment shows a new rollout, either a
+changed `ravel.nofire.ai/secrets-checksum` annotation on its pod template or
+a new ReplicaSet:
+
+```sh
+kubectl get deployment <cluster>-query \
+  -o jsonpath='{.spec.template.metadata.annotations.ravel\.nofire\.ai/secrets-checksum}'
+kubectl get replicaset -l app.kubernetes.io/instance=<cluster>,app.kubernetes.io/component=query
+```
+
+Then wait for that rollout to finish with
+`kubectl rollout status deployment/<cluster>-query` before the next edit.
 
 ### Managed objects
 

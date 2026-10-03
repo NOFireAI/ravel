@@ -44,7 +44,7 @@ use crate::crd::{
 };
 use crate::reconcile::{
     AUDIT_TOKEN_KEY_MISSING_MESSAGE, AUDIT_TOKEN_KEY_MISSING_REASON, AUDIT_TOKEN_KEY_SECRET_KEY,
-    DEPLOYMENT_KEY_SECRET_KEY, DeploymentTier, GC_BOOTSTRAP_STALL_AFTER,
+    DEPLOYMENT_KEY_SECRET_KEY, DeploymentTier, DesiredObjects, GC_BOOTSTRAP_STALL_AFTER,
     GC_BOOTSTRAP_STALLED_REASON, GC_BOOTSTRAP_UNAVAILABLE_MESSAGE, GC_BOOTSTRAP_UNAVAILABLE_REASON,
     GcBootstrapGate, MIN_KUBERNETES_MINOR_VERSION, QUALIFY_COMPONENT, QUALIFY_SPEC_HASH_ANNOTATION,
     QualificationDecision, QualifyJobAction, QualifyJobObservation, QualifyStoreReason, RenderCtx,
@@ -1239,6 +1239,10 @@ where
 /// keeps the old pods covered through the disabling rollout
 /// ([`query_fragment_policy_hold_while_disabling`]).
 ///
+/// When `held` is `None` and `desired` is `Some`, `desired` itself is applied
+/// before `apply_deployments`, so the policy-before-port order does not depend
+/// on the caller having derived a hold.
+///
 /// The exact `desired` policy replaces `held`, and every other name in
 /// `possible_names` is deleted, only once `apply_deployments` returns the
 /// applied query Deployment with no pods left on an older spec
@@ -1263,6 +1267,10 @@ where
     DF: Future<Output = Result<(), Error>>,
 {
     let desired_name = desired.as_ref().map(ResourceExt::name_any);
+    // Without a held policy the desired one goes on before the Deployment step,
+    // so a pass whose caller could not derive a hold still never opens the
+    // fragment port uncovered.
+    let held = held.or_else(|| desired.clone());
     if let Some(held) = held.clone() {
         apply_policy(held.name_any(), held).await?;
     }
@@ -1841,7 +1849,7 @@ async fn reconcile_inner(
         credential_resource_versions,
         deployment_key_resource_version: deployment_key_secret.resource_version,
         audit_token_key_resource_version,
-        distributed_query_resource_versions: distributed_query.resource_versions(),
+        distributed_query_resource_versions: Vec::new(),
     };
 
     let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
@@ -1856,7 +1864,20 @@ async fn reconcile_inner(
     // `router_*` fields then `None`) rather than propagating it, so only the
     // router degrades -- the block below records a Degraded condition for it while
     // every other tier's apply and sweep still runs this pass.
-    let desired = desired_objects(&obj.spec, instance, namespace, &render_ctx)?;
+    //
+    // `plan_render` also decides which Deployments this pass applies and the
+    // render's `Degraded` entry, from the distributed-query resolution.
+    let PassRender {
+        desired,
+        mut tiers,
+        mut degraded,
+    } = plan_render(
+        &obj.spec,
+        instance,
+        namespace,
+        render_ctx,
+        &distributed_query,
+    )?;
 
     // Services and routing first, then the three Deployments in the order the
     // `sys/gc` bootstrap plan dictates (see the block after the router sweep).
@@ -1946,22 +1967,13 @@ async fn reconcile_inner(
     let roles: Api<Role> = Api::namespaced(client.clone(), namespace);
     let role_bindings: Api<RoleBinding> = Api::namespaced(client.clone(), namespace);
     // A router RENDER error (a missing routerImage, or canonicalTenant with no
-    // resolver) degrades ONLY the router: record a Degraded condition and render
-    // none of its objects, but let every other tier below still reconcile.
-    // `desired_objects` already captured the error here rather than aborting the
-    // whole reconcile, so all `router_*` fields are None and the apply blocks
-    // below are no-ops; the sweep then removes any stale router objects.
-    // Collected rather than pushed straight onto `extra_conditions`: a
-    // conditions array is keyed by type, so a pass may record at most one
-    // `Degraded` entry, and the `sys/gc` bootstrap check below can also produce
-    // one. Resolved once, after that check; `render_degraded` ranks the render
-    // causes.
-    let mut degraded = render_degraded(
-        audit_key_missing,
-        distributed_query.secret_missing_degrade(),
-        desired.distributed_query_render_error,
-        desired.router_render_error,
-    );
+    // resolver) degrades ONLY the router: `plan_render` recorded it in
+    // `degraded` and the render produced none of its objects, so all `router_*`
+    // fields are None and the apply blocks below are no-ops; the sweep then
+    // removes any stale router objects. `degraded` is collected rather than
+    // pushed straight onto `extra_conditions`: a conditions array is keyed by
+    // type, so a pass may record at most one `Degraded` entry, and the `sys/gc`
+    // bootstrap check below can also produce one.
     let mut desired_router_names: BTreeSet<String> = BTreeSet::new();
     if let Some(mut sa) = desired.router_service_account {
         let name = sa.name_any();
@@ -2066,13 +2078,6 @@ async fn reconcile_inner(
             (None, None, false)
         };
 
-    let mut tiers = TierDeployments::new(
-        &obj.spec,
-        distributed_query_secret_missing,
-        desired.gateway_deployment,
-        desired.query_deployment,
-        desired.maintain_deployment,
-    );
     // Maintain disabled: converge its Deployment away.
     if tiers.maintain.is_none() {
         delete_if_present(&deployments, &maintain_name).await?;
@@ -2141,19 +2146,11 @@ async fn reconcile_inner(
     let applied_query_ready = tiers
         .applied(DeploymentTier::Query)
         .and_then(ready_replicas);
-    // The live GET only runs when the query tier's apply was withheld (a
-    // missing audit-token key, or a missing distributed-query Secret): every
-    // other pass already has its answer from the apply it just made, and paying
-    // for an extra round trip on every reconcile of every cluster for a case
-    // that only applies to a held-back query tier would be wasted cost.
+    // When the query tier's apply was withheld (a missing audit-token key, or a
+    // missing distributed-query Secret), this pass never touched the query
+    // Deployment, so the live object read before the apply still describes it.
     let query_held = audit_key_missing || distributed_query_secret_missing;
-    let live_query_ready = if query_held {
-        live_replica_counts(&deployments, &child(instance, "query"))
-            .await?
-            .0
-    } else {
-        None
-    };
+    let live_query_ready = live_query.as_ref().and_then(ready_replicas);
     let query_ready = effective_query_ready(query_held, applied_query_ready, live_query_ready);
     let waiting = plan.waiting_for_bootstrap(maintain_ready_before, request_serving_exists);
 
@@ -2264,6 +2261,54 @@ async fn reconcile_inner(
         return Ok(Action::requeue(BOOTSTRAP_POLL));
     }
     Ok(Action::requeue(RESYNC))
+}
+
+/// What [`plan_render`] decides for one pass, before any API call.
+struct PassRender {
+    /// Everything the pass renders. Its `gateway_deployment`,
+    /// `query_deployment`, `maintain_deployment`, `router_render_error` and
+    /// `distributed_query_render_error` fields have been moved out (into
+    /// `tiers` and `degraded`) and are left at their defaults.
+    desired: DesiredObjects,
+    /// The Deployments this pass applies.
+    tiers: TierDeployments,
+    /// The render's `Degraded` reason and message, before the `sys/gc`
+    /// bootstrap check can override it.
+    degraded: Option<(String, String)>,
+}
+
+/// Turn the distributed-query Secret resolution into what this pass renders
+/// and applies: the resolved `resourceVersion`s go into `render_ctx` (so a
+/// rotated Secret moves the query pod-template checksum), a missing Secret
+/// withholds the query Deployment apply, and the render's `Degraded` entry
+/// names a missing Secret. Pure: no API client, so tests drive it directly.
+fn plan_render(
+    spec: &RavelClusterSpec,
+    instance: &str,
+    namespace: &str,
+    mut render_ctx: RenderCtx,
+    distributed_query: &DistributedQueryResolution,
+) -> Result<PassRender, Error> {
+    render_ctx.distributed_query_resource_versions = distributed_query.resource_versions();
+    let mut desired = desired_objects(spec, instance, namespace, &render_ctx)?;
+    let degraded = render_degraded(
+        audit_token_key_missing(spec),
+        distributed_query.secret_missing_degrade(),
+        desired.distributed_query_render_error.take(),
+        desired.router_render_error.take(),
+    );
+    let tiers = TierDeployments::new(
+        spec,
+        distributed_query.holds_query_tier(),
+        std::mem::take(&mut desired.gateway_deployment),
+        std::mem::take(&mut desired.query_deployment),
+        desired.maintain_deployment.take(),
+    );
+    Ok(PassRender {
+        desired,
+        tiers,
+        degraded,
+    })
 }
 
 /// The rendered Deployment for each tier and the applied result for each tier
@@ -3247,7 +3292,8 @@ pub async fn run_on(
 mod tests {
     use super::*;
     use crate::crd::{
-        GatewaySpec, IngestAffinitySpec, MaintainSpec, ProbesSpec, QuerySpec, S3Spec, StorageSpec,
+        DistributedQuerySpec, GatewaySpec, IngestAffinitySpec, MaintainSpec, ProbesSpec, QuerySpec,
+        S3Spec, StorageSpec,
     };
     use kube::Config;
 
@@ -4735,11 +4781,13 @@ mod tests {
 
     /// Item 4: disabling distributed query while the query rollout is still in
     /// flight holds the wider policy (applied before the deployment step) and
-    /// keeps it until the rollout completes, then deletes it. Guarding line: the
-    /// `if let Some(held)` apply in `converge_query_network_policy` fed by the
-    /// `None => query_fragment_policy_hold_while_disabling(...)` arm in
-    /// `reconcile_inner`. With no held policy the "apply" vanishes and the stale,
-    /// narrower policy blocks a port the new pods open through the rollout.
+    /// keeps it until the rollout completes, then deletes it. The test builds the
+    /// hold with `query_fragment_policy_hold_while_disabling` from a live query
+    /// Deployment that still opens the fragment port, then drives
+    /// `converge_query_network_policy` with it and no desired policy. Guarding
+    /// line: the `if let Some(held)` apply in `converge_query_network_policy`;
+    /// without it the "apply" vanishes and the stale, narrower policy blocks a
+    /// port the new pods open through the rollout.
     #[tokio::test]
     async fn disabling_distributed_query_holds_the_wider_policy_through_the_rollout() {
         use crate::reconcile::{FRAGMENT_PORT, HTTP_PORT};
@@ -4779,12 +4827,36 @@ mod tests {
         );
     }
 
-    /// Item 5 wiring: the resolution's resourceVersions feed the query checksum
-    /// (they are what `RenderCtx.distributed_query_resource_versions` carries),
-    /// and a missing Secret holds ONLY the query tier while naming the Secret on
-    /// the Degraded condition. Guarding line: the `|| distributed_query_secret_missing`
-    /// disjunct in `query_tier_apply_target`; remove it and the missing-Secret
-    /// case rolls the query tier onto a spec that cannot mount the Secret.
+    /// With a desired policy and no held one, an incomplete rollout still gets
+    /// the desired policy, and it goes on before the Deployment step. Guarding
+    /// line: `let held = held.or_else(|| desired.clone());` in
+    /// `converge_query_network_policy`; without the fallback the pass applies no
+    /// policy at all and the fragment port opens uncovered until the rollout
+    /// completes.
+    #[tokio::test]
+    async fn desired_policy_is_applied_before_the_deployments_when_nothing_is_held() {
+        use crate::reconcile::{FRAGMENT_PORT, HTTP_PORT};
+        let desired = fragment_policy("rc-query-fragment");
+        let incomplete = query_rollout(3, Some(2), 3, 3, None, &[HTTP_PORT, FRAGMENT_PORT]);
+        assert!(!deployment_rollout_complete(&incomplete));
+        let trace = converge_raw(Some(desired.clone()), None, Some(incomplete)).await;
+        assert_eq!(
+            trace,
+            vec![
+                ("apply rc-query-fragment".to_string(), Some(desired)),
+                ("deployments".to_string(), None),
+            ]
+        );
+    }
+
+    /// The accessors on `DistributedQueryResolution`: a resolved one yields its
+    /// resourceVersions, holds nothing and degrades nothing; a missing Secret
+    /// yields no versions, holds the query Deployment and a `SecretNotFound`
+    /// degrade naming the Secret. Also checks `query_tier_apply_target` on the
+    /// flag alone. Guarding line: the `|| distributed_query_secret_missing`
+    /// disjunct in `query_tier_apply_target`. That these values reach the
+    /// checksum, the apply targets and the condition is pinned by the
+    /// `plan_render_*` tests below.
     #[test]
     fn distributed_query_resolution_wires_versions_and_holds_only_query() {
         let resolved = DistributedQueryResolution::Resolved(vec![
@@ -4873,6 +4945,104 @@ mod tests {
             Some("rc-maintain"),
             "the maintain Deployment still applies"
         );
+    }
+
+    /// A spec with distributed query on and a deployment key set (so the audit
+    /// token key is present and only the distributed-query flag can hold the
+    /// query Deployment).
+    fn distributed_query_keyed_spec() -> RavelClusterSpec {
+        let secret = |name: &str| {
+            Some(LocalSecretRef {
+                name: name.to_string(),
+            })
+        };
+        let mut spec = spec_with_affinity(None);
+        spec.deployment_key_secret_ref = secret("dk");
+        spec.query.distributed_query = Some(DistributedQuerySpec {
+            enabled: true,
+            fragment_tls_secret_ref: secret("frag-tls"),
+            fragment_ca_secret_ref: secret("frag-ca"),
+            fragment_key_secret_ref: secret("frag-keys"),
+            sql_ticket_key_secret_ref: secret("sql-keys"),
+        });
+        spec
+    }
+
+    /// The pod-template secrets-checksum annotation on a Deployment.
+    fn pod_template_checksum(deployment: Option<&Deployment>) -> String {
+        deployment
+            .and_then(|d| d.spec.as_ref())
+            .and_then(|spec| spec.template.metadata.as_ref())
+            .and_then(|meta| meta.annotations.as_ref())
+            .and_then(|annotations| annotations.get(crate::reconcile::SECRETS_CHECKSUM_ANNOTATION))
+            .cloned()
+            .expect("the Deployment carries a secrets checksum")
+    }
+
+    /// The resolved distributed-query resourceVersions reach the query
+    /// Deployment's pod-template checksum, so a rotated Secret rolls the query
+    /// pods, and they move neither the gateway nor the maintain checksum.
+    /// Guarding line: `render_ctx.distributed_query_resource_versions =
+    /// distributed_query.resource_versions();` in `plan_render`; set it to an
+    /// empty Vec and the query checksum no longer moves on a rotation.
+    #[test]
+    fn plan_render_puts_resolved_versions_into_the_query_checksum_only() {
+        let spec = distributed_query_keyed_spec();
+        let plan = |rvs: [&str; 4]| {
+            plan_render(
+                &spec,
+                "rc",
+                "ns",
+                RenderCtx::default(),
+                &DistributedQueryResolution::Resolved(rvs.map(String::from).to_vec()),
+            )
+            .expect("spec renders")
+        };
+        let before = plan(["1", "2", "3", "4"]);
+        let rotated = plan(["1", "2", "3", "5"]);
+        assert_eq!(before.degraded, None);
+        assert_ne!(
+            pod_template_checksum(before.tiers.query.as_ref()),
+            pod_template_checksum(rotated.tiers.query.as_ref()),
+            "a rotated distributed-query Secret moves the query checksum"
+        );
+        assert_eq!(
+            pod_template_checksum(before.tiers.gateway.as_ref()),
+            pod_template_checksum(rotated.tiers.gateway.as_ref()),
+            "the gateway does not mount the distributed-query Secrets"
+        );
+        assert_eq!(
+            pod_template_checksum(before.tiers.maintain.as_ref()),
+            pod_template_checksum(rotated.tiers.maintain.as_ref()),
+            "maintain does not mount the distributed-query Secrets"
+        );
+    }
+
+    /// A missing distributed-query Secret holds back the query Deployment only,
+    /// with a `SecretNotFound` degrade naming the Secret, while the gateway and
+    /// maintain Deployments are still apply targets. Guarding lines in
+    /// `plan_render`: `distributed_query.secret_missing_degrade()` (pass `None`
+    /// and the degrade disappears) and `distributed_query.holds_query_tier()`
+    /// (pass `false` and the query Deployment rolls onto pods that cannot mount
+    /// the Secret).
+    #[test]
+    fn plan_render_holds_only_the_query_deployment_on_a_missing_secret() {
+        let spec = distributed_query_keyed_spec();
+        let missing = DistributedQueryResolution::SecretMissing {
+            name: "frag-ca".to_string(),
+            reason: "referenced by spec.query.distributedQuery.fragmentCaSecretRef".to_string(),
+        };
+        let plan =
+            plan_render(&spec, "rc", "ns", RenderCtx::default(), &missing).expect("spec renders");
+        assert!(
+            plan.tiers.query.is_none(),
+            "the query Deployment is held back"
+        );
+        assert!(plan.tiers.gateway.is_some(), "the gateway still applies");
+        assert!(plan.tiers.maintain.is_some(), "maintain still applies");
+        let (reason, message) = plan.degraded.expect("a missing Secret degrades");
+        assert_eq!(reason, "SecretNotFound");
+        assert!(message.contains("frag-ca"), "{message}");
     }
 
     /// Finding 3: credential resourceVersions are resolved before the gate and
