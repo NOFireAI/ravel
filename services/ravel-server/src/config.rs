@@ -1180,8 +1180,11 @@ pub struct Cli {
     /// query whose pool grow would exceed it aborts rather than growing without
     /// bound. Process-wide, not per-tenant (per-tenant SQL budgets wait on the
     /// limits-file's per-tenant enforcement gap, ADR-0088). Default when unset:
-    /// derived, 25% of MemTotal; reference host (16 cores, 30 GiB): 8,053,063,680.
-    /// Fallback when MemTotal is unknown: 256 MiB.
+    /// derived, 50% of MemTotal, the same share as `--sql-tenant-max-bytes`, so
+    /// a lone statement may use the tenant's whole SQL share; reference host
+    /// (16 cores, 30 GiB): 16,106,127,360. Concurrent statements still share the
+    /// per-tenant ceiling. To keep a four-way split, set this flag to a quarter
+    /// of the tenant ceiling. Fallback when MemTotal is unknown: 256 MiB.
     ///
     /// Omitted, the value is DERIVED from the host
     /// ([`resolve_performance_defaults`], ADR-0088 as amended by issue #1141):
@@ -3026,13 +3029,23 @@ pub const LOOPBACK_CACHE_MEMORY_PERCENT: u64 = 40;
 /// no longer bounds it.
 pub const CATALOG_CACHE_MEMORY_PERCENT: u64 = 5;
 
-/// Share of `MemTotal` the derived `--sql-max-query-bytes` takes (~8 GiB on the
-/// reference host).
-pub const SQL_QUERY_MEMORY_PERCENT: u64 = 25;
+/// Share of `MemTotal` the derived `--sql-max-query-bytes` takes (~15 GiB on
+/// the reference host), equal to [`SQL_TENANT_MEMORY_PERCENT`] (ADR-2414
+/// decision B1): a lone statement may use the tenant's whole SQL share.
+/// Concurrency stays bounded by the per-tenant pool, which the per-query pool
+/// nests inside (`ravel-sql`'s `memory.rs` charges the same bytes to both), so
+/// N statements share the total they shared at 25%; a second concurrent
+/// statement no longer has a guaranteed quarter of memory, it gets what the
+/// first left. One tenant's sum stays 80% of memory (fetch cache 25%, catalog
+/// cache 5%, SQL tenant share 50%), not 130%: the per-query share is a
+/// ceiling inside the tenant share, not a reservation on top of it. An
+/// explicit `--sql-max-query-bytes` still wins and is still clamped to the
+/// tenant ceiling.
+pub const SQL_QUERY_MEMORY_PERCENT: u64 = 50;
 
-/// Share of `MemTotal` the derived `--sql-tenant-max-bytes` takes (~16 GiB on
-/// the reference host), twice the per-query share so the per-tenant ceiling
-/// admits concurrent queries without the per-query clamp binding.
+/// Share of `MemTotal` the derived `--sql-tenant-max-bytes` takes (~15 GiB on
+/// the reference host). Equal to the per-query share, so the derived per-query
+/// pool equals the ceiling and never crosses it.
 pub const SQL_TENANT_MEMORY_PERCENT: u64 = 50;
 
 /// The derived `--max-segments`: the fan-out cap the #968 ClickBench result ran
@@ -3396,7 +3409,7 @@ fn resolve_knob(
 ///   operator explicitly set is the one direction that costs isolation.
 ///
 /// Derived-vs-derived and fallback-vs-fallback never cross by construction
-/// (25% <= 50%, 256 MiB <= 1 GiB), so neither flag fires there.
+/// (50% <= 50%, 256 MiB <= 1 GiB), so neither flag fires there.
 pub fn resolve_performance_defaults(
     host: HostProfile,
     flags: PerformanceFlags,
@@ -9456,7 +9469,7 @@ mod tests {
         // shared SQL/fetch MemoryBudget accountant: budget = hard_caps + remainder.
         assert_eq!(resolved.memory_hard_caps_bytes, 9_019_431_321);
         assert_eq!(resolved.memory_remainder_bytes, 21_045_339_751);
-        assert_eq!(resolved.sql_max_query_bytes, 8_053_063_680);
+        assert_eq!(resolved.sql_max_query_bytes, 16_106_127_360);
         assert_eq!(resolved.sql_tenant_max_bytes, 16_106_127_360);
         assert_eq!(resolved.max_segments, 1_000_000);
         assert_eq!(resolved.query_deadline, Duration::from_secs(660));
@@ -9503,7 +9516,7 @@ mod tests {
         assert_eq!(resolved.catalog_cache_max_bytes, 322_122_547);
         assert_eq!(resolved.memory_hard_caps_bytes, 1_932_735_283);
         assert_eq!(resolved.memory_remainder_bytes, 4_509_715_661);
-        assert_eq!(resolved.sql_max_query_bytes, 2_147_483_648);
+        assert_eq!(resolved.sql_max_query_bytes, 4_294_967_296);
         assert_eq!(resolved.sql_tenant_max_bytes, 4_294_967_296);
         // The two host-independent rules do not shrink with the host: a
         // segment-count cap and a deadline are not resident bytes.
@@ -9848,7 +9861,7 @@ mod tests {
     ///
     /// Prove-the-test: replace the clamp with
     /// `let sql_max_query_bytes = unclamped_query_bytes;` and the first
-    /// assertion reads 8,053,063,680 against the expected 1,048,576.
+    /// assertion reads 16,106,127,360 against the expected 1,048,576.
     #[test]
     fn the_per_query_sql_pool_is_clamped_to_the_per_tenant_ceiling() {
         let clamped = resolve_performance_defaults(
@@ -9884,6 +9897,53 @@ mod tests {
         assert_eq!(both.sql_tenant_max_bytes, 4 * 1024 * 1024);
         assert!(both.sql_max_query_bytes_clamped);
         assert!(!both.sql_tenant_max_bytes_raised);
+    }
+
+    /// ADR-2414 decision B1: the derived per-query SQL pool is the tenant's
+    /// whole SQL share, so a lone statement may reserve all of it. On the
+    /// reference host (30 GiB `MemTotal` = 32,212,254,720 bytes) both derived
+    /// values are 50% = 16,106,127,360. An explicit per-query flag above the
+    /// derived tenant ceiling is still clamped to it, not allowed to raise it.
+    ///
+    /// Prove-the-test: set `SQL_QUERY_MEMORY_PERCENT` back to 25 and the
+    /// first assertion reads 8,053,063,680 against 16,106,127,360; raise
+    /// `SQL_TENANT_MEMORY_PERCENT` to 75 instead (query share left at 25) and
+    /// it fails the same way, on the per-query value; in the clamp branch of
+    /// `resolve_performance_defaults`, replace `sql_max_query_bytes =
+    /// sql_tenant_max_bytes;` with `sql_max_query_bytes =
+    /// unclamped_query_bytes;` (no clamp) or with `sql_tenant_max_bytes =
+    /// unclamped_query_bytes;` (raise the ceiling) and the explicit flag
+    /// reads 20,000,000,000 against the expected 16,106,127,360. The tenant
+    /// ceiling is explicit here because an explicit per-query flag over a
+    /// non-explicit ceiling raises it by design (see
+    /// `an_explicit_query_pool_raises_a_non_explicit_tenant_ceiling`).
+    #[test]
+    fn the_derived_per_query_pool_is_the_tenant_share() {
+        let derived = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
+        assert_eq!(derived.sql_max_query_bytes, 16_106_127_360);
+        assert_eq!(derived.sql_tenant_max_bytes, 16_106_127_360);
+        assert_eq!(derived.sql_max_query_bytes, derived.sql_tenant_max_bytes);
+        assert_eq!(
+            derived.sql_max_query_bytes,
+            bytes_as_usize(percent_of(REFERENCE_MEM_BYTES, 50))
+        );
+        assert!(!derived.sql_max_query_bytes_clamped);
+        assert!(!derived.sql_tenant_max_bytes_raised);
+
+        // An explicit per-query flag above an explicit tenant ceiling equal to
+        // the derived share is clamped to it, and the ceiling is not raised.
+        let clamped = resolve_performance_defaults(
+            reference_host(),
+            PerformanceFlags {
+                sql_max_query_bytes: Some(20_000_000_000),
+                sql_tenant_max_bytes: Some(16_106_127_360),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(clamped.sql_max_query_bytes, 16_106_127_360);
+        assert_eq!(clamped.sql_tenant_max_bytes, 16_106_127_360);
+        assert!(clamped.sql_max_query_bytes_clamped);
+        assert!(!clamped.sql_tenant_max_bytes_raised);
     }
 
     /// The catalog byte cache is a SEPARATE derived ceiling from the fetcher
@@ -10219,10 +10279,10 @@ mod tests {
         assert!(clamped.sql_max_query_bytes_clamped);
         assert!(!clamped.sql_tenant_max_bytes_raised);
 
-        // Derived vs derived on the reference host: 25% <= 50% by construction,
+        // Derived vs derived on the reference host: 50% <= 50% by construction,
         // so no crossing and neither flag fires.
         let derived = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
-        assert_eq!(derived.sql_max_query_bytes, 8_053_063_680);
+        assert_eq!(derived.sql_max_query_bytes, 16_106_127_360);
         assert_eq!(derived.sql_tenant_max_bytes, 16_106_127_360);
         assert!(!derived.sql_max_query_bytes_clamped);
         assert!(!derived.sql_tenant_max_bytes_raised);
@@ -10879,7 +10939,7 @@ mod tests {
     /// change to the rule has to restate the number it produces.
     const REFERENCE_FETCH_CONCURRENCY: usize = 32;
     const REFERENCE_CACHE_MAX_BYTES: u64 = 7_516_192_768;
-    const REFERENCE_SQL_MAX_QUERY_BYTES: usize = 8_053_063_680;
+    const REFERENCE_SQL_MAX_QUERY_BYTES: usize = 16_106_127_360;
     const REFERENCE_SQL_TENANT_MAX_BYTES: usize = 16_106_127_360;
 
     /// The reference [`HostProfile`], injected.
