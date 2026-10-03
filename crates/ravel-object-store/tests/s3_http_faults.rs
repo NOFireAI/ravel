@@ -281,10 +281,13 @@ struct FakeState {
     peak_in_flight: AtomicUsize,
     /// Woken whenever `in_flight` changes.
     in_flight_changed: Notify,
-    /// When set, an `UploadPart` waits before answering until this many
-    /// requests are in flight or the grace period passes, so every part a
-    /// client sends concurrently overlaps at the server.
-    part_hold: Mutex<Option<(usize, Duration)>>,
+    /// When set, a request of one of these ops waits before answering until
+    /// this many requests are in flight or the grace period passes, so every
+    /// request a client sends concurrently overlaps at the server.
+    hold: Mutex<Option<(Vec<Op>, usize, Duration)>>,
+    /// For each held request, its op and the in-flight count its hold ended
+    /// on: the target once reached, else the count when the grace ran out.
+    hold_ends: Mutex<Vec<(Op, usize)>>,
 }
 
 /// One request's slot in [`FakeState::in_flight`], released on drop so a
@@ -308,6 +311,21 @@ impl Drop for InFlight<'_> {
 }
 
 impl FakeState {
+    /// Wait until at least `target` requests are in flight, and return the
+    /// count that satisfied it.
+    async fn wait_in_flight(&self, target: usize) -> usize {
+        loop {
+            let changed = self.in_flight_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let now = self.in_flight.load(Ordering::SeqCst);
+            if now >= target {
+                return now;
+            }
+            changed.await;
+        }
+    }
+
     /// Pop the fault for this request: scripted queue first, then the
     /// per-operation persistent fault, else serve normally.
     fn take_fault(&self, op: Op) -> Option<Fault> {
@@ -493,10 +511,26 @@ impl FakeS3 {
         self.requests(op).len()
     }
 
-    /// Hold every `UploadPart` until `target` requests are in flight or
-    /// `grace` passes, whichever comes first.
-    fn hold_parts(&self, target: usize, grace: Duration) {
-        *self.state.part_hold.lock() = Some((target, grace));
+    /// Hold every request of the `ops` until `target` requests are in flight
+    /// or `grace` passes, whichever comes first.
+    fn hold(&self, ops: &[Op], target: usize, grace: Duration) {
+        *self.state.hold.lock() = Some((ops.to_vec(), target, grace));
+    }
+
+    /// The in-flight count each held request of `op` was released on.
+    fn hold_ends(&self, op: Op) -> Vec<usize> {
+        self.state
+            .hold_ends
+            .lock()
+            .iter()
+            .filter(|(held, _)| *held == op)
+            .map(|(_, in_flight)| *in_flight)
+            .collect()
+    }
+
+    /// Wait until at least `target` requests are in flight.
+    async fn wait_in_flight(&self, target: usize) {
+        self.state.wait_in_flight(target).await;
     }
 
     /// The most requests of any kind the endpoint has served at once.
@@ -796,22 +830,14 @@ async fn handle(
 
     let fault = state.take_fault(op);
     state.record(op, &key, fault, &headers, &query, &data);
-    let part_hold = *state.part_hold.lock();
-    if op == Op::UploadPart
-        && let Some((target, grace)) = part_hold
+    let hold = state.hold.lock().clone();
+    if let Some((ops, target, grace)) = hold
+        && ops.contains(&op)
     {
-        let reached = async {
-            loop {
-                let changed = state.in_flight_changed.notified();
-                tokio::pin!(changed);
-                changed.as_mut().enable();
-                if state.in_flight.load(Ordering::SeqCst) >= target {
-                    return;
-                }
-                changed.await;
-            }
-        };
-        let _ = tokio::time::timeout(grace, reached).await;
+        let ended_on = tokio::time::timeout(grace, state.wait_in_flight(target))
+            .await
+            .unwrap_or_else(|_| state.in_flight.load(Ordering::SeqCst));
+        state.hold_ends.lock().push((op, ended_on));
     }
     if has_unsigned_amz_header(&headers) {
         return error_response(
@@ -3245,11 +3271,12 @@ async fn successful_multipart_upload_moves_neither_counter() {
 }
 
 /// A `put()` above the multipart threshold through a scheduled class handle
-/// never has more requests in flight than the permits it holds (issue #2327):
-/// one permit when the class has capacity 1, two when the background class
-/// has two. The endpoint holds every part until four are in flight (the
-/// store's unscheduled part concurrency) or 200 ms pass, so parts the store
-/// sends together overlap at the server and count toward the peak.
+/// with upload integrity off keeps exactly as many requests in flight as the
+/// permits it holds (issue #2327): one permit when the class has capacity 1,
+/// two when the background class has two. The endpoint holds every part until
+/// four are in flight (the store's unscheduled part concurrency) or 200 ms
+/// pass, so parts the store sends together overlap at the server and count
+/// toward the peak.
 #[tokio::test]
 async fn scheduled_large_put_keeps_requests_within_its_permits() {
     // (scheduler sizing, use the background handle, permits the put can hold)
@@ -3258,7 +3285,7 @@ async fn scheduled_large_put_keeps_requests_within_its_permits() {
         (SchedulerConfig::new(8, 2, 1), true, 2),
     ] {
         let fake = FakeS3::start().await;
-        fake.hold_parts(4, Duration::from_millis(200));
+        fake.hold(&[Op::UploadPart], 4, Duration::from_millis(200));
         let classed = ClassedStore::scheduled(Arc::new(fake.store()), config);
         let handle = if background {
             classed.background()
@@ -3279,8 +3306,8 @@ async fn scheduled_large_put_keeps_requests_within_its_permits() {
         );
         assert_eq!(fake.count(Op::UploadPart), 5, "five parts uploaded");
         let peak = fake.peak_in_flight();
-        assert!(
-            peak <= permits,
+        assert_eq!(
+            peak, permits,
             "{peak} requests were in flight at once for a put holding {permits} permit(s) \
              ({config:?}, background: {background})"
         );
@@ -3290,6 +3317,56 @@ async fn scheduled_large_put_keeps_requests_within_its_permits() {
             "the completed object must hold the uploaded bytes"
         );
     }
+}
+
+/// With upload integrity on, `S3Store` sends a large overwrite as one PUT, so a
+/// scheduled handle takes exactly one permit for it rather than the multipart
+/// fan-out. In a class of five permits, four GETs issued while the PUT is held
+/// at the endpoint all reach it alongside the PUT, so the PUT is released with
+/// five requests in flight; a put holding more than one permit would leave
+/// fewer than four for them.
+#[tokio::test]
+async fn scheduled_large_put_with_integrity_takes_one_permit() {
+    const PERMITS: usize = 5;
+    let fake = FakeS3::start().await;
+    fake.seed("scheduled/read", b"read beside the put");
+    fake.hold(&[Op::Put, Op::Get], PERMITS, Duration::from_secs(5));
+    let classed = ClassedStore::scheduled(
+        Arc::new(fake.store_with_upload_integrity(UploadIntegrity::Crc64Nvme)),
+        SchedulerConfig::new(PERMITS, PERMITS, 1),
+    );
+    let handle = classed.foreground();
+    let payload = Bytes::from(vec![6u8; 4 * MULTIPART_PART_SIZE + 1]);
+
+    let put = handle.put("scheduled/integrity", payload.clone(), PutOptions::default());
+    let reads = async {
+        fake.wait_in_flight(1).await;
+        futures::future::join_all(
+            (1..PERMITS).map(|_| handle.get("scheduled/read", GetRange::Full)),
+        )
+        .await
+    };
+    let (put, reads) = tokio::join!(put, reads);
+    put.expect("a scheduled single-PUT put must succeed");
+    for read in reads {
+        read.expect("a GET beside the put must succeed");
+    }
+
+    assert_eq!(fake.count(Op::CreateMultipart), 0, "integrity keeps one PUT");
+    assert_eq!(fake.count(Op::Put), 1, "exactly one PUT request");
+    let ends = fake.hold_ends(Op::Put);
+    assert_eq!(ends.len(), 1, "the one PUT was held");
+    assert_eq!(
+        ends[0],
+        PERMITS,
+        "the put left {} of {PERMITS} permits for the GETs beside it",
+        ends[0].saturating_sub(1)
+    );
+    assert_eq!(
+        fake.object("scheduled/integrity").as_deref(),
+        Some(&payload[..]),
+        "the object must hold the uploaded bytes"
+    );
 }
 
 /// `SlowDown` inside a 200 response body is S3's documented behavior for
