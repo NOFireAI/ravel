@@ -28,10 +28,20 @@
 //! has over spill: the files beneath it are created by DataFusion's disk
 //! manager. The configured directory's own mode is the operator's.
 //!
-//! Cleaning up scratch left by a process that died mid-query is explicitly NOT
-//! done here (no startup sweep, no node-wide or per-tenant scratch quota):
-//! those need an owner outside a single query's lifetime and are follow-up
-//! work.
+//! Cleaning up scratch left by a process that died mid-query needs an owner
+//! outside a single query's lifetime: [`SpillRootOwner`] is that owner. A
+//! `--cache-dir`-configured process acquires one root,
+//! `<cache_dir>/sql-spill/<instance_id>`, for its whole lifetime, with an
+//! exclusive `flock` on a lock file inside it as its live-ownership proof
+//! (ADR-0954 requirement 7 explicitly rejects a pid for this: a reused pid is
+//! live and owns nothing of the dead process's directory, while a `flock` is
+//! released by the kernel the instant the owning process's last handle to it
+//! closes, however that happens). At startup, after acquiring its own root, a
+//! process calls [`SpillRootOwner::sweep_orphaned_spill_roots`] to remove
+//! every sibling root whose lock it can take itself; a sibling whose
+//! ownership cannot be settled either way is left in place and logged, never
+//! guessed at. There is still no node-wide or per-tenant scratch quota;
+//! that remains follow-up work.
 //!
 //! # What the figures count
 //!
@@ -225,6 +235,173 @@ impl Drop for SpillScratch {
         // (see the module doc). Nothing downstream reads it, so a failure to
         // remove costs disk, never correctness.
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Name of the owner lock file inside each process's `--cache-dir` spill root
+/// (ADR-0954 requirement 7, issue #2416). Its exclusive `flock` is that
+/// process's live-ownership proof: ADR-0954 explicitly rejects a pid, in the
+/// directory name or anywhere else, as ownership proof, because a reused pid
+/// is live and owns nothing of the dead process's directory. A `flock` is
+/// instead released by the kernel the instant the owning process's last
+/// handle to it closes, however that happens -- clean exit, crash, `SIGKILL`
+/// -- so another process can tell "still owned" from "abandoned" by trying to
+/// take the lock itself, never by reading the directory's name or checking
+/// pid liveness.
+const OWNER_LOCK_FILE_NAME: &str = ".owner.lock";
+
+/// This process's exclusive hold on its `--cache-dir` spill root
+/// (ADR-0954 requirement 7, issue #2416):
+/// `<cache_dir>/sql-spill/<instance_id>`, created owner-only, with an
+/// `.owner.lock` file this value holds an exclusive `flock` on for as long as
+/// it is alive. Held for the process's lifetime (the caller keeps it, not
+/// this module); dropping it closes the lock file, which releases the lock
+/// immediately, including on a crash -- the kernel does this regardless of
+/// how the process exits.
+pub struct SpillRootOwner {
+    dir: PathBuf,
+    _lock: std::fs::File,
+}
+
+impl SpillRootOwner {
+    /// Create (idempotently) and take ownership of
+    /// `<cache_dir>/sql-spill/<instance_id>`. `instance_id` is whatever
+    /// identity the process already carries for its own artifacts; this does
+    /// not mint one.
+    ///
+    /// Fails only on an I/O error: the directory could not be created (or
+    /// found existing), or its lock file could not be opened or locked. A
+    /// `WouldBlock` here means another live process already holds this exact
+    /// `(cache_dir, instance_id)` pair -- an instance identity collision, not
+    /// the expected startup path -- and is surfaced as an ordinary
+    /// [`std::io::Error`] via `TryLockError`'s conversion.
+    pub fn acquire(cache_dir: &Path, instance_id: &str) -> std::io::Result<SpillRootOwner> {
+        let sql_spill_root = cache_dir.join(crate::config::SQL_SPILL_SUBDIR);
+        std::fs::create_dir_all(&sql_spill_root)?;
+        let dir = crate::config::cache_spill_dir(cache_dir, instance_id);
+        match create_scratch_dir(&dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err),
+        }
+        let lock_path = dir.join(OWNER_LOCK_FILE_NAME);
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        fs4::FileExt::try_lock(&lock_file)?;
+        Ok(SpillRootOwner {
+            dir,
+            _lock: lock_file,
+        })
+    }
+
+    /// This process's own spill root, `<cache_dir>/sql-spill/<instance_id>`.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Remove every sibling spill root under `<cache_dir>/sql-spill` whose
+    /// owner is provably gone (ADR-0954 requirement 7, issue #2416): a
+    /// process other than this one that cannot be, because its lock file can
+    /// be exclusively locked here and now. Never removes `self.dir()`, never
+    /// looks above `<cache_dir>/sql-spill`, and never removes a sibling whose
+    /// ownership this call cannot settle one way or the other -- an
+    /// unreadable directory, a missing lock file, or any lock error other
+    /// than contention is left in place and logged, not guessed at.
+    ///
+    /// Call once at process startup, after [`SpillRootOwner::acquire`].
+    pub fn sweep_orphaned_spill_roots(&self) {
+        let Some(sql_spill_root) = self.dir.parent() else {
+            return;
+        };
+        let entries = match std::fs::read_dir(sql_spill_root) {
+            Ok(entries) => entries,
+            Err(err) => {
+                tracing::warn!(
+                    dir = %sql_spill_root.display(),
+                    error = %err,
+                    "could not list SQL spill roots to sweep"
+                );
+                return;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "could not read a SQL spill root directory entry"
+                    );
+                    continue;
+                }
+            };
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let candidate = sql_spill_root.join(entry.file_name());
+            if candidate == self.dir {
+                continue;
+            }
+            self.sweep_one(&candidate);
+        }
+    }
+
+    /// Settle, and act on, one sibling spill root's ownership.
+    fn sweep_one(&self, candidate: &Path) {
+        let lock_path = candidate.join(OWNER_LOCK_FILE_NAME);
+        let lock_file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(err) => {
+                tracing::warn!(
+                    dir = %candidate.display(),
+                    error = %err,
+                    "cannot prove ownership of this SQL spill root (no readable owner lock); \
+                     leaving it in place"
+                );
+                return;
+            }
+        };
+        match fs4::FileExt::try_lock(&lock_file) {
+            Ok(()) => {
+                drop(lock_file);
+                match std::fs::remove_dir_all(candidate) {
+                    Ok(()) => {
+                        tracing::info!(
+                            dir = %candidate.display(),
+                            "removed orphaned SQL spill root: its owner process is gone"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            dir = %candidate.display(),
+                            error = %err,
+                            "owner of this SQL spill root is gone, but it could not be removed"
+                        );
+                    }
+                }
+            }
+            Err(fs4::TryLockError::WouldBlock) => {
+                // Owned by a live process. Expected steady state; nothing to log.
+            }
+            Err(err @ fs4::TryLockError::Error(_)) => {
+                tracing::warn!(
+                    dir = %candidate.display(),
+                    error = %std::io::Error::from(err),
+                    "cannot prove ownership of this SQL spill root; leaving it in place"
+                );
+            }
+        }
     }
 }
 
@@ -542,6 +719,124 @@ mod tests {
         assert_eq!(
             counts.bytes_read, None,
             "unmeasured must stay distinguishable from zero"
+        );
+    }
+
+    /// `acquire` creates `<cache_dir>/sql-spill/<instance_id>` owner-only and
+    /// holds an exclusive lock on it, matching [`crate::config::cache_spill_dir`]'s
+    /// path construction exactly (the sweep and the server's resolved-line log
+    /// both depend on this agreeing).
+    #[test]
+    fn acquire_creates_the_shared_cache_dir_path() {
+        let root = tempfile::tempdir().expect("temp root");
+        let owner = SpillRootOwner::acquire(root.path(), "inst-1").expect("acquire must succeed");
+        assert_eq!(
+            owner.dir(),
+            crate::config::cache_spill_dir(root.path(), "inst-1"),
+            "the owner's directory must match the shared path-construction helper"
+        );
+        assert!(owner.dir().is_dir());
+    }
+
+    /// Two [`SpillRootOwner`]s cannot acquire the same `(cache_dir,
+    /// instance_id)` pair at once: the second's `try_lock` contends with the
+    /// first's live lock.
+    #[test]
+    fn acquiring_the_same_root_twice_while_the_first_is_alive_fails() {
+        let root = tempfile::tempdir().expect("temp root");
+        let _first =
+            SpillRootOwner::acquire(root.path(), "inst-1").expect("first acquire must succeed");
+        let second = SpillRootOwner::acquire(root.path(), "inst-1");
+        assert!(
+            second.is_err(),
+            "a second live owner of the same root must be refused"
+        );
+    }
+
+    /// The sweep removes a sibling root whose owner is provably gone: nobody
+    /// holds its `.owner.lock`, so this process's own `try_lock` on it
+    /// succeeds.
+    ///
+    /// FLIP (sweep-by-age, non-vacuity): replace `sweep_one`'s try-lock check
+    /// with one that removes any sibling whose directory is at least as old
+    /// as `Duration::ZERO` (i.e. every sibling, unconditionally on age). This
+    /// test still passes (the dead sibling is still removed), but
+    /// `sweep_leaves_a_sibling_with_a_live_owner` then fails: age cannot tell
+    /// a live owner from a dead one. See that test for the actual failing
+    /// assertion.
+    #[test]
+    fn sweep_removes_a_sibling_whose_owner_is_provably_gone() {
+        let root = tempfile::tempdir().expect("temp root");
+        let owner = SpillRootOwner::acquire(root.path(), "inst-1").expect("acquire");
+
+        let dead_dir = root
+            .path()
+            .join(crate::config::SQL_SPILL_SUBDIR)
+            .join("inst-dead");
+        std::fs::create_dir_all(&dead_dir).expect("dead sibling dir");
+        std::fs::write(dead_dir.join(OWNER_LOCK_FILE_NAME), b"")
+            .expect("dead sibling lock file, held by nobody");
+
+        owner.sweep_orphaned_spill_roots();
+
+        assert!(
+            !dead_dir.exists(),
+            "a sibling with no live lock holder must be removed"
+        );
+    }
+
+    /// The sweep leaves a sibling root alone while its owner is still alive:
+    /// trying to take its lock would block, which is exactly the proof that
+    /// it is still owned.
+    ///
+    /// FLIP (sweep-everything-not-ours, non-vacuity): replace `sweep_one`
+    /// with an unconditional `remove_dir_all` on every sibling that is not
+    /// `self.dir`. This test then fails: the live sibling's directory no
+    /// longer exists after the sweep.
+    #[test]
+    fn sweep_leaves_a_sibling_with_a_live_owner() {
+        let root = tempfile::tempdir().expect("temp root");
+        let owner = SpillRootOwner::acquire(root.path(), "inst-1").expect("acquire inst-1");
+        let live_owner = SpillRootOwner::acquire(root.path(), "inst-2").expect("acquire inst-2");
+
+        owner.sweep_orphaned_spill_roots();
+
+        assert!(
+            live_owner.dir().is_dir(),
+            "a sibling root whose owner is still alive must survive the sweep"
+        );
+    }
+
+    /// A sibling whose ownership cannot be settled (no lock file to test at
+    /// all) is left in place rather than guessed at either way.
+    #[test]
+    fn sweep_leaves_a_sibling_with_no_lock_file() {
+        let root = tempfile::tempdir().expect("temp root");
+        let owner = SpillRootOwner::acquire(root.path(), "inst-1").expect("acquire");
+
+        let unprovable_dir = root
+            .path()
+            .join(crate::config::SQL_SPILL_SUBDIR)
+            .join("inst-unprovable");
+        std::fs::create_dir_all(&unprovable_dir).expect("unprovable sibling dir");
+
+        owner.sweep_orphaned_spill_roots();
+
+        assert!(
+            unprovable_dir.is_dir(),
+            "a sibling with no owner lock to test must be left in place, not guessed at"
+        );
+    }
+
+    /// The sweep never touches its own root.
+    #[test]
+    fn sweep_never_removes_its_own_root() {
+        let root = tempfile::tempdir().expect("temp root");
+        let owner = SpillRootOwner::acquire(root.path(), "inst-1").expect("acquire");
+        owner.sweep_orphaned_spill_roots();
+        assert!(
+            owner.dir().is_dir(),
+            "the sweep must never remove its own root"
         );
     }
 }
