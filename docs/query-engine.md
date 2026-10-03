@@ -424,6 +424,50 @@ pages turn out to cover the object after all. `LogsScanExec` publishes
 `fast_path_ranged_segments` and `fast_path_whole_object_segments` so
 `EXPLAIN ANALYZE` shows the split without counting store requests.
 
+## The striped route: directories once per segment, row groups whole
+
+The plan-then-stripe route (every logs statement the whole-segment fast path
+declines, which includes every one whose partition count exceeds its segment
+count) opens a segment once per partition that owns some of its blocks.
+ADR-2414 decision A1 makes that cost independent of how many partitions open
+the same segment:
+
+- **Directories decode once per (query, segment).** `plan_segment` reads and
+  decodes STREAM_DIR, FIELD_DIR, SKIP_IDX and PAGE_DIR for each relevant segment
+  (`SegmentDirectories`) and carries them with the footer to every
+  per-partition subset open. The open builds its reader from them
+  (`RlogReader::from_decoded`), resolves stream-attribute filters and the read
+  gate's job size from them, and its ranged fetch neither fetches nor decodes
+  any of the four sections. The plan phase charges the decode to
+  `decompressed_bytes` once, where it happens; a reader built from carried
+  directories does not seed its scans with it again. For a projection over a
+  segment, the plan phase's `decompressed_bytes` is the four sections'
+  `uncomp_len` and the scan phase's is the projected block pages alone
+  (`striped_projection_decompresses_once_per_segment`). Reading the front
+  directory sections (STREAM_DIR and FIELD_DIR, which the suffix probe does not
+  cover) is therefore one more plan-phase GET per segment for a predicate-free
+  statement, in exchange for none in the scan phase.
+- **Row groups are dealt whole.** With a read cache wired, `owned_work` numbers
+  every surviving row group in segment-then-group order across the whole scan,
+  where a row group is the PAGE_DIR group (`group_target_blocks` consecutive
+  blocks, the unit the format stores column-major) and a pruned block stays
+  with its group, and gives group `i` to partition `i % n`. Every block of a
+  group is on one partition, so a group's dictionary pages are decoded once per
+  scan rather than once per partition holding one of its blocks, and group
+  counts differ by at most one across partitions (`owned_work_tests`). A
+  segment with fewer row groups than partitions keeps some of them idle. Without
+  a read cache the assignment stays one whole segment per partition.
+- **The ranged plan covers the partition's own blocks.** A subset open
+  intersects the ts and numeric candidate blocks with the blocks it owns before
+  the projected page extents and the coverage crossover are computed, so a
+  partition fetches the pages of its own row groups only
+  (`owned_block_plan_tests`). The coverage crossover therefore weighs the
+  partition's own footprint, and an open that owns a small share of a segment
+  stays on ranged reads where a whole-object read would otherwise have won.
+- A row-ref names a block by its position in the segment's surviving-block
+  list, not by its whole-object index; the scan resolves the position through
+  that list, so late materialization reopens the block the scan decoded.
+
 ## Selective (predicated) logs scan: request count
 
 A statement with a block-level predicate (a declared-column or `attrs`
