@@ -582,7 +582,7 @@ jobs:
     needs: [changes, tla-models]
     if: always()
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     permissions:
       contents: read
     env:
@@ -620,8 +620,27 @@ jobs:
             exit 1
           fi
           echo "areas covered: $actual"
+      # The download asks the artifact service for one signed URL per marker,
+      # and a dropped connection there fails this required check with every
+      # leg green. One retry covers that. A second failed download fails the
+      # job at the retry step; when a download succeeds, the name assertion
+      # below decides.
       - name: Collect the area markers
+        id: markers
         if: needs.changes.outputs.formal_area == 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: tla-ok-*
+          path: tla-markers
+          merge-multiple: true
+      - name: Wait before retrying the marker download
+        if: needs.changes.outputs.formal_area == 'true' && steps.markers.outcome == 'failure'
+        run: |
+          rm -rf tla-markers
+          sleep 30
+      - name: Collect the area markers (retry)
+        if: needs.changes.outputs.formal_area == 'true' && steps.markers.outcome == 'failure'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: tla-ok-*
