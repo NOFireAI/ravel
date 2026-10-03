@@ -2488,8 +2488,16 @@ pub async fn start_with_heartbeat(
                 .merge(remote_write::router(mtls_rw_state));
         }
     }
+    // ADR-1702 decision 4: snapshot part, postings and column-statistics
+    // decodes run on the read gate, not on the resolving task. The memory
+    // budget stays unlimited here.
     let catalog =
         query::build_catalog_for_server(store.clone(), &config, ingest_lag.catalog_window_ns)?;
+    let catalog = Arc::new(
+        Arc::into_inner(catalog)
+            .ok_or_else(|| anyhow::anyhow!("the freshly built catalog is already shared"))?
+            .with_read_gate(cpu_gates.read.clone()),
+    );
     // Durable shard_count enforcement on the read path (ADR-0050 section 5).
     // The two cache flags reach the catalog byte cache here, not only the
     // fetcher cache.
