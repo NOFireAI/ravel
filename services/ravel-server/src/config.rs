@@ -12962,7 +12962,7 @@ mod tests {
     ///
     /// Prove-the-test: write `off: false` in `Cli::query_budgets` and the `off`
     /// row reads `false`; pass `resolved.memory_remainder_bytes` instead of
-    /// `memory_budget_bytes` and the budget reads 22,548,578,304 against
+    /// `memory_budget_bytes` and the budget reads 21,045,339,751 against
     /// 30,064,771,072.
     #[test]
     fn sql_spill_flag_parses_auto_and_off_and_reaches_query_budgets() {

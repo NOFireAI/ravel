@@ -2755,9 +2755,8 @@ mod tests {
         KEEP_TWO_DISPATCHERS
             .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
         let capture = InfoCapture::default();
-        let guard = tracing::subscriber::set_default(
-            tracing_subscriber::registry().with(capture.clone()),
-        );
+        let guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
         (capture, guard)
     }
 
@@ -2855,9 +2854,9 @@ mod tests {
     ///
     /// Prove-the-test: move the `inputs.off` early return in
     /// `resolve_sql_spill` below the `SpillConfig::resolve` call and keep
-    /// the env result, and the off row reads the env pair's directory; check
-    /// `cache_dir` before the env pair and the env row reads the cache-dir
-    /// root.
+    /// the env result, and the off row reads the env pair's directory; map
+    /// `SpillConfigError::Incomplete` through unchanged and the half-set rows
+    /// read "only one of the two is set", naming neither variable.
     #[test]
     fn spill_sources_resolve_in_precedence_order() {
         let cache = tempfile::tempdir().expect("cache dir");
@@ -2884,7 +2883,10 @@ mod tests {
             }
         );
         assert!(env.inputs.cache_dir.is_none() && env.owner.is_none());
-        assert!(dead.is_dir(), "an env-rooted spill never sweeps the cache dir");
+        assert!(
+            dead.is_dir(),
+            "an env-rooted spill never sweeps the cache dir"
+        );
 
         let off = prepare(
             Some(cache.path()),
@@ -2974,10 +2976,14 @@ mod tests {
     /// (`memory_budget_bytes` 30,064,771,072) with 300 GiB free, the cap binds:
     /// 120,259,084,288.
     ///
+    /// The builder honours `off` itself, not only through `prepare` leaving
+    /// the cache inputs out: inputs carrying both `off` and a cache dir build
+    /// an executor with spill disabled.
+    ///
     /// Prove-the-test: call `.with_spill_from_env()` in
     /// `build_sql_state_inner` instead of `.with_spill_resolved(...)` and the
-    /// auto row reads `None`; pass `false` instead of `spill.off` and the off
-    /// row reads the cache-dir config.
+    /// auto row reads `None`; pass `false` instead of `spill.off` and the
+    /// direct off row reads the cache-dir config.
     #[test]
     fn sql_spill_and_cache_dir_reach_the_executor_from_cli() {
         use clap::Parser;
@@ -3001,40 +3007,7 @@ mod tests {
                 300 * GIB,
             )
             .expect("spill resolves");
-            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-            let catalog = build_catalog(
-                store.clone(),
-                1,
-                false,
-                ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
-                None,
-                None,
-                None,
-                Duration::from_secs(2),
-            )
-            .expect("catalog");
-            let state = build_sql_state_with_parquet(
-                catalog,
-                store,
-                Arc::new(StaticBearerTokenResolver::new(HashMap::new())),
-                None,
-                EngineConfig::default(),
-                Arc::new(GetLimiter::new(1).expect("nonzero permits")),
-                ravel_sql::DEFAULT_MAX_QUERY_BYTES,
-                DEFAULT_MAX_TENANT_BYTES,
-                false,
-                Arc::new(crate::metrics::QueryAccountingMetrics::new(
-                    std::collections::HashSet::new(),
-                )),
-                QueryAdmissionController::shared(ravel_query::QueryConcurrencyLimit::Unlimited),
-                None,
-                Arc::new(ravel_memory::MemoryBudget::unlimited()),
-                None,
-                ravel_sql::DEFAULT_MIN_GRACE_MS,
-                &startup.inputs,
-            )
-            .expect("sql state builds");
-            state.executor.config().spill.clone()
+            executor_spill(&startup.inputs)
         };
 
         let cache = tempfile::tempdir().expect("cache dir");
@@ -3047,6 +3020,58 @@ mod tests {
         );
         let cache = tempfile::tempdir().expect("cache dir");
         assert_eq!(state_for(&["--sql-spill", "off"], cache.path()), None);
+        assert_eq!(
+            executor_spill(&SqlSpillInputs {
+                off: true,
+                cache_dir: Some(CacheDirSpillInputs {
+                    cache_dir: cache.path().to_path_buf(),
+                    instance_id: INSTANCE.to_string(),
+                    free_bytes: 300 * GIB,
+                    memory_budget_bytes: 30_064_771_072,
+                }),
+            }),
+            None,
+            "off in the inputs wins over a cache dir in the same inputs"
+        );
+    }
+
+    /// The `SqlConfig::spill` of an executor `build_sql_state_with_parquet`
+    /// builds from `inputs`.
+    fn executor_spill(inputs: &SqlSpillInputs) -> Option<ravel_sql::SpillConfig> {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog = build_catalog(
+            store.clone(),
+            1,
+            false,
+            ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+            None,
+            None,
+            None,
+            Duration::from_secs(2),
+        )
+        .expect("catalog");
+        let state = build_sql_state_with_parquet(
+            catalog,
+            store,
+            Arc::new(StaticBearerTokenResolver::new(HashMap::new())),
+            None,
+            EngineConfig::default(),
+            Arc::new(GetLimiter::new(1).expect("nonzero permits")),
+            ravel_sql::DEFAULT_MAX_QUERY_BYTES,
+            DEFAULT_MAX_TENANT_BYTES,
+            false,
+            Arc::new(crate::metrics::QueryAccountingMetrics::new(
+                std::collections::HashSet::new(),
+            )),
+            QueryAdmissionController::shared(ravel_query::QueryConcurrencyLimit::Unlimited),
+            None,
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
+            None,
+            ravel_sql::DEFAULT_MIN_GRACE_MS,
+            inputs,
+        )
+        .expect("sql state builds");
+        state.executor.config().spill.clone()
     }
 
     /// The startup lines: `sql_spill_dir` and `sql_spill_max_bytes` each
@@ -3062,13 +3087,16 @@ mod tests {
         let cache = tempfile::tempdir().expect("cache dir");
         let explicit = cache.path().join("explicit");
         let root = cache.path().join("sql-spill").join(INSTANCE);
-        let cases: [(&str, bool, Option<&std::ffi::OsStr>, Option<&std::ffi::OsStr>, String, String); 3] = [
+        let cases = [
             (
                 "cache-dir",
                 false,
                 None,
                 None,
-                format!(" value={:?} source=\"cache-dir\"", root.display().to_string()),
+                format!(
+                    " value={:?} source=\"cache-dir\"",
+                    root.display().to_string()
+                ),
                 format!(" value={} source=\"derived\"", 8 * GIB),
             ),
             (
@@ -3116,8 +3144,8 @@ mod tests {
     ///
     /// Prove-the-test: replace `owner.sweep_orphaned_spill_roots()` in
     /// `sweep_spill_roots` with a removal of every sibling older than an hour
-    /// and the live root is gone while the dead one stays; with a removal of
-    /// every sibling that is not `owner.dir()` the live root is gone.
+    /// and the live root is gone; with a removal of every sibling that is not
+    /// `owner.dir()` the live root is gone.
     #[test]
     fn startup_sweep_removes_only_roots_whose_owner_lock_is_free() {
         let cache = tempfile::tempdir().expect("cache dir");
@@ -3167,8 +3195,9 @@ mod tests {
     /// held, and sweeps nothing first.
     ///
     /// Prove-the-test: make the `SpillRootOwner::acquire` failure in
-    /// `prepare_sql_spill_with` non-fatal (`.ok()`, sweeping with a fresh
-    /// owner only when one was taken) and startup returns `Ok`.
+    /// `prepare_sql_spill_with` non-fatal (sweeping only when an owner was
+    /// taken) and startup returns `Ok`; drop the path from its context and
+    /// the refusal no longer names the root.
     #[test]
     fn startup_refuses_when_its_own_spill_root_is_locked() {
         let cache = tempfile::tempdir().expect("cache dir");
