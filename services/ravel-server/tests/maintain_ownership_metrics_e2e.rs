@@ -1008,6 +1008,8 @@ fn render_safety_exposition(safety: &ravel_server::maintain::MaintenanceSafetyMe
         None,
         None,
         None,
+        None,
+        None,
         MemoryBudgetSnapshot::default(),
         false,
     )
