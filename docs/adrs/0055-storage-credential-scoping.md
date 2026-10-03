@@ -1233,7 +1233,8 @@ pattern is spelled with IAM's single-character `?` wildcard, not
 `t/*/*/admission/*`, because IAM's `*` matches across `/`: the `*` form
 would also match `t/<hash>/pq/t/admission/v/<version>.pqm`, the manifests of
 a Parquet table named `admission`, which ADR-2040's table-name validation
-does not reserve. A tenant hash is always 32 hex characters (both the
+did not reserve when this amendment was written (its 2026-10-03 IAM
+segment amendment now does). A tenant hash is always 32 hex characters (both the
 unkeyed and the keyed derivation yield a 16-byte `TenantHash`) and every
 signal prefix is one character, so the `?` form matches every snapshot the
 reap deletes and fails at `/pq/` on every manifest. No `Deny` in
@@ -1248,7 +1249,8 @@ and `a`, also reach the manifests of a Parquet table with that name. For
 Gateway, Query and Admin that is a write and read exposure, not a delete
 one. Maintain's delete grants on `l0`, `c`, `l1` and `idem` also match those
 tables' manifests, which adds nothing to its `t/*/pq/t/*` delete above.
-Closing all of it by reserving those table names is left to a follow-up.
+ADR-2040's 2026-10-03 IAM segment amendment closes all of it by reserving
+those table names.
 
 This changes the wording of §2. An admission snapshot is mutable per-process
 state that the live processes rewrite every reconcile interval, not durable
