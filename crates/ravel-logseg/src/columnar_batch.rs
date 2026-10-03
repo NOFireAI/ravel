@@ -357,7 +357,9 @@ impl ColumnarLogBatch {
         }
         // `batch.stream_ids` is ascending by construction, so each record's ref
         // is its stream id's position in it, found by binary search rather than
-        // a hash lookup.
+        // a hash lookup. A miss cannot happen: `stream_blob` above is built from
+        // every record's own `r.stream_id` in this same `records` slice, so each
+        // id resolved here was already inserted into it.
         for (row, r) in records.iter().enumerate() {
             batch.stream_refs[row] = batch
                 .stream_ids
