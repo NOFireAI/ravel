@@ -6274,7 +6274,35 @@ impl BlockRangeFetcher {
         // groups in ascending order), and `candidate_blocks` is ascending
         // too (`SkipIndex::candidate_blocks`'s own doc), so a binary search
         // per candidate is enough; no caller passes an unsorted list.
+        // The pages other partitions' row groups hold in the selected columns
+        // are fences: this partition's runs are never bridged or coalesced
+        // across one, so the spans partitions fetch for one object stay
+        // disjoint and their wire bytes sum to at most the object's size.
+        let mut fences: Vec<(u64, u64)> = Vec::new();
         if let Some(owned) = owned_blocks {
+            let owned_groups: HashSet<u32> = owned
+                .iter()
+                .filter_map(|&b| u32::try_from(b).ok())
+                .filter_map(|b| page_dir.locate_block(b).map(|(g, _)| g.first_block))
+                .collect();
+            let foreign: Vec<usize> = candidates
+                .iter()
+                .copied()
+                .filter(|&c| {
+                    u32::try_from(c)
+                        .ok()
+                        .and_then(|b| page_dir.locate_block(b))
+                        .is_none_or(|(g, _)| !owned_groups.contains(&g.first_block))
+                })
+                .collect();
+            let foreign_extents = projected_page_extents(
+                key,
+                page_dir,
+                blocks_desc.offset,
+                &foreign,
+                selected.as_ref(),
+            )?;
+            fences = merge_fences(&foreign_extents);
             candidates.retain(|c| owned.binary_search(c).is_ok());
         }
         stats.candidate_blocks = candidates.len() as u64;
@@ -6305,7 +6333,7 @@ impl BlockRangeFetcher {
         // routinely covers the whole object) must not shrink that footprint,
         // or an all-columns read of such an object would skip `covering_read`
         // and its whole-object cache admission entirely.
-        let wanted_bytes: u64 = self.bridged_run_bytes(&seg_ref.level, &wanted);
+        let wanted_bytes: u64 = self.bridged_run_bytes(&seg_ref.level, &wanted, &fences);
         let coverage = wanted_bytes as f64 / blocks_desc.len.max(1) as f64;
         if coverage >= self.coverage_threshold {
             // `wanted` is already owned (resolved above from the decoded skip
@@ -6423,6 +6451,7 @@ impl BlockRangeFetcher {
             tenant_hash,
             pin,
             &wanted,
+            &fences,
             phases.blocks,
             &mut asm,
             accounting,
@@ -6445,14 +6474,15 @@ impl BlockRangeFetcher {
         &self,
         level: &SegmentLevel,
         wanted: &[ByteExtent],
+        fences: &[(u64, u64)],
         asm: &ObjectAssembler,
     ) -> Vec<ByteExtent> {
-        let runs: Vec<(u64, u64)> = coalesce_byte_extents(wanted, self.effective_coalesce_gap())
+        let runs: Vec<(u64, u64)> = coalesce_fenced(wanted, self.effective_coalesce_gap(), fences)
             .into_iter()
             .filter(|r| !asm.covers(r.abs_start, r.abs_end()))
             .map(|r| (r.abs_start, r.abs_end()))
             .collect();
-        bound_runs(runs, chunk_run_cap(level))
+        bound_runs_fenced(runs, chunk_run_cap(level), fences)
             .into_iter()
             .map(|(start, end)| ByteExtent {
                 abs_start: start,
@@ -6478,12 +6508,17 @@ impl BlockRangeFetcher {
     /// [`bounded_chunk_runs`](Self::bounded_chunk_runs) answers the different
     /// question of what an actual fetch still needs to GET, and keeps its own
     /// `asm`-covers filter for that.
-    fn bridged_run_bytes(&self, level: &SegmentLevel, wanted: &[ByteExtent]) -> u64 {
-        let runs: Vec<(u64, u64)> = coalesce_byte_extents(wanted, self.effective_coalesce_gap())
+    fn bridged_run_bytes(
+        &self,
+        level: &SegmentLevel,
+        wanted: &[ByteExtent],
+        fences: &[(u64, u64)],
+    ) -> u64 {
+        let runs: Vec<(u64, u64)> = coalesce_fenced(wanted, self.effective_coalesce_gap(), fences)
             .into_iter()
             .map(|r| (r.abs_start, r.abs_end()))
             .collect();
-        bound_runs(runs, chunk_run_cap(level))
+        bound_runs_fenced(runs, chunk_run_cap(level), fences)
             .into_iter()
             .map(|(start, end)| end - start)
             .sum()
@@ -6491,11 +6526,16 @@ impl BlockRangeFetcher {
 
     /// Fetch the coalesced page ranges into `asm`, every run concurrently,
     /// through the same [`cached_extent`](Self::cached_extent) path every other
-    /// GET here takes: concurrent partitions striping one segment resolve the
-    /// identical candidate set and the identical projection, so they produce the
-    /// identical runs and collapse onto one real request each rather than one
-    /// per partition (ADR-0102 decision 1's premise), and the etag pin holds
-    /// across the sequence.
+    /// GET here takes, and the etag pin holds across the sequence.
+    ///
+    /// `fences` are the byte extents other partitions' row groups hold in the
+    /// selected columns (empty for a read that owns the whole object): a run is
+    /// never coalesced or bridged across one ([`coalesce_fenced`],
+    /// [`bound_runs_fenced`]), so the runs partitions dealt different row
+    /// groups of one object issue are pairwise disjoint and their wire bytes
+    /// sum to at most the object's size. A partition's request count is its own
+    /// runs, at most [`chunk_run_cap`] for an L0 object unless a fence forbids
+    /// the bridge that would reach the cap.
     ///
     /// These are the BLOCKS-section data ranges, so `phase` is the read's
     /// [`ReadPhases::blocks`] and the WIRE bytes recorded here are the
@@ -6512,6 +6552,7 @@ impl BlockRangeFetcher {
         tenant_hash: TenantHash,
         pin: &EtagPin,
         wanted: &[ByteExtent],
+        fences: &[(u64, u64)],
         phase: QueryPhase,
         asm: &mut ObjectAssembler,
         accounting: &QueryAccounting,
@@ -6524,7 +6565,7 @@ impl BlockRangeFetcher {
         // per ADR-2066 decision 1: an already-covered run should never count
         // against the cap or force a bridge a genuinely uncovered run set
         // would not have needed.
-        let runs: Vec<ByteExtent> = self.bounded_chunk_runs(&seg_ref.level, wanted, &*asm);
+        let runs: Vec<ByteExtent> = self.bounded_chunk_runs(&seg_ref.level, wanted, fences, &*asm);
         // Reserve every run's bytes before `join_all` issues a GET (ADR-1170
         // decision 2): a refusal fails typed with zero GETs. Each run's buffer
         // is placed into `asm` as it arrived, so this one guard covers what the
@@ -7429,6 +7470,90 @@ fn coalesce_byte_extents(extents: &[ByteExtent], max_gap: u64) -> Vec<ByteExtent
             abs_start: start,
             len: end - start,
         });
+    }
+    out
+}
+
+/// Sorts `extents` and merges every overlapping or touching pair, giving the
+/// ordered, disjoint `(start, end)` list [`gap_crosses_fence`] searches.
+fn merge_fences(extents: &[ByteExtent]) -> Vec<(u64, u64)> {
+    let mut ranges: Vec<(u64, u64)> = extents.iter().map(|e| (e.abs_start, e.abs_end())).collect();
+    ranges.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match out.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => out.push((start, end)),
+        }
+    }
+    out
+}
+
+/// Whether the gap `[from, to)` holds any byte of a fence. `fences` is the
+/// ordered, disjoint list [`merge_fences`] returns.
+fn gap_crosses_fence(fences: &[(u64, u64)], from: u64, to: u64) -> bool {
+    let at = fences.partition_point(|f| f.1 <= from);
+    fences.get(at).is_some_and(|f| f.0 < to)
+}
+
+/// [`coalesce_byte_extents`] that never joins two extents across a gap holding
+/// fence bytes, whatever `max_gap` says. With no fences it is that function.
+fn coalesce_fenced(extents: &[ByteExtent], max_gap: u64, fences: &[(u64, u64)]) -> Vec<ByteExtent> {
+    let mut ranges: Vec<(u64, u64)> = extents.iter().map(|e| (e.abs_start, e.abs_end())).collect();
+    ranges.sort_by_key(|r| r.0);
+    let mut out: Vec<ByteExtent> = Vec::new();
+    for (start, end) in ranges {
+        if let Some(last) = out.last_mut()
+            && start <= last.abs_end().saturating_add(max_gap)
+            && !gap_crosses_fence(fences, last.abs_end(), start)
+        {
+            let new_end = last.abs_end().max(end);
+            last.len = new_end - last.abs_start;
+            continue;
+        }
+        out.push(ByteExtent {
+            abs_start: start,
+            len: end - start,
+        });
+    }
+    out
+}
+
+/// [`bound_runs`] that never bridges a gap holding fence bytes. The smallest
+/// bridgeable gaps go first, ties earliest first, exactly as `bound_runs`
+/// picks them; when too few gaps are bridgeable to reach `max_runs`, the
+/// result keeps more runs than that rather than cross a fence.
+fn bound_runs_fenced(
+    runs: Vec<(u64, u64)>,
+    max_runs: usize,
+    fences: &[(u64, u64)],
+) -> Vec<(u64, u64)> {
+    if fences.is_empty() {
+        return bound_runs(runs, max_runs);
+    }
+    let max_runs = max_runs.max(1);
+    if runs.len() <= max_runs {
+        return runs;
+    }
+    let mut gaps: Vec<(u64, usize)> = runs
+        .windows(2)
+        .enumerate()
+        .filter(|(_, pair)| !gap_crosses_fence(fences, pair[0].1, pair[1].0))
+        .map(|(i, pair)| (pair[1].0.saturating_sub(pair[0].1), i))
+        .collect();
+    gaps.sort_unstable();
+    let mut bridged = vec![false; runs.len().saturating_sub(1)];
+    for (_, i) in gaps.into_iter().take(runs.len() - max_runs) {
+        bridged[i] = true;
+    }
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(max_runs);
+    let mut bridge_previous = false;
+    for (run, bridge_next) in runs.into_iter().zip(bridged.into_iter().chain([false])) {
+        match out.last_mut() {
+            Some(last) if bridge_previous => last.1 = last.1.max(run.1),
+            _ => out.push(run),
+        }
+        bridge_previous = bridge_next;
     }
     out
 }
@@ -12464,6 +12589,7 @@ mod late_serve_accounting_tests {
                             TENANT,
                             pin,
                             wanted,
+                            &[],
                             QueryPhase::Scan,
                             &mut asm,
                             &acc,
@@ -12670,6 +12796,12 @@ mod owned_block_plan_tests {
     }
 
     async fn fixture_with(two_streams: bool) -> Fixture {
+        fixture_with_gap(two_streams, Some(0)).await
+    }
+
+    /// `coalesce_gap` `None` keeps the fetcher's default gap, which bridges
+    /// every hole this object has.
+    async fn fixture_with_gap(two_streams: bool, coalesce_gap: Option<u64>) -> Fixture {
         let cfg = RlogConfig {
             block_target_records: 1,
             group_target_blocks: GROUP_BLOCKS,
@@ -12715,14 +12847,15 @@ mod owned_block_plan_tests {
         let parsed = footer::open(&object).expect("footer");
         let blocks = parsed.section(kind::BLOCKS).expect("BLOCKS");
         let tail = object.len() as u64 - (blocks.offset + blocks.len);
-        let fetcher = LogSegmentFetcher::new(store.clone())
+        let mut range_fetcher = BlockRangeFetcher::new(store.clone())
+            .with_suffix_len(tail)
+            .with_whole_object_threshold(0);
+        if let Some(gap) = coalesce_gap {
+            range_fetcher = range_fetcher.with_coalesce_gap(gap);
+        }
+        let fetcher = LogSegmentFetcher::new(store)
             .with_block_range_threshold(0)
-            .with_block_range(
-                BlockRangeFetcher::new(store)
-                    .with_suffix_len(tail)
-                    .with_coalesce_gap(0)
-                    .with_whole_object_threshold(0),
-            );
+            .with_block_range(range_fetcher);
         Fixture {
             fetcher,
             seg,
@@ -12945,5 +13078,92 @@ mod owned_block_plan_tests {
             ts.extend(rows.iter().map(|r| r.ts_ns));
         }
         assert_eq!(ts, vec![0, 2, 4, 6, 8, 10]);
+    }
+
+    /// Two partitions dealt interleaved row groups of one object (A the first
+    /// and third, B the middle one) fetch disjoint spans: neither places a page
+    /// of the other's group, though the default coalesce gap is wider than the
+    /// hole between A's two groups. Their wire bytes then sum to at most the
+    /// BLOCKS section's length, and each issues one request per owned group.
+    ///
+    /// Fails against a plan that bridges and coalesces over the whole
+    /// candidate set's holes regardless of ownership (A's run spans group 1,
+    /// so A places B's blocks and the sum passes the section length), and
+    /// against a plan that stops bridging for a partition altogether (A and B
+    /// issue one GET per column chunk, not one per group).
+    #[tokio::test]
+    async fn partitions_dealt_interleaved_groups_fetch_disjoint_spans() {
+        let fx = fixture_with_gap(false, None).await;
+        let blocks_len = footer::open(&fx.object)
+            .expect("footer")
+            .section(kind::BLOCKS)
+            .expect("BLOCKS")
+            .len;
+        let owned_a: Vec<usize> = (0..GROUP_BLOCKS).chain(2 * GROUP_BLOCKS..BLOCKS).collect();
+        let owned_b: Vec<usize> = (GROUP_BLOCKS..2 * GROUP_BLOCKS).collect();
+        let dirs = RlogReader::decode_directories(&fx.object[..], &RlogConfig::default())
+            .expect("directories");
+        let own = |blocks| {
+            Some(OwnedBlocks {
+                blocks,
+                dirs: Some(&dirs),
+            })
+        };
+        let (bytes_a, stats_a) = plan(&fx, i64::MIN, own(&owned_a[..])).await;
+        let (bytes_b, stats_b) = plan(&fx, i64::MIN, own(&owned_b[..])).await;
+
+        assert_eq!(placed_blocks(&fx, &bytes_a), owned_a);
+        assert_eq!(placed_blocks(&fx, &bytes_b), owned_b);
+        assert!(
+            stats_a.block_bytes_fetched + stats_b.block_bytes_fetched <= blocks_len,
+            "wire bytes across partitions {} + {} exceed the object's BLOCKS section {blocks_len}",
+            stats_a.block_bytes_fetched,
+            stats_b.block_bytes_fetched,
+        );
+        assert_eq!(
+            stats_b.block_range_gets, 1,
+            "one run for the one owned group: holes inside a group are still bridged"
+        );
+        assert_eq!(
+            stats_a.block_range_gets, 2,
+            "one run per owned group, not one spanning the group between them"
+        );
+    }
+
+    #[test]
+    fn a_fence_stops_coalescing_and_bridging() {
+        let ext = |start: u64, end: u64| ByteExtent {
+            abs_start: start,
+            len: end - start,
+        };
+        assert_eq!(
+            merge_fences(&[ext(500, 510), ext(240, 260), ext(200, 250)]),
+            vec![(200, 260), (500, 510)]
+        );
+        let fences = merge_fences(&[ext(200, 250), ext(240, 260)]);
+
+        // Within the gap limit but holding fence bytes: kept apart. The same
+        // extents with no fence join.
+        let wanted = [ext(0, 100), ext(150, 190), ext(300, 400)];
+        let runs = |fences: &[(u64, u64)]| -> Vec<(u64, u64)> {
+            coalesce_fenced(&wanted, 1_000, fences)
+                .iter()
+                .map(|r| (r.abs_start, r.abs_end()))
+                .collect()
+        };
+        assert_eq!(runs(&[]), vec![(0, 400)]);
+        assert_eq!(runs(&fences), vec![(0, 190), (300, 400)]);
+
+        // Bounding to one run: the gap holding a fence is the one left open
+        // even though it is not the smallest.
+        let bound = |runs: Vec<(u64, u64)>, cap: usize| bound_runs_fenced(runs, cap, &fences);
+        let three = vec![(0, 190), (300, 400), (700, 800)];
+        assert_eq!(bound(three.clone(), 2), vec![(0, 190), (300, 800)]);
+        assert_eq!(bound(three.clone(), 1), vec![(0, 190), (300, 800)]);
+        assert_eq!(
+            bound_runs(three, 1),
+            vec![(0, 800)],
+            "unfenced bridges both"
+        );
     }
 }
