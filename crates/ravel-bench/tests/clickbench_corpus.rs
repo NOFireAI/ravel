@@ -583,22 +583,28 @@ async fn parquet_lane_runs_the_upstream_suite_verbatim() {
         failures.len(),
         failures.join("\n")
     );
-    // These figures are exact because everything they depend on is fixed: the
-    // fixture (FIXTURE_SEED) and both engines' plan partition count
-    // (engine::PLAN_PARTITIONS), which sets how many partial aggregates the
-    // floating-point sums are combined from. A comparator that stops reducing
-    // ties or comparing floats on any statement-arm changes the totals.
+    // Q4's ulp distance is bounded, not pinned: PLAN_PARTITIONS fixes how many
+    // partial aggregates its AVG combines, but the final merge follows stream
+    // arrival, so the last bits can move between runs (measured 1 on arm A and
+    // 2 on arm B). The bound is suite.toml's float_max_ulps for Q4.
     let q4_ulps: Vec<(&str, u64)> = ulps
         .iter()
         .filter(|(_, number, _)| *number == 4)
         .map(|(arm, _, distance)| (arm.as_str(), *distance))
         .collect();
     assert_eq!(
-        q4_ulps,
-        [("A", 1), ("B", 2)],
-        "Q4's ulp distance per arm changed; suite.toml's float_max_ulps for Q4 is \
-         declared against these"
+        q4_ulps.len(),
+        2,
+        "Q4 was not judged on both arms: {q4_ulps:?}"
     );
+    assert!(
+        q4_ulps.iter().all(|(_, distance)| *distance <= 3),
+        "Q4's ulp distance exceeds suite.toml's float_max_ulps of 3: {q4_ulps:?}"
+    );
+    // The totals are exact: they count rows reduced at a cut and float cells
+    // compared, which depend on the fixture (FIXTURE_SEED) and not on float
+    // bits. A comparator that stops reducing ties or comparing floats on any
+    // statement-arm changes them.
     assert_eq!(
         totals.0, 588,
         "summed tie_rows_reduced across both arms changed"

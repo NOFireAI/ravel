@@ -142,8 +142,9 @@ parquet58 = { package = "parquet", version = "58", default-features = false, fea
 # Gated behind `sql-latency`. The ClickBench Parquet lane's reference engine
 # (`src/clickbench_parquet/engine.rs`) registers the fixture directly as a
 # DataFusion `ListingTable` over `ParquetFormat`, independent of any Ravel
-# read path, so the suite has an oracle that never shares code with the
-# engine it is checking. Not a new external crate: this already resolves in
+# read path. It still links the same DataFusion build as Ravel; the
+# `reference` module doc in that file says what it does and does not catch.
+# Not a new external crate: this already resolves in
 # the workspace lockfile at 54.1.0, the same version `ravel-parquet` links.
 datafusion-datasource-parquet = { version = "54", default-features = false, optional = true }
 # Gated behind `sql-latency`. The logs scan-partitioning scaling bench
