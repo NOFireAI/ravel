@@ -391,7 +391,10 @@ fn main() {
          issue #2428, then one sampled encode (`stage0::ROW_SAMPLE` on) whose per-row \
          instrumentation in `resolve_row` and the row-resolution loop in `build_object` \
          accumulates live-byte and allocation-count deltas into five `stage0` bucket \
-         counters plus a whole-row-call counter, read back after `finish()` returns.\n\n",
+         counters plus a whole-row-call counter, read back after `finish()` returns. Two \
+         further counters, sampled directly around the once-per-encode setup before the loop \
+         and the row-ordering step after it, account for the step delta's two components \
+         outside `resolve_row`'s per-row cost; see the deviation note below.\n\n",
     );
     md.push_str(&format!(
         "Calibration: {CALIBRATION_SAMPLES} consecutive `stats_sampler()` calls with nothing \
