@@ -455,16 +455,18 @@ pub const MAX_SHARD_COUNT: u32 = 10_000;
 /// Ingest bounds that term instead, with its flush deferral cap
 /// (`ravel_ingest::IngestConfig::flush_deferral_cap_ns`, the ADR-1642
 /// deferral cap amendment): this slack less `max_flush_lifetime` less the
-/// worst age a buffer holding a strict-mode waiter reaches before its flush
-/// opens (`max_flush_delay`, or the adaptive corridor's widest ceiling, plus
-/// one `flush_tick`), 3597.8s at today's defaults. A strict-mode waiter is
+/// largest age any buffer reaches before its flush trigger fires, leaving out
+/// the sub-floor hold (the largest of `max_flush_delay`,
+/// `max_flush_delay_idle` and the adaptive corridor's widest ceiling, plus
+/// one `flush_tick`), 3559.8s at today's defaults. A strict-mode waiter is
 /// never acknowledged from a flush that opens past the cap, and a shard whose
 /// oldest deferral reaches it refuses new writes in both write modes until
 /// its deferred flushes open, so every acknowledged strict-mode row keeps its
-/// routing-to-pin span plus the flush lifetime inside this slack. A
-/// buffered-mode row acknowledged before its shard reached the cap is not
-/// covered: its buffer still waits for a queue slot for as long as the stall
-/// lasts. `ravel_ingest::shard::tests::a_deferred_flush_is_never_acked_past_the_flush_bound_slack`
+/// routing-to-pin span plus the flush lifetime inside this slack, and the
+/// refusal starts before a deferred buffered row outside the sub-floor hold
+/// could open its flush too late for it. A buffered-mode row acknowledged
+/// before its shard reached the cap is not covered: its buffer still waits
+/// for a queue slot for as long as the stall lasts. `ravel_ingest::shard::tests::a_deferred_flush_is_never_acked_past_the_flush_bound_slack`
 /// holds the strict-mode bound against a live shard actor.
 ///
 /// The constant is deliberately left alone, and so is the pin. Raising this

@@ -401,37 +401,46 @@ refuses every new write, in both write modes, until that flush opens, instead
 of deferring another round with new work piling in behind it.
 
 **The cap.** `IngestConfig::flush_deferral_cap_ns()` is what the read-side
-slack leaves a strict-mode row once the rest of that row's span is paid for:
+slack leaves a row once the rest of that row's span is paid for:
 
 ```
-cap = FLUSH_BOUND_SLACK_HOURS * 1h - max_flush_lifetime - strict_ack_age_bound
-strict_ack_age_bound = max(max_flush_delay, widest adaptive ceiling) + flush_tick
+cap = FLUSH_BOUND_SLACK_HOURS * 1h - max_flush_lifetime - flush_trigger_age_bound
+flush_trigger_age_bound = max(max_flush_delay, max_flush_delay_idle,
+                              widest adaptive ceiling) + flush_tick
 widest adaptive ceiling = strict_visibility_budget_ns - put_retry_base_delay
                           (only with adaptive_flush_delay on)
 ```
 
-The derivation follows the rows the cap protects. A strict-mode waiter puts its
-buffer on the fast clock in all three actors (`age_threshold_ns`), so a buffer
-holding one triggers no later than `max_flush_delay` after its oldest row, or,
-on the metrics actor with adaptive delay on, the corridor ceiling, whose widest
-value is the visibility budget less the retry headroom at a zero PUT round
-trip. The age check runs on a tick, so add one `flush_tick`. That is
-`strict_ack_age_bound`: a strict row has waited at most that long when its
-buffer's deferral starts, or none at all if it arrived after the deferral
-started. A strict waiter is acknowledged only from a flush that opens less
-than the cap after the deferral's start, and the flush then has its
-`max_flush_lifetime`. So an acknowledged strict row's routing-to-pin span plus
-the flush lifetime is below `strict_ack_age_bound + cap + max_flush_lifetime =
-FLUSH_BOUND_SLACK_HOURS`, the span ADR-0052 section 3 sized the slack for. At
-the shipped defaults that is `7200s - 3600s - (2s + 0.2s) = 3597.8s`. A
-non-zero `idle_flush_byte_floor` leaves it at 3597.8s: the sub-floor hold of
-ADR-1737 applies only to a buffer with no strict waiter, so it is not a term.
-(The first cut subtracted the longest age threshold of any buffer, which made
-the cap 0 whenever the floor was set and refused every strict write on the
-first full queue.) With adaptive delay on at the defaults the bound is 2.6s
-and the cap 3597.4s. The log and span actors use the same cap; the adaptive
-term only ever lowers it. It saturates at 0 for a configuration whose own
-bounds already spend the slack. The constant is unchanged.
+The derivation follows the rows the cap protects. The strict ack deadline
+the server applies is a fixed 10 s, so in production the rows a long deferral
+puts at risk are buffered rows, not strict ones. `flush_trigger_age_bound`
+(`IngestConfig::flush_trigger_age_bound_ns()`) is the largest age any buffer
+reaches before its flush trigger fires, leaving out the sub-floor hold: the
+fast clock `max_flush_delay` (a buffer with a strict waiter, or one already
+worth a PUT), the idle clock `max_flush_delay_idle` (a buffered-mode buffer
+under `min_flush_bytes`), or, on the metrics actor with adaptive delay on, the
+corridor ceiling, whose widest value is the visibility budget less the retry
+headroom at a zero PUT round trip. The age check runs on a tick, so add one
+`flush_tick`. A row outside the sub-floor hold has waited at most that long
+when its buffer's deferral starts, or none at all if it arrived after the
+deferral started. A strict waiter is acknowledged only from a flush that opens
+less than the cap after the deferral's start, and the flush then has its
+`max_flush_lifetime`, so an acknowledged strict row's routing-to-pin span plus
+the flush lifetime is below `flush_trigger_age_bound + cap + max_flush_lifetime
+= FLUSH_BOUND_SLACK_HOURS`, the span ADR-0052 section 3 sized the slack for.
+For a buffered row the same sum bounds when the backpressure starts: the shard
+refuses every new write from the instant its oldest deferral reaches the cap,
+while a flush opening at that instant would still fit every row of a deferred
+buffer outside the sub-floor hold inside the slack. At the shipped defaults the
+cap is `7200s - 3600s - (40s + 0.2s) = 3559.8s`. A non-zero `idle_flush_byte_floor`
+leaves it at 3559.8s: the sub-floor hold of ADR-1737 is not a term, since it
+already spends `max_flush_lifetime` and counting it would make the cap 0
+whenever the floor is set, refusing every write on the first full queue. With
+adaptive delay on at the defaults the corridor ceiling (2.4s) is below the
+idle clock, so the bound stays 40.2s and the cap 3559.8s; the adaptive term
+lowers the cap only once its ceiling passes `max_flush_delay_idle`. The log
+and span actors use the same cap. It saturates at 0 for a configuration whose
+own bounds already spend the slack. The constant is unchanged.
 
 **What is tracked.** Each tenant buffer carries the time of its first refusal
 across every later one, and each shard keeps the oldest of those and publishes
@@ -458,8 +467,8 @@ persisted.
 - The strict-mode waiters already riding a buffer whose deferral has reached the
   cap are answered at the refusal or flush open that finds it there, with the
   existing outcome-unknown `Abandoned` (503), not with a refusal. Their rows
-  stay buffered and a later flush stores them unacknowledged, as on the
-  ADR-1307 clock-refusal arm, so a client retry writes them twice. For metrics
+  are still written, unacknowledged, by the flush that opens past the cap, so
+  a client retry writes them twice. For metrics
   the query-time dedup by `(series_id, ts)` collapses the copy; logs and spans
   have no query-time dedup, so there the retry is the same at-least-once
   duplication a lost acknowledgement already produces
@@ -473,6 +482,12 @@ persisted.
   refused writes, fed from each pipeline's ingest metrics the way the other
   ingest counters are. The first refusal of each cap episode logs once at WARN
   with the signal, shard and cap.
+- A dead shard is not held at the cap. The router checks whether the shard's
+  actor is dead or its mailbox closed before the cap check, so a shard whose
+  actor panicked while a flush was deferred gives the dead-shard answer
+  (`ShardUnavailable`), and the metrics router respawns it, rather than
+  `DeferralCapReached` for as long as the process runs. Each actor also clears
+  its deferral start from the flag when it exits, by return or by panic.
 - The shard accepts again once every buffer that reached the cap has opened.
   That needs a queue slot, so in practice it is when the queue drains below
   `max_queued_flushes`. The oldest deferral is recomputed on every age tick and
@@ -488,16 +503,22 @@ far below its age threshold, and answering its waiters can raise its threshold
 from `max_flush_delay` to the idle tier, and it must not wait either out while
 holding the shard at the cap.
 
-**What this does not bound.** Two things, stated so the guarantee is not read
-wider than it is:
+**What this does not bound.** Four things, stated so the guarantee is not
+read wider than it is:
 
-- Buffered-mode rows acknowledged before the shard reached the cap. Their
-  buffer still waits for a queue slot, so such a row can pin late and be
-  invisible to the retiring generation of a shard-count decrease; with a
-  non-zero `idle_flush_byte_floor` a sub-floor buffer has spent the whole slack
-  on its hold before any deferral. What the cap adds for buffered mode is that
-  no new buffered write joins a shard at the cap. Under a `Bounded` byte budget
-  the ceiling still bounds how much of it accumulates.
+- Buffered-mode rows held under a non-zero `idle_flush_byte_floor`. The
+  sub-floor hold is left out of `flush_trigger_age_bound`, so a sub-floor
+  buffer has spent the whole slack on its hold before any deferral starts, and
+  a deferral then pins it late enough to be invisible to the retiring
+  generation of a shard-count decrease.
+- Strict-mode writes that already timed out (`AckTimeout`). The caller already
+  has its outcome-unknown answer, so withholding the acknowledgement protects
+  nothing, and the rows are written by whichever flush opens, inside the cap or
+  past it.
+- Rows acknowledged in buffered mode before the shard reached the cap. The
+  refusal stops new writes joining a stalled shard, but those rows still wait
+  for a queue slot, so their flush can open past the cap and pin late. Under a
+  `Bounded` byte budget the ceiling still bounds how much of it accumulates.
 - The wall-clock length of a deferral. A buffer at the cap still waits for a
   queue slot. What the cap bounds is what gets acknowledged, and how much new
   work joins the queue behind a stall.

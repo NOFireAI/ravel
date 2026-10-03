@@ -41,19 +41,20 @@ Strict mode (default):
   Object-store durability is the floor: data survives anything the object
   store survives.
 - A strict write is never acknowledged from a flush the queued-flush cap
-  deferred for longer than the flush deferral cap (ADR-1642 deferral cap
+  deferred for at least the flush deferral cap (ADR-1642 deferral cap
   amendment): `FLUSH_BOUND_SLACK_HOURS` (2 h) less `max_flush_lifetime`, less
-  `max_flush_delay` (or, with adaptive flush delay on, the corridor's widest
-  ceiling) and one `flush_tick`, 3597.8 s at the defaults. This keeps every
-  acknowledged strict row inside the read-side scan slack. A strict waiter on a
-  buffer whose deferral reached the cap is answered with the retryable
-  `Abandoned` (503), which here means outcome unknown: its rows stay buffered
-  and a later flush stores them. While a shard's oldest deferral is at the cap,
-  every new write routed to it, strict or buffered, is refused before
-  buffering with the retryable `DeferralCapReached` (HTTP 429 with
-  `Retry-After`, gRPC `RESOURCE_EXHAUSTED`), until its deferred flushes open.
-  A multi-shard write whose capped shard fails after a sibling committed
-  answers the partial multi-shard commit error instead, which takes 503.
+  the largest of `max_flush_delay`, `max_flush_delay_idle` and (with adaptive
+  flush delay on) the corridor's widest ceiling, and one `flush_tick`,
+  3559.8 s at the defaults. This keeps every acknowledged strict row inside the
+  read-side scan slack. A strict waiter on a buffer whose deferral reached the
+  cap is answered with the retryable `Abandoned` (503), which here means
+  outcome unknown: its rows are still written, by the flush that opens past
+  the cap. While a shard's oldest deferral is at the cap, every new write
+  routed to it, strict or buffered, is refused before buffering with the
+  retryable `DeferralCapReached` (HTTP 429 with `Retry-After`, gRPC
+  `RESOURCE_EXHAUSTED`), until its deferred flushes open. A multi-shard write
+  whose capped shard fails after a sibling committed answers the partial
+  multi-shard commit error instead, which takes 503.
 
 Buffered mode (opt-in per request, named "buffered"):
 - Acknowledged after admission and enqueue to a shard actor. A crash between
@@ -78,6 +79,14 @@ Buffered mode (opt-in per request, named "buffered"):
   the one-hour window for tenants below the floor in exchange for their PUT
   cost. Strict mode is unaffected at any setting, since a strict waiter keeps
   the fast clock.
+- A buffer whose flush the queued-flush cap keeps deferring holds its rows
+  past these delays. The flush deferral cap above is sized from the slowest
+  of them, so a shard starts refusing new writes before a deferred buffered
+  row could open its flush too late for the read-side scan slack. Two kinds
+  of row are not bounded by the cap: buffered rows held under a non-zero
+  `--idle-flush-byte-floor`, whose hold already spends that slack, and rows of
+  a strict write that already timed out (`AckTimeout`), which are written by
+  whichever flush opens, inside the cap or past it.
 - The `max_flush_lifetime` abandonment budget is measured from the moment the
   flush's permit is granted, not from flush-open, so time spent queued behind
   a stalled prefix does not count against it: a flush that waited behind a
@@ -129,9 +138,13 @@ Buffered mode (opt-in per request, named "buffered"):
 
 Rejection: admission failures (limits, auth, quota, the ingest byte budget)
 and a shard at the flush deferral cap reject before buffering in both modes,
-so nothing of a rejected request is stored. A strict waiter answered
-`Abandoned` at the deferral cap is not a rejection: its rows were buffered
-before the answer and a later flush stores them. Partial success uses the OTLP
+so nothing of a rejected request is stored, with one exception. A
+multi-shard strict write enqueued just before a shard reached the cap can be
+refused with `DeferralCapReached` by that shard while a sibling shard answers
+`Abandoned`; the request returns the refusal, yet the sibling's rows were
+buffered and are still stored. A strict waiter answered `Abandoned` at the
+deferral cap is not a rejection: its rows were buffered before the answer and
+the flush that opens past the cap stores them. Partial success uses the OTLP
 partial-success message with rejected point counts and reasons.
 
 ## Visibility semantics

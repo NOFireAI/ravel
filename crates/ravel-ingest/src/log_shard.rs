@@ -1118,6 +1118,9 @@ impl LogShardActor {
     }
 
     pub(crate) async fn run(mut self) {
+        // Dropped after every other local and before `self`, so a return or a
+        // panic clears this actor's deferral before its mailbox closes.
+        let _clear_cap_on_exit = self.cap_flag.clear_on_exit();
         // The flush-tick cadence runs on the injected `Clock`, not the tokio
         // timer, exactly as [`crate::shard::ShardActor::run`] does it: age-based
         // flush timing shares the one clock the age check itself reads, so a
@@ -1737,9 +1740,10 @@ impl LogShardActor {
             // Deferred for the whole deferral cap, so a flush opening from here
             // on pins past the read-side slack for this buffer's strict
             // records. Its strict-mode waiters are not acknowledged from that
-            // flush; the records stay buffered and a later flush writes them,
-            // so the answer is the outcome-unknown `Abandoned` (503), and a
-            // client retry stores them twice: logs have no query-time dedup.
+            // flush; the records are still written, by the flush that opens
+            // past the cap, so the answer is the outcome-unknown `Abandoned`
+            // (503), and a client retry stores them twice: logs have no
+            // query-time dedup.
             let waiters = std::mem::take(&mut buf.waiters);
             self.ctx.ack_waiters(
                 waiters,
