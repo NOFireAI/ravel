@@ -5318,4 +5318,96 @@ mod tests {
              ({cells}); with_body={with_body}, fixed_only={fixed_only}"
         );
     }
+
+    fn drain_ts(scan: &mut BlockScan, object: &[u8]) -> Vec<i64> {
+        let mut ts = Vec::new();
+        while let Some(rows) = scan.next_block(object).expect("block") {
+            ts.extend(rows.iter().map(|r| r.ts_ns));
+        }
+        ts
+    }
+
+    /// ADR-2414 decision A1: a reader built from decoded directories does not
+    /// seed its scans with the directories' decode, because whoever ran
+    /// [`RlogReader::decode_directories`] charges
+    /// [`SegmentDirectories::open_decompressed_bytes`] once; a reader that
+    /// decodes for itself still seeds it.
+    ///
+    /// Fails if `from_decoded` copies the open-time total into the reader (the
+    /// two scans would then report the same figure, one decode charged once per
+    /// reader), and if `from_source` stops seeding it (the difference would be
+    /// zero).
+    #[test]
+    fn a_decoded_reader_does_not_recharge_the_directory_decode() {
+        let (_, object) = dict_fixture::two_group_object();
+        let cfg = RlogConfig::default();
+        let all = Predicate::TsRange {
+            min_ns: i64::MIN,
+            max_ns: i64::MAX,
+        };
+        let total = |reader: &RlogReader<'_>| {
+            let mut scan = reader
+                .scan_blocks(&all, &[], &ColumnSelection::all())
+                .expect("scan");
+            drain_ts(&mut scan, &object);
+            scan.stats().decompressed_bytes
+        };
+
+        let dirs = RlogReader::decode_directories(&object[..], &cfg).expect("directories");
+        assert!(dirs.open_decompressed_bytes() > 0, "the sections are zstd");
+        let own = RlogReader::new(&object, &cfg).expect("open");
+        assert_eq!(
+            own.directories().open_decompressed_bytes(),
+            dirs.open_decompressed_bytes(),
+            "one decode, one figure, however the directories are obtained"
+        );
+        let shared = RlogReader::from_decoded(&object[..], &dirs);
+        let pages = total(&shared);
+        assert!(pages > 0, "the blocks' zstd pages are charged");
+        assert_eq!(
+            total(&own),
+            pages + dirs.open_decompressed_bytes(),
+            "the self-decoding reader's scan adds exactly the directory decode"
+        );
+        assert_eq!(
+            total(&shared),
+            pages,
+            "and a second decoded reader adds none"
+        );
+    }
+
+    /// `scan_blocks_raw_subset` names whole-object block indices. A wanted
+    /// index pruning removed is absent, not an error, and the drain follows the
+    /// scan's own block order.
+    ///
+    /// Fails against the ordinal reading of `wanted` (`scan_blocks_subset`
+    /// positions): with blocks 0 and 1 pruned, positions 0 and 1 are blocks 2
+    /// and 3 and position 6 does not exist.
+    #[test]
+    fn a_raw_subset_names_whole_object_block_indices() {
+        let (records, object) = dict_fixture::two_group_object();
+        let cfg = RlogConfig::default();
+        let reader = RlogReader::new(&object, &cfg).expect("open");
+        // Four records per block, so ts >= 1008 prunes blocks 0 and 1.
+        let from_block_two = Predicate::TsRange {
+            min_ns: 1_008,
+            max_ns: i64::MAX,
+        };
+        let block_ts =
+            |b: usize| -> Vec<i64> { records[4 * b..4 * b + 4].iter().map(|r| r.ts_ns).collect() };
+
+        let mut scan = reader
+            .scan_blocks_raw_subset(&from_block_two, &[], &ColumnSelection::all(), &[0, 1, 6, 5])
+            .expect("raw subset");
+        assert_eq!(scan.survivor_block_indices(), vec![5, 6]);
+        let mut want = block_ts(5);
+        want.extend(block_ts(6));
+        assert_eq!(drain_ts(&mut scan, &object), want);
+
+        let mut none = reader
+            .scan_blocks_raw_subset(&from_block_two, &[], &ColumnSelection::all(), &[0, 1])
+            .expect("raw subset of pruned blocks");
+        assert_eq!(none.remaining_blocks(), 0);
+        assert!(drain_ts(&mut none, &object).is_empty());
+    }
 }
