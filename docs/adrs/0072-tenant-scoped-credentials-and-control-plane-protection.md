@@ -180,7 +180,9 @@ breaks a real key shape fails CI instead of a production deployment.
 
 - A leaked single-role credential in a KMS-routed deployment yields
   ciphertext for other tenants' data objects; control-plane rollback
-  and deletion require defeating bucket versioning/Object Lock, which
+  and deletion require defeating bucket versioning/Object Lock
+  (control-plane rollback amendment below: they do not; what survives is
+  the locked prior version), which
   `--require-bucket-protection` guarantees is configured on fleets
   that opt in. The residual risk is a leaked Admin credential plus KMS
   grants, which is the platform-operator trust boundary, not a Ravel
@@ -407,3 +409,28 @@ in front of every writer, no code path should ever again attempt to
 persist two entries sharing a hash, but the guard remains the backstop
 that turns a future writer's oversight into a typed decode-time refusal
 instead of a silent brick.
+
+## Amendment (2026-10-03, #2258): the control-plane rollback amendment
+
+<!-- amendment-applies: sections="Consequences" pointer="control-plane rollback amendment" -->
+<!-- amendment-supersedes: phrase="require defeating bucket versioning/Object Lock" pointer="control-plane rollback amendment" -->
+
+The first Consequences bullet says that with a leaked credential, rolling
+back or deleting control-plane state requires defeating bucket versioning
+or Object Lock. It does not. On a versioned bucket with compliance-mode
+Object Lock on `sys/*` and `t/*/*/prov`, a credential with write access can
+PUT an older or forged body to a control-plane key, and that PUT becomes the
+key's current version: every reader, Ravel included, reads the rolled-back
+state. A delete with no version id likewise succeeds and inserts a delete
+marker. Neither request defeats versioning or Object Lock; both are ordinary
+versioned-bucket writes that compliance mode does not refuse.
+
+What survives is the locked prior version. Compliance mode refuses a delete
+naming that version id and any lifecycle expiration of it for the retention
+period, so the state the key held before the rollback stays in the bucket
+and is recoverable by restoring that version as the current one (the
+disaster-recovery guide's "Restore one overwritten key from its locked prior
+version"). `--require-bucket-protection` guarantees that this recovery path
+exists on fleets that opt in; it does not prevent the rollback. This matches
+`docs/object-store-contract.md`, "Required bucket configuration". The
+residual-risk sentence that follows in the bullet is unchanged.

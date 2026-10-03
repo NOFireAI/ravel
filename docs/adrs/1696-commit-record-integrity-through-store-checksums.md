@@ -248,7 +248,8 @@ flowchart LR
      stored object, and assert the read is `Corrupted`; assert that the
      current tree returns a decoded record with the wrong `max_event_ts_ns`.
   4. Scrub: count a `Corrupted` commit-record GET as a checksum mismatch
-     instead of "decode failed; skipping" (`services/ravel-server/src/scrub.rs:599-604`).
+     (retired, see the scrub-counter amendment below) instead of "decode
+     failed; skipping" (`services/ravel-server/src/scrub.rs:599-604`).
   5. Docs: the two contract documents above, the flags reference, and the
      operations guide's S3 endpoint section.
 
@@ -420,3 +421,27 @@ with and builds each tenant store through
 the same upload checksum and sends the same stored-checksum request as every
 other write. The read-only external Parquet profile stores are the one kind
 of S3 store still built with the default config.
+
+## Amendment (2026-10-03, #1696): the scrub-counter amendment retires follow-up task 4
+
+<!-- amendment-applies: sections="Consequences" pointer="scrub-counter amendment" -->
+<!-- amendment-supersedes: phrase="count a `Corrupted` commit-record GET as a checksum mismatch" pointer="scrub-counter amendment" -->
+
+Follow-up task 4 is retired and will not be done. ADR-1686's 2026-09-26
+amendment ("the tick is sized by entries and requests against a
+retention-capped deadline", in
+`docs/adrs/1686-scrub-resume-with-a-start-after-marker.md`) decided the
+opposite on purpose: a commit-record GET that fails with an error retrying
+cannot clear, `Corrupted` included, is counted once on
+`ravel_scrub_unreadable_total{signal, level, reason}` with
+`reason="permanent"` (`reason="access_denied"` for `AccessDenied`), and not
+on `ravel_scrub_checksum_mismatch_total`, which counts only bytes that were
+read and did not verify.
+
+The code follows ADR-1686. `UnreadableReason::of` in
+`crates/ravel-maintain/src/scrub.rs` maps `AccessDenied` to `AccessDenied`
+and every other kind, `Corrupted` among them, to `Permanent`, and the module
+documentation of `services/ravel-server/src/scrub.rs` states the same split.
+A store-checksum failure therefore surfaces in scrub as an unreadable record,
+not as a "decode failed; skipping" log line and not as a checksum mismatch.
+ADR-1686's amendment is the governing text for how scrub counts it.
