@@ -870,10 +870,12 @@ async fn a_bad_rlog_zstd_level_is_refused_before_any_store_request() {
 /// measured on this fixture: compaction's 20 is the headline test's figure,
 /// and the bare rewrite's 18 is that less the two LISTs a compaction issues
 /// around it (the listing it plans from and the pre-publish re-list). The
+/// migration's 22 is the bare rewrite's 18 plus its planning LIST, its two
+/// eligibility reads of the commit records, and its pre-publish re-list. The
 /// erasure rewrite's 20 includes its own pre-publish re-list.
 #[tokio::test]
 async fn the_default_level_runs_each_rlog_entry_point_against_the_store() {
-    for (entry, expected) in RLOG_ENTRIES.into_iter().zip([20, 21, 18, 20]) {
+    for (entry, expected) in RLOG_ENTRIES.into_iter().zip([20, 22, 18, 20]) {
         let (result, oracle, _) = run_rlog_entry_at(entry, 9).await;
         assert!(result.is_ok(), "{entry:?}: {result:?}");
         assert_eq!(oracle, expected, "{entry:?}: store requests");

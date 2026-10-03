@@ -27,10 +27,11 @@ use ravel_commit::{keys, signal};
 use ravel_fleet::claim::COMPACTION_CLAIMS_PREFIX;
 use ravel_maintain::claim_guard::ClaimSleeper;
 use ravel_maintain::{
-    Checkpoint, ClaimParticipant, ClaimSkipReason, ClaimedCompaction, Clock, CompactionOutcome,
-    CompactorConfig, Coordination, ErasureRewriteOutcome, FixedClock, MaintainMemo, NoLeases,
-    PendingErasureRequest, PublishOutcome, RequestLedger, compact_bucket, compact_bucket_claimed,
-    erasure_rewrite_bucket, read,
+    Checkpoint, ClaimAcquisition, ClaimParticipant, ClaimSkipReason, ClaimedCompaction, Clock,
+    CompactionOutcome, CompactorConfig, Coordination, ErasureAbandon, ErasureRewriteOutcome,
+    FixedClock, MaintainMemo, MigrateOutcome, NoLeases, PendingErasureRequest, PublishOutcome,
+    RequestLedger, compact_bucket, compact_bucket_claimed, erasure_rewrite_bucket,
+    migrate_bucket_format, read,
 };
 use ravel_object_store::fault::{FaultPlan, FaultStore, GateHandle, Occurrence, Op};
 use ravel_object_store::memory::MemoryStore;
@@ -315,9 +316,13 @@ async fn a_compaction_that_publishes_mid_erasure_cancels_the_erasure_rewrite() {
         e_outcome,
         ErasureRewriteOutcome::Rewritten {
             parts: 0,
-            publish: PublishOutcome::Abandoned
+            publish: PublishOutcome::Abandoned,
+            abandoned: Some(ErasureAbandon::ClaimLost {
+                at: Checkpoint::Publish
+            }),
+            claim: Some(ClaimAcquisition { stolen: false }),
         },
-        "E publishes nothing"
+        "E publishes nothing, and says it lost the claim it took fresh"
     );
     assert_eq!(
         record_sets(store.as_ref()).await,
@@ -387,7 +392,11 @@ async fn a_claim_held_by_one_pass_makes_the_other_back_off() {
         e_outcome,
         ErasureRewriteOutcome::Rewritten {
             parts: 0,
-            publish: PublishOutcome::Abandoned
+            publish: PublishOutcome::Abandoned,
+            abandoned: Some(ErasureAbandon::ClaimHeld {
+                reason: ClaimSkipReason::HeldByAnother
+            }),
+            claim: None,
         },
         "the erasure rewrite backs off while the compaction holds the claim"
     );
@@ -558,7 +567,9 @@ async fn the_pre_publish_relist_aborts_when_the_record_set_changed() {
         e_outcome,
         ErasureRewriteOutcome::Rewritten {
             parts: 0,
-            publish: PublishOutcome::Abandoned
+            publish: PublishOutcome::Abandoned,
+            abandoned: Some(ErasureAbandon::RecordSetChanged),
+            claim: None,
         },
         "the re-list found the compaction record and the rewrite published nothing"
     );
@@ -624,7 +635,11 @@ async fn a_stale_unreadable_claim_holds_the_bucket_against_both_passes() {
         erasure(store.as_ref(), &clock, &e_config).await,
         ErasureRewriteOutcome::Rewritten {
             parts: 0,
-            publish: PublishOutcome::Abandoned
+            publish: PublishOutcome::Abandoned,
+            abandoned: Some(ErasureAbandon::ClaimHeld {
+                reason: ClaimSkipReason::UnreadableClaim
+            }),
+            claim: None,
         }
     );
     assert_eq!(record_sets(store.as_ref()).await, (0, 0));
@@ -637,4 +652,218 @@ async fn a_stale_unreadable_claim_holds_the_bucket_against_both_passes() {
         Bytes::from_static(b"\xff\xff not a claim"),
         "the unreadable claim is left in place"
     );
+}
+
+/// A run past its `max_compaction_lifetime` deadline publishes nothing and says
+/// the deadline was why, not the claim: it took the claim fresh and still held
+/// it.
+///
+/// Fails if the deadline arm of `build_and_publish_rewrite` (the
+/// `then_some(ErasureAbandon::Deadline)`) is removed: `abandoned` is then
+/// `None` beside an abandoned publish.
+#[tokio::test]
+async fn an_erasure_rewrite_past_its_deadline_reports_the_deadline() {
+    let now_ns = sealed_now_ns();
+    let store = seeded_store(now_ns).await;
+    let clock = FixedClock::new(now_ns);
+    let ledger = RequestLedger::new();
+    let e_config = CompactorConfig {
+        max_compaction_lifetime_ns: -1,
+        ..config(Some(1), &clock, &ledger)
+    };
+
+    let outcome = erasure(store.as_ref(), &clock, &e_config).await;
+    match outcome {
+        ErasureRewriteOutcome::Rewritten {
+            parts,
+            publish: PublishOutcome::Abandoned,
+            abandoned: Some(ErasureAbandon::Deadline),
+            claim: Some(ClaimAcquisition { stolen: false }),
+        } => assert!(parts > 0, "the build ran before the deadline check"),
+        other => panic!("the run must abandon at its deadline: {other:?}"),
+    }
+    assert_eq!(record_sets(store.as_ref()).await, (0, 0));
+    assert_eq!(ledger.report().publish.requests, 0, "no record PUT");
+}
+
+/// `maintain migrate`'s per-bucket publish is fenced like a compaction's: an
+/// erasure rewrite that publishes while a migration of the same bucket is
+/// parked at its first part PUT makes the migration publish nothing.
+///
+/// Migration M claims the bucket and is parked at its first part PUT. The
+/// lease expires; erasure E, a second process, steals the claim and publishes
+/// its rewrite record. M resumes; its next checkpoint renews, finds the claim
+/// stolen, and M cancels there.
+///
+/// Shown failing against the pre-fix code, where the migration took no claim
+/// and did not re-list: M publishes a compaction record from the unerased
+/// inputs beside E's rewrite record (`Rewritten { publish: Published }`,
+/// record sets `(1, 1)`). With only the `claim_bucket(store, config, bucket,
+/// "migrate")` call in `migrate_bucket_format_scoped` removed, E creates the
+/// claim fresh rather than stealing it, and M is stopped by its re-list
+/// instead (`RewritePresent`), which fails both the steal and the `Cancelled`
+/// assertions: this test pins the claim, the next pins the re-list.
+#[tokio::test]
+async fn an_erasure_rewrite_that_publishes_mid_migration_cancels_the_migration() {
+    let now_ns = sealed_now_ns();
+    let store = seeded_store(now_ns).await;
+    let clock = FixedClock::new(now_ns);
+    let m_ledger = RequestLedger::new();
+    let m_config = config(Some(1), &clock, &m_ledger);
+    let e_ledger = RequestLedger::new();
+    let e_config = config(Some(2), &clock, &e_ledger);
+    let gate = store.hold(Op::Put, Some(PART_KEYS.to_string()), Occurrence::Nth(1));
+
+    let m = async {
+        migrate_bucket_format(store.as_ref(), &clock, &m_config, &bucket(), u32::MAX)
+            .await
+            .expect("migration")
+    };
+    let e = async {
+        let id = parked(&gate, Op::Put, PART_KEYS).await;
+        clock.set(now_ns + PAST_LEASE_NS);
+        store.inner().set_clock_ms(ms(now_ns + PAST_LEASE_NS));
+        let outcome = erasure(store.as_ref(), &clock, &e_config).await;
+        assert!(gate.release(id), "the parked part PUT was released");
+        outcome
+    };
+    let (m_outcome, e_outcome) = tokio::join!(m, e);
+
+    assert!(
+        matches!(
+            e_outcome,
+            ErasureRewriteOutcome::Rewritten {
+                publish: PublishOutcome::Published,
+                claim: Some(ClaimAcquisition { stolen: true }),
+                ..
+            }
+        ),
+        "E steals the expired claim and publishes: {e_outcome:?}"
+    );
+    assert_eq!(
+        m_outcome,
+        MigrateOutcome::Cancelled {
+            at: Checkpoint::PartBoundary
+        },
+        "M cancels on its stolen claim"
+    );
+    assert_eq!(
+        record_sets(store.as_ref()).await,
+        (0, 1),
+        "exactly the erasure rewrite's record and no compaction record"
+    );
+    assert_eq!(m_ledger.report().publish.requests, 0, "M PUT no record");
+}
+
+/// The migration's pre-publish re-list is its whole fence when it takes no
+/// claim (`ravel-cli maintain migrate --no-claim`, or no participant): parked
+/// at its first part PUT while an erasure rewrite publishes, it re-lists on
+/// resuming, finds the rewrite record, and reports `RewritePresent` with no
+/// record PUT.
+///
+/// Shown failing against the pre-fix code, where `migrate_bucket_format` did
+/// not re-list: M publishes a compaction record beside the rewrite record. The
+/// removed line is the `Some(planned)` that `dispatch_rewrite` passes to
+/// `load_then_rewrite` (pass `None` and M publishes).
+#[tokio::test]
+async fn the_migration_relist_aborts_when_an_erasure_rewrite_published() {
+    let now_ns = sealed_now_ns();
+    let store = seeded_store(now_ns).await;
+    let clock = FixedClock::new(now_ns);
+    let m_ledger = RequestLedger::new();
+    let m_config = config(None, &clock, &m_ledger);
+    let e_ledger = RequestLedger::new();
+    let e_config = config(None, &clock, &e_ledger);
+    let gate = store.hold(Op::Put, Some(PART_KEYS.to_string()), Occurrence::Nth(1));
+
+    let m = async {
+        migrate_bucket_format(store.as_ref(), &clock, &m_config, &bucket(), u32::MAX)
+            .await
+            .expect("migration")
+    };
+    let e = async {
+        let id = parked(&gate, Op::Put, PART_KEYS).await;
+        let outcome = erasure(store.as_ref(), &clock, &e_config).await;
+        assert!(gate.release(id));
+        outcome
+    };
+    let (m_outcome, e_outcome) = tokio::join!(m, e);
+
+    assert!(
+        matches!(
+            e_outcome,
+            ErasureRewriteOutcome::Rewritten {
+                publish: PublishOutcome::Published,
+                ..
+            }
+        ),
+        "{e_outcome:?}"
+    );
+    assert_eq!(
+        m_outcome,
+        MigrateOutcome::RewritePresent,
+        "the re-list found the rewrite record and the migration refused it"
+    );
+    let m_report = m_ledger.report();
+    assert_eq!(
+        m_report.list.requests, 2,
+        "the planning LIST and the re-list"
+    );
+    assert_eq!(m_report.publish.requests, 0, "no record PUT");
+    assert_eq!(m_report.coordinate.requests, 0, "no claim was involved");
+    assert_eq!(
+        record_sets(store.as_ref()).await,
+        (0, 1),
+        "exactly the erasure rewrite's record and no compaction record"
+    );
+}
+
+/// A migration backs off a bucket whose claim an erasure rewrite holds, with
+/// nothing built, and the holder then publishes.
+///
+/// Fails if the `BucketClaim::Skipped` arm of `migrate_bucket_format_scoped`
+/// is replaced by running unclaimed: the migration then builds parts and
+/// publishes a compaction record while E is parked.
+#[tokio::test]
+async fn a_claim_held_by_an_erasure_rewrite_makes_the_migration_back_off() {
+    let now_ns = sealed_now_ns();
+    let store = seeded_store(now_ns).await;
+    let clock = FixedClock::new(now_ns);
+    let e_ledger = RequestLedger::new();
+    let e_config = config(Some(1), &clock, &e_ledger);
+    let m_ledger = RequestLedger::new();
+    let m_config = config(Some(2), &clock, &m_ledger);
+    let gate = store.hold(Op::Get, Some(L0_KEYS.to_string()), Occurrence::Nth(1));
+
+    let e = erasure(store.as_ref(), &clock, &e_config);
+    let m = async {
+        let id = parked(&gate, Op::Get, L0_KEYS).await;
+        let outcome = migrate_bucket_format(store.as_ref(), &clock, &m_config, &bucket(), u32::MAX)
+            .await
+            .expect("migration");
+        let between = record_sets(store.as_ref()).await;
+        assert!(gate.release(id));
+        (outcome, between)
+    };
+    let (e_outcome, (m_outcome, between)) = tokio::join!(e, m);
+
+    assert_eq!(
+        m_outcome,
+        MigrateOutcome::SkippedClaimed {
+            reason: ClaimSkipReason::HeldByAnother
+        }
+    );
+    assert_eq!(m_ledger.report().part_put.requests, 0, "M built nothing");
+    assert_eq!(between, (0, 0), "nothing was published while E was parked");
+    assert!(
+        matches!(
+            e_outcome,
+            ErasureRewriteOutcome::Rewritten {
+                publish: PublishOutcome::Published,
+                ..
+            }
+        ),
+        "the holder publishes: {e_outcome:?}"
+    );
+    assert_eq!(record_sets(store.as_ref()).await, (0, 1));
 }

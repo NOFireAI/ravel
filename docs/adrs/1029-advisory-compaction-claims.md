@@ -685,12 +685,17 @@ publishes, and neither pass may skip it. Concretely:
 3. **A pass that cannot take the claim backs off.** It builds nothing,
    publishes nothing, and a later pass retries; it never publishes unfenced. A
    compaction reports `ClaimedCompaction::SkippedClaimed` as before. An
-   erasure rewrite reports `Rewritten { parts: 0, publish: Abandoned }`, which
-   the supervisor already treats as deferred (the `.dreq` stays pending and no
-   `.done` is written); its outcome enum gained no variant because
-   `ravel-server` matches it exhaustively. A claim lost mid-run cancels at the
-   next checkpoint as decision 3 describes (`Cancelled` for a compaction,
-   `Abandoned` for an erasure rewrite).
+   erasure rewrite reports `Rewritten { parts: 0, publish: Abandoned, .. }`,
+   which the supervisor already treats as deferred (the `.dreq` stays pending
+   and no `.done` is written); its outcome enum gained no variant, and
+   `Rewritten` instead carries why it abandoned (`ErasureAbandon`: the claim
+   held by another process, the claim lost, the re-list finding the record set
+   changed, or the deadline) and its claim acquisition, so `ravel-server`
+   counts a refused claim on `ravel_maintain_claims_skipped_total`, a lost one
+   on `ravel_maintain_claims_lost_total`, and the other two on no claim
+   counter. A claim lost mid-run cancels at the next checkpoint as decision 3
+   describes (`Cancelled` for a compaction, `Abandoned` for an erasure
+   rewrite).
 4. **The pre-publish re-list is a second check.** After its last claim
    checkpoint and immediately before its record PUT, each pass lists the
    bucket again (`rewrite::relist_changed`) and compares its record set (L0
@@ -703,13 +708,36 @@ publishes, and neither pass may skip it. Concretely:
    clock when it resumed, and a caller that takes no claim. It costs one LIST
    per run that reaches its publish, counted under the request ledger's list
    phase.
-5. **Callers that take no claim keep only the re-list.** The unclaimed
-   `compact_bucket` entry point, any caller without a `ClaimParticipant`
-   (`ravel-cli`'s `--no-claim` and `--dry-run`), and `coordination = off` take
-   no claim, so the window between their re-list and their PUT stays open
-   against an erasure rewrite. `coordination = off` is decision 5's escape
-   hatch for a store without the CAS probes and stays one, with this cost now
-   stated.
+5. **Callers that take no claim keep only the re-list.** Each of these
+   publishes after the pre-publish re-list and holds no claim, so the window
+   between its re-list and its PUT stays open against an erasure rewrite of
+   the same bucket:
+   - the unclaimed `compact_bucket` entry point, which `scan_and_compact`
+     drives for the server's query-audit shard (a signal the erasure rewrite
+     never touches, so no erasure rewrite can race it there), and which
+     benchmarks and tests drive directly;
+   - `ravel-cli maintain compact-bucket`, `compact-tenant` and `migrate` run
+     with `--no-claim`, which install no `ClaimParticipant` (`--dry-run`
+     installs none either, and publishes nothing);
+   - `erasure_rewrite_bucket` and `migrate_bucket_format` under a caller that
+     installs no participant;
+   - every pass on a process with `coordination = off`
+     (`--maintain-claims off`).
+
+   The public `rewrite_and_publish` primitive keeps neither: it is given no
+   planned listing, so it neither claims nor re-lists, and only tests drive
+   it. `coordination = off` is decision 5's escape hatch for a store without
+   the CAS probes and stays one, with this cost now stated.
+
+   The format migration is fenced like a compaction, since it publishes a
+   compaction record. `migrate_bucket_format` takes the bucket's claim through
+   `claim_guard::claim_bucket` when its config carries a participant, after
+   its eligibility reads and before it rewrites, and holds it through its
+   record PUT; it reports `MigrateOutcome::SkippedClaimed` when refused and
+   `MigrateOutcome::Cancelled` when it loses the claim, publishing nothing in
+   either case. It passes its listing to the primitive, so its re-list runs
+   with or without a claim. `ravel-cli maintain migrate` installs a
+   participant unless `--no-claim` is given.
 6. **Why no key-layout or proto change was needed.** The claim object already
    lives at `sys/maintain/claims/compaction/<work_id_hex>`, keyed by the
    bucket's four fields, which identify the erasure rewrite's bucket exactly as
@@ -728,9 +756,18 @@ publishes, and neither pass may skip it. Concretely:
    without the fence the race already served erased rows. A claim held too
    long delays the other pass, which the erasure deadline surfaces; a claim
    stolen from a live owner is caught by its renewal at the next checkpoint or
-   by its re-list. The Context's statement that claims are not
-   correctness-critical is narrowed accordingly: for this one pair of passes
-   the claim is part of the correctness argument, with the re-list behind it.
+   by its re-list. An owner that stalls longer than the lease between its
+   re-list and its record PUT is caught by neither: both ran before the steal,
+   so it publishes, and the pass that stole the claim can publish too. That is
+   the same short window the unclaimed callers of point 5 have. Between two
+   compactions the re-list also changes how decision 2's convergence plays
+   out: a losing compaction now usually finds the winner's record at its
+   re-list and stops with `AlreadyCompacted`, so it rarely reaches
+   `publish.rs`'s `resolve_already_exists`, and that path's re-PUT of a
+   winner's missing parts no longer repairs them in practice. The Context's
+   statement that claims are not correctness-critical is narrowed accordingly:
+   for this one pair of passes the claim is part of the correctness argument,
+   with the re-list behind it.
 
 Tests, each shown failing against the pre-fix code, in
 `crates/ravel-maintain/tests/erasure_compaction_fence.rs`:
@@ -739,7 +776,9 @@ Tests, each shown failing against the pre-fix code, in
 interleavings, driven by `FaultStore` hold gates and test clocks),
 `a_claim_held_by_one_pass_makes_the_other_back_off`,
 `the_pre_publish_relist_aborts_when_the_record_set_changed` and
-`a_stale_unreadable_claim_holds_the_bucket_against_both_passes`. In
+`a_stale_unreadable_claim_holds_the_bucket_against_both_passes`; for the
+migration, `an_erasure_rewrite_that_publishes_mid_migration_cancels_the_migration`
+and `the_migration_relist_aborts_when_an_erasure_rewrite_published`. In
 `crates/ravel-maintain/tests/compaction_claims.rs`,
 `a_bucket_below_the_retired_cost_gate_is_claimed` replaces the cost-gate test
 and `a_stale_unreadable_claim_holds_the_bucket` replaces the test that ran such

@@ -34,10 +34,14 @@
 //! The distinction is not cosmetic. A lease is logically a lock, and Ravel's
 //! architectural statement is that there are no correctness-critical
 //! distributed locks: immutable content-addressed parts and CAS record
-//! publication remain the sole correctness mechanism. A claim confers zero
-//! publication rights and its absence removes none (ADR-1029 decision 2); the
-//! publish path never reads one. A claim bug can waste work, it cannot corrupt
-//! data.
+//! publication remain the correctness mechanism between two compactions. There
+//! a claim confers zero publication rights (ADR-1029 decision 2), the record
+//! publish never reads one, and a claim bug can only waste work. A compaction
+//! record and an erasure rewrite record have different keys, so CAS
+//! publication does not serialize those two passes, and in `ravel-maintain`
+//! holding the claim is a condition of a participating pass's publish
+//! (ADR-1029, the 2026-10-03 amendment). The store enforces no lock: each pass checks its own
+//! claim before its PUT, with a re-list of the bucket behind it.
 //!
 //! # Work identity
 //!
@@ -469,9 +473,12 @@ pub enum Reclaim {
 /// (a renewal store error, any other error after the claim was taken, or a
 /// completed run's marker), or held by a concurrent sibling run in this
 /// process, which then cancels at its next renewal if that falls before it
-/// publishes and otherwise duplicates the merge. Either way, taking it back
-/// costs nothing correctness-wise: claims are advisory, and the worst case
-/// is a cancelled or duplicated merge, never incorrect data.
+/// publishes and otherwise duplicates the merge. Between two compactions the
+/// worst case is a cancelled or duplicated merge. When the sibling is an
+/// erasure rewrite of the same bucket the claim also fences the two
+/// publishes (ADR-1029, the 2026-10-03 amendment): a sibling past its last
+/// renewal is then stopped only by its pre-publish re-list, which leaves the
+/// short window between that re-list and its record PUT.
 ///
 /// The caller maps `Err(StoreError::NotFound)` (a claim deleted between the
 /// observation and the CAS, as the S3 adapter reports it) to a lost race, as
@@ -662,8 +669,11 @@ async fn observe(
     // Clamped above by MAX_OBSERVED_LEASE_MS: nothing ever deletes a claim, so
     // trusting an absurd holder-declared lease (misconfiguration, or decodable
     // corruption) would suppress claimed compaction of the bucket until the
-    // heat death of i64. The clamp is an availability guard on the advisory
-    // layer; correctness never depended on the lease.
+    // heat death of i64. The clamp is an availability guard. A lease it cuts
+    // short lets a steal come sooner; a stolen owner cancels at its next
+    // renewal, and its pre-publish re-list catches a steal after that, apart
+    // from the short window before its record PUT (ADR-1029, the 2026-10-03
+    // amendment).
     let lease_ms = holder
         .as_ref()
         .map(|h| h.lease_duration_ns)

@@ -814,6 +814,7 @@ async fn migrate_raises_floor_on_a_clean_tenant() {
         None,
         None,
         0,
+        &ClaimOptions::fresh(),
     )
     .await
     .expect("migrate raises the floor on a clean tenant");
@@ -871,6 +872,7 @@ async fn migrate_exits_nonzero_and_holds_the_floor_when_a_straggler_survives() {
         None,
         None,
         0,
+        &ClaimOptions::fresh(),
     )
     .await
     .expect_err("a fresh straggler must make migrate exit nonzero");

@@ -194,11 +194,13 @@ impl S3UploadIntegrity {
 /// that does not depend on clap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum MaintainClaimsArg {
-    /// Claim buckets at or above the cost gate. The default.
+    /// Claim every bucket a compaction, migration or erasure rewrite works
+    /// on, whatever its size. The default.
     #[default]
     On,
-    /// Never claim; racing runs still converge at the compaction record's
-    /// `CreateIfAbsent`.
+    /// Never claim; racing compactions still converge at the compaction
+    /// record's `CreateIfAbsent`, and a compaction and an erasure rewrite of
+    /// the same bucket are fenced only by the pre-publish re-list.
     Off,
 }
 
@@ -816,8 +818,10 @@ pub struct Cli {
     #[arg(long = "maintain-interior-reverify", value_name = "DURATION")]
     pub maintain_interior_reverify: Option<String>,
 
-    /// How long an advisory compaction claim (ADR-1029) stays live without a
-    /// renewal, as a humantime duration (e.g. `300s`, `5m`). Passed straight
+    /// How long a bucket claim (ADR-1029) stays live without a renewal, as a
+    /// humantime duration (e.g. `300s`, `5m`). The claim saves duplicate
+    /// compaction work and fences a compaction against an erasure rewrite of
+    /// the same bucket. Passed straight
     /// to `ravel_maintain::config::CompactorConfig::claim_lease_duration`.
     /// Omitted defaults to
     /// [`ravel_maintain::config::DEFAULT_CLAIM_LEASE_DURATION`] (300 s). Zero
@@ -862,8 +866,8 @@ pub struct Cli {
     #[arg(long = "maintain-l1-part-memory-target-bytes", value_name = "BYTES")]
     pub maintain_l1_part_memory_target_bytes: Option<u64>,
 
-    /// Whether this process takes advisory compaction claims at all
-    /// (ADR-1029 decision 5's escape hatch). `off` is the fleet-wide
+    /// Whether this process takes bucket claims at all (ADR-1029 decision 5's
+    /// escape hatch). `off` is the fleet-wide
     /// fallback for a store whose qualification record predates the CAS
     /// probes, or an emergency: racing compactions still converge at the
     /// compaction record's `CreateIfAbsent` and the loser just pays its merge
