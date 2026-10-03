@@ -1319,20 +1319,27 @@ and a readable `MemAvailable` (Linux's own `/proc/meminfo` estimate of memory
 a new allocation could claim without swapping), the budget is
 `min(MemTotal - RESERVE, max(FLOOR, MemAvailable + own RSS - RESERVE))`,
 every subtraction saturating at zero. `RESERVE` is the same fixed 2 GiB
-overhead reserve as before; `FLOOR` is a 1 GiB floor below which the budget
-never derives, logged at `WARN` with the `MemAvailable` reading that hit it
-and `--memory-budget-bytes` named as the remedy. The process's own resident
-set counts as available because the kernel does not call a process's own
-resident pages "available" even though this process may reuse them rather
-than compete with them. A cgroup memory limit, when present, keeps the
-pre-amendment rule instead: the limit is already this process's whole share,
-so a whole-host `MemAvailable` would only be wrong to consult, and the
-budget is that limit minus the reserve. With no cgroup limit and no readable
-`MemAvailable` (non-Linux, or a `/proc/meminfo` that is unreadable), the
-budget is `MemTotal` minus the reserve, same as before the amendment. Set
-`--memory-budget-bytes` to override every one of these branches outright;
-it still goes through the same startup refusal as a derived budget (below),
-and env var `RAVEL_MEMORY_BUDGET_BYTES` follows it. This is the one setting
+overhead reserve as before; `FLOOR` is a 1 GiB floor under the
+`MemAvailable + own RSS - RESERVE` term only, not under the final budget:
+binding it logs at `WARN` with the `MemAvailable` reading that hit it and
+`--memory-budget-bytes` named as the remedy, but the outer `min` against
+`MemTotal - RESERVE` can still clip the final budget below `FLOOR`
+afterward, down to 0 on a host whose `MemTotal` barely exceeds the reserve.
+The process's own resident set counts as available because the kernel does
+not call a process's own resident pages "available" even though this
+process may reuse them rather than compete with them. A cgroup memory
+limit, when present, keeps the pre-amendment rule instead: the limit is
+already this process's whole share, so a whole-host `MemAvailable` would
+only be wrong to consult, and the budget is that limit minus the reserve.
+With no cgroup limit, a readable `MemTotal`, and no readable `MemAvailable`
+(an unusual Linux kernel or container runtime whose `/proc/meminfo` parses
+`MemTotal` but not `MemAvailable`), the budget is `MemTotal` minus the
+reserve, same as before the amendment. A host whose `MemTotal` itself is
+unreadable (every non-Linux build, or a Linux host whose `/proc/meminfo`
+cannot be read at all) derives no budget at all: the budget is unlimited,
+same as before this amendment existed. Set `--memory-budget-bytes` to
+override every one of these branches outright; it still goes through the
+same startup refusal as a derived budget (below). This is the one setting
 to reach for on a host where this process shares memory with another one it
 cannot see: the available-memory derivation reads `MemAvailable` once at
 startup and cannot anticipate a sibling process claiming memory afterward.
@@ -1413,8 +1420,7 @@ fetcher cache's larger 40% share, resolved instead of `budget-carve` when
 the store is `s3` against a loopback endpoint and `--cache-max-bytes` is
 unset), or `fallback` (no flag and no readable `MemTotal`, so the
 compiled-in constant is used). `memory_budget_bytes` resolved with source
-`flag` means `--memory-budget-bytes` (or `RAVEL_MEMORY_BUDGET_BYTES`) won
-over every derivation branch. So
+`flag` means `--memory-budget-bytes` won over every derivation branch. So
 `journalctl -u ravel-server | grep
 'performance default resolved'` answers "what is this process actually running
 with" without reading the unit file:
@@ -1436,9 +1442,13 @@ INFO performance default resolved setting="sql_tenant_max_bytes" value=161061273
 INFO performance default resolved setting="gc_max_query_duration" value_ms=660000 source="derived"
 ```
 
-`source="derived"` on `memory_budget_bytes` above means this host's `MemAvailable`
-was not consulted (unreadable, or this is a non-Linux build): the budget is plain
-`MemTotal` minus the reserve, the pre-amendment rule. On a Linux host with a
+`source="derived"` on `memory_budget_bytes` above means this host's `MemTotal`
+was readable but its `MemAvailable` was not (an unusual Linux kernel or
+container runtime): the budget is plain `MemTotal` minus the reserve, the
+pre-amendment rule. A non-Linux build, or a Linux host whose `/proc/meminfo`
+cannot be read at all, never reaches this source: `MemTotal` itself is
+unknown there, so the source reads `fallback` and the budget is unlimited,
+regardless of any cache or SQL caps set on it. On a Linux host with a
 readable `MemAvailable` and no cgroup memory limit, the source instead reads
 `derived-available` and the value comes from the available-memory formula above;
 [`docs/internal/clickbench.md`](../../internal/clickbench.md#deriving-the-reference-sizes)
@@ -1447,7 +1457,8 @@ has a worked example from a real measured host, including the SQL-pool cap at
 `derived-cgroup` and `MemAvailable` is not consulted at all: the limit minus the
 reserve is used directly, unchanged from before the amendment. When
 `MemAvailable` plus this process's own resident set would collapse the budget
-below the 1 GiB floor, one extra line appears before the block above:
+below the 1 GiB floor, one extra line appears inside the block above, after
+the `memory_remainder_bytes` line and before the two SQL pool lines:
 
 ```
 WARN memory_budget_bytes was held at MEMORY_BUDGET_FLOOR_BYTES: MemAvailable plus this process's own resident set left little or no room after the overhead reserve, most likely a co-resident process claiming most of the host; set --memory-budget-bytes to size the budget explicitly memory_budget_bytes=1073741824 mem_available_bytes=2147483648 own_rss_bytes=0

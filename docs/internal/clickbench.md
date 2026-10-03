@@ -378,9 +378,9 @@ cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
 - `--sql-max-segments 1000000` lifts the engine's sealed-segment ceiling from
   its default of 1024; a folded ClickBench tenant sits far above that and
   every statement would otherwise fail with `8424 exceeds max 1024`.
-- `--cache-bytes 25769803776` (24 GiB) exceeds the ~12 GB corpus, so the second
-  and third runs have a hot column to report. Leave it off for a cold-only
-  pass.
+- `--cache-bytes 25769803776` (24 GiB) exceeds the 9,844,635,064-byte corpus,
+  so the second and third runs have a hot column to report. Leave it off for
+  a cold-only pass.
 - `--tenant clickbench` measures the loaded tenant (not an in-process generated
   dataset). It resolves the tenant's real durable declaration and **skips** any
   statement whose required declared column is absent or the wrong type, rather
@@ -762,13 +762,18 @@ resolve to that same 13,748,627,313 (the exact `bytes_as_usize`-truncated
 90% figure) with `remainder_capped=true`. This box's exact numbers depend on
 `MemAvailable` at the moment the server starts, not only on its fixed
 `MemTotal`: a co-resident process on the same host at that moment would
-derive a smaller budget and smaller caches. Do not assume the resolved
-values: record the server's own startup log lines (below) with the entry.
-Both of the two settings that used to be mandatory here are among the
+derive a smaller budget and smaller caches, so two stock passes on the same
+host can resolve different ceilings (ADR-1170's 2026-10-03 available-memory
+amendment). Do not assume the resolved values: record the server's own
+startup log lines (below) with the entry, alongside the `MemAvailable`
+reading those lines were derived from. When comparing two passes against
+each other (an A/B, a regression check), pin `--memory-budget-bytes` to one
+value on both runs, so the budget is not the variable that differs between
+them. Both of the two settings that used to be mandatory here are among the
 derived six: a folded ClickBench tenant sits far above the old 1024
 sealed-segment ceiling, so an un-derived server failed every statement with
-`8424 exceeds max 1024`, and the cache must exceed the ~12 GB corpus or
-every run is cold and there is no hot column to compare.
+`8424 exceeds max 1024`, and the cache must exceed the 9,844,635,064-byte
+corpus or every run is cold and there is no hot column to compare.
 
 Read the resolved values off the server's own startup log rather than
 assuming them, and record them with the entry (the lines below are this

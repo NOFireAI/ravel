@@ -463,6 +463,14 @@ budget -- see
 for the worked S3 and loopback figures and how they move with
 `MemAvailable`.
 
+Because the derived figures depend on a `MemAvailable` reading, two stock
+passes on the same instance type can resolve different ceilings. A published
+stock result records the `MemAvailable` reading next to the resolved
+`performance default resolved` lines in the entry. Comparing two passes
+against each other (an A/B, a regression check) pins `--memory-budget-bytes`
+to one value on both runs instead, so the budget is not the variable that
+differs between them.
+
 ## 9. Check the report before reading the headline
 
 A number printed and not asserted on is decoration. Write the expected figures
