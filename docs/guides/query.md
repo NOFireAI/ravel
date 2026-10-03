@@ -419,7 +419,7 @@ seconds) lowers the deadline per request. It cannot raise it above the
 server's configured default.
 
 SQL queries carry one more bound, a per-query byte ceiling on the DataFusion
-memory pool (by default 25% of the host's memory, ~8 GiB on a 30 GB host; see
+memory pool (by default 50% of the host's memory, the tenant's whole SQL share, ~15 GiB on a 30 GB host; see
 [Operator-configurable budgets](#operator-configurable-budgets-server-flags)).
 It bounds the memory the query *holds at one instant* -- what a scan currently has decoded, plus the batch it is handing
 downstream, plus whatever aggregate state the operators above it accumulate --
@@ -453,7 +453,7 @@ run used.
 | `--sql-partition-count <N>` | `EngineConfig::sql_partition_count`, DataFusion `target_partitions` | derived: `max(8, 2 x cores)` | 32 |
 | `--promql-fetch-fanout <N>` | `EngineConfig::promql_fetch_fanout`, per-selector fetch stream fan-out | derived: `max(8, 2 x cores)` | 32 |
 | `--max-segments <N>` | `EngineConfig::max_segments` | fixed: 1,000,000 (host-independent) | 1,000,000 |
-| `--sql-max-query-bytes <BYTES>` | `SqlConfig::max_query_bytes` (per-query SQL memory pool) | derived: 25% of MemTotal (256 MiB if unknown) | 8,053,063,680 |
+| `--sql-max-query-bytes <BYTES>` | `SqlConfig::max_query_bytes` (per-query SQL memory pool) | derived: 50% of MemTotal, the tenant's share (256 MiB if unknown) | 16,106,127,360 |
 | `--sql-tenant-max-bytes <BYTES>` | per-tenant SQL memory ceiling | derived: 50% of MemTotal (1 GiB if unknown) | 16,106,127,360 |
 
 Combining `--fetch-concurrency` with any of `--store-get-concurrency`,
@@ -506,9 +506,10 @@ raise this flag for such a workload.
 
 `--sql-max-query-bytes` bounds a single SQL query's DataFusion memory pool;
 `--sql-tenant-max-bytes` bounds the memory one tenant may hold across its
-concurrent SQL queries (the multi-tenant isolation ceiling, twice the per-query
-pool at the derived defaults). Both apply only in a build with the `sql`
-feature.
+concurrent SQL queries (the multi-tenant isolation ceiling, equal to the
+per-query pool at the derived defaults: a lone statement may use the whole
+share, and a second concurrent statement gets what the first left).
+Both apply only in a build with the `sql` feature.
 Per-tenant SQL budgets are **not** configurable in the `--limits-file`: its
 per-tenant query overrides are not consulted at query time and are inert, so
 these ceilings are process-wide flags.
