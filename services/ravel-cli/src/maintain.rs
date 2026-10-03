@@ -2739,6 +2739,16 @@ fn check_object_epoch(
     }
 }
 
+/// Printed by `verify-custody` for a tenant with a recorded key epoch: the
+/// control records ravel-cli writes under the Admin credential never route
+/// through the tenant's key (issue #2363), and this check reads write times,
+/// not encryption keys, so nothing below reports them either way.
+const ADMIN_CONTROL_RECORDS_NOTE: &str = "control records: the provisioning records, legal \
+     holds, reconstructed commit records, erasure requests, tenant config record and Parquet \
+     grants record ravel-cli writes under the Admin credential are encrypted under the bucket's \
+     default encryption, not the tenant's key; this check reads write times, not encryption \
+     keys, and reports none of them";
+
 /// `maintain verify-custody`: independently re-verify the content-addressed
 /// chain for a tenant, at rest and after the fact (ADR-0042 decision 5). It
 /// extends `audit_versions`'s tenant/shard-scoped per-object walk (same
@@ -2813,11 +2823,14 @@ pub async fn verify_custody(
             )
         })?;
     match &key_epochs {
-        Some(epochs) => println!(
-            "key-epoch history: {} epoch(s) recorded; checking every live object's write time \
-             against it",
-            epochs.len()
-        ),
+        Some(epochs) => {
+            println!(
+                "key-epoch history: {} epoch(s) recorded; checking every live object's write \
+                 time against it",
+                epochs.len()
+            );
+            println!("{ADMIN_CONTROL_RECORDS_NOTE}");
+        }
         None => println!(
             "key-epoch history: none recorded; every object is under the deployment default key \
              (no epoch check)"

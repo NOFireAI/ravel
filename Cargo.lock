@@ -4710,6 +4710,7 @@ dependencies = [
  "serde",
  "thiserror",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "uuid",

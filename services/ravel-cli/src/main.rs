@@ -1483,6 +1483,8 @@ enum MaintainCommand {
         /// compactor default).
         #[arg(long, value_name = "LEVEL")]
         compaction_zstd_level: Option<i32>,
+        #[command(flatten)]
+        tenant_kms: store::TenantKmsArgs,
     },
     /// Compact every sealed bucket of a whole tenant signal: walk each shard's
     /// ingest hours and run the same per-bucket compaction `compact-bucket`
@@ -1609,6 +1611,8 @@ enum MaintainCommand {
         /// compactor default).
         #[arg(long, value_name = "LEVEL")]
         compaction_zstd_level: Option<i32>,
+        #[command(flatten)]
+        tenant_kms: store::TenantKmsArgs,
     },
     /// Run one sweep pass (orphan GC, superseded, unreferenced segments) over a shard.
     Sweep {
@@ -1706,6 +1710,8 @@ enum MaintainCommand {
         /// default: such a bucket is then reported as reencode_blocked.
         #[arg(long)]
         reencode_compaction_parts: bool,
+        #[command(flatten)]
+        tenant_kms: store::TenantKmsArgs,
     },
     /// Re-verify the content-addressed chain for a tenant at rest (both
     /// signals): every live data object's content still hashes to the hash16
@@ -1773,6 +1779,8 @@ enum CatalogCommand {
         /// text report. Either form carries every counter on the report.
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        tenant_kms: store::TenantKmsArgs,
     },
     /// Decode and print HEAD and every referenced snapshot part for one
     /// (tenant, signal).
@@ -1935,9 +1943,11 @@ async fn main() -> anyhow::Result<()> {
                     signal,
                     max_flush_lifetime,
                     json,
+                    tenant_kms,
                 },
         } => catalog::fold(
-            store::build_store(&cli.store)?,
+            store::build_tenant_data_store(&cli.store, &tenant_kms, &tenant, true, now_ns()?)
+                .await?,
             cli.store.selection(),
             &tenant,
             shards,
@@ -1989,10 +1999,18 @@ async fn main() -> anyhow::Result<()> {
                     l1_part_memory_target_bytes,
                     max_l1_part_bytes,
                     compaction_zstd_level,
+                    tenant_kms,
                 },
         } => {
             maintain::compact_with_part_split_targets(
-                store::build_store(&cli.store)?,
+                store::build_tenant_data_store(
+                    &cli.store,
+                    &tenant_kms,
+                    &tenant,
+                    !dry_run,
+                    now_ns()?,
+                )
+                .await?,
                 cli.store.selection(),
                 &tenant,
                 signal,
@@ -2023,9 +2041,11 @@ async fn main() -> anyhow::Result<()> {
                     input_read_concurrency,
                     bucket_concurrency,
                     compaction_zstd_level,
+                    tenant_kms,
                 },
         } => maintain::compact_tenant(
-            store::build_store(&cli.store)?,
+            store::build_tenant_data_store(&cli.store, &tenant_kms, &tenant, !dry_run, now_ns()?)
+                .await?,
             cli.store.selection(),
             &tenant,
             signal,
@@ -2124,10 +2144,18 @@ async fn main() -> anyhow::Result<()> {
                     no_claim,
                     dry_run,
                     reencode_compaction_parts,
+                    tenant_kms,
                 },
         } => {
             maintain::migrate(
-                store::build_store(&cli.store)?,
+                store::build_tenant_data_store(
+                    &cli.store,
+                    &tenant_kms,
+                    &tenant,
+                    !dry_run,
+                    now_ns()?,
+                )
+                .await?,
                 cli.store.selection(),
                 &tenant,
                 signal,
@@ -3587,6 +3615,57 @@ mod tests {
              allocation: the process is not running under the jemalloc global allocator"
         );
         std::hint::black_box(big);
+    }
+
+    /// Every subcommand path, space-joined, whose own arguments include
+    /// `--tenant-kms-config`.
+    fn paths_taking_tenant_kms_config(
+        command: &clap::Command,
+        prefix: &str,
+        out: &mut Vec<String>,
+    ) {
+        for sub in command.get_subcommands() {
+            let path = if prefix.is_empty() {
+                sub.get_name().to_string()
+            } else {
+                format!("{prefix} {}", sub.get_name())
+            };
+            if sub
+                .get_arguments()
+                .any(|arg| arg.get_long() == Some("tenant-kms-config"))
+            {
+                out.push(path.clone());
+            }
+            paths_taking_tenant_kms_config(sub, &path, out);
+        }
+    }
+
+    /// Issue #2363: `--tenant-kms-config` is taken by exactly the commands
+    /// that write tenant data under the Maintain credential, and by nothing
+    /// else. Every Admin command that writes a control record (`hold set`,
+    /// `erase submit`, `commit reconstruct`, `provision`, `tenant
+    /// parquet-grant`, `typed-attr-column set`, `clustering-key`, `bloom-scope`)
+    /// has no way to receive it, so its writes stay under the bucket's default
+    /// encryption, as ADR-0055's Decrypt-only Admin role requires.
+    ///
+    /// Non-vacuity: drop the `tenant_kms` field from `MaintainCommand::Migrate`
+    /// and the set loses `maintain migrate`; flatten `TenantKmsArgs` into
+    /// `HoldCommand::Set` and it gains `hold set`. Either fails the equality.
+    #[test]
+    fn only_maintain_credential_data_writers_take_tenant_kms_config() {
+        use clap::CommandFactory;
+        let mut got = Vec::new();
+        paths_taking_tenant_kms_config(&Cli::command(), "", &mut got);
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                "catalog fold",
+                "maintain compact-bucket",
+                "maintain compact-tenant",
+                "maintain migrate",
+            ]
+        );
     }
 
     /// `load --signal` defaults to logs and accepts all three signal names
