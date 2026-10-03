@@ -5,6 +5,7 @@
 use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -40,6 +41,7 @@ use crate::limiter::GetLimiter;
 use crate::log_fetcher::{DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD, LogFetchError, LogSegmentFetcher};
 use crate::log_series;
 use crate::phase_accounting::{PhaseAccounting, PhaseAccountingSnapshot};
+use crate::phase_timers;
 use crate::request_budgets::RequestBudgets;
 use crate::segment_admission::{self, RequestBudget};
 
@@ -863,7 +865,18 @@ impl QueryEngine {
                 span.in_scope(|| evaluator.eval_instant_annotated(source, query, t_ms))
             })
             .await?;
-        Ok((value, annotations, stats))
+        // Issue #2468 stage 0: result assembly, the tail of this call after
+        // the operator (`evaluate`, timed by `ravel_promql::op_timers`)
+        // returns. Does not cover `instant_with_stats_annotated`'s enclosing
+        // `tokio::time::timeout`/`unify_deadline`, or `instant`'s
+        // `Coverage::from_stats`: both are thin, await-free wrapping with no
+        // phase of their own, and fall into the unattributed remainder.
+        let assembly_start = Instant::now();
+        let result = Ok((value, annotations, stats));
+        phase_timers::RESULT_ASSEMBLY_NS
+            .fetch_add(assembly_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        phase_timers::RESULT_ASSEMBLY_CALLS.fetch_add(1, Ordering::Relaxed);
+        result
     }
 
     /// Evaluates `query` as a range query, returning its value paired with the
@@ -2031,6 +2044,12 @@ impl QueryEngine {
             // candidate.
             let pushdown_target =
                 count_over_time_pushdown_target(plans, eval_window, snapshot_eligible)?;
+            // Issue #2468 stage 0: fetch+decode wall span. Segments fetch and
+            // decode concurrently across this `buffer_unordered` fan-out, so
+            // this is the WALL time the whole stage occupies, not a sum of
+            // per-segment fetch/decode times (`FETCH_NS`/`DECODE_NS` below are
+            // the latter); use this one for share-of-wall accounting.
+            let fetch_decode_start = Instant::now();
             let results: Vec<Result<PerPlan, QueryError>> = stream::iter(distinct_plans)
                 .map(|plan| {
                     let snapshot = &snapshot;
@@ -2098,6 +2117,11 @@ impl QueryEngine {
                 .buffer_unordered(concurrency)
                 .collect()
                 .await;
+            phase_timers::FETCH_DECODE_WALL_NS.fetch_add(
+                fetch_decode_start.elapsed().as_nanos() as u64,
+                Ordering::Relaxed,
+            );
+            phase_timers::FETCH_DECODE_WALL_CALLS.fetch_add(1, Ordering::Relaxed);
 
             // Collect every distinct matcher set's raw scalar runs into one
             // pool and every distinct matcher set's histogram series into one
@@ -2209,8 +2233,18 @@ impl QueryEngine {
                 .raw_f64_bytes
                 .saturating_add(fed_stats.raw_f64_bytes);
 
+            // Issue #2468 stage 0: series materialisation, the k-way run merge
+            // plus the label-set sort immediately after it. Sequential (not
+            // inside the fetch/decode fan-out above), so this is both the
+            // summed and the wall time for this phase.
+            let materialize_start = Instant::now();
             let mut series = merge_soa_runs(all_scalar_runs, max_series, max_samples)?;
             series.sort_by(|a, b| a.labels.iter().cmp(b.labels.iter()));
+            phase_timers::MATERIALIZE_NS.fetch_add(
+                materialize_start.elapsed().as_nanos() as u64,
+                Ordering::Relaxed,
+            );
+            phase_timers::MATERIALIZE_CALLS.fetch_add(1, Ordering::Relaxed);
             let mut histogram_series: Vec<HistogramSeriesData> =
                 combined_histograms.into_values().collect();
             histogram_series.sort_by(|a, b| a.labels.iter().cmp(b.labels.iter()));
@@ -2362,17 +2396,26 @@ impl QueryEngine {
             generations: first_generations,
             unfolded_segments_resolved: first_unfolded,
             fold_lag: first_fold_lag,
-        } = self
-            .resolve_bounded(
-                tenant_hash,
-                signal,
-                window,
-                min_tokens,
-                now_ns,
-                name_filter,
-                first_accounting.resolve(),
-            )
-            .await?;
+        } = {
+            // Issue #2468 stage 0: catalog resolve. Summed across both the
+            // first attempt and any not-found retry below.
+            let resolve_start = Instant::now();
+            let resolved = self
+                .resolve_bounded(
+                    tenant_hash,
+                    signal,
+                    window,
+                    min_tokens,
+                    now_ns,
+                    name_filter,
+                    first_accounting.resolve(),
+                )
+                .await?;
+            phase_timers::RESOLVE_NS
+                .fetch_add(resolve_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            phase_timers::RESOLVE_CALLS.fetch_add(1, Ordering::Relaxed);
+            resolved
+        };
         // Checked here, right after the resolve returns, not only at the
         // segment-fetch boundaries below: a query whose snapshot resolves to
         // zero segments never reaches those checks, so a caller with a
@@ -2417,17 +2460,26 @@ impl QueryEngine {
                     generations: second_generations,
                     unfolded_segments_resolved: second_unfolded,
                     fold_lag: second_fold_lag,
-                } = self
-                    .resolve_bounded(
-                        tenant_hash,
-                        signal,
-                        window,
-                        min_tokens,
-                        now_ns,
-                        name_filter,
-                        second_accounting.resolve(),
-                    )
-                    .await?;
+                } = {
+                    let resolve_start = Instant::now();
+                    let resolved = self
+                        .resolve_bounded(
+                            tenant_hash,
+                            signal,
+                            window,
+                            min_tokens,
+                            now_ns,
+                            name_filter,
+                            second_accounting.resolve(),
+                        )
+                        .await?;
+                    phase_timers::RESOLVE_NS.fetch_add(
+                        resolve_start.elapsed().as_nanos() as u64,
+                        Ordering::Relaxed,
+                    );
+                    phase_timers::RESOLVE_CALLS.fetch_add(1, Ordering::Relaxed);
+                    resolved
+                };
                 if let Some(err) = segment_admission::request_budget_exceeded(
                     second_accounting.snapshot().pooled().total_s3_requests(),
                     RequestBudget::new(self.config.max_s3_requests, second_fold_lag),

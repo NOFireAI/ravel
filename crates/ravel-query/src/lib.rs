@@ -16,6 +16,7 @@ mod limiter;
 mod log_fetcher;
 pub mod log_series;
 mod phase_accounting;
+pub mod phase_timers;
 mod query_admission;
 #[cfg(test)]
 pub(crate) mod read_gate_test_support;

@@ -2,6 +2,9 @@
 //! pruning, and coalesced byte-range page fetches over one segment
 //! (docs/query-engine.md "Flow", docs/segment-format.md reader protocol).
 
+use std::sync::atomic::Ordering;
+use std::time::Instant;
+
 use bytes::Bytes;
 use futures::future::join_all;
 use ravel_cache::{Cache, CacheKey, ReadOutcome, SingleFlightError, TieredCache};
@@ -17,6 +20,7 @@ use ravel_segment::{
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
 
 use crate::phase_accounting::PhaseAccounting;
+use crate::phase_timers;
 use ravel_cpu_gate::{CpuGateError, JobSize, ReadGate, ReadSite};
 use ravel_types::{LabelSet, Sample, SeriesId, TenantHash};
 use tracing::Instrument;
@@ -1217,7 +1221,15 @@ impl SegmentFetcher {
             StoreError::Transient("GetLimiter semaphore closed unexpectedly".into())
         })?;
         accounting.record_s3_request(AccountedOp::Get);
+        // Issue #2468 stage 0: object fetch. This is the single funnel every
+        // ranged GET in this file passes through (see the doc comment
+        // above), so timing just this call covers footer, catalog-section,
+        // and page-range GETs alike; the semaphore-acquire wait above is
+        // concurrency-limiting queue time, not fetch time, and is excluded.
+        let fetch_start = Instant::now();
         let got = self.store.get(key, range).await?;
+        phase_timers::FETCH_NS.fetch_add(fetch_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        phase_timers::FETCH_CALLS.fetch_add(1, Ordering::Relaxed);
         accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
         Ok(got)
     }
@@ -1812,6 +1824,10 @@ impl SegmentFetcher {
                 // filter it.
                 let reservation = self.reserve_catalog_decode(footer, regions)?;
                 let limits = self.limits;
+                // Issue #2468 stage 0: segment decode (catalog bytes -> series
+                // entries). Wraps the whole match so the `None` (inline) and
+                // `Some(gate)` (gated) branches are timed identically.
+                let decode_start = Instant::now();
                 let (decoded, reservation) = match &self.read_gate {
                     None => (
                         decode_series_meta_catalog(footer, &dict, &ids, &meta, matchers, limits),
@@ -1831,6 +1847,8 @@ impl SegmentFetcher {
                         .map_err(|err| gate_failed(key, err))?
                     }
                 };
+                phase_timers::DECODE_NS.fetch_add(decode_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                phase_timers::DECODE_CALLS.fetch_add(1, Ordering::Relaxed);
                 let (entries, materialized) = decoded.map_err(|source| corrupt(key, source))?;
                 self.record_materialized(materialized);
                 DecodedCatalog {
@@ -1871,6 +1889,9 @@ impl SegmentFetcher {
                     .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
                 let reservation = self.reserve_catalog_decode(footer, regions)?;
                 let limits = self.limits;
+                // Issue #2468 stage 0: segment decode (catalog bytes -> series
+                // entries), whole-object branch.
+                let decode_start = Instant::now();
                 let (decoded, reservation) = match &self.read_gate {
                     None => (
                         decode_whole_object_catalog(footer, &object, matchers, limits),
@@ -1889,6 +1910,8 @@ impl SegmentFetcher {
                         .map_err(|err| gate_failed(key, err))?
                     }
                 };
+                phase_timers::DECODE_NS.fetch_add(decode_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                phase_timers::DECODE_CALLS.fetch_add(1, Ordering::Relaxed);
                 let (entries, materialized) = decoded.map_err(|source| corrupt(key, source))?;
                 self.record_materialized(materialized);
                 DecodedCatalog {
@@ -2005,6 +2028,9 @@ impl SegmentFetcher {
             .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
         let reservation = self.reserve_catalog_decode(footer, regions)?;
         let limits = self.limits;
+        // Issue #2468 stage 0: segment decode (sparse catalog bytes -> series
+        // entries).
+        let decode_start = Instant::now();
         let (decoded, reservation) = match &self.read_gate {
             None => (
                 decode_catalog_v5_chunked(footer, &dict, &ids, &idx, &chunks, limits),
@@ -2022,6 +2048,8 @@ impl SegmentFetcher {
                 .map_err(|err| gate_failed(key, err))?
             }
         };
+        phase_timers::DECODE_NS.fetch_add(decode_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        phase_timers::DECODE_CALLS.fetch_add(1, Ordering::Relaxed);
         let entries = decoded.map_err(|source| corrupt(key, source))?;
         Ok(DecodedCatalog {
             entries,
@@ -2141,6 +2169,9 @@ impl SegmentFetcher {
             .slice(plan.val_range.0, plan.val_range.1)
             .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
         let before = timestamps.len();
+        // Issue #2468 stage 0: segment decode (TS/VAL page bytes -> typed
+        // sample columns).
+        let decode_start = Instant::now();
         let kind = decode_run_pages_soa(
             series_id,
             run,
@@ -2152,6 +2183,8 @@ impl SegmentFetcher {
             values,
         )
         .map_err(|source| corrupt(key, source))?;
+        phase_timers::DECODE_NS.fetch_add(decode_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        phase_timers::DECODE_CALLS.fetch_add(1, Ordering::Relaxed);
         // Typed-output footprint (i64 ts + f64 value per sample), not the
         // intermediate decompression buffer size: `ravel-segment` does not
         // expose the latter without an out-of-scope change (docs/query-engine.md
@@ -2189,9 +2222,15 @@ impl SegmentFetcher {
         let hist_bytes = regions
             .slice(plan.hist_range.0, plan.hist_range.1)
             .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+        // Issue #2468 stage 0: segment decode (TS/HIST page bytes -> typed
+        // sample columns). Not exercised by the stage 0 bench's two scalar
+        // metrics; instrumented for symmetry with `decode_run`.
+        let decode_start = Instant::now();
         let samples =
             decode_run_histogram_pages(series_id, run, &ts_bytes, &hist_bytes, self.limits)
                 .map_err(|source| corrupt(key, source))?;
+        phase_timers::DECODE_NS.fetch_add(decode_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        phase_timers::DECODE_CALLS.fetch_add(1, Ordering::Relaxed);
         let mut added_bytes: u64 = 0;
         for sample in samples {
             added_bytes = added_bytes.saturating_add(8 + histogram_value_footprint(&sample.value));
