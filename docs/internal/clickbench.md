@@ -455,7 +455,11 @@ cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
   ranged read; `byte-minimal` uses ranged reads wherever they save more bytes
   than a request costs; `cost-based` (the bench's default) derives the
   choice from the pass's store cost profile, which at the shipped reference
-  intra-region profile resolves to request-minimal behaviour; `latency-first`
+  intra-region profile no longer resolves to request-minimal behaviour: the
+  rate is the profile's time term, 6,300,000 bytes per request, and a narrow
+  projection reads an object ranged only where it skips more than the
+  31,500,000-byte projection break-even, so objects of that size or less are
+  still read whole; `latency-first`
   resolves the byte-minimizing quantities as an intent rather than from prices,
   and pays off only at the concurrency its trade was measured at, which a pass
   sets with `--fetch-concurrency`. So a bench run at

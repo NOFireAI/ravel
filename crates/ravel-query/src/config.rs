@@ -370,9 +370,10 @@ pub enum LogsFetchPolicy {
     /// larger of its price term and its time term ([`RateTerm`], ADR-2414
     /// decision A3). At the reference (intra-region) profile the price term
     /// saturates and the time term gives 6,300,000 bytes per request, so a
-    /// narrow projection of an object above the projection break-even
-    /// ([`ResolvedLogsFetch::projection_break_even_bytes`]) reads ranged and
-    /// every object at or below it reads whole; at egress prices it resolves
+    /// narrow projection reads an object ranged when the bytes it skips exceed
+    /// the projection break-even
+    /// ([`ResolvedLogsFetch::projection_break_even_bytes`]), and every object
+    /// at or below the break-even reads whole; at egress prices it resolves
     /// to a small byte cost the floors clamp. The default.
     #[default]
     CostBased,

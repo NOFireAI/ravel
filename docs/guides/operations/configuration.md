@@ -1062,7 +1062,7 @@ deployment against a loopback `--s3-endpoint`.
 |---|---|---|
 | `request-minimal` | Fewest object-store requests. An object at or under the fetch bound is read whole in one covering request with no footer probe; a larger object is read as covering sub-range requests. | The backend bills requests and not transfer, so a saved request is a saved dollar and the bytes it costs are free. |
 | `byte-minimal` | Fewest transferred bytes. Ranged reads wherever they save more bytes than a request is worth. | The backend bills egress, or the network is the constraint, so moved bytes are the cost that matters. |
-| `cost-based` | Whichever of the two is cheaper under the active store cost profile, resolved from the profile's prices at startup. | You want the shape the deployment's own prices imply. At the reference intra-region profile this resolves to request-minimal, on every store including a loopback one. |
+| `cost-based` | Whichever of the two is cheaper under the active store cost profile, resolved at startup from the profile's prices and its measured request timings. | You want the shape the deployment's own prices and timings imply. At the reference intra-region profile, on every store including a loopback one, a request costs 6,300,000 bytes (its time term), so a projection that skips more than 31,500,000 bytes of an object reads ranged and every object of 31,500,000 bytes or less reads whole. |
 | `latency-first` | Fewest transferred bytes, exactly like `byte-minimal`. An intent, not a tuning constant: it says spend requests to save wall time, and leaves how up to the concurrency you configure. | Cold wall-clock matters more than the request bill, and you are willing to raise the object-store GET concurrency and the SQL scan width explicitly to cash in the trade: measured over 3 reps on a 42-statement reference corpus, true cold in the warm-up-empty state, at GET concurrency 256: 5.30x the GET requests (570,752 against 107,781) for 52% less cold time, with a per-rep range of 50.3% to 54.2%. That ratio is a measurement of two code paths at one point in the project's history, not a property of the policy, and it has already moved once as the cost-based side changed; the decision record for the fetch objective names the exact build it was taken on. Re-measure against the build you run rather than treating it as a constant. |
 
 For any policy value a query returns exactly the same rows. Only request counts
@@ -1102,7 +1102,8 @@ process is against to know what an unset flag resolved to.
 ### The store cost profile
 
 `--store-cost-profile <path>` names a TOML file of this deployment's
-object-store prices. It is read only when resolving `cost-based`; no price ever
+object-store prices and, optionally, two request timings measured from its
+hosts. It is read only when resolving `cost-based`; no price ever
 reaches the fetch layer, which runs on byte quantities alone. The same file is
 read by `ravel-bench`, so the engine and the ledger price a run the same way.
 Omitted, the reference profile `s3-intra-region-2026` is used.
@@ -1114,6 +1115,9 @@ get_class_nanodollars = 400           # GET/SELECT/HEAD class, per request
 delete_class_nanodollars = 0          # optional; DELETE class, per request
 transfer_nanodollars_per_gib = 0      # egress, per GiB
 retrieval_nanodollars_per_gib = 0     # per-GiB retrieval on classes that bill it
+request_latency_micros = 70000        # optional; one request's latency
+per_connection_throughput_bytes_per_s = 90000000  # optional; set with the latency
+timings_measured = "2026-10-03, the 32 GB reference box of the reference suite, intra-region against S3"
 ```
 
 Prices are integer nanodollars, never floats, because they are exact decimal
@@ -1123,20 +1127,31 @@ transfer and retrieval free. One PUT costs 12.5 GETs at those prices. Every
 price is a modeled figure under a named profile, not a billed amount, and the
 same run under a different profile reprices to different numbers.
 
-Every field except `delete_class_nanodollars` is required. Loading is
-fail-closed: an unreadable file, invalid TOML, an unknown or misspelled key, or
-a blank name refuses startup with an error naming the flag. There is no silent
+The two timings are measured constants, not prices: the latency of one request
+from the deployment's hosts and the bytes one connection transfers per second,
+with `timings_measured` naming when and where they were measured. The
+reference values were measured on 2026-10-03 from the 32 GB reference box,
+intra-region against S3. They are optional, and set together or not at all.
+
+Every field except `delete_class_nanodollars` and the three timing fields is
+required. Loading is fail-closed: an unreadable file, invalid TOML, an unknown
+or misspelled key, one timing without the other (the error names the missing
+one), or a blank name refuses startup with an error naming the flag. There is no silent
 fallback to the reference prices, because a deployment that named a profile and
 got the reference prices instead would stamp one profile into its reports while
 resolving its fetch policy from another.
 
-**How `cost-based` resolves.** It converts the profile's prices into the one
-byte quantity the fetch layer runs on: how many transferred bytes one saved
-request is worth.
+**How `cost-based` resolves.** It converts the profile into the one byte
+quantity the fetch layer runs on: how many transferred bytes one saved request
+is worth. Two terms can answer that, and the larger one is the rate. The price
+term is what a request costs in bytes at the profile's prices; the time term is
+the bytes one connection could have moved during the request's latency.
 
 ```
-request_cost_bytes = get_class_nanodollars x BYTES_PER_GIB
-                     / (transfer_nanodollars_per_gib + retrieval_nanodollars_per_gib)
+price term = get_class_nanodollars x BYTES_PER_GIB
+             / (transfer_nanodollars_per_gib + retrieval_nanodollars_per_gib)
+time term  = request_latency_micros x per_connection_throughput_bytes_per_s / 1,000,000
+request_cost_bytes = the larger of the two terms
 ```
 
 `BYTES_PER_GIB` is 2^30, and the arithmetic multiplies before it divides in
@@ -1146,14 +1161,33 @@ way, so a profile with free transfer but priced retrieval still routes
 byte-minimally rather than reporting retrieval dollars a request-minimal plan
 would never have spent. The result is floor-rounded, held at a minimum of one
 byte, and clamped to the coalescing-gap and routing-threshold floors. Two cases
-saturate the rate, both meaning "read whole always": a zero denominator, where
-no per-byte cost exists, and quotient overflow from a near-free but nonzero
-per-byte price, which is logged at startup naming the profile.
+saturate the price term: a zero denominator, where no per-byte cost exists, and
+quotient overflow from a near-free but nonzero per-byte price. A saturated
+price term yields to the time term, so the rate itself saturates, meaning "read
+whole always", only on a profile with neither per-byte prices nor timings; that
+is logged at startup naming the profile. The startup line's `rate_term` field
+says which term the rate came from: `price`, `time` or `saturated` (or `flag`
+when `--logs-request-cost-bytes` set it).
 
-At the reference profile both per-byte prices are zero, so `cost-based` resolves
-to request-minimal behavior. At egress list prices (GET class $0.40 per million
-against $0.09 per GiB transfer plus $0.01 per GiB retrieval) it resolves to
-about 4.4 KB, which the floors then clamp.
+At the reference profile both per-byte prices are zero, so the price term
+saturates and the rate is the time term: 70,000 microseconds at 90,000,000
+bytes per second, 6,300,000 bytes. At egress list prices (GET class $0.40 per
+million against $0.09 per GiB transfer plus $0.01 per GiB retrieval) and no
+timings it resolves to 4,294 bytes, which the floors then clamp.
+
+Under `cost-based`, and only there, a finite rate also sets the projection
+break-even: the bytes a narrow projection must save before it is read ranged
+instead of whole, the larger of the routing threshold
+(`--logs-block-range-threshold`, 524,288 bytes by default) and five request
+costs. At the reference profile that is 31,500,000 bytes, so a one-column read
+of a 35 MB object reads its column ranges while every object of 31,500,000
+bytes or less, such as a 3 MB flush object, still reads whole. The same figure
+is the object size at or below which the ranged fetch reads the whole object
+anyway. The startup line reports it as `projection_break_even_bytes`, 0 under
+the other policies, which keep the routing threshold as the break-even. The
+coalescing gap, the largest hole between two wanted ranges that one request
+reads through, stays one request cost (at least 64 KiB) under every policy, so
+at the reference profile it is 6,300,000 bytes.
 
 ### The covering-read bound and flag precedence
 
@@ -1169,11 +1203,12 @@ rate. The policy is the intent layer and this is the expert escape hatch, so a
 deployment can select `cost-based` and still pin the one derived quantity when
 it has measured a better value.
 
-`request-minimal` additionally overrides an explicitly set
-`--logs-block-range-threshold`: it saturates both routing thresholds regardless
-of that flag, and a set-but-overridden threshold is logged at startup so the
-override is visible. Under the other two policies that flag keeps its normal
-role.
+A saturated rate additionally overrides an explicitly set
+`--logs-block-range-threshold`: `request-minimal`, and `cost-based` on a
+profile with neither per-byte prices nor timings, saturate both routing
+thresholds regardless of that flag, and a set-but-overridden threshold is
+logged at startup so the override is visible. Otherwise that flag keeps its
+normal role, including under `cost-based` at the reference profile.
 
 ### What this does not touch
 
