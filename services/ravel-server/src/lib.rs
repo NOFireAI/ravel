@@ -825,18 +825,9 @@ pub struct ServerConfig {
     /// set it to zero so a suite that shuts a server down on every case does not
     /// pay it hundreds of times.
     pub drain_settle_interval: Duration,
-    /// The coordinated ingest-lag bound, from `--max-ingest-lag` (default
-    /// [`DEFAULT_MAX_INGEST_LAG`], 2h), ADR-0051 section 4. One value drives BOTH
-    /// the catalog listing window (`ravel_catalog::CatalogConfig::max_ingest_lag_ns`,
-    /// set first) AND the three OTLP admission bounds
-    /// (`IngestLimits`/`LogIngestLimits`/`SpanIngestLimits::max_ingest_lag_ns`,
-    /// set second) at every ingest construction site [`start`] builds, so
-    /// ADR-0051's "widen the window first, then the admission bound" order holds
-    /// by construction and the two can never be set inconsistently. [`start`]
-    /// resolves it through [`resolve_ingest_lag`], which validates the pair
-    /// before building the catalog or any limits. Raise it to replay telemetry
-    /// older than the default after an outage or bulk import; the change reaches
-    /// the OTLP HTTP, OTLP gRPC, OTAP, Remote Write, and span surfaces at once.
+    /// The maximum ingest lag from `--max-ingest-lag`, which [`start`] resolves
+    /// into the catalog window and every admission bound; see
+    /// [`resolve_ingest_lag`].
     pub max_ingest_lag: Duration,
 }
 
@@ -892,17 +883,14 @@ fn record_drain_overrun() {
 /// so this server-side default cannot drift from the catalog listing window's
 /// own default; a test also pins it equal to the three OTLP limit defaults
 /// ([`ravel_otlp::IngestLimits`], [`ravel_otlp::LogIngestLimits`],
-/// [`ravel_otlp::SpanIngestLimits`]). One flag drives both the admission bound
-/// and the catalog window (see [`resolve_ingest_lag`]), so a deployment that
-/// leaves it unset sees byte-identical behavior to before the flag existed.
+/// [`ravel_otlp::SpanIngestLimits`]), so a deployment that leaves the flag unset
+/// sees byte-identical behavior to before it existed. How the value resolves
+/// into the catalog window: see [`resolve_ingest_lag`].
 pub const DEFAULT_MAX_INGEST_LAG: Duration =
     Duration::from_nanos(ravel_catalog::DEFAULT_MAX_INGEST_LAG_NS as u64);
 
-/// The coordinated ingest-lag pair resolved from a single `--max-ingest-lag`
-/// value (ADR-0051 section 4): the catalog listing window and the OTLP admission
-/// bound, in nanoseconds. Kept as two fields, not one, so the invariant that
-/// makes late data discoverable -- the admission bound must never exceed the
-/// listing window -- is a value a validator can check, not merely a convention.
+/// The catalog listing window and OTLP admission bound, in nanoseconds, that
+/// [`resolve_ingest_lag`] builds from one `--max-ingest-lag` value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IngestLagConfig {
     /// The catalog listing window (`ravel_catalog::CatalogConfig::max_ingest_lag_ns`):
@@ -934,17 +922,36 @@ pub struct IngestLagWindowError {
 }
 
 /// Build the coordinated ingest-lag pair from one resolved `--max-ingest-lag`
-/// duration. The catalog listing window is assigned FIRST, then the admission
-/// bound is derived from the same value, so ADR-0051's "widen the window first,
-/// then the admission bound" order holds by construction and the two can never
-/// be set inconsistently through this path. The validation is still run: it is
+/// duration (default [`DEFAULT_MAX_INGEST_LAG`], 2h), ADR-0051 section 4.
+///
+/// One value drives two bounds. The catalog listing window
+/// (`ravel_catalog::CatalogConfig::max_ingest_lag_ns`) is how far behind a
+/// query's range start the commit listing extends, and decides whether old
+/// data is discoverable. The OTLP admission bound
+/// (`IngestLimits`/`LogIngestLimits`/`SpanIngestLimits::max_ingest_lag_ns`) is
+/// how far behind ingest time an event may lag before it is rejected as too
+/// old, and decides whether old data is admitted. The admission bound must
+/// never exceed the window: a point admitted in the gap would be stored and
+/// acknowledged yet invisible to every non-token query. [`IngestLagConfig`]
+/// keeps the two as separate fields so that invariant is a value a validator
+/// can check, not merely a convention.
+///
+/// The catalog listing window is assigned FIRST, then the admission bound is
+/// derived from the same value, so ADR-0051's "widen the window first, then
+/// the admission bound" order holds by construction and the two can never be
+/// set inconsistently through this path. The validation is still run: it is
 /// the mechanical guard (the docs' "startup equality assertion") that a future
-/// edge which decouples the two is caught at startup rather than silently losing
-/// data, and it is what [`validate_ingest_lag_window`] pins by test.
+/// edge which decouples the two is caught at startup rather than silently
+/// losing data, and it is what [`validate_ingest_lag_window`] pins by test.
+///
+/// [`start`] calls this once, before it builds the catalog or any ingest
+/// limits, and passes the window to the catalog and the admission bound to
+/// every ingest surface (OTLP HTTP, OTLP gRPC, OTAP, Remote Write; metrics,
+/// logs, and spans). `main` also calls it, so the retention floor is validated
+/// against the same window the catalog resolves with. Raise the flag to replay
+/// telemetry older than the default after an outage or a bulk import.
 pub fn resolve_ingest_lag(max_ingest_lag: Duration) -> anyhow::Result<IngestLagConfig> {
     let ns = crate::config::duration_nanos_saturating(max_ingest_lag);
-    // Window first, then admission bound: both from the same source, so the
-    // admission bound cannot exceed the window by construction.
     let catalog_window_ns = ns;
     let admission_lag_ns = ns;
     validate_ingest_lag_window(catalog_window_ns, admission_lag_ns)?;
@@ -2416,11 +2423,8 @@ pub async fn start_with_heartbeat(
     // exactly in the query-serving modes that spawn one; carried out to
     // `Running` so `shutdown` can drain it.
     let mut running_audit_pipeline: Option<Arc<ravel_maintain::AuditPipeline>> = None;
-    // The coordinated ingest-lag pair (ADR-0051 section 4), resolved once here so
-    // the catalog listing window and every OTLP admission bound below are built
-    // from the same value. `resolve_ingest_lag` assigns the window first and
-    // derives the admission bound from it, so the "widen the window first" order
-    // holds by construction, and it validates the pair before either is built.
+    // Resolved once, before the catalog and every admission bound below are
+    // built from it; see `resolve_ingest_lag`.
     let ingest_lag = resolve_ingest_lag(config.max_ingest_lag)?;
     if let (Some(router), Some(log_router), Some(span_router)) =
         (&ingest_router, &log_ingest_router, &span_ingest_router)

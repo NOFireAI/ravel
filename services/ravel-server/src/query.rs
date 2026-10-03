@@ -123,10 +123,8 @@ pub fn fragments_json(entries: &[crate::distrib::FragmentStatEntry]) -> serde_js
 /// derive from take. The per-prefix bound is not exposed here: it has no flag,
 /// and a request holds a permit of each.
 ///
-/// `max_ingest_lag_ns` is the catalog listing window (ADR-0051 section 4), from
-/// `--max-ingest-lag`. `None` leaves `CatalogConfig`'s own 2h default; `Some(ns)`
-/// is the value `start` keeps equal to the OTLP admission bound so admitted late
-/// data stays discoverable.
+/// `max_ingest_lag_ns` overrides the catalog listing window, `None` keeping
+/// `CatalogConfig`'s own 2h default; see [`crate::resolve_ingest_lag`].
 ///
 /// `max_flush_delay` is the server's resolved `--max-flush-delay` (issue
 /// #1735), the same cadence every ingest pipeline flushes on. It sizes
@@ -201,10 +199,7 @@ pub fn build_catalog(
         cache_capacity_per_tenant,
         ..server_catalog_config_base()
     };
-    // The catalog listing window (ADR-0051 section 4), from `--max-ingest-lag`.
-    // `None` leaves `CatalogConfig`'s own 2h default; `Some(ns)` is the value
-    // `start` resolves through `resolve_ingest_lag`, kept equal to the OTLP
-    // admission bound so admitted late data stays discoverable.
+    // Override the catalog listing window; see `crate::resolve_ingest_lag`.
     if let Some(ns) = max_ingest_lag_ns {
         catalog_config.max_ingest_lag_ns = ns;
     }
