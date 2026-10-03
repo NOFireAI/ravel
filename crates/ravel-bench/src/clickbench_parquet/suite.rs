@@ -84,6 +84,13 @@ pub enum SuiteError {
          \"cardinality\" without a reason"
     )]
     CardinalityWithoutReason { number: u32 },
+    /// A `[[statement]]` override declared `ci_expected_error` with no
+    /// `reason`: an expected failure needs to say what Ravel is missing.
+    #[error(
+        "benchmarks/clickbench/parquet/suite.toml: statement {number} declares \
+         ci_expected_error without a reason"
+    )]
+    ExpectedErrorWithoutReason { number: u32 },
 }
 
 /// `suite.toml`'s `[table]` section: the Ravel DDL template that mounts the
@@ -136,10 +143,17 @@ pub struct StatementOverride {
     #[serde(default)]
     pub compare: Option<String>,
     /// Required alongside `compare = "cardinality"`
-    /// ([`SuiteError::CardinalityWithoutReason`] otherwise); unused
-    /// otherwise.
+    /// ([`SuiteError::CardinalityWithoutReason`] otherwise) and alongside
+    /// `ci_expected_error` ([`SuiteError::ExpectedErrorWithoutReason`]
+    /// otherwise); unused otherwise.
     #[serde(default)]
     pub reason: Option<String>,
+    /// A stable prefix of the error Ravel returns for this statement. When
+    /// set, the statement is not compared: the acceptance test asserts that
+    /// each Ravel arm fails with an error starting with this text, so the
+    /// statement starting to answer (or failing differently) turns it red.
+    #[serde(default)]
+    pub ci_expected_error: Option<String>,
     /// Why this statement's float cells are allowed to differ by up to
     /// `float_max_ulps` (e.g. a sequential-fold `avg`, ADR-0022). Declaring
     /// one of `float_reason`/`float_max_ulps` without the other is a typed
@@ -259,6 +273,11 @@ pub fn load(queries_sql: &str, suite_toml: &str) -> Result<Suite, SuiteError> {
                 });
             }
         }
+        if over.ci_expected_error.is_some() && over.reason.is_none() {
+            return Err(SuiteError::ExpectedErrorWithoutReason {
+                number: over.number,
+            });
+        }
     }
     Ok(Suite {
         statements: parse_statements(queries_sql),
@@ -331,9 +350,8 @@ mod tests {
         assert!(rendered.contains("CREATE EXTERNAL TABLE hits"));
     }
 
-    /// `suite.toml`'s one override (statement 43) loads with the exact key
-    /// the comparator consumes, and declares no float tolerance (none of
-    /// the frozen corpus's statements do yet).
+    /// Statement 43's override loads with the exact key the comparator
+    /// consumes, and declares no float tolerance.
     #[test]
     fn statement_43_override_loads() {
         let suite = load_default().expect("pinned corpus loads");
@@ -342,6 +360,52 @@ mod tests {
         assert!(suite.override_for(1).is_none());
         assert_eq!(over.float_tolerance(), None);
         assert!(!over.is_cardinality_only());
+        assert_eq!(over.ci_expected_error, None);
+    }
+
+    /// The checked-in statement 4 override declares the sequential-fold avg
+    /// tolerance at exactly 2 ULPs.
+    #[test]
+    fn statement_4_float_tolerance_loads() {
+        let suite = load_default().expect("pinned corpus loads");
+        let over = suite.override_for(4).expect("Q4 override present");
+        let tolerance = over.float_tolerance().expect("Q4 declares a tolerance");
+        assert_eq!(tolerance.reason, "Ravel sequential-fold avg (ADR-0022)");
+        assert_eq!(tolerance.max_ulps, 2);
+    }
+
+    /// The checked-in statement 19 override declares its expected error
+    /// prefix together with a reason.
+    #[test]
+    fn statement_19_expected_error_loads() {
+        let suite = load_default().expect("pinned corpus loads");
+        let over = suite.override_for(19).expect("Q19 override present");
+        assert_eq!(
+            over.ci_expected_error.as_deref(),
+            Some(
+                "query failed: SQL planning failed: This feature is not implemented: \
+                 Extract not supported by ExprPlanner"
+            )
+        );
+        assert!(over.reason.is_some());
+    }
+
+    /// `ci_expected_error` with no `reason` is a typed load error.
+    #[test]
+    fn expected_error_without_reason_is_refused() {
+        let toml = r#"
+            [table]
+            template = "CREATE EXTERNAL TABLE hits () STORED AS PARQUET LOCATION '{location}'"
+
+            [[statement]]
+            number = 19
+            ci_expected_error = "query failed"
+        "#;
+        let err = load(QUERIES_SQL, toml).expect_err("reason-less expected error is refused");
+        assert!(matches!(
+            err,
+            SuiteError::ExpectedErrorWithoutReason { number: 19 }
+        ));
     }
 
     /// A `[[statement]]` block declaring only `float_reason` (no

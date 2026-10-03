@@ -21,6 +21,15 @@
 #     (Q25, Q27). Q18 also compares by cardinality, but needs no override:
 #     it has a LIMIT and no ORDER BY at all, which the comparator already
 #     treats as cardinality-only.
+#
+# Two more statements carry overrides for where Ravel's answer differs from
+# the reference engine's:
+#
+#   * `float_reason` with `float_max_ulps`: an AVG column whose value differs
+#     from the reference only in its last bits (Q4).
+#   * `ci_expected_error` with a required `reason`: Ravel fails the statement;
+#     the acceptance test asserts each Ravel arm's error starts with this
+#     prefix instead of comparing results (Q19).
 
 [table]
 # `{location}` is substituted with the fixture's hits.parquet object URL.
@@ -63,3 +72,18 @@ reason = "ORDER BY key not projected; rows past a tie on EventTime cannot be ide
 number = 27
 compare = "cardinality"
 reason = "ORDER BY key not projected; rows past a tie on EventTime cannot be identified from the output"
+
+# Q4: `AVG("UserID")` over the fixture differs from the reference by 1 ULP on
+# the four-part layout and 2 ULPs on the single-file layout.
+[[statement]]
+number = 4
+float_reason = "Ravel sequential-fold avg (ADR-0022)"
+float_max_ulps = 2
+
+# Q19: `extract(minute FROM ...)` does not plan. The workspace links
+# datafusion 54 with default features off, so no datetime ExprPlanner is
+# registered for EXTRACT.
+[[statement]]
+number = 19
+ci_expected_error = "query failed: SQL planning failed: This feature is not implemented: Extract not supported by ExprPlanner"
+reason = "EXTRACT has no ExprPlanner: datafusion is built without its datetime expressions"
