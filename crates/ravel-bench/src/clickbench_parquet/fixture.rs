@@ -1297,7 +1297,10 @@ mod tests {
 
         for (name, bytes_before) in names.iter().zip(before) {
             let bytes_after = std::fs::read(dir.path().join(name)).expect("read after");
-            assert_eq!(bytes_before, bytes_after, "{name} differs after overwrite in place");
+            assert_eq!(
+                bytes_before, bytes_after,
+                "{name} differs after overwrite in place"
+            );
         }
     }
 }
