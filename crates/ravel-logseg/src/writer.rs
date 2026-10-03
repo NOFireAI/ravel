@@ -1845,6 +1845,7 @@ impl RlogWriter {
         }
 
         let (blocks_bytes, l0, page_dir) = blocks.finish_checked()?;
+        stage0::fire(stage0_mode, "after_finish_checked");
         let skip = SkipIndex::build(l0);
         if section_sample {
             tsamp[3] = Some(stage0::sample());
