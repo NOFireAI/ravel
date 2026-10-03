@@ -420,11 +420,11 @@ spec:
 The block expects four Secrets in the `RavelCluster`'s namespace. The
 operator mounts them and reads only their `resourceVersion` (a metadata-only
 read) to detect a rotation; it never loads their values, and never creates
-or rotates them. A referenced Secret that does not exist does not fail the
-whole reconcile: the operator holds back only the query tier (its running
-pods keep serving), keeps the fragment NetworkPolicy in place, and records a
-`Degraded` condition naming the Secret, while the gateway and maintain
-Deployments reconcile as usual.
+or rotates them. A referenced Secret missing from the namespace holds back
+only the query Deployment (its running pods keep serving on their current
+spec): the operator keeps the fragment NetworkPolicy in place, records a
+`Degraded` condition naming the Secret, and reconciles the gateway and
+maintain Deployments as usual.
 
 | Reference | Secret keys | Mounted at | Flag |
 |---|---|---|---|
@@ -526,14 +526,14 @@ fragment CA.
 
 Upgrading the operator to a version with this block: apply
 `deploy/k8s/operator/rbac.yaml` before rolling out the new operator image.
-The operator deletes the fragment NetworkPolicy on every reconcile of a
-cluster without the block, and without the `networkpolicies` grant that
-delete fails and stops reconciliation of every `RavelCluster`. A cluster
-with the block already enabled sees one query rollout on the upgrade: the
-four Secrets' `resourceVersion`s now feed the query pod template's checksum
-(see below), which moves it once. If one of those four Secrets is missing,
-that upgrade pass holds the query tier back and reports `Degraded` naming the
-Secret, while the gateway and maintain Deployments still reconcile.
+On a cluster without the block, a reconcile whose query rollout is complete
+issues a delete for any fragment NetworkPolicy, and without the
+`networkpolicies` grant that delete fails the reconcile. A cluster with the
+block already enabled sees one query rollout on the upgrade: the four
+Secrets' `resourceVersion`s now feed the query pod template's checksum (see
+below), which moves it once. If one of those four Secrets is missing, that
+upgrade pass holds the query Deployment back and reports `Degraded` naming
+the Secret, while the gateway and maintain Deployments still reconcile.
 
 `ravel-server` reads all four files once at startup, so the four Secrets'
 `resourceVersion`s feed the query pod template's secrets checksum, the same
