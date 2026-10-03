@@ -249,6 +249,9 @@ async fn metrics_render_queued_flush_families_named_by_the_flag_help() {
             ("ravel_ingest_queued_flushes", "gauge"),
             ("ravel_ingest_flush_trigger_deferred_total", "counter"),
             ("ravel_ingest_deferral_cap_refused_total", "counter"),
+            ("ravel_ingest_rerouted_flushes_total", "counter"),
+            ("ravel_ingest_hand_back_failures_total", "counter"),
+            ("ravel_ingest_teardown_unscanned_writes_total", "counter"),
         ] {
             assert_eq!(
                 body.matches(&format!("# TYPE {family} {metric_type}"))

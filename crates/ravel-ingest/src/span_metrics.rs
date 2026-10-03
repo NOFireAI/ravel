@@ -172,6 +172,14 @@ pub struct SpanIngestMetrics {
     /// bounded grace window (ADR-0052 degraded-safe fallback), the
     /// span-pipeline counterpart of `IngestMetrics::grace_extended_stale_flushes`.
     grace_extended_stale_flushes: AtomicU64,
+    /// Flushes handed back instead of written outside the scan set of the hour
+    /// they pinned (ADR-1642 scan-set amendment), the span-pipeline
+    /// counterpart of `IngestMetrics::rerouted_flushes`.
+    rerouted_flushes: AtomicU64,
+    /// The counterpart of `IngestMetrics::hand_back_failures`.
+    hand_back_failures: AtomicU64,
+    /// The counterpart of `IngestMetrics::teardown_unscanned_writes`.
+    teardown_unscanned_writes: AtomicU64,
     /// Per-shard count of flushes whose flush task has been spawned but has
     /// not yet acked its waiters (ADR-0067 decisions 1-2, the span-pipeline
     /// counterpart of [`crate::IngestMetrics`]'s own gauge), counted from the
@@ -266,6 +274,16 @@ pub struct SpanIngestMetricsSnapshot {
     pub deferral_cap_refused: u64,
     pub stale_provisioning_flushes: u64,
     pub grace_extended_stale_flushes: u64,
+    /// Flushes handed back instead of written outside the scan set (ADR-1642
+    /// scan-set amendment).
+    pub rerouted_flushes: u64,
+    /// Hand-back episodes that left rows in the source buffer because a
+    /// target shard was not live. Exported as
+    /// `ravel_ingest_hand_back_failures_total`.
+    pub hand_back_failures: u64,
+    /// Teardown flushes written in place outside the scan set. Exported as
+    /// `ravel_ingest_teardown_unscanned_writes_total`.
+    pub teardown_unscanned_writes: u64,
     /// Sum across shards of [`SpanIngestMetrics::in_flight_flushes_by_shard`]
     /// at snapshot time. The per-shard breakdown does not fit this struct's
     /// flat Copy shape; call `in_flight_flushes_by_shard` directly for that.
@@ -571,6 +589,29 @@ impl SpanIngestMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One flush handed back instead of written outside the scan set
+    /// (ADR-1642 scan-set amendment).
+    pub(crate) fn record_rerouted_flush(&self) {
+        self.rerouted_flushes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Flushes handed back so far, read by the router's drain.
+    pub(crate) fn rerouted_flushes(&self) -> u64 {
+        self.rerouted_flushes.load(Ordering::Relaxed)
+    }
+
+    /// One hand-back episode that kept rows in the source buffer because a
+    /// target shard was not live.
+    pub(crate) fn record_hand_back_failure(&self) {
+        self.hand_back_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One teardown flush written in place outside the scan set.
+    pub(crate) fn record_teardown_unscanned_write(&self) {
+        self.teardown_unscanned_writes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> SpanIngestMetricsSnapshot {
         let skew = self.shard_skew_by_shard();
         SpanIngestMetricsSnapshot {
@@ -600,6 +641,9 @@ impl SpanIngestMetrics {
             deferral_cap_refused: self.deferral_cap_refused.load(Ordering::Relaxed),
             stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
             grace_extended_stale_flushes: self.grace_extended_stale_flushes.load(Ordering::Relaxed),
+            rerouted_flushes: self.rerouted_flushes.load(Ordering::Relaxed),
+            hand_back_failures: self.hand_back_failures.load(Ordering::Relaxed),
+            teardown_unscanned_writes: self.teardown_unscanned_writes.load(Ordering::Relaxed),
             in_flight_flushes_total: self
                 .in_flight_flushes_by_shard()
                 .into_iter()

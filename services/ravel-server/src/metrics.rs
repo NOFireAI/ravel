@@ -985,8 +985,19 @@ pub struct IngestPipelineSnapshot {
     /// client as a retryable error carrying the durable tokens.
     pub partial_writes: u64,
     /// Flushes failed closed because the router's cached provisioning view for
-    /// the tenant was older than the refresh interval `C` (ADR-0052 section 3).
+    /// the tenant was older than the refresh interval `C` (ADR-0052 section 3),
+    /// plus buffers whose flush stayed closed at flush open because the view
+    /// was past its trust horizon, counted once per buffer per episode.
     pub stale_provisioning_flushes: u64,
+    /// Flushes handed back to the tenant's current shard generation instead of
+    /// written outside the read-side scan set of their ingest hour.
+    pub rerouted_flushes: u64,
+    /// Hand-back episodes that kept rows in the source buffer because a target
+    /// shard was dead, condemned or closed.
+    pub hand_back_failures: u64,
+    /// Teardown flushes written in place under a shard index readers do not
+    /// scan for their ingest hour.
+    pub teardown_unscanned_writes: u64,
     /// Write-side POSTINGS counters (ADR-0049). `Some` only for the
     /// log pipeline; `None` for metrics and spans, which build no POSTINGS
     /// section, so the postings family renders no sample for them.
@@ -1156,6 +1167,9 @@ impl IngestPipelineSnapshot {
             shards_condemned: snapshot.shards_condemned,
             partial_writes: snapshot.partial_writes,
             stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
+            rerouted_flushes: snapshot.rerouted_flushes,
+            hand_back_failures: snapshot.hand_back_failures,
+            teardown_unscanned_writes: snapshot.teardown_unscanned_writes,
             postings: None,
             metadata_sink: Some(MetadataSinkCounters {
                 flush_gets_total: snapshot.metadata_flush_gets_total,
@@ -1205,6 +1219,9 @@ impl IngestPipelineSnapshot {
             shards_condemned: snapshot.shards_condemned,
             partial_writes: snapshot.partial_writes,
             stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
+            rerouted_flushes: snapshot.rerouted_flushes,
+            hand_back_failures: snapshot.hand_back_failures,
+            teardown_unscanned_writes: snapshot.teardown_unscanned_writes,
             postings: Some(PostingsCounters {
                 objects: snapshot.postings_objects,
                 bytes_total: snapshot.postings_bytes_total,
@@ -1253,6 +1270,9 @@ impl IngestPipelineSnapshot {
             shards_condemned: snapshot.shards_condemned,
             partial_writes: snapshot.partial_writes,
             stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
+            rerouted_flushes: snapshot.rerouted_flushes,
+            hand_back_failures: snapshot.hand_back_failures,
+            teardown_unscanned_writes: snapshot.teardown_unscanned_writes,
             postings: None,
             metadata_sink: None,
             exemplars: None,
@@ -1548,8 +1568,11 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
     write_header(
         out,
         "ravel_ingest_stale_provisioning_flushes_total",
-        "Flushes failed closed because the router's cached shard-generation view was older than \
-         the refresh interval C (ADR-0052 section 3), by signal.",
+        "Refusals on a shard-generation view the router cannot trust, by signal, counting two \
+         cases: a write whose cached view was older than the refresh interval C, whose re-read \
+         failed and that the grace window could not cover (ADR-0052 section 3), once per refused \
+         write; and a buffer whose flush stays closed at flush open because its view is missing \
+         or past its trust horizon, once per buffer until a re-read confirms the view.",
         "counter",
     );
     for pipeline in pipelines {
@@ -1578,6 +1601,59 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
             "ravel_ingest_grace_extended_stale_flushes_total",
             &labels(mode, pipeline.signal),
             pipeline.grace_extended_stale_flushes,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_ingest_rerouted_flushes_total",
+        "Flushes that would have written under a shard index outside the read-side scan set of \
+         the ingest hour they pinned and handed their rows to the tenant's current shard \
+         generation instead, by signal.",
+        "counter",
+    );
+    for pipeline in pipelines {
+        write_sample(
+            out,
+            "ravel_ingest_rerouted_flushes_total",
+            &labels(mode, pipeline.signal),
+            pipeline.rerouted_flushes,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_ingest_hand_back_failures_total",
+        "Hand-backs that could not deliver rows because a target shard of the tenant's current \
+         generation was dead, condemned or closed, by signal, counted once per buffer until a \
+         hand-back from it delivers. The rows stay in the source shard's buffer and are retried; \
+         a log or span target stays condemned until restart, so a rise there means rows waiting \
+         for the shutdown drain.",
+        "counter",
+    );
+    for pipeline in pipelines {
+        write_sample(
+            out,
+            "ravel_ingest_hand_back_failures_total",
+            &labels(mode, pipeline.signal),
+            pipeline.hand_back_failures,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_ingest_teardown_unscanned_writes_total",
+        "Flushes a shutdown or channel-close drain wrote in place under a shard index readers do \
+         not scan for their ingest hour, because no live target shard could take the rows, by \
+         signal. Those rows are stored and returned by no query.",
+        "counter",
+    );
+    for pipeline in pipelines {
+        write_sample(
+            out,
+            "ravel_ingest_teardown_unscanned_writes_total",
+            &labels(mode, pipeline.signal),
+            pipeline.teardown_unscanned_writes,
         );
     }
 

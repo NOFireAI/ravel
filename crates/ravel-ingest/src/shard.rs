@@ -19,8 +19,8 @@
 //! adaptive age trigger (ADR-0067
 //! decision 3) is `age_threshold_ns`/`adaptive_age_threshold_ns` below.
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -39,6 +39,7 @@ use ravel_segment::{
 };
 use ravel_types::{
     CommitToken, ExemplarCap, Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId,
+    shard_for,
 };
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
@@ -54,6 +55,9 @@ use crate::config::{
 };
 use crate::deferral::{DEFERRAL_CAP_ABANDONED, DeferralCapFlag, deferral_cap_reached};
 use crate::error::WriteError;
+use crate::generation::{
+    FlushScope, HandBackArrival, SCAN_SET_HANDBACK_ABANDONED, ScanCheck, reread_and_check,
+};
 use crate::metrics::{FlushTrigger, IngestMetrics};
 #[cfg(feature = "stage-timing")]
 use crate::stage_timing::{MetricStage, MetricStageTimings};
@@ -80,6 +84,18 @@ pub(crate) enum ShardMsg {
         /// test write that bypasses the budget (production always charges via
         /// [`crate::IngestRouter`]).
         charge: Option<Arc<IngestByteCharge>>,
+    },
+    /// Rows a retiring shard handed back at flush open instead of writing them
+    /// outside the scan set of the hour they would have pinned (ADR-1642
+    /// scan-set amendment), routed to this shard under the tenant's current
+    /// generation. Already admitted and charged: the charges travel with them,
+    /// and no strict waiter rides along, since the source answered it.
+    HandBack {
+        tenant: TenantId,
+        points: Vec<IngestPoint>,
+        exemplars: Vec<IngestExemplar>,
+        charges: Vec<Arc<IngestByteCharge>>,
+        arrival: HandBackArrival,
     },
     /// Flush every buffered tenant now, regardless of size/age thresholds.
     FlushNow { done: oneshot::Sender<()> },
@@ -200,6 +216,13 @@ struct TenantBuf {
     /// cap, carried across every later refusal so the deferral is measured
     /// from its start (issue #1916). `None` for a buffer never refused.
     deferred_since_ns: Option<i64>,
+    /// Set once this buffer's flush was kept closed on a generation view the
+    /// router cannot trust, so the episode counts once on
+    /// `stale_provisioning_flushes` however many triggers retry it.
+    stale_view_counted: bool,
+    /// Set once a hand-back from this buffer found a target shard not live, so
+    /// the episode counts and logs once however many triggers retry it.
+    hand_back_blocked: bool,
 }
 
 impl TenantBuf {
@@ -252,6 +275,14 @@ impl TenantBuf {
     /// losing series' samples under the winning label set (the id-keyed
     /// `HashMap` below cannot tell them apart), which ADR-0005 forbids.
     fn merge(&mut self, points: Vec<IngestPoint>, arrival_ns: i64) -> Result<usize, WriteError> {
+        let bytes_added = self.merge_unstamped(points)?;
+        self.note_arrival(arrival_ns);
+        Ok(bytes_added)
+    }
+
+    /// [`TenantBuf::merge`] without the arrival stamp, for handed-back rows
+    /// whose arrival bookkeeping travels with them ([`HandBackArrival`]).
+    fn merge_unstamped(&mut self, points: Vec<IngestPoint>) -> Result<usize, WriteError> {
         let mut batch_claims: HashMap<SeriesId, (&Arc<LabelSet>, ValueKind)> = HashMap::new();
         for point in &points {
             let point_kind = point.value.kind();
@@ -288,7 +319,6 @@ impl TenantBuf {
         }
         drop(batch_claims);
 
-        self.note_arrival(arrival_ns);
         let mut bytes_added = 0usize;
         let mut object_bytes_added = 0usize;
         for point in points {
@@ -987,6 +1017,17 @@ pub(crate) struct ShardActor {
     /// router refuses a write to a shard at the deferral cap before enqueue,
     /// buffered mode included.
     cap_flag: DeferralCapFlag,
+    /// The router's generation state, for the scan-set check at flush open
+    /// and the hand-back it may lead to (ADR-1642 scan-set amendment).
+    scope: Arc<dyn FlushScope<ShardMsg>>,
+    /// Set by a hand-back and cleared by the next flush that opens in place,
+    /// so a run of hand-backs on this shard logs one WARN.
+    handing_back: bool,
+    /// Inside a drain, the tenants whose provisioning record this drain has
+    /// already re-read after the scan-set check found no trusted view, so each
+    /// is re-read once per drain rather than once per pass. `None` outside a
+    /// drain, where an untrusted view only starts a background re-read.
+    drain_rereads: Option<HashSet<TenantHash>>,
 }
 
 impl ShardActor {
@@ -1005,6 +1046,7 @@ impl ShardActor {
         flush_floor_ns: Arc<AtomicI64>,
         backstop_ceiling: BufferBudgetCeiling,
         cap_flag: DeferralCapFlag,
+        scope: Arc<dyn FlushScope<ShardMsg>>,
         #[cfg(feature = "stage-timing")] stage_timings: Arc<MetricStageTimings>,
     ) -> Self {
         // A fresh incarnation starts with no buffers, so nothing it inherits
@@ -1044,6 +1086,9 @@ impl ShardActor {
             deferral_cap_ns: config.flush_deferral_cap_ns(),
             oldest_deferral_ns: None,
             cap_flag,
+            scope,
+            handing_back: false,
+            drain_rereads: None,
         }
     }
 
@@ -1085,6 +1130,10 @@ impl ShardActor {
                             let on_actor_ns =
                                 self.clock.now_ns().saturating_sub(started_ns).max(0) as u64;
                             self.metrics.record_shard_processed(self.shard, on_actor_ns);
+                        }
+                        Some(ShardMsg::HandBack { tenant, points, exemplars, charges, arrival }) => {
+                            self.handle_hand_back(tenant, points, exemplars, charges, arrival)
+                                .await;
                         }
                         Some(ShardMsg::FlushNow { done }) => {
                             // Not a teardown: this arm does not break, so the
@@ -1221,6 +1270,210 @@ impl ShardActor {
             self.flush_tenant(tenant, buf, FlushTrigger::Size, LagCheck::Enforced)
                 .await;
         }
+    }
+
+    /// Merges rows another shard handed back at flush open (ADR-1642 scan-set
+    /// amendment). They skip the deferral-cap refusal a new strict append
+    /// gets, since they carry no waiter and were admitted once already, and
+    /// their charges join this buffer's to be refunded by its flush. The
+    /// arrival bookkeeping they carry widens this buffer's, so its age trigger
+    /// sees how long they have waited.
+    async fn handle_hand_back(
+        &mut self,
+        tenant: TenantId,
+        points: Vec<IngestPoint>,
+        exemplars: Vec<IngestExemplar>,
+        charges: Vec<Arc<IngestByteCharge>>,
+        arrival: HandBackArrival,
+    ) {
+        if !self.absorb_rows(&tenant, points, exemplars, charges, arrival) {
+            return;
+        }
+        let should_flush = self.tenants.get(&tenant).is_some_and(|buf| {
+            size_trigger_fires(
+                buf.flush_est_bytes,
+                buf.est_bytes,
+                &self.config,
+                self.backstop_ceiling.get(),
+            )
+        });
+        if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
+            self.flush_tenant(tenant, buf, FlushTrigger::Size, LagCheck::Enforced)
+                .await;
+        }
+    }
+
+    /// Merges rows that are already admitted and charged into `tenant`'s
+    /// buffer: a hand-back arriving here, or rows a failed hand-back send
+    /// returned to this shard. Returns `false` when the rows were dropped on a
+    /// collision.
+    fn absorb_rows(
+        &mut self,
+        tenant: &TenantId,
+        points: Vec<IngestPoint>,
+        exemplars: Vec<IngestExemplar>,
+        charges: Vec<Arc<IngestByteCharge>>,
+        arrival: HandBackArrival,
+    ) -> bool {
+        let buf = self.tenants.entry(tenant.clone()).or_default();
+        if let Err(err) = buf.merge_unstamped(points) {
+            // A series id claiming a second label set is the ADR-0005 collision
+            // a fresh write would have been refused for; there is no caller
+            // left to answer, so the rows are dropped loudly.
+            self.metrics.record_series_id_collision();
+            tracing::error!(
+                shard = self.shard,
+                error = %err,
+                "ravel-ingest: handed-back rows collide with this shard's buffer; dropping them"
+            );
+            return false;
+        }
+        buf.absorb_exemplars(exemplars);
+        buf.charges.extend(charges);
+        arrival.fold_into(
+            &mut buf.oldest_arrival_ns,
+            &mut buf.min_ingest_ts_ns,
+            &mut buf.max_ingest_ts_ns,
+        );
+        true
+    }
+
+    /// Hands `buf`'s rows to the shards of the `count`-shard set that
+    /// `shard_for` routes them to, instead of writing them under this shard's
+    /// index outside the scan set of the hour it would pin (ADR-1642 scan-set
+    /// amendment). Every target's liveness is checked before anything is taken
+    /// apart, so a dead or closed target returns the buffer untouched for the
+    /// caller to keep. Past that point strict waiters are answered `Abandoned`
+    /// (outcome unknown: the rows are written, by another shard), and each
+    /// target gets a clone of every charge, so each is refunded once, by the
+    /// last of those flushes, and never charged twice.
+    ///
+    /// A target that dies after the liveness check fails its send, which
+    /// returns the message: its rows go back into this shard's buffer for the
+    /// tenant with the charges, once however many sends failed, so the next
+    /// flush attempt retries the hand-back. Their waiters were already
+    /// answered, so nothing is acknowledged twice. Returns whether any target
+    /// took rows.
+    ///
+    /// The send awaits the target's mailbox on this actor. A hand-back always
+    /// goes to a strictly smaller set than this one (the target count is at
+    /// most `scan_count`, which this index is not below), so a chain of such
+    /// waits ends and cannot cycle.
+    async fn hand_back(
+        &mut self,
+        tenant: &TenantId,
+        mut buf: TenantBuf,
+        count: u32,
+    ) -> Result<bool, TenantBuf> {
+        let mut targets: Vec<u32> = buf
+            .series
+            .keys()
+            .chain(buf.exemplars.iter().map(|e| &e.series_id))
+            .map(|id| shard_for(id, count))
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        let mut senders = Vec::with_capacity(targets.len());
+        for &target in &targets {
+            match self.scope.live_sender(count, target) {
+                Some(tx) => senders.push(tx),
+                None => return Err(buf),
+            }
+        }
+
+        let waiters = std::mem::take(&mut buf.waiters);
+        self.ctx.ack_waiters(
+            waiters,
+            Err(WriteError::Abandoned(SCAN_SET_HANDBACK_ABANDONED.into())),
+        );
+        let TenantBuf {
+            series,
+            exemplars,
+            oldest_arrival_ns,
+            min_ingest_ts_ns,
+            max_ingest_ts_ns,
+            charges,
+            deferred_since_ns,
+            hand_back_blocked,
+            ..
+        } = buf;
+        let arrival = HandBackArrival {
+            oldest_arrival_ns,
+            min_ingest_ts_ns,
+            max_ingest_ts_ns,
+        };
+        let mut points: HashMap<u32, Vec<IngestPoint>> = HashMap::new();
+        for (series_id, accum) in series {
+            let into = points.entry(shard_for(&series_id, count)).or_default();
+            let labels = accum.labels;
+            match accum.values {
+                SeriesAccumValues::Scalar(samples) => {
+                    into.extend(samples.into_iter().map(|s| IngestPoint {
+                        series_id,
+                        labels: Arc::clone(&labels),
+                        value: IngestValue::Scalar(s),
+                    }))
+                }
+                SeriesAccumValues::Histogram(samples) => {
+                    into.extend(samples.into_iter().map(|h| IngestPoint {
+                        series_id,
+                        labels: Arc::clone(&labels),
+                        value: IngestValue::Histogram(h),
+                    }))
+                }
+            }
+        }
+        let mut exemplars_by: HashMap<u32, Vec<IngestExemplar>> = HashMap::new();
+        for exemplar in exemplars {
+            exemplars_by
+                .entry(shard_for(&exemplar.series_id, count))
+                .or_default()
+                .push(exemplar);
+        }
+        let mut delivered = false;
+        let mut kept = false;
+        for (target, tx) in targets.into_iter().zip(senders) {
+            let msg = ShardMsg::HandBack {
+                tenant: tenant.clone(),
+                points: points.remove(&target).unwrap_or_default(),
+                exemplars: exemplars_by.remove(&target).unwrap_or_default(),
+                charges: charges.clone(),
+                arrival,
+            };
+            let Err(mpsc::error::SendError(msg)) = tx.send(msg).await else {
+                delivered = true;
+                continue;
+            };
+            let ShardMsg::HandBack {
+                points,
+                exemplars,
+                charges: returned,
+                ..
+            } = msg
+            else {
+                continue;
+            };
+            let charges = if kept { Vec::new() } else { returned };
+            if self.absorb_rows(tenant, points, exemplars, charges, arrival)
+                && let Some(buf) = self.tenants.get_mut(tenant)
+            {
+                buf.deferred_since_ns = buf.deferred_since_ns.or(deferred_since_ns);
+                buf.hand_back_blocked = true;
+            }
+            if !kept && !hand_back_blocked {
+                self.metrics.record_hand_back_failure();
+                tracing::warn!(
+                    signal = ?self.ctx.signal,
+                    shard = self.shard,
+                    target,
+                    tenant_hash = %tenant.hash().to_hex(),
+                    "ravel-ingest: hand-back target shard closed before its rows arrived; \
+                     keeping them in this shard's buffer for the next flush to retry"
+                );
+            }
+            kept = true;
+        }
+        Ok(delivered)
     }
 
     /// A buffer with a strict-mode waiter, or one whose flush would write at
@@ -1384,6 +1637,7 @@ impl ShardActor {
     /// the residue is still in the tenant map with its arrival bookkeeping and
     /// the actor is still running to flush it.
     async fn flush_all(&mut self, trigger: FlushTrigger, intent: DrainIntent) {
+        self.drain_rereads = Some(HashSet::new());
         let mut passes = 0;
         while !self.tenants.is_empty() && passes < MAX_FLUSH_ALL_PASSES {
             self.flush_all_pass(trigger, LagCheck::Enforced).await;
@@ -1427,6 +1681,7 @@ impl ShardActor {
                 }
             }
         }
+        self.drain_rereads = None;
         self.join_all_flushes().await;
         self.refresh_oldest_deferral();
     }
@@ -1604,6 +1859,54 @@ impl ShardActor {
         self.flushes.len() >= self.config.queued_flush_cap()
     }
 
+    /// The scan-set check at flush open (ADR-1642 scan-set amendment). Inside
+    /// a drain, a tenant whose view cannot be trusted is re-read once, waiting
+    /// at most `max_flush_lifetime`, and checked again, so one drain flushes
+    /// what the re-read confirms; elsewhere an untrusted view only starts a
+    /// background re-read and the next trigger retries.
+    async fn scan_check(&mut self, tenant: TenantHash, hour: u32, now_ns: i64) -> ScanCheck {
+        let verdict = self.scope.check(tenant, self.shard, hour, now_ns);
+        if verdict != ScanCheck::Unknown
+            || !self
+                .drain_rereads
+                .as_mut()
+                .is_some_and(|reread| reread.insert(tenant))
+        {
+            return verdict;
+        }
+        reread_and_check(
+            self.scope.as_ref(),
+            self.clock.as_ref(),
+            self.config.max_flush_lifetime,
+            tenant,
+            self.shard,
+            hour,
+            now_ns,
+        )
+        .await
+    }
+
+    /// Whether a flush on a generation view this router cannot trust stays
+    /// unopened, its buffer kept whole for a later trigger (ADR-1642 scan-set
+    /// amendment). Always, except on a teardown bypass pass, which a drain
+    /// reaches only after its own synchronous re-read failed: a drain that is
+    /// about to end the actor writes the buffer in place instead, since a row
+    /// written where the read side may not scan can still be found and a row
+    /// dropped at shutdown cannot. That write is logged.
+    fn keeps_unconfirmed_flush(&self, lag_check: LagCheck, reason: &str) -> bool {
+        if matches!(lag_check, LagCheck::Enforced) {
+            return true;
+        }
+        tracing::warn!(
+            signal = ?self.ctx.signal,
+            shard = self.shard,
+            reason,
+            "ravel-ingest: teardown bypass pass: writing a flush in place although it could \
+             not be confirmed inside the read-side scan set"
+        );
+        false
+    }
+
     /// Publishes this shard's spawned-but-unreaped flush-task count (issue
     /// #1740). Called wherever `flushes` changes length, so the gauge always
     /// reads the value the next trigger will be tested against.
@@ -1769,6 +2072,103 @@ impl ShardActor {
             }
         };
         let tenant_hash = tenant.hash();
+        let ingest_hour_bucket = match checked_ingest_hour_bucket(flush_open_ns) {
+            Ok(bucket) => bucket,
+            Err(msg) => {
+                // Defensive: `flush_open_ns` was already hour-bucket-validated (it
+                // is either `raw_ns`, checked at the helper entry, or the floor,
+                // itself a previously-checked raw reading). If it ever fails here
+                // it is fail-loud like InvalidReading: drop the buffer, count the
+                // dropped exemplars so the drop stays visible (finding 2), refund
+                // `charges` on drop.
+                if !buf.exemplars.is_empty() {
+                    self.metrics.record_exemplars(0, buf.exemplars.len() as u64);
+                }
+                self.metrics.record_abandoned_input_rejected();
+                self.ctx
+                    .ack_waiters(buf.waiters, Err(WriteError::SegmentBuild(msg)));
+                return;
+            }
+        };
+        // ADR-1642 scan-set amendment: write under this shard index only if
+        // the read side scans it for the hour this flush is about to pin.
+        let buf = match self
+            .scan_check(tenant_hash, ingest_hour_bucket, raw_ns)
+            .await
+        {
+            ScanCheck::InScanSet => {
+                self.handing_back = false;
+                buf
+            }
+            ScanCheck::HandBack {
+                scan_count,
+                active_count,
+            } => match self.hand_back(&tenant, buf, active_count).await {
+                Ok(delivered) => {
+                    if delivered {
+                        self.metrics.record_rerouted_flush();
+                        if !std::mem::replace(&mut self.handing_back, true) {
+                            tracing::warn!(
+                                signal = ?self.ctx.signal,
+                                shard = self.shard,
+                                ingest_hour_bucket,
+                                scan_count,
+                                active_count,
+                                "ravel-ingest: flush would write outside the read-side scan set \
+                                 of its ingest hour; handing its rows to the current shard generation"
+                            );
+                        }
+                    }
+                    return;
+                }
+                Err(mut buf) => {
+                    buf.stale_view_counted = false;
+                    if matches!(lag_check, LagCheck::Enforced) {
+                        if !std::mem::replace(&mut buf.hand_back_blocked, true) {
+                            self.metrics.record_hand_back_failure();
+                            tracing::warn!(
+                                signal = ?self.ctx.signal,
+                                shard = self.shard,
+                                tenant_hash = %tenant_hash.to_hex(),
+                                ingest_hour_bucket,
+                                active_count,
+                                "ravel-ingest: a hand-back target shard of the tenant's current \
+                                 generation is dead or closed; keeping the rows in this shard's \
+                                 buffer until it is live again (the next write routed to a dead \
+                                 metrics shard respawns it)"
+                            );
+                        }
+                        self.tenants.insert(tenant, buf);
+                        return;
+                    }
+                    self.metrics.record_teardown_unscanned_write();
+                    tracing::error!(
+                        signal = ?self.ctx.signal,
+                        shard = self.shard,
+                        tenant_hash = %tenant_hash.to_hex(),
+                        ingest_hour_bucket,
+                        scan_count,
+                        active_count,
+                        "ravel-ingest: teardown bypass pass: writing a flush in place under a \
+                         shard index readers do not scan for its ingest hour, because a \
+                         hand-back target shard is dead or closed; the rows are stored but no \
+                         query returns them"
+                    );
+                    buf
+                }
+            },
+            ScanCheck::Unknown => {
+                let mut buf = buf;
+                if !std::mem::replace(&mut buf.stale_view_counted, true) {
+                    self.metrics.record_stale_provisioning_flush();
+                }
+                if self.keeps_unconfirmed_flush(lag_check, "no trusted generation view") {
+                    self.tenants.insert(tenant, buf);
+                    return;
+                }
+                buf
+            }
+        };
         let seq = self.next_seq;
         self.next_seq += 1;
         let TenantBuf {
@@ -1780,24 +2180,6 @@ impl ShardActor {
             charges,
             ..
         } = buf;
-        let ingest_hour_bucket = match checked_ingest_hour_bucket(flush_open_ns) {
-            Ok(bucket) => bucket,
-            Err(msg) => {
-                // Defensive: `flush_open_ns` was already hour-bucket-validated (it
-                // is either `raw_ns`, checked at the helper entry, or the floor,
-                // itself a previously-checked raw reading). If it ever fails here
-                // it is fail-loud like InvalidReading: drop the buffer, count the
-                // dropped exemplars so the drop stays visible (finding 2), refund
-                // `charges` on drop.
-                if !exemplars.is_empty() {
-                    self.metrics.record_exemplars(0, exemplars.len() as u64);
-                }
-                self.metrics.record_abandoned_input_rejected();
-                self.ctx
-                    .ack_waiters(waiters, Err(WriteError::SegmentBuild(msg)));
-                return;
-            }
-        };
         self.metrics.record_flush(trigger);
         // The deadline pinned here is the flush-open deadline. It bounds how
         // long the flush may sit queued for a permit: the spawned task checks it
@@ -2276,9 +2658,9 @@ mod tests {
     use std::pin::Pin;
 
     use ravel_commit::record;
-    use ravel_object_store::GetRange;
     use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
     use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{GetRange, list_all};
     use ravel_otlp::normalize::NormalizedPoint;
     use ravel_types::METRIC_NAME_LABEL;
     use tokio::sync::watch;
@@ -3247,5 +3629,237 @@ mod tests {
         let (hold_ns, trigger) = idle_age_threshold(0, &floored);
         assert_eq!(trigger, FlushTrigger::AgeFloor);
         hold_ns
+    }
+
+    /// One metrics shard actor (index 3) whose scan-set check and hand-back
+    /// target the test scripts, over a `MemoryStore` and a clock that never
+    /// advances, so only the test's `FlushNow`/`Shutdown` messages flush.
+    struct HandBackRig {
+        tx: mpsc::Sender<ShardMsg>,
+        scope: Arc<crate::generation::ScriptedScope<ShardMsg>>,
+        metrics: Arc<IngestMetrics>,
+        store: Arc<dyn ObjectStoreBackend>,
+        budget: Arc<IngestByteBudget>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    /// Handing back to a two-shard set, which these rows split across.
+    const HAND_BACK: ScanCheck = ScanCheck::HandBack {
+        scan_count: 3,
+        active_count: 2,
+    };
+
+    impl HandBackRig {
+        fn new(target: Option<mpsc::Sender<ShardMsg>>) -> Self {
+            let scope = crate::generation::ScriptedScope::new(HAND_BACK, target);
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let metrics = Arc::new(IngestMetrics::new(4));
+            let config = IngestConfig {
+                shard_count: 4,
+                ..IngestConfig::default()
+            };
+            let (tx, rx) = mpsc::channel(64);
+            let actor = ShardActor::new(
+                3,
+                Signal::Metrics,
+                Uuid::new_v4(),
+                1,
+                Arc::clone(&store),
+                TestClock::new(BASE_NS),
+                Arc::new(ravel_commit::rng::SystemRng),
+                config,
+                Arc::clone(&metrics),
+                rx,
+                Arc::new(AtomicI64::new(0)),
+                BufferBudgetCeiling::unlimited(),
+                DeferralCapFlag::new(config.flush_deferral_cap_ns()),
+                scope.clone(),
+                #[cfg(feature = "stage-timing")]
+                Arc::new(MetricStageTimings::new()),
+            );
+            HandBackRig {
+                tx,
+                scope,
+                metrics,
+                store,
+                budget: IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(1 << 30)),
+                task: tokio::spawn(actor.run()),
+            }
+        }
+
+        /// Buffers six points of tenant `acme`, under one charge of `bytes`.
+        async fn write(&self, bytes: u64) -> Arc<IngestByteCharge> {
+            let tenant = TenantId::new("acme");
+            let points: Vec<IngestPoint> = (0..6)
+                .map(|i| {
+                    let p = point(&tenant, &format!("host-{i}"));
+                    IngestPoint {
+                        series_id: p.series_id,
+                        labels: p.labels,
+                        value: IngestValue::Scalar(p.sample),
+                    }
+                })
+                .collect();
+            let targets: HashSet<u32> = points.iter().map(|p| shard_for(&p.series_id, 2)).collect();
+            assert_eq!(targets.len(), 2, "the rows split across both targets");
+            let charge = Arc::new(self.budget.try_charge(bytes).expect("charge"));
+            self.tx
+                .send(ShardMsg::Write {
+                    tenant,
+                    points,
+                    exemplars: Vec::new(),
+                    ack: None,
+                    charge: Some(Arc::clone(&charge)),
+                })
+                .await
+                .expect("send write");
+            charge
+        }
+
+        async fn flush_now(&self) {
+            let (done, wait) = oneshot::channel();
+            self.tx
+                .send(ShardMsg::FlushNow { done })
+                .await
+                .expect("send FlushNow");
+            wait.await.expect("FlushNow answered");
+        }
+
+        /// Hands the buffer to a live test-owned target and returns every
+        /// point and charge the actor sends it.
+        async fn drain_to_live_target(&self) -> (usize, Vec<Arc<IngestByteCharge>>) {
+            let (target, mut inbox) = mpsc::channel(16);
+            self.scope.set(HAND_BACK, Some(target));
+            self.flush_now().await;
+            let (mut points, mut charges) = (0, Vec::new());
+            while let Ok(msg) = inbox.try_recv() {
+                if let ShardMsg::HandBack {
+                    points: p,
+                    charges: c,
+                    ..
+                } = msg
+                {
+                    points += p.len();
+                    charges.extend(c);
+                }
+            }
+            (points, charges)
+        }
+    }
+
+    /// A target whose mailbox closes between the liveness check and the send
+    /// (the scripted scope returns it as live): every row goes back into the
+    /// source buffer and its charge is held exactly once, so the next hand-back
+    /// delivers all six rows with the one charge per target message.
+    ///
+    /// Guard: the `self.absorb_rows(..)` call in `hand_back`'s failed-send
+    /// branch. Without it the returned message is dropped, the charge refunds
+    /// at once, and the held-bytes assertion reads 0.
+    #[tokio::test]
+    async fn a_target_closed_after_the_liveness_check_returns_the_rows() {
+        let (closed, inbox) = mpsc::channel(16);
+        drop(inbox);
+        let rig = HandBackRig::new(Some(closed));
+        let charge = rig.write(4_096).await;
+        let charge_ptr = Arc::as_ptr(&charge);
+        drop(charge);
+
+        rig.flush_now().await;
+        let snap = rig.metrics.snapshot();
+        assert_eq!(
+            rig.budget.in_flight_bytes(),
+            4_096,
+            "the charge is still held"
+        );
+        assert_eq!(
+            snap.hand_back_failures, 1,
+            "one episode, however many sends and passes failed"
+        );
+        assert_eq!(snap.rerouted_flushes, 0, "no target took rows");
+
+        let (points, charges) = rig.drain_to_live_target().await;
+        assert_eq!(points, 6, "every row stayed in the source buffer");
+        assert_eq!(
+            charges.len(),
+            2,
+            "one clone per target message, not one per failed send"
+        );
+        assert!(
+            charges
+                .iter()
+                .all(|c| std::ptr::eq(Arc::as_ptr(c), charge_ptr))
+        );
+        assert_eq!(rig.budget.in_flight_bytes(), 4_096);
+        drop(charges);
+        assert_eq!(
+            rig.budget.in_flight_bytes(),
+            0,
+            "refunded once the rows leave"
+        );
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// A target that is not live at the check keeps the whole buffer, counted
+    /// once however many drain passes retry it.
+    ///
+    /// Guard: `self.tenants.insert(tenant, buf)` in `flush_tenant`'s
+    /// `Err(mut buf)` arm. Without it the buffer is dropped and the live
+    /// target later receives no rows.
+    #[tokio::test]
+    async fn a_dead_target_keeps_the_whole_source_buffer() {
+        let rig = HandBackRig::new(None);
+        drop(rig.write(4_096).await);
+
+        rig.flush_now().await;
+        rig.flush_now().await;
+        assert_eq!(rig.metrics.snapshot().hand_back_failures, 1);
+        assert_eq!(rig.budget.in_flight_bytes(), 4_096);
+        let (points, charges) = rig.drain_to_live_target().await;
+        assert_eq!(points, 6);
+        drop(charges);
+        assert_eq!(rig.budget.in_flight_bytes(), 0);
+        assert!(
+            list_all(rig.store.as_ref(), "t/")
+                .await
+                .expect("list")
+                .is_empty(),
+            "nothing was written under the shard"
+        );
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// A teardown whose hand-back target is not live writes the rows in place,
+    /// where readers do not scan them, and counts the write.
+    ///
+    /// Guard: `self.metrics.record_teardown_unscanned_write()` in
+    /// `flush_tenant`'s `Err(mut buf)` arm, and the `buf` it falls through
+    /// with. Without the first the counter reads 0; with the arm keeping the
+    /// buffer instead, nothing is written and the residue counter moves.
+    #[tokio::test]
+    async fn a_teardown_with_a_dead_target_writes_in_place_and_counts_it() {
+        let rig = HandBackRig::new(None);
+        drop(rig.write(4_096).await);
+
+        let (done, wait) = oneshot::channel();
+        rig.tx
+            .send(ShardMsg::Shutdown { done })
+            .await
+            .expect("send Shutdown");
+        wait.await.expect("Shutdown answered");
+        let snap = rig.metrics.snapshot();
+        assert_eq!(snap.teardown_unscanned_writes, 1);
+        assert_eq!(snap.flush_all_residue_tenants, 0);
+        assert_eq!(rig.budget.in_flight_bytes(), 0);
+        let commits: Vec<String> = list_all(rig.store.as_ref(), "t/")
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|o| o.key)
+            .filter(|k| k.contains("/c/0003/"))
+            .collect();
+        assert_eq!(commits.len(), 1, "one commit under shard 3, {commits:?}");
+        rig.task.await.expect("actor ends");
     }
 }
