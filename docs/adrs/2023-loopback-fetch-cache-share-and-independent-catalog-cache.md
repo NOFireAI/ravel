@@ -66,6 +66,9 @@ the query remainder to 6.76 GB.
    ADR-1196 decided. This supersedes ADR-2014's decision. An explicit
    `--logs-fetch-policy byte-minimal` still gives the ranged plan, where its
    single-query gain is the goal, for example a tuned benchmark entry.
+   The rate `cost-based` resolves on the intra-region profile and the
+   break-even a narrow projection is routed by are changed by the ADR-2414
+   amendment below.
 2. **`--cache-max-bytes` bounds the fetch cache only.** The catalog byte cache
    derives at its own share (`CATALOG_CACHE_MEMORY_PERCENT`, 5%) whether or not
    `--cache-max-bytes` is set, and `--catalog-cache-max-bytes` sets it
@@ -189,3 +192,22 @@ Consequences name: the SQL remainder is 4.6 GB smaller, and the control, with
 run whose run-to-run spread was never measured. The owner accepted the miss
 and kept the 40% share; #2044 tracks bringing the refusals under the bar
 without giving back the hot-time gain.
+
+## Amendment (2026-10-03, Refs: #2414): a time term in the cost-based rate and a projection break-even above the routing threshold
+
+<!-- amendment-applies: sections="Decision" pointer="ADR-2414 amendment" -->
+
+Decision 1 keeps `cost-based` as every deployment's default. ADR-2414
+decision A3 changes what that policy resolves to: the store cost profile
+carries a request latency and a per-connection throughput beside its
+prices, the request cost in bytes is the larger of the price-derived rate
+and `request_latency * per_connection_throughput`, and on the intra-region
+profile, whose prices are zero, the rate is therefore finite instead of
+`u64::MAX`. The routing threshold keeps its configured value, and the
+projection break-even (`ranged_projection_pays`) takes the larger of that
+threshold and five request costs, so a 3 MB L0 object still reads whole and
+a 35 MB compacted object at a narrow projection reads ranged. The loopback
+measurement in decision 4 stands: on a loopback profile the time term must
+still resolve whole-object reads for the working set it measured, which the
+implementing task re-runs or reasons about before it lands.
+

@@ -1,10 +1,12 @@
 # ADR-2414: narrow projections read ranged on S3, and a lone statement gets the tenant's SQL share
 
 Status: Proposed. Issue #2414.
-Amends ADR-2023 (the cost-based fetch policy's rate on the reference store
-profile), ADR-1170 (the derived per-query SQL share) and ADR-0954 (the spill
-eligibility predicate); each carries an amendment section pointing here. No
-persistent format changes.
+Amends ADR-2023 (the cost-based fetch policy's rate and the projection
+break-even) and ADR-0954 (the spill eligibility predicate); both are
+Accepted and carry an amendment section pointing here, added together with
+this document. ADR-1170 (the derived per-query SQL share) is still Proposed,
+so task B1 edits its share in place and cites this ADR there. No persistent
+format changes.
 
 ## Context
 
@@ -94,13 +96,21 @@ per_connection_throughput`, from the store cost profile beside its prices
 about 70 ms and about 90 MB/s, so about 6.3 MB per request), and the
 resolved rate is the larger of the price-derived rate and the time-derived
 one. `resolve_cost_based_rate` therefore returns a finite rate on the
-intra-region profile, the routing threshold stays at its configured value,
-and `ranged_projection_pays` applies its existing break-even (five request
-costs of saved bytes, 512 KiB floor): a 35 MB object at a 3% projection
-saves 34 MB against a 31 MB break-even and reads ranged; a 3 MB L0 object
-saves under 3 MB and reads whole. The startup line names which term
-produced the rate. The partition count is unchanged (derived from cores);
-with A2 that is enough.
+intra-region profile and the routing threshold stays at its configured
+value (512 KiB by default). The projection break-even is NOT that
+threshold: today the engine always sets `logs_block_range_threshold`, and
+`effective_whole_object_threshold` returns the configured value verbatim,
+so a finite rate alone would make `ranged_projection_pays` compare the
+saved bytes against 512 KiB and read a 3 MB L0 object ranged, the shape
+ADR-2023 measured as a threefold concurrent throughput loss. So
+`ranged_projection_pays` takes the larger of the configured routing
+threshold and five request costs as its break-even whenever the rate is
+finite: a 35 MB object at a 3% projection saves 34 MB against a 31 MB
+break-even and reads ranged; a 3 MB L0 object saves under 3 MB and reads
+whole; an explicit `--logs-block-range-threshold` still bounds the
+block-range routing it was written for. The startup line names which term
+produced the rate and the break-even in force. The partition count is
+unchanged (derived from cores); with A2 that is enough.
 
 Expected on the reference box after A1 to A3 (pre-registered on #1248
 before A3's run): the one-column statement under 2 s cold at 32 partitions,
@@ -112,12 +122,14 @@ segment count.
 
 B1. **The derived per-query SQL pool is the tenant's share.**
 `SQL_QUERY_MEMORY_PERCENT` becomes 50, equal to `SQL_TENANT_MEMORY_PERCENT`,
-so a lone statement may reserve the tenant's whole SQL share. Concurrency is
-bounded exactly as before: the per-query pool nests inside the per-tenant
-pool, which refuses the byte that would exceed 50%, so N statements share
-the same total they share today and the ten-connection envelope (#2367) does
-not move. An explicit `--sql-max-query-bytes` still wins and is still
-clamped to the tenant ceiling. On the reference box q33 then runs inside
+so a lone statement may reserve the tenant's whole SQL share. The tenant
+total is unchanged and the per-statement cap is removed: the per-query pool
+nests inside the per-tenant pool, which refuses the byte that would exceed
+50%, so N statements share the same total they share today, but a second
+concurrent statement no longer has a guaranteed quarter of memory; it gets
+what the first left. The ten-connection envelope (#2367) does not move,
+because the tenant pool bounds the sum. An explicit `--sql-max-query-bytes`
+still wins and is still clamped to the tenant ceiling. On the reference box q33 then runs inside
 16,451,897,344 against its 10.86 GB peak.
 
 B2. **Spill eligibility admits `Sort` over a spill-exact aggregate.**
@@ -141,8 +153,9 @@ cold, 10 s warm from Stage 0); a null for it is a miss.
   group's final count and not monotone with the final order, so no exact
   short-cut exists over an unsorted scan (noted on #837).
 - **Raise only the tenant share.** The refusal comes from the per-query
-  ceiling; 25% was chosen so four statements could share one tenant's SQL
-  budget, which the tenant pool already enforces by refusing the fifth byte.
+  ceiling; 25% was chosen so two statements could sit at the ceiling at once
+  inside the 50% tenant share and a second always had room, and the tenant
+  pool already bounds the sum by refusing the byte over 50%.
 - **Derive the partition count from the segment count per query.** It fixes
   the ranged fast path's latency bound for this corpus but not the general
   case (a query over 10,000 segments cannot run 10,000 partitions), and it
