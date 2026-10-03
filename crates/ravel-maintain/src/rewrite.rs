@@ -53,12 +53,34 @@
 //! convergence/repair unchanged. A crashed rewrite re-run from scratch rebuilds
 //! the identical content-addressed parts and converges at the record's
 //! `CreateIfAbsent`, the same statelessness compaction has.
+//!
+//! ## Force 2: re-encoding a compaction record's parts
+//!
+//! [`reencode_compaction_parts`] is ADR-0066's force 2 (the 2026-09-28
+//! amendment): a bucket whose one compaction record has parts below the
+//! current segment format version gets those parts re-encoded at the current
+//! version and a version 2 compaction record that supersedes the old one. It
+//! sits behind [`CompactorConfig::reencode_writer_enabled`], off by default,
+//! and has no production caller yet.
+
+use std::collections::BTreeMap;
 
 use futures::stream::{StreamExt, TryStreamExt, iter as stream_iter};
-use ravel_object_store::ObjectStoreBackend;
-use ravel_types::Signal;
+use ravel_catalog::select_authoritative_compaction_records;
+use ravel_commit::keys;
+use ravel_object_store::{GetRange, ObjectStoreBackend};
+use ravel_proto::commit::v1::{CompactionPart, CompactionRecord};
+use ravel_segment::{
+    CompactionMetaV4, ExemplarInput, IngestBounds, ReaderLimits, RunInputV7, SegmentIdentity,
+    SegmentWriter, SeriesEntryV4, SeriesInputV7, SeriesValues, ValueKind, decode_catalog_v5,
+    decode_exemplars_section, decode_run_histogram_pages, decode_run_pages_soa, encode_run_v4,
+    open_from_full, plan_ranges_v4,
+};
+use ravel_types::declared_stats::DeclaredStatType;
+use ravel_types::{Sample, Signal};
 
 use crate::bucket::Bucket;
+use crate::build::{BuiltPart, PartPut, put_part_with_ledger};
 use crate::claim_guard::{BucketClaim, Checkpoint, ClaimSkipReason, claim_bucket};
 use crate::clock::Clock;
 use crate::codec::{RsegCodec, SegmentCodec};
@@ -66,11 +88,12 @@ use crate::config::CompactorConfig;
 use crate::error::{MaintainError, Result};
 use crate::publish::{
     ConservationPredicate, PublishOutcome, conserve_exact, publish_record_with_conservation,
+    publish_superseding_record,
 };
 use crate::read::{
     BucketListing, input_set_hash, list_bucket_with_ledger, load_inputs_with_ledger,
 };
-use crate::request_ledger::RequestLedger;
+use crate::request_ledger::{RequestLedger, RequestPhase, note_get};
 use crate::rlog::RlogCodec;
 use crate::rspan_codec::SpanCodec;
 
@@ -753,6 +776,649 @@ async fn dispatch_rewrite(
             "rewrite is not implemented for signal {other:?}"
         ))),
     }
+}
+
+/// RSEG section kinds the force 2 re-encode reads out of a whole part object
+/// (docs/segment-format.md), named as `read.rs` names them.
+const RSEG_LABEL_DICT: u32 = 1;
+const RSEG_EXEMPLARS: u32 = 10;
+
+/// The result of a [`reencode_compaction_parts`] call. Every variant except
+/// [`ReencodeOutcome::Reencoded`] published nothing, and names why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReencodeOutcome {
+    /// [`CompactorConfig::reencode_writer_enabled`] is off. No store request
+    /// was made.
+    WriterDisabled,
+    /// A retention tombstone is present; the bucket is never rewritten.
+    Tombstoned,
+    /// The bucket holds a rewrite record, which blocks it from every
+    /// migration (ADR-1331).
+    RewritePresent,
+    /// The bucket holds no compaction record. Raw L0 records are
+    /// [`migrate_bucket_format`]'s.
+    NoCompactionRecord,
+    /// An overlap component holds more than one compaction record once the
+    /// records a version 2 record supersedes are set aside (ADR-0066 force 2
+    /// amendment, item 4): a new record's hash could lose the tie-break to the
+    /// old loser.
+    ContestedOverlap { largest_component: usize },
+    /// More than one compaction record survives supersession, each in its own
+    /// overlap component. Force 2 re-encodes a bucket's one record only.
+    MultipleRecords { records: usize },
+    /// Every part of the bucket's one compaction record is at the current
+    /// segment format version.
+    UpToDate,
+    /// The parts of the record at `superseded_record_key` were re-encoded into
+    /// `parts` current-version parts, and the version 2 record naming it
+    /// resolved as `publish` says.
+    Reencoded {
+        superseded_record_key: String,
+        parts: usize,
+        publish: PublishOutcome,
+    },
+    /// The pre-publish re-list found a record set other than the one this run
+    /// planned from, so it published nothing (ADR-1029, the 2026-10-03
+    /// amendment). A later run plans again.
+    RecordSetChanged,
+    /// The bucket's claim was not available, so the run read no part and
+    /// published nothing.
+    SkippedClaimed { reason: ClaimSkipReason },
+    /// The run took the bucket's claim and lost it before its record PUT, and
+    /// cancelled at `at` with nothing published.
+    Cancelled { at: Checkpoint },
+}
+
+/// The segment format version the current writer emits for `signal`'s
+/// compaction parts.
+fn current_part_version(signal: Signal) -> Result<u32> {
+    match signal {
+        Signal::Metrics => Ok(crate::build::OUTPUT_FORMAT_VERSION),
+        Signal::Logs => Ok(crate::rlog::OUTPUT_FORMAT_VERSION),
+        Signal::Spans => Ok(crate::rspan_codec::OUTPUT_FORMAT_VERSION),
+        other => Err(MaintainError::Invariant(format!(
+            "re-encode is not implemented for signal {other:?}"
+        ))),
+    }
+}
+
+/// ADR-0066 force 2: re-encode the parts of `bucket`'s one compaction record at
+/// the current segment format version and publish a version 2 compaction
+/// record superseding it.
+///
+/// It runs only when [`CompactorConfig::reencode_writer_enabled`] is on, and
+/// only when the force 2 amendment says it applies: no tombstone, no rewrite
+/// record in the bucket (ADR-1331), exactly one compaction record once the
+/// shared selector ([`select_authoritative_compaction_records`]) has set aside
+/// the records a version 2 record supersedes (item 4), and at least one of that
+/// record's parts below the current version. Every other case returns the
+/// [`ReencodeOutcome`] that names it, having written nothing. A part recorded
+/// above the current version is an [`MaintainError::Invariant`]: a forward
+/// re-encode cannot write it (ADR-0066 decision 2).
+///
+/// Every part is read whole and re-encoded with exact contents (item 7). An
+/// RSEG part is re-encoded part for part: each run is decoded and re-encoded
+/// with its own run-wide provenance, its per-sample dedup provenance column
+/// and its exemplars carried over, so part boundaries and part indexes are the
+/// predecessor's. RLOG and RSPAN parts go through their codec's compaction
+/// merge, which decodes and re-encodes every record, so their part split
+/// follows this run's configuration. The new parts are written
+/// `CreateIfAbsent` as compaction writes them, and the record goes through
+/// compaction's publish path: its inputs are the predecessor's, verbatim, its
+/// `superseded_record_key` names the predecessor, and its key is the
+/// canonical key of its version 2 hash. The conservation gate compares the
+/// predecessor's part record counts with the new parts'.
+///
+/// The run takes the bucket's claim through [`claim_bucket`] after it has read
+/// the compaction records and before it reads any part, holds it through the
+/// record PUT, and consults it at every merge checkpoint and at the publish
+/// checkpoint. Immediately before the record PUT it lists the bucket again and
+/// publishes nothing if the record set changed (ADR-1029, the 2026-10-03
+/// amendment), the same fence compaction and the erasure rewrite use.
+///
+/// Nothing in production calls this yet: `migrate` wiring is ADR-0066 force 2
+/// task T6.
+pub async fn reencode_compaction_parts(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    bucket: &Bucket,
+) -> Result<ReencodeOutcome> {
+    if !config.reencode_writer_enabled {
+        return Ok(ReencodeOutcome::WriterDisabled);
+    }
+    let scope = config.request_ledger.as_ref().map(|l| {
+        l.reset_for_run();
+        l.run_scope_guard()
+    });
+    let outcome = reencode_compaction_parts_scoped(store, clock, config, bucket).await;
+    emit_request_report(config, bucket, outcome.is_ok());
+    if let Some(scope) = scope {
+        scope.close();
+    }
+    outcome
+}
+
+/// [`reencode_compaction_parts`]'s body, with the request ledger's run scope
+/// already opened and guaranteed to be closed by its caller.
+async fn reencode_compaction_parts_scoped(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    bucket: &Bucket,
+) -> Result<ReencodeOutcome> {
+    crate::rlog::check_rlog_zstd_level(config, bucket)?;
+    let target_version = current_part_version(bucket.signal)?;
+    let start_ns = clock.now_ns();
+    let ledger = config.request_ledger.as_ref();
+
+    let listing = list_bucket_with_ledger(store, bucket, ledger).await?;
+    if listing.tombstone_key.is_some() {
+        return Ok(ReencodeOutcome::Tombstoned);
+    }
+    if !listing.rewrite_record_keys.is_empty() {
+        return Ok(ReencodeOutcome::RewritePresent);
+    }
+    if listing.compaction_record_keys.is_empty() {
+        return Ok(ReencodeOutcome::NoCompactionRecord);
+    }
+
+    let records = read_compaction_records(store, &listing.compaction_record_keys, ledger).await?;
+    let selection = select_authoritative_compaction_records(&records).map_err(|err| {
+        MaintainError::Invariant(format!(
+            "compaction records have an unresolvable supersession chain: {err}"
+        ))
+    })?;
+    if selection.largest_component() > 1 {
+        return Ok(ReencodeOutcome::ContestedOverlap {
+            largest_component: selection.largest_component(),
+        });
+    }
+    let live: Vec<&(String, CompactionRecord)> = records
+        .iter()
+        .filter(|(key, _)| !selection.is_excluded(key))
+        .collect();
+    let (predecessor_key, predecessor) = match live.as_slice() {
+        [] => return Ok(ReencodeOutcome::NoCompactionRecord),
+        [only] => (only.0.as_str(), &only.1),
+        more => {
+            return Ok(ReencodeOutcome::MultipleRecords {
+                records: more.len(),
+            });
+        }
+    };
+
+    if let Some(newer) = predecessor
+        .parts
+        .iter()
+        .find(|p| p.segment_format_version > target_version)
+    {
+        return Err(MaintainError::Invariant(format!(
+            "compaction record {predecessor_key} has part {} recorded at format version {}, \
+             newer than the current output version {target_version}: a re-encode cannot \
+             write it (ADR-0066 decision 2)",
+            newer.part_index, newer.segment_format_version
+        )));
+    }
+    if !predecessor
+        .parts
+        .iter()
+        .any(|p| p.segment_format_version < target_version)
+    {
+        return Ok(ReencodeOutcome::UpToDate);
+    }
+
+    // The bucket claim, the one compaction, the erasure rewrite and `migrate`
+    // take, held from here through the record PUT.
+    let guard = match claim_bucket(store, config, bucket, "reencode").await? {
+        BucketClaim::Held { guard, .. } => Some(guard),
+        BucketClaim::NotParticipating => None,
+        BucketClaim::Skipped(skip) => {
+            return Ok(ReencodeOutcome::SkippedClaimed {
+                reason: skip.reason,
+            });
+        }
+    };
+    let run_config = match guard.as_ref() {
+        Some(guard) => CompactorConfig {
+            claim_guard: Some(guard.clone()),
+            ..config.clone()
+        },
+        None => config.clone(),
+    };
+
+    let fenced = match reencode_and_publish(
+        store,
+        clock,
+        &run_config,
+        bucket,
+        &listing,
+        predecessor_key,
+        predecessor,
+        start_ns,
+    )
+    .await
+    {
+        Err(MaintainError::ClaimLost { .. }) if guard.is_some() => None,
+        other => Some(other?),
+    };
+
+    if let Some(guard) = guard {
+        if let Some(at) = guard.cancelled_at().await {
+            return Ok(ReencodeOutcome::Cancelled { at });
+        }
+        if let Err(err) = guard.complete(store).await {
+            tracing::warn!(
+                signal = ?bucket.signal,
+                shard = bucket.shard,
+                ingest_hour_bucket = bucket.ingest_hour_bucket,
+                work_id = %guard.work_id_hex(),
+                error = %err,
+                "re-encode finished, but marking its claim completed failed; \
+                 the claim ages out under its lease (ADR-1029)"
+            );
+        }
+    }
+
+    match fenced {
+        Some(FencedRewrite::Ran(outcome)) => Ok(ReencodeOutcome::Reencoded {
+            superseded_record_key: predecessor_key.to_string(),
+            parts: outcome.parts,
+            publish: outcome.publish,
+        }),
+        Some(FencedRewrite::RecordSetChanged(_)) => Ok(ReencodeOutcome::RecordSetChanged),
+        None => Err(MaintainError::Invariant(
+            "a re-encode lost its claim but its guard names no checkpoint".to_string(),
+        )),
+    }
+}
+
+/// GET and decode each compaction record in `record_keys`, checking each one
+/// reconstructs to the key it was listed at.
+async fn read_compaction_records(
+    store: &dyn ObjectStoreBackend,
+    record_keys: &[String],
+    ledger: Option<&RequestLedger>,
+) -> Result<Vec<(String, CompactionRecord)>> {
+    let mut records = Vec::with_capacity(record_keys.len());
+    for key in record_keys {
+        let got = store.get(key, GetRange::Full).await;
+        note_get(ledger, RequestPhase::RecordRead, &got);
+        let record = ravel_commit::record::decode_compaction(got?.data.as_ref()).map_err(|e| {
+            MaintainError::Invariant(format!("compaction record {key} does not decode: {e}"))
+        })?;
+        keys::verify_compaction_record_key(&record, key)?;
+        records.push((key.clone(), record));
+    }
+    Ok(records)
+}
+
+/// Re-encode `predecessor`'s parts and publish the version 2 record over them,
+/// fenced by the claim checkpoints in `config` and by the pre-publish re-list
+/// against `planned`. May unwind with [`MaintainError::ClaimLost`] from any
+/// checkpoint.
+#[allow(clippy::too_many_arguments)]
+async fn reencode_and_publish(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    bucket: &Bucket,
+    planned: &BucketListing,
+    predecessor_key: &str,
+    predecessor: &CompactionRecord,
+    start_ns: i64,
+) -> Result<FencedRewrite> {
+    if let Some(t) = config.merge_memory_tracker.as_ref() {
+        t.reset_for_run();
+    }
+    let hash = ravel_commit::erasure::compute_superseding_compaction_input_set_hash(
+        &predecessor.inputs,
+        predecessor_key,
+    );
+    crate::claim_guard::checkpoint(config, store, Checkpoint::InputSet).await?;
+
+    let part_keys = predecessor
+        .parts
+        .iter()
+        .map(|p| keys::reconstruct_l1_part_key(predecessor, p))
+        .collect::<std::result::Result<Vec<String>, _>>()?;
+    let parts = match bucket.signal {
+        Signal::Metrics => {
+            reencode_rseg_parts(store, config, bucket, predecessor, &part_keys, &hash).await?
+        }
+        Signal::Logs => {
+            let catalogs =
+                crate::rlog::load_catalogs_by_key(store, config, &part_keys, true).await?;
+            let mut indexed_fields: Vec<String> = catalogs
+                .iter()
+                .flat_map(|c| c.indexed_fields.iter().cloned())
+                .collect();
+            indexed_fields.sort();
+            indexed_fields.dedup();
+            crate::rlog::merge_catalogs(
+                store,
+                config,
+                bucket,
+                &catalogs,
+                &hash,
+                indexed_fields,
+                declared_columns_from_parts(&predecessor.parts),
+                config.dry_run,
+                false,
+                &mut |_| Ok(true),
+            )
+            .await?
+            .parts
+        }
+        Signal::Spans => {
+            let catalogs =
+                crate::rspan_codec::load_catalogs_by_key(store, config, &part_keys).await?;
+            crate::rspan_codec::merge(
+                store,
+                config,
+                bucket,
+                &catalogs,
+                &hash,
+                config.dry_run,
+                &mut |_| Ok(true),
+            )
+            .await?
+            .parts
+        }
+        other => {
+            return Err(MaintainError::Invariant(format!(
+                "re-encode is not implemented for signal {other:?}"
+            )));
+        }
+    };
+
+    crate::claim_guard::checkpoint(config, store, Checkpoint::Publish).await?;
+    if let Some(now) =
+        relist_changed(store, bucket, planned, config.request_ledger.as_ref()).await?
+    {
+        return Ok(FencedRewrite::RecordSetChanged(now));
+    }
+
+    let publish = publish_superseding_record(
+        store,
+        config,
+        clock,
+        bucket,
+        predecessor_key,
+        predecessor,
+        &hash,
+        &parts,
+        start_ns,
+        conserve_exact(),
+    )
+    .await?;
+    Ok(FencedRewrite::Ran(RewriteOutcome {
+        parts: parts.len(),
+        publish,
+    }))
+}
+
+/// The declared columns the predecessor's RLOG parts carry stamps for, so the
+/// re-encoded parts recompute stamps for the same columns (ADR-0873 decision
+/// 3).
+fn declared_columns_from_parts(parts: &[CompactionPart]) -> Vec<(String, DeclaredStatType)> {
+    let mut seen: BTreeMap<String, DeclaredStatType> = BTreeMap::new();
+    for part in parts {
+        for stat in ravel_commit::declared_stats::read_compaction_part(part).covered() {
+            seen.entry(stat.name().to_string())
+                .or_insert_with(|| stat.declared_type());
+        }
+    }
+    seen.into_iter().collect()
+}
+
+/// Re-encode each RSEG part of `predecessor` into one current-version part
+/// with the same part index, PUT it `CreateIfAbsent`, and release its bytes,
+/// as compaction does. The compactor's `build_parts` is not used: it stamps
+/// every run with its input's commit-record provenance and writes a single-run
+/// series without a provenance column, which would rewrite the dedup keys an
+/// L1 part already carries.
+async fn reencode_rseg_parts(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    bucket: &Bucket,
+    predecessor: &CompactionRecord,
+    part_keys: &[String],
+    input_set_hash: &[u8; 32],
+) -> Result<Vec<BuiltPart>> {
+    let ledger = config.request_ledger.as_ref();
+    let mut built = Vec::with_capacity(part_keys.len());
+    for (part, key) in predecessor.parts.iter().zip(part_keys) {
+        crate::claim_guard::checkpoint(config, store, Checkpoint::MergeLoop).await?;
+        let got = store.get(key, GetRange::Full).await;
+        note_get(ledger, RequestPhase::BlockRead, &got);
+        let object = got?.data;
+        if blake3::hash(&object).as_bytes().as_slice() != part.content_hash.as_slice() {
+            return Err(MaintainError::Invariant(format!(
+                "part {key} does not match its record's content hash"
+            )));
+        }
+        let mut new_part = reencode_rseg_part(
+            bucket,
+            config,
+            &object,
+            part,
+            predecessor.level,
+            input_set_hash,
+        )?;
+        if !config.dry_run
+            && put_part_with_ledger(store, &new_part, ledger).await? == PartPut::AlreadyExisted
+        {
+            new_part.put_already_existed = true;
+        }
+        new_part.bytes = None;
+        crate::claim_guard::checkpoint(config, store, Checkpoint::PartBoundary).await?;
+        built.push(new_part);
+    }
+    Ok(built)
+}
+
+/// `(offset, len)` of `object`, or a typed error when it falls outside.
+fn object_range(object: &[u8], (offset, len): (u64, u64)) -> Result<&[u8]> {
+    let start = usize::try_from(offset).ok();
+    let end = start
+        .zip(usize::try_from(len).ok())
+        .and_then(|(s, l)| s.checked_add(l));
+    start
+        .zip(end)
+        .and_then(|(s, e)| object.get(s..e))
+        .ok_or_else(|| {
+            MaintainError::Invariant(format!(
+                "range ({offset}, {len}) falls outside a {}-byte part",
+                object.len()
+            ))
+        })
+}
+
+/// Re-encode one whole RSEG part at the current version: every run decoded and
+/// re-encoded under its own run-wide provenance, its per-sample provenance
+/// column (when it has one) and the part's exemplars carried as they are, and
+/// the footer's ingest bounds kept.
+fn reencode_rseg_part(
+    bucket: &Bucket,
+    config: &CompactorConfig,
+    object: &[u8],
+    part: &CompactionPart,
+    level: u32,
+    input_set_hash: &[u8; 32],
+) -> Result<BuiltPart> {
+    let limits = ReaderLimits::default();
+    let loc = open_from_full(object, limits)?;
+    let footer = &loc.footer;
+    let entries = decode_catalog_v5(footer, object, limits)?;
+    let refs: Vec<&SeriesEntryV4> = entries.iter().collect();
+    let mut planned = plan_ranges_v4(footer, &refs)?.into_iter();
+
+    let mut series = Vec::with_capacity(entries.len());
+    let mut run_count: u64 = 0;
+    let mut scratch = Vec::new();
+    for entry in &entries {
+        let series_id = entry.entry.series_id;
+        let mut runs = Vec::with_capacity(entry.runs.len());
+        for (i, run) in entry.runs.iter().enumerate() {
+            let range = planned.next().ok_or_else(|| {
+                MaintainError::Invariant("plan_ranges_v4 produced fewer ranges than runs".into())
+            })?;
+            let ts_page = object_range(object, range.ts_range)?;
+            let values = match entry.entry.value_kind {
+                ValueKind::Scalar => {
+                    let mut timestamps = Vec::new();
+                    let mut values = Vec::new();
+                    decode_run_pages_soa(
+                        &series_id,
+                        run,
+                        ts_page,
+                        object_range(object, range.val_range)?,
+                        limits,
+                        &mut scratch,
+                        &mut timestamps,
+                        &mut values,
+                    )?;
+                    SeriesValues::Scalar(
+                        timestamps
+                            .into_iter()
+                            .zip(values)
+                            .map(|(ts_ns, value)| Sample { ts_ns, value })
+                            .collect(),
+                    )
+                }
+                ValueKind::Histogram => SeriesValues::Histogram(decode_run_histogram_pages(
+                    &series_id,
+                    run,
+                    ts_page,
+                    object_range(object, range.hist_range)?,
+                    limits,
+                )?),
+            };
+            runs.push(RunInputV7 {
+                run: encode_run_v4(
+                    &series_id,
+                    run.created_unix_ns,
+                    run.writer_epoch,
+                    run.writer_seq,
+                    &values,
+                )?,
+                provenance: entry.per_sample_provenance.get(i).cloned().flatten(),
+            });
+        }
+        run_count += runs.len() as u64;
+        series.push(SeriesInputV7 {
+            series_id,
+            labels: entry.entry.labels.clone(),
+            runs,
+        });
+    }
+    if planned.next().is_some() {
+        return Err(MaintainError::Invariant(
+            "plan_ranges_v4 produced more ranges than runs".into(),
+        ));
+    }
+    let exemplars = rseg_part_exemplars(object, footer, &entries, limits)?;
+
+    let first_series_id = series.iter().map(|s| s.series_id).min();
+    let last_series_id = series.iter().map(|s| s.series_id).max();
+    let identity = SegmentIdentity {
+        tenant_hash: bucket.tenant_hash.0,
+        shard: bucket.shard,
+        writer_id: config.compactor_writer_id.to_string(),
+        writer_epoch: 0,
+        writer_seq: 0,
+    };
+    let ingest = IngestBounds {
+        min_ingest_ts_ns: footer.min_ingest_ts_ns,
+        max_ingest_ts_ns: footer.max_ingest_ts_ns,
+    };
+    let meta = CompactionMetaV4 {
+        ingest_hour_bucket: bucket.ingest_hour_bucket,
+        input_set_hash: *input_set_hash,
+        part_index: part.part_index,
+        level,
+    };
+    let written =
+        SegmentWriter::write_v7_with_provenance(series, identity, ingest, meta, exemplars)?;
+    let content_hash = written.summary.blake3;
+    let key = keys::l1_part_key(
+        &bucket.tenant_hash,
+        bucket.signal,
+        bucket.shard,
+        bucket.ingest_hour_bucket,
+        &hex::encode(&input_set_hash[..8]),
+        part.part_index,
+        &hex::encode(&content_hash[..8]),
+    )?;
+    let mut new_part = CompactionPart {
+        part_index: part.part_index,
+        first_series_id: first_series_id.map(|s| s.0.to_vec()).unwrap_or_default(),
+        last_series_id: last_series_id.map(|s| s.0.to_vec()).unwrap_or_default(),
+        content_hash: content_hash.to_vec(),
+        object_size: written.bytes.len() as u64,
+        sample_count: written.summary.sample_count,
+        series_count: written.summary.series_count,
+        run_count,
+        min_event_ts_ns: written.summary.min_event_ts_ns,
+        max_event_ts_ns: written.summary.max_event_ts_ns,
+        segment_format_version: crate::build::OUTPUT_FORMAT_VERSION,
+        declared_column_stats: Vec::new(),
+    };
+    // Metrics carry no declared columns; stamped the one way `build.rs` does.
+    ravel_commit::declared_stats::stamp_compaction_part(&mut new_part, &[]);
+    Ok(BuiltPart {
+        key,
+        bytes: Some(written.bytes),
+        part: new_part,
+        put_already_existed: false,
+    })
+}
+
+/// The exemplars of one whole RSEG part, each resolved from its
+/// `series_index` to the series id it names, so the writer re-resolves it
+/// against the new part's SERIES_IDS (ADR-0047 decision 3).
+fn rseg_part_exemplars(
+    object: &[u8],
+    footer: &ravel_segment::Footer,
+    entries: &[SeriesEntryV4],
+    limits: ReaderLimits,
+) -> Result<Vec<ExemplarInput>> {
+    let section = |kind: u32| footer.sections.iter().find(|s| s.kind == kind);
+    let Some(exemplars) = section(RSEG_EXEMPLARS) else {
+        return Ok(Vec::new());
+    };
+    let dict = section(RSEG_LABEL_DICT).ok_or_else(|| {
+        MaintainError::Invariant("RSEG part carries EXEMPLARS without LABEL_DICT".into())
+    })?;
+    let records = decode_exemplars_section(
+        footer,
+        object_range(object, (dict.offset, dict.len))?,
+        object_range(object, (exemplars.offset, exemplars.len))?,
+        limits,
+    )?;
+    records
+        .into_iter()
+        .map(|r| {
+            let entry = usize::try_from(r.series_index)
+                .ok()
+                .and_then(|idx| entries.get(idx))
+                .ok_or_else(|| {
+                    MaintainError::Invariant(format!(
+                        "exemplar series_index {} is outside the part's catalog",
+                        r.series_index
+                    ))
+                })?;
+            Ok(ExemplarInput {
+                series_id: entry.entry.series_id,
+                ts_ns: r.ts_ns,
+                value: r.value,
+                trace_id: r.trace_id,
+                span_id: r.span_id,
+                attrs: r.attrs,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
